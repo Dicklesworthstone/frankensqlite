@@ -2814,22 +2814,53 @@ Kullback-Leibler divergence.
 use asupersync::lab::oracle::eprocess::{EProcess, EProcessConfig};
 
 /// Create e-processes for all MVCC invariants.
+///
+/// CALIBRATION NOTE (Alien-Artifact Discipline):
+/// Each invariant has qualitatively different violation characteristics.
+/// Using identical (p0, lambda, alpha) for all is wrong:
+///   - INV-1 (monotonicity) is enforced by AtomicU64 fetch_add. A violation
+///     implies a hardware fault. p0 should be ~10^-15.
+///   - INV-SSI-FP (false positive rate) has an EXPECTED baseline of ~0.5-5%.
+///     p0 = 0.001 would trigger false alarms constantly.
+///
+/// Per-invariant power analysis: for a monitor with p0 and lambda, the
+/// expected detection delay (observations to reject H0) when the true
+/// violation rate is p1 is:
+///   N_detect ≈ log(1/alpha) / KL(p1 || p0)
+/// where KL is the Kullback-Leibler divergence.
 fn create_mvcc_monitors() -> Vec<EProcess> {
-    let config = EProcessConfig {
-        p0: 0.001,       // null: violation rate <= 0.1%
-        lambda: 0.5,     // moderate bet
-        alpha: 0.05,     // reject at 5% significance
-        max_evalue: 1e15, // overflow guard
-    };
-
     vec![
-        EProcess::new("INV-1: TxnId Monotonicity", config.clone()),
-        EProcess::new("INV-2: Lock Exclusivity", config.clone()),
-        EProcess::new("INV-3: Version Chain Order", config.clone()),
-        EProcess::new("INV-4: Write Set Consistency", config.clone()),
-        EProcess::new("INV-5: Snapshot Stability", config.clone()),
-        EProcess::new("INV-6: Commit Atomicity", config.clone()),
-        EProcess::new("INV-7: Serialized Mode Exclusivity", config.clone()),
+        // INV-1: Monotonicity. Enforced by hardware atomics; any violation
+        // is a catastrophic bug. p0 ~ 0, lambda maximal for instant detection.
+        // Power: detects a single violation within 1 observation.
+        EProcess::new("INV-1: TxnId Monotonicity", EProcessConfig {
+            p0: 1e-9, lambda: 0.999, alpha: 1e-6, max_evalue: 1e18,
+        }),
+        // INV-2: Lock Exclusivity. CAS-enforced; violation = logic bug.
+        EProcess::new("INV-2: Lock Exclusivity", EProcessConfig {
+            p0: 1e-9, lambda: 0.999, alpha: 1e-6, max_evalue: 1e18,
+        }),
+        // INV-3: Version Chain Order. Depends on correct insert ordering.
+        // A bug here is subtle (wrong version served). Moderate sensitivity.
+        EProcess::new("INV-3: Version Chain Order", EProcessConfig {
+            p0: 1e-6, lambda: 0.9, alpha: 0.001, max_evalue: 1e15,
+        }),
+        // INV-4: Write Set Consistency. Lock-before-write invariant.
+        EProcess::new("INV-4: Write Set Consistency", EProcessConfig {
+            p0: 1e-6, lambda: 0.9, alpha: 0.001, max_evalue: 1e15,
+        }),
+        // INV-5: Snapshot Stability. Read-set immutability during txn.
+        EProcess::new("INV-5: Snapshot Stability", EProcessConfig {
+            p0: 1e-6, lambda: 0.9, alpha: 0.001, max_evalue: 1e15,
+        }),
+        // INV-6: Commit Atomicity. All-or-nothing page visibility.
+        EProcess::new("INV-6: Commit Atomicity", EProcessConfig {
+            p0: 1e-6, lambda: 0.9, alpha: 0.001, max_evalue: 1e15,
+        }),
+        // INV-7: Serialized Mode Exclusivity. Global mutex correctness.
+        EProcess::new("INV-7: Serialized Mode Exclusivity", EProcessConfig {
+            p0: 1e-9, lambda: 0.999, alpha: 1e-6, max_evalue: 1e18,
+        }),
     ]
 }
 ```
@@ -3454,15 +3485,62 @@ PageVersion := {
     pgno       : PageNumber,
     created_by : TxnId,
     data       : PageData,                  -- or RaptorQ delta (Section 3.4.4)
-    prev       : Option<Box<PageVersion>>,  -- link to older version
+    prev_idx   : Option<VersionIdx>,        -- index into VersionArena (NOT Box pointer)
+}
+
+-- PERFORMANCE (Extreme Optimization Discipline):
+-- Version chains MUST NOT use heap-allocated linked lists (Box<PageVersion>).
+-- Pointer-chasing through N heap allocations at N random addresses is the
+-- worst possible pattern for CPU cache utilization (Section 1.5 mandates
+-- "no pointer chasing in hot paths").
+--
+-- Instead, all PageVersion nodes live in a VersionArena: a contiguous,
+-- pre-allocated Vec<PageVersion> with bump allocation. VersionIdx is a u32
+-- index into this arena. Traversing a version chain of length L touches
+-- L entries in a dense array -- mostly sequential memory access.
+--
+-- Theorem 5 (Section 5.5) bounds version chain length to R * D + 1 where
+-- R is the write rate and D is the duration above the GC horizon. For
+-- typical workloads (R=100 writes/sec, D=0.1s), chains are <= 11 entries.
+-- A SmallVec<[PageVersion; 8]> inline buffer covers the common case with
+-- zero heap allocation; the arena handles the overflow case.
+--
+-- Reclamation: when GC advances the horizon and prunes old versions,
+-- arena slots are added to a free list for reuse. Epoch-based reclamation
+-- (crossbeam-epoch) ensures no reader holds a stale VersionIdx during GC.
+
+VersionArena := {
+    slots    : Vec<PageVersion>,       -- dense storage, cache-friendly
+    free_list: Vec<VersionIdx>,        -- recycled slots from GC
+    high_water: VersionIdx,            -- bump pointer for new allocations
 }
 
 PageLockTable := ShardedHashMap<PageNumber, TxnId>  -- exclusive write locks
     -- Sharded by PageNumber hash into N shards (N = 64 default).
     -- Each shard is a parking_lot::Mutex<HashMap<PageNumber, TxnId>>.
-    -- Sharding reduces contention under high writer counts (>16 concurrent
-    -- writers would bottleneck on a single Mutex). Shard count is a power
-    -- of two for fast modular arithmetic (pgno & (N-1)).
+    -- Shard count is a power of two for fast modular arithmetic (pgno & (N-1)).
+    --
+    -- CONTENTION MODEL (Alien-Artifact Discipline):
+    -- With W concurrent writers and S shards, the probability that at least
+    -- two writers contend on the same shard follows the birthday problem:
+    --   P(collision) ≈ 1 - e^(-W*(W-1) / (2*S))
+    -- For S=64, W=16: P ≈ 1 - e^(-240/128) ≈ 0.85 (85% chance of at least
+    -- one collision). For S=64, W=8: P ≈ 0.36. For S=64, W=4: P ≈ 0.09.
+    --
+    -- Under ZIPFIAN page access (which Section 17.3 uses for benchmarking),
+    -- collisions are WORSE because hot pages cluster into hot shards.
+    -- The effective shard count is S_eff = S / skew_factor where skew_factor
+    -- depends on the Zipfian parameter s (for s=1.0, roughly 4x concentration
+    -- on the top 10% of shards, so S_eff ≈ 16 for S=64).
+    --
+    -- The expected lock hold time per shard access is ~50ns (HashMap lookup
+    -- under parking_lot::Mutex). Expected wait time when contended:
+    --   E[wait] ≈ (W/S) * t_hold ≈ (16/64) * 50ns = 12.5ns (uniform)
+    --   E[wait] ≈ (W/S_eff) * t_hold ≈ (16/16) * 50ns = 50ns (Zipfian)
+    --
+    -- S=64 is adequate for W <= 32 under uniform access, W <= 16 under
+    -- Zipfian. For higher concurrency, increase S to 256 (via PRAGMA).
+    -- Monitored at runtime via the BOCPD contention stream (Section 4.8).
 
 SireadTable := ShardedHashMap<PageNumber, SmallVec<TxnId>>
     -- Maps each page to the set of active transactions that have read it.
@@ -3496,11 +3574,21 @@ IntentOp := {
   | IndexDelete { index: IndexId, key: Vec<u8>, rowid: RowId }
 }
 
-CommitLog := BTreeMap<TxnId, CommitRecord>
+CommitLog := AppendOnlyVec<CommitRecord>
+    -- NOT BTreeMap. TxnIds are monotonically increasing (INV-1), so the
+    -- commit log is naturally sorted by insertion order. Append is O(1).
+    -- Lookup by TxnId: binary search on the dense array, O(log n).
+    -- Lookup for recent commits (the hot case during SSI validation):
+    --   offset = txn_id - base_txn_id, then direct index, O(1).
+    -- GC truncates the front when all transactions below the horizon
+    -- have been reclaimed, using a VecDeque or circular buffer.
+    -- BTreeMap would pay O(log n) insertion into the rightmost leaf
+    -- with poor cache behavior (tree node pointer chasing). A dense
+    -- array is strictly superior for monotonic keys.
 
 CommitRecord := {
     txn_id    : TxnId,
-    pages     : Vec<PageNumber>,
+    pages     : SmallVec<[PageNumber; 8]>,  -- most commits touch few pages
     timestamp : Instant,
 }
 ```
@@ -5373,10 +5461,40 @@ pub struct CachedPage {
 }
 
 /// The MVCC-aware ARC cache.
+///
+/// IMPLEMENTATION NOTE (Extreme Optimization Discipline):
+/// The Megiddo & Modha (FAST '03) ARC algorithm is specified here as the
+/// logical model. The PHYSICAL implementation SHOULD use the CAR (Clock
+/// with Adaptive Replacement) variant from the same authors (FAST '04),
+/// which replaces the four LinkedHashMaps with two circular clock buffers
+/// and two ghost hash sets:
+///
+///   - T1 clock: contiguous array of CachedPage slots with reference bits.
+///     Scanning for eviction is a sequential memory sweep (cache-friendly).
+///   - T2 clock: same structure for frequency-favored pages.
+///   - B1/B2: remain as HashSets of CacheKey (metadata only, small).
+///
+/// Why CAR over linked-list ARC:
+///   - LinkedHashMap has 2 pointers per entry (prev/next) plus HashMap
+///     overhead. For 2000-page cache: 32KB wasted on link pointers alone.
+///   - Every ARC operation (insert, promote, evict) mutates linked list
+///     pointers scattered across heap — L1/L2 cache pollution.
+///   - CAR's clock hand sweep is a sequential scan over a dense array —
+///     the CPU prefetcher handles it. Hit rate is identical to ARC
+///     (proven in the FAST '04 paper).
+///   - Arc<CachedPage> indirection adds another pointer chase. Instead,
+///     use inline CachedPage in the clock array with a pinned flag.
+///     Pinned pages are simply skipped by the clock hand (not removed
+///     from the array, avoiding ABA problems).
+///
+/// The struct below is the LOGICAL specification. The physical layout uses
+/// clock buffers internally but exposes identical semantics.
 pub struct ArcCache {
     /// T1: pages accessed exactly once recently (recency-favored).
+    /// Physical: CircularClockBuffer<CachedPage> with reference bit.
     t1: LinkedHashMap<CacheKey, Arc<CachedPage>>,
     /// T2: pages accessed two or more times recently (frequency-favored).
+    /// Physical: CircularClockBuffer<CachedPage> with reference bit.
     t2: LinkedHashMap<CacheKey, Arc<CachedPage>>,
     /// B1: ghost entries evicted from T1 (metadata only, no page data).
     b1: LinkedHashSet<CacheKey>,
@@ -5390,6 +5508,9 @@ pub struct ArcCache {
     total_bytes: usize,
     /// Maximum bytes allowed (derived from PRAGMA cache_size).
     max_bytes: usize,
+    /// Lookup index: HashMap<CacheKey, SlotIdx> for O(1) cache probes.
+    /// SlotIdx encodes which clock (T1 or T2) and the array index.
+    index: HashMap<CacheKey, SlotIdx>,
 }
 ```
 
