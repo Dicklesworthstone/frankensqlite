@@ -58,8 +58,10 @@ Pseudocode and type definitions are normative unless explicitly labeled
 | **ObjectId** | Content-addressed identifier: `BLAKE3(canonical_encoding(object))`, 32 bytes. |
 | **CommitCapsule** | Atomic unit of commit state in Native mode: intent log, page deltas, SSI witnesses. |
 | **CommitMarker** | The durable "this commit exists" record: capsule ObjectId + prev-marker chain. |
+| **CommitSeq** | Monotonically increasing `u64` commit sequence number (global "commit clock" for ordering). |
 | **RaptorQ** | RFC 6330 fountain code: K source symbols → unlimited encoding symbols, recoverable from any K' ≈ K. |
 | **OTI** | Object Transmission Information. RaptorQ metadata needed for decoding: (F, Al, T, Z, N). |
+| **DecodeProof** | Auditable witness artifact produced by the RaptorQ decoder when repairing or failing to repair (lab/debug). |
 | **Cx** | Capability context (asupersync). Threads cancellation, deadlines, and capability narrowing through every operation. |
 | **PageNumber** | 1-based `NonZeroU32` identifying a database page. Page 1 is always the database header. |
 | **TxnId** | Monotonically increasing `u64` transaction identifier. `TxnId::ZERO` represents the on-disk baseline. |
@@ -70,6 +72,52 @@ Pseudocode and type definitions are normative unless explicitly labeled
 | **ARC** | Adaptive Replacement Cache. Balances recency and frequency for buffer pool eviction. |
 | **RootManifest** | Bootstrap object in ECS: maps logical database name → current committed state ObjectId. |
 | **TxnSlot** | Fixed-size shared-memory record for cross-process MVCC coordination. |
+| **DecodeProof** | Mathematical witness that a RaptorQ decode/repair operation produced the correct output. |
+| **VersionPointer** | Stable, content-addressed pointer from page index to patch object: `(commit_seq, patch_object: ObjectId, patch_kind, base_hint)`. |
+
+### 0.4 What "RaptorQ Everywhere" Means (No Weasel Words)
+
+RaptorQ is not an "optional replication feature." It is the default substrate
+for:
+
+- **Durability objects:** commit capsules, markers, checkpoints.
+- **Indexing objects:** index segments, locator segments, manifest segments.
+- **Replication traffic:** symbols, not files.
+- **Repair:** recover from partial loss/corruption by decoding, not by
+  panicking.
+- **History compression:** patch chains stored as coded objects, not infinite
+  full-page copies.
+
+If a subsystem persists or synchronizes bytes, it MUST specify how those bytes
+are represented as ECS objects and how they are repaired/replicated (see the
+RaptorQ Permeation Map in §3.5.7).
+
+## Table of Contents
+
+- 0. How to Read This Document
+- 1. Project Identity
+- 2. Why Page-Level MVCC
+- 3. RaptorQ: The Information-Theoretic Foundation
+- 4. Asupersync Deep Integration
+- 5. MVCC Formal Model (Revised)
+- 6. Buffer Pool: ARC Cache
+- 7. Checksums and Integrity
+- 8. Architecture: Crate Map and Dependencies
+- 9. Trait Hierarchy
+- 10. Query Pipeline
+- 11. File Format Compatibility
+- 12. SQL Coverage
+- 13. Built-in Functions
+- 14. Extensions
+- 15. Exclusions (What We Are NOT Building)
+- 16. Implementation Phases
+- 17. Testing Strategy
+- 18. Probabilistic Conflict Model
+- 19. C SQLite Behavioral Reference
+- 20. Key Reference Files
+- 21. Risk Register, Open Questions, and Future Work
+- 22. Verification Gates
+- 23. Summary: What Makes FrankenSQLite Alien
 
 ---
 
@@ -116,10 +164,19 @@ model rather than a silent corruption or a "panic and pray" failure mode.
 - **`unsafe_code = "forbid"`** -- no escape hatches
 - **Clippy pedantic + nursery at deny level** -- with specific documented allows
 - **23 crates** in workspace under `crates/`
-- **Release profile** (as configured in the workspace `Cargo.toml`): `opt-level = 3`,
+- **Release profile** (as configured in the workspace `Cargo.toml`): `opt-level = "z"`,
   `lto = true`, `codegen-units = 1`, `panic = "abort"`, `strip = true`
-  (This is a database engine, not a size-constrained CLI tool. Peak throughput
-  matters more than binary size.)
+  (Binary size optimization is the default. Performance is still monitored and
+  gated by benchmarks and profiling.)
+
+**Engineering & Process Constraints (from `AGENTS.md`):**
+- **User is in charge.** If the user overrides anything, follow the user.
+- **No file deletion** without explicit written permission.
+- **No destructive commands** (e.g. `rm -rf`, `git reset --hard`) without explicit confirmation.
+- **Branch:** `main` only.
+- **No script-based code transformations.** Manual edits only. Brittle regex scripts are forbidden.
+- **No file proliferation.** Revise existing files in place; do not create `_v2` or `_improved` variants.
+- **After substantive changes:** Run `cargo check/clippy/fmt` and tests. Use `br` for task tracking.
 
 ### 1.5 Mechanical Sympathy
 
@@ -153,6 +210,16 @@ patterns. The following constraints are non-negotiable for hot-path code:
 - **Prefetch hints.** B-tree descent SHOULD issue prefetch hints for child
   pages when the next page number is known (via `std::arch::x86_64::_mm_prefetch`
   behind a feature gate, with no-op fallback on other architectures).
+
+- **Avoid allocation in the read path.** Cache lookups, version checks, and
+  index resolution MUST be allocation-free in the common case. Hot-path
+  structures (e.g., active transaction sets) should use stack-allocated
+  small vectors (`SmallVec`) where possible.
+
+- **Exploit auto-vectorization.** GF(256) symbol ops and XOR patches should
+  operate on `u64`/`u128` chunks in safe Rust loops that LLVM can easily
+  vectorize. Use optimized dependencies (`xxhash-rust`, `asupersync`) for
+  heavy lifting rather than writing `unsafe` SIMD intrinsics manually.
 
 ---
 
@@ -286,6 +353,21 @@ of T octets. For FrankenSQLite, T = page_size (typically 4096 bytes), so a
 single source block can cover up to 56,403 pages, or approximately 220MB of
 database content. Larger databases are partitioned into multiple source blocks
    (see Section 3.4.3).
+
+### 3.1.1 Operational Guidance: Overhead and Failure Probability
+
+RaptorQ is "any K symbols suffice" in the *engineering* sense, but the decode
+success probability at exactly `K` is not literally 1. The point of repair
+symbols is to drive decode failure probability into the floor.
+
+**Rules of thumb (backed by RFC 6330):**
+- Decoding with **exactly K** received symbols rarely fails (~99% success).
+- Decoding with **K+1** symbols fails with probability < 10^-5.
+- Decoding with **K+2** symbols fails with probability < 10^-7.
+
+**V1 Default Policy:** Aim to persist/replicate enough symbols that a decoder
+can almost always collect **K+2** symbols without coordination. This eliminates
+the need for "just one more symbol" negotiation loops in the common case.
 
 ### 3.2 How RaptorQ Works (Essential Understanding)
 
@@ -965,12 +1047,15 @@ this via checksums and discards the frame, losing the transaction.
 WAL Commit (N pages):
   Source symbols:   [Page1_data | Page2_data | ... | PageN_data]
   Repair symbols:   R additional symbols (configurable redundancy)
-  Written to WAL:  N source frames + R repair frames
+  Written to disk:
+    - `.wal`: N standard SQLite WAL frames (source symbols)
+    - `.wal-fec`: R repair symbols + group metadata (sidecar)
 
 Recovery:
   If any frames are torn/corrupted (detected by checksum):
-    Collect surviving frames (source + repair)
-    If |surviving| >= N: RaptorQ-decode to recover ALL source pages
+    Collect surviving source frames from `.wal`
+    Collect repair symbols from `.wal-fec` for that commit group
+    If |surviving_sources| + |repairs| >= N: RaptorQ-decode to recover missing source pages
     Else: transaction is truly lost (requires catastrophic multi-frame loss)
 ```
 
@@ -983,19 +1068,49 @@ Instead, we use a **sidecar file** (`.wal-fec`) to store repair symbols.
 **The `.wal` file:** Contains ONLY standard, valid SQLite WAL frames (source symbols).
 **The `.wal-fec` file:** Contains repair symbols and metadata for each commit group.
 
-**Sidecar (`.wal-fec`) Record Format:**
+**Sidecar (`.wal-fec`) Object Model and Format**
+
+We treat each committed SQLite WAL transaction (the set of frames up to the
+commit frame with `db_size != 0`) as a compat ECS object:
+
+- **Object type:** `CompatWalCommitGroup`
+- **Source symbols (K):** the ordered list of page images written by the group
+  (taken from `.wal` frames, not duplicated into `.wal-fec`)
+- **Repair symbols (R):** `PRAGMA raptorq_repair_symbols` repair symbols, stored
+  in `.wal-fec`
+
+Each group has a stable identifier:
 
 ```
-FecRecord {
-    group_id: u64,          // Stable ID for the commit group (e.g., salt + end_offset)
-    k_source: u16,          // Number of source pages in this group
-    r_repair: u16,          // Number of repair symbols stored here
-    symbol_size: u16,       // T (usually page_size)
-    page_numbers: [u32; K], // Ordered list of pgnos in this commit
-    repair_data: [u8; R*T], // Concatenated repair symbols
-    checksum: u64,          // Integrity check for the FEC record
+group_id := (wal_salt1, wal_salt2, end_frame_no)
+```
+
+The `.wal-fec` file is an append-only sequence of:
+
+1. A `WalFecGroupMeta` record (variable length; length-prefixed)
+2. `R` ECS `SymbolRecord`s (Section 3.5.2) for ESIs `K..K+R-1`
+
+```
+WalFecGroupMeta := {
+    magic          : [u8; 8],    // "FSQLWFEC"
+    version        : u32,        // 1
+    wal_salt1      : u32,
+    wal_salt2      : u32,
+    start_frame_no : u32,        // inclusive, 1-based frame numbering within the WAL
+    end_frame_no   : u32,        // inclusive; commit frame
+    page_size      : u32,
+    k_source       : u32,        // K
+    r_repair       : u32,        // R
+    oti            : OTI,        // decoding params (symbol size, block partitioning)
+    object_id      : [u8; 32],   // ObjectId of CompatWalCommitGroup (content-addressed)
+    page_numbers   : Vec<u32>,   // length = K; maps ISI 0..K-1 -> Pgno
+    checksum       : u64,        // xxh3_64 of all preceding fields
 }
 ```
+
+**Write ordering:** `.wal-fec` is written before the commit reports durable.
+If `.wal-fec` is missing/incomplete for a group, recovery degrades to SQLite:
+detect corruption and truncate at the last valid commit boundary.
 
 **Worked Example: Commit of 5 Pages with 2 Repair Symbols**
 
@@ -1008,10 +1123,11 @@ Transaction writes pages 7, 12, 45, 100, 203. `PRAGMA raptorq_repair_symbols = 2
 
 2.  **Write to `.wal-fec`:**
     - Generate 2 repair symbols from the 5 pages.
-    - Append one `FecRecord` to `.wal-fec` containing:
-        - `k_source`=5, `r_repair`=2
-        - `page_numbers`=[7, 12, 45, 100, 203]
-        - `repair_data`=[8192 bytes of repair data]
+    - Append one `WalFecGroupMeta` record describing the group:
+        - `group_id=(salt1, salt2, end_frame_no)`
+        - `k_source=5`, `r_repair=2`
+        - `page_numbers=[7, 12, 45, 100, 203]`
+    - Append two ECS `SymbolRecord`s (Section 3.5.2) for repair ESIs 5 and 6.
     - This happens *before* the `.wal` fsync.
 
 3.  **Commit:** `fsync` both files.
@@ -1021,8 +1137,8 @@ Transaction writes pages 7, 12, 45, 100, 203. `PRAGMA raptorq_repair_symbols = 2
 On recovery, we scan the `.wal` file. If we encounter a torn write (invalid checksum):
 
 1.  Identify the damaged commit group in the `.wal`.
-2.  Locate the corresponding `FecRecord` in `.wal-fec` (matching offset/salt).
-3.  Collect valid source frames from `.wal` and repair symbols from `.wal-fec`.
+2.  Locate the corresponding `WalFecGroupMeta` in `.wal-fec` (matching `group_id`).
+3.  Collect valid source frames from `.wal` and repair `SymbolRecord`s from `.wal-fec`.
 4.  If `valid_sources + valid_repairs >= K`:
     - Decode to recover missing/corrupted source pages.
     - Treat recovered pages as if they were successfully read from the WAL.
@@ -1036,7 +1152,7 @@ PRAGMA raptorq_repair_symbols;          -- Query current value (default: 2)
 PRAGMA raptorq_repair_symbols = N;      -- Set to N (0 disables, max 255)
 ```
 
-- N = 0: Exact C SQLite behavior. No repair frames written. No recovery
+- N = 0: Exact C SQLite behavior. No `.wal-fec` repair symbols written. No recovery
   from torn writes beyond what the checksum chain provides.
 - N = 1: Tolerates 1 corrupted frame per commit group. Recommended minimum
   for production use. Overhead: 1/K additional WAL space per commit.
@@ -1874,6 +1990,99 @@ This transforms the database file from "one bit flip = SQLITE_CORRUPT" to
 self-healing WAL, this creates defense in depth where data corruption
 becomes a mathematical near-impossibility.
 
+#### 3.4.7 Replication Architecture (ECS-Native, Symbol-Native)
+
+The low-level transport mechanics are specified in §3.4.2 (fountain-coded
+replication) and §3.4.3 (snapshot shipping). This section specifies the
+high-level replication architecture: roles, modes, routing, convergence,
+durability guarantees, and security.
+
+**Replication Roles and Modes:**
+
+We define two modes:
+
+1. **Leader commit clock (V1 default):** One node publishes the authoritative
+   marker stream. Other nodes replicate objects + markers and serve reads.
+   Writers can still be concurrent within the leader (MVCC). This keeps
+   semantics sharp and testable.
+2. **Multi-writer (experimental):** Multiple nodes publish capsules. Marker
+   stream ordering becomes a distributed problem (not V1 default). Requires
+   distributed consensus integration (see §21.4).
+
+**What We Replicate (Object Classes):**
+
+We replicate ECS objects, not files:
+- `CommitCapsule` objects (and patch objects they reference).
+- `CommitMarker` records (the commit clock).
+- `IndexSegment` objects (page version, object locator, manifest).
+- `CheckpointChunk` and `SnapshotManifest` objects.
+- Optionally: `DecodeProof` / audit traces for debugging.
+
+**Transport Substrate (asupersync):**
+
+We build replication on:
+- `asupersync::transport::{SymbolSink, SymbolStream, SymbolRouter,
+  MultipathAggregator, SymbolDeduplicator, SymbolReorderer}`
+- `asupersync::transport::mock::SimNetwork` for tests.
+- `asupersync::security::{SecurityContext, AuthenticatedSymbol}` for
+  security.
+
+**Symbol Routing: Consistent Hashing + Policies:**
+
+We assign **symbols** to nodes, not objects:
+- Encode object into `K_total` source symbols + `R` repair symbols.
+- Assign each symbol to one or more nodes via
+  `asupersync::distributed::consistent_hash`.
+- Replication factor and `R` determine node-loss tolerance, loss tolerance,
+  and catch-up rate.
+
+**Anti-Entropy Loop (Convergence Protocol):**
+
+Replication MUST converge even if nodes are offline. The anti-entropy loop:
+
+1. **Exchange tips:** Latest `RootManifest` ObjectId, latest marker stream
+   position, optional index segment tips.
+2. **Compute missing:** ObjectId set difference via manifests/index summaries.
+3. **Request symbols:** For missing objects.
+4. **Stream until decode:** Send symbols until the receiver reports completion
+   (typically around `K_total + ε` symbols). Stop early.
+5. **Persist and update:** Decoded objects persisted locally; caches refreshed.
+
+Because objects are fountain-coded, a requester can ask for "any symbols for
+object X" without tracking which ESIs it already has. The responder sends
+whatever is convenient (source first, then repairs).
+
+**Quorum Durability (Commit-Time Policy):**
+
+Commit can be declared durable only after a quorum of symbol stores have
+accepted enough symbols. We reuse asupersync quorum semantics
+(`asupersync::combinator::quorum`):
+
+- Local-only: `quorum(1, [local_store])`
+- 2-of-3: `quorum(2, [storeA, storeB, storeC])`
+
+Integrated into the commit protocol: the marker is not published until the
+durability policy's quorum reports satisfaction.
+
+**Consistency Checking (Sheaf + TLA+ Export):**
+
+We treat distributed correctness as first-class:
+- **Sheaf check:** `asupersync::trace::distributed::sheaf` detects anomalies
+  that pairwise comparisons miss (phantom global commits that no single node
+  witnessed end-to-end).
+- **TLA+ export:** `asupersync::trace::tla_export` exports traces into TLA+
+  behaviors for model checking of bounded scenarios (commit, replication,
+  recovery).
+
+**Security (Authenticated Symbols):**
+
+Replication MAY be secured by enabling an
+`asupersync::security::SecurityContext`:
+- Symbols become `AuthenticatedSymbol`.
+- Receivers verify tags before accepting symbols.
+- Unauthenticated/corrupted symbols are ignored (repair handles loss).
+- Security is orthogonal: it does not change ECS semantics.
+
 ### 3.5 ECS: The Erasure-Coded Stream Substrate
 
 ECS is the universal persistence layer for Native mode. Every durable object
@@ -1963,22 +2172,22 @@ overhead tolerates ~20% symbol loss.
 
 #### 3.5.4 Local Physical Layout (Native Mode)
 
-In Native mode, the database directory has the following layout:
+In Native mode, the database directory has the following layout, optimized for
+sequential write throughput (log-structured):
 
 ```
 foo.db.fsqlite/
 ├── ecs/
-│   ├── objects/          -- symbol records, organized by ObjectId prefix
-│   │   ├── 00/           -- first byte of ObjectId
-│   │   │   ├── 00a1b2...rec  -- symbol records for this object
-│   │   │   └── 00c3d4...rec
-│   │   ├── 01/
-│   │   │   └── ...
-│   │   └── ff/
-│   ├── commit_stream/    -- append-only sequence of CommitMarker records
-│   │   └── stream.log    -- CommitMarkers in commit_seq order
-│   └── manifest.root     -- RootManifest (tiny, mutable, the ONE mutable thing)
+│   ├── root              -- tiny mutable pointer file (atomic update)
+│   │                     -- contains: [latest_manifest_object_id (16B) | checksum (8B)]
+│   ├── symbols/          -- append-only symbol record logs
+│   │   ├── segment-000000.log
+│   │   ├── segment-000001.log
+│   │   └── ...
+│   └── markers/          -- append-only commit marker stream
+│       └── segment-000000.log
 ├── cache/                -- rebuildable derived state (NOT source of truth)
+│   ├── object_locator.cache -- map ObjectId -> (SegmentId, Offset)
 │   ├── btree.cache       -- materialized B-tree pages (hot set)
 │   ├── index.cache       -- secondary index pages
 │   └── schema.cache      -- parsed schema
@@ -1990,14 +2199,16 @@ foo.db.fsqlite/
 **Key invariants:**
 - `ecs/` is the source of truth. Everything in `cache/` is rebuildable from
   `ecs/`. Deleting `cache/` is always safe (costs a rebuild).
+- `ecs/symbols/*.log` are immutable once rotated.
+- `ecs/root` is the **ONLY** mutable file in the ECS directory. It is updated
+  atomically via `write-to-temp` + `rename`.
 - `compat/` is an export target for compatibility mode. It is NOT the source
   of truth in Native mode.
-- `manifest.root` is the ONLY mutable file. It is a single `RootManifest`
-  record, updated atomically (write-to-temp + rename).
 
 #### 3.5.5 RootManifest: Bootstrap
 
-The RootManifest is the bootstrap entry point for the entire database:
+The RootManifest is the bootstrap entry point, stored as a standard ECS object.
+The `ecs/root` file points to it.
 
 ```
 RootManifest := {
@@ -2016,15 +2227,17 @@ RootManifest := {
 ```
 
 **Bootstrap sequence:**
-1. Read `manifest.root`. Verify magic and checksum.
-2. Fetch `current_commit` → walk CommitMarker chain to find committed state.
-3. Fetch `schema_snapshot` → reconstruct schema cache.
-4. Fetch `checkpoint_base` → populate B-tree page cache for hot pages.
-5. Database is open and ready for queries.
+1. Read `ecs/root`. Verify checksum. Get `manifest_object_id`.
+2. Fetch `RootManifest` object from symbol logs (using `object_locator.cache` or scan).
+3. Decode `RootManifest`.
+4. Fetch `current_commit` → walk CommitMarker chain to find committed state.
+5. Fetch `schema_snapshot` → reconstruct schema cache.
+6. Fetch `checkpoint_base` → populate B-tree page cache for hot pages.
+7. Database is open and ready for queries.
 
-If `manifest.root` is corrupted, the database can be rebuilt by scanning
-`ecs/commit_stream/stream.log` and replaying CommitMarkers from the
-beginning. This is O(commit history) but always works.
+If `ecs/root` is corrupted (missing or invalid checksum), the database can be
+recovered by scanning `ecs/markers/*.log` to find the latest valid CommitMarker,
+or `ecs/symbols/*.log` to find the latest RootManifest symbol.
 
 #### 3.5.6 Inter-Object Coding (Replication Optimization)
 
@@ -2087,6 +2300,10 @@ policy (K/R), and repair story.
 | Schedule exploration | `LabRuntime` deterministic trace | Reproducible concurrency bugs from a single seed |
 | Invariant monitoring | e-process monitors | MVCC invariants, memory bounds, replication divergence |
 | Model checking | `TLA+ export` of traces | Bounded model checking of commit/replication/recovery |
+
+**Wild but aligned experiments (encouraged, feature-gated):**
+- **Symbol-level RAID on a single machine:** Distribute symbols across multiple local devices/paths; any `K` reconstructs. RAID-like redundancy without strict striping constraints.
+- **Integrity sweeps as information theory:** Periodically sample symbols and attempt partial decodes; use e-process monitors to detect elevated corruption rates early (before data loss becomes possible).
 
 **Rule:** If a new feature persists bytes or ships bytes, it MUST declare its
 ECS object type, symbol policy, and repair story before implementation begins.
