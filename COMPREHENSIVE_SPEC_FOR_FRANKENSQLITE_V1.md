@@ -11021,16 +11021,18 @@ INSERT INTO table VALUES (?, ?)
 
 **UPDATE -> VDBE opcodes:**
 ```
-UPDATE table SET col = ? WHERE rowid = ?
+-- Schema: CREATE TABLE t(a, b)
+UPDATE t SET b = ? WHERE rowid = ?
   Init       0, <end>
   Transaction 0, 1           # begin write transaction
-  Variable   1, 1            # bind new value -> r1
+  Variable   1, 1            # bind new value for b -> r1
   Variable   2, 2            # bind rowid -> r2
-  OpenWrite  0, <root>, 0    # open cursor 0 for writing
+  OpenWrite  0, <root>, 2    # open cursor 0 for writing (2 columns)
   NotExists  0, <done>, 2    # if rowid r2 not found, skip
-  Column     0, 0, 3         # read existing col0 into r3 (if needed for index updates)
-  MakeRecord 1, 1, 4         # pack r1 into new record r4
-  Insert     0, 4, 2, REPLACE  # overwrite record at rowid r2 with r4
+  Column     0, 0, 3         # read existing col a into r3
+  Copy       1, 4            # new col b value (from r1) into r4
+  MakeRecord 3, 2, 5         # pack r3..r4 (ALL columns) into record r5
+  Insert     0, 5, 2, REPLACE  # overwrite record at rowid r2 with r5
   <done>:
   Close      0
   Halt       0, 0
