@@ -1204,6 +1204,14 @@ WalFecGroupMeta := {
 }
 ```
 
+**WalFecGroupMeta invariants (normative):**
+- `k_source == end_frame_no - start_frame_no + 1`
+- `page_numbers.len() == k_source`
+- `source_page_xxh3.len() == k_source`
+- `end_frame_no` is the group's commit frame (the corresponding WAL frame has
+  `db_size != 0` when fully intact), and `db_size_pages` MUST equal that commit
+  frame's `db_size` field.
+
 **Write ordering and semantics (normative):**
 
 - **Durable (SQLite semantics):** a commit is durable once the `.wal` frames for
@@ -8044,7 +8052,7 @@ rebase replay:
    - **CHECK** constraints for the target table (a CHECK that evaluates to
      false fails; true or NULL passes, per SQLite semantics).
    If any constraint fails, rebase MUST abort (true conflict/violation).
-6. **Index regeneration (critical):** Any `IndexDelete`/`IndexInsert` ops in the
+7. **Index regeneration (critical):** Any `IndexDelete`/`IndexInsert` ops in the
    original intent log that are associated with this `UpdateExpression` (same
    `table`, same `rowid`) carry stale key bytes derived from the original snapshot
    and MUST be discarded during rebase. Instead, the rebase engine MUST regenerate
