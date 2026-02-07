@@ -2136,10 +2136,12 @@ We treat distributed correctness as first-class:
 
 Replication MAY be secured by enabling an
 `asupersync::security::SecurityContext`:
-- Symbols become `AuthenticatedSymbol`.
-- Receivers verify tags before accepting symbols.
+- Writers attach `auth_tag` to `SymbolRecord`s (see §3.5.2) using epoch-scoped keys
+  (§4.18.2).
+- Receivers verify tags before accepting symbols for decoding.
 - Unauthenticated/corrupted symbols are ignored (repair handles loss).
-- Security is orthogonal: it does not change ECS semantics.
+- Security is orthogonal: it does not change ECS semantics; it only rejects
+  unauthenticated bytes before they can influence decoding.
 
 ### 3.5 ECS: The Erasure-Coded Stream Substrate
 
@@ -10173,16 +10175,22 @@ walks outward.
 
 ### 10.5 Query Planning
 
-**Cost model:** The planner estimates the I/O cost (in page reads) for each
-access path.
+**Cost model:** The planner estimates cost for each access path, primarily
+in page reads. When `ANALYZE` statistics are available (`sqlite_stat1`,
+`sqlite_stat4`), the planner uses actual row counts and distribution data;
+otherwise it falls back to heuristic estimates.
 
 ```
 Full table scan:              cost = N_pages(table)
 Index scan (range):           cost = log2(N_pages(index)) + selectivity * N_pages(table)
 Index scan (equality):        cost = log2(N_pages(index)) + 1
-Covering index scan:          cost = selectivity * N_pages(index)
+Covering index scan:          cost = log2(N_pages(index)) + selectivity * N_pages(index)
 Rowid lookup:                 cost = log2(N_pages(table))
 ```
+
+Note: These are simplified cost formulas for initial implementation. C SQLite's
+cost model is more nuanced, incorporating CPU cost estimates and per-row lookup
+cost for non-covering index scans.
 
 **Index usability:** For each WHERE term, the planner determines if an index
 can satisfy it:
