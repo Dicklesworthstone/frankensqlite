@@ -1713,195 +1713,97 @@ only a portion of the page.
 
 #### 3.4.5 Algebraic Write Merging Over GF(256)
 
-**Problem:** When two transactions write different byte ranges of the same page,
-standard MVCC must abort one (page-level conflict). But if the modifications
-don't overlap, aborting is wasteful.
+This section is about the **byte algebra** that underlies patch encodings.
+It is *not* a license to merge arbitrary structured SQLite pages by checking
+"byte-disjointness".
 
-**Solution:** Exploit GF(256) linearity for non-overlapping modifications:
+**Goal:** Reduce aborts from page-granularity first-committer-wins (FCW) when
+two transactions perform *logically commuting* operations that nevertheless
+touch the same page (see §5.10).
 
+**Critical distinction (normative):**
+
+- **Byte algebra:** Pages are byte vectors; XOR-deltas compose linearly.
+- **SQLite page semantics:** Many page types are **self-referential** (internal
+  pointers, variable layout, derived metadata). A change to one byte range can
+  change the *meaning* of bytes in a different range without touching them.
+  Therefore, byte-disjointness is not a sufficient merge condition.
+
+##### Lemma (Disjoint-Delta Byte Composition)
+
+Let a page be a vector `P ∈ GF(2)^n` (bit vector). Let `P0` be the page at a
+transaction's snapshot point. Two transactions produce:
+
+- `P1 = P0 ⊕ D1` where `D1 = P1 ⊕ P0`
+- `P2 = P0 ⊕ D2` where `D2 = P2 ⊕ P0`
+
+Define support:
 ```
-Page P (original): [AAAA|BBBB|CCCC|DDDD]
-T1 modifies bytes 0-3:  [XXXX|BBBB|CCCC|DDDD]
-T2 modifies bytes 8-11: [AAAA|BBBB|YYYY|DDDD]
-
-Traditional MVCC: One must abort.
-
-Algebraic merge:
-  delta_T1 = T1_page XOR original = [XXXX^AAAA|0000|0000|0000]
-  delta_T2 = T2_page XOR original = [0000|0000|YYYY^CCCC|0000]
-  merged = original XOR delta_T1 XOR delta_T2
-         = [XXXX|BBBB|YYYY|DDDD]
-
-This is valid because XOR is GF(2) addition, and the deltas have
-disjoint support (non-overlapping non-zero regions).
-```
-
-**Complete Mathematical Formalization in GF(2)**
-
-Let page P be a vector in GF(2)^n where n = page_size * 8 (the page
-represented as a bit vector). Let P_0 be the original page at the
-snapshot point.
-
-Transaction T1 produces page P_1 = P_0 + D_1, where D_1 = P_1 XOR P_0
-is the delta (in GF(2) vector addition = XOR).
-
-Transaction T2 produces page P_2 = P_0 + D_2, where D_2 = P_2 XOR P_0.
-
-Define the **support** of a delta vector:
-```
-supp(D) = { i : D[i] != 0 } = { bit positions where D is non-zero }
+supp(D) = { i : D[i] != 0 }   // bit positions where D is non-zero
 ```
 
-**Theorem (Correctness of Algebraic Merge):**
-If supp(D_1) and supp(D_2) are disjoint (supp(D_1) intersection supp(D_2) = empty set),
-then the merged page:
+If `supp(D1) ∩ supp(D2) = ∅`, then:
 ```
-P_merged = P_0 + D_1 + D_2 = P_0 XOR D_1 XOR D_2
+Pmerge = P0 ⊕ D1 ⊕ D2
 ```
-is the unique page that incorporates both T1's changes and T2's changes,
-and agrees with P_0 on all bytes that neither transaction modified.
+is the unique byte vector that equals `P1` on `supp(D1)`, equals `P2` on
+`supp(D2)`, and equals `P0` elsewhere.
 
-**Proof:**
+This lemma is **purely about vectors**. It does not imply semantic correctness
+for structured pages.
 
-For any bit position i:
-- Case 1: i not in supp(D_1) and i not in supp(D_2).
-  Then D_1[i] = D_2[i] = 0, so P_merged[i] = P_0[i] + 0 + 0 = P_0[i].
-  The merged page preserves the original value. Correct.
+##### Counterexample (Lost Update on B-tree Pages)
 
-- Case 2: i in supp(D_1) and i not in supp(D_2).
-  Then D_2[i] = 0, so P_merged[i] = P_0[i] + D_1[i] + 0 = P_1[i].
-  The merged page has T1's value. Correct.
+SQLite B-tree pages contain internal pointers (cell pointer array offsets,
+freeblock list links) and are routinely **defragmented**, which moves cells and
+updates pointers.
 
-- Case 3: i not in supp(D_1) and i in supp(D_2).
-  Then D_1[i] = 0, so P_merged[i] = P_0[i] + 0 + D_2[i] = P_2[i].
-  The merged page has T2's value. Correct.
+Consider two transactions that start from the same snapshot `P0`:
 
-- Case 4: i in supp(D_1) and i in supp(D_2).
-  This case cannot occur because the supports are disjoint.
+1. `T1` moves a cell from offset `X` to offset `Y` (defragmentation or balance):
+   it updates the pointer entry to `Y`, and writes the cell bytes at `Y`.
+2. `T2` updates the same logical cell's payload bytes at the *old* offset `X`.
 
-Therefore P_merged = P_0 + D_1 + D_2 is correct for all bit positions. QED.
+It is possible for `supp(D1)` and `supp(D2)` to be disjoint if `T1` does not
+overwrite `X` (leaves stale bytes or a freeblock). A naive XOR merge produces:
 
-**Corollary (Byte-Level Sufficiency):**
-Since page data is byte-addressed and all modifications are byte-aligned
-(SQLite never modifies individual bits within a byte), it suffices to check
-disjointness at byte granularity rather than bit granularity. Define:
+- pointer now references `Y` (from `T1`)
+- cell at `Y` contains the **old** payload copied by `T1` from `P0`
+- updated payload written by `T2` remains at `X`, now unreachable garbage
 
-```
-byte_supp(D) = { j : D[j*8..(j+1)*8] != 0x00 } = { byte positions where D is non-zero }
-```
+The merged page can satisfy all structural invariants (ordering, free space,
+checksums) while still being **logically wrong** (a real lost update).
 
-If byte_supp(D_1) intersection byte_supp(D_2) = empty set, then
-supp(D_1) intersection supp(D_2) = empty set, and the merge is valid.
+##### Normative Rule (Merge Safety)
 
-**Proof of Correctness for Non-Overlapping Modifications**
+1. **Raw byte-disjoint XOR merge MUST NOT be used to accept a commit for any
+   SQLite file-format page kind whose semantics include internal pointers or
+   variable layout.** This includes (at minimum) all B-tree pages, overflow
+   pages, freelist pages, and pointer-map pages.
+2. For such pages, a merge is only permitted when the engine can justify
+   semantic correctness by construction:
+   - deterministic rebase via intent replay (§5.10.2), and/or
+   - structured page patch merge keyed by stable identifiers (§5.10.3),
+     with post-merge invariant checks and proof artifacts (§5.10.5).
+3. XOR/`GF(256)` deltas remain useful as an **encoding** of patches and for
+   history compression. They are not a correctness criterion.
 
-The merge operation P_merged = P_0 XOR D_1 XOR D_2 is:
-1. **Associative**: (P_0 XOR D_1) XOR D_2 = P_0 XOR (D_1 XOR D_2). Order
-   of applying deltas does not matter.
-2. **Commutative**: D_1 XOR D_2 = D_2 XOR D_1. T1 and T2's changes can be
-   applied in either order.
-3. **Idempotent (self-inverse)**: Applying the same delta twice cancels out
-   (D XOR D = 0). This means the merge is reversible.
-4. **Extends to N transactions**: For N transactions with pairwise disjoint
-   byte supports, P_merged = P_0 XOR D_1 XOR D_2 XOR ... XOR D_N.
+##### Configuration: Write-Merge Policy (PRAGMA)
 
-**Byte-Level Conflict Detection Algorithm**
+Write-merge behavior is controlled by:
 
 ```
-can_algebraic_merge(
-    T1: &Transaction,
-    page_T2_committed: &PageData,
-    pgno: PageNumber,
-    original: &PageData,
-) -> bool:
-    let page_T1 = T1.write_set[pgno].data
-    let page_T2 = page_T2_committed
-
-    // Compute byte-level deltas
-    let delta_T1 = xor_pages(page_T1, original)     // 4096 bytes
-    let delta_T2 = xor_pages(page_T2, original)      // 4096 bytes
-
-    // Check for overlapping non-zero bytes
-    // This is SIMD-friendly: AND the deltas and check for any non-zero result
-    for i in (0..page_size).step_by(8):
-        let d1 = u64::from_le_bytes(delta_T1[i..i+8])
-        let d2 = u64::from_le_bytes(delta_T2[i..i+8])
-        // If both deltas have non-zero bits in the same u64 word,
-        // check byte-level overlap
-        if d1 != 0 && d2 != 0:
-            // Check each byte within this 8-byte word
-            for j in 0..8:
-                if delta_T1[i+j] != 0 && delta_T2[i+j] != 0:
-                    return false    // Byte-level conflict detected!
-    return true    // No overlap, merge is safe
-
-perform_algebraic_merge(
-    T1: &mut Transaction,
-    page_T2_committed: &PageData,
-    pgno: PageNumber,
-    original: &PageData,
-):
-    let page_T1 = T1.write_set[pgno].data
-    let page_T2 = page_T2_committed
-
-    // Compute deltas
-    let delta_T1 = xor_pages(page_T1, original)
-    let delta_T2 = xor_pages(page_T2, original)
-
-    // Merge: original XOR delta_T1 XOR delta_T2
-    // Equivalently: page_T1 XOR delta_T2  (since page_T1 = original XOR delta_T1)
-    let merged = xor_pages(page_T1, delta_T2)
-
-    // Update T1's write set with the merged page
-    T1.write_set[pgno].data = merged
+PRAGMA fsqlite.write_merge = OFF | SAFE | LAB_UNSAFE;
 ```
 
-**Performance Analysis: When Merging Saves vs Just Aborting**
-
-The algebraic merge check has a cost:
-
-```
-Cost of merge check:
-    - Compute delta_T1: page_size / 8 = 512 XOR operations (u64)
-    - Compute delta_T2: 512 XOR operations
-    - Check overlap: 512 AND + compare operations (worst case)
-    - Total: ~1536 u64 operations = ~192 cycles on modern CPU
-    - Wall time: ~50 nanoseconds
-
-Cost of successful merge:
-    - Merge check: ~50 ns
-    - Compute merged page: 512 XOR operations = ~64 cycles = ~20 ns
-    - Total: ~70 nanoseconds
-
-Cost of abort + retry:
-    - Abort current transaction: release locks, discard write set (~1 microsecond)
-    - Application-level retry: re-execute entire transaction (~100 microseconds to ~10 ms)
-    - Total: 100x to 100,000x more expensive than merge
-```
-
-Therefore, algebraic merging is always worth attempting when a page-level
-conflict is detected. The merge check is so cheap (50ns) that even if it
-fails 99% of the time, the 1% of successful merges easily justify the cost.
-
-In practice, for B-tree workloads:
-- Interior page conflicts (two child pointers updated): ~70% mergeable
-  (different child pointers in different regions of the page)
-- Leaf page conflicts (two rows in same page): ~40% mergeable
-  (depends on whether the cells are in different regions)
-- Overall false conflict reduction: estimated 30-50% of page-level
-  conflicts are resolved by algebraic merging
-
-**Detection:** At commit validation, if a page conflict is detected, check
-whether the two write sets have disjoint byte-level modifications. If yes,
-merge algebraically instead of aborting. This turns page-level conflicts
-into byte-level conflicts, dramatically reducing false aborts.
-
-**Caveat:** This only works for truly independent modifications. If both
-transactions read the overlapping region before writing, write skew applies
-and the merge may be incorrect. The SSI layer (Section 2.4, Layer 2) catches
-this: rw-antidependency tracking detects the read-before-write pattern and
-aborts the transaction that would produce an anomaly. Algebraic merging is
-gated behind a PRAGMA: `PRAGMA raptorq_write_merge = ON`.
+- `OFF`: FCW conflicts abort/retry (no merge attempts).
+- `SAFE` (default for `BEGIN CONCURRENT`): enable §5.10 merges that are justified
+  semantically (rebase + structured patches). Raw XOR merge is forbidden for
+  structured SQLite pages.
+- `LAB_UNSAFE`: permits additional *debug-only* merge experiments (e.g., raw XOR
+  merges on explicitly-declared opaque pages). This mode MUST be rejected in
+  release builds and MUST never enable raw XOR merging for B-tree/overflow/
+  freelist/pointer-map pages.
 
 #### 3.4.6 Erasure-Coded Page Storage
 
@@ -2307,25 +2209,50 @@ The repair symbol budget is controlled per-object-type:
 PRAGMA raptorq_overhead = <percent>    -- default: 20%
 ```
 
-This means: for `K_source` source symbols, budget
-`R = ceil(K_source * overhead_percent / 100)` deterministic repair symbols.
+This means: for `K_source` source symbols, budget deterministic repair symbols:
+
+```
+slack_decode = 2  // V1 default: target K_source+2 decode slack (RFC 6330 Annex B)
+R = max(slack_decode, ceil(K_source * overhead_percent / 100))
+```
+
+The additive `slack_decode` is not "extra safety for erasures"; it is there to
+drive RaptorQ's *exactly-K* decode failure probability into the floor. The
+multiplicative term is the erasure/corruption budget.
 
 **Important:** There are two distinct "overheads":
 - **Decode slack (additive):** the number of *extra* symbols beyond `K_source`
   needed to make decode failure probability negligible (V1 targets `K_source+2`
   per RFC 6330 Annex B; see §3.1.1).
 - **Loss budget (multiplicative):** how many symbols we can afford to lose to
-  erasures/corruption and still collect `K_source + slack` survivors.
+  erasures/corruption and still collect `K_source + slack_decode` survivors.
 
 Therefore the tolerated erasure fraction without coordination is approximately:
 
 ```
-loss_fraction_max ≈ max(0, (R - slack) / (K_source + R))
+loss_fraction_max ≈ max(0, (R - slack_decode) / (K_source + R))
 ```
 
 and for large `K_source` it approaches `R/(K_source+R) ≈ overhead/(100+overhead)`.
 Small objects (small `K_source`) are dominated by the additive slack; the
 implementation MUST clamp policies to avoid under-provisioning.
+
+**Adaptive overhead (alien-artifact, optional but recommended):**
+
+The engine MAY auto-tune `PRAGMA raptorq_overhead` using anytime-valid evidence:
+
+- Maintain an e-process monitor on symbol survival/corruption (Section 4.3).
+- If evidence suggests the symbol erasure rate exceeds the assumed budget,
+  increase `overhead_percent` (and thus `R`) until the derived `loss_fraction_max`
+  clears the new budget with margin.
+- If evidence suggests the erasure rate is far below budget for a sustained
+  period, the engine MAY decrease `overhead_percent` to reduce space/write
+  amplification, but only under a conservative loss matrix where the cost of a
+  false decrease (future data loss risk) dwarfs the benefit of saved bytes.
+
+Every automatic retune MUST emit an evidence ledger: the prior/assumed budget,
+the observed e-value trajectory, the chosen new overhead, and the implied
+`loss_fraction_max` bound.
 
 #### 3.5.4 Local Physical Layout (Native Mode)
 
@@ -2362,6 +2289,83 @@ foo.db.fsqlite/
 - `compat/` is an export target for compatibility mode. It is NOT the source
   of truth in Native mode.
 
+#### 3.5.4.1 Commit Marker Stream Format (Random-Access, Auditable)
+
+The CommitMarker stream under `ecs/markers/` is the **total order** of commits.
+It MUST be:
+
+- append-only,
+- record-aligned (fixed-size records),
+- seekable by `commit_seq` in O(1),
+- auditable (tamper-evident hash chain).
+
+**Marker segment file:**
+
+`ecs/markers/segment-XXXXXX.log` stores a contiguous range of markers. Each file
+starts with a header, followed by a dense array of fixed-size records.
+
+```
+MarkerSegmentHeader := {
+  magic           : [u8; 4],    -- "FSMK"
+  version         : u32,        -- 1
+  segment_id      : u64,        -- monotonic identifier (matches filename)
+  start_commit_seq: u64,        -- first commit_seq stored in this segment
+  record_size     : u32,        -- bytes per CommitMarkerRecord (constant in V1)
+  header_xxh3     : u64,        -- xxhash3 of all preceding header fields
+}
+
+CommitMarkerRecord := {
+  commit_seq         : u64,
+  commit_time_unix_ns: u64,
+  capsule_object_id  : [u8; 16],
+  proof_object_id    : [u8; 16],
+  prev_marker_id     : [u8; 16],  -- 0 for genesis
+  marker_id          : [u8; 16],  -- BLAKE3_128 of all preceding fields in this record
+  record_xxh3        : u64,       -- xxhash3 of all preceding fields in this record
+}
+```
+
+`marker_id` is both:
+- the marker's integrity hash (tamper-evident), and
+- an `ObjectId`-compatible identifier (128-bit BLAKE3) suitable for use in
+  `RootManifest.current_commit` and `CommitMarker.prev_marker`.
+
+**O(1) seek by commit_seq (normative):**
+
+Given a target `commit_seq`, the reader locates the segment containing it
+(by either scanning segment headers, or using a fixed rotation policy).
+
+**Fixed rotation policy (recommended):**
+
+- `markers_per_segment` is a constant (default: 1,000,000).
+- `segment_id := commit_seq / markers_per_segment`.
+- `start_commit_seq := segment_id * markers_per_segment`.
+
+Then compute:
+
+```
+offset = sizeof(MarkerSegmentHeader)
+       + (commit_seq - start_commit_seq) * record_size
+```
+
+It then reads exactly one `CommitMarkerRecord`, verifies `record_xxh3`, and
+verifies that `record.commit_seq == commit_seq`.
+
+**Binary search by time (enables time travel):**
+
+Because `commit_time_unix_ns` is monotonic non-decreasing in `commit_seq`,
+mapping a timestamp to a commit uses binary search over `[0, latest_commit_seq]`
+with random-access record reads. Complexity: `O(log N)` record reads.
+
+**Fork/divergence detection (replication correctness):**
+
+To check whether two replicas share the same commit history prefix:
+- Compare `(latest_commit_seq, latest_marker_id)`.
+- If `latest_commit_seq` differs, use the smaller one as the comparison bound.
+- If marker ids mismatch, binary search in `commit_seq` space for the greatest
+  `k` such that `marker_id(seq=k)` matches on both replicas. This yields the
+  greatest-common-prefix commit in `O(log N)` marker reads without scanning.
+
 #### 3.5.5 RootManifest: Bootstrap
 
 The RootManifest is the bootstrap entry point, stored as a standard ECS object.
@@ -2388,7 +2392,11 @@ RootManifest := {
 1. Read `ecs/root`. Verify checksum. Get `manifest_object_id`.
 2. Fetch `RootManifest` object from symbol logs (using `object_locator.cache` or scan).
 3. Decode `RootManifest`.
-4. Fetch `current_commit` → walk CommitMarker chain to find committed state.
+4. Fetch and verify the latest `CommitMarkerRecord`:
+   - Locate record by `RootManifest.commit_seq` via §3.5.4.1.
+   - Verify `marker_id == RootManifest.current_commit`.
+   - (Optional, bounded): verify the marker hash chain back to the latest
+     checkpoint tip (detects marker-stream corruption early without O(N) open).
 5. Fetch `schema_snapshot` → reconstruct schema cache.
 6. Fetch `checkpoint_base` → populate B-tree page cache for hot pages.
 7. Database is open and ready for queries.
@@ -4408,16 +4416,15 @@ commit(T) -> Result<()>:
         // This procedure emits `DependencyEdge` / `AbortWitness` / `CommitProof` artifacts in Native mode.
         ssi_validate_and_publish(T)?  // returns Err(SQLITE_BUSY_SNAPSHOT) if pivot
 
-        // Step 2: First-committer-wins validation + algebraic merge (commit-seq snapshots).
+        // Step 2: First-committer-wins (FCW) validation + merge policy (§5.10.4).
         for pgno in T.write_set.keys():
             if commit_index.latest_commit_seq(pgno) > T.snapshot.high:
-                // Attempt deterministic rebase merge (Section 5.10).
-                if can_rebase_merge(T, pgno):
-                    perform_rebase_merge(T, pgno)
-                // Fallback: try algebraic byte merge (Section 5.10.3 / §3.4.5).
-                elif can_algebraic_merge(T, pgno):
-                    perform_algebraic_merge(T, pgno)
-                else:
+                // Base drift detected: this would be an abort under strict FCW.
+                //
+                // If `PRAGMA fsqlite.write_merge = SAFE`, attempt the strict safety
+                // ladder in §5.10.4 (deterministic rebase + structured patch merge).
+                // Raw byte-disjoint XOR merge is forbidden for SQLite structured pages.
+                if !try_resolve_conflict_via_merge_policy(T, pgno):
                     abort(T)
                     return Err(SQLITE_BUSY_SNAPSHOT)  // retryable conflict
 
@@ -4475,7 +4482,7 @@ WRITE:              No page lock needed          try_acquire page lock
 
 COMMIT:             No validation needed         SSI check: abort if pivot
                     (mutex ensures serial)       First-committer-wins check
-                    WAL append                   Rebase merge / algebraic merge
+                    WAL append                   FCW check + merge ladder (§5.10)
                     Release global_write_mutex   WAL append
                                                  Release page locks
 
@@ -5028,7 +5035,7 @@ WitnessKey =
 
 **Correctness rule:** It is always valid to fall back to `Page(pgno)` even if
 higher-resolution keys exist. Finer keys exist to reduce false positives and
-unlock algebraic merges (§5.10), never to preserve correctness.
+unlock safe merge/refinement (§5.10), never to preserve correctness.
 
 ##### 5.6.4.4 RangeKey: Hierarchical Buckets Over WitnessKey Hash Space
 
@@ -6538,7 +6545,20 @@ REQUEST(cache, key: CacheKey) -> Result<Arc<CachedPage>>:
       REPLACE(cache, key)
     else:
       // T1 is full, B1 is empty. Evict LRU of T1 directly.
-      evict_lru_t1(cache)
+      // CRITICAL: Do NOT add evicted key to B1 here. Adding to B1 would
+      // push |B1| to 1 while |T1| remains at capacity, violating the
+      // invariant L1 = |T1| + |B1| ≤ capacity. The evicted key is simply
+      // discarded (it was never in a ghost list, so the page leaves the
+      // cache entirely — no ghost metadata is preserved).
+      candidate = T1.front()
+      while candidate.ref_count > 0:
+        T1.rotate_front_to_back()
+        candidate = T1.front()
+      if candidate.dirty:
+        flush_to_wal(candidate)       // must persist before eviction
+      (evicted_key, _) = T1.pop_front()
+      // No B1.push_back — intentionally omitted (see above)
+      total_bytes -= _.byte_size
   else if L1 < capacity AND L1 + L2 >= capacity:
     if L1 + L2 >= 2 * capacity:
       B2.pop_front()              // discard oldest ghost from B2
@@ -7211,10 +7231,10 @@ For each publish request:
    marker references them. Without this barrier, write reordering (common on
    NVMe with volatile write caches) can make the marker durable while its
    referents are not — an irrecoverable corruption on crash.
-5. **Persist marker (tiny):** Append `CommitMarkerBytes(commit_seq,
-   commit_time_unix_ns, capsule_object_id, proof_object_id, prev_marker,
-   integrity)` to the marker stream. This is the atomic "this commit exists"
-   step (≈ 72–88 bytes).
+5. **Persist marker (tiny):** Append a `CommitMarkerRecord` (§3.5.4.1) to the
+   marker stream. This is the atomic "this commit exists" step (fixed-size,
+   ~96 bytes in V1). `prev_marker_id` links to the previous marker, and
+   `marker_id` is the integrity hash of the record.
 6. **FSYNC barrier (post-marker):** Issue `fdatasync` on the marker stream.
    The client MUST NOT receive a success response until this completes.
 7. **Respond:** Notify the client of success (or conflict/abort).
@@ -7271,7 +7291,13 @@ To reclaim storage, the system runs a **Mark-and-Compact** process.
 - **Time interval:** `PRAGMA fsqlite.auto_compact_interval`.
 - **Manual:** `PRAGMA fsqlite.compact`.
 
-**Compaction Algorithm (Background E-Process):**
+**Compaction Algorithm (Background Task, Crash-Safe):**
+
+Compaction MUST be:
+- cancel-safe (safe at any `.await`),
+- crash-safe (safe at any instruction boundary),
+- cross-process safe (multiple processes may be reading),
+- non-disruptive to p99 latency (rate-limited background region).
 
 1.  **Mark Phase (Identify Live Symbols):**
     -   Start from `RootManifest` and active `CommitMarker` stream.
@@ -7281,20 +7307,43 @@ To reclaim storage, the system runs a **Mark-and-Compact** process.
     -   Build a `BloomFilter` of live `ObjectId`s.
 
 2.  **Compact Phase (Rewrite Logs):**
-    -   Create new symbol log segment(s).
+    -   Create new symbol log segment(s) using **temporary names**:
+        `segment-XXXXXX.log.compacting` (never overwrite an existing segment).
     -   Scan old symbol logs. For each symbol record:
         -   If `ObjectId` is in live set (check Bloom + exact check): copy to new log.
         -   Else: discard (dead object).
-    -   Update `object_locator.cache` to point to new offsets.
+    -   `fdatasync()` new segment files (and directory fsync if required by VFS).
+    -   Write a new `cache/object_locator.cache.tmp` built from the rewritten logs.
 
-3.  **Atomic Swap (Metadata Update):**
-    -   The `object_locator` update is atomic in memory.
-    -   Old log files are unlinked (deleted) once all active readers have released their handles (Unix refcounting handles this; Windows requires explicit handle closure).
+3.  **Publish Phase (Two-Phase, Normative Ordering):**
+    -   Atomically publish the new locator:
+        - `fdatasync(cache/object_locator.cache.tmp)`
+        - `rename(cache/object_locator.cache.tmp, cache/object_locator.cache)`
+        - `fsync(cache/ dir)` if required by VFS.
+    -   Atomically publish compacted segments:
+        - `rename(segment-*.log.compacting, segment-*.log)`
+        - `fsync(ecs/symbols/ dir)` if required by VFS.
+    -   **Ordering rule:** old segments MUST NOT be retired until both the new
+        segments and the new locator are durable. This prevents a crash from
+        leaving the system with neither a valid locator nor the old segments
+        that the old locator points at.
 
-**Safety:** Compaction is concurrent with readers/writers. It never modifies
-existing log files; it only creates new ones and deletes old ones. Readers
-holding open handles to deleted logs continue reading safely until they close
-the handle.
+4.  **Retire Phase (Space Reclamation):**
+    -   Old segments are retired only once no active readers depend on them.
+        This is tracked via segment leases / obligations (asupersync-style):
+        a reader that may dereference an `ObjectLocator` entry holds a lease on
+        the referenced segment(s).
+    -   Unix: old segments MAY be unlinked once retired; open handles remain valid.
+    -   Windows: deletion of open files is not supported; old segments MUST be
+        renamed to `segment-*.log.retired` and deleted only after all handles
+        are closed (lease set empty).
+
+**Safety argument (sketch):**
+- Compaction never mutates an existing segment; it only creates new segments.
+- Publication is two-phase: until published, new segments/locator are ignored;
+  after published, old segments are retained until reader leases drain.
+- Therefore, at all times there exists at least one complete set of symbol logs
+  sufficient to decode any reachable object under the retention policy.
 
 ---
 
@@ -7975,7 +8024,8 @@ pub trait MvccPager: sealed::Sealed + Send + Sync {
     fn free_page(&self, cx: &Cx, txn: &mut Transaction, pgno: PageNumber) -> Result<()>;
 
     /// Commit the transaction. SSI validation (abort if pivot),
-    /// first-committer-wins check, rebase/algebraic merge, WAL append,
+    /// first-committer-wins check, merge ladder (§5.10) (rebase + structured patch),
+    /// WAL append,
     /// version publishing, witness-plane evidence publication/proof emission,
     /// lock release.
     /// Returns SQLITE_BUSY_SNAPSHOT on SSI abort or conflict.
@@ -9775,7 +9825,8 @@ SELECT ... FROM my_table FOR SYSTEM_TIME AS OF COMMITSEQ 1234567;
    - Otherwise parse the `time-string` using SQLite-compatible datetime rules
      (same inputs accepted by `unixepoch(...)`) and convert to
      `target_time_unix_ns`.
-     Then binary-search the CommitMarker stream for the greatest marker with:
+     Then binary-search commit sequence space using random-access marker reads
+     (§3.5.4.1) for the greatest marker with:
      `marker.commit_time_unix_ns <= target_time_unix_ns`, and set
      `target_commit_seq := marker.commit_seq`.
 2. Create a synthetic read-only snapshot `S` with `S.high = target_commit_seq`.
@@ -10223,10 +10274,13 @@ descends into nested arrays and objects. Same column schema as json_each.
 JSONB is a binary encoding of JSON stored as a BLOB. Structure:
 - Each node is a header byte (4-bit type + 4-bit size-of-payload-size),
   followed by the payload size (0, 1, 2, 4, or 8 bytes), followed by payload.
-- Node types: null(0), true(1), false(2), int(3), int5(4), float(5),
-  text(6), textj(7), text5(8), textraw(9), array(10), object(11).
+- Node types (lower 4 bits of first header byte):
+  null(0x0), true(0x1), false(0x2), int(0x3), int5(0x4), float(0x5),
+  float5(0x6), text(0x7), textj(0x8), text5(0x9), textraw(0xA),
+  array(0xB), object(0xC). Types 0xD–0xF are reserved.
+  Upper 4 bits of the first header byte encode payload size category.
 - Arrays and objects store their children as concatenated child nodes.
-- JSONB is approximately 10-20% larger than text JSON but avoids parsing
+- JSONB is typically 5–10% smaller than text JSON and avoids parsing
   overhead on every function call.
 
 Functions that produce JSON output also accept and produce JSONB when the
@@ -10395,9 +10449,11 @@ match statistics. FORMAT string controls what is included:
 **compress/uncompress (FTS4 only):** Custom compression functions for stored
 content: `CREATE VIRTUAL TABLE t USING fts4(content, compress=zlib_compress, uncompress=zlib_uncompress)`.
 
-### 14.4 R-Tree (`fsqlite-ext-rtree`)
+### 14.4 R*-Tree (`fsqlite-ext-rtree`)
 
-R-Tree provides efficient spatial indexing for multi-dimensional data.
+R*-Tree (Beckmann et al., SIGMOD 1990) provides efficient spatial indexing
+for multi-dimensional data. SQLite uses the R*-tree variant, not the original
+R-tree of Guttman (1984).
 
 ```sql
 CREATE VIRTUAL TABLE demo_index USING rtree(
@@ -10422,7 +10478,7 @@ SELECT * FROM demo_index WHERE minX <= 100 AND maxX >= 50
 SELECT * FROM demo_index WHERE id MATCH my_geometry(50, 100, 30);
 ```
 
-**Custom geometry callbacks** implement the `Fts5Geometry` trait:
+**Custom geometry callbacks** implement the `RtreeGeometry` trait:
 ```rust
 pub trait RtreeGeometry: Send + Sync {
     fn query_func(&self, bbox: &[f64]) -> Result<RtreeQueryResult>;
@@ -10957,8 +11013,9 @@ raptorq integration: 2,000).
   (conservative pivot abort rule with optional refinement + merge), plus
   `DependencyEdge` / `CommitProof` / `AbortWitness` artifacts for explainability
 - `crates/fsqlite-mvcc/src/conflict.rs`: First-committer-wins validation,
-  deterministic rebase merge via intent logs (Section 5.10), algebraic
-  write merging (Section 3.4.5), byte-level conflict detection
+  merge policy ladder (Section 5.10): deterministic rebase via intent logs and
+  structured page patch merge; explicit prohibition of raw byte-disjoint XOR
+  merge for SQLite structured pages (§3.4.5)
 - `crates/fsqlite-mvcc/src/gc.rs`: Garbage collection -- horizon computation
   (min active begin_seq), version chain trimming, witness-plane GC horizons and
   bucket epoch advance (§5.6.4.8), memory bound enforcement
@@ -11091,7 +11148,7 @@ behavior for conformance.
 - FTS5: Tokenize 100K documents, full-text search with BM25 ranking,
   highlight and snippet, prefix queries
 - FTS3/4: matchinfo blob format matches C SQLite output
-- R-Tree: 2D spatial index with 100K entries, range query, custom geometry
+- R*-Tree: 2D spatial index with 100K entries, range query, custom geometry
 - Session: Generate changeset from modifications, apply to second database,
   verify identical content
 - ICU: Create collation from locale, ORDER BY uses locale-correct sorting
@@ -11508,7 +11565,7 @@ SQL statements, and capture results deterministically.
 - Functions: every built-in function with edge cases (200+ tests)
 - Transactions: BEGIN/COMMIT/ROLLBACK, savepoints, isolation (100+ tests)
 - Edge cases: empty tables, MAX_LENGTH values, Unicode, zero-length blobs (100+ tests)
-- Extensions: JSON1, FTS5, R-Tree basic operations (100+ tests)
+- Extensions: JSON1, FTS5, R*-Tree basic operations (100+ tests)
 - Concurrency regression: write skew patterns (must abort under default
   serializable mode in `BEGIN CONCURRENT`)
 
@@ -12336,7 +12393,7 @@ Every phase must pass all applicable gates before proceeding to the next.
 **Phase 8 gates:**
 - JSON1: json_valid/json_extract/json_set pass 200 conformance tests
 - FTS5: full-text search returns relevant results for 100 test queries
-- R-Tree: spatial query returns correct results for 50 bounding box queries
+- R*-Tree: spatial query returns correct results for 50 bounding box queries
 
 **Phase 9 gates:**
 - Conformance: 95%+ pass rate across 1,000+ golden files
@@ -12466,6 +12523,6 @@ an embedded database engine can achieve.
 
 ---
 
-*Document version: 1.10 (Deep audit round 2: ARC REPLACE safety valve fix; NOT precedence fix; WAL checksum algorithm added; varint encoding added; crate dependency cycle broken (wal/pager); layer inversion fixed (mvcc moved to L3); VfsFile &Cx threading; AggregateFunction type-erasure fix; B-tree page header layout; WAL-index structure corrected; comparison affinity rules corrected; RawFd→FileExt; BOCPD summation; e-process hard-invariant guidance; pointer map types; index max_local math corrected (1003→1002); CTE UNION support; Database/Connection clarification; 30+ additional errata)*
+*Document version: 1.11 (Marker stream format + O(1) seek; time-travel binary search clarified; crash-safe ECS compaction publication; RaptorQ overhead slack/clamp + adaptive tuning; continued spec errata fixes)*
 *Last updated: 2026-02-07*
 *Status: Authoritative Specification*
