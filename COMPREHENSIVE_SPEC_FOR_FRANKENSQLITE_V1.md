@@ -143,7 +143,11 @@ RaptorQ Permeation Map in §3.5.7).
 ### 1.1 What It Is
 
 FrankenSQLite is a **clean-room Rust reimplementation** of SQLite version 3.52.0
-(~218K lines of C). It targets:
+(~238K lines of C in the amalgamation). **Note:** SQLite 3.52.0 is a forward
+target (scheduled for release ~March 2026). If 3.52.0's final API surface
+differs from this spec, the spec will be updated to match the release. All
+references to "3.52.0" throughout this document denote this forward target.
+It targets:
 
 - Full SQL dialect compatibility with C SQLite
 - File format round-trip interoperability (read/write standard `.sqlite` files)
@@ -234,8 +238,12 @@ patterns. The following constraints are non-negotiable for hot-path code:
   decoder (matrix multiply is only needed for repair).
 
 - **Prefetch hints.** B-tree descent SHOULD issue prefetch hints for child
-  pages when the next page number is known (via `std::arch::x86_64::_mm_prefetch`
-  behind a feature gate, with no-op fallback on other architectures).
+  pages when the next page number is known. Since `std::arch::x86_64::_mm_prefetch`
+  is an `unsafe fn` (incompatible with workspace-level `unsafe_code = "forbid"`),
+  prefetch MUST be delegated to a thin external helper crate (e.g., `fsqlite-prefetch`)
+  that allows `unsafe` internally, exposing a safe public API. The helper crate
+  is NOT part of the `unsafe_code = "forbid"` workspace lint scope. No-op fallback
+  on architectures without prefetch intrinsics.
 
 - **Avoid allocation in the read path.** Cache lookups, version checks, and
   index resolution MUST be allocation-free in the common case. Hot-path
@@ -2201,6 +2209,33 @@ OTI := {
 
 The local symbol store MAY define additional flags, but they MUST be treated as
 advisory optimization hints. Correctness never depends on them.
+
+**Authenticated symbols (normative when enabled):**
+
+`auth_tag` is the optional authenticity check for symbols received from
+untrusted transport (replication, remote tier). When enabled, receivers MUST
+verify `auth_tag` before accepting a symbol for decoding.
+
+- Enable via `PRAGMA fsqlite.symbol_auth = on` (default: `off` for local-only
+  durability).
+- If `PRAGMA durability = quorum(M)` and the transport is not already
+  authenticated, `symbol_auth` MUST be enabled.
+
+**Tag construction (normative):**
+
+Let `epoch_id` be the `SymbolSegmentHeader.epoch_id` of the segment containing
+this `SymbolRecord` (§3.5.4.2). Derive the epoch key `K_epoch` as in §4.18.2.
+Then compute:
+
+```
+auth_tag = Trunc128( BLAKE3_KEYED( K_epoch,
+                  "fsqlite:symbol-auth:v1" || bytes(magic..frame_xxh3) ) )
+```
+
+**Failure behavior (normative):**
+- If `symbol_auth = on` and `auth_tag` verification fails, the symbol MUST be
+  rejected (it MAY still be counted as a corruption observation for §3.5.12).
+- If `symbol_auth = off`, `auth_tag` MUST be all-zero and MUST be ignored.
 
 **Systematic read fast path (hybrid decode):**
 
@@ -5857,6 +5892,20 @@ HotWitnessBucketEntry := {
 
 Where `W = ceil(max_txn_slots / 64)`.
 
+**Helper views (conceptual, but required semantics):**
+
+```
+readers_for_epoch(bucket, e):
+  if bucket.epoch_a == e: return bucket.readers_a
+  if bucket.epoch_b == e: return bucket.readers_b
+  return all_zeros
+
+writers_for_epoch(bucket, e):
+  if bucket.epoch_a == e: return bucket.writers_a
+  if bucket.epoch_b == e: return bucket.writers_b
+  return all_zeros
+```
+
 **Update on read/write (monotonic, race-free):**
 
 - Every Concurrent-mode transaction pins a `witness_epoch` at begin
@@ -5968,10 +6017,14 @@ The hot plane uses **bucket epochs**:
   target that epoch for all witness-plane registrations. This ensures a
   transaction's discoverability does not depend on global epoch changes while it
   is active.
-- **Safe epoch advancement (normative):** Let `cur = HotWitnessIndex.epoch`.
-  Advancing `epoch` from `cur` to `cur+1` necessarily drops/reuses the
-  `cur-1` buffers. Therefore epoch advancement is permitted iff there are **no**
-  Active Concurrent-mode TxnSlots with `witness_epoch == cur-1`.
+- **Safe epoch advancement (normative):** Let `cur = HotWitnessIndex.epoch.load(Acquire)`
+  and `old = cur - 1`. Advancing `epoch` from `cur` to `cur+1` necessarily
+  drops/reuses buffers tagged `old`. Therefore epoch advancement is permitted
+  iff there are **no** TxnSlots with:
+  - `mode == Concurrent`, and
+  - `state` in {Active, Committing}, and
+  - `txn_id != 0` and `txn_id != TXN_ID_CLAIMING`, and
+  - `witness_epoch == old`.
   This does not require a moment of zero active transactions; it requires only
   that the *oldest* epoch has drained.
 - **Bucket refresh:** When an updater needs to set a bit for `target_epoch` and
@@ -9927,8 +9980,12 @@ messages like: `line 3, column 15: expected ')' but found ','`.
 
 ### 10.2 Parser Detail
 
-Hand-written recursive descent, NOT a generated parser. Uses `parse.y`
-(1,963 lines) as the authoritative grammar reference.
+Hand-written recursive descent, NOT a generated parser. Uses C SQLite's
+`parse.y` (~1,900+ production lines; the full file including Lemon directives
+and semantic actions is ~76 KB) as the authoritative grammar reference for
+production rules. Note: C SQLite uses a Lemon LALR(1) generated parser —
+the switch to recursive descent is a deliberate FrankenSQLite design choice
+for better Rust ergonomics, error recovery, and debuggability.
 
 **Structure:** One method per grammar production. Each method consumes tokens
 from the lexer and returns an AST node. Methods are named after the grammar
@@ -10127,9 +10184,10 @@ can satisfy it:
 - N <= 8: exhaustive search of all N! orderings (at most 40,320).
 - N > 8: greedy algorithm -- at each step, add the table that has the lowest
   estimated join cost with the already-joined set.
-(Note: C SQLite's NGQP uses a more sophisticated backtracking algorithm that
-handles up to ~10 tables optimally with pruning. The simpler exhaustive/greedy
-split here is FrankenSQLite's initial implementation strategy.)
+(Note: C SQLite's NGQP uses a bounded "N Nearest Neighbors" (N3) algorithm
+that maintains the N best partial paths at each step — it is O(K*N), not
+exhaustive. N varies by join complexity (1 for simple, 5–18 for multi-table).
+The simpler exhaustive/greedy split here is FrankenSQLite's initial strategy.)
 
 ### 10.6 Code Generation
 
