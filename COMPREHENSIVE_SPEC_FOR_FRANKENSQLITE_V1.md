@@ -8792,9 +8792,46 @@ list of freeblocks. Each freeblock starts with a 2-byte pointer to the next
 freeblock (0 if last) and a 2-byte size. Minimum freeblock size is 4 bytes.
 
 **Fragmented bytes:** The page header byte at offset 7 counts bytes of space
-lost to fragmentation (freeblocks smaller than 4 bytes, or gaps between cells
-that are not tracked by the freeblock list). If this count reaches 60 or more,
-the page is defragmented (cells are compacted toward the end of the page).
+lost to fragmentation -- individual 1-3 byte gaps between cells or at the
+end of freeblocks that are too small to form their own freeblock entry (the
+minimum freeblock size is 4 bytes, so gaps of 1-3 bytes cannot be tracked).
+If this count reaches 60 or more, the page is defragmented (cells are
+compacted toward the end of the page).
+
+### 11.2.1 Varint Encoding
+
+SQLite uses a specific variable-length integer encoding throughout cell
+formats and record headers. This is NOT protobuf varint, NOT LEB128. The
+encoding is a custom Huffman-like scheme with a maximum length of 9 bytes:
+
+```
+Bytes  Value range                    Encoding
+  1    0 to 127                       0xxxxxxx (high bit clear)
+  2    128 to 16383                   1xxxxxxx 0xxxxxxx
+  3    16384 to 2097151               1xxxxxxx 1xxxxxxx 0xxxxxxx
+  ...  (pattern continues)
+  8    up to 2^56 - 1                 1xxxxxxx * 7 then 0xxxxxxx
+  9    up to 2^64 - 1                 1xxxxxxx * 8 then xxxxxxxx (full byte)
+```
+
+**Decoding algorithm:**
+- For the first 8 bytes: if the high bit is set, the lower 7 bits contribute
+  to the result and the next byte is read. If the high bit is clear, the
+  lower 7 bits are the final contribution.
+- The 9th byte (if reached) contributes all 8 bits (no continuation bit).
+- Maximum encoded value: a full u64 (2^64 - 1).
+- The result is an unsigned 64-bit integer. For signed values (e.g., rowid),
+  it is cast to i64 (two's complement).
+
+**Encoding algorithm:** Encode the least number of bytes needed. Values 0-127
+use 1 byte; values 128-16383 use 2 bytes; and so on up to 9 bytes for values
+>= 2^56.
+
+**Critical difference from protobuf/LEB128:** In protobuf varints, each byte
+contributes 7 bits with the high bit as continuation, for ALL bytes. In
+SQLite varints, the 9th byte contributes ALL 8 bits. This means SQLite
+varints can encode a full 64-bit value in exactly 9 bytes, whereas protobuf
+would need 10 bytes.
 
 ### 11.3 Cell Formats
 
