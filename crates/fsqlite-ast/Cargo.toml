@@ -1,0 +1,14 @@
+[package]
+name = "fsqlite-ast"
+version = "0.1.0"
+description = "SQL abstract syntax tree node types"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+fsqlite-types = { workspace = true }
+
+[lints]
+workspace = true

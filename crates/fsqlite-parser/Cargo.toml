@@ -1,0 +1,17 @@
+[package]
+name = "fsqlite-parser"
+version = "0.1.0"
+description = "Hand-written recursive descent SQL parser"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+fsqlite-types = { workspace = true }
+fsqlite-error = { workspace = true }
+fsqlite-ast = { workspace = true }
+memchr = { workspace = true }
+
+[lints]
+workspace = true

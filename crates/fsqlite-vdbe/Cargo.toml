@@ -1,0 +1,17 @@
+[package]
+name = "fsqlite-vdbe"
+version = "0.1.0"
+description = "Virtual database engine bytecode interpreter"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+fsqlite-types = { workspace = true }
+fsqlite-error = { workspace = true }
+fsqlite-pager = { workspace = true }
+fsqlite-btree = { workspace = true }
+
+[lints]
+workspace = true
