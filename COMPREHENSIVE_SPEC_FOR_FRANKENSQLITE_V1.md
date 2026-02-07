@@ -2590,6 +2590,95 @@ Tiered storage is orthogonal to GC horizons:
   audit, and forensic replay (Section 12.17). Default policy in V1 is:
   retain full commit history, with cold history eligible for L3-only residence.
 
+#### 3.5.12 Adaptive Redundancy (Anytime-Valid Durability Autopilot)
+
+Static redundancy assumptions are a correctness risk: media, firmware, filesystems,
+and networks do not keep stable loss/corruption rates over time. FrankenSQLite
+therefore treats RaptorQ redundancy as a **control loop** with formal guarantees:
+we monitor symbol health with anytime-valid tests, and we raise redundancy when
+evidence indicates the durability budget is being violated.
+
+**Key enabling fact (RaptorQ + ECS):** Repair symbol generation is deterministic
+for a given `(ObjectId, config)` (§3.5.3, §3.5.9). Therefore redundancy is
+**appendable**: we can publish additional repair symbols for an existing object
+later without changing its ObjectId or rewriting the object bytes. This is a
+uniquely powerful "self-hardening" lever compared to traditional WAL designs.
+
+##### 3.5.12.1 Durability Budgets (Per Object Type, Normative Defaults)
+
+For each ECS object class, the engine defines:
+- `p_symbol_budget`: maximum acceptable symbol corruption probability per record.
+- `epsilon_loss_budget`: maximum acceptable probability that an object becomes
+  undecodable given the symbol budget and redundancy policy.
+- `slack_symbols`: additive decode slack per source block (V1 default `+2`).
+
+Markers and commit proofs are special:
+- `CommitMarker` and `CommitProof` MUST use conservative budgets (smaller objects
+  are dominated by rounding + additive slack; the policy MUST clamp to avoid
+  under-provisioning; §3.5.3).
+
+##### 3.5.12.2 Anytime-Valid Monitoring (e-Process, Optional Stopping Safe)
+
+Every time we validate or decode a symbol record, we obtain a Bernoulli
+observation:
+
+- `X = 1` if record failed integrity (`frame_xxh3` mismatch, auth failure, etc.)
+- `X = 0` otherwise
+
+We maintain an e-process monitor of the null hypothesis `H0: p <= p0`
+where `p0 = p_symbol_budget`. If the e-value exceeds `1/alpha`, the monitor
+rejects with a provable false-alarm bound (Ville's inequality).
+
+```rust
+// Symbol corruption monitor (anytime-valid).
+let sym_corruption = EProcess::new("INV-SYMBOL-CORRUPTION: p <= p0",
+    EProcessConfig {
+        p0: 1e-6,        // budget for symbol corruption probability
+        lambda: 0.5,     // moderate bet; tune by calibration
+        alpha: 1e-6,     // extremely low false alarm (durability is sacred)
+        max_evalue: 1e18,
+    });
+
+// Each verified record yields one observation.
+sym_corruption.observe(record_is_corrupt as u8);
+```
+
+**Rule:** Monitoring MUST be separated from the hot path: observations are
+batched and recorded as part of decode/verification bookkeeping, not as an
+unbounded per-record logging stream.
+
+##### 3.5.12.3 Autopilot Policy (Raise Redundancy, Repair Hardening)
+
+When `INV-SYMBOL-CORRUPTION` rejects (evidence that p exceeded the budget),
+FrankenSQLite MUST enter a **durability hardening mode**:
+
+1. **Raise redundancy for new objects:** increase `raptorq_overhead` for affected
+   object classes (CommitCapsule / IndexSegment / PageHistory) up to a configured
+   maximum. Default policy:
+   `overhead := min(overhead_max, max(overhead_min, overhead * 2))`.
+2. **Retroactive hardening (background):** For recently reachable objects (under
+   retention), generate and persist additional deterministic repair symbols
+   for each object up to the new redundancy policy. This is safe because it is
+   union-only: adding symbols cannot invalidate prior decodes.
+3. **Escalate integrity sweeps:** increase sweep frequency and widen sampling
+   (more objects, more buckets) until the monitor stops accumulating evidence
+   of excess corruption.
+4. **Emit explainable evidence:** record an evidence ledger entry (§4.16.1)
+   describing the rejection, the policy change, and the set of objects hardened.
+
+**Graceful degradation (required):** If retroactive hardening cannot decode an
+object (insufficient surviving symbols), the engine MUST surface a
+"durability contract violated" diagnostic with decode proofs, and it MUST
+halt any operation that would otherwise claim durable commit ordering for
+unverifiable objects (markers are the atomic truth).
+
+##### 3.5.12.4 Why This Is Alien-Artifact Quality
+
+- **Formal safety guarantees:** false-alarm probability is bounded under optional stopping.
+- **Explainability:** decisions carry evidence ledgers and (in lab) decode proofs.
+- **Self-healing:** redundancy increases are append-only, deterministic, and auditable.
+- **Graceful degradation:** the system does not pretend; it either repairs or emits proofs.
+
 ### 3.6 Native Indexing: RaptorQ-Coded Index Segments
 
 Classic SQLite uses a separate WAL-index structure (shm) to avoid scanning the WAL. FrankenSQLite's Native Mode goes further: the index itself is a stream of self-healing ECS objects.
@@ -4421,26 +4510,49 @@ commit(T) -> Result<()>:
         // This procedure emits `DependencyEdge` / `AbortWitness` / `CommitProof` artifacts in Native mode.
         ssi_validate_and_publish(T)?  // returns Err(SQLITE_BUSY_SNAPSHOT) if pivot
 
-        // Step 2: First-committer-wins (FCW) validation + merge policy (§5.10.4).
-        for pgno in T.write_set.keys():
-            if commit_index.latest_commit_seq(pgno) > T.snapshot.high:
-                // Base drift detected: this would be an abort under strict FCW.
-                //
-                // If `PRAGMA fsqlite.write_merge = SAFE`, attempt the strict safety
-                // ladder in §5.10.4 (deterministic rebase + structured patch merge).
-                // Raw byte-disjoint XOR merge is forbidden for SQLite structured pages.
-                if !try_resolve_conflict_via_merge_policy(T, pgno):
-                    abort(T)
-                    return Err(SQLITE_BUSY_SNAPSHOT)  // retryable conflict
+    // Merge-Retry Loop:
+    // The Coordinator is the source of truth. If it rejects us with Conflict, we
+    // must retry the merge logic with the authoritative conflict info it provides.
+    loop:
+        if T.mode == Concurrent:
+            // Step 2: First-committer-wins (FCW) validation + merge policy (§5.10.4).
+            // NOTE: On first pass, this uses local CommitIndex. On retry, it uses
+            // the Conflict info returned by the coordinator.
+            for pgno in T.write_set.keys():
+                if commit_index.latest_commit_seq(pgno) > T.snapshot.high:
+                    // Base drift detected: this would be an abort under strict FCW.
+                    //
+                    // If `PRAGMA fsqlite.write_merge = SAFE`, attempt the strict safety
+                    // ladder in §5.10.4 (deterministic rebase + structured patch merge).
+                    // Raw byte-disjoint XOR merge is forbidden for SQLite structured pages.
+                    if !try_resolve_conflict_via_merge_policy(T, pgno):
+                        abort(T)
+                        return Err(SQLITE_BUSY_SNAPSHOT)  // retryable conflict
 
-    // Step 3: Persist + publish using the selected commit protocol (Section 7).
-    // The commit sequencer assigns commit_seq and appends the atomic marker/record.
-    commit_seq = write_coordinator.publish(T)
-    T.state = Committed{commit_seq}
-    release_page_locks(T)
-    if T.mode == Serialized:
-        manager.global_write_mutex.unlock()
-    Ok(())
+        // Step 3: Persist + publish using the selected commit protocol (Section 7).
+        // The commit sequencer assigns commit_seq and appends the atomic marker/record.
+        response = write_coordinator.publish(T)
+        match response:
+            Ok(commit_seq) =>
+                T.state = Committed{commit_seq}
+                release_page_locks(T)
+                if T.mode == Serialized:
+                    manager.global_write_mutex.unlock()
+                return Ok(())
+
+            Conflict(pages, seq) =>
+                // The coordinator saw a conflict our local index missed (stale cache).
+                // Update local knowledge and RETRY the merge loop.
+                commit_index.update_from_coordinator(pages, seq)
+                continue // Loop back to Step 2 to attempt merge with new info
+
+            Aborted(code) =>
+                abort(T)
+                return Err(code)
+
+            IoError(e) =>
+                abort(T)
+                return Err(SQLITE_IOERR)
 ```
 
 **Transaction state machine:**
@@ -4785,6 +4897,7 @@ TxnSlot := {
     mode            : AtomicU8,      -- 0=Serialized, 1=Concurrent
     has_in_rw       : AtomicBool,    -- SSI: has incoming rw-antidependency
     has_out_rw      : AtomicBool,    -- SSI: has outgoing rw-antidependency
+    marked_for_abort: AtomicBool,    -- SSI: eager pivot abort signal (optimization)
     write_set_pages : AtomicU32,     -- count of pages in write set (for GC sizing)
     _padding        : [u8; 64],      -- pad to 128 bytes (two cache lines; prevents false sharing between adjacent slots)
 }
@@ -5225,7 +5338,11 @@ raise_gc_horizon():
     // commit sequence number.
     global_min_begin_seq = shm.commit_seq.load()
     for slot in txn_slots:
-        if slot.txn_id != 0:
+        // Ignore free slots (0) and slots currently being acquired (CLAIMING).
+        // A claiming slot has not yet published its begin_seq, so it cannot
+        // hold a snapshot that blocks GC.
+        tid = slot.txn_id.load()
+        if tid != 0 && tid != TXN_ID_CLAIMING:
             global_min_begin_seq = min(global_min_begin_seq, slot.begin_seq.load())
     shm.gc_horizon.store(global_min_begin_seq)
 ```
@@ -5761,7 +5878,85 @@ enabled:
   produced non-serializable results.
 - `BEGIN` / `BEGIN IMMEDIATE` / `BEGIN EXCLUSIVE` continue to use Serialized
   mode (global write mutex), which is trivially serializable and does not
-  need SSI.
+need SSI.
+
+#### 5.7.4 Witness Refinement Policy (VOI-Driven, Bounded)
+
+Page-granularity SSI is deliberately conservative. To reduce false positive
+aborts without weakening correctness, the witness plane supports **refinement**
+to finer witness keys (`Cell`, `ByteRange`, hashed sets, or exact keys).
+
+Refinement has a cost:
+- more bytes in `ReadWitness` / `WriteWitness` / `WitnessDelta`
+- more encode/decode work
+- more candidate confirmation work during commit validation
+
+So refinement MUST be budgeted and targeted.
+
+**Non-negotiable correctness rule:** Refinement is an optimization layer only.
+If refinement is disabled or budget-exhausted, the system MUST still be sound
+(it may abort more often, but must not miss true conflicts; §5.6.4.1).
+
+##### 5.7.4.1 VOI Model (Expected Loss Minimization)
+
+We choose refinement using **Value of Information (VOI)**:
+refine where the expected reduction in false abort cost exceeds the expected
+CPU/bytes cost of refinement.
+
+For a given `RangeKey` bucket `b`, define:
+- `c_b`: estimated rate of "bucket overlap observations" per unit time
+  (how often this bucket participates in candidate conflicts).
+- `fp_b`: estimated probability that a bucket overlap is a false positive
+  at page granularity (no true key intersection).
+- `Δfp_b`: estimated reduction in false positive probability if we refine
+  this bucket (page → cell/byte-range, or add key summaries).
+- `L_abort`: expected cost of aborting a transaction (duration + write set
+  cost; measured and tracked).
+- `Cost_refine_b`: bytes + CPU cost to emit and later decode refinement for `b`.
+
+Then the VOI score is:
+
+```
+Benefit_b = c_b * Δfp_b * L_abort
+VOI_b     = Benefit_b - Cost_refine_b
+```
+
+**Rule:** The engine SHOULD refine buckets with `VOI_b > 0`, subject to a per-txn
+refinement budget (bytes + CPU) derived from the commit budget (`Cx::budget`).
+
+##### 5.7.4.2 Practical Policy (V1 Defaults)
+
+1. **Always register Page keys:** Hot index is always updated at `Page(pgno)` so
+   candidate discoverability is never lost.
+2. **Emit refined keys only for hotspots:** Maintain per-bucket statistics from:
+   - `INV-SSI-FP` (false positive rate monitor; §5.7.3)
+   - conflict heatmaps (`DependencyEdge` aggregation; bucket frequency)
+   - merge outcomes (`MergeWitness` success rate by bucket/page)
+3. **Refine in descending VOI order** until `refinement_budget_bytes` is exhausted.
+4. **Refinement types priority (recommended):**
+   - `CellBitmap` (best for B-tree leaf/interior ops when cell tags exist)
+   - `ByteRangeList` (best when page patches are sparse/disjoint)
+   - `HashedKeySet` (medium: cheaper than exact keys, good for large sets)
+   - `ExactKeys` (only for tiny sets; most precise)
+
+##### 5.7.4.3 How Refinement Is Published (Objects + Hot Plane)
+
+Refinement MUST appear only in durable ECS objects:
+- `ReadWitness.key_summary` / `WriteWitness.key_summary` for the refined set
+- and/or `WitnessDelta.refinement` for compact per-bucket participation updates
+
+Hot-plane `HotWitnessIndex` remains bucket participation only (bitsets).
+Refinement is consulted only after candidate discovery (cold-plane decode),
+and only to reduce false positives.
+
+##### 5.7.4.4 Explaining Refinement Decisions (Evidence Ledger)
+
+When refinement is enabled, the commit pipeline SHOULD emit an evidence ledger
+entry (§4.16.1) showing:
+- which buckets were refined,
+- the VOI scores and budget constraints,
+- which candidate conflicts were eliminated by refinement,
+- and whether merge (§5.10) tightened witness precision.
 
 ### 5.8 Conflict Detection and Resolution Detail
 
@@ -6174,8 +6369,9 @@ conflicts, we attempt to **merge** them.
 
 1. **Logical plane (preferred):** Merge *intent-level* B-tree operations that
    commute (e.g., inserts into distinct keys).
-2. **Physical plane (fallback):** Merge *byte-level* patches when we can prove
-   disjointness + invariant preservation.
+2. **Physical plane (fallback):** Merge *structured page patches* keyed by
+   stable identifiers (e.g., `cell_key_digest`) with explicit invariant checks.
+   Raw byte-disjoint XOR merge is forbidden for SQLite structured pages (§3.4.5).
 
 #### 5.10.1 Intent Logs (Semantic Operations)
 
@@ -6244,31 +6440,27 @@ given `(intent_log, base_snapshot)`. Under `LabRuntime`, identical inputs yield
 identical outputs across all seeds. No dependence on wall-clock, iteration
 order, or hash randomization.
 
-#### 5.10.3 Physical Merge: GF(256) Sparse XOR Patches
+#### 5.10.3 Physical Merge: Structured Page Patches
 
-Physical merge is the fallback for tiny, local, obviously-disjoint changes.
+Physical merge is the fallback when a commit sees **base drift** (FCW conflict)
+and deterministic rebase (§5.10.2) is not applicable or does not succeed.
 
-A page is a vector `p ∈ GF(256)^n`. A sparse XOR patch `Δ` has support in a
-set of byte ranges. Apply: `p' = p ⊕ Δ`.
+**Encoding vs correctness:** Pages and deltas are still byte vectors and may be
+encoded using XOR/`GF(256)` deltas (useful for history compression). However,
+for SQLite file-format pages, **merge eligibility is never decided by raw
+byte-range disjointness** (§3.4.5).
 
-Merge condition:
-```
-disjoint(ΔA, ΔB) := support(ΔA) ∩ support(ΔB) = ∅
-merge(ΔA, ΔB) := ΔA ⊕ ΔB
-```
+Instead, physical merge is expressed as a `StructuredPagePatch` whose operations
+are keyed by stable identifiers rather than physical offsets.
 
-When disjoint, merges commute and associate. This gives merge without ordering
-assumptions and a clean algebra that matches the RaptorQ coding field.
-
-**StructuredPagePatch** refines byte disjointness to account for structural
-B-tree metadata:
+**StructuredPagePatch (normative representation):**
 
 ```
 StructuredPagePatch {
   header_ops: Vec<HeaderOp>,         -- serialized (not merged)
   cell_ops: Vec<CellOp>,            -- mergeable when disjoint by cell_key
   free_ops: Vec<FreeSpaceOp>,       -- default: conflict; future: structured merge
-  raw_xor_ranges: Vec<RangeXorPatch>, -- escape hatch (debug only)
+  raw_xor_ranges: Vec<RangeXorPatch>, -- forbidden for SQLite structured pages; debug-only for opaque pages
 }
 ```
 
@@ -6276,20 +6468,40 @@ StructuredPagePatch {
 rowid/index key), not by raw offsets. This enables safe merges even when the
 page layout shifts during a concurrent split.
 
+**Normative safety constraints:**
+
+1. For any SQLite file-format structured page kind (including B-tree, overflow,
+   freelist, pointer-map), `raw_xor_ranges` MUST be empty under all SAFE builds
+   and under `PRAGMA fsqlite.write_merge = SAFE`.
+2. `raw_xor_ranges` MAY be used only for pages explicitly designated **opaque**
+   by the engine (not SQLite file-format pages), and only when
+   `PRAGMA fsqlite.write_merge = LAB_UNSAFE`. This is a lab/debug facility, not
+   a correctness mechanism.
+3. A `StructuredPagePatch` merge MUST treat `header_ops` as non-commutative:
+   if both patches include header mutations that cannot be serialized without
+   ambiguity, the merge MUST reject and fall back to abort/retry.
+4. For V1, `free_ops` are conservative: if either patch includes non-empty
+   `free_ops`, the merge MUST reject unless the implementation can prove safe
+   composition by construction (future work).
+
 #### 5.10.4 Commit-Time Merge Policy (Strict Safety Ladder)
 
 When txn `U` reaches commit, for each page in `write_set(U)`:
 
 1. If base unchanged since snapshot → OK (no merge needed).
-2. Else, attempt merge in strict priority order:
-   a. **Schema epoch check (required):** If `current_schema_epoch != U.snapshot.schema_epoch`,
-      abort with `SQLITE_SCHEMA` (merging across DDL/VACUUM boundaries is forbidden).
-   b. **Deterministic rebase replay** (preferred, but restricted):
-      - MUST verify `U` has no `ReadWitness` covering this page/key (see §5.10.2).
-      - If safe, replay `IntentOp` against current base.
-   c. **Structured page patch merge** (if ops are cell-disjoint)
-   d. **Sparse XOR merge** (only if ranges are declared merge-safe)
-   e. **Abort/retry** (no safe merge found)
+2. Else, apply `PRAGMA fsqlite.write_merge`:
+   - `OFF`: Abort/retry (strict FCW).
+   - `SAFE`: Attempt merge in strict priority order:
+     1. **Schema epoch check (required):** If `current_schema_epoch != U.snapshot.schema_epoch`,
+        abort with `SQLITE_SCHEMA` (merging across DDL/VACUUM boundaries is forbidden).
+     2. **Deterministic rebase replay** (preferred, but restricted):
+        - MUST verify `U` has no `ReadWitness` covering this page/key (see §5.10.2).
+        - If safe, replay `IntentOp` against current base.
+     3. **Structured page patch merge** (if ops are disjoint by semantic key, e.g., `cell_key_digest`)
+     4. **Abort/retry** (no safe merge found)
+   - `LAB_UNSAFE`: Perform the SAFE ladder above. If it fails, the engine MAY
+     additionally merge `raw_xor_ranges` for explicitly-opaque pages only; it
+     MUST still reject raw XOR merging for SQLite structured pages (§3.4.5).
 
 This yields a strict safety ladder: we only take merges we can justify.
 
@@ -8602,14 +8814,21 @@ parse_statement()              -> Statement
 | 1 (lowest) | OR | Left |
 | 2 | AND | Left |
 | 3 | NOT (prefix) | Right |
-| 4 | =, ==, !=, <>, <, <=, >, >=, IS, IS NOT, IN, LIKE, GLOB, BETWEEN, MATCH, REGEXP | Left |
-| 5 | ESCAPE | Left |
-| 6 | &, \|, <<, >> | Left |
-| 7 | +, - | Left |
-| 8 | *, /, % | Left |
-| 9 | \|\| (concat), ->, ->> (JSON) | Left |
-| 10 | COLLATE | Left |
-| 11 (highest) | ~ (bitwise not), + (unary), - (unary) | Right |
+| 4 | =, ==, !=, <>, IS, IS NOT, IN, LIKE, GLOB, BETWEEN, MATCH, REGEXP | Left |
+| 5 | <, <=, >, >= | Left |
+| 6 | ESCAPE | Right |
+| 7 | &, \|, <<, >> | Left |
+| 8 | +, - | Left |
+| 9 | *, /, % | Left |
+| 10 | \|\| (concat), ->, ->> (JSON) | Left |
+| 11 | COLLATE | Left |
+| 12 (highest) | ~ (bitwise not), + (unary), - (unary) | Right |
+
+**NOTE:** Equality/membership operators (level 4) and relational operators
+(level 5) are at SEPARATE precedence levels, matching C SQLite's `parse.y`
+(`%left IS MATCH LIKE_KW BETWEEN IN ... NE EQ` then `%left GT LE LT GE`).
+This means `a = b < c` parses as `a = (b < c)`, NOT `(a = b) < c`.
+ESCAPE is `%right` (not `%left`) per `parse.y`.
 
 **Error recovery strategy:** On parse error, the parser:
 1. Records the error (token, expected alternatives, source span).
@@ -9782,19 +10001,20 @@ rebuilds indexes after collation sequence changes.
 
 Full expression grammar including all operators by precedence (highest first):
 
-| Precedence | Operators |
-|-----------|-----------|
-| 1 (highest) | `COLLATE` (postfix collation override) |
-| 2 | `~` (bitwise NOT), unary `+`, unary `-` |
-| 3 | `||` (string concat) |
-| 4 | `*`, `/`, `%` |
-| 5 | `+`, `-` |
-| 6 | `<<`, `>>`, `&`, `\|` |
-| 7 | `<`, `<=`, `>`, `>=` |
-| 8 | `=`, `==`, `!=`, `<>`, `IS`, `IS NOT`, `IS DISTINCT FROM`, `IS NOT DISTINCT FROM`, `IN`, `LIKE`, `GLOB`, `MATCH`, `REGEXP`, `BETWEEN` |
-| 9 | `NOT` (prefix logical negation -- lower than comparisons: `NOT x = y` parses as `NOT (x = y)`) |
-| 10 | `AND` |
-| 11 (lowest) | `OR` |
+| Precedence | Operators | Assoc |
+|-----------|-----------|-------|
+| 1 (highest) | `COLLATE` (postfix collation override) | Left |
+| 2 | `~` (bitwise NOT), unary `+`, unary `-` | Right |
+| 3 | `\|\|` (string concat), `->`, `->>` (JSON extract) | Left |
+| 4 | `*`, `/`, `%` | Left |
+| 5 | `+`, `-` | Left |
+| 6 | `<<`, `>>`, `&`, `\|` | Left |
+| 7 | `ESCAPE` | Right |
+| 8 | `<`, `<=`, `>`, `>=` | Left |
+| 9 | `=`, `==`, `!=`, `<>`, `IS`, `IS NOT`, `IS DISTINCT FROM`, `IS NOT DISTINCT FROM`, `IN`, `LIKE`, `GLOB`, `MATCH`, `REGEXP`, `BETWEEN` | Left |
+| 10 | `NOT` (prefix logical negation -- lower than comparisons: `NOT x = y` parses as `NOT (x = y)`) | Right |
+| 11 | `AND` | Left |
+| 12 (lowest) | `OR` | Left |
 
 **IMPORTANT:** `NOT` is NOT at the same precedence as unary `~`/`+`/`-`.
 In SQLite, `NOT x = y` means `NOT (x = y)`, not `(NOT x) = y`. This
@@ -11075,17 +11295,17 @@ raptorq integration: 2,000).
   isolation, `BEGIN IMMEDIATE` blocks other writers
 - Concurrent mode: Two transactions writing to different pages both commit
   successfully
-- Concurrent mode: Two transactions writing to the same page, second
-  committer gets `SQLITE_BUSY_SNAPSHOT`
+- Concurrent mode: Two transactions writing to the same page with a
+  non-mergeable conflict, second committer gets `SQLITE_BUSY_SNAPSHOT`
 - Concurrent mode: 100 threads each insert 100 rows into separate rowid
   ranges, all 10,000 rows present after all commits
 - Snapshot isolation: Long-running reader (started before writer) does not
   see writer's changes even after writer commits
 - Snapshot isolation: Reader started after writer commits sees all changes
-- Algebraic merge: Two transactions modify non-overlapping byte ranges of
-  the same page, both commit successfully via GF(256) merge
-- Algebraic merge: Two transactions modify overlapping byte ranges, merge
-  rejected, second committer aborted
+- Merge safety: SQLite structured pages MUST NOT be merged by raw byte-range
+  XOR; include a regression test for the B-tree lost-update counterexample
+  (cell move/defrag vs update at old offset) that must abort or resolve
+  semantically (never a silent lost update)
 - GC: Sustained write load of 1,000 transactions, memory usage bounded by
   O(active_transactions * pages_per_transaction), not O(total_transactions)
 - GC: Version chain length never exceeds active transaction count + 1
@@ -11121,9 +11341,11 @@ raptorq integration: 2,000).
   a read lock on active_transactions during snapshot capture.
 - GC must not reclaim versions needed by any active transaction. Mitigation:
   formal proof in Section 5.5, e-process monitoring at runtime.
-- Algebraic merge correctness depends on disjoint byte-range detection.
-  Off-by-one errors cause silent corruption. Mitigation: proptest with
-  random page mutations and merge verification.
+- Merge ladder correctness (intent replay + structured patches) is subtle:
+  a naive byte-range merge can silently lose writes on B-tree pages.
+  Mitigation: explicit counterexample tests + proptest/DPOR asserting that
+  any accepted merge is observationally equivalent to some serial ordering
+  of the intent ops, and passes integrity_check post-commit.
 - ARC cache interaction with MVCC versioning adds complexity to eviction
   decisions. Mitigation: start with simple LRU, upgrade to ARC once basic
   MVCC works.
@@ -11490,9 +11712,9 @@ forbidden; §5.6.4.1).
 
 Required scenarios (minimum set):
 - **Two writers, disjoint pages:** both commit; no FCW/SSI aborts.
-- **Two writers, same page, disjoint cell tags / byte ranges:** merge path
-  succeeds (§5.10) and emits `MergeWitness`; SSI does not emit spurious edges
-  at refined granularity.
+- **Two writers, same page, disjoint cell tags:** merge ladder succeeds (§5.10)
+  and emits `MergeWitness`; SSI does not emit spurious edges at refined
+  granularity.
 - **Classic write skew:** must abort under default SSI (`BEGIN CONCURRENT`),
   and must succeed under explicitly non-serializable mode (if enabled).
 - **Multi-process lease expiry + slot reuse:** reuse a TxnSlotId and validate
@@ -12006,9 +12228,10 @@ in the no-split case, ~12-20 in the split case.
 To validate the probabilistic model against actual conflict rates:
 
 1. **Instrumentation:** Add counters to the MVCC commit path:
-   - `conflicts_detected`: total page-level conflicts
-   - `conflicts_merged`: conflicts resolved by algebraic merge
-   - `conflicts_aborted`: conflicts that caused transaction abort
+   - `conflicts_detected`: total FCW base-drift conflicts (commit-index says base changed)
+   - `conflicts_merged_rebase`: conflicts resolved by deterministic rebase (intent replay)
+   - `conflicts_merged_structured`: conflicts resolved by structured patch merge
+   - `conflicts_aborted`: conflicts that caused transaction abort/retry
    - `total_commits`: total commit attempts
    - `pages_per_commit`: histogram of write set sizes
 
@@ -12022,41 +12245,36 @@ To validate the probabilistic model against actual conflict rates:
    result: uniform model matches uniform workload within 10%, Zipf model
    matches skewed workloads within 20%.
 
-### 18.7 Impact of Algebraic Write Merging
+### 18.7 Impact of Safe Write Merging
 
-Algebraic write merging (Section 3.4.5) reduces the effective conflict rate
-by resolving page-level conflicts at byte level.
+Safe write merging (§5.10; §3.4.5) reduces aborts by converting some FCW
+base-drift conflicts into successful commits *only when the underlying intent
+operations commute*.
 
-**Worked example:**
-- Table page: 4096 bytes, containing ~40 rows of ~100 bytes each
-- T1 inserts row at cell offset 200, modifying bytes 200-300
-- T2 inserts row at cell offset 3500, modifying bytes 3500-3600
-- Without merge: page conflict, one transaction aborted
-- With merge: byte ranges [200,300] and [3500,3600] are disjoint,
-  algebraic merge succeeds, both transactions commit
+**Worked example (semantic, not byte offsets):**
+- Two concurrent transactions `T1` and `T2` both INSERT distinct keys that land
+  on the same leaf page.
+- Without merge: `T2` hits FCW base drift at commit and aborts/retries.
+- With merge ladder (`PRAGMA fsqlite.write_merge = SAFE`): `T2` rebases its
+  `IntentOp::Insert` against the current committed snapshot (or merges a
+  `StructuredPagePatch` keyed by `cell_key_digest`), producing a page that
+  contains both inserts.
 
-**Effective conflict rate reduction:**
-For a page with C cells, two random insertions have a byte-level conflict
-probability of approximately:
+Note that the physical byte regions touched by the two inserts may overlap
+(cell pointer array growth, free space accounting, defragmentation). SAFE merge
+is possible anyway because the merge predicate is **semantic disjointness**,
+not byte disjointness.
+
+**Effective abort reduction model:**
+
+Let `f_merge` be the empirically-measured fraction of detected FCW conflicts
+that are resolved by the SAFE merge ladder (rebase + structured patches). Then:
+
 ```
-P(byte conflict) ~ P(page conflict) * (avg_cell_size / page_size)
-                 ~ P(page conflict) * (1/C)
+P_abort_eff ≈ P_conflict * (1 - f_merge)
 ```
 
-For a page with 40 cells, this gives a ~97.5% theoretical upper bound
-assuming two uniformly-random cell-only insertions with no shared page
-metadata. In practice, this upper bound is rarely achieved because:
-- The cell pointer array (2 bytes per cell, at the front of the page)
-  is modified by all insertions, creating a shared conflict region.
-- Free block list and content area offset are shared metadata.
-- B-tree cell allocation is not uniformly random (new cells pack toward
-  the content area boundary).
-
-**Realistic estimate:** For INSERT-heavy workloads, algebraic merge reduces
-effective conflict rate by 30-60%. For UPDATE-heavy workloads, the reduction
-is smaller (10-20%) because updates are more likely to modify shared
-page-level structures (cell pointer array reordering). These figures are
-empirical targets to be validated (see §18.6).
+`f_merge` is workload-dependent and must be measured (see §18.6), not assumed.
 
 ### 18.8 Throughput Model
 
@@ -12082,7 +12300,7 @@ For the typical case (medium DB, moderate writers):
 - P = 100,000 pages, W = 50 pages/txn, N = 8 writers
 - P(pairwise conflict) ~ 1 - e^(-50^2/100000) ~ 0.025
 - P(any conflict for one txn) ~ 1 - (1-0.025)^7 ~ 0.16
-- With algebraic merge reducing 40%: effective P_abort ~ 0.10
+- With safe merge ladder resolving f_merge=0.40 of detected conflicts (empirical): effective P_abort ~ 0.10
 - With one retry: P_abort ~ 0.01
 - TPS ~ 8 * 0.99 / T_txn
 
@@ -12461,9 +12679,10 @@ Every phase must pass all applicable gates before proceeding to the next.
 - Serialized mode: behavior identical to C SQLite for single-writer test suite
 - Rebase merge: 1,000 merge attempts with distinct-key inserts on same page,
   zero false rejections
-- Algebraic merge: 1,000 merge attempts with known-disjoint byte
-  modifications, zero false rejections; 1,000 attempts with overlapping
-  modifications, zero false acceptances
+- Structured merge safety: 1,000 merge attempts with commuting, cell-key-disjoint
+  operations on the same page, no lost updates; negative tests for the B-tree
+  lost-update counterexample (cell move/defrag vs update at old offset) are
+  never accepted
 - Crash model: 100 crash-recovery scenarios validating self-healing durability
   contract (Section 7.9)
 
