@@ -1305,6 +1305,17 @@ Replication Packet (variable size, typically 4104 bytes):
 Total packet size: 8 + T bytes (e.g., 8 + 4096 = 4104 bytes)
 ```
 
+**Hard wire limit (physical):** For IPv4 UDP, the application payload MUST be
+`<= 65,507` bytes. Therefore, `8 + T <= 65,507`. Implementations MUST reject
+any configuration that violates this bound.
+
+**Reliability note (normative guidance):** IP fragmentation amplifies loss:
+when a single symbol is split across many Ethernet frames, losing any one frame
+drops the entire symbol. Therefore, for MTU-constrained networks, implementations
+SHOULD choose a symbol size that avoids fragmentation entirely (e.g., `T <= 1366`
+for Ethernet MTU 1500 with the 8-byte header above), or use RFC 6330 sub-blocking
+to achieve an MTU-safe `T`.
+
 For MTU-constrained networks (e.g., standard Ethernet MTU = 1500 bytes),
 the symbol size T can be reduced by sub-dividing each page into sub-symbols.
 A 4096-byte page becomes 3 sub-symbols of 1400 bytes each (with 4096 - 4200
@@ -1897,21 +1908,36 @@ partition_page_groups(db_size_pages: u32) -> Vec<PageGroup>:
     return groups
 ```
 
-The repair symbols for each group are stored in a dedicated region of the
-database file, after the main page area. The file layout becomes:
+**SQLite file-format compatibility rule (normative):** In Compatibility mode,
+the SQLite `.db` file MUST remain a pure page array of size `P * page_size`. It
+MUST NOT embed any FrankenSQLite-specific "repair region" past the last page.
+(Many SQLite tools rewrite/truncate the database to exactly
+`db_size_pages * page_size` during VACUUM/backup/restore; appending extra bytes
+invites silent loss.)
+
+Therefore, the repair symbols for each page group are stored in a **sidecar**
+file, analogous to `.wal-fec`:
+
+- **Compatibility mode:** `foo.db-fec` adjacent to `foo.db` (or under the
+  database's `.fsqlite/` directory).
+- **Native mode:** the same idea is represented as ECS objects in the symbol
+  store; no SQLite `.db` file is ever treated as authoritative state.
+
+**Sidecar layout (Compatibility mode):**
 
 ```
-Database File Layout (with erasure coding):
-    Offset 0:                   Database header (page 1, 4096 bytes)
-    Offset page_size:           Page 2
-    ...
-    Offset (P-1)*page_size:     Page P
-    Offset P*page_size:         Repair region header (4096 bytes)
-    Offset (P+1)*page_size:     Repair symbols for group 0
-    ...
-    Offset (P+1+R0)*page_size:  Repair symbols for group 1
-    ...
+foo.db       -- standard SQLite database file (no trailing repair region)
+foo.db-fec   -- page-group repair symbols + metadata
 ```
+
+`foo.db-fec` MUST begin with a small header that is sufficient to locate/repair
+page 1 even if the SQLite header page is corrupted. At minimum it MUST
+redundantly store:
+
+- `page_size`
+- the page-group policy parameters (G/R and the page-1 special case)
+- a digest binding it to the target `foo.db` generation (so stale sidecars are
+  detected and ignored)
 
 **Read Path with On-the-Fly Repair**
 
@@ -1927,7 +1953,8 @@ read_page_with_repair(pgno: PageNumber) -> Result<PageData>:
         return Ok(page)    // Page is intact, zero overhead
 
     // Step 2: Page is corrupted. Attempt on-the-fly repair.
-    group = find_page_group(pgno)
+    // The group lookup uses `.db-fec` geometry and MUST NOT depend on page 1.
+    group = find_page_group_from_db_fec(pgno)
 
     // Read all pages in the group + repair symbols
     available_symbols = []
@@ -1940,7 +1967,7 @@ read_page_with_repair(pgno: PageNumber) -> Result<PageData>:
 
     // Read repair symbols for this group
     for r in 0..group.repair:
-        repair_data = read_repair_symbol(group, r)
+        repair_data = read_repair_symbol_from_db_fec(group, r)
         if verify_checksum_repair(group, r, repair_data):
             available_symbols.append((group.size + r, repair_data))    // ISI = G + r
 
@@ -1953,7 +1980,7 @@ read_page_with_repair(pgno: PageNumber) -> Result<PageData>:
         // Extract the corrupted page from recovered data
         repaired_page = recovered[pgno - group.start]
 
-        // Write back the repaired page (self-healing)
+        // Write back the repaired page (self-healing) using the normal durability path.
         write_raw_page(pgno, repaired_page)
         update_checksum(pgno, compute_xxhash3(repaired_page))
 
@@ -2501,7 +2528,7 @@ policy (K/R), and repair story.
 | Subsystem | ECS Object Type | Symbol Policy | Repair Story |
 |-----------|----------------|---------------|--------------|
 | Commits | `CommitCapsule` + `CommitProof` (coded) + `CommitMarkerRecord` (marker stream) | Capsule/Proof: T = `min(page_size, 4096)`, R = 20% default; Marker: 88B fixed records | Capsule/Proof: decode from surviving symbols; Marker: torn-tail ignore + `record_xxh3` + hash-chain audit |
-| Checkpoints | `CheckpointChunk` | T = 4096–65535B, R = policy-driven | Chunked snapshot objects; rebuild from marker stream if lost |
+| Checkpoints | `CheckpointChunk` | T = 1024–4096B, R = policy-driven | Chunked snapshot objects; rebuild from marker stream if lost |
 | Indices | `IndexSegment` (Page, Object, Manifest) | T = 1280–4096B, R = 20% default | Decode or rebuild-from-marker-scan |
 | Page storage | `PageHistory` | T = page_size, R = per-group | Decode from group symbols; on-the-fly repair on read |
 
@@ -2588,7 +2615,7 @@ tuning:
 |------------|-------------------|-----------|
 | `CommitCapsule` | `min(page_size, 4096)` | Aligns encoding with page boundaries; `u16`-bounded |
 | `IndexSegment` | 1280–4096 bytes | Metadata-heavy; smaller symbols reduce tail loss impact |
-| `CheckpointChunk` | 16384–65535 bytes | Throughput-optimized for bulk local writes; falls back to page-sized for compat export |
+| `CheckpointChunk` | 1024–4096 bytes | MTU-safe for UDP symbol emission; large objects use larger K/more blocks rather than huge T |
 | `PageHistory` | page_size (4096) | Natural alignment with page boundaries |
 
 All sizing is versioned in `RootManifest` so replicas decode correctly.
@@ -7658,9 +7685,11 @@ SQLite's WAL design prevents double-write corruption through:
 3. **Commit frame marker:** A frame with non-zero `db_size` field marks a
    transaction boundary. Partial transactions (no valid commit frame) are
    discarded during recovery.
-4. **Sector size alignment:** Frames align to filesystem sector size (detected
-   via `VfsFile::sector_size()`, typically 4096 on SSDs). A torn write
-   affects at most one frame.
+4. **Tightly-packed frames:** WAL frames are NOT sector-aligned; each frame
+   (24-byte header + page_size bytes) follows the previous with no padding.
+   Torn writes are detected by the cumulative checksum chain, not by
+   alignment. (Contrast with rollback journal, where the header IS padded
+   to sector size.)
 
 **FrankenSQLite addition:** RaptorQ repair symbols (Section 3.4.1) turn
 "detect and discard" into "detect and repair" -- corrupted frames within a
@@ -7767,8 +7796,8 @@ verifiability:
   SHM protocol, §5.6.7). To interoperate with legacy writers, run without
   `foo.db.fsqlite-shm` (file-lock fallback, §5.6.6.2), which disables
   multi-writer MVCC and SSI.
-- We may write *extra* sidecars (`.wal-fec` for repair symbols, `.idx-fec`
-  for index repair) but the core `.db` stays SQLite-compatible when
+- We may write *extra* sidecars (`.wal-fec` for WAL repair symbols, `.db-fec`
+  for page-group repair symbols, `.idx-fec` for index repair) but the core `.db` stays SQLite-compatible when
   checkpointed.
 - This is the default mode for conformance testing.
 
@@ -7926,7 +7955,7 @@ optimal batch size derivation (§4.5) already accounts for `t_fsync`.
 
 ### 7.12 Native Mode Recovery Algorithm
 
-1. Load `RootManifest` via `ecs/manifest.root` (§3.5.5).
+1. Load `RootManifest` via `ecs/root` (§3.5.5).
 2. Locate the latest checkpoint (if any) and its manifest.
 3. Scan marker stream from the checkpoint tip forward (or from genesis).
 4. For each marker:
@@ -12988,7 +13017,7 @@ Mitigations:
 Mitigations:
 - Shared-memory coordination protocol specified (Section 5.6.1).
 - Lease-based TxnSlot cleanup handles process crashes without blocking.
-- In-process MVCC is validated first (Phase 6), cross-process follows (Phase 7).
+- Both in-process and cross-process MVCC are validated in Phase 6.
 - Explicit tests for multi-process behaviors required before shipping.
 
 **R6. File format compatibility vs "do it right".**
@@ -13044,8 +13073,9 @@ trees: optimistic descent + right-sibling guidance + deterministic retry.
 ### 21.2 Cross-Process MVCC (Implementation Notes)
 
 Cross-process MVCC is specified in Section 5.6.1. Implementation notes:
-- Phase 6 validates in-process MVCC correctness
-- Phase 7 extends to cross-process using the shared-memory coordination region
+- Phase 6 validates both in-process and cross-process MVCC correctness
+  (the Phase 6 gates in §22 explicitly test multi-process lease expiry
+  and TxnSlot reuse; Phase 7 is "Advanced Query Planner", not cross-process)
 - Key challenge: benchmarking the mmap-based TxnSlot array vs in-process atomics
 - Lease-based cleanup must be stress-tested under process crash scenarios
 
@@ -13120,7 +13150,7 @@ the row-store B-tree:
 Section 3.4.6 fully specifies erasure-coded page storage. Implementation notes:
 - Modified page allocation: allocate G pages as a group
 - Repair page storage: in the ECS object store (Native mode) or in a
-  dedicated repair region of the database file (Compatibility mode)
+  `foo.db-fec` sidecar file (Compatibility mode)
 - Read path: attempt source page first, fall back to erasure recovery
 - Group size selection: benchmark G=32, G=64, G=128 to find the optimal
   balance of space overhead vs recovery capability per workload
