@@ -3486,9 +3486,11 @@ use asupersync::lab::oracle::eprocess::{EProcess, EProcessConfig};
 /// where KL is the Kullback-Leibler divergence.
 fn create_mvcc_monitors() -> Vec<EProcess> {
     vec![
-        // INV-1: Monotonicity. Enforced by hardware atomics; any violation
-        // is a catastrophic bug. Each violation roughly doubles E (factor ≈ 2.0);
-        // ~20 violations cross the 1/alpha = 1e6 threshold (log2(1e6) ≈ 20).
+        // INV-1: Monotonicity. Enforced by hardware atomics; any violation is a
+        // catastrophic bug. For this class of invariant, the correct response is
+        // to fail-fast on the first observed violation (assert/panic), while the
+        // e-process provides an auditable, anytime-valid *ledger* for long-running
+        // fuzz/lab traces (optional stopping safe).
         EProcess::new("INV-1: TxnId/CommitSeq Monotonicity", EProcessConfig {
             p0: 1e-9, lambda: 0.999, alpha: 1e-6, max_evalue: 1e18,
         }),
@@ -3797,6 +3799,35 @@ This provides:
   `N_opt = sqrt(t_fsync / t_validate) = sqrt(400) = 20`. The capacity of 16
   is below this optimum, so the system naturally batches up to 16 per fsync
   under saturation, which is near-optimal.
+
+**Alien-artifact upgrade (recommended): Conformal control for batch size**
+
+The derivation above uses point estimates. In reality, `t_fsync` and
+`t_validate` are random variables with heavy tails and regime shifts
+(queue depth, background compaction, device health).
+
+The coordinator SHOULD therefore choose `N` using conservative, distribution-free
+upper quantiles *within the current BOCPD regime* (§4.8):
+
+1. Maintain bounded calibration windows (ring buffers) of recent measurements:
+   - `fsync_samples = {t_fsync_i}` from completed batches
+   - `validate_samples = {t_validate_i}` from per-commit validation
+2. Compute conformal upper quantiles (split conformal; §4.7):
+   - `q_fsync := Q_{1-α}(fsync_samples)`
+   - `q_validate := Q_{1-α}(validate_samples)`
+3. Choose:
+
+```
+N_conformal = clamp(round(sqrt(q_fsync / q_validate)), 1, C)
+```
+
+**Operational rules (normative):**
+- On a BOCPD regime shift for fsync/validate streams, the calibration windows
+  MUST reset (new regime, new quantiles).
+- `N` MUST change with hysteresis (e.g., require a 2-step improvement) to avoid
+  thrash; policy changes MUST be logged in the evidence ledger (§4.16.1).
+- Under `LabRuntime`, the decision MUST be deterministic for a fixed
+  (seed, trace): calibration uses the lab clock (not wall clock).
 
 ### 4.6 Sheaf-Theoretic Consistency Checking (Optional, Speculative)
 
@@ -5885,7 +5916,7 @@ SSI tracks rw-antidependencies over a canonical key space:
 ```text
 WitnessKey =
   | Page(pgno: u32)
-  | Cell(page: u32, cell_tag: u32)
+  | Cell(btree_root_pgno: u32, cell_tag: u32)
   | ByteRange(page: u32, start: u16, len: u16)
   | KeyRange(index_id: u32, lo: Key, hi: Key)   // optional, advanced
   | Custom(namespace: u32, bytes: [u8])
@@ -5894,6 +5925,25 @@ WitnessKey =
 **Correctness rule:** It is always valid to fall back to `Page(pgno)` even if
 higher-resolution keys exist. Finer keys exist to reduce false positives and
 unlock safe merge/refinement (§5.10), never to preserve correctness.
+
+**Implementation directive (critical for deterministic rebase/merge):**
+The SSI witness plane is fed by *semantic* operations (VDBE/B-tree), not raw
+pager I/O. Implementations MUST NOT register `WitnessKey::Page(pgno)` reads just
+because a cursor traversed or inspected a B-tree page. Doing so makes almost all
+writers appear read-dependent on the pages they modify, collapsing safe merge
+and deterministic rebase (§5.10.2) back to abort/retry.
+
+Instead, the B-tree/VDBE MUST register witnesses at key granularity:
+- **Point read / uniqueness check (including "negative read"):**
+  `WitnessKey::Cell(btree_root_pgno, cell_tag(key_bytes))`
+- **Point write (insert/delete/update by key):**
+  `WitnessKey::Cell(btree_root_pgno, cell_tag(key_bytes))`
+- `btree_root_pgno` is the SQLite B-tree root page number for the table or
+  index (stable namespace; see §11.11 `sqlite_master.rootpage`).
+
+`cell_tag(key_bytes)` MUST be deterministic and stable across processes. A
+recommended derivation is:
+`cell_tag = low32(xxh3_64("fsqlite:witness:cell:v1" || le_u32(btree_root_pgno) || canonical_key_bytes))`.
 
 ##### 5.6.4.4 RangeKey: Hierarchical Buckets Over WitnessKey Hash Space
 
@@ -6251,10 +6301,19 @@ maintain the standard `foo.db-shm` WAL-index:
    - Use the dual-copy protocol (write copy 1, then copy 2) so lock-free
      readers see a consistent snapshot.
 
-3. **Maintain reader marks.** FrankenSQLite readers MUST also write an
-   `aReadMark` in the standard WAL-index corresponding to their snapshot
-   frame. This prevents a C SQLite checkpointer from overwriting frames
-   that FrankenSQLite readers still need.
+3. **Maintain reader marks + reader locks.** FrankenSQLite readers MUST
+   participate in SQLite's WAL reader protocol, not just its metadata:
+   - A FrankenSQLite reader MUST acquire and hold a legacy `WAL_READ_LOCK(i)`
+     (shared lock on the corresponding `aLock` byte in `foo.db-shm`; see §11.10)
+     before writing `aReadMark[i]`.
+   - It MUST write `aReadMark[i]` while holding `WAL_READ_LOCK(i)`.
+   - It MUST hold `WAL_READ_LOCK(i)` for the full lifetime of the snapshot,
+     releasing it only when the snapshot ends.
+   This is non-negotiable: legacy checkpointers consult the read locks to decide
+   which `aReadMark` entries are live. Updating `aReadMark` without holding the
+   matching `WAL_READ_LOCK(i)` can cause overwritten frames and silent corruption.
+   If no `WAL_READ_LOCK(i)` slot is available, the reader MUST return `SQLITE_BUSY`
+   (or wait per busy-timeout).
 
 4. **Checkpoint coordination.** Checkpoint logic (§7.5) MUST update
    `nBackfill` in the standard `WalCkptInfo` during backfill.
@@ -7368,7 +7427,70 @@ IntentOpKind ::=
   | Update { table: TableId, key: RowId, new_record: Vec<u8> }
   | IndexInsert { index: IndexId, key: Vec<u8>, rowid: RowId }
   | IndexDelete { index: IndexId, key: Vec<u8>, rowid: RowId }
+  | UpdateExpression {
+      table: TableId,
+      key: RowId,
+      column_updates: Vec<(ColumnIdx, RebaseExpr)>,
+  }
+
+// Simplified, serializable expression AST for replayable column updates.
+// Each variant is a pure, deterministic computation that can be re-evaluated
+// against a different base row during rebase.
+RebaseExpr ::=
+  | ColumnRef(ColumnIdx)              // read current value of column N from the base row
+  | Literal(SqliteValue)              // constant: integer, real, text, blob, null
+  | BinaryOp {
+      op: { Add | Sub | Mul | Div | Rem | BitAnd | BitOr | ShiftL | ShiftR
+          | Eq | Ne | Lt | Le | Gt | Ge | And | Or },
+      lhs: Box<RebaseExpr>,
+      rhs: Box<RebaseExpr>,
+  }
+  | UnaryOp {
+      op: { Neg | BitNot | Not },
+      operand: Box<RebaseExpr>,
+  }
+  | FunctionCall {
+      fn_id: DeterministicFnId,       // must satisfy ScalarFunction::is_deterministic() (§8.2)
+      args: Vec<RebaseExpr>,
+  }
+  | Cast {
+      operand: Box<RebaseExpr>,
+      target_affinity: TypeAffinity,
+  }
+  | Case {
+      operand: Option<Box<RebaseExpr>>,
+      when_clauses: Vec<(RebaseExpr, RebaseExpr)>,
+      else_clause: Option<Box<RebaseExpr>>,
+  }
+  | Coalesce(Vec<RebaseExpr>)         // COALESCE(a, b, ...): first non-NULL
+  | NullIf {
+      lhs: Box<RebaseExpr>,
+      rhs: Box<RebaseExpr>,
+  }
+  | Concat {                          // || operator: text concatenation
+      operands: Vec<RebaseExpr>,
+  }
 ```
+
+**Expression safety analysis (normative):**
+
+```
+fn expr_is_rebase_safe(expr: &Expr) -> Option<RebaseExpr>
+```
+
+Walks the resolved AST expression tree and attempts to lower it into a `RebaseExpr`.
+Returns `None` (rejecting the expression) if any of the following are encountered:
+- Subqueries (scalar, `EXISTS`, `IN (SELECT ...)`)
+- Non-deterministic functions (any `ScalarFunction` where `is_deterministic()` returns
+  `false`; see §8.2 line ~9573)
+- Aggregate functions or window functions
+- Correlated column references (references to tables other than the UPDATE target)
+- `RANDOM()`, `LAST_INSERT_ROWID()`, or any function with session/connection state dependency
+- User-defined functions not registered with the `SQLITE_DETERMINISTIC` flag
+
+When `expr_is_rebase_safe` returns `Some(rebase_expr)`, the expression is guaranteed
+to be a pure function of the target row's column values and constants, and can be
+safely re-evaluated against any base row version.
 
 Intent logs are *small* (typically tens of entries) and encode/replicate
 efficiently as ECS objects. They are the preferred merge substrate because
@@ -7395,20 +7517,57 @@ updated since its snapshot, we attempt **deterministic rebase**:
    commit proceeds with the rebased page deltas.
 5. **If replay fails** (true conflict, constraint violation): abort/retry.
 
-**Safety Constraint (Read-Dependency Check):** Rebase MUST NOT proceed if the
-transaction has any SSI read-dependency on the page/key being modified, or if
-any `IntentOp.footprint.reads` is non-empty. Replaying a write that depended on
-a previous read against a *different* base version creates a Lost Update (Write
-Skew).
+**Safety Constraint (Refined Read-Dependency Check):** Rebase safety depends on
+distinguishing two categories of reads:
 
-**Limitation (Blind Writes):** Consequently, V1 rebase is strictly limited to
-**pure blind writes** where the transaction performed no semantic reads
-(`IntentOp.footprint.reads` is empty) and did not trigger structural side-effects
-(`IntentOp.footprint.structural == NONE`).
-Arithmetic read-modify-write operations (e.g., `SET c = c + 1`) or conditional
-updates based on read values cannot be merged. Future work may add
-`IntentOp::UpdateExpression` to enable AST-based merge logic that re-evaluates
-reads against the new base.
+- **Blocking reads:** Reads recorded in `footprint.reads` — values the transaction
+  consumed for decisions NOT captured in replayable expressions. A blocking read
+  creates a stale dependency on the snapshot base. If any `IntentOp.footprint.reads`
+  is non-empty, rebase MUST NOT proceed (replaying against a different base creates
+  a Lost Update / Write Skew).
+- **Expression reads:** Column reads embedded in `RebaseExpr` within an
+  `UpdateExpression` intent. These are NOT recorded in `footprint.reads` because
+  the read is captured in the expression AST itself. During rebase, the expression
+  is re-evaluated against the new committed base row, so no stale dependency exists.
+
+**Rebase rule (normative):** Rebase proceeds when ALL of:
+1. `footprint.reads` is empty for every `IntentOp` in the transaction's intent log, AND
+2. `footprint.structural == NONE` for every `IntentOp`.
+
+`UpdateExpression` ops do NOT add their implicit column reads to `footprint.reads`
+because the reads are captured in `RebaseExpr` and will be replayed. The VDBE MUST
+ensure this invariant (see codegen rules below).
+
+**Rebase algorithm for `UpdateExpression` (normative):**
+
+For each `UpdateExpression { table, key, column_updates }` in the intent log during
+rebase replay:
+1. Read the target row from the new committed base by `key` (rowid lookup).
+2. If the row was deleted in the new base → abort (true conflict; the row no longer
+   exists and the expression cannot be evaluated).
+3. For each `(col_idx, rebase_expr)` in `column_updates`: evaluate `rebase_expr`
+   against the new base row's column values. `ColumnRef(i)` resolves to column `i`
+   of the new base row, not the original snapshot row.
+4. Produce the updated row record from the new base row with the evaluated column
+   updates applied. Emit as a page delta.
+5. Type affinity coercion follows standard SQLite rules (§3.1 of the SQLite file
+   format documentation). NULL propagation follows SQL semantics.
+
+**VDBE codegen rules for `UpdateExpression` emission (normative):**
+
+The code generator emits an `UpdateExpression` intent (instead of a materialized `Update`
+with the row read in `footprint.reads`) when ALL of:
+- The WHERE clause resolves to a point lookup by rowid or integer primary key
+  (not a range scan, not a secondary index scan with multiple candidates).
+- All SET expressions pass `expr_is_rebase_safe()` (§5.10.1): pure, deterministic,
+  no subqueries, no non-deterministic functions.
+- The transaction has no prior explicit read of the same row (via SELECT or
+  otherwise) that would have already recorded a `SemanticKeyRef` in
+  `footprint.reads` for this key. If such a read exists, the stale-dependency
+  is already established and `UpdateExpression` cannot remove it.
+
+Otherwise, the VDBE falls back to a materialized `Update` with the row read
+recorded in `footprint.reads` (blocking rebase for this transaction).
 
 This is "merge by re-execution", not "merge by bytes". It gives us *row-level
 concurrency effects* without storing row-level MVCC metadata.
@@ -7425,14 +7584,18 @@ operations. Conformance is defined on observable behavior (query results and
 integrity checks), not on matching legacy cell-placement heuristics (see risk
 R6, §21).
 
-**V1 scope restriction (normative):** Deterministic rebase is permitted only
-for a restricted, proven-safe subset of B-tree operations. In V1, a rebase
-attempt MUST reject (and fall back to the next merge ladder step, §5.10.4) if
-replay would require any of:
+**Structural scope restriction (normative):** Deterministic rebase is permitted
+only for a restricted, proven-safe subset of B-tree operations. A rebase attempt
+MUST reject (and fall back to the next merge ladder step, §5.10.4) if replay
+would require any of:
 - page split/merge/balance across multiple pages,
 - overflow allocation or overflow chain mutation,
 - freelist trunk/leaf mutation beyond the leaf page itself, or
 - any non-deterministic tie-breaking (HashMap iteration, wall-clock time).
+
+These are correctness constraints (not version limitations): the structural
+operations above interact with global page-allocation state that cannot be safely
+replayed against a different base without full B-tree re-traversal.
 
 #### 5.10.3 Physical Merge: Structured Page Patches
 
@@ -7498,9 +7661,9 @@ page layout shifts during a concurrent split.
 3. A `StructuredPagePatch` merge MUST treat `header_ops` as non-commutative:
    if both patches include header mutations that cannot be serialized without
    ambiguity, the merge MUST reject and fall back to abort/retry.
-4. For V1, `free_ops` are conservative: if either patch includes non-empty
-   `free_ops`, the merge MUST reject unless the implementation can prove safe
-   composition by construction (future work).
+4. `free_ops` are conservative: if either patch includes non-empty `free_ops`,
+   the merge MUST reject unless the implementation can prove safe composition
+   by construction (provable via proptest over randomized free-list states).
 
 #### 5.10.4 Commit-Time Merge Policy (Strict Safety Ladder)
 
@@ -7512,9 +7675,12 @@ When txn `U` reaches commit, for each page in `write_set(U)`:
    - `SAFE`: Attempt merge in strict priority order:
      1. **Schema epoch check (required):** If `current_schema_epoch != U.snapshot.schema_epoch`,
         abort with `SQLITE_SCHEMA` (merging across DDL/VACUUM boundaries is forbidden).
-     2. **Deterministic rebase replay** (preferred, but restricted):
+     2. **Deterministic rebase replay** (preferred):
         - MUST verify `U` has no `ReadWitness` covering this page/key (see §5.10.2).
-        - If safe, replay `IntentOp` against current base.
+        - If safe, replay `IntentOp` against current base. For `UpdateExpression`
+          ops, re-evaluate column expressions against the new base row (§5.10.2).
+        - Handles both pure blind writes (`Insert`/`Delete`/`Update` with empty
+          `footprint.reads`) and expression-based updates (`UpdateExpression`).
      3. **Structured page patch merge** (if ops are disjoint by semantic key, e.g., `cell_key_digest`)
      4. **Abort/retry** (no safe merge found)
    - `LAB_UNSAFE`: Perform the SAFE ladder above. If it fails, the engine MAY
@@ -7533,6 +7699,13 @@ Runnable proofs (proptest + DPOR), not prose:
   when mergeable. Commutativity for declared commutative ops.
 - **Determinism:** Identical `(intent_log, base_snapshot)` yields identical
   replay outcome under `LabRuntime` across seeds.
+- **UpdateExpression determinism:** `evaluate_rebase_expr(expr, row)` is
+  deterministic for a given `(expr, row)` pair. Verified by proptest over
+  randomized `RebaseExpr` trees and row values.
+- **Expression safety:** `expr_is_rebase_safe` correctly rejects all
+  non-deterministic and side-effectful expressions. Verified by exhaustive
+  enumeration of rejected expression kinds (subqueries, non-deterministic
+  functions, aggregates, window functions, correlated references).
 
 #### 5.10.6 MVCC History Compression: PageHistory Objects
 
@@ -7565,8 +7738,22 @@ Two intent ops `a, b` are independent (written `(a, b) in I_intent`) iff:
 - `Writes(a) ∩ Writes(b) = ∅`, and
 - `Writes(a) ∩ Reads(b) = ∅` and `Writes(b) ∩ Reads(a) = ∅`.
 
-For V1 SAFE merges, an additional restriction applies:
-- `Reads(a)` and `Reads(b)` MUST both be empty (pure blind writes).
+For SAFE merges, an additional restriction applies:
+- `Reads(a)` and `Reads(b)` MUST both be empty. (For `UpdateExpression` ops, the
+  implicit column reads are captured in `RebaseExpr` and are NOT in `footprint.reads`,
+  so this condition is satisfied.)
+
+**`UpdateExpression` commutativity refinement:** Two `UpdateExpression` ops `a, b`
+targeting the same `(table, key)` are independent iff their `column_updates` sets
+are disjoint by `ColumnIdx`:
+- `columns_written(a) ∩ columns_written(b) = ∅`
+
+where `columns_written(x) := { col_idx | (col_idx, _) in x.column_updates }`.
+If any column index overlaps, the ops are NOT independent (the writes conflict
+on a sub-row granularity) and the merge MUST reject for that pair.
+
+An `UpdateExpression` and a materialized `Update` (or `Delete`) targeting the same
+key are NEVER independent (the materialized op replaces the entire row).
 
 Here `Reads(x)` and `Writes(x)` refer to the sets of `SemanticKeyRef` in
 `x.footprint`.
@@ -7584,18 +7771,21 @@ form derived from the trace monoid:
 This is the *exact* order that must be recorded in the merge certificate
 (§5.10.8).
 
-**V1 mergeable intent classes (normative):**
+**Mergeable intent classes (normative):**
 
-V1 SAFE merging is deliberately narrow. A merge attempt MUST reject unless all
+SAFE merging is deliberately narrow. A merge attempt MUST reject unless all
 involved intents are from this set:
 
 - `Insert/Delete/Update` on table B-tree leaf pages for distinct `RowId` keys,
   with no overflow and no multi-page balance.
+- `UpdateExpression` on table B-tree leaf pages, subject to the column-disjointness
+  rule above. Two `UpdateExpression` ops on the same `RowId` with disjoint
+  `ColumnIdx` sets are independent; overlapping column sets are not.
 - `IndexInsert/IndexDelete` on index B-tree leaf pages for distinct index keys,
   with no overflow and no multi-page balance.
 
 Any op with `footprint.structural != NONE` MUST be treated as non-commutative
-and MUST not be merged; abort/retry is the only safe path in V1.
+and MUST not be merged; abort/retry is the only safe path.
 
 **Key identity alignment (required):**
 
@@ -11307,8 +11497,8 @@ name and its tables are accessible as `schema-name.table-name`. The main
 database is always named `main`. The temp database is always named `temp`.
 Maximum 10 attached databases by default (`SQLITE_MAX_ATTACHED`). Cross-database
 transactions are atomic only in rollback journal mode (not WAL mode in
-standard SQLite; FrankenSQLite preserves this limitation initially, with
-cross-database atomic WAL transactions as future work).
+standard SQLite; FrankenSQLite MUST support cross-database atomic WAL
+transactions via two-phase commit across attached database WAL files).
 
 ### 12.12 EXPLAIN and EXPLAIN QUERY PLAN
 
