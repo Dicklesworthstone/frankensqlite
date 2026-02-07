@@ -974,131 +974,60 @@ Recovery:
     Else: transaction is truly lost (requires catastrophic multi-frame loss)
 ```
 
-**Concrete WAL Commit Frame Layout**
+**Concrete WAL Commit Frame Layout (Compatibility Mode)**
 
-Each frame in the WAL (both source and repair) has an identical physical
-structure:
+Standard SQLite WAL frames are exactly 24 bytes (header) + page_size (data). They have **no spare padding**. Therefore, we cannot embed RaptorQ metadata in the WAL file itself without breaking compatibility.
+
+Instead, we use a **sidecar file** (`.wal-fec`) to store repair symbols.
+
+**The `.wal` file:** Contains ONLY standard, valid SQLite WAL frames (source symbols).
+**The `.wal-fec` file:** Contains repair symbols and metadata for each commit group.
+
+**Sidecar (`.wal-fec`) Record Format:**
 
 ```
-Frame Layout (4120 bytes for 4096-byte pages):
-    Offset  Size    Field
-    ------  ----    -----
-    0       4       Page number (u32 big-endian)
-                    - For source frames: the actual database page number (1-based)
-                    - For repair frames: 0xFFFFFFFF (sentinel indicating repair)
-    4       4       Commit frame count (u32 big-endian)
-                    - Non-zero only on the LAST frame of a commit group
-                    - Equals N + R (total frames in commit group)
-                    - Zero for all other frames in the group
-    8       4       Checksum-1 (cumulative, SQLite-native algorithm)
-    12      4       Checksum-2 (cumulative, SQLite-native algorithm)
-    16      4       RaptorQ metadata (u32 big-endian):
-                    - Bits 31-28: repair symbol flag (0x0 = source, 0xF = repair)
-                    - Bits 27-24: reserved
-                    - Bits 23-0: encoding symbol ID (ISI)
-    20      4       Source block size K (u32 big-endian)
-                    - Number of source symbols (= N, the number of pages in commit)
-    24      4096    Page data (source frame) or repair symbol data (repair frame)
-
-Total frame size: 24 + page_size = 4120 bytes
+FecRecord {
+    group_id: u64,          // Stable ID for the commit group (e.g., salt + end_offset)
+    k_source: u16,          // Number of source pages in this group
+    r_repair: u16,          // Number of repair symbols stored here
+    symbol_size: u16,       // T (usually page_size)
+    page_numbers: [u32; K], // Ordered list of pgnos in this commit
+    repair_data: [u8; R*T], // Concatenated repair symbols
+    checksum: u64,          // Integrity check for the FEC record
+}
 ```
-
-The RaptorQ metadata field at offset 16 is stored in space that C SQLite
-reserves as padding in the frame header. This means the frame header remains
-exactly 24 bytes, maintaining compatibility with tools that scan WAL files.
-A C SQLite reader will see repair frames as writes to page 0xFFFFFFFF, which
-it will ignore (no valid page has that number). This provides forward
-compatibility: a C SQLite database can read a FrankenSQLite WAL and simply
-skip the repair frames.
 
 **Worked Example: Commit of 5 Pages with 2 Repair Symbols**
 
-Suppose a transaction modifies pages 7, 12, 45, 100, and 203. With
-`PRAGMA raptorq_repair_symbols = 2`, the WAL commit group contains 7 frames:
+Transaction writes pages 7, 12, 45, 100, 203. `PRAGMA raptorq_repair_symbols = 2`.
 
-```
-Frame 0 (Source, ISI=0):
-    [00000007 | 00000000 | cksum1 | cksum2 | 00000000 | 00000005 | <page 7 data, 4096B>]
-    Page number: 7, commit count: 0 (not last), ISI: 0, K: 5
+1.  **Write to `.wal`:**
+    - Write 5 standard SQLite WAL frames (pages 7, 12, 45, 100, 203).
+    - Total `.wal` growth: 5 * (24 + 4096) = 20,600 bytes.
+    - These are the K=5 source symbols.
 
-Frame 1 (Source, ISI=1):
-    [0000000C | 00000000 | cksum1 | cksum2 | 00000001 | 00000005 | <page 12 data, 4096B>]
+2.  **Write to `.wal-fec`:**
+    - Generate 2 repair symbols from the 5 pages.
+    - Append one `FecRecord` to `.wal-fec` containing:
+        - `k_source`=5, `r_repair`=2
+        - `page_numbers`=[7, 12, 45, 100, 203]
+        - `repair_data`=[8192 bytes of repair data]
+    - This happens *before* the `.wal` fsync.
 
-Frame 2 (Source, ISI=2):
-    [0000002D | 00000000 | cksum1 | cksum2 | 00000002 | 00000005 | <page 45 data, 4096B>]
+3.  **Commit:** `fsync` both files.
 
-Frame 3 (Source, ISI=3):
-    [00000064 | 00000000 | cksum1 | cksum2 | 00000003 | 00000005 | <page 100 data, 4096B>]
+**Recovery Algorithm (Compatibility Mode)**
 
-Frame 4 (Source, ISI=4):
-    [000000CB | 00000000 | cksum1 | cksum2 | 00000004 | 00000005 | <page 203 data, 4096B>]
+On recovery, we scan the `.wal` file. If we encounter a torn write (invalid checksum):
 
-Frame 5 (Repair, ISI=5):
-    [FFFFFFFF | 00000000 | cksum1 | cksum2 | F0000005 | 00000005 | <repair symbol 5, 4096B>]
-    Page number: sentinel, ISI: 5, repair flag: 0xF
-
-Frame 6 (Repair, ISI=6):
-    [FFFFFFFF | 00000007 | cksum1 | cksum2 | F0000006 | 00000005 | <repair symbol 6, 4096B>]
-    Page number: sentinel, commit count: 7 (last frame!), ISI: 6, repair flag: 0xF
-```
-
-Total WAL bytes for this commit: 7 * 4120 = 28,840 bytes.
-Without repair symbols: 5 * 4120 = 20,600 bytes.
-Overhead: 40% for R=2. This is configurable; R=1 gives 20% overhead.
-
-**Recovery Algorithm**
-
-When opening a database with a WAL file, FrankenSQLite scans the WAL and
-recovers commit groups:
-
-```
-recover_wal(wal_file):
-    frames = []
-    offset = 32    // skip WAL header
-
-    while offset < wal_file.size():
-        header = read_frame_header(wal_file, offset)
-
-        // Verify frame checksum
-        if not verify_checksum(header, wal_file, offset):
-            // Frame is corrupted (torn write)
-            frames.append(CorruptedFrame { offset, header })
-        else:
-            frames.append(ValidFrame { offset, header, data })
-
-        offset += 24 + page_size
-
-    // Group frames into commit groups
-    // (a commit group ends at a frame with non-zero commit count)
-    commit_groups = partition_into_commit_groups(frames)
-
-    for group in commit_groups:
-        valid_sources = [f for f in group if f.is_valid() and f.is_source()]
-        valid_repairs = [f for f in group if f.is_valid() and f.is_repair()]
-        corrupted     = [f for f in group if f.is_corrupted()]
-        K = group.source_block_size()    // from the K field in frame headers
-
-        if len(corrupted) == 0:
-            // No corruption: apply all source frames directly
-            apply_source_frames(valid_sources)
-
-        else if len(valid_sources) + len(valid_repairs) >= K:
-            // RaptorQ recovery possible!
-            decoder = RaptorQDecoder::new(K, page_size)
-            for f in valid_sources:
-                decoder.add_symbol(f.isi(), f.data())
-            for f in valid_repairs:
-                decoder.add_symbol(f.isi(), f.data())
-            recovered = decoder.decode()?
-            // Apply recovered source symbols as page writes
-            apply_recovered_pages(recovered, group.page_numbers())
-
-        else:
-            // Catastrophic loss: too many frames corrupted
-            // Discard this commit group (transaction is lost)
-            log_warning("Commit group at offset {} unrecoverable", group.offset)
-            break   // No further commit groups can be trusted
-```
+1.  Identify the damaged commit group in the `.wal`.
+2.  Locate the corresponding `FecRecord` in `.wal-fec` (matching offset/salt).
+3.  Collect valid source frames from `.wal` and repair symbols from `.wal-fec`.
+4.  If `valid_sources + valid_repairs >= K`:
+    - Decode to recover missing/corrupted source pages.
+    - Treat recovered pages as if they were successfully read from the WAL.
+5.  If `valid_sources + valid_repairs < K`:
+    - The commit is lost (catastrophic failure). Truncate WAL before this group.
 
 **PRAGMA raptorq_repair_symbols Semantics**
 
@@ -1955,51 +1884,42 @@ generation, and rebuildable indexes.
 
 #### 3.5.1 ObjectId: Content-Addressed Identity
 
-Every ECS object is identified by its ObjectId:
+Every ECS object is identified by its ObjectId. To ensure deterministic addressing across all replicas:
+
+**Canonical Encoding Rules (Deterministic Bytes, Not "Serde Vibes"):**
+- **Explicit versioned wire format:** The byte stream must be fully defined, not dependent on compiler layout or serialization library defaults.
+- **Little-endian integers:** All fixed-width integers use little-endian byte order (matches native x86/ARM/WASM).
+- **Sorted map keys:** If map-like structures are encoded, keys must be sorted lexicographically by byte representation.
+- **No floating-point in headers:** Canonical headers must use fixed-point or integers to avoid NaN/rounding non-determinism.
+
+**ObjectId Construction:**
 
 ```
-ObjectId := BLAKE3(canonical_encoding(object))    -- 32 bytes
+ObjectId = Trunc128( BLAKE3( "fsqlite:ecs:v1" || canonical_object_header || payload_hash ) )
 ```
 
-**Canonical encoding rules:**
-- All integers are little-endian (native x86/ARM byte order for zero-cost
-  decode on the dominant architectures).
-- All variable-length fields are prefixed with a `u32` byte count.
-- Struct fields are serialized in declaration order, no padding, no alignment
-  holes.
-- Enums use a `u8` discriminant followed by the variant's fields.
-- Floating-point values use IEEE 754 binary64 representation.
-- Strings are UTF-8 bytes (no null terminator).
-- Optional fields use `0x00` (absent) or `0x01` + value (present).
-
-This encoding is deterministic: the same logical object always produces the
-same byte sequence and therefore the same ObjectId. There is no ambiguity,
-no ordering sensitivity, no hash randomization.
+We use BLAKE3 for speed and security, truncated to 128 bits (16 bytes) for storage efficiency. The prefix "fsqlite:ecs:v1" prevents cross-protocol collisions.
 
 **ObjectId properties:**
-- Immutable: once created, an ObjectId never changes. Objects are
-  write-once-read-many.
-- Content-addressed: identical objects have identical ObjectIds. Deduplication
-  is automatic.
-- Collision-resistant: BLAKE3 provides 256-bit security. Probability of
-  collision is `2^-128` even after `2^64` objects.
+- Immutable: once created, an ObjectId never changes. Objects are write-once-read-many.
+- Content-addressed: identical objects have identical ObjectIds. Deduplication is automatic.
+- Collision-resistant: 128-bit BLAKE3 is sufficient for all non-adversarial collisions and most adversarial ones in this context.
 
 #### 3.5.2 Symbol Record Envelope
 
-Every ECS object is stored as one or more **symbol records**. A symbol
-record is the atomic unit of physical storage -- the smallest thing that
-can be read, written, verified, and transmitted.
+Every ECS object is stored as one or more **symbol records**. A symbol record is the atomic unit of physical storage -- the smallest thing that can be read, written, verified, and transmitted.
 
 ```
 SymbolRecord := {
     magic       : [u8; 4],      -- 0x46 0x53 0x45 0x43 ("FSEC")
     version     : u8,           -- envelope version (1)
-    object_id   : [u8; 32],     -- BLAKE3 hash of the logical object
+    object_id   : [u8; 16],     -- ObjectId (128-bit)
     oti         : OTI,          -- RaptorQ Object Transmission Information
     esi         : u32,          -- Encoding Symbol Identifier (which symbol this is)
     symbol_size : u32,          -- T: symbol size in bytes
     symbol_data : [u8; T],      -- the actual RaptorQ encoding symbol
-    checksum    : u64,          -- xxhash3 of all preceding fields
+    frame_xxh3  : u64,          -- xxhash3 of all preceding fields (fast integrity)
+    auth_tag    : [u8; 16],     -- Optional: HMAC/Poly1305 for authenticated transport
 }
 
 OTI := {
@@ -2011,16 +1931,10 @@ OTI := {
 }
 ```
 
-**Self-describing property:** A symbol record contains everything needed to
-decode it: the ObjectId identifies which object this symbol belongs to, the
-OTI provides the RaptorQ parameters, and the ESI identifies which encoding
-symbol this is. A decoder collecting K' symbols with the same ObjectId can
-reconstruct the original object without any external metadata.
+**Self-describing property:** A symbol record contains everything needed to decode it: the ObjectId identifies which object this symbol belongs to, the OTI provides the RaptorQ parameters, and the ESI identifies which encoding symbol this is. A decoder collecting K' symbols with the same ObjectId can reconstruct the original object without any external metadata.
 
-**Symbol record sizing:** For a given object, the symbol size `T` is chosen
-based on the object type:
-- **CommitCapsules:** Small symbols (T ≈ 256 bytes) for low-latency commit.
-  Typical capsule is 1-4 KB, encoded as 4-16 source symbols + repair.
+**Symbol record sizing:** For a given object, the symbol size `T` is chosen based on the object type:
+- **CommitCapsules:** Small symbols (T ≈ 256 bytes) for low-latency commit. Typical capsule is 1-4 KB, encoded as 4-16 source symbols + repair.
 - **Page snapshots:** T = page_size (4096 bytes). One source symbol per page.
 - **Index checkpoints:** Large symbols (T ≈ 4096-16384 bytes) for throughput.
 - **WAL segments:** T = WAL frame size for natural alignment.
@@ -2132,6 +2046,171 @@ Receiver:
 This is particularly effective for replication catch-up: a lagging replica
 can request "all commits since sequence N" as a single coded group, and
 recover even if some symbols are lost in transit (UDP multicast).
+
+#### 3.5.7 RaptorQ Permeation Map (Every Pore, Every Layer)
+
+This is the "no excuses" mapping from subsystem to ECS/RaptorQ role. If a
+subsystem persists or ships bytes, it MUST declare its ECS object type, symbol
+policy (K/R), and repair story.
+
+**Durability plane (disk):**
+
+| Subsystem | ECS Object Type | Symbol Policy | Repair Story |
+|-----------|----------------|---------------|--------------|
+| Commits | `CommitCapsule` + `CommitMarker` | T ≈ 256B, R = 20% default | Decode from surviving symbols; `DecodeProof` in lab/debug |
+| Checkpoints | `CheckpointChunk` | T = 4096–65535B, R = policy-driven | Chunked snapshot objects; rebuild from marker stream if lost |
+| Indices | `IndexSegment` (Page, Object, Manifest) | T = 1280–4096B, R = 20% default | Decode or rebuild-from-marker-scan |
+| Page storage | `PageHistory` | T = page_size, R = per-group | Decode from group symbols; on-the-fly repair on read |
+
+**Concurrency plane (memory):**
+
+| Subsystem | ECS Role | Notes |
+|-----------|----------|-------|
+| MVCC page history | `PageHistory` objects (patch chains) | Bounded by GC horizon; compressed via intent log + structured patches |
+| Conflict reduction | Intent logs as small ECS objects | Replayed deterministically for rebase merge |
+| Explainability | Abort witnesses as lab/debug artifacts | `(Pgno, reader_txn, writer_txn)` events |
+
+**Replication plane (network):**
+
+| Subsystem | Transport Primitive | Notes |
+|-----------|-------------------|-------|
+| Symbol streaming | `SymbolSink`/`SymbolStream` | Symbol-native, not file-native |
+| Anti-entropy | ObjectId set reconciliation | "Which ObjectIds do you have?" + "Send any symbols" |
+| Bootstrap | `CheckpointChunk` symbol streaming | Late-join = collect K symbols |
+| Multipath | `MultipathAggregator` | Any K symbols from any path suffice |
+
+**Observability plane (alien-artifact explainability):**
+
+| Subsystem | Mechanism | Notes |
+|-----------|-----------|-------|
+| Repair auditing | `DecodeProof` artifacts | Attached to lab traces when repair occurs |
+| Schedule exploration | `LabRuntime` deterministic trace | Reproducible concurrency bugs from a single seed |
+| Invariant monitoring | e-process monitors | MVCC invariants, memory bounds, replication divergence |
+| Model checking | `TLA+ export` of traces | Bounded model checking of commit/replication/recovery |
+
+**Rule:** If a new feature persists bytes or ships bytes, it MUST declare its
+ECS object type, symbol policy, and repair story before implementation begins.
+
+#### 3.5.8 Decode Proofs (Auditable Repair)
+
+Asupersync includes a `DecodeProof` facility
+(`asupersync::raptorq::proof`). We exploit this in two critical ways:
+
+- In **lab runtime**: every decode that repairs corruption MUST produce a
+  proof artifact attached to the test trace. This makes repair operations
+  auditable and reproducible.
+- In **replication**: a replica MAY demand proof artifacts for suspicious
+  objects (e.g., repeated decode failures), enabling explainable "why did we
+  reject this commit?" answers.
+
+`DecodeProof` records:
+- The set of symbol ESIs received.
+- Which symbols were repair vs source.
+- The intermediate decoder state at success/failure.
+- Timing metadata under `LabRuntime` (deterministic virtual time).
+
+This is the "alien artifact" stance on repair: we do not merely fix things;
+we produce a mathematical witness that the fix is correct.
+
+#### 3.5.9 Deterministic Encoding (Seed Derivation from ObjectId)
+
+If `ObjectId` is content-derived, symbol generation MUST be deterministic:
+- The set of source symbols is deterministic by definition (payload chunking).
+- Repair symbol generation MUST be deterministic for a given ObjectId and
+  config.
+
+**Practical rule:**
+- Derive any internal "repair schedule seed" from `ObjectId`:
+  `seed = xxh3_64(object_id_bytes)`.
+- Wire it through `RaptorQConfig` or sender construction as needed.
+
+This makes "the object" a platonic mathematical entity: any replica can
+regenerate missing repair symbols (within policy) without coordination.
+
+#### 3.5.10 Symbol Size Policy (Object-Type-Aware, Measured)
+
+Symbol size is a major performance lever:
+- Too small: too many symbols, higher metadata overhead, more routing work.
+- Too large: worse cache behavior, higher per-symbol loss impact, more wasted
+  decode work.
+
+We choose symbol size per object type, with sane defaults and benchmark-driven
+tuning:
+
+| Object Type | Default Symbol Size | Rationale |
+|------------|-------------------|-----------|
+| `CommitCapsule` | `min(page_size, 4096)` | Aligns encoding with page boundaries; `u16`-bounded |
+| `IndexSegment` | 1280–4096 bytes | Metadata-heavy; smaller symbols reduce tail loss impact |
+| `CheckpointChunk` | 16384–65535 bytes | Throughput-optimized for bulk local writes; falls back to page-sized for compat export |
+| `PageHistory` | page_size (4096) | Natural alignment with page boundaries |
+
+All sizing is versioned in `RootManifest` so replicas decode correctly.
+Benchmarks MUST drive tuning decisions; these defaults are starting points.
+
+### 3.6 Native Indexing: RaptorQ-Coded Index Segments
+
+Classic SQLite uses a separate WAL-index structure (shm) to avoid scanning the WAL. FrankenSQLite's Native Mode goes further: the index itself is a stream of self-healing ECS objects.
+
+#### 3.6.1 What The Index Must Answer
+
+Given `(pgno, snapshot)` we need:
+1. The newest committed version `V` such that `V.commit_seq <= snapshot.high`.
+2. A pointer to the bytes (or intent replay recipe) to materialize `V`.
+
+#### 3.6.2 VersionPointer (The Atom of Lookup)
+
+```
+VersionPointer {
+  commit_seq: u64,
+  patch_object: ObjectId,     // ECS object containing the patch/intent
+  patch_kind: PatchKind,      // FullImage | IntentLog | SparseXor
+  base_hint: Option<ObjectId> // optional "base image" hint for fast materialization
+}
+```
+
+The pointer is stable and replicable: it references content-addressed objects, not physical offsets.
+
+#### 3.6.3 IndexSegment Types
+
+We use multiple segment kinds, all ECS objects:
+
+1.  **PageVersionIndexSegment**: Maps `Pgno -> VersionPointer` for a specific commit range. Includes bloom filters for fast "not present" checks.
+2.  **ObjectLocatorSegment**: Maps `ObjectId -> Vec<SymbolLogOffset>`. An accelerator for finding symbols on disk. Rebuildable by scanning symbol logs.
+3.  **ManifestSegment**: Maps `commit_seq` ranges to `IndexSegment` object IDs. Used for bootstrapping.
+
+#### 3.6.4 Lookup Algorithm (Read Path)
+
+To read page `P` under snapshot `S`:
+
+1.  **Check Cache:** Consult ARC cache for a visible committed version.
+2.  **Check Filter:** Consult Version Presence Filter (Bloom/Quotient). If "no versions", read base page.
+3.  **Index Scan:** Scan `PageVersionIndexSegment`s backwards from `S.high` until a visible version is found.
+4.  **Fetch & Materialize:**
+    - Fetch the `patch_object` (repairing via RaptorQ if needed).
+    - If it's a full image, return it.
+    - If it's a patch/intent, apply it to the base page (recursively if needed).
+
+#### 3.6.5 Segment Construction (Background, Deterministic)
+
+The **Segment Builder** consumes the commit marker stream:
+- Accumulates `Pgno -> VersionPointer` updates in memory.
+- Periodically flushes a new `PageVersionIndexSegment` object covering `[start_seq, end_seq]`.
+- Construction is **deterministic**: stable map iteration order, stable encoding. This ensures all replicas build identical index segments.
+
+#### 3.6.6 Repair and Rebuild
+
+Because IndexSegments are ECS objects:
+- **Repair:** Missing/corrupt segments are repaired by decoding from surviving symbols (local or remote).
+- **Rebuild:** If a segment is irretrievably lost, it is rebuilt by re-scanning the commit marker stream and capsules.
+- **Diagnostics:** "Index unrebuildable but commit markers exist" is a critical integrity failure.
+
+#### 3.6.7 Boldness Constraint
+
+Coded index segments ship in V1. They are not a "Phase 9 nice-to-have." The
+index is part of the fundamental ECS thesis: if durability, storage, and
+transport are all object-based and symbol-native, then the index MUST be too.
+Fallbacks (e.g., linear marker-stream scan for lookup) exist only as emergency
+escape hatches, activated only after conformance/performance data proves a need.
 
 ---
 
@@ -2883,10 +2962,11 @@ PageData    := Vec<u8>                      -- page content, length = page_size
 
 Snapshot := {
     high_water_mark : TxnId,               -- all txn_ids <= this are "potentially committed"
-    in_flight       : RoaringBitmap,        -- active txns at snapshot creation
-                                            -- Roaring Bitmap for O(1) membership test
-                                            -- (replacing SortedVec+Bloom: fewer false positives,
-                                            -- compressed storage, set operations for GC horizon)
+    in_flight       : ActiveTxnSet,         -- active txns at snapshot creation.
+                                            -- Adaptive structure:
+                                            --   Small case: Sorted SmallVec<TxnId> (very fast iteration)
+                                            --   Large case: RoaringBitmap (fast set ops, compression)
+                                            -- Optimizes for the common case of few concurrent writers.
 }
 
 PageVersion := {
@@ -8950,6 +9030,21 @@ Statistical methodology using asupersync's conformal calibration:
 6. **No distributional assumptions:** Conformal p-values are valid regardless
    of the underlying distribution (important because database latencies are
    typically heavy-tailed, not normal).
+
+### 17.9 Isomorphism Proof Template (Required For Optimizations)
+
+For every performance optimization that touches query execution or data storage, the PR description MUST include this proof template:
+
+```
+Change: <description of optimization>
+- Ordering preserved:     [yes/no] (+why)
+- Tie-breaking unchanged: [yes/no] (+why)
+- Float behavior:         [identical / N/A]
+- RNG seeds:              [unchanged / N/A]
+- Oracle fixtures:        PASS (list reference case IDs)
+```
+
+This ensures we stay fast without drifting from parity. "It feels faster" is not an acceptable justification.
 
 ---
 
