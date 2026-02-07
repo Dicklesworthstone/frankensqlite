@@ -6520,7 +6520,10 @@ if !slot.txn_id.CAS(0, TXN_ID_CLAIMING):
 // Seed the timeout clock without overwriting a cleanup-seeded timestamp.
 slot.claiming_timestamp.CAS(0, unix_timestamp())
 // Phase 2: initialize fields (pid, pid_birth, lease_expiry, etc.)
-// Phase 3: publish real TxnId
+// Phase 3: publish real TxnId (CAS, do not store)
+if !slot.txn_id.CAS(TXN_ID_CLAIMING, real_txn_id):
+    // Cleanup reclaimed the slot while we were stalled. Abort and retry acquire.
+    restart_slot_acquire()
 ```
 
 **Rationale:** Writing `claiming_timestamp` before the CAS is a race: if the
@@ -11855,7 +11858,8 @@ C SQLite's NGQP (`wherePathSolver()` in `where.c`).
   - 5 for two-table.
   - 12 or 18 for 3+ tables (star-query heuristic may raise to 18; see
     `computeMxChoice` in SQLite's `where.c`).
-- Complexity: `O(mxChoice * N)` join-order exploration (not `N!`).
+- Complexity: worst-case ~`O(mxChoice * N^2)` candidate expansions (bounded beam,
+  not `N!`).
 
 This is the V1 strategy (there is no exhaustive `N!` search path). The phrase
 "N Nearest Neighbors" is not used in the SQLite source; beam search is the
