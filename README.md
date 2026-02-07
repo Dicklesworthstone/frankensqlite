@@ -1,8 +1,6 @@
-<p align="center">
-  <br>
-  <img width="460" src="https://upload.wikimedia.org/wikipedia/commons/3/38/SQLite370.svg" alt="FrankenSQLite">
-  <br><br>
-</p>
+<div align="center">
+  <img src="frankensqlite_illustration.webp" alt="FrankenSQLite — a Frankenstein monster building a database engine at his workbench">
+</div>
 
 <h1 align="center">FrankenSQLite</h1>
 
@@ -98,39 +96,9 @@ Database engines live and die by cache behavior and I/O patterns. All page buffe
 
 FrankenSQLite is organized as a 23-crate Cargo workspace with strict layered dependencies:
 
-```
-                          ┌──────────────┐
-                          │  fsqlite-cli │  Interactive SQL shell
-                          └──────┬───────┘
-                                 │
-                          ┌──────┴───────┐
-                          │   fsqlite    │  Public API facade
-                          └──────┬───────┘
-                                 │
-                          ┌──────┴───────┐
-                          │ fsqlite-core │  Engine orchestration
-                          └──────┬───────┘
-                                 │
-            ┌────────────────────┼────────────────────┐
-            │                    │                     │
-     ┌──────┴──────┐    ┌───────┴───────┐    ┌────────┴───────┐
-     │  SQL Layer  │    │ Storage Layer │    │   Extensions   │
-     ├─────────────┤    ├───────────────┤    ├────────────────┤
-     │ parser      │    │ btree         │    │ ext-fts3       │
-     │ ast         │    │ pager         │    │ ext-fts5       │
-     │ planner     │    │ wal           │    │ ext-rtree      │
-     │ vdbe        │    │ mvcc          │    │ ext-json       │
-     │ func        │    │ vfs           │    │ ext-session    │
-     └──────┬──────┘    └───────┬───────┘    │ ext-icu        │
-            │                   │            │ ext-misc       │
-            └─────────┬─────────┘            └────────┬───────┘
-                      │                               │
-            ┌─────────┴───────────────────────────────┘
-            │
-     ┌──────┴──────┐    ┌──────────────┐
-     │fsqlite-types│    │fsqlite-error │  Foundation (no internal deps)
-     └─────────────┘    └──────────────┘
-```
+<div align="center">
+  <img src="frankensqlite_diagram.webp" alt="FrankenSQLite architecture diagram — 23-crate layered workspace" width="512">
+</div>
 
 ### Crate Map
 
