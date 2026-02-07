@@ -15270,6 +15270,9 @@ instrumentation:
 - At each commit attempt (including aborted attempts), obtain the de-duplicated
   `write_set(txn)` (pages written).
 - Maintain counters per fixed window (e.g., 10 seconds) per BOCPD regime:
+  - Windowing MUST be deterministic under `LabRuntime` (use lab time / epoch
+    ticks, not wall-clock). In production, windows SHOULD be derived from a
+    monotonic clock and recorded as `(window_start, window_end)` in telemetry.
   - `txn_count`: number of observed write transactions in the window.
   - A bounded second-moment sketch state for estimating `F2 := Σ c_pgno^2`
     (required; §18.4.1.3), where `c_pgno := #txns whose write_set contains pgno`.
@@ -15465,7 +15468,8 @@ H'(K,s) = - Σ_{i=1}^{K} (log i)/i^s
 
 **Regime awareness:** Run the estimator per BOCPD regime (reset counts on regime
 change). Emit `(s_hat, window_n, regime_id)` into telemetry and the evidence
-ledger when used for policy decisions.
+ledger when presented to operators or used to parameterize synthetic benchmarks.
+`s_hat` MUST NOT be used as a direct policy input when `M2_hat` is available.
 
 **Connecting Zipf to conflicts (approximate):** If we assume each transaction
 writes `W` pages on average (use `W := E[W]` for the current window/regime) by
