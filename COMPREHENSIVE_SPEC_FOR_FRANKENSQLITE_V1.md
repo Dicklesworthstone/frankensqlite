@@ -9792,18 +9792,24 @@ prefix of the WAL.
 
 ### 11.10 WAL Index (wal-index / SHM)
 
+**Byte order:** Unlike the main database file and WAL file (big-endian),
+all WAL-index (SHM) header fields are stored in **native byte order** of the
+host machine (except salt values copied verbatim from the WAL header). This
+is because the SHM is not involved in crash recovery and does not need to be
+portable across architectures.
+
 ```
 Header (136 bytes):
   [0..48]:   WalIndexHdr (first copy):
-               iVersion(u32), unused(u32), iChange(u32), isInit(u8),
+               iVersion(u32) = 3007000 (MUST match),
+               unused(u32), iChange(u32), isInit(u8),
                bigEndCksum(u8), szPage(u16), mxFrame(u32), nPage(u32),
                aFrameCksum[2](u32), aSalt[2](u32), aCksum[2](u32)
   [48..96]:  WalIndexHdr (second copy -- lock-free reads: reader reads
                both copies, uses them only if they match)
-  [96..120]: WalCkptInfo (24 bytes):
+  [96..136]: WalCkptInfo (40 bytes total):
                nBackfill(u32) at offset 96
                aReadMark[5](u32) at offsets 100-119 (5 reader marks, 20 bytes)
-  [120..136]: Remaining WalCkptInfo fields (16 bytes):
                aLock[8](u8) at offsets 120-127 (8 SHM lock slots, 1 byte each)
                nBackfillAttempted(u32) at offset 128
                notUsed0(u32) at offset 132
