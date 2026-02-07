@@ -57,7 +57,7 @@ Pseudocode and type definitions are normative unless explicitly labeled
 | **ECS** | Erasure-Coded Stream. The universal persistence substrate: objects encoded as RaptorQ symbols. |
 | **ObjectId** | Content-addressed identifier: `Trunc128(BLAKE3("fsqlite:ecs:v1" || canonical_object_header || payload_hash))`, 16 bytes. Canonical full digest is BLAKE3-256; the 128-bit truncation is for storage efficiency. |
 | **CommitCapsule** | Atomic unit of commit state in Native mode: intent log, page deltas, SSI witnesses. |
-| **CommitMarker** | The durable "this commit exists" record: capsule ObjectId + prev-marker chain. |
+| **CommitMarker** | The durable "this commit exists" record in Native mode: `(commit_seq, commit_time_unix_ns, capsule_object_id, proof_object_id, prev_marker, integrity_hash)`. |
 | **CommitSeq** | Monotonically increasing `u64` commit sequence number (global "commit clock" for ordering). |
 | **RaptorQ** | RFC 6330 fountain code: K source symbols → unlimited encoding symbols, recoverable from any K' ≈ K. |
 | **OTI** | Object Transmission Information. RaptorQ metadata needed for decoding: (F, Al, T, Z, N). |
@@ -67,6 +67,7 @@ Pseudocode and type definitions are normative unless explicitly labeled
 | **TxnId** | Monotonically increasing `u64` transaction begin identifier (allocated at `BEGIN`). `TxnSlot.txn_id = 0` is reserved to mean "free slot", so real TxnIds are non-zero. |
 | **TxnEpoch** | Monotonically increasing `u32` generation counter for a reused TxnSlot (prevents stale slot-id interpretation). |
 | **TxnToken** | Canonical transaction identity for SSI witness plane: `(TxnId, TxnEpoch)`. |
+| **SchemaEpoch** | Monotonically increasing `u64` epoch for schema/physical-layout changes (DDL/VACUUM). Captured at `BEGIN` and carried through intent logs to forbid replay/merge across schema boundaries. |
 | **SIREAD witness (legacy term)** | PostgreSQL terminology for SSI read evidence ("SIREAD locks"). In FrankenSQLite this is represented by `ReadWitness` objects plus hot-plane reader bits; it does not block and is not a lock. |
 | **Intent log** | Semantic operation log: `Vec<IntentOp>`. Records what a transaction intended to do (insert, delete, update). |
 | **Deterministic rebase** | Replaying intent logs against the current committed snapshot to merge without byte-level patches. |
@@ -1782,12 +1783,12 @@ The merge operation P_merged = P_0 XOR D_1 XOR D_2 is:
 ```
 can_algebraic_merge(
     T1: &Transaction,
-    T2_committed: &CommitRecord,
+    page_T2_committed: &PageData,
     pgno: PageNumber,
     original: &PageData,
 ) -> bool:
     let page_T1 = T1.write_set[pgno].data
-    let page_T2 = T2_committed.get_page_data(pgno)
+    let page_T2 = page_T2_committed
 
     // Compute byte-level deltas
     let delta_T1 = xor_pages(page_T1, original)     // 4096 bytes
@@ -1809,12 +1810,12 @@ can_algebraic_merge(
 
 perform_algebraic_merge(
     T1: &mut Transaction,
-    T2_committed: &CommitRecord,
+    page_T2_committed: &PageData,
     pgno: PageNumber,
     original: &PageData,
 ):
     let page_T1 = T1.write_set[pgno].data
-    let page_T2 = T2_committed.get_page_data(pgno)
+    let page_T2 = page_T2_committed
 
     // Compute deltas
     let delta_T1 = xor_pages(page_T1, original)
@@ -4282,7 +4283,7 @@ may wait, but only for the duration of another Serialized transaction, which by
 inductive hypothesis completes in finite time.
 
 **Read:** `resolve()` walks the version chain, which has bounded length
-(Theorem 5). Each visibility check is O(1) amortized (Bloom filter). Total
+(Theorem 5). Each visibility check is O(1) (`commit_seq <= snapshot.high`). Total
 time is bounded.
 
 **Write:** `try_acquire` is non-blocking (returns immediately with `Ok` or
@@ -6773,22 +6774,23 @@ MVCC version management, the heart of the concurrency innovation.
 
 Modules:
 - `manager.rs`: `MvccManager` -- coordinates transactions, version store,
-  page lock table, commit log, and GC.
-- `snapshot.rs`: `Snapshot` struct with Bloom filter. `capture_snapshot()`
-  logic. Visibility predicate.
-- `version.rs`: `PageVersion` struct, version chains (linked list per page).
-  Version store keyed by `PageNumber`.
+  page lock table, commit index, witness plane hooks, and GC.
+- `snapshot.rs`: `Snapshot` struct (`high: CommitSeq`, `schema_epoch: SchemaEpoch`).
+  `capture_snapshot()` logic. Visibility predicate (`commit_seq <= snapshot.high`).
+- `version.rs`: `PageVersion` struct and version chains (arena-backed indices;
+  ordered by `commit_seq`).
 - `lock_table.rs`: `PageLockTable` (HashMap<PageNumber, TxnId>). `try_acquire`,
   `release`, `release_all`.
 - `transaction.rs`: `Transaction` struct. Lifecycle: Active -> Committed/Aborted.
-  Write set, read set, page locks.
-- `commit.rs`: Commit validation (first-committer-wins). Algebraic write merge
-  detection. WAL append via write coordinator.
+  Write set, intent log, witness keys, page locks.
+- `commit.rs`: Commit validation (FCW via `CommitIndex` + merge ladder). Commit
+  publication via WriteCoordinator (WAL group commit in Compatibility mode;
+  tiny-marker sequencing in Native mode).
 - `gc.rs`: Garbage collection. Horizon computation, version chain pruning,
   reclaimability predicate.
 - `coordinator.rs`: `WriteCoordinator` -- wraps asupersync two-phase MPSC
-  channel. Serializes WAL appends while allowing concurrent validation.
-- `bloom.rs`: Bloom filter implementation for snapshot in-flight set.
+  channel. Serializes the commit sequencing critical section: WAL appends in
+  Compatibility mode; tiny marker/proof writes in Native mode.
 
 Dependency rationale: needs `fsqlite-wal` for WAL append; needs `fsqlite-pager`
 for page cache; needs `parking_lot` for fast Mutex/RwLock on hot-path
