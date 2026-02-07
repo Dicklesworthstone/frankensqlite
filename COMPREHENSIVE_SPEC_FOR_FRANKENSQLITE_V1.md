@@ -6381,10 +6381,10 @@ TxnSlot := {
                                    -- Phase 1 CAS set TXN_ID_CLAIMING, or cleanup CAS set TXN_ID_CLEANING.
                                    -- Used by cleanup to detect stuck sentinel slots (§5.6.2).
                                    -- Written AFTER the successful CAS; zeroed when slot is freed.
-	    cleanup_txn_id   : AtomicU64,    -- crash-cleanup: TxnId being cleaned when txn_id==TXN_ID_CLEANING.
-	                                   -- Only meaningful when txn_id==TXN_ID_CLEANING.
-	                                   -- MUST be 0 in all other states; MUST be zeroed when slot is freed.
-	    _padding        : [u8; 40],      -- pad to 128 bytes (two cache lines; prevents false sharing between adjacent slots)
+    cleanup_txn_id   : AtomicU64,    -- crash-cleanup: TxnId being cleaned when txn_id==TXN_ID_CLEANING.
+                                   -- Only meaningful when txn_id==TXN_ID_CLEANING; otherwise ignored.
+                                   -- SHOULD be 0 in all other states; MUST be zeroed when slot is freed.
+    _padding        : [u8; 40],      -- pad to 128 bytes (two cache lines; prevents false sharing between adjacent slots)
                                    -- Layout: 88 bytes of fields with repr(C) alignment + 40B padding = 128B total.
                                    -- Gaps: 2B after mode (witness_epoch align), 1B after marked_for_abort (write_set_pages align).
 }
@@ -11060,19 +11060,19 @@ the trait. Test mocks for sealed traits live alongside the trait definition
 /// # Error Handling
 /// All methods return `Result<T, FrankenError>`. I/O errors are wrapped in
 /// `FrankenError::IoError(std::io::Error)`. Permission errors map to
-	/// `FrankenError::CantOpen` or `FrankenError::Auth`.
-	pub trait Vfs: Send + Sync {
-	    /// Open a file at the given path with the specified flags.
-	    ///
-	    /// `path` is None for temporary files (the VFS chooses a path).
-	    /// Returns the opened file handle and the flags that were actually used
-	    /// (some flags may be modified, e.g., READWRITE downgraded to READONLY).
+/// `FrankenError::CantOpen` or `FrankenError::Auth`.
+pub trait Vfs: Send + Sync {
+    /// Open a file at the given path with the specified flags.
     ///
-	    /// # Errors
-	    /// - `FrankenError::CantOpen` if the file cannot be opened.
-	    /// - `FrankenError::IoError` for underlying I/O failures.
-	    fn open(&self, cx: &Cx, path: Option<&Path>, flags: VfsOpenFlags)
-	        -> Result<(Box<dyn VfsFile>, VfsOpenFlags)>;
+    /// `path` is None for temporary files (the VFS chooses a path).
+    /// Returns the opened file handle and the flags that were actually used
+    /// (some flags may be modified, e.g., READWRITE downgraded to READONLY).
+    ///
+    /// # Errors
+    /// - `FrankenError::CantOpen` if the file cannot be opened.
+    /// - `FrankenError::IoError` for underlying I/O failures.
+    fn open(&self, cx: &Cx, path: Option<&Path>, flags: VfsOpenFlags)
+        -> Result<(Box<dyn VfsFile>, VfsOpenFlags)>;
 
     /// Delete a file. If `sync_dir` is true, also sync the directory
     /// containing the file to ensure the deletion is durable.
