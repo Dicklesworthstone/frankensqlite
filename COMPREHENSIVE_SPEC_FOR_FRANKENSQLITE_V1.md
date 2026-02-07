@@ -8927,22 +8927,87 @@ Offset  Size  Description
  20       4   Cumulative checksum-2
 ```
 
+### 11.9.1 WAL Checksum Algorithm
+
+The WAL uses a custom double-accumulator checksum (NOT CRC-32, NOT xxHash).
+This is critical for implementation: without the exact algorithm, WAL frames
+cannot be validated or written.
+
+```rust
+/// Compute WAL checksum over `data` using the double-accumulator algorithm.
+///
+/// `s0` and `s1` are the running accumulators (initialized from the
+/// previous frame's checksum, or from the WAL header checksum for the
+/// first frame). `native_byte_order` is true if the WAL magic is
+/// 0x377F0682 (big-endian on big-endian machines, little-endian on
+/// little-endian machines -- i.e., the checksum words are in the
+/// machine's native byte order). If 0x377F0683, use the opposite
+/// byte order.
+///
+/// The data MUST be padded to a multiple of 8 bytes (zero-padded if
+/// necessary). This function processes the data in 8-byte chunks,
+/// treating each chunk as two 32-bit unsigned integers.
+fn wal_checksum(data: &[u8], mut s0: u32, mut s1: u32, native: bool) -> (u32, u32) {
+    assert!(data.len() % 8 == 0, "WAL checksum data must be 8-byte aligned");
+    for chunk in data.chunks_exact(8) {
+        let (d0, d1) = if native {
+            // Native byte order: read as two u32 in platform endianness
+            let d0 = u32::from_ne_bytes(chunk[0..4].try_into().unwrap());
+            let d1 = u32::from_ne_bytes(chunk[4..8].try_into().unwrap());
+            (d0, d1)
+        } else {
+            // Opposite byte order
+            let d0 = u32::from_ne_bytes(chunk[0..4].try_into().unwrap()).swap_bytes();
+            let d1 = u32::from_ne_bytes(chunk[4..8].try_into().unwrap()).swap_bytes();
+            (d0, d1)
+        };
+        s0 = s0.wrapping_add(d0).wrapping_add(s1);
+        s1 = s1.wrapping_add(d1).wrapping_add(s0);
+    }
+    (s0, s1)
+}
+```
+
+**Checksum chain:**
+1. **WAL header checksum:** `wal_checksum(header_bytes[0..24], 0, 0, native)` →
+   stored at header bytes 24..32.
+2. **First frame:** `wal_checksum(frame_header[0..8] ++ page_data, hdr_s0, hdr_s1, native)`
+   → stored at frame header bytes 16..24. (Note: only the first 8 bytes of
+   the frame header are checksummed, NOT bytes 8..16 which contain the salt.)
+3. **Subsequent frames:** use the previous frame's `(s0, s1)` as the seed.
+   Each frame's checksum covers itself AND all prior frames (cumulative).
+
+**Validation:** During recovery, walk frames sequentially. A frame is valid iff
+its recomputed checksum matches the stored values AND its salt matches the WAL
+header salt. The first frame that fails either check terminates the valid
+prefix of the WAL.
+
 ### 11.10 WAL Index (wal-index / SHM)
 
 ```
 Header (136 bytes):
-  [0..48]:   WAL index header (version, change counters, page counts)
-  [48..96]:  Copy of header (lock-free reads: reader reads both, uses if they match)
-  [96..136]: Lock bytes (8 read marks + write lock + checkpoint lock)
+  [0..48]:   WalIndexHdr (first copy):
+               iVersion(u32), unused(u32), iChange(u32), isInit(u8),
+               bigEndCksum(u8), szPage(u16), mxFrame(u32), nPage(u32),
+               aFrameCksum[2](u32), aSalt[2](u32), aCksum[2](u32)
+  [48..96]:  WalIndexHdr (second copy -- lock-free reads: reader reads
+               both copies, uses them only if they match)
+  [96..120]: WalCkptInfo (24 bytes):
+               nBackfill(u32) at offset 96
+               aReadMark[5](u32) at offsets 100-119 (5 reader marks, 20 bytes)
+  [120..136]: Lock bytes (16 bytes for SHM locking: 8 lock slots x 2 bytes)
 
 Hash table segments (32 KB each):
-  Each covers up to 4062 frames.
-  [0..16248]:     Page number array: 4062 entries x 4 bytes
-  [16248..32760]: Hash table: 8192 slots x 2 bytes
-                  Hash: page_number % 8192, linear probing
+  First segment:  covers up to 4062 frames (reduced by the 136-byte header).
+                  [0..16248]:     Page number array: 4062 entries x 4 bytes
+                  [16248..32632]: Hash table: 8192 slots x 2 bytes
+  Subsequent:     covers up to 4096 frames (full 32 KB region).
+                  [0..16384]:     Page number array: 4096 entries x 4 bytes
+                  [16384..32768]: Hash table: 8192 slots x 2 bytes
+  Hash function: page_number % 8192, linear probing.
 ```
 
-**Reader marks:** Byte offsets 100-131 contain 5 reader marks (u32 each).
+**Reader marks:** Byte offsets 100-119 contain 5 reader marks (u32 each, 20 bytes total).
 Each reader mark records the WAL frame count at the time a reader began.
 This prevents checkpoint from overwriting frames still needed by active readers.
 
@@ -12191,9 +12256,14 @@ is unrecoverable is:
 P(loss) <= sum_{i=R+1}^{K+R} C(K+R, i) * p^i * (1-p)^(K+R-i)
 ```
 
-For the V1 default (R = 0.2K, p = 10^-4), this is bounded by `10^(-5K)`,
-making committed data loss a mathematical near-impossibility for any object
-with K >= 4 source symbols.
+For the V1 default (R ≈ 0.2K, p = 10^-4), this tail probability is extremely
+small for moderate K. Concrete orders of magnitude (using the leading term of
+the binomial tail):
+- K=4, R=1 (n=5): P(loss) ≈ C(5,2) p^2 ≈ 1e-7
+- K=16, R=4 (n=20): P(loss) ≈ C(20,5) p^5 ≈ 1.6e-16
+
+Small-K objects are dominated by integer rounding and additive decode slack;
+the engine clamps symbol policies per §3.5.3.
 
 **Theorem (Repair Completeness).** For any ECS object, if the local symbol
 store retains at least K valid symbols (out of K+R stored), the original
