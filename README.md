@@ -655,6 +655,36 @@ In FrankenSQLite's MVCC mode, WAL frames carry transaction IDs. The WAL index ma
 
 ---
 
+## Rollback Journal
+
+FrankenSQLite supports rollback journal mode for reading databases not in WAL mode. The rollback journal (`<database>-journal`) is the legacy crash-recovery mechanism that predates WAL.
+
+**Journal format:**
+
+```
+Journal Header (padded to sector boundary):
+  Offset  Size  Description
+    0       8   Magic: {0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7}
+    8       4   Page count (-1 means compute from file size)
+   12       4   Random nonce for checksum
+   16       4   Initial database size in pages (before this transaction)
+   20       4   Sector size (header padded to this boundary)
+   24       4   Page size
+
+Journal Page Records (repeated page_count times):
+  [4 bytes: page number (u32 BE)]
+  [page_size bytes: original page content before modification]
+  [4 bytes: checksum]
+```
+
+**How it works:** Before modifying a page, the pager writes the original page content to the journal. On crash, the journal is played back to restore the database to its pre-transaction state. The checksum uses a sparse sampling algorithm: `nonce + data[page_size-200] + data[page_size-400] + ...`, summing bytes at 200-byte intervals from the end of the page (20 bytes sampled for 4096-byte pages).
+
+**Hot journal recovery:** On open, if a journal file exists, is non-empty, and the database's reserved lock is not held, it is a "hot journal." Recovery plays back original pages from the journal, then deletes it.
+
+**Journal modes:** `DELETE` (default — delete journal after commit), `TRUNCATE` (truncate to zero), `PERSIST` (zero the header), `MEMORY` (journal in RAM only — no crash safety), `WAL` (switch to write-ahead logging), `OFF` (no journal — no crash safety). FrankenSQLite defaults to WAL mode but must handle all modes for compatibility with existing databases.
+
+---
+
 ## Buffer Pool: ARC Cache
 
 LRU fails on database workloads: a single table scan evicts the entire working set. FrankenSQLite uses an **Adaptive Replacement Cache (ARC)** that balances recency and frequency, with a provable competitive ratio of 2 against OPT.
@@ -746,6 +776,63 @@ async caller
 ```
 
 Write transactions submit commit requests through an MPSC channel to a single write coordinator task. This serializes commit validation (SSI check + first-committer-wins + safe merge ladder) and WAL appends without holding a lock across the entire commit. Each request includes a `oneshot::Sender<Result<()>>` so the caller can `.await` the result.
+
+---
+
+## Structured Concurrency, Cancellation, and Supervision
+
+FrankenSQLite adopts asupersync's **region tree** as the lifetime model for all concurrency. Every background worker, coordinator, replicator, and long-lived service runs as a region-owned task or actor. No task may outlive the `Database` root region. There are no detached tasks.
+
+**Region tree (conceptual):**
+
+```
+DbRootRegion
+  ├── WriteCoordinatorRegion         (marker sequencer + compat WAL path)
+  ├── SymbolStoreRegion              (local symbol logs + tiered storage fetch)
+  ├── ReplicationRegion              (stream symbols; anti-entropy; membership)
+  ├── CheckpointGcRegion             (checkpointer, compactor, GC horizon)
+  └── ObservabilityRegion            (deadline monitor, task inspector, metrics)
+
+PerConnectionRegion (child of DbRootRegion)
+  ├── QueryExecution tasks
+  └── Cursor prefetch tasks (bounded; optional)
+
+PerTransactionRegion (child of PerConnectionRegion)
+  ├── Encode/persist capsule tasks (native mode)
+  ├── Witness publication tasks
+  └── Validation tasks
+```
+
+Closing the database is a protocol, not a `drop`: request cancellation, drain, finalize, then return. A region does not report closed until all child tasks are completed, all finalizers have run, and all obligations are resolved.
+
+### Cancellation Is a Protocol (Request, Drain, Finalize)
+
+Cancellation is **not** "drop the future." It is a multi-phase protocol with explicit checkpoints, bounded drain, and finalizers:
+
+```
+Created/Running → CancelRequested → Cancelling → Finalizing → Completed(Cancelled)
+```
+
+FrankenSQLite places `cx.checkpoint()` at every natural yield point that bounds uninterruptible work: VDBE instruction boundaries, B-tree descent loops, RaptorQ encode/decode loops, and any loop over user data. A cancellation-unaware hot loop is a bug.
+
+**Masked critical sections** (`Cx::masked`) allow bounded cancellation deferral for short, atomic publication steps that must not be interrupted (e.g., publishing a commit marker after allocating `commit_seq`). Mask depth is bounded at `MAX_MASK_DEPTH = 64`. Masking is forbidden for long operations.
+
+### Obligations (Linear Resources)
+
+Asupersync models cancellation-safe effects using **obligations** — linear resources with a two-phase lifecycle: `Reserved → Committed` or `Reserved → Aborted`. A reserved obligation that is dropped without resolution is a `Leaked` obligation — a correctness bug that fails fast in lab mode and triggers diagnostic escalation in production.
+
+FrankenSQLite treats the following as obligations: commit pipeline `SendPermit` reservations, commit response delivery, `TxnSlot` acquisition and renewal, witness-plane reservation tokens, and any name/registration in shared state that could go stale on crash.
+
+### OTP-Style Supervision
+
+Long-lived services (sequencers, replicators, checkpoint workers) are supervised. "Spawn a loop and hope" is forbidden. Supervision provides restart strategies (`Stop`, `Restart(config)`, `Escalate`), restart budgets with backoff, and monotone severity (outcomes cannot be downgraded):
+
+- `WriteCoordinator`: `Escalate` on error or panic (sequencer correctness is core).
+- `SymbolStore`: `Restart` on transient I/O; `Escalate` on integrity faults.
+- `Replicator`: `Restart` with exponential backoff; `Stop` when remote disabled.
+- `CheckpointerGc`: `Restart` (bounded) on transient errors; escalate if repeated.
+
+A component crash becomes an explainable, bounded event with a deterministic restart policy — not a silent hang or memory leak.
 
 ---
 
@@ -1108,6 +1195,61 @@ Offset  Size  Field
 
 ---
 
+## Pointer Map and Auto-Vacuum
+
+SQLite's auto-vacuum mode returns freed pages to the operating system instead of adding them to the freelist. This requires a **pointer map** — a reverse lookup from any page to its parent — so the engine can relocate pages and update parent pointers during vacuum.
+
+**Entry format (5 bytes per page):**
+
+| Byte | Content |
+|------|---------|
+| 0 | Type code: 1 = root page, 2 = freelist page, 3 = first overflow page, 4 = subsequent overflow page, 5 = non-root B-tree page |
+| 1-4 | Parent page number (u32 big-endian). Meaning varies by type: for B-tree pages, it's the parent in the tree; for overflow pages, it's the page containing the cell that overflows. |
+
+The first pointer map page is always page 2. Each page holds `usable_size / 5` entries (819 entries for 4096-byte pages). Pointer map pages recur at regular intervals: pages 2, 822, 1642, ... (group size = entries_per_page + 1 = 820).
+
+**How auto-vacuum works:** When a page is freed (e.g., by `DELETE`), the engine moves the last page in the file into the freed slot, updates the moved page's parent pointer using the pointer map, and truncates the file by one page. This keeps the database file compact without requiring a full `VACUUM` rebuild.
+
+FrankenSQLite replicates pointer map layout and auto-vacuum page relocation identically to C SQLite, ensuring databases with `auto_vacuum = FULL` or `auto_vacuum = INCREMENTAL` are fully interoperable.
+
+---
+
+## Schema Management (sqlite_master)
+
+Every SQLite database contains a `sqlite_master` table rooted at page 1 with this schema:
+
+```sql
+CREATE TABLE sqlite_master (
+    type TEXT,      -- 'table', 'index', 'view', 'trigger'
+    name TEXT,      -- object name
+    tbl_name TEXT,  -- associated table name (for indexes/triggers: the parent table)
+    rootpage INT,   -- root B-tree page number (0 for views/triggers)
+    sql TEXT        -- original CREATE statement text (NULL for auto-indexes)
+);
+```
+
+For the temp database, the equivalent is `sqlite_temp_master`.
+
+On database creation, FrankenSQLite creates page 1 as a table leaf page containing zero rows. The first `CREATE TABLE` inserts a row into `sqlite_master` with the CREATE statement text. Every DDL operation (CREATE, DROP, ALTER) modifies this table and increments a **schema cookie** (a 32-bit counter at header offset 40) so that prepared statements can detect schema changes and re-prepare automatically.
+
+`ATTACH DATABASE` adds a secondary database with its own `sqlite_master` (aliased as `<schema>.sqlite_master`). Cross-database queries use fully qualified names (`schema.table`).
+
+---
+
+## The Lock-Byte Page
+
+For databases larger than 1 GiB, the page containing byte offset `0x40000000` (1,073,741,824 — the POSIX advisory "pending byte") is reserved for file locking and must never store B-tree content. For 4096-byte pages, this is page 262145 (`(0x40000000 / 4096) + 1`). The exact page number depends on page size.
+
+SQLite skips this page during allocation (`allocateBtreePage()` in btree.c). FrankenSQLite replicates this behavior precisely:
+
+- Never allocate this page for B-tree storage or freelist use.
+- On `PRAGMA integrity_check`, verify this page is not referenced by any B-tree pointer.
+- The page is simply a hole in the file that exists solely so POSIX `fcntl()` locks can operate on it without corrupting B-tree data.
+
+This is critical for multi-process locking compatibility: if a B-tree page were to occupy the lock-byte region, concurrent readers using POSIX advisory locks would silently corrupt it.
+
+---
+
 ## Two Operating Modes
 
 FrankenSQLite operates in one of two modes, selected per-connection via `PRAGMA fsqlite.mode`:
@@ -1129,6 +1271,27 @@ A **CommitCapsule** is the atomic unit of commit state, containing:
 A **CommitMarker** is the durable "this commit exists" record: the capsule's ObjectId plus a pointer to the previous marker, forming an append-only chain. A commit is committed if and only if its marker is durable. Recovery ignores capsules without a committed marker.
 
 Checkpointing materializes a canonical `.db` for compatibility export, but the commit stream remains the source of truth. Both modes expose the same SQL and API surface.
+
+---
+
+## Time Travel Queries (Native Mode)
+
+Native mode persists an immutable commit stream (capsules + markers with monotonic timestamps). This enables **time travel queries** that evaluate reads against a historical commit sequence — querying the database as it existed at any past point in time.
+
+**Syntax:**
+
+```sql
+SELECT * FROM orders FOR SYSTEM_TIME AS OF '2024-06-15 09:30:00';
+SELECT * FROM orders FOR SYSTEM_TIME AS OF COMMITSEQ 1234567;
+```
+
+**How it works:**
+
+1. **Resolve target commit:** If `AS OF COMMITSEQ N`, use N directly. Otherwise, parse the timestamp using SQLite-compatible datetime rules and binary-search the marker stream for the greatest marker with `commit_time_unix_ns <= target_time_unix_ns`.
+2. **Create synthetic snapshot:** Build a read-only snapshot `S` with `S.high = target_commit_seq`.
+3. **Execute normally:** The query runs using standard MVCC resolution rules — `resolve(P, S)` returns the newest committed page version with `version.commit_seq <= S.high`.
+
+**Restrictions (V1):** Time travel is read-only. `INSERT`, `UPDATE`, `DELETE`, and DDL in a time-travel context fail with `SQLITE_ERROR`. If the retention policy has pruned the requested historical state, the query fails with an explicit "history not retained" error. With tiered storage enabled, older capsules and index segments may reside only in remote storage; the engine fetches symbols on demand and decodes/repairs as usual.
 
 ---
 
@@ -1180,6 +1343,62 @@ foo.db.fsqlite/
 ```
 
 The `RootManifest` is the bootstrap object: it maps the logical database name to the current committed state ObjectId. It is the only mutable file in the entire layout. Repair overhead is configurable via `PRAGMA raptorq_overhead` (default: 20%, meaning 1.2x source symbols stored).
+
+---
+
+## Native Mode Commit Protocol
+
+The Native-mode commit protocol decouples **bulk durability** (payload bytes) from **ordering** (the marker stream). Writers persist `CommitCapsule` payloads concurrently using bulk I/O off the critical section. A single sequencer (`WriteCoordinator`) serializes only the tiny ordering step: validation, `commit_seq` allocation, and `CommitMarker` append.
+
+**Writer path (concurrent):**
+
+1. Finalize the write set (pages and/or intent log).
+2. Run SSI validation using the witness plane. If SSI aborts, return `SQLITE_BUSY_SNAPSHOT`.
+3. Publish witness evidence objects (pre-marker) using the cancel-safe two-phase publication protocol.
+4. Build the `CommitCapsule` deterministically from intent log, page deltas, snapshot basis, and witness references.
+5. RaptorQ-encode the capsule into systematic + repair symbols.
+6. Persist capsule symbols to local symbol logs (and optionally stream to replicas) **before** acquiring the commit sequencing critical section.
+7. Submit a tiny publish request to the `WriteCoordinator` containing the capsule `ObjectId`, write-set summary, and witness references. Await the coordinator response.
+
+**WriteCoordinator loop (serialized, tiny I/O):**
+
+1. FCW validation using write-set summaries (no full capsule decode needed). SSI re-validation checks for dangerous structures created by concurrent commits after the writer's local validation.
+2. Allocate `commit_seq` (gap-free, derived from marker stream tip).
+3. Persist a `CommitProof` ECS object.
+4. **FSYNC_1** — barrier ensuring capsule symbols and proof are durable before the marker references them.
+5. Append `CommitMarker` record (~96 bytes) to the marker stream.
+6. **FSYNC_2** — barrier ensuring the marker is durable before the client receives a success response.
+7. Publish `commit_seq` to shared memory with `Release` ordering.
+8. Respond to the client.
+
+**Why two fsync barriers:**
+- **FSYNC_1** prevents "committed marker, lost data" — the worst-case native mode failure where recovery finds a marker but cannot decode its capsule.
+- **FSYNC_2** prevents "client thinks committed, marker not persisted" — a silent transaction loss on crash.
+
+The two-fsync cost (~100-200 microseconds on NVMe) is amortized by batching multiple commits per WriteCoordinator iteration.
+
+---
+
+## ECS Compaction
+
+Native Mode's append-only symbol logs (`ecs/symbols/*.log`) grow indefinitely. To reclaim storage, the system runs a **mark-and-compact** process that is cancel-safe, crash-safe, cross-process safe, and non-disruptive to p99 query latency.
+
+**Compaction triggers:**
+- **Space amplification:** `total_log_size / live_data_size > 2.0` (configurable via PRAGMA).
+- **Time interval:** `PRAGMA fsqlite.auto_compact_interval`.
+- **Manual:** `PRAGMA fsqlite.compact`.
+
+**The four phases:**
+
+1. **Mark:** Start from the `RootManifest` and active commit marker stream. Trace all reachable `CommitCapsule`, `PageHistory`, and witness objects. Build a `BloomFilter` of live `ObjectId`s.
+
+2. **Compact:** Create new symbol log segments using temporary names (`segment-XXXXXX.log.compacting`). Scan old logs; copy live symbols to new segments, discard dead objects. Fsync new segments.
+
+3. **Publish:** Two-phase atomic publication. First, publish the new object locator cache. Then, rename compacted segments into place. Old segments are NOT retired until both the new segments and locator are durable — preventing a crash from leaving the system with neither valid data set.
+
+4. **Retire:** Old segments are retired only once no active readers depend on them, tracked via segment leases. On Unix, old segments are unlinked once retired (open handles remain valid). On Windows, old segments are renamed to `.retired` and deleted after all handles close.
+
+**Safety invariant:** Compaction never mutates an existing segment. At all times, there exists at least one complete set of symbol logs sufficient to decode any reachable object under the retention policy.
 
 ---
 
@@ -1998,6 +2217,37 @@ The load factor cap at 0.5 keeps the expected number of probes below 2. Since th
 
 ---
 
+### BOCPD: Workload Regime Detection
+
+Database workloads are non-stationary. A write-heavy analytical job may start at 2 AM, a bulk import may spike contention, or a schema migration may temporarily change the page access pattern. Static thresholds for MVCC tuning parameters (GC frequency, version chain length limits, witness-plane hot/cold index compaction policy) will be wrong for at least one regime.
+
+FrankenSQLite uses **Bayesian Online Change-Point Detection** (Adams & MacKay, 2007) to detect regime shifts in real time. BOCPD maintains a posterior distribution over the *run length* `r_t` (number of observations since the last change point):
+
+```
+P(r_t | x_{1:t}) ∝ Σ_{r_{t-1}} P(x_t | r_t, x_{t-r_t:t-1}) · P(r_t | r_{t-1}) · P(r_{t-1} | x_{1:t-1})
+```
+
+The predictive probability under the current regime is modeled as a conjugate **Normal-Gamma** for throughput and contention streams, and **Beta-Binomial** for abort rates. The hazard function uses a geometric prior with `H = 1/250`, corresponding to an expected regime length of ~4 minutes at one observation per second.
+
+**What BOCPD monitors:**
+
+| Stream | Conjugate Model | Action on Change Point |
+|--------|----------------|----------------------|
+| Commit throughput (ops/sec) | Normal-Gamma | Log regime shift, adjust GC frequency |
+| SSI abort rate | Beta-Binomial | If rate jumps, log warning; if rate drops, relax version chain limits |
+| Page contention (locks/sec) | Normal-Gamma | Adjust witness-plane refinement and hot-index pressure controls |
+| Version chain length | Normal-Gamma | Tighten/loosen GC watermarks |
+
+**Why BOCPD instead of fixed-window averages:**
+- No window size to tune (the algorithm infers the regime length).
+- Exact posterior inference via the run-length recursion (no MCMC needed).
+- Naturally handles multiple change points.
+- Computational cost: O(1) amortized after pruning low-probability run lengths.
+
+BOCPD operates as an advisory harness component (Layer 3 in the monitoring stack), sitting above the e-process invariant monitors and conformal anomaly detection. It does not gate correctness decisions; it tunes heuristics for GC, eviction, and compaction scheduling.
+
+---
+
 ## Implementation Roadmap and Verification Gates
 
 FrankenSQLite follows a 9-phase implementation plan. Each phase has specific **verification gates** — quantitative acceptance criteria that must pass before the next phase begins. No phase ships until every gate is green.
@@ -2157,6 +2407,28 @@ cargo bench --bench btree_perf
 cargo bench --bench mvcc_scaling
 cargo bench --bench parser_throughput
 ```
+
+---
+
+## What We Deliberately Exclude (and Why)
+
+FrankenSQLite deliberately omits several components of the C SQLite ecosystem. Each exclusion has a technical rationale; none are omitted from laziness.
+
+**Amalgamation build system.** The C SQLite amalgamation (`sqlite3.c`) is a single-file build artifact produced by concatenating ~150 source files. Its purpose is simplifying C compilation. Rust's Cargo workspace with 23 crates provides superior modularity, parallel compilation, and dependency tracking. There is no analog of the amalgamation in a Rust project.
+
+**TCL test harness.** C SQLite's test suite is driven by ~90,000+ lines of TCL scripts deeply intertwined with the C API. These cannot be meaningfully ported. Instead, FrankenSQLite uses native Rust `#[test]` modules, proptest for property-based testing, a conformance harness comparing SQL output against C SQLite golden files, and asupersync's lab reactor for deterministic concurrency tests.
+
+**LEMON parser generator.** C SQLite uses a custom LALR(1) parser generator called LEMON to produce `parse.c` from `parse.y`. FrankenSQLite uses a hand-written recursive descent parser with Pratt precedence for expressions. This yields better error messages with precise source span reporting, simpler maintenance, and no build-time code generation step. The `parse.y` grammar still serves as an authoritative reference.
+
+**Loadable extension API (.so/.dll).** C SQLite supports dynamically loading extensions via `sqlite3_load_extension()`, requiring a C-compatible ABI and `dlopen`/`LoadLibrary` calls. FrankenSQLite instead compiles all extensions directly into the binary, controlled by Cargo features. This eliminates an entire class of security vulnerabilities (arbitrary code loading) and simplifies deployment. Users who need custom extensions implement Rust traits and recompile.
+
+**Legacy file format quirks (schema format < 4).** Schema format number 4 has been the default since SQLite 3.3.0 (2006). Formats 1-3 have minor differences in how DESC indexes and boolean handling work. Supporting them would add complexity for a format that no actively maintained database uses. FrankenSQLite requires schema format 4 and rejects older formats with a clear error message.
+
+**Shared-cache mode.** C SQLite's shared-cache mode allows multiple connections within the same process to share a single page cache and use table-level locking. It has been deprecated since SQLite 3.41.0 (2023) and is widely considered a source of subtle bugs. FrankenSQLite's MVCC system supersedes it entirely: multiple connections share the MVCC version chains and benefit from page-level concurrency, which is strictly superior.
+
+**Multiplexor VFS.** C SQLite's multiplexor shards large databases across multiple files to work around filesystem limitations (e.g., FAT32 4GB limit). Modern filesystems do not have these limitations.
+
+**SEE (SQLite Encryption Extension).** The commercial C SQLite encryption extension is not ported. FrankenSQLite provides its own page-level encryption using XChaCha20-Poly1305 with DEK/KEK envelope encryption, Argon2id key derivation, and O(1) instant rekey (only the wrapped key is rewritten, not bulk page data).
 
 ---
 
