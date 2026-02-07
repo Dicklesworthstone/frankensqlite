@@ -52,14 +52,19 @@ pub trait Vfs: Send + Sync {
     ///
     /// Fills `buf` with bytes suitable for temporary file naming.
     ///
-    /// The default implementation is deterministic (xorshift) for reproducible
-    /// tests; real VFS implementations should override this and use OS-provided
-    /// randomness to avoid collisions.
+    /// The default implementation is deterministic (xorshift seeded from a
+    /// process-local counter) for reproducible tests; real VFS implementations
+    /// should override this and use OS-provided randomness to avoid collisions.
     fn randomness(&self, cx: &Cx, buf: &mut [u8]) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static CALL_SEQ: AtomicU64 = AtomicU64::new(0);
+
         // Default: fill with pseudo-random bytes using a simple xorshift.
         // Real VFS implementations should use OS-provided randomness.
         let _ = cx; // Usage to silence unused variable warning
-        let mut state: u64 = 0x5DEE_CE66_D1A4_F681;
+        let seq = CALL_SEQ.fetch_add(1, Ordering::Relaxed);
+        let mut state: u64 = 0x5DEE_CE66_D1A4_F681 ^ seq.wrapping_mul(0x9E37_79B9_7F4A_7C15);
         for chunk in buf.chunks_mut(8) {
             state ^= state << 13;
             state ^= state >> 7;

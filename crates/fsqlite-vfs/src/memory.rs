@@ -497,7 +497,7 @@ mod tests {
         let mut buf2 = [0u8; 16];
         vfs.randomness(&cx, &mut buf1);
         vfs.randomness(&cx, &mut buf2);
-        assert_eq!(buf1, buf2);
+        assert_ne!(buf1, buf2);
     }
 
     #[test]
