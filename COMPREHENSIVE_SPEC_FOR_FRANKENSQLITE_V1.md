@@ -6506,6 +6506,18 @@ REPLACE(cache, target_key):
       return
 ```
 
+**Dirty flush under mutex (design note):** The `flush_to_wal()` calls above
+execute WAL I/O while the cache mutex is held, blocking all concurrent cache
+operations for the duration of the write. This is a deliberate simplicity
+trade-off: the alternative (releasing the mutex, flushing, re-acquiring) would
+require complex state management to handle pages that change during the
+unlocked window. For the typical case (4096-byte page, NVMe SSD), a single
+`write_frame` completes in ~4μs — acceptable latency for the mutex critical
+section. If profiling reveals this as a bottleneck under heavy concurrent load,
+a "flush queue" approach (mark candidate as flush-pending, release mutex, flush
+asynchronously, re-acquire and evict) can be added without changing the
+logical algorithm.
+
 ### 6.4 Full ARC Algorithm: REQUEST Subroutine
 
 ```
@@ -6569,7 +6581,10 @@ REQUEST(cache, key: CacheKey) -> Result<Arc<CachedPage>>:
         T1.rotate_front_to_back()
         candidate = T1.front()
       if candidate.dirty:
-        flush_to_wal(candidate)       // must persist before eviction
+        if flush_to_wal(candidate).is_err():
+          T1.rotate_front_to_back()
+          candidate = T1.front()
+          continue                    // retry with next candidate
       (evicted_key, _) = T1.pop_front()
       // No B1.push_back — intentionally omitted (see above)
       total_bytes -= _.byte_size
@@ -6587,8 +6602,11 @@ REQUEST(cache, key: CacheKey) -> Result<Arc<CachedPage>>:
 ```
 
 **Complexity:** Each cache operation is O(1) amortized. Ghost lists consume
-only 12 bytes per entry (CacheKey), so maintaining them at `capacity` entries
-each has negligible memory overhead compared to the page data.
+12 bytes per CacheKey (`PageNumber`: 4B + `CommitSeq`: 8B) plus container
+overhead (hash table bucket pointer + linked list links ≈ 24 bytes per entry
+in a `LinkedHashSet`). At `capacity` entries each: 2000 entries × ~36 bytes
+= ~72 KB total ghost list overhead — still negligible compared to page data
+(~8 MiB for a 2000-page cache).
 
 ### 6.5 MVCC Adaptation: (PageNumber, CommitSeq) Keying with Ghost Lists
 
@@ -6743,12 +6761,18 @@ PRAGMA cache_size = N:
         cache.max_bytes = |N| * 1024    // |N| KiB
         cache.capacity = max(10, cache.max_bytes / page_size)
     if N == 0:
-        cache.capacity = 2000           // SQLite default
-        cache.max_bytes = 2000 * page_size
+        // SQLite treats 0 as "reset to compile-time default" (SQLITE_DEFAULT_CACHE_SIZE,
+        // which is -2000, meaning 2000 KiB). The effective page count is then
+        // max(10, 2000*1024 / page_size). For 4096-byte pages: max(10, 500) = 500.
+        // For 1024-byte pages: max(10, 2000) = 2000. The minimum of 10 pages
+        // is enforced by sqlite3BtreeSetCacheSize() (btree.c).
+        cache.max_bytes = 2000 * 1024   // 2000 KiB (compile-time default)
+        cache.capacity = max(10, cache.max_bytes / page_size)
 ```
 
-**Default:** 2000 pages (8 MiB for 4096-byte pages). Ghost lists limited to
-`capacity` entries each (~24 KB overhead for 2000 entries).
+**Default:** Compile-time default is -2000 (= 2000 KiB). For 4096-byte pages
+this yields 500 pages (2 MiB); for 1024-byte pages, 2000 pages. Ghost lists
+limited to `capacity` entries each (~72 KB overhead for 2000 entries, see §6.4).
 
 **Resize protocol (runtime change):**
 1. Set new capacity and max_bytes.
@@ -12581,6 +12605,6 @@ an embedded database engine can achieve.
 
 ---
 
-*Document version: 1.11 (Marker stream format + O(1) seek; time-travel binary search clarified; crash-safe ECS compaction publication; RaptorQ overhead slack/clamp + adaptive tuning; continued spec errata fixes)*
+*Document version: 1.12 (JSONB node types corrected with float5/reserved; JSONB size claim fixed; R\*-Tree naming; FTS3/4 feature matrix; birthday paradox examples fixed; Zipf formula rewritten; byte-level conflict clarified; retry policy; PageVersion xxh3 clarified; math compile flag; geopoly\_xform)*
 *Last updated: 2026-02-07*
 *Status: Authoritative Specification*
