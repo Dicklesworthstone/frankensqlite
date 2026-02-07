@@ -112,7 +112,6 @@ fsqlite-harness
 
 ```rust
 /// Virtual filesystem -- abstracts OS file operations.
-/// Equivalent to sqlite3_vfs.
 pub trait Vfs: Send + Sync {
     type File: VfsFile;
 
@@ -123,7 +122,6 @@ pub trait Vfs: Send + Sync {
 }
 
 /// An open file handle within a VFS.
-/// Equivalent to sqlite3_file + sqlite3_io_methods.
 pub trait VfsFile: Send + Sync {
     fn read(&self, buf: &mut [u8], offset: u64) -> Result<usize>;
     fn write(&self, buf: &[u8], offset: u64) -> Result<()>;
@@ -134,12 +132,30 @@ pub trait VfsFile: Send + Sync {
     fn unlock(&self, level: LockLevel) -> Result<()>;
 }
 
-/// Page cache -- manages in-memory page buffers.
-/// Sits between the pager and the VFS.
-pub trait PageCache: Send + Sync {
-    fn get_page(&self, pgno: PageNumber) -> Result<PageRef>;
-    fn release_page(&self, page: PageRef);
-    fn write_page(&self, pgno: PageNumber, data: &[u8]) -> Result<()>;
+/// Cache policy is pluggable: ARC/LRU/TinyLFU are implementations, not
+/// assumptions. Pager logic MUST NOT hardcode eviction behavior.
+pub trait CachePolicy: Send + Sync {
+    fn on_hit(&self, key: PageCacheKey);
+    fn on_insert(&self, key: PageCacheKey);
+    fn choose_victim(&self) -> Option<PageCacheKey>;
+}
+
+/// Pager -- snapshot/txn-aware page access API (MVCC-first).
+///
+/// Key point: the snapshot/txn context is explicit in signatures so MVCC and
+/// correctness constraints shape the design from day 1.
+pub trait Pager: Send + Sync {
+    type Transaction;
+    type Snapshot;
+
+    fn begin(&self, cx: &Cx, mode: TxnMode) -> Result<Self::Transaction>;
+    fn snapshot(&self, txn: &Self::Transaction) -> Self::Snapshot;
+
+    fn get_page(&self, cx: &Cx, snap: &Self::Snapshot, pgno: PageNumber) -> Result<PageRef>;
+    fn write_page(&self, cx: &Cx, txn: &mut Self::Transaction, pgno: PageNumber) -> Result<PageRef>;
+
+    fn commit(&self, cx: &Cx, txn: Self::Transaction) -> Result<()>;
+    fn rollback(&self, cx: &Cx, txn: Self::Transaction) -> Result<()>;
 }
 
 /// Cursor operations over a B-tree.
@@ -157,13 +173,11 @@ pub trait BtreeCursorOps {
 
 ```rust
 /// A deterministic or non-deterministic scalar function.
-/// Equivalent to xFunc in sqlite3_create_function.
 pub trait ScalarFunction: Send + Sync {
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue>;
 }
 
 /// An aggregate function with step/finalize semantics.
-/// Equivalent to xStep + xFinal.
 pub trait AggregateFunction: Send + Sync {
     type State: Default;
 
@@ -172,7 +186,6 @@ pub trait AggregateFunction: Send + Sync {
 }
 
 /// A window function extends aggregate with inverse and value.
-/// Equivalent to xStep + xInverse + xValue + xFinal.
 pub trait WindowFunction: Send + Sync {
     type State: Default;
 
@@ -187,7 +200,6 @@ pub trait WindowFunction: Send + Sync {
 
 ```rust
 /// A virtual table implementation.
-/// Equivalent to sqlite3_module.
 pub trait VirtualTable: Send + Sync {
     type Cursor: VirtualTableCursor;
 
@@ -345,12 +357,12 @@ reclaimable:
 
 ```rust
 struct BufferPool {
-    /// Versioned page cache. Keyed by (page_number, txn_id) so that
-    /// multiple versions of the same page can coexist.
-    pages: BTreeMap<(PageNumber, TxnId), CachedPage>,
+    /// Versioned page cache. Keyed by (pgno, version) so that multiple
+    /// versions of the same page can coexist.
+    pages: BTreeMap<PageCacheKey, CachedPage>,
 
-    /// LRU tracking for eviction. Each entry is a (PageNumber, TxnId) key.
-    lru: LruList,
+    /// Pluggable eviction policy (e.g., ARC by default).
+    policy: Arc<dyn CachePolicy>,
 
     /// Maximum number of pages to keep in the pool.
     /// Default: 2000 pages (~8MB at 4KB page size).
@@ -366,60 +378,44 @@ struct CachedPage {
 
 Eviction policy:
 - Only pages with `ref_count == 0` are eviction candidates.
-- Among candidates, prefer pages that are both **clean** (not dirty) and
-  **superseded** (a newer committed version exists in the pool for the same
-  page number).
-- If no superseded pages are available, evict the least recently used clean
-  page.
+- Among candidates, the configured `CachePolicy` chooses victims using signals
+  like recency/frequency and pager-provided hints (clean vs dirty, superseded
+  vs latest).
 - Dirty pages are never evicted; they must be flushed to the WAL first.
 
 ---
 
 ## Async Integration
 
-FrankenSQLite supports async callers through a controlled bridge between the
-synchronous database engine and async runtimes.
+FrankenSQLite uses **asupersync** as its async runtime and I/O substrate.
+There is no Tokio layer. The engine is written to be cancellation-aware and
+deadline-aware by threading `&Cx` through long-running operations.
 
 ### Components
 
-- **BlockingPool.** All file I/O operations (VFS reads, writes, syncs) are
-  dispatched to a dedicated blocking thread pool to avoid starving async
-  executor threads. The pool size defaults to 4 threads but is configurable.
+- **Cx (Capability Context).** Every database operation accepts `&Cx` for
+  cooperative cancellation and deadlines. Long-running queries observe
+  cancellation at explicit yield points (e.g., VDBE instruction boundaries)
+  and return `SQLITE_INTERRUPT` when cancelled.
 
-- **Cx (Capability Context).** Every database operation accepts an optional `Cx`
-  context that carries a cancellation token. Long-running queries check the
-  token at VDBE instruction boundaries (approximately every N opcodes) and
-  return `SQLITE_INTERRUPT` if cancelled. This enables cooperative cancellation
-  from async timeouts.
+- **Two-phase channels.** Commit publication and other critical pipelines use
+  asupersync's two-phase MPSC channels (reserve/commit) for bounded backpressure
+  and cancellation-safe publication.
 
-- **RwLock for active_transactions.** The `MvccManager` maintains a
-  `parking_lot::RwLock<HashMap<TxnId, TransactionState>>` map of active
-  transactions. Readers acquire a read lock (non-blocking, concurrent).
-  Transaction begin/commit/rollback acquire a write lock (brief, serialized).
-
-- **MPSC channel for write coordinator.** Write transactions submit their commit
-  requests through an `mpsc::channel` to a single write coordinator task. This
-  serializes commit validation and WAL appends without holding a lock across
-  the entire commit operation.
-
-- **Oneshot channel for commit response.** Each commit request includes a
-  `oneshot::Sender<Result<()>>` that the write coordinator uses to signal
-  success or failure back to the committing transaction. This allows the
-  caller to `.await` the commit result without polling.
+- **WriteCoordinator.** A single sequencer serializes only the tiny ordering
+  step of commit publication (validation + marker append). Bulk durability I/O
+  is performed by writers off the critical section.
 
 ### Flow
 
 ```
-async caller
-  → Connection::execute(sql).await
-    → spawn_blocking(|| {
-        parse(sql)
-        plan(ast)
-        execute(bytecode, cx)
-      })
+caller (sync or async)
+  → Connection::execute(&cx, sql)
+    → parse(sql)
+    → plan(ast)
+    → execute(bytecode, &cx)
       ← periodically checks cx.is_cancelled()
-    → on commit: tx.send(CommitRequest { write_set, response: oneshot })
-    → response.await
+    → on commit: publish request (two-phase MPSC) → await coordinator response
   ← Result<Rows>
 ```
 
@@ -433,7 +429,7 @@ The full lifecycle of a SQL statement from text to results:
 SQL text
   |
   v
-Lexer (tokenize.c equivalent)
+Lexer (tokenizer)
   - Produces a stream of Token { kind: TokenKind, span: Range<usize> }
   - Uses memchr for fast keyword/identifier boundary detection
   - Handles string literals, blob literals, numeric literals, operators

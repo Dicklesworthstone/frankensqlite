@@ -90,4 +90,4 @@ Derived from `COMPREHENSIVE_SPEC_FOR_FRANKENSQLITE_V1.md` Section 16.
 - [ ] Populate `conformance/` with 1000+ tests <!-- id: 68 -->
 - [ ] Implement fountain-coded replication <!-- id: 69 -->
 - [ ] Implement snapshot shipping <!-- id: 70 -->
-- [ ] Verify 95%+ conformance pass rate <!-- id: 71 -->
+- [ ] Verify 100% parity target against golden conformance suite (with any intentional divergences documented + annotated) <!-- id: 71 -->

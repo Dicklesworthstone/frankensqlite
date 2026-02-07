@@ -25,17 +25,22 @@ FrankenSQLite replaces this with **MVCC page-level versioning**:
 
 - **Multiple concurrent writers.** Two transactions modifying different B-tree
   pages proceed in full parallel with zero contention.
-- **Snapshot isolation.** Each transaction captures a consistent point-in-time
-  view at BEGIN. Long-running readers never block writers.
-- **Page-level conflict detection.** When two transactions modify the same page,
-  the conflict is detected eagerly at write time (not deferred to commit).
-  First-committer-wins semantics with immediate `SQLITE_BUSY` for the second
-  writer -- no deadlocks are possible.
+- **Snapshot-based reads + SSI by default.** Each transaction captures a
+  consistent point-in-time view at BEGIN. `BEGIN CONCURRENT` targets
+  SERIALIZABLE behavior via Serializable Snapshot Isolation (SSI), not merely
+  plain Snapshot Isolation (SI). A PRAGMA may explicitly downgrade to SI for
+  benchmarking or applications that tolerate write skew.
+- **Page-level conflict detection (FCW + safe merge ladder).** When two
+  transactions modify the same page, first-committer-wins (FCW) detects base
+  drift at commit. If configured, commuting same-page conflicts may be resolved
+  by the safe write-merge ladder (deterministic rebase + structured page
+  patches); otherwise the loser retries with `SQLITE_BUSY_SNAPSHOT`. Deadlocks
+  are impossible by construction (eager page locking, no wait-for cycles).
 - **Unlimited concurrent readers.** No `aReadMark[5]` limit. Any number of
   readers can hold independent snapshots simultaneously.
-- **WAL append serialization.** The expensive part (B-tree modifications) runs
-  in parallel. Only the cheap part (sequential WAL frame appends) is serialized
-  via a mutex, preserving correctness with minimal contention.
+- **Serialized commit ordering, not serialized I/O.** Writers perform bulk
+  persistence work in parallel; only a tiny ordering step (FCW + commit_seq +
+  commit marker append) is serialized.
 
 This design is similar in spirit to PostgreSQL's MVCC, but operates at page
 granularity rather than tuple granularity, matching the B-tree page-oriented
@@ -57,13 +62,22 @@ Page-level MVCC was chosen as the sweet spot between complexity and concurrency:
   abstraction. Writers to different parts of the same B-tree (different leaf
   pages) can proceed in parallel.
 
+### Concurrency Scope (Explicit)
+
+- **In-process (threads):** In scope. This is the minimum bar.
+- **Multi-process (same DB file):** In scope. Cross-process coordination uses
+  shared-memory state + OS file locks. The project MUST not assume
+  single-process ownership of a database file.
+
 ### Target Behavior
 
 - Read and write standard SQLite database files (format compatible with C SQLite)
 - Support the full SQL dialect recognized by SQLite 3.52.0
 - Implement all major extensions (FTS3/4/5, R-tree, JSON1, Session, ICU, misc)
 - Provide a drop-in interactive CLI shell replacement
-- Achieve 95%+ conformance against a golden-file test suite derived from C SQLite
+- **100% behavioral parity target** against a golden-file test suite derived
+  from C SQLite (for the supported surface). Any intentional divergence MUST be
+  explicitly documented and annotated in the harness with rationale.
 
 ---
 
@@ -162,19 +176,30 @@ establish the project infrastructure.
   format compatibility, testing strategy)
 - Write `PLAN_TO_PORT_SQLITE_TO_RUST.md` (this document)
 - Update `AGENTS.md` for the FrankenSQLite project
+- Scaffold `crates/fsqlite-harness/` with:
+  - an Oracle runner (C sqlite3) that can execute SQL and emit JSON fixtures
+  - a minimal golden comparison loop (rows, error codes, and side effects)
+- Establish perf regression discipline from day 1:
+  - define baseline artifact layout (criterion/hyperfine/profiles)
+  - capture at least one tiny baseline run (so "perf later" never happens)
 
 **Acceptance criteria:**
 - `cargo check --workspace` completes with zero errors
 - `cargo clippy --workspace --all-targets -- -D warnings` produces zero warnings
 - `cargo fmt --all -- --check` passes
 - All three specification documents are complete and reviewed
+- Oracle runner can execute at least 10 fixtures against C sqlite3 and emit
+  self-describing JSON fixtures (golden inputs/outputs)
+- First perf baseline artifact captured (even if trivial)
 
 ---
 
-### Phase 2: Core Types and Storage Foundation
+### Phase 2: MVCC-Shaped Storage Foundation
 
 **Goal:** Implement the foundational type system and the lowest layers of the
-storage stack (VFS, pager, page cache).
+storage stack (VFS + pager), but with MVCC/SSI requirements baked into the API
+from day 1 (snapshot/txn-aware page access; policy-pluggable cache). This phase
+is explicitly designed to avoid a "build then refactor" trap.
 
 **Work items:**
 - `fsqlite-types`: `PageNumber(u32)`, `PageSize`, `PageData`, `SqliteValue`
@@ -185,13 +210,22 @@ storage stack (VFS, pager, page cache).
   SQLite result codes, `StructuredError` with source location
 - `fsqlite-vfs`: `Vfs` and `VfsFile` traits, `MemoryVfs` implementation,
   `UnixVfs` implementation with `asupersync` blocking I/O
-- `fsqlite-pager`: Pager state machine, page cache with LRU eviction,
-  dirty page tracking
+- `fsqlite-pager`: Pager state machine with **snapshot/txn-aware** APIs (e.g.
+  `get_page(pgno, snapshot)` and `write_page(pgno, txn)`), dirty page tracking,
+  and a cache policy plug-in boundary (LRU/ARC/TinyLFU are implementations, not
+  assumptions)
+- `fsqlite-mvcc` (API-first): define the core types/predicates that shape pager
+  and WAL design (`TxnId`, `Snapshot`, visibility predicate, page-lock table
+  interfaces, and commit pipeline channel types). The goal here is correctness
+  of *interfaces* and invariants, not full concurrency throughput yet.
 
 **Acceptance criteria:**
 - `cargo check --workspace` clean
 - `cargo clippy -- -D warnings` clean
 - Memory VFS stores and retrieves pages correctly
+- Pager API makes snapshot/txn context explicit; cache policy is pluggable
+- Conformance harness can execute basic fixtures against FrankenSQLite (even if
+  the SQL surface is still small) and compare outputs against Oracle fixtures
 - 200+ unit tests passing
 
 ---
@@ -220,7 +254,8 @@ Hand-written recursive descent replacing LEMON-generated parser:
 
 **Acceptance criteria:**
 - B-tree integrity check passes after 10,000 random inserts
-- Parser handles 95%+ of the SQLite SQL grammar
+- Parser accepts the full SQLite SQL grammar required by the conformance corpus
+  (any remaining gaps are explicitly tracked and driven to zero)
 - 500+ tests passing
 
 ---
@@ -263,101 +298,64 @@ Port from `resolve.c`, `where.c`, `wherecode.c`, `whereexpr.c`:
 
 ---
 
-### Phase 5: Persistence, WAL, and Transactions
+### Phase 5: WAL + Transactions + MVCC Concurrent Writers (SSI)
 
 **Goal:** Implement durable storage with file-backed persistence, WAL mode, and
-full transaction semantics.
+full transaction semantics, while enabling concurrent writers via page-level
+MVCC. MVCC is not a "bolt-on": Phase 2 already shaped the pager/WAL interfaces;
+this phase fills in the full implementation and hard correctness gates.
 
-**Persistence:**
+**Persistence (Compatibility mode first):**
 - Unix VFS with POSIX file locking (fcntl advisory locks)
-- Rollback journal mode (DELETE, TRUNCATE, PERSIST, MEMORY, OFF)
-- Database file format compatibility (read C SQLite files, write files C SQLite
-  can read)
+- Rollback journal modes (DELETE, TRUNCATE, PERSIST, MEMORY, OFF) as needed for
+  SQLite parity
+- Database file format round-trip (read/write standard `.sqlite` files)
 
 **WAL (`fsqlite-wal`):**
-- WAL frame writing and reading (32-byte WAL header, 24-byte frame headers)
+- WAL frame append + read-back (canonical header/frame format)
 - WAL index (page-to-frame-offset hash mapping via shared memory / `-shm` file)
 - Checkpoint modes: PASSIVE, FULL, RESTART, TRUNCATE
 - Crash recovery (scan WAL, replay committed frames, discard uncommitted)
-- Snapshot isolation for readers
 
 **Transactions:**
 - BEGIN DEFERRED / IMMEDIATE / EXCLUSIVE
-- COMMIT and ROLLBACK
-- Savepoints: SAVEPOINT name / RELEASE name / ROLLBACK TO name
-- Auto-commit mode
-- Statement journaling for statement-level rollback
-- PRAGMA journal_mode, synchronous, cache_size
+- COMMIT / ROLLBACK and auto-commit semantics
+- Savepoints: SAVEPOINT / RELEASE / ROLLBACK TO
+- PRAGMAs: journal_mode, synchronous, cache_size
+
+**MVCC + SSI (`fsqlite-mvcc`):**
+- Page-level version chains (copy-on-write per page) with bounded GC horizon
+- Page-level lock table (eager, non-blocking acquisition; no wait-for cycles)
+- First-Committer-Wins validation and safe write-merge ladder for commuting
+  conflicts (deterministic rebase + structured page patches; raw XOR forbidden
+  for SQLite structured pages)
+- Serializable Snapshot Isolation (SSI) by default for `BEGIN CONCURRENT`
+  (explicit PRAGMA to downgrade to SI)
+- WriteCoordinator commit pipeline (two-phase MPSC reserve/commit) with
+  serialized **ordering only** (bulk I/O happens off the critical section)
+
+**Asupersync integration (non-negotiable):**
+- All file I/O via asupersync (no Tokio)
+- `Cx` for cooperative cancellation and deadlines
+- Two-phase channels for commit publication and bounded backpressure
 
 **Acceptance criteria:**
 - Create database, close, reopen, read back data correctly
-- WAL mode: concurrent readers + single writer
-- Crash recovery: kill mid-transaction, verify database consistency on reopen
 - File format round-trip with C SQLite (create with one, read with the other)
-- 1,500+ tests passing
-
----
-
-### Phase 6: MVCC Concurrent Writers
-
-**This is the architectural centerpiece that makes FrankenSQLite different
-from SQLite.**
-
-**Goal:** Replace the single-writer WAL model with MVCC page-level versioning
-to enable truly concurrent writers.
-
-**Core MVCC types (`fsqlite-mvcc`):**
-- `version_store.rs` -- Page version chains (copy-on-write per page)
-- `transaction.rs` -- TxnId (atomic u64 counter), transaction lifecycle
-- `visibility.rs` -- Snapshot isolation visibility rules:
-  - A page version V is visible to snapshot S if and only if:
-    1. `V.created_by <= S.high_water_mark`
-    2. `V.created_by NOT IN S.in_flight`
-    3. V is the most recent version satisfying conditions (1) and (2)
-- `conflict.rs` -- Page-level lock table (`BTreeMap<PageNumber, TxnId>`) +
-  first-committer-wins validation
-- `gc.rs` -- GC horizon = `min(active_txn_ids)`, truncate old versions that
-  have been superseded by committed versions below the horizon
-- `mvcc_wal.rs` -- MVCC-aware WAL with per-transaction frame groups
-- `page_version.rs` -- `PageVersion { pgno, created_by: TxnId, data, prev }`
-
-**MVCC-aware page access:**
-- `MvccPager::get_page(pgno, snapshot)` replaces `sqlite3PagerGet()` with a
-  three-tier lookup: buffer pool -> WAL index -> database file
-- `MvccPager::write_page(pgno, txn)` replaces `sqlite3PagerWrite()` with page
-  lock acquisition, copy-on-write versioning, and write set recording
-
-**Buffer pool:**
-- `BTreeMap<(PageNumber, TxnId), CachedPage>` -- multiple versions of same page
-  coexist in the cache
-- LRU eviction of unreferenced, clean, superseded versions
-- Default capacity: 2,000 pages (~8MB at 4KB page size)
-- Dirty pages never evicted until flushed to WAL
-
-**Asupersync integration:**
-- All file I/O via `BlockingPool` (1 min, 4 max threads)
-- `Cx` capability context for cooperative cancellation at VDBE instruction
-  boundaries
-- `asupersync::sync::RwLock` for `active_transactions` map
-- `asupersync::channel::mpsc` (two-phase reserve/commit) for write coordinator
-  commit pipeline
-- `asupersync::channel::oneshot` for commit response
-
-**Acceptance criteria:**
-- Two connections insert into different tables simultaneously -- no blocking
-- Two connections insert into same table, different pages -- both succeed
-- Same-page conflict: second committer gets proper error
-- 100 concurrent writers x 100 rows each -- all 10,000 rows present after
-  completion
-- Snapshot isolation: long-running reader sees consistent state despite
-  concurrent commits
-- GC reclaims memory after long-running readers close
-- Under 2x overhead vs single-writer for non-contended workloads
+- Crash recovery: kill mid-transaction, verify database consistency on reopen
+- Concurrent readers + writers: long-running reader sees consistent snapshot
+- Two concurrent writers touching disjoint pages both commit (no blocking)
+- Same-page conflict: loser retries with correct error (or succeeds only via
+  safe merge ladder when provably commuting)
+- SSI: write-skew patterns abort under default serializable mode
+- GC keeps memory bounded under sustained write load
+- Conformance harness runs continuously through this phase (no end-game deferral)
+- Perf baselines captured for MVCC hot paths (resolve, lock table, commit path)
 - 2,000+ tests passing
 
 ---
 
-### Phase 7: Advanced Query Planner and Full VDBE
+### Phase 6: Advanced Query Planner and Full VDBE
 
 **Goal:** Complete the query optimizer and implement all remaining VDBE opcodes
 and SQL features.
@@ -385,7 +383,7 @@ and SQL features.
 
 ---
 
-### Phase 8: Extensions
+### Phase 7: Extensions
 
 **Goal:** Implement all major SQLite extensions, each in its own feature-gated
 crate.
@@ -408,7 +406,7 @@ crate.
 
 ---
 
-### Phase 9: CLI Shell and Conformance
+### Phase 8: CLI Shell, Conformance, Benchmarks
 
 **Goal:** Deliver a production-quality interactive CLI and achieve verified
 conformance against C SQLite.
@@ -435,8 +433,9 @@ Interactive shell built with `frankentui`:
 - Error code matching (same error for same malformed input)
 - Type affinity and NULL handling verification
 - Golden file storage in `conformance/golden/`
-- Target: 95%+ conformance across 1,000+ test SQL files
-- Known incompatibilities documented with rationale
+- Target: **100% behavioral parity target** across 1,000+ test SQL files (for
+  the supported surface)
+- Any intentional divergence explicitly documented and annotated with rationale
 
 **Benchmarks:**
 - `benches/btree_insert.rs` -- insertion throughput
@@ -449,7 +448,7 @@ Interactive shell built with `frankentui`:
 
 **Acceptance criteria:**
 - CLI usable as a drop-in sqlite3 replacement for interactive use
-- 95%+ conformance against golden file suite
+- 100% parity target against golden file suite (with any intentional divergences documented + annotated)
 - Documented benchmark results with comparison to C SQLite
 - 4,000+ tests passing across the entire workspace
 
@@ -465,7 +464,7 @@ Every phase must pass this gate before proceeding:
 4. `cargo test --workspace` -- all tests pass
 5. `cargo bench --workspace` -- no performance regressions (Phase 4+)
 
-Additional verification for Phase 6+:
+Additional verification for Phase 5+ (MVCC-enabled):
 
 6. Stress test: 100 threads x 100 writes -- all rows present, no corruption
 7. Long-running reader + concurrent writer: snapshot consistency verified
@@ -706,7 +705,9 @@ The golden-file conformance system:
    row-by-row against golden files.
 3. **Reporting**: Produce a conformance matrix showing pass/fail/skip per test
    file, with diff output for failures.
-4. **Target**: 95%+ pass rate across 1,000+ test SQL files.
+4. **Target**: **100% behavioral parity target** across 1,000+ test SQL files
+   (for the supported surface), with any intentional divergences explicitly
+   documented and annotated.
 
 ### File Format Round-Trip
 
@@ -715,7 +716,7 @@ with FrankenSQLite (and vice versa), and verifies identical query results.
 This ensures file format compatibility is maintained. Includes byte-level
 comparison of page contents for known datasets.
 
-### Concurrency Stress Tests (Phase 6+)
+### Concurrency Stress Tests (Phase 5+)
 
 - 100 threads x 100 writes: verify all 10,000 rows present, no corruption
 - Long-running reader + concurrent writer: snapshot consistency
@@ -740,11 +741,10 @@ comparison of page contents for known datasets.
 | Phase 2 | 200+ |
 | Phase 3 | 500+ |
 | Phase 4 | 1,000+ |
-| Phase 5 | 1,500+ |
-| Phase 6 | 2,000+ |
-| Phase 7 | 3,000+ |
-| Phase 8 | 3,500+ |
-| Phase 9 | 4,000+ |
+| Phase 5 | 2,000+ |
+| Phase 6 | 3,000+ |
+| Phase 7 | 3,500+ |
+| Phase 8 | 4,000+ |
 
 ---
 
@@ -754,7 +754,7 @@ comparison of page contents for known datasets.
 
 | Risk | Impact | Likelihood | Mitigation |
 |------|--------|------------|------------|
-| **MVCC overhead exceeds budget.** Page-level versioning adds memory and CPU cost per page access. If overhead exceeds 2x for non-contended workloads, the concurrency benefit may not justify the cost. | High | Medium | Benchmark continuously from Phase 6. Buffer pool eviction of superseded versions keeps memory bounded. Page lock table uses `BTreeMap` (not `HashMap`) for cache-friendly access patterns. Profile and optimize hot paths with `criterion`. |
+| **MVCC overhead exceeds budget.** Page-level versioning adds memory and CPU cost per page access. If overhead exceeds 2x for non-contended workloads, the concurrency benefit may not justify the cost. | High | Medium | Benchmark continuously from Phase 5. Buffer pool eviction of superseded versions keeps memory bounded. Page lock table uses `BTreeMap` (not `HashMap`) for cache-friendly access patterns. Profile and optimize hot paths with `criterion`. |
 | **B-tree balancing correctness.** The page splitting/merging algorithms in `btree.c` are among the most complex and subtle code in SQLite (~4,000 lines for balance_nonroot alone). Correctness bugs here corrupt data silently. | High | Medium | Extensive property-based testing with `proptest` (random insert/delete sequences). Integrity check function runs after every test. Compare B-tree structure against C SQLite for identical insertion sequences. |
 | **File format incompatibility.** Subtle encoding differences (varint edge cases, cell pointer alignment, overflow threshold calculations) could produce files that C SQLite rejects or misreads. | High | Medium | Golden-file round-trip tests: create with FrankenSQLite, read with C SQLite (and vice versa). Byte-level comparison of page contents for known datasets. Test with databases up to 1GB. |
 

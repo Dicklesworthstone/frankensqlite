@@ -95,7 +95,7 @@ insta = { version = "1.42", features = ["json", "yaml"] }
 tempfile = "3.17"
 
 [profile.release]
-opt-level = 3
+opt-level = "z"
 lto = true
 codegen-units = 1
 panic = "abort"

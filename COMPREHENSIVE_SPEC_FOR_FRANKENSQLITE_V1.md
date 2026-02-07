@@ -190,11 +190,10 @@ model rather than a silent corruption or a "panic and pray" failure mode.
 - **`unsafe_code = "forbid"`** -- no escape hatches
 - **Clippy pedantic + nursery at deny level** -- with specific documented allows
 - **23 crates** in workspace under `crates/`
-- **Release profile** (as configured in the workspace `Cargo.toml`): `opt-level = 3`,
-  `lto = true`, `codegen-units = 1`, `panic = "abort"`, `strip = true`
-  (A database engine requires full throughput optimization, not size optimization.
-  `opt-level = 3` enables aggressive inlining, loop unrolling, and vectorization
-  critical for page checksumming, B-tree traversal, and RaptorQ codec hot paths.)
+- **Release profile** (as configured in the workspace `Cargo.toml`): `opt-level = "z"`,
+  `lto = true`, `codegen-units = 1`, `panic = "abort"`, `strip = true`.
+  For throughput benchmarking and perf work, use a separate `release-perf`
+  profile that inherits from `release` but sets `opt-level = 3`.
 
 **Engineering & Process Constraints (from `AGENTS.md`):**
 - **User is in charge.** If the user overrides anything, follow the user.
@@ -5178,6 +5177,14 @@ visible(V, S) :=
 resolve(P, S) :=
     first V in version_chain(P) where visible(V, S)
     // Falls back to on-disk baseline if no committed version found
+
+resolve_for_txn(P, T) -> Option<VersionIdx> :=
+    // Returns the VersionArena index of the base version for a write.
+    // Used by write_page() to set PageVersion.prev_idx.
+    if P in T.write_set: return T.write_set[P].prev_idx
+    let V = resolve(P, T.snapshot)
+    if V exists: return Some(V.arena_idx)   // arena index of the resolved version
+    else: return None                       // page only exists on disk (no version chain entry)
 ```
 
 **Complete worked example (commit-seq snapshots):**
@@ -5832,7 +5839,10 @@ MUST be rejected (or not compiled), and only Serialized mode is supported.
    analysis of transaction durations; §5.5). LEASE does not enforce `D` by
    itself; it only enables crash cleanup.
 3. **Commit/Abort:** Set `state` to Committed or Aborted. Release page locks.
-   On commit: set `commit_seq = assigned_commit_seq`. Set `txn_id` to 0 (slot is free).
+   On commit: set `commit_seq = assigned_commit_seq`. For Concurrent-mode
+   transactions with SSI enabled, insert a `CommittedReaderEntry` into the
+   `RecentlyCommittedReadersIndex` (§5.6.2.1) BEFORE freeing the slot.
+   Then set `txn_id` to 0 (slot is free).
    (The next acquirer increments `txn_epoch`, so stale slot references are rejected.)
 
 **Lease-based crash cleanup:** If a process crashes, its TxnSlots become
@@ -5921,6 +5931,91 @@ succeeds.
 - Unix: use `kill(pid, 0)` to check existence (treat `EPERM` as "alive"), AND
   verify the process start time matches `pid_birth` (prevents PID reuse bugs).
 - Windows: check process handle liveness and creation time.
+
+#### 5.6.2.1 Recently Committed Readers (SSI Incoming Edge Coverage)
+
+**Problem (normative):** The SSI incoming-edge discovery procedure (§5.7.3
+step 3) uses the hot plane (`HotWitnessIndex` bitsets intersected with
+`active_slots_bitset`) to find readers that read keys the committing
+transaction wrote. Once a reader `R` commits and frees its TxnSlot
+(`txn_id = 0`), `R` is invisible in the hot plane. If `R` read a key that
+the committing transaction `T` later wrote, the rw-antidependency edge
+`R -rw-> T` goes undetected. This can:
+
+- suppress `T.has_in_rw` (making a pivot commit possible when it should abort), and/or
+- suppress the **T3 rule** for a dangerous structure `X -rw-> R -rw-> T` when `R`
+  is the pivot but has already committed (and thus cannot be aborted).
+
+This is the symmetric counterpart to the outgoing-edge gap (committed writers
+invisible in the hot plane), which is solved by consulting the `commit_index`.
+PostgreSQL SSI solves the incoming-edge problem by retaining SIREAD locks for
+committed transactions until all concurrent transactions have finished.
+
+**Solution (normative):** FrankenSQLite MUST maintain a
+`RecentlyCommittedReadersIndex` that retains committed transactions' SSI read
+evidence until it is safe to discard.
+
+```
+RecentlyCommittedReadersIndex := {
+    entries: Vec<CommittedReaderEntry>,
+    gc_horizon: CommitSeq,             -- entries with commit_seq <= gc_horizon are prunable
+}
+
+CommittedReaderEntry := {
+    txn_id      : TxnId,
+    begin_seq   : CommitSeq,           -- snapshot.high at BEGIN
+    commit_seq  : CommitSeq,           -- assigned at commit
+    has_in_rw   : bool,                -- SSI incoming flag at commit time
+    read_witness_summary : WitnessPageSet,  -- pages (or witness keys) read by this txn
+}
+
+WitnessPageSet := RoaringBitmap<u32>   -- page numbers; sound superset of keys read
+```
+
+**Lifecycle:**
+
+1. **On commit:** After a Concurrent-mode transaction `R` passes SSI validation
+   and commits, the engine MUST insert a `CommittedReaderEntry` into the index
+   BEFORE freeing `R`'s TxnSlot. The entry captures `R`'s read witness summary
+   (a page-level bitmap, sufficient for incoming-edge discovery; cell/byte-range
+   refinement uses the cold plane) and `R`'s SSI flags at commit time.
+
+2. **During incoming-edge discovery:** `discover_incoming_edges(T, write_wits)`
+   MUST, in addition to querying the hot plane, scan the
+   `RecentlyCommittedReadersIndex` for entries where:
+   - `entry.commit_seq > T.begin_seq` (R committed after T's snapshot), AND
+   - `entry.read_witness_summary` overlaps with T's write set pages.
+   Each matching entry produces a candidate incoming edge `R -rw-> T`. If
+   `entry.has_in_rw` is true, then allowing `T` to commit would complete a
+   dangerous structure where the pivot (`R`) is already committed and cannot be
+   aborted. Therefore `T` MUST abort with `SQLITE_BUSY_SNAPSHOT` (the T3 rule
+   for committed pivots; §5.7.3 step 6).
+
+3. **GC:** An entry is safe to prune when no active transaction has
+   `begin_seq <= entry.begin_seq`. Equivalently, when the oldest active
+   snapshot's `high >= entry.commit_seq`, any future committer's incoming-edge
+   check cannot produce an edge with `entry` (the committer's snapshot already
+   includes `entry`'s commit, so `entry` is not concurrent). The GC horizon
+   tracks `min(active snapshot.high)` and prunes entries whose `commit_seq`
+   is at or below it.
+
+**Cross-process (shared memory):** The index MUST be accessible to all
+processes. In multi-process deployments, it resides in the
+`foo.db.fsqlite-shm` shared memory region as a fixed-capacity circular buffer
+of `CommittedReaderEntry` records. Overflow beyond capacity forces the oldest
+entries to be pruned early; if this risks correctness (pruned entries'
+`commit_seq > min(active snapshot.high)`), the engine MUST fall back to
+aborting the committing transaction with `SQLITE_BUSY_SNAPSHOT` rather than
+allowing a potential false negative.
+
+**Memory bound:** Under steady state with commit rate `R` and maximum
+transaction duration `D`, the index holds at most `R * D` entries (same
+bound as version chain length; Theorem 5). In shared memory this MUST be
+implemented as a fixed byte-capacity ring (records are eviction-prone by design):
+if inserting a new `CommittedReaderEntry` would exceed capacity (or would force
+eviction of entries that are still required for correctness), the engine MUST
+abort the committing transaction with `SQLITE_BUSY_SNAPSHOT` rather than risk a
+false negative.
 
 #### 5.6.3 Cross-Process Page Lock Table
 
@@ -6736,11 +6831,11 @@ transactions. The witness plane does this in two stages:
 **Outgoing rw-antidependency discovery** (`T -rw-> W`) is symmetric using
 the union of `writers_for_epoch(cur) ∪ writers_for_epoch(prev)`.
 
-**Theorem (No False Negatives, hot plane):**
+**Theorem (No False Negatives, hot plane -- active transactions only):**
 
-If a transaction `R` registers a read `WitnessKey K`, then `R` is discoverable
-as a reader candidate for `K` at commit time for any overlapping writer `T`
-because:
+If a transaction `R` is **active** (holds its TxnSlot) and registers a read
+`WitnessKey K`, then `R` is discoverable as a reader candidate for `K` at
+commit time for any overlapping writer `T` because:
 - registration updates every configured level bucket for `K` (or `overflow`)
   by setting `readers_for_epoch(R.witness_epoch)[R.slot_id]` (union-only),
 - epoch advancement is constrained so every active transaction has
@@ -6748,8 +6843,16 @@ because:
   live epochs for those same buckets (and `overflow`),
 - stale bits are filtered by `(txn_id, txn_epoch)` validation.
 
-Thus false negatives are forbidden by construction; false positives are bounded
-and reduced by refinement.
+Thus false negatives are forbidden by construction for active readers; false
+positives are bounded and reduced by refinement.
+
+**Scope limitation:** This theorem covers only transactions that still hold
+their TxnSlot. Once `R` commits and frees its slot (`txn_id = 0`), `R`'s
+hot-plane evidence becomes stale (slot reuse changes `txn_epoch`). For
+committed readers, the `RecentlyCommittedReadersIndex` (§5.6.2.1) provides
+the required coverage. The combination of hot plane (active readers) +
+`RecentlyCommittedReadersIndex` (committed readers) is required for complete
+incoming-edge coverage.
 
 #### 5.7.3 Commit-Time SSI Validation (Proof-Carrying)
 
@@ -6822,22 +6925,29 @@ ssi_validate_and_publish(T):
      abort T with SQLITE_BUSY_SNAPSHOT
 
   // 6) T3 rule (Cahill/Ports §3.2, "near-miss" check):
-  //    When T commits, it may complete a dangerous structure where some
-  //    other active transaction T_other is the pivot. Specifically, if T
-  //    wrote a page that T_other read (creating an rw edge T_other->T,
-  //    making T_other.has_out_rw = true) AND T_other already has an
-  //    incoming rw edge (T_other.has_in_rw = true), then T_other is now
-  //    a confirmed pivot and must be aborted.
+  //    When T commits, it may complete a dangerous structure where some other
+  //    transaction R is the pivot. Specifically, if:
+  //      - R already has an incoming rw edge (R.has_in_rw = true), and
+  //      - T wrote a key/page that R read (creating R -rw-> T, i.e. R now has
+  //        an outgoing rw edge),
+  //    then R is a confirmed pivot in `X -rw-> R -rw-> T`.
   //
-  //    Implementation: scan in_edges (which represent R -rw-> T: some R
-  //    read a page that T later wrote). For each such R, R now has an
-  //    outgoing rw edge, so set R.has_out_rw = true. If R also has an
-  //    incoming edge (R.has_in_rw), then R is a pivot: T_x -> R -> T.
-  for T_other in in_edges.source_txns():    // T_other -rw-> T (T_other read, T wrote)
-      T_other.has_out_rw = true              // T_other now has an outgoing rw edge to T
-      if T_other.has_in_rw:
-          // T_other is now a pivot: T_x -> T_other -> T (and T is committing)
-          T_other.marked_for_abort = true     // eager abort optimization
+  //    - If R is still active: mark R for abort (eager optimization).
+  //    - If R already committed: R cannot be aborted, so T MUST abort.
+  //
+  //    Sources of `in_edges` include:
+  //    - active readers discovered from the hot plane (TxnSlots), and
+  //    - committed readers discovered via `RecentlyCommittedReadersIndex` (§5.6.2.1),
+  //      which carries `has_in_rw` from the reader's commit-time state.
+  for R in in_edges.source_txns():           // R -rw-> T (R read, T wrote)
+      if R.is_active():
+          R.has_out_rw = true                // R now has an outgoing rw edge to T
+          if R.has_in_rw:
+              R.marked_for_abort = true      // R is pivot; abort it
+      else:
+          if R.has_in_rw:
+              publish AbortWitness(T, edges = in_edges ∪ out_edges)   // committed pivot implies abort T (conservative)
+              abort T with SQLITE_BUSY_SNAPSHOT
 
   // 7) Publish edges + return evidence references for CommitProof.
   edge_ids = publish DependencyEdge objects for (in_edges ∪ out_edges)
@@ -9800,7 +9910,7 @@ must_use_candidate = { level = "allow", priority = 1 }
 option_if_let_else = { level = "allow", priority = 1 }
 
 [profile.release]
-opt-level = 3          # Full optimization (database engine needs throughput, not min size)
+opt-level = "z"        # Default release optimizes for size; use release-perf for throughput characterization
 lto = true             # Whole-program optimization
 codegen-units = 1      # Single codegen unit for maximum optimization
 panic = "abort"        # No unwinding overhead
@@ -9898,17 +10008,17 @@ pub trait Vfs: Send + Sync {
     /// - `AccessFlags::EXISTS`: file exists
     /// - `AccessFlags::READWRITE`: file exists and is read-write
     /// - `AccessFlags::READ`: file exists and is readable
-    fn access(&self, path: &Path, flags: AccessFlags) -> Result<bool>;
+    fn access(&self, cx: &Cx, path: &Path, flags: AccessFlags) -> Result<bool>;
 
     /// Convert a relative path to an absolute (canonical) path.
-    fn full_pathname(&self, path: &Path) -> Result<PathBuf>;
+    fn full_pathname(&self, cx: &Cx, path: &Path) -> Result<PathBuf>;
 
     /// Fill `buf` with random bytes. Used for WAL salt generation.
-    fn randomness(&self, buf: &mut [u8]);
+    fn randomness(&self, cx: &Cx, buf: &mut [u8]);
 
     /// Return the current time as a Julian day number (fractional days
     /// since noon, November 24, 4714 BC, proleptic Gregorian calendar).
-    fn current_time(&self) -> f64;
+    fn current_time(&self, cx: &Cx) -> f64;
 }
 
 /// An open file handle within a VFS.
@@ -9945,7 +10055,7 @@ pub trait VfsFile: Send + Sync {
     fn sync(&mut self, cx: &Cx, flags: SyncFlags) -> Result<()>;
 
     /// Return the current file size in bytes.
-    fn file_size(&self) -> Result<u64>;
+    fn file_size(&self, cx: &Cx) -> Result<u64>;
 
     /// Acquire or upgrade a file lock.
     /// Lock levels: NONE < SHARED < RESERVED < PENDING < EXCLUSIVE.
@@ -9962,7 +10072,7 @@ pub trait VfsFile: Send + Sync {
 
     /// Check whether another process holds a RESERVED lock.
     /// Used to determine if a write transaction is in progress elsewhere.
-    fn check_reserved_lock(&self) -> Result<bool>;
+    fn check_reserved_lock(&self, cx: &Cx) -> Result<bool>;
 
     /// Return the sector size of the underlying storage device.
     /// Typically 512 (HDD) or 4096 (SSD). Used for WAL frame alignment.
@@ -10179,7 +10289,7 @@ pub trait ScalarFunction: Send + Sync {
     /// Returns the result value, or an error.
     ///
     /// # Errors
-    /// - `FrankenError::Error` with a message for domain errors (e.g., abs(NULL))
+    /// - `FrankenError::Error` with a message for domain errors (e.g., abs(-9223372036854775808))
     /// - `FrankenError::TooBig` if result exceeds SQLITE_MAX_LENGTH
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue>;
 
@@ -10556,13 +10666,20 @@ pub enum TokenType {
     // Literals
     Integer,          // 42, -7, 0xFF
     Float,            // 3.14, 1e10, .5
-    String,           // 'hello', "hello" (SQL standard single-quote; double-quote for identifiers)
+    String,           // 'hello' (single-quoted only at the lexer level)
     Blob,             // X'CAFE', x'00ff'
     Variable,         // ?1, :name, @name, $name
 
     // Identifiers and keywords
     Id,               // unquoted identifier
     QuotedId,         // "quoted identifier" or [bracketed identifier] or `backtick`
+                      // NOTE: "hello" is ALWAYS QuotedId at the lexer level, matching
+                      // C SQLite's tokenizer (tokenize.c:413 emits TK_ID for all
+                      // double-quoted tokens). The DQS (double-quoted string) legacy
+                      // behavior — where an unresolvable "identifier" is reinterpreted
+                      // as a string literal — is handled in name resolution (resolve.c),
+                      // NOT the lexer. QuotedId tokens carry an EP_DblQuoted-equivalent
+                      // flag so the resolver can apply DQS fallback when enabled.
 
     // Keywords (each is its own variant for fast matching)
     KwAbort, KwAction, KwAdd, KwAfter, KwAll, KwAlter, KwAlways,
@@ -10835,7 +10952,7 @@ otherwise it falls back to heuristic estimates.
 
 ```
 Full table scan:              cost = N_pages(table)
-Index scan (range):           cost = log2(N_pages(index)) + selectivity * N_pages(table)
+Index scan (range):           cost = log2(N_pages(index)) + selectivity * N_pages(index) + selectivity * N_pages(table)
 Index scan (equality):        cost = log2(N_pages(index)) + 1
 Covering index scan:          cost = log2(N_pages(index)) + selectivity * N_pages(index)
 Rowid lookup:                 cost = log2(N_pages(table))
@@ -12233,7 +12350,9 @@ NULL immediately**. The aggregate `min(X)` over a column ignores NULLs.
 **nullif(X, Y)** -> any. Returns NULL if X = Y, otherwise returns X.
 
 **octet_length(X)** -> integer (SQLite 3.43+). Returns the number of bytes
-in the text or blob representation of X, without any type conversion.
+in the UTF-8 encoding of X. For numeric values, X is first converted to its
+text representation. This is equivalent to `length(CAST(X AS BLOB))` and
+differs from `length(X)` for UTF-8 text (`length` counts characters, not bytes).
 
 **quote(X)** -> text. Returns X in a form suitable for inclusion in SQL.
 Text is single-quoted with internal quotes doubled. Blobs become `X'hex'`.
@@ -12258,12 +12377,23 @@ positive X. Returns NULL for NULL. Returns NULL for non-numeric strings.
 string (letter + 3 digits). Returns `?000` for empty or NULL input.
 
 **substr(X, START [, LENGTH])** / **substring(X, START [, LENGTH])** -> text
-or blob. 1-based indexing. Negative START counts from the end. If LENGTH is
-negative, returns characters to the left of START. For blob arguments,
-operates on bytes.
+or blob.
+
+- 1-based indexing for `START > 0`.
+- `START = 0` is a historical quirk (SQLite default behavior): if LENGTH is
+  provided and `LENGTH > 0`, the function returns `max(LENGTH - 1, 0)` elements
+  from the start; if LENGTH is omitted, it behaves like `START = 1`.
+- Negative START counts from the end.
+- If LENGTH is omitted, returns from START to the end.
+- If LENGTH is negative, returns `abs(LENGTH)` characters (or bytes for BLOB)
+  immediately preceding START (to the left), excluding the element at START.
 
 **typeof(X)** -> text. Returns `"null"`, `"integer"`, `"real"`, `"text"`,
 or `"blob"`.
+
+**subtype(X)** -> integer. Returns the subtype of X as an integer tag
+(`sqlite3_value_subtype(X)`). Unlike most scalar functions, `subtype()` does
+NOT propagate NULL: `subtype(NULL) = 0` (the same value used for "no subtype").
 
 **unhex(X [, Y])** -> blob (SQLite 3.41+). Decodes hex string X into blob.
 Y specifies characters to ignore (e.g., spaces, dashes). Returns NULL if X
@@ -12272,16 +12402,24 @@ contains invalid hex characters (after removing Y characters).
 **unicode(X)** -> integer. Returns the Unicode code point of the first
 character of text X.
 
-**unistr(X)** -> text (SQLite 3.45+). Interprets `\uXXXX` and `\UXXXXXXXX`
-escape sequences in X.
+**unistr(X)** -> text (SQLite 3.45+; `SQLITE_ENABLE_UNISTR_FUNCTION` in C builds).
+Interprets `\uXXXX` and `\UXXXXXXXX` escape sequences in X.
 
 **zeroblob(N)** -> blob. Returns a blob consisting of N zero bytes.
 Efficiently represented internally without allocating N bytes.
 
 **sqlite_version()** -> text. Returns the version string (e.g., "3.52.0").
-FrankenSQLite returns its own version but the format matches SQLite.
+For compatibility, FrankenSQLite SHOULD report its claimed SQLite feature
+compatibility target (so application feature detection works). It MAY also
+expose an engine-specific version via a separate function.
 
 **sqlite_source_id()** -> text. Returns source identification string.
+
+**sqlite_compileoption_used(X)** -> integer (0 or 1). Returns 1 if compile
+option X was used, else 0.
+
+**sqlite_compileoption_get(N)** -> text or NULL. Returns the Nth compile-time
+option string. Returns NULL if N is out of range.
 
 **changes()** -> integer. Returns the number of rows modified by the most
 recent INSERT, UPDATE, or DELETE on the same connection.
@@ -12289,9 +12427,10 @@ recent INSERT, UPDATE, or DELETE on the same connection.
 **total_changes()** -> integer. Returns the total number of rows modified
 since the connection was opened.
 
-**sqlite_offset(X)** -> integer. Returns the byte offset of the column X
-in the database file. Only meaningful within a query; requires that X be a
-direct column reference (not an expression).
+**sqlite_offset(X)** -> integer (`SQLITE_ENABLE_OFFSET_SQL_FUNC` in C builds).
+Returns the byte offset of the value for column X within the underlying record
+payload. Only meaningful within a query; requires that X be a direct column
+reference (not an expression).
 
 ### 13.2 Math Functions (SQLite 3.35+)
 
@@ -12308,12 +12447,15 @@ sqrt of negative), the behavior depends on the function.
 **atan(X)** -> real. Arc tangent. Domain: all reals.
 **atan2(Y, X)** -> real. Two-argument arc tangent. Returns angle in radians.
 **atanh(X)** -> real. Inverse hyperbolic tangent. Domain: (-1, 1).
-**ceil(X)** / **ceiling(X)** -> integer. Smallest integer >= X.
+**ceil(X)** / **ceiling(X)** -> integer or real. Smallest integer >= X.
+Returns INTEGER if X is INTEGER; otherwise returns a REAL with an integral
+value (e.g., `ceil(1.2) = 2.0`).
 **cos(X)** -> real. Cosine (X in radians).
 **cosh(X)** -> real. Hyperbolic cosine.
 **degrees(X)** -> real. Converts radians to degrees.
 **exp(X)** -> real. e raised to the power X. Overflow returns +Inf.
-**floor(X)** -> integer. Largest integer <= X.
+**floor(X)** -> integer or real. Largest integer <= X.
+Returns INTEGER if X is INTEGER; otherwise returns a REAL with an integral value.
 **ln(X)** -> real. Natural logarithm. Domain: (0, +inf). Returns NULL for X <= 0.
 **log(X)** / **log10(X)** -> real. Base-10 logarithm.
 **log(B, X)** -> real. Base-B logarithm. Computed as ln(X)/ln(B).
@@ -12328,13 +12470,16 @@ sqrt of negative), the behavior depends on the function.
 **sqrt(X)** -> real. Square root. Returns NULL for negative X.
 **tan(X)** -> real. Tangent (X in radians).
 **tanh(X)** -> real. Hyperbolic tangent.
-**trunc(X)** -> integer. Truncates toward zero.
+**trunc(X)** -> integer or real. Truncates toward zero.
+Returns INTEGER if X is INTEGER; otherwise returns a REAL with an integral value.
 
-**NaN and Inf handling:** SQLite does not have first-class NaN or Inf values.
-If a math function would return NaN (e.g., `0.0/0.0`), the result is NULL.
-If a function would return +/-Inf (e.g., `exp(1000)`), the behavior is
-platform-dependent in C SQLite; FrankenSQLite returns NULL for Inf to
-maintain deterministic behavior.
+**NaN and Inf handling (normative):** SQLite stores IEEE-754 doubles as REAL.
+`+Inf` and `-Inf` are valid REAL values and can be produced by overflow
+(e.g., `exp(1000)` yields `Inf`). Division by zero yields NULL (not Inf/NaN).
+
+FrankenSQLite MUST match SQLite observable behavior:
+- propagate `+Inf` / `-Inf` as REAL values when SQLite does,
+- normalize NaN results to NULL (and avoid surfacing NaN as a stored value).
 
 ### 13.3 Date/Time Functions
 
@@ -12465,10 +12610,19 @@ over sliding windows, rather than recomputing from scratch.
 
 ### 13.6 COLLATE Interaction
 
-Comparison functions (`min`, `max`, `instr`, `replace`, `LIKE`, `GLOB`)
-respect the collation of their operands. When operands have different
-collations, the affinity rules determine which collation wins:
-1. Explicit `COLLATE` clause on either operand wins
+Collation affects ordering/comparison semantics, not raw string processing.
+
+**Functions affected by collation:** `min` / `max` (scalar and aggregate) use
+SQLite's comparison rules and therefore respect collation.
+
+**Functions NOT affected by collation:** `instr`, `replace`, `LIKE`, and `GLOB`
+do not use collation; they implement their own byte/character and/or
+case-folding rules.
+
+When operands have different collations for a comparison, SQLite's normal
+collation selection rules apply:
+1. Explicit `COLLATE` clause wins (if multiple explicit collations appear,
+   the leftmost one wins)
 2. Column collation from the schema
 3. Default `BINARY` collation
 
@@ -14640,7 +14794,7 @@ Mitigations:
 
 **R3. Append-only storage grows without bound.**
 Mitigations:
-- Checkpoint and compaction are first-class (Section 5.5 for GC/version chain trimming, Section 7.9 for crash contract).
+- Checkpoint, GC, and compaction are first-class (Section 5.5 for MVCC GC/version chain trimming, Section 7.13 for ECS compaction, Section 7.9 for the crash contract).
 - Enforce budgets for MVCC history, SSI witness plane, symbol caches.
 - Safe GC horizon = min(active `begin_seq`) (Theorem 4) bounds version chain length (Theorem 5).
 

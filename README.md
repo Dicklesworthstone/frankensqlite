@@ -1093,7 +1093,10 @@ for h in handles { h.join().unwrap(); }
 
 ### Conformance Target
 
-95%+ behavioral compatibility with C SQLite 3.52.0. Every known incompatibility is documented with rationale. The conformance suite runs SQL Logic Tests (SLT format) covering:
+**100% behavioral parity target** with C SQLite 3.52.0 for the supported
+surface. Any intentional divergence MUST be explicitly documented and
+annotated in the harness with rationale. The conformance suite runs SQL Logic
+Tests (SLT format) covering:
 
 - All DML and DDL operations
 - All join types (INNER, LEFT, RIGHT, FULL, CROSS, NATURAL)
@@ -2264,7 +2267,7 @@ FrankenSQLite follows a 9-phase implementation plan. Each phase has specific **v
 | 6 | **Concurrency** | MVCC engine, SSI, safe write merge ladder, garbage collection |
 | 7 | **SQL Completeness** | Query planner, window functions, CTEs, triggers, views |
 | 8 | **Extensions** | FTS5, R-tree, JSON1, session, ICU, misc extensions |
-| 9 | **Conformance** | 95%+ compatibility with C SQLite, benchmarks, hardening |
+| 9 | **Conformance** | 100% parity target with C SQLite, benchmarks, hardening |
 
 ### Universal Verification Gates (Every Phase)
 
@@ -2299,7 +2302,7 @@ FrankenSQLite follows a 9-phase implementation plan. Each phase has specific **v
 - Crash model: 100 crash-recovery scenarios validating self-healing contract
 
 **Phase 9 (Conformance):**
-- 95%+ pass rate across 1,000+ golden test files
+- 100% parity target across 1,000+ golden test files (with any intentional divergences documented + annotated)
 - Single-writer benchmarks within 3× of C SQLite
 - No regression (conformal p-value > 0.01) compared to Phase 8
 
@@ -2485,7 +2488,10 @@ A: Safe Rust with proper data structures is fast. The type system prevents entir
 A: SQLite's C codebase is well-engineered but carries 24 years of accumulated complexity (218K LOC in the amalgamation). A clean-room Rust implementation enables MVCC without fighting the existing architecture, provides compile-time memory safety, and produces a codebase that Rust developers can work with naturally.
 
 **Q: What's the conformance target?**
-A: 95%+ behavioral compatibility with C SQLite 3.52.0, measured by running the SQLite test corpus against both implementations and comparing results. Known incompatibilities are documented with rationale.
+A: **100% behavioral parity target** with C SQLite 3.52.0 for the supported
+surface, measured by running the SQLite test corpus against both implementations
+and comparing results. Any intentional divergence is documented and annotated
+with rationale.
 
 **Q: How does MVCC garbage collection affect latency?**
 A: The GC runs on a background thread every ~1 second. It walks version chains and frees unreachable versions. The GC never holds the WAL append mutex, so it does not block writers. The only contention point is the brief `RwLock` acquisition to read the active transaction set when computing the GC horizon.

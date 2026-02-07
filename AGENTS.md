@@ -88,6 +88,14 @@ panic = "abort"     # Smaller binary, no unwinding overhead
 strip = true        # Remove debug symbols
 ```
 
+For throughput benchmarking and perf work, a separate profile exists:
+
+```toml
+[profile.release-perf]
+inherits = "release"
+opt-level = 3
+```
+
 ---
 
 ## Code Editing Discipline
