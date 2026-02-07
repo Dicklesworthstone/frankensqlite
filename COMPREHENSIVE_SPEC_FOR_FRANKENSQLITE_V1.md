@@ -12659,9 +12659,21 @@ modifiers. The time string formats recognized are:
 **julianday(time-string, modifier, ...)** -> real. Returns Julian day number.
 **unixepoch(time-string, modifier, ...)** -> integer. Returns Unix timestamp.
 **strftime(format, time-string, modifier, ...)** -> text. Format specifiers:
-`%d` day, `%f` fractional seconds, `%H` hour, `%j` day of year, `%J` Julian
-day, `%m` month, `%M` minute, `%s` Unix timestamp, `%S` seconds, `%w` day
-of week, `%W` week of year, `%Y` year, `%%` literal %.
+`%d` day (01-31), `%e` day with leading space (SQLite 3.44+),
+`%f` fractional seconds SS.SSS, `%H` hour 00-23, `%I` hour 01-12 (SQLite 3.44+),
+`%j` day of year 001-366, `%J` Julian day number,
+`%k` hour 0-23 with leading space (SQLite 3.44+),
+`%l` hour 1-12 with leading space (SQLite 3.44+),
+`%m` month 01-12, `%M` minute 00-59,
+`%p` AM/PM (SQLite 3.44+), `%P` am/pm lowercase (SQLite 3.44+),
+`%R` equivalent to `%H:%M` (SQLite 3.44+),
+`%s` Unix timestamp, `%S` seconds 00-59,
+`%T` equivalent to `%H:%M:%S` (SQLite 3.44+),
+`%u` ISO 8601 weekday 1-7 Mon=1 (SQLite 3.44+),
+`%w` day of week 0-6 Sun=0, `%W` week of year 00-53,
+`%G` ISO 8601 year (SQLite 3.44+), `%g` 2-digit ISO year (SQLite 3.44+),
+`%V` ISO 8601 week number 01-53 (SQLite 3.44+),
+`%Y` year, `%%` literal %.
 **timediff(time1, time2)** -> text (SQLite 3.43+). Returns the difference
 as `+YYYY-MM-DD HH:MM:SS.SSS`.
 
@@ -12673,12 +12685,16 @@ Internally accumulates sum and count separately to avoid precision loss.
 **count(*)** -> integer. Counts all rows (including NULLs).
 **count(X)** -> integer. Counts non-NULL values of X.
 
-**group_concat(X [, SEP])** -> text. Concatenates non-NULL values with
-separator (default `,`). Order is arbitrary unless the SELECT has ORDER BY.
+**group_concat(X [, SEP] [ORDER BY ...])** -> text. Concatenates non-NULL
+values with separator (default `,`). Without an ORDER BY clause, the
+concatenation order is arbitrary. Since SQLite 3.44+, an ORDER BY clause
+can be specified directly inside the function call to control concatenation
+order: `group_concat(name, ', ' ORDER BY name)`. This is distinct from
+the SELECT-level ORDER BY (which orders result rows, not aggregated values).
 
-**string_agg(X, SEP)** -> text (SQLite 3.44+). Alias for `group_concat(X, SEP)`.
-Concatenation order is arbitrary unless an ORDER BY clause is used (same as
-group_concat). Added for SQL standard naming compatibility.
+**string_agg(X, SEP [ORDER BY ...])** -> text (SQLite 3.44+). SQL-standard
+alias for `group_concat(X, SEP)`. Supports the same in-aggregate ORDER BY
+clause: `string_agg(name, ', ' ORDER BY name DESC)`.
 
 **max(X)** -> any. Returns maximum non-NULL value. For aggregate use
 (single argument).
