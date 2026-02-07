@@ -63,6 +63,9 @@ Pseudocode and type definitions are normative unless explicitly labeled
 | **OTI** | Object Transmission Information. RaptorQ metadata needed for decoding: (F, Al, T, Z, N). |
 | **DecodeProof** | Auditable witness artifact produced by the RaptorQ decoder when repairing or failing to repair (lab/debug). |
 | **Cx** | Capability context (asupersync). Threads cancellation via `is_cancel_requested()` / `checkpoint()`, progress via `checkpoint_with()`, budgets/deadlines via `Budget` and scoped budgets, and type-level restriction via `Cx::restrict::<NewCaps>()`. |
+| **Budget** | Asupersync resource budget (product semiring) carried by `Cx`: `{ deadline: Option<Time>, poll_quota: u32, cost_quota: Option<u64>, priority: u8 }`. Combined via `meet`: deadline/poll/cost = `min` (tighter wins), priority = `max` (higher wins). Budget exhaustion requests cancellation (deadline/budget). |
+| **Outcome** | Asupersync 4-valued result lattice for concurrent tasks: `Ok < Err < Cancelled < Panicked`. Used for supervision and combinators; FrankenSQLite maps outcomes into SQLite error codes at API boundaries. |
+| **Region** | Asupersync structured concurrency scope: a tree of owned tasks. Region close implies quiescence (no live children, all finalizers run, all obligations resolved). |
 | **PageNumber** | 1-based `NonZeroU32` identifying a database page. Page 1 is always the database header. |
 | **TxnId** | Monotonically increasing `u64` transaction begin identifier (allocated at `BEGIN`). `TxnSlot.txn_id = 0` is reserved to mean "free slot", so real TxnIds are non-zero. |
 | **TxnEpoch** | Monotonically increasing `u32` generation counter for a reused TxnSlot (prevents stale slot-id interpretation). |
@@ -358,7 +361,9 @@ ANY set of K' encoding symbols where K' is only slightly larger than K (in most
 cases, K' = K suffices).
 
 **Key properties:**
-- **Information-theoretically optimal**: Achieves capacity of the erasure channel
+- **Near-optimal (engineering sense)**: Approaches erasure-channel capacity with
+  small overhead. RaptorQ trades the last fraction of optimality for practical,
+  polynomial-time encoding/decoding under real-world constraints.
 - **Systematic**: The first K encoding symbols ARE the source symbols (zero
   encoding overhead for the common no-loss case)
 - **Rateless**: Generate as many repair symbols as needed on-the-fly
@@ -366,14 +371,20 @@ cases, K' = K suffices).
 
 RaptorQ improves upon the original Raptor code (RFC 5053) in several ways:
 it uses GF(256) arithmetic for the HDPC constraints instead of GF(2), which
-dramatically improves the failure probability at the minimum overhead of zero
-extra symbols. Where Raptor codes over GF(2) have a ~1-2% failure rate when
-decoding with exactly K symbols, RaptorQ achieves ~0.01% failure rate under
-the same conditions. With just one additional symbol (K+1 received), the
-failure rate drops to approximately 10^-5. With two additional symbols (K+2),
-it drops to approximately 10^-7. This near-perfect recovery rate is what
-makes RaptorQ suitable as a foundational building block for database durability
-rather than merely a network transport optimization.
+dramatically improves the failure probability at low overhead. Where Raptor
+codes over GF(2) have a ~5-10% failure rate when decoding with exactly K
+symbols, RaptorQ achieves ~1% failure rate (RFC 6330 Annex B: for most K
+values, P_fail(K) < 0.01). With just one additional symbol (K+1 received),
+the failure rate drops to approximately 10^-4. With two additional symbols
+(K+2), it drops to approximately 10^-7. This near-perfect recovery rate is
+what makes RaptorQ suitable as a foundational building block for database
+durability rather than merely a network transport optimization.
+
+**Caution on failure probability claims:** The exact failure probability
+depends on K, the symbol size, and implementation quality. The figures above
+are from RFC 6330 Annex B simulation data. Do not cite "0.01%" (10^-4) for
+exactly-K decoding; that overstates the guarantee by ~100x. Our V1 policy
+(K+2 symbols) is specifically chosen to push well past this ambiguity.
 
 The RFC 6330 specification defines behavior for source blocks containing up
 to 56,403 source symbols (K_max = 56403). Each symbol is a contiguous block
@@ -388,10 +399,10 @@ RaptorQ is "any K symbols suffice" in the *engineering* sense, but the decode
 success probability at exactly `K` is not literally 1. The point of repair
 symbols is to drive decode failure probability into the floor.
 
-**Rules of thumb (backed by RFC 6330):**
-- Decoding with **exactly K** received symbols rarely fails (~99% success).
-- Decoding with **K+1** symbols fails with probability < 10^-5.
-- Decoding with **K+2** symbols fails with probability < 10^-7.
+**Rules of thumb (RFC 6330 Annex B simulation data):**
+- Decoding with **exactly K** received symbols: ~99% success (P_fail < 0.01).
+- Decoding with **K+1** symbols: P_fail < 10^-4.
+- Decoding with **K+2** symbols: P_fail < 10^-7.
 
 **V1 Default Policy:** Aim to persist/replicate enough symbols that a decoder
 can almost always collect **K+2** symbols without coordination. This eliminates
@@ -692,8 +703,8 @@ unlimited stream of encoding symbols. Here is the complete procedure:
 Given K source symbols C'[0], C'[1], ..., C'[K-1]:
 
 1. Look up K' in the systematic index table (RFC 6330 Table 2). K' is the
-   smallest value in the table that is >= K. The table contains 477 entries
-   covering K from 1 to 56,403. For example:
+   smallest value in the table that is >= K. (Table 2 enumerates the supported
+   K' values up to 56,403.) For example:
    - K = 5 -> K' = 6
    - K = 10 -> K' = 10
    - K = 100 -> K' = 101
@@ -703,10 +714,12 @@ Given K source symbols C'[0], C'[1], ..., C'[K-1]:
 
 3. For K', the systematic index table also defines:
    - J(K'): the systematic index (used in the Tuple generator)
-   - S(K'): the number of LDPC symbols (S is the smallest prime >= ceil(0.01 * K') + X,
-     where X depends on K')
-   - H(K'): the number of HDPC symbols (H = ceil(sqrt(K')))
-   - W(K'): used in the LT generator (W is the smallest prime >= floor(K'/S) * S + 1)
+   - S(K'): the number of LDPC symbols
+   - H(K'): the number of HDPC symbols
+   - W(K'): the LT generator modulus parameter
+
+   FrankenSQLite relies on asupersync's RFC 6330 implementation for these
+   derivations; do not substitute ad-hoc formulas here.
 
 4. L = K' + S + H: the total number of intermediate symbols.
 
@@ -994,7 +1007,7 @@ in generating that encoding symbol. This function is deterministic and
 depends only on K' and the ISI.
 
 The systematic index table (RFC 6330 Table 2) is a precomputed table of
-477 entries. For each supported K', it stores a value J(K') such that the
+supported K' values. For each K', it stores a value J(K') such that the
 first K' encoding symbols (ISIs 0 through K'-1) correspond exactly to the
 K' source symbols. This is the "systematic" property -- it's engineered so
 that the encoding matrix has an embedded identity for the source symbols.
@@ -1190,8 +1203,14 @@ PRAGMA raptorq_repair_symbols = N;      -- Set to N (0 disables, max 255)
   encoder will generate them, but the marginal benefit beyond N = 3 or 4
   is negligible for typical corruption patterns.
 
-The PRAGMA is persistent (stored in the database header's reserved bytes
-at offset 72-91) and takes effect on the next transaction commit.
+The PRAGMA is persistent.
+
+- **Compatibility mode:** Persist the setting in the `.wal-fec` sidecar (a small
+  header record with checksum), not in the main database file header. The
+  SQLite database header remains standard and user-controlled (`user_version`,
+  `application_id`), and bytes 72-91 ("reserved for expansion") remain zero as
+  required by the file format.
+- **Native mode:** Persist the setting in the ECS `RootManifest` metadata.
 
 **Impact:** A commit of 10 pages with 2 repair symbols survives ANY 2 torn
 frames. The probability of losing a committed transaction drops from
@@ -1558,7 +1577,7 @@ Reconstruction of V1:
 Space savings:
   If delta between versions is D bytes out of 4096:
   Full copy: 4096 bytes per version
-  RaptorQ delta: ~D bytes per version (information-theoretically optimal)
+  RaptorQ delta: ~D bytes per version (near-optimal; bounded by entropy of diff)
 ```
 
 **Worked Example with Actual Byte Values**
@@ -1600,20 +1619,28 @@ V1: 4096 bytes (full copy)
 Total: 12,288 bytes for 3 versions
 ```
 
-**Storage under RaptorQ delta compression:**
+**Storage under XOR delta compression (stored as ECS objects, optionally
+erasure-coded for durability):**
+
+**Clarification:** The delta is a plain XOR (or sparse-encoded XOR), NOT a
+RaptorQ encoding of the delta. RaptorQ operates at the ECS object level to
+provide erasure-coded durability for *any* object, including delta objects.
+The two concerns are separate:
+- **Delta compression:** XOR(V_old, V_new) → sparse representation.
+- **Durability:** The resulting delta object is stored as an ECS object and
+  MAY have RaptorQ repair symbols generated for it (like any ECS object).
 
 ```
-V3: 4096 bytes (full page)
-V2 delta: RaptorQ encoding of (V2 XOR V3)
+V3: 4096 bytes (full page, stored as ECS object)
+V2 delta: XOR(V2, V3) → sparse encoding
     V2 XOR V3 has ~60 non-zero bytes out of 4096
-    This sparse vector can be represented as a repair symbol set
-    Stored as: [delta_header(8B) | compressed_delta(~80B)]
-    Total: ~88 bytes
+    Sparse representation: [delta_header(8B) | (offset,len,data)* (~80B)]
+    Total: ~88 bytes (stored as ECS object)
 
-V1 delta: RaptorQ encoding of (V1 XOR V2)
+V1 delta: XOR(V1, V2) → sparse encoding
     V1 XOR V2 has ~300 non-zero bytes out of 4096
-    Stored as: [delta_header(8B) | compressed_delta(~340B)]
-    Total: ~348 bytes
+    Sparse representation: [delta_header(8B) | (offset,len,data)* (~340B)]
+    Total: ~348 bytes (stored as ECS object)
 
 Total: 4096 + 88 + 348 = 4,532 bytes for 3 versions
 Savings: 63% reduction (4,532 vs 12,288)
@@ -2619,10 +2646,13 @@ Every FrankenSQLite operation accepts `&Cx`. This enables:
   "stalled task" detection. FrankenSQLite maps `ErrorKind::Cancelled` to the most
   precise SQLite error code for the context (default: `SQLITE_INTERRUPT`).
 - **Deadline propagation (budgets)**: time budgets are expressed as `Budget` deadlines
-  and enforced via region/scope budgets. When tightening a budget, callers MUST
-  compute `effective = cx.budget().meet(child)` and then use
+  and enforced via region/scope budgets. Budgets are a **product semiring**
+  (deadline + poll quota + cost quota + priority) with `meet` (∧) semantics:
+  constraints tighten by `min` and priority tightens by `max`. When tightening a
+  budget, callers MUST compute `effective = cx.budget().meet(child)` and then use
   `cx.scope_with_budget(effective)` so child scopes cannot loosen parent budgets.
-  Nested deadlines combine by `meet` semantics (tightest deadline wins).
+  Cancellation cleanup MUST use a bounded cleanup budget (`Budget::MINIMAL` or a
+  stricter budget derived from it).
 - **Compile-time capability narrowing**: Functions that should not perform I/O
   accept a narrowed `&Cx<CapsWithoutIo>`. Pure layers (parser/planner) accept
   capability sets without `IO`, `REMOTE`, and typically without `SPAWN`. Narrowing
@@ -3186,6 +3216,13 @@ async fn submit_commit(cx: &Cx, tx: &mpsc::Sender<CommitRequest>, req: CommitReq
 }
 ```
 
+**Tracked variant (recommended for safety-critical channels):**
+In lab mode (and optionally in production for the commit pipeline), FrankenSQLite
+SHOULD wrap critical senders with asupersync's obligation-tracked session layer
+(`asupersync::channel::session::TrackedSender`). Dropping a reserved permit
+without `send()` or `abort()` is then structurally detected (fail-fast in lab;
+diagnostic escalation in production; §4.13.1).
+
 **Cancel-safety: why this matters for database commits:**
 
 Consider the sequence of operations during a `COMMIT`:
@@ -3620,6 +3657,235 @@ This ensures that:
   preserving determinism by avoiding real threads.
 
 ---
+
+### 4.11 Structured Concurrency (Regions) -- Database Lifetime and Quiescence
+
+FrankenSQLite adopts asupersync's region tree as the **non-negotiable lifetime
+model** for all concurrency:
+
+- Every background worker, coordinator, replicator, and long-lived service MUST
+  run as a region-owned task/actor.
+- No task may outlive the `Database` root region. There are no detached tasks.
+- `Database::close()` MUST close the root region and await **quiescence**.
+
+This is not cosmetic. It is the structural guarantee that makes shutdown,
+cancellation, and failure handling predictable: no orphan tasks, no "still
+flushing in the background", no half-finished repairs.
+
+**Normative region tree (conceptual):**
+
+```
+DbRootRegion
+  - WriteCoordinatorRegion          (native marker sequencer + compat WAL path)
+  - SymbolStoreRegion               (local symbol logs + tiered storage fetch)
+  - ReplicationRegion               (stream symbols; anti-entropy; membership)
+  - CheckpointGcRegion              (checkpointer, compactor, GC horizon)
+  - ObservabilityRegion             (deadline monitor, task inspector, metrics)
+
+PerConnectionRegion (child of DbRootRegion)
+  - QueryExecution tasks
+  - Cursor prefetch tasks (bounded; optional)
+
+PerTransactionRegion (child of PerConnectionRegion)
+  - Encode/persist capsule tasks (native mode)
+  - Witness publication tasks
+  - Validation tasks
+```
+
+**Rule (INV-REGION-QUIESCENCE):** A region MUST NOT report closed until:
+- all child tasks are completed,
+- all finalizers have run,
+- all obligations are resolved (Committed/Aborted, not Reserved/Leaked).
+
+**Practical consequence:** Closing the database is a protocol, not a `drop`:
+on close we request cancellation, drain, finalize, then return. Any subsystem
+that cannot prove bounded drain is a spec violation.
+
+### 4.12 Cancellation Is a Protocol (Request → Drain → Finalize) + Masking
+
+Asupersync cancellation is **not** "drop the future". It is a multi-phase
+protocol with explicit checkpoints, bounded drain, and finalizers.
+
+**Task cancellation state machine (asupersync oracle model):**
+
+```
+Created/Running → CancelRequested → Cancelling → Finalizing → Completed(Cancelled)
+```
+
+**Rules:**
+- **INV-CANCEL-PROPAGATES:** Region cancellation MUST propagate to all descendant
+  regions; a parent cannot be cancelled while a child remains uncancelled.
+- **INV-CANCEL-IDEMPOTENT:** Multiple cancel requests MUST be monotone: the
+  strongest cancel reason wins (it cannot get weaker).
+- **INV-LOSERS-DRAIN:** Any combinator that returns early (race/timeout/hedge)
+  MUST cancel and drain losers to completion before returning.
+
+#### 4.12.1 Checkpoints (Where Cancellation Is Observed)
+
+FrankenSQLite MUST place `cx.checkpoint()` / `cx.checkpoint_with(...)` at yield
+points that bound the "amount of uninterruptible work" between observations:
+
+- VDBE instruction boundaries (each opcode tick).
+- B-tree descent loops (every node visit).
+- RaptorQ decode/encode loops (every fixed number of symbol operations).
+- Any loop over user data (every N rows; N derived from budget poll_quota).
+
+**Rule:** Any cancellation-unaware hot loop is a bug. Cancelling a query must
+bound cleanup and bound latency, not "maybe if it hits an await".
+
+#### 4.12.2 Masked Critical Sections (Cx::masked, MAX_MASK_DEPTH)
+
+Asupersync supports bounded cancellation deferral via `Cx::masked(...)`:
+while masked, `checkpoint()` returns `Ok(())` even if cancellation is requested.
+
+Masking exists for **short, atomic publication steps** that must not be
+interrupted once started (two-phase effects):
+- Completing a reserved send/commit.
+- Publishing a marker after allocating `commit_seq`.
+- Releasing a set of resources in a required order.
+
+Asupersync enforces **INV-MASK-BOUNDED**: mask depth MUST be finite and bounded
+(`MAX_MASK_DEPTH = 64`). Exceeding the bound is a correctness failure (panic in
+lab; fatal diagnostic in production).
+
+**Rule:** FrankenSQLite MUST NOT use masking for long operations (remote fetch,
+bulk decode, long scans). Masking MAY wrap tiny durability-critical steps
+(e.g., marker publication + local fsync barriers in the commit section), but
+every masked section MUST remain explicitly bounded (poll quota + leak-free
+obligation discipline).
+
+#### 4.12.3 Commit Sections (Bounded Masking for Two-Phase Protocols)
+
+For protocol steps that are logically atomic but involve multiple operations,
+FrankenSQLite SHOULD use an asupersync commit section helper (`commit_section`
+semantics) that:
+- masks cancellation while the section is in progress,
+- enforces a poll quota bound (bounded deferral),
+- guarantees finalizers run even on cancellation.
+
+**Normative usage sites:**
+- In the WriteCoordinator: once FCW validation passes and `commit_seq` is
+  allocated, proof+marker publication MUST run as a commit section so the
+  sequencer cannot emit "half a commit" under cancellation.
+- In witness publication: once a reservation is committed, the commit must
+  complete or the reservation must abort deterministically.
+
+### 4.13 Obligations (Linear Resources) -- No Leaks, No Ghosts
+
+Asupersync models cancellation-safe effects using **obligations** (linear
+resources) with a two-phase lifecycle:
+
+```
+Reserved  ──commit──▶  Committed
+    │
+    └─abort/drop──▶  Aborted
+
+(Bug) Reserved ──drop without resolution──▶ Leaked  (detected by oracles)
+```
+
+Obligations are what turn "best-effort cleanup" into a structural invariant.
+
+**Rule (INV-NO-OBLIGATION-LEAKS):** Every reserved obligation MUST reach a
+terminal state (Committed or Aborted). Leaked obligations are correctness bugs:
+fail-fast in lab; diagnostic escalation in production.
+
+**FrankenSQLite MUST treat the following as obligations:**
+- Commit pipeline `SendPermit` reservations (two-phase MPSC).
+- Commit response delivery (reply obligation on oneshot/session replies).
+- TxnSlot acquisition + renewal (lease obligations; abort on expiry).
+- Witness-plane reservation tokens for symbol/object publication (reserve/commit).
+- Any "name/registration" in shared state that could go stale on crash.
+
+#### 4.13.1 Tracked Two-Phase Channels for Safety-Critical Protocols
+
+For safety-critical internal messaging, FrankenSQLite SHOULD use asupersync's
+obligation-tracked session channels (`asupersync::channel::session`) rather than
+raw MPSC/oneshot, so dropping a permit without resolution is structurally
+detected:
+
+- Lab mode: leaks MUST fail fast (panic-on-leak).
+- Production: leaks MUST be trace-visible (log + metrics) and MUST trigger
+  escalation (close the offending region/connection) rather than silently
+  continuing.
+
+**Rule:** It is acceptable for non-critical telemetry channels to use policies
+like `send_evict_oldest`, but commit ordering, durability publication, and
+cross-process coordination MUST NOT drop messages.
+
+#### 4.13.2 Obligation Leak Response Policy (Lab vs Production)
+
+FrankenSQLite inherits asupersync's stance:
+- **Lab runtime default:** obligation leak is a test failure (panic) because it
+  indicates a cancel-safety or protocol bug.
+- **Production default:** obligation leak is a correctness incident: emit a
+  diagnostic bundle (trace + obligation ledger), fail the affected connection,
+  and keep the database process alive if and only if invariants for durability
+  objects are not violated.
+
+### 4.14 Supervision (Spork/OTP-Style) for Database Services
+
+Long-lived services (sequencers, replicators, checkpoint workers) MUST be
+supervised. "Spawn a loop and hope" is forbidden.
+
+Asupersync supervision provides:
+- Strategies: `Stop`, `Restart(config)`, `Escalate`.
+- Restart budgets: `max_restarts` in a sliding `window`, with backoff.
+- Budget-aware restarts (cost quota, min remaining time, min poll quota).
+- Monotone severity: outcomes cannot be "downgraded" by supervision.
+
+**Rule (INV-SUPERVISION-MONOTONE):**
+- `Outcome::Panicked` MUST NOT be restarted (programming error). Stop/escalate.
+- `Outcome::Cancelled` MUST stop (external directive / shutdown).
+- `Outcome::Err` MAY restart if the error is classified transient and restart
+  budget allows.
+
+**FrankenSQLite supervision tree (normative):**
+- `DbRootSupervisor` owns:
+  - `WriteCoordinator`: `Escalate` on Err/Panicked (sequencer correctness is core).
+  - `SymbolStore`: `Restart` on transient I/O; `Escalate` on integrity faults.
+  - `Replicator`: `Restart` with exponential backoff; `Stop` when remote disabled.
+  - `CheckpointerGc`: `Restart` (bounded) on transient errors; escalate if repeated.
+  - `IntegritySweeper` (optional): `Stop` on error; does not gate core function.
+
+This structure ensures: a component crash becomes an explainable, bounded event
+with a deterministic restart policy, not a silent hang or memory leak.
+
+### 4.15 Resilience Combinators (Backpressure, Isolation, Graceful Degradation)
+
+FrankenSQLite MUST leverage asupersync's cancel-safe combinators to keep the
+system robust under load and partial failure:
+
+- `pipeline`: staged commit capsule publication and replication with backpressure.
+- `bulkhead`: isolate heavy work (encode/decode/compaction/remote fetch) with
+  bounded parallelism so it cannot starve the sequencer or VDBE.
+- `rate_limit`: cap background work (GC/compaction/sweeps) to preserve p99 query
+  latency.
+- `retry`: budget-aware retries for transient I/O (with jitter/backoff).
+- `circuit_breaker`: open/half-open/closed policy for remote tier fetch; prevent
+  retry storms when remote is degraded.
+- `hedge` / `first_ok`: latency reduction for symbol fetch (start backup after
+  delay; first success wins).
+- `bracket`: acquire/use/release wrappers so resource cleanup is guaranteed
+  under cancellation (file handles, leases, reservations).
+
+**Rule:** Any use of these combinators MUST preserve INV-LOSERS-DRAIN and
+INV-NO-OBLIGATION-LEAKS; the loser branches must drain and all obligations must
+resolve even when the winner returns early.
+
+### 4.16 Observability and Diagnostics (Task Inspector, Explainable Failures)
+
+FrankenSQLite MUST surface asupersync-native diagnostics for production and lab:
+
+- Task inspector: live visibility into blocked reasons, budget usage, mask depth,
+  held obligations, and cancellation status.
+- Diagnostics: structured explanations for cancellation propagation and blocked
+  tasks (why are we stuck? who holds what?).
+- Deterministic repro bundles: when `ASUPERSYNC_TEST_ARTIFACTS_DIR` is set in
+  harness runs, failures MUST emit a repro manifest and trace artifacts that
+  recreate the schedule and cancellation points.
+
+This is a direct consequence of the "no vibes" philosophy: if something times
+out or aborts, the system must be able to explain why with evidence.
 
 ## 5. MVCC Formal Model (Revised)
 
@@ -4379,11 +4645,28 @@ TxnSlot := {
 ```
 
 **Slot lifecycle:**
-1. **Acquire:** Process scans TxnSlot array for a slot with `txn_id == 0`.
-   CAS the `txn_id` from 0 to the new TxnId. Increment `txn_epoch`
-   (wrap permitted), set `begin_seq = shm.commit_seq.load()`, set `pid` and
-   `pid_birth`,
-   `lease_expiry`, and `state = Active`.
+1. **Acquire (atomic, TOCTOU-safe):** Process scans TxnSlot array for a slot
+   with `txn_id == 0`. The acquisition is a **two-phase protocol**:
+
+   **Phase 1 (claim):** CAS `txn_id` from 0 to a **sentinel value**
+   `TXN_ID_CLAIMING := u64::MAX`. This is an atomic claim that prevents
+   other processes from racing on the same slot. If the CAS fails, try the
+   next slot.
+
+   **Phase 2 (initialize):** With the slot exclusively claimed (no other
+   process can acquire it because `txn_id != 0`), initialize all fields:
+   increment `txn_epoch` (wrap permitted), set `begin_seq = shm.commit_seq.load()`,
+   set `pid`, `pid_birth`, `lease_expiry`, and `state = Active`.
+
+   **Phase 3 (publish):** Store the real TxnId into `txn_id` with Release
+   ordering. Only after this store is the slot visible to other processes as
+   a live transaction.
+
+   **Why sentinel:** Without the two-phase protocol, there is a TOCTOU window
+   between the CAS(0 → real_txn_id) and the field initialization. During this
+   window, cleanup_orphaned_slots() or another reader could observe a slot
+   with a valid txn_id but uninitialized begin_seq / pid / lease_expiry,
+   leading to incorrect cleanup decisions or stale snapshot computations.
 2. **Renew lease:** While active, process periodically updates `lease_expiry`
    to `now + LEASE_DURATION` (default: 30 seconds). This is a simple
    atomic store. **Derivation of LEASE_DURATION:** The lease must satisfy
@@ -4407,15 +4690,27 @@ this and clean up:
 cleanup_orphaned_slots():
     now = unix_timestamp()
     for slot in txn_slots:
+        if slot.txn_id == TXN_ID_CLAIMING:
+            // Slot is being claimed by another process (Phase 1 of acquire).
+            // Only clean up if lease has expired AND process is dead — same
+            // as for normal slots. The sentinel is treated as a valid txn_id
+            // for cleanup purposes.
+            pass  // fall through to the same lease check below
         if slot.txn_id != 0 AND slot.lease_expiry < now:
             // Lease expired -- check whether the owning process still exists.
             // IMPORTANT: PID reuse is real; liveness checks MUST defend against it.
             if !process_alive(slot.pid, slot.pid_birth):
                 // Process crashed. Abort its transaction.
-                release_page_locks_for(slot.txn_id)
+                // ATOMICITY: CAS txn_id from current value to 0 to prevent
+                // double-cleanup if two processes race. If CAS fails, another
+                // process already cleaned this slot — skip it.
+                old_txn_id = slot.txn_id.load()
+                if !slot.txn_id.CAS(old_txn_id, TXN_ID_CLAIMING):
+                    continue  // someone else is cleaning this slot
+                release_page_locks_for(old_txn_id)
                 slot.state = Aborted
                 slot.commit_seq = 0
-                slot.txn_id = 0    // Free the slot
+                slot.txn_id = 0    // Free the slot (Release ordering)
 ```
 
 `process_alive(pid, pid_birth)` is platform-specific:
@@ -4468,12 +4763,21 @@ PageLockEntry := {
 This insertion discipline is required: inserting by writing `owner_txn` alone
 is incorrect because it would create entries with no discoverable key.
 
-**Release (tombstone deletion):**
+**Release (tombstone deletion, ordering-critical):**
 
 - Locate the entry for `page_number` by probing from its hash.
-- CAS `owner_txn` from owning TxnId -> 0.
-- Set `page_number` to TOMBSTONE (do not clear to 0). Clearing to empty in a
-  linear-probing table can break probe chains and cause false negatives.
+- **Step 1:** CAS `page_number` from `page_number` -> TOMBSTONE. This removes
+  the entry from the probe chain's perspective first. (Do NOT clear to 0;
+  clearing to empty in a linear-probing table breaks probe chains and causes
+  false negatives for entries hashed past this slot.)
+- **Step 2:** Store `owner_txn = 0` (Release ordering).
+
+**Why this order matters:** If we clear `owner_txn` first (to 0) before
+tombstoning, there is a race window where another process sees
+`(page_number=P, owner_txn=0)` and interprets it as "page P is in the table
+but unlocked" — allowing a spurious re-acquire of a slot that is about to
+become a tombstone. By tombstoning first, the entry is immediately invisible
+to new acquirers.
 
 Tombstones are reused by subsequent inserts; if tombstones accumulate and probe
 lengths degrade, the system MAY rebuild the table under a global quiescence
@@ -4990,11 +5294,27 @@ ssi_validate_and_publish(T):
   T.has_out_rw = (out_edges not empty)
 
   // 4) Pivot rule (conservative, sound default):
+  //    T is the pivot (T2 in T1->T2->T3): abort T.
   if T.has_in_rw && T.has_out_rw:
      publish AbortWitness(T, edges = in_edges ∪ out_edges)
      abort T with SQLITE_BUSY_SNAPSHOT
 
-  // 5) Publish edges + return evidence references for CommitProof.
+  // 5) T3 rule (Cahill/Ports §3.2, "near-miss" check):
+  //    When T commits, it may complete a dangerous structure where some
+  //    other active transaction T_other is the pivot. Specifically, if T
+  //    wrote a page that T_other read (creating an rw edge T_other->T,
+  //    making T_other.has_out_rw = true) AND T_other already has an
+  //    incoming rw edge (T_other.has_in_rw = true), then T_other is now
+  //    a confirmed pivot and must be aborted.
+  //
+  //    Implementation: scan out_edges (where T is the "T3" that wrote
+  //    over what T_other read). For each such T_other:
+  for T_other in out_edges.source_txns():    // T_other -rw-> T (T_other read, T wrote)
+      if T_other.has_in_rw:
+          // T_other is now a pivot: T_x -> T_other -> T (and T is committing)
+          T_other.marked_for_abort = true     // eager abort optimization
+
+  // 6) Publish edges + return evidence references for CommitProof.
   edge_ids = publish DependencyEdge objects for (in_edges ∪ out_edges)
   return (read_wits, write_wits, edge_ids, merge_witnesses)
 ```
@@ -6328,14 +6648,17 @@ RaptorQ repair symbols carry CRC-32C checksums (4-byte overhead per symbol).
 **Detection strategy:**
 
 ```rust
-/// CRC-32C computation. The crc32fast crate auto-detects hardware support
-/// at runtime via CPUID/feature probing and selects the fastest path.
-/// The crate uses unsafe internally for SIMD intrinsics, but our workspace
-/// only forbids unsafe in *our* crates, not dependencies.
+/// CRC-32C computation. We use the `crc32c` crate (NOT `crc32fast`, which
+/// computes CRC-32/ISO-HDLC, a different polynomial). CRC-32C (Castagnoli,
+/// polynomial 0x1EDC6F41) is what SSE4.2's `crc32` instruction computes
+/// natively and what protocols like iSCSI, ext4, and btrfs use.
+///
+/// The `crc32c` crate auto-detects SSE4.2 / ARMv8 CRC at runtime and
+/// falls back to a software table implementation. It uses unsafe internally
+/// for SIMD intrinsics, but our workspace only forbids unsafe in *our*
+/// crates, not dependencies.
 pub fn crc32c(data: &[u8]) -> u32 {
-    let mut hasher = crc32fast::Hasher::new();
-    hasher.update(data);
-    hasher.finalize()
+    crc32c::crc32c(data)
 }
 ```
 
@@ -6618,25 +6941,58 @@ For each publish request:
 1. **Validation (FCW):** Perform First-Committer-Wins validation using
    `write_set_summary` against the coordinator's commit index (or equivalent).
    Validation MUST NOT require decoding the entire capsule.
+   This step is cancellable: if the database is shutting down, the coordinator
+   MAY respond `Aborted { SQLITE_INTERRUPT }` before entering the commit section.
 2. **Allocate `commit_seq`:** Assign the next commit sequence number.
    Also assign `commit_time_unix_ns` as a monotonic timestamp:
    `commit_time_unix_ns := max(now_unix_ns(), last_commit_time_unix_ns + 1)`.
+   Steps (2)–(7) form the sequencer's **commit section**: once `commit_seq` is
+   allocated, the coordinator MUST NOT observe cancellation until the marker is
+   durable and the requester has been responded to. Implement using bounded
+   masking (`Cx::masked` / commit_section semantics; §4.12.2–§4.12.3).
 3. **Persist `CommitProof` (small):** Build and publish a `CommitProof` ECS
    object containing `commit_seq` and evidence references. Record its
    `proof_object_id`.
-4. **Persist marker (tiny):** Append `CommitMarkerBytes(commit_seq,
+4. **FSYNC barrier (pre-marker):** Issue `fdatasync` (or platform equivalent)
+   on the symbol log files and proof object storage. This ensures capsule
+   symbols and CommitProof are durable on the storage medium BEFORE the
+   marker references them. Without this barrier, write reordering (common on
+   NVMe with volatile write caches) can make the marker durable while its
+   referents are not — an irrecoverable corruption on crash.
+5. **Persist marker (tiny):** Append `CommitMarkerBytes(commit_seq,
    commit_time_unix_ns, capsule_object_id, proof_object_id, prev_marker,
    integrity)` to the marker stream. This is the atomic "this commit exists"
    step (≈ 72–88 bytes).
-5. **Respond:** Notify the client of success (or conflict/abort).
+6. **FSYNC barrier (post-marker):** Issue `fdatasync` on the marker stream.
+   The client MUST NOT receive a success response until this completes.
+7. **Respond:** Notify the client of success (or conflict/abort).
 
 #### 7.11.3 Background Work (Not in Critical Section)
 
 - Index segments and caches update asynchronously.
 
-**Critical ordering:** Marker publication MUST happen AFTER capsule durability
-and AFTER `CommitProof` durability is satisfied. If the marker is durable but
-the capsule or proof is not decodable, the core durability contract is violated.
+**Critical ordering (TWO fsync barriers, normative):**
+
+```
+capsule symbols [persisted by committing txn, step 6 of §7.11.1]
+    → CommitProof [persisted, step 3 above]
+    → FSYNC_1 (step 4)      ← ensures referents are durable
+    → marker [persisted, step 5]
+    → FSYNC_2 (step 6)      ← ensures marker is durable
+    → client response (step 7)
+```
+
+Both barriers are **mandatory**:
+- **FSYNC_1** prevents "committed marker, lost data" — the worst-case native
+  mode failure. If the marker is durable but the capsule or proof is not
+  decodable, the core durability contract is violated and recovery cannot
+  proceed.
+- **FSYNC_2** prevents "client thinks committed, marker not persisted" — a
+  durability violation that silently loses transactions on crash.
+
+**Performance note:** The two-fsync cost (~100-200μs on NVMe) is amortized
+by batching multiple commits per WriteCoordinator iteration (§4.5). The
+optimal batch size derivation (§4.5) already accounts for `t_fsync`.
 
 ### 7.12 Native Mode Recovery Algorithm
 
@@ -10403,6 +10759,57 @@ fn mvcc_two_writers_different_pages() {
 CI runs each concurrency test with 100 different seeds. A failing seed is
 recorded in the test failure message for exact replay.
 
+**Deterministic repro artifacts (asupersync-native):**
+
+When `ASUPERSYNC_TEST_ARTIFACTS_DIR` is set, any failing deterministic lab run
+MUST emit a self-contained repro bundle (so "flake" bugs become one-command
+reproductions).
+
+**Directory layout (required on failure):**
+```
+$ASUPERSYNC_TEST_ARTIFACTS_DIR/
+  {test_id}/
+    repro_manifest.json
+    event_log.txt
+    failed_assertions.json
+    trace.async          # optional (if trace capture enabled)
+    inputs.bin           # optional (if failure depends on input bytes)
+```
+
+**Seed taxonomy (required):** each repro manifest MUST record:
+- `test_seed` (root)
+- derived seeds:
+  - `schedule_seed` (scheduler RNG)
+  - `entropy_seed` (Cx randomness)
+  - `fault_seed` (fault injection)
+  - `fuzz_seed` (property generators)
+
+**Derivation rule (normative):**
+`derived = H(test_seed || purpose_tag || scope_id)` where `H` is a stable 64-bit
+hash (xxh3_64 or SplitMix64), `purpose_tag` is ASCII (`"schedule"`, `"entropy"`,
+`"fault"`, `"fuzz"`), and `scope_id` is a stable scenario identifier.
+
+**`repro_manifest.json` minimum schema (required):**
+```json
+{
+  "schema_version": 1,
+  "test_id": "mvcc_two_writers_different_pages",
+  "seed": 3735928559,
+  "scenario_id": "mvcc_two_writers_different_pages",
+  "config_hash": "sha256:...",
+  "trace_fingerprint": "sha256:...",
+  "input_digest": "sha256:...",
+  "oracle_violations": ["obligation_leak", "cancel_protocol"],
+  "passed": false
+}
+```
+
+**Replay workflow (required):**
+1. Load `repro_manifest.json`.
+2. Re-run with `ASUPERSYNC_SEED=<seed>` and the same scenario/test id.
+3. If `trace.async` exists, replay directly; any divergence MUST produce a
+   divergence artifact with the first mismatched event.
+
 **Fault injection:** The lab reactor supports injecting I/O failures:
 ```rust
 let vfs = fsqlite_harness::vfs::FaultInjectingVfs::new(UnixVfs::new());
@@ -11211,7 +11618,8 @@ Every phase must pass all applicable gates before proceeding to the next.
 
 FrankenSQLite is not an incremental improvement on SQLite. It is a
 ground-up reimagination of what an embedded database engine can be when
-built on information-theoretic foundations and modern language guarantees.
+built on near-optimal erasure coding, formal verification, and modern
+language guarantees.
 
 **1. MVCC with Serializable Concurrent Writers (In-Process and Cross-Process).**
 The single biggest limitation of SQLite -- the WAL_WRITE_LOCK that serializes
@@ -11231,8 +11639,8 @@ not bolted on as an afterthought. They are woven into every layer: the WAL
 uses RaptorQ repair symbols for self-healing durability that survives torn
 writes without double-write journaling. The replication protocol is
 fountain-coded for bandwidth-optimal, UDP-based, multicast-capable data
-transfer over lossy networks. Version chains use RaptorQ delta encoding for
-near-optimal compression. Conflict resolution uses GF(256) algebraic merging
+transfer over lossy networks. Version chains use XOR delta encoding (stored as ECS objects, erasure-coded
+for durability) for near-optimal compression. Conflict resolution uses GF(256) algebraic merging
 to resolve page-level false conflicts at byte granularity. The Erasure-Coded
 Stream (ECS) substrate provides content-addressed, self-describing,
 deterministic object storage with BLAKE3 ObjectIds and self-healing repair
@@ -11315,13 +11723,13 @@ waiting for a scheduled integrity sweep.
 
 FrankenSQLite demonstrates that embedded databases need not sacrifice
 concurrency for simplicity, durability for performance, or safety for speed.
-By building on information-theoretic optimality (RaptorQ), formal
+By building on near-optimal erasure coding (RaptorQ), formal
 verification techniques (e-processes, Mazurkiewicz traces, sheaf theory),
 and the memory safety guarantees of Rust, it sets a new standard for what
 an embedded database engine can achieve.
 
 ---
 
-*Document version: 1.6h (Extreme optimization + alien-artifact hardening + SSI witness plane: zero-copy VFS, arena version chains, CAR cache, formal constant derivations via Little's Law / queuing theory / survival analysis / birthday problem, per-invariant e-process calibration, SSI loss sensitivity analysis, BOCPD Jeffreys priors, nonce exhaustion analysis, GC scheduling policy, load factor bounds, delta cost model, Bloom crossover derivation, opt-level=3, RaptorQ-native SSI witness plane with TxnToken identity / HotWitnessIndex / proof-carrying commits / DependencyEdge ECS objects, canonical SSI detection algorithm with eager abort)*
+*Document version: 1.8 (Asupersync-first hardening: structured regions + cancel protocol + bounded masking/commit sections + obligation discipline + supervision tree + resilience combinators + deterministic repro bundles; RaptorQ accuracy fixes: near-optimal wording, XOR-delta vs erasure-coding separation, compatibility-mode PRAGMA persistence moved to `.wal-fec` sidecar)*
 *Last updated: 2026-02-07*
 *Status: Authoritative Specification*
