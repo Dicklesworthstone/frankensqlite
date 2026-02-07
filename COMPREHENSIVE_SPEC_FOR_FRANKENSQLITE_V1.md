@@ -2243,7 +2243,8 @@ DbFecHeader := {
     default_group_size    : u32,       // G (e.g., 64)
     default_r_repair      : u32,       // R (e.g., 4)
     header_page_r_repair  : u32,       // special-case repair count for page 1 (e.g., 4)
-    db_gen_digest         : [u8; 16],  // best-effort stale-sidecar guard (see above)
+    db_gen_digest         : [u8; 16],  // Trunc128(BLAKE3("fsqlite:compat:dbgen:v1" || change_counter || page_count || freelist_count || schema_cookie))
+                                       // where fields are read as big-endian u32 from db header offsets 24, 28, 36, 40
     checksum              : u64,       // xxh3_64 of all preceding fields
 }
 ```
@@ -2362,8 +2363,9 @@ when a newer committed version exists in WAL state.
 The read path is modified to detect and repair corrupted pages transparently:
 
 **`verify_page_integrity` (normative behavior):**
-- If page encryption is enabled (§15), integrity is verified via the page AEAD
-  tag (Poly1305) with required AAD (swap resistance).
+- If page encryption is enabled (§15, "Encryption" subsection: XChaCha20-Poly1305),
+  integrity is verified via the page AEAD tag (Poly1305) with required AAD
+  (swap resistance).
 - Else if `PRAGMA page_checksum = ON` (§7.4), integrity is verified via the
   page's reserved-space XXH3-128 checksum.
 - Else, Compatibility mode MAY only detect corruption via structural checks
@@ -2393,19 +2395,19 @@ read_page_with_repair(pgno: PageNumber) -> Result<PageData>:
         // Validate sources independently of page-embedded checksums (like WAL-FEC).
         // This also detects stale `.db-fec` metadata for the group.
         if xxh3_128(page_data) == meta.source_page_xxh3_128[pg - group.start]:
-            available_symbols.append((pg - group.start, page_data))    // ISI = offset within group
+            available_symbols.append((pg - group.start, page_data))    // ESI = offset within group
 
     // Read repair symbols for this group
     for r in 0..group.repair:
         repair_rec = read_repair_symbol_from_db_fec(group, r)  // SymbolRecord
         if verify_symbol_record_envelope(repair_rec) && repair_rec.object_id == meta.object_id && repair_rec.oti == meta.oti:
-            available_symbols.append((group.size + r, repair_rec.symbol_data))    // ISI = K + r
+            available_symbols.append((repair_rec.esi, repair_rec.symbol_data))    // ESI from SymbolRecord (K + r per RFC 6330)
 
     if available_symbols.len() >= group.size:
         // Enough symbols to decode
         decoder = RaptorQDecoder::new(meta.oti)
-        for (isi, data) in available_symbols:
-            decoder.add_symbol(isi, data)
+        for (esi, data) in available_symbols:
+            decoder.add_symbol(esi, data)
         recovered = decoder.decode()?
         // Extract the corrupted page from recovered data
         repaired_page = recovered[pgno - group.start]
@@ -2449,12 +2451,13 @@ DbFecGroupMeta := {
 
     // Independent per-source validation (required for safe repair):
     // xxh3_128 of each source page's on-disk bytes for this group snapshot.
-    // ISI i corresponds to page number (start_pgno + i).
+    // ESI i corresponds to page number (start_pgno + i).
     source_page_xxh3_128: Vec<[u8; 16]>,  // length = K
 
     // Bind to the target database generation (best-effort; see above hazard notes).
     // This is NOT used as a security mechanism; it is a stale-sidecar guard.
-    db_gen_digest  : [u8; 16],   // Trunc128(BLAKE3("fsqlite:compat:dbgen:v1" || ...))
+    db_gen_digest  : [u8; 16],   // Trunc128(BLAKE3("fsqlite:compat:dbgen:v1" || change_counter || page_count || freelist_count || schema_cookie))
+                                  // (big-endian u32 from db header offsets 24, 28, 36, 40; same derivation as DbFecHeader)
     checksum       : u64,        // xxh3_64 of all preceding fields
 }
 ```
@@ -3000,7 +3003,9 @@ verifies that `record.commit_seq == commit_seq`.
 
 **Binary search by time (enables time travel):**
 
-Because `commit_time_unix_ns` is monotonic non-decreasing in `commit_seq`,
+Because `commit_time_unix_ns` is monotonic non-decreasing in `commit_seq`
+(enforced by the commit protocol: §7.11.2 step 2, which assigns
+`commit_time_unix_ns := max(now_unix_ns(), last_commit_time_unix_ns + 1)`),
 mapping a timestamp to a commit uses binary search over `[0, latest_commit_seq]`
 with random-access record reads. Complexity: `O(log N)` record reads.
 
