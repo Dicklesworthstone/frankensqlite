@@ -4341,6 +4341,12 @@ rather than testing hundreds of redundant interleavings.
 
 ### 4.5 Two-Phase MPSC Channels -- Write Coordinator
 
+This section specifies the **in-process** (single OS process) commit pipeline
+mechanics. In a multi-process deployment, other processes route commit
+publication to the coordinator over a Unix domain socket transport (§5.9.0),
+and the coordinator then enqueues requests into this same internal two-phase
+MPSC channel.
+
 The write coordinator uses asupersync's cancel-safe two-phase MPSC channel:
 
 ```
@@ -5552,7 +5558,11 @@ TxnToken    := (txn_id: TxnId, txn_epoch: TxnEpoch)
 CommitSeq   := u64                          -- monotonically increasing commit sequence (assigned at COMMIT by the sequencer)
 SchemaEpoch := u64                          -- increments on schema/layout changes (DDL, VACUUM, etc.)
 PageNumber  := NonZeroU32                   -- 1-based page number
-PageData    := Vec<u8>                      -- page content, length = page_size
+TableId     := NonZeroU32                   -- B-tree root page number for a table (schema-epoch scoped)
+IndexId     := NonZeroU32                   -- B-tree root page number for an index (schema-epoch scoped)
+
+PageBuf     := owned, page-aligned buffer handle, length = page_size
+PageData    := PageBuf                      -- page content (full-page images); must be page-aligned (§1.5, §4.10)
 
 Snapshot := {
     high            : CommitSeq,            -- all commits with commit_seq <= high are visible
@@ -5700,6 +5710,7 @@ Transaction := {
     slot_id     : Option<u32>,             -- TxnSlot array index when shared-memory coordination is enabled (§5.6.2).
                                           -- Required for hot witness-plane registrations and GC horizon accounting.
     snapshot    : Snapshot,
+    snapshot_established: bool,            -- true iff the snapshot is established for SQLite DEFERRED semantics (§5.4).
     write_set   : HashMap<PageNumber, PageVersion>, -- private versions (commit_seq = 0); spillable page images in Compatibility mode (§5.9.2)
     intent_log  : Vec<IntentOp>,            -- semantic operation log for rebase merge
     page_locks  : HashSet<PageNumber>,
@@ -6021,13 +6032,16 @@ load_consistent_snapshot(manager) -> Snapshot:
     // Without this, a concurrent DDL commit can race BEGIN and produce a mixed
     // snapshot that incorrectly permits deterministic rebase (§5.10.2).
     //
-    // Cross-process: the same algorithm applies to SharedMemoryLayout.{commit_seq,schema_epoch}.
+    // Cross-process: this is a seqlock read under SharedMemoryLayout.snapshot_seq (§5.6.1).
     loop:
-        high1 = manager.commit_seq.load(Acquire)
-        epoch = manager.schema_epoch.load(Acquire)
-        high2 = manager.commit_seq.load(Acquire)
-        if high1 == high2:
-            return Snapshot { high: high1, schema_epoch: epoch }
+        s1 = manager.shm.snapshot_seq.load(Acquire)
+        if (s1 & 1) == 1:
+            continue  // writer in progress; retry
+        high = manager.shm.commit_seq.load(Acquire)
+        epoch = manager.shm.schema_epoch.load(Acquire)
+        s2 = manager.shm.snapshot_seq.load(Acquire)
+        if s1 == s2 && (s2 & 1) == 0:
+            return Snapshot { high, schema_epoch: epoch }
 
 begin(manager, begin_kind) -> Result<Transaction>:
     // TxnId allocation MUST never publish reserved tagged/sentinel values into shared memory.
@@ -6059,7 +6073,7 @@ begin(manager, begin_kind) -> Result<Transaction>:
         //
         // Cross-process, this MUST exclude Concurrent writers (single-writer
         // contract) via the SharedMemoryLayout.serialized_writer_token indicator.
-        acquire_serialized_writer_exclusion(manager.shm, txn_id)?
+        acquire_serialized_writer_exclusion(manager, txn_id)?
         serialized_write_lock_held = true
 
     // Acquire and publish a TxnSlot (cross-process visibility) using the
@@ -6106,16 +6120,16 @@ write_page(manager, T, pgno, new_data) -> Result<()>:
         // DEFERRED upgrade: if we haven't taken writer exclusion yet, take it now.
         // This preserves concurrent readers (SQLite DEFERRED behavior).
         if !T.serialized_write_lock_held:
-            acquire_serialized_writer_exclusion(manager.shm, T.txn_id)?
+            acquire_serialized_writer_exclusion(manager, T.txn_id)?
             // Reader-turned-writer rule (normative): if the transaction already
             // established a snapshot via reads and the database advanced since,
             // the upgrade MUST fail with SQLITE_BUSY_SNAPSHOT (exact SQLite).
             snap_now = load_consistent_snapshot(manager)
             if T.snapshot_established && snap_now.schema_epoch != T.snapshot.schema_epoch:
-                release_serialized_writer_exclusion(manager.shm, T.txn_id)
+                release_serialized_writer_exclusion(manager, T.txn_id)
                 return Err(SQLITE_SCHEMA)
             if T.snapshot_established && snap_now.high != T.snapshot.high:
-                release_serialized_writer_exclusion(manager.shm, T.txn_id)
+                release_serialized_writer_exclusion(manager, T.txn_id)
                 return Err(SQLITE_BUSY_SNAPSHOT)
 
             // If no snapshot was established yet (no reads), writer upgrade
@@ -6626,6 +6640,7 @@ SharedMemoryLayout := {
     // exclusion and violating INV-7 (§5.8).
     serialized_writer_token      : AtomicU64,  -- 0 = no serialized writer; else unique token (recommended: TxnId)
     serialized_writer_pid        : AtomicU32,  -- owning process id (best-effort; for liveness cleanup only)
+    _align1                     : u32,        -- MUST be 0. Padding to ensure 8-byte alignment for AtomicU64 fields.
     serialized_writer_pid_birth  : AtomicU64,  -- process "birth" id (defends against PID reuse; §5.6.2)
     serialized_writer_lease_expiry: AtomicU64, -- unix timestamp (seconds); 0 if token==0
     lock_table_offset: u64,            -- byte offset to PageLockTable region
@@ -6648,8 +6663,8 @@ operations.
 
 **Alignment requirement (normative):** Every `AtomicU64` field in the mapped
 shared-memory region MUST be naturally aligned (8-byte alignment). The layout
-above includes explicit padding (`_align0`) so that `next_txn_id` and subsequent
-64-bit atomics are aligned even though earlier fields are `u32`. Implementations
+above includes explicit padding (`_align0`, `_align1`) so that all 64-bit atomics
+remain aligned even when adjacent metadata fields are `u32`. Implementations
 MUST NOT assume the compiler will insert padding in a byte-specified shared
 memory layout.
 
@@ -7997,9 +8012,9 @@ standard SQLite process from becoming a writer.
 **Coordinator note (multi-process):** Because `WAL_WRITE_LOCK` is exclusive,
 Compatibility mode with `foo.db.fsqlite-shm` requires a single cross-process
 commit sequencer while the exclusion lock is held. In multi-process deployments,
-other processes MUST route commit publication through the sequencer (shared
-memory two-phase queue) so the lock is not released to legacy writers between
-commits.
+other processes MUST route commit publication through the sequencer (Coordinator
+IPC Transport; §5.9.0) so the lock is not released to legacy writers
+between commits.
 
 If the exclusion lock cannot be acquired, the database open MUST fail with
 `SQLITE_BUSY` (or wait per busy-timeout), because the Hybrid SHM protocol
@@ -8993,9 +9008,108 @@ coordinator" is a **role**, not necessarily a thread in every process:
 - In Compatibility mode with `foo.db.fsqlite-shm` (Hybrid SHM protocol, §5.6.7),
   this is REQUIRED to uphold the legacy writer exclusion lock (§5.6.6.1): the
   coordinator holds `WAL_WRITE_LOCK` for its lifetime and sequences WAL appends.
-- Other processes MUST route commit publication through the coordinator (shared
-  memory two-phase queue; asupersync reserve/commit discipline). The in-process
-  channel examples below define the **message schemas**; the transport differs.
+- Other processes MUST route commit publication through the coordinator using
+  the **Coordinator IPC Transport** (§5.9.0). The in-process channel examples
+  below define the **internal message schemas**; cross-process routing MUST NOT
+  attempt to transmit Rust heap objects (`Vec`, `HashMap`, `oneshot::Sender`,
+  etc.) through shared memory.
+
+#### 5.9.0 Coordinator IPC Transport (Cross-Process; Required on Unix)
+
+When multiple OS processes attach to the same database, only one process is
+allowed to hold the coordinator role at a time (§5.9). All other processes
+MUST route commit publication through that coordinator.
+
+V1 specifies a **Unix domain socket** transport for coordinator IPC on Unix-like
+systems. This avoids requiring a variable-size shared-memory message queue (and
+its `unsafe`-heavy ring-buffer implementation) inside this repository, while
+still providing:
+- backpressure,
+- cancel-safety by construction (reserve/submit discipline),
+- secure bulk payload transfer via file-descriptor passing (SCM_RIGHTS),
+- and deterministic lab testing via VirtualTcp-style shims (§4.19.6).
+
+**Socket endpoint (normative):**
+- The coordinator MUST listen on a per-database Unix socket path:
+  `foo.db.fsqlite/coordinator.sock` (Native mode) or `foo.db.fsqlite/coordinator-wal.sock`
+  (Compatibility/WAL mode).
+- The socket directory MUST be created with `0700` permissions. The socket file
+  MUST have `0600` permissions. (This is necessary but not sufficient; peer
+  credentials checks below are still required.)
+
+**Peer authentication (required):**
+- On accept, the coordinator MUST call `UnixStream::peer_cred()` and MUST reject
+  any peer whose `uid` does not match the database owner's UID (or the UID of
+  the coordinator process, depending on deployment policy).
+- If a deployment wants stronger mutual authentication, it MAY layer a
+  connection-level MAC cookie derived from `DatabaseId` + a per-install secret,
+  but UID checks are mandatory in V1.
+
+**Framing (normative):**
+- Coordinator IPC is a byte stream; therefore every message MUST be framed.
+- V1 uses **length-delimited frames**:
+
+```
+Frame := {
+  len_be     : u32,     // number of bytes following (cap: 4 MiB; reject larger)
+  version_be : u16,     // protocol version (1)
+  kind_be    : u16,     // message kind
+  request_id : u64_be,  // per-connection correlation id (monotonic)
+  payload    : [u8; len_be - 16],
+}
+```
+
+- All frame header integers are big-endian (network byte order).
+- Payload encoding is **canonical** and deterministic: integers are little-endian
+  unless otherwise specified by the payload schema. Variable-length arrays are
+  length-prefixed with `u32` counts and elements are encoded in a fixed order.
+
+**Reserve/submit discipline (normative):**
+Cross-process IPC MUST preserve the same safety posture as the in-process
+two-phase MPSC channel (§4.5): clients MUST NOT "half submit" a commit and leave
+ghost state in the coordinator.
+
+Therefore coordinator IPC is **two-phase**:
+1. `RESERVE`: client requests a commit pipeline slot; coordinator replies with a
+   `permit_id` (u64) or `BUSY`.
+2. `SUBMIT_*`: client submits exactly one request bound to that `permit_id`.
+   Dropping the connection without submitting MUST free the permit.
+
+The coordinator MUST bound the number of outstanding permits (default 16; same
+derivation as §4.5). If the bound is exceeded, `RESERVE` returns `BUSY`.
+
+**Idempotency (required for robustness):**
+- Every `SUBMIT_*` message MUST carry `txn: TxnToken`.
+- The coordinator MUST treat `(txn_id, txn_epoch)` as an idempotency key for
+  commit publication:
+  - If it has already produced a terminal decision for that token
+    (`Ok{commit_seq}` or `Conflict{...}`), it MUST return the same response to
+    any duplicate `SUBMIT_*` request.
+  - This prevents "disconnect after submit" from creating ambiguous client
+    outcomes.
+
+**Bulk payload transfer (required):**
+- Cross-process IPC MUST NOT send full page bytes inline in frames.
+- For Compatibility/WAL commits, large write sets MUST be transferred by sending
+  a **spill file descriptor** to the coordinator using SCM_RIGHTS ancillary data
+  on the `SUBMIT_WAL_COMMIT` frame.
+- This MUST use asupersync's Unix socket support:
+  - `asupersync::net::unix::{UnixStream, SocketAncillary, AncillaryMessage}`
+  - `UnixStream::{send_with_ancillary, recv_with_ancillary}`
+
+**Wire message kinds (V1 minimal set):**
+- `RESERVE`
+- `SUBMIT_NATIVE_PUBLISH`
+- `SUBMIT_WAL_COMMIT`
+- `ROWID_RESERVE` (reserve a monotone RowId range; used by `OP_NewRowid` in
+  Concurrent mode; §5.10.1.1). This message is small and MAY be served without
+  consuming a commit pipeline permit.
+- `RESPONSE` (all responses use this frame kind with a response payload)
+- `PING` / `PONG` (optional keepalive)
+
+The internal coordinator uses an in-process two-phase MPSC channel (§4.5). A
+per-connection handler task translates wire frames into internal requests,
+awaits the internal oneshot response, then writes a RESPONSE frame.
 
 #### 5.9.1 Native Mode Sequencer (Tiny Marker Path)
 
@@ -9033,6 +9147,12 @@ Marker IO:  Append CommitMarker (tiny) to marker stream (atomic visibility point
 ```
 
 **PublishRequest (native mode):**
+
+**NOTE (normative):** The Rust struct below is the **in-process** coordinator
+message schema. In multi-process mode, a client process sends a framed
+`SUBMIT_NATIVE_PUBLISH` wire payload over the coordinator Unix socket (§5.9.0)
+and receives a RESPONSE frame; it MUST NOT attempt to transmit Rust heap objects
+or synchronization primitives across processes.
 
 ```rust
 pub struct PublishRequest {
@@ -9104,6 +9224,12 @@ States:
 
 **Compatibility-mode CommitRequest and CommitResponse types:**
 
+**NOTE (normative):** The Rust structs below are the **in-process** coordinator
+message schemas. In multi-process mode, a client process sends a framed
+`SUBMIT_WAL_COMMIT` wire payload over the coordinator Unix socket (§5.9.0),
+including a spill file descriptor passed via SCM_RIGHTS. It MUST NOT attempt to
+send `HashMap`/`Vec`/`oneshot::Sender` values through shared memory.
+
 ```rust
 /// Sent by a committing transaction to the write coordinator (compatibility/WAL path).
 pub struct CommitRequest {
@@ -9171,8 +9297,14 @@ pub enum CommitWriteSet {
 }
 
 pub struct SpilledWriteSet {
-    /// Absolute path to the spill file, stable for the duration of the commit.
-    pub spill_path: std::path::PathBuf,
+    /// Readable spill file handle for the duration of the commit.
+    ///
+    /// - In single-process mode, the coordinator MAY open the spill file itself.
+    /// - In multi-process mode, this MUST be provided via SCM_RIGHTS fd passing
+    ///   on the coordinator IPC transport (§5.9.0).
+    pub spill_fd: std::os::unix::io::OwnedFd,
+    /// Optional diagnostics path (never trusted for correctness).
+    pub spill_path: Option<std::path::PathBuf>,
     /// Page index: page number -> location in spill file (last-write wins).
     pub pages: HashMap<PageNumber, SpillLoc>,
 }
@@ -9205,14 +9337,19 @@ append coordinator-only, Compatibility mode MUST support write-set spilling:
   images to a private per-txn spill file.
 - The spill file is a temporary artifact (e.g., `foo.db.fsqlite-tmp/txn-<TxnToken>.spill`)
   and MUST NOT be used for crash recovery. It exists only to bound RAM usage.
+- **Multi-process robustness (recommended):** The spilling process SHOULD open
+  the spill file, then immediately unlink it (or use an unnamed temp file
+  facility where available) so cleanup is automatic if the process crashes.
+  The open file descriptor remains valid and is passed to the coordinator.
 - The spill file MUST implement last-write-wins semantics per page number
   (via an in-memory index `pgno -> SpillLoc`).
 - Self-visibility MUST still hold: if a page's latest bytes were spilled, reads
   of that page by the same transaction MUST load the bytes from the spill file.
 - Multi-process note (normative): when commit publication is routed across
   processes (§5.6.7), the commit request transport MUST NOT attempt to carry
-  full page bytes. Implementations SHOULD therefore use `CommitWriteSet::Spilled`
-  for cross-process commit requests.
+  full page bytes. Therefore **cross-process** commits MUST use
+  `CommitWriteSet::Spilled` and MUST supply the spill file to the coordinator
+  via SCM_RIGHTS fd passing on the coordinator IPC transport (§5.9.0).
 - At commit time, the transaction sends a `CommitRequest` whose `write_set`
   is either `Inline(...)` or `Spilled(...)`. The coordinator performs WALAppend
   by reading page bytes from `CommitWriteSet` only after validation succeeds.
