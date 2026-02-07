@@ -6576,11 +6576,11 @@ cleanup_orphaned_slots():
                 slot.txn_id = 0  // Free the slot (Release ordering, LAST)
             continue
 
-        if slot.txn_id == TXN_ID_CLAIMING:
-            // Slot is being claimed by another process (Phase 1 of acquire).
-            //
-            // CRITICAL: If a process crashes between Phase 1 (CAS 0 ->
-            // TXN_ID_CLAIMING) and Phase 2 (write pid/lease_expiry), the
+	        if slot.txn_id == TXN_ID_CLAIMING:
+	            // Slot is being claimed by another process (Phase 1 of acquire).
+	            //
+	            // CRITICAL: If a process crashes between Phase 1 (CAS 0 ->
+	            // TXN_ID_CLAIMING) and Phase 2 (write pid/lease_expiry), the
             // slot's pid/pid_birth/lease_expiry fields are STALE (they
             // belong to the previous occupant, or are zero for a fresh slot).
             // We MUST NOT rely on those fields for CLAIMING-state cleanup.
@@ -6589,74 +6589,74 @@ cleanup_orphaned_slots():
             // CLAIMING state for longer than CLAIMING_TIMEOUT_SECS, the
             // claimer is presumed dead. 5 seconds is orders of magnitude
             // longer than any valid Phase 1 -> Phase 2 transition (~μs).
-            if slot.claiming_timestamp == 0:
-                // The claimer writes claiming_timestamp after the CAS (§5.6.2).
-                // If it crashed immediately after claiming, the timestamp may
-                // still be 0. Seed the timeout clock without touching other fields.
-                slot.claiming_timestamp.CAS(0, now)
-                continue
-            if now - slot.claiming_timestamp > CLAIMING_TIMEOUT_SECS:
-                // Transition to CLEANING before clearing fields so we do not race
-                // with a new claimer that could otherwise observe/clobber state.
-                if slot.txn_id.CAS(TXN_ID_CLAIMING, TXN_ID_CLEANING):
-                    // Entered CLEANING; stamp the sentinel-time so other cleaners
-                    // do not treat this slot as "stuck CLEANING" immediately.
-                    slot.claiming_timestamp = now
-                    // Clear snapshot/epoch fields as well: a future claimer must not
-                    // observe stale begin_seq/witness_epoch under TXN_ID_CLAIMING (§5.6.5, §5.6.4.8).
-                    slot.state = Free
-                    slot.mode = Serialized
-                    slot.commit_seq = 0
-                    slot.begin_seq = 0
-                    slot.snapshot_high = 0
-                    slot.witness_epoch = 0
-                    slot.has_in_rw = false
-                    slot.has_out_rw = false
-                    slot.marked_for_abort = false
-                    slot.write_set_pages = 0
-                    slot.pid = 0
-                    slot.pid_birth = 0
-                    slot.lease_expiry = 0
-                    slot.cleanup_txn_id = 0
-                    slot.claiming_timestamp = 0
-                    slot.txn_id = 0  // Free the slot (Release ordering, LAST)
-            continue  // skip the lease/liveness check — fields are stale
+	            if slot.claiming_timestamp == 0:
+	                // The claimer writes claiming_timestamp after the CAS (§5.6.2).
+	                // If it crashed immediately after claiming, the timestamp may
+	                // still be 0. Seed the timeout clock without touching other fields.
+	                slot.claiming_timestamp.CAS(0, now)
+	                continue
+	            if now - slot.claiming_timestamp > CLAIMING_TIMEOUT_SECS:
+	                // Transition to CLEANING before clearing fields so we do not race
+	                // with a new claimer that could otherwise observe/clobber state.
+	                if slot.txn_id.CAS(TXN_ID_CLAIMING, TXN_ID_CLEANING):
+	                    // Entered CLEANING; stamp the sentinel-time so other cleaners
+	                    // do not treat this slot as "stuck CLEANING" immediately.
+	                    slot.claiming_timestamp = now
+	                    // Clear snapshot/epoch fields as well: a future claimer must not
+	                    // observe stale begin_seq/witness_epoch under TXN_ID_CLAIMING (§5.6.5, §5.6.4.8).
+	                    slot.state = Free
+	                    slot.mode = Serialized
+	                    slot.commit_seq = 0
+	                    slot.begin_seq = 0
+	                    slot.snapshot_high = 0
+	                    slot.witness_epoch = 0
+	                    slot.has_in_rw = false
+	                    slot.has_out_rw = false
+	                    slot.marked_for_abort = false
+	                    slot.write_set_pages = 0
+	                    slot.pid = 0
+	                    slot.pid_birth = 0
+	                    slot.lease_expiry = 0
+	                    slot.cleanup_txn_id = 0
+	                    slot.claiming_timestamp = 0
+	                    slot.txn_id = 0  // Free the slot (Release ordering, LAST)
+	                continue  // skip the lease/liveness check — fields are stale
+	            continue  // CLAIMING recently; give the claimer time
 
-        if slot.txn_id != 0 AND slot.lease_expiry < now:
-            // Lease expired -- check whether the owning process still exists.
-            // IMPORTANT: PID reuse is real; liveness checks MUST defend against it.
-            if !process_alive(slot.pid, slot.pid_birth):
-                // Process crashed. Abort its transaction.
-                //
-                // ATOMICITY: record the old TxnId for retryable cleanup, then
-                // CAS txn_id to TXN_ID_CLEANING so only one cleaner proceeds.
-                // If CAS fails, another process already claimed cleanup — skip it.
-                old_txn_id = slot.txn_id.load()
-                slot.cleanup_txn_id = old_txn_id  // MUST happen before sentinel overwrite (crash-safety)
-                if !slot.txn_id.CAS(old_txn_id, TXN_ID_CLEANING):
-                    // Avoid leaking cleanup_txn_id into a non-cleaning slot.
-                    slot.cleanup_txn_id = 0
-                    continue  // someone else is cleaning this slot (or slot changed)
-                // Entered CLEANING; stamp the sentinel-time unconditionally. This
-                // must overwrite any old "claim" timestamp left over from slot acquire.
-                slot.claiming_timestamp = now
-                release_page_locks_for(old_txn_id)
-                slot.state = Free
-                slot.mode = Serialized
-                slot.commit_seq = 0
-                slot.begin_seq = 0
-                slot.snapshot_high = 0
-                slot.witness_epoch = 0
-                slot.has_in_rw = false
-                slot.has_out_rw = false
-                slot.marked_for_abort = false
-                slot.write_set_pages = 0
-                slot.pid = 0
-                slot.pid_birth = 0
-                slot.lease_expiry = 0
-                slot.cleanup_txn_id = 0
-                slot.claiming_timestamp = 0
-                slot.txn_id = 0    // Free the slot (Release ordering, LAST)
+	        if slot.txn_id != 0 AND slot.lease_expiry < now:
+	            // Lease expired -- check whether the owning process still exists.
+	            // IMPORTANT: PID reuse is real; liveness checks MUST defend against it.
+	            if !process_alive(slot.pid, slot.pid_birth):
+	                // Process crashed. Abort its transaction.
+	                //
+	                // ATOMICITY: record the old TxnId for retryable cleanup, then
+	                // CAS txn_id to TXN_ID_CLEANING so only one cleaner proceeds.
+	                // If CAS fails, another process already claimed cleanup — skip it.
+	                old_txn_id = slot.txn_id.load()
+	                slot.cleanup_txn_id = old_txn_id  // MUST happen before sentinel overwrite (crash-safety)
+	                if !slot.txn_id.CAS(old_txn_id, TXN_ID_CLEANING):
+	                    continue  // someone else is cleaning this slot (or slot changed)
+	                // Entered CLEANING; stamp the sentinel-time unconditionally. This
+	                // must overwrite any old "claim" timestamp left over from slot acquire.
+	                slot.claiming_timestamp = now
+	                release_page_locks_for(old_txn_id)
+	                slot.state = Free
+	                slot.mode = Serialized
+	                slot.commit_seq = 0
+	                slot.begin_seq = 0
+	                slot.snapshot_high = 0
+	                slot.witness_epoch = 0
+	                slot.has_in_rw = false
+	                slot.has_out_rw = false
+	                slot.marked_for_abort = false
+	                slot.write_set_pages = 0
+	                slot.pid = 0
+	                slot.pid_birth = 0
+	                slot.lease_expiry = 0
+	                slot.cleanup_txn_id = 0
+	                slot.claiming_timestamp = 0
+	                slot.txn_id = 0    // Free the slot (Release ordering, LAST)
+	                continue
 ```
 
 The three-phase acquire protocol MUST set `claiming_timestamp` **after** the
@@ -9336,7 +9336,7 @@ pub struct GhostStore<K> {
 /// CONCURRENCY: All ArcCache operations (REQUEST, REPLACE, promote, evict)
 /// mutate multiple internal collections atomically. The cache MUST be
 /// protected by a `Mutex<ArcCache>` (or `parking_lot::Mutex` for fast
-/// uncontended paths). Individual CachedPage fields (ref_count, dirty) use
+/// uncontended paths). Individual CachedPage fields (ref_count, dirty, flush_inflight) use
 /// atomics for lock-free read-side access, but structural mutations to
 /// T1/T2/B1/B2/p/index require the mutex. With the CAR physical
 /// implementation, the mutex-held critical section is short (clock sweep
@@ -9366,7 +9366,9 @@ pub struct ArcCache {
 
 **Eviction constraints:**
 1. Never evict a pinned page (`ref_count > 0`)
-2. Never evict a dirty page without flushing it to the WAL first
+2. Eviction MUST be a pure memory operation: it MUST NOT append to `.wal` and
+   MUST NOT perform durability I/O. (Durability is handled by the commit
+   coordinator + checkpointing; §5.9.2, §7.5, §11.)
 3. Prefer superseded versions (newer committed version exists and is visible
    to all active snapshots)
 
@@ -9419,14 +9421,6 @@ REPLACE(cache, target_key):
         T1.rotate_front_to_back()  // skip pinned; try next
         rotations_t1 += 1
         continue
-      if candidate.dirty:
-        if flush_dirty_page(candidate).is_err():
-          // WAL write failed (disk full, I/O error). Skip this candidate
-          // rather than evicting an unflushed dirty page (data loss).
-          // flush_dirty_page() restores the dirty flag on failure (§6.6).
-          T1.rotate_front_to_back()
-          rotations_t1 += 1
-          continue
       (evicted_key, evicted_page) = T1.pop_front()
       B1.push_back(evicted_key)    // remember in ghost list
       total_bytes -= evicted_page.byte_size
@@ -9439,11 +9433,6 @@ REPLACE(cache, target_key):
         T2.rotate_front_to_back()
         rotations_t2 += 1
         continue
-      if candidate.dirty:
-        if flush_dirty_page(candidate).is_err():
-          T2.rotate_front_to_back()
-          rotations_t2 += 1
-          continue
       (evicted_key, evicted_page) = T2.pop_front()
       B2.push_back(evicted_key)
       total_bytes -= evicted_page.byte_size
@@ -9453,20 +9442,8 @@ REPLACE(cache, target_key):
 **Async integration (normative):** In FrankenSQLite, all file I/O is dispatched
 via asupersync's blocking pool (`spawn_blocking_io(...).await`; §4.10). Therefore
 a `parking_lot::Mutex` guard MUST NOT be held across any I/O or `.await`.
-
-Consequently, the REPLACE/REQUEST logic above MUST be implemented with a
-**flush-then-evict** protocol:
-
-1. Select an eviction candidate under the cache mutex.
-2. Drop the mutex.
-3. Attempt to flush (WAL write) outside the mutex using the cancel-safe flush
-   claim in §6.6 (`flush_inflight: false -> true` via CAS). If flush fails, the
-   page MUST remain dirty and MUST NOT be evicted.
-4. Re-acquire the mutex and evict only if the page is still present, still
-   unpinned (`ref_count == 0`), and now clean.
-
-This is required for liveness: holding a synchronous mutex across `.await`
-creates executor-level deadlocks under bounded worker pools.
+REPLACE itself performs no I/O (eviction is pure), but REQUEST misses must fetch
+from storage and therefore MUST drop the cache mutex before doing so.
 
 ### 6.4 Full ARC Algorithm: REQUEST Subroutine
 
@@ -9528,19 +9505,12 @@ REQUEST(cache, key: CacheKey) -> Result<Arc<CachedPage>>:
       // cache entirely — no ghost metadata is preserved).
       rotations = 0
       candidate = T1.front()
-      while candidate.ref_count > 0 OR candidate.dirty:
+      while candidate.ref_count > 0:
         if rotations >= |T1|:
-          // Safety valve: all T1 pages are pinned or unflushed.
+          // Safety valve: all T1 pages are pinned.
           // Allow temporary over-capacity rather than spinning forever.
           capacity_overflow += 1
           break  // skip eviction, insert will exceed capacity
-        if candidate.dirty AND candidate.ref_count == 0:
-          if flush_dirty_page(candidate).is_err():
-            T1.rotate_front_to_back()
-            rotations += 1
-            candidate = T1.front()
-            continue                  // retry with next candidate
-          break  // flush succeeded, candidate is now clean and evictable
         T1.rotate_front_to_back()
         rotations += 1
         candidate = T1.front()
@@ -9674,7 +9644,7 @@ heavily-versioned page consumes multiple cache slots. Under high write
 contention, the effective number of distinct pages cached decreases. This is
 correct: the cache prioritizes versions actively needed over breadth.
 
-### 6.6 Eviction: Pinned Pages and Dirty Flush Protocol
+### 6.6 Eviction: Pinned Pages and Durability Boundaries
 
 **All pages pinned scenario.** If REPLACE scans all of T1 and T2 without
 finding an unpinned, clean page, the cache is overcommitted. Resolution:
@@ -9688,61 +9658,26 @@ This is a safety valve, not the normal path. In practice, pinned page count
 is bounded by `(concurrent_cursors * max_btree_depth)`, which is typically
 under 200 even for heavy workloads.
 
-**Dirty page flush protocol:**
+**CRITICAL RULE (normative): ARC eviction MUST NOT append to `.wal`.**
 
-**Cancellation safety (normative):** After an evictor successfully claims
-`page.flush_inflight = true`, it MUST run the flush to completion (mask
-cancellation) and MUST clear `flush_inflight` on all paths (success, failure).
-Stranding `flush_inflight=true` is a liveness bug that can permanently prevent
-eviction of the page.
+In Compatibility mode, WAL transaction boundaries are encoded by the *commit
+frame marker* (a frame with `db_size != 0`; §11.9). This format assumes each
+transaction's frames are appended contiguously and that there are no uncommitted
+frames in the committed WAL prefix. If an eviction path were to append an
+uncommitted page frame to `.wal` and a different transaction later commits, the
+eviction frame would lie before a commit marker and would therefore be treated
+as committed by the legacy WAL-index machinery. That is silent corruption.
 
-**I/O stall semantics (normative):** Masking cancellation is deliberately
-hostile to "fast shutdown" when storage is unhealthy. If the underlying
-`wal.write_frame()` call hangs (stalled device, pathological filesystem,
-misconfigured network storage), there is no safe way to time out and proceed:
-the engine cannot know whether the write will later succeed, partially succeed,
-or never succeed. In this failure mode, **data safety dominates liveness**:
+Therefore:
+- Only the Write Coordinator is permitted to append to `.wal` (§5.9.2).
+- The buffer pool MUST treat eviction as a memory-only operation. It MUST NOT
+  call `wal.write_frame` (or any equivalent WAL append primitive).
 
-- The process may become unable to make progress on eviction (and therefore may
-  be unable to complete a clean shutdown).
-- Supervisors MUST treat this as an I/O-fatal condition: stop accepting new
-  write work (backpressure), surface a clear diagnostic (include the blocked
-  operation and elapsed time), and require operator intervention (restart /
-  kill). A hung process can be replaced; a corrupted database cannot.
-
-```rust
-fn flush_dirty_page(page: &CachedPage, wal: &WalWriter) -> Result<()> {
-    if !page.dirty.load(Acquire) {
-        return Ok(());
-    }
-
-    // Atomically claim the flush to prevent double-flush AND to block eviction
-    // while the WAL write is in progress.
-    if page
-        .flush_inflight
-        .compare_exchange(false, true, AcqRel, Acquire)
-        .is_err()
-    {
-        // Another evictor is already flushing this page.
-        return Err(SQLITE_BUSY);
-    }
-
-    // Cancellation must not strand `flush_inflight=true`.
-    let res = wal.write_frame(page.key.pgno, &page.data);
-    match res {
-        Ok(()) => {
-            page.dirty.store(false, Release);
-            page.flush_inflight.store(false, Release);
-            Ok(())
-        }
-        Err(e) => {
-            // WAL write failed (e.g., disk full). Keep dirty=true and unblock eviction.
-            page.flush_inflight.store(false, Release);
-            Err(e)
-        }
-    }
-}
-```
+**Where uncommitted pages go (normative):** Uncommitted/private page images live
+in the transaction's `write_set` (§5.1, §5.4) and MUST be spillable to a
+per-transaction temporary spill file in Compatibility mode to prevent OOM. See
+§5.9.2 for the spill mechanism and how the coordinator consumes spilled pages
+at commit time.
 
 ### 6.7 MVCC Version Coalescing
 
@@ -9805,6 +9740,7 @@ We do not accept unbounded growth of ANY of the following:
 | Subsystem | Budget Source | Reclamation Policy |
 |-----------|-------------|-------------------|
 | ARC page cache | `PRAGMA cache_size` | ARC eviction (§6.3–6.4) |
+| Transaction write sets (page images) | `PRAGMA fsqlite.txn_write_set_mem_bytes` | Spill to per-txn temp file (§5.9.2); abort if hard cap exceeded |
 | MVCC page version chains | GC horizon (min active snapshot) | Coalescing + version drop (§6.7) |
 | SSI witness plane (hot index + evidence caches) | Hot: fixed SHM layout; Cold: fixed byte budgets | Hot: epoch swap (§5.6.4.8); Cold: LRU + rebuild from ECS; evidence GC by safe horizons |
 | Symbol caches (decoded objects) | Fixed byte budget, configurable | LRU eviction |
@@ -9854,7 +9790,7 @@ limited to `capacity` entries each (~72 KB overhead for 2000 entries, see §6.4)
 **Resize protocol (runtime change):**
 1. Set new capacity and max_bytes.
 2. If `|T1| + |T2| > new_capacity`: repeatedly call REPLACE until within
-   limits (dirty pages are flushed during this process).
+   limits.
 3. Trim ghost lists: `B1.truncate(new_capacity)`, `B2.truncate(new_capacity)`.
 4. Clamp p to `[0, new_capacity]`.
 
@@ -10084,7 +10020,8 @@ reports when FrankenSQLite next reads the modified pages.
 **Verification points in the hot path:**
 - Every disk read: compute XXH3, store in CachedPage
 - Every cache read (optional): reverify XXH3
-- Before WAL write: verify dirty page XXH3 matches
+- Before WAL append: verify each page image's integrity hash matches the expected
+  value (whether sourced from in-memory write set or a spill file).
 - Before checkpoint write: verify page XXH3
 
 ### 7.5 WAL Frame Integrity: Cumulative Checksum Chain
@@ -14471,6 +14408,12 @@ encryption using the reserved-space-per-page field in the database header:
 - **Key management API:** Retain the familiar SQLite-style API surface:
   `PRAGMA key` / `PRAGMA rekey`. The underlying scheme is not SEE-compatible
   byte-for-byte; it is compatible at the SQL interface level.
+
+- **Interoperability note (normative):** Encrypted databases are **not** readable
+  by stock C SQLite. Compatibility mode's "legacy interoperability" applies only
+  to plaintext databases. If encryption is enabled, FrankenSQLite MUST fail
+  closed rather than attempting to interoperate with legacy clients that would
+  treat ciphertext as page bytes.
 
 - **Encrypt-then-code:** Encryption is orthogonal to ECS: encrypted pages are
   encoded as ECS symbols with encryption applied before RaptorQ encoding
