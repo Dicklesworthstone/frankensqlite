@@ -13353,6 +13353,6 @@ an embedded database engine can achieve.
 
 ---
 
-*Document version: 1.17 (Round 7 audit fixes: marker stream byte-exact header/record math + marker_id domain separation; SharedPageLockTable: forbid per-unlock key deletion (key-stable release) and correct rebuild accounting; compaction publish ordering (segments before locator); CommitMarkerRecord size corrected to 88B; permeation map clarified (coded capsule/proof vs uncoded marker stream))*
+*Document version: 1.18 (Round 5b audit fixes: rollback journal checksum loop bound corrected (>= 0 → > 0, data[0] never sampled); P_loss table values corrected (were wrong by 2-17 orders of magnitude); database size validity condition added (offset 28 only valid when offset 92 == offset 24); WAL-index SHM native byte order note added; iVersion = 3007000 specified; WalCkptInfo consolidated as 40 bytes; usable_size >= 480 constraint added; fragmented bytes threshold corrected (may not exceed 60); cell format payload comments fixed (reference §11.4 overflow calc); BtreeCursorOps: added &Cx to all methods + first()/last(); VfsFile: added xShmMap/xShmLock/xShmBarrier/xShmUnmap for WAL mode; VirtualTable: added xCreate/xDestroy/xUpdate/xBegin/xSync/xCommit/xRollback/xRename/xSavepoint; CheckpointPageWriter trait definition added; FunctionRegistry: added find_window; Transaction type placement note (circular dependency fix); Phase 9 replication gate added)*
 *Last updated: 2026-02-07*
 *Status: Authoritative Specification*
