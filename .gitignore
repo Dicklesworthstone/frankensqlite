@@ -44,3 +44,6 @@ fuzz/artifacts/
 
 # Claude Code / AI agent ephemeral files
 .claude/
+
+# bv (beads viewer) local config and caches
+.bv/
