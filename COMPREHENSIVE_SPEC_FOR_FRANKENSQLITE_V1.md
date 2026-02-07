@@ -7397,7 +7397,9 @@ Page cache and transaction state machine. The core I/O layer.
 Modules:
 - `pager.rs`: `Pager` struct (the main type). State machine:
   `Open -> Reader -> Writer -> Error`. Manages database file handle, journal
-  file, WAL file, and the ARC cache.
+  file, and the ARC cache. (WAL operations are in `fsqlite-wal`; the pager
+  defines the `MvccPager` trait and `CheckpointPageWriter` trait but does
+  not depend on `fsqlite-wal`.)
 - `cache.rs`: `ArcCache` implementation (Section 6). Full ARC algorithm with
   MVCC-aware eviction.
 - `page_ref.rs`: `PageRef` (RAII guard that pins a page in cache, decrements
@@ -7664,6 +7666,7 @@ Compares output row-by-row. Error code matching. Golden file management.
 | fsqlite-planner | fsqlite-types | Column metadata, affinities |
 | fsqlite-vdbe | fsqlite-btree | B-tree cursor operations |
 | fsqlite-vdbe | fsqlite-pager | Direct page access for some opcodes |
+| fsqlite-vdbe | fsqlite-func | Function dispatch (ScalarFunction, AggregateFunction, etc.) |
 | fsqlite-vdbe | fsqlite-types | Opcode enum, Mem values |
 | fsqlite-func | fsqlite-types | SqliteValue args and return |
 | fsqlite-core | (all above) | Orchestration layer |
@@ -8902,7 +8905,8 @@ Total: 22 bytes.
 ```
 Offset  Size  Description
   0       4   Magic: 0x377F0682 (big-endian cksum) or 0x377F0683 (little-endian)
-  4       4   Format version: 3007000
+  4       4   Format version: 3007000 (constant for all WAL1 databases;
+              indicates the WAL format introduced in SQLite 3.7.0)
   8       4   Page size
  12       4   Checkpoint sequence number
  16       4   Salt-1
