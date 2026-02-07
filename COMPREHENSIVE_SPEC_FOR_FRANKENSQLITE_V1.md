@@ -7970,8 +7970,8 @@ pub trait MvccPager: sealed::Sealed + Send + Sync {
 
     /// Abort the transaction. Discards write set, releases locks,
     /// and leaves monotonic witness evidence to be ignored and GC'd by horizons.
-    /// Never fails.
-    fn rollback(&self, txn: Transaction);
+    /// Never fails (panics on poisoned mutex, which is unrecoverable anyway).
+    fn rollback(&self, cx: &Cx, txn: Transaction);
 }
 
 /// Cursor operations over a B-tree.
@@ -9217,9 +9217,11 @@ WITH [RECURSIVE]
 SELECT ... FROM cte_name ...
 ```
 
-Recursive CTEs require `UNION ALL` between the base case and the recursive
-step. The recursive step may reference `cte_name` exactly once. Cycle
-detection is not automatic; use `LIMIT` to prevent infinite recursion.
+Recursive CTEs use `UNION ALL` (keeps duplicates) or `UNION` (discards
+duplicates, providing implicit cycle detection) between the base case and
+the recursive step. The recursive step may reference `cte_name` exactly once.
+When using `UNION ALL`, cycle detection is not automatic; use `LIMIT` to
+prevent infinite recursion.
 `MATERIALIZED` forces the CTE to be evaluated once and stored as a temp
 table. `NOT MATERIALIZED` allows the optimizer to inline the CTE as a
 subquery (default behavior for non-recursive CTEs referenced once).
