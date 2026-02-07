@@ -6693,10 +6693,10 @@ SharedMemoryLayout := {
     txn_slot_offset  : u64,            -- byte offset to TxnSlot array
     committed_readers_offset: u64,     -- byte offset to RecentlyCommittedReadersRing region (§5.6.2.1)
     committed_readers_bytes : u64,     -- reserved bytes for the ring (fixed per layout version)
-	    layout_checksum  : u64,            -- xxh3_64 of immutable layout metadata fields
-	                                       -- (magic/version/page_size/max_txn_slots/offsets/bytes); excludes
-	                                       -- dynamic atomics (counters, epochs, leases). Written once at
-	                                       -- initialization and validated on map.
+    layout_checksum  : u64,            -- xxh3_64 of immutable layout metadata fields
+                                       -- (magic/version/page_size/max_txn_slots/offsets/bytes); excludes
+                                       -- dynamic atomics (counters, epochs, leases). Written once at
+                                       -- initialization and validated on map.
     _padding         : [u8; 64],       -- align to cache line
     // --- TxnSlot array follows at txn_slot_offset ---
     // --- RecentlyCommittedReadersRing follows at committed_readers_offset ---
@@ -6755,21 +6755,30 @@ the snapshot backbone fields (`commit_seq`, `schema_epoch`, `ecs_epoch`): the
 coordinator/sequencer in its commit publication section.
 
 Because processes can crash, the writer MUST be robust to seeing an odd
-`snapshot_seq` (stale "writer in progress" marker). It MUST use a CAS protocol
-that always transitions **even -> odd -> even** around publication and repairs
-stale odd values when it is the active coordinator:
+`snapshot_seq` (stale "writer in progress" marker).
+
+**CRITICAL (normative):** It is forbidden to transition `snapshot_seq` from odd
+to even unless the snapshot backbone fields have been written to a
+self-consistent set derived from durable state. Otherwise, a reader can observe
+an even `snapshot_seq` and accept a mixed snapshot.
+
+Therefore the coordinator MUST use a CAS protocol that transitions
+**even -> odd -> even** around publication. If `snapshot_seq` is already odd
+(crash-stale), the coordinator MUST treat this as an already-open publish
+window and complete reconciliation while keeping it odd.
 
 ```
 begin_snapshot_publish(shm):
+  // PRECONDITION (normative): caller holds the coordinator/sequencer publication
+  // lock (WAL write lock in Compatibility mode; marker sequencer lock in Native
+  // mode). This ensures there is at most one snapshot publisher at a time.
   loop:
     s = shm.snapshot_seq.load(Acquire)
     if (s & 1) == 1:
-      // stale in-progress marker from a crashed coordinator; repair to even
-      // before starting a new publication.
-      if shm.snapshot_seq.CAS(s, s + 1, AcqRel, Acquire):
-        continue
-      else:
-        continue
+      // Stale in-progress marker from a crashed coordinator. Keep it odd so
+      // readers continue to retry; reconciliation will rewrite the backbone
+      // fields from durable state and end_snapshot_publish() will flip to even.
+      return
     // s is even; claim writer-in-progress by flipping to odd.
     if shm.snapshot_seq.CAS(s, s + 1, AcqRel, Acquire):
       return
@@ -9121,7 +9130,7 @@ Frame := {
   version_be : u16,     // protocol version (1)
   kind_be    : u16,     // message kind
   request_id : u64_be,  // per-connection correlation id (monotonic)
-  payload    : [u8; len_be - 16],
+  payload    : [u8; len_be - 12],
 }
 ```
 
@@ -9172,6 +9181,124 @@ derivation as §4.5). If the bound is exceeded, `RESERVE` returns `BUSY`.
   consuming a commit pipeline permit.
 - `RESPONSE` (all responses use this frame kind with a response payload)
 - `PING` / `PONG` (optional keepalive)
+
+**Wire payload schemas (normative, version 1):**
+
+The payload of each frame is a canonical byte encoding. Unless a schema below
+explicitly says "big-endian", all integers in payloads are little-endian.
+
+Common atoms:
+- `ObjectId`: 16 raw bytes.
+- `TxnToken`:
+  - `txn_id: u64_le`
+  - `txn_epoch: u32_le`
+  - `pad: u32_le = 0` (reserved)
+
+`RESERVE` payload:
+
+```
+ReserveV1 := {
+  purpose   : u8,      // 0 = NativePublish, 1 = WalCommit
+  pad0      : [u8; 7], // reserved (0)
+  txn       : TxnToken,
+}
+```
+
+`RESERVE` response payload (inside a `RESPONSE` frame with the same `request_id`):
+
+```
+ReserveRespV1 :=
+  | Ok   { permit_id: u64_le }
+  | Busy { retry_after_ms: u32_le }
+  | Err  { code: u32_le }  // SQLite-ish error code enum
+```
+
+`SUBMIT_NATIVE_PUBLISH` payload:
+
+```
+SubmitNativePublishV1 := {
+  permit_id           : u64_le,
+  txn                 : TxnToken,
+  begin_seq           : u64_le,
+  capsule_object_id   : ObjectId,
+  capsule_digest_32   : [u8; 32],      // e.g., BLAKE3-256(capsule bytes)
+
+  write_set_summary_len: u32_le,
+  write_set_summary    : [u8; write_set_summary_len], // canonical RoaringBitmap serialization
+
+  read_witness_count  : u32_le,
+  read_witnesses      : [ObjectId; read_witness_count],
+  write_witness_count : u32_le,
+  write_witnesses     : [ObjectId; write_witness_count],
+  edge_count          : u32_le,
+  edges               : [ObjectId; edge_count],
+  merge_witness_count : u32_le,
+  merge_witnesses     : [ObjectId; merge_witness_count],
+
+  abort_policy        : u8,            // enum tag (AbortPivot, AbortYoungest, ...)
+  pad0                : [u8; 7],       // reserved (0)
+}
+```
+
+`SUBMIT_WAL_COMMIT` payload:
+
+```
+SubmitWalCommitV1 := {
+  permit_id          : u64_le,
+  txn                : TxnToken,
+  mode               : u8,             // 0 = Serialized, 1 = Concurrent
+  pad0               : [u8; 7],
+
+  snapshot_high      : u64_le,
+  snapshot_schema_epoch: u64_le,
+
+  has_in_rw          : u8,             // 0/1
+  has_out_rw         : u8,             // 0/1
+  wal_fec_r          : u8,
+  pad1               : [u8; 5],
+
+  spill_page_count   : u32_le,
+  spill_pages        : [SpillPageV1; spill_page_count],
+}
+
+SpillPageV1 := {
+  pgno     : u32_le,
+  pad0     : u32_le,
+  offset   : u64_le,
+  len      : u32_le,   // MUST equal page_size in V1
+  pad1     : u32_le,
+  xxh3_64  : u64_le,
+}
+```
+
+**FD passing rule (required):** `SUBMIT_WAL_COMMIT` MUST carry exactly one file
+descriptor in SCM_RIGHTS ancillary data. That fd is the spill file referenced
+by `offset/len` above. If the fd is missing, truncated, or extra fds are present,
+the coordinator MUST reject the request.
+
+`ROWID_RESERVE` payload:
+
+```
+RowIdReserveV1 := {
+  txn                : TxnToken,   // for attribution + audit (not for uniqueness)
+  schema_epoch       : u64_le,
+  table_id           : u32_le,      // TableId (btree root page number)
+  count              : u32_le,      // requested range length
+}
+```
+
+`ROWID_RESERVE` response payload:
+
+```
+RowIdReserveRespV1 :=
+  | Ok  { start_rowid: u64_le, count: u32_le }
+  | Err { code: u32_le }
+```
+
+**Wire size caps (normative):**
+- `write_set_summary_len` MUST be <= 1 MiB.
+- Total counts across witness/edge arrays MUST be <= 65,536 per commit.
+- Any frame exceeding the 4 MiB framing cap MUST be rejected.
 
 The internal coordinator uses an in-process two-phase MPSC channel (§4.5). A
 per-connection handler task translates wire frames into internal requests,
@@ -9299,8 +9426,8 @@ send `HashMap`/`Vec`/`oneshot::Sender` values through shared memory.
 ```rust
 /// Sent by a committing transaction to the write coordinator (compatibility/WAL path).
 pub struct CommitRequest {
-    /// Transaction ID of the committing transaction.
-    pub txn_id: TxnId,
+    /// Identity of the committing transaction (cross-process stable).
+    pub txn: TxnToken,
     /// Transaction mode (Serialized or Concurrent).
     pub mode: TxnMode,
     /// Pages to be committed (page images). The coordinator reads page bytes
@@ -9365,11 +9492,12 @@ pub enum CommitWriteSet {
 pub struct SpilledWriteSet {
     /// Readable spill file handle for the duration of the commit.
     ///
-    /// - In single-process mode, the coordinator MAY open the spill file itself.
-    /// - In multi-process mode, this MUST be provided via SCM_RIGHTS fd passing
-    ///   on the coordinator IPC transport (§5.9.0).
+    /// - In single-process mode, this is passed directly to the coordinator through
+    ///   the in-process channel.
+    /// - In multi-process mode, this MUST be provided via SCM_RIGHTS fd passing on
+    ///   the coordinator IPC transport (§5.9.0).
     pub spill_fd: std::os::unix::io::OwnedFd,
-    /// Optional diagnostics path (never trusted for correctness).
+    /// Optional diagnostics path (never trusted for correctness; may be None if the creator unlinks the file immediately).
     pub spill_path: Option<std::path::PathBuf>,
     /// Page index: page number -> location in spill file (last-write wins).
     pub pages: HashMap<PageNumber, SpillLoc>,
@@ -9743,6 +9871,41 @@ explicit/implicit inserts.
 **Range reservation (recommended):** To avoid an atomic op per row, connections
 SHOULD reserve small RowId ranges from the allocator (e.g., 32 or 64 at a time)
 and allocate locally within the range; unused values may be discarded on abort.
+
+**Allocator state location (normative):** The "global per-table allocator"
+state is owned by the **coordinator role** (§5.9) and is not stored inside the
+SQLite file format.
+
+- In a **single-process** deployment, this can be a coordinator-owned in-memory
+  map keyed by `(schema_epoch, TableId)` that serves range reservations to
+  in-process connections.
+- In a **multi-process** deployment, the same coordinator-owned map serves
+  reservations to other processes over coordinator IPC using `ROWID_RESERVE`
+  (§5.9.0 wire payload `RowIdReserveV1`).
+
+This resolves the otherwise-missing question "where do the per-table counters
+live?" without requiring a dynamically-sized shared-memory hash table in
+`foo.db.fsqlite-shm`.
+
+**Coordinator initialization (normative):** On first use of a `(schema_epoch,
+table_id)` allocator entry, the coordinator MUST initialize `next_rowid` from
+the latest durable tip, not from any transaction snapshot:
+- `next_rowid = max_committed_rowid(table_id) + 1`.
+- AUTOINCREMENT: `next_rowid = max(next_rowid, sqlite_sequence_seq(table_id) + 1)`.
+
+The coordinator MAY cache the initialized value. If the coordinator restarts, it
+MAY reinitialize lazily using the same rule. Gaps are permitted.
+
+**Cross-process request semantics (normative):**
+- The caller MUST send `schema_epoch` and the coordinator MUST reject the request
+  with `SQLITE_SCHEMA` if it does not equal the current durable schema epoch.
+- The caller requests a `count` and the coordinator returns a range
+  `[start_rowid, start_rowid + count)` with:
+  - `start_rowid >= 1`,
+  - monotone, never reused within a schema epoch,
+  - `start_rowid + count - 1 <= MAX_ROWID`.
+- The coordinator MUST advance the allocator by `count` even if the caller later
+  aborts (gaps permitted).
 
 **MAX_ROWID saturation (V1 rule):** The allocator MUST NOT allocate a RowId
 greater than SQLite's `MAX_ROWID` (`2^63-1`). In `BEGIN CONCURRENT`, if the
