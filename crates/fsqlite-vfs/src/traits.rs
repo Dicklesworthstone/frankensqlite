@@ -1,8 +1,9 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use fsqlite_error::Result;
-use fsqlite_types::LockLevel;
+use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::{AccessFlags, SyncFlags, VfsOpenFlags};
+use fsqlite_types::LockLevel;
 
 /// A virtual filesystem implementation.
 ///
@@ -25,30 +26,31 @@ pub trait Vfs: Send + Sync {
     ///
     /// Returns the opened file and the flags that were actually used (the VFS
     /// may add flags like `READWRITE` when `CREATE` is specified).
-    fn open(&self, path: Option<&Path>, flags: VfsOpenFlags) -> Result<(Self::File, VfsOpenFlags)>;
+    fn open(&self, cx: &Cx, path: Option<&Path>, flags: VfsOpenFlags) -> Result<(Self::File, VfsOpenFlags)>;
 
     /// Delete a file.
     ///
     /// If `sync_dir` is true, the directory entry removal should be synced
     /// to ensure durability.
-    fn delete(&self, path: &Path, sync_dir: bool) -> Result<()>;
+    fn delete(&self, cx: &Cx, path: &Path, sync_dir: bool) -> Result<()>;
 
     /// Check file access.
     ///
     /// Returns true if the file at `path` satisfies the access check
     /// described by `flags`.
-    fn access(&self, path: &Path, flags: AccessFlags) -> Result<bool>;
+    fn access(&self, cx: &Cx, path: &Path, flags: AccessFlags) -> Result<bool>;
 
     /// Resolve a potentially relative path into an absolute path.
-    fn full_pathname(&self, path: &Path) -> Result<std::path::PathBuf>;
+    fn full_pathname(&self, cx: &Cx, path: &Path) -> Result<PathBuf>;
 
     /// Generate a random byte sequence for temporary file naming.
     ///
     /// Fills `buf` with random bytes. The default implementation uses the
     /// system random number generator.
-    fn randomness(&self, buf: &mut [u8]) {
+    fn randomness(&self, cx: &Cx, buf: &mut [u8]) {
         // Default: fill with pseudo-random bytes using a simple xorshift.
         // Real VFS implementations should use OS-provided randomness.
+        let _ = cx; // Usage to silence unused variable warning
         let mut state: u64 = 0x5DEE_CE66_D1A4_F681;
         for chunk in buf.chunks_mut(8) {
             state ^= state << 13;
@@ -63,8 +65,9 @@ pub trait Vfs: Send + Sync {
 
     /// Return the current time as a Julian day number (days since noon
     /// on November 24, 4714 B.C.).
-    fn current_time(&self) -> f64 {
+    fn current_time(&self, cx: &Cx) -> f64 {
         // Default: use system time.
+        let _ = cx;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default();
@@ -82,40 +85,40 @@ pub trait VfsFile: Send + Sync {
     /// Close the file.
     ///
     /// After this call, the file handle should not be used.
-    fn close(&mut self) -> Result<()>;
+    fn close(&mut self, cx: &Cx) -> Result<()>;
 
     /// Read `buf.len()` bytes starting at byte offset `offset`.
     ///
     /// Returns the number of bytes actually read. If fewer bytes are read
     /// than requested (short read), the remaining bytes in `buf` are zeroed.
-    fn read(&mut self, buf: &mut [u8], offset: u64) -> Result<usize>;
+    fn read(&mut self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize>;
 
     /// Write `buf` starting at byte offset `offset`.
-    fn write(&mut self, buf: &[u8], offset: u64) -> Result<()>;
+    fn write(&mut self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()>;
 
     /// Truncate the file to `size` bytes.
-    fn truncate(&mut self, size: u64) -> Result<()>;
+    fn truncate(&mut self, cx: &Cx, size: u64) -> Result<()>;
 
     /// Sync the file contents to stable storage.
     ///
     /// `flags` indicates the type of sync (normal, full, data-only).
-    fn sync(&mut self, flags: SyncFlags) -> Result<()>;
+    fn sync(&mut self, cx: &Cx, flags: SyncFlags) -> Result<()>;
 
     /// Return the current file size in bytes.
-    fn file_size(&self) -> Result<u64>;
+    fn file_size(&self, cx: &Cx) -> Result<u64>;
 
     /// Acquire a file lock at the given level.
     ///
     /// SQLite's five-level locking: None < Shared < Reserved < Pending < Exclusive.
-    fn lock(&mut self, level: LockLevel) -> Result<()>;
+    fn lock(&mut self, cx: &Cx, level: LockLevel) -> Result<()>;
 
     /// Release the file lock to the given level.
-    fn unlock(&mut self, level: LockLevel) -> Result<()>;
+    fn unlock(&mut self, cx: &Cx, level: LockLevel) -> Result<()>;
 
     /// Check if another process holds a reserved lock.
     ///
     /// Returns true if a RESERVED or higher lock is held by another connection.
-    fn check_reserved_lock(&self) -> Result<bool>;
+    fn check_reserved_lock(&self, cx: &Cx) -> Result<bool>;
 
     /// Return the sector size for this file.
     ///
@@ -133,6 +136,30 @@ pub trait VfsFile: Send + Sync {
     fn device_characteristics(&self) -> u32 {
         0
     }
+
+    // --- Shared-memory methods (required for WAL mode) ---
+
+    /// Map a region of shared memory. `region` is a 0-based index of 32KB
+    /// regions. If `extend` is true and the region does not exist, create it.
+    /// Returns a mutable pointer to the mapped region.
+    /// (Equivalent to sqlite3_io_methods.xShmMap)
+    fn shm_map(&mut self, cx: &Cx, region: u32, size: u32, extend: bool) -> Result<*mut u8>;
+
+    /// Acquire or release a shared-memory lock.
+    /// `offset` and `n` define a range of lock slots.
+    /// `flags`: SHM_LOCK | (SHM_SHARED | SHM_EXCLUSIVE).
+    /// (Equivalent to sqlite3_io_methods.xShmLock)
+    fn shm_lock(&mut self, cx: &Cx, offset: u32, n: u32, flags: u32) -> Result<()>;
+
+    /// Memory barrier for shared memory -- ensures all prior SHM writes are
+    /// visible to other processes before subsequent reads.
+    /// (Equivalent to sqlite3_io_methods.xShmBarrier)
+    fn shm_barrier(&self);
+
+    /// Unmap all shared-memory regions. If `delete` is true, also delete
+    /// the underlying SHM file.
+    /// (Equivalent to sqlite3_io_methods.xShmUnmap)
+    fn shm_unmap(&mut self, cx: &Cx, delete: bool) -> Result<()>;
 }
 
 #[cfg(test)]
@@ -150,32 +177,42 @@ mod tests {
     fn vfs_file_defaults() {
         struct DummyFile;
         impl VfsFile for DummyFile {
-            fn close(&mut self) -> Result<()> {
+            fn close(&mut self, _cx: &Cx) -> Result<()> {
                 Ok(())
             }
-            fn read(&mut self, _buf: &mut [u8], _offset: u64) -> Result<usize> {
+            fn read(&mut self, _cx: &Cx, _buf: &mut [u8], _offset: u64) -> Result<usize> {
                 Ok(0)
             }
-            fn write(&mut self, _buf: &[u8], _offset: u64) -> Result<()> {
+            fn write(&mut self, _cx: &Cx, _buf: &[u8], _offset: u64) -> Result<()> {
                 Ok(())
             }
-            fn truncate(&mut self, _size: u64) -> Result<()> {
+            fn truncate(&mut self, _cx: &Cx, _size: u64) -> Result<()> {
                 Ok(())
             }
-            fn sync(&mut self, _flags: SyncFlags) -> Result<()> {
+            fn sync(&mut self, _cx: &Cx, _flags: SyncFlags) -> Result<()> {
                 Ok(())
             }
-            fn file_size(&self) -> Result<u64> {
+            fn file_size(&self, _cx: &Cx) -> Result<u64> {
                 Ok(0)
             }
-            fn lock(&mut self, _level: LockLevel) -> Result<()> {
+            fn lock(&mut self, _cx: &Cx, _level: LockLevel) -> Result<()> {
                 Ok(())
             }
-            fn unlock(&mut self, _level: LockLevel) -> Result<()> {
+            fn unlock(&mut self, _cx: &Cx, _level: LockLevel) -> Result<()> {
                 Ok(())
             }
-            fn check_reserved_lock(&self) -> Result<bool> {
+            fn check_reserved_lock(&self, _cx: &Cx) -> Result<bool> {
                 Ok(false)
+            }
+            fn shm_map(&mut self, _cx: &Cx, _region: u32, _size: u32, _extend: bool) -> Result<*mut u8> {
+                Err(fsqlite_error::FrankenError::Unsupported)
+            }
+            fn shm_lock(&mut self, _cx: &Cx, _offset: u32, _n: u32, _flags: u32) -> Result<()> {
+                Err(fsqlite_error::FrankenError::Unsupported)
+            }
+            fn shm_barrier(&self) {}
+            fn shm_unmap(&mut self, _cx: &Cx, _delete: bool) -> Result<()> {
+                Ok(())
             }
         }
 

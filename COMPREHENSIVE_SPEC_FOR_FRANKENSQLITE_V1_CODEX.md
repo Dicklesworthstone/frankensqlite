@@ -274,7 +274,7 @@ This is the “no excuses” mapping from subsystem → ECS/RaptorQ role.
 **Replication plane (network):**
 
 - transport primitives are symbol-native (`SymbolSink`/`SymbolStream`)
-- anti-entropy is “which object ids do you have?” + “send any symbols”
+- anti-entropy uses IBLT set reconciliation (O(Δ) in symmetric difference), with a segment-hash fallback
 - bootstrap is “stream checkpoint chunks until decode”
 
 **Observability plane (alien-artifact explainability):**
@@ -1129,6 +1129,7 @@ Marker contains:
 - `record_xxh3` (fast corruption check)
 
 The marker stream is append-only and totally ordered; it is the “commit clock”.
+Optional (recommended for distributed replication): maintain an MMR accumulator over the marker stream for O(log N) inclusion/prefix proofs.
 
 ### 9.5 Commit Protocol (Native Mode, High-Concurrency)
 
@@ -1765,6 +1766,7 @@ We use:
   - MVCC invariants
   - memory growth bounds
   - replication divergence signals
+  - recommended: mixture e-processes (a small grid of betting strategies) to avoid brittle hand-tuned λ
 - `asupersync::lab::conformal` for distribution-free calibration of performance thresholds in lab harnesses (avoid “benchmark noise” excuses).
 
 ### 13.7 Formalization Hooks: TLA+ Export + Distributed Sheaf Checks

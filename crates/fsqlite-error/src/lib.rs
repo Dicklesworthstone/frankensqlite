@@ -201,6 +201,10 @@ pub enum FrankenError {
     #[error("internal error: {0}")]
     Internal(String),
 
+    /// Operation is not supported by the current backend or configuration.
+    #[error("unsupported operation")]
+    Unsupported,
+
     /// Feature not yet implemented.
     #[error("not implemented: {0}")]
     NotImplemented(String),

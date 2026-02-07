@@ -543,23 +543,27 @@ Let us multiply 0xA3 (163 decimal) by 0x47 (71 decimal) step by step.
 ```
 Step 1: Look up logarithms
     0xA3 = x^7 + x^5 + x + 1
-    Using the OCT_LOG table (computed from g = 2):
-    OCT_LOG[0xA3] = 146
-    OCT_LOG[0x47] = 63
+    Using the OCT_LOG table (computed from g = 2, p(x) = 0x11D):
+    OCT_LOG[0xA3] = 91     (i.e., 2^91 mod p(x) = 0xA3)
+    OCT_LOG[0x47] = 253    (i.e., 2^253 mod p(x) = 0x47)
 
-Step 2: Add logarithms
-    146 + 63 = 209
+Step 2: Add logarithms (modulo 255, since the multiplicative group has order 255)
+    91 + 253 = 344
+    344 mod 255 = 89
 
 Step 3: Look up exponential
-    OCT_EXP[209] = 0x8E   (this is g^209 mod p(x))
+    OCT_EXP[89] = 0xE1   (this is g^89 mod p(x))
 
 Step 4: Result
-    0xA3 * 0x47 = 0x8E   (142 decimal)
+    0xA3 * 0x47 = 0xE1   (225 decimal)
 ```
 
-Verification: 0x8E = x^7 + x^3 + x^2 + x. We can confirm by directly
+Verification: 0xE1 = x^7 + x^6 + x^5 + 1. We can confirm by directly
 multiplying the polynomials (x^7 + x^5 + x + 1)(x^6 + x^2 + x + 1) modulo
 p(x) = x^8 + x^4 + x^3 + x^2 + 1, and reducing modulo 2 in each coefficient.
+The unreduced product x^13 + x^11 + x^9 + x^8 + x^7 + x^5 + x^3 + 1 reduces
+to x^7 + x^6 + x^5 + 1 after substituting x^8 ≡ x^4 + x^3 + x^2 + 1 and
+collapsing terms mod 2.
 
 **Bulk Multiplication Tables (MUL_TABLES)**
 
@@ -2457,6 +2461,53 @@ To check whether two replicas share the same commit history prefix:
   `k` such that `marker_id(seq=k)` matches on both replicas. This yields the
   greatest-common-prefix commit in `O(log N)` marker reads without scanning.
 
+**Optional (recommended for distributed replication): Merkle Mountain Range (MMR)**
+
+The hash chain (`prev_marker_id`) is tamper-evident, but it only supports
+efficient verification in one direction:
+- verifying a *specific* marker requires either trusting the local marker stream,
+  or scanning backward to a trusted anchor (O(length)).
+
+For replication and audit, we want **small proofs**:
+- "marker at commit_seq = k is in the history" (inclusion proof)
+- "these replicas share the same prefix up to k" (prefix proof)
+
+Use a **Merkle Mountain Range** (MMR) over the marker stream. This is an
+append-only Merkle accumulator that supports O(log N) proofs without rewriting
+history.
+
+**Leaf hash (normative if MMR enabled):**
+
+```
+leaf_hash(seq=k) = BLAKE3_256( "fsqlite:mmr:leaf:v1"
+                               || le_u64(commit_seq)
+                               || marker_id )
+```
+
+**Node hash (normative if MMR enabled):**
+
+```
+node_hash = BLAKE3_256( "fsqlite:mmr:node:v1" || left || right )
+```
+
+**MMR state:**
+- Maintain MMR peaks for the current marker stream tip.
+- Persist periodic `MMRCheckpoint` objects (e.g., every 1,048,576 markers) that
+  store:
+  - `n_leaves` (= latest_commit_seq + 1 if commit_seq is 0-based dense),
+  - `peaks[]`,
+  - `bagged_root = BLAKE3_256("fsqlite:mmr:bag:v1" || peaks concatenated)`
+
+**Replication use:**
+- Replicas exchange `(latest_commit_seq, latest_marker_id, bagged_root)`.
+- If `bagged_root` matches at the same `n_leaves`, the histories are identical
+  without any further reads.
+- Otherwise, replicas can request inclusion/prefix proofs to identify the
+  greatest common prefix without scanning the marker stream.
+
+MMR is optional in V1; when disabled, the hash chain + binary search remains
+the default divergence check.
+
 #### 3.5.5 RootManifest: Bootstrap
 
 The RootManifest is the bootstrap entry point, stored as a standard ECS object.
@@ -2545,9 +2596,30 @@ policy (K/R), and repair story.
 | Subsystem | Transport Primitive | Notes |
 |-----------|-------------------|-------|
 | Symbol streaming | `SymbolSink`/`SymbolStream` | Symbol-native, not file-native |
-| Anti-entropy | ObjectId set reconciliation | "Which ObjectIds do you have?" + "Send any symbols" |
+| Anti-entropy | ObjectId set reconciliation (IBLT) | O(Δ) reconciliation of ObjectId sets; fallback to segment hash scan |
 | Bootstrap | `CheckpointChunk` symbol streaming | Late-join = collect K symbols |
 | Multipath | `MultipathAggregator` | Any K symbols from any path suffice |
+
+**Anti-entropy via IBLT (recommended):**
+
+Naive set reconciliation ("send me your ObjectIds") is O(|A|) bandwidth and
+often dominates catch-up cost. Use an **Invertible Bloom Lookup Table (IBLT)**
+to reconcile the symmetric difference in O(Δ) where Δ = |A Δ B|.
+
+Protocol sketch:
+
+1. Replica A builds an IBLT over its ObjectId set in the reconciliation scope
+   (e.g., "all objects reachable since checkpoint C", or "all objects in marker
+   segments [S..tip]").
+2. A sends the IBLT to replica B.
+3. B subtracts its own ObjectIds from the received IBLT and attempts to peel
+   (decode) the remaining cells.
+4. On success, B obtains the missing ObjectIds and requests any needed symbols.
+5. If peeling fails (Δ larger than configured capacity), B requests a larger
+   IBLT (or falls back to a segment-hash scan).
+
+This is correctness-preserving: failure to peel is not silent; it simply
+degrades to a slower fallback.
 
 **Observability plane (alien-artifact explainability):**
 
@@ -3180,6 +3252,32 @@ Under H_0, `E[X_t] = p_0`, so `E[E_t | E_{t-1}] = E_{t-1}` (martingale).
 Under the alternative H_1 (actual violation rate `p_1 > p_0`), the e-process
 grows exponentially at rate `KL(p_1 || p_0)` per observation, where KL is the
 Kullback-Leibler divergence.
+
+**Alien-artifact upgrade (recommended): Mixture e-processes (no hand-tuned λ)**
+
+The fixed-λ betting martingale is valid but brittle: power depends strongly on
+choosing λ well, and we generally do not know the true violation rate `p_1`
+ahead of time.
+
+Key fact: any **nonnegative mixture** of valid e-processes is itself a valid
+e-process (by linearity of expectation). Therefore we can run a small grid of
+λ strategies in parallel and sum them:
+
+```
+E_mix(t) := Σ_j w_j * E_{λ_j}(t),   w_j >= 0, Σ_j w_j = 1
+```
+
+where each `E_{λ_j}` updates as `E_t = E_{t-1} * (1 + λ_j (X_t - p0))`.
+
+**Practical implementation (normative guidance):**
+- Choose `λ_j` on a log grid spanning "sensitive to rare violations" → "sensitive
+  to frequent violations" (e.g., 16–64 values).
+- Maintain `log(E_{λ_j})` and compute the mixture in log-space (log-sum-exp) for
+  numerical stability.
+- Alarm when `E_mix(t) >= 1/alpha` (same Ville guarantee; optional stopping safe).
+
+This gives near-oracle power across a wide range of `p_1` without per-invariant
+hand-tuning, while preserving the same statistical guarantee under H0.
 
 **Multiple invariants (family-wise error control):**
 
@@ -4173,6 +4271,70 @@ EvidenceEntry := {
   and any commit abort due to FCW/SSI/merge.
 - **Production:** evidence ledger SHOULD be sampleable and gated (PRAGMA or
   env). It MUST NOT impose unbounded overhead or allocate on hot paths.
+
+### 4.17 Policy Controller (Expected Loss + Anytime-Valid Guardrails + BOCPD)
+
+Many parameters in FrankenSQLite are **policies**, not correctness axioms:
+redundancy overhead, checkpoint cadence, background compaction rate limits,
+busy timeouts, and which SAFE merge rungs are worth attempting under budget.
+Hard-coded thresholds are brittle because workloads and environments shift.
+
+FrankenSQLite therefore defines an optional but recommended `PolicyController`
+service that tunes *non-correctness* knobs using principled math, with explicit
+guarantees and explainability.
+
+**Non-negotiable safety rule:** `PolicyController` MUST NOT change correctness
+semantics (e.g., isolation level, enabling LAB_UNSAFE merges, bypassing
+invariant checks). It only tunes performance/reliability knobs within the
+pre-defined safe envelope.
+
+**Inputs (normative):**
+- **Anytime-valid monitors (e-processes):** guardrail budgets on failure/violation
+  rates under optional stopping (§4.3).
+- **Conformal budgets:** distribution-free performance bounds over oracle reports
+  across seeds (§4.7).
+- **Regime detection (BOCPD):** change-point posterior for workload/health streams
+  (§4.8).
+- **Local telemetry:** latency histograms, queue depths, symbol fetch success,
+  merge accept/reject counts, etc. (All telemetry is advisory; correctness never
+  depends on it.)
+
+**Decision rule (normative): expected loss minimization**
+
+For each policy knob `k`, define a finite action set `A_k` (candidate settings)
+and a loss matrix `L(a, state)` reflecting asymmetric costs (e.g., data loss risk
+is vastly more expensive than extra redundancy bytes). The controller chooses:
+
+```
+a* = argmin_{a in A_k}  E[ L(a, state) | evidence ]
+```
+
+where `evidence` is the current monitor state (e-process trajectories, conformal
+alerts, BOCPD regime posterior, telemetry).
+
+**Guardrails (normative):**
+- The controller MUST NOT take an action that violates an active e-process budget.
+  Example: decreasing `raptorq_overhead` is forbidden while the symbol-loss
+  monitor rejects `H0: p <= p_budget` (§3.5.3).
+- If BOCPD detects a regime shift with posterior `P(change) > threshold`, the
+  controller MAY retune action sets and priors, but it MUST emit an evidence
+  ledger entry describing the change-point and the new policy choice (§4.16.1).
+
+**Explainability (required):**
+
+Every automatic policy change MUST emit an evidence ledger entry that includes:
+- the knob name and prior setting,
+- the candidate actions evaluated,
+- the expected loss for each candidate,
+- the winning action and the top contributing evidence (e.g., e-value threshold
+  crossing, change-point posterior spike, conformal alert).
+
+**Determinism (required in lab):**
+
+Under `LabRuntime`, `PolicyController` decisions MUST be deterministic for a
+given trace + seed: no dependence on wall-clock, hash randomization, or
+unordered iteration. Any randomization MUST be explicit, seeded, and recorded
+in the evidence ledger.
 
 ## 5. MVCC Formal Model (Revised)
 
@@ -6775,7 +6937,47 @@ IntentOp := {
   // The schema epoch captured at transaction begin. This prevents replaying
   // semantic intents against a different schema/physical layout.
   schema_epoch: u64,
+
+  // A semantic footprint for this intent op, used to justify (or forbid)
+  // deterministic rebase / merge by construction.
+  footprint: IntentFootprint,
+
   op: IntentOpKind,
+}
+
+IntentFootprint := {
+  // Semantic reads that the correctness of this op depends on (e.g., predicate
+  // reads, uniqueness checks). Structural reads (B-tree descent, page layout)
+  // do not belong here; those are accounted for by `structural` (below).
+  reads : Vec<SemanticKeyRef>,
+
+  // Semantic writes performed by this op (the logical keys it creates/updates/deletes).
+  writes: Vec<SemanticKeyRef>,
+
+  // Structural side-effects that make the op non-commutative (split/merge/overflow/freelist).
+  structural: StructuralEffects,
+}
+
+SemanticKeyRef := {
+  // Stable identifier of the logical object being accessed.
+  btree: { TableId | IndexId },
+  kind : { TableRow, IndexEntry },
+
+  // 128-bit stable digest of the key bytes with domain separation:
+  // key_digest = Trunc128(BLAKE3("fsqlite:btree:key:v1" || kind || btree_id || canonical_key_bytes))
+  key_digest: [u8; 16],
+}
+
+StructuralEffects := bitflags {
+  NONE               = 0,
+  PAGE_SPLIT         = 1 << 0,
+  PAGE_MERGE         = 1 << 1,
+  BALANCE_MULTI_PAGE = 1 << 2,
+  OVERFLOW_ALLOC     = 1 << 3,
+  OVERFLOW_MUTATE    = 1 << 4,
+  FREELIST_MUTATE    = 1 << 5,
+  POINTER_MAP_MUTATE = 1 << 6,
+  DEFRAG_MOVE_CELLS  = 1 << 7,
 }
 
 IntentOpKind ::=
@@ -6812,13 +7014,15 @@ updated since its snapshot, we attempt **deterministic rebase**:
 5. **If replay fails** (true conflict, constraint violation): abort/retry.
 
 **Safety Constraint (Read-Dependency Check):** Rebase MUST NOT proceed if the
-transaction has any SSI read-dependency on the page/key being modified, UNLESS
-the `IntentOp` is explicitly marked as "independent of read state" (V1 does not
-support this marking). Replaying a write that depended on a previous read
-against a *different* base version creates a Lost Update (Write Skew).
+transaction has any SSI read-dependency on the page/key being modified, or if
+any `IntentOp.footprint.reads` is non-empty. Replaying a write that depended on
+a previous read against a *different* base version creates a Lost Update (Write
+Skew).
 
 **Limitation (Blind Writes):** Consequently, V1 rebase is strictly limited to
-**pure blind writes** where the transaction did not read the target page/row.
+**pure blind writes** where the transaction performed no semantic reads
+(`IntentOp.footprint.reads` is empty) and did not trigger structural side-effects
+(`IntentOp.footprint.structural == NONE`).
 Arithmetic read-modify-write operations (e.g., `SET c = c + 1`) or conditional
 updates based on read values cannot be merged. Future work may add
 `IntentOp::UpdateExpression` to enable AST-based merge logic that re-evaluates
@@ -6865,6 +7069,20 @@ are keyed by stable identifiers rather than physical offsets.
 MUST be implemented as `parse -> merge -> repack` (deterministic). It MUST NOT be
 implemented as "apply two byte patches to the same base page", even when the
 byte ranges appear disjoint.
+
+**Lens law (normative):** Let `parse_k` / `repack_k` be the parser and canonical
+repacker for SQLite page kind `k` (e.g., B-tree leaf table). SAFE physical merge
+MUST operate on the parsed object:
+
+```
+obj_base = parse_k(bytes_base)
+obj'     = merge_obj(obj_base, patch_a, patch_b, ...)   // semantic keys, not offsets
+bytes'   = repack_k(obj')                               // canonical layout
+```
+
+The repacker MUST be canonical: `repack_k(parse_k(bytes))` yields a canonical
+layout that is stable across processes and replays for equivalent semantic
+content (no "layout by chance").
 
 In SAFE mode, `StructuredPagePatch` for B-tree leaf pages MUST contain only
 semantic cell operations (`cell_ops` keyed by `cell_key_digest`). Header and
@@ -6946,6 +7164,116 @@ Storing full page images per version is not acceptable long-term:
 
 This is how MVCC avoids eating memory under real write concurrency.
 
+#### 5.10.7 Intent Footprints and Commutativity (Trace-Normalized Merge)
+
+The merge ladder (§5.10.4) is safe only when it preserves a **semantic
+serialization order**. The key mechanism is `IntentOp.footprint`
+(`IntentFootprint`, §5.10.1): merges are permitted only when the engine can
+prove (by construction) that the involved intents **commute**.
+
+We make "commute" concrete via a trace-monoid independence relation (see the
+formal definition of trace monoids and Foata normal form in §4.4).
+
+**Independence relation on intents (normative):**
+
+Two intent ops `a, b` are independent (written `(a, b) in I_intent`) iff:
+
+- `a.schema_epoch == b.schema_epoch`, and
+- `a.footprint.structural == NONE` and `b.footprint.structural == NONE`, and
+- `Writes(a) ∩ Writes(b) = ∅`, and
+- `Writes(a) ∩ Reads(b) = ∅` and `Writes(b) ∩ Reads(a) = ∅`.
+
+For V1 SAFE merges, an additional restriction applies:
+- `Reads(a)` and `Reads(b)` MUST both be empty (pure blind writes).
+
+Here `Reads(x)` and `Writes(x)` refer to the sets of `SemanticKeyRef` in
+`x.footprint`.
+
+**Canonical merge order (normative):**
+
+When a merge is allowed, the engine MUST execute it using a deterministic normal
+form derived from the trace monoid:
+
+- Define `Sigma_intent` as the alphabet of intent ops (identified by stable
+  `op_digest := Trunc128(BLAKE3("fsqlite:intent:v1" || canonical_intent_bytes))`).
+- Order independent ops using the Foata normal form layering; within each layer,
+  sort stably by `(btree_id, kind, key_digest, op_kind, op_digest)`.
+
+This is the *exact* order that must be recorded in the merge certificate
+(§5.10.8).
+
+**V1 mergeable intent classes (normative):**
+
+V1 SAFE merging is deliberately narrow. A merge attempt MUST reject unless all
+involved intents are from this set:
+
+- `Insert/Delete/Update` on table B-tree leaf pages for distinct `RowId` keys,
+  with no overflow and no multi-page balance.
+- `IndexInsert/IndexDelete` on index B-tree leaf pages for distinct index keys,
+  with no overflow and no multi-page balance.
+
+Any op with `footprint.structural != NONE` MUST be treated as non-commutative
+and MUST not be merged; abort/retry is the only safe path in V1.
+
+**Key identity alignment (required):**
+
+`StructuredPagePatch.cell_ops[*].cell_key_digest` MUST be derived from the same
+domain-separated semantic key digest as `SemanticKeyRef.key_digest`. The merge
+machinery MUST NOT treat physical offsets as identity.
+
+#### 5.10.8 Merge Certificates (Proof-Carrying Merge)
+
+Any commit that is accepted via a merge path (deterministic rebase §5.10.2 and/or
+structured patch merge §5.10.3) MUST produce a verifiable **MergeCertificate**
+and MUST attach it to the commit's proof payload:
+
+- **Native mode:** `CommitProof` MUST include the certificate (referenced by the
+  marker record as `proof_object_id`; §3.5.4.1).
+- **Compatibility mode:** the certificate MUST be emitted to the evidence ledger
+  (§4.16.1) and MUST be available to the harness; implementations MAY persist
+  it to a sidecar for forensic replay.
+
+**MergeCertificate schema (normative):**
+
+```text
+MergeCertificate := {
+  merge_kind        : { rebase, structured_patch, rebase+patch },
+  base_commit_seq   : u64,
+  schema_epoch      : u64,
+  pages             : Vec<PageNumber>,
+  intent_op_digests : Vec<[u8;16]>,          -- op digests involved in the merge
+  footprint_digest  : [u8;16],               -- digest over all IntentFootprints
+  normal_form       : Vec<[u8;16]>,          -- op digests in canonical order used
+  post_state        : {
+    page_hashes          : Vec<(PageNumber, [u8;16])>,  -- hash of repacked bytes
+    btree_invariant_hash : [u8;16],
+  },
+  verifier_version  : u32,
+}
+```
+
+**Verification (normative):**
+
+Given `(base snapshot, intents, certificate)`, a verifier MUST be able to:
+
+1. Recompute all `op_digest` values from canonical intent encodings.
+2. Recompute `footprint_digest` from the included `IntentFootprint` values.
+3. Check that the `normal_form` is a valid trace-monoid normal form under
+   `I_intent` (§5.10.7) for the involved intents.
+4. Re-execute `parse -> merge -> repack` for affected pages and re-run B-tree
+   invariants; compare `page_hashes` and `btree_invariant_hash`.
+
+**Circuit breaker (normative):**
+
+If any merge verification fails, the system MUST treat it as a correctness
+incident. In production, the engine MUST:
+
+- disable SAFE merging for the current database epoch (`PRAGMA fsqlite.write_merge = OFF`),
+- emit an evidence ledger entry with the failing check and the certificate id,
+- escalate supervision for the component that produced the certificate (§4.14).
+
+In lab mode, it MUST fail fast (test failure).
+
 ---
 
 ## 6. Buffer Pool: ARC Cache
@@ -6955,13 +7283,15 @@ This is how MVCC avoids eating memory under real write concurrency.
 LRU fails catastrophically for database workloads: a single table scan evicts
 the entire working set. ARC (Adaptive Replacement Cache, Megiddo & Modha,
 FAST '03) auto-tunes between recency and frequency. The original paper proves
-that ARC(2c) contains both LRU(c) and LFU(c) as special cases, and dominates
-LRU across all tested workloads. (The competitive ratio of 2 against OPT is
-the Sleator-Tarjan result for LRU, not ARC; ARC's theoretical contribution is
+that ARC's 2c-entry directory always contains the c pages LRU(c) would retain,
+and that ARC self-tunes to capture both recency and frequency. It dominates
+LRU across all tested workloads. (The Sleator-Tarjan competitive ratio for any deterministic paging algorithm
+including LRU is k — the cache size — not 2. ARC's theoretical contribution is
 adaptive self-tuning, not a tighter worst-case bound.)
 
-**Patent note:** The ARC patent (US 6981114) has expired, so implementing ARC
-and its practical variants (e.g., CAR) is legally safe.
+**Patent note:** The ARC patent (US 6,996,676 B2, Megiddo & Modha, filed 2002,
+expired Feb 2024) has expired, so implementing ARC and its practical variants
+(e.g., CAR) is legally safe.
 
 ARC's advantage over LRU is not marginal -- it is structural. Consider three
 canonical database access patterns:
@@ -7012,7 +7342,7 @@ pub struct CachedPage {
 /// IMPLEMENTATION NOTE (Extreme Optimization Discipline):
 /// The Megiddo & Modha (FAST '03) ARC algorithm is specified here as the
 /// logical model. The PHYSICAL implementation SHOULD use the CAR (Clock
-/// with Adaptive Replacement) variant from the same authors (FAST '04),
+/// with Adaptive Replacement) variant by Bansal & Modha (FAST '04),
 /// which replaces the four LinkedHashMaps with two circular clock buffers
 /// and two ghost hash sets:
 ///
@@ -7027,8 +7357,8 @@ pub struct CachedPage {
 ///   - Every ARC operation (insert, promote, evict) mutates linked list
 ///     pointers scattered across heap — L1/L2 cache pollution.
 ///   - CAR's clock hand sweep is a sequential scan over a dense array —
-///     the CPU prefetcher handles it. Hit rate is identical to ARC
-///     (proven in the FAST '04 paper).
+///     the CPU prefetcher handles it. Hit rate is comparable to ARC
+///     (shown empirically in the FAST '04 paper across all tested workloads).
 ///   - Arc<CachedPage> indirection adds another pointer chase. Instead,
 ///     use inline CachedPage in the clock array with a pinned flag.
 ///     Pinned pages are simply skipped by the clock hand (not removed
@@ -7072,7 +7402,7 @@ pub struct ArcCache {
 
 **Eviction constraints:**
 1. Never evict a pinned page (`ref_count > 0`)
-2. Never evict a dirty page (must flush to WAL first)
+2. Never evict a dirty page without flushing it to the WAL first
 3. Prefer superseded versions (newer committed version exists and is visible
    to all active snapshots)
 
@@ -7235,10 +7565,11 @@ REQUEST(cache, key: CacheKey) -> Result<Arc<CachedPage>>:
 ```
 
 **Complexity:** Each cache operation is O(1) amortized. Ghost lists consume
-12 bytes per CacheKey (`PageNumber`: 4B + `CommitSeq`: 8B) plus container
-overhead (hash table bucket pointer + linked list links ≈ 24 bytes per entry
-in a `LinkedHashSet`). At `capacity` entries each: 2000 entries × ~36 bytes
-= ~72 KB total ghost list overhead — still negligible compared to page data
+16 bytes per CacheKey (`PageNumber`: 4B + 4B alignment padding + `CommitSeq`:
+8B) plus container overhead (hash table bucket pointer + linked list links ≈
+24 bytes per entry in a `LinkedHashSet`). At `capacity` entries **each** (B1
+and B2): 2 × 2000 entries × ~40 bytes = ~160 KB total ghost list overhead —
+still negligible compared to page data
 (~8 MiB for a 2000-page cache).
 
 ### 6.5 MVCC Adaptation: (PageNumber, CommitSeq) Keying with Ghost Lists
@@ -7513,8 +7844,8 @@ FrankenSQLite writes WAL files using native byte order for performance.
 
 **Cumulative chaining:** Each frame's checksum chains from the previous:
 ```
-WAL header checksum = wal_checksum(header[0..24], 0, 0, big_end_cksum)
-Frame 0 checksum = wal_checksum(frame0_hdr[0..8] ++ page0_data, hdr_s1, hdr_s2, big_end_cksum)
+WAL header checksum: (hdr_cksum1, hdr_cksum2) = wal_checksum(header[0..24], 0, 0, big_end_cksum)
+Frame 0 checksum = wal_checksum(frame0_hdr[0..8] ++ page0_data, hdr_cksum1, hdr_cksum2, big_end_cksum)
 Frame N checksum = wal_checksum(frameN_hdr[0..8] ++ pageN_data, s1_{N-1}, s2_{N-1}, big_end_cksum)
 ```
 
@@ -9498,9 +9829,12 @@ can satisfy it:
 - LIKE (`col LIKE 'prefix%'`): usable if prefix is constant.
 
 **Join ordering:** For N tables:
-- N <= 6: exhaustive search of all N! orderings (at most 720).
-- N > 6: greedy algorithm -- at each step, add the table that has the lowest
+- N <= 8: exhaustive search of all N! orderings (at most 40,320).
+- N > 8: greedy algorithm -- at each step, add the table that has the lowest
   estimated join cost with the already-joined set.
+(Note: C SQLite's NGQP uses a more sophisticated backtracking algorithm that
+handles up to ~10 tables optimally with pruning. The simpler exhaustive/greedy
+split here is FrankenSQLite's initial implementation strategy.)
 
 ### 10.6 Code Generation
 
@@ -9509,7 +9843,7 @@ can satisfy it:
 SELECT col FROM table WHERE rowid = ?
   Init       0, <end>
   Transaction 0, 0           # begin read transaction
-  Integer    <bind>, 1       # load parameter into r1
+  Variable   1, 1            # load bind parameter ?1 into r1
   OpenRead   0, <root>, 0    # open cursor 0 on table
   SeekRowid  0, <notfound>, 1  # seek to rowid in r1
   Column     0, <col_idx>, 2   # extract column into r2
@@ -9632,7 +9966,7 @@ Offset  Size  Field                    Valid Values              FrankenSQLite D
  36       4   Total freelist pages     count                     0
  40       4   Schema cookie            any u32                   Incremented on schema change
  44       4   Schema format number     1,2,3,4                   4 (current)
- 48       4   Default cache size       PRAGMA default_cache_size  0 (use runtime default)
+ 48       4   Suggested cache size     PRAGMA default_cache_size  0 (use runtime default)
  52       4   Largest root b-tree page 0 or page# (auto-vacuum)  0
  56       4   Text encoding            1=UTF8, 2=UTF16le,        1 (UTF-8)
                                        3=UTF16be
@@ -9913,10 +10247,10 @@ and frame sequence.
 **Checksum chain:**
 1. **WAL header checksum:** `wal_checksum(header_bytes[0..24], 0, 0, big_end_cksum)` →
    stored at header bytes 24..32.
-2. **First frame:** `wal_checksum(frame_header[0..8] ++ page_data, hdr_s0, hdr_s1, big_end_cksum)`
+2. **First frame:** `wal_checksum(frame_header[0..8] ++ page_data, hdr_cksum1, hdr_cksum2, big_end_cksum)`
    → stored at frame header bytes 16..24. (Note: only the first 8 bytes of
    the frame header are checksummed, NOT bytes 8..16 which contain the salt.)
-3. **Subsequent frames:** use the previous frame's `(s0, s1)` as the seed.
+3. **Subsequent frames:** use the previous frame's `(cksum1, cksum2)` as the seed.
    Each frame's checksum covers itself AND all prior frames (cumulative).
 
 **Validation:** During recovery, walk frames sequentially. A frame is valid iff
@@ -10714,7 +11048,7 @@ printf with format specifiers:
 - `%Q` -- like %q but wraps in single quotes, NULL renders as `NULL` (unquoted)
 - `%w` -- like %q but wraps in double quotes (for identifiers)
 - `%c` -- character from integer code point
-- `%n` -- length of string so far (written to argument, not output)
+- `%n` -- no-op (deliberately disabled for security; does NOT write to memory)
 - `%z` -- same as %s (compatibility)
 - `%%` -- literal percent sign
 Width, precision, and flag modifiers (`-`, `+`, ` `, `0`) are supported.
@@ -10724,11 +11058,15 @@ Width, precision, and flag modifiers (`-`, `+`, ` `, `0`) are supported.
 character classes. This is the function form of the `GLOB` operator.
 
 **hex(X)** -> text. Returns the hexadecimal rendering of X. If X is a blob,
-each byte becomes two hex characters. If X is a number or text, it is first
-converted to its blob representation.
+each byte becomes two hex characters. If X is text, the UTF-8 bytes are
+rendered. If X is a number, it is first converted to its UTF-8 text
+representation, then those bytes are hex-encoded (NOT the raw IEEE-754 bits).
 
-**iif(COND, X, Y)** -> any. Equivalent to `CASE WHEN COND THEN X ELSE Y END`.
-Short-circuits evaluation.
+**iif(B1, V1 [, B2, V2, ...] [, ELSE])** -> any. Three-argument form is
+equivalent to `CASE WHEN B1 THEN V1 ELSE ELSE END`. Multi-condition form
+(SQLite 3.49+) evaluates B1, B2, ... in order, returning the first Vn where
+Bn is true. Short-circuits evaluation. **`if()`** is an alias (SQLite 3.48+).
+Two-argument `iif(COND, X)` returns NULL when COND is false (SQLite 3.48+).
 
 **ifnull(X, Y)** -> any. Returns X if X is not NULL, otherwise Y.
 Equivalent to `coalesce(X, Y)`.
@@ -10794,7 +11132,8 @@ Uses a PRNG seeded from the system entropy source at connection open.
 If Y is empty string, returns X unchanged.
 
 **round(X [, N])** -> real. Rounds X to N decimal places (default 0).
-Uses banker's rounding (round half to even) for exact halfway cases.
+Uses round half away from zero (e.g., round(2.5) = 3.0, round(-2.5) = -3.0).
+This is NOT banker's rounding.
 
 **sign(X)** -> integer. Returns -1, 0, or +1 for negative, zero, or
 positive X. Returns NULL for NULL. Returns NULL for non-numeric strings.
@@ -10867,7 +11206,7 @@ sqrt of negative), the behavior depends on the function.
 **pi()** -> real. Returns 3.141592653589793.
 **pow(X, Y)** / **power(X, Y)** -> real. X raised to the power Y.
 **radians(X)** -> real. Converts degrees to radians.
-**sign(X)** -> integer. -1, 0, or +1 (also listed in core scalars).
+**(sign(X) is a core scalar, not a math function -- see §13.1.)**
 **sin(X)** -> real. Sine (X in radians).
 **sinh(X)** -> real. Hyperbolic sine.
 **sqrt(X)** -> real. Square root. Returns NULL for negative X.
@@ -10928,20 +11267,38 @@ Internally accumulates sum and count separately to avoid precision loss.
 **group_concat(X [, SEP])** -> text. Concatenates non-NULL values with
 separator (default `,`). Order is arbitrary unless the SELECT has ORDER BY.
 
-**string_agg(X, SEP)** -> text (SQLite 3.44+). Same as group_concat but
-with guaranteed argument order matching SQL standard.
+**string_agg(X, SEP)** -> text (SQLite 3.44+). Alias for `group_concat(X, SEP)`.
+Concatenation order is arbitrary unless an ORDER BY clause is used (same as
+group_concat). Added for SQL standard naming compatibility.
 
 **max(X)** -> any. Returns maximum non-NULL value. For aggregate use
 (single argument).
 
 **min(X)** -> any. Returns minimum non-NULL value.
 
-**sum(X)** -> integer or real. Sum of non-NULL values. Returns integer 0
-for empty set. Raises an integer overflow error if the sum exceeds i64 range.
+**sum(X)** -> integer or real. Sum of non-NULL values. Returns **NULL** for
+empty set (use `total()` for a guaranteed non-NULL 0.0 result). Raises an
+integer overflow error if the sum exceeds i64 range.
 
 **total(X)** -> real. Always returns a float (0.0 for empty set). Never
 overflows (uses double precision). Use `total()` instead of `sum()` when
 you need a guaranteed non-NULL result.
+
+**median(X)** -> real (SQLite 3.51+, requires SQLITE_ENABLE_PERCENTILE which
+is enabled by default in amalgamation builds since 3.51.0). Equivalent to
+`percentile_cont(X, 0.5)`. Returns the interpolated median of non-NULL values.
+
+**percentile(Y, P)** -> real (SQLite 3.51+). Returns the P-th percentile of
+non-NULL values in Y, where P is a percentage in the range 0.0 to 100.0.
+Uses linear interpolation between adjacent values.
+
+**percentile_cont(Y, P)** -> real (SQLite 3.51+). Continuous percentile per
+SQL standard. P is a fraction in the range 0.0 to 1.0. Interpolates between
+adjacent input values.
+
+**percentile_disc(Y, P)** -> any (SQLite 3.51+). Discrete percentile per SQL
+standard. P is a fraction in the range 0.0 to 1.0. Returns an actual input
+value (no interpolation).
 
 ### 13.5 Window Functions
 
@@ -10960,8 +11317,10 @@ the previous rank + 1.
 **percent_rank()** -> real. `(rank - 1) / (partition_rows - 1)`. Returns
 0.0 for partitions with one row.
 
-**cume_dist()** -> real. Cumulative distribution: fraction of rows with
-values <= the current row's value.
+**cume_dist()** -> real. Cumulative distribution: `row_number / partition_rows`
+where `row_number` is the row_number() of the **last peer** in the current
+peer group. All rows with the same ORDER BY value get the same cume_dist.
+For partition [1,2,2,3]: cume_dist values are 0.25, 0.75, 0.75, 1.0.
 
 **ntile(N)** -> integer. Distributes rows into N roughly equal groups,
 numbered 1 through N.
@@ -11023,12 +11382,12 @@ every function call.
 **json(X)** -> text. Validates and minifies JSON text X. **Throws an error**
 (not NULL) if X is not well-formed JSON or JSONB. Converts JSONB to text JSON.
 
-**json_valid(X [, FLAGS])** -> integer. Returns 1 if X is well-formed JSON
-(or JSONB if FLAGS=2), 0 otherwise. FLAGS bitmask (SQLite 3.45+):
-- 0x01: Accept JSON text
-- 0x02: Accept JSONB
-- 0x04: Accept JSON5 extensions
-- 0x08: Require that X is a JSON object or array (not a primitive)
+**json_valid(X [, FLAGS])** -> integer. Returns 1 if X is well-formed according
+to FLAGS, 0 otherwise. FLAGS bitmask (SQLite 3.45+, default 0x01):
+- 0x01: Accept RFC-8259 canonical JSON text
+- 0x02: Accept JSON5 text extensions
+- 0x04: Accept JSONB blob (superficial check)
+- 0x08: Accept JSONB blob (strict format verification)
 
 **json_type(X [, PATH])** -> text. Returns the type of the JSON value at
 PATH as one of: `"null"`, `"true"`, `"false"`, `"integer"`, `"real"`,
@@ -11072,6 +11431,30 @@ NULL becomes JSON `null`, blob becomes JSON text via hex encoding.
 
 **json_object(KEY, VALUE, ...)** -> text. Returns a JSON object. Arguments
 are key/value pairs. Keys must be text.
+
+**jsonb(X)** -> blob. Converts JSON text X to the JSONB binary format.
+Throws an error if X is not well-formed JSON. The inverse of `json(X)`.
+
+**json_array_length(X [, PATH])** -> integer. Returns the number of elements
+in the JSON array X (or at PATH within X). Returns 0 for `[]`, NULL if
+X is not an array or PATH does not exist.
+
+**json_error_position(X)** -> integer (SQLite 3.42+). Returns 0 if X is
+well-formed JSON, or the 1-based character position of the first syntax
+error. Useful for diagnosing malformed JSON without a try/catch.
+
+**json_pretty(X [, INDENT])** -> text (SQLite 3.46+). Returns a
+pretty-printed version of JSON text X. INDENT defaults to 4 spaces;
+pass a string to use custom indentation (e.g., `json_pretty(X, char(9))`
+for tabs).
+
+**JSONB variants:** Every JSON1 scalar function that returns JSON text has
+a corresponding `jsonb_*` variant that returns JSONB blob instead:
+`jsonb_extract`, `jsonb_set`, `jsonb_insert`, `jsonb_replace`,
+`jsonb_remove`, `jsonb_patch`, `jsonb_array`, `jsonb_object`,
+`jsonb_group_array`, `jsonb_group_object`. These avoid the
+text→JSONB→text round-trip when the result will be stored or passed to
+another JSON function.
 
 #### 14.1.2 Aggregate Functions
 
@@ -11247,6 +11630,46 @@ manually (using triggers or explicit management).
 **Contentless:** `content=''` stores no content at all. Only the inverted
 index is maintained. `highlight()` and `snippet()` are not available.
 Useful for pure search-and-retrieve-rowid workloads.
+
+**Contentless-delete (SQLite 3.43+):** `content='' content_rowid=id` with
+`contentless_delete=1`. Like contentless but supports DELETE operations,
+maintaining a delete-marker tombstone in the index.
+
+**fts5vocab:** Shadow virtual table for inspecting the FTS5 index vocabulary:
+```sql
+CREATE VIRTUAL TABLE vocab USING fts5vocab(docs, 'row');    -- per-row stats
+CREATE VIRTUAL TABLE vocab USING fts5vocab(docs, 'col');    -- per-column stats
+CREATE VIRTUAL TABLE vocab USING fts5vocab(docs, 'instance'); -- every occurrence
+```
+Columns: `term`, `doc` (document count), `cnt` (total occurrences),
+`col` (column name, for 'col'/'instance' types).
+
+#### 14.2.7 Configuration Options
+
+FTS5 configuration is modified via special INSERT commands:
+
+```sql
+-- Merge control
+INSERT INTO docs(docs) VALUES('merge=500');      -- merge up to 500 pages
+INSERT INTO docs(docs) VALUES('automerge=8');     -- auto-merge threshold (2-16, default 4)
+INSERT INTO docs(docs) VALUES('crisismerge=16');  -- crisis merge threshold (default 2× automerge)
+INSERT INTO docs(docs) VALUES('usermerge=4');     -- manual merge segment count
+
+-- Storage tuning
+INSERT INTO docs(docs) VALUES('pgsz=4096');       -- leaf page size in bytes (default 1000)
+INSERT INTO docs(docs) VALUES('hashsize=131072'); -- hash table size for pending terms (default 1MB)
+
+-- Maintenance
+INSERT INTO docs(docs) VALUES('rebuild');          -- rebuild entire index from content
+INSERT INTO docs(docs) VALUES('optimize');         -- merge all segments into one
+INSERT INTO docs(docs) VALUES('integrity-check'); -- verify index integrity
+INSERT INTO docs(docs) VALUES('delete-all');       -- delete all entries
+```
+
+**secure-delete (SQLite 3.44+):** `INSERT INTO docs(docs) VALUES('secure-delete=1')`
+causes DELETE operations to physically remove content from the index (not just
+mark as deleted), preventing deleted content from appearing in `integrity-check`
+or being recoverable from the database file.
 
 ### 14.3 FTS3/FTS4 (`fsqlite-ext-fts3`)
 
@@ -13394,6 +13817,6 @@ an embedded database engine can achieve.
 
 ---
 
-*Document version: 1.18 (Round 5b audit fixes: rollback journal checksum loop bound corrected (>= 0 → > 0, data[0] never sampled); P_loss table values corrected (were wrong by 2-17 orders of magnitude); database size validity condition added (offset 28 only valid when offset 92 == offset 24); WAL-index SHM native byte order note added; iVersion = 3007000 specified; WalCkptInfo consolidated as 40 bytes; usable_size >= 480 constraint added; fragmented bytes threshold corrected (may not exceed 60); cell format payload comments fixed (reference §11.4 overflow calc); BtreeCursorOps: added &Cx to all methods + first()/last(); VfsFile: added xShmMap/xShmLock/xShmBarrier/xShmUnmap for WAL mode; VirtualTable: added xCreate/xDestroy/xUpdate/xBegin/xSync/xCommit/xRollback/xRename/xSavepoint; CheckpointPageWriter trait definition added; FunctionRegistry: added find_window; Transaction type placement note (circular dependency fix); Phase 9 replication gate added)*
+*Document version: 1.22 (Round 6 audit: json(X) error semantics fixed (throws error not NULL); round() corrected to half-away-from-zero; sum(X) empty-set corrected to NULL; json_valid FLAGS corrected; median/percentile functions added; iif multi-arg + if() alias; string_agg is just alias; cume_dist peer-group semantics; sign(X) core-only; hex(X) clarified; %n no-op; Suggested cache size; VDBE Integer→Variable fix; join threshold harmonized at 8; Sleator-Tarjan ratio corrected to k; ARC patent US 6,996,676; CAR by Bansal&Modha; CAR hit rate comparable not identical; ghost list 4000 entries/16B CacheKey; eviction constraint wording)*
 *Last updated: 2026-02-07*
 *Status: Authoritative Specification*

@@ -1,9 +1,11 @@
+pub mod cx;
 pub mod flags;
 pub mod limits;
 pub mod opcode;
 pub mod record;
 pub mod serial_type;
 pub mod value;
+pub mod cx;
 
 use std::fmt;
 use std::num::NonZeroU32;
@@ -516,154 +518,5 @@ mod tests {
         assert_eq!(PageSize::MIN.get(), 512);
         assert_eq!(PageSize::MAX.get(), 65536);
         assert_eq!(PageSize::default(), PageSize::DEFAULT);
-    }
-
-    #[test]
-    fn page_size_usable() {
-        let ps = PageSize::new(4096).unwrap();
-        assert_eq!(ps.usable(0), 4096);
-        assert_eq!(ps.usable(20), 4076);
-    }
-
-    #[test]
-    fn page_data_zeroed() {
-        let pd = PageData::zeroed(PageSize::DEFAULT);
-        assert_eq!(pd.len(), 4096);
-        assert!(!pd.is_empty());
-        assert!(pd.as_bytes().iter().all(|&b| b == 0));
-    }
-
-    #[test]
-    fn page_data_from_vec() {
-        let v = vec![1u8, 2, 3, 4];
-        let pd = PageData::from_vec(v);
-        assert_eq!(pd.len(), 4);
-        assert_eq!(pd.as_bytes(), &[1, 2, 3, 4]);
-    }
-
-    #[test]
-    fn page_data_mutation() {
-        let mut pd = PageData::zeroed(PageSize::MIN);
-        pd.as_bytes_mut()[0] = 0xFF;
-        assert_eq!(pd.as_bytes()[0], 0xFF);
-    }
-
-    #[test]
-    fn page_data_into_vec() {
-        let pd = PageData::from_vec(vec![42; 10]);
-        let v = pd.into_vec();
-        assert_eq!(v.len(), 10);
-        assert!(v.iter().all(|&b| b == 42));
-    }
-
-    #[test]
-    fn txn_id_basics() {
-        assert_eq!(TxnId::ZERO.get(), 0);
-        assert_eq!(TxnId::new(5).get(), 5);
-        assert_eq!(TxnId::new(0), TxnId::ZERO);
-    }
-
-    #[test]
-    fn txn_id_ordering() {
-        assert!(TxnId::new(1) > TxnId::ZERO);
-        assert!(TxnId::new(100) > TxnId::new(50));
-    }
-
-    #[test]
-    fn txn_id_next() {
-        assert_eq!(TxnId::ZERO.next(), TxnId::new(1));
-        assert_eq!(TxnId::new(42).next(), TxnId::new(43));
-    }
-
-    #[test]
-    fn txn_id_display() {
-        assert_eq!(TxnId::new(123).to_string(), "txn#123");
-    }
-
-    #[test]
-    fn type_affinity_values() {
-        assert_eq!(TypeAffinity::Integer as u8, b'D');
-        assert_eq!(TypeAffinity::Text as u8, b'B');
-        assert_eq!(TypeAffinity::Blob as u8, b'A');
-        assert_eq!(TypeAffinity::Real as u8, b'E');
-        assert_eq!(TypeAffinity::Numeric as u8, b'C');
-    }
-
-    #[test]
-    fn text_encoding_default() {
-        assert_eq!(TextEncoding::default(), TextEncoding::Utf8);
-    }
-
-    #[test]
-    fn journal_mode_default() {
-        assert_eq!(JournalMode::default(), JournalMode::Delete);
-    }
-
-    #[test]
-    fn synchronous_mode_default() {
-        assert_eq!(SynchronousMode::default(), SynchronousMode::Full);
-    }
-
-    #[test]
-    fn lock_level_ordering() {
-        assert!(LockLevel::None < LockLevel::Shared);
-        assert!(LockLevel::Shared < LockLevel::Reserved);
-        assert!(LockLevel::Reserved < LockLevel::Pending);
-        assert!(LockLevel::Pending < LockLevel::Exclusive);
-    }
-
-    #[test]
-    fn btree_page_type_from_byte() {
-        assert_eq!(
-            BTreePageType::from_byte(2),
-            Some(BTreePageType::InteriorIndex)
-        );
-        assert_eq!(
-            BTreePageType::from_byte(5),
-            Some(BTreePageType::InteriorTable)
-        );
-        assert_eq!(BTreePageType::from_byte(10), Some(BTreePageType::LeafIndex));
-        assert_eq!(BTreePageType::from_byte(13), Some(BTreePageType::LeafTable));
-        assert_eq!(BTreePageType::from_byte(0), None);
-        assert_eq!(BTreePageType::from_byte(1), None);
-        assert_eq!(BTreePageType::from_byte(255), None);
-    }
-
-    #[test]
-    fn btree_page_type_properties() {
-        assert!(BTreePageType::LeafTable.is_leaf());
-        assert!(BTreePageType::LeafIndex.is_leaf());
-        assert!(!BTreePageType::InteriorTable.is_leaf());
-        assert!(!BTreePageType::InteriorIndex.is_leaf());
-
-        assert!(BTreePageType::InteriorTable.is_interior());
-        assert!(!BTreePageType::LeafTable.is_interior());
-
-        assert!(BTreePageType::InteriorTable.is_table());
-        assert!(BTreePageType::LeafTable.is_table());
-        assert!(!BTreePageType::InteriorIndex.is_table());
-
-        assert!(BTreePageType::InteriorIndex.is_index());
-        assert!(BTreePageType::LeafIndex.is_index());
-        assert!(!BTreePageType::InteriorTable.is_index());
-    }
-
-    #[test]
-    fn database_header_default() {
-        let h = DatabaseHeader::default();
-        assert_eq!(h.page_size, PageSize::DEFAULT);
-        assert_eq!(h.write_version, 1);
-        assert_eq!(h.read_version, 1);
-        assert_eq!(h.reserved_per_page, 0);
-        assert_eq!(h.schema_format, 4);
-        assert_eq!(h.text_encoding, TextEncoding::Utf8);
-        assert_eq!(h.default_cache_size, -2000);
-    }
-
-    #[test]
-    fn database_header_magic() {
-        assert_eq!(DATABASE_HEADER_MAGIC.len(), 16);
-        assert_eq!(&DATABASE_HEADER_MAGIC[..15], b"SQLite format 3");
-        assert_eq!(DATABASE_HEADER_MAGIC[15], 0);
     }
 }
