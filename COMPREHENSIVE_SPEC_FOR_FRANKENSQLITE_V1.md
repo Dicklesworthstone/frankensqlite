@@ -64,7 +64,7 @@ Pseudocode and type definitions are normative unless explicitly labeled
 | **DecodeProof** | Auditable witness artifact produced by the RaptorQ decoder when repairing or failing to repair (lab/debug). |
 | **Cx** | Capability context (asupersync). Threads cancellation via `is_cancel_requested()` / `checkpoint()`, progress via `checkpoint_with()`, budgets/deadlines via `Budget` and scoped budgets, and type-level restriction via `Cx::restrict::<NewCaps>()`. |
 | **PageNumber** | 1-based `NonZeroU32` identifying a database page. Page 1 is always the database header. |
-| **TxnId** | Monotonically increasing `u64` transaction identifier. `TxnId::ZERO` represents the on-disk baseline. |
+| **TxnId** | Monotonically increasing `u64` transaction begin identifier (allocated at `BEGIN`). `TxnSlot.txn_id = 0` is reserved to mean "free slot", so real TxnIds are non-zero. |
 | **TxnEpoch** | Monotonically increasing `u32` generation counter for a reused TxnSlot (prevents stale slot-id interpretation). |
 | **TxnToken** | Canonical transaction identity for SSI witness plane: `(TxnId, TxnEpoch)`. |
 | **SIREAD witness (legacy term)** | PostgreSQL terminology for SSI read evidence ("SIREAD locks"). In FrankenSQLite this is represented by `ReadWitness` objects plus hot-plane reader bits; it does not block and is not a lock. |
@@ -2888,9 +2888,9 @@ runtime monitoring that can be checked at ANY point during execution, not just
 at the end of a test.
 
 **For MVCC, monitor these invariants as e-processes:**
-- **INV-1 (Monotonicity)**: TxnId is strictly increasing
+- **INV-1 (Monotonicity)**: TxnId (begin ids) and CommitSeq (commit clock) are strictly increasing
 - **INV-2 (Lock Exclusivity)**: No two active transactions hold the same page lock
-- **INV-3 (Version Chain Order)**: Versions are ordered by descending TxnId
+- **INV-3 (Version Chain Order)**: Versions are ordered by descending CommitSeq
 - **INV-4 (Write Set Consistency)**: Write set only contains locked pages
 - **INV-6 (Commit Atomicity)**: Committed transaction's pages all become visible
 
@@ -5785,17 +5785,17 @@ canonical database access patterns:
 
 ### 6.2 MVCC-Aware ARC Data Structures
 
-Standard ARC keys on page number. Our variant keys on `(PageNumber, TxnId)`
+Standard ARC keys on page number. Our variant keys on `(PageNumber, CommitSeq)`
 because multiple versions coexist.
 
 ```rust
 /// Cache key: MVCC-aware page identity.
 /// Multiple versions of the same page coexist when concurrent transactions
-/// hold different snapshots. TxnId::ZERO represents the on-disk baseline.
+/// hold different snapshots. `commit_seq = 0` represents the on-disk baseline.
 #[derive(Clone, Copy, Hash, Eq, PartialEq)]
 pub struct CacheKey {
     pub pgno: PageNumber,
-    pub version_id: TxnId,
+    pub commit_seq: CommitSeq,
 }
 
 /// A cached page with metadata for eviction decisions.
@@ -5937,7 +5937,7 @@ REQUEST(cache, key: CacheKey) -> Result<Arc<CachedPage>>:
     p = min(p + delta, capacity)
     REPLACE(cache, key)
     B1.remove(key)
-    page = fetch_from_storage(key.pgno, key.version_id)
+    page = fetch_from_storage(key.pgno, key.commit_seq)
     T2.push_back(key, page)       // enters T2 (second lifetime access)
     total_bytes += page.byte_size
     page.ref_count.fetch_add(1)
@@ -5950,7 +5950,7 @@ REQUEST(cache, key: CacheKey) -> Result<Arc<CachedPage>>:
     p = max(p.saturating_sub(delta), 0)
     REPLACE(cache, key)
     B2.remove(key)
-    page = fetch_from_storage(key.pgno, key.version_id)
+    page = fetch_from_storage(key.pgno, key.commit_seq)
     T2.push_back(key, page)
     total_bytes += page.byte_size
     page.ref_count.fetch_add(1)
@@ -5973,7 +5973,7 @@ REQUEST(cache, key: CacheKey) -> Result<Arc<CachedPage>>:
     REPLACE(cache, key)
   // else: cache has room, no eviction needed
 
-  page = fetch_from_storage(key.pgno, key.version_id)
+  page = fetch_from_storage(key.pgno, key.commit_seq)
   T1.push_back(key, page)         // new pages always enter T1
   total_bytes += page.byte_size
   page.ref_count.fetch_add(1)
@@ -5994,13 +5994,13 @@ genuinely different access patterns.
 
 **Version coalescing in ghost lists.** Ghost lists may accumulate many entries
 for the same page number with different commit sequence values. To bound ghost list size,
-when the GC horizon advances, prune ghost entries whose version_id is below the
+when the GC horizon advances, prune ghost entries whose commit sequence is below the
 new horizon:
 
 ```
 prune_ghosts(cache, gc_horizon: CommitSeq):
-  B1.retain(|k| k.version_id >= gc_horizon)
-  B2.retain(|k| k.version_id >= gc_horizon)
+  B1.retain(|k| k.commit_seq >= gc_horizon)
+  B2.retain(|k| k.commit_seq >= gc_horizon)
 ```
 
 **Capacity accounting.** Each `(pgno, commit_seq)` pair counts as one entry. A
@@ -6055,11 +6055,11 @@ older versions are reclaimable. The cache proactively drops them.
 ```
 coalesce_versions(cache, pgno, gc_horizon):
   versions = all cached entries where key.pgno == pgno
-  sort versions by version_id descending
+  sort versions by commit_seq descending
 
   kept_committed = false
   for key in versions:
-    if key.version_id <= gc_horizon AND is_committed(key.version_id):
+    if key.commit_seq != 0 AND key.commit_seq <= gc_horizon:
       if !kept_committed:
         kept_committed = true   // keep newest committed below horizon
         continue
