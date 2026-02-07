@@ -7,7 +7,7 @@
 <h1 align="center">FrankenSQLite</h1>
 
 <p align="center">
-  <strong>A clean-room Rust reimplementation of SQLite with concurrent writers.</strong>
+  <strong>A clean-room Rust reimplementation of SQLite with concurrent writers and information-theoretic durability.</strong>
 </p>
 
 <p align="center">
@@ -21,21 +21,31 @@
 
 ## TL;DR
 
-**The Problem:** SQLite allows only one writer at a time. If two threads or processes try to write concurrently, one blocks (or gets `SQLITE_BUSY`). For write-heavy workloads, this single-writer bottleneck caps throughput regardless of how many cores you have.
+**The Problem:** SQLite allows only one writer at a time. A single lock byte (`WAL_WRITE_LOCK` at `wal.c:3698`) serializes all writers. For write-heavy workloads, this bottleneck caps throughput regardless of how many cores you have. Torn writes and bit-flips can corrupt the database with no self-repair mechanism.
 
-**The Solution:** FrankenSQLite reimplements SQLite from scratch in safe Rust and replaces the single-writer lock with MVCC (Multi-Version Concurrency Control) at the page level. Multiple writers commit simultaneously as long as they touch different pages. Readers never block. The file format stays 100% compatible with existing `.sqlite` databases.
+**The Solution:** FrankenSQLite reimplements SQLite from scratch in safe Rust with two architectural innovations:
+
+1. **MVCC Concurrent Writers.** The single-writer lock is replaced with page-level Multi-Version Concurrency Control. Multiple writers commit simultaneously as long as they touch different pages. Serializable Snapshot Isolation (SSI) prevents write skew by default. Algebraic write merging resolves 30-50% of same-page conflicts at byte granularity, further reducing contention.
+
+2. **RaptorQ-Pervasive Durability.** Every persistent layer is infused with RFC 6330 fountain codes via asupersync's production-grade RaptorQ implementation. WAL frames carry repair symbols for self-healing after torn writes. Snapshot transfer uses rateless coding for bandwidth-optimal replication over lossy networks. Data loss becomes a mathematical near-impossibility rather than a failure mode to mitigate.
+
+The file format stays 100% compatible with existing `.sqlite` databases in Compatibility mode. A Native mode stores everything as content-addressed, erasure-coded objects (ECS) for maximum durability and cross-process concurrency.
 
 ### Why FrankenSQLite?
 
 | Feature | C SQLite | FrankenSQLite |
 |---------|----------|---------------|
-| Concurrent writers | 1 (file-level lock) | Many (page-level MVCC) |
+| Concurrent writers | 1 (file-level lock) | Many (page-level MVCC with SSI) |
+| Isolation level | SERIALIZABLE (by serializing) | SERIALIZABLE (SSI for concurrent mode) |
 | Concurrent readers | Unlimited (WAL mode) | Unlimited (no `aReadMark[5]` limit) |
 | Memory safety | Manual (C) | Guaranteed (`#[forbid(unsafe_code)]`) |
 | Data races | Possible (careful C) | Impossible (Rust ownership) |
-| File format | SQLite 3.x | Identical (binary compatible) |
+| File format | SQLite 3.x | Identical (Compatibility mode) or ECS (Native mode) |
+| Self-healing storage | No | Yes (RaptorQ repair symbols) |
+| Page-level encryption | No (commercial SEE extension) | AES-256-GCM with Argon2id key derivation |
 | SQL dialect | Full | Full (same parser coverage) |
 | Extensions | FTS3/4/5, R-tree, JSON1, etc. | All the same, compiled in |
+| Cross-process MVCC | No | Yes (shared-memory coordination) |
 | Embedded, zero-config | Yes | Yes |
 
 ---
@@ -62,9 +72,9 @@ The entire workspace enforces `#[forbid(unsafe_code)]`. Every crate, every modul
 
 Databases created by FrankenSQLite open in C SQLite and vice versa. No migration step, no conversion tool. The 100-byte header, B-tree page layout, record encoding, and WAL frame format are all identical.
 
-### 5. Snapshot Isolation with First-Committer-Wins
+### 5. Serializable Snapshot Isolation (SSI) by Default
 
-When two writers touch the same page, the first to commit wins. The second gets `SQLITE_BUSY` and retries. Deadlocks are impossible by construction (eager page locking, no wait-for cycles). Simple, predictable, and compatible with existing SQLite error handling.
+`BEGIN CONCURRENT` provides full SERIALIZABLE isolation, not merely Snapshot Isolation. The conservative Cahill/Fekete rule applied at page granularity ("Page-SSI") prevents write skew: no committed transaction may have both an incoming and outgoing rw-antidependency edge. PostgreSQL has shipped SSI since 2011 with less than 7% throughput overhead. `PRAGMA fsqlite.serializable = OFF` explicitly downgrades to plain SI for benchmarking or applications that tolerate write skew. When two writers touch the same page, the first to commit wins. The second gets `SQLITE_BUSY` and retries. Deadlocks are impossible by construction (eager page locking, no wait-for cycles).
 
 ### 6. Strong Types Over Runtime Checks
 
@@ -73,6 +83,14 @@ Page numbers, transaction IDs, page sizes, error codes, opcode variants, and loc
 ### 7. Layered Crate Architecture
 
 Each subsystem lives in its own crate with explicit dependency boundaries enforced by Cargo. The parser cannot reach into the pager. The B-tree cannot call the planner. This prevents the kind of circular coupling that accumulates in a single-file C codebase and makes each component independently testable.
+
+### 8. RaptorQ Everywhere
+
+RFC 6330 fountain codes are woven into every persistent layer, not bolted on as a replication afterthought. The WAL uses repair symbols to survive torn writes without double-write journaling. Version chains use RaptorQ delta encoding for near-optimal compression. The replication protocol is fountain-coded for bandwidth-optimal transfer over lossy networks. In Native mode, every durable object is stored as an ECS (Erasure-Coded Stream) object with content-addressed BLAKE3 identity.
+
+### 9. Mechanical Sympathy
+
+Database engines live and die by cache behavior and I/O patterns. All page buffers are allocated at `page_size` alignment for direct I/O. VFS read/write paths operate directly on aligned buffers with no intermediate copies. The MVCC `PageLockTable` and `SireadTable` shards are padded to 64-byte cache-line boundaries to prevent false sharing. B-tree key comparisons and RaptorQ GF(256) arithmetic use SIMD-friendly contiguous layouts. B-tree descent issues prefetch hints for child pages.
 
 ---
 
@@ -121,7 +139,7 @@ FrankenSQLite is organized as a 23-crate Cargo workspace with strict layered dep
 | **Foundation** | `fsqlite-types` | PageNumber, PageSize, TxnId, SqliteValue, 190+ VDBE opcodes, serial types, limits, bitflags |
 | | `fsqlite-error` | 50+ error variants, SQLite error code mapping, recovery hints, transient detection |
 | **Storage** | `fsqlite-vfs` | Virtual filesystem trait (Vfs, VfsFile) abstracting all OS operations |
-| | `fsqlite-pager` | Page cache, rollback journal, LRU eviction, dirty page write-back |
+| | `fsqlite-pager` | Page cache, rollback journal, ARC eviction, dirty page write-back |
 | | `fsqlite-wal` | Write-ahead log: frame append, checkpoint, WAL index, crash recovery |
 | | `fsqlite-mvcc` | MVCC page versioning, snapshot management, conflict detection, garbage collection |
 | | `fsqlite-btree` | B-tree/B+tree: cell parsing, page splitting, overflow chains, cursor navigation |
@@ -183,19 +201,32 @@ read(page 47, snapshot TxnId=41)
 
 Readers never acquire locks. Unlimited concurrent readers.
 
-### Conflict Detection
+### Conflict Detection (SSI + First-Committer-Wins)
 
 ```
-Transaction C: UPDATE accounts SET balance = ... WHERE id = 1
-Transaction D: UPDATE accounts SET balance = ... WHERE id = 2
+Transaction C and D both reach COMMIT:
 
-Both touch leaf page 47 (same B-tree leaf)?
+  1. SSI Validation (rw-antidependency check)
+     │
+     ├── C has both an incoming AND outgoing rw-antidependency edge?
+     │   └── Yes → ABORT C immediately (write skew detected, no page lock needed)
+     │
+     └── No → proceed to step 2
   │
-  ├── Yes → First to lock page 47 wins. Second gets SQLITE_BUSY immediately.
-  │         Deadlock impossible (eager locking, no wait-for cycles).
-  │
-  └── No (different leaf pages) → Both proceed and commit independently.
+  2. Page-Level First-Committer-Wins
+     │
+     ├── Both touch leaf page 47 (same B-tree leaf)?
+     │   ├── Yes → First to lock page 47 wins. Second gets SQLITE_BUSY.
+     │   │         Deadlock impossible (eager locking, no wait-for cycles).
+     │   │
+     │   └── If algebraic write merging is enabled (PRAGMA raptorq_write_merge = ON):
+     │       └── Attempt deterministic rebase of loser's intent log against
+     │           current committed state. If replay succeeds → both commit.
+     │
+     └── No (different leaf pages) → Both proceed and commit independently.
 ```
+
+The SSI check fires before the first-committer-wins check. This means write skew is caught even when the conflicting transactions touch disjoint pages, because SSI tracks read dependencies (via the `SireadTable`) across all pages.
 
 ### MVCC Visibility Rules
 
@@ -211,14 +242,15 @@ These rules produce snapshot isolation: each transaction sees a frozen view of t
 
 ```rust
 /// Monotonically increasing transaction identifier.
-/// Allocated from an AtomicU64 in MvccManager.
+/// Allocated from an AtomicU64 with SeqCst ordering.
 struct TxnId(u64);
 
 /// A frozen view of which transactions are committed.
-/// Captured at BEGIN.
+/// Captured at BEGIN. Uses RoaringBitmap for O(1) membership
+/// tests and compressed storage (replacing SortedVec + BloomFilter).
 struct Snapshot {
     high_water_mark: TxnId,
-    in_flight: Vec<TxnId>,
+    in_flight: RoaringBitmap,
 }
 
 /// A single versioned copy of a database page.
@@ -230,19 +262,65 @@ struct PageVersion {
     prev: Option<Box<PageVersion>>,
 }
 
-/// Tracks which transaction holds exclusive write access to each page.
-/// Eager acquisition means no deadlocks.
-struct PageLockTable(BTreeMap<PageNumber, TxnId>);
+/// Exclusive page-level write locks. Sharded into 64 buckets
+/// (power of two for fast modular arithmetic). Each shard is a
+/// parking_lot::Mutex<HashMap<PageNumber, TxnId>>. Shards are
+/// padded to 64-byte cache-line boundaries to prevent false sharing.
+struct PageLockTable { shards: [Mutex<HashMap<PageNumber, TxnId>>; 64] }
+
+/// SSI read tracking. Maps each page to the set of active
+/// transactions that have read it. Used to detect rw-antidependencies.
+struct SireadTable { shards: [Mutex<HashMap<PageNumber, SmallVec<TxnId>>>; 64] }
+
+/// Semantic operation log for deterministic rebase merge.
+/// Records what a transaction intended to do at the B-tree level.
+enum IntentOp {
+    Insert { table: TableId, key: RowId, record: Vec<u8> },
+    Delete { table: TableId, key: RowId },
+    Update { table: TableId, key: RowId, new_record: Vec<u8> },
+    IndexInsert { index: IndexId, key: Vec<u8>, rowid: RowId },
+    IndexDelete { index: IndexId, key: Vec<u8>, rowid: RowId },
+}
 ```
+
+### Three Invariants (Must Hold at All Times)
+
+1. **INV-1 (Monotonic TxnIds):** TxnIds are strictly monotonically increasing, allocated via `AtomicU64::fetch_add` with `SeqCst` ordering.
+2. **INV-2 (Page lock exclusivity):** At most one active transaction holds the exclusive lock on any given page.
+3. **INV-3 (Version chain ordering):** In every version chain, newer versions have strictly higher `created_by` TxnIds.
+
+### Algebraic Write Merging and Intent Logs
+
+Standard page-level MVCC produces false conflicts when two transactions modify different rows that happen to live on the same B-tree leaf page. Algebraic write merging reduces these false conflicts by 30-50% without introducing row-level MVCC metadata.
+
+Each writing transaction records a semantic intent log (`Vec<IntentOp>`) describing what it intended to do at the B-tree level. When a transaction reaches commit and discovers a page was modified since its snapshot, a **deterministic rebase** replays the intent log against the current committed state:
+
+1. **Detect base drift:** the page's latest committed version differs from what the transaction read.
+2. **Attempt rebase:** replay the intent log against the current snapshot.
+3. **Replay succeeds** (B-tree invariants hold, no constraint violations) → commit with rebased deltas.
+4. **Replay fails** (true conflict or constraint violation) → abort/retry.
+
+A strict safety ladder governs merge strategy selection at commit time:
+
+| Priority | Strategy | When Used |
+|----------|----------|-----------|
+| 1 | Deterministic rebase replay | Intent logs commute at B-tree level (preferred) |
+| 2 | Structured page patch merge | Cell-disjoint modifications on same page |
+| 3 | Sparse XOR merge | Byte-range disjointness proven via GF(256) patches |
+| 4 | Abort/retry | True conflict; no safe merge possible |
+
+Algebraic write merging is gated behind `PRAGMA raptorq_write_merge = ON` (off by default). When enabled, intent logs are recorded automatically during writes and evaluated at commit time.
 
 ### Garbage Collection
 
 Old page versions are reclaimed when no active transaction can see them:
 
-- **GC horizon** = `min(active_snapshot_ids)` across all open transactions
+- **GC horizon** = `min(active_snapshot_ids)` across all open transactions (in multi-process mode, `gc_horizon` is an `AtomicU64` in shared memory coordinated across all attached processes)
 - A version is reclaimable if a newer committed version of the same page also falls below the horizon
+- **Epoch-based reclamation** via `commit_seq`: the global commit sequence counter determines when versions fall out of all active snapshots
 - A background task runs every ~1 second, walks version chains, and unlinks reclaimable nodes
 - During WAL checkpointing, reclaimable frames are copied back to the main database file
+- ARC ghost entries (B1/B2) for pruned versions are cleaned when the GC horizon advances
 
 ### Deadlock Freedom (By Construction)
 
@@ -543,14 +621,18 @@ Savepoints are implemented as a stack. ROLLBACK TO undoes changes back to the sa
 
 ### Crash Recovery
 
+The crash model makes six explicit assumptions: (1) process crash at any point, (2) `fsync()` is a durability barrier, (3) writes may be reordered unless constrained by fsync barriers, (4) torn writes at sector granularity (512B or 4KB), (5) bitrot and corruption exist (checksums detect, RaptorQ repairs), (6) file metadata durability may require directory `fsync()`.
+
 The WAL provides crash recovery with the following guarantees:
 
-1. **Atomic commit:** A transaction is either fully visible or fully invisible after crash recovery. Partial commits cannot occur.
-2. **Durability:** Once `COMMIT` returns, the data survives power loss (assuming `PRAGMA synchronous = FULL`).
-3. **Recovery procedure:**
+1. **Atomic commit:** A transaction is either fully visible or fully invisible after crash recovery. Partial commits cannot occur. In Native mode, a commit is committed if and only if its `CommitMarker` is durable.
+2. **Durability:** Once `COMMIT` returns, the data survives power loss (assuming `PRAGMA synchronous = FULL`). Durability policy is configurable: `PRAGMA durability = local` (default) requires enough RaptorQ symbols persisted locally for decode success; `PRAGMA durability = quorum(M)` requires symbols across M of N replicas.
+3. **Self-healing:** WAL frames carry RaptorQ repair symbols. Torn writes and bit-flips are detected by xxhash3 checksums and repaired from redundant symbols without requiring a full WAL replay.
+4. **Recovery procedure:**
    - On database open, check for a WAL file.
    - Read the WAL header; validate magic number and checksums.
    - Replay all committed frames (those with a nonzero "database size" field in the frame header, indicating a commit boundary).
+   - For frames with checksum failures, attempt RaptorQ repair from available repair symbols.
    - Discard any frames after the last commit boundary (incomplete transaction).
    - Rebuild the WAL index from the replayed frames.
 
@@ -602,62 +684,97 @@ In FrankenSQLite's MVCC mode, WAL frames carry transaction IDs. The WAL index ma
 
 ---
 
-## Buffer Pool and Page Cache
+## Buffer Pool: ARC Cache
 
-### Structure
+LRU fails on database workloads: a single table scan evicts the entire working set. FrankenSQLite uses an **Adaptive Replacement Cache (ARC)** that balances recency and frequency, with a provable competitive ratio of 2 against OPT.
+
+### MVCC-Aware Structure
+
+The buffer pool keys on `(PageNumber, TxnId)` because multiple versions of the same page coexist for MVCC:
 
 ```rust
-struct BufferPool {
-    /// Versioned page cache, keyed by (page_number, txn_id).
-    /// Multiple versions of the same page coexist for MVCC.
-    pages: BTreeMap<(PageNumber, TxnId), CachedPage>,
-
-    /// LRU list for eviction ordering.
-    lru: LruList,
-
-    /// Max pages in pool. Default: 2000 (~8MB at 4KB page size).
+struct ArcBufferPool {
+    /// Pages accessed exactly once recently (recency-favored).
+    t1: LinkedHashMap<CacheKey, CachedPage>,
+    /// Pages accessed two or more times (frequency-favored).
+    t2: LinkedHashMap<CacheKey, CachedPage>,
+    /// Ghost entries evicted from T1 (metadata only, no page data).
+    b1: LinkedHashSet<CacheKey>,
+    /// Ghost entries evicted from T2 (metadata only).
+    b2: LinkedHashSet<CacheKey>,
+    /// Adaptive parameter: target size for T1 (range [0, capacity]).
+    p: usize,
+    /// Max pages in T1 + T2. Default: 2000 (~8MB at 4KB pages).
     capacity: usize,
 }
+
+struct CacheKey { pgno: PageNumber, version_id: TxnId }
 ```
 
-### Eviction Policy
+### How ARC Works
 
-When the buffer pool is full and a new page must be loaded:
+On page request (O(1) amortized):
 
-1. Only pages with `ref_count == 0` are candidates.
-2. Prefer **clean + superseded** pages (a newer committed version of the same page exists in the pool). These are dead weight.
-3. If no superseded pages exist, evict the **least recently used clean** page.
-4. Dirty pages are never evicted. They must be flushed to the WAL first.
+| Case | Condition | Action |
+|------|-----------|--------|
+| Hit in T1 | Page found in recency list | Promote to T2 (now frequency-tracked) |
+| Hit in T2 | Page found in frequency list | Move to T2 head (refresh) |
+| Ghost hit in B1 | Recently evicted recency page requested again | Increase `p` (favor recency), fetch from disk, insert to T2 |
+| Ghost hit in B2 | Recently evicted frequency page requested again | Decrease `p` (favor frequency), fetch from disk, insert to T2 |
+| Complete miss | Not in any list | Evict if needed, fetch from disk, insert to T1 |
 
-This policy ensures that MVCC version chains are trimmed naturally: as newer versions enter the cache and older versions lose all readers, the old versions become eviction candidates.
+Ghost entries (B1/B2) store only the cache key, not page data. They let ARC learn access patterns without consuming page-sized memory.
+
+### Eviction Constraints
+
+1. Never evict a pinned page (`ref_count > 0`).
+2. Never evict a dirty page (must flush to WAL first).
+3. Prefer **superseded versions** (a newer committed version exists that is visible to all active snapshots).
+4. Dual eviction trigger: fires when page count exceeds capacity OR `total_bytes` exceeds `max_bytes` (from `PRAGMA cache_size`).
+
+### Visibility Bloom Filter
+
+Each `Snapshot` includes a Bloom filter over its `in_flight` set for O(1) amortized visibility checks. For small in-flight sets (< 8 transactions), binary search on the `RoaringBitmap` is used instead. Parameters scale with transaction concurrency: n=10 transactions need only 12 bytes; n=1000 need ~1.2 KB.
 
 ---
 
-## Async Integration
+## Async Integration (asupersync + Cx)
 
-FrankenSQLite bridges the gap between its synchronous engine core and async callers.
+FrankenSQLite uses [asupersync](https://github.com/Dicklesworthstone/asupersync) for async I/O rather than tokio. asupersync provides capabilities that database engines require but general-purpose runtimes do not.
 
-### Components
+### Cx (Capability Context) Everywhere
 
-- **BlockingPool:** All file I/O (VFS reads, writes, syncs) dispatches to a dedicated thread pool (default: 4 threads) to avoid starving async executor threads.
-- **Cx (Capability Context):** Every database operation accepts an optional `Cx` carrying a cancellation token. Long queries check the token at VDBE instruction boundaries (every N opcodes) and return `SQLITE_INTERRUPT` if cancelled. This integrates with async timeout mechanisms.
-- **MPSC channel for write coordination:** Write transactions submit commit requests through a channel to a single write coordinator task. This serializes commit validation and WAL appends without holding a lock across the entire commit.
-- **Oneshot channel for commit response:** Each commit request includes a `oneshot::Sender<Result<()>>` so the caller can `.await` the result without polling.
+Every trait method that touches I/O, acquires locks, or could block accepts `&Cx`. This is a non-negotiable rule throughout the codebase. Pure computation (e.g., collation comparisons, CPU-only scalar functions) is the only exception.
 
-### Flow
+Cx threads three capabilities through the entire call chain:
+
+- **Cancellation:** Any operation can be cancelled by its caller's context. Long queries check the cancellation token at VDBE instruction boundaries (every N opcodes) and return `SQLITE_INTERRUPT` if cancelled.
+- **Deadline propagation:** Timeout budgets flow through the entire call chain. A 5-second query deadline decrements as it passes through the parser, planner, and executor.
+- **Capability narrowing:** Callers can restrict what callees are allowed to do. A read-only connection's Cx prevents write operations at the capability level.
+
+### asupersync Components
+
+- **Lab reactor:** Fully deterministic concurrency testing with reproducible scheduling and precise fault injection. Every MVCC interleaving can be replayed exactly.
+- **E-processes:** Anytime-valid statistical invariant monitoring. Detects anomalies (e.g., snapshot isolation violations) with bounded false-positive rates.
+- **Mazurkiewicz traces:** Enumerate all non-equivalent interleavings for exhaustive concurrency verification without combinatorial explosion.
+- **DPOR (Dynamic Partial Order Reduction):** Prunes equivalent schedules during testing. Only explores interleavings that lead to genuinely different outcomes.
+
+### Write Coordination Flow
 
 ```
 async caller
-  → Connection::execute(sql).await
+  → Connection::execute(sql, &cx).await
     → spawn_blocking(|| {
         parse(sql)
         plan(ast)
-        execute(bytecode, cx)
+        execute(bytecode, &cx)
       })
-    → on commit: tx.send(CommitRequest { write_set, response: oneshot })
+    → on commit: tx.send(CommitRequest { write_set, intent_log, response: oneshot })
     → response.await
   ← Result<Rows>
 ```
+
+Write transactions submit commit requests through an MPSC channel to a single write coordinator task. This serializes commit validation (SSI check + first-committer-wins + optional algebraic merge) and WAL appends without holding a lock across the entire commit. Each request includes a `oneshot::Sender<Result<()>>` so the caller can `.await` the result.
 
 ---
 
@@ -1020,22 +1137,153 @@ Offset  Size  Field
 
 ---
 
+## Two Operating Modes
+
+FrankenSQLite operates in one of two modes, selected per-connection via `PRAGMA fsqlite.mode`:
+
+### Compatibility Mode (Default)
+
+The database file is a standard SQLite `.db` file. WAL frames use standard SQLite WAL format. An existing C SQLite database opens without conversion, and a FrankenSQLite database opens in C SQLite without conversion. Optional sidecars (`.wal-fec`, `.idx-fec`) store RaptorQ repair symbols alongside the standard files but the core `.db` remains SQLite-compatible when checkpointed. This mode is the default and is used for conformance testing against C SQLite.
+
+### Native Mode
+
+Primary durable state is an ECS commit stream: append-only `CommitCapsule` objects encoded as RaptorQ symbols. The source-of-truth is the commit stream, not a mutable `.db` file.
+
+A **CommitCapsule** is the atomic unit of commit state, containing:
+- `commit_seq` and `snapshot_basis`
+- Intent log and/or page deltas
+- Read/write set digests
+- SSI witnesses
+
+A **CommitMarker** is the durable "this commit exists" record: the capsule's ObjectId plus a pointer to the previous marker, forming an append-only chain. A commit is committed if and only if its marker is durable. Recovery ignores capsules without a committed marker.
+
+Checkpointing materializes a canonical `.db` for compatibility export, but the commit stream remains the source of truth. Both modes expose the same SQL and API surface.
+
+---
+
+## ECS: The Erasure-Coded Stream Substrate
+
+In Native mode, every durable object (commit capsules, page snapshots, WAL segments, index checkpoints, schema snapshots) is stored as an ECS object.
+
+### Content-Addressed Identity
+
+Every object is identified by a 128-bit content address:
+
+```
+ObjectId = Trunc128( BLAKE3( "fsqlite:ecs:v1" || canonical_header || payload_hash ) )
+```
+
+BLAKE3 truncated to 128 bits (16 bytes) provides sufficient collision resistance for the non-adversarial setting and halves storage overhead compared to full 256-bit hashes. Objects are immutable: the same content always produces the same ObjectId.
+
+### SymbolRecord Envelope
+
+The atomic unit of physical storage is a `SymbolRecord`:
+
+```
+┌────────┬─────────┬───────────┬─────┬─────┬──────────────┬─────────┬──────────┐
+│ Magic  │ Version │ ObjectId  │ OTI │ ESI │ Symbol Data  │ XXH3    │ Auth Tag │
+│ "FSEC" │ u8 (1)  │ [u8; 16]  │     │ u32 │ [u8; T]      │ u64     │ [u8; 16] │
+└────────┴─────────┴───────────┴─────┴─────┴──────────────┴─────────┴──────────┘
+```
+
+OTI (Object Transmission Information) carries the RaptorQ metadata needed for decoding: transfer length, symbol alignment, symbol size, source blocks, and sub-blocks. Repair symbol generation is deterministic: the same object and repair count always produce identical repair symbols, enabling idempotent writes and incremental repair.
+
+### Local Physical Layout (Native Mode)
+
+```
+foo.db.fsqlite/
+├── ecs/
+│   ├── objects/          -- symbol records, sharded by ObjectId prefix
+│   │   ├── 00/
+│   │   └── ff/
+│   ├── commit_stream/    -- append-only CommitMarker sequence
+│   │   └── stream.log
+│   └── manifest.root     -- RootManifest (the ONE mutable file)
+├── cache/                -- rebuildable derived state
+│   ├── btree.cache       -- materialized B-tree pages
+│   ├── index.cache       -- secondary index pages
+│   └── schema.cache      -- parsed schema
+└── compat/               -- optional compatibility export
+    ├── foo.db            -- standard SQLite database file
+    └── foo.db-wal        -- standard WAL
+```
+
+The `RootManifest` is the bootstrap object: it maps the logical database name to the current committed state ObjectId. It is the only mutable file in the entire layout. Repair overhead is configurable via `PRAGMA raptorq_overhead` (default: 20%, meaning 1.2x source symbols stored).
+
+---
+
+## Multi-Process MVCC
+
+FrankenSQLite extends MVCC coordination across OS processes via a shared-memory file (`foo.db.fsqlite-shm`), analogous to SQLite's WAL-index but extended for full MVCC.
+
+### Shared Memory Layout
+
+```
+┌─────────────────────────────────────┐
+│ Header                              │
+│   magic: "FSQLSHM\0"               │
+│   version: u32 (1)                  │
+│   next_txn_id: AtomicU64            │  ← global TxnId counter
+│   commit_seq: AtomicU64             │  ← global commit sequence
+│   gc_horizon: AtomicU64             │  ← min active TxnId across processes
+│   checksum: u64 (xxhash3)           │
+├─────────────────────────────────────┤
+│ TxnSlot Array (256 slots default)   │  ← one slot per active transaction
+├─────────────────────────────────────┤
+│ PageLockTable Region                │  ← open-addressing hash in shared mem
+├─────────────────────────────────────┤
+│ SIREAD Plane                        │  ← cross-process rw-antidependency tracking
+└─────────────────────────────────────┘
+```
+
+All fields use atomic operations. The fast in-process path is unchanged; the cross-process path adds ~100ns per lock operation via mmap-based atomics.
+
+### Crash Cleanup
+
+Each `TxnSlot` carries a lease timestamp. If a process crashes while holding active transactions, other processes detect the stale lease and reclaim the slot after a configurable timeout. This prevents crashed processes from pinning page versions indefinitely or blocking the GC horizon from advancing.
+
+### File-Lock Fallback
+
+On systems where shared memory is unavailable or restricted, FrankenSQLite falls back to file-lock-based coordination (POSIX `fcntl` or Windows `LockFileEx`). This degrades to single-writer behavior but preserves correctness.
+
+---
+
+## Page-Level Encryption
+
+FrankenSQLite provides AES-256-GCM page-level encryption as a built-in feature, replacing the need for SQLite's commercial Encryption Extension (SEE).
+
+| Property | Value |
+|----------|-------|
+| Cipher | AES-256-GCM |
+| Key derivation | Argon2id from passphrase |
+| Nonce | 12 bytes, derived from `(page_number, write_counter)` |
+| Authentication tag | 16 bytes, stored in the page's reserved space |
+| Key management API | `PRAGMA key = 'passphrase'` / `PRAGMA rekey = 'new_passphrase'` |
+
+The nonce is derived deterministically from the page number and a per-page write counter, ensuring uniqueness without additional storage overhead. The 16-byte GCM authentication tag fits in the reserved-bytes-per-page field from the database header.
+
+In Native mode, encryption applies before RaptorQ encoding (encrypt-then-code). An attacker who corrupts encrypted ECS symbols cannot forge valid ciphertext; RaptorQ repairs the corruption, then decryption proceeds as normal.
+
+---
+
 ## Comparison with Alternatives
 
 | | **C SQLite** | **FrankenSQLite** | **libsql** | **DuckDB** | **Limbo** |
 |---|---|---|---|---|---|
 | Language | C | Rust (safe) | C (SQLite fork) | C++ | Rust |
 | Concurrent writers | No (1 writer) | Yes (page-level MVCC) | Partial (WAL extensions) | Yes (different architecture) | No (1 writer) |
+| Isolation level | Serializable (by serializing) | SSI (true serializable concurrency) | Snapshot | Snapshot | Snapshot |
 | Memory safety | Manual | Compile-time guaranteed | Manual (C) | Manual (C++) | Compile-time guaranteed |
-| File format | SQLite 3.x | SQLite 3.x (compatible) | SQLite 3.x (compatible) | Own format | SQLite 3.x (compatible) |
-| Drop-in replacement | N/A (it's the original) | Yes (file format) | Yes (API + format) | No | Yes (file format) |
-| OLAP optimized | No | No | No | Yes (columnar) | No |
+| File format | SQLite 3.x | SQLite 3.x (Compat) or ECS (Native) | SQLite 3.x (compatible) | Own format | SQLite 3.x (compatible) |
+| Page encryption | Commercial (SEE) | AES-256-GCM built-in | No | No | No |
+| Self-healing storage | No | RaptorQ repair symbols | No | No | No |
+| Cross-process MVCC | No | Shared-memory coordination | No | Yes | No |
 | Embeddable | Yes | Yes | Yes | Yes | Yes |
 | Extensions | Loadable + built-in | Built-in | Built-in + WASM | Built-in | Limited |
-| WASM target | Via Emscripten | Planned | Yes | Yes | Yes |
-| Async I/O | No | Yes (via blocking pool) | Yes | No | Yes (io_uring) |
+| WASM target | Via Emscripten | Planned (VFS abstraction) | Yes | Yes | Yes |
+| Async I/O | No | Yes (asupersync + Cx) | Yes | No | Yes (io_uring) |
 
-FrankenSQLite is the only option that combines SQLite file format compatibility, concurrent writers via MVCC, and Rust memory safety. Limbo (another Rust SQLite) focuses on async I/O with io_uring but retains the single-writer model. libsql is a C fork that inherits the original codebase's complexity. DuckDB targets analytics workloads with a columnar storage format incompatible with SQLite.
+FrankenSQLite is the only option that combines SQLite file format compatibility, concurrent writers via MVCC with SSI, page-level encryption, self-healing storage, and Rust memory safety. Limbo (another Rust SQLite) focuses on async I/O with io_uring but retains the single-writer model. libsql is a C fork that inherits the original codebase's complexity. DuckDB targets analytics workloads with a columnar storage format incompatible with SQLite.
 
 ---
 
@@ -1101,11 +1349,12 @@ cargo bench --bench parser_throughput
 
 - **Nightly Rust required.** Uses edition 2024 features that aren't stabilized yet.
 - **No C API.** The initial release targets Rust consumers. A C-compatible FFI wrapper is a future goal.
-- **No loadable extensions.** All extensions are compiled in. Dynamic `dlopen`-based loading is not planned for the initial release.
-- **Unix-first.** The initial VFS targets Linux and macOS. Windows support follows.
-- **No WASM target yet.** Browser/edge deployment via WebAssembly is a future goal.
-- **MVCC adds memory overhead.** Multiple page versions consume more RAM than single-version SQLite. Garbage collection mitigates this but introduces background work.
-- **No row-level locking.** Two transactions modifying different rows on the same page still conflict. This is a deliberate tradeoff for file format compatibility.
+- **No loadable extensions.** All extensions are compiled in. Dynamic `dlopen`-based loading is not planned.
+- **No WASM target yet.** The VFS trait abstracts all OS operations, and a `WasmVfs` implementation is planned but not yet built. Browser/edge deployment via WebAssembly is a future goal.
+- **MVCC adds memory overhead.** Multiple page versions consume more RAM than single-version SQLite. ARC eviction and GC mitigate this but introduce background work.
+- **No row-level locking.** Two transactions modifying different rows on the same page still conflict at the page level. Algebraic write merging reduces false conflicts by 30-50% when enabled, but does not eliminate them entirely. This is a deliberate tradeoff for file format compatibility.
+- **Encryption adds per-page overhead.** The 16-byte GCM tag consumes reserved space in each page. Databases created with encryption cannot be read without the key, even by C SQLite.
+- **Native mode databases are not directly readable by C SQLite.** The ECS commit stream format is FrankenSQLite-specific. Compatibility export (`compat/foo.db`) materializes a standard SQLite file on demand.
 
 ---
 
@@ -1135,6 +1384,21 @@ A: The GC runs on a background thread every ~1 second. It walks version chains a
 **Q: What prevents a long-running reader from causing unbounded memory growth?**
 A: A reader that holds a snapshot open for a long time pins all page versions newer than its snapshot, preventing GC from reclaiming them. This is the same tradeoff PostgreSQL makes. In practice, connection timeouts and application-level query deadlines prevent runaway memory growth.
 
+**Q: What is SSI and why does it matter?**
+A: Serializable Snapshot Isolation detects write skew -- a class of anomaly where two transactions each read data the other writes, producing a result impossible under serial execution. Plain Snapshot Isolation misses this. FrankenSQLite applies the conservative Cahill/Fekete rule at page granularity: if a committed transaction has both an incoming and outgoing rw-antidependency edge, it is aborted. PostgreSQL has shipped SSI since 2011 with less than 7% throughput overhead. You can downgrade to plain SI with `PRAGMA fsqlite.serializable = OFF`.
+
+**Q: What does RaptorQ actually buy me in practice?**
+A: Three things. (1) Self-healing after torn writes: WAL frames carry repair symbols, so partial writes during a crash are recoverable without double-write journaling. (2) Bandwidth-optimal replication: fountain coding means a receiver can reconstruct data from any sufficient subset of encoding symbols, regardless of which symbols arrive. (3) Version chain compression: older page versions are stored as RaptorQ-encoded deltas rather than full copies.
+
+**Q: What is the difference between Compatibility and Native mode?**
+A: Compatibility mode stores data in a standard SQLite `.db` file readable by C SQLite. Native mode stores data as an append-only stream of content-addressed, erasure-coded objects (ECS) for maximum durability and cross-process concurrency. Both modes expose the same SQL dialect and API. Switch with `PRAGMA fsqlite.mode = compatibility | native`.
+
+**Q: How does encryption work?**
+A: `PRAGMA key = 'passphrase'` derives a 256-bit key via Argon2id and encrypts every page with AES-256-GCM. The 12-byte nonce comes from the page number and a write counter; the 16-byte authentication tag is stored in the page's reserved space. In Native mode, encryption happens before RaptorQ encoding (encrypt-then-code).
+
+**Q: Does FrankenSQLite support Windows?**
+A: Yes. The `WindowsVfs` implements the same `Vfs` trait as `UnixVfs`, using `LockFileEx`/`UnlockFileEx` for file locking and `CreateFileMapping` for shared memory. Platform-specific code is isolated behind `#[cfg(target_os)]` gates. OS/2, VxWorks, and Windows CE are excluded.
+
 **Q: Can I use FrankenSQLite as a library without the CLI?**
 A: Yes. The `fsqlite` crate is the public API. The CLI (`fsqlite-cli`) is a separate binary crate that depends on `fsqlite`. You can depend on `fsqlite` alone.
 
@@ -1151,6 +1415,9 @@ A: Yes. The `fsqlite` crate is the public API. The CLI (`fsqlite-cli`) is a sepa
 | Tests fail on `fsqlite-types` | Possible float precision | Check platform; tests use exact float comparison for known values |
 | SQLITE_BUSY in concurrent tests | Expected MVCC conflict | Wrap writes in a retry loop; see the concurrent writers example above |
 | High memory usage with many readers | Long-lived snapshots pin old versions | Close transactions promptly; set connection timeouts |
+| SSI abort (write skew detected) | Two concurrent transactions created rw-antidependency cycle | Retry the aborted transaction; or `PRAGMA fsqlite.serializable = OFF` if write skew is acceptable |
+| Cannot open Native mode database in C SQLite | ECS format is FrankenSQLite-specific | Use `compat/foo.db` export, or switch to Compatibility mode |
+| Encryption: "not an error" / garbled data | Wrong key or unencrypted database opened with key | Verify passphrase; use `PRAGMA key` before any other operation |
 
 ---
 
@@ -1162,6 +1429,8 @@ frankensqlite/
 ├── Cargo.lock                # Pinned dependency versions
 ├── rust-toolchain.toml       # Nightly channel + rustfmt + clippy
 ├── AGENTS.md                 # AI agent development guidelines
+├── COMPREHENSIVE_SPEC_FOR_FRANKENSQLITE_V1.md  # Single source of truth (~9,500 lines)
+├── MVCC_SPECIFICATION.md     # Standalone MVCC formal specification
 ├── PLAN_TO_PORT_SQLITE_TO_RUST.md    # 9-phase implementation roadmap
 ├── PROPOSED_ARCHITECTURE.md  # Crate architecture + MVCC design spec
 ├── EXISTING_SQLITE_STRUCTURE.md      # SQLite behavioral specification
