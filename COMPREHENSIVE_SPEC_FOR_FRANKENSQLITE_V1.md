@@ -241,6 +241,14 @@ patterns. The following constraints are non-negotiable for hot-path code:
   64-byte cache-line boundaries to prevent false sharing between concurrent
   writers.
 
+- **Bounded parallelism.** Any internal parallelism (prefetch tasks, background
+  compaction, replication, integrity sweeps, encode/decode helpers) MUST be
+  bounded and bulkheaded. Defaults MUST be conservative and derived from
+  `std::thread::available_parallelism()`; the system MUST NOT spawn unbounded
+  work proportional to core count. Background work MUST degrade gracefully
+  (rate-limit, bulkhead, overflow fallbacks) rather than saturating CPU, memory
+  bandwidth, or I/O queues. See §4.15 and §4.17.
+
 - **Systematic fast-path reads.** When persisting ECS objects, writers MUST
   pre-position systematic symbols (ESI 0..K-1) as contiguous runs in the local
   symbol store when possible (Section 3.5.2). This enables a "happy path" read
@@ -380,8 +388,10 @@ cannot silently downgrade.
   relied on SI and experienced silent write skew.
 
 **Layer 3 (Future refinement): Reduced-abort SSI.**
-- Refine witness keys from `Page(pgno)` to `Cell(btree_root_pgno, cell_tag)` and/or
-  `ByteRange(page, start, len)` to reduce false positive aborts on hot pages.
+- Reduce false positive aborts via witness refinement:
+  - point operations: `Cell(btree_root_pgno, cell_tag)` and/or `ByteRange(page, start, len)`
+  - range scans: leaf-page `Page(leaf_pgno)` witnessing remains required for phantom protection,
+    but MAY be refined with `KeyRange(...)` witnesses when implemented (§5.6.4.3)
 - Smarter victim selection (instead of always aborting the committing pivot).
 - These are optimizations of SSI, not correctness changes.
 - **Value of Information (VOI) for granularity investment:** The decision to
@@ -1352,6 +1362,11 @@ ENCODING:
     Action:
         - Deterministically serialize the changeset (the pages + metadata) into
           a byte stream of length F bytes (`changeset_bytes`).
+        - Compute a stable per-changeset identifier:
+          `changeset_object_id = Trunc128(BLAKE3("fsqlite:replication:changeset:v1" || changeset_bytes))`.
+          This ObjectId is carried in every UDP packet so receivers can join mid-stream and
+          so multiple concurrent changesets can be multiplexed without relying on the
+          RaptorQ Source Block Number (SBN) as a global partition key.
         - Choose a transport symbol size `T_replication` (bytes per encoding
           symbol on the wire). `T_replication` is independent of the SQLite
           page size; it is chosen to respect the transport's constraints (MTU,
@@ -1359,6 +1374,11 @@ ENCODING:
         - Create a RaptorQ encoder for `changeset_bytes` using symbol size
           `T_replication`, yielding `K_source = ceil(F / T_replication)` source
           symbols for the block.
+        - **Block-size limit (normative):** If `K_source > 56,403` (RFC 6330 Table 2),
+          the sender MUST shard the transfer into multiple independent changeset objects
+          (each with its own `changeset_bytes` and `changeset_object_id`) such that
+          each shard satisfies `K_source <= 56,403`. Multi-block (SBN>0) changesets are
+          not used in V1.
         - Compute intermediate symbols (one-time cost: O(F) bytes of work)
         - Prepare the ISI counter starting at 0
     Transition -> STREAMING
@@ -1410,38 +1430,60 @@ All integer fields are encoded little-endian.
 `page_xxh3` for every page before applying it; on mismatch, the changeset MUST
 be rejected (or repaired via additional symbols if possible).
 
+**RaptorQ object size limit (normative):**
+RFC 6330 bounds the Source Block Number (SBN) to 8 bits. Therefore, even with
+multi-block encoding, a single RaptorQ object has a hard maximum size determined
+by:
+
+- `K_max = 56,403` source symbols per block (RFC 6330 Table 2)
+- `SBN_max = 255` (8-bit source block numbering)
+- `T_replication` symbol size on the wire
+
+Implementations MUST NOT assume that a single changeset object can represent an
+entire database snapshot. For large transfers (initial snapshot, bulk backfill,
+or very large write sets), replication MUST shard the transfer into **multiple
+independent changeset objects**, each with its own `changeset_object_id` and its
+own RaptorQ symbol stream. This removes any total database size limit from the
+protocol: overall capacity is unbounded because the number of changeset objects
+is unbounded.
+
 **UDP Packet Format**
 
 ```
 Replication Packet (variable size):
     Offset  Size    Field
     ------  ----    -----
-    0       1       Source block number (u8)
+    0       16      Changeset ObjectId (16 bytes)
+                    - `changeset_object_id` computed in ENCODING (above)
+                    - Identifies which changeset this symbol belongs to
+                    - Enables multiplexing many concurrent changesets on the same UDP socket
+    16      1       Source block number (u8)
                     - Identifies which source block this symbol belongs to
-                    - For changesets with K_source <= 56,403, always 0
-                    - For larger changesets, identifies the partition
-    1       3       Encoding Symbol ID (u24 big-endian)
+                    - **V1 rule:** MUST be 0. Each changeset object is encoded as a single
+                      RaptorQ source block (sharding across `changeset_object_id`s handles large transfers).
+                    - Reserved for future multi-block changesets; receivers MAY reject `source_block != 0`.
+    17      3       Encoding Symbol ID (u24 big-endian)
                     - The ISI of this symbol
                     - 0 to K_source-1 for source symbols, >= K_source for repair symbols
-    4       4       Source block size K_source (u32 big-endian)
+    20      4       Source block size K_source (u32 big-endian)
                     - Number of source symbols in this block
-    8       T       Symbol data (T bytes, where T = T_replication)
+    24      T       Symbol data (T bytes, where T = T_replication)
                     - The actual encoding symbol content
 
-Total packet size: 8 + T bytes (e.g., 8 + 1368 = 1376 bytes for an MTU-safe
+Total packet size: 24 + T bytes (e.g., 24 + 1368 = 1392 bytes for an MTU-safe
 configuration on Ethernet MTU 1500 with IPv4).
 ```
 
 **Hard wire limit (physical):** For IPv4 UDP, the application payload MUST be
-`<= 65,507` bytes. Therefore, `8 + T <= 65,507`. Implementations MUST reject
+`<= 65,507` bytes. Therefore, `24 + T <= 65,507`. Implementations MUST reject
 any configuration that violates this bound.
 
 **Reliability note (normative guidance):** IP fragmentation amplifies loss:
 when a single symbol is split across many Ethernet frames, losing any one frame
 drops the entire symbol. Therefore, for MTU-constrained networks, implementations
-SHOULD choose a symbol size that avoids fragmentation entirely (e.g., `T <= 1464`
+SHOULD choose a symbol size that avoids fragmentation entirely (e.g., `T <= 1448`
 for Ethernet MTU 1500 minus 20-byte IPv4 header, 8-byte UDP header, and the
-8-byte replication header above). Encoding packets MUST carry whole encoding
+24-byte replication header above). Encoding packets MUST carry whole encoding
 symbols (RFC 6330 §4.4.2); replication MUST NOT assume that a SQLite page is a
 single on-wire symbol. If `page_size > T`, the changeset serialization simply
 spans multiple symbols.
@@ -1460,22 +1502,22 @@ LISTENING:
 COLLECTING:
     Entry: At least one packet received.
     State:
-        - decoder: RaptorQDecoder (created from K_source in first packet)
-        - received_count: number of symbols added to decoder
-        - source_block_decoders: HashMap<u8, RaptorQDecoder> (for multi-block)
+        - decoders: HashMap<ObjectId, RaptorQDecoder> (one decoder per `changeset_object_id`)
+        - received_counts: HashMap<ObjectId, u32>
     Action (on each packet):
-        - Parse packet header (source_block, ISI, K_source)
-        - Get or create decoder for this source block
+        - Parse packet header (changeset_object_id, source_block, ISI, K_source)
+        - **V1 rule:** If `source_block != 0`, reject (multi-block changesets are not used in V1; sharding uses multiple `changeset_object_id`s).
+        - Get or create decoder for `changeset_object_id` (created from `K_source` in the first packet)
         - Add symbol to decoder: decoder.add_symbol(ISI, symbol_data)
-        - Increment received_count
-        - If received_count >= K_source: attempt decode
+        - Increment `received_counts[changeset_object_id]`
+        - If `received_counts[changeset_object_id] >= K_source`: attempt decode for that changeset
     Transition -> DECODING (when enough symbols collected)
 
 DECODING:
-    Entry: >= K_source symbols collected for at least one source block.
+    Entry: >= K_source symbols collected for at least one changeset object.
     Action:
-        - Call decoder.decode(cx)
-        - If success: recovered K_source source symbols (and thus `changeset_bytes`)
+        - Call decoder.decode(cx) for the ready `changeset_object_id`
+        - If success: recovered K_source source symbols (and thus `changeset_bytes` for that changeset object)
         - If failure (rare, ~1% at exactly K_source): stay in COLLECTING, wait for more
     Transition -> APPLYING (on successful decode)
     Transition -> COLLECTING (on decode failure, need more symbols)
@@ -4719,6 +4761,9 @@ system robust under load and partial failure:
 - `pipeline`: staged commit capsule publication and replication with backpressure.
 - `bulkhead`: isolate heavy work (encode/decode/compaction/remote fetch) with
   bounded parallelism so it cannot starve the sequencer or VDBE.
+- `governor`: enforce a *global* concurrency budget for background and optional
+  work (Ready lane). This prevents self-DoS on many-core machines by bounding
+  runnable tasks and I/O storms regardless of how many connections are active.
 - `rate_limit`: cap background work (GC/compaction/sweeps) to preserve p99 query
   latency.
 - `retry`: budget-aware retries for transient I/O (with jitter/backoff).
@@ -4732,6 +4777,16 @@ system robust under load and partial failure:
 **Rule:** Any use of these combinators MUST preserve INV-LOSERS-DRAIN and
 INV-NO-OBLIGATION-LEAKS; the loser branches must drain and all obligations must
 resolve even when the winner returns early.
+
+**Global governance rule (normative):** All Ready-lane background services
+(compaction, anti-entropy, integrity sweeps, deep witness refinement, optional
+prefetchers) MUST run behind a global governor + per-service bulkheads. When the
+governor budget is exhausted, the service MUST degrade gracefully rather than
+spawn more work (reduce rate, drop to coarse witnesses/overflow, postpone
+compaction, or return to idle). The governor's default limits are derived from
+`available_parallelism()` with conservative caps and are tunable via
+`PolicyController` (§4.17) and explicit PRAGMAs (no hidden magic; §4.17.1:
+`PRAGMA fsqlite.bg_cpu_max`, `PRAGMA fsqlite.remote_max_in_flight`).
 
 ### 4.16 Observability and Diagnostics (Task Inspector, Explainable Failures)
 
@@ -4875,6 +4930,72 @@ given trace + seed: no dependence on wall-clock, hash randomization, or
 unordered iteration. Any randomization MUST be explicit, seeded, and recorded
 in the evidence ledger.
 
+#### 4.17.1 Out-of-the-Box Auto-Tuning (Default: ON, Optional)
+
+The goal is to be "amazing by default" without requiring users to pre-classify
+their workload as read-heavy, write-heavy, batch, OLTP, etc. FrankenSQLite does
+this by keeping **one canonical correctness path** and auto-tuning only
+non-correctness policy knobs *within a safe envelope* based on observed activity
+(telemetry + BOCPD regimes + guardrails).
+
+**Hard rule (restated):** Auto-tuning MUST NOT change correctness semantics.
+It may only change limits, budgets, batch sizes, and background scheduling.
+
+**Primary knob surface (normative, exposed via PRAGMA):**
+
+```
+PRAGMA fsqlite.auto_tune = ON | OFF;                 -- default: ON
+PRAGMA fsqlite.profile   = balanced | latency | throughput; -- default: balanced
+
+PRAGMA fsqlite.bg_cpu_max            = <int>;        -- global Ready-lane CPU permits
+PRAGMA fsqlite.remote_max_in_flight  = <int>;        -- global remote ops in flight
+PRAGMA fsqlite.commit_encode_max     = <int>;        -- max parallelism for large capsule encode
+```
+
+All three integer PRAGMAs MUST accept:
+- `0` meaning "auto" (use derived defaults + PolicyController),
+- an explicit positive integer meaning "hard cap override".
+
+**Scope and semantics (normative):**
+- These PRAGMAs are per-database (apply to all connections).
+- The integer caps are **permits** (bulkhead slots), not OS threads.
+  Implementations MUST NOT spawn new OS threads proportional to these values.
+- `commit_encode_max` applies only to *large* capsule encodes; small capsules
+  SHOULD encode single-threaded to avoid parallel scheduling overhead.
+
+**Default derivations (normative):**
+
+Let `P = std::thread::available_parallelism().get()` (hardware threads).
+Let `clamp(x, lo, hi)` clamp integer `x` to `[lo, hi]`.
+
+| `profile` | `bg_cpu_max_default` | `remote_max_in_flight_def` | `commit_encode_max_default` |
+|---|---:|---:|---:|
+| `balanced` (default) | `clamp(P / 8, 1, 16)` | `clamp(P / 8, 1, 8)` | `clamp(P / 4, 1, 16)` |
+| `latency` | `clamp(P / 16, 1, 8)` | `clamp(P / 16, 1, 4)` | `clamp(P / 8, 1, 8)` |
+| `throughput` | `clamp(P / 4, 1, 32)` | `clamp(P / 4, 1, 16)` | `clamp(P / 2, 1, 32)` |
+
+The `balanced` and `latency` defaults intentionally scale sublinearly with core
+count so a 32–64 core workstation does not become unresponsive due to background
+runnable-task storms. `throughput` opts into higher utilization while still
+remaining bounded. Foreground work is protected by scheduler lanes (§4.20) and
+by requiring all optional/background work to acquire governor permits (§4.15).
+
+**When auto-tune is enabled (recommended):**
+- The `PolicyController` MAY adjust:
+  - commit group size `N` using conformal quantiles within the BOCPD regime (§4.5),
+  - background compaction `rate_limit` and timing (§7.13),
+  - witness refinement budgets and hot-plane pressure controls (§5.7.4, §5.6.4.5),
+  - remote hedging and circuit breaker thresholds (§4.15),
+  - and the governor caps up/down within operator-set hard limits.
+- Every automatic change MUST emit an evidence ledger entry (§4.16.1).
+- Changes MUST apply hysteresis (no thrash): a setting MUST NOT change more
+  frequently than once per policy interval, and BOCPD regime shifts MUST reset
+  calibration windows (§4.5) before retuning.
+
+**Graceful fallback (required):**
+- If auto-tune is OFF, or if telemetry is unavailable, the system MUST fall back
+  to the derived defaults above and MUST remain safe (may be slower, not broken).
+
 ### 4.18 Epochs (Asupersync EpochClock) -- Validity Windows and Coordination
 
 Asupersync provides an epoch model (`asupersync::epoch`) for time-bounded
@@ -4973,6 +5094,11 @@ and the epoch advanced, or it did not.
 Tiered storage (L3) and replication are fundamentally remote effects. FrankenSQLite
 adopts asupersync's remote contract so remote behavior is cancellable, bounded,
 and auditable rather than ad-hoc.
+
+**Global remote bulkhead (normative):** All remote operations (fetch, upload,
+anti-entropy RPCs) MUST run under a global remote bulkhead with concurrency cap
+`PRAGMA fsqlite.remote_max_in_flight` (`0` = auto; §4.17.1). This prevents retry
+storms and kernel-level overload on many-core machines when remote tiers degrade.
 
 #### 4.19.1 Explicit Remote Capability (Required)
 
@@ -5265,8 +5391,10 @@ Formal (commit clock): forall C1, C2 :
 ```
 
 *Enforcement:* `TxnManager::next_txn_id` is an `AtomicU64` incremented with
-`fetch_add(1, SeqCst)`. Sequential consistency ordering guarantees that no two
-calls return the same value, and the values are strictly increasing.
+`fetch_add(1, SeqCst)`, but the published TxnId is `raw + 1` (§5.4) so `TxnId=0`
+is unrepresentable for any live transaction (0 is reserved for shared-memory
+sentinels). Sequential consistency ordering guarantees that no two calls return
+the same raw value, and therefore the resulting TxnIds are strictly increasing.
 `CommitSeq` is assigned only by the commit sequencer in the serialized commit
 section, so committed transactions have a strict total order.
 
@@ -5501,7 +5629,10 @@ What each transaction sees when reading `P1`:
 BeginKind := {Deferred, Immediate, Exclusive, Concurrent}
 
 begin(manager, begin_kind) -> Transaction:
-    txn_id = manager.next_txn_id.fetch_add(1, SeqCst)
+    // `TxnId=0` is reserved as a shared-memory sentinel (slot free). `fetch_add`
+    // returns the previous value, so we shift the domain by +1.
+    raw = manager.next_txn_id.fetch_add(1, SeqCst)
+    txn_id = raw + 1
     txn_epoch = 0  // in-process; cross-process uses TxnSlot.epoch (Section 5.6.2)
     snapshot = Snapshot {
         high: manager.commit_seq.load(Acquire),
@@ -6605,15 +6736,36 @@ unlock safe merge/refinement (§5.10), never to preserve correctness.
 **Implementation directive (critical for deterministic rebase/merge):**
 The SSI witness plane is fed by *semantic* operations (VDBE/B-tree), not raw
 pager I/O. Implementations MUST NOT register `WitnessKey::Page(pgno)` reads just
-because a cursor traversed or inspected a B-tree page. Doing so makes almost all
-writers appear read-dependent on the pages they modify, collapsing safe merge
-and deterministic rebase (§5.10.2) back to abort/retry.
+because a cursor traversed internal pages or performed point-lookup descent.
+Doing so makes almost all writers appear read-dependent on the pages they
+modify, collapsing safe merge and deterministic rebase (§5.10.2) back to
+abort/retry. Range scans/predicate reads are handled separately below for
+phantom protection.
 
 Instead, the B-tree/VDBE MUST register witnesses at key granularity:
-- **Point read / uniqueness check (including "negative read"):**
-  `WitnessKey::Cell(btree_root_pgno, cell_tag(key_bytes))`
+- **Point read / uniqueness check (including "negative point read"):**
+  `WitnessKey::Cell(btree_root_pgno, cell_tag(key_bytes))`.
+
 - **Point write (insert/delete/update by key):**
-  `WitnessKey::Cell(btree_root_pgno, cell_tag(key_bytes))`
+  `WitnessKey::Cell(btree_root_pgno, cell_tag(key_bytes))` AND
+  `WitnessKey::Page(leaf_pgno)` as a write witness.
+
+- **Range scan / predicate read (phantom protection; SERIALIZABLE requirement):**
+  For any cursor iteration that can observe a predicate-defined set (e.g. `WHERE k > 10`,
+  `BETWEEN`, prefix LIKE on an index, or a full scan), implementations MUST register
+  `WitnessKey::Page(leaf_pgno)` as a read witness for every **leaf** page visited by
+  `OP_Next`/`OP_Prev` (including the first leaf page reached by the initial seek, even
+  if the scan returns zero rows). This witnesses the *gaps* between returned keys:
+  any insert/delete that would create a phantom must structurally modify some visited
+  leaf page and therefore must emit a `Page(leaf_pgno)` write witness, creating an
+  rw-antidependency discoverable by the witness plane.
+
+  (Optional refinement): If `WitnessKey::KeyRange` is implemented, range scans SHOULD
+  additionally register `KeyRange(btree_root_pgno, lo, hi)` to reduce false positives
+  from non-overlapping inserts into the same leaf page.
+
+- `leaf_pgno` is the **physical page number** of the leaf page whose cell content area is
+  inspected or structurally modified. It is not the `btree_root_pgno` namespace.
 - `btree_root_pgno` is the SQLite B-tree root page number for the table or
   index (stable namespace; see §11.11 `sqlite_master.rootpage`).
 
@@ -8853,17 +9005,23 @@ REPLACE(cache, target_key):
       continue
 ```
 
-**Dirty flush under mutex (design note):** The `flush_dirty_page()` calls above
-execute WAL I/O while the cache mutex is held, blocking all concurrent cache
-operations for the duration of the write. This is a deliberate simplicity
-trade-off: the alternative (releasing the mutex, flushing, re-acquiring) would
-require complex state management to handle pages that change during the
-unlocked window. For the typical case (4096-byte page, NVMe SSD), a single
-`write_frame` completes in ~4μs — acceptable latency for the mutex critical
-section. If profiling reveals this as a bottleneck under heavy concurrent load,
-a "flush queue" approach (mark candidate as flush-pending, release mutex, flush
-asynchronously, re-acquire and evict) can be added without changing the
-logical algorithm.
+**Async integration (normative):** In FrankenSQLite, all file I/O is dispatched
+via asupersync's blocking pool (`spawn_blocking_io(...).await`; §4.10). Therefore
+a `parking_lot::Mutex` guard MUST NOT be held across any I/O or `.await`.
+
+Consequently, the REPLACE/REQUEST logic above MUST be implemented with a
+**flush-then-evict** protocol:
+
+1. Select an eviction candidate under the cache mutex.
+2. Drop the mutex.
+3. Attempt to flush (WAL write) outside the mutex using the cancel-safe dirty
+   claim in §6.6 (`dirty: true -> false` via CAS). If flush fails, the page MUST
+   remain dirty and MUST NOT be evicted.
+4. Re-acquire the mutex and evict only if the page is still present, still
+   unpinned (`ref_count == 0`), and now clean.
+
+This is required for liveness: holding a synchronous mutex across `.await`
+creates executor-level deadlocks under bounded worker pools.
 
 ### 6.4 Full ARC Algorithm: REQUEST Subroutine
 
@@ -8957,6 +9115,53 @@ REQUEST(cache, key: CacheKey) -> Result<Arc<CachedPage>>:
   page.ref_count.fetch_add(1)
   return Ok(page)
 ```
+
+**Async implementation of REQUEST (normative):** The pseudocode above specifies the
+logical ARC state transitions. In the real engine, `fetch_from_storage` performs I/O
+via `spawn_blocking_io(...).await` (§4.10) and therefore MUST NOT execute while holding
+the cache mutex (§6.2).
+
+Implementations MUST use a **singleflight Loading placeholder** protocol so that:
+1. no synchronous mutex guard lives across `.await` (liveness), and
+2. only one task performs I/O for a missing key (no thundering herd).
+
+Canonical pattern (conceptual; compatible with asupersync's cancel-safe `watch` / `oneshot` channels):
+
+```
+CacheEntry :=
+  | Ready(Arc<CachedPage>)
+  | Loading { done: watch::Receiver<Option<Result<(), Error>>> }  // None=pending; Some=complete (waiters re-run REQUEST)
+
+REQUEST_ASYNC(cx, cache_mutex, key) -> Result<Arc<CachedPage>>:
+  loop:
+    lock cache_mutex
+    match cache.get_entry(key):
+      Ready(page) => { arc_promote_and_pin(cache, key, page); unlock; return Ok(page); }
+      Loading(done) => { local = done.clone(); unlock; local.changed(cx).await?; continue; }
+      Missing => {
+        // Install Loading placeholder (this caller becomes the single loader)
+        let (tx, rx) = watch::channel::<Option<Result<(), Error>>>(None);
+        cache.insert_loading(key, rx);
+        unlock;
+
+        // I/O outside mutex
+        let load_res = fetch_from_storage_async(cx, key.pgno, key.commit_seq).await;
+
+        // Install result and wake waiters
+        lock cache_mutex
+        cache.remove_loading(key);
+        match load_res {
+          Ok(page) => { arc_insert_as_miss(cache, key, page); tx.send(Some(Ok(())))?; }
+          Err(e) => { tx.send(Some(Err(e)))?; }
+        }
+        unlock;
+        continue;
+      }
+```
+
+**Cancellation safety:** If the loader task is cancelled after installing the Loading
+placeholder, it MUST resolve the `done` latch (send an error) and remove the placeholder,
+so waiters do not block forever.
 
 **Complexity:** Each cache operation is O(1) amortized. Ghost lists consume
 16 bytes per CacheKey (`PageNumber`: 4B + 4B alignment padding + `CommitSeq`:
@@ -9627,6 +9832,9 @@ digests, and compact write-set summaries.
    intent log, page deltas, snapshot basis, and the witness-plane ObjectId
    references from step (3).
 5. **Encode:** RaptorQ-encode capsule bytes into symbols (systematic + repair).
+   For large capsules, encoding SHOULD be task-parallel up to
+   `PRAGMA fsqlite.commit_encode_max` (`0` = auto; §4.17.1), but MUST remain
+   deterministic for a fixed capsule byte string (lab-replayable).
 6. **Write capsule symbols (CONCURRENT I/O):** The committing transaction
    writes symbols to local symbol log files (and optionally streams to replicas).
    This happens **before** acquiring the commit sequencing critical section:
@@ -9804,7 +10012,8 @@ Compaction MUST be:
 - cancel-safe (safe at any `.await`),
 - crash-safe (safe at any instruction boundary),
 - cross-process safe (multiple processes may be reading),
-- non-disruptive to p99 latency (rate-limited background region).
+- non-disruptive to p99 latency (rate-limited + bulkheaded background region;
+  §4.15, `PRAGMA fsqlite.bg_cpu_max`).
 
 **Saga requirement (normative):** Compaction MUST be implemented as a Saga
 (`asupersync::remote::Saga` semantics; §4.19.5) even when all I/O is local.
@@ -14896,18 +15105,19 @@ This is the birthday paradox with `N(N-1)/2` pairwise comparisons, each
 having `W^2/P` collision probability per pair. The N(N-1) term (not N^2)
 reflects that a transaction cannot conflict with itself.
 
-**Interpreting the threshold:** Conflicts become *non-negligible* (not
-"likely") near `N * W ~ sqrt(P)`. For P = 1,000,000 pages:
+**Interpreting the threshold:** Conflicts become *substantial* near
+`N * W ~ sqrt(P)`. For P = 1,000,000 pages:
 
-- N=10, W=100 (N*W=1,000): exponent = 10*9*10000/(2*1e6) = 0.045,
-  so P(conflict) ~ 4.4% — noticeable but not probable.
-- N=10, W=370 (N*W=3,700): exponent ~ 0.62, P(conflict) ~ 46%.
-- N=100, W=10: exponent = 100*99*100/(2*1e6) = 0.495,
+- N=10, W=100 (N*W=1,000 = sqrt(P)): exponent = 10*9*10000/(2*1e6) = 0.45,
+  so P(conflict) ~ 36% — already substantial.
+- N=10, W=370 (N*W=3,700 = 3.7*sqrt(P)): exponent = 90*136900/2e6 ~ 6.16,
+  P(conflict) > 99% — near certain.
+- N=100, W=10 (N*W=1,000 = sqrt(P)): exponent = 100*99*100/(2*1e6) = 0.495,
   P(conflict) ~ 39%.
 
 For P(conflict) > 50%, the exponent must exceed ln(2) ~ 0.693, requiring
-`N(N-1)W^2 > 1.386P`. The sqrt(P) threshold marks where conflicts start
-appearing at low single-digit percentages, not where they become probable.
+`N(N-1)W^2 > 1.386P`. The sqrt(P) threshold marks where conflicts become
+substantial (~35-40%), not where they first appear.
 
 ### 18.4 Non-Uniform Page Access: Zipf Distribution
 
@@ -14982,13 +15192,14 @@ P(any conflict) ~ 1 - product_{k=1}^{P} e^{-C(N,2) * p(k)^2}
 where C(N,2) = N(N-1)/2 is the number of transaction pairs and p(k) is
 the probability each transaction writes page k. For the uniform model,
 `sum_k p(k)^2 = P * (W/P)^2 = W^2/P`, recovering the formula in §18.3.
-For Zipf, `sum_k p(k)^2 = sum_k 1/(k^{2s} * H(P,s)^2)` is dominated by
-the hot pages (small k), concentrating conflict mass on the root and
-upper-level B-tree pages.
+For Zipf, `sum_k p(k)^2 = W^2 * sum_k 1/(k^{2s} * H(P,s)^2)
+= W^2 * H(P,2s) / H(P,s)^2`, which is dominated by the hot pages
+(small k), concentrating conflict mass on the root and upper-level
+B-tree pages.
 
 **Numerical comparison (P=1M, N=10, W=100):**
-- Uniform: P(conflict) ~ 4.4%
-- Zipf s=1.0: P(conflict) ~ 15-25% (hot-page concentration effect)
+- Uniform: P(conflict) ~ 36%
+- Zipf s=1.0: P(conflict) ~ 60-80% (hot-page concentration effect)
 
 ### 18.5 B-Tree Hotspot Analysis
 
