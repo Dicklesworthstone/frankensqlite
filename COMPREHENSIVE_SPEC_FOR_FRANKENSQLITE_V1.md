@@ -1711,7 +1711,7 @@ This is particularly effective for B-tree interior pages where only child
 pointers change during splits, and for leaf pages where insertions affect
 only a portion of the page.
 
-#### 3.4.5 Algebraic Write Merging Over GF(256)
+#### 3.4.5 GF(256) Patch Algebra: Encoding, Not Write-Merge Correctness
 
 This section is about the **byte algebra** that underlies patch encodings.
 It is *not* a license to merge arbitrary structured SQLite pages by checking
@@ -1845,11 +1845,11 @@ where `P_loss(G,R,p) = sum_{i=R+1}^{G+R} C(G+R,i) * p^i * (1-p)^(G+R-i)`
 
 | G   | R  | Overhead (R/G) | P_loss (p=10^-4) | Expected cost |
 |-----|----|----------------|------------------|---------------|
-| 32  | 2  | 6.25%          | ~10^-10          | 6.25 + ~0     |
-| 64  | 4  | 6.25%          | ~10^-20          | 6.25 + ~0     |
-| 64  | 2  | 3.12%          | ~10^-10          | 3.12 + ~0     |
-| 128 | 4  | 3.12%          | ~10^-20          | 3.12 + ~0     |
-| 128 | 8  | 6.25%          | ~10^-40          | 6.25 + ~0     |
+| 32  | 2  | 6.25%          | ~6 x 10^-9       | 6.25 + ~0     |
+| 64  | 4  | 6.25%          | ~1 x 10^-13      | 6.25 + ~0     |
+| 64  | 2  | 3.12%          | ~5 x 10^-8       | 3.12 + ~0     |
+| 128 | 4  | 3.12%          | ~3 x 10^-13      | 3.12 + ~0     |
+| 128 | 8  | 6.25%          | ~2 x 10^-23      | 6.25 + ~0     |
 
 At p=10^-4, P_loss is negligible for all reasonable (G,R) pairs. The
 binding constraint is **correlated failure**: if a firmware bug, power
@@ -2299,6 +2299,19 @@ It MUST be:
 - seekable by `commit_seq` in O(1),
 - auditable (tamper-evident hash chain).
 
+**On-disk encoding (normative):**
+- All fixed-width integers are encoded little-endian (§3.5.1).
+- All sizes below are **byte-exact**. Implementations MUST NOT use language
+  `sizeof(struct)` / `mem::size_of::<T>()` for on-disk offset math (padding would
+  silently corrupt indexing).
+
+**V1 constants (normative):**
+
+```
+MARKER_SEGMENT_HEADER_BYTES := 36
+COMMIT_MARKER_RECORD_BYTES  := 88
+```
+
 **Marker segment file:**
 
 `ecs/markers/segment-XXXXXX.log` stores a contiguous range of markers. Each file
@@ -2310,7 +2323,7 @@ MarkerSegmentHeader := {
   version         : u32,        -- 1
   segment_id      : u64,        -- monotonic identifier (matches filename)
   start_commit_seq: u64,        -- first commit_seq stored in this segment
-  record_size     : u32,        -- bytes per CommitMarkerRecord (constant in V1)
+  record_size     : u32,        -- bytes per CommitMarkerRecord (MUST be 88 in V1)
   header_xxh3     : u64,        -- xxhash3 of all preceding header fields
 }
 
@@ -2324,6 +2337,17 @@ CommitMarkerRecord := {
   record_xxh3        : u64,       -- xxhash3 of all preceding fields in this record
 }
 ```
+
+**MarkerId definition (normative):**
+
+`marker_id` MUST be computed with domain separation:
+
+```
+marker_id = Trunc128( BLAKE3( "fsqlite:marker:v1" || record_prefix_bytes ) )
+```
+
+where `record_prefix_bytes` is the canonical byte encoding of:
+`(commit_seq, commit_time_unix_ns, capsule_object_id, proof_object_id, prev_marker_id)`.
 
 `marker_id` is both:
 - the marker's integrity hash (tamper-evident), and
@@ -2354,14 +2378,14 @@ The allocator for the next commit sequence number is:
 
 ```
 // Inside the marker-append lock / commit section.
-let n_records = floor((segment_file_len_bytes - sizeof(MarkerSegmentHeader)) / record_size);
+let n_records = floor((segment_file_len_bytes - MARKER_SEGMENT_HEADER_BYTES) / record_size);
 next_commit_seq = start_commit_seq + n_records;
 ```
 
 **Torn tail handling (normative):**
 
 - If a marker segment ends with a partial record (i.e.,
-  `(segment_file_len_bytes - sizeof(MarkerSegmentHeader)) % record_size != 0`),
+  `(segment_file_len_bytes - MARKER_SEGMENT_HEADER_BYTES) % record_size != 0`),
   those trailing bytes MUST be treated as a torn-write tail and MUST be ignored
   for `commit_seq` allocation. Recovery MAY truncate them.
 - If the last complete record fails `record_xxh3` verification, recovery MUST
@@ -2384,7 +2408,7 @@ Given a target `commit_seq`, the reader locates the segment containing it
 Then compute:
 
 ```
-offset = sizeof(MarkerSegmentHeader)
+offset = MARKER_SEGMENT_HEADER_BYTES
        + (commit_seq - start_commit_seq) * record_size
 ```
 
@@ -5139,15 +5163,18 @@ SharedPageLockTable := {
 }
 
 PageLockEntry := {
-    page_number : AtomicU32,         -- 0 = empty slot, TOMBSTONE = deleted, else page number
-    owner_txn   : AtomicU64,         -- TxnId that holds the exclusive lock
+    page_number : AtomicU32,         -- 0 = empty slot, else page number
+    owner_txn   : AtomicU64,         -- TxnId that holds the exclusive lock (0 = unlocked)
 }
 ```
 
 **Representation notes (normative):**
-- `TOMBSTONE := 0xFFFF_FFFF` is reserved. `PageNumber` MUST NOT take this value.
-- `owner_txn == 0` means "not currently locked", but `page_number` may still be
-  occupied (either by a live key or a tombstone).
+- `page_number == 0` means "empty slot".
+- `owner_txn == 0` means "not currently locked".
+- **Key stability (normative):** `page_number` MUST NOT be deleted/tombstoned as
+  part of normal `release()`. Keys are cleared only during a quiescent rebuild
+  (§5.6.3.1). This avoids key-deletion races in a lock-free linear-probing table
+  where `(page_number, owner_txn)` are separate atomics.
 
 **Acquire (linear probing with atomic insertion):**
 
@@ -5161,56 +5188,37 @@ PageLockEntry := {
      - On failure: return `SQLITE_BUSY`.
    - If `entries[idx].page_number == 0` (empty):
      - CAS `page_number` from 0 -> `page_number` to claim the slot.
-       If CAS fails, continue probing (someone else raced).
+       If CAS fails, do NOT advance: re-read the same slot and continue probing.
+       (The winner may have inserted `page_number` here; advancing can create
+       duplicate keys in a lock-free open-addressing table.)
      - Then CAS `owner_txn` from 0 -> requesting TxnId.
        **MUST NOT** `store()` here: after the key is published, another process
        may observe `(page_number=P, owner_txn=0)` and acquire via CAS. A plain
        store would clobber that winner.
        If this CAS fails, another process raced and won; treat as `SQLITE_BUSY`
        (correct) and continue/retry as policy.
-   - If `entries[idx].page_number == TOMBSTONE`:
-     - Tombstones MAY transiently carry a nonzero `owner_txn` (e.g., a crash
-       between deletion steps). A tombstone slot is reusable only after its
-       `owner_txn` is 0.
-     - If `owner_txn != 0`, the probing process MAY "help" finalize deletion by
-       CASing `owner_txn` from the observed value -> 0, then continue probing.
-       (If the CAS fails, someone else is racing; continue probing.)
-     - If `owner_txn == 0`, remember the first such tombstone index and continue
-       probing to ensure there is no existing entry for `page_number`. When an
-       empty slot is found (or after a full probe), attempt to reuse the
-       remembered tombstone by CAS `page_number` from TOMBSTONE -> `page_number`,
-       then CAS `owner_txn` from 0 -> requesting TxnId.
    - Else: advance `idx = (idx + 1) & (capacity - 1)`.
 
 This insertion discipline is required: inserting by writing `owner_txn` alone
 is incorrect because it would create entries with no discoverable key.
 
-**Release (tombstone deletion, ordering-critical):**
+**Release (key-stable, race-free):**
 
 - Locate the entry for `page_number` by probing from its hash.
-- **Step 1:** CAS `page_number` from `page_number` -> TOMBSTONE. This removes
-  the entry from the probe chain's perspective first. (Do NOT clear to 0;
-  clearing to empty in a linear-probing table breaks probe chains and causes
-  false negatives for entries hashed past this slot.)
-- **Step 2:** Store `owner_txn = 0` (Release ordering). If the process crashes
-  after Step 1 but before Step 2, other processes will eventually encounter the
-  tombstone and may clear `owner_txn` to 0 (helping) as part of acquisition.
+- CAS `owner_txn` from `releasing TxnId` -> 0 (Release ordering).
+- MUST NOT modify `page_number` during normal release. Key deletion in a
+  lock-free linear-probing table with separate `(page_number, owner_txn)` atomics
+  is not safe; rebuild under quiescence is the only supported removal mechanism
+  (§5.6.3.1).
 
-**Why this order matters:** If we clear `owner_txn` first (to 0) before
-tombstoning, there is a race window where another process sees
-`(page_number=P, owner_txn=0)` and interprets it as "page P is in the table
-but unlocked" — allowing a spurious re-acquire of a slot that is about to
-become a tombstone. By tombstoning first, the entry is immediately invisible
-to new acquirers.
-
-Tombstones are reused by subsequent inserts; if tombstones accumulate and probe
-lengths degrade, the system MAY rebuild the table under a global quiescence
-point (e.g., when no Active concurrent transactions exist).
+Because keys persist, the table can saturate in long-running workloads. The
+lease-based rebuild protocol (§5.6.3.1) clears the table at a proven quiescence
+point to reclaim capacity and bound probe lengths.
 
 This is simpler than the in-process sharded HashMap but provides the same
 semantics: exclusive write locks per page, immediate failure on contention.
 
-##### 5.6.3.1 Tombstone Rebuild (Lease + Quiescence Barrier)
+##### 5.6.3.1 Table Rebuild (Lease + Quiescence Barrier)
 
 The shared-memory lock table is fixed-capacity in V1; "rebuild" means "clear
 tombstones by resetting the table", not "resize".
@@ -5589,37 +5597,42 @@ Legacy SQLite processes do not understand `foo.db.fsqlite-shm`. They coordinate
 only via the standard SQLite lock regime (`foo.db-shm` WAL-index locks and
 database-file byte locks). This creates a strict interop boundary:
 
-- **Serialized mode** MAY interoperate with legacy writers (it uses the standard
-  WAL write-lock protocol and single-writer semantics).
-- **Concurrent mode** MUST exclude legacy writers, because a legacy writer would
-  bypass the `.fsqlite-shm` page lock table and SSI witness plane, undermining
-  correctness assumptions.
+- When `foo.db.fsqlite-shm` is used (the default fast path), FrankenSQLite MUST
+  run the Hybrid SHM protocol (§5.6.7). This supports **legacy readers** but
+  MUST exclude legacy writers (a legacy writer would bypass `.fsqlite-shm` and
+  can corrupt the WAL).
+- If `foo.db.fsqlite-shm` cannot be used, FrankenSQLite falls back to standard
+  SQLite file locking (single-writer). This fallback can interoperate with
+  legacy writers, but it has no multi-writer MVCC and no SSI.
 
-##### 5.6.6.1 Legacy Writer Exclusion (Required for Concurrent Mode)
+##### 5.6.6.1 Legacy Writer Exclusion (Required When Using `foo.db.fsqlite-shm`)
 
 **Problem:** If a legacy writer can acquire SQLite's standard write locks while
-any `BEGIN CONCURRENT` transaction is active, it can write pages without
-participating in page-level exclusion or witness registration.
+FrankenSQLite is operating in Compatibility mode with `foo.db.fsqlite-shm`, it
+can write pages without participating in MVCC coordination or witness
+registration.
 
-**Rule (normative):** In Compatibility mode, while **any** Concurrent-mode
-transaction exists for a database, the system MUST hold a legacy-writer
-exclusion lock that prevents a standard SQLite process from becoming a writer.
+**Rule (normative):** In Compatibility mode, whenever `foo.db.fsqlite-shm` is
+in use, the system MUST hold a legacy-writer exclusion lock that prevents a
+standard SQLite process from becoming a writer.
 
-**WAL mode (required for Compatibility+Concurrent):**
+**WAL mode (required for Compatibility mode):**
 - The exclusion lock MUST be `WAL_WRITE_LOCK` on the legacy WAL-index shared
   memory (`foo.db-shm`).
-- The lock MUST be held continuously for the duration of the Concurrent epoch
-  (until no Concurrent txns remain).
+- The lock MUST be held for the coordinator's lifetime (Hybrid SHM protocol,
+  §5.6.7). Releasing it creates a window for a legacy writer.
 - Legacy readers remain permitted: `WAL_WRITE_LOCK` blocks writers, not readers.
 
 **Coordinator note (multi-process):** Because `WAL_WRITE_LOCK` is exclusive,
-Compatibility+Concurrent requires a single cross-process commit sequencer while
-the exclusion lock is held. In multi-process deployments, other processes MUST
-route commit publication through the sequencer (shared-memory two-phase queue)
-so the lock is not released to legacy writers between commits.
+Compatibility mode with `foo.db.fsqlite-shm` requires a single cross-process
+commit sequencer while the exclusion lock is held. In multi-process deployments,
+other processes MUST route commit publication through the sequencer (shared
+memory two-phase queue) so the lock is not released to legacy writers between
+commits.
 
-If the exclusion lock cannot be acquired, `BEGIN CONCURRENT` MUST fail with
-`SQLITE_BUSY` (or wait per busy-timeout).
+If the exclusion lock cannot be acquired, the database open MUST fail with
+`SQLITE_BUSY` (or wait per busy-timeout), because the Hybrid SHM protocol
+cannot be made safe without excluding legacy writers.
 
 ##### 5.6.6.2 No-SHM Fallback (File Locks Only)
 
@@ -6410,9 +6423,9 @@ First-Committer-Wins and make conflict behavior timing-dependent.
 
 **External interop hook (Compatibility mode):** Concurrent-mode exclusion is
 meaningless if a legacy SQLite writer can bypass `.fsqlite-shm` entirely.
-Therefore, in Compatibility mode, `BEGIN CONCURRENT` MUST also activate the
-legacy writer exclusion lock (§5.6.6.1). It is forbidden to run Concurrent mode
-without excluding legacy writers.
+Therefore, Compatibility mode with `foo.db.fsqlite-shm` MUST exclude legacy
+writers via the Hybrid SHM protocol (§5.6.6.1, §5.6.7). It is forbidden to run
+multi-writer MVCC while legacy writers are permitted.
 
 ### 5.9 Write Coordinator Detail
 
@@ -6428,6 +6441,17 @@ sequencing** critical section. Its responsibilities differ by operating mode:
 
 This split is structural: it prevents "one sequencing thread moves all bytes"
 from becoming the scalability ceiling on modern NVMe.
+
+**Multi-process note (normative):** In a multi-process deployment, "the
+coordinator" is a **role**, not necessarily a thread in every process:
+- Exactly one process MUST hold the coordinator role for a database at a time
+  (lease-backed; same posture as TxnSlot leases).
+- In Compatibility mode with `foo.db.fsqlite-shm` (Hybrid SHM protocol, §5.6.7),
+  this is REQUIRED to uphold the legacy writer exclusion lock (§5.6.6.1): the
+  coordinator holds `WAL_WRITE_LOCK` for its lifetime and sequences WAL appends.
+- Other processes MUST route commit publication through the coordinator (shared
+  memory two-phase queue; asupersync reserve/commit discipline). The in-process
+  channel examples below define the **message schemas**; the transport differs.
 
 #### 5.9.1 Native Mode Sequencer (Tiny Marker Path)
 
@@ -6690,10 +6714,10 @@ block on `tx.reserve(cx).await`, which provides backpressure. This prevents
 unbounded memory growth from write set buffering and naturally rate-limits
 the commit pipeline when the WAL I/O is the bottleneck.
 
-### 5.10 Algebraic Write Merging and Intent Logs
+### 5.10 Safe Write Merging and Intent Logs
 
 Page-level MVCC can conflict on hot pages (B-tree root, internal nodes during
-splits, hot leaf pages). Algebraic Write Merging reduces false conflicts
+splits, hot leaf pages). Safe write merging reduces false conflicts
 **without** upgrading to row-level MVCC metadata (which would break file format
 and cost space).
 
@@ -6806,13 +6830,23 @@ byte-range disjointness** (§3.4.5).
 Instead, physical merge is expressed as a `StructuredPagePatch` whose operations
 are keyed by stable identifiers rather than physical offsets.
 
+**Implementation model (normative):** For SQLite structured pages, physical merge
+MUST be implemented as `parse -> merge -> repack` (deterministic). It MUST NOT be
+implemented as "apply two byte patches to the same base page", even when the
+byte ranges appear disjoint.
+
+In SAFE mode, `StructuredPagePatch` for B-tree leaf pages MUST contain only
+semantic cell operations (`cell_ops` keyed by `cell_key_digest`). Header and
+free-space layout is derived by repacking; patches MUST NOT encode physical
+cell offsets as merge inputs.
+
 **StructuredPagePatch (normative representation):**
 
 ```
 StructuredPagePatch {
-  header_ops: Vec<HeaderOp>,         -- serialized (not merged)
+  header_ops: Vec<HeaderOp>,         -- derived during repack (SHOULD be empty for SAFE B-tree leaf merges)
   cell_ops: Vec<CellOp>,            -- mergeable when disjoint by cell_key
-  free_ops: Vec<FreeSpaceOp>,       -- default: conflict; future: structured merge
+  free_ops: Vec<FreeSpaceOp>,       -- derived during repack (SHOULD be empty for SAFE B-tree leaf merges)
   raw_xor_ranges: Vec<RangeXorPatch>, -- forbidden for SQLite structured pages; debug-only for opaque pages
 }
 ```
@@ -7724,10 +7758,11 @@ verifiability:
 - Purpose: Prove SQL/API correctness against C SQLite 3.52.0.
 - DB file is standard SQLite format.
 - WAL frames are standard SQLite WAL frames.
-- Legacy SQLite readers MAY attach concurrently. Legacy writers MAY attach only
-  when FrankenSQLite is not in Concurrent mode. While any `BEGIN CONCURRENT`
-  transaction exists, Compatibility mode MUST exclude legacy writers using the
-  legacy-writer exclusion lock (§5.6.6.1).
+- Legacy SQLite readers MAY attach concurrently.
+- Legacy writers are excluded whenever `foo.db.fsqlite-shm` is in use (Hybrid
+  SHM protocol, §5.6.7). To interoperate with legacy writers, run without
+  `foo.db.fsqlite-shm` (file-lock fallback, §5.6.6.2), which disables
+  multi-writer MVCC and SSI.
 - We may write *extra* sidecars (`.wal-fec` for repair symbols, `.idx-fec`
   for index repair) but the core `.db` stays SQLite-compatible when
   checkpointed.
@@ -7847,7 +7882,7 @@ For each publish request:
    referents are not — an irrecoverable corruption on crash.
 5. **Persist marker (tiny):** Append a `CommitMarkerRecord` (§3.5.4.1) to the
    marker stream. This is the atomic "this commit exists" step (fixed-size,
-   ~96 bytes in V1). `prev_marker_id` links to the previous marker, and
+   88 bytes in V1). `prev_marker_id` links to the previous marker, and
    `marker_id` is the integrity hash of the record.
 6. **FSYNC barrier (post-marker):** Issue `fdatasync` on the marker stream.
    The client MUST NOT receive a success response until this completes.
@@ -7935,13 +7970,13 @@ Compaction MUST be:
     -   Write a new `cache/object_locator.cache.tmp` built from the rewritten logs.
 
 3.  **Publish Phase (Two-Phase, Normative Ordering):**
-    -   Atomically publish the new locator:
-        - `fdatasync(cache/object_locator.cache.tmp)`
-        - `rename(cache/object_locator.cache.tmp, cache/object_locator.cache)`
-        - `fsync(cache/ dir)` if required by VFS.
     -   Atomically publish compacted segments:
         - `rename(segment-*.log.compacting, segment-*.log)`
         - `fsync(ecs/symbols/ dir)` if required by VFS.
+    -   Atomically publish the new locator (MUST be AFTER segment publish):
+        - `fdatasync(cache/object_locator.cache.tmp)`
+        - `rename(cache/object_locator.cache.tmp, cache/object_locator.cache)`
+        - `fsync(cache/ dir)` if required by VFS.
     -   **Ordering rule:** old segments MUST NOT be retired until both the new
         segments and the new locator are durable. This prevents a crash from
         leaving the system with neither a valid locator nor the old segments
@@ -9873,10 +9908,11 @@ Journal Page Records (repeated page_count times):
 ```
 
 **Checksum:** `nonce + data[page_size-200] + data[page_size-400] + ... + data[k]`
-where k is the smallest value `>= 0` in the arithmetic sequence. The loop
-starts at offset `page_size - 200`, decrements by 200 each step, and stops
-when the offset would go below zero (pager.c `pager_cksum()`). For 4096-byte
-pages: 20 bytes summed (offsets 3896, 3696, ..., 96).
+where k is the smallest value `> 0` (strictly positive) in the arithmetic
+sequence. The loop condition is `while( i > 0 )`, so `data[0]` is **never**
+sampled (pager.c `pager_cksum()`). Each `data[i]` reads a single `u8` byte,
+accumulated into a `u32` sum. For 4096-byte pages: 19 bytes summed (offsets
+3896, 3696, ..., 296, 96).
 
 **Hot journal recovery:** On open, if a journal file exists, is non-empty,
 and the database's reserved lock is not held, it is a "hot journal." Recovery
@@ -13089,8 +13125,8 @@ all writers -- is replaced with page-level MVCC versioning and Serializable
 Snapshot Isolation (SSI). Applications choose their isolation level: Serialized
 mode for exact backward compatibility, Concurrent mode for true multi-writer
 parallelism with full SERIALIZABLE guarantees (not merely Snapshot Isolation).
-The conservative Page-SSI rule prevents write skew by default; algebraic write
-merging and intent-based deterministic rebase reduce conflict rates on hot
+The conservative Page-SSI rule prevents write skew by default; safe write
+merging (intent replay + structured page patch merge) and deterministic rebase reduce conflict rates on hot
 pages without row-level MVCC metadata. Cross-process MVCC uses a shared-memory
 coordination region with lease-based crash cleanup. The layered approach means
 zero risk for existing applications and serializable concurrency for
@@ -13102,8 +13138,9 @@ uses RaptorQ repair symbols for self-healing durability that survives torn
 writes without double-write journaling. The replication protocol is
 fountain-coded for bandwidth-optimal, UDP-based, multicast-capable data
 transfer over lossy networks. Version chains use XOR delta encoding (stored as ECS objects, erasure-coded
-for durability) for near-optimal compression. Conflict resolution uses GF(256) algebraic merging
-to resolve page-level false conflicts at byte granularity. The Erasure-Coded
+for durability) for near-optimal compression. Conflict resolution uses semantic write merging (intent
+replay + structured page patches keyed by stable identifiers); XOR/`GF(256)` is an encoding for patch/history
+objects, not a merge correctness criterion. The Erasure-Coded
 Stream (ECS) substrate provides content-addressed, self-describing,
 deterministic object storage with BLAKE3 ObjectIds and self-healing repair
 symbols. The result: data loss becomes a mathematical near-impossibility
@@ -13197,6 +13234,6 @@ an embedded database engine can achieve.
 
 ---
 
-*Document version: 1.16 (Round 6 audit fixes: shm commit_seq reconciliation on open; SharedPageLockTable tombstone rebuild lease + quiescence barrier; legacy-writer exclusion lock for Compatibility+Concurrent; HotWitnessIndex epoch swap locking; deterministic rebase clarified as observable-behavior (not byte layout) + V1 restrictions)*
+*Document version: 1.16 (Round 6 audit fixes: shm commit_seq reconciliation on open; SharedPageLockTable tombstone rebuild lease + quiescence barrier; Compatibility-mode legacy writer exclusion + hybrid SHM discipline; HotWitnessIndex epoch swap locking; deterministic rebase clarified as observable-behavior (not byte layout) + V1 restrictions)*
 *Last updated: 2026-02-07*
 *Status: Authoritative Specification*
