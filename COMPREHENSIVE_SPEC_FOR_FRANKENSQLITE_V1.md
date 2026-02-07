@@ -8886,7 +8886,9 @@ else:
   overflow_bytes = payload_size - local
 ```
 
-For 4096-byte page, 0 reserved: table leaf max_local = 4061, index max_local = 1003.
+For 4096-byte page, 0 reserved: table leaf max_local = 4061, index max_local = 1001.
+(Index: `(usable - 12) * 64 / 255 - 23` = `4084 * 64 / 255 - 23` = `1024 - 23` = 1001,
+using integer division.)
 
 **Overflow page format:**
 ```
@@ -9635,12 +9637,21 @@ Five affinities: TEXT, NUMERIC, INTEGER, REAL, BLOB.
 4. Type name contains "REAL", "FLOA", or "DOUB" -> REAL
 5. Otherwise -> NUMERIC
 
-**Comparison affinity rules** (when comparing values of different types):
-- If either operand has INTEGER, REAL, or NUMERIC affinity, apply numeric
-  affinity to both operands
-- If either operand has TEXT affinity and neither has numeric affinity, apply
-  TEXT affinity
-- Otherwise, no affinity applied (BLOB comparison)
+**Comparison affinity rules** (applied before comparison; determines which
+operand gets type coercion -- per SQLite documentation `datatype3.html`):
+
+1. If one operand has INTEGER, REAL, or NUMERIC affinity and the other has
+   TEXT or BLOB/NONE affinity: apply numeric affinity to the TEXT/BLOB
+   operand only. (The numeric operand is already in numeric form.)
+2. If one operand has TEXT affinity and the other has BLOB/NONE affinity
+   (and neither has numeric affinity): apply TEXT affinity to the BLOB/NONE
+   operand only.
+3. Otherwise (both have the same affinity class, or both have BLOB/NONE):
+   no affinity conversion is applied.
+
+**Key distinction from a common misreading:** affinity is applied to the
+operand that needs conversion, not to both. If both operands already share
+an affinity class, no coercion occurs.
 
 ### 12.17 Time Travel Queries (Native Mode Extension)
 
