@@ -6523,6 +6523,57 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
         }
       }
 
+      let COMPUTE_RUNNING = false;
+
+      async function computeAllMetrics() {
+        if (COMPUTE_RUNNING) return;
+        if (!DATASET.loaded) return;
+        if (!ALL_COMMITS.length) return;
+
+        COMPUTE_RUNNING = true;
+        const prog = document.getElementById("computeProgress");
+        if (prog) {
+          prog.classList.remove("hidden");
+          prog.textContent = "Computing metrics...";
+        }
+
+        try {
+          const total = ALL_COMMITS.length;
+          for (let i = 0; i < total; i++) {
+            const c = ALL_COMMITS[i];
+            const patch = patchForIdx(i);
+
+            // Always ensure quick metrics are present.
+            if (!METRICS.tokensChanged.has(c.hash) || !METRICS.bytesChanged.has(c.hash) || !METRICS.hunks.has(c.hash)) {
+              const qm = quickMetricsFromPatch(patch);
+              METRICS.tokensChanged.set(c.hash, qm.tokensChanged);
+              METRICS.bytesChanged.set(c.hash, qm.bytesChanged);
+              METRICS.hunks.set(c.hash, qm.hunks);
+            }
+
+            if (i > 0 && !METRICS.lev.has(c.hash)) {
+              const d = await levenshteinForPatch(patch);
+              METRICS.lev.set(c.hash, d);
+            }
+
+            if (prog) {
+              const haveLev = METRICS.lev.size;
+              prog.textContent = `Computed ${i + 1}/${total} commits · Levenshtein ready ${haveLev}/${total - 1}`;
+            }
+
+            if (i % 4 === 0) {
+              // Yield to keep UI responsive; refresh charts occasionally.
+              await new Promise((r) => setTimeout(r, 0));
+              if (i % 12 === 0) render();
+            }
+          }
+        } finally {
+          COMPUTE_RUNNING = false;
+          if (prog) prog.textContent = "Done. Charts updated.";
+          render();
+        }
+      }
+
       function syncDockAndDoc() {
         if (!ALL_COMMITS.length) return;
         DOC.idx = clamp(DOC.idx, 0, ALL_COMMITS.length - 1);
@@ -7212,8 +7263,59 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
         // BOCPD hazard slider
         document.getElementById("hazard").addEventListener("input", () => render());
 
+        // Stack chart controls
+        document.getElementById("stackResolution")?.addEventListener("change", () => render());
+        document.getElementById("stackMetric")?.addEventListener("change", () => render());
+
+        // Doc tabs + toggles
+        document.getElementById("docTabSpec")?.addEventListener("click", () => setDocTab("spec"));
+        document.getElementById("docTabDiff")?.addEventListener("click", () => setDocTab("diff"));
+        document.getElementById("docTabMetrics")?.addEventListener("click", () => setDocTab("metrics"));
+
+        document.getElementById("btnRawToggle")?.addEventListener("click", () => {
+          DOC.rawSpec = !DOC.rawSpec;
+          void updateDocUI();
+        });
+
+        document.getElementById("btnPrettyDiff")?.addEventListener("click", () => {
+          DOC.diffMode = "pretty";
+          void updateDocUI();
+        });
+        document.getElementById("btnRawDiff")?.addEventListener("click", () => {
+          DOC.diffMode = "raw";
+          void updateDocUI();
+        });
+
+        document.getElementById("btnComputeAll")?.addEventListener("click", () => {
+          void computeAllMetrics();
+        });
+
         // Galaxy brain button: jump to alien section
         document.getElementById("btnGalaxy").addEventListener("click", () => scrollToSection("sectionAlien"));
+
+        // Dock controls
+        document.getElementById("dockPrev")?.addEventListener("click", () => selectCommitIdx(DOC.idx - 1));
+        document.getElementById("dockNext")?.addEventListener("click", () => selectCommitIdx(DOC.idx + 1));
+        document.getElementById("dockSlider")?.addEventListener("input", (e) => {
+          const v = Number(e?.target?.value || 0);
+          selectCommitIdx(v);
+        });
+
+        document.addEventListener("keydown", (e) => {
+          const t = e.target;
+          const isTyping =
+            t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT" || t.isContentEditable);
+          if (isTyping) return;
+
+          if (e.key === "ArrowLeft") {
+            e.preventDefault();
+            selectCommitIdx(DOC.idx - 1);
+          }
+          if (e.key === "ArrowRight") {
+            e.preventDefault();
+            selectCommitIdx(DOC.idx + 1);
+          }
+        });
 
         // Mobile sheet
         const overlay = document.getElementById("overlay");
