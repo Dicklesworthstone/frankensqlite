@@ -6008,6 +6008,8 @@ cleanup_orphaned_slots():
                 continue
             if now - slot.claiming_timestamp > CLAIMING_TIMEOUT_SECS:
                 // Best-effort reclaim: clear fields again and free the slot.
+                slot.state = Free
+                slot.mode = Serialized
                 slot.begin_seq = 0
                 slot.snapshot_high = 0
                 slot.witness_epoch = 0
@@ -6046,6 +6048,8 @@ cleanup_orphaned_slots():
                 if slot.txn_id.CAS(TXN_ID_CLAIMING, TXN_ID_CLEANING):
                     // Clear snapshot/epoch fields as well: a future claimer must not
                     // observe stale begin_seq/witness_epoch under TXN_ID_CLAIMING (§5.6.5, §5.6.4.8).
+                    slot.state = Free
+                    slot.mode = Serialized
                     slot.begin_seq = 0
                     slot.snapshot_high = 0
                     slot.witness_epoch = 0
@@ -6073,7 +6077,8 @@ cleanup_orphaned_slots():
                 if !slot.txn_id.CAS(old_txn_id, TXN_ID_CLAIMING):
                     continue  // someone else is cleaning this slot
                 release_page_locks_for(old_txn_id)
-                slot.state = Aborted
+                slot.state = Free
+                slot.mode = Serialized
                 slot.commit_seq = 0
                 slot.begin_seq = 0
                 slot.snapshot_high = 0
