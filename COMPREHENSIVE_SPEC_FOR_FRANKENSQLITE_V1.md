@@ -7636,10 +7636,14 @@ For each publish request:
    If `has_in_rw && has_out_rw` (and `request.abort_policy != Custom`), the
    coordinator MUST abort with `SQLITE_BUSY_SNAPSHOT`.
 
-2. **Allocate `commit_seq`:** Assign the next commit sequence number.
+2. **Allocate `commit_seq` (gap-free, marker-tip-derived):** Assign the next
+   commit sequence number by deriving it from the physical marker stream tip,
+   inside the same cross-process serialized section used to append the marker
+   record (§3.5.4.1). This prevents commit sequence gaps under crash:
+   a `commit_seq` is not "consumed" unless a marker record is actually written.
    Also assign `commit_time_unix_ns` as a monotonic timestamp:
    `commit_time_unix_ns := max(now_unix_ns(), last_commit_time_unix_ns + 1)`.
-   Steps (2)–(7) form the sequencer's **commit section**: once `commit_seq` is
+   Steps (2)–(8) form the sequencer's **commit section**: once `commit_seq` is
    allocated, the coordinator MUST NOT observe cancellation until the marker is
    durable and the requester has been responded to. Implement using bounded
    masking (`Cx::masked` / commit_section semantics; §4.12.2–§4.12.3).
@@ -7676,7 +7680,8 @@ capsule symbols [persisted by committing txn, step 6 of §7.11.1]
     → FSYNC_1 (step 4)      ← ensures referents are durable
     → marker [persisted, step 5]
     → FSYNC_2 (step 6)      ← ensures marker is durable
-    → client response (step 7)
+    → shm.commit_seq publish (step 7)
+    → client response (step 8)
 ```
 
 Both barriers are **mandatory**:
