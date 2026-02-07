@@ -3627,20 +3627,23 @@ use asupersync::cx::Cx;
 use asupersync::runtime::spawn_blocking_io;
 
 /// Read exactly one database page into an owned pool buffer (no memcpy).
-async fn read_page(cx: &Cx, pool: &PageBufPool, fd: RawFd, offset: u64) -> Result<PageBuf> {
+///
+/// NOTE: Uses `std::os::unix::fs::FileExt::read_exact_at` (safe API),
+/// NOT raw `pread`/`RawFd` which would require `unsafe`.
+async fn read_page(cx: &Cx, pool: &PageBufPool, file: &Arc<File>, offset: u64) -> Result<PageBuf> {
     cx.checkpoint()?; // observe cancellation before scheduling blocking work
 
     let mut buf = pool.acquire(); // PageBuf (owned, RAII -> pool on drop)
+    let file = Arc::clone(file);
 
     // Move the owned buffer into the blocking closure. This is safe and `unsafe`-free.
-    let (buf, n): (PageBuf, usize) = spawn_blocking_io(move || {
-        // The concrete syscall wrapper is implementation detail (pread/pread64/etc).
-        let n = pread_exact(fd, offset, buf.as_mut_slice())?;
-        Ok((buf, n))
+    let buf: PageBuf = spawn_blocking_io(move || {
+        // FileExt::read_exact_at is safe Rust; no `unsafe` needed.
+        file.read_exact_at(buf.as_mut_slice(), offset)?;
+        Ok(buf)
     })
     .await?;
 
-    ensure!(n == buf.len(), "short read: expected {} got {}", buf.len(), n);
     Ok(buf)
 }
 ```
@@ -8915,8 +8918,13 @@ Header offset 32 = first trunk page; offset 36 = total freelist page count.
 
 **Entry format (5 bytes per page):**
 ```
-Byte 0:     Type code (1=root, 2=free, 3=overflow-first, 4=overflow-chain, 5=btree-child)
-Bytes 1-4:  Parent page number (u32 BE)
+Byte 0:     Type code:
+              1 = PTRMAP_ROOTPAGE  (root page of a B-tree; parent = 0)
+              2 = PTRMAP_FREEPAGE  (page on freelist; parent = 0)
+              3 = PTRMAP_OVERFLOW1 (first overflow page; parent = B-tree page holding the cell)
+              4 = PTRMAP_OVERFLOW2 (subsequent overflow page; parent = preceding overflow page)
+              5 = PTRMAP_BTREE     (non-root B-tree page; parent = B-tree parent page)
+Bytes 1-4:  Parent page number (u32 BE). Meaning varies by type (see above).
 ```
 
 **Location:** First pointer map page is always page 2.
