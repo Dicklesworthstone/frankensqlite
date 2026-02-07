@@ -55,19 +55,19 @@ Pseudocode and type definitions are normative unless explicitly labeled
 | **MVCC** | Multi-Version Concurrency Control. Transactions see a consistent snapshot while writers create new versions. |
 | **SSI** | Serializable Snapshot Isolation. Extends SI to detect write skew via rw-antidependency tracking. |
 | **ECS** | Erasure-Coded Stream. The universal persistence substrate: objects encoded as RaptorQ symbols. |
-| **ObjectId** | Content-addressed identifier: `BLAKE3(canonical_encoding(object))`, 32 bytes. |
+| **ObjectId** | Content-addressed identifier: `Trunc128(BLAKE3("fsqlite:ecs:v1" || canonical_object_header || payload_hash))`, 16 bytes. Canonical full digest is BLAKE3-256; the 128-bit truncation is for storage efficiency. |
 | **CommitCapsule** | Atomic unit of commit state in Native mode: intent log, page deltas, SSI witnesses. |
 | **CommitMarker** | The durable "this commit exists" record: capsule ObjectId + prev-marker chain. |
 | **CommitSeq** | Monotonically increasing `u64` commit sequence number (global "commit clock" for ordering). |
 | **RaptorQ** | RFC 6330 fountain code: K source symbols → unlimited encoding symbols, recoverable from any K' ≈ K. |
 | **OTI** | Object Transmission Information. RaptorQ metadata needed for decoding: (F, Al, T, Z, N). |
 | **DecodeProof** | Auditable witness artifact produced by the RaptorQ decoder when repairing or failing to repair (lab/debug). |
-| **Cx** | Capability context (asupersync). Threads cancellation, deadlines, and capability narrowing through every operation. |
+| **Cx** | Capability context (asupersync). Threads cancellation via `is_cancel_requested()` / `checkpoint()`, progress via `checkpoint_with()`, budgets/deadlines via `Budget` and scoped budgets, and type-level restriction via `Cx::restrict::<NewCaps>()`. |
 | **PageNumber** | 1-based `NonZeroU32` identifying a database page. Page 1 is always the database header. |
 | **TxnId** | Monotonically increasing `u64` transaction identifier. `TxnId::ZERO` represents the on-disk baseline. |
 | **TxnEpoch** | Monotonically increasing `u32` generation counter for a reused TxnSlot (prevents stale slot-id interpretation). |
 | **TxnToken** | Canonical transaction identity for SSI witness plane: `(TxnId, TxnEpoch)`. |
-| **SIREAD lock** | Marker recording "transaction T read page P under snapshot." Used for SSI rw-antidependency detection. |
+| **SIREAD witness (legacy term)** | PostgreSQL terminology for SSI read evidence ("SIREAD locks"). In FrankenSQLite this is represented by `ReadWitness` objects plus hot-plane reader bits; it does not block and is not a lock. |
 | **Intent log** | Semantic operation log: `Vec<IntentOp>`. Records what a transaction intended to do (insert, delete, update). |
 | **Deterministic rebase** | Replaying intent logs against the current committed snapshot to merge without byte-level patches. |
 | **PageHistory** | Compressed version chain: newest = full image, older = patches (intent logs and/or structured patches). |
@@ -161,7 +161,7 @@ model rather than a silent corruption or a "panic and pray" failure mode.
 
 | Dependency | Location | Role |
 |-----------|----------|------|
-| `asupersync` | `/dp/asupersync` | Async runtime, RaptorQ codec, Cx contexts, channels, lab reactor, e-processes |
+| `asupersync` | `/dp/asupersync` | Async runtime, RaptorQ codec, `Cx` capability contexts, structured concurrency (`Scope` + macros), lab runtime (deterministic scheduling, cancellation injection, chaos), oracles/e-process monitors, deadline monitoring, and trace/TLA export |
 | `frankentui` | `/dp/frankentui` | TUI framework (CLI shell only) |
 
 **No tokio.** All async I/O uses asupersync exclusively.
@@ -172,13 +172,12 @@ model rather than a silent corruption or a "panic and pray" failure mode.
 - **`unsafe_code = "forbid"`** -- no escape hatches
 - **Clippy pedantic + nursery at deny level** -- with specific documented allows
 - **23 crates** in workspace under `crates/`
-- **Release profile** (as configured in the workspace `Cargo.toml`): `opt-level = 3`,
+- **Release profile** (as configured in the workspace `Cargo.toml`): `opt-level = "z"`,
   `lto = true`, `codegen-units = 1`, `panic = "abort"`, `strip = true`
-  (This is a database engine where throughput is paramount. `opt-level = 3` enables
-  full inlining, loop unrolling, auto-vectorization, and SIMD codegen that are
-  critical for hot-path performance. Section 1.5 mandates SIMD-friendly layouts
-  and cache-line alignment -- these are meaningless without an optimizer that
-  exploits them.)
+  (We ship a lean binary by default. For throughput characterization and hot-path
+  tuning, use benchmark builds and profiling gates in §22; those run under
+  optimized benchmarking configurations rather than the size-optimized shipping
+  profile.)
 
 **Engineering & Process Constraints (from `AGENTS.md`):**
 - **User is in charge.** If the user overrides anything, follow the user.
@@ -311,36 +310,32 @@ cannot silently downgrade.
   that switch from `BEGIN` to `BEGIN CONCURRENT` get weaker guarantees without
   warning.
 - The conservative Page-SSI rule (`has_in_rw && has_out_rw => abort`) is
-  simple to implement: two boolean flags per transaction, one SIREAD table.
-  The overhead is bounded by the number of active transactions times pages read.
+  simple to implement: two boolean flags per transaction plus a witness plane
+  that makes read/write evidence discoverable across processes (§5.6.4, §5.7).
+  Hot-plane overhead is bounded by `TxnSlot` count and hot bucket capacity
+  (bitsets over slots); cold-plane evidence is append-only but GC-able by
+  `safe_gc_seq` horizons.
 - PostgreSQL has proven SSI viable in production since 2011 with <7% overhead
   and ~0.5% false positive abort rate. At page granularity, our false positive
   rate will be somewhat higher, but algebraic write merging (Section 5.10)
   compensates by turning many apparent conflicts into successful merges.
 - Starting with SSI from day one means we never ship a correctness regression.
-  We can always *reduce* abort rates later (finer-grained SIREAD tracking,
+  We can always *reduce* abort rates later (finer witness keys + refinement,
   better victim selection), but we cannot retroactively fix applications that
   relied on SI and experienced silent write skew.
 
 **Layer 3 (Future refinement): Reduced-abort SSI.**
-- Refine SIREAD granularity from page to (page, cell_tag) or (page, range_tag)
-  to reduce false positive aborts on hot pages.
+- Refine witness keys from `Page(pgno)` to `Cell(page, cell_tag)` and/or
+  `ByteRange(page, start, len)` to reduce false positive aborts on hot pages.
 - Smarter victim selection (instead of always aborting the committing pivot).
 - These are optimizations of SSI, not correctness changes.
 - **Value of Information (VOI) for granularity investment:** The decision to
-  invest engineering effort in cell-level SIREAD tracking should be data-driven.
-  Compute `VOI = E[ΔL_fp] * N_txn/day - C_impl`, where `E[ΔL_fp]` is the
-  expected reduction in false positive abort cost (measured by the SSI e-process
-  monitor INV-SSI-FP in Section 5.7), `N_txn/day` is daily transaction volume,
+  invest engineering effort in cell/byte-range witness refinement should be
+  data-driven. Compute `VOI = E[ΔL_fp] * N_txn/day - C_impl`, where `E[ΔL_fp]`
+  is the expected reduction in false positive abort cost (measured by the SSI
+  e-process monitor INV-SSI-FP in §5.7), `N_txn/day` is daily transaction volume,
   and `C_impl` is the amortized implementation cost. Only invest when VOI > 0.
-  This prevents premature optimization of the SIREAD granularity.
-- **Value of Information (VOI) for granularity investment:** The decision to
-  invest engineering effort in cell-level SIREAD tracking should be data-driven.
-  Compute `VOI = E[ΔL_fp] * N_txn/day - C_impl`, where `E[ΔL_fp]` is the
-  expected reduction in false positive abort cost (measured by the SSI e-process
-  monitor INV-SSI-FP in Section 5.7), `N_txn/day` is daily transaction volume,
-  and `C_impl` is the amortized implementation cost. Only invest when VOI > 0.
-  This prevents premature optimization of the SIREAD granularity.
+  This prevents premature optimization of witness granularity.
 
 ---
 
@@ -1127,7 +1122,7 @@ WalFecGroupMeta := {
     k_source       : u32,        // K
     r_repair       : u32,        // R
     oti            : OTI,        // decoding params (symbol size, block partitioning)
-    object_id      : [u8; 32],   // ObjectId of CompatWalCommitGroup (content-addressed)
+    object_id      : [u8; 16],   // ObjectId of CompatWalCommitGroup (content-addressed)
     page_numbers   : Vec<u32>,   // length = K; maps ISI 0..K-1 -> Pgno
     checksum       : u64,        // xxh3_64 of all preceding fields
 }
@@ -2091,6 +2086,8 @@ We replicate ECS objects, not files:
 - `CommitCapsule` objects (and patch objects they reference).
 - `CommitMarker` records (the commit clock).
 - `IndexSegment` objects (page version, object locator, manifest).
+- SSI witness-plane objects (§5.6.4, §5.7): `ReadWitness` / `WriteWitness` / `WitnessDelta` /
+  `WitnessIndexSegment` / `DependencyEdge` / `CommitProof` / `AbortWitness` / `MergeWitness`.
 - `CheckpointChunk` and `SnapshotManifest` objects.
 - Optionally: `DecodeProof` / audit traces for debugging.
 
@@ -2517,19 +2514,28 @@ FrankenSQLite's needs:
 
 Every FrankenSQLite operation accepts `&Cx`. This enables:
 
-- **Cooperative cancellation**: Long-running queries check `cx.is_cancelled()`
-  at VDBE instruction boundaries. `SQLITE_INTERRUPT` on cancellation.
-- **Deadline propagation**: `cx.with_deadline(duration)` automatically cancels
-  operations that exceed their time budget.
+- **Cooperative cancellation**: Long-running queries check `cx.is_cancel_requested()`
+  and MUST call `cx.checkpoint()` at explicit yield points (e.g., VDBE instruction
+  boundaries, symbol decode loops, long scans). `checkpoint()` is the canonical
+  cancellation observation point in asupersync and also records progress for
+  "stalled task" detection. FrankenSQLite maps `ErrorKind::Cancelled` to the most
+  precise SQLite error code for the context (default: `SQLITE_INTERRUPT`).
+- **Deadline propagation (budgets)**: time budgets are expressed as `Budget` deadlines
+  and enforced via region/scope budgets. When tightening a budget, callers MUST
+  compute `effective = cx.budget().meet(child)` and then use
+  `cx.scope_with_budget(effective)` so child scopes cannot loosen parent budgets.
+  Nested deadlines combine by `meet` semantics (tightest deadline wins).
 - **Compile-time capability narrowing**: Functions that should not perform I/O
-  accept `&Cx<NoIo>`. Functions that should not allocate accept `&Cx<NoBudget>`.
-  The type system prevents capability escalation.
+  accept a narrowed `&Cx<CapsWithoutIo>`. Pure layers (parser/planner) accept
+  capability sets without `IO`, `REMOTE`, and typically without `SPAWN`. Narrowing
+  is zero-cost via `cx.restrict::<NewCaps>()` and is monotone (`SubsetOf`), so the
+  type system prevents capability escalation.
 
 **Integration pattern:**
 ```rust
 fn execute_query(cx: &Cx, stmt: &PreparedStatement) -> Result<Rows> {
-    for opcode in &stmt.program {
-        cx.check_cancelled()?;  // cooperatively yield to cancellation
+    for (pc, opcode) in stmt.program.iter().enumerate() {
+        cx.checkpoint_with(format!("vdbe pc={pc} opcode={opcode:?}"))?;
         dispatch_opcode(cx, opcode)?;
     }
 }
@@ -2554,21 +2560,22 @@ use asupersync::cx::{Cx, cap};
 // Type aliases for FrankenSQLite-specific capability profiles
 type FullCaps = cap::All;                                   // Connection level: everything
 type StorageCaps = cap::CapSet<false, true, false, true, false>;  // VFS: time + I/O, no spawn/remote
-type ComputeCaps = cap::CapSet<false, false, false, false, false>; // Parser/planner: pure computation
+type ComputeCaps = cap::None;                               // Parser/planner: pure computation
 
 /// Connection::execute_query has full capabilities.
 /// It is the outermost entry point from the public API.
 pub fn execute_query(cx: &Cx<FullCaps>, sql: &str) -> Result<Rows> {
-    let ast = parse_sql(cx.narrow(), sql)?;          // narrow to ComputeCaps
-    let plan = plan_query(cx.narrow(), &ast)?;        // narrow to ComputeCaps
-    let program = codegen(cx.narrow(), &plan)?;       // narrow to ComputeCaps
+    let compute_cx = cx.restrict::<ComputeCaps>();
+    let ast = parse_sql(&compute_cx, sql)?;          // restrict to ComputeCaps
+    let plan = plan_query(&compute_cx, &ast)?;       // restrict to ComputeCaps
+    let program = codegen(&compute_cx, &plan)?;      // restrict to ComputeCaps
     execute_program(cx, &program)                     // full caps: needs I/O for page reads
 }
 
 /// The parser accepts only ComputeCaps. It cannot perform I/O.
 /// This is a compile-time guarantee, not a runtime check.
 fn parse_sql(cx: &Cx<ComputeCaps>, sql: &str) -> Result<Ast> {
-    cx.check_cancelled()?;  // cancellation is always available
+    cx.checkpoint()?;  // cancellation is always available
     // cx.blocking_io(...)  -- COMPILE ERROR: ComputeCaps lacks IO
     let lexer = Lexer::new(sql);
     Parser::parse(cx, lexer)
@@ -2576,11 +2583,13 @@ fn parse_sql(cx: &Cx<ComputeCaps>, sql: &str) -> Result<Ast> {
 
 /// The VFS layer accepts StorageCaps: it can do I/O and timers
 /// but cannot spawn tasks or make remote calls.
-fn read_page(cx: &Cx<StorageCaps>, file: &impl VfsFile, pgno: PageNumber) -> Result<PageData> {
-    cx.check_cancelled()?;
+fn read_page(cx: &Cx<StorageCaps>, file: &mut impl VfsFile, pgno: PageNumber) -> Result<PageData> {
+    cx.checkpoint()?;
     let offset = u64::from(pgno.get() - 1) * u64::from(page_size);
     let mut buf = vec![0u8; page_size as usize];
-    file.read_at(cx, offset, &mut buf)?;
+    // NOTE: `VfsFile` is synchronous (SQLite-compatible). Callers running on
+    // asupersync worker threads MUST offload the actual read to the blocking pool.
+    file.read(&mut buf, offset)?;
     Ok(PageData::from(buf))
 }
 ```
@@ -2593,8 +2602,8 @@ Connection::execute(cx: &Cx<All>)
     -> BtreeCursor::move_to(cx: &Cx<StorageCaps>)
       -> MvccPager::get_page(cx: &Cx<StorageCaps>)
         -> ArcCache::fetch(cx: &Cx<StorageCaps>)
-          -> VfsFile::read_at(cx: &Cx<StorageCaps>)
-            -> BlockingPool::spawn_blocking(cx, || { pread64(...) })
+          -> VfsFile::read(buf, offset)     // synchronous SQLite-compatible VFS method
+            -> asupersync::runtime::spawn_blocking_io(|| { pread64(...) })
 ```
 
 At each level, capabilities can only be narrowed, never widened. The VDBE
@@ -2604,148 +2613,174 @@ down to the pager, it narrows to `StorageCaps`. When the parser is invoked
 parser that accidentally tries to do I/O is caught at compile time, not at
 runtime.
 
-### 4.2 Lab Reactor -- Deterministic Testing
+### 4.2 Lab Runtime + Lab Reactor -- Deterministic Testing
 
-Asupersync's lab reactor provides a fully deterministic virtual I/O environment.
-No real syscalls, no real time, no real threads -- everything is simulated with
-controllable scheduling.
+Asupersync provides **deterministic testing primitives** that FrankenSQLite uses
+as the foundation for concurrency verification:
 
-**For MVCC testing, this is transformative:**
-- Run 100 concurrent transactions with deterministic interleaving
-- Reproduce any race condition by replaying the same schedule
-- Inject faults (disk failure, partial write) at precise points
-- Test crash recovery without actually crashing
+- `asupersync::lab::LabRuntime`: deterministic scheduling, virtual time, oracle suite,
+  trace certificates, replay capture, and (optional) chaos injection.
+- `asupersync::runtime::reactor::LabReactor`: a **virtual readiness reactor**
+  (tokens + injected events) for deterministic testing of async I/O readiness.
 
-**Integration:** All VFS operations in test mode route through the lab reactor.
-The MVCC stress tests use the lab reactor for reproducible concurrency testing
-rather than hoping real-thread interleavings happen to cover edge cases.
+**Critical clarification (merge-canon rule):** these lab primitives do **not**
+magically virtualize filesystem syscalls. Determinism is about *task scheduling,
+virtual time, cancellation injection, and trace equivalence classes*. Disk fault
+injection is provided by the FrankenSQLite harness via an explicit VFS wrapper
+(described below).
 
-**Complete test scenario: verifying snapshot isolation under deterministic scheduling:**
+**Why this matters for MVCC testing:**
+- Run 100 concurrent transactions with deterministic interleaving.
+- Reproduce any race condition by replaying the same seed + schedule certificate.
+- Systematically explore interleavings via DPOR-style explorers (Section 4.4, Section 17.4).
+- Inject cancellation at every await point to prove cancel-safety (below).
+- Inject *storage* faults via a deterministic `FaultInjectingVfs` wrapper (below).
+
+#### 4.2.1 The Real LabRuntime Skeleton (Actual Asupersync API)
+
+```rust
+use asupersync::lab::{LabConfig, LabRuntime};
+use asupersync::types::Budget;
+
+let mut runtime = LabRuntime::new(LabConfig::new(0xDEAD_BEEF).worker_count(4).max_steps(100_000));
+let region = runtime.state.create_root_region(Budget::INFINITE);
+
+let (t1_id, _t1) = runtime.state.create_task(region, Budget::INFINITE, async move {
+    // Inside tasks, `Cx::current()` is set by the runtime (capabilities, cancellation, budgets).
+    // let cx = asupersync::cx::Cx::current().expect("cx");
+    // ... run test logic ...
+    1_u64
+}).expect("create task");
+
+runtime.scheduler.lock().unwrap().schedule(t1_id, 0);
+
+let report = runtime.run_until_quiescent_with_report();
+assert!(report.oracle_report.all_passed(), "oracle failures:\n{}", report.oracle_report);
+assert!(report.invariant_violations.is_empty(), "lab invariants: {:?}", report.invariant_violations);
+```
+
+#### 4.2.2 Systematic Cancellation Injection (Actual Asupersync API)
+
+Cancellation can strike at any `.await`. FrankenSQLite MUST be cancel-correct:
+no leaked locks, no leaked obligations, no half-commits.
+
+```rust
+use asupersync::lab::{lab, InjectionStrategy, InstrumentedFuture};
+
+#[test]
+fn mvcc_commit_is_cancel_safe() {
+    let report = lab(42)
+        .with_cancellation_injection(InjectionStrategy::AllPoints)
+        .with_all_oracles()
+        .run(|injector| InstrumentedFuture::new(async {
+            // ... run a representative MVCC commit scenario ...
+        }, injector));
+
+    assert!(report.all_passed(), "Cancellation failures:\n{}", report);
+}
+```
+
+#### 4.2.3 FrankenSQLite Harness: FsLab + FaultInjectingVfs (Adds What Asupersync Does Not)
+
+To keep the spec examples readable *and* remain truthful to asupersync APIs,
+FrankenSQLite defines harness utilities in `crates/fsqlite-harness/`:
+
+- `fsqlite_harness::lab::FsLab`: a small wrapper around `LabRuntime` that provides
+  ergonomic `run(|cx| async { ... })` and `spawn(name, |cx| async { ... })` helpers.
+- `fsqlite_harness::vfs::FaultInjectingVfs`: deterministic disk fault injection
+  for SQLite-style VFS calls (torn writes, partial writes, fsync loss, power-cut).
+
+These wrappers are **FrankenSQLite functionality**, built on the asupersync lab runtime.
+
+**Complete scenario (canonical): snapshot isolation under deterministic scheduling**
 
 ```rust
 #[test]
 fn snapshot_isolation_holds_under_specific_interleaving() {
-    let config = LabConfig::new()
-        .seed(0xDEAD_BEEF)           // deterministic scheduling seed
-        .max_steps(100_000)
-        .worker_count(4);
+    let mut lab = fsqlite_harness::lab::FsLab::new(0xDEAD_BEEF)
+        .worker_count(4)
+        .max_steps(100_000);
 
-    let mut lab = LabRuntime::new(config);
-
-    lab.run(|cx| async move {
+    let report = lab.run(|cx| async move {
         let db = Database::open_in_memory(cx).await.unwrap();
         db.execute(cx, "CREATE TABLE t(id INTEGER PRIMARY KEY, val INTEGER)").await.unwrap();
         db.execute(cx, "INSERT INTO t VALUES(1, 100)").await.unwrap();
         db.execute(cx, "INSERT INTO t VALUES(2, 200)").await.unwrap();
 
-        // T1: long-running reader -- takes a snapshot, then reads after T2 commits
         let db1 = db.clone();
-        let t1 = cx.spawn("reader", async move |cx| {
+        let t1 = lab.spawn("reader", move |cx| async move {
             let txn = db1.begin_concurrent(cx).await.unwrap();
-            // Read row 1 -- sees original value
             let val1 = txn.query_one(cx, "SELECT val FROM t WHERE id=1").await.unwrap();
             assert_eq!(val1, 100);
 
-            // Yield -- this is where the deterministic scheduler allows T2 to run
-            cx.yield_now().await;
+            cx.checkpoint_with("yield to let writer commit")?;
+            fsqlite_harness::yield_now().await; // harness-level deterministic yield helper
 
-            // Read row 1 again -- MUST still see 100 (snapshot isolation)
-            // even though T2 has committed val=999 by now
             let val1_again = txn.query_one(cx, "SELECT val FROM t WHERE id=1").await.unwrap();
             assert_eq!(val1_again, 100, "snapshot isolation violated!");
-
             txn.commit(cx).await.unwrap();
+            Ok::<_, FrankenError>(())
         });
 
-        // T2: writer -- modifies row 1 and commits while T1 is active
         let db2 = db.clone();
-        let t2 = cx.spawn("writer", async move |cx| {
+        let t2 = lab.spawn("writer", move |cx| async move {
             let txn = db2.begin_concurrent(cx).await.unwrap();
             txn.execute(cx, "UPDATE t SET val=999 WHERE id=1").await.unwrap();
             txn.commit(cx).await.unwrap();
+            Ok::<_, FrankenError>(())
         });
 
         t1.await.unwrap();
         t2.await.unwrap();
+        Ok::<_, FrankenError>(())
     });
 
-    let report = lab.report();
-    assert!(report.invariant_violations.is_empty());
+    assert!(report.oracle_report.all_passed(), "oracle failures:\n{}", report.oracle_report);
+    assert!(report.invariant_violations.is_empty(), "lab invariants: {:?}", report.invariant_violations);
 }
 ```
 
-**Injecting disk failure at a specific write offset:**
+**Canonical storage fault tests (FrankenSQLite harness VFS wrapper):**
 
 ```rust
 #[test]
 fn wal_survives_torn_write_at_frame_3() {
-    let config = LabConfig::new().seed(42).max_steps(50_000);
-    let mut lab = LabRuntime::new(config);
-
-    lab.run(|cx| async move {
-        let vfs = LabVfs::new(cx);
-
-        // Inject a torn write: after writing exactly 2 complete WAL frames
-        // (header + 2 * (frame_header + page_data)), corrupt the next write
-        let wal_header_size = 32;
-        let frame_size = 24 + 4096;  // frame header + page data
-        let corruption_offset = wal_header_size + 2 * frame_size;
-
-        vfs.inject_fault(FaultSpec {
-            file_pattern: "*.wal",
-            trigger: FaultTrigger::WriteAtOffset(corruption_offset),
-            effect: FaultEffect::TornWrite { valid_bytes: 17 },  // partial frame header
-        });
+    let mut lab = fsqlite_harness::lab::FsLab::new(42).max_steps(50_000);
+    let report = lab.run(|cx| async move {
+        let vfs = fsqlite_harness::vfs::FaultInjectingVfs::new(UnixVfs::new());
+        vfs.inject_fault(FaultSpec::torn_write("*.wal").at_offset_bytes(32 + 2 * (24 + 4096)).valid_bytes(17));
 
         let db = Database::open(cx, &vfs, "test.db").await.unwrap();
         // ... perform a 5-page transaction that writes 5 WAL frames ...
-        // Frame 3 will be torn. With RaptorQ repair symbols (R=2),
-        // the commit should be recoverable.
+        drop(db); // crash
 
-        // Simulate crash
-        drop(db);
-
-        // Recovery
         let db = Database::open(cx, &vfs, "test.db").await.unwrap();
         db.execute(cx, "PRAGMA integrity_check").await.unwrap();
-        // All 5 pages should be recovered via RaptorQ decoding
+        Ok::<_, FrankenError>(())
     });
+
+    assert!(report.oracle_report.all_passed(), "oracle failures:\n{}", report.oracle_report);
 }
-```
 
-**Simulating power loss during WAL commit:**
-
-```rust
 #[test]
 fn power_loss_during_wal_commit_preserves_atomicity() {
-    let config = LabConfig::new().seed(7777).max_steps(50_000);
-    let mut lab = LabRuntime::new(config);
-
-    lab.run(|cx| async move {
-        let vfs = LabVfs::new(cx);
-
-        // Inject power loss after fsync of WAL frames but before
-        // writing the commit record
-        vfs.inject_fault(FaultSpec {
-            file_pattern: "*.wal",
-            trigger: FaultTrigger::AfterNthSync(1),  // after first fsync (frames)
-            effect: FaultEffect::ProcessCrash,         // simulated power loss
-        });
+    let mut lab = fsqlite_harness::lab::FsLab::new(7777).max_steps(50_000);
+    let report = lab.run(|cx| async move {
+        let vfs = fsqlite_harness::vfs::FaultInjectingVfs::new(UnixVfs::new());
+        vfs.inject_fault(FaultSpec::power_cut("*.wal").after_nth_sync(1));
 
         let db = Database::open(cx, &vfs, "test.db").await.unwrap();
         db.execute(cx, "CREATE TABLE t(x INTEGER)").await.unwrap();
         db.execute(cx, "INSERT INTO t VALUES(1)").await.unwrap();
+        let _ = db.execute(cx, "INSERT INTO t VALUES(2)").await; // interrupted
 
-        // This transaction's commit will be interrupted
-        let result = db.execute(cx, "INSERT INTO t VALUES(2)").await;
-        // The process "crashed" -- result is irrelevant
-
-        // Recovery: reopen database. The uncommitted transaction must not
-        // be visible (atomicity guarantee).
         let db = Database::open(cx, &vfs, "test.db").await.unwrap();
         let count: i64 = db.query_one(cx, "SELECT count(*) FROM t").await.unwrap();
         assert_eq!(count, 1, "uncommitted transaction must not be visible after crash");
+        Ok::<_, FrankenError>(())
     });
+
+    assert!(report.oracle_report.all_passed(), "oracle failures:\n{}", report.oracle_report);
 }
 ```
 
@@ -2872,8 +2907,8 @@ transaction holds a lock. We define the observation function:
 
 ```rust
 /// Check INV-2 at the current instant.
-/// Returns 1.0 (violation) if any page has two holders, 0.0 otherwise.
-fn observe_lock_exclusivity(lock_table: &PageLockTable) -> f64 {
+/// Returns true (violation) if any page has two holders, false otherwise.
+fn observe_lock_exclusivity(lock_table: &PageLockTable) -> bool {
     // The lock table maps PageNumber -> TxnId.
     // By construction, HashMap allows only one value per key.
     // But we additionally verify against the per-transaction lock sets:
@@ -2887,19 +2922,19 @@ fn observe_lock_exclusivity(lock_table: &PageLockTable) -> f64 {
     }
     for (pgno, holders) in &page_holders {
         if holders.len() > 1 {
-            return 1.0;  // VIOLATION
+            return true; // VIOLATION
         }
     }
-    0.0  // no violation
+    false // no violation
 }
 
 // In the test loop, after each operation:
-let observation = observe_lock_exclusivity(&lock_table);
-inv2_eprocess.observe(observation);
-if inv2_eprocess.current_evalue().rejects_at(0.05) {
+let violated = observe_lock_exclusivity(&lock_table);
+inv2_eprocess.observe(violated);
+if inv2_eprocess.rejected {
     panic!(
         "INV-2 violated: e-value {} >= threshold {} after {} observations",
-        inv2_eprocess.current_evalue().value,
+        inv2_eprocess.e_value(),
         inv2_eprocess.config.threshold(),
         inv2_eprocess.observations,
     );
@@ -3144,57 +3179,85 @@ let result = fsqlite_harness::sheaf::check_consistency(&sections, &global_versio
 assert!(result.is_consistent(), "Sheaf violation: {}", result.obstruction());
 ```
 
-### 4.7 Conformal Calibration -- Distribution-Free Confidence
+### 4.7 Conformal Calibration -- Distribution-Free Confidence (Oracles + Perf)
 
-For performance benchmarks, conformal calibration provides **distribution-free
-confidence intervals** rather than assuming normal distributions. This means:
+Conformal prediction is used in two **distinct** ways:
 
-- "Page lock contention is below 5% with 95% confidence" is a rigorous
-  statement, not a guess based on assumed distributions
-- Benchmark results include conformal p-values for regression detection
-- No parametric assumptions needed (important because database workloads
-  are highly non-normal)
+1. **Oracle anomaly detection (asupersync-native):** calibrate on `OracleReport`s
+   from deterministic lab runs and produce prediction sets for invariant-level
+   behavior (distribution-free, finite-sample coverage).
+2. **Numeric performance regression detection (FrankenSQLite harness):** treat
+   throughput/latency/memory as first-class metrics, but gate changes using the
+   Extreme Optimization Loop (baseline → profile → one-lever change → isomorphism
+   proof → verify) rather than pretending a single conformal wrapper replaces
+   benchmarking statistics.
 
-**Concrete example: detecting MVCC throughput regression:**
+#### 4.7.1 Oracle Calibrator (Actual Asupersync API)
+
+Asupersync's `ConformalCalibrator` consumes `OracleReport` (not raw floats):
 
 ```rust
-use asupersync::lab::conformal::{ConformalCalibrator, ConformalConfig};
+use asupersync::lab::{ConformalCalibrator, ConformalConfig, LabConfig, LabRuntime};
+use asupersync::types::Budget;
 
-let mut calibrator = ConformalCalibrator::new(ConformalConfig {
-    alpha: 0.05,                    // 95% coverage guarantee
-    min_calibration_samples: 50,     // need at least 50 baseline runs
-    // NOTE: 20 samples is too few. With n calibration samples and alpha=0.05,
-    // the conformal prediction set is bounded by the ceil((1-alpha)*(n+1))-th
-    // order statistic. For n=20: the 20th of 21 order statistics = the range.
-    // This produces prediction intervals so wide they rarely reject anything.
-    // For n=50: the 48th of 51 order statistics, giving meaningful resolution.
-    // Rule of thumb: n >= 1/(alpha * epsilon) where epsilon is the desired
-    // precision of the coverage guarantee. For alpha=0.05, epsilon=0.1:
-    // n >= 200. We use 50 as the minimum (phase gates run 100+ trials).
+let mut cal = ConformalCalibrator::new(ConformalConfig {
+    alpha: 0.05,                  // 95% coverage guarantee
+    min_calibration_samples: 50,   // require ≥50 seeds before predicting
 });
 
-// Calibration phase: run baseline benchmark 100 times for tight intervals
-for seed in 0..100 {
-    let throughput = run_mvcc_benchmark(seed);
-    calibrator.observe(throughput);
+// Calibration: many deterministic seeds, same scenario.
+for seed in 0..100_u64 {
+    let mut rt = LabRuntime::new(LabConfig::new(seed));
+    let root = rt.state.create_root_region(Budget::INFINITE);
+    let (task_id, _handle) = rt.state.create_task(root, Budget::INFINITE, async move {
+        // ... run a representative FrankenSQLite harness scenario ...
+    }).expect("create task");
+    rt.scheduler.lock().unwrap().schedule(task_id, 0);
+    let rep = rt.run_until_quiescent_with_report();
+    cal.calibrate(&rep.oracle_report);
 }
 
-// Prediction phase: is this new measurement within the prediction set?
-let new_throughput = run_mvcc_benchmark_after_code_change(51);
-let in_prediction_set = calibrator.is_conforming(new_throughput);
-if !in_prediction_set {
-    panic!("MVCC throughput regression detected: {} ops/sec outside 95% prediction set",
-           new_throughput);
+// Prediction: after a code change, new oracle report should remain conforming.
+let mut rt = LabRuntime::new(LabConfig::new(101));
+let root = rt.state.create_root_region(Budget::INFINITE);
+let (task_id, _handle) = rt.state.create_task(root, Budget::INFINITE, async move {
+    // ... same scenario ...
+}).expect("create task");
+rt.scheduler.lock().unwrap().schedule(task_id, 0);
+let rep = rt.run_until_quiescent_with_report();
+
+if let Some(pred) = cal.predict(&rep.oracle_report) {
+    for ps in &pred.prediction_sets {
+        if !ps.conforming {
+            panic!("Oracle anomaly: {} score={} threshold={}", ps.invariant, ps.score, ps.threshold);
+        }
+    }
 }
 ```
+
+**Order-statistic intuition (why `min_calibration_samples` matters):**
+The conformal threshold is the `ceil((1-α)(n+1))`-th order statistic of
+calibration scores. With small `n`, thresholds are too permissive and regressions
+slip through. `n >= 50` is a pragmatic minimum; phase gates typically run 100+
+seeds for tighter bounds.
+
+#### 4.7.2 Performance Regression Discipline (Extreme Optimization Loop)
+
+Performance metrics are not oracle invariants. For throughput/latency changes,
+FrankenSQLite MUST follow the Extreme Optimization Loop (baseline, profile, one lever,
+isomorphism proof, verify). Asupersync's benchmarking guide is the reference template
+for this workflow (Criterion baselines + smoke artifacts + opportunity scoring).
+
+**Non-negotiable gate:** only land optimizations with OpportunityScore ≥ 2.0:
+`score = impact * confidence / effort`.
 
 ### 4.8 Bayesian Online Change-Point Detection (BOCPD)
 
 Database workloads are non-stationary. A write-heavy analytical job may start
 at 2 AM, a bulk import may spike contention, or a schema migration may
 temporarily change the page access pattern. Static thresholds for MVCC tuning
-parameters (GC frequency, version chain length limit, SIREAD table eviction
-policy) will be wrong for at least one regime.
+parameters (GC frequency, version chain length limit, witness-plane hot/cold
+index compaction policy) will be wrong for at least one regime.
 
 BOCPD (Adams & MacKay, 2007) detects regime shifts in real time by maintaining
 a posterior distribution over the **run length** `r_t` (number of observations
@@ -3216,7 +3279,7 @@ where:
 |--------|----------------|----------------------|
 | Commit throughput (ops/sec) | Normal-Gamma | Log regime shift, adjust GC frequency |
 | SSI abort rate | Beta-Binomial | If rate jumps, log warning for DBA; if rate drops, consider relaxing version chain limits |
-| Page contention (locks/sec) | Normal-Gamma | Adjust SIREAD eviction aggressiveness |
+| Page contention (locks/sec) | Normal-Gamma | Adjust witness-plane refinement and hot-index pressure controls |
 | Version chain length | Normal-Gamma | Tighten/loosen GC watermarks |
 
 **Why BOCPD, not fixed-window averages:**
@@ -3229,7 +3292,8 @@ where:
 **Integration:**
 
 ```rust
-use asupersync::lab::bocpd::{BocpdMonitor, BocpdConfig, HazardFunction};
+// NOTE: BOCPD is a FrankenSQLite harness component (not provided by asupersync).
+use fsqlite_harness::drift::bocpd::{BocpdMonitor, BocpdConfig, HazardFunction};
 
 // CALIBRATION NOTE (Alien-Artifact Discipline):
 // All parameters below have explicit derivations. None are magic numbers.
@@ -3274,38 +3338,72 @@ if throughput_monitor.change_point_detected() {
 }
 ```
 
-BOCPD, e-processes, and conformal calibration form a **three-layer
-monitoring stack**: BOCPD detects *when* the world changed, e-processes
-detect *if invariants are violated* in the new regime, and conformal
-calibration provides *distribution-free bounds* on performance metrics
-within a regime.
+**Monitoring stack (merged, canonical):**
+
+- **Layer 0 (asupersync deadline monitor):** adaptive deadline warnings and "no progress"
+  detection based on `Cx::checkpoint*` and task-type labeling via `Cx::set_task_type("...")`.
+- **Layer 1 (e-processes):** anytime-valid evidence of invariant violations (sound false-alarm control).
+- **Layer 2 (conformal):** distribution-free anomaly detection on *oracle reports* across seeds.
+- **Optional Layer 3 (BOCPD harness):** regime-shift detection on workload streams; used to retune
+  heuristics (GC watermarks, eviction aggressiveness) and explain performance changes.
+
+**Deadline monitoring (actual asupersync builder API):**
+
+```rust
+use asupersync::runtime::RuntimeBuilder;
+use std::time::Duration;
+
+let rt = RuntimeBuilder::low_latency()
+    .deadline_monitoring(|m| {
+        m.enabled(true)
+            .check_interval(Duration::from_secs(1))
+            .checkpoint_timeout(Duration::from_secs(30))
+            .adaptive_enabled(true)
+            .adaptive_warning_percentile(0.90)
+            .adaptive_min_samples(10)
+            .adaptive_fallback_threshold(Duration::from_secs(30))
+            .on_warning(|w| eprintln!("deadline warning: {w:?}"))
+    })
+    .build()
+    .expect("runtime");
+```
 
 ### 4.9 TLA+ Export -- Model Checking
 
-Asupersync can export protocol specifications to TLA+ for model checking.
-The MVCC commit protocol, WAL checkpoint protocol, and GC protocol should
-all be specified in a form that can be exported and verified by TLC (the
-TLA+ model checker).
+Asupersync ships a **trace-driven** TLA+ exporter: `asupersync::trace::TlaExporter`.
+It can:
 
-**Concrete example: exporting the commit protocol:**
+- Export a **concrete behavior** (a sequence of states) from a `Vec<TraceEvent>`.
+- Export a **parametric skeleton** for a model-checkable spec structure.
+
+FrankenSQLite adopts the same pattern for MVCC protocols:
+
+1. Instrument MVCC commit/checkpoint/GC with a domain trace (`MvccTraceEvent`).
+2. Run deterministic scenarios in the harness (LabRuntime seeds + schedule certs).
+3. Export both:
+   - A concrete behavior module for debugging ("what actually happened")
+   - A spec skeleton for TLC checks ("what can happen in bounded models")
+
+**Concrete example (asupersync runtime trace export):**
 
 ```rust
-// The MVCC commit protocol expressed as a state machine that can be
-// exported to TLA+ via asupersync's trace infrastructure:
-let protocol = ProtocolSpec::new("MvccCommit")
-    .state_var("txn_states", "TxnId -> {Active, Committed, Aborted}")
-    .state_var("page_locks", "PageNumber -> Option<TxnId>")
-    .state_var("version_chains", "PageNumber -> Seq<PageVersion>")
-    .action("begin", |s| { /* snapshot capture */ })
-    .action("write_page", |s| { /* try_acquire + cow */ })
-    .action("commit", |s| { /* validate + wal_append + publish */ })
-    .action("abort", |s| { /* release locks + discard */ })
-    .invariant("LockExclusive", "forall p: |{t: page_locks[p] = t}| <= 1")
-    .invariant("SnapshotIsolation", "/* visibility predicate */");
+use asupersync::trace::{TraceEvent, TlaExporter};
 
-// Export to TLA+
-let tla_spec = protocol.to_tla_plus();
-// Run TLC model checker with bounded state space
+let events: Vec<TraceEvent> = /* captured from a deterministic run */;
+let exporter = TlaExporter::from_trace(&events);
+let behavior = exporter.export_behavior("AsupersyncRuntimeBehavior");
+let skeleton = TlaExporter::export_spec_skeleton("AsupersyncRuntimeModel");
+```
+
+**Concrete example (FrankenSQLite MVCC trace export; harness feature):**
+
+```rust
+use fsqlite_harness::tla::{MvccTlaExporter, MvccTraceEvent};
+
+let mvcc_events: Vec<MvccTraceEvent> = /* captured from MVCC commit scenarios */;
+let exporter = MvccTlaExporter::from_trace(&mvcc_events);
+let behavior = exporter.export_behavior("MvccCommitBehavior");
+let skeleton = MvccTlaExporter::export_spec_skeleton("MvccCommitModel");
 ```
 
 ### 4.10 BlockingPool Integration
@@ -3314,101 +3412,65 @@ All file I/O in FrankenSQLite is dispatched to asupersync's blocking pool,
 ensuring that the async runtime's worker threads are never blocked by
 synchronous system calls.
 
-**How file I/O is dispatched:**
+**Hard rule (workspace invariant): `unsafe` is forbidden.**
+
+Therefore, FrankenSQLite MUST NOT transmit raw pointers or borrowed slices
+across a `spawn_blocking` boundary. The correct, safe, zero-allocation pattern
+is: **owned pooled buffers** moved into the blocking closure and returned by
+value (RAII on drop).
+
+We use asupersync's blocking helpers:
+- `asupersync::runtime::spawn_blocking`
+- `asupersync::runtime::spawn_blocking_io`
+
+**I/O buffer model (normative):**
+
+- `PageBuf`: owned, page-sized buffer handle that is `Send + 'static`.
+  Drop returns the underlying allocation to a pool (even if the task is cancelled).
+- `PageBufPool`: bounded pool keyed by `page_size`. This is FrankenSQLite
+  infrastructure (in `fsqlite-pager`), not an asupersync feature.
+
+This achieves all goals simultaneously:
+- no `unsafe`
+- no heap allocation on the hot path (pool reuse)
+- no extra memcpy in the common path (pager consumes `PageBuf` directly)
+- cancellation safety: if a task is cancelled mid-I/O, the buffer is dropped and
+  deterministically returned to the pool.
+
+**How file I/O is dispatched (canonical pattern):**
 
 ```rust
-/// VFS file operations are async at the trait level but dispatch to
-/// the blocking pool for actual I/O.
-///
-/// CRITICAL: Zero-copy I/O (Section 1.5).
-/// The read/write paths MUST NOT allocate intermediate buffers.
-/// We use pre-registered page-aligned buffers from the PageBufferPool
-/// (arena-allocated, reused across I/O operations).
-impl VfsFile for UnixFile {
-    async fn read_at(&self, cx: &Cx, offset: u64, buf: &mut [u8]) -> Result<usize> {
-        let fd = self.fd;
-        // Safety: `buf` is borrowed mutably and the blocking task completes
-        // before this function returns, so the borrow is valid for the
-        // duration of the pread call. We transmit the raw pointer + length
-        // across the spawn_blocking boundary.
-        let ptr = buf.as_mut_ptr();
-        let len = buf.len();
-        cx.spawn_blocking(move || {
-            // SAFETY: ptr is valid for `len` bytes and exclusively borrowed
-            // for the duration of this blocking task. The caller awaits
-            // completion before accessing `buf` again.
-            let slice = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
-            let n = nix::sys::uio::pread(fd, slice, offset as i64)?;
-            Ok(n)
-        }).await
-    }
+use asupersync::cx::Cx;
+use asupersync::runtime::spawn_blocking_io;
 
-    async fn write_at(&self, cx: &Cx, offset: u64, data: &[u8]) -> Result<()> {
-        let fd = self.fd;
-        // Same zero-copy approach: transmit pointer + length.
-        // The shared borrow is valid because the caller awaits completion.
-        let ptr = data.as_ptr();
-        let len = data.len();
-        cx.spawn_blocking(move || {
-            // SAFETY: ptr is valid for `len` bytes and the shared borrow
-            // lives until this blocking task completes.
-            let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
-            nix::sys::uio::pwrite(fd, slice, offset as i64)?;
-            Ok(())
-        }).await
-    }
+/// Read exactly one database page into an owned pool buffer (no memcpy).
+async fn read_page(cx: &Cx, pool: &PageBufPool, fd: RawFd, offset: u64) -> Result<PageBuf> {
+    cx.checkpoint()?; // observe cancellation before scheduling blocking work
 
-    async fn sync(&self, cx: &Cx, flags: SyncFlags) -> Result<()> {
-        let fd = self.fd;
-        cx.spawn_blocking(move || {
-            if flags.contains(SyncFlags::DATAONLY) {
-                nix::unistd::fdatasync(fd)?;
-            } else {
-                nix::unistd::fsync(fd)?;
-            }
-            Ok(())
-        }).await
-    }
+    let mut buf = pool.acquire(); // PageBuf (owned, RAII -> pool on drop)
+
+    // Move the owned buffer into the blocking closure. This is safe and `unsafe`-free.
+    let (buf, n): (PageBuf, usize) = spawn_blocking_io(move || {
+        // The concrete syscall wrapper is implementation detail (pread/pread64/etc).
+        let n = pread_exact(fd, offset, buf.as_mut_slice())?;
+        Ok((buf, n))
+    })
+    .await?;
+
+    ensure!(n == buf.len(), "short read: expected {} got {}", buf.len(), n);
+    Ok(buf)
 }
 ```
 
-**Why `unsafe` is justified here (exception to workspace `forbid`):**
+**Cancel semantics (asupersync):**
 
-The VFS crate is the *one* place where raw pointer transmission across thread
-boundaries is necessary for zero-copy I/O. The safety argument is:
-1. The caller holds a mutable (read) or shared (write) borrow on the buffer.
-2. The caller `.await`s the blocking task to completion before accessing the
-   buffer again.
-3. Therefore the pointer is valid for the entire duration of the blocking task.
-4. No other thread accesses the buffer during this window.
+`spawn_blocking*` is *soft-cancel*: dropping the future requests cancellation of
+the pool task, but the underlying OS syscall may still run to completion. This is
+acceptable because all FrankenSQLite durable effects are guarded by:
+- the reserve/commit publication protocol (ECS symbol logs, witness plane)
+- commit markers as the atomic visibility point
 
-This is annotated with `#[allow(unsafe_code)]` at the function level only,
-with the workspace-level `forbid` relaxed to `deny` for the `fsqlite-vfs`
-crate alone. The relaxation is documented in the crate's `lib.rs` with a
-cross-reference to this specification section.
-
-**Alternative (if `unsafe` is unacceptable):** Use asupersync's
-`PageBufferPool` -- an arena of pre-allocated, page-aligned buffers that
-are `Send + 'static`. The blocking task receives ownership of a pool buffer,
-performs the I/O, and returns the buffer to the caller, who copies into the
-target slice. This adds one memcpy but zero heap allocations (pool buffers
-are reused). This is the fallback if the unsafe-pointer approach is rejected.
-
-```rust
-// Fallback: pool-buffer approach (one memcpy, zero alloc)
-async fn read_at(&self, cx: &Cx, offset: u64, buf: &mut [u8]) -> Result<usize> {
-    let fd = self.fd;
-    let mut pool_buf = cx.page_buffer_pool().acquire(buf.len());
-    let n = cx.spawn_blocking(move || {
-        let n = nix::sys::uio::pread(fd, &mut pool_buf, offset as i64)?;
-        Ok((pool_buf, n))
-    }).await?;
-    let (pool_buf, n) = n;
-    buf[..n].copy_from_slice(&pool_buf[..n]);
-    cx.page_buffer_pool().release(pool_buf);
-    Ok(n)
-}
-```
+So a cancelled task can never publish a partial commit as durable.
 
 **Pool sizing:**
 
@@ -3442,7 +3504,7 @@ The blocking pool uses a min/max thread model:
 
 The async-to-blocking bridge works as follows:
 
-1. Async task calls `cx.spawn_blocking(closure)`, which returns a `Future`.
+1. Async task calls `asupersync::runtime::spawn_blocking*(closure)`, which returns a `Future`.
 2. The closure is placed on the blocking pool's work queue.
 3. A blocking pool thread picks up the closure and executes it.
 4. When the closure completes, the result is sent back via an internal oneshot
@@ -3455,8 +3517,9 @@ This ensures that:
 - File I/O operations are still cancellable: if the async task is cancelled,
   the blocking operation runs to completion (cannot interrupt `pread64`), but
   the result is discarded and the async task is cleaned up.
-- Under the lab reactor, `spawn_blocking` is intercepted and executed
-  synchronously within the virtual time framework, maintaining determinism.
+- In lab runs, the runtime typically omits a blocking pool; `spawn_blocking*`
+  falls back to executing the closure inline (see asupersync implementation),
+  preserving determinism by avoiding real threads.
 
 ---
 
@@ -3954,7 +4017,9 @@ COMMIT:             No validation needed         SSI check: abort if pivot
 
 ABORT:              Release global_write_mutex   Release all page locks
                     Discard write_set            Discard write_set
-                                                 Clean up SIREAD entries
+                                                 Witness evidence is monotonic; aborted
+                                                 witnesses are ignored and later GC'd
+                                                 by safe horizons (§5.6.4.8)
 
 CONCURRENCY:        One writer at a time         Multiple writers in parallel
                     (exact SQLite behavior)      (conflict on same page only)
@@ -4658,6 +4723,202 @@ emit_witnesses() -> (read_witnesses: Vec<ObjectId>, write_witnesses: Vec<ObjectI
 updates the hot-plane `HotWitnessIndex` buckets (shared memory) as a monotonic
 union.
 
+#### 5.7.1 Witness Objects (Canonical ECS Schemas)
+
+The witness plane is defined by a small family of **canonical ECS objects**
+whose encoding is deterministic (§3.5) and whose publication is cancel-safe
+(reserve/write/commit; §5.6.4.7).
+
+These structures are *normative*; field order and canonicalization rules follow
+the ECS encoding rules:
+- integer endianness: little-endian
+- maps/sets: sorted by canonical byte representation
+- bitmaps: canonical roaring encoding (stable container ordering)
+
+```text
+KeyHash := u64
+CommitSeq := u64
+
+KeySummary :=
+  | ExactKeys(keys: Vec<WitnessKey>)                  // sorted by canonical bytes
+  | HashedKeySet(hashes: Vec<KeyHash>)                // sorted ascending
+  | PageBitmap(pages: RoaringBitmap<u32>)             // page numbers
+  | CellBitmap(cells: RoaringBitmap<u64>)             // (page<<32) | cell_tag
+  | ByteRangeList(ranges: Vec<(u32, u16, u16)>)       // (page, start, len), sorted
+  | Chunked(chunks: Vec<KeySummaryChunk>)             // for large sets; each chunk is sound
+
+ReadWitness := {
+  txn          : TxnToken
+  begin_seq    : CommitSeq
+  level        : u8
+  range_prefix : u32
+  key_summary  : KeySummary        // sound: no false negatives for its coverage claim
+  emitted_at   : LogicalTime       // from asupersync logical clock (optional in minimal builds)
+}
+
+WriteWitness := {
+  txn          : TxnToken
+  begin_seq    : CommitSeq
+  level        : u8
+  range_prefix : u32
+  key_summary  : KeySummary
+  emitted_at   : LogicalTime
+  write_kind   : { Intent, Final } // Final is required before commit validation
+}
+
+WitnessDelta := {
+  txn          : TxnToken
+  begin_seq    : CommitSeq
+  kind         : { Read, Write }
+  level        : u8
+  range_prefix : u32
+  participation: { Present }       // union-only CRDT update (no removals)
+  refinement   : Option<KeySummary>
+}
+
+WitnessIndexSegment := {
+  segment_id        : u64
+  level             : u8
+  range_prefix      : u32
+  readers           : RoaringBitmap<u64>  // TxnId
+  writers           : RoaringBitmap<u64>  // TxnId
+  epochs            : Option<EpochSnapshot> // optional epoch table snapshot for slot reuse validation
+  covered_begin_seq : CommitSeq
+  covered_end_seq   : CommitSeq
+}
+
+DependencyEdge := {
+  kind            : { RWAntiDependency }
+  from            : TxnToken
+  to              : TxnToken
+  key_basis       : { level: u8, range_prefix: u32, refinement: Option<KeySummaryDigest> }
+  observed_by     : TxnToken
+  observation_seq : CommitSeq
+}
+
+CommitProof := {
+  txn                : TxnToken
+  begin_seq          : CommitSeq
+  commit_seq         : CommitSeq
+  has_in_rw          : bool
+  has_out_rw         : bool
+  read_witnesses     : Vec<ObjectId>
+  write_witnesses    : Vec<ObjectId>
+  index_segments_used: Vec<ObjectId>
+  edges_emitted      : Vec<ObjectId>
+  merge_witnesses    : Vec<ObjectId>
+  abort_policy       : { AbortPivot, AbortYoungest, Custom }
+}
+
+AbortWitness := {
+  txn            : TxnToken
+  begin_seq      : CommitSeq
+  abort_seq      : CommitSeq              // observation ordering stamp (not a commit)
+  reason         : { SSIPivot, Cancelled, Other }
+  edges_observed : Vec<ObjectId>
+}
+
+MergeWitness := {
+  // Specified in §5.10 (merge artifacts are ECS objects and RaptorQ-encodable).
+}
+```
+
+**Soundness rule (KeySummary):** A `KeySummary` MUST NOT have false negatives
+for the subset it claims to cover. False positives are allowed and are reduced
+by refinement (cell/byte-range keys) and merge (§5.10).
+
+**CommitProof meaning:** `CommitProof` is a *replayable proof*, not a
+cryptographic proof: it contains enough evidence references to deterministically
+re-run SSI validation and reach the same decision (commit vs abort) given the
+same witness plane.
+
+#### 5.7.2 Candidate Discovery (Hot Plane) and Refinement (Cold Plane)
+
+SSI validation needs to discover candidate overlaps without scanning all active
+transactions. The witness plane does this in two stages:
+
+1. **Hot-plane candidate discovery:** shared-memory `HotWitnessIndex` bitsets
+   provide a superset of candidates in O(1) per bucket.
+2. **Cold-plane refinement (optional):** decode `ReadWitness`/`WriteWitness`
+   refinements (or `WitnessIndexSegment`s) to confirm actual key intersection and
+   reduce false positives.
+
+**Incoming rw-antidependency discovery** (`R -rw-> T`):
+
+- For each `WriteWitness` bucket of `T`, query the bucket's `readers_bits` and
+  intersect with `active_slots_bitset`.
+- Map slots to `TxnToken` via `TxnSlotTable`, validating `txn_epoch` matches.
+- If refinement is enabled, confirm `ReadSet(R) ∩ WriteSet(T) ≠ ∅` at the finest
+  available key granularity; otherwise treat bucket overlap as conflict.
+
+**Outgoing rw-antidependency discovery** (`T -rw-> W`) is symmetric using
+`writers_bits`.
+
+**Theorem (No False Negatives, hot plane):**
+
+If a transaction `R` registers a read `WitnessKey K`, then `R` is discoverable
+as a reader candidate for `K` at commit time for any overlapping writer `T`
+because:
+- registration updates every configured level bucket for `K` (or `overflow`)
+  by setting `readers_bits[R.slot_id]` (union-only),
+- candidate discovery queries those same buckets (and `overflow`),
+- stale bits are filtered by `(txn_id, txn_epoch)` validation.
+
+Thus false negatives are forbidden by construction; false positives are bounded
+and reduced by refinement.
+
+#### 5.7.3 Commit-Time SSI Validation (Proof-Carrying)
+
+SSI validation runs as part of the commit pipeline (see §7.11 in Native mode).
+It produces explicit evidence artifacts:
+- `DependencyEdge` objects for observed rw-antidependencies
+- `CommitProof` for commits
+- `AbortWitness` for SSI aborts
+
+This makes concurrency behavior deterministic, auditable, and replicable.
+
+**Normative commit-time procedure (conceptual pseudocode):**
+
+```text
+ssi_validate_and_publish(T):
+  // Preconditions:
+  // - T has registered read/write WitnessKeys during execution.
+  // - T holds the necessary page locks / write intents for its write set.
+
+  // 1) Emit witnesses (ECS) + update hot index (SHM).
+  (read_wits, write_wits) = T.emit_witnesses()
+
+  // 2) Discover incoming and outgoing rw-antidependencies (superset via hot plane).
+  in_edges  = discover_incoming_edges(T, write_wits)
+  out_edges = discover_outgoing_edges(T, read_wits)
+
+  T.has_in_rw  = (in_edges not empty)
+  T.has_out_rw = (out_edges not empty)
+
+  // 3) Refinement and merge escape hatch (optional but canonical).
+  // - Refinement confirms true intersection at finer WitnessKey granularity.
+  // - Merge (§5.10) can transform "same page" conflicts into commuting merges,
+  //   tightening witness precision and dropping spurious edges.
+  (in_edges, out_edges, merge_witnesses) = refine_and_maybe_merge(T, in_edges, out_edges)
+
+  T.has_in_rw  = (in_edges not empty)
+  T.has_out_rw = (out_edges not empty)
+
+  // 4) Pivot rule (conservative, sound default):
+  if T.has_in_rw && T.has_out_rw:
+     publish AbortWitness(T, edges = in_edges ∪ out_edges)
+     abort T with SQLITE_BUSY_SNAPSHOT
+
+  // 5) Publish edges + return evidence references for CommitProof.
+  edge_ids = publish DependencyEdge objects for (in_edges ∪ out_edges)
+  return (read_wits, write_wits, edge_ids, merge_witnesses)
+```
+
+**Correctness rule:** Skipping refinement is always safe (over-approx); it only
+increases abort rate. Merge never weakens correctness: it replaces false
+conflicts with commuting composition and tightens witness precision so SSI sees
+fewer spurious edges.
+
 **The dangerous structure:**
 
 SSI detects serialization anomalies by identifying "dangerous structures" --
@@ -4684,7 +4945,7 @@ Formally, the dangerous structure exists when:
 ```
 exists T1, T2, T3 :
     rw_edge(T1, T2) AND rw_edge(T2, T3)
-    AND T2.has_incoming_rw AND T2.has_outgoing_rw
+    AND T2.has_in_rw AND T2.has_out_rw
     AND (T1 committed OR T3 committed)
 ```
 
@@ -4695,49 +4956,28 @@ exists T1, T2, T3 :
 ```
 Transaction (SSI extensions) := {
     ...existing fields...
-    has_incoming_rw : bool,   -- some other transaction created a rw edge TO this txn
-    has_outgoing_rw : bool,   -- some other transaction created a rw edge FROM this txn
-    rw_in_from      : HashSet<TxnId>,  -- transactions that have rw edges to this txn
-    rw_out_to       : HashSet<TxnId>,  -- transactions that this txn has rw edges to
+    has_in_rw       : bool,                -- some transaction created an rw edge TO this txn
+    has_out_rw      : bool,                -- this txn created an rw edge TO some txn
+    rw_in_from      : HashSet<TxnToken>,   -- (optional) sources of incoming edges
+    rw_out_to       : HashSet<TxnToken>,   -- (optional) targets of outgoing edges
+    edges_emitted   : Vec<ObjectId>,       -- edges emitted/observed during validation
+    marked_for_abort: bool,                -- eager abort optimization
 }
 ```
 
-**Detection algorithm pseudocode:**
+**Pivot abort rule (normative default):**
 
-```
-on_commit(T):
-    // T is about to commit. Check if T is a pivot in a dangerous structure.
-    if T.has_incoming_rw AND T.has_outgoing_rw:
-        // T is the pivot (T2 in T1 -rw-> T2 -rw-> T3).
-        // Check if any T1 (source of incoming rw) and T3 (target of outgoing rw)
-        // form a genuine dangerous structure.
-        for T1_id in T.rw_in_from:
-            T1 = transaction(T1_id)
-            if T1.state == Committed OR T1.state == Active:
-                for T3_id in T.rw_out_to:
-                    T3 = transaction(T3_id)
-                    if T3.state == Committed:
-                        // Dangerous structure confirmed: T1 -rw-> T -rw-> T3
-                        // T3 committed, T1 committed or still active.
-                        // Must abort to prevent anomaly.
-                        abort(T)
-                        return Err(SQLITE_BUSY_SNAPSHOT)
+After `ssi_validate_and_publish(T)` computes `has_in_rw` and `has_out_rw` for
+the committing transaction `T` (§5.7.3), `T` MUST abort if both are true,
+unless refinement + merge (§5.10) eliminate one side of the rw evidence.
 
-    // Also check: is T the T3 in someone else's dangerous structure?
-    // When T commits, it might complete a dangerous structure where
-    // some active pivot T2 now has both incoming and outgoing rw edges
-    // with committed endpoints.
-    for T2_id in T.rw_in_from:
-        T2 = transaction(T2_id)
-        if T2.state == Active AND T2.has_incoming_rw AND T2.has_outgoing_rw:
-            // T2 might be a pivot. But we only abort T2 at T2's commit time.
-            // Mark T2 for eager abort (optimization: abort early rather than
-            // waiting for T2 to attempt commit).
-            T2.marked_for_abort = true
+**Eager abort marking (optional optimization):**
 
-    // Passed SSI check. Proceed with normal commit.
-    proceed_with_commit(T)
-```
+When a committing transaction observes an edge that makes some other active
+transaction a pivot (both flags true), the observer MAY set
+`TxnSlot.marked_for_abort = true` for that pivot. This is an optimization to
+abort early (reducing wasted work), not a correctness requirement. Correctness
+comes from the pivot abort rule enforced at the pivot's own commit time.
 
 **When to abort T2 (the pivot) vs T3 (the unsafe): Decision-Theoretic Policy**
 
@@ -4763,11 +5003,16 @@ Based on the PostgreSQL 9.1+ implementation (Ports, 2012):
   false positive (retry the transaction) is much lower than the cost of a
   missed anomaly (data corruption).
 - **Overhead:** <7% throughput reduction compared to plain Snapshot Isolation,
-  measured on TPC-C. The overhead comes from maintaining SIREAD locks and
-  checking for dangerous structures.
-- **Memory:** SIREAD lock table grows proportionally to the number of active
-  transactions times pages read. Under PostgreSQL's row-level granularity,
-  this can be significant; at page granularity, it is much smaller.
+  measured on TPC-C. The overhead comes from maintaining *read-dependency
+  evidence* (Postgres: SIREAD locks) and checking for dangerous structures.
+  In FrankenSQLite the analogous costs are witness registration, hot-index
+  bitset updates, witness object publication, and (optional) refinement.
+- **Memory:** PostgreSQL's SIREAD lock table grows roughly with
+  `active_txns * read_granules`. In FrankenSQLite:
+  - hot plane memory is bounded by `TxnSlot` count and hot bucket capacity
+    (bitsets over slots, plus overflow bucket),
+  - cold plane witness objects are append-only but GC-able by `safe_gc_seq`
+    horizons (§5.6.4.8).
 
 **How SSI maps to page granularity in FrankenSQLite:**
 
@@ -4777,11 +5022,10 @@ SSI at page granularity is coarser than PostgreSQL's row-level SSI. This means:
   they are logically independent. The false positive rate will be higher than
   PostgreSQL's 0.5%.
 - **Less overhead:** Fewer SIREAD lock entries (one per page, not one per
-  row). The SIREAD lock table is smaller and faster to scan.
-- **Mitigation:** The algebraic write merging mechanism (Section 3.4.5) can
-  refine page-level conflicts to byte-level, reducing false positives for
-  the write side. For the read side, future work could add cell-level
-  SIREAD tracking within B-tree pages.
+  row). The witness-key set is smaller and candidate discovery is cheaper.
+- **Mitigation:** Witness refinement + merge (§5.10) can refine page-level
+  conflicts to `Cell(page, cell_tag)` and/or `ByteRange(page, start, len)`,
+  reducing false positives while preserving correctness.
 
 **Decision-Theoretic SSI Abort Policy (Alien-Artifact Discipline).**
 
@@ -4848,11 +5092,13 @@ should not depend on precise knowledge of hard-to-estimate quantities.
 
 **Why this matters beyond "just use the conservative rule":**
 1. It provides a formal framework for the Layer 3 refinement (Section 0.2,
-   bullet 4). When cell-level SIREAD tracking is added, `P(anomaly|evidence)`
-   drops for same-page-different-row conflicts, and the decision framework
-   naturally produces fewer aborts without changing the threshold.
-2. It enables **adaptive victim selection**. If algebraic write merging
-   (Section 3.4.5) resolves the write conflict to a successful merge,
+   bullet 4). When cell/byte-range witness refinement is added (i.e., witnesses
+   include `Cell(page, cell_tag)` and/or `ByteRange(page, start, len)` keys),
+   `P(anomaly|evidence)` drops for same-page-different-row conflicts, and the
+   decision framework naturally produces fewer aborts without changing the
+   threshold.
+2. It enables **adaptive victim selection**. If merge (§5.10) resolves the
+   apparent conflict to a successful commuting merge,
    the posterior `P(anomaly|evidence)` drops to zero for the write-side
    contribution, and the decision can flip from abort to commit.
 3. It makes the abort policy **auditable**: every abort decision can log
@@ -4882,8 +5128,8 @@ ssi_fp_monitor.observe(is_false_positive);
 
 If the e-process exceeds `1/alpha = 100`, the false positive rate is
 significantly above the 5% budget. This triggers an alert (not an
-automatic response) suggesting that cell-level SIREAD tracking should be
-prioritized for the hot pages causing the most false positives.
+automatic response) suggesting that cell/byte-range witness refinement should
+be prioritized for the hot pages causing the most false positives.
 
 **Conformal calibration of page-level coarseness overhead:**
 
@@ -5790,7 +6036,7 @@ We do not accept unbounded growth of ANY of the following:
 |-----------|-------------|-------------------|
 | ARC page cache | `PRAGMA cache_size` | ARC eviction (§6.3–6.4) |
 | MVCC page version chains | GC horizon (min active snapshot) | Coalescing + version drop (§6.7) |
-| SIREAD table | Proportional to active txn count | Pruned on txn commit/abort |
+| SSI witness plane (hot index + evidence caches) | Hot: fixed SHM layout; Cold: fixed byte budgets | Hot: epoch swap (§5.6.4.8); Cold: LRU + rebuild from ECS; evidence GC by safe horizons |
 | Symbol caches (decoded objects) | Fixed byte budget, configurable | LRU eviction |
 | Index segment caches | Fixed byte budget | LRU eviction; rebuild from ECS on miss |
 | Bloom/quotient filters | O(n) where n = active pages with versions | Rebuilt on GC horizon advance |
@@ -6870,7 +7116,8 @@ pub trait MvccPager: Send + Sync {
 
     /// Read a page within a transaction. Returns a pinned page reference.
     /// The page is resolved through: write_set -> version_chain -> disk.
-    /// Tracks the page in the transaction's read set and SIREAD table (SSI).
+    /// Tracks the page in the transaction's read set and registers a `WitnessKey`
+    /// in the SSI witness plane (register_read; §5.7).
     fn get_page(&self, cx: &Cx, txn: &Transaction, pgno: PageNumber) -> Result<PageRef>;
 
     /// Write a page within a transaction.
@@ -6887,12 +7134,14 @@ pub trait MvccPager: Send + Sync {
 
     /// Commit the transaction. SSI validation (abort if pivot),
     /// first-committer-wins check, rebase/algebraic merge, WAL append,
-    /// version publishing, SIREAD cleanup, lock release.
+    /// version publishing, witness-plane evidence publication/proof emission,
+    /// lock release.
     /// Returns SQLITE_BUSY_SNAPSHOT on SSI abort or conflict.
     fn commit(&self, cx: &Cx, txn: Transaction) -> Result<()>;
 
     /// Abort the transaction. Discards write set, releases locks,
-    /// cleans up SIREAD entries. Never fails.
+    /// and leaves monotonic witness evidence to be ignored and GC'd by horizons.
+    /// Never fails.
     fn rollback(&self, txn: Transaction);
 }
 
@@ -9589,16 +9838,19 @@ raptorq integration: 2,000).
   delta encoding via RaptorQ (Section 3.4.4)
 - `crates/fsqlite-mvcc/src/lock_table.rs`: Sharded PageLockTable (64 shards)
   with try_acquire (non-blocking) and release_all
-- `crates/fsqlite-mvcc/src/siread.rs`: SireadTable (sharded) for SSI
-  rw-antidependency tracking at page granularity
-- `crates/fsqlite-mvcc/src/ssi.rs`: SSI validation (conservative
-  has_in_rw && has_out_rw => abort rule), witness recording for debug/lab
+- `crates/fsqlite-mvcc/src/witness_plane.rs`: SSI witness plane integration:
+  witness-key registration (`register_read`/`register_write`), shared-memory
+  `HotWitnessIndex` updates, cold-plane witness object emission (`ReadWitness`,
+  `WriteWitness`, `WitnessDelta`) and index-segment compaction hooks
+- `crates/fsqlite-mvcc/src/ssi.rs`: SSI validation on top of the witness plane
+  (conservative pivot abort rule with optional refinement + merge), plus
+  `DependencyEdge` / `CommitProof` / `AbortWitness` artifacts for explainability
 - `crates/fsqlite-mvcc/src/conflict.rs`: First-committer-wins validation,
   deterministic rebase merge via intent logs (Section 5.10), algebraic
   write merging (Section 3.4.5), byte-level conflict detection
 - `crates/fsqlite-mvcc/src/gc.rs`: Garbage collection -- horizon computation
-  (min active TxnId), version chain trimming, SIREAD table cleanup,
-  memory bound enforcement
+  (min active begin_seq), version chain trimming, witness-plane GC horizons and
+  bucket epoch advance (§5.6.4.8), memory bound enforcement
 - `crates/fsqlite-mvcc/src/coordinator.rs`: Write coordinator using
   asupersync two-phase MPSC channel, commit serialization for WAL append
 - `crates/fsqlite-mvcc/src/arc_cache.rs`: ARC cache with (PageNumber, TxnId)
@@ -9640,7 +9892,7 @@ raptorq integration: 2,000).
   zero false positives (exact, not probabilistic)
 - ARC cache: Sequential scan does not evict frequently-accessed index pages
   (ARC adaptation test)
-- Lab reactor: All above tests run under deterministic scheduling with
+- Lab runtime: All above tests run under deterministic scheduling with
   same results across 100 different seeds
 - Mazurkiewicz traces: 3-transaction scenario (T1 writes page A, T2 writes
   page B, T3 writes both A and B) -- all 6 possible commit orderings
@@ -9853,51 +10105,64 @@ proptest! {
         txns in vec(arbitrary_txn_ops(), 2..16),
         seed in any::<u64>()
     ) {
-        let reactor = LabReactor::new(seed);
-        let db = Database::open_in_memory(&reactor);
-        // Execute all transactions concurrently under lab reactor
-        // Verify: every committed transaction's reads are consistent
-        // with its snapshot, every aborted transaction had a real conflict
+        let mut lab = fsqlite_harness::lab::FsLab::new(seed).worker_count(4).max_steps(200_000);
+        let report = lab.run(|cx| async move {
+            let db = Database::open_in_memory(cx).await.unwrap();
+            // Execute all transactions concurrently under deterministic lab scheduling.
+            // Verify: every committed transaction's reads are consistent with its snapshot,
+            // every aborted transaction had a real conflict.
+            Ok::<_, FrankenError>(())
+        });
+        prop_assert!(report.oracle_report.all_passed(), "oracle failures:\n{}", report.oracle_report);
     }
 }
 ```
 
-### 17.3 Deterministic Concurrency Tests (Lab Reactor)
+### 17.3 Deterministic Concurrency Tests (Lab Runtime)
 
-All MVCC tests run under asupersync's lab reactor. Setup:
+All MVCC tests run under asupersync's lab runtime via `fsqlite-harness`'s `FsLab`
+wrapper (Section 4.2.3). Setup:
 
 ```rust
 #[test]
 fn mvcc_two_writers_different_pages() {
     let seed = 0xDEADBEEF_u64;
-    let reactor = LabReactor::new(seed);
+    let mut lab = fsqlite_harness::lab::FsLab::new(seed).worker_count(4).max_steps(200_000);
 
-    reactor.run(async {
-        let db = Database::open(":memory:", &reactor).await;
-        db.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)").await;
+    let report = lab.run(|cx| async move {
+        let db = Database::open_in_memory(cx).await.unwrap();
+        db.execute(cx, "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)").await.unwrap();
 
-        let (tx1_done, tx2_done) = (oneshot(), oneshot());
+        let (tx1_done, tx2_done) = (fsqlite_harness::oneshot(), fsqlite_harness::oneshot());
 
         // Transaction 1: insert into low rowids
-        reactor.spawn(async {
-            let txn = db.begin_concurrent().await;
-            for i in 1..=100 { txn.execute("INSERT INTO t VALUES(?,?)", (i, "a")).await; }
-            txn.commit().await.unwrap();
+        let db1 = db.clone();
+        let t1 = lab.spawn("writer.low", move |cx| async move {
+            let txn = db1.begin_concurrent(cx).await.unwrap();
+            for i in 1..=100 { txn.execute(cx, "INSERT INTO t VALUES(?,?)", (i, "a")).await.unwrap(); }
+            txn.commit(cx).await.unwrap();
             tx1_done.send(());
+            Ok::<_, FrankenError>(())
         });
 
         // Transaction 2: insert into high rowids
-        reactor.spawn(async {
-            let txn = db.begin_concurrent().await;
-            for i in 1001..=1100 { txn.execute("INSERT INTO t VALUES(?,?)", (i, "b")).await; }
-            txn.commit().await.unwrap();
+        let db2 = db.clone();
+        let t2 = lab.spawn("writer.high", move |cx| async move {
+            let txn = db2.begin_concurrent(cx).await.unwrap();
+            for i in 1001..=1100 { txn.execute(cx, "INSERT INTO t VALUES(?,?)", (i, "b")).await.unwrap(); }
+            txn.commit(cx).await.unwrap();
             tx2_done.send(());
+            Ok::<_, FrankenError>(())
         });
 
-        join(tx1_done.recv(), tx2_done.recv()).await;
-        let count: i64 = db.query_one("SELECT count(*) FROM t").await;
+        t1.await.unwrap();
+        t2.await.unwrap();
+        fsqlite_harness::join(tx1_done.recv(), tx2_done.recv()).await;
+        let count: i64 = db.query_one(cx, "SELECT count(*) FROM t").await.unwrap();
         assert_eq!(count, 200);
     });
+
+    assert!(report.oracle_report.all_passed(), "oracle failures:\n{}", report.oracle_report);
 }
 ```
 
@@ -9907,11 +10172,8 @@ recorded in the test failure message for exact replay.
 
 **Fault injection:** The lab reactor supports injecting I/O failures:
 ```rust
-reactor.inject_fault(FaultSpec {
-    target: FaultTarget::Write { file: "test.db-wal", offset: 4096 },
-    action: FaultAction::PartialWrite { bytes_written: 2048 },
-    trigger: FaultTrigger::After { count: 50 },
-});
+let vfs = fsqlite_harness::vfs::FaultInjectingVfs::new(UnixVfs::new());
+vfs.inject_fault(FaultSpec::partial_write("test.db-wal").at_offset_bytes(4096).bytes_written(2048).after_count(50));
 ```
 
 ### 17.4 Systematic Interleaving (Mazurkiewicz Traces)
@@ -10107,7 +10369,7 @@ We operate under a strict loop: Baseline -> Profile -> Prove behavior unchanged 
 *Micro:*
 - **Page read path:** Resolve visible version (varying chain lengths 0, 1, 10).
 - **Delta apply:** Cost of merging intent logs or applying patches.
-- **SSI overhead:** Cost of SIREAD lock tracking and pivot detection.
+- **SSI overhead:** Cost of witness-key registration + hot-index updates + refinement + pivot detection.
 - **RaptorQ:** Encode/decode throughput for typical capsule sizes (1-4 KB).
 - **Coded Index:** Lookup latency vs direct pointer chase.
 
@@ -10806,6 +11068,6 @@ an embedded database engine can achieve.
 
 ---
 
-*Document version: 1.6 (Extreme optimization + alien-artifact hardening: zero-copy VFS, arena version chains, CAR cache, formal constant derivations via Little's Law / queuing theory / survival analysis / birthday problem, per-invariant e-process calibration, SSI loss sensitivity analysis, BOCPD Jeffreys priors, nonce exhaustion analysis, GC scheduling policy, load factor bounds, delta cost model, Bloom crossover derivation, opt-level=3)*
+*Document version: 1.6h (Extreme optimization + alien-artifact hardening + SSI witness plane: zero-copy VFS, arena version chains, CAR cache, formal constant derivations via Little's Law / queuing theory / survival analysis / birthday problem, per-invariant e-process calibration, SSI loss sensitivity analysis, BOCPD Jeffreys priors, nonce exhaustion analysis, GC scheduling policy, load factor bounds, delta cost model, Bloom crossover derivation, opt-level=3, RaptorQ-native SSI witness plane with TxnToken identity / HotWitnessIndex / proof-carrying commits / DependencyEdge ECS objects, canonical SSI detection algorithm with eager abort)*
 *Last updated: 2026-02-07*
 *Status: Authoritative Specification*
