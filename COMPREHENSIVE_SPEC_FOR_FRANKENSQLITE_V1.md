@@ -10386,8 +10386,8 @@ Modules:
   resolution, star expansion, subquery scoping.
 - `where_clause.rs`: WHERE clause analysis. Extracting index-usable terms,
   range constraints, OR optimization.
-- `join.rs`: Join ordering. Greedy algorithm for > 6 tables, exhaustive
-  search for <= 6.
+- `join.rs`: Join ordering. Beam search (best-first path solver) with
+  mxChoice=12 or 18 for 3+ tables (matching C SQLite's `wherePathSolver`).
 - `cost.rs`: Cost model. Estimated I/O per access path. Index selectivity
   estimation from sqlite_stat1/stat4.
 - `index.rs`: Index usability determination. Which indexes can serve a
