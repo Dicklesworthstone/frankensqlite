@@ -343,6 +343,7 @@ impl FrankenError {
             Self::Abort => ErrorCode::Abort,
             Self::AuthDenied => ErrorCode::Auth,
             Self::OutOfMemory => ErrorCode::NoMem,
+            Self::Unsupported => ErrorCode::NoLfs,
         }
     }
 
@@ -354,6 +355,7 @@ impl FrankenError {
                 | Self::DatabaseLocked { .. }
                 | Self::Busy
                 | Self::BusyRecovery
+                | Self::Unsupported
                 | Self::SyntaxError { .. }
                 | Self::ParseError { .. }
                 | Self::NoSuchTable { .. }

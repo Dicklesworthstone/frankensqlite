@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::LockLevel;
+use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::{AccessFlags, SyncFlags, VfsOpenFlags};
 
 use crate::traits::{Vfs, VfsFile};
@@ -52,7 +53,12 @@ impl Vfs for MemoryVfs {
     }
 
     #[allow(clippy::significant_drop_tightening)]
-    fn open(&self, path: Option<&Path>, flags: VfsOpenFlags) -> Result<(Self::File, VfsOpenFlags)> {
+    fn open(
+        &self,
+        _cx: &Cx,
+        path: Option<&Path>,
+        flags: VfsOpenFlags,
+    ) -> Result<(Self::File, VfsOpenFlags)> {
         let mut inner = self.inner.lock().map_err(|_| lock_err())?;
 
         let resolved_path = if let Some(p) = path {
@@ -97,7 +103,7 @@ impl Vfs for MemoryVfs {
         Ok((file, out_flags))
     }
 
-    fn delete(&self, path: &Path, _sync_dir: bool) -> Result<()> {
+    fn delete(&self, _cx: &Cx, path: &Path, _sync_dir: bool) -> Result<()> {
         self.inner
             .lock()
             .map_err(|_| lock_err())?
@@ -106,7 +112,7 @@ impl Vfs for MemoryVfs {
         Ok(())
     }
 
-    fn access(&self, path: &Path, _flags: AccessFlags) -> Result<bool> {
+    fn access(&self, _cx: &Cx, path: &Path, _flags: AccessFlags) -> Result<bool> {
         Ok(self
             .inner
             .lock()
@@ -115,7 +121,7 @@ impl Vfs for MemoryVfs {
             .contains_key(path))
     }
 
-    fn full_pathname(&self, path: &Path) -> Result<PathBuf> {
+    fn full_pathname(&self, _cx: &Cx, path: &Path) -> Result<PathBuf> {
         if path.is_absolute() {
             Ok(path.to_path_buf())
         } else {
@@ -137,7 +143,7 @@ pub struct MemoryFile {
 }
 
 impl VfsFile for MemoryFile {
-    fn close(&mut self) -> Result<()> {
+    fn close(&mut self, _cx: &Cx) -> Result<()> {
         if self.delete_on_close {
             self.vfs
                 .lock()
@@ -150,7 +156,7 @@ impl VfsFile for MemoryFile {
     }
 
     #[allow(clippy::cast_possible_truncation)]
-    fn read(&mut self, buf: &mut [u8], offset: u64) -> Result<usize> {
+    fn read(&mut self, _cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
         let storage = self.storage.lock().map_err(|_| lock_err())?;
 
         let offset = offset as usize;
@@ -176,7 +182,7 @@ impl VfsFile for MemoryFile {
     }
 
     #[allow(clippy::cast_possible_truncation, clippy::significant_drop_tightening)]
-    fn write(&mut self, buf: &[u8], offset: u64) -> Result<()> {
+    fn write(&mut self, _cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
         let mut storage = self.storage.lock().map_err(|_| lock_err())?;
 
         let offset = offset as usize;
@@ -191,7 +197,7 @@ impl VfsFile for MemoryFile {
     }
 
     #[allow(clippy::cast_possible_truncation)]
-    fn truncate(&mut self, size: u64) -> Result<()> {
+    fn truncate(&mut self, _cx: &Cx, size: u64) -> Result<()> {
         self.storage
             .lock()
             .map_err(|_| lock_err())?
@@ -200,28 +206,42 @@ impl VfsFile for MemoryFile {
         Ok(())
     }
 
-    fn sync(&mut self, _flags: SyncFlags) -> Result<()> {
+    fn sync(&mut self, _cx: &Cx, _flags: SyncFlags) -> Result<()> {
         Ok(())
     }
 
-    fn file_size(&self) -> Result<u64> {
+    fn file_size(&self, _cx: &Cx) -> Result<u64> {
         Ok(self.storage.lock().map_err(|_| lock_err())?.data.len() as u64)
     }
 
-    fn lock(&mut self, level: LockLevel) -> Result<()> {
+    fn lock(&mut self, _cx: &Cx, level: LockLevel) -> Result<()> {
         self.lock_level = level;
         Ok(())
     }
 
-    fn unlock(&mut self, level: LockLevel) -> Result<()> {
+    fn unlock(&mut self, _cx: &Cx, level: LockLevel) -> Result<()> {
         if level < self.lock_level {
             self.lock_level = level;
         }
         Ok(())
     }
 
-    fn check_reserved_lock(&self) -> Result<bool> {
+    fn check_reserved_lock(&self, _cx: &Cx) -> Result<bool> {
         Ok(false)
+    }
+
+    fn shm_map(&mut self, _cx: &Cx, _region: u32, _size: u32, _extend: bool) -> Result<*mut u8> {
+        Err(FrankenError::Unsupported)
+    }
+
+    fn shm_lock(&mut self, _cx: &Cx, _offset: u32, _n: u32, _flags: u32) -> Result<()> {
+        Err(FrankenError::Unsupported)
+    }
+
+    fn shm_barrier(&self) {}
+
+    fn shm_unmap(&mut self, _cx: &Cx, _delete: bool) -> Result<()> {
+        Ok(())
     }
 }
 
@@ -236,32 +256,34 @@ mod tests {
 
     #[test]
     fn create_and_read_file() {
+        let cx = Cx::new();
         let vfs = make_vfs();
         let path = Path::new("test.db");
         let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
 
-        let (mut file, _) = vfs.open(Some(path), flags).unwrap();
+        let (mut file, _) = vfs.open(&cx, Some(path), flags).unwrap();
 
-        file.write(b"hello", 0).unwrap();
-        assert_eq!(file.file_size().unwrap(), 5);
+        file.write(&cx, b"hello", 0).unwrap();
+        assert_eq!(file.file_size(&cx).unwrap(), 5);
 
         let mut buf = [0u8; 5];
-        let n = file.read(&mut buf, 0).unwrap();
+        let n = file.read(&cx, &mut buf, 0).unwrap();
         assert_eq!(n, 5);
         assert_eq!(&buf, b"hello");
     }
 
     #[test]
     fn read_past_end_zeroes() {
+        let cx = Cx::new();
         let vfs = make_vfs();
         let path = Path::new("test.db");
         let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
 
-        let (mut file, _) = vfs.open(Some(path), flags).unwrap();
-        file.write(b"hi", 0).unwrap();
+        let (mut file, _) = vfs.open(&cx, Some(path), flags).unwrap();
+        file.write(&cx, b"hi", 0).unwrap();
 
         let mut buf = [0xFFu8; 10];
-        let n = file.read(&mut buf, 0).unwrap();
+        let n = file.read(&cx, &mut buf, 0).unwrap();
         assert_eq!(n, 2);
         assert_eq!(&buf[..2], b"hi");
         assert!(buf[2..].iter().all(|&b| b == 0));
@@ -269,77 +291,83 @@ mod tests {
 
     #[test]
     fn read_from_empty_file() {
+        let cx = Cx::new();
         let vfs = make_vfs();
         let path = Path::new("empty.db");
         let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
 
-        let (mut file, _) = vfs.open(Some(path), flags).unwrap();
+        let (mut file, _) = vfs.open(&cx, Some(path), flags).unwrap();
 
         let mut buf = [0xFFu8; 4];
-        let n = file.read(&mut buf, 0).unwrap();
+        let n = file.read(&cx, &mut buf, 0).unwrap();
         assert_eq!(n, 0);
         assert!(buf.iter().all(|&b| b == 0));
     }
 
     #[test]
     fn write_extends_file() {
+        let cx = Cx::new();
         let vfs = make_vfs();
         let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
 
-        let (mut file, _) = vfs.open(Some(Path::new("test.db")), flags).unwrap();
+        let (mut file, _) = vfs.open(&cx, Some(Path::new("test.db")), flags).unwrap();
 
-        file.write(b"world", 10).unwrap();
-        assert_eq!(file.file_size().unwrap(), 15);
+        file.write(&cx, b"world", 10).unwrap();
+        assert_eq!(file.file_size(&cx).unwrap(), 15);
 
         let mut buf = [0xFFu8; 15];
-        file.read(&mut buf, 0).unwrap();
+        file.read(&cx, &mut buf, 0).unwrap();
         assert!(buf[..10].iter().all(|&b| b == 0));
         assert_eq!(&buf[10..], b"world");
     }
 
     #[test]
     fn truncate() {
+        let cx = Cx::new();
         let vfs = make_vfs();
         let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
 
-        let (mut file, _) = vfs.open(Some(Path::new("test.db")), flags).unwrap();
-        file.write(b"hello world", 0).unwrap();
-        assert_eq!(file.file_size().unwrap(), 11);
+        let (mut file, _) = vfs.open(&cx, Some(Path::new("test.db")), flags).unwrap();
+        file.write(&cx, b"hello world", 0).unwrap();
+        assert_eq!(file.file_size(&cx).unwrap(), 11);
 
-        file.truncate(5).unwrap();
-        assert_eq!(file.file_size().unwrap(), 5);
+        file.truncate(&cx, 5).unwrap();
+        assert_eq!(file.file_size(&cx).unwrap(), 5);
 
         let mut buf = [0u8; 5];
-        file.read(&mut buf, 0).unwrap();
+        file.read(&cx, &mut buf, 0).unwrap();
         assert_eq!(&buf, b"hello");
     }
 
     #[test]
     fn open_nonexistent_without_create_fails() {
+        let cx = Cx::new();
         let vfs = make_vfs();
         let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::READWRITE;
 
-        let result = vfs.open(Some(Path::new("nope.db")), flags);
+        let result = vfs.open(&cx, Some(Path::new("nope.db")), flags);
         assert!(result.is_err());
     }
 
     #[test]
     fn delete_file() {
+        let cx = Cx::new();
         let vfs = make_vfs();
         let path = Path::new("test.db");
         let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
 
-        let (mut file, _) = vfs.open(Some(path), flags).unwrap();
-        file.write(b"data", 0).unwrap();
-        file.close().unwrap();
+        let (mut file, _) = vfs.open(&cx, Some(path), flags).unwrap();
+        file.write(&cx, b"data", 0).unwrap();
+        file.close(&cx).unwrap();
 
-        assert!(vfs.access(path, AccessFlags::EXISTS).unwrap());
-        vfs.delete(path, false).unwrap();
-        assert!(!vfs.access(path, AccessFlags::EXISTS).unwrap());
+        assert!(vfs.access(&cx, path, AccessFlags::EXISTS).unwrap());
+        vfs.delete(&cx, path, false).unwrap();
+        assert!(!vfs.access(&cx, path, AccessFlags::EXISTS).unwrap());
     }
 
     #[test]
     fn delete_on_close() {
+        let cx = Cx::new();
         let vfs = make_vfs();
         let path = Path::new("temp.db");
         let flags = VfsOpenFlags::MAIN_DB
@@ -347,96 +375,102 @@ mod tests {
             | VfsOpenFlags::READWRITE
             | VfsOpenFlags::DELETEONCLOSE;
 
-        let (mut file, _) = vfs.open(Some(path), flags).unwrap();
-        file.write(b"temp data", 0).unwrap();
-        assert!(vfs.access(path, AccessFlags::EXISTS).unwrap());
+        let (mut file, _) = vfs.open(&cx, Some(path), flags).unwrap();
+        file.write(&cx, b"temp data", 0).unwrap();
+        assert!(vfs.access(&cx, path, AccessFlags::EXISTS).unwrap());
 
-        file.close().unwrap();
-        assert!(!vfs.access(path, AccessFlags::EXISTS).unwrap());
+        file.close(&cx).unwrap();
+        assert!(!vfs.access(&cx, path, AccessFlags::EXISTS).unwrap());
     }
 
     #[test]
     fn temp_file_auto_naming() {
+        let cx = Cx::new();
         let vfs = make_vfs();
         let flags = VfsOpenFlags::TEMP_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
 
-        let (mut file1, _) = vfs.open(None, flags).unwrap();
-        let (mut file2, _) = vfs.open(None, flags).unwrap();
+        let (mut file1, _) = vfs.open(&cx, None, flags).unwrap();
+        let (mut file2, _) = vfs.open(&cx, None, flags).unwrap();
 
-        file1.write(b"file1", 0).unwrap();
-        file2.write(b"file2", 0).unwrap();
+        file1.write(&cx, b"file1", 0).unwrap();
+        file2.write(&cx, b"file2", 0).unwrap();
 
         let mut buf = [0u8; 5];
-        file1.read(&mut buf, 0).unwrap();
+        file1.read(&cx, &mut buf, 0).unwrap();
         assert_eq!(&buf, b"file1");
 
-        file2.read(&mut buf, 0).unwrap();
+        file2.read(&cx, &mut buf, 0).unwrap();
         assert_eq!(&buf, b"file2");
     }
 
     #[test]
     fn shared_file_across_handles() {
+        let cx = Cx::new();
         let vfs = make_vfs();
         let path = Path::new("shared.db");
         let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
 
-        let (mut file1, _) = vfs.open(Some(path), flags).unwrap();
-        file1.write(b"shared data", 0).unwrap();
+        let (mut file1, _) = vfs.open(&cx, Some(path), flags).unwrap();
+        file1.write(&cx, b"shared data", 0).unwrap();
 
         let open_flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::READWRITE;
-        let (mut file2, _) = vfs.open(Some(path), open_flags).unwrap();
+        let (mut file2, _) = vfs.open(&cx, Some(path), open_flags).unwrap();
         let mut buf = [0u8; 11];
-        let n = file2.read(&mut buf, 0).unwrap();
+        let n = file2.read(&cx, &mut buf, 0).unwrap();
         assert_eq!(n, 11);
         assert_eq!(&buf, b"shared data");
     }
 
     #[test]
     fn full_pathname() {
+        let cx = Cx::new();
         let vfs = make_vfs();
-        let resolved = vfs.full_pathname(Path::new("test.db")).unwrap();
+        let resolved = vfs.full_pathname(&cx, Path::new("test.db")).unwrap();
         assert!(resolved.is_absolute());
 
-        let already_abs = vfs.full_pathname(Path::new("/tmp/test.db")).unwrap();
+        let already_abs = vfs.full_pathname(&cx, Path::new("/tmp/test.db")).unwrap();
         assert_eq!(already_abs, Path::new("/tmp/test.db"));
     }
 
     #[test]
     fn locking() {
+        let cx = Cx::new();
         let vfs = make_vfs();
         let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
 
-        let (mut file, _) = vfs.open(Some(Path::new("lock.db")), flags).unwrap();
+        let (mut file, _) = vfs.open(&cx, Some(Path::new("lock.db")), flags).unwrap();
 
-        file.lock(LockLevel::Shared).unwrap();
-        file.lock(LockLevel::Reserved).unwrap();
-        file.lock(LockLevel::Exclusive).unwrap();
+        file.lock(&cx, LockLevel::Shared).unwrap();
+        file.lock(&cx, LockLevel::Reserved).unwrap();
+        file.lock(&cx, LockLevel::Exclusive).unwrap();
 
-        assert!(!file.check_reserved_lock().unwrap());
+        assert!(!file.check_reserved_lock(&cx).unwrap());
 
-        file.unlock(LockLevel::Shared).unwrap();
-        file.unlock(LockLevel::None).unwrap();
+        file.unlock(&cx, LockLevel::Shared).unwrap();
+        file.unlock(&cx, LockLevel::None).unwrap();
     }
 
     #[test]
     fn sync_is_noop() {
+        let cx = Cx::new();
         let vfs = make_vfs();
         let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
-        let (mut file, _) = vfs.open(Some(Path::new("sync.db")), flags).unwrap();
-        file.sync(SyncFlags::FULL).unwrap();
+        let (mut file, _) = vfs.open(&cx, Some(Path::new("sync.db")), flags).unwrap();
+        file.sync(&cx, SyncFlags::FULL).unwrap();
     }
 
     #[test]
     fn write_overwrite() {
+        let cx = Cx::new();
         let vfs = make_vfs();
         let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
-        let (mut file, _) = vfs.open(Some(Path::new("test.db")), flags).unwrap();
+        let (mut file, _) = vfs.open(&cx, Some(Path::new("test.db")), flags).unwrap();
 
-        file.write(b"AAAAAAAAAA", 0).unwrap();
-        file.write(b"BB", 3).unwrap();
+        file.write(&cx, b"AAAAAAAAAA", 0).unwrap();
+        file.write(&cx, b"BB", 3).unwrap();
 
         let mut buf = [0u8; 10];
-        file.read(&mut buf, 0).unwrap();
+        file.read(&cx, &mut buf, 0).unwrap();
         assert_eq!(&buf, b"AAABBAAAAA");
     }
 
@@ -448,40 +482,43 @@ mod tests {
 
     #[test]
     fn vfs_default_current_time() {
+        let cx = Cx::new();
         let vfs = make_vfs();
-        let time = vfs.current_time();
+        let time = vfs.current_time(&cx);
         assert!(time > 2_450_000.0);
         assert!(time < 2_500_000.0);
     }
 
     #[test]
     fn vfs_default_randomness() {
+        let cx = Cx::new();
         let vfs = make_vfs();
         let mut buf1 = [0u8; 16];
         let mut buf2 = [0u8; 16];
-        vfs.randomness(&mut buf1);
-        vfs.randomness(&mut buf2);
+        vfs.randomness(&cx, &mut buf1);
+        vfs.randomness(&cx, &mut buf2);
         assert_eq!(buf1, buf2);
     }
 
     #[test]
     fn page_read_write_roundtrip() {
+        let cx = Cx::new();
         let vfs = make_vfs();
         let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
-        let (mut file, _) = vfs.open(Some(Path::new("pages.db")), flags).unwrap();
+        let (mut file, _) = vfs.open(&cx, Some(Path::new("pages.db")), flags).unwrap();
 
         let page1 = vec![0xAA_u8; 4096];
         let page2 = vec![0xBB_u8; 4096];
 
-        file.write(&page1, 0).unwrap();
-        file.write(&page2, 4096).unwrap();
-        assert_eq!(file.file_size().unwrap(), 8192);
+        file.write(&cx, &page1, 0).unwrap();
+        file.write(&cx, &page2, 4096).unwrap();
+        assert_eq!(file.file_size(&cx).unwrap(), 8192);
 
         let mut buf = vec![0u8; 4096];
-        file.read(&mut buf, 0).unwrap();
+        file.read(&cx, &mut buf, 0).unwrap();
         assert!(buf.iter().all(|&b| b == 0xAA));
 
-        file.read(&mut buf, 4096).unwrap();
+        file.read(&cx, &mut buf, 4096).unwrap();
         assert!(buf.iter().all(|&b| b == 0xBB));
     }
 }

@@ -1,0 +1,6 @@
+# UBS ignore patterns (globs), applied in addition to gitignore.
+#
+# This repository contains large Markdown specs with embedded pseudocode in
+# multiple languages. UBS is a source scanner and produces high-noise findings
+# when run on these documents.
+COMPREHENSIVE_SPEC_FOR_FRANKENSQLITE_V1.md

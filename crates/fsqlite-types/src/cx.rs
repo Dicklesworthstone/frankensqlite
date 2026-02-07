@@ -2,14 +2,16 @@
 
 use std::marker::PhantomData;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy)]
 pub struct Cx<Caps = ()> {
     _marker: PhantomData<Caps>,
 }
 
 impl<Caps> Cx<Caps> {
     pub fn new() -> Self {
-        Self { _marker: PhantomData }
+        Self {
+            _marker: PhantomData,
+        }
     }
 
     pub fn checkpoint(&self) -> std::result::Result<(), i32> {
@@ -21,6 +23,8 @@ impl<Caps> Cx<Caps> {
     }
 
     pub fn restrict<NewCaps>(&self) -> Cx<NewCaps> {
-        Cx { _marker: PhantomData }
+        Cx {
+            _marker: PhantomData,
+        }
     }
 }

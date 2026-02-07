@@ -63,8 +63,13 @@ Pseudocode and type definitions are normative unless explicitly labeled
 | **OTI** | Object Transmission Information. RaptorQ metadata needed for decoding: (F, Al, T, Z, N). |
 | **DecodeProof** | Auditable witness artifact produced by the RaptorQ decoder when repairing or failing to repair (lab/debug). |
 | **Cx** | Capability context (asupersync). Threads cancellation via `is_cancel_requested()` / `checkpoint()`, progress via `checkpoint_with()`, budgets/deadlines via `Budget` and scoped budgets, and type-level restriction via `Cx::restrict::<NewCaps>()`. |
-| **Budget** | Asupersync resource budget (product meet-semilattice) carried by `Cx`: `{ deadline: Option<Time>, poll_quota: u32, cost_quota: Option<u64>, priority: u8 }`. Combined via `meet`: deadline/poll/cost = `min` (tighter wins), priority = `max` (higher wins). Budget exhaustion requests cancellation (deadline/budget). |
+| **Budget** | Asupersync resource budget carried by `Cx`: `{ deadline: Option<Time>, poll_quota: u32, cost_quota: Option<u64>, priority: u8 }`. Combined via component-wise `combine`: deadline/poll/cost use `min` (tighter resource limit wins); priority uses `max` (higher priority propagates inward). Note: the priority `max` rule makes this a **product lattice with mixed meet/join**, not a pure meet-semilattice — deadline/poll/cost follow meet order (tighter = lower) while priority follows join order (higher = more urgent). Budget exhaustion requests cancellation. |
 | **Outcome** | Asupersync 4-valued result lattice for concurrent tasks: `Ok < Err < Cancelled < Panicked`. Used for supervision and combinators; FrankenSQLite maps outcomes into SQLite error codes at API boundaries. |
+| **EpochId** | Monotonically increasing `u64` epoch for distributed coordination and validity windows (asupersync `epoch`). Used for key rotation, tiered-storage policy transitions, and cross-process barriers. |
+| **SymbolValidityWindow** | Epoch interval `[from_epoch, to_epoch]` used to accept/reject symbols/segments under key rotation and retention policies. |
+| **RemoteCap** | Asupersync capability token required for remote tier (L3) fetch/upload or remote compute. |
+| **IdempotencyKey** | Stable identifier used to deduplicate remote requests under retries (remote fetch/upload/compaction publish). |
+| **Saga** | Structured multi-step operation with deterministic compensations; used for compaction and tier eviction so cancellation never leaves partial state. |
 | **Region** | Asupersync structured concurrency scope: a tree of owned tasks. Region close implies quiescence (no live children, all finalizers run, all obligations resolved). |
 | **PageNumber** | 1-based `NonZeroU32` identifying a database page. Page 1 is always the database header. |
 | **TxnId** | Monotonically increasing `u64` transaction begin identifier (allocated at `BEGIN`). `TxnSlot.txn_id = 0` is reserved to mean "free slot", so real TxnIds are non-zero. |
@@ -283,9 +288,10 @@ the **write skew anomaly**: two transactions T1 and T2 each read overlapping
 data, each writes to a different item based on what they read, and both commit
 successfully -- but the combined result is inconsistent.
 
-**Example:** Table has two rows summing to 100. Constraint: sum must stay >= 0.
-T1 reads both (50, 50), writes row A = -40. T2 reads both (50, 50), writes
-row B = -40. Both commit. Sum is now -30. Constraint violated. Under
+**Example:** Table has two rows (A=50, B=50), sum=100. Constraint: sum >= 0.
+T1 reads both (50, 50), decides safe to withdraw 90, writes A = 50-90 = -40.
+T2 reads both (50, 50), decides safe to withdraw 90, writes B = 50-90 = -40.
+Both commit. Sum is now -40 + -40 = -80. Constraint violated. Under
 SERIALIZABLE, one would have seen the other's write and aborted.
 
 **This is a data corruption risk.** SQLite users depend on SERIALIZABLE. We
@@ -308,8 +314,10 @@ cannot silently downgrade.
 - SSI implements the conservative Cahill/Fekete rule at page granularity
   ("Page-SSI"): no committed transaction may have both an incoming AND
   outgoing rw-antidependency edge. This prevents serialization cycles.
-- Applications that opt in get **SERIALIZABLE** concurrent writes. The ~7%
-  overhead measured by PostgreSQL 9.1+ is acceptable for correctness.
+- Applications that opt in get **SERIALIZABLE** concurrent writes. The 3–7%
+  throughput overhead measured on OLTP benchmarks with PostgreSQL 9.1+ (Ports &
+  Grittner, VLDB 2012; up to 10–20% on synthetic microbenchmarks without
+  read-only optimizations) is acceptable for correctness.
 - `PRAGMA fsqlite.serializable = OFF` provides an explicit opt-out to plain
   Snapshot Isolation for benchmarking or applications that tolerate write skew.
   This is NOT the default.
@@ -326,8 +334,9 @@ cannot silently downgrade.
   Hot-plane overhead is bounded by `TxnSlot` count and hot bucket capacity
   (bitsets over slots); cold-plane evidence is append-only but GC-able by
   `safe_gc_seq` horizons.
-- PostgreSQL has proven SSI viable in production since 2011 with <7% overhead
-  and ~0.5% false positive abort rate. At page granularity, our false positive
+- PostgreSQL has proven SSI viable in production since 2011 with 3–7% OLTP
+  overhead (up to 10–20% on microbenchmarks) and ~0.5% false positive abort
+  rate. At page granularity, our false positive
   rate will be somewhat higher, but the safe write-merge ladder (Section 5.10)
   compensates by turning many apparent conflicts into successful merges.
 - Starting with SSI from day one means we never ship a correctness regression.
@@ -2508,6 +2517,65 @@ node_hash = BLAKE3_256( "fsqlite:mmr:node:v1" || left || right )
 MMR is optional in V1; when disabled, the hash chain + binary search remains
 the default divergence check.
 
+#### 3.5.4.2 Symbol Record Logs (Append-Only, Locator-Friendly, Epoch-Typed)
+
+Symbol record logs under `ecs/symbols/` are the persistence substrate for ECS
+objects. Unlike the marker stream (fixed-size records), symbol logs store
+variable-sized `SymbolRecord`s (because `T = symbol_size` is object-type-aware).
+
+The format is optimized for:
+- sequential append writes,
+- sequential scans (for rebuild),
+- random access via locator offsets (for decode).
+
+**V1 constants (normative):**
+
+```
+SYMBOL_SEGMENT_HEADER_BYTES := 40
+```
+
+**Symbol segment file:**
+
+`ecs/symbols/segment-XXXXXX.log` stores a sequence of symbol records. Each file
+starts with a header, followed by a concatenation of `SymbolRecord` entries.
+
+```
+SymbolSegmentHeader := {
+  magic      : [u8; 4],   -- "FSSY"
+  version    : u32,       -- 1
+  segment_id : u64,       -- monotonic identifier (matches filename)
+  epoch_id   : u64,       -- ECS coordination epoch (RootManifest.ecs_epoch at segment creation)
+  created_at : u64,       -- unix_ns (monotonic in lab via virtual time)
+  header_xxh3: u64,       -- xxhash3 of all preceding header fields
+}
+```
+
+**Epoch meaning (normative):**
+`epoch_id` is not needed for RaptorQ decoding (OTI+ESI are sufficient). It
+exists to make distributed operation and security policy explicit:
+- Symbol auth key derivation is epoch-scoped (§4.18.2).
+- Remote durability/quorum configuration is epoch-scoped (§4.18.3).
+- Epoch transitions are explicit and quiescent (§4.18.4).
+
+**Torn tail handling (normative):**
+If a symbol segment ends with a partial `SymbolRecord` (incomplete bytes),
+rebuild/recovery MUST ignore the torn tail.
+
+**Locator offsets (normative):**
+
+The locator indexes symbols by their location in a segment:
+
+```
+SymbolLogOffset := {
+  segment_id   : u64,
+  offset_bytes : u64,  -- byte offset AFTER SymbolSegmentHeader
+}
+```
+
+`cache/object_locator.cache` stores (at minimum) `ObjectId -> Vec<SymbolLogOffset>`.
+It is an accelerator only and MUST be rebuildable by scanning `ecs/symbols/`
+and parsing symbol records.
+
 #### 3.5.5 RootManifest: Bootstrap
 
 The RootManifest is the bootstrap entry point, stored as a standard ECS object.
@@ -2522,6 +2590,7 @@ RootManifest := {
     commit_seq      : u64,         -- latest commit sequence number
     schema_snapshot : ObjectId,    -- ObjectId of current schema ECS object
     schema_epoch    : u64,         -- monotonic schema epoch (bumps on DDL/VACUUM)
+    ecs_epoch       : u64,         -- monotonic ECS coordination epoch (remote config + symbol auth key derivation)
     checkpoint_base : ObjectId,    -- ObjectId of last full checkpoint
     gc_horizon      : u64,         -- safe GC horizon commit sequence (min active begin_seq)
     created_at      : u64,         -- Unix timestamp
@@ -2715,6 +2784,21 @@ objects to remote storage while preserving correctness and predictability.
 - `PRAGMA durability = quorum(M)`: L3 (or replica peers) participate in the
   durability contract; commit is not successful until the configured quorum
   acknowledges enough symbols to make decode succeed.
+
+**Remote tier integration (asupersync RemoteCap + idempotency, normative):**
+
+- L3 fetch/upload MUST require `RemoteCap` in `Cx` (§4.19.1). Without RemoteCap,
+  any attempt to fetch from L3 MUST fail with an explicit error and MUST NOT
+  perform network I/O.
+- Remote operations MUST be expressed as named computations (`ComputationName`,
+  no closure shipping; §4.19.2) so the set of remotely-executable behaviors is
+  explicit and auditable.
+- Remote fetch/upload MUST be idempotent under retries (§4.19.4). Requests MUST
+  carry an IdempotencyKey derived from request bytes and MUST include `ecs_epoch`
+  (§4.18.3) to prevent mixed-epoch ambiguity.
+- Multi-step workflows (segment eviction, compaction publish) MUST use the Saga
+  discipline (§4.19.5): either the saga completes, or its compensations leave
+  the system in a state equivalent to "the saga never happened."
 
 **Eviction policy (normative):**
 
@@ -2926,9 +3010,10 @@ Every FrankenSQLite operation accepts `&Cx`. This enables:
   "stalled task" detection. FrankenSQLite maps `ErrorKind::Cancelled` to the most
   precise SQLite error code for the context (default: `SQLITE_INTERRUPT`).
 - **Deadline propagation (budgets)**: time budgets are expressed as `Budget` deadlines
-  and enforced via region/scope budgets. Budgets are a **product meet-semilattice**
-  (deadline + poll quota + cost quota + priority) with `meet` (∧) semantics:
-  constraints tighten by `min` and priority tightens by `max`. When tightening a
+  and enforced via region/scope budgets. Budgets are a **product lattice with
+  mixed meet/join** (deadline + poll quota + cost quota + priority): resource
+  constraints (deadline/poll/cost) tighten by `min` (meet), while priority
+  propagates by `max` (join — higher priority is more urgent). When tightening a
   budget, callers MUST compute `effective = cx.budget().meet(child)` and then use
   `cx.scope_with_budget(effective)` so child scopes cannot loosen parent budgets.
   Cancellation cleanup MUST use a bounded cleanup budget (`Budget::MINIMAL` or a
@@ -2938,6 +3023,24 @@ Every FrankenSQLite operation accepts `&Cx`. This enables:
   capability sets without `IO`, `REMOTE`, and typically without `SPAWN`. Narrowing
   is zero-cost via `cx.restrict::<NewCaps>()` and is monotone (`SubsetOf`), so the
   type system prevents capability escalation.
+
+#### 4.1.1 Ambient Authority Prohibition (Audit Gate)
+
+Deterministic testing, capability security, and cancel-correctness all collapse
+if code can silently reach around `Cx` (ambient authority). Therefore:
+
+**Rule (INV-NO-AMBIENT-AUTHORITY):** FrankenSQLite crates MUST NOT call ambient
+side-effect APIs directly. In particular, database crates MUST NOT call:
+- `std::time::SystemTime::now()` / `Instant::now()` (use Cx time/budget clocks),
+- ambient RNG (`rand::thread_rng()` / `getrandom`) (use Cx randomness),
+- direct filesystem/network APIs (`std::fs`, `std::net`) (use VFS + RemoteCap),
+- spawning (`std::thread::spawn`, tokio, etc.) (use asupersync regions/scopes).
+
+**Enforcement (required):**
+- Time/randomness/I/O MUST flow through `Cx` + VFS/Remote traits.
+- The workspace SHOULD use a compile-time audit gate (asupersync
+  `audit::ambient` pattern: define "pristine modules" and deny disallowed
+  symbols) so violations are caught in CI, not in production.
 
 **Integration pattern:**
 ```rust
@@ -4336,6 +4439,144 @@ given trace + seed: no dependence on wall-clock, hash randomization, or
 unordered iteration. Any randomization MUST be explicit, seeded, and recorded
 in the evidence ledger.
 
+### 4.18 Epochs (Asupersync EpochClock) -- Validity Windows and Coordination
+
+Asupersync provides an epoch model (`asupersync::epoch`) for time-bounded
+distributed operations. FrankenSQLite adopts epochs as the explicit mechanism
+for cross-process and cross-host transitions that must not be "half applied":
+
+- durability quorum membership changes,
+- remote tier endpoint changes,
+- symbol authentication key rotations,
+- compaction publication generations (optional, advisory).
+
+**Definition (normative):**
+- `ecs_epoch : EpochId` is a monotone `u64` stored durably in `RootManifest.ecs_epoch`
+  (§3.5.5) and mirrored in `SharedMemoryLayout.ecs_epoch` (§5.6.1).
+- `ecs_epoch` increments only under a serialized coordinator decision. Epochs
+  MUST NOT be reused.
+
+#### 4.18.1 SymbolValidityWindow (Normative Default)
+
+The engine defines a SymbolValidityWindow:
+
+```
+SymbolValidityWindow := [0, RootManifest.ecs_epoch]
+```
+
+This is a fail-closed policy for future epochs:
+- Symbols/segments tagged with `epoch_id > RootManifest.ecs_epoch` MUST be rejected
+  as misconfiguration or replay from an incompatible future configuration.
+- Past epochs are accepted by default (time travel + full-history retention).
+
+Implementations MAY tighten the lower bound (reject very old epochs) only if
+the retention policy does not require decoding historical objects from those
+epochs.
+
+#### 4.18.2 Epoch-Scoped Symbol Authentication Key Derivation (Required)
+
+When symbol authentication (`auth_tag`) is enabled (§3.5.2), the verification
+key MUST be derived as a deterministic function of `(master_key, ecs_epoch)`:
+
+```
+K_epoch = KDF(master_key, "fsqlite:symbol-auth:v1" || le_u64(ecs_epoch))
+```
+
+This aligns with asupersync's "no ambient keys" principle: keys are provided
+through capabilities, and derivation is deterministic (lab-replayable).
+
+**Rule:** Auth failures MUST fail closed: invalid/missing `auth_tag` on a symbol
+record MUST cause the symbol to be rejected for decoding (it MAY still be used
+as a corruption signal for redundancy autopilot (§3.5.12)).
+
+#### 4.18.3 Epoch-Scoped Remote Durability Configuration (Required)
+
+If durability depends on remote acknowledgements (`PRAGMA durability = quorum(M)`),
+the durability configuration is epoch-scoped:
+- Requests MUST carry `ecs_epoch` and peers MUST reject requests outside their
+  SymbolValidityWindow (preventing mixed-quorum ambiguity).
+- CommitMarkers implicitly bind to the epoch in effect at the time their
+  referent symbols were made durable.
+
+#### 4.18.4 Epoch Transition Barrier (Quiescence Without Stop-The-World)
+
+Epoch transitions that affect correctness-critical policy (quorum membership,
+symbol auth master key) MUST establish a quiescence point so no single commit
+straddles two epochs.
+
+FrankenSQLite MUST implement this as an asupersync-style barrier:
+- Coordinator creates an `EpochBarrier(current_epoch, participants=N, timeout)`.
+- Participants are the region-owned services: WriteCoordinator, SymbolStore,
+  Replicator, CheckpointerGc.
+- Each participant arrives only after draining in-flight work that would bind to
+  the old epoch (e.g., commits in the sequencer queue; ongoing remote uploads).
+- If the barrier triggers with `AllArrived`, the coordinator increments
+  `RootManifest.ecs_epoch`, publishes it durably, then updates
+  `SharedMemoryLayout.ecs_epoch` with `Release`.
+- If the barrier triggers by `Timeout` or `Cancelled`, the transition MUST abort
+  (remain in the old epoch) unless explicitly forced by an operator command.
+
+This is the non-vibes way to do configuration changes: either everyone arrived
+and the epoch advanced, or it did not.
+
+### 4.19 Remote Effects (Asupersync Remote) -- Named Computations, Leases, Idempotency, Sagas
+
+Tiered storage (L3) and replication are fundamentally remote effects. FrankenSQLite
+adopts asupersync's remote contract so remote behavior is cancellable, bounded,
+and auditable rather than ad-hoc.
+
+#### 4.19.1 Explicit Remote Capability (Required)
+
+All remote operations MUST require `RemoteCap` in `Cx`. Without it:
+- No network I/O can occur (compile-time or runtime refusal).
+- Native mode still functions under `durability = local` (remote is optional).
+
+This prevents silent network I/O from arbitrary SQL code paths and makes the
+system testable (lab contexts simply omit RemoteCap).
+
+#### 4.19.2 Named Computations (No Closure Shipping, Required for Auditing)
+
+Remote work MUST be specified by a `ComputationName` plus serialized input bytes.
+The runtime must never serialize arbitrary closures.
+
+Normative remote computation names (minimum set):
+- `symbol_get_range(object_id, esi_lo, esi_hi, ecs_epoch)`
+- `symbol_put_batch(object_id, symbols[], ecs_epoch)`
+- `segment_put(segment_id, bytes, ecs_epoch)`
+- `segment_stat(segment_id, ecs_epoch)`
+
+#### 4.19.3 Lease-Backed Liveness (Required)
+
+Remote handles MUST be lease-backed: if a lease expires, the local region MUST
+escalate (cancel, retry, or fail), and the event MUST be trace-visible.
+
+This is how we avoid "hung remote fetch" as an unbounded tail-latency failure.
+
+#### 4.19.4 Idempotency (Required)
+
+All remote requests that might be retried MUST include an IdempotencyKey:
+
+```
+IdempotencyKey = Trunc128(BLAKE3("fsqlite:remote:v1" || request_bytes))
+```
+
+Remote receivers MUST deduplicate by IdempotencyKey (asupersync IdempotencyStore
+semantics):
+- Duplicate with same computation name + inputs returns the recorded outcome.
+- Duplicate with same key but different computation inputs is a conflict and MUST
+  be rejected.
+
+#### 4.19.5 Sagas for Multi-Step Publication (Compaction, Eviction, Required)
+
+Any multi-step remote+local workflow that would otherwise leave partial state
+on cancellation/crash MUST be expressed as a Saga (forward steps + deterministic
+compensations). This is required for:
+- L2 segment eviction to L3 (upload -> verify -> retire local),
+- compaction publish (write new segments -> publish -> update locators/manifests).
+
+Sagas are deterministic and replayable: given the same inputs, the same sequence
+of steps and compensations occurs, and evidence is recorded for debugging.
+
 ## 5. MVCC Formal Model (Revised)
 
 This section supersedes `MVCC_SPECIFICATION.md` with corrections for the
@@ -5159,6 +5400,7 @@ SharedMemoryLayout := {
                                        -- physical marker stream tip (§3.5.4.1). It MUST NOT get ahead of
                                        -- the marker stream (no gaps).
     schema_epoch     : AtomicU64,      -- monotonic schema epoch (mirror of RootManifest.schema_epoch)
+    ecs_epoch        : AtomicU64,      -- monotonic ECS coordination epoch (mirror of RootManifest.ecs_epoch)
     gc_horizon       : AtomicU64,      -- safe GC horizon commit_seq (min active begin_seq) across all processes
     lock_table_offset: u64,            -- byte offset to PageLockTable region
     witness_offset   : u64,            -- byte offset to SSI witness plane (HotWitnessIndex)
@@ -5187,6 +5429,9 @@ operations.
   durable commit clock tip:
   - **Native mode:** the physical marker stream tip (§3.5.4.1).
   - **Compatibility mode:** the durable WAL-visible state (WAL index + frames).
+- On database open (native mode), implementations MUST set `shm.ecs_epoch` from
+  `RootManifest.ecs_epoch` so cross-process services share the same epoch-scoped
+  remote/key policy configuration (§4.18). Loads/stores MUST use Acquire/Release.
 - If the shared-memory file already exists, implementations MUST reconcile
   `shm.commit_seq` against the durable tip and MUST NOT allow `shm.commit_seq`
   to remain ahead of durable reality (that would make snapshots reference
@@ -5212,6 +5457,7 @@ TxnSlot := {
                                    -- commit_seq.load(Acquire) used for begin_seq to avoid GC safety issues.
     state           : AtomicU8,      -- 0=Free, 1=Active, 2=Committing, 3=Committed, 4=Aborted
     mode            : AtomicU8,      -- 0=Serialized, 1=Concurrent
+    witness_epoch   : AtomicU32,     -- witness-plane epoch pinned at BEGIN CONCURRENT (§5.6.4.8)
     has_in_rw       : AtomicBool,    -- SSI: has incoming rw-antidependency
     has_out_rw      : AtomicBool,    -- SSI: has outgoing rw-antidependency
     marked_for_abort: AtomicBool,    -- SSI: eager pivot abort signal (optimization)
@@ -5219,7 +5465,7 @@ TxnSlot := {
     claiming_timestamp: AtomicU64,   -- unix timestamp when Phase 1 CAS set TXN_ID_CLAIMING;
                                    -- used by cleanup to detect stuck CLAIMING slots (§5.6.2).
                                    -- Written BEFORE the Phase 1 CAS; zeroed when slot is freed.
-    _padding        : [u8; 56],      -- pad to 128 bytes (two cache lines; prevents false sharing between adjacent slots)
+    _padding        : [u8; 52],      -- pad to 128 bytes (two cache lines; prevents false sharing between adjacent slots)
 }
 ```
 
@@ -5236,6 +5482,9 @@ TxnSlot := {
    process can acquire it because `txn_id != 0`), initialize all fields:
    increment `txn_epoch` (wrap permitted), set `begin_seq = shm.commit_seq.load(Acquire)`,
    set `pid`, `pid_birth`, `lease_expiry`, and `state = Active`.
+   If `mode == Concurrent`, set `witness_epoch = HotWitnessIndex.epoch.load(Acquire)` so all
+   witness-plane registrations for the transaction are pinned to a single epoch
+   generation (prevents reader-induced epoch livelock; §5.6.4.8).
 
    **Phase 3 (publish):** Store the real TxnId into `txn_id` with Release
    ordering. Only after this store is the slot visible to other processes as
@@ -5361,9 +5610,10 @@ PageLockEntry := {
 - `page_number == 0` means "empty slot".
 - `owner_txn == 0` means "not currently locked".
 - **Key stability (normative):** `page_number` MUST NOT be deleted/tombstoned as
-  part of normal `release()`. Keys are cleared only during a quiescent rebuild
-  (§5.6.3.1). This avoids key-deletion races in a lock-free linear-probing table
-  where `(page_number, owner_txn)` are separate atomics.
+  part of normal `release()`. Keys are cleared only during a **lock-quiescent**
+  rebuild (§5.6.3.1), i.e., after freezing new acquisitions and draining all
+  outstanding lock holders. This avoids key-deletion races in a lock-free
+  linear-probing table where `(page_number, owner_txn)` are separate atomics.
 
 **Acquire (linear probing with atomic insertion):**
 
@@ -5398,17 +5648,17 @@ is incorrect because it would create entries with no discoverable key.
 - CAS `owner_txn` from `releasing TxnId` -> 0 (Release ordering).
 - MUST NOT modify `page_number` during normal release. Key deletion in a
   lock-free linear-probing table with separate `(page_number, owner_txn)` atomics
-  is not safe; rebuild under quiescence is the only supported removal mechanism
+  is not safe; rebuild under lock-quiescence is the only supported removal mechanism
   (§5.6.3.1).
 
 Because keys persist, the table can saturate in long-running workloads. The
-lease-based rebuild protocol (§5.6.3.1) clears the table at a proven quiescence
+lease-based rebuild protocol (§5.6.3.1) clears the table at a proven lock-quiescence
 point to reclaim capacity and bound probe lengths.
 
 This is simpler than the in-process sharded HashMap but provides the same
 semantics: exclusive write locks per page, immediate failure on contention.
 
-##### 5.6.3.1 Table Rebuild (Lease + Quiescence Barrier)
+##### 5.6.3.1 Table Rebuild (Lease + Lock-Quiescence Barrier)
 
 The shared-memory lock table is fixed-capacity in V1; "rebuild" means "clear
 the table to empty", not "resize".
@@ -5441,16 +5691,19 @@ sequencer is unavailable, but only one rebuild may be in progress.
 2. Freeze new acquisitions: while rebuild lease is active, `try_acquire` MUST
    fail with `SQLITE_BUSY` (or wait per busy-timeout). `release` MUST continue
    to function.
-3. Drain to quiescence: wait until there are no TxnSlots with:
-   - `mode == Concurrent`, and
-   - `state` in {Active, Committing}, and
-   - `txn_id != 0` and `txn_id != TXN_ID_CLAIMING`.
+3. Drain to **lock-quiescence**: wait until there are no outstanding lock
+   holders in the PageLockTable, i.e., until:
+   - `forall entry in entries: entry.owner_txn == 0`.
+   Read-only transactions MUST NOT block rebuild: Concurrent-mode reads do not
+   touch the PageLockTable. During drain, the rebuilder SHOULD run
+   `cleanup_orphaned_slots()` so orphaned holders cannot stall the drain.
 4. Clear table: set every entry to empty (`page_number = 0`, `owner_txn = 0`).
-   This is safe because no Concurrent transactions exist at this point, so no
-   lock operations can race with clearing.
+   This is safe because (a) new acquisitions are frozen and (b) drain observed
+   `owner_txn == 0` for all entries, so no acquire/release operation can race
+   with key clearing.
 5. Increment `rebuild_epoch` and release the lease (`rebuild_pid = 0`).
 
-**Cancellation safety:** Once drain observes quiescence and clearing begins,
+**Cancellation safety:** Once drain observes lock-quiescence and clearing begins,
 the rebuild MUST run to completion (mask cancellation) so the lease is released
 and the table is not left partially cleared.
 
@@ -5583,8 +5836,8 @@ bucket entry with **monotonic bitsets** of active TxnSlots:
 
 ```
 HotWitnessIndex := {
-    capacity : u32,      -- power-of-2; sized for expected hot buckets
-    epoch    : AtomicU32 -- global bucket epoch for O(1) "clears"
+    capacity : u32,       -- power-of-2; sized for expected hot buckets
+    epoch    : AtomicU32, -- current witness epoch (monotonic)
     entries  : [HotWitnessBucketEntry; capacity],
     overflow : HotWitnessBucketEntry, -- always-present catch-all (no false negatives)
 }
@@ -5592,10 +5845,13 @@ HotWitnessIndex := {
 HotWitnessBucketEntry := {
     level        : AtomicU8,      -- 0xFF = empty
     prefix       : AtomicU32,     -- packed prefix bits (interpretation depends on level)
-    bucket_epoch : AtomicU32,     -- epoch of the readers/writers bitsets
-    epoch_lock   : AtomicU32,     -- 0 = unlocked; non-zero = locked (spinlock for epoch swap + clear)
-    readers_bits : [AtomicU64; W],-- bit i = TxnSlotId i is a reader in this bucket epoch
-    writers_bits : [AtomicU64; W],
+    epoch_lock   : AtomicU32,     -- 0 = unlocked; non-zero = locked (spinlock for epoch install + clear)
+    epoch_a      : AtomicU32,     -- epoch tag for (readers_a, writers_a)
+    readers_a    : [AtomicU64; W],-- bit i = TxnSlotId i is a reader in epoch_a
+    writers_a    : [AtomicU64; W],
+    epoch_b      : AtomicU32,     -- epoch tag for (readers_b, writers_b)
+    readers_b    : [AtomicU64; W],-- bit i = TxnSlotId i is a reader in epoch_b
+    writers_b    : [AtomicU64; W],
 }
 ```
 
@@ -5603,26 +5859,31 @@ Where `W = ceil(max_txn_slots / 64)`.
 
 **Update on read/write (monotonic, race-free):**
 
-- On read of key `K` by slot `s`, set bit `s` in `readers_bits` for all
-  configured levels' buckets for `K` (L0/L1/L2).
-- On write of key `K` by slot `s`, set bit `s` in `writers_bits` similarly.
+- Every Concurrent-mode transaction pins a `witness_epoch` at begin
+  (`TxnSlot.witness_epoch`; §5.6.2 and §5.6.4.8). All witness-plane
+  registrations for the transaction MUST target that pinned epoch.
+- On read of key `K` by slot `s`, set bit `s` in the bucket buffer tagged with
+  `epoch == TxnSlot[s].witness_epoch` for all configured levels' buckets for `K`
+  (L0/L1/L2), or `overflow` if allocation fails.
+- On write of key `K` by slot `s`, set bit `s` in the corresponding `writers_*`
+  buffers similarly.
 
 **Epoch discipline (required to avoid false negatives):**
 
-- Updaters MUST load `global_epoch = HotWitnessIndex.epoch` with `Acquire`.
-- Updaters MUST load `bucket_epoch` with `Acquire`.
-- If `bucket_epoch != global_epoch`, the updater MUST acquire `epoch_lock` and
-  perform the epoch swap atomically:
-  - clear all `readers_bits[*]` and `writers_bits[*]` to 0, then
-  - store `bucket_epoch = global_epoch` with `Release`, then
-  - release `epoch_lock`.
-
-The clear MUST happen-before publishing the new `bucket_epoch` (Release store),
-so that a concurrent updater that observes `bucket_epoch == global_epoch` (via
-Acquire load) cannot have its bit wiped by a delayed clear.
-
-Fast path: if `bucket_epoch == global_epoch`, no lock is needed; the updater
-sets the relevant bit using `fetch_or`.
+- At any time, there are at most two *live* epochs in the hot plane:
+  `cur = HotWitnessIndex.epoch` and `prev = cur - 1` (because epoch advancement
+  is constrained by §5.6.4.8).
+- Updaters MUST load `target_epoch = TxnSlot[s].witness_epoch` with `Acquire`.
+- Fast path: if `epoch_a == target_epoch` or `epoch_b == target_epoch`, no lock
+  is needed; set the relevant bit using `fetch_or` in that buffer.
+- Slow path (install + clear): if neither buffer is tagged with `target_epoch`,
+  the updater MUST acquire `epoch_lock` and install `target_epoch` into one
+  buffer by:
+  - clearing that buffer's `readers_*[*]` and `writers_*[*]` to 0, then
+  - storing the corresponding `epoch_* = target_epoch` with `Release`, then
+  - releasing `epoch_lock`.
+  Install MUST NOT overwrite the other live epoch's buffer (if present); any
+  buffer tagged with neither `cur` nor `prev` is stale and may be reused.
 
 **`epoch_lock` acquisition (normative):**
 
@@ -5698,19 +5959,26 @@ debuggability).
 
 The hot plane uses **bucket epochs**:
 - `HotWitnessIndex.epoch` is a monotonically increasing global generation number.
-  Advancing it makes buckets *logically empty* until they are refreshed.
-- **No-false-negatives constraint (normative):** advancing `HotWitnessIndex.epoch`
-  MUST NOT make an active transaction undiscoverable for any `WitnessKey` it has
-  registered. In V1, the only universally safe rule is:
-  advance the global epoch only when there are **no Active Concurrent-mode
-  transactions** (quiescence), i.e., when `oldest_active_begin_seq ==
-  shm.commit_seq.load(Acquire)`.
-  (More aggressive epoch advancement requires a more complex hot-plane design
-  such as double-buffering; see §21.)
-- When a bucket entry's `bucket_epoch != HotWitnessIndex.epoch`, the next updater
-  MUST refresh the bucket under `HotWitnessBucketEntry.epoch_lock` by clearing
-  bitsets, then publishing `bucket_epoch = global_epoch` with Release semantics
-  (§5.6.4.5). This prevents lost updates and false negatives.
+  It is a **performance accelerator**, not the source of truth.
+- The hot plane MUST be **double-buffered** per bucket (two epoch-tagged bitset
+  buffers; §5.6.4.5). This allows advancing epochs without requiring "zero
+  Concurrent-mode transactions", preventing reader-induced writer starvation.
+- **Pinned epoch (normative):** Every Concurrent-mode transaction MUST pin
+  `TxnSlot.witness_epoch = HotWitnessIndex.epoch.load(Acquire)` at BEGIN and MUST
+  target that epoch for all witness-plane registrations. This ensures a
+  transaction's discoverability does not depend on global epoch changes while it
+  is active.
+- **Safe epoch advancement (normative):** Let `cur = HotWitnessIndex.epoch`.
+  Advancing `epoch` from `cur` to `cur+1` necessarily drops/reuses the
+  `cur-1` buffers. Therefore epoch advancement is permitted iff there are **no**
+  Active Concurrent-mode TxnSlots with `witness_epoch == cur-1`.
+  This does not require a moment of zero active transactions; it requires only
+  that the *oldest* epoch has drained.
+- **Bucket refresh:** When an updater needs to set a bit for `target_epoch` and
+  the bucket has no buffer tagged with that epoch, it refreshes a stale buffer
+  under `epoch_lock` by clearing it and publishing the new `epoch_*` tag with
+  Release semantics (§5.6.4.5). Candidate discovery MUST consult both live
+  epochs (`cur` and `cur-1`) plus `overflow`.
 
 This yields bounded memory and bounded per-operation cost without per-txn clears.
 
@@ -6057,14 +6325,17 @@ transactions. The witness plane does this in two stages:
 
 **Incoming rw-antidependency discovery** (`R -rw-> T`):
 
-- For each `WriteWitness` bucket of `T`, query the bucket's `readers_bits` and
-  intersect with `active_slots_bitset`.
+- Let `cur = HotWitnessIndex.epoch.load(Acquire)` and `prev = cur - 1`.
+- For each `WriteWitness` bucket of `T`, query the bucket's reader bitsets for
+  **both live epochs** (`cur` and `prev`) and OR them:
+  `readers = readers_for_epoch(cur) ∪ readers_for_epoch(prev)`.
+  Then intersect with `active_slots_bitset`.
 - Map slots to `TxnToken` via `TxnSlotTable`, validating `txn_epoch` matches.
 - If refinement is enabled, confirm `ReadSet(R) ∩ WriteSet(T) ≠ ∅` at the finest
   available key granularity; otherwise treat bucket overlap as conflict.
 
 **Outgoing rw-antidependency discovery** (`T -rw-> W`) is symmetric using
-`writers_bits`.
+the union of `writers_for_epoch(cur) ∪ writers_for_epoch(prev)`.
 
 **Theorem (No False Negatives, hot plane):**
 
@@ -6072,8 +6343,10 @@ If a transaction `R` registers a read `WitnessKey K`, then `R` is discoverable
 as a reader candidate for `K` at commit time for any overlapping writer `T`
 because:
 - registration updates every configured level bucket for `K` (or `overflow`)
-  by setting `readers_bits[R.slot_id]` (union-only),
-- candidate discovery queries those same buckets (and `overflow`),
+  by setting `readers_for_epoch(R.witness_epoch)[R.slot_id]` (union-only),
+- epoch advancement is constrained so every active transaction has
+  `witness_epoch ∈ {cur, cur-1}` (§5.6.4.8), and candidate discovery queries both
+  live epochs for those same buckets (and `overflow`),
 - stale bits are filtered by `(txn_id, txn_epoch)` validation.
 
 Thus false negatives are forbidden by construction; false positives are bounded
@@ -6244,11 +6517,13 @@ Based on the PostgreSQL 9.1+ implementation (Ports, 2012):
   under typical OLTP workloads. This is acceptable because the cost of a
   false positive (retry the transaction) is much lower than the cost of a
   missed anomaly (data corruption).
-- **Overhead:** <7% throughput reduction compared to plain Snapshot Isolation,
-  measured on TPC-C. The overhead comes from maintaining *read-dependency
-  evidence* (Postgres: SIREAD locks) and checking for dangerous structures.
-  In FrankenSQLite the analogous costs are witness registration, hot-index
-  bitset updates, witness object publication, and (optional) refinement.
+- **Overhead:** 3–7% throughput reduction on OLTP benchmarks (TPC-C, RUBiS);
+  10–20% on synthetic microbenchmarks (SIBENCH) before read-only optimizations
+  (Ports & Grittner, VLDB 2012). Overhead comes from maintaining
+  *read-dependency evidence* (Postgres: SIREAD locks) and checking for dangerous
+  structures. In FrankenSQLite the analogous costs are witness registration,
+  hot-index bitset updates, witness object publication, and (optional)
+  refinement.
 - **Memory:** PostgreSQL's SIREAD lock table grows roughly with
   `active_txns * read_granules`. In FrankenSQLite:
   - hot plane memory is bounded by `TxnSlot` count and hot bucket capacity
@@ -7439,7 +7714,7 @@ REPLACE(cache, target_key):
         rotations += 1
         continue
       if candidate.dirty:
-        if flush_to_wal(candidate).is_err():
+        if flush_dirty_page(candidate).is_err():
           // WAL write failed (disk full, I/O error). Skip this candidate
           // rather than evicting an unflushed dirty page (data loss).
           // flush_dirty_page() restores the dirty flag on failure (§6.6).
@@ -7459,7 +7734,7 @@ REPLACE(cache, target_key):
         rotations += 1
         continue
       if candidate.dirty:
-        if flush_to_wal(candidate).is_err():
+        if flush_dirty_page(candidate).is_err():
           T2.rotate_front_to_back()
           rotations += 1
           continue
@@ -7469,7 +7744,7 @@ REPLACE(cache, target_key):
       return
 ```
 
-**Dirty flush under mutex (design note):** The `flush_to_wal()` calls above
+**Dirty flush under mutex (design note):** The `flush_dirty_page()` calls above
 execute WAL I/O while the cache mutex is held, blocking all concurrent cache
 operations for the duration of the write. This is a deliberate simplicity
 trade-off: the alternative (releasing the mutex, flushing, re-acquiring) would
@@ -7539,18 +7814,28 @@ REQUEST(cache, key: CacheKey) -> Result<Arc<CachedPage>>:
       // invariant L1 = |T1| + |B1| ≤ capacity. The evicted key is simply
       // discarded (it was never in a ghost list, so the page leaves the
       // cache entirely — no ghost metadata is preserved).
+      rotations = 0
       candidate = T1.front()
-      while candidate.ref_count > 0:
+      while candidate.ref_count > 0 OR candidate.dirty:
+        if rotations >= |T1|:
+          // Safety valve: all T1 pages are pinned or unflushed.
+          // Allow temporary over-capacity rather than spinning forever.
+          capacity_overflow += 1
+          break  // skip eviction, insert will exceed capacity
+        if candidate.dirty AND candidate.ref_count == 0:
+          if flush_dirty_page(candidate).is_err():
+            T1.rotate_front_to_back()
+            rotations += 1
+            candidate = T1.front()
+            continue                  // retry with next candidate
+          break  // flush succeeded, candidate is now clean and evictable
         T1.rotate_front_to_back()
+        rotations += 1
         candidate = T1.front()
-      if candidate.dirty:
-        if flush_to_wal(candidate).is_err():
-          T1.rotate_front_to_back()
-          candidate = T1.front()
-          continue                    // retry with next candidate
-      (evicted_key, _) = T1.pop_front()
-      // No B1.push_back — intentionally omitted (see above)
-      total_bytes -= _.byte_size
+      if rotations < |T1| AND candidate.ref_count == 0:
+        (evicted_key, _) = T1.pop_front()
+        // No B1.push_back — intentionally omitted (see above)
+        total_bytes -= _.byte_size
   else if L1 < capacity AND L1 + L2 >= capacity:
     if L1 + L2 >= 2 * capacity:
       B2.pop_front()              // discard oldest ghost from B2
@@ -8316,6 +8601,16 @@ Compaction MUST be:
 - crash-safe (safe at any instruction boundary),
 - cross-process safe (multiple processes may be reading),
 - non-disruptive to p99 latency (rate-limited background region).
+
+**Saga requirement (normative):** Compaction MUST be implemented as a Saga
+(`asupersync::remote::Saga` semantics; §4.19.5) even when all I/O is local.
+Each phase that could leave partial state MUST have a deterministic
+compensation:
+- If cancellation occurs before publication, temporary segments remain ignored
+  and may be garbage-collected later.
+- If cancellation occurs after new segments are durable but before locator/root
+  update, the system MUST either complete publication or roll back pointers to
+  a coherent pre-compaction view.
 
 1.  **Mark Phase (Identify Live Symbols):**
     -   Start from `RootManifest` and active `CommitMarker` stream.
@@ -12727,6 +13022,25 @@ The property test harness MUST:
 - randomly crash/cancel publishers mid-stream (reserve/write without commit),
 - verify candidate discoverability still holds (no false negatives).
 
+#### 17.4.3 Tiered Storage + Remote Idempotency + Saga Cancellation Scenarios (Required)
+
+Because tiered storage and remote durability are correctness-relevant (not just
+"performance features"), the harness MUST include deterministic lab scenarios
+for the remote plane (§3.5.11, §4.18–§4.19):
+
+- **Idempotent remote fetch:** Issue duplicate `symbol_get_range` requests with
+  the same IdempotencyKey and verify the receiver returns identical outcomes
+  (dedup), with no double-accounting of durability acks.
+- **Idempotent remote upload:** Retry `symbol_put_batch` after injected timeouts;
+  verify the receiver records exactly one durable publication per IdempotencyKey.
+- **Eviction saga cancel-safety:** Cancel the eviction saga at each await point
+  (upload, verify, local retire) and verify the post-state is coherent: either
+  (a) the segment remains locally present, or (b) the segment is provably
+  retrievable from L3 and local retirement has occurred. No "half-evicted" state.
+- **Epoch transition quiescence:** Trigger an epoch transition while concurrent
+  commits are in flight; verify the epoch barrier prevents any commit from
+  straddling epochs when the transition affects quorum/key policy (§4.18.4).
+
 ### 17.5 Runtime Invariant Monitoring (E-Processes)
 
 E-process configuration for MVCC invariants:
@@ -13588,12 +13902,15 @@ Section 3.4.6 fully specifies erasure-coded page storage. Implementation notes:
 - Group size selection: benchmark G=32, G=64, G=128 to find the optimal
   balance of space overhead vs recovery capability per workload
 
-### 21.10 Time Travel Queries and Tiered Symbol Storage (Future)
+### 21.10 Time Travel Queries and Tiered Symbol Storage (Implementation Notes)
 
 Native mode's source of truth is an immutable commit stream (`CommitCapsule` +
-`CommitMarker`). Exposing historical reads ("time travel") and pushing cold
-history to remote object storage are natural extensions, but they require
-explicit policy and careful latency control.
+`CommitMarker`). The canonical spec already includes:
+- Time travel queries (§12.17: `FOR SYSTEM_TIME AS OF ...` including a `COMMITSEQ` form), and
+- Tiered symbol storage (§3.5.11: L1/L2/L3 with fetch-on-demand under capability).
+
+The remaining work is operational: explicit retention policy, predictable
+latency control, and failure-mode hardening (idempotency + sagas; §4.19).
 
 - **Retention policy:** Time travel is only meaningful within a configured
   history window. GC/compaction MUST remain free to drop old history unless a
@@ -13601,13 +13918,13 @@ explicit policy and careful latency control.
 - **Addressing:** The stable history coordinate is `commit_seq`. Timestamp-based
   APIs require persisting `commit_time` metadata per commit and an index to map
   time → `commit_seq` (under `LabRuntime`, this uses deterministic virtual time).
-- **SQL surface:** Prefer SQLite-style extensions (e.g.,
-  `PRAGMA fsqlite.as_of_commit_seq = N`) over adopting SQL:2011
-  `FOR SYSTEM_TIME AS OF`, to avoid grammar drift and compatibility surprises.
+- **SQL surface:** FrankenSQLite supports `FOR SYSTEM_TIME AS OF` (§12.17) as
+  the primary interface, plus `... AS OF COMMITSEQ <n>` as a stable coordinate
+  that avoids timestamp ambiguity.
 - **Tiered SymbolStore:** `SymbolStore` SHOULD remain pluggable with an optional
   cold backend (object storage). Remote fetch MUST require an explicit capability
-  (no silent network I/O in arbitrary code paths) and MUST be paired with caching
-  and prefetching so query latency remains predictable.
+  (`RemoteCap`; §4.19.1) and MUST be paired with caching and prefetching so query
+  latency remains predictable.
 
 ---
 
@@ -13817,6 +14134,6 @@ an embedded database engine can achieve.
 
 ---
 
-*Document version: 1.22 (Round 6 audit: json(X) error semantics fixed (throws error not NULL); round() corrected to half-away-from-zero; sum(X) empty-set corrected to NULL; json_valid FLAGS corrected; median/percentile functions added; iif multi-arg + if() alias; string_agg is just alias; cume_dist peer-group semantics; sign(X) core-only; hex(X) clarified; %n no-op; Suggested cache size; VDBE Integer→Variable fix; join threshold harmonized at 8; Sleator-Tarjan ratio corrected to k; ARC patent US 6,996,676; CAR by Bansal&Modha; CAR hit rate comparable not identical; ghost list 4000 entries/16B CacheKey; eviction constraint wording)*
+*Document version: 1.23 (Write-merge hardening: add IntentFootprint + I_intent trace-normalized commutativity rules; formalize parse->merge->repack lens law and canonical repack requirement; require MergeCertificate proof payloads + verifier + circuit breaker; add PolicyController spec (expected loss + e-process guardrails + BOCPD regime triggers).)*
 *Last updated: 2026-02-07*
 *Status: Authoritative Specification*

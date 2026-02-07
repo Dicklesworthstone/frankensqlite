@@ -5,7 +5,6 @@ pub mod opcode;
 pub mod record;
 pub mod serial_type;
 pub mod value;
-pub mod cx;
 
 use std::fmt;
 use std::num::NonZeroU32;

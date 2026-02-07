@@ -1,9 +1,9 @@
 use std::path::{Path, PathBuf};
 
 use fsqlite_error::Result;
+use fsqlite_types::LockLevel;
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::{AccessFlags, SyncFlags, VfsOpenFlags};
-use fsqlite_types::LockLevel;
 
 /// A virtual filesystem implementation.
 ///
@@ -26,7 +26,12 @@ pub trait Vfs: Send + Sync {
     ///
     /// Returns the opened file and the flags that were actually used (the VFS
     /// may add flags like `READWRITE` when `CREATE` is specified).
-    fn open(&self, cx: &Cx, path: Option<&Path>, flags: VfsOpenFlags) -> Result<(Self::File, VfsOpenFlags)>;
+    fn open(
+        &self,
+        cx: &Cx,
+        path: Option<&Path>,
+        flags: VfsOpenFlags,
+    ) -> Result<(Self::File, VfsOpenFlags)>;
 
     /// Delete a file.
     ///
@@ -204,7 +209,13 @@ mod tests {
             fn check_reserved_lock(&self, _cx: &Cx) -> Result<bool> {
                 Ok(false)
             }
-            fn shm_map(&mut self, _cx: &Cx, _region: u32, _size: u32, _extend: bool) -> Result<*mut u8> {
+            fn shm_map(
+                &mut self,
+                _cx: &Cx,
+                _region: u32,
+                _size: u32,
+                _extend: bool,
+            ) -> Result<*mut u8> {
                 Err(fsqlite_error::FrankenError::Unsupported)
             }
             fn shm_lock(&mut self, _cx: &Cx, _offset: u32, _n: u32, _flags: u32) -> Result<()> {
