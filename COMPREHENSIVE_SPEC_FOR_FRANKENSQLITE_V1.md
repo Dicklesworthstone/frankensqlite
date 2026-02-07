@@ -211,8 +211,11 @@ patterns. The following constraints are non-negotiable for hot-path code:
 
 - **Page alignment.** All page buffers MUST be allocated at `page_size`
   alignment (4096 by default). This enables direct I/O (`O_DIRECT`) where
-  physically compatible and avoids partial-page kernel copies. Use
-  `std::alloc::Layout` with alignment.
+  physically compatible and avoids partial-page kernel copies.
+  **Implementation constraint:** Workspace crates forbid `unsafe` (§1.4), so
+  aligned allocation MUST be provided via safe abstractions (e.g., an aligned
+  buffer type from a dependency crate, or OS page allocation via a safe mmap
+  wrapper). Dependencies may use `unsafe` internally.
   **Compatibility note:** SQLite `.wal` frames are `24 + page_size` bytes and
   therefore do not preserve sector alignment at the frame boundaries. In
   Compatibility mode, implementations MUST NOT require `O_DIRECT` for `.wal`
@@ -4774,7 +4777,7 @@ We use asupersync's blocking helpers:
 
 **I/O buffer model (normative):**
 
-- `PageBuf`: owned, page-sized buffer handle that is `Send + 'static`.
+- `PageBuf`: owned, page-sized, page-aligned buffer handle that is `Send + 'static`.
   Drop returns the underlying allocation to a pool (even if the task is cancelled).
 - `PageBufPool`: bounded pool keyed by `page_size`. This is FrankenSQLite
   infrastructure (in `fsqlite-pager`), not an asupersync feature.
@@ -5561,7 +5564,7 @@ PageNumber  := NonZeroU32                   -- 1-based page number
 TableId     := NonZeroU32                   -- B-tree root page number for a table (schema-epoch scoped)
 IndexId     := NonZeroU32                   -- B-tree root page number for an index (schema-epoch scoped)
 
-PageBuf     := owned, page-sized buffer handle, length = page_size
+PageBuf     := owned, page-sized, page-aligned buffer handle, length = page_size
 PageData    := PageBuf                      -- page content (full-page images)
 
 Snapshot := {
@@ -6094,7 +6097,7 @@ begin(manager, begin_kind) -> Result<Transaction>:
         snapshot_established,
         mode,
         serialized_write_lock_held,
-        ...
+        // All other fields initialize to empty/false and are omitted for brevity.
     })
 
 acquire_and_publish_txn_slot(manager, txn_id, mode) -> Result<(u32, TxnEpoch, Snapshot)>:
@@ -6111,6 +6114,8 @@ acquire_and_publish_txn_slot(manager, txn_id, mode) -> Result<(u32, TxnEpoch, Sn
         if !slot.txn_id.CAS(0, claim_word, AcqRel, Acquire):
             continue
         // Phase 1 succeeded: seed CLAIMING timeout clock.
+        if slot.txn_id.load(Acquire) != claim_word:
+            continue  // lost claim (cleanup reclaimed); retry
         slot.claiming_timestamp.CAS(0, unix_timestamp())
 
         // Phase 2: initialize required fields (see §5.6.2 for full list).
@@ -6128,7 +6133,7 @@ acquire_and_publish_txn_slot(manager, txn_id, mode) -> Result<(u32, TxnEpoch, Sn
         slot.cleanup_txn_id.store(0, Relaxed)
         slot.pid.store(current_pid(), Relaxed)
         slot.pid_birth.store(process_birth_id(), Relaxed)
-	        slot.lease_expiry.store(unix_timestamp() + LEASE_DURATION, Relaxed)
+        slot.lease_expiry.store(unix_timestamp() + LEASE_DURATION, Relaxed)
         if mode == Concurrent:
             slot.witness_epoch.store(HotWitnessIndex.epoch.load(Acquire), Release)
         else:
@@ -6137,45 +6142,45 @@ acquire_and_publish_txn_slot(manager, txn_id, mode) -> Result<(u32, TxnEpoch, Sn
         // Phase 3: publish the real TxnId (CAS, never store).
         if !slot.txn_id.CAS(claim_word, txn_id, AcqRel, Acquire):
             return Err(SQLITE_BUSY)  // slot was reclaimed while we were stalled; caller retries begin
-	        slot.claiming_timestamp.store(0, Release)
-	        return Ok((slot_idx, slot.txn_epoch.load(Acquire), snap))
-	    return Err(SQLITE_BUSY)
+        slot.claiming_timestamp.store(0, Release)
+        return Ok((slot_idx, slot.txn_epoch.load(Acquire), snap))
+    return Err(SQLITE_BUSY)
 
-	acquire_serialized_writer_exclusion(manager, txn_id) -> Result<()>:
-	    // See §5.8 "Serialized writer acquisition ordering (normative)".
-	    //
-	    // 1. Acquire the mode's global serialized writer exclusion:
-	    //    - Compatibility mode: legacy writer exclusion (WAL_WRITE_LOCK or equivalent).
-	    //    - Native mode: coordinator-mediated serialized writer mutex.
-	    acquire_mode_global_serialized_writer_exclusion(manager)?
+acquire_serialized_writer_exclusion(manager, txn_id) -> Result<()>:
+    // See §5.8 "Serialized writer acquisition ordering (normative)".
+    //
+    // 1. Acquire the mode's global serialized writer exclusion:
+    //    - Compatibility mode: legacy writer exclusion (WAL_WRITE_LOCK or equivalent).
+    //    - Native mode: coordinator-mediated serialized writer mutex.
+    acquire_mode_global_serialized_writer_exclusion(manager)?
 
-	    // 2. Publish the shared indicator (token + pid + lease). Release to token is
-	    // the publication edge; the other fields are liveness/debug aids.
-	    shm = manager.shm
-	    shm.serialized_writer_pid.store(current_pid(), Relaxed)
-	    shm.serialized_writer_pid_birth.store(process_birth_id(), Relaxed)
-	    shm.serialized_writer_lease_expiry.store(unix_timestamp() + LEASE_DURATION, Relaxed)
-	    shm.serialized_writer_token.store(txn_id, Release)
+    // 2. Publish the shared indicator (token + pid + lease). Release to token is
+    // the publication edge; the other fields are liveness/debug aids.
+    shm = manager.shm
+    shm.serialized_writer_pid.store(current_pid(), Relaxed)
+    shm.serialized_writer_pid_birth.store(process_birth_id(), Relaxed)
+    shm.serialized_writer_lease_expiry.store(unix_timestamp() + LEASE_DURATION, Relaxed)
+    shm.serialized_writer_token.store(txn_id, Release)
 
-	    // 3. Drain concurrent writers: wait until there are no outstanding page locks
-	    // held by Concurrent-mode transactions (scan both lock tables; §5.6.3). While
-	    // draining, the implementation SHOULD run `cleanup_orphaned_slots()` so
-	    // crashed holders cannot stall progress.
-	    drain_concurrent_writers_via_lock_table_scan(manager)?
+    // 3. Drain concurrent writers: wait until there are no outstanding page locks
+    // held by Concurrent-mode transactions (scan both lock tables; §5.6.3). While
+    // draining, the implementation SHOULD run `cleanup_orphaned_slots()` so
+    // crashed holders cannot stall progress.
+    drain_concurrent_writers_via_lock_table_scan(manager)?
 
-	    Ok(())
+    Ok(())
 
-	release_serialized_writer_exclusion(manager, txn_id):
-	    // Clear shared indicator (best-effort CAS token -> 0) and release the mode's global exclusion.
-	    // The indicator MUST be cleared before releasing the global exclusion so Concurrent writers
-	    // do not observe a window where no mutex is held but the token still blocks progress.
-	    shm = manager.shm
-	    tok = shm.serialized_writer_token.load(Acquire)
-	    if tok == txn_id && shm.serialized_writer_token.CAS(tok, 0, AcqRel, Acquire):
-	        shm.serialized_writer_pid.store(0, Relaxed)
-	        shm.serialized_writer_pid_birth.store(0, Relaxed)
-	        shm.serialized_writer_lease_expiry.store(0, Relaxed)
-	    release_mode_global_serialized_writer_exclusion(manager)
+release_serialized_writer_exclusion(manager, txn_id):
+    // Clear shared indicator (best-effort CAS token -> 0) and release the mode's global exclusion.
+    // The indicator MUST be cleared before releasing the global exclusion so Concurrent writers
+    // do not observe a window where no mutex is held but the token still blocks progress.
+    shm = manager.shm
+    tok = shm.serialized_writer_token.load(Acquire)
+    if tok == txn_id && shm.serialized_writer_token.CAS(tok, 0, AcqRel, Acquire):
+        shm.serialized_writer_pid.store(0, Relaxed)
+        shm.serialized_writer_pid_birth.store(0, Relaxed)
+        shm.serialized_writer_lease_expiry.store(0, Relaxed)
+    release_mode_global_serialized_writer_exclusion(manager)
 ```
 
 **Read (both modes):**

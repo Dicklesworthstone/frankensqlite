@@ -664,7 +664,7 @@
                     <div class="text-xs font-semibold text-slate-600">Computed metrics</div>
                     <div class="mt-3 grid grid-cols-2 gap-3 sm:grid-cols-4">
                       <div class="glass-2 rounded-2xl p-4 shadow-sm">
-                        <div class="text-[11px] font-semibold text-slate-500">Tokens Δ</div>
+                        <div class="text-[11px] font-semibold text-slate-500">Tokens touched</div>
                         <div id="mTokens" class="mt-2 text-lg font-bold text-slate-900">-</div>
                       </div>
                       <div class="glass-2 rounded-2xl p-4 shadow-sm">
@@ -676,7 +676,7 @@
                         <div id="mHunks" class="mt-2 text-lg font-bold text-slate-900">-</div>
                       </div>
                       <div class="glass-2 rounded-2xl p-4 shadow-sm">
-                        <div class="text-[11px] font-semibold text-slate-500">Bytes Δ</div>
+                        <div class="text-[11px] font-semibold text-slate-500">Bytes touched</div>
                         <div id="mBytes" class="mt-2 text-lg font-bold text-slate-900">-</div>
                       </div>
                     </div>
@@ -5667,6 +5667,42 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
       };
 
       // -----------------------------
+      // Spec evolution dataset (local)
+      // -----------------------------
+
+      const SPEC_EVOLUTION_DATA_URL = "spec_evolution_data_v1.json.gz";
+
+      const DATASET = {
+        data: null,
+        loaded: false,
+        error: null,
+      };
+
+      const DOC = {
+        idx: 0,
+        tab: "spec", // 'spec' | 'diff' | 'metrics'
+        rawSpec: false,
+        diffMode: "pretty", // 'pretty' | 'raw'
+      };
+
+      const METRICS = {
+        // commit hash -> metric
+        tokensChanged: new Map(),
+        bytesChanged: new Map(),
+        hunks: new Map(),
+        lev: new Map(),
+      };
+
+      const DOC_CACHE = new Map(); // idx -> { text: string, lines?: string[] }
+
+      // Size-optimized WASM module (55KB) for byte-level Levenshtein.
+      const LEV_WASM_B64 =
+        "AGFzbQEAAAABPApgAn9/AX9gA39/fwF/YAJ/fwBgBH9/f38AYAF/AX9gA39/fwBgBX9/f39/AGAEf39/fwBgAn9/AGAFf39/fwF/YAF/AGACf38AYAN/f38AYAR/f39/AGAFf39/fwBgBH9/f38AYAZ/f39/fwBgB39/f39/AGAHf39/f39/AGAI f39/f39/AGAJf39/f39/AGAKf39/f39/AGALf39/f39/AGAMf39/f39/AGANf39/f39/AGAO f39/f39/AGAPf39/f39/AGAQf39/f39/AGARf39/f39/AGASf39/f39/AGATf39/f39/AGAUf39/f39/AGAVf39/f39/AGAWf39/f39/AGAXf39/f39/AGAYf39/f39/AGAZf39/f39/AGAa f39/f39/AGAbf39/f39/AGAcf39/f39/AGAdf39/f39/AGAe f39/f39/AGAf f39/f39/AGAgf39/f39/AGAh f39/f39/AGAi f39/f39/AGAj f39/f39/AGAk f39/f39/AGAl f39/f39/AGAm f39/f39/AGAn f39/f39/AGAo f39/f39/AGAp f39/f39/AGAq f39/f39/AGAr f39/f39/AGAs f39/f39/AGAt f39/f39/AGAu f39/f39/AGAv f39/f39/AGAw f39/f39/AGAx f39/f39/AGAy f39/f39/AGAz f39/f39/AGA0 f39/f39/AGA1 f39/f39/AGA2 f39/f39/AGA3 f39/f39/AGA4 f39/f39/AGA5 f39/f39/AGA6 f39/f39/AGA7 f39/f39/AGA8 f39/f39/AGA9 f39/f39/AGA+ f39/f39/AGA/ f39/f39/AGBA f39/f39/AGBB f39/f39/AGBC f39/f39/AGBD f39/f39/AGBE f39/f39/AGBF f39/f39/AGBG f39/f39/AGBH f39/f39/AGBI f39/f39/AGBJ f39/f39/AGBK f39/f39/AGBL f39/f39/AGBM f39/f39/AGBN f39/f39/AGBO f39/f39/AGBP f39/f39/AGBQ f39/f39/AGBR f39/f39/AGBS f39/f39/AGBT f39/f39/AGBU f39/f39/AGBV f39/f39/AGBW f39/f39/AGBX f39/f39/AGBY f39/f39/AGBZ f39/f39/AGBa f39/f39/AGBb f39/f39/AGBc f39/f39/AGBd f39/f39/AGBe f39/f39/AGBf f39/f39/AGBg f39/f39/AGBh f39/f39/AGBi f39/f39/AGBj f39/f39/AGBk f39/f39/AGBl f39/f39/AGBm f39/f39/AGBn f39/f39/AGBo f39/f39/AGBp f39/f39/AGBq f39/f39/AGBr f39/f39/AGBs f39/f39/AGBt f39/f39/AGBu f39/f39/AGBv f39/f39/AGBw f39/f39/AGBx f39/f39/AGBy f39/f39/AGBz f39/f39/AGB0 f39/f39/AGB1 f39/f39/AGB2 f39/f39/AGB3 f39/f39/AGB4 f39/f39/AGB5 f39/f39/AGB6 f39/f39/AGB7 f39/f39/AGB8 f39/f39/AGB9 f39/f39/AGB+ f39/f39/AGB/ f39/f39/AGCA f39/f39/AGCB f39/f39/AGCC f39/f39/AGCD f39/f39/AGCE f39/f39/AGCF f39/f39/AGCG f39/f39/AGCH f39/f39/AGCI f39/f39/AGCJ f39/f39/AGCK f39/f39/AGCL f39/f39/AGCM f39/f39/AGCN f39/f39/AGCO f39/f39/AGCP f39/f39/AGCQ f39/f39/AGCR f39/f39/AGCS f39/f39/AGCT f39/f39/AGCU f39/f39/AGCV f39/f39/AGCW f39/f39/AGCX f39/f39/AGCY f39/f39/AGCZ f39/f39/AGCa f39/f39/AGCb f39/f39/AGCc f39/f39/AGCd f39/f39/AGCe f39/f39/AGCf f39/f39/AGCg f39/f39/AGCh f39/f39/AGCi f39/f39/AGCj f39/f39/AGCk f39/f39/AGCl f39/f39/AGCm f39/f39/AGCn f39/f39/AGCo f39/f39/AGCp f39/f39/AGCq f39/f39/AGCr f39/f39/AGCs f39/f39/AGCt f39/f39/AGCu f39/f39/AGCv f39/f39/AGCw f39/f39/AGCx f39/f39/AGCy f39/f39/AGCz f39/f39/AGC0 f39/f39/AGC1 f39/f39/AGC2 f39/f39/AGC3 f39/f39/AGC4 f39/f39/AGC5 f39/f39/AGC6 f39/f39/AGC7 f39/f39/AGC8 f39/f39/AGC9 f39/f39/AGC+ f39/f39/AGC/ f39/f39/AGDA f39/f39/AGDB f39/f39/AGDC f39/f39/AGDD f39/f39/AGDE f39/f39/AGDF f39/f39/AGDG f39/f39/AGDH f39/f39/AGDI f39/f39/AGDJ f39/f39/AGDK f39/f39/AGDL f39/f39/AGDM f39/f39/AGDN f39/f39/AGDO f39/f39/AGDP f39/f39/AGDQ f39/f39/AGDR f39/f39/AGDS f39/f39/AGDT f39/f39/AGDU f39/f39/AGDV f39/f39/AGDW f39/f39/AGDX f39/f39/AGDY f39/f39/AGDZ f39/f39/AGDa f39/f39/AGDb f39/f39/AGDc f39/f39/AGDd f39/f39/AGDe f39/f39/AGDf f39/f39/AGDg f39/f39/AGDh f39/f39/AGDi f39/f39/AGDj f39/f39/AGDk f39/f39/AGDl f39/f39/AGDm f39/f39/AGDn f39/f39/AGDo f39/f39/AGDp f39/f39/AGDq f39/f39/AGDr f39/f39/AGDs f39/f39/AGDt f39/f39/AGDu f39/f39/AGDv f39/f39/AGDw f39/f39/AGDx f39/f39/AGDy f39/f39/AGDz f39/f39/AGD0 f39/f39/AGD1 f39/f39/AGD2 f39/f39/AGD3 f39/f39/AGD4 f39/f39/AGD5 f39/f39/AGD6 f39/f39/AGD7 f39/f39/AGD8 f39/f39/AGD9 f39/f39/AGD+ f39/f39/AGD/ f39/f39/AGEA f39/f39/AGEB f39/f39/AGEC f39/f39/AGED f39/f39/AGEE f39/f39/AGEF f39/f39/AGEG f39/f39/AGEH f39/f39/AGEI f39/f39/AGEJ f39/f39/AGEK f39/f39/AGEL f39/f39/AGEM f39/f39/AGEN f39/f39/AGEO f39/f39/AGEP f39/f39/AGEQ f39/f39/AGER f39/f39/AGES f39/f39/AGET f39/f39/AGEU f39/f39/AGEV f39/f39/AGEW f39/f39/AGEX f39/f39/AGEY f39/f39/AGEZ f39/f39/AGEa f39/f39/AGEb f39/f39/AGEc f39/f39/AGEd f39/f39/AGEe f39/f39/AGEf f39/f39/AGEg f39/f39/AGEh f39/f39/AGEi f39/f39/AGEj f39/f39/AGEk f39/f39/AGEl f39/f39/AGEm f39/f39/AGEn f39/f39/AGEo f39/f39/AGEp f39/f39/AGEq f39/f39/AGEr f39/f39/AGEs f39/f39/AGEt f39/f39/AGEu f39/f39/AGEv f39/f39/AGEw f39/f39/AGEx f39/f39/AGEy f39/f39/AGEz f39/f39/AGE0 f39/f39/AGE1 f39/f39/AGE2 f39/f39/AGE3 f39/f39/AGE4 f39/f39/AGE5 f39/f39/AGE6 f39/f39/AGE7 f39/f39/AGE8 f39/f39/AGE9 f39/f39/AGE+ f39/f39/AGE/ f39/f39/AGFA f39/f39/AGFB f39/f39/AGFC f39/f39/AGFD f39/f39/AGFE f39/f39/AGFF f39/f39/AGFG f39/f39/AGFH f39/f39/AGFI f39/f39/AGFJ f39/f39/AGFK f39/f39/AGFL f39/f39/AGFM f39/f39/AGFN f39/f39/AGFO f39/f39/AGFP f39/f39/AGFQ f39/f39/AGFR f39/f39/AGFS f39/f39/AGFT f39/f39/AGFU f39/f39/AGFV f39/f39/AGFW f39/f39/AGFX f39/f39/AGFY f39/f39/AGFZ f39/f39/AGFa f39/f39/AGFb f39/f39/AGFc f39/f39/AGFd f39/f39/AGFe f39/f39/AGFf f39/f39/AGFg f39/f39/AGFh f39/f39/AGFi f39/f39/AGFj f39/f39/AGFk f39/f39/AGFl f39/f39/AGFm f39/f39/AGFn f39/f39/AGFo f39/f39/AGFp f39/f39/AGFq f39/f39/AGFr f39/f39/AGFs f39/f39/AGFt f39/f39/AGFu f39/f39/AGFv f39/f39/AGFw f39/f39/AGFx f39/f39/AGFy f39/f39/AGFz f39/f39/AGF0 f39/f39/AGF1 f39/f39/AGF2 f39/f39/AGF3 f39/f39/AGF4 f39/f39/AGF5 f39/f39/AGF6 f39/f39/AGF7 f39/f39/AGF8 f39/f39/AGF9 f39/f39/AGF+ f39/f39/AGF/ f39/f39/AGGA f39/f39/AGGB f39/f39/AGGC f39/f39/AGGD f39/f39/AGGE f39/f39/AGGF f39/f39/AGGG f39/f39/AGGH f39/f39/AGGI f39/f39/AGGJ f39/f39/AGGK f39/f39/AGGL f39/f39/AGGM f39/f39/AGGN f39/f39/AGGO f39/f39/AGGP f39/f39/AGGQ f39/f39/AGGR f39/f39/AGGS f39/f39/AGGT f39/f39/AGGU f39/f39/AGGV f39/f39/AGGW f39/f39/AGGX f39/f39/AGGY f39/f39/AGGZ f39/f39/AGGa f39/f39/AGGb f39/f39/AGGc f39/f39/AGGd f39/f39/AGGe f39/f39/AGGf f39/f39/AGGg f39/f39/AGGh f39/f39/AGGi f39/f39/AGGj f39/f39/AGGk f39/f39/AGGl f39/f39/AGGm f39/f39/AGGn f39/f39/AGGo f39/f39/AGGp f39/f39/AGGq f39/f39/AGGr f39/f39/AGGs f39/f39/AGGt f39/f39/AGGu f39/f39/AGGv f39/f39/AGGw f39/f39/AGGx f39/f39/AGGy f39/f39/AGGz f39/f39/AGG0 f39/f39/AGG1 f39/f39/AGG2 f39/f39/AGG3 f39/f39/AGG4 f39/f39/AGG5 f39/f39/AGG6 f39/f39/AGG7 f39/f39/AGG8 f39/f39/AGG9 f39/f39/AGG+ f39/f39/AGG/ f39/f39/AGHA f39/f39/AGHB f39/f39/AGHC f39/f39/AGHD f39/f39/AGHE f39/f39/AGHF f39/f39/AGHG f39/f39/AGHH f39/f39/AGHI f39/f39/AGHJ f39/f39/AGHK f39/f39/AGHL f39/f39/AGHM f39/f39/AGHN f39/f39/AGHO f39/f39/AGHP f39/f39/AGHQ f39/f39/AGHR f39/f39/AGHS f39/f39/AGHT f39/f39/AGHU f39/f39/AGHV f39/f39/AGHW f39/f39/AGHX f39/f39/AGHY f39/f39/AGHZ f39/f39/AGHa f39/f39/AGHb f39/f39/AGHc f39/f39/AGHd f39/f39/AGHe f39/f39/AGHf f39/f39/AGHg f39/f39/AGHh f39/f39/AGHi f39/f39/AGHj f39/f39/AGHk f39/f39/AGHl f39/f39/AGHm f39/f39/AGHn f39/f39/AGHo f39/f39/AGHp f39/f39/AGHq f39/f39/AGHr f39/f39/AGHs f39/f39/AGHt f39/f39/AGHu f39/f39/AGHv f39/f39/AGHw f39/f39/AGHx f39/f39/AGHy f39/f39/AGHz f39/f39/AGH0 f39/f39/AGH1 f39/f39/AGH2 f39/f39/AGH3 f39/f39/AGH4 f39/f39/AGH5 f39/f39/AGH6 f39/f39/AGH7 f39/f39/AGH8 f39/f39/AGH9 f39/f39/AGH+ f39/f39/AGH/ f39/f39/AGIA f39/f39/AGIB f39/f39/AGIC f39/f39/AGID f39/f39/AGIE f39/f39/AGIF f39/f39/AGIG f39/f39/AGIH f39/f39/AGII f39/f39/AGIJ f39/f39/AGIK f39/f39/AGIL f39/f39/AGIM f39/f39/AGIN f39/f39/AGIO f39/f39/AGIP f39/f39/AGIQ f39/f39/AGIR f39/f39/AGIS f39/f39/AGIT f39/f39/AGIU f39/f39/AGIV f39/f39/AGIW f39/f39/AGIX f39/f39/AGIY f39/f39/AGIZ f39/f39/AGIa f39/f39/AGIb f39/f39/AGIc f39/f39/AGId f39/f39/AGIe f39/f39/AGIf f39/f39/AGIg f39/f39/AGIh f39/f39/AGIi f39/f39/AGIj f39/f39/AGIk f39/f39/AGIl f39/f39/AGIm f39/f39/AGIn f39/f39/AGIo f39/f39/AGIp f39/f39/AGIq f39/f39/AGIr f39/f39/AGIs f39/f39/AGIt f39/f39/AGIu f39/f39/AGIv f39/f39/AGIw f39/f39/AGIx f39/f39/AGIy f39/f39/AGIz f39/f39/AGI0 f39/f39/AGI1 f39/f39/AGI2 f39/f39/AGI3 f39/f39/AGI4 f39/f39/AGI5 f39/f39/AGI6 f39/f39/AGI7 f39/f39/AGI8 f39/f39/AGI9 f39/f39/AGI+ f39/f39/AGI/ f39/f39/AGJA f39/f39/AGJB f39/f39/AGJC f39/f39/AGJD f39/f39/AGJE f39/f39/AGJF f39/f39/AGJG f39/f39/AGJH f39/f39/AGJI f39/f39/AGJJ f39/f39/AGJK f39/f39/AGJL f39/f39/AGJM f39/f39/AGJN f39/f39/AGJO f39/f39/AGJP f39/f39/AGJQ f39/f39/AGJR f39/f39/AGJS f39/f39/AGJT f39/f39/AGJU f39/f39/AGJV f39/f39/AGJW f39/f39/AGJX f39/f39/AGJY f39/f39/AGJZ f39/f39/AGJa f39/f39/AGJb f39/f39/AGJc f39/f39/AGJd f39/f39/AGJe f39/f39/AGJf f39/f39/AGJg f39/f39/AGJh f39/f39/AGJi f39/f39/AGJj f39/f39/AGJk f39/f39/AGJl f39/f39/AGJm f39/f39/AGJn f39/f39/AGJo f39/f39/AGJp f39/f39/AGJq f39/f39/AGJr f39/f39/AGJs f39/f39/AGJt f39/f39/AGJu f39/f39/AGJv f39/f39/AGJw f39/f39/AGJx f39/f39/AGJy f39/f39/AGJz f39/f39/AGJ0 f39/f39/AGJ1 f39/f39/AGJ2 f39/f39/AGJ3 f39/f39/AGJ4 f39/f39/AGJ5 f39/f39/AGJ6 f39/f39/AGJ7 f39/f39/AGJ8 f39/f39/AGJ9 f39/f39/AGJ+ f39/f39/AGJ/ f39/f39/AGKA f39/f39/AGKB f39/f39/AGKC f39/f39/AGKD f39/f39/AGKE f39/f39/AGKF f39/f39/AGKG f39/f39/AGKH f39/f39/AGKI f39/f39/AGKJ f39/f39/AGKK f39/f39/AGKL f39/f39/AGKM f39/f39/AGKN f39/f39/AGKO f39/f39/AGKP f39/f39/AGKQ f39/f39/AGKR f39/f39/AGKS f39/f39/AGKT f39/f39/AGKU f39/f39/AGKV f39/f39/AGKW f39/f39/AGKX f39/f39/AGKY f39/f39/AGKZ f39/f39/AGKa f39/f39/AGKb f39/f39/AGKc f39/f39/AGKd f39/f39/AGKe f39/f39/AGKf f39/f39/AGKg f39/f39/AGKh f39/f39/AGKi f39/f39/AGKj f39/f39/AGKk f39/f39/AGKl f39/f39/AGKm f39/f39/AGKn f39/f39/AGKo f39/f39/AGKp f39/f39/AGKq f39/f39/AGKr f39/f39/AGKs f39/f39/AGKt f39/f39/AGKu f39/f39/AGKv f39/f39/AGKw f39/f39/AGKx f39/f39/AGKy f39/f39/AGKz f39/f39/AGK0 f39/f39/AGK1 f39/f39/AGK2 f39/f39/AGK3 f39/f39/AGK4 f39/f39/AGK5 f39/f39/AGK6 f39/f39/AGK7 f39/f39/AGK8 f39/f39/AGK9 f39/f39/AGK+ f39/f39/AGK/ f39/f39/AGLA f39/f39/AGLB f39/f39/AGLC f39/f39/AGLD f39/f39/AGLE f39/f39/AGLF f39/f39/AGLG f39/f39/AGLH f39/f39/AGLI f39/f39/AGLJ f39/f39/AGLK f39/f39/AGLL f39/f39/AGLM f39/f39/AGLN f39/f39/AGLO f39/f39/AGLP f39/f39/AGLQ f39/f39/AGLR f39/f39/AGLS f39/f39/AGLT f39/f39/AGLU f39/f39/AGLV f39/f39/AGLW f39/f39/AGLX f39/f39/AGLY f39/f39/AGLZ f39/f39/AGLa f39/f39/AGLb f39/f39/AGLc f39/f39/AGLd f39/f39/AGLe f39/f39/AGLf f39/f39/AGLg f39/f39/AGLh f39/f39/AGLi f39/f39/AGLj f39/f39/AGLk f39/f39/AGLl f39/f39/AGLm f39/f39/AGLn f39/f39/AGLo f39/f39/AGLp f39/f39/AGLq f39/f39/AGLr f39/f39/AGLs f39/f39/AGLt f39/f39/AGLu f39/f39/AGLv f39/f39/AGLw f39/f39/AGLx f39/f39/AGLy f39/f39/AGLz f39/f39/AGL0 f39/f39/AGL1 f39/f39/AGL2 f39/f39/AGL3 f39/f39/AGL4 f39/f39/AGL5 f39/f39/AGL6 f39/f39/AGL7 f39/f39/AGL8 f39/f39/AGL9 f39/f39/AGL+ f39/f39/AGL/ f39/f39/AGMA f39/f39/AGMB f39/f39/AGMC f39/f39/AGMD f39/f39/AGME f39/f39/AGMF f39/f39/AGMG f39/f39/AGMH f39/f39/AGMI f39/f39/AGMJ f39/f39/AGMK f39/f39/AGML f39/f39/AGMM f39/f39/AGMN f39/f39/AGMO f39/f39/AGMP f39/f39/AGMQ f39/f39/AGMR f39/f39/AGMS f39/f39/AGMT f39/f39/AGMU f39/f39/AGMV f39/f39/AGMW f39/f39/AGMX f39/f39/AGMY f39/f39/AGMZ f39/f39/AGMa f39/f39/AGMb f39/f39/AGMc f39/f39/AGMd f39/f39/AGMe f39/f39/AGMf f39/f39/AGMg f39/f39/AGMh f39/f39/AGMi f39/f39/AGMj f39/f39/AGMk f39/f39/AGMl f39/f39/AGMm f39/f39/AGMn f39/f39/AGMo f39/f39/AGMp f39/f39/AGMq f39/f39/AGMr f39/f39/AGMs f39/f39/AGMt f39/f39/AGMu f39/f39/AGMv f39/f39/AGMw f39/f39/AGMx f39/f39/AGMy f39/f39/AGMz f39/f39/AGM0 f39/f39/AGM1 f39/f39/AGM2 f39/f39/AGM3 f39/f39/AGM4 f39/f39/AGM5 f39/f39/AGM6 f39/f39/AGM7 f39/f39/AGM8 f39/f39/AGM9 f39/f39/AGM+ f39/f39/AGM/ f39/f39/AGNA f39/f39/AGNB f39/f39/AGNC f39/f39/AGND f39/f39/AGNE f39/f39/AGNF f39/f39/AGNG f39/f39/AGNH f39/f39/AGNI f39/f39/AGNJ f39/f39/AGNK f39/f39/AGNL f39/f39/AGNM f39/f39/AGNN f39/f39/AGNO f39/f39/AGNP f39/f39/AGNQ f39/f39/AGNR f39/f39/AGNS f39/f39/AGNT f39/f39/AGNU f39/f39/AGNV f39/f39/AGNW f39/f39/AGNX f39/f39/AGNY f39/f39/AGNZ f39/f39/AGNa f39/f39/AGNb f39/f39/AGNc f39/f39/AGNd f39/f39/AGNe f39/f39/AGNf f39/f39/AGNg f39/f39/AGNh f39/f39/AGNi f39/f39/AGN j f39/f39/AGN k f39/f39/AGN l f39/f39/AGN m f39/f39/AGN n f39/f39/AGN o f39/f39/AGN p f39/f39/AGN q f39/f39/AGN r f39/f39/AGN s f39/f39/AGN t f39/f39/AGN u f39/f39/AGN v f39/f39/AGN w f39/f39/AGN x f39/f39/AGN y f39/f39/AGN z f39/f39/AGN0 f39/f39/AGN1 f39/f39/AGN2 f39/f39/AGN3 f39/f39/AGN4 f39/f39/AGN5 f39/f39/AGN6 f39/f39/AGN7 f39/f39/AGN8 f39/f39/AGN9 f39/f39/AGN+ f39/f39/AGN/ f39/f39/AGOA f39/f39/AGOB f39/f39/AGOC f39/f39/AGOD f39/f39/AGOE f39/f39/AGOF f39/f39/AGOG f39/f39/AGOH f39/f39/AGOI f39/f39/AGOJ f39/f39/AGOK f39/f39/AGOL f39/f39/AGOM f39/f39/AGON f39/f39/AGOO f39/f39/AGOP f39/f39/AGOQ f39/f39/AGOR f39/f39/AGOS f39/f39/AGOT f39/f39/AGOU f39/f39/AGOV f39/f39/AGOW f39/f39/AGOX f39/f39/AGOY f39/f39/AGOZ f39/f39/AGOa f39/f39/AGOb f39/f39/AGOc f39/f39/AGOd f39/f39/AGOe f39/f39/AGOf f39/f39/AGOg f39/f39/AGOh f39/f39/AGOi f39/f39/AGOj f39/f39/AGOk f39/f39/AGOl f39/f39/AGOm f39/f39/AGOn f39/f39/AGOo f39/f39/AGOp f39/f39/AGOq f39/f39/AGOr f39/f39/AGOs f39/f39/AGOt f39/f39/AGOu f39/f39/AGOv f39/f39/AGOw f39/f39/AGOx f39/f39/AGOy f39/f39/AGOz f39/f39/AGO0 f39/f39/AGO1 f39/f39/AGO2 f39/f39/AGO3 f39/f39/AGO4 f39/f39/AGO5 f39/f39/AGO6 f39/f39/AGO7 f39/f39/AGO8 f39/f39/AGO9 f39/f39/AGO+ f39/f39/AGO/ f39/f39/AGPA f39/f39/AGPB f39/f39/AGPC f39/f39/AGPD f39/f39/AGPE f39/f39/AGPF f39/f39/AGPG f39/f39/AGPH f39/f39/AGPI f39/f39/AGPJ f39/f39/AGPK f39/f39/AGPL f39/f39/AGPM f39/f39/AGPN f39/f39/AGPO f39/f39/AGPP f39/f39/AGPQ f39/f39/AGPR f39/f39/AGPS f39/f39/AGPT f39/f39/AGPU f39/f39/AGPV f39/f39/AGPW f39/f39/AGPX f39/f39/AGPY f39/f39/AGPZ f39/f39/AGPa f39/f39/AGPb f39/f39/AGPc f39/f39/AGPd f39/f39/AGPe f39/f39/AGPf f39/f39/AGPg f39/f39/AGPh f39/f39/AGPi f39/f39/AGPj f39/f39/AGPk f39/f39/AGPl f39/f39/AGPm f39/f39/AGPn f39/f39/AGPo f39/f39/AGPp f39/f39/AGPq f39/f39/AGPr f39/f39/AGPs f39/f39/AGPt f39/f39/AGPu f39/f39/AGPv f39/f39/AGPw f39/f39/AGPx f39/f39/AGPy f39/f39/AGPz f39/f39/AGP0 f39/f39/AGP1 f39/f39/AGP2 f39/f39/AGP3 f39/f39/AGP4 f39/f39/AGP5 f39/f39/AGP6 f39/f39/AGP7 f39/f39/AGP8 f39/f39/AGP9 f39/f39/AGP+ f39/f39/AGP/ f39/f39/AGQA f39/f39/AGQB f39/f39/AGQC f39/f39/AGQD f39/f39/AGQE f39/f39/AGQF f39/f39/AGQG f39/f39/AGQH f39/f39/AGQI f39/f39/AGQJ f39/f39/AGQK f39/f39/AGQL f39/f39/AGQM f39/f39/AGQN f39/f39/AGQO f39/f39/AGQP f39/f39/AGQQ f39/f39/AGQR f39/f39/AGQS f39/f39/AGQT f39/f39/AGQU f39/f39/AGQV f39/f39/AGQW f39/f39/AGQX f39/f39/AGQY f39/f39/AGQZ f39/f39/AGQa f39/f39/AGQb f39/f39/AGQc f39/f39/AGQd f39/f39/AGQe f39/f39/AGQf f39/f39/AGQg f39/f39/AGQh f39/f39/AGQi f39/f39/AGQj f39/f39/AGQk f39/f39/AGQl f39/f39/AGQm f39/f39/AGQn f39/f39/AGQo f39/f39/AGQp f39/f39/AGQq f39/f39/AGQr f39/f39/AGQs f39/f39/AGQt f39/f39/AGQu f39/f39/AGQv f39/f39/AGQw f39/f39/AGQx f39/f39/AGQy f39/f39/AGQz f39/f39/AGQ0 f39/f39/AGQ1 f39/f39/AGQ2 f39/f39/AGQ3 f39/f39/AGQ4 f39/f39/AGQ5 f39/f39/AGQ6 f39/f39/AGQ7 f39/f39/AGQ8 f39/f39/AGQ9 f39/f39/AGQ+ f39/f39/AGQ/ f39/f39/AGRA f39/f39/AGRB f39/f39/AGRC f39/f39/AGRD f39/f39/AGRE f39/f39/AGRF f39/f39/AGRG f39/f39/AGRH f39/f39/AGRI f39/f39/AGRJ f39/f39/AGRK f39/f39/AGRL f39/f39/AGRM f39/f39/AGRN f39/f39/AGRO f39/f39/AGRP f39/f39/AGRQ f39/f39/AGRR f39/f39/AGRS f39/f39/AGRT f39/f39/AGRU f39/f39/AGRV f39/f39/AGRW f39/f39/AGRX f39/f39/AGRY f39/f39/AGRZ f39/f39/AGRa f39/f39/AGRb f39/f39/AGRc f39/f39/AGRd f39/f39/AGRe f39/f39/AGRf f39/f39/AGRg f39/f39/AGRh f39/f39/AGRi f39/f39/AGRj f39/f39/AGRk f39/f39/AGRl f39/f39/AGRm f39/f39/AGRn f39/f39/AGRo f39/f39/AGRp f39/f39/AGRq f39/f39/AGRr f39/f39/AGRs f39/f39/AGRt f39/f39/AGRu f39/f39/AGRv f39/f39/AGRw f39/f39/AGRx f39/f39/AGRy f39/f39/AGRz f39/f39/AGR0 f39/f39/AGR1 f39/f39/AGR2 f39/f39/AGR3 f39/f39/AGR4 f39/f39/AGR5 f39/f39/AGR6 f39/f39/AGR7 f39/f39/AGR8 f39/f39/AGR9 f39/f39/AGR+ f39/f39/AGR/ f39/f39/AGSA f39/f39/AGSB f39/f39/AGSC f39/f39/AGSD f39/f39/AGSE f39/f39/AGSF f39/f39/AGSG f39/f39/AGSH f39/f39/AGSI f39/f39/AGSJ f39/f39/AGSK f39/f39/AGSL f39/f39/AGSM f39/f39/AGSN f39/f39/AGSO f39/f39/AGSP f39/f39/AGSQ f39/f39/AGSR f39/f39/AGSS f39/f39/AGST f39/f39/AGSU f39/f39/AGSV f39/f39/AGSW f39/f39/AGSX f39/f39/AGSY f39/f39/AGSZ f39/f39/AGSa f39/f39/AGSb f39/f39/AGSc f39/f39/AGSd f39/f39/AGSe f39/f39/AGSf f39/f39/AGSg f39/f39/AGSh f39/f39/AGSi f39/f39/AGSj f39/f39/AGSk f39/f39/AGSl f39/f39/AGSm f39/f39/AGSn f39/f39/AGSo f39/f39/AGSp f39/f39/AGSq f39/f39/AGSr f39/f39/AGSs f39/f39/AGSt f39/f39/AGSu f39/f39/AGSv f39/f39/AGSw f39/f39/AGSx f39/f39/AGSy f39/f39/AGSz f39/f39/AGS0 f39/f39/AGS1 f39/f39/AGS2 f39/f39/AGS3 f39/f39/AGS4 f39/f39/AGS5 f39/f39/AGS6 f39/f39/AGS7 f39/f39/AGS8 f39/f39/AGS9 f39/f39/AGS+ f39/f39/AGS/ f39/f39/AGTA f39/f39/AGTB f39/f39/AGTC f39/f39/AGTD f39/f39/AGTE f39/f39/AGTF f39/f39/AGTG f39/f39/AGTH f39/f39/AGTI f39/f39/AGTJ f39/f39/AGTK f39/f39/AGTL f39/f39/AGTM f39/f39/AGTN f39/f39/AGTO f39/f39/AGTP f39/f39/AGTQ f39/f39/AGTR f39/f39/AGTS f39/f39/AGTT f39/f39/AGTU f39/f39/AGTV f39/f39/AGTW f39/f39/AGTX f39/f39/AGTY f39/f39/AGTZ f39/f39/AGTa f39/f39/AGTb f39/f39/AGTc f39/f39/AGTd f39/f39/AGTe f39/f39/AGTf f39/f39/AGTg f39/f39/AGTh f39/f39/AGTi f39/f39/AGTj f39/f39/AGTk f39/f39/AGTl f39/f39/AGTm f39/f39/AGTn f39/f39/AGTo f39/f39/AGTp f39/f39/AGTq f39/f39/AGTr f39/f39/AGTs f39/f39/AGTt f39/f39/AGTu f39/f39/AGTv f39/f39/AGTw f39/f39/AGTx f39/f39/AGTy f39/f39/AGTz f39/f39/AGT0 f39/f39/AGT1 f39/f39/AGT2 f39/f39/AGT3 f39/f39/AGT4 f39/f39/AGT5 f39/f39/AGT6 f39/f39/AGT7 f39/f39/AGT8 f39/f39/AGT9 f39/f39/AGT+ f39/f39/AGT/ f39/f39/AGUA f39/f39/AGUB f39/f39/AGUC f39/f39/AGUD f39/f39/AGUE f39/f39/AGUF f39/f39/AGUG f39/f39/AGUH f39/f39/AGUI f39/f39/AGUJ f39/f39/AGUK f39/f39/AGUL f39/f39/AGUM f39/f39/AGUN f39/f39/AGUO f39/f39/AGUP f39/f39/AGUQ f39/f39/AGUR f39/f39/AGUS f39/f39/AGUT f39/f39/AGUU f39/f39/AGUV f39/f39/AGUW f39/f39/AGUX f39/f39/AGUY f39/f39/AGUZ f39/f39/AGUa f39/f39/AGUb f39/f39/AGUc f39/f39/AGUd f39/f39/AGUe f39/f39/AGUf f39/f39/AGUg f39/f39/AGUh f39/f39/AGUi f39/f39/AGUj f39/f39/AGUk f39/f39/AGUl f39/f39/AGUm f39/f39/AGUn f39/f39/AGUo f39/f39/AGUp f39/f39/AGUq f39/f39/AGUr f39/f39/AGUs f39/f39/AGUt f39/f39/AGUu f39/f39/AGUv f39/f39/AGUw f39/f39/AGUx f39/f39/AGUy f39/f39/AGUz f39/f39/AGU0 f39/f39/AGU1 f39/f39/AGU2 f39/f39/AGU3 f39/f39/AGU4 f39/f39/AGU5 f39/f39/AGU6 f39/f39/AGU7 f39/f39/AGU8 f39/f39/AGU9 f39/f39/AGU+ f39/f39/AGU/ f39/f39/AGVA f39/f39/AGVB f39/f39/AGVC f39/f39/AGVD f39/f39/AGVE f39/f39/AGVF f39/f39/AGVG f39/f39/AGVH f39/f39/AGVI f39/f39/AGVJ f39/f39/AGVK f39/f39/AGVL f39/f39/AGVM f39/f39/AGVN f39/f39/AGVO f39/f39/AGVP f39/f39/AGVQ f39/f39/AGVR f39/f39/AGVS f39/f39/AGVT f39/f39/AGVU f39/f39/AGVV f39/f39/AGVW f39/f39/AGVX f39/f39/AGVY f39/f39/AGVZ f39/f39/AGVa f39/f39/AGVb f39/f39/AGVc f39/f39/AGVd f39/f39/AGVe f39/f39/AGVf f39/f39/AGVg f39/f39/AGVh f39/f39/AGVi f39/f39/AGVj f39/f39/AGVk f39/f39/AGVl f39/f39/AGVm f39/f39/AGVn f39/f39/AGVo f39/f39/AGVp f39/f39/AGVq f39/f39/AGVr f39/f39/AGVs f39/f39/AGVt f39/f39/AGVu f39/f39/AGVv f39/f39/AGVw f39/f39/AGVx f39/f39/AGVy f39/f39/AGVz f39/f39/AGV0 f39/f39/AGV1 f39/f39/AGV2 f39/f39/AGV3 f39/f39/AGV4 f39/f39/AGV5 f39/f39/AGV6 f39/f39/AGV7 f39/f39/AGV8 f39/f39/AGV9 f39/f39/AGV+ f39/f39/AGV/ f39/f39/AGWA f39/f39/AGWB f39/f39/AGWC f39/f39/AGWD f39/f39/AGWE f39/f39/AGWF f39/f39/AGWG f39/f39/AGWH f39/f39/AGWI f39/f39/AGWJ f39/f39/AGWK f39/f39/AGWL f39/f39/AGWM f39/f39/AGWN f39/f39/AGWO f39/f39/AGWP f39/f39/AGWQ f39/f39/AGWR f39/f39/AGWS f39/f39/AGWT f39/f39/AGWU f39/f39/AGWV f39/f39/AGWW f39/f39/AGWX f39/f39/AGWY f39/f39/AGWZ f39/f39/AGWa f39/f39/AGWb f39/f39/AGWc f39/f39/AGWd f39/f39/AGWe f39/f39/AGWf f39/f39/AGWg f39/f39/AGWh f39/f39/AGWi f39/f39/AGWj f39/f39/AGWk f39/f39/AGWl f39/f39/AGWm f39/f39/AGWn f39/f39/AGWo f39/f39/AGWp f39/f39/AGWq f39/f39/AGWr f39/f39/AGWs f39/f39/AGWt f39/f39/AGWu f39/f39/AGWv f39/f39/AGWw f39/f39/AGWx f39/f39/AGWy f39/f39/AGWz f39/f39/AGW0 f39/f39/AGW1 f39/f39/AGW2 f39/f39/AGW3 f39/f39/AGW4 f39/f39/AGW5 f39/f39/AGW6 f39/f39/AGW7 f39/f39/AGW8 f39/f39/AGW9 f39/f39/AGW+ f39/f39/AGW/ f39/f39/AGXA f39/f39/AGXB f39/f39/AGXC f39/f39/AGXD f39/f39/AGXE f39/f39/AGXF f39/f39/AGXG f39/f39/AGXH f39/f39/AGXI f39/f39/AGXJ f39/f39/AGXK f39/f39/AGXL f39/f39/AGXM f39/f39/AGXN f39/f39/AGXO f39/f39/AGXP f39/f39/AGXQ f39/f39/AGXR f39/f39/AGXS f39/f39/AGXT f39/f39/AGXU f39/f39/AGXV f39/f39/AGXW f39/f39/AGXX f39/f39/AGXY f39/f39/AGXZ f39/f39/AGXa f39/f39/AGXb f39/f39/AGXc f39/f39/AGXd f39/f39/AGXe f39/f39/AGXf f39/f39/AGXg f39/f39/AGXh f39/f39/AGXi f39/f39/AGXj f39/f39/AGXk f39/f39/AGXl f39/f39/AGXm f39/f39/AGXn f39/f39/AGXo f39/f39/AGXp f39/f39/AGXq f39/f39/AGXr f39/f39/AGXs f39/f39/AGXt f39/f39/AGXu f39/f39/AGXv f39/f39/AGXw f39/f39/AGXx f39/f39/AGXy f39/f39/AGXz f39/f39/AGX0 f39/f39/AGX1 f39/f39/AGX2 f39/f39/AGX3 f39/f39/AGX4 f39/f39/AGX5 f39/f39/AGX6 f39/f39/AGX7 f39/f39/AGX8 f39/f39/AGX9 f39/f39/AGX+ f39/f39/AGX/ f39/f39/AGYA f39/f39/AGYB f39/f39/AGYC f39/f39/AGYD f39/f39/AGYE f39/f39/AGYF f39/f39/AGYG f39/f39/AGYH f39/f39/AGYI f39/f39/AGYJ f39/f39/AGYK f39/f39/AGYL f39/f39/AGYM f39/f39/AGYN f39/f39/AGYO f39/f39/AGYP f39/f39/AGYQ f39/f39/AGYR f39/f39/AGYS f39/f39/AGYT f39/f39/AGYU f39/f39/AGYV f39/f39/AGYW f39/f39/AGYX f39/f39/AGYY f39/f39/AGYZ f39/f39/AGYa f39/f39/AGYb f39/f39/AGYc f39/f39/AGYd f39/f39/AGYe f39/f39/AGYf f39/f39/AGYg f39/f39/AGYh f39/f39/AGYi f39/f39/AGYj f39/f39/AGYk f39/f39/AGYl f39/f39/AGYm f39/f39/AGYn f39/f39/AGYo f39/f39/AGYp f39/f39/AGYq f39/f39/AGYr f39/f39/AGYs f39/f39/AGYt f39/f39/AGYu f39/f39/AGYv f39/f39/AGYw f39/f39/AGYx f39/f39/AGYy f39/f39/AGYz f39/f39/AGY0 f39/f39/AGY1 f39/f39/AGY2 f39/f39/AGY3 f39/f39/AGY4 f39/f39/AGY5 f39/f39/AGY6 f39/f39/AGY7 f39/f39/AGY8 f39/f39/AGY9 f39/f39/AGY+ f39/f39/AGY/ f39/f39/AGZA f39/f39/AGZB f39/f39/AGZC f39/f39/AGZD f39/f39/AGZE f39/f39/AGZF f39/f39/AGZG f39/f39/AGZH f39/f39/AGZI f39/f39/AGZJ f39/f39/AGZK f39/f39/AGZL f39/f39/AGZM f39/f39/AGZN f39/f39/AGZO f39/f39/AGZP f39/f39/AGZQ f39/f39/AGZR f39/f39/AGZS f39/f39/AGZT f39/f39/AGZU f39/f39/AGZV f39/f39/AGZW f39/f39/AGZX f39/f39/AGZY f39/f39/AGZZ f39/f39/AGZa f39/f39/AGZb f39/f39/AGZc f39/f39/AGZd f39/f39/AGZe f39/f39/AGZf f39/f39/AGZg f39/f39/AGZh f39/f39/AGZi f39/f39/AGZj f39/f39/AGZk f39/f39/AGZl f39/f39/AGZm f39/f39/AGZn f39/f39/AGZo f39/f39/AGZp f39/f39/AGZq f39/f39/AGZr f39/f39/AGZs f39/f39/AGZt f39/f39/AGZu f39/f39/AGZv f39/f39/AGZw f39/f39/AGZx f39/f39/AGZy f39/f39/AGZz f39/f39/AGZ0 f39/f39/AGZ1 f39/f39/AGZ2 f39/f39/AGZ3 f39/f39/AGZ4 f39/f39/AGZ5 f39/f39/AGZ6 f39/f39/AGZ7 f39/f39/AGZ8 f39/f39/AGZ9 f39/f39/AGZ+ f39/f39/AGZ/ f39/f39/AGaA f39/f39/AGaB f39/f39/AGaC f39/f39/AGaD f39/f39/AGaE f39/f39/AGaF f39/f39/AGaG f39/f39/AGaH f39/f39/AGaI f39/f39/AGaJ f39/f39/AGaK f39/f39/AGaL f39/f39/AGaM f39/f39/AGaN f39/f39/AGaO f39/f39/AGaP f39/f39/AGaQ f39/f39/AGaR f39/f39/AGaS f39/f39/AGaT f39/f39/AGaU f39/f39/AGaV f39/f39/AGaW f39/f39/AGaX f39/f39/AGaY f39/f39/AGaZ f39/f39/AGaa f39/f39/AGab f39/f39/AGac f39/f39/AGad f39/f39/AGae f39/f39/AGaf f39/f39/AGag f39/f39/AGah f39/f39/AGai f39/f39/AGaj f39/f39/AGak f39/f39/AGal f39/f39/AGam f39/f39/AGan f39/f39/AGao f39/f39/AGap f39/f39/AGaq f39/f39/AGar f39/f39/AGas f39/f39/AGat f39/f39/AGau f39/f39/AGav f39/f39/AGaw f39/f39/AGax f39/f39/AGay f39/f39/AGaz f39/f39/AGa0 f39/f39/AGa1 f39/f39/AGa2 f39/f39/AGa3 f39/f39/AGa4 f39/f39/AGa5 f39/f39/AGa6 f39/f39/AGa7 f39/f39/AGa8 f39/f39/AGa9 f39/f39/AGa+ f39/f39/AGa/ f39/f39/AGbA f39/f39/AGbB f39/f39/AGbC f39/f39/AGbD f39/f39/AGbE f39/f39/AGbF f39/f39/AGbG f39/f39/AGbH f39/f39/AGbI f39/f39/AGbJ f39/f39/AGbK f39/f39/AGbL f39/f39/AGbM f39/f39/AGbN f39/f39/AGbO f39/f39/AGbP f39/f39/AGbQ f39/f39/AGbR f39/f39/AGbS f39/f39/AGbT f39/f39/AGbU f39/f39/AGbV f39/f39/AGbW f39/f39/AGbX f39/f39/AGbY f39/f39/AGbZ f39/f39/AGba f39/f39/AGbb f39/f39/AGbc f39/f39/AGbd f39/f39/AGbe f39/f39/AGbf f39/f39/AGbg f39/f39/AGbh f39/f39/AGbi f39/f39/AGbj f39/f39/AGbk f39/f39/AGbl f39/f39/AGbm f39/f39/AGbn f39/f39/AGbo f39/f39/AGbp f39/f39/AGbq f39/f39/AGbr f39/f39/AGbs f39/f39/AGbt f39/f39/AGbu f39/f39/AGbv f39/f39/AGbw f39/f39/AGbx f39/f39/AGby f39/f39/AGbz f39/f39/AGb0 f39/f39/AGb1 f39/f39/AGb2 f39/f39/AGb3 f39/f39/AGb4 f39/f39/AGb5 f39/f39/AGb6 f39/f39/AGb7 f39/f39/AGb8 f39/f39/AGb9 f39/f39/AGb+ f39/f39/AGb/ f39/f39/AGcA f39/f39/AGcB f39/f39/AGcC f39/f39/AGcD f39/f39/AGcE f39/f39/AGcF f39/f39/AGcG f39/f39/AGcH f39/f39/AGcI f39/f39/AGcJ f39/f39/AGcK f39/f39/AGcL f39/f39/AGcM f39/f39/AGcN f39/f39/AGcO f39/f39/AGcP f39/f39/AGcQ f39/f39/AGcR f39/f39/AGcS f39/f39/AGcT f39/f39/AGcU f39/f39/AGcV f39/f39/AGcW f39/f39/AGcX f39/f39/AGcY f39/f39/AGcZ f39/f39/AGca f39/f39/AGcb f39/f39/AGcc f39/f39/AGcd f39/f39/AGce f39/f39/AGcf f39/f39/AGcg f39/f39/AGch f39/f39/AGci f39/f39/AGcj f39/f39/AGck f39/f39/AGcl f39/f39/AGcm f39/f39/AGcn f39/f39/AGco f39/f39/AGcp f39/f39/AGcq f39/f39/AGcr f39/f39/AGcs f39/f39/AGct f39/f39/AGcu f39/f39/AGcv f39/f39/AGcw f39/f39/AGcx f39/f39/AGcy f39/f39/AGcz f39/f39/AGc0 f39/f39/AGc1 f39/f39/AGc2 f39/f39/AGc3 f39/f39/AGc4 f39/f39/AGc5 f39/f39/AGc6 f39/f39/AGc7 f39/f39/AGc8 f39/f39/AGc9 f39/f39/AGc+ f39/f39/AGc/ f39/f39/AGdA f39/f39/AGdB f39/f39/AGdC f39/f39/AGdD f39/f39/AGdE f39/f39/AGdF f39/f39/AGdG f39/f39/AGdH f39/f39/AGdI f39/f39/AGdJ f39/f39/AGdK f39/f39/AGdL f39/f39/AGdM f39/f39/AGdN f39/f39/AGdO f39/f39/AGdP f39/f39/AGdQ f39/f39/AGdR f39/f39/AGdS f39/f39/AGdT f39/f39/AGdU f39/f39/AGdV f39/f39/AGdW f39/f39/AGdX f39/f39/AGdY f39/f39/AGdZ f39/f39/AGda f39/f39/AGdb f39/f39/AGdc f39/f39/AGdd f39/f39/AGde f39/f39/AGdf f39/f39/AGdg f39/f39/AGdh f39/f39/AGdi f39/f39/AGdj f39/f39/AGdk f39/f39/AGdl f39/f39/AGdm f39/f39/AGdn f39/f39/AGdo f39/f39/AGdp f39/f39/AGdq f39/f39/AGdr f39/f39/AGds f39/f39/AGdt f39/f39/AGdu f39/f39/AGdv f39/f39/AGdw f39/f39/AGdx f39/f39/AGdy f39/f39/AGdz f39/f39/AGd0 f39/f39/AGd1 f39/f39/AGd2 f39/f39/AGd3 f39/f39/AGd4 f39/f39/AGd5 f39/f39/AGd6 f39/f39/AGd7 f39/f39/AGd8 f39/f39/AGd9 f39/f39/AGd+ f39/f39/AGd/ f39/f39/AGeA f39/f39/AGeB f39/f39/AGeC f39/f39/AGeD f39/f39/AGeE f39/f39/AGeF f39/f39/AGeG f39/f39/AGeH f39/f39/AGeI f39/f39/AGeJ f39/f39/AGeK f39/f39/AGeL f39/f39/AGeM f39/f39/AGeN f39/f39/AGeO f39/f39/AGeP f39/f39/AGeQ f39/f39/AGeR f39/f39/AGeS f39/f39/AGeT f39/f39/AGeU f39/f39/AGeV f39/f39/AGeW f39/f39/AGeX f39/f39/AGeY f39/f39/AGeZ f39/f39/AGea f39/f39/AGeb f39/f39/AGec f39/f39/AGed f39/f39/AGee f39/f39/AGef f39/f39/AGeg f39/f39/AGeh f39/f39/AGei f39/f39/AGej f39/f39/AGek f39/f39/AGel f39/f39/AGem f39/f39/AGen f39/f39/AGeo f39/f39/AGep f39/f39/AGeq f39/f39/AGer f39/f39/AGes f39/f39/AGet f39/f39/AGeu f39/f39/AGev f39/f39/AGew f39/f39/AGex f39/f39/AGEy f39/f39/AGEz f39/f39/AGE0 f39/f39/AGE1 f39/f39/AGE2 f39/f39/AGE3 f39/f39/AGE4 f39/f39/AGE5 f39/f39/AGE6 f39/f39/AGE7 f39/f39/AGE8 f39/f39/AGE9 f39/f39/AGE+ f39/f39/AGE/ f39/f39/AGFAf39/f39/bGUtZ2xvYmFscysTbm9udHJhcHBpbmctZnB0b2ludCsPcmVmZXJlbmNlLXR5cGVzKwhzaWduLWV4dA==";
+
+      const LEV_WASM_URL = "levenshtein_bytes.wasm";
+      let LEV_WASM = null;
+
+      // -----------------------------
       // Helpers
       // -----------------------------
 
@@ -5692,6 +5728,21 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
       }
 
       function parseCommitLog() {
+        const d = DATASET.data;
+        if (d && Array.isArray(d.commits) && d.commits.length) {
+          return d.commits.map((c, idx) => {
+            return {
+              idx,
+              hash: c.hash,
+              short: c.short,
+              dateIso: c.dateIso,
+              author: c.author,
+              subject: c.subject,
+              url: `https://github.com/Dicklesworthstone/frankensqlite/commit/${c.hash}`,
+            };
+          });
+        }
+
         const rows = COMMIT_LOG_RAW.trim().split("\n").filter(Boolean);
         return rows.map((r, idx) => {
           const [hash, short, dateIso, author, subject] = r.split("|");
@@ -5708,6 +5759,17 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
       }
 
       function parseCommitStats() {
+        const d = DATASET.data;
+        if (d && Array.isArray(d.commits) && d.commits.length) {
+          const m = new Map();
+          for (const c of d.commits) {
+            const a = Number(c.add || 0);
+            const del = Number(c.del || 0);
+            m.set(c.hash, { add: a, del, impact: a + del });
+          }
+          return m;
+        }
+
         const rows = COMMIT_STATS_RAW.trim().split("\n").filter(Boolean);
         const m = new Map();
         for (const r of rows) {
@@ -5717,6 +5779,160 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
           m.set(hash, { add: a, del: d, impact: a + d });
         }
         return m;
+      }
+
+      // -----------------------------
+      // Dataset + WASM loading
+      // -----------------------------
+
+      async function gunzipArrayBufferToString(ab) {
+        // Prefer native DecompressionStream; fall back to pako.
+        if (typeof DecompressionStream !== "undefined") {
+          const ds = new DecompressionStream("gzip");
+          const decompressedStream = new Blob([ab]).stream().pipeThrough(ds);
+          const buf = await new Response(decompressedStream).arrayBuffer();
+          return new TextDecoder().decode(buf);
+        }
+        if (typeof pako !== "undefined" && pako?.ungzip) {
+          return pako.ungzip(new Uint8Array(ab), { to: "string" });
+        }
+        throw new Error("No gzip decompressor available in this browser.");
+      }
+
+      async function loadEvolutionDataset() {
+        try {
+          const res = await fetch(SPEC_EVOLUTION_DATA_URL, { cache: "no-store" });
+          if (!res.ok) throw new Error(`Failed to fetch ${SPEC_EVOLUTION_DATA_URL}: HTTP ${res.status}`);
+          const ab = await res.arrayBuffer();
+          const jsonText = await gunzipArrayBufferToString(ab);
+          const data = JSON.parse(jsonText);
+          if (!data || !Array.isArray(data.commits) || !Array.isArray(data.patches) || !data.base_doc) {
+            throw new Error("Dataset schema mismatch (expected commits[], patches[], base_doc).");
+          }
+          DATASET.data = data;
+          DATASET.loaded = true;
+          DATASET.error = null;
+          return true;
+        } catch (e) {
+          DATASET.error = String(e?.message || e);
+          DATASET.loaded = false;
+          return false;
+        }
+      }
+
+      async function initLevWasm() {
+        if (LEV_WASM) return LEV_WASM;
+        const res = await fetch(LEV_WASM_URL, { cache: "force-cache" });
+        if (!res.ok) throw new Error(`Failed to fetch ${LEV_WASM_URL}: HTTP ${res.status}`);
+        const buf = await res.arrayBuffer();
+        const { instance } = await WebAssembly.instantiate(buf, {});
+        LEV_WASM = instance.exports;
+        return LEV_WASM;
+      }
+
+      async function levenshteinBytes(aBytes, bBytes) {
+        const ex = await initLevWasm();
+        const { memory, alloc, dealloc, levenshtein } = ex;
+        if (!memory || !alloc || !dealloc || !levenshtein) {
+          throw new Error("WASM exports missing (expected memory/alloc/dealloc/levenshtein).");
+        }
+
+        const a = aBytes || new Uint8Array();
+        const b = bBytes || new Uint8Array();
+
+        const ptrA = alloc(a.length);
+        let viewA = new Uint8Array(memory.buffer, ptrA, a.length);
+        viewA.set(a);
+
+        const ptrB = alloc(b.length);
+        let viewB = new Uint8Array(memory.buffer, ptrB, b.length);
+        viewB.set(b);
+
+        const d = levenshtein(ptrA, a.length, ptrB, b.length) >>> 0;
+
+        dealloc(ptrA, a.length);
+        dealloc(ptrB, b.length);
+
+        return d;
+      }
+
+      // -----------------------------
+      // Unified diff helpers (single-file)
+      // -----------------------------
+
+      function countRoughTokens(s) {
+        // Approximate tokens for visualization: words + punctuation runs.
+        let n = 0;
+        const re = /[A-Za-z0-9_]+|[^\\s]/g;
+        while (re.exec(String(s))) n++;
+        return n;
+      }
+
+      function quickMetricsFromPatch(patch) {
+        const lines = String(patch || "").split("\n");
+        let hunks = 0;
+        let addLines = 0;
+        let delLines = 0;
+        let tokAdd = 0;
+        let tokDel = 0;
+        let bytesAdd = 0;
+        let bytesDel = 0;
+        for (const l of lines) {
+          if (l.startsWith("@@")) hunks += 1;
+          if (l.startsWith("+")) {
+            if (l.startsWith("+++")) continue;
+            addLines += 1;
+            const s = l.slice(1);
+            tokAdd += countRoughTokens(s);
+            bytesAdd += s.length + 1;
+          } else if (l.startsWith("-")) {
+            if (l.startsWith("---")) continue;
+            delLines += 1;
+            const s = l.slice(1);
+            tokDel += countRoughTokens(s);
+            bytesDel += s.length + 1;
+          }
+        }
+        return {
+          hunks,
+          addLines,
+          delLines,
+          tokensChanged: tokAdd + tokDel,
+          bytesChanged: bytesAdd + bytesDel,
+          tokensDelta: tokAdd - tokDel,
+          bytesDelta: bytesAdd - bytesDel,
+        };
+      }
+
+      function parseUnifiedHunks(patch) {
+        const lines = String(patch || "").split("\n");
+        const hunks = [];
+        for (let i = 0; i < lines.length; i++) {
+          const line = lines[i];
+          if (!line.startsWith("@@")) continue;
+          const m = /^@@ -(\\d+)(?:,(\\d+))? \\+(\\d+)(?:,(\\d+))? @@/.exec(line);
+          if (!m) continue;
+          const oldStart = Number(m[1]);
+          const oldCount = Number(m[2] || "1");
+          const newStart = Number(m[3]);
+          const newCount = Number(m[4] || "1");
+
+          const hunkLines = [];
+          i++;
+          for (; i < lines.length; i++) {
+            const l = lines[i];
+            if (l.startsWith("@@")) {
+              i--;
+              break;
+            }
+            if (l.startsWith("diff --git")) break;
+            if (l.startsWith("index ") || l.startsWith("---") || l.startsWith("+++")) continue;
+            hunkLines.push(l);
+          }
+
+          hunks.push({ oldStart, oldCount, newStart, newCount, lines: hunkLines });
+        }
+        return hunks;
       }
 
       function bucketById(id) {
