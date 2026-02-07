@@ -210,8 +210,15 @@ Database engines live and die by cache behavior, memory layout, and I/O
 patterns. The following constraints are non-negotiable for hot-path code:
 
 - **Page alignment.** All page buffers MUST be allocated at `page_size`
-  alignment (4096 by default). This enables direct I/O (`O_DIRECT`) and
-  avoids partial-page kernel copies. Use `std::alloc::Layout` with alignment.
+  alignment (4096 by default). This enables direct I/O (`O_DIRECT`) where
+  physically compatible and avoids partial-page kernel copies. Use
+  `std::alloc::Layout` with alignment.
+  **Compatibility note:** SQLite `.wal` frames are `24 + page_size` bytes and
+  therefore do not preserve sector alignment at the frame boundaries. In
+  Compatibility mode, implementations MUST NOT require `O_DIRECT` for `.wal`
+  I/O; buffered I/O is required there. Direct I/O MAY still be used for
+  page-aligned `.db` I/O and FrankenSQLite-native sidecars/logs whose record
+  format preserves alignment.
 
 - **Zero-copy I/O.** The VFS read/write paths MUST NOT allocate intermediate
   buffers. `read_exact_at` / `write_all_at` operate directly on page-aligned
@@ -240,21 +247,18 @@ patterns. The following constraints are non-negotiable for hot-path code:
   that concatenates systematic symbol payloads without invoking the GF(256)
   decoder (matrix multiply is only needed for repair).
 
-- **Prefetch hints.** B-tree descent SHOULD issue prefetch hints for child
-  pages when the next page number is known. Since `std::arch::x86_64::_mm_prefetch`
-  is an `unsafe fn` (incompatible with workspace-level `unsafe_code = "forbid"`),
-  prefetch MUST be delegated to a thin external helper crate (e.g., `fsqlite-prefetch`)
-  that allows `unsafe` internally, exposing a safe public API. The helper crate
-  is NOT part of the `unsafe_code = "forbid"` workspace lint scope. No-op fallback
-  on architectures without prefetch intrinsics.
+- **Prefetch hints.** B-tree descent SHOULD issue prefetch hints for child pages
+  when the next page number is known. Because workspace members forbid `unsafe`,
+  prefetch MUST be implemented only via safe APIs (e.g., asupersync-provided safe
+  hints) and MUST degrade to a no-op if no safe prefetch primitive exists on the
+  platform.
 
-- **VFS platform operations.** The `fsqlite-vfs` crate requires `unsafe` for
-  platform-specific operations (mmap for shared memory, mlock, madvise, direct
-  I/O flags). Like the prefetch helper crate, `fsqlite-vfs` is excluded from the
-  workspace-level `unsafe_code = "forbid"` lint scope and uses
-  `#![allow(unsafe_code)]` at the crate level. All unsafe operations are
-  encapsulated behind safe public types (e.g., `ShmRegion` wraps mmap'd shared
-  memory with bounds-checked accessor methods).
+- **VFS platform operations.** Workspace members forbid `unsafe` (§1.4). The
+  VFS MUST therefore rely on safe platform abstractions (e.g., asupersync's safe
+  file/shm/lock primitives) rather than direct FFI. If a platform feature (e.g.,
+  `mmap`-backed shared memory) cannot be expressed safely, that feature MUST be
+  disabled or moved behind an external dependency boundary (not implemented as
+  `unsafe` inside this repository).
 
 - **Avoid allocation in the read path.** Cache lookups, version checks, and
   index resolution MUST be allocation-free in the common case. Hot-path
@@ -1318,10 +1322,10 @@ order-dependent.
 **Solution:** FrankenSQLite's replication protocol is fountain-coded:
 
 ```
-Replication of changeset C (K pages):
-  Sender: Continuously emit RaptorQ repair symbols for C
-  Receiver: Collect symbols until K' >= K received
-  Decode: Recover all K pages
+Replication of changeset C (dirty pages + metadata):
+  Sender: Serialize C -> `changeset_bytes` (length F) and fountain-code it
+  Receiver: Collect encoding symbols until decode succeeds (K' ≳ K_source)
+  Decode: Recover `changeset_bytes`, then parse into `(page_number, page_data)` pairs
   Apply: Write pages to local database
 
 Properties:
@@ -1340,14 +1344,22 @@ States: IDLE -> ENCODING -> STREAMING -> COMPLETE
 IDLE:
     Entry: No active replication session.
     Trigger: New committed transaction (or explicit REPLICATE command).
-    Action: Collect the transaction's write set (K dirty pages).
+    Action: Collect the transaction's write set (`K_pages` dirty pages).
     Transition -> ENCODING
 
 ENCODING:
-    Entry: Have K source symbols (page data).
+    Entry: Have `K_pages` pages (page data) and a deterministic changeset encoding.
     Action:
-        - Create RaptorQ encoder for K source symbols, symbol size = page_size
-        - Compute intermediate symbols (one-time cost: O(K * page_size))
+        - Deterministically serialize the changeset (the pages + metadata) into
+          a byte stream of length F bytes (`changeset_bytes`).
+        - Choose a transport symbol size `T_replication` (bytes per encoding
+          symbol on the wire). `T_replication` is independent of the SQLite
+          page size; it is chosen to respect the transport's constraints (MTU,
+          fragmentation tolerance, etc.).
+        - Create a RaptorQ encoder for `changeset_bytes` using symbol size
+          `T_replication`, yielding `K_source = ceil(F / T_replication)` source
+          symbols for the block.
+        - Compute intermediate symbols (one-time cost: O(F) bytes of work)
         - Prepare the ISI counter starting at 0
     Transition -> STREAMING
 
@@ -1358,11 +1370,11 @@ STREAMING:
         - Package into UDP packet (format below)
         - Send packet to destination(s) (unicast or multicast)
         - Increment ISI
-        - If ISI < K: sending source symbols (systematic)
-        - If ISI >= K: sending repair symbols (fountain)
+        - If ISI < K_source: sending source symbols (systematic)
+        - If ISI >= K_source: sending repair symbols (fountain)
         - Continue until:
             a) Receiver ACKs completion (optional, for unicast), OR
-            b) ISI reaches sender-configured maximum (e.g., 2*K), OR
+            b) ISI reaches sender-configured maximum (e.g., 2*K_source), OR
             c) Explicit stop command
     Transition -> COMPLETE (on any stop condition)
 
@@ -1375,22 +1387,23 @@ COMPLETE:
 **UDP Packet Format**
 
 ```
-Replication Packet (variable size, typically 4104 bytes):
+Replication Packet (variable size):
     Offset  Size    Field
     ------  ----    -----
     0       1       Source block number (u8)
                     - Identifies which source block this symbol belongs to
-                    - For changesets <= 56,403 pages, always 0
+                    - For changesets with K_source <= 56,403, always 0
                     - For larger changesets, identifies the partition
     1       3       Encoding Symbol ID (u24 big-endian)
                     - The ISI of this symbol
-                    - 0 to K-1 for source symbols, >= K for repair symbols
-    4       4       Source block size K (u32 big-endian)
+                    - 0 to K_source-1 for source symbols, >= K_source for repair symbols
+    4       4       Source block size K_source (u32 big-endian)
                     - Number of source symbols in this block
-    8       T       Symbol data (T bytes, where T = page_size)
+    8       T       Symbol data (T bytes, where T = T_replication)
                     - The actual encoding symbol content
 
-Total packet size: 8 + T bytes (e.g., 8 + 4096 = 4104 bytes)
+Total packet size: 8 + T bytes (e.g., 8 + 1368 = 1376 bytes for an MTU-safe
+configuration on Ethernet MTU 1500 with IPv4).
 ```
 
 **Hard wire limit (physical):** For IPv4 UDP, the application payload MUST be
@@ -1402,16 +1415,10 @@ when a single symbol is split across many Ethernet frames, losing any one frame
 drops the entire symbol. Therefore, for MTU-constrained networks, implementations
 SHOULD choose a symbol size that avoids fragmentation entirely (e.g., `T <= 1464`
 for Ethernet MTU 1500 minus 20-byte IPv4 header, 8-byte UDP header, and the
-8-byte replication header above), or use RFC 6330 sub-blocking to achieve an
-MTU-safe `T`.
-
-For pages larger than the MTU budget (e.g., a 4096-byte page on standard
-Ethernet), RFC 6330 sub-blocking splits the symbol into sub-symbols that each
-fit in a single packet. For example, with a 1464-byte MTU budget the page is
-divided into `ceil(4096 / 1464) = 3` sub-symbols of 1366 bytes each
-(3 × 1366 = 4098 ≥ 4096, with 2 bytes of zero-padding in the last
-sub-symbol). This is handled transparently by the sub-blocking mechanism
-of RFC 6330.
+8-byte replication header above). Encoding packets MUST carry whole encoding
+symbols (RFC 6330 §4.4.2); replication MUST NOT assume that a SQLite page is a
+single on-wire symbol. If `page_size > T`, the changeset serialization simply
+spans multiple symbols.
 
 **Receiver State Machine**
 
@@ -1427,32 +1434,33 @@ LISTENING:
 COLLECTING:
     Entry: At least one packet received.
     State:
-        - decoder: RaptorQDecoder (created from K in first packet)
+        - decoder: RaptorQDecoder (created from K_source in first packet)
         - received_count: number of symbols added to decoder
         - source_block_decoders: HashMap<u8, RaptorQDecoder> (for multi-block)
     Action (on each packet):
-        - Parse packet header (source_block, ISI, K)
+        - Parse packet header (source_block, ISI, K_source)
         - Get or create decoder for this source block
         - Add symbol to decoder: decoder.add_symbol(ISI, symbol_data)
         - Increment received_count
-        - If received_count >= K: attempt decode
+        - If received_count >= K_source: attempt decode
     Transition -> DECODING (when enough symbols collected)
 
 DECODING:
-    Entry: >= K symbols collected for at least one source block.
+    Entry: >= K_source symbols collected for at least one source block.
     Action:
         - Call decoder.decode(cx)
-        - If success: recovered K source symbols
-        - If failure (rare, ~1% at exactly K): stay in COLLECTING, wait for more
+        - If success: recovered K_source source symbols (and thus `changeset_bytes`)
+        - If failure (rare, ~1% at exactly K_source): stay in COLLECTING, wait for more
     Transition -> APPLYING (on successful decode)
     Transition -> COLLECTING (on decode failure, need more symbols)
 
 APPLYING:
-    Entry: All K source symbols recovered.
+    Entry: All K_source source symbols recovered.
     Action:
-        - Map ISI -> page number using the changeset metadata
-        - For each recovered page:
-            - Write page to local database at the correct page number
+        - Parse the decoded `changeset_bytes` into the ordered set of
+          `(page_number, page_data)` pairs.
+        - For each page:
+            - Write the page to the local database at the correct page number
         - Flush WAL / checkpoint as needed
     Transition -> COMPLETE
 
@@ -5878,10 +5886,26 @@ MUST be rejected (or not compiled), and only Serialized mode is supported.
    other processes from racing on the same slot. If the CAS fails, try the
    next slot.
 
+   **Reserved sentinels (normative):**
+   - `TXN_ID_CLAIMING := u64::MAX` means "slot is claimed but not yet published".
+   - `TXN_ID_CLEANING := u64::MAX - 1` means "cleanup owns this slot and is
+     resetting fields"; acquisitions MUST treat it as non-free.
+   These sentinel values are never valid TxnIds.
+
    **Phase 2 (initialize):** With the slot exclusively claimed (no other
-   process can acquire it because `txn_id != 0`), initialize all fields:
-   increment `txn_epoch` (wrap permitted), set `begin_seq = shm.commit_seq.load(Acquire)`,
-   set `pid`, `pid_birth`, `lease_expiry`, and `state = Active`.
+   process can acquire it because `txn_id != 0`), initialize all fields.
+   **Required ordering:** fields that scanners rely on (`begin_seq`,
+   `snapshot_high`, `mode`, `state`) MUST be initialized before Phase 3 publish.
+   In particular, `begin_seq`/`snapshot_high` MUST be set before the slot can
+   influence GC and witness-epoch advancement decisions (§5.6.4.8, §5.6.5).
+
+   Minimum required initialization:
+   - increment `txn_epoch` (wrap permitted),
+   - `snap = shm.commit_seq.load(Acquire)`,
+   - set `begin_seq = snap` and `snapshot_high = snap` (from the SAME `snap`),
+   - set `mode` (Serialized or Concurrent) for this transaction,
+   - clear `commit_seq = 0`, clear SSI flags/counters (`has_in_rw/has_out_rw/marked_for_abort/write_set_pages = 0`),
+   - set `pid`, `pid_birth`, `lease_expiry`, and `state = Active`.
    If `mode == Concurrent`, set `witness_epoch = HotWitnessIndex.epoch.load(Acquire)` so all
    witness-plane registrations for the transaction are pinned to a single epoch
    generation (prevents reader-induced epoch livelock; §5.6.4.8).
@@ -5928,7 +5952,15 @@ MUST be rejected (or not compiled), and only Serialized mode is supported.
    On commit: set `commit_seq = assigned_commit_seq`. For Concurrent-mode
    transactions with SSI enabled, insert a `CommittedReaderEntry` into the
    `RecentlyCommittedReadersIndex` (§5.6.2.1) BEFORE freeing the slot.
-   Then set `txn_id` to 0 (slot is free).
+
+   **Freeing discipline (normative):** Before setting `txn_id = 0`, the owner
+   MUST clear snapshot/epoch fields so a future claimer cannot transiently expose
+   stale values under `TXN_ID_CLAIMING`:
+   - `begin_seq = 0`, `snapshot_high = 0`, `witness_epoch = 0`,
+   - clear SSI flags/counters (`has_in_rw/has_out_rw/marked_for_abort/write_set_pages = 0`),
+   - set `state = Free` and clear/zero other metadata as desired (pid/lease, etc.).
+   The `txn_id.store(0, Release)` MUST be the final write that publishes the slot
+   as free.
    (The next acquirer increments `txn_epoch`, so stale slot references are rejected.)
 
 **Lease-based crash cleanup:** If a process crashes, its TxnSlots become
@@ -5941,6 +5973,8 @@ const CLAIMING_TIMEOUT_SECS: u64 = 5;  // no valid Phase 1->Phase 2 takes 5s
 cleanup_orphaned_slots():
     now = unix_timestamp()
     for slot in txn_slots:
+        if slot.txn_id == TXN_ID_CLEANING:
+            continue  // another process is resetting this slot
         if slot.txn_id == TXN_ID_CLAIMING:
             // Slot is being claimed by another process (Phase 1 of acquire).
             //
@@ -5961,11 +5995,23 @@ cleanup_orphaned_slots():
                 slot.claiming_timestamp.CAS(0, now)
                 continue
             if now - slot.claiming_timestamp > CLAIMING_TIMEOUT_SECS:
-                if slot.txn_id.CAS(TXN_ID_CLAIMING, 0):
+                // Transition to CLEANING before clearing fields so we do not race
+                // with a new claimer that could otherwise observe/clobber state.
+                if slot.txn_id.CAS(TXN_ID_CLAIMING, TXN_ID_CLEANING):
+                    // Clear snapshot/epoch fields as well: a future claimer must not
+                    // observe stale begin_seq/witness_epoch under TXN_ID_CLAIMING (§5.6.5, §5.6.4.8).
+                    slot.begin_seq = 0
+                    slot.snapshot_high = 0
+                    slot.witness_epoch = 0
+                    slot.has_in_rw = false
+                    slot.has_out_rw = false
+                    slot.marked_for_abort = false
+                    slot.write_set_pages = 0
                     slot.pid = 0
                     slot.pid_birth = 0
                     slot.lease_expiry = 0
                     slot.claiming_timestamp = 0
+                    slot.txn_id = 0  // Free the slot (Release ordering, LAST)
                 continue  // skip the lease/liveness check — fields are stale
             else:
                 continue  // CLAIMING recently; give the claimer time
@@ -5983,6 +6029,13 @@ cleanup_orphaned_slots():
                 release_page_locks_for(old_txn_id)
                 slot.state = Aborted
                 slot.commit_seq = 0
+                slot.begin_seq = 0
+                slot.snapshot_high = 0
+                slot.witness_epoch = 0
+                slot.has_in_rw = false
+                slot.has_out_rw = false
+                slot.marked_for_abort = false
+                slot.write_set_pages = 0
                 slot.pid = 0             // Zero stale metadata to prevent
                 slot.pid_birth = 0       // future CLAIMING-crash scenarios
                 slot.lease_expiry = 0    // from reading ghost values.
@@ -6542,7 +6595,7 @@ The hot plane uses **bucket epochs**:
   iff there are **no** TxnSlots with:
   - `mode == Concurrent`, and
   - `state` in {Active, Committing}, and
-  - `txn_id != 0` and `txn_id != TXN_ID_CLAIMING`, and
+  - `txn_id != 0` (including `TXN_ID_CLAIMING`; Phase 2 pins `witness_epoch` before publish), and
   - `witness_epoch == old`.
   This does not require a moment of zero active transactions; it requires only
   that the *oldest* epoch has drained.
@@ -6613,15 +6666,24 @@ updated `gc_horizon` on their next read.
 raise_gc_horizon():
     // Default: if no active transactions exist, the safe point is the latest
     // commit sequence number.
+    old_horizon = shm.gc_horizon.load(Acquire)
     global_min_begin_seq = shm.commit_seq.load(Acquire)
     for slot in txn_slots:
-        // Ignore free slots (0) and slots currently being acquired (CLAIMING).
-        // A claiming slot has not yet published its begin_seq, so it cannot
-        // hold a snapshot that blocks GC.
-        tid = slot.txn_id.load()
-        if tid != 0 && tid != TXN_ID_CLAIMING:
-            global_min_begin_seq = min(global_min_begin_seq, slot.begin_seq.load())
-    shm.gc_horizon.store(global_min_begin_seq)
+        tid = slot.txn_id.load(Acquire)
+        if tid == 0:
+            continue
+        if tid == TXN_ID_CLAIMING || tid == TXN_ID_CLEANING:
+            // CRITICAL: A claiming slot may already have captured its snapshot
+            // (Phase 2 initializes begin_seq/snapshot_high), but has not yet
+            // published a real txn_id. Advancing gc_horizon while a slot is in
+            // CLAIMING can prune versions that the soon-to-be-active transaction
+            // will require. Therefore, do not advance the horizon while ANY slot
+            // is in CLAIMING state.
+            global_min_begin_seq = min(global_min_begin_seq, old_horizon)
+            continue
+        global_min_begin_seq = min(global_min_begin_seq, slot.begin_seq.load(Acquire))
+    new_horizon = max(old_horizon, global_min_begin_seq)  // monotonic
+    shm.gc_horizon.store(new_horizon, Release)
 ```
 
 #### 5.6.6 Compatibility: Legacy Interop and File-Lock Fallback
@@ -13023,7 +13085,10 @@ SELECT * FROM docs('search terms');  -- shorthand
 Query language:
 - **Implicit AND:** `word1 word2` matches documents containing both words
 - **OR:** `word1 OR word2`
-- **NOT:** `NOT word1` or `word1 NOT word2`
+- **NOT:** `word1 NOT word2` (binary operator only — matches documents
+  containing word1 but not word2; unlike FTS3/4, unary `NOT word1` is a
+  syntax error in FTS5; see `fts5parse.y` where NOT is `%left` with
+  production `expr NOT expr`)
 - **Phrase:** `"exact phrase"` matches consecutive tokens
 - **Prefix:** `pref*` matches any token starting with "pref"
 - **NEAR:** `NEAR(word1 word2, 10)` matches when word1 and word2 appear
