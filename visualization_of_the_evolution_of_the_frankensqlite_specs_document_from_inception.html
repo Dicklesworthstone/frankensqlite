@@ -6051,6 +6051,10 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
       let chartDonut = null;
       let chartBocpd = null;
 
+      let ALL_COMMITS = [];
+      let FILTERED_COMMITS = [];
+      let DOCK_READY = false;
+
       function render() {
         const commits = parseCommitLog();
         const stats = parseCommitStats();
@@ -6089,6 +6093,8 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
           };
         });
 
+        ALL_COMMITS = enriched;
+
         // KPI
         document.getElementById("kpiCommits").textContent = fmtInt(enriched.length);
         const totalGroups = enriched.reduce((acc, c) => acc + c.changeGroups.length, 0);
@@ -6126,6 +6132,7 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
 
         // Filter
         const filtered = enriched.filter((c) => matchesFilters(c));
+        FILTERED_COMMITS = filtered;
         document.getElementById("showingCount").textContent = `${fmtInt(filtered.length)} commits`;
 
         // Charts + list
