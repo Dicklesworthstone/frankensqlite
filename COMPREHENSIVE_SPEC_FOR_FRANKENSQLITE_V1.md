@@ -5195,8 +5195,9 @@ PageLockEntry := {
        **MUST NOT** `store()` here: after the key is published, another process
        may observe `(page_number=P, owner_txn=0)` and acquire via CAS. A plain
        store would clobber that winner.
-       If this CAS fails, another process raced and won; treat as `SQLITE_BUSY`
-       (correct) and continue/retry as policy.
+       If this CAS fails, another process raced and acquired the lock; return
+       `SQLITE_BUSY` (or wait per busy-timeout). The acquirer MUST NOT continue
+       probing to insert a second copy of `page_number` elsewhere.
    - Else: advance `idx = (idx + 1) & (capacity - 1)`.
 
 This insertion discipline is required: inserting by writing `owner_txn` alone
