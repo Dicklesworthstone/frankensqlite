@@ -160,8 +160,8 @@ It targets:
 ### 1.2 The Two Innovations
 
 **Innovation 1: MVCC Concurrent Writers.** SQLite's single biggest limitation
-is the `WAL_WRITE_LOCK` in `wal.c` (function `sqlite3WalBeginWriteTransaction`;
-line numbers shift by SQLite version) -- a single exclusive lock byte that
+is the `WAL_WRITE_LOCK` in `wal.c` (function `sqlite3WalBeginWriteTransaction`) --
+a single exclusive lock byte that
 serializes ALL writers. FrankenSQLite replaces this with page-level MVCC
 versioning, allowing transactions that touch different pages to commit in full
 parallel. This is the PostgreSQL concurrency model applied at page granularity.
@@ -5733,6 +5733,19 @@ What each transaction sees when reading `P1`:
 ```
 BeginKind := {Deferred, Immediate, Exclusive, Concurrent}
 
+load_consistent_snapshot(manager) -> Snapshot:
+    // Snapshot capture MUST return a self-consistent (high, schema_epoch) pair.
+    // Without this, a concurrent DDL commit can race BEGIN and produce a mixed
+    // snapshot that incorrectly permits deterministic rebase (§5.10.2).
+    //
+    // Cross-process: the same algorithm applies to SharedMemoryLayout.{commit_seq,schema_epoch}.
+    loop:
+        high1 = manager.commit_seq.load(Acquire)
+        epoch = manager.schema_epoch.load(Acquire)
+        high2 = manager.commit_seq.load(Acquire)
+        if high1 == high2:
+            return Snapshot { high: high1, schema_epoch: epoch }
+
 begin(manager, begin_kind) -> Transaction:
     // TxnId allocation MUST never publish reserved sentinel values into shared memory.
     //
@@ -5754,10 +5767,7 @@ begin(manager, begin_kind) -> Transaction:
             txn_id = candidate
             break
     txn_epoch = 0  // in-process; cross-process uses TxnSlot.epoch (Section 5.6.2)
-    snapshot = Snapshot {
-        high: manager.commit_seq.load(Acquire),
-        schema_epoch: manager.schema_epoch.load(),
-    }
+    snapshot = load_consistent_snapshot(manager)
     serialized_write_lock_held = false
     mode = if begin_kind == Concurrent { Concurrent } else { Serialized }
     if begin_kind == Immediate || begin_kind == Exclusive:
@@ -5824,9 +5834,14 @@ commit(manager, T) -> Result<()>:
         // This procedure emits `DependencyEdge` / `AbortWitness` / `CommitProof` artifacts in Native mode.
         ssi_validate_and_publish(T)?  // returns Err(SQLITE_BUSY_SNAPSHOT) if pivot
 
-    // Merge-Retry Loop:
-    // The Coordinator is the source of truth. If it rejects us with Conflict, we
-    // must retry the merge logic with the authoritative conflict info it provides.
+    // Merge-Retry Loop (Concurrent mode only):
+    // The Coordinator is the source of truth. If it rejects a Concurrent txn with
+    // Conflict, we MAY retry the merge logic with the authoritative conflict info
+    // it provides.
+    //
+    // Serialized mode MUST NOT retry: it cannot rebase/merge. A Conflict indicates
+    // a stale-snapshot write (SQLite "reader-turned-writer" semantics) and MUST
+    // abort with SQLITE_BUSY_SNAPSHOT.
     loop:
         if T.mode == Concurrent:
             // Step 2: First-committer-wins (FCW) validation + merge policy (§5.10.4).
@@ -5856,7 +5871,12 @@ commit(manager, T) -> Result<()>:
 
             Conflict(pages, seq) =>
                 // The coordinator saw a conflict our local index missed (stale cache).
-                // Update local knowledge and RETRY the merge loop.
+                //
+                // Concurrent: update local knowledge and retry Step 2 (merge ladder).
+                // Serialized: cannot rebase; treat as a snapshot conflict and abort.
+                if T.mode == Serialized:
+                    abort(T)
+                    return Err(SQLITE_BUSY_SNAPSHOT)
                 commit_index.update_from_coordinator(pages, seq)
                 continue // Loop back to Step 2 to attempt merge with new info
 
@@ -5915,7 +5935,8 @@ WRITE:              No page lock needed          try_acquire page lock
                     Add to write_set             Add to write_set
 
 COMMIT:             No validation needed         SSI check: abort if pivot
-                    (mutex ensures serial)       First-committer-wins check
+                    (no merge; abort on         First-committer-wins check
+                     snapshot conflict)          FCW check + merge ladder (§5.10)
                     WAL append                   FCW check + merge ladder (§5.10)
                     Release global_write_mutex   WAL append
                     (if held)                    Release page locks
@@ -6163,7 +6184,9 @@ without unbounded blocking.
 
 **Begin:** `fetch_add` on an `AtomicU64` completes in O(1). Snapshot capture is
 O(1): it reads the current `commit_seq` and `schema_epoch` and stores them in
-the immutable `Snapshot` (INV-5). For `BeginKind::Immediate` / `Exclusive`,
+the immutable `Snapshot` (INV-5). The capture MUST be self-consistent (see
+`load_consistent_snapshot()` in §5.4; it is still O(1), just two `commit_seq`
+loads). For `BeginKind::Immediate` / `Exclusive`,
 acquiring `global_write_mutex` may wait, but only for the duration of another
 Serialized writer, which by inductive hypothesis completes in finite time. For
 `BeginKind::Deferred`, no mutex is acquired at BEGIN; the mutex MAY be acquired
@@ -6253,6 +6276,14 @@ operations.
 **Memory ordering (normative):**
 - `commit_seq` stores MUST use `Release` ordering at the commit publication
   point; `commit_seq` loads for snapshot capture MUST use `Acquire` ordering.
+- `schema_epoch` stores MUST use `Release` ordering at the schema-change
+  publication point; `schema_epoch` loads for snapshot capture MUST use `Acquire`
+  ordering.
+- **DDL publication ordering (normative):** If a commit advances `schema_epoch`,
+  the coordinator MUST store the new `schema_epoch` (Release) **before**
+  publishing the corresponding `commit_seq` (Release). This ensures that any
+  transaction that observes the new `commit_seq` with an Acquire load also
+  observes the schema epoch change, preventing mixed snapshots.
 - Other fields MAY use `SeqCst` when simplicity is worth the cost; otherwise
   use `Acquire/Release` where required by invariants and `Relaxed` only for
   diagnostics counters.
@@ -8308,11 +8339,23 @@ The coordinator processes commits sequentially. Each commit involves:
 2. **WAL append (systematic)**: Write page frames sequentially to `.wal`, then
    `fsync` (durable). Repair symbols are pipelined to a background encoder
    thread (§3.4.1) and MUST NOT extend the WAL write critical section.
-   - Cost: W frames * (24 bytes header + page_size data).
-   - Typical: 10 frames * 4120 bytes = ~40KB sequential write.
-   - SSD sequential write throughput: ~2 GB/s. Time: 40KB / 2GB/s = 20us.
-   - Plus fsync: ~50us on modern NVMe (group commit amortizes this).
-   - Let `T_wal` denote the synchronous `.wal` cost.
+   - Bytes written:
+     `bytes_wal = W * (24 + page_size)` (W frames, each `24 + page_size` bytes).
+   - Write time:
+     `T_wal_write ≈ bytes_wal / bw_seq_write` where `bw_seq_write` is the
+     **measured** sequential write bandwidth of the underlying device/filesystem.
+     (Example: 40KB at 2GB/s is ~20µs, but bandwidth is not the dominant term.)
+   - Sync time:
+     `T_fsync = wal.sync()` latency. This is strongly device/filesystem dependent
+     and MUST be treated as a measured distribution, not a constant. On many
+     real deployments, fsync is in the **sub-millisecond to multi-millisecond**
+     range (and on HDD can be tens of milliseconds). This term typically
+     dominates `T_wal_write`.
+   - Overheads:
+     `T_wal_overhead` includes syscall overhead, WAL-index (`foo.db-shm`) updates
+     (§5.6.7), and any required directory fsync modeled by the VFS (§7 crash model).
+   - Let `T_wal = T_wal_write + T_fsync + T_wal_overhead` denote the synchronous
+     `.wal` critical-path cost.
 
    **Background FEC cost (out of critical path):** Generating and appending `.wal-fec`
    repair symbols consumes CPU and sequential write bandwidth but is not included
@@ -8326,23 +8369,25 @@ The coordinator processes commits sequentially. Each commit involves:
 Total per-commit latency:
 ```
 T_commit = T_validate + T_wal + T_publish
-         = 0.5us + 70us + 1us
-         = ~71.5us
 ```
 
 Throughput (single coordinator, no batching):
 ```
-Throughput = 1 / T_commit = 1 / 71.5us ~ 14,000 commits/sec
+Throughput ≈ 1 / T_commit
 ```
 
 With group commit batching (amortize fsync across N concurrent commits):
 ```
-T_commit_batched = T_validate + T_wal_write + T_fsync/N + T_publish
-                 = 0.5us + 20us + 50us/N + 1us
-
-For N = 10:  T_commit = 26.5us  -> Throughput ~ 37,700 commits/sec
-For N = 50:  T_commit = 22.5us  -> Throughput ~ 44,400 commits/sec
+T_commit_batched ≈ T_validate + T_wal_write + (T_fsync / N) + T_wal_overhead + T_publish
 ```
+
+**Measurement + self-correction (normative):**
+- The coordinator MUST record a histogram of `T_fsync` (and `T_wal_overhead`)
+  and expose it to the PolicyController (§4.17).
+- Batch sizing MUST be derived from observed `T_fsync` and deadline/latency
+  policy, not from assumed constants. This architecture remains correct even
+  when fsync is 10–100x slower than the toy numbers above: group commit simply
+  amortizes a larger `T_fsync`.
 
 **Batching optimization: coalescing multiple commits into a single WAL sync:**
 
@@ -9451,6 +9496,20 @@ under 200 even for heavy workloads.
 cancellation) and MUST clear `flush_inflight` on all paths (success, failure).
 Stranding `flush_inflight=true` is a liveness bug that can permanently prevent
 eviction of the page.
+
+**I/O stall semantics (normative):** Masking cancellation is deliberately
+hostile to "fast shutdown" when storage is unhealthy. If the underlying
+`wal.write_frame()` call hangs (stalled device, pathological filesystem,
+misconfigured network storage), there is no safe way to time out and proceed:
+the engine cannot know whether the write will later succeed, partially succeed,
+or never succeed. In this failure mode, **data safety dominates liveness**:
+
+- The process may become unable to make progress on eviction (and therefore may
+  be unable to complete a clean shutdown).
+- Supervisors MUST treat this as an I/O-fatal condition: stop accepting new
+  write work (backpressure), surface a clear diagnostic (include the blocked
+  operation and elapsed time), and require operator intervention (restart /
+  kill). A hung process can be replaced; a corrupted database cannot.
 
 ```rust
 fn flush_dirty_page(page: &CachedPage, wal: &WalWriter) -> Result<()> {
@@ -15029,6 +15088,35 @@ we keep the project honest while being radically innovative internally.
 MUST be able to run the Oracle in-process or via a small runner binary, execute
 SQL statements, and capture results deterministically.
 
+**Mode matrix (normative, anti-drift):**
+
+FrankenSQLite has two persistence/commit engines (§7.10). This doubles the test
+surface unless we force it back down with a non-negotiable harness discipline:
+
+- Every conformance case MUST declare which FrankenSQLite operating modes it is
+  required to pass under:
+  - `compatibility` (WAL path + sidecars, legacy file-format interop)
+  - `native` (ECS commit stream + marker stream)
+- Default: if a case does not declare modes, it MUST run under **both** modes.
+- A case MAY restrict itself to a single mode only with an explicit reason:
+  - `compatibility`-only: tests that assert legacy WAL-index behavior, legacy
+    reader interop, `.wal`/`.shm` layout details, or other explicitly-legacy
+    properties.
+  - `native`-only: tests that assert ECS-specific behavior (replication, tiered
+    storage, marker stream semantics) that does not exist in compatibility mode.
+
+**CI gate (normative):**
+- For every case that runs in a mode, that mode's output MUST match the Oracle
+  (rows, types where observable, error codes, row counts, boundary effects).
+- For every case that runs in **both** modes, FrankenSQLite outputs MUST also
+  match **each other**. Cross-mode mismatches are regressions.
+
+**Fixture annotation (required):**
+- Optional top-level field: `"fsqlite_modes": ["compatibility", "native"]`
+  (default if omitted: both).
+- If `fsqlite_modes` is present and does not include both modes, the fixture
+  MUST also include `"fsqlite_modes_reason": "<string>"`.
+
 **Categories:**
 - DDL: CREATE/DROP/ALTER for tables, indexes, views, triggers (100+ tests)
 - DML: INSERT/UPDATE/DELETE with all clause variants (200+ tests)
@@ -15053,6 +15141,7 @@ SQL statements, and capture results deterministically.
 ```json
 {
   "name": "insert-and-select",
+  "fsqlite_modes": ["compatibility", "native"],
   "steps": [
     { "op": "open", "flags": "readwrite_create", "pragmas": ["journal_mode=WAL"] },
     { "op": "exec", "sql": "CREATE TABLE t(x INTEGER);" },
@@ -15995,12 +16084,16 @@ from spec, never translate line-by-line).
 
 ### C SQLite Source (for spec extraction only)
 
+**Note on line numbers:** The `Lines` column is approximate and varies by SQLite
+version. Do not rely on line numbers. Use function/struct names and the
+invariants in this spec as the source of truth.
+
 | File | Purpose | Lines | What to Extract |
 |------|---------|-------|-----------------|
 | `sqliteInt.h` | Main internal header | 5,882 | All struct definitions (Btree, BtCursor, Pager, Wal, Vdbe, Mem, Table, Index, Column, Expr, Select, etc.), all `#define` constants, all function prototypes. This is the Rosetta Stone. |
 | `btree.c` | B-tree engine | 11,568 | Page format parsing, cell format, cursor movement algorithms (moveToChild, moveToRoot, moveToLeftmost, moveToRightmost), insert/delete with rebalancing, overflow page management, freelist operations. Focus on `balance_nonroot` (~800 lines, lines 8230-9033) as the most complex function. |
 | `pager.c` | Page cache | 7,834 | Pager state machine (OPEN, READER, WRITER_LOCKED, WRITER_CACHEMOD, WRITER_DBMOD, WRITER_FINISHED, ERROR), journal format, hot journal detection, page reference counting, cache eviction policy. |
-| `wal.c` | WAL subsystem | 4,621 | WAL header/frame format, checksum algorithm implementation, WAL index (wal-index) hash table structure, checkpoint algorithm, the critical `WAL_WRITE_LOCK` in `sqlite3WalBeginWriteTransaction` (line numbers shift by SQLite version) that FrankenSQLite replaces with MVCC. |
+| `wal.c` | WAL subsystem | 4,621 | WAL header/frame format, checksum algorithm implementation, WAL index (wal-index) hash table structure, checkpoint algorithm, the critical `WAL_WRITE_LOCK` in `sqlite3WalBeginWriteTransaction` that FrankenSQLite replaces with MVCC. |
 | `vdbe.c` | VDBE interpreter | 9,316 | The giant switch statement dispatching all opcodes. Each case is the authoritative definition of what that opcode does. Extract: register manipulation, cursor operations, comparison semantics, NULL handling per opcode. |
 | `select.c` | SELECT compilation | 8,972 | How SELECT is compiled to VDBE opcodes: result column processing, FROM clause flattening, subquery handling, compound SELECT, DISTINCT, ORDER BY, LIMIT. |
 | `where.c` | WHERE optimization | 7,858 | Index selection algorithm, cost estimation, OR optimization, skip-scan, automatic index creation. The `WhereTerm`, `WhereLoop`, and `WherePath` structures define the optimizer's search space. |
