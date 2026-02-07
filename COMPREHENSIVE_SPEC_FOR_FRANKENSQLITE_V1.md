@@ -5427,9 +5427,20 @@ is eligible for cold-plane compaction/pruning (subject to retention policy for
 debuggability).
 
 The hot plane uses **bucket epochs**:
-- `HotWitnessIndex.epoch` advances when `safe_gc_seq` advances sufficiently.
-- When a bucket entry's `bucket_epoch != HotWitnessIndex.epoch`, the next writer
-  resets its bitsets and sets `bucket_epoch` to current (epoch swap = O(1) clear).
+- `HotWitnessIndex.epoch` is a monotonically increasing global generation number.
+  Advancing it makes buckets *logically empty* until they are refreshed.
+- **No-false-negatives constraint (normative):** advancing `HotWitnessIndex.epoch`
+  MUST NOT make an active transaction undiscoverable for any `WitnessKey` it has
+  registered. In V1, the only universally safe rule is:
+  advance the global epoch only when there are **no Active Concurrent-mode
+  transactions** (quiescence), i.e., when `oldest_active_begin_seq ==
+  shm.commit_seq.load(Acquire)`.
+  (More aggressive epoch advancement requires a more complex hot-plane design
+  such as double-buffering; see §21.)
+- When a bucket entry's `bucket_epoch != HotWitnessIndex.epoch`, the next updater
+  MUST refresh the bucket under `HotWitnessBucketEntry.epoch_lock` by clearing
+  bitsets, then publishing `bucket_epoch = global_epoch` with Release semantics
+  (§5.6.4.5). This prevents lost updates and false negatives.
 
 This yields bounded memory and bounded per-operation cost without per-txn clears.
 
