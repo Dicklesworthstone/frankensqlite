@@ -6128,7 +6128,7 @@ acquire_and_publish_txn_slot(manager, txn_id, mode) -> Result<(u32, TxnEpoch, Sn
         slot.cleanup_txn_id.store(0, Relaxed)
         slot.pid.store(current_pid(), Relaxed)
         slot.pid_birth.store(process_birth_id(), Relaxed)
-        slot.lease_expiry.store(unix_timestamp() + LEASE_DURATION_SECS, Relaxed)
+	        slot.lease_expiry.store(unix_timestamp() + LEASE_DURATION, Relaxed)
         if mode == Concurrent:
             slot.witness_epoch.store(HotWitnessIndex.epoch.load(Acquire), Release)
         else:
@@ -6137,9 +6137,45 @@ acquire_and_publish_txn_slot(manager, txn_id, mode) -> Result<(u32, TxnEpoch, Sn
         // Phase 3: publish the real TxnId (CAS, never store).
         if !slot.txn_id.CAS(claim_word, txn_id, AcqRel, Acquire):
             return Err(SQLITE_BUSY)  // slot was reclaimed while we were stalled; caller retries begin
-        slot.claiming_timestamp.store(0, Release)
-        return Ok((slot_idx, slot.txn_epoch.load(Acquire), snap))
-    return Err(SQLITE_BUSY)
+	        slot.claiming_timestamp.store(0, Release)
+	        return Ok((slot_idx, slot.txn_epoch.load(Acquire), snap))
+	    return Err(SQLITE_BUSY)
+
+	acquire_serialized_writer_exclusion(manager, txn_id) -> Result<()>:
+	    // See §5.8 "Serialized writer acquisition ordering (normative)".
+	    //
+	    // 1. Acquire the mode's global serialized writer exclusion:
+	    //    - Compatibility mode: legacy writer exclusion (WAL_WRITE_LOCK or equivalent).
+	    //    - Native mode: coordinator-mediated serialized writer mutex.
+	    acquire_mode_global_serialized_writer_exclusion(manager)?
+
+	    // 2. Publish the shared indicator (token + pid + lease). Release to token is
+	    // the publication edge; the other fields are liveness/debug aids.
+	    shm = manager.shm
+	    shm.serialized_writer_pid.store(current_pid(), Relaxed)
+	    shm.serialized_writer_pid_birth.store(process_birth_id(), Relaxed)
+	    shm.serialized_writer_lease_expiry.store(unix_timestamp() + LEASE_DURATION, Relaxed)
+	    shm.serialized_writer_token.store(txn_id, Release)
+
+	    // 3. Drain concurrent writers: wait until there are no outstanding page locks
+	    // held by Concurrent-mode transactions (scan both lock tables; §5.6.3). While
+	    // draining, the implementation SHOULD run `cleanup_orphaned_slots()` so
+	    // crashed holders cannot stall progress.
+	    drain_concurrent_writers_via_lock_table_scan(manager)?
+
+	    Ok(())
+
+	release_serialized_writer_exclusion(manager, txn_id):
+	    // Clear shared indicator (best-effort CAS token -> 0) and release the mode's global exclusion.
+	    // The indicator MUST be cleared before releasing the global exclusion so Concurrent writers
+	    // do not observe a window where no mutex is held but the token still blocks progress.
+	    shm = manager.shm
+	    tok = shm.serialized_writer_token.load(Acquire)
+	    if tok == txn_id && shm.serialized_writer_token.CAS(tok, 0, AcqRel, Acquire):
+	        shm.serialized_writer_pid.store(0, Relaxed)
+	        shm.serialized_writer_pid_birth.store(0, Relaxed)
+	        shm.serialized_writer_lease_expiry.store(0, Relaxed)
+	    release_mode_global_serialized_writer_exclusion(manager)
 ```
 
 **Read (both modes):**
@@ -6709,6 +6745,14 @@ The shared-memory file is created on first access and mapped by every
 process that opens the database. All fields after the header use atomic
 operations.
 
+**Layout checksum (normative):** On first creation, the initializer MUST compute
+`layout_checksum = xxh3_64(immutable_layout_metadata_bytes)` where the metadata
+includes only static fields (magic/version/page_size/max_txn_slots and offsets /
+byte sizes) encoded in canonical little-endian. It MUST NOT include dynamic
+atomics (counters, epochs, leases). On map/open, implementations MUST verify
+`layout_checksum` matches the expected value for this layout version; mismatch
+means the SHM is incompatible/corrupt and MUST NOT be used.
+
 **Rust safety constraint (normative):** Workspace members forbid `unsafe`
 (`#![forbid(unsafe_code)]`). Therefore, implementations MUST NOT "reinterpret
 cast" a `&[u8]` mapping into `&SharedMemoryLayout` inside this repository.
@@ -6933,11 +6977,11 @@ MUST be rejected (or not compiled), and only Serialized mode is supported.
    In particular, `begin_seq`/`snapshot_high` MUST be set before the slot can
    influence GC and witness-epoch advancement decisions (§5.6.4.8, §5.6.5).
 
-	   Minimum required initialization:
-	   - increment `txn_epoch` (wrap permitted),
-	   - `snap = load_consistent_snapshot(...)` (seqlock; §5.4),
-	   - set `begin_seq = snap.high` and `snapshot_high = snap.high` (from the SAME snapshot),
-	   - set `mode` (Serialized or Concurrent) for this transaction,
+   Minimum required initialization:
+   - increment `txn_epoch` (wrap permitted),
+   - `snap = load_consistent_snapshot(...)` (seqlock; §5.4),
+   - set `begin_seq = snap.high` and `snapshot_high = snap.high` (from the SAME snapshot),
+   - set `mode` (Serialized or Concurrent) for this transaction,
    - clear `commit_seq = 0`, clear SSI flags/counters (`has_in_rw/has_out_rw/marked_for_abort/write_set_pages = 0`),
    - clear `cleanup_txn_id = 0` (must never leak across slot reuse),
    - set `pid`, `pid_birth`, `lease_expiry`, and `state = Active`.
@@ -9224,7 +9268,7 @@ SubmitNativePublishV1 := {
   capsule_digest_32   : [u8; 32],      // e.g., BLAKE3-256(capsule bytes)
 
   write_set_summary_len: u32_le,
-  write_set_summary    : [u8; write_set_summary_len], // canonical RoaringBitmap serialization
+  write_set_summary    : [u8; write_set_summary_len], // canonical encoding of a set of u32 page numbers (see below)
 
   read_witness_count  : u32_le,
   read_witnesses      : [ObjectId; read_witness_count],
@@ -9271,10 +9315,56 @@ SpillPageV1 := {
 }
 ```
 
+**`write_set_summary` encoding (normative, V1):**
+
+`write_set_summary` is a canonical, deterministic encoding of a set of page
+numbers (`u32`). V1 encodes it as a raw array of `u32_le` values:
+
+- `write_set_summary_len` MUST be a multiple of 4.
+- Interpret `write_set_summary` as `pages: [u32_le; write_set_summary_len/4]`.
+- `pages` MUST be sorted ascending and MUST contain no duplicates.
+
+Future versions MAY introduce a compressed encoding, but it MUST be explicitly
+tagged in the wire schema (no silent format changes).
+
 **FD passing rule (required):** `SUBMIT_WAL_COMMIT` MUST carry exactly one file
 descriptor in SCM_RIGHTS ancillary data. That fd is the spill file referenced
 by `offset/len` above. If the fd is missing, truncated, or extra fds are present,
 the coordinator MUST reject the request.
+
+`SUBMIT_NATIVE_PUBLISH` response payload (inside a `RESPONSE` frame):
+
+```
+NativePublishRespV1 :=
+  | Ok {
+      commit_seq       : u64_le,
+      marker_object_id : ObjectId,
+    }
+  | Conflict {
+      conflicting_commit_seq : u64_le,
+      page_count             : u32_le,
+      pages                  : [u32_le; page_count],
+    }
+  | Aborted { code: u32_le }
+  | Err     { code: u32_le }
+```
+
+`SUBMIT_WAL_COMMIT` response payload (inside a `RESPONSE` frame):
+
+```
+WalCommitRespV1 :=
+  | Ok {
+      wal_offset : u64_le,
+      commit_seq : u64_le,
+    }
+  | Conflict {
+      conflicting_txn_id : u64_le,
+      page_count         : u32_le,
+      pages              : [u32_le; page_count],
+    }
+  | IoError { code: u32_le }
+  | Err     { code: u32_le }
+```
 
 `ROWID_RESERVE` payload:
 
@@ -9296,7 +9386,7 @@ RowIdReserveRespV1 :=
 ```
 
 **Wire size caps (normative):**
-- `write_set_summary_len` MUST be <= 1 MiB.
+- `write_set_summary_len` MUST be <= 1 MiB and MUST be a multiple of 4.
 - Total counts across witness/edge arrays MUST be <= 65,536 per commit.
 - Any frame exceeding the 4 MiB framing cap MUST be rejected.
 
@@ -9489,16 +9579,22 @@ pub enum CommitWriteSet {
     Spilled(SpilledWriteSet),
 }
 
+/// Handle to the spill file backing a `CommitWriteSet::Spilled`.
+///
+/// V1 multi-process coordinator IPC is specified for Unix (§5.9.0) and uses
+/// SCM_RIGHTS fd passing. Single-process mode MAY pass a path and have the
+/// coordinator open the file directly. Other platforms may define an equivalent
+/// handle-passing mechanism.
+pub enum SpillHandle {
+    /// Coordinator opens by path (single-process or platform fallback).
+    Path(std::path::PathBuf),
+    /// Unix multi-process: coordinator receives an fd via SCM_RIGHTS (§5.9.0).
+    Fd(std::os::unix::io::OwnedFd),
+}
+
 pub struct SpilledWriteSet {
     /// Readable spill file handle for the duration of the commit.
-    ///
-    /// - In single-process mode, this is passed directly to the coordinator through
-    ///   the in-process channel.
-    /// - In multi-process mode, this MUST be provided via SCM_RIGHTS fd passing on
-    ///   the coordinator IPC transport (§5.9.0).
-    pub spill_fd: std::os::unix::io::OwnedFd,
-    /// Optional diagnostics path (never trusted for correctness; may be None if the creator unlinks the file immediately).
-    pub spill_path: Option<std::path::PathBuf>,
+    pub spill: SpillHandle,
     /// Page index: page number -> location in spill file (last-write wins).
     pub pages: HashMap<PageNumber, SpillLoc>,
 }
@@ -9507,8 +9603,9 @@ pub struct SpillLoc {
     pub offset: u64,
     /// In V1, len MUST equal the database page size (full-page images).
     pub len: u32,
-    /// Integrity hash of the spilled page bytes.
-    pub xxh3: Xxh3Hash,
+    /// Integrity hash of the spilled page bytes (fast corruption detection).
+    /// Use `xxh3_64(page_bytes)`; this is not cryptographic.
+    pub xxh3_64: u64,
 }
 ```
 
@@ -14449,28 +14546,14 @@ rebuilds indexes after collation sequence changes.
 
 ### 12.15 Expression Syntax
 
-Full expression grammar including all operators by precedence (highest first):
+Expression parsing uses a Pratt parser. The normative operator precedence table
+is in §10.2 ("Pratt precedence table for expressions"). This section does not
+redefine precedence.
 
-| Precedence | Operators | Assoc |
-|-----------|-----------|-------|
-| 1 (highest) | `~` (bitwise NOT), unary `+`, unary `-` | Right |
-| 2 | `COLLATE` (postfix collation override) | Left |
-| 3 | `\|\|` (string concat), `->`, `->>` (JSON extract) | Left |
-| 4 | `*`, `/`, `%` | Left |
-| 5 | `+`, `-` | Left |
-| 6 | `<<`, `>>`, `&`, `\|` | Left |
-| 7 | `ESCAPE` | Right |
-| 8 | `<`, `<=`, `>`, `>=` | Left |
-| 9 | `=`, `==`, `!=`, `<>`, `IS`, `IS NOT`, `IS DISTINCT FROM`, `IS NOT DISTINCT FROM`, `IN`, `LIKE`, `GLOB`, `MATCH`, `REGEXP`, `BETWEEN`, `ISNULL`, `NOTNULL`, `NOT NULL` | Left |
-| 10 | `NOT` (prefix logical negation -- lower than comparisons: `NOT x = y` parses as `NOT (x = y)`) | Right |
-| 11 | `AND` | Left |
-| 12 (lowest) | `OR` | Left |
-
-**IMPORTANT:** `NOT` is NOT at the same precedence as unary `~`/`+`/`-`.
-In SQLite, `NOT x = y` means `NOT (x = y)`, not `(NOT x) = y`. This
-matches the SQLite source grammar (parse.y) and documentation. Unary
-operators bind tighter than `COLLATE`: `-x COLLATE NOCASE` parses as
-`(-x) COLLATE NOCASE`, not `-(x COLLATE NOCASE)`.
+Key rules (normative):
+- `NOT x = y` parses as `NOT (x = y)` (NOT has lower precedence than comparisons).
+- `ESCAPE` is not a standalone operator; it is parsed as part of the `LIKE` form.
+- Unary operators bind tighter than `COLLATE`: `-x COLLATE NOCASE` parses as `(-x) COLLATE NOCASE`.
 
 **Special expression forms:**
 - `CAST(expr AS type-name)` -- explicit type conversion
@@ -17972,6 +18055,6 @@ an embedded database engine can achieve.
 
 ---
 
-*Document version: 1.29 (Round 12 audit: Compatibility/WAL mode corrected: ARC eviction MUST NOT append to `.wal`; WAL append is coordinator-only; write-set spill to per-txn temp file specified (`CommitWriteSet::Spilled`) + `PRAGMA fsqlite.txn_write_set_mem_bytes`; Round 11 audit: ARC p-update online-learning framing added (research note; canonical ARC update remains normative); Round 10 audit: version-chain delta compression corrected: use sparse XOR deltas between adjacent page versions (RaptorQ remains the durability/repair layer for delta objects); prior rounds: forbid raw byte-disjoint XOR write merging for SQLite structured pages; specify safe merge ladder (intent-log deterministic rebase + structured patch parse/merge/repack + merge certificates); built-in function semantics audited/corrected (ceil/floor/trunc return types, NaN/Inf handling, octet_length bytes, substr negative length, COLLATE interaction, compileoption funcs); VFS trait examples corrected to include `&Cx`; risk register compaction cross-reference fixed.)*
+*Document version: 1.31 (Round 14 audit: define cross-process coordinator IPC transport via asupersync Unix domain sockets + SCM_RIGHTS fd passing; specify cancel-safe reserve/submit framing + wire payload schemas; define coordinator-owned per-table RowId allocator + `ROWID_RESERVE`; formal model `PageData` switched to page-aligned `PageBuf` (no Vec-alignment contradiction); `SpillLoc` integrity hash clarified as `xxh3_64`; lock-table rebuild liveness rule strengthened to forbid blocking commit sequencing. Round 13 audit: snapshot seqlock made normative and wired through `load_consistent_snapshot`; TxnSlot sentinel timestamp cleanup rule clarified; Serialized writer exclusion indicator wiring clarified; `SharedMemoryLayout.layout_checksum` fixed to cover immutable layout metadata only; Expression precedence duplication removed (`ESCAPE` is not an operator); Round 12 audit: Compatibility/WAL mode corrected: ARC eviction MUST NOT append to `.wal`; WAL append is coordinator-only; write-set spill to per-txn temp file specified (`CommitWriteSet::Spilled`) + `PRAGMA fsqlite.txn_write_set_mem_bytes`; Round 11 audit: ARC p-update online-learning framing added (research note; canonical ARC update remains normative); Round 10 audit: version-chain delta compression corrected: use sparse XOR deltas between adjacent page versions (RaptorQ remains the durability/repair layer for delta objects); prior rounds: forbid raw byte-disjoint XOR write merging for SQLite structured pages; specify safe merge ladder (intent-log deterministic rebase + structured patch parse/merge/repack + merge certificates); built-in function semantics audited/corrected (ceil/floor/trunc return types, NaN/Inf handling, octet_length bytes, substr negative length, COLLATE interaction, compileoption funcs); VFS trait examples corrected to include `&Cx`; risk register compaction cross-reference fixed.)*
 *Last updated: 2026-02-07*
 *Status: Authoritative Specification*
