@@ -1,0 +1,19 @@
+[package]
+name = "fsqlite-cli"
+version = "0.1.0"
+description = "Interactive SQL shell"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "fsqlite"
+path = "src/main.rs"
+
+[dependencies]
+fsqlite = { workspace = true }
+fsqlite-error = { workspace = true }
+
+[lints]
+workspace = true

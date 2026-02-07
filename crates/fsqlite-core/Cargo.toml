@@ -1,0 +1,25 @@
+[package]
+name = "fsqlite-core"
+version = "0.1.0"
+description = "Core engine: connection, prepare, schema, DDL/DML codegen"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+fsqlite-types = { workspace = true }
+fsqlite-error = { workspace = true }
+fsqlite-vfs = { workspace = true }
+fsqlite-pager = { workspace = true }
+fsqlite-wal = { workspace = true }
+fsqlite-mvcc = { workspace = true }
+fsqlite-btree = { workspace = true }
+fsqlite-ast = { workspace = true }
+fsqlite-parser = { workspace = true }
+fsqlite-planner = { workspace = true }
+fsqlite-vdbe = { workspace = true }
+fsqlite-func = { workspace = true }
+
+[lints]
+workspace = true

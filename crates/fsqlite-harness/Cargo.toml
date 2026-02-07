@@ -1,0 +1,15 @@
+[package]
+name = "fsqlite-harness"
+version = "0.1.0"
+description = "Conformance test runner and golden file comparison"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+fsqlite = { workspace = true }
+fsqlite-error = { workspace = true }
+
+[lints]
+workspace = true
