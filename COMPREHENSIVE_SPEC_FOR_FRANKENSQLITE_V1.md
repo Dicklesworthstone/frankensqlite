@@ -4517,6 +4517,17 @@ key MUST be derived as a deterministic function of `(master_key, ecs_epoch)`:
 K_epoch = KDF(master_key, "fsqlite:symbol-auth:v1" || le_u64(ecs_epoch))
 ```
 
+**Master key source (normative):**
+- **Production:** `master_key` MUST be derived from the database's encryption
+  `DEK` with domain separation (so a page-encryption key cannot be misused as a
+  transport-auth key without intent):
+  `master_key = BLAKE3_KEYED(DEK, "fsqlite:symbol-auth-master:v1")`.
+- If page encryption is disabled and the transport is not already authenticated
+  (TLS), then `PRAGMA fsqlite.symbol_auth = on` MUST fail (no silent insecure
+  authentication).
+- **Lab runtime:** `master_key` MUST be derived deterministically from the seed
+  so traces are replay-stable.
+
 This aligns with asupersync's "no ambient keys" principle: keys are provided
 through capabilities, and derivation is deterministic (lab-replayable).
 
@@ -10232,11 +10243,10 @@ pub struct VdbeOp {
     pub p2: i32,           // second operand (jump target, register, etc.)
     pub p3: i32,           // third operand
     pub p4: P4,            // extended operand
-    pub p5: u16,           // flags (only low 8 bits are semantically used;
-                           // upper 8 bits MUST be zero. The C SQLite struct
-                           // declares this as u16 for alignment, but all
-                           // opcode flag masks fit in u8. Do NOT store data
-                           // in the upper byte.)
+    pub p5: u16,           // flags. C SQLite declares this as u16; most
+                           // opcode flag masks fit in the low 8 bits, but
+                           // some newer opcodes may use the full 16 bits.
+                           // Match C SQLite's per-opcode P5 usage exactly.
 }
 
 pub enum P4 {
