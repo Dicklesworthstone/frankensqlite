@@ -22,6 +22,9 @@ Desktop.ini
 # Rust-specific
 **/*.rs.bk
 
+# Common accidental compiler output
+a.out
+
 # Profiling and coverage
 *.profraw
 *.profdata

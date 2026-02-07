@@ -50,7 +50,8 @@ is infused with RaptorQ fountain codes (RFC 6330), leveraging asupersync's
 production-grade implementation. This isn't bolted-on replication -- it's woven
 into the storage format, WAL durability, snapshot transfer, version chain
 compression, and conflict resolution. The result is a database that treats data
-loss as a mathematical impossibility rather than a failure mode.
+loss as a quantitatively bounded, repairable event under an explicit failure
+model rather than a silent corruption or a "panic and pray" failure mode.
 
 ### 1.3 Key External Dependencies
 
@@ -67,9 +68,8 @@ loss as a mathematical impossibility rather than a failure mode.
 - **`unsafe_code = "forbid"`** -- no escape hatches
 - **Clippy pedantic + nursery at deny level** -- with specific documented allows
 - **23 crates** in workspace under `crates/`
-- **Release profile**: `opt-level = 3` (NOT "z" -- this is a database engine,
-  not a CLI tool; throughput matters more than binary size), `lto = true`,
-  `codegen-units = 1`, `panic = "abort"`, `strip = true`
+- **Release profile** (as configured in the workspace `Cargo.toml`): `opt-level = "z"`,
+  `lto = true`, `codegen-units = 1`, `panic = "abort"`, `strip = true`
 
 ---
 
@@ -77,10 +77,12 @@ loss as a mathematical impossibility rather than a failure mode.
 
 ### 2.1 The Problem
 
-In WAL mode, C SQLite allows unlimited concurrent readers but only ONE writer
-at a time. The `WAL_WRITE_LOCK` (byte 120 of the WAL index shared memory)
-is an exclusive advisory lock. Any connection attempting to write while another
-holds this lock receives `SQLITE_BUSY`.
+In WAL mode, C SQLite allows multiple concurrent readers but caps the number
+of simultaneously active reader locks via `WAL_NREADER` in the wal-index shared
+memory (default: 5). It still allows only ONE writer at a time. The
+`WAL_WRITE_LOCK` (byte 120 of the WAL index shared memory) is an exclusive
+advisory lock. Any connection attempting to write while another holds this lock
+receives `SQLITE_BUSY` (or `SQLITE_BUSY_SNAPSHOT` in the fork-protection case).
 
 For applications with mixed read/write workloads across different tables or
 different regions of the same table, this is a needless bottleneck. Two users
@@ -200,7 +202,7 @@ to 56,403 source symbols (K_max = 56403). Each symbol is a contiguous block
 of T octets. For FrankenSQLite, T = page_size (typically 4096 bytes), so a
 single source block can cover up to 56,403 pages, or approximately 220MB of
 database content. Larger databases are partitioned into multiple source blocks
-(see Section 3.4.3).
+   (see Section 3.4.3).
 
 ### 3.2 How RaptorQ Works (Essential Understanding)
 
@@ -273,7 +275,7 @@ logarithm and exponential tables based on a primitive element (generator) of
 the multiplicative group GF(256)*.
 
 The multiplicative group GF(256)* consists of the 255 non-zero elements and
-is cyclic. RFC 6330 Section 5.7 specifies the generator g = 2 (the polynomial
+is cyclic. RFC 6330 §5.7 specifies the generator g = 2 (the polynomial
 x). Every non-zero element a can be written as a = g^k for some unique
 k in {0, 1, ..., 254}. We define:
 
@@ -771,19 +773,25 @@ should match exactly (this serves as a verification check).
 Discard the (K' - K) padding symbols to recover the original K source
 symbols C'[0], ..., C'[K-1].
 
-**Failure Probability:**
+**Decoding Failure Behavior (Normative):**
 
-| Symbols Received | Failure Probability |
-|------------------|-------------------|
-| K (minimum)      | ~1% (0.01 for most K) |
-| K + 1            | ~0.01% |
-| K + 2            | ~0.001% |
-| K + 3            | < 10^-5 |
+RFC 6330 states that the decoder can recover the source block from *almost any*
+set of encoding symbols of sufficient cardinality: *in most cases* `K` symbols
+suffice; *in rare cases* slightly more than `K` are required. We therefore
+treat decoding failure as a normal, recoverable event:
 
-These probabilities are independent of K and the symbol size T. They depend
-only on the number of extra symbols received beyond K. This is the
-information-theoretic near-optimality of RaptorQ: you pay essentially zero
-overhead beyond the information-theoretic minimum.
+- Correctness MUST NOT depend on decoding succeeding with exactly `K` symbols.
+- Durability/replication code MUST be able to obtain more symbols (local repair
+  store and/or peers) and retry decode.
+- For durability-critical objects, the writer MUST persist an explicit overhead
+  policy (e.g., "store `K + r` repair symbols") in the object metadata so
+  readers know what to request.
+
+**Verification (Alien-Artifact Discipline):** we do not hard-code or assume
+numerical failure probabilities. Instead, we continuously validate the *observed*
+failure rate envelope as a function of `(K, r, symbol_size)` using lab tests and
+anytime-valid monitoring (e-process/e-values) so regressions are caught even
+under optional stopping.
 
 #### 3.2.5 The Tuple Generator and Systematic Index Table
 
@@ -801,7 +809,7 @@ that the encoding matrix has an embedded identity for the source symbols.
 The Tuple function uses the Rand function (a hash combining K', ISI, and
 an iteration counter) to pseudorandomly but deterministically select the
 LT degree and the positions of the non-zero entries. The degree distribution
-is the "RaptorQ degree distribution" (RFC 6330 Section 5.3.5.4), which is a
+is the "RaptorQ degree distribution" (RFC 6330 §5.3.5.4), which is a
 carefully tuned soliton-like distribution optimized for inactivation decoding.
 
 ### 3.3 Asupersync's RaptorQ Implementation
@@ -821,33 +829,41 @@ Asupersync contains a complete, production-grade RFC 6330 implementation:
 - **Distributed module**: Consistent hashing, quorum-based symbol distribution,
   recovery protocols
 
-The implementation is structured as a layered API:
+The implementation is structured as a layered set of modules (asupersync paths
+shown for navigation):
 
 ```
-Layer 0: gf256.rs       -- GF(256) arithmetic, OCT_LOG, OCT_EXP, MUL_TABLES
-Layer 1: symbol.rs      -- Symbol type (Vec<u8>), symbol_add, symbol_addmul
-Layer 2: matrix.rs      -- Sparse/dense matrix operations over GF(256)
-Layer 3: constraint.rs  -- LDPC, HDPC, LT constraint generation
-Layer 4: encoder.rs     -- Systematic encoder, intermediate symbol computation
-Layer 5: decoder.rs     -- Inactivation decoder, peeling + Gaussian phases
-Layer 6: codec.rs       -- High-level encode/decode API with Cx integration
-Layer 7: distributed.rs -- Quorum distribution, recovery protocols
+src/raptorq/gf256.rs        -- GF(256) arithmetic
+src/raptorq/linalg.rs       -- sparse/dense linear algebra over GF(256)
+src/raptorq/systematic.rs   -- systematic index table + tuple generator machinery
+src/raptorq/decoder.rs      -- inactivation decoder (peeling + Gaussian)
+src/raptorq/proof.rs        -- explainable decode proofs / failure reasons
+src/raptorq/pipeline.rs     -- end-to-end sender/receiver pipelines
+src/distributed/            -- quorum routing + recovery (for replication use-cases)
 ```
 
-FrankenSQLite interacts primarily with Layer 6 (codec.rs), using the
-high-level API:
+FrankenSQLite integrates primarily via the pipeline builders (`RaptorQSender*`
+and `RaptorQReceiver*`) plus the lower-level decode proof artifacts:
 
 ```rust
-// Encoding
-let encoder = RaptorQEncoder::new(source_symbols, symbol_size)?;
-let repair_symbol = encoder.generate_repair(isi)?;
+use asupersync::config::RaptorQConfig;
+use asupersync::raptorq::{RaptorQReceiverBuilder, RaptorQSenderBuilder};
 
-// Decoding
-let mut decoder = RaptorQDecoder::new(num_source_symbols, symbol_size)?;
-for (isi, data) in received_symbols {
-    decoder.add_symbol(isi, data)?;
-}
-let source_symbols = decoder.decode(cx)?;
+// Encoding + send (transport is a SymbolSink; omitted here)
+let config = RaptorQConfig::default();
+let mut sender = RaptorQSenderBuilder::new()
+    .config(config.clone())
+    .transport(sink)
+    .build()?;
+sender.send_object(cx, object_id, &bytes)?;
+
+// Receive + decode (source is a SymbolStream; omitted here)
+let mut receiver = RaptorQReceiverBuilder::new()
+    .config(config)
+    .source(stream)
+    .build()?;
+let out = receiver.receive_object(cx, &params)?;
+let bytes = out.data;
 ```
 
 ### 3.4 RaptorQ Integration Points in FrankenSQLite
@@ -1257,7 +1273,7 @@ multiple source blocks:
 
 ```
 partition_source_blocks(P: u32, page_size: u32) -> Vec<SourceBlock>:
-    // RFC 6330 Section 4.4.1 source block partitioning
+// RFC 6330 §4.4.1 source block partitioning
     K_max = 56403
     T = page_size    // symbol size = page size
 
@@ -2400,10 +2416,11 @@ be simultaneously in the commit pipeline. This provides:
 - **Fair queuing**: FIFO ordering of the reserve waiters ensures that
   long-waiting transactions are served first, preventing starvation.
 
-### 4.6 Sheaf-Theoretic Consistency Checking
+### 4.6 Sheaf-Theoretic Consistency Checking (Optional, Speculative)
 
-Asupersync provides tools for checking that local observations are globally
-consistent (sheaf condition). For FrankenSQLite:
+Sheaf-theoretic consistency is an optional formal lens for checking that local
+observations are globally consistent (the sheaf condition). FrankenSQLite can
+implement this check *in the harness* on top of the lab runtime:
 
 - Each transaction's local view (its snapshot) is a "section" over its
   read set
@@ -2425,8 +2442,8 @@ let sections: Vec<Section> = completed_txns.iter().map(|txn| {
     }
 }).collect();
 
-// Check the sheaf condition: overlapping sections must agree
-let result = sheaf::check_consistency(&sections, &global_version_chains);
+// Check the sheaf condition: overlapping sections must agree (pseudocode)
+let result = fsqlite_harness::sheaf::check_consistency(&sections, &global_version_chains);
 assert!(result.is_consistent(), "Sheaf violation: {}", result.obstruction());
 ```
 
@@ -3661,10 +3678,16 @@ pub struct CommitRequest {
     pub mode: TxnMode,
     /// Pages to be committed: page number -> new page data.
     pub write_set: HashMap<PageNumber, PageData>,
+    /// Intent log for deterministic rebase merge (Section 5.10).
+    pub intent_log: Vec<IntentOp>,
     /// Page locks held (for release after commit).
     pub page_locks: HashSet<PageNumber>,
     /// Snapshot of the committing transaction (for validation).
     pub snapshot: Snapshot,
+    /// SSI state: has_in_rw and has_out_rw flags (pre-checked by caller,
+    /// but coordinator may re-validate if needed).
+    pub has_in_rw: bool,
+    pub has_out_rw: bool,
     /// Pre-computed RaptorQ repair symbols for the write set.
     pub repair_symbols: Vec<RepairSymbol>,
     /// Oneshot channel for the coordinator's response.
@@ -5044,19 +5067,30 @@ Compares output row-by-row. Error code matching. Golden file management.
 ### 8.5 Feature Flags
 
 ```toml
+# Status: not yet implemented in Cargo manifests.
+#
+# Feature flags MUST live on a real package manifest (e.g. `crates/fsqlite/Cargo.toml`),
+# not the workspace root (which is a virtual manifest). The target shape is:
+#
+# crates/fsqlite/Cargo.toml (planned)
 [features]
 default = ["json", "fts5", "rtree"]
 
-json = ["fsqlite-ext-json"]       # JSON1 extension
-fts5 = ["fsqlite-ext-fts5"]       # Full-text search v5
-fts3 = ["fsqlite-ext-fts3"]       # FTS3/4 compatibility
-rtree = ["fsqlite-ext-rtree"]     # R-tree spatial index
-session = ["fsqlite-ext-session"] # Session/changeset
-icu = ["fsqlite-ext-icu"]         # ICU collation
-misc = ["fsqlite-ext-misc"]       # Miscellaneous extensions
-raptorq = ["asupersync/raptorq"]  # RaptorQ integration (WAL self-healing, etc.)
-mvcc = []                         # MVCC concurrent writers (always compiled; flag controls runtime default)
-cli = ["fsqlite-cli", "frankentui"] # CLI shell
+json = ["dep:fsqlite-ext-json"]
+fts5 = ["dep:fsqlite-ext-fts5"]
+fts3 = ["dep:fsqlite-ext-fts3"]
+rtree = ["dep:fsqlite-ext-rtree"]
+session = ["dep:fsqlite-ext-session"]
+icu = ["dep:fsqlite-ext-icu"]
+misc = ["dep:fsqlite-ext-misc"]
+
+# Enables FrankenSQLite's RaptorQ-backed repair/replication hooks.
+# Note: asupersync's RaptorQ module is not feature-gated upstream; this flag
+# controls FrankenSQLite integration code only.
+raptorq = []
+
+# MVCC is core; use runtime configuration to choose default transaction behavior.
+mvcc = []
 ```
 
 ### 8.6 Build Configuration
@@ -5065,19 +5099,27 @@ cli = ["fsqlite-cli", "frankentui"] # CLI shell
 [workspace.package]
 edition = "2024"
 license = "MIT"
+repository = "https://github.com/Dicklesworthstone/frankensqlite"
+rust-version = "1.85"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"            # No unsafe anywhere in workspace
 
 [workspace.lints.clippy]
-pedantic = { level = "deny" }     # Strict but reasonable
-nursery = { level = "deny" }      # Catches pre-stable issues
-module_name_repetitions = "allow" # fsqlite_types::SqliteValue is fine
-must_use_candidate = "allow"      # Too noisy for database APIs
-missing_errors_doc = "allow"      # All errors are FrankenError
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+cast_precision_loss = { level = "allow", priority = 1 }
+doc_markdown = { level = "allow", priority = 1 }
+missing_const_for_fn = { level = "allow", priority = 1 }
+uninlined_format_args = { level = "allow", priority = 1 }
+missing_errors_doc = { level = "allow", priority = 1 }
+missing_panics_doc = { level = "allow", priority = 1 }
+module_name_repetitions = { level = "allow", priority = 1 }
+must_use_candidate = { level = "allow", priority = 1 }
+option_if_let_else = { level = "allow", priority = 1 }
 
 [profile.release]
-opt-level = 3          # Maximum throughput (not "z" for size)
+opt-level = "z"        # Optimize for size (lean binary for distribution)
 lto = true             # Whole-program optimization
 codegen-units = 1      # Single codegen unit for maximum optimization
 panic = "abort"        # No unwinding overhead
@@ -5085,11 +5127,6 @@ strip = true           # Strip debug info from release binary
 
 [profile.dev]
 opt-level = 1          # Mild optimization for acceptable test speed
-
-[profile.bench]
-inherits = "release"
-debug = true           # Debug info for profiling
-strip = false
 ```
 
 ---
@@ -7714,6 +7751,9 @@ in a future version, but V1 does not include encryption.
   construction (reject zero), all Opcode display names, limit constant
   values matching C SQLite, serial type round-trip for all type categories
 - Every error variant has a distinct ErrorCode and meaningful Display output
+- Conformance harness infrastructure: Oracle runner can execute SQL against
+  C SQLite and capture results in JSON fixture format (Section 17.7)
+- At least 10 basic conformance fixtures captured from Oracle
 
 **Dependencies:** None (first phase).
 
@@ -7721,7 +7761,8 @@ in a future version, but V1 does not include encryption.
 their numeric values must match C SQLite for EXPLAIN output compatibility.
 Mitigation: extract opcode list mechanically from `opcodes.h`.
 
-**Estimated complexity:** ~2,500 LOC across fsqlite-types and fsqlite-error.
+**Estimated complexity:** ~3,000 LOC across fsqlite-types, fsqlite-error,
+and fsqlite-harness bootstrap.
 
 ### Phase 2: Core Types and Storage Foundation [IN PROGRESS]
 
@@ -7919,27 +7960,34 @@ reads them correctly.
 **Estimated complexity:** ~10,000 LOC (pager: 3,000, wal: 5,000,
 raptorq integration: 2,000).
 
-### Phase 6: MVCC Concurrent Writers
+### Phase 6: MVCC Concurrent Writers with SSI
 
 **Deliverables:**
 - `crates/fsqlite-mvcc/src/txn.rs`: Transaction type with TxnId, Snapshot,
-  write_set, read_set, page_locks, mode (Serialized/Concurrent)
-- `crates/fsqlite-mvcc/src/snapshot.rs`: Snapshot capture, Bloom filter
-  construction for in_flight set, visibility predicate
+  write_set, read_set, intent_log, page_locks, mode (Serialized/Concurrent),
+  SSI state (has_in_rw, has_out_rw, rw_in_from, rw_out_to)
+- `crates/fsqlite-mvcc/src/snapshot.rs`: Snapshot capture, Roaring Bitmap
+  for in_flight set (replacing Bloom filter), visibility predicate
 - `crates/fsqlite-mvcc/src/version_chain.rs`: Page version chains, GF(256)
   delta encoding via RaptorQ (Section 3.4.4)
-- `crates/fsqlite-mvcc/src/lock_table.rs`: PageLockTable with try_acquire
-  (non-blocking) and release_all
+- `crates/fsqlite-mvcc/src/lock_table.rs`: Sharded PageLockTable (64 shards)
+  with try_acquire (non-blocking) and release_all
+- `crates/fsqlite-mvcc/src/siread.rs`: SireadTable (sharded) for SSI
+  rw-antidependency tracking at page granularity
+- `crates/fsqlite-mvcc/src/ssi.rs`: SSI validation (conservative
+  has_in_rw && has_out_rw => abort rule), witness recording for debug/lab
 - `crates/fsqlite-mvcc/src/conflict.rs`: First-committer-wins validation,
-  algebraic write merging (Section 3.4.5), byte-level conflict detection
+  deterministic rebase merge via intent logs (Section 5.10), algebraic
+  write merging (Section 3.4.5), byte-level conflict detection
 - `crates/fsqlite-mvcc/src/gc.rs`: Garbage collection -- horizon computation
-  (min active TxnId), version chain trimming, memory bound enforcement
+  (min active TxnId), version chain trimming, SIREAD table cleanup,
+  memory bound enforcement
 - `crates/fsqlite-mvcc/src/coordinator.rs`: Write coordinator using
   asupersync two-phase MPSC channel, commit serialization for WAL append
 - `crates/fsqlite-mvcc/src/arc_cache.rs`: ARC cache with (PageNumber, TxnId)
   keys, eviction constraints (pinned, dirty, superseded)
 - `crates/fsqlite-pager/src/mvcc_pager.rs`: MvccPager trait implementation
-  bridging B-tree layer to MVCC layer
+  bridging B-tree layer to MVCC layer, Cx threading
 
 **Acceptance criteria:**
 - Serialized mode: Exact C SQLite behavior -- single writer, SERIALIZABLE
@@ -7962,8 +8010,17 @@ raptorq integration: 2,000).
 - GC: Version chain length never exceeds active transaction count + 1
 - Version chain compression: Pages with small diffs (< 10% changed) use
   RaptorQ delta encoding, space savings > 80%
-- Bloom filter: Visibility checks with 100 in-flight transactions have
-  < 1% false positive rate
+- SSI: Write skew pattern (two txns read overlapping data, write disjoint
+  pages based on reads) -- at least one txn aborted under default mode
+- SSI: PRAGMA fsqlite.serializable=OFF allows both to commit (SI mode)
+- SSI: has_in_rw/has_out_rw flags correctly set for known rw-antidependency
+  patterns
+- Rebase merge: Two transactions insert distinct keys into the same leaf
+  page -- rebase succeeds, both commit
+- Rebase merge: Two transactions update the same key -- rebase fails,
+  second committer aborts
+- Roaring Bitmap: Visibility checks with 100 in-flight transactions have
+  zero false positives (exact, not probabilistic)
 - ARC cache: Sequential scan does not evict frequently-accessed index pages
   (ARC adaptation test)
 - Lab reactor: All above tests run under deterministic scheduling with
@@ -8071,7 +8128,7 @@ behavior for conformance.
   highlighting, command history
 - `crates/fsqlite-harness/`: Conformance test runner, golden file comparison
 - `conformance/`: 1,000+ SQL test files with golden output from C sqlite3
-- `benches/`: Criterion benchmark suite from Section 17.9
+- `benches/`: Criterion benchmark suite (see Section 17.8 for regression methodology)
 - Fountain-coded replication: UDP-based symbol emission, receiver assembly,
   changeset application
 - Snapshot shipping: full database transfer via RaptorQ encoding
@@ -8349,6 +8406,16 @@ fuzz_target!(|stmt: FuzzStatement| {
 
 ### 17.7 Conformance Testing
 
+**Principle:** Conformance is not Phase 9. It starts in Phase 1, and it is how
+we keep the project honest while being radically innovative internally.
+
+> We are allowed to change *how* it works. We are not allowed to change *what
+> it does* (unless explicitly approved).
+
+**The Oracle:** C SQLite 3.52.0 built from `legacy_sqlite_code/`. The harness
+MUST be able to run the Oracle in-process or via a small runner binary, execute
+SQL statements, and capture results deterministically.
+
 **Categories:**
 - DDL: CREATE/DROP/ALTER for tables, indexes, views, triggers (100+ tests)
 - DML: INSERT/UPDATE/DELETE with all clause variants (200+ tests)
@@ -8357,8 +8424,52 @@ fuzz_target!(|stmt: FuzzStatement| {
 - Transactions: BEGIN/COMMIT/ROLLBACK, savepoints, isolation (100+ tests)
 - Edge cases: empty tables, MAX_LENGTH values, Unicode, zero-length blobs (100+ tests)
 - Extensions: JSON1, FTS5, R-Tree basic operations (100+ tests)
+- Concurrency regression: write skew patterns (must abort under default
+  serializable mode in `BEGIN CONCURRENT`)
 
-**Golden file format:**
+**What we compare (not just rows):**
+- Result rows (including NULL behavior)
+- Type affinity where observable
+- Error code + extended error code (normalized)
+- Affected-row counts (`changes()`, `total_changes()`)
+- `last_insert_rowid()` where relevant
+- Transaction boundary effects (commit/rollback, savepoints)
+
+**JSON fixture format (self-describing):**
+
+```json
+{
+  "name": "insert-and-select",
+  "steps": [
+    { "op": "open", "flags": "readwrite_create", "pragmas": ["journal_mode=WAL"] },
+    { "op": "exec", "sql": "CREATE TABLE t(x INTEGER);" },
+    { "op": "exec", "sql": "INSERT INTO t VALUES (1),(2),(3);" },
+    { "op": "query", "sql": "SELECT x FROM t ORDER BY x;",
+      "expect": { "rows": [["1"],["2"],["3"]] } }
+  ]
+}
+```
+
+JSON fixtures are generated by the Oracle runner and consumed by Rust tests.
+Harness MUST support multi-step cases (transactions, temp objects, pragmas).
+Results are string-normalized by default; type-aware comparison is opt-in.
+
+**SQLLogicTest (SLT) ingestion:** The harness MUST also consume SQLLogicTest
+files for broad SQL coverage. SLT provides thousands of pre-existing test
+queries with expected results.
+
+**Normalization rules (avoid false failures):**
+- Unordered SELECT results: compare as multisets when SQL has no ORDER BY.
+- Floating-point: compare exact strings (default) or tolerance mode where
+  explicitly requested.
+- Error messages: compare error codes; messages are normalized (Oracle's exact
+  phrasing is not stable across versions).
+
+**Golden output discipline:** Every optimization or refactor must preserve
+golden outputs unless we explicitly document an intentional divergence and
+add a harness annotation explaining why it is acceptable.
+
+**Golden file format (simple text):**
 ```
 -- test: insert_returning
 -- description: INSERT with RETURNING clause
@@ -8604,7 +8715,8 @@ from spec, never translate line-by-line).
 
 - **Integer overflow wraps silently** in some contexts. The `sum()`
   aggregate raises an error on overflow, but arithmetic expressions like
-  `9223372036854775807 + 1` wrap to -9223372036854775808 without error.
+  `9223372036854775807 + 1` promote to REAL (floating point) rather than
+  wrapping.
 
 - **AUTOINCREMENT vs rowid reuse:** Without AUTOINCREMENT, deleted rowids
   CAN be reused. `max(rowid)+1` is used for new rows, but if the maximum
@@ -8637,27 +8749,27 @@ from spec, never translate line-by-line).
 | `vdbe.c` | VDBE interpreter | 9,316 | The giant switch statement dispatching all opcodes. Each case is the authoritative definition of what that opcode does. Extract: register manipulation, cursor operations, comparison semantics, NULL handling per opcode. |
 | `select.c` | SELECT compilation | 8,972 | How SELECT is compiled to VDBE opcodes: result column processing, FROM clause flattening, subquery handling, compound SELECT, DISTINCT, ORDER BY, LIMIT. |
 | `where.c` | WHERE optimization | 7,858 | Index selection algorithm, cost estimation, OR optimization, skip-scan, automatic index creation. The `WhereTerm`, `WhereLoop`, and `WherePath` structures define the optimizer's search space. |
-| `parse.y` | LEMON grammar | 1,963 | The authoritative SQL grammar. Every production rule defines a valid SQL construct. Use as the reference for the recursive descent parser. |
+| `parse.y` | LEMON grammar | 2,160 | The authoritative SQL grammar. Every production rule defines a valid SQL construct. Use as the reference for the recursive descent parser. |
 | `tokenize.c` | SQL tokenizer | 899 | Token types, keyword recognition, string/number/blob literal parsing, comment handling. |
-| `func.c` | Built-in functions | 2,415 | Implementation of all scalar and aggregate functions. Edge case behaviors (NULL handling, type coercion, overflow) are defined here. |
-| `expr.c` | Expression handling | 6,891 | Expression compilation, affinity computation, collation resolution, constant folding. |
-| `build.c` | DDL processing | 5,743 | CREATE TABLE/INDEX/VIEW/TRIGGER compilation, schema modification, type affinity determination from type name strings. |
+| `func.c` | Built-in functions | 3,461 | Implementation of all scalar and aggregate functions. Edge case behaviors (NULL handling, type coercion, overflow) are defined here. |
+| `expr.c` | Expression handling | 7,702 | Expression compilation, affinity computation, collation resolution, constant folding. |
+| `build.c` | DDL processing | 5,815 | CREATE TABLE/INDEX/VIEW/TRIGGER compilation, schema modification, type affinity determination from type name strings. |
 
 ### Asupersync Modules
 
 | Module | What FrankenSQLite Uses | Why It Matters |
 |--------|----------------------|----------------|
-| `raptorq/` | RFC 6330 codec | WAL self-healing, replication, version chain compression. The core innovation enabler. |
-| `sync/` | Mutex, RwLock, Condvar | MVCC lock table, version chain access, global write mutex for serialized mode. |
-| `channel/mpsc.rs` | Two-phase MPSC | Write coordinator commit pipeline with cancel-safety and backpressure. |
-| `channel/oneshot.rs` | Oneshot response | Commit response delivery from coordinator to committing transaction. |
-| `cx.rs` | Capability context | Threading through every function for cancellation, deadlines, and capability narrowing. |
-| `lab/reactor.rs` | Deterministic runtime | All concurrency tests run here. Deterministic scheduling, fault injection, reproducible by seed. |
-| `lab/eprocess.rs` | E-process monitors | Continuous invariant monitoring during MVCC stress tests. Anytime-valid statistical guarantees. |
-| `lab/mazurkiewicz.rs` | Trace exploration | Exhaustive interleaving enumeration for small critical MVCC scenarios. |
-| `lab/sheaf.rs` | Consistency checking | Formal verification that MVCC snapshot views satisfy the sheaf condition (local-to-global consistency). |
-| `lab/conformal.rs` | Distribution-free stats | Benchmark regression detection without parametric assumptions. |
-| `database/sqlite.rs` | API reference | FrankenSQLite's public API mirrors asupersync's SQLite wrapper API for familiarity. |
+| `src/raptorq/` | RFC 6330 codec | WAL self-healing, replication, version chain compression. The core innovation enabler. |
+| `src/sync/` | Mutex, RwLock, Condvar | MVCC lock table, version chain access, global write mutex for serialized mode. |
+| `src/channel/mpsc.rs` | Two-phase MPSC | Write coordinator commit pipeline with cancel-safety and backpressure. |
+| `src/channel/oneshot.rs` | Oneshot response | Commit response delivery from coordinator to committing transaction. |
+| `src/cx/` | Capability context | Threading through every function for cancellation, deadlines, and capability narrowing. |
+| `src/lab/runtime.rs` | Deterministic runtime | Reproducible concurrency testing, fault injection, virtual time. |
+| `src/lab/explorer.rs` | DPOR + Mazurkiewicz traces | Systematic schedule exploration for small critical concurrency scenarios. |
+| `src/obligation/eprocess.rs` | E-process core | Anytime-valid monitoring for invariant violations under optional stopping. |
+| `src/lab/oracle/eprocess.rs` | E-process oracle | Test harness + certificates for e-process monitoring. |
+| `src/lab/conformal.rs` | Distribution-free stats | Benchmark regression detection without parametric assumptions. |
+| `src/database/sqlite.rs` | API reference | FrankenSQLite's public API mirrors asupersync's SQLite wrapper API for familiarity. |
 
 ### Project Documents
 
@@ -8884,15 +8996,23 @@ Every phase must pass all applicable gates before proceeding to the next.
 **Phase 6 gates:**
 - MVCC stress test: 100 concurrent writers, 100 operations each, all
   committed rows present, no phantom rows
+- SSI: write skew patterns produce abort under default serializable mode;
+  same patterns succeed under PRAGMA fsqlite.serializable=OFF
+- SSI: no false negatives (no write skew anomaly escapes detection in
+  3-transaction Mazurkiewicz trace exploration)
 - Snapshot isolation: verified via Mazurkiewicz trace exploration for
   3-transaction scenarios (all non-equivalent orderings)
 - E-process monitors: INV-1 through INV-7, zero violations over 1M operations
 - GC memory bound: memory usage under sustained load stays within 2x of
   minimum theoretical (active transactions * pages per transaction * page size)
 - Serialized mode: behavior identical to C SQLite for single-writer test suite
-- Algebraic merge: 1,000 merge attempts with known-disjoint modifications,
-  zero false rejections; 1,000 attempts with overlapping modifications,
-  zero false acceptances
+- Rebase merge: 1,000 merge attempts with distinct-key inserts on same page,
+  zero false rejections
+- Algebraic merge: 1,000 merge attempts with known-disjoint byte
+  modifications, zero false rejections; 1,000 attempts with overlapping
+  modifications, zero false acceptances
+- Crash model: 100 crash-recovery scenarios validating self-healing durability
+  contract (Section 7.9)
 
 **Phase 7 gates:**
 - Query planner: EXPLAIN QUERY PLAN shows index usage for indexed queries
@@ -8917,13 +9037,16 @@ FrankenSQLite is not an incremental improvement on SQLite. It is a
 ground-up reimagination of what an embedded database engine can be when
 built on information-theoretic foundations and modern language guarantees.
 
-**1. MVCC with Layered Isolation.** The single biggest limitation of
-SQLite -- the WAL_WRITE_LOCK that serializes all writers -- is replaced
-with page-level MVCC versioning. Applications choose their isolation level:
-Serialized mode for exact backward compatibility, Concurrent mode for true
-multi-writer parallelism, and (future) SSI mode for serializable concurrent
-writes. The layered approach means zero risk for existing applications and
-full concurrency for applications that opt in.
+**1. MVCC with Serializable Concurrent Writers.** The single biggest limitation
+of SQLite -- the WAL_WRITE_LOCK that serializes all writers -- is replaced
+with page-level MVCC versioning and Serializable Snapshot Isolation (SSI).
+Applications choose their isolation level: Serialized mode for exact backward
+compatibility, Concurrent mode for true multi-writer parallelism with full
+SERIALIZABLE guarantees (not merely Snapshot Isolation). The conservative
+Page-SSI rule prevents write skew by default; algebraic write merging and
+intent-based deterministic rebase reduce conflict rates on hot pages without
+row-level MVCC metadata. The layered approach means zero risk for existing
+applications and serializable concurrency for applications that opt in.
 
 **2. RaptorQ-Pervasive Architecture.** Fountain codes are not bolted on as
 an afterthought. They are woven into every layer: the WAL uses RaptorQ
@@ -8961,13 +9084,16 @@ It is a drop-in replacement for the sqlite3 CLI and library.
 
 **6. Formal Verification Depth.** The MVCC system is specified with formal
 invariants (INV-1 through INV-7), safety proofs (deadlock freedom, snapshot
-isolation, serializable mode, first-committer-wins, GC safety), and a
-probabilistic conflict model validated empirically. The testing strategy
+isolation, serializable mode, first-committer-wins, GC safety), SSI
+correctness argument (conservative rw-antidependency rule prevents cycles),
+and a probabilistic conflict model validated empirically. The testing strategy
 combines property-based testing, deterministic concurrency testing, systematic
 interleaving exploration, anytime-valid statistical monitoring, grammar-based
-fuzzing, and conformance testing against the reference implementation. This
-is not aspirational -- these tools exist in asupersync and are integrated
-into the test infrastructure.
+fuzzing, and conformance testing against the reference implementation starting
+from Phase 1 (not deferred to Phase 9). An explicit crash model, risk
+register, and operating mode duality (Compatibility vs Native) ensure the
+system is both innovative and verifiable. This is not aspirational -- these
+tools exist in asupersync and are integrated into the test infrastructure.
 
 FrankenSQLite demonstrates that embedded databases need not sacrifice
 concurrency for simplicity, durability for performance, or safety for speed.
@@ -8978,6 +9104,6 @@ an embedded database engine can achieve.
 
 ---
 
-*Document version: V1.1 (expanded)*
+*Document version: V1.2 (SSI-by-default, Codex synthesis)*
 *Last updated: 2026-02-07*
 *Status: Draft for review*

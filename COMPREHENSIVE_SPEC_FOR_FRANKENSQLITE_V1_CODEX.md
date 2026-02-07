@@ -1,13 +1,20 @@
 # COMPREHENSIVE SPEC FOR FRANKENSQLITE V1 (CODEX)
 
-**Document status:** Draft v1 (single-source-of-truth for agents)  
+**Document status:** Draft v1 (agent companion, kept in sync with canon)  
 **Repo:** `/data/projects/frankensqlite`  
 **Target oracle:** SQLite 3.52.0 (C reference in `legacy_sqlite_code/`)  
 **RaptorQ bible:** `docs/rfc6330.txt` (RFC 6330)
 
 This document is intentionally **self-contained**: it includes the goals, constraints, architecture, formal semantics, verification strategy, and execution plan. It is written to be handed to other agents without requiring them to read any other docs first.
 
-If any other project docs disagree with this file, treat this file as authoritative until updated.
+**Canon / precedence:**
+
+- `AGENTS.md` is the operational ruleset for agents.
+- `Cargo.toml` and `rust-toolchain.toml` are ground truth for toolchain, workspace membership, and build profiles.
+- `COMPREHENSIVE_SPEC_FOR_FRANKENSQLITE_V1.md` is the full canonical spec.
+- This file is the *Codex companion* (more operational, sometimes more concrete).
+
+If this file conflicts with `AGENTS.md`, `Cargo.toml`, `rust-toolchain.toml`, or `COMPREHENSIVE_SPEC_FOR_FRANKENSQLITE_V1.md`, treat those as authoritative and update this file to match.
 
 ---
 
@@ -223,6 +230,12 @@ Implementation note (practical API surface we will bind to):
 
 RaptorQ is “any K symbols suffice” in the *engineering* sense, but the decode success probability at exactly `K` is not literally 1. The whole point of repair symbols is to drive decode failure probability into the floor.
 
+Terminology we use consistently:
+
+- `K_block = ObjectParams.symbols_per_block` (source symbols per source block)
+- `B = ObjectParams.source_blocks` (number of source blocks)
+- `K_total = K_block * B` (total source symbols across the whole object)
+
 Rules of thumb (backed by RFC 6330 guidance and typical RaptorQ behavior):
 
 - decoding with **exactly K** received symbols can very rarely fail (still extremely good compared to older fountain codes)
@@ -232,7 +245,7 @@ Therefore, we define a default redundancy policy:
 
 - **V1 default:** aim to persist/replicate enough symbols that a decoder can almost always collect **K+2** symbols for each source block without coordination.
 - expose knobs via PRAGMAs (see §9.3, §9.9, §12.6):
-  - `PRAGMA raptorq_overhead_percent = ...`
+  - `PRAGMA raptorq_overhead = <percent>`
   - `PRAGMA raptorq_repair_symbols = ...` (compatibility view policy)
 
 We also respect RFC 6330 source-block limits by chunking large objects into multiple source blocks via `ObjectParams`.
@@ -362,7 +375,6 @@ We define a commit capsule object type:
 
 ```
 CommitCapsule {
-  commit_seq: u64,
   snapshot_basis: SnapshotId,
 
   // Preferred: semantic intent log (merge/rebase friendly)
@@ -381,6 +393,11 @@ CommitCapsule {
   checks: CommitChecks,
 }
 ```
+
+`commit_seq` is carried by `CommitMarker` (the commit clock), not by the capsule payload. This lets us:
+
+- build/content-address the capsule deterministically before publish
+- allocate `commit_seq` strictly at marker append time (preserving total order without head-of-line blocking)
 
 Where `PageDelta` is not necessarily “a full page image”. It can be:
 
@@ -532,7 +549,7 @@ To retrieve object bytes:
 1. Obtain `ObjectParams` for the object.
    - from any symbol record header (preferred)
    - or from `RootManifest` / index segments
-2. Collect any `K = symbols_per_block * source_blocks` symbols.
+2. Collect symbols until decode succeeds (typically ≥`K_total`, often with a small redundancy margin).
    - from local symbol logs
    - from remote peers (replication)
 3. Decode via `asupersync::raptorq::RaptorQReceiver`.
@@ -568,13 +585,13 @@ Symbol size is a major performance lever:
 We therefore choose symbol size per object type, with sane defaults and benchmark-driven tuning:
 
 - `CommitCapsule` (page deltas / intent chunks):
-  - default `symbol_size = page_size` (e.g., 4096)
-  - rationale: aligns encoding units with page images and patch application boundaries
+  - default `symbol_size = min(page_size, 4096)` (symbol size is `u16`-bounded; if `page_size = 65536`, we chunk)
+  - rationale: aligns encoding units with page boundaries without exceeding RFC/asupersync sizing
 - `IndexSegment`:
   - default `symbol_size` in the 1–4 KiB range (often 1280 or 4096 depending on size)
   - rationale: segment payloads are metadata-heavy; smaller symbols can reduce tail loss impact
 - `CheckpointChunk`:
-  - default larger `symbol_size` (e.g., 16–64 KiB) when shipping over reliable local disk, but MAY fall back to page-sized for compatibility export
+  - default larger `symbol_size` (e.g., 16–64 KiB, capped at `u16::MAX`) when shipping over reliable local disk, but MAY fall back to page-sized for compatibility export
 
 All of this is versioned in `RootManifest` so replicas decode correctly.
 
@@ -592,19 +609,23 @@ User-visible contract:
 - **Readers never block writers** and **writers never block readers**.
 - **Writers do not wait while holding locks.** If a required lock is unavailable, the operation fails fast with a retryable error (`BUSY`-class).
 
-API / SQL surface (proposed):
+API / SQL surface (proposed, aligned to the canonical spec’s *Serialized vs Concurrent* modes):
 
-- `BEGIN` (default): serializable MVCC mode (this section).
-- `BEGIN IMMEDIATE`: “compat” style global writer intent (useful for legacy apps that expect single-writer semantics; still MVCC underneath, but we suppress concurrency).
-- `BEGIN CONCURRENT`: synonym for default MVCC serializable mode (explicit, readable).
-- `PRAGMA fsqlite.serializable = ON|OFF`:
-  - `ON` (default): SSI/OCC validation enabled
-  - `OFF`: Snapshot Isolation (SI) allowed as an explicit opt-in (for benchmark exploration only; not a default)
+- `BEGIN` / `BEGIN DEFERRED` / `BEGIN IMMEDIATE` / `BEGIN EXCLUSIVE`:
+  - start a **Serialized** transaction (single-writer semantics for parity and safety)
+  - this is the default in V1 conformance runs (SQLite is the oracle)
+- `BEGIN CONCURRENT`:
+  - start a **Concurrent** transaction (page MVCC + first-committer-wins + SSI by default)
+- `PRAGMA fsqlite.serializable = ON|OFF` (applies to **Concurrent** mode only):
+  - `ON` (default): SSI validation enabled (serializable)
+  - `OFF`: Snapshot Isolation (SI) allowed as an explicit opt-in (benchmarking / permissive apps only)
 
 Error mapping:
 
-- **Write-write conflict** (true conflict, not mergeable): `SQLITE_BUSY` (or `SQLITE_BUSY_SNAPSHOT` where the Oracle uses that code).
-- **Serialization failure** (SSI/OCC abort): `SQLITE_BUSY`-class with a distinct extended code for “retryable serialization abort” (we standardize in our API even if SQLite’s exact extended code differs).
+- **Page lock conflict** (could not acquire a page write lock): `SQLITE_BUSY`.
+- **Commit-time conflict** (first-committer-wins) or **SSI abort**: `SQLITE_BUSY_SNAPSHOT` (retryable).
+
+Note: “fail fast” is an engine rule. SQLite-style `busy_timeout` behavior can be implemented in the API layer by retrying with backoff; we do not block while holding multiple resources.
 
 ### 7.2 Formal MVCC Model (Executable Definitions)
 
@@ -708,8 +729,8 @@ We maintain:
   - later refinement key: `(Pgno, RangeTag)` or `(Pgno, CellTag)`
   - value: a compact set of active txn ids (SmallVec/bitset style)
 - Per-txn flags:
-  - `has_in_rw(T)` (someone read what T wrote, or equivalently some reader conflicts in)
-  - `has_out_rw(T)` (T read what someone else later wrote)
+  - `has_in_rw(T)`: ∃`R` such that `R ->rw T` (some other txn read a page/key that `T` later overwrote)
+  - `has_out_rw(T)`: ∃`W` such that `T ->rw W` (`T` read a page/key that some other txn later overwrote)
 
 We MUST also maintain “explainability witnesses” in debug/lab builds:
 
@@ -813,7 +834,7 @@ We will validate the model with benchmarks that control:
 
 ### 7.12 Mechanical Sympathy: Data Structures That Make This Fast
 
-This is where Gemini’s feedback is correct: the math is only valuable if it is embodied in the right low-level structures.
+The math is only valuable if it is embodied in the right low-level structures.
 
 #### 7.12.1 Active Transaction Set Representation (Adaptive)
 
@@ -1095,12 +1116,13 @@ We define two durable object types:
 
 Capsule contains:
 
-- `commit_seq` (assigned during marker append)
 - `snapshot_basis` (what the txn read)
 - `intent_log` (preferred) and/or `page_deltas` (materialized patches)
 - `read_set_digest` and `write_set_digest` (for debugging + conformance witnesses)
 - SSI witnesses (debug/lab builds; can be feature-gated in release)
 - schema delta (DDL) if applicable
+
+During recovery/apply, the `commit_seq` from the marker is associated with the capsule and used as the “created_by” identifier for any committed versions it publishes.
 
 #### CommitMarker (V1 payload)
 
@@ -1126,8 +1148,8 @@ Protocol for txn `T`:
 1. Build `CommitCapsuleBytes(T)` deterministically.
 2. Encode capsule bytes into symbols using `asupersync::raptorq::RaptorQSender`.
 3. Persist symbols to local symbol logs (and optionally stream to replicas) until the durability policy is satisfied:
-   - local: persist ≥K symbols plus margin
-   - quorum: persist/ack ≥K symbols across M replicas (asupersync quorum combinator)
+   - local: persist ≥`K_total + margin` symbols (where `K_total = ObjectParams.total_source_symbols()`)
+   - quorum: persist/ack ≥`K_total + margin` symbols across M replicas (asupersync quorum combinator)
 4. Create `CommitMarkerBytes(commit_seq, capsule_object_id, prev_marker, ...)`.
    - `commit_seq` is allocated at this point.
 5. Encode/persist the marker as an ECS object as well, and append its id to the marker stream.
@@ -1139,8 +1161,8 @@ Protocol for txn `T`:
 Proof sketch (marker ⇒ decodable capsule under budget):
 
 - The commit path does not publish a marker until the durability policy reports enough persisted symbols for the capsule.
-- Decoding requires ≥K symbols (ObjectParams).
-- Therefore, under the assumed loss/corruption budget, recovery can collect ≥K valid symbols and decode the capsule.
+- For an object with `ObjectParams`, decoding requires (at minimum) ≥`K_block` symbols per source block, i.e. ≥`K_total` symbols total (and in practice slightly more to crush failure probability).
+- Therefore, under the assumed loss/corruption budget and redundancy margin, recovery can collect ≥`K_total` valid symbols and decode the capsule.
 
 ### 9.6 Recovery Algorithm (Native Mode)
 
@@ -1199,7 +1221,7 @@ In both cases, ECS remains the source-of-truth in native mode; compatibility art
 
 ### 9.9 WAL-FEC Sidecar (Corrected, SQLite-Compatible, Still RaptorQ)
 
-Opus had a powerful idea: treat each WAL commit group as `K` source symbols (page images) plus `R` repair symbols. That idea is correct.
+Earlier drafts proposed: treat each WAL commit group as `K` source symbols (page images) plus `R` repair symbols. That idea is correct.
 
 The *frame-header embedding* idea, however, must be corrected:
 
@@ -1233,7 +1255,7 @@ Persistence:
 
 For each WAL commit group `G` that writes `K` pages:
 
-- define a compat ECS object `CompatWalCommitGroup` whose **source symbols** are the `K` page images (symbol size = `page_size`)
+- define a compat ECS object `CompatWalCommitGroup` whose **source symbols** are the commit group’s page images (chunked to `symbol_size <= u16::MAX`)
 - generate `R = PRAGMA raptorq_repair_symbols` **repair symbols**
 - write the `K` source frames to `.wal` normally
 - write only the `R` repair symbols + minimal metadata to `.wal-fec`
@@ -1241,8 +1263,8 @@ For each WAL commit group `G` that writes `K` pages:
 Metadata we MUST store per group:
 
 - a stable `group_id` (e.g., `(wal_salt1, wal_salt2, end_frame_no)` or a content-derived id)
-- `ObjectParams` (object id, object_size, symbol_size, source_blocks, K)
-- the ordered list of `Pgno`s corresponding to source symbol indices `0..K-1`
+- `ObjectParams` (object id, object_size, symbol_size, source_blocks, `K_block`)
+- the ordered list of `Pgno`s for frames in the group, plus `(page_size, symbol_size)` so source symbol indices map deterministically to `(pgno, chunk_index)`
 - the WAL frame range `(start_frame, end_frame)` so recovery can partition without relying on possibly-corrupted commit headers
 
 `wal-fec` record format can reuse our ECS symbol record envelope (§6.4), with one additional “group metadata” record that carries the `Pgno` list.
@@ -1578,7 +1600,7 @@ We do not assign “objects to nodes”. We assign **symbols** to nodes.
 
 Default:
 
-- encode object into `K` source symbols + `R` repair symbols
+- encode object into `K_total` source symbols + `R` repair symbols
 - assign each symbol to one or more nodes via `asupersync::distributed::consistent_hash`
 - replication factor and `R` determine:
   - node-loss tolerance
@@ -1597,7 +1619,7 @@ Anti-entropy loop:
    - optional index segment tips
 2. Compute missing object ids (set difference via manifests/index summaries).
 3. Request symbols for missing objects.
-4. Stream symbols until decode succeeds; stop early once K symbols gathered.
+4. Stream symbols until decode succeeds; stop early once the receiver reports completion (typically around `K_total + ε` symbols).
 5. Persist decoded objects locally; update caches.
 
 Because objects are fountain-coded:
@@ -1935,7 +1957,7 @@ We do NOT use SHA-256 on hot paths unless we have a specific security requiremen
 
 ### 15.3 Mechanical Sympathy (Speed Without Cheating)
 
-Gemini’s point is correct: “math is instructions.” The project should feel like it was built by someone who can see the CPU.
+Principle: “math is instructions.” The project should feel like it was built by someone who can see the CPU.
 
 Non-negotiables:
 
@@ -1973,17 +1995,17 @@ This is how we stay fast without drifting from parity.
 
 ### 15.6 Build Profiles (Perf First, Size As A Separate Track)
 
-This is a database engine, not a demo binary. We want **opt-level 3** for performance-critical builds.
+This repo currently sets `[profile.release]` to size-optimized settings (`opt-level="z"`, `lto=true`, `codegen-units=1`, `panic="abort"`, `strip=true`) in `Cargo.toml`.
 
 Policy:
 
-- `profile.release`: performance profile (`opt-level=3`, `lto=true`, `codegen-units=1`, `panic=abort`).
-- `profile.dist` (or equivalent): size profile (`opt-level="z"`, strip, etc.) for distribution experiments.
+- Treat the existing `profile.release` as **V1 default** (it’s what CI and most agents will use unless explicitly changed).
+- If/when we need a dedicated performance profile, add a separate Cargo profile (e.g. `profile.perf`) and benchmark under that profile explicitly.
 
 Rationale:
 
-- Performance decisions must be measured and optimized under the same profile we intend to ship for serious use.
-- Size optimization is not “free”; it can damage hot-path throughput and tail latency.
+- The spec and the repo configuration must agree (agents should not chase phantom profiles).
+- If we introduce a perf profile later, it must come with benchmark evidence and a clear “which profile is canonical for perf claims” rule.
 
 ---
 
@@ -2174,12 +2196,14 @@ Answer plan: benchmark workloads that hammer the same index/table; if internal-p
 
 - **RaptorQ canon:** `docs/rfc6330.txt`
 - **Legacy oracle (C SQLite 3.52.0):** `legacy_sqlite_code/`
-- Existing extracted structure notes (useful, but this doc is authoritative):
+- Canon (source of truth):
+  - `AGENTS.md`
+  - `COMPREHENSIVE_SPEC_FOR_FRANKENSQLITE_V1.md`
+- Other extracted structure notes (useful context; superseded where they conflict with canon):
   - `EXISTING_SQLITE_STRUCTURE.md`
   - `PLAN_TO_PORT_SQLITE_TO_RUST.md`
   - `PROPOSED_ARCHITECTURE.md`
-- Previous drafts (superseded by this doc):
+- Older / partial specs (generally superseded by canon):
   - `MVCC_SPECIFICATION.md`
-  - `COMPREHENSIVE_SPEC_FOR_FRANKENSQLITE_V1.md`
 - Issue tracker state:
   - `.beads/`
