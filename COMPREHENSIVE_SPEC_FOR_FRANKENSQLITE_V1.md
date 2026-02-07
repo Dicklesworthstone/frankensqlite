@@ -73,7 +73,7 @@ Pseudocode and type definitions are normative unless explicitly labeled
 | **Saga** | Structured multi-step operation with deterministic compensations; used for compaction and tier eviction so cancellation never leaves partial state. |
 | **Region** | Asupersync structured concurrency scope: a tree of owned tasks. Region close implies quiescence (no live children, all finalizers run, all obligations resolved). |
 | **PageNumber** | 1-based `NonZeroU32` identifying a database page. Page 1 is always the database header. |
-| **TxnId** | Monotonically increasing `u64` transaction begin identifier (allocated at `BEGIN`). `TxnSlot.txn_id = 0` is reserved to mean "free slot", so real TxnIds are non-zero. Additionally, the shared-memory protocol reserves `u64::MAX` and `u64::MAX-1` as sentinel values (§5.6.2); TxnId allocation MUST never produce those values. |
+| **TxnId** | Monotonically increasing `u64` transaction begin identifier (allocated at `BEGIN`). `TxnSlot.txn_id = 0` is reserved to mean "free slot", so real TxnIds are non-zero. In shared memory, `TxnSlot.txn_id` is a tagged state word that encodes sentinel states (CLAIMING/CLEANING) in the top bits (§5.6.2). Therefore real TxnIds MUST fit in 62 bits: `1 <= TxnId <= (1<<62)-1`. |
 | **TxnEpoch** | Monotonically increasing `u32` generation counter for a reused TxnSlot (prevents stale slot-id interpretation). |
 | **TxnToken** | Canonical transaction identity for SSI witness plane: `(TxnId, TxnEpoch)`. |
 | **SchemaEpoch** | Monotonically increasing `u64` epoch for schema/physical-layout changes (DDL/VACUUM). Captured at `BEGIN` and carried through intent logs to forbid replay/merge across schema boundaries. |
@@ -295,7 +295,8 @@ cross-cutting checklist:
 
 - **Hybrid SHM interop must follow legacy lock protocol, not just layout.**
   In Compatibility mode, FrankenSQLite readers MUST acquire `WAL_READ_LOCK(i)`
-  (EXCLUSIVE to update `aReadMark[i]`, then SHARED for the snapshot lifetime),
+  (SHARED to **join** an existing `aReadMark[i]`, or EXCLUSIVE only when it must
+  update `aReadMark[i]`, then downgrade to SHARED for the snapshot lifetime),
   and writers MUST hold `WAL_WRITE_LOCK` for the coordinator lifetime (§5.6.7).
 
 - **Witnesses must be semantic and sub-page for point ops.**
@@ -311,14 +312,13 @@ cross-cutting checklist:
 
 - **Lock table rebuild quiescence is "no lock holders", not "no transactions".**
   Rebuild MUST drain to lock-quiescence (`forall entries: owner_txn==0`), and
-  read-only transactions MUST NOT block rebuild. If a transaction holds any page
-  locks and encounters rebuild-induced `SQLITE_BUSY`, it MUST abort/retry (no
-  busy-wait while holding locks) (§5.6.3.1).
+  read-only transactions MUST NOT block rebuild. Rebuild MUST be **rolling**
+  (rotate + drain + clear) and MUST NOT induce a global abort storm (§5.6.3.1).
 
 - **GC horizon must account for TxnSlot sentinel states.**
-  `raise_gc_horizon()` MUST treat `TXN_ID_CLAIMING/TXN_ID_CLEANING` as horizon
-  blockers (§5.6.5). Crash cleanup MUST preserve enough identity (`cleanup_txn_id`)
-  to make cleanup retryable without lock leaks (§5.6.2).
+  `raise_gc_horizon()` MUST treat TxnSlots in CLAIMING/CLEANING sentinel states
+  as horizon blockers (§5.6.5). Crash cleanup MUST preserve enough identity
+  (`cleanup_txn_id`) to make cleanup retryable without lock leaks (§5.6.2).
 
 - **Direct I/O is incompatible with SQLite WAL framing.**
   Compatibility mode MUST NOT require `O_DIRECT` for `.wal` I/O because the
@@ -1374,10 +1374,12 @@ PRAGMA raptorq_repair_symbols = N;      -- Set to N (0 disables, max 255)
 
 - N = 0: Exact C SQLite behavior. No `.wal-fec` repair symbols written. No recovery
   from torn writes beyond what the checksum chain provides.
-- N = 1: Tolerates 1 corrupted frame per commit group. Recommended minimum
-  for production use. Overhead: 1/K additional WAL space per commit.
-- N = 2: Tolerates 2 corrupted frames. Default. Overhead: 2/K additional
-  WAL space.
+- N = 1: Tolerates 1 missing/corrupt frame per **repairable** commit group.
+  Recommended minimum for production use. Overhead: `1/K` additional page-image
+  worth of bytes in `.wal-fec` per commit group.
+- N = 2: Tolerates 2 missing/corrupt frames per **repairable** commit group.
+  Default. Overhead: `2/K` additional page-image worth of bytes in `.wal-fec`
+  per commit group.
 - N > K: Valid but wasteful (more repair symbols than source symbols). The
   encoder will generate them, but the marginal benefit beyond N = 3 or 4
   is negligible for typical corruption patterns.
@@ -2249,6 +2251,44 @@ DbFecHeader := {
 }
 ```
 
+**Stale/foreign sidecar guard (normative):**
+
+`DbFecHeader.db_gen_digest` exists to prevent a catastrophic failure mode:
+repairing a corrupted page to a *stale* or *foreign* state. Therefore, before
+the engine uses any `.db-fec` group metadata or repair symbols, it MUST verify
+that the `.db-fec` header matches the current `.db` header generation.
+
+**Generation digest computation (normative):**
+
+Let `db_gen_digest_current` be computed from the *current* database header
+fields (all big-endian u32) at offsets 24, 28, 36, 40:
+`(change_counter, page_count, freelist_count, schema_cookie)`.
+
+```
+db_gen_digest_current =
+  Trunc128(BLAKE3("fsqlite:compat:dbgen:v1"
+                  || be_u32(change_counter)
+                  || be_u32(page_count)
+                  || be_u32(freelist_count)
+                  || be_u32(schema_cookie)))
+```
+
+**Verification rule (normative):**
+
+1. Read `DbFecHeader` and verify `checksum`.
+2. If the `.db` header page (page 1) passes basic validity checks (SQLite
+   signature + encryption/tag or reserved checksum if enabled), compute
+   `db_gen_digest_current` and require:
+   `db_gen_digest_current == DbFecHeader.db_gen_digest`.
+   On mismatch, treat `.db-fec` as stale/foreign and ignore it entirely.
+3. If the `.db` header page is corrupted and the engine is attempting repair:
+   - It MAY attempt to repair page 1 using the page-1 group segment in `.db-fec`.
+   - After obtaining a candidate repaired header page, it MUST recompute
+     `db_gen_digest_current` from the repaired bytes and require it matches
+     `DbFecHeader.db_gen_digest`.
+   - On mismatch, treat the sidecar as foreign and fail closed
+     (`SQLITE_CORRUPT`): do not "repair" the database to an unrelated state.
+
 The group lookup function `find_page_group_from_db_fec(pgno)` MUST be computed
 from `DbFecHeader` and MUST NOT depend on page 1 bytes.
 
@@ -2473,10 +2513,25 @@ DbFecGroupMeta := {
 **Write path / checkpoint integration (normative):**
 
 - `.db-fec` generation MUST NOT occur in the transaction commit critical path.
+- **Single-writer checkpoint rule (normative):** In Compatibility mode, there
+  MUST be exactly one logical checkpointer writing `.db` and `.db-fec` at a
+  time (cross-process). The same mutual exclusion used for checkpoint writes
+  MUST cover `.db-fec` updates so no other actor can race group updates.
 - When checkpointing pages from WAL into `.db`, the checkpointer MUST ensure
   `.db-fec` is updated for the affected page groups before it performs any WAL
   operation that would discard the newest committed version of those pages
   (`RESTART` / `TRUNCATE`), per the WAL truncation safety rule above.
+- **Global generation commit record (required):** A `.db-fec` header update is
+  the commit record for sidecar freshness:
+  - The checkpointer MUST `fsync`/`fdatasync` `.db` (checkpoint durability) for
+    the pages it wrote (including page 1 if updated) before committing `.db-fec`
+    to that database generation.
+  - After all required group segments have been updated (and their metas written),
+    the checkpointer MUST write `DbFecHeader.db_gen_digest` for the *current*
+    durable `.db` header generation and then write `DbFecHeader.checksum`.
+  - The checkpointer MUST `fsync` `.db-fec` after the header write.
+  - WAL `RESTART`/`TRUNCATE` MUST NOT occur until this header fsync completes.
+  Readers MUST treat a `.db-fec` header with invalid checksum as absent.
 - **Crash-consistent group update (required):** Updating a group segment MUST use
   a "meta-is-commit-record" discipline:
   1. Write the new repair `SymbolRecord`s for the group (with the new `object_id`)
@@ -2842,7 +2897,7 @@ sequential write throughput (log-structured):
 foo.db.fsqlite/
 ├── ecs/
 │   ├── root              -- tiny mutable pointer file (atomic update)
-│   │                     -- contains: [magic (4B "FSRT") | version (4B) | manifest_object_id (16B) | checksum (8B)]
+│   │                     -- contains: [magic (4B "FSRT") | version (4B) | manifest_object_id (16B) | ecs_epoch (8B) | checksum (8B) | root_auth_tag (16B, optional)]
 │   ├── symbols/          -- append-only symbol record logs
 │   │   ├── segment-000000.log
 │   │   ├── segment-000001.log
@@ -3076,6 +3131,17 @@ The format is optimized for:
 - sequential scans (for rebuild),
 - random access via locator offsets (for decode).
 
+**Direct I/O note (normative):** Because `SymbolRecord` entries are variable-sized,
+`ecs/symbols/*.log` does not, in general, preserve sector alignment at record
+boundaries. Implementations therefore MUST NOT require `O_DIRECT` for symbol logs
+(§1.5). Buffered I/O is permitted and expected.
+
+Implementations MAY provide an **aligned symbol log** variant for `O_DIRECT`
+experiments: pad each on-disk `SymbolRecord` to `align_up(record_len, sector_size)`
+and record the padded length in a per-segment index. This is optional and MUST
+not change the logical `SymbolRecord` bytes used for `frame_xxh3`/`auth_tag`
+verification.
+
 **V1 constants (normative):**
 
 ```
@@ -3129,6 +3195,40 @@ and parsing symbol records.
 The RootManifest is the bootstrap entry point, stored as a standard ECS object.
 The `ecs/root` file points to it.
 
+**`ecs/root` record (required):**
+
+`ecs/root` is the *mutable* anchor file. It is tiny, atomically updated (§3.5.4),
+and is the only place the engine reads before it knows which ECS objects are the
+current tip.
+
+```
+EcsRootPointer := {
+    magic            : [u8; 4],   -- "FSRT"
+    version          : u32,       -- 1
+    manifest_object_id: [u8; 16], -- ObjectId of the RootManifest ECS object
+    ecs_epoch        : u64,       -- current ECS coordination epoch (must match RootManifest.ecs_epoch)
+    checksum         : u64,       -- xxh3_64 of all preceding fields (torn-write detection)
+    root_auth_tag    : [u8; 16],  -- Optional: keyed authenticity tag (see below)
+}
+```
+
+**Root pointer authenticity (normative when `symbol_auth` enabled):**
+
+When `PRAGMA fsqlite.symbol_auth = on` (§3.5.2), the engine MUST treat `ecs/root`
+as part of the authenticated bootstrap chain:
+
+- `root_auth_tag` MUST be present and MUST be verified before using
+  `manifest_object_id` or `ecs_epoch`.
+- `root_auth_tag` is derived from the *epoch-independent* `master_key`
+  (§4.18.2) so bootstrap does not require knowing the epoch a priori.
+
+```
+root_auth_tag = Trunc128( BLAKE3_KEYED(master_key,
+                  "fsqlite:ecs-root-auth:v1" || bytes(magic..checksum) ) )
+```
+
+If `symbol_auth = off`, `root_auth_tag` MUST be all-zero and MUST be ignored.
+
 ```
 RootManifest := {
     magic           : [u8; 8],     -- "FSQLROOT"
@@ -3148,17 +3248,24 @@ RootManifest := {
 ```
 
 **Bootstrap sequence:**
-1. Read `ecs/root`. Verify checksum. Get `manifest_object_id`.
-2. Fetch `RootManifest` object from symbol logs (using `object_locator.cache` or scan).
-3. Decode `RootManifest`.
-4. Fetch and verify the latest `CommitMarkerRecord`:
+1. Read `ecs/root`. Verify `checksum`.
+2. If `symbol_auth = on`, verify `root_auth_tag` using `master_key` (epoch-independent).
+3. Record `root_epoch = EcsRootPointer.ecs_epoch` and `manifest_object_id`.
+4. Fetch `RootManifest` object from symbol logs (using `object_locator.cache` or scan).
+   - **Fail-closed epoch check (bootstrap):** While loading the manifest, the
+     engine MUST reject symbol segments with `SymbolSegmentHeader.epoch_id > root_epoch`
+     (future-epoch misconfiguration/replay guard; §4.18.1).
+5. Decode `RootManifest`.
+   - **Invariant (required):** `RootManifest.ecs_epoch` MUST equal `root_epoch`.
+     On mismatch, treat as corruption (do not silently pick one).
+6. Fetch and verify the latest `CommitMarkerRecord`:
    - Locate record by `RootManifest.commit_seq` via §3.5.4.1.
    - Verify `marker_id == RootManifest.current_commit`.
    - (Optional, bounded): verify the marker hash chain back to the latest
      checkpoint tip (detects marker-stream corruption early without O(N) open).
-5. Fetch `schema_snapshot` → reconstruct schema cache.
-6. Fetch `checkpoint_base` → populate B-tree page cache for hot pages.
-7. Database is open and ready for queries.
+7. Fetch `schema_snapshot` → reconstruct schema cache.
+8. Fetch `checkpoint_base` → populate B-tree page cache for hot pages.
+9. Database is open and ready for queries.
 
 If `ecs/root` is corrupted (missing or invalid checksum), the database can be
 recovered by scanning `ecs/markers/*.log` to find the latest valid CommitMarker,
@@ -5236,6 +5343,12 @@ The engine defines a SymbolValidityWindow:
 SymbolValidityWindow := [0, RootManifest.ecs_epoch]
 ```
 
+**Bootstrap note (required):** Before `RootManifest` is decoded, the engine
+MUST use the `ecs_epoch` value from `ecs/root` (`EcsRootPointer.ecs_epoch`;
+§3.5.5) as the provisional upper bound, and MUST reject symbol segments with
+`epoch_id > root_epoch` while loading the manifest. After decoding, the engine
+MUST enforce `RootManifest.ecs_epoch == root_epoch`.
+
 This is a fail-closed policy for future epochs:
 - Symbols/segments tagged with `epoch_id > RootManifest.ecs_epoch` MUST be rejected
   as misconfiguration or replay from an incompatible future configuration.
@@ -5431,6 +5544,8 @@ isolation level analysis, checksum performance, and multi-process semantics.
 
 ```
 TxnId       := u64                          -- monotonically increasing logical id allocated at BEGIN (AtomicU64)
+                                         -- MUST satisfy: 1 <= TxnId <= TXN_ID_MAX where TXN_ID_MAX=(1<<62)-1
+                                         -- (top bits reserved for TxnSlot sentinel encoding; §5.6.2)
 TxnEpoch    := u32                          -- increments when a TxnSlotId is reused (prevents stale slot interpretation)
 TxnToken    := (txn_id: TxnId, txn_epoch: TxnEpoch)
 
@@ -5456,7 +5571,7 @@ Snapshot := {
 PageVersion := {
     pgno       : PageNumber,
     commit_seq : CommitSeq,                 -- 0 for uncommitted/private versions (only in a txn write_set)
-    created_by : TxnToken,                  -- creator identity (debug/audit); not used for visibility
+    created_by : TxnId,                     -- creator identity (debug/audit); not used for visibility
     data       : PageData,                  -- or sparse XOR delta (Section 3.4.4)
     prev_idx   : Option<VersionIdx>,        -- index into VersionArena (NOT Box pointer)
 }
@@ -5489,6 +5604,15 @@ PageVersion := {
 --   while holding a read guard; the coordinator mutates the arena only while
 --   holding a write guard. Implementations MUST NOT hand out raw pointers or
 --   references that outlive the guard.
+--
+--   **CRITICAL (normative):** No VersionArena guard may be held across:
+--   - any file I/O (WAL append, marker append, page reads),
+--   - any `.await` point / task yield, or
+--   - any long-running scan of unrelated pages.
+--   The write guard is permitted only for short, bounded in-memory publication
+--   steps (allocate a few VersionIdx slots, splice a few chain heads, push a
+--   few freed indices to `free_list`). Durable I/O MUST happen outside the
+--   arena lock to preserve SQLite-style reader/writer non-blocking behavior.
 --
 -- MEMORY STABILITY (normative): The arena MUST be chunked so that appending new
 -- versions cannot reallocate/move previously published PageVersion storage.
@@ -5573,6 +5697,8 @@ SSIWitnessPlane := (see §5.6.4)
 Transaction := {
     txn_id      : TxnId,
     txn_epoch   : TxnEpoch,
+    slot_id     : Option<u32>,             -- TxnSlot array index when shared-memory coordination is enabled (§5.6.2).
+                                          -- Required for hot witness-plane registrations and GC horizon accounting.
     snapshot    : Snapshot,
     write_set   : HashMap<PageNumber, PageVersion>, -- private versions (commit_seq = 0); spillable page images in Compatibility mode (§5.9.2)
     intent_log  : Vec<IntentOp>,            -- semantic operation log for rebase merge
@@ -5630,12 +5756,12 @@ Formal (commit clock): forall C1, C2 :
 ```
 
 *Enforcement:* `TxnManager::next_txn_id` is an `AtomicU64` advanced by a CAS loop
-that increments by 1 and rejects reserved sentinel values (§5.4). Each successful
-CAS publishes a unique TxnId, and the underlying counter only ever increases, so
-TxnIds are strictly increasing. If the counter would wrap into `TxnId=0` or the
-reserved shared-memory sentinels (`TXN_ID_CLAIMING`, `TXN_ID_CLEANING`; §5.6.2),
-the engine MUST fail fast with `FATAL_TXN_ID_OVERFLOW` rather than publishing an
-illegal TxnId into shared memory.
+that increments by 1 and rejects invalid TxnIds (§5.4). Each successful CAS
+publishes a unique TxnId, and the underlying counter only ever increases, so
+TxnIds are strictly increasing. If the counter would wrap into `TxnId=0` or
+exceed `TXN_ID_MAX` (violating the 62-bit TxnId domain required by TxnSlot
+tagging; §5.6.2), the engine MUST fail fast with `FATAL_TXN_ID_OVERFLOW` rather
+than publishing an illegal TxnId into shared memory.
 
 `CommitSeq` is assigned only by the commit sequencer in the serialized commit
 section, so committed transactions have a strict total order.
@@ -5728,13 +5854,28 @@ bypassing the first-committer-wins check.
 
 ```
 Formal: forall T : T.snapshot at time t = T.snapshot at time t' for all t' > t
-    where t is the time of begin(T)
+    where t is the time the snapshot is established
 ```
 
 *Enforcement:* The `Snapshot` struct is stored by value inside the `Transaction`
-struct. No mutable references to `T.snapshot` are ever created after
-`capture_snapshot()` returns. The `Snapshot` type does not implement
+struct. No mutable references to `T.snapshot` are ever created after snapshot
+establishment. The `Snapshot` type does not implement
 interior mutability.
+
+**SQLite DEFERRED nuance (normative):** In Serialized mode, `BEGIN DEFERRED`
+does not establish a read snapshot until the first read (or until writer
+upgrade on the first write). To match SQLite semantics and to avoid spurious
+`SQLITE_BUSY_SNAPSHOT` for transactions that have not observed any data:
+
+- A Serialized `BEGIN DEFERRED` transaction's snapshot is **provisional** until
+  the first read or first write attempt.
+- On the first read, the engine MUST refresh the snapshot to the then-current
+  durable `(commit_seq, schema_epoch)` pair and mark it established.
+- On writer upgrade, if the snapshot is already established and stale, the
+  engine MUST fail with `SQLITE_BUSY_SNAPSHOT` rather than allow a
+  reader-turned-writer overwrite (write skew).
+- Once established, the snapshot is immutable for the remainder of the
+  transaction.
 
 *Violation consequence:* If a snapshot changes during a transaction, reads at
 different times could see different versions of the same page, breaking
@@ -5888,47 +6029,73 @@ load_consistent_snapshot(manager) -> Snapshot:
         if high1 == high2:
             return Snapshot { high: high1, schema_epoch: epoch }
 
-begin(manager, begin_kind) -> Transaction:
-    // TxnId allocation MUST never publish reserved sentinel values into shared memory.
+begin(manager, begin_kind) -> Result<Transaction>:
+    // TxnId allocation MUST never publish reserved tagged/sentinel values into shared memory.
     //
     // Domain:
     // - `TxnId=0` is reserved as a shared-memory sentinel (slot free).
-    // - `TXN_ID_CLEANING := u64::MAX - 1` and `TXN_ID_CLAIMING := u64::MAX` are
-    //   reserved by the TxnSlot protocol (§5.6.2).
+    // - The TxnSlot protocol encodes slot sentinel states (CLAIMING/CLEANING)
+    //   in the *top bits* of `TxnSlot.txn_id` (§5.6.2). Therefore real TxnIds
+    //   MUST fit in 62 bits: `1 <= txn_id <= TXN_ID_MAX`.
     //
     // IMPORTANT: `fetch_add` is forbidden here. It advances the counter even when
     // we abort and will eventually wrap, producing `TxnId=0`. Use a CAS loop so
     // illegal values are never published.
+    const TXN_ID_MAX: u64 = (1u64 << 62) - 1;
     loop:
         raw = manager.next_txn_id.load(Acquire)
         candidate = raw + 1
-        if candidate == 0 OR candidate == TXN_ID_CLEANING OR candidate == TXN_ID_CLAIMING:
+        if candidate == 0 OR candidate > TXN_ID_MAX:
             // TxnId space exhausted or corrupted. This is fatal: TxnSlots cannot be reused safely.
             abort(FATAL_TXN_ID_OVERFLOW)
         if manager.next_txn_id.CAS(raw, candidate, AcqRel, Acquire):
             txn_id = candidate
             break
-    txn_epoch = 0  // in-process; cross-process uses TxnSlot.epoch (Section 5.6.2)
-    snapshot = load_consistent_snapshot(manager)
+    snapshot_established = (begin_kind != Deferred)
     serialized_write_lock_held = false
     mode = if begin_kind == Concurrent { Concurrent } else { Serialized }
     if begin_kind == Immediate || begin_kind == Exclusive:
         // Writer-intent at BEGIN (SQLite IMMEDIATE/EXCLUSIVE semantics).
-        manager.global_write_mutex.lock()
+        //
+        // Cross-process, this MUST exclude Concurrent writers (single-writer
+        // contract) via the SharedMemoryLayout.serialized_writer_token indicator.
+        acquire_serialized_writer_exclusion(manager.shm, txn_id)?
         serialized_write_lock_held = true
-    return Transaction {
-        txn_id, txn_epoch, snapshot, mode,
+
+    // Acquire and publish a TxnSlot (cross-process visibility) using the
+    // three-phase protocol in §5.6.2.
+    //
+    // NOTE (normative): The slot is claimed BEFORE snapshot capture so GC cannot
+    // advance past our soon-to-be-visible begin_seq (GC treats CLAIMING/CLEANING
+    // sentinel states as horizon blockers; §5.6.5). For BEGIN IMMEDIATE/EXCLUSIVE, writer exclusion
+    // was acquired above; snapshot capture therefore occurs after any lock wait,
+    // matching SQLite semantics.
+    (slot_idx, txn_epoch, snapshot) = acquire_and_publish_txn_slot(manager, txn_id, mode)?
+
+    Ok(Transaction {
+        txn_id,
+        txn_epoch,
+        slot_id: Some(slot_idx),
+        snapshot,
+        snapshot_established,
+        mode,
         serialized_write_lock_held,
         ...
-    }
+    })
 ```
 
 **Read (both modes):**
 ```
-read_page(T, pgno) -> PageData:
+read_page(manager, T, pgno) -> PageData:
     // NOTE: SSI witnesses are emitted by semantic layers (VDBE/B-tree),
     // not by raw pager reads. See §5.6.4.3.
     if pgno in T.write_set: return T.write_set[pgno].data
+    if T.mode == Serialized && !T.snapshot_established:
+        // SQLite DEFERRED semantics: the snapshot is established at the first
+        // read (not at BEGIN). This prevents surprising "stale snapshot" behavior
+        // for transactions that began but did not observe data.
+        T.snapshot = load_consistent_snapshot(manager)
+        T.snapshot_established = true
     return resolve(pgno, T.snapshot).data
 ```
 
@@ -5939,14 +6106,38 @@ write_page(manager, T, pgno, new_data) -> Result<()>:
         // DEFERRED upgrade: if we haven't taken writer exclusion yet, take it now.
         // This preserves concurrent readers (SQLite DEFERRED behavior).
         if !T.serialized_write_lock_held:
-            manager.global_write_mutex.lock()  // exact SQLite compat (writer only)
+            acquire_serialized_writer_exclusion(manager.shm, T.txn_id)?
+            // Reader-turned-writer rule (normative): if the transaction already
+            // established a snapshot via reads and the database advanced since,
+            // the upgrade MUST fail with SQLITE_BUSY_SNAPSHOT (exact SQLite).
+            snap_now = load_consistent_snapshot(manager)
+            if T.snapshot_established && snap_now.schema_epoch != T.snapshot.schema_epoch:
+                release_serialized_writer_exclusion(manager.shm, T.txn_id)
+                return Err(SQLITE_SCHEMA)
+            if T.snapshot_established && snap_now.high != T.snapshot.high:
+                release_serialized_writer_exclusion(manager.shm, T.txn_id)
+                return Err(SQLITE_BUSY_SNAPSHOT)
+
+            // If no snapshot was established yet (no reads), writer upgrade
+            // establishes the snapshot at the latest durable tip.
+            T.snapshot = snap_now
+            T.snapshot_established = true
             T.serialized_write_lock_held = true
         // No page lock needed (mutex provides writer exclusion), but still track
         // in write_set for WAL append.
     else: // Concurrent mode
+        // Serialized-mode writers are exclusive with respect to Concurrent writers
+        // (SQLite single-writer contract; §5.8). Enforce it BEFORE acquiring any
+        // page lock so we never overlap.
+        check_serialized_writer_exclusion(manager.shm)?
+
         lock_result = page_lock_table.try_acquire(pgno, T.txn_id)
         if lock_result = AlreadyHeld(other): return Err(SQLITE_BUSY)
         T.page_locks.insert(pgno)
+        // Cross-process visibility: record that we now hold at least one page lock.
+        // This is used by Serialized writer acquisition to avoid overlapping writers.
+        if let Some(slot_id) = T.slot_id:
+            manager.shm.txn_slots[slot_id].write_set_pages.fetch_add(1, Relaxed)
 
         // NOTE: SSI witnesses are emitted by semantic layers (VDBE/B-tree) that
         // know which logical keys are being written. See §5.6.4.3.
@@ -5955,7 +6146,7 @@ write_page(manager, T, pgno, new_data) -> Result<()>:
     T.write_set.insert(pgno, PageVersion {
         pgno,
         commit_seq: 0,
-        created_by: (T.txn_id, T.txn_epoch),
+        created_by: T.txn_id,
         data: new_data,
         prev_idx: base,
     })
@@ -5979,7 +6170,7 @@ commit(manager, T) -> Result<()>:
                 T.state = Committed{commit_seq}
                 release_page_locks(T)
                 if T.serialized_write_lock_held:
-                    manager.global_write_mutex.unlock()
+                    release_serialized_writer_exclusion(manager.shm, T.txn_id)
                 return Ok(())
 
             Conflict(_pages, _seq) =>
@@ -6396,7 +6587,8 @@ WAL-index shared memory but extended for MVCC.
 #### 5.6.1 Shared-Memory Coordination Region
 
 The shared-memory file is structured as a fixed-size header followed by
-an array of TxnSlots:
+fixed-layout regions (TxnSlots, RecentlyCommittedReadersRing, PageLockTable,
+and HotWitnessIndex):
 
 ```
 SharedMemoryLayout := {
@@ -6408,7 +6600,11 @@ SharedMemoryLayout := {
                                        -- Typical: 16 processes * 16 concurrent queries = 256 slots.
                                        -- Memory cost: 256 * sizeof(TxnSlot) ≈ 256 * 128B = 32KB.
                                        -- Exceeding capacity returns SQLITE_BUSY (not silent failure).
+    _align0          : u32,            -- MUST be 0. Padding to ensure 8-byte alignment for AtomicU64 fields.
     next_txn_id      : AtomicU64,      -- global TxnId counter (allocated via CAS loop; §5.4)
+    snapshot_seq     : AtomicU64,      -- seqlock sequence for consistent snapshot capture of
+                                       -- (commit_seq, schema_epoch, ecs_epoch). Even = stable,
+                                       -- odd = writer in progress (§5.4).
     commit_seq       : AtomicU64,      -- published commit_seq high-water mark (latest DURABLE commit)
                                        -- NOTE: This is NOT a commit_seq allocator.
                                        -- Native mode: advanced by the marker sequencer only AFTER the
@@ -6418,12 +6614,29 @@ SharedMemoryLayout := {
     schema_epoch     : AtomicU64,      -- monotonic schema epoch (mirror of RootManifest.schema_epoch)
     ecs_epoch        : AtomicU64,      -- monotonic ECS coordination epoch (mirror of RootManifest.ecs_epoch)
     gc_horizon       : AtomicU64,      -- safe GC horizon commit_seq (min active begin_seq) across all processes
+    // Serialized-mode writer exclusion indicator (cross-process; §5.8).
+    //
+    // A Serialized writer MUST set this indicator only after it has acquired
+    // the global writer exclusion mechanism for the active mode:
+    // - Compatibility mode: after acquiring the legacy writer exclusion (WAL_WRITE_LOCK or equivalent).
+    // - Native mode: after acquiring the coordinator-mediated serialized writer exclusion.
+    //
+    // Concurrent-mode writers MUST check this indicator before acquiring page
+    // write locks. This prevents a Serialized writer from bypassing page-level
+    // exclusion and violating INV-7 (§5.8).
+    serialized_writer_token      : AtomicU64,  -- 0 = no serialized writer; else unique token (recommended: TxnId)
+    serialized_writer_pid        : AtomicU32,  -- owning process id (best-effort; for liveness cleanup only)
+    serialized_writer_pid_birth  : AtomicU64,  -- process "birth" id (defends against PID reuse; §5.6.2)
+    serialized_writer_lease_expiry: AtomicU64, -- unix timestamp (seconds); 0 if token==0
     lock_table_offset: u64,            -- byte offset to PageLockTable region
     witness_offset   : u64,            -- byte offset to SSI witness plane (HotWitnessIndex)
     txn_slot_offset  : u64,            -- byte offset to TxnSlot array
+    committed_readers_offset: u64,     -- byte offset to RecentlyCommittedReadersRing region (§5.6.2.1)
+    committed_readers_bytes : u64,     -- reserved bytes for the ring (fixed per layout version)
     checksum         : u64,            -- xxhash3 of header fields
     _padding         : [u8; 64],       -- align to cache line
     // --- TxnSlot array follows at txn_slot_offset ---
+    // --- RecentlyCommittedReadersRing follows at committed_readers_offset ---
     // --- PageLockTable region follows at lock_table_offset ---
     // --- SSI witness plane follows at witness_offset ---
 }
@@ -6433,12 +6646,26 @@ The shared-memory file is created on first access and mapped by every
 process that opens the database. All fields after the header use atomic
 operations.
 
+**Alignment requirement (normative):** Every `AtomicU64` field in the mapped
+shared-memory region MUST be naturally aligned (8-byte alignment). The layout
+above includes explicit padding (`_align0`) so that `next_txn_id` and subsequent
+64-bit atomics are aligned even though earlier fields are `u32`. Implementations
+MUST NOT assume the compiler will insert padding in a byte-specified shared
+memory layout.
+
 **Memory ordering (normative):**
 - `commit_seq` stores MUST use `Release` ordering at the commit publication
   point; `commit_seq` loads for snapshot capture MUST use `Acquire` ordering.
 - `schema_epoch` stores MUST use `Release` ordering at the schema-change
   publication point; `schema_epoch` loads for snapshot capture MUST use `Acquire`
   ordering.
+- `snapshot_seq` implements a seqlock for snapshot capture (§5.4). Writers MUST
+  increment it to an odd value before publishing any of
+  `(schema_epoch, ecs_epoch, commit_seq)` and MUST increment it again (back to
+  even) after. Snapshot capture MUST retry if `snapshot_seq` changes or is odd.
+- `serialized_writer_token` stores MUST use `Release` ordering at the Serialized
+  writer acquisition point; Concurrent-mode checks MUST load it with `Acquire`
+  ordering (§5.8).
 - **DDL publication ordering (normative):** If a commit advances `schema_epoch`,
   the coordinator MUST store the new `schema_epoch` (Release) **before**
   publishing the corresponding `commit_seq` (Release). This ensures that any
@@ -6447,6 +6674,43 @@ operations.
 - Other fields MAY use `SeqCst` when simplicity is worth the cost; otherwise
   use `Acquire/Release` where required by invariants and `Relaxed` only for
   diagnostics counters.
+
+**Snapshot seqlock writer protocol (normative):**
+
+`snapshot_seq` is a seqlock sequence counter. The system has a single writer of
+the snapshot backbone fields (`commit_seq`, `schema_epoch`, `ecs_epoch`): the
+coordinator/sequencer in its commit publication section.
+
+Because processes can crash, the writer MUST be robust to seeing an odd
+`snapshot_seq` (stale "writer in progress" marker). It MUST use a CAS protocol
+that always transitions **even -> odd -> even** around publication and repairs
+stale odd values when it is the active coordinator:
+
+```
+begin_snapshot_publish(shm):
+  loop:
+    s = shm.snapshot_seq.load(Acquire)
+    if (s & 1) == 1:
+      // stale in-progress marker from a crashed coordinator; repair to even
+      // before starting a new publication.
+      if shm.snapshot_seq.CAS(s, s + 1, AcqRel, Acquire):
+        continue
+      else:
+        continue
+    // s is even; claim writer-in-progress by flipping to odd.
+    if shm.snapshot_seq.CAS(s, s + 1, AcqRel, Acquire):
+      return
+
+end_snapshot_publish(shm):
+  // odd -> even
+  shm.snapshot_seq.fetch_add(1, Release)
+```
+
+During the publish window (after `begin_snapshot_publish` and before
+`end_snapshot_publish`), the coordinator MUST store updated values for
+`schema_epoch`/`ecs_epoch` (if changed) and `commit_seq` with `Release` ordering,
+then call `end_snapshot_publish`. Readers MUST use the retry algorithm in
+`load_consistent_snapshot()` (§5.4).
 
 **Initialization and reconciliation (normative):**
 - On database open, implementations MUST set `shm.commit_seq` to the current
@@ -6472,12 +6736,27 @@ operations.
 - If the shared-memory file already exists, implementations MUST also reconcile
   `shm.schema_epoch` against the durable schema epoch and MUST NOT allow it to
   remain ahead of durable reality (mixed-schema snapshots are forbidden).
+- **Seqlock crash repair (normative):** If `shm.snapshot_seq` is observed to be
+  odd for more than a short bounded wait (e.g., 1ms), an opener that is capable
+  of establishing the coordinator/sequencer role MUST treat this as a crashed
+  coordinator that died mid-publication. It MUST repair by:
+  1. Running `begin_snapshot_publish(shm)`.
+  2. Writing the reconciled durable values to `schema_epoch`/`ecs_epoch` and
+     `commit_seq` with `Release` stores (per the publication ordering rules).
+  3. Running `end_snapshot_publish(shm)` to return `snapshot_seq` to even.
+  This is required to prevent `BEGIN` from spinning forever in
+  `load_consistent_snapshot()` (§5.4).
 
 #### 5.6.2 TxnSlot: Per-Transaction Cross-Process State
 
 ```
 TxnSlot := {
-    txn_id          : AtomicU64,     -- 0 = slot is free
+    txn_id          : AtomicU64,     -- tagged slot-state word (NOT just a TxnId):
+                                   --   0                     => Free
+                                   --   (tag=00, payload=tid) => Active transaction tid (real TxnId)
+                                   --   (tag=01, payload=tid) => CLAIMING token (Phase 1), not yet published
+                                   --   (tag=10, payload=tid) => CLEANING token (cleanup owns slot)
+                                   -- See "TxnSlot.txn_id tagged encoding" below.
     txn_epoch       : AtomicU32,     -- increments when the slot is acquired (prevents stale slot-id interpretation)
     pid             : AtomicU32,     -- owning process ID
     pid_birth       : AtomicU64,     -- process "birth" identifier to prevent PID reuse bugs during cleanup
@@ -6498,18 +6777,49 @@ TxnSlot := {
     has_out_rw      : AtomicBool,    -- SSI: has outgoing rw-antidependency
     marked_for_abort: AtomicBool,    -- SSI: eager pivot abort signal (optimization)
     write_set_pages : AtomicU32,     -- count of pages in write set (for GC sizing)
-    claiming_timestamp: AtomicU64,   -- unix timestamp when `txn_id` entered a sentinel state:
-                                   -- Phase 1 CAS set TXN_ID_CLAIMING, or cleanup CAS set TXN_ID_CLEANING.
+    claiming_timestamp: AtomicU64,   -- unix timestamp when `txn_id` entered a sentinel state
+                                   -- (CLAIMING or CLEANING).
                                    -- Used by cleanup to detect stuck sentinel slots (§5.6.2).
-                                   -- Written AFTER the successful CAS; zeroed when slot is freed.
-    cleanup_txn_id   : AtomicU64,    -- crash-cleanup: TxnId being cleaned when txn_id==TXN_ID_CLEANING.
-                                   -- Only meaningful when txn_id==TXN_ID_CLEANING; otherwise ignored.
+                                   -- Non-zero is permitted ONLY when txn_id is a sentinel.
+                                   -- Written AFTER the successful sentinel CAS; MUST be cleared
+                                   -- (store 0) immediately after Phase 3 publish to a real TxnId
+                                   -- and again when the slot is freed.
+    cleanup_txn_id   : AtomicU64,    -- crash-cleanup: TxnId being cleaned when slot is in CLEANING state.
+                                   -- Only meaningful when txn_id is CLEANING; otherwise ignored.
                                    -- SHOULD be 0 in all other states; MUST be zeroed when slot is freed.
     _padding        : [u8; 40],      -- pad to 128 bytes (two cache lines; prevents false sharing between adjacent slots)
                                    -- Layout: 88 bytes of fields with repr(C) alignment + 40B padding = 128B total.
                                    -- Gaps: 2B after mode (witness_epoch align), 1B after marked_for_abort (write_set_pages align).
 }
 ```
+
+**TxnSlot.txn_id tagged encoding (normative, critical for correctness):**
+
+`TxnSlot.txn_id` is a single atomic state word used to prevent ABA races during
+slot acquisition/cleanup in multi-process environments. In particular, using a
+*constant* sentinel (e.g., `u64::MAX`) permits a stalled claimer to "steal" a
+later claim after cleanup; the spec forbids that.
+
+We reserve the top 2 bits of the `txn_id` word as a tag:
+
+```
+const SLOT_TAG_SHIFT     : u32 = 62;
+const SLOT_TAG_MASK      : u64 = 0b11u64 << SLOT_TAG_SHIFT;
+const SLOT_PAYLOAD_MASK  : u64 = (1u64 << SLOT_TAG_SHIFT) - 1;
+
+const TAG_CLAIMING : u64 = 0b01u64 << SLOT_TAG_SHIFT;
+const TAG_CLEANING : u64 = 0b10u64 << SLOT_TAG_SHIFT;
+
+encode_claiming(tid: TxnId) -> u64 = TAG_CLAIMING | tid
+encode_cleaning(tid: TxnId) -> u64 = TAG_CLEANING | tid
+
+decode_tag(word: u64) -> u64 = word & SLOT_TAG_MASK
+decode_payload(word: u64) -> u64 = word & SLOT_PAYLOAD_MASK
+```
+
+**TxnId domain constraint (normative):** Real TxnIds MUST satisfy:
+`tid != 0` and `(tid & SLOT_TAG_MASK) == 0`, i.e., `1 <= tid <= TXN_ID_MAX` where
+`TXN_ID_MAX = (1<<62)-1`.
 
 **Platform requirement (normative):** Concurrent mode relies on 64-bit atomic
 operations in shared memory (`AtomicU64` in the `FSQLSHM` header/TxnSlots). This
@@ -6521,18 +6831,18 @@ MUST be rejected (or not compiled), and only Serialized mode is supported.
 1. **Acquire (atomic, TOCTOU-safe):** Process scans TxnSlot array for a slot
    with `txn_id == 0`. The acquisition is a **three-phase protocol**:
 
-   **Phase 1 (claim):** CAS `txn_id` from 0 to a **sentinel value**
-   `TXN_ID_CLAIMING := u64::MAX`. This is an atomic claim that prevents
-   other processes from racing on the same slot. If the CAS fails, try the
-   next slot.
+   **Phase 1 (claim):** CAS `txn_id` from 0 to a **tagged claim token**
+   `claim_word = encode_claiming(real_txn_id)` (§5.6.2 tagged encoding). This
+   is an atomic claim that prevents other processes from racing on the same
+   slot. If the CAS fails, try the next slot.
 
-   **Reserved sentinels (normative):**
-   - `TXN_ID_CLAIMING := u64::MAX` means "slot is claimed but not yet published".
-   - `TXN_ID_CLEANING := u64::MAX - 1` means "cleanup owns this slot and is
-     resetting fields"; acquisitions MUST treat it as non-free. When
-     `txn_id == TXN_ID_CLEANING`, `cleanup_txn_id` records the TxnId being
-     cleaned so crash cleanup is retryable.
-   These sentinel values are never valid TxnIds.
+   **Why the claim token is required (normative):** A constant sentinel is
+   incorrect in a crash-prone multi-process environment: if a claimer stalls
+   after Phase 1, cleanup can reclaim the slot and a different process can
+   re-claim it. Without a per-claimer token, the stalled claimer can later
+   "win" Phase 3 and corrupt the new owner's slot (ABA race). Tagging the
+   claimant's TxnId into `claim_word` makes Phase 3 unstealable: the CAS must
+   match the exact token.
 
    **Phase 2 (initialize):** With the slot exclusively claimed (no other
    process can acquire it because `txn_id != 0`), initialize all fields.
@@ -6554,9 +6864,12 @@ MUST be rejected (or not compiled), and only Serialized mode is supported.
    generation (prevents reader-induced epoch livelock; §5.6.4.8).
 
    **Phase 3 (publish):** Publish the real TxnId with a CAS:
-   `CAS(txn_id, TXN_ID_CLAIMING -> real_txn_id, AcqRel, Acquire)`.
+   `CAS(txn_id, claim_word -> real_txn_id, AcqRel, Acquire)`.
    Only after this CAS succeeds is the slot visible to other processes as a
    live transaction.
+   Immediately after the CAS succeeds, the owner MUST clear
+   `claiming_timestamp` by storing 0 (Release). This prevents stale claim-time
+   timestamps from polluting the stuck-cleaner detection logic for CLEANING slots.
 
    **If the CAS fails:** Some other actor (cleanup) reclaimed the slot while
    this transaction was stalled in Phase 2. The transaction MUST abort and
@@ -6604,7 +6917,7 @@ MUST be rejected (or not compiled), and only Serialized mode is supported.
 
    **Freeing discipline (normative):** Before setting `txn_id = 0`, the owner
    MUST clear snapshot/epoch fields so a future claimer cannot transiently expose
-   stale values under `TXN_ID_CLAIMING`:
+   stale values under CLAIMING:
    - `begin_seq = 0`, `snapshot_high = 0`, `witness_epoch = 0`,
    - `cleanup_txn_id = 0` and `claiming_timestamp = 0`,
    - clear SSI flags/counters (`has_in_rw/has_out_rw/marked_for_abort/write_set_pages = 0`),
@@ -6624,14 +6937,15 @@ cleanup_orphaned_slots():
     now = unix_timestamp()
     for slot in txn_slots:
         // Snapshot txn_id ONCE per slot iteration. txn_id can change concurrently
-        // (e.g., another cleaner transitioning into TXN_ID_CLEANING). Branching on
+        // (e.g., another cleaner transitioning into CLEANING). Branching on
         // multiple unsynchronized reads can mis-handle sentinels and free a slot
         // while another cleaner is still releasing locks.
         tid = slot.txn_id.load(Acquire)
         if tid == 0:
             continue
+        tag = decode_tag(tid)
 
-        if tid == TXN_ID_CLEANING:
+        if tag == TAG_CLEANING:
             // Another process is resetting this slot. If it crashed mid-reset,
             // the slot can become permanently stuck. Treat this like CLAIMING:
             // if CLEANING persists beyond the timeout, reclaim and free.
@@ -6663,11 +6977,11 @@ cleanup_orphaned_slots():
                 slot.txn_id = 0  // Free the slot (Release ordering, LAST)
             continue
 
-        if tid == TXN_ID_CLAIMING:
+        if tag == TAG_CLAIMING:
             // Slot is being claimed by another process (Phase 1 of acquire).
             //
             // CRITICAL: If a process crashes between Phase 1 (CAS 0 ->
-            // TXN_ID_CLAIMING) and Phase 2 (write pid/lease_expiry), the
+            // CLAIMING(tag)) and Phase 2 (write pid/lease_expiry), the
             // slot's pid/pid_birth/lease_expiry fields are STALE (they
             // belong to the previous occupant, or are zero for a fresh slot).
             // We MUST NOT rely on those fields for CLAIMING-state cleanup.
@@ -6685,12 +6999,13 @@ cleanup_orphaned_slots():
             if now - slot.claiming_timestamp > CLAIMING_TIMEOUT_SECS:
                 // Transition to CLEANING before clearing fields so we do not race
                 // with a new claimer that could otherwise observe/clobber state.
-                if slot.txn_id.CAS(TXN_ID_CLAIMING, TXN_ID_CLEANING):
+                tok = decode_payload(tid)
+                if slot.txn_id.CAS(tid, encode_cleaning(tok)):
                     // Entered CLEANING; stamp the sentinel-time so other cleaners
                     // do not treat this slot as "stuck CLEANING" immediately.
                     slot.claiming_timestamp = now
                     // Clear snapshot/epoch fields as well: a future claimer must not
-                    // observe stale begin_seq/witness_epoch under TXN_ID_CLAIMING (§5.6.5, §5.6.4.8).
+                    // observe stale begin_seq/witness_epoch under CLAIMING (§5.6.5, §5.6.4.8).
                     slot.state = Free
                     slot.mode = Serialized
                     slot.commit_seq = 0
@@ -6718,11 +7033,11 @@ cleanup_orphaned_slots():
                 // Process crashed. Abort its transaction.
                 //
                 // ATOMICITY: record the old TxnId for retryable cleanup, then
-                // CAS txn_id to TXN_ID_CLEANING so only one cleaner proceeds.
+                // CAS txn_id to CLEANING so only one cleaner proceeds.
                 // If CAS fails, another process already claimed cleanup — skip it.
                 old_txn_id = tid
                 slot.cleanup_txn_id = old_txn_id  // MUST happen before sentinel overwrite (crash-safety)
-                if !slot.txn_id.CAS(old_txn_id, TXN_ID_CLEANING):
+                if !slot.txn_id.CAS(old_txn_id, encode_cleaning(old_txn_id)):
                     continue  // someone else is cleaning this slot (or slot changed)
                 // Entered CLEANING; stamp the sentinel-time unconditionally. This
                 // must overwrite any old "claim" timestamp left over from slot acquire.
@@ -6753,16 +7068,19 @@ actor can extend the timeout window by overwriting a previously-seeded value:
 
 ```
 // Phase 1: claim the slot
-if !slot.txn_id.CAS(0, TXN_ID_CLAIMING):
+claim_word = encode_claiming(real_txn_id)
+if !slot.txn_id.CAS(0, claim_word):
     continue  // slot taken by another process
 // CAS succeeded — we exclusively own this slot now.
 // Seed the timeout clock without overwriting a cleanup-seeded timestamp.
 slot.claiming_timestamp.CAS(0, unix_timestamp())
 // Phase 2: initialize fields (pid, pid_birth, lease_expiry, etc.)
 // Phase 3: publish real TxnId (CAS, do not store)
-if !slot.txn_id.CAS(TXN_ID_CLAIMING, real_txn_id):
+if !slot.txn_id.CAS(claim_word, real_txn_id):
     // Cleanup reclaimed the slot while we were stalled. Abort and retry acquire.
     restart_slot_acquire()
+// Publish succeeded: the slot is now a live transaction. Clear sentinel timestamp.
+slot.claiming_timestamp.store(0, Release)
 ```
 
 **Rationale:** Writing `claiming_timestamp` before the CAS is a race: if the
@@ -6814,11 +7132,83 @@ CommittedReaderEntry := {
     begin_seq   : CommitSeq,           -- snapshot.high at BEGIN
     commit_seq  : CommitSeq,           -- assigned at commit
     has_in_rw   : bool,                -- SSI incoming flag at commit time
-    read_witness_summary : WitnessPageSet,  -- pages (or witness keys) read by this txn
+    read_witness_summary : WitnessPageBitmap,  -- pages (or witness keys) read by this txn
 }
 
-WitnessPageSet := RoaringBitmap<u32>   -- page numbers; sound superset of keys read
+WitnessPageBitmap := RoaringBitmap<u32>   -- page numbers; sound superset of keys read (in-process representation)
 ```
+
+**Shared-memory representation (normative):**
+
+In multi-process deployments, `RecentlyCommittedReadersIndex` MUST be backed by
+a fixed-layout ring buffer inside `foo.db.fsqlite-shm` at
+`SharedMemoryLayout.committed_readers_offset`. This is required for cross-process
+interoperability: a `RoaringBitmap` is not a stable in-SHM binary format.
+
+The SHM ring stores a **bounded, no-false-negative** summary of pages read by
+recently committed transactions. It is permitted to have false positives (it
+may cause extra candidate edges and aborts), but it MUST NOT have false
+negatives unless the committer aborts (overflow policy below).
+
+```
+RecentlyCommittedReadersRing := {
+    capacity  : u32,         -- number of entries (power-of-2)
+    entry_len : u32,         -- bytes per entry (for versioning sanity checks)
+    head      : AtomicU64,   -- next logical index to write (monotonic)
+    tail      : AtomicU64,   -- first unpruned logical index (monotonic)
+    _padding  : [u8; 48],    -- align to cache line
+    entries   : [CommittedReaderShmEntry; capacity],
+}
+
+CommittedReaderShmEntry := {
+    commit_seq : AtomicU64,        -- publication word: 0 = empty/unpublished
+    txn_id     : AtomicU64,        -- TxnId of the committed reader
+    begin_seq  : AtomicU64,        -- reader's snapshot.high at BEGIN
+    flags      : AtomicU64,        -- bit0 = has_in_rw
+    read_pages_bloom : [AtomicU64; CR_BLOOM_WORDS], -- 4096-bit Bloom filter over pgno
+    _padding   : [u8; 32],         -- pad entry to 576B (9 cache lines)
+}
+
+const CR_BLOOM_WORDS: usize = 64;  // 64 * 64 = 4096 bits
+const CR_BLOOM_K    : u32  = 3;    // number of hash probes
+```
+
+**Bloom hashing (normative):**
+
+For a page number `pgno` (u32), define:
+
+```
+h = xxh3_64("fsqlite:cr-bloom:v1" || be_u32(pgno))
+h1 = low32(h)
+h2 = high32(h) | 1   // force odd so it cycles mod 2^n
+for i in 0..CR_BLOOM_K:
+  bit = (h1 + i*h2) & (CR_BLOOM_BITS - 1)   // CR_BLOOM_BITS = 4096
+  word = bit >> 6
+  mask = 1u64 << (bit & 63)
+  bloom[word].fetch_or(mask, Relaxed)
+```
+
+Membership test uses the same derived bits and returns "maybe" only if all
+required bits are set.
+
+**Ring ownership (normative):** Appends and pruning MUST be performed inside
+the commit sequencer critical section (§5.9 / §7.11). Readers MAY scan the ring
+without locks.
+
+**Append protocol (normative, single-writer):**
+
+1. Prune: while `tail < head` and `entries[tail % capacity].commit_seq != 0` and
+   `entries[tail % capacity].commit_seq <= shm.gc_horizon`, advance `tail`.
+2. If `head - tail == capacity`, the ring is full with entries that are still
+   required for correctness. The committing transaction MUST abort with
+   `SQLITE_BUSY_SNAPSHOT` (fail closed; no false negatives).
+3. Write entry at `idx = head % capacity`:
+   - `entries[idx].commit_seq.store(0, Release)` (clear/unpublish),
+   - write `txn_id`, `begin_seq`, `flags`, and bloom words,
+   - `entries[idx].commit_seq.store(real_commit_seq, Release)` (publish).
+4. `head.store(head + 1, Release)`.
+
+Consumers MUST treat entries with `commit_seq == 0` as empty/unpublished.
 
 **Lifecycle:**
 
@@ -6849,12 +7239,11 @@ WitnessPageSet := RoaringBitmap<u32>   -- page numbers; sound superset of keys r
 
 **Cross-process (shared memory):** The index MUST be accessible to all
 processes. In multi-process deployments, it resides in the
-`foo.db.fsqlite-shm` shared memory region as a fixed-capacity circular buffer
-of `CommittedReaderEntry` records. Overflow beyond capacity forces the oldest
-entries to be pruned early; if this risks correctness (pruned entries'
-`commit_seq > min(active snapshot.high)`), the engine MUST fall back to
-aborting the committing transaction with `SQLITE_BUSY_SNAPSHOT` rather than
-allowing a potential false negative.
+`foo.db.fsqlite-shm` shared memory region as `RecentlyCommittedReadersRing`
+(above). Overflow beyond capacity forces a fail-closed policy: if inserting a
+new committed reader entry would require evicting an entry whose
+`commit_seq > shm.gc_horizon`, the committing transaction MUST abort with
+`SQLITE_BUSY_SNAPSHOT` rather than allowing a potential false negative.
 
 **Memory bound:** Under steady state with commit rate `R` and maximum
 transaction duration `D`, the index holds at most `R * D` entries (same
@@ -6872,11 +7261,20 @@ in-process sharded HashMap). It uses open addressing with linear probing:
 
 ```
 SharedPageLockTable := {
-    capacity            : u32,        -- power-of-2 (default: 65536)
-    rebuild_pid         : AtomicU32,  -- 0 = no rebuild in progress
-    rebuild_pid_birth   : AtomicU64,  -- used to defend against PID reuse
-    rebuild_lease_expiry: AtomicU64,  -- unix timestamp (seconds); same semantics as TxnSlot lease
-    rebuild_epoch       : AtomicU32,  -- increments on successful rebuild (debug + stale detection)
+    capacity            : u32,         -- power-of-2 per table (default: 1_048_576)
+                                      -- Default sizing rationale: large enough to avoid frequent churn
+                                      -- under random-update workloads, still small enough to mmap cheaply.
+                                      -- (1,048,576 entries * 16B/entry ≈ 16 MiB per table.)
+    active_table        : AtomicU32,   -- 0 or 1 (which table new acquisitions insert into)
+    draining_table      : AtomicU32,   -- 0 or 1, or NONE (= 0xFFFF_FFFF) if no draining table
+    rebuild_pid         : AtomicU32,   -- 0 = no rebuild lease held
+    rebuild_pid_birth   : AtomicU64,   -- used to defend against PID reuse
+    rebuild_lease_expiry: AtomicU64,   -- unix timestamp (seconds); same semantics as TxnSlot lease
+    rebuild_epoch       : AtomicU32,   -- increments on successful rotation+drain (debug + stale detection)
+    tables              : [LockTableInstance; 2],
+}
+
+LockTableInstance := {
     entries             : [PageLockEntry; capacity],
 }
 
@@ -6890,25 +7288,28 @@ PageLockEntry := {
 - `page_number == 0` means "empty slot".
 - `owner_txn == 0` means "not currently locked".
 - **Key stability (normative):** `page_number` MUST NOT be deleted/tombstoned as
-  part of normal `release()`. Keys are cleared only during a **lock-quiescent**
-  rebuild (§5.6.3.1), i.e., after freezing new acquisitions and draining all
-  outstanding lock holders. This avoids key-deletion races in a lock-free
+  part of normal `release()`. Keys are cleared only when a table is in the
+  **draining** role and has reached **lock-quiescence** as part of the rolling
+  rebuild protocol (§5.6.3.1). This avoids key-deletion races in a lock-free
   linear-probing table where `(page_number, owner_txn)` are separate atomics.
 
 **Acquire (linear probing with atomic insertion):**
 
-0. If the table is under rebuild (`rebuild_lease_expiry >= now` AND owner is alive),
-   `try_acquire` MUST fail **immediately** with `SQLITE_BUSY`. It MUST NOT
-   block/spin inside the lock-table implementation (deadlock freedom; §5.5
-   Theorem 1). `release` MUST continue to function during rebuild drain (see
-   §5.6.3.1).
-   **Liveness rule (normative):** If a transaction currently holds *any* page
-   locks and observes `SQLITE_BUSY` due to rebuild, it MUST abort/rollback
-   (releasing its page locks) rather than waiting, so the rebuild can drain to
-   lock-quiescence. Busy-timeout waiting, if enabled, MUST occur only when the
-   caller holds no page locks.
-1. Start at `idx = hash(page_number) & (capacity - 1)`.
-2. Probe:
+0. Snapshot table selection once (Acquire loads):
+   - `active = active_table`
+   - `draining = draining_table` (or NONE)
+   The rebuild lease MAY be held concurrently; `try_acquire` MUST NOT fail
+   solely because a rebuild is in progress. (Rolling rebuild is designed to
+   avoid stop-the-world abort storms; §5.6.3.1.)
+1. If `draining != NONE`, probe the draining table for an existing lock on
+   `page_number`:
+   - If found with `owner_txn != 0` and `owner_txn != requesting_txn_id`:
+     return `SQLITE_BUSY`.
+   - If found with `owner_txn == requesting_txn_id`: return `Ok(())`
+     (idempotent re-acquire; the txn still holds the lock from before rotation).
+   - Otherwise (not found or `owner_txn == 0`): proceed.
+2. In the **active** table, start at `idx = hash(page_number) & (capacity - 1)`.
+3. Probe:
    - If `entries[idx].page_number == page_number`:
      - CAS `owner_txn` from 0 -> requesting TxnId. On success: lock acquired.
      - On failure: return `SQLITE_BUSY`.
@@ -6931,8 +7332,13 @@ is incorrect because it would create entries with no discoverable key.
 
 **Release (key-stable, race-free):**
 
-- Locate the entry for `page_number` by probing from its hash.
-- CAS `owner_txn` from `releasing TxnId` -> 0 (Release ordering).
+- Snapshot `active_table` and `draining_table` (Acquire loads).
+- Locate the entry for `page_number` by probing in the **active** table first.
+  If not found (or found but owned by a different txn), probe the draining table
+  (if any). This is required because a transaction may have acquired locks
+  before a rotation and thus still holds them in the draining table.
+- CAS `owner_txn` from `releasing TxnId` -> 0 (Release ordering) in whichever
+  table contains the lock.
 - MUST NOT modify `page_number` during normal release. Key deletion in a
   lock-free linear-probing table with separate `(page_number, owner_txn)` atomics
   is not safe; rebuild under lock-quiescence is the only supported removal mechanism
@@ -6946,8 +7352,9 @@ Therefore crash cleanup MUST be able to release locks using only shared state:
 
 ```
 release_page_locks_for(txn_id):
-  for entry in entries:
-    entry.owner_txn.CAS(txn_id, 0)  // do not clear page_number (key-stable)
+  for table in tables:
+    for entry in table.entries:
+      entry.owner_txn.CAS(txn_id, 0)  // do not clear page_number (key-stable)
 ```
 
 This is `O(capacity)` and is acceptable because it is executed only for:
@@ -6963,8 +7370,13 @@ semantics: exclusive write locks per page, immediate failure on contention.
 
 ##### 5.6.3.1 Table Rebuild (Lease + Lock-Quiescence Barrier)
 
-The shared-memory lock table is fixed-capacity in V1; "rebuild" means "clear
-the table to empty", not "resize".
+The shared-memory lock table is fixed-capacity in V1; "rebuild" means
+**rotate + drain + clear**, not "stop the world and abort everyone".
+
+This section is intentionally explicit because a naive rebuild protocol
+(`freeze acquisitions; force lock holders to abort`) creates deterministic
+write unavailability when the working set is large. V1 MUST avoid that failure
+mode: rebuild MUST be a *rolling* maintenance operation.
 
 **Why rebuild is needed:** Because keys are not deleted during normal operation
 (§5.6.3), the number of distinct pages ever locked since the last rebuild can
@@ -6989,27 +7401,57 @@ sequencer is unavailable, but only one rebuild may be in progress.
   is dead (PID + birth mismatch; §5.6.2), another process MAY steal the lease.
 - Lease duration `T` SHOULD be short (default 5s) and renewed while rebuilding.
 
-**Protocol (normative):**
-1. Acquire rebuild lease.
-2. Freeze new acquisitions: while rebuild lease is active, `try_acquire` MUST
-   fail with `SQLITE_BUSY` (non-blocking; busy-timeout is a caller policy).
-   `release` MUST continue to function.
-   **Deadlock avoidance (normative):** If a transaction already holds one or
-   more page locks, it MUST NOT busy-wait/spin on this `SQLITE_BUSY` while
-   continuing to hold those locks. It MUST abort/retry (releasing its locks)
-   so the drain can reach lock-quiescence. Busy-timeout waiting is permitted
-   only for transactions that currently hold **zero** page locks.
-3. Drain to **lock-quiescence**: wait until there are no outstanding lock
-   holders in the PageLockTable, i.e., until:
-   - `forall entry in entries: entry.owner_txn == 0`.
-   Read-only transactions MUST NOT block rebuild: Concurrent-mode reads do not
-   touch the PageLockTable. During drain, the rebuilder SHOULD run
-   `cleanup_orphaned_slots()` so orphaned holders cannot stall the drain.
-4. Clear table: set every entry to empty (`page_number = 0`, `owner_txn = 0`).
-   This is safe because (a) new acquisitions are frozen and (b) drain observed
-   `owner_txn == 0` for all entries, so no acquire/release operation can race
-   with key clearing.
-5. Increment `rebuild_epoch` and release the lease (`rebuild_pid = 0`).
+**Rolling rebuild protocol (normative):**
+
+The `SharedPageLockTable` contains **two** physical tables. At any moment:
+- one table is **active** (new acquisitions insert keys there), and
+- at most one table is **draining** (still consulted to detect locks held before
+  rotation).
+
+Transactions MAY hold locks in either table. This is safe because:
+- `try_acquire` consults the draining table first, and
+- `release`/crash cleanup operate on both tables.
+
+1. **Acquire rebuild lease.**
+2. **Rotate (fast, non-blocking):** If `draining_table == NONE` and the active
+   table exceeds the load factor threshold, the rebuilder MUST:
+   - choose `new_active = 1 - active_table`,
+   - ensure `tables[new_active]` is empty (it MUST have been cleared by the last
+     completed rebuild; if not, wait for the clear step below),
+   - set `draining_table = active_table` (Release),
+   - set `active_table = new_active` (Release).
+
+   After this point, new acquisitions insert into the fresh table while still
+   refusing to conflict with locks held in the draining table.
+
+3. **Drain (no abort storms):** While `draining_table != NONE`, the rebuilder
+   SHOULD periodically check whether the draining table has reached
+   lock-quiescence:
+   - `forall entry in draining.entries: entry.owner_txn == 0`.
+
+   The rebuilder MUST NOT freeze acquisitions in the active table and MUST NOT
+   require other transactions to abort solely to facilitate the drain.
+   Normal `release()` calls should eventually drive the draining table to
+   quiescence. Read-only transactions MUST NOT block rebuild (they do not touch
+   the lock table).
+
+   During drain, the rebuilder SHOULD run `cleanup_orphaned_slots()` so orphaned
+   holders cannot stall quiescence.
+
+4. **Clear drained table:** Once the draining table is lock-quiescent, the
+   rebuilder MUST clear it by setting all entries to empty (`page_number = 0`,
+   `owner_txn = 0`). This is safe: because `owner_txn == 0` everywhere, clearing
+   keys cannot cause a false negative for "is a lock held?" queries.
+   Then set `draining_table = NONE` (Release).
+
+5. **Increment `rebuild_epoch`** and release the lease (`rebuild_pid = 0`).
+
+**Resource exhaustion behavior (normative):** If `draining_table != NONE` and
+the active table is also beyond its load factor threshold, new acquisitions that
+would require inserting a **new** key MAY fail with `SQLITE_BUSY` to avoid
+pathological probe chains. This is a capacity-budget signal: either the table
+capacity must be increased (operator/config), or the workload's concurrent
+working set of distinct pages is too large for the chosen shared-memory budget.
 
 **Cancellation safety:** Once drain observes lock-quiescence and clearing begins,
 the rebuild MUST run to completion (mask cancellation) so the lease is released
@@ -7037,8 +7479,9 @@ clustering degrades performance further:
 
 **Maximum load factor policy:** If `N > 0.70 * C`, new lock acquisitions
 return `SQLITE_BUSY` rather than degrading to pathological probe chains.
-With C=65536 and the 70% limit, this allows up to 45,875 distinct page numbers
-in the table before requiring rebuild. This is a capacity budget, not a limit
+With C=1,048,576 (V1 default) and the 70% limit, this allows up to 734,003
+distinct page numbers in the active table before requiring rotation/clear.
+This is a capacity budget, not a limit
 on concurrent transactions; a single transaction can touch many pages.
 
 **Alternative: Robin Hood hashing.** If Zipfian clustering proves
@@ -7347,7 +7790,7 @@ The hot plane uses **bucket epochs**:
   iff there are **no** TxnSlots with:
   - `mode == Concurrent`, and
   - `state` in {Active, Committing}, and
-  - `txn_id != 0` (including `TXN_ID_CLAIMING`; Phase 2 pins `witness_epoch` before publish), and
+  - `txn_id != 0` (including CLAIMING/CLEANING tagged `txn_id` words; Phase 2 pins `witness_epoch` before publish), and
   - `witness_epoch == old`.
   This does not require a moment of zero active transactions; it requires only
   that the *oldest* epoch has drained.
@@ -7424,19 +7867,100 @@ raise_gc_horizon():
         tid = slot.txn_id.load(Acquire)
         if tid == 0:
             continue
-        if tid == TXN_ID_CLAIMING || tid == TXN_ID_CLEANING:
+        if decode_tag(tid) != 0:
             // CRITICAL: A claiming slot may already have captured its snapshot
             // (Phase 2 initializes begin_seq/snapshot_high), but has not yet
             // published a real txn_id. Advancing gc_horizon while a slot is in
             // CLAIMING can prune versions that the soon-to-be-active transaction
-            // will require. Therefore, do not advance the horizon while ANY slot
-            // is in CLAIMING state.
+            // will require. Likewise, CLEANING indicates a slot is in-transition
+            // and must not be ignored. Therefore, treat all sentinel-tagged slots
+            // as horizon blockers.
             global_min_begin_seq = min(global_min_begin_seq, old_horizon)
             continue
         global_min_begin_seq = min(global_min_begin_seq, slot.begin_seq.load(Acquire))
     new_horizon = max(old_horizon, global_min_begin_seq)  // monotonic
     shm.gc_horizon.store(new_horizon, Release)
 ```
+
+##### 5.6.5.1 In-Process Version Pruning (Required)
+
+Advancing `shm.gc_horizon` defines **which versions are reclaimable**
+(Theorem 4), but it does not reclaim memory by itself. Each process maintains
+in-memory MVCC state (`VersionArena` + per-page chain heads + ARC cache). A
+naive "scan everything under the VersionArena write guard" GC is forbidden: it
+would create stop-the-world pauses and negate the SQLite WAL property that
+writers do not block readers for long intervals.
+
+Therefore, V1 MUST implement **incremental, touched-page-driven pruning** with
+strict work budgets.
+
+**Core idea:** Whenever a process publishes or materializes a committed version
+for a page `P`, it enqueues `P` into a per-process `GcTodo` queue. GC work is
+performed by popping pages from this queue and pruning only those pages' local
+in-memory version chains.
+
+```
+GcTodo := {
+  queue    : VecDeque<PageNumber>,
+  in_queue : HashSet<PageNumber>,  // prevents unbounded duplicates
+}
+
+on_publish_or_materialize_version(pgno):
+  if !in_queue.contains(pgno):
+    in_queue.insert(pgno)
+    queue.push_back(pgno)
+
+gc_tick():
+  horizon = shm.gc_horizon.load(Acquire)
+  // Work budgets (normative): bound worst-case pause time.
+  pages_budget = 64
+  versions_budget = 4096
+
+  lock VersionArena.write()
+  while pages_budget > 0 AND versions_budget > 0 AND !queue.is_empty():
+    pgno = queue.pop_front()
+    in_queue.remove(pgno)
+    reclaimed = prune_page_chain(pgno, horizon)  // returns #freed VersionIdx
+    versions_budget -= reclaimed
+    pages_budget -= 1
+  unlock
+
+prune_page_chain(pgno, horizon) -> u32:
+  // Version chains are ordered by descending commit_seq (INV-3). With only
+  // `prev_idx` links, pruning is performed from the head down; no `next_idx`
+  // field is required.
+  head = chain_heads.get(pgno)
+  if head is None: return 0
+
+  // Walk down through versions newer than the safe horizon.
+  cur = head
+  while cur is Some AND arena[cur].commit_seq > horizon:
+    cur = arena[cur].prev_idx
+
+  // If we found a committed version <= horizon, it becomes the new tail.
+  // Everything older is reclaimable by Theorem 4.
+  if cur is None: return 0
+  tail = arena[cur].prev_idx
+  arena[cur].prev_idx = None
+
+  freed = 0
+  while tail is Some:
+    next = arena[tail].prev_idx
+    free_list.push(tail)
+    tail = next
+    freed += 1
+  return freed
+```
+
+**ARC interaction (normative):** When a committed version is removed from the
+in-memory version chain, its cache entry MUST also be eligible for eviction:
+remove its `(pgno, commit_seq)` key from ARC indexes and ghost lists as needed
+to prevent memory leaks. (§6.7 coalescing + §6.6 durability boundary rules.)
+
+**I/O boundary (normative):** `prune_page_chain` is pure in-memory work. It MUST
+NOT perform any file reads. If a pruned/evicted version is later required by an
+old snapshot, `resolve()` consults the durable store and materializes it again
+(§5.2, §7.11).
 
 #### 5.6.6 Compatibility: Legacy Interop and File-Lock Fallback
 
@@ -7494,6 +8018,15 @@ to C SQLite's file-level locking protocol:
 This ensures FrankenSQLite works on any filesystem that supports advisory
 file locks, degrading gracefully from multi-writer to single-writer.
 
+**BEGIN CONCURRENT behavior (normative):** If `foo.db.fsqlite-shm` is unavailable,
+`BEGIN CONCURRENT` MUST return an error and MUST NOT silently downgrade to
+Serialized mode. (Reason: callers explicitly opted into the multi-writer MVCC/SSI
+contract; silently changing the contract makes performance and conflict behavior
+non-obvious.)
+
+Recommended: return `SQLITE_ERROR` with an extended code such as
+`SQLITE_ERROR_CONCURRENT_UNAVAILABLE`.
+
 #### 5.6.7 Compatibility Mode: Hybrid SHM Coordination Protocol
 
 **Problem statement:** Compatibility Mode (§2.4 Layer 1) produces standard
@@ -7532,23 +8065,42 @@ maintain the standard `foo.db-shm` WAL-index:
 
 3. **Maintain reader marks + reader locks.** FrankenSQLite readers MUST
    participate in SQLite's WAL reader protocol, not just its metadata:
-   - Slot claim + mark update MUST follow SQLite's lock discipline:
-     - Acquire `WAL_READ_LOCK(i)` **EXCLUSIVE** (byte `aLock[3+i]` in `foo.db-shm`; §11.10),
-       then write/update `aReadMark[i]` while holding the EXCLUSIVE lock.
-     - Downgrade to a **SHARED** `WAL_READ_LOCK(i)` for the full lifetime of the
-       snapshot, releasing it only when the snapshot ends.
+   - Slot claim + mark update MUST follow SQLite's lock discipline. A reader MUST
+     either **join** an existing read mark (SHARED fast path) or **claim+update**
+     a mark (EXCLUSIVE slow path), then hold SHARED for the snapshot lifetime:
+
+     - **Join fast path (preferred; enables >5 concurrent readers):**
+       - Let `m` be the desired read mark (the current `mxFrame` snapshot point).
+       - For some `i in 0..4`:
+         1. If `aReadMark[i] == m`, acquire `WAL_READ_LOCK(i)` in **SHARED** mode.
+         2. After acquiring SHARED, re-check `aReadMark[i] == m`. If it changed,
+            release the lock and continue searching (the slot was repurposed).
+         3. If it matches, the reader joins this mark and holds SHARED for the
+            snapshot lifetime.
+
+     - **Claim+update slow path (only when no joinable mark exists):**
+       - For some `i in 0..4`:
+         1. Acquire `WAL_READ_LOCK(i)` in **EXCLUSIVE** mode (byte `aLock[3+i]` in
+            `foo.db-shm`; §11.10).
+         2. Write/update `aReadMark[i] = m` while holding EXCLUSIVE.
+         3. Downgrade to **SHARED** `WAL_READ_LOCK(i)` for the full snapshot
+            lifetime, releasing it only when the snapshot ends.
+
      This matches SQLite's invariants: the lock (not just the mark value) is what
-     legacy checkpointers consult to decide which marks are live.
+     legacy checkpointers consult to decide which marks are live, and EXCLUSIVE
+     is required only when mutating `aReadMark[i]`.
    This is non-negotiable: legacy checkpointers consult the read locks to decide
    which `aReadMark` entries are live. Updating `aReadMark` without holding the
    matching `WAL_READ_LOCK(i)` can cause overwritten frames and silent corruption.
-   If no `WAL_READ_LOCK(i)` slot is available (cannot obtain EXCLUSIVE on any
-   slot that would be required for the snapshot), the reader MUST return
-   `SQLITE_BUSY` (or wait per busy-timeout).
+   If no `WAL_READ_LOCK(i)` slot is available (cannot obtain SHARED on any
+   joinable mark and cannot obtain EXCLUSIVE on any slot to claim a new mark),
+   the reader MUST return `SQLITE_BUSY` (or wait per busy-timeout).
 
    **Interop limitation (explicit):** The legacy WAL-index format provides only
-   5 reader marks/locks (`aReadMark[0..4]`). This bounds the number of distinct
-   concurrently-active WAL snapshots that can be represented to legacy tooling.
+   5 reader marks/locks (`aReadMark[0..4]`). This bounds the number of **distinct**
+   concurrently-active WAL snapshots (read marks) that can be represented to
+   legacy tooling; it does NOT bound the total number of readers, because many
+   readers can share a mark via SHARED `WAL_READ_LOCK(i)`.
    FrankenSQLite's "hundreds of readers" story applies to Native mode and to
    non-legacy coordination; Compatibility mode inherits this legacy constraint.
 
@@ -8372,6 +8924,43 @@ when a Serialized transaction acquires writer exclusion (at `BEGIN IMMEDIATE /
 EXCLUSIVE` or at DEFERRED upgrade on first write) and is cleared at commit/abort.
 Concurrent-mode write paths MUST check this indicator before acquiring page locks.
 
+**Indicator check algorithm (normative):**
+
+```
+check_serialized_writer_exclusion() -> Result<()>:
+  tok = shm.serialized_writer_token.load(Acquire)
+  if tok == 0:
+    return Ok(())
+
+  expiry = shm.serialized_writer_lease_expiry.load(Relaxed)
+  pid = shm.serialized_writer_pid.load(Relaxed)
+  birth = shm.serialized_writer_pid_birth.load(Relaxed)
+
+  if expiry >= unix_timestamp() && process_alive(pid, birth):
+    return Err(SQLITE_BUSY)   // a serialized writer is active
+
+  // Stale indicator: lease expired or owner is dead. Best-effort clear.
+  if shm.serialized_writer_token.CAS(tok, 0):
+    shm.serialized_writer_pid.store(0, Relaxed)
+    shm.serialized_writer_pid_birth.store(0, Relaxed)
+    shm.serialized_writer_lease_expiry.store(0, Relaxed)
+  return Ok(())
+```
+
+**Serialized writer acquisition ordering (normative):**
+
+1. Acquire the mode's global serialized writer exclusion (Compatibility mode:
+   legacy writer exclusion lock; Native mode: coordinator-mediated serialized
+   writer mutex).
+2. Publish the shared indicator (`serialized_writer_token != 0`) with `Release`
+   ordering.
+3. Drain concurrent writers: wait until there are no outstanding page locks
+   held by Concurrent-mode transactions (scan both lock tables; §5.6.3). This
+   ensures the Serialized writer does not race with in-flight concurrent writers.
+4. Perform writes.
+5. On commit/abort, clear the indicator (CAS token -> 0) and release the global
+   exclusion.
+
 This design avoids a correctness pitfall where a Serialized writer could modify
 pages without participating in page-level exclusion, which would undermine
 First-Committer-Wins and make conflict behavior timing-dependent.
@@ -8938,7 +9527,9 @@ concurrent writers (and across processes when shared-memory MVCC is enabled).
   AUTOINCREMENT state by updating `sqlite_sequence` to at least the maximum rowid
   actually inserted by that transaction. This update is mergeable because it is
   a monotone max (encode as an `UpdateExpression` on the `sqlite_sequence` row:
-  `seq = max(seq, inserted_rowid)` using the *scalar* `max(a,b)` function).
+  `seq = max(seq, inserted_rowid)` using the *scalar* `max(a,b)` function), and
+  V1 SAFE merge explicitly recognizes this as a **join update** that commutes
+  across concurrent transactions (§5.10.7).
 
 **Bump-on-explicit-rowid (required):** If a statement inserts an explicit rowid
 (or explicit INTEGER PRIMARY KEY alias value) `r`, the engine MUST ensure the
@@ -8949,6 +9540,13 @@ explicit/implicit inserts.
 **Range reservation (recommended):** To avoid an atomic op per row, connections
 SHOULD reserve small RowId ranges from the allocator (e.g., 32 or 64 at a time)
 and allocate locally within the range; unused values may be discarded on abort.
+
+**MAX_ROWID saturation (V1 rule):** The allocator MUST NOT allocate a RowId
+greater than SQLite's `MAX_ROWID` (`2^63-1`). In `BEGIN CONCURRENT`, if the
+allocator would exceed `MAX_ROWID`, the statement MUST fail with `SQLITE_FULL`
+(RowId space exhausted). This is a deliberate consequence of monotone allocation
+in Concurrent mode. Layer 1 / Serialized mode retains C SQLite's `OP_NewRowid`
+behavior (including the random-rowid fallback when `max(rowid) == MAX_ROWID`).
 
 **Expression safety analysis (normative):**
 
@@ -9306,6 +9904,34 @@ iff their `column_updates` sets are disjoint by `ColumnIdx`:
 where `columns_written(x) := { col_idx | (col_idx, _) in x.column_updates }`.
 If any column index overlaps, the ops are NOT independent (the writes conflict
 on a sub-row granularity) and the merge MUST reject for that pair.
+
+**Join-update exception (normative; required for AUTOINCREMENT):** Some
+overlapping column updates still commute by algebra (not by disjointness). V1
+permits exactly one overlapping-write class in SAFE merges: **monotone join
+updates** of the form `col = max(col, c)` on INTEGER values, used for the
+`sqlite_sequence.seq` "highest ever" rule.
+
+Define `is_join_max_int_update(col_idx, expr)` to be true iff `expr` is in one
+of these canonical forms:
+
+- `FunctionCall { name: "MAX", args: [ColumnRef(col_idx), Literal(Integer(c))] }`
+- `FunctionCall { name: "MAX", args: [Literal(Integer(c)), ColumnRef(col_idx)] }`
+
+where `c` is a statement-time constant (e.g., the transaction's maximum inserted
+rowid for that table), and the function name is canonical uppercase per §5.10.1.
+
+Two `UpdateExpression` ops `a, b` that target the same `(table, key)` are
+independent even with overlapping `ColumnIdx` sets iff:
+
+- for every overlapping `col_idx` in `columns_written(a) ∩ columns_written(b)`,
+  both updates on that column satisfy `is_join_max_int_update(col_idx, ...)`.
+
+**Deterministic normalization (required):** When the merge certificate normal
+form (§5.10.8) contains multiple join-max updates to the same `(table, key,
+col_idx)`, the engine MUST normalize them by collapsing to a single update with
+`c = max(c_1, c_2, ...)`. This is justified because `max` is associative,
+commutative, and idempotent on integers, so the collapsed update is
+observationally equivalent to any sequential application order.
 
 An `UpdateExpression` and a materialized `Update` (or `Delete`) targeting the same
 key are NEVER independent (the materialized op replaces the entire row).
@@ -14574,6 +15200,13 @@ is widely considered a source of subtle bugs. FrankenSQLite's MVCC system
 supersedes shared-cache entirely: multiple connections within a process
 share the MVCC version chains and benefit from page-level concurrency, which
 is strictly superior.
+
+**PRAGMA read_uncommitted (dirty reads).** SQLite exposes `PRAGMA read_uncommitted`
+as a (dangerous) escape hatch primarily tied to shared-cache behavior. FrankenSQLite
+does not support dirty reads: snapshots are stable (INV-5) and readers never observe
+uncommitted writes from other transactions. Setting `PRAGMA read_uncommitted=1`
+MAY be accepted for compatibility but MUST have no effect; reading the pragma MUST
+return `0`.
 
 **NOTE:** `WindowsVfs` is NOT an exclusion -- it is in-scope (listed under
 §15 for completeness of the VFS discussion). Windows file locking uses

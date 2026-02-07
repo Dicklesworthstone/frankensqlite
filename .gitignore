@@ -53,6 +53,8 @@ fuzz/artifacts/
 
 # Local analysis artifacts
 spec_review_findings.md
+ANALYSIS_OF_SPEC_DOC_DIFFS.md
+spec_evolution_data_v1.json.gz
 
 # bv (beads viewer) local config and caches
 .bv/
