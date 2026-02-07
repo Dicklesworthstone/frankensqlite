@@ -1859,8 +1859,8 @@ just like any other object.
 **Reconstruction cost bound:** Reconstructing the oldest version in a chain of
 depth `L` requires `L-1` sequential delta applications starting from the newest
 (full) version. Theorem 5 (§5.5) bounds chain length to `R * D + 1` where `R`
-is the write rate and `D` is the duration above the GC horizon; the adaptive GC
-controller (§5.6.3) targets a chain depth of ~8. This ensures delta
+is the write rate and `D` is the duration above the GC horizon; the GC
+scheduling policy (§5.6.5) targets a chain depth of ~8. This ensures delta
 reconstruction cost remains bounded and predictable.
 
 ```
@@ -6299,7 +6299,7 @@ Therefore:
 **Caveat (non-steady-state):** Theorem 5 assumes constant `R` and bounded `D`.
 Under burst workloads (high `R`) or under a policy that permits larger `D`, the
 bound grows proportionally. If version chain length exceeds the configured
-threshold, the adaptive GC controller (§5.6.3) increases GC frequency and the
+threshold, the GC scheduling policy (§5.6.5) increases GC frequency and the
 PolicyController MAY tighten `txn_max_duration` (never loosen under active
 memory pressure).
 
