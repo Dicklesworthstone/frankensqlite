@@ -84,7 +84,7 @@ Pseudocode and type definitions are normative unless explicitly labeled
 | **ARC** | Adaptive Replacement Cache. Balances recency and frequency for buffer pool eviction. |
 | **RootManifest** | Bootstrap object in ECS: maps logical database name → current committed state ObjectId. |
 | **TxnSlot** | Fixed-size shared-memory record for cross-process MVCC coordination. |
-| **WitnessKey** | The canonical key-space for SSI read/write evidence: `Page(pgno)` or finer tags like `Cell(page, tag)` and `ByteRange(page, start, len)`. |
+| **WitnessKey** | The canonical key-space for SSI read/write evidence: `Page(pgno)` or finer tags like `Cell(btree_root_pgno, tag)` and `ByteRange(page, start, len)`. |
 | **RangeKey** | Hierarchical bucket key for witness indexing: `(level, hash_prefix)` in a prefix tree over `WitnessKey` hashes. |
 | **ReadWitness** | ECS object: durable evidence of a transaction's reads over a `RangeKey` bucket (sound, no false negatives for its coverage claim). |
 | **WriteWitness** | ECS object: durable evidence of a transaction's writes over a `RangeKey` bucket (sound, no false negatives for its coverage claim). |
@@ -188,12 +188,11 @@ model rather than a silent corruption or a "panic and pray" failure mode.
 - **`unsafe_code = "forbid"`** -- no escape hatches
 - **Clippy pedantic + nursery at deny level** -- with specific documented allows
 - **23 crates** in workspace under `crates/`
-- **Release profile** (as configured in the workspace `Cargo.toml`): `opt-level = "z"`,
+- **Release profile** (as configured in the workspace `Cargo.toml`): `opt-level = 3`,
   `lto = true`, `codegen-units = 1`, `panic = "abort"`, `strip = true`
-  (We ship a lean binary by default. For throughput characterization and hot-path
-  tuning, use benchmark builds and profiling gates in §22; those run under
-  optimized benchmarking configurations rather than the size-optimized shipping
-  profile.)
+  (A database engine requires full throughput optimization, not size optimization.
+  `opt-level = 3` enables aggressive inlining, loop unrolling, and vectorization
+  critical for page checksumming, B-tree traversal, and RaptorQ codec hot paths.)
 
 **Engineering & Process Constraints (from `AGENTS.md`):**
 - **User is in charge.** If the user overrides anything, follow the user.
@@ -358,7 +357,7 @@ cannot silently downgrade.
   relied on SI and experienced silent write skew.
 
 **Layer 3 (Future refinement): Reduced-abort SSI.**
-- Refine witness keys from `Page(pgno)` to `Cell(page, cell_tag)` and/or
+- Refine witness keys from `Page(pgno)` to `Cell(btree_root_pgno, cell_tag)` and/or
   `ByteRange(page, start, len)` to reduce false positive aborts on hot pages.
 - Smarter victim selection (instead of always aborting the committing pivot).
 - These are optimizations of SSI, not correctness changes.
@@ -1176,9 +1175,23 @@ WalFecGroupMeta := {
 }
 ```
 
-**Write ordering:** `.wal-fec` is written before the commit reports durable.
-If `.wal-fec` is missing/incomplete for a group, recovery degrades to SQLite:
-detect corruption and truncate at the last valid commit boundary.
+**Write ordering and semantics (normative):**
+
+- **Durable (SQLite semantics):** a commit is durable once the `.wal` frames for
+  the group (including the commit frame) are written and `fsync`'d and the
+  wal-index (`foo.db-shm`) is updated (§5.6.7 step 2).
+- **Repairable (FrankenSQLite enhancement):** a commit group becomes repairable
+  only after its `.wal-fec` `WalFecGroupMeta` + `R` repair `SymbolRecord`s are
+  appended and `fsync`'d.
+
+**Pipelined repair symbols (required):** GF(256) encoding work (RaptorQ repair
+symbols) MUST NOT occur inside the WAL write critical section. Instead, the
+coordinator MUST acknowledge commit durability after Phase 1 (`.wal` fsync) and
+enqueue a background job that generates and appends `.wal-fec` repair symbols
+for the just-committed group. If the process crashes before the `.wal-fec` job
+completes, the commit remains valid (durable) but may be temporarily
+non-repairable until catch-up regenerates repair symbols deterministically from
+the `.wal` frames.
 
 **Worked Example: Commit of 5 Pages with 2 Repair Symbols**
 
@@ -1190,15 +1203,15 @@ Transaction writes pages 7, 12, 45, 100, 203. `PRAGMA raptorq_repair_symbols = 2
     - These are the K=5 source symbols.
 
 2.  **Write to `.wal-fec`:**
-    - Generate 2 repair symbols from the 5 pages.
-    - Append one `WalFecGroupMeta` record describing the group:
-        - `group_id=(salt1, salt2, end_frame_no)`
-        - `k_source=5`, `r_repair=2`
-        - `page_numbers=[7, 12, 45, 100, 203]`
-    - Append two ECS `SymbolRecord`s (Section 3.5.2) for repair ESIs 5 and 6.
-    - This happens *before* the `.wal` fsync.
+    - Enqueue a background FEC job for the group with `r_repair=2`.
+    - The encoder thread reads the 5 source frames from `.wal`, generates 2
+      deterministic repair symbols, and appends:
+        - one `WalFecGroupMeta` record describing the group, then
+        - two repair `SymbolRecord`s (Section 3.5.2) for repair ESIs 5 and 6.
+    - The encoder then `fsync`s `.wal-fec` to make the group repairable.
 
-3.  **Commit:** `fsync` both files.
+3.  **Commit:** `fsync` `.wal` (durable). `.wal-fec` may lag briefly; once the
+    background job completes and `fsync`s `.wal-fec`, the group is repairable.
 
 **Recovery Algorithm (Compatibility Mode)**
 
@@ -1880,7 +1893,10 @@ min_{G,R} [ P_loss(G,R,p) * L_loss + (R/G) * L_overhead ]
 ```
 
 where `P_loss(G,R,p) = sum_{i=R+1}^{G+R} C(G+R,i) * p^i * (1-p)^(G+R-i)`
-(Durability Bound theorem, Section 23), `p = 10^-4` (sector corruption rate),
+(Durability Bound theorem, Section 23). For design-time calculation we use a
+representative sector corruption design point `p_design = 10^-4`; at runtime,
+the durability autopilot maintains living estimates and conservative bounds for
+`p` (§3.5.12) and MAY harden by increasing redundancy.
 `L_loss = 10^9` (data loss cost in arbitrary units), `L_overhead = 1` per
 1% space overhead.
 
@@ -2939,6 +2955,46 @@ sym_corruption.observe(record_is_corrupt as u8);
 **Rule:** Monitoring MUST be separated from the hot path: observations are
 batched and recorded as part of decode/verification bookkeeping, not as an
 unbounded per-record logging stream.
+
+###### 3.5.12.2.1 Living Corruption-Rate Estimates (Bayes + Anytime-Valid Bounds)
+
+The e-process provides an anytime-valid *budget test* ("is p <= p0 still
+plausible?"). Separately, the system SHOULD maintain a living estimate of `p`
+for explainability and for decision-theoretic policy tuning (§4.17).
+
+**Bayesian posterior (recommended, explainability):**
+
+For each object class and storage tier, maintain bounded counters:
+- `n_ok`: count of verified-clean symbol records (`X=0`)
+- `n_bad`: count of corrupt symbol records (`X=1`)
+
+Assume a Beta prior `p ~ Beta(α0, β0)` (conjugate to Bernoulli). The posterior is:
+
+```
+p | data ~ Beta(α0 + n_bad, β0 + n_ok)
+E[p | data] = (α0 + n_bad) / (α0 + β0 + n_ok + n_bad)
+```
+
+This posterior MUST be surfaced for diagnostics (PRAGMA / evidence ledger) as:
+- posterior mean `E[p|data]`
+- an upper credible bound `p_cred_hi` (e.g., 99.9% quantile)
+
+**Anytime-valid conservative bound (required for safety decisions):**
+
+For safety-critical actions (reducing redundancy, relaxing repair budgets, or
+reporting a "durability bound" as a guarantee), the engine MUST use an
+anytime-valid conservative bound `p_upper` that remains correct under optional
+stopping.
+
+One valid construction is to derive `p_upper` by inverting an e-process into a
+confidence sequence (martingale inversion).
+
+**Important:** Bayesian credible bounds are not anytime-valid under optional
+stopping; they MUST be treated as diagnostics only and MUST NOT be used as
+formal guarantees for safety-critical policy decisions.
+
+**Rule:** `PolicyController` MAY use the Bayesian posterior for expected-loss
+ranking, but it MUST treat e-process budgets as hard guardrails (§4.17).
 
 ##### 3.5.12.3 Autopilot Policy (Raise Redundancy, Repair Hardening)
 
@@ -4509,6 +4565,30 @@ pre-defined safe envelope.
   merge accept/reject counts, etc. (All telemetry is advisory; correctness never
   depends on it.)
 
+**Monitoring is also a policy (VOI budgeting, recommended):**
+
+Some measurements are cheap (counters, lightweight histograms). Others are
+expensive and must be budgeted (integrity sweeps, row-level replay to classify
+SSI false positives, deep B-tree invariant audits).
+
+The controller SHOULD schedule *optional* monitors by Value of Information
+(VOI), under explicit CPU/I/O budgets:
+
+```
+VOI(m) = E[ ΔLoss(m) | evidence ] - Cost(m)
+```
+
+Correctness-critical monitors (durability budgets, MVCC invariants) have
+effectively infinite VOI and MUST remain always-on; VOI only gates additional,
+diagnostic, or high-cost measurements.
+
+**Typical knobs (non-exhaustive):**
+- redundancy overhead / repair slack (§3.5.12),
+- group-commit batch size N (conformal; §4.5),
+- retry/backoff control (optimal stopping; §18.8),
+- transaction max duration D (memory boundedness; §5.5) and lease sizing (§5.6.2),
+- background GC/compaction scheduling (§7.13).
+
 **Decision rule (normative): expected loss minimization**
 
 For each policy knob `k`, define a finite action set `A_k` (candidate settings)
@@ -5099,11 +5179,8 @@ begin(manager, mode) -> Transaction:
 **Read (both modes):**
 ```
 read_page(T, pgno) -> PageData:
-    if T.mode == Concurrent:
-        // SSI witness-plane evidence (no SIREAD lock table).
-        key = WitnessKey::Page(pgno)
-        T.read_keys.insert(key)
-        witness_plane.register_read(key)  // hot index update; §5.6.4
+    // NOTE: SSI witnesses are emitted by semantic layers (VDBE/B-tree),
+    // not by raw pager reads. See §5.6.4.3.
     if pgno in T.write_set: return T.write_set[pgno].data
     return resolve(pgno, T.snapshot).data
 ```
@@ -5119,11 +5196,8 @@ write_page(T, pgno, new_data) -> Result<()>:
         if lock_result = AlreadyHeld(other): return Err(SQLITE_BUSY)
         T.page_locks.insert(pgno)
 
-        // SSI witness-plane evidence (edges are discovered at commit time via
-        // hot-index candidate discovery + refinement; §5.7).
-        key = WitnessKey::Page(pgno)
-        T.write_keys.insert(key)
-        witness_plane.register_write(key)  // hot index update; §5.6.4
+        // NOTE: SSI witnesses are emitted by semantic layers (VDBE/B-tree) that
+        // know which logical keys are being written. See §5.6.4.3.
 
     base = resolve_for_txn(pgno, T)
     T.write_set.insert(pgno, PageVersion {
@@ -5428,17 +5502,48 @@ newest version visible to the oldest active snapshot). All older versions are
 reclaimable by GC Safety (Theorem 4). Total retained versions per page:
 `R * D + 1`. QED.
 
-**Practical implication:** With `D = 5s` (max transaction duration) and
-`R = 1000 commits/s`, at most 5001 versions per page. At 4KB per version,
-this is ~20MB per hot page. In practice, most pages are not written by every
-transaction, so actual memory usage is much lower.
+**Practical implication (example numbers):** With `D = 5s` (configured maximum
+active snapshot duration; `PRAGMA fsqlite.txn_max_duration_ms`) and
+`R = 1000 commits/s`, at most 5001 versions per page. At 4KB per full-page
+version, this is ~20MB per extremely hot page. In practice:
+- most transactions touch a small subset of pages,
+- older history is stored as patches/intent logs (§5.10.6), not full images,
+- GC prunes aggressively once the horizon advances.
 
-**Caveat (non-steady-state):** Theorem 5 assumes constant `R` and `D`. Under
-burst workloads (e.g., batch import at `R = 10,000 commits/s`) or long-running
-analytics queries (`D = 30s`), the bound grows proportionally. For production
-capacity planning, use the p99.9 of observed `D` and peak `R` with a 2x safety
-margin. If version chain length exceeds the configured threshold, the adaptive
-GC controller (§5.6.3) increases GC frequency to compensate.
+**Alien-artifact correction (required):** `D` is not a "nice-to-have estimate".
+It is a contractual bound on how long the oldest active snapshot can hold the
+GC horizon back. If `D` is unbounded, memory boundedness is unprovable.
+
+Therefore:
+- The engine MUST define a configured `txn_max_duration` for Concurrent mode
+  (and any mode that retains MVCC history), and it MUST enforce it by aborting
+  transactions that exceed it.
+- The default `txn_max_duration` SHOULD be derived from survival analysis of
+  transaction durations (Kaplan-Meier with right censoring) and updated only on
+  BOCPD regime shifts, with evidence-ledger justification (§4.17).
+
+**Caveat (non-steady-state):** Theorem 5 assumes constant `R` and bounded `D`.
+Under burst workloads (high `R`) or under a policy that permits larger `D`, the
+bound grows proportionally. If version chain length exceeds the configured
+threshold, the adaptive GC controller (§5.6.3) increases GC frequency and the
+PolicyController MAY tighten `txn_max_duration` (never loosen under active
+memory pressure).
+
+**Deriving `txn_max_duration` (survival analysis, recommended):**
+
+`txn_max_duration` is a policy knob that SHOULD be derived from measured
+transaction durations, per BOCPD regime.
+
+1. Record `duration_ms = end_time - begin_time` for each completed transaction.
+2. Treat active transactions at the end of the observation window as
+   right-censored samples (they survived at least `now - begin_time`).
+3. Maintain a Kaplan-Meier estimator `S(t) = P(duration > t)` for the current
+   regime (reset on BOCPD change-point).
+4. Choose `txn_max_duration` as a high quantile of the survival function
+   (e.g., `Q_0.999`), plus a fixed safety margin; clamp to operator limits.
+
+This adapts to workloads with heavy-tailed durations without guessing a single
+global constant.
 
 ---
 
@@ -5617,15 +5722,33 @@ TxnSlot := {
    leading to incorrect cleanup decisions or stale snapshot computations.
 2. **Renew lease:** While active, process periodically updates `lease_expiry`
    to `now + LEASE_DURATION` (default: 30 seconds). This is a simple
-   atomic store. **Derivation of LEASE_DURATION:** The lease must satisfy
-   two competing constraints: (a) `LEASE > max_txn_duration` to avoid
-   prematurely expiring healthy transactions, and (b) `LEASE` should be
-   small to minimize crash recovery latency (orphaned slots are stuck for
-   up to LEASE seconds). Survival analysis of typical SQLite transaction
-   durations shows p99 < 5s for OLTP, p99 < 20s for batch operations.
-   Setting LEASE = 30s covers p99.9 of transaction durations while keeping
-   crash recovery latency acceptable. Adjustable via
-   `PRAGMA fsqlite.txn_lease_seconds`.
+   atomic store.
+
+   **Derivation of LEASE_DURATION (correctness):** The TxnSlot lease is a
+   crash-detection heartbeat, not a transaction deadline. Healthy processes
+   renew leases periodically; long transactions are safe as long as renewals
+   continue. Therefore LEASE sizing does NOT depend on transaction duration.
+
+   LEASE trades off:
+   - shorter LEASE: faster crash cleanup (orphaned slots cleared sooner)
+   - longer LEASE: lower risk of false-orphan detection during pauses
+     (scheduler stalls, stop-the-world events, overload)
+
+   **Recommended sizing (alien-artifact):**
+   - define a renewal cadence `renew_every = LEASE/3` (runtime timer; deterministic
+     in lab),
+   - measure the distribution of *renewal gaps* (time between successful
+     renewals) per BOCPD regime,
+   - set `LEASE_DURATION` to a high quantile of that gap distribution plus a
+     safety margin (e.g., p99.999 + 2s), so healthy processes do not expire.
+
+   Adjustable via `PRAGMA fsqlite.txn_lease_seconds`.
+
+   **Separately (memory boundedness):** Theorem 5 depends on a bound `D` on how
+   long the *oldest active snapshot* can remain active. This is a different
+   knob (`PRAGMA fsqlite.txn_max_duration_ms`, default derived from survival
+   analysis of transaction durations; §5.5). LEASE does not enforce `D` by
+   itself; it only enables crash cleanup.
 3. **Commit/Abort:** Set `state` to Committed or Aborted. Release page locks.
    On commit: set `commit_seq = assigned_commit_seq`. Set `txn_id` to 0 (slot is free).
    (The next acquirer increments `txn_epoch`, so stale slot references are rejected.)
@@ -5918,7 +6041,7 @@ WitnessKey =
   | Page(pgno: u32)
   | Cell(btree_root_pgno: u32, cell_tag: u32)
   | ByteRange(page: u32, start: u16, len: u16)
-  | KeyRange(index_id: u32, lo: Key, hi: Key)   // optional, advanced
+  | KeyRange(btree_root_pgno: u32, lo: Key, hi: Key)   // optional, advanced
   | Custom(namespace: u32, bytes: [u8])
 ```
 
@@ -6707,7 +6830,7 @@ SSI at page granularity is coarser than PostgreSQL's row-level SSI. This means:
 - **Less overhead:** Fewer SIREAD lock entries (one per page, not one per
   row). The witness-key set is smaller and candidate discovery is cheaper.
 - **Mitigation:** Witness refinement + merge (§5.10) can refine page-level
-  conflicts to `Cell(page, cell_tag)` and/or `ByteRange(page, start, len)`,
+  conflicts to `Cell(btree_root_pgno, cell_tag)` and/or `ByteRange(page, start, len)`,
   reducing false positives while preserving correctness.
 
 **Decision-Theoretic SSI Abort Policy (Alien-Artifact Discipline).**
@@ -6779,7 +6902,7 @@ should not depend on precise knowledge of hard-to-estimate quantities.
 **Why this matters beyond "just use the conservative rule":**
 1. It provides a formal framework for the Layer 3 refinement (Section 2.4,
    bullet 4). When cell/byte-range witness refinement is added (i.e., witnesses
-   include `Cell(page, cell_tag)` and/or `ByteRange(page, start, len)` keys),
+   include `Cell(btree_root_pgno, cell_tag)` and/or `ByteRange(page, start, len)` keys),
    `P(anomaly|evidence)` drops for same-page-different-row conflicts, and the
    decision framework naturally produces fewer aborts without changing the
    threshold.
@@ -6845,6 +6968,25 @@ assert!(coarseness_calibrator.is_conforming(current_delta),
 This provides a **distribution-free** bound on how much worse page-level
 SSI is compared to the theoretical row-level ideal, without assuming any
 particular workload distribution.
+
+**PAC-Bayes bound on page-level SSI false positives (harness methodology, recommended):**
+
+The spec must not merely claim "page-level false positives will be higher". The
+harness SHOULD produce a quantified, high-probability bound on the page-level
+false-positive rate within each BOCPD regime.
+
+Let `X_i = 1` if an SSI abort is classified as a false positive by row-level
+replay, and `X_i = 0` otherwise. Treat samples as exchangeable across lab seeds
+within a regime. Maintain a prior `P` over the false-positive probability
+`p_fp` (e.g., `Beta(α0, β0)`) and a posterior `Q` after observing `n` samples.
+
+Apply a PAC-Bayes bound to obtain an upper bound `p_fp_hi` such that, with
+probability at least `1-δ` over the lab sample draw:
+- the true regime false-positive rate satisfies `p_fp <= p_fp_hi`.
+
+This bound (and the chosen `(α0, β0, δ)`) MUST be emitted in harness reports
+alongside the e-process and conformal results, and it SHOULD gate the default
+false-positive budget for `INV-SSI-FP` when sufficient evidence is available.
 
 **Interaction with BEGIN CONCURRENT:**
 
@@ -7187,7 +7329,7 @@ section "tiny."
 States:
   Idle:       Waiting for next CommitRequest on MPSC channel.
   Validate:   Running first-committer-wins check on the request's write set.
-  WALAppend:  Writing page frames + repair symbols to WAL file.
+  WALAppend:  Writing page frames to WAL file (systematic only); enqueue FEC job.
   Publish:    Inserting versions into version store and commit record into commit log.
   Abort:      Notifying the requester of failure; cleaning up partial state.
 ```
@@ -7213,8 +7355,9 @@ pub struct CommitRequest {
     /// but coordinator may re-validate if needed).
     pub has_in_rw: bool,
     pub has_out_rw: bool,
-    /// Pre-computed RaptorQ repair symbols for the write set.
-    pub repair_symbols: Vec<RepairSymbol>,
+    /// Snapshot of the WAL FEC policy for this commit group (Section 3.4.1).
+    /// Captured at BEGIN/COMMIT time so policy changes cannot race the encoder.
+    pub wal_fec_r: u8,
     /// Oneshot channel for the coordinator's response.
     pub response_tx: oneshot::Sender<CommitResponse>,
 }
@@ -7251,12 +7394,19 @@ The coordinator processes commits sequentially. Each commit involves:
      CommitIndex hash lookup: ~50ns. Typical: W = 10 pages. Total: 10 * 50ns = 500ns.
    - Let `T_validate` denote this cost.
 
-2. **WAL append**: Write page frames + repair symbols sequentially.
-   - Cost: W frames * (24 bytes header + page_size data) + R repair frames.
+2. **WAL append (systematic)**: Write page frames sequentially to `.wal`, then
+   `fsync` (durable). Repair symbols are pipelined to a background encoder
+   thread (§3.4.1) and MUST NOT extend the WAL write critical section.
+   - Cost: W frames * (24 bytes header + page_size data).
    - Typical: 10 frames * 4120 bytes = ~40KB sequential write.
    - SSD sequential write throughput: ~2 GB/s. Time: 40KB / 2GB/s = 20us.
    - Plus fsync: ~50us on modern NVMe (group commit amortizes this).
-   - Let `T_wal` denote this cost.
+   - Let `T_wal` denote the synchronous `.wal` cost.
+
+   **Background FEC cost (out of critical path):** Generating and appending `.wal-fec`
+   repair symbols consumes CPU and sequential write bandwidth but is not included
+   in `T_commit`. The system MUST bound and monitor "repair lag" (time from durable
+   commit to repairable group) and prioritize encoder catch-up under sustained load.
 
 3. **Version publishing + commit log**: In-memory operations.
    - Cost: O(W) hash insertions. Typical: 10 * 100ns = 1us.
@@ -7421,6 +7571,9 @@ StructuralEffects := bitflags {
   DEFRAG_MOVE_CELLS  = 1 << 7,
 }
 
+// 0-based column index in the table schema (as used by the VDBE `Column` opcode).
+ColumnIdx := u16
+
 IntentOpKind ::=
   | Insert { table: TableId, key: RowId, record: Vec<u8> }
   | Delete { table: TableId, key: RowId }
@@ -7450,7 +7603,7 @@ RebaseExpr ::=
       operand: Box<RebaseExpr>,
   }
   | FunctionCall {
-      fn_id: DeterministicFnId,       // must satisfy ScalarFunction::is_deterministic() (§8.2)
+      name: String,                  // canonical uppercase; MUST be deterministic (§8.2)
       args: Vec<RebaseExpr>,
   }
   | Cast {
@@ -7535,8 +7688,8 @@ distinguishing two categories of reads:
 2. `footprint.structural == NONE` for every `IntentOp`.
 
 `UpdateExpression` ops do NOT add their implicit column reads to `footprint.reads`
-because the reads are captured in `RebaseExpr` and will be replayed. The VDBE MUST
-ensure this invariant (see codegen rules below).
+because the reads are captured in `RebaseExpr` and will be replayed. The compiler
+MUST ensure this invariant (see codegen rules below).
 
 **Rebase algorithm for `UpdateExpression` (normative):**
 
@@ -7557,6 +7710,10 @@ rebase replay:
 
 The code generator emits an `UpdateExpression` intent (instead of a materialized `Update`
 with the row read in `footprint.reads`) when ALL of:
+- The target table has no triggers (BEFORE/AFTER/INSTEAD) and no foreign-key
+  actions that would require executing additional statements. If triggers or FK
+  actions are present, the statement MUST fall back to a materialized `Update`
+  so the full statement semantics are preserved.
 - The WHERE clause resolves to a point lookup by rowid or integer primary key
   (not a range scan, not a secondary index scan with multiple candidates).
 - All SET expressions pass `expr_is_rebase_safe()` (§5.10.1): pure, deterministic,
@@ -8890,10 +9047,55 @@ proofs attached (lab/debug builds).
 Native Mode's append-only symbol logs (`ecs/symbols/*.log`) grow indefinitely.
 To reclaim storage, the system runs a **Mark-and-Compact** process.
 
-**Compaction Triggers:**
-- **Space amplification:** `total_log_size / live_data_size > 2.0` (configurable).
+**Compaction Signals (candidate triggers):**
+- **Space amplification:** `total_log_size / live_data_size` exceeds a policy
+  threshold (default: 2.0).
 - **Time interval:** `PRAGMA fsqlite.auto_compact_interval`.
-- **Manual:** `PRAGMA fsqlite.compact`.
+- **Manual:** `PRAGMA fsqlite.compact` (MUST run regardless of policy).
+
+**Policy rule (recommended):** The *timing* and *rate limiting* of background
+compaction SHOULD be selected by `PolicyController` via expected loss (§4.17),
+not by a single fixed threshold.
+
+#### 7.13.1 Workload-Adaptive Compaction Policy (MDP, Recommended)
+
+Compaction has a real opportunity cost: it consumes I/O and CPU and competes
+with foreground reads/writes. The optimal time to compact depends on the
+current workload regime (read-heavy vs write-heavy), which FrankenSQLite already
+tracks via BOCPD (§4.8).
+
+Model compaction scheduling as a finite-state Markov Decision Process (MDP):
+
+- **State:** `S = (space_amp_bucket, read_regime, write_regime, compaction_debt)`
+  - `space_amp_bucket`: discretized `total_log_size/live_data_size`
+  - `read_regime`, `write_regime`: BOCPD regime labels
+  - `compaction_debt`: whether deferred compaction work is accumulating
+- **Actions:** `A = {Defer, CompactNow(rate_limit)}` where `rate_limit` is chosen
+  from a small discrete set (e.g., {low, medium, high}).
+- **Cost:** per time step,
+
+  ```
+  Cost(S, a) =
+    w_space * space_amp
+  + w_read  * read_rate_regime * read_amp(space_amp)
+  + w_write * write_rate_regime * write_interference(a)
+  + w_cpu   * compaction_cpu(a)
+  ```
+
+  Weights `w_*` are explicit policy constants and MUST be recorded in evidence
+  ledger entries when policy is applied.
+
+- **Transition:** `space_amp` tends to increase under write-heavy regimes and
+  decrease under compaction actions; regime transitions are driven by BOCPD.
+
+**Implementation guidance (normative):**
+- Solve the MDP offline over a small discretized grid and embed the resulting
+  policy as a deterministic lookup table (no floating-point instability).
+- On BOCPD regime shifts, the controller MAY switch to a different precomputed
+  policy table and MUST emit an evidence ledger entry describing the regime
+  change and chosen action.
+- If the policy is unavailable, fall back to the default threshold signal
+  (`space_amp > 2.0`) with conservative rate limiting (graceful degradation).
 
 **Compaction Algorithm (Background Task, Crash-Safe):**
 
@@ -10949,6 +11151,16 @@ Hash table segments (32 KB each):
 **Reader marks:** Byte offsets 100-119 contain 5 reader marks (u32 each, 20 bytes total).
 Each reader mark records the WAL frame count at the time a reader began.
 This prevents checkpoint from overwriting frames still needed by active readers.
+
+**WAL-index lock slot mapping (required for Hybrid SHM interop):**
+- `aLock[0]` (byte 120) = `WAL_WRITE_LOCK` (exclusive; writer exclusion)
+- `aLock[1]` (byte 121) = `WAL_CKPT_LOCK`
+- `aLock[2]` (byte 122) = `WAL_RECOVER_LOCK`
+- `aLock[3 + i]` (bytes 123..127) = `WAL_READ_LOCK(i)` for `i in 0..4`
+
+These bytes are lockable file regions. Their *values* are not used as a
+coordination protocol; correctness depends on the OS-level locks taken on these
+byte offsets.
 
 ### 11.11 sqlite_master Table
 
@@ -13831,6 +14043,40 @@ p(k) = (1/k^s) / H(P,s)
 where H(P,s) = sum_{i=1}^{P} 1/i^s  (generalized harmonic number)
 ```
 
+#### 18.4.1 Estimating the Zipf Parameter s Online (Policy Input)
+
+The conflict model depends on the skew parameter `s`. It MUST NOT be treated as
+a magic constant. The engine SHOULD estimate `s` online from observed page
+access frequencies and feed the estimate into:
+- shard sizing for lock tables and hot indices,
+- contention predictions (abort rate expectations),
+- BOCPD regime detection for skew shifts.
+
+**Data collection (bounded, deterministic):**
+- Maintain a bounded heavy-hitters summary of page accesses (top-K pages) per
+  time window (e.g., 10 seconds), plus an "other" bucket.
+- Rank pages by observed frequency within the window (ties broken by pgno).
+
+**Estimator (recommended): discrete Zipf MLE**
+
+For ranks `k = 1..K` with counts `c_k`, let `n = Σ_k c_k`. The Zipf log-likelihood is:
+
+```
+ℓ(s) = Σ_{k=1}^{K} c_k * (-s log k - log H(K,s))
+```
+
+Solve `dℓ/ds = 0` with a bounded Newton step (few iterations; clamp `s` to
+`[0.1, 2.0]`):
+
+```
+f(s)    = - Σ c_k log k - n * (H'(K,s)/H(K,s))
+H'(K,s) = - Σ_{i=1}^{K} (log i)/i^s
+```
+
+**Regime awareness:** Run the estimator per BOCPD regime (reset counts on regime
+change). Emit `(s_hat, window_n, regime_id)` into telemetry and the evidence
+ledger when used for policy decisions.
+
 With s ~ 0.8-1.2 (typical for database workloads), the conflict probability
 increases significantly compared to the uniform model. For N concurrent
 transactions each writing W pages drawn from the Zipf distribution, the
@@ -13962,18 +14208,45 @@ achieve near-linear scaling up to ~8 writers. Beyond that, conflict rates
 grow quadratically (birthday paradox) and throughput plateaus.
 
 **Retry policy (required for completeness):**
-- Maximum retry count: configurable, default 5. After exhausting retries,
-  return `SQLITE_BUSY` to the application.
-- Backoff strategy: immediate first retry (conflict likely resolved by the
-  commit that caused it), then exponential backoff with jitter
-  (base 1ms, max 100ms) for subsequent retries.
-- Fairness: no priority inversion — retried transactions do NOT acquire
-  higher priority. If starvation is detected (same transaction aborted
-  3+ times), the next attempt acquires a brief exclusive advisory lock
-  to guarantee forward progress.
-- Transaction timeout: configurable via `PRAGMA busy_timeout`. If the
-  cumulative retry wait exceeds the timeout, return `SQLITE_BUSY`
-  without further retries.
+
+Retries are a policy problem with explicit tradeoffs: extra retries reduce
+abort rate but increase tail latency and can amplify contention. Hard-coded
+"max retries" and fixed backoff constants are brittle.
+
+**Normative model:** Retry control MUST be framed as expected-loss minimization
+under uncertainty, bounded by the caller's timeout (`PRAGMA busy_timeout`) and
+`Cx` deadline (§4.17).
+
+Define:
+- `T_budget`: remaining time budget (ms)
+- `C_try`: cost of one retry attempt (validation + potential write amplification)
+- `C_fail`: cost of surfacing `SQLITE_BUSY` to the application
+- `p_succ(t | evidence)`: probability the next attempt succeeds if we wait `t`
+  before retrying (estimated per BOCPD regime from conflict telemetry; default
+  priors allowed)
+
+The controller chooses an action `a ∈ {FailNow} ∪ {RetryAfter(t)}` minimizing:
+
+```
+E[Loss(FailNow)]         = C_fail
+E[Loss(RetryAfter(t))]   = t + C_try + (1 - p_succ(t)) * C_fail
+```
+
+The argmin yields an **optimal stopping** rule ("retry while the expected
+benefit exceeds the marginal cost"). With a Beta-Bernoulli model for success
+probability and a fixed per-attempt cost, the optimal policy corresponds to a
+Gittins-index threshold rule; implementations MAY use the index directly or a
+deterministic approximation.
+
+**Starvation / fairness (required):**
+- The controller MUST NOT grant retried transactions priority over new ones.
+- If a single transaction experiences repeated conflicts under remaining budget
+  (starvation), the controller MAY escalate by switching that transaction to a
+  brief serialized/advisory mode for progress. This is a policy action that
+  MUST be recorded in the evidence ledger.
+
+If `T_budget` is exhausted, the engine MUST stop retrying and return
+`SQLITE_BUSY` (or `SQLITE_INTERRUPT` if cancelled).
 
 ---
 
@@ -14033,7 +14306,7 @@ from spec, never translate line-by-line).
 
 | File | Purpose | Lines | What to Extract |
 |------|---------|-------|-----------------|
-| `sqliteInt.h` | Main internal header | ~19,000 | All struct definitions (Btree, BtCursor, Pager, Wal, Vdbe, Mem, Table, Index, Column, Expr, Select, etc.), all `#define` constants, all function prototypes. This is the Rosetta Stone. |
+| `sqliteInt.h` | Main internal header | 5,882 | All struct definitions (Btree, BtCursor, Pager, Wal, Vdbe, Mem, Table, Index, Column, Expr, Select, etc.), all `#define` constants, all function prototypes. This is the Rosetta Stone. |
 | `btree.c` | B-tree engine | 11,568 | Page format parsing, cell format, cursor movement algorithms (moveToChild, moveToRoot, moveToLeftmost, moveToRightmost), insert/delete with rebalancing, overflow page management, freelist operations. Focus on `balance_nonroot` (~1,200 lines) as the most complex function. |
 | `pager.c` | Page cache | 7,834 | Pager state machine (OPEN, READER, WRITER_LOCKED, WRITER_CACHEMOD, WRITER_DBMOD, WRITER_FINISHED, ERROR), journal format, hot journal detection, page reference counting, cache eviction policy. |
 | `wal.c` | WAL subsystem | 4,621 | WAL header/frame format, checksum algorithm implementation, WAL index (wal-index) hash table structure, checkpoint algorithm, the critical `WAL_WRITE_LOCK` in `sqlite3WalBeginWriteTransaction` (line numbers shift by SQLite version) that FrankenSQLite replaces with MVCC. |
@@ -14454,9 +14727,18 @@ is unrecoverable is:
 P(loss) <= sum_{i=R+1}^{K+R} C(K+R, i) * p^i * (1-p)^(K+R-i)
 ```
 
-For the V1 default (R ≈ 0.2K, p = 10^-4), this tail probability is extremely
-small for moderate K. Concrete orders of magnitude (using the leading term of
-the binomial tail):
+This bound holds for any `p`. FrankenSQLite treats `p` as a budgeted and
+monitored parameter (§3.5.12): e-processes provide anytime-valid guardrails,
+and the system maintains living estimates of `p` (Bayesian posterior for
+explainability plus a conservative `p_upper` for decisions).
+
+When the engine reports a "durability bound" as a guarantee, it MUST plug
+`p_upper` (not a point estimate) into the theorem, so the bound is conservative
+under optional stopping.
+
+Plugging in a representative design point (R ≈ 0.2K, p = 10^-4), this tail
+probability is extremely small for moderate K. Concrete orders of magnitude
+(using the leading term of the binomial tail):
 - K=4, R=1 (n=5): P(loss) ≈ C(5,2) p^2 ≈ 1e-7
 - K=16, R=4 (n=20): P(loss) ≈ C(20,5) p^5 ≈ 1.6e-16
 
@@ -14470,14 +14752,17 @@ the reconstruction: it records the specific symbol subset used and the
 decoder's intermediate state, constituting a mathematical certificate of
 correct repair.
 
-**Monitoring via e-processes:** The failure probability envelope is not merely
-a design-time calculation. At runtime, e-process monitors
-(`asupersync::lab::oracle::eprocess`) track the empirical symbol survival
-rate and compare it against the theoretical bound. If the observed corruption
-rate drifts above the budget (indicating media degradation, firmware bugs, or
-other real-world failures), the e-process alarm fires *before* data loss
-becomes possible -- an anytime-valid early warning that does not require
-waiting for a scheduled integrity sweep.
+**Monitoring via e-processes + living bounds:** The failure probability envelope
+is not merely a design-time calculation. At runtime:
+- e-process monitors track whether symbol corruption exceeds the configured
+  budget under optional stopping (§3.5.12),
+- and the system SHOULD export a "living durability estimate" per object class:
+  `(p_posterior, p_upper, P_loss(p_upper))` for the current epoch/regime.
+
+If evidence indicates `p` drifted above budget (media degradation, firmware
+bugs, correlated failures), the e-process alarm fires *before* data loss
+becomes possible, and the redundancy autopilot hardens by publishing additional
+repair symbols (§3.5.12.3).
 
 FrankenSQLite demonstrates that embedded databases need not sacrifice
 concurrency for simplicity, durability for performance, or safety for speed.
