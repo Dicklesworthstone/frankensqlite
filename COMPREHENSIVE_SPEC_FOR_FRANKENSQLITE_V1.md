@@ -4820,7 +4820,17 @@ explainable:
 - cancellation propagation (who cancelled whom, and why)
 - race/timeout/hedge winner selection (and loser drain proofs)
 - scheduler choices under deadlines/budgets (lane + tie-break)
-- commit/abort decisions (FCW conflicts, SSI pivot aborts, merge eligibility)
+- commit/abort decisions (FCW conflicts, SSI pivot aborts, merge eligibility,
+  and any retry/merge policy decisions that depend on contention telemetry)
+
+**Commit-ledger rule (normative):** If a commit/abort decision is influenced by
+contention telemetry or policy inference (rather than a pure correctness check),
+the ledger MUST include the contention state used, at minimum:
+- `regime_id` / window identifier (if any),
+- `writers_active` (or the `N` used in the model),
+- `M2_hat` / `P_eff_hat` (if used; §18.4.1),
+- `f_merge` / merge rung yields (if used; §18.7),
+- and the evaluated candidate actions with expected losses (§18.8).
 
 **Minimum ledger entry schema (normative):**
 
@@ -15183,7 +15193,7 @@ For P(conflict) > 50%, the exponent must exceed ln(2) ~ 0.693, requiring
 `N(N-1)W^2 > 1.386P`. The sqrt(P) threshold marks where conflicts become
 substantial (~35-40%), not where they first appear.
 
-### 18.4 Non-Uniform Page Access: Zipf Distribution
+### 18.4 Non-Uniform Write-Set Skew: Zipf and Beyond
 
 Real workloads are NOT uniform. However, the **conflict model is about the
 distribution of pages in write sets** (pages written at commit), not the read
