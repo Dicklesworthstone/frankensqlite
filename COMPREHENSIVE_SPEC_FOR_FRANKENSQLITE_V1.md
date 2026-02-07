@@ -4362,10 +4362,13 @@ TxnSlot := {
     txn_id          : AtomicU64,     -- 0 = slot is free
     txn_epoch       : AtomicU32,     -- increments when the slot is acquired (prevents stale slot-id interpretation)
     pid             : AtomicU32,     -- owning process ID
+    pid_birth       : AtomicU64,     -- process "birth" identifier to prevent PID reuse bugs during cleanup
+                                   -- Unix: process start time (platform-specific monotonic ticks)
+                                   -- Windows: process creation time
     lease_expiry    : AtomicU64,     -- Unix timestamp (seconds) of lease expiry
     begin_seq       : AtomicU64,     -- CommitSeq observed at BEGIN (snapshot backbone for SSI overlap)
     commit_seq      : AtomicU64,     -- CommitSeq when committed; 0 if not committed
-    snapshot_hwm    : AtomicU64,     -- snapshot high_water_mark
+    snapshot_high   : AtomicU64,     -- snapshot high commit sequence (debug/audit; equals begin_seq for commit-seq snapshots)
     state           : AtomicU8,      -- 0=Free, 1=Active, 2=Committing, 3=Committed, 4=Aborted
     mode            : AtomicU8,      -- 0=Serialized, 1=Concurrent
     has_in_rw       : AtomicBool,    -- SSI: has incoming rw-antidependency
@@ -4378,7 +4381,8 @@ TxnSlot := {
 **Slot lifecycle:**
 1. **Acquire:** Process scans TxnSlot array for a slot with `txn_id == 0`.
    CAS the `txn_id` from 0 to the new TxnId. Increment `txn_epoch`
-   (wrap permitted), set `begin_seq = shm.commit_seq.load()`, set `pid`,
+   (wrap permitted), set `begin_seq = shm.commit_seq.load()`, set `pid` and
+   `pid_birth`,
    `lease_expiry`, and `state = Active`.
 2. **Renew lease:** While active, process periodically updates `lease_expiry`
    to `now + LEASE_DURATION` (default: 30 seconds). This is a simple
@@ -4396,7 +4400,7 @@ TxnSlot := {
    (The next acquirer increments `txn_epoch`, so stale slot references are rejected.)
 
 **Lease-based crash cleanup:** If a process crashes, its TxnSlots become
-orphaned (lease expires, `pid` is no longer alive). Any process can detect
+orphaned (lease expires, and the owning process is no longer alive). Any process can detect
 this and clean up:
 
 ```
@@ -4404,8 +4408,9 @@ cleanup_orphaned_slots():
     now = unix_timestamp()
     for slot in txn_slots:
         if slot.txn_id != 0 AND slot.lease_expiry < now:
-            // Lease expired -- check if process is alive
-            if !process_alive(slot.pid):
+            // Lease expired -- check whether the owning process still exists.
+            // IMPORTANT: PID reuse is real; liveness checks MUST defend against it.
+            if !process_alive(slot.pid, slot.pid_birth):
                 // Process crashed. Abort its transaction.
                 release_page_locks_for(slot.txn_id)
                 slot.state = Aborted
@@ -4413,8 +4418,10 @@ cleanup_orphaned_slots():
                 slot.txn_id = 0    // Free the slot
 ```
 
-`process_alive(pid)` uses `kill(pid, 0)` on Unix (signal 0 checks existence
-without sending a signal). This is a standard POSIX technique.
+`process_alive(pid, pid_birth)` is platform-specific:
+- Unix: use `kill(pid, 0)` to check existence (treat `EPERM` as "alive"), AND
+  verify the process start time matches `pid_birth` (prevents PID reuse bugs).
+- Windows: check process handle liveness and creation time.
 
 #### 5.6.3 Cross-Process Page Lock Table
 
@@ -4428,17 +4435,49 @@ SharedPageLockTable := {
 }
 
 PageLockEntry := {
-    page_number : AtomicU32,         -- 0 = empty slot
+    page_number : AtomicU32,         -- 0 = empty slot, TOMBSTONE = deleted, else page number
     owner_txn   : AtomicU64,         -- TxnId that holds the exclusive lock
 }
 ```
 
-**Acquire:** Hash `page_number`, probe linearly until finding a matching
-entry or an empty slot. CAS `owner_txn` from 0 to the requesting TxnId.
-If CAS fails (another transaction holds it), return `SQLITE_BUSY`.
+**Representation notes (normative):**
+- `TOMBSTONE := 0xFFFF_FFFF` is reserved. `PageNumber` MUST NOT take this value.
+- `owner_txn == 0` means "not currently locked", but `page_number` may still be
+  occupied (either by a live key or a tombstone).
 
-**Release:** CAS `owner_txn` from owning TxnId to 0. If the slot is the
-last in a probe chain, also clear `page_number` to allow reclamation.
+**Acquire (linear probing with atomic insertion):**
+
+1. Start at `idx = hash(page_number) & (capacity - 1)`.
+2. Probe:
+   - If `entries[idx].page_number == page_number`:
+     - CAS `owner_txn` from 0 -> requesting TxnId. On success: lock acquired.
+     - On failure: return `SQLITE_BUSY`.
+   - If `entries[idx].page_number == 0` (empty):
+     - CAS `page_number` from 0 -> `page_number` to claim the slot.
+       If CAS fails, continue probing (someone else raced).
+     - Then CAS `owner_txn` from 0 -> requesting TxnId (or store, since you own
+       the slot). If this CAS fails, another process raced and won; treat as
+       `SQLITE_BUSY` (correct) and continue/retry as policy.
+   - If `entries[idx].page_number == TOMBSTONE`:
+     - Remember the first tombstone index and continue probing to ensure there
+       is no existing entry for `page_number`. When an empty slot is found (or
+       after a full probe), attempt to reuse the remembered tombstone by CAS
+       `page_number` from TOMBSTONE -> `page_number`, then claim `owner_txn`.
+   - Else: advance `idx = (idx + 1) & (capacity - 1)`.
+
+This insertion discipline is required: inserting by writing `owner_txn` alone
+is incorrect because it would create entries with no discoverable key.
+
+**Release (tombstone deletion):**
+
+- Locate the entry for `page_number` by probing from its hash.
+- CAS `owner_txn` from owning TxnId -> 0.
+- Set `page_number` to TOMBSTONE (do not clear to 0). Clearing to empty in a
+  linear-probing table can break probe chains and cause false negatives.
+
+Tombstones are reused by subsequent inserts; if tombstones accumulate and probe
+lengths degrade, the system MAY rebuild the table under a global quiescence
+point (e.g., when no Active concurrent transactions exist).
 
 This is simpler than the in-process sharded HashMap but provides the same
 semantics: exclusive write locks per page, immediate failure on contention.
@@ -4446,7 +4485,8 @@ semantics: exclusive write locks per page, immediate failure on contention.
 **Load factor analysis (Extreme Optimization Discipline):**
 
 Linear probing has expected probe length `1/(1 - alpha)` where `alpha = N/C`
-is the load factor (N = concurrent locks, C = capacity). Worst-case probe
+is the load factor (N = occupied slots including tombstones, C = capacity).
+Worst-case probe
 chain length grows as `O(log C)` with high probability for uniform hashing,
 but under Zipfian page access, primary clustering degrades performance:
 
@@ -7060,7 +7100,7 @@ must_use_candidate = { level = "allow", priority = 1 }
 option_if_let_else = { level = "allow", priority = 1 }
 
 [profile.release]
-opt-level = 3          # Max performance: inlining, vectorization, SIMD (this is a DB engine)
+opt-level = "z"        # Optimize for size (lean binary for distribution)
 lto = true             # Whole-program optimization
 codegen-units = 1      # Single codegen unit for maximum optimization
 panic = "abort"        # No unwinding overhead
