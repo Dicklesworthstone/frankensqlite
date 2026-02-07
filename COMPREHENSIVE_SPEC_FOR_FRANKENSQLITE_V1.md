@@ -4410,8 +4410,8 @@ visibility point:
 - Once durable, the commit's versions share a single `commit_seq` and become
   visible simultaneously to any snapshot with `snapshot.high >= commit_seq`.
 
-*Memory ordering constraint (normative):* The global `commit_seq` counter
-MUST be incremented with `Release` ordering AFTER all version chain updates
+*Memory ordering constraint (normative):* The published `commit_seq`
+high-water mark MUST be stored with `Release` ordering AFTER all version chain updates
 for the committing transaction are visible (i.e., version chain head pointers
 are updated with at least `Release` stores). Readers MUST load `commit_seq`
 with `Acquire` ordering before traversing version chains. This ensures that
@@ -4420,13 +4420,20 @@ corresponding version chain entries. Without this ordering, a reader could
 take a snapshot that includes `commit_seq = N` but traverse stale version
 chains that do not yet reflect commit N's versions, violating INV-6.
 
-*Cross-process note:* The Acquire/Release ordering above governs the
-in-process buffer pool. Cross-process visibility is handled by the WAL layer
-(§11.9): WAL frames are durable on disk before the WAL index (shared memory)
-is updated. A reader in another process loads the WAL index with Acquire
-semantics (via `mmap` + memory barriers or `read()`) and then reads WAL
-frames from the file, which are guaranteed to be present because the writer
-flushed them before updating the index.
+*Cross-process note:* The Acquire/Release ordering above governs the in-process
+buffer pool and the shared-memory `commit_seq` publication point (§5.6.1).
+Cross-process *data* visibility is mode-specific:
+
+- **Compatibility mode:** WAL frames are durable on disk before the WAL index
+  (shared memory) is updated (§11.9). A reader in another process loads the WAL
+  index with Acquire semantics and then reads WAL frames from the file, which
+  are guaranteed to be present because the writer flushed them before updating
+  the index.
+- **Native mode:** Referents (capsule symbols + `CommitProof`) are made durable
+  before the marker is made durable (FSYNC_1 then marker then FSYNC_2; §7.11.2).
+  After the marker is durable, the sequencer publishes `shm.commit_seq` with a
+  Release store; other processes capture snapshots via Acquire loads and can
+  safely decode the commit’s referents via the marker stream and ECS logs.
 
 *Violation consequence:* Partial visibility means a reader could see some of
 a transaction's writes but not others, observing an inconsistent state. For
@@ -5004,7 +5011,7 @@ TxnSlot := {
 
    **Phase 2 (initialize):** With the slot exclusively claimed (no other
    process can acquire it because `txn_id != 0`), initialize all fields:
-   increment `txn_epoch` (wrap permitted), set `begin_seq = shm.commit_seq.load()`,
+   increment `txn_epoch` (wrap permitted), set `begin_seq = shm.commit_seq.load(Acquire)`,
    set `pid`, `pid_birth`, `lease_expiry`, and `state = Active`.
 
    **Phase 3 (publish):** Store the real TxnId into `txn_id` with Release
@@ -5324,6 +5331,7 @@ HotWitnessBucketEntry := {
     level        : AtomicU8,      -- 0xFF = empty
     prefix       : AtomicU32,     -- packed prefix bits (interpretation depends on level)
     bucket_epoch : AtomicU32,     -- epoch of the readers/writers bitsets
+    epoch_lock   : AtomicU32,     -- 0 = unlocked; non-zero = locked (spinlock for epoch swap + clear)
     readers_bits : [AtomicU64; W],-- bit i = TxnSlotId i is a reader in this bucket epoch
     writers_bits : [AtomicU64; W],
 }
@@ -5331,10 +5339,28 @@ HotWitnessBucketEntry := {
 
 Where `W = ceil(max_txn_slots / 64)`.
 
-**Update on read/write (monotonic):**
+**Update on read/write (monotonic, race-free):**
+
 - On read of key `K` by slot `s`, set bit `s` in `readers_bits` for all
   configured levels' buckets for `K` (L0/L1/L2).
 - On write of key `K` by slot `s`, set bit `s` in `writers_bits` similarly.
+
+**Epoch discipline (required to avoid false negatives):**
+
+- Updaters MUST load `global_epoch = HotWitnessIndex.epoch` with `Acquire`.
+- Updaters MUST load `bucket_epoch` with `Acquire`.
+- If `bucket_epoch != global_epoch`, the updater MUST acquire `epoch_lock` and
+  perform the epoch swap atomically:
+  - clear all `readers_bits[*]` and `writers_bits[*]` to 0, then
+  - store `bucket_epoch = global_epoch` with `Release`, then
+  - release `epoch_lock`.
+
+The clear MUST happen-before publishing the new `bucket_epoch` (Release store),
+so that a concurrent updater that observes `bucket_epoch == global_epoch` (via
+Acquire load) cannot have its bit wiped by a delayed clear.
+
+Fast path: if `bucket_epoch == global_epoch`, no lock is needed; the updater
+sets the relevant bit using `fetch_or`.
 
 If a bucket cannot be allocated due to hot-index capacity pressure, the update
 MUST be applied to `HotWitnessIndex.overflow` for the corresponding kind
@@ -9240,6 +9266,14 @@ page size. Must be a power of 2 in the range [512, 65536].
 **FrankenSQLite version number:** At offset 96, FrankenSQLite writes 3052000
 (representing 3.52.0) to indicate compatibility with SQLite 3.52.0.
 
+**Write/read version forward compatibility (offsets 18-19):** When opening a
+database, if the read version (offset 19) exceeds the maximum version the
+library understands (currently 2 = WAL), the database MUST be refused with
+`SQLITE_CANTOPEN`. If only the write version (offset 18) exceeds the maximum,
+the database MUST be opened read-only. This mechanism allows future SQLite
+format extensions (e.g., WAL2) to prevent older libraries from corrupting
+databases they cannot fully understand.
+
 ### 11.2 B-Tree Page Layout
 
 **Page structure (top to bottom within a page):**
@@ -9486,43 +9520,9 @@ Offset  Size  Description
 ### 11.9.1 WAL Checksum Algorithm
 
 The WAL uses a custom double-accumulator checksum (NOT CRC-32, NOT xxHash).
-This is critical for implementation: without the exact algorithm, WAL frames
-cannot be validated or written.
-
-```rust
-/// Compute WAL checksum over `data` using the double-accumulator algorithm.
-/// See §7.1 for the canonical implementation and parameter semantics.
-///
-/// `big_end_cksum = (magic & 1) != 0` records whether the WAL creator machine
-/// was big-endian. Compute:
-/// `native_cksum = (big_end_cksum == cfg!(target_endian = "big"))`.
-/// When `native_cksum == 0`, BYTESWAP32 each u32 before accumulating (SQLite
-/// `walChecksumBytes(nativeCksum, ...)`).
-///
-/// The data MUST be padded to a multiple of 8 bytes (zero-padded if
-/// necessary). This function processes the data in 8-byte chunks,
-/// treating each chunk as two 32-bit unsigned integers.
-fn wal_checksum(data: &[u8], mut s0: u32, mut s1: u32, big_end_cksum: bool) -> (u32, u32) {
-    assert!(data.len() % 8 == 0, "WAL checksum data must be 8-byte aligned");
-    let native_cksum = big_end_cksum == cfg!(target_endian = "big");
-    for chunk in data.chunks_exact(8) {
-        let (d0, d1) = if native_cksum {
-            // nativeCksum=1: read u32 words in native byte order (no swap)
-            let d0 = u32::from_ne_bytes(chunk[0..4].try_into().unwrap());
-            let d1 = u32::from_ne_bytes(chunk[4..8].try_into().unwrap());
-            (d0, d1)
-        } else {
-            // nativeCksum=0: BYTESWAP32 each u32 before accumulating
-            let d0 = u32::from_ne_bytes(chunk[0..4].try_into().unwrap()).swap_bytes();
-            let d1 = u32::from_ne_bytes(chunk[4..8].try_into().unwrap()).swap_bytes();
-            (d0, d1)
-        };
-        s0 = s0.wrapping_add(d0).wrapping_add(s1);
-        s1 = s1.wrapping_add(d1).wrapping_add(s0);
-    }
-    (s0, s1)
-}
-```
+The canonical implementation is in **§7.1** (`wal_checksum()`). This section
+specifies the checksum chain — how that function is applied to the WAL header
+and frame sequence.
 
 **Checksum chain:**
 1. **WAL header checksum:** `wal_checksum(header_bytes[0..24], 0, 0, big_end_cksum)` →
@@ -9623,6 +9623,24 @@ on Unicode code points regardless of encoding.
 - Page size is set at database creation and cannot be changed except by
   `PRAGMA page_size = N; VACUUM;` (only when NOT in WAL mode) or `VACUUM INTO`
 - FrankenSQLite default: 4096 (matches modern filesystem block size and SSD page size)
+
+### 11.13.1 Lock-Byte Page (Pending Byte)
+
+For databases larger than 1 GiB, the page containing byte offset
+0x40000000 (1,073,741,824 — the POSIX advisory "pending byte") is reserved
+for file locking and MUST NOT store B-tree content. For 4096-byte pages this
+is page `(0x40000000 / 4096) + 1 = 262145`. SQLite skips this page during
+allocation (`allocateBtreePage()` in btree.c).
+
+FrankenSQLite MUST replicate this behavior:
+- Never allocate this page for B-tree storage or freelist use.
+- On `PRAGMA integrity_check`, verify this page is not referenced by any
+  B-tree pointer.
+- The exact page number depends on page size: `(0x40000000 / page_size) + 1`.
+
+This is critical for multi-process locking compatibility: if a B-tree page
+occupies the lock-byte region, concurrent readers using POSIX `fcntl()` locks
+will corrupt it.
 
 ### 11.14 Rollback Journal Format
 
