@@ -6060,12 +6060,12 @@ begin(manager, begin_kind) -> Result<Transaction>:
     // illegal values are never published.
     const TXN_ID_MAX: u64 = (1u64 << 62) - 1;
     loop:
-        raw = manager.next_txn_id.load(Acquire)
+        raw = manager.shm.next_txn_id.load(Acquire)
         candidate = raw + 1
         if candidate == 0 OR candidate > TXN_ID_MAX:
             // TxnId space exhausted or corrupted. This is fatal: TxnSlots cannot be reused safely.
             abort(FATAL_TXN_ID_OVERFLOW)
-        if manager.next_txn_id.CAS(raw, candidate, AcqRel, Acquire):
+        if manager.shm.next_txn_id.CAS(raw, candidate, AcqRel, Acquire):
             txn_id = candidate
             break
     snapshot_established = (begin_kind != Deferred)
@@ -9151,7 +9151,8 @@ still providing:
 - backpressure,
 - cancel-safety by construction (reserve/submit discipline),
 - secure bulk payload transfer via file-descriptor passing (SCM_RIGHTS),
-- and deterministic lab testing via VirtualTcp-style shims (§4.19.6).
+- and deterministic lab testing by substituting the transport with an in-process
+  harness while keeping the wire codec deterministic and fully testable (§4.19.6).
 
 **Socket endpoint (normative):**
 - The coordinator MUST listen on a per-database Unix socket path:
@@ -9184,6 +9185,9 @@ Frame := {
 ```
 
 - All frame header integers are big-endian (network byte order).
+- `len_be` MUST be `>= 12` (header-only frame with empty payload) and MUST be
+  `<= 4 MiB`. Values outside this range MUST be rejected.
+- `version_be` MUST equal `1`. Unknown versions MUST be rejected.
 - Payload encoding is **canonical** and deterministic: integers are little-endian
   unless otherwise specified by the payload schema. Variable-length arrays are
   length-prefixed with `u32` counts and elements are encoded in a fixed order.
@@ -9201,6 +9205,13 @@ Therefore coordinator IPC is **two-phase**:
 
 The coordinator MUST bound the number of outstanding permits (default 16; same
 derivation as §4.5). If the bound is exceeded, `RESERVE` returns `BUSY`.
+
+**Permit binding (normative):**
+- `permit_id` is connection-scoped. A `SUBMIT_*` MUST reference a `permit_id`
+  previously returned by `RESERVE` on the same connection, and the coordinator
+  MUST reject any `SUBMIT_*` with an unknown `permit_id`.
+- A `permit_id` is a single-use capability: it MUST be consumed by exactly one
+  successful `SUBMIT_*` request. Reusing a consumed `permit_id` MUST be rejected.
 
 **Idempotency (required for robustness):**
 - Every `SUBMIT_*` message MUST carry `txn: TxnToken`.
@@ -9231,6 +9242,16 @@ derivation as §4.5). If the bound is exceeded, `RESERVE` returns `BUSY`.
 - `RESPONSE` (all responses use this frame kind with a response payload)
 - `PING` / `PONG` (optional keepalive)
 
+**kind_be values (normative; version 1):**
+- 1: `RESERVE`
+- 2: `SUBMIT_NATIVE_PUBLISH`
+- 3: `SUBMIT_WAL_COMMIT`
+- 4: `ROWID_RESERVE`
+- 5: `RESPONSE`
+- 6: `PING`
+- 7: `PONG`
+Unknown kinds MUST be rejected.
+
 **Wire payload schemas (normative, version 1):**
 
 The payload of each frame is a canonical byte encoding. Unless a schema below
@@ -9256,10 +9277,16 @@ ReserveV1 := {
 `RESERVE` response payload (inside a `RESPONSE` frame with the same `request_id`):
 
 ```
-ReserveRespV1 :=
+ReserveRespV1 := {
+  tag  : u8,       // 0 = Ok, 1 = Busy, 2 = Err
+  pad0 : [u8; 7],  // reserved (0)
+  body : ReserveRespBodyV1,
+}
+
+ReserveRespBodyV1 :=
   | Ok   { permit_id: u64_le }
-  | Busy { retry_after_ms: u32_le }
-  | Err  { code: u32_le }  // SQLite-ish error code enum
+  | Busy { retry_after_ms: u32_le, pad1: u32_le = 0 }
+  | Err  { code: u32_le }  // SQLite-ish (primary or extended) error code
 ```
 
 `SUBMIT_NATIVE_PUBLISH` payload:
@@ -9340,7 +9367,13 @@ the coordinator MUST reject the request.
 `SUBMIT_NATIVE_PUBLISH` response payload (inside a `RESPONSE` frame):
 
 ```
-NativePublishRespV1 :=
+NativePublishRespV1 := {
+  tag  : u8,       // 0 = Ok, 1 = Conflict, 2 = Aborted, 3 = Err
+  pad0 : [u8; 7],  // reserved (0)
+  body : NativePublishBodyV1,
+}
+
+NativePublishBodyV1 :=
   | Ok {
       commit_seq       : u64_le,
       marker_object_id : ObjectId,
@@ -9357,7 +9390,13 @@ NativePublishRespV1 :=
 `SUBMIT_WAL_COMMIT` response payload (inside a `RESPONSE` frame):
 
 ```
-WalCommitRespV1 :=
+WalCommitRespV1 := {
+  tag  : u8,       // 0 = Ok, 1 = Conflict, 2 = IoError, 3 = Err
+  pad0 : [u8; 7],  // reserved (0)
+  body : WalCommitBodyV1,
+}
+
+WalCommitBodyV1 :=
   | Ok {
       wal_offset : u64_le,
       commit_seq : u64_le,
@@ -9385,8 +9424,14 @@ RowIdReserveV1 := {
 `ROWID_RESERVE` response payload:
 
 ```
-RowIdReserveRespV1 :=
-  | Ok  { start_rowid: u64_le, count: u32_le }
+RowIdReserveRespV1 := {
+  tag  : u8,       // 0 = Ok, 1 = Err
+  pad0 : [u8; 7],  // reserved (0)
+  body : RowIdReserveBodyV1,
+}
+
+RowIdReserveBodyV1 :=
+  | Ok  { start_rowid: u64_le, count: u32_le, pad1: u32_le = 0 }
   | Err { code: u32_le }
 ```
 
@@ -18060,6 +18105,6 @@ an embedded database engine can achieve.
 
 ---
 
-*Document version: 1.31 (Round 14 audit: define cross-process coordinator IPC transport via asupersync Unix domain sockets + SCM_RIGHTS fd passing; specify cancel-safe reserve/submit framing + wire payload schemas; define coordinator-owned per-table RowId allocator + `ROWID_RESERVE`; formal model `PageData` switched to page-aligned `PageBuf` (no Vec-alignment contradiction); `SpillLoc` integrity hash clarified as `xxh3_64`; lock-table rebuild liveness rule strengthened to forbid blocking commit sequencing. Round 13 audit: snapshot seqlock made normative and wired through `load_consistent_snapshot`; TxnSlot sentinel timestamp cleanup rule clarified; Serialized writer exclusion indicator wiring clarified; `SharedMemoryLayout.layout_checksum` fixed to cover immutable layout metadata only; Expression precedence duplication removed (`ESCAPE` is not an operator); Round 12 audit: Compatibility/WAL mode corrected: ARC eviction MUST NOT append to `.wal`; WAL append is coordinator-only; write-set spill to per-txn temp file specified (`CommitWriteSet::Spilled`) + `PRAGMA fsqlite.txn_write_set_mem_bytes`; Round 11 audit: ARC p-update online-learning framing added (research note; canonical ARC update remains normative); Round 10 audit: version-chain delta compression corrected: use sparse XOR deltas between adjacent page versions (RaptorQ remains the durability/repair layer for delta objects); prior rounds: forbid raw byte-disjoint XOR write merging for SQLite structured pages; specify safe merge ladder (intent-log deterministic rebase + structured patch parse/merge/repack + merge certificates); built-in function semantics audited/corrected (ceil/floor/trunc return types, NaN/Inf handling, octet_length bytes, substr negative length, COLLATE interaction, compileoption funcs); VFS trait examples corrected to include `&Cx`; risk register compaction cross-reference fixed.)*
+*Document version: 1.32 (Round 15 audit: coordinator IPC wire framing tightened (len bounds, kind mapping, permit binding); response payloads made fully canonical with explicit variant tags; BEGIN TxnId allocation corrected to read `SharedMemoryLayout.next_txn_id` in pseudocode. Round 14 audit: define cross-process coordinator IPC transport via asupersync Unix domain sockets + SCM_RIGHTS fd passing; specify cancel-safe reserve/submit framing + wire payload schemas; define coordinator-owned per-table RowId allocator + `ROWID_RESERVE`; formal model `PageData` switched to page-aligned `PageBuf` (no Vec-alignment contradiction); `SpillLoc` integrity hash clarified as `xxh3_64`; lock-table rebuild liveness rule strengthened to forbid blocking commit sequencing. Round 13 audit: snapshot seqlock made normative and wired through `load_consistent_snapshot`; TxnSlot sentinel timestamp cleanup rule clarified; Serialized writer exclusion indicator wiring clarified; `SharedMemoryLayout.layout_checksum` fixed to cover immutable layout metadata only; Expression precedence duplication removed (`ESCAPE` is not an operator); Round 12 audit: Compatibility/WAL mode corrected: ARC eviction MUST NOT append to `.wal`; WAL append is coordinator-only; write-set spill to per-txn temp file specified (`CommitWriteSet::Spilled`) + `PRAGMA fsqlite.txn_write_set_mem_bytes`; Round 11 audit: ARC p-update online-learning framing added (research note; canonical ARC update remains normative); Round 10 audit: version-chain delta compression corrected: use sparse XOR deltas between adjacent page versions (RaptorQ remains the durability/repair layer for delta objects); prior rounds: forbid raw byte-disjoint XOR write merging for SQLite structured pages; specify safe merge ladder (intent-log deterministic rebase + structured patch parse/merge/repack + merge certificates); built-in function semantics audited/corrected (ceil/floor/trunc return types, NaN/Inf handling, octet_length bytes, substr negative length, COLLATE interaction, compileoption funcs); VFS trait examples corrected to include `&Cx`; risk register compaction cross-reference fixed.)*
 *Last updated: 2026-02-07*
 *Status: Authoritative Specification*
