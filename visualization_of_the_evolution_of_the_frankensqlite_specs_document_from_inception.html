@@ -1038,7 +1038,10 @@ a71e1d95715c1190335e8738413382b31b6d167c|a71e1d9|2026-02-07T17:07:05-05:00|Dickl
 	19106d19e531ea75918241b2858024c34a73f037|19106d1|2026-02-07T18:20:51-05:00|Dicklesworthstone|spec: harden MVCC TxnSlot protocol, write_page idempotency, and SHM layout
 	7313951174e317f889851f696de264b546e4b54e|7313951|2026-02-07T18:21:25-05:00|Dicklesworthstone|spec: define wire payload schemas, RowId allocator state, and CommitRequest type
 	d329df055a1a13459d0f507bc222b05525bb7522|d329df0|2026-02-07T18:28:22-05:00|Dicklesworthstone|spec: fix snapshot seqlock + shm invariants
-	351c282e9a9a2ee118496651cef7a4b33cf309f2|351c282|2026-02-07T18:41:22-05:00|Dicklesworthstone|spec: fix TxnSlot acquire pseudocode + add spec viz wasm`;
+	351c282e9a9a2ee118496651cef7a4b33cf309f2|351c282|2026-02-07T18:41:22-05:00|Dicklesworthstone|spec: fix TxnSlot acquire pseudocode + add spec viz wasm
+	b1c1e72d9331952247c804af6589fe3b349d0b8a|b1c1e72|2026-02-07T18:58:48-05:00|Dicklesworthstone|spec: tighten coordinator IPC framing
+	e60049751d7e238e46e45ce8009d9e9f053a41c2|e600497|2026-02-07T19:15:51-05:00|Dicklesworthstone|spec: harden claiming liveness and IPC ordering
+	6d5d36a1380d3b4b4b6ddba71828825ef942975b|6d5d36a|2026-02-07T19:16:12-05:00|Dicklesworthstone|spec: update Round 16 audit notes`;
       const COMMIT_STATS_RAW = String.raw`c08f1602d03b1833a4f91c8f77347f8f196bac9d|8628|0
 f9d88aa96f50893f8531373d0734597ebae3c592|431|76
 76eef31be20a6faedc62e7fecce88e78652ebdcf|242|116
@@ -1172,7 +1175,10 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
 	19106d19e531ea75918241b2858024c34a73f037|87|21
 	7313951174e317f889851f696de264b546e4b54e|183|20
 	d329df055a1a13459d0f507bc222b05525bb7522|126|43
-	351c282e9a9a2ee118496651cef7a4b33cf309f2|50|45`;
+	351c282e9a9a2ee118496651cef7a4b33cf309f2|50|45
+	b1c1e72d9331952247c804af6589fe3b349d0b8a|56|11
+	e60049751d7e238e46e45ce8009d9e9f053a41c2|81|25
+	6d5d36a1380d3b4b4b6ddba71828825ef942975b|1|1`;
 
       // -----------------------------
       // Data: manual classification
@@ -5957,6 +5963,123 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
 	        "changed_headings": [
 	          "TxnSlot acquire protocol",
 	          "acquire_and_publish_txn_slot()"
+	        ]
+	      }
+	    ]
+	  },
+	  {
+	    "commit": "b1c1e72d9331952247c804af6589fe3b349d0b8a",
+	    "change_groups": [
+	      {
+	        "summary": "Tighten coordinator IPC framing and capability discipline: enforce len/version/kind validity, bind permit_id to a connection as a single-use capability, and make responses canonically tagged.",
+	        "categories": [
+	          4,
+	          7,
+	          1
+	        ],
+	        "primary_category": 4,
+	        "confidence": 0.78,
+	        "evidence": [
+	          "Add len_be bounds (>=12 and <=4MiB), require version_be==1, and enumerate kind_be values (unknown kinds rejected).",
+	          "Permit binding: SUBMIT_* must reference a permit_id previously returned by RESERVE on the same connection; consumed permits cannot be reused.",
+	          "Response payloads become explicit tag+padding+body wrappers (ReserveRespV1, NativePublishRespV1, WalCommitRespV1, RowIdReserveRespV1)."
+	        ],
+	        "changed_headings": [
+	          "5.9.0 Coordinator IPC Transport",
+	          "Wire payload schemas"
+	        ]
+	      },
+	      {
+	        "summary": "Fix BEGIN TxnId allocation pseudocode to use SharedMemoryLayout.next_txn_id (cross-process global), not a per-manager field.",
+	        "categories": [
+	          1,
+	          5
+	        ],
+	        "primary_category": 1,
+	        "confidence": 0.9,
+	        "evidence": [
+	          "begin() pseudocode now reads manager.shm.next_txn_id and CASes it for TxnId allocation."
+	        ],
+	        "changed_headings": [
+	          "BEGIN / TxnId allocation"
+	        ]
+	      }
+	    ]
+	  },
+	  {
+	    "commit": "e60049751d7e238e46e45ce8009d9e9f053a41c2",
+	    "change_groups": [
+	      {
+	        "summary": "Harden TAG_CLAIMING liveness safety: require early pid/pid_birth/lease publication before snapshot capture and forbid reclaiming live claimers; add conservative timeouts when pid identity is still unknown.",
+	        "categories": [
+	          4,
+	          1,
+	          7
+	        ],
+	        "primary_category": 4,
+	        "confidence": 0.85,
+	        "evidence": [
+	          "Phase 2 ordering: publish pid/pid_birth/lease_expiry before any potentially blocking work (including seqlock snapshot capture).",
+	          "cleanup_orphaned_slots never reclaims a CLAIMING slot if pid/birth are non-zero and process_alive(pid,birth) is true.",
+	          "Split timeouts: short fast-path timeout vs longer no-pid fallback timeout."
+	        ],
+	        "changed_headings": [
+	          "5.6.2 TxnSlot",
+	          "cleanup_orphaned_slots()"
+	        ]
+	      },
+	      {
+	        "summary": "Fix check_serialized_writer_exclusion stale-token cleanup: retry on CAS failure so we never return Ok while a new serialized writer installs a fresh token.",
+	        "categories": [
+	          1,
+	          4,
+	          7
+	        ],
+	        "primary_category": 1,
+	        "confidence": 0.8,
+	        "evidence": [
+	          "Stale indicator clearing loops: if CAS(tok->0) fails, retry because token changed (cleared or replaced).",
+	          "CAS uses AcqRel/Acquire to ensure correct publication edges."
+	        ],
+	        "changed_headings": [
+	          "Indicator check algorithm"
+	        ]
+	      },
+	      {
+	        "summary": "Make IPC payload set-ordering canonical: ObjectId arrays sorted/deduped, conflict page arrays sorted, and spill_pages sorted by pgno with no duplicates.",
+	        "categories": [
+	          7,
+	          4
+	        ],
+	        "primary_category": 7,
+	        "confidence": 0.75,
+	        "evidence": [
+	          "Any payload field that semantically represents a set must be encoded in sorted order without duplicates.",
+	          "Applies to witness/edge/merge arrays, conflict page lists, and spill_pages ordering."
+	        ],
+	        "changed_headings": [
+	          "Framing",
+	          "Canonical ordering"
+	        ]
+	      }
+	    ]
+	  },
+	  {
+	    "commit": "6d5d36a1380d3b4b4b6ddba71828825ef942975b",
+	    "change_groups": [
+	      {
+	        "summary": "Update Round 16 audit note wording to explicitly include TAG_CLAIMING liveness hardening as part of the round's scope.",
+	        "categories": [
+	          5,
+	          9
+	        ],
+	        "primary_category": 5,
+	        "confidence": 0.9,
+	        "evidence": [
+	          "Footer audit note now mentions early pid/birth publication and forbidding reclaim of live claimers."
+	        ],
+	        "changed_headings": [
+	          "Document version footer"
 	        ]
 	      }
 	    ]
