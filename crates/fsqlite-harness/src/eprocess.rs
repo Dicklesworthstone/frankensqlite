@@ -229,6 +229,180 @@ where
     false
 }
 
+/// Point-in-time hard-invariant metrics for runtime checks.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct HardInvariantSample {
+    pub prev_txn_id: TxnId,
+    pub current_txn_id: TxnId,
+    pub max_concurrent_holders_per_page: usize,
+    pub chain_order_violations_per_1k: usize,
+    pub unlocked_writes_per_1k: usize,
+    pub snapshot_mutation_events_per_txn: usize,
+    pub partial_visibility_observations: usize,
+    pub concurrent_serialized_writers: usize,
+}
+
+/// INV-1: TxnId monotonicity.
+#[must_use]
+pub fn check_inv1_monotonicity(prev: TxnId, current: TxnId) -> bool {
+    let ok = current > prev;
+    debug_assert!(
+        ok,
+        "INV-1 violation: TxnId must be strictly increasing (prev={prev}, current={current})"
+    );
+    ok
+}
+
+/// INV-2: lock exclusivity.
+#[must_use]
+pub fn check_inv2_lock_exclusivity(max_holders: usize) -> bool {
+    let ok = max_holders <= 1;
+    debug_assert!(
+        ok,
+        "INV-2 violation: max concurrent holders per page must be <= 1 (got {max_holders})"
+    );
+    ok
+}
+
+/// INV-3: version chain order.
+#[must_use]
+pub fn check_inv3_version_chain_order(chain_order_violations_per_1k: usize) -> bool {
+    let ok = chain_order_violations_per_1k == 0;
+    debug_assert!(
+        ok,
+        "INV-3 violation: chain order violations per 1K ops must be 0 (got \
+         {chain_order_violations_per_1k})"
+    );
+    ok
+}
+
+/// INV-4: write-set consistency.
+#[must_use]
+pub fn check_inv4_write_set_consistency(unlocked_writes_per_1k: usize) -> bool {
+    let ok = unlocked_writes_per_1k == 0;
+    debug_assert!(
+        ok,
+        "INV-4 violation: unlocked writes per 1K ops must be 0 (got {unlocked_writes_per_1k})"
+    );
+    ok
+}
+
+/// INV-5: snapshot stability.
+#[must_use]
+pub fn check_inv5_snapshot_stability(snapshot_mutation_events_per_txn: usize) -> bool {
+    let ok = snapshot_mutation_events_per_txn == 0;
+    debug_assert!(
+        ok,
+        "INV-5 violation: snapshot mutation events per txn must be 0 (got \
+         {snapshot_mutation_events_per_txn})"
+    );
+    ok
+}
+
+/// INV-6: commit atomicity.
+#[must_use]
+pub fn check_inv6_commit_atomicity(partial_visibility_observations: usize) -> bool {
+    let ok = partial_visibility_observations == 0;
+    debug_assert!(
+        ok,
+        "INV-6 violation: partial visibility observations must be 0 (got \
+         {partial_visibility_observations})"
+    );
+    ok
+}
+
+/// INV-7: serialized mode exclusivity.
+#[must_use]
+pub fn check_inv7_serialized_mode_exclusivity(concurrent_serialized_writers: usize) -> bool {
+    let ok = concurrent_serialized_writers <= 1;
+    debug_assert!(
+        ok,
+        "INV-7 violation: concurrent serialized writers must be <= 1 (got \
+         {concurrent_serialized_writers})"
+    );
+    ok
+}
+
+/// Runs all hard-invariant checks (INV-1..INV-7) in one call.
+#[must_use]
+pub fn check_hard_invariants(sample: HardInvariantSample) -> bool {
+    check_inv1_monotonicity(sample.prev_txn_id, sample.current_txn_id)
+        && check_inv2_lock_exclusivity(sample.max_concurrent_holders_per_page)
+        && check_inv3_version_chain_order(sample.chain_order_violations_per_1k)
+        && check_inv4_write_set_consistency(sample.unlocked_writes_per_1k)
+        && check_inv5_snapshot_stability(sample.snapshot_mutation_events_per_txn)
+        && check_inv6_commit_atomicity(sample.partial_visibility_observations)
+        && check_inv7_serialized_mode_exclusivity(sample.concurrent_serialized_writers)
+}
+
+/// Runtime monitoring facade: hard invariants via `debug_assert!`, SSI-FP via e-process.
+pub struct RuntimeInvariantMonitor {
+    ssi_fp: EProcess,
+}
+
+impl RuntimeInvariantMonitor {
+    /// Constructs a runtime monitor with INV-SSI-FP calibration.
+    #[must_use]
+    pub fn new() -> Self {
+        let config = MvccInvariant::SsiFalsePositiveRate.config();
+        Self {
+            ssi_fp: EProcess::new(MvccInvariant::SsiFalsePositiveRate.name(), config),
+        }
+    }
+
+    /// Whether a specific invariant is monitored with an e-process at runtime.
+    #[must_use]
+    pub fn uses_eprocess_for(&self, invariant: MvccInvariant) -> bool {
+        invariant == MvccInvariant::SsiFalsePositiveRate
+    }
+
+    /// Observe one SSI false-positive outcome (true = false-positive abort occurred).
+    pub fn observe_ssi_false_positive(&mut self, false_positive_abort: bool) {
+        self.ssi_fp.observe(false_positive_abort);
+        info!(
+            bead_id = "bd-1cx0",
+            monitor = "INV-SSI-FP",
+            status = if self.ssi_fp.rejected {
+                "rejected"
+            } else {
+                "monitoring"
+            },
+            e_value = self.ssi_fp.current,
+            threshold = self.ssi_fp.config.threshold(),
+            "invariant monitor state change"
+        );
+
+        if self.ssi_fp.current >= 0.1 / self.ssi_fp.config.alpha {
+            warn!(
+                bead_id = "bd-1cx0",
+                monitor = "INV-SSI-FP",
+                evidence_id = format!("inv-ssi-fp-{}", self.ssi_fp.observations),
+                e_value = self.ssi_fp.current,
+                threshold = self.ssi_fp.config.threshold(),
+                "drift/regime shift detected"
+            );
+        }
+    }
+
+    /// Runs hard-invariant assertions for one sample.
+    #[must_use]
+    pub fn check_hard_sample(&self, sample: HardInvariantSample) -> bool {
+        check_hard_invariants(sample)
+    }
+
+    /// Access current SSI-FP e-process state.
+    #[must_use]
+    pub fn ssi_fp_state(&self) -> &EProcess {
+        &self.ssi_fp
+    }
+}
+
+impl Default for RuntimeInvariantMonitor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl fmt::Display for MvccInvariant {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.name())
@@ -707,10 +881,27 @@ impl Default for MvccEProcessMonitor {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::panic::{self, AssertUnwindSafe};
 
     const TEST_BEAD_ID: &str = "bd-3go.3";
     const FRAMEWORK_BEAD_ID: &str = "bd-x1ww";
     const MONITOR_BEAD_ID: &str = "bd-3q2k";
+    const RUNTIME_BEAD_ID: &str = "bd-1cx0";
+
+    fn assert_debug_assert_behavior(f: impl FnOnce() + std::panic::UnwindSafe) {
+        let panicked = panic::catch_unwind(AssertUnwindSafe(f)).is_err();
+        if cfg!(debug_assertions) {
+            assert!(
+                panicked,
+                "bead_id={RUNTIME_BEAD_ID} expected debug_assert panic in debug builds"
+            );
+        } else {
+            assert!(
+                !panicked,
+                "bead_id={RUNTIME_BEAD_ID} expected no debug_assert panic in release builds"
+            );
+        }
+    }
 
     #[test]
     fn test_eprocess_initial_state() {
@@ -1639,6 +1830,193 @@ mod tests {
                 .iter()
                 .any(|c| c.invariant == MvccInvariant::LockExclusivity),
             "bead_id={FRAMEWORK_BEAD_ID} evidence entry should identify INV-2 contribution"
+        );
+    }
+
+    // -- bd-1cx0 runtime invariant monitoring --
+
+    #[test]
+    fn test_inv1_monotonicity_violation_detected() {
+        assert_debug_assert_behavior(|| {
+            let _ = check_inv1_monotonicity(100, 100);
+        });
+    }
+
+    #[test]
+    fn test_inv2_lock_exclusivity_violation_detected() {
+        assert_debug_assert_behavior(|| {
+            let _ = check_inv2_lock_exclusivity(2);
+        });
+    }
+
+    #[test]
+    fn test_inv3_version_chain_order_violation() {
+        assert_debug_assert_behavior(|| {
+            let _ = check_inv3_version_chain_order(1);
+        });
+    }
+
+    #[test]
+    fn test_inv4_unlocked_write_detected() {
+        assert_debug_assert_behavior(|| {
+            let _ = check_inv4_write_set_consistency(1);
+        });
+    }
+
+    #[test]
+    fn test_inv5_snapshot_stability_mutation() {
+        assert_debug_assert_behavior(|| {
+            let _ = check_inv5_snapshot_stability(1);
+        });
+    }
+
+    #[test]
+    fn test_inv6_partial_visibility_detected() {
+        assert_debug_assert_behavior(|| {
+            let _ = check_inv6_commit_atomicity(1);
+        });
+    }
+
+    #[test]
+    fn test_inv7_concurrent_serialized_writers_detected() {
+        assert_debug_assert_behavior(|| {
+            let _ = check_inv7_serialized_mode_exclusivity(2);
+        });
+    }
+
+    #[test]
+    fn test_inv1_through_inv7_100_threads() {
+        let handles = (0..100)
+            .map(|tid| {
+                std::thread::spawn(move || {
+                    let base = 10_000_u64 * (tid as u64 + 1);
+                    let sample = HardInvariantSample {
+                        prev_txn_id: base,
+                        current_txn_id: base + 1,
+                        max_concurrent_holders_per_page: 1,
+                        chain_order_violations_per_1k: 0,
+                        unlocked_writes_per_1k: 0,
+                        snapshot_mutation_events_per_txn: 0,
+                        partial_visibility_observations: 0,
+                        concurrent_serialized_writers: 1,
+                    };
+                    for _ in 0..1_000 {
+                        assert!(check_hard_invariants(sample));
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for handle in handles {
+            handle
+                .join()
+                .expect("bead_id=bd-1cx0 hard-invariant stress thread should not panic");
+        }
+    }
+
+    #[test]
+    fn test_inv_ssi_fp_eprocess_normal_rate() {
+        let mut monitor = RuntimeInvariantMonitor::new();
+        for i in 0..20_000 {
+            monitor.observe_ssi_false_positive(i % 25 == 0); // 4% < 5% baseline
+        }
+        assert!(
+            !monitor.ssi_fp_state().rejected,
+            "bead_id={RUNTIME_BEAD_ID} SSI-FP should remain below rejection threshold at normal rate"
+        );
+    }
+
+    #[test]
+    fn test_inv_ssi_fp_eprocess_elevated_rate() {
+        let mut monitor = RuntimeInvariantMonitor::new();
+        for i in 0..3_000 {
+            monitor.observe_ssi_false_positive(i % 6 == 0); // ~16.7%
+        }
+        assert!(
+            monitor.ssi_fp_state().rejected,
+            "bead_id={RUNTIME_BEAD_ID} SSI-FP should reject under elevated false-positive rate"
+        );
+        assert!(
+            monitor.ssi_fp_state().current >= 100.0,
+            "bead_id={RUNTIME_BEAD_ID} threshold should be 1/alpha = 100"
+        );
+    }
+
+    #[test]
+    fn test_debug_assert_zero_overhead() {
+        // In release builds debug assertions compile out; in debug builds they trap.
+        let panicked = panic::catch_unwind(AssertUnwindSafe(|| {
+            let _ = check_inv2_lock_exclusivity(2);
+        }))
+        .is_err();
+        assert_eq!(
+            panicked,
+            cfg!(debug_assertions),
+            "bead_id={RUNTIME_BEAD_ID} debug_assert behavior should match build profile"
+        );
+    }
+
+    #[test]
+    fn test_eprocess_not_used_for_hard_invariants() {
+        let monitor = RuntimeInvariantMonitor::new();
+        for &inv in MvccInvariant::ALL {
+            assert!(
+                !monitor.uses_eprocess_for(inv),
+                "bead_id={RUNTIME_BEAD_ID} hard invariant {} should not use e-process runtime checks",
+                inv.name()
+            );
+        }
+        assert!(
+            monitor.uses_eprocess_for(MvccInvariant::SsiFalsePositiveRate),
+            "bead_id={RUNTIME_BEAD_ID} INV-SSI-FP should use e-process runtime checks"
+        );
+    }
+
+    #[test]
+    fn test_e2e_bd_1cx0() {
+        let mut monitor = RuntimeInvariantMonitor::new();
+
+        // Baseline phase: clean hard-invariant samples + low SSI-FP.
+        for i in 0..5_000 {
+            let sample = HardInvariantSample {
+                prev_txn_id: i + 1,
+                current_txn_id: i + 2,
+                max_concurrent_holders_per_page: 1,
+                chain_order_violations_per_1k: 0,
+                unlocked_writes_per_1k: 0,
+                snapshot_mutation_events_per_txn: 0,
+                partial_visibility_observations: 0,
+                concurrent_serialized_writers: 1,
+            };
+            assert!(monitor.check_hard_sample(sample));
+            monitor.observe_ssi_false_positive(i % 50 == 0); // 2%
+        }
+        assert!(
+            !monitor.ssi_fp_state().rejected,
+            "bead_id={RUNTIME_BEAD_ID} baseline phase should not reject"
+        );
+
+        // Inject a deliberate hard-invariant violation.
+        assert_debug_assert_behavior(|| {
+            let _ = monitor.check_hard_sample(HardInvariantSample {
+                prev_txn_id: 42,
+                current_txn_id: 42, // INV-1 violation
+                max_concurrent_holders_per_page: 1,
+                chain_order_violations_per_1k: 0,
+                unlocked_writes_per_1k: 0,
+                snapshot_mutation_events_per_txn: 0,
+                partial_visibility_observations: 0,
+                concurrent_serialized_writers: 1,
+            });
+        });
+
+        // Inject elevated SSI-FP regime.
+        for i in 0..3_000 {
+            monitor.observe_ssi_false_positive(i % 6 == 0); // ~16.7%
+        }
+        assert!(
+            monitor.ssi_fp_state().rejected,
+            "bead_id={RUNTIME_BEAD_ID} elevated regime should trigger SSI-FP rejection"
         );
     }
 }

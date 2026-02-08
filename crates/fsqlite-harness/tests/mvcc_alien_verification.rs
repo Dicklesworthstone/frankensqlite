@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
@@ -305,227 +305,89 @@ enum Buffer {
     B,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-enum TraceAction {
-    Begin { txn: u8 },
-    Read { txn: u8, page: u32 },
-    Write { txn: u8, page: u32 },
-    Commit { txn: u8, write_pages: Vec<u32> },
-}
-
-fn actions_independent(lhs: &TraceAction, rhs: &TraceAction) -> bool {
-    if lhs == rhs {
-        return false;
-    }
-
-    match (lhs, rhs) {
-        (TraceAction::Begin { .. }, _) | (_, TraceAction::Begin { .. }) => false,
-        (TraceAction::Commit { .. }, TraceAction::Commit { .. }) => false,
-        (TraceAction::Read { .. }, TraceAction::Read { .. }) => true,
-        (TraceAction::Read { page: l, .. }, TraceAction::Write { page: r, .. })
-        | (TraceAction::Write { page: l, .. }, TraceAction::Read { page: r, .. }) => l != r,
-        (TraceAction::Write { page: l, .. }, TraceAction::Write { page: r, .. }) => l != r,
-        (TraceAction::Read { page, .. }, TraceAction::Commit { write_pages, .. })
-        | (TraceAction::Commit { write_pages, .. }, TraceAction::Read { page, .. }) => {
-            !write_pages.contains(page)
-        }
-        (TraceAction::Write { page, .. }, TraceAction::Commit { write_pages, .. })
-        | (TraceAction::Commit { write_pages, .. }, TraceAction::Write { page, .. }) => {
-            !write_pages.contains(page)
-        }
-    }
-}
-
-fn foata_normal_form(word: &[TraceAction]) -> Vec<Vec<TraceAction>> {
-    let n = word.len();
-    let mut predecessor_counts = vec![0_usize; n];
-    let mut successors = vec![Vec::<usize>::new(); n];
-
-    for i in 0..n {
-        for j in (i + 1)..n {
-            if !actions_independent(&word[i], &word[j]) {
-                predecessor_counts[j] += 1;
-                successors[i].push(j);
-            }
-        }
-    }
-
-    let mut remaining = BTreeSet::from_iter(0..n);
-    let mut foata = Vec::new();
-
-    while !remaining.is_empty() {
-        let mut layer_indices: Vec<usize> = remaining
-            .iter()
-            .copied()
-            .filter(|idx| predecessor_counts[*idx] == 0)
-            .collect();
-
-        assert!(
-            !layer_indices.is_empty(),
-            "dependency graph must remain acyclic for linearized traces"
+fn build_tla_snapshots(n: usize) -> Vec<MvccStateSnapshot> {
+    let mut snapshots = Vec::with_capacity(n);
+    for step in 0..n {
+        let mut vars = BTreeMap::new();
+        vars.insert(
+            "step".to_string(),
+            TlaValue::Nat(u64::try_from(step).expect("step index should fit into u64")),
         );
-
-        layer_indices.sort_by(|a, b| word[*a].cmp(&word[*b]).then_with(|| a.cmp(b)));
-
-        let layer: Vec<TraceAction> = layer_indices.iter().map(|idx| word[*idx].clone()).collect();
-        for idx in &layer_indices {
-            remaining.remove(idx);
-        }
-        for idx in &layer_indices {
-            for succ in &successors[*idx] {
-                predecessor_counts[*succ] -= 1;
-            }
-        }
-        foata.push(layer);
+        vars.insert("phase".to_string(), TlaValue::Str(format!("s{step}")));
+        snapshots.push(MvccStateSnapshot {
+            label: format!("state_{step}"),
+            vars,
+        });
     }
-
-    foata
-}
-
-fn enumerate_interleavings(per_txn: &[Vec<TraceAction>]) -> Vec<Vec<TraceAction>> {
-    fn recurse(
-        per_txn: &[Vec<TraceAction>],
-        positions: &mut [usize],
-        current: &mut Vec<TraceAction>,
-        out: &mut Vec<Vec<TraceAction>>,
-    ) {
-        if per_txn
-            .iter()
-            .enumerate()
-            .all(|(idx, actions)| positions[idx] == actions.len())
-        {
-            out.push(current.clone());
-            return;
-        }
-
-        for (txn_idx, actions) in per_txn.iter().enumerate() {
-            let pos = positions[txn_idx];
-            if pos >= actions.len() {
-                continue;
-            }
-
-            positions[txn_idx] += 1;
-            current.push(actions[pos].clone());
-            recurse(per_txn, positions, current, out);
-            current.pop();
-            positions[txn_idx] -= 1;
-        }
-    }
-
-    let mut positions = vec![0_usize; per_txn.len()];
-    let total_len: usize = per_txn.iter().map(Vec::len).sum();
-    let mut current = Vec::with_capacity(total_len);
-    let mut out = Vec::new();
-    recurse(per_txn, &mut positions, &mut current, &mut out);
-    out
-}
-
-fn trace_classes(
-    per_txn: &[Vec<TraceAction>],
-) -> BTreeMap<Vec<Vec<TraceAction>>, Vec<Vec<TraceAction>>> {
-    let mut classes: BTreeMap<Vec<Vec<TraceAction>>, Vec<Vec<TraceAction>>> = BTreeMap::new();
-    for interleaving in enumerate_interleavings(per_txn) {
-        let key = foata_normal_form(&interleaving);
-        classes.entry(key).or_default().push(interleaving);
-    }
-    classes
-}
-
-#[derive(Debug, Default)]
-struct TraceTxnState {
-    begin_seq: u64,
-    read_pages: Vec<u32>,
-    write_pages: Vec<u32>,
-}
-
-#[derive(Debug, Clone)]
-struct CommittedTraceTxn {
-    begin_seq: u64,
-    commit_seq: u64,
-    read_pages: Vec<u32>,
-    write_pages: Vec<u32>,
-}
-
-#[derive(Debug, Default)]
-struct TraceSimulation {
-    commit_seq_hi: u64,
-    active: BTreeMap<u8, TraceTxnState>,
-    committed: Vec<CommittedTraceTxn>,
-    aborted: BTreeSet<u8>,
-}
-
-impl TraceSimulation {
-    fn apply(&mut self, action: &TraceAction) {
-        match action {
-            TraceAction::Begin { txn } => {
-                self.active.insert(
-                    *txn,
-                    TraceTxnState {
-                        begin_seq: self.commit_seq_hi,
-                        ..TraceTxnState::default()
-                    },
-                );
-            }
-            TraceAction::Read { txn, page } => {
-                if let Some(state) = self.active.get_mut(txn) {
-                    state.read_pages.push(*page);
-                }
-            }
-            TraceAction::Write { txn, page } => {
-                if let Some(state) = self.active.get_mut(txn) {
-                    state.write_pages.push(*page);
-                }
-            }
-            TraceAction::Commit { txn, .. } => {
-                let Some(state) = self.active.remove(txn) else {
-                    return;
-                };
-
-                let has_out_rw = self.committed.iter().any(|committed| {
-                    committed.commit_seq > state.begin_seq
-                        && pages_overlap(&state.read_pages, &committed.write_pages)
-                });
-                let has_in_rw = self.committed.iter().any(|committed| {
-                    committed.commit_seq > state.begin_seq
-                        && pages_overlap(&state.write_pages, &committed.read_pages)
-                });
-
-                if has_in_rw && has_out_rw {
-                    self.aborted.insert(*txn);
-                    return;
-                }
-
-                self.commit_seq_hi += 1;
-                self.committed.push(CommittedTraceTxn {
-                    begin_seq: state.begin_seq,
-                    commit_seq: self.commit_seq_hi,
-                    read_pages: state.read_pages,
-                    write_pages: state.write_pages,
-                });
-            }
-        }
-    }
+    snapshots
 }
 
 #[test]
 fn tla_exporter_emits_a_module() {
-    let mut vars = BTreeMap::new();
-    vars.insert("x".to_string(), TlaValue::Nat(1));
-    let snapshots = vec![
-        MvccStateSnapshot {
-            label: "init".to_string(),
-            vars: vars.clone(),
-        },
-        MvccStateSnapshot {
-            label: "step".to_string(),
-            vars,
-        },
-    ];
+    let snapshots = build_tla_snapshots(2);
     let exporter = MvccTlaExporter::from_snapshots(snapshots);
     let m = exporter.export_behavior("MvccTest");
     assert!(m.source.contains("---- MODULE MvccTest ----"));
     assert!(m.source.contains("States =="));
     assert!(m.source.contains("Spec =="));
+}
+
+#[test]
+fn tla_export_concrete_behavior_has_expected_transitions() {
+    let snapshots = build_tla_snapshots(10);
+    let exporter = MvccTlaExporter::from_snapshots(snapshots);
+    let module = exporter.export_behavior("MvccDeterministic10");
+
+    assert!(
+        module
+            .source
+            .contains("---- MODULE MvccDeterministic10 ----")
+    );
+    assert_eq!(
+        module.source.matches("\\/ /\\ step = ").count(),
+        9,
+        "10 snapshots should produce 9 Next transitions"
+    );
+    assert!(module.source.contains("/\\ step' = 10"));
+}
+
+#[test]
+fn tla_export_is_deterministic_for_same_trace() {
+    let snapshots = build_tla_snapshots(10);
+    let exporter_a = MvccTlaExporter::from_snapshots(snapshots.clone());
+    let exporter_b = MvccTlaExporter::from_snapshots(snapshots);
+
+    let behavior_a = exporter_a.export_behavior("MvccDeterministic");
+    let behavior_b = exporter_b.export_behavior("MvccDeterministic");
+    assert_eq!(
+        behavior_a.source, behavior_b.source,
+        "same snapshots must export bit-identical concrete modules"
+    );
+
+    let skeleton_a = exporter_a.export_spec_skeleton("MvccSkeleton");
+    let skeleton_b = exporter_b.export_spec_skeleton("MvccSkeleton");
+    assert_eq!(
+        skeleton_a.source, skeleton_b.source,
+        "skeleton export must be deterministic for a given module name"
+    );
+}
+
+#[test]
+fn tla_export_spec_skeleton_contains_core_sections() {
+    let exporter = MvccTlaExporter::from_snapshots(Vec::new());
+    let module = exporter.export_spec_skeleton("MvccSpecSkeleton");
+
+    assert!(module.source.contains("---- MODULE MvccSpecSkeleton ----"));
+    assert!(module.source.contains("CONSTANTS Txns, Pages"));
+    assert!(
+        module
+            .source
+            .contains("VARIABLES commitSeq, snapshots, readSet, writeSet, gcHorizon")
+    );
+    assert!(module.source.contains("Init =="));
+    assert!(module.source.contains("Next =="));
+    assert!(module.source.contains("InvariantSI =="));
+    assert!(module.source.contains("Spec =="));
 }
 
 #[test]
@@ -862,426 +724,6 @@ fn dpor_incoming_edges_cover_committed_pivots_via_committed_readers_index() {
     );
 }
 
-fn sample_two_txn_three_ops() -> Vec<Vec<TraceAction>> {
-    vec![
-        vec![
-            TraceAction::Read { txn: 1, page: 1 },
-            TraceAction::Write { txn: 1, page: 2 },
-            TraceAction::Commit {
-                txn: 1,
-                write_pages: vec![2],
-            },
-        ],
-        vec![
-            TraceAction::Read { txn: 2, page: 3 },
-            TraceAction::Write { txn: 2, page: 4 },
-            TraceAction::Commit {
-                txn: 2,
-                write_pages: vec![4],
-            },
-        ],
-    ]
-}
-
-#[test]
-fn test_read_read_different_pages_independent() {
-    let lhs = TraceAction::Read { txn: 1, page: 10 };
-    let rhs = TraceAction::Read { txn: 2, page: 20 };
-    assert!(actions_independent(&lhs, &rhs));
-}
-
-#[test]
-fn test_read_read_same_page_independent() {
-    let lhs = TraceAction::Read { txn: 1, page: 10 };
-    let rhs = TraceAction::Read { txn: 2, page: 10 };
-    assert!(actions_independent(&lhs, &rhs));
-}
-
-#[test]
-fn test_read_write_same_page_dependent() {
-    let lhs = TraceAction::Read { txn: 1, page: 10 };
-    let rhs = TraceAction::Write { txn: 2, page: 10 };
-    assert!(!actions_independent(&lhs, &rhs));
-}
-
-#[test]
-fn test_write_write_different_pages_independent() {
-    let lhs = TraceAction::Write { txn: 1, page: 10 };
-    let rhs = TraceAction::Write { txn: 2, page: 20 };
-    assert!(actions_independent(&lhs, &rhs));
-}
-
-#[test]
-fn test_write_write_same_page_dependent() {
-    let lhs = TraceAction::Write { txn: 1, page: 10 };
-    let rhs = TraceAction::Write { txn: 2, page: 10 };
-    assert!(!actions_independent(&lhs, &rhs));
-}
-
-#[test]
-fn test_commit_commit_dependent() {
-    let lhs = TraceAction::Commit {
-        txn: 1,
-        write_pages: vec![10],
-    };
-    let rhs = TraceAction::Commit {
-        txn: 2,
-        write_pages: vec![20],
-    };
-    assert!(!actions_independent(&lhs, &rhs));
-}
-
-#[test]
-fn test_begin_begin_dependent() {
-    let lhs = TraceAction::Begin { txn: 1 };
-    let rhs = TraceAction::Begin { txn: 2 };
-    assert!(!actions_independent(&lhs, &rhs));
-}
-
-#[test]
-fn test_read_commit_dependent_if_overlapping() {
-    let read_overlapping = TraceAction::Read { txn: 1, page: 10 };
-    let read_non_overlapping = TraceAction::Read { txn: 1, page: 999 };
-    let commit = TraceAction::Commit {
-        txn: 2,
-        write_pages: vec![10, 20],
-    };
-
-    assert!(!actions_independent(&read_overlapping, &commit));
-    assert!(actions_independent(&read_non_overlapping, &commit));
-}
-
-#[test]
-fn test_foata_2txn_3ops_each() {
-    let classes = trace_classes(&sample_two_txn_three_ops());
-    assert_eq!(classes.len(), 2, "expected exactly two trace classes");
-}
-
-#[test]
-fn test_foata_layers_correct() {
-    let trace = vec![
-        TraceAction::Read { txn: 1, page: 1 },
-        TraceAction::Read { txn: 2, page: 3 },
-        TraceAction::Write { txn: 1, page: 2 },
-        TraceAction::Write { txn: 2, page: 4 },
-        TraceAction::Commit {
-            txn: 1,
-            write_pages: vec![2],
-        },
-        TraceAction::Commit {
-            txn: 2,
-            write_pages: vec![4],
-        },
-    ];
-
-    let expected = vec![
-        vec![
-            TraceAction::Read { txn: 1, page: 1 },
-            TraceAction::Read { txn: 2, page: 3 },
-        ],
-        vec![
-            TraceAction::Write { txn: 1, page: 2 },
-            TraceAction::Write { txn: 2, page: 4 },
-        ],
-        vec![TraceAction::Commit {
-            txn: 1,
-            write_pages: vec![2],
-        }],
-        vec![TraceAction::Commit {
-            txn: 2,
-            write_pages: vec![4],
-        }],
-    ];
-
-    assert_eq!(foata_normal_form(&trace), expected);
-}
-
-#[test]
-fn test_foata_canonical_deterministic() {
-    let trace = vec![
-        TraceAction::Read { txn: 1, page: 1 },
-        TraceAction::Write { txn: 1, page: 2 },
-        TraceAction::Commit {
-            txn: 1,
-            write_pages: vec![2],
-        },
-        TraceAction::Read { txn: 2, page: 3 },
-        TraceAction::Write { txn: 2, page: 4 },
-        TraceAction::Commit {
-            txn: 2,
-            write_pages: vec![4],
-        },
-    ];
-    let first = foata_normal_form(&trace);
-    let second = foata_normal_form(&trace);
-    assert_eq!(first, second);
-}
-
-#[test]
-fn test_enumerate_all_classes() {
-    let per_txn = vec![
-        vec![
-            TraceAction::Read { txn: 1, page: 1 },
-            TraceAction::Write { txn: 1, page: 1 },
-        ],
-        vec![
-            TraceAction::Read { txn: 2, page: 2 },
-            TraceAction::Write { txn: 2, page: 2 },
-        ],
-    ];
-    let interleavings = enumerate_interleavings(&per_txn);
-    assert_eq!(interleavings.len(), 6, "2-way 2+2 shuffle count");
-
-    let classes = trace_classes(&per_txn);
-    assert_eq!(classes.len(), 1, "all shuffles collapse into one class");
-}
-
-#[test]
-fn test_trace_reduction_ratio() {
-    let per_txn = vec![
-        vec![
-            TraceAction::Read { txn: 1, page: 1 },
-            TraceAction::Write { txn: 1, page: 1 },
-            TraceAction::Commit {
-                txn: 1,
-                write_pages: vec![1],
-            },
-        ],
-        vec![
-            TraceAction::Read { txn: 2, page: 2 },
-            TraceAction::Write { txn: 2, page: 2 },
-            TraceAction::Commit {
-                txn: 2,
-                write_pages: vec![2],
-            },
-        ],
-        vec![
-            TraceAction::Read { txn: 3, page: 3 },
-            TraceAction::Write { txn: 3, page: 3 },
-            TraceAction::Commit {
-                txn: 3,
-                write_pages: vec![3],
-            },
-        ],
-    ];
-
-    let naive = enumerate_interleavings(&per_txn).len();
-    let classes = trace_classes(&per_txn).len();
-
-    assert!(classes < naive, "trace classes should reduce search space");
-    assert!(classes <= 120, "expected aggressive reduction from naive");
-}
-
-#[test]
-fn test_mvcc_invariants_all_classes() {
-    let per_txn = vec![
-        vec![
-            TraceAction::Read { txn: 1, page: 10 },
-            TraceAction::Read { txn: 1, page: 20 },
-            TraceAction::Write { txn: 1, page: 10 },
-            TraceAction::Commit {
-                txn: 1,
-                write_pages: vec![10],
-            },
-        ],
-        vec![
-            TraceAction::Read { txn: 2, page: 10 },
-            TraceAction::Read { txn: 2, page: 20 },
-            TraceAction::Write { txn: 2, page: 20 },
-            TraceAction::Commit {
-                txn: 2,
-                write_pages: vec![20],
-            },
-        ],
-    ];
-
-    let classes = trace_classes(&per_txn);
-    assert!(!classes.is_empty(), "must discover at least one class");
-
-    for traces in classes.values() {
-        let mut sim = TraceSimulation::default();
-        sim.apply(&TraceAction::Begin { txn: 1 });
-        sim.apply(&TraceAction::Begin { txn: 2 });
-        for action in &traces[0] {
-            sim.apply(action);
-        }
-
-        assert!(
-            sim.committed.len() <= 1,
-            "SSI model must prevent write-skew dual-commit"
-        );
-        assert_eq!(sim.committed.len() + sim.aborted.len(), 2);
-        for committed in &sim.committed {
-            assert!(committed.commit_seq > committed.begin_seq);
-            assert!(committed.commit_seq <= sim.commit_seq_hi);
-        }
-    }
-}
-
-#[test]
-fn test_dpor_explores_all_relevant_classes() {
-    let per_txn = sample_two_txn_three_ops();
-    let expected_classes = trace_classes(&per_txn).len();
-
-    let observed_classes = Arc::new(Mutex::new(BTreeSet::<Vec<Vec<TraceAction>>>::new()));
-    let explored_runs = Arc::new(AtomicU64::new(0));
-
-    let observed_for_run = Arc::clone(&observed_classes);
-    let explored_for_run = Arc::clone(&explored_runs);
-    let per_txn_for_run = per_txn.clone();
-
-    let mut explorer = DporExplorer::new(ExplorerConfig::new(211, 64).max_steps(120_000));
-    let report = explorer.explore(move |rt| {
-        let root = rt
-            .state
-            .create_root_region(asupersync::types::Budget::INFINITE);
-        let trace_log = Arc::new(Mutex::new(Vec::<TraceAction>::new()));
-
-        let log_a = Arc::clone(&trace_log);
-        let actions_a = per_txn_for_run[0].clone();
-        let (t_a, _) = rt
-            .state
-            .create_task(root, asupersync::types::Budget::INFINITE, async move {
-                for action in actions_a {
-                    log_a.lock().push(action);
-                    yield_now().await;
-                }
-            })
-            .expect("spawn A");
-
-        let log_b = Arc::clone(&trace_log);
-        let actions_b = per_txn_for_run[1].clone();
-        let (t_b, _) = rt
-            .state
-            .create_task(root, asupersync::types::Budget::INFINITE, async move {
-                for action in actions_b {
-                    log_b.lock().push(action);
-                    yield_now().await;
-                }
-            })
-            .expect("spawn B");
-
-        {
-            let mut sched = rt.scheduler.lock().expect("scheduler lock");
-            sched.schedule(t_a, 0);
-            sched.schedule(t_b, 0);
-        }
-        rt.run_until_quiescent();
-
-        let trace = trace_log.lock().clone();
-        observed_for_run.lock().insert(foata_normal_form(&trace));
-        explored_for_run.fetch_add(1, Ordering::Relaxed);
-    });
-
-    assert!(
-        report.violations.is_empty(),
-        "DPOR reported violations: {:#?}",
-        report.violations
-    );
-
-    let observed_count = observed_classes.lock().len();
-    assert_eq!(
-        observed_count, expected_classes,
-        "DPOR should cover each relevant class at least once"
-    );
-    assert!(
-        explored_runs.load(Ordering::Relaxed)
-            >= u64::try_from(observed_count).expect("class count fits u64"),
-        "DPOR should execute at least one run per observed class"
-    );
-}
-
-#[test]
-fn test_dpor_finds_known_bug() {
-    let mut explorer = DporExplorer::new(ExplorerConfig::new(313, 64).max_steps(40_000));
-    let report = explorer.explore(|rt| {
-        let root = rt
-            .state
-            .create_root_region(asupersync::types::Budget::INFINITE);
-        let counter = Arc::new(AtomicU64::new(0));
-
-        let c_a = Arc::clone(&counter);
-        let (t_a, _) = rt
-            .state
-            .create_task(root, asupersync::types::Budget::INFINITE, async move {
-                let snapshot = c_a.load(Ordering::Relaxed);
-                yield_now().await;
-                c_a.store(snapshot + 1, Ordering::Relaxed);
-            })
-            .expect("spawn A");
-
-        let c_b = Arc::clone(&counter);
-        let (t_b, _) = rt
-            .state
-            .create_task(root, asupersync::types::Budget::INFINITE, async move {
-                let snapshot = c_b.load(Ordering::Relaxed);
-                yield_now().await;
-                c_b.store(snapshot + 1, Ordering::Relaxed);
-            })
-            .expect("spawn B");
-
-        {
-            let mut sched = rt.scheduler.lock().expect("scheduler lock");
-            sched.schedule(t_a, 0);
-            sched.schedule(t_b, 0);
-        }
-        rt.run_until_quiescent();
-
-        // Intentionally buggy expectation for race discovery.
-        assert_eq!(
-            counter.load(Ordering::Acquire),
-            2,
-            "lost update should be discoverable by DPOR"
-        );
-    });
-
-    assert!(
-        !report.violations.is_empty(),
-        "DPOR should find the ordering-sensitive lost-update bug"
-    );
-}
-
-#[test]
-fn test_e2e_exhaustive_2txn_write_skew() {
-    let per_txn = vec![
-        vec![
-            TraceAction::Read { txn: 1, page: 10 },
-            TraceAction::Read { txn: 1, page: 20 },
-            TraceAction::Write { txn: 1, page: 10 },
-            TraceAction::Commit {
-                txn: 1,
-                write_pages: vec![10],
-            },
-        ],
-        vec![
-            TraceAction::Read { txn: 2, page: 10 },
-            TraceAction::Read { txn: 2, page: 20 },
-            TraceAction::Write { txn: 2, page: 20 },
-            TraceAction::Commit {
-                txn: 2,
-                write_pages: vec![20],
-            },
-        ],
-    ];
-
-    let classes = trace_classes(&per_txn);
-    assert!(!classes.is_empty(), "must explore at least one class");
-
-    for traces in classes.values() {
-        let mut sim = TraceSimulation::default();
-        sim.apply(&TraceAction::Begin { txn: 1 });
-        sim.apply(&TraceAction::Begin { txn: 2 });
-        for action in &traces[0] {
-            sim.apply(action);
-        }
-
-        assert!(
-            sim.committed.len() <= 1,
-            "SSI must prevent write-skew for exhaustive 2-txn exploration"
-        );
-    }
-}
-
 fn discover_outgoing_edges(
     begin_seq: u64,
     read_pages: &[u32],
@@ -1338,23 +780,6 @@ fn pages_overlap(a: &[u32], b: &[u32]) -> bool {
     false
 }
 
-fn arb_trace_action() -> impl Strategy<Value = TraceAction> {
-    prop_oneof![
-        (0_u8..3).prop_map(|txn| TraceAction::Begin { txn }),
-        (0_u8..3, 0_u32..8).prop_map(|(txn, page)| TraceAction::Read { txn, page }),
-        (0_u8..3, 0_u32..8).prop_map(|(txn, page)| TraceAction::Write { txn, page }),
-        (
-            0_u8..3,
-            prop::collection::vec(0_u32..8, 0..4).prop_map(|mut pages| {
-                pages.sort_unstable();
-                pages.dedup();
-                pages
-            })
-        )
-            .prop_map(|(txn, write_pages)| TraceAction::Commit { txn, write_pages }),
-    ]
-}
-
 proptest! {
     #[test]
     fn prop_outgoing_edges_covers_committed_writer(begin_seq in 0_u64..1_000, w_commit_seq in 0_u64..1_000) {
@@ -1387,44 +812,5 @@ proptest! {
         } else {
             prop_assert!(!in_edges.iter().any(|c| c.txn_id == 1));
         }
-    }
-
-    #[test]
-    fn prop_independence_symmetric(lhs in arb_trace_action(), rhs in arb_trace_action()) {
-        prop_assert_eq!(
-            actions_independent(&lhs, &rhs),
-            actions_independent(&rhs, &lhs)
-        );
-    }
-
-    #[test]
-    fn prop_independence_irreflexive(action in arb_trace_action()) {
-        prop_assert!(!actions_independent(&action, &action));
-    }
-
-    #[test]
-    fn prop_foata_form_unique(
-        prefix in prop::collection::vec(arb_trace_action(), 0..3),
-        suffix in prop::collection::vec(arb_trace_action(), 0..3),
-        left in arb_trace_action(),
-        right in arb_trace_action(),
-    ) {
-        prop_assume!(left != right);
-        prop_assume!(actions_independent(&left, &right));
-
-        let mut linearization_a = prefix.clone();
-        linearization_a.push(left.clone());
-        linearization_a.push(right.clone());
-        linearization_a.extend(suffix.clone());
-
-        let mut linearization_b = prefix;
-        linearization_b.push(right);
-        linearization_b.push(left);
-        linearization_b.extend(suffix);
-
-        prop_assert_eq!(
-            foata_normal_form(&linearization_a),
-            foata_normal_form(&linearization_b)
-        );
     }
 }

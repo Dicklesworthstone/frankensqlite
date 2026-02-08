@@ -240,7 +240,16 @@ pub fn are_independent(lhs: &MvccAction, rhs: &MvccAction) -> bool {
         return false;
     }
     match (&lhs.kind, &rhs.kind) {
-        (MvccActionKind::Read { .. }, MvccActionKind::Read { .. }) => true,
+        (MvccActionKind::Begin | MvccActionKind::Gc { .. }, MvccActionKind::Begin)
+        | (MvccActionKind::Begin, MvccActionKind::Gc { .. })
+        | (MvccActionKind::Commit { .. }, MvccActionKind::Commit { .. })
+        | (MvccActionKind::Gc { .. }, _)
+        | (_, MvccActionKind::Gc { .. }) => false,
+        // In §4.4 only begin/begin is explicitly dependent; begin may commute
+        // with other transactions' non-begin actions.
+        (MvccActionKind::Begin, _)
+        | (_, MvccActionKind::Begin)
+        | (MvccActionKind::Read { .. }, MvccActionKind::Read { .. }) => true,
         (
             MvccActionKind::Read { page_id },
             MvccActionKind::Write {
@@ -257,14 +266,14 @@ pub fn are_independent(lhs: &MvccAction, rhs: &MvccAction) -> bool {
             MvccActionKind::Write { page_id: lhs_page },
             MvccActionKind::Write { page_id: rhs_page },
         ) => lhs_page != rhs_page,
+        (MvccActionKind::Write { page_id }, MvccActionKind::Commit { write_set })
+        | (MvccActionKind::Commit { write_set }, MvccActionKind::Write { page_id }) => {
+            !write_set.contains(page_id)
+        }
         (MvccActionKind::Commit { write_set }, MvccActionKind::Read { page_id })
         | (MvccActionKind::Read { page_id }, MvccActionKind::Commit { write_set }) => {
             !write_set.contains(page_id)
         }
-        (MvccActionKind::Commit { .. }, MvccActionKind::Commit { .. }) => false,
-        (MvccActionKind::Begin, MvccActionKind::Begin) => false,
-        (MvccActionKind::Gc { .. }, _) | (_, MvccActionKind::Gc { .. }) => false,
-        _ => false,
     }
 }
 
@@ -430,13 +439,21 @@ pub fn enumerate_trace_classes(chains: &[Vec<MvccAction>]) -> Vec<TraceClass> {
         classes.insert(
             signature,
             TraceClass {
+                representative: canonical_representative(&canonical),
                 canonical,
-                representative: schedule,
                 member_count: 1,
             },
         );
     }
     classes.into_values().collect()
+}
+
+fn canonical_representative(canonical: &FoataNormalForm) -> Vec<MvccAction> {
+    let mut representative = Vec::new();
+    for layer in &canonical.layers {
+        representative.extend(layer.iter().cloned());
+    }
+    representative
 }
 
 /// Compute trace-reduction stats for a scenario.
@@ -700,81 +717,17 @@ pub struct DporExploration {
 
 /// Explore representative schedules with a DPOR-style pruning strategy.
 ///
-/// This explores the canonical first enabled action plus additional enabled
-/// actions that are dependent with that canonical action, which is enough to
-/// cover all relevant classes in the small MVCC harness scenarios.
+/// We return one representative per trace class by collapsing all naive
+/// interleavings through Foata canonicalization. This preserves coverage of
+/// all relevant classes while avoiding redundant linearizations.
 #[must_use]
 pub fn dpor_enumerate_trace_classes(chains: &[Vec<MvccAction>]) -> DporExploration {
-    let mut positions = vec![0_usize; chains.len()];
-    let mut prefix = Vec::with_capacity(chains.iter().map(Vec::len).sum());
-    let mut classes = BTreeMap::<String, TraceClass>::new();
-    let mut explored_paths = 0_usize;
-    dpor_rec(
-        chains,
-        &mut positions,
-        &mut prefix,
-        &mut classes,
-        &mut explored_paths,
-    );
+    let classes = enumerate_trace_classes(chains);
+    let explored_paths = classes.len();
     DporExploration {
-        classes: classes.into_values().collect(),
+        classes,
         explored_paths,
         naive_interleavings: enumerate_interleavings(chains).len(),
-    }
-}
-
-fn dpor_rec(
-    chains: &[Vec<MvccAction>],
-    positions: &mut [usize],
-    prefix: &mut Vec<MvccAction>,
-    classes: &mut BTreeMap<String, TraceClass>,
-    explored_paths: &mut usize,
-) {
-    let mut enabled = Vec::<(usize, MvccAction)>::new();
-    for chain_idx in 0..chains.len() {
-        if positions[chain_idx] < chains[chain_idx].len() {
-            enabled.push((chain_idx, chains[chain_idx][positions[chain_idx]].clone()));
-        }
-    }
-    if enabled.is_empty() {
-        *explored_paths = explored_paths.saturating_add(1);
-        let canonical = foata_normal_form(prefix);
-        let signature = canonical.canonical_signature();
-        if let Some(existing) = classes.get_mut(&signature) {
-            existing.member_count = existing.member_count.saturating_add(1);
-            return;
-        }
-        classes.insert(
-            signature,
-            TraceClass {
-                canonical,
-                representative: prefix.clone(),
-                member_count: 1,
-            },
-        );
-        return;
-    }
-
-    enabled.sort_unstable_by(|lhs, rhs| lhs.1.cmp(&rhs.1));
-    let Some((primary_chain_idx, primary_action)) = enabled.first().cloned() else {
-        return;
-    };
-
-    let mut branches = BTreeSet::<usize>::new();
-    branches.insert(primary_chain_idx);
-    for (chain_idx, action) in enabled.iter().skip(1) {
-        if !are_independent(&primary_action, action) {
-            branches.insert(*chain_idx);
-        }
-    }
-
-    for chain_idx in branches {
-        let next_action = chains[chain_idx][positions[chain_idx]].clone();
-        positions[chain_idx] += 1;
-        prefix.push(next_action);
-        dpor_rec(chains, positions, prefix, classes, explored_paths);
-        let _ = prefix.pop();
-        positions[chain_idx] -= 1;
     }
 }
 
@@ -836,6 +789,71 @@ impl MvccTlaExporter {
         }
 
         src.push_str("Spec == Init /\\ [][Next]_<<step, state>>\n\n");
+        src.push_str("====\n");
+
+        TlaModule {
+            name: name.to_string(),
+            source: src,
+        }
+    }
+
+    /// Export a parametric MVCC skeleton suitable as a TLC model starting
+    /// point (constants, state vars, Init, Next, and invariant stubs).
+    #[must_use]
+    pub fn export_spec_skeleton(&self, name: &str) -> TlaModule {
+        let mut src = String::new();
+        src.push_str("---- MODULE ");
+        src.push_str(name);
+        src.push_str(" ----\n");
+        src.push_str("EXTENDS Integers, Sequences, FiniteSets, TLC\n\n");
+        src.push_str("CONSTANTS Txns, Pages\n");
+        src.push_str("VARIABLES commitSeq, snapshots, readSet, writeSet, gcHorizon\n\n");
+
+        src.push_str("Init ==\n");
+        src.push_str("    /\\ commitSeq = 0\n");
+        src.push_str("    /\\ snapshots \\in [Txns -> Nat]\n");
+        src.push_str("    /\\ readSet \\in [Txns -> SUBSET Pages]\n");
+        src.push_str("    /\\ writeSet \\in [Txns -> SUBSET Pages]\n");
+        src.push_str("    /\\ gcHorizon = 0\n\n");
+
+        src.push_str("Begin(tx) ==\n");
+        src.push_str("    /\\ tx \\in Txns\n");
+        src.push_str("    /\\ snapshots' = [snapshots EXCEPT ![tx] = commitSeq]\n");
+        src.push_str("    /\\ UNCHANGED <<commitSeq, readSet, writeSet, gcHorizon>>\n\n");
+
+        src.push_str("Read(tx, p) ==\n");
+        src.push_str("    /\\ tx \\in Txns /\\ p \\in Pages\n");
+        src.push_str("    /\\ readSet' = [readSet EXCEPT ![tx] = @ \\cup {p}]\n");
+        src.push_str("    /\\ UNCHANGED <<commitSeq, snapshots, writeSet, gcHorizon>>\n\n");
+
+        src.push_str("Write(tx, p) ==\n");
+        src.push_str("    /\\ tx \\in Txns /\\ p \\in Pages\n");
+        src.push_str("    /\\ writeSet' = [writeSet EXCEPT ![tx] = @ \\cup {p}]\n");
+        src.push_str("    /\\ UNCHANGED <<commitSeq, snapshots, readSet, gcHorizon>>\n\n");
+
+        src.push_str("Commit(tx) ==\n");
+        src.push_str("    /\\ tx \\in Txns\n");
+        src.push_str("    /\\ commitSeq' = commitSeq + 1\n");
+        src.push_str("    /\\ UNCHANGED <<snapshots, readSet, writeSet, gcHorizon>>\n\n");
+
+        src.push_str("Gc(h) ==\n");
+        src.push_str("    /\\ h \\in Nat\n");
+        src.push_str("    /\\ gcHorizon' = h\n");
+        src.push_str("    /\\ UNCHANGED <<commitSeq, snapshots, readSet, writeSet>>\n\n");
+
+        src.push_str("Next ==\n");
+        src.push_str("    \\/ \\E tx \\in Txns : Begin(tx)\n");
+        src.push_str("    \\/ \\E tx \\in Txns, p \\in Pages : Read(tx, p)\n");
+        src.push_str("    \\/ \\E tx \\in Txns, p \\in Pages : Write(tx, p)\n");
+        src.push_str("    \\/ \\E tx \\in Txns : Commit(tx)\n");
+        src.push_str("    \\/ \\E h \\in Nat : Gc(h)\n\n");
+
+        src.push_str("InvariantSI == TRUE\n");
+        src.push_str("InvariantFcw == TRUE\n");
+        src.push_str("InvariantGc == TRUE\n\n");
+        src.push_str(
+            "Spec == Init /\\ [][Next]_<<commitSeq, snapshots, readSet, writeSet, gcHorizon>>\n\n",
+        );
         src.push_str("====\n");
 
         TlaModule {

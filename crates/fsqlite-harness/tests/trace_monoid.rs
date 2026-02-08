@@ -121,25 +121,25 @@ fn test_foata_layers_correct() {
     assert!(
         foata.layers[0]
             .iter()
-            .all(|action| matches!(action.kind, MvccActionKind::Read { .. }))
+            .all(|action| matches!(&action.kind, MvccActionKind::Read { .. }))
     );
 
     assert_eq!(foata.layers[1].len(), 2);
     assert!(
         foata.layers[1]
             .iter()
-            .all(|action| matches!(action.kind, MvccActionKind::Write { .. }))
+            .all(|action| matches!(&action.kind, MvccActionKind::Write { .. }))
     );
 
     assert_eq!(foata.layers[2].len(), 1);
     assert!(matches!(
-        foata.layers[2][0].kind,
+        &foata.layers[2][0].kind,
         MvccActionKind::Commit { .. }
     ));
 
     assert_eq!(foata.layers[3].len(), 1);
     assert!(matches!(
-        foata.layers[3][0].kind,
+        &foata.layers[3][0].kind,
         MvccActionKind::Commit { .. }
     ));
 }
