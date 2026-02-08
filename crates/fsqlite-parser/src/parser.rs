@@ -1942,10 +1942,10 @@ mod tests {
                 assert!(matches!(columns[0], ResultColumn::Star));
                 assert!(from.is_some());
             } else {
-                panic!("expected Select core");
+                unreachable!("expected Select core");
             }
         } else {
-            panic!("expected Select");
+            unreachable!("expected Select");
         }
     }
 
@@ -1956,7 +1956,7 @@ mod tests {
             assert!(s.limit.is_some());
             assert_eq!(s.order_by.len(), 1);
         } else {
-            panic!("expected Select");
+            unreachable!("expected Select");
         }
     }
 
@@ -1986,10 +1986,10 @@ mod tests {
             if let CreateTableBody::Columns { columns, .. } = ct.body {
                 assert_eq!(columns.len(), 2);
             } else {
-                panic!("expected column defs");
+                unreachable!("expected column defs");
             }
         } else {
-            panic!("expected CreateTable");
+            unreachable!("expected CreateTable");
         }
     }
 
@@ -2000,7 +2000,7 @@ mod tests {
             assert!(ci.unique);
             assert_eq!(ci.columns.len(), 2);
         } else {
-            panic!("expected CreateIndex");
+            unreachable!("expected CreateIndex");
         }
     }
 
@@ -2011,7 +2011,7 @@ mod tests {
             assert!(d.if_exists);
             assert_eq!(d.object_type, DropObjectType::Table);
         } else {
-            panic!("expected Drop");
+            unreachable!("expected Drop");
         }
     }
 
@@ -2022,7 +2022,7 @@ mod tests {
         if let Statement::Begin(b) = &stmts[0] {
             assert_eq!(b.mode, Some(TransactionMode::Immediate));
         } else {
-            panic!("expected Begin");
+            unreachable!("expected Begin");
         }
         assert!(matches!(stmts[1], Statement::Commit));
     }
@@ -2033,7 +2033,7 @@ mod tests {
         if let Statement::Rollback(r) = stmt {
             assert_eq!(r.to_savepoint.as_deref(), Some("sp1"));
         } else {
-            panic!("expected Rollback");
+            unreachable!("expected Rollback");
         }
     }
 
@@ -2069,7 +2069,7 @@ mod tests {
         if let Statement::Select(s) = stmt {
             assert_eq!(s.body.compounds.len(), 1);
         } else {
-            panic!("expected Select");
+            unreachable!("expected Select");
         }
     }
 

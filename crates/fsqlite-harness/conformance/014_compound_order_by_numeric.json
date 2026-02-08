@@ -1,0 +1,35 @@
+{
+  "id": "014_compound_order_by_numeric",
+  "description": "Compound SELECT ORDER BY with numeric column references",
+  "ops": [
+    { "op": "open", "path": ":memory:" },
+    {
+      "op": "query",
+      "sql": "SELECT 3 AS a UNION ALL SELECT 1 AS b UNION ALL SELECT 2 AS c ORDER BY 1",
+      "expect": {
+        "columns": ["a"],
+        "rows": [["1"], ["2"], ["3"]],
+        "ordered": true
+      }
+    },
+    {
+      "op": "query",
+      "sql": "SELECT 1 AS a UNION SELECT 3 AS b UNION SELECT 2 AS c ORDER BY 1 DESC",
+      "expect": {
+        "columns": ["a"],
+        "rows": [["3"], ["2"], ["1"]],
+        "ordered": true
+      }
+    },
+    {
+      "op": "query",
+      "sql": "SELECT 2 AS a, 1 AS x UNION ALL SELECT 1 AS b, 2 AS y ORDER BY 2",
+      "expect": {
+        "columns": ["a", "x"],
+        "rows": [["2", "1"], ["1", "2"]],
+        "ordered": true
+      }
+    }
+  ],
+  "fsqlite_modes": ["compatibility", "native"]
+}

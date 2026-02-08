@@ -1,0 +1,35 @@
+{
+  "id": "013_compound_order_by_alias",
+  "description": "Compound SELECT ORDER BY resolves aliases from first SELECT preferentially",
+  "ops": [
+    { "op": "open", "path": ":memory:" },
+    {
+      "op": "query",
+      "sql": "SELECT 2 AS a UNION SELECT 1 AS b ORDER BY a",
+      "expect": {
+        "columns": ["a"],
+        "rows": [["1"], ["2"]],
+        "ordered": true
+      }
+    },
+    {
+      "op": "query",
+      "sql": "SELECT 2 AS a UNION SELECT 1 AS b ORDER BY b",
+      "expect": {
+        "columns": ["a"],
+        "rows": [["1"], ["2"]],
+        "ordered": true
+      }
+    },
+    {
+      "op": "query",
+      "sql": "SELECT 2 AS a UNION ALL SELECT 1 AS b ORDER BY a",
+      "expect": {
+        "columns": ["a"],
+        "rows": [["1"], ["2"]],
+        "ordered": true
+      }
+    }
+  ],
+  "fsqlite_modes": ["compatibility", "native"]
+}

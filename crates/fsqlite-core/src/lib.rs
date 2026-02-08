@@ -1354,18 +1354,17 @@ mod tests {
         );
 
         let decode = decoder.decode(&received);
-        match decode {
-            Ok(_) => panic!(
-                "bead_id={RAPTORQ_BEAD_ID} case=decode_insufficient_symbols unexpectedly succeeded"
-            ),
-            Err(err) => {
-                tracing::error!(
-                    bead_id = RAPTORQ_BEAD_ID,
-                    case = "test_decode_insufficient_symbols",
-                    error = ?err,
-                    "decode failed as expected due to insufficient symbols"
-                );
-            }
+        assert!(
+            decode.is_err(),
+            "bead_id={RAPTORQ_BEAD_ID} case=decode_insufficient_symbols unexpectedly succeeded"
+        );
+        if let Err(err) = decode {
+            tracing::error!(
+                bead_id = RAPTORQ_BEAD_ID,
+                case = "test_decode_insufficient_symbols",
+                error = ?err,
+                "decode failed as expected due to insufficient symbols"
+            );
         }
     }
 

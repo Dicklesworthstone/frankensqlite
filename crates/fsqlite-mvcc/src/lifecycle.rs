@@ -9,16 +9,21 @@
 //! - [`CommitResponse`]: Result type for the commit sequencer.
 
 use std::collections::HashMap;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fsqlite_types::{
     BTreePageType, CommitSeq, PageData, PageNumber, PageSize, PageVersion, SchemaEpoch, Snapshot,
-    TxnEpoch, TxnToken,
+    TxnEpoch, TxnId, TxnToken,
 };
 
 use crate::core_types::{
     CommitIndex, InProcessPageLockTable, Transaction, TransactionMode, TransactionState,
 };
 use crate::invariants::{SerializedWriteMutex, TxnManager, VersionStore};
+use crate::shm::SharedMemoryLayout;
+
+const DEFAULT_BUSY_TIMEOUT_MS: u64 = 100;
+const DEFAULT_SERIALIZED_WRITER_LEASE_SECS: u64 = 30;
 
 // ---------------------------------------------------------------------------
 // BeginKind
@@ -289,10 +294,13 @@ pub struct TransactionManager {
     version_store: VersionStore,
     lock_table: InProcessPageLockTable,
     write_mutex: SerializedWriteMutex,
+    shm: SharedMemoryLayout,
     commit_index: CommitIndex,
     /// Current schema epoch (simplified; in full impl this lives in SHM).
     schema_epoch: SchemaEpoch,
     write_merge_policy: WriteMergePolicy,
+    busy_timeout_ms: u64,
+    serialized_writer_lease_secs: u64,
     txn_max_duration_ms: u64,
 }
 
@@ -305,11 +313,25 @@ impl TransactionManager {
             version_store: VersionStore::new(page_size),
             lock_table: InProcessPageLockTable::new(),
             write_mutex: SerializedWriteMutex::new(),
+            shm: SharedMemoryLayout::new(page_size, 128),
             commit_index: CommitIndex::new(),
             schema_epoch: SchemaEpoch::ZERO,
             write_merge_policy: WriteMergePolicy::default(),
+            busy_timeout_ms: DEFAULT_BUSY_TIMEOUT_MS,
+            serialized_writer_lease_secs: DEFAULT_SERIALIZED_WRITER_LEASE_SECS,
             txn_max_duration_ms: 5_000,
         }
+    }
+
+    /// Busy-timeout for draining concurrent writers during Serialized acquisition (§5.8.1).
+    #[must_use]
+    pub const fn busy_timeout_ms(&self) -> u64 {
+        self.busy_timeout_ms
+    }
+
+    /// Set busy-timeout for Serialized acquisition drain.
+    pub fn set_busy_timeout_ms(&mut self, busy_timeout_ms: u64) {
+        self.busy_timeout_ms = busy_timeout_ms;
     }
 
     /// Current write-merge policy.
@@ -374,9 +396,7 @@ impl TransactionManager {
 
         // For Immediate/Exclusive: acquire serialized writer exclusion at BEGIN.
         if kind == BeginKind::Immediate || kind == BeginKind::Exclusive {
-            self.write_mutex
-                .try_acquire(txn_id)
-                .map_err(|_| MvccError::Busy)?;
+            self.acquire_serialized_writer_exclusion(txn_id)?;
             txn.serialized_write_lock_held = true;
         }
 
@@ -631,20 +651,18 @@ impl TransactionManager {
     ) -> Result<(), MvccError> {
         if !txn.serialized_write_lock_held {
             // DEFERRED upgrade: acquire global mutex on first write.
-            self.write_mutex
-                .try_acquire(txn.txn_id)
-                .map_err(|_| MvccError::Busy)?;
+            self.acquire_serialized_writer_exclusion(txn.txn_id)?;
 
             // Reader-turned-writer rule: if snapshot was already established
             // (via prior reads) and the database has advanced, fail.
             let snap_now = self.load_consistent_snapshot();
             if txn.snapshot_established {
                 if snap_now.schema_epoch != txn.snapshot.schema_epoch {
-                    self.write_mutex.release(txn.txn_id);
+                    self.release_serialized_writer_exclusion(txn.txn_id);
                     return Err(MvccError::Schema);
                 }
                 if snap_now.high != txn.snapshot.high {
-                    self.write_mutex.release(txn.txn_id);
+                    self.release_serialized_writer_exclusion(txn.txn_id);
                     return Err(MvccError::BusySnapshot);
                 }
             }
@@ -677,7 +695,11 @@ impl TransactionManager {
         data: PageData,
     ) -> Result<(), MvccError> {
         // Check serialized writer exclusion first.
-        if self.write_mutex.holder().is_some() {
+        if self
+            .shm
+            .check_serialized_writer_exclusion(Self::now_epoch_secs(), |_pid, _birth| true)
+            .is_err()
+        {
             return Err(MvccError::Busy);
         }
 
@@ -817,7 +839,8 @@ impl TransactionManager {
 
         // Release serialized write mutex if held.
         if txn.serialized_write_lock_held {
-            self.write_mutex.release(txn.txn_id);
+            // Per spec: clear serialized writer indicator BEFORE releasing mutex.
+            self.release_serialized_writer_exclusion(txn.txn_id);
             txn.serialized_write_lock_held = false;
         }
     }
@@ -835,6 +858,128 @@ impl TransactionManager {
             return Err(MvccError::TxnMaxDurationExceeded);
         }
         Ok(())
+    }
+
+    fn now_epoch_secs() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_secs()
+    }
+
+    fn acquire_serialized_writer_exclusion(&self, txn_id: TxnId) -> Result<(), MvccError> {
+        // Step 1: Acquire global mutex.
+        self.write_mutex.try_acquire(txn_id).map_err(|_holder| {
+            tracing::warn!(
+                txn_id = %txn_id,
+                "serialized writer acquisition failed: mutex held"
+            );
+            MvccError::Busy
+        })?;
+
+        // Step 2: Clear stale indicator if needed, then publish indicator.
+        let now = Self::now_epoch_secs();
+        let pid = std::process::id();
+        let pid_birth = now; // simplified; real impl uses epoch nanos + OS liveness
+        let lease_expiry = now.saturating_add(self.serialized_writer_lease_secs);
+
+        // If a serialized-writer token is present and not stale, treat as BUSY.
+        if self
+            .shm
+            .check_serialized_writer_exclusion(now, |_pid, _birth| true)
+            .is_err()
+        {
+            self.write_mutex.release(txn_id);
+            return Err(MvccError::Busy);
+        }
+
+        if !self
+            .shm
+            .acquire_serialized_writer(txn_id.get(), pid, pid_birth, lease_expiry)
+        {
+            tracing::warn!(
+                txn_id = %txn_id,
+                "serialized writer acquisition failed: indicator already set"
+            );
+            self.write_mutex.release(txn_id);
+            return Err(MvccError::Busy);
+        }
+
+        tracing::info!(
+            txn_id = %txn_id,
+            pid,
+            pid_birth,
+            lease_expiry,
+            "serialized writer exclusion published"
+        );
+
+        // Step 3: Drain concurrent writers (scan active + draining lock tables).
+        if let Err(err) = self.drain_concurrent_writers_via_lock_table_scan(txn_id) {
+            // Step 5 (early): clear indicator + release mutex on failure.
+            self.release_serialized_writer_exclusion(txn_id);
+            return Err(err);
+        }
+
+        Ok(())
+    }
+
+    fn drain_concurrent_writers_via_lock_table_scan(&self, txn_id: TxnId) -> Result<(), MvccError> {
+        let start = Instant::now();
+        let timeout = Duration::from_millis(self.busy_timeout_ms);
+        let mut last_remaining = usize::MAX;
+
+        loop {
+            let remaining = self.lock_table.total_lock_count();
+            if remaining == 0 {
+                tracing::debug!(
+                    txn_id = %txn_id,
+                    elapsed_ms = start.elapsed().as_millis(),
+                    "serialized writer drain complete"
+                );
+                return Ok(());
+            }
+
+            if start.elapsed() >= timeout {
+                tracing::warn!(
+                    txn_id = %txn_id,
+                    remaining,
+                    elapsed_ms = start.elapsed().as_millis(),
+                    busy_timeout_ms = self.busy_timeout_ms,
+                    "serialized writer drain timed out; returning SQLITE_BUSY"
+                );
+                return Err(MvccError::Busy);
+            }
+
+            if remaining != last_remaining {
+                last_remaining = remaining;
+                tracing::debug!(
+                    txn_id = %txn_id,
+                    remaining,
+                    elapsed_ms = start.elapsed().as_millis(),
+                    "serialized writer drain progress"
+                );
+            }
+
+            // Be polite: this is a busy-wait with a deadline, not a hard spin.
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn release_serialized_writer_exclusion(&self, txn_id: TxnId) {
+        let token = txn_id.get();
+        if !self.shm.release_serialized_writer(token) {
+            tracing::warn!(
+                txn_id = %txn_id,
+                token,
+                "failed to release serialized writer indicator (token mismatch)"
+            );
+        }
+        if !self.write_mutex.release(txn_id) {
+            tracing::warn!(
+                txn_id = %txn_id,
+                "failed to release serialized write mutex (not held by txn)"
+            );
+        }
     }
 }
 
@@ -859,6 +1004,8 @@ impl std::fmt::Debug for TransactionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
     use fsqlite_types::TxnId;
@@ -866,6 +1013,12 @@ mod tests {
 
     fn mgr() -> TransactionManager {
         TransactionManager::new(PageSize::DEFAULT)
+    }
+
+    fn mgr_with_busy_timeout_ms(busy_timeout_ms: u64) -> TransactionManager {
+        let mut m = TransactionManager::new(PageSize::DEFAULT);
+        m.set_busy_timeout_ms(busy_timeout_ms);
+        m
     }
 
     fn test_data(byte: u8) -> PageData {
@@ -1169,6 +1322,177 @@ mod tests {
             MvccError::Busy,
             "concurrent write while serialized writer active should fail"
         );
+    }
+
+    #[test]
+    fn test_concurrent_writer_blocks_serialized_acquisition() {
+        let m = mgr_with_busy_timeout_ms(5);
+
+        // Hold a concurrent page lock.
+        let mut txn_conc = m.begin(BeginKind::Concurrent).unwrap();
+        m.write_page(&mut txn_conc, PageNumber::new(1).unwrap(), test_data(0x01))
+            .unwrap();
+
+        // Serialized acquisition should fail BUSY while any concurrent locks exist.
+        let err = m.begin(BeginKind::Immediate).unwrap_err();
+        assert_eq!(err, MvccError::Busy);
+        assert!(m.write_mutex().holder().is_none(), "mutex must be released");
+        assert!(
+            m.shm.check_serialized_writer().is_none(),
+            "indicator must be cleared on failure"
+        );
+    }
+
+    #[test]
+    fn test_drain_waits_for_all_concurrent_locks_released() {
+        let m = Arc::new(mgr_with_busy_timeout_ms(200));
+
+        let mut txn_conc = m.begin(BeginKind::Concurrent).unwrap();
+        m.write_page(&mut txn_conc, PageNumber::new(1).unwrap(), test_data(0x01))
+            .unwrap();
+
+        // Release the concurrent lock shortly after the serialized writer begins draining.
+        let m2 = Arc::clone(&m);
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            let mut txn_conc = txn_conc;
+            m2.abort(&mut txn_conc);
+        });
+
+        let mut txn_ser = m.begin(BeginKind::Immediate).unwrap();
+        assert!(txn_ser.serialized_write_lock_held);
+
+        // Clean up.
+        m.abort(&mut txn_ser);
+        releaser.join().unwrap();
+    }
+
+    #[test]
+    fn test_concurrent_reads_allowed_during_serialized_write() {
+        let m = mgr();
+
+        // Commit a baseline page so a concurrent reader has something to observe.
+        let pgno = PageNumber::new(1).unwrap();
+        let mut writer = m.begin(BeginKind::Immediate).unwrap();
+        m.write_page(&mut writer, pgno, test_data(0x11)).unwrap();
+        let seq = m.commit(&mut writer).unwrap();
+        assert!(seq.get() > 0);
+
+        // Hold serialized writer exclusion.
+        let _ser = m.begin(BeginKind::Immediate).unwrap();
+
+        // Concurrent reads must still be permitted.
+        let mut reader = m.begin(BeginKind::Concurrent).unwrap();
+        let got = m.read_page(&mut reader, pgno).unwrap();
+        assert_eq!(got.as_bytes()[0], 0x11);
+    }
+
+    #[test]
+    fn test_deferred_read_begin_allowed_during_concurrent_writes() {
+        let m = mgr_with_busy_timeout_ms(5);
+
+        // Hold a concurrent write lock.
+        let mut conc = m.begin(BeginKind::Concurrent).unwrap();
+        m.write_page(&mut conc, PageNumber::new(1).unwrap(), test_data(0x01))
+            .unwrap();
+
+        // DEFERRED read-only begin always permitted.
+        let mut def = m.begin(BeginKind::Deferred).unwrap();
+        let _ = m.read_page(&mut def, PageNumber::new(2).unwrap());
+
+        // But writer upgrade should be excluded while concurrent locks exist.
+        let err = m
+            .write_page(&mut def, PageNumber::new(3).unwrap(), test_data(0x02))
+            .unwrap_err();
+        assert_eq!(err, MvccError::Busy);
+    }
+
+    #[test]
+    fn test_acquisition_ordering_steps_1_through_5() {
+        let m = Arc::new(mgr_with_busy_timeout_ms(200));
+
+        // Hold a concurrent lock so the serialized writer must drain.
+        let mut conc = m.begin(BeginKind::Concurrent).unwrap();
+        m.write_page(&mut conc, PageNumber::new(1).unwrap(), test_data(0x01))
+            .unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        let m2 = Arc::clone(&m);
+        std::thread::spawn(move || {
+            let got = m2.begin(BeginKind::Immediate);
+            tx.send(got).unwrap();
+        });
+
+        // Step 2 must happen before drain completes: indicator becomes visible.
+        let wait_start = Instant::now();
+        while m.shm.check_serialized_writer().is_none() {
+            if wait_start.elapsed() > Duration::from_millis(50) {
+                panic!("timed out waiting for serialized writer indicator");
+            }
+            std::thread::yield_now();
+        }
+
+        // While draining, new concurrent writes must be blocked.
+        let mut conc2 = m.begin(BeginKind::Concurrent).unwrap();
+        let err = m
+            .write_page(&mut conc2, PageNumber::new(2).unwrap(), test_data(0x02))
+            .unwrap_err();
+        assert_eq!(err, MvccError::Busy);
+
+        // Release existing concurrent locks so drain can finish.
+        m.abort(&mut conc);
+
+        let mut ser = rx
+            .recv_timeout(Duration::from_millis(200))
+            .unwrap()
+            .unwrap();
+        assert!(ser.serialized_write_lock_held);
+
+        // Step 5: clear indicator before releasing mutex (observable as indicator==None after abort).
+        m.abort(&mut ser);
+        assert!(m.shm.check_serialized_writer().is_none());
+        assert!(m.write_mutex().holder().is_none());
+
+        // After release, concurrent writes can proceed.
+        let mut conc3 = m.begin(BeginKind::Concurrent).unwrap();
+        m.write_page(&mut conc3, PageNumber::new(3).unwrap(), test_data(0x03))
+            .unwrap();
+    }
+
+    #[test]
+    fn test_e2e_serialized_vs_concurrent_mutual_exclusion() {
+        let m = Arc::new(mgr_with_busy_timeout_ms(200));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (commit_tx, commit_rx) = mpsc::channel();
+
+        let m2 = Arc::clone(&m);
+        let th = std::thread::spawn(move || {
+            let mut ser = m2.begin(BeginKind::Immediate).unwrap();
+            started_tx.send(()).unwrap();
+            m2.write_page(&mut ser, PageNumber::new(1).unwrap(), test_data(0xAA))
+                .unwrap();
+            commit_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            m2.commit(&mut ser).unwrap()
+        });
+
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        // Concurrent writer must be blocked while serialized writer is active.
+        let mut conc = m.begin(BeginKind::Concurrent).unwrap();
+        let err = m
+            .write_page(&mut conc, PageNumber::new(2).unwrap(), test_data(0xBB))
+            .unwrap_err();
+        assert_eq!(err, MvccError::Busy);
+
+        // Let serialized writer commit.
+        commit_tx.send(()).unwrap();
+        let seq = th.join().unwrap();
+        assert!(seq.get() > 0);
+
+        // After serialized commit, concurrent writer should succeed.
+        let mut conc2 = m.begin(BeginKind::Concurrent).unwrap();
+        m.write_page(&mut conc2, PageNumber::new(2).unwrap(), test_data(0xBB))
+            .unwrap();
     }
 
     // -----------------------------------------------------------------------

@@ -10,6 +10,7 @@ pub mod lifecycle;
 pub mod shared_lock_table;
 pub mod shm;
 pub mod witness_hierarchy;
+pub mod witness_plane;
 pub mod xor_delta;
 
 pub use cache_aligned::{
@@ -38,6 +39,7 @@ pub use witness_hierarchy::{
     HotWitnessIndexDerivationV1, HotWitnessIndexSizingV1, WitnessHierarchyConfigV1,
     WitnessHotIndexManifestV1, WitnessSizingError,
 };
+pub use witness_plane::{WitnessSet, validate_txn_token, witness_keys_overlap};
 pub use xor_delta::{
     DEFAULT_DELTA_THRESHOLD_PCT, DELTA_FIXED_OVERHEAD_BYTES, DELTA_HEADER_BYTES, DELTA_MAGIC,
     DELTA_RUN_HEADER_BYTES, DELTA_SPARSE_OVERHEAD_PCT, DELTA_VERSION, DeltaEncoding, DeltaError,

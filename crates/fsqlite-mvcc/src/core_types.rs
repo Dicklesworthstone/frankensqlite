@@ -1239,6 +1239,258 @@ pub fn cleanup_and_raise_gc_horizon(
 }
 
 // ---------------------------------------------------------------------------
+// Orphaned Slot Cleanup (§5.6.2.2, bd-2xns)
+// ---------------------------------------------------------------------------
+
+/// Statistics from a full [`cleanup_orphaned_slots`] pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrphanedSlotCleanupStats {
+    /// Number of slots scanned.
+    pub scanned: usize,
+    /// Number of orphaned slots reclaimed.
+    pub orphans_found: usize,
+    /// Number of page lock releases performed.
+    pub locks_released: usize,
+}
+
+/// Clear all mutable fields of a [`SharedTxnSlot`], with `txn_id = 0` stored
+/// last using `Release` ordering (§5.6.2.2 field-clearing discipline).
+///
+/// The `txn_id = 0` store is the sentinel that marks the slot as free. Any
+/// reader that observes `txn_id == 0` must see all other fields already cleared
+/// (Release/Acquire pairing).
+fn clear_slot_fields(slot: &SharedTxnSlot) {
+    slot.state.store(0, Ordering::Release);
+    slot.mode.store(0, Ordering::Release);
+    slot.commit_seq.store(0, Ordering::Release);
+    slot.begin_seq.store(0, Ordering::Release);
+    slot.snapshot_high.store(0, Ordering::Release);
+    slot.witness_epoch.store(0, Ordering::Release);
+    slot.has_in_rw.store(false, Ordering::Release);
+    slot.has_out_rw.store(false, Ordering::Release);
+    slot.marked_for_abort.store(false, Ordering::Release);
+    slot.write_set_pages.store(0, Ordering::Release);
+    slot.pid.store(0, Ordering::Release);
+    slot.pid_birth.store(0, Ordering::Release);
+    slot.lease_expiry.store(0, Ordering::Release);
+    slot.cleanup_txn_id.store(0, Ordering::Release);
+    slot.claiming_timestamp.store(0, Ordering::Release);
+    // Free the slot — Release ordering ensures all field clears are visible.
+    slot.txn_id.store(0, Ordering::Release);
+}
+
+/// Attempt to clean up a single orphaned slot (§5.6.2.2).
+///
+/// This handles all three branches of the orphaned slot state machine:
+///
+/// 1. **TAG_CLEANING:** Stuck cleaner — release locks, clear fields.
+/// 2. **TAG_CLAIMING:** Dead claimer — CAS to CLEANING, clear fields.
+/// 3. **Real TxnId:** Expired lease + dead process — CAS to CLEANING, release
+///    locks, clear fields.
+///
+/// # Arguments
+///
+/// * `slot` — the [`SharedTxnSlot`] to inspect.
+/// * `now_epoch_secs` — current time in unix epoch seconds.
+/// * `process_alive` — returns `true` if process with `(pid, pid_birth)` is
+///   alive.
+/// * `release_locks` — callback to release page locks for a given TxnId.
+///
+/// # Returns
+///
+/// A [`SlotCleanupResult`] indicating what action was taken.
+pub fn try_cleanup_orphaned_slot(
+    slot: &SharedTxnSlot,
+    now_epoch_secs: u64,
+    process_alive: impl Fn(u32, u64) -> bool,
+    release_locks: impl Fn(u64),
+) -> SlotCleanupResult {
+    // Single-read-per-iteration rule: snapshot txn_id ONCE.
+    let tid = slot.txn_id.load(Ordering::Acquire);
+    if tid == 0 {
+        return SlotCleanupResult::NotApplicable;
+    }
+
+    let tag = decode_tag(tid);
+
+    if tag != 0 {
+        // ===== Sentinel-tagged slot =====
+        let was_claiming = tag == TAG_CLAIMING;
+
+        // Seed claiming_timestamp if not yet set (CAS to avoid race).
+        let claiming_ts = slot.claiming_timestamp.load(Ordering::Acquire);
+        if claiming_ts == 0 {
+            let _ = slot.claiming_timestamp.compare_exchange(
+                0,
+                now_epoch_secs,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+            return SlotCleanupResult::StillRecent;
+        }
+
+        if was_claiming {
+            // TAG_CLAIMING: check process liveness first.
+            let pid = slot.pid.load(Ordering::Acquire);
+            let birth = slot.pid_birth.load(Ordering::Acquire);
+            if pid != 0 && birth != 0 && process_alive(pid, birth) {
+                return SlotCleanupResult::ProcessAlive;
+            }
+
+            let timeout = if pid == 0 || birth == 0 {
+                CLAIMING_TIMEOUT_NO_PID_SECS
+            } else {
+                CLAIMING_TIMEOUT_SECS
+            };
+            if now_epoch_secs.saturating_sub(claiming_ts) <= timeout {
+                return SlotCleanupResult::StillRecent;
+            }
+        } else {
+            // TAG_CLEANING: if stuck longer than timeout, reclaim.
+            if now_epoch_secs.saturating_sub(claiming_ts) <= CLAIMING_TIMEOUT_SECS {
+                return SlotCleanupResult::StillRecent;
+            }
+        }
+
+        let orphan_txn_id = decode_payload(tid);
+
+        if was_claiming {
+            // Transition CLAIMING → CLEANING (preserves identity).
+            let cleaning_word = encode_cleaning(orphan_txn_id);
+            if slot
+                .txn_id
+                .compare_exchange(tid, cleaning_word, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                return SlotCleanupResult::CasRaceSkipped;
+            }
+            slot.claiming_timestamp
+                .store(now_epoch_secs, Ordering::Release);
+            tracing::info!(
+                orphan_txn_id,
+                "transitioned stale CLAIMING slot to CLEANING"
+            );
+        }
+
+        // TAG_CLEANING payload preserves identity for retryable lock release.
+        slot.cleanup_txn_id.store(orphan_txn_id, Ordering::Release);
+
+        // Release page locks (idempotent).
+        if orphan_txn_id != 0 {
+            release_locks(orphan_txn_id);
+        }
+
+        tracing::info!(
+            orphan_txn_id,
+            was_claiming,
+            "reclaiming stale sentinel slot"
+        );
+
+        clear_slot_fields(slot);
+
+        return SlotCleanupResult::Reclaimed {
+            orphan_txn_id,
+            was_claiming,
+        };
+    }
+
+    // ===== Real TxnId (no sentinel tag) =====
+    let lease = slot.lease_expiry.load(Ordering::Acquire);
+    if lease != 0 && lease > now_epoch_secs {
+        // Lease not expired — slot is still valid.
+        return SlotCleanupResult::NotApplicable;
+    }
+
+    let pid = slot.pid.load(Ordering::Acquire);
+    let birth = slot.pid_birth.load(Ordering::Acquire);
+    if pid != 0 && birth != 0 && process_alive(pid, birth) {
+        return SlotCleanupResult::ProcessAlive;
+    }
+
+    // Dead process with expired (or zero) lease — reclaim.
+    let orphan_txn_id = decode_payload(tid);
+
+    // Write cleanup_txn_id BEFORE sentinel overwrite (crash-safety).
+    slot.cleanup_txn_id.store(orphan_txn_id, Ordering::Release);
+
+    // CAS to CLEANING.
+    let cleaning_word = encode_cleaning(orphan_txn_id);
+    if slot
+        .txn_id
+        .compare_exchange(tid, cleaning_word, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return SlotCleanupResult::CasRaceSkipped;
+    }
+    slot.claiming_timestamp
+        .store(now_epoch_secs, Ordering::Release);
+
+    // Release page locks (idempotent).
+    release_locks(orphan_txn_id);
+
+    tracing::info!(orphan_txn_id, "reclaiming orphaned real TxnId slot");
+
+    clear_slot_fields(slot);
+
+    SlotCleanupResult::Reclaimed {
+        orphan_txn_id,
+        was_claiming: false,
+    }
+}
+
+/// Scan all slots and clean up orphaned entries (§5.6.2.2).
+///
+/// Combines per-slot cleanup with statistics collection. This is the main
+/// entry point for periodic crash recovery maintenance.
+#[allow(clippy::needless_pass_by_value)]
+pub fn cleanup_orphaned_slots(
+    slots: &[SharedTxnSlot],
+    now_epoch_secs: u64,
+    process_alive: impl Fn(u32, u64) -> bool,
+    release_locks: impl Fn(u64),
+) -> OrphanedSlotCleanupStats {
+    let mut orphans_found = 0_usize;
+    let mut locks_released = 0_usize;
+
+    tracing::info!(
+        scanned = slots.len(),
+        "starting cleanup_orphaned_slots pass"
+    );
+
+    for (idx, slot) in slots.iter().enumerate() {
+        let result =
+            try_cleanup_orphaned_slot(slot, now_epoch_secs, &process_alive, &release_locks);
+        if let SlotCleanupResult::Reclaimed {
+            orphan_txn_id,
+            was_claiming,
+        } = result
+        {
+            orphans_found += 1;
+            locks_released += 1;
+            tracing::debug!(
+                slot_idx = idx,
+                orphan_txn_id,
+                was_claiming,
+                "reclaimed orphaned slot"
+            );
+        }
+    }
+
+    tracing::info!(
+        scanned = slots.len(),
+        orphans_found,
+        locks_released,
+        "completed cleanup_orphaned_slots pass"
+    );
+
+    OrphanedSlotCleanupStats {
+        scanned: slots.len(),
+        orphans_found,
+        locks_released,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -2358,7 +2610,8 @@ mod tests {
                 );
             }
             DrainResult::TimedOut { remaining, .. } => {
-                panic!(
+                assert!(
+                    false,
                     "bead_id={BEAD_22N12} case=bounded_time \
                      rebuild should not time out, remaining={remaining}"
                 );

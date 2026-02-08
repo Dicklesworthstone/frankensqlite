@@ -489,7 +489,7 @@ pub(crate) fn balance_nonroot<W: PageWriter>(
             page_offset,
             usable_size,
             right_child,
-        );
+        )?;
 
         writer.write_page(cx, pgno, &page_data)?;
 
@@ -818,7 +818,7 @@ fn build_page(
     header_offset: usize,
     usable_size: u32,
     right_child: Option<PageNumber>,
-) -> Vec<u8> {
+) -> Result<Vec<u8>> {
     let page_size = usable_size as usize;
     let mut page = vec![0u8; page_size];
 
@@ -829,12 +829,12 @@ fn build_page(
     for cell in cells {
         let cell_len = cell.data.len();
         let Some(next_offset) = content_offset.checked_sub(cell_len) else {
-            panic!(
+            return Err(FrankenError::internal(format!(
                 "build_page overflow: page_type={page_type:?} header_offset={header_offset} \
                  page_size={page_size} content_offset={content_offset} cell_len={cell_len} \
                  cells={}",
                 cells.len()
-            );
+            )));
         };
         content_offset = next_offset;
         page[content_offset..content_offset + cell_len].copy_from_slice(&cell.data);
@@ -857,7 +857,7 @@ fn build_page(
     // Write cell pointer array.
     write_cell_pointers(&mut page, header_offset, &header, &cell_pointers);
 
-    page
+    Ok(page)
 }
 
 // ---------------------------------------------------------------------------
@@ -1072,7 +1072,7 @@ pub(crate) fn apply_child_replacement<W: PageWriter>(
         offset,
         usable_size,
         right_child,
-    );
+    )?;
 
     // Preserve database header on page 1.
     let mut final_page = new_page;
@@ -1280,7 +1280,7 @@ fn split_overflowing_root<W: PageWriter>(
             child_offset,
             usable_size,
             Some(right_children[i]),
-        );
+        )?;
         writer.write_page(cx, child_pgnos[i], &page)?;
     }
 
@@ -1299,7 +1299,7 @@ fn split_overflowing_root<W: PageWriter>(
         root_offset,
         usable_size,
         Some(root_right),
-    );
+    )?;
     if root_offset > 0 {
         new_root[..root_offset].copy_from_slice(root_prefix);
     }
@@ -1475,7 +1475,7 @@ fn split_overflowing_nonroot_interior_page<W: PageWriter>(
             child_off,
             usable_size,
             Some(right_children[i]),
-        );
+        )?;
         let mut final_page = page;
         if i == 0 && child_off > 0 {
             final_page[..child_off].copy_from_slice(page_prefix);
@@ -1839,7 +1839,8 @@ mod tests {
             },
         ];
 
-        let page = build_page(&cells, BtreePageType::LeafTable, 0, USABLE, None);
+        let page = build_page(&cells, BtreePageType::LeafTable, 0, USABLE, None)
+            .expect("build_page should succeed");
 
         let header = BtreePageHeader::parse(&page, 0).unwrap();
         assert_eq!(header.cell_count, 2);

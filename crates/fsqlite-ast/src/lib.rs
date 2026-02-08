@@ -6,6 +6,8 @@
 //!
 //! Reference: §10.3–10.4 of the FrankenSQLite specification.
 
+pub mod rebase;
+
 use std::fmt;
 
 // ---------------------------------------------------------------------------

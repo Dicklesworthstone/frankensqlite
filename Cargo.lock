@@ -587,6 +587,7 @@ dependencies = [
  "fsqlite-ast",
  "fsqlite-error",
  "fsqlite-types",
+ "tracing",
 ]
 
 [[package]]
@@ -597,6 +598,7 @@ dependencies = [
  "blake3",
  "proptest",
  "serde",
+ "serde_json",
  "smallvec",
  "xxhash-rust",
 ]

@@ -534,8 +534,9 @@ impl SharedMemoryLayout {
         token: u64,
         pid: u32,
         pid_birth: u64,
-        lease_secs: u64,
+        lease_expiry_epoch_secs: u64,
     ) -> bool {
+        assert_ne!(token, 0, "serialized writer token must be non-zero");
         // CAS 0 → token.
         if self
             .serialized_writer_token
@@ -548,7 +549,7 @@ impl SharedMemoryLayout {
         self.serialized_writer_pid_birth
             .store(pid_birth, Ordering::Release);
         self.serialized_writer_lease_expiry
-            .store(lease_secs, Ordering::Release);
+            .store(lease_expiry_epoch_secs, Ordering::Release);
         true
     }
 
@@ -579,6 +580,90 @@ impl SharedMemoryLayout {
     pub fn check_serialized_writer(&self) -> Option<TxnId> {
         let token = self.serialized_writer_token.load(Ordering::Acquire);
         TxnId::new(token)
+    }
+
+    /// Check serialized-writer exclusion for concurrent writers (§5.8.1).
+    ///
+    /// Returns `Ok(())` if no serialized writer is active (or if a stale
+    /// indicator was successfully cleared). Returns `Err(MvccError::Busy)`
+    /// if a non-stale serialized writer is active.
+    ///
+    /// The stale-indicator cleanup loop is linearizable:
+    /// - Acquire-load the token.
+    /// - If stale, CAS-clear with AcqRel.
+    /// - Retry on CAS races.
+    pub fn check_serialized_writer_exclusion(
+        &self,
+        now_epoch_secs: u64,
+        process_alive: impl Fn(u32, u64) -> bool,
+    ) -> Result<(), MvccError> {
+        let mut noop = |_token: u64| {};
+        self.check_serialized_writer_exclusion_with_hook(now_epoch_secs, process_alive, &mut noop)
+    }
+
+    fn check_serialized_writer_exclusion_with_hook<F>(
+        &self,
+        now_epoch_secs: u64,
+        process_alive: impl Fn(u32, u64) -> bool,
+        on_stale_before_cas: &mut F,
+    ) -> Result<(), MvccError>
+    where
+        F: FnMut(u64),
+    {
+        loop {
+            let token = self.serialized_writer_token.load(Ordering::Acquire);
+            if token == 0 {
+                return Ok(());
+            }
+
+            let pid = self.serialized_writer_pid.load(Ordering::Acquire);
+            let pid_birth = self.serialized_writer_pid_birth.load(Ordering::Acquire);
+            let lease_expiry = self.serialized_writer_lease_expiry.load(Ordering::Acquire);
+
+            let lease_expired = lease_expiry != 0 && now_epoch_secs >= lease_expiry;
+            let process_dead = pid != 0 && pid_birth != 0 && !process_alive(pid, pid_birth);
+
+            if !lease_expired && !process_dead {
+                tracing::warn!(
+                    token,
+                    pid,
+                    pid_birth,
+                    lease_expiry,
+                    "serialized writer active: concurrent writer excluded"
+                );
+                return Err(MvccError::Busy);
+            }
+
+            tracing::debug!(
+                token,
+                pid,
+                pid_birth,
+                lease_expiry,
+                lease_expired,
+                process_dead,
+                "serialized writer indicator appears stale; attempting CAS clear"
+            );
+
+            on_stale_before_cas(token);
+
+            if self
+                .serialized_writer_token
+                .compare_exchange(token, 0, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                // Clear auxiliary fields after token is zeroed.
+                self.serialized_writer_pid.store(0, Ordering::Release);
+                self.serialized_writer_pid_birth.store(0, Ordering::Release);
+                self.serialized_writer_lease_expiry
+                    .store(0, Ordering::Release);
+
+                tracing::info!(token, "cleared stale serialized writer indicator via CAS");
+                return Ok(());
+            }
+
+            // CAS race: some other cleaner or legitimate release/reacquire won.
+            // Loop and re-check.
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1122,7 +1207,7 @@ mod tests {
         let layout = SharedMemoryLayout::new(PageSize::DEFAULT, 64);
 
         assert!(layout.check_serialized_writer().is_none());
-        assert!(layout.acquire_serialized_writer(42, 1234, 999, 3600));
+        assert!(layout.acquire_serialized_writer(42, 1234, 999, 10_000));
         assert!(layout.check_serialized_writer().is_some());
         assert_eq!(layout.check_serialized_writer().unwrap().get(), 42);
 
@@ -1134,7 +1219,7 @@ mod tests {
     fn test_serialized_writer_idempotent_release() {
         let layout = SharedMemoryLayout::new(PageSize::DEFAULT, 64);
 
-        assert!(layout.acquire_serialized_writer(42, 1234, 999, 3600));
+        assert!(layout.acquire_serialized_writer(42, 1234, 999, 10_000));
         assert!(layout.release_serialized_writer(42));
         // Second release with same token should fail (already cleared).
         assert!(!layout.release_serialized_writer(42));
@@ -1144,9 +1229,9 @@ mod tests {
     fn test_serialized_writer_blocks_second_token() {
         let layout = SharedMemoryLayout::new(PageSize::DEFAULT, 64);
 
-        assert!(layout.acquire_serialized_writer(42, 1234, 999, 3600));
+        assert!(layout.acquire_serialized_writer(42, 1234, 999, 10_000));
         // Another token should be blocked.
-        assert!(!layout.acquire_serialized_writer(99, 5678, 888, 1800));
+        assert!(!layout.acquire_serialized_writer(99, 5678, 888, 10_000));
         // Original can still release.
         assert!(layout.release_serialized_writer(42));
     }
@@ -1154,13 +1239,14 @@ mod tests {
     #[test]
     fn test_serialized_writer_lease_set() {
         let layout = SharedMemoryLayout::new(PageSize::DEFAULT, 64);
-        assert!(layout.acquire_serialized_writer(42, 1234, 999, 3600));
+        let lease_expiry = 10_000_u64;
+        assert!(layout.acquire_serialized_writer(42, 1234, 999, lease_expiry));
 
         assert_eq!(
             layout
                 .serialized_writer_lease_expiry
                 .load(Ordering::Relaxed),
-            3600
+            lease_expiry
         );
         assert_eq!(layout.serialized_writer_pid.load(Ordering::Relaxed), 1234);
         assert_eq!(
@@ -1178,6 +1264,63 @@ mod tests {
             SharedMemoryLayout::open(&buf).unwrap_err(),
             MvccError::ShmTooSmall
         );
+    }
+
+    #[test]
+    fn test_stale_indicator_cleared_by_cas() {
+        let layout = SharedMemoryLayout::new(PageSize::DEFAULT, 64);
+        let now = 100_u64;
+
+        // Expired lease => stale.
+        assert!(layout.acquire_serialized_writer(42, 1234, 999, now.saturating_sub(1)));
+        assert!(layout.check_serialized_writer().is_some());
+
+        let res = layout.check_serialized_writer_exclusion(now, |_pid, _birth| false);
+        assert!(res.is_ok(), "stale indicator should be cleared");
+        assert!(layout.check_serialized_writer().is_none());
+        assert_eq!(layout.serialized_writer_pid.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            layout.serialized_writer_pid_birth.load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            layout
+                .serialized_writer_lease_expiry
+                .load(Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[test]
+    fn test_cas_retry_on_new_writer_during_stale_clear() {
+        let layout = SharedMemoryLayout::new(PageSize::DEFAULT, 64);
+        let now = 100_u64;
+
+        // Start with an expired (stale) indicator.
+        assert!(layout.acquire_serialized_writer(42, 1234, 999, now.saturating_sub(1)));
+
+        // Inject: between load and CAS, simulate legitimate release + new writer acquire.
+        let mut injected = false;
+        let res = layout.check_serialized_writer_exclusion_with_hook(
+            now,
+            |_pid, _birth| false,
+            &mut |token| {
+                if injected {
+                    return;
+                }
+                injected = true;
+                assert_eq!(token, 42);
+                assert!(layout.release_serialized_writer(42));
+                assert!(layout.acquire_serialized_writer(99, 5678, 888, now + 10_000));
+            },
+        );
+
+        assert_eq!(
+            res.unwrap_err(),
+            MvccError::Busy,
+            "new writer should block stale cleanup completion"
+        );
+        assert_eq!(layout.check_serialized_writer().unwrap().get(), 99);
     }
 
     #[test]
@@ -1320,7 +1463,7 @@ mod tests {
     #[test]
     fn test_serialized_writer_aux_cleared_on_release() {
         let layout = SharedMemoryLayout::new(PageSize::DEFAULT, 64);
-        assert!(layout.acquire_serialized_writer(42, 1234, 999, 3600));
+        assert!(layout.acquire_serialized_writer(42, 1234, 999, 10_000));
 
         // Verify aux fields are set.
         assert_eq!(layout.serialized_writer_pid.load(Ordering::Relaxed), 1234);

@@ -1,0 +1,18 @@
+{
+  "id": "015_compound_order_by_error",
+  "description": "Compound SELECT ORDER BY error cases match C sqlite3",
+  "ops": [
+    { "op": "open", "path": ":memory:" },
+    {
+      "op": "exec",
+      "sql": "SELECT 1 AS a UNION SELECT 2 AS b ORDER BY z",
+      "expect_error": "ERROR"
+    },
+    {
+      "op": "exec",
+      "sql": "SELECT 1 AS a UNION SELECT 2 AS b ORDER BY a+0",
+      "expect_error": "ERROR"
+    }
+  ],
+  "fsqlite_modes": ["compatibility", "native"]
+}

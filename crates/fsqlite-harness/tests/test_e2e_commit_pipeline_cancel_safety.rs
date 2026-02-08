@@ -127,6 +127,10 @@ fn test_e2e_commit_pipeline_cancel_safety() {
         done_rx
             .recv()
             .expect("coordinator should wait for post-drain checks");
+        // Keep the commit receiver alive until after the post-storm recovery check.
+        // Without this, NLL may drop `receiver` early (after its last use in the
+        // drain loop), causing `reserve()` to observe Disconnected().
+        drop(receiver);
         seen_txn_ids
     });
 

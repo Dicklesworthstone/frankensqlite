@@ -592,12 +592,18 @@ impl Region {
     }
 }
 
-/// SSI witness key basis.
+/// SSI witness key basis (§5.6.4.3).
+///
+/// Canonical key space for SSI rw-antidependency tracking. Always valid to
+/// fall back to `Page(pgno)` — finer keys reduce false positives but never
+/// compromise correctness.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum WitnessKey {
     /// Coarse witness: entire page.
     Page(PageNumber),
-    /// Semantic witness: specific B-tree cell/tag.
+    /// Semantic witness: specific B-tree cell identified by domain-separated hash.
+    ///
+    /// `tag` is `low32(xxh3_64("fsqlite:witness:cell:v1" || le_u32(btree_root) || key_bytes))`.
     Cell { btree_root: PageNumber, tag: u64 },
     /// Semantic witness: structured byte range on a page.
     ByteRange {
@@ -605,6 +611,79 @@ pub enum WitnessKey {
         start: u32,
         len: u32,
     },
+    /// Key range witness for reduced false positives on range scans (optional, advanced).
+    KeyRange {
+        btree_root: PageNumber,
+        lo: Vec<u8>,
+        hi: Vec<u8>,
+    },
+    /// Custom namespace witness (extensibility point).
+    Custom { namespace: u32, bytes: Vec<u8> },
+}
+
+impl WitnessKey {
+    /// Derive a deterministic cell tag from a B-tree root page and canonical key bytes.
+    ///
+    /// Uses domain-separated xxh3_64 (§5.6.4.3):
+    /// `cell_tag = low32(xxh3_64("fsqlite:witness:cell:v1" || le_u32(btree_root_pgno) || key_bytes))`
+    #[must_use]
+    pub fn cell_tag(btree_root: PageNumber, canonical_key_bytes: &[u8]) -> u64 {
+        use xxhash_rust::xxh3::xxh3_64;
+        let mut buf =
+            Vec::with_capacity(b"fsqlite:witness:cell:v1".len() + 4 + canonical_key_bytes.len());
+        buf.extend_from_slice(b"fsqlite:witness:cell:v1");
+        buf.extend_from_slice(&btree_root.get().to_le_bytes());
+        buf.extend_from_slice(canonical_key_bytes);
+        // Store full 64-bit hash; low32 extraction done at comparison site if needed.
+        xxh3_64(&buf)
+    }
+
+    /// Create a cell witness for a point read/uniqueness check.
+    #[must_use]
+    pub fn for_cell_read(btree_root: PageNumber, canonical_key_bytes: &[u8]) -> Self {
+        Self::Cell {
+            btree_root,
+            tag: Self::cell_tag(btree_root, canonical_key_bytes),
+        }
+    }
+
+    /// Create page-level witnesses for a range scan (phantom protection).
+    ///
+    /// Returns one `Page(leaf_pgno)` witness per visited leaf page (§5.6.4.3).
+    #[must_use]
+    pub fn for_range_scan(leaf_pages: &[PageNumber]) -> Vec<Self> {
+        leaf_pages.iter().copied().map(Self::Page).collect()
+    }
+
+    /// Create a cell + page witness pair for a point write.
+    ///
+    /// Writes register both `Cell(btree_root, cell_tag)` AND `Page(leaf_pgno)`
+    /// as write witnesses (§5.6.4.3).
+    #[must_use]
+    pub fn for_point_write(
+        btree_root: PageNumber,
+        canonical_key_bytes: &[u8],
+        leaf_pgno: PageNumber,
+    ) -> (Self, Self) {
+        let cell = Self::Cell {
+            btree_root,
+            tag: Self::cell_tag(btree_root, canonical_key_bytes),
+        };
+        let page = Self::Page(leaf_pgno);
+        (cell, page)
+    }
+
+    /// Returns `true` if this is a coarse page-level witness.
+    #[must_use]
+    pub fn is_page(&self) -> bool {
+        matches!(self, Self::Page(_))
+    }
+
+    /// Returns `true` if this is a cell-level semantic witness.
+    #[must_use]
+    pub fn is_cell(&self) -> bool {
+        matches!(self, Self::Cell { .. })
+    }
 }
 
 /// Witness hierarchy range key (prefix-based bucketing).
@@ -1398,5 +1477,200 @@ mod tests {
         let mut alloc = RowIdAllocator::new(RowIdMode::AutoIncrement);
         let r = alloc.allocate(None).unwrap();
         assert_eq!(r.get(), 1);
+    }
+
+    // ── bd-2blq: IntentOpKind, SemanticKeyRef, StructuralEffects, RowId ──
+
+    #[test]
+    fn test_intent_op_all_variants_encode_decode_roundtrip() {
+        use crate::SqliteValue;
+
+        let variants: Vec<IntentOpKind> = vec![
+            IntentOpKind::Insert {
+                table: TableId::new(1),
+                key: RowId::new(100),
+                record: vec![0x01, 0x02, 0x03],
+            },
+            IntentOpKind::Delete {
+                table: TableId::new(2),
+                key: RowId::new(200),
+            },
+            IntentOpKind::Update {
+                table: TableId::new(3),
+                key: RowId::new(300),
+                new_record: vec![0x04, 0x05],
+            },
+            IntentOpKind::IndexInsert {
+                index: IndexId::new(10),
+                key: vec![0xAA, 0xBB],
+                rowid: RowId::new(400),
+            },
+            IntentOpKind::IndexDelete {
+                index: IndexId::new(11),
+                key: vec![0xCC],
+                rowid: RowId::new(500),
+            },
+            IntentOpKind::UpdateExpression {
+                table: TableId::new(4),
+                key: RowId::new(600),
+                column_updates: vec![
+                    (
+                        ColumnIdx::new(0),
+                        RebaseExpr::BinaryOp {
+                            op: RebaseBinaryOp::Add,
+                            left: Box::new(RebaseExpr::ColumnRef(ColumnIdx::new(0))),
+                            right: Box::new(RebaseExpr::Literal(SqliteValue::Integer(1))),
+                        },
+                    ),
+                    (
+                        ColumnIdx::new(2),
+                        RebaseExpr::Coalesce(vec![
+                            RebaseExpr::ColumnRef(ColumnIdx::new(2)),
+                            RebaseExpr::Literal(SqliteValue::Integer(0)),
+                        ]),
+                    ),
+                ],
+            },
+        ];
+
+        for variant in &variants {
+            let op = IntentOp {
+                schema_epoch: 42,
+                footprint: IntentFootprint::empty(),
+                op: variant.clone(),
+            };
+
+            let json = serde_json::to_string(&op).expect("serialize must succeed");
+            let decoded: IntentOp = serde_json::from_str(&json).expect("deserialize must succeed");
+
+            assert_eq!(decoded, op, "roundtrip failed for variant: {variant:?}");
+        }
+    }
+
+    #[test]
+    fn test_semantic_key_ref_digest_stable() {
+        let table = BtreeRef::Table(TableId::new(42));
+        let key_bytes = b"canonical_key_data";
+
+        // Compute digest twice — must be identical.
+        let d1 = SemanticKeyRef::compute_digest(SemanticKeyKind::TableRow, table, key_bytes);
+        let d2 = SemanticKeyRef::compute_digest(SemanticKeyKind::TableRow, table, key_bytes);
+        assert_eq!(d1, d2, "digest must be stable across calls");
+
+        // Construct via `new()` — digest must match.
+        let skr = SemanticKeyRef::new(table, SemanticKeyKind::TableRow, key_bytes);
+        assert_eq!(skr.key_digest, d1);
+
+        // Different key bytes produce different digest.
+        let d3 = SemanticKeyRef::compute_digest(SemanticKeyKind::TableRow, table, b"different_key");
+        assert_ne!(d1, d3);
+
+        // Different kind produces different digest.
+        let d4 = SemanticKeyRef::compute_digest(SemanticKeyKind::IndexEntry, table, key_bytes);
+        assert_ne!(d1, d4);
+
+        // Different btree produces different digest.
+        let index = BtreeRef::Index(IndexId::new(42));
+        let d5 = SemanticKeyRef::compute_digest(SemanticKeyKind::TableRow, index, key_bytes);
+        assert_ne!(d1, d5);
+
+        // Digest is 16 bytes (Trunc128).
+        assert_eq!(d1.len(), 16);
+    }
+
+    #[test]
+    fn test_structural_effects_bitflags() {
+        // NONE = 0.
+        assert_eq!(StructuralEffects::NONE.bits(), 0);
+        assert!(StructuralEffects::NONE.is_empty());
+
+        // Simple leaf operations have no structural effects.
+        let leaf = StructuralEffects::NONE;
+        assert!(!leaf.contains(StructuralEffects::PAGE_SPLIT));
+        assert!(!leaf.contains(StructuralEffects::FREELIST_MUTATE));
+
+        // Page split + overflow alloc.
+        let split_overflow = StructuralEffects::PAGE_SPLIT | StructuralEffects::OVERFLOW_ALLOC;
+        assert!(split_overflow.contains(StructuralEffects::PAGE_SPLIT));
+        assert!(split_overflow.contains(StructuralEffects::OVERFLOW_ALLOC));
+        assert!(!split_overflow.contains(StructuralEffects::PAGE_MERGE));
+
+        // All flags can be combined.
+        let all = StructuralEffects::PAGE_SPLIT
+            | StructuralEffects::PAGE_MERGE
+            | StructuralEffects::BALANCE_MULTI_PAGE
+            | StructuralEffects::OVERFLOW_ALLOC
+            | StructuralEffects::OVERFLOW_MUTATE
+            | StructuralEffects::FREELIST_MUTATE
+            | StructuralEffects::POINTER_MAP_MUTATE
+            | StructuralEffects::DEFRAG_MOVE_CELLS;
+        assert!(all.contains(StructuralEffects::FREELIST_MUTATE));
+        assert!(all.contains(StructuralEffects::DEFRAG_MOVE_CELLS));
+
+        // Serde roundtrip.
+        let json = serde_json::to_string(&split_overflow).expect("serialize");
+        let decoded: StructuralEffects = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded, split_overflow);
+    }
+
+    #[test]
+    fn test_rowid_allocator_monotone_no_collision() {
+        // Two "concurrent writers" allocating from the same allocator must
+        // produce disjoint, monotonically increasing rowids.
+        let mut alloc = RowIdAllocator::new(RowIdMode::Normal);
+        let mut ids: Vec<RowId> = Vec::new();
+
+        // Writer A gets range.
+        for _ in 0..5 {
+            let max_existing = ids.last().copied();
+            let r = alloc.allocate(max_existing).unwrap();
+            ids.push(r);
+        }
+
+        // Writer B continues from same state.
+        for _ in 0..5 {
+            let max_existing = ids.last().copied();
+            let r = alloc.allocate(max_existing).unwrap();
+            ids.push(r);
+        }
+
+        // Verify monotonic and disjoint.
+        let raw_ids: Vec<i64> = ids.iter().map(|r| r.get()).collect();
+        for window in raw_ids.windows(2) {
+            assert!(
+                window[1] > window[0],
+                "RowIds must be strictly monotonically increasing: {} <= {}",
+                window[0],
+                window[1]
+            );
+        }
+
+        // Verify no duplicates.
+        let unique: HashSet<i64> = raw_ids.iter().copied().collect();
+        assert_eq!(unique.len(), raw_ids.len(), "RowIds must be disjoint");
+    }
+
+    #[test]
+    fn test_rowid_allocator_bump_on_explicit_rowid() {
+        let mut alloc = RowIdAllocator::new(RowIdMode::AutoIncrement);
+
+        // Normal allocation: start at 1.
+        let r1 = alloc.allocate(None).unwrap();
+        assert_eq!(r1.get(), 1);
+
+        // Explicit rowid 1000 bumps the high-water mark.
+        alloc.set_sequence_high_water(1000);
+
+        // Next allocation must be at least 1001.
+        let r2 = alloc.allocate(Some(RowId::new(999))).unwrap();
+        assert!(
+            r2.get() >= 1001,
+            "allocator must bump past explicit rowid 1000, got {}",
+            r2.get()
+        );
+
+        // Verify subsequent allocations continue above.
+        let r3 = alloc.allocate(Some(r2)).unwrap();
+        assert!(r3.get() > r2.get());
     }
 }
