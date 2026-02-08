@@ -537,16 +537,18 @@
       @keyframes spFadeIn { from { opacity: 0; transform: translateY(-8px); } to { opacity: 1; transform: translateY(0); } }
       .search-palette-input { border: none; border-bottom: 1px solid rgba(2, 6, 23, 0.08); padding: 14px 16px; font-size: 15px; font-family: inherit; outline: none; background: transparent; width: 100%; }
       .search-palette-input::placeholder { color: rgba(2, 6, 23, 0.38); }
-      .search-palette-results { flex: 1; overflow-y: auto; padding: 4px; }
-      .search-palette-item { display: flex; align-items: baseline; gap: 8px; padding: 8px 12px; border-radius: 10px; cursor: pointer; font-size: 13px; color: #0f172a; }
-      .search-palette-item:hover, .search-palette-item.kb-active { background: rgba(59, 130, 246, 0.08); }
-      .search-palette-item .sp-idx { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: rgba(2, 6, 23, 0.35); font-size: 11px; min-width: 24px; flex-shrink: 0; }
-      .search-palette-item .sp-hash { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: rgba(59, 130, 246, 0.6); font-size: 11px; flex-shrink: 0; }
-      .search-palette-item .sp-subject { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; }
-      .search-palette-item .sp-score { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: rgba(2, 6, 23, 0.25); font-size: 10px; flex-shrink: 0; }
-      .search-palette-hint { padding: 16px; text-align: center; font-size: 12px; color: rgba(2, 6, 23, 0.4); }
-      .search-palette-footer { border-top: 1px solid rgba(2, 6, 23, 0.06); padding: 6px 12px; display: flex; gap: 12px; font-size: 10px; color: rgba(2, 6, 23, 0.38); }
-      .search-palette-footer kbd { display: inline-block; padding: 1px 5px; border: 1px solid rgba(2, 6, 23, 0.15); border-radius: 4px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; background: rgba(2, 6, 23, 0.03); }
+	      .search-palette-results { flex: 1; overflow-y: auto; padding: 4px; }
+	      .search-palette-item { display: flex; align-items: baseline; gap: 8px; padding: 8px 12px; border-radius: 10px; cursor: pointer; font-size: 13px; color: #0f172a; }
+	      .search-palette-item:hover, .search-palette-item.kb-active, .search-palette-item.active { background: rgba(59, 130, 246, 0.08); }
+	      .search-palette-item .sp-idx { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: rgba(2, 6, 23, 0.35); font-size: 11px; min-width: 24px; flex-shrink: 0; }
+	      .search-palette-item .sp-hash { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: rgba(59, 130, 246, 0.6); font-size: 11px; flex-shrink: 0; }
+	      .search-palette-item .sp-subject { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; }
+	      .search-palette-item .sp-score { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: rgba(2, 6, 23, 0.25); font-size: 10px; flex-shrink: 0; }
+	      .search-palette-section { padding: 10px 12px 6px; font-size: 11px; font-weight: 800; letter-spacing: 0.08em; text-transform: uppercase; color: rgba(2, 6, 23, 0.5); }
+	      .search-palette-note { padding: 10px 12px; font-size: 11px; color: rgba(2, 6, 23, 0.48); }
+	      .search-palette-hint { padding: 16px; text-align: center; font-size: 12px; color: rgba(2, 6, 23, 0.4); }
+	      .search-palette-footer { border-top: 1px solid rgba(2, 6, 23, 0.06); padding: 6px 12px; display: flex; gap: 12px; font-size: 10px; color: rgba(2, 6, 23, 0.38); }
+	      .search-palette-footer kbd { display: inline-block; padding: 1px 5px; border: 1px solid rgba(2, 6, 23, 0.15); border-radius: 4px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; background: rgba(2, 6, 23, 0.03); }
       @media (max-width: 639px) {
         .search-palette-overlay { padding-top: 0; align-items: stretch; }
         .search-palette { width: 100%; max-height: 100%; border-radius: 0; }
@@ -660,7 +662,7 @@
                     class="inline-block h-2 w-2 rounded-full"
                     style="background: linear-gradient(90deg, var(--c1), var(--c6))"
                   ></span>
-                  Single-file visualization
+	                  SQLite-backed visualization
                 </span>
                 <span
                   id="metaSpan"
@@ -932,7 +934,7 @@
               </div>
             </div>
             <div id="outlierList" class="mt-3 space-y-1.5 max-h-[50vh] overflow-auto"></div>
-            <div id="outlierEmpty" class="hidden mt-3 text-xs text-slate-400 italic p-3">No outliers detected.</div>
+            <div id="outlierEmpty" class="mt-3 text-xs text-slate-400 italic p-3">Outliers will appear after a quick compute (runs on idle).</div>
             <div id="outlierLoading" class="hidden mt-3 text-xs text-slate-400 italic p-3">Computing outliers...</div>
           </section>
 
@@ -960,7 +962,7 @@
               </div>
             </div>
             <div id="clusterList" class="mt-3 space-y-2 max-h-[50vh] overflow-auto"></div>
-            <div id="clusterEmpty" class="hidden mt-3 text-xs text-slate-400 italic p-3">No clusters found.</div>
+            <div id="clusterEmpty" class="mt-3 text-xs text-slate-400 italic p-3">Enable Galaxy Brain to compute clusters.</div>
             <div id="clusterLoading" class="hidden mt-3 text-xs text-slate-400 italic p-3">Computing clusters...</div>
             <!-- In-cluster navigation (shown when a cluster is selected) -->
             <div id="clusterNav" class="hidden mt-3 flex items-center justify-between border-t border-slate-900/10 pt-3">
@@ -1055,9 +1057,9 @@
               </div>
             </div>
 
-            <div id="docLoading" class="mt-4 rounded-3xl border border-slate-900/10 bg-white/60 p-4 text-sm text-slate-700">
-              Loading spec evolution dataset... (local gzip JSON; no GitHub API)
-            </div>
+	            <div id="docLoading" class="mt-4 rounded-3xl border border-slate-900/10 bg-white/60 p-4 text-sm text-slate-700">
+	              Loading spec evolution dataset... (SQLite via sql.js; no GitHub API)
+	            </div>
 
             <div id="docMain" class="mt-4 hidden grid-cols-1 gap-4 lg:grid lg:grid-cols-[1fr_360px]">
               <section class="glass-2 rounded-3xl p-4 lg:p-5">
@@ -1559,12 +1561,12 @@
     </div>
 
     <!-- History Search Palette (bd-24q.9.2) -->
-    <div id="searchPaletteOverlay" class="search-palette-overlay hidden" role="dialog" aria-modal="true" aria-label="Search history">
-      <div class="search-palette">
-        <input id="searchPaletteInput" class="search-palette-input" type="text" placeholder="Search commits, sections, keywords... (use &quot;quotes&quot; for exact phrase)" autocomplete="off" spellcheck="false" />
-        <div id="searchPaletteResults" class="search-palette-results">
-          <div class="search-palette-hint">Type to search across all commits</div>
-        </div>
+	    <div id="searchPaletteOverlay" class="search-palette-overlay hidden" role="dialog" aria-modal="true" aria-label="Search commits">
+	      <div class="search-palette">
+	        <input id="searchPaletteInput" class="search-palette-input" type="text" placeholder="Search commits, sections, keywords... (use &quot;quotes&quot; for exact phrase)" aria-label="Search commits" autocomplete="off" autocapitalize="off" spellcheck="false" />
+	        <div id="searchPaletteResults" class="search-palette-results">
+	          <div class="search-palette-hint">Type to search across all commits</div>
+	        </div>
         <div class="search-palette-footer">
           <span><kbd>&uarr;</kbd><kbd>&darr;</kbd> navigate</span>
           <span><kbd>Enter</kbd> jump</span>
@@ -1709,8 +1711,14 @@
 	    <script type="module">
 	      const { dayjs, echarts, hljs, markdownit, DOMPurify, Diff2Html, Diff } = window;
 
-      // Extend dayjs with UTC plugin for timezone-aware binning.
-      if (dayjs && window.dayjs_plugin_utc) dayjs.extend(window.dayjs_plugin_utc);
+	      // Extend dayjs with UTC plugin for timezone-aware binning.
+	      if (dayjs && window.dayjs_plugin_utc) dayjs.extend(window.dayjs_plugin_utc);
+
+	      // highlight.js emits noisy warnings when diff renderers include HTML spans inside <code>.
+	      // We sanitize rendered Markdown with DOMPurify, and we do not apply hljs to diff2html output.
+	      if (hljs && typeof hljs.configure === "function") {
+	        try { hljs.configure({ ignoreUnescapedHTML: true }); } catch { /* ignore */ }
+	      }
 
       // requestIdleCallback polyfill (Safari < 16.4)
       if (typeof requestIdleCallback === "undefined") {
@@ -1896,6 +1904,39 @@
         hunks: new Map(),
         lev: new Map(),
       };
+
+      function syncMetricOptionAvailability() {
+        const hasTokens = METRICS.tokensChanged.size > 0;
+        const hasLev = METRICS.lev.size > 0;
+        const hasHunks = METRICS.hunks.size > 0;
+
+        const syncSel = (sel, rules, fallbackValue) => {
+          if (!sel) return;
+          for (const opt of sel.querySelectorAll("option")) {
+            const ok = rules[opt.value];
+            if (ok === undefined) continue;
+            opt.disabled = !ok;
+            if (!ok) {
+              opt.title = "Compute metrics to enable this option";
+            } else {
+              opt.title = "";
+            }
+          }
+          const cur = [...sel.options].find((o) => o.value === sel.value);
+          if (cur && cur.disabled) sel.value = fallbackValue;
+        };
+
+        syncSel(
+          document.getElementById("stackMetric"),
+          { tokens: hasTokens, lev: hasLev },
+          "groups",
+        );
+        syncSel(
+          document.getElementById("outlierMetricSel"),
+          { tokens: hasTokens, lev: hasLev, hunks: hasHunks },
+          "impact",
+        );
+      }
 
 
       // --- Cache Layer (bd-24q.5.2) ---
@@ -4234,6 +4275,10 @@
 
       async function warmDerivedWorkerArtifacts() {
         if (!WORKER_STATE.ready) return;
+        if (WORKER_DERIVED.searchReady && WORKER_DERIVED.clusterReady && WORKER_DERIVED.mostEditedReady) {
+          setWorkerStatus("Worker online · search + clustering + analytics ready", "ok");
+          return;
+        }
         WARMUP_ABORT_CONTROLLER?.abort();
         WARMUP_ABORT_CONTROLLER = new AbortController();
         const _wSignal = WARMUP_ABORT_CONTROLLER.signal;
@@ -4544,19 +4589,18 @@
           try {
             return await workerRequest("first_introduced", { query, contextLines: contextLines || 3 }, { timeoutMs: 15000 });
           } catch (e) { console.warn("Worker first_introduced fallback:", e); }
-        }
-        // Inline fallback: scan patches directly.
-        const commits = ALL_COMMITS || [];
-        const patches = STATE.dataset?.patches || [];
-        if (!commits.length || !query) return { found: false, query };
-        const q = query.toLowerCase().trim();
-        const ctx = Math.max(0, Number(contextLines) || 3);
-        for (let i = 0; i < patches.length; i++) {
-          const patch = patches[i] || "";
-          const lines = String(patch).split("\n");
-          for (let j = 0; j < lines.length; j++) {
-            const line = lines[j];
-            if (!line.startsWith("+") || line.startsWith("+++")) continue;
+	        }
+	        // Inline fallback: scan patches directly.
+	        const commits = ALL_COMMITS || [];
+	        if (!commits.length || !query) return { found: false, query };
+	        const q = query.toLowerCase().trim();
+	        const ctx = Math.max(0, Number(contextLines) || 3);
+	        for (let i = 0; i < commits.length; i++) {
+	          const patch = patchForIdx(i) || "";
+	          const lines = String(patch).split("\n");
+	          for (let j = 0; j < lines.length; j++) {
+	            const line = lines[j];
+	            if (!line.startsWith("+") || line.startsWith("+++")) continue;
             const text = line.slice(1);
             if (text.toLowerCase().includes(q)) {
               const ctxLines = [];
@@ -5084,6 +5128,7 @@
 
       function _doRender() {
         ensureEnriched();
+        syncMetricOptionAvailability();
         const enriched = ALL_COMMITS;
         const missing = ENRICHED_MISSING;
 
@@ -5142,26 +5187,15 @@
         const showingCount = _getRenderElement("showingCount");
         if (showingCount) showingCount.textContent = `${fmtInt(filtered.length)} commits`;
 
-        // Charts + list
-        renderBucketToggles();
-        renderCharts(filtered);
-        renderCommitList(filtered);
-        syncDockAndDoc();
+	        // Charts + list
+	        renderBucketToggles();
+	        renderCharts(filtered);
+	        renderCommitList(filtered);
+	        syncDockAndDoc();
 
-        // Make sure code highlighting is applied to newly inserted excerpts
-        requestIdleCallback(() => {
-          document.querySelectorAll("pre code:not(.hljs)").forEach((el) => {
-            try {
-              hljs.highlightElement(el);
-            } catch {
-              // ignore
-            }
-          });
-        }, { timeout: 500 });
-
-        // Keep URL in sync with filter/view state.
-        syncUrlToState();
-      }
+	        // Keep URL in sync with filter/view state.
+	        syncUrlToState();
+	      }
 
       function matchesFilters(commit, q) {
         if (commit.impact < STATE.minImpact) return false;
@@ -5189,6 +5223,52 @@
         idx: 0,
         lines: null,
       };
+
+      // Rendering the full spec (10k+ lines) is expensive; defer it until the user scrolls to the
+      // doc section or explicitly requests a heavy view (spec/diff/sections).
+      const DOC_RENDER = {
+        near: false,
+        forced: false,
+      };
+
+      function docHeavyEnabled() {
+        return DOC_RENDER.forced || DOC_RENDER.near;
+      }
+
+      function forceDocHeavyRender() {
+        DOC_RENDER.forced = true;
+      }
+
+      function initDeferredDocRender() {
+        const section = document.getElementById("sectionDoc");
+        if (!section) return;
+
+        // If already near the viewport, allow heavy rendering immediately.
+        const rect = section.getBoundingClientRect();
+        if (rect.top <= window.innerHeight + 240) {
+          DOC_RENDER.near = true;
+          return;
+        }
+
+        if (!("IntersectionObserver" in window)) {
+          DOC_RENDER.near = true;
+          return;
+        }
+
+        const obs = new IntersectionObserver(
+          (entries) => {
+            for (const e of entries) {
+              if (!e.isIntersecting) continue;
+              DOC_RENDER.near = true;
+              obs.disconnect();
+              void updateDocUI();
+              break;
+            }
+          },
+          { root: null, threshold: 0.01, rootMargin: "600px 0px" },
+        );
+        obs.observe(section);
+      }
 
       function setDocTab(tab) {
         DOC.tab = tab;
@@ -6293,8 +6373,7 @@
         _spResults = [];
         ov.classList.remove("hidden");
         inp.value = "";
-        document.getElementById("searchPaletteResults").innerHTML =
-          '<div class="search-palette-hint">Type to search across all commits</div>';
+        renderSearchPaletteEmpty();
         requestAnimationFrame(() => inp.focus());
       }
 
@@ -6307,20 +6386,83 @@
         clearTimeout(_spDebounce);
       }
 
-	      async function searchPaletteQuery(q) {
-	        if (_spAbort) { _spAbort.abort(); _spAbort = null; }
-	        const container = document.getElementById("searchPaletteResults");
-	        if (!container) return;
-	        const trimmed = q.trim();
-	        if (!trimmed) {
-	          _spResults = [];
-	          _spActiveIdx = -1;
-	          container.innerHTML = '<div class="search-palette-hint">Type to search across all commits</div>';
-	          return;
-	        }
-	        container.innerHTML = '<div class="search-palette-hint">Searching\u2026</div>';
-	        _spAbort = new AbortController();
-	        try {
+      function renderSearchPaletteList(container) {
+        if (!container) return;
+        container.innerHTML = _spResults.map((h, i) => {
+          const badge = h.badge
+            ? `<span style="display:inline-flex;align-items:center;gap:6px;margin-right:8px;padding:2px 8px;border-radius:999px;border:1px solid rgba(2,6,23,0.10);background:rgba(255,255,255,0.75);font-size:10px;font-weight:700;color:rgba(2,6,23,0.62);white-space:nowrap;">${escapeHtml(h.badge)}</span>`
+            : "";
+          return (
+            `<div class="search-palette-item${i === _spActiveIdx ? " active" : ""}" data-sp-idx="${i}">` +
+            `<span class="sp-idx">#${fmtInt(h.idx)}</span>` +
+            `<span class="sp-hash">${escapeHtml(h.short || "")}</span>` +
+            `<span class="sp-subject">${badge}${escapeHtml(h.subject || "")}</span>` +
+            `</div>`
+          );
+        }).join("");
+      }
+
+      function renderSearchPaletteEmpty() {
+        const container = document.getElementById("searchPaletteResults");
+        if (!container) return;
+        try {
+          ensureEnriched();
+        } catch {
+          container.innerHTML = '<div class="search-palette-hint">Loading dataset\u2026</div>';
+          return;
+        }
+        const commits = ALL_COMMITS || [];
+        if (!commits.length) {
+          container.innerHTML = '<div class="search-palette-hint">Dataset not loaded yet</div>';
+          return;
+        }
+
+        const latest = commits[commits.length - 1];
+        const earliest = commits[0];
+        const biggestImpact = commits.reduce((a, b) => (Number(b.impact || 0) > Number(a.impact || 0) ? b : a), commits[0]);
+        const mostGroups = commits.reduce((a, b) => ((b.changeGroups?.length || 0) > (a.changeGroups?.length || 0) ? b : a), commits[0]);
+        const biggestAdd = commits.reduce((a, b) => (Number(b.add || 0) > Number(a.add || 0) ? b : a), commits[0]);
+
+        const picks = [
+          { c: latest, badge: "Latest" },
+          { c: biggestImpact, badge: "Biggest impact" },
+          { c: mostGroups, badge: "Most groups" },
+          { c: biggestAdd, badge: "Most added" },
+          { c: earliest, badge: "Inception" },
+        ];
+
+        const seen = new Set();
+        _spResults = [];
+        for (const p of picks) {
+          const c = p.c;
+          if (!c) continue;
+          if (seen.has(c.idx)) continue;
+          seen.add(c.idx);
+          _spResults.push({ idx: c.idx, short: c.short, subject: c.subject, badge: p.badge });
+        }
+        _spActiveIdx = _spResults.length ? 0 : -1;
+
+        container.innerHTML =
+          `<div class="search-palette-section">Quick jumps</div>` +
+          `<div id="spQuickList"></div>` +
+          `<div class="search-palette-note">Type to search. Examples: <span class="mono">MVCC</span>, <span class="mono">WAL</span>, <span class="mono">RaptorQ</span>, <span class="mono">SSI</span>.</div>`;
+        renderSearchPaletteList(document.getElementById("spQuickList"));
+      }
+
+      async function searchPaletteQuery(q) {
+        if (_spAbort) { _spAbort.abort(); _spAbort = null; }
+        const container = document.getElementById("searchPaletteResults");
+        if (!container) return;
+        const trimmed = q.trim();
+        if (!trimmed) {
+          _spResults = [];
+          _spActiveIdx = -1;
+          renderSearchPaletteEmpty();
+          return;
+        }
+        container.innerHTML = '<div class="search-palette-hint">Searching\u2026</div>';
+        _spAbort = new AbortController();
+        try {
 	          // Fast main-thread fallback (137 commits): avoids initializing the heavy worker.
 	          if (!WORKER_STATE.ready) {
 	            ensureEnriched();
@@ -6330,37 +6472,27 @@
 	              const cg = (c.changeGroups || []).map((g) => `${g.summary || ""} ${(g.changed_headings || []).join(" ")} ${(g.evidence || []).join(" ")}`).join(" ");
 	              const hay = `${c.idx} ${c.short} ${c.hash} ${c.author} ${c.subject} ${cg}`.toLowerCase();
 	              if (!hay.includes(ql)) continue;
-	              hits.push({ idx: c.idx, short: c.short, subject: c.subject });
-	              if (hits.length >= 30) break;
-	            }
-	            _spResults = hits;
-	            _spActiveIdx = _spResults.length ? 0 : -1;
-	            if (!_spResults.length) {
-	              container.innerHTML = '<div class="search-palette-hint">No results</div>';
-	              return;
-	            }
-	            container.innerHTML = _spResults.map((h, i) =>
-	              `<div class="search-palette-item${i === _spActiveIdx ? " active" : ""}" data-sp-idx="${i}">` +
-	              `<span class="font-medium text-slate-900 truncate">#${h.idx} ${h.short}</span>` +
-	              `<span class="text-xs text-slate-500 truncate">${h.subject}</span>` +
-	              `</div>`
-	            ).join("");
-	            return;
-	          }
+		              hits.push({ idx: c.idx, short: c.short, subject: c.subject });
+		              if (hits.length >= 30) break;
+		            }
+		            _spResults = hits;
+		            _spActiveIdx = _spResults.length ? 0 : -1;
+		            if (!_spResults.length) {
+		              container.innerHTML = '<div class="search-palette-hint">No results</div>';
+		              return;
+		            }
+		            renderSearchPaletteList(container);
+		            return;
+		          }
 
 	          const res = await workerRequest("query_search", { q: trimmed, limit: 30 }, { signal: _spAbort.signal });
 	          _spResults = res.hits || [];
-	          _spActiveIdx = _spResults.length ? 0 : -1;
-	          if (!_spResults.length) {
-	            container.innerHTML = '<div class="search-palette-hint">No results</div>';
+		          _spActiveIdx = _spResults.length ? 0 : -1;
+		          if (!_spResults.length) {
+		            container.innerHTML = '<div class="search-palette-hint">No results</div>';
             return;
           }
-          container.innerHTML = _spResults.map((h, i) =>
-            `<div class="search-palette-item${i === _spActiveIdx ? " active" : ""}" data-sp-idx="${i}">` +
-            `<span class="font-medium text-slate-900 truncate">#${h.idx} ${h.short}</span>` +
-            `<span class="text-xs text-slate-500 truncate">${h.subject}</span>` +
-            `</div>`
-          ).join("");
+          renderSearchPaletteList(container);
         } catch (err) {
           if (err.name === "AbortError") return;
           container.innerHTML = '<div class="search-palette-hint">Search error</div>';
@@ -6371,8 +6503,12 @@
         const hit = _spResults[i];
         if (!hit) return;
         closeSearchPalette();
+        // Jump should take you to the diff view and the doc section.
+        forceDocHeavyRender();
+        DOC_RENDER.near = true;
         selectCommitIdx(hit.idx);
         setDocTab("diff");
+        scrollToSection("sectionDoc");
       }
 
       function spNavigate(delta) {
@@ -13519,11 +13655,11 @@
         if (!DATASET.loaded) {
           loading.classList.remove("hidden");
           main.classList.add("hidden");
-          loading.textContent = DATASET.error
-            ? `Spec evolution dataset unavailable: ${DATASET.error}`
-            : "Loading spec evolution dataset... (local gzip JSON; no GitHub API)";
-          return;
-        }
+	          loading.textContent = DATASET.error
+	            ? `Spec evolution dataset unavailable: ${DATASET.error}`
+	            : "Loading spec evolution dataset... (SQLite via sql.js; no GitHub API)";
+	          return;
+	        }
 
         loading.classList.add("hidden");
         main.classList.remove("hidden");
@@ -13566,17 +13702,74 @@
         const mBytes = document.getElementById("mBytes");
         const mHunks = document.getElementById("mHunks");
         const mLev = document.getElementById("mLev");
-        if (mTokens) mTokens.textContent = (tok === null || tok === undefined) ? "-" : fmtInt(tok);
-        if (mBytes) mBytes.textContent = (byt === null || byt === undefined) ? "-" : fmtInt(byt);
-        if (mHunks) mHunks.textContent = (hn === null || hn === undefined) ? "-" : fmtInt(hn);
-        if (mLev) mLev.textContent = (lv === null || lv === undefined) ? "-" : fmtInt(lv);
+	        if (mTokens) mTokens.textContent = (tok === null || tok === undefined) ? "-" : fmtInt(tok);
+	        if (mBytes) mBytes.textContent = (byt === null || byt === undefined) ? "-" : fmtInt(byt);
+	        if (mHunks) mHunks.textContent = (hn === null || hn === undefined) ? "-" : fmtInt(hn);
+	        if (mLev) mLev.textContent = (lv === null || lv === undefined) ? "-" : fmtInt(lv);
+	
+	        // Heavy doc rendering (spec/diff/sections) is deferred for performance unless the user is
+	        // near the doc section or explicitly requests it.
+	        if (!docHeavyEnabled() && (DOC.tab === "spec" || DOC.tab === "diff" || DOC.tab === "sections")) {
+	          if (DOC.tab === "spec") {
+	            const raw = document.getElementById("docRaw");
+	            const rendered = document.getElementById("docRendered");
+	            const msg = `
+	              <div class="rounded-2xl border border-slate-900/10 bg-white/70 p-4">
+	                <div class="text-sm font-semibold text-slate-900">Spec rendering deferred</div>
+	                <div class="mt-1 text-xs leading-relaxed text-slate-600">
+	                  Rendering the full spec is intentionally deferred to keep page load fast.
+	                  Scroll to this section (or click below) to render.
+	                </div>
+	                <div class="mt-3">
+	                  <button id="btnDocRenderNowSpec" class="focus-ring rounded-xl bg-slate-900 px-3 py-2 text-xs font-semibold text-white hover:bg-slate-800" type="button">
+	                    Render now
+	                  </button>
+	                </div>
+	              </div>
+	            `.trim();
+	            if (rendered) rendered.innerHTML = msg;
+	            if (raw) raw.textContent = "Raw spec rendering deferred. Click \"Render now\" above to load.";
+	            if (rendered) rendered.classList.toggle("hidden", DOC.rawSpec);
+	            if (raw) raw.classList.toggle("hidden", !DOC.rawSpec);
+	            const btn = document.getElementById("btnDocRenderNowSpec");
+	            if (btn) btn.onclick = () => { forceDocHeavyRender(); DOC_RENDER.near = true; void updateDocUI(); };
+	          } else if (DOC.tab === "diff") {
+	            const raw = document.getElementById("diffRaw");
+	            const pretty = document.getElementById("diffPretty");
+	            const msg = `
+	              <div class="rounded-2xl border border-slate-900/10 bg-white/70 p-4">
+	                <div class="text-sm font-semibold text-slate-900">Diff rendering deferred</div>
+	                <div class="mt-1 text-xs leading-relaxed text-slate-600">
+	                  Pretty diffs are computed on demand. Scroll to this section (or click below) to render.
+	                </div>
+	                <div class="mt-3">
+	                  <button id="btnDocRenderNowDiff" class="focus-ring rounded-xl bg-slate-900 px-3 py-2 text-xs font-semibold text-white hover:bg-slate-800" type="button">
+	                    Render now
+	                  </button>
+	                </div>
+	              </div>
+	            `.trim();
+	            if (pretty) pretty.innerHTML = msg;
+	            if (raw) raw.textContent = "";
+	            const btn = document.getElementById("btnDocRenderNowDiff");
+	            if (btn) btn.onclick = () => { forceDocHeavyRender(); DOC_RENDER.near = true; void updateDocUI(); };
+	          } else if (DOC.tab === "sections") {
+	            const wrap = document.getElementById("sectionTableWrap");
+	            const empty = document.getElementById("sectionEmpty");
+	            if (wrap) wrap.classList.add("hidden");
+	            if (empty) {
+	              empty.classList.remove("hidden");
+	              empty.textContent = "Section summaries are deferred for speed. Scroll here to compute.";
+	            }
+	          }
+	          return;
+	        }
 
-        const patch = patchForIdx(DOC.idx);
-
-        if (DOC.tab === "diff") {
-          const raw = document.getElementById("diffRaw");
-          const pretty = document.getElementById("diffPretty");
-          const inRenderedMode = DOC.compareMode && DOC.abViewMode === "rendered";
+	        if (DOC.tab === "diff") {
+	          const patch = patchForIdx(DOC.idx);
+	          const raw = document.getElementById("diffRaw");
+	          const pretty = document.getElementById("diffPretty");
+	          const inRenderedMode = DOC.compareMode && DOC.abViewMode === "rendered";
 
           const cacheKey = DOC.compareMode 
             ? `ab|${DOC.compareFromIdx}:${DOC.compareToIdx}|${DOC.diffLayout}|${DOC.diffMode}|${DOC.abViewMode}`
@@ -13734,35 +13927,10 @@
           void updateMiniMap();
         }
 
-        if (DOC.tab === "sections") {
-          void updateSectionSummary();
-        }
-
-        if (DATASET.loaded && DOC.idx > 0 && !METRICS.lev.has(c.hash)) {
-          void (async () => {
-            try {
-              const d = await levenshteinForPatch(patch);
-              METRICS.lev.set(c.hash, d);
-              if (ALL_COMMITS[DOC.idx]?.hash === c.hash) {
-                const mLev = document.getElementById("mLev");
-                if (mLev) mLev.textContent = fmtInt(d);
-                syncDockAndDoc();
-              }
-            } catch (e) {
-              if (e?.name !== "AbortError") {
-                console.error("On-demand Levenshtein failed:", e);
-                if (ALL_COMMITS[DOC.idx]?.hash === c.hash) {
-                  const levNode = document.getElementById("mLev");
-                  if (levNode) {
-                    levNode.textContent = "ERR";
-                    levNode.title = formatErr(e);
-                  }
-                }
-              }
-            }
-          })();
-        }
-      }
+	        if (DOC.tab === "sections") {
+	          void updateSectionSummary();
+	        }
+	      }
 
       let COMPUTE_RUNNING = false;
 
@@ -14905,6 +15073,13 @@
         const loading = document.getElementById("clusterLoading");
         if (!list) return;
 
+        if (!WORKER_STATE.ready) {
+          if (loading) loading.classList.add("hidden");
+          if (empty) empty.classList.remove("hidden");
+          list.innerHTML = "";
+          return;
+        }
+
         const threshold = parseFloat(document.getElementById("clusterThresholdSel")?.value || "0.3");
         const limit = parseInt(document.getElementById("clusterLimitSel")?.value || "10", 10);
 
@@ -15712,7 +15887,41 @@
         });
 
         // Galaxy brain button: jump to alien section
-        document.getElementById("btnGalaxy").addEventListener("click", () => scrollToSection("sectionAlien"));
+        document.getElementById("btnGalaxy").addEventListener("click", () => {
+          scrollToSection("sectionAlien");
+          const btn = document.getElementById("btnGalaxy");
+          const orig = btn?.textContent || "Galaxy Brain";
+
+          const setBtn = (text, disabled) => {
+            if (!btn) return;
+            btn.textContent = text;
+            btn.disabled = !!disabled;
+            btn.style.opacity = disabled ? "0.85" : "1";
+          };
+
+          void (async () => {
+            try {
+              setBtn("Warming Galaxy Brain\u2026", true);
+              const ok = await initAnalysisWorker();
+              if (!ok) return;
+              await warmDerivedWorkerArtifacts();
+              // Force chart refresh so phase/outlier overlays compute once the worker is online.
+              _lastChartsCommitsHash = "";
+              render();
+              setBtn("Galaxy Brain \u2713", false);
+              setTimeout(() => { if (btn) btn.textContent = orig; }, 1400);
+            } catch (e) {
+              console.error("Galaxy Brain warmup failed:", e);
+              setBtn(orig, false);
+            } finally {
+              if (btn) {
+                btn.disabled = false;
+                btn.style.opacity = "1";
+                if (btn.textContent && btn.textContent.includes("Warming")) btn.textContent = orig;
+              }
+            }
+          })();
+        });
 
         // Dock collapse toggle (mobile)
         const dockBody = document.getElementById("dockBody");
@@ -15869,6 +16078,7 @@
       });
 
 	      wireUI();
+	      initDeferredDocRender();
 	      _wireHeatStripe();
 	      _wireMiniMapMobile();
 	      _wireStoryMobile();
@@ -15895,35 +16105,72 @@
 		        // Start at the latest commit (most interesting view).
 		        DOC.idx = Math.max(0, ALL_COMMITS.length - 1);
 
-		        // Restore state from URL if present; otherwise use defaults.
-		        const urlState = decodeUrlState(location.search);
-		        if (urlState) {
-		          applyUrlState(urlState);
-	          if (DOC.compareMode) {
+			        // Restore state from URL if present; otherwise use defaults.
+			        const urlState = decodeUrlState(location.search);
+			        if (urlState) {
+			          applyUrlState(urlState);
+		          if (DOC.compareMode) {
 	            populateCompareSelects();
 	            const _b = document.getElementById("btnCompareToggle"); if (_b) { _b.classList.add("bg-slate-900","text-white"); _b.classList.remove("bg-white/70","text-slate-900"); }
 	            const _r = document.getElementById("abCompareBar"); if (_r) _r.classList.remove("hidden");
 	            const _l = document.getElementById("btnDiffLayout"); if (_l) { _l.classList.remove("hidden"); _l.textContent = DOC.diffLayout === "side-by-side" ? "Side-by-Side" : "Unified"; }
-	          }
-	        }
+		          }
+		        }
+	
+		        // If the URL explicitly requests a heavy doc view, render it immediately (deep links).
+		        {
+		          const p = new URLSearchParams(location.search || "");
+		          const t = p.get("t");
+		          const wantsHeavy =
+		            (p.has("t") && (t === "spec" || t === "diff" || t === "sections")) ||
+		            p.get("cmp") === "1" ||
+		            p.get("raw") === "1" ||
+		            p.get("ih") === "1";
+		          if (wantsHeavy) {
+		            forceDocHeavyRender();
+		            DOC_RENDER.near = true;
+		          }
+		        }
 
-	        // Set tab (may have been overridden by URL state).
-	        setDocTab(DOC.tab);
-	        render();
+		        // Set tab (may have been overridden by URL state).
+		        setDocTab(DOC.tab);
+		        render();
 
-		        // Record initial URL state (replaceState so back goes to referrer, not blank).
-		        syncUrlToState({ immediate: true, replace: true });
-		      })();
+		        // Populate outliers on idle so the panel isn't blank (fast for 137 commits).
+		        requestIdleCallback(() => {
+		          const cs = (Array.isArray(FILTERED_COMMITS) && FILTERED_COMMITS.length) ? FILTERED_COMMITS : ALL_COMMITS;
+		          if (cs && cs.length) void renderOutlierPanel(cs);
+		        }, { timeout: 1500 });
+
+			        // Record initial URL state (replaceState so back goes to referrer, not blank).
+			        syncUrlToState({ immediate: true, replace: true });
+			      })();
 
       // Browser back/forward: restore state from URL.
       window.addEventListener("popstate", () => {
-        const s = decodeUrlState(location.search);
-        if (s) {
-          applyUrlState(s);
-          // Restore compare UI elements.
-          const cmpBtn = document.getElementById("btnCompareToggle");
-          const cmpBar = document.getElementById("abCompareBar");
-          const layoutBtn = document.getElementById("btnDiffLayout");
+	        const s = decodeUrlState(location.search);
+	        if (s) {
+	          applyUrlState(s);
+	
+	          // If the URL explicitly requests a heavy doc view, render it immediately.
+	          {
+	            const p = new URLSearchParams(location.search || "");
+	            const t = p.get("t");
+	            const wantsHeavy =
+	              (p.has("t") && (t === "spec" || t === "diff" || t === "sections")) ||
+	              p.get("cmp") === "1" ||
+	              p.get("raw") === "1" ||
+	              p.get("ih") === "1";
+	            if (wantsHeavy) {
+	              forceDocHeavyRender();
+	              DOC_RENDER.near = true;
+	            }
+	          }
+
+	          // Restore compare UI elements.
+	          const cmpBtn = document.getElementById("btnCompareToggle");
+	          const cmpBar = document.getElementById("abCompareBar");
+	          const layoutBtn = document.getElementById("btnDiffLayout");
           if (cmpBtn) { cmpBtn.classList.toggle("bg-slate-900", DOC.compareMode); cmpBtn.classList.toggle("text-white", DOC.compareMode); cmpBtn.classList.toggle("bg-white/70", !DOC.compareMode); cmpBtn.classList.toggle("text-slate-900", !DOC.compareMode); }
           if (cmpBar) cmpBar.classList.toggle("hidden", !DOC.compareMode);
           if (layoutBtn) { layoutBtn.classList.toggle("hidden", !DOC.compareMode); if (DOC.compareMode) layoutBtn.textContent = DOC.diffLayout === "side-by-side" ? "Side-by-Side" : "Unified"; }

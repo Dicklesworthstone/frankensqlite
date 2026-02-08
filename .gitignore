@@ -63,3 +63,7 @@ spec_review_findings.md
 .bv/
 
 # Spec evolution visualization artifacts (tracked)
+
+# Node / Playwright (local only)
+node_modules/
+test-results/
