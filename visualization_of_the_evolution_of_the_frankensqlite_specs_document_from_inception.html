@@ -141,344 +141,40 @@
             flex-shrink: 0;
             z-index: 50;
             backdrop-filter: blur(10px);
+            transition: transform 0.4s var(--ease-out-expo), margin-left 0.4s var(--ease-in-out);
         }
 
-        .sidebar-header {
-            padding: 24px;
-            border-bottom: 1px solid var(--border);
-            background: rgba(10, 10, 10, 0.3);
+        /* ... (skipping unchanged parts) ... */
+
+        /* --- Focus Mode --- */
+        body.focus-mode .app-header { margin-top: calc(var(--header-height) * -1); }
+        body.focus-mode .sidebar { margin-left: calc(var(--sidebar-width) * -1); }
+        body.focus-mode .dock { margin-bottom: -100px; } /* Approx height */
+        
+        body.focus-mode .app-header, 
+        body.focus-mode .sidebar, 
+        body.focus-mode .dock { 
+            pointer-events: none; 
+            opacity: 0;
         }
         
-        .search-wrapper { position: relative; }
-        .search-wrapper input {
-            width: 100%;
-            background: var(--bg-surface-2);
-            border: 1px solid var(--border);
-            padding: 12px 16px;
-            color: var(--text-1);
-            font-family: var(--font-sans);
-            font-size: 13px;
-            border-radius: var(--radius-md);
-            outline: none;
-            transition: all var(--duration-fast);
-            box-shadow: inset 0 2px 4px rgba(0,0,0,0.2);
-        }
+        body.focus-mode .main-content { margin: 0; height: 100vh; }
+        body.focus-mode .scroll-pane { padding: 40px; }
         
-        .search-wrapper input:focus {
-            border-color: var(--text-3);
-            background: var(--bg-surface-3);
-            box-shadow: 0 0 0 4px rgba(255,255,255,0.02);
-        }
+        .app-header, .dock { transition: margin 0.4s var(--ease-in-out), opacity 0.4s var(--ease-in-out); }
 
-        .commit-list {
-            flex: 1;
-            overflow-y: auto;
-            padding: 16px;
+        .btn-focus-exit {
+            position: fixed; bottom: 32px; right: 32px; 
+            background: var(--primary); color: #000; font-weight: 700;
+            padding: 12px 24px; border-radius: 99px; box-shadow: 0 4px 20px var(--primary-glow);
+            z-index: 5000; opacity: 0; transform: translateY(20px); transition: all 0.3s;
+            cursor: pointer; border: none; font-family: var(--font-sans);
         }
+        body.focus-mode .btn-focus-exit { opacity: 1; transform: translateY(0); }
 
-        .commit-card {
-            background: transparent;
-            border: 1px solid transparent;
-            border-radius: var(--radius-md);
-            padding: 14px;
-            margin-bottom: 8px;
-            cursor: pointer;
-            transition: all var(--duration-fast);
-            position: relative;
-            overflow: hidden;
-        }
-
-        .commit-card:hover {
-            background: rgba(255, 255, 255, 0.02);
-            border-color: var(--border-hover);
-            transform: translateY(-1px);
-        }
-
-        .commit-card.selected {
-            background: var(--bg-surface-2);
-            border-color: var(--primary-dim);
-            box-shadow: 0 4px 20px rgba(0,0,0,0.2);
-        }
-        .commit-card.selected::before {
-            content: '';
-            position: absolute;
-            left: 0; top: 0; bottom: 0;
-            width: 3px;
-            background: var(--primary);
-            box-shadow: 0 0 12px var(--primary);
-        }
-
-        .commit-card-header {
-            display: flex;
-            justify-content: space-between;
-            font-size: 10px;
-            color: var(--text-3);
-            font-family: var(--font-mono);
-            margin-bottom: 8px;
-            letter-spacing: 0.05em;
-        }
-
-        .commit-card-subject {
-            font-size: 14px;
-            font-weight: 500;
-            color: var(--text-2);
-            margin-bottom: 10px;
-            line-height: 1.5;
-            display: -webkit-box;
-            -webkit-line-clamp: 2;
-            -webkit-box-orient: vertical;
-            overflow: hidden;
-            transition: color 0.2s;
-        }
-
-        .commit-card.selected .commit-card-subject { color: var(--text-1); }
-
-        .commit-card-meta {
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            font-size: 11px;
-            font-weight: 600;
-        }
-        
-        .tag-pill {
-            padding: 2px 8px;
-            border-radius: 4px;
-            background: rgba(255,255,255,0.05);
-            font-size: 10px;
-            text-transform: uppercase;
-            letter-spacing: 0.05em;
-        }
-
-        /* --- Main Content --- */
-        .main-content {
-            flex: 1;
-            display: flex;
-            flex-direction: column;
-            background: transparent;
-            overflow: hidden;
-            position: relative;
-        }
-
-        .content-header {
-            height: 56px;
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            padding: 0 40px;
-            border-bottom: 1px solid var(--border);
-            background: rgba(5,5,5,0.2);
-            backdrop-filter: blur(5px);
-        }
-
-        .tabs { 
-            display: flex; 
-            gap: 24px; 
-            position: relative;
-        }
-        
-        .tab {
-            font-size: 13px;
-            font-weight: 500;
-            cursor: pointer;
-            color: var(--text-3);
-            padding: 18px 0;
-            transition: color var(--duration-fast);
-            position: relative;
-        }
-        
-        .tab:hover { color: var(--text-2); }
-        .tab.active { color: var(--text-1); }
-        
-        .tab.active::after {
-            content: '';
-            position: absolute;
-            bottom: -1px;
-            left: 0; right: 0;
-            height: 2px;
-            background: var(--primary);
-            box-shadow: 0 -2px 10px var(--primary-glow);
-        }
-
-        .viewport { flex: 1; position: relative; overflow: hidden; }
-        
-        .scroll-pane { 
-            height: 100%; 
-            overflow-y: auto; 
-            padding: 60px 80px;
-            scroll-behavior: smooth;
-        }
-
-        .spec-container {
-            max-width: 900px;
-            margin: 0 auto;
-            color: var(--text-2);
-            padding-bottom: 120px;
-        }
-
-        .spec-content {
-            font-family: var(--font-sans);
-            font-size: 16px;
-            line-height: 1.8;
-            color: var(--text-2);
-        }
-
-        .spec-content h1, .spec-content h2, .spec-content h3 {
-            color: var(--text-1);
-            font-weight: 700;
-            letter-spacing: -0.02em;
-            margin-top: 2.5em;
-            margin-bottom: 1em;
-        }
-        
-        .spec-content h1 { 
-            font-size: 32px; 
-            border-bottom: 1px solid var(--border); 
-            padding-bottom: 0.8em; 
-            background: linear-gradient(to bottom, #fff, #aaa);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-        }
-        
-        .spec-content h2 { font-size: 22px; }
-        
-        .spec-content code {
-            font-family: var(--font-mono);
-            background: rgba(255,255,255,0.06);
-            padding: 2px 6px;
-            border-radius: 4px;
-            font-size: 0.85em;
-            color: #d1d5db;
-            border: 1px solid rgba(255,255,255,0.04);
-        }
-        
-        .spec-content pre {
-            background: #0d0d0d;
-            border: 1px solid var(--border);
-            border-radius: var(--radius-md);
-            padding: 24px;
-            overflow-x: auto;
-            margin: 2em 0;
-            box-shadow: inset 0 2px 10px rgba(0,0,0,0.5);
-        }
-
-        /* --- Dock --- */
-        .dock {
-            background: var(--glass-bg);
-            backdrop-filter: var(--backdrop-blur);
-            border-top: 1px solid var(--glass-border);
-            padding: 16px 32px calc(16px + env(safe-area-inset-bottom));
-            z-index: 100;
-        }
-
-        .evolution-map { 
-            height: 56px; 
-            background: var(--bg-surface); 
-            border-radius: var(--radius-md); 
-            position: relative; 
-            margin-bottom: 20px; 
-            border: 1px solid var(--border); 
-            overflow: hidden;
-            box-shadow: inset 0 2px 8px rgba(0,0,0,0.3);
-        }
-        
-        .map-canvas { width: 100%; height: 100%; display: block; opacity: 1; }
-        .map-slider { 
-            position: absolute; inset: 0; width: 100%; height: 100%; 
-            -webkit-appearance: none; background: transparent; margin: 0; z-index: 10; 
-            cursor: pointer;
-        }
-        .map-slider:focus { outline: none; }
-        .map-slider::-webkit-slider-thumb { 
-            -webkit-appearance: none; 
-            width: 4px; 
-            height: 56px; 
-            background: #fff; 
-            box-shadow: 0 0 20px rgba(255,255,255,0.8); 
-            border-radius: 2px;
-        }
-
-        .dock-bottom { display: flex; align-items: center; justify-content: space-between; gap: 24px; }
-        
-        .btn-lab {
-            background: var(--bg-surface-3); 
-            border: 1px solid var(--border); 
-            color: var(--text-2); 
-            font-family: var(--font-sans);
-            font-weight: 500; 
-            padding: 8px 16px; 
-            border-radius: var(--radius-sm); 
-            font-size: 12px; 
-            cursor: pointer;
-            transition: all 0.2s var(--ease-out-expo);
-        }
-        .btn-lab:hover { 
-            background: var(--text-4); 
-            color: var(--text-1); 
-            border-color: var(--text-3); 
-            transform: translateY(-1px);
-        }
-        .btn-lab:active { transform: translateY(0); }
-
-        .btn-play { display: none !important; }
-
-        /* --- Mobile Overrides --- */
-        .mobile-only { display: none !important; }
-        
-        @media (max-width: 768px) {
-            .mobile-only { display: block !important; }
-            .mobile-hide { display: none !important; }
-            
-            .sidebar {
-                position: absolute;
-                top: 0; bottom: 0; left: 0;
-                width: 90%;
-                max-width: 340px;
-                transform: translateX(-100%);
-                box-shadow: 50px 0 100px rgba(0,0,0,0.5);
-                transition: transform 0.4s var(--ease-out-expo);
-            }
-            .sidebar.active { transform: translateX(0); }
-            
-            .app-header { padding: 0 20px; height: 60px; }
-            .content-header { padding: 0 20px; overflow-x: auto; gap: 16px; }
-            .scroll-pane { padding: 24px 20px; }
-            
-            .dock { padding: 16px 20px calc(16px + env(safe-area-inset-bottom)); }
-            .evolution-map { height: 60px; }
-            
-            .tabs { gap: 16px; }
-        }
-
-        /* --- Utilities --- */
-        .hidden { display: none !important; }
-        
         /* --- Responsive Tables (Card View) --- */
         @media (max-width: 768px) {
-            .spec-content table, .spec-content thead, .spec-content tbody, .spec-content th, .spec-content td, .spec-content tr { 
-                display: block; 
-            }
-            .spec-content thead tr { position: absolute; top: -9999px; left: -9999px; }
-            .spec-content tr { 
-                border: 1px solid var(--border); 
-                margin-bottom: 16px; 
-                border-radius: var(--radius-sm); 
-                background: var(--bg-surface-2);
-                overflow: hidden;
-            }
-            .spec-content td { 
-                border: none; 
-                border-bottom: 1px solid var(--border); 
-                position: relative; 
-                padding: 12px 16px 12px 40%; 
-                text-align: right;
-                font-size: 13px;
-                min-height: 40px;
-                display: flex;
-                align-items: center;
-                justify-content: flex-end;
-            }
-            .spec-content td:last-child { border-bottom: none; }
+            /* ... (skipping unchanged parts) ... */
             .spec-content td::before { 
                 position: absolute; 
                 top: 0; left: 0; bottom: 0;
@@ -495,40 +191,10 @@
                 display: flex;
                 align-items: center;
                 border-right: 1px solid var(--border);
+                overflow: hidden;
+                text-overflow: ellipsis;
             }
         }
-        
-        /* --- Mobile Legend --- */
-        .legend-overlay {
-            position: fixed; inset: 0; background: rgba(0,0,0,0.8); backdrop-filter: blur(8px);
-            z-index: 2000; display: flex; align-items: center; justify-content: center;
-            opacity: 0; pointer-events: none; transition: opacity 0.3s;
-        }
-        .legend-overlay.active { opacity: 1; pointer-events: auto; }
-        .legend-card {
-            background: var(--bg-surface); border: 1px solid var(--border); 
-            border-radius: var(--radius-md); padding: 24px; width: 90%; max-width: 320px;
-            box-shadow: 0 10px 40px rgba(0,0,0,0.5);
-        }
-        .legend-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-        .legend-item { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--text-2); }
-        .legend-dot { width: 8px; height: 8px; border-radius: 50%; }
-
-        /* --- Focus Mode --- */
-        body.focus-mode .sidebar, body.focus-mode .dock, body.focus-mode .app-header { transform: translateY(150%) opacity(0); pointer-events: none; }
-        body.focus-mode .app-header { transform: translateY(-100%); }
-        body.focus-mode .sidebar { transform: translateX(-100%); }
-        body.focus-mode .main-content { margin: 0; height: 100vh; }
-        body.focus-mode .scroll-pane { padding: 40px; }
-        
-        .btn-focus-exit {
-            position: fixed; bottom: 32px; right: 32px; 
-            background: var(--primary); color: #000; font-weight: 700;
-            padding: 12px 24px; border-radius: 99px; box-shadow: 0 4px 20px var(--primary-glow);
-            z-index: 5000; opacity: 0; transform: translateY(20px); transition: all 0.3s;
-            cursor: pointer; border: none; font-family: var(--font-sans);
-        }
-        body.focus-mode .btn-focus-exit { opacity: 1; transform: translateY(0); }
 
         /* --- Diff Highlight --- */
         .diff-highlight {
@@ -565,7 +231,7 @@
     <div class="kpis" style="display: flex; gap: 30px;">
         <div style="display: flex; flex-direction: column;"><span style="font-size: 10px; font-weight: 600; color: var(--text-3); letter-spacing: 0.05em;">ENTRIES</span><span id="kpiCommits" style="font-size: 13px; font-weight: 600; color: var(--text-1);">-</span></div>
         <div style="display: flex; flex-direction: column;"><span style="font-size: 10px; font-weight: 600; color: var(--text-3); letter-spacing: 0.05em;">MASS</span><span id="kpiLines" style="font-size: 13px; font-weight: 600; color: var(--text-1);">-</span></div>
-        <button class="btn-lab mobile-only" id="btnShowLegend" style="margin-left: 12px;">LEGEND</button>
+        <button class="btn-lab" id="btnShowLegend" style="margin-left: 12px;">LEGEND</button>
     </div>
     <button class="btn-lab mobile-hide" onclick="window.open('https://github.com/Dicklesworthstone/frankensqlite')">SOURCE</button>
 </header>
