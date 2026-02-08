@@ -506,6 +506,11 @@ impl TransactionManager {
     /// Returns `MvccError::InvalidState` if not active.
     pub fn commit(&self, txn: &mut Transaction) -> Result<CommitSeq, MvccError> {
         if txn.state != TransactionState::Active {
+            tracing::error!(
+                txn_id = %txn.txn_id,
+                state = ?txn.state,
+                "lock protocol violation: commit attempted on non-active transaction"
+            );
             return Err(MvccError::InvalidState);
         }
 
@@ -752,44 +757,82 @@ impl TransactionManager {
         Ok(commit_seq)
     }
 
-    /// Concurrent commit path.
+    /// Concurrent commit path (§5.8 FCW + merge-retry pipeline, bd-zppf).
+    ///
+    /// Pipeline: (1) SSI validation, (2) FCW CommitIndex check with rebase
+    /// attempt on conflict, (3) SSI re-validation after rebase, (4) publish.
     fn commit_concurrent(&self, txn: &mut Transaction) -> Result<CommitSeq, MvccError> {
-        // SSI validation (simplified): if dangerous structure, abort.
+        // Step 1: SSI validation — if dangerous structure, abort immediately.
         if txn.has_dangerous_structure() {
             self.abort(txn);
             return Err(MvccError::BusySnapshot);
         }
 
-        // FCW freshness validation: abort on first conflict.
-        // Merge-retry is a separate bead (bd-zppf).
+        // Step 2: FCW freshness validation with merge-retry (§5.8, §5.10).
+        // First pass: collect conflicting pages.
+        let mut conflicts = Vec::new();
         for &pgno in &txn.write_set {
             if let Some(latest) = self.commit_index.latest(pgno) {
                 if latest > txn.snapshot.high {
-                    let page_kind = txn
-                        .write_set_data
-                        .get(&pgno)
-                        .map_or(MergePageKind::OpaqueLab, |page| {
-                            classify_page_for_merge(page.as_bytes())
-                        });
-                    let decision =
-                        merge_decision(self.write_merge_policy, page_kind, cfg!(debug_assertions));
-                    tracing::warn!(
-                        txn_id = %txn.txn_id,
-                        pgno = pgno.get(),
-                        latest_seq = latest.get(),
-                        snapshot_high = txn.snapshot.high.get(),
-                        ?page_kind,
-                        ?decision,
-                        ?self.write_merge_policy,
-                        "FCW conflict detected in concurrent commit"
-                    );
-                    self.abort(txn);
-                    return Err(MvccError::BusySnapshot);
+                    conflicts.push(pgno);
                 }
             }
         }
 
-        // Publish.
+        // Second pass: attempt rebase for each conflicting page.
+        let mut rebased = false;
+        for pgno in conflicts {
+            let page_kind = {
+                let data = txn.write_set_data.get(&pgno);
+                data.map_or(MergePageKind::OpaqueLab, |page| {
+                    classify_page_for_merge(page.as_bytes())
+                })
+            };
+            let decision =
+                merge_decision(self.write_merge_policy, page_kind, cfg!(debug_assertions));
+
+            if decision == MergeDecision::AbortRetry {
+                tracing::info!(
+                    txn_id = %txn.txn_id,
+                    pgno = pgno.get(),
+                    ?decision,
+                    "FCW conflict: merge policy is Off, aborting"
+                );
+                self.abort(txn);
+                return Err(MvccError::BusySnapshot);
+            }
+
+            // Attempt deterministic rebase (§5.10).
+            if self.try_rebase_page(txn, pgno) {
+                tracing::info!(
+                    txn_id = %txn.txn_id,
+                    pgno = pgno.get(),
+                    ?page_kind,
+                    ?decision,
+                    "FCW conflict resolved via disjoint rebase"
+                );
+                rebased = true;
+            } else {
+                tracing::info!(
+                    txn_id = %txn.txn_id,
+                    pgno = pgno.get(),
+                    ?page_kind,
+                    ?decision,
+                    "FCW conflict: rebase failed, aborting"
+                );
+                self.abort(txn);
+                return Err(MvccError::BusySnapshot);
+            }
+        }
+
+        // Step 3: SSI re-validation after rebase (§5.7.3 — mandatory even on
+        // successful rebase, per spec line ~9005).
+        if rebased && txn.has_dangerous_structure() {
+            self.abort(txn);
+            return Err(MvccError::BusySnapshot);
+        }
+
+        // Step 4: Publish.
         let commit_seq = self.publish_write_set(txn);
         txn.commit();
         self.release_all_resources(txn);
@@ -797,10 +840,64 @@ impl TransactionManager {
         tracing::info!(
             txn_id = %txn.txn_id,
             commit_seq = commit_seq.get(),
+            rebased,
             "concurrent commit succeeded"
         );
 
         Ok(commit_seq)
+    }
+
+    /// Attempt to rebase a conflicting page via GF(256) disjoint merge (§5.10).
+    ///
+    /// Computes XOR deltas between (base, ours) and (base, theirs). If the
+    /// deltas have disjoint support (non-overlapping byte changes), composes
+    /// them to produce a merged page and updates the transaction's write set.
+    fn try_rebase_page(&self, txn: &mut Transaction, pgno: PageNumber) -> bool {
+        // Get base version visible at txn's snapshot.
+        let base_data = match self.version_store.resolve(pgno, &txn.snapshot) {
+            Some(idx) => match self.version_store.get_version(idx) {
+                Some(v) => v.data,
+                None => return false,
+            },
+            None => {
+                // Page didn't exist at txn's snapshot — insert-insert conflict,
+                // cannot rebase without higher-level intent replay.
+                return false;
+            }
+        };
+
+        // Get latest committed version (chain head = "theirs").
+        let latest_data = match self.version_store.chain_head(pgno) {
+            Some(idx) => match self.version_store.get_version(idx) {
+                Some(v) => v.data,
+                None => return false,
+            },
+            None => return false,
+        };
+
+        // Get txn's written data ("ours").
+        let ours = match txn.write_set_data.get(&pgno) {
+            Some(data) => data.clone(),
+            None => return false,
+        };
+
+        // Compute XOR deltas.
+        let Some(delta_ours) = gf256_patch_delta(base_data.as_bytes(), ours.as_bytes()) else {
+            return false;
+        };
+        let Some(delta_theirs) = gf256_patch_delta(base_data.as_bytes(), latest_data.as_bytes())
+        else {
+            return false;
+        };
+
+        // Compose if disjoint.
+        match compose_disjoint_gf256_patches(base_data.as_bytes(), &delta_ours, &delta_theirs) {
+            Some(merged) => {
+                txn.write_set_data.insert(pgno, PageData::from_vec(merged));
+                true
+            }
+            None => false,
+        }
     }
 
     /// Publish a transaction's write set into the version store and commit index.
@@ -968,16 +1065,16 @@ impl TransactionManager {
     fn release_serialized_writer_exclusion(&self, txn_id: TxnId) {
         let token = txn_id.get();
         if !self.shm.release_serialized_writer(token) {
-            tracing::warn!(
+            tracing::error!(
                 txn_id = %txn_id,
                 token,
-                "failed to release serialized writer indicator (token mismatch)"
+                "lock protocol violation: serialized writer indicator release failed (token mismatch)"
             );
         }
         if !self.write_mutex.release(txn_id) {
-            tracing::warn!(
+            tracing::error!(
                 txn_id = %txn_id,
-                "failed to release serialized write mutex (not held by txn)"
+                "lock protocol violation: serialized write mutex release failed (not held by txn)"
             );
         }
     }
@@ -2954,5 +3051,254 @@ mod tests {
         // Keep the named E2E hook requested in bead comments and run the same
         // executable theorem suite.
         test_e2e_all_six_theorems_under_concurrent_workload();
+    }
+
+    // ===================================================================
+    // bd-zppf tests — §5.8 FCW Conflict Detection and Resolution
+    // ===================================================================
+
+    /// Helper: create a page where only byte at `offset` is set to `value`.
+    /// This lets us produce disjoint XOR deltas for rebase tests.
+    fn test_data_at(offset: usize, value: u8) -> PageData {
+        let mut data = PageData::zeroed(PageSize::DEFAULT);
+        data.as_bytes_mut()[offset] = value;
+        data
+    }
+
+    // -- bd-zppf test 1: T1 commits, T2 detects conflict --
+
+    #[test]
+    fn test_first_committer_wins() {
+        let mut m = mgr();
+        // Policy Off: conflicts always abort (no merge attempt).
+        m.set_write_merge_policy(WriteMergePolicy::Off).unwrap();
+
+        let pgno = PageNumber::new(1).unwrap();
+
+        // T1 and T2 begin at the same snapshot (stale for T2 after T1 commits).
+        let mut txn1 = m.begin(BeginKind::Concurrent).unwrap();
+        let mut txn2 = m.begin(BeginKind::Concurrent).unwrap();
+
+        // T1 writes and commits first (acquires & releases page lock).
+        m.write_page(&mut txn1, pgno, test_data(0xAA)).unwrap();
+        let seq1 = m.commit(&mut txn1).unwrap();
+        assert!(seq1.get() > 0);
+
+        // T2 writes the same page AFTER T1 released its lock.
+        m.write_page(&mut txn2, pgno, test_data(0xBB)).unwrap();
+
+        // T2 commits — detects conflict via CommitIndex (seq1 > T2.snapshot.high).
+        let result = m.commit(&mut txn2);
+        assert_eq!(
+            result.unwrap_err(),
+            MvccError::BusySnapshot,
+            "second committer must get SQLITE_BUSY_SNAPSHOT"
+        );
+        assert_eq!(txn2.state, TransactionState::Aborted);
+    }
+
+    // -- bd-zppf test 2: no conflict on different pages --
+
+    #[test]
+    fn test_no_conflict_different_pages() {
+        let m = mgr();
+
+        let mut txn1 = m.begin(BeginKind::Concurrent).unwrap();
+        let mut txn2 = m.begin(BeginKind::Concurrent).unwrap();
+
+        // Different pages — no conflict.
+        m.write_page(&mut txn1, PageNumber::new(1).unwrap(), test_data(0xAA))
+            .unwrap();
+        m.write_page(&mut txn2, PageNumber::new(2).unwrap(), test_data(0xBB))
+            .unwrap();
+
+        // Both commit successfully — no conflict.
+        let seq1 = m.commit(&mut txn1).unwrap();
+        let seq2 = m.commit(&mut txn2).unwrap();
+        assert!(seq1.get() > 0);
+        assert!(seq2.get() > seq1.get());
+    }
+
+    // -- bd-zppf test 3: conflict with successful rebase --
+
+    #[test]
+    fn test_conflict_with_successful_rebase() {
+        let m = mgr();
+        // Default policy is Safe → StructuredPatch for non-btree pages.
+        // So the rebase path (GF(256) disjoint merge) will be attempted.
+
+        let pgno = PageNumber::new(10).unwrap();
+
+        // T0: establish a base version (all-zeros page).
+        let mut txn0 = m.begin(BeginKind::Concurrent).unwrap();
+        m.write_page(&mut txn0, pgno, PageData::zeroed(PageSize::DEFAULT))
+            .unwrap();
+        m.commit(&mut txn0).unwrap();
+
+        // T1 and T2 begin at the same snapshot (seeing T0's base).
+        let mut txn1 = m.begin(BeginKind::Concurrent).unwrap();
+        let mut txn2 = m.begin(BeginKind::Concurrent).unwrap();
+
+        // T1 writes byte[0] and commits (releases page lock).
+        m.write_page(&mut txn1, pgno, test_data_at(0, 0xAA))
+            .unwrap();
+        m.commit(&mut txn1).unwrap();
+
+        // T2 writes byte[1] after T1 releases lock — commuting operation.
+        m.write_page(&mut txn2, pgno, test_data_at(1, 0xBB))
+            .unwrap();
+
+        // T2 commits — FCW detects conflict, GF(256) disjoint merge succeeds.
+        let seq2 = m.commit(&mut txn2);
+        assert!(
+            seq2.is_ok(),
+            "disjoint byte changes should be rebasable: {seq2:?}"
+        );
+
+        // Verify the merged version contains both changes.
+        let head_idx = m.version_store().chain_head(pgno).unwrap();
+        let merged = m.version_store().get_version(head_idx).unwrap();
+        assert_eq!(merged.data.as_bytes()[0], 0xAA, "T1's change preserved");
+        assert_eq!(merged.data.as_bytes()[1], 0xBB, "T2's change preserved");
+    }
+
+    // -- bd-zppf test 4: non-rebasable conflict returns BUSY_SNAPSHOT --
+
+    #[test]
+    fn test_conflict_response_sqlite_busy() {
+        let m = mgr();
+        // Default policy is Safe (rebase attempted, but will fail for overlapping bytes).
+
+        let pgno = PageNumber::new(20).unwrap();
+
+        // T0: establish base version.
+        let mut txn0 = m.begin(BeginKind::Concurrent).unwrap();
+        m.write_page(&mut txn0, pgno, PageData::zeroed(PageSize::DEFAULT))
+            .unwrap();
+        m.commit(&mut txn0).unwrap();
+
+        // T1 and T2 begin at the same snapshot.
+        let mut txn1 = m.begin(BeginKind::Concurrent).unwrap();
+        let mut txn2 = m.begin(BeginKind::Concurrent).unwrap();
+
+        // T1 modifies byte[0] and commits (releases lock).
+        m.write_page(&mut txn1, pgno, test_data_at(0, 0xAA))
+            .unwrap();
+        m.commit(&mut txn1).unwrap();
+
+        // T2 modifies the SAME byte — non-commuting, non-rebasable.
+        m.write_page(&mut txn2, pgno, test_data_at(0, 0xBB))
+            .unwrap();
+
+        // T2: rebase fails (overlapping deltas), returns SQLITE_BUSY_SNAPSHOT.
+        let result = m.commit(&mut txn2);
+        assert_eq!(
+            result.unwrap_err(),
+            MvccError::BusySnapshot,
+            "non-rebasable conflict must return SQLITE_BUSY_SNAPSHOT"
+        );
+    }
+
+    // -- bd-zppf test 5: CommitIndex tracks latest commit per page --
+
+    #[test]
+    fn test_commit_index_lookup_correctness() {
+        let m = mgr();
+
+        let pg1 = PageNumber::new(100).unwrap();
+        let pg2 = PageNumber::new(200).unwrap();
+
+        // No commits yet — CommitIndex returns None.
+        assert_eq!(m.commit_index().latest(pg1), None);
+        assert_eq!(m.commit_index().latest(pg2), None);
+
+        // T1 writes pg1.
+        let mut txn1 = m.begin(BeginKind::Concurrent).unwrap();
+        m.write_page(&mut txn1, pg1, test_data(0x01)).unwrap();
+        let seq1 = m.commit(&mut txn1).unwrap();
+
+        // CommitIndex tracks pg1 at seq1; pg2 still None.
+        assert_eq!(m.commit_index().latest(pg1), Some(seq1));
+        assert_eq!(m.commit_index().latest(pg2), None);
+
+        // T2 writes both pages.
+        let mut txn2 = m.begin(BeginKind::Concurrent).unwrap();
+        m.write_page(&mut txn2, pg1, test_data(0x02)).unwrap();
+        m.write_page(&mut txn2, pg2, test_data(0x03)).unwrap();
+        let seq2 = m.commit(&mut txn2).unwrap();
+
+        // CommitIndex updated to seq2 for both pages.
+        assert_eq!(m.commit_index().latest(pg1), Some(seq2));
+        assert_eq!(m.commit_index().latest(pg2), Some(seq2));
+        assert!(seq2 > seq1, "later commit has higher seq");
+    }
+
+    // -- bd-zppf E2E: two concurrent writers, deterministic outcome --
+
+    #[test]
+    fn test_e2e_first_committer_wins_conflict_response() {
+        let m = mgr();
+
+        let pgno = PageNumber::new(50).unwrap();
+
+        // Establish base version.
+        let mut txn0 = m.begin(BeginKind::Concurrent).unwrap();
+        m.write_page(&mut txn0, pgno, PageData::zeroed(PageSize::DEFAULT))
+            .unwrap();
+        let base_seq = m.commit(&mut txn0).unwrap();
+
+        // --- Part 1: Disjoint changes → rebase succeeds ---
+
+        // W1 and W2 begin at the same snapshot.
+        let mut w1 = m.begin(BeginKind::Concurrent).unwrap();
+        let mut w2 = m.begin(BeginKind::Concurrent).unwrap();
+        assert_eq!(w1.snapshot.high, base_seq);
+        assert_eq!(w2.snapshot.high, base_seq);
+
+        // W1 writes byte[0] and commits (releases lock).
+        m.write_page(&mut w1, pgno, test_data_at(0, 0x11)).unwrap();
+        let seq1 = m.commit(&mut w1).unwrap();
+        assert!(seq1 > base_seq);
+
+        // W2 writes byte[4] after W1 released lock (disjoint).
+        m.write_page(&mut w2, pgno, test_data_at(4, 0x22)).unwrap();
+
+        // W2 commits — rebase succeeds (disjoint changes).
+        let seq2 = m.commit(&mut w2).unwrap();
+        assert!(seq2 > seq1);
+
+        // Verify merged version.
+        let head = m.version_store().chain_head(pgno).unwrap();
+        let merged = m.version_store().get_version(head).unwrap();
+        assert_eq!(merged.data.as_bytes()[0], 0x11, "W1 byte preserved");
+        assert_eq!(merged.data.as_bytes()[4], 0x22, "W2 byte preserved");
+        assert_eq!(merged.commit_seq, seq2);
+
+        // --- Part 2: Overlapping changes → conflict, deterministic outcome ---
+
+        let mut w3 = m.begin(BeginKind::Concurrent).unwrap();
+        let mut w4 = m.begin(BeginKind::Concurrent).unwrap();
+
+        // W3 writes byte[0] and commits.
+        m.write_page(&mut w3, pgno, test_data_at(0, 0x33)).unwrap();
+        let seq3 = m.commit(&mut w3).unwrap();
+        assert!(seq3 > seq2);
+
+        // W4 writes byte[0] after W3 released lock (overlapping).
+        m.write_page(&mut w4, pgno, test_data_at(0, 0x44)).unwrap();
+
+        // W4 fails — deterministic SQLITE_BUSY_SNAPSHOT.
+        let result = m.commit(&mut w4);
+        assert_eq!(
+            result.unwrap_err(),
+            MvccError::BusySnapshot,
+            "overlapping byte conflict must fail deterministically"
+        );
+
+        // Final verification: only W3's change visible.
+        let final_head = m.version_store().chain_head(pgno).unwrap();
+        let final_ver = m.version_store().get_version(final_head).unwrap();
+        assert_eq!(final_ver.data.as_bytes()[0], 0x33);
+        assert_eq!(final_ver.commit_seq, seq3);
     }
 }

@@ -1216,4 +1216,373 @@ mod tests {
             assert_eq!(table.holder(page), Some(txn_id));
         }
     }
+
+    // ===================================================================
+    // bd-3t3.8 tests — §5.6.3 SharedPageLockTable: Cross-Process Exclusive Locks
+    // ===================================================================
+
+    // -- bd-3t3.8 test 1: try_acquire on free page succeeds --
+
+    #[test]
+    fn test_try_acquire_free_page_succeeds() {
+        let table = SharedPageLockTable::new(TEST_CAP);
+
+        // Page 42 has no lock — try_acquire should succeed via CAS(owner_txn: 0 → 1).
+        let result = table.try_acquire(42, 1);
+        assert_eq!(result, AcquireResult::Acquired);
+
+        // Verify lock table maps page 42 → txn_id 1.
+        assert_eq!(table.holder(42), Some(1));
+        assert_eq!(table.total_locked(), 1);
+    }
+
+    // -- bd-3t3.8 test 2: try_acquire on locked page returns Busy --
+
+    #[test]
+    fn test_try_acquire_locked_page_returns_busy() {
+        let table = SharedPageLockTable::new(TEST_CAP);
+
+        // txn_1 locks page 42.
+        assert!(table.try_acquire(42, 1).is_ok());
+
+        // txn_2 tries to acquire page 42 — MUST return Busy immediately
+        // (non-blocking, no spin).
+        let result = table.try_acquire(42, 2);
+        assert_eq!(
+            result,
+            AcquireResult::Busy { holder: 1 },
+            "locked page must return SQLITE_BUSY immediately"
+        );
+
+        // Lock is unchanged — still held by txn_1.
+        assert_eq!(table.holder(42), Some(1));
+    }
+
+    // -- bd-3t3.8 test 3: idempotent acquire by same txn --
+
+    #[test]
+    fn test_try_acquire_idempotent_same_txn() {
+        let table = SharedPageLockTable::new(TEST_CAP);
+
+        // txn_1 acquires page 10.
+        assert_eq!(table.try_acquire(10, 1), AcquireResult::Acquired);
+
+        // txn_1 re-acquires same page — idempotent, no double-locking.
+        assert_eq!(table.try_acquire(10, 1), AcquireResult::AlreadyHeld);
+
+        // Still only one locked entry.
+        assert_eq!(table.total_locked(), 1);
+        assert_eq!(table.holder(10), Some(1));
+    }
+
+    // -- bd-3t3.8 test 4: release preserves key (page_number stays) --
+
+    #[test]
+    fn test_release_key_stable_no_page_number_deletion() {
+        let table = SharedPageLockTable::new(TEST_CAP);
+
+        // Acquire and release page 42.
+        assert!(table.try_acquire(42, 1).is_ok());
+        assert!(table.release(42, 1));
+
+        // After release: holder is None (owner_txn == 0).
+        assert_eq!(table.holder(42), None);
+
+        // Key-stable invariant: page_number is NOT deleted during release.
+        // The occupied_count (slots with page_number != 0) should still be 1.
+        assert_eq!(
+            table.active_occupied(),
+            1,
+            "page_number must NOT be deleted during release (key-stable invariant)"
+        );
+
+        // Re-acquiring the same page should reuse the existing slot (CAS on
+        // owner_txn, no new slot allocation needed).
+        let result = table.try_acquire(42, 2);
+        assert_eq!(result, AcquireResult::Acquired);
+        assert_eq!(table.holder(42), Some(2));
+
+        // Occupied count unchanged — no new slot created.
+        assert_eq!(table.active_occupied(), 1);
+    }
+
+    // -- bd-3t3.8 test 5: linear probing handles hash collisions --
+
+    #[test]
+    fn test_linear_probing_collision_handling() {
+        let table = SharedPageLockTable::new(TEST_CAP);
+
+        // With capacity=64 (mask=63) and fibonacci hash: h = page * 2654435769.
+        // Since 2654435769 is coprime to 64 (odd number, power-of-2 modulus),
+        // pages p and (p + 64) always hash to the same index.
+        // So pages 1 and 65 collide → exercises linear probing.
+        let page_a = 1_u32;
+        let page_b = 65_u32; // page_a + 64
+
+        // Both must be lockable by different txns despite collision.
+        assert_eq!(table.try_acquire(page_a, 100), AcquireResult::Acquired);
+        assert_eq!(table.try_acquire(page_b, 200), AcquireResult::Acquired);
+
+        // Verify both locks are independent.
+        assert_eq!(table.holder(page_a), Some(100));
+        assert_eq!(table.holder(page_b), Some(200));
+
+        // No duplicate page_number entries: exactly 2 occupied slots.
+        assert_eq!(table.active_occupied(), 2);
+
+        // Release one — the other remains.
+        assert!(table.release(page_a, 100));
+        assert_eq!(table.holder(page_a), None);
+        assert_eq!(table.holder(page_b), Some(200));
+    }
+
+    // -- bd-3t3.8 test 6: 70% load factor guard --
+
+    #[test]
+    fn test_load_factor_70_percent_guard() {
+        // Small capacity to exercise load factor check.
+        let table = SharedPageLockTable::new(16);
+
+        // Fill to > 70%. With capacity=16: 0.70 * 16 = 11.2.
+        // Need 12 entries (12/16 = 0.75 > 0.70) so the 13th is rejected.
+        for i in 1..=12_u32 {
+            let result = table.try_acquire(i, u64::from(i));
+            assert!(result.is_ok(), "should acquire page {i}, got {result:?}");
+        }
+
+        // Beyond 70%: new key acquisition must return CapacityExhausted.
+        let result = table.try_acquire(200, 200);
+        assert_eq!(
+            result,
+            AcquireResult::CapacityExhausted,
+            "new key beyond 70% load factor must fail (no corruption or pathological chains)"
+        );
+
+        // Existing keys can still be re-acquired (no new slot needed).
+        assert!(table.release(1, 1));
+        let result = table.try_acquire(1, 50);
+        assert!(
+            result.is_ok(),
+            "re-acquiring existing key slot must succeed even at capacity"
+        );
+    }
+
+    // -- bd-3t3.8 test 7: crash cleanup via release_all_for_txn --
+
+    #[test]
+    fn test_crash_cleanup_release_all_for_txn() {
+        let table = SharedPageLockTable::new(TEST_CAP);
+
+        let crashed_txn: u64 = 999;
+
+        // Process A (txn_id=999) acquires locks on P1, P2, P3.
+        assert!(table.try_acquire(1, crashed_txn).is_ok());
+        assert!(table.try_acquire(2, crashed_txn).is_ok());
+        assert!(table.try_acquire(3, crashed_txn).is_ok());
+
+        // Process B also has some locks.
+        assert!(table.try_acquire(10, 500).is_ok());
+        assert_eq!(table.total_locked(), 4);
+
+        // Rotate so locks span both tables.
+        table.acquire_rebuild_lease(1, 0, 1000).unwrap();
+        table.rotate().unwrap();
+
+        // Acquire one more lock for crashed txn in the new active table.
+        assert!(table.try_acquire(4, crashed_txn).is_ok());
+        assert_eq!(table.total_locked(), 5);
+
+        // Simulate crash: cleanup scans BOTH tables and CASes all owner_txn==999 to 0.
+        let released = table.release_all_for_txn(crashed_txn);
+        assert_eq!(
+            released, 4,
+            "must release all 4 locks held by crashed txn across both tables"
+        );
+
+        // Verify crashed txn's locks are free.
+        assert_eq!(table.holder(1), None);
+        assert_eq!(table.holder(2), None);
+        assert_eq!(table.holder(3), None);
+        assert_eq!(table.holder(4), None);
+
+        // Process B's lock is untouched.
+        assert_eq!(table.holder(10), Some(500));
+    }
+
+    // -- bd-3t3.8 test 8: rolling rebuild rotate → drain → clear --
+
+    #[test]
+    fn test_rolling_rebuild_rotate_drain_clear() {
+        let table = SharedPageLockTable::new(TEST_CAP);
+
+        // Insert locks.
+        for i in 1..=8_u32 {
+            assert!(table.try_acquire(i, u64::from(i)).is_ok());
+        }
+        assert_eq!(table.total_locked(), 8);
+        assert_eq!(table.rebuild_epoch(), 0);
+
+        // Step 1: Acquire lease and rotate to fresh active table.
+        table.acquire_rebuild_lease(42, 0, 1000).unwrap();
+        table.rotate().unwrap();
+
+        // After rotation: new acquisitions go to the fresh active table.
+        assert!(table.try_acquire(100, 100).is_ok());
+
+        // Draining table has 8 locks — NOT quiescent yet.
+        let status = table.drain_progress().unwrap();
+        assert_eq!(status.remaining, 8);
+        assert!(!status.quiescent);
+
+        // Step 2: Drain — release all draining locks (no abort storms).
+        // Transactions continue normally, releasing at their own pace.
+        for i in 1..=8_u32 {
+            assert!(table.release(i, u64::from(i)));
+        }
+
+        // Now quiescent.
+        let status = table.drain_progress().unwrap();
+        assert_eq!(status.remaining, 0);
+        assert!(status.quiescent, "drain must reach lock-quiescence");
+
+        // Step 3: Clear restores capacity — finalize clears drained table.
+        let cleared = table.finalize_rebuild(42).unwrap();
+        assert_eq!(
+            cleared, 8,
+            "must clear all 8 occupied slots from drained table"
+        );
+        assert_eq!(table.rebuild_epoch(), 1, "epoch must increment on rebuild");
+
+        // No drain in progress.
+        assert!(!table.is_rebuild_in_progress());
+
+        // New lock in fresh table is still there.
+        assert_eq!(table.holder(100), Some(100));
+    }
+
+    // -- bd-3t3.8 E2E: cross-process contention --
+
+    #[test]
+    fn test_e2e_shared_page_lock_table_cross_process_contention() {
+        use std::sync::Barrier;
+        use std::sync::atomic::AtomicBool;
+
+        let table = Arc::new(SharedPageLockTable::new(256));
+        let barrier = Arc::new(Barrier::new(2));
+        let done = Arc::new(AtomicBool::new(false));
+
+        // "Process 1" (thread 1): Writer that acquires and holds page locks.
+        let table1 = Arc::clone(&table);
+        let barrier1 = Arc::clone(&barrier);
+        let done1 = Arc::clone(&done);
+
+        let proc1 = std::thread::spawn(move || {
+            let mut acquired_count = 0_u32;
+
+            // Acquire a set of page locks.
+            for page in 1..=20_u32 {
+                let result = table1.try_acquire(page, 1);
+                assert!(result.is_ok(), "proc1 should acquire page {page}");
+                acquired_count += 1;
+            }
+
+            // Sync: both processes have attempted their locks.
+            barrier1.wait();
+
+            // Hold locks briefly, then release.
+            std::thread::yield_now();
+            for page in 1..=20_u32 {
+                table1.release(page, 1);
+            }
+
+            // Signal done.
+            done1.store(true, Ordering::Release);
+            acquired_count
+        });
+
+        // "Process 2" (thread 2): Contender that checks mutual exclusion.
+        let table2 = Arc::clone(&table);
+        let barrier2 = Arc::clone(&barrier);
+        let done2 = Arc::clone(&done);
+
+        let proc2 = std::thread::spawn(move || {
+            let mut busy_count = 0_u32;
+            let mut acquired_count = 0_u32;
+
+            // Sync: ensure proc1 has acquired its locks.
+            barrier2.wait();
+
+            // Contend for the same pages. Some will be Busy, some may have
+            // been released by now.
+            for page in 1..=20_u32 {
+                let result = table2.try_acquire(page, 2);
+                match result {
+                    AcquireResult::Busy { holder } => {
+                        // Mutual exclusion: only txn 1 can hold these.
+                        assert_eq!(
+                            holder, 1,
+                            "if busy, holder must be proc1's txn (page {page})"
+                        );
+                        busy_count += 1;
+                    }
+                    AcquireResult::Acquired => {
+                        acquired_count += 1;
+                    }
+                    other => {
+                        unreachable!("unexpected result for page {page}: {other:?}");
+                    }
+                }
+            }
+
+            // Wait for proc1 to finish releasing, then acquire remaining.
+            while !done2.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+
+            // Liveness: all pages should now be acquirable by proc2.
+            for page in 1..=20_u32 {
+                if table2.holder(page) != Some(2) {
+                    let result = table2.try_acquire(page, 2);
+                    assert!(
+                        result.is_ok(),
+                        "liveness: page {page} should be acquirable after proc1 released"
+                    );
+                }
+            }
+
+            (busy_count, acquired_count)
+        });
+
+        let p1_acquired = proc1.join().unwrap();
+        let (p2_busy, p2_early_acquired) = proc2.join().unwrap();
+
+        // Verify mutual exclusion was observed.
+        assert_eq!(p1_acquired, 20, "proc1 acquired all 20 pages");
+        assert!(
+            p2_busy + p2_early_acquired == 20,
+            "proc2 saw exactly 20 results: {p2_busy} busy + {p2_early_acquired} acquired"
+        );
+
+        // Verify all pages now held by proc2.
+        for page in 1..=20_u32 {
+            assert_eq!(
+                table.holder(page),
+                Some(2),
+                "after proc1 release, proc2 should hold page {page}"
+            );
+        }
+
+        // Rebuild completes without write unavailability.
+        let rebuild_result = table.full_rebuild(
+            100,
+            0,
+            2000,
+            |_| false, // No active txns for drain purposes.
+            Duration::from_secs(5),
+        );
+        assert!(rebuild_result.is_ok(), "rebuild must complete");
+        let result = rebuild_result.unwrap();
+        assert!(!result.timed_out, "rebuild must not time out");
+        assert_eq!(result.epoch, 1, "rebuild epoch should be 1");
+    }
 }
