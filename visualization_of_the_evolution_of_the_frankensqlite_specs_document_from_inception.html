@@ -705,17 +705,27 @@
                       </div>
                     </div>
                     <div class="mt-4">
-                      <button
-                        id="btnComputeAll"
-                        class="focus-ring w-full rounded-2xl bg-slate-900 px-4 py-2.5 text-sm font-semibold text-white hover:bg-slate-800"
-                        type="button"
-                      >
-                        Compute token + Levenshtein metrics for all commits (runs locally)
-                      </button>
+                      <div class="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                        <button
+                          id="btnComputeAll"
+                          class="focus-ring w-full rounded-2xl bg-slate-900 px-4 py-2.5 text-sm font-semibold text-white hover:bg-slate-800"
+                          type="button"
+                        >
+                          Compute token + Levenshtein metrics for all commits
+                        </button>
+                        <button
+                          id="btnCancelCompute"
+                          class="focus-ring hidden w-full rounded-2xl border border-rose-300 bg-rose-50 px-4 py-2.5 text-sm font-semibold text-rose-700 hover:bg-rose-100"
+                          type="button"
+                        >
+                          Cancel running compute
+                        </button>
+                      </div>
                       <div class="mt-2 text-xs text-slate-500">
                         This can take a bit on large diffs. The UI stays responsive; charts update
                         as metrics arrive.
                       </div>
+                      <div id="workerStatus" class="mt-2 text-xs text-slate-500"></div>
                       <div id="computeProgress" class="mt-2 hidden text-xs font-semibold text-slate-700"></div>
                     </div>
                   </div>
@@ -6134,7 +6144,15 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
 	      }
 	    ]
 	  }
-	];
+		];
+
+      const CSS_CACHE = new Map();
+      function getCss(varName) {
+        if (CSS_CACHE.has(varName)) return CSS_CACHE.get(varName);
+        const v = getComputedStyle(document.documentElement).getPropertyValue(varName).trim();
+        CSS_CACHE.set(varName, v);
+        return v;
+      }
 
       // -----------------------------
       // Buckets
@@ -6243,20 +6261,36 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
 
       const DOC_CACHE = new Map(); // idx -> { text: string, lines?: string[] }
 
+      const OUTLINE_CACHE = new Map(); // idx -> outline[]
+
       const LEV_WASM_URL = "levenshtein_bytes.wasm";
       let LEV_WASM = null;
+
+      const WORKER_STATE = {
+        worker: null,
+        ready: false,
+        disabled: false,
+        reqSeq: 1,
+        pending: new Map(), // reqId -> { resolve, reject, onProgress, timeoutId }
+        datasetHash: "",
+      };
+
+      const WORKER_DERIVED = {
+        searchReady: false,
+        clusterReady: false,
+        phase: null,
+        phaseKey: "",
+        outliers: null,
+        outlierKey: "",
+      };
+
+      let COMPUTE_ABORT_CONTROLLER = null;
+      let PHASE_ABORT_CONTROLLER = null;
+      let OUTLIER_ABORT_CONTROLLER = null;
 
       // -----------------------------
       // Helpers
       // -----------------------------
-
-      const CSS_CACHE = new Map();
-      function getCss(varName) {
-        if (CSS_CACHE.has(varName)) return CSS_CACHE.get(varName);
-        const v = getComputedStyle(document.documentElement).getPropertyValue(varName).trim();
-        CSS_CACHE.set(varName, v);
-        return v;
-      }
 
       function clamp(n, lo, hi) {
         return Math.max(lo, Math.min(hi, n));
@@ -6341,6 +6375,961 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
           m.set(hash, { add: a, del: d, impact: a + d });
         }
         return m;
+      }
+
+      function formatErr(e) {
+        const name = e?.name || "Error";
+        const message = e?.message || String(e || "Unknown error");
+        const stack = e?.stack ? String(e.stack) : "";
+        return stack ? `${name}: ${message}\n${stack}` : `${name}: ${message}`;
+      }
+
+      function setWorkerStatus(text, tone = "neutral", detail = "") {
+        const el = document.getElementById("workerStatus");
+        if (!el) return;
+        el.textContent = text || "";
+        el.title = detail ? String(detail) : "";
+        if (tone === "error") {
+          el.className = "mt-2 text-xs font-semibold text-rose-700";
+        } else if (tone === "ok") {
+          el.className = "mt-2 text-xs font-semibold text-emerald-700";
+        } else {
+          el.className = "mt-2 text-xs text-slate-500";
+        }
+      }
+
+      function supportsAnalysisWorker() {
+        return typeof Worker !== "undefined" && typeof URL !== "undefined" && typeof Blob !== "undefined";
+      }
+
+      function toHex(buf) {
+        return Array.from(new Uint8Array(buf))
+          .map((b) => b.toString(16).padStart(2, "0"))
+          .join("");
+      }
+
+      async function computeDatasetHash(data) {
+        const commitHashes = Array.isArray(data?.commits) ? data.commits.map((c) => String(c.hash || "")) : [];
+        const patchSizes = Array.isArray(data?.patches) ? data.patches.map((p) => String((p || "").length)) : [];
+        const basis = `${String(data?.base_doc || "").length}|${commitHashes.join(",")}|${patchSizes.join(",")}`;
+        const enc = new TextEncoder().encode(basis);
+        if (crypto?.subtle?.digest) {
+          const dig = await crypto.subtle.digest("SHA-256", enc);
+          return toHex(dig);
+        }
+        // Fallback hash (djb2 xor), deterministic but non-cryptographic.
+        let h = 5381;
+        for (let i = 0; i < basis.length; i++) {
+          h = ((h << 5) + h) ^ basis.charCodeAt(i);
+        }
+        return `djb2-${(h >>> 0).toString(16)}`;
+      }
+
+      function makeAnalysisWorkerSource() {
+        return `
+          const LEV_WASM_URL = ${JSON.stringify(LEV_WASM_URL)};
+          const STATE = {
+            dataset: null,
+            datasetHash: "",
+            patchHunks: [],
+            snapshotCache: new Map(),
+            snapshotCursorIdx: 0,
+            snapshotCursorLines: null,
+            levWasm: null,
+            searchIndex: null,
+            clusterData: null,
+          };
+          const CANCELLED_REQS = new Set();
+
+          class AbortErr extends Error {
+            constructor(message) {
+              super(message || "Request cancelled");
+              this.name = "AbortError";
+            }
+          }
+
+          function isCancelled(reqId) {
+            return CANCELLED_REQS.has(reqId);
+          }
+
+          function throwIfCancelled(reqId) {
+            if (isCancelled(reqId)) throw new AbortErr("Request cancelled by main thread");
+          }
+
+          function serializeError(err) {
+            return {
+              name: err?.name || "Error",
+              message: err?.message || String(err || "Unknown error"),
+              stack: err?.stack ? String(err.stack) : "",
+            };
+          }
+
+          function countRoughTokens(s) {
+            let n = 0;
+            const re = /[A-Za-z0-9_]+|[^\\\\s]/g;
+            while (re.exec(String(s))) n++;
+            return n;
+          }
+
+          function parseUnifiedHunks(patch) {
+            const lines = String(patch || "").split("\\n");
+            const hunks = [];
+            for (let i = 0; i < lines.length; i++) {
+              const line = lines[i];
+              if (!line.startsWith("@@")) continue;
+              const m = /^@@ -(\\\\d+)(?:,(\\\\d+))? \\\\+(\\\\d+)(?:,(\\\\d+))? @@/.exec(line);
+              if (!m) continue;
+              const oldStart = Number(m[1]);
+              const oldCount = Number(m[2] || "1");
+              const newStart = Number(m[3]);
+              const newCount = Number(m[4] || "1");
+              const hunkLines = [];
+              i++;
+              for (; i < lines.length; i++) {
+                const l = lines[i];
+                if (l.startsWith("@@")) {
+                  i--;
+                  break;
+                }
+                if (l.startsWith("diff --git")) break;
+                if (l.startsWith("index ") || l.startsWith("---") || l.startsWith("+++")) continue;
+                hunkLines.push(l);
+              }
+              hunks.push({ oldStart, oldCount, newStart, newCount, lines: hunkLines });
+            }
+            return hunks;
+          }
+
+          function quickMetricsFromPatch(patch) {
+            const lines = String(patch || "").split("\\n");
+            let hunks = 0;
+            let addLines = 0;
+            let delLines = 0;
+            let tokAdd = 0;
+            let tokDel = 0;
+            let bytesAdd = 0;
+            let bytesDel = 0;
+            for (const l of lines) {
+              if (l.startsWith("@@")) hunks += 1;
+              if (l.startsWith("+")) {
+                if (l.startsWith("+++")) continue;
+                addLines += 1;
+                const s = l.slice(1);
+                tokAdd += countRoughTokens(s);
+                bytesAdd += s.length + 1;
+              } else if (l.startsWith("-")) {
+                if (l.startsWith("---")) continue;
+                delLines += 1;
+                const s = l.slice(1);
+                tokDel += countRoughTokens(s);
+                bytesDel += s.length + 1;
+              }
+            }
+            return {
+              hunks,
+              addLines,
+              delLines,
+              tokensChanged: tokAdd + tokDel,
+              bytesChanged: bytesAdd + bytesDel,
+              tokensDelta: tokAdd - tokDel,
+              bytesDelta: bytesAdd - bytesDel,
+            };
+          }
+
+          function clamp(n, lo, hi) {
+            return Math.max(lo, Math.min(hi, n));
+          }
+
+          function applyPatchLines(prevLines, patch) {
+            const hunks = parseUnifiedHunks(patch);
+            let out = prevLines.slice();
+            let offset = 0;
+            for (const h of hunks) {
+              let at = (h.oldStart - 1) + offset;
+              at = clamp(at, 0, out.length);
+              let cursor = at;
+              const next = [];
+              for (const hl of h.lines) {
+                if (!hl) continue;
+                const p = hl[0];
+                const content = hl.slice(1);
+                if (p === " ") {
+                  next.push(content);
+                  cursor += 1;
+                } else if (p === "-") {
+                  cursor += 1;
+                } else if (p === "+") {
+                  next.push(content);
+                }
+              }
+              out.splice(at, cursor - at, ...next);
+              offset += next.length - (cursor - at);
+            }
+            return out;
+          }
+
+          function patchForIdx(idx) {
+            const d = STATE.dataset;
+            if (!d || !Array.isArray(d.patches)) return "";
+            return d.patches[idx] || "";
+          }
+
+          function docTextAtLocal(idx, reqId, progressCb) {
+            const d = STATE.dataset;
+            if (!d) return "";
+            if (idx <= 0) return String(d.base_doc || "");
+            const cached = STATE.snapshotCache.get(idx);
+            if (typeof cached === "string") return cached;
+
+            if (STATE.snapshotCursorLines && idx === STATE.snapshotCursorIdx + 1) {
+              throwIfCancelled(reqId);
+              const nextLines = applyPatchLines(STATE.snapshotCursorLines, patchForIdx(idx));
+              STATE.snapshotCursorIdx = idx;
+              STATE.snapshotCursorLines = nextLines;
+              const text = nextLines.join("\\n");
+              STATE.snapshotCache.set(idx, text);
+              return text;
+            }
+
+            let anchor = 0;
+            for (let j = idx - 1; j > 0; j--) {
+              if (STATE.snapshotCache.has(j)) {
+                anchor = j;
+                break;
+              }
+            }
+
+            let lines = String(d.base_doc || "").split("\\n");
+            if (anchor > 0) lines = String(STATE.snapshotCache.get(anchor) || "").split("\\n");
+
+            for (let k = Math.max(1, anchor + 1); k <= idx; k++) {
+              throwIfCancelled(reqId);
+              lines = applyPatchLines(lines, patchForIdx(k));
+              if (k === idx || k % 10 === 0) {
+                STATE.snapshotCache.set(k, lines.join("\\n"));
+              }
+              if (progressCb && (k % 8 === 0 || k === idx)) {
+                progressCb({ stage: "snapshot", done: k, total: idx, message: "Reconstructing snapshot" });
+              }
+            }
+
+            STATE.snapshotCursorIdx = idx;
+            STATE.snapshotCursorLines = lines;
+            const out = STATE.snapshotCache.get(idx) || lines.join("\\n");
+            STATE.snapshotCache.set(idx, out);
+            return out;
+          }
+
+          async function initLevWasm() {
+            if (STATE.levWasm) return STATE.levWasm;
+            const res = await fetch(LEV_WASM_URL, { cache: "force-cache" });
+            if (!res.ok) throw new Error("Failed to fetch " + LEV_WASM_URL + ": HTTP " + res.status);
+            const buf = await res.arrayBuffer();
+            const { instance } = await WebAssembly.instantiate(buf, {});
+            STATE.levWasm = instance.exports;
+            return STATE.levWasm;
+          }
+
+          async function levenshteinBytes(aBytes, bBytes) {
+            const ex = await initLevWasm();
+            const memory = ex.memory;
+            const alloc = ex.alloc;
+            const dealloc = ex.dealloc;
+            const levenshtein = ex.levenshtein;
+            if (!memory || !alloc || !dealloc || !levenshtein) {
+              throw new Error("WASM exports missing (memory/alloc/dealloc/levenshtein)");
+            }
+            const a = aBytes || new Uint8Array();
+            const b = bBytes || new Uint8Array();
+            const ptrA = alloc(a.length);
+            const viewA = new Uint8Array(memory.buffer, ptrA, a.length);
+            viewA.set(a);
+            const ptrB = alloc(b.length);
+            const viewB = new Uint8Array(memory.buffer, ptrB, b.length);
+            viewB.set(b);
+            const d = levenshtein(ptrA, a.length, ptrB, b.length) >>> 0;
+            dealloc(ptrA, a.length);
+            dealloc(ptrB, b.length);
+            return d;
+          }
+
+          async function levenshteinForPatch(patch, reqId) {
+            const hunks = parseUnifiedHunks(patch);
+            const enc = new TextEncoder();
+            let sum = 0;
+            for (const h of hunks) {
+              throwIfCancelled(reqId);
+              const oldLines = [];
+              const newLines = [];
+              for (const hl of h.lines) {
+                if (!hl) continue;
+                const p = hl[0];
+                const content = hl.slice(1);
+                if (p === "-") oldLines.push(content);
+                if (p === "+") newLines.push(content);
+              }
+              if (!oldLines.length && !newLines.length) continue;
+              const a = enc.encode(oldLines.join("\\n"));
+              const b = enc.encode(newLines.join("\\n"));
+              if (a.length > 20000 || b.length > 20000) {
+                sum += a.length + b.length;
+              } else {
+                sum += await levenshteinBytes(a, b);
+              }
+            }
+            return sum;
+          }
+
+          function tokenize(text) {
+            return String(text || "")
+              .toLowerCase()
+              .split(/[^a-z0-9_]+/g)
+              .filter((x) => x.length >= 2);
+          }
+
+          function buildSearchIndex() {
+            const commits = STATE.dataset?.commits || [];
+            const postings = new Map();
+            const docs = [];
+            for (let i = 0; i < commits.length; i++) {
+              const c = commits[i];
+              const body = [c.hash || "", c.short || "", c.author || "", c.subject || ""].join(" ");
+              const tokens = tokenize(body);
+              docs.push({ i, hash: c.hash, short: c.short, subject: c.subject, author: c.author, body });
+              const seen = new Set();
+              for (const tok of tokens) {
+                if (seen.has(tok)) continue;
+                seen.add(tok);
+                let arr = postings.get(tok);
+                if (!arr) {
+                  arr = [];
+                  postings.set(tok, arr);
+                }
+                arr.push(i);
+              }
+            }
+            STATE.searchIndex = { postings, docs };
+            return { docs: docs.length, terms: postings.size };
+          }
+
+          function querySearch(q, limit) {
+            const index = STATE.searchIndex;
+            if (!index) return { query: q, hits: [] };
+            const toks = tokenize(q);
+            if (!toks.length) return { query: q, hits: [] };
+            let candidate = null;
+            for (const t of toks) {
+              const posting = index.postings.get(t) || [];
+              if (candidate === null) {
+                candidate = new Set(posting);
+              } else {
+                const next = new Set();
+                for (const docId of candidate) {
+                  if (posting.includes(docId)) next.add(docId);
+                }
+                candidate = next;
+              }
+            }
+            const out = [];
+            for (const docId of candidate || []) {
+              const d = index.docs[docId];
+              if (!d) continue;
+              let score = 0;
+              for (const t of toks) {
+                if (d.body.toLowerCase().includes(t)) score += 1;
+              }
+              out.push({ idx: d.i, hash: d.hash, short: d.short, subject: d.subject, author: d.author, score });
+            }
+            out.sort((a, b) => b.score - a.score || a.idx - b.idx);
+            return { query: q, hits: out.slice(0, Math.max(1, Number(limit || 20))) };
+          }
+
+          function hash32(seed, str) {
+            let h = seed >>> 0;
+            for (let i = 0; i < str.length; i++) {
+              h ^= str.charCodeAt(i);
+              h = Math.imul(h, 16777619);
+            }
+            return h >>> 0;
+          }
+
+          function computeClusters(limit) {
+            const commits = STATE.dataset?.commits || [];
+            const seeds = [2166136261, 19088743, 591798841, 2654435761, 40503, 734539, 1889, 2651];
+            const docs = commits.map((c, idx) => {
+              const tokens = Array.from(new Set(tokenize((c.subject || "") + " " + (c.author || ""))));
+              const sig = [];
+              for (const seed of seeds) {
+                let best = 0xffffffff;
+                for (const tok of tokens) {
+                  const h = hash32(seed, tok);
+                  if (h < best) best = h;
+                }
+                sig.push(best >>> 0);
+              }
+              return { idx, hash: c.hash, short: c.short, subject: c.subject, sig };
+            });
+
+            const bands = new Map();
+            for (const d of docs) {
+              for (let b = 0; b < 4; b++) {
+                const key = d.sig.slice(b * 2, b * 2 + 2).join("-");
+                const bandKey = b + ":" + key;
+                let arr = bands.get(bandKey);
+                if (!arr) {
+                  arr = [];
+                  bands.set(bandKey, arr);
+                }
+                arr.push(d.idx);
+              }
+            }
+
+            const clusterSets = [];
+            const seenKeys = new Set();
+            for (const ids of bands.values()) {
+              if (ids.length < 2) continue;
+              const uniq = Array.from(new Set(ids)).sort((a, b) => a - b);
+              const key = uniq.join(",");
+              if (seenKeys.has(key)) continue;
+              seenKeys.add(key);
+              clusterSets.push(uniq);
+            }
+
+            clusterSets.sort((a, b) => b.length - a.length);
+            const max = Math.max(1, Number(limit || 12));
+            const clusters = clusterSets.slice(0, max).map((ids, i) => ({
+              id: i + 1,
+              size: ids.length,
+              items: ids.map((idx) => {
+                const c = commits[idx] || {};
+                return { idx, hash: c.hash, short: c.short, subject: c.subject };
+              }),
+            }));
+            STATE.clusterData = clusters;
+            return { clusters };
+          }
+
+          function median(values) {
+            const arr = values.slice().sort((a, b) => a - b);
+            if (!arr.length) return 0;
+            const mid = Math.floor(arr.length / 2);
+            if (arr.length % 2) return arr[mid];
+            return (arr[mid - 1] + arr[mid]) / 2;
+          }
+
+          function computeOutliers(values, topK) {
+            const xs = values.map((v) => Number(v || 0));
+            const med = median(xs);
+            const absDev = xs.map((x) => Math.abs(x - med));
+            const mad = median(absDev) || 1e-9;
+            const scored = xs.map((x, idx) => {
+              const z = 0.6745 * (x - med) / mad;
+              return { idx, value: x, z };
+            });
+            scored.sort((a, b) => Math.abs(b.z) - Math.abs(a.z));
+            return { median: med, mad, top: scored.slice(0, Math.max(1, Number(topK || 10))) };
+          }
+
+          function logAddExp(a, b) {
+            if (a === -Infinity) return b;
+            if (b === -Infinity) return a;
+            const m = Math.max(a, b);
+            return m + Math.log(Math.exp(a - m) + Math.exp(b - m));
+          }
+
+          function updateWelford(st, x) {
+            const n1 = st.n + 1;
+            const delta = x - st.mean;
+            const mean1 = st.mean + delta / n1;
+            const delta2 = x - mean1;
+            const m21 = st.m2 + delta * delta2;
+            return { n: n1, mean: mean1, m2: m21 };
+          }
+
+          function logGamma(z) {
+            const p = [
+              0.99999999999980993, 676.5203681218851, -1259.1392167224028, 771.32342877765313,
+              -176.61502916214059, 12.507343278686905, -0.13857109526572012, 9.9843695780195716e-6,
+              1.5056327351493116e-7,
+            ];
+            if (z < 0.5) {
+              return Math.log(Math.PI) - Math.log(Math.sin(Math.PI * z)) - logGamma(1 - z);
+            }
+            z -= 1;
+            let x = p[0];
+            for (let i = 1; i < p.length; i++) x += p[i] / (z + i);
+            const t = z + 7.5;
+            return 0.5 * Math.log(2 * Math.PI) + (z + 0.5) * Math.log(t) - t + Math.log(x);
+          }
+
+          function studentTLogPdf(x, mu, sigma, nu) {
+            const z = (x - mu) / (sigma || 1e-9);
+            return (
+              logGamma((nu + 1) / 2) -
+              logGamma(nu / 2) -
+              Math.log((sigma || 1e-9) * Math.sqrt(nu * Math.PI)) -
+              ((nu + 1) / 2) * Math.log(1 + (z * z) / nu)
+            );
+          }
+
+          function computePhaseMap(values, hazard) {
+            const y = values.map((v) => Number(v || 0));
+            const H = Math.max(1e-4, Math.min(0.9999, Number(hazard || 0.03)));
+            let mu0 = 0.0;
+            let kappa0 = 0.01;
+            let alpha0 = 0.5;
+            let beta0 = 0.5;
+            let logR = [0.0];
+            let stats = [{ n: 0, mean: 0.0, m2: 0.0 }];
+            const p0 = [];
+            const changePoints = [];
+            const logHaz = Math.log(H);
+            const log1mHaz = Math.log(1.0 - H);
+            for (let t = 0; t < y.length; t++) {
+              const x = y[t];
+              const logPred = [];
+              for (let r = 0; r < stats.length; r++) {
+                const st = stats[r];
+                const n = st.n;
+                const mean = st.mean;
+                const kappa = kappa0 + n;
+                const alpha = alpha0 + n / 2;
+                const beta = beta0 + 0.5 * st.m2 + (kappa0 * n * (mean - mu0) * (mean - mu0)) / (2 * (kappa0 + n));
+                const dof = 2 * alpha;
+                const scale2 = (beta * (kappa + 1)) / (alpha * kappa);
+                logPred.push(studentTLogPdf(x, mean, Math.sqrt(scale2), dof));
+              }
+              const newLogR = new Array(stats.length + 1).fill(-Infinity);
+              let logSumCp = -Infinity;
+              for (let r = 0; r < logR.length; r++) {
+                logSumCp = logAddExp(logSumCp, logR[r] + logPred[r] + logHaz);
+              }
+              newLogR[0] = logSumCp;
+              for (let r = 0; r < logR.length; r++) {
+                newLogR[r + 1] = logR[r] + logPred[r] + log1mHaz;
+              }
+              const logZ = newLogR.reduce((a, b) => logAddExp(a, b), -Infinity);
+              for (let i = 0; i < newLogR.length; i++) newLogR[i] -= logZ;
+              const p_r0 = Math.exp(newLogR[0]);
+              p0.push(p_r0);
+              if (p_r0 > 0.5) changePoints.push(t);
+              const newStats = new Array(stats.length + 1);
+              newStats[0] = { n: 1, mean: x, m2: 0.0 };
+              for (let r = 1; r < newStats.length; r++) {
+                newStats[r] = updateWelford(stats[r - 1], x);
+              }
+              const K = 120;
+              const idxs = newLogR
+                .map((v, i) => [v, i])
+                .sort((a, b) => b[0] - a[0])
+                .slice(0, K)
+                .map((x) => x[1])
+                .sort((a, b) => a - b);
+              logR = idxs.map((i) => newLogR[i]);
+              stats = idxs.map((i) => newStats[i]);
+              const logZ2 = logR.reduce((a, b) => logAddExp(a, b), -Infinity);
+              logR = logR.map((v) => v - logZ2);
+            }
+            return { p0, changePoints };
+          }
+
+          async function computeAllMetrics(reqId, progressCb, includeLev) {
+            const d = STATE.dataset;
+            const commits = d?.commits || [];
+            const patches = d?.patches || [];
+            const tokensChanged = {};
+            const bytesChanged = {};
+            const hunks = {};
+            const lev = {};
+            const total = commits.length;
+            for (let i = 0; i < total; i++) {
+              throwIfCancelled(reqId);
+              const c = commits[i] || {};
+              const patch = patches[i] || "";
+              const qm = quickMetricsFromPatch(patch);
+              tokensChanged[c.hash] = qm.tokensChanged;
+              bytesChanged[c.hash] = qm.bytesChanged;
+              hunks[c.hash] = qm.hunks;
+              if (includeLev && i > 0) {
+                lev[c.hash] = await levenshteinForPatch(patch, reqId);
+              }
+              if (progressCb && (i === total - 1 || i % 3 === 0)) {
+                progressCb({
+                  stage: "metrics",
+                  done: i + 1,
+                  total,
+                  haveLev: Object.keys(lev).length,
+                  message: "Computing per-commit metrics",
+                });
+              }
+            }
+            return { tokensChanged, bytesChanged, hunks, lev, commitCount: total };
+          }
+
+          function validateDatasetHash(inputHash) {
+            if (!STATE.datasetHash) return;
+            if (!inputHash) throw new Error("datasetHash missing on worker request");
+            if (inputHash !== STATE.datasetHash) {
+              throw new Error("datasetHash mismatch: stale request against a different dataset");
+            }
+          }
+
+          self.onmessage = async (event) => {
+            const msg = event?.data || {};
+            const op = msg.op;
+            const reqId = msg.reqId;
+            const payload = msg.payload || {};
+            const incomingHash = msg.datasetHash || "";
+            if (!op) return;
+
+            if (op === "cancel") {
+              const targetReqId = payload.targetReqId;
+              if (targetReqId) CANCELLED_REQS.add(targetReqId);
+              self.postMessage({
+                op,
+                reqId,
+                type: "ok",
+                datasetHash: STATE.datasetHash || "",
+                payload: { cancelledReqId: targetReqId || null },
+              });
+              return;
+            }
+
+            const progressCb = (info) => {
+              self.postMessage({
+                op,
+                reqId,
+                type: "progress",
+                datasetHash: STATE.datasetHash || "",
+                payload: info || {},
+              });
+            };
+
+            try {
+              if (!reqId) throw new Error("reqId is required");
+              if (op !== "init_dataset") {
+                if (!STATE.dataset) throw new Error("Worker dataset not initialized");
+                validateDatasetHash(incomingHash);
+              }
+              throwIfCancelled(reqId);
+
+              let result = null;
+              switch (op) {
+                case "init_dataset": {
+                  const ds = payload.dataset;
+                  const dsHash = payload.datasetHash || incomingHash;
+                  if (!ds || !Array.isArray(ds.commits) || !Array.isArray(ds.patches)) {
+                    throw new Error("Invalid dataset payload for init_dataset");
+                  }
+                  STATE.dataset = ds;
+                  STATE.datasetHash = dsHash || "";
+                  STATE.patchHunks = ds.patches.map((p) => parseUnifiedHunks(p));
+                  STATE.snapshotCache.clear();
+                  STATE.snapshotCache.set(0, String(ds.base_doc || ""));
+                  STATE.snapshotCursorIdx = 0;
+                  STATE.snapshotCursorLines = String(ds.base_doc || "").split("\\n");
+                  STATE.searchIndex = null;
+                  STATE.clusterData = null;
+                  result = {
+                    datasetHash: STATE.datasetHash,
+                    commits: ds.commits.length,
+                    patches: ds.patches.length,
+                  };
+                  break;
+                }
+                case "snapshot_at": {
+                  const idx = Number(payload.idx || 0);
+                  const text = docTextAtLocal(idx, reqId, progressCb);
+                  result = { idx, text };
+                  break;
+                }
+                case "quick_patch_metrics": {
+                  result = quickMetricsFromPatch(payload.patch || "");
+                  break;
+                }
+                case "levenshtein_patch": {
+                  const lev = await levenshteinForPatch(payload.patch || "", reqId);
+                  result = { lev };
+                  break;
+                }
+                case "compute_all_metrics": {
+                  const includeLev = payload.includeLev !== false;
+                  result = await computeAllMetrics(reqId, progressCb, includeLev);
+                  break;
+                }
+                case "build_search_index": {
+                  result = buildSearchIndex();
+                  break;
+                }
+                case "query_search": {
+                  result = querySearch(payload.q || "", payload.limit || 20);
+                  break;
+                }
+                case "compute_clusters": {
+                  result = computeClusters(payload.limit || 12);
+                  break;
+                }
+                case "compute_phase_map": {
+                  result = computePhaseMap(payload.values || [], payload.hazard);
+                  break;
+                }
+                case "compute_outliers": {
+                  result = computeOutliers(payload.values || [], payload.topK || 10);
+                  break;
+                }
+                default:
+                  throw new Error("Unknown worker op: " + op);
+              }
+
+              throwIfCancelled(reqId);
+              self.postMessage({
+                op,
+                reqId,
+                type: "ok",
+                datasetHash: STATE.datasetHash || "",
+                payload: result,
+              });
+            } catch (err) {
+              if (err?.name === "AbortError" || isCancelled(reqId)) {
+                self.postMessage({
+                  op,
+                  reqId,
+                  type: "cancelled",
+                  datasetHash: STATE.datasetHash || "",
+                  payload: { message: "Request cancelled" },
+                });
+              } else {
+                self.postMessage({
+                  op,
+                  reqId,
+                  type: "error",
+                  datasetHash: STATE.datasetHash || "",
+                  error: serializeError(err),
+                });
+              }
+            } finally {
+              CANCELLED_REQS.delete(reqId);
+            }
+          };
+        `;
+      }
+
+      function tearDownWorker() {
+        if (WORKER_STATE.worker) {
+          try {
+            WORKER_STATE.worker.terminate();
+          } catch {
+            // ignore
+          }
+        }
+        WORKER_STATE.worker = null;
+        WORKER_STATE.ready = false;
+        for (const [reqId, req] of WORKER_STATE.pending.entries()) {
+          if (req?.timeoutId) clearTimeout(req.timeoutId);
+          req?.reject?.(new Error(`Worker terminated while handling reqId=${reqId}`));
+        }
+        WORKER_STATE.pending.clear();
+      }
+
+      function handleWorkerMessage(event) {
+        const msg = event?.data || {};
+        const reqId = msg.reqId;
+        if (!reqId) return;
+        const pending = WORKER_STATE.pending.get(reqId);
+        if (!pending) return;
+
+        if (msg.type === "progress") {
+          pending.onProgress?.(msg.payload || {});
+          return;
+        }
+
+        if (pending.timeoutId) clearTimeout(pending.timeoutId);
+        WORKER_STATE.pending.delete(reqId);
+
+        if (msg.type === "ok") {
+          pending.resolve(msg.payload);
+          return;
+        }
+        if (msg.type === "cancelled") {
+          const abortErr = new DOMException("Worker request cancelled", "AbortError");
+          pending.reject(abortErr);
+          return;
+        }
+
+        const errObj = msg.error || {};
+        const err = new Error(errObj.message || `Worker op failed (${msg.op || "unknown"})`);
+        err.name = errObj.name || "WorkerError";
+        if (errObj.stack) err.stack = errObj.stack;
+        pending.reject(err);
+      }
+
+      function workerRequest(op, payload, opts = {}) {
+        if (!WORKER_STATE.worker || (op !== "init_dataset" && !WORKER_STATE.ready)) {
+          return Promise.reject(new Error(`Worker unavailable for op=${op}`));
+        }
+        const reqId = `w${WORKER_STATE.reqSeq++}`;
+        const timeoutMs = Number(opts.timeoutMs || 0);
+        const signal = opts.signal || null;
+        let aborted = false;
+        let timeoutId = null;
+
+        return new Promise((resolve, reject) => {
+          const abortHandler = () => {
+            aborted = true;
+            try {
+              WORKER_STATE.worker.postMessage({
+                op: "cancel",
+                reqId: `cancel-${reqId}`,
+                datasetHash: WORKER_STATE.datasetHash,
+                payload: { targetReqId: reqId },
+              });
+            } catch {
+              // ignore transport errors
+            }
+            WORKER_STATE.pending.delete(reqId);
+            reject(new DOMException("Aborted by caller", "AbortError"));
+          };
+
+          if (signal) {
+            if (signal.aborted) {
+              abortHandler();
+              return;
+            }
+            signal.addEventListener("abort", abortHandler, { once: true });
+          }
+
+          if (timeoutMs > 0) {
+            timeoutId = setTimeout(() => {
+              WORKER_STATE.pending.delete(reqId);
+              reject(new Error(`Worker request timed out: op=${op} reqId=${reqId} after ${timeoutMs}ms`));
+            }, timeoutMs);
+          }
+
+          WORKER_STATE.pending.set(reqId, {
+            resolve: (value) => {
+              if (signal) signal.removeEventListener("abort", abortHandler);
+              if (aborted) return;
+              resolve(value);
+            },
+            reject: (err) => {
+              if (signal) signal.removeEventListener("abort", abortHandler);
+              if (aborted) return;
+              reject(err);
+            },
+            onProgress: opts.onProgress,
+            timeoutId,
+          });
+
+          WORKER_STATE.worker.postMessage({
+            op,
+            reqId,
+            datasetHash: WORKER_STATE.datasetHash,
+            payload: payload || {},
+          });
+        });
+      }
+
+      async function initAnalysisWorker() {
+        if (!supportsAnalysisWorker()) {
+          WORKER_STATE.disabled = true;
+          setWorkerStatus("Web Worker unavailable; using main-thread compute fallback.", "error");
+          return false;
+        }
+        if (WORKER_STATE.ready) return true;
+        if (!DATASET.loaded || !DATASET.data) return false;
+
+        try {
+          WORKER_STATE.datasetHash = await computeDatasetHash(DATASET.data);
+          const src = makeAnalysisWorkerSource();
+          const blob = new Blob([src], { type: "text/javascript" });
+          const url = URL.createObjectURL(blob);
+          const worker = new Worker(url, { name: "spec-evolution-worker" });
+          URL.revokeObjectURL(url);
+          worker.addEventListener("message", handleWorkerMessage);
+          worker.addEventListener("error", (event) => {
+            setWorkerStatus(`Worker runtime error: ${event.message || "unknown error"}`, "error");
+          });
+          WORKER_STATE.worker = worker;
+
+          const initPayload = await workerRequest("init_dataset", {
+            datasetHash: WORKER_STATE.datasetHash,
+            dataset: DATASET.data,
+          });
+
+          if (!initPayload || initPayload.datasetHash !== WORKER_STATE.datasetHash) {
+            throw new Error("Worker dataset initialization returned an unexpected dataset hash");
+          }
+          WORKER_STATE.ready = true;
+          setWorkerStatus(
+            `Worker online · dataset ${WORKER_STATE.datasetHash.slice(0, 12)}… · ${fmtInt(initPayload.commits)} commits`,
+            "ok",
+          );
+          return true;
+        } catch (e) {
+          WORKER_STATE.disabled = true;
+          tearDownWorker();
+          setWorkerStatus("Worker init failed; fallback active.", "error", formatErr(e));
+          return false;
+        }
+      }
+
+      async function warmDerivedWorkerArtifacts() {
+        if (!WORKER_STATE.ready) return;
+        try {
+          await workerRequest("build_search_index", {}, { timeoutMs: 30000 });
+          WORKER_DERIVED.searchReady = true;
+          await workerRequest("compute_clusters", { limit: 12 }, { timeoutMs: 30000 });
+          WORKER_DERIVED.clusterReady = true;
+          setWorkerStatus("Worker online · search index + clustering ready", "ok");
+        } catch (e) {
+          console.error("Worker warmup failed:", e);
+          setWorkerStatus("Worker warmup partial failure.", "error", formatErr(e));
+        }
+      }
+
+      async function maybeRefreshPhaseAndOutliers(commits) {
+        if (!WORKER_STATE.ready || !Array.isArray(commits) || !commits.length) return;
+        const hazard = Number(document.getElementById("hazard")?.value || 0.03);
+        const values = commits.map((c) => Math.log1p(Number(c.impact || 0)));
+        const outlierValues = commits.map((c) => Number(c.impact || 0));
+        const phaseKey = `${hazard}|${values.join(",")}`;
+        const outlierKey = outlierValues.join(",");
+
+        if (WORKER_DERIVED.phaseKey === phaseKey && WORKER_DERIVED.outlierKey === outlierKey) return;
+
+        PHASE_ABORT_CONTROLLER?.abort();
+        OUTLIER_ABORT_CONTROLLER?.abort();
+        PHASE_ABORT_CONTROLLER = new AbortController();
+        OUTLIER_ABORT_CONTROLLER = new AbortController();
+
+        try {
+          const [phase, outliers] = await Promise.all([
+            workerRequest(
+              "compute_phase_map",
+              { values, hazard },
+              { signal: PHASE_ABORT_CONTROLLER.signal, timeoutMs: 30000 },
+            ),
+            workerRequest(
+              "compute_outliers",
+              { values: outlierValues, topK: 10 },
+              { signal: OUTLIER_ABORT_CONTROLLER.signal, timeoutMs: 30000 },
+            ),
+          ]);
+          WORKER_DERIVED.phase = phase || null;
+          WORKER_DERIVED.outliers = outliers || null;
+          WORKER_DERIVED.phaseKey = phaseKey;
+          WORKER_DERIVED.outlierKey = outlierKey;
+          setWorkerStatus(
+            `Worker online · phase CP ${fmtInt(phase?.changePoints?.length || 0)} · outlier set ${fmtInt(
+              outliers?.top?.length || 0,
+            )}`,
+            "ok",
+          );
+          renderBocpd(commits);
+        } catch (e) {
+          if (e?.name === "AbortError") return;
+          console.error("Phase/outlier worker compute failed:", e);
+        }
       }
 
       // -----------------------------
@@ -6824,7 +7813,7 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
         return out;
       }
 
-      async function docTextAt(idx) {
+      async function docTextAtLocal(idx) {
         const d = DATASET.data;
         if (!d) return "";
         if (idx <= 0) return String(d.base_doc || "");
@@ -6865,7 +7854,126 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
         return DOC_CACHE.get(idx)?.text || lines.join("\n");
       }
 
-      async function levenshteinForPatch(patch) {
+      async function docTextAt(idx) {
+        if (WORKER_STATE.ready) {
+          try {
+            const res = await workerRequest("snapshot_at", { idx }, { timeoutMs: 45000 });
+            if (typeof res?.text === "string") return res.text;
+          } catch (e) {
+            console.error("Worker snapshot reconstruction failed; falling back to local path:", e);
+          }
+        }
+        return docTextAtLocal(idx);
+      }
+
+      // -----------------------------
+      // Heading Outline Extraction (bd-24q.8.1)
+      // -----------------------------
+
+      /**
+       * Generate a URL-safe slug from heading text.
+       * Deterministic: same input always yields same output.
+       */
+      function slugifyHeading(text) {
+        return String(text || "")
+          .toLowerCase()
+          .replace(/[^\p{L}\p{N}]+/gu, "-")
+          .replace(/^-+|-+$/g, "")
+          || "heading";
+      }
+
+      /**
+       * Extract an outline from markdown text using markdown-it's token stream.
+       * Returns: [{ text: string, level: number, id: string }]
+       *
+       * Anchor IDs are deterministic and disambiguated: if two headings
+       * produce the same slug, a numeric suffix (-1, -2, ...) is appended.
+       */
+      function extractOutline(markdownText) {
+        if (!window._mdSingleton) {
+          window._mdSingleton = markdownit({
+            html: false,
+            linkify: true,
+            typographer: true,
+            highlight: (str, lang) => {
+              try {
+                if (lang && hljs.getLanguage(lang)) {
+                  return `<pre class="hljs"><code>${hljs.highlight(str, { language: lang }).value}</code></pre>`;
+                }
+                return `<pre class="hljs"><code>${hljs.highlightAuto(str).value}</code></pre>`;
+              } catch {
+                return `<pre class="hljs"><code>${escapeHtml(str)}</code></pre>`;
+              }
+            },
+          });
+        }
+        const tokens = window._mdSingleton.parse(markdownText || "", {});
+        const outline = [];
+        const slugCounts = new Map(); // slug -> count for disambiguation
+
+        for (let i = 0; i < tokens.length; i++) {
+          const tok = tokens[i];
+          if (tok.type !== "heading_open") continue;
+
+          // Level from tag: "h1" -> 1, "h2" -> 2, etc.
+          const level = Number(tok.tag?.slice(1)) || 1;
+
+          // Next token should be the inline content.
+          const inlineTok = tokens[i + 1];
+          let text = "";
+          if (inlineTok?.type === "inline") {
+            // Collect all text children (handles bold, code, etc. inside headings).
+            text = (inlineTok.children || [])
+              .filter((c) => c.type === "text" || c.type === "code_inline")
+              .map((c) => c.content)
+              .join("");
+            if (!text) text = inlineTok.content || "";
+          }
+
+          // Generate stable, disambiguated slug.
+          const baseSlug = slugifyHeading(text);
+          const count = slugCounts.get(baseSlug) || 0;
+          slugCounts.set(baseSlug, count + 1);
+          const id = count === 0 ? baseSlug : `${baseSlug}-${count}`;
+
+          outline.push({ text: text.trim(), level, id });
+        }
+        return outline;
+      }
+
+      /**
+       * Get the heading outline for a given commit index.
+       * Caches results; uses docTextAt to reconstruct the spec.
+       *
+       * Returns: Promise<[{ text: string, level: number, id: string }]>
+       */
+      async function getOutline(commitIdx) {
+        const idx = Number(commitIdx || 0);
+        if (OUTLINE_CACHE.has(idx)) return OUTLINE_CACHE.get(idx);
+
+        const text = await docTextAt(idx);
+        const outline = extractOutline(text);
+        OUTLINE_CACHE.set(idx, outline);
+        return outline;
+      }
+
+      /**
+       * Resolve offsetTop values for outline entries by querying the DOM.
+       * Call this AFTER rendering markdown to get accurate positions.
+       * Returns: [{ text, level, id, offsetTop }]
+       */
+      function resolveOutlineOffsets(outline, containerEl) {
+        if (!containerEl || !outline?.length) return outline || [];
+        return outline.map((entry) => {
+          const el = containerEl.querySelector(`#${CSS.escape(entry.id)}`);
+          return {
+            ...entry,
+            offsetTop: el ? el.offsetTop : null,
+          };
+        });
+      }
+
+      async function levenshteinForPatchLocal(patch) {
         const hunks = parseUnifiedHunks(patch);
         const enc = new TextEncoder();
         let sum = 0;
@@ -6890,6 +7998,19 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
           }
         }
         return sum;
+      }
+
+      async function levenshteinForPatch(patch, opts = {}) {
+        if (WORKER_STATE.ready && !opts.localOnly) {
+          try {
+            const res = await workerRequest("levenshtein_patch", { patch }, { timeoutMs: 30000, signal: opts.signal });
+            if (Number.isFinite(Number(res?.lev))) return Number(res.lev);
+          } catch (e) {
+            if (e?.name === "AbortError") throw e;
+            console.error("Worker Levenshtein failed; using local fallback:", e);
+          }
+        }
+        return levenshteinForPatchLocal(patch);
       }
 
       function selectCommitIdx(idx, opts = {}) {
@@ -7096,8 +8217,17 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
                 document.getElementById("mLev").textContent = fmtInt(d);
                 syncDockAndDoc();
               }
-            } catch {
-              // ignore
+            } catch (e) {
+              if (e?.name !== "AbortError") {
+                console.error("On-demand Levenshtein failed:", e);
+                if (ALL_COMMITS[DOC.idx]?.hash === c.hash) {
+                  const levNode = document.getElementById("mLev");
+                  if (levNode) {
+                    levNode.textContent = "ERR";
+                    levNode.title = formatErr(e);
+                  }
+                }
+              }
             }
           })();
         }
@@ -7105,51 +8235,124 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
 
       let COMPUTE_RUNNING = false;
 
+      function applyMetricsPayload(payload) {
+        if (!payload) return;
+        const tokens = payload.tokensChanged || {};
+        const bytes = payload.bytesChanged || {};
+        const hunks = payload.hunks || {};
+        const lev = payload.lev || {};
+        for (const [hash, value] of Object.entries(tokens)) {
+          METRICS.tokensChanged.set(hash, Number(value || 0));
+        }
+        for (const [hash, value] of Object.entries(bytes)) {
+          METRICS.bytesChanged.set(hash, Number(value || 0));
+        }
+        for (const [hash, value] of Object.entries(hunks)) {
+          METRICS.hunks.set(hash, Number(value || 0));
+        }
+        for (const [hash, value] of Object.entries(lev)) {
+          METRICS.lev.set(hash, Number(value || 0));
+        }
+      }
+
+      async function computeAllMetricsLocal(progressCb, signal) {
+        const total = ALL_COMMITS.length;
+        for (let i = 0; i < total; i++) {
+          if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
+          const c = ALL_COMMITS[i];
+          const patch = patchForIdx(i);
+          if (!METRICS.tokensChanged.has(c.hash) || !METRICS.bytesChanged.has(c.hash) || !METRICS.hunks.has(c.hash)) {
+            const qm = quickMetricsFromPatch(patch);
+            METRICS.tokensChanged.set(c.hash, qm.tokensChanged);
+            METRICS.bytesChanged.set(c.hash, qm.bytesChanged);
+            METRICS.hunks.set(c.hash, qm.hunks);
+          }
+          if (i > 0 && !METRICS.lev.has(c.hash)) {
+            const d = await levenshteinForPatchLocal(patch);
+            METRICS.lev.set(c.hash, d);
+          }
+          progressCb?.({
+            stage: "metrics",
+            done: i + 1,
+            total,
+            haveLev: METRICS.lev.size,
+            message: "Computing per-commit metrics",
+          });
+          if (i % 4 === 0) {
+            await new Promise((r) => setTimeout(r, 0));
+            if (i % 12 === 0) render();
+          }
+        }
+      }
+
       async function computeAllMetrics() {
         if (COMPUTE_RUNNING) return;
         if (!DATASET.loaded) return;
         if (!ALL_COMMITS.length) return;
 
         COMPUTE_RUNNING = true;
+        COMPUTE_ABORT_CONTROLLER?.abort();
+        COMPUTE_ABORT_CONTROLLER = new AbortController();
         const prog = document.getElementById("computeProgress");
+        const cancelBtn = document.getElementById("btnCancelCompute");
         if (prog) {
           prog.classList.remove("hidden");
-          prog.textContent = "Computing metrics...";
+          prog.className = "mt-2 text-xs font-semibold text-slate-700";
+          prog.textContent = WORKER_STATE.ready
+            ? "Worker compute in progress..."
+            : "Computing metrics (main-thread fallback)...";
+          prog.title = "";
+        }
+        if (cancelBtn) {
+          cancelBtn.classList.remove("hidden");
+          cancelBtn.disabled = false;
         }
 
         try {
-          const total = ALL_COMMITS.length;
-          for (let i = 0; i < total; i++) {
-            const c = ALL_COMMITS[i];
-            const patch = patchForIdx(i);
-
-            // Always ensure quick metrics are present.
-            if (!METRICS.tokensChanged.has(c.hash) || !METRICS.bytesChanged.has(c.hash) || !METRICS.hunks.has(c.hash)) {
-              const qm = quickMetricsFromPatch(patch);
-              METRICS.tokensChanged.set(c.hash, qm.tokensChanged);
-              METRICS.bytesChanged.set(c.hash, qm.bytesChanged);
-              METRICS.hunks.set(c.hash, qm.hunks);
-            }
-
-            if (i > 0 && !METRICS.lev.has(c.hash)) {
-              const d = await levenshteinForPatch(patch);
-              METRICS.lev.set(c.hash, d);
-            }
-
+          const updateProgressText = (p) => {
             if (prog) {
-              const haveLev = METRICS.lev.size;
-              prog.textContent = `Computed ${i + 1}/${total} commits · Levenshtein ready ${haveLev}/${total - 1}`;
+              const done = Number(p?.done || 0);
+              const total = Number(p?.total || ALL_COMMITS.length);
+              const haveLev = Number(p?.haveLev || METRICS.lev.size);
+              prog.textContent = `Computed ${done}/${total} commits · Levenshtein ready ${haveLev}/${Math.max(0, total - 1)}`;
             }
+          };
 
-            if (i % 4 === 0) {
-              // Yield to keep UI responsive; refresh charts occasionally.
-              await new Promise((r) => setTimeout(r, 0));
-              if (i % 12 === 0) render();
+          if (WORKER_STATE.ready) {
+            const payload = await workerRequest(
+              "compute_all_metrics",
+              { includeLev: true },
+              {
+                signal: COMPUTE_ABORT_CONTROLLER.signal,
+                timeoutMs: 180000,
+                onProgress: updateProgressText,
+              },
+            );
+            applyMetricsPayload(payload);
+          } else {
+            await computeAllMetricsLocal(updateProgressText, COMPUTE_ABORT_CONTROLLER.signal);
+          }
+          if (prog) prog.textContent = "Done. Charts updated.";
+        } catch (e) {
+          if (e?.name === "AbortError") {
+            if (prog) {
+              prog.textContent = "Compute cancelled.";
+              prog.title = "";
             }
+          } else {
+            if (prog) {
+              prog.className = "mt-2 text-xs font-semibold text-rose-700";
+              prog.textContent = `Compute failed: ${e?.message || e}`;
+              prog.title = formatErr(e);
+            }
+            console.error("computeAllMetrics failed:", e);
           }
         } finally {
           COMPUTE_RUNNING = false;
-          if (prog) prog.textContent = "Done. Charts updated.";
+          if (cancelBtn) {
+            cancelBtn.disabled = true;
+            cancelBtn.classList.add("hidden");
+          }
           render();
         }
       }
@@ -7472,6 +8675,7 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
         });
 
         renderBocpd(commits);
+        void maybeRefreshPhaseAndOutliers(commits);
       }
 
       function renderBocpd(commits) {
@@ -7481,7 +8685,9 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
         const xs = commits.map((c) => c.idx);
         const ys = commits.map((c) => Math.log1p(c.impact));
 
-        const cp = bocpdChangePoints(ys, H);
+        const cp = WORKER_DERIVED.phase && WORKER_DERIVED.phaseKey === `${H}|${ys.join(",")}`
+          ? WORKER_DERIVED.phase
+          : bocpdChangePoints(ys, H);
         const markers = cp.changePoints.map((idx) => ({
           xAxis: xs[idx],
           label: { formatter: "CP", color: "rgba(2,6,23,.75)", fontSize: 10 },
@@ -7943,6 +9149,9 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
         document.getElementById("btnComputeAll")?.addEventListener("click", () => {
           void computeAllMetrics();
         });
+        document.getElementById("btnCancelCompute")?.addEventListener("click", () => {
+          COMPUTE_ABORT_CONTROLLER?.abort();
+        });
 
         // Galaxy brain button: jump to alien section
         document.getElementById("btnGalaxy").addEventListener("click", () => scrollToSection("sectionAlien"));
@@ -8043,14 +9252,35 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
         await loadEvolutionDataset();
 
         if (DATASET.loaded) {
-          // Precompute cheap per-commit metrics from unified patches.
+          const workerReady = await initAnalysisWorker();
           const d = DATASET.data;
-          for (let i = 0; i < d.commits.length; i++) {
-            const c = d.commits[i];
-            const qm = quickMetricsFromPatch(d.patches[i]);
-            METRICS.tokensChanged.set(c.hash, qm.tokensChanged);
-            METRICS.bytesChanged.set(c.hash, qm.bytesChanged);
-            METRICS.hunks.set(c.hash, qm.hunks);
+          if (workerReady) {
+            try {
+              const metricsNoLev = await workerRequest(
+                "compute_all_metrics",
+                { includeLev: false },
+                { timeoutMs: 120000 },
+              );
+              applyMetricsPayload(metricsNoLev);
+            } catch (e) {
+              console.error("Worker boot metric precompute failed; using local precompute:", e);
+              setWorkerStatus("Worker precompute failed; local fallback active.", "error", formatErr(e));
+              for (let i = 0; i < d.commits.length; i++) {
+                const c = d.commits[i];
+                const qm = quickMetricsFromPatch(d.patches[i]);
+                METRICS.tokensChanged.set(c.hash, qm.tokensChanged);
+                METRICS.bytesChanged.set(c.hash, qm.bytesChanged);
+                METRICS.hunks.set(c.hash, qm.hunks);
+              }
+            }
+          } else {
+            for (let i = 0; i < d.commits.length; i++) {
+              const c = d.commits[i];
+              const qm = quickMetricsFromPatch(d.patches[i]);
+              METRICS.tokensChanged.set(c.hash, qm.tokensChanged);
+              METRICS.bytesChanged.set(c.hash, qm.bytesChanged);
+              METRICS.hunks.set(c.hash, qm.hunks);
+            }
           }
 
           // Start at the latest commit (most interesting view).
@@ -8060,6 +9290,7 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
         // Default tabs.
         setDocTab("spec");
         render();
+        void warmDerivedWorkerArtifacts();
       })();
     </script>
   </body>
