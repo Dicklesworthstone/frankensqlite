@@ -1,0 +1,18 @@
+{
+  "id": "006_join_basic",
+  "description": "Basic INNER JOIN and LEFT JOIN",
+  "ops": [
+    { "op": "open", "path": ":memory:" },
+    { "op": "exec", "sql": "CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT)" },
+    { "op": "exec", "sql": "CREATE TABLE orders(id INTEGER PRIMARY KEY, user_id INTEGER, amount INTEGER)" },
+    { "op": "exec", "sql": "INSERT INTO users VALUES(1, 'Alice')" },
+    { "op": "exec", "sql": "INSERT INTO users VALUES(2, 'Bob')" },
+    { "op": "exec", "sql": "INSERT INTO users VALUES(3, 'Carol')" },
+    { "op": "exec", "sql": "INSERT INTO orders VALUES(1, 1, 100)" },
+    { "op": "exec", "sql": "INSERT INTO orders VALUES(2, 1, 200)" },
+    { "op": "exec", "sql": "INSERT INTO orders VALUES(3, 2, 150)" },
+    { "op": "query", "sql": "SELECT u.name, o.amount FROM users u INNER JOIN orders o ON u.id = o.user_id ORDER BY u.name, o.amount", "expect": { "rows": [["Alice", "100"], ["Alice", "200"], ["Bob", "150"]], "ordered": true } },
+    { "op": "query", "sql": "SELECT u.name, o.amount FROM users u LEFT JOIN orders o ON u.id = o.user_id ORDER BY u.name, o.amount", "expect": { "ordered": true, "row_count": 4 } }
+  ],
+  "fsqlite_modes": ["compatibility", "native"]
+}

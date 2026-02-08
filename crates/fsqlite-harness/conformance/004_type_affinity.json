@@ -1,0 +1,12 @@
+{
+  "id": "004_type_affinity",
+  "description": "SQLite type affinity rules: numeric string stored in TEXT column",
+  "ops": [
+    { "op": "open", "path": ":memory:" },
+    { "op": "exec", "sql": "CREATE TABLE t4(a TEXT, b INTEGER, c REAL)" },
+    { "op": "exec", "sql": "INSERT INTO t4 VALUES('123', '456', '7.89')" },
+    { "op": "query", "sql": "SELECT typeof(a), typeof(b), typeof(c) FROM t4", "expect": { "rows": [["text", "integer", "real"]], "ordered": true } },
+    { "op": "query", "sql": "SELECT a, b, c FROM t4", "expect": { "ordered": true } }
+  ],
+  "fsqlite_modes": ["compatibility", "native"]
+}

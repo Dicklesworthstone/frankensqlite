@@ -1,0 +1,15 @@
+{
+  "id": "010_index_and_ordering",
+  "description": "Index creation and ORDER BY with ASC/DESC",
+  "ops": [
+    { "op": "open", "path": ":memory:" },
+    { "op": "exec", "sql": "CREATE TABLE t10(a INTEGER, b TEXT)" },
+    { "op": "exec", "sql": "CREATE INDEX idx_t10_a ON t10(a)" },
+    { "op": "exec", "sql": "INSERT INTO t10 VALUES(3, 'c')" },
+    { "op": "exec", "sql": "INSERT INTO t10 VALUES(1, 'a')" },
+    { "op": "exec", "sql": "INSERT INTO t10 VALUES(2, 'b')" },
+    { "op": "query", "sql": "SELECT a, b FROM t10 ORDER BY a ASC", "expect": { "rows": [["1", "a"], ["2", "b"], ["3", "c"]], "ordered": true } },
+    { "op": "query", "sql": "SELECT a, b FROM t10 ORDER BY a DESC", "expect": { "rows": [["3", "c"], ["2", "b"], ["1", "a"]], "ordered": true } }
+  ],
+  "fsqlite_modes": ["compatibility", "native"]
+}

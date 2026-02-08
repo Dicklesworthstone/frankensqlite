@@ -1,0 +1,9 @@
+{
+  "id": "012_syntax_error",
+  "description": "SQL syntax error detection",
+  "ops": [
+    { "op": "open", "path": ":memory:" },
+    { "op": "exec", "sql": "SELECTT 1", "expect_error": "ERROR" }
+  ],
+  "fsqlite_modes": ["compatibility", "native"]
+}

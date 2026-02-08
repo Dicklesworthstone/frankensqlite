@@ -1,0 +1,15 @@
+{
+  "id": "008_update_delete",
+  "description": "UPDATE and DELETE statements with WHERE clause",
+  "ops": [
+    { "op": "open", "path": ":memory:" },
+    { "op": "exec", "sql": "CREATE TABLE t8(id INTEGER PRIMARY KEY, val TEXT)" },
+    { "op": "exec", "sql": "INSERT INTO t8 VALUES(1, 'original')" },
+    { "op": "exec", "sql": "INSERT INTO t8 VALUES(2, 'keep')" },
+    { "op": "exec", "sql": "INSERT INTO t8 VALUES(3, 'remove')" },
+    { "op": "exec", "sql": "UPDATE t8 SET val = 'modified' WHERE id = 1" },
+    { "op": "exec", "sql": "DELETE FROM t8 WHERE id = 3" },
+    { "op": "query", "sql": "SELECT id, val FROM t8 ORDER BY id", "expect": { "rows": [["1", "modified"], ["2", "keep"]], "ordered": true } }
+  ],
+  "fsqlite_modes": ["compatibility", "native"]
+}

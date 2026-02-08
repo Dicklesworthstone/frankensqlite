@@ -1,0 +1,18 @@
+{
+  "id": "011_transactions_rollback",
+  "description": "Transaction COMMIT and ROLLBACK behavior",
+  "ops": [
+    { "op": "open", "path": ":memory:" },
+    { "op": "exec", "sql": "CREATE TABLE t11(a INTEGER)" },
+    { "op": "exec", "sql": "BEGIN" },
+    { "op": "exec", "sql": "INSERT INTO t11 VALUES(1)" },
+    { "op": "exec", "sql": "INSERT INTO t11 VALUES(2)" },
+    { "op": "exec", "sql": "ROLLBACK" },
+    { "op": "query", "sql": "SELECT COUNT(*) FROM t11", "expect": { "rows": [["0"]], "ordered": true } },
+    { "op": "exec", "sql": "BEGIN" },
+    { "op": "exec", "sql": "INSERT INTO t11 VALUES(10)" },
+    { "op": "exec", "sql": "COMMIT" },
+    { "op": "query", "sql": "SELECT a FROM t11", "expect": { "rows": [["10"]], "ordered": true } }
+  ],
+  "fsqlite_modes": ["compatibility", "native"]
+}

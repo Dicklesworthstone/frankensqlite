@@ -1,0 +1,13 @@
+{
+  "id": "009_expressions_and_functions",
+  "description": "Built-in functions and expressions: COALESCE, IFNULL, CASE, LENGTH, UPPER",
+  "ops": [
+    { "op": "open", "path": ":memory:" },
+    { "op": "query", "sql": "SELECT COALESCE(NULL, NULL, 'fallback')", "expect": { "rows": [["fallback"]], "ordered": true } },
+    { "op": "query", "sql": "SELECT IFNULL(NULL, 42)", "expect": { "rows": [["42"]], "ordered": true } },
+    { "op": "query", "sql": "SELECT CASE WHEN 1 > 0 THEN 'yes' ELSE 'no' END", "expect": { "rows": [["yes"]], "ordered": true } },
+    { "op": "query", "sql": "SELECT LENGTH('hello')", "expect": { "rows": [["5"]], "ordered": true } },
+    { "op": "query", "sql": "SELECT UPPER('hello'), LOWER('WORLD')", "expect": { "rows": [["HELLO", "world"]], "ordered": true } }
+  ],
+  "fsqlite_modes": ["compatibility", "native"]
+}

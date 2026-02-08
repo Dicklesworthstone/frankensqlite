@@ -1,0 +1,15 @@
+{
+  "id": "005_aggregate_functions",
+  "description": "Aggregate functions: SUM, AVG, MIN, MAX, GROUP_CONCAT",
+  "ops": [
+    { "op": "open", "path": ":memory:" },
+    { "op": "exec", "sql": "CREATE TABLE t5(category TEXT, value INTEGER)" },
+    { "op": "exec", "sql": "INSERT INTO t5 VALUES('A', 10)" },
+    { "op": "exec", "sql": "INSERT INTO t5 VALUES('A', 20)" },
+    { "op": "exec", "sql": "INSERT INTO t5 VALUES('B', 30)" },
+    { "op": "exec", "sql": "INSERT INTO t5 VALUES('B', 40)" },
+    { "op": "query", "sql": "SELECT category, SUM(value) FROM t5 GROUP BY category ORDER BY category", "expect": { "rows": [["A", "30"], ["B", "70"]], "ordered": true } },
+    { "op": "query", "sql": "SELECT MIN(value), MAX(value), AVG(value) FROM t5", "expect": { "ordered": true } }
+  ],
+  "fsqlite_modes": ["compatibility", "native"]
+}

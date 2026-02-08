@@ -12,14 +12,16 @@ pub mod witness_hierarchy;
 pub mod xor_delta;
 
 pub use cache_aligned::{
-    CACHE_LINE_BYTES, CLAIMING_TIMEOUT_NO_PID_SECS, CLAIMING_TIMEOUT_SECS, CacheAligned,
-    SLOT_PAYLOAD_MASK, SLOT_TAG_MASK, SLOT_TAG_SHIFT, SharedTxnSlot, TAG_CLAIMING, TAG_CLEANING,
-    decode_payload, decode_tag, encode_claiming, encode_cleaning, is_sentinel,
+    CACHE_LINE_BYTES, CLAIMING_TIMEOUT_NO_PID_SECS, CLAIMING_TIMEOUT_SECS, CacheAligned, RcriEntry,
+    RcriOverflowError, RecentlyCommittedReadersIndex, SLOT_PAYLOAD_MASK, SLOT_TAG_MASK,
+    SLOT_TAG_SHIFT, SharedTxnSlot, SlotAcquireError, TAG_CLAIMING, TAG_CLEANING, TxnSlotArray,
+    decode_payload, decode_tag, encode_claiming, encode_cleaning, is_sentinel, rcri_bloom,
+    slot_mode, slot_state,
 };
 pub use core_types::{
     CommitIndex, CommitLog, CommitRecord, DrainProgress, DrainResult, GcHorizonResult,
-    InProcessPageLockTable, LOCK_TABLE_SHARDS, PageBuf, RebuildError, RebuildResult,
-    SlotCleanupResult, Transaction, TransactionMode, TransactionState, VersionArena, VersionIdx,
+    InProcessPageLockTable, LOCK_TABLE_SHARDS, RebuildError, RebuildResult, SlotCleanupResult,
+    Transaction, TransactionMode, TransactionState, VersionArena, VersionIdx,
     cleanup_and_raise_gc_horizon, raise_gc_horizon, try_cleanup_sentinel_slot,
 };
 pub use invariants::{

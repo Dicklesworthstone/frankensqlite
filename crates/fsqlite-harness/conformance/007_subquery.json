@@ -1,0 +1,15 @@
+{
+  "id": "007_subquery",
+  "description": "Subqueries: scalar, IN, EXISTS",
+  "ops": [
+    { "op": "open", "path": ":memory:" },
+    { "op": "exec", "sql": "CREATE TABLE t7(a INTEGER, b TEXT)" },
+    { "op": "exec", "sql": "INSERT INTO t7 VALUES(1, 'one')" },
+    { "op": "exec", "sql": "INSERT INTO t7 VALUES(2, 'two')" },
+    { "op": "exec", "sql": "INSERT INTO t7 VALUES(3, 'three')" },
+    { "op": "query", "sql": "SELECT a FROM t7 WHERE a IN (SELECT a FROM t7 WHERE a > 1) ORDER BY a", "expect": { "rows": [["2"], ["3"]], "ordered": true } },
+    { "op": "query", "sql": "SELECT (SELECT MAX(a) FROM t7)", "expect": { "rows": [["3"]], "ordered": true } },
+    { "op": "query", "sql": "SELECT a FROM t7 WHERE EXISTS (SELECT 1 FROM t7 AS t WHERE t.a = t7.a AND t.a > 2) ORDER BY a", "expect": { "rows": [["3"]], "ordered": true } }
+  ],
+  "fsqlite_modes": ["compatibility", "native"]
+}

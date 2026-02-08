@@ -1,0 +1,11 @@
+{
+  "id": "003_unique_constraint",
+  "description": "UNIQUE constraint violation detection",
+  "ops": [
+    { "op": "open", "path": ":memory:" },
+    { "op": "exec", "sql": "CREATE TABLE t3(a INTEGER UNIQUE, b TEXT)" },
+    { "op": "exec", "sql": "INSERT INTO t3 VALUES(1, 'first')" },
+    { "op": "exec", "sql": "INSERT INTO t3 VALUES(1, 'duplicate')", "expect_error": "CONSTRAINT" }
+  ],
+  "fsqlite_modes": ["compatibility", "native"]
+}

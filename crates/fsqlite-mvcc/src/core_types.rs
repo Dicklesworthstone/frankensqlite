@@ -8,7 +8,6 @@
 //! [`fsqlite_types::glossary`]; this module builds the runtime machinery on top.
 
 use std::collections::{HashMap, HashSet};
-use std::hash::{BuildHasherDefault, Hasher};
 use std::time::{Duration, Instant};
 
 use parking_lot::{Mutex, RwLock};
@@ -17,12 +16,13 @@ use smallvec::SmallVec;
 use std::sync::atomic::Ordering;
 
 use crate::cache_aligned::{
-    decode_payload, decode_tag, encode_cleaning, is_sentinel, CacheAligned, SharedTxnSlot,
-    CLAIMING_TIMEOUT_NO_PID_SECS, CLAIMING_TIMEOUT_SECS, TAG_CLAIMING,
+    CLAIMING_TIMEOUT_NO_PID_SECS, CLAIMING_TIMEOUT_SECS, CacheAligned, SharedTxnSlot, TAG_CLAIMING,
+    decode_payload, decode_tag, encode_cleaning, is_sentinel,
 };
+pub use fsqlite_pager::PageBuf;
 use fsqlite_types::{
-    CommitSeq, IntentLog, PageData, PageNumber, PageSize, PageVersion, Snapshot, TxnEpoch, TxnId,
-    TxnSlot, TxnToken, WitnessKey,
+    CommitSeq, IntentLog, PageData, PageNumber, PageNumberBuildHasher, PageVersion, Snapshot,
+    TxnEpoch, TxnId, TxnSlot, TxnToken, WitnessKey,
 };
 
 // ---------------------------------------------------------------------------
@@ -167,35 +167,6 @@ impl std::fmt::Debug for VersionArena {
             .finish_non_exhaustive()
     }
 }
-
-// ---------------------------------------------------------------------------
-// PageNumber hasher (identity-hash for u32 keys)
-// ---------------------------------------------------------------------------
-
-/// Fast identity hasher for `PageNumber` keys in lock/commit tables.
-///
-/// Page numbers are already well-distributed u32 values, so we skip
-/// hashing entirely and use the raw value directly.
-#[derive(Default)]
-struct PageNumberHasher(u64);
-
-impl Hasher for PageNumberHasher {
-    fn write(&mut self, _: &[u8]) {
-        // PageNumber's Hash impl calls write_u32 (via NonZeroU32). If this
-        // method is reached, the hasher is being misused with a non-u32 key.
-        debug_assert!(false, "PageNumberHasher only supports write_u32");
-    }
-
-    fn write_u32(&mut self, n: u32) {
-        self.0 = u64::from(n);
-    }
-
-    fn finish(&self) -> u64 {
-        self.0
-    }
-}
-
-type PageNumberBuildHasher = BuildHasherDefault<PageNumberHasher>;
 
 // ---------------------------------------------------------------------------
 // InProcessPageLockTable
@@ -1268,131 +1239,13 @@ pub fn cleanup_and_raise_gc_horizon(
 }
 
 // ---------------------------------------------------------------------------
-// PageBuf — page-aligned owned buffer
-// ---------------------------------------------------------------------------
-
-/// An owned, page-sized buffer.
-///
-/// The exposed page slice is always exactly `page_size` bytes and is
-/// guaranteed to be aligned to `page_size`.
-///
-/// Internally this uses a slightly larger `Vec<u8>` allocation and a
-/// subslice offset chosen to satisfy alignment without unsafe code.
-pub struct PageBuf {
-    alloc: Vec<u8>,
-    offset: usize,
-    page_size: PageSize,
-}
-
-impl Clone for PageBuf {
-    fn clone(&self) -> Self {
-        // Cannot derive Clone: the cloned Vec gets a new heap address,
-        // so the offset computed for the original allocation is invalid.
-        // Allocate a fresh aligned buffer and copy the page data in.
-        let mut buf = Self::zeroed(self.page_size);
-        buf.as_bytes_mut().copy_from_slice(self.as_bytes());
-        buf
-    }
-}
-
-impl PageBuf {
-    #[inline]
-    fn start(&self) -> usize {
-        self.offset
-    }
-
-    #[inline]
-    fn end(&self) -> usize {
-        self.offset + self.page_size.as_usize()
-    }
-
-    /// Create a zeroed page buffer.
-    #[must_use]
-    pub fn zeroed(page_size: PageSize) -> Self {
-        let align = page_size.as_usize();
-        let len = page_size.as_usize() + align - 1;
-        let alloc = vec![0u8; len];
-
-        let base = alloc.as_ptr() as usize;
-        let rem = base % align;
-        let offset = if rem == 0 { 0 } else { align - rem };
-
-        Self {
-            alloc,
-            offset,
-            page_size,
-        }
-    }
-
-    /// Create from existing data. Panics if `data.len() != page_size`.
-    #[must_use]
-    pub fn from_vec(data: Vec<u8>, page_size: PageSize) -> Self {
-        assert_eq!(data.len(), page_size.as_usize(), "PageBuf size mismatch");
-        // Fast path: already aligned; reuse the allocation without copying.
-        if (data.as_ptr() as usize) % page_size.as_usize() == 0 {
-            return Self {
-                alloc: data,
-                offset: 0,
-                page_size,
-            };
-        }
-
-        // Slow path: realign via a fresh allocation.
-        let mut buf = Self::zeroed(page_size);
-        buf.as_bytes_mut().copy_from_slice(&data);
-        buf
-    }
-
-    #[inline]
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.alloc[self.start()..self.end()]
-    }
-
-    #[inline]
-    pub fn as_bytes_mut(&mut self) -> &mut [u8] {
-        let start = self.start();
-        let end = self.end();
-        &mut self.alloc[start..end]
-    }
-
-    #[must_use]
-    pub fn page_size(&self) -> PageSize {
-        self.page_size
-    }
-
-    /// Check if the data pointer is aligned to the page size.
-    #[must_use]
-    pub fn is_aligned(&self) -> bool {
-        (self.as_bytes().as_ptr() as usize) % self.page_size.as_usize() == 0
-    }
-}
-
-impl PartialEq for PageBuf {
-    fn eq(&self, other: &Self) -> bool {
-        self.page_size == other.page_size && self.as_bytes() == other.as_bytes()
-    }
-}
-
-impl Eq for PageBuf {}
-
-#[allow(clippy::missing_fields_in_debug)]
-impl std::fmt::Debug for PageBuf {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PageBuf")
-            .field("page_size", &self.page_size.get())
-            .field("aligned", &self.is_aligned())
-            .finish_non_exhaustive()
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fsqlite_types::{PageData, SchemaEpoch, VersionPointer};
+    use fsqlite_types::{PageData, PageSize, SchemaEpoch, VersionPointer};
     use proptest::prelude::*;
 
     fn make_page_version(pgno: u32, commit: u64) -> PageVersion {
@@ -1851,22 +1704,6 @@ mod tests {
         assert_eq!(index.latest(page), Some(CommitSeq::new(10)));
     }
 
-    // -- PageBuf --
-
-    #[test]
-    fn test_page_buf_zeroed() {
-        let buf = PageBuf::zeroed(PageSize::DEFAULT);
-        assert_eq!(buf.as_bytes().len(), 4096);
-        assert!(buf.as_bytes().iter().all(|&b| b == 0));
-        assert_eq!(buf.page_size(), PageSize::DEFAULT);
-    }
-
-    #[test]
-    #[should_panic(expected = "PageBuf size mismatch")]
-    fn test_page_buf_size_mismatch() {
-        let _ = PageBuf::from_vec(vec![0u8; 100], PageSize::DEFAULT);
-    }
-
     // -- All types Debug+Clone --
 
     #[test]
@@ -1882,46 +1719,6 @@ mod tests {
         assert_debug::<CommitRecord>();
         assert_debug::<CommitLog>();
         assert_debug::<CommitIndex>();
-        assert_debug::<PageBuf>();
-    }
-
-    #[test]
-    fn test_page_buf_alignment() {
-        let buf = PageBuf::zeroed(PageSize::DEFAULT);
-        assert!(
-            buf.is_aligned(),
-            "PageBuf must be aligned to page_size (for direct I/O)"
-        );
-    }
-
-    #[test]
-    fn test_page_buf_from_vec_is_aligned_and_preserves_bytes() {
-        let mut data = vec![0u8; PageSize::DEFAULT.as_usize()];
-        for (i, b) in data.iter_mut().enumerate() {
-            *b = u8::try_from(i & 0xFF).unwrap_or(0);
-        }
-        let buf = PageBuf::from_vec(data.clone(), PageSize::DEFAULT);
-        assert!(
-            buf.is_aligned(),
-            "PageBuf::from_vec must yield aligned storage"
-        );
-        assert_eq!(buf.as_bytes(), data.as_slice());
-    }
-
-    #[test]
-    fn test_page_buf_clone_preserves_alignment_and_data() {
-        let mut buf = PageBuf::zeroed(PageSize::DEFAULT);
-        // Write a recognizable pattern.
-        for (i, b) in buf.as_bytes_mut().iter_mut().enumerate() {
-            *b = u8::try_from(i & 0xFF).unwrap_or(0);
-        }
-        let cloned = buf.clone();
-        assert!(
-            cloned.is_aligned(),
-            "cloned PageBuf must be aligned (new heap allocation)"
-        );
-        assert_eq!(cloned.as_bytes(), buf.as_bytes());
-        assert_eq!(cloned.page_size(), buf.page_size());
     }
 
     #[test]
@@ -1932,7 +1729,6 @@ mod tests {
         assert_clone_eq::<TransactionState>();
         assert_clone_eq::<TransactionMode>();
         assert_clone_eq::<CommitRecord>();
-        assert_clone_eq::<PageBuf>();
     }
 
     // -- Property tests --
@@ -2809,8 +2605,8 @@ mod tests {
     const BEAD_22N13: &str = "bd-22n.13";
 
     use crate::cache_aligned::{
-        encode_claiming, encode_cleaning, CLAIMING_TIMEOUT_NO_PID_SECS, CLAIMING_TIMEOUT_SECS,
-        TAG_CLEANING,
+        CLAIMING_TIMEOUT_NO_PID_SECS, CLAIMING_TIMEOUT_SECS, TAG_CLEANING, encode_claiming,
+        encode_cleaning,
     };
 
     /// Helper: create a slot with a real (non-sentinel) TxnId and begin_seq.
