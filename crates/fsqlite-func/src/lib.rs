@@ -27,13 +27,14 @@ pub mod math;
 pub mod scalar;
 pub mod vtab;
 pub mod window;
+pub mod window_builtins;
 
 pub use agg_builtins::register_aggregate_builtins;
 pub use aggregate::{AggregateAdapter, AggregateFunction};
 pub use authorizer::{AuthAction, AuthResult, Authorizer, AuthorizerAction, AuthorizerDecision};
 pub use builtins::register_builtins;
-pub use datetime::register_datetime_builtins;
 pub use collation::{BinaryCollation, CollationFunction, NoCaseCollation, RtrimCollation};
+pub use datetime::register_datetime_builtins;
 pub use math::register_math_builtins;
 pub use scalar::ScalarFunction;
 pub use vtab::{
@@ -41,6 +42,7 @@ pub use vtab::{
     VirtualTable, VirtualTableCursor,
 };
 pub use window::{WindowAdapter, WindowFunction};
+pub use window_builtins::register_window_builtins;
 
 /// Type-erased aggregate function object used by the registry.
 pub type ErasedAggregateFunction = dyn AggregateFunction<State = Box<dyn Any + Send>>;

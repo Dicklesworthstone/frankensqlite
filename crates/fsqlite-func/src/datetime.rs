@@ -45,10 +45,7 @@ fn ymd_to_jdn(y: i64, m: i64, d: i64) -> f64 {
     let (y, m) = if m <= 2 { (y - 1, m + 12) } else { (y, m) };
     let a = y / 100;
     let b = 2 - a + a / 4;
-    (365.25 * (y + 4716) as f64).floor()
-        + (30.6001 * (m + 1) as f64).floor()
-        + d as f64
-        + b as f64
+    (365.25 * (y + 4716) as f64).floor() + (30.6001 * (m + 1) as f64).floor() + d as f64 + b as f64
         - 1524.5
 }
 
@@ -369,8 +366,7 @@ fn apply_modifiers(jdn: f64, modifiers: &[String]) -> Option<(f64, bool)> {
 }
 
 fn is_month_year_modifier(m: &str) -> bool {
-    (m.contains("month") || m.contains("year"))
-        && (m.starts_with('+') || m.starts_with('-'))
+    (m.contains("month") || m.contains("year")) && (m.starts_with('+') || m.starts_with('-'))
 }
 
 /// Exact month/year arithmetic by decomposing to YMD.
@@ -452,7 +448,13 @@ fn format_strftime(fmt: &str, jdn: f64) -> String {
                 'H' => result.push_str(&format!("{h:02}")),
                 'I' => {
                     // 12-hour clock.
-                    let h12 = if h == 0 { 12 } else if h > 12 { h - 12 } else { h };
+                    let h12 = if h == 0 {
+                        12
+                    } else if h > 12 {
+                        h - 12
+                    } else {
+                        h
+                    };
                     result.push_str(&format!("{h12:02}"));
                 }
                 'j' => result.push_str(&format!("{doy:03}")),
@@ -463,7 +465,13 @@ fn format_strftime(fmt: &str, jdn: f64) -> String {
                 }
                 'l' => {
                     // Space-padded 12-hour.
-                    let h12 = if h == 0 { 12 } else if h > 12 { h - 12 } else { h };
+                    let h12 = if h == 0 {
+                        12
+                    } else if h > 12 {
+                        h - 12
+                    } else {
+                        h
+                    };
                     result.push_str(&format!("{h12:>2}"));
                 }
                 'm' => result.push_str(&format!("{mo:02}")),
@@ -585,13 +593,7 @@ fn parse_args(args: &[SqliteValue]) -> Option<(f64, bool)> {
 
     let modifiers: Vec<String> = args[1..]
         .iter()
-        .filter_map(|a| {
-            if a.is_null() {
-                None
-            } else {
-                Some(a.to_text())
-            }
-        })
+        .filter_map(|a| if a.is_null() { None } else { Some(a.to_text()) })
         .collect();
 
     apply_modifiers(input, &modifiers)
@@ -824,9 +826,7 @@ mod tests {
 
     #[test]
     fn test_datetime_basic() {
-        let r = DateTimeFunc
-            .invoke(&[text("2024-03-15 14:30:00")])
-            .unwrap();
+        let r = DateTimeFunc.invoke(&[text("2024-03-15 14:30:00")]).unwrap();
         assert_text(&r, "2024-03-15 14:30:00");
     }
 
@@ -836,10 +836,7 @@ mod tests {
         match r {
             SqliteValue::Float(jdn) => {
                 // JDN for 2024-03-15 should be approximately 2460384.5
-                assert!(
-                    (jdn - 2_460_384.5).abs() < 0.01,
-                    "unexpected JDN: {jdn}"
-                );
+                assert!((jdn - 2_460_384.5).abs() < 0.01, "unexpected JDN: {jdn}");
             }
             other => panic!("expected Float, got {other:?}"),
         }
@@ -924,9 +921,7 @@ mod tests {
 
     #[test]
     fn test_modifier_unixepoch() {
-        let r = DateTimeFunc
-            .invoke(&[int(0), text("unixepoch")])
-            .unwrap();
+        let r = DateTimeFunc.invoke(&[int(0), text("unixepoch")]).unwrap();
         assert_text(&r, "1970-01-01 00:00:00");
     }
 
@@ -934,21 +929,13 @@ mod tests {
     fn test_modifier_order_matters() {
         // 'start of month' then '+1 day' = March 2nd.
         let r1 = DateFunc
-            .invoke(&[
-                text("2024-03-15"),
-                text("start of month"),
-                text("+1 days"),
-            ])
+            .invoke(&[text("2024-03-15"), text("start of month"), text("+1 days")])
             .unwrap();
         assert_text(&r1, "2024-03-02");
 
         // '+1 day' then 'start of month' = March 1st.
         let r2 = DateFunc
-            .invoke(&[
-                text("2024-03-15"),
-                text("+1 days"),
-                text("start of month"),
-            ])
+            .invoke(&[text("2024-03-15"), text("+1 days"), text("start of month")])
             .unwrap();
         assert_text(&r2, "2024-03-01");
     }
@@ -963,9 +950,7 @@ mod tests {
 
     #[test]
     fn test_t_separator() {
-        let r = DateTimeFunc
-            .invoke(&[text("2024-03-15T14:30:00")])
-            .unwrap();
+        let r = DateTimeFunc.invoke(&[text("2024-03-15T14:30:00")]).unwrap();
         assert_text(&r, "2024-03-15 14:30:00");
     }
 
@@ -1180,9 +1165,6 @@ mod tests {
         assert_eq!(unix, 0, "Unix epoch should be 0");
 
         let jdn2 = unix_to_jdn(0.0);
-        assert!(
-            (jdn2 - UNIX_EPOCH_JDN).abs() < 1e-10,
-            "roundtrip failed"
-        );
+        assert!((jdn2 - UNIX_EPOCH_JDN).abs() < 1e-10, "roundtrip failed");
     }
 }
