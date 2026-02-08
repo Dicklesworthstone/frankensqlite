@@ -1507,4 +1507,607 @@ mod tests {
     fn test_subquery_expr() {
         assert!(matches!(parse("(SELECT 1)"), Expr::Subquery(..)));
     }
+
+    // ── bd-kzat: §10.2 Pratt Precedence Validation ─────────────────────
+    //
+    // Systematic tests for ALL 11 operator precedence levels.
+    // Each level gets a dedicated associativity test and a boundary test
+    // against the adjacent level.
+
+    // Level 1: OR — left-associative
+    #[test]
+    fn test_pratt_level1_or_left_assoc() {
+        // a OR b OR c → (a OR b) OR c
+        let expr = parse("a OR b OR c");
+        match &expr {
+            Expr::BinaryOp {
+                op: BinaryOp::Or,
+                left,
+                ..
+            } => assert!(
+                matches!(
+                    left.as_ref(),
+                    Expr::BinaryOp {
+                        op: BinaryOp::Or,
+                        ..
+                    }
+                ),
+                "OR should be left-associative"
+            ),
+            other => unreachable!("expected Or(Or(a,b), c), got {other:?}"),
+        }
+    }
+
+    // Level 2: AND — left-associative, tighter than OR
+    #[test]
+    fn test_pratt_level2_and_left_assoc() {
+        // a AND b AND c → (a AND b) AND c
+        let expr = parse("a AND b AND c");
+        match &expr {
+            Expr::BinaryOp {
+                op: BinaryOp::And,
+                left,
+                ..
+            } => assert!(
+                matches!(
+                    left.as_ref(),
+                    Expr::BinaryOp {
+                        op: BinaryOp::And,
+                        ..
+                    }
+                ),
+                "AND should be left-associative"
+            ),
+            other => unreachable!("expected And(And(a,b), c), got {other:?}"),
+        }
+    }
+
+    // Level 3: NOT — prefix, higher than AND, lower than equality
+    #[test]
+    fn test_pratt_level3_not_higher_than_and() {
+        // NOT a AND b → (NOT a) AND b
+        let expr = parse("NOT a AND b");
+        match &expr {
+            Expr::BinaryOp {
+                op: BinaryOp::And,
+                left,
+                ..
+            } => assert!(
+                matches!(
+                    left.as_ref(),
+                    Expr::UnaryOp {
+                        op: UnaryOp::Not,
+                        ..
+                    }
+                ),
+                "NOT should bind tighter than AND"
+            ),
+            other => unreachable!("expected And(Not(a), b), got {other:?}"),
+        }
+    }
+
+    // Level 4: Equality/membership — left-associative
+    #[test]
+    fn test_pratt_level4_equality_left_assoc() {
+        // a = b != c → (a = b) != c
+        let expr = parse("a = b != c");
+        match &expr {
+            Expr::BinaryOp {
+                op: BinaryOp::Ne,
+                left,
+                ..
+            } => assert!(
+                matches!(
+                    left.as_ref(),
+                    Expr::BinaryOp {
+                        op: BinaryOp::Eq,
+                        ..
+                    }
+                ),
+                "equality operators should be left-associative at same level"
+            ),
+            other => unreachable!("expected Ne(Eq(a,b), c), got {other:?}"),
+        }
+    }
+
+    // Level 4 vs Level 5: THE CRITICAL BOUNDARY
+    // Equality (level 4) and relational (level 5) are SEPARATE levels
+    // per C SQLite's parse.y grammar.
+    #[test]
+    fn test_pratt_level4_vs_level5_eq_lt_boundary() {
+        // a = b < c MUST parse as a = (b < c), NOT (a = b) < c
+        // This is the normative invariant from §10.2.
+        let expr = parse("a = b < c");
+        match &expr {
+            Expr::BinaryOp {
+                op: BinaryOp::Eq,
+                right,
+                ..
+            } => assert!(
+                matches!(
+                    right.as_ref(),
+                    Expr::BinaryOp {
+                        op: BinaryOp::Lt,
+                        ..
+                    }
+                ),
+                "a = b < c MUST parse as a = (b < c): relational binds tighter"
+            ),
+            other => unreachable!("expected Eq(a, Lt(b,c)), got {other:?}"),
+        }
+    }
+
+    // Reverse direction of the same boundary
+    #[test]
+    fn test_pratt_level4_vs_level5_ne_ge_boundary() {
+        // a != b >= c → a != (b >= c)
+        let expr = parse("a != b >= c");
+        match &expr {
+            Expr::BinaryOp {
+                op: BinaryOp::Ne,
+                right,
+                ..
+            } => assert!(
+                matches!(
+                    right.as_ref(),
+                    Expr::BinaryOp {
+                        op: BinaryOp::Ge,
+                        ..
+                    }
+                ),
+                "a != b >= c must parse as a != (b >= c)"
+            ),
+            other => unreachable!("expected Ne(a, Ge(b,c)), got {other:?}"),
+        }
+    }
+
+    // Level 5: Relational — left-associative
+    #[test]
+    fn test_pratt_level5_relational_left_assoc() {
+        // a < b >= c → (a < b) >= c
+        let expr = parse("a < b >= c");
+        match &expr {
+            Expr::BinaryOp {
+                op: BinaryOp::Ge,
+                left,
+                ..
+            } => assert!(
+                matches!(
+                    left.as_ref(),
+                    Expr::BinaryOp {
+                        op: BinaryOp::Lt,
+                        ..
+                    }
+                ),
+                "relational operators should be left-associative"
+            ),
+            other => unreachable!("expected Ge(Lt(a,b), c), got {other:?}"),
+        }
+    }
+
+    // Level 6: Bitwise — tighter than relational
+    #[test]
+    fn test_pratt_level6_bitwise_tighter_than_comparison() {
+        // a < b & c → a < (b & c)
+        let expr = parse("a < b & c");
+        match &expr {
+            Expr::BinaryOp {
+                op: BinaryOp::Lt,
+                right,
+                ..
+            } => assert!(
+                matches!(
+                    right.as_ref(),
+                    Expr::BinaryOp {
+                        op: BinaryOp::BitAnd,
+                        ..
+                    }
+                ),
+                "bitwise should bind tighter than relational"
+            ),
+            other => unreachable!("expected Lt(a, BitAnd(b,c)), got {other:?}"),
+        }
+    }
+
+    // Level 6: Shift operators left-associative
+    #[test]
+    fn test_pratt_level6_shifts_left_assoc() {
+        // a << b >> c → (a << b) >> c
+        let expr = parse("a << b >> c");
+        match &expr {
+            Expr::BinaryOp {
+                op: BinaryOp::ShiftRight,
+                left,
+                ..
+            } => assert!(
+                matches!(
+                    left.as_ref(),
+                    Expr::BinaryOp {
+                        op: BinaryOp::ShiftLeft,
+                        ..
+                    }
+                ),
+                "shift operators should be left-associative"
+            ),
+            other => unreachable!("expected ShiftRight(ShiftLeft(a,b), c), got {other:?}"),
+        }
+    }
+
+    // Level 7: Addition/subtraction — left-associative, tighter than bitwise
+    #[test]
+    fn test_pratt_level7_add_sub_left_assoc() {
+        // a + b - c → (a + b) - c
+        let expr = parse("a + b - c");
+        match &expr {
+            Expr::BinaryOp {
+                op: BinaryOp::Subtract,
+                left,
+                ..
+            } => assert!(
+                matches!(
+                    left.as_ref(),
+                    Expr::BinaryOp {
+                        op: BinaryOp::Add,
+                        ..
+                    }
+                ),
+                "add/sub should be left-associative"
+            ),
+            other => unreachable!("expected Sub(Add(a,b), c), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_pratt_level7_tighter_than_bitwise() {
+        // a & b + c → a & (b + c)
+        let expr = parse("a & b + c");
+        match &expr {
+            Expr::BinaryOp {
+                op: BinaryOp::BitAnd,
+                right,
+                ..
+            } => assert!(
+                matches!(
+                    right.as_ref(),
+                    Expr::BinaryOp {
+                        op: BinaryOp::Add,
+                        ..
+                    }
+                ),
+                "addition should bind tighter than bitwise"
+            ),
+            other => unreachable!("expected BitAnd(a, Add(b,c)), got {other:?}"),
+        }
+    }
+
+    // Level 8: Multiplication/division/modulo — left-associative
+    #[test]
+    fn test_pratt_level8_mul_div_left_assoc() {
+        // a * b / c → (a * b) / c
+        let expr = parse("a * b / c");
+        match &expr {
+            Expr::BinaryOp {
+                op: BinaryOp::Divide,
+                left,
+                ..
+            } => assert!(
+                matches!(
+                    left.as_ref(),
+                    Expr::BinaryOp {
+                        op: BinaryOp::Multiply,
+                        ..
+                    }
+                ),
+                "mul/div should be left-associative"
+            ),
+            other => unreachable!("expected Div(Mul(a,b), c), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_pratt_level8_modulo() {
+        // a * b % c → (a * b) % c
+        let expr = parse("a * b % c");
+        match &expr {
+            Expr::BinaryOp {
+                op: BinaryOp::Modulo,
+                left,
+                ..
+            } => assert!(
+                matches!(
+                    left.as_ref(),
+                    Expr::BinaryOp {
+                        op: BinaryOp::Multiply,
+                        ..
+                    }
+                ),
+                "modulo and multiply at same level, left-associative"
+            ),
+            other => unreachable!("expected Mod(Mul(a,b), c), got {other:?}"),
+        }
+    }
+
+    // Level 9: Concatenation (||) — left-associative, tighter than mul
+    #[test]
+    fn test_pratt_level9_concat_left_assoc() {
+        // a || b || c → (a || b) || c
+        let expr = parse("a || b || c");
+        match &expr {
+            Expr::BinaryOp {
+                op: BinaryOp::Concat,
+                left,
+                ..
+            } => assert!(
+                matches!(
+                    left.as_ref(),
+                    Expr::BinaryOp {
+                        op: BinaryOp::Concat,
+                        ..
+                    }
+                ),
+                "concatenation should be left-associative"
+            ),
+            other => unreachable!("expected Concat(Concat(a,b), c), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_pratt_level9_tighter_than_mul() {
+        // a * b || c → a * (b || c)
+        let expr = parse("a * b || c");
+        match &expr {
+            Expr::BinaryOp {
+                op: BinaryOp::Multiply,
+                right,
+                ..
+            } => assert!(
+                matches!(
+                    right.as_ref(),
+                    Expr::BinaryOp {
+                        op: BinaryOp::Concat,
+                        ..
+                    }
+                ),
+                "concat should bind tighter than multiply"
+            ),
+            other => unreachable!("expected Mul(a, Concat(b,c)), got {other:?}"),
+        }
+    }
+
+    // Level 10: COLLATE — postfix, tighter than concat
+    #[test]
+    fn test_pratt_level10_collate_tighter_than_concat() {
+        // a || b COLLATE NOCASE → a || (b COLLATE NOCASE)
+        let expr = parse("a || b COLLATE NOCASE");
+        match &expr {
+            Expr::BinaryOp {
+                op: BinaryOp::Concat,
+                right,
+                ..
+            } => assert!(
+                matches!(right.as_ref(), Expr::Collate { .. }),
+                "COLLATE should bind tighter than concat"
+            ),
+            other => unreachable!("expected Concat(a, Collate(b)), got {other:?}"),
+        }
+    }
+
+    // Level 11: Unary prefix (- + ~) — tightest of all
+    #[test]
+    fn test_pratt_level11_unary_negate_tightest() {
+        // -a * b → (-a) * b
+        let expr = parse("-a * b");
+        match &expr {
+            Expr::BinaryOp {
+                op: BinaryOp::Multiply,
+                left,
+                ..
+            } => assert!(
+                matches!(
+                    left.as_ref(),
+                    Expr::UnaryOp {
+                        op: UnaryOp::Negate,
+                        ..
+                    }
+                ),
+                "unary minus should bind tighter than multiply"
+            ),
+            other => unreachable!("expected Mul(Negate(a), b), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_pratt_level11_bitnot_tightest() {
+        // ~a + b → (~a) + b
+        let expr = parse("~a + b");
+        match &expr {
+            Expr::BinaryOp {
+                op: BinaryOp::Add,
+                left,
+                ..
+            } => assert!(
+                matches!(
+                    left.as_ref(),
+                    Expr::UnaryOp {
+                        op: UnaryOp::BitNot,
+                        ..
+                    }
+                ),
+                "bitwise NOT should bind tighter than addition"
+            ),
+            other => unreachable!("expected Add(BitNot(a), b), got {other:?}"),
+        }
+    }
+
+    // ESCAPE is NOT a standalone infix operator — it's suffix of LIKE/GLOB
+    #[test]
+    fn test_pratt_escape_not_infix_operator() {
+        // a LIKE b ESCAPE c → Like(a, b, escape=c)
+        let expr = parse("a LIKE b ESCAPE c");
+        match &expr {
+            Expr::Like {
+                escape: Some(esc), ..
+            } => assert!(
+                matches!(esc.as_ref(), Expr::Column(..)),
+                "ESCAPE should be parsed as suffix of LIKE, not standalone infix"
+            ),
+            other => unreachable!("expected Like with escape, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_pratt_escape_glob_not_infix() {
+        // a GLOB b ESCAPE c → Like(a, b, op=Glob, escape=c)
+        let expr = parse("a GLOB b ESCAPE c");
+        match &expr {
+            Expr::Like {
+                op: LikeOp::Glob,
+                escape: Some(_),
+                ..
+            } => {}
+            other => unreachable!("expected Glob with escape, got {other:?}"),
+        }
+    }
+
+    // Error recovery: multiple errors collected in one pass
+    #[test]
+    fn test_pratt_error_recovery_multiple_errors() {
+        use crate::parser::Parser;
+        let mut p = Parser::from_sql("SELECT +; SELECT *; SELECT 1");
+        let (stmts, errs) = p.parse_all();
+        // SELECT + fails (missing operand), SELECT * fails (no FROM for bare *),
+        // SELECT 1 should succeed.
+        assert!(
+            !stmts.is_empty(),
+            "should recover and parse at least one valid statement"
+        );
+        assert!(
+            !errs.is_empty(),
+            "should collect at least one error from malformed statements"
+        );
+    }
+
+    // Complex mixed expression: full 11-level test
+    #[test]
+    fn test_pratt_complex_mixed_all_levels() {
+        // NOT a = b + c * -d OR e < f AND g LIKE h
+        // → (NOT (a = (b + (c * (-d))))) OR ((e < f) AND (g LIKE h))
+        let expr = parse("NOT a = b + c * -d OR e < f AND g LIKE h");
+        // Top level: OR
+        match &expr {
+            Expr::BinaryOp {
+                op: BinaryOp::Or,
+                left,
+                right,
+                ..
+            } => {
+                // left = NOT (a = (b + (c * (-d))))
+                assert!(
+                    matches!(
+                        left.as_ref(),
+                        Expr::UnaryOp {
+                            op: UnaryOp::Not,
+                            ..
+                        }
+                    ),
+                    "left of OR should be NOT(...)"
+                );
+                // right = (e < f) AND (g LIKE h)
+                match right.as_ref() {
+                    Expr::BinaryOp {
+                        op: BinaryOp::And,
+                        left: and_left,
+                        right: and_right,
+                        ..
+                    } => {
+                        assert!(
+                            matches!(
+                                and_left.as_ref(),
+                                Expr::BinaryOp {
+                                    op: BinaryOp::Lt,
+                                    ..
+                                }
+                            ),
+                            "left of AND should be Lt(e,f)"
+                        );
+                        assert!(
+                            matches!(and_right.as_ref(), Expr::Like { .. }),
+                            "right of AND should be Like(g,h)"
+                        );
+                    }
+                    other => unreachable!("expected And(Lt, Like), got {other:?}"),
+                }
+
+                // Drill into the NOT to verify deeper structure:
+                // NOT → Eq → right = Add → right = Mul → right = Negate
+                if let Expr::UnaryOp {
+                    expr: not_inner, ..
+                } = left.as_ref()
+                {
+                    if let Expr::BinaryOp {
+                        op: BinaryOp::Eq,
+                        right: eq_right,
+                        ..
+                    } = not_inner.as_ref()
+                    {
+                        if let Expr::BinaryOp {
+                            op: BinaryOp::Add,
+                            right: add_right,
+                            ..
+                        } = eq_right.as_ref()
+                        {
+                            if let Expr::BinaryOp {
+                                op: BinaryOp::Multiply,
+                                right: mul_right,
+                                ..
+                            } = add_right.as_ref()
+                            {
+                                assert!(
+                                    matches!(
+                                        mul_right.as_ref(),
+                                        Expr::UnaryOp {
+                                            op: UnaryOp::Negate,
+                                            ..
+                                        }
+                                    ),
+                                    "deepest: negate"
+                                );
+                            } else {
+                                unreachable!("expected Mul in add_right");
+                            }
+                        } else {
+                            unreachable!("expected Add in eq_right");
+                        }
+                    } else {
+                        unreachable!("expected Eq inside NOT");
+                    }
+                }
+            }
+            other => unreachable!("expected Or(Not(...), And(...)), got {other:?}"),
+        }
+    }
+
+    // JSON operators at highest infix precedence
+    #[test]
+    fn test_pratt_json_highest_infix() {
+        // a || b -> c → a || (b -> c) since JSON binds tightest
+        let expr = parse("a || b -> c");
+        match &expr {
+            Expr::BinaryOp {
+                op: BinaryOp::Concat,
+                right,
+                ..
+            } => assert!(
+                matches!(
+                    right.as_ref(),
+                    Expr::JsonAccess {
+                        arrow: JsonArrow::Arrow,
+                        ..
+                    }
+                ),
+                "JSON -> should bind tighter than concat"
+            ),
+            other => unreachable!("expected Concat(a, JsonAccess(b,c)), got {other:?}"),
+        }
+    }
 }
