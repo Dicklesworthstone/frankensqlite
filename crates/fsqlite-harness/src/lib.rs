@@ -7,6 +7,7 @@
 pub mod eprocess;
 pub mod fslab;
 pub mod log;
+pub mod scheduler;
 pub mod supervision;
 pub mod tla;
 
