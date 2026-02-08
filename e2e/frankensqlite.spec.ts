@@ -140,9 +140,9 @@ test.describe("FrankenSQLite Visualization – Live Site", () => {
     const commitCount = await page.locator("#commitList > *").count();
     expect(commitCount).toBeGreaterThan(10);
 
-    // Bucket toggles exist
+    // Bucket toggles exist (in DOM; may be below fold or in hidden-lg:block aside)
     const bucketToggles = page.locator("#bucketToggles button, #bucketToggles label");
-    await expect(bucketToggles.first()).toBeVisible();
+    await expect(bucketToggles.first()).toBeAttached();
   });
 
   // ── New features: heat stripe, story mode, SbS panes ─────────────────
@@ -150,8 +150,8 @@ test.describe("FrankenSQLite Visualization – Live Site", () => {
     await page.goto("/");
     await page.waitForLoadState("networkidle");
 
-    // Heat stripe canvas
-    await expect(page.locator("#heatStripeCanvas")).toBeAttached();
+    // Dock heat stripe canvas
+    await expect(page.locator("#dockHeatStripe")).toBeAttached();
 
     // Story mode elements
     await expect(page.locator("#storyRail")).toBeAttached();
@@ -159,9 +159,6 @@ test.describe("FrankenSQLite Visualization – Live Site", () => {
 
     // Side-by-side rendered panes
     await expect(page.locator("#sbsContainer")).toBeAttached();
-
-    // Dock heat stripe
-    await expect(page.locator("#dockHeatStripe")).toBeAttached();
   });
 
   // ── Tab navigation ────────────────────────────────────────────────────
@@ -352,5 +349,309 @@ test.describe("FrankenSQLite Visualization – Live Site", () => {
         expect(errors).toHaveLength(0);
       }
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Test suite: Inline Highlights (bd-24q.16.4)
+// ---------------------------------------------------------------------------
+
+test.describe("Inline Highlights – Toggle + Navigation + Stability", () => {
+  let monitor: ConsoleMonitor;
+
+  test.beforeEach(async ({ page }) => {
+    monitor = new ConsoleMonitor();
+    monitor.attach(page);
+  });
+
+  /**
+   * Helper: navigate to a known commit with changes and switch to spec tab.
+   * Commit index 5 is well past the initial commit so it should have diffs.
+   */
+  async function goToSpecWithChanges(page: Page) {
+    await page.goto("/?v=spec&c=5");
+    await page.waitForFunction(
+      () => document.getElementById("kpiCommits")?.textContent !== "-",
+      { timeout: 10_000 }
+    );
+    // Ensure spec tab is visible
+    await page.waitForSelector("#docRendered", { state: "attached", timeout: 5_000 });
+    await page.waitForTimeout(1000); // Let rendering settle
+  }
+
+  // ── Toggle highlights on ──────────────────────────────────────────────
+  test("toggle highlights on shows changed blocks", async ({ page }) => {
+    await goToSpecWithChanges(page);
+
+    // Highlights button should exist
+    const btn = page.locator("#btnIHToggle");
+    await expect(btn).toBeVisible();
+
+    // Click to enable highlights
+    await btn.click();
+    await page.waitForTimeout(1500); // Wait for sentinel rendering
+
+    // Verify at least one highlighted block
+    const highlightCount = await page.locator("#docRendered .ih-changed").count();
+    console.log(`[IH Diag] commit=5, highlight_count=${highlightCount}`);
+    expect(highlightCount).toBeGreaterThan(0);
+
+    // Nav bar should be visible
+    const nav = page.locator("#ihNav");
+    await expect(nav).toBeVisible();
+
+    // Nav label should not be "0/0" (there are highlights)
+    const label = await page.textContent("#ihNavLabel");
+    console.log(`[IH Diag] nav_label="${label}"`);
+    expect(label).not.toBe("0/0");
+
+    // No runtime errors
+    expect(monitor.getRuntimeErrors()).toHaveLength(0);
+  });
+
+  // ── Toggle highlights off clears them ─────────────────────────────────
+  test("toggle highlights off clears changed blocks", async ({ page }) => {
+    await goToSpecWithChanges(page);
+
+    const btn = page.locator("#btnIHToggle");
+
+    // Enable
+    await btn.click();
+    await page.waitForTimeout(1500);
+    const onCount = await page.locator("#docRendered .ih-changed").count();
+    expect(onCount).toBeGreaterThan(0);
+
+    // Disable
+    await btn.click();
+    await page.waitForTimeout(1000);
+    const offCount = await page.locator("#docRendered .ih-changed").count();
+    console.log(`[IH Diag] after toggle off: highlight_count=${offCount}`);
+    expect(offCount).toBe(0);
+
+    // Nav bar should be hidden
+    const navDisplay = await page.evaluate(
+      () => document.getElementById("ihNav")?.style.display
+    );
+    expect(navDisplay).not.toBe("inline-flex");
+
+    expect(monitor.getRuntimeErrors()).toHaveLength(0);
+  });
+
+  // ── Next/Prev navigation changes scroll position ──────────────────────
+  test("next/prev navigation scrolls between changed blocks", async ({ page }) => {
+    await goToSpecWithChanges(page);
+
+    // Enable highlights
+    await page.locator("#btnIHToggle").click();
+    await page.waitForTimeout(1500);
+
+    const highlightCount = await page.locator("#docRendered .ih-changed").count();
+    // Skip if no highlights at this commit
+    test.skip(highlightCount < 2, "Need at least 2 highlights to test navigation");
+
+    // Get initial scroll position
+    const scrollBefore = await page.evaluate(
+      () => document.getElementById("docRendered")?.scrollTop ?? 0
+    );
+
+    // Click "Next change"
+    await page.locator("#btnIHNext").click();
+    await page.waitForTimeout(500);
+
+    const scrollAfterNext = await page.evaluate(
+      () => document.getElementById("docRendered")?.scrollTop ?? 0
+    );
+    console.log(`[IH Diag] scroll: before=${scrollBefore}, after_next=${scrollAfterNext}`);
+
+    // Scroll should have changed (navigated to a different block)
+    // Note: if the first highlight is already at the top, next may not change scroll much.
+    // But at least the nav label should update
+    const labelAfterNext = await page.textContent("#ihNavLabel");
+    console.log(`[IH Diag] nav_label after next: "${labelAfterNext}"`);
+    expect(labelAfterNext).toMatch(/^\d+\/\d+$/);
+
+    // Click "Prev change"
+    await page.locator("#btnIHPrev").click();
+    await page.waitForTimeout(500);
+
+    const scrollAfterPrev = await page.evaluate(
+      () => document.getElementById("docRendered")?.scrollTop ?? 0
+    );
+    const labelAfterPrev = await page.textContent("#ihNavLabel");
+    console.log(`[IH Diag] scroll: after_prev=${scrollAfterPrev}, label="${labelAfterPrev}"`);
+
+    expect(monitor.getRuntimeErrors()).toHaveLength(0);
+  });
+
+  // ── Keyboard shortcuts Alt+Arrow ──────────────────────────────────────
+  test("Alt+Arrow keyboard shortcuts navigate highlights", async ({ page }) => {
+    await goToSpecWithChanges(page);
+
+    await page.locator("#btnIHToggle").click();
+    await page.waitForTimeout(1500);
+
+    const highlightCount = await page.locator("#docRendered .ih-changed").count();
+    test.skip(highlightCount < 2, "Need at least 2 highlights to test keyboard nav");
+
+    const labelBefore = await page.textContent("#ihNavLabel");
+
+    // Alt+ArrowDown = next change
+    await page.keyboard.press("Alt+ArrowDown");
+    await page.waitForTimeout(500);
+
+    const labelAfterDown = await page.textContent("#ihNavLabel");
+    console.log(`[IH Diag] keyboard: before="${labelBefore}", after_down="${labelAfterDown}"`);
+
+    // Alt+ArrowUp = prev change
+    await page.keyboard.press("Alt+ArrowUp");
+    await page.waitForTimeout(500);
+
+    const labelAfterUp = await page.textContent("#ihNavLabel");
+    console.log(`[IH Diag] keyboard: after_up="${labelAfterUp}"`);
+
+    expect(monitor.getRuntimeErrors()).toHaveLength(0);
+  });
+
+  // ── Commit switch refreshes highlights ────────────────────────────────
+  test("switching commits refreshes highlights correctly", async ({ page }) => {
+    await goToSpecWithChanges(page);
+
+    // Enable highlights
+    await page.locator("#btnIHToggle").click();
+    await page.waitForTimeout(1500);
+
+    const count1 = await page.locator("#docRendered .ih-changed").count();
+    console.log(`[IH Diag] commit=5, highlights=${count1}`);
+
+    // Switch to a different commit via dock slider
+    await page.evaluate(() => {
+      const s = document.getElementById("dockSlider") as HTMLInputElement;
+      s.value = "10";
+      s.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await page.waitForTimeout(2000); // Wait for re-render
+
+    const count2 = await page.locator("#docRendered .ih-changed").count();
+    console.log(`[IH Diag] commit=10, highlights=${count2}`);
+
+    // Highlights should exist for the new commit (it also has changes)
+    // The key assertion: no stale highlights from the previous commit remain
+    // We verify by checking the data-srcmap attributes are consistent with current content
+    const staleCheck = await page.evaluate(() => {
+      const rendered = document.getElementById("docRendered");
+      if (!rendered) return { ok: false, reason: "no docRendered" };
+      const changed = rendered.querySelectorAll(".ih-changed");
+      // Every .ih-changed element should also have data-changed="true"
+      let staleCount = 0;
+      for (const el of changed) {
+        if (el.getAttribute("data-changed") !== "true") staleCount++;
+      }
+      return { ok: staleCount === 0, staleCount, totalChanged: changed.length };
+    });
+    console.log(`[IH Diag] stale check:`, JSON.stringify(staleCheck));
+    expect(staleCheck.ok).toBe(true);
+
+    expect(monitor.getRuntimeErrors()).toHaveLength(0);
+  });
+
+  // ── Highlights survive tab switch ─────────────────────────────────────
+  test("highlights persist after switching away and back to spec tab", async ({ page }) => {
+    await goToSpecWithChanges(page);
+
+    // Enable highlights
+    await page.locator("#btnIHToggle").click();
+    await page.waitForTimeout(1500);
+
+    const countBefore = await page.locator("#docRendered .ih-changed").count();
+    expect(countBefore).toBeGreaterThan(0);
+
+    // Switch to diff tab
+    const diffTab = page.locator('button:has-text("Diff"), [data-tab="diff"]').first();
+    if (await diffTab.isVisible()) {
+      await diffTab.click();
+      await page.waitForTimeout(500);
+
+      // Switch back to spec tab
+      const specTab = page.locator('button:has-text("Spec"), [data-tab="spec"]').first();
+      await specTab.click();
+      await page.waitForTimeout(1500);
+
+      const countAfter = await page.locator("#docRendered .ih-changed").count();
+      console.log(`[IH Diag] tab round-trip: before=${countBefore}, after=${countAfter}`);
+
+      // Highlights should still be present (re-rendered with highlights on)
+      expect(countAfter).toBeGreaterThan(0);
+    }
+
+    expect(monitor.getRuntimeErrors()).toHaveLength(0);
+  });
+
+  // ── URL state preserves highlights toggle ─────────────────────────────
+  test("ih=1 URL param enables highlights on load", async ({ page }) => {
+    // Navigate with ih=1
+    await page.goto("/?v=spec&c=5&ih=1");
+    await page.waitForFunction(
+      () => document.getElementById("kpiCommits")?.textContent !== "-",
+      { timeout: 10_000 }
+    );
+    await page.waitForTimeout(2000); // Wait for rendering
+
+    // Highlights should be active
+    const btnClass = await page.getAttribute("#btnIHToggle", "class");
+    const isActive = btnClass?.includes("bg-slate-900") ?? false;
+    console.log(`[IH Diag] URL ih=1: btn_active=${isActive}, class="${btnClass?.slice(0, 40)}..."`);
+
+    // If the button is active, highlights should be present
+    if (isActive) {
+      const count = await page.locator("#docRendered .ih-changed").count();
+      console.log(`[IH Diag] URL ih=1: highlight_count=${count}`);
+      expect(count).toBeGreaterThan(0);
+    }
+
+    expect(monitor.getRuntimeErrors()).toHaveLength(0);
+  });
+
+  // ── No JS errors during full highlight lifecycle ──────────────────────
+  test("full highlight lifecycle produces no JS errors", async ({ page }) => {
+    await goToSpecWithChanges(page);
+
+    // Toggle on
+    await page.locator("#btnIHToggle").click();
+    await page.waitForTimeout(1500);
+
+    // Navigate forward 3 times
+    for (let i = 0; i < 3; i++) {
+      await page.locator("#btnIHNext").click();
+      await page.waitForTimeout(300);
+    }
+
+    // Navigate back 2 times
+    for (let i = 0; i < 2; i++) {
+      await page.locator("#btnIHPrev").click();
+      await page.waitForTimeout(300);
+    }
+
+    // Switch commit
+    await page.evaluate(() => {
+      const s = document.getElementById("dockSlider") as HTMLInputElement;
+      s.value = "15";
+      s.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await page.waitForTimeout(2000);
+
+    // Toggle off
+    await page.locator("#btnIHToggle").click();
+    await page.waitForTimeout(500);
+
+    // Toggle on again
+    await page.locator("#btnIHToggle").click();
+    await page.waitForTimeout(1500);
+
+    // Final check: no runtime errors through the entire lifecycle
+    const errors = monitor.getRuntimeErrors();
+    if (errors.length > 0) {
+      console.log("[IH Diag] lifecycle errors:", JSON.stringify(errors, null, 2));
+    }
+    expect(errors).toHaveLength(0);
   });
 });

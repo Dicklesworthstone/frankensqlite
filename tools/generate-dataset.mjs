@@ -119,9 +119,16 @@ function computeDatasetHash(data) {
   return createHash("sha256").update(basis).digest("hex");
 }
 
-/** Deterministic JSON serialization: sorted keys, no trailing spaces. */
+/** Deterministic JSON serialization: sorted keys at every nesting level. */
 function deterministicJson(data) {
-  return JSON.stringify(data, Object.keys(data).sort(), 0);
+  return JSON.stringify(data, (key, value) => {
+    if (value && typeof value === "object" && !Array.isArray(value)) {
+      const sorted = {};
+      for (const k of Object.keys(value).sort()) sorted[k] = value[k];
+      return sorted;
+    }
+    return value;
+  });
 }
 
 /** Deterministic gzip: level 9, no OS header, no filename, no mtime. */
