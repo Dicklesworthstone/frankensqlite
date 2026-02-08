@@ -1,8 +1,8 @@
 //! Storage trait hierarchy for MVCC pager and checkpoint operations.
 //!
 //! This module defines the sealed, internal-only traits that encode
-//! MVCC safety invariants. Only the defining crate (and test mocks
-//! within it) can implement these traits.
+//! MVCC safety invariants. Only the defining crate can implement these
+//! traits.
 //!
 //! # Sealed Trait Discipline (§9)
 //!
@@ -165,6 +165,90 @@ pub trait CheckpointPageWriter: sealed::Sealed + Send {
 }
 
 // ---------------------------------------------------------------------------
+// Exported test mocks (cross-crate)
+// ---------------------------------------------------------------------------
+
+/// Test/mock pager implementation exported for cross-crate tests.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct MockMvccPager;
+
+impl sealed::Sealed for MockMvccPager {}
+
+impl MvccPager for MockMvccPager {
+    type Txn = MockTransaction;
+
+    fn begin(&self, _cx: &Cx, _mode: TransactionMode) -> Result<Self::Txn> {
+        Ok(MockTransaction {
+            committed: false,
+            next_page: 2,
+        })
+    }
+}
+
+/// Test/mock transaction handle exported for cross-crate tests.
+#[derive(Debug, Clone)]
+pub struct MockTransaction {
+    committed: bool,
+    next_page: u32,
+}
+
+impl sealed::Sealed for MockTransaction {}
+
+impl TransactionHandle for MockTransaction {
+    fn get_page(&self, _cx: &Cx, page_no: PageNumber) -> Result<PageData> {
+        let size = fsqlite_types::PageSize::default();
+        let mut data = PageData::zeroed(size);
+        // Stamp the page number in the first 4 bytes for test verification.
+        data.as_bytes_mut()[..4].copy_from_slice(&page_no.get().to_le_bytes());
+        Ok(data)
+    }
+
+    fn write_page(&mut self, _cx: &Cx, _page_no: PageNumber, _data: &[u8]) -> Result<()> {
+        Ok(())
+    }
+
+    fn allocate_page(&mut self, _cx: &Cx) -> Result<PageNumber> {
+        let page = PageNumber::new(self.next_page)
+            .expect("mock allocator must always produce non-zero page numbers");
+        self.next_page += 1;
+        Ok(page)
+    }
+
+    fn free_page(&mut self, _cx: &Cx, _page_no: PageNumber) -> Result<()> {
+        Ok(())
+    }
+
+    fn commit(&mut self, _cx: &Cx) -> Result<()> {
+        self.committed = true;
+        Ok(())
+    }
+
+    fn rollback(&mut self, _cx: &Cx) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Test/mock checkpoint writer exported for cross-crate tests.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct MockCheckpointPageWriter;
+
+impl sealed::Sealed for MockCheckpointPageWriter {}
+
+impl CheckpointPageWriter for MockCheckpointPageWriter {
+    fn write_page(&mut self, _cx: &Cx, _page_no: PageNumber, _data: &[u8]) -> Result<()> {
+        Ok(())
+    }
+
+    fn truncate(&mut self, _cx: &Cx, _n_pages: u32) -> Result<()> {
+        Ok(())
+    }
+
+    fn sync(&mut self, _cx: &Cx) -> Result<()> {
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -172,91 +256,20 @@ pub trait CheckpointPageWriter: sealed::Sealed + Send {
 mod tests {
     use super::*;
 
-    // -- Sealed trait enforcement (compile-fail conceptually, compile-pass here) --
-
-    /// A test mock for `MvccPager` — only possible within this crate
-    /// because the trait is sealed.
-    struct MockPager;
-
-    impl sealed::Sealed for MockPager {}
-
-    impl MvccPager for MockPager {
-        type Txn = MockTxn;
-
-        fn begin(&self, _cx: &Cx, _mode: TransactionMode) -> Result<Self::Txn> {
-            Ok(MockTxn { committed: false })
-        }
-    }
-
-    struct MockTxn {
-        committed: bool,
-    }
-
-    impl sealed::Sealed for MockTxn {}
-
-    impl TransactionHandle for MockTxn {
-        fn get_page(&self, _cx: &Cx, page_no: PageNumber) -> Result<PageData> {
-            let size = fsqlite_types::PageSize::default();
-            let mut data = PageData::zeroed(size);
-            // Stamp the page number in the first 4 bytes for test verification.
-            data.as_bytes_mut()[..4].copy_from_slice(&page_no.get().to_le_bytes());
-            Ok(data)
-        }
-
-        fn write_page(&mut self, _cx: &Cx, _page_no: PageNumber, _data: &[u8]) -> Result<()> {
-            Ok(())
-        }
-
-        fn allocate_page(&mut self, _cx: &Cx) -> Result<PageNumber> {
-            Ok(PageNumber::new(2).expect("2 is non-zero"))
-        }
-
-        fn free_page(&mut self, _cx: &Cx, _page_no: PageNumber) -> Result<()> {
-            Ok(())
-        }
-
-        fn commit(&mut self, _cx: &Cx) -> Result<()> {
-            self.committed = true;
-            Ok(())
-        }
-
-        fn rollback(&mut self, _cx: &Cx) -> Result<()> {
-            Ok(())
-        }
-    }
-
-    struct MockCheckpointWriter;
-
-    impl sealed::Sealed for MockCheckpointWriter {}
-
-    impl CheckpointPageWriter for MockCheckpointWriter {
-        fn write_page(&mut self, _cx: &Cx, _page_no: PageNumber, _data: &[u8]) -> Result<()> {
-            Ok(())
-        }
-
-        fn truncate(&mut self, _cx: &Cx, _n_pages: u32) -> Result<()> {
-            Ok(())
-        }
-
-        fn sync(&mut self, _cx: &Cx) -> Result<()> {
-            Ok(())
-        }
-    }
-
     // -- Unit tests --
 
     #[test]
     fn test_pager_trait_is_sealed_mock_impl() {
         // This compiles because MockPager is in the same crate.
         // External crates cannot impl Sealed, so they cannot impl MvccPager.
-        let pager = MockPager;
+        let pager = MockMvccPager;
         let cx = Cx::new();
         let _txn = pager.begin(&cx, TransactionMode::Deferred).unwrap();
     }
 
     #[test]
     fn test_mvccpager_begin_commit_rollback_signatures() {
-        let pager = MockPager;
+        let pager = MockMvccPager;
         let cx = Cx::new();
 
         // Begin takes &Cx and returns Result.
@@ -280,7 +293,7 @@ mod tests {
 
     #[test]
     fn test_transaction_rollback_is_infallible() {
-        let pager = MockPager;
+        let pager = MockMvccPager;
         let cx = Cx::new();
         let mut txn = pager.begin(&cx, TransactionMode::Deferred).unwrap();
         // Rollback should succeed without error.
@@ -289,7 +302,7 @@ mod tests {
 
     #[test]
     fn test_checkpoint_page_writer_signatures() {
-        let mut writer = MockCheckpointWriter;
+        let mut writer = MockCheckpointPageWriter;
         let cx = Cx::new();
         let page1 = PageNumber::new(1).unwrap();
 
@@ -312,7 +325,7 @@ mod tests {
         //
         // Since we can't directly test "external crate fails to compile"
         // in a unit test, we verify that our mock impls compile and work.
-        let pager = MockPager;
-        let _: &dyn MvccPager<Txn = MockTxn> = &pager;
+        let pager = MockMvccPager;
+        let _: &dyn MvccPager<Txn = MockTransaction> = &pager;
     }
 }

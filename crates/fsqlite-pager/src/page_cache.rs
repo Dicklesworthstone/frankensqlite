@@ -736,4 +736,112 @@ mod tests {
             "bead_id={BEAD_ID} case=debug_format"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // bd-22n.8 — Allocation-Free Read Path Tests (Pager Layer)
+    // -----------------------------------------------------------------------
+
+    const BEAD_22N8: &str = "bd-22n.8";
+
+    #[test]
+    fn test_cache_lookup_no_alloc() {
+        // bd-22n.8: Buffer pool cache lookup is allocation-free.
+        //
+        // PageCache::get() returns Option<&[u8]> — a reference into the
+        // pool-allocated buffer.  It does a HashMap::get + PageBuf::as_slice,
+        // neither of which allocates.
+        //
+        // We verify by: (a) checking the returned &[u8] is the same pointer
+        // as the original PageBuf, and (b) repeating the lookup many times
+        // and verifying pointer stability (proves no reallocation).
+        let (cx, mut file) = setup();
+
+        let data = vec![0xBE_u8; 4096];
+        file.write(&cx, &data, 0).unwrap();
+
+        let mut cache = PageCache::new(PageSize::DEFAULT, 8);
+        let page1 = PageNumber::ONE;
+
+        // Cold read — allocates from pool.
+        let initial = cache.read_page(&cx, &mut file, page1).unwrap();
+        let initial_ptr = initial.as_ptr();
+
+        // Hot reads — must be allocation-free (same pointer).
+        for round in 0..100u32 {
+            let cached = cache.get(page1).unwrap();
+            assert_eq!(
+                cached.as_ptr(),
+                initial_ptr,
+                "bead_id={BEAD_22N8} case=cache_lookup_no_alloc \
+                 round={round} pointer must be stable (no realloc)"
+            );
+        }
+    }
+
+    #[test]
+    fn test_cache_lookup_hit_returns_reference() {
+        // bd-22n.8: Verify structurally that get() returns a borrow, not a copy.
+        // We insert a page, mutate it via get_mut, then verify get() sees the
+        // mutation at the same pointer — proving it's a reference into the
+        // same memory.
+        let mut cache = PageCache::new(PageSize::DEFAULT, 4);
+        let page1 = PageNumber::ONE;
+
+        // Insert a fresh page and write a sentinel.
+        let fresh = cache.insert_fresh(page1);
+        fresh[0] = 0xAA;
+        let ptr_after_insert = cache.get(page1).unwrap().as_ptr();
+
+        // Mutate in place.
+        let mutref = cache.get_mut(page1).unwrap();
+        mutref[1] = 0xBB;
+
+        // get() must see the mutation AND return the same pointer.
+        let read_back = cache.get(page1).unwrap();
+        assert_eq!(
+            read_back.as_ptr(),
+            ptr_after_insert,
+            "bead_id={BEAD_22N8} case=cache_lookup_returns_reference \
+             pointer must be stable through mutation"
+        );
+        assert_eq!(read_back[0], 0xAA);
+        assert_eq!(read_back[1], 0xBB);
+    }
+
+    #[test]
+    fn test_pool_reuse_avoids_alloc_on_reread() {
+        // bd-22n.8: After eviction, re-reading a page reuses a pool buffer
+        // rather than allocating fresh memory.  This ensures the read path
+        // is allocation-free in steady state (pool has recycled buffers).
+        let (cx, mut file) = setup();
+
+        let data = vec![0xDD_u8; 4096];
+        file.write(&cx, &data, 0).unwrap();
+
+        let mut cache = PageCache::new(PageSize::DEFAULT, 8);
+        let page1 = PageNumber::ONE;
+
+        // Cold read, then evict.
+        let _ = cache.read_page(&cx, &mut file, page1).unwrap();
+        assert_eq!(cache.pool().available(), 0);
+        cache.evict(page1);
+        assert_eq!(
+            cache.pool().available(),
+            1,
+            "bead_id={BEAD_22N8} case=evicted_buffer_returned_to_pool"
+        );
+
+        // Re-read: pool has a buffer, so no new allocation needed.
+        let reread = cache.read_page(&cx, &mut file, page1).unwrap();
+        assert_eq!(
+            reread,
+            data.as_slice(),
+            "bead_id={BEAD_22N8} case=pool_reuse_data_correct"
+        );
+        assert_eq!(
+            cache.pool().available(),
+            0,
+            "bead_id={BEAD_22N8} case=pool_buffer_consumed_on_reread"
+        );
+    }
 }
