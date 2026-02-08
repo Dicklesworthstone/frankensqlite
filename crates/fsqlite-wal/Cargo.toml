@@ -11,6 +11,12 @@ rust-version.workspace = true
 fsqlite-types = { workspace = true }
 fsqlite-error = { workspace = true }
 fsqlite-vfs = { workspace = true }
+xxhash-rust = { workspace = true }
+crc32c = { workspace = true }
+blake3 = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [lints]
 workspace = true
