@@ -1,10 +1,13 @@
-//! Query planner: name resolution, WHERE analysis, cost model, join ordering.
+//! Query planner: name resolution, WHERE analysis, cost model, join ordering, codegen.
 //!
 //! Implements:
 //! - Compound SELECT ORDER BY resolution (§19 quirk: first SELECT wins)
 //! - Cost model for access paths in page reads (§10.5)
 //! - Index usability analysis for WHERE terms (§10.5)
 //! - Bounded beam search join ordering — NGQP-style (§10.5)
+//! - AST-to-VDBE bytecode compilation (§10.6)
+
+pub mod codegen;
 
 use fsqlite_ast::{
     BinaryOp as AstBinaryOp, CompoundOp, Expr, InSet, LikeOp, Literal, NullsOrder, OrderingTerm,
