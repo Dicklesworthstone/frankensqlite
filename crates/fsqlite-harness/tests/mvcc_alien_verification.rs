@@ -333,6 +333,117 @@ fn tla_exporter_emits_a_module() {
 }
 
 #[test]
+fn test_tla_export_concrete_behavior() {
+    let mut vars0 = BTreeMap::new();
+    vars0.insert("commit_seq_hi".to_string(), TlaValue::Nat(0));
+    let mut vars1 = BTreeMap::new();
+    vars1.insert("commit_seq_hi".to_string(), TlaValue::Nat(1));
+
+    let exporter = MvccTlaExporter::from_snapshots(vec![
+        MvccStateSnapshot {
+            label: "init".to_string(),
+            vars: vars0,
+        },
+        MvccStateSnapshot {
+            label: "commit".to_string(),
+            vars: vars1,
+        },
+    ]);
+    let module = exporter.export_behavior("MvccConcreteBehavior");
+
+    assert!(
+        module
+            .source
+            .contains("---- MODULE MvccConcreteBehavior ----")
+    );
+    assert!(module.source.contains("States =="));
+    assert!(module.source.contains("Init =="));
+    assert!(module.source.contains("Next =="));
+    assert!(module.source.contains("Spec =="));
+}
+
+#[test]
+fn test_tla_export_spec_skeleton() {
+    let exporter = MvccTlaExporter::from_snapshots(Vec::new());
+    let module = exporter.export_parametric_spec_skeleton(
+        "MvccSkeleton",
+        &["txn_state", "commit_index", "gc_horizon"],
+        &["InvNoDirtyRead", "InvGcSafe"],
+    );
+
+    assert!(module.source.contains("---- MODULE MvccSkeleton ----"));
+    assert!(
+        module
+            .source
+            .contains("VARIABLES txn_state, commit_index, gc_horizon")
+    );
+    assert!(module.source.contains("Init =="));
+    assert!(module.source.contains("Next =="));
+    assert!(module.source.contains("Spec =="));
+    assert!(module.source.contains("InvNoDirtyRead == TRUE"));
+    assert!(module.source.contains("InvGcSafe == TRUE"));
+}
+
+#[test]
+fn test_tla_export_deterministic() {
+    let mut vars0 = BTreeMap::new();
+    vars0.insert("commit_seq_hi".to_string(), TlaValue::Nat(2));
+    let mut vars1 = BTreeMap::new();
+    vars1.insert("commit_seq_hi".to_string(), TlaValue::Nat(3));
+    vars1.insert("rw_flag".to_string(), TlaValue::Bool(true));
+
+    let snapshots = vec![
+        MvccStateSnapshot {
+            label: "before".to_string(),
+            vars: vars0,
+        },
+        MvccStateSnapshot {
+            label: "after".to_string(),
+            vars: vars1,
+        },
+    ];
+
+    let exporter_a = MvccTlaExporter::from_snapshots(snapshots.clone());
+    let exporter_b = MvccTlaExporter::from_snapshots(snapshots);
+
+    let out_a = exporter_a.export_behavior("DeterministicTrace");
+    let out_b = exporter_b.export_behavior("DeterministicTrace");
+    assert_eq!(out_a.source, out_b.source);
+}
+
+#[test]
+fn test_tla_mvcc_commit_scenario() {
+    let bucket = HotBucket::new(10);
+    let mut state = ModelState::default();
+    state.snapshot("begin", &bucket);
+    state.commit_seq_hi = 1;
+    state.commit_index.insert(7, 1);
+    state.snapshot("commit", &bucket);
+    state.snapshot("abort", &bucket);
+
+    let module = MvccTlaExporter::from_snapshots(state.trace).export_behavior("MvccCommitScenario");
+    assert!(module.source.contains("\"begin\""));
+    assert!(module.source.contains("\"commit\""));
+    assert!(module.source.contains("\"abort\""));
+}
+
+#[test]
+fn test_e2e_tla_export_roundtrip() {
+    let mut vars = BTreeMap::new();
+    vars.insert("step".to_string(), TlaValue::Nat(0));
+    let snapshots = vec![MvccStateSnapshot {
+        label: "single".to_string(),
+        vars,
+    }];
+
+    let module = MvccTlaExporter::from_snapshots(snapshots).export_behavior("Roundtrip");
+    assert!(module.source.starts_with("---- MODULE Roundtrip ----"));
+    assert!(module.source.contains("Spec =="));
+    assert!(module.source.trim_end().ends_with("===="));
+    assert!(module.source.contains("\"single\""));
+}
+
+#[test]
 fn tla_export_concrete_behavior_has_expected_transitions() {
     let snapshots = build_tla_snapshots(10);
     let exporter = MvccTlaExporter::from_snapshots(snapshots);
