@@ -566,7 +566,8 @@
             if (p) lines = applySynapticPatch(lines, p);
             const text = lines.join("\n");
             const tokens = text.split(/\s+/).length;
-            const lev = i === 0 ? text.length : synapticDistance(prevText, text);
+            // Use commit impact as a proxy for volatility to avoid expensive Levenshtein calc
+            const lev = (COMMITS[i] && COMMITS[i].impact) ? COMMITS[i].impact : 0; 
             METRICS.push({ lines: lines.length, tokens, lev });
             prevText = text;
             if (i % 10 === 0) DOC_CACHE.set(i, text);
@@ -682,7 +683,8 @@
     }
 
     function applySynapticPatch(lines, patch) {
-        const out = [...lines];
+        // Use slice() instead of spread for large array safety
+        const out = lines.slice();
         const patchLines = patch.split("\n");
         let offset = 0;
         for (let i = 0; i < patchLines.length; i++) {
@@ -701,7 +703,21 @@
                         i++;
                     }
                     i--;
-                    out.splice(startPos, oc, ...newSeg);
+                    
+                    // Batched splice implementation with safe chunk size
+                    const CHUNK_SIZE = 5000;
+                    if (newSeg.length > CHUNK_SIZE) {
+                         // Remove the old segment first
+                         out.splice(startPos, oc);
+                         // Insert new segment in chunks
+                         for (let j = 0; j < newSeg.length; j += CHUNK_SIZE) {
+                             const chunk = newSeg.slice(j, j + CHUNK_SIZE);
+                             out.splice(startPos + j, 0, ...chunk);
+                         }
+                    } else {
+                         out.splice(startPos, oc, ...newSeg);
+                    }
+                    
                     offset += (parseInt(m[4] || "1") - oc);
                 }
             }
@@ -866,11 +882,11 @@
 
     const CHARS = "01$!@#%^&*()_+{}:<>?[]|";
 
-    function decodeText(element, targetText, duration = 1, delay = 0) {
-        if (!element || !targetText) return;
-        const dur = Math.max(0.01, duration);
-        setTimeout(() => {
-            let iteration = 0;
+	    function decodeText(element, targetText, duration = 1, delay = 0) {
+	        if (!element || !targetText) return;
+	        const dur = Math.max(0.01, duration);
+	        setTimeout(() => {
+	            let iteration = 0;
             const maxIterations = targetText.length;
             const startTime = Date.now();
             element.innerText = "";
@@ -884,14 +900,57 @@
                 }).join("");
                 if (iteration >= maxIterations) { clearInterval(interval); element.innerText = targetText; }
             }, 30);
-        }, delay * 1000);
-    }
+	        }, delay * 1000);
+	    }
 
-    function startLabEffects() {
-        function packetLoop() {
-            if (document.visibilityState === 'visible' && Math.random() > 0.98) { createDataPacket(); }
-            requestAnimationFrame(packetLoop);
-        }
+	    // Optional lab effect: animated "data packets" across the UI.
+	    // Must never crash the app (the viz page should render even if effects fail).
+	    let LAST_PACKET_AT_MS = 0;
+	    function createDataPacket() {
+	        try {
+	            const now = performance.now();
+	            // Throttle to avoid DOM churn on high-FPS displays.
+	            if (now - LAST_PACKET_AT_MS < 120) return;
+	            LAST_PACKET_AT_MS = now;
+
+	            const packet = document.createElement("div");
+	            packet.className = "data-packet";
+	            const w = window.innerWidth || 0;
+	            const h = window.innerHeight || 0;
+	            const margin = 20;
+	            const startFromLeft = Math.random() < 0.5;
+	            const startX = startFromLeft ? -margin : (w + margin);
+	            const startY = margin + Math.random() * Math.max(0, h - (margin * 2));
+	            const endX = startFromLeft ? (w + margin) : -margin;
+	            const endY = margin + Math.random() * Math.max(0, h - (margin * 2));
+
+	            packet.style.left = startX + "px";
+	            packet.style.top = startY + "px";
+	            document.body.appendChild(packet);
+
+	            const dx = endX - startX;
+	            const dy = endY - startY;
+	            const dur = 600 + Math.random() * 900;
+	            const anim = packet.animate(
+	                [
+	                    { transform: "translate(0,0)", opacity: 0.0 },
+	                    { transform: "translate(0,0)", opacity: 1.0, offset: 0.12 },
+	                    { transform: `translate(${dx}px, ${dy}px)`, opacity: 0.0 }
+	                ],
+	                { duration: dur, easing: "cubic-bezier(0.2,0.8,0.2,1)", fill: "forwards" }
+	            );
+	            anim.onfinish = () => packet.remove();
+	            anim.oncancel = () => packet.remove();
+	        } catch (e) {
+	            // Never crash the main viz experience for optional effects.
+	        }
+	    }
+
+	    function startLabEffects() {
+	        function packetLoop() {
+	            if (document.visibilityState === 'visible' && Math.random() > 0.98) { createDataPacket(); }
+	            requestAnimationFrame(packetLoop);
+	        }
         packetLoop();
         setInterval(updateSystemHud, 1000);
         setInterval(maybeSpark, 3000);
