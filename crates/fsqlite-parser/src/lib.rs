@@ -3,6 +3,7 @@
 // Hand-written recursive descent SQL parser with Pratt precedence-climbing
 // for expressions. Produces an AST from `fsqlite-ast`.
 
+pub mod expr;
 pub mod lexer;
 pub mod parser;
 pub mod token;

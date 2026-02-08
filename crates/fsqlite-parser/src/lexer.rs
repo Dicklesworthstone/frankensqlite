@@ -34,7 +34,7 @@ impl<'a> Lexer<'a> {
 
     /// Tokenize the entire input into a Vec of tokens.
     #[must_use]
-    pub fn tokenize(source: &str) -> Vec<Token> {
+    pub fn tokenize(source: &'a str) -> Vec<Token> {
         let mut lexer = Self::new(source);
         let mut tokens = Vec::new();
         loop {
@@ -153,6 +153,7 @@ impl<'a> Lexer<'a> {
 
         Token {
             kind,
+            #[allow(clippy::cast_possible_truncation)]
             span: Span::new(start as u32, self.pos as u32),
             line: start_line,
             col: start_col,
@@ -183,6 +184,7 @@ impl<'a> Lexer<'a> {
         self.src.get(self.pos + offset).copied()
     }
 
+    #[allow(clippy::cast_possible_truncation)]
     fn make_token(&self, kind: TokenKind, start: usize, end: usize) -> Token {
         Token {
             kind,
@@ -205,9 +207,7 @@ impl<'a> Lexer<'a> {
             }
 
             // Line comment: `-- ...`
-            if self.src[self.pos] == b'-'
-                && self.peek_at(1) == Some(b'-')
-            {
+            if self.src[self.pos] == b'-' && self.peek_at(1) == Some(b'-') {
                 self.advance(); // skip -
                 self.advance(); // skip -
                 while self.pos < self.src.len() && self.src[self.pos] != b'\n' {
@@ -217,22 +217,16 @@ impl<'a> Lexer<'a> {
             }
 
             // Block comment: `/* ... */`
-            if self.src[self.pos] == b'/'
-                && self.peek_at(1) == Some(b'*')
-            {
+            if self.src[self.pos] == b'/' && self.peek_at(1) == Some(b'*') {
                 self.advance(); // skip /
                 self.advance(); // skip *
                 let mut depth = 1u32;
                 while self.pos < self.src.len() && depth > 0 {
-                    if self.src[self.pos] == b'/'
-                        && self.peek_at(1) == Some(b'*')
-                    {
+                    if self.src[self.pos] == b'/' && self.peek_at(1) == Some(b'*') {
                         self.advance();
                         self.advance();
                         depth += 1;
-                    } else if self.src[self.pos] == b'*'
-                        && self.peek_at(1) == Some(b'/')
-                    {
+                    } else if self.src[self.pos] == b'*' && self.peek_at(1) == Some(b'/') {
                         self.advance();
                         self.advance();
                         depth -= 1;
@@ -260,36 +254,35 @@ impl<'a> Lexer<'a> {
         loop {
             // Use memchr to find the next single quote quickly
             let remaining = &self.src[self.pos..];
-            match memchr(b'\'', remaining) {
-                Some(offset) => {
-                    // Append bytes up to the quote
-                    value.push_str(&String::from_utf8_lossy(&self.src[self.pos..self.pos + offset]));
-                    // Advance past the accumulated bytes and the quote
-                    for _ in 0..offset {
-                        self.advance();
-                    }
-                    self.advance(); // the quote itself
+            if let Some(offset) = memchr(b'\'', remaining) {
+                // Append bytes up to the quote
+                value.push_str(&String::from_utf8_lossy(
+                    &self.src[self.pos..self.pos + offset],
+                ));
+                // Advance past the accumulated bytes and the quote
+                for _ in 0..offset {
+                    self.advance();
+                }
+                self.advance(); // the quote itself
 
-                    // Check for escaped quote ('')
-                    if self.peek() == Some(b'\'') {
-                        value.push('\'');
-                        self.advance();
-                    } else {
-                        return TokenKind::String(value);
-                    }
+                // Check for escaped quote ('')
+                if self.peek() == Some(b'\'') {
+                    value.push('\'');
+                    self.advance();
+                } else {
+                    return TokenKind::String(value);
                 }
-                None => {
-                    // Unterminated string
-                    let rest = String::from_utf8_lossy(&self.src[self.pos..]).into_owned();
-                    value.push_str(&rest);
-                    while self.pos < self.src.len() {
-                        self.advance();
-                    }
-                    return TokenKind::Error(format!(
-                        "unterminated string literal starting at byte {}",
-                        start
-                    ));
+            } else {
+                // Unterminated string
+                let rest = String::from_utf8_lossy(&self.src[self.pos..]).into_owned();
+                value.push_str(&rest);
+                while self.pos < self.src.len() {
+                    self.advance();
                 }
+                return TokenKind::Error(format!(
+                    "unterminated string literal starting at byte {}",
+                    start
+                ));
             }
         }
     }
@@ -302,31 +295,30 @@ impl<'a> Lexer<'a> {
         let mut value = String::new();
         loop {
             let remaining = &self.src[self.pos..];
-            match memchr(b'"', remaining) {
-                Some(offset) => {
-                    value.push_str(&String::from_utf8_lossy(&self.src[self.pos..self.pos + offset]));
-                    for _ in 0..offset {
-                        self.advance();
-                    }
-                    self.advance(); // the quote
+            if let Some(offset) = memchr(b'"', remaining) {
+                value.push_str(&String::from_utf8_lossy(
+                    &self.src[self.pos..self.pos + offset],
+                ));
+                for _ in 0..offset {
+                    self.advance();
+                }
+                self.advance(); // the quote
 
-                    // Doubled-quote escape: "" -> "
-                    if self.peek() == Some(b'"') {
-                        value.push('"');
-                        self.advance();
-                    } else {
-                        return TokenKind::QuotedId(value, true);
-                    }
+                // Doubled-quote escape: "" -> "
+                if self.peek() == Some(b'"') {
+                    value.push('"');
+                    self.advance();
+                } else {
+                    return TokenKind::QuotedId(value, true);
                 }
-                None => {
-                    while self.pos < self.src.len() {
-                        self.advance();
-                    }
-                    return TokenKind::Error(format!(
-                        "unterminated double-quoted identifier at byte {}",
-                        start
-                    ));
+            } else {
+                while self.pos < self.src.len() {
+                    self.advance();
                 }
+                return TokenKind::Error(format!(
+                    "unterminated double-quoted identifier at byte {}",
+                    start
+                ));
             }
         }
     }
@@ -339,30 +331,29 @@ impl<'a> Lexer<'a> {
         let mut value = String::new();
         loop {
             let remaining = &self.src[self.pos..];
-            match memchr(b'`', remaining) {
-                Some(offset) => {
-                    value.push_str(&String::from_utf8_lossy(&self.src[self.pos..self.pos + offset]));
-                    for _ in 0..offset {
-                        self.advance();
-                    }
-                    self.advance(); // the backtick
+            if let Some(offset) = memchr(b'`', remaining) {
+                value.push_str(&String::from_utf8_lossy(
+                    &self.src[self.pos..self.pos + offset],
+                ));
+                for _ in 0..offset {
+                    self.advance();
+                }
+                self.advance(); // the backtick
 
-                    if self.peek() == Some(b'`') {
-                        value.push('`');
-                        self.advance();
-                    } else {
-                        return TokenKind::QuotedId(value, false);
-                    }
+                if self.peek() == Some(b'`') {
+                    value.push('`');
+                    self.advance();
+                } else {
+                    return TokenKind::QuotedId(value, false);
                 }
-                None => {
-                    while self.pos < self.src.len() {
-                        self.advance();
-                    }
-                    return TokenKind::Error(format!(
-                        "unterminated backtick identifier at byte {}",
-                        start
-                    ));
+            } else {
+                while self.pos < self.src.len() {
+                    self.advance();
                 }
+                return TokenKind::Error(format!(
+                    "unterminated backtick identifier at byte {}",
+                    start
+                ));
             }
         }
     }
@@ -374,24 +365,20 @@ impl<'a> Lexer<'a> {
 
         let mut value = String::new();
         let remaining = &self.src[self.pos..];
-        match memchr(b']', remaining) {
-            Some(offset) => {
-                value.push_str(&String::from_utf8_lossy(&self.src[self.pos..self.pos + offset]));
-                for _ in 0..offset {
-                    self.advance();
-                }
-                self.advance(); // skip ]
-                TokenKind::QuotedId(value, false)
+        if let Some(offset) = memchr(b']', remaining) {
+            value.push_str(&String::from_utf8_lossy(
+                &self.src[self.pos..self.pos + offset],
+            ));
+            for _ in 0..offset {
+                self.advance();
             }
-            None => {
-                while self.pos < self.src.len() {
-                    self.advance();
-                }
-                TokenKind::Error(format!(
-                    "unterminated bracket identifier at byte {}",
-                    start
-                ))
+            self.advance(); // skip ]
+            TokenKind::QuotedId(value, false)
+        } else {
+            while self.pos < self.src.len() {
+                self.advance();
             }
+            TokenKind::Error(format!("unterminated bracket identifier at byte {}", start))
         }
     }
 
@@ -403,45 +390,42 @@ impl<'a> Lexer<'a> {
 
         let hex_start = self.pos;
         let remaining = &self.src[self.pos..];
-        match memchr(b'\'', remaining) {
-            Some(offset) => {
-                let hex_bytes = &self.src[hex_start..hex_start + offset];
-                for _ in 0..offset {
-                    self.advance();
-                }
-                self.advance(); // skip closing '
+        if let Some(offset) = memchr(b'\'', remaining) {
+            let hex_bytes = &self.src[hex_start..hex_start + offset];
+            for _ in 0..offset {
+                self.advance();
+            }
+            self.advance(); // skip closing '
 
-                // Validate hex content
-                if hex_bytes.len() % 2 != 0 {
-                    return TokenKind::Error(format!(
-                        "blob literal has odd number of hex digits at byte {}",
-                        start
-                    ));
-                }
+            // Validate hex content
+            if hex_bytes.len() % 2 != 0 {
+                return TokenKind::Error(format!(
+                    "blob literal has odd number of hex digits at byte {}",
+                    start
+                ));
+            }
 
-                let hex_str = String::from_utf8_lossy(hex_bytes);
-                let mut bytes = Vec::with_capacity(hex_bytes.len() / 2);
-                let mut i = 0;
-                while i < hex_str.len() {
-                    match u8::from_str_radix(&hex_str[i..i + 2], 16) {
-                        Ok(b) => bytes.push(b),
-                        Err(_) => {
-                            return TokenKind::Error(format!(
-                                "invalid hex in blob literal at byte {}",
-                                start
-                            ));
-                        }
+            let hex_str = String::from_utf8_lossy(hex_bytes);
+            let mut bytes = Vec::with_capacity(hex_bytes.len() / 2);
+            let mut i = 0;
+            while i < hex_str.len() {
+                match u8::from_str_radix(&hex_str[i..i + 2], 16) {
+                    Ok(b) => bytes.push(b),
+                    Err(_) => {
+                        return TokenKind::Error(format!(
+                            "invalid hex in blob literal at byte {}",
+                            start
+                        ));
                     }
-                    i += 2;
                 }
-                TokenKind::Blob(bytes)
+                i += 2;
             }
-            None => {
-                while self.pos < self.src.len() {
-                    self.advance();
-                }
-                TokenKind::Error(format!("unterminated blob literal at byte {}", start))
+            TokenKind::Blob(bytes)
+        } else {
+            while self.pos < self.src.len() {
+                self.advance();
             }
+            TokenKind::Error(format!("unterminated blob literal at byte {}", start))
         }
     }
 
@@ -463,10 +447,7 @@ impl<'a> Lexer<'a> {
             let hex_str = String::from_utf8_lossy(&self.src[hex_start..self.pos]);
             return match i64::from_str_radix(&hex_str, 16) {
                 Ok(v) => TokenKind::Integer(v),
-                Err(_) => TokenKind::Error(format!(
-                    "hex literal out of range at byte {}",
-                    start
-                )),
+                Err(_) => TokenKind::Error(format!("hex literal out of range at byte {}", start)),
             };
         }
 
@@ -481,7 +462,9 @@ impl<'a> Lexer<'a> {
         // Fractional part
         if self.pos < self.src.len()
             && self.src[self.pos] == b'.'
-            && self.peek_at(1).is_some_and(|c| c.is_ascii_digit() || c == b'e' || c == b'E')
+            && self
+                .peek_at(1)
+                .is_some_and(|c| c.is_ascii_digit() || c == b'e' || c == b'E')
         {
             is_float = true;
             self.advance(); // skip dot
@@ -504,11 +487,11 @@ impl<'a> Lexer<'a> {
         }
 
         // Exponent
-        if self.pos < self.src.len() && (self.src[self.pos] == b'e' || self.src[self.pos] == b'E')
-        {
+        if self.pos < self.src.len() && (self.src[self.pos] == b'e' || self.src[self.pos] == b'E') {
             is_float = true;
             self.advance(); // skip e/E
-            if self.pos < self.src.len() && (self.src[self.pos] == b'+' || self.src[self.pos] == b'-')
+            if self.pos < self.src.len()
+                && (self.src[self.pos] == b'+' || self.src[self.pos] == b'-')
             {
                 self.advance();
             }
@@ -800,10 +783,7 @@ mod tests {
             TokenKind::QuotedId("table_name".to_owned(), true)
         );
         assert_eq!(tokens[1], TokenKind::QuotedId("column".to_owned(), false));
-        assert_eq!(
-            tokens[2],
-            TokenKind::QuotedId("backtick".to_owned(), false)
-        );
+        assert_eq!(tokens[2], TokenKind::QuotedId("backtick".to_owned(), false));
     }
 
     #[test]

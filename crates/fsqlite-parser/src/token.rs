@@ -64,17 +64,17 @@ pub enum TokenKind {
     Tilde,
     ShiftLeft,
     ShiftRight,
-    Eq,       // `=`
-    EqEq,     // `==`
-    Ne,       // `!=`
-    LtGt,     // `<>`
+    Eq,   // `=`
+    EqEq, // `==`
+    Ne,   // `!=`
+    LtGt, // `<>`
     Lt,
     Le,
     Gt,
     Ge,
-    Concat,       // `||`
-    Arrow,        // `->`
-    DoubleArrow,  // `->>`
+    Concat,      // `||`
+    Arrow,       // `->`
+    DoubleArrow, // `->>`
 
     // === Punctuation ===
     Dot,
@@ -247,6 +247,7 @@ impl TokenKind {
     /// Look up an identifier string to see if it's a keyword.
     /// Returns the keyword variant if so, else `None`.
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn lookup_keyword(s: &str) -> Option<Self> {
         // Case-insensitive keyword matching.
         // We uppercase for comparison since SQL keywords are case-insensitive.
