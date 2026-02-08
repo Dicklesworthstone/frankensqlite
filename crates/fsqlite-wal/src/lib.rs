@@ -1,6 +1,7 @@
-//! WAL checksum primitives and integrity helpers.
+//! WAL checksum primitives, integrity helpers, and native commit protocol.
 
 pub mod checksum;
+pub mod native_commit;
 pub mod wal_index;
 
 pub use checksum::{

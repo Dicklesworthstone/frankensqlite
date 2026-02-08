@@ -31,7 +31,7 @@ impl TxnId {
     /// Construct a `TxnId` if `raw` is in-domain.
     #[inline]
     pub const fn new(raw: u64) -> Option<Self> {
-        if raw == 0 || raw > Self::MAX_RAW {
+        if raw > Self::MAX_RAW {
             return None;
         }
         match NonZeroU64::new(raw) {
@@ -217,21 +217,221 @@ pub struct PageVersion {
     pub prev: Option<VersionPointer>,
 }
 
-/// A commit capsule is the durable ECS object that commits refer to.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub struct CommitCapsule {
-    pub object_id: ObjectId,
+/// Database operating mode (§7.10).
+///
+/// Selectable via `PRAGMA fsqlite.mode = compatibility | native`.
+/// Per-database (not per-connection). Default: [`Compatibility`](Self::Compatibility).
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
+pub enum OperatingMode {
+    /// Standard SQLite WAL format. Legacy reader interop, single coordinator
+    /// holds `WAL_WRITE_LOCK`. Sidecars (`.wal-fec`, `.db-fec`) present but
+    /// core `.db` stays compatible when checkpointed.
+    #[default]
+    Compatibility,
+    /// ECS-based storage. `CommitCapsules` + `CommitMarkers`, no legacy
+    /// interop, full concurrent writes.
+    Native,
 }
 
-/// Commit marker persisted in the commit chain.
+impl fmt::Display for OperatingMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Compatibility => f.write_str("compatibility"),
+            Self::Native => f.write_str("native"),
+        }
+    }
+}
+
+impl OperatingMode {
+    /// Parse from the PRAGMA string value (case-insensitive).
+    #[must_use]
+    pub fn from_pragma(s: &str) -> Option<Self> {
+        let lower = s.trim().to_ascii_lowercase();
+        match lower.as_str() {
+            "compatibility" | "compat" => Some(Self::Compatibility),
+            "native" => Some(Self::Native),
+            _ => None,
+        }
+    }
+
+    /// Whether this mode uses ECS-based storage.
+    #[must_use]
+    pub const fn is_native(self) -> bool {
+        matches!(self, Self::Native)
+    }
+
+    /// Whether legacy SQLite readers can attach.
+    #[must_use]
+    pub const fn legacy_readers_allowed(self) -> bool {
+        matches!(self, Self::Compatibility)
+    }
+}
+
+/// A commit capsule is the durable ECS object that a native-mode commit
+/// refers to (§7.11.1).
+///
+/// Contains the transaction's intent log, page deltas, snapshot basis,
+/// and SSI witness-plane evidence references. Built deterministically by the
+/// writer before submission to the `WriteCoordinator`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CommitCapsule {
+    /// Content-addressed identity of this capsule ECS object.
+    pub object_id: ObjectId,
+    /// The commit-seq snapshot this transaction read from.
+    pub snapshot_basis: CommitSeq,
+    /// Semantic intent log (ordered operations).
+    pub intent_log: Vec<IntentOp>,
+    /// Page-level deltas: `(page_number, delta_bytes)`.
+    pub page_deltas: Vec<(PageNumber, Vec<u8>)>,
+    /// BLAKE3 digest of the transaction's read set.
+    pub read_set_digest: [u8; 32],
+    /// BLAKE3 digest of the transaction's write set.
+    pub write_set_digest: [u8; 32],
+    /// ECS `ObjectId` refs to `ReadWitness` objects.
+    pub read_witness_refs: Vec<ObjectId>,
+    /// ECS `ObjectId` refs to `WriteWitness` objects.
+    pub write_witness_refs: Vec<ObjectId>,
+    /// ECS `ObjectId` refs to `DependencyEdge` objects.
+    pub dependency_edge_refs: Vec<ObjectId>,
+    /// ECS `ObjectId` refs to `MergeWitness` objects.
+    pub merge_witness_refs: Vec<ObjectId>,
+}
+
+/// Commit marker persisted in the commit chain (§7.11.2).
+///
+/// The marker is the point of no return: a transaction is committed if and
+/// only if its marker is durable. The marker stream is append-only and
+/// sequential; each record is small (~88 bytes V1) so fsync latency is
+/// minimized.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct CommitMarker {
     pub commit_seq: CommitSeq,
+    /// Monotonic non-decreasing: `max(now_unix_ns(), prev + 1)`.
     pub commit_time_unix_ns: u64,
     pub capsule_object_id: ObjectId,
     pub proof_object_id: ObjectId,
+    /// Previous marker in the chain (`None` for the genesis marker).
     pub prev_marker: Option<ObjectId>,
-    pub integrity_hash: [u8; 32],
+    /// XXH3-128 integrity hash covering all preceding fields.
+    pub integrity_hash: [u8; 16],
+}
+
+/// Wire size of a [`CommitMarkerRecord`] V1: 88 bytes.
+///
+/// Layout: `version(1) + flags(1) + commit_seq(8) + commit_time_unix_ns(8)
+/// + capsule_oid(16) + proof_oid(16) + prev_marker_oid(16) + has_prev(1)
+/// + integrity_hash(16) + reserved(5) = 88`.
+pub const COMMIT_MARKER_RECORD_V1_SIZE: usize = 88;
+
+/// Version byte for the current marker record format.
+const COMMIT_MARKER_RECORD_VERSION: u8 = 1;
+
+impl CommitMarker {
+    /// Serialize to the canonical 88-byte V1 wire format (little-endian).
+    #[must_use]
+    pub fn to_record_bytes(&self) -> [u8; COMMIT_MARKER_RECORD_V1_SIZE] {
+        let mut buf = [0u8; COMMIT_MARKER_RECORD_V1_SIZE];
+        buf[0] = COMMIT_MARKER_RECORD_VERSION;
+        buf[1] = 0; // flags (reserved)
+
+        // commit_seq at offset 2
+        buf[2..10].copy_from_slice(&self.commit_seq.get().to_le_bytes());
+        // commit_time_unix_ns at offset 10
+        buf[10..18].copy_from_slice(&self.commit_time_unix_ns.to_le_bytes());
+        // capsule_object_id at offset 18
+        buf[18..34].copy_from_slice(self.capsule_object_id.as_bytes());
+        // proof_object_id at offset 34
+        buf[34..50].copy_from_slice(self.proof_object_id.as_bytes());
+        // prev_marker at offset 50 (16 bytes, all-zero if None)
+        if let Some(prev) = self.prev_marker {
+            buf[50..66].copy_from_slice(prev.as_bytes());
+        }
+        // has_prev flag at offset 66
+        buf[66] = u8::from(self.prev_marker.is_some());
+        // integrity_hash at offset 67
+        buf[67..83].copy_from_slice(&self.integrity_hash);
+        // bytes 83..88 are reserved (zero)
+        buf
+    }
+
+    /// Deserialize from the canonical 88-byte V1 wire format.
+    #[must_use]
+    pub fn from_record_bytes(data: &[u8; COMMIT_MARKER_RECORD_V1_SIZE]) -> Option<Self> {
+        if data[0] != COMMIT_MARKER_RECORD_VERSION {
+            return None;
+        }
+
+        let commit_seq = CommitSeq::new(u64::from_le_bytes(data[2..10].try_into().ok()?));
+        let commit_time_unix_ns = u64::from_le_bytes(data[10..18].try_into().ok()?);
+        let capsule_object_id = ObjectId::from_bytes(data[18..34].try_into().ok()?);
+        let proof_object_id = ObjectId::from_bytes(data[34..50].try_into().ok()?);
+        let has_prev = data[66] != 0;
+        let prev_marker = if has_prev {
+            Some(ObjectId::from_bytes(data[50..66].try_into().ok()?))
+        } else {
+            None
+        };
+        let mut integrity_hash = [0u8; 16];
+        integrity_hash.copy_from_slice(&data[67..83]);
+
+        Some(Self {
+            commit_seq,
+            commit_time_unix_ns,
+            capsule_object_id,
+            proof_object_id,
+            prev_marker,
+            integrity_hash,
+        })
+    }
+
+    /// Compute the integrity hash (XXH3-128) over all fields except the
+    /// integrity hash itself.
+    #[must_use]
+    pub fn compute_integrity_hash(&self) -> [u8; 16] {
+        let mut buf = Vec::with_capacity(74);
+        append_u64_le(&mut buf, self.commit_seq.get());
+        append_u64_le(&mut buf, self.commit_time_unix_ns);
+        buf.extend_from_slice(self.capsule_object_id.as_bytes());
+        buf.extend_from_slice(self.proof_object_id.as_bytes());
+        if let Some(prev) = self.prev_marker {
+            buf.push(1);
+            buf.extend_from_slice(prev.as_bytes());
+        } else {
+            buf.push(0);
+            buf.extend_from_slice(&[0u8; 16]);
+        }
+        let hash128 = xxhash_rust::xxh3::xxh3_128(&buf);
+        hash128.to_le_bytes()
+    }
+
+    /// Build a marker with the integrity hash computed automatically.
+    #[must_use]
+    pub fn new(
+        commit_seq: CommitSeq,
+        commit_time_unix_ns: u64,
+        capsule_object_id: ObjectId,
+        proof_object_id: ObjectId,
+        prev_marker: Option<ObjectId>,
+    ) -> Self {
+        let mut marker = Self {
+            commit_seq,
+            commit_time_unix_ns,
+            capsule_object_id,
+            proof_object_id,
+            prev_marker,
+            integrity_hash: [0u8; 16],
+        };
+        marker.integrity_hash = marker.compute_integrity_hash();
+        marker
+    }
+
+    /// Verify the integrity hash.
+    #[must_use]
+    pub fn verify_integrity(&self) -> bool {
+        self.integrity_hash == self.compute_integrity_hash()
+    }
 }
 
 /// Object Transmission Information (RaptorQ / RFC 6330).
@@ -445,10 +645,19 @@ pub struct DependencyEdge {
     pub observed_by: TxnId,
 }
 
-/// Proof object tying together the dependency edges relevant to a commit decision.
+/// Proof object tying together the dependency edges relevant to a commit
+/// decision (§7.11.2 step 3).
+///
+/// Persisted as an ECS object by the `WriteCoordinator` after FCW + SSI
+/// re-validation succeeds. Referenced by the corresponding `CommitMarker`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CommitProof {
+    /// The commit sequence this proof was generated for.
+    pub commit_seq: CommitSeq,
+    /// SSI dependency edges that were validated.
     pub edges: Vec<DependencyEdge>,
+    /// ECS `ObjectId` refs to witness evidence objects.
+    pub evidence_refs: Vec<ObjectId>,
 }
 
 /// Identifier for a table b-tree root (logical, not physical file page).
@@ -1091,6 +1300,7 @@ mod tests {
         assert_debug_clone::<ArcCache>();
         assert_debug_clone::<RootManifest>();
         assert_debug_clone::<TxnSlot>();
+        assert_debug_clone::<OperatingMode>();
     }
 
     fn arb_budget() -> impl Strategy<Value = Budget> {

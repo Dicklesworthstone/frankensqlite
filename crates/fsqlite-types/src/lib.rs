@@ -15,13 +15,14 @@ pub use ecs::{
     SymbolRecordError, SymbolRecordFlags,
 };
 pub use glossary::{
-    ArcCache, BtreeRef, Budget, ColumnIdx, CommitCapsule, CommitMarker, CommitProof, CommitSeq,
-    DecodeProof, DependencyEdge, EpochId, IdempotencyKey, IndexId, IntentFootprint, IntentLog,
-    IntentOp, IntentOpKind, OTI_WIRE_SIZE, Oti, Outcome, PageHistory, PageVersion, RangeKey,
-    ReadWitness, RebaseBinaryOp, RebaseExpr, RebaseUnaryOp, Region, RemoteCap, RootManifest, RowId,
-    RowIdAllocator, RowIdExhausted, RowIdMode, Saga, SchemaEpoch, SemanticKeyKind, SemanticKeyRef,
-    Snapshot, StructuralEffects, SymbolAuthMasterKeyCap, SymbolValidityWindow, TableId, TxnEpoch,
-    TxnId, TxnSlot, TxnToken, VersionPointer, WitnessIndexSegment, WitnessKey, WriteWitness,
+    ArcCache, BtreeRef, Budget, COMMIT_MARKER_RECORD_V1_SIZE, ColumnIdx, CommitCapsule,
+    CommitMarker, CommitProof, CommitSeq, DecodeProof, DependencyEdge, EpochId, IdempotencyKey,
+    IndexId, IntentFootprint, IntentLog, IntentOp, IntentOpKind, OTI_WIRE_SIZE, OperatingMode, Oti,
+    Outcome, PageHistory, PageVersion, RangeKey, ReadWitness, RebaseBinaryOp, RebaseExpr,
+    RebaseUnaryOp, Region, RemoteCap, RootManifest, RowId, RowIdAllocator, RowIdExhausted,
+    RowIdMode, Saga, SchemaEpoch, SemanticKeyKind, SemanticKeyRef, Snapshot, StructuralEffects,
+    SymbolAuthMasterKeyCap, SymbolValidityWindow, TableId, TxnEpoch, TxnId, TxnSlot, TxnToken,
+    VersionPointer, WitnessIndexSegment, WitnessKey, WriteWitness,
 };
 pub use value::SqliteValue;
 
@@ -73,6 +74,53 @@ impl TryFrom<u32> for PageNumber {
     fn try_from(value: u32) -> Result<Self, Self::Error> {
         Self::new(value).ok_or(InvalidPageNumber)
     }
+}
+
+/// Fast identity hasher for `PageNumber` keys in lock/commit tables.
+///
+/// Page numbers are already well-distributed u32 values, so we skip
+/// hashing entirely and use the raw value directly.
+#[derive(Default)]
+pub struct PageNumberHasher(u64);
+
+impl std::hash::Hasher for PageNumberHasher {
+    fn write(&mut self, _: &[u8]) {
+        // PageNumber's Hash impl calls write_u32 (via NonZeroU32). If this
+        // method is reached, the hasher is being misused with a non-u32 key.
+        debug_assert!(false, "PageNumberHasher only supports write_u32");
+    }
+
+    fn write_u32(&mut self, n: u32) {
+        self.0 = u64::from(n);
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+/// BuildHasher for `PageNumberHasher`.
+pub type PageNumberBuildHasher = std::hash::BuildHasherDefault<PageNumberHasher>;
+
+/// Scalar GF(256) multiply with irreducible polynomial `0x11d`.
+///
+/// This is the core algebraic primitive used for RaptorQ encoding and
+/// XOR-delta compression (§3.2.1).
+#[must_use]
+pub fn gf256_mul_byte(mut a: u8, mut b: u8) -> u8 {
+    let mut out = 0_u8;
+    while b != 0 {
+        if (b & 1) != 0 {
+            out ^= a;
+        }
+        let carry = (a & 0x80) != 0;
+        a <<= 1;
+        if carry {
+            a ^= 0x1D;
+        }
+        b >>= 1;
+    }
+    out
 }
 
 /// Error returned when attempting to create a `PageNumber` from 0.

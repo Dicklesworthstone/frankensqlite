@@ -190,6 +190,15 @@ fn sample_oti(symbol_size: u32) -> Oti {
 fn test_commit_capsules_are_ecs_objects() {
     let capsule = CommitCapsule {
         object_id: ObjectId::from_bytes([0x11; ObjectId::LEN]),
+        snapshot_basis: CommitSeq::new(0),
+        intent_log: Vec::new(),
+        page_deltas: Vec::new(),
+        read_set_digest: [0u8; 32],
+        write_set_digest: [0u8; 32],
+        read_witness_refs: Vec::new(),
+        write_witness_refs: Vec::new(),
+        dependency_edge_refs: Vec::new(),
+        merge_witness_refs: Vec::new(),
     };
     assert_eq!(
         capsule.object_id.as_bytes().len(),
@@ -217,7 +226,7 @@ fn test_commit_markers_are_ecs_objects() {
         capsule_object_id: ObjectId::from_bytes([0x22; ObjectId::LEN]),
         proof_object_id: ObjectId::from_bytes([0x23; ObjectId::LEN]),
         prev_marker: Some(ObjectId::from_bytes([0x24; ObjectId::LEN])),
-        integrity_hash: [0x42; 32],
+        integrity_hash: [0x42; 16],
     };
     assert_eq!(
         marker.commit_seq.get(),
@@ -240,12 +249,14 @@ fn test_commit_markers_are_ecs_objects() {
 #[test]
 fn test_commit_proofs_are_ecs_objects() {
     let proof = CommitProof {
+        commit_seq: CommitSeq::new(1),
         edges: vec![DependencyEdge {
             from: TxnId::new(1).expect("valid txn id"),
             to: TxnId::new(2).expect("valid txn id"),
             key_basis: WitnessKey::Page(PageNumber::ONE),
             observed_by: TxnId::new(3).expect("valid txn id"),
         }],
+        evidence_refs: Vec::new(),
     };
     assert_eq!(
         proof.edges.len(),
