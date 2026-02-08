@@ -247,6 +247,28 @@
             animation: pulse-active 1.5s infinite var(--ease-in-out);
         }
 
+        /* --- Sidebar Commit Pulse (Activity Markers) --- */
+        .commit-list {
+            position: relative;
+        }
+        .commit-card[data-impact-high="true"]::after {
+            content: "";
+            position: absolute;
+            left: 0; top: 0; bottom: 0;
+            width: 3px;
+            background: var(--accent-error);
+            box-shadow: 2px 0 8px var(--accent-error);
+            opacity: 0.6;
+        }
+        .commit-card[data-impact-med="true"]::after {
+            content: "";
+            position: absolute;
+            left: 0; top: 0; bottom: 0;
+            width: 3px;
+            background: var(--accent-info);
+            opacity: 0.4;
+        }
+
         .commit-card-header {
             display: flex;
             justify-content: space-between;
@@ -737,6 +759,26 @@
             background: rgba(57, 255, 20, 0.25);
         }
 
+        /* --- Flashlight Mode --- */
+        body[data-flashlight="true"]::before {
+            content: "";
+            position: fixed;
+            inset: 0;
+            z-index: 9000;
+            pointer-events: none;
+            background: radial-gradient(
+                circle 250px at var(--mouse-x, 50%) var(--mouse-y, 50%),
+                transparent 0%,
+                rgba(0, 0, 0, 0.92) 100%
+            );
+        }
+        
+        #btnFlashlight.active {
+            color: var(--primary);
+            box-shadow: 0 0 15px var(--primary-glow);
+            border-color: var(--primary);
+        }
+
         /* --- Filters --- */
         #bucketFilters {
             display: flex;
@@ -794,7 +836,10 @@
     <div class="kpis" style="display: flex; gap: 30px;">
         <div style="display: flex; flex-direction: column;"><span style="font-size: 10px; font-weight: 600; color: var(--text-3); letter-spacing: 0.05em;">ENTRIES</span><span id="kpiCommits" style="font-size: 13px; font-weight: 600; color: var(--text-1);">-</span></div>
         <div style="display: flex; flex-direction: column;"><span style="font-size: 10px; font-weight: 600; color: var(--text-3); letter-spacing: 0.05em;">MASS</span><span id="kpiLines" style="font-size: 13px; font-weight: 600; color: var(--text-1);">-</span></div>
-        <button class="btn-lab" id="btnShowLegend" style="margin-left: 12px;">LEGEND</button>
+        <div style="display: flex; gap: 8px; align-items: center; margin-left: 12px;">
+            <button class="btn-lab" id="btnFlashlight" title="Toggle Searchlight (Artifact Mode)">BEAM</button>
+            <button class="btn-lab" id="btnShowLegend">LEGEND</button>
+        </div>
     </div>
     <button class="btn-lab mobile-hide" onclick="window.open('https://github.com/Dicklesworthstone/frankensqlite')">SOURCE</button>
 </header>
@@ -1305,9 +1350,16 @@
             const classes = ["commit-card"];
             if (isSelected) classes.push("selected");
             if (isSelected && STATE.playing) classes.push("playing");
+            
+            const highImpact = c.impact > 200;
+            const medImpact = c.impact > 50 && c.impact <= 200;
 
             return `
-                <div class="${classes.join(" ")}" data-idx="${c.idx}" onclick="window.selectCommit(${c.idx}); document.getElementById('sidebar').classList.remove('active');">
+                <div class="${classes.join(" ")}" 
+                     data-idx="${c.idx}" 
+                     data-impact-high="${highImpact}"
+                     data-impact-med="${medImpact}"
+                     onclick="window.selectCommit(${c.idx}); document.getElementById('sidebar').classList.remove('active');">
                     <div class="commit-card-header">
                         <span>#${c.idx}</span>
                         <span>${dayjs(c.date).format("MMM DD")}</span>
@@ -1431,6 +1483,52 @@
         document.getElementById("btnFocusExit").addEventListener("click", toggleFocusMode);
         
         initLegend();
+        setupInteractivity();
+    }
+
+    function setupInteractivity() {
+        // --- 1. Keyboard Shortcuts ---
+        window.addEventListener("keydown", (e) => {
+            if (e.target.tagName === "INPUT") return;
+            
+            switch(e.code) {
+                case "Space": e.preventDefault(); togglePlay(); break;
+                case "ArrowLeft": document.getElementById("btnPrev").click(); break;
+                case "ArrowRight": document.getElementById("btnNext").click(); break;
+                case "KeyF": toggleFocusMode(); break;
+                case "KeyL": document.getElementById("btnShowLegend").click(); break;
+                case "Slash": e.preventDefault(); document.getElementById("searchInput").focus(); break;
+                case "Escape": 
+                    document.getElementById("legendOverlay").classList.remove("active");
+                    if (document.body.classList.contains("focus-mode")) toggleFocusMode();
+                    break;
+            }
+        });
+
+        // --- 2. Interactive Map (Bottom Canvas) ---
+        const cvs = document.getElementById("mapCanvas");
+        cvs.style.cursor = "pointer";
+        cvs.addEventListener("click", (e) => {
+            const rect = cvs.getBoundingClientRect();
+            const x = e.clientX - rect.left;
+            const idx = Math.floor((x / rect.width) * COMMITS.length);
+            selectCommit(idx);
+        });
+
+        // --- 3. Flashlight Mode ---
+        const btnFlash = document.getElementById("btnFlashlight");
+        btnFlash.addEventListener("click", () => {
+            const active = document.body.getAttribute("data-flashlight") === "true";
+            document.body.setAttribute("data-flashlight", !active);
+            btnFlash.classList.toggle("active", !active);
+        });
+
+        window.addEventListener("mousemove", (e) => {
+            if (document.body.getAttribute("data-flashlight") === "true") {
+                document.body.style.setProperty("--mouse-x", e.clientX + "px");
+                document.body.style.setProperty("--mouse-y", e.clientY + "px");
+            }
+        });
     }
 
     function syncNeuralFilters() { 
@@ -1469,7 +1567,13 @@
             yAxis: { axisLine: { lineStyle: { color: '#27272a' } }, splitLine: { lineStyle: { color: '#27272a' } } } 
         };
         
-        if (!charts.velocity) charts.velocity = echarts.init(document.getElementById("chartVelocity"));
+        if (!charts.velocity) {
+            charts.velocity = echarts.init(document.getElementById("chartVelocity"));
+            charts.velocity.on('click', (params) => {
+                const idx = params.dataIndex;
+                if (idx !== undefined) selectCommit(idx);
+            });
+        }
         charts.velocity.setOption({ 
             ...t, 
             series: [{ 
@@ -1498,7 +1602,15 @@
 
     function renderMassGrowth(nonce) {
         if (nonce && nonce !== STATE.renderNonce) return;
-        if (!charts.mass) charts.mass = echarts.init(document.getElementById("chartMass"));
+        if (!charts.mass) {
+            charts.mass = echarts.init(document.getElementById("chartMass"));
+            charts.mass.on('click', (params) => {
+                // Grouping makes exact commit mapping complex, but we can jump to the approximate time
+                const dateStr = params.name;
+                const commit = COMMITS.find(c => dayjs(c.date).format("YYYY-MM-DD") === dateStr || dayjs(c.date).format("MM-DD HH:00") === dateStr);
+                if (commit) selectCommit(commit.idx);
+            });
+        }
         const buckets = groupCommits(STATE.timeBucket);
         const labels = Object.keys(buckets).sort();
         const series = BUCKETS.map(b => ({ 
