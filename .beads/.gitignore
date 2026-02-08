@@ -9,3 +9,6 @@
 # Temporary
 last-touched
 *.tmp
+
+# br CLI history snapshots (large + ephemeral)
+.br_history/
