@@ -907,10 +907,7 @@ mod tests {
     fn parse(sql: &str) -> Expr {
         match parse_expr(sql) {
             Ok(expr) => expr,
-            Err(err) => {
-                assert!(false, "parse error for `{sql}`: {err}");
-                Expr::Literal(Literal::Null, Span::ZERO)
-            }
+            Err(err) => unreachable!("parse error for `{sql}`: {err}"),
         }
     }
 
@@ -929,9 +926,9 @@ mod tests {
                 Expr::BinaryOp {
                     op: BinaryOp::Eq, ..
                 } => {}
-                other => assert!(false, "expected Eq inside NOT, got {other:?}"),
+                other => unreachable!("expected Eq inside NOT, got {other:?}"),
             },
-            other => assert!(false, "expected NOT(Eq), got {other:?}"),
+            other => unreachable!("expected NOT(Eq), got {other:?}"),
         }
     }
 
@@ -954,7 +951,7 @@ mod tests {
                     }
                 ));
             }
-            other => assert!(false, "expected COLLATE(Negate), got {other:?}"),
+            other => unreachable!("expected COLLATE(Negate), got {other:?}"),
         }
     }
 
@@ -981,7 +978,7 @@ mod tests {
                     }
                 ));
             }
-            other => assert!(false, "expected Add(1, Mul(2,3)), got {other:?}"),
+            other => unreachable!("expected Add(1, Mul(2,3)), got {other:?}"),
         }
     }
 
@@ -1003,7 +1000,7 @@ mod tests {
                     }
                 ));
             }
-            other => assert!(false, "expected Or(a, And(b,c)), got {other:?}"),
+            other => unreachable!("expected Or(a, And(b,c)), got {other:?}"),
         }
     }
 
@@ -1024,7 +1021,7 @@ mod tests {
                 ));
                 assert_eq!(type_name.name, "INTEGER");
             }
-            other => assert!(false, "expected Cast, got {other:?}"),
+            other => unreachable!("expected Cast, got {other:?}"),
         }
     }
 
@@ -1046,7 +1043,7 @@ mod tests {
                 assert!(matches!(op.as_ref(), Expr::Column(..)));
                 assert_eq!(whens.len(), 2);
             }
-            other => assert!(false, "expected simple CASE, got {other:?}"),
+            other => unreachable!("expected simple CASE, got {other:?}"),
         }
     }
 
@@ -1072,7 +1069,7 @@ mod tests {
                     }
                 ));
             }
-            other => assert!(false, "expected searched CASE, got {other:?}"),
+            other => unreachable!("expected searched CASE, got {other:?}"),
         }
     }
 
@@ -1101,7 +1098,7 @@ mod tests {
                 set: InSet::List(items),
                 ..
             } => assert_eq!(items.len(), 3),
-            other => assert!(false, "expected IN list, got {other:?}"),
+            other => unreachable!("expected IN list, got {other:?}"),
         }
     }
 
@@ -1148,7 +1145,7 @@ mod tests {
                 left,
                 ..
             } => assert!(matches!(left.as_ref(), Expr::Between { .. })),
-            other => assert!(false, "expected AND(BETWEEN, Eq), got {other:?}"),
+            other => unreachable!("expected AND(BETWEEN, Eq), got {other:?}"),
         }
     }
 
@@ -1206,7 +1203,7 @@ mod tests {
                 pattern.as_ref(),
                 Expr::Literal(Literal::String(s), _) if s == "[a-z]*"
             )),
-            other => assert!(false, "expected GLOB, got {other:?}"),
+            other => unreachable!("expected GLOB, got {other:?}"),
         }
     }
 
@@ -1219,7 +1216,7 @@ mod tests {
             Expr::Collate { collation, .. } => {
                 assert_eq!(collation, "NOCASE");
             }
-            other => assert!(false, "expected COLLATE, got {other:?}"),
+            other => unreachable!("expected COLLATE, got {other:?}"),
         }
     }
 
@@ -1287,10 +1284,10 @@ mod tests {
                 assert_eq!(name, "max");
                 match args {
                     FunctionArgs::List(v) => assert_eq!(v.len(), 2),
-                    FunctionArgs::Star => assert!(false, "expected arg list"),
+                    FunctionArgs::Star => unreachable!("expected arg list"),
                 }
             }
-            other => assert!(false, "expected FunctionCall, got {other:?}"),
+            other => unreachable!("expected FunctionCall, got {other:?}"),
         }
     }
 
@@ -1358,7 +1355,7 @@ mod tests {
                 },
                 _,
             ) => assert_eq!(column, "x"),
-            other => assert!(false, "expected bare column, got {other:?}"),
+            other => unreachable!("expected bare column, got {other:?}"),
         }
     }
 
@@ -1375,7 +1372,7 @@ mod tests {
                 assert_eq!(t, "t");
                 assert_eq!(column, "x");
             }
-            other => assert!(false, "expected qualified column, got {other:?}"),
+            other => unreachable!("expected qualified column, got {other:?}"),
         }
     }
 
@@ -1397,7 +1394,7 @@ mod tests {
                     ..
                 }
             )),
-            other => assert!(false, "expected Add(a, Concat(b,c)), got {other:?}"),
+            other => unreachable!("expected Add(a, Concat(b,c)), got {other:?}"),
         }
     }
 
@@ -1419,7 +1416,7 @@ mod tests {
                     ..
                 }
             )),
-            other => assert!(false, "expected Mul(Add, 3), got {other:?}"),
+            other => unreachable!("expected Mul(Add, 3), got {other:?}"),
         }
     }
 
@@ -1465,7 +1462,7 @@ mod tests {
                     ..
                 }
             )),
-            other => assert!(false, "expected BitOr(BitAnd, c), got {other:?}"),
+            other => unreachable!("expected BitOr(BitAnd, c), got {other:?}"),
         }
     }
 

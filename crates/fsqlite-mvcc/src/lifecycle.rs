@@ -9,13 +9,14 @@
 //! - [`CommitResponse`]: Result type for the commit sequencer.
 
 use std::collections::HashMap;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use fsqlite_types::{
     BTreePageType, CommitSeq, PageData, PageNumber, PageSize, PageVersion, SchemaEpoch, Snapshot,
     TxnEpoch, TxnId, TxnToken,
 };
 
+use crate::cache_aligned::{logical_now_epoch_secs, logical_now_millis};
 use crate::core_types::{
     CommitIndex, InProcessPageLockTable, Transaction, TransactionMode, TransactionState,
 };
@@ -702,7 +703,7 @@ impl TransactionManager {
         // Check serialized writer exclusion first.
         if self
             .shm
-            .check_serialized_writer_exclusion(Self::now_epoch_secs(), |_pid, _birth| true)
+            .check_serialized_writer_exclusion(logical_now_epoch_secs(), |_pid, _birth| true)
             .is_err()
         {
             return Err(MvccError::Busy);
@@ -943,8 +944,9 @@ impl TransactionManager {
     }
 
     fn ensure_txn_within_max_duration(&self, txn: &mut Transaction) -> Result<(), MvccError> {
-        let elapsed_ms = txn.started_at.elapsed().as_millis();
-        if elapsed_ms > u128::from(self.txn_max_duration_ms) {
+        let now_ms = logical_now_millis();
+        let elapsed_ms = now_ms.saturating_sub(txn.started_at_ms);
+        if elapsed_ms > self.txn_max_duration_ms {
             self.abort(txn);
             tracing::warn!(
                 txn_id = %txn.txn_id,
@@ -955,13 +957,6 @@ impl TransactionManager {
             return Err(MvccError::TxnMaxDurationExceeded);
         }
         Ok(())
-    }
-
-    fn now_epoch_secs() -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or(Duration::ZERO)
-            .as_secs()
     }
 
     fn acquire_serialized_writer_exclusion(&self, txn_id: TxnId) -> Result<(), MvccError> {
@@ -975,7 +970,7 @@ impl TransactionManager {
         })?;
 
         // Step 2: Clear stale indicator if needed, then publish indicator.
-        let now = Self::now_epoch_secs();
+        let now = logical_now_epoch_secs();
         let pid = std::process::id();
         let pid_birth = now; // simplified; real impl uses epoch nanos + OS liveness
         let lease_expiry = now.saturating_add(self.serialized_writer_lease_secs);
@@ -1021,8 +1016,8 @@ impl TransactionManager {
     }
 
     fn drain_concurrent_writers_via_lock_table_scan(&self, txn_id: TxnId) -> Result<(), MvccError> {
-        let start = Instant::now();
-        let timeout = Duration::from_millis(self.busy_timeout_ms);
+        let mut elapsed_ms = 0_u64;
+        let mut remaining_budget_ms = self.busy_timeout_ms;
         let mut last_remaining = usize::MAX;
 
         loop {
@@ -1030,17 +1025,17 @@ impl TransactionManager {
             if remaining == 0 {
                 tracing::debug!(
                     txn_id = %txn_id,
-                    elapsed_ms = start.elapsed().as_millis(),
+                    elapsed_ms,
                     "serialized writer drain complete"
                 );
                 return Ok(());
             }
 
-            if start.elapsed() >= timeout {
+            if remaining_budget_ms == 0 {
                 tracing::warn!(
                     txn_id = %txn_id,
                     remaining,
-                    elapsed_ms = start.elapsed().as_millis(),
+                    elapsed_ms,
                     busy_timeout_ms = self.busy_timeout_ms,
                     "serialized writer drain timed out; returning SQLITE_BUSY"
                 );
@@ -1052,23 +1047,25 @@ impl TransactionManager {
                 tracing::debug!(
                     txn_id = %txn_id,
                     remaining,
-                    elapsed_ms = start.elapsed().as_millis(),
+                    elapsed_ms,
                     "serialized writer drain progress"
                 );
             }
 
             // Be polite: this is a busy-wait with a deadline, not a hard spin.
             std::thread::sleep(Duration::from_millis(1));
+            elapsed_ms = elapsed_ms.saturating_add(1);
+            remaining_budget_ms = remaining_budget_ms.saturating_sub(1);
         }
     }
 
     fn release_serialized_writer_exclusion(&self, txn_id: TxnId) {
-        let token = txn_id.get();
-        if !self.shm.release_serialized_writer(token) {
+        let writer_txn_id_raw = txn_id.get();
+        if !self.shm.release_serialized_writer(writer_txn_id_raw) {
             tracing::error!(
                 txn_id = %txn_id,
-                token,
-                "lock protocol violation: serialized writer indicator release failed (token mismatch)"
+                writer_txn_id_raw,
+                "lock protocol violation: serialized writer indicator release failed (writer txn id mismatch)"
             );
         }
         if !self.write_mutex.release(txn_id) {
@@ -1109,12 +1106,17 @@ mod tests {
     use proptest::prelude::*;
 
     fn mgr() -> TransactionManager {
-        TransactionManager::new(PageSize::DEFAULT)
+        // Use very high max-duration since the logical clock is global/shared
+        // across parallel tests, so elapsed_ms accumulates fast.
+        let mut m = TransactionManager::new(PageSize::DEFAULT);
+        m.set_txn_max_duration_ms(u64::MAX);
+        m
     }
 
     fn mgr_with_busy_timeout_ms(busy_timeout_ms: u64) -> TransactionManager {
         let mut m = TransactionManager::new(PageSize::DEFAULT);
         m.set_busy_timeout_ms(busy_timeout_ms);
+        m.set_txn_max_duration_ms(u64::MAX);
         m
     }
 
@@ -2525,9 +2527,7 @@ mod tests {
         m.set_txn_max_duration_ms(1);
 
         let mut txn = m.begin(BeginKind::Immediate).unwrap();
-        txn.started_at = Instant::now()
-            .checked_sub(Duration::from_millis(10))
-            .expect("instant underflow not expected");
+        txn.started_at_ms = txn.started_at_ms.saturating_sub(10);
 
         let result = m.write_page(&mut txn, PageNumber::new(1).unwrap(), test_data(0xEF));
         assert_eq!(result.unwrap_err(), MvccError::TxnMaxDurationExceeded);
@@ -2987,8 +2987,7 @@ mod tests {
         const R: u64 = 8;
         const D_SECONDS: u64 = 1;
 
-        let mut m = mgr();
-        m.set_txn_max_duration_ms(2_000);
+        let m = mgr();
 
         // Theorem 1 + 3A: conflicting writes are immediate BUSY (non-blocking).
         let pg_conflict = PageNumber::new(900).unwrap();
@@ -3300,5 +3299,258 @@ mod tests {
         let final_ver = m.version_store().get_version(final_head).unwrap();
         assert_eq!(final_ver.data.as_bytes()[0], 0x33);
         assert_eq!(final_ver.commit_seq, seq3);
+    }
+
+    // ===================================================================
+    // bd-iwu.1 — Layer 1: SQLite Behavioral Compatibility Mode (§2.4)
+    // ===================================================================
+
+    #[test]
+    fn test_begin_deferred_no_write_lock() {
+        let m = mgr();
+        let txn = m.begin(BeginKind::Deferred).unwrap();
+
+        assert!(
+            m.write_mutex().holder().is_none(),
+            "DEFERRED must not hold write mutex at BEGIN"
+        );
+        assert!(
+            !txn.serialized_write_lock_held,
+            "DEFERRED must not hold serialized_write_lock at BEGIN"
+        );
+    }
+
+    #[test]
+    fn test_deferred_upgrade_on_first_write() {
+        let m = mgr();
+        let mut txn = m.begin(BeginKind::Deferred).unwrap();
+
+        assert!(
+            !txn.serialized_write_lock_held,
+            "no mutex before first write"
+        );
+
+        let pgno = PageNumber::new(1).unwrap();
+        m.write_page(&mut txn, pgno, test_data(0x01)).unwrap();
+
+        assert!(
+            txn.serialized_write_lock_held,
+            "mutex must be acquired on first write"
+        );
+        assert!(
+            txn.snapshot_established,
+            "snapshot must be established on first write"
+        );
+        assert_eq!(
+            m.write_mutex().holder(),
+            Some(txn.txn_id),
+            "write mutex must be held by this txn"
+        );
+    }
+
+    #[test]
+    fn test_begin_immediate_acquires_write_lock() {
+        let m = mgr();
+        let txn1 = m.begin(BeginKind::Immediate).unwrap();
+
+        assert!(
+            txn1.serialized_write_lock_held,
+            "IMMEDIATE must acquire mutex at BEGIN"
+        );
+        assert_eq!(m.write_mutex().holder(), Some(txn1.txn_id));
+
+        let result = m.begin(BeginKind::Immediate);
+        assert_eq!(
+            result.unwrap_err(),
+            MvccError::Busy,
+            "second IMMEDIATE must get SQLITE_BUSY"
+        );
+    }
+
+    #[test]
+    fn test_begin_exclusive_acquires_write_lock() {
+        let m = mgr();
+        let txn = m.begin(BeginKind::Exclusive).unwrap();
+
+        assert!(
+            txn.serialized_write_lock_held,
+            "EXCLUSIVE must acquire mutex at BEGIN"
+        );
+        assert_eq!(m.write_mutex().holder(), Some(txn.txn_id));
+
+        let result = m.begin(BeginKind::Exclusive);
+        assert_eq!(
+            result.unwrap_err(),
+            MvccError::Busy,
+            "second EXCLUSIVE must get SQLITE_BUSY (identical to IMMEDIATE in WAL mode)"
+        );
+    }
+
+    #[test]
+    fn test_concurrent_readers_no_block() {
+        let m = mgr();
+        let mut r1 = m.begin(BeginKind::Deferred).unwrap();
+        let mut r2 = m.begin(BeginKind::Deferred).unwrap();
+        let mut r3 = m.begin(BeginKind::Deferred).unwrap();
+
+        let pgno = PageNumber::new(1).unwrap();
+        let _ = m.read_page(&mut r1, pgno);
+        let _ = m.read_page(&mut r2, pgno);
+        let _ = m.read_page(&mut r3, pgno);
+
+        assert!(r1.snapshot_established);
+        assert!(r2.snapshot_established);
+        assert!(r3.snapshot_established);
+        assert!(
+            m.write_mutex().holder().is_none(),
+            "readers must never hold write mutex"
+        );
+    }
+
+    #[test]
+    fn test_writer_does_not_block_readers() {
+        let m = mgr();
+
+        let pgno = PageNumber::new(1).unwrap();
+        let mut setup = m.begin(BeginKind::Immediate).unwrap();
+        m.write_page(&mut setup, pgno, test_data(0x11)).unwrap();
+        m.commit(&mut setup).unwrap();
+
+        let _ser = m.begin(BeginKind::Immediate).unwrap();
+        assert!(m.write_mutex().holder().is_some());
+
+        let mut reader = m.begin(BeginKind::Deferred).unwrap();
+        let data = m.read_page(&mut reader, pgno);
+        assert!(
+            data.is_some(),
+            "reader must not be blocked by active writer (WAL semantics)"
+        );
+        assert_eq!(data.unwrap().as_bytes()[0], 0x11);
+    }
+
+    #[test]
+    fn test_single_writer_serialization() {
+        let m = mgr();
+
+        let txn1 = m.begin(BeginKind::Immediate).unwrap();
+        assert!(txn1.serialized_write_lock_held);
+
+        assert_eq!(
+            m.begin(BeginKind::Immediate).unwrap_err(),
+            MvccError::Busy,
+            "second IMMEDIATE writer must get SQLITE_BUSY"
+        );
+        assert_eq!(
+            m.begin(BeginKind::Exclusive).unwrap_err(),
+            MvccError::Busy,
+            "EXCLUSIVE writer must also get SQLITE_BUSY"
+        );
+
+        // DEFERRED can begin but will fail on first write attempt.
+        let mut def = m.begin(BeginKind::Deferred).unwrap();
+        assert!(!def.serialized_write_lock_held);
+        let err = m.write_page(&mut def, PageNumber::new(1).unwrap(), test_data(0x01));
+        assert_eq!(
+            err.unwrap_err(),
+            MvccError::Busy,
+            "DEFERRED upgrade must fail while another writer holds mutex"
+        );
+    }
+
+    #[test]
+    fn test_serializable_behavior() {
+        let m = mgr();
+        let pgno_a = PageNumber::new(1).unwrap();
+        let pgno_b = PageNumber::new(2).unwrap();
+
+        // Writer 1 writes two pages atomically.
+        let mut w1 = m.begin(BeginKind::Immediate).unwrap();
+        m.write_page(&mut w1, pgno_a, test_data(0x01)).unwrap();
+        m.write_page(&mut w1, pgno_b, test_data(0x02)).unwrap();
+        assert_eq!(
+            m.begin(BeginKind::Immediate).unwrap_err(),
+            MvccError::Busy,
+            "write skew impossible: second writer blocked"
+        );
+        m.commit(&mut w1).unwrap();
+
+        // Writer 2 sees complete state from w1.
+        let mut w2 = m.begin(BeginKind::Immediate).unwrap();
+        let a = m.read_page(&mut w2, pgno_a).unwrap();
+        let b = m.read_page(&mut w2, pgno_b).unwrap();
+        assert_eq!(a.as_bytes()[0], 0x01, "w2 sees w1 page A");
+        assert_eq!(b.as_bytes()[0], 0x02, "w2 sees w1 page B");
+        m.commit(&mut w2).unwrap();
+    }
+
+    #[test]
+    fn test_busy_timeout_wait() {
+        let m = Arc::new(mgr_with_busy_timeout_ms(500));
+
+        let mut txn_conc = m.begin(BeginKind::Concurrent).unwrap();
+        m.write_page(&mut txn_conc, PageNumber::new(1).unwrap(), test_data(0x01))
+            .unwrap();
+
+        let m2 = Arc::clone(&m);
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            let mut txn = txn_conc;
+            m2.abort(&mut txn);
+        });
+
+        let start = Instant::now();
+        let mut txn_ser = m.begin(BeginKind::Immediate).unwrap();
+        let elapsed = start.elapsed();
+
+        assert!(
+            txn_ser.serialized_write_lock_held,
+            "writer must eventually acquire lock after busy_timeout wait"
+        );
+        assert!(
+            elapsed.as_millis() >= 20,
+            "writer should have waited (elapsed: {}ms)",
+            elapsed.as_millis()
+        );
+        assert!(
+            elapsed.as_millis() < 500,
+            "writer should succeed before full timeout (elapsed: {}ms)",
+            elapsed.as_millis()
+        );
+
+        m.abort(&mut txn_ser);
+        releaser.join().unwrap();
+    }
+
+    #[test]
+    fn test_savepoint_nested() {
+        let m = mgr();
+        let mut txn = m.begin(BeginKind::Immediate).unwrap();
+        let p1 = PageNumber::new(1).unwrap();
+        let p2 = PageNumber::new(2).unwrap();
+        let p3 = PageNumber::new(3).unwrap();
+
+        m.write_page(&mut txn, p1, test_data(0x01)).unwrap();
+        let sp1 = TransactionManager::savepoint(&txn, "sp1");
+
+        m.write_page(&mut txn, p2, test_data(0x02)).unwrap();
+        let sp2 = TransactionManager::savepoint(&txn, "sp2");
+
+        m.write_page(&mut txn, p3, test_data(0x03)).unwrap();
+        assert_eq!(txn.write_set.len(), 3);
+
+        // ROLLBACK TO sp2 — undoes p3 only.
+        TransactionManager::rollback_to_savepoint(&mut txn, &sp2);
+        assert_eq!(txn.write_set.len(), 2);
+        assert!(txn.write_set_data.contains_key(&p1));
+        assert!(txn.write_set_data.contains_key(&p2));
+        assert!(!txn.write_set_data.contains_key(&p3));
+
+        // ROLLBACK TO sp1 — undoes p2 as well.
+        TransactionManager::rollback_to_savepoint(&mut txn, &sp1);
+        assert_eq!(txn.write_set.len(), 1);
+        assert!(txn.write_set_data.contains_key(&p1));
+        assert!(!txn.write_set_data.contains_key(&p2));
+
+        m.commit(&mut txn).unwrap();
     }
 }

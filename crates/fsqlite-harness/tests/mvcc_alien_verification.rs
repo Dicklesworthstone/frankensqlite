@@ -386,7 +386,7 @@ fn test_tla_export_spec_skeleton() {
 
 #[test]
 fn test_tla_asupersync_trace_export() {
-    use asupersync::trace::{TraceEvent, TlaExporter};
+    use asupersync::trace::{TlaExporter, TraceEvent};
     use asupersync::types::{RegionId, TaskId, Time};
 
     // Minimal deterministic trace: one region, one task lifecycle.
@@ -408,14 +408,30 @@ fn test_tla_asupersync_trace_export() {
     let behavior = exporter.export_behavior("AsupersyncRuntimeBehavior");
     let skeleton = TlaExporter::export_spec_skeleton("AsupersyncRuntimeModel");
 
-    assert!(behavior.source.contains("---- MODULE AsupersyncRuntimeBehavior ----"));
-    assert!(behavior.source.contains("VARIABLES tasks, regions, obligations, time, step"));
+    assert!(
+        behavior
+            .source
+            .contains("---- MODULE AsupersyncRuntimeBehavior ----")
+    );
+    assert!(
+        behavior
+            .source
+            .contains("VARIABLES tasks, regions, obligations, time, step")
+    );
     assert!(behavior.source.contains("Init =="));
     assert!(behavior.source.contains("Next =="));
     assert!(behavior.source.contains("Spec =="));
 
-    assert!(skeleton.source.contains("---- MODULE AsupersyncRuntimeModel ----"));
-    assert!(skeleton.source.contains("VARIABLES tasks, regions, obligations, time"));
+    assert!(
+        skeleton
+            .source
+            .contains("---- MODULE AsupersyncRuntimeModel ----")
+    );
+    assert!(
+        skeleton
+            .source
+            .contains("VARIABLES tasks, regions, obligations, time")
+    );
     assert!(skeleton.source.contains("Init =="));
     assert!(skeleton.source.contains("Next =="));
     assert!(skeleton.source.contains("Spec =="));

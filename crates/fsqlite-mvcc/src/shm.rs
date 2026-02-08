@@ -5,7 +5,7 @@
 //! - Immutable fields: magic, version, page_size, max_txn_slots, region offsets.
 //! - Atomic counters: next_txn_id, snapshot_seq (seqlock), commit_seq,
 //!   schema_epoch, ecs_epoch, gc_horizon.
-//! - Serialized writer indicator: token, pid, pid_birth, lease_expiry.
+//! - Serialized writer indicator: writer_txn_id, pid, pid_birth, lease_expiry.
 //! - An xxh3_64 checksum over the immutable fields.
 //!
 //! The in-process fast path uses native Rust atomics. Serialization to/from
@@ -59,8 +59,8 @@ mod offsets {
     /// `u64` — GC horizon.
     pub const GC_HORIZON: usize = 64;
 
-    /// `u64` — serialized writer token.
-    pub const SERIALIZED_WRITER_TOKEN: usize = 72;
+    /// `u64` — serialized writer txn id (0 = none).
+    pub const SERIALIZED_WRITER_TXN_ID: usize = 72;
 
     /// `u32` — serialized writer PID.
     pub const SERIALIZED_WRITER_PID: usize = 80;
@@ -157,7 +157,7 @@ pub struct SharedMemoryLayout {
     schema_epoch: AtomicU64,
     ecs_epoch: AtomicU64,
     gc_horizon: AtomicU64,
-    serialized_writer_token: AtomicU64,
+    serialized_writer_txn_id: AtomicU64,
     serialized_writer_pid: AtomicU32,
     serialized_writer_pid_birth: AtomicU64,
     serialized_writer_lease_expiry: AtomicU64,
@@ -224,7 +224,7 @@ impl SharedMemoryLayout {
             schema_epoch: AtomicU64::new(0),
             ecs_epoch: AtomicU64::new(0),
             gc_horizon: AtomicU64::new(0),
-            serialized_writer_token: AtomicU64::new(0),
+            serialized_writer_txn_id: AtomicU64::new(0),
             serialized_writer_pid: AtomicU32::new(0),
             serialized_writer_pid_birth: AtomicU64::new(0),
             serialized_writer_lease_expiry: AtomicU64::new(0),
@@ -293,7 +293,7 @@ impl SharedMemoryLayout {
         let schema_epoch = read_u64(buf, offsets::SCHEMA_EPOCH);
         let ecs_epoch = read_u64(buf, offsets::ECS_EPOCH);
         let gc_horizon = read_u64(buf, offsets::GC_HORIZON);
-        let sw_token = read_u64(buf, offsets::SERIALIZED_WRITER_TOKEN);
+        let sw_txn_id = read_u64(buf, offsets::SERIALIZED_WRITER_TXN_ID);
         let sw_pid = read_u32(buf, offsets::SERIALIZED_WRITER_PID);
         let sw_pid_birth = read_u64(buf, offsets::SERIALIZED_WRITER_PID_BIRTH);
         let sw_lease = read_u64(buf, offsets::SERIALIZED_WRITER_LEASE_EXPIRY);
@@ -313,7 +313,7 @@ impl SharedMemoryLayout {
             schema_epoch: AtomicU64::new(schema_epoch),
             ecs_epoch: AtomicU64::new(ecs_epoch),
             gc_horizon: AtomicU64::new(gc_horizon),
-            serialized_writer_token: AtomicU64::new(sw_token),
+            serialized_writer_txn_id: AtomicU64::new(sw_txn_id),
             serialized_writer_pid: AtomicU32::new(sw_pid),
             serialized_writer_pid_birth: AtomicU64::new(sw_pid_birth),
             serialized_writer_lease_expiry: AtomicU64::new(sw_lease),
@@ -367,8 +367,8 @@ impl SharedMemoryLayout {
         // Serialized writer.
         write_u64(
             &mut buf,
-            offsets::SERIALIZED_WRITER_TOKEN,
-            self.serialized_writer_token.load(Ordering::Acquire),
+            offsets::SERIALIZED_WRITER_TXN_ID,
+            self.serialized_writer_txn_id.load(Ordering::Acquire),
         );
         write_u32(
             &mut buf,
@@ -527,20 +527,23 @@ impl SharedMemoryLayout {
 
     /// Attempt to acquire the serialized writer indicator.
     ///
-    /// Returns `true` if acquired (token was 0 → now `token`).
+    /// Returns `true` if acquired (field was 0 → now `writer_txn_id_raw`).
     /// Returns `false` if another writer holds it.
     pub fn acquire_serialized_writer(
         &self,
-        token: u64,
+        writer_txn_id_raw: u64,
         pid: u32,
         pid_birth: u64,
         lease_expiry_epoch_secs: u64,
     ) -> bool {
-        assert_ne!(token, 0, "serialized writer token must be non-zero");
-        // CAS 0 → token.
+        assert_ne!(
+            writer_txn_id_raw, 0,
+            "serialized writer txn id must be non-zero"
+        );
+        // CAS 0 → writer_txn_id_raw.
         if self
-            .serialized_writer_token
-            .compare_exchange(0, token, Ordering::AcqRel, Ordering::Acquire)
+            .serialized_writer_txn_id
+            .compare_exchange(0, writer_txn_id_raw, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
             return false;
@@ -555,17 +558,17 @@ impl SharedMemoryLayout {
 
     /// Release the serialized writer indicator.
     ///
-    /// Returns `true` if released (token matched).
-    /// Per spec: clear token BEFORE releasing mutex.
-    pub fn release_serialized_writer(&self, token: u64) -> bool {
+    /// Returns `true` if released (writer txn id matched).
+    /// Per spec: clear writer txn id BEFORE releasing mutex.
+    pub fn release_serialized_writer(&self, writer_txn_id_raw: u64) -> bool {
         if self
-            .serialized_writer_token
-            .compare_exchange(token, 0, Ordering::AcqRel, Ordering::Acquire)
+            .serialized_writer_txn_id
+            .compare_exchange(writer_txn_id_raw, 0, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
             return false;
         }
-        // Clear auxiliary fields after token is zeroed.
+        // Clear auxiliary fields after the writer txn id is zeroed.
         self.serialized_writer_pid.store(0, Ordering::Release);
         self.serialized_writer_pid_birth.store(0, Ordering::Release);
         self.serialized_writer_lease_expiry
@@ -578,8 +581,8 @@ impl SharedMemoryLayout {
     /// Returns `Some(TxnId)` if a writer holds the indicator, `None` otherwise.
     #[must_use]
     pub fn check_serialized_writer(&self) -> Option<TxnId> {
-        let token = self.serialized_writer_token.load(Ordering::Acquire);
-        TxnId::new(token)
+        let writer_txn_id_raw = self.serialized_writer_txn_id.load(Ordering::Acquire);
+        TxnId::new(writer_txn_id_raw)
     }
 
     /// Check serialized-writer exclusion for concurrent writers (§5.8.1).
@@ -589,7 +592,7 @@ impl SharedMemoryLayout {
     /// if a non-stale serialized writer is active.
     ///
     /// The stale-indicator cleanup loop is linearizable:
-    /// - Acquire-load the token.
+    /// - Acquire-load the writer txn id.
     /// - If stale, CAS-clear with AcqRel.
     /// - Retry on CAS races.
     pub fn check_serialized_writer_exclusion(
@@ -597,7 +600,7 @@ impl SharedMemoryLayout {
         now_epoch_secs: u64,
         process_alive: impl Fn(u32, u64) -> bool,
     ) -> Result<(), MvccError> {
-        let mut noop = |_token: u64| {};
+        let mut noop = |_writer_txn_id_raw: u64| {};
         self.check_serialized_writer_exclusion_with_hook(now_epoch_secs, process_alive, &mut noop)
     }
 
@@ -611,8 +614,8 @@ impl SharedMemoryLayout {
         F: FnMut(u64),
     {
         loop {
-            let token = self.serialized_writer_token.load(Ordering::Acquire);
-            if token == 0 {
+            let writer_txn_id_raw = self.serialized_writer_txn_id.load(Ordering::Acquire);
+            if writer_txn_id_raw == 0 {
                 return Ok(());
             }
 
@@ -634,7 +637,7 @@ impl SharedMemoryLayout {
 
             if writer_live {
                 tracing::warn!(
-                    token,
+                    writer_txn_id_raw,
                     pid,
                     pid_birth,
                     lease_expiry,
@@ -644,7 +647,7 @@ impl SharedMemoryLayout {
             }
 
             tracing::debug!(
-                token,
+                writer_txn_id_raw,
                 pid,
                 pid_birth,
                 lease_expiry,
@@ -653,20 +656,23 @@ impl SharedMemoryLayout {
                 "serialized writer indicator appears stale; attempting CAS clear"
             );
 
-            on_stale_before_cas(token);
+            on_stale_before_cas(writer_txn_id_raw);
 
             if self
-                .serialized_writer_token
-                .compare_exchange(token, 0, Ordering::AcqRel, Ordering::Acquire)
+                .serialized_writer_txn_id
+                .compare_exchange(writer_txn_id_raw, 0, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
-                // Clear auxiliary fields after token is zeroed.
+                // Clear auxiliary fields after the writer txn id is zeroed.
                 self.serialized_writer_pid.store(0, Ordering::Release);
                 self.serialized_writer_pid_birth.store(0, Ordering::Release);
                 self.serialized_writer_lease_expiry
                     .store(0, Ordering::Release);
 
-                tracing::info!(token, "cleared stale serialized writer indicator via CAS");
+                tracing::info!(
+                    writer_txn_id_raw,
+                    "cleared stale serialized writer indicator via CAS"
+                );
                 return Ok(());
             }
 
@@ -960,7 +966,7 @@ mod tests {
             offsets::SCHEMA_EPOCH,
             offsets::ECS_EPOCH,
             offsets::GC_HORIZON,
-            offsets::SERIALIZED_WRITER_TOKEN,
+            offsets::SERIALIZED_WRITER_TXN_ID,
             offsets::SERIALIZED_WRITER_PID_BIRTH,
             offsets::SERIALIZED_WRITER_LEASE_EXPIRY,
             offsets::LOCK_TABLE_OFFSET,
@@ -1230,16 +1236,16 @@ mod tests {
 
         assert!(layout.acquire_serialized_writer(42, 1234, 999, 10_000));
         assert!(layout.release_serialized_writer(42));
-        // Second release with same token should fail (already cleared).
+        // Second release with the same writer_txn_id should fail (already cleared).
         assert!(!layout.release_serialized_writer(42));
     }
 
     #[test]
-    fn test_serialized_writer_blocks_second_token() {
+    fn test_serialized_writer_blocks_second_writer_txn_id() {
         let layout = SharedMemoryLayout::new(PageSize::DEFAULT, 64);
 
         assert!(layout.acquire_serialized_writer(42, 1234, 999, 10_000));
-        // Another token should be blocked.
+        // Another writer_txn_id should be blocked.
         assert!(!layout.acquire_serialized_writer(99, 5678, 888, 10_000));
         // Original can still release.
         assert!(layout.release_serialized_writer(42));
@@ -1313,12 +1319,12 @@ mod tests {
         let res = layout.check_serialized_writer_exclusion_with_hook(
             now,
             |_pid, _birth| true,
-            &mut |token| {
+            &mut |writer_txn_id| {
                 if injected {
                     return;
                 }
                 injected = true;
-                assert_eq!(token, 42);
+                assert_eq!(writer_txn_id, 42);
                 assert!(layout.release_serialized_writer(42));
                 assert!(layout.acquire_serialized_writer(99, 5678, 888, now + 10_000));
             },
@@ -1465,7 +1471,7 @@ mod tests {
         let layout = SharedMemoryLayout::new(PageSize::DEFAULT, 64);
         assert!(
             layout.check_serialized_writer().is_none(),
-            "token=0 must mean no active serialized writer"
+            "writer_txn_id=0 must mean no active serialized writer"
         );
     }
 

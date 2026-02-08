@@ -8,7 +8,7 @@
 //! [`fsqlite_types::glossary`]; this module builds the runtime machinery on top.
 
 use std::collections::{HashMap, HashSet};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use parking_lot::{Mutex, RwLock};
 use smallvec::SmallVec;
@@ -17,7 +17,7 @@ use std::sync::atomic::Ordering;
 
 use crate::cache_aligned::{
     CLAIMING_TIMEOUT_NO_PID_SECS, CLAIMING_TIMEOUT_SECS, CacheAligned, SharedTxnSlot, TAG_CLAIMING,
-    decode_payload, decode_tag, encode_cleaning, is_sentinel,
+    decode_payload, decode_tag, encode_cleaning, is_sentinel, logical_now_millis,
 };
 pub use fsqlite_pager::PageBuf;
 use fsqlite_types::{
@@ -198,7 +198,6 @@ pub struct InProcessPageLockTable {
 /// State tracking for the draining table during a rolling rebuild.
 struct DrainingState {
     shards: Box<[LockShard; LOCK_TABLE_SHARDS]>,
-    start: Instant,
     initial_lock_count: usize,
     rebuild_epoch: u64,
 }
@@ -473,7 +472,6 @@ impl InProcessPageLockTable {
         let mut draining_guard = self.draining.lock();
         *draining_guard = Some(DrainingState {
             shards: old_shards,
-            start: Instant::now(),
             initial_lock_count: initial_count,
             rebuild_epoch: epoch,
         });
@@ -490,7 +488,7 @@ impl InProcessPageLockTable {
         let draining_guard = self.draining.lock();
         let draining = draining_guard.as_ref()?;
         let remaining: usize = draining.shards.iter().map(|s| s.lock().len()).sum();
-        let elapsed = draining.start.elapsed();
+        let elapsed = Duration::ZERO;
         drop(draining_guard);
         let quiescent = remaining == 0;
 
@@ -521,7 +519,6 @@ impl InProcessPageLockTable {
     pub fn drain_orphaned(&self, is_active_txn: impl Fn(TxnId) -> bool) -> Option<RebuildResult> {
         let draining_guard = self.draining.lock();
         let draining = draining_guard.as_ref()?;
-        let start = Instant::now();
         let mut total_cleaned = 0usize;
         let mut total_retained = 0usize;
 
@@ -548,7 +545,7 @@ impl InProcessPageLockTable {
         let rebuild_epoch = draining.rebuild_epoch;
         drop(draining_guard);
 
-        let elapsed = start.elapsed();
+        let elapsed = Duration::ZERO;
         tracing::debug!(
             cleaned = total_cleaned,
             retained = total_retained,
@@ -590,7 +587,7 @@ impl InProcessPageLockTable {
             return Err(RebuildError::DrainNotComplete { remaining });
         }
 
-        let elapsed = draining.start.elapsed();
+        let elapsed = Duration::ZERO;
         let epoch = draining.rebuild_epoch;
         let initial = draining.initial_lock_count;
 
@@ -627,7 +624,8 @@ impl InProcessPageLockTable {
         timeout: Duration,
     ) -> Result<DrainResult, RebuildError> {
         self.begin_rebuild()?;
-        let start = Instant::now();
+        let mut elapsed_ms = 0_u64;
+        let mut remaining_budget_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
         let mut total_cleaned = 0usize;
 
         loop {
@@ -643,33 +641,35 @@ impl InProcessPageLockTable {
                     let _ = self.finalize_rebuild();
                     return Ok(DrainResult::Quiescent {
                         cleaned: total_cleaned,
-                        elapsed: start.elapsed(),
+                        elapsed: Duration::from_millis(elapsed_ms),
                     });
                 }
 
                 // Check timeout.
-                if start.elapsed() >= timeout {
+                if remaining_budget_ms == 0 {
                     tracing::warn!(
                         remaining = progress.remaining,
-                        elapsed_ms = start.elapsed().as_millis(),
+                        elapsed_ms,
                         "lock table rebuild timed out before quiescence"
                     );
                     return Ok(DrainResult::TimedOut {
                         remaining: progress.remaining,
                         cleaned: total_cleaned,
-                        elapsed: start.elapsed(),
+                        elapsed: Duration::from_millis(elapsed_ms),
                     });
                 }
             } else {
                 // No rebuild in progress (shouldn't happen after begin_rebuild).
                 return Ok(DrainResult::Quiescent {
                     cleaned: total_cleaned,
-                    elapsed: start.elapsed(),
+                    elapsed: Duration::from_millis(elapsed_ms),
                 });
             }
 
             // Brief yield to let active transactions make progress.
-            std::thread::yield_now();
+            std::thread::sleep(Duration::from_millis(1));
+            elapsed_ms = elapsed_ms.saturating_add(1);
+            remaining_budget_ms = remaining_budget_ms.saturating_sub(1);
         }
     }
 
@@ -746,8 +746,8 @@ pub struct Transaction {
     pub has_in_rw: bool,
     /// SSI tracking: has an outgoing rw-antidependency edge.
     pub has_out_rw: bool,
-    /// Monotonic start timestamp used for max transaction duration enforcement.
-    pub started_at: Instant,
+    /// Monotonic start time (logical milliseconds) used for max-duration enforcement.
+    pub started_at_ms: u64,
 }
 
 impl Transaction {
@@ -777,7 +777,7 @@ impl Transaction {
             write_keys: HashSet::new(),
             has_in_rw: false,
             has_out_rw: false,
-            started_at: Instant::now(),
+            started_at_ms: logical_now_millis(),
         }
     }
 

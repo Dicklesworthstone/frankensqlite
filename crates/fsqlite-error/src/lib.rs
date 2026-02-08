@@ -141,7 +141,9 @@ pub enum FrankenError {
     BusyRecovery,
 
     /// BEGIN CONCURRENT is not available without fsqlite-shm (§5.6.6.2).
-    #[error("BEGIN CONCURRENT unavailable: fsqlite-shm not present (multi-writer MVCC requires shared memory coordination)")]
+    #[error(
+        "BEGIN CONCURRENT unavailable: fsqlite-shm not present (multi-writer MVCC requires shared memory coordination)"
+    )]
     ConcurrentUnavailable,
 
     // === Type Errors ===

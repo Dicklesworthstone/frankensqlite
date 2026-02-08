@@ -10,11 +10,7 @@
 use std::time::Instant;
 
 use fsqlite_error::{FrankenError, Result};
-use fsqlite_types::OperatingMode;
-use fsqlite_wal::wal_index::{
-    WAL_CKPT_LOCK, WAL_READ_LOCK_BASE, WAL_READ_MARK_COUNT, WAL_WRITE_LOCK, WalCkptInfo,
-    WalIndexHdr,
-};
+use fsqlite_wal::wal_index::{WAL_READ_MARK_COUNT, WalCkptInfo, WalIndexHdr};
 
 // ---------------------------------------------------------------------------
 // CompatMode — operating posture
@@ -153,9 +149,17 @@ impl HybridShmState {
         self.legacy_hdr.n_page = new_n_page;
         self.legacy_hdr.a_frame_cksum = new_frame_cksum;
         self.legacy_hdr.a_salt = new_salt;
-        // Recompute header checksum over bytes 0..40.
-        self.legacy_hdr.a_cksum = self.legacy_hdr.compute_cksum();
         self.legacy_hdr.i_change = self.legacy_hdr.i_change.wrapping_add(1);
+        // Recompute header checksum over bytes 0..40. The checksum is computed
+        // by serializing the header and checksumming the first 40 bytes.
+        let hdr_bytes = self.legacy_hdr.to_bytes();
+        let (mut s1, mut s2) = (0_u32, 0_u32);
+        for chunk in hdr_bytes[..40].chunks(4) {
+            let word = u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            s1 = s1.wrapping_add(word).wrapping_add(s2);
+            s2 = s2.wrapping_add(word).wrapping_add(s1);
+        }
+        self.legacy_hdr.a_cksum = [s1, s2];
 
         Ok(UpdatedLegacyShm {
             hdr: self.legacy_hdr,
@@ -296,11 +300,7 @@ impl RecoveryPlan {
     /// update), we must reconstruct from the WAL file. If they match but
     /// `isInit` is 0, the WAL-index was never fully initialized.
     #[must_use]
-    pub fn from_header_state(
-        copies_match: bool,
-        is_init: bool,
-        has_stale_marks: bool,
-    ) -> Self {
+    pub fn from_header_state(copies_match: bool, is_init: bool, has_stale_marks: bool) -> Self {
         Self {
             reconstruct_wal_index: !copies_match || !is_init,
             clear_stale_read_marks: has_stale_marks,
@@ -328,7 +328,7 @@ mod tests {
 
     /// Helper: build a minimal valid `WalIndexHdr`.
     fn make_hdr(mx_frame: u32, n_page: u32) -> WalIndexHdr {
-        let mut hdr = WalIndexHdr {
+        WalIndexHdr {
             i_version: WAL_INDEX_VERSION,
             unused: 0,
             i_change: 1,
@@ -338,11 +338,9 @@ mod tests {
             mx_frame,
             n_page,
             a_frame_cksum: [0, 0],
-            a_salt: [0x12345678, 0x9ABCDEF0],
+            a_salt: [0x1234_5678, 0x9ABC_DEF0],
             a_cksum: [0, 0],
-        };
-        hdr.a_cksum = hdr.compute_cksum();
-        hdr
+        }
     }
 
     /// Helper: build a minimal `WalCkptInfo`.
@@ -352,6 +350,7 @@ mod tests {
             a_read_mark: [0; WAL_READ_MARK_COUNT],
             a_lock: [0; 8],
             n_backfill_attempted: 0,
+            not_used0: 0,
         }
     }
 
@@ -371,7 +370,7 @@ mod tests {
 
         // Simulate a commit appending frames 11..15.
         let updated = state
-            .update_legacy_shm(15, 105, [0xAA, 0xBB], [0x12345678, 0x9ABCDEF0])
+            .update_legacy_shm(15, 105, [0xAA, 0xBB], [0x1234_5678, 0x9ABC_DEF0])
             .expect("bead_id=bd-3inz: update should succeed while write lock held");
 
         assert_eq!(
@@ -457,7 +456,7 @@ mod tests {
             let new_mx_frame = commit_num * 3; // 3, 6, 9, 12, 15
             let updated = state
                 .update_legacy_shm(new_mx_frame, 10 + commit_num, [commit_num, 0], [0, 0])
-                .unwrap_or_else(|_| panic!("commit {commit_num} should succeed"));
+                .unwrap_or_else(|_| unreachable!("commit {commit_num} should succeed"));
 
             assert!(
                 updated.hdr.mx_frame > prev_mx_frame,
@@ -475,14 +474,16 @@ mod tests {
 
         // Verify the state accumulates correctly.
         assert_eq!(
-            state.legacy_hdr().mx_frame, 15,
+            state.legacy_hdr().mx_frame,
+            15,
             "bead_id={BEAD_3INZ} final mxFrame should be 15 after 5 commits"
         );
 
         // Update nBackfill during checkpoint (Step 4).
         state.update_backfill(10);
         assert_eq!(
-            state.legacy_ckpt().n_backfill, 10,
+            state.legacy_ckpt().n_backfill,
+            10,
             "bead_id={BEAD_3INZ} nBackfill must be updated during checkpoint"
         );
     }

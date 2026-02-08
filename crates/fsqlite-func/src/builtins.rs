@@ -731,21 +731,19 @@ impl ScalarFunction for RandomFunc {
 
 /// Simple deterministic-enough PRNG for SQLite's random().
 fn simple_random_i64() -> i64 {
-    // Use std's random via a simple hash of the current time + counter.
-    // This is NOT cryptographic, matching SQLite's semantics.
+    // Deterministic per-process PRNG (no ambient authority).
+    // Not cryptographic, matching SQLite's random()/randomblob() semantics.
+    //
+    // splitmix64: fast, decent statistical properties, and requires only a u64 state.
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::SystemTime;
 
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let count = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let seed = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map_or(0u64, |d| d.as_nanos() as u64);
-    // Simple xorshift-style mixing
-    let mut x = seed.wrapping_add(count).wrapping_mul(0x517c_c1b7_2722_0a95);
-    x ^= x >> 33;
-    x = x.wrapping_mul(0xff51_afd7_ed55_8ccd);
-    x ^= x >> 33;
+    static STATE: AtomicU64 = AtomicU64::new(0xD1B5_4A32_D192_ED03);
+    let mut x = STATE.fetch_add(0x9E37_79B9_7F4A_7C15, Ordering::Relaxed);
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^= x >> 31;
     x as i64
 }
 
@@ -2613,10 +2611,9 @@ mod tests {
     #[test]
     fn test_randomblob_length() {
         let result = invoke1(&RandomblobFunc, SqliteValue::Integer(16)).unwrap();
-        if let SqliteValue::Blob(b) = result {
-            assert_eq!(b.len(), 16);
-        } else {
-            panic!("expected blob");
+        match result {
+            SqliteValue::Blob(b) => assert_eq!(b.len(), 16),
+            other => unreachable!("expected blob, got {other:?}"),
         }
     }
 
@@ -2625,11 +2622,12 @@ mod tests {
     #[test]
     fn test_zeroblob_length() {
         let result = invoke1(&ZeroblobFunc, SqliteValue::Integer(100)).unwrap();
-        if let SqliteValue::Blob(b) = result {
-            assert_eq!(b.len(), 100);
-            assert!(b.iter().all(|&x| x == 0));
-        } else {
-            panic!("expected blob");
+        match result {
+            SqliteValue::Blob(b) => {
+                assert_eq!(b.len(), 100);
+                assert!(b.iter().all(|&x| x == 0));
+            }
+            other => unreachable!("expected blob, got {other:?}"),
         }
     }
 
@@ -2821,10 +2819,11 @@ mod tests {
     #[test]
     fn test_sqlite_version_format() {
         let result = SqliteVersionFunc.invoke(&[]).unwrap();
-        if let SqliteValue::Text(v) = result {
-            assert_eq!(v.split('.').count(), 3, "version must be N.N.N format");
-        } else {
-            panic!("expected text");
+        match result {
+            SqliteValue::Text(v) => {
+                assert_eq!(v.split('.').count(), 3, "version must be N.N.N format");
+            }
+            other => unreachable!("expected text, got {other:?}"),
         }
     }
 

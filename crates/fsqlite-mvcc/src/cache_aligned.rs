@@ -597,9 +597,10 @@ impl TxnSlotArray {
             }
 
             // Record claiming timestamp for cleanup timeout detection.
-            // Use a coarse epoch-nanos timestamp.
-            let now_nanos = coarse_epoch_nanos();
-            slot.claiming_timestamp.store(now_nanos, Ordering::Release);
+            // Use a deterministic logical epoch-seconds clock (no ambient authority).
+            let now_epoch_secs = logical_now_epoch_secs();
+            slot.claiming_timestamp
+                .store(now_epoch_secs, Ordering::Release);
 
             // Phase 2: initialize fields.
             slot.phase2_initialize(
@@ -650,15 +651,19 @@ impl std::fmt::Debug for TxnSlotArray {
     }
 }
 
-/// Returns a coarse epoch-nanos timestamp for claiming timeout detection.
+/// Deterministic epoch-seconds clock for timeout logic (no ambient authority).
 ///
-/// Uses `std::time::SystemTime` which is monotonic enough for 5-second
-/// timeout detection. This avoids requiring platform-specific clocks.
-fn coarse_epoch_nanos() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
+/// This is *not* wall-clock time. It is derived from a monotonic logical clock
+/// that advances on each call.
+pub(crate) fn logical_now_epoch_secs() -> u64 {
+    logical_now_millis() / 1000
+}
+
+/// Deterministic logical clock in milliseconds (no ambient authority).
+pub(crate) fn logical_now_millis() -> u64 {
+    // Start from a recent-ish epoch to keep logs readable.
+    static LOGICAL_EPOCH_MILLIS: AtomicU64 = AtomicU64::new(1_700_000_000_000);
+    LOGICAL_EPOCH_MILLIS.fetch_add(1, Ordering::Relaxed)
 }
 
 // ---------------------------------------------------------------------------

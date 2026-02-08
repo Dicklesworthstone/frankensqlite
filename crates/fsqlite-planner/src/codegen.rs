@@ -900,37 +900,37 @@ mod tests {
         }]
     }
 
-    fn from_table(name: &str) -> Option<FromClause> {
-        Some(FromClause {
+    fn from_table(name: &str) -> FromClause {
+        FromClause {
             source: TableOrSubquery::Table {
                 name: QualifiedName::bare(name),
                 alias: None,
                 index_hint: None,
             },
             joins: vec![],
-        })
+        }
     }
 
     fn placeholder(n: u32) -> Expr {
         Expr::Placeholder(PlaceholderType::Numbered(n), Span::ZERO)
     }
 
-    fn rowid_eq_param() -> Option<Box<Expr>> {
-        Some(Box::new(Expr::BinaryOp {
+    fn rowid_eq_param() -> Box<Expr> {
+        Box::new(Expr::BinaryOp {
             left: Box::new(Expr::Column(ColumnRef::bare("rowid"), Span::ZERO)),
             op: AstBinaryOp::Eq,
             right: Box::new(placeholder(1)),
             span: Span::ZERO,
-        }))
+        })
     }
 
-    fn col_eq_param(col: &str, n: u32) -> Option<Box<Expr>> {
-        Some(Box::new(Expr::BinaryOp {
+    fn col_eq_param(col: &str, n: u32) -> Box<Expr> {
+        Box::new(Expr::BinaryOp {
             left: Box::new(Expr::Column(ColumnRef::bare(col), Span::ZERO)),
             op: AstBinaryOp::Eq,
             right: Box::new(placeholder(n)),
             span: Span::ZERO,
-        }))
+        })
     }
 
     fn simple_select(
@@ -950,7 +950,7 @@ mod tests {
                             alias: None,
                         })
                         .collect(),
-                    from: from_table(table),
+                    from: Some(from_table(table)),
                     where_clause,
                     group_by: vec![],
                     having: None,
@@ -970,7 +970,7 @@ mod tests {
                 select: SelectCore::Select {
                     distinct: Distinctness::All,
                     columns: vec![ResultColumn::Star],
-                    from: from_table(table),
+                    from: Some(from_table(table)),
                     where_clause: None,
                     group_by: vec![],
                     having: None,
@@ -1002,7 +1002,7 @@ mod tests {
     // === Test 1: SELECT by rowid ===
     #[test]
     fn test_codegen_select_by_rowid() {
-        let stmt = simple_select(&["b"], "t", rowid_eq_param());
+        let stmt = simple_select(&["b"], "t", Some(rowid_eq_param()));
         let schema = test_schema();
         let ctx = CodegenContext::default();
         let mut b = ProgramBuilder::new();
@@ -1180,7 +1180,7 @@ mod tests {
     // === Test 5: Label resolution ===
     #[test]
     fn test_codegen_label_resolution() {
-        let stmt = simple_select(&["a"], "t", rowid_eq_param());
+        let stmt = simple_select(&["a"], "t", Some(rowid_eq_param()));
         let schema = test_schema();
         let ctx = CodegenContext::default();
         let mut b = ProgramBuilder::new();
@@ -1197,7 +1197,7 @@ mod tests {
                     op.p2
                 );
                 assert!(
-                    (op.p2 as usize) <= prog.len(),
+                    usize::try_from(op.p2).unwrap() <= prog.len(),
                     "jump target out of range at {:?}: p2 = {} (prog len = {})",
                     op.opcode,
                     op.p2,
@@ -1327,7 +1327,7 @@ mod tests {
     // === Test 9: SELECT with index ===
     #[test]
     fn test_codegen_select_with_index() {
-        let stmt = simple_select(&["a"], "t", col_eq_param("b", 1));
+        let stmt = simple_select(&["a"], "t", Some(col_eq_param("b", 1)));
         let schema = test_schema_with_index();
         let ctx = CodegenContext::default();
         let mut b = ProgramBuilder::new();
@@ -1335,12 +1335,12 @@ mod tests {
         let prog = b.finish().unwrap();
 
         // Should use OpenRead on both table and index.
-        let open_reads: Vec<_> = prog
+        let open_reads = prog
             .ops()
             .iter()
             .filter(|op| op.opcode == Opcode::OpenRead)
-            .collect();
-        assert_eq!(open_reads.len(), 2, "should open both table and index");
+            .count();
+        assert_eq!(open_reads, 2, "should open both table and index");
 
         // Should have SeekGE + IdxRowid + SeekRowid pattern.
         assert!(has_opcodes(

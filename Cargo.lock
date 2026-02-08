@@ -553,6 +553,7 @@ dependencies = [
  "parking_lot",
  "proptest",
  "serde",
+ "serde_json",
  "smallvec",
  "tracing",
  "xxhash-rust",
@@ -562,11 +563,13 @@ dependencies = [
 name = "fsqlite-pager"
 version = "0.1.0"
 dependencies = [
+ "asupersync",
  "fsqlite-error",
  "fsqlite-types",
  "fsqlite-vfs",
  "parking_lot",
  "proptest",
+ "tempfile",
  "xxhash-rust",
 ]
 
@@ -587,6 +590,7 @@ dependencies = [
  "fsqlite-ast",
  "fsqlite-error",
  "fsqlite-types",
+ "fsqlite-vdbe",
  "tracing",
 ]
 

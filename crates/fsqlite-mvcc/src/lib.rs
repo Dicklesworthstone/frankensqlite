@@ -14,6 +14,7 @@ pub mod shared_lock_table;
 pub mod shm;
 pub mod witness_hierarchy;
 pub mod witness_plane;
+pub mod witness_publication;
 pub mod xor_delta;
 
 pub use cache_aligned::{
@@ -56,6 +57,11 @@ pub use witness_hierarchy::{
     range_key_bucket_index, witness_key_canonical_bytes, witness_key_hash,
 };
 pub use witness_plane::{WitnessSet, validate_txn_token, witness_keys_overlap};
+pub use witness_publication::{
+    ActiveSlotSnapshot, CommitMarkerStore, CommittedPublication, DefaultProofValidator,
+    GcEligibility, ProofCarryingCommit, ProofCarryingValidator, PublicationError, PublicationPhase,
+    ReservationId, ReservationToken, ValidationVerdict, WitnessGcCoordinator, WitnessPublisher,
+};
 pub use xor_delta::{
     DEFAULT_DELTA_THRESHOLD_PCT, DELTA_FIXED_OVERHEAD_BYTES, DELTA_HEADER_BYTES, DELTA_MAGIC,
     DELTA_RUN_HEADER_BYTES, DELTA_SPARSE_OVERHEAD_PCT, DELTA_VERSION, DeltaEncoding, DeltaError,

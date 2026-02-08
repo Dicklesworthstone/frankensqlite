@@ -269,7 +269,6 @@ impl PageBufPool {
             pool: Some(Arc::clone(&self.inner)),
         })
     }
-    }
 
     /// The page size (in bytes) this pool serves.
     #[inline]
@@ -435,7 +434,10 @@ mod tests {
 
         let b1 = pool.acquire().unwrap();
         let b2 = pool.acquire().unwrap();
-        assert!(pool.acquire().is_err(), "pool must enforce max_buffers bound");
+        assert!(
+            pool.acquire().is_err(),
+            "pool must enforce max_buffers bound"
+        );
 
         drop(b1);
         drop(b2);

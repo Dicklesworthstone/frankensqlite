@@ -13,7 +13,7 @@
 //! - Maximum load factor: 0.70 (Knuth Vol. 3 analysis for linear probing)
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tracing::{debug, info, warn};
 
@@ -728,7 +728,8 @@ impl SharedPageLockTable {
         is_active_txn: impl Fn(u64) -> bool,
         timeout: Duration,
     ) -> Result<RebuildResult, RebuildLeaseError> {
-        let start = Instant::now();
+        let mut elapsed_ms = 0_u64;
+        let mut remaining_budget_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
 
         // Step 1: Acquire lease.
         self.acquire_rebuild_lease(pid, pid_birth, now_secs)?;
@@ -756,7 +757,7 @@ impl SharedPageLockTable {
             }
 
             // Check timeout.
-            if start.elapsed() > timeout {
+            if remaining_budget_ms == 0 {
                 // Cancel: must still finalize if quiescent, otherwise
                 // leave drain in progress for next attempt.
                 if let Some(status) = self.drain_progress() {
@@ -768,7 +769,7 @@ impl SharedPageLockTable {
                     return Ok(RebuildResult {
                         cleared: 0,
                         orphaned_cleaned,
-                        elapsed: start.elapsed(),
+                        elapsed: Duration::from_millis(elapsed_ms),
                         epoch: self.rebuild_epoch.load(Ordering::Acquire),
                         timed_out: true,
                     });
@@ -777,7 +778,9 @@ impl SharedPageLockTable {
             }
 
             // Brief yield to let transactions release locks.
-            std::thread::yield_now();
+            std::thread::sleep(Duration::from_millis(1));
+            elapsed_ms = elapsed_ms.saturating_add(1);
+            remaining_budget_ms = remaining_budget_ms.saturating_sub(1);
         }
 
         // Steps 4+5: Clear and finalize.
@@ -787,7 +790,7 @@ impl SharedPageLockTable {
         Ok(RebuildResult {
             cleared,
             orphaned_cleaned,
-            elapsed: start.elapsed(),
+            elapsed: Duration::from_millis(elapsed_ms),
             epoch: self.rebuild_epoch.load(Ordering::Acquire),
             timed_out: false,
         })

@@ -257,12 +257,77 @@ mod tests {
         (cx, file)
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_spawn_blocking_io_read_page() {
-        // Current pager path is synchronous but already enforces the same
-        // ownership contract required by blocking dispatch: read directly into
-        // pool-owned PageBuf with no intermediate allocation.
-        test_vfs_read_no_intermediate_alloc();
+        use asupersync::runtime::{RuntimeBuilder, spawn_blocking_io};
+        use std::io::{ErrorKind, Write as _};
+        use std::os::unix::fs::FileExt as _;
+        use std::sync::Arc;
+        use tempfile::NamedTempFile;
+
+        fn read_exact_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+            let mut total = 0_usize;
+            while total < buf.len() {
+                #[allow(clippy::cast_possible_truncation)]
+                let off = offset + total as u64;
+                let n = file.read_at(&mut buf[total..], off)?;
+                if n == 0 {
+                    return Err(std::io::Error::new(ErrorKind::UnexpectedEof, "short read"));
+                }
+                total += n;
+            }
+            Ok(())
+        }
+
+        let mut tmp = NamedTempFile::new().unwrap();
+        let page_data: Vec<u8> = (0..4096u16)
+            .map(|i| u8::try_from(i % 256).expect("i % 256 fits in u8"))
+            .collect();
+        tmp.as_file_mut().write_all(&page_data).unwrap();
+        tmp.as_file_mut().flush().unwrap();
+
+        let file = Arc::new(tmp.reopen().unwrap());
+        let pool = PageBufPool::new(PageSize::DEFAULT, 1);
+
+        let rt = RuntimeBuilder::low_latency()
+            .worker_threads(1)
+            .blocking_threads(1, 1)
+            .build()
+            .unwrap();
+
+        let join = rt.handle().spawn(async move {
+            let worker_tid = std::thread::current().id();
+
+            let mut buf = pool.acquire().unwrap();
+            let file2 = Arc::clone(&file);
+            let (buf, io_tid) = spawn_blocking_io(move || {
+                let io_tid = std::thread::current().id();
+                read_exact_at(file2.as_ref(), buf.as_mut_slice(), 0)?;
+                Ok::<_, std::io::Error>((buf, io_tid))
+            })
+            .await
+            .unwrap();
+
+            assert_ne!(
+                io_tid, worker_tid,
+                "spawn_blocking_io must dispatch work to a blocking thread"
+            );
+            assert_eq!(
+                buf.as_slice(),
+                page_data.as_slice(),
+                "bead_id={BEAD_ID} case=spawn_blocking_io_read_page data mismatch"
+            );
+
+            drop(buf);
+            assert_eq!(
+                pool.available(),
+                1,
+                "bead_id={BEAD_ID} case=spawn_blocking_io_read_page buf must return to pool"
+            );
+        });
+
+        rt.block_on(join);
     }
 
     #[test]
@@ -276,29 +341,90 @@ mod tests {
     }
 
     #[test]
-    fn test_cancel_mid_io_returns_buf_to_pool() {
-        // Simulate cancellation by cancelling Cx before a read.
-        // read_page acquires a buffer first; on read failure the buffer must be
-        // dropped and returned to the pool (no leak).
-        let cx_open = Cx::new();
-        let vfs = MemoryVfs::new();
-        let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
-        let (mut file, _) = vfs
-            .open(&cx_open, Some(Path::new("cancel.db")), flags)
-            .unwrap();
-        let cx_cancelled = Cx::new();
-        cx_cancelled.cancel();
+    fn test_blocking_pool_lab_mode_inline() {
+        use asupersync::lab::{LabConfig, LabRuntime};
+        use asupersync::runtime::spawn_blocking_io;
+        use asupersync::types::Budget;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
 
-        let pool = PageBufPool::new(PageSize::DEFAULT, 4);
-        let mut cache = PageCache::with_pool(pool.clone(), PageSize::DEFAULT);
-        assert_eq!(pool.available(), 0);
-        let result = cache.read_page(&cx_cancelled, &mut file, PageNumber::ONE);
-        assert!(result.is_err(), "cancelled Cx should abort the read");
-        assert_eq!(
-            pool.available(),
-            1,
-            "failed/cancelled read must return acquired buffer to pool"
+        let mut rt = LabRuntime::new(LabConfig::new(42));
+        let region = rt.state.create_root_region(Budget::INFINITE);
+
+        let ok = Arc::new(AtomicBool::new(false));
+        let ok_task = Arc::clone(&ok);
+
+        let (task_id, _handle) = rt
+            .state
+            .create_task(region, Budget::INFINITE, async move {
+                let worker_tid = std::thread::current().id();
+                let io_tid =
+                    spawn_blocking_io(|| Ok::<_, std::io::Error>(std::thread::current().id()))
+                        .await
+                        .unwrap();
+                ok_task.store(worker_tid == io_tid, Ordering::Release);
+            })
+            .unwrap();
+
+        rt.scheduler.lock().unwrap().schedule(task_id, 0);
+        rt.run_until_quiescent();
+
+        assert!(
+            ok.load(Ordering::Acquire),
+            "spawn_blocking_io must execute inline when no blocking pool exists (lab determinism)"
         );
+    }
+
+    #[test]
+    fn test_cancel_mid_io_returns_buf_to_pool() {
+        use asupersync::runtime::{RuntimeBuilder, spawn_blocking_io, yield_now};
+        use std::future::poll_fn;
+        use std::task::Poll;
+        use std::time::Duration;
+
+        let rt = RuntimeBuilder::low_latency()
+            .worker_threads(1)
+            .blocking_threads(1, 1)
+            .build()
+            .unwrap();
+
+        let pool = PageBufPool::new(PageSize::DEFAULT, 1);
+        let join = rt.handle().spawn(async move {
+            let buf = pool.acquire().unwrap();
+
+            let mut fut = Box::pin(spawn_blocking_io(move || {
+                std::thread::sleep(Duration::from_millis(20));
+                Ok::<_, std::io::Error>(buf)
+            }));
+
+            // Poll once to ensure the blocking task is enqueued, then drop the
+            // future (soft cancel). The owned PageBuf must be returned to the pool.
+            let mut polled = false;
+            poll_fn(|cx| {
+                if !polled {
+                    polled = true;
+                    let _ = fut.as_mut().poll(cx);
+                }
+                Poll::Ready(())
+            })
+            .await;
+
+            drop(fut);
+
+            for _ in 0..10_000u32 {
+                if pool.available() == 1 {
+                    break;
+                }
+                yield_now().await;
+            }
+            assert_eq!(
+                pool.available(),
+                1,
+                "bead_id={BEAD_ID} case=cancel_mid_io_returns_buf_to_pool"
+            );
+        });
+
+        rt.block_on(join);
     }
 
     #[test]

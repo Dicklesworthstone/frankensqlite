@@ -15,7 +15,9 @@ parking_lot = { workspace = true }
 xxhash-rust = { workspace = true }
 
 [dev-dependencies]
+asupersync = { path = "/dp/asupersync" }
 proptest = { workspace = true }
+tempfile = { workspace = true }
 
 [lints]
 workspace = true
