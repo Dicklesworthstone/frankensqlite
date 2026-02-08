@@ -17,8 +17,8 @@ use smallvec::SmallVec;
 use std::sync::atomic::Ordering;
 
 use crate::cache_aligned::{
-    CLAIMING_TIMEOUT_NO_PID_SECS, CLAIMING_TIMEOUT_SECS, CacheAligned, SharedTxnSlot, TAG_CLAIMING,
-    decode_payload, decode_tag, encode_cleaning, is_sentinel,
+    decode_payload, decode_tag, encode_cleaning, is_sentinel, CacheAligned, SharedTxnSlot,
+    CLAIMING_TIMEOUT_NO_PID_SECS, CLAIMING_TIMEOUT_SECS, TAG_CLAIMING,
 };
 use fsqlite_types::{
     CommitSeq, IntentLog, PageData, PageNumber, PageSize, PageVersion, Snapshot, TxnEpoch, TxnId,
@@ -775,6 +775,8 @@ pub struct Transaction {
     pub has_in_rw: bool,
     /// SSI tracking: has an outgoing rw-antidependency edge.
     pub has_out_rw: bool,
+    /// Monotonic start timestamp used for max transaction duration enforcement.
+    pub started_at: Instant,
 }
 
 impl Transaction {
@@ -804,6 +806,7 @@ impl Transaction {
             write_keys: HashSet::new(),
             has_in_rw: false,
             has_out_rw: false,
+            started_at: Instant::now(),
         }
     }
 
@@ -2806,8 +2809,8 @@ mod tests {
     const BEAD_22N13: &str = "bd-22n.13";
 
     use crate::cache_aligned::{
-        CLAIMING_TIMEOUT_NO_PID_SECS, CLAIMING_TIMEOUT_SECS, TAG_CLEANING, encode_claiming,
-        encode_cleaning,
+        encode_claiming, encode_cleaning, CLAIMING_TIMEOUT_NO_PID_SECS, CLAIMING_TIMEOUT_SECS,
+        TAG_CLEANING,
     };
 
     /// Helper: create a slot with a real (non-sentinel) TxnId and begin_seq.

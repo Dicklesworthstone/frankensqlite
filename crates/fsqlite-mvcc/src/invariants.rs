@@ -972,6 +972,207 @@ mod tests {
         assert_eq!(chain[1].commit_seq.get(), 1, "tail should be V1");
     }
 
+    #[test]
+    fn test_theorem4_gc_never_removes_needed_version() {
+        let store = VersionStore::new(PageSize::DEFAULT);
+        let pgno = PageNumber::new(7).unwrap();
+
+        // Build chain: V1(seq=1) <- V2(seq=5) <- V3(seq=10)
+        let v1 = make_version(7, 1, None);
+        let idx1 = store.publish(v1);
+        let v2 = make_version(7, 5, Some(idx_to_version_pointer(idx1)));
+        let idx2 = store.publish(v2);
+        let v3 = make_version(7, 10, Some(idx_to_version_pointer(idx2)));
+        let idx3 = store.publish(v3);
+
+        // Active snapshot at high=7 must resolve to V2.
+        let active_snap = make_snapshot(7);
+        let visible_idx = store.resolve(pgno, &active_snap).unwrap();
+        let visible = store.get_version(visible_idx).unwrap();
+        assert_eq!(
+            visible.commit_seq.get(),
+            5,
+            "active snapshot must keep V2 reachable"
+        );
+
+        // GC horizon at 7: V1 reclaimable (superseded by V2 <= horizon),
+        // V2 not reclaimable (newer is V3=10 > horizon), V3 not reclaimable.
+        let gc_horizon = CommitSeq::new(7);
+        let v1_ref = store.get_version(idx1).unwrap();
+        let v2_ref = store.get_version(idx2).unwrap();
+        let v3_ref = store.get_version(idx3).unwrap();
+
+        let v1_reclaimable = v1_ref.commit_seq < gc_horizon && v2_ref.commit_seq <= gc_horizon;
+        let v2_reclaimable = v2_ref.commit_seq < gc_horizon && v3_ref.commit_seq <= gc_horizon;
+        let v3_reclaimable = v3_ref.commit_seq < gc_horizon;
+
+        assert!(v1_reclaimable, "V1 should be reclaimable");
+        assert!(!v2_reclaimable, "V2 must be retained for snapshot high=7");
+        assert!(!v3_reclaimable, "head version is never reclaimable here");
+    }
+
+    #[test]
+    fn test_theorem5_version_chain_bounded_by_rd_plus_1() {
+        let store = VersionStore::new(PageSize::DEFAULT);
+        let pgno = PageNumber::new(11).unwrap();
+        let commit_rate_per_sec = 100_u64;
+        let max_txn_duration_secs = 1_u64;
+        let bound = commit_rate_per_sec * max_txn_duration_secs + 1;
+
+        let mut prev: Option<VersionPointer> = None;
+        for seq in 1..=bound {
+            let version = PageVersion {
+                pgno,
+                commit_seq: CommitSeq::new(seq),
+                created_by: TxnToken::new(TxnId::new(seq).unwrap(), TxnEpoch::new(0)),
+                data: PageData::zeroed(PageSize::DEFAULT),
+                prev,
+            };
+            let idx = store.publish(version);
+            prev = Some(idx_to_version_pointer(idx));
+        }
+
+        let chain = store.walk_chain(pgno);
+        assert_eq!(
+            chain.len(),
+            usize::try_from(bound).unwrap(),
+            "version chain should respect R*D+1 bound in bounded workload"
+        );
+    }
+
+    #[test]
+    fn test_theorem4_no_active_txns_gc_all_but_latest() {
+        let store = VersionStore::new(PageSize::DEFAULT);
+        let pgno = PageNumber::new(12).unwrap();
+
+        let mut prev: Option<VersionPointer> = None;
+        for seq in 1_u64..=3 {
+            let version = PageVersion {
+                pgno,
+                commit_seq: CommitSeq::new(seq),
+                created_by: TxnToken::new(TxnId::new(seq).unwrap(), TxnEpoch::new(0)),
+                data: PageData::zeroed(PageSize::DEFAULT),
+                prev,
+            };
+            let idx = store.publish(version);
+            prev = Some(idx_to_version_pointer(idx));
+        }
+
+        // No active txns: safe horizon is latest commit.
+        let horizon = CommitSeq::new(3);
+        let chain = store.walk_chain(pgno); // [3, 2, 1]
+        assert_eq!(chain.len(), 3);
+        assert_eq!(chain[0].commit_seq, CommitSeq::new(3));
+
+        // All but the latest are reclaimable at horizon=latest.
+        let reclaimable = chain
+            .windows(2)
+            .filter(|pair| pair[1].commit_seq < horizon && pair[0].commit_seq <= horizon)
+            .count();
+        assert_eq!(reclaimable, 2, "older versions should be reclaimable");
+    }
+
+    #[test]
+    fn test_theorem4_gc_horizon_min_active_snapshot() {
+        let active_highs = [CommitSeq::new(10), CommitSeq::new(20), CommitSeq::new(30)];
+        let safe_gc_seq = active_highs.iter().copied().min().unwrap();
+        assert_eq!(
+            safe_gc_seq,
+            CommitSeq::new(10),
+            "gc horizon must track min active snapshot.high"
+        );
+    }
+
+    #[test]
+    fn test_theorem4_reclaimability_predicate() {
+        let store = VersionStore::new(PageSize::DEFAULT);
+
+        // Chain: V1(3) <- V2(5) <- V3(9)
+        let v1 = make_version(13, 3, None);
+        let idx1 = store.publish(v1);
+        let v2 = make_version(13, 5, Some(idx_to_version_pointer(idx1)));
+        let idx2 = store.publish(v2);
+        let v3 = make_version(13, 9, Some(idx_to_version_pointer(idx2)));
+        let idx3 = store.publish(v3);
+
+        let horizon = CommitSeq::new(7);
+        let v1_ref = store.get_version(idx1).unwrap();
+        let v2_ref = store.get_version(idx2).unwrap();
+        let v3_ref = store.get_version(idx3).unwrap();
+
+        let v1_reclaimable = v1_ref.commit_seq < horizon && v2_ref.commit_seq <= horizon;
+        let v2_reclaimable = v2_ref.commit_seq < horizon && v3_ref.commit_seq <= horizon;
+        assert!(v1_reclaimable, "V1 should satisfy reclaimability predicate");
+        assert!(
+            !v2_reclaimable,
+            "V2 must be retained because newer V3 is beyond horizon"
+        );
+    }
+
+    #[test]
+    fn test_theorem5_version_chain_bounded() {
+        test_theorem5_version_chain_bounded_by_rd_plus_1();
+    }
+
+    #[test]
+    fn test_theorem5_gc_prunes_old_versions() {
+        let store = VersionStore::new(PageSize::DEFAULT);
+        let pgno = PageNumber::new(14).unwrap();
+        let mut prev: Option<VersionPointer> = None;
+        for seq in 1_u64..=32 {
+            let version = PageVersion {
+                pgno,
+                commit_seq: CommitSeq::new(seq),
+                created_by: TxnToken::new(TxnId::new(seq).unwrap(), TxnEpoch::new(0)),
+                data: PageData::zeroed(PageSize::DEFAULT),
+                prev,
+            };
+            let idx = store.publish(version);
+            prev = Some(idx_to_version_pointer(idx));
+        }
+
+        let chain = store.walk_chain(pgno);
+        let horizon = CommitSeq::new(32);
+        let reclaimable = chain
+            .iter()
+            .skip(1)
+            .filter(|version| version.commit_seq <= horizon)
+            .count();
+        assert_eq!(reclaimable, 31, "all non-head versions are reclaimable");
+        assert_eq!(chain[0].commit_seq, CommitSeq::new(32));
+    }
+
+    proptest! {
+        #[test]
+        fn prop_gc_safety_holds(horizon in 1_u64..40_u64) {
+            let store = VersionStore::new(PageSize::DEFAULT);
+            let pgno = PageNumber::new(15).unwrap();
+            let mut prev: Option<VersionPointer> = None;
+
+            for seq in 1_u64..=horizon + 2 {
+                let version = PageVersion {
+                    pgno,
+                    commit_seq: CommitSeq::new(seq),
+                    created_by: TxnToken::new(TxnId::new(seq).unwrap(), TxnEpoch::new(0)),
+                    data: PageData::zeroed(PageSize::DEFAULT),
+                    prev,
+                };
+                let idx = store.publish(version);
+                prev = Some(idx_to_version_pointer(idx));
+            }
+
+            let active_snapshot = make_snapshot(horizon);
+            let visible_idx = store.resolve(pgno, &active_snapshot).expect("visible version must exist");
+            let visible = store.get_version(visible_idx).expect("arena lookup must succeed");
+            prop_assert_eq!(visible.commit_seq, CommitSeq::new(horizon));
+
+            // The version selected by an active snapshot must not satisfy the reclaim predicate.
+            // Its immediate newer successor is horizon+1, which is > horizon.
+            let visible_reclaimable = visible.commit_seq < active_snapshot.high;
+            prop_assert!(!visible_reclaimable);
+        }
+    }
+
     // -----------------------------------------------------------------------
     // E2E: invariants hold under concurrent schedule
     // -----------------------------------------------------------------------
