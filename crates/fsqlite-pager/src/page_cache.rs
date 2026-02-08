@@ -9,6 +9,7 @@
 //! eviction policy lives in a higher-level module (bd-7pu).
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 
 use fsqlite_error::Result;
 use fsqlite_types::cx::Cx;
@@ -16,6 +17,9 @@ use fsqlite_types::{PageNumber, PageSize};
 use fsqlite_vfs::VfsFile;
 
 use crate::page_buf::{PageBuf, PageBufPool};
+
+pub mod arc_cache;
+pub use arc_cache::{AccessOutcome, ArcCache, CacheKey, CachedPage};
 
 // ---------------------------------------------------------------------------
 // PageCache
@@ -53,6 +57,11 @@ impl PageCache {
     /// Create a page cache backed by an existing pool.
     #[must_use]
     pub fn with_pool(pool: PageBufPool, page_size: PageSize) -> Self {
+        debug_assert_eq!(
+            pool.page_size(),
+            page_size.as_usize(),
+            "pool page_size must match cache page_size"
+        );
         Self {
             pool,
             pages: HashMap::new(),
@@ -137,11 +146,11 @@ impl PageCache {
         if !self.pages.contains_key(&page_no) {
             let mut buf = self.pool.acquire();
             let offset = page_offset(page_no, self.page_size);
-            file.read(cx, buf.as_mut_slice(), offset)?;
+            let _ = file.read(cx, buf.as_mut_slice(), offset)?;
             self.pages.insert(page_no, buf);
         }
-        // SAFETY: we just inserted or confirmed the page exists.
-        Ok(self.pages.get(&page_no).map(PageBuf::as_slice).unwrap())
+        // SAFETY (logical): we just ensured the key exists above.
+        Ok(self.pages.get(&page_no).expect("just inserted").as_slice())
     }
 
     /// Write a cached page out to a VFS file.
@@ -163,13 +172,18 @@ impl PageCache {
     ///
     /// Returns a mutable reference so the caller can populate it.
     pub fn insert_fresh(&mut self, page_no: PageNumber) -> &mut [u8] {
-        let buf = self.pool.acquire();
         // Freshly acquired buffers from the pool may contain stale data.
         // Zero the buffer to match the "new page" semantics.
-        self.pages.insert(page_no, buf);
-        let entry = self.pages.get_mut(&page_no).unwrap();
-        entry.as_mut_slice().fill(0);
-        entry.as_mut_slice()
+        let mut buf = self.pool.acquire();
+        buf.as_mut_slice().fill(0);
+
+        match self.pages.entry(page_no) {
+            Entry::Occupied(mut entry) => {
+                entry.insert(buf);
+                entry.into_mut().as_mut_slice()
+            }
+            Entry::Vacant(entry) => entry.insert(buf).as_mut_slice(),
+        }
     }
 
     // --- Eviction ---
