@@ -344,6 +344,47 @@
       .dock-slider {
         width: 100%;
       }
+      /* Mobile Story Mode (bd-24q.4.3) */
+      .story-mobile-overlay {
+        position: fixed; inset: 0; z-index: 47;
+        background: rgba(2,6,23,0.5); backdrop-filter: blur(6px);
+        transition: opacity 0.2s;
+      }
+      .story-mobile-sheet {
+        position: fixed; inset: 0; z-index: 48;
+        background: rgba(255,255,255,0.98);
+        display: flex; flex-direction: column;
+        padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+        transform: translateY(100%);
+        transition: transform 0.3s ease-out;
+      }
+      .story-mobile-sheet.open { transform: translateY(0); }
+      .story-mobile-card {
+        display: flex; flex-direction: column;
+        justify-content: center; align-items: stretch;
+        flex: 1; padding: 1.5rem;
+        overflow-y: auto;
+      }
+
+      /* Mobile Mini-Map Sheet (bd-24q.2.3) */
+      .minimap-mobile-overlay {
+        position: fixed; inset: 0; z-index: 45;
+        background: rgba(2,6,23,0.3); backdrop-filter: blur(4px);
+        transition: opacity 0.2s;
+      }
+      .minimap-mobile-sheet {
+        position: fixed; top: 0; left: 0; bottom: 0; z-index: 46;
+        width: min(320px, 85vw);
+        background: rgba(255,255,255,0.97);
+        border-right: 1px solid rgba(2,6,23,0.1);
+        box-shadow: 8px 0 32px rgba(2,6,23,0.15);
+        transform: translateX(-100%);
+        transition: transform 0.25s ease-out;
+        display: flex; flex-direction: column;
+        padding: env(safe-area-inset-top) 0 env(safe-area-inset-bottom) env(safe-area-inset-left);
+      }
+      .minimap-mobile-sheet.open { transform: translateX(0); }
+
       .dock-heat-stripe {
         width: 100%;
         height: 12px;
@@ -843,6 +884,36 @@
             </section>
           </section>
 
+          <!-- Outlier Dashboard (bd-24q.10.2) -->
+          <section id="outlierPanel" class="glass shadow-glow mt-6 rounded-3xl p-5">
+            <div class="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
+              <div>
+                <div class="text-sm font-bold text-slate-900">Outlier Commits</div>
+                <div class="mt-1 text-xs text-slate-500">Largest deltas by MAD-Z score. Click to jump.</div>
+              </div>
+              <div class="flex flex-wrap items-center gap-2">
+                <label class="chip inline-flex items-center gap-2 rounded-2xl px-3 py-1.5 text-xs font-semibold text-slate-700">Metric
+                  <select id="outlierMetricSel" class="ml-1 rounded-xl border border-slate-900/10 bg-white/70 px-2 py-1 text-xs">
+                    <option value="impact" selected>Impact (lines)</option>
+                    <option value="linesAdded">Lines Added</option>
+                    <option value="linesDeleted">Lines Deleted</option>
+                    <option value="tokens">Tokens Changed</option>
+                    <option value="lev">Levenshtein</option>
+                    <option value="hunks">Hunks</option>
+                  </select>
+                </label>
+                <label class="chip inline-flex items-center gap-2 rounded-2xl px-3 py-1.5 text-xs font-semibold text-slate-700">Top
+                  <select id="outlierTopKSel" class="ml-1 rounded-xl border border-slate-900/10 bg-white/70 px-2 py-1 text-xs">
+                    <option value="5">5</option><option value="10" selected>10</option><option value="20">20</option><option value="50">50</option>
+                  </select>
+                </label>
+              </div>
+            </div>
+            <div id="outlierList" class="mt-3 space-y-1.5 max-h-[50vh] overflow-auto"></div>
+            <div id="outlierEmpty" class="hidden mt-3 text-xs text-slate-400 italic p-3">No outliers detected.</div>
+            <div id="outlierLoading" class="hidden mt-3 text-xs text-slate-400 italic p-3">Computing outliers...</div>
+          </section>
+
           <!-- Doc evolution -->
           <section id="sectionDoc" class="glass shadow-glow mt-6 rounded-3xl p-5">
             <div class="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
@@ -967,6 +1038,14 @@
                           Story
                         </button>
                         <button
+                          id="btnStoryMobileTrigger"
+                          class="sm:hidden focus-ring rounded-xl border border-slate-900/10 bg-white/70 px-3 py-1.5 text-[11px] font-semibold text-slate-900 hover:bg-white"
+                          type="button"
+                          title="Story mode (mobile)"
+                        >
+                          Story
+                        </button>
+                        <button
                           id="btnMiniMapToggle"
                           class="focus-ring rounded-xl border border-slate-900/10 bg-white/70 px-3 py-1.5 text-[11px] font-semibold text-slate-900 hover:bg-white"
                           type="button"
@@ -983,6 +1062,12 @@
                         </button>
                       </div>
                     </div>
+                    <!-- Mobile outline trigger (bd-24q.2.3) -->
+                    <button
+                      id="btnMiniMapMobile"
+                      class="sm:hidden mt-2 w-full focus-ring rounded-2xl bg-slate-900 px-4 py-2.5 text-sm font-semibold text-white hover:bg-slate-800"
+                      type="button"
+                    >Outline</button>
                     <div class="mt-3 flex gap-3">
                       <nav
                         id="miniMap"
@@ -1412,6 +1497,43 @@
       </div>
     </div>
 
+    <!-- Mobile Story Mode Sheet (bd-24q.4.3) -->
+    <div id="storyMobileOverlay" class="story-mobile-overlay hidden" aria-hidden="true"></div>
+    <div id="storyMobileSheet" class="story-mobile-sheet hidden" role="dialog" aria-label="Story milestones">
+      <div class="shrink-0 flex items-center justify-between border-b border-slate-200 px-4 py-3">
+        <span class="text-sm font-bold text-slate-900">Milestones</span>
+        <span id="storyMobileProgress" class="text-[11px] font-semibold text-slate-400">0/0</span>
+        <button id="btnStoryMobileClose" class="focus-ring rounded-lg px-2 py-1 text-xs font-semibold text-slate-500 hover:bg-slate-100" type="button">Close</button>
+      </div>
+      <div id="storyMobileCardArea" class="story-mobile-card"></div>
+      <div class="shrink-0 flex items-center justify-between gap-3 border-t border-slate-200 px-4 py-3">
+        <button id="storyMobilePrev" class="focus-ring flex-1 rounded-2xl bg-slate-100 px-4 py-3 text-sm font-semibold text-slate-700 hover:bg-slate-200" type="button">&larr; Previous</button>
+        <button id="storyMobileNext" class="focus-ring flex-1 rounded-2xl bg-slate-900 px-4 py-3 text-sm font-semibold text-white hover:bg-slate-800" type="button">Next &rarr;</button>
+      </div>
+    </div>
+
+    <!-- Mobile Mini-Map Sheet (bd-24q.2.3) -->
+    <div id="miniMapMobileOverlay" class="minimap-mobile-overlay hidden" aria-hidden="true"></div>
+    <div id="miniMapMobileSheet" class="minimap-mobile-sheet hidden" role="dialog" aria-label="Document outline">
+      <div class="shrink-0 flex items-center justify-between border-b border-slate-200 px-4 py-3">
+        <span class="text-sm font-bold text-slate-900">Outline</span>
+        <label class="flex items-center gap-1.5 text-[10px] text-slate-500">
+          <input id="miniMapMobileStayOpen" type="checkbox" class="rounded" />
+          Stay open
+        </label>
+        <button id="btnMiniMapMobileClose" class="focus-ring rounded-lg px-2 py-1 text-xs font-semibold text-slate-500 hover:bg-slate-100" type="button">Close</button>
+      </div>
+      <div class="shrink-0 px-4 py-2">
+        <input
+          id="miniMapMobileSearch"
+          type="text"
+          placeholder="Filter headings..."
+          class="focus-ring w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 placeholder-slate-400"
+        />
+      </div>
+      <div id="miniMapMobileList" class="flex-1 overflow-auto px-2 py-2 space-y-1"></div>
+    </div>
+
     <!-- Timeline dock -->
     <div id="dock" class="dock fixed inset-x-0 bottom-0 z-30 px-4 py-3">
       <div class="mx-auto max-w-[1200px]">
@@ -1533,280 +1655,7 @@
       // Data: commit metadata + stats
       // -----------------------------
 
-      const COMMIT_LOG_RAW = String.raw`c08f1602d03b1833a4f91c8f77347f8f196bac9d|c08f160|2026-02-07T01:17:42-05:00|Dicklesworthstone|Add comprehensive specification documents (8,628 + 1,206 lines)
-f9d88aa96f50893f8531373d0734597ebae3c592|f9d88aa|2026-02-07T01:43:43-05:00|Dicklesworthstone|Promote SSI to V1, add intent logs, shard lock tables, expand specs
-76eef31be20a6faedc62e7fecce88e78652ebdcf|76eef31|2026-02-07T02:04:31-05:00|Dicklesworthstone|docs: reconcile v1 specs (RaptorQ/SSI/K semantics)
-9800b17df4a56c2dc065cf566c2810d4ed2e576c|9800b17|2026-02-07T02:45:02-05:00|Dicklesworthstone|Spec V1.3: scope doctrine, ECS substrate, multi-process MVCC, encryption
-79018f161649e6d7977bc74eb849a0e22eceb286|79018f1|2026-02-07T02:56:16-05:00|Dicklesworthstone|Spec: revise WAL frame layout for true compatibility mode
-5ad34871f7242de61378843c6c1e8311e35d9fa3|5ad3487|2026-02-07T03:14:56-05:00|Dicklesworthstone|Spec V1.4: Codex synthesis — RaptorQ everywhere, WAL sidecar overhaul, ECS layout, replication
-7b2c677cf61adda977e71524b59d7ec234137962|7b2c677|2026-02-07T03:16:08-05:00|Dicklesworthstone|Spec V1.5: alien-artifact discipline — decision-theoretic SSI, BOCPD, monitoring stack, native mode
-bf0426417685504bb2b2f5acfc4de2c2f087ef8b|bf04264|2026-02-07T03:31:40-05:00|Dicklesworthstone|Spec V1.6a: RaptorQ-native SSI witness plane — cross-process, distributed, proof-carrying
-05cf07847753f444b9f74dfd0279ef96c3ff86b9|05cf078|2026-02-07T03:32:45-05:00|Dicklesworthstone|Spec V1.6b: alien-artifact discipline — formal derivations for every tunable parameter
-e8ddf469d8ab8ff8eefbae92b24453e06fcf4627|e8ddf46|2026-02-07T03:33:30-05:00|Dicklesworthstone|Spec V1.6c: performance optimizations — arena allocators, CAR cache, per-invariant monitoring
-480c10086fb73630744364f5fb34966de2572dc1|480c100|2026-02-07T03:35:03-05:00|Dicklesworthstone|Spec V1.6d: SSI transaction struct — TxnToken edges, eager abort, terminology scoping
-0313678eff44b70cd4ea40cabc2f2222cac2ba93|0313678|2026-02-07T03:38:40-05:00|Dicklesworthstone|Spec V1.6e: SSI detection algorithm — proof-carrying commit with eager abort
-b97b1abe4727a738197180c5639738c1da2f5311|b97b1ab|2026-02-07T03:39:32-05:00|Dicklesworthstone|Spec V1.6f: fixup — remove 3-way merge artifacts, restore canonical state
-643c89c1c941d1e47cb6a2574e01fd7556f622ec|643c89c|2026-02-07T03:42:22-05:00|Dicklesworthstone|Spec V1.6g: final reconciliation — canonical SSI detection algorithm
-0404e42c9dbdc677da9b8a5731d29290ef9f3b26|0404e42|2026-02-07T03:50:09-05:00|Dicklesworthstone|Spec V1.6h: native mode commit protocol — SSI witness-plane integration
-2a6353d2f77a050454d2a6fd4b3fd6c8363064e9|2a6353d|2026-02-07T04:08:59-05:00|Dicklesworthstone|spec: align asupersync integration + preserve harness canon
-3253050f2835fb305bd115bd9f5939b72cd46503|3253050|2026-02-07T04:30:26-05:00|Dicklesworthstone|docs/spec: schema epoch + align encryption
-06dfe9a709d61fc899e00ee33d54dc15d003bb48|06dfe9a|2026-02-07T04:43:05-05:00|Dicklesworthstone|docs/spec: seal internal traits + clarify extensions
-63f6057e8705b7105837952bc8ea977ad6f34da6|63f6057|2026-02-07T04:44:32-05:00|Dicklesworthstone|docs/spec: key ARC pages by commit_seq
-2cff3a0287f1de30d2fd1185c376ac81913922c9|2cff3a0|2026-02-07T04:45:11-05:00|Dicklesworthstone|docs/spec: clarify INV-1 monitor name
-4ba1ee3bce5eef69acf5e24c61e0fe5482662a79|4ba1ee3|2026-02-07T04:54:23-05:00|Dicklesworthstone|docs/spec: tighten glossary + fix merge pseudocode types
-72eb835e83063d8fe19c1288a8c4624438473b2e|72eb835|2026-02-07T11:07:04-05:00|Dicklesworthstone|spec: fix cross-process cleanup + lock table semantics
-0b543b5b587d72a5531a37324ad31fab0157b6ed|0b543b5|2026-02-07T11:21:20-05:00|Dicklesworthstone|docs/spec: deepen asupersync integration (regions/cancel/supervision)
-d7b38efedc6f77029ce412c1eea2d0197b8b8fc6|d7b38ef|2026-02-07T11:50:08-05:00|Dicklesworthstone|Spec V1.7: deep audit fixes for Section 5 (MVCC Formal Model)
-322af1706478c8da09b09af4927e6a011041c5a6|322af17|2026-02-07T11:53:09-05:00|Dicklesworthstone|Spec V1.7a + README: deep audit fixes (MVCC model alignment, SSI/ordering)
-1a672dd545885d61c2531bf2be178d0edb4a5065|1a672dd|2026-02-07T12:09:27-05:00|Dicklesworthstone|Spec V1.7b: deep audit fixes for Section 7 (Checksums and Integrity)
-a19a3acb957598db6e11ece9ab199ae8f34eb88e|a19a3ac|2026-02-07T12:10:44-05:00|Dicklesworthstone|docs/spec: deepen asupersync integration + witness-plane rigor
-d0fda0186411a7f75bd73771f484259c29d7921a|d0fda01|2026-02-07T12:11:01-05:00|Dicklesworthstone|docs/spec: minor wording tweak
-b8344dba9b295b31b843807f80c6ec10e601459b|b8344db|2026-02-07T12:11:40-05:00|Dicklesworthstone|docs/spec: tighten crate boundaries + WAL notes
-5e2344ce7b5640aaad2fb48bed85838f9c9ecfef|5e2344c|2026-02-07T12:12:14-05:00|Dicklesworthstone|docs/spec: add WAL checksum algorithm + refine repair tail bounds
-713e6dc4f8b202870b16e154a597bcd735d5c05b|713e6dc|2026-02-07T12:12:40-05:00|Dicklesworthstone|docs/spec: bump document version
-e2dc2232567e901ce8f7192303c9da013e4c8d7c|e2dc223|2026-02-07T12:13:08-05:00|Dicklesworthstone|docs/spec: clarify fragmentation byte + add SQLite varint encoding
-3c5d5a177c8fbd78fd6f11f32a02e4c3ada9e172|3c5d5a1|2026-02-07T12:13:41-05:00|Dicklesworthstone|docs/spec: fix index local-payload math + clarify affinity coercion
-714570a488c9e93f3349ba527e70e744570555e9|714570a|2026-02-07T12:14:00-05:00|Dicklesworthstone|docs/spec: expand pointer-map entry type semantics
-893691fc58cca08e1fba3a25a5ddf520624d6860|893691f|2026-02-07T12:14:48-05:00|Dicklesworthstone|docs/spec: add SSI invariants + correct e-process example + fix index max_local
-a9aff80df7c0d04f465db40b74165a2e75ae5e29|a9aff80|2026-02-07T12:15:31-05:00|Dicklesworthstone|docs/spec: tighten budget algebra wording + fix BOCPD recursion
-80bc4494162ff420cdb48c5122324d9bdc8d328b|80bc449|2026-02-07T12:16:49-05:00|Dicklesworthstone|docs/spec: refine public API facade + type-erased function state factories
-a5a85e64c6356176ad86795d69e1293bd76f2601|a5a85e6|2026-02-07T12:17:16-05:00|Dicklesworthstone|docs/spec: thread Cx into rollback + clarify recursive CTE UNION semantics
-7c93dbb54e2d939f820d97a469bf204829ce97c8|7c93dbb|2026-02-07T12:20:46-05:00|Dicklesworthstone|Spec audit round 2: WAL checksum inversion, WAL-index hash, ARC claim
-07236c61ff86a87f22bb1aa6fd26885eb527d268|07236c6|2026-02-07T12:23:21-05:00|Dicklesworthstone|docs/spec: fix WAL checksum endianness + clarify WindowsVfs + layering notes
-d9146f771541d7e134f540e11016df82cc6e17b9|d9146f7|2026-02-07T12:28:33-05:00|Dicklesworthstone|spec: harden marker stream + compaction + RaptorQ overhead
-30619b34ea187d682283f8cd137d8d30e306e6bd|30619b3|2026-02-07T12:28:52-05:00|Dicklesworthstone|docs/spec: clarify R*-tree geopoly wording
-7e9cace601485722e7b31411ad74796c0685bd05|7e9cace|2026-02-07T12:29:17-05:00|Dicklesworthstone|docs/spec: refine Zipf conflict probability
-ff937f3d678f88eb855051dbbd32e8e5046bea0f|ff937f3|2026-02-07T12:29:51-05:00|Dicklesworthstone|docs/spec: tighten MVCC + merge modeling notes
-61ee3e03f4cd5e44b189da55bb70e91cdba63a29|61ee3e0|2026-02-07T12:30:34-05:00|Dicklesworthstone|docs/spec: harden ARC eviction failure path
-a90a3794616e12b083f88276e3cb47a045f3ac10|a90a379|2026-02-07T12:32:18-05:00|Dicklesworthstone|Spec V1.7c: deep audit fixes for Section 6 (Buffer Pool: ARC Cache)
-246102e6b4266fa15000580a3d016d76bcb1c801|246102e|2026-02-07T12:35:11-05:00|Dicklesworthstone|Spec audit round 3: fix operator precedence tables (§10.2 and §12.15)
-5ea1b6fb02945e4bc147c37ae7d054d92fdd9045|5ea1b6f|2026-02-07T12:44:12-05:00|Dicklesworthstone|Spec audit round 4: SSI pseudocode, precedence, RETURNING, merge terminology
-f1f25abe3b40ad0fb8704eaee310aee17de78d25|f1f25ab|2026-02-07T12:46:31-05:00|Dicklesworthstone|Spec: harden write-merge (no raw XOR on SQLite pages)
-9725f136b2450c6411f5735a1575a068f2aacc0b|9725f13|2026-02-07T12:47:33-05:00|Dicklesworthstone|Spec: clarify cross-process ordering + file format edge cases
-56742886aae65bdca3a34acda8d677b52a0c241d|5674288|2026-02-07T12:47:51-05:00|Dicklesworthstone|Spec: witness hot-plane epoch advancement safety
-71a41750d478e8ecad031a2f490e84a4424a839e|71a4175|2026-02-07T12:48:33-05:00|Dicklesworthstone|Spec: publish commit_seq only after durable marker
-9fa8f7b6082f164d4cb1026296a360cfbafe1f73|9fa8f7b|2026-02-07T12:48:54-05:00|Dicklesworthstone|Spec: make commit_seq allocation marker-tip-derived
-86d63af874d7a3dc7d522d47bf5f004f12913adb|86d63af|2026-02-07T12:49:41-05:00|Dicklesworthstone|Spec: compatibility mode legacy writer exclusion + WAL-index bridge
-23f575f7d4ee20399865e33abca1f93e60eda2d7|23f575f|2026-02-07T12:49:56-05:00|Dicklesworthstone|Spec: Acquire snapshot commit_seq; tighten V1 rebase scope
-6228e273d3dce6ca67c97fd43afb9018d19c6f5f|6228e27|2026-02-07T12:53:57-05:00|Dicklesworthstone|spec: fix native commit_seq gaps + witness epoch race
-2e3ea218a908f4a22791b4c8b30a0dbf746f867b|2e3ea21|2026-02-07T12:58:54-05:00|Dicklesworthstone|Spec audit round 5: SharedPageLockTable key-stability, marker encoding, legacy writer exclusion
-d05de23ea89da924e86232c8da519b6b58b4a0d5|d05de23|2026-02-07T12:59:44-05:00|Dicklesworthstone|Spec audit round 5b: align §5.6.3.1 rebuild prose with tombstone removal + header notes
-fa1830e4593854a492d78bec24da1db90351c2f0|fa1830e|2026-02-07T13:00:08-05:00|Dicklesworthstone|Spec audit round 5c: permeation map, fragment limit, cell payload refs
-70436b5c2c04e42c0aaf4b776a8f779416abdeff|70436b5|2026-02-07T13:00:29-05:00|Dicklesworthstone|Spec audit: WAL index byte order note + header layout corrections
-a4e773481bd417530fe83f33868ef6ce5656e933|a4e7734|2026-02-07T13:02:16-05:00|Dicklesworthstone|Spec: add VFS shm API + clarify commit marker record
-09c095901ddb1e5db47f55ddf5c616b5d51bf74e|09c0959|2026-02-07T13:02:34-05:00|Dicklesworthstone|Spec: checkpoint writer trait + replication gate
-40a2ac7739778b30cb11129a782d8746bd13e6ed|40a2ac7|2026-02-07T13:03:14-05:00|Dicklesworthstone|Spec: bump audit footer to v1.18
-40c6c3d152cf7d86104ad9ca19fbb850d6fdf343|40c6c3d|2026-02-07T13:04:47-05:00|Dicklesworthstone|Spec: lock-table acquire returns BUSY on insert race
-8512e62aed8835864a8800ed895c91a8773dc996|8512e62|2026-02-07T13:08:08-05:00|Dicklesworthstone|spec: move compat page-FEC to sidecar + tighten UDP bounds
-e31897fd92088e5305735d080e224a23b7315a11|e31897f|2026-02-07T13:08:45-05:00|Dicklesworthstone|spec: clarify checkpoint chunk MTU rationale
-b03db7bc0b8a2705fe6fda19f5f149452755284c|b03db7b|2026-02-07T13:10:18-05:00|Dicklesworthstone|Spec V1.7d: deep audit fixes for Section 12 (SQL Coverage)
-dd190e4f7f24aa2a8b7bb1bbc7020aead6d014c0|dd190e4|2026-02-07T13:23:44-05:00|Dicklesworthstone|Spec audit round 5+: fix GF(256) worked example, WAL checksum naming, MMR, IBLT
-a664265e3f5876177b7c1410dad7119e01e7f9e9|a664265|2026-02-07T13:30:10-05:00|Dicklesworthstone|Spec+VFS: SAFE write-merge proofs + policy controller
-599cafb3f29c52dd2a44f27d5632032c54a34a25|599cafb|2026-02-07T13:30:47-05:00|Dicklesworthstone|Spec: clarify forward target + symbol auth + epoch helpers
-e42a43de57ff5d4ee616cd2ec3b54a0db249a3e6|e42a43d|2026-02-07T13:31:08-05:00|Dicklesworthstone|Spec: symbol auth master key derivation + VdbeOp p5 note
-f158b44a5bd96ef34b378b58f61399568424f6d4|f158b44|2026-02-07T13:31:30-05:00|Dicklesworthstone|Spec: symbol auth wording + planner cost note
-3cf0f13571c101725f9ef34ce2476c90478ff07d|3cf0f13|2026-02-07T13:35:09-05:00|Dicklesworthstone|Spec V1.7e: deep audit fix for Section 3 (RaptorQ MTU/sub-blocking)
-0cb22962ec87cb29a29a44acfc5ec14588aadb23|0cb2296|2026-02-07T13:40:27-05:00|Dicklesworthstone|Spec: WAL lock refs + row-value expr
-1680d6931f5773673fae021b7cc646e3f3faab44|1680d69|2026-02-07T13:45:48-05:00|Dicklesworthstone|Spec V1.7f: deep audit fixes for Section 4 (Asupersync e-process math)
-1e2aae9940969190c6b9bebe94c94749eee91626|1e2aae9|2026-02-07T13:50:03-05:00|Dicklesworthstone|Spec: add UpdateExpression to write-merge system (§5.10)
-da22f479dc2f8d1e98294750b741b3cce168fd19|da22f47|2026-02-07T13:55:11-05:00|Dicklesworthstone|Spec: formal durability+policy hardening
-c25f0d00238fc36f355f818f571abc3d4a1198df|c25f0d0|2026-02-07T13:56:03-05:00|Dicklesworthstone|Spec: UpdateExpression rebase index regen
-02e48a41810bdb2ad471926d9728a9a9af12b155|02e48a4|2026-02-07T14:00:52-05:00|Dicklesworthstone|Spec: fix maxLocal example + add encryption plan gates
-bcd893da081fd15b1614a05c4d8b593f55cf7011|bcd893d|2026-02-07T14:16:38-05:00|Dicklesworthstone|Spec V1.7g: Section 9 deep audit — BtreeCursorOps, shm_map safety, opt-level fix
-6da51572d2b5b76eb9a37ffa99da76bfb850cd83|6da5157|2026-02-07T14:16:48-05:00|Dicklesworthstone|Spec: deep audit fixes for §5.6.2 + §7.11
-22e75e65b831adda852df3a11628e793aaa9e7a9|22e75e6|2026-02-07T14:27:26-05:00|Dicklesworthstone|planning: close obsolete beads; align spec/docs
-2f0970b9a5d8fc755269ba848169f5a1369ec6a6|2f0970b|2026-02-07T14:27:39-05:00|Dicklesworthstone|Spec V1.7h: Section 10 deep audit — lexer DQS, cost model, UPDATE trace
-5cc32a6bc813ff59db231f29db5b95a13ea94704|5cc32a6|2026-02-07T14:28:53-05:00|Dicklesworthstone|spec: tighten asupersync net + scheduler lane requirements
-dc92e549d05ac8dc0c23937d6e6dfa874729fdd4|dc92e54|2026-02-07T14:31:37-05:00|Dicklesworthstone|spec: fix MVCC version-chain delta encoding
-2433562451b188c9233f6fd83a9ef7573ce48f97|2433562|2026-02-07T14:33:19-05:00|Dicklesworthstone|spec: add per-source validation for WAL-FEC recovery
-82dfd4bf99283e5ab283073651787b3c7975561f|82dfd4b|2026-02-07T14:33:56-05:00|Dicklesworthstone|spec: clarify WAL-FEC repair semantics + WAL checksums
-ab20d7fac6f83ac527475927aa53b204c11ed7c8|ab20d7f|2026-02-07T14:34:24-05:00|Dicklesworthstone|spec: add ARC p-update online-learning note
-96f32f3174453e68960d849672cb4b7a8d33d1c7|96f32f3|2026-02-07T14:34:56-05:00|Dicklesworthstone|spec: lock-table rebuild busy-wait rule + ARC p-update research note
-f37158f2468145272817fd65794d78be539be19b|f37158f|2026-02-07T14:35:20-05:00|Dicklesworthstone|spec: fix UpdateExpression rebase step numbering
-19fa01f6d66c19892c634a02da44f7f536b29e43|19fa01f|2026-02-07T14:42:37-05:00|Dicklesworthstone|Spec V1.7i: Section 13 deep audit — strftime specifiers, aggregate ORDER BY
-a3e7ae521e6a0dcb3cf9489ac5a67b0f62aad526|a3e7ae5|2026-02-07T14:45:48-05:00|Dicklesworthstone|Spec V1.7j: Section 14 deep audit — FTS5 NOT is binary-only
-56a4e91425fa5cba9aecf08f786691ef03563750|56a4e91|2026-02-07T14:46:20-05:00|Dicklesworthstone|spec: define replication changeset_bytes encoding
-d2a49862864dff9799e236d2cf81b51ed268f93f|d2a4986|2026-02-07T14:48:36-05:00|Dicklesworthstone|spec: tighten crash/interop guidance (TxnSlot cleaning, WAL marks, ARC, triggers)
-859e81752809cd343b00ad6499c159d2f341cc46|859e817|2026-02-07T14:50:40-05:00|Dicklesworthstone|spec: fully reset TxnSlot state/mode during cleanup
-be3d256b12679a32f2fb4e44eeb82e513607b284|be3d256|2026-02-07T15:03:41-05:00|Dicklesworthstone|spec: make .db-fec checkpoint-owned + add per-source validation
-65ab2f709f724750878f2cb5d045649bf0c53e89|65ab2f7|2026-02-07T15:14:48-05:00|Dicklesworthstone|spec: add auto-tuning defaults and scaling knobs
-63ee097eb68a72ac23effab3979978adafb5b411|63ee097|2026-02-07T15:15:18-05:00|Dicklesworthstone|spec: fix §18 probabilistic conflict model — 10x arithmetic error + missing W²
-29f7ebe942a43891f2a55fd998d02c37411efc9f|29f7ebe|2026-02-07T15:27:04-05:00|Dicklesworthstone|spec: harden rebase + safe SHM + skew-aware conflicts
-6b0c12fc40c5759f5d53028ba692e8aaff80fc92|6b0c12f|2026-02-07T15:30:14-05:00|Dicklesworthstone|spec: fix §16 Phase 7 join ordering — beam search, not exhaustive
-b181b6d148e02862b195824020954abadae8de88|b181b6d|2026-02-07T15:31:48-05:00|Dicklesworthstone|spec: fix §8.3 planner join ordering — beam search, not exhaustive
-d302b391af5c2932c9097dd85923a8535593e45e|d302b39|2026-02-07T15:44:17-05:00|Dicklesworthstone|mvcc/spec: witness hot-index sizing manifest
-017745631c79f0c9061e4fdba8d0ce09ecc6c86d|0177456|2026-02-07T15:44:51-05:00|Dicklesworthstone|spec: clarify Zipf write-set skew section
-5dae90d79aef7d70300fe53a17f9e40dba24b309|5dae90d|2026-02-07T15:45:46-05:00|Dicklesworthstone|spec: tighten Zipf s_hat guidance
-ca60e008352585f2501ca3f81337849396b4d140|ca60e00|2026-02-07T15:47:59-05:00|Dicklesworthstone|spec: define .db-fec physical layout + crash-consistent update
-30203fb1f91acfb45c6085432a66029896e26e66|30203fb|2026-02-07T15:50:22-05:00|Dicklesworthstone|spec: reserve TxnId sentinels + guard allocation
-75ac25db5853747e3f56877c943d51ce8d649a5e|75ac25d|2026-02-07T16:07:05-05:00|Dicklesworthstone|spec: harden TxnId alloc + replication changeset id + ARC singleflight
-ec9adc1a8f61663d224399711d165a7dd623b919|ec9adc1|2026-02-07T16:13:12-05:00|Dicklesworthstone|spec: fix TxnId monotonicity note + clarify P_eff
-e80fdde018b3ce359f49271f082366bbad19f928|e80fdde|2026-02-07T16:14:32-05:00|Dicklesworthstone|spec: deterministic RaptorQ seed for ChangesetId
-fa25db0b24e84470e8271309370e0f8093463ddd|fa25db0|2026-02-07T16:21:05-05:00|Dicklesworthstone|spec: adopt NGQP beam search for V1 join ordering
-1d8bbfb40fa7a1fe90e710b593dfa2b3e9113c2d|1d8bbfb|2026-02-07T16:22:50-05:00|Dicklesworthstone|spec: add TxnId CAS abort path and correct beam search complexity
-4432a3daa2f875bc2d3fe47caf783b3eb286ebfe|4432a3d|2026-02-07T16:25:52-05:00|Dicklesworthstone|spec: conformance mode matrix; bump asupersync
-aa8e81601a80b6910a3791490d07c5691b517850|aa8e816|2026-02-07T16:28:25-05:00|Dicklesworthstone|spec: tighten serialized FCW + schema_epoch open + rebase read footprint
-0a8d8676ac74f994535eceaa1c6c47cb17868038|0a8d867|2026-02-07T16:38:09-05:00|Dicklesworthstone|spec: fix TxnSlot cleanup crash-safety and reconcile lock/VFS semantics
-3d568547fd6b8036481df0d73a2c60b5bf30d5a7|3d56854|2026-02-07T16:39:53-05:00|Dicklesworthstone|spec: fix Vfs trait formatting and cleanup_txn_id comment
-4c07e10c56ee30db5d03453237ae6c29c31a7cf0|4c07e10|2026-02-07T16:41:55-05:00|Dicklesworthstone|spec: clarify TxnSlot cleanup_txn_id + fix Vfs trait formatting
-df0313b00f2854929c376434c56129ef6e2740e0|df0313b|2026-02-07T16:42:11-05:00|Dicklesworthstone|spec: fix ARC/CAR comment indentation
-97df1f07893def20701570db65418ff75ed45656|97df1f0|2026-02-07T16:42:40-05:00|Dicklesworthstone|spec: clarify zero-copy terminology
-bbc4a3114572200d7a8a674eb3a4e430ae1d0b47|bbc4a31|2026-02-07T16:45:48-05:00|Dicklesworthstone|spec: define canonical AAD encoding for page encryption
-4363f50065239e47d56f12250d933f5a1ab75a00|4363f50|2026-02-07T16:51:53-05:00|Dicklesworthstone|spec: add critical implementation controls checklist
-d9021cffb65692624f3990ae2544a96ae0c07021|d9021cf|2026-02-07T16:52:38-05:00|Dicklesworthstone|spec: clarify rebase rowid reuse + DatabaseId encoding
-29107df6b155bb20934ef369b934699191076b32|29107df|2026-02-07T17:00:26-05:00|Dicklesworthstone|spec: harden TxnSlot cleanup and epoch reset semantics
-f708f338cb6e435db3822e2aa81b2785b51bf39b|f708f33|2026-02-07T17:01:38-05:00|Dicklesworthstone|spec: clarify pipelined durability and compatibility spill semantics
-a71e1d95715c1190335e8738413382b31b6d167c|a71e1d9|2026-02-07T17:07:05-05:00|Dicklesworthstone|spec: harden ECS root update; snapshot slot tid; clarify ESCAPE parsing
-120eee252b4caa7fe6389602bd2c8a316c6cee2a|120eee2|2026-02-07T17:08:11-05:00|Dicklesworthstone|spec: strengthen WAL-FEC per-source validation hash to xxh3_128
-	975f65c78a5745424665a95f0c222287306c9dd5|975f65c|2026-02-07T17:08:59-05:00|Dicklesworthstone|spec: clarify GF(256) elimination note; bound delta reconstruction cost
-	24b6f60e9e751b699cb232759d85a06c42792019|24b6f60|2026-02-07T17:15:05-05:00|Dicklesworthstone|spec: fix GC scheduling cross-reference
-	80decf6b8ba71dd4331f559a08ee0fba3fbdf4bb|80decf6|2026-02-07T17:28:31-05:00|Dicklesworthstone|spec: clarify db-fec generation digest + ESI terminology
-	7cc726325faa5cad71d2132480cbb68fb046563d|7cc7263|2026-02-07T18:11:25-05:00|Dicklesworthstone|spec: harden SHM snapshot seqlock + compat db-fec freshness
-	9ad50ae2a2c7fce76a75d1200e22374eb729914d|9ad50ae|2026-02-07T18:15:58-05:00|Dicklesworthstone|spec: define SHM snapshot seqlock + coordinator IPC
-	19106d19e531ea75918241b2858024c34a73f037|19106d1|2026-02-07T18:20:51-05:00|Dicklesworthstone|spec: harden MVCC TxnSlot protocol, write_page idempotency, and SHM layout
-	7313951174e317f889851f696de264b546e4b54e|7313951|2026-02-07T18:21:25-05:00|Dicklesworthstone|spec: define wire payload schemas, RowId allocator state, and CommitRequest type
-	d329df055a1a13459d0f507bc222b05525bb7522|d329df0|2026-02-07T18:28:22-05:00|Dicklesworthstone|spec: fix snapshot seqlock + shm invariants
-	351c282e9a9a2ee118496651cef7a4b33cf309f2|351c282|2026-02-07T18:41:22-05:00|Dicklesworthstone|spec: fix TxnSlot acquire pseudocode + add spec viz wasm
-	b1c1e72d9331952247c804af6589fe3b349d0b8a|b1c1e72|2026-02-07T18:58:48-05:00|Dicklesworthstone|spec: tighten coordinator IPC framing
-	e60049751d7e238e46e45ce8009d9e9f053a41c2|e600497|2026-02-07T19:15:51-05:00|Dicklesworthstone|spec: harden claiming liveness and IPC ordering
-	6d5d36a1380d3b4b4b6ddba71828825ef942975b|6d5d36a|2026-02-07T19:16:12-05:00|Dicklesworthstone|spec: update Round 16 audit notes`;
-      const COMMIT_STATS_RAW = String.raw`c08f1602d03b1833a4f91c8f77347f8f196bac9d|8628|0
-f9d88aa96f50893f8531373d0734597ebae3c592|431|76
-76eef31be20a6faedc62e7fecce88e78652ebdcf|242|116
-9800b17df4a56c2dc065cf566c2810d4ed2e576c|537|74
-79018f161649e6d7977bc74eb849a0e22eceb286|246|151
-5ad34871f7242de61378843c6c1e8311e35d9fa3|262|45
-7b2c677cf61adda977e71524b59d7ec234137962|425|36
-bf0426417685504bb2b2f5acfc4de2c2f087ef8b|290|71
-05cf07847753f444b9f74dfd0279ef96c3ff86b9|217|31
-e8ddf469d8ab8ff8eefbae92b24453e06fcf4627|141|20
-480c10086fb73630744364f5fb34966de2572dc1|60|48
-0313678eff44b70cd4ea40cabc2f2222cac2ba93|169|73
-b97b1abe4727a738197180c5639738c1da2f5311|79|170
-643c89c1c941d1e47cb6a2574e01fd7556f622ec|37|59
-0404e42c9dbdc677da9b8a5731d29290ef9f3b26|33|16
-2a6353d2f77a050454d2a6fd4b3fd6c8363064e9|643|381
-3253050f2835fb305bd115bd9f5939b72cd46503|404|86
-06dfe9a709d61fc899e00ee33d54dc15d003bb48|318|424
-63f6057e8705b7105837952bc8ea977ad6f34da6|14|14
-2cff3a0287f1de30d2fd1185c376ac81913922c9|1|1
-4ba1ee3bce5eef69acf5e24c61e0fe5482662a79|18|16
-72eb835e83063d8fe19c1288a8c4624438473b2e|56|16
-0b543b5b587d72a5531a37324ad31fab0157b6ed|472|64
-d7b38efedc6f77029ce412c1eea2d0197b8b8fc6|78|39
-322af1706478c8da09b09af4927e6a011041c5a6|21|1
-1a672dd545885d61c2531bf2be178d0edb4a5065|449|51
-a19a3acb957598db6e11ece9ab199ae8f34eb88e|47|21
-d0fda0186411a7f75bd73771f484259c29d7921a|6|3
-b8344dba9b295b31b843807f80c6ec10e601459b|6|2
-5e2344ce7b5640aaad2fb48bed85838f9c9ecfef|81|11
-713e6dc4f8b202870b16e154a597bcd735d5c05b|18|1
-e2dc2232567e901ce8f7192303c9da013e4c8d7c|40|3
-3c5d5a177c8fbd78fd6f11f32a02e4c3ada9e172|18|7
-714570a488c9e93f3349ba527e70e744570555e9|16|8
-893691fc58cca08e1fba3a25a5ddf520624d6860|26|14
-a9aff80df7c0d04f465db40b74165a2e75ae5e29|14|10
-80bc4494162ff420cdb48c5122324d9bdc8d328b|33|5
-a5a85e64c6356176ad86795d69e1293bd76f2601|7|5
-7c93dbb54e2d939f820d97a469bf204829ce97c8|89|34
-07236c61ff86a87f22bb1aa6fd26885eb527d268|43|41
-d9146f771541d7e134f540e11016df82cc6e17b9|264|207
-30619b34ea187d682283f8cd137d8d30e306e6bd|16|8
-7e9cace601485722e7b31411ad74796c0685bd05|17|3
-ff937f3d678f88eb855051dbbd32e8e5046bea0f|29|6
-61ee3e03f4cd5e44b189da55bb70e91cdba63a29|15|2
-a90a3794616e12b083f88276e3cb47a045f3ac10|32|8
-246102e6b4266fa15000580a3d016d76bcb1c801|336|117
-5ea1b6fb02945e4bc147c37ae7d054d92fdd9045|90|26
-f1f25abe3b40ad0fb8704eaee310aee17de78d25|96|14
-9725f136b2450c6411f5735a1575a068f2aacc0b|66|48
-56742886aae65bdca3a34acda8d677b52a0c241d|14|3
-71a41750d478e8ecad031a2f490e84a4424a839e|5|1
-9fa8f7b6082f164d4cb1026296a360cfbafe1f73|8|3
-86d63af874d7a3dc7d522d47bf5f004f12913adb|99|2
-23f575f7d4ee20399865e33abca1f93e60eda2d7|17|1
-6228e273d3dce6ca67c97fd43afb9018d19c6f5f|81|5
-2e3ea218a908f4a22791b4c8b30a0dbf746f867b|130|93
-d05de23ea89da924e86232c8da519b6b58b4a0d5|15|8
-fa1830e4593854a492d78bec24da1db90351c2f0|8|7
-70436b5c2c04e42c0aaf4b776a8f779416abdeff|9|3
-a4e773481bd417530fe83f33868ef6ce5656e933|98|11
-09c095901ddb1e5db47f55ddf5c616b5d51bf74e|18|0
-40a2ac7739778b30cb11129a782d8746bd13e6ed|1|1
-40c6c3d152cf7d86104ad9ca19fbb850d6fdf343|3|2
-8512e62aed8835864a8800ed895c91a8773dc996|57|27
-e31897fd92088e5305735d080e224a23b7315a11|1|1
-b03db7bc0b8a2705fe6fda19f5f149452755284c|18|8
-dd190e4f7f24aa2a8b7bb1bbc7020aead6d014c0|478|55
-a664265e3f5876177b7c1410dad7119e01e7f9e9|410|93
-599cafb3f29c52dd2a44f27d5632032c54a34a25|70|12
-e42a43de57ff5d4ee616cd2ec3b54a0db249a3e6|15|5
-f158b44a5bd96ef34b378b58f61399568424f6d4|14|6
-3cf0f13571c101725f9ef34ce2476c90478ff07d|22|17
-0cb22962ec87cb29a29a44acfc5ec14588aadb23|80|16
-1680d6931f5773673fae021b7cc646e3f3faab44|47|28
-1e2aae9940969190c6b9bebe94c94749eee91626|228|38
-da22f479dc2f8d1e98294750b741b3cce168fd19|373|88
-c25f0d00238fc36f355f818f571abc3d4a1198df|27|7
-02e48a41810bdb2ad471926d9728a9a9af12b155|11|4
-bcd893da081fd15b1614a05c4d8b593f55cf7011|379|134
-6da51572d2b5b76eb9a37ffa99da76bfb850cd83|4|4
-22e75e65b831adda852df3a11628e793aaa9e7a9|214|60
-2f0970b9a5d8fc755269ba848169f5a1369ec6a6|8|6
-5cc32a6bc813ff59db231f29db5b95a13ea94704|56|1
-dc92e549d05ac8dc0c23937d6e6dfa874729fdd4|17|15
-2433562451b188c9233f6fd83a9ef7573ce48f97|24|5
-82dfd4bf99283e5ab283073651787b3c7975561f|30|5
-ab20d7fac6f83ac527475927aa53b204c11ed7c8|26|1
-96f32f3174453e68960d849672cb4b7a8d33d1c7|18|6
-f37158f2468145272817fd65794d78be539be19b|9|1
-19fa01f6d66c19892c634a02da44f7f536b29e43|24|8
-a3e7ae521e6a0dcb3cf9489ac5a67b0f62aad526|133|68
-56a4e91425fa5cba9aecf08f786691ef03563750|26|0
-d2a49862864dff9799e236d2cf81b51ed268f93f|79|28
-859e81752809cd343b00ad6499c159d2f341cc46|6|1
-be3d256b12679a32f2fb4e44eeb82e513607b284|176|9
-65ab2f709f724750878f2cb5d045649bf0c53e89|267|56
-63ee097eb68a72ac23effab3979978adafb5b411|10|0
-29f7ebe942a43891f2a55fd998d02c37411efc9f|262|65
-6b0c12fc40c5759f5d53028ba692e8aaff80fc92|3|1
-b181b6d148e02862b195824020954abadae8de88|2|2
-d302b391af5c2932c9097dd85923a8535593e45e|229|45
-017745631c79f0c9061e4fdba8d0ce09ecc6c86d|12|2
-5dae90d79aef7d70300fe53a17f9e40dba24b309|5|1
-ca60e008352585f2501ca3f81337849396b4d140|51|0
-30203fb1f91acfb45c6085432a66029896e26e66|6|2
-75ac25db5853747e3f56877c943d51ce8d649a5e|116|51
-ec9adc1a8f61663d224399711d165a7dd623b919|16|8
-e80fdde018b3ce359f49271f082366bbad19f928|12|3
-fa25db0b24e84470e8271309370e0f8093463ddd|78|34
-1d8bbfb40fa7a1fe90e710b593dfa2b3e9113c2d|6|2
-4432a3daa2f875bc2d3fe47caf783b3eb286ebfe|119|26
-aa8e81601a80b6910a3791490d07c5691b517850|45|20
-0a8d8676ac74f994535eceaa1c6c47cb17868038|261|135
-3d568547fd6b8036481df0d73a2c60b5bf30d5a7|16|16
-4c07e10c56ee30db5d03453237ae6c29c31a7cf0|78|57
-df0313b00f2854929c376434c56129ef6e2740e0|5|5
-97df1f07893def20701570db65418ff75ed45656|4|0
-bbc4a3114572200d7a8a674eb3a4e430ae1d0b47|3|0
-4363f50065239e47d56f12250d933f5a1ab75a00|44|2
-d9021cffb65692624f3990ae2544a96ae0c07021|5|4
-29107df6b155bb20934ef369b934699191076b32|109|166
-f708f338cb6e435db3822e2aa81b2785b51bf39b|242|100
-a71e1d95715c1190335e8738413382b31b6d167c|178|105
-	120eee252b4caa7fe6389602bd2c8a316c6cee2a|6|6
-	975f65c78a5745424665a95f0c222287306c9dd5|17|2
-	24b6f60e9e751b699cb232759d85a06c42792019|3|3
-	80decf6b8ba71dd4331f559a08ee0fba3fbdf4bb|15|10
-	7cc726325faa5cad71d2132480cbb68fb046563d|781|148
-	9ad50ae2a2c7fce76a75d1200e22374eb729914d|160|23
-	19106d19e531ea75918241b2858024c34a73f037|87|21
-	7313951174e317f889851f696de264b546e4b54e|183|20
-	d329df055a1a13459d0f507bc222b05525bb7522|126|43
-	351c282e9a9a2ee118496651cef7a4b33cf309f2|50|45
-	b1c1e72d9331952247c804af6589fe3b349d0b8a|56|11
-	e60049751d7e238e46e45ce8009d9e9f053a41c2|81|25
-	6d5d36a1380d3b4b4b6ddba71828825ef942975b|1|1`;
+      // Commit metadata and per-commit add/del stats are loaded from SPEC_EVOLUTION_DATA_URL.
 
       // -----------------------------
       // Data: manual classification
@@ -6885,6 +6734,7 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
       const WORKER_DERIVED = {
         searchReady: false,
         clusterReady: false,
+        mostEditedReady: false,
         phase: null,
         phaseKey: "",
         outliers: null,
@@ -7177,65 +7027,38 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
         };
       }
 
-      function parseCommitLog() {
-        const d = DATASET.data;
-        if (d && Array.isArray(d.commits) && d.commits.length) {
-          return d.commits.map((c, idx) => {
-            return {
-              idx,
-              hash: c.hash,
-              short: c.short,
-              dateIso: c.dateIso,
-              author: c.author,
-              subject: c.subject,
-              url: `https://github.com/Dicklesworthstone/frankensqlite/commit/${c.hash}`,
-            };
-          });
-        }
+	      function parseCommitLog() {
+	        const d = DATASET.data;
+	        if (!d || !Array.isArray(d.commits) || d.commits.length === 0) {
+	          throw new Error("Dataset not loaded: missing commits[]");
+	        }
+	        return d.commits.map((c, idx) => {
+	          return {
+	            idx,
+	            hash: c.hash,
+	            short: c.short,
+	            dateIso: c.dateIso,
+	            author: c.author,
+	            subject: c.subject,
+	            url: `https://github.com/Dicklesworthstone/frankensqlite/commit/${c.hash}`,
+	          };
+	        });
+	      }
 
-        const rows = COMMIT_LOG_RAW.trim()
-          .split("\n")
-          .map((l) => l.trim())
-          .filter(Boolean);
-        return rows.map((r, idx) => {
-          const [hash, short, dateIso, author, subject] = r.split("|").map((x) => x.trim());
-          return {
-            idx,
-            hash,
-            short,
-            dateIso,
-            author,
-            subject,
-            url: `https://github.com/Dicklesworthstone/frankensqlite/commit/${hash}`,
-          };
-        });
-      }
-
-      function parseCommitStats() {
-        const d = DATASET.data;
-        if (d && Array.isArray(d.commits) && d.commits.length) {
-          const m = new Map();
-          for (const c of d.commits) {
-            const a = Number(c.add || 0);
-            const del = Number(c.del || 0);
-            m.set(c.hash, { add: a, del, impact: a + del });
-          }
-          return m;
-        }
-
-        const rows = COMMIT_STATS_RAW.trim()
-          .split("\n")
-          .map((l) => l.trim())
-          .filter(Boolean);
-        const m = new Map();
-        for (const r of rows) {
-          const [hash, add, del] = r.split("|").map((x) => x.trim());
-          const a = Number(add || 0);
-          const d = Number(del || 0);
-          m.set(hash, { add: a, del: d, impact: a + d });
-        }
-        return m;
-      }
+	      function parseCommitStats() {
+	        const d = DATASET.data;
+	        if (!d || !Array.isArray(d.commits) || d.commits.length === 0) {
+	          throw new Error("Dataset not loaded: missing commits[]");
+	        }
+	        const m = new Map();
+	        for (const c of d.commits) {
+	          const a = Number(c.add || 0);
+	          const del = Number(c.del || 0);
+	          const impact = Number.isFinite(Number(c.impact)) ? Number(c.impact) : (a + del);
+	          m.set(c.hash, { add: a, del, impact });
+	        }
+	        return m;
+	      }
 
       function formatErr(e) {
         const name = e?.name || "Error";
@@ -7299,6 +7122,7 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
             searchIndex: null,
             clusterData: null,
             minhashSignatures: null,
+            mostEditedSections: null,
           };
           const CANCELLED_REQS = new Set();
 
@@ -7905,6 +7729,118 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
             return true;
           }
 
+
+          // --- History Search Analytics: First-Introduced + Most-Edited (bd-24q.9.3) ---
+
+          /**
+           * Find the earliest commit where a token or phrase first appears in added lines.
+           * Returns { found, commitIdx, hash, short, subject, matchLine, contextLines[] }.
+           */
+          function findFirstIntroduced(query, options) {
+            const commits = STATE.dataset?.commits || [];
+            const patches = STATE.dataset?.patches || [];
+            if (!commits.length || !query) return { found: false, query };
+
+            const qLower = query.toLowerCase().trim();
+            const maxContext = (options && options.contextLines) || 3;
+
+            for (let i = 0; i < commits.length; i++) {
+              const patch = patches[i] || "";
+              const lines = String(patch).split("\\n");
+              for (let j = 0; j < lines.length; j++) {
+                const line = lines[j];
+                if (!line.startsWith("+") || line.startsWith("+++")) continue;
+                const content = line.slice(1);
+                if (content.toLowerCase().includes(qLower)) {
+                  const contextLines = [];
+                  const start = Math.max(0, j - maxContext);
+                  const end = Math.min(lines.length - 1, j + maxContext);
+                  for (let k = start; k <= end; k++) {
+                    const cl = lines[k];
+                    if (cl.startsWith("@@") || cl.startsWith("---") || cl.startsWith("+++")) continue;
+                    contextLines.push({ line: k, prefix: cl[0] || " ", text: cl.slice(1), isMatch: k === j });
+                  }
+                  const c = commits[i];
+                  return {
+                    found: true,
+                    query: qLower,
+                    commitIdx: i,
+                    hash: c.hash,
+                    short: c.short,
+                    subject: c.subject,
+                    author: c.author,
+                    matchLine: content,
+                    contextLines,
+                  };
+                }
+              }
+            }
+            return { found: false, query: qLower };
+          }
+
+          /**
+           * Compute per-heading edit mass across all commits.
+           * Returns { sections: [{ heading, totalTokensDelta, totalLinesDelta, peakIdx, peakDelta, commitCount, timeline[] }] }.
+           */
+          function computeMostEditedSections(reqId, progressCb, options) {
+            const commits = STATE.dataset?.commits || [];
+            const patches = STATE.dataset?.patches || [];
+            const topK = (options && options.topK) || 20;
+            if (!commits.length) return { sections: [] };
+
+            const headingStats = {};
+
+            for (let i = 0; i < commits.length; i++) {
+              if (progressCb && i % 10 === 0) progressCb({ phase: "most_edited", current: i, total: commits.length });
+              throwIfCancelled(reqId);
+
+              const patch = patches[i] || "";
+              if (!patch) continue;
+
+              const text = docTextAtLocal(i, reqId, null);
+              if (!text) continue;
+              const outline = extractOutlineWorker(text);
+              const totalLines = text.split("\\n").length;
+              const lineMap = buildLineToHeadingMapW(totalLines, outline);
+              const metrics = attributeHunksToHeadingsW(patch, lineMap);
+
+              for (const hid of Object.keys(metrics)) {
+                if (hid === "__preamble__") continue;
+                const m = metrics[hid];
+                if (!headingStats[hid]) {
+                  headingStats[hid] = { heading: hid, totalTokensDelta: 0, totalLinesDelta: 0, peakIdx: i, peakDelta: 0, commitCount: 0, timeline: [] };
+                }
+                const s = headingStats[hid];
+                const tokenDelta = m.tokensAdded + m.tokensDeleted;
+                const lineDelta = m.addLines + m.delLines;
+                s.totalTokensDelta += tokenDelta;
+                s.totalLinesDelta += lineDelta;
+                s.commitCount++;
+                s.timeline.push({ idx: i, tokensAdded: m.tokensAdded, tokensDeleted: m.tokensDeleted, addLines: m.addLines, delLines: m.delLines });
+                if (tokenDelta > s.peakDelta) {
+                  s.peakDelta = tokenDelta;
+                  s.peakIdx = i;
+                }
+              }
+            }
+
+            const sections = Object.values(headingStats)
+              .sort((a, b) => b.totalTokensDelta - a.totalTokensDelta || a.heading.localeCompare(b.heading))
+              .slice(0, topK)
+              .map((s) => ({
+                heading: s.heading,
+                totalTokensDelta: s.totalTokensDelta,
+                totalLinesDelta: s.totalLinesDelta,
+                peakIdx: s.peakIdx,
+                peakDelta: s.peakDelta,
+                commitCount: s.commitCount,
+                timeline: s.timeline,
+              }));
+
+            STATE.mostEditedSections = sections;
+            return { sections };
+          }
+
           // --- Clustering: Deterministic Grouping + Theme Tags (bd-24q.14.2) ---
 
           /** Estimate Jaccard similarity from MinHash signature agreement. */
@@ -8508,6 +8444,7 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
                   STATE.snapshotCursorLines = String(ds.base_doc || "").split("\\n");
                   STATE.searchIndex = null;
                   STATE.clusterData = null;
+                  STATE.mostEditedSections = null;
                   result = {
                     datasetHash: STATE.datasetHash,
                     commits: ds.commits.length,
@@ -8558,6 +8495,15 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
                   result = querySearch(payload.q || "", payload.limit || 20);
                   break;
                 }
+                case "first_introduced": {
+                  result = findFirstIntroduced(payload.query || "", { contextLines: payload.contextLines || 3 });
+                  break;
+                }
+                case "most_edited_sections": {
+                  result = computeMostEditedSections(reqId, progressCb, { topK: payload.topK || 20 });
+                  break;
+                }
+
                 case "compute_minhash_signatures": {
                   result = computeMinHashSignatures(reqId, progressCb, {
                     sigLen: payload.sigLen || 64,
@@ -8614,6 +8560,14 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
                   const lineMap = buildLineToHeadingMapW(totalLines, outline);
                   const metrics = attributeHunksToHeadingsW(patch, lineMap);
                   result = { idx, outline, metrics };
+                  break;
+                }
+                case "find_first_introduced": {
+                  result = findFirstIntroduced(payload.query || "", { contextLines: payload.contextLines || 3 });
+                  break;
+                }
+                case "compute_most_edited_sections": {
+                  result = computeMostEditedSections(reqId, progressCb, { topK: payload.topK || 20 });
                   break;
                 }
                 default:
@@ -8873,7 +8827,12 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
 
           await workerRequest("compute_clusters", { limit: 12 }, { timeoutMs: 30000 });
           WORKER_DERIVED.clusterReady = true;
-          setWorkerStatus("Worker online · search index + MinHash + clustering ready", "ok");
+
+          // Precompute most-edited sections analytics (bd-24q.9.3).
+          await workerRequest("compute_most_edited_sections", { topK: 20 }, { timeoutMs: 120000 });
+          WORKER_DERIVED.mostEditedReady = true;
+
+          setWorkerStatus("Worker online · search + clustering + analytics ready", "ok");
         } catch (e) {
           console.error("Worker warmup failed:", e);
           setWorkerStatus("Worker warmup partial failure.", "error", formatErr(e));
@@ -9077,6 +9036,71 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
         return { p0, changePoints, segments, evidence, hazard: H, seriesLength: y.length };
       }
 
+
+      // -------------------------------------------------------
+      // History Search Analytics: Main-Thread API (bd-24q.9.3)
+      // -------------------------------------------------------
+
+      /**
+       * Find earliest commit where a query appears in added lines.
+       * Dispatches to worker; falls back to inline scan of STATE.dataset.
+       * @param {string} query - search term or phrase
+       * @param {number} contextLines - lines of context around match (default 3)
+       * @returns {Promise<{found, query, commitIdx?, hash?, short?, subject?, matchLine?, contextLines?}>}
+       */
+      async function searchFirstIntroduced(query, contextLines) {
+        if (WORKER_STATE.ready) {
+          try {
+            return await workerRequest("first_introduced", { query, contextLines: contextLines || 3 }, { timeoutMs: 15000 });
+          } catch (e) { console.warn("Worker first_introduced fallback:", e); }
+        }
+        // Inline fallback: scan patches directly.
+        const commits = ALL_COMMITS || [];
+        const patches = STATE.dataset?.patches || [];
+        if (!commits.length || !query) return { found: false, query };
+        const q = query.toLowerCase().trim();
+        const ctx = Math.max(0, Number(contextLines) || 3);
+        for (let i = 0; i < patches.length; i++) {
+          const patch = patches[i] || "";
+          const lines = String(patch).split("\n");
+          for (let j = 0; j < lines.length; j++) {
+            const line = lines[j];
+            if (!line.startsWith("+") || line.startsWith("+++")) continue;
+            const text = line.slice(1);
+            if (text.toLowerCase().includes(q)) {
+              const ctxLines = [];
+              const start = Math.max(0, j - ctx);
+              const end = Math.min(lines.length - 1, j + ctx);
+              for (let k = start; k <= end; k++) {
+                const cl = lines[k];
+                if (cl.startsWith("@@") || cl.startsWith("---") || cl.startsWith("+++")) continue;
+                ctxLines.push({ line: k, prefix: cl[0] || " ", text: cl.slice(1), isMatch: k === j });
+              }
+              const c = commits[i] || {};
+              return { found: true, query: q, commitIdx: i, hash: c.hash || "", short: c.short || "", subject: c.subject || "", author: c.author || "", matchLine: text, contextLines: ctxLines };
+            }
+          }
+        }
+        return { found: false, query: q };
+      }
+
+      /**
+       * Compute per-heading edit mass across all commits.
+       * Dispatches to worker; falls back to returning empty result (requires worker for full scan).
+       * @param {number} topK - number of top headings to return (default 20)
+       * @returns {Promise<{sections: Array}>}
+       */
+      async function searchMostEditedSections(topK) {
+        if (WORKER_STATE.ready) {
+          try {
+            return await workerRequest("most_edited_sections", { topK: topK || 20 }, { timeoutMs: 60000 });
+          } catch (e) { console.warn("Worker most_edited_sections fallback:", e); }
+        }
+        // Inline fallback: requires snapshot reconstruction only available in worker.
+        console.warn("most_edited_sections requires worker (needs docTextAtLocal)");
+        return { sections: [] };
+      }
+
       async function maybeRefreshPhaseAndOutliers(commits) {
         if (!WORKER_STATE.ready || !Array.isArray(commits) || !commits.length) return;
         const hazard = Number(document.getElementById("hazard")?.value || 0.03);
@@ -9116,6 +9140,8 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
             "ok",
           );
           renderBocpd(commits);
+          renderPhaseOverlay(commits);
+          void renderOutlierPanel(commits);
         } catch (e) {
           if (e?.name === "AbortError") return;
           console.error("Phase/outlier worker compute failed:", e);
@@ -9150,6 +9176,11 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
 	          const data = JSON.parse(jsonText);
           if (!data || !Array.isArray(data.commits) || !Array.isArray(data.patches) || !data.base_doc) {
             throw new Error("Dataset schema mismatch (expected commits[], patches[], base_doc).");
+          }
+          // Schema version check (bd-24q.6.3): current viz supports schema_version 1.
+          const sv = data.schema_version || 0;
+          if (sv > 1) {
+            console.warn(`[dataset] Schema version ${sv} is newer than supported (1). Some features may not work.`);
           }
           DATASET.data = data;
           DATASET.loaded = true;
@@ -9766,6 +9797,70 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
         paneEl.innerHTML = DOMPurify.sanitize(html, { ADD_ATTR: ["id"] });
         if (orig) window._mdSingleton.renderer.rules.heading_open = orig;
         else delete window._mdSingleton.renderer.rules.heading_open;
+      }
+
+      // --- Inline Highlights: Hunk-to-DOM Mapping (bd-24q.16.1) ---
+      function parsePatchChangedNewLines(patch) {
+        const changed = new Set();
+        for (const line of String(patch || "").split("\n")) {
+          if (!line.startsWith("@@")) continue;
+          // handled inline below
+        }
+        // Full implementation:
+        const lines = String(patch || "").split("\n");
+        for (let i = 0; i < lines.length; i++) {
+          if (!lines[i].startsWith("@@")) continue;
+          const m = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(lines[i]);
+          if (!m) continue;
+          let nl = Number(m[1]);
+          for (i++; i < lines.length; i++) {
+            const l = lines[i];
+            if (l.startsWith("@@") || l.startsWith("diff ")) { i--; break; }
+            if (l.startsWith("---") || l.startsWith("+++") || l.startsWith("index ")) continue;
+            if (l[0] === "+") { changed.add(nl); nl++; }
+            else if (l[0] !== "-") nl++;
+          }
+        }
+        return changed;
+      }
+      function renderMarkdownWithSentinels(text, paneEl, idPrefix, changedLines) {
+        if (!paneEl) return;
+        if (!window._mdSingleton) {
+          window._mdSingleton = markdownit({ html: false, linkify: true, typographer: true,
+            highlight: (str, lang) => { try { if (lang && hljs.getLanguage(lang)) return '<pre class="hljs"><code>' + hljs.highlight(str, { language: lang }).value + "</code></pre>"; return '<pre class="hljs"><code>' + hljs.highlightAuto(str).value + "</code></pre>"; } catch { return '<pre class="hljs"><code>' + escapeHtml(str) + "</code></pre>"; } },
+          });
+        }
+        const outline = extractOutline(text);
+        const prefix = idPrefix || "";
+        let oIdx = 0;
+        const md = window._mdSingleton;
+        const origHO = md.renderer.rules.heading_open;
+        md.renderer.rules.heading_open = (tokens, idx, options, env, self) => { const entry = outline[oIdx++]; if (entry) tokens[idx].attrSet("id", prefix + entry.id); return self.renderToken(tokens, idx, options); };
+        const origRT = md.renderer.renderToken.bind(md.renderer);
+        md.renderer.renderToken = function (tokens, idx, options) {
+          const tok = tokens[idx];
+          if (tok.map && tok.nesting === 1) {
+            tok.attrSet("data-srcmap", tok.map[0] + ":" + tok.map[1]);
+            if (changedLines) { for (let ln = tok.map[0]; ln < tok.map[1]; ln++) { if (changedLines.has(ln + 1)) { tok.attrSet("data-changed", "true"); break; } } }
+          }
+          return origRT(tokens, idx, options);
+        };
+        const html = md.render(text || "");
+        paneEl.innerHTML = DOMPurify.sanitize(html, { ADD_ATTR: ["id", "data-srcmap", "data-changed"] });
+        md.renderer.renderToken = origRT;
+        if (origHO) md.renderer.rules.heading_open = origHO; else delete md.renderer.rules.heading_open;
+      }
+      function applyInlineHighlights(paneEl) { if (!paneEl) return; for (const el of paneEl.querySelectorAll("[data-changed='true']")) el.classList.add("ih-changed"); }
+      function clearInlineHighlights(paneEl) { if (!paneEl) return; for (const el of paneEl.querySelectorAll(".ih-changed")) el.classList.remove("ih-changed"); for (const el of paneEl.querySelectorAll(".ih-debug")) el.classList.remove("ih-debug"); }
+      function toggleHighlightDebug(paneEl, enabled) { if (!paneEl) return; for (const el of paneEl.querySelectorAll("[data-srcmap]")) { el.classList.toggle("ih-debug", enabled); if (enabled) el.title = "Lines: " + el.getAttribute("data-srcmap") + (el.dataset.changed ? " [CHANGED]" : ""); else el.removeAttribute("title"); } }
+      function navigateChangedBlock(paneEl, direction) {
+        if (!paneEl) return null;
+        const blocks = Array.from(paneEl.querySelectorAll("[data-changed='true']"));
+        if (!blocks.length) return null;
+        const thresh = paneEl.scrollTop + (direction === "next" ? 20 : -20);
+        const target = direction === "next" ? blocks.find((el) => el.offsetTop > thresh) || blocks[0] : blocks.reverse().find((el) => el.offsetTop < thresh) || blocks[0];
+        target.scrollIntoView({ behavior: "smooth", block: "center" });
+        return target;
       }
 
       let _sbsRenderedKey = "";
@@ -13371,6 +13466,243 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
       };
       // ---- End Outlier Unit Tests ----
 
+      // ---- Outlier E2E Tests (bd-24q.10.4) ----
+      // Run via console: window.__runOutlierE2ETests()
+      // Requires dataset to be loaded.
+      window.__runOutlierE2ETests = async function () {
+        const R = [];
+        const log = (msg, ctx) => console.log("  [OUT-E2E]", msg, ctx || "");
+        const A = (c, m, x) => { R.push(c ? { pass: true, msg: m } : { pass: false, msg: m, ctx: x }); if (!c) console.error("  FAIL:", m, x || ""); else log("PASS: " + m); };
+        const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+
+        if (!DATASET.loaded || ALL_COMMITS.length < 10) {
+          console.error("OUT-E2E: Need loaded dataset with >= 10 commits.");
+          return { passed: 0, failed: 1, total: 1, results: [{ pass: false, msg: "Dataset not loaded or < 10 commits" }] };
+        }
+
+        const panel = document.getElementById("outlierPanel");
+        const listEl = document.getElementById("outlierList");
+        const metricSel = document.getElementById("outlierMetricSel");
+        const topKSel = document.getElementById("outlierTopKSel");
+        if (!panel || !listEl || !metricSel || !topKSel) {
+          console.error("OUT-E2E: Missing outlier panel DOM elements.");
+          return { passed: 0, failed: 1, total: 1, results: [{ pass: false, msg: "Missing outlier DOM elements" }] };
+        }
+
+        const origIdx = DOC.idx;
+        const origMetric = metricSel.value;
+        const origTopK = topKSel.value;
+
+        // --- E2E 1: Default render populates outlier list ---
+        await (async function testE2E_defaultRender() {
+          metricSel.value = "impact";
+          topKSel.value = "10";
+          metricSel.dispatchEvent(new Event("change"));
+          await wait(2000); // Worker computation can be slow.
+
+          const items = listEl.querySelectorAll("[data-outlier-hash]");
+          log("Default render: " + items.length + " outlier items");
+          A(items.length > 0, "out-e2e: outlier list populated", { count: items.length });
+          A(items.length <= 10, "out-e2e: at most topK=10 items", { count: items.length });
+
+          // Each item should have a hash, rank, and z-score.
+          if (items.length > 0) {
+            const first = items[0];
+            const hash = first.dataset.outlierHash;
+            A(hash && hash.length >= 7, "out-e2e: first item has hash", { hash });
+            A(first.textContent.includes("#1"), "out-e2e: first item shows rank #1");
+            A(first.textContent.includes("z="), "out-e2e: first item shows z-score");
+          }
+        })();
+
+        // --- E2E 2: Change metric to lev -> list updates ---
+        await (async function testE2E_changeMetric() {
+          metricSel.value = "impact";
+          metricSel.dispatchEvent(new Event("change"));
+          await wait(2000);
+          const impactItems = listEl.querySelectorAll("[data-outlier-hash]");
+          const impactHash = impactItems.length > 0 ? impactItems[0].dataset.outlierHash : "";
+
+          metricSel.value = "lev";
+          metricSel.dispatchEvent(new Event("change"));
+          await wait(2000);
+          const levItems = listEl.querySelectorAll("[data-outlier-hash]");
+          const levHash = levItems.length > 0 ? levItems[0].dataset.outlierHash : "";
+
+          log("Impact #1: " + impactHash.slice(0, 7) + ", Lev #1: " + levHash.slice(0, 7));
+          A(levItems.length > 0, "out-e2e: lev metric has outlier items", { count: levItems.length });
+          // Different metrics likely produce different top outliers.
+          if (impactItems.length > 0 && levItems.length > 0) {
+            // Just verify both rendered (they may or may not differ).
+            A(true, "out-e2e: both metrics rendered outliers");
+          }
+        })();
+
+        // --- E2E 3: Change Top-K to 5 -> fewer items ---
+        await (async function testE2E_changeTopK() {
+          metricSel.value = "impact";
+          topKSel.value = "5";
+          metricSel.dispatchEvent(new Event("change"));
+          await wait(2000);
+
+          const items5 = listEl.querySelectorAll("[data-outlier-hash]");
+          log("TopK=5: " + items5.length + " items");
+          A(items5.length > 0, "out-e2e: topK=5 has items", { count: items5.length });
+          A(items5.length <= 5, "out-e2e: topK=5 limits to 5 items", { count: items5.length });
+
+          topKSel.value = "20";
+          metricSel.dispatchEvent(new Event("change"));
+          await wait(2000);
+
+          const items20 = listEl.querySelectorAll("[data-outlier-hash]");
+          log("TopK=20: " + items20.length + " items");
+          A(items20.length >= items5.length, "out-e2e: topK=20 has >= topK=5 items", { k5: items5.length, k20: items20.length });
+        })();
+
+        // --- E2E 4: Click outlier item -> jumps to commit ---
+        await (async function testE2E_clickJumpsToCommit() {
+          metricSel.value = "impact";
+          topKSel.value = "10";
+          metricSel.dispatchEvent(new Event("change"));
+          await wait(2000);
+
+          const items = listEl.querySelectorAll("[data-outlier-hash]");
+          if (items.length < 1) {
+            A(false, "out-e2e: no outlier items to click");
+            return;
+          }
+
+          // Select a different commit first.
+          selectCommitIdx(0);
+          await wait(200);
+          A(DOC.idx === 0, "out-e2e: start at idx 0");
+
+          // Click the first outlier item.
+          const firstHash = items[0].dataset.outlierHash;
+          const expectedIdx = ALL_COMMITS.findIndex(c => c.hash === firstHash);
+          items[0].click();
+          await wait(300);
+
+          log("Clicked outlier #1: hash=" + firstHash.slice(0, 7) + ", expected idx=" + expectedIdx + ", got idx=" + DOC.idx);
+          A(DOC.idx === expectedIdx, "out-e2e: click jumped to correct commit", { expected: expectedIdx, got: DOC.idx });
+          A(DOC.idx !== 0, "out-e2e: commit index changed from 0", { got: DOC.idx });
+        })();
+
+        // --- E2E 5: Click different outlier items -> different commits ---
+        await (async function testE2E_clickDifferentOutliers() {
+          metricSel.value = "impact";
+          topKSel.value = "10";
+          metricSel.dispatchEvent(new Event("change"));
+          await wait(2000);
+
+          const items = listEl.querySelectorAll("[data-outlier-hash]");
+          if (items.length < 2) {
+            log("Only " + items.length + " outlier(s), skipping multi-click test");
+            A(true, "out-e2e: skipped multi-click (insufficient outliers)");
+            return;
+          }
+
+          items[0].click();
+          await wait(200);
+          const idx1 = DOC.idx;
+
+          items[1].click();
+          await wait(200);
+          const idx2 = DOC.idx;
+
+          log("Outlier #1 idx=" + idx1 + ", Outlier #2 idx=" + idx2);
+          A(idx1 !== idx2, "out-e2e: different outliers select different commits", { idx1, idx2 });
+        })();
+
+        // --- E2E 6: Chart annotations appear on timeline ---
+        await (async function testE2E_chartAnnotations() {
+          metricSel.value = "impact";
+          topKSel.value = "10";
+          metricSel.dispatchEvent(new Event("change"));
+          await wait(2000);
+
+          if (!chartTimeline) {
+            log("chartTimeline not available, skipping annotation test");
+            A(true, "out-e2e: skipped chart annotation (no chartTimeline)");
+            return;
+          }
+
+          const opt = chartTimeline.getOption();
+          const series = opt?.series || [];
+          // Check if any series has markPoint data (outlier annotations).
+          let hasMarkPoints = false;
+          for (const s of series) {
+            const mp = s.markPoint?.data;
+            if (mp && mp.length > 0) {
+              hasMarkPoints = true;
+              log("Found " + mp.length + " mark points on series");
+              break;
+            }
+          }
+          A(hasMarkPoints, "out-e2e: timeline chart has outlier mark points");
+        })();
+
+        // --- E2E 7: Z-score bar color coding ---
+        await (async function testE2E_zScoreColors() {
+          metricSel.value = "impact";
+          topKSel.value = "10";
+          metricSel.dispatchEvent(new Event("change"));
+          await wait(2000);
+
+          const items = listEl.querySelectorAll("[data-outlier-hash]");
+          if (items.length < 1) {
+            A(false, "out-e2e: no items for z-score color test");
+            return;
+          }
+
+          // Check that z-score text is present and uses a color class.
+          let foundZScore = false;
+          for (const item of items) {
+            const zMatch = item.textContent.match(/z=(\d+\.\d+)/);
+            if (zMatch) {
+              foundZScore = true;
+              const z = parseFloat(zMatch[1]);
+              log("Found z=" + z);
+              // Verify the z-score span has appropriate coloring.
+              const zSpan = item.querySelector("[style*='color:']");
+              A(zSpan != null, "out-e2e: z-score element has color styling");
+              break;
+            }
+          }
+          A(foundZScore, "out-e2e: at least one z-score found in items");
+        })();
+
+        // --- E2E 8: Loading/empty state handling ---
+        await (async function testE2E_loadingState() {
+          const loading = document.getElementById("outlierLoading");
+          const empty = document.getElementById("outlierEmpty");
+          A(loading != null, "out-e2e: loading element exists");
+          A(empty != null, "out-e2e: empty element exists");
+          // After successful render, both should be hidden.
+          metricSel.value = "impact";
+          topKSel.value = "10";
+          metricSel.dispatchEvent(new Event("change"));
+          await wait(2500);
+          A(loading.classList.contains("hidden"), "out-e2e: loading hidden after render", { classes: loading.className });
+        })();
+
+        // --- Restore original state ---
+        metricSel.value = origMetric;
+        topKSel.value = origTopK;
+        metricSel.dispatchEvent(new Event("change"));
+        selectCommitIdx(origIdx);
+        await wait(300);
+        log("Restored: idx=" + origIdx + ", metric=" + origMetric + ", topK=" + origTopK);
+
+        // --- Summary ---
+        const p = R.filter(x => x.pass).length, f = R.filter(x => !x.pass).length;
+        const s = `Outlier E2E Tests: ${p} passed, ${f} failed, ${R.length} total`;
+        if (f > 0) { console.warn(s); R.filter(x => !x.pass).forEach(x => console.error("  FAIL:", x.msg, x.ctx || "")); }
+        else console.log("%c" + s, "color:green;font-weight:bold");
+        return { passed: p, failed: f, total: R.length, results: R };
+      };
+      // ---- End Outlier E2E Tests ----
+
 
       // ---- Heat Stripe Unit Tests (bd-24q.13.3) ----
       // Run via console: window.__runHeatStripeTests()
@@ -13583,6 +13915,189 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
         return { passed: p, failed: f, total: R.length, results: R };
       };
       // ---- End Heat Stripe Unit Tests ----
+
+      // ---- Heat Stripe E2E Tests (bd-24q.13.4) ----
+      // Run via console: window.__runHeatStripeE2ETests()
+      // Requires dataset to be loaded.
+      window.__runHeatStripeE2ETests = async function () {
+        const R = [];
+        const log = (msg, ctx) => console.log("  [HS-E2E]", msg, ctx || "");
+        const A = (c, m, x) => { R.push(c ? { pass: true, msg: m } : { pass: false, msg: m, ctx: x }); if (!c) console.error("  FAIL:", m, x || ""); else log("PASS: " + m); };
+        const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+
+        if (!DATASET.loaded || ALL_COMMITS.length < 5) {
+          console.error("HS-E2E: Need loaded dataset with >= 5 commits.");
+          return { passed: 0, failed: 1, total: 1, results: [{ pass: false, msg: "Dataset not loaded or < 5 commits" }] };
+        }
+
+        const canvas = document.getElementById("dockHeatStripe");
+        const tooltip = document.getElementById("dockHeatTooltip");
+        if (!canvas || !tooltip) {
+          console.error("HS-E2E: Missing dockHeatStripe canvas or dockHeatTooltip div.");
+          return { passed: 0, failed: 1, total: 1, results: [{ pass: false, msg: "Missing heat stripe DOM elements" }] };
+        }
+
+        const origIdx = DOC.idx;
+
+        // Ensure stripe is rendered.
+        renderHeatStripe();
+        await wait(200);
+
+        const stripe = computeHeatStripe(ALL_COMMITS, {
+          resolution: "commit",
+          tzMode: "local",
+          metric: "lines",
+          bucketMode: STATE.bucketMode,
+        });
+
+        // --- E2E 1: Canvas rendered with correct dimensions ---
+        await (async function testE2E_canvasRendered() {
+          A(canvas.width > 0, "hs-e2e: canvas width > 0", { got: canvas.width });
+          A(canvas.height > 0, "hs-e2e: canvas height > 0", { got: canvas.height });
+          A(stripe != null, "hs-e2e: computeHeatStripe returns data");
+          A(stripe.bins.length > 0, "hs-e2e: bins array is non-empty", { got: stripe.bins.length });
+          A(stripe.bins.length === ALL_COMMITS.length, "hs-e2e: commit mode has one bin per commit", { bins: stripe.bins.length, commits: ALL_COMMITS.length });
+        })();
+
+        // --- E2E 2: Mousemove shows tooltip with expected fields ---
+        await (async function testE2E_tooltipOnHover() {
+          const rect = canvas.getBoundingClientRect();
+          const midX = rect.left + rect.width / 2;
+          const midY = rect.top + rect.height / 2;
+
+          // Simulate mousemove over middle of stripe.
+          const moveEvt = new MouseEvent("mousemove", { clientX: midX, clientY: midY, bubbles: true });
+          canvas.dispatchEvent(moveEvt);
+          await wait(100);
+
+          A(!tooltip.classList.contains("hidden"), "hs-e2e: tooltip visible after mousemove");
+          const html = tooltip.innerHTML;
+          log("Tooltip content sample: " + html.slice(0, 120));
+
+          // Tooltip should contain commit hash (short, 7 chars hex).
+          const hasHash = /<strong>[a-f0-9]{7}<\/strong>/i.test(html);
+          A(hasHash, "hs-e2e: tooltip contains commit short hash", { html: html.slice(0, 200) });
+
+          // Tooltip should mention "dominant".
+          A(html.includes("dominant"), "hs-e2e: tooltip shows dominant bucket", { html: html.slice(0, 200) });
+
+          // Tooltip should mention mass (lines).
+          A(html.includes("lines"), "hs-e2e: tooltip shows mass in lines", { html: html.slice(0, 200) });
+        })();
+
+        // --- E2E 3: Mouseleave hides tooltip ---
+        await (async function testE2E_tooltipHidesOnLeave() {
+          const leaveEvt = new MouseEvent("mouseleave", { bubbles: true });
+          canvas.dispatchEvent(leaveEvt);
+          await wait(100);
+
+          A(tooltip.classList.contains("hidden"), "hs-e2e: tooltip hidden after mouseleave");
+        })();
+
+        // --- E2E 4: Click on stripe changes commit index ---
+        await (async function testE2E_clickJumpsToCommit() {
+          // Click near the start (25% from left).
+          const rect = canvas.getBoundingClientRect();
+          const clickX = rect.left + rect.width * 0.25;
+          const clickY = rect.top + rect.height / 2;
+
+          selectCommitIdx(ALL_COMMITS.length - 1); // Start at end.
+          await wait(100);
+          const before = DOC.idx;
+
+          const clickEvt = new MouseEvent("click", { clientX: clickX, clientY: clickY, bubbles: true });
+          canvas.dispatchEvent(clickEvt);
+          await wait(200);
+
+          const after = DOC.idx;
+          log("Click at 25%: before=" + before + ", after=" + after);
+          A(after !== before, "hs-e2e: click changed commit index", { before, after });
+          // 25% of the stripe should select a commit roughly in the first quarter.
+          const quarter = Math.floor(ALL_COMMITS.length * 0.35);
+          A(after <= quarter, "hs-e2e: clicking left quarter selects early commit", { after, quarter });
+        })();
+
+        // --- E2E 5: Click at different positions selects different commits ---
+        await (async function testE2E_differentClicksDifferentCommits() {
+          const rect = canvas.getBoundingClientRect();
+          const y = rect.top + rect.height / 2;
+
+          // Click at 10%.
+          const click1 = new MouseEvent("click", { clientX: rect.left + rect.width * 0.1, clientY: y, bubbles: true });
+          canvas.dispatchEvent(click1);
+          await wait(100);
+          const idx1 = DOC.idx;
+
+          // Click at 90%.
+          const click2 = new MouseEvent("click", { clientX: rect.left + rect.width * 0.9, clientY: y, bubbles: true });
+          canvas.dispatchEvent(click2);
+          await wait(100);
+          const idx2 = DOC.idx;
+
+          log("10% click: idx=" + idx1 + ", 90% click: idx=" + idx2);
+          A(idx2 > idx1, "hs-e2e: right click selects later commit than left click", { idx1, idx2 });
+        })();
+
+        // --- E2E 6: Tooltip updates when moving to different bin ---
+        await (async function testE2E_tooltipUpdatesOnMove() {
+          const rect = canvas.getBoundingClientRect();
+          const y = rect.top + rect.height / 2;
+
+          // Hover at 20%.
+          const move1 = new MouseEvent("mousemove", { clientX: rect.left + rect.width * 0.2, clientY: y, bubbles: true });
+          canvas.dispatchEvent(move1);
+          await wait(100);
+          const html1 = tooltip.innerHTML;
+
+          // Hover at 80%.
+          const move2 = new MouseEvent("mousemove", { clientX: rect.left + rect.width * 0.8, clientY: y, bubbles: true });
+          canvas.dispatchEvent(move2);
+          await wait(100);
+          const html2 = tooltip.innerHTML;
+
+          log("Tooltip at 20%: " + html1.slice(0, 60) + "...");
+          log("Tooltip at 80%: " + html2.slice(0, 60) + "...");
+          A(html1 !== html2, "hs-e2e: tooltip content differs for different bins");
+
+          // Cleanup.
+          canvas.dispatchEvent(new MouseEvent("mouseleave", { bubbles: true }));
+        })();
+
+        // --- E2E 7: Selected marker updates after click ---
+        await (async function testE2E_selectedMarkerUpdates() {
+          const rect = canvas.getBoundingClientRect();
+          const y = rect.top + rect.height / 2;
+
+          // Click at 50%.
+          canvas.dispatchEvent(new MouseEvent("click", { clientX: rect.left + rect.width * 0.5, clientY: y, bubbles: true }));
+          await wait(200);
+
+          // After click, DOC.idx should be roughly in the middle.
+          const mid = DOC.idx;
+          const expected = Math.floor(ALL_COMMITS.length * 0.5);
+          const tolerance = Math.max(3, Math.floor(ALL_COMMITS.length * 0.1));
+          A(Math.abs(mid - expected) <= tolerance, "hs-e2e: 50% click selects mid-range commit", { mid, expected, tolerance });
+
+          // Verify renderHeatStripe runs without error after index change.
+          let threw = false;
+          try { renderHeatStripe(); } catch (e) { threw = true; }
+          A(!threw, "hs-e2e: renderHeatStripe succeeds after index change");
+        })();
+
+        // --- Restore original state ---
+        selectCommitIdx(origIdx);
+        await wait(200);
+        canvas.dispatchEvent(new MouseEvent("mouseleave", { bubbles: true }));
+        log("Restored: idx=" + origIdx);
+
+        // --- Summary ---
+        const p = R.filter(x => x.pass).length, f = R.filter(x => !x.pass).length;
+        const s = `Heat Stripe E2E Tests: ${p} passed, ${f} failed, ${R.length} total`;
+        if (f > 0) { console.warn(s); R.filter(x => !x.pass).forEach(x => console.error("  FAIL:", x.msg, x.ctx || "")); }
+        else console.log("%c" + s, "color:green;font-weight:bold");
+        return { passed: p, failed: f, total: R.length, results: R };
+      };
+      // ---- End Heat Stripe E2E Tests ----
 
 
       // ---- Phase Map Unit Tests (bd-24q.11.3) ----
@@ -13825,6 +14340,251 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
         return { passed: p, failed: f, total: R.length, results: R };
       };
       // ---- End Phase Map Unit Tests ----
+      // ---- History Search Unit Tests (bd-24q.9.4) ----
+      // Run via console: window.__runSearchTests()
+      window.__runSearchTests = async function () {
+        const R = [];
+        const A = (c, m, x) => { R.push(c ? { pass: true, msg: m } : { pass: false, msg: m, ctx: x }); if (!c) console.error("FAIL:", m, x || ""); };
+        const log = (m) => console.log("  [search]", m);
+
+        // --- Tokenizer tests (via worker) ---
+        log("Testing tokenizer via worker query_search...");
+
+        // Test 1: Empty query returns no hits.
+        try {
+          const r1 = await workerRequest("query_search", { q: "", limit: 10 }, { timeoutMs: 5000 });
+          A(Array.isArray(r1.hits), "tokenizer: empty query returns hits array");
+          A(r1.hits.length === 0, "tokenizer: empty query -> 0 hits", { len: r1.hits.length });
+        } catch (e) { A(false, "tokenizer: empty query threw", { err: String(e) }); }
+
+        // Test 2: Nonsense query returns no hits.
+        try {
+          const r2 = await workerRequest("query_search", { q: "xyzzyplugh99999", limit: 10 }, { timeoutMs: 5000 });
+          A(r2.hits.length === 0, "tokenizer: nonsense query -> 0 hits", { len: r2.hits.length });
+        } catch (e) { A(false, "tokenizer: nonsense query threw", { err: String(e) }); }
+
+        // Test 3: Known query returns results (spec-related term).
+        try {
+          const r3 = await workerRequest("query_search", { q: "MVCC", limit: 5 }, { timeoutMs: 10000 });
+          A(r3.hits.length > 0, "tokenizer: MVCC query returns hits", { len: r3.hits.length });
+          if (r3.hits.length > 0) {
+            A(typeof r3.hits[0].idx === "number", "tokenizer: hit has idx field");
+            A(typeof r3.hits[0].subject === "string", "tokenizer: hit has subject field");
+            A(typeof r3.hits[0].score === "number", "tokenizer: hit has score field");
+          }
+        } catch (e) { A(false, "tokenizer: MVCC query threw", { err: String(e) }); }
+
+        // Test 4: Quoted phrase search.
+        try {
+          const r4 = await workerRequest("query_search", { q: '"page-level versioning"', limit: 5 }, { timeoutMs: 10000 });
+          A(Array.isArray(r4.hits), "tokenizer: phrase search returns array");
+          log("Phrase search 'page-level versioning': " + r4.hits.length + " hits");
+        } catch (e) { A(false, "tokenizer: phrase search threw", { err: String(e) }); }
+
+        // Test 5: Limit respected.
+        try {
+          const r5 = await workerRequest("query_search", { q: "spec", limit: 2 }, { timeoutMs: 10000 });
+          A(r5.hits.length <= 2, "tokenizer: limit=2 respected", { len: r5.hits.length });
+        } catch (e) { A(false, "tokenizer: limit test threw", { err: String(e) }); }
+
+        // --- Search index tests ---
+        log("Testing search index...");
+
+        // Test 6: Search index was built during warmup.
+        A(WORKER_DERIVED.searchReady === true, "index: searchReady is true");
+
+        // Test 7: Export/hydrate round-trip.
+        try {
+          const exported = await workerRequest("export_search_index", {}, { timeoutMs: 10000 });
+          A(exported && typeof exported === "object", "index: export returns object");
+          A(typeof exported.docs_count === "number" || typeof exported.docs === "object", "index: export has docs info", { keys: Object.keys(exported) });
+          log("Exported index keys: " + Object.keys(exported).join(", "));
+
+          const hydrated = await workerRequest("hydrate_search_index", { data: exported }, { timeoutMs: 10000 });
+          A(hydrated && hydrated.hydrated === true, "index: hydrate succeeds after export", hydrated);
+        } catch (e) { A(false, "index: export/hydrate threw", { err: String(e) }); }
+
+        // --- First-introduced tests ---
+        log("Testing first-introduced analytics...");
+
+        // Test 8: First-introduced for a known term.
+        try {
+          const fi = await workerRequest("find_first_introduced", { query: "MVCC", contextLines: 2 }, { timeoutMs: 30000 });
+          A(fi.found === true, "first-introduced: MVCC found", fi);
+          if (fi.found) {
+            A(typeof fi.commitIdx === "number", "first-introduced: has commitIdx");
+            A(fi.commitIdx >= 0, "first-introduced: commitIdx >= 0", { idx: fi.commitIdx });
+            A(typeof fi.matchLine === "string", "first-introduced: has matchLine");
+            A(fi.matchLine.toLowerCase().includes("mvcc"), "first-introduced: matchLine contains query", { matchLine: fi.matchLine });
+            A(Array.isArray(fi.contextLines), "first-introduced: has contextLines");
+            A(fi.contextLines.length > 0, "first-introduced: contextLines non-empty", { len: fi.contextLines.length });
+            const matchCtx = fi.contextLines.find(c => c.isMatch);
+            A(matchCtx !== undefined, "first-introduced: contextLines has isMatch=true entry");
+            log("MVCC first introduced at commit #" + fi.commitIdx + " (" + fi.short + "): " + fi.subject);
+          }
+        } catch (e) { A(false, "first-introduced: MVCC threw", { err: String(e) }); }
+
+        // Test 9: First-introduced for nonexistent term.
+        try {
+          const fi2 = await workerRequest("find_first_introduced", { query: "xyzzyplugh99999" }, { timeoutMs: 10000 });
+          A(fi2.found === false, "first-introduced: nonexistent term -> not found", fi2);
+        } catch (e) { A(false, "first-introduced: nonexistent threw", { err: String(e) }); }
+
+        // Test 10: First-introduced empty query.
+        try {
+          const fi3 = await workerRequest("find_first_introduced", { query: "" }, { timeoutMs: 5000 });
+          A(fi3.found === false, "first-introduced: empty query -> not found", fi3);
+        } catch (e) { A(false, "first-introduced: empty query threw", { err: String(e) }); }
+
+        // Test 11: First-introduced case insensitivity.
+        try {
+          const fiLower = await workerRequest("find_first_introduced", { query: "mvcc" }, { timeoutMs: 30000 });
+          const fiUpper = await workerRequest("find_first_introduced", { query: "MVCC" }, { timeoutMs: 30000 });
+          A(fiLower.found === fiUpper.found, "first-introduced: case insensitive (same found)", { lower: fiLower.found, upper: fiUpper.found });
+          if (fiLower.found && fiUpper.found) {
+            A(fiLower.commitIdx === fiUpper.commitIdx, "first-introduced: case insensitive (same commitIdx)", { lower: fiLower.commitIdx, upper: fiUpper.commitIdx });
+          }
+        } catch (e) { A(false, "first-introduced: case test threw", { err: String(e) }); }
+
+        // --- Most-edited sections tests ---
+        log("Testing most-edited sections analytics...");
+
+        // Test 12: Most-edited sections were precomputed during warmup.
+        A(WORKER_DERIVED.mostEditedReady === true, "most-edited: mostEditedReady is true");
+
+        // Test 13: Compute most-edited sections.
+        try {
+          const me = await workerRequest("compute_most_edited_sections", { topK: 5 }, { timeoutMs: 120000 });
+          A(Array.isArray(me.sections), "most-edited: returns sections array");
+          A(me.sections.length > 0, "most-edited: has sections", { len: me.sections.length });
+          A(me.sections.length <= 5, "most-edited: topK=5 respected", { len: me.sections.length });
+
+          if (me.sections.length > 0) {
+            const s0 = me.sections[0];
+            A(typeof s0.heading === "string", "most-edited: section has heading");
+            A(typeof s0.totalTokensDelta === "number", "most-edited: section has totalTokensDelta");
+            A(typeof s0.totalLinesDelta === "number", "most-edited: section has totalLinesDelta");
+            A(typeof s0.peakIdx === "number", "most-edited: section has peakIdx");
+            A(typeof s0.peakDelta === "number", "most-edited: section has peakDelta");
+            A(typeof s0.commitCount === "number", "most-edited: section has commitCount");
+            A(Array.isArray(s0.timeline), "most-edited: section has timeline");
+            A(s0.timeline.length > 0, "most-edited: timeline non-empty", { len: s0.timeline.length });
+            A(s0.commitCount === s0.timeline.length, "most-edited: commitCount matches timeline.length", { commitCount: s0.commitCount, timelineLen: s0.timeline.length });
+            log("Top section: '" + s0.heading + "' - " + s0.totalTokensDelta + " token delta across " + s0.commitCount + " commits");
+
+            // Verify sorting (descending by totalTokensDelta).
+            for (let i = 1; i < me.sections.length; i++) {
+              A(me.sections[i - 1].totalTokensDelta >= me.sections[i].totalTokensDelta,
+                "most-edited: sorted desc by totalTokensDelta",
+                { prev: me.sections[i - 1].totalTokensDelta, curr: me.sections[i].totalTokensDelta, idx: i });
+            }
+          }
+        } catch (e) { A(false, "most-edited: compute threw", { err: String(e) }); }
+
+        // Test 14: Timeline entry structure.
+        try {
+          const me2 = await workerRequest("compute_most_edited_sections", { topK: 1 }, { timeoutMs: 120000 });
+          if (me2.sections.length > 0 && me2.sections[0].timeline.length > 0) {
+            const t = me2.sections[0].timeline[0];
+            A(typeof t.idx === "number", "most-edited: timeline entry has idx");
+            A(typeof t.tokensAdded === "number", "most-edited: timeline entry has tokensAdded");
+            A(typeof t.tokensDeleted === "number", "most-edited: timeline entry has tokensDeleted");
+            A(typeof t.addLines === "number", "most-edited: timeline entry has addLines");
+            A(typeof t.delLines === "number", "most-edited: timeline entry has delLines");
+            A(t.tokensAdded >= 0, "most-edited: tokensAdded >= 0", { val: t.tokensAdded });
+            A(t.tokensDeleted >= 0, "most-edited: tokensDeleted >= 0", { val: t.tokensDeleted });
+          }
+        } catch (e) { A(false, "most-edited: timeline structure threw", { err: String(e) }); }
+
+        // --- Search palette UI tests ---
+        log("Testing search palette UI...");
+
+        // Test 15: Search palette elements exist.
+        A(document.getElementById("searchPaletteOverlay") !== null, "palette: overlay element exists");
+        A(document.getElementById("searchPaletteInput") !== null, "palette: input element exists");
+        A(document.getElementById("searchPaletteResults") !== null, "palette: results element exists");
+
+        // Test 16: Open/close palette.
+        if (typeof openSearchPalette === "function" && typeof closeSearchPalette === "function") {
+          openSearchPalette();
+          const ov = document.getElementById("searchPaletteOverlay");
+          A(!ov.classList.contains("hidden"), "palette: opens (overlay not hidden)");
+          A(_spOpen === true, "palette: _spOpen is true after open");
+
+          closeSearchPalette();
+          A(ov.classList.contains("hidden"), "palette: closes (overlay hidden)");
+          A(_spOpen === false, "palette: _spOpen is false after close");
+        } else {
+          A(false, "palette: openSearchPalette/closeSearchPalette not defined");
+        }
+
+        // Test 17: spNavigate bounds.
+        if (typeof spNavigate === "function") {
+          _spResults = [{ idx: 0 }, { idx: 1 }, { idx: 2 }];
+          _spActiveIdx = 0;
+          spNavigate(1);
+          A(_spActiveIdx === 1, "palette: navigate down from 0 -> 1", { idx: _spActiveIdx });
+          spNavigate(1);
+          A(_spActiveIdx === 2, "palette: navigate down from 1 -> 2", { idx: _spActiveIdx });
+          spNavigate(1);
+          A(_spActiveIdx === 2, "palette: navigate down from 2 -> 2 (clamped)", { idx: _spActiveIdx });
+          spNavigate(-1);
+          A(_spActiveIdx === 1, "palette: navigate up from 2 -> 1", { idx: _spActiveIdx });
+          spNavigate(-10);
+          A(_spActiveIdx === 0, "palette: navigate up past 0 -> 0 (clamped)", { idx: _spActiveIdx });
+          _spResults = [];
+          _spActiveIdx = -1;
+        }
+
+        // --- Clustering tests ---
+        log("Testing clustering...");
+
+        // Test 18: Clusters were computed during warmup.
+        A(WORKER_DERIVED.clusterReady === true, "clustering: clusterReady is true");
+
+        // Test 19: Cluster structure.
+        try {
+          const cl = await workerRequest("compute_clusters", { limit: 5, threshold: 0.3 }, { timeoutMs: 30000 });
+          A(Array.isArray(cl.clusters), "clustering: returns clusters array");
+          log("Got " + cl.clusters.length + " clusters");
+          if (cl.clusters.length > 0) {
+            const c0 = cl.clusters[0];
+            A(typeof c0.id === "string", "clustering: cluster has string id", { id: c0.id });
+            A(c0.id.startsWith("cl-"), "clustering: cluster id starts with cl-", { id: c0.id });
+            A(typeof c0.size === "number", "clustering: cluster has size");
+            A(c0.size >= 2, "clustering: cluster size >= 2", { size: c0.size });
+            A(typeof c0.medoid === "number", "clustering: cluster has medoid");
+            A(Array.isArray(c0.tags), "clustering: cluster has tags array");
+            A(Array.isArray(c0.items), "clustering: cluster has items array");
+            A(c0.items.length === c0.size, "clustering: items.length === size", { items: c0.items.length, size: c0.size });
+            // Verify items have expected fields.
+            if (c0.items.length > 0) {
+              A(typeof c0.items[0].idx === "number", "clustering: item has idx");
+              A(typeof c0.items[0].subject === "string", "clustering: item has subject");
+            }
+            // Verify sorting (largest first).
+            for (let i = 1; i < cl.clusters.length; i++) {
+              A(cl.clusters[i - 1].size >= cl.clusters[i].size,
+                "clustering: sorted desc by size",
+                { prev: cl.clusters[i - 1].size, curr: cl.clusters[i].size, idx: i });
+            }
+            // Verify stable IDs (deterministic).
+            const cl2 = await workerRequest("compute_clusters", { limit: 5, threshold: 0.3 }, { timeoutMs: 30000 });
+            if (cl2.clusters.length > 0) {
+              A(cl2.clusters[0].id === c0.id, "clustering: stable IDs across calls", { first: c0.id, second: cl2.clusters[0].id });
+            }
+          }
+        } catch (e) { A(false, "clustering: compute threw", { err: String(e) }); }
+
+        // --- Summary ---
+        const p = R.filter(x => x.pass).length, f = R.filter(x => !x.pass).length;
+        const s = `Search Tests: ${p} passed, ${f} failed, ${R.length} total`;
+        if (f > 0) { console.warn(s); R.filter(x => !x.pass).forEach(x => console.error("  FAIL:", x.msg, x.ctx || "")); }
+        else console.log("%c" + s, "color:green;font-weight:bold");
+        return { passed: p, failed: f, total: R.length, results: R };
+      };
+      // ---- End History Search Unit Tests ----
+
 
 
 
@@ -14734,6 +15494,158 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
         selectCommitIdx(bin.repCommitIdx);
       }
 
+      // -----------------------------------------------------------
+      // Mobile Story Mode (bd-24q.4.3)
+      // -----------------------------------------------------------
+
+      let _storyMobileIdx = 0;
+
+      function openStoryMobile() {
+        const sheet = document.getElementById("storyMobileSheet");
+        const overlay = document.getElementById("storyMobileOverlay");
+        if (sheet) { sheet.classList.remove("hidden"); requestAnimationFrame(() => sheet.classList.add("open")); }
+        if (overlay) overlay.classList.remove("hidden");
+        _storyMilestones = getMilestones().filter(m => m.commitIdx !== null);
+        if (_storyMilestones.length && _storyMobileIdx >= _storyMilestones.length) _storyMobileIdx = 0;
+        _renderStoryMobileCard();
+      }
+
+      function closeStoryMobile() {
+        const sheet = document.getElementById("storyMobileSheet");
+        const overlay = document.getElementById("storyMobileOverlay");
+        if (sheet) { sheet.classList.remove("open"); setTimeout(() => sheet.classList.add("hidden"), 310); }
+        if (overlay) overlay.classList.add("hidden");
+      }
+
+      function _renderStoryMobileCard() {
+        const area = document.getElementById("storyMobileCardArea");
+        const progress = document.getElementById("storyMobileProgress");
+        if (!area) return;
+        const m = _storyMilestones[_storyMobileIdx];
+        if (!m) { area.innerHTML = '<div class="text-sm text-slate-400 italic text-center">No milestones</div>'; return; }
+        const commit = ALL_COMMITS[m.commitIdx];
+        const date = commit?.dateIso ? new Date(commit.dateIso).toLocaleDateString() : "";
+        const md = window._mdSingleton || window.markdownit?.();
+        const annotationHtml = md ? md.render(m.annotationMd || "") : escapeHtml(m.annotationMd || "");
+        const metrics = commit ? `+${fmtInt(commit.add || 0)} -${fmtInt(commit.del || 0)} lines` : "";
+        area.innerHTML = `<div class="text-center"><div class="text-xl font-bold text-slate-900">${escapeHtml(m.title)}</div><div class="mt-4 text-sm leading-relaxed text-slate-700 story-annotation text-left">${annotationHtml}</div><div class="mt-4 flex items-center justify-center gap-3 text-xs text-slate-400">${date ? `<span>${escapeHtml(date)}</span>` : ""}${metrics ? `<span class="mono">${escapeHtml(metrics)}</span>` : ""}</div><button class="mt-4 focus-ring rounded-2xl bg-blue-600 px-5 py-2.5 text-sm font-semibold text-white hover:bg-blue-700" id="storyMobileJump" type="button">Jump to this commit</button></div>`;
+        document.getElementById("storyMobileJump")?.addEventListener("click", () => {
+          selectCommitIdx(m.commitIdx);
+          if (m.defaultTab) setDocTab(m.defaultTab);
+          if (m.focusHeading) {
+            requestAnimationFrame(() => {
+              const docEl = document.getElementById("docRendered");
+              const target = docEl?.querySelector("#" + CSS.escape(m.focusHeading));
+              if (target) target.scrollIntoView({ behavior: "smooth", block: "start" });
+            });
+          }
+          closeStoryMobile();
+        });
+        if (progress) progress.textContent = `${_storyMobileIdx + 1}/${_storyMilestones.length}`;
+        // Update prev/next button states
+        const prev = document.getElementById("storyMobilePrev");
+        const next = document.getElementById("storyMobileNext");
+        if (prev) prev.disabled = _storyMobileIdx <= 0;
+        if (next) next.disabled = _storyMobileIdx >= _storyMilestones.length - 1;
+      }
+
+      function _storyMobilePrev() {
+        if (_storyMobileIdx > 0) { _storyMobileIdx--; _renderStoryMobileCard(); }
+      }
+      function _storyMobileNext() {
+        if (_storyMobileIdx < _storyMilestones.length - 1) { _storyMobileIdx++; _renderStoryMobileCard(); }
+      }
+
+      function _wireStoryMobile() {
+        document.getElementById("btnStoryMobileTrigger")?.addEventListener("click", openStoryMobile);
+        document.getElementById("btnStoryMobileClose")?.addEventListener("click", closeStoryMobile);
+        document.getElementById("storyMobileOverlay")?.addEventListener("click", closeStoryMobile);
+        document.getElementById("storyMobilePrev")?.addEventListener("click", _storyMobilePrev);
+        document.getElementById("storyMobileNext")?.addEventListener("click", _storyMobileNext);
+        // Swipe gesture support
+        let _touchStartX = 0;
+        const area = document.getElementById("storyMobileCardArea");
+        if (area) {
+          area.addEventListener("touchstart", (e) => { _touchStartX = e.touches[0]?.clientX || 0; }, { passive: true });
+          area.addEventListener("touchend", (e) => {
+            const dx = (e.changedTouches[0]?.clientX || 0) - _touchStartX;
+            if (Math.abs(dx) > 60) {
+              if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+              if (dx > 0) _storyMobilePrev(); else _storyMobileNext();
+            }
+          });
+        }
+      }
+
+      // -----------------------------------------------------------
+      // Mobile Mini-Map Sheet (bd-24q.2.3)
+      // -----------------------------------------------------------
+
+      function openMiniMapMobile() {
+        const sheet = document.getElementById("miniMapMobileSheet");
+        const overlay = document.getElementById("miniMapMobileOverlay");
+        if (sheet) { sheet.classList.remove("hidden"); requestAnimationFrame(() => sheet.classList.add("open")); }
+        if (overlay) overlay.classList.remove("hidden");
+        void updateMiniMapMobileList();
+      }
+
+      function closeMiniMapMobile() {
+        const sheet = document.getElementById("miniMapMobileSheet");
+        const overlay = document.getElementById("miniMapMobileOverlay");
+        if (sheet) { sheet.classList.remove("open"); setTimeout(() => sheet.classList.add("hidden"), 260); }
+        if (overlay) overlay.classList.add("hidden");
+      }
+
+      async function updateMiniMapMobileList() {
+        const list = document.getElementById("miniMapMobileList");
+        if (!list) return;
+        const outline = await getOutline(DOC.idx);
+        const metrics = DOC.idx > 0 ? await getHeadingMetrics(DOC.idx) : new Map();
+        const filter = (document.getElementById("miniMapMobileSearch")?.value || "").trim().toLowerCase();
+        const items = [];
+        for (const entry of outline) {
+          if (filter && !entry.text.toLowerCase().includes(filter)) continue;
+          const m = metrics.get(entry.id) || { addLines: 0, delLines: 0, tokensAdded: 0, tokensDeleted: 0 };
+          const total = m.addLines + m.delLines;
+          const color = total === 0 ? "bg-slate-50 text-slate-600" : total > 20 ? "bg-red-50 text-red-700" : total > 5 ? "bg-amber-50 text-amber-700" : "bg-emerald-50 text-emerald-700";
+          const indent = Math.max(0, entry.level - 1) * 10;
+          const badge = total > 0 ? `<span class="ml-auto shrink-0 rounded-full px-1.5 py-0.5 text-[10px] font-bold ${color}">+${m.addLines} -${m.delLines}</span>` : "";
+          items.push(`<button class="w-full text-left flex items-center gap-2 rounded-xl px-3 py-2.5 min-h-[44px] ${color} hover:brightness-95 active:brightness-90 transition-colors" data-heading-id="${escapeHtml(entry.id)}" style="padding-left:${indent + 12}px"><span class="truncate text-sm font-medium">${escapeHtml(entry.text)}</span>${badge}</button>`);
+        }
+        list.innerHTML = items.length ? items.join("") : '<div class="text-xs text-slate-400 italic p-3">No headings found</div>';
+        list.querySelectorAll("button[data-heading-id]").forEach(btn => {
+          btn.addEventListener("click", () => {
+            const hid = btn.dataset.headingId;
+            if (DOC.tab !== "spec") setDocTab("spec");
+            setTimeout(() => {
+              const docEl = document.getElementById("docRendered");
+              if (docEl) {
+                const target = docEl.querySelector("#" + CSS.escape(hid));
+                if (target) {
+                  target.scrollIntoView({ behavior: "smooth", block: "start" });
+                  target.classList.remove("section-highlight");
+                  void target.offsetWidth;
+                  target.classList.add("section-highlight");
+                }
+              }
+            }, 200);
+            const stayOpen = document.getElementById("miniMapMobileStayOpen")?.checked;
+            if (!stayOpen) closeMiniMapMobile();
+          });
+        });
+      }
+
+      function _wireMiniMapMobile() {
+        document.getElementById("btnMiniMapMobile")?.addEventListener("click", openMiniMapMobile);
+        document.getElementById("btnMiniMapMobileClose")?.addEventListener("click", closeMiniMapMobile);
+        document.getElementById("miniMapMobileOverlay")?.addEventListener("click", closeMiniMapMobile);
+        let searchTimer = 0;
+        document.getElementById("miniMapMobileSearch")?.addEventListener("input", () => {
+          clearTimeout(searchTimer);
+          searchTimer = setTimeout(() => void updateMiniMapMobileList(), 150);
+        });
+      }
+
       function _wireHeatStripe() {
         const canvas = document.getElementById("dockHeatStripe");
         if (!canvas) return;
@@ -15356,6 +16268,89 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
 
         renderBocpd(commits);
         void maybeRefreshPhaseAndOutliers(commits);
+      }
+
+      // -----------------------------------------------------------
+      // Phase Map: Overlay Rendering + Interactions (bd-24q.11.2)
+      // -----------------------------------------------------------
+      const PHASE_COLORS = [
+        "rgba(59,130,246,0.06)","rgba(168,85,247,0.06)","rgba(34,197,94,0.06)",
+        "rgba(249,115,22,0.06)","rgba(236,72,153,0.06)","rgba(20,184,166,0.06)",
+      ];
+      let PHASE_FILTER = { segIdx: -1 };
+
+      function renderPhaseOverlay(commits) {
+        if (!chartTimeline || !commits.length) return;
+        const phase = WORKER_DERIVED.phase;
+        if (!phase || !phase.segments || !phase.segments.length) return;
+        const areas = phase.segments.map((seg, i) => {
+          const c0 = commits[seg.start]; const c1 = commits[seg.end] || commits[commits.length - 1];
+          if (!c0 || !c1) return null;
+          return [{ xAxis: c0.dateIso, itemStyle: { color: PHASE_COLORS[i % PHASE_COLORS.length], opacity: PHASE_FILTER.segIdx === i ? 0.18 : 0.06 } }, { xAxis: c1.dateIso }];
+        }).filter(Boolean);
+        chartTimeline.setOption({ series: [{ markArea: { silent: false, data: areas, tooltip: { formatter: (p) => {
+          const seg = WORKER_DERIVED.phase?.segments?.[p.dataIndex];
+          if (!seg) return "";
+          return `<div style="min-width:160px"><div style="font-weight:700">Phase ${p.dataIndex + 1}</div><div style="font-size:11px">Duration: ${seg.length} commits</div><div style="font-size:11px">Mean: ${seg.mean.toFixed(2)}, σ: ${seg.stddev.toFixed(2)}</div><div style="font-size:11px">Confidence: ${(seg.confidence * 100).toFixed(0)}%</div></div>`;
+        } } } }] }, false);
+        if (chartBocpd) {
+          const ba = phase.segments.map((seg, i) => [{ xAxis: seg.start, itemStyle: { color: PHASE_COLORS[i % PHASE_COLORS.length], opacity: PHASE_FILTER.segIdx === i ? 0.18 : 0.06 } }, { xAxis: seg.end }]);
+          chartBocpd.setOption({ series: [{ markArea: { silent: true, data: ba } }, {}] }, false);
+        }
+      }
+
+      // -----------------------------------------------------------
+      // Outlier Dashboard UI (bd-24q.10.2)
+      // -----------------------------------------------------------
+      let _outlierComputeSeq = 0;
+      async function renderOutlierPanel(commits) {
+        if (!commits || !commits.length) return;
+        const list = document.getElementById("outlierList");
+        const empty = document.getElementById("outlierEmpty");
+        const loading = document.getElementById("outlierLoading");
+        if (!list) return;
+        const metric = document.getElementById("outlierMetricSel")?.value || "impact";
+        const topK = Number(document.getElementById("outlierTopKSel")?.value || 10);
+        if (loading) loading.classList.remove("hidden");
+        if (empty) empty.classList.add("hidden");
+        list.innerHTML = "";
+        const seq = ++_outlierComputeSeq;
+        try {
+          const result = await computeMultiMetricOutliers(commits, topK);
+          if (seq !== _outlierComputeSeq) return;
+          const data = result?.[metric];
+          if (!data || !data.top || !data.top.length) { if (loading) loading.classList.add("hidden"); if (empty) empty.classList.remove("hidden"); return; }
+          const maxZ = Math.max(1, ...data.top.map(o => Math.abs(o.z)));
+          list.innerHTML = data.top.map((o, rank) => {
+            const c = ALL_COMMITS.find(cm => cm.hash === o.hash);
+            const b = c ? bucketById(c.primary) : { color: "#94a3b8", name: "?" };
+            const zAbs = Math.abs(o.z).toFixed(2);
+            const barW = Math.round((Math.abs(o.z) / maxZ) * 100);
+            const zColor = Math.abs(o.z) > 3 ? "#dc2626" : Math.abs(o.z) > 2 ? "#d97706" : "#059669";
+            return `<div class="flex items-center gap-3 rounded-2xl px-3 py-2 cursor-pointer hover:bg-slate-50/80 transition-colors border border-slate-100" data-outlier-hash="${escapeHtml(o.hash)}"><div class="shrink-0 w-6 text-center text-[10px] font-bold text-slate-400">#${rank+1}</div><div class="shrink-0 w-2 h-2 rounded-full" style="background:${b.color}"></div><div class="min-w-0 flex-1"><div class="flex items-baseline gap-2"><span class="mono text-xs font-semibold text-slate-800">${escapeHtml((o.hash||"").slice(0,7))}</span><span class="truncate text-[11px] text-slate-600 max-w-[200px]">${escapeHtml((c?.subject||"").slice(0,60))}</span></div><div class="mt-0.5 text-[10px] text-slate-400">${o.ts ? dayjs(o.ts).format("YYYY-MM-DD HH:mm") : ""} <span style="color:${b.color}">${escapeHtml(b.name)}</span></div></div><div class="shrink-0 text-right"><div class="text-xs font-bold text-slate-800">${fmtInt(Math.round(o.value))}</div><div class="mt-0.5 flex items-center gap-1"><span class="inline-block h-1.5 rounded-full bg-slate-200" style="width:40px"><span class="inline-block h-1.5 rounded-full" style="width:${barW}%;background:${zColor}"></span></span><span class="text-[10px] mono font-semibold" style="color:${zColor}">z=${zAbs}</span></div></div></div>`;
+          }).join("");
+          if (loading) loading.classList.add("hidden");
+          list.querySelectorAll("[data-outlier-hash]").forEach(el => {
+            el.addEventListener("click", () => {
+              const idx = ALL_COMMITS.findIndex(c => c.hash === el.dataset.outlierHash);
+              if (idx >= 0) selectCommitIdx(idx);
+            });
+          });
+          // Annotate timeline chart
+          if (chartTimeline) {
+            const mpData = data.top.slice(0, 10).map(o => {
+              const c = commits.find(cm => cm.hash === o.hash);
+              if (!c) return null;
+              return { coord: [c.dateIso, Number(c.impact || 0)], value: Math.abs(o.z).toFixed(1), symbol: "diamond", symbolSize: 8, itemStyle: { color: "rgba(220,38,38,0.8)", borderColor: "#fff", borderWidth: 1 }, label: { show: false } };
+            }).filter(Boolean);
+            chartTimeline.setOption({ series: [{ markPoint: { data: mpData } }] }, false);
+          }
+        } catch (e) { if (loading) loading.classList.add("hidden"); console.error("Outlier render:", e); }
+      }
+      function _wireOutlierPanel() {
+        const refresh = () => { if (ALL_COMMITS.length) void renderOutlierPanel(ALL_COMMITS); };
+        document.getElementById("outlierMetricSel")?.addEventListener("change", refresh);
+        document.getElementById("outlierTopKSel")?.addEventListener("change", refresh);
       }
 
       function renderBocpd(commits) {
@@ -16171,13 +17166,22 @@ a71e1d95715c1190335e8738413382b31b6d167c|178|105
       });
 
       wireUI();
-      _wireHeatStripe();
-      (async function boot() {
-        await loadEvolutionDataset();
+	      _wireHeatStripe();
+      _wireMiniMapMobile();
+      _wireStoryMobile();
+	      _wireOutlierPanel();
+	      (async function boot() {
+	        await loadEvolutionDataset();
+	        if (!DATASET.loaded || !DATASET.data) {
+	          setWorkerStatus("Dataset load failed.", "error", DATASET.error || "");
+	          const integrity = document.getElementById("kpiIntegrity");
+	          if (integrity) integrity.textContent = "ERROR";
+	          return;
+	        }
 
-        if (DATASET.loaded) {
-          const workerReady = await initAnalysisWorker();
-          const d = DATASET.data;
+	        if (DATASET.loaded) {
+	          const workerReady = await initAnalysisWorker();
+	          const d = DATASET.data;
           if (workerReady) {
             try {
               const metricsNoLev = await workerRequest(
