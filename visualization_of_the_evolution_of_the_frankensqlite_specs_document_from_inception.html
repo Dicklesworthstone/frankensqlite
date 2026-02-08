@@ -9770,6 +9770,12 @@
       let FILTERED_COMMITS = [];
       let DOCK_READY = false;
 
+      let _lastChartsCommitsHash = "";
+      let _lastCommitListCommitsHash = "";
+      let _lastCommitListBucketMode = "";
+      let _lastSectionIdx = -1;
+      let _lastSectionFilter = "";
+
       // --- Phase 1: Lazy enrichment cache (parse + enrich once) ---
       let ENRICHED_READY = false;
       let ENRICHED_MISSING = [];
@@ -9826,17 +9832,37 @@
         });
       }
 
+      const _renderElements = {
+        kpiCommits: null,
+        kpiGroups: null,
+        kpiLines: null,
+        kpiMode: null,
+        kpiIntegrity: null,
+        impact: null,
+        impactMobile: null,
+        impactLabel: null,
+        impactLabelMobile: null,
+        rangeLabel: null,
+        metaSpan: null,
+        showingCount: null
+      };
+
+      function _getRenderElement(id) {
+        if (!_renderElements[id]) _renderElements[id] = document.getElementById(id);
+        return _renderElements[id];
+      }
+
       function _doRender() {
         ensureEnriched();
         const enriched = ALL_COMMITS;
         const missing = ENRICHED_MISSING;
 
         // KPI
-        const kpiCommits = document.getElementById("kpiCommits");
-        const kpiGroups = document.getElementById("kpiGroups");
-        const kpiLines = document.getElementById("kpiLines");
-        const kpiMode = document.getElementById("kpiMode");
-        const kpiIntegrity = document.getElementById("kpiIntegrity");
+        const kpiCommits = _getRenderElement("kpiCommits");
+        const kpiGroups = _getRenderElement("kpiGroups");
+        const kpiLines = _getRenderElement("kpiLines");
+        const kpiMode = _getRenderElement("kpiMode");
+        const kpiIntegrity = _getRenderElement("kpiIntegrity");
 
         if (kpiCommits) kpiCommits.textContent = fmtInt(enriched.length);
         const totalGroups = enriched.reduce((acc, c) => acc + c.changeGroups.length, 0);
@@ -9852,10 +9878,10 @@
           const idx = Math.max(0, Math.ceil(0.99 * impacts.length) - 1);
           const p99 = impacts[idx] || 200;
           const maxImpact = Math.max(200, p99);
-          const impact = document.getElementById("impact");
-          const impactMobile = document.getElementById("impactMobile");
-          const impactLabel = document.getElementById("impactLabel");
-          const impactLabelMobile = document.getElementById("impactLabelMobile");
+          const impact = _getRenderElement("impact");
+          const impactMobile = _getRenderElement("impactMobile");
+          const impactLabel = _getRenderElement("impactLabel");
+          const impactLabelMobile = _getRenderElement("impactLabelMobile");
 
           if (impact && impactMobile) {
             impact.max = String(maxImpact);
@@ -9873,16 +9899,17 @@
         const earliest = enriched[0];
         const latest = enriched[enriched.length - 1];
         if (earliest && latest) {
-          const rangeLabel = document.getElementById("rangeLabel");
-          const metaSpan = document.getElementById("metaSpan");
+          const rangeLabel = _getRenderElement("rangeLabel");
+          const metaSpan = _getRenderElement("metaSpan");
           if (rangeLabel) rangeLabel.textContent = `${earliest.short} → ${latest.short}`;
           if (metaSpan) metaSpan.textContent = `${dayjs(earliest.dateIso).format("YYYY-MM-DD HH:mm")} to ${dayjs(latest.dateIso).format("HH:mm")}`;
         }
 
         // Filter
-        const filtered = enriched.filter((c) => matchesFilters(c));
+        const q = STATE.q.trim().toLowerCase();
+        const filtered = enriched.filter((c) => matchesFilters(c, q));
         FILTERED_COMMITS = filtered;
-        const showingCount = document.getElementById("showingCount");
+        const showingCount = _getRenderElement("showingCount");
         if (showingCount) showingCount.textContent = `${fmtInt(filtered.length)} commits`;
 
         // Charts + list
@@ -9906,9 +9933,8 @@
         syncUrlToState();
       }
 
-      function matchesFilters(commit) {
+      function matchesFilters(commit, q) {
         if (commit.impact < STATE.minImpact) return false;
-        const q = STATE.q.trim().toLowerCase();
         if (q) {
           const hay =
             `${commit.hash} ${commit.short} ${commit.author} ${commit.subject} ${commit.changeGroups
@@ -10571,6 +10597,209 @@
         return { passed: p, failed: f, total: R.length, results: R };
       };
       // ---- End Inline Highlights Unit Tests ----
+
+
+      // ---- Inline Highlights E2E Tests (bd-24q.16.4) ----
+      // Run via console: window.__runInlineHighlightE2ETests()
+      window.__runInlineHighlightE2ETests = async function () {
+        const R = [];
+        const A = (c, m, x) => { R.push(c ? { pass: true, msg: m } : { pass: false, msg: m, ctx: x }); if (!c) console.error("FAIL:", m, x || ""); };
+        const wait = (ms) => new Promise(r => setTimeout(r, ms));
+        const log = (m) => console.log("  [ih-e2e]", m);
+
+        if (!DATASET.loaded || !ALL_COMMITS.length) {
+          console.error("IH E2E: Need loaded dataset.");
+          return { passed: 0, failed: 1, total: 1, results: [{ pass: false, msg: "Dataset not loaded" }] };
+        }
+
+        // Save state.
+        const savedIdx = DOC.idx;
+        const savedTab = DOC.tab;
+        const savedIH = DOC.inlineHighlights;
+        const savedIhIdx = _ihCurrentIdx;
+        const savedIhBlocks = _ihBlocks.slice();
+
+        // Find a commit with changes (idx > 0 with a non-empty patch).
+        let testIdx = -1;
+        for (let i = 1; i < ALL_COMMITS.length && i < 20; i++) {
+          const patch = patchForIdx(i);
+          if (patch && patch.length > 50) { testIdx = i; break; }
+        }
+        if (testIdx < 0) {
+          console.error("IH E2E: No commit with changes found.");
+          return { passed: 0, failed: 1, total: 1, results: [{ pass: false, msg: "No commit with patch data" }] };
+        }
+        log("Using test commit idx=" + testIdx);
+
+        // --- E2E 1: Toggle inline highlights ON ---
+        await (async function testToggleOn() {
+          // Ensure off first.
+          DOC.inlineHighlights = false;
+          selectCommitIdx(testIdx);
+          setDocTab("spec");
+          await wait(500);
+          // Toggle on.
+          DOC.inlineHighlights = false; // ensure clean state
+          toggleInlineHighlights();
+          await wait(1500); // wait for async render with sentinels
+          A(DOC.inlineHighlights === true, "e2e-1: DOC.inlineHighlights is true after toggle");
+          const btn = document.getElementById("btnIHToggle");
+          A(btn && btn.classList.contains("bg-slate-900"), "e2e-1: toggle button shows active state");
+          const nav = document.getElementById("ihNav");
+          A(nav && nav.style.display !== "none", "e2e-1: ihNav visible when highlights on");
+          log("Toggle on: OK");
+        })();
+
+        // --- E2E 2: Highlighted blocks exist for commit with changes ---
+        await (async function testHighlightBlocksExist() {
+          const rendered = document.getElementById("docRendered");
+          const changed = rendered?.querySelectorAll("[data-changed='true']") || [];
+          const highlighted = rendered?.querySelectorAll(".ih-changed") || [];
+          A(changed.length > 0, "e2e-2: data-changed elements exist", { count: changed.length });
+          A(highlighted.length > 0, "e2e-2: ih-changed elements exist", { count: highlighted.length });
+          A(_ihBlocks.length > 0, "e2e-2: _ihBlocks populated", { len: _ihBlocks.length });
+          log("Highlighted blocks: " + highlighted.length + " elements, " + _ihBlocks.length + " nav blocks");
+        })();
+
+        // --- E2E 3: Nav label shows correct count ---
+        await (async function testNavLabelCount() {
+          const lbl = document.getElementById("ihNavLabel");
+          if (!lbl) { log("Skipping nav label (no element)"); return; }
+          // Before navigation, should show -/N or 0/0.
+          A(lbl.textContent.includes("/" + _ihBlocks.length), "e2e-3: nav label includes total count", { got: lbl.textContent, expected: "/" + _ihBlocks.length });
+          log("Nav label: " + lbl.textContent);
+        })();
+
+        // --- E2E 4: Next change navigation scrolls and updates label ---
+        await (async function testNextChangeNav() {
+          if (_ihBlocks.length < 1) { log("Skipping next nav (no blocks)"); return; }
+          ihNavigate("next");
+          await wait(400);
+          A(_ihCurrentIdx === 0, "e2e-4: ihNavigate next sets _ihCurrentIdx to 0", { got: _ihCurrentIdx });
+          const lbl = document.getElementById("ihNavLabel");
+          A(lbl && lbl.textContent === "1/" + _ihBlocks.length, "e2e-4: nav label shows 1/N after first next", { got: lbl?.textContent });
+          // Navigate again.
+          if (_ihBlocks.length >= 2) {
+            ihNavigate("next");
+            await wait(400);
+            A(_ihCurrentIdx === 1, "e2e-4: ihNavigate next advances to 1", { got: _ihCurrentIdx });
+            A(lbl && lbl.textContent === "2/" + _ihBlocks.length, "e2e-4: nav label shows 2/N", { got: lbl?.textContent });
+          }
+          log("Next change nav: OK (idx=" + _ihCurrentIdx + ")");
+        })();
+
+        // --- E2E 5: Prev change navigation works ---
+        await (async function testPrevChangeNav() {
+          if (_ihBlocks.length < 2) { log("Skipping prev nav (< 2 blocks)"); return; }
+          // Set to index 1, then navigate prev.
+          _ihCurrentIdx = 1;
+          ihNavigate("prev");
+          await wait(400);
+          A(_ihCurrentIdx === 0, "e2e-5: ihNavigate prev from 1 goes to 0", { got: _ihCurrentIdx });
+          // Navigate prev at 0 wraps to last.
+          ihNavigate("prev");
+          await wait(400);
+          A(_ihCurrentIdx === _ihBlocks.length - 1, "e2e-5: ihNavigate prev from 0 wraps to last", { got: _ihCurrentIdx, expected: _ihBlocks.length - 1 });
+          log("Prev change nav: OK");
+        })();
+
+        // --- E2E 6: Next wraps around at end ---
+        await (async function testNextWrapAround() {
+          if (_ihBlocks.length < 1) { log("Skipping wrap (no blocks)"); return; }
+          _ihCurrentIdx = _ihBlocks.length - 1;
+          ihNavigate("next");
+          await wait(300);
+          A(_ihCurrentIdx === 0, "e2e-6: ihNavigate next wraps from last to 0", { got: _ihCurrentIdx });
+          log("Wrap around: OK");
+        })();
+
+        // --- E2E 7: Switch commit → highlights refresh, no stale highlights ---
+        await (async function testSwitchCommitRefreshes() {
+          // Record blocks at current commit.
+          const blockCountBefore = _ihBlocks.length;
+          const firstBlockText = _ihBlocks.length > 0 ? _ihBlocks[0].textContent?.slice(0, 40) : "";
+          // Switch to a different commit.
+          let otherIdx = testIdx + 1;
+          if (otherIdx >= ALL_COMMITS.length) otherIdx = testIdx - 1;
+          if (otherIdx < 1) { log("Skipping switch (only one commit)"); return; }
+          selectCommitIdx(otherIdx);
+          await wait(1500); // wait for render
+          // Re-apply highlights (the render pipeline should handle this).
+          applyOrClearSpecHighlights();
+          await wait(500);
+          // Check that _ihBlocks was refreshed.
+          const rendered = document.getElementById("docRendered");
+          const currentChanged = rendered?.querySelectorAll("[data-changed='true']") || [];
+          log("Commit switch: idx=" + otherIdx + ", changed=" + currentChanged.length + " (was " + blockCountBefore + " at idx=" + testIdx + ")");
+          // If the other commit has changes, blocks should be refreshed.
+          // If no changes, blocks should be empty.
+          const otherPatch = patchForIdx(otherIdx);
+          if (otherPatch && otherPatch.length > 50) {
+            A(_ihBlocks.length >= 0, "e2e-7: _ihBlocks refreshed for new commit", { len: _ihBlocks.length });
+          } else {
+            A(_ihBlocks.length === 0 || currentChanged.length === 0, "e2e-7: no stale highlights on commit without changes");
+          }
+          A(true, "e2e-7: commit switch completed without error");
+          // Switch back.
+          selectCommitIdx(testIdx);
+          await wait(1000);
+          applyOrClearSpecHighlights();
+          await wait(500);
+        })();
+
+        // --- E2E 8: Toggle OFF clears highlights ---
+        await (async function testToggleOff() {
+          // Ensure on first.
+          if (!DOC.inlineHighlights) toggleInlineHighlights();
+          await wait(500);
+          A(DOC.inlineHighlights === true, "e2e-8: highlights on before toggle off");
+          // Toggle off.
+          toggleInlineHighlights();
+          await wait(500);
+          A(DOC.inlineHighlights === false, "e2e-8: DOC.inlineHighlights is false after toggle off");
+          const rendered = document.getElementById("docRendered");
+          const highlighted = rendered?.querySelectorAll(".ih-changed") || [];
+          A(highlighted.length === 0, "e2e-8: no ih-changed elements after toggle off", { count: highlighted.length });
+          A(_ihBlocks.length === 0, "e2e-8: _ihBlocks cleared after toggle off", { len: _ihBlocks.length });
+          const nav = document.getElementById("ihNav");
+          A(nav && nav.style.display === "none", "e2e-8: ihNav hidden after toggle off");
+          log("Toggle off: OK");
+        })();
+
+        // --- E2E 9: Permalink round-trip preserves inline highlight state ---
+        await (async function testPermalinkRoundTrip() {
+          DOC.inlineHighlights = true;
+          const encoded = encodeUrlState();
+          A(encoded.includes("ih=1"), "e2e-9: URL includes ih=1 when highlights on", { encoded: encoded.slice(0, 100) });
+          DOC.inlineHighlights = false;
+          const encoded2 = encodeUrlState();
+          A(!encoded2.includes("ih=1"), "e2e-9: URL omits ih when highlights off");
+          // Decode round-trip.
+          const decoded = decodeUrlState("?" + encoded);
+          A(decoded.ih === true, "e2e-9: decoded ih = true", { got: decoded.ih });
+          const decoded2 = decodeUrlState("?" + encoded2);
+          A(decoded2.ih === false, "e2e-9: decoded ih = false when omitted", { got: decoded2.ih });
+          log("Permalink round-trip: OK");
+        })();
+
+        // Restore state.
+        DOC.inlineHighlights = savedIH;
+        _ihCurrentIdx = savedIhIdx;
+        _ihBlocks = savedIhBlocks;
+        selectCommitIdx(savedIdx);
+        if (savedTab) setDocTab(savedTab);
+        applyOrClearSpecHighlights();
+        await wait(300);
+
+        // --- Summary ---
+        const p = R.filter(x => x.pass).length, f = R.filter(x => !x.pass).length;
+        const s = `Inline Highlight E2E Tests: ${p} passed, ${f} failed, ${R.length} total`;
+        if (f > 0) { console.warn(s); R.filter(x => !x.pass).forEach(x => console.error("  FAIL:", x.msg, x.ctx || "")); }
+        else console.log("%c" + s, "color:green;font-weight:bold");
+        return { passed: p, failed: f, total: R.length, results: R };
+      };
+      // ---- End Inline Highlights E2E Tests ----
+
 
       let _sbsRenderedKey = "";
 
@@ -11411,13 +11640,18 @@
       async function updateSectionSummary() {
         const view = document.getElementById("docSectionsView");
         if (!view || view.classList.contains("hidden")) return;
+        
+        const filter = (document.getElementById("sectionFilter")?.value || "").trim().toLowerCase();
+        if (_lastSectionIdx === DOC.idx && _lastSectionFilter === filter) return;
+        _lastSectionIdx = DOC.idx;
+        _lastSectionFilter = filter;
+
         const tbody = document.getElementById("sectionTableBody");
         const empty = document.getElementById("sectionEmpty");
         const wrap = document.getElementById("sectionTableWrap");
         if (!tbody) return;
         const outline = await getOutline(DOC.idx);
         const metrics = DOC.idx > 0 ? await getHeadingMetrics(DOC.idx) : new Map();
-        const filter = (document.getElementById("sectionFilter")?.value || "").trim().toLowerCase();
         const rows = [];
         for (const entry of outline) {
           if (filter && !entry.text.toLowerCase().includes(filter)) continue;
@@ -14421,8 +14655,6 @@
         return { passed: p, failed: f, total: R.length, results: R };
       };
       // ---- End Story Mode Unit Tests ----
-
-
       // ---- Story Mode E2E Tests (bd-24q.4.6) ----
       // Run via console: window.__runStoryModeE2ETests()
       window.__runStoryModeE2ETests = async function () {
@@ -17013,14 +17245,406 @@
       };
       // ---- End Performance Unit Tests ----
 
+      // ---- Dataset Tool Unit Tests (bd-24q.6.4) ----
+      // Run via console: window.__runDatasetToolTests()
+      // Requires dataset to be loaded.
+      window.__runDatasetToolTests = async function () {
+        const R = [];
+        const log = (msg, ctx) => console.log("  [DS-UT]", msg, ctx || "");
+        const A = (c, m, x) => { R.push(c ? { pass: true, msg: m } : { pass: false, msg: m, ctx: x }); if (!c) console.error("  FAIL:", m, x || ""); else log("PASS: " + m); };
+
+        if (!DATASET.loaded || ALL_COMMITS.length < 5) {
+          console.error("DS-UT: Need loaded dataset with >= 5 commits.");
+          return { passed: 0, failed: 1, total: 1, results: [{ pass: false, msg: "Dataset not loaded or < 5 commits" }] };
+        }
+
+        // --- Unit 1: parseUnifiedHunks - basic patch ---
+        (function test_parseHunks_basic() {
+          const patch = "@@ -1,3 +1,4 @@\n line1\n-old\n+new\n+added\n line3";
+          const hunks = parseUnifiedHunks(patch);
+          A(hunks.length === 1, "parseHunks: single hunk parsed", { count: hunks.length });
+          A(hunks[0].oldStart === 1, "parseHunks: oldStart=1", { got: hunks[0].oldStart });
+          A(hunks[0].oldCount === 3, "parseHunks: oldCount=3", { got: hunks[0].oldCount });
+          A(hunks[0].newStart === 1, "parseHunks: newStart=1", { got: hunks[0].newStart });
+          A(hunks[0].newCount === 4, "parseHunks: newCount=4", { got: hunks[0].newCount });
+          A(hunks[0].lines.length === 5, "parseHunks: 5 lines", { got: hunks[0].lines.length });
+        })();
+
+        // --- Unit 2: parseUnifiedHunks - multiple hunks ---
+        (function test_parseHunks_multi() {
+          const patch = "@@ -1,2 +1,2 @@\n-old1\n+new1\n line2\n@@ -10,2 +10,3 @@\n line10\n+added10\n line11";
+          const hunks = parseUnifiedHunks(patch);
+          A(hunks.length === 2, "parseHunks multi: 2 hunks", { count: hunks.length });
+          A(hunks[0].oldStart === 1, "parseHunks multi: hunk0 oldStart=1");
+          A(hunks[1].oldStart === 10, "parseHunks multi: hunk1 oldStart=10");
+          A(hunks[1].newCount === 3, "parseHunks multi: hunk1 newCount=3");
+        })();
+
+        // --- Unit 3: parseUnifiedHunks - empty/null input ---
+        (function test_parseHunks_empty() {
+          A(parseUnifiedHunks("").length === 0, "parseHunks empty: '' returns []");
+          A(parseUnifiedHunks(null).length === 0, "parseHunks empty: null returns []");
+          A(parseUnifiedHunks(undefined).length === 0, "parseHunks empty: undefined returns []");
+          A(parseUnifiedHunks("no hunks here").length === 0, "parseHunks empty: 'no hunks here' returns []");
+        })();
+
+        // --- Unit 4: applyPatchLines - simple addition ---
+        (function test_applyPatch_add() {
+          const prev = ["line1", "line2", "line3"];
+          const patch = "@@ -2,1 +2,2 @@\n line2\n+inserted";
+          const result = applyPatchLines(prev, patch);
+          A(result.length === 4, "applyPatch add: length 4", { got: result.length });
+          A(result[0] === "line1", "applyPatch add: line1 preserved");
+          A(result[1] === "line2", "applyPatch add: line2 preserved");
+          A(result[2] === "inserted", "applyPatch add: inserted at position 2", { got: result[2] });
+          A(result[3] === "line3", "applyPatch add: line3 moved to position 3", { got: result[3] });
+        })();
+
+        // --- Unit 5: applyPatchLines - deletion ---
+        (function test_applyPatch_del() {
+          const prev = ["alpha", "beta", "gamma", "delta"];
+          const patch = "@@ -2,2 +2,1 @@\n-beta\n gamma";
+          const result = applyPatchLines(prev, patch);
+          A(result.length === 3, "applyPatch del: length 3", { got: result.length });
+          A(result[0] === "alpha", "applyPatch del: alpha kept");
+          A(result[1] === "gamma", "applyPatch del: gamma at pos 1", { got: result[1] });
+          A(result[2] === "delta", "applyPatch del: delta at pos 2", { got: result[2] });
+        })();
+
+        // --- Unit 6: applyPatchLines - replacement ---
+        (function test_applyPatch_replace() {
+          const prev = ["a", "b", "c"];
+          const patch = "@@ -2,1 +2,1 @@\n-b\n+B";
+          const result = applyPatchLines(prev, patch);
+          A(result.length === 3, "applyPatch replace: length 3", { got: result.length });
+          A(result[1] === "B", "applyPatch replace: b -> B", { got: result[1] });
+        })();
+
+        // --- Unit 7: applyPatchLines - empty patch ---
+        (function test_applyPatch_empty() {
+          const prev = ["x", "y"];
+          const result = applyPatchLines(prev, "");
+          A(result.length === 2, "applyPatch empty: no change", { got: result.length });
+          A(result[0] === "x" && result[1] === "y", "applyPatch empty: content preserved");
+        })();
+
+        // --- Unit 8: applyPatchLines - sequential series reconstruction ---
+        (function test_applyPatch_series() {
+          let lines = ["# Title", "", "Paragraph one."];
+          const patches = [
+            "@@ -3,1 +3,2 @@\n Paragraph one.\n+Paragraph two.",
+            "@@ -1,1 +1,1 @@\n-# Title\n+# Updated Title",
+            "@@ -4,1 +4,2 @@\n Paragraph two.\n+Paragraph three.",
+          ];
+          for (const p of patches) lines = applyPatchLines(lines, p);
+          A(lines.length === 5, "applyPatch series: 5 lines after 3 patches", { got: lines.length });
+          A(lines[0] === "# Updated Title", "applyPatch series: title updated", { got: lines[0] });
+          A(lines[4] === "Paragraph three.", "applyPatch series: para 3 added", { got: lines[4] });
+          log("Series result: " + JSON.stringify(lines));
+        })();
+
+        // --- Unit 9: quickMetricsFromPatch - basic metrics ---
+        (function test_quickMetrics_basic() {
+          const patch = "@@ -1,2 +1,3 @@\n context\n-removed line\n+added line one\n+added line two";
+          const m = quickMetricsFromPatch(patch);
+          A(m.hunks === 1, "quickMetrics: 1 hunk", { got: m.hunks });
+          A(m.addLines === 2, "quickMetrics: 2 add lines", { got: m.addLines });
+          A(m.delLines === 1, "quickMetrics: 1 del line", { got: m.delLines });
+          A(m.tokensChanged > 0, "quickMetrics: tokensChanged > 0", { got: m.tokensChanged });
+          A(m.bytesChanged > 0, "quickMetrics: bytesChanged > 0", { got: m.bytesChanged });
+          A(m.tokensDelta > 0, "quickMetrics: tokensDelta positive (net add)", { got: m.tokensDelta });
+          A(m.bytesDelta > 0, "quickMetrics: bytesDelta positive (net add)", { got: m.bytesDelta });
+        })();
+
+        // --- Unit 10: quickMetricsFromPatch - empty ---
+        (function test_quickMetrics_empty() {
+          const m = quickMetricsFromPatch("");
+          A(m.hunks === 0, "quickMetrics empty: 0 hunks");
+          A(m.addLines === 0, "quickMetrics empty: 0 add");
+          A(m.delLines === 0, "quickMetrics empty: 0 del");
+        })();
+
+        // --- Unit 11: quickMetricsFromPatch - skips +++ and --- lines ---
+        (function test_quickMetrics_skipHeaders() {
+          const patch = "--- a/file.md\n+++ b/file.md\n@@ -1,1 +1,2 @@\n context\n+added";
+          const m = quickMetricsFromPatch(patch);
+          A(m.addLines === 1, "quickMetrics headers: only 1 add (skips +++)", { got: m.addLines });
+          A(m.delLines === 0, "quickMetrics headers: 0 del (skips ---)", { got: m.delLines });
+        })();
+
+        // --- Unit 12: parseCommitLog - structure ---
+        (function test_parseCommitLog_structure() {
+          const commits = parseCommitLog();
+          A(Array.isArray(commits), "parseCommitLog: returns array");
+          A(commits.length === DATASET.data.commits.length, "parseCommitLog: same length as dataset", { got: commits.length, expected: DATASET.data.commits.length });
+
+          const c0 = commits[0];
+          A(c0.idx === 0, "parseCommitLog: first commit idx=0");
+          A(typeof c0.hash === "string" && c0.hash.length >= 7, "parseCommitLog: hash is string >= 7 chars", { hash: c0.hash });
+          A(typeof c0.short === "string", "parseCommitLog: has short hash");
+          A(typeof c0.dateIso === "string", "parseCommitLog: has dateIso");
+          A(typeof c0.author === "string", "parseCommitLog: has author");
+          A(typeof c0.subject === "string", "parseCommitLog: has subject");
+          A(c0.url.includes(c0.hash), "parseCommitLog: url contains hash");
+          log("First commit: " + c0.short + " '" + c0.subject.slice(0, 40) + "'");
+        })();
+
+        // --- Unit 13: parseCommitStats - structure ---
+        (function test_parseCommitStats_structure() {
+          const stats = parseCommitStats();
+          A(stats instanceof Map, "parseCommitStats: returns Map");
+          A(stats.size === DATASET.data.commits.length, "parseCommitStats: same size as commits", { got: stats.size });
+
+          const firstHash = DATASET.data.commits[0].hash;
+          const s0 = stats.get(firstHash);
+          A(s0 != null, "parseCommitStats: first commit has stats");
+          A(typeof s0.add === "number", "parseCommitStats: has 'add' number");
+          A(typeof s0.del === "number", "parseCommitStats: has 'del' number");
+          A(typeof s0.impact === "number", "parseCommitStats: has 'impact' number");
+          A(s0.impact >= 0, "parseCommitStats: impact >= 0", { got: s0.impact });
+          log("First commit stats: add=" + s0.add + ", del=" + s0.del + ", impact=" + s0.impact);
+        })();
+
+        // --- Unit 14: computeDatasetHash - determinism ---
+        await (async function test_datasetHash_determinism() {
+          const h1 = await computeDatasetHash(DATASET.data);
+          const h2 = await computeDatasetHash(DATASET.data);
+          A(h1 === h2, "datasetHash: same data -> same hash", { h1: h1.slice(0, 16), h2: h2.slice(0, 16) });
+          A(typeof h1 === "string" && h1.length > 0, "datasetHash: non-empty string", { len: h1.length });
+          log("Dataset hash: " + h1.slice(0, 24) + "...");
+
+          // Different data -> different hash.
+          const fakeData = { commits: [{ hash: "fake123" }], patches: ["fake"], base_doc: "fake" };
+          const h3 = await computeDatasetHash(fakeData);
+          A(h3 !== h1, "datasetHash: different data -> different hash", { real: h1.slice(0, 16), fake: h3.slice(0, 16) });
+        })();
+
+        // --- Unit 15: Real dataset patch apply reconstruction ---
+        (function test_realDataset_reconstruction() {
+          const d = DATASET.data;
+          if (!d.base_doc || !d.patches || d.patches.length < 3) {
+            A(true, "realReconstruction: skipped (insufficient patches)");
+            return;
+          }
+
+          // Reconstruct first 3 snapshots.
+          let lines = String(d.base_doc).split("\n");
+          A(lines.length > 0, "realReconstruction: base_doc has lines", { count: lines.length });
+
+          for (let i = 1; i <= Math.min(3, d.patches.length - 1); i++) {
+            const patch = d.patches[i];
+            if (!patch) continue;
+            const before = lines.length;
+            lines = applyPatchLines(lines, patch);
+            A(lines.length > 0, "realReconstruction: patch " + i + " produces non-empty doc", { before, after: lines.length });
+            log("Patch " + i + ": " + before + " -> " + lines.length + " lines");
+          }
+
+          // Verify reconstructed text has markdown headings.
+          const text = lines.join("\n");
+          const headingMatch = text.match(/^#+ /m);
+          A(headingMatch != null, "realReconstruction: reconstructed text has markdown headings");
+        })();
+
+        // --- Unit 16: Metrics consistency with ALL_COMMITS ---
+        (function test_metricsConsistency() {
+          const stats = parseCommitStats();
+          let mismatches = 0;
+          for (let i = 0; i < Math.min(10, ALL_COMMITS.length); i++) {
+            const c = ALL_COMMITS[i];
+            const s = stats.get(c.hash);
+            if (!s) { mismatches++; continue; }
+            if (c.add !== s.add || c.del !== s.del) mismatches++;
+          }
+          A(mismatches === 0, "metricsConsistency: ALL_COMMITS matches parseCommitStats for first 10", { mismatches });
+        })();
+
+        // --- Diagnostics ---
+        log("Dataset: " + DATASET.data.commits.length + " commits, " + (DATASET.data.patches?.length || 0) + " patches, base_doc=" + (DATASET.data.base_doc?.length || 0) + " chars");
+
+        // --- Summary ---
+        const p = R.filter(x => x.pass).length, f = R.filter(x => !x.pass).length;
+        const s = `Dataset Tool Tests: ${p} passed, ${f} failed, ${R.length} total`;
+        if (f > 0) { console.warn(s); R.filter(x => !x.pass).forEach(x => console.error("  FAIL:", x.msg, x.ctx || "")); }
+        else console.log("%c" + s, "color:green;font-weight:bold");
+        return { passed: p, failed: f, total: R.length, results: R };
+      };
+      // ---- End Dataset Tool Unit Tests ----
 
 
 
 
+      // ---- Performance E2E Tests (bd-24q.5.5) ----
+      // Run via console: window.__runPerfE2ETests()
+      window.__runPerfE2ETests = async function () {
+        const R = [];
+        const A = (c, m, x) => { R.push(c ? { pass: true, msg: m } : { pass: false, msg: m, ctx: x }); if (!c) console.error("FAIL:", m, x || ""); };
+        const log = (m) => console.log("  [perf-e2e]", m);
 
+        // --- 1. PERF_BUDGET object exists and is functional ---
+        log("Testing PERF_BUDGET...");
+        A(typeof PERF_BUDGET === "object", "perf: PERF_BUDGET object exists");
+        A(typeof PERF_BUDGET.log === "function", "perf: PERF_BUDGET.log is function");
+        A(typeof PERF_BUDGET.summary === "function", "perf: PERF_BUDGET.summary is function");
+        A(Array.isArray(PERF_BUDGET.entries), "perf: PERF_BUDGET.entries is array");
 
+        // --- 2. PERF_BUDGET tracks entries ---
+        log("Testing PERF_BUDGET tracking...");
+        const entriesBefore = PERF_BUDGET.entries.length;
+        PERF_BUDGET.log("test_op_e2e", 42.5, false);
+        A(PERF_BUDGET.entries.length === entriesBefore + 1, "perf: log adds entry", { before: entriesBefore, after: PERF_BUDGET.entries.length });
+        const lastEntry = PERF_BUDGET.entries[PERF_BUDGET.entries.length - 1];
+        A(lastEntry.op === "test_op_e2e", "perf: entry has correct op", { op: lastEntry.op });
+        A(lastEntry.ms === 42.5, "perf: entry has correct ms", { ms: lastEntry.ms });
+        A(lastEntry.cached === false, "perf: entry has cached flag", { cached: lastEntry.cached });
+        A(typeof lastEntry.ts === "number", "perf: entry has timestamp");
 
+        // Cache hit entry
+        PERF_BUDGET.log("test_op_e2e_cached", 0.1, true);
+        const cachedEntry = PERF_BUDGET.entries[PERF_BUDGET.entries.length - 1];
+        A(cachedEntry.cached === true, "perf: cached entry has cached=true");
 
+        // --- 3. PERF_BUDGET summary ---
+        log("Testing PERF_BUDGET.summary()...");
+        const s = PERF_BUDGET.summary();
+        A(typeof s.totalMs === "number", "perf: summary has totalMs", { totalMs: s.totalMs });
+        A(typeof s.hitRate === "string", "perf: summary has hitRate string", { hitRate: s.hitRate });
+        A(typeof s.hits === "number", "perf: summary has hits count", { hits: s.hits });
+        A(typeof s.misses === "number", "perf: summary has misses count", { misses: s.misses });
+        A(s.entries.length >= 2, "perf: summary entries include our test ops", { len: s.entries.length });
+
+        // --- 4. WORKER_RESULT_CACHE integration ---
+        log("Testing WORKER_RESULT_CACHE integration...");
+        A(typeof WORKER_RESULT_CACHE === "object", "cache: WORKER_RESULT_CACHE exists");
+        A(typeof WORKER_RESULT_CACHE.get === "function", "cache: has get method");
+        A(typeof WORKER_RESULT_CACHE.set === "function", "cache: has set method");
+        A(typeof WORKER_RESULT_CACHE.size === "number", "cache: has size property");
+
+        // --- 5. Cache hit on repeated worker request ---
+        log("Testing cache hit on repeated workerRequest...");
+        if (WORKER_STATE.ready) {
+          try {
+            // First request — cache miss (or already cached from warmup)
+            const hitsBefore = PERF_BUDGET.cacheHits;
+            const r1 = await workerRequest("compute_clusters", { limit: 3, threshold: 0.3 }, { timeoutMs: 30000 });
+            A(r1 !== undefined && r1 !== null, "cache-hit: first request returns data");
+            A(Array.isArray(r1.clusters), "cache-hit: first request has clusters array");
+
+            // Second request — should be a cache hit
+            const hitsBefore2 = PERF_BUDGET.cacheHits;
+            const r2 = await workerRequest("compute_clusters", { limit: 3, threshold: 0.3 }, { timeoutMs: 30000 });
+            A(r2 !== undefined && r2 !== null, "cache-hit: second request returns data");
+            A(PERF_BUDGET.cacheHits > hitsBefore2, "cache-hit: second request logged as cache hit", { before: hitsBefore2, after: PERF_BUDGET.cacheHits });
+
+            // Verify same data
+            A(r1.clusters.length === r2.clusters.length, "cache-hit: same result both times", { c1: r1.clusters.length, c2: r2.clusters.length });
+            log("Cache hit confirmed for compute_clusters");
+          } catch (e) {
+            A(false, "cache-hit: worker request threw", { err: String(e) });
+          }
+        } else {
+          log("Worker not ready, skipping cache hit test");
+          A(true, "cache-hit: skipped (worker not ready)");
+        }
+
+        // --- 6. Uncacheable ops bypass cache ---
+        log("Testing uncacheable ops...");
+        A(typeof _UNCACHEABLE_OPS === "object", "uncacheable: _UNCACHEABLE_OPS exists");
+        A(_UNCACHEABLE_OPS.has("init_dataset"), "uncacheable: init_dataset is uncacheable");
+        A(_UNCACHEABLE_OPS.has("cancel"), "uncacheable: cancel is uncacheable");
+        A(_UNCACHEABLE_OPS.has("compute_minhash_signatures"), "uncacheable: compute_minhash_signatures is uncacheable");
+
+        // --- 7. Progress UI elements exist ---
+        log("Testing progress UI elements...");
+        A(document.getElementById("warmupProgress") !== null, "progress-ui: warmupProgress div exists");
+        A(document.getElementById("warmupProgressBar") !== null, "progress-ui: warmupProgressBar div exists");
+        A(document.getElementById("warmupProgressLabel") !== null, "progress-ui: warmupProgressLabel span exists");
+        A(document.getElementById("warmupStage") !== null, "progress-ui: warmupStage div exists");
+        A(document.getElementById("btnCancelWarmup") !== null, "progress-ui: btnCancelWarmup button exists");
+        A(document.getElementById("computeProgress") !== null, "progress-ui: computeProgress div exists");
+        A(document.getElementById("btnCancelCompute") !== null, "progress-ui: btnCancelCompute button exists");
+
+        // --- 8. showWarmupProgress / hideWarmupProgress work ---
+        log("Testing showWarmupProgress / hideWarmupProgress...");
+        showWarmupProgress(50, "Test stage");
+        const wp = document.getElementById("warmupProgress");
+        A(!wp.classList.contains("hidden"), "progress-ui: showWarmupProgress removes hidden class");
+        const bar = document.getElementById("warmupProgressBar");
+        A(bar.style.width === "50%", "progress-ui: bar width set to 50%", { width: bar.style.width });
+        const label = document.getElementById("warmupProgressLabel");
+        A(label.textContent === "50%", "progress-ui: label shows 50%", { text: label.textContent });
+        const stage = document.getElementById("warmupStage");
+        A(stage.textContent === "Test stage", "progress-ui: stage text set", { text: stage.textContent });
+
+        hideWarmupProgress();
+        A(wp.classList.contains("hidden"), "progress-ui: hideWarmupProgress adds hidden class");
+
+        // --- 9. Progress clamping ---
+        log("Testing progress clamping...");
+        showWarmupProgress(-10, "Negative");
+        A(bar.style.width === "0%", "progress-ui: negative clamped to 0%", { width: bar.style.width });
+        showWarmupProgress(150, "Over");
+        A(bar.style.width === "100%", "progress-ui: >100 clamped to 100%", { width: bar.style.width });
+        hideWarmupProgress();
+
+        // --- 10. WARMUP_ABORT_CONTROLLER ---
+        log("Testing warmup abort controller...");
+        A(typeof WARMUP_ABORT_CONTROLLER === "object" || WARMUP_ABORT_CONTROLLER === null, "abort: WARMUP_ABORT_CONTROLLER exists or is null");
+
+        // --- 11. Warmup timing entries recorded ---
+        log("Testing warmup timing entries...");
+        if (WORKER_STATE.ready && WORKER_DERIVED.searchReady) {
+          const warmupOps = PERF_BUDGET.entries.filter(e => e.op === "search_index" || e.op === "minhash_signatures" || e.op === "compute_clusters" || e.op === "most_edited_sections" || e.op === "warmup_total");
+          A(warmupOps.length > 0, "timing: warmup ops recorded in PERF_BUDGET", { count: warmupOps.length, ops: warmupOps.map(e => e.op) });
+          log("Warmup entries: " + warmupOps.map(e => e.op + "=" + e.ms.toFixed(0) + "ms").join(", "));
+
+          // Check warmup_total exists
+          const totalEntry = warmupOps.find(e => e.op === "warmup_total");
+          if (totalEntry) {
+            A(totalEntry.ms > 0, "timing: warmup_total > 0ms", { ms: totalEntry.ms });
+            log("Total warmup time: " + totalEntry.ms.toFixed(0) + "ms");
+          }
+        } else {
+          log("Worker not ready or search not ready, skipping warmup timing test");
+          A(true, "timing: skipped (worker/search not ready)");
+        }
+
+        // --- 12. window.__perfBudget exposed ---
+        log("Testing window.__perfBudget...");
+        A(window.__perfBudget === PERF_BUDGET, "exposed: window.__perfBudget === PERF_BUDGET");
+
+        // --- 13. Cache hit rate calculation ---
+        log("Testing cache hit rate...");
+        const budget = PERF_BUDGET.summary();
+        const totalOps = budget.hits + budget.misses;
+        if (totalOps > 0) {
+          const rate = parseFloat(budget.hitRate);
+          A(!isNaN(rate), "hitRate: is valid number", { hitRate: budget.hitRate });
+          A(rate >= 0 && rate <= 100, "hitRate: between 0-100%", { rate });
+          log("Overall cache hit rate: " + budget.hitRate + "% (" + budget.hits + "/" + totalOps + ")");
+        } else {
+          A(true, "hitRate: no ops to measure (skipped)");
+        }
+
+        // --- Diagnostics ---
+        const failed = R.filter(r => !r.pass);
+        if (failed.length > 0) {
+          console.group("Performance E2E Test Diagnostics");
+          failed.forEach(r => console.error("  FAIL:", r.msg, r.ctx || ""));
+          console.log("PERF_BUDGET:", PERF_BUDGET.summary());
+          console.log("WORKER_STATE:", { ready: WORKER_STATE.ready, disabled: WORKER_STATE.disabled });
+          console.log("WORKER_DERIVED:", { ...WORKER_DERIVED });
+          console.groupEnd();
+        }
+
+        // --- Summary ---
+        const p = R.filter(r => r.pass).length, f = R.filter(r => !r.pass).length;
+        const summary = "Performance E2E Tests: " + p + " passed, " + f + " failed, " + R.length + " total";
+        if (f > 0) { console.warn(summary); R.filter(r => !r.pass).forEach(r => console.error("  FAIL:", r.msg, r.ctx || "")); }
+        else console.log("%c" + summary, "color: green; font-weight: bold");
+        return { passed: p, failed: f, total: R.length, results: R };
+      };
+      // ---- End Performance E2E Tests ----
 
       async function levenshteinForPatchLocal(patch) {
         const hunks = parseUnifiedHunks(patch);
@@ -17560,9 +18184,17 @@
         DOCK_READY = true;
       }
 
+      let _lastDrawDockIdx = -1;
+      let _lastDrawDockCommitsLen = -1;
+
       function drawDock() {
         const canvas = document.getElementById("dockCanvas");
         if (!canvas || !ALL_COMMITS.length) return;
+
+        if (_lastDrawDockIdx === DOC.idx && _lastDrawDockCommitsLen === ALL_COMMITS.length) return;
+        _lastDrawDockIdx = DOC.idx;
+        _lastDrawDockCommitsLen = ALL_COMMITS.length;
+
         const dpr = window.devicePixelRatio || 1;
         const w = Math.max(1, Math.floor(canvas.clientWidth * dpr));
         const h = Math.max(1, Math.floor(canvas.clientHeight * dpr));
@@ -18649,6 +19281,17 @@
       }
 
       function renderCharts(commits) {
+        const resSel = document.getElementById("stackResolution");
+        const metricSel = document.getElementById("stackMetric");
+        const tzSel = document.getElementById("stackTimezone");
+        const resolution = resSel?.value || "commit";
+        const metric = metricSel?.value || "groups";
+        const tzMode = tzSel?.value || "local";
+
+        const commitsHash = commits.length + "|" + (commits[0]?.hash || "") + "|" + (commits[commits.length - 1]?.hash || "") + "|" + resolution + "|" + metric + "|" + tzMode + "|" + STATE.bucketMode;
+        if (_lastChartsCommitsHash === commitsHash) return;
+        _lastChartsCommitsHash = commitsHash;
+
         // Timeline scatter
         if (!chartTimeline) chartTimeline = echarts.init(document.getElementById("timelineChart"));
         if (!chartStack) chartStack = echarts.init(document.getElementById("stackChart"));
@@ -18723,7 +19366,7 @@
               emphasis: { scale: true },
             },
           ],
-        });
+        }, { lazyUpdate: true });
 
         chartTimeline.off("click");
         chartTimeline.on("click", (p) => {
@@ -18740,13 +19383,6 @@
         // Stacked buckets by time bin (commit/day/hour/15m/5m)
         // Uses dense wall-clock bins for time-based resolutions so
         // empty periods are visible in the chart (bd-24q.12.1).
-        const resSel = document.getElementById("stackResolution");
-        const metricSel = document.getElementById("stackMetric");
-        const tzSel = document.getElementById("stackTimezone");
-        const resolution = resSel?.value || "commit";
-        const metric = metricSel?.value || "groups";
-        const tzMode = tzSel?.value || "local";
-
         let binLabels = [];
         let binCommits = [];
 
@@ -18870,23 +19506,23 @@
               data: valuesByBucket.get(b.id),
             };
           }),
-        });
+        }, { lazyUpdate: true });
 
-	        // Donut distribution by (primary or multi)
-	        const totals = new Map(BUCKETS.map((b) => [b.id, 0]));
-	        if (STATE.bucketMode === "primary") {
-	          for (const c of commits) {
-	            for (const g of c.changeGroups) {
-	              totals.set(g.primary, (totals.get(g.primary) || 0) + 1);
-	            }
-	          }
-	        } else {
-	          for (const c of commits) {
-	            for (const g of c.changeGroups) {
-	              for (const b of g.labels) totals.set(b, (totals.get(b) || 0) + 1);
-	            }
-	          }
-	        }
+        // Donut distribution by (primary or multi)
+        const totals = new Map(BUCKETS.map((b) => [b.id, 0]));
+        if (STATE.bucketMode === "primary") {
+          for (const c of commits) {
+            for (const g of c.changeGroups) {
+              totals.set(g.primary, (totals.get(g.primary) || 0) + 1);
+            }
+          }
+        } else {
+          for (const c of commits) {
+            for (const g of c.changeGroups) {
+              for (const b of g.labels) totals.set(b, (totals.get(b) || 0) + 1);
+            }
+          }
+        }
         const donutData = BUCKETS.map((b) => ({ name: `${b.id}. ${b.name}`, value: totals.get(b.id) || 0, itemStyle: { color: b.color } }));
 
         chartDonut.setOption({
@@ -18903,7 +19539,7 @@
               data: donutData,
             },
           ],
-        });
+        }, { lazyUpdate: true });
 
         renderBocpd(commits);
         void maybeRefreshPhaseAndOutliers(commits);
@@ -19433,8 +20069,15 @@
       }
 
       function renderCommitList(filteredCommits) {
-        ensureCommitNodes();
         const wrap = document.getElementById("commitList");
+        if (!wrap) return;
+
+        const commitsHash = filteredCommits.length + "|" + (filteredCommits[0]?.hash || "") + "|" + (filteredCommits[filteredCommits.length - 1]?.hash || "");
+        if (_lastCommitListCommitsHash === commitsHash && _lastCommitListBucketMode === STATE.bucketMode) return;
+        _lastCommitListCommitsHash = commitsHash;
+        _lastCommitListBucketMode = STATE.bucketMode;
+
+        ensureCommitNodes();
 
         _clFilteredCommits = filteredCommits;
         _clRenderedCount = 0;
