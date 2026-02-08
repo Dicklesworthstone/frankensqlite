@@ -92,8 +92,10 @@ mod gf256_verification {
         }
     }
 
-    fn fail_mismatch(case: &str, a: u8, b: u8, expected: u8, actual: u8, source: &str) -> ! {
-        panic!(
+    #[track_caller]
+    fn fail_mismatch(case: &str, a: u8, b: u8, expected: u8, actual: u8, source: &str) {
+        assert_eq!(
+            actual, expected,
             "bead_id={BEAD_ID} case={case} a=0x{a:02X} b=0x{b:02X} expected=0x{expected:02X} actual=0x{actual:02X} source={source}",
         );
     }
@@ -141,7 +143,7 @@ mod gf256_verification {
         for i in 0_u16..=254 {
             #[allow(clippy::cast_possible_truncation)]
             {
-                table[val as usize] = i as u8;
+                table[usize::from(val)] = i as u8;
             }
             val <<= 1;
             if val & 0x100 != 0 {
@@ -160,10 +162,7 @@ mod gf256_verification {
 
     fn poly_mod(mut dividend: u16, divisor: u16) -> u16 {
         let div_deg = poly_degree(divisor).expect("divisor must be non-zero");
-        loop {
-            let Some(dvd_deg) = poly_degree(dividend) else {
-                break;
-            };
+        while let Some(dvd_deg) = poly_degree(dividend) {
             if dvd_deg < div_deg {
                 break;
             }
@@ -276,11 +275,10 @@ mod gf256_verification {
         for k in 0..255 {
             let a = o.exp(k);
             let b = o.exp(k + 255);
-            if a != b {
-                panic!(
-                    "bead_id={BEAD_ID} case=exp_mirror k={k} exp=0x{a:02X} exp_mirror=0x{b:02X}"
-                );
-            }
+            assert_eq!(
+                a, b,
+                "bead_id={BEAD_ID} case=exp_mirror k={k} exp=0x{a:02X} exp_mirror=0x{b:02X}"
+            );
         }
 
         // Verify max log sum is within the 512-entry extended table.
@@ -326,8 +324,7 @@ mod gf256_verification {
     #[test]
     fn test_gf256_inverse_property() {
         let o = Gf256Oracle::global();
-        for a in 1_u16..=255 {
-            let a = a as u8;
+        for a in 1_u8..=u8::MAX {
             let inv = o.inv(a);
             let expected = 1_u8;
             let actual = o.mul_logexp(a, inv);
@@ -351,10 +348,8 @@ mod gf256_verification {
     #[test]
     fn test_gf256_division_identity() {
         let o = Gf256Oracle::global();
-        for a in 0_u16..=255 {
-            for b in 1_u16..=255 {
-                let a = a as u8;
-                let b = b as u8;
+        for a in 0_u8..=u8::MAX {
+            for b in 1_u8..=u8::MAX {
                 let prod = o.mul_logexp(a, b);
                 let got = o.div(prod, b);
                 if got != a {
@@ -372,10 +367,8 @@ mod gf256_verification {
     #[test]
     fn test_gf256_mul_tables_match_logexp() {
         let o = Gf256Oracle::global();
-        for a in 0_u16..=255 {
-            for b in 0_u16..=255 {
-                let a = a as u8;
-                let b = b as u8;
+        for a in 0_u8..=u8::MAX {
+            for b in 0_u8..=u8::MAX {
                 let expected = o.mul_logexp(a, b);
                 let actual = gf256_mul_const(a, b);
                 if actual != expected {
@@ -409,14 +402,11 @@ mod gf256_verification {
         // table when dst.len() >= 64. We drive it with a 256-byte slice covering all octets.
         let o = Gf256Oracle::global();
 
-        let base: Vec<u8> = (0_u16..=255).map(|x| x as u8).collect();
-        for c in 0_u16..=255 {
-            let c = c as u8;
+        let base: Vec<u8> = (0_u8..=u8::MAX).collect();
+        for c in 0_u8..=u8::MAX {
             let mut data = base.clone();
             gf256_mul_slice(&mut data, Gf256(c));
-            for (x, &got) in data.iter().enumerate() {
-                #[allow(clippy::cast_possible_truncation)]
-                let x = x as u8;
+            for (&x, &got) in base.iter().zip(data.iter()) {
                 let expected = o.mul_logexp(x, c);
                 if got != expected {
                     fail_mismatch(
@@ -437,14 +427,11 @@ mod gf256_verification {
         // Similar to mul_slice, but validate addmul slice multiply table usage.
         let o = Gf256Oracle::global();
 
-        let src: Vec<u8> = (0_u16..=255).map(|x| x as u8).collect();
-        for c in 0_u16..=255 {
-            let c = c as u8;
+        let src: Vec<u8> = (0_u8..=u8::MAX).collect();
+        for c in 0_u8..=u8::MAX {
             let mut dst = vec![0_u8; src.len()];
             gf256_addmul_slice(&mut dst, &src, Gf256(c));
-            for (x, &got) in dst.iter().enumerate() {
-                #[allow(clippy::cast_possible_truncation)]
-                let x = x as u8;
+            for (&x, &got) in src.iter().zip(dst.iter()) {
                 let expected = o.mul_logexp(x, c);
                 if got != expected {
                     fail_mismatch(
@@ -463,19 +450,15 @@ mod gf256_verification {
     #[test]
     fn test_gf256_distributive_over_add_exhaustive() {
         let o = Gf256Oracle::global();
-        for a in 0_u16..=255 {
-            for b in 0_u16..=255 {
-                for c in 0_u16..=255 {
-                    let a = a as u8;
-                    let b = b as u8;
-                    let c = c as u8;
+        for a in 0_u8..=u8::MAX {
+            for b in 0_u8..=u8::MAX {
+                for c in 0_u8..=u8::MAX {
                     let lhs = o.mul_logexp(a, b ^ c);
                     let rhs = o.mul_logexp(a, b) ^ o.mul_logexp(a, c);
-                    if lhs != rhs {
-                        panic!(
-                            "bead_id={BEAD_ID} case=distributive a=0x{a:02X} b=0x{b:02X} c=0x{c:02X} lhs=0x{lhs:02X} rhs=0x{rhs:02X}",
-                        );
-                    }
+                    assert_eq!(
+                        lhs, rhs,
+                        "bead_id={BEAD_ID} case=distributive a=0x{a:02X} b=0x{b:02X} c=0x{c:02X} lhs=0x{lhs:02X} rhs=0x{rhs:02X}",
+                    );
                 }
             }
         }
@@ -545,7 +528,10 @@ mod gf256_verification {
         let source: Vec<Vec<u8>> = (0..k)
             .map(|i| {
                 (0..symbol_size)
-                    .map(|j| ((i * 37 + j * 13 + 7) % 256) as u8)
+                    .map(|j| {
+                        let v = (i * 37 + j * 13 + 7) % 256;
+                        u8::try_from(v).expect("patterned source byte")
+                    })
                     .collect()
             })
             .collect();
@@ -554,6 +540,8 @@ mod gf256_verification {
         let decoder = InactivationDecoder::new(k, symbol_size, seed);
         let params = decoder.params();
         let l = params.l;
+        let k_u32 = u32::try_from(k).expect("k is small and fits u32");
+        let l_u32 = u32::try_from(l).expect("L is small in this test and fits u32");
         let base_rows = params.s + params.h;
         let constraints = ConstraintMatrix::build(params, seed);
 
@@ -573,7 +561,7 @@ mod gf256_verification {
                 }
             }
             received.push(ReceivedSymbol {
-                esi: i as u32,
+                esi: u32::try_from(i).expect("esi fits u32 for this test"),
                 is_source: true,
                 columns,
                 coefficients,
@@ -582,18 +570,18 @@ mod gf256_verification {
         }
 
         // Add enough repair symbols to reach L total.
-        for esi in (k as u32)..(l as u32) {
+        for esi in k_u32..l_u32 {
             let (cols, coefs) = decoder.repair_equation(esi);
 
             // Build repair symbol bytes from the encoder's intermediate symbols using the oracle GF(256).
             let mut repair = vec![0_u8; symbol_size];
             for (col, coef) in cols.iter().copied().zip(coefs.iter().copied()) {
                 let sym = encoder.intermediate_symbol(col);
-                o.addmul_slice(&mut repair, &sym, coef.0);
+                o.addmul_slice(&mut repair, sym, coef.0);
             }
 
             // Cross-check a few symbols against asupersync's own encoder output (sanity).
-            if esi < (k as u32 + 4) {
+            if esi < k_u32 + 4 {
                 let expected = encoder.repair_symbol(esi);
                 assert_eq!(
                     repair, expected,
@@ -604,9 +592,9 @@ mod gf256_verification {
             received.push(ReceivedSymbol::repair(esi, cols, coefs, repair));
         }
 
-        let decoded = decoder.decode(&received).expect("decode should succeed");
+        let decode_outcome = decoder.decode(&received).expect("decode should succeed");
         assert_eq!(
-            decoded.source, source,
+            decode_outcome.source, source,
             "bead_id={BEAD_ID} case=e2e_roundtrip source mismatch"
         );
     }

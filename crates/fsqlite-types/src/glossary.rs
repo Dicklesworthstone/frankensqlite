@@ -7,7 +7,7 @@
 use std::fmt;
 use std::num::NonZeroU64;
 
-use crate::{PageData, PageNumber};
+use crate::{ObjectId, PageData, PageNumber};
 
 /// Monotonically increasing transaction identifier.
 ///
@@ -214,51 +214,6 @@ pub struct PageVersion {
     pub prev: Option<VersionPointer>,
 }
 
-/// Content-addressed identity for ECS objects.
-///
-/// Spec: `ObjectId = Trunc128(BLAKE3("fsqlite:ecs:v1" || canonical_object_header || payload_hash))`.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, PartialOrd, Ord,
-)]
-#[repr(transparent)]
-pub struct ObjectId([u8; 16]);
-
-impl ObjectId {
-    pub const BYTES: usize = 16;
-    const DOMAIN: &'static [u8] = b"fsqlite:ecs:v1";
-
-    /// Derive an `ObjectId` from the canonical object header bytes and payload bytes.
-    #[must_use]
-    pub fn from_header_and_payload(header: &[u8], payload: &[u8]) -> Self {
-        let payload_hash = blake3::hash(payload);
-
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(Self::DOMAIN);
-        hasher.update(header);
-        hasher.update(payload_hash.as_bytes());
-
-        let out = hasher.finalize();
-        let mut bytes = [0_u8; Self::BYTES];
-        bytes.copy_from_slice(&out.as_bytes()[..Self::BYTES]);
-        Self(bytes)
-    }
-
-    /// Return the raw bytes of this object id.
-    #[inline]
-    pub const fn as_bytes(self) -> [u8; Self::BYTES] {
-        self.0
-    }
-}
-
-impl fmt::Display for ObjectId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for b in &self.0 {
-            write!(f, "{b:02x}")?;
-        }
-        Ok(())
-    }
-}
-
 /// A commit capsule is the durable ECS object that commits refer to.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct CommitCapsule {
@@ -298,35 +253,10 @@ pub struct DecodeProof {
     pub oti: Oti,
 }
 
-/// Capability context (stubbed in `crate::cx` until asupersync integration lands).
-pub use crate::cx::Cx;
-
-/// A cooperative budget for async operations (deadline + quotas + priority).
+/// Capability context + cooperative budget types.
 ///
-/// Combine semantics form a product lattice:
-/// - deadline, poll_quota, cost_quota: **meet** (`min`)
-/// - priority: **join** (`max`)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub struct Budget {
-    pub deadline_unix_ns: u64,
-    pub poll_quota: u32,
-    pub cost_quota: u64,
-    pub priority: u8,
-}
-
-impl Budget {
-    /// Combine two budgets (meet/join product lattice).
-    #[inline]
-    #[must_use]
-    pub const fn combine(self, other: Self) -> Self {
-        Self {
-            deadline_unix_ns: self.deadline_unix_ns.min(other.deadline_unix_ns),
-            poll_quota: self.poll_quota.min(other.poll_quota),
-            cost_quota: self.cost_quota.min(other.cost_quota),
-            priority: self.priority.max(other.priority),
-        }
-    }
-}
+/// Canonical definitions live in `crate::cx` (per `bd-3go.1`).
+pub use crate::cx::{Budget, Cx};
 
 /// Result outcome lattice for cooperative cancellation and failure.
 #[derive(
@@ -423,7 +353,11 @@ pub enum WitnessKey {
     /// Semantic witness: specific B-tree cell/tag.
     Cell { btree_root: PageNumber, tag: u64 },
     /// Semantic witness: structured byte range on a page.
-    ByteRange { page: PageNumber, start: u32, len: u32 },
+    ByteRange {
+        page: PageNumber,
+        start: u32,
+        len: u32,
+    },
 }
 
 /// Witness hierarchy range key (prefix-based bucketing).
@@ -562,8 +496,11 @@ impl TxnSlot {
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
+    use std::time::Duration;
 
     use proptest::prelude::*;
+
+    use crate::PayloadHash;
 
     use super::*;
 
@@ -585,19 +522,19 @@ mod tests {
     fn test_object_id_16_bytes_blake3_truncation() {
         let header = b"hdr:v1";
         let payload = b"payload";
-        let oid = ObjectId::from_header_and_payload(header, payload);
-        assert_eq!(oid.as_bytes().len(), ObjectId::BYTES);
+        let oid = ObjectId::derive(header, PayloadHash::blake3(payload));
+        assert_eq!(oid.as_bytes().len(), ObjectId::LEN);
     }
 
     #[test]
     fn test_object_id_content_addressed() {
         let header = b"hdr:v1";
         let payload = b"payload";
-        let a = ObjectId::from_header_and_payload(header, payload);
-        let b = ObjectId::from_header_and_payload(header, payload);
+        let a = ObjectId::derive(header, PayloadHash::blake3(payload));
+        let b = ObjectId::derive(header, PayloadHash::blake3(payload));
         assert_eq!(a, b);
 
-        let c = ObjectId::from_header_and_payload(header, b"payload2");
+        let c = ObjectId::derive(header, PayloadHash::blake3(b"payload2"));
         assert_ne!(a, c);
     }
 
@@ -610,8 +547,8 @@ mod tests {
         for i in 0..10_000_u64 {
             // Deterministic pseudo-randomness, but ensure distinct inputs by embedding i.
             state = state
-                .wrapping_mul(6364136223846793005_u64)
-                .wrapping_add(1442695040888963407_u64);
+                .wrapping_mul(6_364_136_223_846_793_005_u64)
+                .wrapping_add(1_442_695_040_888_963_407_u64);
 
             let mut payload = [0_u8; 32];
             payload[..8].copy_from_slice(&i.to_le_bytes());
@@ -619,7 +556,7 @@ mod tests {
             payload[16..24].copy_from_slice(&state.rotate_left(17).to_le_bytes());
             payload[24..32].copy_from_slice(&state.rotate_left(41).to_le_bytes());
 
-            let oid = ObjectId::from_header_and_payload(header, &payload);
+            let oid = ObjectId::derive(header, PayloadHash::blake3(&payload));
             assert!(ids.insert(oid), "ObjectId collision at i={i}");
         }
     }
@@ -634,21 +571,21 @@ mod tests {
     #[test]
     fn test_budget_product_lattice_semantics() {
         let a = Budget {
-            deadline_unix_ns: 100,
+            deadline: Some(Duration::from_millis(100)),
             poll_quota: 10,
-            cost_quota: 500,
+            cost_quota: Some(500),
             priority: 1,
         };
         let b = Budget {
-            deadline_unix_ns: 50,
+            deadline: Some(Duration::from_millis(50)),
             poll_quota: 20,
-            cost_quota: 400,
+            cost_quota: Some(400),
             priority: 9,
         };
-        let c = a.combine(b);
-        assert_eq!(c.deadline_unix_ns, 50);
+        let c = a.meet(b);
+        assert_eq!(c.deadline, Some(Duration::from_millis(50)));
         assert_eq!(c.poll_quota, 10);
-        assert_eq!(c.cost_quota, 400);
+        assert_eq!(c.cost_quota, Some(400));
         assert_eq!(c.priority, 9);
     }
 
@@ -674,18 +611,9 @@ mod tests {
             len: 16,
         };
 
-        match a {
-            WitnessKey::Page(_) => {}
-            WitnessKey::Cell { .. } | WitnessKey::ByteRange { .. } => unreachable!(),
-        }
-        match b {
-            WitnessKey::Cell { .. } => {}
-            WitnessKey::Page(_) | WitnessKey::ByteRange { .. } => unreachable!(),
-        }
-        match c {
-            WitnessKey::ByteRange { .. } => {}
-            WitnessKey::Page(_) | WitnessKey::Cell { .. } => unreachable!(),
-        }
+        assert!(matches!(a, WitnessKey::Page(_)));
+        assert!(matches!(b, WitnessKey::Cell { .. }));
+        assert!(matches!(c, WitnessKey::ByteRange { .. }));
     }
 
     #[test]
@@ -734,13 +662,13 @@ mod tests {
 
     fn arb_budget() -> impl Strategy<Value = Budget> {
         (
-            any::<u64>(),
+            prop::option::of(any::<u64>()),
             any::<u32>(),
-            any::<u64>(),
+            prop::option::of(any::<u64>()),
             any::<u8>(),
         )
-            .prop_map(|(deadline_unix_ns, poll_quota, cost_quota, priority)| Budget {
-                deadline_unix_ns,
+            .prop_map(|(deadline_ms, poll_quota, cost_quota, priority)| Budget {
+                deadline: deadline_ms.map(Duration::from_millis),
                 poll_quota,
                 cost_quota,
                 priority,
@@ -750,13 +678,12 @@ mod tests {
     proptest! {
         #[test]
         fn prop_budget_combine_associative(a in arb_budget(), b in arb_budget(), c in arb_budget()) {
-            prop_assert_eq!(a.combine(b).combine(c), a.combine(b.combine(c)));
+            prop_assert_eq!(a.meet(b).meet(c), a.meet(b.meet(c)));
         }
 
         #[test]
         fn prop_budget_combine_commutative(a in arb_budget(), b in arb_budget()) {
-            prop_assert_eq!(a.combine(b), b.combine(a));
+            prop_assert_eq!(a.meet(b), b.meet(a));
         }
     }
 }
-

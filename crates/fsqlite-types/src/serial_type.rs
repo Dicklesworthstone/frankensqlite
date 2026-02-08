@@ -359,6 +359,25 @@ mod tests {
     }
 
     #[test]
+    fn varint_nine_bytes_uses_full_8bit_last_byte() {
+        // Pick a value that requires 9 bytes and has a low byte with the high bit set (0xFF).
+        // If the 9th byte were incorrectly treated as 7-bit, this would not round-trip.
+        let value: u64 = (1u64 << 56) | 0xFF;
+
+        let mut buf = [0u8; 9];
+        let written = write_varint(&mut buf, value);
+        assert_eq!(written, 9);
+        assert_eq!(buf[8], 0xFF);
+
+        // The first 8 bytes must all have the continuation bit set.
+        assert!(buf[..8].iter().all(|b| b & 0x80 != 0));
+
+        let (decoded, consumed) = read_varint(&buf).unwrap();
+        assert_eq!(decoded, value);
+        assert_eq!(consumed, 9);
+    }
+
+    #[test]
     fn read_varint_empty() {
         assert!(read_varint(&[]).is_none());
     }

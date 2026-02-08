@@ -365,7 +365,10 @@ dependencies = [
  "fsqlite-types",
  "fsqlite-wal",
  "parking_lot",
+ "proptest",
  "serde",
+ "smallvec",
+ "tracing",
 ]
 
 [[package]]

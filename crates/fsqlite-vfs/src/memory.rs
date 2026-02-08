@@ -484,9 +484,15 @@ mod tests {
     fn vfs_default_current_time() {
         let cx = Cx::new();
         let vfs = make_vfs();
+        // Use deterministic time from Cx (no ambient authority).
+        cx.set_unix_millis_for_testing(1_700_000_000_000);
         let time = vfs.current_time(&cx);
-        assert!(time > 2_450_000.0);
-        assert!(time < 2_500_000.0);
+        #[allow(clippy::cast_precision_loss)]
+        let expected = 2_440_587.5 + ((1_700_000_000_000_f64 / 1000.0) / 86_400.0);
+        assert!(
+            (time - expected).abs() < 1e-9,
+            "unexpected julian day: got={time} expected≈{expected}"
+        );
     }
 
     #[test]

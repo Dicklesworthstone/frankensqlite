@@ -78,15 +78,8 @@ pub trait Vfs: Send + Sync {
     /// Return the current time as a Julian day number (days since noon
     /// on November 24, 4714 B.C.).
     fn current_time(&self, cx: &Cx) -> f64 {
-        // Default: use system time.
-        let _ = cx;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default();
-        // Unix epoch in Julian days: 2440587.5
-        #[allow(clippy::cast_precision_loss)]
-        let julian = 2_440_587.5 + (now.as_secs_f64() / 86400.0);
-        julian
+        // Default: derive from `Cx` time capability (no ambient authority).
+        cx.current_time_julian_day()
     }
 }
 

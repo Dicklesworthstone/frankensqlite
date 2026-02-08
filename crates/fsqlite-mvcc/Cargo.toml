@@ -13,7 +13,12 @@ fsqlite-error = { workspace = true }
 fsqlite-pager = { workspace = true }
 fsqlite-wal = { workspace = true }
 parking_lot = { workspace = true }
+smallvec = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
 
 [lints]
 workspace = true
