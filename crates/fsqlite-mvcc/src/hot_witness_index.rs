@@ -13,7 +13,7 @@
 //! - **Bounded backoff**: epoch_lock acquisition respects budget and falls back
 //!   to overflow when budget is exhausted.
 
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 use fsqlite_types::RangeKey;
 use tracing::{debug, info, warn};
@@ -84,8 +84,7 @@ impl HotWitnessBucketEntry {
 
     /// Check if this bucket matches the given (level, prefix).
     fn matches(&self, level: u8, prefix: u32) -> bool {
-        self.level.load(Ordering::Acquire) == level
-            && self.prefix.load(Ordering::Acquire) == prefix
+        self.level.load(Ordering::Acquire) == level && self.prefix.load(Ordering::Acquire) == prefix
     }
 
     /// Try to claim this empty bucket for (level, prefix) via CAS.
@@ -155,17 +154,16 @@ impl HotWitnessBucketEntry {
             self.release_epoch_lock();
             return true;
         }
-        // Install into whichever buffer is stale (not cur or cur-1).
-        let prev_epoch = current_epoch.wrapping_sub(1);
+        // Install into whichever buffer is stale.
+        // A buffer is stale if its epoch is 0 (sentinel) or not a live epoch.
         let ea = self.epoch_a.load(Ordering::Acquire);
         let eb = self.epoch_b.load(Ordering::Acquire);
-        let target_buf = if ea != current_epoch && ea != prev_epoch {
+        let target_buf = if is_epoch_stale(ea, current_epoch) {
             'a'
-        } else if eb != current_epoch && eb != prev_epoch {
+        } else if is_epoch_stale(eb, current_epoch) {
             'b'
         } else {
-            // Both buffers hold live epochs — this shouldn't happen with proper
-            // epoch advancement, but handle gracefully by using overflow.
+            // Both buffers hold live epochs — handle gracefully by using overflow.
             self.release_epoch_lock();
             return false;
         };
@@ -202,12 +200,11 @@ impl HotWitnessBucketEntry {
             self.release_epoch_lock();
             return true;
         }
-        let prev_epoch = current_epoch.wrapping_sub(1);
         let ea = self.epoch_a.load(Ordering::Acquire);
         let eb = self.epoch_b.load(Ordering::Acquire);
-        let target_buf = if ea != current_epoch && ea != prev_epoch {
+        let target_buf = if is_epoch_stale(ea, current_epoch) {
             'a'
-        } else if eb != current_epoch && eb != prev_epoch {
+        } else if is_epoch_stale(eb, current_epoch) {
             'b'
         } else {
             self.release_epoch_lock();
@@ -235,11 +232,11 @@ impl HotWitnessBucketEntry {
     fn all_reader_bits(&self, words: u32) -> Vec<u64> {
         let w = words as usize;
         let mut result = vec![0u64; w];
-        for i in 0..w.min(self.readers_a.len()) {
-            result[i] |= self.readers_a[i].load(Ordering::Acquire);
+        for (r, a) in result.iter_mut().zip(self.readers_a.iter()).take(w) {
+            *r |= a.load(Ordering::Acquire);
         }
-        for i in 0..w.min(self.readers_b.len()) {
-            result[i] |= self.readers_b[i].load(Ordering::Acquire);
+        for (r, b) in result.iter_mut().zip(self.readers_b.iter()).take(w) {
+            *r |= b.load(Ordering::Acquire);
         }
         result
     }
@@ -248,11 +245,11 @@ impl HotWitnessBucketEntry {
     fn all_writer_bits(&self, words: u32) -> Vec<u64> {
         let w = words as usize;
         let mut result = vec![0u64; w];
-        for i in 0..w.min(self.writers_a.len()) {
-            result[i] |= self.writers_a[i].load(Ordering::Acquire);
+        for (r, a) in result.iter_mut().zip(self.writers_a.iter()).take(w) {
+            *r |= a.load(Ordering::Acquire);
         }
-        for i in 0..w.min(self.writers_b.len()) {
-            result[i] |= self.writers_b[i].load(Ordering::Acquire);
+        for (r, b) in result.iter_mut().zip(self.writers_b.iter()).take(w) {
+            *r |= b.load(Ordering::Acquire);
         }
         result
     }
@@ -309,7 +306,7 @@ impl std::fmt::Debug for HotWitnessBucketEntry {
             .field("prefix", &self.prefix.load(Ordering::Relaxed))
             .field("epoch_a", &self.epoch_a.load(Ordering::Relaxed))
             .field("epoch_b", &self.epoch_b.load(Ordering::Relaxed))
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -347,7 +344,10 @@ impl HotWitnessIndex {
     /// Panics if `capacity` is zero or not a power of two.
     #[must_use]
     pub fn new(capacity: u32, max_txn_slots: u32) -> Self {
-        assert!(capacity > 0 && capacity.is_power_of_two(), "capacity must be power of 2");
+        assert!(
+            capacity > 0 && capacity.is_power_of_two(),
+            "capacity must be power of 2"
+        );
         let words = max_txn_slots.div_ceil(64);
         let mask = capacity - 1;
         let entries = (0..capacity)
@@ -374,7 +374,7 @@ impl HotWitnessIndex {
     /// across all `range_keys` derived from a `WitnessKey` (§5.6.4.5).
     pub fn register_read(&self, slot_id: u32, witness_epoch: u32, range_keys: &[RangeKey]) {
         for rk in range_keys {
-            if !self.register_read_single(slot_id, witness_epoch, rk) {
+            if !self.register_read_single(slot_id, witness_epoch, *rk) {
                 // Capacity pressure or lock failure: fall back to overflow.
                 self.set_overflow_reader(slot_id, witness_epoch);
                 debug!(
@@ -393,7 +393,7 @@ impl HotWitnessIndex {
     /// across all `range_keys`.
     pub fn register_write(&self, slot_id: u32, witness_epoch: u32, range_keys: &[RangeKey]) {
         for rk in range_keys {
-            if !self.register_write_single(slot_id, witness_epoch, rk) {
+            if !self.register_write_single(slot_id, witness_epoch, *rk) {
                 self.set_overflow_writer(slot_id, witness_epoch);
                 debug!(
                     slot_id,
@@ -415,7 +415,7 @@ impl HotWitnessIndex {
     pub fn candidate_readers(&self, range_keys: &[RangeKey]) -> Vec<u64> {
         let mut result = self.overflow.all_reader_bits(self.words);
         for rk in range_keys {
-            if let Some(bucket) = self.find_bucket(rk) {
+            if let Some(bucket) = self.find_bucket(*rk) {
                 let bits = bucket.all_reader_bits(self.words);
                 for (r, b) in result.iter_mut().zip(bits.iter()) {
                     *r |= *b;
@@ -430,7 +430,7 @@ impl HotWitnessIndex {
     pub fn candidate_writers(&self, range_keys: &[RangeKey]) -> Vec<u64> {
         let mut result = self.overflow.all_writer_bits(self.words);
         for rk in range_keys {
-            if let Some(bucket) = self.find_bucket(rk) {
+            if let Some(bucket) = self.find_bucket(*rk) {
                 let bits = bucket.all_writer_bits(self.words);
                 for (r, b) in result.iter_mut().zip(bits.iter()) {
                     *r |= *b;
@@ -464,17 +464,10 @@ impl HotWitnessIndex {
     }
 
     /// Internal: register a single read witness for one range key.
-    fn register_read_single(
-        &self,
-        slot_id: u32,
-        witness_epoch: u32,
-        range_key: &RangeKey,
-    ) -> bool {
+    fn register_read_single(&self, slot_id: u32, witness_epoch: u32, range_key: RangeKey) -> bool {
         let current_epoch = self.current_epoch();
-        // Try to find existing bucket or claim a new one.
-        let bucket = match self.find_or_create_bucket(range_key) {
-            Some(b) => b,
-            None => return false, // No capacity → use overflow.
+        let Some(bucket) = self.find_or_create_bucket(range_key) else {
+            return false; // No capacity → use overflow.
         };
         // Fast path: set bit in existing epoch buffer.
         if bucket.set_reader_bit_fast(witness_epoch, slot_id) {
@@ -485,16 +478,10 @@ impl HotWitnessIndex {
     }
 
     /// Internal: register a single write witness for one range key.
-    fn register_write_single(
-        &self,
-        slot_id: u32,
-        witness_epoch: u32,
-        range_key: &RangeKey,
-    ) -> bool {
+    fn register_write_single(&self, slot_id: u32, witness_epoch: u32, range_key: RangeKey) -> bool {
         let current_epoch = self.current_epoch();
-        let bucket = match self.find_or_create_bucket(range_key) {
-            Some(b) => b,
-            None => return false,
+        let Some(bucket) = self.find_or_create_bucket(range_key) else {
+            return false;
         };
         if bucket.set_writer_bit_fast(witness_epoch, slot_id) {
             return true;
@@ -503,7 +490,7 @@ impl HotWitnessIndex {
     }
 
     /// Find an existing bucket for the given range key.
-    fn find_bucket(&self, range_key: &RangeKey) -> Option<&HotWitnessBucketEntry> {
+    fn find_bucket(&self, range_key: RangeKey) -> Option<&HotWitnessBucketEntry> {
         let start = range_key_bucket_index(range_key, self.mask);
         for probe in 0..self.max_probes {
             let idx = ((start + probe) & self.mask) as usize;
@@ -519,7 +506,7 @@ impl HotWitnessIndex {
     }
 
     /// Find or create a bucket for the given range key via linear probing.
-    fn find_or_create_bucket(&self, range_key: &RangeKey) -> Option<&HotWitnessBucketEntry> {
+    fn find_or_create_bucket(&self, range_key: RangeKey) -> Option<&HotWitnessBucketEntry> {
         let start = range_key_bucket_index(range_key, self.mask);
         for probe in 0..self.max_probes {
             let idx = ((start + probe) & self.mask) as usize;
@@ -566,7 +553,7 @@ impl std::fmt::Debug for HotWitnessIndex {
             .field("capacity", &self.capacity)
             .field("epoch", &self.epoch.load(Ordering::Relaxed))
             .field("words", &self.words)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -633,18 +620,18 @@ impl ColdWitnessStore {
         let stem = sidecar
             .file_stem()
             .map_or_else(|| "db".into(), std::ffi::OsStr::to_os_string);
-        sidecar.set_file_name(format!(".fsqlite"));
-        sidecar.push(format!(
-            "{}_witnesses.log",
-            stem.to_string_lossy()
-        ));
+        sidecar.set_file_name(".fsqlite");
+        sidecar.push(format!("{}_witnesses.log", stem.to_string_lossy()));
         sidecar
     }
 
     /// Find all read witnesses for a given transaction.
     #[must_use]
     pub fn reads_for_txn(&self, txn: fsqlite_types::TxnId) -> Vec<&fsqlite_types::ReadWitness> {
-        self.read_witnesses.iter().filter(|w| w.txn == txn).collect()
+        self.read_witnesses
+            .iter()
+            .filter(|w| w.txn == txn)
+            .collect()
     }
 
     /// Find all write witnesses for a given transaction.
@@ -670,6 +657,20 @@ impl ColdWitnessStore {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Check if a buffer epoch tag is stale (safe to reuse).
+///
+/// Epoch 0 is a sentinel (uninitialized) and is always stale.
+/// Otherwise, a buffer is stale if its epoch is not one of the two live epochs
+/// (current or current-1).
+#[must_use]
+const fn is_epoch_stale(buffer_epoch: u32, current_epoch: u32) -> bool {
+    if buffer_epoch == 0 {
+        return true; // Sentinel: never used.
+    }
+    let prev_epoch = current_epoch.wrapping_sub(1);
+    buffer_epoch != current_epoch && buffer_epoch != prev_epoch
+}
+
 /// Compute (word_index, bit_mask) for a given TxnSlot ID.
 #[must_use]
 const fn slot_bit(slot_id: u32) -> (usize, u64) {
@@ -680,13 +681,15 @@ const fn slot_bit(slot_id: u32) -> (usize, u64) {
 
 /// Extract set bit positions from a bitset.
 #[must_use]
+#[allow(clippy::cast_possible_truncation)]
 pub fn bitset_to_slot_ids(bitset: &[u64]) -> Vec<u32> {
     let mut ids = Vec::new();
     for (word_idx, &word) in bitset.iter().enumerate() {
+        let base = (word_idx as u32) * 64;
         let mut w = word;
         while w != 0 {
             let bit = w.trailing_zeros();
-            ids.push(word_idx as u32 * 64 + bit);
+            ids.push(base + bit);
             w &= w - 1; // Clear lowest set bit.
         }
     }
@@ -700,7 +703,7 @@ pub fn bitset_to_slot_ids(bitset: &[u64]) -> Vec<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::witness_hierarchy::{derive_range_keys, WitnessHierarchyConfigV1};
+    use crate::witness_hierarchy::{WitnessHierarchyConfigV1, derive_range_keys};
     use fsqlite_types::{PageNumber, WitnessKey};
 
     fn page(n: u32) -> PageNumber {
@@ -772,7 +775,10 @@ mod tests {
         let readers = bitset_to_slot_ids(&idx.candidate_readers(&rks));
         let writers = bitset_to_slot_ids(&idx.candidate_writers(&rks));
 
-        assert!(readers.contains(&0), "T1 must be discovered as reader of K1");
+        assert!(
+            readers.contains(&0),
+            "T1 must be discovered as reader of K1"
+        );
         assert!(
             writers.contains(&1),
             "T2 must be discovered as writer of K1"
@@ -831,7 +837,10 @@ mod tests {
         idx.register_read(0, epoch1, &rks);
 
         // Advance epoch.
-        assert!(idx.try_advance_epoch(epoch1), "epoch advancement should succeed");
+        assert!(
+            idx.try_advance_epoch(epoch1),
+            "epoch advancement should succeed"
+        );
         let epoch2 = idx.current_epoch();
         assert_eq!(epoch2, epoch1 + 1);
 
@@ -906,7 +915,7 @@ mod tests {
 
         // Manually hold the epoch_lock on the bucket to simulate contention.
         // (Find the bucket first.)
-        let bucket = idx.find_bucket(&rks[0]);
+        let bucket = idx.find_bucket(rks[0]);
         if let Some(b) = bucket {
             // Lock the bucket.
             b.epoch_lock.store(1, Ordering::Release);
@@ -1027,14 +1036,10 @@ mod tests {
         let handles: Vec<_> = (0..num_threads)
             .map(|t| {
                 let idx = Arc::clone(&idx);
-                let config = config;
                 thread::spawn(move || {
                     for i in 0..ops_per_thread {
                         let slot_id = t * ops_per_thread + i;
-                        let key = WitnessKey::for_cell_read(
-                            page(u32::try_from(t).unwrap() + 1),
-                            &u32::try_from(i).unwrap().to_le_bytes(),
-                        );
+                        let key = WitnessKey::for_cell_read(page(t + 1), &i.to_le_bytes());
                         let rks = derive_range_keys(&key, &config);
                         if i % 2 == 0 {
                             idx.register_read(slot_id, epoch, &rks);
@@ -1054,10 +1059,7 @@ mod tests {
         for t in 0..num_threads {
             for i in 0..ops_per_thread {
                 let slot_id = t * ops_per_thread + i;
-                let key = WitnessKey::for_cell_read(
-                    page(u32::try_from(t).unwrap() + 1),
-                    &u32::try_from(i).unwrap().to_le_bytes(),
-                );
+                let key = WitnessKey::for_cell_read(page(t + 1), &i.to_le_bytes());
                 let rks = derive_range_keys(&key, &config);
                 if i % 2 == 0 {
                     let readers = bitset_to_slot_ids(&idx.candidate_readers(&rks));

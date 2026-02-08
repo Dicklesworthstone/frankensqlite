@@ -1,6 +1,6 @@
 use std::fmt;
 
-use fsqlite_types::{PageNumber, RangeKey, WitnessKey};
+use fsqlite_types::{RangeKey, WitnessKey};
 use xxhash_rust::xxh3::xxh3_64;
 
 // ---------------------------------------------------------------------------
@@ -35,11 +35,7 @@ pub fn witness_key_canonical_bytes(key: &WitnessKey) -> Vec<u8> {
             buf.extend_from_slice(&len.to_le_bytes());
             buf
         }
-        WitnessKey::KeyRange {
-            btree_root,
-            lo,
-            hi,
-        } => {
+        WitnessKey::KeyRange { btree_root, lo, hi } => {
             let mut buf = Vec::with_capacity(13 + lo.len() + hi.len());
             buf.push(0x04);
             buf.extend_from_slice(&btree_root.get().to_le_bytes());
@@ -103,7 +99,7 @@ pub fn derive_range_keys(key: &WitnessKey, config: &WitnessHierarchyConfigV1) ->
 /// Uses Fibonacci hashing for good distribution under linear probing.
 #[must_use]
 #[allow(clippy::cast_possible_truncation)]
-pub fn range_key_bucket_index(range_key: &RangeKey, mask: u32) -> u32 {
+pub fn range_key_bucket_index(range_key: RangeKey, mask: u32) -> u32 {
     // Combine level + prefix into a single key for hashing.
     let combined = u64::from(range_key.level) << 32 | u64::from(range_key.hash_prefix);
     // Fibonacci hash: multiply by golden ratio constant, take top bits.

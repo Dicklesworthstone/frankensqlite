@@ -7,6 +7,7 @@ pub mod cache_aligned;
 pub mod compat;
 pub mod core_types;
 pub mod gc;
+pub mod hot_witness_index;
 pub mod invariants;
 pub mod lifecycle;
 pub mod shared_lock_table;
@@ -37,6 +38,9 @@ pub use gc::{
     GC_F_MAX_HZ, GC_F_MIN_HZ, GC_PAGES_BUDGET, GC_TARGET_CHAIN_LENGTH, GC_VERSIONS_BUDGET,
     GcScheduler, GcTickResult, GcTodo, PruneResult, gc_tick, prune_page_chain,
 };
+pub use hot_witness_index::{
+    ColdPlaneMode, ColdWitnessStore, HotWitnessBucketEntry, HotWitnessIndex, bitset_to_slot_ids,
+};
 pub use invariants::{
     SerializedWriteMutex, TxnManager, VersionStore, idx_to_version_pointer, visible,
 };
@@ -48,7 +52,8 @@ pub use shared_lock_table::{
 pub use shm::{SharedMemoryLayout, ShmSnapshot};
 pub use witness_hierarchy::{
     HotWitnessIndexDerivationV1, HotWitnessIndexSizingV1, WitnessHierarchyConfigV1,
-    WitnessHotIndexManifestV1, WitnessSizingError,
+    WitnessHotIndexManifestV1, WitnessSizingError, derive_range_keys, extract_prefix,
+    range_key_bucket_index, witness_key_canonical_bytes, witness_key_hash,
 };
 pub use witness_plane::{WitnessSet, validate_txn_token, witness_keys_overlap};
 pub use xor_delta::{
