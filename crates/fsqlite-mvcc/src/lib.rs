@@ -1,3 +1,6 @@
+#![cfg_attr(target_family = "unix", feature(peer_credentials_unix_socket))]
+#![cfg_attr(target_family = "unix", feature(unix_socket_ancillary_data))]
+
 //! MVCC page-level versioning for concurrent writers.
 //!
 //! This crate is intentionally small in early phases: it defines the core MVCC
@@ -5,6 +8,7 @@
 
 pub mod cache_aligned;
 pub mod compat;
+pub mod coordinator_ipc;
 pub mod core_types;
 pub mod gc;
 pub mod hot_witness_index;

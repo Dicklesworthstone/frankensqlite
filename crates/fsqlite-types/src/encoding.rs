@@ -76,6 +76,33 @@ pub fn write_u64_le(dst: &mut [u8], value: u64) -> Option<()> {
 }
 
 #[inline]
+#[must_use]
+pub fn read_u64_be(src: &[u8]) -> Option<u64> {
+    Some(u64::from_be_bytes(src.get(..8)?.try_into().ok()?))
+}
+
+#[inline]
+pub fn write_u64_be(dst: &mut [u8], value: u64) -> Option<()> {
+    dst.get_mut(..8)?.copy_from_slice(&value.to_be_bytes());
+    Some(())
+}
+
+#[inline]
+pub fn append_u16_be(buf: &mut Vec<u8>, value: u16) {
+    buf.extend_from_slice(&value.to_be_bytes());
+}
+
+#[inline]
+pub fn append_u32_be(buf: &mut Vec<u8>, value: u32) {
+    buf.extend_from_slice(&value.to_be_bytes());
+}
+
+#[inline]
+pub fn append_u64_be(buf: &mut Vec<u8>, value: u64) {
+    buf.extend_from_slice(&value.to_be_bytes());
+}
+
+#[inline]
 pub fn append_u32_le(buf: &mut Vec<u8>, value: u32) {
     let mut scratch = [0u8; 4];
     write_u32_le(&mut scratch, value).expect("fixed scratch width");

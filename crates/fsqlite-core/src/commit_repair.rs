@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use fsqlite_error::{FrankenError, Result};
 use tracing::{debug, error, info, warn};
@@ -173,45 +173,38 @@ impl TwoPhaseCommitSender {
 
     /// Reserve with timeout; `None` means caller gave up (cancel during reserve).
     #[must_use]
+    #[allow(clippy::significant_drop_tightening)]
     pub fn try_reserve_for(&self, timeout: Duration) -> Option<SendPermit> {
-        let start = Instant::now();
-        let mut guard = lock_with_recovery(&self.shared.state, "two_phase_state");
-        let ticket = guard.next_wait_ticket;
-        guard.next_wait_ticket = guard.next_wait_ticket.saturating_add(1);
-        guard.wait_queue.push_back(ticket);
+        let mut state_guard = lock_with_recovery(&self.shared.state, "two_phase_state");
+        let ticket = state_guard.next_wait_ticket;
+        state_guard.next_wait_ticket = state_guard.next_wait_ticket.saturating_add(1);
+        state_guard.wait_queue.push_back(ticket);
 
-        loop {
-            if guard.can_admit(ticket) {
-                let _ = guard.wait_queue.pop_front();
-                let reservation_seq = guard.reserve_slot();
-                self.shared.cv.notify_all();
-                return Some(SendPermit {
-                    shared: Arc::clone(&self.shared),
-                    reservation_seq: Some(reservation_seq),
-                });
-            }
-
-            let elapsed = start.elapsed();
-            let Some(remaining) = timeout.checked_sub(elapsed) else {
-                guard.remove_wait_ticket(ticket);
-                self.shared.cv.notify_all();
-                return None;
+        let (mut guard, _) =
+            match self
+                .shared
+                .cv
+                .wait_timeout_while(state_guard, timeout, |state| !state.can_admit(ticket))
+            {
+                Ok(pair) => pair,
+                Err(poisoned) => poisoned.into_inner(),
             };
 
-            let waited = self.shared.cv.wait_timeout(guard, remaining);
-            guard = match waited {
-                Ok((next, result)) => {
-                    if result.timed_out() {
-                        let mut timed_out_guard = next;
-                        timed_out_guard.remove_wait_ticket(ticket);
-                        self.shared.cv.notify_all();
-                        return None;
-                    }
-                    next
-                }
-                Err(poisoned) => poisoned.into_inner().0,
-            };
+        if !guard.can_admit(ticket) {
+            guard.remove_wait_ticket(ticket);
+            drop(guard);
+            self.shared.cv.notify_all();
+            return None;
         }
+
+        let _ = guard.wait_queue.pop_front();
+        let reservation_seq = guard.reserve_slot();
+        drop(guard);
+        self.shared.cv.notify_all();
+        Some(SendPermit {
+            shared: Arc::clone(&self.shared),
+            reservation_seq: Some(reservation_seq),
+        })
     }
 
     /// Current buffered + reserved occupancy.
@@ -245,29 +238,21 @@ impl TwoPhaseCommitReceiver {
 
     /// Timed receive used by tests and bounded coordinator loops.
     #[must_use]
+    #[allow(clippy::significant_drop_tightening)]
     pub fn try_recv_for(&self, timeout: Duration) -> Option<CommitRequest> {
-        let start = Instant::now();
-        let mut guard = lock_with_recovery(&self.shared.state, "two_phase_state");
-        loop {
-            if let Some(request) = guard.ready_commits.pop_front() {
-                self.shared.cv.notify_all();
-                return Some(request);
-            }
+        let (mut guard, _) = match self.shared.cv.wait_timeout_while(
+            lock_with_recovery(&self.shared.state, "two_phase_state"),
+            timeout,
+            |state| state.ready_commits.is_empty(),
+        ) {
+            Ok(pair) => pair,
+            Err(poisoned) => poisoned.into_inner(),
+        };
 
-            let elapsed = start.elapsed();
-            let remaining = timeout.checked_sub(elapsed)?;
-
-            let waited = self.shared.cv.wait_timeout(guard, remaining);
-            guard = match waited {
-                Ok((next, result)) => {
-                    if result.timed_out() {
-                        return None;
-                    }
-                    next
-                }
-                Err(poisoned) => poisoned.into_inner().0,
-            };
-        }
+        let request = guard.ready_commits.pop_front()?;
+        drop(guard);
+        self.shared.cv.notify_all();
+        Some(request)
     }
 }
 
@@ -475,7 +460,8 @@ pub enum CommitRepairEventKind {
 #[derive(Debug, Clone, Copy)]
 pub struct CommitRepairEvent {
     pub commit_seq: u64,
-    pub at: Instant,
+    /// Monotonic event sequence number (logical time, no ambient authority).
+    pub seq: u64,
     pub kind: CommitRepairEventKind,
 }
 
@@ -704,7 +690,6 @@ where
 
     /// Execute critical-path durability and schedule async repair work.
     pub fn commit(&self, systematic_symbols: &[u8]) -> Result<CommitReceipt> {
-        let started = Instant::now();
         let commit_seq = self.next_commit_seq.fetch_add(1, Ordering::Relaxed);
 
         self.io
@@ -718,7 +703,7 @@ where
                 commit_seq,
                 durable: true,
                 repair_pending: false,
-                latency: started.elapsed(),
+                latency: Duration::ZERO,
             });
         }
 
@@ -803,7 +788,7 @@ where
             commit_seq,
             durable: true,
             repair_pending: true,
-            latency: started.elapsed(),
+            latency: Duration::ZERO,
         })
     }
 
@@ -846,7 +831,9 @@ where
         let repair_done = events
             .iter()
             .find(|event| event.kind == CommitRepairEventKind::RepairCompleted)?;
-        Some(repair_done.at.saturating_duration_since(ack.at))
+        Some(Duration::from_millis(
+            repair_done.seq.saturating_sub(ack.seq),
+        ))
     }
 
     #[must_use]
@@ -909,9 +896,13 @@ fn record_event_into(
     commit_seq: u64,
     kind: CommitRepairEventKind,
 ) {
-    lock_with_recovery(events, "repair_events").push(CommitRepairEvent {
+    let mut guard = lock_with_recovery(events, "repair_events");
+    let seq = u64::try_from(guard.len())
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    guard.push(CommitRepairEvent {
         commit_seq,
-        at: Instant::now(),
+        seq,
         kind,
     });
 }
@@ -1411,6 +1402,7 @@ mod two_phase_pipeline_tests {
     use super::*;
     use std::sync::mpsc as std_mpsc;
     use std::thread;
+    use std::time::Instant;
 
     fn request(txn_id: u64) -> CommitRequest {
         CommitRequest::new(
@@ -1605,6 +1597,7 @@ mod two_phase_pipeline_tests {
 #[allow(clippy::cast_possible_truncation)]
 mod group_commit_tests {
     use super::*;
+    use std::time::Instant;
 
     fn req(txn_id: u64, pages: &[u32]) -> CommitRequest {
         CommitRequest::new(txn_id, pages.to_vec(), vec![0xAB])

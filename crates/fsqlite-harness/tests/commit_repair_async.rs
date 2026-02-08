@@ -285,11 +285,11 @@ fn test_e2e_commit_latency_not_affected_by_repair() {
             .expect("repair completion must exist");
 
         assert!(
-            repair_started.at >= ack.at,
+            repair_started.seq >= ack.seq,
             "repair must start after commit acknowledgment"
         );
         assert!(
-            repair_completed.at >= repair_started.at,
+            repair_completed.seq >= repair_started.seq,
             "repair completion must follow repair start"
         );
         assert!(

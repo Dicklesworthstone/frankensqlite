@@ -300,6 +300,10 @@ pub struct TransactionManager {
     /// Current schema epoch (simplified; in full impl this lives in SHM).
     schema_epoch: SchemaEpoch,
     write_merge_policy: WriteMergePolicy,
+    /// `PRAGMA fsqlite.serializable`: when true (default), SSI validation is
+    /// performed on concurrent commits.  When false, plain SI is used and
+    /// write-skew is tolerated.
+    ssi_enabled: bool,
     busy_timeout_ms: u64,
     serialized_writer_lease_secs: u64,
     txn_max_duration_ms: u64,
@@ -318,6 +322,7 @@ impl TransactionManager {
             commit_index: CommitIndex::new(),
             schema_epoch: SchemaEpoch::ZERO,
             write_merge_policy: WriteMergePolicy::default(),
+            ssi_enabled: true,
             busy_timeout_ms: DEFAULT_BUSY_TIMEOUT_MS,
             serialized_writer_lease_secs: DEFAULT_SERIALIZED_WRITER_LEASE_SECS,
             txn_max_duration_ms: 5_000,
@@ -353,6 +358,27 @@ impl TransactionManager {
         }
         self.write_merge_policy = policy;
         Ok(())
+    }
+
+    /// Whether SSI validation is enabled (`PRAGMA fsqlite.serializable`).
+    ///
+    /// When `true` (default), concurrent commits perform SSI validation
+    /// and abort transactions with dangerous structure (write-skew).
+    /// When `false`, plain Snapshot Isolation is used.
+    #[must_use]
+    pub const fn ssi_enabled(&self) -> bool {
+        self.ssi_enabled
+    }
+
+    /// Set SSI mode (`PRAGMA fsqlite.serializable = ON|OFF`).
+    pub fn set_ssi_enabled(&mut self, enabled: bool) {
+        let old = self.ssi_enabled;
+        self.ssi_enabled = enabled;
+        tracing::debug!(
+            old_value = old,
+            new_value = enabled,
+            "PRAGMA fsqlite.serializable changed"
+        );
     }
 
     /// Configured transaction max duration in milliseconds.
@@ -764,7 +790,8 @@ impl TransactionManager {
     /// attempt on conflict, (3) SSI re-validation after rebase, (4) publish.
     fn commit_concurrent(&self, txn: &mut Transaction) -> Result<CommitSeq, MvccError> {
         // Step 1: SSI validation — if dangerous structure, abort immediately.
-        if txn.has_dangerous_structure() {
+        // Skipped when PRAGMA fsqlite.serializable = OFF (plain SI mode).
+        if self.ssi_enabled && txn.has_dangerous_structure() {
             self.abort(txn);
             return Err(MvccError::BusySnapshot);
         }
@@ -828,7 +855,7 @@ impl TransactionManager {
 
         // Step 3: SSI re-validation after rebase (§5.7.3 — mandatory even on
         // successful rebase, per spec line ~9005).
-        if rebased && txn.has_dangerous_structure() {
+        if self.ssi_enabled && rebased && txn.has_dangerous_structure() {
             self.abort(txn);
             return Err(MvccError::BusySnapshot);
         }
@@ -1082,6 +1109,7 @@ impl std::fmt::Debug for TransactionManager {
         f.debug_struct("TransactionManager")
             .field("schema_epoch", &self.schema_epoch)
             .field("write_merge_policy", &self.write_merge_policy)
+            .field("ssi_enabled", &self.ssi_enabled)
             .field("txn_max_duration_ms", &self.txn_max_duration_ms)
             .field(
                 "current_commit_counter",
@@ -3552,5 +3580,412 @@ mod tests {
         assert!(!txn.write_set_data.contains_key(&p2));
 
         m.commit(&mut txn).unwrap();
+    }
+
+    // ===================================================================
+    // bd-iwu.2 — Layer 2: BEGIN CONCURRENT with SSI (§2.4)
+    // ===================================================================
+
+    #[test]
+    fn test_begin_concurrent_parsed() {
+        // At the MVCC layer, BeginKind::Concurrent creates a Concurrent-mode txn.
+        // (Parser integration is higher-level; here we verify the MVCC semantics.)
+        let m = mgr();
+        let txn = m.begin(BeginKind::Concurrent).unwrap();
+
+        assert_eq!(
+            txn.mode,
+            TransactionMode::Concurrent,
+            "BEGIN CONCURRENT must create Concurrent-mode transaction"
+        );
+        assert!(
+            !txn.serialized_write_lock_held,
+            "concurrent txn must NOT hold serialized writer mutex"
+        );
+        assert!(
+            txn.snapshot_established,
+            "concurrent txn establishes snapshot at BEGIN"
+        );
+        assert!(
+            m.write_mutex().holder().is_none(),
+            "concurrent txn must not touch the global write mutex"
+        );
+    }
+
+    #[test]
+    fn test_concurrent_disjoint_writes_both_commit() {
+        let m = mgr();
+        let mut t1 = m.begin(BeginKind::Concurrent).unwrap();
+        let mut t2 = m.begin(BeginKind::Concurrent).unwrap();
+
+        let p1 = PageNumber::new(1).unwrap();
+        let p2 = PageNumber::new(2).unwrap();
+
+        m.write_page(&mut t1, p1, test_data(0xAA)).unwrap();
+        m.write_page(&mut t2, p2, test_data(0xBB)).unwrap();
+
+        let seq1 = m.commit(&mut t1).unwrap();
+        let seq2 = m.commit(&mut t2).unwrap();
+
+        assert!(seq1 > CommitSeq::ZERO);
+        assert!(seq2 > seq1, "t2 must commit after t1");
+
+        // Both committed values must be visible.
+        let mut reader = m.begin(BeginKind::Deferred).unwrap();
+        let d1 = m.read_page(&mut reader, p1).unwrap();
+        let d2 = m.read_page(&mut reader, p2).unwrap();
+        assert_eq!(d1.as_bytes()[0], 0xAA);
+        assert_eq!(d2.as_bytes()[0], 0xBB);
+    }
+
+    #[test]
+    fn test_concurrent_same_page_first_committer_wins() {
+        let m = mgr();
+        let mut t1 = m.begin(BeginKind::Concurrent).unwrap();
+        let mut t2 = m.begin(BeginKind::Concurrent).unwrap();
+
+        let pgno = PageNumber::new(10).unwrap();
+
+        m.write_page(&mut t1, pgno, test_data(0x11)).unwrap();
+
+        // t2 cannot even write the same page (page lock held by t1).
+        let err = m.write_page(&mut t2, pgno, test_data(0x22));
+        assert_eq!(
+            err.unwrap_err(),
+            MvccError::Busy,
+            "same-page concurrent write must fail with BUSY"
+        );
+
+        // t1 commits successfully.
+        let seq = m.commit(&mut t1).unwrap();
+        assert!(seq > CommitSeq::ZERO);
+    }
+
+    #[test]
+    fn test_ssi_write_skew_detected_and_aborted() {
+        // Classic write-skew scenario at page level:
+        // T1 reads P_A, writes P_B.
+        // T2 reads P_B, writes P_A.
+        // Under SSI, the dangerous structure (both in+out rw-antidependency)
+        // causes one transaction to abort.
+        let m = mgr();
+        assert!(m.ssi_enabled(), "SSI must be on by default");
+
+        let pa = PageNumber::new(1).unwrap();
+        let pb = PageNumber::new(2).unwrap();
+
+        // Seed data.
+        let mut setup = m.begin(BeginKind::Immediate).unwrap();
+        m.write_page(&mut setup, pa, test_data(0x10)).unwrap();
+        m.write_page(&mut setup, pb, test_data(0x20)).unwrap();
+        m.commit(&mut setup).unwrap();
+
+        // T1: reads P_A, writes P_B.
+        let mut t1 = m.begin(BeginKind::Concurrent).unwrap();
+        let _ = m.read_page(&mut t1, pa);
+        m.write_page(&mut t1, pb, test_data(0x21)).unwrap();
+
+        // T2: reads P_B, writes P_A.
+        let mut t2 = m.begin(BeginKind::Concurrent).unwrap();
+        let _ = m.read_page(&mut t2, pb);
+        // t2 can't write P_A since page lock isn't held for reads, but
+        // we simulate the rw-antidependency flags as the witness plane would set them.
+        m.write_page(&mut t2, pa, test_data(0x11)).unwrap();
+
+        // Simulate SSI flags that the witness plane would set:
+        // T1 has in_rw (T2 wrote P_A which T1 read) and out_rw (T1 wrote P_B which T2 read).
+        t1.has_in_rw = true;
+        t1.has_out_rw = true;
+
+        // T1 commit must fail due to dangerous structure.
+        let result = m.commit(&mut t1);
+        assert_eq!(
+            result.unwrap_err(),
+            MvccError::BusySnapshot,
+            "write skew must be detected and aborted under SSI"
+        );
+    }
+
+    #[test]
+    fn test_ssi_dangerous_structure_both_flags() {
+        let m = mgr();
+        let mut txn = m.begin(BeginKind::Concurrent).unwrap();
+        let pgno = PageNumber::new(1).unwrap();
+        m.write_page(&mut txn, pgno, test_data(0x01)).unwrap();
+
+        // Set both SSI flags.
+        txn.has_in_rw = true;
+        txn.has_out_rw = true;
+
+        assert!(
+            txn.has_dangerous_structure(),
+            "both flags set must indicate dangerous structure"
+        );
+
+        let result = m.commit(&mut txn);
+        assert_eq!(
+            result.unwrap_err(),
+            MvccError::BusySnapshot,
+            "dangerous structure must abort at commit"
+        );
+        assert_eq!(txn.state, TransactionState::Aborted);
+    }
+
+    #[test]
+    fn test_ssi_rw_antidependency_tracking() {
+        let m = mgr();
+        let pgno = PageNumber::new(42).unwrap();
+
+        // Seed data.
+        let mut setup = m.begin(BeginKind::Immediate).unwrap();
+        m.write_page(&mut setup, pgno, test_data(0x10)).unwrap();
+        m.commit(&mut setup).unwrap();
+
+        // T1 reads page K (establishing read dependency).
+        let mut t1 = m.begin(BeginKind::Concurrent).unwrap();
+        let data = m.read_page(&mut t1, pgno);
+        assert!(data.is_some());
+
+        // T2 writes page K after T1's snapshot — creates rw-antidependency.
+        let mut t2 = m.begin(BeginKind::Concurrent).unwrap();
+        m.write_page(&mut t2, pgno, test_data(0x20)).unwrap();
+        m.commit(&mut t2).unwrap();
+
+        // T1 now has an incoming rw-antidependency (T2 wrote what T1 read).
+        // In full implementation, the witness plane sets this flag.
+        t1.has_in_rw = true;
+
+        // With only one flag, T1 can still commit (dangerous structure needs BOTH).
+        assert!(
+            !t1.has_dangerous_structure(),
+            "single rw edge must not trigger dangerous structure"
+        );
+
+        // But if we also set outgoing edge...
+        t1.has_out_rw = true;
+        assert!(
+            t1.has_dangerous_structure(),
+            "both edges must trigger dangerous structure"
+        );
+    }
+
+    #[test]
+    fn test_pragma_serializable_off_allows_skew() {
+        let mut m = mgr();
+        m.set_ssi_enabled(false);
+        assert!(!m.ssi_enabled());
+
+        let mut txn = m.begin(BeginKind::Concurrent).unwrap();
+        let pgno = PageNumber::new(1).unwrap();
+        m.write_page(&mut txn, pgno, test_data(0x01)).unwrap();
+
+        // Set dangerous structure flags.
+        txn.has_in_rw = true;
+        txn.has_out_rw = true;
+        assert!(txn.has_dangerous_structure());
+
+        // With SSI disabled, commit should SUCCEED despite dangerous structure.
+        let seq = m.commit(&mut txn).unwrap();
+        assert!(
+            seq > CommitSeq::ZERO,
+            "with PRAGMA fsqlite.serializable = OFF, write skew must be tolerated"
+        );
+    }
+
+    #[test]
+    fn test_concurrent_mixed_with_serialized() {
+        let m = mgr();
+
+        // Start a concurrent writer on page 1.
+        let mut conc = m.begin(BeginKind::Concurrent).unwrap();
+        m.write_page(&mut conc, PageNumber::new(1).unwrap(), test_data(0x01))
+            .unwrap();
+
+        // Serialized writer cannot acquire mutex while concurrent locks exist
+        // (with a very short timeout to avoid blocking).
+        let m2 = mgr_with_busy_timeout_ms(5);
+        // We need to share the same infrastructure; use the same manager.
+        // Concurrent write blocks serialized acquisition.
+        let mut conc2 = m.begin(BeginKind::Concurrent).unwrap();
+        m.write_page(&mut conc2, PageNumber::new(2).unwrap(), test_data(0x02))
+            .unwrap();
+
+        // Both concurrent writers can coexist (different pages).
+        let seq1 = m.commit(&mut conc).unwrap();
+        let seq2 = m.commit(&mut conc2).unwrap();
+        assert!(seq1 > CommitSeq::ZERO);
+        assert!(seq2 > seq1);
+
+        // Now serialized writer can proceed.
+        let mut ser = m.begin(BeginKind::Immediate).unwrap();
+        assert!(ser.serialized_write_lock_held);
+        m.write_page(&mut ser, PageNumber::new(3).unwrap(), test_data(0x03))
+            .unwrap();
+        m.commit(&mut ser).unwrap();
+
+        // Concurrent reader can still work during serialized writer.
+        let _active_writer = m.begin(BeginKind::Immediate).unwrap();
+        let mut reader = m.begin(BeginKind::Concurrent).unwrap();
+        let read_result = m.read_page(&mut reader, PageNumber::new(1).unwrap());
+        assert!(
+            read_result.is_some(),
+            "concurrent reader works during serialized writer"
+        );
+
+        // But concurrent writes are blocked by serialized writer.
+        let write_result = m.write_page(&mut reader, PageNumber::new(4).unwrap(), test_data(0x04));
+        assert_eq!(
+            write_result.unwrap_err(),
+            MvccError::Busy,
+            "concurrent write must fail while serialized writer is active"
+        );
+        let _ = &m2; // suppress unused warning
+    }
+
+    // ===================================================================
+    // bd-iwu.5 — Isolation Level Switching PRAGMA (§2.4)
+    // ===================================================================
+
+    #[test]
+    fn test_pragma_serializable_on_default() {
+        let m = mgr();
+        assert!(
+            m.ssi_enabled(),
+            "PRAGMA fsqlite.serializable must default to ON"
+        );
+
+        // With default ON, dangerous structure should cause abort.
+        let mut txn = m.begin(BeginKind::Concurrent).unwrap();
+        m.write_page(&mut txn, PageNumber::new(1).unwrap(), test_data(0x01))
+            .unwrap();
+        txn.has_in_rw = true;
+        txn.has_out_rw = true;
+        assert_eq!(
+            m.commit(&mut txn).unwrap_err(),
+            MvccError::BusySnapshot,
+            "default ON must enforce SSI"
+        );
+    }
+
+    #[test]
+    fn test_pragma_serializable_off() {
+        let mut m = mgr();
+        m.set_ssi_enabled(false);
+        assert!(!m.ssi_enabled());
+
+        // With OFF, dangerous structure should NOT cause abort (plain SI).
+        let mut txn = m.begin(BeginKind::Concurrent).unwrap();
+        m.write_page(&mut txn, PageNumber::new(1).unwrap(), test_data(0x01))
+            .unwrap();
+        txn.has_in_rw = true;
+        txn.has_out_rw = true;
+        let seq = m.commit(&mut txn).unwrap();
+        assert!(
+            seq > CommitSeq::ZERO,
+            "OFF must allow write skew (plain SI)"
+        );
+    }
+
+    #[test]
+    fn test_pragma_serializable_on() {
+        let mut m = mgr();
+        // Start OFF, then switch ON.
+        m.set_ssi_enabled(false);
+        m.set_ssi_enabled(true);
+        assert!(m.ssi_enabled());
+
+        // With ON, dangerous structure must abort.
+        let mut txn = m.begin(BeginKind::Concurrent).unwrap();
+        m.write_page(&mut txn, PageNumber::new(1).unwrap(), test_data(0x01))
+            .unwrap();
+        txn.has_in_rw = true;
+        txn.has_out_rw = true;
+        assert_eq!(
+            m.commit(&mut txn).unwrap_err(),
+            MvccError::BusySnapshot,
+            "ON must enforce SSI after being toggled back"
+        );
+    }
+
+    #[test]
+    fn test_pragma_scope_per_connection() {
+        // Each TransactionManager represents a connection.
+        let mut conn_a = mgr();
+        let conn_b = mgr();
+
+        // Change PRAGMA on conn_a.
+        conn_a.set_ssi_enabled(false);
+        assert!(!conn_a.ssi_enabled());
+
+        // conn_b is unaffected.
+        assert!(
+            conn_b.ssi_enabled(),
+            "PRAGMA must be per-connection: conn_b unchanged"
+        );
+
+        // Verify behavioral difference.
+        let mut txn_a = conn_a.begin(BeginKind::Concurrent).unwrap();
+        conn_a
+            .write_page(&mut txn_a, PageNumber::new(1).unwrap(), test_data(0x01))
+            .unwrap();
+        txn_a.has_in_rw = true;
+        txn_a.has_out_rw = true;
+        assert!(
+            conn_a.commit(&mut txn_a).is_ok(),
+            "conn_a (OFF) must allow write skew"
+        );
+
+        let mut txn_b = conn_b.begin(BeginKind::Concurrent).unwrap();
+        conn_b
+            .write_page(&mut txn_b, PageNumber::new(1).unwrap(), test_data(0x02))
+            .unwrap();
+        txn_b.has_in_rw = true;
+        txn_b.has_out_rw = true;
+        assert_eq!(
+            conn_b.commit(&mut txn_b).unwrap_err(),
+            MvccError::BusySnapshot,
+            "conn_b (ON) must enforce SSI"
+        );
+    }
+
+    #[test]
+    fn test_pragma_persists_in_session() {
+        let mut m = mgr();
+        m.set_ssi_enabled(false);
+
+        // Transaction 1: write skew allowed.
+        let mut txn1 = m.begin(BeginKind::Concurrent).unwrap();
+        m.write_page(&mut txn1, PageNumber::new(1).unwrap(), test_data(0x01))
+            .unwrap();
+        txn1.has_in_rw = true;
+        txn1.has_out_rw = true;
+        assert!(m.commit(&mut txn1).is_ok(), "txn1: OFF allows write skew");
+
+        // No PRAGMA change between transactions.
+
+        // Transaction 2: PRAGMA should still be OFF.
+        assert!(!m.ssi_enabled(), "PRAGMA must persist in session");
+        let mut txn2 = m.begin(BeginKind::Concurrent).unwrap();
+        m.write_page(&mut txn2, PageNumber::new(2).unwrap(), test_data(0x02))
+            .unwrap();
+        txn2.has_in_rw = true;
+        txn2.has_out_rw = true;
+        assert!(
+            m.commit(&mut txn2).is_ok(),
+            "txn2: OFF must persist across transactions"
+        );
+
+        // Now switch ON and verify it takes effect.
+        m.set_ssi_enabled(true);
+        let mut txn3 = m.begin(BeginKind::Concurrent).unwrap();
+        m.write_page(&mut txn3, PageNumber::new(3).unwrap(), test_data(0x03))
+            .unwrap();
+        txn3.has_in_rw = true;
+        txn3.has_out_rw = true;
+        assert_eq!(
+            m.commit(&mut txn3).unwrap_err(),
+            MvccError::BusySnapshot,
+            "txn3: ON must take effect for next transaction"
+        );
     }
 }
