@@ -8,6 +8,7 @@
     "test": "tests"
   },
   "scripts": {
+    "build": "mkdir -p dist && cp visualization_of_the_evolution_of_the_frankensqlite_specs_document_from_inception.html dist/index.html && cp frankentui.css spec_evolution_v1.sqlite3 spec_evolution_v1.sqlite3.config.json og-image.png twitter-image.png frankensqlite_illustration.webp frankensqlite_diagram.webp dist/",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "repository": {

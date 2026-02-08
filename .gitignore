@@ -67,3 +67,9 @@ spec_review_findings.md
 # Node / Playwright (local only)
 node_modules/
 test-results/
+
+# Cloudflare Pages build output
+dist/
+
+# Wrangler config (downloaded, not source of truth)
+wrangler.toml
