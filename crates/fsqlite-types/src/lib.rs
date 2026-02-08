@@ -19,9 +19,9 @@ pub use glossary::{
     DecodeProof, DependencyEdge, EpochId, IdempotencyKey, IndexId, IntentFootprint, IntentLog,
     IntentOp, IntentOpKind, OTI_WIRE_SIZE, Oti, Outcome, PageHistory, PageVersion, RangeKey,
     ReadWitness, RebaseBinaryOp, RebaseExpr, RebaseUnaryOp, Region, RemoteCap, RootManifest, RowId,
-    Saga, SchemaEpoch, SemanticKeyKind, SemanticKeyRef, Snapshot, StructuralEffects,
-    SymbolAuthMasterKeyCap, SymbolValidityWindow, TableId, TxnEpoch, TxnId, TxnSlot, TxnToken,
-    VersionPointer, WitnessIndexSegment, WitnessKey, WriteWitness,
+    RowIdAllocator, RowIdExhausted, RowIdMode, Saga, SchemaEpoch, SemanticKeyKind, SemanticKeyRef,
+    Snapshot, StructuralEffects, SymbolAuthMasterKeyCap, SymbolValidityWindow, TableId, TxnEpoch,
+    TxnId, TxnSlot, TxnToken, VersionPointer, WitnessIndexSegment, WitnessKey, WriteWitness,
 };
 pub use value::SqliteValue;
 
@@ -300,6 +300,91 @@ impl TypeAffinity {
 
         // Rule 3: no coercion
         None
+    }
+}
+
+/// The five fundamental SQLite storage classes.
+///
+/// Every value stored in SQLite belongs to exactly one of these classes.
+/// See <https://www.sqlite.org/datatype3.html>.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum StorageClass {
+    /// SQL NULL.
+    Null = 1,
+    /// A signed 64-bit integer.
+    Integer = 2,
+    /// An IEEE 754 64-bit float.
+    Real = 3,
+    /// A UTF-8 text string.
+    Text = 4,
+    /// A binary large object.
+    Blob = 5,
+}
+
+impl fmt::Display for StorageClass {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Null => f.write_str("NULL"),
+            Self::Integer => f.write_str("INTEGER"),
+            Self::Real => f.write_str("REAL"),
+            Self::Text => f.write_str("TEXT"),
+            Self::Blob => f.write_str("BLOB"),
+        }
+    }
+}
+
+/// Column types valid in STRICT tables.
+///
+/// STRICT tables enforce that every non-NULL value stored in a column matches
+/// the declared type. See <https://www.sqlite.org/stricttables.html>.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StrictColumnType {
+    /// Only INTEGER storage class (and NULL).
+    Integer,
+    /// REAL storage class; integers are implicitly converted to REAL (and NULL).
+    Real,
+    /// Only TEXT storage class (and NULL).
+    Text,
+    /// Only BLOB storage class (and NULL).
+    Blob,
+    /// Any storage class accepted without coercion.
+    Any,
+}
+
+impl StrictColumnType {
+    /// Parse a STRICT column type from a type name string.
+    ///
+    /// Returns `None` if the type name is not a valid STRICT type.
+    /// Valid STRICT types: INT, INTEGER, REAL, TEXT, BLOB, ANY.
+    pub fn from_type_name(name: &str) -> Option<Self> {
+        match name.to_ascii_uppercase().as_str() {
+            "INT" | "INTEGER" => Some(Self::Integer),
+            "REAL" => Some(Self::Real),
+            "TEXT" => Some(Self::Text),
+            "BLOB" => Some(Self::Blob),
+            "ANY" => Some(Self::Any),
+            _ => None,
+        }
+    }
+}
+
+/// Error returned when a value violates a STRICT table column type constraint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StrictTypeError {
+    /// The expected strict column type.
+    pub expected: StrictColumnType,
+    /// The actual storage class of the value.
+    pub actual: StorageClass,
+}
+
+impl fmt::Display for StrictTypeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "cannot store {} value in {:?} column",
+            self.actual, self.expected
+        )
     }
 }
 

@@ -507,6 +507,89 @@ impl RowId {
     }
 }
 
+/// Rowid allocation mode for a table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RowIdMode {
+    /// Normal rowid: max(rowid)+1, deleted rowids may be reused.
+    Normal,
+    /// AUTOINCREMENT: never reuse deleted rowids. Uses sqlite_sequence
+    /// high-water mark. Returns error at MAX_ROWID.
+    AutoIncrement,
+}
+
+/// Rowid allocator implementing SQLite's allocation semantics.
+///
+/// - Normal mode: next rowid = max(existing) + 1. Deleted rowids may be reused
+///   when max rowid is not the table maximum.
+/// - AUTOINCREMENT mode: next rowid = max(max_existing, sqlite_sequence) + 1.
+///   Rowids are never reused. When MAX_ROWID is reached, allocation fails.
+#[derive(Debug, Clone)]
+pub struct RowIdAllocator {
+    mode: RowIdMode,
+    /// High-water mark from sqlite_sequence (AUTOINCREMENT only).
+    sequence_high_water: i64,
+}
+
+impl RowIdAllocator {
+    /// Create a new allocator.
+    pub const fn new(mode: RowIdMode) -> Self {
+        Self {
+            mode,
+            sequence_high_water: 0,
+        }
+    }
+
+    /// Allocate the next rowid given the current maximum rowid in the table.
+    ///
+    /// `max_existing` is `None` if the table is empty.
+    ///
+    /// Returns `Ok(rowid)` or `Err` if MAX_ROWID is exhausted (AUTOINCREMENT only).
+    pub fn allocate(&mut self, max_existing: Option<RowId>) -> Result<RowId, RowIdExhausted> {
+        let max_val = max_existing.map_or(0, RowId::get);
+
+        match self.mode {
+            RowIdMode::Normal => {
+                if max_val < i64::MAX {
+                    Ok(RowId::new(max_val + 1))
+                } else {
+                    // MAX_ROWID reached: SQLite tries random probing.
+                    // For the type-level implementation, we signal exhaustion.
+                    Err(RowIdExhausted)
+                }
+            }
+            RowIdMode::AutoIncrement => {
+                let base = max_val.max(self.sequence_high_water);
+                if base == i64::MAX {
+                    return Err(RowIdExhausted);
+                }
+                let next = base + 1;
+                self.sequence_high_water = next;
+                Ok(RowId::new(next))
+            }
+        }
+    }
+
+    /// Get the current sqlite_sequence high-water mark.
+    pub const fn sequence_high_water(&self) -> i64 {
+        self.sequence_high_water
+    }
+
+    /// Set the sqlite_sequence high-water mark (loaded from DB).
+    pub fn set_sequence_high_water(&mut self, val: i64) {
+        self.sequence_high_water = val;
+    }
+}
+
+/// Error when rowid space is exhausted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowIdExhausted;
+
+impl std::fmt::Display for RowIdExhausted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("database or object is full (rowid exhausted)")
+    }
+}
+
 /// Column index within a table (0-based).
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
@@ -1035,5 +1118,75 @@ mod tests {
         fn prop_budget_combine_commutative(a in arb_budget(), b in arb_budget()) {
             prop_assert_eq!(a.meet(b), b.meet(a));
         }
+    }
+
+    // ── bd-13r.5: RowId + AUTOINCREMENT Semantics ──
+
+    #[test]
+    fn test_rowid_reuse_without_autoincrement() {
+        let mut alloc = RowIdAllocator::new(RowIdMode::Normal);
+        // Table has max rowid 5 → next is 6.
+        let r = alloc.allocate(Some(RowId::new(5))).unwrap();
+        assert_eq!(r.get(), 6);
+
+        // After deleting row 6, if max existing drops to 3, next is 4 (reuse).
+        let r = alloc.allocate(Some(RowId::new(3))).unwrap();
+        assert_eq!(r.get(), 4);
+    }
+
+    #[test]
+    fn test_autoincrement_no_reuse() {
+        let mut alloc = RowIdAllocator::new(RowIdMode::AutoIncrement);
+        // First allocation, table max is 5.
+        let r = alloc.allocate(Some(RowId::new(5))).unwrap();
+        assert_eq!(r.get(), 6);
+
+        // After deleting row 6, max existing drops to 3. But AUTOINCREMENT
+        // uses high-water mark (6), so next is 7 (no reuse).
+        let r = alloc.allocate(Some(RowId::new(3))).unwrap();
+        assert_eq!(r.get(), 7);
+    }
+
+    #[test]
+    fn test_sqlite_sequence_updates() {
+        let mut alloc = RowIdAllocator::new(RowIdMode::AutoIncrement);
+        assert_eq!(alloc.sequence_high_water(), 0);
+
+        let _ = alloc.allocate(Some(RowId::new(10))).unwrap();
+        assert_eq!(alloc.sequence_high_water(), 11);
+
+        // Loading from DB.
+        alloc.set_sequence_high_water(100);
+        let r = alloc.allocate(Some(RowId::new(50))).unwrap();
+        assert_eq!(r.get(), 101);
+        assert_eq!(alloc.sequence_high_water(), 101);
+    }
+
+    #[test]
+    fn test_max_rowid_exhausted_autoincrement() {
+        let mut alloc = RowIdAllocator::new(RowIdMode::AutoIncrement);
+        // MAX_ROWID reached: AUTOINCREMENT must fail.
+        let result = alloc.allocate(Some(RowId::MAX));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_max_rowid_exhausted_normal() {
+        let mut alloc = RowIdAllocator::new(RowIdMode::Normal);
+        // MAX_ROWID reached in normal mode: also fails (random probing
+        // would happen at the B-tree level, not in the type allocator).
+        let result = alloc.allocate(Some(RowId::MAX));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_rowid_allocate_empty_table() {
+        let mut alloc = RowIdAllocator::new(RowIdMode::Normal);
+        let r = alloc.allocate(None).unwrap();
+        assert_eq!(r.get(), 1);
+
+        let mut alloc = RowIdAllocator::new(RowIdMode::AutoIncrement);
+        let r = alloc.allocate(None).unwrap();
+        assert_eq!(r.get(), 1);
     }
 }
