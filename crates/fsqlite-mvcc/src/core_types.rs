@@ -77,8 +77,9 @@ impl VersionArena {
         self.chunks[chunk_idx].push(Some(version));
         self.high_water += 1;
 
-        #[allow(clippy::cast_possible_truncation)]
-        VersionIdx::new(chunk_idx as u32, offset as u32)
+        let chunk_u32 = u32::try_from(chunk_idx).expect("VersionArena chunk index overflow u32");
+        let offset_u32 = u32::try_from(offset).expect("VersionArena offset overflow u32");
+        VersionIdx::new(chunk_u32, offset_u32)
     }
 
     /// Free the slot at `idx`, making it available for reuse.
@@ -717,13 +718,11 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::cast_possible_truncation)]
     fn test_version_arena_chunk_growth() {
         let mut arena = VersionArena::new();
         assert_eq!(arena.chunk_count(), 1);
 
-        #[allow(clippy::cast_possible_truncation)]
-        let upper = (ARENA_CHUNK + 1) as u32;
+        let upper = u32::try_from(ARENA_CHUNK + 1).unwrap();
         for i in 1..=upper {
             let pgno = PageNumber::new(i.max(1)).unwrap();
             arena.alloc(PageVersion {
