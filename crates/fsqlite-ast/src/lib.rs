@@ -281,7 +281,6 @@ pub enum BinaryOp {
 }
 
 impl fmt::Display for BinaryOp {
-    #[allow(clippy::too_many_lines)]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::Add => "+",
@@ -991,9 +990,12 @@ pub struct DeleteStatement {
 
 /// A CREATE TABLE statement.
 #[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct CreateTableStatement {
     /// `IF NOT EXISTS` flag.
     pub if_not_exists: bool,
+    /// `CREATE TEMP TABLE`.
+    pub temporary: bool,
     /// Table name.
     pub name: QualifiedName,
     /// Table definition body.
@@ -1708,6 +1710,7 @@ mod tests {
     fn test_ast_statement_variants_ddl() {
         let _ = Statement::CreateTable(CreateTableStatement {
             if_not_exists: false,
+            temporary: false,
             name: QualifiedName::bare("t"),
             body: CreateTableBody::Columns {
                 columns: vec![],

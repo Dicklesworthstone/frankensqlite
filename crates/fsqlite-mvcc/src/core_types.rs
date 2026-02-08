@@ -136,13 +136,14 @@ impl Default for VersionArena {
     }
 }
 
+#[allow(clippy::missing_fields_in_debug)]
 impl std::fmt::Debug for VersionArena {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("VersionArena")
             .field("chunks", &self.chunks.len())
             .field("free_list", &self.free_list.len())
             .field("high_water", &self.high_water)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -158,7 +159,11 @@ impl std::fmt::Debug for VersionArena {
 struct PageNumberHasher(u64);
 
 impl Hasher for PageNumberHasher {
-    fn write(&mut self, _: &[u8]) {}
+    fn write(&mut self, _: &[u8]) {
+        // PageNumber's Hash impl calls write_u32 (via NonZeroU32). If this
+        // method is reached, the hasher is being misused with a non-u32 key.
+        debug_assert!(false, "PageNumberHasher only supports write_u32");
+    }
 
     fn write_u32(&mut self, n: u32) {
         self.0 = u64::from(n);
@@ -312,7 +317,7 @@ pub struct Transaction {
     pub snapshot_established: bool,
     pub write_set: Vec<PageNumber>,
     pub intent_log: IntentLog,
-    pub page_locks: Vec<PageNumber>,
+    pub page_locks: HashSet<PageNumber>,
     pub state: TransactionState,
     pub mode: TransactionMode,
     /// True iff this txn currently holds the global write mutex (Serialized mode).
@@ -345,7 +350,7 @@ impl Transaction {
             snapshot_established: true,
             write_set: Vec::new(),
             intent_log: Vec::new(),
-            page_locks: Vec::new(),
+            page_locks: HashSet::new(),
             state: TransactionState::Active,
             mode,
             serialized_write_lock_held: false,
@@ -428,7 +433,10 @@ impl CommitLog {
     /// Append a commit record. The record's `commit_seq` must be the next
     /// expected sequence number.
     pub fn append(&mut self, record: CommitRecord) {
-        let expected = self.base_seq + self.records.len() as u64;
+        let expected = self
+            .base_seq
+            .checked_add(self.records.len() as u64)
+            .expect("CommitLog sequence overflow");
         assert_eq!(
             record.commit_seq.get(),
             expected,
@@ -464,8 +472,11 @@ impl CommitLog {
         if self.records.is_empty() {
             None
         } else {
+            // len >= 1, so len - 1 is safe; checked_add guards base_seq overflow.
             Some(CommitSeq::new(
-                self.base_seq + self.records.len() as u64 - 1,
+                self.base_seq
+                    .checked_add(self.records.len() as u64 - 1)
+                    .expect("CommitLog sequence overflow"),
             ))
         }
     }
@@ -893,6 +904,17 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "can only abort active")]
+    fn test_transaction_double_abort_panics() {
+        let txn_id = TxnId::new(6).unwrap();
+        let snap = Snapshot::new(CommitSeq::new(0), SchemaEpoch::ZERO);
+
+        let mut txn = Transaction::new(txn_id, TxnEpoch::new(0), snap, TransactionMode::Concurrent);
+        txn.abort();
+        txn.abort(); // should panic: already aborted
+    }
+
+    #[test]
     fn test_transaction_mode_concurrent() {
         let txn_id = TxnId::new(1).unwrap();
         let snap = Snapshot::new(CommitSeq::new(0), SchemaEpoch::ZERO);
@@ -908,6 +930,29 @@ mod tests {
 
         let txn = Transaction::new(txn_id, TxnEpoch::new(0), snap, TransactionMode::Serialized);
         assert_eq!(txn.mode, TransactionMode::Serialized);
+    }
+
+    #[test]
+    fn test_transaction_new_initializes_all_fields() {
+        let txn_id = TxnId::new(42).unwrap();
+        let epoch = TxnEpoch::new(7);
+        let snap = Snapshot::new(CommitSeq::new(100), SchemaEpoch::new(3));
+
+        let txn = Transaction::new(txn_id, epoch, snap, TransactionMode::Concurrent);
+        assert_eq!(txn.txn_id, txn_id);
+        assert_eq!(txn.txn_epoch, epoch);
+        assert!(txn.slot_id.is_none());
+        assert_eq!(txn.snapshot.high, CommitSeq::new(100));
+        assert!(txn.snapshot_established);
+        assert!(txn.write_set.is_empty());
+        assert!(txn.intent_log.is_empty());
+        assert!(txn.page_locks.is_empty());
+        assert_eq!(txn.state, TransactionState::Active);
+        assert!(!txn.serialized_write_lock_held);
+        assert!(txn.read_keys.is_empty());
+        assert!(txn.write_keys.is_empty());
+        assert!(!txn.has_in_rw);
+        assert!(!txn.has_out_rw);
     }
 
     #[test]
