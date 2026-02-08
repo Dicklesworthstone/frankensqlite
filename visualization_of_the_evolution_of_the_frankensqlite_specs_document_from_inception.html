@@ -20,6 +20,10 @@
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/diff2html/bundles/css/diff2html.min.css" />
     <style>
         :root {
+            /* --- Mouse Defaults --- */
+            --mouse-x: 50%;
+            --mouse-y: 50%;
+
             /* --- Core Palette (Stripe-grade Dark Mode) --- */
             --bg-depth: #020202;
             --bg-surface: #080808;
@@ -932,16 +936,16 @@
 
     const DB_URL = "spec_evolution_v1.sqlite3";
     const BUCKETS = [
-        { id: 1, name: "Logic", color: "#39ff14", desc: "Fixing mistakes in logic, math, or reasoning." },
-        { id: 2, name: "SQLite", color: "#adff2f", desc: "Correcting inaccurate statements about the legacy SQLite codebase." },
-        { id: 3, name: "Async", color: "#00ff00", desc: "Correcting inaccurate statements about the asupersync library." },
-        { id: 4, name: "Arch", color: "#ff003c", desc: "Fixing conceptual errors or architectural mistakes." },
-        { id: 5, name: "Meta", color: "#71717a", desc: "Ministerial/scrivening fixes (renumbering, references, etc.)." },
-        { id: 6, name: "Context", color: "#d946ef", desc: "Adding background information or context for completeness." },
-        { id: 7, name: "Eng", color: "#06b6d4", desc: "Standard computer engineering improvements (cache, concurrency, etc.)." },
-        { id: 8, name: "Math", color: "#8b5cf6", desc: "Application of esoteric math and advanced 'alien artifact' theory." },
-        { id: 9, name: "Clarify", color: "#14b8a6", desc: "Further elaboration or clarification without substantive changes." },
-        { id: 10, name: "Other", color: "#52525b", desc: "General changes that don't fit into specific categories." }
+        { id: 1, name: "Logic/Math", color: "#39ff14", desc: "Fixing outright mistakes in logic, math, or reasoning." },
+        { id: 2, name: "Legacy SQLite", color: "#adff2f", desc: "Fixing inaccurate statements about the existing sqlite legacy codebase." },
+        { id: 3, name: "Asupersync", color: "#00ff00", desc: "Fixing inaccurate statements about the existing asupersync library codebase." },
+        { id: 4, name: "Architecture", color: "#ff003c", desc: "Fixing conceptual errors or architectural mistakes." },
+        { id: 5, name: "Ministerial", color: "#71717a", desc: "Ministerial/scrivening fixes (e.g., renumbering properly, fixing references, etc)." },
+        { id: 6, name: "Context", color: "#d946ef", desc: "Addition of extra background information or context to make the spec more self-contained and complete." },
+        { id: 7, name: "Engineering", color: "#06b6d4", desc: "Improvements to the spec based on standard computer engineering concepts (e.g., better cache friendliness, better concurrency management, etc.)." },
+        { id: 8, name: "Alien Artifact", color: "#8b5cf6", desc: "Improvements to the spec based on the application of the 'alien artifact' approach: extremely advanced and esoteric/abstruse math rarely seen in applied computer science." },
+        { id: 9, name: "Clarification", color: "#14b8a6", desc: "Further elaboration or clarification of what is already there without making substantive improvements or fixes." },
+        { id: 10, name: "General/Other", color: "#52525b", desc: "A generic 'catch all' umbrella category for all other changes that don't fit nicely within each of the preceding 9 categories." }
     ];
 
     let DB = null;
@@ -1074,7 +1078,7 @@
         const filterContainer = document.createElement("div");
         filterContainer.id = "bucketFilters";
         filterContainer.innerHTML = BUCKETS.map(b => `
-            <div class="filter-pill" data-id="${b.id}" style="color: ${b.color}cc">
+            <div class="filter-pill" data-id="${b.id}" style="color: ${b.color}cc" title="${b.desc}">
                 ${b.name}
             </div>
         `).join("");
@@ -1235,7 +1239,7 @@
     function initLegend() {
         const grid = document.getElementById("legendGrid");
         grid.innerHTML = BUCKETS.map(b => `
-            <div class="legend-item">
+            <div class="legend-item" title="${b.desc}">
                 <div class="legend-item-header">
                     <div class="legend-dot" style="background: ${b.color}"></div>
                     <span class="legend-item-name">${b.name}</span>
@@ -1370,14 +1374,14 @@
                      data-idx="${c.idx}" 
                      data-impact-high="${highImpact}"
                      data-impact-med="${medImpact}"
-                     onclick="window.selectCommit(${c.idx}); document.getElementById('sidebar').classList.remove('active');">
+                     onclick="window.selectCommit(${c.idx}); toggleSidebar(false);">
                     <div class="commit-card-header">
                         <span>#${c.idx}</span>
                         <span>${dayjs(c.date).format("MMM DD")}</span>
                     </div>
                     <div class="commit-card-subject">${escapeHtml(c.subject)}</div>
                     <div class="commit-card-meta">
-                        <span class="tag-pill" style="color:${b.color}; border:1px solid ${b.color}20">${b.name}</span>
+                        <span class="tag-pill" style="color:${b.color}; border:1px solid ${b.color}20" title="${b.desc}">${b.name}</span>
                         <span style="color:var(--text-3); font-size:10px;">+${c.add} / -${c.del}</span>
                     </div>
                 </div>`;
@@ -1413,6 +1417,17 @@
                 cy += sh;
             });
         });
+    }
+
+    function toggleSidebar(active) {
+        const sidebar = document.getElementById("sidebar");
+        if (active) {
+            sidebar.classList.add("active");
+            document.body.style.overflow = "hidden";
+        } else {
+            sidebar.classList.remove("active");
+            document.body.style.overflow = "";
+        }
     }
 
     function setupEventListeners() {
@@ -1466,19 +1481,14 @@
         // Mobile Sidebar
         document.getElementById("btnOpenLogs").addEventListener("click", (e) => {
             e.stopPropagation();
-            document.getElementById("sidebar").classList.add("active");
-            document.body.style.overflow = "hidden";
+            toggleSidebar(true);
         });
-        document.getElementById("btnCloseLogs").addEventListener("click", () => {
-            document.getElementById("sidebar").classList.remove("active");
-            document.body.style.overflow = "";
-        });
+        document.getElementById("btnCloseLogs").addEventListener("click", () => toggleSidebar(false));
         document.addEventListener("click", (e) => {
             const sidebar = document.getElementById("sidebar");
             const btn = document.getElementById("btnOpenLogs");
             if (sidebar.classList.contains("active") && !sidebar.contains(e.target) && e.target !== btn) {
-                sidebar.classList.remove("active");
-                document.body.style.overflow = "";
+                toggleSidebar(false);
             }
         });
 
@@ -1526,7 +1536,16 @@
             return Math.floor((x / rect.width) * COMMITS.length);
         };
 
-        cvs.addEventListener("click", (e) => selectCommit(getMapIdx(e)));
+        const updateMapPreview = () => {
+            const c = COMMITS[STATE.idx];
+            document.getElementById("dockSubject").textContent = c.subject;
+            document.getElementById("dockDetails").textContent = `HASH: ${c.short} // BY: ${c.author} // TIME: ${dayjs(c.date).format("MMM DD HH:mm")}`;
+        };
+
+        cvs.addEventListener("click", (e) => {
+            selectCommit(getMapIdx(e));
+            updateMapPreview();
+        });
         
         cvs.addEventListener("mousemove", (e) => {
             const idx = getMapIdx(e);
@@ -1537,11 +1556,7 @@
             }
         });
 
-        cvs.addEventListener("mouseleave", () => {
-            const c = COMMITS[STATE.idx];
-            document.getElementById("dockSubject").textContent = c.subject;
-            document.getElementById("dockDetails").textContent = `HASH: ${c.short} // BY: ${c.author} // TIME: ${dayjs(c.date).format("MMM DD HH:mm")}`;
-        });
+        cvs.addEventListener("mouseleave", updateMapPreview);
 
         // --- 3. Flashlight Mode ---
         const btnFlash = document.getElementById("btnFlashlight");
@@ -1644,9 +1659,11 @@
         if (!charts.mass) {
             charts.mass = echarts.init(document.getElementById("chartMass"));
             charts.mass.on('click', (params) => {
-                // Grouping makes exact commit mapping complex, but we can jump to the approximate time
                 const dateStr = params.name;
-                const commit = COMMITS.find(c => dayjs(c.date).format("YYYY-MM-DD") === dateStr || dayjs(c.date).format("MM-DD HH:00") === dateStr);
+                const commit = COMMITS.find(c => {
+                    const d = dayjs(c.date);
+                    return d.format("YYYY-MM-DD") === dateStr || d.format("MM-DD HH:00") === dateStr;
+                });
                 if (commit) selectCommit(commit.idx);
             });
         }
