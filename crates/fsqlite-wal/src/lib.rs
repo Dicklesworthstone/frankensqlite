@@ -2,6 +2,7 @@
 
 pub mod checksum;
 pub mod native_commit;
+pub mod recovery_compaction;
 pub mod wal_index;
 
 pub use checksum::{
