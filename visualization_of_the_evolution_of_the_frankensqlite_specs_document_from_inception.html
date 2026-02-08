@@ -2,6 +2,7 @@
 <html lang="en">
 <head>
     <meta charset="utf-8" />
+    <!-- Deploy Hash: 2026-02-08-PREMIUM-DARK-V2 -->
     <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=0, viewport-fit=cover" />
     <title>FrankenSQLite | Spec Reanimation</title>
     
@@ -19,26 +20,50 @@
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/diff2html/bundles/css/diff2html.min.css" />
     <style>
         :root {
-            --bg: #010401;
-            --panel: #050805;
-            --sidebar: #000000;
-            --fg: #d0f0d0;
-            --fg-dim: #2a5a2a;
-            --primary: #39ff14; 
-            --primary-dim: rgba(57, 255, 20, 0.08);
-            --accent: #ff003c; 
-            --electric: #00f2ff; 
-            --border: #142214;
-            --font-mono: 'JetBrains Mono', monospace;
-            --font-sans: 'Inter', sans-serif;
-            --glow: 0 0 20px rgba(57, 255, 20, 0.15);
+            /* Premium Dark Palette */
+            --bg: #050505;
+            --surface-1: #0A0A0A;
+            --surface-2: #121212;
+            --surface-3: #1E1E1E;
+            --border: #2A2A2A;
+            --border-highlight: #3A3A3A;
+            
+            --primary: #39ff14; /* Keeping brand green */
+            --primary-dim: rgba(57, 255, 20, 0.1);
+            --primary-glow: rgba(57, 255, 20, 0.3);
+
+            /* Legacy accent tokens still referenced in HUD/error overlays */
+            --accent: #ff003c;
+            --electric: #00f2ff;
+            
+            --text-primary: #EDEDED;
+            --text-secondary: #A0A0A0;
+            --text-tertiary: #606060;
+            
+            --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
+            
+            --glass-bg: rgba(10, 10, 10, 0.7);
+            --glass-border: rgba(255, 255, 255, 0.08);
+            --backdrop-blur: blur(12px);
+            
+            --shadow-sm: 0 2px 8px rgba(0,0,0,0.4);
+            --shadow-md: 0 8px 24px rgba(0,0,0,0.5);
+            --shadow-lg: 0 24px 48px rgba(0,0,0,0.6);
+            
+            --radius-sm: 6px;
+            --radius-md: 12px;
+            --radius-lg: 16px;
+            
+            --transition-fast: 0.15s cubic-bezier(0.2, 0, 0, 1);
+            --transition-smooth: 0.3s cubic-bezier(0.2, 0, 0, 1);
         }
 
-        * { box-sizing: border-box; -webkit-font-smoothing: antialiased; }
+        * { box-sizing: border-box; -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; }
         
         body {
             background-color: var(--bg);
-            color: var(--fg);
+            color: var(--text-primary);
             font-family: var(--font-sans);
             margin: 0;
             overflow: hidden;
@@ -47,6 +72,7 @@
             flex-direction: column;
         }
 
+        /* --- Layout Structure --- */
         .main-container {
             width: 100%;
             height: 100%;
@@ -54,271 +80,327 @@
             flex-direction: column;
             position: relative;
             z-index: 1;
-            /* Apply the CRT filter here instead of body */
-            filter: url(#crt-filter);
+            background: radial-gradient(circle at top center, #111 0%, var(--bg) 60%);
         }
 
-        /* --- Advanced CRT FX --- */
-        #flashlight {
-            position: fixed;
-            width: 800px;
-            height: 800px;
-            background: radial-gradient(circle, rgba(57, 255, 20, 0.06) 0%, transparent 70%);
-            pointer-events: none;
-            z-index: 9996;
-            transform: translate(-50%, -50%);
-            mix-blend-mode: plus-lighter;
-            will-change: transform;
-        }
-
-        .aberration { display: none; } /* Replaced by SVG filter */
-
-        /* ... rest of existing styles ... */
         .app-header {
-            height: 64px;
-            background: var(--sidebar);
-            border-bottom: 1px solid var(--border);
+            height: 60px;
+            background: var(--glass-bg);
+            backdrop-filter: var(--backdrop-blur);
+            border-bottom: 1px solid var(--glass-border);
             display: flex;
             align-items: center;
             justify-content: space-between;
-            padding: 0 20px;
+            padding: 0 24px;
             flex-shrink: 0;
             z-index: 100;
-            padding-top: env(safe-area-inset-top);
+            position: relative;
         }
 
         .brand { display: flex; align-items: center; gap: 12px; }
-        .brand img { height: 36px; border-radius: 4px; }
-        .brand h1 { font-size: 1rem; font-weight: 800; color: var(--primary); text-shadow: var(--glow); margin: 0; letter-spacing: 0.05em; }
+        .brand img { height: 32px; border-radius: 6px; box-shadow: 0 0 10px rgba(57,255,20,0.1); }
+        .brand h1 { font-size: 14px; font-weight: 600; color: var(--text-primary); letter-spacing: -0.01em; margin: 0; }
+        .brand h1 span { color: var(--text-secondary); font-weight: 400; margin-left: 8px; }
 
         .app-body { flex: 1; display: flex; overflow: hidden; position: relative; }
 
+        /* --- Optional "Lab Effects" (must never crash core rendering) --- */
+        .data-packet {
+            position: fixed;
+            width: 6px;
+            height: 6px;
+            border-radius: 999px;
+            background: rgba(57, 255, 20, 0.95);
+            box-shadow: 0 0 12px rgba(57, 255, 20, 0.35);
+            pointer-events: none;
+            z-index: 9997;
+        }
+
+        /* --- Sidebar (Commit List) --- */
         .sidebar {
-            width: 380px;
-            background: var(--sidebar);
+            width: 360px;
+            background: var(--surface-1);
             border-right: 1px solid var(--border);
             display: flex;
             flex-direction: column;
             flex-shrink: 0;
             z-index: 50;
-            transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            transition: transform var(--transition-smooth);
         }
 
+        .sidebar-header {
+            padding: 16px 20px;
+            border-bottom: 1px solid var(--border);
+            background: var(--surface-1);
+        }
+        
+        .sidebar-header input {
+            width: 100%;
+            background: var(--surface-2);
+            border: 1px solid var(--border);
+            padding: 10px 12px;
+            color: var(--text-primary);
+            font-family: var(--font-sans);
+            font-size: 13px;
+            border-radius: var(--radius-sm);
+            outline: none;
+            transition: all var(--transition-fast);
+        }
+        
+        .sidebar-header input:focus {
+            border-color: var(--primary);
+            box-shadow: 0 0 0 2px var(--primary-dim);
+        }
+        
+        .sidebar-header input::placeholder { color: var(--text-tertiary); }
+
+        .commit-list {
+            flex: 1;
+            overflow-y: auto;
+            padding: 12px;
+        }
+
+        .commit-card {
+            background: transparent;
+            border: 1px solid transparent;
+            border-radius: var(--radius-sm);
+            padding: 10px 12px;
+            margin-bottom: 4px;
+            cursor: pointer;
+            transition: all var(--transition-fast);
+        }
+
+        .commit-card:hover {
+            background: var(--surface-2);
+            border-color: var(--border);
+        }
+
+        .commit-card.selected {
+            background: var(--surface-2);
+            border-color: var(--primary);
+            box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+        }
+
+        .commit-card-header {
+            display: flex;
+            justify-content: space-between;
+            font-size: 11px;
+            color: var(--text-tertiary);
+            font-family: var(--font-mono);
+            margin-bottom: 4px;
+        }
+
+        .commit-card-subject {
+            font-size: 13px;
+            font-weight: 500;
+            color: var(--text-secondary);
+            margin-bottom: 6px;
+            line-height: 1.4;
+            display: -webkit-box;
+            -webkit-line-clamp: 2;
+            -webkit-box-orient: vertical;
+            overflow: hidden;
+        }
+
+        .commit-card.selected .commit-card-subject { color: var(--text-primary); }
+
+        .commit-card-meta {
+            display: flex;
+            justify-content: space-between;
+            font-size: 10px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+
+        /* --- Main Content --- */
         .main-content {
             flex: 1;
             display: flex;
             flex-direction: column;
-            background: #030303;
+            background: var(--bg);
             overflow: hidden;
+            position: relative;
         }
 
         .content-header {
-            height: 50px;
-            background: var(--panel);
-            border-bottom: 1px solid var(--border);
+            height: 48px;
             display: flex;
             align-items: center;
             justify-content: space-between;
-            padding: 0 15px;
+            padding: 0 24px;
+            border-bottom: 1px solid var(--border);
+            background: var(--surface-1);
         }
 
-        .tabs { display: flex; gap: 8px; }
+        .tabs { display: flex; gap: 4px; background: var(--surface-2); padding: 3px; border-radius: var(--radius-sm); border: 1px solid var(--border); }
         .tab {
-            padding: 8px 16px;
-            font-size: 11px;
-            font-weight: 700;
-            text-transform: uppercase;
-            letter-spacing: 0.05em;
+            padding: 6px 14px;
+            font-size: 12px;
+            font-weight: 500;
             cursor: pointer;
-            color: var(--fg-dim);
+            color: var(--text-secondary);
             border-radius: 4px;
+            transition: all var(--transition-fast);
         }
-        .tab.active { color: var(--bg); background: var(--primary); }
+        .tab:hover { color: var(--text-primary); }
+        .tab.active { background: var(--surface-3); color: var(--text-primary); box-shadow: var(--shadow-sm); }
 
         .viewport { flex: 1; position: relative; overflow: hidden; }
-        .scroll-pane { height: 100%; overflow-y: auto; padding: 20px; -webkit-overflow-scrolling: touch; }
+        
+        .scroll-pane { 
+            height: 100%; 
+            overflow-y: auto; 
+            padding: 40px; 
+            -webkit-overflow-scrolling: touch; 
+        }
 
         .spec-container {
             max-width: 800px;
             margin: 0 auto;
-            background: #000;
+            color: var(--text-secondary);
+            padding-bottom: 100px;
+        }
+
+        .spec-content {
+            font-family: var(--font-sans);
+            font-size: 16px;
+            line-height: 1.7;
+            color: var(--text-secondary);
+            overflow-x: hidden;
+            word-wrap: break-word;
+            overflow-wrap: anywhere; 
+        }
+
+        .spec-content h1, .spec-content h2, .spec-content h3 {
+            color: var(--text-primary);
+            font-weight: 600;
+            letter-spacing: -0.02em;
+            margin-top: 2em;
+        }
+        
+        .spec-content h1 { border-bottom: 1px solid var(--border); padding-bottom: 0.5em; font-size: 24px; }
+        .spec-content h2 { font-size: 20px; }
+        
+        .spec-content code {
+            font-family: var(--font-mono);
+            background: var(--surface-2);
+            padding: 2px 5px;
+            border-radius: 4px;
+            font-size: 0.9em;
+            color: #E6E6E6;
+        }
+        
+        .spec-content pre {
+            background: var(--surface-2);
             border: 1px solid var(--border);
-            border-radius: 8px;
-            padding: 60px 50px;
-            box-shadow: 0 20px 40px rgba(0,0,0,0.5);
-            position: relative;
+            border-radius: var(--radius-sm);
+            padding: 16px;
+            overflow-x: auto;
+            margin: 1.5em 0;
         }
 
-        .spec-container::after {
-            content: "";
-            position: absolute;
-            top: 10px; left: 10px; right: 10px; bottom: 10px;
-            border: 1px dashed #111;
-            pointer-events: none;
-        }
-
-        .spec-content { font-family: var(--font-sans); font-size: 17px; line-height: 1.8; color: #ccc; }
-        .spec-content h1, .spec-content h2 { color: var(--primary); font-family: var(--font-mono); margin-top: 2.5em; border-bottom: 1px solid var(--border); padding-bottom: 10px; }
-
+        /* --- Dock --- */
         .dock {
-            background: var(--sidebar);
-            border-top: 1px solid var(--border);
-            padding: 15px 20px calc(15px + env(safe-area-inset-bottom));
+            background: var(--glass-bg);
+            backdrop-filter: var(--backdrop-blur);
+            border-top: 1px solid var(--glass-border);
+            padding: 16px 24px calc(16px + env(safe-area-inset-bottom));
             z-index: 100;
         }
 
-        .evolution-map { height: 60px; background: #050505; border-radius: 6px; position: relative; margin-bottom: 15px; border: 1px solid #111; }
-        .map-canvas { width: 100%; height: 100%; display: block; border-radius: 6px; }
-        .map-slider { position: absolute; inset: 0; -webkit-appearance: none; background: transparent; margin: 0; z-index: 10; cursor: crosshair; }
-        .map-slider::-webkit-slider-thumb { -webkit-appearance: none; width: 2px; height: 60px; background: #fff; box-shadow: 0 0 10px #fff; }
+        .evolution-map { 
+            height: 48px; 
+            background: var(--surface-2); 
+            border-radius: var(--radius-sm); 
+            position: relative; 
+            margin-bottom: 16px; 
+            border: 1px solid var(--border); 
+            overflow: hidden;
+        }
+        
+        .map-canvas { width: 100%; height: 100%; display: block; opacity: 0.8; }
+        .map-slider { position: absolute; inset: 0; width: 100%; height: 100%; -webkit-appearance: none; background: transparent; margin: 0; z-index: 10; cursor: crosshair; }
+        .map-slider:focus { outline: none; }
+        .map-slider::-webkit-slider-thumb { 
+            -webkit-appearance: none; 
+            width: 4px; 
+            height: 48px; 
+            background: #fff; 
+            box-shadow: 0 0 15px rgba(255,255,255,0.5); 
+            border-radius: 2px;
+            cursor: ew-resize;
+        }
 
         .dock-bottom { display: flex; align-items: center; justify-content: space-between; gap: 20px; }
+        
         .btn-lab {
-            background: #000; border: 1px solid var(--border); color: var(--primary); font-family: var(--font-mono);
-            font-weight: 800; padding: 10px 16px; border-radius: 6px; font-size: 11px; text-transform: uppercase; cursor: pointer;
-        }
-        .btn-lab:hover { background: var(--primary-dim); border-color: var(--primary); }
-        .btn-play { background: var(--primary); color: #000; min-width: 100px; }
-
-        /* --- HUD DNA --- */
-        .dna-hud { width: 280px; background: rgba(255,255,255,0.03); border: 1px solid var(--border); border-radius: 6px; padding: 12px; }
-        .dna-label { font-size: 8px; font-weight: 800; color: var(--fg-dim); text-transform: uppercase; margin-bottom: 6px; letter-spacing: 1px; }
-        .dna-bar { display: flex; height: 6px; background: #111; border-radius: 3px; overflow: hidden; }
-        .dna-seg { height: 100%; transition: width 0.3s ease; }
-
-        /* --- Metrics HUD --- */
-        .metrics-hud { width: 340px; display: grid; grid-template-columns: 1fr 1fr; gap: 10px; background: rgba(255,255,255,0.02); padding: 12px; border-radius: 6px; border: 1px solid var(--border); }
-        .metric-item { display: flex; flex-direction: column; }
-        .metric-label { font-size: 7px; color: var(--fg-dim); font-weight: 800; text-transform: uppercase; }
-        .metric-value { font-size: 12px; font-weight: 800; color: #fff; font-family: var(--font-mono); }
-
-        /* --- Responsive --- */
-        @media (max-width: 768px) {
-            .sidebar { position: absolute; inset: 0; width: 100%; transform: translateX(-100%); }
-            .sidebar.active { transform: translateX(0); }
-            .kpis { display: none; }
-            .dna-hud { display: none; }
-            .metrics-hud { display: none; }
-            .mobile-hide { display: none !important; }
-            .spec-container { padding: 40px 20px; border: none; }
-        }
-        @media (min-width: 769px) {
-            .mobile-only { display: none !important; }
-            .sidebar { transform: none !important; }
-        }
-
-        #loadingOverlay { position: fixed; inset: 0; background: #000; z-index: 10000; display: flex; flex-direction: column; align-items: center; justify-content: center; }
-        .vital-pulse { width: 200px; height: 2px; background: #111; position: relative; overflow: hidden; }
-        .vital-pulse::after { content: ""; position: absolute; width: 100px; height: 100%; background: var(--primary); left: -100px; animation: p 1.5s infinite; }
-        @keyframes p { 100% { left: 300px; } }
-
-        .main-container {
-            width: 100%;
-            height: 100%;
-            display: flex;
-            flex-direction: column;
-            transform: scale(0.99) rotateX(0.2deg);
-            transition: transform 0.3s ease;
-        }
-
-        /* --- Advanced CRT & Electric FX --- */
-        .aberration {
-            position: fixed;
-            inset: 0;
-            pointer-events: none;
-            z-index: 9997;
-            background: 
-                linear-gradient(rgba(255, 0, 0, 0.02), transparent),
-                linear-gradient(90deg, rgba(0, 255, 255, 0.02), transparent);
-            mix-blend-mode: screen;
-            opacity: 0.4;
-        }
-
-        #flashlight {
-            position: fixed;
-            width: 600px;
-            height: 600px;
-            background: radial-gradient(circle, rgba(57, 255, 20, 0.05) 0%, transparent 70%);
-            pointer-events: none;
-            z-index: 9996;
-            transform: translate(-50%, -50%);
-            mix-blend-mode: plus-lighter;
-        }
-
-        .arc-container {
-            position: fixed;
-            inset: 0;
-            pointer-events: none;
-            z-index: 10001;
-        }
-
-        .electric-arc {
-            stroke: var(--primary);
-            stroke-width: 1.5;
-            fill: none;
-            filter: drop-shadow(0 0 8px var(--primary));
-            opacity: 0;
-        }
-
-        @keyframes spark {
-            0% { opacity: 0; stroke-dashoffset: 100; }
-            10% { opacity: 1; stroke-dashoffset: 0; }
-            30% { opacity: 0.4; }
-            100% { opacity: 0; stroke-dashoffset: -100; }
-        }
-
-        @keyframes shake {
-            0% { transform: translate(1px, 1px) rotate(0deg); }
-            10% { transform: translate(-1px, -2px) rotate(-0.5deg); }
-            20% { transform: translate(-2px, 0px) rotate(0.5deg); }
-            30% { transform: translate(2px, 2px) rotate(0deg); }
-            40% { transform: translate(1px, -1px) rotate(0.5deg); }
-            50% { transform: translate(-1px, 2px) rotate(-0.5deg); }
-            60% { transform: translate(-2px, 1px) rotate(0deg); }
-            70% { transform: translate(2px, 1px) rotate(-0.5deg); }
-            80% { transform: translate(-1px, -1px) rotate(0.5deg); }
-            90% { transform: translate(1px, 2px) rotate(0deg); }
-            100% { transform: translate(1px, -2px) rotate(-0.5deg); }
-        }
-
-        /* --- Custom HUD --- */
-        .system-hud {
-            position: fixed;
-            top: 80px;
-            right: 20px;
-            width: 200px;
-            background: rgba(0, 0, 0, 0.85);
-            border: 1px solid var(--border);
-            border-radius: 4px;
-            padding: 12px;
-            font-size: 9px;
-            color: var(--primary);
+            background: var(--surface-2); 
+            border: 1px solid var(--border); 
+            color: var(--text-secondary); 
             font-family: var(--font-mono);
-            pointer-events: none;
-            z-index: 60;
-            backdrop-filter: blur(12px);
-            box-shadow: 0 10px 30px rgba(0,0,0,0.5), var(--glow);
+            font-weight: 600; 
+            padding: 8px 16px; 
+            border-radius: var(--radius-sm); 
+            font-size: 11px; 
+            cursor: pointer;
+            transition: all var(--transition-fast);
+        }
+        .btn-lab:hover { background: var(--surface-3); color: var(--text-primary); border-color: var(--border-highlight); }
+        .btn-lab:active { transform: translateY(1px); }
+
+        .btn-play { display: none !important; }
+
+        /* --- Mobile Overrides --- */
+        .mobile-only { display: none !important; }
+        
+        @media (max-width: 768px) {
+            .mobile-only { display: block !important; }
+            .mobile-hide { display: none !important; }
+            
+            /* Sidebar becomes a drawer */
+            .sidebar {
+                position: absolute;
+                top: 0; bottom: 0; left: 0;
+                width: 85%;
+                max-width: 320px;
+                transform: translateX(-100%);
+                box-shadow: var(--shadow-lg);
+                border-right: 1px solid var(--glass-border);
+            }
+            .sidebar.active { transform: translateX(0); }
+            
+            /* Add backdrop for sidebar */
+            .sidebar.active::before {
+                content: "";
+                position: fixed;
+                inset: 0;
+                left: 320px; /* Offset by sidebar width */
+                width: 100vw;
+                background: rgba(0,0,0,0.5);
+                backdrop-filter: blur(4px);
+                z-index: -1;
+            }
+
+            .app-header { padding: 0 16px; height: 56px; }
+            .content-header { padding: 0 16px; overflow-x: auto; }
+            .scroll-pane { padding: 20px 16px; }
+            
+            .dock { padding: 12px 16px calc(12px + env(safe-area-inset-bottom)); }
+            .evolution-map { height: 60px; /* Taller touch target */ }
+            .map-slider::-webkit-slider-thumb { width: 20px; height: 60px; background: rgba(255,255,255,0.2); box-shadow: none; border-left: 2px solid #fff; border-right: 2px solid #fff; }
+            
+            .brand h1 span { display: none; }
         }
 
-        .hud-brain { width: 32px; height: 32px; fill: var(--border); transition: all 0.3s ease; }
-        .brain-glow { fill: var(--primary); filter: blur(2px); opacity: 0; transition: opacity 0.3s ease; }
-
-        .hud-row { display: flex; justify-content: space-between; margin-bottom: 6px; align-items: center; }
-        .hud-bar { flex: 1; height: 4px; background: #111; margin-left: 10px; position: relative; border-radius: 2px; overflow: hidden; }
-        .hud-fill { height: 100%; background: var(--primary); width: 0%; transition: width 0.3s ease; }
-
-        .data-packet {
-            position: absolute;
-            width: 3px;
-            height: 3px;
-            background: var(--primary);
-            box-shadow: 0 0 10px var(--primary);
-            border-radius: 50%;
-            pointer-events: none;
-            z-index: 1000;
-        }
-
+        /* --- Utilities --- */
         .hidden { display: none !important; }
+        #loadingOverlay { position: fixed; inset: 0; background: var(--bg); z-index: 10000; display: flex; flex-direction: column; align-items: center; justify-content: center; }
+        .vital-pulse { width: 40px; height: 40px; border: 3px solid var(--border); border-top-color: var(--primary); border-radius: 50%; animation: spin 1s linear infinite; }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        
+        /* Cleanup unwanted elements */
+        .system-hud, .dna-hud, .metrics-hud, #flashlight, .aberration, .arc-container { display: none !important; }
     </style>
 </head>
 <body data-flashlight="true">
@@ -389,21 +471,21 @@
 
 <div id="loadingOverlay">
     <div class="vital-pulse"></div>
-    <div style="font-family: var(--font-mono); font-size: 10px; color: var(--primary); margin-top: 20px; letter-spacing: 0.5em;">REANIMATING_DNA</div>
+    <div style="font-family: var(--font-mono); font-size: 11px; color: var(--text-secondary); margin-top: 24px; letter-spacing: 0.1em; font-weight: 500;">INITIALIZING</div>
 </div>
 
 <div class="main-container" id="mainContainer">
     <header class="app-header">
     <div class="brand">
-        <button class="btn-lab mobile-only" id="btnOpenLogs">LOGS</button>
+        <button class="btn-lab mobile-only" id="btnOpenLogs" style="margin-right: 12px;">LOGS</button>
         <img src="frankensqlite_illustration.webp" alt="Logo">
-        <h1>FrankenSQLite // Evolutionary_DNA</h1>
+        <h1>FrankenSQLite<span>Evolutionary DNA</span></h1>
     </div>
     <div class="kpis" style="display: flex; gap: 30px;">
-        <div style="display: flex; flex-direction: column;"><span style="font-size: 8px; color: var(--fg-dim);">ENTRIES</span><span id="kpiCommits" style="font-size: 14px; font-weight: 800;">-</span></div>
-        <div style="display: flex; flex-direction: column;"><span style="font-size: 8px; color: var(--fg-dim);">MASS</span><span id="kpiLines" style="font-size: 14px; font-weight: 800;">-</span></div>
+        <div style="display: flex; flex-direction: column;"><span style="font-size: 10px; font-weight: 600; color: var(--text-tertiary); letter-spacing: 0.05em;">ENTRIES</span><span id="kpiCommits" style="font-size: 13px; font-weight: 600; color: var(--text-primary);">-</span></div>
+        <div style="display: flex; flex-direction: column;"><span style="font-size: 10px; font-weight: 600; color: var(--text-tertiary); letter-spacing: 0.05em;">MASS</span><span id="kpiLines" style="font-size: 13px; font-weight: 600; color: var(--text-primary);">-</span></div>
     </div>
-    <button class="btn-lab" onclick="window.open('https://github.com/Dicklesworthstone/frankensqlite')">SOURCE</button>
+    <button class="btn-lab mobile-hide" onclick="window.open('https://github.com/Dicklesworthstone/frankensqlite')">SOURCE</button>
 </header>
 
 <div class="app-body">
@@ -599,6 +681,7 @@
         dockSubject.textContent = c.subject;
         if(!STATE.isPlaying) decodeText(dockSubject, c.subject, 0.8);
         
+        document.getElementById("dockDetails").style.color = "var(--text-tertiary)";
         document.getElementById("dockDetails").textContent = `HASH: ${c.short} // BY: ${c.author} // TIME: ${dayjs(c.date).format("MMM DD HH:mm")}`;
         document.getElementById("activeLabel").textContent = `LOG_ENTRY_${STATE.idx} // ${c.short}`;
         
@@ -825,31 +908,28 @@
             });
         });
 
-        document.getElementById("btnOpenLogs").addEventListener("click", () => document.getElementById("sidebar").classList.add("active"));
+        document.getElementById("btnOpenLogs").addEventListener("click", (e) => {
+            e.stopPropagation();
+            document.getElementById("sidebar").classList.add("active");
+        });
+        
         document.getElementById("btnCloseLogs").addEventListener("click", () => document.getElementById("sidebar").classList.remove("active"));
         
-        document.getElementById("btnPlay").addEventListener("click", () => {
-            STATE.isPlaying = !STATE.isPlaying;
-            document.getElementById("btnPlay").textContent = STATE.isPlaying ? "STABILIZE" : "REANIMATE";
-            
-            if (STATE.isPlaying) {
-                document.body.style.animation = 'shake 0.5s infinite';
-                STATE.playInterval = setInterval(() => { 
-                    if (STATE.idx < COMMITS.length - 1) {
-                        selectCommit(STATE.idx + 1);
-                        if(Math.random() > 0.5) createElectricArc();
-                    } else { 
-                        clearInterval(STATE.playInterval); 
-                        STATE.isPlaying = false; 
-                        document.getElementById("btnPlay").textContent = "REANIMATE"; 
-                        document.body.style.animation = 'none';
-                    } 
-                }, 200);
-            } else { 
-                clearInterval(STATE.playInterval); 
-                document.body.style.animation = 'none';
+        // Click outside to close sidebar on mobile
+        document.addEventListener("click", (e) => {
+            const sidebar = document.getElementById("sidebar");
+            const btn = document.getElementById("btnOpenLogs");
+            if (sidebar.classList.contains("active") && !sidebar.contains(e.target) && e.target !== btn) {
+                sidebar.classList.remove("active");
             }
         });
+
+        // Reanimate button disabled
+        /*
+        document.getElementById("btnPlay").addEventListener("click", () => {
+             // ...
+        });
+        */
 
         document.getElementById("btnPrev").addEventListener("click", () => selectCommit(STATE.idx - 1));
         document.getElementById("btnNext").addEventListener("click", () => selectCommit(STATE.idx + 1));
@@ -863,7 +943,8 @@
         container.innerHTML = FILTERED.slice().reverse().map(c => {
             const b = BUCKETS.find(x => x.id === c.primary) || BUCKETS[9];
             const sel = c.idx === STATE.idx ? "selected" : "";
-            return `<div class="commit-card ${sel}" onclick="window.selectCommit(${c.idx}); document.getElementById('sidebar').classList.remove('active');"><div class="commit-card-header"><span>ENT_${c.idx}</span><span style="color: var(--fg-dim)">${dayjs(c.date).format("MMM DD")}</span></div><div class="commit-card-subject">${escapeHtml(c.subject)}</div><div class="commit-card-meta"><span style="color:${b.color}">${b.name}</span><span style="color:var(--primary)">+${c.add}</span></div></div>`;
+            // Use --text-tertiary instead of old --fg-dim
+            return `<div class="commit-card ${sel}" onclick="window.selectCommit(${c.idx}); document.getElementById('sidebar').classList.remove('active');"><div class="commit-card-header"><span>ENT_${c.idx}</span><span style="color: var(--text-tertiary)">${dayjs(c.date).format("MMM DD")}</span></div><div class="commit-card-subject">${escapeHtml(c.subject)}</div><div class="commit-card-meta"><span style="color:${b.color}">${b.name}</span><span style="color:var(--primary)">+${c.add}</span></div></div>`;
         }).join("");
     }
 
@@ -906,7 +987,65 @@
 	    // Optional lab effect: animated "data packets" across the UI.
 	    // Must never crash the app (the viz page should render even if effects fail).
 	    let LAST_PACKET_AT_MS = 0;
+	    let LAB_EFFECTS_DISABLED = false;
+	    let LAB_EFFECTS_DISABLE_REASON = "";
+
+	    function logLabEffectOnce(level, event, extra) {
+	        if (LAB_EFFECTS_DISABLED && event === "spec_viz_effect_disabled" && LAB_EFFECTS_DISABLE_REASON) return;
+	        try {
+	            const payload = Object.assign({ event, level, ts_ms: Date.now() }, extra || {});
+	            // One-line JSON so Playwright/CI logs are readable.
+	            console.log(JSON.stringify(payload));
+	        } catch (_) {
+	            // Logging must never crash the page.
+	        }
+	    }
+
+	    function disableLabEffects(reason, err) {
+	        LAB_EFFECTS_DISABLED = true;
+	        LAB_EFFECTS_DISABLE_REASON = reason || "unknown";
+	        logLabEffectOnce("info", "spec_viz_effect_disabled", {
+	            effect: "lab_effects",
+	            reason: LAB_EFFECTS_DISABLE_REASON,
+	            error: err && err.message ? String(err.message) : undefined,
+	        });
+	    }
+
+	    function isSelfTestMode() {
+	        try {
+	            const u = new URL(window.location.href);
+	            return u.searchParams.get("selftest") === "1" || u.hash === "#selftest";
+	        } catch (_) {
+	            return false;
+	        }
+	    }
+
+	    function prefersReducedMotion() {
+	        try {
+	            return window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+	        } catch (_) {
+	            return false;
+	        }
+	    }
+
+	    function setSelfTestSentinel(ok, err) {
+	        const id = "specVizSelftestSentinel";
+	        let el = document.getElementById(id);
+	        if (!el) {
+	            el = document.createElement("div");
+	            el.id = id;
+	            el.style.cssText = "position:fixed;left:-9999px;top:-9999px;font-family:monospace;font-size:12px;";
+	            document.body.appendChild(el);
+	        }
+	        el.textContent = ok ? "SPEC_VIZ_SELFTEST_PASS" : "SPEC_VIZ_SELFTEST_FAIL";
+	        logLabEffectOnce("info", "spec_viz_selftest", {
+	            result: ok ? "pass" : "fail",
+	            error: err && err.message ? String(err.message) : undefined,
+	        });
+	    }
+
 	    function createDataPacket() {
+	        if (LAB_EFFECTS_DISABLED) return;
 	        try {
 	            const now = performance.now();
 	            // Throttle to avoid DOM churn on high-FPS displays.
@@ -931,6 +1070,7 @@
 	            const dx = endX - startX;
 	            const dy = endY - startY;
 	            const dur = 600 + Math.random() * 900;
+	            const t0 = performance.now();
 	            const anim = packet.animate(
 	                [
 	                    { transform: "translate(0,0)", opacity: 0.0 },
@@ -939,80 +1079,54 @@
 	                ],
 	                { duration: dur, easing: "cubic-bezier(0.2,0.8,0.2,1)", fill: "forwards" }
 	            );
-	            anim.onfinish = () => packet.remove();
-	            anim.oncancel = () => packet.remove();
+	            anim.onfinish = () => {
+	                try { packet.remove(); } catch (_) {}
+	                const dt = performance.now() - t0;
+	                logLabEffectOnce("debug", "spec_viz_create_data_packet", { duration_ms: Math.round(dt) });
+	            };
+	            anim.oncancel = () => { try { packet.remove(); } catch (_) {} };
 	        } catch (e) {
-	            // Never crash the main viz experience for optional effects.
+	            disableLabEffects("exception", e);
 	        }
 	    }
 
 	    function startLabEffects() {
-	        function packetLoop() {
-	            if (document.visibilityState === 'visible' && Math.random() > 0.98) { createDataPacket(); }
-	            requestAnimationFrame(packetLoop);
+	        try {
+	            const selftest = isSelfTestMode();
+	            if (!selftest && prefersReducedMotion()) return;
+	            if (LAB_EFFECTS_DISABLED) return;
+
+	            if (selftest) {
+	                try {
+	                    createDataPacket();
+	                    setSelfTestSentinel(true);
+	                } catch (e) {
+	                    setSelfTestSentinel(false, e);
+	                }
+	                return;
+	            }
+
+	            function packetLoop() {
+	                if (LAB_EFFECTS_DISABLED) return;
+	                try {
+	                    if (document.visibilityState === "visible" && Math.random() > 0.98) createDataPacket();
+	                } catch (e) {
+	                    disableLabEffects("exception", e);
+	                    return;
+	                }
+	                requestAnimationFrame(packetLoop);
+	            }
+	            packetLoop();
+	        } catch (e) {
+	            disableLabEffects("exception", e);
 	        }
-        packetLoop();
-        setInterval(updateSystemHud, 1000);
-        setInterval(maybeSpark, 3000);
-        const flashlight = document.getElementById('flashlight');
-        document.addEventListener('mousemove', (e) => {
-            let x = e.clientX, y = e.clientY;
-            const targets = document.querySelectorAll('button, .commit-card, .tab');
-            let nearestDist = 150;
-            targets.forEach(t => {
-                const r = t.getBoundingClientRect();
-                const tx = r.left + r.width/2, ty = r.top + r.height/2;
-                const d = Math.hypot(x - tx, y - ty);
-                if (d < nearestDist) { x = x * 0.85 + tx * 0.15; y = y * 0.85 + ty * 0.15; }
-            });
-            if(flashlight) flashlight.style.transform = `translate(${x}px, ${y}px) translate(-50%, -50%)`;
-        });
-    }
+	    }
 
-    function updateSystemHud() {
-        const isReanimating = STATE.isPlaying;
-        const load = isReanimating ? (80 + Math.random() * 20) : (5 + Math.random() * 15);
-        const integrity = isReanimating ? (90 + Math.random() * 5) : (99 + Math.random() * 1);
-        const temp = (isReanimating ? (42 + Math.random() * 5) : (36 + Math.random() * 0.5)).toFixed(1);
-        const voltage = isReanimating ? (400 + Math.floor(Math.random() * 100)) : (230 + Math.floor(Math.random() * 10));
+    function updateSystemHud() { return; }
 
-        const shift = (load / 100) * 2.5;
-        const offR = document.querySelector('#crt-filter feOffset[result="red-chan"]');
-        const offB = document.querySelector('#crt-filter feOffset[result="blue-chan"]');
-        if(offR) offR.setAttribute('dx', shift);
-        if(offB) offB.setAttribute('dx', -shift);
+    function maybeSpark() { return; }
 
-        const hl = document.getElementById('hudLoad'), hi = document.getElementById('hudIntegrity');
-        if(hl) hl.style.width = load + '%'; if(hi) hi.style.width = integrity + '%';
-        const ht = document.getElementById('hudTemp'), hv = document.getElementById('hudVoltage');
-        if(ht) ht.innerText = temp + '°C'; if(hv) hv.innerText = voltage + 'V';
-        const syncs = isReanimating ? ["STRESS", "CRITICAL", "REANIMATING", "OVERLOAD"] : ["STABLE", "SYNCING", "IDLE", "CALIBRATED"];
-        const hs = document.getElementById('hudSync');
-        if(hs) {
-            hs.innerText = syncs[Math.floor(Math.random() * syncs.length)];
-            hs.style.color = isReanimating ? 'var(--accent)' : 'var(--electric)';
-        }
-    }
-
-    function maybeSpark() { const threshold = STATE.isPlaying ? 0.3 : 0.8; if (Math.random() > threshold) createElectricArc(); }
-
-    function createElectricArc() {
-        const path = document.getElementById('arcPath');
-        const w = window.innerWidth, h = window.innerHeight;
-        const points = [{x: 10, y: 10}, {x: w-10, y: 10}, {x: 10, y: h-10}, {x: w-10, y: h-10}];
-        const p1 = points[Math.floor(Math.random() * points.length)];
-        let p2 = points[Math.floor(Math.random() * points.length)];
-        while(p1 === p2) p2 = points[Math.floor(Math.random() * points.length)];
-        let d = `M ${p1.x} ${p1.y}`;
-        const segments = 12;
-        for(let i=1; i<segments; i++) {
-            const tx = p1.x + (p2.x - p1.x) * (i / segments), ty = p1.y + (p2.y - p1.y) * (i / segments);
-            d += ` L ${tx + (Math.random() - 0.5) * 120} ${ty + (Math.random() - 0.5) * 120}`;
-        }
-        d += ` L ${p2.x} ${p2.y}`;
-        path.setAttribute('d', d); path.style.animation = 'none'; path.getBoundingClientRect(); 
-        path.style.animation = 'spark 0.3s ease-out forwards';
-    }
+    function createElectricArc() { return; }
 
     function escapeHtml(text) { return text ? text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;") : ""; }
 
