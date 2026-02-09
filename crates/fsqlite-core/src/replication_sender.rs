@@ -91,7 +91,9 @@ impl ChangesetHeader {
         let version = u16::from_le_bytes(buf[4..6].try_into().expect("2 bytes"));
         if version != CHANGESET_VERSION {
             return Err(FrankenError::DatabaseCorrupt {
-                detail: format!("changeset version mismatch: expected {CHANGESET_VERSION}, got {version}"),
+                detail: format!(
+                    "changeset version mismatch: expected {CHANGESET_VERSION}, got {version}"
+                ),
             });
         }
         let page_size = u32::from_le_bytes(buf[6..10].try_into().expect("4 bytes"));
@@ -233,10 +235,7 @@ pub fn encode_changeset(page_size: u32, pages: &mut [PageEntry]) -> Result<Vec<u
 
     debug!(
         bead_id = BEAD_ID,
-        n_pages,
-        page_size,
-        total_len,
-        "encoded changeset"
+        n_pages, page_size, total_len, "encoded changeset"
     );
 
     debug_assert_eq!(buf.len() as u64, total_len);
@@ -267,10 +266,7 @@ pub struct ChangesetShard {
 /// # Errors
 ///
 /// Returns error if `symbol_size` is 0.
-pub fn shard_changeset(
-    changeset_bytes: Vec<u8>,
-    symbol_size: u16,
-) -> Result<Vec<ChangesetShard>> {
+pub fn shard_changeset(changeset_bytes: Vec<u8>, symbol_size: u16) -> Result<Vec<ChangesetShard>> {
     if symbol_size == 0 {
         return Err(FrankenError::OutOfRange {
             what: "symbol_size".to_owned(),
@@ -322,7 +318,7 @@ pub fn shard_changeset(
         let shard_bytes = chunk.to_vec();
         let id = compute_changeset_id(&shard_bytes);
         let seed = derive_seed_from_changeset_id(&id);
-        let k = u64::from(chunk.len() as u64).div_ceil(t);
+        let k = (chunk.len() as u64).div_ceil(t);
         let k_source = u32::try_from(k).expect("each shard <= K_MAX symbols");
 
         debug!(
@@ -549,7 +545,10 @@ impl ReplicationSender {
         config: SenderConfig,
     ) -> Result<()> {
         if self.state != SenderState::Idle {
-            return Err(FrankenError::Internal(format!("sender must be IDLE to prepare, current state: {:?}", self.state)));
+            return Err(FrankenError::Internal(format!(
+                "sender must be IDLE to prepare, current state: {:?}",
+                self.state
+            )));
         }
 
         ReplicationPacket::validate_symbol_size(usize::from(config.symbol_size))?;
@@ -607,7 +606,10 @@ impl ReplicationSender {
             )));
         }
 
-        let session = self.session.as_mut().expect("session exists in STREAMING state");
+        let session = self
+            .session
+            .as_mut()
+            .expect("session exists in STREAMING state");
 
         if session.current_shard >= session.shards.len() {
             // All shards complete.
@@ -615,7 +617,9 @@ impl ReplicationSender {
         }
 
         let shard = &session.shards[session.current_shard];
-        let max_isi = shard.k_source.saturating_mul(session.config.max_isi_multiplier);
+        let max_isi = shard
+            .k_source
+            .saturating_mul(session.config.max_isi_multiplier);
 
         if session.current_isi >= max_isi {
             // Move to next shard.
@@ -643,7 +647,7 @@ impl ReplicationSender {
         // For source symbols (ISI < K_source): extract from changeset bytes.
         // For repair symbols (ISI >= K_source): would use RaptorQ encoder in production.
         // Here we provide the framework; actual FEC encoding is delegated to asupersync.
-        let symbol_data = if (isi as u64) < u64::from(shard.k_source) {
+        let symbol_data = if u64::from(isi) < u64::from(shard.k_source) {
             // Source symbol: extract T bytes starting at ISI * T.
             let start = isi as usize * t;
             let end = (start + t).min(shard.changeset_bytes.len());
@@ -658,11 +662,15 @@ impl ReplicationSender {
             // Repair symbol: placeholder (production uses RaptorQ intermediate symbols).
             // For now, generate deterministic placeholder from seed + ISI.
             let mut data = vec![0_u8; t];
-            let repair_seed = shard.seed.wrapping_add(u64::from(isi));
-            for (i, byte) in data.iter_mut().enumerate() {
-                let mixed = repair_seed.wrapping_mul(0x9E37_79B9_7F4A_7C15)
-                    .wrapping_add(i as u64);
-                *byte = (mixed >> 32) as u8;
+            #[allow(clippy::cast_possible_truncation)]
+            {
+                let repair_seed = shard.seed.wrapping_add(u64::from(isi));
+                for (i, byte) in data.iter_mut().enumerate() {
+                    let mixed = repair_seed
+                        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                        .wrapping_add(i as u64);
+                    *byte = (mixed >> 32) as u8;
+                }
             }
             warn!(
                 bead_id = BEAD_ID,
@@ -732,6 +740,7 @@ mod tests {
 
     const TEST_BEAD_ID: &str = "bd-1hi.13";
 
+    #[allow(clippy::cast_possible_truncation)]
     fn make_pages(page_size: u32, page_numbers: &[u32]) -> Vec<PageEntry> {
         page_numbers
             .iter()
@@ -760,7 +769,11 @@ mod tests {
             total_len: 42_000,
         };
         let bytes = header.to_bytes();
-        assert_eq!(&bytes[0..4], b"FSRP", "bead_id={TEST_BEAD_ID} case=header_magic");
+        assert_eq!(
+            &bytes[0..4],
+            b"FSRP",
+            "bead_id={TEST_BEAD_ID} case=header_magic"
+        );
         assert_eq!(bytes.len(), CHANGESET_HEADER_SIZE);
 
         let decoded = ChangesetHeader::from_bytes(&bytes).expect("decode should succeed");
@@ -866,7 +879,7 @@ mod tests {
         );
 
         // Tampered page fails validation.
-        let mut tampered = page.clone();
+        let mut tampered = page;
         tampered.page_bytes[0] ^= 0xFF;
         assert!(
             !tampered.validate_xxh3(),
@@ -918,8 +931,7 @@ mod tests {
         let t = usize::from(MTU_SAFE_SYMBOL_SIZE);
         let total = REPLICATION_HEADER_SIZE + t;
         assert_eq!(
-            total,
-            1472,
+            total, 1472,
             "bead_id={TEST_BEAD_ID} case=mtu_safe_packet_size"
         );
         // Plus IP + UDP headers: 1472 + 20 + 8 = 1500.
@@ -1063,7 +1075,7 @@ mod tests {
         let symbol_size = 64_u16;
         let bytes_per_max_block = u64::from(K_MAX) * u64::from(symbol_size);
         // Make changeset bytes just over the limit.
-        let changeset_bytes = vec![0xAB_u8; (bytes_per_max_block as usize) + 1];
+        let changeset_bytes = vec![0xAB_u8; usize::try_from(bytes_per_max_block).unwrap() + 1];
         let shards = shard_changeset(changeset_bytes.clone(), symbol_size).expect("shard");
 
         assert!(
@@ -1099,7 +1111,10 @@ mod tests {
         let page_size = 128_u32;
         let mut ids = Vec::new();
         for seed in 0_u32..20 {
-            let mut pages = vec![PageEntry::new(1, vec![seed as u8; page_size as usize])];
+            let mut pages = vec![PageEntry::new(
+                1,
+                vec![u8::try_from(seed).unwrap(); page_size as usize],
+            )];
             let bytes = encode_changeset(page_size, &mut pages).expect("encode");
             ids.push(compute_changeset_id(&bytes));
         }
@@ -1120,7 +1135,7 @@ mod tests {
         let symbol_size = 64_u16;
         for size_multiplier in [1_u64, 2, 5] {
             let total = u64::from(K_MAX) * u64::from(symbol_size) * size_multiplier + 7;
-            let changeset = vec![0xCC_u8; total as usize];
+            let changeset = vec![0xCC_u8; usize::try_from(total).unwrap()];
             let shards = shard_changeset(changeset.clone(), symbol_size).expect("shard");
 
             let reassembled: Vec<u8> = shards
@@ -1146,7 +1161,7 @@ mod tests {
         assert_eq!(CHANGESET_HEADER_SIZE, 22);
         assert_eq!(REPLICATION_HEADER_SIZE, 24);
         assert_eq!(MAX_UDP_PAYLOAD, 65_507);
-        assert!(MAX_REPLICATION_SYMBOL_SIZE < MAX_UDP_PAYLOAD);
+        const { assert!(MAX_REPLICATION_SYMBOL_SIZE < MAX_UDP_PAYLOAD) };
 
         // Verify core functions exist.
         let _ = ChangesetId::from_bytes([0; 16]);
