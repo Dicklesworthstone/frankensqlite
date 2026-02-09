@@ -18,6 +18,7 @@ pub mod hot_witness_index;
 pub mod index_regen;
 pub mod invariants;
 pub mod lifecycle;
+pub mod physical_merge;
 pub mod rowid_alloc;
 pub mod shared_lock_table;
 pub mod sheaf_conformal;
@@ -77,6 +78,11 @@ pub use invariants::{
     SerializedWriteMutex, TxnManager, VersionStore, idx_to_version_pointer, visible,
 };
 pub use lifecycle::{BeginKind, CommitResponse, MvccError, Savepoint, TransactionManager};
+pub use physical_merge::{
+    CellOp, CellOpKind, FreeSpaceOp, HeaderOp, MergeError, MergeLadderResult, ParsedCell,
+    ParsedPage, RangeXorPatch, StructuredPagePatch, apply_patch, diff_parsed_pages,
+    evaluate_merge_ladder, merge_structured_patches, parse_btree_page, repack_btree_page,
+};
 pub use rowid_alloc::{
     AllocatorKey, ConcurrentRowIdAllocator, DEFAULT_RANGE_SIZE, LocalRowIdCache, RangeReservation,
     RowIdAllocError, SQLITE_FULL, SQLITE_SCHEMA,
