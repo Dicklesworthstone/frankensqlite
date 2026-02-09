@@ -44,6 +44,12 @@ pub const DEFAULT_FAILURE_ALERT_THRESHOLD: f64 = 20.0;
 /// Wilson interval z-score used for conservative upper-bound monitoring.
 pub const DEFAULT_WILSON_Z: f64 = 3.0;
 
+/// Bead identifier for adaptive redundancy autopilot scope.
+pub const ADAPTIVE_REDUNDANCY_BEAD_ID: &str = "bd-1hi.30";
+
+/// Structured logging standard reference for this bead.
+pub const ADAPTIVE_REDUNDANCY_LOGGING_STANDARD: &str = "bd-1fpm";
+
 /// Default debug throttling interval for monitor updates.
 pub const DEFAULT_DEBUG_EVERY_ATTEMPTS: u64 = 64;
 
@@ -52,6 +58,24 @@ pub const MIN_ATTEMPTS_FOR_WARN: u64 = 64;
 
 /// Minimum sample count before INFO alert decisions are emitted.
 pub const MIN_ATTEMPTS_FOR_ALERT: u64 = 128;
+
+/// Trigger source for a redundancy policy decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RedundancyTrigger {
+    /// Automatic escalation after anytime-valid bound rejection.
+    EprocessReject,
+    /// Explicit operator/diagnostic retune.
+    Manual,
+}
+
+impl fmt::Display for RedundancyTrigger {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EprocessReject => write!(f, "eprocess_reject"),
+            Self::Manual => write!(f, "manual"),
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Repair Config
@@ -200,6 +224,12 @@ pub struct OverheadRetuneEntry {
     pub new_loss_fraction_max_permille: u32,
     /// K_source at the time of retune.
     pub k_source: u32,
+    /// Trigger source for this policy decision.
+    pub trigger: RedundancyTrigger,
+    /// Monotone regime identifier from the controller.
+    pub regime_id: u64,
+    /// Anytime-valid upper bound used as hard gate.
+    pub p_upper: f64,
 }
 
 // ---------------------------------------------------------------------------
@@ -715,15 +745,164 @@ fn ln_n_choose_k(n: u32, k: u32) -> f64 {
     acc
 }
 
-/// Record an adaptive overhead retune in the evidence ledger (§3.5.3).
+/// Policy knobs for adaptive redundancy autopilot (§3.5.12).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AdaptiveRedundancyPolicy {
+    /// Minimum allowed overhead percentage.
+    pub overhead_min: u32,
+    /// Maximum allowed overhead percentage.
+    pub overhead_max: u32,
+    /// Warn-only upper bound for conservative `p_upper`.
+    pub p_upper_warn_budget: f64,
+    /// Alert threshold for conservative `p_upper`.
+    pub p_upper_alert_budget: f64,
+    /// Bound above which durability contract is considered violated.
+    pub p_upper_violation_budget: f64,
+}
+
+impl Default for AdaptiveRedundancyPolicy {
+    fn default() -> Self {
+        Self {
+            overhead_min: 5,
+            overhead_max: 200,
+            p_upper_warn_budget: 0.08,
+            p_upper_alert_budget: 0.15,
+            p_upper_violation_budget: 0.50,
+        }
+    }
+}
+
+/// Deterministic policy decision from adaptive redundancy autopilot.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RedundancyAutopilotDecision {
+    /// Previous overhead percentage.
+    pub old_overhead_percent: u32,
+    /// New overhead percentage.
+    pub new_overhead_percent: u32,
+    /// Trigger for this decision.
+    pub trigger: RedundancyTrigger,
+    /// Monotone regime id for replay stability.
+    pub regime_id: u64,
+    /// Snapshot upper-bound estimate used as the hard guardrail.
+    pub p_upper: f64,
+    /// E-process value at decision time (diagnostic).
+    pub e_value: f64,
+    /// Whether retroactive hardening should be enqueued.
+    pub retroactive_hardening_enqueued: bool,
+    /// Whether integrity sweeps should be escalated.
+    pub integrity_sweeps_escalated: bool,
+    /// Whether policy entered a contract-violation window.
+    pub durability_contract_violated: bool,
+    /// Append-only evidence entry for this decision.
+    pub evidence_entry: OverheadRetuneEntry,
+}
+
+impl AdaptiveRedundancyPolicy {
+    /// Evaluate adaptive redundancy policy using the anytime-valid bound
+    /// (`p_upper`) as the hard guardrail.
+    #[must_use]
+    pub fn evaluate(
+        &self,
+        current_overhead_percent: u32,
+        k_source: u32,
+        state: FailureEProcessState,
+        regime_id: u64,
+    ) -> Option<RedundancyAutopilotDecision> {
+        debug!(
+            bead_id = ADAPTIVE_REDUNDANCY_BEAD_ID,
+            logging_standard = ADAPTIVE_REDUNDANCY_LOGGING_STANDARD,
+            old_overhead = current_overhead_percent,
+            regime_id,
+            p_upper = state.p_upper,
+            e_value = state.e_value,
+            "adaptive redundancy policy evaluation"
+        );
+
+        if state.p_upper <= self.p_upper_warn_budget {
+            return None;
+        }
+
+        if state.p_upper <= self.p_upper_alert_budget {
+            warn!(
+                bead_id = ADAPTIVE_REDUNDANCY_BEAD_ID,
+                logging_standard = ADAPTIVE_REDUNDANCY_LOGGING_STANDARD,
+                old_overhead = current_overhead_percent,
+                regime_id,
+                p_upper = state.p_upper,
+                warn_budget = self.p_upper_warn_budget,
+                alert_budget = self.p_upper_alert_budget,
+                "entering durable-but-not-repairable warning window"
+            );
+            return None;
+        }
+
+        let new_overhead_percent = current_overhead_percent
+            .saturating_mul(2)
+            .max(self.overhead_min)
+            .min(self.overhead_max);
+        let trigger = RedundancyTrigger::EprocessReject;
+        let evidence_entry = record_overhead_retune_with_context(
+            k_source,
+            &RepairConfig::with_overhead(current_overhead_percent),
+            new_overhead_percent,
+            state.e_value,
+            trigger,
+            regime_id,
+            state.p_upper,
+        );
+        let durability_contract_violated = state.p_upper > self.p_upper_violation_budget;
+        if durability_contract_violated {
+            error!(
+                bead_id = ADAPTIVE_REDUNDANCY_BEAD_ID,
+                logging_standard = ADAPTIVE_REDUNDANCY_LOGGING_STANDARD,
+                old_overhead = current_overhead_percent,
+                new_overhead = new_overhead_percent,
+                regime_id,
+                p_upper = state.p_upper,
+                violation_budget = self.p_upper_violation_budget,
+                "durability contract violated: repair insufficiency proof required"
+            );
+        }
+
+        info!(
+            bead_id = ADAPTIVE_REDUNDANCY_BEAD_ID,
+            logging_standard = ADAPTIVE_REDUNDANCY_LOGGING_STANDARD,
+            old_overhead = current_overhead_percent,
+            new_overhead = new_overhead_percent,
+            trigger = %trigger,
+            regime_id,
+            p_upper = state.p_upper,
+            e_value = state.e_value,
+            "adaptive redundancy policy change applied"
+        );
+
+        Some(RedundancyAutopilotDecision {
+            old_overhead_percent: current_overhead_percent,
+            new_overhead_percent,
+            trigger,
+            regime_id,
+            p_upper: state.p_upper,
+            e_value: state.e_value,
+            retroactive_hardening_enqueued: true,
+            integrity_sweeps_escalated: true,
+            durability_contract_violated,
+            evidence_entry,
+        })
+    }
+}
+
+/// Record an adaptive overhead retune in the evidence ledger (§3.5.12).
 ///
 /// Returns the ledger entry for persistence.
 #[must_use]
-pub fn record_overhead_retune(
+pub fn record_overhead_retune_with_context(
     k_source: u32,
     old_config: &RepairConfig,
     new_overhead_percent: u32,
     e_value: f64,
+    trigger: RedundancyTrigger,
+    regime_id: u64,
+    p_upper: f64,
 ) -> OverheadRetuneEntry {
     let old_budget = compute_repair_budget(k_source, old_config);
     let new_config = RepairConfig::with_overhead(new_overhead_percent);
@@ -736,12 +915,20 @@ pub fn record_overhead_retune(
         old_loss_fraction_max_permille: old_budget.loss_fraction_max_permille,
         new_loss_fraction_max_permille: new_budget.loss_fraction_max_permille,
         k_source,
+        trigger,
+        regime_id,
+        p_upper,
     };
 
     info!(
+        bead_id = ADAPTIVE_REDUNDANCY_BEAD_ID,
+        logging_standard = ADAPTIVE_REDUNDANCY_LOGGING_STANDARD,
         old_overhead = old_config.overhead_percent,
         new_overhead = new_overhead_percent,
+        trigger = %trigger,
+        regime_id,
         e_value,
+        p_upper,
         old_loss_fraction_max_permille = old_budget.loss_fraction_max_permille,
         new_loss_fraction_max_permille = new_budget.loss_fraction_max_permille,
         k_source,
@@ -749,6 +936,25 @@ pub fn record_overhead_retune(
     );
 
     entry
+}
+
+/// Backward-compatible helper for callers without trigger context.
+#[must_use]
+pub fn record_overhead_retune(
+    k_source: u32,
+    old_config: &RepairConfig,
+    new_overhead_percent: u32,
+    e_value: f64,
+) -> OverheadRetuneEntry {
+    record_overhead_retune_with_context(
+        k_source,
+        old_config,
+        new_overhead_percent,
+        e_value,
+        RedundancyTrigger::Manual,
+        0,
+        1.0,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1107,5 +1313,153 @@ mod tests {
             state.p_upper > 0.01,
             "with 1/100 failures and z=3, p_upper should stay conservative"
         );
+    }
+
+    fn make_state(p_upper: f64, e_value: f64) -> FailureEProcessState {
+        FailureEProcessState {
+            e_value,
+            total_attempts: 256,
+            total_failures: 64,
+            null_rate: 0.02,
+            alert_threshold: DEFAULT_FAILURE_ALERT_THRESHOLD,
+            p_upper,
+            warned: true,
+            alerted: true,
+        }
+    }
+
+    #[test]
+    fn test_redundancy_autopilot() {
+        let policy = AdaptiveRedundancyPolicy::default();
+        let state = make_state(0.32, 41.0);
+        let decision = policy
+            .evaluate(20, 100, state, 7)
+            .expect("p_upper above alert budget must trigger autopilot");
+        assert_eq!(decision.old_overhead_percent, 20);
+        assert_eq!(decision.new_overhead_percent, 40);
+        assert_eq!(decision.trigger, RedundancyTrigger::EprocessReject);
+        assert!(decision.retroactive_hardening_enqueued);
+        assert!(decision.integrity_sweeps_escalated);
+    }
+
+    #[test]
+    fn test_redundancy_increases_on_corruption() {
+        let mut monitor = FailureRateMonitor::new();
+        for i in 0..600 {
+            let success = i % 4 != 0; // 25% corruption/failure rate.
+            let _ = monitor.update(DecodeAttempt::new(
+                100,
+                102,
+                4096,
+                success,
+                250,
+                DecodeObjectType::EcsObject,
+            ));
+        }
+        let key = FailureBucketKey {
+            k_range: KRangeBucket::K11To100,
+            overhead_bucket: 2,
+        };
+        let state = monitor
+            .state_for(key)
+            .expect("monitor bucket should exist after updates");
+        let decision = AdaptiveRedundancyPolicy::default()
+            .evaluate(20, 100, state, 11)
+            .expect("high corruption must trigger redundancy increase");
+        assert!(decision.new_overhead_percent > decision.old_overhead_percent);
+    }
+
+    #[test]
+    fn test_redundancy_evidence_logged() {
+        let policy = AdaptiveRedundancyPolicy::default();
+        let state = make_state(0.28, 33.0);
+        let decision = policy.evaluate(25, 100, state, 99).expect("decision");
+        assert_eq!(
+            decision.evidence_entry.trigger,
+            RedundancyTrigger::EprocessReject
+        );
+        assert_eq!(decision.evidence_entry.regime_id, 99);
+        assert!(decision.evidence_entry.p_upper > policy.p_upper_alert_budget);
+        assert_eq!(decision.evidence_entry.new_overhead_percent, 50);
+    }
+
+    #[test]
+    fn test_policy_uses_p_upper_guardrail() {
+        let policy = AdaptiveRedundancyPolicy::default();
+        let state = make_state(0.01, 10_000.0); // high e-value, safe p_upper.
+        let decision = policy.evaluate(20, 100, state, 3);
+        assert!(
+            decision.is_none(),
+            "hard gate must be p_upper, not diagnostic e_value under optional stopping"
+        );
+    }
+
+    #[test]
+    fn test_bd_1hi_30_unit_compliance_gate() {
+        assert_eq!(ADAPTIVE_REDUNDANCY_BEAD_ID, "bd-1hi.30");
+        assert_eq!(ADAPTIVE_REDUNDANCY_LOGGING_STANDARD, "bd-1fpm");
+        let policy = AdaptiveRedundancyPolicy::default();
+        assert!(policy.overhead_min > 0);
+        assert!(policy.overhead_max >= policy.overhead_min);
+        assert!(policy.p_upper_alert_budget > policy.p_upper_warn_budget);
+    }
+
+    #[test]
+    fn prop_bd_1hi_30_structure_compliance() {
+        let policy = AdaptiveRedundancyPolicy::default();
+        for overhead in [5_u32, 20, 64, 120] {
+            for p_upper in [0.16_f64, 0.30, 0.70] {
+                let state = make_state(p_upper, 25.0);
+                let decision = policy
+                    .evaluate(overhead, 100, state, 42)
+                    .expect("p_upper above alert budget must produce decision");
+                assert!(decision.new_overhead_percent >= decision.old_overhead_percent);
+                assert!(decision.new_overhead_percent <= policy.overhead_max);
+                assert!(decision.evidence_entry.new_overhead_percent <= policy.overhead_max);
+            }
+        }
+    }
+
+    #[test]
+    fn test_e2e_bd_1hi_30_compliance() {
+        let mut monitor = FailureRateMonitor::new();
+        for _ in 0..200 {
+            let _ = monitor.update(DecodeAttempt::new(
+                100,
+                102,
+                4096,
+                true,
+                220,
+                DecodeObjectType::WalCommitGroup,
+            ));
+        }
+        for i in 0..400 {
+            let success = i % 2 == 0;
+            let _ = monitor.update(DecodeAttempt::new(
+                100,
+                102,
+                4096,
+                success,
+                260,
+                DecodeObjectType::WalCommitGroup,
+            ));
+        }
+
+        let key = FailureBucketKey {
+            k_range: KRangeBucket::K11To100,
+            overhead_bucket: 2,
+        };
+        let state = monitor.state_for(key).expect("state after drift");
+        let policy = AdaptiveRedundancyPolicy::default();
+        let first = policy
+            .evaluate(20, 100, state, 123)
+            .expect("autopilot decision");
+        let second = policy
+            .evaluate(20, 100, state, 123)
+            .expect("deterministic replay");
+        assert_eq!(first, second, "decision must be replay-stable");
+        assert!(first.retroactive_hardening_enqueued);
+        assert!(first.integrity_sweeps_escalated);
+        assert_eq!(first.trigger, RedundancyTrigger::EprocessReject);
     }
 }
