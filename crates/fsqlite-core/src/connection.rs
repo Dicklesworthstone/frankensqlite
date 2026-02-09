@@ -432,9 +432,7 @@ impl Connection {
                 .iter()
                 .rev()
                 .find(|e| e.name.eq_ignore_ascii_case(sp_name))
-                .ok_or_else(|| {
-                    FrankenError::Internal(format!("no such savepoint: {sp_name}"))
-                })?;
+                .ok_or_else(|| FrankenError::Internal(format!("no such savepoint: {sp_name}")))?;
             let snap = entry.snapshot.clone();
             drop(savepoints);
             self.restore_snapshot(&snap);
@@ -477,9 +475,7 @@ impl Connection {
         let idx = savepoints
             .iter()
             .rposition(|e| e.name.eq_ignore_ascii_case(name))
-            .ok_or_else(|| {
-                FrankenError::Internal(format!("no such savepoint: {name}"))
-            })?;
+            .ok_or_else(|| FrankenError::Internal(format!("no such savepoint: {name}")))?;
         // RELEASE removes the named savepoint and all savepoints created after it.
         savepoints.truncate(idx);
         // If no savepoints remain and we started implicitly, end the transaction.
