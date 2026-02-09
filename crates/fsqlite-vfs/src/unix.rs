@@ -104,6 +104,11 @@ fn sqlite_wal_path(path: &Path) -> PathBuf {
     PathBuf::from(wal)
 }
 
+fn sqlite_shm_dms_lock_byte() -> u64 {
+    let base = wal_lock_byte(WAL_WRITE_LOCK).expect("WAL write lock byte must exist");
+    base + u64::from(WAL_TOTAL_LOCKS)
+}
+
 fn sqlite_page_size_from_db_header(db_header: &[u8]) -> Result<u32> {
     const DB_HEADER_BYTES: usize = 100;
     if db_header.len() < DB_HEADER_BYTES {
@@ -837,6 +842,51 @@ impl UnixFile {
         );
     }
 
+    fn acquire_shm_dms_shared(&self, info: &mut ShmInfo) -> Result<()> {
+        let lock_byte = sqlite_shm_dms_lock_byte();
+        let slot_idx = usize::try_from(SQLITE_SHM_DMS_SLOT).expect("DMS slot fits usize");
+        let read_marks = info.read_marks();
+        let slot_state = &mut info.slots[slot_idx];
+
+        if let Some(owner) = slot_state.exclusive_owner {
+            if owner != self.shm_owner_id {
+                Self::log_lock_conflict(
+                    SQLITE_SHM_DMS_SLOT,
+                    "shared",
+                    Self::observed_mode(slot_state),
+                    read_marks,
+                );
+                return Err(FrankenError::Busy);
+            }
+            return Ok(());
+        }
+
+        let total_shared = slot_state.shared_holders.values().copied().sum::<u32>();
+        if total_shared == 0 && !posix_lock(&*info.file, libc::F_RDLCK, lock_byte, 1)? {
+            Self::log_lock_conflict(
+                SQLITE_SHM_DMS_SLOT,
+                "shared",
+                Self::observed_mode(slot_state),
+                read_marks,
+            );
+            return Err(FrankenError::Busy);
+        }
+
+        *slot_state
+            .shared_holders
+            .entry(self.shm_owner_id)
+            .or_insert(0) += 1;
+        lock_debug!(
+            slot = SQLITE_SHM_DMS_SLOT,
+            lock_byte,
+            requested_mode = "shared",
+            observed_mode = Self::observed_mode(slot_state),
+            ?read_marks,
+            "acquired shm DMS shared lock"
+        );
+        Ok(())
+    }
+
     fn acquire_shm_shared_slot(&self, info: &mut ShmInfo, slot: u32) -> Result<()> {
         let Some(lock_byte) = wal_lock_byte(slot) else {
             error!(slot, "invalid SHM slot for shared lock");
@@ -1095,6 +1145,10 @@ impl UnixFile {
     }
 
     pub fn compat_writer_hold_wal_write_lock(&mut self, cx: &Cx) -> Result<()> {
+        // Hold the DMS ("deadman switch") byte in SHARED mode so legacy SQLite
+        // openers do not truncate `*-shm` while we hold WAL_WRITE_LOCK.
+        self.compat_shm_hold_dms_shared(cx)?;
+
         self.shm_lock(
             cx,
             WAL_WRITE_LOCK,
@@ -1112,6 +1166,13 @@ impl UnixFile {
             1,
             SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE,
         )
+    }
+
+    fn compat_shm_hold_dms_shared(&mut self, cx: &Cx) -> Result<()> {
+        checkpoint_or_abort(cx)?;
+        let shm_info = self.ensure_shm_info()?;
+        let mut info = shm_info.lock().expect("shm info lock poisoned");
+        self.acquire_shm_dms_shared(&mut info)
     }
 
     fn compat_writer_init_wal_shm_header_if_needed(&mut self, cx: &Cx) -> Result<()> {
@@ -1142,8 +1203,7 @@ impl UnixFile {
         }
 
         let wal_path = sqlite_wal_path(&self.path);
-        let wal_has_frames = fs::metadata(&wal_path)
-            .is_ok_and(|m| m.len() > 0);
+        let wal_has_frames = fs::metadata(&wal_path).is_ok_and(|m| m.len() > 0);
         if wal_has_frames {
             return Err(FrankenError::WalCorrupt {
                 detail: format!(
@@ -1603,6 +1663,50 @@ mod tests {
     use super::*;
     use std::process::{Command, Output};
 
+    fn debug_dump_sqlite_wal_files(db_path: &Path) {
+        if std::env::var_os("FSQLITE_DEBUG_SQLITE_WAL_INTEROP").is_none() {
+            return;
+        }
+
+        let shm_path = sqlite_shm_path(db_path);
+        let wal_path = sqlite_wal_path(db_path);
+
+        let db_len = fs::metadata(db_path).map(|m| m.len()).unwrap_or(0);
+        let shm_len = fs::metadata(&shm_path).map(|m| m.len()).unwrap_or(0);
+        let wal_len = fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+
+        eprintln!(
+            "[debug] sqlite interop paths:\n  db={}\n  shm={} (len={shm_len})\n  wal={} (len={wal_len})\n  db_len={db_len}",
+            db_path.display(),
+            shm_path.display(),
+            wal_path.display(),
+        );
+
+        if let Ok(file) = File::open(&shm_path) {
+            let mut header = [0_u8; SQLITE_WAL_SHM_HEADER_BYTES];
+            let n = file.read_at(&mut header, 0).unwrap_or(0);
+            let valid = sqlite_wal_shm_header_is_valid(&header).unwrap_or(false);
+            eprintln!("[debug] shm header read_at(0) -> {n} bytes, valid={valid}");
+
+            let mut line = String::new();
+            for (i, b) in header.iter().enumerate() {
+                if i % 16 == 0 {
+                    if !line.is_empty() {
+                        eprintln!("{line}");
+                        line.clear();
+                    }
+                    line.push_str(&format!("[debug] {i:04x}: "));
+                }
+                line.push_str(&format!("{b:02x} "));
+            }
+            if !line.is_empty() {
+                eprintln!("{line}");
+            }
+        } else {
+            eprintln!("[debug] shm file open failed");
+        }
+    }
+
     fn make_temp_path(name: &str) -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join(name);
@@ -2050,6 +2154,7 @@ mod tests {
 
         let (mut coordinator, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
         coordinator.compat_writer_hold_wal_write_lock(&cx).unwrap();
+        debug_dump_sqlite_wal_files(&path);
 
         let reader_output = sqlite3_exec(&path, "PRAGMA busy_timeout=0; SELECT COUNT(*) FROM t;");
         assert!(
@@ -2081,6 +2186,7 @@ mod tests {
 
         let (mut coordinator, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
         coordinator.compat_writer_hold_wal_write_lock(&cx).unwrap();
+        debug_dump_sqlite_wal_files(&path);
 
         let writer_output = sqlite3_exec(
             &path,
@@ -2120,6 +2226,7 @@ mod tests {
 
         let (mut coordinator, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
         coordinator.compat_writer_hold_wal_write_lock(&cx).unwrap();
+        debug_dump_sqlite_wal_files(&path);
 
         // Reader interop while coordinator holds WAL_WRITE_LOCK.
         let read_output = sqlite3_exec(&path, "PRAGMA busy_timeout=0; SELECT SUM(id) FROM t;");
