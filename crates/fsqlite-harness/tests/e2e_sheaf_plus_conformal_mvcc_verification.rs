@@ -160,7 +160,7 @@ fn test_e2e_sheaf_plus_conformal_mvcc_verification() {
         "bead_id={BEAD_ID} expected >=95% conforming holdout rate, got {conforming_rate:.3}"
     );
 
-    let inconsistent_sections = make_inconsistent_sections(0xBAD5_EED);
+    let inconsistent_sections = make_inconsistent_sections(0x0BAD_5EED);
     let inconsistent_result = check_sheaf_consistency(&inconsistent_sections, None);
     assert!(
         !inconsistent_result.is_consistent(),

@@ -1101,6 +1101,7 @@ pub fn validate_hyperfine_json_output(path: &Path) -> Result<(), PerfLoopError> 
 }
 
 /// Resolve a profiling tool version string, if installed.
+#[allow(dead_code)]
 #[must_use]
 pub fn resolve_profiling_tool_version(tool: &str) -> Option<String> {
     let (program, args): (&str, &[&str]) = match tool {
@@ -1146,6 +1147,7 @@ where
 }
 
 /// Enforce profiling tool presence gate using the default resolver.
+#[allow(dead_code)]
 pub fn enforce_profiling_toolchain_presence() -> Result<ProfilingToolchainReport, PerfLoopError> {
     enforce_profiling_toolchain_presence_with(resolve_profiling_tool_version)
 }

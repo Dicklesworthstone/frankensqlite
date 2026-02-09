@@ -694,10 +694,7 @@ fn tiny_digest(bytes: &[u8]) -> u64 {
         let shift = u32::try_from((idx % 8) * 8).expect("shift fits u32");
         acc ^= u64::from(*byte) << shift;
     }
-    let len_u64 = match u64::try_from(bytes.len()) {
-        Ok(value) => value,
-        Err(_) => u64::MAX,
-    };
+    let len_u64 = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
     acc ^ len_u64
 }
 

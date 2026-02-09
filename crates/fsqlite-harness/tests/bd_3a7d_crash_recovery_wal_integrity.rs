@@ -76,8 +76,12 @@ fn workspace_root() -> Result<PathBuf, String> {
 
 fn load_issue_description(issue_id: &str) -> Result<String, String> {
     let issues_path = workspace_root()?.join(ISSUES_JSONL);
-    let raw = fs::read_to_string(&issues_path)
-        .map_err(|error| format!("issues_jsonl_read_failed path={issues_path:?} error={error}"))?;
+    let raw = fs::read_to_string(&issues_path).map_err(|error| {
+        format!(
+            "issues_jsonl_read_failed path={} error={error}",
+            issues_path.display()
+        )
+    })?;
 
     for line in raw.lines().filter(|line| !line.trim().is_empty()) {
         let value: Value = serde_json::from_str(line)
@@ -382,7 +386,7 @@ fn test_e2e_wal_fec_insufficient_symbols_fails_gracefully() {
 fn test_e2e_xxh3_page_checksum_detects_bitflip() {
     let original = sample_page(12);
     let original_hash = wal_fec_source_hash_xxh3_128(&original);
-    let mut flipped = original.clone();
+    let mut flipped = original;
     flipped[101] ^= 0x01;
     let flipped_hash = wal_fec_source_hash_xxh3_128(&flipped);
 
@@ -396,7 +400,7 @@ fn test_e2e_xxh3_page_checksum_detects_bitflip() {
 fn test_e2e_crc32c_raptorq_symbol_integrity() {
     let payload = sample_page(77);
     let crc_before = crc32c_checksum(&payload);
-    let mut corrupted = payload.clone();
+    let mut corrupted = payload;
     corrupted[233] ^= 0x80;
     let crc_after = crc32c_checksum(&corrupted);
 
@@ -450,8 +454,12 @@ fn test_e2e_bd_3a7d_compliance() -> Result<(), String> {
     };
     let report_bytes = serde_json::to_vec_pretty(&report)
         .map_err(|error| format!("report_serialize_failed: {error}"))?;
-    fs::write(&report_path, report_bytes)
-        .map_err(|error| format!("report_write_failed path={report_path:?} error={error}"))?;
+    fs::write(&report_path, report_bytes).map_err(|error| {
+        format!(
+            "report_write_failed path={} error={error}",
+            report_path.display()
+        )
+    })?;
 
     eprintln!(
         "DEBUG bead_id={BEAD_ID} case=e2e_artifact_capture path={} seed={}",

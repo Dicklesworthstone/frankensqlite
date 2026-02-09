@@ -285,8 +285,8 @@ fn test_step3_4_intermediate_first_k_match_source() {
     let Some(enc) = SystematicEncoder::new(&source, 64, 42) else {
         return;
     };
-    for i in 0..k {
-        assert_eq!(enc.intermediate_symbol(i), &source[i][..]);
+    for (i, src) in source.iter().enumerate() {
+        assert_eq!(enc.intermediate_symbol(i), &src[..]);
     }
 }
 
@@ -390,11 +390,8 @@ fn test_encoding_pipeline_correctness() {
     };
     let (decoder, received) = build_full_decode_input(&source, &enc, k, 64, seed);
     let result = decoder.decode(&received).expect("decode");
-    for i in 0..k {
-        assert_eq!(
-            result.source[i], source[i],
-            "bead_id={BEAD_ID} roundtrip i={i}"
-        );
+    for (i, src) in source.iter().enumerate() {
+        assert_eq!(result.source[i], *src, "bead_id={BEAD_ID} roundtrip i={i}");
     }
 }
 
@@ -500,14 +497,14 @@ fn test_e2e_encode_decode_pipeline_k64_t4096() {
         eprintln!("bead_id={BEAD_ID} SKIP: singular k={k}");
         return;
     };
-    for i in 0..k {
-        assert_eq!(enc.intermediate_symbol(i), &source[i][..]);
+    for (i, src) in source.iter().enumerate() {
+        assert_eq!(enc.intermediate_symbol(i), &src[..]);
     }
     let drop: HashSet<usize> = [7, 31].into_iter().collect();
     let (decoder, received) = build_decode_with_erasures(&source, &drop, &enc, k, 4096, seed);
     let result = decoder.decode(&received).expect("e2e decode");
-    for i in 0..k {
-        assert_eq!(result.source[i], source[i], "bead_id={BEAD_ID} e2e i={i}");
+    for (i, src) in source.iter().enumerate() {
+        assert_eq!(result.source[i], *src, "bead_id={BEAD_ID} e2e i={i}");
     }
 }
 
@@ -521,8 +518,8 @@ fn test_e2e_roundtrip_all_source() {
         };
         let (decoder, received) = build_full_decode_input(&source, &enc, k, 64, seed);
         let result = decoder.decode(&received).expect("all source decode");
-        for i in 0..k {
-            assert_eq!(result.source[i], source[i]);
+        for (i, src) in source.iter().enumerate() {
+            assert_eq!(result.source[i], *src);
         }
     }
 }
@@ -581,8 +578,8 @@ fn test_e2e_different_symbol_sizes() {
         };
         let (decoder, received) = build_full_decode_input(&source, &enc, k, sym_sz, seed);
         let result = decoder.decode(&received).expect("various sizes");
-        for i in 0..k {
-            assert_eq!(result.source[i], source[i]);
+        for (i, src) in source.iter().enumerate() {
+            assert_eq!(result.source[i], *src);
         }
     }
 }
@@ -601,8 +598,8 @@ fn test_e2e_larger_k_500() {
     }
     let (decoder, received) = build_full_decode_input(&source, &enc, k, 256, seed);
     let result = decoder.decode(&received).expect("decode k=500");
-    for i in 0..k {
-        assert_eq!(result.source[i], source[i]);
+    for (i, src) in source.iter().enumerate() {
+        assert_eq!(result.source[i], *src);
     }
 }
 

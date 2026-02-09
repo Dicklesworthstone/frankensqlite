@@ -123,8 +123,12 @@ fn workspace_root() -> Result<PathBuf, String> {
 
 fn load_issue_description(issue_id: &str) -> Result<String, String> {
     let issues_path = workspace_root()?.join(ISSUES_JSONL);
-    let raw = fs::read_to_string(&issues_path)
-        .map_err(|error| format!("issues_jsonl_read_failed path={issues_path:?} error={error}"))?;
+    let raw = fs::read_to_string(&issues_path).map_err(|error| {
+        format!(
+            "issues_jsonl_read_failed path={} error={error}",
+            issues_path.display()
+        )
+    })?;
 
     for line in raw.lines().filter(|line| !line.trim().is_empty()) {
         let value: Value = serde_json::from_str(line)
@@ -154,8 +158,7 @@ fn load_issue_description(issue_id: &str) -> Result<String, String> {
 
 fn contains_identifier(text: &str, expected_marker: &str) -> bool {
     text.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '.'))
-        .collect::<Vec<_>>()
-        .contains(&expected_marker)
+        .any(|x| x == expected_marker)
 }
 
 fn evaluate_description(description: &str) -> ComplianceEvaluation {
@@ -183,7 +186,8 @@ fn evaluate_description(description: &str) -> ComplianceEvaluation {
 }
 
 fn canonical_text(path: &Path) -> Result<String, String> {
-    fs::read_to_string(path).map_err(|error| format!("read_failed path={path:?} error={error}"))
+    fs::read_to_string(path)
+        .map_err(|error| format!("read_failed path={} error={error}", path.display()))
 }
 
 fn contains_source_marker_token(text: &str, needle: &str) -> bool {
@@ -225,7 +229,8 @@ fn missing_relative_paths(root: &Path, paths: &[&str]) -> Vec<String> {
 fn missing_absolute_paths(paths: &[&str]) -> Vec<String> {
     paths
         .iter()
-        .filter_map(|absolute| (!Path::new(absolute).exists()).then(|| (*absolute).to_owned()))
+        .filter(|absolute| !Path::new(absolute).exists())
+        .map(|absolute| (*absolute).to_owned())
         .collect::<Vec<_>>()
 }
 

@@ -202,6 +202,7 @@ fn test_e2e_bd_1hi_7() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn test_e2e_monitoring_under_corruption() {
     let mut monitor = FailureRateMonitor::new();
     let mut first_warn_idx = None;

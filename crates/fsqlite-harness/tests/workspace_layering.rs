@@ -300,12 +300,18 @@ fn spec_section_8_3() -> Result<String, String> {
     let section_start = spec
         .find("### 8.3 Per-Crate Detailed Descriptions")
         .ok_or_else(|| {
-            format!("bead_id={DESC_BEAD_ID} case=section_8_3_start_missing path={path:?}")
+            format!(
+                "bead_id={DESC_BEAD_ID} case=section_8_3_start_missing path={}",
+                path.display()
+            )
         })?;
     let section_end = spec
         .find("### 8.4 Dependency Edges with Rationale")
         .ok_or_else(|| {
-            format!("bead_id={DESC_BEAD_ID} case=section_8_4_start_missing path={path:?}")
+            format!(
+                "bead_id={DESC_BEAD_ID} case=section_8_4_start_missing path={}",
+                path.display()
+            )
         })?;
 
     if section_end <= section_start {
@@ -329,10 +335,16 @@ fn spec_section_8_4() -> Result<String, String> {
     let section_start = spec
         .find("### 8.4 Dependency Edges with Rationale")
         .ok_or_else(|| {
-            format!("bead_id={DESC_BEAD_ID} case=section_8_4_start_missing path={path:?}")
+            format!(
+                "bead_id={DESC_BEAD_ID} case=section_8_4_start_missing path={}",
+                path.display()
+            )
         })?;
     let section_end = spec.find("### 8.5 Feature Flags").ok_or_else(|| {
-        format!("bead_id={DESC_BEAD_ID} case=section_8_5_start_missing path={path:?}")
+        format!(
+            "bead_id={DESC_BEAD_ID} case=section_8_5_start_missing path={}",
+            path.display()
+        )
     })?;
 
     if section_end <= section_start {

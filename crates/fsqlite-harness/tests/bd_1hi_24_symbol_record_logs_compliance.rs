@@ -10,6 +10,7 @@ use fsqlite_types::{ObjectId, Oti, SymbolRecord, SymbolRecordFlags};
 use proptest::prelude::proptest;
 use proptest::test_runner::TestCaseError;
 use serde_json::{Value, json};
+use std::io::Write as _;
 
 const BEAD_ID: &str = "bd-1hi.24";
 const ISSUES_JSONL: &str = ".beads/issues.jsonl";
@@ -64,8 +65,12 @@ fn workspace_root() -> Result<PathBuf, String> {
 
 fn load_issue_description(issue_id: &str) -> Result<String, String> {
     let issues_path = workspace_root()?.join(ISSUES_JSONL);
-    let raw = fs::read_to_string(&issues_path)
-        .map_err(|error| format!("issues_jsonl_read_failed path={issues_path:?} error={error}"))?;
+    let raw = fs::read_to_string(&issues_path).map_err(|error| {
+        format!(
+            "issues_jsonl_read_failed path={} error={error}",
+            issues_path.display()
+        )
+    })?;
 
     for line in raw.lines().filter(|line| !line.trim().is_empty()) {
         let value: Value = serde_json::from_str(line)
@@ -121,8 +126,8 @@ fn unique_runtime_dir(label: &str) -> Result<PathBuf, String> {
     let root = workspace_root()?.join("target").join("bd_1hi_24_runtime");
     fs::create_dir_all(&root).map_err(|error| {
         format!(
-            "runtime_dir_create_failed path={:?} error={error}",
-            root.as_path()
+            "runtime_dir_create_failed path={} error={error}",
+            root.as_path().display()
         )
     })?;
     let stamp = SystemTime::now()
@@ -131,8 +136,8 @@ fn unique_runtime_dir(label: &str) -> Result<PathBuf, String> {
     let path = root.join(format!("{label}_{}_{}", std::process::id(), stamp));
     fs::create_dir_all(&path).map_err(|error| {
         format!(
-            "runtime_subdir_create_failed path={:?} error={error}",
-            path.as_path()
+            "runtime_subdir_create_failed path={} error={error}",
+            path.as_path().display()
         )
     })?;
     Ok(path)
@@ -227,6 +232,7 @@ proptest! {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn test_e2e_bd_1hi_24_compliance() -> Result<(), String> {
     let description = load_issue_description(BEAD_ID)?;
     let evaluation = evaluate_description(&description);
@@ -235,8 +241,8 @@ fn test_e2e_bd_1hi_24_compliance() -> Result<(), String> {
     let symbols_dir = runtime_dir.join("ecs").join("symbols");
     fs::create_dir_all(&symbols_dir).map_err(|error| {
         format!(
-            "symbols_dir_create_failed path={:?} error={error}",
-            symbols_dir.as_path()
+            "symbols_dir_create_failed path={} error={error}",
+            symbols_dir.as_path().display()
         )
     })?;
     let header = SymbolSegmentHeader::new(1, 42, 1_700_000_000);
@@ -257,7 +263,6 @@ fn test_e2e_bd_1hi_24_compliance() -> Result<(), String> {
         .append(true)
         .open(&segment_path)
         .map_err(|error| format!("segment_open_append_failed error={error}"))?;
-    use std::io::Write as _;
     file.write_all(&crash_record[..cut])
         .map_err(|error| format!("partial_append_failed error={error}"))?;
     file.sync_data()
@@ -281,7 +286,12 @@ fn test_e2e_bd_1hi_24_compliance() -> Result<(), String> {
         serde_json::to_string_pretty(&artifact)
             .map_err(|error| format!("artifact_serialize_failed error={error}"))?,
     )
-    .map_err(|error| format!("artifact_write_failed path={artifact_path:?} error={error}"))?;
+    .map_err(|error| {
+        format!(
+            "artifact_write_failed path={} error={error}",
+            artifact_path.display()
+        )
+    })?;
 
     eprintln!(
         "DEBUG bead_id={BEAD_ID} case=artifact_written path={} record_count={} torn_tail={}",

@@ -54,8 +54,12 @@ fn workspace_root() -> Result<PathBuf, String> {
 
 fn load_issue_description(issue_id: &str) -> Result<String, String> {
     let issues_path = workspace_root()?.join(ISSUES_JSONL);
-    let raw = fs::read_to_string(&issues_path)
-        .map_err(|error| format!("issues_jsonl_read_failed path={issues_path:?} error={error}"))?;
+    let raw = fs::read_to_string(&issues_path).map_err(|error| {
+        format!(
+            "issues_jsonl_read_failed path={} error={error}",
+            issues_path.display()
+        )
+    })?;
 
     for line in raw.lines().filter(|line| !line.trim().is_empty()) {
         let value: Value = serde_json::from_str(line)
@@ -111,8 +115,8 @@ fn unique_runtime_dir(label: &str) -> Result<PathBuf, String> {
     let root = workspace_root()?.join("target").join("bd_316x_runtime");
     fs::create_dir_all(&root).map_err(|error| {
         format!(
-            "runtime_dir_create_failed path={:?} error={error}",
-            root.as_path()
+            "runtime_dir_create_failed path={} error={error}",
+            root.as_path().display()
         )
     })?;
 
@@ -122,8 +126,8 @@ fn unique_runtime_dir(label: &str) -> Result<PathBuf, String> {
     let path = root.join(format!("{label}_{}_{}", std::process::id(), stamp));
     fs::create_dir_all(&path).map_err(|error| {
         format!(
-            "runtime_subdir_create_failed path={:?} error={error}",
-            path.as_path()
+            "runtime_subdir_create_failed path={} error={error}",
+            path.as_path().display()
         )
     })?;
     Ok(path)
@@ -204,8 +208,8 @@ fn test_e2e_bd_316x_compliance() -> Result<(), String> {
         .map_err(|error| format!("artifact_serialize_failed error={error}"))?;
     fs::write(&artifact_path, artifact_pretty).map_err(|error| {
         format!(
-            "artifact_write_failed path={:?} error={error}",
-            artifact_path.as_path()
+            "artifact_write_failed path={} error={error}",
+            artifact_path.as_path().display()
         )
     })?;
 

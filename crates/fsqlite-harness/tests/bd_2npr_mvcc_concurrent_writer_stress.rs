@@ -129,8 +129,12 @@ fn workspace_root() -> Result<PathBuf, String> {
 
 fn load_issue_description(issue_id: &str) -> Result<String, String> {
     let issues_path = workspace_root()?.join(ISSUES_JSONL);
-    let raw = fs::read_to_string(&issues_path)
-        .map_err(|error| format!("issues_jsonl_read_failed path={issues_path:?} error={error}"))?;
+    let raw = fs::read_to_string(&issues_path).map_err(|error| {
+        format!(
+            "issues_jsonl_read_failed path={} error={error}",
+            issues_path.display()
+        )
+    })?;
 
     for line in raw.lines().filter(|line| !line.trim().is_empty()) {
         let value: Value = serde_json::from_str(line)
@@ -181,7 +185,9 @@ fn evaluate_description(description: &str) -> ComplianceEvaluation {
 }
 
 fn lcg_next(state: &mut u64) -> u64 {
-    *state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+    *state = state
+        .wrapping_mul(6_364_136_223_846_793_005)
+        .wrapping_add(1);
     *state
 }
 
@@ -704,7 +710,7 @@ fn test_e2e_intent_log_rebase_after_conflict() {
         snapshot_seq: 0,
     };
     let first = simulate_mvcc(
-        &[winner.clone(), loser_first_try.clone()],
+        &[winner.clone(), loser_first_try],
         &[1, 2],
         IsolationMode::Serializable,
         false,
@@ -934,8 +940,12 @@ fn test_e2e_bd_2npr_compliance() -> Result<(), String> {
     let artifact_path = artifact_dir.path().join("bd_2npr_stress_artifact.json");
     let bytes = serde_json::to_vec_pretty(&artifact)
         .map_err(|error| format!("artifact_serialize_failed: {error}"))?;
-    fs::write(&artifact_path, bytes)
-        .map_err(|error| format!("artifact_write_failed path={artifact_path:?} error={error}"))?;
+    fs::write(&artifact_path, bytes).map_err(|error| {
+        format!(
+            "artifact_write_failed path={} error={error}",
+            artifact_path.display()
+        )
+    })?;
 
     eprintln!(
         "DEBUG bead_id={BEAD_ID} case=stress_trace seed={} trace_len={} artifact={}",
