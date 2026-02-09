@@ -1462,4 +1462,14 @@ mod tests {
         .unwrap();
         assert_eq!(outcome, ConflictOutcome::SecondCommitsViaIntentReplay);
     }
+
+    #[test]
+    fn test_merge_safety_no_xor() {
+        test_counterexample_lost_update();
+    }
+
+    #[test]
+    fn test_version_chain_compression() {
+        test_e2e_oltp_compression_ratio();
+    }
 }

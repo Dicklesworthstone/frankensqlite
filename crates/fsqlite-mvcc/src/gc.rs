@@ -1051,4 +1051,62 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn test_gc_memory_bounded() {
+        // bd-bca.2: sustained history is bounded by active horizon after pruning.
+        let mut arena = VersionArena::new();
+        let mut chain_heads = HashMap::with_hasher(PageNumberBuildHasher::default());
+
+        for page in 1_u32..=64 {
+            let pgno = PageNumber::new(page).expect("page number in range");
+            let (head, _) = build_chain(&mut arena, pgno, 1_000);
+            chain_heads.insert(pgno, head);
+        }
+
+        let mut todo = GcTodo::new();
+        for page in 1_u32..=64 {
+            todo.enqueue(PageNumber::new(page).expect("page number in range"));
+        }
+
+        // Keep only the newest 16 versions (active window) per page.
+        let active_window = 16_u64;
+        let horizon = CommitSeq::new(1_000 - active_window + 1);
+        let mut total_freed = 0_u32;
+        while !todo.is_empty() {
+            let result = gc_tick(&mut todo, horizon, &mut arena, &mut chain_heads);
+            total_freed = total_freed.saturating_add(result.versions_freed);
+        }
+
+        let expected_freed =
+            u32::try_from(64_usize * usize::try_from(1_000_u64 - active_window).unwrap())
+                .expect("expected freed versions fits u32");
+        assert_eq!(
+            total_freed, expected_freed,
+            "GC should prune obsolete history and keep only active-window versions"
+        );
+    }
+
+    #[test]
+    fn test_gc_version_chain_length() {
+        // bd-bca.2: chain length should be bounded by active transactions + 1 after prune.
+        let mut arena = VersionArena::new();
+        let pgno = PageNumber::new(777).unwrap();
+        let (head, _) = build_chain(&mut arena, pgno, 40);
+        let mut chain_heads = HashMap::with_hasher(PageNumberBuildHasher::default());
+        chain_heads.insert(pgno, head);
+
+        let active_txns = 7_u64;
+        let keep = active_txns + 1;
+        let horizon = CommitSeq::new(40 - keep + 1);
+        let result = prune_page_chain(pgno, horizon, &mut arena, &mut chain_heads);
+        let retained_len =
+            40usize.saturating_sub(usize::try_from(result.freed).expect("u32 fits usize"));
+        assert!(
+            retained_len <= usize::try_from(active_txns + 1).unwrap(),
+            "retained chain length {} must be <= active_txns+1 ({})",
+            retained_len,
+            active_txns + 1
+        );
+    }
 }

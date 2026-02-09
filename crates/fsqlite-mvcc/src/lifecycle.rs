@@ -4436,4 +4436,102 @@ mod tests {
             "indexed write skew must be detected"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // bd-bca.2 acceptance-name aliases (Phase 6 MVCC + SSI)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_mvcc_serialized_mode() {
+        test_serializable_behavior();
+    }
+
+    #[test]
+    fn test_mvcc_concurrent_different_pages() {
+        test_concurrent_disjoint_writes_both_commit();
+    }
+
+    #[test]
+    fn test_mvcc_concurrent_same_page_conflict() {
+        test_concurrent_same_page_first_committer_wins();
+    }
+
+    #[test]
+    fn test_mvcc_100_threads_100_rows() {
+        let manager = Arc::new(Mutex::new(mgr()));
+
+        let handles: Vec<_> = (0_u32..100)
+            .map(|thread_id| {
+                let manager = Arc::clone(&manager);
+                std::thread::spawn(move || {
+                    for row in 0_u32..100 {
+                        let pgno_raw = 10_000 + thread_id * 100 + row;
+                        let pgno = PageNumber::new(pgno_raw).expect("page number in range");
+                        let payload = u8::try_from((row + thread_id) % 251).expect("bounded");
+                        let guard = manager.lock().expect("manager lock");
+                        let mut txn = guard
+                            .begin(BeginKind::Concurrent)
+                            .expect("begin concurrent");
+                        guard
+                            .write_page(&mut txn, pgno, test_data(payload))
+                            .expect("write");
+                        guard.commit(&mut txn).expect("commit");
+                    }
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().expect("worker thread panicked");
+        }
+
+        let guard = manager.lock().expect("manager lock");
+        let mut reader = guard.begin(BeginKind::Deferred).expect("begin reader");
+        let mut present = 0usize;
+        for thread_id in 0_u32..100 {
+            for row in 0_u32..100 {
+                let pgno_raw = 10_000 + thread_id * 100 + row;
+                let pgno = PageNumber::new(pgno_raw).expect("page number in range");
+                if guard.read_page(&mut reader, pgno).is_some() {
+                    present += 1;
+                }
+            }
+        }
+        assert_eq!(present, 10_000, "expected 10,000 committed page writes");
+    }
+
+    #[test]
+    fn test_snapshot_isolation_long_reader() {
+        test_theorem2_snapshot_isolation_all_or_nothing_visibility();
+    }
+
+    #[test]
+    fn test_snapshot_isolation_new_reader() {
+        test_theorem1_committed_writes_visible_in_later_snapshots();
+    }
+
+    #[test]
+    fn test_ssi_write_skew_abort() {
+        test_ssi_write_skew_detected_and_aborted();
+    }
+
+    #[test]
+    fn test_ssi_non_serializable_allows() {
+        test_pragma_serializable_off_allows_skew();
+    }
+
+    #[test]
+    fn test_ssi_rw_flags() {
+        test_ssi_rw_antidependency_tracking();
+    }
+
+    #[test]
+    fn test_rebase_merge_distinct_keys() {
+        test_conflict_with_successful_rebase();
+    }
+
+    #[test]
+    fn test_rebase_merge_same_key_abort() {
+        test_conflict_response_sqlite_busy();
+    }
 }

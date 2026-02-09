@@ -360,10 +360,11 @@ impl TwoPhaseCoordinator {
     ///
     /// Detaching is forbidden while a 2PC is in progress.
     pub fn check_detach(&self, db_id: DatabaseId) -> Result<(), TwoPhaseError> {
-        if self.state != TwoPhaseState::Idle && self.state != TwoPhaseState::Committed {
-            if self.participants.contains_key(&db_id) {
-                return Err(TwoPhaseError::DetachWithActiveTransaction { db_id });
-            }
+        if self.state != TwoPhaseState::Idle
+            && self.state != TwoPhaseState::Committed
+            && self.participants.contains_key(&db_id)
+        {
+            return Err(TwoPhaseError::DetachWithActiveTransaction { db_id });
         }
         Ok(())
     }
@@ -681,7 +682,7 @@ mod tests {
         }
 
         // Prepare all.
-        for (&db_id, _) in &coord.participants.clone() {
+        for &db_id in coord.participants.clone().keys() {
             coord
                 .prepare_participant(
                     db_id,
@@ -929,11 +930,114 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Test 12: Savepoint integration preserves concurrent snapshot during 2PC.
+    // Test 12: Crash after Phase 1 prepare preserves atomicity guarantees.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_cross_db_2pc_crash_after_prepare() {
+        let mut coord = TwoPhaseCoordinator::new(12);
+        coord
+            .add_participant(MAIN_DB_ID, "main".to_owned(), true)
+            .unwrap();
+        coord.add_participant(2, "aux".to_owned(), true).unwrap();
+
+        coord
+            .prepare_participant(
+                MAIN_DB_ID,
+                PrepareResult::Ok {
+                    wal_offset: 4096,
+                    frame_count: 2,
+                },
+            )
+            .unwrap();
+        coord
+            .prepare_participant(
+                2,
+                PrepareResult::Ok {
+                    wal_offset: 8192,
+                    frame_count: 2,
+                },
+            )
+            .unwrap();
+        coord.check_all_prepared().unwrap();
+
+        // Crash point: all participants prepared, decision marker not durable yet.
+        let recovery = TwoPhaseCoordinator::determine_recovery(false, false);
+        assert!(matches!(
+            recovery,
+            RecoveryAction::RollBack | RecoveryAction::RollForward
+        ));
+
+        match recovery {
+            RecoveryAction::RollBack => {
+                coord.abort().unwrap();
+                assert!(coord.is_aborted());
+                assert!(!coord.is_committed());
+            }
+            RecoveryAction::RollForward => {
+                coord
+                    .write_commit_marker(CommitSeq::new(320), 3_200_000)
+                    .unwrap();
+                for db_id in [MAIN_DB_ID, 2] {
+                    coord.commit_participant(db_id).unwrap();
+                }
+                coord.check_all_committed().unwrap();
+                assert!(coord.is_committed());
+            }
+            RecoveryAction::NoAction => panic!("recovery cannot be NoAction after crash"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 13: Crash during Phase 2 rolls forward to complete commit.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn test_cross_db_2pc_crash_during_phase2() {
+        let mut coord = TwoPhaseCoordinator::new(13);
+        coord
+            .add_participant(MAIN_DB_ID, "main".to_owned(), true)
+            .unwrap();
+        coord.add_participant(2, "aux".to_owned(), true).unwrap();
+
+        coord
+            .prepare_participant(
+                MAIN_DB_ID,
+                PrepareResult::Ok {
+                    wal_offset: 4096,
+                    frame_count: 1,
+                },
+            )
+            .unwrap();
+        coord
+            .prepare_participant(
+                2,
+                PrepareResult::Ok {
+                    wal_offset: 8192,
+                    frame_count: 1,
+                },
+            )
+            .unwrap();
+        coord.check_all_prepared().unwrap();
+        coord
+            .write_commit_marker(CommitSeq::new(330), 3_300_000)
+            .unwrap();
+
+        // Crash point: marker durable and one WAL-index already updated.
+        coord.commit_participant(MAIN_DB_ID).unwrap();
+        let recovery = TwoPhaseCoordinator::determine_recovery(true, false);
+        assert_eq!(recovery, RecoveryAction::RollForward);
+
+        // Recovery completes the remaining Phase 2 work.
+        coord.commit_participant(2).unwrap();
+        coord.check_all_committed().unwrap();
+        assert!(coord.is_committed());
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 14: Abort before marker is allowed and clears decision marker.
     // -----------------------------------------------------------------------
     #[test]
     fn test_2pc_abort_before_marker() {
-        let mut coord = TwoPhaseCoordinator::new(12);
+        let mut coord = TwoPhaseCoordinator::new(14);
         coord
             .add_participant(MAIN_DB_ID, "main".to_owned(), true)
             .unwrap();

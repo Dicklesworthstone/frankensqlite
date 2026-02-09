@@ -888,4 +888,21 @@ mod tests {
         // More precise refinement wins (3 keys > 2 keys).
         assert_eq!(merged.refinement.as_ref().unwrap().len(), 3);
     }
+
+    #[test]
+    fn test_roaring_bitmap_visibility() {
+        let visible_pages: BTreeSet<u32> = (1_u32..=100).collect();
+        let summary = KeySummary::PageBitmap(visible_pages);
+
+        for page in 1_u32..=100 {
+            assert!(
+                summary.may_overlap(&test_page_key(page)),
+                "bitmap should include in-flight visible page {page}"
+            );
+        }
+        assert!(
+            !summary.may_overlap(&test_page_key(101)),
+            "bitmap should reject out-of-set page"
+        );
+    }
 }

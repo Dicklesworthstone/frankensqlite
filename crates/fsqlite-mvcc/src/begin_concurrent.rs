@@ -227,11 +227,9 @@ pub fn concurrent_write_page(
     }
     let txn_id = TxnId::new(session_id).ok_or(MvccError::InvalidState)?;
     // Acquire page lock if not already held.
-    if !handle.page_locks.contains(&page) {
-        if lock_table.try_acquire(page, txn_id).is_err() {
-            return Err(MvccError::Busy);
-        }
-        handle.page_locks.insert(page);
+    if handle.page_locks.insert(page) && lock_table.try_acquire(page, txn_id).is_err() {
+        handle.page_locks.remove(&page);
+        return Err(MvccError::Busy);
     }
     handle.write_set.insert(page, data);
     Ok(())
@@ -363,7 +361,7 @@ pub fn concurrent_rollback_to_savepoint(
     if !handle.is_active() {
         return Err(MvccError::InvalidState);
     }
-    handle.write_set = savepoint.write_set_snapshot.clone();
+    handle.write_set.clone_from(&savepoint.write_set_snapshot);
     Ok(())
 }
 
