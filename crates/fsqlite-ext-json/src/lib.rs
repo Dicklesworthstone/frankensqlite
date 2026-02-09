@@ -1685,6 +1685,29 @@ mod tests {
     }
 
     #[test]
+    fn test_jsonb_array_variant() {
+        let blob = jsonb_array(&[
+            SqliteValue::Integer(1),
+            SqliteValue::Text("two".to_owned()),
+            SqliteValue::Null,
+        ])
+        .unwrap();
+        assert_eq!(json_from_jsonb(&blob).unwrap(), r#"[1,"two",null]"#);
+    }
+
+    #[test]
+    fn test_jsonb_object_variant() {
+        let blob = jsonb_object(&[
+            SqliteValue::Text("a".to_owned()),
+            SqliteValue::Integer(1),
+            SqliteValue::Text("b".to_owned()),
+            SqliteValue::Text("two".to_owned()),
+        ])
+        .unwrap();
+        assert_eq!(json_from_jsonb(&blob).unwrap(), r#"{"a":1,"b":"two"}"#);
+    }
+
+    #[test]
     fn test_json_array_length() {
         assert_eq!(json_array_length("[1,2,3]", None).unwrap(), Some(3));
         assert_eq!(json_array_length("[]", None).unwrap(), Some(0));
@@ -1697,6 +1720,12 @@ mod tests {
             json_array_length(r#"{"a":[1,2,3]}"#, Some("$.a")).unwrap(),
             Some(3)
         );
+    }
+
+    #[test]
+    fn test_json_array_length_not_array() {
+        assert_eq!(json_array_length(r#"{"a":1}"#, Some("$.a")).unwrap(), None);
+        assert_eq!(json_array_length(r#""text""#, None).unwrap(), None);
     }
 
     #[test]
@@ -1903,6 +1932,20 @@ mod tests {
         let rows = json_tree(r#"{"a":{"b":1}}"#, None).unwrap();
         assert!(rows.iter().any(|row| row.fullkey == "$.a"));
         assert!(rows.iter().any(|row| row.fullkey == "$.a.b"));
+    }
+
+    #[test]
+    fn test_json_tree_columns() {
+        let rows = json_tree(r#"{"a":{"b":1}}"#, None).unwrap();
+        let row = rows
+            .iter()
+            .find(|candidate| candidate.fullkey == "$.a.b")
+            .expect("nested row should exist");
+        assert_eq!(row.key, SqliteValue::Text("b".to_owned()));
+        assert_eq!(row.value, SqliteValue::Integer(1));
+        assert_eq!(row.type_name, "integer");
+        assert_eq!(row.atom, SqliteValue::Integer(1));
+        assert_eq!(row.path, "$.a");
     }
 
     #[test]
