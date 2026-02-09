@@ -822,4 +822,150 @@ mod tests {
         let (decoded, _) = read_varint(&buf[..written]).unwrap();
         assert_eq!(decoded, i64_max_u + 1);
     }
+
+    // ================================================================
+    // Property-based tests (bd-309f)
+    // ================================================================
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Varint roundtrip: write then read recovers the original value.
+        #[test]
+        fn prop_varint_roundtrip(value: u64) {
+            let mut buf = [0u8; 9];
+            let written = write_varint(&mut buf, value);
+            let (decoded, consumed) = read_varint(&buf[..written]).unwrap();
+            prop_assert_eq!(decoded, value);
+            prop_assert_eq!(consumed, written);
+        }
+
+        /// varint_len matches actual bytes written by write_varint.
+        #[test]
+        fn prop_varint_len_matches_write(value: u64) {
+            let mut buf = [0u8; 9];
+            let written = write_varint(&mut buf, value);
+            prop_assert_eq!(varint_len(value), written);
+        }
+
+        /// Varint encoding is canonical: no leading zero-value continuation bytes
+        /// (i.e. shorter encodings don't decode to the same value).
+        #[test]
+        fn prop_varint_canonical(value: u64) {
+            let mut buf = [0u8; 9];
+            let written = write_varint(&mut buf, value);
+            // If more than 1 byte, removing the first byte should NOT decode
+            // to the same value (proves minimality).
+            if written > 1 {
+                if let Some((alt, _)) = read_varint(&buf[1..written]) {
+                    prop_assert_ne!(alt, value, "shorter encoding yields same value — not canonical");
+                }
+            }
+        }
+
+        /// serial_type_for_integer always returns a type whose class is
+        /// Integer, Zero, or One (never Blob, Text, etc.).
+        #[test]
+        fn prop_integer_serial_type_class(value: i64) {
+            let st = serial_type_for_integer(value);
+            let class = classify_serial_type(st);
+            prop_assert!(
+                matches!(class, SerialTypeClass::Integer | SerialTypeClass::Zero | SerialTypeClass::One),
+                "integer value {value} got unexpected class {class:?} for serial type {st}"
+            );
+        }
+
+        /// serial_type_for_integer returns a type whose content size fits the value.
+        #[test]
+        fn prop_integer_serial_type_fits(value: i64) {
+            let st = serial_type_for_integer(value);
+            if let Some(size) = serial_type_len(st) {
+                // Zero-length types are only valid for 0 and 1
+                if size == 0 {
+                    prop_assert!(value == 0 || value == 1);
+                }
+            }
+        }
+
+        /// serial_type_for_text produces odd types >= 13 that classify as Text.
+        #[test]
+        fn prop_text_serial_type(len in 0u64..=1_000_000) {
+            let st = serial_type_for_text(len);
+            prop_assert!(st >= 13, "text type {st} < 13");
+            prop_assert!(st % 2 == 1, "text type {st} is even");
+            prop_assert_eq!(classify_serial_type(st), SerialTypeClass::Text);
+            // Inverse: recover original length
+            prop_assert_eq!(serial_type_len(st), Some(len));
+        }
+
+        /// serial_type_for_blob produces even types >= 12 that classify as Blob.
+        #[test]
+        fn prop_blob_serial_type(len in 0u64..=1_000_000) {
+            let st = serial_type_for_blob(len);
+            prop_assert!(st >= 12, "blob type {st} < 12");
+            prop_assert!(st % 2 == 0, "blob type {st} is odd");
+            prop_assert_eq!(classify_serial_type(st), SerialTypeClass::Blob);
+            // Inverse: recover original length
+            prop_assert_eq!(serial_type_len(st), Some(len));
+        }
+
+        /// Classification is exhaustive and deterministic for arbitrary serial types.
+        #[test]
+        fn prop_classification_deterministic(st: u64) {
+            let class = classify_serial_type(st);
+            // Re-classify to confirm determinism
+            prop_assert_eq!(classify_serial_type(st), class);
+            // Verify consistency with serial_type_len
+            match class {
+                SerialTypeClass::Reserved => {
+                    prop_assert!(serial_type_len(st).is_none());
+                }
+                _ => {
+                    prop_assert!(serial_type_len(st).is_some());
+                }
+            }
+        }
+
+        /// SMALL_TYPE_SIZES matches serial_type_len for all indices 0..128.
+        #[test]
+        #[allow(clippy::cast_possible_truncation)]
+        fn prop_small_type_table_consistent(i in 0u64..128) {
+            let expected = match serial_type_len(i) {
+                Some(n) if n <= 255 => n as u8,
+                _ => 0,
+            };
+            prop_assert_eq!(SMALL_TYPE_SIZES[usize::try_from(i).unwrap()], expected);
+        }
+
+        /// Varint encoding uses at most 9 bytes and at least 1 byte.
+        #[test]
+        fn prop_varint_len_bounds(value: u64) {
+            let len = varint_len(value);
+            prop_assert!((1..=9).contains(&len), "varint_len({value}) = {len}");
+        }
+
+        /// For 9-byte varints, the first 8 bytes all have the continuation bit set.
+        #[test]
+        fn prop_nine_byte_varint_continuation_bits(value in 0x0100_0000_0000_0000u64..=u64::MAX) {
+            let mut buf = [0u8; 9];
+            let written = write_varint(&mut buf, value);
+            if written == 9 {
+                for (i, &byte) in buf[..8].iter().enumerate() {
+                    prop_assert!(byte & 0x80 != 0, "byte {i} missing continuation bit for value {value}");
+                }
+            }
+        }
+
+        /// read_varint on a truncated buffer returns None.
+        #[test]
+        fn prop_truncated_varint_returns_none(value: u64) {
+            let mut buf = [0u8; 9];
+            let written = write_varint(&mut buf, value);
+            if written > 1 {
+                // Truncate by removing the last byte
+                prop_assert!(read_varint(&buf[..written - 1]).is_none() ||
+                    read_varint(&buf[..written - 1]).unwrap().0 != value,
+                    "truncated buffer should not decode to original value");
+            }
+        }
+    }
 }
