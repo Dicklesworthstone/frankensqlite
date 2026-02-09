@@ -49,7 +49,7 @@ static ROOT_TMP_SUFFIX_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// In-process monotone epoch counter (§4.18).
 ///
 /// Wraps an `AtomicU64` for lock-free reads. Increments are serialized by
-/// the coordinator (only one caller should call [`increment`] at a time).
+/// the coordinator (only one caller should call [`EpochClock::increment`] at a time).
 #[derive(Debug)]
 pub struct EpochClock {
     current: AtomicU64,
@@ -339,7 +339,7 @@ impl EpochBarrier {
 ///
 /// # Errors
 ///
-/// Returns [`FrankenError::CorruptData`] if the symbol epoch is outside
+/// Returns [`FrankenError::DatabaseCorrupt`] if the symbol epoch is outside
 /// the validity window.
 pub fn validate_symbol_epoch(
     symbol_epoch: EpochId,

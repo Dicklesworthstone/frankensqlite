@@ -3,8 +3,8 @@
 //! This module implements:
 //! - [`CompatMode`]: Operating posture selection (Hybrid SHM vs File-Lock Only).
 //! - [`HybridShmState`]: Dual-SHM maintenance state for coordinator.
-//! - [`ReadLockProtocol`]: WAL reader mark join/claim protocol.
-//! - [`CoordinatorRecovery`]: Crash recovery after coordinator or legacy process death.
+//! - `ReadLockProtocol`: WAL reader mark join/claim protocol.
+//! - `CoordinatorRecovery`: Crash recovery after coordinator or legacy process death.
 //! - `begin_concurrent_check`: Gate for `BEGIN CONCURRENT` under no-SHM fallback.
 
 use std::time::Instant;

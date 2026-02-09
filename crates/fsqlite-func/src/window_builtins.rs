@@ -11,7 +11,7 @@
 //!
 //! Pure-numbering functions (row_number, rank, dense_rank) track position
 //! via step() and expose the current value through value().  The ORDER BY
-//! column is passed as args[0] so the function can detect peer-group
+//! column is passed as args\[0\] so the function can detect peer-group
 //! boundaries.
 //!
 //! Buffer-based functions (lag, lead, first_value, last_value, nth_value)

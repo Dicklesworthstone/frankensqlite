@@ -672,7 +672,7 @@ impl ArcCacheInner {
 
     /// Get a reference to a cached page by key.
     ///
-    /// Does **not** modify list ordering.  Call [`request`] first to
+    /// Does **not** modify list ordering.  Call [`Self::request`] first to
     /// trigger ARC promotion/refresh logic.
     #[must_use]
     pub fn get(&self, key: &CacheKey) -> Option<&CachedPage> {
@@ -711,7 +711,7 @@ impl ArcCacheInner {
     ///
     /// Returns the outcome so the caller knows whether to fetch from disk
     /// (on [`CacheLookup::GhostHitB1`], [`CacheLookup::GhostHitB2`], or
-    /// [`CacheLookup::Miss`]) and then call [`admit`].
+    /// [`CacheLookup::Miss`]) and then call [`Self::admit`].
     pub fn request(&mut self, key: &CacheKey) -> CacheLookup {
         let location = self.directory.get(key).copied();
         match location {
@@ -751,7 +751,7 @@ impl ArcCacheInner {
 
     /// Insert a page after a cache miss or ghost hit.
     ///
-    /// `lookup` must be the result of the preceding [`request`] call for the
+    /// `lookup` must be the result of the preceding [`Self::request`] call for the
     /// same key.  On ghost hits the page goes into T2; on misses it goes
     /// into T1.
     ///

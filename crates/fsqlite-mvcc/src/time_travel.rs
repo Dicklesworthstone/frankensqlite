@@ -215,7 +215,7 @@ pub fn resolve_timestamp_via_markers(
 /// Binary-search the commit log to find the greatest commit sequence whose
 /// `timestamp_unix_ns <= target_unix_ns`.
 ///
-/// The [`CommitLog`] stores [`CommitRecord`] entries with a `timestamp_unix_ns`
+/// The [`CommitLog`] stores [`CommitRecord`](crate::core_types::CommitRecord) entries with a `timestamp_unix_ns`
 /// field that is monotonically non-decreasing (timestamps are assigned at
 /// commit time). This allows a standard binary search over the contiguous
 /// record array.
@@ -524,10 +524,7 @@ mod tests {
         let mut marker_store = CommitMarkerStore::new();
 
         for seq in 1..=5 {
-            marker_store.publish(make_commit_marker(
-                seq,
-                base_ts + (seq - 1) * 1_000_000_000,
-            ));
+            marker_store.publish(make_commit_marker(seq, base_ts + (seq - 1) * 1_000_000_000));
         }
 
         let seq = resolve_timestamp_via_markers(&marker_store, base_ts + 2_500_000_000)

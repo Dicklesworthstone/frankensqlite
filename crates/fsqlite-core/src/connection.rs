@@ -474,7 +474,7 @@ impl Connection {
         Ok(())
     }
 
-    /// Handle RELEASE [SAVEPOINT] name.
+    /// Handle RELEASE \[SAVEPOINT\] name.
     fn execute_release(&self, name: &str) -> Result<()> {
         let mut savepoints = self.savepoints.borrow_mut();
         let idx = savepoints

@@ -491,7 +491,7 @@ impl DbFecGroupMeta {
 /// the full-group at 0-based index `g` (groups starting at page 2).
 ///
 /// Layout:
-///   [DbFecHeader][Seg1 (page 1)][SegG_0][SegG_1]...
+///   \[DbFecHeader\]\[Seg1 (page 1)\]\[SegG\_0\]\[SegG\_1\]...
 ///
 /// `segment_1_len`: The total byte size of the page-1 segment (meta + R repair symbols).
 /// `full_segment_len`: The total byte size of a full-group segment (meta + R repair symbols).

@@ -3122,6 +3122,82 @@ mod tests {
         assert!(token.colocated);
     }
 
+    // -----------------------------------------------------------------------
+    // bd-6i2s required: FTS5 secure-delete table-level tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_fts5_secure_delete_removes() {
+        let mut table = Fts5Table::with_columns(vec!["content".to_owned()]);
+        table.config_mut().apply_control_command("secure-delete=1");
+
+        table.insert_document(1, &["sensitive data here".to_owned()]);
+        table.insert_document(2, &["public information".to_owned()]);
+
+        // Verify document found before delete.
+        let before = table.search("sensitive").unwrap();
+        assert_eq!(before.len(), 1);
+
+        // Delete with secure-delete enabled.
+        table.delete_document(1);
+
+        // After delete, "sensitive" should return no results.
+        let after = table.search("sensitive").unwrap();
+        assert!(
+            after.is_empty(),
+            "secure-deleted term should not be searchable"
+        );
+    }
+
+    #[test]
+    fn test_fts5_secure_delete_integrity() {
+        let mut table = Fts5Table::with_columns(vec!["content".to_owned()]);
+        table.config_mut().apply_control_command("secure-delete=1");
+
+        for i in 0..10 {
+            table.insert_document(i, &[format!("document number {i}")]);
+        }
+
+        // Delete half the documents.
+        for i in (0..10).step_by(2) {
+            table.delete_document(i);
+        }
+
+        // Remaining documents should still be searchable.
+        let results = table.search("document").unwrap();
+        assert_eq!(results.len(), 5, "5 remaining docs should be found");
+
+        // Each remaining doc should have an odd ID.
+        for (rowid, _) in &results {
+            assert!(rowid % 2 == 1, "only odd-numbered docs should remain");
+        }
+    }
+
+    #[test]
+    fn test_fts5_contentless_delete_tombstone() {
+        let mut table = Fts5Table::with_columns(vec!["content".to_owned()]);
+        *table.config_mut() = Fts5Config::new(ContentMode::Contentless);
+        table
+            .config_mut()
+            .apply_control_command("contentless_delete=1");
+
+        table.insert_document(1, &["hello world".to_owned()]);
+        table.insert_document(2, &["hello rust".to_owned()]);
+
+        table.delete_document(1);
+
+        // Deleted entry should no longer match.
+        let results = table.search("world").unwrap();
+        assert!(
+            results.is_empty(),
+            "tombstoned entry should not match queries"
+        );
+
+        // Non-deleted entry should still match.
+        let results = table.search("rust").unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
     #[test]
     fn test_fts5_vtab_best_index_full_scan() {
         let cx = Cx::new();

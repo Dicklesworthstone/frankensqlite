@@ -13,7 +13,7 @@
 //!
 //! **Key design:** POSIX fcntl locks are per-process, not per-fd. If one fd in
 //! a process holds a lock, closing *any* fd to the same file releases it. We
-//! handle this with a global inode table ([`InodeTable`]) that coalesces locks
+//! handle this with a global inode table (`InodeTable`) that coalesces locks
 //! across all file handles in the same process.
 
 use std::collections::HashMap;

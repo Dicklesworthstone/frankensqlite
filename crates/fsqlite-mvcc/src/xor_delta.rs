@@ -323,15 +323,15 @@ pub fn encode_page_delta(
 /// Encode a sparse XOR delta in canonical wire format.
 ///
 /// Header (8 bytes):
-/// - magic[2] = "XD"
-/// - version[1] = 1
-/// - flags[1] = 0
-/// - nonzero_count[4] little-endian
+/// - magic\[2\] = "XD"
+/// - version\[1\] = 1
+/// - flags\[1\] = 0
+/// - nonzero\_count\[4\] little-endian
 ///
 /// Runs:
-/// - offset[u16 little-endian]
-/// - len[u16 little-endian]
-/// - data[len]
+/// - offset\[u16 little-endian\]
+/// - len\[u16 little-endian\]
+/// - data\[len\]
 ///
 /// # Errors
 ///

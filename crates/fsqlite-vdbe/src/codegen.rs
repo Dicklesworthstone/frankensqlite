@@ -1763,7 +1763,7 @@ fn emit_is_comparison(
     b.free_temp(r_left);
 }
 
-/// Emit CASE [operand] WHEN ... THEN ... [ELSE ...] END.
+/// Emit CASE \[operand\] WHEN ... THEN ... \[ELSE ...\] END.
 fn emit_case_expr(
     b: &mut ProgramBuilder,
     operand: Option<&Expr>,

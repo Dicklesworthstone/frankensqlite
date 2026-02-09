@@ -2248,6 +2248,57 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // bd-6i2s required tests: json_pretty + jsonb availability
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_json_pretty_object() {
+        let output = json_pretty(r#"{"a":1,"b":[2,3]}"#, None).unwrap();
+        assert!(output.contains('\n'));
+        assert!(output.contains("    \"a\""));
+        assert!(output.contains("    \"b\""));
+    }
+
+    #[test]
+    fn test_json_pretty_array() {
+        let output = json_pretty("[1,2,3]", None).unwrap();
+        assert!(output.contains('\n'));
+        assert!(output.contains("    1"));
+        assert!(output.contains("    2"));
+        assert!(output.contains("    3"));
+    }
+
+    #[test]
+    fn test_json_pretty_idempotent() {
+        let input = r#"{"a":1,"b":[2,3]}"#;
+        let first = json_pretty(input, None).unwrap();
+        let second = json_pretty(&first, None).unwrap();
+        assert_eq!(first, second, "json_pretty should be idempotent");
+    }
+
+    #[test]
+    fn test_jsonb_functions_available() {
+        let blob = jsonb_array(&[SqliteValue::Integer(1), SqliteValue::Integer(2)]).unwrap();
+        assert!(
+            !blob.is_empty(),
+            "jsonb_array should produce non-empty output"
+        );
+
+        let blob2 = jsonb_set(r#"{"a":1}"#, &[("$.a", SqliteValue::Integer(9))]).unwrap();
+        assert!(
+            !blob2.is_empty(),
+            "jsonb_set should produce non-empty output"
+        );
+
+        let blob3 =
+            jsonb_object(&[SqliteValue::Text("key".into()), SqliteValue::Integer(42)]).unwrap();
+        assert!(
+            !blob3.is_empty(),
+            "jsonb_object should produce non-empty output"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // json_quote edge cases
     // -----------------------------------------------------------------------
 

@@ -318,7 +318,7 @@ pub struct CommitMarker {
     pub integrity_hash: [u8; 16],
 }
 
-/// Wire size of a [`CommitMarkerRecord`] V1: 88 bytes.
+/// Wire size of a `CommitMarkerRecord` V1: 88 bytes.
 ///
 /// Layout: `version(1) + flags(1) + commit_seq(8) + commit_time_unix_ns(8)
 /// + capsule_oid(16) + proof_oid(16) + prev_marker_oid(16) + has_prev(1)

@@ -4,8 +4,8 @@
 //! - [`TxnManager`]: Monotonic `TxnId` allocation via `AtomicU64` CAS (INV-1).
 //! - [`VersionStore`]: Version chain management with arena-backed storage.
 //! - [`visible`]: The core visibility predicate.
-//! - [`resolve`]: Version chain resolution against a snapshot.
-//! - [`resolve_for_txn`]: Write-set-aware resolution for transactions.
+//! - `resolve`: Version chain resolution against a snapshot.
+//! - `resolve_for_txn`: Write-set-aware resolution for transactions.
 //! - [`SerializedWriteMutex`]: Global write mutex for Serialized mode (INV-7).
 
 use std::collections::HashMap;

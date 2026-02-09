@@ -1573,6 +1573,49 @@ mod tests {
         assert!(geopoly_within(&sq, &sq));
     }
 
+    // -----------------------------------------------------------------------
+    // bd-6i2s required: geopoly_area_triangle + geopoly_within_not_contained
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_geopoly_area_triangle() {
+        // Right triangle with legs 3 and 4 → area = 6.0
+        let tri = [
+            Point::new(0.0, 0.0),
+            Point::new(3.0, 0.0),
+            Point::new(0.0, 4.0),
+        ];
+        assert!(approx_eq(geopoly_area(&tri), 6.0));
+    }
+
+    #[test]
+    fn test_geopoly_area_square_unit() {
+        let sq = square(0.0, 0.0, 1.0);
+        assert!(approx_eq(geopoly_area(&sq), 1.0));
+    }
+
+    #[test]
+    fn test_geopoly_within_not_contained() {
+        let small = square(0.0, 0.0, 1.0);
+        let big = square(5.0, 5.0, 2.0);
+        assert!(
+            !geopoly_within(&small, &big),
+            "disjoint polygons: small not within big"
+        );
+    }
+
+    #[test]
+    fn test_geopoly_contains_point_inside() {
+        let sq = square(0.0, 0.0, 2.0);
+        assert!(geopoly_contains_point(&sq, Point::new(1.0, 1.0)));
+    }
+
+    #[test]
+    fn test_geopoly_contains_point_outside() {
+        let sq = square(0.0, 0.0, 2.0);
+        assert!(!geopoly_contains_point(&sq, Point::new(5.0, 5.0)));
+    }
+
     #[test]
     fn test_rtree_insert_multiple_range_query() {
         let config = RtreeConfig::new(2, RtreeCoordType::Float32).unwrap();

@@ -212,7 +212,7 @@ pub trait TransactionHandle: sealed::Sealed + Send {
     ///
     /// Performs SSI validation, First-Committer-Wins check, merge ladder,
     /// WAL append, and version publish. Returns `SQLITE_BUSY_SNAPSHOT`
-    /// (via [`FrankenError::BusySnapshot`]) on serialization failure.
+    /// (via `FrankenError::Busy`) on serialization failure.
     fn commit(&mut self, cx: &Cx) -> Result<()>;
 
     /// Roll back this transaction, discarding the write-set.

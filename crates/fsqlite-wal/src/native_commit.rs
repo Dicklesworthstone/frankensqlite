@@ -1,7 +1,7 @@
 //! Native mode commit protocol (§7.11).
 //!
 //! Decouples bulk durability (payload bytes) from ordering (marker stream).
-//! Writers persist [`CommitCapsule`] payloads concurrently via RaptorQ encoding,
+//! Writers persist `CommitCapsule` payloads concurrently via RaptorQ encoding,
 //! then submit to the [`WriteCoordinator`] which serializes only:
 //! validation + `commit_seq` allocation + [`CommitMarker`] append.
 //!
@@ -378,7 +378,7 @@ impl WriteCoordinator {
     /// This allocates a commit_seq, builds the proof and marker, and adds
     /// the commit to the group batch. Returns the allocated commit result.
     ///
-    /// The caller MUST call [`flush_batch`] to actually issue fsyncs and
+    /// The caller MUST call `flush_batch` to actually issue fsyncs and
     /// complete the commits.
     ///
     /// # Errors

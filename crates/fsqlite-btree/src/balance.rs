@@ -6,11 +6,11 @@
 //! SQLite:
 //!
 //! - [`balance_deeper`]: Root page split — increases tree depth by 1.
-//! - [`balance_nonroot`]: 3-way sibling rebalancing.
+//! - `balance_nonroot`: 3-way sibling rebalancing.
 //! - [`balance_quick`]: Fast-path leaf append (rightmost cell on rightmost child).
 //!
-//! The central entry point is [`balance`], which dispatches to the
-//! appropriate algorithm based on the cursor position and page state.
+//! The central entry point dispatches to the appropriate algorithm based on
+//! the cursor position and page state.
 
 use crate::cell::{
     BtreePageHeader, BtreePageType, CellRef, header_offset_for_page, read_cell_pointers,
