@@ -796,8 +796,7 @@ impl UnixFile {
 
             // Release DMS ("deadman switch") lock at byte 128 if held.
             {
-                let slot_idx =
-                    usize::try_from(SQLITE_SHM_DMS_SLOT).expect("DMS slot fits usize");
+                let slot_idx = usize::try_from(SQLITE_SHM_DMS_SLOT).expect("DMS slot fits usize");
                 let slot_state = &mut info.slots[slot_idx];
                 let lock_byte = sqlite_shm_dms_lock_byte();
 
@@ -816,13 +815,12 @@ impl UnixFile {
                     .shared_holders
                     .remove(&self.shm_owner_id)
                     .is_some()
+                    && slot_state.exclusive_owner.is_none()
+                    && slot_state.shared_holders.is_empty()
                 {
-                    if slot_state.exclusive_owner.is_none() && slot_state.shared_holders.is_empty()
-                    {
-                        if let Err(err) = posix_unlock(&*shm_file, lock_byte, 1) {
-                            if first_error.is_none() {
-                                first_error = Some(err);
-                            }
+                    if let Err(err) = posix_unlock(&*shm_file, lock_byte, 1) {
+                        if first_error.is_none() {
+                            first_error = Some(err);
                         }
                     }
                 }

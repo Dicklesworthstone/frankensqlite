@@ -194,6 +194,11 @@ pub struct PruneResult {
     pub freed: u32,
     /// Whether the chain head was removed (page fully pruned).
     pub head_removed: bool,
+    /// `(PageNumber, CommitSeq)` keys of pruned versions, for ARC cache eviction.
+    ///
+    /// When ARC is integrated (§6.5-6.7), the caller MUST remove these keys from
+    /// ARC indexes and ghost lists to prevent memory leaks.
+    pub pruned_keys: Vec<(PageNumber, CommitSeq)>,
 }
 
 /// Prune the version chain for a single page, freeing versions older than the
@@ -223,6 +228,7 @@ pub fn prune_page_chain(
         return PruneResult {
             freed: 0,
             head_removed: false,
+            pruned_keys: Vec::new(),
         };
     };
 
@@ -250,6 +256,7 @@ pub fn prune_page_chain(
         return PruneResult {
             freed: 0,
             head_removed: false,
+            pruned_keys: Vec::new(),
         };
     };
 
@@ -266,11 +273,16 @@ pub fn prune_page_chain(
         version.prev = None;
     }
 
-    // Free everything from tail_idx onward.
+    // Free everything from tail_idx onward, collecting pruned keys for ARC.
     let mut freed = 0_u32;
+    let mut pruned_keys = Vec::new();
     let mut current = tail_idx;
     while let Some(idx) = current {
-        let next = arena.get(idx).and_then(|v| v.prev.map(ptr_to_idx));
+        let version = arena.get(idx);
+        let next = version.and_then(|v| v.prev.map(ptr_to_idx));
+        if let Some(v) = version {
+            pruned_keys.push((pgno, v.commit_seq));
+        }
         arena.free(idx);
         freed += 1;
         current = next;
@@ -287,6 +299,7 @@ pub fn prune_page_chain(
     PruneResult {
         freed,
         head_removed: false,
+        pruned_keys,
     }
 }
 
@@ -307,6 +320,11 @@ pub struct GcTickResult {
     pub pages_budget_exhausted: bool,
     /// Pages remaining in the GcTodo queue after this tick.
     pub queue_remaining: usize,
+    /// Aggregated `(PageNumber, CommitSeq)` keys of pruned versions for ARC eviction.
+    ///
+    /// The caller MUST pass these to the ARC cache (when available) to remove
+    /// stale entries from indexes and ghost lists (§6.7 normative rule).
+    pub pruned_keys: Vec<(PageNumber, CommitSeq)>,
 }
 
 /// Run one incremental GC pass: pop pages from the todo queue and prune their
@@ -331,11 +349,13 @@ pub fn gc_tick(
     let mut versions_budget = GC_VERSIONS_BUDGET;
     let mut pages_pruned = 0_u32;
     let mut versions_freed = 0_u32;
+    let mut all_pruned_keys = Vec::new();
 
     while pages_budget > 0 && versions_budget > 0 && !todo.is_empty() {
         let pgno = todo.pop().expect("queue is not empty");
         let result = prune_page_chain(pgno, horizon, arena, chain_heads);
         versions_freed += result.freed;
+        all_pruned_keys.extend(result.pruned_keys);
         pages_pruned += 1;
         pages_budget -= 1;
         versions_budget = versions_budget.saturating_sub(result.freed);
@@ -368,6 +388,7 @@ pub fn gc_tick(
         versions_budget_exhausted,
         pages_budget_exhausted,
         queue_remaining: todo.len(),
+        pruned_keys: all_pruned_keys,
     }
 }
 
@@ -871,6 +892,132 @@ mod tests {
             result.freed, 2,
             "bead_id={BEAD_ZCDN} pure in-memory prune works correctly"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // bd-3t3.10: incremental across calls + ARC eviction tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_gc_tick_incremental_across_calls() {
+        // bead_id=bd-3t3.10: Enqueue 100 pages. First gc_tick processes 64
+        // (pages budget). Second gc_tick processes remaining 36.
+        let mut arena = VersionArena::new();
+        let mut chain_heads = HashMap::with_hasher(PageNumberBuildHasher::default());
+        let mut todo = GcTodo::new();
+
+        for i in 1..=100 {
+            let pgno = PageNumber::new(i).unwrap();
+            let (head, _) = build_chain(&mut arena, pgno, 5);
+            chain_heads.insert(pgno, head);
+            todo.enqueue(pgno);
+        }
+        assert_eq!(todo.len(), 100);
+
+        // Tick 1: processes exactly GC_PAGES_BUDGET=64 pages.
+        let horizon = CommitSeq::new(3); // free versions 1,2 per page
+        let r1 = gc_tick(&mut todo, horizon, &mut arena, &mut chain_heads);
+        assert_eq!(
+            r1.pages_pruned, GC_PAGES_BUDGET,
+            "bead_id=bd-3t3.10: first tick should process 64 pages"
+        );
+        assert_eq!(
+            r1.queue_remaining, 36,
+            "bead_id=bd-3t3.10: 36 pages should remain after first tick"
+        );
+        assert!(r1.pages_budget_exhausted);
+
+        // Tick 2: processes the remaining 36 pages.
+        let r2 = gc_tick(&mut todo, horizon, &mut arena, &mut chain_heads);
+        assert_eq!(
+            r2.pages_pruned, 36,
+            "bead_id=bd-3t3.10: second tick should process remaining 36 pages"
+        );
+        assert_eq!(
+            r2.queue_remaining, 0,
+            "bead_id=bd-3t3.10: queue should be empty after second tick"
+        );
+        assert!(!r2.pages_budget_exhausted);
+        assert!(!r2.versions_budget_exhausted);
+
+        // Total freed: 2 versions × 100 pages = 200.
+        assert_eq!(
+            r1.versions_freed + r2.versions_freed,
+            200,
+            "bead_id=bd-3t3.10: total freed should be 2 per page × 100 pages"
+        );
+    }
+
+    #[test]
+    fn test_arc_eviction_on_prune() {
+        // bead_id=bd-3t3.10: After pruning, verify pruned_keys contains the
+        // correct (pgno, commit_seq) pairs for ARC cache eviction.
+        // When ARC is integrated (§6.5-6.7), these keys MUST be removed from
+        // ARC indexes and ghost lists.
+        let mut arena = VersionArena::new();
+        let pgno = PageNumber::new(50).unwrap();
+
+        // Chain: seq 1, 2, 3, 4, 5 (head=5).
+        let (head, _) = build_chain(&mut arena, pgno, 5);
+        let mut chain_heads = HashMap::with_hasher(PageNumberBuildHasher::default());
+        chain_heads.insert(pgno, head);
+
+        // Horizon at 3: keep versions 3,4,5. Free versions 1,2.
+        let result = prune_page_chain(pgno, CommitSeq::new(3), &mut arena, &mut chain_heads);
+
+        assert_eq!(result.freed, 2);
+        assert_eq!(
+            result.pruned_keys.len(),
+            2,
+            "bead_id=bd-3t3.10: pruned_keys should contain 2 entries"
+        );
+
+        // Verify the pruned keys are (pgno, seq=2) and (pgno, seq=1),
+        // in the order they were freed (newest-first from the severed tail).
+        let seqs: Vec<u64> = result.pruned_keys.iter().map(|(_, cs)| cs.get()).collect();
+        assert!(
+            seqs.contains(&1) && seqs.contains(&2),
+            "bead_id=bd-3t3.10: pruned_keys must contain versions 1 and 2, got: {seqs:?}"
+        );
+        // All keys should be for this page.
+        for (pn, _) in &result.pruned_keys {
+            assert_eq!(
+                *pn, pgno,
+                "bead_id=bd-3t3.10: all pruned keys must be for the pruned page"
+            );
+        }
+    }
+
+    #[test]
+    fn test_gc_tick_pruned_keys_aggregated() {
+        // bead_id=bd-3t3.10: gc_tick aggregates pruned_keys from all pages.
+        let mut arena = VersionArena::new();
+        let mut chain_heads = HashMap::with_hasher(PageNumberBuildHasher::default());
+        let mut todo = GcTodo::new();
+
+        // 3 pages, each with 5 versions.
+        for i in 1..=3 {
+            let pgno = PageNumber::new(i).unwrap();
+            let (head, _) = build_chain(&mut arena, pgno, 5);
+            chain_heads.insert(pgno, head);
+            todo.enqueue(pgno);
+        }
+
+        // Horizon at 3: free versions 1,2 per page = 6 total pruned keys.
+        let result = gc_tick(&mut todo, CommitSeq::new(3), &mut arena, &mut chain_heads);
+
+        assert_eq!(result.versions_freed, 6);
+        assert_eq!(
+            result.pruned_keys.len(),
+            6,
+            "bead_id=bd-3t3.10: gc_tick should aggregate 6 pruned keys (2 per page × 3 pages)"
+        );
+
+        // Verify all 3 pages are represented.
+        let page_nums: HashSet<u32> = result.pruned_keys.iter().map(|(pn, _)| pn.get()).collect();
+        assert!(page_nums.contains(&1));
+        assert!(page_nums.contains(&2));
+        assert!(page_nums.contains(&3));
     }
 
     #[test]
