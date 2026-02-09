@@ -445,6 +445,7 @@ dependencies = [
  "fsqlite-vfs",
  "fsqlite-wal",
  "tracing",
+ "xxhash-rust",
 ]
 
 [[package]]
@@ -557,6 +558,7 @@ dependencies = [
  "serde_json",
  "smallvec",
  "tracing",
+ "tracing-subscriber",
  "xxhash-rust",
 ]
 

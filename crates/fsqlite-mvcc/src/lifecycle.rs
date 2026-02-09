@@ -1156,7 +1156,9 @@ impl std::fmt::Debug for TransactionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io;
     use std::sync::Arc;
+    use std::sync::Mutex;
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
@@ -1182,6 +1184,60 @@ mod tests {
         let mut data = PageData::zeroed(PageSize::DEFAULT);
         data.as_bytes_mut()[0] = byte;
         data
+    }
+
+    fn test_i64(v: i64) -> PageData {
+        let mut data = PageData::zeroed(PageSize::DEFAULT);
+        data.as_bytes_mut()[..8].copy_from_slice(&v.to_le_bytes());
+        data
+    }
+
+    fn decode_i64(data: &PageData) -> i64 {
+        let mut bytes = [0_u8; 8];
+        bytes.copy_from_slice(&data.as_bytes()[..8]);
+        i64::from_le_bytes(bytes)
+    }
+
+    #[derive(Clone)]
+    struct BufMakeWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for BufMakeWriter {
+        type Writer = BufWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            BufWriter(Arc::clone(&self.0))
+        }
+    }
+
+    struct BufWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for BufWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            let mut guard = self.0.lock().expect("log buffer lock");
+            guard.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn with_tracing_capture<F, R>(f: F) -> (R, String)
+    where
+        F: FnOnce() -> R,
+    {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(BufMakeWriter(Arc::clone(&buf)))
+            .finish();
+
+        let result = tracing::subscriber::with_default(subscriber, f);
+        let bytes = buf.lock().expect("log buffer lock").clone();
+        (result, String::from_utf8_lossy(&bytes).to_string())
     }
 
     // -----------------------------------------------------------------------
@@ -4058,6 +4114,263 @@ mod tests {
         assert!(
             seq > CommitSeq::ZERO,
             "OFF-at-BEGIN must tolerate write skew"
+        );
+    }
+
+    // ===================================================================
+    // bd-iwu.4 — Write Skew Detection Test Suite (§2.3)
+    // ===================================================================
+
+    #[test]
+    fn test_write_skew_sum_constraint() {
+        // §2.3 canonical example: A=50, B=50, constraint sum>=0.
+        // T1 reads (A,B)=(50,50), writes A=-40 (withdraw 90).
+        // T2 reads (A,B)=(50,50), writes B=-40 (withdraw 90).
+        // Under SSI: one must abort.
+        let m = mgr();
+        let pa = PageNumber::new(1).unwrap();
+        let pb = PageNumber::new(2).unwrap();
+
+        // Seed: A=50, B=50 (represented as first byte).
+        let mut setup = m.begin(BeginKind::Immediate).unwrap();
+        m.write_page(&mut setup, pa, test_data(50)).unwrap();
+        m.write_page(&mut setup, pb, test_data(50)).unwrap();
+        m.commit(&mut setup).unwrap();
+
+        // T1: reads both, writes A.
+        let mut t1 = m.begin(BeginKind::Concurrent).unwrap();
+        let _ = m.read_page(&mut t1, pa);
+        let _ = m.read_page(&mut t1, pb);
+        m.write_page(&mut t1, pa, test_data(0xD8)).unwrap(); // -40 as u8
+
+        // T2: reads both, writes B.
+        let mut t2 = m.begin(BeginKind::Concurrent).unwrap();
+        let _ = m.read_page(&mut t2, pa);
+        let _ = m.read_page(&mut t2, pb);
+        m.write_page(&mut t2, pb, test_data(0xD8)).unwrap(); // -40 as u8
+
+        // Simulate SSI witness flags (the witness plane would set these):
+        // T1 has out_rw (wrote A which T2 read) and in_rw (read B which T2 writes).
+        t1.has_in_rw = true;
+        t1.has_out_rw = true;
+        // T2 has symmetric flags.
+        t2.has_in_rw = true;
+        t2.has_out_rw = true;
+
+        // Under SSI, both have dangerous structure — first to commit fails.
+        let r1 = m.commit(&mut t1);
+        assert_eq!(
+            r1.unwrap_err(),
+            MvccError::BusySnapshot,
+            "write skew: T1 must abort (sum constraint preserved)"
+        );
+
+        // T2 also has dangerous structure (abort here too, unless you want
+        // to only abort one — in practice the first-to-commit check catches one).
+        let r2 = m.commit(&mut t2);
+        assert_eq!(
+            r2.unwrap_err(),
+            MvccError::BusySnapshot,
+            "write skew: T2 must also abort (both have dangerous structure)"
+        );
+    }
+
+    #[test]
+    fn test_write_skew_mutual_exclusion() {
+        // T1 reads A, writes B. T2 reads B, writes A.
+        // Both see pre-transaction state. Under SSI, one must abort.
+        let m = mgr();
+        let pa = PageNumber::new(10).unwrap();
+        let pb = PageNumber::new(11).unwrap();
+
+        let mut setup = m.begin(BeginKind::Immediate).unwrap();
+        m.write_page(&mut setup, pa, test_data(0x10)).unwrap();
+        m.write_page(&mut setup, pb, test_data(0x20)).unwrap();
+        m.commit(&mut setup).unwrap();
+
+        let mut t1 = m.begin(BeginKind::Concurrent).unwrap();
+        let _ = m.read_page(&mut t1, pa); // T1 reads A
+        m.write_page(&mut t1, pb, test_data(0x21)).unwrap(); // T1 writes B
+
+        let mut t2 = m.begin(BeginKind::Concurrent).unwrap();
+        let _ = m.read_page(&mut t2, pb); // T2 reads B
+        m.write_page(&mut t2, pa, test_data(0x11)).unwrap(); // T2 writes A
+
+        // T1: in_rw (T2 writes A, which T1 read), out_rw (T1 writes B, which T2 read).
+        t1.has_in_rw = true;
+        t1.has_out_rw = true;
+
+        let r1 = m.commit(&mut t1);
+        assert_eq!(
+            r1.unwrap_err(),
+            MvccError::BusySnapshot,
+            "mutual exclusion write skew: T1 must be aborted"
+        );
+    }
+
+    #[test]
+    fn test_write_skew_three_way() {
+        // T1 reads P1, writes P2.
+        // T2 reads P2, writes P3.
+        // T3 reads P3, writes P1.
+        // Cycle: T1→T2→T3→T1. Under SSI, at least one aborts.
+        let m = mgr();
+        let p1 = PageNumber::new(20).unwrap();
+        let p2 = PageNumber::new(21).unwrap();
+        let p3 = PageNumber::new(22).unwrap();
+
+        let mut setup = m.begin(BeginKind::Immediate).unwrap();
+        m.write_page(&mut setup, p1, test_data(0x01)).unwrap();
+        m.write_page(&mut setup, p2, test_data(0x02)).unwrap();
+        m.write_page(&mut setup, p3, test_data(0x03)).unwrap();
+        m.commit(&mut setup).unwrap();
+
+        let mut t1 = m.begin(BeginKind::Concurrent).unwrap();
+        let _ = m.read_page(&mut t1, p1);
+        m.write_page(&mut t1, p2, test_data(0x12)).unwrap();
+
+        let mut t2 = m.begin(BeginKind::Concurrent).unwrap();
+        let _ = m.read_page(&mut t2, p2);
+        m.write_page(&mut t2, p3, test_data(0x23)).unwrap();
+
+        let mut t3 = m.begin(BeginKind::Concurrent).unwrap();
+        let _ = m.read_page(&mut t3, p3);
+        m.write_page(&mut t3, p1, test_data(0x31)).unwrap();
+
+        // In a 3-way cycle, the "pivot" transactions have both edges.
+        // At page-SSI granularity, all three are pivots.
+        t1.has_in_rw = true;
+        t1.has_out_rw = true;
+        t2.has_in_rw = true;
+        t2.has_out_rw = true;
+        t3.has_in_rw = true;
+        t3.has_out_rw = true;
+
+        // At least one must abort. With all having dangerous structure, all abort.
+        let mut aborted = 0_u32;
+        if m.commit(&mut t1).is_err() {
+            aborted += 1;
+        }
+        if m.commit(&mut t2).is_err() {
+            aborted += 1;
+        }
+        if m.commit(&mut t3).is_err() {
+            aborted += 1;
+        }
+        assert!(
+            aborted >= 1,
+            "three-way write skew: at least one transaction must abort"
+        );
+    }
+
+    #[test]
+    fn test_write_skew_read_only_anomaly() {
+        // Fekete 2005: read-only transaction anomaly.
+        // Read-only transactions should never be aborted by SSI.
+        let m = mgr();
+        let pgno = PageNumber::new(30).unwrap();
+
+        let mut setup = m.begin(BeginKind::Immediate).unwrap();
+        m.write_page(&mut setup, pgno, test_data(0x01)).unwrap();
+        m.commit(&mut setup).unwrap();
+
+        // Read-only transaction: only reads, no writes.
+        let mut reader = m.begin(BeginKind::Concurrent).unwrap();
+        let data = m.read_page(&mut reader, pgno);
+        assert!(data.is_some());
+
+        // Reader has no writes, so no dangerous structure possible.
+        assert!(
+            !reader.has_dangerous_structure(),
+            "read-only txn cannot have dangerous structure"
+        );
+
+        // Commit should succeed (read-only).
+        let seq = m.commit(&mut reader).unwrap();
+        assert_eq!(
+            seq,
+            CommitSeq::ZERO,
+            "read-only commit returns ZERO seq (no writes published)"
+        );
+    }
+
+    #[test]
+    fn test_no_write_skew_under_serialized_mode() {
+        // Under BEGIN IMMEDIATE (Layer 1), writers are serialized.
+        // Write skew is impossible because only one writer is active.
+        let m = mgr();
+        let pa = PageNumber::new(40).unwrap();
+        let pb = PageNumber::new(41).unwrap();
+
+        let mut setup = m.begin(BeginKind::Immediate).unwrap();
+        m.write_page(&mut setup, pa, test_data(50)).unwrap();
+        m.write_page(&mut setup, pb, test_data(50)).unwrap();
+        m.commit(&mut setup).unwrap();
+
+        // T1 (serialized): reads both, writes A.
+        let mut t1 = m.begin(BeginKind::Immediate).unwrap();
+        let _ = m.read_page(&mut t1, pa);
+        let _ = m.read_page(&mut t1, pb);
+        m.write_page(&mut t1, pa, test_data(0xD8)).unwrap();
+
+        // T2 cannot even begin IMMEDIATE while T1 holds the mutex.
+        assert_eq!(
+            m.begin(BeginKind::Immediate).unwrap_err(),
+            MvccError::Busy,
+            "serialized mode prevents concurrent writers entirely"
+        );
+
+        m.commit(&mut t1).unwrap();
+
+        // After T1 commits, T2 can proceed and sees T1's changes.
+        let mut t2 = m.begin(BeginKind::Immediate).unwrap();
+        let a = m.read_page(&mut t2, pa).unwrap();
+        assert_eq!(
+            a.as_bytes()[0],
+            0xD8,
+            "T2 sees T1's committed data — no write skew possible"
+        );
+        m.commit(&mut t2).unwrap();
+    }
+
+    #[test]
+    fn test_write_skew_with_indexes() {
+        // Write skew involving "indexed lookups" — at the MVCC layer, this
+        // means reads and writes to different pages where the index page is
+        // shared (both txns traverse it). This creates rw-antidependency.
+        let m = mgr();
+        let idx_page = PageNumber::new(50).unwrap(); // shared index page
+        let data_a = PageNumber::new(51).unwrap();
+        let data_b = PageNumber::new(52).unwrap();
+
+        let mut setup = m.begin(BeginKind::Immediate).unwrap();
+        m.write_page(&mut setup, idx_page, test_data(0xFF)).unwrap();
+        m.write_page(&mut setup, data_a, test_data(0x0A)).unwrap();
+        m.write_page(&mut setup, data_b, test_data(0x0B)).unwrap();
+        m.commit(&mut setup).unwrap();
+
+        // T1: reads index page + data_a, writes data_b.
+        let mut t1 = m.begin(BeginKind::Concurrent).unwrap();
+        let _ = m.read_page(&mut t1, idx_page);
+        let _ = m.read_page(&mut t1, data_a);
+        m.write_page(&mut t1, data_b, test_data(0x1B)).unwrap();
+
+        // T2: reads index page + data_b, writes data_a.
+        let mut t2 = m.begin(BeginKind::Concurrent).unwrap();
+        let _ = m.read_page(&mut t2, idx_page);
+        let _ = m.read_page(&mut t2, data_b);
+        m.write_page(&mut t2, data_a, test_data(0x2A)).unwrap();
+
+        // Index witness captures the conflict: both read the shared index page,
+        // and each writes to a data page the other depends on.
+        t1.has_in_rw = true;
+        t1.has_out_rw = true;
+
+        let result = m.commit(&mut t1);
+        assert_eq!(
+            result.unwrap_err(),
+            MvccError::BusySnapshot,
+            "indexed write skew must be detected"
         );
     }
 }
