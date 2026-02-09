@@ -3,6 +3,8 @@ pub mod shm;
 pub mod traits;
 #[cfg(unix)]
 pub mod unix;
+#[cfg(target_os = "windows")]
+pub mod windows;
 
 /// Host filesystem helpers that are allowed to use `std::fs`.
 ///
@@ -76,3 +78,5 @@ pub use shm::ShmRegion;
 pub use traits::{Vfs, VfsFile};
 #[cfg(unix)]
 pub use unix::{UnixFile, UnixVfs};
+#[cfg(target_os = "windows")]
+pub use windows::{WindowsFile, WindowsVfs};

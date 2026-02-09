@@ -5,7 +5,7 @@ use asupersync::types::Budget;
 use fsqlite_harness::fslab::FsLab;
 use fsqlite_mvcc::{
     ConformalCalibratorConfig, ConformalOracleCalibrator, InvariantScore, OracleReport, Section,
-    check_sheaf_consistency,
+    check_sheaf_consistency, check_sheaf_consistency_with_chains,
 };
 
 const BEAD_ID: &str = "bd-3go.6";
@@ -48,6 +48,22 @@ fn make_inconsistent_sections(seed: u64) -> Vec<Section> {
     }
 
     sections
+}
+
+fn make_global_version_chains(seed: u64) -> HashMap<u64, Vec<u64>> {
+    let base_version = (seed % 10_000).wrapping_mul(10);
+    (1_u64..=5_u64)
+        .map(|page| {
+            (
+                page,
+                vec![
+                    base_version + page - 1,
+                    base_version + page,
+                    base_version + page + 1,
+                ],
+            )
+        })
+        .collect()
 }
 
 fn run_lab_with_20_concurrent_txns(seed: u64) {
@@ -118,7 +134,8 @@ fn test_e2e_sheaf_plus_conformal_mvcc_verification() {
         run_lab_with_20_concurrent_txns(seed);
 
         let sections = make_consistent_sections(seed);
-        let sheaf_result = check_sheaf_consistency(&sections, None);
+        let chains = make_global_version_chains(seed);
+        let sheaf_result = check_sheaf_consistency_with_chains(&sections, &chains);
         assert!(
             sheaf_result.is_consistent(),
             "bead_id={BEAD_ID} seed={seed} expected sheaf-consistent sections"
@@ -161,10 +178,20 @@ fn test_e2e_sheaf_plus_conformal_mvcc_verification() {
     );
 
     let inconsistent_sections = make_inconsistent_sections(0x0BAD_5EED);
-    let inconsistent_result = check_sheaf_consistency(&inconsistent_sections, None);
+    let inconsistent_result = check_sheaf_consistency_with_chains(
+        &inconsistent_sections,
+        &make_global_version_chains(0x0BAD_5EED),
+    );
     assert!(
         !inconsistent_result.is_consistent(),
         "bead_id={BEAD_ID} injected inconsistency must be detected"
+    );
+
+    // Keep strict-mode coverage for the original API (no explicit chain metadata).
+    let strict_result = check_sheaf_consistency(&inconsistent_sections, None);
+    assert!(
+        !strict_result.is_consistent(),
+        "bead_id={BEAD_ID} strict sheaf check must still detect mismatch"
     );
 
     let anomaly_prediction = calibrator

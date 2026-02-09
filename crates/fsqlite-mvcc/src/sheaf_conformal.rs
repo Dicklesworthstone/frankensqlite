@@ -114,6 +114,72 @@ pub fn check_sheaf_consistency(
     }
 }
 
+/// Check sheaf consistency using explicit global version chains per page.
+///
+/// This is a convenience adapter for the canonical sheaf check when the caller
+/// has concrete version-chain metadata:
+/// `page_number -> ordered [version_id]`.
+///
+/// A pair of overlapping observations is considered consistent when:
+/// - both transactions observed the same version on that page, or
+/// - both observed versions exist in that page's global version chain.
+///
+/// If either observed version is absent from the page chain, the overlap is
+/// treated as an obstruction.
+#[must_use]
+pub fn check_sheaf_consistency_with_chains(
+    sections: &[Section],
+    global_version_chains: &HashMap<u64, Vec<u64>>,
+) -> SheafResult {
+    check_sheaf_consistency_with_chains_hasher(sections, global_version_chains)
+}
+
+/// Internal generic form to keep the public API ergonomic while avoiding
+/// hasher-specific assumptions.
+#[must_use]
+pub fn check_sheaf_consistency_with_chains_hasher<S: std::hash::BuildHasher>(
+    sections: &[Section],
+    global_version_chains: &HashMap<u64, Vec<u64>, S>,
+) -> SheafResult {
+    let mut obstructions = Vec::new();
+
+    for i in 0..sections.len() {
+        for j in (i + 1)..sections.len() {
+            let a = &sections[i];
+            let b = &sections[j];
+
+            for (&page, &ver_a) in &a.observations {
+                let Some(&ver_b) = b.observations.get(&page) else {
+                    continue;
+                };
+
+                let consistent = if ver_a == ver_b {
+                    true
+                } else {
+                    global_version_chains
+                        .get(&page)
+                        .is_some_and(|chain| chain.contains(&ver_a) && chain.contains(&ver_b))
+                };
+
+                if !consistent {
+                    obstructions.push(SheafObstruction {
+                        page,
+                        txn_a: a.txn_id,
+                        version_a: ver_a,
+                        txn_b: b.txn_id,
+                        version_b: ver_b,
+                    });
+                }
+            }
+        }
+    }
+
+    SheafResult {
+        consistent: obstructions.is_empty(),
+        obstructions,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // §4.7 Conformal calibrator
 // ---------------------------------------------------------------------------
@@ -426,6 +492,49 @@ mod tests {
             result.is_consistent(),
             "bead_id={BEAD_ID} ordered_versions_consistent"
         );
+    }
+
+    #[test]
+    fn test_sheaf_consistency_with_global_version_chain() {
+        let sections = vec![
+            Section {
+                txn_id: 1,
+                observations: std::iter::once((10, 100)).collect(),
+            },
+            Section {
+                txn_id: 2,
+                observations: std::iter::once((10, 200)).collect(),
+            },
+        ];
+
+        let chains = HashMap::from([(10_u64, vec![50_u64, 100_u64, 200_u64, 300_u64])]);
+        let result = check_sheaf_consistency_with_chains(&sections, &chains);
+        assert!(
+            result.is_consistent(),
+            "bead_id={BEAD_ID} explicit_chain_consistent"
+        );
+    }
+
+    #[test]
+    fn test_sheaf_consistency_with_chains_flags_unknown_version() {
+        let sections = vec![
+            Section {
+                txn_id: 1,
+                observations: std::iter::once((10, 100)).collect(),
+            },
+            Section {
+                txn_id: 2,
+                observations: std::iter::once((10, 9_999)).collect(),
+            },
+        ];
+
+        let chains = HashMap::from([(10_u64, vec![50_u64, 100_u64, 200_u64, 300_u64])]);
+        let result = check_sheaf_consistency_with_chains(&sections, &chains);
+        assert!(
+            !result.is_consistent(),
+            "bead_id={BEAD_ID} explicit_chain_unknown_version"
+        );
+        assert_eq!(result.obstructions.len(), 1);
     }
 
     #[test]
