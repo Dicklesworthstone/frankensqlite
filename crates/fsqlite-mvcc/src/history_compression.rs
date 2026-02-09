@@ -1344,13 +1344,14 @@ mod tests {
 
     // -- Test 3: §5.10.7 Independence relation --
 
+    #[allow(clippy::too_many_lines)]
     #[test]
     fn test_intent_independence_relation() {
         let t1 = TableId::new(1);
         let t2 = TableId::new(2);
 
         // Two inserts on different tables, different keys → independent.
-        let a = make_op_with_writes(
+        let insert_table1 = make_op_with_writes(
             1,
             IntentOpKind::Insert {
                 table: t1,
@@ -1359,7 +1360,7 @@ mod tests {
             },
             vec![table_key(1, 10)],
         );
-        let b = make_op_with_writes(
+        let insert_table2 = make_op_with_writes(
             1,
             IntentOpKind::Insert {
                 table: t2,
@@ -1368,10 +1369,10 @@ mod tests {
             },
             vec![table_key(2, 20)],
         );
-        assert!(are_intent_ops_independent(&a, &b));
+        assert!(are_intent_ops_independent(&insert_table1, &insert_table2));
 
         // Two inserts on same table, same key → NOT independent (write overlap).
-        let c = make_op_with_writes(
+        let insert_same_key = make_op_with_writes(
             1,
             IntentOpKind::Insert {
                 table: t1,
@@ -1380,10 +1381,13 @@ mod tests {
             },
             vec![table_key(1, 10)],
         );
-        assert!(!are_intent_ops_independent(&a, &c));
+        assert!(!are_intent_ops_independent(
+            &insert_table1,
+            &insert_same_key
+        ));
 
         // Different schema epochs → NOT independent.
-        let d = make_op_with_writes(
+        let different_epoch = make_op_with_writes(
             2,
             IntentOpKind::Insert {
                 table: t2,
@@ -1392,10 +1396,13 @@ mod tests {
             },
             vec![table_key(2, 30)],
         );
-        assert!(!are_intent_ops_independent(&a, &d));
+        assert!(!are_intent_ops_independent(
+            &insert_table1,
+            &different_epoch
+        ));
 
         // Structural effects → NOT independent.
-        let e = IntentOp {
+        let structural_insert = IntentOp {
             schema_epoch: 1,
             footprint: IntentFootprint {
                 reads: Vec::new(),
@@ -1408,13 +1415,16 @@ mod tests {
                 record: vec![],
             },
         };
-        assert!(!are_intent_ops_independent(&a, &e));
+        assert!(!are_intent_ops_independent(
+            &insert_table1,
+            &structural_insert
+        ));
 
         // Write/Read overlap → NOT independent.
-        let f = IntentOp {
+        let read_write_overlap = IntentOp {
             schema_epoch: 1,
             footprint: IntentFootprint {
-                reads: vec![table_key(1, 10)], // reads what `a` writes
+                reads: vec![table_key(1, 10)], // reads what `insert_table1` writes
                 writes: vec![table_key(2, 50)],
                 structural: StructuralEffects::NONE,
             },
@@ -1424,7 +1434,10 @@ mod tests {
                 new_record: vec![],
             },
         };
-        assert!(!are_intent_ops_independent(&a, &f));
+        assert!(!are_intent_ops_independent(
+            &insert_table1,
+            &read_write_overlap
+        ));
 
         // Index ops on different indices → independent.
         let idx_a = make_op_with_writes(
@@ -1464,7 +1477,7 @@ mod tests {
         let key = RowId::new(100);
 
         // Disjoint columns → independent.
-        let a = make_op(
+        let update_col0 = make_op(
             1,
             IntentOpKind::UpdateExpression {
                 table: t1,
@@ -1475,7 +1488,7 @@ mod tests {
                 )],
             },
         );
-        let b = make_op(
+        let update_col1 = make_op(
             1,
             IntentOpKind::UpdateExpression {
                 table: t1,
@@ -1486,10 +1499,10 @@ mod tests {
                 )],
             },
         );
-        assert!(are_intent_ops_independent(&a, &b));
+        assert!(are_intent_ops_independent(&update_col0, &update_col1));
 
         // Overlapping columns (not join-max) → NOT independent.
-        let c = make_op(
+        let overlapping_col0 = make_op(
             1,
             IntentOpKind::UpdateExpression {
                 table: t1,
@@ -1500,10 +1513,10 @@ mod tests {
                 )],
             },
         );
-        assert!(!are_intent_ops_independent(&a, &c));
+        assert!(!are_intent_ops_independent(&update_col0, &overlapping_col0));
 
         // Different keys → fall through to general independence (independent).
-        let d = make_op(
+        let different_key_update = make_op(
             1,
             IntentOpKind::UpdateExpression {
                 table: t1,
@@ -1514,10 +1527,13 @@ mod tests {
                 )],
             },
         );
-        assert!(are_intent_ops_independent(&a, &d));
+        assert!(are_intent_ops_independent(
+            &update_col0,
+            &different_key_update
+        ));
 
         // UpdateExpression + materialized Update on same key → NOT independent.
-        let e = make_op(
+        let materialized_update = make_op(
             1,
             IntentOpKind::Update {
                 table: t1,
@@ -1525,11 +1541,14 @@ mod tests {
                 new_record: vec![1, 2, 3],
             },
         );
-        assert!(!are_intent_ops_independent(&a, &e));
+        assert!(!are_intent_ops_independent(
+            &update_col0,
+            &materialized_update
+        ));
 
         // UpdateExpression + Delete on same key → NOT independent.
-        let f = make_op(1, IntentOpKind::Delete { table: t1, key });
-        assert!(!are_intent_ops_independent(&a, &f));
+        let delete_same_key = make_op(1, IntentOpKind::Delete { table: t1, key });
+        assert!(!are_intent_ops_independent(&update_col0, &delete_same_key));
     }
 
     // -- Test 5: §5.10.7 Join-max-int-update recognition --
@@ -1592,8 +1611,8 @@ mod tests {
         assert!(!is_join_max_int_update(col, &expr5));
 
         // Multiple join-max updates collapse correctly.
-        let exprs: Vec<&RebaseExpr> = vec![&expr1, &expr2];
-        let collapsed = collapse_join_max_updates(col, &exprs).unwrap();
+        let expressions: Vec<&RebaseExpr> = vec![&expr1, &expr2];
+        let collapsed = collapse_join_max_updates(col, &expressions).unwrap();
         // max(100, 200) = 200.
         if let RebaseExpr::FunctionCall { args, .. } = &collapsed {
             assert!(matches!(
@@ -1610,7 +1629,7 @@ mod tests {
             IntentOpKind::UpdateExpression {
                 table: TableId::new(1),
                 key: RowId::new(1),
-                column_updates: vec![(col, expr1.clone())],
+                column_updates: vec![(col, expr1)],
             },
         );
         let op_b = make_op(
@@ -1618,7 +1637,7 @@ mod tests {
             IntentOpKind::UpdateExpression {
                 table: TableId::new(1),
                 key: RowId::new(1),
-                column_updates: vec![(col, expr2.clone())],
+                column_updates: vec![(col, expr2)],
             },
         );
         assert!(are_intent_ops_independent(&op_a, &op_b));
@@ -1651,7 +1670,7 @@ mod tests {
 
         let page_bytes = vec![0xAA; 4096];
         let pgno = PageNumber::new(3).unwrap();
-        let affected_pages = vec![(pgno, page_bytes.clone())];
+        let affected_pages = vec![(pgno, page_bytes)];
         let btree_hash = blake3::hash(b"btree_invariant_ok");
         let mut btree_inv_hash = [0u8; 16];
         btree_inv_hash.copy_from_slice(&btree_hash.as_bytes()[..16]);
