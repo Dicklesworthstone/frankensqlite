@@ -305,7 +305,7 @@ impl SsiFpMonitor {
         };
 
         // Multiplicative update: e_t = e_{t-1} * (1 + lambda * (X_t - p0))
-        let factor = 1.0 + self.config.lambda * (x - self.config.p0);
+        let factor = self.config.lambda.mul_add(x - self.config.p0, 1.0);
         self.e_value = (self.e_value * factor).min(self.config.max_evalue);
 
         // Clamp below 0 (can happen if p0 > 0 and we observe true positive).
@@ -551,9 +551,7 @@ mod tests {
         let lm = LossMatrix::default();
         // Even tiny P(anomaly) exceeds threshold (1/1001 ~ 0.001).
         let p_anomaly = 0.01; // 1% chance — well above threshold.
-        let envelope = AbortDecisionEnvelope::evaluate(
-            true, true, p_anomaly, lm, None,
-        );
+        let envelope = AbortDecisionEnvelope::evaluate(true, true, p_anomaly, lm, None);
         assert_eq!(
             envelope.decision,
             AbortDecision::Abort,
@@ -576,10 +574,7 @@ mod tests {
             monitor.e_value(),
             monitor.rejection_threshold()
         );
-        assert!(
-            !monitor.alert_triggered(),
-            "bead_id={BEAD_ID} no_alert"
-        );
+        assert!(!monitor.alert_triggered(), "bead_id={BEAD_ID} no_alert");
     }
 
     #[test]
@@ -618,10 +613,7 @@ mod tests {
         assert!(cal.is_calibrated());
         let ub = cal.upper_bound().expect("calibrated");
         // Upper bound should be around 0.05.
-        assert!(
-            ub >= 0.04,
-            "bead_id={BEAD_ID} upper_bound={ub}"
-        );
+        assert!(ub >= 0.04, "bead_id={BEAD_ID} upper_bound={ub}");
 
         // New observation within band.
         assert_eq!(
@@ -666,9 +658,7 @@ mod tests {
                 duration_us: 10_000,
             },
         );
-        let envelope = AbortDecisionEnvelope::evaluate(
-            true, true, 0.5, lm, Some(victim),
-        );
+        let envelope = AbortDecisionEnvelope::evaluate(true, true, 0.5, lm, Some(victim));
 
         // All required fields present.
         assert!(envelope.has_in_rw);

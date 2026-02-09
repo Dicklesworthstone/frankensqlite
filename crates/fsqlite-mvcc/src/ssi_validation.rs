@@ -1457,11 +1457,9 @@ mod tests {
         let page_b = page_key(20);
 
         // T1 as active reader (reads A,B)
-        let _t1_view =
-            MockActiveTxn::new(1, 0, 1).with_reads(vec![page_a.clone(), page_b.clone()]);
+        let _t1_view = MockActiveTxn::new(1, 0, 1).with_reads(vec![page_a.clone(), page_b.clone()]);
         // T2 as active reader (reads A,B)
-        let t2_view =
-            MockActiveTxn::new(2, 0, 1).with_reads(vec![page_a.clone(), page_b.clone()]);
+        let t2_view = MockActiveTxn::new(2, 0, 1).with_reads(vec![page_a.clone(), page_b.clone()]);
 
         // T1 commits first: writes A. T2 is active reader of A → incoming edge.
         // No outgoing edge for T1 (nobody is writing to B yet).

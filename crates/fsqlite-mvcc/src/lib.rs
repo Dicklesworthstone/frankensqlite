@@ -17,12 +17,13 @@ pub mod lifecycle;
 pub mod rowid_alloc;
 pub mod shared_lock_table;
 pub mod shm;
+pub mod ssi_abort_policy;
 pub mod ssi_validation;
 pub mod witness_hierarchy;
-pub mod witness_refinement;
 pub mod witness_objects;
 pub mod witness_plane;
 pub mod witness_publication;
+pub mod witness_refinement;
 pub mod xor_delta;
 
 pub use cache_aligned::{
@@ -63,6 +64,10 @@ pub use shared_lock_table::{
     RebuildResult as SharedRebuildResult, SharedPageLockTable,
 };
 pub use shm::{SharedMemoryLayout, ShmSnapshot};
+pub use ssi_abort_policy::{
+    AbortDecision, AbortDecisionEnvelope, ConformalCalibrator, ConformalConfig, CycleStatus,
+    LossMatrix, SsiFpMonitor, SsiFpMonitorConfig, TxnCost, Victim, VictimDecision, select_victim,
+};
 pub use ssi_validation::{
     ActiveTxnView, CommittedReaderInfo, CommittedWriterInfo, DiscoveredEdge, SsiAbortReason,
     SsiBusySnapshot, SsiState, SsiValidationOk, discover_incoming_edges, discover_outgoing_edges,
@@ -80,14 +85,14 @@ pub use witness_objects::{
     WitnessParticipation, WriteKind, cold_plane_refine, hot_plane_discover,
 };
 pub use witness_plane::{WitnessSet, validate_txn_token, witness_keys_overlap};
-pub use witness_refinement::{
-    RefinementBudget, RefinementDecision, RefinementPriority, RefinementResult, VoiMetrics,
-    refine_edges,
-};
 pub use witness_publication::{
     ActiveSlotSnapshot, CommitMarkerStore, CommittedPublication, DefaultProofValidator,
     GcEligibility, ProofCarryingCommit, ProofCarryingValidator, PublicationError, PublicationPhase,
     ReservationId, ReservationToken, ValidationVerdict, WitnessGcCoordinator, WitnessPublisher,
+};
+pub use witness_refinement::{
+    RefinementBudget, RefinementDecision, RefinementPriority, RefinementResult, VoiMetrics,
+    refine_edges,
 };
 pub use xor_delta::{
     DEFAULT_DELTA_THRESHOLD_PCT, DELTA_FIXED_OVERHEAD_BYTES, DELTA_HEADER_BYTES, DELTA_MAGIC,

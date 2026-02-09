@@ -59,6 +59,10 @@ spec_review_findings.md
 # NOTE: `ANALYSIS_OF_SPEC_DOC_DIFFS.md` and `spec_evolution_data_v1.json.gz` are intentionally tracked:
 # they are required inputs for the spec-evolution visualization.
 
+# Local scratch SQLite DBs (never tracked)
+storage.sqlite3
+storage.sqlite3-*
+
 # bv (beads viewer) local config and caches
 .bv/
 

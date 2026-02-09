@@ -6,8 +6,8 @@ pub mod traits;
 
 pub use arc_cache::{ArcCache, ArcCacheInner, CacheKey, CacheLookup, CachedPage};
 pub use encrypt::{
-    Argon2Params, DatabaseId, EncryptError, KeyManager, PageEncryptor, validate_reserved_bytes,
-    DATABASE_ID_SIZE, ENCRYPTION_RESERVED_BYTES, KEY_SIZE, NONCE_SIZE, TAG_SIZE,
+    Argon2Params, DATABASE_ID_SIZE, DatabaseId, ENCRYPTION_RESERVED_BYTES, EncryptError, KEY_SIZE,
+    KeyManager, NONCE_SIZE, PageEncryptor, TAG_SIZE, validate_reserved_bytes,
 };
 pub use page_buf::{PageBuf, PageBufPool};
 pub use page_cache::PageCache;

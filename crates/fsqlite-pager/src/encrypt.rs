@@ -223,11 +223,7 @@ impl PageEncryptor {
     /// Reads the nonce and tag from the reserved region, decrypts, and zeros
     /// the reserved region.  Returns [`EncryptError::AuthenticationFailed`] if
     /// the key is wrong, data is corrupt, or the AAD doesn't match.
-    pub fn decrypt_page(
-        &self,
-        page: &mut [u8],
-        page_number: u32,
-    ) -> Result<(), EncryptError> {
+    pub fn decrypt_page(&self, page: &mut [u8], page_number: u32) -> Result<(), EncryptError> {
         let reserved = usize::from(ENCRYPTION_RESERVED_BYTES);
         let page_len = page.len();
         if page_len < reserved {
@@ -570,7 +566,7 @@ mod tests {
         assert_ne!(nonce_a, nonce_b, "test nonces must differ");
 
         let mut page_a = original.clone();
-        let mut page_b = original.clone();
+        let mut page_b = original;
         enc.encrypt_page(&mut page_a, 1, &nonce_a).unwrap();
         enc.encrypt_page(&mut page_b, 1, &nonce_b).unwrap();
 

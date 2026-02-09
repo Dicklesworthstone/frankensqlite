@@ -282,7 +282,10 @@ fn estimate_summary_bytes(summary: &KeySummary) -> usize {
         KeySummary::PageBitmap(pages) => pages.len() * 4,
         KeySummary::CellBitmap(cells) => cells.len() * 8,
         KeySummary::ByteRangeList(ranges) => ranges.len() * 8,
-        KeySummary::Chunked(chunks) => chunks.iter().map(|c| estimate_summary_bytes(&c.summary) + 4).sum(),
+        KeySummary::Chunked(chunks) => chunks
+            .iter()
+            .map(|c| estimate_summary_bytes(&c.summary) + 4)
+            .sum(),
     }
 }
 
@@ -291,9 +294,10 @@ fn summary_to_priority(summary: &KeySummary) -> RefinementPriority {
     match summary {
         KeySummary::CellBitmap(_) => RefinementPriority::CellBitmap,
         KeySummary::ByteRangeList(_) => RefinementPriority::ByteRangeList,
-        KeySummary::HashedKeySet(_) => RefinementPriority::HashedKeySet,
+        KeySummary::HashedKeySet(_) | KeySummary::PageBitmap(_) | KeySummary::Chunked(_) => {
+            RefinementPriority::HashedKeySet
+        }
         KeySummary::ExactKeys(_) => RefinementPriority::ExactKeys,
-        KeySummary::PageBitmap(_) | KeySummary::Chunked(_) => RefinementPriority::HashedKeySet,
     }
 }
 
@@ -304,8 +308,8 @@ fn summary_to_priority(summary: &KeySummary) -> RefinementPriority {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeSet;
     use fsqlite_types::{PageNumber, TxnEpoch, TxnId, TxnToken, WitnessKey};
+    use std::collections::BTreeSet;
 
     fn test_token(id: u64) -> TxnToken {
         TxnToken::new(TxnId::new(id).unwrap(), TxnEpoch::new(0))
@@ -349,11 +353,10 @@ mod tests {
 
     #[test]
     fn test_cell_level_reduces_false_positives() {
-        // Edge claims overlap at page 5, but cell-level refinement shows
-        // the actual cells don't overlap.
-        let in_edges = vec![make_edge(1, 2, 5)];
+        // Edge claims overlap at page 10, but cell-level refinement shows
+        // the actual cells are on a different page.
 
-        // Refinement: page 5 only has cells at (5 << 32) | 100.
+        // Refinement: page 10's CellBitmap has cells at (5 << 32) | 42,
         // The edge's overlap_key is Page(5), which has page number 5.
         // CellBitmap checks page membership: (5 << 32) to (5 << 32)|0xFFFFFFFF.
         // Page(5) has page=5, so CellBitmap will find the range contains cells.
@@ -362,7 +365,7 @@ mod tests {
 
         let refinements = vec![(
             10_u32,
-            KeySummary::CellBitmap(BTreeSet::from([(5_u64 << 32) | 42])), // cells on page 5, not page 10
+            KeySummary::CellBitmap(BTreeSet::from([(5_u64 << 32) | 0x2a])), // cells on page 5, not page 10
         )];
 
         let result = refine_edges(
@@ -372,7 +375,11 @@ mod tests {
             &RefinementBudget::v1_default(),
         );
         // CellBitmap for page 10 contains cells for page 5 → page 10 not found → eliminated.
-        assert_eq!(result.eliminated_edges.len(), 1, "cell refinement should eliminate false positive");
+        assert_eq!(
+            result.eliminated_edges.len(),
+            1,
+            "cell refinement should eliminate false positive"
+        );
         assert!(result.confirmed_edges.is_empty());
 
         // Without refinement: same edges pass through.
@@ -383,7 +390,11 @@ mod tests {
             &[], // no refinement
             &RefinementBudget::v1_default(),
         );
-        assert_eq!(result_no_refine.confirmed_edges.len(), 1, "without refinement, edge passes through");
+        assert_eq!(
+            result_no_refine.confirmed_edges.len(),
+            1,
+            "without refinement, edge passes through"
+        );
     }
 
     // -- §5.7.4 test 3: Refinement budget respected --
@@ -391,15 +402,11 @@ mod tests {
     #[test]
     fn test_refinement_budget_respected() {
         // Create edges with refinement data, but set a tiny budget.
-        let in_edges = vec![
-            make_edge(1, 2, 5),
-            make_edge(3, 4, 10),
-            make_edge(5, 6, 15),
-        ];
+        let in_edges = vec![make_edge(1, 2, 5), make_edge(3, 4, 10), make_edge(5, 6, 15)];
         let refinements = vec![
-            (5_u32, KeySummary::ExactKeys(vec![page_key(99)])),   // doesn't overlap page 5
-            (10_u32, KeySummary::ExactKeys(vec![page_key(99)])),  // doesn't overlap page 10
-            (15_u32, KeySummary::ExactKeys(vec![page_key(99)])),  // doesn't overlap page 15
+            (5_u32, KeySummary::ExactKeys(vec![page_key(99)])), // doesn't overlap page 5
+            (10_u32, KeySummary::ExactKeys(vec![page_key(99)])), // doesn't overlap page 10
+            (15_u32, KeySummary::ExactKeys(vec![page_key(99)])), // doesn't overlap page 15
         ];
 
         // Budget: only 1 bucket allowed.
@@ -409,7 +416,11 @@ mod tests {
         // Only 1 bucket refined (eliminated), rest pass through conservatively.
         assert_eq!(result.buckets_refined, 1);
         assert_eq!(result.eliminated_edges.len(), 1);
-        assert_eq!(result.confirmed_edges.len(), 2, "budget-exceeded edges pass through");
+        assert_eq!(
+            result.confirmed_edges.len(),
+            2,
+            "budget-exceeded edges pass through"
+        );
     }
 
     // -- §5.7.4 test 4: VOI metric computation --
@@ -417,16 +428,19 @@ mod tests {
     #[test]
     fn test_voi_metric_computation() {
         let metrics = VoiMetrics {
-            c_b: 10.0,        // 10 conflicts per unit time
-            fp_b: 0.8,        // 80% false positive rate
-            delta_fp_b: 0.7,  // refinement reduces FP by 70%
-            l_abort: 100.0,   // abort cost = 100 units
+            c_b: 10.0,           // 10 conflicts per unit time
+            fp_b: 0.8,           // 80% false positive rate
+            delta_fp_b: 0.7,     // refinement reduces FP by 70%
+            l_abort: 100.0,      // abort cost = 100 units
             cost_refine_b: 50.0, // refinement cost = 50 units
         };
 
         // Benefit = 10 * 0.7 * 100 = 700
         let benefit = metrics.benefit();
-        assert!((benefit - 700.0).abs() < 1e-10, "benefit = c_b * delta_fp_b * L_abort");
+        assert!(
+            (benefit - 700.0).abs() < 1e-10,
+            "benefit = c_b * delta_fp_b * L_abort"
+        );
 
         // VOI = 700 - 50 = 650
         let voi = metrics.voi();
@@ -441,7 +455,10 @@ mod tests {
             l_abort: 10.0,
             cost_refine_b: 100.0,
         };
-        assert!(expensive.voi() < 0.0, "negative VOI means refinement not worth it");
+        assert!(
+            expensive.voi() < 0.0,
+            "negative VOI means refinement not worth it"
+        );
     }
 
     // -- Soundness: disabling refinement never introduces false negatives --
@@ -450,13 +467,8 @@ mod tests {
     fn test_disabling_refinement_is_sound() {
         // With refinement disabled (no refinement data), all edges pass through.
         // This is always safe: over-approximation, never misses real conflicts.
-        let in_edges = vec![
-            make_edge(1, 2, 5),
-            make_edge(3, 4, 10),
-        ];
-        let out_edges = vec![
-            make_edge(2, 3, 7),
-        ];
+        let in_edges = vec![make_edge(1, 2, 5), make_edge(3, 4, 10)];
+        let out_edges = vec![make_edge(2, 3, 7)];
 
         let result = refine_edges(in_edges, out_edges, &[], &RefinementBudget::v1_default());
 
@@ -469,10 +481,7 @@ mod tests {
 
     #[test]
     fn test_byte_budget_enforcement() {
-        let in_edges = vec![
-            make_edge(1, 2, 5),
-            make_edge(3, 4, 10),
-        ];
+        let in_edges = vec![make_edge(1, 2, 5), make_edge(3, 4, 10)];
         // Each ExactKeys refinement costs 16 bytes per key.
         let refinements = vec![
             (5_u32, KeySummary::ExactKeys(vec![page_key(99)])),
