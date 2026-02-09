@@ -202,12 +202,7 @@ fn generate_schedule(seed: u64, txn_ids: &[u64]) -> Vec<u64> {
     order
 }
 
-fn generate_workload(
-    seed: u64,
-    txn_count: usize,
-    page_pool: u32,
-    overlap_pct: u8,
-) -> Vec<TxnSpec> {
+fn generate_workload(seed: u64, txn_count: usize, page_pool: u32, overlap_pct: u8) -> Vec<TxnSpec> {
     let mut state = seed;
     let mut out = Vec::with_capacity(txn_count);
     for idx in 0..txn_count {
@@ -216,17 +211,13 @@ fn generate_workload(
         let write_page = if hot_pick {
             1
         } else {
-            let page = (lcg_next(&mut state)
-                % u64::from(page_pool.saturating_sub(2).max(1)))
-                + 2;
+            let page = (lcg_next(&mut state) % u64::from(page_pool.saturating_sub(2).max(1))) + 2;
             u32::try_from(page).expect("page should fit u32")
         };
         let read_page = if hot_pick {
             2
         } else {
-            let page = (lcg_next(&mut state)
-                % u64::from(page_pool.saturating_sub(2).max(1)))
-                + 2;
+            let page = (lcg_next(&mut state) % u64::from(page_pool.saturating_sub(2).max(1))) + 2;
             u32::try_from(page).expect("page should fit u32")
         };
         let intent = if idx % 2 == 0 {
@@ -390,7 +381,12 @@ fn simulate_crash_mid_commit(
     crash_after_commits: usize,
 ) -> SimulationResult {
     let full = simulate_mvcc(txns, schedule, IsolationMode::Serializable, false);
-    let keep = full.committed.iter().take(crash_after_commits).copied().collect();
+    let keep = full
+        .committed
+        .iter()
+        .take(crash_after_commits)
+        .copied()
+        .collect();
     SimulationResult {
         committed: keep,
         aborted: full.aborted,
@@ -469,14 +465,20 @@ fn test_schedule_controller_replay() {
     let ids = (1_u64..=32).collect::<Vec<_>>();
     let s1 = generate_schedule(0xDEAD_BEEF, &ids);
     let s2 = generate_schedule(0xDEAD_BEEF, &ids);
-    assert_eq!(s1, s2, "bead_id={BEAD_ID} schedule replay must be deterministic");
+    assert_eq!(
+        s1, s2,
+        "bead_id={BEAD_ID} schedule replay must be deterministic"
+    );
 }
 
 #[test]
 fn test_metrics_aggregation() {
     let result = SimulationResult {
         committed: vec![1, 2, 3, 4],
-        aborted: vec![(5, AbortReason::PageConflict), (6, AbortReason::SsiWriteSkew)],
+        aborted: vec![
+            (5, AbortReason::PageConflict),
+            (6, AbortReason::SsiWriteSkew),
+        ],
         conflict_pages_by_txn: BTreeMap::from([(5, vec![2]), (6, vec![7])]),
         merged_txns: vec![4],
         deadlock_detected: false,
@@ -501,8 +503,8 @@ fn test_invariant_report_format() -> Result<(), String> {
         conflict_count: 8,
         no_deadlock: true,
     };
-    let value =
-        serde_json::to_value(&report).map_err(|error| format!("report_serialize_failed: {error}"))?;
+    let value = serde_json::to_value(&report)
+        .map_err(|error| format!("report_serialize_failed: {error}"))?;
     for key in [
         "schema_version",
         "run_id",
@@ -514,7 +516,9 @@ fn test_invariant_report_format() -> Result<(), String> {
         "no_deadlock",
     ] {
         if value.get(key).is_none() {
-            return Err(format!("bead_id={BEAD_ID} case=invariant_missing_key key={key}"));
+            return Err(format!(
+                "bead_id={BEAD_ID} case=invariant_missing_key key={key}"
+            ));
         }
     }
     let roundtrip: InvariantReport = serde_json::from_value(value)
@@ -621,7 +625,10 @@ fn test_e2e_two_writers_same_page_first_wins() {
     ];
     let result = simulate_mvcc(&txns, &[1, 2], IsolationMode::Serializable, false);
     assert_eq!(result.committed, vec![1]);
-    assert_eq!(result.aborted, vec![(2, AbortReason::NonCommutativeConflict)]);
+    assert_eq!(
+        result.aborted,
+        vec![(2, AbortReason::NonCommutativeConflict)]
+    );
 }
 
 #[test]
@@ -703,7 +710,10 @@ fn test_e2e_intent_log_rebase_after_conflict() {
         false,
     );
     assert_eq!(first.committed, vec![1]);
-    assert_eq!(first.aborted, vec![(2, AbortReason::NonCommutativeConflict)]);
+    assert_eq!(
+        first.aborted,
+        vec![(2, AbortReason::NonCommutativeConflict)]
+    );
 
     let rebased_retry = TxnSpec {
         txn_id: 3,
@@ -765,7 +775,10 @@ fn test_e2e_non_commutative_operations_abort() {
     ];
     let result = simulate_mvcc(&txns, &[1, 2], IsolationMode::Serializable, true);
     assert_eq!(result.committed, vec![1]);
-    assert_eq!(result.aborted, vec![(2, AbortReason::NonCommutativeConflict)]);
+    assert_eq!(
+        result.aborted,
+        vec![(2, AbortReason::NonCommutativeConflict)]
+    );
 }
 
 #[test]
@@ -774,7 +787,10 @@ fn test_e2e_100_concurrent_transactions_no_deadlock() {
     let ids = txns.iter().map(|txn| txn.txn_id).collect::<Vec<_>>();
     let schedule = generate_schedule(2027, &ids);
     let result = simulate_mvcc(&txns, &schedule, IsolationMode::Serializable, true);
-    assert!(!result.deadlock_detected, "bead_id={BEAD_ID} deadlock freedom");
+    assert!(
+        !result.deadlock_detected,
+        "bead_id={BEAD_ID} deadlock freedom"
+    );
     assert_eq!(result.committed.len() + result.aborted.len(), 100);
 }
 
@@ -929,16 +945,12 @@ fn test_e2e_bd_2npr_compliance() -> Result<(), String> {
     );
     eprintln!(
         "INFO bead_id={BEAD_ID} case=stress_summary writers={} commits={} aborts={} conflicts={}",
-        artifact.writer_count,
-        artifact.commit_count,
-        artifact.abort_count,
-        artifact.conflict_count
+        artifact.writer_count, artifact.commit_count, artifact.abort_count, artifact.conflict_count
     );
     if artifact.abort_count > artifact.commit_count {
         eprintln!(
             "WARN bead_id={BEAD_ID} case=degraded_mode aborts_exceed_commits aborts={} commits={}",
-            artifact.abort_count,
-            artifact.commit_count
+            artifact.abort_count, artifact.commit_count
         );
     }
     if !evaluation.is_compliant() {
