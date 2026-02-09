@@ -286,6 +286,27 @@ mod tests {
     }
 
     #[test]
+    fn test_memory_vfs_write_read_1mb() {
+        let cx = Cx::new();
+        let vfs = make_vfs();
+        let path = Path::new("one_mb.db");
+        let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
+
+        let payload = (0..(1024 * 1024))
+            .map(|idx| u8::try_from(idx % 251).expect("mod value must fit in u8"))
+            .collect::<Vec<_>>();
+
+        let (mut file, _) = vfs.open(&cx, Some(path), flags).unwrap();
+        file.write(&cx, &payload, 0).unwrap();
+        assert_eq!(file.file_size(&cx).unwrap(), payload.len() as u64);
+
+        let mut roundtrip = vec![0_u8; payload.len()];
+        let read = file.read(&cx, &mut roundtrip, 0).unwrap();
+        assert_eq!(read, payload.len());
+        assert_eq!(roundtrip, payload);
+    }
+
+    #[test]
     fn read_past_end_zeroes() {
         let cx = Cx::new();
         let vfs = make_vfs();
@@ -350,6 +371,27 @@ mod tests {
         let mut buf = [0u8; 5];
         file.read(&cx, &mut buf, 0).unwrap();
         assert_eq!(&buf, b"hello");
+    }
+
+    #[test]
+    fn test_memory_vfs_truncate() {
+        let cx = Cx::new();
+        let vfs = make_vfs();
+        let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
+
+        let payload = vec![0xAB_u8; 1024 * 1024];
+        let (mut file, _) = vfs
+            .open(&cx, Some(Path::new("truncate_1mb.db")), flags)
+            .unwrap();
+        file.write(&cx, &payload, 0).unwrap();
+
+        file.truncate(&cx, 512 * 1024).unwrap();
+        assert_eq!(file.file_size(&cx).unwrap(), 512 * 1024);
+
+        let mut buf = vec![0_u8; 512 * 1024];
+        let n = file.read(&cx, &mut buf, 0).unwrap();
+        assert_eq!(n, 512 * 1024);
+        assert!(buf.iter().all(|byte| *byte == 0xAB));
     }
 
     #[test]

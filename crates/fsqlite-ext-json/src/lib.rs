@@ -2259,6 +2259,7 @@ mod tests {
 
     #[test]
     fn test_json_quote_float() {
+        #[allow(clippy::approx_constant)]
         let result = json_quote(&SqliteValue::Float(3.14));
         assert!(result.starts_with("3.14"));
     }
@@ -2543,7 +2544,7 @@ mod tests {
 
     #[test]
     fn test_path_unclosed_bracket() {
-        assert!(json_extract(r#"[1,2]"#, &["$[0"]).is_err());
+        assert!(json_extract(r"[1,2]", &["$[0"]).is_err());
     }
 
     #[test]

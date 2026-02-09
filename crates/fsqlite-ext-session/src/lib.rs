@@ -2024,6 +2024,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
+    #[allow(clippy::approx_constant)]
     fn test_changeset_value_sqlite_roundtrip_all_types() {
         let values = vec![
             SqliteValue::Null,
@@ -2575,8 +2576,8 @@ mod tests {
             skipped: 2,
         };
         let s = format!("{:?}", outcome);
-        assert!(s.contains("5"));
-        assert!(s.contains("2"));
+        assert!(s.contains('5'));
+        assert!(s.contains('2'));
     }
 
     #[test]

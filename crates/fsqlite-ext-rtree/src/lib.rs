@@ -1515,6 +1515,7 @@ mod tests {
     // ── Point / BoundingBox ──────────────────────────────────────────────
 
     #[test]
+    #[allow(clippy::approx_constant)]
     fn test_point_new() {
         let p = Point::new(3.14, 2.72);
         assert!(approx_eq(p.x, 3.14));
