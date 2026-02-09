@@ -1634,19 +1634,20 @@ mod tests {
 
         assert_eq!(decode_invocations.get(), 1);
         assert_eq!(decoded, expected);
-        match path {
-            SymbolReadPath::FullDecodeFallback { reason } => {
-                assert!(matches!(
-                    reason,
-                    SystematicLayoutError::NonContiguousSystematicSymbol {
-                        expected_esi: 5,
-                        ..
-                    } | SystematicLayoutError::MissingSystematicSymbol { expected_esi: 5 }
-                ));
-            }
-            SymbolReadPath::SystematicFastPath => {
-                panic!("fallback path expected when a systematic symbol is missing");
-            }
+        assert!(matches!(path, SymbolReadPath::FullDecodeFallback { .. }));
+        if let SymbolReadPath::FullDecodeFallback { reason } = path {
+            assert!(matches!(
+                reason,
+                SystematicLayoutError::NonContiguousSystematicSymbol {
+                    expected_esi: 5,
+                    ..
+                } | SystematicLayoutError::MissingSystematicSymbol { expected_esi: 5 }
+            ));
+        } else {
+            assert!(
+                false,
+                "fallback path expected when a systematic symbol is missing"
+            );
         }
     }
 
@@ -1670,16 +1671,14 @@ mod tests {
 
         assert_eq!(decode_invocations.get(), 1);
         assert_eq!(decoded, expected);
-        match path {
-            SymbolReadPath::FullDecodeFallback { reason } => {
-                assert!(matches!(
-                    reason,
-                    SystematicLayoutError::CorruptSymbol { esi: 3 }
-                ));
-            }
-            SymbolReadPath::SystematicFastPath => {
-                panic!("corrupted systematic symbol must trigger fallback");
-            }
+        assert!(matches!(path, SymbolReadPath::FullDecodeFallback { .. }));
+        if let SymbolReadPath::FullDecodeFallback { reason } = path {
+            assert!(matches!(
+                reason,
+                SystematicLayoutError::CorruptSymbol { esi: 3 }
+            ));
+        } else {
+            assert!(false, "corrupted systematic symbol must trigger fallback");
         }
     }
 

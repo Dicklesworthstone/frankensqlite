@@ -610,3 +610,141 @@ fn test_e2e_matrix_serialization_roundtrip() {
         "bead_id={OPPORTUNITY_MATRIX_BEAD_ID} E2E artifact must preserve threshold"
     );
 }
+
+#[test]
+fn test_flamegraph_generation() {
+    let temp = TempDir::new().expect("tempdir");
+    let flamegraph_path = temp.path().join("flamegraph.svg");
+    fs::write(
+        &flamegraph_path,
+        r#"<svg xmlns="http://www.w3.org/2000/svg"><rect/></svg>"#,
+    )
+    .expect("write flamegraph");
+
+    validate_flamegraph_output(&flamegraph_path).expect("svg flamegraph should validate");
+}
+
+#[test]
+fn test_hyperfine_json_output() {
+    let temp = TempDir::new().expect("tempdir");
+    let hyperfine_path = temp.path().join("hyperfine.json");
+    fs::write(
+        &hyperfine_path,
+        r#"{"command":"fsqlite-cli --bench","results":[{"mean":1.2}]}"#,
+    )
+    .expect("write hyperfine");
+
+    validate_hyperfine_json_output(&hyperfine_path).expect("hyperfine json should validate");
+}
+
+#[test]
+fn test_metadata_completeness() {
+    let metadata = record_profiling_metadata(
+        "deadbeef",
+        "mvcc_hot_path?writers=32",
+        "42",
+        "RUSTFLAGS=-C force-frame-pointers=yes;features=perf",
+        "Linux x86_64",
+    );
+    validate_profiling_metadata(&metadata).expect("metadata should be complete");
+}
+
+#[test]
+fn test_cookbook_commands_exist() {
+    let commands = canonical_profiling_cookbook_commands(
+        "mvcc_stress",
+        "mvcc_hot_path",
+        "cargo bench --bench mvcc_stress",
+    );
+    validate_cookbook_commands_exist(&commands).expect("canonical commands should validate");
+}
+
+fn profiling_artifact_report_fixture() -> ProfilingArtifactReport {
+    let metadata = record_profiling_metadata(
+        "deadbeef",
+        "mvcc_hot_path?writers=32",
+        "42",
+        "RUSTFLAGS=-C force-frame-pointers=yes;features=perf",
+        "Linux x86_64",
+    );
+    let artifact_paths = std::collections::BTreeMap::from([
+        (
+            "flamegraph".to_string(),
+            "artifacts/flamegraph.svg".to_string(),
+        ),
+        (
+            "hyperfine".to_string(),
+            "artifacts/hyperfine.json".to_string(),
+        ),
+        (
+            "heaptrack".to_string(),
+            "artifacts/heaptrack.out".to_string(),
+        ),
+        ("strace".to_string(), "artifacts/strace.txt".to_string()),
+    ]);
+    ProfilingArtifactReport {
+        trace_id: "trace-prof-0001".to_string(),
+        scenario_id: "mvcc_hot_path".to_string(),
+        git_sha: "deadbeef".to_string(),
+        artifact_paths,
+        metadata,
+    }
+}
+
+#[test]
+fn test_e2e_profile_and_attach_artifacts() {
+    let temp = TempDir::new().expect("tempdir");
+    let artifacts_dir = temp.path().join("artifacts");
+    fs::create_dir_all(&artifacts_dir).expect("create artifacts dir");
+    fs::write(
+        artifacts_dir.join("flamegraph.svg"),
+        r#"<svg xmlns="http://www.w3.org/2000/svg"><rect/></svg>"#,
+    )
+    .expect("write flamegraph");
+    fs::write(
+        artifacts_dir.join("hyperfine.json"),
+        r#"{"command":"cargo bench --bench mvcc_stress","results":[{"mean":1.2}]}"#,
+    )
+    .expect("write hyperfine");
+    fs::write(artifacts_dir.join("heaptrack.out"), "heaptrack-report").expect("write heaptrack");
+    fs::write(artifacts_dir.join("strace.txt"), "strace-summary").expect("write strace");
+
+    let report = profiling_artifact_report_fixture();
+    validate_profiling_artifact_report(&report).expect("report schema should validate");
+    validate_profiling_artifact_paths(temp.path(), &report).expect("artifact paths should exist");
+}
+
+#[test]
+fn test_e2e_toolchain_presence_gate() {
+    let available = enforce_profiling_toolchain_presence_with(|tool| Some(format!("{tool} 1.0.0")))
+        .expect("all tools available should pass");
+    assert_eq!(
+        available.missing.len(),
+        0,
+        "bead_id={PROFILING_COOKBOOK_BEAD_ID} no tools should be missing in passing gate"
+    );
+
+    let error = enforce_profiling_toolchain_presence_with(|tool| {
+        if tool == "heaptrack" {
+            None
+        } else {
+            Some(format!("{tool} 1.0.0"))
+        }
+    })
+    .expect_err("missing tool should fail gate");
+    match error {
+        PerfLoopError::ToolUnavailable { tool, remediation } => {
+            assert_eq!(
+                tool, "heaptrack",
+                "bead_id={PROFILING_COOKBOOK_BEAD_ID} missing tool should be reported explicitly"
+            );
+            assert!(
+                remediation.contains("install"),
+                "bead_id={PROFILING_COOKBOOK_BEAD_ID} remediation guidance should be present"
+            );
+        }
+        other => {
+            panic!("bead_id={PROFILING_COOKBOOK_BEAD_ID} expected ToolUnavailable, got {other:?}")
+        }
+    }
+}
