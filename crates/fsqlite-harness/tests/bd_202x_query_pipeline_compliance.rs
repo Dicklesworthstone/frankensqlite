@@ -1,9 +1,10 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use proptest::prelude::proptest;
 use proptest::test_runner::TestCaseError;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 const BEAD_ID: &str = "bd-202x";
 const ISSUES_JSONL: &str = ".beads/issues.jsonl";
@@ -105,6 +106,28 @@ fn evaluate_description(description: &str) -> ComplianceEvaluation {
     }
 }
 
+fn unique_runtime_dir(label: &str) -> Result<PathBuf, String> {
+    let root = workspace_root()?.join("target").join("bd_202x_runtime");
+    fs::create_dir_all(&root).map_err(|error| {
+        format!(
+            "runtime_dir_create_failed path={:?} error={error}",
+            root.as_path()
+        )
+    })?;
+
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0_u128, |duration| duration.as_nanos());
+    let path = root.join(format!("{label}_{}_{}", std::process::id(), stamp));
+    fs::create_dir_all(&path).map_err(|error| {
+        format!(
+            "runtime_subdir_create_failed path={:?} error={error}",
+            path.as_path()
+        )
+    })?;
+    Ok(path)
+}
+
 #[test]
 fn test_bd_202x_unit_compliance_gate() -> Result<(), String> {
     let description = load_issue_description(BEAD_ID)?;
@@ -166,6 +189,31 @@ fn test_e2e_bd_202x_compliance() -> Result<(), String> {
     let description = load_issue_description(BEAD_ID)?;
     let evaluation = evaluate_description(&description);
 
+    let runtime_dir = unique_runtime_dir("e2e")?;
+    let artifact_path = runtime_dir.join("bd_202x_artifact.json");
+    let artifact = json!({
+        "bead_id": BEAD_ID,
+        "missing_unit_ids": evaluation.missing_unit_ids,
+        "missing_e2e_ids": evaluation.missing_e2e_ids,
+        "missing_log_levels": evaluation.missing_log_levels,
+        "missing_log_standard_ref": evaluation.missing_log_standard_ref
+    });
+    let artifact_pretty = serde_json::to_string_pretty(&artifact)
+        .map_err(|error| format!("artifact_serialize_failed error={error}"))?;
+    fs::write(&artifact_path, artifact_pretty).map_err(|error| {
+        format!(
+            "artifact_write_failed path={:?} error={error}",
+            artifact_path.as_path()
+        )
+    })?;
+
+    eprintln!(
+        "DEBUG bead_id={BEAD_ID} case=artifact_written path={} size_bytes={}",
+        artifact_path.display(),
+        fs::metadata(&artifact_path)
+            .map_err(|error| format!("artifact_metadata_failed error={error}"))?
+            .len()
+    );
     eprintln!(
         "INFO bead_id={BEAD_ID} case=e2e_summary missing_unit_ids={} missing_e2e_ids={} missing_log_levels={} missing_log_standard_ref={}",
         evaluation.missing_unit_ids.len(),
