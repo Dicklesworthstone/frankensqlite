@@ -17,7 +17,8 @@
 //! - `$[#-N]` reverse array index
 
 use fsqlite_error::{FrankenError, Result};
-use fsqlite_types::SqliteValue;
+use fsqlite_func::{ColumnContext, IndexInfo, VirtualTable, VirtualTableCursor};
+use fsqlite_types::{SqliteValue, cx::Cx};
 use serde_json::{Map, Number, Value};
 
 const JSON_VALID_DEFAULT_FLAGS: u8 = 0x01;
@@ -563,6 +564,140 @@ pub fn json_tree(input: &str, path: Option<&str>) -> Result<Vec<JsonTableRow>> {
     Ok(rows)
 }
 
+/// Virtual table module for `json_each`.
+pub struct JsonEachVtab;
+
+/// Cursor for `json_each` virtual table scans.
+#[derive(Default)]
+pub struct JsonEachCursor {
+    rows: Vec<JsonTableRow>,
+    pos: usize,
+}
+
+impl VirtualTable for JsonEachVtab {
+    type Cursor = JsonEachCursor;
+
+    fn connect(_cx: &Cx, _args: &[&str]) -> Result<Self> {
+        Ok(Self)
+    }
+
+    fn best_index(&self, info: &mut IndexInfo) -> Result<()> {
+        info.estimated_cost = 100.0;
+        info.estimated_rows = 100;
+        Ok(())
+    }
+
+    fn open(&self) -> Result<Self::Cursor> {
+        Ok(JsonEachCursor::default())
+    }
+}
+
+impl VirtualTableCursor for JsonEachCursor {
+    fn filter(
+        &mut self,
+        _cx: &Cx,
+        _idx_num: i32,
+        _idx_str: Option<&str>,
+        args: &[SqliteValue],
+    ) -> Result<()> {
+        let (input, path) = parse_json_table_filter_args(args)?;
+        self.rows = json_each(input, path)?;
+        self.pos = 0;
+        Ok(())
+    }
+
+    fn next(&mut self, _cx: &Cx) -> Result<()> {
+        if self.pos < self.rows.len() {
+            self.pos += 1;
+        }
+        Ok(())
+    }
+
+    fn eof(&self) -> bool {
+        self.pos >= self.rows.len()
+    }
+
+    fn column(&self, ctx: &mut ColumnContext, col: i32) -> Result<()> {
+        let row = self.rows.get(self.pos).ok_or_else(|| {
+            FrankenError::function_error("json_each cursor is out of bounds for column read")
+        })?;
+        write_json_table_column(row, ctx, col)
+    }
+
+    fn rowid(&self) -> Result<i64> {
+        self.rows.get(self.pos).map(|row| row.id).ok_or_else(|| {
+            FrankenError::function_error("json_each cursor is out of bounds for rowid")
+        })
+    }
+}
+
+/// Virtual table module for `json_tree`.
+pub struct JsonTreeVtab;
+
+/// Cursor for `json_tree` virtual table scans.
+#[derive(Default)]
+pub struct JsonTreeCursor {
+    rows: Vec<JsonTableRow>,
+    pos: usize,
+}
+
+impl VirtualTable for JsonTreeVtab {
+    type Cursor = JsonTreeCursor;
+
+    fn connect(_cx: &Cx, _args: &[&str]) -> Result<Self> {
+        Ok(Self)
+    }
+
+    fn best_index(&self, info: &mut IndexInfo) -> Result<()> {
+        info.estimated_cost = 200.0;
+        info.estimated_rows = 1_000;
+        Ok(())
+    }
+
+    fn open(&self) -> Result<Self::Cursor> {
+        Ok(JsonTreeCursor::default())
+    }
+}
+
+impl VirtualTableCursor for JsonTreeCursor {
+    fn filter(
+        &mut self,
+        _cx: &Cx,
+        _idx_num: i32,
+        _idx_str: Option<&str>,
+        args: &[SqliteValue],
+    ) -> Result<()> {
+        let (input, path) = parse_json_table_filter_args(args)?;
+        self.rows = json_tree(input, path)?;
+        self.pos = 0;
+        Ok(())
+    }
+
+    fn next(&mut self, _cx: &Cx) -> Result<()> {
+        if self.pos < self.rows.len() {
+            self.pos += 1;
+        }
+        Ok(())
+    }
+
+    fn eof(&self) -> bool {
+        self.pos >= self.rows.len()
+    }
+
+    fn column(&self, ctx: &mut ColumnContext, col: i32) -> Result<()> {
+        let row = self.rows.get(self.pos).ok_or_else(|| {
+            FrankenError::function_error("json_tree cursor is out of bounds for column read")
+        })?;
+        write_json_table_column(row, ctx, col)
+    }
+
+    fn rowid(&self) -> Result<i64> {
+        self.rows.get(self.pos).map(|row| row.id).ok_or_else(|| {
+            FrankenError::function_error("json_tree cursor is out of bounds for rowid")
+        })
+    }
+}
+
 fn parse_json_text(input: &str) -> Result<Value> {
     serde_json::from_str::<Value>(input)
         .map_err(|error| FrankenError::function_error(format!("invalid JSON input: {error}")))
@@ -1047,6 +1182,51 @@ fn append_tree_rows(
         _ => {}
     }
 
+    Ok(())
+}
+
+fn parse_json_table_filter_args(args: &[SqliteValue]) -> Result<(&str, Option<&str>)> {
+    let Some(input_arg) = args.first() else {
+        return Err(FrankenError::function_error(
+            "json table-valued functions require JSON input argument",
+        ));
+    };
+    let SqliteValue::Text(input_text) = input_arg else {
+        return Err(FrankenError::function_error(
+            "json table-valued input must be TEXT JSON",
+        ));
+    };
+
+    let path = match args.get(1) {
+        None | Some(SqliteValue::Null) => None,
+        Some(SqliteValue::Text(path)) => Some(path.as_str()),
+        Some(_) => {
+            return Err(FrankenError::function_error(
+                "json table-valued PATH argument must be TEXT or NULL",
+            ));
+        }
+    };
+
+    Ok((input_text.as_str(), path))
+}
+
+fn write_json_table_column(row: &JsonTableRow, ctx: &mut ColumnContext, col: i32) -> Result<()> {
+    let value = match col {
+        0 => row.key.clone(),
+        1 => row.value.clone(),
+        2 => SqliteValue::Text(row.type_name.to_owned()),
+        3 => row.atom.clone(),
+        4 => SqliteValue::Integer(row.id),
+        5 => row.parent.clone(),
+        6 => SqliteValue::Text(row.fullkey.clone()),
+        7 => SqliteValue::Text(row.path.clone()),
+        _ => {
+            return Err(FrankenError::function_error(format!(
+                "json table-valued invalid column index {col}"
+            )));
+        }
+    };
+    ctx.set_value(value);
     Ok(())
 }
 
@@ -1666,5 +1846,67 @@ mod tests {
         assert_eq!(row.parent, SqliteValue::Null);
         assert_eq!(row.fullkey, "$.a");
         assert_eq!(row.path, "$");
+    }
+
+    #[test]
+    fn test_json_each_vtab_cursor_scan() {
+        let cx = Cx::new();
+        let vtab = JsonEachVtab::connect(&cx, &[]).unwrap();
+        let mut cursor = vtab.open().unwrap();
+        cursor
+            .filter(&cx, 0, None, &[SqliteValue::Text("[4,5]".to_owned())])
+            .unwrap();
+
+        let mut values = Vec::new();
+        while !cursor.eof() {
+            let mut key_ctx = ColumnContext::new();
+            let mut value_ctx = ColumnContext::new();
+            cursor.column(&mut key_ctx, 0).unwrap();
+            cursor.column(&mut value_ctx, 1).unwrap();
+            values.push((
+                key_ctx.take_value().unwrap(),
+                value_ctx.take_value().unwrap(),
+            ));
+            cursor.next(&cx).unwrap();
+        }
+
+        assert_eq!(
+            values,
+            vec![
+                (SqliteValue::Integer(0), SqliteValue::Integer(4)),
+                (SqliteValue::Integer(1), SqliteValue::Integer(5)),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_json_tree_vtab_cursor_scan() {
+        let cx = Cx::new();
+        let vtab = JsonTreeVtab::connect(&cx, &[]).unwrap();
+        let mut cursor = vtab.open().unwrap();
+        cursor
+            .filter(
+                &cx,
+                0,
+                None,
+                &[
+                    SqliteValue::Text(r#"{"a":{"b":1}}"#.to_owned()),
+                    SqliteValue::Text("$.a".to_owned()),
+                ],
+            )
+            .unwrap();
+
+        let mut fullkeys = Vec::new();
+        while !cursor.eof() {
+            let mut ctx = ColumnContext::new();
+            cursor.column(&mut ctx, 6).unwrap();
+            let fullkey = ctx.take_value().unwrap();
+            if let SqliteValue::Text(text) = fullkey {
+                fullkeys.push(text);
+            }
+            cursor.next(&cx).unwrap();
+        }
+
+        assert_eq!(fullkeys, vec!["$.a".to_owned(), "$.a.b".to_owned()]);
     }
 }

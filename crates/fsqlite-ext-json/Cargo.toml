@@ -10,6 +10,7 @@ rust-version.workspace = true
 [dependencies]
 fsqlite-types = { workspace = true }
 fsqlite-error = { workspace = true }
+fsqlite-func = { workspace = true }
 serde_json = { workspace = true }
 json5 = "0.4"
 
