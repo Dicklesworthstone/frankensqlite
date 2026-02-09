@@ -14,7 +14,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use fsqlite_error::{FrankenError, Result};
-use fsqlite_types::{ObjectId, SymbolRecord};
+use fsqlite_types::{ObjectId, Oti, SymbolRecord, SymbolRecordFlags, source_symbol_count};
 use tracing::{debug, error, info, warn};
 use xxhash_rust::xxh3::xxh3_64;
 
@@ -654,6 +654,470 @@ pub fn rebuild_object_locator(
     Ok(locator)
 }
 
+/// Locator for a contiguous systematic-symbol run (`ESI 0..K-1`) for an object.
+///
+/// This captures the physical placement needed by the §3.5.2 fast path:
+/// read the first `K` source symbols sequentially and reconstruct without
+/// invoking GF(256) decode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SystematicRunLocator {
+    /// Object whose systematic run is located.
+    pub object_id: ObjectId,
+    /// Segment containing the run.
+    pub segment_id: u64,
+    /// Inclusive start of the ESI range (always 0 for systematic runs).
+    pub esi_start: u32,
+    /// Inclusive end of the ESI range (`K-1`).
+    pub esi_end_inclusive: u32,
+    /// Locator offsets in ascending ESI order.
+    pub offsets: Vec<SymbolLogOffset>,
+}
+
+impl SystematicRunLocator {
+    /// Number of source symbols in this run.
+    #[must_use]
+    pub fn source_symbol_count(&self) -> usize {
+        self.offsets.len()
+    }
+}
+
+/// Rebuild `ObjectId -> SystematicRunLocator` by scanning symbol segments.
+///
+/// Rules:
+/// - Run start is identified by `ESI=0` with `SYSTEMATIC_RUN_START`.
+/// - A valid run must provide contiguous symbols `ESI 0..K-1` with matching
+///   `object_id` and `OTI`.
+/// - If validation fails (missing/interleaved/non-contiguous symbols), that
+///   start is ignored and fast-path MUST fall back to decode.
+/// - If multiple valid runs exist for one object, the newest one (largest
+///   segment/order in append-only log) wins.
+pub fn rebuild_systematic_run_locator(
+    symbols_dir: &Path,
+) -> Result<BTreeMap<ObjectId, SystematicRunLocator>> {
+    let mut locator: BTreeMap<ObjectId, SystematicRunLocator> = BTreeMap::new();
+    let segments = sorted_segment_paths(symbols_dir)?;
+
+    for (segment_id, path) in segments {
+        let scan = scan_symbol_segment(&path)?;
+        let rows = &scan.records;
+
+        for start_idx in 0..rows.len() {
+            let start = &rows[start_idx].record;
+            if start.esi != 0
+                || !start
+                    .flags
+                    .contains(SymbolRecordFlags::SYSTEMATIC_RUN_START)
+            {
+                continue;
+            }
+
+            match build_systematic_run_locator(rows, start_idx) {
+                Ok(run) => {
+                    locator.insert(run.object_id, run);
+                }
+                Err(detail) => {
+                    warn!(
+                        bead_id = BEAD_ID,
+                        logging_standard = LOGGING_STANDARD_BEAD,
+                        segment_id,
+                        path = %path.display(),
+                        start_offset = rows[start_idx].offset.offset_bytes,
+                        start_object_id = %start.object_id,
+                        reason = %detail,
+                        "invalid systematic run start; fast-path must fall back"
+                    );
+                }
+            }
+        }
+
+        if scan.torn_tail {
+            warn!(
+                bead_id = BEAD_ID,
+                logging_standard = LOGGING_STANDARD_BEAD,
+                segment_id,
+                path = %path.display(),
+                "systematic-run locator rebuild ignored torn tail in segment"
+            );
+        }
+    }
+
+    info!(
+        bead_id = BEAD_ID,
+        logging_standard = LOGGING_STANDARD_BEAD,
+        objects = locator.len(),
+        "rebuilt systematic run locator from symbol segments"
+    );
+
+    Ok(locator)
+}
+
+/// Attempt systematic fast-path reconstruction for one object.
+///
+/// Inputs:
+/// - object metadata (`object_id`, `oti`) providing `(F, T, K_source)`.
+/// - prebuilt locator for a contiguous systematic run (`ESI 0..K-1`).
+///
+/// Returns:
+/// - `Ok(Some(bytes))` when fast path succeeds.
+/// - `Ok(None)` when any missing/corrupt/mismatch condition requires fallback.
+/// - `Err(...)` for unexpected I/O/runtime errors unrelated to symbol validity.
+#[derive(Debug, Clone, Copy)]
+struct SystematicFastPathPlan {
+    source_symbols: usize,
+    symbol_size: usize,
+    transfer_len: usize,
+    total_len: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SystematicFastPathExpectations<'a> {
+    run: &'a SystematicRunLocator,
+    object_id: ObjectId,
+    oti: Oti,
+    symbol_size: usize,
+    auth_epoch_key: Option<&'a [u8; 32]>,
+}
+
+fn fast_path_unavailable(object_id: ObjectId, detail: &str) {
+    warn!(
+        bead_id = BEAD_ID,
+        logging_standard = LOGGING_STANDARD_BEAD,
+        object_id = %object_id,
+        detail,
+        "systematic fast path unavailable"
+    );
+}
+
+fn fast_path_unavailable_esi(object_id: ObjectId, expected_esi: u32, detail: &str) {
+    warn!(
+        bead_id = BEAD_ID,
+        logging_standard = LOGGING_STANDARD_BEAD,
+        object_id = %object_id,
+        expected_esi,
+        detail,
+        "systematic fast path unavailable"
+    );
+}
+
+pub fn read_systematic_fast_path(
+    symbols_dir: &Path,
+    run: &SystematicRunLocator,
+    object_id: ObjectId,
+    oti: Oti,
+    auth_epoch_key: Option<&[u8; 32]>,
+) -> Result<Option<Vec<u8>>> {
+    let Some(plan) = build_systematic_fast_path_plan(run, object_id, oti) else {
+        return Ok(None);
+    };
+    if plan.source_symbols == 0 {
+        return Ok(Some(Vec::new()));
+    }
+
+    let Some((bytes, _header)) = load_systematic_fast_path_segment(symbols_dir, run, object_id)?
+    else {
+        return Ok(None);
+    };
+
+    let expectations = SystematicFastPathExpectations {
+        run,
+        object_id,
+        oti,
+        symbol_size: plan.symbol_size,
+        auth_epoch_key,
+    };
+    let mut out = vec![0_u8; plan.total_len];
+
+    for (index, offset) in run.offsets.iter().copied().enumerate() {
+        let Ok(expected_esi) = u32::try_from(index) else {
+            fast_path_unavailable(object_id, "index does not fit ESI");
+            return Ok(None);
+        };
+        let Some(parsed) =
+            read_systematic_fast_path_record(&bytes, &expectations, offset, expected_esi)
+        else {
+            return Ok(None);
+        };
+
+        let Some(start) = index.checked_mul(plan.symbol_size) else {
+            fast_path_unavailable_esi(object_id, expected_esi, "output offset overflow");
+            return Ok(None);
+        };
+        let Some(end) = start.checked_add(plan.symbol_size) else {
+            fast_path_unavailable_esi(object_id, expected_esi, "output end overflow");
+            return Ok(None);
+        };
+        if end > out.len() {
+            fast_path_unavailable_esi(object_id, expected_esi, "output bounds check failed");
+            return Ok(None);
+        }
+        out[start..end].copy_from_slice(&parsed.symbol_data);
+    }
+
+    out.truncate(plan.transfer_len);
+    Ok(Some(out))
+}
+
+fn build_systematic_fast_path_plan(
+    run: &SystematicRunLocator,
+    object_id: ObjectId,
+    oti: Oti,
+) -> Option<SystematicFastPathPlan> {
+    let source_symbols = match source_symbol_count(oti) {
+        Ok(value) => value,
+        Err(err) => {
+            let detail = format!("invalid source symbol count: {err}");
+            fast_path_unavailable(object_id, &detail);
+            return None;
+        }
+    };
+    if source_symbols == 0 {
+        return Some(SystematicFastPathPlan {
+            source_symbols,
+            symbol_size: 0,
+            transfer_len: 0,
+            total_len: 0,
+        });
+    }
+    if run.object_id != object_id {
+        fast_path_unavailable(object_id, "locator object mismatch");
+        return None;
+    }
+    if run.esi_start != 0 {
+        fast_path_unavailable(object_id, "run does not start at ESI 0");
+        return None;
+    }
+    if run.offsets.len() != source_symbols {
+        let detail = format!(
+            "locator offset count mismatch: expected={source_symbols} found={}",
+            run.offsets.len()
+        );
+        fast_path_unavailable(object_id, &detail);
+        return None;
+    }
+    let Ok(expected_end) = u32::try_from(source_symbols.saturating_sub(1)) else {
+        fast_path_unavailable(object_id, "source symbol count exceeds ESI range");
+        return None;
+    };
+    if run.esi_end_inclusive != expected_end {
+        fast_path_unavailable(object_id, "locator ESI range mismatch");
+        return None;
+    }
+
+    let Ok(symbol_size) = usize::try_from(oti.t) else {
+        fast_path_unavailable(object_id, "invalid OTI.t");
+        return None;
+    };
+    let Ok(transfer_len) = usize::try_from(oti.f) else {
+        fast_path_unavailable(object_id, "invalid OTI.f");
+        return None;
+    };
+    let Some(total_len) = source_symbols.checked_mul(symbol_size) else {
+        fast_path_unavailable(object_id, "reconstruction size overflow");
+        return None;
+    };
+
+    Some(SystematicFastPathPlan {
+        source_symbols,
+        symbol_size,
+        transfer_len,
+        total_len,
+    })
+}
+
+fn load_systematic_fast_path_segment(
+    symbols_dir: &Path,
+    run: &SystematicRunLocator,
+    object_id: ObjectId,
+) -> Result<Option<(Vec<u8>, SymbolSegmentHeader)>> {
+    let segment_path = symbol_segment_path(symbols_dir, run.segment_id);
+    if !segment_path.exists() {
+        fast_path_unavailable(object_id, "locator segment missing");
+        return Ok(None);
+    }
+
+    let bytes = fs::read(&segment_path)?;
+    if bytes.len() < SYMBOL_SEGMENT_HEADER_BYTES {
+        fast_path_unavailable(object_id, "segment shorter than header");
+        return Ok(None);
+    }
+
+    let header = match SymbolSegmentHeader::decode(&bytes[..SYMBOL_SEGMENT_HEADER_BYTES]) {
+        Ok(value) => value,
+        Err(err) => {
+            let detail = format!("invalid segment header: {err}");
+            fast_path_unavailable(object_id, &detail);
+            return Ok(None);
+        }
+    };
+    if header.segment_id != run.segment_id {
+        fast_path_unavailable(object_id, "segment id mismatch");
+        return Ok(None);
+    }
+
+    Ok(Some((bytes, header)))
+}
+
+fn read_systematic_fast_path_record(
+    bytes: &[u8],
+    expectations: &SystematicFastPathExpectations<'_>,
+    offset: SymbolLogOffset,
+    expected_esi: u32,
+) -> Option<SymbolRecord> {
+    if offset.segment_id != expectations.run.segment_id {
+        fast_path_unavailable_esi(
+            expectations.object_id,
+            expected_esi,
+            "wrong segment in offset",
+        );
+        return None;
+    }
+
+    let Ok(offset_usize) = usize::try_from(offset.offset_bytes) else {
+        fast_path_unavailable_esi(expectations.object_id, expected_esi, "bad record offset");
+        return None;
+    };
+    let Some(absolute_offset) = SYMBOL_SEGMENT_HEADER_BYTES.checked_add(offset_usize) else {
+        fast_path_unavailable_esi(
+            expectations.object_id,
+            expected_esi,
+            "absolute offset overflow",
+        );
+        return None;
+    };
+
+    let parsed = match parse_symbol_record_at(bytes, expectations.run.segment_id, absolute_offset) {
+        Ok(Some((row, _))) => row.record,
+        Ok(None) => {
+            fast_path_unavailable_esi(
+                expectations.object_id,
+                expected_esi,
+                "missing symbol record at offset",
+            );
+            return None;
+        }
+        Err(err) => {
+            let detail = format!("invalid symbol record: {err}");
+            fast_path_unavailable_esi(expectations.object_id, expected_esi, &detail);
+            return None;
+        }
+    };
+
+    if parsed.object_id != expectations.object_id {
+        fast_path_unavailable_esi(expectations.object_id, expected_esi, "object mismatch");
+        return None;
+    }
+    if parsed.oti != expectations.oti {
+        fast_path_unavailable_esi(expectations.object_id, expected_esi, "OTI mismatch");
+        return None;
+    }
+    if parsed.esi != expected_esi {
+        fast_path_unavailable_esi(expectations.object_id, expected_esi, "non-contiguous ESI");
+        return None;
+    }
+    if parsed.symbol_data.len() != expectations.symbol_size {
+        fast_path_unavailable_esi(expectations.object_id, expected_esi, "symbol size mismatch");
+        return None;
+    }
+    if !parsed.verify_integrity() {
+        fast_path_unavailable_esi(
+            expectations.object_id,
+            expected_esi,
+            "integrity check failed",
+        );
+        return None;
+    }
+    if parsed.auth_tag != [0_u8; 16] {
+        let Some(epoch_key) = expectations.auth_epoch_key else {
+            fast_path_unavailable_esi(
+                expectations.object_id,
+                expected_esi,
+                "auth tag present but no epoch key provided",
+            );
+            return None;
+        };
+        if !parsed.verify_auth(epoch_key) {
+            fast_path_unavailable_esi(expectations.object_id, expected_esi, "auth check failed");
+            return None;
+        }
+    }
+
+    Some(parsed)
+}
+
+fn build_systematic_run_locator(
+    rows: &[SymbolLogRecord],
+    start_idx: usize,
+) -> std::result::Result<SystematicRunLocator, String> {
+    let start_row = rows
+        .get(start_idx)
+        .ok_or_else(|| format!("run start index {start_idx} out of bounds"))?;
+    let start = &start_row.record;
+    let source_symbols = source_symbol_count(start.oti)
+        .map_err(|err| format!("invalid source symbol count at run start: {err}"))?;
+    if source_symbols == 0 {
+        return Err("source symbol count is zero".to_owned());
+    }
+    let source_symbols_u32 = u32::try_from(source_symbols)
+        .map_err(|_| format!("source symbol count does not fit u32: {source_symbols}"))?;
+    let end_exclusive = start_idx
+        .checked_add(source_symbols)
+        .ok_or_else(|| "systematic run index overflow".to_owned())?;
+    if end_exclusive > rows.len() {
+        return Err(format!(
+            "incomplete systematic run: need {} rows from index {}, have {}",
+            source_symbols,
+            start_idx,
+            rows.len().saturating_sub(start_idx)
+        ));
+    }
+
+    let mut offsets = Vec::with_capacity(source_symbols);
+    for relative in 0..source_symbols {
+        let row = &rows[start_idx + relative];
+        let rec = &row.record;
+        let expected_esi = u32::try_from(relative).expect("relative index fits u32");
+
+        if rec.object_id != start.object_id {
+            return Err(format!(
+                "object boundary at relative={} expected={} found={}",
+                relative, start.object_id, rec.object_id
+            ));
+        }
+        if rec.oti != start.oti {
+            return Err(format!(
+                "OTI mismatch at relative={} expected={:?} found={:?}",
+                relative, start.oti, rec.oti
+            ));
+        }
+        if rec.esi != expected_esi {
+            return Err(format!(
+                "non-contiguous ESI at relative={} expected={} found={}",
+                relative, expected_esi, rec.esi
+            ));
+        }
+        if relative == 0 {
+            if !rec.flags.contains(SymbolRecordFlags::SYSTEMATIC_RUN_START) {
+                return Err("missing SYSTEMATIC_RUN_START on ESI 0".to_owned());
+            }
+        } else if rec.flags.contains(SymbolRecordFlags::SYSTEMATIC_RUN_START) {
+            return Err(format!(
+                "unexpected SYSTEMATIC_RUN_START on non-zero ESI {}",
+                rec.esi
+            ));
+        }
+
+        offsets.push(row.offset);
+    }
+
+    Ok(SystematicRunLocator {
+        object_id: start.object_id,
+        segment_id: start_row.offset.segment_id,
+        esi_start: 0,
+        esi_end_inclusive: source_symbols_u32.saturating_sub(1),
+        offsets,
+    })
+}
+
 fn parse_symbol_record_at(
     bytes: &[u8],
     segment_id: u64,
@@ -903,6 +1367,33 @@ mod tests {
         )
     }
 
+    fn systematic_record(
+        object_seed: u8,
+        oti: Oti,
+        esi: u32,
+        fill: u8,
+        systematic_start: bool,
+    ) -> SymbolRecord {
+        let symbol_len = usize::try_from(oti.t).expect("OTI.t fits usize for tests");
+        let mut data = vec![fill; symbol_len];
+        if let Some(first) = data.first_mut() {
+            let esi_tag = u8::try_from(esi).unwrap_or(0);
+            *first = object_seed.wrapping_add(esi_tag);
+        }
+        let flags = if systematic_start {
+            SymbolRecordFlags::SYSTEMATIC_RUN_START
+        } else {
+            SymbolRecordFlags::empty()
+        };
+        SymbolRecord::new(
+            ObjectId::from_bytes([object_seed; 16]),
+            oti,
+            esi,
+            data,
+            flags,
+        )
+    }
+
     #[test]
     fn test_symbol_segment_header_encode_decode() {
         let header = SymbolSegmentHeader::new(17, 42, 1_731_000_000);
@@ -1031,6 +1522,298 @@ mod tests {
         let locator = rebuild_object_locator(dir.path()).expect("rebuild from scan");
         assert_eq!(locator.len(), 1);
         assert!(locator.contains_key(&ObjectId::from_bytes([9_u8; 16])));
+    }
+
+    #[test]
+    fn test_systematic_run_locator_rebuild_happy_path() {
+        let dir = tempdir().expect("tempdir");
+        let manager = SymbolLogManager::new(dir.path(), 1, 42, 100).expect("manager");
+        let oti = Oti {
+            f: 64_u64 * 3,
+            al: 1,
+            t: 64,
+            z: 1,
+            n: 1,
+        };
+        let object_id = ObjectId::from_bytes([7_u8; 16]);
+
+        let r0 = systematic_record(7, oti, 0, 0xA1, true);
+        let r1 = systematic_record(7, oti, 1, 0xA2, false);
+        let r2 = systematic_record(7, oti, 2, 0xA3, false);
+        let repair = systematic_record(7, oti, 3, 0xAF, false);
+
+        let o0 = manager.append(&r0).expect("append esi0");
+        let o1 = manager.append(&r1).expect("append esi1");
+        let o2 = manager.append(&r2).expect("append esi2");
+        let _o3 = manager.append(&repair).expect("append repair");
+
+        let locator =
+            rebuild_systematic_run_locator(dir.path()).expect("rebuild systematic locator");
+        let run = locator.get(&object_id).expect("run must exist");
+        assert_eq!(run.segment_id, 1);
+        assert_eq!(run.esi_start, 0);
+        assert_eq!(run.esi_end_inclusive, 2);
+        assert_eq!(run.source_symbol_count(), 3);
+        assert_eq!(run.offsets, vec![o0, o1, o2]);
+    }
+
+    #[test]
+    fn test_systematic_run_locator_missing_symbol_is_ignored() {
+        let dir = tempdir().expect("tempdir");
+        let manager = SymbolLogManager::new(dir.path(), 1, 42, 100).expect("manager");
+        let oti = Oti {
+            f: 64_u64 * 3,
+            al: 1,
+            t: 64,
+            z: 1,
+            n: 1,
+        };
+        let object_id = ObjectId::from_bytes([8_u8; 16]);
+
+        manager
+            .append(&systematic_record(8, oti, 0, 0xB1, true))
+            .expect("append esi0");
+        manager
+            .append(&systematic_record(8, oti, 2, 0xB3, false))
+            .expect("append esi2");
+
+        let locator =
+            rebuild_systematic_run_locator(dir.path()).expect("rebuild systematic locator");
+        assert!(
+            !locator.contains_key(&object_id),
+            "incomplete run must not be indexed as fast-path eligible"
+        );
+    }
+
+    #[test]
+    fn test_systematic_run_locator_interleaved_object_is_ignored() {
+        let dir = tempdir().expect("tempdir");
+        let manager = SymbolLogManager::new(dir.path(), 1, 42, 100).expect("manager");
+        let oti = Oti {
+            f: 64_u64 * 2,
+            al: 1,
+            t: 64,
+            z: 1,
+            n: 1,
+        };
+        let object_a = ObjectId::from_bytes([11_u8; 16]);
+        let object_b = ObjectId::from_bytes([12_u8; 16]);
+
+        manager
+            .append(&systematic_record(11, oti, 0, 0xC1, true))
+            .expect("append A esi0");
+        manager
+            .append(&systematic_record(12, oti, 0, 0xD1, true))
+            .expect("append B esi0");
+        manager
+            .append(&systematic_record(11, oti, 1, 0xC2, false))
+            .expect("append A esi1");
+
+        let locator =
+            rebuild_systematic_run_locator(dir.path()).expect("rebuild systematic locator");
+        assert!(
+            !locator.contains_key(&object_a),
+            "interleaved run must be rejected for fast-path"
+        );
+        assert!(
+            !locator.contains_key(&object_b),
+            "single-symbol run with K=2 must be rejected as incomplete"
+        );
+    }
+
+    #[test]
+    fn test_systematic_run_locator_prefers_newest_complete_run() {
+        let dir = tempdir().expect("tempdir");
+        let mut manager = SymbolLogManager::new(dir.path(), 1, 42, 100).expect("manager");
+        let oti = Oti {
+            f: 64_u64 * 2,
+            al: 1,
+            t: 64,
+            z: 1,
+            n: 1,
+        };
+        let object_id = ObjectId::from_bytes([13_u8; 16]);
+
+        manager
+            .append(&systematic_record(13, oti, 0, 0xE1, true))
+            .expect("append seg1 esi0");
+        manager
+            .append(&systematic_record(13, oti, 1, 0xE2, false))
+            .expect("append seg1 esi1");
+
+        manager.rotate(2, 43, 200).expect("rotate");
+        let newer_o0 = manager
+            .append(&systematic_record(13, oti, 0, 0xF1, true))
+            .expect("append seg2 esi0");
+        let newer_o1 = manager
+            .append(&systematic_record(13, oti, 1, 0xF2, false))
+            .expect("append seg2 esi1");
+
+        let locator =
+            rebuild_systematic_run_locator(dir.path()).expect("rebuild systematic locator");
+        let run = locator.get(&object_id).expect("run exists");
+        assert_eq!(
+            run.segment_id, 2,
+            "newest complete run should win in append-order locator rebuild"
+        );
+        assert_eq!(run.offsets, vec![newer_o0, newer_o1]);
+    }
+
+    #[test]
+    fn test_systematic_fast_path_success() {
+        let dir = tempdir().expect("tempdir");
+        let manager = SymbolLogManager::new(dir.path(), 1, 42, 100).expect("manager");
+        let oti = Oti {
+            f: 64_u64 * 3 - 11,
+            al: 1,
+            t: 64,
+            z: 1,
+            n: 1,
+        };
+        let object_id = ObjectId::from_bytes([21_u8; 16]);
+
+        let r0 = systematic_record(21, oti, 0, 0x11, true);
+        let r1 = systematic_record(21, oti, 1, 0x22, false);
+        let r2 = systematic_record(21, oti, 2, 0x33, false);
+        manager.append(&r0).expect("append esi0");
+        manager.append(&r1).expect("append esi1");
+        manager.append(&r2).expect("append esi2");
+        manager
+            .append(&systematic_record(21, oti, 3, 0x44, false))
+            .expect("append repair");
+
+        let runs = rebuild_systematic_run_locator(dir.path()).expect("rebuild runs");
+        let run = runs.get(&object_id).expect("run exists");
+        let maybe_payload = read_systematic_fast_path(dir.path(), run, object_id, oti, None)
+            .expect("fast-path read");
+        let payload = maybe_payload.expect("fast path should reconstruct");
+
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&r0.symbol_data);
+        expected.extend_from_slice(&r1.symbol_data);
+        expected.extend_from_slice(&r2.symbol_data);
+        expected.truncate(usize::try_from(oti.f).expect("f fits usize"));
+        assert_eq!(payload, expected);
+    }
+
+    #[test]
+    fn test_systematic_fast_path_corrupt_symbol_requires_fallback() {
+        let dir = tempdir().expect("tempdir");
+        let manager = SymbolLogManager::new(dir.path(), 1, 42, 100).expect("manager");
+        let oti = Oti {
+            f: 64_u64 * 3 - 7,
+            al: 1,
+            t: 64,
+            z: 1,
+            n: 1,
+        };
+        let object_id = ObjectId::from_bytes([22_u8; 16]);
+
+        let r0 = systematic_record(22, oti, 0, 0x51, true);
+        let r1 = systematic_record(22, oti, 1, 0x52, false);
+        let r2 = systematic_record(22, oti, 2, 0x53, false);
+        manager.append(&r0).expect("append esi0");
+        let r1_offset = manager.append(&r1).expect("append esi1");
+        manager.append(&r2).expect("append esi2");
+
+        let runs = rebuild_systematic_run_locator(dir.path()).expect("rebuild runs");
+        let run = runs.get(&object_id).expect("run exists").clone();
+
+        let segment_path = symbol_segment_path(dir.path(), r1_offset.segment_id);
+        let mut bytes = fs::read(&segment_path).expect("read segment bytes");
+        let record_offset = usize::try_from(r1_offset.offset_bytes).expect("offset fits usize");
+        let absolute_record_offset = SYMBOL_SEGMENT_HEADER_BYTES
+            .checked_add(record_offset)
+            .expect("absolute offset");
+        let data_byte_offset = absolute_record_offset
+            .checked_add(SYMBOL_RECORD_HEADER_BYTES)
+            .expect("data offset");
+        bytes[data_byte_offset] ^= 0xFF;
+        fs::write(&segment_path, bytes).expect("write corrupted segment");
+
+        let result = read_systematic_fast_path(dir.path(), &run, object_id, oti, None)
+            .expect("fast-path read should not hard-fail on corrupt symbol");
+        assert!(
+            result.is_none(),
+            "corrupt symbol should force fallback path"
+        );
+    }
+
+    #[test]
+    fn test_systematic_fast_path_missing_symbol_requires_fallback() {
+        let dir = tempdir().expect("tempdir");
+        let manager = SymbolLogManager::new(dir.path(), 1, 42, 100).expect("manager");
+        let oti = Oti {
+            f: 64_u64 * 3 - 3,
+            al: 1,
+            t: 64,
+            z: 1,
+            n: 1,
+        };
+        let object_id = ObjectId::from_bytes([23_u8; 16]);
+
+        manager
+            .append(&systematic_record(23, oti, 0, 0x61, true))
+            .expect("append esi0");
+        manager
+            .append(&systematic_record(23, oti, 1, 0x62, false))
+            .expect("append esi1");
+        manager
+            .append(&systematic_record(23, oti, 2, 0x63, false))
+            .expect("append esi2");
+
+        let runs = rebuild_systematic_run_locator(dir.path()).expect("rebuild runs");
+        let mut run = runs.get(&object_id).expect("run exists").clone();
+        run.offsets[1].offset_bytes = run.offsets[1].offset_bytes.saturating_add(1_000_000);
+
+        let result = read_systematic_fast_path(dir.path(), &run, object_id, oti, None)
+            .expect("fast-path read should not hard-fail on missing symbol");
+        assert!(
+            result.is_none(),
+            "missing symbol should force fallback path"
+        );
+    }
+
+    #[test]
+    fn test_systematic_fast_path_auth_failure_requires_fallback() {
+        let dir = tempdir().expect("tempdir");
+        let manager = SymbolLogManager::new(dir.path(), 1, 42, 100).expect("manager");
+        let oti = Oti {
+            f: 64_u64 * 3 - 5,
+            al: 1,
+            t: 64,
+            z: 1,
+            n: 1,
+        };
+        let object_id = ObjectId::from_bytes([24_u8; 16]);
+        let auth_epoch_key = [0xA5_u8; 32];
+        let wrong_epoch_key = [0x5A_u8; 32];
+
+        let r0 = systematic_record(24, oti, 0, 0x71, true).with_auth_tag(&auth_epoch_key);
+        let r1 = systematic_record(24, oti, 1, 0x72, false).with_auth_tag(&auth_epoch_key);
+        let r2 = systematic_record(24, oti, 2, 0x73, false).with_auth_tag(&auth_epoch_key);
+        manager.append(&r0).expect("append esi0");
+        manager.append(&r1).expect("append esi1");
+        manager.append(&r2).expect("append esi2");
+
+        let runs = rebuild_systematic_run_locator(dir.path()).expect("rebuild runs");
+        let run = runs.get(&object_id).expect("run exists");
+
+        let wrong_key_result =
+            read_systematic_fast_path(dir.path(), run, object_id, oti, Some(&wrong_epoch_key))
+                .expect("fast-path read with wrong key");
+        assert!(
+            wrong_key_result.is_none(),
+            "auth mismatch should force fallback path"
+        );
+
+        let correct_key_result =
+            read_systematic_fast_path(dir.path(), run, object_id, oti, Some(&auth_epoch_key))
+                .expect("fast-path read with correct key");
+        assert!(
+            correct_key_result.is_some(),
+            "correct auth key should keep fast path eligible"
+        );
     }
 
     #[test]
