@@ -9,10 +9,15 @@
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
+use std::mem::size_of;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, mpsc};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use fsqlite_error::{FrankenError, Result};
-use fsqlite_types::{ObjectId, Oti, PageSize, SymbolRecord};
+use fsqlite_types::{ObjectId, Oti, PageSize, SymbolRecord, SymbolRecordFlags};
 use tracing::{debug, error, info, warn};
 use xxhash_rust::xxh3::xxh3_64;
 
@@ -216,9 +221,7 @@ impl WalFecGroupMeta {
             let digest = read_array::<16>(bytes, &mut cursor, "source_page_hash")?;
             source_page_xxh3_128.push(Xxh3Checksum128 {
                 low: u64::from_le_bytes(digest[..8].try_into().expect("8-byte low hash slice")),
-                high: u64::from_le_bytes(
-                    digest[8..].try_into().expect("8-byte high hash slice"),
-                ),
+                high: u64::from_le_bytes(digest[8..].try_into().expect("8-byte high hash slice")),
             });
         }
         let checksum = read_u64_le(bytes, &mut cursor, "checksum")?;
@@ -269,12 +272,12 @@ impl WalFecGroupMeta {
     }
 
     fn compute_checksum(&self) -> u64 {
-        let mut bytes = self.to_record_bytes_without_checksum();
-        xxh3_64(&bytes.split_off(0))
+        xxh3_64(&self.to_record_bytes_without_checksum())
     }
 
     fn to_record_bytes_without_checksum(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(self.serialized_len_without_prefix() - META_CHECKSUM_BYTES);
+        let mut bytes =
+            Vec::with_capacity(self.serialized_len_without_prefix() - META_CHECKSUM_BYTES);
         bytes.extend_from_slice(&self.magic);
         append_u32_le(&mut bytes, self.version);
         append_u32_le(&mut bytes, self.wal_salt1);
@@ -297,6 +300,28 @@ impl WalFecGroupMeta {
     }
 
     fn validate_invariants(&self) -> Result<()> {
+        self.validate_meta_header()?;
+        self.validate_frame_span()?;
+        if self.r_repair == 0 {
+            return Err(FrankenError::WalCorrupt {
+                detail: "r_repair must be >= 1 for wal-fec groups".to_owned(),
+            });
+        }
+        let k_source_usize =
+            usize::try_from(self.k_source).map_err(|_| FrankenError::WalCorrupt {
+                detail: format!("k_source {} does not fit in usize", self.k_source),
+            })?;
+        self.validate_array_lengths(k_source_usize)?;
+        self.validate_page_size_and_oti()?;
+        if self.db_size_pages == 0 {
+            return Err(FrankenError::WalCorrupt {
+                detail: "db_size_pages must be non-zero commit frame size".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_meta_header(&self) -> Result<()> {
         if self.magic != WAL_FEC_GROUP_META_MAGIC {
             return Err(FrankenError::WalCorrupt {
                 detail: "invalid wal-fec magic".to_owned(),
@@ -310,6 +335,10 @@ impl WalFecGroupMeta {
                 ),
             });
         }
+        Ok(())
+    }
+
+    fn validate_frame_span(&self) -> Result<()> {
         if self.start_frame_no == 0 {
             return Err(FrankenError::WalCorrupt {
                 detail: "start_frame_no must be 1-based and nonzero".to_owned(),
@@ -338,16 +367,11 @@ impl WalFecGroupMeta {
                 ),
             });
         }
-        if self.r_repair == 0 {
-            return Err(FrankenError::WalCorrupt {
-                detail: "r_repair must be >= 1 for wal-fec groups".to_owned(),
-            });
-        }
-        if self.page_numbers.len()
-            != usize::try_from(self.k_source).map_err(|_| FrankenError::WalCorrupt {
-                detail: format!("k_source {} does not fit in usize", self.k_source),
-            })?
-        {
+        Ok(())
+    }
+
+    fn validate_array_lengths(&self, k_source_usize: usize) -> Result<()> {
+        if self.page_numbers.len() != k_source_usize {
             return Err(FrankenError::WalCorrupt {
                 detail: format!(
                     "page_numbers length {} must equal k_source {}",
@@ -356,11 +380,7 @@ impl WalFecGroupMeta {
                 ),
             });
         }
-        if self.source_page_xxh3_128.len()
-            != usize::try_from(self.k_source).map_err(|_| FrankenError::WalCorrupt {
-                detail: format!("k_source {} does not fit in usize", self.k_source),
-            })?
-        {
+        if self.source_page_xxh3_128.len() != k_source_usize {
             return Err(FrankenError::WalCorrupt {
                 detail: format!(
                     "source_page_xxh3_128 length {} must equal k_source {}",
@@ -369,6 +389,10 @@ impl WalFecGroupMeta {
                 ),
             });
         }
+        Ok(())
+    }
+
+    fn validate_page_size_and_oti(&self) -> Result<()> {
         if PageSize::new(self.page_size).is_none() {
             return Err(FrankenError::WalCorrupt {
                 detail: format!("invalid SQLite page_size {}", self.page_size),
@@ -393,11 +417,6 @@ impl WalFecGroupMeta {
                     "OTI.f {} must equal k_source*page_size ({expected_f})",
                     self.oti.f
                 ),
-            });
-        }
-        if self.db_size_pages == 0 {
-            return Err(FrankenError::WalCorrupt {
-                detail: "db_size_pages must be non-zero commit frame size".to_owned(),
             });
         }
         Ok(())
@@ -478,6 +497,416 @@ pub struct WalFecScanResult {
     pub truncated_tail: bool,
 }
 
+const DEFAULT_REPAIR_PIPELINE_QUEUE_CAPACITY: usize = 64;
+const REPAIR_PIPELINE_FLUSH_POLL_INTERVAL: Duration = Duration::from_millis(1);
+
+/// Pipeline configuration for asynchronous WAL-FEC repair generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalFecRepairPipelineConfig {
+    /// Maximum queued work items before backpressure.
+    pub queue_capacity: usize,
+    /// Optional deterministic delay per generated repair symbol (test hook).
+    pub per_symbol_delay: Duration,
+}
+
+impl Default for WalFecRepairPipelineConfig {
+    fn default() -> Self {
+        Self {
+            queue_capacity: DEFAULT_REPAIR_PIPELINE_QUEUE_CAPACITY,
+            per_symbol_delay: Duration::ZERO,
+        }
+    }
+}
+
+/// A single asynchronous WAL-FEC repair-generation work item.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalFecRepairWorkItem {
+    pub sidecar_path: PathBuf,
+    pub meta: WalFecGroupMeta,
+    pub source_pages: Vec<Vec<u8>>,
+}
+
+impl WalFecRepairWorkItem {
+    pub fn new(
+        sidecar_path: impl Into<PathBuf>,
+        meta: WalFecGroupMeta,
+        source_pages: Vec<Vec<u8>>,
+    ) -> Result<Self> {
+        validate_source_pages(&meta, &source_pages)?;
+        Ok(Self {
+            sidecar_path: sidecar_path.into(),
+            meta,
+            source_pages,
+        })
+    }
+}
+
+/// Snapshot of asynchronous WAL-FEC pipeline counters.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WalFecRepairPipelineStats {
+    pub pending_jobs: usize,
+    pub completed_jobs: usize,
+    pub failed_jobs: usize,
+    pub canceled_jobs: usize,
+    pub max_pending_jobs: usize,
+}
+
+#[derive(Debug)]
+enum WalFecPipelineMessage {
+    Work(WalFecRepairWorkItem),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WalFecWorkOutcome {
+    Completed,
+    Canceled,
+}
+
+/// Background worker that computes and appends WAL-FEC repair symbols.
+pub struct WalFecRepairPipeline {
+    sender: Option<mpsc::SyncSender<WalFecPipelineMessage>>,
+    cancel_flag: Arc<AtomicBool>,
+    pending_jobs: Arc<AtomicUsize>,
+    completed_jobs: Arc<AtomicUsize>,
+    failed_jobs: Arc<AtomicUsize>,
+    canceled_jobs: Arc<AtomicUsize>,
+    max_pending_jobs: Arc<AtomicUsize>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl WalFecRepairPipeline {
+    /// Start the pipeline worker.
+    pub fn start(config: WalFecRepairPipelineConfig) -> Result<Self> {
+        if config.queue_capacity == 0 {
+            return Err(FrankenError::WalCorrupt {
+                detail: "wal-fec repair pipeline queue_capacity must be >= 1".to_owned(),
+            });
+        }
+
+        let (tx, rx) = mpsc::sync_channel(config.queue_capacity);
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let pending_jobs = Arc::new(AtomicUsize::new(0));
+        let completed_jobs = Arc::new(AtomicUsize::new(0));
+        let failed_jobs = Arc::new(AtomicUsize::new(0));
+        let canceled_jobs = Arc::new(AtomicUsize::new(0));
+        let max_pending_jobs = Arc::new(AtomicUsize::new(0));
+
+        let worker_cancel = Arc::clone(&cancel_flag);
+        let worker_pending = Arc::clone(&pending_jobs);
+        let worker_completed = Arc::clone(&completed_jobs);
+        let worker_failed = Arc::clone(&failed_jobs);
+        let worker_canceled = Arc::clone(&canceled_jobs);
+        let worker_handle = thread::Builder::new()
+            .name("wal-fec-repair-pipeline".to_owned())
+            .spawn(move || {
+                while let Ok(message) = rx.recv() {
+                    match message {
+                        WalFecPipelineMessage::Work(work_item) => {
+                            let group_id = work_item.meta.group_id();
+                            let outcome = process_repair_work_item(
+                                &work_item,
+                                worker_cancel.as_ref(),
+                                config.per_symbol_delay,
+                            );
+                            worker_pending.fetch_sub(1, Ordering::SeqCst);
+                            match outcome {
+                                Ok(WalFecWorkOutcome::Completed) => {
+                                    worker_completed.fetch_add(1, Ordering::SeqCst);
+                                    info!(
+                                        group_id = %group_id,
+                                        "wal-fec repair work item completed"
+                                    );
+                                }
+                                Ok(WalFecWorkOutcome::Canceled) => {
+                                    worker_canceled.fetch_add(1, Ordering::SeqCst);
+                                    warn!(
+                                        group_id = %group_id,
+                                        "wal-fec repair work item canceled before append"
+                                    );
+                                }
+                                Err(err) => {
+                                    worker_failed.fetch_add(1, Ordering::SeqCst);
+                                    error!(
+                                        group_id = %group_id,
+                                        error = %err,
+                                        "wal-fec repair work item failed"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            })
+            .map_err(|err| FrankenError::WalCorrupt {
+                detail: format!("failed to spawn wal-fec repair worker thread: {err}"),
+            })?;
+
+        Ok(Self {
+            sender: Some(tx),
+            cancel_flag,
+            pending_jobs,
+            completed_jobs,
+            failed_jobs,
+            canceled_jobs,
+            max_pending_jobs,
+            worker: Some(worker_handle),
+        })
+    }
+
+    /// Queue a new repair-generation work item without blocking commit path.
+    pub fn enqueue(&self, work_item: WalFecRepairWorkItem) -> Result<()> {
+        if self.cancel_flag.load(Ordering::SeqCst) {
+            return Err(FrankenError::WalCorrupt {
+                detail: "wal-fec repair pipeline is canceled".to_owned(),
+            });
+        }
+        let sender = self
+            .sender
+            .as_ref()
+            .ok_or_else(|| FrankenError::WalCorrupt {
+                detail: "wal-fec repair pipeline is shut down".to_owned(),
+            })?;
+
+        let pending_after = self.pending_jobs.fetch_add(1, Ordering::SeqCst) + 1;
+        update_max_pending(&self.max_pending_jobs, pending_after);
+
+        match sender.try_send(WalFecPipelineMessage::Work(work_item)) {
+            Ok(()) => Ok(()),
+            Err(mpsc::TrySendError::Full(_)) => {
+                self.pending_jobs.fetch_sub(1, Ordering::SeqCst);
+                Err(FrankenError::WalCorrupt {
+                    detail: "wal-fec repair pipeline queue full".to_owned(),
+                })
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                self.pending_jobs.fetch_sub(1, Ordering::SeqCst);
+                Err(FrankenError::WalCorrupt {
+                    detail: "wal-fec repair pipeline worker is disconnected".to_owned(),
+                })
+            }
+        }
+    }
+
+    /// Request cancellation for queued/in-flight work.
+    pub fn cancel(&self) {
+        self.cancel_flag.store(true, Ordering::SeqCst);
+    }
+
+    /// Wait until queue drains or timeout expires.
+    #[must_use]
+    pub fn flush(&self, timeout: Duration) -> bool {
+        let Some(deadline) = Instant::now().checked_add(timeout) else {
+            return false;
+        };
+        loop {
+            if self.pending_jobs.load(Ordering::SeqCst) == 0 {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(REPAIR_PIPELINE_FLUSH_POLL_INTERVAL);
+        }
+    }
+
+    /// Read current counters.
+    #[must_use]
+    pub fn stats(&self) -> WalFecRepairPipelineStats {
+        WalFecRepairPipelineStats {
+            pending_jobs: self.pending_jobs.load(Ordering::SeqCst),
+            completed_jobs: self.completed_jobs.load(Ordering::SeqCst),
+            failed_jobs: self.failed_jobs.load(Ordering::SeqCst),
+            canceled_jobs: self.canceled_jobs.load(Ordering::SeqCst),
+            max_pending_jobs: self.max_pending_jobs.load(Ordering::SeqCst),
+        }
+    }
+
+    /// Stop the worker and join thread.
+    pub fn shutdown(&mut self) -> Result<WalFecRepairPipelineStats> {
+        self.cancel();
+        self.sender.take();
+        if let Some(worker) = self.worker.take() {
+            worker.join().map_err(|_| FrankenError::WalCorrupt {
+                detail: "wal-fec repair worker thread panicked".to_owned(),
+            })?;
+        }
+        Ok(self.stats())
+    }
+}
+
+impl Drop for WalFecRepairPipeline {
+    fn drop(&mut self) {
+        if self.worker.is_some() {
+            let _ = self.shutdown();
+        }
+    }
+}
+
+/// Deterministically generate repair symbols from source pages.
+pub fn generate_wal_fec_repair_symbols(
+    meta: &WalFecGroupMeta,
+    source_pages: &[Vec<u8>],
+) -> Result<Vec<SymbolRecord>> {
+    match generate_wal_fec_repair_symbols_inner(meta, source_pages, None, Duration::ZERO)? {
+        Some(symbols) => Ok(symbols),
+        None => Err(FrankenError::WalCorrupt {
+            detail: "unexpected cancellation while generating wal-fec symbols".to_owned(),
+        }),
+    }
+}
+
+fn process_repair_work_item(
+    work_item: &WalFecRepairWorkItem,
+    cancel_flag: &AtomicBool,
+    per_symbol_delay: Duration,
+) -> Result<WalFecWorkOutcome> {
+    if cancel_flag.load(Ordering::SeqCst) {
+        return Ok(WalFecWorkOutcome::Canceled);
+    }
+    let Some(repair_symbols) = generate_wal_fec_repair_symbols_inner(
+        &work_item.meta,
+        &work_item.source_pages,
+        Some(cancel_flag),
+        per_symbol_delay,
+    )?
+    else {
+        return Ok(WalFecWorkOutcome::Canceled);
+    };
+    if cancel_flag.load(Ordering::SeqCst) {
+        return Ok(WalFecWorkOutcome::Canceled);
+    }
+    let group = WalFecGroupRecord::new(work_item.meta.clone(), repair_symbols)?;
+    append_wal_fec_group(&work_item.sidecar_path, &group)?;
+    Ok(WalFecWorkOutcome::Completed)
+}
+
+fn generate_wal_fec_repair_symbols_inner(
+    meta: &WalFecGroupMeta,
+    source_pages: &[Vec<u8>],
+    cancel_flag: Option<&AtomicBool>,
+    per_symbol_delay: Duration,
+) -> Result<Option<Vec<SymbolRecord>>> {
+    validate_source_pages(meta, source_pages)?;
+    let symbol_len = usize::try_from(meta.oti.t).map_err(|_| FrankenError::WalCorrupt {
+        detail: format!("OTI symbol size {} does not fit in usize", meta.oti.t),
+    })?;
+    let mut symbols = Vec::with_capacity(usize::try_from(meta.r_repair).map_err(|_| {
+        FrankenError::WalCorrupt {
+            detail: format!("r_repair {} does not fit in usize", meta.r_repair),
+        }
+    })?);
+
+    for repair_index in 0..meta.r_repair {
+        if let Some(flag) = cancel_flag {
+            if flag.load(Ordering::SeqCst) {
+                return Ok(None);
+            }
+        }
+        let mut payload = vec![0_u8; symbol_len];
+        let seed = derive_repair_seed(meta, repair_index);
+        let seed_bytes = seed.to_le_bytes();
+        let repair_index_usize =
+            usize::try_from(repair_index).map_err(|_| FrankenError::WalCorrupt {
+                detail: format!("repair_index {repair_index} does not fit in usize"),
+            })?;
+
+        for byte_index in 0..symbol_len {
+            let mut mixed = seed_bytes[byte_index % seed_bytes.len()];
+            for (page_index, page) in source_pages.iter().enumerate() {
+                let read_index = (byte_index + page_index + repair_index_usize) % symbol_len;
+                let source_byte = page[read_index];
+                let tweak_raw = (page_index + byte_index) & 0xFF;
+                let tweak = u8::try_from(tweak_raw).map_err(|_| FrankenError::WalCorrupt {
+                    detail: format!("tweak value {tweak_raw} does not fit in u8"),
+                })?;
+                mixed ^= source_byte;
+                mixed = mixed.rotate_left(u32::from(tweak & 0x07)) ^ tweak;
+            }
+            payload[byte_index] = mixed;
+        }
+
+        if per_symbol_delay > Duration::ZERO {
+            thread::sleep(per_symbol_delay);
+        }
+        let esi =
+            meta.k_source
+                .checked_add(repair_index)
+                .ok_or_else(|| FrankenError::WalCorrupt {
+                    detail: "repair symbol ESI overflow".to_owned(),
+                })?;
+        symbols.push(SymbolRecord::new(
+            meta.object_id,
+            meta.oti,
+            esi,
+            payload,
+            SymbolRecordFlags::empty(),
+        ));
+    }
+
+    Ok(Some(symbols))
+}
+
+fn validate_source_pages(meta: &WalFecGroupMeta, source_pages: &[Vec<u8>]) -> Result<()> {
+    let expected_pages = usize::try_from(meta.k_source).map_err(|_| FrankenError::WalCorrupt {
+        detail: format!("k_source {} does not fit in usize", meta.k_source),
+    })?;
+    if source_pages.len() != expected_pages {
+        return Err(FrankenError::WalCorrupt {
+            detail: format!(
+                "source page count {} must equal k_source {}",
+                source_pages.len(),
+                meta.k_source
+            ),
+        });
+    }
+    let expected_len = usize::try_from(meta.page_size).map_err(|_| FrankenError::WalCorrupt {
+        detail: format!("page_size {} does not fit in usize", meta.page_size),
+    })?;
+
+    for (index, page) in source_pages.iter().enumerate() {
+        if page.len() != expected_len {
+            return Err(FrankenError::WalCorrupt {
+                detail: format!(
+                    "source page {index} has length {}, expected {expected_len}",
+                    page.len()
+                ),
+            });
+        }
+        let actual_hash = wal_fec_source_hash_xxh3_128(page);
+        let expected_hash = meta.source_page_xxh3_128[index];
+        if actual_hash != expected_hash {
+            return Err(FrankenError::WalCorrupt {
+                detail: format!("source page hash mismatch at index {index}"),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn derive_repair_seed(meta: &WalFecGroupMeta, repair_index: u32) -> u64 {
+    let mut seed_material = Vec::with_capacity(16 + (7 * size_of::<u32>()));
+    seed_material.extend_from_slice(meta.object_id.as_bytes());
+    seed_material.extend_from_slice(&meta.wal_salt1.to_le_bytes());
+    seed_material.extend_from_slice(&meta.wal_salt2.to_le_bytes());
+    seed_material.extend_from_slice(&meta.start_frame_no.to_le_bytes());
+    seed_material.extend_from_slice(&meta.end_frame_no.to_le_bytes());
+    seed_material.extend_from_slice(&meta.k_source.to_le_bytes());
+    seed_material.extend_from_slice(&meta.r_repair.to_le_bytes());
+    seed_material.extend_from_slice(&repair_index.to_le_bytes());
+    xxh3_64(&seed_material)
+}
+
+fn update_max_pending(max_pending: &AtomicUsize, candidate: usize) {
+    let mut observed = max_pending.load(Ordering::SeqCst);
+    while candidate > observed {
+        match max_pending.compare_exchange(observed, candidate, Ordering::SeqCst, Ordering::SeqCst)
+        {
+            Ok(_) => break,
+            Err(new_observed) => observed = new_observed,
+        }
+    }
+}
+
 /// Build source hashes for `K` WAL payload pages.
 #[must_use]
 pub fn build_source_page_hashes(page_payloads: &[Vec<u8>]) -> Vec<Xxh3Checksum128> {
@@ -491,9 +920,7 @@ pub fn build_source_page_hashes(page_payloads: &[Vec<u8>]) -> Vec<Xxh3Checksum12
 #[must_use]
 pub fn wal_fec_path_for_wal(wal_path: &Path) -> PathBuf {
     let wal_name = wal_path.to_string_lossy();
-    if wal_name.ends_with("-wal") {
-        PathBuf::from(format!("{wal_name}-fec"))
-    } else if wal_name.ends_with(".wal") {
+    if wal_name.ends_with("-wal") || wal_name.ends_with(".wal") {
         PathBuf::from(format!("{wal_name}-fec"))
     } else {
         PathBuf::from(format!("{wal_name}.wal-fec"))
@@ -558,38 +985,33 @@ pub fn scan_wal_fec(sidecar_path: &Path) -> Result<WalFecScanResult> {
     let mut truncated_tail = false;
 
     while cursor < bytes.len() {
-        let meta_bytes = match read_length_prefixed(&bytes, &mut cursor)? {
-            Some(record) => record,
-            None => {
+        let Some(meta_bytes) = read_length_prefixed(&bytes, &mut cursor)? else {
+            truncated_tail = true;
+            warn!(
+                sidecar = %sidecar_path.display(),
+                cursor,
+                "truncated wal-fec metadata tail detected"
+            );
+            break;
+        };
+        let meta = WalFecGroupMeta::from_record_bytes(meta_bytes)?;
+        let mut repair_symbols =
+            Vec::with_capacity(usize::try_from(meta.r_repair).map_err(|_| {
+                FrankenError::WalCorrupt {
+                    detail: format!("r_repair {} does not fit in usize", meta.r_repair),
+                }
+            })?);
+
+        for _ in 0..meta.r_repair {
+            let Some(symbol_bytes) = read_length_prefixed(&bytes, &mut cursor)? else {
                 truncated_tail = true;
                 warn!(
                     sidecar = %sidecar_path.display(),
+                    group_id = %meta.group_id(),
                     cursor,
-                    "truncated wal-fec metadata tail detected"
+                    "truncated wal-fec repair-symbol tail detected"
                 );
                 break;
-            }
-        };
-        let meta = WalFecGroupMeta::from_record_bytes(meta_bytes)?;
-        let mut repair_symbols = Vec::with_capacity(
-            usize::try_from(meta.r_repair).map_err(|_| FrankenError::WalCorrupt {
-                detail: format!("r_repair {} does not fit in usize", meta.r_repair),
-            })?,
-        );
-
-        for _ in 0..meta.r_repair {
-            let symbol_bytes = match read_length_prefixed(&bytes, &mut cursor)? {
-                Some(record) => record,
-                None => {
-                    truncated_tail = true;
-                    warn!(
-                        sidecar = %sidecar_path.display(),
-                        group_id = %meta.group_id(),
-                        cursor,
-                        "truncated wal-fec repair-symbol tail detected"
-                    );
-                    break;
-                }
             };
             let symbol = SymbolRecord::from_bytes(symbol_bytes).map_err(|err| {
                 error!(
@@ -631,7 +1053,10 @@ pub fn find_wal_fec_group(
 
 fn write_length_prefixed(file: &mut File, payload: &[u8], what: &str) -> Result<()> {
     let len_u32 = u32::try_from(payload.len()).map_err(|_| FrankenError::WalCorrupt {
-        detail: format!("{what} too large for wal-fec length prefix: {}", payload.len()),
+        detail: format!(
+            "{what} too large for wal-fec length prefix: {}",
+            payload.len()
+        ),
     })?;
     file.write_all(&len_u32.to_le_bytes())?;
     file.write_all(payload)?;
@@ -648,11 +1073,10 @@ fn read_length_prefixed<'a>(bytes: &'a [u8], cursor: &mut usize) -> Result<Optio
     let mut len_raw = [0u8; LENGTH_PREFIX_BYTES];
     len_raw.copy_from_slice(&bytes[*cursor..*cursor + LENGTH_PREFIX_BYTES]);
     *cursor += LENGTH_PREFIX_BYTES;
-    let payload_len = usize::try_from(u32::from_le_bytes(len_raw)).map_err(|_| {
-        FrankenError::WalCorrupt {
+    let payload_len =
+        usize::try_from(u32::from_le_bytes(len_raw)).map_err(|_| FrankenError::WalCorrupt {
             detail: "wal-fec length prefix does not fit in usize".to_owned(),
-        }
-    })?;
+        })?;
     let end = cursor
         .checked_add(payload_len)
         .ok_or_else(|| FrankenError::WalCorrupt {
@@ -685,9 +1109,11 @@ fn read_u64_le(bytes: &[u8], cursor: &mut usize, field: &str) -> Result<u64> {
 }
 
 fn read_array<const N: usize>(bytes: &[u8], cursor: &mut usize, field: &str) -> Result<[u8; N]> {
-    let end = cursor.checked_add(N).ok_or_else(|| FrankenError::WalCorrupt {
-        detail: format!("overflow reading wal-fec field {field}"),
-    })?;
+    let end = cursor
+        .checked_add(N)
+        .ok_or_else(|| FrankenError::WalCorrupt {
+            detail: format!("overflow reading wal-fec field {field}"),
+        })?;
     if end > bytes.len() {
         return Err(FrankenError::WalCorrupt {
             detail: format!(
@@ -702,4 +1128,3 @@ fn read_array<const N: usize>(bytes: &[u8], cursor: &mut usize, field: &str) -> 
     *cursor = end;
     Ok(out)
 }
-
