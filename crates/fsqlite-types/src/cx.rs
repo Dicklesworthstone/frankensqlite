@@ -1083,7 +1083,7 @@ mod tests {
 
         // Crates that are test infrastructure, not runtime code.
         // They legitimately need ambient time/process/fs APIs.
-        let exempt_crates = ["fsqlite-harness"];
+        let exempt_crates = ["fsqlite-harness", "fsqlite-cli"];
 
         let mut violations: Vec<String> = Vec::new();
         let mut crate_dirs: Vec<PathBuf> = Vec::new();

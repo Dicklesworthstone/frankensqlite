@@ -57,13 +57,14 @@ pub use compat::{
 pub use conflict_model::{
     AMS_SKETCH_VERSION, AmsEvidenceLedger, AmsSketch, AmsSketchConfig, AmsWindowCollector,
     AmsWindowCollectorConfig, AmsWindowEstimate, DEFAULT_AMS_R, DEFAULT_HEAVY_HITTER_K,
-    DEFAULT_ZIPF_MAX_ITERS, HeadTailDecomposition, HeavyHitterLedgerEntry, MAX_AMS_R,
-    MAX_HEAVY_HITTER_K, MIN_AMS_R, MIN_HEAVY_HITTER_K, SpaceSavingEntry, SpaceSavingSummary,
-    WindowCloseReason, ZIPF_S_MAX, ZIPF_S_MIN, ZipfMleResult, ams_sign,
+    DEFAULT_ZIPF_MAX_ITERS, HeadTailDecomposition, HeavyHitterLedgerEntry, InstrumentationCounters,
+    MAX_AMS_R, MAX_HEAVY_HITTER_K, MIN_AMS_R, MIN_HEAVY_HITTER_K, SpaceSavingEntry,
+    SpaceSavingSummary, WindowCloseReason, ZIPF_S_MAX, ZIPF_S_MIN, ZipfMleResult, ams_sign,
     birthday_conflict_probability_m2, birthday_conflict_probability_uniform,
-    compute_head_tail_decomposition, dedup_write_set, effective_collision_pool, exact_m2, mix64,
-    pairwise_conflict_probability, policy_collision_mass_input, validate_ams_r,
-    validate_heavy_hitter_k, zipf_mle_from_ranked_counts,
+    compute_head_tail_decomposition, dedup_write_set, effective_collision_pool,
+    effective_w_index_multiplier, effective_w_leaf_split, effective_w_root_split, exact_m2, mix64,
+    p_abort_attempt, p_drift, pairwise_conflict_probability, policy_collision_mass_input,
+    tps_estimate, validate_ams_r, validate_heavy_hitter_k, zipf_mle_from_ranked_counts,
 };
 pub use core_types::{
     CommitIndex, CommitLog, CommitRecord, DrainProgress, DrainResult, GcHorizonResult,
@@ -132,7 +133,7 @@ pub use ssi_validation::{
 };
 pub use time_travel::{
     TimeTravelError, TimeTravelSnapshot, TimeTravelTarget, create_time_travel_snapshot,
-    resolve_page_at_commit, resolve_timestamp_via_commit_log,
+    resolve_page_at_commit, resolve_timestamp_via_commit_log, resolve_timestamp_via_markers,
 };
 pub use two_phase_commit::{
     COMMIT_MARKER_MAGIC, COMMIT_MARKER_MIN_SIZE, DatabaseId, GlobalCommitMarker, MAIN_DB_ID,
