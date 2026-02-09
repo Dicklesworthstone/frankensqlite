@@ -489,6 +489,7 @@ dependencies = [
  "fsqlite-error",
  "fsqlite-pager",
  "fsqlite-types",
+ "proptest",
  "tracing",
 ]
 
@@ -606,6 +607,7 @@ dependencies = [
  "fsqlite-core",
  "fsqlite-error",
  "fsqlite-func",
+ "fsqlite-mvcc",
  "fsqlite-pager",
  "fsqlite-types",
  "fsqlite-vfs",

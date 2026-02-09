@@ -395,22 +395,17 @@ impl Parser {
         } else {
             vec![]
         };
-        let materialized = if self.eat_kw(&TokenKind::KwAs) {
-            None
-        } else if self.check_kw(&TokenKind::KwNot) {
+        // SQL syntax: name AS [NOT] MATERIALIZED (subquery)
+        self.expect_kw(&TokenKind::KwAs)?;
+        let materialized = if self.check_kw(&TokenKind::KwNot) {
             self.advance();
             self.expect_kw(&TokenKind::KwMaterialized)?;
-            self.expect_kw(&TokenKind::KwAs)?;
             Some(CteMaterialized::NotMaterialized)
         } else if self.eat_kw(&TokenKind::KwMaterialized) {
-            self.expect_kw(&TokenKind::KwAs)?;
             Some(CteMaterialized::Materialized)
         } else {
-            self.expect_kw(&TokenKind::KwAs)?;
             None
         };
-        // Handle the case where AS was consumed above.
-        // Now we need the parenthesized select.
         self.expect_token(&TokenKind::LeftParen)?;
         let query = self.parse_select_stmt(None)?;
         self.expect_token(&TokenKind::RightParen)?;
@@ -2009,6 +2004,39 @@ mod tests {
     }
 
     #[test]
+    fn select_named_window_definition_and_reference() {
+        let stmt = parse_one(
+            "SELECT sum(x) OVER win FROM t \
+             WINDOW win AS (PARTITION BY y ORDER BY z)",
+        );
+        if let Statement::Select(s) = stmt {
+            if let SelectCore::Select {
+                columns, windows, ..
+            } = &s.body.select
+            {
+                assert_eq!(windows.len(), 1);
+                assert_eq!(windows[0].name, "win");
+                assert_eq!(windows[0].spec.partition_by.len(), 1);
+                assert_eq!(windows[0].spec.order_by.len(), 1);
+                match &columns[0] {
+                    ResultColumn::Expr {
+                        expr:
+                            Expr::FunctionCall {
+                                over: Some(over), ..
+                            },
+                        ..
+                    } => assert_eq!(over.base_window.as_deref(), Some("win")),
+                    other => unreachable!("expected named window function, got {other:?}"),
+                }
+            } else {
+                unreachable!("expected Select core");
+            }
+        } else {
+            unreachable!("expected Select");
+        }
+    }
+
+    #[test]
     fn insert_values() {
         let stmt = parse_one("INSERT INTO t (a, b) VALUES (1, 2), (3, 4)");
         assert!(matches!(stmt, Statement::Insert(_)));
@@ -2137,5 +2165,559 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // bd-2kvo Phase 3 acceptance: parser join types
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parser_join_inner() {
+        let stmt = parse_one("SELECT * FROM a INNER JOIN b ON a.id = b.a_id");
+        if let Statement::Select(s) = stmt {
+            if let SelectCore::Select { from, .. } = &s.body.select {
+                let from = from.as_ref().expect("FROM clause");
+                assert!(!from.joins.is_empty());
+                assert_eq!(from.joins[0].join_type.kind, JoinKind::Inner);
+            } else {
+                unreachable!("expected Select core");
+            }
+        } else {
+            unreachable!("expected Select");
+        }
+    }
+
+    #[test]
+    fn test_parser_join_left() {
+        let stmt = parse_one("SELECT * FROM a LEFT JOIN b ON a.id = b.a_id");
+        if let Statement::Select(s) = stmt {
+            if let SelectCore::Select { from, .. } = &s.body.select {
+                let from = from.as_ref().expect("FROM clause");
+                assert_eq!(from.joins[0].join_type.kind, JoinKind::Left);
+            } else {
+                unreachable!("expected Select core");
+            }
+        } else {
+            unreachable!("expected Select");
+        }
+    }
+
+    #[test]
+    fn test_parser_join_left_outer() {
+        let stmt = parse_one("SELECT * FROM a LEFT OUTER JOIN b ON a.id = b.a_id");
+        if let Statement::Select(s) = stmt {
+            if let SelectCore::Select { from, .. } = &s.body.select {
+                let from = from.as_ref().expect("FROM clause");
+                assert_eq!(from.joins[0].join_type.kind, JoinKind::Left);
+            } else {
+                unreachable!("expected Select core");
+            }
+        } else {
+            unreachable!("expected Select");
+        }
+    }
+
+    #[test]
+    fn test_parser_join_right() {
+        let stmt = parse_one("SELECT * FROM a RIGHT JOIN b ON a.id = b.a_id");
+        if let Statement::Select(s) = stmt {
+            if let SelectCore::Select { from, .. } = &s.body.select {
+                let from = from.as_ref().expect("FROM clause");
+                assert_eq!(from.joins[0].join_type.kind, JoinKind::Right);
+            } else {
+                unreachable!("expected Select core");
+            }
+        } else {
+            unreachable!("expected Select");
+        }
+    }
+
+    #[test]
+    fn test_parser_join_full() {
+        let stmt = parse_one("SELECT * FROM a FULL OUTER JOIN b ON a.id = b.a_id");
+        if let Statement::Select(s) = stmt {
+            if let SelectCore::Select { from, .. } = &s.body.select {
+                let from = from.as_ref().expect("FROM clause");
+                assert_eq!(from.joins[0].join_type.kind, JoinKind::Full);
+            } else {
+                unreachable!("expected Select core");
+            }
+        } else {
+            unreachable!("expected Select");
+        }
+    }
+
+    #[test]
+    fn test_parser_join_cross() {
+        let stmt = parse_one("SELECT * FROM a CROSS JOIN b");
+        if let Statement::Select(s) = stmt {
+            if let SelectCore::Select { from, .. } = &s.body.select {
+                let from = from.as_ref().expect("FROM clause");
+                assert_eq!(from.joins[0].join_type.kind, JoinKind::Cross);
+            } else {
+                unreachable!("expected Select core");
+            }
+        } else {
+            unreachable!("expected Select");
+        }
+    }
+
+    #[test]
+    fn test_parser_join_natural() {
+        let stmt = parse_one("SELECT * FROM a NATURAL JOIN b");
+        if let Statement::Select(s) = stmt {
+            if let SelectCore::Select { from, .. } = &s.body.select {
+                let from = from.as_ref().expect("FROM clause");
+                assert!(from.joins[0].join_type.natural);
+            } else {
+                unreachable!("expected Select core");
+            }
+        } else {
+            unreachable!("expected Select");
+        }
+    }
+
+    #[test]
+    fn test_parser_join_using() {
+        let stmt = parse_one("SELECT * FROM a JOIN b USING (id)");
+        if let Statement::Select(s) = stmt {
+            if let SelectCore::Select { from, .. } = &s.body.select {
+                let from = from.as_ref().expect("FROM clause");
+                assert!(matches!(
+                    from.joins[0].constraint,
+                    Some(JoinConstraint::Using(_))
+                ));
+            } else {
+                unreachable!("expected Select core");
+            }
+        } else {
+            unreachable!("expected Select");
+        }
+    }
+
+    #[test]
+    fn test_parser_join_comma() {
+        // Comma-join is an implicit cross join.
+        let stmt = parse_one("SELECT * FROM a, b WHERE a.id = b.a_id");
+        if let Statement::Select(s) = stmt {
+            if let SelectCore::Select { from, .. } = &s.body.select {
+                let from = from.as_ref().expect("FROM clause");
+                assert!(!from.joins.is_empty());
+                assert_eq!(from.joins[0].join_type.kind, JoinKind::Cross);
+            } else {
+                unreachable!("expected Select core");
+            }
+        } else {
+            unreachable!("expected Select");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // bd-2kvo Phase 3 acceptance: CTE syntax
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parser_cte_basic() {
+        let stmt = parse_one("WITH cte AS (SELECT 1 AS x) SELECT * FROM cte");
+        if let Statement::Select(s) = stmt {
+            let with = s.with.as_ref().expect("WITH clause");
+            assert!(!with.recursive);
+            assert_eq!(with.ctes.len(), 1);
+            assert_eq!(with.ctes[0].name, "cte");
+        } else {
+            unreachable!("expected Select");
+        }
+    }
+
+    #[test]
+    fn test_parser_cte_multiple() {
+        let stmt = parse_one("WITH a AS (SELECT 1), b AS (SELECT 2) SELECT * FROM a, b");
+        if let Statement::Select(s) = stmt {
+            let with = s.with.as_ref().expect("WITH clause");
+            assert_eq!(with.ctes.len(), 2);
+            assert_eq!(with.ctes[0].name, "a");
+            assert_eq!(with.ctes[1].name, "b");
+        } else {
+            unreachable!("expected Select");
+        }
+    }
+
+    #[test]
+    fn test_parser_cte_recursive() {
+        let stmt = parse_one(
+            "WITH RECURSIVE cnt(x) AS (\
+             SELECT 1 UNION ALL SELECT x+1 FROM cnt WHERE x<10\
+             ) SELECT x FROM cnt",
+        );
+        if let Statement::Select(s) = stmt {
+            let with = s.with.as_ref().expect("WITH clause");
+            assert!(with.recursive);
+            assert_eq!(with.ctes[0].name, "cnt");
+            assert_eq!(with.ctes[0].columns, vec!["x".to_owned()]);
+        } else {
+            unreachable!("expected Select");
+        }
+    }
+
+    #[test]
+    fn test_parser_cte_materialized() {
+        let stmt = parse_one("WITH cte AS MATERIALIZED (SELECT 1) SELECT * FROM cte");
+        if let Statement::Select(s) = stmt {
+            let with = s.with.as_ref().expect("WITH clause");
+            assert_eq!(
+                with.ctes[0].materialized,
+                Some(CteMaterialized::Materialized)
+            );
+        } else {
+            unreachable!("expected Select");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // bd-2kvo Phase 3 acceptance: keywords as identifiers
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parser_keyword_as_column_name() {
+        // "order" is a keyword but valid as a column name in many contexts.
+        let stmt = parse_one("SELECT \"order\" FROM t");
+        assert!(matches!(stmt, Statement::Select(_)));
+    }
+
+    #[test]
+    fn test_parser_keyword_as_alias() {
+        let stmt = parse_one("SELECT 1 AS \"limit\"");
+        assert!(matches!(stmt, Statement::Select(_)));
+    }
+
+    #[test]
+    fn test_parser_keyword_as_table_name() {
+        let stmt = parse_one("SELECT * FROM \"group\"");
+        assert!(matches!(stmt, Statement::Select(_)));
+    }
+
+    // -----------------------------------------------------------------------
+    // bd-2kvo Phase 3 acceptance: all statement types (Section 12 coverage)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parser_all_statement_types() {
+        // Each statement type from Section 12 must parse without error.
+        let statements = [
+            // DML
+            "SELECT 1",
+            "INSERT INTO t VALUES (1)",
+            "INSERT OR REPLACE INTO t VALUES (1)",
+            "UPDATE t SET a = 1",
+            "DELETE FROM t WHERE id = 1",
+            "REPLACE INTO t VALUES (1)",
+            // DDL
+            "CREATE TABLE t (id INTEGER PRIMARY KEY)",
+            "CREATE TEMPORARY TABLE t (id INTEGER)",
+            "CREATE TABLE IF NOT EXISTS t (id INTEGER)",
+            "CREATE INDEX idx ON t (a)",
+            "CREATE UNIQUE INDEX idx ON t (a)",
+            "CREATE VIEW v AS SELECT 1",
+            "CREATE TRIGGER tr AFTER INSERT ON t BEGIN SELECT 1; END",
+            "CREATE VIRTUAL TABLE t USING fts5(a, b)",
+            "ALTER TABLE t RENAME TO t2",
+            "ALTER TABLE t ADD COLUMN c TEXT",
+            "ALTER TABLE t DROP COLUMN c",
+            "ALTER TABLE t RENAME COLUMN a TO b",
+            "DROP TABLE t",
+            "DROP TABLE IF EXISTS t",
+            "DROP INDEX idx",
+            "DROP VIEW v",
+            "DROP TRIGGER tr",
+            // Transaction
+            "BEGIN",
+            "BEGIN DEFERRED",
+            "BEGIN IMMEDIATE",
+            "BEGIN EXCLUSIVE",
+            "COMMIT",
+            "END",
+            "ROLLBACK",
+            "SAVEPOINT sp1",
+            "RELEASE sp1",
+            "RELEASE SAVEPOINT sp1",
+            "ROLLBACK TO sp1",
+            "ROLLBACK TO SAVEPOINT sp1",
+            // Utility
+            "ATTACH DATABASE ':memory:' AS db2",
+            "DETACH db2",
+            "ANALYZE",
+            "ANALYZE t",
+            "VACUUM",
+            "VACUUM INTO '/tmp/backup.db'",
+            "REINDEX",
+            "REINDEX t",
+            "EXPLAIN SELECT 1",
+            "EXPLAIN QUERY PLAN SELECT 1",
+            // PRAGMA
+            "PRAGMA journal_mode",
+            "PRAGMA journal_mode = WAL",
+            "PRAGMA table_info(t)",
+        ];
+
+        for sql in &statements {
+            let mut p = Parser::from_sql(sql);
+            let (stmts, errs) = p.parse_all();
+            assert!(errs.is_empty(), "failed to parse '{sql}': {errs:?}");
+            assert_eq!(
+                stmts.len(),
+                1,
+                "expected 1 statement for '{sql}', got {}",
+                stmts.len()
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // bd-2kvo Phase 3 acceptance: expression precedence
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parser_expression_precedence_mul_over_add() {
+        // 1 + 2 * 3 should parse as 1 + (2 * 3)
+        let stmt = parse_one("SELECT 1 + 2 * 3");
+        if let Statement::Select(s) = stmt {
+            if let SelectCore::Select { columns, .. } = &s.body.select {
+                match &columns[0] {
+                    ResultColumn::Expr { expr, .. } => {
+                        // Outer expression should be Add, right side should be Multiply.
+                        assert!(
+                            matches!(expr, Expr::BinaryOp { .. }),
+                            "expected BinaryOp, got {expr:?}"
+                        );
+                    }
+                    other => unreachable!("expected Expr column, got {other:?}"),
+                }
+            } else {
+                unreachable!("expected Select core");
+            }
+        } else {
+            unreachable!("expected Select");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // bd-2kvo Phase 3 acceptance: INSERT with ON CONFLICT and RETURNING
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parser_insert_on_conflict() {
+        let stmt =
+            parse_one("INSERT INTO t (a) VALUES (1) ON CONFLICT (a) DO UPDATE SET a = excluded.a");
+        if let Statement::Insert(i) = stmt {
+            assert!(!i.upsert.is_empty());
+        } else {
+            unreachable!("expected Insert");
+        }
+    }
+
+    #[test]
+    fn test_parser_insert_returning() {
+        let stmt = parse_one("INSERT INTO t (a) VALUES (1) RETURNING *");
+        if let Statement::Insert(i) = stmt {
+            assert!(!i.returning.is_empty());
+        } else {
+            unreachable!("expected Insert");
+        }
+    }
+
+    #[test]
+    fn test_parser_delete_returning() {
+        let stmt = parse_one("DELETE FROM t WHERE id = 1 RETURNING *");
+        if let Statement::Delete(d) = stmt {
+            assert!(!d.returning.is_empty());
+        } else {
+            unreachable!("expected Delete");
+        }
+    }
+
+    #[test]
+    fn test_parser_update_returning() {
+        let stmt = parse_one("UPDATE t SET a = 1 RETURNING a, b");
+        if let Statement::Update(u) = stmt {
+            assert_eq!(u.returning.len(), 2);
+        } else {
+            unreachable!("expected Update");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // bd-2kvo Phase 3 acceptance: compound SELECT operators
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parser_union() {
+        let stmt = parse_one("SELECT 1 UNION SELECT 2");
+        if let Statement::Select(s) = stmt {
+            assert_eq!(s.body.compounds.len(), 1);
+            assert_eq!(s.body.compounds[0].0, CompoundOp::Union);
+        } else {
+            unreachable!("expected Select");
+        }
+    }
+
+    #[test]
+    fn test_parser_intersect() {
+        let stmt = parse_one("SELECT 1 INTERSECT SELECT 2");
+        if let Statement::Select(s) = stmt {
+            assert_eq!(s.body.compounds.len(), 1);
+            assert_eq!(s.body.compounds[0].0, CompoundOp::Intersect);
+        } else {
+            unreachable!("expected Select");
+        }
+    }
+
+    #[test]
+    fn test_parser_except() {
+        let stmt = parse_one("SELECT 1 EXCEPT SELECT 2");
+        if let Statement::Select(s) = stmt {
+            assert_eq!(s.body.compounds.len(), 1);
+            assert_eq!(s.body.compounds[0].0, CompoundOp::Except);
+        } else {
+            unreachable!("expected Select");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // bd-2kvo Phase 3 acceptance: subquery in FROM
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parser_subquery_in_from() {
+        let stmt = parse_one("SELECT * FROM (SELECT 1 AS x) AS sub");
+        assert!(matches!(stmt, Statement::Select(_)));
+    }
+
+    // -----------------------------------------------------------------------
+    // bd-2kvo Phase 3 acceptance: CREATE TABLE with constraints
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parser_create_table_all_constraints() {
+        let stmt = parse_one(
+            "CREATE TABLE t (\
+             id INTEGER PRIMARY KEY AUTOINCREMENT,\
+             name TEXT NOT NULL DEFAULT '',\
+             email TEXT UNIQUE,\
+             age INTEGER CHECK(age >= 0),\
+             dept_id INTEGER REFERENCES dept(id) ON DELETE CASCADE,\
+             CONSTRAINT pk PRIMARY KEY (id),\
+             UNIQUE (email),\
+             CHECK (age < 200),\
+             FOREIGN KEY (dept_id) REFERENCES dept(id)\
+             )",
+        );
+        if let Statement::CreateTable(ct) = stmt {
+            if let CreateTableBody::Columns {
+                columns,
+                constraints,
+            } = ct.body
+            {
+                assert_eq!(columns.len(), 5);
+                assert!(!constraints.is_empty());
+            } else {
+                unreachable!("expected column defs");
+            }
+        } else {
+            unreachable!("expected CreateTable");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // bd-2kvo Phase 3 acceptance: CREATE TRIGGER with all timing/events
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parser_create_trigger_before_delete() {
+        let stmt = parse_one("CREATE TRIGGER tr BEFORE DELETE ON t BEGIN SELECT 1; END");
+        if let Statement::CreateTrigger(tr) = stmt {
+            assert_eq!(tr.timing, TriggerTiming::Before);
+            assert!(matches!(tr.event, TriggerEvent::Delete));
+        } else {
+            unreachable!("expected CreateTrigger");
+        }
+    }
+
+    #[test]
+    fn test_parser_create_trigger_instead_of_update() {
+        let stmt =
+            parse_one("CREATE TRIGGER tr INSTEAD OF UPDATE OF a, b ON v BEGIN SELECT 1; END");
+        if let Statement::CreateTrigger(tr) = stmt {
+            assert_eq!(tr.timing, TriggerTiming::InsteadOf);
+            if let TriggerEvent::Update(cols) = &tr.event {
+                assert_eq!(cols.len(), 2);
+            } else {
+                unreachable!("expected UpdateOf event");
+            }
+        } else {
+            unreachable!("expected CreateTrigger");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // bd-2kvo Phase 3 acceptance: CREATE VIEW with columns
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parser_create_view_with_columns() {
+        let stmt = parse_one("CREATE VIEW v (a, b) AS SELECT 1, 2");
+        if let Statement::CreateView(cv) = stmt {
+            assert_eq!(cv.columns, vec!["a".to_owned(), "b".to_owned()]);
+        } else {
+            unreachable!("expected CreateView");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // bd-2kvo Phase 3 acceptance: multi-way join
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parser_multi_join() {
+        let stmt = parse_one(
+            "SELECT a.x, b.y, c.z FROM a \
+             JOIN b ON a.id = b.a_id \
+             LEFT JOIN c ON b.id = c.b_id \
+             CROSS JOIN d",
+        );
+        if let Statement::Select(s) = stmt {
+            if let SelectCore::Select { from, .. } = &s.body.select {
+                let from = from.as_ref().expect("FROM clause");
+                assert_eq!(from.joins.len(), 3);
+                assert_eq!(from.joins[0].join_type.kind, JoinKind::Inner);
+                assert_eq!(from.joins[1].join_type.kind, JoinKind::Left);
+                assert_eq!(from.joins[2].join_type.kind, JoinKind::Cross);
+            } else {
+                unreachable!("expected Select core");
+            }
+        } else {
+            unreachable!("expected Select");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // bd-2kvo Phase 3 acceptance: GROUP BY / HAVING
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parser_group_by_having() {
+        let stmt = parse_one("SELECT dept, count(*) FROM emp GROUP BY dept HAVING count(*) > 5");
+        if let Statement::Select(s) = stmt {
+            if let SelectCore::Select {
+                group_by, having, ..
+            } = &s.body.select
+            {
+                assert!(!group_by.is_empty());
+                assert!(having.is_some());
+            } else {
+                unreachable!("expected Select core");
+            }
+        } else {
+            unreachable!("expected Select");
+        }
     }
 }

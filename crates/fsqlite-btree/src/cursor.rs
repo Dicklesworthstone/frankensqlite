@@ -960,29 +960,62 @@ impl<P: PageWriter> BtCursor<P> {
     /// Balance the tree after deleting from a non-root leaf.
     ///
     /// For a root leaf page (single-level tree), no balancing is required.
+    ///
+    /// This propagates the rebalance upward through the tree.  When
+    /// merging siblings at one level reduces the parent to zero cells,
+    /// the parent itself becomes a candidate for merging with *its*
+    /// siblings at the next level up.  At the root level,
+    /// `apply_child_replacement` triggers `balance_shallower` which
+    /// copies the sole remaining child into the root page, reducing the
+    /// tree depth by one (the inverse of `balance_deeper`).
     fn balance_for_delete(&mut self, cx: &Cx) -> Result<()> {
         let depth = self.stack.len();
         if depth <= 1 {
             return Ok(());
         }
 
-        let parent_page_no = self.stack[depth - 2].page_no;
-        let child_idx = usize::from(self.stack[depth - 2].cell_idx);
+        // Start at the leaf's parent and propagate upward as needed.
+        let mut level = depth - 2;
 
-        let outcome = balance::balance_nonroot(
-            cx,
-            &mut self.pager,
-            parent_page_no,
-            child_idx,
-            &[],
-            0,
-            self.usable_size,
-            parent_page_no == self.root_page,
-        )?;
-        if matches!(outcome, balance::BalanceResult::Split { .. }) {
-            return Err(FrankenError::internal(
-                "delete balance unexpectedly returned split requiring parent update",
-            ));
+        loop {
+            let parent_page_no = self.stack[level].page_no;
+            let child_idx = usize::from(self.stack[level].cell_idx);
+            let parent_is_root = parent_page_no == self.root_page;
+
+            let outcome = balance::balance_nonroot(
+                cx,
+                &mut self.pager,
+                parent_page_no,
+                child_idx,
+                &[],
+                0,
+                self.usable_size,
+                parent_is_root,
+            )?;
+            if matches!(outcome, balance::BalanceResult::Split { .. }) {
+                return Err(FrankenError::internal(
+                    "delete balance unexpectedly returned split requiring parent update",
+                ));
+            }
+
+            // If we just balanced at the root level, we are done.
+            // balance_shallower (called from apply_child_replacement)
+            // already handled the 0-cell root case.
+            if parent_is_root || level == 0 {
+                break;
+            }
+
+            // Check whether the parent now has zero cells — if so, it
+            // needs to be merged with its siblings at the next level up.
+            let parent_data = self.pager.read_page(cx, parent_page_no)?;
+            let parent_offset = cell::header_offset_for_page(parent_page_no);
+            let parent_header = cell::BtreePageHeader::parse(&parent_data, parent_offset)?;
+
+            if parent_header.cell_count == 0 && parent_header.page_type.is_interior() {
+                level -= 1;
+            } else {
+                break;
+            }
         }
 
         // Tree shape may change after balancing.
@@ -1216,6 +1249,7 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
 mod tests {
     use super::*;
     use fsqlite_types::serial_type::write_varint;
+    use proptest::strategy::Strategy as _;
     use std::collections::{BTreeMap, BTreeSet, HashMap};
 
     /// Simple in-memory page store for testing.
@@ -1764,12 +1798,16 @@ mod tests {
             cursor.delete(&cx).unwrap();
         }
 
+        // After balance_shallower, the root collapses from interior
+        // (with 0 cells and a single right-child) down to whatever page
+        // type the right-child was.  For a depth-2 tree the right-child
+        // is a leaf, so the root becomes a leaf.
         let root_page = cursor.pager.pages.get(&2).unwrap();
         let root_header = BtreePageHeader::parse(root_page, 0).unwrap();
-        assert_eq!(root_header.page_type, cell::BtreePageType::InteriorTable);
-        assert_eq!(
-            root_header.cell_count, 0,
-            "root should collapse to a single right-child after leftmost leaf drains"
+        assert!(
+            root_header.page_type.is_leaf(),
+            "root should collapse to leaf after leftmost leaf drains, got {:?}",
+            root_header.page_type
         );
 
         assert!(cursor.first(&cx).unwrap());
@@ -2375,5 +2413,288 @@ mod tests {
         assert!(cursor.eof());
         assert!(cursor.payload(&cx).is_err());
         assert!(cursor.rowid(&cx).is_err());
+    }
+
+    /// Regression test for bd-14lx: sustained deletes that drain all leaf
+    /// pages under one interior subtree must collapse the tree from depth 3
+    /// back to depth 2 (or even depth 1).
+    ///
+    /// The test inserts enough data to force a depth-3 tree (root →
+    /// interior → leaf), then deletes every row.  After all deletes the
+    /// tree must have collapsed — either to a single leaf root page, or
+    /// at least from depth 3 to a shallower structure that passes
+    /// first()/next() enumeration correctly.
+    #[test]
+    fn test_depth3_collapse_after_sustained_deletes() {
+        let mut store = MemPageStore::default();
+        store.pages.insert(2, build_leaf_table(&[]));
+
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+
+        // Use large payloads (~1400 bytes) so that fewer cells per leaf
+        // forces deeper trees sooner.
+        let mut max_rowid = 0i64;
+        let mut reached_depth_3 = false;
+
+        for rowid in 1..=2000_i64 {
+            let payload = vec![b'D'; 1400];
+            cursor.table_insert(&cx, rowid, &payload).unwrap();
+            max_rowid = rowid;
+
+            // Check tree depth by descending from root.
+            let depth = measure_tree_depth(&cursor.pager, pn(2), USABLE);
+            if depth >= 3 {
+                reached_depth_3 = true;
+                break;
+            }
+        }
+
+        assert!(
+            reached_depth_3,
+            "failed to build depth-3 tree (reached rowid {max_rowid})"
+        );
+
+        // Delete every row.
+        for rowid in 1..=max_rowid {
+            let seek = cursor.table_move_to(&cx, rowid).unwrap();
+            assert!(seek.is_found(), "rowid {rowid} should exist before delete");
+            cursor.delete(&cx).unwrap();
+        }
+
+        // After deleting everything, the tree must be empty.
+        assert!(
+            !cursor.first(&cx).unwrap(),
+            "tree should be empty after total delete"
+        );
+        assert!(cursor.eof());
+
+        // The root page should have collapsed to a leaf (depth 1).
+        let root_data = cursor.pager.read_page(&cx, pn(2)).unwrap();
+        let root_header = cell::BtreePageHeader::parse(&root_data, 0).unwrap();
+        assert!(
+            root_header.page_type.is_leaf(),
+            "root should collapse to leaf after all rows deleted, got {:?}",
+            root_header.page_type
+        );
+        assert_eq!(root_header.cell_count, 0);
+    }
+
+    /// Variant of the depth-3 collapse test that deletes only *some* rows,
+    /// enough to drain one interior subtree, and verifies the remaining
+    /// rows are still correctly enumerable.
+    #[test]
+    fn test_depth3_partial_delete_collapse() {
+        let mut store = MemPageStore::default();
+        store.pages.insert(2, build_leaf_table(&[]));
+
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+
+        let mut max_rowid = 0i64;
+        for rowid in 1..=2000_i64 {
+            let payload = vec![b'P'; 1400];
+            cursor.table_insert(&cx, rowid, &payload).unwrap();
+            max_rowid = rowid;
+
+            let depth = measure_tree_depth(&cursor.pager, pn(2), USABLE);
+            if depth >= 3 {
+                break;
+            }
+        }
+
+        // Delete the first half of rows.
+        let half = max_rowid / 2;
+        for rowid in 1..=half {
+            let seek = cursor.table_move_to(&cx, rowid).unwrap();
+            assert!(seek.is_found(), "rowid {rowid} should exist before delete");
+            cursor.delete(&cx).unwrap();
+        }
+
+        // Verify the remaining rows are intact.
+        let mut seen = 0usize;
+        if cursor.first(&cx).unwrap() {
+            let mut prev = i64::MIN;
+            loop {
+                let rowid = cursor.rowid(&cx).unwrap();
+                assert!(rowid > prev, "out-of-order rowid {rowid} after {prev}");
+                assert!(rowid > half, "deleted rowid {rowid} still present");
+                prev = rowid;
+                seen += 1;
+                if !cursor.next(&cx).unwrap() {
+                    break;
+                }
+            }
+        }
+        assert_eq!(
+            seen,
+            usize::try_from(max_rowid - half).unwrap(),
+            "wrong number of surviving rows"
+        );
+    }
+
+    /// Measure tree depth by descending from the root following the
+    /// leftmost child at each interior level.
+    fn measure_tree_depth<P: PageReader>(pager: &P, root: PageNumber, _usable: u32) -> usize {
+        let cx = Cx::new();
+        let mut pgno = root;
+        let mut depth = 1;
+        loop {
+            let data = pager.read_page(&cx, pgno).unwrap();
+            let offset = cell::header_offset_for_page(pgno);
+            let header = cell::BtreePageHeader::parse(&data, offset).unwrap();
+            if header.page_type.is_leaf() {
+                return depth;
+            }
+            // Descend into the leftmost child.
+            let ptrs = cell::read_cell_pointers(&data, &header, offset).unwrap();
+            if ptrs.is_empty() {
+                // Interior page with 0 cells — use right_child.
+                pgno = header
+                    .right_child
+                    .expect("interior page must have right_child");
+            } else {
+                // First cell's left-child pointer (first 4 bytes of cell).
+                let cell_offset = ptrs[0] as usize;
+                let raw = u32::from_be_bytes([
+                    data[cell_offset],
+                    data[cell_offset + 1],
+                    data[cell_offset + 2],
+                    data[cell_offset + 3],
+                ]);
+                pgno = PageNumber::new(raw).expect("invalid child page number");
+            }
+            depth += 1;
+        }
+    }
+
+    /// Phase 3 acceptance: large overflow payloads are stored and retrieved
+    /// correctly across multiple overflow pages.
+    #[test]
+    fn test_btree_multiple_overflow_pages() {
+        let mut store = MemPageStore::default();
+        store.pages.insert(2, build_leaf_table(&[]));
+
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+
+        // Insert 10 rows with payloads between 5000 and 10000 bytes,
+        // each requiring multiple overflow pages (page usable = 4096).
+        let payloads: Vec<Vec<u8>> = (0..10)
+            .map(|i| vec![b'A' + (i as u8 % 26); 5000 + i * 500])
+            .collect();
+
+        for (i, payload) in payloads.iter().enumerate() {
+            let rowid = i64::try_from(i + 1).unwrap();
+            cursor.table_insert(&cx, rowid, payload).unwrap();
+        }
+
+        // Verify every row round-trips exactly.
+        for (i, expected) in payloads.iter().enumerate() {
+            let rowid = i64::try_from(i + 1).unwrap();
+            let seek = cursor.table_move_to(&cx, rowid).unwrap();
+            assert!(seek.is_found(), "rowid {rowid} not found");
+            let got = cursor.payload(&cx).unwrap();
+            assert_eq!(
+                got.len(),
+                expected.len(),
+                "payload length mismatch at rowid {rowid}"
+            );
+            assert_eq!(&got[..], &expected[..], "payload mismatch at rowid {rowid}");
+        }
+    }
+
+    /// Phase 3 acceptance: page count must grow as rows are inserted
+    /// (proving page splits occur), and sorted order is maintained.
+    #[test]
+    fn test_btree_page_count_grows_with_inserts() {
+        let mut store = MemPageStore::default();
+        store.pages.insert(2, build_leaf_table(&[]));
+
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+
+        // Insert 500 rows with ~200 byte payloads to force multiple splits.
+        for i in 1..=500_i64 {
+            let payload = format!("row-{i:05}-payload-data-{}", "X".repeat(180));
+            cursor.table_insert(&cx, i, payload.as_bytes()).unwrap();
+        }
+
+        // The tree must have split into multiple levels.
+        let depth = measure_tree_depth(&cursor.pager, pn(2), USABLE);
+        assert!(
+            depth > 1,
+            "expected tree depth > 1 after 500 inserts, got {depth}"
+        );
+
+        // Full forward scan must yield 500 rows in sorted order.
+        assert!(cursor.first(&cx).unwrap());
+        let mut count = 1u32;
+        let mut prev = cursor.rowid(&cx).unwrap();
+        while cursor.next(&cx).unwrap() {
+            let current = cursor.rowid(&cx).unwrap();
+            assert!(current > prev, "sort violation: {current} followed {prev}");
+            prev = current;
+            count += 1;
+        }
+        assert_eq!(count, 500, "expected 500 rows, saw {count}");
+    }
+
+    proptest::proptest! {
+        /// Property: after arbitrary insert/delete sequences the B-tree
+        /// always maintains sorted rowid order when scanned.
+        #[test]
+        fn prop_btree_order_invariant(
+            ops in proptest::collection::vec(
+                proptest::prop_oneof![
+                    (1..=5000_i64, proptest::collection::vec(proptest::num::u8::ANY, 10..200))
+                        .prop_map(|(r, p)| (true, r, p)),
+                    (1..=5000_i64,).prop_map(|(r,)| (false, r, Vec::new())),
+                ],
+                1..200
+            )
+        ) {
+            let mut store = MemPageStore::default();
+            store.pages.insert(2, build_leaf_table(&[]));
+
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+            let mut live: BTreeSet<i64> = BTreeSet::new();
+
+            for (is_insert, rowid, payload) in &ops {
+                if *is_insert && !live.contains(rowid) {
+                    cursor.table_insert(&cx, *rowid, payload).unwrap();
+                    live.insert(*rowid);
+                } else if !*is_insert && live.contains(rowid) {
+                    let seek = cursor.table_move_to(&cx, *rowid).unwrap();
+                    if seek.is_found() {
+                        cursor.delete(&cx).unwrap();
+                        live.remove(rowid);
+                    }
+                }
+            }
+
+            // Verify sorted order and correct count.
+            let mut scanned = Vec::new();
+            if cursor.first(&cx).unwrap() {
+                loop {
+                    scanned.push(cursor.rowid(&cx).unwrap());
+                    if !cursor.next(&cx).unwrap() {
+                        break;
+                    }
+                }
+            }
+
+            // Rowids must be strictly ascending.
+            for window in scanned.windows(2) {
+                proptest::prop_assert!(
+                    window[0] < window[1],
+                    "sort violation: {} >= {}",
+                    window[0],
+                    window[1]
+                );
+            }
+            proptest::prop_assert_eq!(scanned.len(), live.len());
+        }
     }
 }
