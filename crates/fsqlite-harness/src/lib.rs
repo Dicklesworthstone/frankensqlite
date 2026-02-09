@@ -16,6 +16,7 @@ pub mod seed_taxonomy;
 pub mod spec_to_beads_audit;
 pub mod supervision;
 pub mod tla;
+pub mod verification_gates;
 
 #[cfg(test)]
 mod gf256_verification {
