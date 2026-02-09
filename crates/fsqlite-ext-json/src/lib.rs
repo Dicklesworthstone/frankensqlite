@@ -27,6 +27,13 @@ enum PathSegment {
     FromEnd(usize),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditMode {
+    Set,
+    Insert,
+    Replace,
+}
+
 /// Parse and minify JSON text.
 ///
 /// Returns a canonical minified JSON string or a `FunctionError` if invalid.
@@ -166,6 +173,42 @@ pub fn json_object(args: &[SqliteValue]) -> Result<String> {
     serde_json::to_string(&Value::Object(map)).map_err(|error| {
         FrankenError::function_error(format!("json_object encode failed: {error}"))
     })
+}
+
+/// Set JSON values at path(s), creating object keys when missing.
+pub fn json_set(input: &str, pairs: &[(&str, SqliteValue)]) -> Result<String> {
+    edit_json_paths(input, pairs, EditMode::Set)
+}
+
+/// Insert JSON values at path(s) only when path does not already exist.
+pub fn json_insert(input: &str, pairs: &[(&str, SqliteValue)]) -> Result<String> {
+    edit_json_paths(input, pairs, EditMode::Insert)
+}
+
+/// Replace JSON values at path(s) only when path already exists.
+pub fn json_replace(input: &str, pairs: &[(&str, SqliteValue)]) -> Result<String> {
+    edit_json_paths(input, pairs, EditMode::Replace)
+}
+
+/// Remove JSON values at path(s). Array removals compact the array.
+pub fn json_remove(input: &str, paths: &[&str]) -> Result<String> {
+    let mut root = parse_json_text(input)?;
+    for path in paths {
+        let segments = parse_path(path)?;
+        remove_at_path(&mut root, &segments);
+    }
+    serde_json::to_string(&root).map_err(|error| {
+        FrankenError::function_error(format!("json_remove encode failed: {error}"))
+    })
+}
+
+/// Apply RFC 7396 JSON Merge Patch.
+pub fn json_patch(input: &str, patch: &str) -> Result<String> {
+    let root = parse_json_text(input)?;
+    let patch_value = parse_json_text(patch)?;
+    let merged = merge_patch(root, patch_value);
+    serde_json::to_string(&merged)
+        .map_err(|error| FrankenError::function_error(format!("json_patch encode failed: {error}")))
 }
 
 fn parse_json_text(input: &str) -> Result<Value> {
@@ -352,6 +395,164 @@ fn sqlite_to_json(value: &SqliteValue) -> Result<Value> {
     }
 }
 
+fn edit_json_paths(input: &str, pairs: &[(&str, SqliteValue)], mode: EditMode) -> Result<String> {
+    let mut root = parse_json_text(input)?;
+    for (path, value) in pairs {
+        let segments = parse_path(path)?;
+        let replacement = sqlite_to_json(value)?;
+        apply_edit(&mut root, &segments, replacement, mode);
+    }
+
+    serde_json::to_string(&root)
+        .map_err(|error| FrankenError::function_error(format!("json edit encode failed: {error}")))
+}
+
+fn apply_edit(root: &mut Value, segments: &[PathSegment], new_value: Value, mode: EditMode) {
+    if segments.is_empty() {
+        match mode {
+            EditMode::Set | EditMode::Replace => *root = new_value,
+            EditMode::Insert => {}
+        }
+        return;
+    }
+
+    let (parent_segments, last) = segments.split_at(segments.len() - 1);
+    let Some(last_segment) = last.first() else {
+        return;
+    };
+    let Some(parent) = resolve_path_mut(root, parent_segments) else {
+        return;
+    };
+
+    match (parent, last_segment) {
+        (Value::Object(object), PathSegment::Key(key)) => {
+            let exists = object.contains_key(key);
+            match mode {
+                EditMode::Set => {
+                    object.insert(key.clone(), new_value);
+                }
+                EditMode::Insert => {
+                    if !exists {
+                        object.insert(key.clone(), new_value);
+                    }
+                }
+                EditMode::Replace => {
+                    if exists {
+                        object.insert(key.clone(), new_value);
+                    }
+                }
+            }
+        }
+        (Value::Array(array), PathSegment::Index(index)) => {
+            apply_array_edit(array, *index, new_value, mode);
+        }
+        (Value::Array(array), PathSegment::FromEnd(from_end)) => {
+            if *from_end == 0 || *from_end > array.len() {
+                return;
+            }
+            let index = array.len() - *from_end;
+            apply_array_edit(array, index, new_value, mode);
+        }
+        _ => {}
+    }
+}
+
+fn apply_array_edit(array: &mut [Value], index: usize, new_value: Value, mode: EditMode) {
+    if index >= array.len() {
+        return;
+    }
+
+    match mode {
+        EditMode::Set | EditMode::Replace => array[index] = new_value,
+        EditMode::Insert => {}
+    }
+}
+
+fn remove_at_path(root: &mut Value, segments: &[PathSegment]) {
+    if segments.is_empty() {
+        *root = Value::Null;
+        return;
+    }
+
+    let (parent_segments, last) = segments.split_at(segments.len() - 1);
+    let Some(last_segment) = last.first() else {
+        return;
+    };
+    let Some(parent) = resolve_path_mut(root, parent_segments) else {
+        return;
+    };
+
+    match (parent, last_segment) {
+        (Value::Object(object), PathSegment::Key(key)) => {
+            object.remove(key);
+        }
+        (Value::Array(array), PathSegment::Index(index)) => {
+            if *index < array.len() {
+                array.remove(*index);
+            }
+        }
+        (Value::Array(array), PathSegment::FromEnd(from_end)) => {
+            if *from_end == 0 || *from_end > array.len() {
+                return;
+            }
+            let index = array.len() - *from_end;
+            array.remove(index);
+        }
+        _ => {}
+    }
+}
+
+fn resolve_path_mut<'a>(root: &'a mut Value, segments: &[PathSegment]) -> Option<&'a mut Value> {
+    let mut cursor = root;
+
+    for segment in segments {
+        match segment {
+            PathSegment::Key(key) => {
+                let next = cursor.as_object_mut()?.get_mut(key)?;
+                cursor = next;
+            }
+            PathSegment::Index(index) => {
+                let next = cursor.as_array_mut()?.get_mut(*index)?;
+                cursor = next;
+            }
+            PathSegment::FromEnd(from_end) => {
+                let array = cursor.as_array_mut()?;
+                if *from_end == 0 || *from_end > array.len() {
+                    return None;
+                }
+                let index = array.len() - *from_end;
+                let next = array.get_mut(index)?;
+                cursor = next;
+            }
+        }
+    }
+
+    Some(cursor)
+}
+
+fn merge_patch(target: Value, patch: Value) -> Value {
+    match patch {
+        Value::Object(patch_map) => {
+            let mut target_map = match target {
+                Value::Object(map) => map,
+                _ => Map::new(),
+            };
+
+            for (key, patch_value) in patch_map {
+                if patch_value.is_null() {
+                    target_map.remove(&key);
+                    continue;
+                }
+                let prior = target_map.remove(&key).unwrap_or(Value::Null);
+                target_map.insert(key, merge_patch(prior, patch_value));
+            }
+
+            Value::Object(target_map)
+        }
+        other => other,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -462,5 +663,65 @@ mod tests {
         assert_eq!(json_array_length("[1,2,3]", None).unwrap(), Some(3));
         assert_eq!(json_array_length("[]", None).unwrap(), Some(0));
         assert_eq!(json_array_length(r#"{"a":1}"#, None).unwrap(), None);
+    }
+
+    #[test]
+    fn test_json_set_create() {
+        let out = json_set(r#"{"a":1}"#, &[("$.b", SqliteValue::Integer(2))]).unwrap();
+        assert_eq!(out, r#"{"a":1,"b":2}"#);
+    }
+
+    #[test]
+    fn test_json_set_overwrite() {
+        let out = json_set(r#"{"a":1}"#, &[("$.a", SqliteValue::Integer(2))]).unwrap();
+        assert_eq!(out, r#"{"a":2}"#);
+    }
+
+    #[test]
+    fn test_json_insert_no_overwrite() {
+        let out = json_insert(r#"{"a":1}"#, &[("$.a", SqliteValue::Integer(2))]).unwrap();
+        assert_eq!(out, r#"{"a":1}"#);
+    }
+
+    #[test]
+    fn test_json_insert_create() {
+        let out = json_insert(r#"{"a":1}"#, &[("$.b", SqliteValue::Integer(2))]).unwrap();
+        assert_eq!(out, r#"{"a":1,"b":2}"#);
+    }
+
+    #[test]
+    fn test_json_replace_overwrite() {
+        let out = json_replace(r#"{"a":1}"#, &[("$.a", SqliteValue::Integer(2))]).unwrap();
+        assert_eq!(out, r#"{"a":2}"#);
+    }
+
+    #[test]
+    fn test_json_replace_no_create() {
+        let out = json_replace(r#"{"a":1}"#, &[("$.b", SqliteValue::Integer(2))]).unwrap();
+        assert_eq!(out, r#"{"a":1}"#);
+    }
+
+    #[test]
+    fn test_json_remove_key() {
+        let out = json_remove(r#"{"a":1,"b":2}"#, &["$.a"]).unwrap();
+        assert_eq!(out, r#"{"b":2}"#);
+    }
+
+    #[test]
+    fn test_json_remove_array_compact() {
+        let out = json_remove("[1,2,3]", &["$[1]"]).unwrap();
+        assert_eq!(out, "[1,3]");
+    }
+
+    #[test]
+    fn test_json_patch_merge() {
+        let out = json_patch(r#"{"a":1,"b":2}"#, r#"{"b":3,"c":4}"#).unwrap();
+        assert_eq!(out, r#"{"a":1,"b":3,"c":4}"#);
+    }
+
+    #[test]
+    fn test_json_patch_delete() {
+        let out = json_patch(r#"{"a":1,"b":2}"#, r#"{"b":null}"#).unwrap();
+        assert_eq!(out, r#"{"a":1}"#);
     }
 }
