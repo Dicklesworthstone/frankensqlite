@@ -1,6 +1,7 @@
 # Rust / Cargo build artifacts
 /target/
 **/target/
+target_*/
 
 # Cargo lock is committed (workspace contains binary crate fsqlite-cli)
 # Cargo.lock
