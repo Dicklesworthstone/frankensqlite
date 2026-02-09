@@ -1,21 +1,35 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::process::{Command, Output};
 
 use fsqlite_pager::{
-    JournalHeader, JournalPageRecord, MvccPager, SimplePager, TransactionHandle, TransactionMode,
+    Argon2Params, DATABASE_ID_SIZE, DatabaseId, ENCRYPTION_RESERVED_BYTES, EncryptError,
+    JournalHeader, JournalPageRecord, KEY_SIZE, KeyManager, MvccPager, NONCE_SIZE, PageEncryptor,
+    SimplePager, TransactionHandle, TransactionMode,
 };
+#[cfg(unix)]
+use fsqlite_types::LockLevel;
 use fsqlite_types::PageSize;
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::{AccessFlags, SyncFlags, VfsOpenFlags};
+use fsqlite_types::{ObjectId, Oti};
 use fsqlite_vfs::MemoryVfs;
+#[cfg(unix)]
+use fsqlite_vfs::UnixVfs;
 use fsqlite_vfs::traits::{Vfs, VfsFile};
 use fsqlite_wal::{
     CheckpointMode, CheckpointState, CheckpointTarget, WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE,
-    WalChainInvalidReason, WalFile, WalSalts, execute_checkpoint, validate_wal_chain,
+    WalChainInvalidReason, WalFecGroupMeta, WalFecGroupMetaInit, WalFecGroupRecord,
+    WalFecRecoveryOutcome, WalFile, WalFrameCandidate, WalSalts, append_wal_fec_group,
+    build_source_page_hashes, compute_wal_frame_checksum, execute_checkpoint,
+    generate_wal_fec_repair_symbols, read_wal_header_checksum, recover_wal_fec_group_with_decoder,
+    validate_wal_chain, write_wal_frame_salts,
 };
 use proptest::prelude::proptest;
 use proptest::test_runner::TestCaseError;
 use serde_json::Value;
+use tempfile::tempdir;
 
 const BEAD_ID: &str = "bd-bca.1";
 const ISSUES_JSONL: &str = ".beads/issues.jsonl";
@@ -168,6 +182,35 @@ fn open_wal_file(
                 wal_path.display()
             )
         })
+}
+
+#[cfg(unix)]
+fn sqlite3_available() -> bool {
+    Command::new("sqlite3").arg("--version").output().is_ok()
+}
+
+#[cfg(unix)]
+fn sqlite3_exec(db_path: &Path, sql: &str) -> Result<Output, String> {
+    Command::new("sqlite3")
+        .arg(db_path)
+        .arg(sql)
+        .output()
+        .map_err(|error| {
+            format!(
+                "sqlite3_exec_failed path={} error={error}",
+                db_path.display()
+            )
+        })
+}
+
+fn encryption_test_nonce(seed: u8) -> [u8; NONCE_SIZE] {
+    let mut nonce = [0_u8; NONCE_SIZE];
+    for (index, byte) in nonce.iter_mut().enumerate() {
+        #[allow(clippy::cast_possible_truncation)]
+        let offset = index as u8;
+        *byte = seed.wrapping_add(offset);
+    }
+    nonce
 }
 
 #[derive(Default)]
@@ -516,6 +559,241 @@ fn test_wal_checksum_corruption() -> Result<(), String> {
 }
 
 #[test]
+fn test_wal_recovery_stops_at_first_invalid_frame() -> Result<(), String> {
+    let cx = test_cx();
+    let vfs = MemoryVfs::new();
+    let wal_path = PathBuf::from("/bd_bca_1_first_invalid_prefix.db-wal");
+    let page_size = PageSize::DEFAULT.as_usize();
+    let page_size_u32 =
+        u32::try_from(page_size).map_err(|error| format!("page_size_u32_failed error={error}"))?;
+
+    {
+        let wal_file = open_wal_file(&vfs, &cx, &wal_path)?;
+        let mut wal = WalFile::create(&cx, wal_file, page_size_u32, 0, wal_salts())
+            .map_err(|error| format!("create_wal_for_prefix_cutoff_test_failed error={error}"))?;
+        for (index, seed) in [0x41_u8, 0x42, 0x43, 0x44].iter().copied().enumerate() {
+            let frame_no = u32::try_from(index + 1)
+                .map_err(|error| format!("frame_no_u32_failed error={error}"))?;
+            wal.append_frame(&cx, frame_no, &sample_page(seed, page_size), frame_no)
+                .map_err(|error| {
+                    format!("append_frame_failed frame_no={frame_no} error={error}")
+                })?;
+        }
+        wal.close(&cx)
+            .map_err(|error| format!("close_wal_for_prefix_cutoff_test_failed error={error}"))?;
+    }
+
+    let mut wal_bytes = {
+        let mut wal_file = open_wal_file(&vfs, &cx, &wal_path)?;
+        let file_size = wal_file
+            .file_size(&cx)
+            .map_err(|error| format!("read_wal_size_failed error={error}"))?;
+        let mut bytes = vec![
+            0_u8;
+            usize::try_from(file_size).map_err(|error| format!(
+                "wal_size_to_usize_failed error={error}"
+            ))?
+        ];
+        wal_file
+            .read(&cx, &mut bytes, 0)
+            .map_err(|error| format!("read_wal_bytes_failed error={error}"))?;
+        bytes
+    };
+
+    let frame_size = WAL_FRAME_HEADER_SIZE + page_size;
+    let invalid_frame = 2_usize;
+    let corrupt_offset = WAL_HEADER_SIZE + frame_size * invalid_frame + WAL_FRAME_HEADER_SIZE + 9;
+    if corrupt_offset >= wal_bytes.len() {
+        return Err(format!(
+            "bead_id={BEAD_ID} case=wal_recovery_invalid_frame_offset_out_of_range offset={corrupt_offset} len={}",
+            wal_bytes.len()
+        ));
+    }
+    wal_bytes[corrupt_offset] ^= 0x7F;
+
+    let validation = validate_wal_chain(&wal_bytes, page_size, false)
+        .map_err(|error| format!("validate_wal_chain_failed error={error}"))?;
+    if validation.reason != Some(WalChainInvalidReason::FrameChecksumMismatch) {
+        return Err(format!(
+            "bead_id={BEAD_ID} case=wal_recovery_invalid_frame_reason_mismatch reason={:?}",
+            validation.reason
+        ));
+    }
+    if validation.valid_frame_count != invalid_frame {
+        return Err(format!(
+            "bead_id={BEAD_ID} case=wal_recovery_invalid_frame_valid_count_mismatch expected={invalid_frame} actual={}",
+            validation.valid_frame_count
+        ));
+    }
+    if validation.first_invalid_frame != Some(invalid_frame) {
+        return Err(format!(
+            "bead_id={BEAD_ID} case=wal_recovery_invalid_frame_index_mismatch expected={invalid_frame} actual={:?}",
+            validation.first_invalid_frame
+        ));
+    }
+    if validation.replayable_frame_count != invalid_frame {
+        return Err(format!(
+            "bead_id={BEAD_ID} case=wal_recovery_invalid_frame_replayable_count_mismatch expected={invalid_frame} actual={}",
+            validation.replayable_frame_count
+        ));
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_wal_recovery_salt_mismatch_stops_at_frame() -> Result<(), String> {
+    let cx = test_cx();
+    let vfs = MemoryVfs::new();
+    let wal_path = PathBuf::from("/bd_bca_1_salt_mismatch.db-wal");
+    let page_size = PageSize::DEFAULT.as_usize();
+    let page_size_u32 =
+        u32::try_from(page_size).map_err(|error| format!("page_size_u32_failed error={error}"))?;
+
+    {
+        let wal_file = open_wal_file(&vfs, &cx, &wal_path)?;
+        let mut wal = WalFile::create(&cx, wal_file, page_size_u32, 0, wal_salts())
+            .map_err(|error| format!("create_wal_for_salt_mismatch_test_failed error={error}"))?;
+        for (index, seed) in [0x51_u8, 0x52, 0x53].iter().copied().enumerate() {
+            let frame_no = u32::try_from(index + 1)
+                .map_err(|error| format!("frame_no_u32_failed error={error}"))?;
+            wal.append_frame(&cx, frame_no, &sample_page(seed, page_size), frame_no)
+                .map_err(|error| {
+                    format!("append_frame_failed frame_no={frame_no} error={error}")
+                })?;
+        }
+        wal.close(&cx)
+            .map_err(|error| format!("close_wal_for_salt_mismatch_test_failed error={error}"))?;
+    }
+
+    let mut wal_bytes = {
+        let mut wal_file = open_wal_file(&vfs, &cx, &wal_path)?;
+        let file_size = wal_file
+            .file_size(&cx)
+            .map_err(|error| format!("read_wal_size_failed error={error}"))?;
+        let mut bytes = vec![
+            0_u8;
+            usize::try_from(file_size).map_err(|error| format!(
+                "wal_size_to_usize_failed error={error}"
+            ))?
+        ];
+        wal_file
+            .read(&cx, &mut bytes, 0)
+            .map_err(|error| format!("read_wal_bytes_failed error={error}"))?;
+        bytes
+    };
+
+    let frame_size = WAL_FRAME_HEADER_SIZE + page_size;
+    let invalid_frame = 1_usize;
+    let header_start = WAL_HEADER_SIZE + frame_size * invalid_frame;
+    let header_end = header_start + WAL_FRAME_HEADER_SIZE;
+    if header_end > wal_bytes.len() {
+        return Err(format!(
+            "bead_id={BEAD_ID} case=wal_recovery_salt_mismatch_header_out_of_range start={header_start} end={header_end} len={}",
+            wal_bytes.len()
+        ));
+    }
+    write_wal_frame_salts(
+        &mut wal_bytes[header_start..header_end],
+        WalSalts {
+            salt1: 0xDEAD_BEEF,
+            salt2: 0xFEED_CAFE,
+        },
+    )
+    .map_err(|error| format!("rewrite_frame_salts_failed error={error}"))?;
+
+    let validation = validate_wal_chain(&wal_bytes, page_size, false)
+        .map_err(|error| format!("validate_wal_chain_failed error={error}"))?;
+    if validation.reason != Some(WalChainInvalidReason::SaltMismatch) {
+        return Err(format!(
+            "bead_id={BEAD_ID} case=wal_recovery_salt_mismatch_reason_mismatch reason={:?}",
+            validation.reason
+        ));
+    }
+    if validation.valid_frame_count != invalid_frame {
+        return Err(format!(
+            "bead_id={BEAD_ID} case=wal_recovery_salt_mismatch_valid_count_mismatch expected={invalid_frame} actual={}",
+            validation.valid_frame_count
+        ));
+    }
+    if validation.first_invalid_frame != Some(invalid_frame) {
+        return Err(format!(
+            "bead_id={BEAD_ID} case=wal_recovery_salt_mismatch_index_mismatch expected={invalid_frame} actual={:?}",
+            validation.first_invalid_frame
+        ));
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_wal_frame_checksum_excludes_salt_header_bytes() -> Result<(), String> {
+    let cx = test_cx();
+    let vfs = MemoryVfs::new();
+    let wal_path = PathBuf::from("/bd_bca_1_checksum_excludes_salt.db-wal");
+    let page_size = PageSize::DEFAULT.as_usize();
+    let page_size_u32 =
+        u32::try_from(page_size).map_err(|error| format!("page_size_u32_failed error={error}"))?;
+
+    {
+        let wal_file = open_wal_file(&vfs, &cx, &wal_path)?;
+        let mut wal =
+            WalFile::create(&cx, wal_file, page_size_u32, 0, wal_salts()).map_err(|error| {
+                format!("create_wal_for_checksum_excludes_salt_test_failed error={error}")
+            })?;
+        wal.append_frame(&cx, 1, &sample_page(0x6D, page_size), 1)
+            .map_err(|error| format!("append_frame_failed error={error}"))?;
+        wal.close(&cx).map_err(|error| {
+            format!("close_wal_for_checksum_excludes_salt_test_failed error={error}")
+        })?;
+    }
+
+    let wal_bytes = {
+        let mut wal_file = open_wal_file(&vfs, &cx, &wal_path)?;
+        let file_size = wal_file
+            .file_size(&cx)
+            .map_err(|error| format!("read_wal_size_failed error={error}"))?;
+        let mut bytes = vec![
+            0_u8;
+            usize::try_from(file_size).map_err(|error| format!(
+                "wal_size_to_usize_failed error={error}"
+            ))?
+        ];
+        wal_file
+            .read(&cx, &mut bytes, 0)
+            .map_err(|error| format!("read_wal_bytes_failed error={error}"))?;
+        bytes
+    };
+
+    let frame_size = WAL_FRAME_HEADER_SIZE + page_size;
+    let seed = read_wal_header_checksum(&wal_bytes[..WAL_HEADER_SIZE])
+        .map_err(|error| format!("read_wal_header_checksum_failed error={error}"))?;
+    let frame = &wal_bytes[WAL_HEADER_SIZE..WAL_HEADER_SIZE + frame_size];
+    let baseline = compute_wal_frame_checksum(frame, page_size, seed, false)
+        .map_err(|error| format!("compute_wal_frame_checksum_baseline_failed error={error}"))?;
+
+    let mut salted_variant = frame.to_vec();
+    write_wal_frame_salts(
+        &mut salted_variant[..WAL_FRAME_HEADER_SIZE],
+        WalSalts {
+            salt1: 0x0102_0304,
+            salt2: 0x0506_0708,
+        },
+    )
+    .map_err(|error| format!("rewrite_frame_salts_failed error={error}"))?;
+    let variant = compute_wal_frame_checksum(&salted_variant, page_size, seed, false)
+        .map_err(|error| format!("compute_wal_frame_checksum_variant_failed error={error}"))?;
+
+    if baseline != variant {
+        return Err(format!(
+            "bead_id={BEAD_ID} case=wal_frame_checksum_excludes_salt_header_bytes_mismatch baseline={baseline:?} variant={variant:?}"
+        ));
+    }
+
+    Ok(())
+}
+
+#[test]
 fn test_wal_recovery_torn_write() -> Result<(), String> {
     let cx = test_cx();
     let vfs = MemoryVfs::new();
@@ -567,6 +845,344 @@ fn test_wal_recovery_torn_write() -> Result<(), String> {
         return Err(format!(
             "bead_id={BEAD_ID} case=wal_recovery_append_after_recovery expected=3 actual={}",
             recovered.frame_count()
+        ));
+    }
+
+    Ok(())
+}
+
+fn build_raptorq_wal_repair_fixture(
+    sidecar_path: &Path,
+) -> Result<(WalFecGroupMeta, Vec<Vec<u8>>, WalSalts), String> {
+    const K_SOURCE: u32 = 10;
+    const R_REPAIR: u32 = 2;
+    const START_FRAME_NO: u32 = 400;
+
+    let salts = wal_salts();
+    let page_size = PageSize::DEFAULT.as_usize();
+    let page_size_u32 =
+        u32::try_from(page_size).map_err(|error| format!("page_size_u32_failed error={error}"))?;
+    let source_pages = (0..K_SOURCE)
+        .map(|offset| {
+            let seed_offset = u8::try_from(offset)
+                .map_err(|error| format!("seed_offset_u8_conversion_failed error={error}"))?;
+            Ok(sample_page(0x70_u8.wrapping_add(seed_offset), page_size))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let source_hashes = build_source_page_hashes(&source_pages);
+    let page_numbers = (0..K_SOURCE)
+        .map(|offset| 1_000_u32 + offset)
+        .collect::<Vec<_>>();
+    let meta = WalFecGroupMeta::from_init(WalFecGroupMetaInit {
+        wal_salt1: salts.salt1,
+        wal_salt2: salts.salt2,
+        start_frame_no: START_FRAME_NO,
+        end_frame_no: START_FRAME_NO + (K_SOURCE - 1),
+        db_size_pages: 4_096,
+        page_size: page_size_u32,
+        k_source: K_SOURCE,
+        r_repair: R_REPAIR,
+        oti: Oti {
+            f: u64::from(K_SOURCE) * u64::from(page_size_u32),
+            al: 1,
+            t: page_size_u32,
+            z: 1,
+            n: 1,
+        },
+        object_id: ObjectId::derive_from_canonical_bytes(b"bd-bca.1-test_raptorq_wal_repair"),
+        page_numbers,
+        source_page_xxh3_128: source_hashes,
+    })
+    .map_err(|error| format!("wal_fec_meta_build_failed error={error}"))?;
+    let repair_symbols = generate_wal_fec_repair_symbols(&meta, &source_pages)
+        .map_err(|error| format!("wal_fec_repair_generate_failed error={error}"))?;
+    let record = WalFecGroupRecord::new(meta.clone(), repair_symbols)
+        .map_err(|error| format!("wal_fec_record_build_failed error={error}"))?;
+    append_wal_fec_group(sidecar_path, &record)
+        .map_err(|error| format!("wal_fec_append_failed error={error}"))?;
+    Ok((meta, source_pages, salts))
+}
+
+fn wal_frame_candidates_from_source(
+    meta: &WalFecGroupMeta,
+    source_pages: &[Vec<u8>],
+) -> Vec<WalFrameCandidate> {
+    source_pages
+        .iter()
+        .enumerate()
+        .map(|(index, page_data)| {
+            #[allow(clippy::cast_possible_truncation)]
+            let frame_offset = index as u32;
+            WalFrameCandidate {
+                frame_no: meta.start_frame_no + frame_offset,
+                page_data: page_data.clone(),
+            }
+        })
+        .collect::<Vec<_>>()
+}
+
+fn corrupt_frame_candidate(
+    candidates: &mut [WalFrameCandidate],
+    target_frame: u32,
+) -> Result<(), String> {
+    let Some(candidate) = candidates
+        .iter_mut()
+        .find(|candidate| candidate.frame_no == target_frame)
+    else {
+        return Err(format!(
+            "bead_id={BEAD_ID} case=raptorq_wal_repair_missing_frame target={target_frame}"
+        ));
+    };
+    candidate.page_data[0] ^= 0x5A;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn test_roundtrip_c_sqlite() -> Result<(), String> {
+    if !sqlite3_available() {
+        return Ok(());
+    }
+
+    let temp_dir = tempdir().map_err(|error| format!("tempdir_create_failed error={error}"))?;
+    let db_path = temp_dir.path().join("bd_bca_1_roundtrip_c_sqlite.db");
+    let setup = sqlite3_exec(
+        &db_path,
+        "PRAGMA journal_mode=WAL;\
+         CREATE TABLE IF NOT EXISTS t(v INTEGER);\
+         DELETE FROM t;\
+         INSERT INTO t VALUES (1),(2);",
+    )?;
+    if !setup.status.success() {
+        return Err(format!(
+            "bead_id={BEAD_ID} case=roundtrip_c_sqlite_setup_failed stderr={}",
+            String::from_utf8_lossy(&setup.stderr)
+        ));
+    }
+
+    let cx = test_cx();
+    let vfs = UnixVfs::new();
+    let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::READWRITE;
+    let (mut coordinator, _) = vfs
+        .open(&cx, Some(&db_path), flags)
+        .map_err(|error| format!("unix_vfs_open_failed error={error}"))?;
+    coordinator
+        .lock(&cx, LockLevel::Reserved)
+        .map_err(|error| format!("unix_vfs_reserved_lock_failed error={error}"))?;
+    let file_size = coordinator
+        .file_size(&cx)
+        .map_err(|error| format!("unix_vfs_file_size_failed error={error}"))?;
+    coordinator
+        .unlock(&cx, LockLevel::None)
+        .map_err(|error| format!("unix_vfs_unlock_failed error={error}"))?;
+    if file_size == 0 {
+        return Err(format!(
+            "bead_id={BEAD_ID} case=roundtrip_c_sqlite_zero_file_size path={}",
+            db_path.display()
+        ));
+    }
+
+    let query = sqlite3_exec(&db_path, "SELECT COUNT(*) FROM t;")?;
+    if !query.status.success() {
+        return Err(format!(
+            "bead_id={BEAD_ID} case=roundtrip_c_sqlite_query_failed stderr={}",
+            String::from_utf8_lossy(&query.stderr)
+        ));
+    }
+    if String::from_utf8_lossy(&query.stdout).trim() != "2" {
+        return Err(format!(
+            "bead_id={BEAD_ID} case=roundtrip_c_sqlite_count_mismatch expected=2 actual={}",
+            String::from_utf8_lossy(&query.stdout).trim()
+        ));
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_raptorq_wal_repair() -> Result<(), String> {
+    let temp_dir = tempdir().map_err(|error| format!("tempdir_create_failed error={error}"))?;
+    let sidecar_path = temp_dir.path().join("bd_bca_1_raptorq_repair.wal-fec");
+    let (meta, source_pages, salts) = build_raptorq_wal_repair_fixture(&sidecar_path)?;
+    let first_corrupt_frame = meta.start_frame_no + 2;
+    let second_corrupt_frame = meta.start_frame_no + 7;
+
+    let mut candidates = wal_frame_candidates_from_source(&meta, &source_pages);
+    corrupt_frame_candidate(&mut candidates, first_corrupt_frame)?;
+    corrupt_frame_candidate(&mut candidates, second_corrupt_frame)?;
+
+    let expected_pages = source_pages.clone();
+    let outcome = recover_wal_fec_group_with_decoder(
+        &sidecar_path,
+        meta.group_id(),
+        salts,
+        first_corrupt_frame,
+        &candidates,
+        move |_group_meta, _available| Ok(expected_pages.clone()),
+    )
+    .map_err(|error| format!("wal_fec_recover_with_decoder_failed error={error}"))?;
+    let WalFecRecoveryOutcome::Recovered(recovered) = outcome else {
+        return Err(format!(
+            "bead_id={BEAD_ID} case=raptorq_wal_repair_expected_recovered outcome={outcome:?}"
+        ));
+    };
+    if recovered.recovered_pages != source_pages {
+        return Err(format!(
+            "bead_id={BEAD_ID} case=raptorq_wal_repair_payload_mismatch"
+        ));
+    }
+    if !recovered.decode_proof.decode_attempted || !recovered.decode_proof.decode_succeeded {
+        return Err(format!(
+            "bead_id={BEAD_ID} case=raptorq_wal_repair_decode_flags_invalid proof={:?}",
+            recovered.decode_proof
+        ));
+    }
+    if !recovered
+        .decode_proof
+        .recovered_frame_nos
+        .contains(&first_corrupt_frame)
+        || !recovered
+            .decode_proof
+            .recovered_frame_nos
+            .contains(&second_corrupt_frame)
+    {
+        return Err(format!(
+            "bead_id={BEAD_ID} case=raptorq_wal_repair_recovered_frame_nos_missing expected=[{first_corrupt_frame}, {second_corrupt_frame}] actual={:?}",
+            recovered.decode_proof.recovered_frame_nos
+        ));
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_encryption_pragma_key() -> Result<(), String> {
+    let params = Argon2Params {
+        m_cost: 256,
+        t_cost: 1,
+        p_cost: 1,
+    };
+    let salt = [0x11_u8; 16];
+    let kek = KeyManager::derive_kek(b"phase5-passphrase", &salt, &params)
+        .map_err(|error| format!("derive_kek_failed error={error}"))?;
+    let wrong_kek = KeyManager::derive_kek(b"wrong-passphrase", &salt, &params)
+        .map_err(|error| format!("derive_wrong_kek_failed error={error}"))?;
+    let dek = [0xAB_u8; KEY_SIZE];
+    let wrapped = KeyManager::wrap_dek(&dek, &kek, &encryption_test_nonce(21))
+        .map_err(|error| format!("wrap_dek_failed error={error}"))?;
+    let unwrapped = KeyManager::unwrap_dek(&wrapped, &kek)
+        .map_err(|error| format!("unwrap_dek_failed error={error}"))?;
+    if unwrapped != dek {
+        return Err(format!(
+            "bead_id={BEAD_ID} case=encryption_pragma_key_unwrap_mismatch"
+        ));
+    }
+    if KeyManager::unwrap_dek(&wrapped, &wrong_kek) != Err(EncryptError::DekUnwrapFailed) {
+        return Err(format!(
+            "bead_id={BEAD_ID} case=encryption_pragma_key_wrong_passphrase_unexpected_success"
+        ));
+    }
+
+    let encryptor = PageEncryptor::new(&dek, DatabaseId::from_bytes([0x42_u8; DATABASE_ID_SIZE]));
+    let mut encrypted_page = sample_page(0x2D, 4_096);
+    let original_page = encrypted_page.clone();
+    encryptor
+        .encrypt_page(&mut encrypted_page, 1, &encryption_test_nonce(31))
+        .map_err(|error| format!("encrypt_page_failed error={error}"))?;
+    let reserved = usize::from(ENCRYPTION_RESERVED_BYTES);
+    if encrypted_page[..4_096 - reserved] == original_page[..4_096 - reserved] {
+        return Err(format!(
+            "bead_id={BEAD_ID} case=encryption_pragma_key_ciphertext_not_changed"
+        ));
+    }
+    encryptor
+        .decrypt_page(&mut encrypted_page, 1)
+        .map_err(|error| format!("decrypt_page_failed error={error}"))?;
+    if encrypted_page[..4_096 - reserved] != original_page[..4_096 - reserved] {
+        return Err(format!(
+            "bead_id={BEAD_ID} case=encryption_pragma_key_roundtrip_mismatch"
+        ));
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_encryption_rekey() -> Result<(), String> {
+    let params = Argon2Params {
+        m_cost: 256,
+        t_cost: 1,
+        p_cost: 1,
+    };
+    let old_kek = KeyManager::derive_kek(b"old-passphrase", &[0xAA_u8; 16], &params)
+        .map_err(|error| format!("derive_old_kek_failed error={error}"))?;
+    let new_kek = KeyManager::derive_kek(b"new-passphrase", &[0xBB_u8; 16], &params)
+        .map_err(|error| format!("derive_new_kek_failed error={error}"))?;
+    let dek = [0xCD_u8; KEY_SIZE];
+    let wrapped_old = KeyManager::wrap_dek(&dek, &old_kek, &encryption_test_nonce(41))
+        .map_err(|error| format!("wrap_old_dek_failed error={error}"))?;
+    let unwrapped_old = KeyManager::unwrap_dek(&wrapped_old, &old_kek)
+        .map_err(|error| format!("unwrap_old_dek_failed error={error}"))?;
+    let wrapped_new = KeyManager::wrap_dek(&unwrapped_old, &new_kek, &encryption_test_nonce(51))
+        .map_err(|error| format!("wrap_new_dek_failed error={error}"))?;
+    let unwrapped_new = KeyManager::unwrap_dek(&wrapped_new, &new_kek)
+        .map_err(|error| format!("unwrap_new_dek_failed error={error}"))?;
+    if unwrapped_new != dek {
+        return Err(format!(
+            "bead_id={BEAD_ID} case=encryption_rekey_dek_changed"
+        ));
+    }
+    if KeyManager::unwrap_dek(&wrapped_new, &old_kek) != Err(EncryptError::DekUnwrapFailed) {
+        return Err(format!(
+            "bead_id={BEAD_ID} case=encryption_rekey_old_kek_unexpected_success"
+        ));
+    }
+
+    let encryptor = PageEncryptor::new(&dek, DatabaseId::from_bytes([0x33_u8; DATABASE_ID_SIZE]));
+    let mut page = sample_page(0x66, 4_096);
+    let original = page.clone();
+    encryptor
+        .encrypt_page(&mut page, 9, &encryption_test_nonce(61))
+        .map_err(|error| format!("encryption_rekey_encrypt_failed error={error}"))?;
+    encryptor
+        .decrypt_page(&mut page, 9)
+        .map_err(|error| format!("encryption_rekey_decrypt_failed error={error}"))?;
+    let reserved = usize::from(ENCRYPTION_RESERVED_BYTES);
+    if page[..4_096 - reserved] != original[..4_096 - reserved] {
+        return Err(format!(
+            "bead_id={BEAD_ID} case=encryption_rekey_page_roundtrip_mismatch"
+        ));
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_encryption_aad_swap_resistance() -> Result<(), String> {
+    let dek = [0xEF_u8; KEY_SIZE];
+    let enc_a = PageEncryptor::new(&dek, DatabaseId::from_bytes([0xA1_u8; DATABASE_ID_SIZE]));
+    let enc_b = PageEncryptor::new(&dek, DatabaseId::from_bytes([0xB2_u8; DATABASE_ID_SIZE]));
+    let mut encrypted_page = sample_page(0x77, 4_096);
+    enc_a
+        .encrypt_page(&mut encrypted_page, 7, &encryption_test_nonce(71))
+        .map_err(|error| format!("aad_swap_encrypt_failed error={error}"))?;
+
+    let mut wrong_page_number = encrypted_page.clone();
+    let wrong_page_err = enc_a
+        .decrypt_page(&mut wrong_page_number, 8)
+        .expect_err("page-number swap should fail authentication");
+    if wrong_page_err != EncryptError::AuthenticationFailed {
+        return Err(format!(
+            "bead_id={BEAD_ID} case=encryption_aad_swap_resistance_page_number_error_mismatch actual={wrong_page_err}"
+        ));
+    }
+
+    let db_swap_err = enc_b
+        .decrypt_page(&mut encrypted_page, 7)
+        .expect_err("database-id swap should fail authentication");
+    if db_swap_err != EncryptError::AuthenticationFailed {
+        return Err(format!(
+            "bead_id={BEAD_ID} case=encryption_aad_swap_resistance_database_id_error_mismatch actual={db_swap_err}"
         ));
     }
 

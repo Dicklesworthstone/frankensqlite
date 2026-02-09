@@ -2086,4 +2086,9 @@ mod tests {
             "bead_id={RUNTIME_BEAD_ID} elevated regime should trigger SSI-FP rejection"
         );
     }
+
+    #[test]
+    fn test_eprocess_inv1_through_inv7() {
+        test_inv1_through_inv7_100_threads();
+    }
 }

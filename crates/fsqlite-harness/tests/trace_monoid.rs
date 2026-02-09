@@ -240,6 +240,56 @@ fn test_dpor_finds_known_bug() {
     );
 }
 
+#[test]
+fn test_lab_deterministic_seeds() {
+    let scenario = sample_three_txn_three_ops_each();
+    let baseline = signatures(&enumerate_trace_classes(&scenario));
+
+    for seed in 0_u64..100 {
+        let observed = signatures(&enumerate_trace_classes(&scenario));
+        assert_eq!(
+            observed, baseline,
+            "deterministic trace class set mismatch for seed {seed}"
+        );
+    }
+}
+
+#[test]
+fn test_mazurkiewicz_3txn_6_orderings() {
+    let scenario = vec![
+        vec![bb(1, 0), ww(1, 1, 10), cc(1, 2, [10])], // T1 writes page A
+        vec![bb(2, 0), ww(2, 1, 20), cc(2, 2, [20])], // T2 writes page B
+        vec![
+            bb(3, 0),
+            ww(3, 1, 10), // T3 writes A
+            ww(3, 2, 20), // T3 writes B
+            cc(3, 3, [10, 20]),
+        ],
+    ];
+
+    let classes = enumerate_trace_classes(&scenario);
+    let commit_orders: BTreeSet<Vec<u64>> = classes
+        .iter()
+        .map(|class| {
+            class
+                .representative
+                .iter()
+                .filter_map(|action| match action.kind {
+                    MvccActionKind::Commit { .. } => Some(action.txn_id),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        })
+        .filter(|order| order.len() == 3)
+        .collect();
+
+    assert_eq!(
+        commit_orders.len(),
+        6,
+        "expected all 6 commit-order permutations for the 3-txn Mazurkiewicz scenario"
+    );
+}
+
 fn arb_action() -> impl Strategy<Value = MvccAction> {
     (
         1_u64..=4,
