@@ -11,12 +11,13 @@ const UNIT_TEST_IDS: [&str; 2] = [
     "test_bd_2ddl_unit_compliance_gate",
     "prop_bd_2ddl_structure_compliance",
 ];
-const E2E_TEST_IDS: [&str; 1] = ["test_e2e_bd_2ddl_compliance"];
+const E2E_TEST_IDS: [&str; 2] = ["test_e2e_bd_2ddl", "test_e2e_bd_2ddl_compliance"];
 const LOG_LEVEL_MARKERS: [&str; 4] = ["DEBUG", "INFO", "WARN", "ERROR"];
 const LOG_STANDARD_REF: &str = "bd-1fpm";
-const REQUIRED_TOKENS: [&str; 8] = [
+const REQUIRED_TOKENS: [&str; 9] = [
     "test_bd_2ddl_unit_compliance_gate",
     "prop_bd_2ddl_structure_compliance",
+    "test_e2e_bd_2ddl",
     "test_e2e_bd_2ddl_compliance",
     "DEBUG",
     "INFO",
@@ -81,15 +82,21 @@ fn load_issue_description(issue_id: &str) -> Result<String, String> {
     Err(format!("bead_id={issue_id} not_found_in={ISSUES_JSONL}"))
 }
 
+fn contains_identifier(text: &str, expected_marker: &str) -> bool {
+    text.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+        .collect::<Vec<_>>()
+        .contains(&expected_marker)
+}
+
 fn evaluate_description(description: &str) -> ComplianceEvaluation {
     let missing_unit_ids = UNIT_TEST_IDS
         .into_iter()
-        .filter(|id| !description.contains(id))
+        .filter(|id| !contains_identifier(description, id))
         .collect::<Vec<_>>();
 
     let missing_e2e_ids = E2E_TEST_IDS
         .into_iter()
-        .filter(|id| !description.contains(id))
+        .filter(|id| !contains_identifier(description, id))
         .collect::<Vec<_>>();
 
     let missing_log_levels = LOG_LEVEL_MARKERS
@@ -141,10 +148,11 @@ proptest! {
     #[test]
     fn prop_bd_2ddl_structure_compliance(missing_index in 0usize..REQUIRED_TOKENS.len()) {
         let mut synthetic = format!(
-            "## Unit Test Requirements\n- {}\n- {}\n\n## E2E Test\n- {}\n\n## Logging Requirements\n- DEBUG: stage progress\n- INFO: summary\n- WARN: degraded mode\n- ERROR: terminal failure\n- Reference: {}\n",
+            "## Unit Test Requirements\n- {}\n- {}\n\n## E2E Test\n- {}\n- {}\n\n## Logging Requirements\n- DEBUG: stage progress\n- INFO: summary\n- WARN: degraded mode\n- ERROR: terminal failure\n- Reference: {}\n",
             UNIT_TEST_IDS[0],
             UNIT_TEST_IDS[1],
             E2E_TEST_IDS[0],
+            E2E_TEST_IDS[1],
             LOG_STANDARD_REF,
         );
 
@@ -196,4 +204,9 @@ fn test_e2e_bd_2ddl_compliance() -> Result<(), String> {
     }
 
     Ok(())
+}
+
+#[test]
+fn test_e2e_bd_2ddl() -> Result<(), String> {
+    test_e2e_bd_2ddl_compliance()
 }
