@@ -611,6 +611,7 @@ dependencies = [
  "fsqlite-pager",
  "fsqlite-types",
  "fsqlite-vfs",
+ "fsqlite-wal",
  "parking_lot",
  "proptest",
  "serde",
