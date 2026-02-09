@@ -10,10 +10,31 @@
 //! and will be wired to the B-tree layer in Phase 5.
 
 use fsqlite_error::{FrankenError, Result};
-use fsqlite_types::opcode::{Opcode, P4};
+use fsqlite_types::opcode::{Opcode, P4, VdbeOp};
 use fsqlite_types::value::SqliteValue;
 
 use crate::VdbeProgram;
+
+const VDBE_TRACE_ENV: &str = "FSQLITE_VDBE_TRACE_OPCODES";
+const VDBE_TRACE_LOGGING_STANDARD: &str = "bd-1fpm";
+
+/// Register spans touched by an opcode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OpcodeRegisterSpans {
+    read_start: i32,
+    read_len: i32,
+    write_start: i32,
+    write_len: i32,
+}
+
+impl OpcodeRegisterSpans {
+    const NONE: Self = Self {
+        read_start: -1,
+        read_len: 0,
+        write_start: -1,
+        write_len: 0,
+    };
+}
 
 /// Outcome of a single engine execution.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,6 +55,8 @@ pub struct VdbeEngine {
     registers: Vec<SqliteValue>,
     /// Bound SQL parameter values (`?1`, `?2`, ...).
     bindings: Vec<SqliteValue>,
+    /// Whether opcode-level tracing is enabled.
+    trace_opcodes: bool,
     /// Result rows accumulated during execution.
     results: Vec<Vec<SqliteValue>>,
 }
@@ -48,6 +71,7 @@ impl VdbeEngine {
         Self {
             registers: vec![SqliteValue::Null; count as usize],
             bindings: Vec::new(),
+            trace_opcodes: opcode_trace_enabled(),
             results: Vec::new(),
         }
     }
@@ -86,6 +110,7 @@ impl VdbeEngine {
             }
 
             let op = &ops[pc];
+            self.trace_opcode(pc, op);
             match op.opcode {
                 // ── Control Flow ────────────────────────────────────────
                 Opcode::Init => {
@@ -849,6 +874,144 @@ impl VdbeEngine {
         }
         self.registers[idx] = val;
     }
+
+    fn trace_opcode(&self, pc: usize, op: &VdbeOp) {
+        if !self.trace_opcodes || !tracing::enabled!(tracing::Level::DEBUG) {
+            return;
+        }
+        let spans = opcode_register_spans(op);
+        tracing::debug!(
+            target: "fsqlite_vdbe::opcode",
+            logging_standard = VDBE_TRACE_LOGGING_STANDARD,
+            pc,
+            opcode = %op.opcode.name(),
+            p1 = op.p1,
+            p2 = op.p2,
+            p3 = op.p3,
+            p5 = op.p5,
+            read_start = spans.read_start,
+            read_len = spans.read_len,
+            write_start = spans.write_start,
+            write_len = spans.write_len,
+            "executing vdbe opcode",
+        );
+    }
+}
+
+fn opcode_trace_enabled() -> bool {
+    let env_enabled = std::env::var(VDBE_TRACE_ENV).is_ok_and(|value| {
+        let normalized = value.trim().to_ascii_lowercase();
+        !normalized.is_empty() && normalized != "0" && normalized != "false" && normalized != "off"
+    });
+    env_enabled || cfg!(test)
+}
+
+fn range(start: i32, len: i32) -> (i32, i32) {
+    if start <= 0 {
+        (-1, 0)
+    } else {
+        (start, len.max(1))
+    }
+}
+
+fn opcode_register_spans(op: &VdbeOp) -> OpcodeRegisterSpans {
+    let (read_start, read_len, write_start, write_len) = match op.opcode {
+        Opcode::Integer
+        | Opcode::Int64
+        | Opcode::Real
+        | Opcode::String
+        | Opcode::String8
+        | Opcode::Blob
+        | Opcode::Variable => {
+            let (write_start, write_len) = range(op.p2, 1);
+            (-1, 0, write_start, write_len)
+        }
+        Opcode::Null => {
+            let write_count = if op.p3 > 0 { op.p3 + 1 } else { 1 };
+            let (write_start, write_len) = range(op.p2, write_count);
+            (-1, 0, write_start, write_len)
+        }
+        Opcode::SoftNull
+        | Opcode::Cast
+        | Opcode::RealAffinity
+        | Opcode::AddImm
+        | Opcode::MustBeInt
+        | Opcode::InitCoroutine
+        | Opcode::Yield
+        | Opcode::EndCoroutine => {
+            let (start, len) = range(op.p1, 1);
+            (start, len, start, len)
+        }
+        Opcode::Move => {
+            let (read_start, read_len) = range(op.p1, op.p3);
+            let (write_start, write_len) = range(op.p2, op.p3);
+            (read_start, read_len, write_start, write_len)
+        }
+        Opcode::Copy | Opcode::SCopy | Opcode::IntCopy | Opcode::BitNot | Opcode::Not => {
+            let (read_start, read_len) = range(op.p1, 1);
+            let (write_start, write_len) = range(op.p2, 1);
+            (read_start, read_len, write_start, write_len)
+        }
+        Opcode::ResultRow => {
+            let (read_start, read_len) = range(op.p1, op.p2);
+            (read_start, read_len, -1, 0)
+        }
+        Opcode::Add
+        | Opcode::Subtract
+        | Opcode::Multiply
+        | Opcode::Divide
+        | Opcode::Remainder
+        | Opcode::Concat
+        | Opcode::BitAnd
+        | Opcode::BitOr
+        | Opcode::ShiftLeft
+        | Opcode::ShiftRight
+        | Opcode::And
+        | Opcode::Or => {
+            let (read_start, read_len) = range(op.p1, 2);
+            let (write_start, write_len) = range(op.p3, 1);
+            (read_start, read_len, write_start, write_len)
+        }
+        Opcode::Eq | Opcode::Ne | Opcode::Lt | Opcode::Le | Opcode::Gt | Opcode::Ge => {
+            let (read_start, read_len) = range(op.p1, 1);
+            let (rhs_start, rhs_len) = range(op.p3, 1);
+            let normalized_start = if read_start > 0 && rhs_start > 0 {
+                read_start.min(rhs_start)
+            } else if read_start > 0 {
+                read_start
+            } else {
+                rhs_start
+            };
+            let normalized_len = if read_start > 0 && rhs_start > 0 && read_start != rhs_start {
+                2
+            } else {
+                read_len.max(rhs_len)
+            };
+            (normalized_start, normalized_len, -1, 0)
+        }
+        Opcode::If | Opcode::IfNot | Opcode::IsNull | Opcode::NotNull | Opcode::IsTrue => {
+            let (read_start, read_len) = range(op.p1, 1);
+            (read_start, read_len, -1, 0)
+        }
+        Opcode::MakeRecord => {
+            let (read_start, read_len) = range(op.p1, op.p2);
+            let (write_start, write_len) = range(op.p3, 1);
+            (read_start, read_len, write_start, write_len)
+        }
+        _ => (
+            OpcodeRegisterSpans::NONE.read_start,
+            OpcodeRegisterSpans::NONE.read_len,
+            OpcodeRegisterSpans::NONE.write_start,
+            OpcodeRegisterSpans::NONE.write_len,
+        ),
+    };
+
+    OpcodeRegisterSpans {
+        read_start,
+        read_len,
+        write_start,
+        write_len,
+    }
 }
 
 // ── Arithmetic helpers ──────────────────────────────────────────────────────
@@ -995,7 +1158,7 @@ fn char_to_affinity(ch: char) -> fsqlite_types::TypeAffinity {
 mod tests {
     use super::*;
     use crate::ProgramBuilder;
-    use fsqlite_types::opcode::{Opcode, P4};
+    use fsqlite_types::opcode::{Opcode, P4, VdbeOp};
 
     /// Build and execute a program, returning results.
     fn run_program(build: impl FnOnce(&mut ProgramBuilder)) -> Vec<Vec<SqliteValue>> {
@@ -1021,6 +1184,40 @@ mod tests {
         let outcome = engine.execute(&prog).expect("execution should succeed");
         assert_eq!(outcome, ExecOutcome::Done);
         engine.take_results()
+    }
+
+    #[test]
+    fn test_opcode_register_spans_for_variable() {
+        let op = VdbeOp {
+            opcode: Opcode::Variable,
+            p1: 2,
+            p2: 9,
+            p3: 0,
+            p4: P4::None,
+            p5: 0,
+        };
+        let spans = opcode_register_spans(&op);
+        assert_eq!(spans.read_start, -1);
+        assert_eq!(spans.read_len, 0);
+        assert_eq!(spans.write_start, 9);
+        assert_eq!(spans.write_len, 1);
+    }
+
+    #[test]
+    fn test_opcode_register_spans_for_result_row() {
+        let op = VdbeOp {
+            opcode: Opcode::ResultRow,
+            p1: 4,
+            p2: 3,
+            p3: 0,
+            p4: P4::None,
+            p5: 0,
+        };
+        let spans = opcode_register_spans(&op);
+        assert_eq!(spans.read_start, 4);
+        assert_eq!(spans.read_len, 3);
+        assert_eq!(spans.write_start, -1);
+        assert_eq!(spans.write_len, 0);
     }
 
     #[test]
@@ -2027,12 +2224,12 @@ mod tests {
             let end = b.emit_label();
             b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
             let r = b.alloc_reg();
-            b.emit_op(Opcode::Real, 0, r, 0, P4::Real(3.14), 0);
+            b.emit_op(Opcode::Real, 0, r, 0, P4::Real(std::f64::consts::PI), 0);
             b.emit_op(Opcode::ResultRow, r, 1, 0, P4::None, 0);
             b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
             b.resolve_label(end);
         });
-        assert_eq!(rows[0], vec![SqliteValue::Float(3.14)]);
+        assert_eq!(rows[0], vec![SqliteValue::Float(std::f64::consts::PI)]);
     }
 
     #[test]
@@ -2906,8 +3103,9 @@ mod tests {
             let r_counter = b.alloc_reg();
             b.emit_op(Opcode::Integer, 0, r_counter, 0, P4::None, 0);
             // First pass: Once jumps to `init_code`
+            let loop_start = b.emit_label();
+            b.resolve_label(loop_start);
             let init_code = b.emit_label();
-            let loop_start = b.current_addr() as i32;
             b.emit_jump_to_label(Opcode::Once, 0, 0, init_code, P4::None, 0);
             // Fall-through path (second+ pass): just output
             let done = b.emit_label();
@@ -2915,7 +3113,7 @@ mod tests {
             // Init code: increment counter and loop back
             b.resolve_label(init_code);
             b.emit_op(Opcode::AddImm, r_counter, 1, 0, P4::None, 0);
-            b.emit_op(Opcode::Goto, 0, loop_start, 0, P4::None, 0);
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, loop_start, P4::None, 0);
             // Done
             b.resolve_label(done);
             b.emit_op(Opcode::ResultRow, r_counter, 1, 0, P4::None, 0);
@@ -3055,13 +3253,13 @@ mod tests {
             let end = b.emit_label();
             b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
             let r = b.alloc_reg();
-            b.emit_op(Opcode::Real, 0, r, 0, P4::Real(3.14), 0);
+            b.emit_op(Opcode::Real, 0, r, 0, P4::Real(std::f64::consts::PI), 0);
             b.emit_op(Opcode::RealAffinity, r, 0, 0, P4::None, 0);
             b.emit_op(Opcode::ResultRow, r, 1, 0, P4::None, 0);
             b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
             b.resolve_label(end);
         });
-        assert_eq!(rows[0], vec![SqliteValue::Float(3.14)]);
+        assert_eq!(rows[0], vec![SqliteValue::Float(std::f64::consts::PI)]);
     }
 
     // ── Error Handling ─────────────────────────────────────────────────
