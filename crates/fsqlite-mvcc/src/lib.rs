@@ -47,9 +47,15 @@ pub use compat::{
     UpdatedLegacyShm, begin_concurrent_check, choose_reader_slot,
 };
 pub use conflict_model::{
-    AmsSketch, AmsSketchConfig, DEFAULT_AMS_R, ams_sign, birthday_conflict_probability_m2,
-    birthday_conflict_probability_uniform, effective_collision_pool, exact_m2, mix64,
-    pairwise_conflict_probability,
+    AMS_SKETCH_VERSION, AmsEvidenceLedger, AmsSketch, AmsSketchConfig, AmsWindowCollector,
+    AmsWindowCollectorConfig, AmsWindowEstimate, DEFAULT_AMS_R, DEFAULT_HEAVY_HITTER_K,
+    DEFAULT_ZIPF_MAX_ITERS, HeadTailDecomposition, HeavyHitterLedgerEntry, MAX_AMS_R,
+    MAX_HEAVY_HITTER_K, MIN_AMS_R, MIN_HEAVY_HITTER_K, SpaceSavingEntry, SpaceSavingSummary,
+    WindowCloseReason, ZIPF_S_MAX, ZIPF_S_MIN, ZipfMleResult, ams_sign,
+    birthday_conflict_probability_m2, birthday_conflict_probability_uniform,
+    compute_head_tail_decomposition, dedup_write_set, effective_collision_pool, exact_m2, mix64,
+    pairwise_conflict_probability, policy_collision_mass_input, validate_ams_r,
+    validate_heavy_hitter_k, zipf_mle_from_ranked_counts,
 };
 pub use core_types::{
     CommitIndex, CommitLog, CommitRecord, DrainProgress, DrainResult, GcHorizonResult,
