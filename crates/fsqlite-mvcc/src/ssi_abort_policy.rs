@@ -608,7 +608,7 @@ mod tests {
         // Calibration: deltas all between 0.01 and 0.05.
         for i in 0..30 {
             #[allow(clippy::cast_precision_loss)]
-            let delta = 0.01 + 0.04 * (i as f64 / 29.0);
+            let delta = 0.04f64.mul_add(f64::from(i) / 29.0, 0.01);
             cal.add_sample(delta);
         }
         assert!(cal.is_calibrated());
@@ -631,7 +631,7 @@ mod tests {
         // Calibration: deltas between 0.01 and 0.03.
         for i in 0..30 {
             #[allow(clippy::cast_precision_loss)]
-            let delta = 0.01 + 0.02 * (i as f64 / 29.0);
+            let delta = 0.02f64.mul_add(f64::from(i) / 29.0, 0.01);
             cal.add_sample(delta);
         }
         assert!(cal.is_calibrated());
