@@ -4,12 +4,17 @@
 //! It is intentionally non-blocking: overflow is rejected with `SQLITE_BUSY`
 //! (`FrankenError::Busy`) instead of queue-and-wait semantics.
 
+pub mod attach;
 pub mod commit_marker;
 pub mod commit_repair;
+pub mod connection;
 pub mod db_fec;
 pub mod decode_proofs;
 pub mod ecs_replication;
 pub mod epoch;
+pub mod explain;
+pub mod native_index;
+pub mod permeation_map;
 pub mod raptorq_integration;
 pub mod region;
 pub mod repair_symbols;
@@ -19,6 +24,7 @@ pub mod snapshot_shipping;
 pub mod source_block_partition;
 pub mod symbol_log;
 pub mod symbol_size_policy;
+pub mod transaction;
 
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
