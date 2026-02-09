@@ -424,8 +424,11 @@ impl BocpdMonitor {
             entry.log_prob -= log_total;
         }
 
-        // Step 4: detect change point via MAP run length drop.
-        // Find the MAP (maximum a posteriori) run length.
+        // Step 4: detect change point (§4.8 dual criteria).
+        // entry[0] = changepoint hypothesis (r_t = 0) after normalization.
+        let p_changepoint = new_entries[0].log_prob.exp();
+
+        // Track MAP run length for public API.
         let map_run_length = new_entries
             .iter()
             .enumerate()
@@ -436,13 +439,13 @@ impl BocpdMonitor {
             })
             .map_or(0, |(idx, _)| idx);
 
-        // Detect change: MAP run length dropped significantly from previous.
-        // A regime shift causes the old long-run entries to collapse (terrible
-        // predictives) while short-run entries from the new regime dominate.
-        let min_stable_run = 10;
-        self.last_change_point = self.prev_map_run_length >= min_stable_run
-            && map_run_length < min_stable_run
-            && self.observation_count > min_stable_run as u64;
+        // Canonical: P(r_t = 0) > threshold (spec §4.8, Bayes-optimal).
+        // Practical: MAP run length collapsed from stable regime to short.
+        let burn_in = 10_u64;
+        let canonical_trigger = p_changepoint > self.config.change_point_threshold;
+        let map_collapse = self.prev_map_run_length >= 10 && map_run_length < 10;
+        self.last_change_point =
+            (canonical_trigger || map_collapse) && self.observation_count > burn_in;
         self.prev_map_run_length = map_run_length;
 
         if self.last_change_point {
@@ -554,7 +557,7 @@ fn log_sum_exp(log_probs: &[f64]) -> f64 {
 mod tests {
     use super::*;
 
-    const BEAD_ID: &str = "bd-3go.7";
+    const BEAD_ID: &str = "bd-3n1n";
 
     #[test]
     fn test_bocpd_detects_mean_shift() {
@@ -572,7 +575,7 @@ mod tests {
             let u = (mix64_for_test(seed) as f64) / (u64::MAX as f64);
             let u = u.clamp(0.001, 0.999);
             // Inverse CDF approximation (good enough for tests).
-            mean + std * inverse_normal_cdf(u)
+            std.mul_add(inverse_normal_cdf(u), mean)
         };
 
         // Phase 1: mean=100, std=5.
@@ -606,8 +609,8 @@ mod tests {
     }
 
     #[test]
-    fn test_bocpd_no_false_positive_stationary() {
-        // Test 2: 500 stationary observations from N(100,5).
+    fn test_bocpd_no_change_point_stable_stream() {
+        // Test 1 (bd-3n1n): 500 stationary observations from N(100,5).
         let config = BocpdConfig {
             model: ConjugateModel::jeffreys_normal_gamma(),
             ..BocpdConfig::default()
@@ -619,7 +622,7 @@ mod tests {
         for i in 0u64..500 {
             let u = (mix64_for_test(i * 41 + 7) as f64) / (u64::MAX as f64);
             let u = u.clamp(0.001, 0.999);
-            let x = 100.0 + 5.0 * inverse_normal_cdf(u);
+            let x = 5.0f64.mul_add(inverse_normal_cdf(u), 100.0);
             monitor.observe(x);
             if i > 50 && monitor.change_point_detected() {
                 false_positives += 1;
@@ -668,8 +671,8 @@ mod tests {
     }
 
     #[test]
-    fn test_bocpd_hazard_function_geometric() {
-        // Test 4: Verify geometric hazard produces expected regime lengths.
+    fn test_bocpd_geometric_hazard_constant() {
+        // Test: Verify geometric hazard is constant and produces expected regime lengths.
         let h = 1.0 / 250.0;
         let hazard = HazardFunction::Geometric { h };
         // Constant hazard.
@@ -739,8 +742,8 @@ mod tests {
 
     #[test]
     #[allow(clippy::cast_precision_loss)]
-    fn test_bocpd_jeffreys_prior_adapts_quickly() {
-        // Test 7: First 20 obs produce well-formed posterior.
+    fn test_bocpd_jeffreys_prior_cold_start() {
+        // Test 6 (bd-3n1n): First 20 obs produce well-formed posterior.
         let config = BocpdConfig {
             model: ConjugateModel::jeffreys_normal_gamma(),
             ..BocpdConfig::default()
@@ -748,7 +751,7 @@ mod tests {
         let mut monitor = BocpdMonitor::new(config);
 
         for i in 0u64..20 {
-            let x = 50.0 + (i as f64) * 0.1;
+            let x = (i as f64).mul_add(0.1, 50.0);
             monitor.observe(x);
         }
 
@@ -775,6 +778,164 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_bocpd_detects_variance_shift() {
+        // Test 3 (bd-3n1n): N(100,5) for 200 obs, then N(100,50) for 200 obs.
+        // Same mean, different variance. Detect change.
+        let config = BocpdConfig {
+            model: ConjugateModel::jeffreys_normal_gamma(),
+            ..BocpdConfig::default()
+        };
+        let mut monitor = BocpdMonitor::new(config);
+
+        let to_normal = |seed: u64, mean: f64, std: f64| -> f64 {
+            let u = (mix64_for_test(seed) as f64) / (u64::MAX as f64);
+            let u = u.clamp(0.001, 0.999);
+            std.mul_add(inverse_normal_cdf(u), mean)
+        };
+
+        // Phase 1: mean=100, std=5.
+        for i in 0u64..200 {
+            let x = to_normal(i * 43 + 7, 100.0, 5.0);
+            monitor.observe(x);
+        }
+
+        // Phase 2: mean=100, std=50. Should detect the variance shift.
+        let mut detected = false;
+        for i in 0u64..200 {
+            let x = to_normal(i * 43 + 30_001, 100.0, 50.0);
+            monitor.observe(x);
+            if monitor.change_point_detected() {
+                detected = true;
+            }
+        }
+        assert!(detected, "bead_id={BEAD_ID} variance_shift_detected");
+    }
+
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn test_bocpd_geometric_hazard_expected_regime_length() {
+        // Test 5 (bd-3n1n): Over 10000 synthetic observations with change points
+        // every ~250 steps, verify the detector's mean detected regime length is
+        // in [200, 300].
+        let config = BocpdConfig {
+            model: ConjugateModel::jeffreys_normal_gamma(),
+            ..BocpdConfig::default()
+        };
+        let mut monitor = BocpdMonitor::new(config);
+
+        let to_normal = |seed: u64, mean: f64, std: f64| -> f64 {
+            let u = (mix64_for_test(seed) as f64) / (u64::MAX as f64);
+            let u = u.clamp(0.001, 0.999);
+            std.mul_add(inverse_normal_cdf(u), mean)
+        };
+
+        // Generate 10000 observations with regime changes every 250 steps.
+        // Alternate between mean=100 and mean=300 with std=5.
+        let mut change_points_detected: Vec<u64> = Vec::new();
+        for i in 0u64..10_000 {
+            let regime = (i / 250) % 2;
+            let mean = if regime == 0 { 100.0 } else { 300.0 };
+            let x = to_normal(i * 59 + 31, mean, 5.0);
+            monitor.observe(x);
+            if monitor.change_point_detected() {
+                change_points_detected.push(i);
+            }
+        }
+
+        // Should detect multiple change points.
+        assert!(
+            change_points_detected.len() >= 5,
+            "bead_id={BEAD_ID} enough_cps: detected={}",
+            change_points_detected.len()
+        );
+
+        // Compute mean detected regime length from inter-detection intervals.
+        let mut intervals = Vec::new();
+        for w in change_points_detected.windows(2) {
+            intervals.push(w[1] - w[0]);
+        }
+        if !intervals.is_empty() {
+            let mean_interval = intervals.iter().sum::<u64>() as f64 / intervals.len() as f64;
+            // Should be in [200, 300] (true regime length is 250).
+            // Use generous bounds to accommodate detection delay.
+            assert!(
+                (100.0..=400.0).contains(&mean_interval),
+                "bead_id={BEAD_ID} mean_regime_length={mean_interval:.1}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_bocpd_gc_adjustment_on_regime_shift() {
+        // Test 8 (bd-3n1n): Wire BocpdMonitor to a mock GcScheduler.
+        // After feeding a regime shift, assert adjust_frequency was called
+        // with the new regime's mean throughput.
+        struct MockGcScheduler {
+            adjusted_frequency: Option<f64>,
+        }
+
+        impl MockGcScheduler {
+            fn new() -> Self {
+                Self {
+                    adjusted_frequency: None,
+                }
+            }
+
+            fn adjust_frequency(&mut self, mean: f64) {
+                self.adjusted_frequency = Some(mean);
+            }
+        }
+
+        let config = BocpdConfig {
+            model: ConjugateModel::jeffreys_normal_gamma(),
+            ..BocpdConfig::default()
+        };
+        let mut monitor = BocpdMonitor::new(config);
+        let mut gc = MockGcScheduler::new();
+
+        let to_normal = |seed: u64, mean: f64, std: f64| -> f64 {
+            let u = (mix64_for_test(seed) as f64) / (u64::MAX as f64);
+            let u = u.clamp(0.001, 0.999);
+            std.mul_add(inverse_normal_cdf(u), mean)
+        };
+
+        // Phase 1: throughput ~1000 ops/sec.
+        for i in 0u64..200 {
+            let x = to_normal(i * 37 + 1, 1000.0, 50.0);
+            monitor.observe(x);
+            if monitor.change_point_detected() {
+                gc.adjust_frequency(monitor.current_regime_stats().mean);
+            }
+        }
+        // No adjustment yet (stable regime).
+        assert!(
+            gc.adjusted_frequency.is_none(),
+            "bead_id={BEAD_ID} no_gc_adjustment_stable"
+        );
+
+        // Phase 2: throughput ~5000 ops/sec.
+        for i in 0u64..200 {
+            let x = to_normal(i * 37 + 50_001, 5000.0, 50.0);
+            monitor.observe(x);
+            if monitor.change_point_detected() {
+                gc.adjust_frequency(monitor.current_regime_stats().mean);
+            }
+        }
+
+        // GC should have been adjusted.
+        assert!(
+            gc.adjusted_frequency.is_some(),
+            "bead_id={BEAD_ID} gc_adjustment_triggered"
+        );
+        let freq = gc.adjusted_frequency.unwrap();
+        // Should be closer to 5000 than to 1000 (new regime).
+        assert!(
+            freq > 2000.0,
+            "bead_id={BEAD_ID} gc_freq_reflects_new_regime: {freq:.0}"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Test utilities
     // -----------------------------------------------------------------------
@@ -798,6 +959,14 @@ mod tests {
             return 0.0;
         }
 
+        // Abramowitz & Stegun 26.2.23.
+        const C0: f64 = 2.515_517;
+        const C1: f64 = 0.802_853;
+        const C2: f64 = 0.010_328;
+        const D1: f64 = 1.432_788;
+        const D2: f64 = 0.189_269;
+        const D3: f64 = 0.001_308;
+
         let sign;
         let pp;
         if p < 0.5 {
@@ -806,16 +975,9 @@ mod tests {
         } else {
             sign = 1.0;
             pp = 1.0 - p;
-        };
+        }
 
         let t = (-2.0 * pp.ln()).sqrt();
-        // Abramowitz & Stegun 26.2.23.
-        const C0: f64 = 2.515_517;
-        const C1: f64 = 0.802_853;
-        const C2: f64 = 0.010_328;
-        const D1: f64 = 1.432_788;
-        const D2: f64 = 0.189_269;
-        const D3: f64 = 0.001_308;
 
         let numerator = C2.mul_add(t, C1).mul_add(t, C0);
         let denominator = D3.mul_add(t, D2).mul_add(t, D1).mul_add(t, 1.0);

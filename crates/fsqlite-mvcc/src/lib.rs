@@ -12,6 +12,7 @@ pub mod compat;
 pub mod conflict_model;
 pub mod coordinator_ipc;
 pub mod core_types;
+pub mod deterministic_rebase;
 pub mod gc;
 pub mod hot_witness_index;
 pub mod index_regen;
@@ -19,6 +20,7 @@ pub mod invariants;
 pub mod lifecycle;
 pub mod rowid_alloc;
 pub mod shared_lock_table;
+pub mod sheaf_conformal;
 pub mod shm;
 pub mod ssi_abort_policy;
 pub mod ssi_validation;
@@ -54,6 +56,11 @@ pub use core_types::{
     VersionIdx, cleanup_and_raise_gc_horizon, cleanup_orphaned_slots, raise_gc_horizon,
     try_cleanup_orphaned_slot, try_cleanup_sentinel_slot,
 };
+pub use deterministic_rebase::{
+    BaseRowReader, RebaseEligibility, RebaseError, RebaseResult, RebaseSchemaLookup, ReplayResult,
+    TableConstraints, UpdateExpressionCandidate, can_emit_update_expression,
+    check_rebase_eligibility, check_schema_epoch, deterministic_rebase, replay_update_expression,
+};
 pub use gc::{
     GC_F_MAX_HZ, GC_F_MIN_HZ, GC_PAGES_BUDGET, GC_TARGET_CHAIN_LENGTH, GC_VERSIONS_BUDGET,
     GcScheduler, GcTickResult, GcTodo, PruneResult, gc_tick, prune_page_chain,
@@ -77,6 +84,11 @@ pub use rowid_alloc::{
 pub use shared_lock_table::{
     AcquireResult, DEFAULT_TABLE_CAPACITY, DrainStatus, RebuildLeaseError,
     RebuildResult as SharedRebuildResult, SharedPageLockTable,
+};
+pub use sheaf_conformal::{
+    ConformalCalibratorConfig, ConformalOracleCalibrator, ConformalPrediction, InvariantScore,
+    OpportunityScore, OracleReport, PredictionSetEntry, Section, SheafObstruction, SheafResult,
+    check_sheaf_consistency,
 };
 pub use shm::{SharedMemoryLayout, ShmSnapshot};
 pub use ssi_abort_policy::{

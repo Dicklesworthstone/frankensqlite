@@ -5,12 +5,14 @@ use serde_json::{Value, json};
 use tempfile::tempdir;
 
 use fsqlite_harness::log::{
-    ConformanceDiff, LOG_SCHEMA_VERSION, LifecycleEventKind, REQUIRED_BUNDLE_FILES, RunStatus,
-    init_repro_bundle, validate_bundle, validate_bundle_meta, validate_events_jsonl,
+    ConformanceDiff, LOG_SCHEMA_VERSION, LifecycleEventKind, PerfBaselineArtifact,
+    REQUIRED_BUNDLE_FILES, RunStatus, detect_optimization_levers, init_repro_bundle,
+    validate_bundle, validate_bundle_meta, validate_events_jsonl, validate_perf_optimization_loop,
     validate_required_files,
 };
 
 const BEAD_ID: &str = "bd-1fpm";
+const PERF_LOOP_BEAD_ID: &str = "bd-3cl3.1";
 
 #[test]
 fn test_log_bundle_meta_json_schema_valid() {
@@ -114,6 +116,99 @@ fn test_e2e_harness_emits_repro_bundle_on_failure() {
         bundle_root.join("oracle_diff.json").is_file(),
         "bead_id={BEAD_ID} case=e2e_oracle_diff_present"
     );
+}
+
+#[test]
+fn test_loop_one_lever_only() {
+    let changed_paths = vec![
+        PathBuf::from("crates/fsqlite-core/src/lib.rs"),
+        PathBuf::from("crates/fsqlite-mvcc/src/lifecycle.rs"),
+    ];
+
+    let detected = detect_optimization_levers(&changed_paths);
+    assert_eq!(
+        detected,
+        vec!["fsqlite-core".to_string(), "fsqlite-mvcc".to_string()],
+        "bead_id={PERF_LOOP_BEAD_ID} case=lever_detection_multicrate"
+    );
+
+    let err = validate_perf_optimization_loop(&changed_paths, None, None, None)
+        .expect_err("multi-lever optimization change must be rejected");
+    let rendered = err.to_string();
+    assert!(
+        rendered.contains("multiple optimization levers"),
+        "bead_id={PERF_LOOP_BEAD_ID} case=reject_multi_lever err={rendered}"
+    );
+}
+
+#[test]
+fn test_baseline_capture_required() {
+    let changed_paths = vec![PathBuf::from("crates/fsqlite-core/src/region.rs")];
+
+    let err = validate_perf_optimization_loop(&changed_paths, None, None, None)
+        .expect_err("optimization change without baseline must fail");
+    let rendered = err.to_string();
+    assert!(
+        rendered.contains("missing baseline artifact"),
+        "bead_id={PERF_LOOP_BEAD_ID} case=baseline_required err={rendered}"
+    );
+}
+
+#[test]
+fn test_golden_unchanged() {
+    let temp = tempdir().expect("tempdir should be created");
+    let baseline_path = temp.path().join("perf_baseline.json");
+    let golden_before = temp.path().join("golden-before.bin");
+    let golden_after = temp.path().join("golden-after.bin");
+
+    write_perf_baseline_artifact(&baseline_path);
+    std::fs::write(&golden_before, b"golden-lock").expect("golden before should be written");
+    std::fs::write(&golden_after, b"golden-lock").expect("golden after should be written");
+
+    let changed_paths = vec![PathBuf::from("crates/fsqlite-core/src/commit_repair.rs")];
+    let report = validate_perf_optimization_loop(
+        &changed_paths,
+        Some(&baseline_path),
+        Some(&golden_before),
+        Some(&golden_after),
+    )
+    .expect("single-lever optimization with matching golden outputs should pass");
+
+    assert_eq!(
+        report.lever_keys,
+        vec!["fsqlite-core".to_string()],
+        "bead_id={PERF_LOOP_BEAD_ID} case=single_lever_ok"
+    );
+    let baseline = report
+        .baseline
+        .expect("baseline should be present for optimization report");
+    assert_eq!(
+        baseline.scenario_id, "hot_page_read",
+        "bead_id={PERF_LOOP_BEAD_ID} case=baseline_scenario"
+    );
+    assert_eq!(
+        report.golden_before_sha256, report.golden_after_sha256,
+        "bead_id={PERF_LOOP_BEAD_ID} case=golden_checksum_lock"
+    );
+}
+
+fn write_perf_baseline_artifact(path: &Path) {
+    let baseline = PerfBaselineArtifact {
+        trace_id: "trace-123".to_string(),
+        scenario_id: "hot_page_read".to_string(),
+        git_sha: "deadbeef".to_string(),
+        artifact_paths: vec![
+            "artifacts/baseline.json".to_string(),
+            "artifacts/profile.folded".to_string(),
+        ],
+        p50_micros: 100,
+        p95_micros: 140,
+        p99_micros: 180,
+        throughput_ops_per_sec: 50_000,
+        alloc_count: 2_500,
+    };
+    let bytes = serde_json::to_vec_pretty(&baseline).expect("baseline json should serialize");
+    std::fs::write(path, bytes).expect("baseline artifact should be written");
 }
 
 fn run_known_failing_harness_case(base_dir: &Path) -> fsqlite_error::Result<PathBuf> {

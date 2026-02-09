@@ -494,6 +494,382 @@ impl SymbolRecord {
 }
 
 // ---------------------------------------------------------------------------
+// §1.5 Systematic symbol layout + fast-path reconstruction helpers
+// ---------------------------------------------------------------------------
+
+/// Error when validating or reconstructing systematic symbol runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SystematicLayoutError {
+    /// No symbol records were provided.
+    EmptySymbolSet,
+    /// OTI uses `t = 0`, which is invalid.
+    ZeroSymbolSize,
+    /// Source-symbol count cannot be represented on this platform.
+    SourceSymbolCountTooLarge { source_symbols: u64 },
+    /// Source-symbol count exceeds the `u32` ESI namespace.
+    SourceSymbolCountExceedsEsiRange { source_symbols: u64 },
+    /// Transfer length cannot be represented as `usize`.
+    TransferLengthTooLarge { transfer_length: u64 },
+    /// Reconstructed buffer size overflow.
+    ReconstructedSizeOverflow {
+        source_symbols: usize,
+        symbol_size: usize,
+    },
+    /// Record object id does not match the run's object id.
+    InconsistentObjectId {
+        expected: ObjectId,
+        found: ObjectId,
+        esi: u32,
+    },
+    /// Record OTI does not match the run's OTI.
+    InconsistentOti { expected: Oti, found: Oti, esi: u32 },
+    /// Record payload length does not match `OTI.t`.
+    InvalidSymbolPayloadSize {
+        esi: u32,
+        expected: usize,
+        found: usize,
+    },
+    /// ESI 0 must carry [`SymbolRecordFlags::SYSTEMATIC_RUN_START`].
+    MissingSystematicStartFlag,
+    /// Missing required source symbol.
+    MissingSystematicSymbol { expected_esi: u32 },
+    /// Duplicate source symbol with the same ESI.
+    DuplicateSystematicSymbol { esi: u32 },
+    /// Source symbols are not laid out as `ESI 0..K-1` contiguously.
+    NonContiguousSystematicSymbol { expected_esi: u32, found_esi: u32 },
+    /// A source symbol appears after the systematic run.
+    RepairInterleaved { index: usize, esi: u32 },
+    /// Symbol integrity check failed.
+    CorruptSymbol { esi: u32 },
+}
+
+impl fmt::Display for SystematicLayoutError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptySymbolSet => f.write_str("no symbol records provided"),
+            Self::ZeroSymbolSize => f.write_str("OTI.t is zero"),
+            Self::SourceSymbolCountTooLarge { source_symbols } => {
+                write!(
+                    f,
+                    "source symbol count too large for platform: {source_symbols}"
+                )
+            }
+            Self::SourceSymbolCountExceedsEsiRange { source_symbols } => {
+                write!(
+                    f,
+                    "source symbol count exceeds u32 ESI range: {source_symbols}"
+                )
+            }
+            Self::TransferLengthTooLarge { transfer_length } => {
+                write!(
+                    f,
+                    "transfer length too large for platform: {transfer_length}"
+                )
+            }
+            Self::ReconstructedSizeOverflow {
+                source_symbols,
+                symbol_size,
+            } => {
+                write!(
+                    f,
+                    "reconstructed size overflow: {source_symbols} * {symbol_size}"
+                )
+            }
+            Self::InconsistentObjectId {
+                expected,
+                found,
+                esi,
+            } => {
+                write!(
+                    f,
+                    "object_id mismatch at esi={esi}: expected {expected}, found {found}"
+                )
+            }
+            Self::InconsistentOti {
+                expected,
+                found,
+                esi,
+            } => {
+                write!(
+                    f,
+                    "OTI mismatch at esi={esi}: expected {expected:?}, found {found:?}"
+                )
+            }
+            Self::InvalidSymbolPayloadSize {
+                esi,
+                expected,
+                found,
+            } => {
+                write!(
+                    f,
+                    "symbol payload size mismatch at esi={esi}: expected {expected}, found {found}"
+                )
+            }
+            Self::MissingSystematicStartFlag => {
+                f.write_str("missing SYSTEMATIC_RUN_START flag on ESI 0")
+            }
+            Self::MissingSystematicSymbol { expected_esi } => {
+                write!(f, "missing systematic symbol esi={expected_esi}")
+            }
+            Self::DuplicateSystematicSymbol { esi } => {
+                write!(f, "duplicate systematic symbol esi={esi}")
+            }
+            Self::NonContiguousSystematicSymbol {
+                expected_esi,
+                found_esi,
+            } => {
+                write!(
+                    f,
+                    "non-contiguous systematic run: expected esi={expected_esi}, found esi={found_esi}"
+                )
+            }
+            Self::RepairInterleaved { index, esi } => {
+                write!(
+                    f,
+                    "repair/source interleave at index={index}: encountered source esi={esi} after systematic run"
+                )
+            }
+            Self::CorruptSymbol { esi } => write!(f, "integrity check failed for esi={esi}"),
+        }
+    }
+}
+
+impl std::error::Error for SystematicLayoutError {}
+
+fn source_symbol_count_u64(oti: Oti) -> Result<u64, SystematicLayoutError> {
+    if oti.t == 0 {
+        return Err(SystematicLayoutError::ZeroSymbolSize);
+    }
+    if oti.f == 0 {
+        return Ok(0);
+    }
+    Ok(oti.f.div_ceil(u64::from(oti.t)))
+}
+
+fn validate_record_shape(
+    record: &SymbolRecord,
+    object_id: ObjectId,
+    oti: Oti,
+    symbol_size: usize,
+) -> Result<(), SystematicLayoutError> {
+    if record.object_id != object_id {
+        return Err(SystematicLayoutError::InconsistentObjectId {
+            expected: object_id,
+            found: record.object_id,
+            esi: record.esi,
+        });
+    }
+    if record.oti != oti {
+        return Err(SystematicLayoutError::InconsistentOti {
+            expected: oti,
+            found: record.oti,
+            esi: record.esi,
+        });
+    }
+    if record.symbol_data.len() != symbol_size {
+        return Err(SystematicLayoutError::InvalidSymbolPayloadSize {
+            esi: record.esi,
+            expected: symbol_size,
+            found: record.symbol_data.len(),
+        });
+    }
+    if !record.verify_integrity() {
+        return Err(SystematicLayoutError::CorruptSymbol { esi: record.esi });
+    }
+    Ok(())
+}
+
+/// Compute source-symbol count `K = ceil(F / T)` for the given [`Oti`].
+pub fn source_symbol_count(oti: Oti) -> Result<usize, SystematicLayoutError> {
+    let source_symbols = source_symbol_count_u64(oti)?;
+    usize::try_from(source_symbols)
+        .map_err(|_| SystematicLayoutError::SourceSymbolCountTooLarge { source_symbols })
+}
+
+/// Writer helper: normalize records into `ESI 0..K-1` contiguous layout.
+///
+/// Guarantees:
+/// - Source symbols are first, in ascending ESI order (`0..K-1`).
+/// - Repair symbols (`ESI >= K`) follow the systematic run.
+/// - Only ESI 0 has [`SymbolRecordFlags::SYSTEMATIC_RUN_START`].
+pub fn layout_systematic_run(
+    records: Vec<SymbolRecord>,
+) -> Result<Vec<SymbolRecord>, SystematicLayoutError> {
+    let first = records
+        .first()
+        .ok_or(SystematicLayoutError::EmptySymbolSet)?
+        .clone();
+    let source_symbols = source_symbol_count(first.oti)?;
+    let source_symbols_u64 = source_symbol_count_u64(first.oti)?;
+    let source_symbols_u32 = u32::try_from(source_symbols_u64).map_err(|_| {
+        SystematicLayoutError::SourceSymbolCountExceedsEsiRange {
+            source_symbols: source_symbols_u64,
+        }
+    })?;
+    let symbol_size =
+        usize::try_from(first.oti.t).map_err(|_| SystematicLayoutError::ZeroSymbolSize)?;
+
+    let mut systematic = vec![None; source_symbols];
+    let mut repairs = Vec::new();
+
+    for mut record in records {
+        validate_record_shape(&record, first.object_id, first.oti, symbol_size)?;
+        record.flags.remove(SymbolRecordFlags::SYSTEMATIC_RUN_START);
+        if record.esi < source_symbols_u32 {
+            let idx = usize::try_from(record.esi).expect("ESI < K fits usize");
+            if systematic[idx].is_some() {
+                return Err(SystematicLayoutError::DuplicateSystematicSymbol { esi: record.esi });
+            }
+            systematic[idx] = Some(record);
+        } else {
+            repairs.push(record);
+        }
+    }
+
+    let mut ordered = Vec::with_capacity(systematic.len().saturating_add(repairs.len()));
+    for (idx, maybe_record) in systematic.into_iter().enumerate() {
+        let mut record =
+            maybe_record.ok_or_else(|| SystematicLayoutError::MissingSystematicSymbol {
+                expected_esi: u32::try_from(idx).expect("idx fits u32"),
+            })?;
+        if idx == 0 {
+            record.flags.insert(SymbolRecordFlags::SYSTEMATIC_RUN_START);
+        }
+        ordered.push(record);
+    }
+
+    repairs.sort_by_key(|record| record.esi);
+    ordered.extend(repairs);
+
+    Ok(ordered)
+}
+
+/// Validate whether records already satisfy systematic contiguous run layout.
+///
+/// Returns the required source-symbol count `K` on success.
+pub fn validate_systematic_run(records: &[SymbolRecord]) -> Result<usize, SystematicLayoutError> {
+    let first = records
+        .first()
+        .ok_or(SystematicLayoutError::EmptySymbolSet)?;
+    let source_symbols = source_symbol_count(first.oti)?;
+    let source_symbols_u64 = source_symbol_count_u64(first.oti)?;
+    let source_symbols_u32 = u32::try_from(source_symbols_u64).map_err(|_| {
+        SystematicLayoutError::SourceSymbolCountExceedsEsiRange {
+            source_symbols: source_symbols_u64,
+        }
+    })?;
+    let symbol_size =
+        usize::try_from(first.oti.t).map_err(|_| SystematicLayoutError::ZeroSymbolSize)?;
+
+    if source_symbols == 0 {
+        return Ok(0);
+    }
+
+    for expected_idx in 0..source_symbols {
+        let record = records.get(expected_idx).ok_or_else(|| {
+            SystematicLayoutError::MissingSystematicSymbol {
+                expected_esi: u32::try_from(expected_idx).expect("idx fits u32"),
+            }
+        })?;
+        validate_record_shape(record, first.object_id, first.oti, symbol_size)?;
+
+        let expected_esi = u32::try_from(expected_idx).expect("idx fits u32");
+        if record.esi != expected_esi {
+            return Err(SystematicLayoutError::NonContiguousSystematicSymbol {
+                expected_esi,
+                found_esi: record.esi,
+            });
+        }
+
+        if expected_idx == 0 {
+            if !record
+                .flags
+                .contains(SymbolRecordFlags::SYSTEMATIC_RUN_START)
+            {
+                return Err(SystematicLayoutError::MissingSystematicStartFlag);
+            }
+        } else if record
+            .flags
+            .contains(SymbolRecordFlags::SYSTEMATIC_RUN_START)
+        {
+            return Err(SystematicLayoutError::MissingSystematicStartFlag);
+        }
+    }
+
+    for (index, record) in records.iter().enumerate().skip(source_symbols) {
+        validate_record_shape(record, first.object_id, first.oti, symbol_size)?;
+        if record.esi < source_symbols_u32 {
+            return Err(SystematicLayoutError::RepairInterleaved {
+                index,
+                esi: record.esi,
+            });
+        }
+    }
+
+    Ok(source_symbols)
+}
+
+/// Reconstruct payload bytes directly from contiguous systematic symbols.
+///
+/// This is the GF(256)-free happy path.
+pub fn reconstruct_systematic_happy_path(
+    records: &[SymbolRecord],
+) -> Result<Vec<u8>, SystematicLayoutError> {
+    let source_symbols = validate_systematic_run(records)?;
+    if source_symbols == 0 {
+        return Ok(Vec::new());
+    }
+
+    let first = &records[0];
+    let symbol_size =
+        usize::try_from(first.oti.t).map_err(|_| SystematicLayoutError::ZeroSymbolSize)?;
+    let transfer_length = usize::try_from(first.oti.f).map_err(|_| {
+        SystematicLayoutError::TransferLengthTooLarge {
+            transfer_length: first.oti.f,
+        }
+    })?;
+    let total_len = source_symbols.checked_mul(symbol_size).ok_or(
+        SystematicLayoutError::ReconstructedSizeOverflow {
+            source_symbols,
+            symbol_size,
+        },
+    )?;
+
+    let mut out = Vec::with_capacity(total_len);
+    for record in records.iter().take(source_symbols) {
+        out.extend_from_slice(&record.symbol_data);
+    }
+    out.truncate(transfer_length);
+    Ok(out)
+}
+
+/// Read-path classification for ECS object recovery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SymbolReadPath {
+    /// Recovered by concatenating contiguous systematic symbols.
+    SystematicFastPath,
+    /// Happy path was unavailable; decoder fallback was invoked.
+    FullDecodeFallback { reason: SystematicLayoutError },
+}
+
+/// Recover object bytes using happy-path first, with decoder fallback.
+pub fn recover_object_with_fallback<F>(
+    records: &[SymbolRecord],
+    mut fallback_decode: F,
+) -> Result<(Vec<u8>, SymbolReadPath), SystematicLayoutError>
+where
+    F: FnMut(&[SymbolRecord]) -> Result<Vec<u8>, SystematicLayoutError>,
+{
+    match reconstruct_systematic_happy_path(records) {
+        Ok(bytes) => Ok((bytes, SymbolReadPath::SystematicFastPath)),
+        Err(reason) => {
+            let decoded = fallback_decode(records)?;
+            Ok((decoded, SymbolReadPath::FullDecodeFallback { reason }))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // §3.6.1-3.6.3 Native Index Types
 // ---------------------------------------------------------------------------
 
@@ -940,6 +1316,60 @@ mod tests {
         )
     }
 
+    fn make_symbol_run(
+        object_id: ObjectId,
+        source_symbols: u32,
+        symbol_size: u32,
+        repair_symbols: u32,
+    ) -> (Vec<SymbolRecord>, Vec<u8>, Oti) {
+        let symbol_size_usize = usize::try_from(symbol_size).expect("symbol_size fits usize");
+        let transfer_length = u64::from(source_symbols).saturating_mul(u64::from(symbol_size));
+        let oti = Oti {
+            f: transfer_length,
+            al: 4,
+            t: symbol_size,
+            z: 1,
+            n: 1,
+        };
+        let mut records = Vec::new();
+        let mut expected = Vec::new();
+
+        for esi in 0..source_symbols {
+            let mut payload = Vec::with_capacity(symbol_size_usize);
+            for idx in 0..symbol_size_usize {
+                let idx_low = u8::try_from(idx & 0xFF).expect("masked to u8");
+                let esi_low = u8::try_from(esi & 0xFF).expect("masked to u8");
+                payload.push(esi_low ^ idx_low.wrapping_mul(3));
+            }
+            expected.extend_from_slice(&payload);
+            let flags = if esi == 0 {
+                SymbolRecordFlags::SYSTEMATIC_RUN_START
+            } else {
+                SymbolRecordFlags::empty()
+            };
+            records.push(SymbolRecord::new(object_id, oti, esi, payload, flags));
+        }
+
+        for repair in 0..repair_symbols {
+            let esi = source_symbols.saturating_add(repair);
+            let mut payload = vec![0u8; symbol_size_usize];
+            let esi_low = u8::try_from(esi & 0xFF).expect("masked to u8");
+            for (idx, byte) in payload.iter_mut().enumerate() {
+                let idx_low = u8::try_from(idx & 0xFF).expect("masked to u8");
+                *byte = esi_low.wrapping_mul(13) ^ idx_low;
+            }
+            records.push(SymbolRecord::new(
+                object_id,
+                oti,
+                esi,
+                payload,
+                SymbolRecordFlags::empty(),
+            ));
+        }
+
+        (records, expected, oti)
+    }
+
     // -----------------------------------------------------------------------
     // §3.5.2 SymbolRecord tests
     // -----------------------------------------------------------------------
@@ -1123,6 +1553,198 @@ mod tests {
             result.unwrap_err(),
             SymbolRecordError::IntegrityFailure { .. }
         ));
+    }
+
+    #[test]
+    fn test_systematic_symbols_contiguous() {
+        let oid = ObjectId::from_bytes([0x44; 16]);
+        let (mut records, expected, oti) = make_symbol_run(oid, 100, 64, 8);
+        let repair = records
+            .pop()
+            .expect("repair symbol exists for interleaving simulation");
+        records.insert(9, repair);
+        records.swap(3, 21);
+
+        let ordered = layout_systematic_run(records).expect("layout must normalize");
+        let source_symbols = validate_systematic_run(&ordered).expect("must be contiguous");
+        assert_eq!(source_symbols, 100);
+
+        for (idx, record) in ordered.iter().take(100).enumerate() {
+            let expected_esi = u32::try_from(idx).expect("idx fits u32");
+            assert_eq!(record.esi, expected_esi);
+        }
+        assert!(
+            ordered.iter().skip(100).all(|record| record.esi >= 100_u32),
+            "repair symbols must follow source run"
+        );
+        assert!(
+            ordered[0]
+                .flags
+                .contains(SymbolRecordFlags::SYSTEMATIC_RUN_START)
+        );
+        assert!(ordered[1..].iter().all(|record| {
+            !record
+                .flags
+                .contains(SymbolRecordFlags::SYSTEMATIC_RUN_START)
+        }));
+
+        let recovered =
+            reconstruct_systematic_happy_path(&ordered).expect("happy-path reconstruction");
+        assert_eq!(
+            recovered.len(),
+            usize::try_from(oti.f).expect("transfer length fits usize")
+        );
+        assert_eq!(recovered, expected);
+    }
+
+    #[test]
+    fn test_happy_path_read_no_gf256() {
+        let oid = ObjectId::from_bytes([0x55; 16]);
+        let (records, expected, _) = make_symbol_run(oid, 50, 64, 5);
+        let decode_invocations = std::cell::Cell::new(0_u32);
+
+        let (decoded, path) = recover_object_with_fallback(&records, |_| {
+            decode_invocations.set(decode_invocations.get().saturating_add(1));
+            Err(SystematicLayoutError::EmptySymbolSet)
+        })
+        .expect("happy-path should succeed");
+
+        assert!(matches!(path, SymbolReadPath::SystematicFastPath));
+        assert_eq!(
+            decode_invocations.get(),
+            0,
+            "fallback decode must not run on systematic happy path"
+        );
+        assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn test_fallback_on_missing_symbol() {
+        let oid = ObjectId::from_bytes([0x66; 16]);
+        let (mut records, expected, _) = make_symbol_run(oid, 50, 64, 5);
+        records.retain(|record| record.esi != 5);
+
+        let decode_invocations = std::cell::Cell::new(0_u32);
+        let fallback_expected = expected.clone();
+        let (decoded, path) = recover_object_with_fallback(&records, |_| {
+            decode_invocations.set(decode_invocations.get().saturating_add(1));
+            Ok(fallback_expected.clone())
+        })
+        .expect("fallback decode should recover object");
+
+        assert_eq!(decode_invocations.get(), 1);
+        assert_eq!(decoded, expected);
+        match path {
+            SymbolReadPath::FullDecodeFallback { reason } => {
+                assert!(matches!(
+                    reason,
+                    SystematicLayoutError::NonContiguousSystematicSymbol {
+                        expected_esi: 5,
+                        ..
+                    } | SystematicLayoutError::MissingSystematicSymbol { expected_esi: 5 }
+                ));
+            }
+            SymbolReadPath::SystematicFastPath => {
+                panic!("fallback path expected when a systematic symbol is missing");
+            }
+        }
+    }
+
+    #[test]
+    fn test_fallback_on_corruption() {
+        let oid = ObjectId::from_bytes([0x77; 16]);
+        let (mut records, expected, _) = make_symbol_run(oid, 50, 64, 5);
+        let corrupt_idx = records
+            .iter()
+            .position(|record| record.esi == 3)
+            .expect("ESI 3 present");
+        records[corrupt_idx].symbol_data[0] ^= 0xAA;
+
+        let decode_invocations = std::cell::Cell::new(0_u32);
+        let fallback_expected = expected.clone();
+        let (decoded, path) = recover_object_with_fallback(&records, |_| {
+            decode_invocations.set(decode_invocations.get().saturating_add(1));
+            Ok(fallback_expected.clone())
+        })
+        .expect("fallback decode should recover corrupted symbol run");
+
+        assert_eq!(decode_invocations.get(), 1);
+        assert_eq!(decoded, expected);
+        match path {
+            SymbolReadPath::FullDecodeFallback { reason } => {
+                assert!(matches!(
+                    reason,
+                    SystematicLayoutError::CorruptSymbol { esi: 3 }
+                ));
+            }
+            SymbolReadPath::SystematicFastPath => {
+                panic!("corrupted systematic symbol must trigger fallback");
+            }
+        }
+    }
+
+    #[test]
+    fn test_benchmark_happy_vs_full() {
+        fn emulate_full_decode(records: &[SymbolRecord]) -> Vec<u8> {
+            let first = records.first().expect("records non-empty");
+            let source_symbols = source_symbol_count(first.oti).expect("valid K");
+            let source_symbols_u32 = u32::try_from(source_symbols).expect("K fits u32");
+            let symbol_size = usize::try_from(first.oti.t).expect("symbol size fits usize");
+            let mut scratch = vec![0_u8; symbol_size];
+            let mut out = Vec::with_capacity(source_symbols.saturating_mul(symbol_size));
+
+            for record in records {
+                if record.esi < source_symbols_u32 {
+                    out.extend_from_slice(&record.symbol_data);
+                }
+                let coeff = u8::try_from((record.esi % 251) + 1).expect("coeff in 1..=251");
+                for _ in 0..24 {
+                    for (dst, src) in scratch.iter_mut().zip(record.symbol_data.iter()) {
+                        *dst ^= crate::gf256_mul_byte(coeff, *src);
+                    }
+                }
+            }
+
+            let transfer_len = usize::try_from(first.oti.f).expect("transfer length fits usize");
+            out.truncate(transfer_len);
+            out
+        }
+
+        let oid = ObjectId::from_bytes([0x88; 16]);
+        let (records, expected, _) = make_symbol_run(oid, 100, 4096, 6);
+        let rounds = 6_u32;
+
+        let fast_start = std::time::Instant::now();
+        let mut fast_guard = 0_u8;
+        for _ in 0..rounds {
+            let decoded = reconstruct_systematic_happy_path(&records).expect("happy-path decode");
+            fast_guard ^= decoded[0];
+            assert_eq!(decoded, expected);
+        }
+        let fast_elapsed = fast_start.elapsed();
+
+        let full_start = std::time::Instant::now();
+        let mut full_guard = 0_u8;
+        for _ in 0..rounds {
+            let decoded = emulate_full_decode(&records);
+            full_guard ^= decoded[0];
+            assert_eq!(decoded, expected);
+        }
+        let full_elapsed = full_start.elapsed();
+
+        assert_ne!(
+            fast_guard,
+            full_guard.wrapping_add(1),
+            "keep optimizer honest"
+        );
+
+        let fast_ns = fast_elapsed.as_nanos().max(1);
+        let full_ns = full_elapsed.as_nanos().max(1);
+        let speedup = full_ns as f64 / fast_ns as f64;
+        assert!(
+            speedup >= 10.0,
+            "expected happy-path to be >=10x faster, got {speedup:.2}x (happy={fast_elapsed:?}, full={full_elapsed:?})"
+        );
     }
 
     #[test]
@@ -1484,6 +2106,71 @@ mod proptests {
             let bytes = rec.to_bytes();
             let rec2 = SymbolRecord::from_bytes(&bytes).unwrap();
             prop_assert_eq!(rec, rec2);
+        }
+
+        #[test]
+        fn test_write_produces_contiguous_layout(
+            source_symbols in 1u16..=500u16,
+            symbol_size in prop::sample::select(vec![64u32, 128u32, 256u32, 512u32]),
+            seed in any::<u8>(),
+        ) {
+            let source_symbols_u32 = u32::from(source_symbols);
+            let symbol_size_usize = usize::try_from(symbol_size).expect("symbol size fits usize");
+            let transfer_length = u64::from(source_symbols_u32).saturating_mul(u64::from(symbol_size));
+            let oti = Oti {
+                f: transfer_length,
+                al: 4,
+                t: symbol_size,
+                z: 1,
+                n: 1,
+            };
+            let oid = ObjectId::from_bytes([seed; 16]);
+
+            let mut records = Vec::new();
+            for esi in 0..source_symbols_u32 {
+                let mut payload = vec![0u8; symbol_size_usize];
+                let esi_low = u8::try_from(esi & 0xFF).expect("masked to u8");
+                for (idx, byte) in payload.iter_mut().enumerate() {
+                    let idx_low = u8::try_from(idx & 0xFF).expect("masked to u8");
+                    *byte = idx_low ^ esi_low.wrapping_mul(5);
+                }
+                let flags = if esi == 0 {
+                    SymbolRecordFlags::SYSTEMATIC_RUN_START
+                } else {
+                    SymbolRecordFlags::empty()
+                };
+                records.push(SymbolRecord::new(oid, oti, esi, payload, flags));
+            }
+
+            for extra in 0..3_u32 {
+                let esi = source_symbols_u32.saturating_add(extra);
+                records.push(SymbolRecord::new(
+                    oid,
+                    oti,
+                    esi,
+                    vec![0xEE; symbol_size_usize],
+                    SymbolRecordFlags::empty(),
+                ));
+            }
+
+            if records.len() > 1 {
+                let rotate_by = usize::from(seed) % records.len();
+                records.rotate_left(rotate_by);
+            }
+
+            let contiguous = layout_systematic_run(records).expect("writer layout normalization");
+            let k = validate_systematic_run(&contiguous).expect("must validate after layout");
+            prop_assert_eq!(k, usize::from(source_symbols));
+            for (idx, record) in contiguous.iter().take(usize::from(source_symbols)).enumerate() {
+                let expected_esi = u32::try_from(idx).expect("idx fits u32");
+                prop_assert_eq!(record.esi, expected_esi);
+            }
+            prop_assert!(
+                contiguous
+                    .iter()
+                    .skip(usize::from(source_symbols))
+                    .all(|record| record.esi >= source_symbols_u32)
+            );
         }
     }
 }

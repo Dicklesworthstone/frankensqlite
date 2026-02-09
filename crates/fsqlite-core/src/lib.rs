@@ -4,6 +4,7 @@
 //! It is intentionally non-blocking: overflow is rejected with `SQLITE_BUSY`
 //! (`FrankenError::Busy`) instead of queue-and-wait semantics.
 
+pub mod commit_marker;
 pub mod commit_repair;
 pub mod decode_proofs;
 pub mod region;
@@ -240,7 +241,19 @@ pub fn symbol_mul_into(coeff: u8, src: &[u8], out: &mut [u8]) -> Result<()> {
             Ok(())
         }
         _ => {
-            for (dst_byte, src_byte) in out.iter_mut().zip(src.iter()) {
+            let mut out_chunks = out.chunks_exact_mut(16);
+            let mut src_chunks = src.chunks_exact(16);
+
+            for (dst_chunk, src_chunk) in out_chunks.by_ref().zip(src_chunks.by_ref()) {
+                for (dst_byte, src_byte) in dst_chunk.iter_mut().zip(src_chunk.iter()) {
+                    *dst_byte = gf256_mul_byte(coeff, *src_byte);
+                }
+            }
+            for (dst_byte, src_byte) in out_chunks
+                .into_remainder()
+                .iter_mut()
+                .zip(src_chunks.remainder().iter())
+            {
                 *dst_byte = gf256_mul_byte(coeff, *src_byte);
             }
             Ok(())
@@ -281,7 +294,19 @@ pub fn symbol_addmul_assign(dst: &mut [u8], coeff: u8, src: &[u8]) -> Result<Wid
         0 => Ok(WideChunkLayout::for_len(dst.len())),
         1 => symbol_add_assign(dst, src),
         _ => {
-            for (dst_byte, src_byte) in dst.iter_mut().zip(src.iter()) {
+            let mut dst_chunks = dst.chunks_exact_mut(16);
+            let mut src_chunks = src.chunks_exact(16);
+
+            for (dst_chunk, src_chunk) in dst_chunks.by_ref().zip(src_chunks.by_ref()) {
+                for (dst_byte, src_byte) in dst_chunk.iter_mut().zip(src_chunk.iter()) {
+                    *dst_byte ^= gf256_mul_byte(coeff, *src_byte);
+                }
+            }
+            for (dst_byte, src_byte) in dst_chunks
+                .into_remainder()
+                .iter_mut()
+                .zip(src_chunks.remainder().iter())
+            {
                 *dst_byte ^= gf256_mul_byte(coeff, *src_byte);
             }
             Ok(WideChunkLayout::for_len(dst.len()))
@@ -596,6 +621,30 @@ mod tests {
         out
     }
 
+    fn xor_patch_bytewise(dst: &mut [u8], patch: &[u8]) {
+        for (dst_byte, patch_byte) in dst.iter_mut().zip(patch.iter()) {
+            *dst_byte ^= *patch_byte;
+        }
+    }
+
+    fn gf256_mul_bytewise(coeff: u8, src: &[u8], out: &mut [u8]) {
+        for (dst_byte, src_byte) in out.iter_mut().zip(src.iter()) {
+            *dst_byte = gf256_mul_byte(coeff, *src_byte);
+        }
+    }
+
+    fn collect_rs_files(root: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let entries = std::fs::read_dir(root).expect("read_dir should succeed");
+        for entry in entries {
+            let path = entry.expect("read_dir entry should be readable").path();
+            if path.is_dir() {
+                collect_rs_files(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
     fn encode_symbols(
         config: RaptorQConfig,
         object_id: AsObjectId,
@@ -884,6 +933,189 @@ mod tests {
         assert_eq!(
             dst, expected,
             "bead_id={SIMD_BEAD_ID} case=xor_patch_matches_scalar_reference"
+        );
+    }
+
+    #[test]
+    fn test_xor_symbols_u64_chunks() {
+        // Length 24 exercises both the u128 and u64 lanes.
+        let mut dst = vec![0xAB_u8; 24];
+        let src = vec![0xCD_u8; 24];
+        let mut expected = vec![0xAB_u8; 24];
+        xor_patch_bytewise(&mut expected, &src);
+
+        let layout = xor_patch_wide_chunks(&mut dst, &src).expect("equal-length buffers");
+        assert_eq!(
+            layout,
+            WideChunkLayout {
+                u128_chunks: 1,
+                u64_chunks: 1,
+                tail_bytes: 0,
+            },
+            "bead_id=bd-2ddc case=u64_chunk_lane_exercised"
+        );
+        assert_eq!(
+            dst, expected,
+            "bead_id=bd-2ddc case=chunked_xor_matches_bytewise_reference"
+        );
+    }
+
+    #[test]
+    fn test_gf256_multiply_chunks() {
+        let coeff = 0xA7_u8;
+        let src = deterministic_payload(4096, 0xDDCC_BBAA_1122_3344);
+        let mut chunked = vec![0_u8; src.len()];
+        let mut scalar = vec![0_u8; src.len()];
+
+        symbol_mul_into(coeff, &src, &mut chunked).expect("chunked symbol_mul_into");
+        gf256_mul_bytewise(coeff, &src, &mut scalar);
+
+        assert_eq!(
+            chunked, scalar,
+            "bead_id=bd-2ddc case=chunked_mul_matches_scalar_reference"
+        );
+    }
+
+    #[test]
+    fn test_u128_chunk_alignment() {
+        // Non-multiple of 16 exercises the u128 path + tail handling.
+        let mut via_wide = deterministic_payload(4099, 0x1234_5678_9ABC_DEF0);
+        let mut via_u64_only = via_wide.clone();
+        let patch = deterministic_payload(4099, 0x0F0E_0D0C_0B0A_0908);
+
+        xor_patch_wide_chunks(&mut via_wide, &patch).expect("wide chunk xor");
+
+        let mut dst_u64_chunks = via_u64_only.chunks_exact_mut(8);
+        let mut patch_u64_chunks = patch.chunks_exact(8);
+        for (dst_chunk, patch_chunk) in dst_u64_chunks.by_ref().zip(patch_u64_chunks.by_ref()) {
+            let dst_word = u64::from_ne_bytes(
+                dst_chunk
+                    .try_into()
+                    .expect("chunks_exact(8) must yield 8-byte chunk"),
+            );
+            let patch_word = u64::from_ne_bytes(
+                patch_chunk
+                    .try_into()
+                    .expect("chunks_exact(8) must yield 8-byte chunk"),
+            );
+            dst_chunk.copy_from_slice(&(dst_word ^ patch_word).to_ne_bytes());
+        }
+        for (dst_byte, patch_byte) in dst_u64_chunks
+            .into_remainder()
+            .iter_mut()
+            .zip(patch_u64_chunks.remainder().iter())
+        {
+            *dst_byte ^= *patch_byte;
+        }
+
+        assert_eq!(
+            via_wide, via_u64_only,
+            "bead_id=bd-2ddc case=u128_lane_matches_u64_plus_tail"
+        );
+    }
+
+    #[test]
+    fn test_benchmark_chunk_vs_byte() {
+        // Meaningful performance checks require optimized codegen.
+        if cfg!(debug_assertions) {
+            return;
+        }
+
+        let iterations = 32_000_usize;
+        let src = deterministic_payload(4096, 0xDEAD_BEEF_F00D_CAFE);
+        let base = deterministic_payload(4096, 0x0123_4567_89AB_CDEF);
+
+        let mut chunked = base.clone();
+        let chunked_start = Instant::now();
+        for _ in 0..iterations {
+            xor_patch_wide_chunks(&mut chunked, &src).expect("chunked xor");
+            std::hint::black_box(&chunked);
+        }
+        let chunked_elapsed = chunked_start.elapsed();
+
+        let mut bytewise = base;
+        let bytewise_start = Instant::now();
+        for _ in 0..iterations {
+            xor_patch_bytewise(&mut bytewise, &src);
+            std::hint::black_box(&bytewise);
+        }
+        let bytewise_elapsed = bytewise_start.elapsed();
+
+        let speedup = bytewise_elapsed.as_secs_f64() / chunked_elapsed.as_secs_f64();
+        assert!(
+            speedup >= 4.0,
+            "bead_id=bd-2ddc case=chunk_vs_byte_speedup speedup={speedup:.2}x \
+             chunked_ns={} bytewise_ns={} iterations={iterations}",
+            chunked_elapsed.as_nanos(),
+            bytewise_elapsed.as_nanos()
+        );
+    }
+
+    #[test]
+    fn test_no_unsafe_simd() {
+        let manifest = include_str!("../../../Cargo.toml");
+        assert!(
+            manifest.contains(r#"unsafe_code = "forbid""#),
+            "bead_id=bd-2ddc case=workspace_forbids_unsafe"
+        );
+
+        let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("crate dir has parent")
+            .parent()
+            .expect("workspace root exists")
+            .to_path_buf();
+        let crates_dir = workspace_root.join("crates");
+
+        let mut rs_files = Vec::new();
+        collect_rs_files(&crates_dir, &mut rs_files);
+
+        let simd_needles = [
+            "_mm_",
+            "std::arch::",
+            "core::arch::",
+            "__m128",
+            "__m256",
+            "__m512",
+            "simd_shuffle",
+            "vpxor",
+            "vxorq",
+        ];
+
+        let mut offenders = Vec::new();
+        for file in rs_files {
+            let Ok(content) = std::fs::read_to_string(&file) else {
+                continue;
+            };
+
+            let lines = content.lines().collect::<Vec<_>>();
+            for (idx, line) in lines.iter().enumerate() {
+                let has_intrinsic = simd_needles.iter().any(|needle| line.contains(needle));
+                if !has_intrinsic {
+                    continue;
+                }
+
+                let window_start = idx.saturating_sub(3);
+                let window_end = (idx + 3).min(lines.len().saturating_sub(1));
+                let mut found_unsafe_nearby = false;
+                for nearby in &lines[window_start..=window_end] {
+                    let trimmed = nearby.trim_start();
+                    let is_comment = trimmed.starts_with("//");
+                    if !is_comment && trimmed.contains("unsafe") {
+                        found_unsafe_nearby = true;
+                        break;
+                    }
+                }
+
+                if found_unsafe_nearby {
+                    offenders.push(format!("{}:{}", file.display(), idx + 1));
+                }
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "bead_id=bd-2ddc case=no_unsafe_simd_intrinsics offenders={offenders:?}"
         );
     }
 

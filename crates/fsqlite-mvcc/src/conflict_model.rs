@@ -330,8 +330,8 @@ mod tests {
     #[test]
     fn test_collision_mass_uniform() {
         // Test 3: Under uniform q(pgno)=W/P, M2=W²/P, P_eff=P/W².
-        let w: u64 = 100;
-        let p: u64 = 1_000_000;
+        let w: f64 = 100.0;
+        let p: f64 = 1_000_000.0;
         let txn_count: u64 = 1000;
         // Simulate uniform: each page has incidence count = txn_count * W / P.
         // For exact computation with integer counts: each of W pages has count = txn_count,
@@ -340,13 +340,13 @@ mod tests {
         //
         // For the theoretical formula: M2 = W²/P = 10000/1000000 = 0.01.
         // Verify the formula directly.
-        let m2_theoretical = (w * w) as f64 / p as f64;
+        let m2_theoretical = (w * w) / p;
         assert!(
             (m2_theoretical - 0.01).abs() < 1e-10,
             "bead_id={BEAD_ID} m2_uniform={m2_theoretical}"
         );
         let p_eff = effective_collision_pool(m2_theoretical);
-        let expected_p_eff = p as f64 / (w * w) as f64;
+        let expected_p_eff = p / (w * w);
         assert!(
             (p_eff - expected_p_eff).abs() < 1e-6,
             "bead_id={BEAD_ID} p_eff={p_eff} expected={expected_p_eff}"
@@ -355,10 +355,7 @@ mod tests {
         // Also test exact_m2 with synthetic counts.
         // 100 pages each with count=10, rest with count=0. txn_count=1000.
         // F2 = 100 * 100 = 10000. M2 = 10000/1000000 = 0.01.
-        let mut counts = vec![0u64; 100];
-        for c in &mut counts {
-            *c = 10;
-        }
+        let counts = vec![10u64; 100];
         let m2 = exact_m2(&counts, txn_count).expect("non-zero txn_count");
         assert!((m2 - 0.01).abs() < 1e-10, "bead_id={BEAD_ID} exact_m2={m2}");
     }

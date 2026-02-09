@@ -13,8 +13,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use fsqlite_types::{
-    BTreePageType, CommitSeq, PageData, PageNumber, PageSize, PageVersion, SchemaEpoch, Snapshot,
-    TxnEpoch, TxnId, TxnToken,
+    CommitSeq, MergePageKind, PageData, PageNumber, PageSize, PageVersion,
+    SchemaEpoch, Snapshot, TxnEpoch, TxnId, TxnToken,
 };
 
 use crate::cache_aligned::{logical_now_epoch_secs, logical_now_millis};
@@ -59,25 +59,6 @@ pub enum WriteMergePolicy {
     LabUnsafe,
 }
 
-/// Page class used for merge-safety decisions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum MergePageKind {
-    BtreeInterior,
-    BtreeLeaf,
-    Overflow,
-    Freelist,
-    PointerMap,
-    OpaqueLab,
-}
-
-impl MergePageKind {
-    /// Whether this page has SQLite-internal pointer semantics.
-    #[must_use]
-    pub const fn is_sqlite_structured(self) -> bool {
-        !matches!(self, Self::OpaqueLab)
-    }
-}
-
 /// Chosen conflict response under the active merge policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MergeDecision {
@@ -85,19 +66,6 @@ pub enum MergeDecision {
     IntentReplay,
     StructuredPatch,
     RawXorLab,
-}
-
-/// Classify a raw page image for merge-safety policy checks.
-#[must_use]
-pub fn classify_page_for_merge(page: &[u8]) -> MergePageKind {
-    let Some(first_byte) = page.first().copied() else {
-        return MergePageKind::OpaqueLab;
-    };
-    match BTreePageType::from_byte(first_byte) {
-        Some(kind) if kind.is_leaf() => MergePageKind::BtreeLeaf,
-        Some(_) => MergePageKind::BtreeInterior,
-        None => MergePageKind::OpaqueLab,
-    }
 }
 
 /// Whether raw XOR merge is allowed for this policy/page-kind pair.
@@ -834,8 +802,8 @@ impl TransactionManager {
         for pgno in conflicts {
             let page_kind = {
                 let data = txn.write_set_data.get(&pgno);
-                data.map_or(MergePageKind::OpaqueLab, |page| {
-                    classify_page_for_merge(page.as_bytes())
+                data.map_or(MergePageKind::Opaque, |page| {
+                    MergePageKind::classify(page.as_bytes())
                 })
             };
             let decision =
@@ -2222,11 +2190,15 @@ mod tests {
     fn test_xor_merge_forbidden_btree_interior() {
         assert!(!raw_xor_merge_allowed(
             WriteMergePolicy::Safe,
-            MergePageKind::BtreeInterior,
+            MergePageKind::BtreeInteriorTable,
             true,
         ));
         assert_eq!(
-            merge_decision(WriteMergePolicy::Safe, MergePageKind::BtreeInterior, true),
+            merge_decision(
+                WriteMergePolicy::Safe,
+                MergePageKind::BtreeInteriorTable,
+                true
+            ),
             MergeDecision::IntentReplay
         );
     }
@@ -2235,11 +2207,11 @@ mod tests {
     fn test_xor_merge_forbidden_btree_leaf() {
         assert!(!raw_xor_merge_allowed(
             WriteMergePolicy::Safe,
-            MergePageKind::BtreeLeaf,
+            MergePageKind::BtreeLeafTable,
             true,
         ));
         assert_eq!(
-            merge_decision(WriteMergePolicy::Safe, MergePageKind::BtreeLeaf, true),
+            merge_decision(WriteMergePolicy::Safe, MergePageKind::BtreeLeafTable, true),
             MergeDecision::IntentReplay
         );
     }
@@ -2381,7 +2353,7 @@ mod tests {
         assert_eq!(
             merge_decision(
                 WriteMergePolicy::Safe,
-                classify_page_for_merge(test_data(0x0D).as_bytes()),
+                MergePageKind::classify(test_data(0x0D).as_bytes()),
                 cfg!(debug_assertions),
             ),
             MergeDecision::IntentReplay
@@ -2407,11 +2379,15 @@ mod tests {
     fn test_lab_unsafe_still_forbids_btree_xor() {
         assert!(!raw_xor_merge_allowed(
             WriteMergePolicy::LabUnsafe,
-            MergePageKind::BtreeLeaf,
+            MergePageKind::BtreeLeafTable,
             true,
         ));
         assert_eq!(
-            merge_decision(WriteMergePolicy::LabUnsafe, MergePageKind::BtreeLeaf, true),
+            merge_decision(
+                WriteMergePolicy::LabUnsafe,
+                MergePageKind::BtreeLeafTable,
+                true
+            ),
             MergeDecision::IntentReplay
         );
     }
@@ -2426,8 +2402,8 @@ mod tests {
             "delta encodes byte differences"
         );
 
-        let page_kind = classify_page_for_merge(&target);
-        assert_eq!(page_kind, MergePageKind::BtreeLeaf);
+        let page_kind = MergePageKind::classify(&target);
+        assert_eq!(page_kind, MergePageKind::BtreeLeafTable);
         assert!(
             !raw_xor_merge_allowed(WriteMergePolicy::Safe, page_kind, true),
             "delta encoding does not imply merge correctness permission"
@@ -2437,8 +2413,8 @@ mod tests {
     #[test]
     fn prop_merge_safety_compile_time() {
         let structured = [
-            MergePageKind::BtreeInterior,
-            MergePageKind::BtreeLeaf,
+            MergePageKind::BtreeInteriorTable,
+            MergePageKind::BtreeLeafTable,
             MergePageKind::Overflow,
             MergePageKind::Freelist,
             MergePageKind::PointerMap,
@@ -2538,7 +2514,7 @@ mod tests {
         assert_eq!(
             merge_decision(
                 WriteMergePolicy::Safe,
-                classify_page_for_merge(test_data(0x0D).as_bytes()),
+                MergePageKind::classify(test_data(0x0D).as_bytes()),
                 cfg!(debug_assertions),
             ),
             MergeDecision::IntentReplay,

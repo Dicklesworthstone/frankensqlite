@@ -1,5 +1,5 @@
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
-use fsqlite_core::{symbol_add_assign, symbol_addmul_assign};
+use fsqlite_core::{symbol_add_assign, symbol_addmul_assign, xor_patch_wide_chunks};
 
 fn fill_pattern(len: usize, a: u8, b: u8) -> Vec<u8> {
     (0..len)
@@ -8,6 +8,12 @@ fn fill_pattern(len: usize, a: u8, b: u8) -> Vec<u8> {
             idx_byte.wrapping_mul(a).wrapping_add(b)
         })
         .collect()
+}
+
+fn xor_patch_bytewise(dst: &mut [u8], patch: &[u8]) {
+    for (dst_byte, patch_byte) in dst.iter_mut().zip(patch.iter()) {
+        *dst_byte ^= *patch_byte;
+    }
 }
 
 fn bench_symbol_ops(c: &mut Criterion) {
@@ -50,6 +56,28 @@ fn bench_symbol_ops(c: &mut Criterion) {
                 b.iter(|| {
                     symbol_addmul_assign(&mut dst, 0x53, black_box(&patch))
                         .expect("symbol_addmul_assign");
+                    black_box(&dst);
+                });
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("xor_patch_chunked", symbol_len),
+            &symbol_len,
+            |b, _| {
+                b.iter(|| {
+                    xor_patch_wide_chunks(&mut dst, black_box(&patch)).expect("xor_patch_chunked");
+                    black_box(&dst);
+                });
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("xor_patch_bytewise", symbol_len),
+            &symbol_len,
+            |b, _| {
+                b.iter(|| {
+                    xor_patch_bytewise(&mut dst, black_box(&patch));
                     black_box(&dst);
                 });
             },

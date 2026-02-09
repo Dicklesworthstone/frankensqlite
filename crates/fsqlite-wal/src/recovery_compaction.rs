@@ -19,7 +19,10 @@
 
 use std::collections::{HashMap, HashSet};
 
-use fsqlite_types::ecs::{BloomFilter, ManifestSegment, ObjectId};
+use fsqlite_types::ecs::{
+    BloomFilter, ManifestSegment, ObjectId, SymbolRecord, reconstruct_systematic_happy_path,
+    source_symbol_count,
+};
 use fsqlite_types::{CommitMarker, CommitSeq, PageNumber};
 use tracing::{debug, info, warn};
 
@@ -36,6 +39,75 @@ pub enum CapsuleDecodeOutcome {
     Repaired { repair_symbols_used: u32 },
     /// Decode failed — durability contract violated.
     Failed { reason: String },
+}
+
+/// Decode capsule symbol records with systematic fast-path + fallback routing.
+///
+/// Logs read-path selection per `bd-3dci`:
+/// - DEBUG: `object_id`, `systematic_ok`, `decode_invoked`.
+/// - INFO: fallback decode events with `symbols_available`, `k_required`, `reason`.
+pub fn decode_capsule_symbol_records<F>(
+    object_id: ObjectId,
+    records: &[SymbolRecord],
+    mut fallback_decode: F,
+) -> CapsuleDecodeOutcome
+where
+    F: FnMut(&[SymbolRecord]) -> std::result::Result<Vec<u8>, String>,
+{
+    let k_required = records
+        .first()
+        .and_then(|record| source_symbol_count(record.oti).ok())
+        .unwrap_or(0);
+    let k_required_u32 = u32::try_from(k_required).ok();
+
+    match reconstruct_systematic_happy_path(records) {
+        Ok(_) => {
+            debug!(
+                object_id = %object_id,
+                systematic_ok = true,
+                decode_invoked = false,
+                symbols_available = records.len(),
+                k_required,
+                "capsule read-path selection"
+            );
+            CapsuleDecodeOutcome::Systematic
+        }
+        Err(reason) => {
+            debug!(
+                object_id = %object_id,
+                systematic_ok = false,
+                decode_invoked = true,
+                symbols_available = records.len(),
+                k_required,
+                reason = %reason,
+                "capsule read-path selection"
+            );
+            info!(
+                object_id = %object_id,
+                symbols_available = records.len(),
+                k_required,
+                reason = %reason,
+                "systematic run unavailable; invoking decode fallback"
+            );
+            match fallback_decode(records) {
+                Ok(_) => {
+                    let repair_symbols_used = k_required_u32.map_or(0_u32, |required| {
+                        let count = records
+                            .iter()
+                            .filter(|record| record.esi >= required)
+                            .count();
+                        u32::try_from(count).unwrap_or(u32::MAX)
+                    });
+                    CapsuleDecodeOutcome::Repaired {
+                        repair_symbols_used,
+                    }
+                }
+                Err(fallback_err) => CapsuleDecodeOutcome::Failed {
+                    reason: format!("{reason}; fallback decode failed: {fallback_err}"),
+                },
+            }
+        }
+    }
 }
 
 /// Diagnostic emitted when a committed marker's capsule cannot be decoded.
@@ -815,6 +887,8 @@ pub enum CompactionCompensation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fsqlite_types::Oti;
+    use fsqlite_types::ecs::SymbolRecordFlags;
 
     fn make_oid(seed: u8) -> ObjectId {
         ObjectId::from_bytes([seed; 16])
@@ -840,6 +914,54 @@ mod tests {
             object_ids: object_seeds.iter().map(|&s| make_oid(s)).collect(),
             size_bytes: size,
         }
+    }
+
+    fn make_capsule_symbol_records(
+        object_id: ObjectId,
+        source_symbols: u32,
+        symbol_size: u32,
+        repair_symbols: u32,
+    ) -> (Vec<SymbolRecord>, Vec<u8>) {
+        let symbol_size_usize = usize::try_from(symbol_size).expect("symbol size fits usize");
+        let oti = Oti {
+            f: u64::from(source_symbols).saturating_mul(u64::from(symbol_size)),
+            al: 4,
+            t: symbol_size,
+            z: 1,
+            n: 1,
+        };
+
+        let mut records = Vec::new();
+        let mut expected = Vec::new();
+        for esi in 0..source_symbols {
+            let mut payload = Vec::with_capacity(symbol_size_usize);
+            let esi_low = u8::try_from(esi & 0xFF).expect("masked to u8");
+            for idx in 0..symbol_size_usize {
+                let idx_low = u8::try_from(idx & 0xFF).expect("masked to u8");
+                payload.push(esi_low.wrapping_mul(7) ^ idx_low);
+            }
+            expected.extend_from_slice(&payload);
+            let flags = if esi == 0 {
+                SymbolRecordFlags::SYSTEMATIC_RUN_START
+            } else {
+                SymbolRecordFlags::empty()
+            };
+            records.push(SymbolRecord::new(object_id, oti, esi, payload, flags));
+        }
+
+        for repair in 0..repair_symbols {
+            let esi = source_symbols.saturating_add(repair);
+            let payload = vec![0xA5; symbol_size_usize];
+            records.push(SymbolRecord::new(
+                object_id,
+                oti,
+                esi,
+                payload,
+                SymbolRecordFlags::empty(),
+            ));
+        }
+
+        (records, expected)
     }
 
     // ── §7.12 Recovery Tests ──
@@ -970,6 +1092,110 @@ mod tests {
         assert_eq!(summary.violations.len(), 1);
         assert_eq!(summary.violations[0].commit_seq, CommitSeq::new(2));
         assert_eq!(summary.violations[0].capsule_object_id, make_oid(2));
+    }
+
+    #[test]
+    fn test_happy_path_read_no_gf256() {
+        let capsule_id = make_oid(0x90);
+        let (records, _expected) = make_capsule_symbol_records(capsule_id, 50, 64, 5);
+        let fallback_invocations = std::cell::Cell::new(0_u32);
+
+        let outcome = decode_capsule_symbol_records(capsule_id, &records, |_| {
+            fallback_invocations.set(fallback_invocations.get().saturating_add(1));
+            Err("fallback should not run on happy path".to_owned())
+        });
+
+        assert!(matches!(outcome, CapsuleDecodeOutcome::Systematic));
+        assert_eq!(
+            fallback_invocations.get(),
+            0,
+            "GF(256) fallback decode must not run when systematic run is intact"
+        );
+    }
+
+    #[test]
+    fn test_fallback_on_missing_symbol() {
+        let capsule_id = make_oid(0x91);
+        let (mut records, _) = make_capsule_symbol_records(capsule_id, 50, 64, 5);
+        records.retain(|record| record.esi != 5);
+        let fallback_invocations = std::cell::Cell::new(0_u32);
+        let fallback_payload = vec![0xC1; 50 * 64];
+
+        let outcome = decode_capsule_symbol_records(capsule_id, &records, |_| {
+            fallback_invocations.set(fallback_invocations.get().saturating_add(1));
+            Ok(fallback_payload.clone())
+        });
+
+        assert_eq!(fallback_invocations.get(), 1);
+        assert!(matches!(
+            outcome,
+            CapsuleDecodeOutcome::Repaired {
+                repair_symbols_used: _
+            }
+        ));
+    }
+
+    #[test]
+    fn test_fallback_on_corruption() {
+        let capsule_id = make_oid(0x92);
+        let (mut records, _) = make_capsule_symbol_records(capsule_id, 50, 64, 5);
+        let idx = records
+            .iter()
+            .position(|record| record.esi == 3)
+            .expect("ESI 3 present");
+        records[idx].symbol_data[0] ^= 0x11;
+        let fallback_invocations = std::cell::Cell::new(0_u32);
+        let fallback_payload = vec![0xD2; 50 * 64];
+
+        let outcome = decode_capsule_symbol_records(capsule_id, &records, |_| {
+            fallback_invocations.set(fallback_invocations.get().saturating_add(1));
+            Ok(fallback_payload.clone())
+        });
+
+        assert_eq!(fallback_invocations.get(), 1);
+        assert!(matches!(
+            outcome,
+            CapsuleDecodeOutcome::Repaired {
+                repair_symbols_used: _
+            }
+        ));
+    }
+
+    #[test]
+    fn test_e2e_systematic_symbol_read_path_no_decode() {
+        let capsule_id = make_oid(0x93);
+        let (records, _expected) = make_capsule_symbol_records(capsule_id, 64, 512, 8);
+        let decode_invocations = std::cell::Cell::new(0_u32);
+
+        let intact = decode_capsule_symbol_records(capsule_id, &records, |_| {
+            decode_invocations.set(decode_invocations.get().saturating_add(1));
+            Err("fallback should not run for intact systematic run".to_owned())
+        });
+        assert!(matches!(intact, CapsuleDecodeOutcome::Systematic));
+        assert_eq!(decode_invocations.get(), 0);
+
+        let mut corrupted = records;
+        let corrupt_idx = corrupted
+            .iter()
+            .position(|record| record.esi == 7)
+            .expect("ESI 7 present");
+        corrupted[corrupt_idx].symbol_data[13] ^= 0xFF;
+
+        let repaired = decode_capsule_symbol_records(capsule_id, &corrupted, |_| {
+            decode_invocations.set(decode_invocations.get().saturating_add(1));
+            Ok(vec![0xAB; 64 * 512])
+        });
+        assert!(matches!(
+            repaired,
+            CapsuleDecodeOutcome::Repaired {
+                repair_symbols_used: _
+            }
+        ));
+        assert_eq!(
+            decode_invocations.get(),
+            1,
+            "fallback decode should run exactly once after corruption"
+        );
     }
 
     // ── §7.13 Compaction Tests ──

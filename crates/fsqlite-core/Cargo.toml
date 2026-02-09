@@ -22,6 +22,7 @@ fsqlite-vdbe = { workspace = true }
 fsqlite-func = { workspace = true }
 tracing = { workspace = true }
 xxhash-rust = { workspace = true }
+blake3 = { workspace = true }
 
 [dev-dependencies]
 asupersync = { path = "/dp/asupersync" }

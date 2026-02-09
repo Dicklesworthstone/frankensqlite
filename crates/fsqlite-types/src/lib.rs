@@ -12,8 +12,10 @@ pub mod value;
 
 pub use cx::Cx;
 pub use ecs::{
-    ObjectId, PayloadHash, SYMBOL_RECORD_MAGIC, SYMBOL_RECORD_VERSION, SymbolRecord,
-    SymbolRecordError, SymbolRecordFlags,
+    ObjectId, PayloadHash, SYMBOL_RECORD_MAGIC, SYMBOL_RECORD_VERSION, SymbolReadPath,
+    SymbolRecord, SymbolRecordError, SymbolRecordFlags, SystematicLayoutError,
+    layout_systematic_run, reconstruct_systematic_happy_path, recover_object_with_fallback,
+    source_symbol_count, validate_systematic_run,
 };
 pub use glossary::{
     ArcCache, BtreeRef, Budget, COMMIT_MARKER_RECORD_V1_SIZE, ColumnIdx, CommitCapsule,
@@ -103,6 +105,12 @@ impl std::hash::Hasher for PageNumberHasher {
 /// BuildHasher for `PageNumberHasher`.
 pub type PageNumberBuildHasher = std::hash::BuildHasherDefault<PageNumberHasher>;
 
+/// GF(256) addition (`+`) for bytes (XOR).
+#[must_use]
+pub const fn gf256_add_byte(lhs: u8, rhs: u8) -> u8 {
+    lhs ^ rhs
+}
+
 /// Scalar GF(256) multiply with irreducible polynomial `0x11d`.
 ///
 /// This is the core algebraic primitive used for RaptorQ encoding and
@@ -122,6 +130,65 @@ pub fn gf256_mul_byte(mut a: u8, mut b: u8) -> u8 {
         b >>= 1;
     }
     out
+}
+
+/// Multiplicative inverse in GF(256) (`None` for zero).
+#[must_use]
+pub fn gf256_inverse_byte(value: u8) -> Option<u8> {
+    if value == 0 {
+        return None;
+    }
+    for candidate in 1u16..=255 {
+        let inv = u8::try_from(candidate).expect("candidate in 1..=255 always fits u8");
+        if gf256_mul_byte(value, inv) == 1 {
+            return Some(inv);
+        }
+    }
+    None
+}
+
+/// SQLite page categories relevant to merge safety policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum MergePageKind {
+    /// Interior table b-tree page (0x05).
+    BtreeInteriorTable,
+    /// Leaf table b-tree page (0x0D).
+    BtreeLeafTable,
+    /// Interior index b-tree page (0x02).
+    BtreeInteriorIndex,
+    /// Leaf index b-tree page (0x0A).
+    BtreeLeafIndex,
+    /// Overflow page.
+    Overflow,
+    /// Freelist trunk/leaf page.
+    Freelist,
+    /// Pointer-map page.
+    PointerMap,
+    /// Opaque/non-SQLite-structured page.
+    Opaque,
+}
+
+impl MergePageKind {
+    /// Whether this page has SQLite-internal pointer semantics.
+    #[must_use]
+    pub const fn is_sqlite_structured(self) -> bool {
+        !matches!(self, Self::Opaque)
+    }
+
+    /// Classify a raw page image for merge-safety policy checks.
+    #[must_use]
+    pub fn classify(page: &[u8]) -> Self {
+        let Some(first_byte) = page.first().copied() else {
+            return Self::Opaque;
+        };
+        match BTreePageType::from_byte(first_byte) {
+            Some(BTreePageType::LeafTable) => Self::BtreeLeafTable,
+            Some(BTreePageType::InteriorTable) => Self::BtreeInteriorTable,
+            Some(BTreePageType::LeafIndex) => Self::BtreeLeafIndex,
+            Some(BTreePageType::InteriorIndex) => Self::BtreeInteriorIndex,
+            None => Self::Opaque,
+        }
+    }
 }
 
 /// Error returned when attempting to create a `PageNumber` from 0.

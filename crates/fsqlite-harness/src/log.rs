@@ -6,13 +6,14 @@
 //! - `stdout.log` / `stderr.log` for text streams
 //! - optional engine artifacts (DB/WAL/SHM, oracle diffs, etc.)
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_vfs::host_fs;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tracing::{error, info, warn};
 
 /// Version of the harness logging schema.
@@ -66,6 +67,29 @@ pub struct ConformanceDiff {
     pub oracle_result: String,
     pub franken_result: String,
     pub diff: String,
+}
+
+/// Baseline measurement artifact required before optimization commits.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PerfBaselineArtifact {
+    pub trace_id: String,
+    pub scenario_id: String,
+    pub git_sha: String,
+    pub artifact_paths: Vec<String>,
+    pub p50_micros: u64,
+    pub p95_micros: u64,
+    pub p99_micros: u64,
+    pub throughput_ops_per_sec: u64,
+    pub alloc_count: u64,
+}
+
+/// Result of validating the mandatory optimization loop gate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PerfOptimizationGateReport {
+    pub lever_keys: Vec<String>,
+    pub baseline: Option<PerfBaselineArtifact>,
+    pub golden_before_sha256: Option<String>,
+    pub golden_after_sha256: Option<String>,
 }
 
 #[derive(Debug)]
@@ -316,6 +340,173 @@ pub fn validate_bundle(bundle_root: &Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Detect optimization "lever keys" from changed paths using CI-friendly
+/// git-diff heuristics.
+///
+/// Current heuristic:
+/// - only `.rs` source files under `crates/<crate>/src/**` are considered
+/// - each crate touched in this region counts as one optimization lever
+#[must_use]
+pub fn detect_optimization_levers(changed_paths: &[PathBuf]) -> Vec<String> {
+    let mut levers = BTreeSet::new();
+    for path in changed_paths {
+        if let Some(lever) = optimization_lever_key(path) {
+            levers.insert(lever);
+        }
+    }
+    levers.into_iter().collect()
+}
+
+/// Parse and validate a baseline artifact captured before an optimization.
+pub fn validate_perf_baseline_artifact(artifact_path: &Path) -> Result<PerfBaselineArtifact> {
+    let bytes = host_fs::read(artifact_path)?;
+    let baseline: PerfBaselineArtifact = serde_json::from_slice(&bytes)
+        .map_err(|err| internal_error(format!("perf baseline parse failure: {err}")))?;
+    validate_perf_baseline_fields(&baseline)?;
+    Ok(baseline)
+}
+
+/// Enforce the strict optimization loop gates for performance-sensitive
+/// changes:
+/// 1) one optimization lever per commit,
+/// 2) mandatory baseline artifact,
+/// 3) golden-output checksum lock unchanged.
+pub fn validate_perf_optimization_loop(
+    changed_paths: &[PathBuf],
+    baseline_artifact_path: Option<&Path>,
+    golden_before_path: Option<&Path>,
+    golden_after_path: Option<&Path>,
+) -> Result<PerfOptimizationGateReport> {
+    let lever_keys = detect_optimization_levers(changed_paths);
+
+    if lever_keys.len() > 1 {
+        return Err(internal_error(format!(
+            "multiple optimization levers detected in one change set: {}",
+            lever_keys.join(", ")
+        )));
+    }
+
+    if lever_keys.is_empty() {
+        return Ok(PerfOptimizationGateReport {
+            lever_keys,
+            baseline: None,
+            golden_before_sha256: None,
+            golden_after_sha256: None,
+        });
+    }
+
+    let baseline_path = baseline_artifact_path
+        .ok_or_else(|| internal_error("missing baseline artifact for optimization change set"))?;
+    let baseline = validate_perf_baseline_artifact(baseline_path)?;
+
+    let golden_before = golden_before_path
+        .ok_or_else(|| internal_error("missing golden-before artifact for optimization change"))?;
+    let golden_after = golden_after_path
+        .ok_or_else(|| internal_error("missing golden-after artifact for optimization change"))?;
+
+    let golden_before_sha256 = sha256_file_hex(golden_before)?;
+    let golden_after_sha256 = sha256_file_hex(golden_after)?;
+
+    if golden_before_sha256 != golden_after_sha256 {
+        return Err(internal_error(format!(
+            "golden checksum mismatch after optimization: before={golden_before_sha256} after={golden_after_sha256}",
+        )));
+    }
+
+    Ok(PerfOptimizationGateReport {
+        lever_keys,
+        baseline: Some(baseline),
+        golden_before_sha256: Some(golden_before_sha256),
+        golden_after_sha256: Some(golden_after_sha256),
+    })
+}
+
+fn validate_perf_baseline_fields(baseline: &PerfBaselineArtifact) -> Result<()> {
+    if baseline.trace_id.is_empty() {
+        return Err(internal_error(
+            "perf baseline artifact requires non-empty trace_id",
+        ));
+    }
+    if baseline.scenario_id.is_empty() {
+        return Err(internal_error(
+            "perf baseline artifact requires non-empty scenario_id",
+        ));
+    }
+    if baseline.git_sha.is_empty() {
+        return Err(internal_error(
+            "perf baseline artifact requires non-empty git_sha",
+        ));
+    }
+    if baseline.artifact_paths.is_empty() {
+        return Err(internal_error(
+            "perf baseline artifact requires at least one artifact path",
+        ));
+    }
+    if baseline.artifact_paths.iter().any(String::is_empty) {
+        return Err(internal_error(
+            "perf baseline artifact contains empty artifact path",
+        ));
+    }
+    if baseline.p50_micros == 0 || baseline.p95_micros == 0 || baseline.p99_micros == 0 {
+        return Err(internal_error(
+            "perf baseline artifact requires non-zero p50/p95/p99",
+        ));
+    }
+    if baseline.p50_micros > baseline.p95_micros || baseline.p95_micros > baseline.p99_micros {
+        return Err(internal_error(
+            "perf baseline artifact must satisfy p50 <= p95 <= p99",
+        ));
+    }
+    if baseline.throughput_ops_per_sec == 0 {
+        return Err(internal_error(
+            "perf baseline artifact requires non-zero throughput_ops_per_sec",
+        ));
+    }
+
+    Ok(())
+}
+
+fn optimization_lever_key(path: &Path) -> Option<String> {
+    if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+        return None;
+    }
+
+    let components: Vec<&str> = path
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(segment) => segment.to_str(),
+            _ => None,
+        })
+        .collect();
+
+    for idx in 0..components.len().saturating_sub(2) {
+        if components[idx] == "crates" && components[idx + 2] == "src" {
+            return Some(components[idx + 1].to_string());
+        }
+    }
+
+    None
+}
+
+fn sha256_file_hex(path: &Path) -> Result<String> {
+    let bytes = host_fs::read(path)?;
+    Ok(sha256_hex(&bytes))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        let high = usize::from(byte >> 4);
+        let low = usize::from(byte & 0x0F);
+        out.push(char::from(HEX[high]));
+        out.push(char::from(HEX[low]));
+    }
+    out
 }
 
 fn append_line(path: &Path, text: &str) -> Result<()> {

@@ -1048,6 +1048,19 @@ mod tests {
     // Test 4: UNIQUE constraint violation aborts.
     #[test]
     fn test_index_regen_unique_constraint_violation_aborts() {
+        // Unique checker that reports a conflict with rowid 99.
+        struct ConflictChecker;
+        impl UniqueChecker for ConflictChecker {
+            fn check_unique(
+                &self,
+                _index_id: IndexId,
+                _key_bytes: &[u8],
+                _exclude_rowid: RowId,
+            ) -> Option<RowId> {
+                Some(RowId::new(99))
+            }
+        }
+
         let base = record_bytes(&[
             SqliteValue::Integer(1),
             SqliteValue::Text("alpha".to_owned()),
@@ -1065,19 +1078,6 @@ mod tests {
             ColumnIdx::new(1),
             RebaseExpr::Literal(SqliteValue::Text("beta".to_owned())),
         )];
-
-        // Unique checker that reports a conflict with rowid 99.
-        struct ConflictChecker;
-        impl UniqueChecker for ConflictChecker {
-            fn check_unique(
-                &self,
-                _index_id: IndexId,
-                _key_bytes: &[u8],
-                _exclude_rowid: RowId,
-            ) -> Option<RowId> {
-                Some(RowId::new(99))
-            }
-        }
 
         let result =
             regenerate_index_ops(&base, &updates, &indexes, RowId::new(1), &ConflictChecker);

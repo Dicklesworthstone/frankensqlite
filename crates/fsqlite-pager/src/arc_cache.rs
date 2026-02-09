@@ -432,6 +432,22 @@ impl ArcCacheInner {
         self.p
     }
 
+    /// Maximum resident-page capacity for T1 + T2.
+    #[inline]
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Hard byte cap for resident pages.
+    ///
+    /// A value of `0` means "no byte cap" unless capacity itself is `0`.
+    #[inline]
+    #[must_use]
+    pub fn max_bytes(&self) -> usize {
+        self.max_bytes
+    }
+
     /// Number of pages in the cache (T1 + T2).
     #[inline]
     #[must_use]
@@ -489,6 +505,32 @@ impl ArcCacheInner {
         self.capacity_overflow_events
     }
 
+    /// O(1) snapshot visibility check (§6.8).
+    ///
+    /// Uncommitted versions (`CommitSeq::ZERO`) are never visible through
+    /// MVCC snapshot resolution.
+    #[inline]
+    #[must_use]
+    pub fn is_visible(version_commit_seq: CommitSeq, snapshot_high: CommitSeq) -> bool {
+        version_commit_seq != CommitSeq::ZERO && version_commit_seq <= snapshot_high
+    }
+
+    /// Visibility including self-visibility from the transaction write set.
+    ///
+    /// This helper keeps write-set self-visibility explicit in callers.
+    #[inline]
+    #[must_use]
+    pub fn is_visible_or_self(
+        version_commit_seq: CommitSeq,
+        snapshot_high: CommitSeq,
+        in_write_set: bool,
+    ) -> bool {
+        if version_commit_seq == CommitSeq::ZERO {
+            return in_write_set;
+        }
+        version_commit_seq <= snapshot_high
+    }
+
     /// Set the GC horizon for superseded version preference.
     ///
     /// Triggers ghost pruning (removes ghost entries below the new horizon)
@@ -497,6 +539,40 @@ impl ArcCacheInner {
         self.gc_horizon = horizon;
         self.prune_ghosts_below_horizon();
         self.coalesce_all_versions();
+    }
+
+    /// Apply SQLite `PRAGMA cache_size` mapping (§6.10).
+    ///
+    /// - `n > 0`: capacity = `n`, max_bytes = `n * page_size`
+    /// - `n < 0`: max_bytes = `|n| * 1024`, capacity = `max_bytes / page_size`
+    /// - `n = 0`: capacity = 0, max_bytes = 0
+    pub fn apply_pragma_cache_size(&mut self, n: i32, page_size: usize) {
+        assert!(page_size > 0, "page_size must be > 0");
+
+        let (new_capacity, new_max_bytes) = if n > 0 {
+            let cap = usize::try_from(n).expect("positive cache_size fits usize");
+            (cap, cap.saturating_mul(page_size))
+        } else if n < 0 {
+            let kib = usize::try_from(n.unsigned_abs()).expect("cache_size magnitude fits usize");
+            let max_bytes = kib.saturating_mul(1024);
+            (max_bytes / page_size, max_bytes)
+        } else {
+            (0, 0)
+        };
+
+        self.resize(new_capacity, new_max_bytes);
+    }
+
+    /// Resize ARC limits at runtime (§6.10 resize protocol).
+    ///
+    /// This updates limits, evicts until within bounds, trims ghost lists,
+    /// and clamps `p` into `[0, capacity]`.
+    pub fn resize(&mut self, new_capacity: usize, new_max_bytes: usize) {
+        self.capacity = new_capacity;
+        self.max_bytes = new_max_bytes;
+        self.enforce_limits();
+        self.trim_ghosts();
+        self.p = self.p.min(self.capacity);
     }
 
     /// Current GC horizon.
@@ -637,6 +713,13 @@ impl ArcCacheInner {
             !matches!(lookup, CacheLookup::Hit),
             "admit called after a cache hit"
         );
+
+        if self.capacity == 0 {
+            // PRAGMA cache_size=0 disables caching of resident pages.
+            self.trim_ghosts();
+            self.p = 0;
+            return;
+        }
 
         let byte_size = page.byte_size;
 
@@ -835,6 +918,17 @@ impl ArcCacheInner {
         None
     }
 
+    fn enforce_limits(&mut self) {
+        while self.len() > self.capacity
+            || (self.max_bytes > 0 && self.total_bytes > self.max_bytes)
+        {
+            if !self.evict_one_preferred() {
+                self.capacity_overflow_events = self.capacity_overflow_events.saturating_add(1);
+                break;
+            }
+        }
+    }
+
     fn reclaim_one_overflow_slot(&mut self) {
         if self.capacity_overflow_events == 0 {
             return;
@@ -923,7 +1017,7 @@ impl ArcCacheInner {
             return 0;
         }
 
-        committed.sort_by(|left, right| right.0.cmp(&left.0));
+        committed.sort_by_key(|entry| std::cmp::Reverse(entry.0));
 
         let mut removed = 0;
         for (_, resident_list, idx, key, is_pinned) in committed.into_iter().skip(1) {
@@ -1079,6 +1173,7 @@ mod tests {
 
     const BEAD_ID: &str = "bd-125g";
     const BEAD_ID_BD_3JK9: &str = "bd-3jk9";
+    const BEAD_ID_BD_1ZLA: &str = "bd-1zla";
 
     /// Helper: create a `CacheKey` from raw parts.
     fn key(pgno: u32, commit_seq: u64) -> CacheKey {

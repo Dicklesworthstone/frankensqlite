@@ -8,7 +8,7 @@
 use std::fmt;
 
 use fsqlite_types::ecs::PatchKind;
-use fsqlite_types::{ObjectId, PayloadHash, gf256_mul_byte};
+use fsqlite_types::{MergePageKind, ObjectId, PayloadHash};
 
 /// Sparse-delta magic bytes (`"XD"`).
 pub const DELTA_MAGIC: [u8; 2] = *b"XD";
@@ -517,27 +517,6 @@ pub fn reconstruct_chain_from_newest<T: AsRef<[u8]>>(
 // §3.4.5 GF(256) patch algebra + merge safety policy
 // ---------------------------------------------------------------------------
 
-/// SQLite page categories relevant to merge safety policy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum MergePageKind {
-    /// Interior table b-tree page (0x05).
-    BtreeInteriorTable,
-    /// Leaf table b-tree page (0x0D).
-    BtreeLeafTable,
-    /// Interior index b-tree page (0x02).
-    BtreeInteriorIndex,
-    /// Leaf index b-tree page (0x0A).
-    BtreeLeafIndex,
-    /// Overflow page.
-    Overflow,
-    /// Freelist trunk/leaf page.
-    Freelist,
-    /// Pointer-map page.
-    PointerMap,
-    /// Opaque/non-SQLite-structured page.
-    Opaque,
-}
-
 /// Required-forbidden page kinds for raw XOR merge.
 pub const RAW_XOR_FORBIDDEN_PAGE_KINDS: [MergePageKind; 7] = [
     MergePageKind::BtreeInteriorTable,
@@ -628,6 +607,13 @@ impl fmt::Display for MergeSafetyError {
 
 impl std::error::Error for MergeSafetyError {}
 
+/// GF(256) addition: XOR. In GF(2^8), addition and subtraction are both XOR.
+#[inline]
+#[must_use]
+pub const fn gf256_add_byte(lhs: u8, rhs: u8) -> u8 {
+    lhs ^ rhs
+}
+
 /// Return true when a page kind is structurally unsafe for raw XOR merge.
 #[must_use]
 pub const fn is_raw_xor_forbidden_page_kind(page_kind: MergePageKind) -> bool {
@@ -642,27 +628,6 @@ pub fn resolve_write_merge_policy(
         return Err(MergeSafetyError::LabUnsafeRejectedInRelease);
     }
     Ok(policy)
-}
-
-/// GF(256) addition (`+`) for bytes (XOR).
-#[must_use]
-pub const fn gf256_add_byte(lhs: u8, rhs: u8) -> u8 {
-    lhs ^ rhs
-}
-
-/// Multiplicative inverse in GF(256) (`None` for zero).
-#[must_use]
-pub fn gf256_inverse_byte(value: u8) -> Option<u8> {
-    if value == 0 {
-        return None;
-    }
-    for candidate in 1u16..=255 {
-        let inv = u8::try_from(candidate).expect("candidate in 1..=255 always fits u8");
-        if gf256_mul_byte(value, inv) == 1 {
-            return Some(inv);
-        }
-    }
-    None
 }
 
 /// GF(256) patch addition for equal-length vectors.
@@ -847,6 +812,7 @@ fn validate_threshold_pct(threshold_pct: u8) -> Result<(), DeltaError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fsqlite_types::{gf256_inverse_byte, gf256_mul_byte};
     use proptest::prelude::*;
 
     fn page_pair_strategy(max_len: usize) -> impl Strategy<Value = (Vec<u8>, Vec<u8>)> {
