@@ -621,6 +621,7 @@ dependencies = [
 name = "fsqlite-mvcc"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "fsqlite-error",
  "fsqlite-pager",
  "fsqlite-types",

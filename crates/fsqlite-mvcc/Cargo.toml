@@ -8,6 +8,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+blake3 = { workspace = true }
 fsqlite-types = { workspace = true }
 fsqlite-error = { workspace = true }
 fsqlite-pager = { workspace = true }

@@ -8,10 +8,12 @@
 
 pub mod cache_aligned;
 pub mod compat;
+pub mod conflict_model;
 pub mod coordinator_ipc;
 pub mod core_types;
 pub mod gc;
 pub mod hot_witness_index;
+pub mod index_regen;
 pub mod invariants;
 pub mod lifecycle;
 pub mod rowid_alloc;
@@ -38,6 +40,11 @@ pub use compat::{
     CompatMode, CoordinatorProbeResult, HybridShmState, ReadLockOutcome, RecoveryPlan,
     UpdatedLegacyShm, begin_concurrent_check, choose_reader_slot,
 };
+pub use conflict_model::{
+    AmsSketch, AmsSketchConfig, DEFAULT_AMS_R, ams_sign, birthday_conflict_probability_m2,
+    birthday_conflict_probability_uniform, effective_collision_pool, exact_m2, mix64,
+    pairwise_conflict_probability,
+};
 pub use core_types::{
     CommitIndex, CommitLog, CommitRecord, DrainProgress, DrainResult, GcHorizonResult,
     InProcessPageLockTable, LOCK_TABLE_SHARDS, OrphanedSlotCleanupStats, RebuildError,
@@ -51,6 +58,11 @@ pub use gc::{
 };
 pub use hot_witness_index::{
     ColdPlaneMode, ColdWitnessStore, HotWitnessBucketEntry, HotWitnessIndex, bitset_to_slot_ids,
+};
+pub use index_regen::{
+    Collation, IndexDef, IndexKeyPart, IndexRegenError, IndexRegenOps, NoOpUniqueChecker,
+    UniqueChecker, apply_column_updates, compute_index_key, discard_stale_index_ops,
+    eval_rebase_expr, regenerate_index_ops,
 };
 pub use invariants::{
     SerializedWriteMutex, TxnManager, VersionStore, idx_to_version_pointer, visible,
