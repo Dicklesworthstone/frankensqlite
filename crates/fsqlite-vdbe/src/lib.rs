@@ -1435,14 +1435,14 @@ mod tests {
             },
         )
         .expect("recover with <=R corruption");
-        match recovered {
-            WalFecRecoveryOutcome::Recovered(group) => {
-                assert_eq!(group.recovered_pages.len(), k_source);
-            }
-            WalFecRecoveryOutcome::TruncateBeforeGroup { .. } => {
-                panic!("expected recovered outcome");
-            }
-        }
+        assert!(
+            matches!(recovered, WalFecRecoveryOutcome::Recovered(_)),
+            "expected recovered outcome"
+        );
+        let WalFecRecoveryOutcome::Recovered(group) = recovered else {
+            unreachable!("asserted recovered outcome above");
+        };
+        assert_eq!(group.recovered_pages.len(), k_source);
 
         let mut corrupt_five_frames = Vec::new();
         for (idx, page) in source_pages_r4.iter().enumerate() {
