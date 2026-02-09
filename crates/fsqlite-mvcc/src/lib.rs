@@ -30,9 +30,7 @@ pub mod witness_refinement;
 pub mod write_coordinator;
 pub mod xor_delta;
 
-pub use bocpd::{
-    BocpdConfig, BocpdMonitor, ConjugateModel, HazardFunction, RegimeStats,
-};
+pub use bocpd::{BocpdConfig, BocpdMonitor, ConjugateModel, HazardFunction, RegimeStats};
 pub use cache_aligned::{
     CACHE_LINE_BYTES, CLAIMING_TIMEOUT_NO_PID_SECS, CLAIMING_TIMEOUT_SECS, CacheAligned, RcriEntry,
     RcriOverflowError, RecentlyCommittedReadersIndex, SLOT_PAYLOAD_MASK, SLOT_TAG_MASK,

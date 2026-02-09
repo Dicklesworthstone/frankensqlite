@@ -127,9 +127,10 @@ impl NormalGammaStats {
         };
 
         let kappa_n = kappa_0 + self.n;
-        let mu_n = (kappa_0 * mu_0 + self.n * self.mean) / kappa_n;
+        let mu_n = self.n.mul_add(self.mean, kappa_0 * mu_0) / kappa_n;
         let alpha_n = alpha_0 + self.n / 2.0;
-        let beta_n = beta_0 + self.sum_sq / 2.0
+        let beta_n = beta_0
+            + self.sum_sq / 2.0
             + kappa_0 * self.n * (self.mean - mu_0).powi(2) / (2.0 * kappa_n);
 
         // Student-t with 2*alpha_n degrees of freedom.
@@ -191,23 +192,21 @@ impl BetaBinomialStats {
 fn student_t_log_pdf(x: f64, mu: f64, scale_sq: f64, df: f64) -> f64 {
     // log p(x) = const - ((df+1)/2) * ln(1 + (x-mu)^2/(df*scale_sq))
     let z_sq = (x - mu).powi(2) / (df * scale_sq);
-    let log_norm = ln_gamma(0.5 * (df + 1.0)) - ln_gamma(0.5 * df)
-        - 0.5 * (df * std::f64::consts::PI * scale_sq).ln();
-    log_norm - 0.5 * (df + 1.0) * (1.0 + z_sq).ln()
+    let log_norm = 0.5f64.mul_add(
+        -(df * std::f64::consts::PI * scale_sq).ln(),
+        ln_gamma(0.5 * (df + 1.0)) - ln_gamma(0.5 * df),
+    );
+    (0.5 * (df + 1.0)).mul_add(-z_sq.ln_1p(), log_norm)
 }
 
 /// Lanczos approximation of ln(Gamma(x)).
 fn ln_gamma(x: f64) -> f64 {
-    // Use Stirling for large x, Lanczos for small x.
-    if x <= 0.0 {
-        return f64::INFINITY;
-    }
     // Lanczos coefficients (g=7, n=9).
     const COEFFS: [f64; 9] = [
-        0.999_999_999_999_809_93,
+        0.999_999_999_999_809_9,
         676.520_368_121_885_1,
-        -1259.139_216_722_402_8,
-        771.323_428_777_653_08,
+        -1_259.139_216_722_402_8,
+        771.323_428_777_653_1,
         -176.615_029_162_140_6,
         12.507_343_278_686_905,
         -0.138_571_095_265_720_12,
@@ -215,6 +214,11 @@ fn ln_gamma(x: f64) -> f64 {
         1.505_632_735_149_311_6e-7,
     ];
     const G: f64 = 7.0;
+
+    // Use Stirling for large x, Lanczos for small x.
+    if x <= 0.0 {
+        return f64::INFINITY;
+    }
 
     if x < 0.5 {
         // Reflection formula.
@@ -234,7 +238,7 @@ fn ln_gamma(x: f64) -> f64 {
     }
 
     let t = z + G + 0.5;
-    0.5 * (2.0 * std::f64::consts::PI).ln() + (z + 0.5) * t.ln() - t + sum.ln()
+    (z + 0.5).mul_add(t.ln(), 0.5 * (2.0 * std::f64::consts::PI).ln()) - t + sum.ln()
 }
 
 // ---------------------------------------------------------------------------
@@ -302,10 +306,11 @@ impl Default for BocpdConfig {
 /// Bayesian Online Change-Point Detection monitor.
 ///
 /// Maintains a posterior distribution over run lengths and detects regime
-/// shifts when `P(r_t = 0) > threshold`.
+/// shifts when the MAP run length drops below the detection window (indicating
+/// the old regime collapsed and short run-length entries dominate).
 pub struct BocpdMonitor {
     config: BocpdConfig,
-    /// Active run-length hypotheses.
+    /// Active run-length hypotheses (index 0 = r_t=0, index k = r_t=k).
     entries: Vec<RunEntry>,
     /// Total observations seen.
     observation_count: u64,
@@ -314,6 +319,8 @@ pub struct BocpdMonitor {
     /// Running mean/count for the current MAP regime.
     regime_mean: f64,
     regime_length: usize,
+    /// Previous MAP run length (for detecting drops).
+    prev_map_run_length: usize,
 }
 
 impl fmt::Debug for BocpdMonitor {
@@ -349,6 +356,7 @@ impl BocpdMonitor {
             last_change_point: false,
             regime_mean: 0.0,
             regime_length: 0,
+            prev_map_run_length: 0,
         }
     }
 
@@ -411,16 +419,31 @@ impl BocpdMonitor {
         }
 
         // Step 3: normalize.
-        let log_total = log_sum_exp(
-            &new_entries.iter().map(|e| e.log_prob).collect::<Vec<_>>(),
-        );
+        let log_total = log_sum_exp(&new_entries.iter().map(|e| e.log_prob).collect::<Vec<_>>());
         for entry in &mut new_entries {
             entry.log_prob -= log_total;
         }
 
-        // Step 4: detect change point.
-        let cp_posterior = new_entries[0].log_prob.exp();
-        self.last_change_point = cp_posterior > self.config.change_point_threshold;
+        // Step 4: detect change point via MAP run length drop.
+        // Find the MAP (maximum a posteriori) run length.
+        let map_run_length = new_entries
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| {
+                a.log_prob
+                    .partial_cmp(&b.log_prob)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map_or(0, |(idx, _)| idx);
+
+        // Detect change: MAP run length dropped significantly from previous.
+        // A regime shift causes the old long-run entries to collapse (terrible
+        // predictives) while short-run entries from the new regime dominate.
+        let min_stable_run = 10;
+        self.last_change_point = self.prev_map_run_length >= min_stable_run
+            && map_run_length < min_stable_run
+            && self.observation_count > min_stable_run as u64;
+        self.prev_map_run_length = map_run_length;
 
         if self.last_change_point {
             // Reset regime tracking.
@@ -483,13 +506,30 @@ impl BocpdMonitor {
         self.entries.len()
     }
 
-    /// Posterior probability of a change point (r_t = 0) on the last step.
+    /// Posterior probability mass on short run lengths (r < 10).
+    ///
+    /// High values indicate a recent regime shift.
     #[must_use]
     pub fn change_point_posterior(&self) -> f64 {
         if self.entries.is_empty() {
             return 0.0;
         }
-        self.entries[0].log_prob.exp()
+        let short_mass: f64 = self.entries.iter().take(10).map(|e| e.log_prob.exp()).sum();
+        short_mass.min(1.0)
+    }
+
+    /// Current MAP (most likely) run length.
+    #[must_use]
+    pub fn map_run_length(&self) -> usize {
+        self.entries
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| {
+                a.log_prob
+                    .partial_cmp(&b.log_prob)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map_or(0, |(idx, _)| idx)
     }
 }
 
@@ -624,10 +664,7 @@ mod tests {
                 detected = true;
             }
         }
-        assert!(
-            detected,
-            "bead_id={BEAD_ID} beta_binomial_abort_rate_shift"
-        );
+        assert!(detected, "bead_id={BEAD_ID} beta_binomial_abort_rate_shift");
     }
 
     #[test]
@@ -697,10 +734,7 @@ mod tests {
 
         let d1 = run();
         let d2 = run();
-        assert_eq!(
-            d1, d2,
-            "bead_id={BEAD_ID} deterministic_replay"
-        );
+        assert_eq!(d1, d2, "bead_id={BEAD_ID} deterministic_replay");
     }
 
     #[test]
@@ -722,16 +756,15 @@ mod tests {
         let stats = monitor.current_regime_stats();
         assert!(
             stats.mean.is_finite(),
-            "bead_id={BEAD_ID} jeffreys_finite_mean: {}", stats.mean
+            "bead_id={BEAD_ID} jeffreys_finite_mean: {}",
+            stats.mean
         );
-        assert!(
-            stats.length > 0,
-            "bead_id={BEAD_ID} jeffreys_length"
-        );
+        assert!(stats.length > 0, "bead_id={BEAD_ID} jeffreys_length");
         // Mean should approximate the data mean (~50.95).
         assert!(
             (stats.mean - 50.95).abs() < 1.0,
-            "bead_id={BEAD_ID} jeffreys_adapts: mean={}", stats.mean
+            "bead_id={BEAD_ID} jeffreys_adapts: mean={}",
+            stats.mean
         );
 
         // Posterior should not be NaN.

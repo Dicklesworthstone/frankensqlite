@@ -14,8 +14,6 @@
 //! 6. UNIQUE enforcement against committed base snapshot
 //! 7. Overflow page chain management (delegated to B-tree layer)
 
-use std::collections::BTreeMap;
-
 use fsqlite_types::TypeAffinity;
 use fsqlite_types::glossary::{ColumnIdx, IndexId, IntentOpKind, RebaseExpr, RowId, TableId};
 use fsqlite_types::record::{parse_record, serialize_record};
@@ -75,20 +73,15 @@ impl std::error::Error for IndexRegenError {}
 // ── Schema types (lightweight, for rebase context) ───────────────────────────
 
 /// Collation ordering for index key comparison.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum Collation {
     /// BINARY: raw byte comparison (memcmp).
+    #[default]
     Binary,
     /// NOCASE: case-insensitive comparison for ASCII range.
     Nocase,
     /// RTRIM: like BINARY but trailing spaces ignored.
     Rtrim,
-}
-
-impl Default for Collation {
-    fn default() -> Self {
-        Self::Binary
-    }
 }
 
 /// An indexed column definition within a secondary index.
@@ -171,7 +164,7 @@ pub fn eval_rebase_expr(
             let i = idx.get() as usize;
             row.get(i)
                 .cloned()
-                .ok_or(IndexRegenError::ColumnOutOfBounds {
+                .ok_or_else(|| IndexRegenError::ColumnOutOfBounds {
                     column_idx: idx.get(),
                     record_columns: row.len(),
                 })
@@ -227,7 +220,7 @@ pub fn eval_rebase_expr(
         RebaseExpr::Concat { left, right } => {
             let l = eval_rebase_expr(left, row)?;
             let r = eval_rebase_expr(right, row)?;
-            Ok(sqlite_concat(l, r))
+            Ok(sqlite_concat(&l, &r))
         }
     }
 }
@@ -265,19 +258,18 @@ fn eval_case(
 }
 
 /// Check if two `SqliteValue`s are equal using SQLite semantics (NULL != NULL).
+/// SQLite equality uses exact comparison for floats (no epsilon), and NULL != NULL.
+#[allow(clippy::float_cmp)]
 fn sqlite_values_equal(a: &SqliteValue, b: &SqliteValue) -> bool {
     match (a, b) {
-        (SqliteValue::Null, _) | (_, SqliteValue::Null) => false,
         (SqliteValue::Integer(x), SqliteValue::Integer(y)) => x == y,
         (SqliteValue::Float(x), SqliteValue::Float(y)) => x == y,
+        #[allow(clippy::cast_precision_loss)]
         (SqliteValue::Integer(x), SqliteValue::Float(y))
-        | (SqliteValue::Float(y), SqliteValue::Integer(x)) => {
-            #[allow(clippy::cast_precision_loss)]
-            let fx = *x as f64;
-            fx == *y
-        }
+        | (SqliteValue::Float(y), SqliteValue::Integer(x)) => *x as f64 == *y,
         (SqliteValue::Text(x), SqliteValue::Text(y)) => x == y,
         (SqliteValue::Blob(x), SqliteValue::Blob(y)) => x == y,
+        // NULL != anything (including NULL), and different type groups are not equal.
         _ => false,
     }
 }
@@ -292,22 +284,21 @@ fn sqlite_value_is_truthy(v: &SqliteValue) -> bool {
 }
 
 /// Concatenate two values as text (SQLite `||` operator).
-fn sqlite_concat(a: SqliteValue, b: SqliteValue) -> SqliteValue {
+fn sqlite_concat(a: &SqliteValue, b: &SqliteValue) -> SqliteValue {
     if matches!(a, SqliteValue::Null) || matches!(b, SqliteValue::Null) {
         return SqliteValue::Null;
     }
-    let sa = sqlite_value_to_text(&a);
-    let sb = sqlite_value_to_text(&b);
+    let sa = sqlite_value_to_text(a);
+    let sb = sqlite_value_to_text(b);
     SqliteValue::Text(format!("{sa}{sb}"))
 }
 
 fn sqlite_value_to_text(v: &SqliteValue) -> String {
     match v {
-        SqliteValue::Null => String::new(),
+        SqliteValue::Null | SqliteValue::Blob(_) => String::new(),
         SqliteValue::Integer(i) => i.to_string(),
         SqliteValue::Float(f) => format!("{f}"),
         SqliteValue::Text(s) => s.clone(),
-        SqliteValue::Blob(_) => String::new(),
     }
 }
 
@@ -371,6 +362,7 @@ fn eval_binary_op(op: RebaseBinaryOp, left: SqliteValue, right: SqliteValue) -> 
         RebaseBinaryOp::Remainder => numeric_rem(&left, &right),
         RebaseBinaryOp::BitwiseAnd => integer_bitop(&left, &right, |a, b| a & b),
         RebaseBinaryOp::BitwiseOr => integer_bitop(&left, &right, |a, b| a | b),
+        #[allow(clippy::cast_sign_loss)]
         RebaseBinaryOp::ShiftLeft => integer_bitop(&left, &right, |a, b| {
             if b < 0 {
                 a.wrapping_shr(b.unsigned_abs() as u32)
@@ -378,6 +370,7 @@ fn eval_binary_op(op: RebaseBinaryOp, left: SqliteValue, right: SqliteValue) -> 
                 a.wrapping_shl(b as u32)
             }
         }),
+        #[allow(clippy::cast_sign_loss)]
         RebaseBinaryOp::ShiftRight => integer_bitop(&left, &right, |a, b| {
             if b < 0 {
                 a.wrapping_shl(b.unsigned_abs() as u32)
@@ -465,6 +458,7 @@ fn integer_bitop(l: &SqliteValue, r: &SqliteValue, f: impl FnOnce(i64, i64) -> i
 }
 
 /// Evaluate a built-in function. Only a limited set is supported for rebase.
+#[allow(clippy::too_many_lines)]
 fn eval_function(name: &str, args: &[SqliteValue]) -> Result<SqliteValue, IndexRegenError> {
     match name.to_ascii_lowercase().as_str() {
         "abs" => {
@@ -500,7 +494,9 @@ fn eval_function(name: &str, args: &[SqliteValue]) -> Result<SqliteValue, IndexR
                 Ok(args.first().cloned().unwrap_or(SqliteValue::Null))
             }
         }
-        "length" => {
+        "length" =>
+        {
+            #[allow(clippy::cast_possible_wrap)]
             if let Some(v) = args.first() {
                 Ok(match v {
                     SqliteValue::Null => SqliteValue::Null,
@@ -635,7 +631,7 @@ pub fn compute_index_key(
                 let v = row
                     .get(i)
                     .cloned()
-                    .ok_or(IndexRegenError::ColumnOutOfBounds {
+                    .ok_or_else(|| IndexRegenError::ColumnOutOfBounds {
                         column_idx: col_idx.get(),
                         record_columns: row.len(),
                     })?;
@@ -798,10 +794,9 @@ pub fn regenerate_index_ops(
     let base_row = parse_record(base_record).ok_or(IndexRegenError::MalformedRecord)?;
 
     // Determine table column affinities from the first index def (all share same table).
-    let table_col_affinities = indexes
-        .first()
-        .map(|idx| idx.table_column_affinities.as_slice())
-        .unwrap_or(&[]);
+    let table_col_affinities = indexes.first().map_or(&[] as &[TypeAffinity], |idx| {
+        idx.table_column_affinities.as_slice()
+    });
 
     // Apply column updates to get the updated row.
     let updated_row = apply_column_updates(&base_row, column_updates, table_col_affinities)?;
@@ -893,6 +888,8 @@ pub fn regenerate_index_ops(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
     use fsqlite_types::record::serialize_record;
 

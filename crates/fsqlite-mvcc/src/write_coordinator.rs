@@ -311,6 +311,7 @@ impl WriteCoordinator {
             acquired_at: timestamp,
             expires_at: 0, // No expiry by default.
         });
+        drop(lease);
         info!(bead_id = "bd-389e", pid, "coordinator lease acquired");
         true
     }
@@ -321,6 +322,7 @@ impl WriteCoordinator {
         if let Some(existing) = &*lease {
             if existing.holder_pid == pid {
                 *lease = None;
+                drop(lease);
                 info!(bead_id = "bd-389e", pid, "coordinator lease released");
                 return true;
             }
