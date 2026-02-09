@@ -83,6 +83,17 @@ impl MemTable {
         }
     }
 
+    /// Delete a row by rowid. Returns true if a row was found and deleted.
+    #[allow(dead_code)]
+    fn delete_by_rowid(&mut self, rowid: i64) -> bool {
+        if let Some(idx) = self.rows.iter().position(|r| r.rowid == rowid) {
+            self.rows.remove(idx);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Find a row by rowid. Returns the index.
     fn find_by_rowid(&self, rowid: i64) -> Option<usize> {
         self.rows.iter().position(|r| r.rowid == rowid)
@@ -877,6 +888,36 @@ impl VdbeEngine {
                     }
                 }
 
+                Opcode::Last => {
+                    // Position cursor at the last row. Jump to p2 if empty.
+                    let cursor_id = op.p1;
+                    let is_empty = if let Some(cursor) = self.cursors.get_mut(&cursor_id) {
+                        if cursor.is_pseudo {
+                            cursor.pseudo_row.is_none()
+                        } else if let Some(db) = self.db.as_ref() {
+                            if let Some(table) = db.get_table(cursor.root_page) {
+                                if table.rows.is_empty() {
+                                    true
+                                } else {
+                                    cursor.position = Some(table.rows.len() - 1);
+                                    false
+                                }
+                            } else {
+                                true
+                            }
+                        } else {
+                            true
+                        }
+                    } else {
+                        true
+                    };
+                    if is_empty {
+                        pc = op.p2 as usize;
+                    } else {
+                        pc += 1;
+                    }
+                }
+
                 Opcode::Next | Opcode::SorterNext => {
                     // Advance cursor to the next row. Jump to p2 if more rows.
                     let cursor_id = op.p1;
@@ -1167,6 +1208,9 @@ impl VdbeEngine {
 
                 Opcode::Delete => {
                     // Delete the row at the current cursor position.
+                    // Cursor position is left unchanged; the DELETE codegen
+                    // uses reverse iteration (Last/Prev) so removing a row
+                    // does not shift indices of unvisited (earlier) rows.
                     let cursor_id = op.p1;
                     if let Some(cursor) = self.cursors.get(&cursor_id) {
                         if let Some(pos) = cursor.position {
@@ -1390,34 +1434,6 @@ impl VdbeEngine {
                 Opcode::IsType => {
                     // Type check; stub: fall through.
                     pc += 1;
-                }
-
-                Opcode::Last => {
-                    // Position cursor at the last row. Jump to p2 if empty.
-                    let cursor_id = op.p1;
-                    let is_empty = if let Some(cursor) = self.cursors.get_mut(&cursor_id) {
-                        if let Some(db) = self.db.as_ref() {
-                            if let Some(table) = db.get_table(cursor.root_page) {
-                                if table.rows.is_empty() {
-                                    true
-                                } else {
-                                    cursor.position = Some(table.rows.len() - 1);
-                                    false
-                                }
-                            } else {
-                                true
-                            }
-                        } else {
-                            true
-                        }
-                    } else {
-                        true
-                    };
-                    if is_empty {
-                        pc = op.p2 as usize;
-                    } else {
-                        pc += 1;
-                    }
                 }
 
                 Opcode::IfSizeBetween | Opcode::IfEmpty => {
@@ -1801,10 +1817,7 @@ fn compare_sorter_rows(lhs: &[SqliteValue], rhs: &[SqliteValue], key_columns: us
             return Ordering::Greater;
         };
 
-        match lhs_value
-            .partial_cmp(rhs_value)
-            .unwrap_or(Ordering::Equal)
-        {
+        match lhs_value.partial_cmp(rhs_value).unwrap_or(Ordering::Equal) {
             Ordering::Equal => {}
             non_equal => return non_equal,
         }
@@ -1815,10 +1828,7 @@ fn compare_sorter_rows(lhs: &[SqliteValue], rhs: &[SqliteValue], key_columns: us
     for idx in 0..full_len {
         match (lhs.get(idx), rhs.get(idx)) {
             (Some(lhs_value), Some(rhs_value)) => {
-                match lhs_value
-                    .partial_cmp(rhs_value)
-                    .unwrap_or(Ordering::Equal)
-                {
+                match lhs_value.partial_cmp(rhs_value).unwrap_or(Ordering::Equal) {
                     Ordering::Equal => {}
                     non_equal => return non_equal,
                 }
@@ -2719,22 +2729,8 @@ mod tests {
             b.emit_jump_to_label(Opcode::SorterSort, 0, 0, diff, P4::None, 0);
 
             b.emit_op(Opcode::Integer, 20, r_probe, 0, P4::None, 0);
-            b.emit_op(
-                Opcode::MakeRecord,
-                r_probe,
-                1,
-                r_probe_record,
-                P4::None,
-                0,
-            );
-            b.emit_jump_to_label(
-                Opcode::SorterCompare,
-                0,
-                r_probe_record,
-                diff,
-                P4::None,
-                0,
-            );
+            b.emit_op(Opcode::MakeRecord, r_probe, 1, r_probe_record, P4::None, 0);
+            b.emit_jump_to_label(Opcode::SorterCompare, 0, r_probe_record, diff, P4::None, 0);
 
             b.emit_op(Opcode::Integer, 1, r_out, 0, P4::None, 0);
             b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
@@ -4498,7 +4494,7 @@ mod tests {
 
     #[test]
     fn test_coroutine_yield_resume() {
-        // Full coroutine: producer yields 3 values, consumer reads them.
+        // Producer coroutine yields 3 values; consumer resumes and emits rows.
         let rows = run_program(|b| {
             let end = b.emit_label();
             b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
@@ -4506,23 +4502,20 @@ mod tests {
             let r_co = b.alloc_reg();
             let r_val = b.alloc_reg();
 
-            // InitCoroutine: store producer start in r_co, jump to consumer.
-            let consumer = b.emit_label();
-            let producer = b.emit_label();
-            b.emit_op(
-                Opcode::InitCoroutine,
-                r_co,
-                0, // will be patched to consumer
-                0, // will be patched to producer
-                P4::None,
-                0,
-            );
-            // Manually set up: InitCoroutine stores p3 in r_co and jumps to p2.
-            // Since we emit labels at runtime, use direct addresses.
+            // Patch target addresses after both blocks are emitted.
+            let init_addr = b.emit_op(Opcode::InitCoroutine, r_co, 0, 0, P4::None, 0);
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            let consumer_start = b.current_addr() as i32;
+            b.emit_op(Opcode::Yield, r_co, 0, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_val, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Yield, r_co, 0, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_val, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Yield, r_co, 0, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_val, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
 
-            // Simpler approach: just use Yield for context switching.
-            // Producer body:
-            b.resolve_label(producer);
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            let producer_start = b.current_addr() as i32;
             b.emit_op(Opcode::Integer, 100, r_val, 0, P4::None, 0);
             b.emit_op(Opcode::Yield, r_co, 0, 0, P4::None, 0);
             b.emit_op(Opcode::Integer, 200, r_val, 0, P4::None, 0);
@@ -4531,15 +4524,10 @@ mod tests {
             b.emit_op(Opcode::Yield, r_co, 0, 0, P4::None, 0);
             b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
 
-            // Consumer body:
-            b.resolve_label(consumer);
-            b.emit_op(Opcode::Yield, r_co, 0, 0, P4::None, 0);
-            b.emit_op(Opcode::ResultRow, r_val, 1, 0, P4::None, 0);
-            b.emit_op(Opcode::Yield, r_co, 0, 0, P4::None, 0);
-            b.emit_op(Opcode::ResultRow, r_val, 1, 0, P4::None, 0);
-            b.emit_op(Opcode::Yield, r_co, 0, 0, P4::None, 0);
-            b.emit_op(Opcode::ResultRow, r_val, 1, 0, P4::None, 0);
-            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            if let Some(init_op) = b.op_at_mut(init_addr) {
+                init_op.p2 = consumer_start;
+                init_op.p3 = producer_start;
+            }
 
             b.resolve_label(end);
         });
@@ -4550,8 +4538,8 @@ mod tests {
     }
 
     #[test]
-    fn test_make_record_stub() {
-        // MakeRecord currently stores an empty blob.
+    fn test_make_record_encodes_values() {
+        // MakeRecord packs source registers into our in-memory blob format.
         let rows = run_program(|b| {
             let end = b.emit_label();
             b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
@@ -4565,7 +4553,16 @@ mod tests {
             b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
             b.resolve_label(end);
         });
-        assert_eq!(rows[0], vec![SqliteValue::Blob(Vec::new())]);
+        let produced_blob = rows.first().and_then(|row| row.first());
+        assert!(
+            matches!(produced_blob, Some(SqliteValue::Blob(_))),
+            "MakeRecord should produce a blob"
+        );
+        let decoded = decode_mem_record(&rows[0][0]);
+        assert_eq!(
+            decoded,
+            vec![SqliteValue::Integer(1), SqliteValue::Text("a".to_owned())]
+        );
     }
 
     #[test]
