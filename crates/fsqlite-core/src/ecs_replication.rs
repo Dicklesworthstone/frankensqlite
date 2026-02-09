@@ -28,18 +28,13 @@ pub enum ReplicationRole {
 }
 
 /// Replication mode (§3.4.7 spec).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum ReplicationMode {
     /// One leader publishes markers. V1 default.
+    #[default]
     LeaderCommitClock,
     /// Multiple nodes publish capsules. Experimental, not V1 default.
     MultiWriter,
-}
-
-impl Default for ReplicationMode {
-    fn default() -> Self {
-        Self::LeaderCommitClock
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -729,17 +724,17 @@ pub fn sheaf_consistency_check(events: &[TraceEvent]) -> SheafCheckResult {
 
     let is_consistent = anomalies.is_empty();
 
-    if !is_consistent {
-        warn!(
-            bead_id = BEAD_ID,
-            anomaly_count = anomalies.len(),
-            "sheaf consistency check found anomalies"
-        );
-    } else {
+    if is_consistent {
         debug!(
             bead_id = BEAD_ID,
             commit_count = commit_seqs.len(),
             "sheaf consistency check passed"
+        );
+    } else {
+        warn!(
+            bead_id = BEAD_ID,
+            anomaly_count = anomalies.len(),
+            "sheaf consistency check found anomalies"
         );
     }
 
@@ -1281,7 +1276,7 @@ mod tests {
     #[test]
     fn test_ecs_replication_ordering() {
         // Commit markers applied in commit_seq order.
-        let markers = vec![
+        let markers = [
             CommitMarker {
                 commit_seq: 1,
                 capsule_id: make_oid(1),
