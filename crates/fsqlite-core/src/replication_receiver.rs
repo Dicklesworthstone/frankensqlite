@@ -12,7 +12,8 @@ use fsqlite_error::{FrankenError, Result};
 use tracing::{debug, error, info, warn};
 
 use crate::replication_sender::{
-    CHANGESET_HEADER_SIZE, ChangesetHeader, ChangesetId, PageEntry, ReplicationPacket,
+    CHANGESET_HEADER_SIZE, ChangesetHeader, ChangesetId, DEFAULT_RPC_MESSAGE_CAP_BYTES, PageEntry,
+    ReplicationPacket,
 };
 use crate::source_block_partition::K_MAX;
 
@@ -211,6 +212,9 @@ impl ReplicationReceiver {
     /// - K_source out of range
     /// - K_source or symbol_size mismatch for existing decoder
     pub fn process_packet(&mut self, packet_bytes: &[u8]) -> Result<PacketResult> {
+        if packet_bytes.len() > DEFAULT_RPC_MESSAGE_CAP_BYTES {
+            return Err(FrankenError::TooBig);
+        }
         let packet = ReplicationPacket::from_bytes(packet_bytes)?;
         self.process_parsed_packet(&packet)
     }
@@ -1107,6 +1111,14 @@ mod tests {
     // -----------------------------------------------------------------------
     // E2E tests
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_packet_reject_over_message_cap() {
+        let mut receiver = ReplicationReceiver::new();
+        let oversized = vec![0_u8; DEFAULT_RPC_MESSAGE_CAP_BYTES + 1];
+        let err = receiver.process_packet(&oversized).unwrap_err();
+        assert!(matches!(err, FrankenError::TooBig));
+    }
 
     #[test]
     fn test_e2e_sender_receiver_roundtrip() {

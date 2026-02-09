@@ -425,8 +425,7 @@ impl WindowsFile {
             return Ok(());
         };
 
-        let mut orphaned = false;
-        {
+        let orphaned = {
             let mut state = state_arc
                 .lock()
                 .map_err(|_| lock_poisoned("windows shm state"))?;
@@ -445,8 +444,8 @@ impl WindowsFile {
                     state.owner_refs.remove(&self.owner_id);
                 }
             }
-            orphaned = state.owner_refs.is_empty();
-        }
+            state.owner_refs.is_empty()
+        };
 
         if orphaned {
             windows_shm_table().remove_if_orphaned(&self.shm_path)?;

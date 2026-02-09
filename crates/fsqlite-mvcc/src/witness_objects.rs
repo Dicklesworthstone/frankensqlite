@@ -140,11 +140,10 @@ fn page_number_of(key: &WitnessKey) -> u32 {
 }
 
 #[must_use]
-fn byte_ranges_overlap(a_start: u16, a_len: u16, b_start: u16, b_len: u16) -> bool {
+fn byte_ranges_overlap(a_start: u16, a_len: u16, b_start: u32, b_len: u32) -> bool {
     let a_start = u32::from(a_start);
-    let b_start = u32::from(b_start);
     let a_end = a_start.saturating_add(u32::from(a_len));
-    let b_end = b_start.saturating_add(u32::from(b_len));
+    let b_end = b_start.saturating_add(b_len);
     a_start < b_end && b_start < a_end
 }
 

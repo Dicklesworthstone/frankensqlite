@@ -403,6 +403,11 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_cell_witness_reduces_false_positives() {
+        test_cell_level_reduces_false_positives();
+    }
+
     // -- §5.7.4 test 3: Refinement budget respected --
 
     #[test]
@@ -539,6 +544,11 @@ mod tests {
         assert_eq!(result.confirmed_edges.len(), 3, "all edges pass through");
         assert!(result.eliminated_edges.is_empty(), "no edges eliminated");
         assert_eq!(result.buckets_refined, 0);
+    }
+
+    #[test]
+    fn test_refinement_preserves_no_false_negatives() {
+        test_disabling_refinement_is_sound();
     }
 
     // -- Byte budget enforcement --

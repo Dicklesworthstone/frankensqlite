@@ -1561,9 +1561,10 @@ mod tests {
     #[test]
     fn test_http2_max_concurrent_streams() {
         let cfg = NetworkStackConfig::default();
-        assert!(cfg
-            .validate_concurrent_streams(DEFAULT_HTTP2_MAX_CONCURRENT_STREAMS)
-            .is_ok());
+        assert!(
+            cfg.validate_concurrent_streams(DEFAULT_HTTP2_MAX_CONCURRENT_STREAMS)
+                .is_ok()
+        );
         let err = cfg
             .validate_concurrent_streams(DEFAULT_HTTP2_MAX_CONCURRENT_STREAMS + 1)
             .unwrap_err();
@@ -1573,9 +1574,10 @@ mod tests {
     #[test]
     fn test_http2_max_header_list_size() {
         let cfg = NetworkStackConfig::default();
-        assert!(cfg
-            .validate_header_list_size(DEFAULT_HTTP2_MAX_HEADER_LIST_SIZE)
-            .is_ok());
+        assert!(
+            cfg.validate_header_list_size(DEFAULT_HTTP2_MAX_HEADER_LIST_SIZE)
+                .is_ok()
+        );
         let err = cfg
             .validate_header_list_size(DEFAULT_HTTP2_MAX_HEADER_LIST_SIZE + 1)
             .unwrap_err();
@@ -1585,9 +1587,10 @@ mod tests {
     #[test]
     fn test_http2_continuation_timeout() {
         let cfg = NetworkStackConfig::default();
-        assert!(cfg
-            .validate_continuation_elapsed(DEFAULT_HTTP2_CONTINUATION_TIMEOUT_MS)
-            .is_ok());
+        assert!(
+            cfg.validate_continuation_elapsed(DEFAULT_HTTP2_CONTINUATION_TIMEOUT_MS)
+                .is_ok()
+        );
         let err = cfg
             .validate_continuation_elapsed(DEFAULT_HTTP2_CONTINUATION_TIMEOUT_MS + 1)
             .unwrap_err();
@@ -1597,9 +1600,10 @@ mod tests {
     #[test]
     fn test_message_size_cap_enforced() {
         let cfg = NetworkStackConfig::default();
-        assert!(cfg
-            .validate_message_size(DEFAULT_RPC_MESSAGE_CAP_BYTES)
-            .is_ok());
+        assert!(
+            cfg.validate_message_size(DEFAULT_RPC_MESSAGE_CAP_BYTES)
+                .is_ok()
+        );
         let err = cfg
             .validate_message_size(DEFAULT_RPC_MESSAGE_CAP_BYTES + 1)
             .unwrap_err();
@@ -1612,9 +1616,10 @@ mod tests {
             handshake_timeout_ms: DEFAULT_HANDSHAKE_TIMEOUT_MS,
             ..NetworkStackConfig::default()
         };
-        assert!(cfg
-            .validate_handshake_elapsed(DEFAULT_HANDSHAKE_TIMEOUT_MS)
-            .is_ok());
+        assert!(
+            cfg.validate_handshake_elapsed(DEFAULT_HANDSHAKE_TIMEOUT_MS)
+                .is_ok()
+        );
         let err = cfg
             .validate_handshake_elapsed(DEFAULT_HANDSHAKE_TIMEOUT_MS + 500)
             .unwrap_err();

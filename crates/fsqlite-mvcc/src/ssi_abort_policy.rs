@@ -556,6 +556,26 @@ mod tests {
     }
 
     #[test]
+    fn test_smarter_victim_selection() {
+        let decision = select_victim(
+            CycleStatus::Potential,
+            TxnCost {
+                write_set_size: 500,
+                duration_us: 50_000,
+            },
+            TxnCost {
+                write_set_size: 1,
+                duration_us: 100,
+            },
+        );
+        assert_eq!(
+            decision.victim,
+            Victim::Other,
+            "bead_id={BEAD_ID} policy must consider abort cost, not always abort pivot"
+        );
+    }
+
+    #[test]
     fn test_victim_selection_potential_cycle_equal_cost() {
         // Test 4: L(T2) ~ L(T3). Default: abort pivot T2.
         let cost = TxnCost {
