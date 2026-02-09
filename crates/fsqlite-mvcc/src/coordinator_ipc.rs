@@ -1364,7 +1364,7 @@ impl Drop for ReceivedFd {
 /// Send raw bytes plus a file descriptor over a Unix stream.
 #[cfg(target_family = "unix")]
 pub fn send_with_fd(
-    mut stream: &std::os::unix::net::UnixStream,
+    stream: &std::os::unix::net::UnixStream,
     data: &[u8],
     fd: std::os::unix::io::RawFd,
 ) -> std::io::Result<usize> {

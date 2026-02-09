@@ -1263,7 +1263,12 @@ impl UnixFile {
 
     pub fn compat_writer_release_wal_write_lock(&mut self, cx: &Cx) -> Result<()> {
         let mut first_error = self
-            .shm_lock(cx, WAL_WRITE_LOCK, 1, SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE)
+            .shm_lock(
+                cx,
+                WAL_WRITE_LOCK,
+                1,
+                SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE,
+            )
             .err();
 
         if let Err(err) = self.compat_shm_release_dms_shared(cx) {
@@ -1791,13 +1796,15 @@ mod tests {
             return;
         }
 
+        use std::fmt::Write as _;
+
         let db_path = &coordinator.path;
         let shm_path = &coordinator.shm_path;
         let wal_path = sqlite_wal_path(db_path);
 
-        let db_len = fs::metadata(db_path).map(|m| m.len()).unwrap_or(0);
-        let shm_len = fs::metadata(shm_path).map(|m| m.len()).unwrap_or(0);
-        let wal_len = fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+        let db_len = fs::metadata(db_path).map_or(0, |m| m.len());
+        let shm_len = fs::metadata(shm_path).map_or(0, |m| m.len());
+        let wal_len = fs::metadata(&wal_path).map_or(0, |m| m.len());
 
         eprintln!(
             "[debug] sqlite interop paths:\n  db={}\n  shm={} (len={shm_len})\n  wal={} (len={wal_len})\n  db_len={db_len}",
@@ -1823,9 +1830,9 @@ mod tests {
                         eprintln!("{line}");
                         line.clear();
                     }
-                    line.push_str(&format!("[debug] {i:04x}: "));
+                    let _ = write!(line, "[debug] {i:04x}: ");
                 }
-                line.push_str(&format!("{b:02x} "));
+                let _ = write!(line, "{b:02x} ");
             }
             if !line.is_empty() {
                 eprintln!("{line}");

@@ -56,32 +56,25 @@ impl KeySummary {
                 hashes.binary_search(&h).is_ok()
             }
             Self::PageBitmap(pages) => {
-                match key {
-                    WitnessKey::Custom { .. } => {
-                        // Custom witness keys are not representable in a page bitmap.
-                        // Conservatively treat as "may overlap" (no false negatives).
-                        true
-                    }
-                    _ => {
-                        let pgno = page_number_of(key);
-                        pages.contains(&pgno)
-                    }
+                if let WitnessKey::Custom { .. } = key {
+                    // Custom witness keys are not representable in a page bitmap.
+                    // Conservatively treat as "may overlap" (no false negatives).
+                    true
+                } else {
+                    let pgno = page_number_of(key);
+                    pages.contains(&pgno)
                 }
             }
             Self::CellBitmap(cells) => {
-                // Conservative: check page membership at minimum.
-                match key {
-                    WitnessKey::Custom { .. } => {
-                        // Custom witness keys are not representable in a cell bitmap.
-                        // Conservatively treat as "may overlap" (no false negatives).
-                        true
-                    }
-                    _ => {
-                        let pgno = page_number_of(key);
-                        let page_prefix = u64::from(pgno) << 32;
-                        let page_end = page_prefix | 0xFFFF_FFFF;
-                        cells.range(page_prefix..=page_end).next().is_some()
-                    }
+                if let WitnessKey::Custom { .. } = key {
+                    // Custom witness keys are not representable in a cell bitmap.
+                    // Conservatively treat as "may overlap" (no false negatives).
+                    true
+                } else {
+                    let pgno = page_number_of(key);
+                    let page_prefix = u64::from(pgno) << 32;
+                    let page_end = page_prefix | 0xFFFF_FFFF;
+                    cells.range(page_prefix..=page_end).next().is_some()
                 }
             }
             Self::ByteRangeList(_ranges) => {
@@ -125,9 +118,10 @@ pub struct KeySummaryChunk {
 fn page_number_of(key: &WitnessKey) -> u32 {
     match key {
         WitnessKey::Page(pgno) => pgno.get(),
-        WitnessKey::Cell { btree_root, .. } => btree_root.get(),
+        WitnessKey::Cell { btree_root, .. } | WitnessKey::KeyRange { btree_root, .. } => {
+            btree_root.get()
+        }
         WitnessKey::ByteRange { page, .. } => page.get(),
-        WitnessKey::KeyRange { btree_root, .. } => btree_root.get(),
         WitnessKey::Custom { .. } => 0,
     }
 }
@@ -538,7 +532,7 @@ mod tests {
         assert!(!bitmap.may_overlap(&test_page_key(6)));
 
         // CellBitmap variant
-        let cell_bmp = KeySummary::CellBitmap(BTreeSet::from([(3_u64 << 32) | 42]));
+        let cell_bmp = KeySummary::CellBitmap(BTreeSet::from([(0x3_u64 << 32) | 0x2a]));
         assert_eq!(cell_bmp.len(), 1);
 
         // ByteRangeList variant
@@ -795,7 +789,7 @@ mod tests {
     #[test]
     fn prop_key_summary_soundness_no_false_negatives() {
         // For ExactKeys, membership is exact: no false negatives AND no false positives.
-        let keys: Vec<WitnessKey> = (1..=100).map(|i| test_page_key(i)).collect();
+        let keys: Vec<WitnessKey> = (1..=100).map(test_page_key).collect();
         let summary = KeySummary::ExactKeys(keys);
 
         for i in 1..=100 {
@@ -853,7 +847,7 @@ mod tests {
                 test_page_key(2),
                 test_page_key(3),
             ])),
-            ..base.clone()
+            ..base
         };
 
         let merged = base.merge(&update);

@@ -377,9 +377,10 @@ fn committed_writer_overlaps(writer: &CommittedWriterInfo, read_key: &WitnessKey
 fn witness_key_page(key: &WitnessKey) -> u32 {
     match key {
         WitnessKey::Page(p) => p.get(),
-        WitnessKey::Cell { btree_root, .. } => btree_root.get(),
+        WitnessKey::Cell { btree_root, .. } | WitnessKey::KeyRange { btree_root, .. } => {
+            btree_root.get()
+        }
         WitnessKey::ByteRange { page, .. } => page.get(),
-        WitnessKey::KeyRange { btree_root, .. } => btree_root.get(),
         WitnessKey::Custom { .. } => 0,
     }
 }
@@ -597,7 +598,7 @@ pub fn ssi_validate_and_publish(
         })
         .collect();
 
-    state.edges_emitted = edge_ids.clone();
+    state.edges_emitted.clone_from(&edge_ids);
 
     let proof = build_commit_proof(txn, begin_seq, commit_seq, &state, &edge_ids, &[]);
 
@@ -1445,6 +1446,7 @@ mod tests {
     // -- §5.7.3 integration test: Write skew prevented --
 
     #[test]
+    #[allow(clippy::redundant_clone, clippy::cloned_ref_to_slice_refs)]
     fn test_write_skew_prevented() {
         // Classic write skew: T1 reads (A,B), writes A; T2 reads (A,B), writes B.
         // Both try to commit. At most one should succeed.
@@ -1455,9 +1457,11 @@ mod tests {
         let page_b = page_key(20);
 
         // T1 as active reader (reads A,B)
-        let _t1_view = MockActiveTxn::new(1, 0, 1).with_reads(vec![page_a.clone(), page_b.clone()]);
+        let _t1_view =
+            MockActiveTxn::new(1, 0, 1).with_reads(vec![page_a.clone(), page_b.clone()]);
         // T2 as active reader (reads A,B)
-        let t2_view = MockActiveTxn::new(2, 0, 1).with_reads(vec![page_a.clone(), page_b.clone()]);
+        let t2_view =
+            MockActiveTxn::new(2, 0, 1).with_reads(vec![page_a.clone(), page_b.clone()]);
 
         // T1 commits first: writes A. T2 is active reader of A → incoming edge.
         // No outgoing edge for T1 (nobody is writing to B yet).
@@ -1482,14 +1486,14 @@ mod tests {
         // T1 has committed and wrote A that T2 read → outgoing edge (T2→T1 via commit log).
         // T2 also wrote B that T1 read → incoming edge if T1 is in RCRI.
         // But T1 already committed, so we model it as committed reader.
-        let committed_t1 = CommittedReaderInfo {
+        let reader_t1 = CommittedReaderInfo {
             token: t1_token,
             begin_seq: CommitSeq::new(1),
             commit_seq: CommitSeq::new(2),
             had_in_rw: ok_t1.ssi_state.has_in_rw,
             pages: vec![PageNumber::new(10).unwrap(), PageNumber::new(20).unwrap()],
         };
-        let committed_w1 = CommittedWriterInfo {
+        let writer_t1 = CommittedWriterInfo {
             token: t1_token,
             commit_seq: CommitSeq::new(2),
             pages: vec![PageNumber::new(10).unwrap()],
@@ -1503,8 +1507,8 @@ mod tests {
             &[page_b],                         // T2 writes B
             &[],
             &[],
-            &[committed_t1], // T1 is committed reader
-            &[committed_w1], // T1 is committed writer
+            &[reader_t1], // T1 is committed reader
+            &[writer_t1], // T1 is committed writer
             false,
         );
 

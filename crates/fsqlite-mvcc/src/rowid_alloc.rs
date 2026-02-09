@@ -321,12 +321,15 @@ impl ConcurrentRowIdAllocator {
             state.autoincrement_high_water = state.autoincrement_high_water.max(last_in_range);
         }
 
+        let next_after = state.next_rowid;
+        drop(tables);
+
         debug!(
             schema_epoch = key.schema_epoch.get(),
             table_id = key.table_id.get(),
             start_rowid = start,
             count,
-            next_rowid_after = state.next_rowid,
+            next_rowid_after = next_after,
             "range reservation"
         );
 
@@ -370,10 +373,13 @@ impl ConcurrentRowIdAllocator {
             state.autoincrement_high_water = state.autoincrement_high_water.max(r);
         }
 
+        let next_after = state.next_rowid;
+        drop(tables);
+
         info!(
             explicit_rowid = r,
             allocator_next_before = before,
-            allocator_next_after = state.next_rowid,
+            allocator_next_after = next_after,
             "bump-on-explicit-rowid"
         );
 
@@ -397,7 +403,7 @@ impl ConcurrentRowIdAllocator {
     /// Validates schema epoch, then delegates to `reserve_range`.
     pub fn handle_rowid_reserve(&self, payload: &RowidReservePayload) -> RowidReserveResponse {
         let current_epoch = self.current_epoch();
-        let requested_epoch = SchemaEpoch::new(u64::from(payload.schema_epoch));
+        let requested_epoch = SchemaEpoch::new(payload.schema_epoch);
 
         if requested_epoch != current_epoch {
             warn!(
