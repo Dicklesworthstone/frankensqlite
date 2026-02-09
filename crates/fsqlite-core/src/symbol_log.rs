@@ -9,7 +9,7 @@
 //! incomplete tail bytes are ignored.
 
 use std::collections::BTreeMap;
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -351,7 +351,7 @@ pub fn append_symbol_record(
         "symbol log offset",
     )?;
 
-    let mut file = OpenOptions::new().append(true).open(&segment_path)?;
+    let mut file = fs::OpenOptions::new().append(true).open(&segment_path)?;
     let record_bytes = record.to_bytes();
     file.write_all(&record_bytes)?;
     file.sync_data()?;
@@ -415,7 +415,7 @@ pub fn append_symbol_record_aligned(
         )?,
     };
 
-    let mut file = OpenOptions::new().append(true).open(&segment_path)?;
+    let mut file = fs::OpenOptions::new().append(true).open(&segment_path)?;
     file.write_all(&record_bytes)?;
     if padding > 0 {
         file.write_all(&vec![0_u8; padding])?;

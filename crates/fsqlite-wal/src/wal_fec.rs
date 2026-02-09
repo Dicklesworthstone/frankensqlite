@@ -8,14 +8,14 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
+use std::fs;
 use std::io::Write;
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::{ObjectId, Oti, PageSize, SymbolRecord, SymbolRecordFlags};
@@ -849,17 +849,17 @@ impl WalFecRepairPipeline {
     /// Wait until queue drains or timeout expires.
     #[must_use]
     pub fn flush(&self, timeout: Duration) -> bool {
-        let Some(deadline) = Instant::now().checked_add(timeout) else {
-            return false;
-        };
+        let mut remaining = timeout;
         loop {
             if self.pending_jobs.load(Ordering::SeqCst) == 0 {
                 return true;
             }
-            if Instant::now() >= deadline {
+            if remaining.is_zero() {
                 return false;
             }
-            thread::sleep(REPAIR_PIPELINE_FLUSH_POLL_INTERVAL);
+            let sleep_for = remaining.min(REPAIR_PIPELINE_FLUSH_POLL_INTERVAL);
+            thread::sleep(sleep_for);
+            remaining = remaining.saturating_sub(sleep_for);
         }
     }
 
@@ -1142,12 +1142,12 @@ pub fn persist_wal_fec_raptorq_repair_symbols(sidecar_path: &Path, value: u8) ->
 
 /// Ensure WAL file and `.wal-fec` sidecar both exist.
 pub fn ensure_wal_with_fec_sidecar(wal_path: &Path) -> Result<PathBuf> {
-    OpenOptions::new()
+    fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(wal_path)?;
     let sidecar_path = wal_fec_path_for_wal(wal_path);
-    OpenOptions::new()
+    fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&sidecar_path)?;
@@ -1165,7 +1165,7 @@ pub fn append_wal_fec_group(sidecar_path: &Path, group: &WalFecGroupRecord) -> R
         "appending wal-fec group"
     );
 
-    let mut file = OpenOptions::new()
+    let mut file = fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(sidecar_path)?;
@@ -1838,7 +1838,7 @@ fn scan_offset_after_optional_pragma_header(bytes: &[u8]) -> Result<usize> {
     Ok(WAL_FEC_PRAGMA_HEADER_BYTES)
 }
 
-fn write_length_prefixed(file: &mut File, payload: &[u8], what: &str) -> Result<()> {
+fn write_length_prefixed(file: &mut fs::File, payload: &[u8], what: &str) -> Result<()> {
     let len_u32 = u32::try_from(payload.len()).map_err(|_| FrankenError::WalCorrupt {
         detail: format!(
             "{what} too large for wal-fec length prefix: {}",

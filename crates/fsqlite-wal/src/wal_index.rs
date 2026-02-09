@@ -10,7 +10,7 @@
 
 use fsqlite_error::{FrankenError, Result};
 
-/// SQLite's prime hash multiplier (`HASHTABLE_HASH_1` in `wal.c`).
+/// SQLite's prime hash multiplier (`HASHTABLE_HASH_1` in upstream SQLite).
 pub const WAL_INDEX_HASH_MULTIPLIER: u32 = 383;
 /// Number of page-number entries per SHM segment.
 pub const WAL_INDEX_PAGE_ARRAY_ENTRIES: usize = 4096;

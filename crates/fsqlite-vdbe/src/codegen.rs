@@ -692,7 +692,16 @@ fn emit_column_reads(
     let mut reg = base_reg;
     for col in columns {
         match col {
-            ResultColumn::Star | ResultColumn::TableStar(_) => {
+            ResultColumn::Star => {
+                for i in 0..table.columns.len() {
+                    b.emit_op(Opcode::Column, cursor, i as i32, reg, P4::None, 0);
+                    reg += 1;
+                }
+            }
+            ResultColumn::TableStar(qualifier) => {
+                if !qualifier.eq_ignore_ascii_case(&table.name) {
+                    return Err(CodegenError::TableNotFound(qualifier.clone()));
+                }
                 for i in 0..table.columns.len() {
                     b.emit_op(Opcode::Column, cursor, i as i32, reg, P4::None, 0);
                     reg += 1;
@@ -700,6 +709,11 @@ fn emit_column_reads(
             }
             ResultColumn::Expr { expr, .. } => {
                 if let Expr::Column(col_ref, _) = expr {
+                    if let Some(qualifier) = &col_ref.table {
+                        if !qualifier.eq_ignore_ascii_case(&table.name) {
+                            return Err(CodegenError::TableNotFound(qualifier.clone()));
+                        }
+                    }
                     let col_idx = table.column_index(&col_ref.column).ok_or_else(|| {
                         CodegenError::ColumnNotFound {
                             table: table.name.clone(),
@@ -708,8 +722,9 @@ fn emit_column_reads(
                     })?;
                     b.emit_op(Opcode::Column, cursor, col_idx as i32, reg, P4::None, 0);
                 } else {
-                    // For non-column expressions, emit the column at position 0 as fallback.
-                    b.emit_op(Opcode::Column, cursor, 0, reg, P4::None, 0);
+                    return Err(CodegenError::Unsupported(
+                        "non-column result expression in table-backed SELECT".to_owned(),
+                    ));
                 }
                 reg += 1;
             }
@@ -1617,6 +1632,73 @@ mod tests {
             .find(|op| op.opcode == Opcode::ResultRow)
             .unwrap();
         assert_eq!(rr.p2, 2);
+    }
+
+    #[test]
+    fn test_codegen_select_non_column_expr_with_from_rejected() {
+        let stmt = SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Select {
+                    distinct: Distinctness::All,
+                    columns: vec![ResultColumn::Expr {
+                        expr: Expr::BinaryOp {
+                            left: Box::new(Expr::Literal(Literal::Integer(1), Span::ZERO)),
+                            op: AstBinaryOp::Add,
+                            right: Box::new(Expr::Literal(Literal::Integer(2), Span::ZERO)),
+                            span: Span::ZERO,
+                        },
+                        alias: None,
+                    }],
+                    from: Some(from_table("t")),
+                    where_clause: None,
+                    group_by: vec![],
+                    having: None,
+                    windows: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        };
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        let err = codegen_select(&mut b, &stmt, &schema, &ctx)
+            .expect_err("non-column table projection must be rejected");
+        assert_eq!(
+            err,
+            CodegenError::Unsupported(
+                "non-column result expression in table-backed SELECT".to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn test_codegen_select_table_star_wrong_table_rejected() {
+        let stmt = SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Select {
+                    distinct: Distinctness::All,
+                    columns: vec![ResultColumn::TableStar("u".to_owned())],
+                    from: Some(from_table("t")),
+                    where_clause: None,
+                    group_by: vec![],
+                    having: None,
+                    windows: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        };
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        let err =
+            codegen_select(&mut b, &stmt, &schema, &ctx).expect_err("unknown table qualifier");
+        assert_eq!(err, CodegenError::TableNotFound("u".to_owned()));
     }
 
     // === Test 9: SELECT with index ===

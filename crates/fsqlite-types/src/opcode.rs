@@ -1,11 +1,11 @@
 /// VDBE (Virtual Database Engine) opcodes.
 ///
-/// These correspond 1:1 to the opcodes in SQLite's `vdbe.c`. Each opcode
+/// These correspond 1:1 to the upstream SQLite VDBE opcode set. Each opcode
 /// represents a single operation in the bytecode program that the VDBE
 /// executes. Opcodes are numbered sequentially; the specific numeric values
 /// match C SQLite for debugging/comparison purposes.
 ///
-/// Reference: `legacy_sqlite_code/sqlite/src/vdbe.c`
+/// Reference: canonical upstream SQLite opcode definitions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 #[allow(clippy::enum_variant_names)]

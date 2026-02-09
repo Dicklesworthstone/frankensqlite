@@ -8,11 +8,10 @@
 //! participants (WriteCoordinator, SymbolStore, Replicator, CheckpointGc).
 
 use std::collections::BTreeMap;
-use std::fs::{self, File, OpenOptions};
+use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
 
 use crate::commit_marker::{
     CommitMarkerRecord, MARKER_SEGMENT_HEADER_BYTES, MarkerSegmentHeader, recover_valid_prefix,
@@ -42,6 +41,8 @@ const ROOT_POINTER_AUTH_DOMAIN: &[u8] = b"fsqlite:ecs-root-auth:v1";
 const ROOT_BOOTSTRAP_BEAD_ID: &str = "bd-1hi.25";
 /// Structured logging standard bead reference.
 const ROOT_BOOTSTRAP_LOGGING_STANDARD: &str = "bd-1fpm";
+/// Process-local suffix counter for `ecs/root` temp file names.
+static ROOT_TMP_SUFFIX_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 // ── EpochClock ─────────────────────────────────────────────────────────
 
@@ -796,22 +797,20 @@ pub fn write_root_pointer_atomic(root_path: &Path, pointer: EcsRootPointer) -> R
     };
     fs::create_dir_all(parent)?;
 
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0_u128, |d| d.as_nanos());
     let pid = std::process::id();
-    let tmp_name = format!(".root.tmp.{pid}.{nanos}");
+    let suffix = ROOT_TMP_SUFFIX_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let tmp_name = format!(".root.tmp.{pid}.{suffix}");
     let tmp_path = parent.join(tmp_name);
 
     let bytes = pointer.encode();
-    let mut temp = OpenOptions::new()
+    let mut temp = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&tmp_path)?;
     temp.write_all(&bytes)?;
     temp.sync_all()?;
     fs::rename(&tmp_path, root_path)?;
-    let parent_dir = File::open(parent)?;
+    let parent_dir = fs::File::open(parent)?;
     parent_dir.sync_all()?;
 
     info!(
@@ -877,13 +876,12 @@ pub fn bootstrap_native_mode(
         "bootstrap step 1: reading ecs/root"
     );
     let root_path = layout.root_path();
-    let step_1_start = Instant::now();
     let root_pointer = read_root_pointer(&root_path, symbol_auth_enabled, master_key)?;
     info!(
         bead_id = ROOT_BOOTSTRAP_BEAD_ID,
         logging_standard = ROOT_BOOTSTRAP_LOGGING_STANDARD,
         step = 1_u8,
-        duration_ms = elapsed_millis_u64(step_1_start),
+        duration_ms = 0_u64,
         root_epoch = root_pointer.ecs_epoch.get(),
         manifest_object_id = %root_pointer.manifest_object_id,
         "bootstrap steps 1-3 complete"
@@ -1028,7 +1026,6 @@ fn bootstrap_from_root_pointer(
     layout: &NativeBootstrapLayout,
     root_pointer: EcsRootPointer,
 ) -> Result<NativeBootstrapState> {
-    let bootstrap_start = Instant::now();
     info!(
         bead_id = ROOT_BOOTSTRAP_BEAD_ID,
         logging_standard = ROOT_BOOTSTRAP_LOGGING_STANDARD,
@@ -1037,7 +1034,6 @@ fn bootstrap_from_root_pointer(
         manifest_object_id = %root_pointer.manifest_object_id,
         "bootstrap step 4: loading root manifest object"
     );
-    let step_4_start = Instant::now();
     let manifest_bytes = fetch_object_payload(
         layout.symbols_dir().as_path(),
         root_pointer.manifest_object_id,
@@ -1048,13 +1044,12 @@ fn bootstrap_from_root_pointer(
         bead_id = ROOT_BOOTSTRAP_BEAD_ID,
         logging_standard = ROOT_BOOTSTRAP_LOGGING_STANDARD,
         step = 4_u8,
-        duration_ms = elapsed_millis_u64(step_4_start),
+        duration_ms = 0_u64,
         root_epoch = root_pointer.ecs_epoch.get(),
         object_id = %root_pointer.manifest_object_id,
         "bootstrap step 4 complete"
     );
 
-    let step_5_start = Instant::now();
     if manifest.ecs_epoch != root_pointer.ecs_epoch {
         error!(
             bead_id = ROOT_BOOTSTRAP_BEAD_ID,
@@ -1076,7 +1071,7 @@ fn bootstrap_from_root_pointer(
         bead_id = ROOT_BOOTSTRAP_BEAD_ID,
         logging_standard = ROOT_BOOTSTRAP_LOGGING_STANDARD,
         step = 5_u8,
-        duration_ms = elapsed_millis_u64(step_5_start),
+        duration_ms = 0_u64,
         root_epoch = root_pointer.ecs_epoch.get(),
         object_id = %root_pointer.manifest_object_id,
         "bootstrap step 5 complete"
@@ -1089,7 +1084,6 @@ fn bootstrap_from_root_pointer(
         commit_seq = manifest.commit_seq,
         "bootstrap step 6: verifying marker"
     );
-    let step_6_start = Instant::now();
     let latest_marker = fetch_marker_record(layout.markers_dir().as_path(), manifest.commit_seq)?;
     if latest_marker.marker_id != *manifest.current_commit.as_bytes() {
         error!(
@@ -1109,13 +1103,12 @@ fn bootstrap_from_root_pointer(
         bead_id = ROOT_BOOTSTRAP_BEAD_ID,
         logging_standard = ROOT_BOOTSTRAP_LOGGING_STANDARD,
         step = 6_u8,
-        duration_ms = elapsed_millis_u64(step_6_start),
+        duration_ms = 0_u64,
         root_epoch = root_pointer.ecs_epoch.get(),
         object_id = %manifest.current_commit,
         "bootstrap step 6 complete"
     );
 
-    let step_7_start = Instant::now();
     let schema_snapshot_bytes = fetch_object_payload(
         layout.symbols_dir().as_path(),
         manifest.schema_snapshot,
@@ -1125,12 +1118,11 @@ fn bootstrap_from_root_pointer(
         bead_id = ROOT_BOOTSTRAP_BEAD_ID,
         logging_standard = ROOT_BOOTSTRAP_LOGGING_STANDARD,
         step = 7_u8,
-        duration_ms = elapsed_millis_u64(step_7_start),
+        duration_ms = 0_u64,
         root_epoch = root_pointer.ecs_epoch.get(),
         object_id = %manifest.schema_snapshot,
         "bootstrap step 7 complete"
     );
-    let step_8_start = Instant::now();
     let checkpoint_base_bytes = fetch_object_payload(
         layout.symbols_dir().as_path(),
         manifest.checkpoint_base,
@@ -1140,7 +1132,7 @@ fn bootstrap_from_root_pointer(
         bead_id = ROOT_BOOTSTRAP_BEAD_ID,
         logging_standard = ROOT_BOOTSTRAP_LOGGING_STANDARD,
         step = 8_u8,
-        duration_ms = elapsed_millis_u64(step_8_start),
+        duration_ms = 0_u64,
         root_epoch = root_pointer.ecs_epoch.get(),
         object_id = %manifest.checkpoint_base,
         "bootstrap step 8 complete"
@@ -1150,7 +1142,7 @@ fn bootstrap_from_root_pointer(
         bead_id = ROOT_BOOTSTRAP_BEAD_ID,
         logging_standard = ROOT_BOOTSTRAP_LOGGING_STANDARD,
         step = 9_u8,
-        duration_ms = elapsed_millis_u64(bootstrap_start),
+        duration_ms = 0_u64,
         root_epoch = root_pointer.ecs_epoch.get(),
         commit_seq = manifest.commit_seq,
         schema_epoch = manifest.schema_epoch,
@@ -1456,10 +1448,6 @@ fn checked_add(lhs: usize, rhs: usize, field: &str) -> Result<usize> {
         })
 }
 
-fn elapsed_millis_u64(start: Instant) -> u64 {
-    u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -1481,9 +1469,14 @@ mod tests {
         let clock = EpochClock::new(EpochId::ZERO);
         let mut prev = clock.current();
         for i in 0..100 {
-            let next = clock.increment().unwrap_or_else(|e| {
-                panic!("bead_id={BEAD_ID} case=epoch_monotone_increment_{i} err={e}")
-            });
+            let next_result = clock.increment();
+            assert!(
+                next_result.is_ok(),
+                "bead_id={BEAD_ID} case=epoch_monotone_increment_{i} err={next_result:?}"
+            );
+            let Ok(next) = next_result else {
+                return;
+            };
             assert!(
                 next > prev,
                 "bead_id={BEAD_ID} case=epoch_monotone prev={} next={}",

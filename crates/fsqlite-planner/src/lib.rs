@@ -10,8 +10,9 @@
 //! planner layer per the workspace layering rules (bd-1wwc).
 
 use fsqlite_ast::{
-    BinaryOp as AstBinaryOp, CompoundOp, Expr, InSet, LikeOp, Literal, NullsOrder, OrderingTerm,
-    ResultColumn, SelectBody, SelectCore, SortDirection, Span,
+    BinaryOp as AstBinaryOp, ColumnRef, CompoundOp, Expr, FromClause, InSet, LikeOp, Literal,
+    NullsOrder, OrderingTerm, ResultColumn, SelectBody, SelectCore, SortDirection, Span,
+    TableOrSubquery,
 };
 use std::fmt;
 
@@ -122,6 +123,131 @@ pub fn count_output_columns(core: &SelectCore) -> usize {
         SelectCore::Select { columns, .. } => columns.len(),
         SelectCore::Values(rows) => rows.first().map_or(0, Vec::len),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Single-table projection resolution (`*` / `table.*` expansion)
+// ---------------------------------------------------------------------------
+
+/// Errors during single-table result-column resolution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SingleTableProjectionError {
+    /// The core is `VALUES`, not `SELECT`.
+    NotSelectCore,
+    /// A `FROM` clause is required for table-backed projection resolution.
+    MissingFromClause,
+    /// Unsupported source shape (non-table source or joins present).
+    UnsupportedFromSource,
+    /// A table qualifier did not match the single table or its alias.
+    UnknownTableQualifier { qualifier: String },
+    /// A referenced column does not exist on the table.
+    ColumnNotFound { column: String },
+}
+
+impl fmt::Display for SingleTableProjectionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotSelectCore => write!(f, "projection resolution requires SELECT core"),
+            Self::MissingFromClause => write!(f, "projection resolution requires FROM clause"),
+            Self::UnsupportedFromSource => {
+                write!(f, "only single-table FROM without JOIN is supported")
+            }
+            Self::UnknownTableQualifier { qualifier } => {
+                write!(f, "unknown table qualifier: {qualifier}")
+            }
+            Self::ColumnNotFound { column } => write!(f, "column not found: {column}"),
+        }
+    }
+}
+
+impl std::error::Error for SingleTableProjectionError {}
+
+/// Resolve result columns for a single-table SELECT by:
+/// - expanding `*` and `table.*` into explicit column refs
+/// - validating table qualifiers and unqualified column refs
+///
+/// Non-column expressions are preserved as-is; codegen decides if they are
+/// supported for table-backed execution.
+pub fn resolve_single_table_result_columns(
+    core: &SelectCore,
+    table_columns: &[String],
+) -> Result<Vec<ResultColumn>, SingleTableProjectionError> {
+    let SelectCore::Select { columns, from, .. } = core else {
+        return Err(SingleTableProjectionError::NotSelectCore);
+    };
+    let from_clause = from
+        .as_ref()
+        .ok_or(SingleTableProjectionError::MissingFromClause)?;
+    let (table_name, table_alias) = single_table_source_name_and_alias(from_clause)?;
+
+    let mut resolved = Vec::new();
+    for result_col in columns {
+        match result_col {
+            ResultColumn::Star => {
+                for column_name in table_columns {
+                    resolved.push(ResultColumn::Expr {
+                        expr: Expr::Column(ColumnRef::bare(column_name.clone()), Span::ZERO),
+                        alias: None,
+                    });
+                }
+            }
+            ResultColumn::TableStar(qualifier) => {
+                if !qualifier_matches_table(qualifier, table_name, table_alias) {
+                    return Err(SingleTableProjectionError::UnknownTableQualifier {
+                        qualifier: qualifier.clone(),
+                    });
+                }
+                for column_name in table_columns {
+                    resolved.push(ResultColumn::Expr {
+                        expr: Expr::Column(ColumnRef::bare(column_name.clone()), Span::ZERO),
+                        alias: None,
+                    });
+                }
+            }
+            ResultColumn::Expr {
+                expr: Expr::Column(col_ref, _),
+                ..
+            } => {
+                if let Some(qualifier) = &col_ref.table {
+                    if !qualifier_matches_table(qualifier, table_name, table_alias) {
+                        return Err(SingleTableProjectionError::UnknownTableQualifier {
+                            qualifier: qualifier.clone(),
+                        });
+                    }
+                }
+                if !column_exists_ignore_case(table_columns, &col_ref.column) {
+                    return Err(SingleTableProjectionError::ColumnNotFound {
+                        column: col_ref.column.clone(),
+                    });
+                }
+                resolved.push(result_col.clone());
+            }
+            ResultColumn::Expr { .. } => resolved.push(result_col.clone()),
+        }
+    }
+
+    Ok(resolved)
+}
+
+fn single_table_source_name_and_alias(
+    from_clause: &FromClause,
+) -> Result<(&str, Option<&str>), SingleTableProjectionError> {
+    if !from_clause.joins.is_empty() {
+        return Err(SingleTableProjectionError::UnsupportedFromSource);
+    }
+    match &from_clause.source {
+        TableOrSubquery::Table { name, alias, .. } => Ok((&name.name, alias.as_deref())),
+        _ => Err(SingleTableProjectionError::UnsupportedFromSource),
+    }
+}
+
+fn column_exists_ignore_case(columns: &[String], name: &str) -> bool {
+    columns.iter().any(|c| c.eq_ignore_ascii_case(name))
+}
+
+fn qualifier_matches_table(qualifier: &str, table_name: &str, table_alias: Option<&str>) -> bool {
+    qualifier.eq_ignore_ascii_case(table_name)
+        || table_alias.is_some_and(|alias| qualifier.eq_ignore_ascii_case(alias))
 }
 
 /// Resolve all ORDER BY terms for a compound SELECT statement.
@@ -1062,8 +1188,8 @@ fn cross_join_allowed(
 mod tests {
     use super::*;
     use fsqlite_ast::{
-        ColumnRef, CompoundOp, Distinctness, Expr, InSet, Literal, OrderingTerm, ResultColumn,
-        SelectBody, SelectCore, SortDirection, Span,
+        ColumnRef, CompoundOp, Distinctness, Expr, FromClause, InSet, Literal, OrderingTerm,
+        QualifiedName, ResultColumn, SelectBody, SelectCore, SortDirection, Span, TableOrSubquery,
     };
 
     /// Helper: build a SELECT core with named result columns.
@@ -1123,7 +1249,85 @@ mod tests {
         }
     }
 
+    fn select_core_single_table(
+        columns: Vec<ResultColumn>,
+        table_name: &str,
+        alias: Option<&str>,
+    ) -> SelectCore {
+        SelectCore::Select {
+            distinct: Distinctness::All,
+            columns,
+            from: Some(FromClause {
+                source: TableOrSubquery::Table {
+                    name: QualifiedName::bare(table_name),
+                    alias: alias.map(str::to_owned),
+                    index_hint: None,
+                },
+                joins: vec![],
+            }),
+            where_clause: None,
+            group_by: vec![],
+            having: None,
+            windows: vec![],
+        }
+    }
+
     // --- Core resolution tests ---
+
+    #[test]
+    fn test_single_table_projection_expands_star() {
+        let core = select_core_single_table(vec![ResultColumn::Star], "t", None);
+        let table_columns = vec!["a".to_owned(), "b".to_owned()];
+        let resolved =
+            resolve_single_table_result_columns(&core, &table_columns).expect("star should expand");
+        assert_eq!(
+            resolved,
+            vec![
+                ResultColumn::Expr {
+                    expr: Expr::Column(ColumnRef::bare("a"), Span::ZERO),
+                    alias: None
+                },
+                ResultColumn::Expr {
+                    expr: Expr::Column(ColumnRef::bare("b"), Span::ZERO),
+                    alias: None
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_single_table_projection_expands_table_star_with_alias() {
+        let core = select_core_single_table(
+            vec![ResultColumn::TableStar("tt".to_owned())],
+            "t",
+            Some("tt"),
+        );
+        let table_columns = vec!["a".to_owned(), "b".to_owned()];
+        let resolved = resolve_single_table_result_columns(&core, &table_columns)
+            .expect("table.* should expand");
+        assert_eq!(resolved.len(), 2);
+    }
+
+    #[test]
+    fn test_single_table_projection_rejects_unknown_column() {
+        let core = select_core_single_table(
+            vec![ResultColumn::Expr {
+                expr: Expr::Column(ColumnRef::bare("z"), Span::ZERO),
+                alias: None,
+            }],
+            "t",
+            None,
+        );
+        let table_columns = vec!["a".to_owned(), "b".to_owned()];
+        let err = resolve_single_table_result_columns(&core, &table_columns)
+            .expect_err("unknown column should fail");
+        assert_eq!(
+            err,
+            SingleTableProjectionError::ColumnNotFound {
+                column: "z".to_owned()
+            }
+        );
+    }
 
     #[test]
     fn test_compound_order_by_uses_first_alias() {

@@ -73,7 +73,7 @@ const SHARED_SIZE: u64 = 510;
 // WAL SHM header initialization (legacy SQLite interop)
 // ---------------------------------------------------------------------------
 
-/// SQLite WAL-index SHM segment size (`WALINDEX_PGSZ` in `wal.c`).
+/// SQLite WAL-index SHM segment size (`WALINDEX_PGSZ` in upstream SQLite).
 ///
 /// This is always 32 KiB and is required so that legacy SQLite can map
 /// the first wal-index page without needing to take `WAL_WRITE_LOCK` just to

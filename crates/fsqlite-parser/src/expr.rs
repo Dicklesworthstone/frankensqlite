@@ -3,7 +3,7 @@
 // Pratt expression parser with SQLite-correct operator precedence.
 // Normative reference: §10.2 of the FrankenSQLite specification.
 //
-// Precedence table (from SQLite parse.y, lowest to highest):
+// Precedence table (from canonical upstream SQLite grammar, lowest to highest):
 //   OR
 //   AND
 //   NOT (prefix)
@@ -1772,7 +1772,7 @@ mod tests {
 
     // Level 4 vs Level 5: THE CRITICAL BOUNDARY
     // Equality (level 4) and relational (level 5) are SEPARATE levels
-    // per C SQLite's parse.y grammar.
+    // per canonical upstream SQLite grammar.
     #[test]
     fn test_pratt_level4_vs_level5_eq_lt_boundary() {
         // a = b < c MUST parse as a = (b < c), NOT (a = b) < c

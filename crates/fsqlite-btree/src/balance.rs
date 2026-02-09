@@ -1243,7 +1243,7 @@ pub(crate) fn apply_child_replacement<W: PageWriter>(
     // children, copy the single right-child's content into the root and
     // free the child page, reducing tree depth by one.  This is the
     // inverse of balance_deeper and corresponds to SQLite's
-    // "balance-shallower" sub-algorithm (btree.c ~8942-8967).
+    // "balance-shallower" sub-algorithm in the canonical upstream implementation.
     if parent_is_root && final_cells.is_empty() {
         if let Some(child_pgno) = right_child {
             balance_shallower(cx, writer, parent_page_no, child_pgno, usable_size)?;
