@@ -6,8 +6,9 @@
 
 use crate::ProgramBuilder;
 use fsqlite_ast::{
-    ColumnRef, DeleteStatement, Expr, InsertSource, InsertStatement, LimitClause, Literal,
-    QualifiedTableRef, ResultColumn, SelectCore, SelectStatement, UpdateStatement,
+    ColumnRef, DeleteStatement, Expr, FunctionArgs, InsertSource, InsertStatement, LimitClause,
+    Literal, OrderingTerm, QualifiedTableRef, ResultColumn, SelectCore, SelectStatement,
+    SortDirection, UpdateStatement,
 };
 use fsqlite_types::opcode::{Opcode, P4};
 
@@ -261,6 +262,34 @@ pub fn codegen_select(
                 end_label,
             );
         }
+    } else if has_aggregate_columns(columns) {
+        // --- Aggregate query (COUNT/SUM/AVG/MIN/MAX/...) ---
+        return codegen_select_aggregate(
+            b,
+            cursor,
+            table,
+            columns,
+            where_clause.as_deref(),
+            out_regs,
+            out_col_count,
+            done_label,
+            end_label,
+        );
+    } else if !stmt.order_by.is_empty() {
+        // --- Full table scan with ORDER BY ---
+        return codegen_select_ordered_scan(
+            b,
+            cursor,
+            table,
+            columns,
+            where_clause.as_deref(),
+            &stmt.order_by,
+            stmt.limit.as_ref(),
+            out_regs,
+            out_col_count,
+            done_label,
+            end_label,
+        );
     } else {
         // --- Full table scan ---
         return codegen_select_full_scan(
@@ -392,6 +421,481 @@ fn emit_limit_expr(b: &mut ProgramBuilder, expr: &Expr, target_reg: i32) {
             b.emit_op(Opcode::Integer, -1, target_reg, 0, P4::None, 0);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// ORDER BY codegen (two-pass sorter)
+// ---------------------------------------------------------------------------
+
+/// Generate VDBE bytecode for a full-scan SELECT with ORDER BY.
+///
+/// Uses a two-pass sorter approach:
+/// 1. Scan table rows (with WHERE), pack sort-key + data columns into sorter.
+/// 2. After sorting, iterate sorted rows and emit `ResultRow`.
+///
+/// LIMIT/OFFSET are applied in pass 2 (on sorted output).
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn codegen_select_ordered_scan(
+    b: &mut ProgramBuilder,
+    cursor: i32,
+    table: &TableSchema,
+    columns: &[ResultColumn],
+    where_clause: Option<&Expr>,
+    order_by: &[OrderingTerm],
+    limit_clause: Option<&LimitClause>,
+    out_regs: i32,
+    out_col_count: i32,
+    done_label: crate::Label,
+    end_label: crate::Label,
+) -> Result<(), CodegenError> {
+    // Resolve ORDER BY column indices (relative to the table).
+    let sort_col_indices: Vec<usize> = order_by
+        .iter()
+        .map(|term| {
+            resolve_column_ref(&term.expr, table).ok_or_else(|| {
+                CodegenError::Unsupported("non-column ORDER BY expression".to_owned())
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Resolve data column indices (the result columns).
+    let data_col_indices = resolve_result_column_indices(columns, table)?;
+
+    let num_sort_keys = sort_col_indices.len();
+    let num_data_cols = data_col_indices.len();
+    let total_sorter_cols = num_sort_keys + num_data_cols;
+
+    // Sorter cursor is separate from the table cursor.
+    let sorter_cursor = cursor + 1;
+
+    // Open sorter: p2 = number of key columns, p4 = sort order string.
+    let sort_order: String = order_by
+        .iter()
+        .map(|term| {
+            if term.direction == Some(SortDirection::Desc) {
+                '-'
+            } else {
+                '+'
+            }
+        })
+        .collect();
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    b.emit_op(
+        Opcode::SorterOpen,
+        sorter_cursor,
+        num_sort_keys as i32,
+        0,
+        P4::Str(sort_order),
+        0,
+    );
+
+    // Open table for reading.
+    b.emit_op(
+        Opcode::OpenRead,
+        cursor,
+        table.root_page,
+        0,
+        P4::Table(table.name.clone()),
+        0,
+    );
+
+    // === Pass 1: Scan rows into sorter ===
+    let scan_start = b.current_addr();
+    let scan_done = b.emit_label();
+    b.emit_jump_to_label(Opcode::Rewind, cursor, 0, scan_done, P4::None, 0);
+
+    // WHERE filter.
+    let skip_label = b.emit_label();
+    if let Some(where_expr) = where_clause {
+        emit_where_filter(b, where_expr, cursor, table, skip_label);
+    }
+
+    // Read sort-key columns + data columns into consecutive registers.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let sorter_base = b.alloc_regs(total_sorter_cols as i32);
+    {
+        let mut reg = sorter_base;
+        for &col_idx in &sort_col_indices {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            b.emit_op(Opcode::Column, cursor, col_idx as i32, reg, P4::None, 0);
+            reg += 1;
+        }
+        for &col_idx in &data_col_indices {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            b.emit_op(Opcode::Column, cursor, col_idx as i32, reg, P4::None, 0);
+            reg += 1;
+        }
+    }
+
+    // MakeRecord from all sorter columns, then SorterInsert.
+    let record_reg = b.alloc_reg();
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    b.emit_op(
+        Opcode::MakeRecord,
+        sorter_base,
+        total_sorter_cols as i32,
+        record_reg,
+        P4::None,
+        0,
+    );
+    b.emit_op(
+        Opcode::SorterInsert,
+        sorter_cursor,
+        record_reg,
+        0,
+        P4::None,
+        0,
+    );
+
+    // Skip label (for WHERE-filtered rows).
+    b.resolve_label(skip_label);
+
+    // Next row in scan.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let scan_body = (scan_start + 1) as i32;
+    b.emit_op(Opcode::Next, cursor, scan_body, 0, P4::None, 0);
+
+    // End of pass 1: close table cursor.
+    b.resolve_label(scan_done);
+    b.emit_op(Opcode::Close, cursor, 0, 0, P4::None, 0);
+
+    // === Pass 2: Iterate sorted rows ===
+
+    // Allocate LIMIT/OFFSET counters (before the sort loop).
+    let limit_reg = limit_clause.map(|lc| {
+        let r = b.alloc_reg();
+        emit_limit_expr(b, &lc.limit, r);
+        r
+    });
+    let offset_reg = limit_clause.and_then(|lc| {
+        lc.offset.as_ref().map(|off_expr| {
+            let r = b.alloc_reg();
+            emit_limit_expr(b, off_expr, r);
+            r
+        })
+    });
+
+    // SorterSort: sort and position at first row; jump to done if empty.
+    b.emit_jump_to_label(
+        Opcode::SorterSort,
+        sorter_cursor,
+        0,
+        done_label,
+        P4::None,
+        0,
+    );
+
+    // Save the address of the sort loop body (SorterData target for SorterNext).
+    let sort_loop_body = b.current_addr();
+
+    // SorterData: decode current sorted row into a register.
+    let sorted_reg = b.alloc_reg();
+    b.emit_op(
+        Opcode::SorterData,
+        sorter_cursor,
+        sorted_reg,
+        0,
+        P4::None,
+        0,
+    );
+
+    // OFFSET: skip rows while offset counter > 0.
+    let output_skip = b.emit_label();
+    if let Some(off_r) = offset_reg {
+        b.emit_jump_to_label(Opcode::IfPos, off_r, 1, output_skip, P4::None, 0);
+    }
+
+    // Extract data columns from the sorted record.
+    // The sorter record has sort-key columns first, then data columns.
+    // We use Column on the sorter cursor to read individual fields.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    for i in 0..num_data_cols {
+        let src_col = (num_sort_keys + i) as i32;
+        b.emit_op(
+            Opcode::Column,
+            sorter_cursor,
+            src_col,
+            out_regs + i as i32,
+            P4::None,
+            0,
+        );
+    }
+
+    // ResultRow.
+    b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
+
+    // LIMIT: decrement limit counter; jump to done when zero.
+    if let Some(lim_r) = limit_reg {
+        b.emit_jump_to_label(Opcode::DecrJumpZero, lim_r, 0, done_label, P4::None, 0);
+    }
+
+    // Output skip label (for OFFSET-skipped rows).
+    b.resolve_label(output_skip);
+
+    // SorterNext: advance to next sorted row, jump back to sort loop body.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    b.emit_op(
+        Opcode::SorterNext,
+        sorter_cursor,
+        sort_loop_body as i32,
+        0,
+        P4::None,
+        0,
+    );
+
+    // Done: Close sorter + Halt.
+    b.resolve_label(done_label);
+    b.emit_op(Opcode::Close, sorter_cursor, 0, 0, P4::None, 0);
+    b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+
+    // End target for Init jump.
+    b.resolve_label(end_label);
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Aggregate codegen
+// ---------------------------------------------------------------------------
+
+/// Known aggregate function names (case-insensitive matching).
+const AGGREGATE_FUNCTIONS: &[&str] = &[
+    "avg",
+    "count",
+    "group_concat",
+    "string_agg",
+    "max",
+    "min",
+    "sum",
+    "total",
+    "median",
+    "percentile",
+    "percentile_cont",
+    "percentile_disc",
+];
+
+/// Check whether a function name is a known aggregate.
+fn is_aggregate_function(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    AGGREGATE_FUNCTIONS.iter().any(|&n| n == lower)
+}
+
+/// Check whether any result column contains an aggregate function call.
+fn has_aggregate_columns(columns: &[ResultColumn]) -> bool {
+    columns.iter().any(|col| {
+        if let ResultColumn::Expr { expr, .. } = col {
+            is_aggregate_expr(expr)
+        } else {
+            false
+        }
+    })
+}
+
+/// Check whether an expression is an aggregate function call.
+fn is_aggregate_expr(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::FunctionCall { name, .. } if is_aggregate_function(name)
+    )
+}
+
+/// Description of one aggregate column for codegen.
+struct AggColumn {
+    /// Aggregate function name (lowercased).
+    name: String,
+    /// Number of arguments (0 for count(*), 1 for sum(col), etc.).
+    num_args: i32,
+    /// Column index of the argument (for single-arg aggregates), or `None` for count(*).
+    arg_col_index: Option<usize>,
+}
+
+/// Generate VDBE bytecode for an aggregate SELECT (no GROUP BY yet).
+///
+/// Pattern:
+/// ```text
+/// Init → Transaction → OpenRead → Rewind →
+///   [AggStep per aggregate per row] → Next →
+/// [AggFinal per aggregate] → ResultRow → Close → Halt
+/// ```
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn codegen_select_aggregate(
+    b: &mut ProgramBuilder,
+    cursor: i32,
+    table: &TableSchema,
+    columns: &[ResultColumn],
+    where_clause: Option<&Expr>,
+    out_regs: i32,
+    out_col_count: i32,
+    done_label: crate::Label,
+    end_label: crate::Label,
+) -> Result<(), CodegenError> {
+    // Parse aggregate columns: extract function name, arg count, arg column index.
+    let agg_columns = parse_aggregate_columns(columns, table)?;
+
+    // Allocate one accumulator register per aggregate.
+    let accum_base = b.alloc_regs(out_col_count);
+
+    // Initialize accumulators to Null (required by AggStep protocol).
+    for i in 0..out_col_count {
+        b.emit_op(Opcode::Null, 0, accum_base + i, 0, P4::None, 0);
+    }
+
+    // Open table for reading.
+    b.emit_op(
+        Opcode::OpenRead,
+        cursor,
+        table.root_page,
+        0,
+        P4::Table(table.name.clone()),
+        0,
+    );
+
+    // Rewind to first row; jump to finalize if table is empty.
+    let finalize_label = b.emit_label();
+    let loop_start = b.current_addr();
+    b.emit_jump_to_label(Opcode::Rewind, cursor, 0, finalize_label, P4::None, 0);
+
+    // WHERE filter.
+    let skip_label = b.emit_label();
+    if let Some(where_expr) = where_clause {
+        emit_where_filter(b, where_expr, cursor, table, skip_label);
+    }
+
+    // AggStep for each aggregate column.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    for (i, agg) in agg_columns.iter().enumerate() {
+        let accum_reg = accum_base + i as i32;
+
+        if agg.num_args == 0 {
+            // count(*): no arguments, p2 is unused (0), p5=0.
+            b.emit_op(
+                Opcode::AggStep,
+                0,
+                0,
+                accum_reg,
+                P4::FuncName(agg.name.clone()),
+                0,
+            );
+        } else {
+            // Single-arg aggregate: read column value into a temp, then AggStep.
+            let arg_reg = b.alloc_temp();
+            let col_idx = agg.arg_col_index.unwrap_or(0);
+            b.emit_op(Opcode::Column, cursor, col_idx as i32, arg_reg, P4::None, 0);
+            let num_args = u16::try_from(agg.num_args).unwrap_or_default();
+            b.emit_op(
+                Opcode::AggStep,
+                0,
+                arg_reg,
+                accum_reg,
+                P4::FuncName(agg.name.clone()),
+                num_args,
+            );
+            b.free_temp(arg_reg);
+        }
+    }
+
+    // Skip label for WHERE-filtered rows.
+    b.resolve_label(skip_label);
+
+    // Next: loop back to start of loop body (instruction after Rewind).
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let loop_body = (loop_start + 1) as i32;
+    b.emit_op(Opcode::Next, cursor, loop_body, 0, P4::None, 0);
+
+    // Finalize: emit AggFinal for each aggregate.
+    b.resolve_label(finalize_label);
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    for (i, agg) in agg_columns.iter().enumerate() {
+        let accum_reg = accum_base + i as i32;
+        b.emit_op(
+            Opcode::AggFinal,
+            accum_reg,
+            agg.num_args,
+            0,
+            P4::FuncName(agg.name.clone()),
+            0,
+        );
+    }
+
+    // Copy accumulator results to output registers.
+    // If accum_base != out_regs, copy; otherwise they're already in place.
+    if accum_base != out_regs {
+        for i in 0..out_col_count {
+            b.emit_op(Opcode::Copy, accum_base + i, out_regs + i, 0, P4::None, 0);
+        }
+    }
+
+    // ResultRow.
+    b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
+
+    // Done: Close + Halt.
+    b.resolve_label(done_label);
+    b.emit_op(Opcode::Close, cursor, 0, 0, P4::None, 0);
+    b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+
+    // End target for Init jump.
+    b.resolve_label(end_label);
+
+    Ok(())
+}
+
+/// Parse result columns to extract aggregate function metadata.
+fn parse_aggregate_columns(
+    columns: &[ResultColumn],
+    table: &TableSchema,
+) -> Result<Vec<AggColumn>, CodegenError> {
+    let mut agg_cols = Vec::new();
+    for col in columns {
+        match col {
+            ResultColumn::Expr {
+                expr: Expr::FunctionCall { name, args, .. },
+                ..
+            } if is_aggregate_function(name) => {
+                let lower_name = name.to_ascii_lowercase();
+                match args {
+                    FunctionArgs::Star => {
+                        // count(*)
+                        agg_cols.push(AggColumn {
+                            name: lower_name,
+                            num_args: 0,
+                            arg_col_index: None,
+                        });
+                    }
+                    FunctionArgs::List(exprs) => {
+                        if exprs.is_empty() {
+                            // count() with no args — treat like count(*)
+                            agg_cols.push(AggColumn {
+                                name: lower_name,
+                                num_args: 0,
+                                arg_col_index: None,
+                            });
+                        } else {
+                            // Single-arg aggregate: resolve column reference.
+                            let col_idx =
+                                resolve_column_ref(&exprs[0], table).ok_or_else(|| {
+                                    CodegenError::Unsupported(
+                                        "non-column argument in aggregate function".to_owned(),
+                                    )
+                                })?;
+                            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+                            agg_cols.push(AggColumn {
+                                name: lower_name,
+                                num_args: exprs.len() as i32,
+                                arg_col_index: Some(col_idx),
+                            });
+                        }
+                    }
+                }
+            }
+            _ => {
+                return Err(CodegenError::Unsupported(
+                    "mixed aggregate and non-aggregate columns without GROUP BY".to_owned(),
+                ));
+            }
+        }
+    }
+    Ok(agg_cols)
 }
 
 // ---------------------------------------------------------------------------
@@ -871,6 +1375,47 @@ fn resolve_column_ref(expr: &Expr, table: &TableSchema) -> Option<usize> {
     }
 }
 
+/// Resolve result columns to table column indices.
+///
+/// Returns a Vec of column indices for each output column.
+/// `Star` and `TableStar` expand to all table columns.
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+fn resolve_result_column_indices(
+    columns: &[ResultColumn],
+    table: &TableSchema,
+) -> Result<Vec<usize>, CodegenError> {
+    let mut indices = Vec::new();
+    for col in columns {
+        match col {
+            ResultColumn::Star => {
+                indices.extend(0..table.columns.len());
+            }
+            ResultColumn::TableStar(qualifier) => {
+                if !qualifier.eq_ignore_ascii_case(&table.name) {
+                    return Err(CodegenError::TableNotFound(qualifier.clone()));
+                }
+                indices.extend(0..table.columns.len());
+            }
+            ResultColumn::Expr { expr, .. } => {
+                if let Expr::Column(col_ref, _) = expr {
+                    let idx = table.column_index(&col_ref.column).ok_or_else(|| {
+                        CodegenError::ColumnNotFound {
+                            table: table.name.clone(),
+                            column: col_ref.column.clone(),
+                        }
+                    })?;
+                    indices.push(idx);
+                } else {
+                    return Err(CodegenError::Unsupported(
+                        "non-column result expression in table-backed SELECT".to_owned(),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(indices)
+}
+
 /// Check if a WHERE clause is a simple `rowid = ?` bind parameter.
 ///
 /// Returns the 1-based bind parameter index if so.
@@ -1298,8 +1843,8 @@ mod tests {
     use fsqlite_ast::{
         Assignment, AssignmentTarget, BinaryOp as AstBinaryOp, ColumnRef, DeleteStatement,
         Distinctness, Expr, FromClause, InsertSource, InsertStatement, LimitClause, Literal,
-        PlaceholderType, QualifiedName, QualifiedTableRef, ResultColumn, SelectBody, SelectCore,
-        SelectStatement, Span, TableOrSubquery, UpdateStatement,
+        OrderingTerm, PlaceholderType, QualifiedName, QualifiedTableRef, ResultColumn, SelectBody,
+        SelectCore, SelectStatement, SortDirection, Span, TableOrSubquery, UpdateStatement,
     };
     use fsqlite_types::opcode::Opcode;
 
@@ -2071,5 +2616,235 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── ORDER BY test helpers ──
+
+    fn star_select_order_by(table: &str, col: &str, desc: bool) -> SelectStatement {
+        SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Select {
+                    distinct: Distinctness::All,
+                    columns: vec![ResultColumn::Star],
+                    from: Some(from_table(table)),
+                    where_clause: None,
+                    group_by: vec![],
+                    having: None,
+                    windows: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![OrderingTerm {
+                expr: Expr::Column(ColumnRef::bare(col), Span::ZERO),
+                direction: if desc {
+                    Some(SortDirection::Desc)
+                } else {
+                    None
+                },
+                nulls: None,
+            }],
+            limit: None,
+        }
+    }
+
+    fn star_select_order_by_with_limit(table: &str, col: &str, limit: i64) -> SelectStatement {
+        SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Select {
+                    distinct: Distinctness::All,
+                    columns: vec![ResultColumn::Star],
+                    from: Some(from_table(table)),
+                    where_clause: None,
+                    group_by: vec![],
+                    having: None,
+                    windows: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![OrderingTerm {
+                expr: Expr::Column(ColumnRef::bare(col), Span::ZERO),
+                direction: None,
+                nulls: None,
+            }],
+            limit: Some(LimitClause {
+                limit: Expr::Literal(Literal::Integer(limit), Span::ZERO),
+                offset: None,
+            }),
+        }
+    }
+
+    // === Test 15: SELECT with ORDER BY ===
+    #[test]
+    fn test_codegen_select_order_by() {
+        let stmt = star_select_order_by("t", "a", false);
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        // Two-pass pattern: SorterOpen, OpenRead, scan loop, SorterSort, output loop.
+        assert!(has_opcodes(
+            &prog,
+            &[
+                Opcode::SorterOpen,
+                Opcode::OpenRead,
+                Opcode::Rewind,
+                Opcode::Column,
+                Opcode::MakeRecord,
+                Opcode::SorterInsert,
+                Opcode::Next,
+                Opcode::Close,
+                Opcode::SorterSort,
+                Opcode::SorterData,
+                Opcode::Column,
+                Opcode::ResultRow,
+                Opcode::SorterNext,
+                Opcode::Close,
+                Opcode::Halt,
+            ]
+        ));
+
+        // SorterOpen p2 should be 1 (one sort key column).
+        let so = prog
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::SorterOpen)
+            .unwrap();
+        assert_eq!(so.p2, 1, "SorterOpen should have 1 key column");
+    }
+
+    // === Test 16: SELECT ORDER BY DESC ===
+    #[test]
+    fn test_codegen_select_order_by_desc() {
+        let stmt = star_select_order_by("t", "b", true);
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        // Should have SorterOpen with sort order in P4.
+        let so = prog
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::SorterOpen)
+            .unwrap();
+        assert_eq!(so.p2, 1, "SorterOpen should have 1 key column");
+        // P4 should contain the '-' (DESC) sort order.
+        assert!(
+            matches!(&so.p4, P4::Str(s) if s == "-"),
+            "SorterOpen P4 should be '-' for DESC, got {:?}",
+            so.p4
+        );
+    }
+
+    // === Test 17: SELECT ORDER BY + LIMIT ===
+    #[test]
+    fn test_codegen_select_order_by_with_limit() {
+        let stmt = star_select_order_by_with_limit("t", "a", 5);
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        // Should have SorterSort + DecrJumpZero (LIMIT on sorted output).
+        assert!(has_opcodes(
+            &prog,
+            &[
+                Opcode::SorterOpen,
+                Opcode::SorterSort,
+                Opcode::SorterData,
+                Opcode::ResultRow,
+                Opcode::DecrJumpZero,
+                Opcode::SorterNext,
+            ]
+        ));
+
+        // Integer for LIMIT should appear after scan pass.
+        let integers: Vec<_> = prog
+            .ops()
+            .iter()
+            .filter(|op| op.opcode == Opcode::Integer)
+            .collect();
+        assert!(
+            integers.iter().any(|op| op.p1 == 5),
+            "should have Integer with limit value 5"
+        );
+    }
+
+    // === Test 18: ORDER BY no sorter without ORDER BY ===
+    #[test]
+    fn test_codegen_select_no_order_by_no_sorter() {
+        let stmt = star_select("t");
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        // Without ORDER BY, there should be no sorter opcodes.
+        let sorter_count = prog
+            .ops()
+            .iter()
+            .filter(|op| {
+                matches!(
+                    op.opcode,
+                    Opcode::SorterOpen
+                        | Opcode::SorterInsert
+                        | Opcode::SorterSort
+                        | Opcode::SorterData
+                        | Opcode::SorterNext
+                )
+            })
+            .count();
+        assert_eq!(sorter_count, 0, "no sorter opcodes without ORDER BY");
+    }
+
+    // === Test 19: ORDER BY labels properly resolved ===
+    #[test]
+    fn test_codegen_select_order_by_labels_resolved() {
+        let stmt = star_select_order_by("t", "a", false);
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        // All jump targets should be valid addresses.
+        for op in prog.ops() {
+            if op.opcode.is_jump() {
+                assert!(
+                    op.p2 >= 0,
+                    "unresolved jump at {:?}: p2 = {}",
+                    op.opcode,
+                    op.p2
+                );
+                assert!(
+                    usize::try_from(op.p2).unwrap() <= prog.len(),
+                    "jump target out of range at {:?}: p2 = {} (prog len = {})",
+                    op.opcode,
+                    op.p2,
+                    prog.len()
+                );
+            }
+        }
+
+        // SorterNext p2 should point to SorterData (within bounds).
+        let sn = prog
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::SorterNext)
+            .unwrap();
+        let target_index = usize::try_from(sn.p2).unwrap();
+        let target_op = &prog.ops()[target_index];
+        assert_eq!(
+            target_op.opcode,
+            Opcode::SorterData,
+            "SorterNext should jump back to SorterData"
+        );
     }
 }
