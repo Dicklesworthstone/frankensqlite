@@ -20,7 +20,17 @@ const UNIT_TEST_IDS: [&str; 9] = [
 ];
 const E2E_TEST_IDS: [&str; 1] = ["test_e2e_networking_stack_replication_under_loss"];
 const LOG_LEVEL_MARKERS: [&str; 4] = ["DEBUG", "INFO", "WARN", "ERROR"];
-const REQUIRED_TOKENS: [&str; 14] = [
+const SPEC_MARKERS: [&str; 8] = [
+    "rustls",
+    "max_concurrent_streams=256",
+    "max_header_list_size=64KiB",
+    "continuation_timeout=5s",
+    "header_fragment_cap",
+    "4MiB",
+    "VirtualTcp",
+    "drop/reorder/corrupt",
+];
+const REQUIRED_TOKENS: [&str; 22] = [
     "test_tls_by_default",
     "test_plaintext_requires_explicit_opt_in",
     "test_http2_max_concurrent_streams",
@@ -35,6 +45,14 @@ const REQUIRED_TOKENS: [&str; 14] = [
     "INFO",
     "WARN",
     "ERROR",
+    "rustls",
+    "max_concurrent_streams=256",
+    "max_header_list_size=64KiB",
+    "continuation_timeout=5s",
+    "header_fragment_cap",
+    "4MiB",
+    "VirtualTcp",
+    "drop/reorder/corrupt",
 ];
 
 #[derive(Debug, PartialEq, Eq)]
@@ -43,6 +61,7 @@ struct ComplianceEvaluation {
     missing_unit_ids: Vec<&'static str>,
     missing_e2e_ids: Vec<&'static str>,
     missing_log_levels: Vec<&'static str>,
+    missing_spec_markers: Vec<&'static str>,
 }
 
 impl ComplianceEvaluation {
@@ -50,6 +69,7 @@ impl ComplianceEvaluation {
         self.missing_unit_ids.is_empty()
             && self.missing_e2e_ids.is_empty()
             && self.missing_log_levels.is_empty()
+            && self.missing_spec_markers.is_empty()
     }
 }
 
@@ -116,10 +136,16 @@ fn evaluate_description(description: &str) -> ComplianceEvaluation {
         .filter(|level| !description.contains(level))
         .collect::<Vec<_>>();
 
+    let missing_spec_markers = SPEC_MARKERS
+        .into_iter()
+        .filter(|marker| !description.contains(marker))
+        .collect::<Vec<_>>();
+
     ComplianceEvaluation {
         missing_unit_ids,
         missing_e2e_ids,
         missing_log_levels,
+        missing_spec_markers,
     }
 }
 
@@ -144,6 +170,12 @@ fn test_bd_i0m5_unit_compliance_gate() -> Result<(), String> {
         return Err(format!(
             "bead_id={BEAD_ID} case=logging_levels_missing missing={:?}",
             evaluation.missing_log_levels
+        ));
+    }
+    if !evaluation.missing_spec_markers.is_empty() {
+        return Err(format!(
+            "bead_id={BEAD_ID} case=spec_markers_missing missing={:?}",
+            evaluation.missing_spec_markers
         ));
     }
 
@@ -186,10 +218,11 @@ fn test_e2e_bd_i0m5_compliance() -> Result<(), String> {
     let evaluation = evaluate_description(&description);
 
     eprintln!(
-        "INFO bead_id={BEAD_ID} case=e2e_summary missing_unit_ids={} missing_e2e_ids={} missing_log_levels={}",
+        "INFO bead_id={BEAD_ID} case=e2e_summary missing_unit_ids={} missing_e2e_ids={} missing_log_levels={} missing_spec_markers={}",
         evaluation.missing_unit_ids.len(),
         evaluation.missing_e2e_ids.len(),
         evaluation.missing_log_levels.len(),
+        evaluation.missing_spec_markers.len(),
     );
 
     for id in &evaluation.missing_unit_ids {
@@ -200,6 +233,9 @@ fn test_e2e_bd_i0m5_compliance() -> Result<(), String> {
     }
     for level in &evaluation.missing_log_levels {
         eprintln!("WARN bead_id={BEAD_ID} case=missing_log_level level={level}");
+    }
+    for marker in &evaluation.missing_spec_markers {
+        eprintln!("WARN bead_id={BEAD_ID} case=missing_spec_marker marker={marker}");
     }
 
     if !evaluation.is_compliant() {
@@ -215,4 +251,17 @@ fn test_e2e_bd_i0m5_compliance() -> Result<(), String> {
 #[test]
 fn test_e2e_networking_stack_replication_under_loss_smoke() -> Result<(), String> {
     test_e2e_bd_i0m5_compliance()
+}
+
+#[test]
+fn test_bd_i0m5_transport_limits_markers_present() -> Result<(), String> {
+    let description = load_issue_description(BEAD_ID)?;
+    let evaluation = evaluate_description(&description);
+    if !evaluation.missing_spec_markers.is_empty() {
+        return Err(format!(
+            "bead_id={BEAD_ID} case=transport_limits_markers_missing missing={:?}",
+            evaluation.missing_spec_markers
+        ));
+    }
+    Ok(())
 }

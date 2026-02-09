@@ -42,6 +42,14 @@ required_tokens=(
     "INFO"
     "WARN"
     "ERROR"
+    "rustls"
+    "max_concurrent_streams=256"
+    "max_header_list_size=64KiB"
+    "continuation_timeout=5s"
+    "header_fragment_cap"
+    "4MiB"
+    "VirtualTcp"
+    "drop/reorder/corrupt"
 )
 
 declare -a missing_tokens=()
