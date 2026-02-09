@@ -3,6 +3,7 @@
 pub mod checksum;
 pub mod native_commit;
 pub mod recovery_compaction;
+pub mod wal_fec;
 pub mod wal_index;
 
 pub use checksum::{
@@ -25,6 +26,12 @@ pub use checksum::{
     verify_wal_fec_source_hash, wal_fec_source_hash_xxh3_128, wal_frame_db_size,
     wal_header_checksum, write_page_checksum, write_wal_frame_checksum, write_wal_frame_salts,
     write_wal_header_checksum, write_wal_header_salts, zero_page_checksum_trailer,
+};
+pub use wal_fec::{
+    WAL_FEC_GROUP_META_MAGIC, WAL_FEC_GROUP_META_VERSION, WalFecGroupId, WalFecGroupMeta,
+    WalFecGroupMetaInit, WalFecGroupRecord, WalFecScanResult, append_wal_fec_group,
+    build_source_page_hashes, ensure_wal_with_fec_sidecar, find_wal_fec_group, scan_wal_fec,
+    wal_fec_path_for_wal,
 };
 pub use wal_index::{
     WAL_CKPT_INFO_BYTES, WAL_CKPT_LOCK, WAL_INDEX_HASH_MASK, WAL_INDEX_HASH_MULTIPLIER,
