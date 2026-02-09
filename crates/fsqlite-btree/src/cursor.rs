@@ -28,7 +28,7 @@ use fsqlite_types::cx::Cx;
 use fsqlite_types::limits::BTREE_MAX_DEPTH;
 use fsqlite_types::serial_type::write_varint;
 use fsqlite_types::{PageNumber, WitnessKey};
-use tracing::warn;
+use tracing::{debug, warn};
 
 const MAX_MUTATION_OVERFLOW_CHAIN: usize = 1_000_000;
 
@@ -43,6 +43,12 @@ const MAX_MUTATION_OVERFLOW_CHAIN: usize = 1_000_000;
 pub trait PageReader {
     /// Read a page by number, returning the raw bytes.
     fn read_page(&self, cx: &Cx, page_no: PageNumber) -> Result<Vec<u8>>;
+
+    /// Hint that a page is likely to be needed soon.
+    ///
+    /// Default implementation is a no-op so platforms without a safe prefetch
+    /// primitive degrade gracefully.
+    fn prefetch_page_hint(&self, _cx: &Cx, _page_no: PageNumber) {}
 }
 
 /// Trait for writing pages (needed for insert/delete).
@@ -162,6 +168,15 @@ impl<P: PageReader> BtCursor<P> {
         self.read_witnesses.push(WitnessKey::Page(page_no));
     }
 
+    fn issue_prefetch_hint(&self, cx: &Cx, page_no: PageNumber) {
+        self.pager.prefetch_page_hint(cx, page_no);
+        debug!(
+            page_number = page_no.get(),
+            source = "btree_descent",
+            "issued best-effort btree prefetch hint"
+        );
+    }
+
     /// Load a page into a stack entry.
     fn load_page(&self, cx: &Cx, page_no: PageNumber) -> Result<StackEntry> {
         let page_data = self.pager.read_page(cx, page_no)?;
@@ -237,6 +252,7 @@ impl<P: PageReader> BtCursor<P> {
                         })?;
                 entry.cell_idx = 0;
                 self.stack.push(entry);
+                self.issue_prefetch_hint(cx, right);
                 current_page = right;
             } else {
                 let cell = self.parse_cell_at(&entry, 0)?;
@@ -247,6 +263,7 @@ impl<P: PageReader> BtCursor<P> {
                     })?;
                 entry.cell_idx = 0;
                 self.stack.push(entry);
+                self.issue_prefetch_hint(cx, child);
                 current_page = child;
             }
         }
@@ -297,6 +314,7 @@ impl<P: PageReader> BtCursor<P> {
                 })?;
             entry.cell_idx = entry.header.cell_count;
             self.stack.push(entry);
+            self.issue_prefetch_hint(cx, right);
             current_page = right;
         }
     }
@@ -377,6 +395,7 @@ impl<P: PageReader> BtCursor<P> {
             let mut entry = entry;
             entry.cell_idx = child_idx;
             self.stack.push(entry);
+            self.issue_prefetch_hint(cx, child);
             current_page = child;
         }
     }
@@ -498,6 +517,7 @@ impl<P: PageReader> BtCursor<P> {
             let mut entry = entry;
             entry.cell_idx = child_idx;
             self.stack.push(entry);
+            self.issue_prefetch_hint(cx, child);
             current_page = child;
         }
     }
@@ -603,6 +623,7 @@ impl<P: PageReader> BtCursor<P> {
                     let next_child_idx = parent.cell_idx + 1;
                     let child = self.child_page_at(parent, next_child_idx)?;
                     self.stack.last_mut().unwrap().cell_idx = next_child_idx;
+                    self.issue_prefetch_hint(cx, child);
                     return self.move_to_leftmost_leaf(cx, child, true);
                 }
                 // cell_idx == cell_count means we already visited right_child.
@@ -643,6 +664,7 @@ impl<P: PageReader> BtCursor<P> {
                     let prev_child_idx = parent.cell_idx - 1;
                     let child = self.child_page_at(parent, prev_child_idx)?;
                     self.stack.last_mut().unwrap().cell_idx = prev_child_idx;
+                    self.issue_prefetch_hint(cx, child);
                     return self.move_to_rightmost_leaf(cx, child, true);
                 }
                 // cell_idx == 0 means we came from the leftmost child.
@@ -1250,7 +1272,10 @@ mod tests {
     use super::*;
     use fsqlite_types::serial_type::write_varint;
     use proptest::strategy::Strategy as _;
+    use std::cell::RefCell;
     use std::collections::{BTreeMap, BTreeSet, HashMap};
+    use std::rc::Rc;
+    use std::time::{Duration, Instant};
 
     /// Simple in-memory page store for testing.
     #[derive(Debug, Clone, Default)]
@@ -1289,6 +1314,49 @@ mod tests {
         fn free_page(&mut self, _cx: &Cx, page_no: PageNumber) -> Result<()> {
             self.pages.remove(&page_no.get());
             Ok(())
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct PrefetchProbeStore {
+        inner: MemPageStore,
+        hinted_pages: Rc<RefCell<Vec<PageNumber>>>,
+    }
+
+    impl PrefetchProbeStore {
+        fn new(inner: MemPageStore) -> Self {
+            Self {
+                inner,
+                hinted_pages: Rc::new(RefCell::new(Vec::new())),
+            }
+        }
+
+        fn hinted_pages(&self) -> Vec<PageNumber> {
+            self.hinted_pages.borrow().clone()
+        }
+    }
+
+    impl PageReader for PrefetchProbeStore {
+        fn read_page(&self, cx: &Cx, page_no: PageNumber) -> Result<Vec<u8>> {
+            self.inner.read_page(cx, page_no)
+        }
+
+        fn prefetch_page_hint(&self, _cx: &Cx, page_no: PageNumber) {
+            self.hinted_pages.borrow_mut().push(page_no);
+        }
+    }
+
+    impl PageWriter for PrefetchProbeStore {
+        fn write_page(&mut self, cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()> {
+            self.inner.write_page(cx, page_no, data)
+        }
+
+        fn allocate_page(&mut self, cx: &Cx) -> Result<PageNumber> {
+            self.inner.allocate_page(cx)
+        }
+
+        fn free_page(&mut self, cx: &Cx, page_no: PageNumber) -> Result<()> {
+            self.inner.free_page(cx, page_no)
         }
     }
 
@@ -1458,6 +1526,107 @@ mod tests {
             payload.push(byte);
         }
         payload
+    }
+
+    #[test]
+    fn test_prefetch_hint_issued_on_descent() {
+        let mut store = MemPageStore::default();
+        store
+            .pages
+            .insert(2, build_interior_table(&[(pn(3), 5)], pn(4)));
+        store
+            .pages
+            .insert(3, build_leaf_table(&[(1, b"a"), (5, b"b")]));
+        store
+            .pages
+            .insert(4, build_leaf_table(&[(10, b"c"), (15, b"d")]));
+
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+
+        let result = cursor.table_move_to(&cx, 10).unwrap();
+        assert!(result.is_found());
+        assert_eq!(cursor.rowid(&cx).unwrap(), 10);
+        assert_eq!(cursor.pager.hinted_pages(), vec![pn(4)]);
+    }
+
+    #[test]
+    fn test_prefetch_noop_if_unavailable() {
+        let mut store = MemPageStore::default();
+        store
+            .pages
+            .insert(2, build_interior_table(&[(pn(3), 5)], pn(4)));
+        store
+            .pages
+            .insert(3, build_leaf_table(&[(1, b"a"), (5, b"b")]));
+        store
+            .pages
+            .insert(4, build_leaf_table(&[(10, b"c"), (15, b"d")]));
+
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+        let result = cursor.table_move_to(&cx, 15).unwrap();
+        assert!(result.is_found());
+
+        // Default trait implementation is a no-op; this must remain harmless.
+        cursor.pager.prefetch_page_hint(&cx, pn(999_999));
+        assert_eq!(cursor.rowid(&cx).unwrap(), 15);
+    }
+
+    #[test]
+    fn test_prefetch_no_unsafe() {
+        let source = include_str!("cursor.rs");
+        let unsafe_blocks = source
+            .lines()
+            .filter(|line| line.trim_start().starts_with("unsafe {"))
+            .count();
+        assert_eq!(
+            unsafe_blocks, 0,
+            "prefetch implementation must remain fully safe"
+        );
+    }
+
+    #[test]
+    fn test_prefetch_does_not_block() {
+        let mut store = MemPageStore::default();
+        store
+            .pages
+            .insert(2, build_interior_table(&[(pn(3), 5)], pn(4)));
+        store
+            .pages
+            .insert(3, build_leaf_table(&[(1, b"a"), (5, b"b")]));
+        store
+            .pages
+            .insert(4, build_leaf_table(&[(10, b"c"), (15, b"d")]));
+
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+
+        let started = Instant::now();
+        let result = cursor.table_move_to(&cx, 10).unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(result.is_found());
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "prefetch hint path should be non-blocking; elapsed={elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn test_prefetch_invalid_page_harmless() {
+        let mut store = MemPageStore::default();
+        store
+            .pages
+            .insert(2, build_leaf_table(&[(1, b"a"), (2, b"b")]));
+
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
+
+        cursor.pager.prefetch_page_hint(&cx, pn(999_999));
+        let result = cursor.table_move_to(&cx, 2).unwrap();
+        assert!(result.is_found());
+        assert!(cursor.pager.hinted_pages().contains(&pn(999_999)));
     }
 
     // -- Single leaf page tests --
@@ -1924,6 +2093,59 @@ mod tests {
         assert!(
             expected_iter.next().is_none(),
             "cursor missed one or more rows during forward scan"
+        );
+    }
+
+    #[test]
+    fn test_e2e_btree_prefetch_latency() {
+        const TOTAL_ROWS: i64 = 1_500;
+
+        let mut seed_store = MemPageStore::default();
+        seed_store.pages.insert(2, build_leaf_table(&[]));
+
+        let cx = Cx::new();
+        let mut seed_cursor = BtCursor::new(seed_store, pn(2), USABLE, true);
+        for rowid in 1..=TOTAL_ROWS {
+            let payload = payload_for_rowid(rowid);
+            seed_cursor.table_insert(&cx, rowid, &payload).unwrap();
+        }
+
+        let baseline_store = seed_cursor.pager.clone();
+        let prefetch_store = PrefetchProbeStore::new(seed_cursor.pager);
+
+        let mut workload: Vec<i64> = (1..=TOTAL_ROWS).collect();
+        deterministic_shuffle(&mut workload, 0x0FEE_D123);
+
+        let mut baseline_cursor = BtCursor::new(baseline_store, pn(2), USABLE, true);
+        let baseline_started = Instant::now();
+        let mut baseline_total_bytes = 0usize;
+        for rowid in &workload {
+            let result = baseline_cursor.table_move_to(&cx, *rowid).unwrap();
+            assert!(result.is_found(), "baseline lookup miss for rowid={rowid}");
+            baseline_total_bytes += baseline_cursor.payload(&cx).unwrap().len();
+        }
+        let baseline_elapsed = baseline_started.elapsed();
+
+        let mut hinted_cursor = BtCursor::new(prefetch_store, pn(2), USABLE, true);
+        let hinted_started = Instant::now();
+        let mut hinted_total_bytes = 0usize;
+        for rowid in &workload {
+            let result = hinted_cursor.table_move_to(&cx, *rowid).unwrap();
+            assert!(result.is_found(), "hinted lookup miss for rowid={rowid}");
+            hinted_total_bytes += hinted_cursor.payload(&cx).unwrap().len();
+        }
+        let hinted_elapsed = hinted_started.elapsed();
+
+        assert_eq!(baseline_total_bytes, hinted_total_bytes);
+        assert!(
+            !hinted_cursor.pager.hinted_pages().is_empty(),
+            "prefetch-enabled workload should record hints"
+        );
+
+        let allowed_regression = baseline_elapsed.saturating_mul(50) + Duration::from_millis(250);
+        assert!(
+            hinted_elapsed <= allowed_regression,
+            "prefetch workload regressed too much: baseline={baseline_elapsed:?}, hinted={hinted_elapsed:?}"
         );
     }
 
