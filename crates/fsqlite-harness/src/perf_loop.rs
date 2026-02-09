@@ -535,7 +535,9 @@ pub fn verify_golden_checksums(
 }
 
 /// Validate that golden outputs include required conformance artifacts.
-pub fn validate_conformance_artifacts_included(golden_output_dir: &Path) -> Result<(), PerfLoopError> {
+pub fn validate_conformance_artifacts_included(
+    golden_output_dir: &Path,
+) -> Result<(), PerfLoopError> {
     let files = read_top_level_files_sorted(golden_output_dir)?;
     let names: Vec<String> = files
         .iter()
@@ -546,9 +548,7 @@ pub fn validate_conformance_artifacts_included(golden_output_dir: &Path) -> Resu
 
     for required in REQUIRED_CONFORMANCE_ARTIFACT_NAMES {
         let required_lower = required.to_ascii_lowercase();
-        let found = names
-            .iter()
-            .any(|name| name.contains(&required_lower));
+        let found = names.iter().any(|name| name.contains(&required_lower));
         if !found {
             return Err(PerfLoopError::MissingConformanceArtifact { name: required });
         }

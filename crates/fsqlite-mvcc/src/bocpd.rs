@@ -966,11 +966,7 @@ mod tests {
             return 0.0;
         }
 
-        let (sign, pp) = if p < 0.5 {
-            (-1.0, p)
-        } else {
-            (1.0, 1.0 - p)
-        };
+        let (sign, pp) = if p < 0.5 { (-1.0, p) } else { (1.0, 1.0 - p) };
 
         let t = (-2.0 * pp.ln()).sqrt();
 

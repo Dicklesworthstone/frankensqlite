@@ -7,18 +7,19 @@ use std::fs;
 use std::path::PathBuf;
 
 use perf_loop::{
-    BASELINE_LAYOUT_BEAD_ID, DETERMINISTIC_MEASUREMENT_BEAD_ID, MeasurementArtifactBundle,
-    OPPORTUNITY_MATRIX_BEAD_ID, OPPORTUNITY_SCORE_THRESHOLD, OpportunityMatrix,
-    OpportunityMatrixEntry, OptimizationLever, PROFILING_COOKBOOK_BEAD_ID, PerfLoopError,
-    PerfSmokeArtifacts, PerfSmokeReport, PerfSmokeSystem, ProfilingArtifactReport, ScheduleEvent,
-    build_measurement_artifact_bundle, canonical_profiling_cookbook_commands,
-    capture_golden_checksums, compute_opportunity_score, compute_trace_fingerprint,
-    enforce_baseline_capture, enforce_extreme_optimization_loop, enforce_one_lever_rule,
-    enforce_opportunity_matrix_gate, enforce_opportunity_matrix_required,
-    enforce_opportunity_score_gate, enforce_profiling_toolchain_presence_with,
-    ensure_baseline_layout, evaluate_opportunity_matrix, load_and_validate_smoke_report,
-    parse_git_diff_changed_paths, record_measurement_env, record_profiling_metadata,
-    replay_schedule_from_fingerprint, run_deterministic_measurement, validate_baseline_layout,
+    BASELINE_LAYOUT_BEAD_ID, DETERMINISTIC_MEASUREMENT_BEAD_ID, GOLDEN_BEHAVIOR_LOCK_BEAD_ID,
+    MeasurementArtifactBundle, OPPORTUNITY_MATRIX_BEAD_ID, OPPORTUNITY_SCORE_THRESHOLD,
+    OpportunityMatrix, OpportunityMatrixEntry, OptimizationLever, PROFILING_COOKBOOK_BEAD_ID,
+    PerfLoopError, PerfSmokeArtifacts, PerfSmokeReport, PerfSmokeSystem, ProfilingArtifactReport,
+    ScheduleEvent, build_measurement_artifact_bundle, canonical_profiling_cookbook_commands,
+    capture_behavior_lock_checksums, capture_golden_checksums, compute_opportunity_score,
+    compute_trace_fingerprint, enforce_baseline_capture, enforce_behavior_lock_ci,
+    enforce_extreme_optimization_loop, enforce_one_lever_rule, enforce_opportunity_matrix_gate,
+    enforce_opportunity_matrix_required, enforce_opportunity_score_gate,
+    enforce_profiling_toolchain_presence_with, ensure_baseline_layout, evaluate_opportunity_matrix,
+    load_and_validate_smoke_report, parse_git_diff_changed_paths, record_measurement_env,
+    record_profiling_metadata, replay_schedule_from_fingerprint, run_deterministic_measurement,
+    validate_baseline_layout, validate_conformance_artifacts_included,
     validate_cookbook_commands_exist, validate_flamegraph_output, validate_hyperfine_json_output,
     validate_measurement_env, validate_opportunity_matrix, validate_perf_smoke_report,
     validate_profiling_artifact_paths, validate_profiling_artifact_report,
@@ -40,6 +41,29 @@ fn make_golden_fixture() -> (TempDir, PathBuf, PathBuf) {
 
     let checksum_file = temp.path().join("golden_checksums.txt");
     capture_golden_checksums(&golden_dir, &checksum_file).expect("capture checksums");
+    (temp, golden_dir, checksum_file)
+}
+
+fn make_conformance_golden_fixture() -> (TempDir, PathBuf, PathBuf) {
+    let temp = TempDir::new().expect("tempdir");
+    let golden_dir = temp.path().join("golden_outputs");
+    fs::create_dir_all(&golden_dir).expect("create golden dir");
+
+    fs::write(golden_dir.join("query_rows.txt"), "alice|1\nbob|2\n").expect("write golden rows");
+    fs::write(golden_dir.join("error_codes.txt"), "SQLITE_OK\n").expect("write golden codes");
+    fs::write(golden_dir.join("CommitMarker.json"), r#"{"commit_seq":1}"#)
+        .expect("write commit marker");
+    fs::write(golden_dir.join("CommitProof.json"), r#"{"proof":"ok"}"#)
+        .expect("write commit proof");
+    fs::write(
+        golden_dir.join("AbortWitness.json"),
+        r#"{"witness":"none"}"#,
+    )
+    .expect("write abort witness");
+
+    let checksum_file = temp.path().join("golden_checksums.txt");
+    capture_behavior_lock_checksums(&golden_dir, &checksum_file)
+        .expect("capture behavior-lock checksums");
     (temp, golden_dir, checksum_file)
 }
 
@@ -130,6 +154,73 @@ fn test_golden_unchanged_behavior_lock() {
     assert!(
         matches!(error, PerfLoopError::GoldenChecksumMismatch { .. }),
         "bead_id={BEAD_ID} expected checksum mismatch, got {error:?}"
+    );
+}
+
+#[test]
+fn test_checksum_capture() {
+    let (_temp, _golden_dir, checksum_file) = make_conformance_golden_fixture();
+    let contents = fs::read_to_string(&checksum_file).expect("read checksums");
+    assert!(
+        !contents.trim().is_empty(),
+        "bead_id={GOLDEN_BEHAVIOR_LOCK_BEAD_ID} checksum file should not be empty"
+    );
+}
+
+#[test]
+fn test_checksum_verify() {
+    let (_temp, golden_dir, checksum_file) = make_conformance_golden_fixture();
+    verify_golden_checksums(&golden_dir, &checksum_file).expect("verify should pass initially");
+
+    fs::write(
+        golden_dir.join("CommitProof.json"),
+        r#"{"proof":"mutated"}"#,
+    )
+    .expect("mutate commit proof");
+    let error = verify_golden_checksums(&golden_dir, &checksum_file)
+        .expect_err("verify should fail after mutation");
+    assert!(
+        matches!(error, PerfLoopError::GoldenChecksumMismatch { .. }),
+        "bead_id={GOLDEN_BEHAVIOR_LOCK_BEAD_ID} expected checksum mismatch after mutation, got {error:?}"
+    );
+}
+
+#[test]
+fn test_conformance_artifacts_included() {
+    let temp = TempDir::new().expect("tempdir");
+    let golden_dir = temp.path().join("golden_outputs");
+    fs::create_dir_all(&golden_dir).expect("create dir");
+    fs::write(golden_dir.join("CommitMarker.json"), "{}").expect("write marker");
+    fs::write(golden_dir.join("CommitProof.json"), "{}").expect("write proof");
+
+    let error = validate_conformance_artifacts_included(&golden_dir)
+        .expect_err("missing abort witness must fail");
+    assert!(
+        matches!(error, PerfLoopError::MissingConformanceArtifact { .. }),
+        "bead_id={GOLDEN_BEHAVIOR_LOCK_BEAD_ID} expected missing conformance artifact, got {error:?}"
+    );
+
+    fs::write(golden_dir.join("AbortWitness.json"), "{}").expect("write witness");
+    validate_conformance_artifacts_included(&golden_dir)
+        .expect("all required conformance artifacts should pass");
+}
+
+#[test]
+fn test_behavior_lock_ci() {
+    let (_temp, golden_dir, checksum_file) = make_conformance_golden_fixture();
+    enforce_behavior_lock_ci(true, &golden_dir, &checksum_file)
+        .expect("perf-only gate should pass");
+
+    fs::write(
+        golden_dir.join("AbortWitness.json"),
+        r#"{"witness":"changed"}"#,
+    )
+    .expect("mutate witness");
+    let error = enforce_behavior_lock_ci(true, &golden_dir, &checksum_file)
+        .expect_err("perf-only gate should fail on mismatch");
+    assert!(
+        matches!(error, PerfLoopError::GoldenChecksumMismatch { .. }),
+        "bead_id={GOLDEN_BEHAVIOR_LOCK_BEAD_ID} expected behavior-lock mismatch failure, got {error:?}"
     );
 }
 
@@ -747,4 +838,46 @@ fn test_e2e_toolchain_presence_gate() {
             panic!("bead_id={PROFILING_COOKBOOK_BEAD_ID} expected ToolUnavailable, got {other:?}")
         }
     }
+}
+
+#[test]
+fn test_e2e_perf_change_requires_behavior_lock() {
+    let (_temp, golden_dir, checksum_file) = make_conformance_golden_fixture();
+    enforce_behavior_lock_ci(true, &golden_dir, &checksum_file)
+        .expect("perf-only behavior lock should pass on unchanged outputs");
+
+    fs::write(golden_dir.join("query_rows.txt"), "alice|1\nbob|999\n")
+        .expect("mutate conformance output");
+    let error = enforce_behavior_lock_ci(true, &golden_dir, &checksum_file)
+        .expect_err("perf-only behavior lock must fail on drift");
+    assert!(
+        matches!(error, PerfLoopError::GoldenChecksumMismatch { .. }),
+        "bead_id={GOLDEN_BEHAVIOR_LOCK_BEAD_ID} expected mismatch failure for perf drift, got {error:?}"
+    );
+}
+
+#[test]
+fn test_e2e_conformance_artifacts_included_in_lock() {
+    let temp = TempDir::new().expect("tempdir");
+    let golden_dir = temp.path().join("golden_outputs");
+    fs::create_dir_all(&golden_dir).expect("create dir");
+    fs::write(golden_dir.join("query_rows.txt"), "alice|1").expect("write rows");
+    fs::write(golden_dir.join("error_codes.txt"), "SQLITE_OK").expect("write codes");
+    fs::write(golden_dir.join("CommitMarker.json"), "{}").expect("write marker");
+    fs::write(golden_dir.join("CommitProof.json"), "{}").expect("write proof");
+
+    let checksum_file = temp.path().join("golden_checksums.txt");
+    capture_golden_checksums(&golden_dir, &checksum_file).expect("capture checksums");
+
+    let error = enforce_behavior_lock_ci(true, &golden_dir, &checksum_file)
+        .expect_err("missing AbortWitness should fail conformance inclusion gate");
+    assert!(
+        matches!(
+            error,
+            PerfLoopError::MissingConformanceArtifact {
+                name: "AbortWitness"
+            }
+        ),
+        "bead_id={GOLDEN_BEHAVIOR_LOCK_BEAD_ID} expected AbortWitness inclusion failure, got {error:?}"
+    );
 }
