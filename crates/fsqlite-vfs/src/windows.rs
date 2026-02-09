@@ -56,6 +56,7 @@ fn ensure_shm_file_len(path: &Path, min_len: u64) -> Result<()> {
         .read(true)
         .write(true)
         .create(true)
+        .truncate(false)
         .open(path)?;
     let current = file.metadata()?.len();
     if current < min_len {
@@ -116,11 +117,14 @@ impl WindowsLockTable {
     }
 
     fn remove_if_empty(&self, path: &Path) -> Result<()> {
-        let mut map = self
-            .map
-            .lock()
-            .map_err(|_| lock_poisoned("windows lock table"))?;
-        let Some(state) = map.get(path).cloned() else {
+        let state = {
+            let map = self
+                .map
+                .lock()
+                .map_err(|_| lock_poisoned("windows lock table"))?;
+            map.get(path).cloned()
+        };
+        let Some(state) = state else {
             return Ok(());
         };
         let empty = state
@@ -129,6 +133,10 @@ impl WindowsLockTable {
             .holders
             .is_empty();
         if empty {
+            let mut map = self
+                .map
+                .lock()
+                .map_err(|_| lock_poisoned("windows lock table"))?;
             map.remove(path);
         }
         Ok(())
@@ -187,11 +195,14 @@ impl WindowsShmTable {
     }
 
     fn remove_if_orphaned(&self, path: &Path) -> Result<()> {
-        let mut map = self
-            .map
-            .lock()
-            .map_err(|_| lock_poisoned("windows shm table"))?;
-        let Some(state) = map.get(path).cloned() else {
+        let state = {
+            let map = self
+                .map
+                .lock()
+                .map_err(|_| lock_poisoned("windows shm table"))?;
+            map.get(path).cloned()
+        };
+        let Some(state) = state else {
             return Ok(());
         };
         let orphaned = state
@@ -200,6 +211,10 @@ impl WindowsShmTable {
             .owner_refs
             .is_empty();
         if orphaned {
+            let mut map = self
+                .map
+                .lock()
+                .map_err(|_| lock_poisoned("windows shm table"))?;
             map.remove(path);
         }
         Ok(())
@@ -395,9 +410,8 @@ impl WindowsFile {
 
         match target {
             LockLevel::None => true,
-            LockLevel::Shared => !has_pending && !has_exclusive,
+            LockLevel::Shared | LockLevel::Pending => !has_pending && !has_exclusive,
             LockLevel::Reserved => !has_reserved && !has_pending && !has_exclusive,
-            LockLevel::Pending => !has_pending && !has_exclusive,
             LockLevel::Exclusive => !has_shared && !has_reserved && !has_pending && !has_exclusive,
         }
     }
@@ -671,6 +685,7 @@ impl VfsFile for WindowsFile {
             current = next;
         }
 
+        drop(state);
         self.lock_level = current;
         Ok(())
     }
@@ -722,6 +737,7 @@ impl VfsFile for WindowsFile {
         SQLITE_IOCAP_UNDELETABLE_WHEN_OPEN
     }
 
+    #[allow(clippy::significant_drop_tightening)]
     fn shm_map(&mut self, _cx: &Cx, region: u32, size: u32, extend: bool) -> Result<ShmRegion> {
         if size == 0 {
             return Err(FrankenError::LockFailed {
@@ -744,34 +760,37 @@ impl VfsFile for WindowsFile {
         ensure_shm_file_len(&self.shm_path, min_len)?;
 
         let shm_state = self.ensure_shm_state()?;
-        let mut state = shm_state
-            .lock()
-            .map_err(|_| lock_poisoned("windows shm state"))?;
+        let mapped_region = {
+            let mut state = shm_state
+                .lock()
+                .map_err(|_| lock_poisoned("windows shm state"))?;
 
-        let entry = state.regions.entry(region);
-        let region_ref = match entry {
-            std::collections::hash_map::Entry::Occupied(mut occupied) => {
-                if occupied.get().len() < size_usize {
-                    let replacement = ShmRegion::new(size_usize);
-                    {
-                        let current = occupied.get();
-                        let old_guard = current.lock();
-                        let mut new_guard = replacement.lock();
-                        let copy_len = old_guard.len().min(new_guard.len());
-                        new_guard[..copy_len].copy_from_slice(&old_guard[..copy_len]);
+            let entry = state.regions.entry(region);
+            let region_ref = match entry {
+                std::collections::hash_map::Entry::Occupied(mut occupied) => {
+                    if occupied.get().len() < size_usize {
+                        let replacement = ShmRegion::new(size_usize);
+                        {
+                            let current = occupied.get();
+                            let old_guard = current.lock();
+                            let mut new_guard = replacement.lock();
+                            let copy_len = old_guard.len().min(new_guard.len());
+                            new_guard[..copy_len].copy_from_slice(&old_guard[..copy_len]);
+                        }
+                        occupied.insert(replacement);
                     }
-                    occupied.insert(replacement);
+                    occupied.into_mut()
                 }
-                occupied.into_mut()
-            }
-            std::collections::hash_map::Entry::Vacant(vacant) => {
-                if !extend {
-                    return Err(FrankenError::CannotOpen {
-                        path: self.shm_path.clone(),
-                    });
+                std::collections::hash_map::Entry::Vacant(vacant) => {
+                    if !extend {
+                        return Err(FrankenError::CannotOpen {
+                            path: self.shm_path.clone(),
+                        });
+                    }
+                    vacant.insert(ShmRegion::new(size_usize))
                 }
-                vacant.insert(ShmRegion::new(size_usize))
-            }
+            };
+            region_ref.clone()
         };
 
         debug!(
@@ -782,7 +801,7 @@ impl VfsFile for WindowsFile {
             "mapped windows shm region"
         );
 
-        Ok(region_ref.clone())
+        Ok(mapped_region)
     }
 
     fn shm_lock(&mut self, _cx: &Cx, offset: u32, n: u32, flags: u32) -> Result<()> {
@@ -983,6 +1002,7 @@ mod tests {
         let guard = region_b.lock();
         assert_eq!(guard[0], 0xAA);
         assert_eq!(guard[1], 0x55);
+        drop(guard);
     }
 
     #[test]

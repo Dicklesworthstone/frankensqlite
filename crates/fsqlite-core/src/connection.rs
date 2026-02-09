@@ -6,6 +6,7 @@
 //! is wired in Phase 5.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use fsqlite_ast::{
@@ -1194,14 +1195,24 @@ fn emit_literal(builder: &mut ProgramBuilder, literal: &Literal, target_reg: i32
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct BindParamState {
     next_index: i32,
+    named_indices: HashMap<NamedPlaceholderKey, i32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct NamedPlaceholderKey {
+    prefix: char,
+    name: String,
 }
 
 impl Default for BindParamState {
     fn default() -> Self {
-        Self { next_index: 1 }
+        Self {
+            next_index: 1,
+            named_indices: HashMap::new(),
+        }
     }
 }
 
@@ -1228,6 +1239,20 @@ impl BindParamState {
         self.next_index = self.next_index.max(next);
         Ok(index)
     }
+
+    fn register_named(&mut self, prefix: char, name: &str) -> Result<i32> {
+        let key = NamedPlaceholderKey {
+            prefix,
+            name: name.to_owned(),
+        };
+        if let Some(index) = self.named_indices.get(&key) {
+            return Ok(*index);
+        }
+
+        let index = self.claim_anonymous()?;
+        self.named_indices.insert(key, index);
+        Ok(index)
+    }
 }
 
 fn placeholder_to_index(
@@ -1243,11 +1268,9 @@ fn placeholder_to_index(
             })?;
             bind_state.register_numbered(index)
         }
-        PlaceholderType::ColonNamed(name)
-        | PlaceholderType::AtNamed(name)
-        | PlaceholderType::DollarNamed(name) => Err(FrankenError::NotImplemented(format!(
-            "named placeholder not supported: {name}",
-        ))),
+        PlaceholderType::ColonNamed(name) => bind_state.register_named(':', name),
+        PlaceholderType::AtNamed(name) => bind_state.register_named('@', name),
+        PlaceholderType::DollarNamed(name) => bind_state.register_named('$', name),
     }
 }
 
@@ -1683,6 +1706,75 @@ mod tests {
                 SqliteValue::Integer(40),
             ]
         );
+    }
+
+    #[test]
+    fn test_query_with_params_named_placeholders_supported() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn
+            .query_with_params(
+                "SELECT :x + :y, :x;",
+                &[SqliteValue::Integer(2), SqliteValue::Integer(5)],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![SqliteValue::Integer(7), SqliteValue::Integer(2)],
+        );
+    }
+
+    #[test]
+    fn test_query_with_params_named_placeholder_reuse_does_not_consume_extra_slot() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn
+            .query_with_params(
+                "SELECT :x, :x, :x;",
+                &[SqliteValue::Text("same".to_owned())],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![
+                SqliteValue::Text("same".to_owned()),
+                SqliteValue::Text("same".to_owned()),
+                SqliteValue::Text("same".to_owned()),
+            ],
+        );
+    }
+
+    #[test]
+    fn test_query_with_params_named_prefixes_are_distinct() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn
+            .query_with_params(
+                "SELECT :x, @x, $x;",
+                &[
+                    SqliteValue::Integer(11),
+                    SqliteValue::Integer(22),
+                    SqliteValue::Integer(33),
+                ],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![
+                SqliteValue::Integer(11),
+                SqliteValue::Integer(22),
+                SqliteValue::Integer(33),
+            ],
+        );
+    }
+
+    #[test]
+    fn test_query_with_params_named_placeholders_missing_required_param_rejected() {
+        let conn = Connection::open(":memory:").unwrap();
+        let error = conn
+            .query_with_params("SELECT :x + :y;", &[SqliteValue::Integer(1)])
+            .expect_err("missing named parameter should fail");
+        assert!(matches!(error, FrankenError::OutOfRange { .. }));
     }
 
     #[test]

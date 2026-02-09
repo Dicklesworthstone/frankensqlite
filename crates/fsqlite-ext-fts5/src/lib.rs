@@ -285,9 +285,16 @@ impl Fts5Tokenizer for AsciiTokenizer {
 
 /// Porter stemmer tokenizer: wraps another tokenizer and applies Porter
 /// stemming to each term.
-#[derive(Debug)]
 pub struct PorterTokenizer {
     inner: Box<dyn Fts5Tokenizer>,
+}
+
+impl std::fmt::Debug for PorterTokenizer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PorterTokenizer")
+            .field("inner", &self.inner.name())
+            .finish()
+    }
 }
 
 impl PorterTokenizer {
