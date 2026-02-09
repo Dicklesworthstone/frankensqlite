@@ -6,11 +6,13 @@
 
 pub mod commit_pipeline;
 pub mod eprocess;
+pub mod fault_vfs;
 pub mod fslab;
 pub mod log;
 pub mod oracle;
 pub mod perf_loop;
 pub mod scheduler;
+pub mod seed_taxonomy;
 pub mod spec_to_beads_audit;
 pub mod supervision;
 pub mod tla;

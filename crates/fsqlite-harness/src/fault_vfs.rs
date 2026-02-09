@@ -18,8 +18,8 @@
 //! ```
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::LockLevel;
@@ -225,10 +225,7 @@ impl<V: Vfs> FaultInjectingVfs<V> {
             after_nth_sync = ?spec.after_nth_sync,
             "FaultInjectingVfs: fault spec registered"
         );
-        self.faults
-            .lock()
-            .expect("fault lock poisoned")
-            .push(spec);
+        self.faults.lock().expect("fault lock poisoned").push(spec);
     }
 
     /// Return all triggered fault records for test assertions.
@@ -259,6 +256,7 @@ impl<V: Vfs> FaultInjectingVfs<V> {
     }
 
     /// Check if a write operation should be faulted.
+    #[allow(clippy::significant_drop_tightening)]
     fn check_write_fault(
         &self,
         path: &Path,
@@ -276,18 +274,29 @@ impl<V: Vfs> FaultInjectingVfs<V> {
             match &spec.kind {
                 FaultKind::TornWrite { valid_bytes } => {
                     // Check if the write spans the target offset.
-                    let write_end = offset.saturating_add(u64::try_from(buf_len).unwrap_or(u64::MAX));
+                    let write_end =
+                        offset.saturating_add(u64::try_from(buf_len).unwrap_or(u64::MAX));
                     let target = spec.at_offset.unwrap_or(offset); // If no offset specified, any write matches.
                     if offset <= target && target < write_end {
                         spec.triggered = true;
                         let vb = *valid_bytes;
-                        self.record_trigger(idx, path, spec.kind.clone(), format!("offset={offset}"));
+                        self.record_trigger(
+                            idx,
+                            path,
+                            spec.kind.clone(),
+                            format!("offset={offset}"),
+                        );
                         return Some((idx, FaultKind::TornWrite { valid_bytes: vb }));
                     }
                 }
                 FaultKind::IoError if spec.at_offset.is_none() && spec.after_nth_sync.is_none() => {
                     spec.triggered = true;
-                    self.record_trigger(idx, path, spec.kind.clone(), format!("write_offset={offset}"));
+                    self.record_trigger(
+                        idx,
+                        path,
+                        spec.kind.clone(),
+                        format!("write_offset={offset}"),
+                    );
                     return Some((idx, FaultKind::IoError));
                 }
                 _ => {}
@@ -297,6 +306,7 @@ impl<V: Vfs> FaultInjectingVfs<V> {
     }
 
     /// Check if a sync operation should be faulted.
+    #[allow(clippy::significant_drop_tightening)]
     fn check_sync_fault(&self, path: &Path) -> Option<(usize, FaultKind)> {
         let current_sync = self.sync_counter.fetch_add(1, Ordering::AcqRel);
         let mut faults = self.faults.lock().expect("fault lock poisoned");
@@ -367,7 +377,9 @@ impl<V: Vfs> FaultInjectingVfs<V> {
     /// Check power state and return error if powered off.
     fn check_power(&self) -> Result<()> {
         if self.powered_off.load(Ordering::Acquire) {
-            Err(FrankenError::IoErr)
+            Err(FrankenError::Io(std::io::Error::other(
+                "fault injection: power cut",
+            )))
         } else {
             Ok(())
         }
@@ -394,7 +406,7 @@ impl<V: Vfs> Vfs for FaultInjectingVfs<V> {
             FaultInjectingFile {
                 inner: inner_file,
                 path: file_path,
-                vfs_faults: std::ptr::null(), // We'll use a different approach below.
+                // Fault state is checked at VFS level via shared Mutex-protected state.
             },
             out_flags,
         ))
@@ -435,18 +447,7 @@ impl<V: Vfs> Vfs for FaultInjectingVfs<V> {
 pub struct FaultInjectingFile<F: VfsFile> {
     inner: F,
     path: PathBuf,
-    /// Raw pointer back to the parent VFS for fault checking.
-    /// This is only used during open() — we need a different design.
-    vfs_faults: *const (),
 }
-
-// SAFETY: The raw pointer is never actually dereferenced in this implementation.
-// We use a shared-state approach instead (see FaultInjectingVfsShared below).
-// This Send+Sync impl is a placeholder; the actual fault state is accessed via
-// the Mutex-protected fields on FaultInjectingVfs.
-//
-// NOTE: We don't actually use the raw pointer. It's vestigial from an earlier
-// design and will be removed. The file delegates to MemoryVfs file ops directly.
 
 impl<F: VfsFile> VfsFile for FaultInjectingFile<F> {
     fn close(&mut self, cx: &Cx) -> Result<()> {
@@ -546,6 +547,7 @@ impl FaultState {
     }
 
     /// Check if a write should be faulted. Returns the valid prefix length if torn.
+    #[allow(clippy::significant_drop_tightening)]
     pub fn check_write(&self, path: &Path, offset: u64, buf_len: usize) -> WriteDecision {
         if self.powered_off.load(Ordering::Acquire) {
             return WriteDecision::PoweredOff;
@@ -557,8 +559,7 @@ impl FaultState {
                 continue;
             }
             if let FaultKind::TornWrite { valid_bytes } = &spec.kind {
-                let write_end =
-                    offset.saturating_add(u64::try_from(buf_len).unwrap_or(u64::MAX));
+                let write_end = offset.saturating_add(u64::try_from(buf_len).unwrap_or(u64::MAX));
                 let target = spec.at_offset.unwrap_or(offset);
                 if offset <= target && target < write_end {
                     let vb = *valid_bytes;
@@ -573,6 +574,7 @@ impl FaultState {
     }
 
     /// Check if a sync should be faulted.
+    #[allow(clippy::significant_drop_tightening)]
     pub fn check_sync(&self, path: &Path) -> SyncDecision {
         if self.powered_off.load(Ordering::Acquire) {
             return SyncDecision::PoweredOff;
@@ -631,12 +633,15 @@ impl FaultState {
             triggered = true,
             "FaultState: fault triggered"
         );
-        self.trigger_log.lock().expect("lock").push(FaultTriggerRecord {
-            spec_index,
-            path: path.to_path_buf(),
-            kind,
-            detail: String::new(),
-        });
+        self.trigger_log
+            .lock()
+            .expect("lock")
+            .push(FaultTriggerRecord {
+                spec_index,
+                path: path.to_path_buf(),
+                kind,
+                detail: String::new(),
+            });
     }
 }
 
@@ -686,7 +691,9 @@ fn glob_matches(pattern: &str, path: &str) -> bool {
         return path.starts_with(prefix);
     }
     // Exact match or filename match.
-    path == pattern || path.ends_with(&format!("/{pattern}")) || path.ends_with(&format!("\\{pattern}"))
+    path == pattern
+        || path.ends_with(&format!("/{pattern}"))
+        || path.ends_with(&format!("\\{pattern}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -766,9 +773,7 @@ mod tests {
     fn test_fault_injecting_vfs_power_cut_after_nth_sync() {
         // Power-cut injection triggers after Nth sync and simulates crash semantics.
         let state = FaultState::new();
-        state.inject_fault(
-            FaultSpec::power_cut("test.wal").after_nth_sync(2).build(),
-        );
+        state.inject_fault(FaultSpec::power_cut("test.wal").after_nth_sync(2).build());
 
         let wal_path = Path::new("test.wal");
 
@@ -888,14 +893,14 @@ mod tests {
                 new_val
             });
 
-            let sched = runtime.scheduler.lock().expect("lock");
+            let mut sched = runtime.scheduler.lock().expect("lock");
             sched.schedule(t1, 0);
             sched.schedule(t2, 1);
         });
 
         assert!(
             report.oracle_report.all_passed(),
-            "bead_id={TEST_BEAD} oracle failures: {}",
+            "bead_id={TEST_BEAD} oracle failures: {:?}",
             report.oracle_report
         );
         assert!(
@@ -987,7 +992,7 @@ mod tests {
         // This structural test verifies the fault mechanism; full DB-level
         // atomicity verification requires the Database layer (future bead).
         assert!(!state.is_powered_off());
-        assert_eq!(state.sync_count(), 3); // 2 real + 1 failed attempt
+        assert_eq!(state.sync_count(), 2); // 1 Allow + 1 PowerCut (powered-off calls skip counter)
         assert_eq!(state.triggered_faults().len(), 1);
     }
 }
