@@ -199,7 +199,7 @@ impl Model for ViewerModel {
         self.render_top_bar(frame, top);
         self.render_list(frame, list_area);
         self.render_detail(frame, detail_area);
-        self.render_footer(frame, footer);
+        Self::render_footer(frame, footer);
     }
 }
 
@@ -257,8 +257,7 @@ impl ViewerModel {
         }
     }
 
-    #[allow(clippy::unused_self)]
-    fn render_footer(&self, frame: &mut ftui::Frame, area: Rect) {
+    fn render_footer(frame: &mut ftui::Frame, area: Rect) {
         Paragraph::new(
             " Up/Down: navigate | Tab: switch tab | PgUp/PgDn: page | q/Esc: quit".to_owned(),
         )
@@ -816,14 +815,13 @@ impl ViewerModel {
                         break;
                     }
                     let label_str = format!("  {label} ");
-                    #[allow(clippy::cast_possible_truncation)]
-                    let label_w = label_str.len() as u16;
+                    let label_w = u16::try_from(label_str.len()).unwrap_or(u16::MAX).min(w);
                     Paragraph::new(label_str)
                         .style(Style::new().fg(PackedRgba::rgb(160, 160, 160)))
-                        .render(Rect::new(x, y, label_w.min(w), 1), frame);
+                        .render(Rect::new(x, y, label_w, 1), frame);
 
-                    let bar_x = x + label_w;
-                    let bar_w = w.saturating_sub(label_w + 12);
+                    let bar_x = x.saturating_add(label_w);
+                    let bar_w = w.saturating_sub(label_w.saturating_add(12));
                     if bar_w > 2 {
                         ProgressBar::new()
                             .ratio(val / max_ms)
@@ -832,11 +830,14 @@ impl ViewerModel {
                     }
 
                     let val_str = format!(" {val:.2}ms");
-                    let val_x = bar_x + bar_w;
-                    if val_x < x + w {
+                    let val_x = bar_x.saturating_add(bar_w);
+                    if val_x < x.saturating_add(w) {
                         Paragraph::new(val_str)
                             .style(Style::new().fg(PackedRgba::rgb(200, 200, 200)))
-                            .render(Rect::new(val_x, y, w.saturating_sub(val_x - x), 1), frame);
+                            .render(
+                                Rect::new(val_x, y, w.saturating_sub(val_x.saturating_sub(x)), 1),
+                                frame,
+                            );
                     }
                     y += 1;
                 }
@@ -1010,4 +1011,207 @@ fn main() -> std::io::Result<()> {
 
     let model = ViewerModel::new(all_runs, all_benchmarks);
     App::new(model).screen_mode(ScreenMode::AltScreen).run()
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_run() -> RunRecordV1 {
+        use fsqlite_e2e::methodology::EnvironmentMeta;
+        use fsqlite_e2e::report::{
+            CorrectnessReport, EngineInfo, EngineRunReport, RunRecordV1Args,
+        };
+
+        RunRecordV1::new(RunRecordV1Args {
+            recorded_unix_ms: 1_700_000_000_000,
+            environment: EnvironmentMeta::capture("test"),
+            engine: EngineInfo {
+                name: "fsqlite".to_owned(),
+                sqlite_version: None,
+                fsqlite_git: None,
+            },
+            fixture_id: "test-fixture".to_owned(),
+            golden_path: None,
+            golden_sha256: None,
+            workload: "commutative_inserts".to_owned(),
+            concurrency: 4,
+            ops_count: 10_000,
+            report: EngineRunReport {
+                wall_time_ms: 1234,
+                ops_total: 10_000,
+                ops_per_sec: 8_103.7,
+                retries: 0,
+                aborts: 0,
+                correctness: CorrectnessReport {
+                    raw_sha256_match: Some(true),
+                    dump_match: None,
+                    canonical_sha256_match: Some(true),
+                    integrity_check_ok: Some(true),
+                    raw_sha256: Some("abc123".to_owned()),
+                    canonical_sha256: Some("def456".to_owned()),
+                    logical_sha256: None,
+                    notes: None,
+                },
+                latency_ms: None,
+                error: None,
+            },
+        })
+    }
+
+    #[test]
+    fn format_ops_ranges() {
+        assert_eq!(format_ops(500.0), "500");
+        assert_eq!(format_ops(1_500.0), "1.5K");
+        assert_eq!(format_ops(2_500_000.0), "2.5M");
+    }
+
+    #[test]
+    fn format_f64_ranges() {
+        assert_eq!(format_f64(0.5), "0.500");
+        assert_eq!(format_f64(12.5), "12.50");
+        assert_eq!(format_f64(1500.0), "1500");
+    }
+
+    #[test]
+    fn truncate_short() {
+        assert_eq!(truncate("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_exact() {
+        assert_eq!(truncate("hello", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_long() {
+        let result = truncate("hello world foo", 10);
+        assert!(result.ends_with("..."));
+        assert!(result.len() <= 10);
+    }
+
+    #[test]
+    fn model_new_defaults_to_runs_tab() {
+        let model = ViewerModel::new(vec![sample_run()], Vec::new());
+        assert_eq!(model.tab, Tab::Runs);
+        assert_eq!(model.run_selected, 0);
+    }
+
+    #[test]
+    fn model_new_defaults_to_benchmarks_when_no_runs() {
+        let model = ViewerModel::new(Vec::new(), Vec::new());
+        assert_eq!(model.tab, Tab::Runs); // Still Runs when both empty.
+    }
+
+    #[test]
+    fn model_navigation_up_down() {
+        let mut model =
+            ViewerModel::new(vec![sample_run(), sample_run(), sample_run()], Vec::new());
+
+        model.move_down();
+        assert_eq!(model.run_selected, 1);
+
+        model.move_down();
+        assert_eq!(model.run_selected, 2);
+
+        model.move_down();
+        assert_eq!(model.run_selected, 2); // Clamped at end.
+
+        model.move_up();
+        assert_eq!(model.run_selected, 1);
+
+        model.move_up();
+        assert_eq!(model.run_selected, 0);
+
+        model.move_up();
+        assert_eq!(model.run_selected, 0); // Clamped at start.
+    }
+
+    #[test]
+    fn model_page_navigation() {
+        let runs: Vec<RunRecordV1> = (0..25).map(|_| sample_run()).collect();
+        let mut model = ViewerModel::new(runs, Vec::new());
+
+        model.page_down();
+        assert_eq!(model.run_selected, 10);
+
+        model.page_down();
+        assert_eq!(model.run_selected, 20);
+
+        model.page_down();
+        assert_eq!(model.run_selected, 24); // Clamped at end.
+
+        model.page_up();
+        assert_eq!(model.run_selected, 14);
+
+        model.page_up();
+        assert_eq!(model.run_selected, 4);
+
+        model.page_up();
+        assert_eq!(model.run_selected, 0); // Clamped at start.
+    }
+
+    #[test]
+    fn model_tab_switch() {
+        let mut model = ViewerModel::new(vec![sample_run()], Vec::new());
+        assert_eq!(model.tab, Tab::Runs);
+
+        model.tab = match model.tab {
+            Tab::Runs => Tab::Benchmarks,
+            Tab::Benchmarks => Tab::Runs,
+        };
+        assert_eq!(model.tab, Tab::Benchmarks);
+    }
+
+    #[test]
+    fn model_empty_navigation_safe() {
+        let mut model = ViewerModel::new(Vec::new(), Vec::new());
+        model.move_down();
+        assert_eq!(model.run_selected, 0);
+        model.move_up();
+        assert_eq!(model.run_selected, 0);
+        model.page_down();
+        assert_eq!(model.run_selected, 0);
+        model.page_up();
+        assert_eq!(model.run_selected, 0);
+    }
+
+    #[test]
+    fn msg_from_event_quit() {
+        let msg = Msg::from(Event::Key(ftui::KeyEvent {
+            code: KeyCode::Char('q'),
+            kind: KeyEventKind::Press,
+            modifiers: ftui::Modifiers::empty(),
+        }));
+        assert!(matches!(msg, Msg::Quit));
+    }
+
+    #[test]
+    fn msg_from_event_navigation() {
+        let down = Msg::from(Event::Key(ftui::KeyEvent {
+            code: KeyCode::Char('j'),
+            kind: KeyEventKind::Press,
+            modifiers: ftui::Modifiers::empty(),
+        }));
+        assert!(matches!(down, Msg::Down));
+
+        let up = Msg::from(Event::Key(ftui::KeyEvent {
+            code: KeyCode::Char('k'),
+            kind: KeyEventKind::Press,
+            modifiers: ftui::Modifiers::empty(),
+        }));
+        assert!(matches!(up, Msg::Up));
+    }
+
+    #[test]
+    fn msg_from_event_tab() {
+        let tab = Msg::from(Event::Key(ftui::KeyEvent {
+            code: KeyCode::Tab,
+            kind: KeyEventKind::Press,
+            modifiers: ftui::Modifiers::empty(),
+        }));
+        assert!(matches!(tab, Msg::SwitchTab));
+    }
 }
