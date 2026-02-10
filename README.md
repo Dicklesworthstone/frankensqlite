@@ -130,6 +130,17 @@ FrankenSQLite is organized as a 23-crate Cargo workspace with strict layered dep
 
 ---
 
+## Current Implementation Status
+
+This README describes the target end-state architecture. The runnable code today still uses the Phase 4 in-memory query engine:
+
+- Public entry point: `fsqlite::Connection` (`crates/fsqlite/src/lib.rs`), implemented by `fsqlite-core::Connection` (`crates/fsqlite-core/src/connection.rs`).
+- Execution backend: table storage is backed by `fsqlite-vdbe::engine::MemDatabase` and executed via `fsqlite-vdbe::VdbeEngine` (`crates/fsqlite-vdbe/src/engine.rs`).
+- Persistence: for non-`:memory:` paths, `Connection` persists by writing/loading a SQL dump of schema + data (not WAL/file-format persistence yet).
+- Storage stack status: `fsqlite-vfs`, `fsqlite-pager`, `fsqlite-wal`, `fsqlite-mvcc`, and `fsqlite-btree` exist and have extensive tests, and `fsqlite-vdbe` has early "storage cursor" support behind a flag, but `Connection` is not yet wired to use the pager/WAL/B-tree stack as its default backend (see Phase 5+ below).
+
+---
+
 ## MVCC: How Concurrent Writers Work
 
 ### The Write Path
