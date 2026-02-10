@@ -3192,6 +3192,7 @@ EXIT CODES:
     let _ = io::stdout().write_all(text.as_bytes());
 }
 
+#[allow(clippy::too_many_lines)]
 fn cmd_compare(argv: &[String]) -> i32 {
     if argv.iter().any(|a| a == "-h" || a == "--help") {
         print_compare_help();

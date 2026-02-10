@@ -18,13 +18,13 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::HarnessSettings;
 use crate::benchmark::{BenchmarkConfig, BenchmarkMeta, BenchmarkSummary, run_benchmark};
 use crate::fsqlite_executor::run_oplog_fsqlite;
 use crate::oplog::{self, OpLog};
 use crate::report::EngineRunReport;
 use crate::run_workspace::{WorkspaceConfig, create_workspace_with_label};
 use crate::sqlite_executor::run_oplog_sqlite;
-use crate::HarnessSettings;
 
 // ── Configuration ──────────────────────────────────────────────────────
 
@@ -213,23 +213,23 @@ pub fn generate_oplog(
             concurrency,
             scale,
         )),
-        "deterministic_transform" => {
-            Some(oplog::preset_deterministic_transform(fixture_id, seed, scale))
-        }
-        "large_txn" => Some(oplog::preset_large_txn(fixture_id, seed, concurrency, scale)),
-        "schema_migration" => Some(oplog::preset_schema_migration(fixture_id, seed, scale)),
-        "btree_stress_sequential" => {
-            Some(oplog::preset_btree_stress_sequential(fixture_id, seed, scale))
-        }
-        "wide_row_overflow" => Some(oplog::preset_wide_row_overflow(
+        "deterministic_transform" => Some(oplog::preset_deterministic_transform(
+            fixture_id, seed, scale,
+        )),
+        "large_txn" => Some(oplog::preset_large_txn(
             fixture_id,
             seed,
+            concurrency,
             scale,
-            2000,
         )),
-        "bulk_delete_reinsert" => {
-            Some(oplog::preset_bulk_delete_reinsert(fixture_id, seed, scale))
-        }
+        "schema_migration" => Some(oplog::preset_schema_migration(fixture_id, seed, scale)),
+        "btree_stress_sequential" => Some(oplog::preset_btree_stress_sequential(
+            fixture_id, seed, scale,
+        )),
+        "wide_row_overflow" => Some(oplog::preset_wide_row_overflow(
+            fixture_id, seed, scale, 2000,
+        )),
+        "bulk_delete_reinsert" => Some(oplog::preset_bulk_delete_reinsert(fixture_id, seed, scale)),
         "scatter_write" => Some(oplog::preset_scatter_write(
             fixture_id,
             seed,
@@ -246,28 +246,22 @@ pub fn generate_oplog(
 // ── Cell execution ─────────────────────────────────────────────────────
 
 /// Run a single matrix cell through the benchmark runner.
-fn run_cell(
-    cell: &MatrixCell,
-    config: &PerfMatrixConfig,
-) -> CellOutcome {
-    let oplog = match generate_oplog(
+fn run_cell(cell: &MatrixCell, config: &PerfMatrixConfig) -> CellOutcome {
+    let Some(oplog) = generate_oplog(
         &cell.workload,
         &cell.fixture_id,
         config.seed,
         cell.concurrency,
         config.scale,
-    ) {
-        Some(log) => log,
-        None => {
-            return CellOutcome {
-                summary: None,
-                error: Some(format!("unknown workload preset: {}", cell.workload)),
-                engine: cell.engine.as_str().to_owned(),
-                fixture_id: cell.fixture_id.clone(),
-                workload: cell.workload.clone(),
-                concurrency: cell.concurrency,
-            };
-        }
+    ) else {
+        return CellOutcome {
+            summary: None,
+            error: Some(format!("unknown workload preset: {}", cell.workload)),
+            engine: cell.engine.as_str().to_owned(),
+            fixture_id: cell.fixture_id.clone(),
+            workload: cell.workload.clone(),
+            concurrency: cell.concurrency,
+        };
     };
 
     let meta = BenchmarkMeta {
@@ -323,13 +317,12 @@ fn run_single_iteration(
     let label = format!("perf_{engine}_{fixture_id}_iter{iteration_idx}");
     let workspace = create_workspace_with_label(workspace_config, &[fixture_id], &label)?;
 
-    let db = workspace
-        .databases
-        .first()
-        .ok_or_else(|| crate::E2eError::Io(std::io::Error::new(
+    let db = workspace.databases.first().ok_or_else(|| {
+        crate::E2eError::Io(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             format!("fixture not found in workspace: {fixture_id}"),
-        )))?;
+        ))
+    })?;
 
     match engine {
         Engine::Sqlite3 => {
@@ -358,12 +351,7 @@ pub fn run_perf_matrix(config: &PerfMatrixConfig) -> PerfResult {
     let mut error_count = 0usize;
 
     for (i, cell) in cells.iter().enumerate() {
-        eprintln!(
-            "[perf] ({}/{}) running {}",
-            i + 1,
-            total,
-            cell,
-        );
+        eprintln!("[perf] ({}/{}) running {}", i + 1, total, cell,);
 
         let outcome = run_cell(cell, config);
 
@@ -401,9 +389,8 @@ pub fn write_results_jsonl(result: &PerfResult, path: &Path) -> std::io::Result<
     let mut file = std::fs::File::create(path)?;
     for cell in &result.cells {
         if let Some(ref summary) = cell.summary {
-            let line = serde_json::to_string(summary).map_err(|e| {
-                std::io::Error::new(std::io::ErrorKind::Other, e)
-            })?;
+            let line = serde_json::to_string(summary)
+                .map_err(std::io::Error::other)?;
             writeln!(file, "{line}")?;
         }
     }
@@ -444,12 +431,16 @@ mod tests {
         assert_eq!(cells.len(), 8);
 
         // Verify all combinations are present.
-        assert!(cells.iter().any(|c| c.engine == Engine::Sqlite3
-            && c.fixture_id == "fix1"
-            && c.concurrency == 1));
-        assert!(cells.iter().any(|c| c.engine == Engine::Fsqlite
-            && c.fixture_id == "fix2"
-            && c.concurrency == 4));
+        assert!(
+            cells.iter().any(|c| c.engine == Engine::Sqlite3
+                && c.fixture_id == "fix1"
+                && c.concurrency == 1)
+        );
+        assert!(
+            cells.iter().any(|c| c.engine == Engine::Fsqlite
+                && c.fixture_id == "fix2"
+                && c.concurrency == 4)
+        );
     }
 
     #[test]
