@@ -322,6 +322,7 @@ impl Connection {
 
     /// Execute a parsed statement, handling both DDL (CREATE TABLE) and
     /// DML (SELECT/INSERT/UPDATE/DELETE).
+    #[allow(clippy::too_many_lines)]
     fn execute_statement(
         &self,
         statement: Statement,
