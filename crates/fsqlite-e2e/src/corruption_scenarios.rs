@@ -139,10 +139,11 @@ impl ScenarioCorruptionPattern {
                 frame_index,
                 bit_position,
             } => {
-                // Frame data starts at WAL_HEADER(32) + frame_index * (24 + 4096) + 24
-                let frame_data_offset = 32 + u64::from(*frame_index) * (24 + 4096) + 24 + 100; // offset 100 into payload
-                CorruptionPattern::BitFlip {
-                    byte_offset: frame_data_offset,
+                // Flip within the frame payload at a fixed offset (100) so this is independent
+                // of WAL file layout details (page size is handled by the injector).
+                CorruptionPattern::WalFrameBitFlip {
+                    frame_index: *frame_index,
+                    byte_offset_within_payload: 100,
                     bit_position: *bit_position,
                 }
             }
@@ -476,7 +477,7 @@ mod tests {
             bit_position: 3,
         };
         let cp = pat.to_corruption_pattern(0, 10);
-        assert!(matches!(cp, CorruptionPattern::BitFlip { .. }));
+        assert!(matches!(cp, CorruptionPattern::WalFrameBitFlip { .. }));
     }
 
     #[test]

@@ -10,6 +10,7 @@
 //! [`CorruptionInjector::new`] refuses paths that resolve into a `golden/`
 //! directory to prevent accidental modification of reference copies.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -38,6 +39,16 @@ const DB_HEADER_SIZE: usize = 100;
 pub enum CorruptionPattern {
     /// Flip a single bit at a specific byte offset.
     BitFlip { byte_offset: u64, bit_position: u8 },
+    /// Flip N unique bits within a region `[offset..offset+length)`.
+    ///
+    /// Deterministic: the same `(offset, length, count, seed)` always flips
+    /// the same set of bits (order-independent).
+    BitFlipMany {
+        offset: u64,
+        length: u64,
+        count: u32,
+        seed: u64,
+    },
     /// Zero out an entire page (SQLite page numbers are 1-indexed).
     PageZero { page_number: u32 },
     /// Overwrite N bytes at offset with seeded random data.
@@ -53,12 +64,42 @@ pub enum CorruptionPattern {
         length: u16,
         seed: u64,
     },
+    /// Truncate the target file to `new_len` bytes.
+    TruncateTo { new_len: u64 },
     /// Zero out the 100-byte database header (page 1, offset 0..100).
     HeaderZero,
     /// Corrupt specific WAL frames with seeded random data.
     ///
     /// Note: `frame_numbers` are 0-indexed (first frame starts at offset 32).
     WalFrameCorrupt { frame_numbers: Vec<u32>, seed: u64 },
+    /// Truncate the WAL to only the first N frames.
+    ///
+    /// The resulting WAL length is `WAL_HEADER_SIZE + frames*(24 + page_size)`.
+    WalTruncate { frames: u32 },
+    /// Flip a single bit within a WAL frame's payload.
+    ///
+    /// `frame_index` is 0-indexed. `byte_offset_within_payload` must be
+    /// `< page_size`.
+    WalFrameBitFlip {
+        frame_index: u32,
+        byte_offset_within_payload: u32,
+        bit_position: u8,
+    },
+    /// Flip N unique bits across WAL frames `frame_start..=frame_end`.
+    WalBitRot {
+        frame_start: u32,
+        frame_end: u32,
+        flips: u32,
+        seed: u64,
+    },
+    /// Simulate a torn write by truncating the WAL within a frame payload.
+    ///
+    /// `frame_index` is 0-indexed. The WAL will be truncated to the end of the
+    /// frame header plus `bytes_into_payload`.
+    WalTornTruncate {
+        frame_index: u32,
+        bytes_into_payload: u32,
+    },
     /// Corrupt a region of an FEC sidecar file with seeded random data.
     SidecarCorrupt {
         offset: u64,
@@ -74,6 +115,15 @@ impl fmt::Display for CorruptionPattern {
                 byte_offset,
                 bit_position,
             } => write!(f, "BitFlip(byte={byte_offset}, bit={bit_position})"),
+            Self::BitFlipMany {
+                offset,
+                length,
+                count,
+                seed,
+            } => write!(
+                f,
+                "BitFlipMany(off={offset}, len={length}, count={count}, seed={seed})"
+            ),
             Self::PageZero { page_number } => write!(f, "PageZero(page={page_number})"),
             Self::RandomOverwrite {
                 offset,
@@ -92,11 +142,37 @@ impl fmt::Display for CorruptionPattern {
                 f,
                 "PagePartialCorrupt(page={page_number}, off={offset_within_page}, len={length}, seed={seed})"
             ),
+            Self::TruncateTo { new_len } => write!(f, "TruncateTo(new_len={new_len})"),
             Self::HeaderZero => write!(f, "HeaderZero"),
             Self::WalFrameCorrupt {
                 frame_numbers,
                 seed,
             } => write!(f, "WalFrameCorrupt(frames={frame_numbers:?}, seed={seed})"),
+            Self::WalTruncate { frames } => write!(f, "WalTruncate(frames={frames})"),
+            Self::WalFrameBitFlip {
+                frame_index,
+                byte_offset_within_payload,
+                bit_position,
+            } => write!(
+                f,
+                "WalFrameBitFlip(frame={frame_index}, off={byte_offset_within_payload}, bit={bit_position})"
+            ),
+            Self::WalBitRot {
+                frame_start,
+                frame_end,
+                flips,
+                seed,
+            } => write!(
+                f,
+                "WalBitRot(frames={frame_start}..={frame_end}, flips={flips}, seed={seed})"
+            ),
+            Self::WalTornTruncate {
+                frame_index,
+                bytes_into_payload,
+            } => write!(
+                f,
+                "WalTornTruncate(frame={frame_index}, bytes_into_payload={bytes_into_payload})"
+            ),
             Self::SidecarCorrupt {
                 offset,
                 length,
@@ -108,11 +184,36 @@ impl fmt::Display for CorruptionPattern {
 
 // ── CorruptionReport ────────────────────────────────────────────────────
 
+/// A precise byte-range modification produced by an injection.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CorruptionModification {
+    /// File byte offset where the modification begins.
+    pub offset: u64,
+    /// Number of bytes modified (or removed for truncation).
+    pub length: u64,
+    /// First SQLite database page affected (1-indexed), if applicable.
+    pub page_first: Option<u32>,
+    /// Last SQLite database page affected (1-indexed), if applicable.
+    pub page_last: Option<u32>,
+    /// First WAL frame index affected (0-indexed), if applicable.
+    pub wal_frame_first: Option<u32>,
+    /// Last WAL frame index affected (0-indexed), if applicable.
+    pub wal_frame_last: Option<u32>,
+    /// SHA-256 of the exact byte range before mutation (or removed bytes for truncation).
+    pub sha256_before: String,
+    /// SHA-256 of the exact byte range after mutation (None for truncation).
+    pub sha256_after: Option<String>,
+}
+
 /// Report documenting exactly what a corruption injection changed.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CorruptionReport {
+    /// Stable scenario id string derived from the pattern parameters.
+    pub scenario_id: String,
     /// The pattern that was applied.
     pub pattern: CorruptionPattern,
+    /// Precise modified ranges.
+    pub modifications: Vec<CorruptionModification>,
     /// Number of bytes actually modified.
     pub affected_bytes: u64,
     /// SQLite page numbers that were affected (1-indexed).
@@ -189,8 +290,9 @@ impl CorruptionInjector {
         }
 
         let ps = self.page_size as usize;
+        let scenario_id = pattern.scenario_id();
 
-        let (affected_bytes, affected_pages, original_region) = match pattern {
+        let (affected_bytes, affected_pages, original_region, modifications) = match pattern {
             CorruptionPattern::BitFlip {
                 byte_offset,
                 bit_position,
@@ -209,10 +311,143 @@ impl CorruptionInjector {
                         format!("byte_offset {off} exceeds file size {}", data.len()),
                     )));
                 }
-                let original = vec![data[off]];
+                let original = [data[off]];
                 data[off] ^= 1 << bit_position;
                 let page = (off / ps) + 1;
-                (1, vec![page as u32], original)
+                let modification = CorruptionModification {
+                    offset: *byte_offset,
+                    length: 1,
+                    page_first: Some(page as u32),
+                    page_last: Some(page as u32),
+                    wal_frame_first: None,
+                    wal_frame_last: None,
+                    sha256_before: sha256_hex(&original),
+                    sha256_after: Some(sha256_hex(&[data[off]])),
+                };
+                (1, vec![page as u32], original.to_vec(), vec![modification])
+            }
+
+            CorruptionPattern::BitFlipMany {
+                offset,
+                length,
+                count,
+                seed,
+            } => {
+                let off = usize::try_from(*offset).map_err(|_| {
+                    E2eError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "offset overflow",
+                    ))
+                })?;
+                let len = usize::try_from(*length).map_err(|_| {
+                    E2eError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "length overflow",
+                    ))
+                })?;
+                if len == 0 {
+                    return Err(E2eError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "length must be > 0",
+                    )));
+                }
+                let end = off.checked_add(len).ok_or_else(|| {
+                    E2eError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "offset+length overflow",
+                    ))
+                })?;
+                if end > data.len() {
+                    return Err(E2eError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("range {off}..{end} exceeds file size {}", data.len()),
+                    )));
+                }
+
+                if *count == 0 {
+                    return Err(E2eError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "count must be > 0",
+                    )));
+                }
+                let max_unique_bits = u64::try_from(len).unwrap_or(u64::MAX).saturating_mul(8);
+                if u64::from(*count) > max_unique_bits {
+                    return Err(E2eError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "count {count} exceeds max unique bits in region ({max_unique_bits})"
+                        ),
+                    )));
+                }
+
+                let mut rng = StdRng::seed_from_u64(*seed);
+                let mut flips = BTreeSet::<(usize, u8)>::new();
+                let target = usize::try_from(*count).map_err(|_| {
+                    E2eError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "count overflow",
+                    ))
+                })?;
+                while flips.len() < target {
+                    let byte_idx = off + rng.gen_range(0..len);
+                    let bit_idx = rng.gen_range(0..8u8);
+                    flips.insert((byte_idx, bit_idx));
+                }
+
+                let mut byte_indices: Vec<usize> = flips.iter().map(|(b, _)| *b).collect();
+                byte_indices.sort_unstable();
+                byte_indices.dedup();
+
+                // Capture originals per contiguous range.
+                let mut original_region = Vec::new();
+                let mut ranges: Vec<(usize, usize, Vec<u8>)> = Vec::new(); // (start, end_exclusive, original)
+                let mut i = 0usize;
+                while i < byte_indices.len() {
+                    let start = byte_indices[i];
+                    let mut end_inclusive = start;
+                    i += 1;
+                    while i < byte_indices.len() && byte_indices[i] == end_inclusive + 1 {
+                        end_inclusive += 1;
+                        i += 1;
+                    }
+                    let end_exclusive = end_inclusive
+                        .checked_add(1)
+                        .expect("end_inclusive derived from valid index");
+                    let original = data[start..end_exclusive].to_vec();
+                    original_region.extend_from_slice(&original);
+                    ranges.push((start, end_exclusive, original));
+                }
+
+                for (byte_idx, bit_idx) in flips {
+                    data[byte_idx] ^= 1 << bit_idx;
+                }
+
+                let mut affected_pages = Vec::new();
+                let mut modifications = Vec::new();
+                for (start, end_exclusive, original) in ranges {
+                    affected_pages.extend(pages_in_range(start, end_exclusive, ps));
+                    let (page_first, page_last) = page_span_for_range(start, end_exclusive, ps);
+                    modifications.push(CorruptionModification {
+                        offset: u64::try_from(start).unwrap_or(u64::MAX),
+                        length: u64::try_from(end_exclusive - start).unwrap_or(u64::MAX),
+                        page_first,
+                        page_last,
+                        wal_frame_first: None,
+                        wal_frame_last: None,
+                        sha256_before: sha256_hex(&original),
+                        sha256_after: Some(sha256_hex(&data[start..end_exclusive])),
+                    });
+                }
+                affected_pages.sort_unstable();
+                affected_pages.dedup();
+
+                let affected_bytes = modifications.iter().map(|m| m.length).sum::<u64>();
+                (
+                    affected_bytes,
+                    affected_pages,
+                    original_region,
+                    modifications,
+                )
             }
 
             CorruptionPattern::PageZero { page_number } => {
@@ -243,7 +478,17 @@ impl CorruptionInjector {
                 }
                 let original = data[start..end].to_vec();
                 data[start..end].fill(0);
-                (ps as u64, vec![*page_number], original)
+                let modification = CorruptionModification {
+                    offset: u64::try_from(start).unwrap_or(u64::MAX),
+                    length: u64::try_from(ps).unwrap_or(u64::MAX),
+                    page_first: Some(*page_number),
+                    page_last: Some(*page_number),
+                    wal_frame_first: None,
+                    wal_frame_last: None,
+                    sha256_before: sha256_hex(&original),
+                    sha256_after: Some(sha256_hex(&data[start..end])),
+                };
+                (ps as u64, vec![*page_number], original, vec![modification])
             }
 
             CorruptionPattern::RandomOverwrite {
@@ -274,8 +519,28 @@ impl CorruptionInjector {
                 for b in &mut data[off..end] {
                     *b = rng.r#gen();
                 }
-                let pages = pages_in_range(off, end, ps);
-                ((*length) as u64, pages, original)
+                let is_sidecar = matches!(pattern, CorruptionPattern::SidecarCorrupt { .. });
+                let pages = if is_sidecar {
+                    Vec::new()
+                } else {
+                    pages_in_range(off, end, ps)
+                };
+                let (page_first, page_last) = if is_sidecar {
+                    (None, None)
+                } else {
+                    page_span_for_range(off, end, ps)
+                };
+                let modification = CorruptionModification {
+                    offset: *offset,
+                    length: u64::try_from(*length).unwrap_or(u64::MAX),
+                    page_first,
+                    page_last,
+                    wal_frame_first: None,
+                    wal_frame_last: None,
+                    sha256_before: sha256_hex(&original),
+                    sha256_after: Some(sha256_hex(&data[off..end])),
+                };
+                ((*length) as u64, pages, original, vec![modification])
             }
 
             CorruptionPattern::PagePartialCorrupt {
@@ -337,14 +602,78 @@ impl CorruptionInjector {
                 for b in &mut data[start..end] {
                     *b = rng.r#gen();
                 }
-                (length as u64, vec![*page_number], original)
+                let modification = CorruptionModification {
+                    offset: u64::try_from(start).unwrap_or(u64::MAX),
+                    length: u64::try_from(length).unwrap_or(u64::MAX),
+                    page_first: Some(*page_number),
+                    page_last: Some(*page_number),
+                    wal_frame_first: None,
+                    wal_frame_last: None,
+                    sha256_before: sha256_hex(&original),
+                    sha256_after: Some(sha256_hex(&data[start..end])),
+                };
+                (
+                    length as u64,
+                    vec![*page_number],
+                    original,
+                    vec![modification],
+                )
+            }
+
+            CorruptionPattern::TruncateTo { new_len } => {
+                let new_len_usize = usize::try_from(*new_len).map_err(|_| {
+                    E2eError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "new_len overflow",
+                    ))
+                })?;
+                if new_len_usize >= data.len() {
+                    return Err(E2eError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("new_len {new_len} must be < file size {}", data.len()),
+                    )));
+                }
+
+                let original = data[new_len_usize..].to_vec();
+                let end = data.len();
+                data.truncate(new_len_usize);
+
+                let pages = pages_in_range(new_len_usize, end, ps);
+                let (page_first, page_last) = page_span_for_range(new_len_usize, end, ps);
+                let modification = CorruptionModification {
+                    offset: *new_len,
+                    length: u64::try_from(end - new_len_usize).unwrap_or(u64::MAX),
+                    page_first,
+                    page_last,
+                    wal_frame_first: None,
+                    wal_frame_last: None,
+                    sha256_before: sha256_hex(&original),
+                    sha256_after: None,
+                };
+                (
+                    u64::try_from(end - new_len_usize).unwrap_or(u64::MAX),
+                    pages,
+                    original,
+                    vec![modification],
+                )
             }
 
             CorruptionPattern::HeaderZero => {
                 let end = DB_HEADER_SIZE.min(data.len());
                 let original = data[..end].to_vec();
                 data[..end].fill(0);
-                (end as u64, vec![1], original)
+                let (page_first, page_last) = page_span_for_range(0, end, ps);
+                let modification = CorruptionModification {
+                    offset: 0,
+                    length: u64::try_from(end).unwrap_or(u64::MAX),
+                    page_first,
+                    page_last,
+                    wal_frame_first: None,
+                    wal_frame_last: None,
+                    sha256_before: sha256_hex(&original),
+                    sha256_after: Some(sha256_hex(&data[..end])),
+                };
+                (end as u64, vec![1], original, vec![modification])
             }
 
             CorruptionPattern::WalFrameCorrupt {
@@ -356,6 +685,7 @@ impl CorruptionInjector {
                 let mut total_bytes = 0u64;
                 let mut all_original = Vec::new();
                 let mut affected_pages = Vec::new();
+                let mut modifications = Vec::new();
 
                 for &frame_num in frame_numbers {
                     let frame_start = WAL_HEADER_SIZE + u64::from(frame_num) * frame_size;
@@ -403,24 +733,432 @@ impl CorruptionInjector {
                     let pgno = u32::from_be_bytes(pgno_bytes);
                     affected_pages.push(pgno);
 
-                    all_original.extend_from_slice(&data[data_start..data_end]);
+                    let original = data[data_start..data_end].to_vec();
+                    all_original.extend_from_slice(&original);
                     for b in &mut data[data_start..data_end] {
                         *b = rng.r#gen();
                     }
+                    modifications.push(CorruptionModification {
+                        offset: u64::try_from(data_start).unwrap_or(u64::MAX),
+                        length: u64::from(self.page_size),
+                        page_first: Some(pgno),
+                        page_last: Some(pgno),
+                        wal_frame_first: Some(frame_num),
+                        wal_frame_last: Some(frame_num),
+                        sha256_before: sha256_hex(&original),
+                        sha256_after: Some(sha256_hex(&data[data_start..data_end])),
+                    });
                     total_bytes += u64::from(self.page_size);
                 }
 
                 affected_pages.sort_unstable();
                 affected_pages.dedup();
 
-                (total_bytes, affected_pages, all_original)
+                (total_bytes, affected_pages, all_original, modifications)
+            }
+
+            CorruptionPattern::WalTruncate { frames } => {
+                if data.len() < usize::try_from(WAL_HEADER_SIZE).unwrap_or(usize::MAX) {
+                    return Err(E2eError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "wal file too small",
+                    )));
+                }
+
+                let frame_size = WAL_FRAME_HEADER_SIZE + u64::from(self.page_size);
+                let new_len = WAL_HEADER_SIZE + u64::from(*frames) * frame_size;
+                let new_len_usize = usize::try_from(new_len).map_err(|_| {
+                    E2eError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "wal truncate length overflow",
+                    ))
+                })?;
+                if new_len_usize >= data.len() {
+                    return Err(E2eError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "wal length {} already <= truncate target {new_len}",
+                            data.len()
+                        ),
+                    )));
+                }
+
+                let original = data[new_len_usize..].to_vec();
+                let original_len = data.len();
+
+                // Determine which full frames are removed and report their db page numbers.
+                let remaining = (u64::try_from(original_len).unwrap_or(u64::MAX))
+                    .saturating_sub(WAL_HEADER_SIZE);
+                let full_frames = remaining.checked_div(frame_size).unwrap_or(0);
+
+                let start_frame = *frames;
+                let end_frame_inclusive = if full_frames == 0 {
+                    None
+                } else {
+                    u32::try_from(full_frames.saturating_sub(1)).ok()
+                };
+
+                let mut affected_pages = Vec::new();
+                let mut page_min: Option<u32> = None;
+                let mut page_max: Option<u32> = None;
+
+                if let Some(last_full_frame) = end_frame_inclusive {
+                    if start_frame <= last_full_frame {
+                        for frame_idx in start_frame..=last_full_frame {
+                            let frame_start = WAL_HEADER_SIZE + u64::from(frame_idx) * frame_size;
+                            let hdr_start = usize::try_from(frame_start).map_err(|_| {
+                                E2eError::Io(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidInput,
+                                    "frame offset overflow",
+                                ))
+                            })?;
+                            if hdr_start + 4 <= original_len {
+                                let pgno = u32::from_be_bytes(
+                                    data[hdr_start..hdr_start + 4]
+                                        .try_into()
+                                        .unwrap_or([0_u8; 4]),
+                                );
+                                if pgno != 0 {
+                                    affected_pages.push(pgno);
+                                    page_min = Some(page_min.map_or(pgno, |p| p.min(pgno)));
+                                    page_max = Some(page_max.map_or(pgno, |p| p.max(pgno)));
+                                }
+                            }
+                        }
+                    }
+                }
+
+                affected_pages.sort_unstable();
+                affected_pages.dedup();
+
+                data.truncate(new_len_usize);
+
+                let modification = CorruptionModification {
+                    offset: new_len,
+                    length: u64::try_from(original_len - new_len_usize).unwrap_or(u64::MAX),
+                    page_first: page_min,
+                    page_last: page_max,
+                    wal_frame_first: Some(*frames),
+                    wal_frame_last: end_frame_inclusive,
+                    sha256_before: sha256_hex(&original),
+                    sha256_after: None,
+                };
+                (
+                    u64::try_from(original_len - new_len_usize).unwrap_or(u64::MAX),
+                    affected_pages,
+                    original,
+                    vec![modification],
+                )
+            }
+
+            CorruptionPattern::WalFrameBitFlip {
+                frame_index,
+                byte_offset_within_payload,
+                bit_position,
+            } => {
+                if *bit_position >= 8 {
+                    return Err(E2eError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("bit_position {bit_position} must be in 0..=7"),
+                    )));
+                }
+                if *byte_offset_within_payload >= self.page_size {
+                    return Err(E2eError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "byte_offset_within_payload exceeds page size",
+                    )));
+                }
+
+                let frame_size = WAL_FRAME_HEADER_SIZE + u64::from(self.page_size);
+                let frame_start = WAL_HEADER_SIZE + u64::from(*frame_index) * frame_size;
+                let hdr_start = usize::try_from(frame_start).map_err(|_| {
+                    E2eError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "frame offset overflow",
+                    ))
+                })?;
+                let hdr_end = hdr_start
+                    .checked_add(WAL_FRAME_HEADER_SIZE as usize)
+                    .ok_or_else(|| {
+                        E2eError::Io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "frame header end overflow",
+                        ))
+                    })?;
+                let payload_start = hdr_end;
+                let payload_end = payload_start
+                    .checked_add(self.page_size as usize)
+                    .ok_or_else(|| {
+                        E2eError::Io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "frame payload end overflow",
+                        ))
+                    })?;
+                if payload_end > data.len() {
+                    return Err(E2eError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("wal frame {frame_index} beyond file end"),
+                    )));
+                }
+
+                let pgno = if hdr_start + 4 <= data.len() {
+                    u32::from_be_bytes(
+                        data[hdr_start..hdr_start + 4]
+                            .try_into()
+                            .unwrap_or([0_u8; 4]),
+                    )
+                } else {
+                    0
+                };
+
+                let payload_off = usize::try_from(*byte_offset_within_payload).map_err(|_| {
+                    E2eError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "payload offset overflow",
+                    ))
+                })?;
+                let byte_idx = payload_start + payload_off;
+                if byte_idx >= payload_end {
+                    return Err(E2eError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "payload byte index out of range",
+                    )));
+                }
+
+                let original = [data[byte_idx]];
+                data[byte_idx] ^= 1 << *bit_position;
+
+                let modification = CorruptionModification {
+                    offset: u64::try_from(byte_idx).unwrap_or(u64::MAX),
+                    length: 1,
+                    page_first: if pgno == 0 { None } else { Some(pgno) },
+                    page_last: if pgno == 0 { None } else { Some(pgno) },
+                    wal_frame_first: Some(*frame_index),
+                    wal_frame_last: Some(*frame_index),
+                    sha256_before: sha256_hex(&original),
+                    sha256_after: Some(sha256_hex(&[data[byte_idx]])),
+                };
+                (
+                    1,
+                    if pgno == 0 { Vec::new() } else { vec![pgno] },
+                    original.to_vec(),
+                    vec![modification],
+                )
+            }
+
+            CorruptionPattern::WalBitRot {
+                frame_start,
+                frame_end,
+                flips,
+                seed,
+            } => {
+                if frame_start > frame_end {
+                    return Err(E2eError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "frame_start must be <= frame_end",
+                    )));
+                }
+                if *flips == 0 {
+                    return Err(E2eError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "flips must be > 0",
+                    )));
+                }
+
+                let frame_size = WAL_FRAME_HEADER_SIZE + u64::from(self.page_size);
+                let total_len = u64::try_from(data.len()).unwrap_or(u64::MAX);
+                let remaining = total_len.saturating_sub(WAL_HEADER_SIZE);
+                let full_frames = remaining.checked_div(frame_size).unwrap_or(0);
+                if full_frames == 0 {
+                    return Err(E2eError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "wal contains no full frames",
+                    )));
+                }
+                let last_full_frame =
+                    u32::try_from(full_frames.saturating_sub(1)).map_err(|_| {
+                        E2eError::Io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "frame index overflow",
+                        ))
+                    })?;
+                if *frame_end > last_full_frame {
+                    return Err(E2eError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("frame_end {frame_end} exceeds last full frame {last_full_frame}"),
+                    )));
+                }
+
+                let frames_count = u64::from(*frame_end - *frame_start + 1);
+                let bits_per_frame = u64::from(self.page_size).saturating_mul(8);
+                let max_bits = frames_count.saturating_mul(bits_per_frame);
+                if u64::from(*flips) > max_bits {
+                    return Err(E2eError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("flips {flips} exceeds max unique bits in range ({max_bits})"),
+                    )));
+                }
+
+                let mut rng = StdRng::seed_from_u64(*seed);
+                let mut flip_map: BTreeMap<u32, BTreeSet<(usize, u8)>> = BTreeMap::new();
+                let target = usize::try_from(*flips).map_err(|_| {
+                    E2eError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "flips overflow",
+                    ))
+                })?;
+                while flip_map.values().map(BTreeSet::len).sum::<usize>() < target {
+                    let frame_idx = rng.gen_range(*frame_start..=*frame_end);
+                    let byte_off = rng.gen_range(0..(self.page_size as usize));
+                    let bit_idx = rng.gen_range(0..8u8);
+                    flip_map
+                        .entry(frame_idx)
+                        .or_default()
+                        .insert((byte_off, bit_idx));
+                }
+
+                let mut modifications = Vec::new();
+                let mut all_original = Vec::new();
+                let mut affected_pages = Vec::new();
+
+                for (&frame_idx, flips) in &flip_map {
+                    let frame_start_off = WAL_HEADER_SIZE + u64::from(frame_idx) * frame_size;
+                    let hdr_start = usize::try_from(frame_start_off).map_err(|_| {
+                        E2eError::Io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "frame offset overflow",
+                        ))
+                    })?;
+                    let hdr_end = hdr_start + WAL_FRAME_HEADER_SIZE as usize;
+                    let payload_start = hdr_end;
+                    let payload_end = payload_start + self.page_size as usize;
+                    if payload_end > data.len() {
+                        return Err(E2eError::Io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "wal frame beyond file end",
+                        )));
+                    }
+
+                    let pgno = if hdr_start + 4 <= data.len() {
+                        u32::from_be_bytes(
+                            data[hdr_start..hdr_start + 4]
+                                .try_into()
+                                .unwrap_or([0_u8; 4]),
+                        )
+                    } else {
+                        0
+                    };
+                    if pgno != 0 {
+                        affected_pages.push(pgno);
+                    }
+
+                    let mut byte_indices: Vec<usize> = flips.iter().map(|(b, _)| *b).collect();
+                    byte_indices.sort_unstable();
+                    byte_indices.dedup();
+
+                    // Capture originals per contiguous range before mutation.
+                    let mut ranges: Vec<(usize, usize, Vec<u8>)> = Vec::new(); // (abs_start, abs_end_exclusive, original)
+                    let mut i = 0usize;
+                    while i < byte_indices.len() {
+                        let start = byte_indices[i];
+                        let mut end_inclusive = start;
+                        i += 1;
+                        while i < byte_indices.len() && byte_indices[i] == end_inclusive + 1 {
+                            end_inclusive += 1;
+                            i += 1;
+                        }
+                        let abs_start = payload_start + start;
+                        let abs_end_exclusive = payload_start + end_inclusive + 1;
+                        let original = data[abs_start..abs_end_exclusive].to_vec();
+                        all_original.extend_from_slice(&original);
+                        ranges.push((abs_start, abs_end_exclusive, original));
+                    }
+
+                    for (byte_off, bit_idx) in flips {
+                        let idx = payload_start + *byte_off;
+                        data[idx] ^= 1 << *bit_idx;
+                    }
+
+                    for (abs_start, abs_end_exclusive, original) in ranges {
+                        modifications.push(CorruptionModification {
+                            offset: u64::try_from(abs_start).unwrap_or(u64::MAX),
+                            length: u64::try_from(abs_end_exclusive - abs_start)
+                                .unwrap_or(u64::MAX),
+                            page_first: if pgno == 0 { None } else { Some(pgno) },
+                            page_last: if pgno == 0 { None } else { Some(pgno) },
+                            wal_frame_first: Some(frame_idx),
+                            wal_frame_last: Some(frame_idx),
+                            sha256_before: sha256_hex(&original),
+                            sha256_after: Some(sha256_hex(&data[abs_start..abs_end_exclusive])),
+                        });
+                    }
+                }
+
+                affected_pages.sort_unstable();
+                affected_pages.dedup();
+
+                let affected_bytes = modifications.iter().map(|m| m.length).sum::<u64>();
+                (affected_bytes, affected_pages, all_original, modifications)
+            }
+
+            CorruptionPattern::WalTornTruncate {
+                frame_index,
+                bytes_into_payload,
+            } => {
+                if *bytes_into_payload >= self.page_size {
+                    return Err(E2eError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "bytes_into_payload exceeds page size",
+                    )));
+                }
+
+                let frame_size = WAL_FRAME_HEADER_SIZE + u64::from(self.page_size);
+                let new_len = WAL_HEADER_SIZE
+                    + u64::from(*frame_index) * frame_size
+                    + WAL_FRAME_HEADER_SIZE
+                    + u64::from(*bytes_into_payload);
+                let new_len_usize = usize::try_from(new_len).map_err(|_| {
+                    E2eError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "wal torn truncate length overflow",
+                    ))
+                })?;
+                if new_len_usize >= data.len() {
+                    return Err(E2eError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("wal length {} already <= new_len {new_len}", data.len()),
+                    )));
+                }
+
+                let original = data[new_len_usize..].to_vec();
+                let original_len = data.len();
+                data.truncate(new_len_usize);
+
+                let modification = CorruptionModification {
+                    offset: new_len,
+                    length: u64::try_from(original_len - new_len_usize).unwrap_or(u64::MAX),
+                    page_first: None,
+                    page_last: None,
+                    wal_frame_first: Some(*frame_index),
+                    wal_frame_last: None,
+                    sha256_before: sha256_hex(&original),
+                    sha256_after: None,
+                };
+                (
+                    u64::try_from(original_len - new_len_usize).unwrap_or(u64::MAX),
+                    Vec::new(),
+                    original,
+                    vec![modification],
+                )
             }
         };
 
         std::fs::write(&self.path, &data)?;
 
         Ok(CorruptionReport {
+            scenario_id,
             pattern: pattern.clone(),
+            modifications,
             affected_bytes,
             affected_pages,
             original_sha256: sha256_hex(&original_region),
@@ -467,6 +1205,17 @@ fn pages_in_range(start: usize, end: usize, page_size: usize) -> Vec<u32> {
     (first_page..=last_page).map(|p| p as u32).collect()
 }
 
+fn page_span_for_range(start: usize, end: usize, page_size: usize) -> (Option<u32>, Option<u32>) {
+    if start >= end || page_size == 0 {
+        return (None, None);
+    }
+    let first_page = (start / page_size) + 1;
+    let last_page = ((end - 1) / page_size) + 1;
+    let first = u32::try_from(first_page).ok();
+    let last = u32::try_from(last_page).ok();
+    (first, last)
+}
+
 /// SHA-256 hex digest of a byte slice.
 fn sha256_hex(data: &[u8]) -> String {
     use std::fmt::Write as _;
@@ -476,6 +1225,140 @@ fn sha256_hex(data: &[u8]) -> String {
         let _ = write!(hex, "{byte:02x}");
     }
     hex
+}
+
+fn sanitize_scenario_id(raw: &str) -> String {
+    // ASCII-only, stable, filesystem-safe.
+    let mut out = String::with_capacity(raw.len().min(80));
+    let mut prev_sep = false;
+
+    for ch in raw.chars() {
+        let lc = ch.to_ascii_lowercase();
+        let keep = match lc {
+            'a'..='z' | '0'..='9' | '-' | '_' => Some(lc),
+            _ => None,
+        };
+
+        if let Some(c) = keep {
+            if (c == '-' || c == '_') && (out.is_empty() || prev_sep) {
+                continue;
+            }
+            out.push(c);
+            prev_sep = c == '-' || c == '_';
+        } else if !out.is_empty() && !prev_sep {
+            out.push('_');
+            prev_sep = true;
+        }
+
+        if out.len() >= 80 {
+            break;
+        }
+    }
+
+    while out.ends_with('_') || out.ends_with('-') {
+        out.pop();
+    }
+    out
+}
+
+fn format_u32_ranges(values: &[u32]) -> String {
+    use std::fmt::Write as _;
+    if values.is_empty() {
+        return String::new();
+    }
+
+    let mut v = values.to_vec();
+    v.sort_unstable();
+    v.dedup();
+
+    let mut out = String::new();
+    let mut i = 0usize;
+    while i < v.len() {
+        let start = v[i];
+        let mut end = start;
+        i += 1;
+        while i < v.len() && v[i] == end.saturating_add(1) {
+            end = v[i];
+            i += 1;
+        }
+
+        if !out.is_empty() {
+            out.push(',');
+        }
+        if start == end {
+            let _ = write!(out, "{start}");
+        } else {
+            let _ = write!(out, "{start}-{end}");
+        }
+    }
+    out
+}
+
+impl CorruptionPattern {
+    /// Stable, filesystem-safe scenario id string derived from this pattern.
+    #[must_use]
+    pub fn scenario_id(&self) -> String {
+        let raw = match self {
+            Self::BitFlip {
+                byte_offset,
+                bit_position,
+            } => format!("bitflip_byte_{byte_offset}_bit_{bit_position}"),
+            Self::BitFlipMany {
+                offset,
+                length,
+                count,
+                seed,
+            } => format!("bitflip_off_{offset}_len_{length}_count_{count}_seed_{seed}"),
+            Self::PageZero { page_number } => format!("page_zero_pg_{page_number}"),
+            Self::RandomOverwrite {
+                offset,
+                length,
+                seed,
+            } => format!("rand_overwrite_off_{offset}_len_{length}_seed_{seed}"),
+            Self::PagePartialCorrupt {
+                page_number,
+                offset_within_page,
+                length,
+                seed,
+            } => format!(
+                "page_partial_pg_{page_number}_off_{offset_within_page}_len_{length}_seed_{seed}"
+            ),
+            Self::TruncateTo { new_len } => format!("truncate_to_{new_len}"),
+            Self::HeaderZero => "header_zero".to_owned(),
+            Self::WalFrameCorrupt {
+                frame_numbers,
+                seed,
+            } => {
+                let frames = format_u32_ranges(frame_numbers);
+                format!("wal_frame_corrupt_frames_{frames}_seed_{seed}")
+            }
+            Self::WalTruncate { frames } => format!("wal_truncate_frames_{frames}"),
+            Self::WalFrameBitFlip {
+                frame_index,
+                byte_offset_within_payload,
+                bit_position,
+            } => format!(
+                "wal_bitflip_frame_{frame_index}_off_{byte_offset_within_payload}_bit_{bit_position}"
+            ),
+            Self::WalBitRot {
+                frame_start,
+                frame_end,
+                flips,
+                seed,
+            } => format!("wal_bitrot_{frame_start}_{frame_end}_flips_{flips}_seed_{seed}"),
+            Self::WalTornTruncate {
+                frame_index,
+                bytes_into_payload,
+            } => format!("wal_torn_truncate_frame_{frame_index}_bytes_{bytes_into_payload}"),
+            Self::SidecarCorrupt {
+                offset,
+                length,
+                seed,
+            } => format!("sidecar_corrupt_off_{offset}_len_{length}_seed_{seed}"),
+        };
+
+        sanitize_scenario_id(&raw)
+    }
 }
 
 // ── Legacy API (preserved for backward compat) ──────────────────────────
