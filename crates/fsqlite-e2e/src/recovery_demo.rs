@@ -325,6 +325,14 @@ mod tests {
         let conn = rusqlite::Connection::open(&db_path).expect("open db");
         conn.execute_batch("PRAGMA journal_mode=WAL;")
             .expect("set WAL mode");
+        let mode: String = conn
+            .pragma_query_value(None, "journal_mode", |r| r.get(0))
+            .expect("query journal_mode");
+        assert_eq!(
+            mode.to_ascii_lowercase(),
+            "wal",
+            "expected WAL journal mode"
+        );
         conn.execute_batch("PRAGMA synchronous=NORMAL;")
             .expect("set sync mode");
         conn.execute_batch("PRAGMA wal_autocheckpoint=0;")
@@ -344,6 +352,9 @@ mod tests {
             expected_rows.push((id, payload));
         }
 
+        let wal_path = db_path.with_extension("db-wal");
+        let wal_backup = db_path.with_extension("db-wal.bak");
+
         // Open a second reader inside an explicit transaction so it holds a
         // WAL read-mark across the writer close.  The open read transaction
         // prevents the close-time passive checkpoint from recycling frames.
@@ -361,20 +372,26 @@ mod tests {
             .query_row("SELECT count(*) FROM demo", [], |r| r.get(0))
             .expect("reader count");
 
+        // Back up the WAL before dropping the writer connection.  This ensures
+        // we have a non-empty WAL for the corruption demo even if SQLite
+        // truncates the WAL on close.
+        assert!(wal_path.exists(), "WAL file must exist after writes");
+        let wal_len = fs::metadata(&wal_path).expect("wal metadata").len();
+        let wal_header_len = u64::try_from(WAL_HEADER_SIZE).expect("WAL header size fits u64");
+        assert!(
+            wal_len > wal_header_len,
+            "WAL must contain frames (len={wal_len})"
+        );
+        fs::copy(&wal_path, &wal_backup).expect("backup WAL");
+
         // Close the writer.  The reader's open transaction holds a read
         // lock so the close-time passive checkpoint cannot truncate the WAL.
         drop(conn);
-
-        // Copy the WAL before closing the reader (which might checkpoint).
-        let wal_path = db_path.with_extension("db-wal");
-        let wal_backup = db_path.with_extension("db-wal.bak");
-        if wal_path.exists() {
-            fs::copy(&wal_path, &wal_backup).expect("backup WAL");
-        }
         drop(reader);
 
         // Restore the WAL if it was removed by the reader's close.
-        if !wal_path.exists() && wal_backup.exists() {
+        let wal_len = fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+        if wal_len <= wal_header_len && wal_backup.exists() {
             fs::copy(&wal_backup, &wal_path).expect("restore WAL");
         }
         // Clean up backup.
