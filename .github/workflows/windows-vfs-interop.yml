@@ -45,6 +45,28 @@ jobs:
         shell: pwsh
         run: New-Item -ItemType Directory -Path artifacts -Force | Out-Null
 
+      - name: Bootstrap local path dependencies
+        shell: pwsh
+        run: |
+          $depsRoot = "D:\dp"
+          New-Item -ItemType Directory -Path $depsRoot -Force | Out-Null
+
+          if (-not (Test-Path "D:\dp\asupersync\Cargo.toml")) {
+            git clone --depth 1 https://github.com/Dicklesworthstone/asupersync.git D:\dp\asupersync
+          }
+
+          if (-not (Test-Path "D:\dp\frankentui\Cargo.toml")) {
+            git clone --depth 1 https://github.com/Dicklesworthstone/frankentui.git D:\dp\frankentui
+          }
+
+          if (-not (Test-Path "D:\dp\asupersync\Cargo.toml")) {
+            throw "Missing dependency manifest: D:\dp\asupersync\Cargo.toml"
+          }
+
+          if (-not (Test-Path "D:\dp\frankentui\Cargo.toml")) {
+            throw "Missing dependency manifest: D:\dp\frankentui\Cargo.toml"
+          }
+
       - name: Check fsqlite-vfs
         shell: pwsh
         run: cargo check -p fsqlite-vfs --all-targets 2>&1 | Tee-Object -FilePath artifacts/cargo-check-fsqlite-vfs.txt
