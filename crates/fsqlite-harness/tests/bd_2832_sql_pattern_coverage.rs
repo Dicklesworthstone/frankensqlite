@@ -306,7 +306,6 @@ fn test_aggregate_avg() {
 }
 
 #[test]
-#[ignore = "GROUP BY not yet implemented — needs dedicated bead"]
 fn test_aggregate_count_with_group_by() {
     let conn = seeded_conn();
     let rows = conn

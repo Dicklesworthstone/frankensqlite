@@ -143,13 +143,14 @@ pub fn codegen_select(
     schema: &[TableSchema],
     _ctx: &CodegenContext,
 ) -> Result<(), CodegenError> {
-    let (columns, from, where_clause) = match &stmt.body.select {
+    let (columns, from, where_clause, group_by) = match &stmt.body.select {
         SelectCore::Select {
             columns,
             from,
             where_clause,
+            group_by,
             ..
-        } => (columns, from, where_clause),
+        } => (columns, from, where_clause, group_by),
         SelectCore::Values(_) => {
             return Err(CodegenError::Unsupported("VALUES in SELECT".to_owned()));
         }
@@ -269,8 +270,22 @@ pub fn codegen_select(
                 end_label,
             );
         }
+    } else if has_aggregate_columns(columns) && !group_by.is_empty() {
+        // --- Aggregate query WITH GROUP BY ---
+        return codegen_select_group_by_aggregate(
+            b,
+            cursor,
+            table,
+            columns,
+            where_clause.as_deref(),
+            group_by,
+            out_regs,
+            out_col_count,
+            done_label,
+            end_label,
+        );
     } else if has_aggregate_columns(columns) {
-        // --- Aggregate query (COUNT/SUM/AVG/MIN/MAX/...) ---
+        // --- Aggregate query (single-group, no GROUP BY) ---
         return codegen_select_aggregate(
             b,
             cursor,
@@ -908,6 +923,503 @@ fn parse_aggregate_columns(
         }
     }
     Ok(agg_cols)
+}
+
+// ---------------------------------------------------------------------------
+// GROUP BY aggregate codegen
+// ---------------------------------------------------------------------------
+
+/// Describes one output column in a GROUP BY query.
+enum GroupByOutputCol {
+    /// A GROUP BY key column. `key_index` is the position within the group key
+    /// vector, and `sorter_col` is the column index in the sorter record.
+    GroupKey {
+        #[allow(dead_code)]
+        key_index: usize,
+        sorter_col: usize,
+    },
+    /// An aggregate function column. `agg_index` is the position within the
+    /// aggregate accumulator vector.
+    Aggregate { agg_index: usize },
+}
+
+/// Parse result columns for a GROUP BY query into output-column descriptors,
+/// a list of group-key table-column indices, and a list of aggregate metadata.
+///
+/// Returns `(output_cols, group_key_table_cols, agg_columns)`.
+fn parse_group_by_output(
+    columns: &[ResultColumn],
+    table: &TableSchema,
+    group_by: &[Expr],
+) -> Result<(Vec<GroupByOutputCol>, Vec<usize>, Vec<AggColumn>), CodegenError> {
+    // Resolve GROUP BY expressions to table column indices.
+    let group_key_table_cols: Vec<usize> = group_by
+        .iter()
+        .map(|expr| {
+            resolve_column_ref(expr, table).ok_or_else(|| {
+                CodegenError::Unsupported("non-column GROUP BY expression".to_owned())
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut output_cols = Vec::new();
+    let mut agg_columns = Vec::new();
+
+    for col in columns {
+        match col {
+            ResultColumn::Expr {
+                expr: Expr::FunctionCall { name, args, .. },
+                ..
+            } if is_aggregate_function(name) => {
+                let agg_index = agg_columns.len();
+                let lower_name = name.to_ascii_lowercase();
+                match args {
+                    FunctionArgs::Star => {
+                        agg_columns.push(AggColumn {
+                            name: lower_name,
+                            num_args: 0,
+                            arg_col_index: None,
+                        });
+                    }
+                    FunctionArgs::List(exprs) => {
+                        if exprs.is_empty() {
+                            agg_columns.push(AggColumn {
+                                name: lower_name,
+                                num_args: 0,
+                                arg_col_index: None,
+                            });
+                        } else {
+                            let col_idx =
+                                resolve_column_ref(&exprs[0], table).ok_or_else(|| {
+                                    CodegenError::Unsupported(
+                                        "non-column argument in aggregate function".to_owned(),
+                                    )
+                                })?;
+                            #[allow(
+                                clippy::cast_possible_truncation,
+                                clippy::cast_possible_wrap
+                            )]
+                            agg_columns.push(AggColumn {
+                                name: lower_name,
+                                num_args: exprs.len() as i32,
+                                arg_col_index: Some(col_idx),
+                            });
+                        }
+                    }
+                }
+                output_cols.push(GroupByOutputCol::Aggregate { agg_index });
+            }
+            ResultColumn::Expr { expr, .. } => {
+                // Must be a GROUP BY column reference.
+                let col_idx = resolve_column_ref(expr, table).ok_or_else(|| {
+                    CodegenError::Unsupported(
+                        "non-aggregate, non-column expression in GROUP BY query".to_owned(),
+                    )
+                })?;
+                let key_index = group_key_table_cols
+                    .iter()
+                    .position(|&k| k == col_idx)
+                    .ok_or_else(|| {
+                        CodegenError::Unsupported(
+                            "result column not in GROUP BY clause".to_owned(),
+                        )
+                    })?;
+                output_cols.push(GroupByOutputCol::GroupKey {
+                    key_index,
+                    sorter_col: key_index,
+                });
+            }
+            ResultColumn::Star | ResultColumn::TableStar(_) => {
+                return Err(CodegenError::Unsupported(
+                    "Star in GROUP BY query".to_owned(),
+                ));
+            }
+        }
+    }
+
+    Ok((output_cols, group_key_table_cols, agg_columns))
+}
+
+/// Generate VDBE bytecode for an aggregate SELECT **with GROUP BY**.
+///
+/// Two-pass pattern:
+/// 1. Scan table rows (with WHERE), pack group-key + agg-arg columns into sorter.
+/// 2. After sorting, iterate sorted rows detecting group boundaries via key
+///    comparison. On each boundary, finalize accumulators and emit `ResultRow`.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn codegen_select_group_by_aggregate(
+    b: &mut ProgramBuilder,
+    cursor: i32,
+    table: &TableSchema,
+    columns: &[ResultColumn],
+    where_clause: Option<&Expr>,
+    group_by: &[Expr],
+    out_regs: i32,
+    out_col_count: i32,
+    done_label: crate::Label,
+    end_label: crate::Label,
+) -> Result<(), CodegenError> {
+    let (output_cols, group_key_table_cols, agg_columns) =
+        parse_group_by_output(columns, table, group_by)?;
+
+    let num_group_keys = group_key_table_cols.len();
+    let num_aggs = agg_columns.len();
+
+    // Collect unique table-column indices needed for aggregate arguments.
+    let mut agg_arg_table_cols: Vec<usize> = Vec::new();
+    for agg in &agg_columns {
+        if let Some(ci) = agg.arg_col_index {
+            if !agg_arg_table_cols.contains(&ci) {
+                agg_arg_table_cols.push(ci);
+            }
+        }
+    }
+
+    // Sorter layout: [group_key_0, ..., group_key_n, agg_arg_0, ..., agg_arg_m]
+    let total_sorter_cols = num_group_keys + agg_arg_table_cols.len();
+
+    // Map each aggregate's arg to its sorter column index.
+    let agg_sorter_col: Vec<Option<usize>> = agg_columns
+        .iter()
+        .map(|agg| {
+            agg.arg_col_index.map(|ci| {
+                num_group_keys
+                    + agg_arg_table_cols
+                        .iter()
+                        .position(|&x| x == ci)
+                        .expect("arg col must be in agg_arg_table_cols")
+            })
+        })
+        .collect();
+
+    // Sorter cursor.
+    let sorter_cursor = cursor + 1;
+
+    // Open sorter: p2 = number of key columns (for sorting by group keys).
+    let sort_order: String = std::iter::repeat_n('+', num_group_keys).collect();
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    b.emit_op(
+        Opcode::SorterOpen,
+        sorter_cursor,
+        num_group_keys as i32,
+        0,
+        P4::Str(sort_order),
+        0,
+    );
+
+    // Open table for reading.
+    b.emit_op(
+        Opcode::OpenRead,
+        cursor,
+        table.root_page,
+        0,
+        P4::Table(table.name.clone()),
+        0,
+    );
+
+    // === Pass 1: Scan rows into sorter ===
+    let scan_start = b.current_addr();
+    let scan_done = b.emit_label();
+    b.emit_jump_to_label(Opcode::Rewind, cursor, 0, scan_done, P4::None, 0);
+
+    // WHERE filter.
+    let skip_label = b.emit_label();
+    if let Some(where_expr) = where_clause {
+        emit_where_filter(b, where_expr, cursor, table, skip_label);
+    }
+
+    // Read group-key columns + agg-arg columns into consecutive registers.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let sorter_base = b.alloc_regs(total_sorter_cols as i32);
+    {
+        let mut reg = sorter_base;
+        for &col_idx in &group_key_table_cols {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            b.emit_op(Opcode::Column, cursor, col_idx as i32, reg, P4::None, 0);
+            reg += 1;
+        }
+        for &col_idx in &agg_arg_table_cols {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            b.emit_op(Opcode::Column, cursor, col_idx as i32, reg, P4::None, 0);
+            reg += 1;
+        }
+    }
+
+    // MakeRecord + SorterInsert.
+    let record_reg = b.alloc_reg();
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    b.emit_op(
+        Opcode::MakeRecord,
+        sorter_base,
+        total_sorter_cols as i32,
+        record_reg,
+        P4::None,
+        0,
+    );
+    b.emit_op(
+        Opcode::SorterInsert,
+        sorter_cursor,
+        record_reg,
+        0,
+        P4::None,
+        0,
+    );
+
+    // Skip label (for WHERE-filtered rows).
+    b.resolve_label(skip_label);
+
+    // Next row in scan.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let scan_body = (scan_start + 1) as i32;
+    b.emit_op(Opcode::Next, cursor, scan_body, 0, P4::None, 0);
+
+    // End of pass 1.
+    b.resolve_label(scan_done);
+    b.emit_op(Opcode::Close, cursor, 0, 0, P4::None, 0);
+
+    // === Pass 2: Iterate sorted rows, accumulate per-group ===
+
+    // Allocate registers for current group keys, previous group keys, accumulators.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let cur_key_base = b.alloc_regs(num_group_keys as i32);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let prev_key_base = b.alloc_regs(num_group_keys as i32);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let accum_base = b.alloc_regs(num_aggs as i32);
+    let first_flag = b.alloc_reg();
+
+    // Initialize: first_flag = 1, accumulators = Null.
+    b.emit_op(Opcode::Integer, 1, first_flag, 0, P4::None, 0);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    for i in 0..num_aggs as i32 {
+        b.emit_op(Opcode::Null, 0, accum_base + i, 0, P4::None, 0);
+    }
+
+    // SorterSort: sort and position at first row; jump to done if empty.
+    b.emit_jump_to_label(
+        Opcode::SorterSort,
+        sorter_cursor,
+        0,
+        done_label,
+        P4::None,
+        0,
+    );
+
+    let sort_loop_body = b.current_addr();
+
+    // SorterData: decode current sorted row.
+    let sorted_reg = b.alloc_reg();
+    b.emit_op(
+        Opcode::SorterData,
+        sorter_cursor,
+        sorted_reg,
+        0,
+        P4::None,
+        0,
+    );
+
+    // Read group-key columns from sorter into cur_key registers.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    for i in 0..num_group_keys {
+        b.emit_op(
+            Opcode::Column,
+            sorter_cursor,
+            i as i32,
+            cur_key_base + i as i32,
+            P4::None,
+            0,
+        );
+    }
+
+    // If first row, skip group-change comparison.
+    let first_row_label = b.emit_label();
+    b.emit_jump_to_label(Opcode::IfPos, first_flag, 1, first_row_label, P4::None, 0);
+
+    // Compare current keys to previous keys. If any differ, jump to new_group.
+    let new_group_label = b.emit_label();
+    let same_group_label = b.emit_label();
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    for i in 0..num_group_keys {
+        // Ne p1=cur_key, p2=new_group_label, p3=prev_key, p5=0x80 (NULLEQ)
+        b.emit_jump_to_label(
+            Opcode::Ne,
+            cur_key_base + i as i32,
+            prev_key_base + i as i32,
+            new_group_label,
+            P4::None,
+            0x80,
+        );
+    }
+    // All keys match — same group.
+    b.emit_jump_to_label(Opcode::Goto, 0, 0, same_group_label, P4::None, 0);
+
+    // new_group: finalize previous group and output ResultRow.
+    b.resolve_label(new_group_label);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    for (i, agg) in agg_columns.iter().enumerate() {
+        let accum_reg = accum_base + i as i32;
+        b.emit_op(
+            Opcode::AggFinal,
+            accum_reg,
+            agg.num_args,
+            0,
+            P4::FuncName(agg.name.clone()),
+            0,
+        );
+    }
+    // Build output row from prev_key + accum.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    for (i, out_col) in output_cols.iter().enumerate() {
+        match out_col {
+            GroupByOutputCol::GroupKey { sorter_col, .. } => {
+                b.emit_op(
+                    Opcode::Copy,
+                    prev_key_base + *sorter_col as i32,
+                    out_regs + i as i32,
+                    0,
+                    P4::None,
+                    0,
+                );
+            }
+            GroupByOutputCol::Aggregate { agg_index } => {
+                b.emit_op(
+                    Opcode::Copy,
+                    accum_base + *agg_index as i32,
+                    out_regs + i as i32,
+                    0,
+                    P4::None,
+                    0,
+                );
+            }
+        }
+    }
+    b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
+    // Reset accumulators for next group.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    for i in 0..num_aggs as i32 {
+        b.emit_op(Opcode::Null, 0, accum_base + i, 0, P4::None, 0);
+    }
+
+    // first_row: (jumped here when first_flag was 1, skipping comparison).
+    b.resolve_label(first_row_label);
+
+    // same_group: copy current keys to previous, then AggStep.
+    b.resolve_label(same_group_label);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    for i in 0..num_group_keys {
+        b.emit_op(
+            Opcode::Copy,
+            cur_key_base + i as i32,
+            prev_key_base + i as i32,
+            0,
+            P4::None,
+            0,
+        );
+    }
+
+    // AggStep for each aggregate.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    for (i, agg) in agg_columns.iter().enumerate() {
+        let accum_reg = accum_base + i as i32;
+        if agg.num_args == 0 {
+            // count(*): no arguments.
+            b.emit_op(
+                Opcode::AggStep,
+                0,
+                0,
+                accum_reg,
+                P4::FuncName(agg.name.clone()),
+                0,
+            );
+        } else {
+            let arg_reg = b.alloc_temp();
+            let sorter_col = agg_sorter_col[i].expect("non-zero-arg agg must have sorter col");
+            b.emit_op(
+                Opcode::Column,
+                sorter_cursor,
+                sorter_col as i32,
+                arg_reg,
+                P4::None,
+                0,
+            );
+            let num_args = u16::try_from(agg.num_args).unwrap_or_default();
+            b.emit_op(
+                Opcode::AggStep,
+                0,
+                arg_reg,
+                accum_reg,
+                P4::FuncName(agg.name.clone()),
+                num_args,
+            );
+            b.free_temp(arg_reg);
+        }
+    }
+
+    // SorterNext: advance to next sorted row.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    b.emit_op(
+        Opcode::SorterNext,
+        sorter_cursor,
+        sort_loop_body as i32,
+        0,
+        P4::None,
+        0,
+    );
+
+    // After loop: output final group (if any rows were processed).
+    // If first_flag is still > 0, table was empty — skip final output.
+    b.emit_jump_to_label(Opcode::IfPos, first_flag, 0, done_label, P4::None, 0);
+
+    // Finalize last group.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    for (i, agg) in agg_columns.iter().enumerate() {
+        let accum_reg = accum_base + i as i32;
+        b.emit_op(
+            Opcode::AggFinal,
+            accum_reg,
+            agg.num_args,
+            0,
+            P4::FuncName(agg.name.clone()),
+            0,
+        );
+    }
+    // Build output row from prev_key (last group's keys) + accum.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    for (i, out_col) in output_cols.iter().enumerate() {
+        match out_col {
+            GroupByOutputCol::GroupKey { sorter_col, .. } => {
+                b.emit_op(
+                    Opcode::Copy,
+                    prev_key_base + *sorter_col as i32,
+                    out_regs + i as i32,
+                    0,
+                    P4::None,
+                    0,
+                );
+            }
+            GroupByOutputCol::Aggregate { agg_index } => {
+                b.emit_op(
+                    Opcode::Copy,
+                    accum_base + *agg_index as i32,
+                    out_regs + i as i32,
+                    0,
+                    P4::None,
+                    0,
+                );
+            }
+        }
+    }
+    b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
+
+    // Done: Close sorter + Halt.
+    b.resolve_label(done_label);
+    b.emit_op(Opcode::Close, sorter_cursor, 0, 0, P4::None, 0);
+    b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+
+    // End target for Init jump.
+    b.resolve_label(end_label);
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

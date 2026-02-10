@@ -1196,11 +1196,8 @@ mod tests {
     }
 
     // ── Aggregate + GROUP BY ───────────────────────────────────────────
-    // NOTE: GROUP BY is not yet implemented for table-backed SELECTs.
-    // Tracked in bd-2mnb.
 
     #[test]
-    #[ignore = "GROUP BY not yet implemented — tracked in bd-2mnb"]
     fn aggregate_group_by_count() {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE tg (k TEXT);").unwrap();
