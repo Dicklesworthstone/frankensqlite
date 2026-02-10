@@ -10,8 +10,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use fsqlite_ast::{
-    BinaryOp, CreateTableBody, Distinctness, Expr, FunctionArgs, InSet, LikeOp, Literal,
-    PlaceholderType, ResultColumn, SelectCore, SelectStatement, Statement, UnaryOp,
+    BinaryOp, CreateTableBody, Distinctness, Expr, FunctionArgs, InSet, LikeOp, LimitClause,
+    Literal, NullsOrder, OrderingTerm, PlaceholderType, ResultColumn, SelectCore, SelectStatement,
+    SortDirection, Statement, UnaryOp,
 };
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_func::FunctionRegistry;
@@ -75,6 +76,22 @@ impl Row {
 pub struct PreparedStatement {
     program: VdbeProgram,
     func_registry: Option<Arc<FunctionRegistry>>,
+    expression_postprocess: Option<ExpressionPostprocess>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ExpressionPostprocess {
+    order_by: Vec<OrderingTerm>,
+    limit: Option<LimitClause>,
+    output_aliases: HashMap<String, usize>,
+    output_width: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ResolvedOrderTerm {
+    column_index: usize,
+    descending: bool,
+    nulls_order: NullsOrder,
 }
 
 impl std::fmt::Debug for PreparedStatement {
@@ -88,12 +105,22 @@ impl std::fmt::Debug for PreparedStatement {
 impl PreparedStatement {
     /// Execute as a query and return all result rows.
     pub fn query(&self) -> Result<Vec<Row>> {
-        execute_program(&self.program, None, self.func_registry.as_ref())
+        execute_program_with_postprocess(
+            &self.program,
+            None,
+            self.func_registry.as_ref(),
+            self.expression_postprocess.as_ref(),
+        )
     }
 
     /// Execute as a query with bound SQL parameters (`?1`, `?2`, ...).
     pub fn query_with_params(&self, params: &[SqliteValue]) -> Result<Vec<Row>> {
-        execute_program(&self.program, Some(params), self.func_registry.as_ref())
+        execute_program_with_postprocess(
+            &self.program,
+            Some(params),
+            self.func_registry.as_ref(),
+            self.expression_postprocess.as_ref(),
+        )
     }
 
     /// Execute as a query and return exactly one row.
@@ -256,7 +283,12 @@ impl Connection {
                 // Check if this is an expression-only SELECT (no FROM clause).
                 if is_expression_only_select(select) {
                     let program = compile_expression_select(select)?;
-                    execute_program(&program, params, Some(&self.func_registry))
+                    execute_program_with_postprocess(
+                        &program,
+                        params,
+                        Some(&self.func_registry),
+                        Some(&build_expression_postprocess(select)),
+                    )
                 } else {
                     let program = self.compile_table_select(select)?;
                     self.execute_table_program(&program, params)
@@ -306,9 +338,11 @@ impl Connection {
         match statement {
             Statement::Select(select) if is_expression_only_select(select) => {
                 let program = compile_expression_select(select)?;
+                let expression_postprocess = Some(build_expression_postprocess(select));
                 Ok(PreparedStatement {
                     program,
                     func_registry: registry,
+                    expression_postprocess,
                 })
             }
             Statement::Select(select) => {
@@ -316,6 +350,7 @@ impl Connection {
                 Ok(PreparedStatement {
                     program,
                     func_registry: registry,
+                    expression_postprocess: None,
                 })
             }
             _ => Err(FrankenError::NotImplemented(
@@ -543,6 +578,7 @@ impl Connection {
         }
 
         engine.set_function_registry(Arc::clone(&self.func_registry));
+        engine.enable_storage_read_cursors(true);
 
         // Lend the MemDatabase to the engine for the duration of execution.
         let db = self.db.replace(MemDatabase::new());
@@ -631,6 +667,204 @@ fn execute_program(
     }
 }
 
+fn execute_program_with_postprocess(
+    program: &VdbeProgram,
+    params: Option<&[SqliteValue]>,
+    func_registry: Option<&Arc<FunctionRegistry>>,
+    expression_postprocess: Option<&ExpressionPostprocess>,
+) -> Result<Vec<Row>> {
+    let mut rows = execute_program(program, params, func_registry)?;
+    if let Some(postprocess) = expression_postprocess {
+        apply_expression_postprocess(&mut rows, postprocess)?;
+    }
+    Ok(rows)
+}
+
+fn build_expression_postprocess(select: &SelectStatement) -> ExpressionPostprocess {
+    let mut output_aliases = HashMap::new();
+    let output_width = match &select.body.select {
+        SelectCore::Select { columns, .. } => {
+            for (index, column) in columns.iter().enumerate() {
+                if let ResultColumn::Expr {
+                    alias: Some(alias), ..
+                } = column
+                {
+                    output_aliases
+                        .entry(alias.to_ascii_lowercase())
+                        .or_insert(index);
+                }
+            }
+            columns.len()
+        }
+        SelectCore::Values(rows) => rows.first().map_or(0, Vec::len),
+    };
+
+    ExpressionPostprocess {
+        order_by: select.order_by.clone(),
+        limit: select.limit.clone(),
+        output_aliases,
+        output_width,
+    }
+}
+
+fn apply_expression_postprocess(
+    rows: &mut Vec<Row>,
+    postprocess: &ExpressionPostprocess,
+) -> Result<()> {
+    if !postprocess.order_by.is_empty() {
+        let resolved_order_terms = resolve_order_terms(
+            &postprocess.order_by,
+            postprocess.output_width,
+            &postprocess.output_aliases,
+        )?;
+        rows.sort_by(|left, right| {
+            for term in &resolved_order_terms {
+                let Some(left_value) = left.values.get(term.column_index) else {
+                    continue;
+                };
+                let Some(right_value) = right.values.get(term.column_index) else {
+                    continue;
+                };
+                let ordering = compare_order_values(left_value, right_value, *term);
+                if ordering != std::cmp::Ordering::Equal {
+                    return ordering;
+                }
+            }
+            std::cmp::Ordering::Equal
+        });
+    }
+
+    if let Some(limit_clause) = postprocess.limit.as_ref() {
+        let offset = limit_clause
+            .offset
+            .as_ref()
+            .map_or(Ok(0_i64), parse_limit_offset_expr)?;
+        if offset > 0 {
+            let offset = usize::try_from(offset).unwrap_or(usize::MAX);
+            if offset >= rows.len() {
+                rows.clear();
+                return Ok(());
+            }
+            rows.drain(0..offset);
+        }
+
+        let limit = parse_limit_offset_expr(&limit_clause.limit)?;
+        if limit >= 0 {
+            let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+            rows.truncate(limit);
+        }
+    }
+
+    Ok(())
+}
+
+fn resolve_order_terms(
+    order_by: &[OrderingTerm],
+    output_width: usize,
+    output_aliases: &HashMap<String, usize>,
+) -> Result<Vec<ResolvedOrderTerm>> {
+    order_by
+        .iter()
+        .map(|term| {
+            let column_index = match &term.expr {
+                Expr::Column(column_ref, _) if column_ref.table.is_none() => output_aliases
+                    .get(&column_ref.column.to_ascii_lowercase())
+                    .copied()
+                    .ok_or_else(|| {
+                        FrankenError::NotImplemented(
+                            "expression-only ORDER BY currently supports output-column positions or aliases only".to_owned(),
+                        )
+                    })?,
+                _ => order_term_positional_index(&term.expr)?,
+            };
+            if column_index >= output_width {
+                return Err(FrankenError::OutOfRange {
+                    what: "ORDER BY column index".to_owned(),
+                    value: (column_index + 1).to_string(),
+                });
+            }
+            Ok(ResolvedOrderTerm {
+                column_index,
+                descending: term.direction == Some(SortDirection::Desc),
+                nulls_order: term
+                    .nulls
+                    .unwrap_or_else(|| default_nulls_order(term.direction)),
+            })
+        })
+        .collect()
+}
+
+fn order_term_positional_index(expr: &Expr) -> Result<usize> {
+    let one_based = parse_limit_offset_expr(expr)?;
+    if one_based <= 0 {
+        return Err(FrankenError::OutOfRange {
+            what: "ORDER BY column index".to_owned(),
+            value: one_based.to_string(),
+        });
+    }
+    let zero_based = one_based - 1;
+    usize::try_from(zero_based).map_err(|_| FrankenError::OutOfRange {
+        what: "ORDER BY column index".to_owned(),
+        value: one_based.to_string(),
+    })
+}
+
+fn parse_limit_offset_expr(expr: &Expr) -> Result<i64> {
+    match expr {
+        Expr::Literal(Literal::Integer(value), _) => Ok(*value),
+        Expr::UnaryOp {
+            op: UnaryOp::Plus,
+            expr: inner,
+            ..
+        } => parse_limit_offset_expr(inner),
+        Expr::UnaryOp {
+            op: UnaryOp::Negate,
+            expr: inner,
+            ..
+        } => parse_limit_offset_expr(inner)?
+            .checked_neg()
+            .ok_or_else(|| FrankenError::OutOfRange {
+                what: "LIMIT/OFFSET expression".to_owned(),
+                value: "integer overflow".to_owned(),
+            }),
+        _ => Err(FrankenError::NotImplemented(
+            "expression-only LIMIT/OFFSET currently supports integer literals only".to_owned(),
+        )),
+    }
+}
+
+fn default_nulls_order(direction: Option<SortDirection>) -> NullsOrder {
+    if direction == Some(SortDirection::Desc) {
+        NullsOrder::Last
+    } else {
+        NullsOrder::First
+    }
+}
+
+fn compare_order_values(
+    left: &SqliteValue,
+    right: &SqliteValue,
+    term: ResolvedOrderTerm,
+) -> std::cmp::Ordering {
+    let left_is_null = left.is_null();
+    let right_is_null = right.is_null();
+    if left_is_null || right_is_null {
+        if left_is_null && right_is_null {
+            return std::cmp::Ordering::Equal;
+        }
+        return match (left_is_null, term.nulls_order) {
+            (true, NullsOrder::First) | (false, NullsOrder::Last) => std::cmp::Ordering::Less,
+            (true, NullsOrder::Last) | (false, NullsOrder::First) => std::cmp::Ordering::Greater,
+        };
+    }
+
+    let mut ordering = left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal);
+    if term.descending {
+        ordering = ordering.reverse();
+    }
+    ordering
+}
+
 fn first_row_or_error(rows: Vec<Row>) -> Result<Row> {
     rows.into_iter()
         .next()
@@ -709,16 +943,6 @@ fn compile_expression_select(select: &SelectStatement) -> Result<VdbeProgram> {
     if select.with.is_some() {
         return Err(FrankenError::NotImplemented(
             "WITH is not supported in this connection path".to_owned(),
-        ));
-    }
-    if !select.order_by.is_empty() {
-        return Err(FrankenError::NotImplemented(
-            "ORDER BY is not supported in this connection path".to_owned(),
-        ));
-    }
-    if select.limit.is_some() {
-        return Err(FrankenError::NotImplemented(
-            "LIMIT is not supported in this connection path".to_owned(),
         ));
     }
     if !select.body.compounds.is_empty() {
@@ -1631,6 +1855,49 @@ mod tests {
     }
 
     #[test]
+    fn test_values_order_by_limit() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn
+            .query("VALUES (3, 'c'), (1, 'a'), (2, 'b') ORDER BY 1 LIMIT 2;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![SqliteValue::Integer(1), SqliteValue::Text("a".to_owned())]
+        );
+        assert_eq!(
+            row_values(&rows[1]),
+            vec![SqliteValue::Integer(2), SqliteValue::Text("b".to_owned())]
+        );
+    }
+
+    #[test]
+    fn test_values_order_by_desc_limit_offset() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn
+            .query("VALUES (3), (1), (2) ORDER BY 1 DESC LIMIT 1 OFFSET 1;")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0]), vec![SqliteValue::Integer(2)]);
+    }
+
+    #[test]
+    fn test_select_expression_limit_zero_returns_no_rows() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn.query("SELECT 42 LIMIT 0;").unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn test_values_offset_beyond_row_count_returns_empty() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn
+            .query("VALUES (1), (2) ORDER BY 1 LIMIT 10 OFFSET 99;")
+            .unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[test]
     fn test_values_mismatched_column_count_rejected() {
         let conn = Connection::open(":memory:").unwrap();
         let error = conn
@@ -1685,6 +1952,18 @@ mod tests {
         let rows = stmt.query_with_params(&[SqliteValue::Integer(9)]).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(row_values(&rows[0]), vec![SqliteValue::Integer(10)]);
+    }
+
+    #[test]
+    fn test_prepared_statement_values_order_by_limit() {
+        let conn = Connection::open(":memory:").unwrap();
+        let stmt = conn
+            .prepare("VALUES (2), (1), (3) ORDER BY 1 LIMIT 2;")
+            .unwrap();
+        let rows = stmt.query().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(row_values(&rows[0]), vec![SqliteValue::Integer(1)]);
+        assert_eq!(row_values(&rows[1]), vec![SqliteValue::Integer(2)]);
     }
 
     #[test]
@@ -2075,6 +2354,26 @@ mod tests {
         assert_eq!(
             row_values(&rows[0]),
             vec![SqliteValue::Integer(2), SqliteValue::Text("BOB".to_owned())]
+        );
+    }
+
+    #[test]
+    fn test_select_by_rowid_with_parameter() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (a INTEGER, b TEXT);").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'alpha');").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 'beta');").unwrap();
+
+        let rows = conn
+            .query_with_params(
+                "SELECT b FROM t WHERE rowid = ?1;",
+                &[SqliteValue::Integer(2)],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![SqliteValue::Text("beta".to_owned())]
         );
     }
 

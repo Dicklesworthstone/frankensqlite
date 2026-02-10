@@ -13,8 +13,10 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use fsqlite_btree::{BtreeCursorOps, MockBtreeCursor};
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_func::FunctionRegistry;
+use fsqlite_types::cx::Cx;
 use fsqlite_types::opcode::{Opcode, P4, VdbeOp};
 use fsqlite_types::value::SqliteValue;
 
@@ -165,6 +167,22 @@ impl SorterCursor {
     }
 }
 
+/// Storage-backed table cursor used by read scans (`OpenRead`).
+#[derive(Debug)]
+struct StorageCursor {
+    cursor: MockBtreeCursor,
+    cx: Cx,
+}
+
+impl StorageCursor {
+    fn new(entries: Vec<(i64, Vec<u8>)>) -> Self {
+        Self {
+            cursor: MockBtreeCursor::new(entries),
+            cx: Cx::new(),
+        }
+    }
+}
+
 /// Shared in-memory database backing the VDBE engine's cursor operations.
 ///
 /// Maps root page numbers to in-memory tables. The Connection layer
@@ -253,6 +271,10 @@ pub struct VdbeEngine {
     cursors: HashMap<i32, MemCursor>,
     /// Open sorter cursors keyed by cursor number.
     sorters: HashMap<i32, SorterCursor>,
+    /// Open storage-backed read cursors keyed by cursor number.
+    storage_cursors: HashMap<i32, StorageCursor>,
+    /// Whether `OpenRead` should route through storage-backed cursors.
+    storage_read_cursors_enabled: bool,
     /// In-memory database backing cursor operations (shared with Connection).
     db: Option<MemDatabase>,
     /// Scalar/aggregate/window function registry for Function/PureFunc opcodes.
@@ -273,6 +295,8 @@ impl VdbeEngine {
             results: Vec::new(),
             cursors: HashMap::new(),
             sorters: HashMap::new(),
+            storage_cursors: HashMap::new(),
+            storage_read_cursors_enabled: false,
             db: None,
             func_registry: None,
         }
@@ -286,6 +310,11 @@ impl VdbeEngine {
     /// Take ownership of the in-memory database back from the engine.
     pub fn take_database(&mut self) -> Option<MemDatabase> {
         self.db.take()
+    }
+
+    /// Enable/disable storage-backed cursor execution for `OpenRead` scans.
+    pub fn enable_storage_read_cursors(&mut self, enabled: bool) {
+        self.storage_read_cursors_enabled = enabled;
     }
 
     /// Attach a function registry for `Function`/`PureFunc` opcode dispatch.
@@ -799,8 +828,13 @@ impl VdbeEngine {
                     let cursor_id = op.p1;
                     let root_page = op.p2;
                     let writable = op.opcode == Opcode::OpenWrite;
-                    self.cursors
-                        .insert(cursor_id, MemCursor::new(root_page, writable));
+                    if !writable && self.open_storage_cursor(cursor_id, root_page) {
+                        self.cursors.remove(&cursor_id);
+                    } else {
+                        self.storage_cursors.remove(&cursor_id);
+                        self.cursors
+                            .insert(cursor_id, MemCursor::new(root_page, writable));
+                    }
                     pc += 1;
                 }
 
@@ -810,6 +844,7 @@ impl VdbeEngine {
                     let num_cols = op.p2.max(1);
                     if let Some(db) = self.db.as_mut() {
                         let root_page = db.create_table(num_cols as usize);
+                        self.storage_cursors.remove(&cursor_id);
                         self.cursors
                             .insert(cursor_id, MemCursor::new(root_page, true));
                     }
@@ -818,6 +853,7 @@ impl VdbeEngine {
 
                 Opcode::OpenPseudo => {
                     let cursor_id = op.p1;
+                    self.storage_cursors.remove(&cursor_id);
                     self.cursors.insert(cursor_id, MemCursor::new_pseudo());
                     pc += 1;
                 }
@@ -834,11 +870,13 @@ impl VdbeEngine {
                         .insert(cursor_id, SorterCursor::new(key_columns));
                     // A cursor id cannot be both table and sorter cursor.
                     self.cursors.remove(&cursor_id);
+                    self.storage_cursors.remove(&cursor_id);
                     pc += 1;
                 }
 
                 Opcode::Close => {
                     self.cursors.remove(&op.p1);
+                    self.storage_cursors.remove(&op.p1);
                     self.sorters.remove(&op.p1);
                     pc += 1;
                 }
@@ -878,6 +916,8 @@ impl VdbeEngine {
                         } else {
                             true
                         }
+                    } else if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
+                        !cursor.cursor.first(&cursor.cx)?
                     } else {
                         true
                     };
@@ -891,7 +931,9 @@ impl VdbeEngine {
                 Opcode::Last => {
                     // Position cursor at the last row. Jump to p2 if empty.
                     let cursor_id = op.p1;
-                    let is_empty = if let Some(cursor) = self.cursors.get_mut(&cursor_id) {
+                    let is_empty = if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
+                        !cursor.cursor.last(&cursor.cx)?
+                    } else if let Some(cursor) = self.cursors.get_mut(&cursor_id) {
                         if cursor.is_pseudo {
                             cursor.pseudo_row.is_none()
                         } else if let Some(db) = self.db.as_ref() {
@@ -957,6 +999,8 @@ impl VdbeEngine {
                         } else {
                             false
                         }
+                    } else if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
+                        cursor.cursor.next(&cursor.cx)?
                     } else {
                         false
                     };
@@ -970,7 +1014,9 @@ impl VdbeEngine {
                 Opcode::Prev => {
                     // Move cursor backward. Jump to p2 if more rows.
                     let cursor_id = op.p1;
-                    let has_prev = if let Some(cursor) = self.cursors.get_mut(&cursor_id) {
+                    let has_prev = if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
+                        cursor.cursor.prev(&cursor.cx)?
+                    } else if let Some(cursor) = self.cursors.get_mut(&cursor_id) {
                         if let Some(pos) = cursor.position {
                             if pos > 0 {
                                 cursor.position = Some(pos - 1);
@@ -997,7 +1043,7 @@ impl VdbeEngine {
                     let cursor_id = op.p1;
                     let col_idx = op.p2 as usize;
                     let target = op.p3;
-                    let val = self.cursor_column(cursor_id, col_idx);
+                    let val = self.cursor_column(cursor_id, col_idx)?;
                     self.set_reg(target, val);
                     pc += 1;
                 }
@@ -1006,7 +1052,7 @@ impl VdbeEngine {
                     // Get rowid from cursor p1 into register p2.
                     let cursor_id = op.p1;
                     let target = op.p2;
-                    let val = self.cursor_rowid(cursor_id);
+                    let val = self.cursor_rowid(cursor_id)?;
                     self.set_reg(target, val);
                     pc += 1;
                 }
@@ -1048,7 +1094,12 @@ impl VdbeEngine {
                     // If not found, jump to p2.
                     let cursor_id = op.p1;
                     let rowid_val = self.get_reg(op.p3).to_integer();
-                    let found = if let Some(cursor) = self.cursors.get_mut(&cursor_id) {
+                    let found = if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
+                        cursor
+                            .cursor
+                            .table_move_to(&cursor.cx, rowid_val)?
+                            .is_found()
+                    } else if let Some(cursor) = self.cursors.get_mut(&cursor_id) {
                         if let Some(db) = self.db.as_ref() {
                             if let Some(table) = db.get_table(cursor.root_page) {
                                 if let Some(idx) = table.find_by_rowid(rowid_val) {
@@ -1078,7 +1129,12 @@ impl VdbeEngine {
                     // Full index seeks require B-tree; for in-memory mode,
                     // position at the start (GE/GT) or end (LE/LT).
                     let cursor_id = op.p1;
-                    let found = if let Some(cursor) = self.cursors.get_mut(&cursor_id) {
+                    let found = if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
+                        match op.opcode {
+                            Opcode::SeekLE | Opcode::SeekLT => cursor.cursor.last(&cursor.cx)?,
+                            _ => cursor.cursor.first(&cursor.cx)?,
+                        }
+                    } else if let Some(cursor) = self.cursors.get_mut(&cursor_id) {
                         if let Some(db) = self.db.as_ref() {
                             if let Some(table) = db.get_table(cursor.root_page) {
                                 if table.rows.is_empty() {
@@ -1118,7 +1174,12 @@ impl VdbeEngine {
                     // Check if rowid in register p3 exists in cursor p1.
                     let cursor_id = op.p1;
                     let rowid_val = self.get_reg(op.p3).to_integer();
-                    let exists = if let Some(cursor) = self.cursors.get(&cursor_id) {
+                    let exists = if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
+                        cursor
+                            .cursor
+                            .table_move_to(&cursor.cx, rowid_val)?
+                            .is_found()
+                    } else if let Some(cursor) = self.cursors.get(&cursor_id) {
                         if let Some(db) = self.db.as_ref() {
                             if let Some(table) = db.get_table(cursor.root_page) {
                                 table.find_by_rowid(rowid_val).is_some()
@@ -1142,7 +1203,12 @@ impl VdbeEngine {
                     // Check if key exists; jump to p2 if found.
                     let cursor_id = op.p1;
                     let rowid_val = self.get_reg(op.p3).to_integer();
-                    let exists = if let Some(cursor) = self.cursors.get(&cursor_id) {
+                    let exists = if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
+                        cursor
+                            .cursor
+                            .table_move_to(&cursor.cx, rowid_val)?
+                            .is_found()
+                    } else if let Some(cursor) = self.cursors.get(&cursor_id) {
                         if let Some(db) = self.db.as_ref() {
                             if let Some(table) = db.get_table(cursor.root_page) {
                                 table.find_by_rowid(rowid_val).is_some()
@@ -1396,10 +1462,13 @@ impl VdbeEngine {
 
                 Opcode::IfNullRow => {
                     // Jump to p2 if cursor p1 is not positioned on a row.
-                    let is_null = self
-                        .cursors
-                        .get(&op.p1)
-                        .is_none_or(|c| c.position.is_none() && !c.is_pseudo);
+                    let is_null = if let Some(cursor) = self.storage_cursors.get(&op.p1) {
+                        cursor.cursor.eof()
+                    } else {
+                        self.cursors
+                            .get(&op.p1)
+                            .is_none_or(|c| c.position.is_none() && !c.is_pseudo)
+                    };
                     if is_null {
                         pc = op.p2 as usize;
                     } else {
@@ -1409,7 +1478,9 @@ impl VdbeEngine {
 
                 Opcode::IfNotOpen => {
                     // Jump to p2 if cursor p1 is not open.
-                    if self.cursors.contains_key(&op.p1) {
+                    if self.cursors.contains_key(&op.p1)
+                        || self.storage_cursors.contains_key(&op.p1)
+                    {
                         pc += 1;
                     } else {
                         pc = op.p2 as usize;
@@ -1653,47 +1724,95 @@ impl VdbeEngine {
     }
 
     /// Read a column value from the cursor's current row.
-    fn cursor_column(&self, cursor_id: i32, col_idx: usize) -> SqliteValue {
+    fn cursor_column(&self, cursor_id: i32, col_idx: usize) -> Result<SqliteValue> {
+        if let Some(cursor) = self.storage_cursors.get(&cursor_id) {
+            if cursor.cursor.eof() {
+                return Ok(SqliteValue::Null);
+            }
+            let payload = cursor.cursor.payload(&cursor.cx)?;
+            let values = decode_mem_record(&SqliteValue::Blob(payload));
+            return Ok(values.get(col_idx).cloned().unwrap_or(SqliteValue::Null));
+        }
+
         if let Some(cursor) = self.cursors.get(&cursor_id) {
             if cursor.is_pseudo {
-                return cursor
+                return Ok(cursor
                     .pseudo_row
                     .as_ref()
                     .and_then(|row| row.get(col_idx))
                     .cloned()
-                    .unwrap_or(SqliteValue::Null);
+                    .unwrap_or(SqliteValue::Null));
             }
-            if let Some(pos) = cursor.position {
-                if let Some(db) = self.db.as_ref() {
-                    if let Some(table) = db.get_table(cursor.root_page) {
-                        if let Some(row) = table.rows.get(pos) {
-                            return row
-                                .values
-                                .get(col_idx)
-                                .cloned()
-                                .unwrap_or(SqliteValue::Null);
-                        }
-                    }
+            if let Some(pos) = cursor.position
+                && let Some(db) = self.db.as_ref()
+                && let Some(table) = db.get_table(cursor.root_page)
+                && let Some(row) = table.rows.get(pos)
+            {
+                return Ok(row
+                    .values
+                    .get(col_idx)
+                    .cloned()
+                    .unwrap_or(SqliteValue::Null));
+            }
+        }
+
+        // Sorter cursor: read column directly from the sorted row.
+        if let Some(sorter) = self.sorters.get(&cursor_id) {
+            if let Some(pos) = sorter.position {
+                if let Some(row) = sorter.rows.get(pos) {
+                    return Ok(row.get(col_idx).cloned().unwrap_or(SqliteValue::Null));
                 }
             }
         }
-        SqliteValue::Null
+
+        Ok(SqliteValue::Null)
     }
 
     /// Get the rowid from the cursor's current row.
-    fn cursor_rowid(&self, cursor_id: i32) -> SqliteValue {
-        if let Some(cursor) = self.cursors.get(&cursor_id) {
-            if let Some(pos) = cursor.position {
-                if let Some(db) = self.db.as_ref() {
-                    if let Some(table) = db.get_table(cursor.root_page) {
-                        if let Some(row) = table.rows.get(pos) {
-                            return SqliteValue::Integer(row.rowid);
-                        }
-                    }
-                }
+    fn cursor_rowid(&self, cursor_id: i32) -> Result<SqliteValue> {
+        if let Some(cursor) = self.storage_cursors.get(&cursor_id) {
+            if cursor.cursor.eof() {
+                return Ok(SqliteValue::Null);
             }
+            return Ok(SqliteValue::Integer(cursor.cursor.rowid(&cursor.cx)?));
         }
-        SqliteValue::Null
+
+        if let Some(cursor) = self.cursors.get(&cursor_id)
+            && let Some(pos) = cursor.position
+            && let Some(db) = self.db.as_ref()
+            && let Some(table) = db.get_table(cursor.root_page)
+            && let Some(row) = table.rows.get(pos)
+        {
+            return Ok(SqliteValue::Integer(row.rowid));
+        }
+        Ok(SqliteValue::Null)
+    }
+
+    fn open_storage_cursor(&mut self, cursor_id: i32, root_page: i32) -> bool {
+        if !self.storage_read_cursors_enabled {
+            return false;
+        }
+        let Some(db) = self.db.as_ref() else {
+            return false;
+        };
+        let Some(table) = db.get_table(root_page) else {
+            return false;
+        };
+
+        let entries = table
+            .rows
+            .iter()
+            .map(|row| {
+                let payload = match encode_mem_record(&row.values) {
+                    SqliteValue::Blob(bytes) => bytes,
+                    _ => Vec::new(),
+                };
+                (row.rowid, payload)
+            })
+            .collect();
+        self.storage_cursors
+            .insert(cursor_id, StorageCursor::new(entries));
+        true
     }
 
     fn trace_opcode(&self, pc: usize, op: &VdbeOp) {
@@ -2956,6 +3075,30 @@ mod tests {
             let mut engine = VdbeEngine::new(prog.register_count());
             let outcome = engine.execute(&prog).expect("execution should succeed");
             assert_eq!(outcome, ExecOutcome::Done);
+        }
+
+        /// Verify `OpenRead` can route through the storage-backed cursor path.
+        #[test]
+        fn test_openread_uses_storage_cursor_backend_when_enabled() {
+            let mut b = ProgramBuilder::new();
+            b.emit_op(Opcode::OpenRead, 0, 2, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            let prog = b.finish().expect("program should build");
+
+            let mut db = MemDatabase::new();
+            let root = db.create_table(1);
+            assert_eq!(root, 2);
+            if let Some(table) = db.get_table_mut(root) {
+                table.insert(1, vec![SqliteValue::Integer(99)]);
+            }
+
+            let mut engine = VdbeEngine::new(prog.register_count());
+            engine.enable_storage_read_cursors(true);
+            engine.set_database(db);
+            let outcome = engine.execute(&prog).expect("execution should succeed");
+            assert_eq!(outcome, ExecOutcome::Done);
+            assert!(engine.storage_cursors.contains_key(&0));
+            assert!(!engine.cursors.contains_key(&0));
         }
 
         /// Verify codegen_update produces a program that executes.

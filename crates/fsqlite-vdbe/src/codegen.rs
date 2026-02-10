@@ -207,7 +207,14 @@ pub fn codegen_select(
             P4::Table(table.name.clone()),
             0,
         );
-        b.emit_jump_to_label(Opcode::SeekRowid, cursor, 0, done_label, P4::None, 0);
+        b.emit_jump_to_label(
+            Opcode::SeekRowid,
+            cursor,
+            rowid_reg,
+            done_label,
+            P4::None,
+            0,
+        );
 
         // Read columns.
         emit_column_reads(b, cursor, columns, table, out_regs)?;
