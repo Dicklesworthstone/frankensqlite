@@ -153,11 +153,37 @@ impl Sqlite3Executor {
             worker_scripts.push((w, script_path, stmt_count));
         }
 
-        // Run all workers concurrently.
+        // Run worker 0 first (schema setup), then remaining workers concurrently.
         let start = Instant::now();
+        let mut workers: Vec<WorkerReport> = Vec::with_capacity(worker_scripts.len());
+
+        // Phase 1: worker 0 runs alone to establish schema.
+        if let Some(&(w, ref script_path, stmt_count)) = worker_scripts.first() {
+            let worker_start = Instant::now();
+            let output = std::process::Command::new(&self.config.sqlite3_bin)
+                .arg(db_path)
+                .stdin(std::process::Stdio::from(std::fs::File::open(script_path)?))
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .output()
+                .map_err(|e| {
+                    E2eError::Io(std::io::Error::new(
+                        e.kind(),
+                        format!("failed to spawn sqlite3 for worker {w}: {e}"),
+                    ))
+                })?;
+            workers.push(Self::collect_worker_report(
+                w,
+                stmt_count,
+                &output,
+                &worker_start,
+            ));
+        }
+
+        // Phase 2: workers 1..N run concurrently.
         let mut handles: Vec<(u16, usize, std::process::Child, Instant)> = Vec::new();
 
-        for (w, script_path, stmt_count) in &worker_scripts {
+        for (w, script_path, stmt_count) in worker_scripts.iter().skip(1) {
             let child = std::process::Command::new(&self.config.sqlite3_bin)
                 .arg(db_path)
                 .stdin(std::process::Stdio::from(std::fs::File::open(script_path)?))
@@ -173,31 +199,15 @@ impl Sqlite3Executor {
             handles.push((*w, *stmt_count, child, Instant::now()));
         }
 
-        // Collect results.
-        let mut workers: Vec<WorkerReport> = Vec::with_capacity(handles.len());
+        // Collect concurrent results.
         for (w, stmt_count, child, worker_start) in handles {
             let output = child.wait_with_output()?;
-            let duration = worker_start.elapsed();
-            let exit_code = output.status.code().unwrap_or(-1);
-
-            let stderr_full = String::from_utf8_lossy(&output.stderr).into_owned();
-            let busy_count = count_pattern(&stderr_full, "database is locked")
-                + count_pattern(&stderr_full, "SQLITE_BUSY");
-            let error_count = count_pattern(&stderr_full, "Error:")
-                + count_pattern(&stderr_full, "error:")
-                + count_pattern(&stderr_full, "Runtime error");
-
-            let stderr_snippet = truncate_string(&stderr_full, 4096);
-
-            workers.push(WorkerReport {
-                worker_id: w,
-                statement_count: stmt_count,
-                exit_code,
-                duration_ms: duration.as_millis() as u64,
-                busy_count,
-                error_count,
-                stderr_snippet,
-            });
+            workers.push(Self::collect_worker_report(
+                w,
+                stmt_count,
+                &output,
+                &worker_start,
+            ));
         }
 
         let total_duration = start.elapsed();
@@ -213,6 +223,33 @@ impl Sqlite3Executor {
         })
     }
 
+    /// Build a [`WorkerReport`] from a completed `sqlite3` process.
+    #[allow(clippy::cast_possible_truncation)]
+    fn collect_worker_report(
+        worker_id: u16,
+        stmt_count: usize,
+        output: &std::process::Output,
+        start: &Instant,
+    ) -> WorkerReport {
+        let duration = start.elapsed();
+        let exit_code = output.status.code().unwrap_or(-1);
+        let stderr_full = String::from_utf8_lossy(&output.stderr).into_owned();
+        let busy_count = count_pattern(&stderr_full, "database is locked")
+            + count_pattern(&stderr_full, "SQLITE_BUSY");
+        let error_count = count_pattern(&stderr_full, "Error:")
+            + count_pattern(&stderr_full, "error:")
+            + count_pattern(&stderr_full, "Runtime error");
+        WorkerReport {
+            worker_id,
+            statement_count: stmt_count,
+            exit_code,
+            duration_ms: duration.as_millis() as u64,
+            busy_count,
+            error_count,
+            stderr_snippet: truncate_string(&stderr_full, 4096),
+        }
+    }
+
     /// Generate the SQL script for a single worker.
     fn generate_worker_sql(&self, ops: &[&OpRecord]) -> String {
         let mut sql = String::with_capacity(ops.len() * 80);
@@ -223,9 +260,7 @@ impl Sqlite3Executor {
         let _ = writeln!(
             sql,
             ".bail on\nPRAGMA busy_timeout={};\nPRAGMA journal_mode={};\nPRAGMA synchronous={};",
-            self.config.busy_timeout_ms,
-            self.config.journal_mode,
-            self.config.synchronous,
+            self.config.busy_timeout_ms, self.config.journal_mode, self.config.synchronous,
         );
 
         for op in ops {

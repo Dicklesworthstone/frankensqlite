@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use rusqlite::ffi::ErrorCode;
 use rusqlite::types::Value;
-use rusqlite::{params_from_iter, Connection, Transaction};
+use rusqlite::{Connection, Transaction, params_from_iter};
 
 use crate::oplog::{ExpectedResult, OpKind, OpLog, OpRecord};
 use crate::report::{CorrectnessReport, EngineRunReport};
@@ -120,13 +120,15 @@ pub fn run_oplog_sqlite(
 
         joins
             .into_iter()
-            .map(|j| j.join().unwrap_or_else(|_| WorkerStats {
-                ops_ok: 0,
-                ops_err: 0,
-                retries: 0,
-                aborts: 0,
-                error: Some("worker thread panicked".to_owned()),
-            }))
+            .map(|j| {
+                j.join().unwrap_or_else(|_| WorkerStats {
+                    ops_ok: 0,
+                    ops_err: 0,
+                    retries: 0,
+                    aborts: 0,
+                    error: Some("worker thread panicked".to_owned()),
+                })
+            })
             .collect()
     });
 
@@ -519,7 +521,10 @@ fn parse_sql_value(s: &str) -> Value {
 
 fn classify_rusqlite_error(err: rusqlite::Error) -> BatchError {
     let code = err.sqlite_error_code();
-    if matches!(code, Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)) {
+    if matches!(
+        code,
+        Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+    ) {
         BatchError::Busy(err.to_string())
     } else {
         BatchError::Fatal(err.to_string())
@@ -528,7 +533,10 @@ fn classify_rusqlite_error(err: rusqlite::Error) -> BatchError {
 
 fn classify_rusqlite_error_as_op(err: rusqlite::Error) -> OpError {
     let code = err.sqlite_error_code();
-    if matches!(code, Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)) {
+    if matches!(
+        code,
+        Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+    ) {
         OpError::Busy(err.to_string())
     } else {
         OpError::Fatal(err.to_string())
@@ -576,4 +584,3 @@ mod tests {
         assert_eq!(count, 100);
     }
 }
-

@@ -102,6 +102,22 @@ impl MemTable {
     fn find_by_rowid(&self, rowid: i64) -> Option<usize> {
         self.rows.iter().position(|r| r.rowid == rowid)
     }
+
+    /// Iterate all rows as `(rowid, values)` pairs.
+    ///
+    /// Used by the compat persistence layer to dump table contents to
+    /// real SQLite format files.
+    pub fn iter_rows(&self) -> impl Iterator<Item = (i64, &[SqliteValue])> + '_ {
+        self.rows.iter().map(|r| (r.rowid, r.values.as_slice()))
+    }
+
+    /// Insert a row with an explicit rowid (for loading from file).
+    ///
+    /// This is the public entry point used by the compat persistence
+    /// loader. It delegates to the private `insert` method.
+    pub fn insert_row(&mut self, rowid: i64, values: Vec<SqliteValue>) {
+        self.insert(rowid, values);
+    }
 }
 
 /// Cursor state for traversing an in-memory table.

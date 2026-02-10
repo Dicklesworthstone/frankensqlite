@@ -415,7 +415,6 @@ impl CorruptionInjector {
 
                 (total_bytes, affected_pages, all_original)
             }
-
         };
 
         std::fs::write(&self.path, &data)?;

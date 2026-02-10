@@ -12,6 +12,7 @@ pub mod executor;
 pub mod golden;
 pub mod oplog;
 pub mod report;
+pub mod sqlite_executor;
 pub mod workload;
 
 /// Result type alias used throughout the E2E harness.
