@@ -811,6 +811,16 @@ impl Connection {
         *self.concurrent_mode_default.borrow()
     }
 
+    /// Returns a reference to the connection-scoped PRAGMA state.
+    ///
+    /// The harness uses this to verify that both engines received identical
+    /// configuration (journal_mode, synchronous, cache_size, page_size,
+    /// busy_timeout).
+    #[must_use]
+    pub fn pragma_state(&self) -> std::cell::Ref<'_, fsqlite_vdbe::pragma::ConnectionPragmaState> {
+        self.pragma_state.borrow()
+    }
+
     // ── Compilation helpers ─────────────────────────────────────────────
 
     /// Compile a table-backed SELECT through the VDBE codegen.

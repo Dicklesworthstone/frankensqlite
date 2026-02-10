@@ -80,14 +80,13 @@ impl HarnessSettings {
     /// FrankenSQLite-specific settings (e.g. `fsqlite.concurrent_mode`).
     #[must_use]
     pub fn to_fsqlite_pragmas(&self) -> Vec<String> {
-        let mut pragmas = vec![
+        vec![
             format!("PRAGMA busy_timeout={};", self.busy_timeout_ms),
             format!("PRAGMA journal_mode={};", self.journal_mode),
             format!("PRAGMA synchronous={};", self.synchronous),
             format!("PRAGMA cache_size={};", self.cache_size),
             format!("PRAGMA page_size={};", self.page_size),
-        ];
-        pragmas
+        ]
     }
 
     /// Build an [`executor::ExecutorConfig`] for the sqlite3 CLI from these settings.
