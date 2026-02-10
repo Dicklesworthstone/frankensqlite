@@ -125,6 +125,15 @@ pub struct LatencySummary {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CorrectnessReport {
+    /// Tier 1: strict SHA-256 match of the raw (non-canonicalized) database bytes.
+    ///
+    /// This is *not* the default compatibility criterion: two engines can produce
+    /// identical logical content while yielding different byte layouts (page
+    /// allocation, freelists, WAL/checkpoint state, etc.).
+    ///
+    /// Intended primarily as a "did we literally write the same bytes?" check
+    /// after ensuring the DB has been checkpointed/flushed.
+    pub raw_sha256_match: Option<bool>,
     pub dump_match: Option<bool>,
     pub canonical_sha256_match: Option<bool>,
     pub integrity_check_ok: Option<bool>,
