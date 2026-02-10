@@ -2945,6 +2945,35 @@ mod tests {
     }
 
     #[test]
+    fn test_execute_returns_affected_row_count_for_dml() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (x INTEGER);").unwrap();
+
+        // Single-row INSERT returns 1.
+        let count = conn.execute("INSERT INTO t VALUES (1);").unwrap();
+        assert_eq!(count, 1);
+
+        // Multi-row INSERT returns the number of rows inserted.
+        let count = conn.execute("INSERT INTO t VALUES (2), (3), (4);").unwrap();
+        assert_eq!(count, 3);
+
+        // UPDATE returns the number of rows updated.
+        let count = conn
+            .execute("UPDATE t SET x = x + 10 WHERE x > 2;")
+            .unwrap();
+        assert_eq!(count, 2);
+
+        // DELETE returns the number of rows deleted.
+        // After the UPDATE, table has: 1, 2, 13, 14 — two values < 10.
+        let count = conn.execute("DELETE FROM t WHERE x < 10;").unwrap();
+        assert_eq!(count, 2);
+
+        // SELECT returns the number of result rows (2 remaining: 13, 14).
+        let count = conn.execute("SELECT * FROM t;").unwrap();
+        assert_eq!(count, 2);
+    }
+
+    #[test]
     fn test_query_executes_multiple_statements_in_order() {
         let conn = Connection::open(":memory:").unwrap();
         let rows = conn
