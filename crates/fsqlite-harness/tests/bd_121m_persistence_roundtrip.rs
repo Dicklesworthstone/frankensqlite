@@ -262,6 +262,38 @@ fn test_persistence_delete_survives_reopen() {
     }
 }
 
+// ── bd-1702: reserved-word column names ─────────────────────────────────────
+
+#[test]
+fn test_persistence_reserved_word_column_unquoted_key() {
+    // bd-1702: unquoted KEY as column name must survive persistence round-trip.
+    // KEY is a non-reserved keyword in SQL, so it should work without quoting.
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("kw.db");
+    let path_str = db_path.to_str().unwrap().to_owned();
+
+    {
+        let conn = Connection::open(&path_str).unwrap();
+        conn.execute("CREATE TABLE meta (key TEXT, val TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO meta VALUES ('version', '1.0');")
+            .unwrap();
+        conn.execute("UPDATE meta SET val = '2.0' WHERE key = 'version';")
+            .unwrap();
+    }
+
+    {
+        let conn = Connection::open(&path_str).unwrap();
+        let rows = conn.query("SELECT key, val FROM meta;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].get(0),
+            Some(&SqliteValue::Text("version".to_owned()))
+        );
+        assert_eq!(rows[0].get(1), Some(&SqliteValue::Text("2.0".to_owned())));
+    }
+}
+
 // ── E2E combined test ───────────────────────────────────────────────────────
 
 #[test]
