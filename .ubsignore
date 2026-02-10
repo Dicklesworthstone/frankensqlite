@@ -5,5 +5,8 @@
 # when run on these documents.
 COMPREHENSIVE_SPEC_FOR_FRANKENSQLITE_V1.md
 
+# Beads issue store is JSONL with embedded code blocks and is not "source" for UBS.
+.beads/*
+
 # Agent-specific build output dirs (large; non-source).
 target_*
