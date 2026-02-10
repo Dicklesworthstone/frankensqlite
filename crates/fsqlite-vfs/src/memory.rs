@@ -495,65 +495,64 @@ impl VfsFile for MemoryFile {
 
         {
             let mut storage = self.storage.lock().map_err(|_| lock_err())?;
-            let locks = &mut storage.locks;
             let id = self.shm_owner_id;
 
             // Escalation: None -> Shared
             if level >= LockLevel::Shared && self.lock_level < LockLevel::Shared {
                 // Blocked by Exclusive or Pending held by others.
-                if let Some(owner) = locks.exclusive {
+                if let Some(owner) = storage.locks.exclusive {
                     if owner != id {
                         return Err(FrankenError::Busy);
                     }
                 }
-                if let Some(owner) = locks.pending {
+                if let Some(owner) = storage.locks.pending {
                     if owner != id {
                         return Err(FrankenError::Busy);
                     }
                 }
-                locks.shared.insert(id);
+                storage.locks.shared.insert(id);
                 self.lock_level = LockLevel::Shared;
             }
 
             // Escalation: Shared -> Reserved
             if level >= LockLevel::Reserved && self.lock_level < LockLevel::Reserved {
                 // Blocked by any existing Reserved lock held by others.
-                if let Some(owner) = locks.reserved {
+                if let Some(owner) = storage.locks.reserved {
                     if owner != id {
                         return Err(FrankenError::Busy);
                     }
                 }
-                locks.reserved = Some(id);
+                storage.locks.reserved = Some(id);
                 self.lock_level = LockLevel::Reserved;
             }
 
             // Escalation: Reserved -> Pending
             if level >= LockLevel::Pending && self.lock_level < LockLevel::Pending {
                 // Blocked by any existing Pending lock held by others.
-                if let Some(owner) = locks.pending {
+                if let Some(owner) = storage.locks.pending {
                     if owner != id {
                         return Err(FrankenError::Busy);
                     }
                 }
-                locks.pending = Some(id);
+                storage.locks.pending = Some(id);
                 self.lock_level = LockLevel::Pending;
             }
 
             // Escalation: Pending -> Exclusive
             if level >= LockLevel::Exclusive && self.lock_level < LockLevel::Exclusive {
                 // Blocked by any existing Exclusive (should be impossible if we hold Pending/Reserved, but check anyway).
-                if let Some(owner) = locks.exclusive {
+                if let Some(owner) = storage.locks.exclusive {
                     if owner != id {
                         return Err(FrankenError::Busy);
                     }
                 }
                 // Blocked if there are ANY other readers.
                 // We are in shared set, so count must be exactly 1 (us).
-                if locks.shared.len() > 1 {
+                if storage.locks.shared.len() > 1 {
                     return Err(FrankenError::Busy);
                 }
-                locks.exclusive = Some(id);
                 self.lock_level = LockLevel::Exclusive;
+                storage.locks.exclusive = Some(id);
             }
         }
 
@@ -567,37 +566,36 @@ impl VfsFile for MemoryFile {
 
         {
             let mut storage = self.storage.lock().map_err(|_| lock_err())?;
-            let locks = &mut storage.locks;
             let id = self.shm_owner_id;
 
             // Downgrade: Exclusive -> Pending
             if self.lock_level == LockLevel::Exclusive && level < LockLevel::Exclusive {
-                if locks.exclusive == Some(id) {
-                    locks.exclusive = None;
+                if storage.locks.exclusive == Some(id) {
+                    storage.locks.exclusive = None;
                 }
                 self.lock_level = LockLevel::Pending;
             }
 
             // Downgrade: Pending -> Reserved
             if self.lock_level == LockLevel::Pending && level < LockLevel::Pending {
-                if locks.pending == Some(id) {
-                    locks.pending = None;
+                if storage.locks.pending == Some(id) {
+                    storage.locks.pending = None;
                 }
                 self.lock_level = LockLevel::Reserved;
             }
 
             // Downgrade: Reserved -> Shared
             if self.lock_level == LockLevel::Reserved && level < LockLevel::Reserved {
-                if locks.reserved == Some(id) {
-                    locks.reserved = None;
+                if storage.locks.reserved == Some(id) {
+                    storage.locks.reserved = None;
                 }
                 self.lock_level = LockLevel::Shared;
             }
 
             // Downgrade: Shared -> None
             if self.lock_level == LockLevel::Shared && level < LockLevel::Shared {
-                locks.shared.remove(&id);
                 self.lock_level = LockLevel::None;
+                storage.locks.shared.remove(&id);
             }
         }
 
@@ -605,10 +603,9 @@ impl VfsFile for MemoryFile {
     }
 
     fn check_reserved_lock(&self, _cx: &Cx) -> Result<bool> {
-        let reserved = {
-            let storage = self.storage.lock().map_err(|_| lock_err())?;
-            storage.locks.reserved
-        };
+        let storage = self.storage.lock().map_err(|_| lock_err())?;
+        let reserved = storage.locks.reserved;
+        drop(storage);
         Ok(reserved.is_some_and(|owner| owner != self.shm_owner_id))
     }
 

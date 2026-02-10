@@ -1244,6 +1244,8 @@ pub struct PresetMeta {
     pub serial_only: bool,
     /// Default concurrency sweep parameters for benchmarking.
     pub concurrency_sweep: ConcurrencySweep,
+    /// The inputs that fully determine the workload output (e.g. `["seed", "rows"]`).
+    pub determinism_inputs: Vec<String>,
 }
 
 /// Return the full catalog of built-in workload presets with documented expectations.
@@ -1261,6 +1263,11 @@ pub fn preset_catalog() -> Vec<PresetMeta> {
                 worker_counts: vec![1, 2, 4, 8, 16, 32],
                 applicable: true,
             },
+            determinism_inputs: vec![
+                "seed".to_owned(),
+                "worker_count".to_owned(),
+                "rows_per_worker".to_owned(),
+            ],
         },
         PresetMeta {
             name: "hot_page_contention".to_owned(),
@@ -1273,6 +1280,11 @@ pub fn preset_catalog() -> Vec<PresetMeta> {
                 worker_counts: vec![1, 2, 4, 8],
                 applicable: true,
             },
+            determinism_inputs: vec![
+                "seed".to_owned(),
+                "worker_count".to_owned(),
+                "rounds".to_owned(),
+            ],
         },
         PresetMeta {
             name: "mixed_read_write".to_owned(),
@@ -1285,6 +1297,11 @@ pub fn preset_catalog() -> Vec<PresetMeta> {
                 worker_counts: vec![1, 2, 4, 8, 16],
                 applicable: true,
             },
+            determinism_inputs: vec![
+                "seed".to_owned(),
+                "worker_count".to_owned(),
+                "ops_per_worker".to_owned(),
+            ],
         },
         PresetMeta {
             name: "deterministic_transform".to_owned(),
@@ -1297,6 +1314,10 @@ pub fn preset_catalog() -> Vec<PresetMeta> {
                 worker_counts: vec![1],
                 applicable: false,
             },
+            determinism_inputs: vec![
+                "seed".to_owned(),
+                "rows_per_table".to_owned(),
+            ],
         },
         PresetMeta {
             name: "large_txn".to_owned(),
@@ -1309,6 +1330,11 @@ pub fn preset_catalog() -> Vec<PresetMeta> {
                 worker_counts: vec![1, 2, 4],
                 applicable: true,
             },
+            determinism_inputs: vec![
+                "seed".to_owned(),
+                "worker_count".to_owned(),
+                "rows_per_txn".to_owned(),
+            ],
         },
         PresetMeta {
             name: "schema_migration".to_owned(),
@@ -1322,6 +1348,10 @@ pub fn preset_catalog() -> Vec<PresetMeta> {
                 worker_counts: vec![1],
                 applicable: false,
             },
+            determinism_inputs: vec![
+                "seed".to_owned(),
+                "rows".to_owned(),
+            ],
         },
     ]
 }
@@ -1665,5 +1695,257 @@ mod tests {
             })
             .count();
         assert_eq!(total_deletes, deletes, "delete count");
+    }
+
+    // ── Large Transaction preset tests ──────────────────────────────
+
+    #[test]
+    fn test_preset_large_txn_structure() {
+        let log = preset_large_txn("fix-lt", 42, 2, 50);
+
+        assert_eq!(log.header.preset.as_deref(), Some("large_txn"));
+        assert_eq!(log.header.concurrency.worker_count, 2);
+        assert_eq!(log.header.concurrency.commit_order_policy, "deterministic");
+
+        // Should have DDL (CREATE TABLE + CREATE INDEX).
+        let ddl_count = log
+            .records
+            .iter()
+            .filter(|r| {
+                matches!(&r.kind, OpKind::Sql { statement }
+                    if statement.starts_with("CREATE"))
+            })
+            .count();
+        assert!(ddl_count >= 4, "expected at least 4 DDL statements (2 tables + indexes)");
+
+        // Each worker should have inserts into lt_main.
+        let main_inserts: usize = log
+            .records
+            .iter()
+            .filter(|r| matches!(&r.kind, OpKind::Insert { table, .. } if table == "lt_main"))
+            .count();
+        assert_eq!(
+            main_inserts,
+            100,
+            "2 workers × 50 rows = 100 lt_main inserts"
+        );
+
+        // Aux inserts: every other row → 25 per worker.
+        let aux_inserts: usize = log
+            .records
+            .iter()
+            .filter(|r| matches!(&r.kind, OpKind::Insert { table, .. } if table == "lt_aux"))
+            .count();
+        assert_eq!(aux_inserts, 50, "2 workers × 25 aux rows = 50");
+
+        // Verification queries at the end.
+        let verify_count = log
+            .records
+            .iter()
+            .filter(|r| {
+                matches!(&r.kind, OpKind::Sql { statement }
+                    if statement.starts_with("SELECT COUNT(*)"))
+            })
+            .count();
+        assert_eq!(verify_count, 2, "expected 2 verification queries");
+    }
+
+    #[test]
+    fn test_preset_large_txn_seed_stability() {
+        let a = preset_large_txn("fix", 99, 2, 100);
+        let b = preset_large_txn("fix", 99, 2, 100);
+        let jsonl_a = a.to_jsonl().unwrap();
+        let jsonl_b = b.to_jsonl().unwrap();
+        assert_eq!(jsonl_a, jsonl_b, "same seed must produce same JSONL");
+    }
+
+    #[test]
+    fn test_preset_large_txn_jsonl_roundtrip() {
+        let log = preset_large_txn("rt", 42, 2, 30);
+        let jsonl = log.to_jsonl().unwrap();
+        let parsed = OpLog::from_jsonl(&jsonl).unwrap();
+        assert_eq!(parsed.records.len(), log.records.len());
+        assert_eq!(parsed.header.preset.as_deref(), Some("large_txn"));
+    }
+
+    // ── Schema Migration preset tests ───────────────────────────────
+
+    #[test]
+    fn test_preset_schema_migration_structure() {
+        let log = preset_schema_migration("fix-sm", 42, 20);
+
+        assert_eq!(log.header.preset.as_deref(), Some("schema_migration"));
+        assert_eq!(log.header.concurrency.worker_count, 1);
+
+        // V1: CREATE TABLE users + posts.
+        let create_count = log
+            .records
+            .iter()
+            .filter(|r| {
+                matches!(&r.kind, OpKind::Sql { statement }
+                    if statement.starts_with("CREATE TABLE"))
+            })
+            .count();
+        assert!(create_count >= 4, "expected CREATE TABLE for users, posts, tags, article_tags");
+
+        // V2: ALTER TABLE statements.
+        let alter_count = log
+            .records
+            .iter()
+            .filter(|r| {
+                matches!(&r.kind, OpKind::Sql { statement }
+                    if statement.starts_with("ALTER TABLE"))
+            })
+            .count();
+        assert!(alter_count >= 3, "expected ALTER TABLE ADD COLUMN (×2) + RENAME");
+
+        // V2: CREATE INDEX.
+        let idx_count = log
+            .records
+            .iter()
+            .filter(|r| {
+                matches!(&r.kind, OpKind::Sql { statement }
+                    if statement.starts_with("CREATE INDEX"))
+            })
+            .count();
+        assert!(idx_count >= 2, "expected at least 2 index creations");
+
+        // User inserts.
+        let user_inserts: usize = log
+            .records
+            .iter()
+            .filter(|r| matches!(&r.kind, OpKind::Insert { table, .. } if table == "users"))
+            .count();
+        assert_eq!(user_inserts, 20, "20 user inserts");
+
+        // Post inserts (2 per user).
+        let post_inserts: usize = log
+            .records
+            .iter()
+            .filter(|r| matches!(&r.kind, OpKind::Insert { table, .. } if table == "posts"))
+            .count();
+        assert_eq!(post_inserts, 40, "40 post inserts (2 per user)");
+
+        // Tag inserts.
+        let tag_inserts: usize = log
+            .records
+            .iter()
+            .filter(|r| matches!(&r.kind, OpKind::Insert { table, .. } if table == "tags"))
+            .count();
+        assert_eq!(tag_inserts, 5, "5 tag inserts");
+
+        // Verification queries.
+        let verify_count = log
+            .records
+            .iter()
+            .filter(|r| {
+                matches!(&r.kind, OpKind::Sql { statement }
+                    if statement.starts_with("SELECT COUNT(*)"))
+            })
+            .count();
+        assert_eq!(verify_count, 4, "4 verification queries");
+    }
+
+    #[test]
+    fn test_preset_schema_migration_seed_stability() {
+        let a = preset_schema_migration("fix", 99, 15);
+        let b = preset_schema_migration("fix", 99, 15);
+        let jsonl_a = a.to_jsonl().unwrap();
+        let jsonl_b = b.to_jsonl().unwrap();
+        assert_eq!(jsonl_a, jsonl_b, "same seed must produce same JSONL");
+    }
+
+    #[test]
+    fn test_preset_schema_migration_jsonl_roundtrip() {
+        let log = preset_schema_migration("rt", 42, 10);
+        let jsonl = log.to_jsonl().unwrap();
+        let parsed = OpLog::from_jsonl(&jsonl).unwrap();
+        assert_eq!(parsed.records.len(), log.records.len());
+        assert_eq!(parsed.header.preset.as_deref(), Some("schema_migration"));
+
+        // Op IDs must be monotonically increasing.
+        for (i, rec) in parsed.records.iter().enumerate() {
+            if i > 0 {
+                assert!(
+                    rec.op_id > parsed.records[i - 1].op_id,
+                    "op_id must increase"
+                );
+            }
+        }
+    }
+
+    // ── Catalog tests ───────────────────────────────────────────────
+
+    #[test]
+    fn test_preset_catalog_completeness() {
+        let catalog = preset_catalog();
+
+        // All 6 presets should be listed.
+        assert_eq!(catalog.len(), 6, "catalog should have 6 presets");
+
+        let names: Vec<&str> = catalog.iter().map(|p| p.name.as_str()).collect();
+        assert!(names.contains(&"commutative_inserts_disjoint_keys"));
+        assert!(names.contains(&"hot_page_contention"));
+        assert!(names.contains(&"mixed_read_write"));
+        assert!(names.contains(&"deterministic_transform"));
+        assert!(names.contains(&"large_txn"));
+        assert!(names.contains(&"schema_migration"));
+    }
+
+    #[test]
+    fn test_preset_catalog_serial_presets_have_single_worker() {
+        let catalog = preset_catalog();
+        for meta in &catalog {
+            if meta.serial_only {
+                assert_eq!(
+                    meta.concurrency_sweep.worker_counts,
+                    vec![1],
+                    "serial preset {} should have worker_counts = [1]",
+                    meta.name
+                );
+                assert!(
+                    !meta.concurrency_sweep.applicable,
+                    "serial preset {} should not have applicable concurrency sweep",
+                    meta.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_preset_catalog_serde_roundtrip() {
+        let catalog = preset_catalog();
+        let json = serde_json::to_string_pretty(&catalog).unwrap();
+        let parsed: Vec<PresetMeta> = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.len(), catalog.len());
+        for (a, b) in catalog.iter().zip(parsed.iter()) {
+            assert_eq!(a.name, b.name);
+            assert_eq!(a.expected_tier, b.expected_tier);
+        }
+    }
+
+    #[test]
+    fn test_equivalence_tier_display() {
+        assert_eq!(EquivalenceTier::Tier1Raw.to_string(), "tier1_raw");
+        assert_eq!(EquivalenceTier::Tier2Canonical.to_string(), "tier2_canonical");
+        assert_eq!(EquivalenceTier::Tier3Logical.to_string(), "tier3_logical");
+    }
+
+    #[test]
+    fn test_preset_catalog_determinism_inputs_populated() {
+        let catalog = preset_catalog();
+        for meta in &catalog {
+            assert!(
+                !meta.determinism_inputs.is_empty(),
+                "preset {} must declare its determinism inputs",
+                meta.name
+            );
+            // Every preset should at least include "seed".
+            assert!(
+                meta.determinism_inputs.iter().any(|i| i == "seed"),
+                "preset {} should include 'seed' in determinism_inputs",
+                meta.name
+            );
+        }
     }
 }
