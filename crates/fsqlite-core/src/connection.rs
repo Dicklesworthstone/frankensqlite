@@ -12,8 +12,8 @@ use std::sync::Arc;
 
 use fsqlite_ast::{
     BinaryOp, CreateTableBody, Distinctness, Expr, FunctionArgs, InSet, LikeOp, LimitClause,
-    Literal, NullsOrder, OrderingTerm, PlaceholderType, ResultColumn, SelectCore, SelectStatement,
-    SortDirection, Statement, UnaryOp,
+    Literal, NullsOrder, OrderingTerm, PlaceholderType, ResultColumn, SelectBody, SelectCore,
+    SelectStatement, SortDirection, Statement, UnaryOp,
 };
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_func::FunctionRegistry;
@@ -316,6 +316,12 @@ impl Connection {
                         dedup_rows(&mut rows);
                     }
                     Ok(rows)
+                } else if has_group_by(select) {
+                    let mut rows = self.execute_group_by_select(select, params)?;
+                    if distinct {
+                        dedup_rows(&mut rows);
+                    }
+                    Ok(rows)
                 } else {
                     let program = self.compile_table_select(select)?;
                     let mut rows = self.execute_table_program(&program, params)?;
@@ -579,6 +585,174 @@ impl Connection {
         builder.finish()
     }
 
+    /// Execute a GROUP BY aggregate SELECT via post-execution processing.
+    ///
+    /// 1. Compile and execute a `SELECT *` scan (no aggregates)
+    /// 2. Group rows by GROUP BY key columns
+    /// 3. Compute aggregates per group
+    #[allow(clippy::too_many_lines)]
+    fn execute_group_by_select(
+        &self,
+        select: &SelectStatement,
+        params: Option<&[SqliteValue]>,
+    ) -> Result<Vec<Row>> {
+        // Extract GROUP BY expressions and result columns from the AST.
+        let SelectCore::Select {
+            columns,
+            group_by: group_by_exprs,
+            ..
+        } = &select.body.select
+        else {
+            return Err(FrankenError::NotImplemented(
+                "GROUP BY on non-SELECT core".to_owned(),
+            ));
+        };
+
+        // Find the table name from the FROM clause.
+        let table_name = match &select.body.select {
+            SelectCore::Select {
+                from: Some(from), ..
+            } => match &from.source {
+                fsqlite_ast::TableOrSubquery::Table { name, .. } => name.name.clone(),
+                _ => {
+                    return Err(FrankenError::NotImplemented(
+                        "GROUP BY with non-table source".to_owned(),
+                    ));
+                }
+            },
+            _ => {
+                return Err(FrankenError::NotImplemented(
+                    "GROUP BY without FROM".to_owned(),
+                ));
+            }
+        };
+
+        // Resolve table schema to map column names to indices.
+        let schema = self.schema.borrow();
+        let table_schema = schema
+            .iter()
+            .find(|t| t.name.eq_ignore_ascii_case(&table_name))
+            .ok_or_else(|| FrankenError::Internal(format!("table not found: {table_name}")))?;
+
+        // Resolve GROUP BY key column indices.
+        let group_key_indices: Vec<usize> = group_by_exprs
+            .iter()
+            .map(|expr| {
+                let col_name = expr_col_name(expr).ok_or_else(|| {
+                    FrankenError::NotImplemented("GROUP BY with non-column expression".to_owned())
+                })?;
+                table_schema.column_index(col_name).ok_or_else(|| {
+                    FrankenError::Internal(format!("GROUP BY column not found: {col_name}"))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        // Parse result columns into GroupByColumn descriptors.
+        let result_descriptors: Vec<GroupByColumn> = columns
+            .iter()
+            .map(|col| match col {
+                ResultColumn::Expr {
+                    expr: Expr::FunctionCall { name, args, .. },
+                    ..
+                } if is_agg_fn(name) => {
+                    let arg_col = match args {
+                        FunctionArgs::Star => None,
+                        FunctionArgs::List(exprs) if exprs.is_empty() => None,
+                        FunctionArgs::List(exprs) => {
+                            let col_name = expr_col_name(&exprs[0]);
+                            col_name.and_then(|n| table_schema.column_index(n))
+                        }
+                    };
+                    Ok(GroupByColumn::Agg {
+                        name: name.to_ascii_lowercase(),
+                        arg_col,
+                    })
+                }
+                ResultColumn::Expr { expr, .. } => {
+                    let col_name = expr_col_name(expr).ok_or_else(|| {
+                        FrankenError::NotImplemented(
+                            "GROUP BY with non-column non-aggregate expression".to_owned(),
+                        )
+                    })?;
+                    let idx = table_schema.column_index(col_name).ok_or_else(|| {
+                        FrankenError::Internal(format!("result column not found: {col_name}"))
+                    })?;
+                    Ok(GroupByColumn::Plain(idx))
+                }
+                ResultColumn::Star | ResultColumn::TableStar(_) => Err(
+                    FrankenError::NotImplemented("SELECT * with GROUP BY".to_owned()),
+                ),
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        drop(schema);
+
+        // Compile and execute a raw SELECT * scan (no aggregates, no GROUP BY).
+        let raw_select = build_raw_scan_select(select);
+        let program = self.compile_table_select(&raw_select)?;
+        let raw_rows = self.execute_table_program(&program, params)?;
+
+        // Group rows by key columns.
+        let mut groups: Vec<(Vec<SqliteValue>, Vec<Vec<SqliteValue>>)> = Vec::new();
+        for row in &raw_rows {
+            let key: Vec<SqliteValue> = group_key_indices
+                .iter()
+                .map(|&idx| row.get(idx).cloned().unwrap_or(SqliteValue::Null))
+                .collect();
+            if let Some(group) = groups.iter_mut().find(|(k, _)| k == &key) {
+                group.1.push(row.values().to_vec());
+            } else {
+                groups.push((key, vec![row.values().to_vec()]));
+            }
+        }
+
+        // Build result rows from groups.
+        let mut result = Vec::with_capacity(groups.len());
+        for (_key, group_rows) in &groups {
+            let mut values = Vec::with_capacity(result_descriptors.len());
+            for desc in &result_descriptors {
+                match desc {
+                    GroupByColumn::Plain(col_idx) => {
+                        // Use the value from the first row in the group.
+                        values.push(
+                            group_rows
+                                .first()
+                                .and_then(|r| r.get(*col_idx))
+                                .cloned()
+                                .unwrap_or(SqliteValue::Null),
+                        );
+                    }
+                    GroupByColumn::Agg { name, arg_col } => {
+                        let agg_values: Vec<&SqliteValue> = match arg_col {
+                            Some(idx) => group_rows.iter().filter_map(|r| r.get(*idx)).collect(),
+                            None => {
+                                // count(*): one entry per row
+                                group_rows
+                                    .iter()
+                                    .map(|r| r.first().unwrap_or(&SqliteValue::Null))
+                                    .collect()
+                            }
+                        };
+                        values.push(compute_aggregate(name, &agg_values));
+                    }
+                }
+            }
+            result.push(Row { values });
+        }
+
+        // Post-process: ORDER BY.
+        if !select.order_by.is_empty() {
+            sort_rows_by_order_terms(&mut result, &select.order_by, columns)?;
+        }
+
+        // Post-process: LIMIT / OFFSET.
+        if let Some(limit_clause) = &select.limit {
+            apply_limit_offset_postprocess(&mut result, limit_clause);
+        }
+
+        Ok(result)
+    }
+
     /// Compile an INSERT through the VDBE codegen.
     fn compile_table_insert(&self, insert: &fsqlite_ast::InsertStatement) -> Result<VdbeProgram> {
         let schema = self.schema.borrow();
@@ -731,6 +905,183 @@ fn dedup_rows(rows: &mut Vec<Row>) {
             true
         }
     });
+}
+
+/// Check whether a table-backed SELECT has a GROUP BY clause.
+fn has_group_by(select: &SelectStatement) -> bool {
+    matches!(
+        &select.body.select,
+        SelectCore::Select { group_by, .. } if !group_by.is_empty()
+    )
+}
+
+/// Known aggregate function names (must match codegen.rs).
+const AGG_NAMES: &[&str] = &[
+    "avg",
+    "count",
+    "group_concat",
+    "string_agg",
+    "max",
+    "min",
+    "sum",
+    "total",
+];
+
+/// Check whether a function name is a known aggregate.
+fn is_agg_fn(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    AGG_NAMES.iter().any(|&n| n == lower)
+}
+
+/// Describes one result column in a GROUP BY query.
+enum GroupByColumn {
+    /// A non-aggregate column reference; stores the column index in the raw row.
+    Plain(usize),
+    /// An aggregate function; stores (func_name_lower, arg_col_index_or_None_for_star).
+    Agg {
+        name: String,
+        arg_col: Option<usize>,
+    },
+}
+
+/// Resolve a column name from an expression (simple Expr::Column case).
+fn expr_col_name(expr: &Expr) -> Option<&str> {
+    match expr {
+        Expr::Column(col_ref, _) => Some(col_ref.column.as_str()),
+        _ => None,
+    }
+}
+
+/// Build a `SELECT *` scan from a GROUP BY SELECT (strips aggregates and GROUP BY).
+fn build_raw_scan_select(select: &SelectStatement) -> SelectStatement {
+    let new_core = match &select.body.select {
+        SelectCore::Select {
+            from, where_clause, ..
+        } => SelectCore::Select {
+            distinct: Distinctness::All,
+            columns: vec![ResultColumn::Star],
+            from: from.clone(),
+            where_clause: where_clause.clone(),
+            group_by: vec![],
+            having: None,
+            windows: vec![],
+        },
+        other @ SelectCore::Values(_) => other.clone(),
+    };
+    SelectStatement {
+        with: select.with.clone(),
+        body: SelectBody {
+            select: new_core,
+            compounds: vec![],
+        },
+        order_by: vec![],
+        limit: None,
+    }
+}
+
+/// Compute the aggregate value for a group of values.
+#[allow(clippy::cast_possible_wrap)]
+fn compute_aggregate(name: &str, values: &[&SqliteValue]) -> SqliteValue {
+    match name {
+        "count" => SqliteValue::Integer(values.len() as i64),
+        "sum" | "total" => {
+            let mut sum = 0.0_f64;
+            let mut has_int = false;
+            let mut all_int = true;
+            let mut int_sum = 0_i64;
+            for v in values {
+                match v {
+                    SqliteValue::Integer(n) => {
+                        has_int = true;
+                        int_sum = int_sum.wrapping_add(*n);
+                        sum += *n as f64;
+                    }
+                    SqliteValue::Float(f) => {
+                        all_int = false;
+                        sum += f;
+                    }
+                    _ => {
+                        all_int = false;
+                    }
+                }
+            }
+            if name == "total" {
+                SqliteValue::Float(sum)
+            } else if has_int && all_int {
+                SqliteValue::Integer(int_sum)
+            } else {
+                SqliteValue::Float(sum)
+            }
+        }
+        "avg" => {
+            if values.is_empty() {
+                return SqliteValue::Null;
+            }
+            let mut sum = 0.0_f64;
+            let mut count = 0_u64;
+            for v in values {
+                match v {
+                    SqliteValue::Integer(n) => {
+                        sum += *n as f64;
+                        count += 1;
+                    }
+                    SqliteValue::Float(f) => {
+                        sum += f;
+                        count += 1;
+                    }
+                    _ => {}
+                }
+            }
+            if count == 0 {
+                SqliteValue::Null
+            } else {
+                SqliteValue::Float(sum / count as f64)
+            }
+        }
+        "min" => values
+            .iter()
+            .filter(|v| !matches!(v, SqliteValue::Null))
+            .min_by(|a, b| cmp_sqlite_values(a, b))
+            .map_or(SqliteValue::Null, |v| (*v).clone()),
+        "max" => values
+            .iter()
+            .filter(|v| !matches!(v, SqliteValue::Null))
+            .max_by(|a, b| cmp_sqlite_values(a, b))
+            .map_or(SqliteValue::Null, |v| (*v).clone()),
+        "group_concat" | "string_agg" => {
+            let parts: Vec<String> = values
+                .iter()
+                .filter(|v| !matches!(v, SqliteValue::Null))
+                .map(|v| match v {
+                    SqliteValue::Text(s) => s.clone(),
+                    SqliteValue::Integer(n) => n.to_string(),
+                    SqliteValue::Float(f) => f.to_string(),
+                    _ => String::new(),
+                })
+                .collect();
+            SqliteValue::Text(parts.join(","))
+        }
+        _ => SqliteValue::Null,
+    }
+}
+
+/// Compare two `SqliteValue`s for ordering (used by min/max aggregates).
+fn cmp_sqlite_values(a: &SqliteValue, b: &SqliteValue) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (a, b) {
+        (SqliteValue::Integer(a), SqliteValue::Integer(b)) => a.cmp(b),
+        (SqliteValue::Float(a), SqliteValue::Float(b)) => {
+            a.partial_cmp(b).unwrap_or(Ordering::Equal)
+        }
+        (SqliteValue::Integer(a), SqliteValue::Float(b)) => {
+            (*a as f64).partial_cmp(b).unwrap_or(Ordering::Equal)
+        }
+        (SqliteValue::Float(a), SqliteValue::Integer(b)) => {
+            a.partial_cmp(&(*b as f64)).unwrap_or(Ordering::Equal)
+        }
+        (SqliteValue::Text(a), SqliteValue::Text(b)) => a.cmp(b),
+        _ => Ordering::Equal,
+    }
 }
 
 /// Map an AST type name to a codegen affinity character.
@@ -3095,7 +3446,7 @@ mod tests {
         let stmt = super::parse_single_statement("INSERT INTO t VALUES (X'DEADBEEF');").unwrap();
         let insert = match stmt {
             Statement::Insert(insert) => insert,
-            other => panic!("expected INSERT statement, got {other:?}"),
+            other => unreachable!("expected INSERT statement, got {other:?}"),
         };
 
         let program = conn.compile_table_insert(&insert).unwrap();
@@ -3110,7 +3461,7 @@ mod tests {
             P4::Blob(bytes) => {
                 assert_eq!(bytes, &vec![0xDE, 0xAD, 0xBE, 0xEF]);
             }
-            other => panic!("expected P4::Blob, got {other:?}"),
+            other => unreachable!("expected P4::Blob, got {other:?}"),
         }
     }
 
@@ -3123,7 +3474,7 @@ mod tests {
         let stmt = super::parse_single_statement("SELECT bl FROM t;").unwrap();
         let select = match stmt {
             Statement::Select(select) => select,
-            other => panic!("expected SELECT statement, got {other:?}"),
+            other => unreachable!("expected SELECT statement, got {other:?}"),
         };
         let program = conn.compile_table_select(&select).unwrap();
 
