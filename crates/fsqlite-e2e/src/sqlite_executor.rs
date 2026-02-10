@@ -185,9 +185,13 @@ pub fn run_oplog_sqlite(
         retries,
         aborts,
         correctness: CorrectnessReport {
+            raw_sha256_match: None,
             dump_match: None,
             canonical_sha256_match: None,
             integrity_check_ok: None,
+            raw_sha256: None,
+            canonical_sha256: None,
+            logical_sha256: None,
             notes: None,
         },
         latency_ms: None,

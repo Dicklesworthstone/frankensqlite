@@ -17,7 +17,7 @@
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -59,6 +59,10 @@ impl Default for ExecutorConfig {
 /// Structured JSON report produced by a run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunReport {
+    /// Path to the `sqlite3` binary used for the run.
+    pub sqlite3_bin: String,
+    /// `sqlite3 --version` output (best-effort).
+    pub sqlite3_version: Option<String>,
     /// Database path that was tested.
     pub db_path: String,
     /// OpLog preset name (if any).
@@ -84,6 +88,8 @@ pub struct WorkerReport {
     pub exit_code: i32,
     /// Wall-clock duration for this worker.
     pub duration_ms: u64,
+    /// Raw stdout output (truncated to 4 KiB for the report).
+    pub stdout_snippet: String,
     /// Number of `SQLITE_BUSY` errors detected in stderr.
     pub busy_count: usize,
     /// Number of other errors detected in stderr.
@@ -122,6 +128,7 @@ impl Sqlite3Executor {
     /// Returns `E2eError::Io` on process spawn or temp-file failures.
     #[allow(clippy::too_many_lines, clippy::cast_possible_truncation)]
     pub fn run(&self, oplog: &OpLog, db_path: &Path) -> E2eResult<RunReport> {
+        let sqlite3_version = self.detect_sqlite3_version();
         let worker_count = oplog.header.concurrency.worker_count;
 
         // Treat the leading SQL-only prefix as global setup (DDL/PRAGMAs) that
@@ -224,11 +231,13 @@ impl Sqlite3Executor {
         let success = workers.iter().all(|w| w.exit_code == 0);
 
         Ok(RunReport {
+            sqlite3_bin: self.config.sqlite3_bin.clone(),
+            sqlite3_version,
             db_path: db_path.to_string_lossy().into_owned(),
             preset: oplog.header.preset.clone(),
             worker_count,
             workers,
-            total_duration_ms: total_duration.as_millis() as u64,
+            total_duration_ms: duration_to_u64_ms(total_duration),
             success,
         })
     }
@@ -243,6 +252,7 @@ impl Sqlite3Executor {
     ) -> WorkerReport {
         let duration = start.elapsed();
         let exit_code = output.status.code().unwrap_or(-1);
+        let stdout_full = String::from_utf8_lossy(&output.stdout).into_owned();
         let stderr_full = String::from_utf8_lossy(&output.stderr).into_owned();
         let busy_count = count_pattern(&stderr_full, "database is locked")
             + count_pattern(&stderr_full, "SQLITE_BUSY");
@@ -253,7 +263,8 @@ impl Sqlite3Executor {
             worker_id,
             statement_count: stmt_count,
             exit_code,
-            duration_ms: duration.as_millis() as u64,
+            duration_ms: duration_to_u64_ms(duration),
+            stdout_snippet: truncate_string(&stdout_full, 4096),
             busy_count,
             error_count,
             stderr_snippet: truncate_string(&stderr_full, 4096),
@@ -333,9 +344,31 @@ impl Sqlite3Executor {
 
         sql
     }
+
+    fn detect_sqlite3_version(&self) -> Option<String> {
+        let out = std::process::Command::new(&self.config.sqlite3_bin)
+            .arg("--version")
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+
+        let s = String::from_utf8_lossy(&out.stdout);
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_owned())
+        }
+    }
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────
+
+fn duration_to_u64_ms(d: Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+}
 
 /// Quote a value for insertion into SQL.  Attempts to detect numeric values
 /// and pass them unquoted; everything else is single-quoted with escaping.
@@ -601,6 +634,8 @@ mod tests {
     #[test]
     fn test_report_serialization() {
         let report = RunReport {
+            sqlite3_bin: "sqlite3".to_owned(),
+            sqlite3_version: Some("3.45.0".to_owned()),
             db_path: "/tmp/test.db".to_owned(),
             preset: Some("test_preset".to_owned()),
             worker_count: 2,
@@ -610,6 +645,7 @@ mod tests {
                     statement_count: 10,
                     exit_code: 0,
                     duration_ms: 50,
+                    stdout_snippet: String::new(),
                     busy_count: 0,
                     error_count: 0,
                     stderr_snippet: String::new(),
@@ -619,6 +655,7 @@ mod tests {
                     statement_count: 10,
                     exit_code: 0,
                     duration_ms: 55,
+                    stdout_snippet: String::new(),
                     busy_count: 2,
                     error_count: 0,
                     stderr_snippet: "database is locked\ndatabase is locked\n".to_owned(),

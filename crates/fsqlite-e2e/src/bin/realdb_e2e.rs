@@ -14,8 +14,13 @@ use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
+
+use fsqlite_e2e::oplog::{self, OpLog};
+use fsqlite_e2e::report::EngineRunReport;
+use fsqlite_e2e::sqlite_executor::{SqliteExecConfig, run_oplog_sqlite};
 
 fn main() {
     let exit_code = run_cli(std::env::args_os());
@@ -401,14 +406,185 @@ fn cmd_run(argv: &[String]) -> i32 {
         i += 1;
     }
 
-    println!(
-        "run: engine={} db={} workload={} concurrency={concurrency}",
-        engine.as_deref().unwrap_or("(not set)"),
-        db.as_deref().unwrap_or("(not set)"),
-        workload.as_deref().unwrap_or("(not set)"),
+    let Some(engine_str) = engine.as_deref() else {
+        eprintln!("error: --engine is required (sqlite3|fsqlite)");
+        return 2;
+    };
+    let Some(db_name) = db.as_deref() else {
+        eprintln!("error: --db is required (golden database identifier)");
+        return 2;
+    };
+    let Some(workload_name) = workload.as_deref() else {
+        eprintln!("error: --workload is required (preset name)");
+        return 2;
+    };
+
+    match engine_str {
+        "sqlite3" => run_sqlite3_engine(db_name, workload_name, concurrency),
+        "fsqlite" => {
+            eprintln!("error: fsqlite engine not yet implemented (see bd-1w6k.3.3)");
+            1
+        }
+        other => {
+            eprintln!("error: unknown engine `{other}` (expected sqlite3 or fsqlite)");
+            2
+        }
+    }
+}
+
+/// Resolve a database identifier to its golden copy path.
+///
+/// Accepts either a bare name (e.g. `"frankensqlite"`) which maps to
+/// `sample_sqlite_db_files/golden/frankensqlite.db`, or an absolute/relative
+/// path to an existing `.db` file.
+fn resolve_golden_db(db_name: &str) -> Result<PathBuf, String> {
+    // If it looks like a path and exists, use it directly.
+    let as_path = PathBuf::from(db_name);
+    if as_path.exists() {
+        return Ok(as_path);
+    }
+
+    // Try golden directory with .db extension.
+    let golden = PathBuf::from(DEFAULT_GOLDEN_DIR).join(format!("{db_name}.db"));
+    if golden.exists() {
+        return Ok(golden);
+    }
+
+    // Try golden directory without adding .db (user may have included it).
+    let golden_bare = PathBuf::from(DEFAULT_GOLDEN_DIR).join(db_name);
+    if golden_bare.exists() {
+        return Ok(golden_bare);
+    }
+
+    Err(format!(
+        "cannot find database `{db_name}` (tried {}, {}, and literal path)",
+        golden.display(),
+        golden_bare.display(),
+    ))
+}
+
+/// Generate an OpLog from a preset name and concurrency setting.
+fn resolve_workload(preset: &str, fixture_id: &str, concurrency: u16) -> Result<OpLog, String> {
+    match preset {
+        "commutative_inserts_disjoint_keys" | "commutative_inserts" => Ok(
+            oplog::preset_commutative_inserts_disjoint_keys(fixture_id, 42, concurrency, 100),
+        ),
+        "hot_page_contention" | "hot_page" => Ok(oplog::preset_hot_page_contention(
+            fixture_id,
+            42,
+            concurrency,
+            10,
+        )),
+        "mixed_read_write" | "mixed" => Ok(oplog::preset_mixed_read_write(
+            fixture_id,
+            42,
+            concurrency,
+            50,
+        )),
+        other => Err(format!(
+            "unknown workload preset `{other}`. Available: \
+             commutative_inserts_disjoint_keys, hot_page_contention, mixed_read_write"
+        )),
+    }
+}
+
+/// Execute a workload against C SQLite via rusqlite and print JSON results.
+fn run_sqlite3_engine(db_name: &str, workload_name: &str, concurrency: u16) -> i32 {
+    // Resolve golden DB path.
+    let golden_path = match resolve_golden_db(db_name) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return 1;
+        }
+    };
+
+    // Copy golden to a working directory so we don't modify the original.
+    let work_dir = match tempfile::tempdir() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("error: failed to create temp dir: {e}");
+            return 1;
+        }
+    };
+    let work_db = work_dir.path().join("work.db");
+    if let Err(e) = fs::copy(&golden_path, &work_db) {
+        eprintln!(
+            "error: failed to copy {} to {}: {e}",
+            golden_path.display(),
+            work_db.display()
+        );
+        return 1;
+    }
+
+    // Resolve the workload preset.
+    let oplog = match resolve_workload(workload_name, db_name, concurrency) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return 1;
+        }
+    };
+
+    let config = SqliteExecConfig::default();
+    let sqlite_version = rusqlite::version().to_owned();
+
+    eprintln!(
+        "Running: engine=sqlite3 (v{sqlite_version}) db={db_name} \
+         workload={workload_name} concurrency={concurrency}"
     );
-    println!("(executor not yet implemented — see bd-1w6k.3.2, bd-1w6k.3.3)");
-    0
+    eprintln!("  golden: {}", golden_path.display());
+    eprintln!("  working: {}", work_db.display());
+    eprintln!("  ops: {}", oplog.records.len());
+
+    // Execute the workload.
+    let report = match run_oplog_sqlite(&work_db, &oplog, &config) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("error: execution failed: {e}");
+            return 1;
+        }
+    };
+
+    // Build JSON output.
+    let output = RunOutput {
+        engine: "sqlite3".to_owned(),
+        sqlite_version,
+        db: db_name.to_owned(),
+        golden_path: golden_path.display().to_string(),
+        workload: workload_name.to_owned(),
+        concurrency,
+        ops_count: oplog.records.len(),
+        report,
+        timestamp_unix_ms: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
+    };
+
+    match serde_json::to_string_pretty(&output) {
+        Ok(json) => {
+            println!("{json}");
+            i32::from(output.report.error.is_some())
+        }
+        Err(e) => {
+            eprintln!("error: failed to serialize report: {e}");
+            1
+        }
+    }
+}
+
+/// JSON output structure for a single run invocation.
+#[derive(serde::Serialize)]
+struct RunOutput {
+    engine: String,
+    sqlite_version: String,
+    db: String,
+    golden_path: String,
+    workload: String,
+    concurrency: u16,
+    ops_count: usize,
+    report: EngineRunReport,
+    timestamp_unix_ms: u64,
 }
 
 fn print_run_help() {
@@ -554,21 +730,28 @@ mod tests {
 
     #[test]
     fn test_run_parses_all_options() {
-        assert_eq!(
-            run_with(&[
-                "realdb-e2e",
-                "run",
-                "--engine",
-                "sqlite3",
-                "--db",
-                "test-db",
-                "--workload",
-                "hot_page_contention",
-                "--concurrency",
-                "8",
-            ]),
-            0
-        );
+        // Use a temporary on-disk database so the test is hermetic and does
+        // not depend on any specific golden fixture being present.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db_path = tmp.path().to_str().unwrap().to_owned();
+        rusqlite::Connection::open(&db_path)
+            .unwrap()
+            .execute_batch("CREATE TABLE seed (id INTEGER PRIMARY KEY);")
+            .unwrap();
+
+        let os_args = vec![
+            OsString::from("realdb-e2e"),
+            OsString::from("run"),
+            OsString::from("--engine"),
+            OsString::from("sqlite3"),
+            OsString::from("--db"),
+            OsString::from(db_path),
+            OsString::from("--workload"),
+            OsString::from("commutative_inserts_disjoint_keys"),
+            OsString::from("--concurrency"),
+            OsString::from("2"),
+        ];
+        assert_eq!(run_cli(os_args), 0);
     }
 
     #[test]
