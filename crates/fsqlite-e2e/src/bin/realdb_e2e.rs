@@ -19,7 +19,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, DatabaseName, OpenFlags};
 use serde::Serialize;
 
 use fsqlite_e2e::benchmark::{BenchmarkConfig, BenchmarkMeta, BenchmarkSummary, run_benchmark};
@@ -379,58 +379,30 @@ fn cmd_corpus_import(argv: &[String]) -> i32 {
 
     let dest_db = golden_dir.join(format!("{fixture_id}.db"));
 
-    // Compute source hash for idempotency / checksums update.
-    let source_sha = match sha256_file(&source_path) {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!(
-                "error: cannot hash source db {}: {e}",
-                source_path.display()
-            );
-            return 1;
-        }
-    };
-
     if dest_db.exists() {
-        let dest_sha = match sha256_file(&dest_db) {
-            Ok(h) => h,
-            Err(e) => {
-                eprintln!(
-                    "error: cannot hash existing golden db {}: {e}",
-                    dest_db.display()
-                );
-                return 1;
-            }
-        };
-        if dest_sha != source_sha {
-            eprintln!("error: destination already exists with different contents:");
-            eprintln!("  dest: {}", dest_db.display());
-            eprintln!("  dest sha256:   {dest_sha}");
-            eprintln!("  source sha256: {source_sha}");
+        // Golden copies are immutable. Never overwrite in-place; use --id for a new fixture.
+        println!("Golden already exists: {}", dest_db.display());
+    } else {
+        // Safety policy (sample_sqlite_db_files/FIXTURES.md): never raw-copy /dp inputs.
+        // Use SQLite's backup API to capture a consistent snapshot.
+        if let Err(e) = backup_sqlite_file(&source_path, &dest_db) {
             eprintln!(
-                "hint: pass --id <new_id> (e.g. {fixture_id}_{}).",
-                &source_sha[..8]
+                "error: failed to back up {} to {}: {e}",
+                source_path.display(),
+                dest_db.display()
             );
             return 1;
         }
-        println!("Already imported: {} (sha256 match)", dest_db.display());
-    } else if let Err(e) = fs::copy(&source_path, &dest_db) {
+    }
+
+    // Verify integrity immediately after capture (or for existing golden).
+    if let Err(e) = sqlite_integrity_check(&dest_db) {
         eprintln!(
-            "error: failed to copy {} to {}: {e}",
-            source_path.display(),
+            "error: golden DB failed PRAGMA integrity_check: {}: {e}",
             dest_db.display()
         );
         return 1;
     }
-
-    // Copy known sidecars if present (WAL/SHM/journal).
-    let copied_sidecars = match copy_sidecars(&source_path, &dest_db) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("error: sidecar copy failed: {e}");
-            return 1;
-        }
-    };
 
     // Best-effort: mark golden copies read-only.
     if let Err(e) = set_read_only(&dest_db) {
@@ -438,11 +410,6 @@ fn cmd_corpus_import(argv: &[String]) -> i32 {
             "warning: failed to mark read-only {}: {e}",
             dest_db.display()
         );
-    }
-    for s in &copied_sidecars {
-        if let Err(e) = set_read_only(s) {
-            eprintln!("warning: failed to mark read-only {}: {e}", s.display());
-        }
     }
 
     // Update checksums file (DB only, not sidecars).
@@ -506,13 +473,6 @@ fn cmd_corpus_import(argv: &[String]) -> i32 {
     }
     if !source_tags.is_empty() {
         println!("  tags: {}", source_tags.join(", "));
-    }
-    println!("  sidecars: {}", copied_sidecars.len());
-    for s in copied_sidecars {
-        println!(
-            "    - {}",
-            s.file_name().and_then(|n| n.to_str()).unwrap_or("")
-        );
     }
 
     0
@@ -2203,6 +2163,52 @@ fn sqlite_magic_header_ok(path: &Path) -> io::Result<bool> {
     Ok(&buf == MAGIC)
 }
 
+fn backup_sqlite_file(src: &Path, dst: &Path) -> Result<(), String> {
+    let src_conn = Connection::open_with_flags(src, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(
+        |e| format!("cannot open source DB {} (read-only): {e}", src.display()),
+    )?;
+
+    // Uses SQLite backup API (same semantics as `sqlite3 "$SRC" ".backup '$DST'"`).
+    src_conn
+        .backup(DatabaseName::Main, dst, None)
+        .map_err(|e| format!("sqlite backup API failed: {e}"))
+}
+
+fn sqlite_integrity_check(db: &Path) -> Result<(), String> {
+    let conn = Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|e| format!("cannot open {} for integrity_check: {e}", db.display()))?;
+
+    let mut stmt = conn
+        .prepare("PRAGMA integrity_check;")
+        .map_err(|e| format!("prepare integrity_check: {e}"))?;
+
+    let mut rows = stmt
+        .query([])
+        .map_err(|e| format!("query integrity_check: {e}"))?;
+
+    let mut lines: Vec<String> = Vec::new();
+    while let Some(row) = rows
+        .next()
+        .map_err(|e| format!("read integrity_check row: {e}"))?
+    {
+        let msg: String = row.get(0).map_err(|e| format!("read row text: {e}"))?;
+        lines.push(msg);
+    }
+
+    if lines.len() == 1 && lines[0].trim() == "ok" {
+        return Ok(());
+    }
+
+    let mut out = String::new();
+    for l in &lines {
+        let _ = writeln!(out, "{l}");
+    }
+    Err(format!(
+        "integrity_check reported {} line(s):\n{out}",
+        lines.len()
+    ))
+}
+
 fn copy_sidecars(src_db: &Path, dest_db: &Path) -> Result<Vec<PathBuf>, String> {
     const SIDECARS: [&str; 3] = ["-wal", "-shm", "-journal"];
     let mut copied = Vec::new();
@@ -2277,17 +2283,23 @@ fn upsert_checksum(
         }
     }
 
-    let mut replaced = false;
-    for (name, hex) in &mut lines {
+    for (name, hex) in &lines {
         if name == &filename {
-            sha256_hex.clone_into(hex);
-            replaced = true;
+            if hex == sha256_hex {
+                // Idempotent: already recorded.
+                return Ok(());
+            }
+            return Err(format!(
+                "{} already contains an entry for {filename} with a different sha256.\n\
+Refusing to overwrite provenance. Golden files are immutable; ingest under a new --id instead.\n\
+existing: {hex}\n\
+current:  {sha256_hex}",
+                checksums_path.display()
+            ));
         }
     }
-    if !replaced {
-        lines.push((filename, sha256_hex.to_owned()));
-    }
 
+    lines.push((filename, sha256_hex.to_owned()));
     lines.sort_by(|a, b| a.0.cmp(&b.0));
 
     let mut out = String::new();

@@ -2218,7 +2218,12 @@ fn sql_div(dividend: &SqliteValue, divisor: &SqliteValue) -> SqliteValue {
         if *b == 0 {
             SqliteValue::Null
         } else {
-            SqliteValue::Integer(a / b)
+            match a.checked_div(*b) {
+                Some(result) => SqliteValue::Integer(result),
+                // i64::MIN / -1 overflows; promote to float like SQLite.
+                #[allow(clippy::cast_precision_loss)]
+                None => SqliteValue::Float(*a as f64 / *b as f64),
+            }
         }
     } else {
         let b = divisor.to_float();
@@ -2245,7 +2250,12 @@ fn sql_rem(dividend: &SqliteValue, divisor: &SqliteValue) -> SqliteValue {
     if b == 0 {
         SqliteValue::Null
     } else {
-        SqliteValue::Integer(a % b)
+        // checked_rem handles i64::MIN % -1 which would overflow.
+        match a.checked_rem(b) {
+            Some(result) => SqliteValue::Integer(result),
+            // i64::MIN % -1 = 0 mathematically (no remainder).
+            None => SqliteValue::Integer(0),
+        }
     }
 }
 
@@ -2342,10 +2352,11 @@ fn sql_cast(val: SqliteValue, target: i32) -> SqliteValue {
 /// Convert affinity character to `TypeAffinity`.
 fn char_to_affinity(ch: char) -> fsqlite_types::TypeAffinity {
     match ch {
-        'd' | 'D' => fsqlite_types::TypeAffinity::Integer,
-        'e' | 'E' => fsqlite_types::TypeAffinity::Real,
-        'C' | 'c' => fsqlite_types::TypeAffinity::Text,
-        'A' | 'a' => fsqlite_types::TypeAffinity::Numeric,
+        'A' | 'a' => fsqlite_types::TypeAffinity::Blob,
+        'B' | 'b' => fsqlite_types::TypeAffinity::Text,
+        'C' | 'c' => fsqlite_types::TypeAffinity::Numeric,
+        'D' | 'd' => fsqlite_types::TypeAffinity::Integer,
+        'E' | 'e' => fsqlite_types::TypeAffinity::Real,
         _ => fsqlite_types::TypeAffinity::Blob,
     }
 }

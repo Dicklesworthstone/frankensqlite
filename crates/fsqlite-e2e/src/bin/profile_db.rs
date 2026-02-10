@@ -42,8 +42,12 @@ where
 
     let mut golden_dir = PathBuf::from("sample_sqlite_db_files/golden");
     let mut output_dir = PathBuf::from("sample_sqlite_db_files/metadata");
+    let mut checksums_path = PathBuf::from("sample_sqlite_db_files/checksums.sha256");
+    let mut manifest_path = PathBuf::from("sample_sqlite_db_files/manifests/manifest.v1.json");
     let mut single_db: Option<String> = None;
     let mut pretty = false;
+    let mut write_manifest = false;
+    let mut manifest_only = false;
 
     let mut i = 0;
     while i < tail.len() {
@@ -64,6 +68,22 @@ where
                 }
                 output_dir = PathBuf::from(&tail[i]);
             }
+            "--checksums" => {
+                i += 1;
+                if i >= tail.len() {
+                    eprintln!("error: --checksums requires a file path");
+                    return 2;
+                }
+                checksums_path = PathBuf::from(&tail[i]);
+            }
+            "--manifest-path" => {
+                i += 1;
+                if i >= tail.len() {
+                    eprintln!("error: --manifest-path requires a file path");
+                    return 2;
+                }
+                manifest_path = PathBuf::from(&tail[i]);
+            }
             "--db" => {
                 i += 1;
                 if i >= tail.len() {
@@ -73,6 +93,8 @@ where
                 single_db = Some(tail[i].clone());
             }
             "--pretty" => pretty = true,
+            "--write-manifest" => write_manifest = true,
+            "--manifest-only" => manifest_only = true,
             other => {
                 eprintln!("error: unknown option `{other}`");
                 return 2;
@@ -81,12 +103,14 @@ where
         i += 1;
     }
 
-    if !golden_dir.is_dir() {
-        eprintln!(
-            "error: golden directory does not exist: {}",
-            golden_dir.display()
-        );
-        return 1;
+    if !manifest_only {
+        if !golden_dir.is_dir() {
+            eprintln!(
+                "error: golden directory does not exist: {}",
+                golden_dir.display()
+            );
+            return 1;
+        }
     }
 
     if !output_dir.is_dir() {
@@ -97,69 +121,86 @@ where
         return 1;
     }
 
-    let db_files = match collect_db_files(&golden_dir, single_db.as_deref()) {
-        Ok(files) => files,
-        Err(e) => {
-            eprintln!("error: failed to list golden directory: {e}");
-            return 1;
-        }
-    };
+    if !manifest_only {
+        let db_files = match collect_db_files(&golden_dir, single_db.as_deref()) {
+            Ok(files) => files,
+            Err(e) => {
+                eprintln!("error: failed to list golden directory: {e}");
+                return 1;
+            }
+        };
 
-    if db_files.is_empty() {
-        eprintln!("warning: no .db files found in {}", golden_dir.display());
-        return 0;
-    }
+        if db_files.is_empty() {
+            eprintln!("warning: no .db files found in {}", golden_dir.display());
+        } else {
+            let mut success_count = 0u32;
+            let mut fail_count = 0u32;
 
-    let mut success_count = 0u32;
-    let mut fail_count = 0u32;
+            for db_path in &db_files {
+                let db_name = db_path
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned();
 
-    for db_path in &db_files {
-        let db_name = db_path
-            .file_stem()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .into_owned();
-
-        match profile_database(db_path) {
-            Ok(profile) => {
-                let json_result = if pretty {
-                    serde_json::to_string_pretty(&profile)
-                } else {
-                    serde_json::to_string(&profile)
-                };
-                match json_result {
-                    Ok(json) => {
-                        let out_path = output_dir.join(format!("{db_name}.json"));
-                        match std::fs::write(&out_path, json.as_bytes()) {
-                            Ok(()) => {
-                                println!("  OK  {db_name} -> {}", out_path.display());
-                                success_count += 1;
+                match profile_database(db_path) {
+                    Ok(profile) => {
+                        let json_result = if pretty {
+                            serde_json::to_string_pretty(&profile)
+                        } else {
+                            serde_json::to_string(&profile)
+                        };
+                        match json_result {
+                            Ok(json) => {
+                                let out_path = output_dir.join(format!("{db_name}.json"));
+                                match std::fs::write(&out_path, json.as_bytes()) {
+                                    Ok(()) => {
+                                        println!("  OK  {db_name} -> {}", out_path.display());
+                                        success_count += 1;
+                                    }
+                                    Err(e) => {
+                                        eprintln!("FAIL  {db_name}: write error: {e}");
+                                        fail_count += 1;
+                                    }
+                                }
                             }
                             Err(e) => {
-                                eprintln!("FAIL  {db_name}: write error: {e}");
+                                eprintln!("FAIL  {db_name}: JSON serialization error: {e}");
                                 fail_count += 1;
                             }
                         }
                     }
                     Err(e) => {
-                        eprintln!("FAIL  {db_name}: JSON serialization error: {e}");
+                        eprintln!("FAIL  {db_name}: {e}");
                         fail_count += 1;
                     }
                 }
             }
-            Err(e) => {
-                eprintln!("FAIL  {db_name}: {e}");
-                fail_count += 1;
+
+            println!(
+                "\nProfiled {success_count}/{} databases ({fail_count} failed)",
+                db_files.len()
+            );
+
+            if fail_count > 0 {
+                return 1;
             }
         }
     }
 
-    println!(
-        "\nProfiled {success_count}/{} databases ({fail_count} failed)",
-        db_files.len()
-    );
+    if write_manifest || manifest_only {
+        match write_manifest_v1(&checksums_path, &output_dir, &manifest_path) {
+            Ok(()) => {
+                println!("Wrote manifest: {}", manifest_path.display());
+            }
+            Err(e) => {
+                eprintln!("error: failed to write manifest: {e}");
+                return 1;
+            }
+        }
+    }
 
-    i32::from(fail_count > 0)
+    0
 }
 
 fn print_help() {
@@ -174,14 +215,23 @@ OPTIONS:
                           (default: sample_sqlite_db_files/golden)
     --output-dir <DIR>    Directory for JSON output files
                           (default: sample_sqlite_db_files/metadata)
+    --checksums <PATH>    Checksums file (sha256sum format) used for manifest generation
+                          (default: sample_sqlite_db_files/checksums.sha256)
+    --manifest-path <PATH> Output path for manifest.v1.json
+                          (default: sample_sqlite_db_files/manifests/manifest.v1.json)
     --db <NAME>           Profile only this database file (e.g. beads_viewer.db)
     --pretty              Pretty-print JSON output
+    --write-manifest      Generate sample_sqlite_db_files/manifests/manifest.v1.json
+                          from checksums + metadata (stable, deterministic output)
+    --manifest-only       Skip profiling; only generate manifest from checksums + metadata
     -h, --help            Show this help message
 
 EXAMPLES:
     profile-db
     profile-db --pretty
     profile-db --db frankensqlite.db --pretty
+    profile-db --write-manifest
+    profile-db --manifest-only
     profile-db --golden-dir /tmp/dbs --output-dir /tmp/meta
 ";
     let _ = io::stdout().write_all(text.as_bytes());
@@ -224,6 +274,210 @@ struct ColumnProfile {
     primary_key: bool,
     not_null: bool,
     default_value: Option<String>,
+}
+
+// ── Manifest (v1) ─────────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+struct ManifestV1 {
+    manifest_version: u32,
+    entries: Vec<ManifestEntryV1>,
+}
+
+#[derive(Debug, Serialize)]
+struct ManifestEntryV1 {
+    db_id: String,
+    golden_filename: String,
+    sha256_golden: String,
+    size_bytes: u64,
+    sqlite_meta: SqliteMetaV1,
+}
+
+#[derive(Debug, Serialize)]
+struct SqliteMetaV1 {
+    page_size: u32,
+    journal_mode: Option<String>,
+    user_version: Option<u32>,
+    application_id: Option<u32>,
+}
+
+fn write_manifest_v1(
+    checksums_path: &Path,
+    metadata_dir: &Path,
+    manifest_path: &Path,
+) -> Result<(), String> {
+    let manifest = build_manifest_v1(checksums_path, metadata_dir)?;
+
+    let json = serde_json::to_string_pretty(&manifest)
+        .map_err(|e| format!("manifest JSON serialization failed: {e}"))?;
+
+    let parent = manifest_path
+        .parent()
+        .ok_or_else(|| format!("invalid manifest path: {}", manifest_path.display()))?;
+    std::fs::create_dir_all(parent).map_err(|e| {
+        format!(
+            "failed to create manifest directory {}: {e}",
+            parent.display()
+        )
+    })?;
+
+    std::fs::write(manifest_path, json.as_bytes())
+        .map_err(|e| format!("failed to write manifest {}: {e}", manifest_path.display()))?;
+
+    Ok(())
+}
+
+fn build_manifest_v1(checksums_path: &Path, metadata_dir: &Path) -> Result<ManifestV1, String> {
+    let checksums = read_checksums_sha256(checksums_path)?;
+
+    let mut entries: Vec<ManifestEntryV1> = Vec::with_capacity(checksums.len());
+    for (golden_filename, sha256_golden) in &checksums {
+        let stem = Path::new(golden_filename)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| format!("invalid golden filename: {golden_filename}"))?;
+
+        let db_id = validate_db_id(stem)?;
+        let meta_path = metadata_dir.join(format!("{db_id}.json"));
+        let (size_bytes, page_size, journal_mode, user_version, application_id) =
+            read_metadata_minimal(&meta_path)?;
+
+        entries.push(ManifestEntryV1 {
+            db_id,
+            golden_filename: golden_filename.to_owned(),
+            sha256_golden: sha256_golden.to_owned(),
+            size_bytes,
+            sqlite_meta: SqliteMetaV1 {
+                page_size,
+                journal_mode,
+                user_version,
+                application_id,
+            },
+        });
+    }
+
+    entries.sort_by(|a, b| a.db_id.cmp(&b.db_id));
+
+    Ok(ManifestV1 {
+        manifest_version: 1,
+        entries,
+    })
+}
+
+fn read_checksums_sha256(path: &Path) -> Result<Vec<(String, String)>, String> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+
+    let mut pairs = Vec::new();
+    for (line_no, raw) in content.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some((hash, filename)) = line.split_once("  ") else {
+            return Err(format!(
+                "malformed checksums line {} (expected '<sha256>  <filename>'): {raw}",
+                line_no + 1
+            ));
+        };
+        let hash = hash.trim();
+        let filename = filename.trim();
+
+        if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(format!(
+                "line {}: invalid sha256 (expected 64 lowercase hex chars): {hash}",
+                line_no + 1
+            ));
+        }
+        let ext_ok = Path::new(filename)
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("db"));
+        if !ext_ok {
+            return Err(format!(
+                "line {}: filename must end with .db: {filename}",
+                line_no + 1
+            ));
+        }
+
+        pairs.push((filename.to_owned(), hash.to_ascii_lowercase()));
+    }
+
+    if pairs.is_empty() {
+        return Err(format!("checksums file {} is empty", path.display()));
+    }
+
+    // Stable ordering by filename.
+    pairs.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // Reject duplicate filenames.
+    for w in pairs.windows(2) {
+        if w[0].0 == w[1].0 {
+            return Err(format!("duplicate filename in checksums file: {}", w[0].0));
+        }
+    }
+
+    Ok(pairs)
+}
+
+fn validate_db_id(s: &str) -> Result<String, String> {
+    let id = s.to_ascii_lowercase();
+    if id.len() < 2 || id.len() > 64 {
+        return Err(format!("db_id length must be 2..=64: {id}"));
+    }
+    let mut chars = id.chars();
+    let Some(first) = chars.next() else {
+        return Err("empty db_id".to_owned());
+    };
+    if !first.is_ascii_lowercase() && !first.is_ascii_digit() {
+        return Err(format!("db_id must start with [a-z0-9]: {id}"));
+    }
+    if !chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-') {
+        return Err(format!(
+            "db_id must match ^[a-z0-9][a-z0-9_\\-]{{1,63}}$: {id}"
+        ));
+    }
+    Ok(id)
+}
+
+fn read_metadata_minimal(
+    meta_path: &Path,
+) -> Result<(u64, u32, Option<String>, Option<u32>, Option<u32>), String> {
+    let content = std::fs::read_to_string(meta_path)
+        .map_err(|e| format!("cannot read metadata {}: {e}", meta_path.display()))?;
+    let v: serde_json::Value =
+        serde_json::from_str(&content).map_err(|e| format!("metadata JSON parse failed: {e}"))?;
+
+    let size_bytes = v
+        .get("file_size_bytes")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| format!("metadata missing file_size_bytes: {}", meta_path.display()))?;
+    let page_size = v
+        .get("page_size")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|n| u32::try_from(n).ok())
+        .ok_or_else(|| format!("metadata missing page_size: {}", meta_path.display()))?;
+
+    let journal_mode = v
+        .get("journal_mode")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    let user_version = v
+        .get("user_version")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|n| u32::try_from(n).ok());
+    let application_id = v
+        .get("application_id")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|n| u32::try_from(n).ok());
+
+    Ok((
+        size_bytes,
+        page_size,
+        journal_mode,
+        user_version,
+        application_id,
+    ))
 }
 
 // ── Core profiling logic ─────────────────────────────────────────────────
@@ -548,6 +802,52 @@ mod tests {
             meta.path().to_str().unwrap(),
         ]);
         assert_eq!(exit_code, 0);
+    }
+
+    #[test]
+    fn test_manifest_only_generates_manifest_from_checksums_and_metadata() {
+        let meta = tempfile::tempdir().unwrap();
+        let checksums = meta.path().join("checksums.sha256");
+        let manifest = meta.path().join("manifest.v1.json");
+
+        // Minimal metadata file matching existing corpus fields.
+        let meta_path = meta.path().join("alpha.json");
+        std::fs::write(
+            &meta_path,
+            r#"{"name":"alpha","file_size_bytes":123,"page_size":4096,"journal_mode":"wal","user_version":0,"application_id":0}"#,
+        )
+        .unwrap();
+
+        std::fs::write(
+            &checksums,
+            "00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff  alpha.db\n",
+        )
+        .unwrap();
+
+        let exit_code = run_with(&[
+            "profile-db",
+            "--manifest-only",
+            "--output-dir",
+            meta.path().to_str().unwrap(),
+            "--checksums",
+            checksums.to_str().unwrap(),
+            "--manifest-path",
+            manifest.to_str().unwrap(),
+        ]);
+        assert_eq!(exit_code, 0);
+        assert!(manifest.exists(), "manifest file should be written");
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&manifest).unwrap()).unwrap();
+        assert_eq!(parsed["manifest_version"], 1);
+        assert_eq!(parsed["entries"][0]["db_id"], "alpha");
+        assert_eq!(parsed["entries"][0]["golden_filename"], "alpha.db");
+        assert_eq!(
+            parsed["entries"][0]["sha256_golden"],
+            "00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff00ff"
+        );
+        assert_eq!(parsed["entries"][0]["size_bytes"], 123);
+        assert_eq!(parsed["entries"][0]["sqlite_meta"]["page_size"], 4096);
     }
 
     #[test]

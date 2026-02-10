@@ -671,14 +671,18 @@ fn try_coerce_text_to_numeric(s: &str) -> Option<SqliteValue> {
     if let Ok(i) = trimmed.parse::<i64>() {
         return Some(SqliteValue::Integer(i));
     }
-    // Try float.
+    // Try float. Reject non-finite results (NaN, Infinity) since SQLite
+    // does not recognise "nan", "inf", or "infinity" as numeric literals.
     if let Ok(f) = trimmed.parse::<f64>() {
-        if f.is_finite() {
-            // If the float is an exact integer value, store as integer.
-            let i = f as i64;
-            if (i as f64) == f {
-                return Some(SqliteValue::Integer(i));
-            }
+        if !f.is_finite() {
+            return None;
+        }
+        // If the float is an exact integer value, store as integer.
+        #[allow(clippy::cast_possible_truncation)]
+        let i = f as i64;
+        #[allow(clippy::cast_precision_loss)]
+        if (i as f64) == f {
+            return Some(SqliteValue::Integer(i));
         }
         return Some(SqliteValue::Float(f));
     }

@@ -227,6 +227,26 @@ fn checksums_path() -> PathBuf {
         .join("sample_sqlite_db_files/checksums.sha256")
 }
 
+/// Resolve the manifest file relative to the workspace root.
+fn manifest_path() -> PathBuf {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    manifest
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("workspace root")
+        .join("sample_sqlite_db_files/manifests/manifest.v1.json")
+}
+
+/// Resolve a metadata JSON file relative to the workspace root.
+fn metadata_path(db_id: &str) -> PathBuf {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    manifest
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("workspace root")
+        .join(format!("sample_sqlite_db_files/metadata/{db_id}.json"))
+}
+
 /// Validate that `checksums.sha256` exists, is non-empty, and every line
 /// follows the `<64-hex-char-sha256>  <filename.db>` format.
 ///
@@ -283,6 +303,137 @@ fn checksums_sha256_is_well_formed() {
     eprintln!(
         "OK: checksums.sha256 is well-formed ({} entries)",
         lines.len()
+    );
+}
+
+/// Validate that `manifest.v1.json` exists and stays consistent with:
+/// - `checksums.sha256` (hashes and filenames)
+/// - `metadata/<db_id>.json` (size_bytes + page_size)
+///
+/// This test runs unconditionally (does NOT require golden `.db` binaries).
+#[test]
+fn manifest_v1_matches_checksums_and_metadata() {
+    let manifest_path = manifest_path();
+    assert!(
+        manifest_path.exists(),
+        "manifest.v1.json must exist at {manifest_path:?} (tracked in git)"
+    );
+
+    let manifest_text =
+        std::fs::read_to_string(&manifest_path).expect("failed to read manifest.v1.json");
+    let manifest_json: serde_json::Value =
+        serde_json::from_str(&manifest_text).expect("manifest.v1.json must be valid JSON");
+
+    assert_eq!(
+        manifest_json["manifest_version"], 1,
+        "manifest_version must be 1"
+    );
+
+    let entries = manifest_json["entries"]
+        .as_array()
+        .expect("manifest.entries must be an array");
+    assert!(
+        !entries.is_empty(),
+        "manifest.entries must contain at least one entry"
+    );
+
+    // Parse checksums into a map.
+    let checksums_text =
+        std::fs::read_to_string(&checksums_path()).expect("failed to read checksums.sha256");
+    let mut checksum_map: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for line in checksums_text.lines().map(str::trim) {
+        if line.is_empty() {
+            continue;
+        }
+        let Some((hash, filename)) = line.split_once("  ") else {
+            assert!(false, "malformed checksum line: {line}");
+            continue;
+        };
+        let prev = checksum_map.insert(filename.to_owned(), hash.to_owned());
+        assert!(
+            prev.is_none(),
+            "duplicate filename in checksums: {filename}"
+        );
+    }
+
+    // Track manifest entries and validate each against checksums + metadata.
+    let mut seen_db_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen_filenames: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for entry in entries {
+        let db_id = entry["db_id"]
+            .as_str()
+            .expect("entry.db_id must be a string")
+            .to_owned();
+        let golden_filename = entry["golden_filename"]
+            .as_str()
+            .expect("entry.golden_filename must be a string")
+            .to_owned();
+        let sha256_golden = entry["sha256_golden"]
+            .as_str()
+            .expect("entry.sha256_golden must be a string")
+            .to_owned();
+        let size_bytes = entry["size_bytes"]
+            .as_u64()
+            .expect("entry.size_bytes must be a u64");
+
+        assert!(
+            seen_db_ids.insert(db_id.clone()),
+            "duplicate db_id in manifest: {db_id}"
+        );
+        assert!(
+            seen_filenames.insert(golden_filename.clone()),
+            "duplicate golden_filename in manifest: {golden_filename}"
+        );
+
+        assert!(
+            checksum_map.contains_key(&golden_filename),
+            "manifest entry {db_id} references file not in checksums: {golden_filename}"
+        );
+        let expected_sha = checksum_map.get(&golden_filename).expect("checked above");
+        assert_eq!(
+            sha256_golden, *expected_sha,
+            "manifest sha mismatch for {golden_filename}"
+        );
+
+        // Validate minimal metadata alignment.
+        let meta_path = metadata_path(&db_id);
+        assert!(
+            meta_path.exists(),
+            "metadata file missing for db_id {db_id}: {meta_path:?}"
+        );
+        let meta_text = std::fs::read_to_string(&meta_path).expect("failed to read metadata");
+        let meta_json: serde_json::Value =
+            serde_json::from_str(&meta_text).expect("metadata must be valid JSON");
+
+        let meta_size = meta_json["file_size_bytes"]
+            .as_u64()
+            .expect("metadata.file_size_bytes must be u64");
+        assert_eq!(
+            size_bytes, meta_size,
+            "manifest size_bytes mismatch for {db_id}"
+        );
+
+        let meta_page_size = meta_json["page_size"]
+            .as_u64()
+            .and_then(|n| u32::try_from(n).ok())
+            .expect("metadata.page_size must be u32");
+        let manifest_page_size = entry["sqlite_meta"]["page_size"]
+            .as_u64()
+            .and_then(|n| u32::try_from(n).ok())
+            .expect("manifest.sqlite_meta.page_size must be u32");
+        assert_eq!(
+            manifest_page_size, meta_page_size,
+            "manifest page_size mismatch for {db_id}"
+        );
+    }
+
+    // Ensure manifest fully covers checksums (no missing entries).
+    assert_eq!(
+        seen_filenames.len(),
+        checksum_map.len(),
+        "manifest entries must cover all checksums.sha256 filenames"
     );
 }
 
