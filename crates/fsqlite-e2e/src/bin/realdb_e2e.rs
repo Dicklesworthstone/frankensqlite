@@ -22,19 +22,19 @@ use sha2::{Digest, Sha256};
 use rusqlite::{Connection, DatabaseName, OpenFlags};
 use serde::Serialize;
 
-use fsqlite_e2e::benchmark::{BenchmarkConfig, BenchmarkMeta, BenchmarkSummary, run_benchmark};
-use fsqlite_e2e::corruption::{CorruptionStrategy, inject_corruption};
+use fsqlite_e2e::benchmark::{run_benchmark, BenchmarkConfig, BenchmarkMeta, BenchmarkSummary};
+use fsqlite_e2e::corruption::{inject_corruption, CorruptionStrategy};
 use fsqlite_e2e::fixture_metadata::{
-    ColumnProfileV1, FIXTURE_METADATA_SCHEMA_VERSION_V1, FixtureFeaturesV1, FixtureMetadataV1,
-    FixtureSafetyV1, RiskLevel, SqliteMetaV1, TableProfileV1, normalize_tags, size_bucket_tag,
+    normalize_tags, size_bucket_tag, ColumnProfileV1, FixtureFeaturesV1, FixtureMetadataV1,
+    FixtureSafetyV1, RiskLevel, SqliteMetaV1, TableProfileV1, FIXTURE_METADATA_SCHEMA_VERSION_V1,
 };
-use fsqlite_e2e::fsqlite_executor::{FsqliteExecConfig, run_oplog_fsqlite};
+use fsqlite_e2e::fsqlite_executor::{run_oplog_fsqlite, FsqliteExecConfig};
 use fsqlite_e2e::methodology::EnvironmentMeta;
 use fsqlite_e2e::oplog::{self, OpLog};
 use fsqlite_e2e::report::{EngineInfo, RunRecordV1, RunRecordV1Args};
 use fsqlite_e2e::report_render::render_benchmark_summaries_markdown;
-use fsqlite_e2e::run_workspace::{WorkspaceConfig, create_workspace};
-use fsqlite_e2e::sqlite_executor::{SqliteExecConfig, run_oplog_sqlite};
+use fsqlite_e2e::run_workspace::{create_workspace, WorkspaceConfig};
+use fsqlite_e2e::sqlite_executor::{run_oplog_sqlite, SqliteExecConfig};
 
 fn main() {
     let exit_code = run_cli(std::env::args_os());
@@ -1077,6 +1077,10 @@ fn verify_golden_checksums(
         }
 
         let filename = entry.file_name().to_string_lossy().into_owned();
+        // Ignore local dotfiles and SQLite sidecars; checksums cover only the golden DB bytes.
+        if filename.starts_with('.') || is_sqlite_sidecar_filename(&filename) {
+            continue;
+        }
         if expected_names.contains(&filename) {
             continue;
         }
@@ -2757,6 +2761,10 @@ fn detect_sidecars(db_path: &Path) -> Vec<String> {
     present
 }
 
+fn is_sqlite_sidecar_filename(filename: &str) -> bool {
+    filename.ends_with("-wal") || filename.ends_with("-shm") || filename.ends_with("-journal")
+}
+
 fn resolve_source_db(
     db_arg: &str,
     root: &Path,
@@ -3365,6 +3373,35 @@ mod tests {
             report.files.iter().any(|f| f.status == VerifyStatus::Extra),
             "must include at least one EXTRA result"
         );
+    }
+
+    #[test]
+    fn test_verify_ignores_dotfiles_and_sqlite_sidecars_in_golden_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let golden = dir.path().join("golden");
+        fs::create_dir(&golden).unwrap();
+
+        // Expected file.
+        let content = b"expected";
+        fs::write(golden.join("a.db"), content).unwrap();
+        let hash = format!("{:x}", Sha256::digest(content));
+
+        // Dotfiles and sidecars are expected to exist locally and should not break verification.
+        fs::write(golden.join(".gitignore"), b"*").unwrap();
+        fs::write(golden.join(".gitkeep"), b"").unwrap();
+        fs::write(golden.join("a.db-wal"), b"").unwrap();
+        fs::write(golden.join("a.db-shm"), b"").unwrap();
+        fs::write(golden.join("a.db-journal"), b"").unwrap();
+
+        let checksums = dir.path().join("checksums.sha256");
+        fs::write(&checksums, format!("{hash}  a.db\n")).unwrap();
+
+        let report = verify_golden_checksums(&checksums, &golden).unwrap();
+        assert_eq!(report.summary.ok, 1);
+        assert_eq!(report.summary.mismatch, 0);
+        assert_eq!(report.summary.missing, 0);
+        assert_eq!(report.summary.error, 0);
+        assert_eq!(report.summary.extra, 0);
     }
 
     #[test]
