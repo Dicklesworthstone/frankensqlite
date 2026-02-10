@@ -81,6 +81,7 @@ pub struct PreparedStatement {
     program: VdbeProgram,
     func_registry: Option<Arc<FunctionRegistry>>,
     expression_postprocess: Option<ExpressionPostprocess>,
+    distinct: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -109,22 +110,30 @@ impl std::fmt::Debug for PreparedStatement {
 impl PreparedStatement {
     /// Execute as a query and return all result rows.
     pub fn query(&self) -> Result<Vec<Row>> {
-        execute_program_with_postprocess(
+        let mut rows = execute_program_with_postprocess(
             &self.program,
             None,
             self.func_registry.as_ref(),
             self.expression_postprocess.as_ref(),
-        )
+        )?;
+        if self.distinct {
+            dedup_rows(&mut rows);
+        }
+        Ok(rows)
     }
 
     /// Execute as a query with bound SQL parameters (`?1`, `?2`, ...).
     pub fn query_with_params(&self, params: &[SqliteValue]) -> Result<Vec<Row>> {
-        execute_program_with_postprocess(
+        let mut rows = execute_program_with_postprocess(
             &self.program,
             Some(params),
             self.func_registry.as_ref(),
             self.expression_postprocess.as_ref(),
-        )
+        )?;
+        if self.distinct {
+            dedup_rows(&mut rows);
+        }
+        Ok(rows)
     }
 
     /// Execute as a query and return exactly one row.
@@ -294,18 +303,26 @@ impl Connection {
                 Ok(Vec::new())
             }
             Statement::Select(ref select) => {
+                let distinct = is_distinct_select(select);
                 // Check if this is an expression-only SELECT (no FROM clause).
                 if is_expression_only_select(select) {
-                    let program = compile_expression_select(select)?;
-                    execute_program_with_postprocess(
-                        &program,
+                    let mut rows = execute_program_with_postprocess(
+                        &compile_expression_select(select)?,
                         params,
                         Some(&self.func_registry),
                         Some(&build_expression_postprocess(select)),
-                    )
+                    )?;
+                    if distinct {
+                        dedup_rows(&mut rows);
+                    }
+                    Ok(rows)
                 } else {
                     let program = self.compile_table_select(select)?;
-                    self.execute_table_program(&program, params)
+                    let mut rows = self.execute_table_program(&program, params)?;
+                    if distinct {
+                        dedup_rows(&mut rows);
+                    }
+                    Ok(rows)
                 }
             }
             Statement::Insert(ref insert) => {
@@ -365,6 +382,7 @@ impl Connection {
                     program,
                     func_registry: registry,
                     expression_postprocess,
+                    distinct: is_distinct_select(select),
                 })
             }
             Statement::Select(select) => {
@@ -373,6 +391,7 @@ impl Connection {
                     program,
                     func_registry: registry,
                     expression_postprocess: None,
+                    distinct: is_distinct_select(select),
                 })
             }
             _ => Err(FrankenError::NotImplemented(
@@ -691,6 +710,27 @@ fn is_expression_only_select(select: &SelectStatement) -> bool {
         SelectCore::Select { from, .. } => from.is_none(),
         SelectCore::Values(_) => true,
     }
+}
+
+/// Check if a SELECT statement uses DISTINCT.
+fn is_distinct_select(select: &SelectStatement) -> bool {
+    match &select.body.select {
+        SelectCore::Select { distinct, .. } => *distinct != Distinctness::All,
+        SelectCore::Values(_) => false,
+    }
+}
+
+/// Remove duplicate rows using `PartialEq`-based comparison.
+fn dedup_rows(rows: &mut Vec<Row>) {
+    let mut seen: Vec<Row> = Vec::new();
+    rows.retain(|row| {
+        if seen.iter().any(|s| s == row) {
+            false
+        } else {
+            seen.push(row.clone());
+            true
+        }
+    });
 }
 
 /// Map an AST type name to a codegen affinity character.
@@ -1039,19 +1079,16 @@ fn compile_expression_select(select: &SelectStatement) -> Result<VdbeProgram> {
 
     match &select.body.select {
         SelectCore::Select {
-            distinct,
             columns,
             from,
             where_clause,
             group_by,
             having,
             windows,
+            ..
         } => {
-            if *distinct != Distinctness::All {
-                return Err(FrankenError::NotImplemented(
-                    "DISTINCT is not supported in this connection path".to_owned(),
-                ));
-            }
+            // DISTINCT is handled post-execution via dedup_rows() in the
+            // caller, so we can safely ignore the `distinct` field here.
             if from.is_some() {
                 return Err(FrankenError::NotImplemented(
                     "SELECT ... FROM is not supported in this connection path".to_owned(),

@@ -1176,9 +1176,51 @@ mod tests {
     }
 
     // ── DISTINCT ──────────────────────────────────────────────────────
-    // NOTE: SELECT DISTINCT is parsed but not yet enforced in codegen.
-    // The DISTINCT keyword is silently ignored and all rows are returned.
-    // A separate bead should be created to implement DISTINCT elimination.
+
+    #[test]
+    fn distinct_table_backed_select() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE td (id INTEGER, flag INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO td VALUES (1, 1);").unwrap();
+        conn.execute("INSERT INTO td VALUES (2, 0);").unwrap();
+        conn.execute("INSERT INTO td VALUES (3, 1);").unwrap();
+        conn.execute("INSERT INTO td VALUES (4, 0);").unwrap();
+        conn.execute("INSERT INTO td VALUES (5, 1);").unwrap();
+
+        let rows = conn.query("SELECT DISTINCT flag FROM td;").unwrap();
+        assert_eq!(rows.len(), 2);
+        let vals: Vec<_> = rows.iter().map(|r| row_values(r)[0].clone()).collect();
+        assert!(vals.contains(&SqliteValue::Integer(0)));
+        assert!(vals.contains(&SqliteValue::Integer(1)));
+    }
+
+    // ── Aggregate + GROUP BY ───────────────────────────────────────────
+    // NOTE: GROUP BY is not yet implemented for table-backed SELECTs.
+    // Tracked in bd-2mnb.
+
+    #[test]
+    #[ignore = "GROUP BY not yet implemented — tracked in bd-2mnb"]
+    fn aggregate_group_by_count() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE tg (k TEXT);").unwrap();
+        conn.execute("INSERT INTO tg VALUES ('a');").unwrap();
+        conn.execute("INSERT INTO tg VALUES ('a');").unwrap();
+        conn.execute("INSERT INTO tg VALUES ('b');").unwrap();
+
+        let rows = conn
+            .query("SELECT k, COUNT(*) FROM tg GROUP BY k ORDER BY k;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![SqliteValue::Text("a".to_owned()), SqliteValue::Integer(2)]
+        );
+        assert_eq!(
+            row_values(&rows[1]),
+            vec![SqliteValue::Text("b".to_owned()), SqliteValue::Integer(1)]
+        );
+    }
 
     // ── Aggregate: count(col) excludes NULL ──────────────────────────────
 
