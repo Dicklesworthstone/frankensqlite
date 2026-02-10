@@ -553,6 +553,14 @@ mod tests {
         (dir, path)
     }
 
+    fn temp_db_filled(size: usize, fill: u8) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("work").join("test.db");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, vec![fill; size]).unwrap();
+        (dir, path)
+    }
+
     // -- CorruptionInjector tests --
 
     #[test]
@@ -595,6 +603,107 @@ mod tests {
     }
 
     #[test]
+    fn test_bit_flip_all_positions() {
+        let (_dir, path) = temp_db_filled(4096, 0);
+        let injector = CorruptionInjector::new(path.clone()).unwrap();
+
+        for bit_position in 0u8..8 {
+            std::fs::write(&path, vec![0u8; 4096]).unwrap();
+            injector
+                .inject(&CorruptionPattern::BitFlip {
+                    byte_offset: 10,
+                    bit_position,
+                })
+                .unwrap();
+            let data = std::fs::read(&path).unwrap();
+            assert_eq!(data[10], 1u8 << bit_position, "bit_position={bit_position}");
+        }
+    }
+
+    #[test]
+    fn test_bit_flip_preserves_surrounding_bytes() {
+        let (_dir, path) = temp_db(4096);
+        let injector = CorruptionInjector::new(path.clone()).unwrap();
+
+        let original = std::fs::read(&path).unwrap();
+        injector
+            .inject(&CorruptionPattern::BitFlip {
+                byte_offset: 100,
+                bit_position: 0,
+            })
+            .unwrap();
+        let mutated = std::fs::read(&path).unwrap();
+
+        assert_ne!(mutated[100], original[100]);
+        let mut original2 = original;
+        original2[100] = mutated[100];
+        assert_eq!(mutated, original2, "only the targeted byte should differ");
+    }
+
+    #[test]
+    fn test_bit_flip_idempotent_when_applied_twice() {
+        let (_dir, path) = temp_db(4096);
+        let injector = CorruptionInjector::new(path.clone()).unwrap();
+
+        let original = std::fs::read(&path).unwrap();
+        let pattern = CorruptionPattern::BitFlip {
+            byte_offset: 123,
+            bit_position: 4,
+        };
+
+        injector.inject(&pattern).unwrap();
+        injector.inject(&pattern).unwrap();
+
+        let data = std::fs::read(&path).unwrap();
+        assert_eq!(data, original, "double-flip should restore original");
+    }
+
+    #[test]
+    fn test_bit_flip_at_file_boundary() {
+        let size = 8192;
+        let (_dir, path) = temp_db(size);
+        let injector = CorruptionInjector::new(path).unwrap();
+
+        let last = u64::try_from(size - 1).unwrap();
+        let report = injector
+            .inject(&CorruptionPattern::BitFlip {
+                byte_offset: last,
+                bit_position: 0,
+            })
+            .unwrap();
+
+        assert_eq!(report.affected_bytes, 1);
+        assert_eq!(report.affected_pages, vec![2]);
+    }
+
+    #[test]
+    fn test_bit_flip_rejects_invalid_bit_position() {
+        let (_dir, path) = temp_db(4096);
+        let injector = CorruptionInjector::new(path).unwrap();
+        let err = injector
+            .inject(&CorruptionPattern::BitFlip {
+                byte_offset: 0,
+                bit_position: 8,
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("bit_position"));
+    }
+
+    #[test]
+    fn test_bit_flip_rejects_out_of_bounds_offset() {
+        let size = 4096;
+        let (_dir, path) = temp_db(size);
+        let injector = CorruptionInjector::new(path).unwrap();
+        let err = injector
+            .inject(&CorruptionPattern::BitFlip {
+                byte_offset: u64::try_from(size).unwrap(),
+                bit_position: 0,
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("exceeds file size"));
+    }
+
+    #[test]
     fn test_page_zero() {
         let (_dir, path) = temp_db(8192);
         let injector = CorruptionInjector::new(path.clone()).unwrap();
@@ -609,6 +718,44 @@ mod tests {
         let data = std::fs::read(&path).unwrap();
         assert!(data[4096..8192].iter().all(|&b| b == 0));
         assert!(data[0..4096].iter().all(|&b| b == 0xAA));
+    }
+
+    #[test]
+    fn test_page_zero_first_page() {
+        let (_dir, path) = temp_db(8192);
+        let injector = CorruptionInjector::new(path.clone()).unwrap();
+
+        injector
+            .inject(&CorruptionPattern::PageZero { page_number: 1 })
+            .unwrap();
+
+        let data = std::fs::read(&path).unwrap();
+        assert!(data[0..4096].iter().all(|&b| b == 0));
+        assert!(data[4096..8192].iter().all(|&b| b == 0xAA));
+    }
+
+    #[test]
+    fn test_page_zero_last_page() {
+        let (_dir, path) = temp_db(3 * 4096);
+        let injector = CorruptionInjector::new(path.clone()).unwrap();
+
+        injector
+            .inject(&CorruptionPattern::PageZero { page_number: 3 })
+            .unwrap();
+
+        let data = std::fs::read(&path).unwrap();
+        assert!(data[0..8192].iter().all(|&b| b == 0xAA));
+        assert!(data[8192..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn test_page_zero_out_of_range_rejected() {
+        let (_dir, path) = temp_db(8192);
+        let injector = CorruptionInjector::new(path).unwrap();
+        let err = injector
+            .inject(&CorruptionPattern::PageZero { page_number: 3 })
+            .unwrap_err();
+        assert!(err.to_string().contains("beyond file end"));
     }
 
     #[test]
@@ -640,6 +787,64 @@ mod tests {
     }
 
     #[test]
+    fn test_random_overwrite_different_seeds_produce_different_bytes() {
+        let (_dir, path) = temp_db(8192);
+        let injector = CorruptionInjector::new(path.clone()).unwrap();
+
+        injector
+            .inject(&CorruptionPattern::RandomOverwrite {
+                offset: 200,
+                length: 64,
+                seed: 1,
+            })
+            .unwrap();
+        let a = std::fs::read(&path).unwrap();
+
+        std::fs::write(&path, vec![0xAA_u8; 8192]).unwrap();
+        injector
+            .inject(&CorruptionPattern::RandomOverwrite {
+                offset: 200,
+                length: 64,
+                seed: 2,
+            })
+            .unwrap();
+        let b = std::fs::read(&path).unwrap();
+
+        assert_ne!(a[200..264], b[200..264]);
+    }
+
+    #[test]
+    fn test_random_overwrite_out_of_range_rejected() {
+        let (_dir, path) = temp_db(1024);
+        let injector = CorruptionInjector::new(path).unwrap();
+
+        let err = injector
+            .inject(&CorruptionPattern::RandomOverwrite {
+                offset: 900,
+                length: 200,
+                seed: 0,
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("exceeds file size"));
+    }
+
+    #[test]
+    fn test_random_overwrite_reports_affected_pages_span() {
+        let (_dir, path) = temp_db(8192);
+        let injector = CorruptionInjector::new(path).unwrap();
+
+        let report = injector
+            .inject(&CorruptionPattern::RandomOverwrite {
+                offset: 4090,
+                length: 20,
+                seed: 123,
+            })
+            .unwrap();
+
+        assert_eq!(report.affected_pages, vec![1, 2]);
+    }
+
+    #[test]
     fn test_page_partial_corrupt() {
         let (_dir, path) = temp_db(8192);
         let injector = CorruptionInjector::new(path.clone()).unwrap();
@@ -666,6 +871,117 @@ mod tests {
     }
 
     #[test]
+    fn test_page_partial_corrupt_at_page_boundary() {
+        let (_dir, path) = temp_db(4096);
+        let injector = CorruptionInjector::new(path.clone()).unwrap();
+
+        let report = injector
+            .inject(&CorruptionPattern::PagePartialCorrupt {
+                page_number: 1,
+                offset_within_page: 4096 - 20,
+                length: 20,
+                seed: 7,
+            })
+            .unwrap();
+
+        assert_eq!(report.affected_bytes, 20);
+        assert_eq!(report.affected_pages, vec![1]);
+        let data = std::fs::read(&path).unwrap();
+        assert!(data[..(4096 - 20)].iter().all(|&b| b == 0xAA));
+        assert!(data[(4096 - 20)..].iter().any(|&b| b != 0xAA));
+    }
+
+    #[test]
+    fn test_page_partial_corrupt_deterministic() {
+        let (_dir, path) = temp_db(4096);
+        let injector = CorruptionInjector::new(path.clone()).unwrap();
+
+        injector
+            .inject(&CorruptionPattern::PagePartialCorrupt {
+                page_number: 1,
+                offset_within_page: 10,
+                length: 20,
+                seed: 42,
+            })
+            .unwrap();
+        let a = std::fs::read(&path).unwrap();
+
+        std::fs::write(&path, vec![0xAA_u8; 4096]).unwrap();
+        injector
+            .inject(&CorruptionPattern::PagePartialCorrupt {
+                page_number: 1,
+                offset_within_page: 10,
+                length: 20,
+                seed: 42,
+            })
+            .unwrap();
+        let b = std::fs::read(&path).unwrap();
+
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_page_partial_corrupt_different_seeds_produce_different_bytes() {
+        let (_dir, path) = temp_db(4096);
+        let injector = CorruptionInjector::new(path.clone()).unwrap();
+
+        injector
+            .inject(&CorruptionPattern::PagePartialCorrupt {
+                page_number: 1,
+                offset_within_page: 100,
+                length: 32,
+                seed: 1,
+            })
+            .unwrap();
+        let a = std::fs::read(&path).unwrap();
+
+        std::fs::write(&path, vec![0xAA_u8; 4096]).unwrap();
+        injector
+            .inject(&CorruptionPattern::PagePartialCorrupt {
+                page_number: 1,
+                offset_within_page: 100,
+                length: 32,
+                seed: 2,
+            })
+            .unwrap();
+        let b = std::fs::read(&path).unwrap();
+
+        assert_ne!(a[100..132], b[100..132]);
+    }
+
+    #[test]
+    fn test_page_partial_corrupt_rejects_cross_page_boundary() {
+        let (_dir, path) = temp_db(4096);
+        let injector = CorruptionInjector::new(path).unwrap();
+
+        let err = injector
+            .inject(&CorruptionPattern::PagePartialCorrupt {
+                page_number: 1,
+                offset_within_page: 4090,
+                length: 10,
+                seed: 0,
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("crosses page boundary"));
+    }
+
+    #[test]
+    fn test_page_partial_corrupt_rejects_offset_out_of_range() {
+        let (_dir, path) = temp_db(4096);
+        let injector = CorruptionInjector::new(path).unwrap();
+
+        let err = injector
+            .inject(&CorruptionPattern::PagePartialCorrupt {
+                page_number: 1,
+                offset_within_page: 4096,
+                length: 1,
+                seed: 0,
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("offset_within_page"));
+    }
+
+    #[test]
     fn test_header_zero() {
         let (_dir, path) = temp_db(4096);
         let injector = CorruptionInjector::new(path.clone()).unwrap();
@@ -678,6 +994,49 @@ mod tests {
         let data = std::fs::read(&path).unwrap();
         assert!(data[..100].iter().all(|&b| b == 0));
         assert!(data[100..].iter().all(|&b| b == 0xAA));
+    }
+
+    #[test]
+    fn test_header_zero_sqlite_magic_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("work").join("header.db");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE t (id INTEGER); INSERT INTO t VALUES (1);")
+            .unwrap();
+        drop(conn);
+
+        let injector = CorruptionInjector::new(path.clone()).unwrap();
+        injector.inject(&CorruptionPattern::HeaderZero).unwrap();
+
+        let data = std::fs::read(&path).unwrap();
+        assert_ne!(&data[..16], b"SQLite format 3\0");
+        assert!(data[..16].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn test_header_zero_makes_database_unopenable_by_sqlite() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("work").join("broken.db");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE t (id INTEGER); INSERT INTO t VALUES (1);")
+            .unwrap();
+        drop(conn);
+
+        let injector = CorruptionInjector::new(path.clone()).unwrap();
+        injector.inject(&CorruptionPattern::HeaderZero).unwrap();
+
+        let flags =
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let reopened = rusqlite::Connection::open_with_flags(&path, flags).unwrap();
+        let res: Result<String, _> = reopened.query_row("PRAGMA integrity_check", [], |r| r.get(0));
+        assert!(
+            res.is_err(),
+            "expected integrity_check to fail on header-zero DB"
+        );
     }
 
     #[test]
@@ -713,6 +1072,93 @@ mod tests {
         // Frame header pgno should remain intact (we only corrupt frame data).
         assert_eq!(&data[32..36], &1u32.to_be_bytes());
         assert_eq!(&data[frame1..frame1 + 4], &2u32.to_be_bytes());
+    }
+
+    #[test]
+    fn test_wal_frame_corrupt_single_frame_only() {
+        let frame_size = 24 + 4096;
+        let wal_size = 32 + 2 * frame_size;
+        let (_dir, path) = temp_db(wal_size);
+
+        let mut wal = std::fs::read(&path).unwrap();
+        wal[32..36].copy_from_slice(&1u32.to_be_bytes());
+        let frame1 = 32 + frame_size;
+        wal[frame1..frame1 + 4].copy_from_slice(&2u32.to_be_bytes());
+        std::fs::write(&path, &wal).unwrap();
+
+        let injector = CorruptionInjector::new(path.clone()).unwrap();
+
+        injector
+            .inject(&CorruptionPattern::WalFrameCorrupt {
+                frame_numbers: vec![0],
+                seed: 77,
+            })
+            .unwrap();
+
+        let data = std::fs::read(&path).unwrap();
+        let frame0_data_start = 32 + 24;
+        let frame0_data_end = frame0_data_start + 4096;
+        assert!(
+            data[frame0_data_start..frame0_data_end]
+                .iter()
+                .any(|&b| b != 0xAA)
+        );
+
+        let frame1_data_start = frame1 + 24;
+        let frame1_data_end = frame1_data_start + 4096;
+        assert!(
+            data[frame1_data_start..frame1_data_end]
+                .iter()
+                .all(|&b| b == 0xAA)
+        );
+    }
+
+    #[test]
+    fn test_wal_frame_corrupt_deterministic() {
+        let frame_size = 24 + 4096;
+        let wal_size = 32 + 2 * frame_size;
+        let (_dir, path) = temp_db(wal_size);
+
+        let mut wal = std::fs::read(&path).unwrap();
+        wal[32..36].copy_from_slice(&1u32.to_be_bytes());
+        let frame1 = 32 + frame_size;
+        wal[frame1..frame1 + 4].copy_from_slice(&2u32.to_be_bytes());
+        std::fs::write(&path, &wal).unwrap();
+
+        let injector = CorruptionInjector::new(path.clone()).unwrap();
+        let pattern = CorruptionPattern::WalFrameCorrupt {
+            frame_numbers: vec![0, 1],
+            seed: 99,
+        };
+
+        injector.inject(&pattern).unwrap();
+        let a = std::fs::read(&path).unwrap();
+
+        std::fs::write(&path, &wal).unwrap();
+        injector.inject(&pattern).unwrap();
+        let b = std::fs::read(&path).unwrap();
+
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_wal_frame_corrupt_out_of_range_rejected() {
+        let frame_size = 24 + 4096;
+        let wal_size = 32 + frame_size;
+        let (_dir, path) = temp_db(wal_size);
+
+        let mut wal = std::fs::read(&path).unwrap();
+        wal[32..36].copy_from_slice(&1u32.to_be_bytes());
+        std::fs::write(&path, &wal).unwrap();
+
+        let injector = CorruptionInjector::new(path).unwrap();
+        let err = injector
+            .inject(&CorruptionPattern::WalFrameCorrupt {
+                frame_numbers: vec![1],
+                seed: 0,
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("beyond file end"));
     }
 
     #[test]
@@ -762,6 +1208,37 @@ mod tests {
         // Original was 100 bytes of 0xAA — verify the hash is non-empty
         assert!(!report.original_sha256.is_empty());
         assert_eq!(report.original_sha256.len(), 64); // SHA-256 hex = 64 chars
+    }
+
+    #[test]
+    fn test_report_original_sha256_matches_expected() {
+        let (_dir, path) = temp_db(4096);
+        let injector = CorruptionInjector::new(path).unwrap();
+
+        let report = injector.inject(&CorruptionPattern::HeaderZero).unwrap();
+
+        let expected = sha256_hex(&[0xAA_u8; 100]);
+        assert_eq!(report.original_sha256, expected);
+    }
+
+    #[test]
+    fn test_inject_many_applies_patterns_sequentially() {
+        let (_dir, path) = temp_db(8192);
+        let injector = CorruptionInjector::new(path.clone()).unwrap();
+
+        let patterns = vec![
+            CorruptionPattern::BitFlip {
+                byte_offset: 0,
+                bit_position: 0,
+            },
+            CorruptionPattern::PageZero { page_number: 2 },
+        ];
+
+        injector.inject_many(&patterns).unwrap();
+        let data = std::fs::read(&path).unwrap();
+
+        assert_eq!(data[0], 0xAB, "0xAA ^ 1 = 0xAB");
+        assert!(data[4096..8192].iter().all(|&b| b == 0));
     }
 
     #[test]

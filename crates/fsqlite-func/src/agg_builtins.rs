@@ -27,12 +27,26 @@ use fsqlite_types::SqliteValue;
 
 use crate::{AggregateFunction, FunctionRegistry};
 
+// ─── Kahan compensated summation ──────────────────────────────────────────
+
+/// Kahan compensated summation step.  Maintains a running compensation term
+/// that captures the low-order bits lost during each addition, matching the
+/// precision behavior of C SQLite's aggregate accumulator.
+#[inline]
+fn kahan_add(sum: &mut f64, compensation: &mut f64, value: f64) {
+    let y = value - *compensation;
+    let t = *sum + y;
+    *compensation = (t - *sum) - y;
+    *sum = t;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // avg(X)
 // ═══════════════════════════════════════════════════════════════════════════
 
 pub struct AvgState {
     sum: f64,
+    compensation: f64,
     count: i64,
 }
 
@@ -42,12 +56,16 @@ impl AggregateFunction for AvgFunc {
     type State = AvgState;
 
     fn initial_state(&self) -> Self::State {
-        AvgState { sum: 0.0, count: 0 }
+        AvgState {
+            sum: 0.0,
+            compensation: 0.0,
+            count: 0,
+        }
     }
 
     fn step(&self, state: &mut Self::State, args: &[SqliteValue]) -> Result<()> {
         if !args[0].is_null() {
-            state.sum += args[0].to_float();
+            kahan_add(&mut state.sum, &mut state.compensation, args[0].to_float());
             state.count += 1;
         }
         Ok(())
@@ -271,10 +289,12 @@ impl AggregateFunction for AggMinFunc {
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// State for `sum()`: tracks whether all values are integers, the running
-/// integer sum, and the float sum as fallback.
+/// integer sum, and the float sum as fallback.  Uses Kahan compensated
+/// summation for the float path to match C SQLite's precision.
 pub struct SumState {
     int_sum: i64,
     float_sum: f64,
+    float_compensation: f64,
     all_integer: bool,
     has_values: bool,
     overflowed: bool,
@@ -289,6 +309,7 @@ impl AggregateFunction for SumFunc {
         SumState {
             int_sum: 0,
             float_sum: 0.0,
+            float_compensation: 0.0,
             all_integer: true,
             has_values: false,
             overflowed: false,
@@ -308,11 +329,19 @@ impl AggregateFunction for SumFunc {
                         None => state.overflowed = true,
                     }
                 }
-                state.float_sum += *i as f64;
+                kahan_add(
+                    &mut state.float_sum,
+                    &mut state.float_compensation,
+                    *i as f64,
+                );
             }
             other => {
                 state.all_integer = false;
-                state.float_sum += other.to_float();
+                kahan_add(
+                    &mut state.float_sum,
+                    &mut state.float_compensation,
+                    other.to_float(),
+                );
             }
         }
         Ok(())
@@ -347,22 +376,31 @@ impl AggregateFunction for SumFunc {
 
 pub struct TotalFunc;
 
+/// State for `total()`: Kahan compensated accumulator.
+pub struct TotalState {
+    sum: f64,
+    compensation: f64,
+}
+
 impl AggregateFunction for TotalFunc {
-    type State = f64;
+    type State = TotalState;
 
     fn initial_state(&self) -> Self::State {
-        0.0
+        TotalState {
+            sum: 0.0,
+            compensation: 0.0,
+        }
     }
 
     fn step(&self, state: &mut Self::State, args: &[SqliteValue]) -> Result<()> {
         if !args[0].is_null() {
-            *state += args[0].to_float();
+            kahan_add(&mut state.sum, &mut state.compensation, args[0].to_float());
         }
         Ok(())
     }
 
     fn finalize(&self, state: Self::State) -> Result<SqliteValue> {
-        Ok(SqliteValue::Float(state))
+        Ok(SqliteValue::Float(state.sum))
     }
 
     fn num_args(&self) -> i32 {
@@ -662,7 +700,12 @@ mod tests {
             SqliteValue::Float(v) => {
                 assert!((v - expected).abs() < EPS, "expected {expected}, got {v}");
             }
-            other => panic!("expected Float({expected}), got {other:?}"),
+            other => {
+                assert!(
+                    matches!(other, SqliteValue::Float(_)),
+                    "expected Float({expected}), got {other:?}"
+                );
+            }
         }
     }
 
@@ -965,7 +1008,12 @@ mod tests {
                     "expected actual value, got {v}"
                 );
             }
-            other => panic!("expected Float, got {other:?}"),
+            other => {
+                assert!(
+                    matches!(other, SqliteValue::Float(_)),
+                    "expected Float, got {other:?}"
+                );
+            }
         }
     }
 
@@ -987,7 +1035,12 @@ mod tests {
                     "disc must not interpolate: got {v}"
                 );
             }
-            other => panic!("expected Float, got {other:?}"),
+            other => {
+                assert!(
+                    matches!(other, SqliteValue::Float(_)),
+                    "expected Float, got {other:?}"
+                );
+            }
         }
     }
 
