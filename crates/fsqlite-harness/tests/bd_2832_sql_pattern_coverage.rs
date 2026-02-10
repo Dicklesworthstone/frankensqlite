@@ -327,7 +327,6 @@ fn test_aggregate_count_with_group_by() {
 // ── DISTINCT ────────────────────────────────────────────────────────────────
 
 #[test]
-#[ignore = "DISTINCT not yet implemented — needs dedicated bead"]
 fn test_distinct() {
     let conn = seeded_conn();
     let rows = conn.query("SELECT DISTINCT flag FROM t;").unwrap();
