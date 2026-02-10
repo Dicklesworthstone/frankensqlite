@@ -347,9 +347,10 @@ fn manifest_v1_matches_checksums_and_metadata() {
         if line.is_empty() {
             continue;
         }
-        let Some((hash, filename)) = line.split_once("  ") else {
-            panic!("malformed checksum line: {line}");
-        };
+        let parts: Vec<&str> = line.splitn(2, "  ").collect();
+        assert_eq!(parts.len(), 2, "malformed checksum line: {line}");
+        let hash = parts[0];
+        let filename = parts[1];
         let prev = checksum_map.insert(filename.to_owned(), hash.to_owned());
         assert!(
             prev.is_none(),

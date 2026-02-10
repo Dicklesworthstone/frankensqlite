@@ -12,9 +12,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use fsqlite_types::{
-    CommitSeq, IntentOp, ObjectId, PageData, PageNumber, Snapshot, TxnId, TxnToken,
-};
+use fsqlite_types::{CommitSeq, IntentOp, ObjectId, PageData, PageNumber, Snapshot, TxnToken};
 use parking_lot::RwLock;
 use tracing::{debug, info, warn};
 
@@ -138,8 +136,9 @@ pub enum CompatCommitResponse {
     Conflict {
         /// Pages that conflict.
         conflicting_pages: Vec<PageNumber>,
-        /// The transaction that already committed the conflicting pages.
-        conflicting_txn: TxnId,
+        /// The commit sequence of the transaction that caused the conflict.
+        /// V1 does not track per-page TxnId, so we report CommitSeq instead.
+        conflicting_commit_seq: CommitSeq,
     },
     /// I/O error during WAL append/sync.
     IoError {
@@ -431,11 +430,9 @@ impl WriteCoordinator {
         );
 
         // Step 1: Validate (FCW).
-        if let Some((conflict_pages, _conflict_seq)) =
+        if let Some((conflict_pages, conflict_seq)) =
             self.validate_fcw_set(&page_set, req.snapshot.high)
         {
-            // Identify conflicting txn (in V1, we don't track per-page txn ID,
-            // so we return a sentinel).
             info!(
                 bead_id = "bd-389e",
                 txn = ?req.txn,
@@ -444,10 +441,7 @@ impl WriteCoordinator {
             );
             return CompatCommitResponse::Conflict {
                 conflicting_pages: conflict_pages,
-                conflicting_txn: TxnId::new(0).unwrap_or_else(|| {
-                    // Safety: 0 is valid as a sentinel "unknown" txn.
-                    unreachable!("TxnId::new(0) should not fail")
-                }),
+                conflicting_commit_seq: conflict_seq,
             };
         }
 
@@ -515,10 +509,12 @@ impl WriteCoordinator {
                 .collect();
             let page_set: BTreeSet<u32> = page_numbers.iter().copied().collect();
 
-            if let Some((conflict_pages, _)) = self.validate_fcw_set(&page_set, req.snapshot.high) {
+            if let Some((conflict_pages, conflict_seq)) =
+                self.validate_fcw_set(&page_set, req.snapshot.high)
+            {
                 responses.push(CompatCommitResponse::Conflict {
                     conflicting_pages: conflict_pages,
-                    conflicting_txn: TxnId::new(0).unwrap_or_else(|| unreachable!()),
+                    conflicting_commit_seq: conflict_seq,
                 });
             } else {
                 valid_indices.push(i);
@@ -668,7 +664,7 @@ impl WriteCoordinator {
 #[allow(clippy::too_many_lines)]
 mod tests {
     use super::*;
-    use fsqlite_types::{SchemaEpoch, TxnEpoch};
+    use fsqlite_types::{SchemaEpoch, TxnEpoch, TxnId};
 
     fn test_token(id: u64) -> TxnToken {
         TxnToken::new(TxnId::new(id).unwrap(), TxnEpoch::new(0))

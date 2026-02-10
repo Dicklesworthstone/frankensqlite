@@ -178,10 +178,12 @@ fn manifest_v1_exists_and_is_consistent() {
         );
 
         // Acceptance requires the manifest to capture page_size.
-        let sqlite_meta = entry
-            .sqlite_meta
-            .as_ref()
-            .unwrap_or_else(|| panic!("manifest entry {} missing sqlite_meta", entry.db_id));
+        assert!(
+            entry.sqlite_meta.is_some(),
+            "manifest entry {} missing sqlite_meta",
+            entry.db_id
+        );
+        let sqlite_meta = entry.sqlite_meta.as_ref().expect("checked above");
         assert!(
             sqlite_meta.page_size.is_some(),
             "manifest entry {} missing sqlite_meta.page_size",

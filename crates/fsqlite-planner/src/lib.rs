@@ -1049,6 +1049,7 @@ struct PartialPath {
 /// - `needed_columns`: Columns needed in the result (for covering index detection).
 /// - `cross_join_pairs`: Pairs of tables that are `CROSS JOIN`ed (prevents reordering).
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn order_joins(
     tables: &[TableStats],
     indexes: &[IndexInfo],
@@ -1155,7 +1156,21 @@ pub fn order_joins(
         paths = next_paths;
     }
 
-    // Pick the lowest-cost complete path.
+    // Pick the lowest-cost complete path.  If CROSS JOIN constraints
+    // eliminated all seed paths (shouldn't happen with valid SQL but
+    // guard defensively), fall back to seeding every table.
+    if paths.is_empty() {
+        for t in tables {
+            let ap = best_access_path(t, indexes, where_terms, needed_columns);
+            paths.push(PartialPath {
+                tables: vec![t.name.clone()],
+                access_paths: vec![ap.clone()],
+                cost: ap.estimated_cost,
+                cumulative_rows: ap.estimated_rows,
+            });
+        }
+    }
+
     let best = paths
         .into_iter()
         .min_by(|a, b| {
@@ -1163,7 +1178,7 @@ pub fn order_joins(
                 .partial_cmp(&b.cost)
                 .unwrap_or(std::cmp::Ordering::Equal)
         })
-        .expect("at least one table");
+        .expect("tables must be non-empty (checked n == 0 above)");
 
     QueryPlan {
         join_order: best.tables,
