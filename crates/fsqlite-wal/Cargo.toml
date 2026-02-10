@@ -18,6 +18,12 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+criterion = { workspace = true }
+asupersync = { path = "/dp/asupersync" }
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "raptorq_matrix"
+harness = false
