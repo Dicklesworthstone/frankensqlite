@@ -97,7 +97,7 @@ libc = "0.2"
 chacha20poly1305 = "0.10"
 argon2 = "0.5"
 rand = "0.8"
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.32", features = ["bundled", "backup"] }
 
 # Dev dependencies
 criterion = { version = "0.5", features = ["html_reports"] }

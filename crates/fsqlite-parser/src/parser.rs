@@ -1524,9 +1524,15 @@ impl Parser {
                             return Err(self.err_expected("closing parenthesis"));
                         }
                         _ => {
-                            // Reconstruct token text from span.
+                            // Reconstruct token text from token kind.
                             let t = self.current().unwrap();
-                            let text = format!("{:?}", t.kind);
+                            let text = t.kind.to_sql();
+                            if !current_arg.is_empty()
+                                && !current_arg.ends_with(' ')
+                                && !text.is_empty()
+                            {
+                                current_arg.push(' ');
+                            }
                             current_arg.push_str(&text);
                             self.advance();
                         }

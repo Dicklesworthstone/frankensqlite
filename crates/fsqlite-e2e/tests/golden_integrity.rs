@@ -312,6 +312,7 @@ fn checksums_sha256_is_well_formed() {
 ///
 /// This test runs unconditionally (does NOT require golden `.db` binaries).
 #[test]
+#[allow(clippy::too_many_lines)]
 fn manifest_v1_matches_checksums_and_metadata() {
     let manifest_path = manifest_path();
     assert!(
@@ -339,7 +340,7 @@ fn manifest_v1_matches_checksums_and_metadata() {
 
     // Parse checksums into a map.
     let checksums_text =
-        std::fs::read_to_string(&checksums_path()).expect("failed to read checksums.sha256");
+        std::fs::read_to_string(checksums_path()).expect("failed to read checksums.sha256");
     let mut checksum_map: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
     for line in checksums_text.lines().map(str::trim) {
@@ -347,8 +348,7 @@ fn manifest_v1_matches_checksums_and_metadata() {
             continue;
         }
         let Some((hash, filename)) = line.split_once("  ") else {
-            assert!(false, "malformed checksum line: {line}");
-            continue;
+            panic!("malformed checksum line: {line}");
         };
         let prev = checksum_map.insert(filename.to_owned(), hash.to_owned());
         assert!(

@@ -1044,7 +1044,7 @@ fn insert_cell_into_page<W: PageWriter>(
         + header.page_type.header_size() as usize
         + (header.cell_count as usize + 1) * CELL_POINTER_SIZE as usize;
 
-    if ptr_array_end + CELL_POINTER_SIZE as usize > new_content_offset {
+    if ptr_array_end > new_content_offset {
         return Err(FrankenError::internal(
             "insufficient space for cell insertion (parent page overflow)",
         ));

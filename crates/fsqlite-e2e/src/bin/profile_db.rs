@@ -103,14 +103,12 @@ where
         i += 1;
     }
 
-    if !manifest_only {
-        if !golden_dir.is_dir() {
-            eprintln!(
-                "error: golden directory does not exist: {}",
-                golden_dir.display()
-            );
-            return 1;
-        }
+    if !manifest_only && !golden_dir.is_dir() {
+        eprintln!(
+            "error: golden directory does not exist: {}",
+            golden_dir.display()
+        );
+        return 1;
     }
 
     if !output_dir.is_dir() {
@@ -440,6 +438,7 @@ fn validate_db_id(s: &str) -> Result<String, String> {
     Ok(id)
 }
 
+#[allow(clippy::type_complexity)]
 fn read_metadata_minimal(
     meta_path: &Path,
 ) -> Result<(u64, u32, Option<String>, Option<u32>, Option<u32>), String> {

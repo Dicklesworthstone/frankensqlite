@@ -435,7 +435,13 @@ fn cmd_corpus_import(argv: &[String]) -> i32 {
             return 1;
         }
 
-        match profile_database_for_metadata(&dest_db, &fixture_id, tag.as_deref(), &source_tags) {
+        match profile_database_for_metadata(
+            &dest_db,
+            &fixture_id,
+            Some(&source_path),
+            tag.as_deref(),
+            &source_tags,
+        ) {
             Ok(profile) => {
                 let out_path = metadata_dir.join(format!("{fixture_id}.json"));
                 match serde_json::to_string_pretty(&profile) {
@@ -1931,6 +1937,7 @@ struct ColumnProfile {
 fn profile_database_for_metadata(
     db_path: &Path,
     fixture_id: &str,
+    source_path: Option<&Path>,
     tag: Option<&str>,
     discovery_tags: &[String],
 ) -> Result<DbProfile, String> {
@@ -1972,7 +1979,7 @@ fn profile_database_for_metadata(
 
     Ok(DbProfile {
         name: fixture_id.to_owned(),
-        source_path: None,
+        source_path: source_path.map(|p| p.to_string_lossy().into_owned()),
         tag: tag.map(str::to_owned),
         discovery_tags: discovery_tags.to_vec(),
         file_size_bytes: meta.len(),
@@ -2164,9 +2171,8 @@ fn sqlite_magic_header_ok(path: &Path) -> io::Result<bool> {
 }
 
 fn backup_sqlite_file(src: &Path, dst: &Path) -> Result<(), String> {
-    let src_conn = Connection::open_with_flags(src, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(
-        |e| format!("cannot open source DB {} (read-only): {e}", src.display()),
-    )?;
+    let src_conn = Connection::open_with_flags(src, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|e| format!("cannot open source DB {} (read-only): {e}", src.display()))?;
 
     // Uses SQLite backup API (same semantics as `sqlite3 "$SRC" ".backup '$DST'"`).
     src_conn

@@ -2352,7 +2352,6 @@ fn sql_cast(val: SqliteValue, target: i32) -> SqliteValue {
 /// Convert affinity character to `TypeAffinity`.
 fn char_to_affinity(ch: char) -> fsqlite_types::TypeAffinity {
     match ch {
-        'A' | 'a' => fsqlite_types::TypeAffinity::Blob,
         'B' | 'b' => fsqlite_types::TypeAffinity::Text,
         'C' | 'c' => fsqlite_types::TypeAffinity::Numeric,
         'D' | 'd' => fsqlite_types::TypeAffinity::Integer,

@@ -1,0 +1,245 @@
+{
+  "manifest_version": 1,
+  "entries": [
+    {
+      "db_id": "agentic_coding_flywheel_setup",
+      "golden_filename": "agentic_coding_flywheel_setup.db",
+      "sha256_golden": "6bef9ced8217337f7bf7196d1f3d8035752c67ec32c4952abc09ad6a0235c037",
+      "size_bytes": 7966720,
+      "sqlite_meta": {
+        "page_size": 4096,
+        "journal_mode": "wal",
+        "user_version": 0,
+        "application_id": 0
+      }
+    },
+    {
+      "db_id": "asupersync",
+      "golden_filename": "asupersync.db",
+      "sha256_golden": "8e91ff61cbbf4c63c68009e6dee7de0ac63f8e601d9555db3a4afbcb7f85acd0",
+      "size_bytes": 12427264,
+      "sqlite_meta": {
+        "page_size": 4096,
+        "journal_mode": "wal",
+        "user_version": 0,
+        "application_id": 0
+      }
+    },
+    {
+      "db_id": "beads_viewer",
+      "golden_filename": "beads_viewer.db",
+      "sha256_golden": "e80d29ccb19a796cda8caf4ac1c87c3f5df2a60f0735bc934b1da86a05f91835",
+      "size_bytes": 6565888,
+      "sqlite_meta": {
+        "page_size": 4096,
+        "journal_mode": "wal",
+        "user_version": 0,
+        "application_id": 0
+      }
+    },
+    {
+      "db_id": "brenner_bot",
+      "golden_filename": "brenner_bot.db",
+      "sha256_golden": "83608b0c169dc42af87f742f3fb53f822bd395b676901f6754614fe795f8d771",
+      "size_bytes": 8740864,
+      "sqlite_meta": {
+        "page_size": 4096,
+        "journal_mode": "wal",
+        "user_version": 0,
+        "application_id": 0
+      }
+    },
+    {
+      "db_id": "coding_agent_session_search",
+      "golden_filename": "coding_agent_session_search.db",
+      "sha256_golden": "418628dd11d06b0d11fc1597e84a1bdcc4165a0f668640ad118321dce095e974",
+      "size_bytes": 8044544,
+      "sqlite_meta": {
+        "page_size": 4096,
+        "journal_mode": "wal",
+        "user_version": 0,
+        "application_id": 0
+      }
+    },
+    {
+      "db_id": "destructive_command_guard",
+      "golden_filename": "destructive_command_guard.db",
+      "sha256_golden": "118d9267785ca02e4d7b26b9812460ff726a385e5aa006463af41d729d3540d8",
+      "size_bytes": 9871360,
+      "sqlite_meta": {
+        "page_size": 4096,
+        "journal_mode": "wal",
+        "user_version": 0,
+        "application_id": 0
+      }
+    },
+    {
+      "db_id": "dp_level",
+      "golden_filename": "dp_level.db",
+      "sha256_golden": "673acf23719e3406da902e78ed755658345506b284493ee8749f04831890a8ed",
+      "size_bytes": 2985984,
+      "sqlite_meta": {
+        "page_size": 4096,
+        "journal_mode": "wal",
+        "user_version": 0,
+        "application_id": 0
+      }
+    },
+    {
+      "db_id": "flywheel_connectors",
+      "golden_filename": "flywheel_connectors.db",
+      "sha256_golden": "931a8e00ee2c38352041112d099ed422bba944c10949e5445b22558a1149d974",
+      "size_bytes": 17813504,
+      "sqlite_meta": {
+        "page_size": 4096,
+        "journal_mode": "wal",
+        "user_version": 0,
+        "application_id": 0
+      }
+    },
+    {
+      "db_id": "flywheel_gateway",
+      "golden_filename": "flywheel_gateway.db",
+      "sha256_golden": "89a42207ef62e498a535cf6e5a7ed412f32696f08b6d7912be6377f7530f4de7",
+      "size_bytes": 13295616,
+      "sqlite_meta": {
+        "page_size": 4096,
+        "journal_mode": "wal",
+        "user_version": 0,
+        "application_id": 0
+      }
+    },
+    {
+      "db_id": "flywheel_private",
+      "golden_filename": "flywheel_private.db",
+      "sha256_golden": "94e2988f3201cae5fc7469edad5fb96de84d69356206f1a5cbd833b175f7070a",
+      "size_bytes": 7294976,
+      "sqlite_meta": {
+        "page_size": 4096,
+        "journal_mode": "wal",
+        "user_version": 0,
+        "application_id": 0
+      }
+    },
+    {
+      "db_id": "frankensqlite",
+      "golden_filename": "frankensqlite.db",
+      "sha256_golden": "74cca46d8b9364fb898e8aa9ad53a733c7dbf39d1d80771a35570a3a3f84f49f",
+      "size_bytes": 10674176,
+      "sqlite_meta": {
+        "page_size": 4096,
+        "journal_mode": "wal",
+        "user_version": 0,
+        "application_id": 0
+      }
+    },
+    {
+      "db_id": "frankentui",
+      "golden_filename": "frankentui.db",
+      "sha256_golden": "ddf28ab6e9c272bb1cee80d11e6433c3945b6efbcb109d9fdeda34be6396f83e",
+      "size_bytes": 8089600,
+      "sqlite_meta": {
+        "page_size": 4096,
+        "journal_mode": "wal",
+        "user_version": 0,
+        "application_id": 0
+      }
+    },
+    {
+      "db_id": "historical_soldiers",
+      "golden_filename": "historical_soldiers.db",
+      "sha256_golden": "37b1f93e010cfb591e7f220df56a7cb96acb8b6b2f02315b2fb3821fd9100591",
+      "size_bytes": 5279744,
+      "sqlite_meta": {
+        "page_size": 4096,
+        "journal_mode": "wal",
+        "user_version": 0,
+        "application_id": 0
+      }
+    },
+    {
+      "db_id": "jain_idea_analyzer_agent",
+      "golden_filename": "jain_idea_analyzer_agent.db",
+      "sha256_golden": "283c044441fd6b18895ce440fae5b6a5c3d73a763dfdf262316351f3b14ae23a",
+      "size_bytes": 5423104,
+      "sqlite_meta": {
+        "page_size": 4096,
+        "journal_mode": "wal",
+        "user_version": 0,
+        "application_id": 0
+      }
+    },
+    {
+      "db_id": "jeffreys_skills_md",
+      "golden_filename": "jeffreys_skills_md.db",
+      "sha256_golden": "45856f68596dcaf51c7934a652323778368d4c274bc217422481d7bf41145ceb",
+      "size_bytes": 11345920,
+      "sqlite_meta": {
+        "page_size": 4096,
+        "journal_mode": "wal",
+        "user_version": 0,
+        "application_id": 0
+      }
+    },
+    {
+      "db_id": "jeffreysprompts_premium",
+      "golden_filename": "jeffreysprompts_premium.db",
+      "sha256_golden": "bfe77a7b8b4694548b2edb6f1e532b5f086a0d6015a9b73f7e3ec6b37e29553c",
+      "size_bytes": 8364032,
+      "sqlite_meta": {
+        "page_size": 4096,
+        "journal_mode": "wal",
+        "user_version": 0,
+        "application_id": 0
+      }
+    },
+    {
+      "db_id": "jsm",
+      "golden_filename": "jsm.db",
+      "sha256_golden": "45856f68596dcaf51c7934a652323778368d4c274bc217422481d7bf41145ceb",
+      "size_bytes": 11345920,
+      "sqlite_meta": {
+        "page_size": 4096,
+        "journal_mode": "wal",
+        "user_version": 0,
+        "application_id": 0
+      }
+    },
+    {
+      "db_id": "meta_skill",
+      "golden_filename": "meta_skill.db",
+      "sha256_golden": "faf3170e17574e7f9e57bb19120aab4dd0c8eb727acffdf2dbf38d1f7f1a9b64",
+      "size_bytes": 10039296,
+      "sqlite_meta": {
+        "page_size": 4096,
+        "journal_mode": "wal",
+        "user_version": 0,
+        "application_id": 0
+      }
+    },
+    {
+      "db_id": "ntm",
+      "golden_filename": "ntm.db",
+      "sha256_golden": "54ed55218773faf30f8fdcee4fc42db87a8afc6c071ceb38402f0e1ce192bc67",
+      "size_bytes": 7168000,
+      "sqlite_meta": {
+        "page_size": 4096,
+        "journal_mode": "wal",
+        "user_version": 0,
+        "application_id": 0
+      }
+    },
+    {
+      "db_id": "remote_compilation_helper",
+      "golden_filename": "remote_compilation_helper.db",
+      "sha256_golden": "e265a73342eebbafaab9df419b86dd18fa157e1c88161173f8b2d317366fafcf",
+      "size_bytes": 9723904,
+      "sqlite_meta": {
+        "page_size": 4096,
+        "journal_mode": "wal",
+        "user_version": 0,
+        "application_id": 0
+      }
+    }
+  ]
+}

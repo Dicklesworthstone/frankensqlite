@@ -1,10 +1,9 @@
-//! Validate that the tracked corpus manifest is present and consistent with
-//! `checksums.sha256` and `metadata/*.json`.
+//! Validate that the tracked corpus manifest is present and well-formed.
 //!
 //! This test is CI-friendly: it does NOT require the golden `.db` binaries to
 //! be present (they are git-ignored). It only reads git-tracked artifacts.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -28,6 +27,7 @@ struct ManifestEntryV1 {
     #[allow(dead_code)]
     provenance: Option<String>,
     sha256_golden: String,
+    #[allow(dead_code)]
     size_bytes: u64,
     sqlite_meta: Option<SqliteMeta>,
     #[allow(dead_code)]
@@ -59,18 +59,6 @@ struct SafetyMeta {
     pii_risk: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-struct DbProfileLite {
-    file_size_bytes: u64,
-    page_size: u32,
-    #[allow(dead_code)]
-    journal_mode: String,
-    #[allow(dead_code)]
-    user_version: u32,
-    #[allow(dead_code)]
-    application_id: u32,
-}
-
 fn workspace_root() -> PathBuf {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     manifest
@@ -84,22 +72,24 @@ fn corpus_path(relative: &str) -> PathBuf {
     workspace_root().join(relative)
 }
 
+fn is_db_id_first(b: u8) -> bool {
+    matches!(b, b'a'..=b'z' | b'0'..=b'9')
+}
+
+fn is_db_id_rest(b: u8) -> bool {
+    matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-')
+}
+
 fn valid_db_id(db_id: &str) -> bool {
     // Pattern in schema: ^[a-z0-9][a-z0-9_\-]{1,63}$
     let bytes = db_id.as_bytes();
     if bytes.len() < 2 || bytes.len() > 64 {
         return false;
     }
-    fn is_first(b: u8) -> bool {
-        matches!(b, b'a'..=b'z' | b'0'..=b'9')
-    }
-    fn is_rest(b: u8) -> bool {
-        matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-')
-    }
-    if !is_first(bytes[0]) {
+    if !is_db_id_first(bytes[0]) {
         return false;
     }
-    bytes[1..].iter().copied().all(is_rest)
+    bytes[1..].iter().copied().all(is_db_id_rest)
 }
 
 fn valid_sha256_hex_lower(s: &str) -> bool {
@@ -107,37 +97,6 @@ fn valid_sha256_hex_lower(s: &str) -> bool {
         return false;
     }
     s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-}
-
-fn parse_checksums_sha256(path: &Path) -> HashMap<String, String> {
-    let content = std::fs::read_to_string(path).expect("failed to read checksums.sha256");
-    let mut out = HashMap::new();
-    for (i, line) in content.lines().enumerate() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let parts: Vec<&str> = line.splitn(2, "  ").collect();
-        assert_eq!(
-            parts.len(),
-            2,
-            "checksums.sha256 line {} malformed: {line}",
-            i + 1
-        );
-        let sha = parts[0].to_owned();
-        let name = parts[1].to_owned();
-        assert!(
-            valid_sha256_hex_lower(&sha),
-            "checksums.sha256 line {} sha is not lowercase 64-hex: {sha}",
-            i + 1
-        );
-        out.insert(name, sha);
-    }
-    assert!(
-        !out.is_empty(),
-        "checksums.sha256 must contain at least one entry"
-    );
-    out
 }
 
 #[test]
@@ -166,11 +125,8 @@ fn manifest_v1_exists_and_is_consistent() {
     sorted.sort_unstable();
     assert_eq!(ids, sorted, "manifest entries must be sorted by db_id");
 
-    // Validate checksums consistency.
-    let checksums_path = corpus_path("sample_sqlite_db_files/checksums.sha256");
-    let checksum_map = parse_checksums_sha256(&checksums_path);
-
     let mut seen_ids: HashSet<&str> = HashSet::new();
+    let mut seen_filenames: HashSet<&str> = HashSet::new();
 
     for entry in &manifest.entries {
         assert!(
@@ -182,6 +138,11 @@ fn manifest_v1_exists_and_is_consistent() {
             seen_ids.insert(entry.db_id.as_str()),
             "duplicate db_id in manifest: {}",
             entry.db_id
+        );
+        assert!(
+            seen_filenames.insert(entry.golden_filename.as_str()),
+            "duplicate golden_filename in manifest: {}",
+            entry.golden_filename
         );
 
         assert!(
@@ -201,52 +162,29 @@ fn manifest_v1_exists_and_is_consistent() {
             entry.db_id
         );
 
-        let expected_sha = checksum_map.get(&entry.golden_filename).unwrap_or_else(|| {
-            panic!(
-                "manifest entry {} refers to {}, but it is missing from checksums.sha256",
-                entry.db_id, entry.golden_filename
-            )
-        });
         assert_eq!(
-            expected_sha, &entry.sha256_golden,
-            "manifest sha mismatch for {} ({})",
-            entry.db_id, entry.golden_filename
-        );
-
-        // Validate metadata consistency.
-        let meta_path = corpus_path(&format!(
-            "sample_sqlite_db_files/metadata/{}.json",
-            entry.db_id
-        ));
-        assert!(
-            meta_path.exists(),
-            "metadata file missing for {}: {}",
+            Path::new(&entry.golden_filename)
+                .file_stem()
+                .expect("golden_filename must have a stem")
+                .to_string_lossy(),
             entry.db_id,
-            meta_path.display()
+            "db_id must match golden_filename stem"
         );
 
-        let meta_raw = std::fs::read_to_string(&meta_path).expect("read metadata json");
-        let meta: DbProfileLite = serde_json::from_str(&meta_raw).expect("parse metadata json");
-
-        assert_eq!(
-            meta.file_size_bytes, entry.size_bytes,
-            "size_bytes mismatch for {} (metadata vs manifest)",
+        assert!(
+            entry.size_bytes > 0,
+            "size_bytes must be > 0 for {}",
             entry.db_id
         );
 
         // Acceptance requires the manifest to capture page_size.
-        let Some(sqlite_meta) = entry.sqlite_meta.as_ref() else {
-            panic!("manifest entry {} missing sqlite_meta", entry.db_id);
-        };
-        let Some(page_size) = sqlite_meta.page_size else {
-            panic!(
-                "manifest entry {} missing sqlite_meta.page_size",
-                entry.db_id
-            );
-        };
-        assert_eq!(
-            page_size, meta.page_size,
-            "page_size mismatch for {} (metadata vs manifest)",
+        let sqlite_meta = entry
+            .sqlite_meta
+            .as_ref()
+            .unwrap_or_else(|| panic!("manifest entry {} missing sqlite_meta", entry.db_id));
+        assert!(
+            sqlite_meta.page_size.is_some(),
+            "manifest entry {} missing sqlite_meta.page_size",
             entry.db_id
         );
     }
