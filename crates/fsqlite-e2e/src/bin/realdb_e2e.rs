@@ -22,19 +22,19 @@ use sha2::{Digest, Sha256};
 use rusqlite::{Connection, DatabaseName, OpenFlags};
 use serde::Serialize;
 
-use fsqlite_e2e::benchmark::{BenchmarkConfig, BenchmarkMeta, BenchmarkSummary, run_benchmark};
-use fsqlite_e2e::corruption::{CorruptionStrategy, inject_corruption};
+use fsqlite_e2e::benchmark::{run_benchmark, BenchmarkConfig, BenchmarkMeta, BenchmarkSummary};
+use fsqlite_e2e::corruption::{inject_corruption, CorruptionStrategy};
 use fsqlite_e2e::fixture_metadata::{
-    ColumnProfileV1, FIXTURE_METADATA_SCHEMA_VERSION_V1, FixtureFeaturesV1, FixtureMetadataV1,
-    FixtureSafetyV1, RiskLevel, SqliteMetaV1, TableProfileV1, normalize_tags, size_bucket_tag,
+    normalize_tags, size_bucket_tag, ColumnProfileV1, FixtureFeaturesV1, FixtureMetadataV1,
+    FixtureSafetyV1, RiskLevel, SqliteMetaV1, TableProfileV1, FIXTURE_METADATA_SCHEMA_VERSION_V1,
 };
-use fsqlite_e2e::fsqlite_executor::{FsqliteExecConfig, run_oplog_fsqlite};
+use fsqlite_e2e::fsqlite_executor::{run_oplog_fsqlite, FsqliteExecConfig};
 use fsqlite_e2e::methodology::EnvironmentMeta;
 use fsqlite_e2e::oplog::{self, OpLog};
 use fsqlite_e2e::report::{EngineInfo, RunRecordV1, RunRecordV1Args};
 use fsqlite_e2e::report_render::render_benchmark_summaries_markdown;
-use fsqlite_e2e::run_workspace::{WorkspaceConfig, create_workspace};
-use fsqlite_e2e::sqlite_executor::{SqliteExecConfig, run_oplog_sqlite};
+use fsqlite_e2e::run_workspace::{create_workspace, WorkspaceConfig};
+use fsqlite_e2e::sqlite_executor::{run_oplog_sqlite, SqliteExecConfig};
 
 fn main() {
     let exit_code = run_cli(std::env::args_os());
@@ -2528,6 +2528,7 @@ fn profile_database_for_metadata(
     }
     tags.extend(discovery_tags.iter().cloned());
     tags.push(size_bucket_tag(meta.len()).to_owned());
+    tags.push(format!("page-size-{page_size}"));
     if journal_mode.eq_ignore_ascii_case("wal") {
         tags.push("wal".to_owned());
     }
