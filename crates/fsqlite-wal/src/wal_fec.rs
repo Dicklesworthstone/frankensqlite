@@ -608,6 +608,66 @@ pub enum WalFecRecoveryFallbackReason {
     InsufficientSymbols,
     DecodeFailed,
     DecodedPayloadMismatch,
+    /// Recovery was explicitly disabled via [`WalFecRecoveryConfig`].
+    RecoveryDisabled,
+}
+
+/// Configuration for WAL-FEC recovery behaviour.
+///
+/// When `recovery_enabled` is `false`, the recovery path immediately returns
+/// a [`WalFecRecoveryOutcome::TruncateBeforeGroup`] with
+/// [`WalFecRecoveryFallbackReason::RecoveryDisabled`], emulating what C SQLite
+/// does on WAL corruption (discard from the first checksum mismatch onward).
+///
+/// This allows the corruption demo harness to contrast:
+/// - Recovery OFF → expect data loss / truncation (C SQLite behaviour).
+/// - Recovery ON  → expect self-healing when repair symbols are sufficient.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalFecRecoveryConfig {
+    /// Whether WAL-FEC recovery is attempted.  Default: `true`.
+    pub recovery_enabled: bool,
+}
+
+impl Default for WalFecRecoveryConfig {
+    fn default() -> Self {
+        Self {
+            recovery_enabled: true,
+        }
+    }
+}
+
+/// Structured log entry for a single WAL-FEC recovery attempt (bd-1w6k.2.5).
+///
+/// Captures machine-readable statistics for the corruption demo harness.
+/// The harness can validate expected outcomes and render human-readable
+/// recovery reports from these entries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct WalFecRecoveryLog {
+    /// Identity of the commit group targeted for recovery.
+    pub group_id: WalFecGroupId,
+    /// Whether recovery was enabled for this attempt.
+    pub recovery_enabled: bool,
+    /// The final outcome: `Recovered` or `TruncateBeforeGroup`.
+    pub outcome_is_recovered: bool,
+    /// Why recovery fell back, if it did.
+    pub fallback_reason: Option<WalFecRecoveryFallbackReason>,
+    /// Source symbols that passed xxh3 verification.
+    pub validated_source_symbols: u32,
+    /// Repair symbols that passed metadata binding.
+    pub validated_repair_symbols: u32,
+    /// Symbols required for decode (= K).
+    pub required_symbols: u32,
+    /// Total usable symbols (source + repair).
+    pub available_symbols: u32,
+    /// Frame numbers that were recovered from repair symbols.
+    pub recovered_frame_nos: Vec<u32>,
+    /// Count of corrupt observations during validation.
+    pub corruption_observations: u32,
+    /// Whether the RaptorQ decoder was invoked.
+    pub decode_attempted: bool,
+    /// Whether decode succeeded.
+    pub decode_succeeded: bool,
 }
 
 /// Recovery audit artifact for a single WAL-FEC group attempt (§3.4.1).
@@ -1371,6 +1431,109 @@ where
         &mut decode,
     )
 }
+
+/// Config-aware WAL-FEC recovery that produces a [`WalFecRecoveryLog`].
+///
+/// When `config.recovery_enabled` is `false`, immediately returns
+/// `TruncateBeforeGroup` (simulating C SQLite behaviour) and a log entry
+/// recording the skip.
+///
+/// When enabled, delegates to [`recover_wal_fec_group_with_decoder`] and
+/// converts the resulting [`WalFecDecodeProof`] into a structured log.
+pub fn recover_wal_fec_group_with_config<F>(
+    sidecar_path: &Path,
+    group_id: WalFecGroupId,
+    wal_salts: WalSalts,
+    first_checksum_mismatch_frame_no: u32,
+    wal_frames: &[WalFrameCandidate],
+    config: &WalFecRecoveryConfig,
+    decode: F,
+) -> Result<(WalFecRecoveryOutcome, WalFecRecoveryLog)>
+where
+    F: FnMut(&WalFecGroupMeta, &[(u32, Vec<u8>)]) -> Result<Vec<Vec<u8>>>,
+{
+    if !config.recovery_enabled {
+        info!(
+            bead_id = BD_1W6K_25_BEAD_ID,
+            group_id = %group_id,
+            "wal-fec recovery disabled; falling back to sqlite-compatible truncation"
+        );
+        let outcome = truncate_outcome(
+            group_id,
+            first_checksum_mismatch_frame_no,
+            WalFecRecoveryFallbackReason::RecoveryDisabled,
+            RecoveryProofStats::new(0),
+        );
+        let log = WalFecRecoveryLog {
+            group_id,
+            recovery_enabled: false,
+            outcome_is_recovered: false,
+            fallback_reason: Some(WalFecRecoveryFallbackReason::RecoveryDisabled),
+            validated_source_symbols: 0,
+            validated_repair_symbols: 0,
+            required_symbols: 0,
+            available_symbols: 0,
+            recovered_frame_nos: Vec::new(),
+            corruption_observations: 0,
+            decode_attempted: false,
+            decode_succeeded: false,
+        };
+        return Ok((outcome, log));
+    }
+
+    let outcome = recover_wal_fec_group_with_decoder(
+        sidecar_path,
+        group_id,
+        wal_salts,
+        first_checksum_mismatch_frame_no,
+        wal_frames,
+        decode,
+    )?;
+
+    let log = recovery_log_from_outcome(group_id, &outcome, true);
+    Ok((outcome, log))
+}
+
+/// Extract a [`WalFecRecoveryLog`] from a completed recovery outcome.
+#[must_use]
+pub fn recovery_log_from_outcome(
+    group_id: WalFecGroupId,
+    outcome: &WalFecRecoveryOutcome,
+    recovery_enabled: bool,
+) -> WalFecRecoveryLog {
+    match outcome {
+        WalFecRecoveryOutcome::Recovered(group) => WalFecRecoveryLog {
+            group_id,
+            recovery_enabled,
+            outcome_is_recovered: true,
+            fallback_reason: None,
+            validated_source_symbols: group.decode_proof.validated_source_symbols,
+            validated_repair_symbols: group.decode_proof.validated_repair_symbols,
+            required_symbols: group.decode_proof.required_symbols,
+            available_symbols: group.decode_proof.available_symbols,
+            recovered_frame_nos: group.decode_proof.recovered_frame_nos.clone(),
+            corruption_observations: group.decode_proof.corruption_observations,
+            decode_attempted: group.decode_proof.decode_attempted,
+            decode_succeeded: group.decode_proof.decode_succeeded,
+        },
+        WalFecRecoveryOutcome::TruncateBeforeGroup { decode_proof, .. } => WalFecRecoveryLog {
+            group_id,
+            recovery_enabled,
+            outcome_is_recovered: false,
+            fallback_reason: decode_proof.fallback_reason,
+            validated_source_symbols: decode_proof.validated_source_symbols,
+            validated_repair_symbols: decode_proof.validated_repair_symbols,
+            required_symbols: decode_proof.required_symbols,
+            available_symbols: decode_proof.available_symbols,
+            recovered_frame_nos: decode_proof.recovered_frame_nos.clone(),
+            corruption_observations: decode_proof.corruption_observations,
+            decode_attempted: decode_proof.decode_attempted,
+            decode_succeeded: decode_proof.decode_succeeded,
+        },
+    }
+}
+
+const BD_1W6K_25_BEAD_ID: &str = "bd-1w6k.2.5";
 
 fn recover_wal_fec_group_record_with_decoder<F>(
     group: &WalFecRecoveryGroupRecord,

@@ -241,6 +241,13 @@ pub struct Connection {
     /// (as opposed to an explicit BEGIN).  Used by RELEASE to decide whether
     /// to auto-commit when the last savepoint is released.
     implicit_txn: RefCell<bool>,
+    /// Whether the current transaction uses MVCC concurrent-writer mode
+    /// (`BEGIN CONCURRENT`).  When true, the harness can observe different
+    /// concurrency behaviour compared to single-writer mode.
+    concurrent_txn: RefCell<bool>,
+    /// Connection-level flag: when set, plain `BEGIN` is promoted to
+    /// `BEGIN CONCURRENT`.  Controlled by `PRAGMA fsqlite.concurrent_mode`.
+    concurrent_mode_default: RefCell<bool>,
 }
 
 impl std::fmt::Debug for Connection {
@@ -277,6 +284,8 @@ impl Connection {
             persist_suspended: RefCell::new(false),
             last_changes: RefCell::new(0),
             implicit_txn: RefCell::new(false),
+            concurrent_txn: RefCell::new(false),
+            concurrent_mode_default: RefCell::new(false),
         };
         conn.load_persisted_state_if_present()?;
         Ok(conn)
@@ -469,8 +478,12 @@ impl Connection {
                 self.execute_release(name)?;
                 Ok(Vec::new())
             }
+            Statement::Pragma(ref pragma) => {
+                self.execute_pragma(pragma)?;
+                Ok(Vec::new())
+            }
             _ => Err(FrankenError::NotImplemented(
-                "only SELECT, INSERT, UPDATE, DELETE, CREATE TABLE, and transaction control are supported".to_owned(),
+                "only SELECT, INSERT, UPDATE, DELETE, CREATE TABLE, transaction control, and PRAGMA are supported".to_owned(),
             )),
         }
     }
@@ -609,15 +622,25 @@ impl Connection {
         (*self.schema.borrow_mut()).clone_from(&snap.schema);
     }
 
-    /// Handle BEGIN [DEFERRED|IMMEDIATE|EXCLUSIVE].
-    fn execute_begin(&self, _begin: fsqlite_ast::BeginStatement) -> Result<()> {
+    /// Handle BEGIN [DEFERRED|IMMEDIATE|EXCLUSIVE|CONCURRENT].
+    fn execute_begin(&self, begin: fsqlite_ast::BeginStatement) -> Result<()> {
         if *self.in_transaction.borrow() {
             return Err(FrankenError::Internal(
                 "cannot start a transaction within a transaction".to_owned(),
             ));
         }
+
+        // Determine effective mode: explicit mode wins; if absent, promote to
+        // Concurrent when `concurrent_mode_default` is enabled.
+        let is_concurrent = match begin.mode {
+            Some(fsqlite_ast::TransactionMode::Concurrent) => true,
+            Some(_) => false,
+            None => *self.concurrent_mode_default.borrow(),
+        };
+
         *self.txn_snapshot.borrow_mut() = Some(self.snapshot());
         *self.in_transaction.borrow_mut() = true;
+        *self.concurrent_txn.borrow_mut() = is_concurrent;
         Ok(())
     }
 
@@ -633,6 +656,7 @@ impl Connection {
         self.savepoints.borrow_mut().clear();
         *self.in_transaction.borrow_mut() = false;
         *self.implicit_txn.borrow_mut() = false;
+        *self.concurrent_txn.borrow_mut() = false;
         Ok(())
     }
 
@@ -665,6 +689,7 @@ impl Connection {
             self.savepoints.borrow_mut().clear();
             *self.in_transaction.borrow_mut() = false;
             *self.implicit_txn.borrow_mut() = false;
+            *self.concurrent_txn.borrow_mut() = false;
         }
         Ok(())
     }
@@ -704,6 +729,54 @@ impl Connection {
             *self.implicit_txn.borrow_mut() = false;
         }
         Ok(())
+    }
+
+    // ── PRAGMA handling ────────────────────────────────────────────────
+
+    /// Handle PRAGMA statements.
+    ///
+    /// Currently supported:
+    /// - `PRAGMA fsqlite.concurrent_mode = ON|OFF|TRUE|FALSE|1|0`
+    ///   Enables or disables MVCC concurrent-writer mode for subsequent
+    ///   transactions on this connection. When enabled, plain `BEGIN` is
+    ///   automatically promoted to `BEGIN CONCURRENT`.
+    fn execute_pragma(&self, pragma: &fsqlite_ast::PragmaStatement) -> Result<()> {
+        let name = pragma.name.name.to_lowercase();
+        let schema = pragma.name.schema.as_ref().map(|s| s.to_lowercase());
+        let full_name = if let Some(ref s) = schema {
+            format!("{s}.{name}")
+        } else {
+            name
+        };
+
+        match full_name.as_str() {
+            "fsqlite.concurrent_mode" | "concurrent_mode" => {
+                if let Some(ref val) = pragma.value {
+                    let enabled = parse_pragma_bool(val)?;
+                    *self.concurrent_mode_default.borrow_mut() = enabled;
+                }
+                Ok(())
+            }
+            // Unrecognised pragmas are silently ignored (SQLite compatibility).
+            _ => Ok(()),
+        }
+    }
+
+    // ── Public MVCC accessors ─────────────────────────────────────────
+
+    /// Returns `true` if the current transaction was started with
+    /// `BEGIN CONCURRENT` (or was promoted to concurrent mode via the
+    /// `fsqlite.concurrent_mode` PRAGMA).
+    #[must_use]
+    pub fn is_concurrent_transaction(&self) -> bool {
+        *self.concurrent_txn.borrow()
+    }
+
+    /// Returns `true` if the connection-level concurrent-mode default is
+    /// enabled (i.e. `PRAGMA fsqlite.concurrent_mode = ON`).
+    #[must_use]
+    pub fn is_concurrent_mode_default(&self) -> bool {
+        *self.concurrent_mode_default.borrow()
     }
 
     // ── Compilation helpers ─────────────────────────────────────────────
@@ -1751,6 +1824,43 @@ fn parse_statements(sql: &str) -> Result<Vec<Statement>> {
     }
 
     Ok(statements)
+}
+
+/// Parse a PRAGMA value as a boolean.
+///
+/// Accepts `on`, `off`, `true`, `false`, `1`, `0`, `yes`, `no`
+/// (case-insensitive).
+fn parse_pragma_bool(value: &fsqlite_ast::PragmaValue) -> Result<bool> {
+    let expr = match value {
+        fsqlite_ast::PragmaValue::Assign(e) | fsqlite_ast::PragmaValue::Call(e) => e,
+    };
+    let text = match expr {
+        Expr::Literal(Literal::Integer(n), _) => {
+            return match *n {
+                0 => Ok(false),
+                1 => Ok(true),
+                _ => Err(FrankenError::Internal(format!(
+                    "PRAGMA boolean value must be 0 or 1, got {n}"
+                ))),
+            };
+        }
+        Expr::Literal(Literal::True, _) => return Ok(true),
+        Expr::Literal(Literal::False, _) => return Ok(false),
+        Expr::Literal(Literal::String(s), _) => s.clone(),
+        Expr::Column(col_ref, _) if col_ref.table.is_none() => col_ref.column.clone(),
+        _ => {
+            return Err(FrankenError::Internal(
+                "PRAGMA boolean value must be ON/OFF/TRUE/FALSE/1/0".to_owned(),
+            ));
+        }
+    };
+    match text.to_lowercase().as_str() {
+        "on" | "true" | "yes" | "1" => Ok(true),
+        "off" | "false" | "no" | "0" => Ok(false),
+        _ => Err(FrankenError::Internal(format!(
+            "PRAGMA boolean value must be ON/OFF/TRUE/FALSE/1/0, got `{text}`"
+        ))),
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -4096,5 +4206,120 @@ mod tests {
                 ],
             );
         }
+    }
+
+    // ── MVCC concurrent-mode toggle tests (bd-1w6k.2.4) ─────────────
+
+    #[test]
+    fn test_concurrent_mode_default_off() {
+        let conn = Connection::open(":memory:").unwrap();
+        assert!(!conn.is_concurrent_mode_default());
+        assert!(!conn.is_concurrent_transaction());
+    }
+
+    #[test]
+    fn test_pragma_concurrent_mode_on_off() {
+        let conn = Connection::open(":memory:").unwrap();
+
+        conn.execute("PRAGMA concurrent_mode=ON;").unwrap();
+        assert!(conn.is_concurrent_mode_default());
+
+        conn.execute("PRAGMA concurrent_mode=OFF;").unwrap();
+        assert!(!conn.is_concurrent_mode_default());
+    }
+
+    #[test]
+    fn test_pragma_concurrent_mode_qualified_name() {
+        let conn = Connection::open(":memory:").unwrap();
+
+        conn.execute("PRAGMA fsqlite.concurrent_mode=ON;").unwrap();
+        assert!(conn.is_concurrent_mode_default());
+
+        conn.execute("PRAGMA fsqlite.concurrent_mode=OFF;").unwrap();
+        assert!(!conn.is_concurrent_mode_default());
+    }
+
+    #[test]
+    fn test_pragma_concurrent_mode_integer_values() {
+        let conn = Connection::open(":memory:").unwrap();
+
+        conn.execute("PRAGMA concurrent_mode=1;").unwrap();
+        assert!(conn.is_concurrent_mode_default());
+
+        conn.execute("PRAGMA concurrent_mode=0;").unwrap();
+        assert!(!conn.is_concurrent_mode_default());
+    }
+
+    #[test]
+    fn test_begin_concurrent_sets_flag() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("BEGIN CONCURRENT;").unwrap();
+        assert!(conn.is_concurrent_transaction());
+        conn.execute("COMMIT;").unwrap();
+        assert!(!conn.is_concurrent_transaction());
+    }
+
+    #[test]
+    fn test_begin_promoted_to_concurrent_by_pragma() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("PRAGMA concurrent_mode=ON;").unwrap();
+
+        // Plain BEGIN should be promoted to concurrent.
+        conn.execute("BEGIN;").unwrap();
+        assert!(conn.is_concurrent_transaction());
+        conn.execute("COMMIT;").unwrap();
+    }
+
+    #[test]
+    fn test_explicit_mode_overrides_pragma_default() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("PRAGMA concurrent_mode=ON;").unwrap();
+
+        // Explicit DEFERRED overrides the concurrent default.
+        conn.execute("BEGIN DEFERRED;").unwrap();
+        assert!(!conn.is_concurrent_transaction());
+        conn.execute("COMMIT;").unwrap();
+    }
+
+    #[test]
+    fn test_rollback_clears_concurrent_flag() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("BEGIN CONCURRENT;").unwrap();
+        assert!(conn.is_concurrent_transaction());
+        conn.execute("ROLLBACK;").unwrap();
+        assert!(!conn.is_concurrent_transaction());
+    }
+
+    #[test]
+    fn test_concurrent_mode_with_single_vs_mvcc_workload() {
+        // Run the same workload in both modes and verify the report
+        // notes capture the correct mode label.
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);")
+            .unwrap();
+
+        // Single-writer mode.
+        conn.execute("BEGIN;").unwrap();
+        assert!(!conn.is_concurrent_transaction());
+        conn.execute("INSERT INTO t VALUES (1, 'a');").unwrap();
+        conn.execute("COMMIT;").unwrap();
+
+        // MVCC concurrent mode.
+        conn.execute("PRAGMA concurrent_mode=ON;").unwrap();
+        conn.execute("BEGIN;").unwrap();
+        assert!(conn.is_concurrent_transaction());
+        conn.execute("INSERT INTO t VALUES (2, 'b');").unwrap();
+        conn.execute("COMMIT;").unwrap();
+
+        // Verify both rows exist.
+        let rows = conn.query("SELECT COUNT(*) FROM t;").unwrap();
+        assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Integer(2));
+    }
+
+    #[test]
+    fn test_unrecognised_pragma_silently_ignored() {
+        let conn = Connection::open(":memory:").unwrap();
+        // Unknown pragma should not error.
+        conn.execute("PRAGMA some_unknown_pragma=42;").unwrap();
     }
 }

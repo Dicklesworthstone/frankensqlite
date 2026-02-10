@@ -31,6 +31,17 @@ pub struct FsqliteExecConfig {
     ///
     /// Each entry should be a complete statement, e.g. `"PRAGMA page_size=4096;"`.
     pub pragmas: Vec<String>,
+    /// Enable MVCC concurrent-writer mode for this run.
+    ///
+    /// When `true`, the executor will issue `PRAGMA concurrent_mode=ON;`
+    /// before the workload so that `BEGIN` is automatically promoted to
+    /// `BEGIN CONCURRENT`.  The report's `correctness.notes` will record
+    /// which mode was used.
+    ///
+    /// Expected transient errors in concurrent mode:
+    /// - `SQLITE_BUSY` — page lock contention; retry the transaction.
+    /// - `SQLITE_BUSY_SNAPSHOT` — first-committer-wins conflict; retry.
+    pub concurrent_mode: bool,
 }
 
 /// Run an OpLog against FrankenSQLite.
@@ -59,6 +70,13 @@ pub fn run_oplog_fsqlite(
 
     let conn = open_connection(db_path)?;
 
+    // Apply concurrent-mode PRAGMA before user pragmas so the user can
+    // override it if needed.
+    if config.concurrent_mode {
+        conn.execute("PRAGMA concurrent_mode=ON;")
+            .map_err(|e| E2eError::Fsqlite(format!("PRAGMA concurrent_mode=ON: {e}")))?;
+    }
+
     for pragma in &config.pragmas {
         conn.execute(pragma)
             .map_err(|e| E2eError::Fsqlite(format!("pragma `{pragma}`: {e}")))?;
@@ -70,7 +88,13 @@ pub fn run_oplog_fsqlite(
     let (ops_ok, ops_err, first_error) = replay_all(&conn, oplog, setup_len, &per_worker);
     let wall = started.elapsed();
 
-    Ok(build_report(wall, ops_ok, ops_err, first_error))
+    Ok(build_report(
+        wall,
+        ops_ok,
+        ops_err,
+        first_error,
+        config.concurrent_mode,
+    ))
 }
 
 fn open_connection(db_path: &Path) -> E2eResult<Connection> {
@@ -151,6 +175,7 @@ fn build_report(
     ops_ok: u64,
     ops_err: u64,
     first_error: Option<String>,
+    concurrent_mode: bool,
 ) -> EngineRunReport {
     let wall_ms = wall.as_millis() as u64;
     let ops_total = ops_ok + ops_err;
@@ -168,6 +193,13 @@ fn build_report(
         }
     });
 
+    let mode_label = if concurrent_mode {
+        "concurrent (MVCC)"
+    } else {
+        "single-writer (serialized)"
+    };
+    let notes = format!("mode={mode_label}; single-threaded sequential execution");
+
     EngineRunReport {
         wall_time_ms: wall_ms,
         ops_total,
@@ -182,7 +214,7 @@ fn build_report(
             raw_sha256: None,
             canonical_sha256: None,
             logical_sha256: None,
-            notes: Some("single-threaded sequential execution".to_owned()),
+            notes: Some(notes),
         },
         latency_ms: None,
         error,
