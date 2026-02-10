@@ -20,28 +20,28 @@ fn main() {
     }
 }
 
-fn run_cli<I>(args: I) -> i32
+fn run_cli<I>(os_args: I) -> i32
 where
     I: IntoIterator<Item = OsString>,
 {
-    let args: Vec<String> = args
+    let raw: Vec<String> = os_args
         .into_iter()
         .map(|a| a.to_string_lossy().into_owned())
         .collect();
 
-    // Skip argv[0].
-    let argv = if args.len() > 1 { &args[1..] } else { &[] };
+    // Skip program name (raw[0]).
+    let tail = if raw.len() > 1 { &raw[1..] } else { &[] };
 
-    if argv.is_empty() || argv.iter().any(|a| a == "-h" || a == "--help") {
+    if tail.is_empty() || tail.iter().any(|a| a == "-h" || a == "--help") {
         print_top_level_help();
         return 0;
     }
 
-    match argv[0].as_str() {
-        "corpus" => cmd_corpus(&argv[1..]),
-        "run" => cmd_run(&argv[1..]),
-        "bench" => cmd_bench(&argv[1..]),
-        "corrupt" => cmd_corrupt(&argv[1..]),
+    match tail[0].as_str() {
+        "corpus" => cmd_corpus(&tail[1..]),
+        "run" => cmd_run(&tail[1..]),
+        "bench" => cmd_bench(&tail[1..]),
+        "corrupt" => cmd_corrupt(&tail[1..]),
         other => {
             eprintln!("error: unknown subcommand `{other}`");
             eprintln!();
@@ -155,13 +155,11 @@ fn cmd_corpus_scan(argv: &[String]) -> i32 {
                     eprintln!("error: --max-depth requires an integer argument");
                     return 2;
                 }
-                match argv[i].parse::<usize>() {
-                    Ok(n) => max_depth = n,
-                    Err(_) => {
-                        eprintln!("error: invalid integer for --max-depth: `{}`", argv[i]);
-                        return 2;
-                    }
-                }
+                let Ok(n) = argv[i].parse::<usize>() else {
+                    eprintln!("error: invalid integer for --max-depth: `{}`", argv[i]);
+                    return 2;
+                };
+                max_depth = n;
             }
             "--header-only" => header_only = true,
             "-h" | "--help" => {
@@ -259,13 +257,11 @@ fn cmd_run(argv: &[String]) -> i32 {
                     eprintln!("error: --concurrency requires an integer");
                     return 2;
                 }
-                match argv[i].parse::<u16>() {
-                    Ok(n) => concurrency = n,
-                    Err(_) => {
-                        eprintln!("error: invalid integer for --concurrency: `{}`", argv[i]);
-                        return 2;
-                    }
-                }
+                let Ok(n) = argv[i].parse::<u16>() else {
+                    eprintln!("error: invalid integer for --concurrency: `{}`", argv[i]);
+                    return 2;
+                };
+                concurrency = n;
             }
             other => {
                 eprintln!("error: unknown option `{other}`");
