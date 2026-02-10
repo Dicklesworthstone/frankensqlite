@@ -236,6 +236,41 @@ mod tests {
         assert!(matches!(err, FrankenError::Internal(_)));
     }
 
+    // ── DML affected-row counts (bd-118o) ─────────────────────────────────
+
+    #[test]
+    fn execute_insert_returns_affected_count() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (v INTEGER);").unwrap();
+        assert_eq!(conn.execute("INSERT INTO t VALUES (1);").unwrap(), 1);
+        assert_eq!(
+            conn.execute("INSERT INTO t VALUES (2), (3), (4);").unwrap(),
+            3,
+        );
+    }
+
+    #[test]
+    fn execute_update_returns_affected_count() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (v INTEGER);").unwrap();
+        conn.execute("INSERT INTO t VALUES (1);").unwrap();
+        conn.execute("INSERT INTO t VALUES (2);").unwrap();
+        conn.execute("INSERT INTO t VALUES (3);").unwrap();
+        assert_eq!(conn.execute("UPDATE t SET v = 0;").unwrap(), 3);
+        assert_eq!(conn.execute("UPDATE t SET v = 99 WHERE v = 0;").unwrap(), 3);
+    }
+
+    #[test]
+    fn execute_delete_returns_affected_count() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (v INTEGER);").unwrap();
+        conn.execute("INSERT INTO t VALUES (1);").unwrap();
+        conn.execute("INSERT INTO t VALUES (2);").unwrap();
+        conn.execute("INSERT INTO t VALUES (3);").unwrap();
+        assert_eq!(conn.execute("DELETE FROM t WHERE v = 2;").unwrap(), 1);
+        assert_eq!(conn.execute("DELETE FROM t;").unwrap(), 2);
+    }
+
     // ── DML: UPDATE / DELETE ─────────────────────────────────────────────
 
     #[test]
@@ -1300,5 +1335,27 @@ mod tests {
         setup_bd2832(&conn);
         let row = conn.query_row("SELECT count(b) FROM tp;").unwrap();
         assert_eq!(row_values(&row), vec![SqliteValue::Integer(4)]);
+    }
+
+    // ── execute() with_params affected row count (bd-118o) ────────────
+
+    #[test]
+    fn execute_with_params_insert_returns_count() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE ewp (v INTEGER);").unwrap();
+        let count = conn
+            .execute_with_params("INSERT INTO ewp VALUES (?1);", &[SqliteValue::Integer(42)])
+            .unwrap();
+        assert_eq!(count, 1, "INSERT via execute_with_params should return 1");
+    }
+
+    #[test]
+    fn execute_select_returns_row_count() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE es (v INTEGER);").unwrap();
+        conn.execute("INSERT INTO es VALUES (1);").unwrap();
+        conn.execute("INSERT INTO es VALUES (2);").unwrap();
+        let count = conn.execute("SELECT * FROM es;").unwrap();
+        assert_eq!(count, 2, "SELECT via execute() should return row count");
     }
 }
