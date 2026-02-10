@@ -281,6 +281,29 @@ impl WriteCoordinator {
         self.mode
     }
 
+    /// Restore coordinator state from persistent storage (WAL/Marker stream).
+    ///
+    /// MUST be called immediately after creation/lease-acquisition to populate
+    /// the FCW conflict detection index and commit sequence.
+    ///
+    /// `next_seq` should be the next available commit sequence number (i.e.,
+    /// last_committed_seq + 1).
+    ///
+    /// `recent_commits` should map page numbers to their last modification
+    /// commit sequence, derived from the recent history window (covering
+    /// at least the oldest active transaction's snapshot).
+    pub fn restore_state(&self, next_seq: CommitSeq, recent_commits: HashMap<u32, CommitSeq>) {
+        self.next_commit_seq.store(next_seq.get(), Ordering::SeqCst);
+        let mut index = self.commit_page_index.write();
+        *index = recent_commits;
+        info!(
+            bead_id = "bd-389e",
+            next_seq = next_seq.get(),
+            restored_pages = index.len(),
+            "coordinator state restored from persistence"
+        );
+    }
+
     /// Acquire the coordinator lease for the given PID.
     ///
     /// Returns `true` if the lease was acquired, `false` if another

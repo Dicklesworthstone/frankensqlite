@@ -104,6 +104,44 @@ impl TableSpec {
             name,
         }
     }
+
+    /// Schema with secondary indexes — exercises B-tree maintenance during mutations.
+    #[must_use]
+    pub fn with_index(name: impl Into<String>) -> Self {
+        let name = name.into();
+        Self {
+            create_sql: format!(
+                "CREATE TABLE IF NOT EXISTS {name} (\
+                    id INTEGER PRIMARY KEY, \
+                    category TEXT NOT NULL, \
+                    val TEXT, \
+                    num REAL, \
+                    created_at INTEGER DEFAULT 0)"
+            ),
+            name,
+        }
+    }
+
+    /// DDL statements that create secondary indexes for a [`TableSpec::with_index`] table.
+    ///
+    /// Callers should emit these as separate `OpKind::Sql` records after the CREATE TABLE.
+    #[must_use]
+    pub fn index_ddl(table_name: &str) -> Vec<String> {
+        vec![
+            format!(
+                "CREATE INDEX IF NOT EXISTS idx_{table_name}_category \
+                    ON {table_name} (category)"
+            ),
+            format!(
+                "CREATE INDEX IF NOT EXISTS idx_{table_name}_num \
+                    ON {table_name} (num)"
+            ),
+            format!(
+                "CREATE INDEX IF NOT EXISTS idx_{table_name}_created \
+                    ON {table_name} (created_at)"
+            ),
+        ]
+    }
 }
 
 /// Configuration controlling workload generation.

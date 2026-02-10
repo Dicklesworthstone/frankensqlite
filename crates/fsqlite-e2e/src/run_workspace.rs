@@ -81,6 +81,37 @@ impl WorkspaceConfig {
 /// Returns `E2eError::Io` if the golden directory is missing, a requested
 /// `db_id` has no matching file, or any copy operation fails.
 pub fn create_workspace(config: &WorkspaceConfig, db_ids: &[&str]) -> E2eResult<RunWorkspace> {
+    create_workspace_inner(config, db_ids, None)
+}
+
+/// Create a new run workspace with a human-readable label embedded in the
+/// run directory name.
+///
+/// The label is sanitized for filesystem safety and intended to embed stable
+/// scenario ids into artifact paths (e.g. corruption demos).
+///
+/// # Errors
+///
+/// Same error conditions as [`create_workspace`].
+pub fn create_workspace_with_label(
+    config: &WorkspaceConfig,
+    db_ids: &[&str],
+    label: &str,
+) -> E2eResult<RunWorkspace> {
+    let sanitized = sanitize_run_label(label);
+    let run_label = if sanitized.is_empty() {
+        None
+    } else {
+        Some(sanitized)
+    };
+    create_workspace_inner(config, db_ids, run_label)
+}
+
+fn create_workspace_inner(
+    config: &WorkspaceConfig,
+    db_ids: &[&str],
+    run_label: Option<String>,
+) -> E2eResult<RunWorkspace> {
     // Validate golden dir exists.
     if !config.golden_dir.is_dir() {
         return Err(E2eError::Io(std::io::Error::new(
@@ -99,7 +130,12 @@ pub fn create_workspace(config: &WorkspaceConfig, db_ids: &[&str]) -> E2eResult<
     let ts = now.as_secs();
     let nanos = now.subsec_nanos();
     let pid = std::process::id();
-    let run_name = format!("run_{ts}_{nanos:09}_{pid}");
+    let mut run_name = format!("run_{ts}_{nanos:09}_{pid}");
+    if let Some(label) = run_label {
+        // Stable, filesystem-safe label for reports and artifact directories.
+        run_name.push('_');
+        run_name.push_str(&label);
+    }
     let run_dir = config.working_base.join(&run_name);
 
     // Create the run directory (fail if it somehow already exists).
@@ -223,6 +259,24 @@ fn discover_golden_dbs(golden_dir: &Path) -> E2eResult<Vec<(String, PathBuf)>> {
 
     dbs.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(dbs)
+}
+
+fn sanitize_run_label(label: &str) -> String {
+    // Keep run directory names portable and stable: ASCII-only and
+    // limited to a small set of safe characters.
+    let mut out = String::with_capacity(label.len().min(80));
+    let mut prev_sep = false;
+    for b in label.as_bytes().iter().copied().take(80) {
+        let ch = b as char;
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+            out.push(ch.to_ascii_lowercase());
+            prev_sep = false;
+        } else if !out.is_empty() && !prev_sep {
+            out.push('_');
+            prev_sep = true;
+        }
+    }
+    out.trim_matches('_').to_owned()
 }
 
 // ── Tests ────────────────────────────────────────────────────────────
@@ -462,5 +516,27 @@ mod tests {
 
         let result = create_workspace(&config, &[]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_create_workspace_with_label_sanitizes_and_embeds_label() {
+        let tmp = tempfile::tempdir().unwrap();
+        let golden = setup_fake_golden(tmp.path());
+        let working = tmp.path().join("working");
+        std::fs::create_dir_all(&working).unwrap();
+
+        let config = WorkspaceConfig {
+            golden_dir: golden,
+            working_base: working,
+        };
+
+        let ws = create_workspace_with_label(&config, &["alpha"], "Wal Bitrot: frame#1!") //
+            .unwrap();
+
+        let run_name = ws.run_dir.file_name().unwrap().to_string_lossy();
+        assert!(
+            run_name.contains("_wal_bitrot_frame_1"),
+            "run name should include sanitized label, got: {run_name}"
+        );
     }
 }

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -16,6 +16,19 @@ use crate::shm::{
 };
 use crate::traits::{Vfs, VfsFile};
 
+/// Tracks file locking state across multiple connections to the same file.
+#[derive(Debug, Default)]
+struct FileLockState {
+    /// Set of connection IDs holding at least a SHARED lock.
+    shared: HashSet<u64>,
+    /// Connection ID holding the RESERVED lock, if any.
+    reserved: Option<u64>,
+    /// Connection ID holding the PENDING lock, if any.
+    pending: Option<u64>,
+    /// Connection ID holding the EXCLUSIVE lock, if any.
+    exclusive: Option<u64>,
+}
+
 /// Shared storage for all files in the memory VFS.
 ///
 /// Each file is stored as a named byte vector. Multiple `MemoryFile` handles
@@ -23,6 +36,7 @@ use crate::traits::{Vfs, VfsFile};
 #[derive(Debug, Default)]
 struct FileStorage {
     data: Vec<u8>,
+    locks: FileLockState,
 }
 
 /// Shared state for the entire memory VFS.
@@ -398,7 +412,10 @@ impl MemoryFile {
 }
 
 impl VfsFile for MemoryFile {
-    fn close(&mut self, _cx: &Cx) -> Result<()> {
+    fn close(&mut self, cx: &Cx) -> Result<()> {
+        // Release any file locks.
+        self.unlock(cx, LockLevel::None)?;
+
         self.release_shm_owner_state(self.delete_on_close)?;
         if self.delete_on_close {
             self.vfs
@@ -407,7 +424,6 @@ impl VfsFile for MemoryFile {
                 .files
                 .remove(&self.path);
         }
-        self.lock_level = LockLevel::None;
         Ok(())
     }
 
@@ -473,19 +489,127 @@ impl VfsFile for MemoryFile {
     }
 
     fn lock(&mut self, _cx: &Cx, level: LockLevel) -> Result<()> {
-        self.lock_level = level;
+        if self.lock_level >= level {
+            return Ok(());
+        }
+
+        {
+            let mut storage = self.storage.lock().map_err(|_| lock_err())?;
+            let locks = &mut storage.locks;
+            let id = self.shm_owner_id;
+
+            // Escalation: None -> Shared
+            if level >= LockLevel::Shared && self.lock_level < LockLevel::Shared {
+                // Blocked by Exclusive or Pending held by others.
+                if let Some(owner) = locks.exclusive {
+                    if owner != id {
+                        return Err(FrankenError::Busy);
+                    }
+                }
+                if let Some(owner) = locks.pending {
+                    if owner != id {
+                        return Err(FrankenError::Busy);
+                    }
+                }
+                locks.shared.insert(id);
+                self.lock_level = LockLevel::Shared;
+            }
+
+            // Escalation: Shared -> Reserved
+            if level >= LockLevel::Reserved && self.lock_level < LockLevel::Reserved {
+                // Blocked by any existing Reserved lock held by others.
+                if let Some(owner) = locks.reserved {
+                    if owner != id {
+                        return Err(FrankenError::Busy);
+                    }
+                }
+                locks.reserved = Some(id);
+                self.lock_level = LockLevel::Reserved;
+            }
+
+            // Escalation: Reserved -> Pending
+            if level >= LockLevel::Pending && self.lock_level < LockLevel::Pending {
+                // Blocked by any existing Pending lock held by others.
+                if let Some(owner) = locks.pending {
+                    if owner != id {
+                        return Err(FrankenError::Busy);
+                    }
+                }
+                locks.pending = Some(id);
+                self.lock_level = LockLevel::Pending;
+            }
+
+            // Escalation: Pending -> Exclusive
+            if level >= LockLevel::Exclusive && self.lock_level < LockLevel::Exclusive {
+                // Blocked by any existing Exclusive (should be impossible if we hold Pending/Reserved, but check anyway).
+                if let Some(owner) = locks.exclusive {
+                    if owner != id {
+                        return Err(FrankenError::Busy);
+                    }
+                }
+                // Blocked if there are ANY other readers.
+                // We are in shared set, so count must be exactly 1 (us).
+                if locks.shared.len() > 1 {
+                    return Err(FrankenError::Busy);
+                }
+                locks.exclusive = Some(id);
+                self.lock_level = LockLevel::Exclusive;
+            }
+        }
+
         Ok(())
     }
 
     fn unlock(&mut self, _cx: &Cx, level: LockLevel) -> Result<()> {
-        if level < self.lock_level {
-            self.lock_level = level;
+        if self.lock_level <= level {
+            return Ok(());
         }
+
+        {
+            let mut storage = self.storage.lock().map_err(|_| lock_err())?;
+            let locks = &mut storage.locks;
+            let id = self.shm_owner_id;
+
+            // Downgrade: Exclusive -> Pending
+            if self.lock_level == LockLevel::Exclusive && level < LockLevel::Exclusive {
+                if locks.exclusive == Some(id) {
+                    locks.exclusive = None;
+                }
+                self.lock_level = LockLevel::Pending;
+            }
+
+            // Downgrade: Pending -> Reserved
+            if self.lock_level == LockLevel::Pending && level < LockLevel::Pending {
+                if locks.pending == Some(id) {
+                    locks.pending = None;
+                }
+                self.lock_level = LockLevel::Reserved;
+            }
+
+            // Downgrade: Reserved -> Shared
+            if self.lock_level == LockLevel::Reserved && level < LockLevel::Reserved {
+                if locks.reserved == Some(id) {
+                    locks.reserved = None;
+                }
+                self.lock_level = LockLevel::Shared;
+            }
+
+            // Downgrade: Shared -> None
+            if self.lock_level == LockLevel::Shared && level < LockLevel::Shared {
+                locks.shared.remove(&id);
+                self.lock_level = LockLevel::None;
+            }
+        }
+
         Ok(())
     }
 
     fn check_reserved_lock(&self, _cx: &Cx) -> Result<bool> {
-        Ok(false)
+        let reserved = {
+            let storage = self.storage.lock().map_err(|_| lock_err())?;
+            storage.locks.reserved
+        };
+        Ok(reserved.is_some_and(|owner| owner != self.shm_owner_id))
     }
 
     fn shm_map(
@@ -1325,5 +1449,52 @@ mod tests {
         file.sync(&cx, SyncFlags::NORMAL).unwrap();
         file.sync(&cx, SyncFlags::FULL).unwrap();
         file.sync(&cx, SyncFlags::DATAONLY).unwrap();
+    }
+
+    #[test]
+    fn test_locking_contention() {
+        let cx = Cx::new();
+        let vfs = make_vfs();
+        let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE;
+        let path = Path::new("contention.db");
+
+        let (mut f1, _) = vfs.open(&cx, Some(path), flags).unwrap();
+        let (mut f2, _) = vfs.open(&cx, Some(path), flags).unwrap();
+
+        // Both can hold SHARED.
+        f1.lock(&cx, LockLevel::Shared).unwrap();
+        f2.lock(&cx, LockLevel::Shared).unwrap();
+
+        // Only one can hold RESERVED.
+        f1.lock(&cx, LockLevel::Reserved).unwrap();
+        let err = f2.lock(&cx, LockLevel::Reserved).unwrap_err();
+        assert!(matches!(err, FrankenError::Busy));
+
+        // f2 can check if reserved lock is held.
+        // Note: check_reserved_lock returns true if *another* connection holds it.
+        // f1 holds it, so f2 should see true.
+        assert!(f2.check_reserved_lock(&cx).unwrap());
+        // f1 holds it, so f1 should see false (it's not "another").
+        assert!(!f1.check_reserved_lock(&cx).unwrap());
+
+        // f1 cannot upgrade to EXCLUSIVE because f2 holds SHARED.
+        let err = f1.lock(&cx, LockLevel::Exclusive).unwrap_err();
+        assert!(matches!(err, FrankenError::Busy));
+
+        // f2 drops SHARED.
+        f2.unlock(&cx, LockLevel::None).unwrap();
+
+        // Now f1 can get EXCLUSIVE.
+        f1.lock(&cx, LockLevel::Exclusive).unwrap();
+
+        // f2 cannot get SHARED while f1 has EXCLUSIVE.
+        let err = f2.lock(&cx, LockLevel::Shared).unwrap_err();
+        assert!(matches!(err, FrankenError::Busy));
+
+        // f1 unlocks.
+        f1.unlock(&cx, LockLevel::None).unwrap();
+
+        // f2 can now get SHARED.
+        f2.lock(&cx, LockLevel::Shared).unwrap();
     }
 }

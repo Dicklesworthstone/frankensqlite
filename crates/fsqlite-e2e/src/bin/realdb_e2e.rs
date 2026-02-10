@@ -22,6 +22,8 @@ use sha2::{Digest, Sha256};
 use rusqlite::{Connection, DatabaseName, OpenFlags};
 use serde::Serialize;
 
+use fsqlite_types::{DATABASE_HEADER_SIZE, DatabaseHeader};
+
 use fsqlite_e2e::benchmark::{BenchmarkConfig, BenchmarkMeta, BenchmarkSummary, run_benchmark};
 use fsqlite_e2e::corruption::{CorruptionStrategy, inject_corruption};
 use fsqlite_e2e::fixture_metadata::{
@@ -33,7 +35,7 @@ use fsqlite_e2e::methodology::EnvironmentMeta;
 use fsqlite_e2e::oplog::{self, OpLog};
 use fsqlite_e2e::report::{EngineInfo, RunRecordV1, RunRecordV1Args};
 use fsqlite_e2e::report_render::render_benchmark_summaries_markdown;
-use fsqlite_e2e::run_workspace::{WorkspaceConfig, create_workspace};
+use fsqlite_e2e::run_workspace::{WorkspaceConfig, create_workspace_with_label};
 use fsqlite_e2e::sqlite_executor::{SqliteExecConfig, run_oplog_sqlite};
 
 fn main() {
@@ -1130,6 +1132,92 @@ fn sha256_file(path: &Path) -> Result<String, String> {
     }
 
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn sha256_bytes(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn sqlite_page_size_or_default(db_bytes: &[u8]) -> u32 {
+    if db_bytes.len() < DATABASE_HEADER_SIZE {
+        return 4096;
+    }
+    let Ok(header_bytes) = <[u8; DATABASE_HEADER_SIZE]>::try_from(&db_bytes[..DATABASE_HEADER_SIZE])
+    else {
+        return 4096;
+    };
+    let Ok(header) = DatabaseHeader::from_bytes(&header_bytes) else {
+        return 4096;
+    };
+    header.page_size.get()
+}
+
+fn diff_modified_ranges(before: &[u8], after: &[u8], page_size: u32) -> Vec<CorruptModification> {
+    let ps = u64::from(page_size.max(1));
+    let common_len = before.len().min(after.len());
+
+    let mut mods = Vec::new();
+
+    let mut i = 0usize;
+    while i < common_len {
+        if before[i] == after[i] {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < common_len && before[i] != after[i] {
+            i += 1;
+        }
+        let end = i;
+
+        let offset = u64::try_from(start).unwrap_or(u64::MAX);
+        let length = u64::try_from(end - start).unwrap_or(u64::MAX);
+        let page_first = u32::try_from(offset / ps + 1).unwrap_or(u32::MAX);
+        let page_last = u32::try_from((offset + length - 1) / ps + 1).unwrap_or(u32::MAX);
+        mods.push(CorruptModification {
+            offset,
+            length,
+            page_first,
+            page_last,
+            sha256_before: sha256_bytes(&before[start..end]),
+            sha256_after: Some(sha256_bytes(&after[start..end])),
+        });
+    }
+
+    // Handle truncation (tail removed) or append (tail added).
+    if after.len() < before.len() {
+        let start = after.len();
+        let end = before.len();
+        let offset = u64::try_from(start).unwrap_or(u64::MAX);
+        let length = u64::try_from(end - start).unwrap_or(u64::MAX);
+        let page_first = u32::try_from(offset / ps + 1).unwrap_or(u32::MAX);
+        let page_last = u32::try_from((offset + length - 1) / ps + 1).unwrap_or(u32::MAX);
+        mods.push(CorruptModification {
+            offset,
+            length,
+            page_first,
+            page_last,
+            sha256_before: sha256_bytes(&before[start..end]),
+            sha256_after: None,
+        });
+    } else if after.len() > before.len() {
+        let start = before.len();
+        let end = after.len();
+        let offset = u64::try_from(start).unwrap_or(u64::MAX);
+        let length = u64::try_from(end - start).unwrap_or(u64::MAX);
+        let page_first = u32::try_from(offset / ps + 1).unwrap_or(u32::MAX);
+        let page_last = u32::try_from((offset + length - 1) / ps + 1).unwrap_or(u32::MAX);
+        mods.push(CorruptModification {
+            offset,
+            length,
+            page_first,
+            page_last,
+            sha256_before: sha256_bytes(&[]),
+            sha256_after: Some(sha256_bytes(&after[start..end])),
+        });
+    }
+
+    mods
 }
 
 fn parse_checksum_line(line: &str, line_no: usize) -> Result<(&str, &str), String> {
@@ -2305,35 +2393,9 @@ fn cmd_corrupt(argv: &[String]) -> i32 {
         return 2;
     };
 
-    // Create a working workspace containing the selected golden DB.
-    let ws_cfg = WorkspaceConfig {
-        golden_dir,
-        working_base,
-    };
-
-    let ws = match create_workspace(&ws_cfg, &[db_id]) {
-        Ok(w) => w,
-        Err(e) => {
-            eprintln!("error: failed to create workspace: {e}");
-            return 1;
-        }
-    };
-    let Some(db) = ws.databases.first() else {
-        eprintln!("error: workspace contains no databases");
-        return 1;
-    };
-
-    let work_db = db.db_path.clone();
-    let before = match sha256_file(&work_db) {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("error: cannot hash working db {}: {e}", work_db.display());
-            return 1;
-        }
-    };
-
-    let (strategy_desc, strat) = match strategy {
+    let (scenario_id, strategy_desc, strat) = match strategy {
         "bitflip" => (
+            format!("bitflip_count_{count}_seed_{seed}"),
             format!("bitflip(count={count}, seed={seed})"),
             CorruptionStrategy::RandomBitFlip { count },
         ),
@@ -2347,6 +2409,7 @@ fn cmd_corrupt(argv: &[String]) -> i32 {
                 return 2;
             };
             (
+                format!("zero_off_{off}_len_{len}"),
                 format!("zero(offset={off}, length={len})"),
                 CorruptionStrategy::ZeroRange {
                     offset: off,
@@ -2360,6 +2423,7 @@ fn cmd_corrupt(argv: &[String]) -> i32 {
                 return 2;
             };
             (
+                format!("page_pg_{pg}_seed_{seed}"),
                 format!("page(page_number={pg}, seed={seed})"),
                 CorruptionStrategy::PageCorrupt { page_number: pg },
             )
@@ -2370,24 +2434,61 @@ fn cmd_corrupt(argv: &[String]) -> i32 {
         }
     };
 
+    // Create a working workspace containing the selected golden DB.
+    let ws_cfg = WorkspaceConfig {
+        golden_dir,
+        working_base,
+    };
+
+    let ws = match create_workspace_with_label(&ws_cfg, &[db_id], &scenario_id) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("error: failed to create workspace: {e}");
+            return 1;
+        }
+    };
+    let Some(db) = ws.databases.first() else {
+        eprintln!("error: workspace contains no databases");
+        return 1;
+    };
+
+    let work_db = db.db_path.clone();
+    let before_bytes = match fs::read(&work_db) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("error: cannot read working db {}: {e}", work_db.display());
+            return 1;
+        }
+    };
+    let before = sha256_bytes(&before_bytes);
+    let page_size = sqlite_page_size_or_default(&before_bytes);
+
     if let Err(e) = inject_corruption(&work_db, strat, seed) {
         eprintln!("error: corruption injection failed: {e}");
         return 1;
     }
 
-    let after = match sha256_file(&work_db) {
-        Ok(h) => h,
+    let after_bytes = match fs::read(&work_db) {
+        Ok(b) => b,
         Err(e) => {
-            eprintln!("error: cannot hash corrupted db {}: {e}", work_db.display());
+            eprintln!("error: cannot read corrupted db {}: {e}", work_db.display());
             return 1;
         }
     };
+    let after = sha256_bytes(&after_bytes);
+
+    let modifications = diff_modified_ranges(&before_bytes, &after_bytes, page_size);
+    let modified_bytes: u64 = modifications.iter().map(|m| m.length).sum();
 
     let report = CorruptReport {
         fixture_id: db_id.to_owned(),
+        scenario_id,
         strategy: strategy_desc,
         workspace_dir: ws.run_dir.display().to_string(),
         db_path: work_db.display().to_string(),
+        page_size,
+        modified_bytes,
+        modifications,
         sha256_before: before,
         sha256_after: after,
     };
@@ -2403,9 +2504,13 @@ fn cmd_corrupt(argv: &[String]) -> i32 {
     } else {
         println!("Corruption injected:");
         println!("  fixture: {}", report.fixture_id);
+        println!("  scenario_id: {}", report.scenario_id);
         println!("  strategy: {}", report.strategy);
         println!("  workspace: {}", report.workspace_dir);
         println!("  db: {}", report.db_path);
+        println!("  page_size: {}", report.page_size);
+        println!("  modified_bytes: {}", report.modified_bytes);
+        println!("  modifications: {}", report.modifications.len());
         println!("  sha256(before): {}", report.sha256_before);
         println!("  sha256(after):  {}", report.sha256_after);
     }
@@ -2448,11 +2553,25 @@ OPTIONS:
 #[derive(Debug, Serialize)]
 struct CorruptReport {
     fixture_id: String,
+    scenario_id: String,
     strategy: String,
     workspace_dir: String,
     db_path: String,
+    page_size: u32,
+    modified_bytes: u64,
+    modifications: Vec<CorruptModification>,
     sha256_before: String,
     sha256_after: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CorruptModification {
+    offset: u64,
+    length: u64,
+    page_first: u32,
+    page_last: u32,
+    sha256_before: String,
+    sha256_after: Option<String>,
 }
 
 // Fixture metadata is emitted using `fsqlite_e2e::fixture_metadata::FixtureMetadataV1`.

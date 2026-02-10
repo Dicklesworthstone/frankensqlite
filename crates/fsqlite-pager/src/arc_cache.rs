@@ -2105,15 +2105,23 @@ mod tests {
             drop(inner);
         }
 
+        let loader_calls = Arc::new(AtomicUsize::new(0));
+        let loader_calls_for_closure = Arc::clone(&loader_calls);
         let outcome = cache
-            .request_async(k, || -> Result<CachedPage, &'static str> {
-                unreachable!("hit path must not call loader");
+            .request_async(k, move || -> Result<CachedPage, &'static str> {
+                loader_calls_for_closure.fetch_add(1, AtomicOrdering::SeqCst);
+                Err("hit path must not call loader")
             })
             .expect("hit path should not fail");
         assert_eq!(
             outcome,
             AsyncLookup::Hit,
             "bead_id={BEAD_ID_BD_7PU_1} case=hit_path_skips_loader"
+        );
+        assert_eq!(
+            loader_calls.load(AtomicOrdering::SeqCst),
+            0,
+            "bead_id={BEAD_ID_BD_7PU_1} case=hit_path_loader_not_called"
         );
     }
 
@@ -2127,7 +2135,9 @@ mod tests {
             let panic_result = std::panic::catch_unwind(AssertUnwindSafe(|| {
                 let _ = cache_leader.request_async(k, || -> Result<CachedPage, &'static str> {
                     thread::sleep(Duration::from_millis(75));
-                    unreachable!("forced loader panic for cancellation path");
+                    resume_unwind(Box::new(
+                        "forced loader unwind for cancellation path (test only)",
+                    ));
                 });
             }));
             panic_result.is_err()
@@ -2137,11 +2147,14 @@ mod tests {
             thread::yield_now();
         }
 
+        let waiter_loader_calls = Arc::new(AtomicUsize::new(0));
+        let waiter_loader_calls_for_thread = Arc::clone(&waiter_loader_calls);
         let cache_waiter = Arc::clone(&cache);
         let waiter = thread::spawn(move || {
             cache_waiter
-                .request_async(k, || -> Result<CachedPage, &'static str> {
-                    unreachable!("waiter loader must not execute while placeholder is active");
+                .request_async(k, move || -> Result<CachedPage, &'static str> {
+                    waiter_loader_calls_for_thread.fetch_add(1, AtomicOrdering::SeqCst);
+                    Err("waiter loader must not execute while placeholder is active")
                 })
                 .expect("waiter should observe peer outcome")
         });
@@ -2155,6 +2168,11 @@ mod tests {
             waiter_outcome,
             AsyncLookup::WaitedForPeerMiss,
             "bead_id={BEAD_ID_BD_7PU_1} case=panic_waiter_unblocked"
+        );
+        assert_eq!(
+            waiter_loader_calls.load(AtomicOrdering::SeqCst),
+            0,
+            "bead_id={BEAD_ID_BD_7PU_1} case=waiter_loader_not_called"
         );
         assert_eq!(
             cache.inflight_count(),

@@ -473,18 +473,330 @@ pub fn compute_correctness_report(db_path: &Path) -> E2eResult<crate::report::Co
     })
 }
 
+/// Key PRAGMAs that meaningfully affect SQLite file layout or logical interpretation.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct KeyPragmas {
+    pub page_size: Option<i64>,
+    pub encoding: Option<String>,
+    pub user_version: Option<i64>,
+    pub application_id: Option<i64>,
+    pub journal_mode: Option<String>,
+    pub auto_vacuum: Option<i64>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct KeyPragmasComparison {
+    pub a: KeyPragmas,
+    pub b: KeyPragmas,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SchemaObject {
+    pub object_type: String,
+    pub name: String,
+    pub sql: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SchemaObjectDiff {
+    pub object_type: String,
+    pub name: String,
+    pub sql_a: Option<String>,
+    pub sql_b: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SchemaDiff {
+    pub only_in_a: Vec<SchemaObject>,
+    pub only_in_b: Vec<SchemaObject>,
+    pub different_sql: Vec<SchemaObjectDiff>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TableDigest {
+    pub table: String,
+    pub row_count: i64,
+    pub digest_sha256: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TableDigestMismatch {
+    pub table: String,
+    pub a: TableDigest,
+    pub b: TableDigest,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TableSampleDiff {
+    pub table: String,
+    pub a_first_rows: Vec<String>,
+    pub b_first_rows: Vec<String>,
+    pub a_last_rows: Vec<String>,
+    pub b_last_rows: Vec<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct LogicalDiff {
+    pub mismatched_tables: Vec<TableDigestMismatch>,
+    pub sample: Option<TableSampleDiff>,
+}
+
 /// Actionable mismatch diagnostic produced when two databases differ.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MismatchDiagnostic {
-    /// Which tier triggered the mismatch (or `None` if insufficient data).
+    /// Which tier triggered the mismatch (or `insufficient_data` if the verdict is `Error`).
     pub failed_tier: String,
     /// Paths of the compared databases.
     pub path_a: PathBuf,
     pub path_b: PathBuf,
+    /// Best-effort correctness report for database A (includes SHA-256 tiers).
+    pub correctness_a: crate::report::CorrectnessReport,
+    /// Best-effort correctness report for database B (includes SHA-256 tiers).
+    pub correctness_b: crate::report::CorrectnessReport,
     /// The full comparison report with verdict and tier details.
     pub comparison: crate::report::ComparisonReport,
+    /// Best-effort snapshot of key PRAGMAs for both databases.
+    pub pragmas: Option<KeyPragmasComparison>,
+    /// Best-effort diff of `sqlite_master` objects (schema DDL).
+    pub schema_diff: Option<SchemaDiff>,
+    /// Best-effort logical diff summary (per-table digest + samples).
+    pub logical_diff: Option<LogicalDiff>,
     /// Quick triage hints to help narrow down the cause.
     pub triage_hints: Vec<String>,
+}
+
+fn open_readonly_db(path: &Path) -> E2eResult<rusqlite::Connection> {
+    let flags =
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    Ok(rusqlite::Connection::open_with_flags(path, flags)?)
+}
+
+fn read_key_pragmas(conn: &rusqlite::Connection) -> KeyPragmas {
+    KeyPragmas {
+        page_size: conn
+            .query_row("PRAGMA page_size", [], |r| r.get::<_, i64>(0))
+            .ok(),
+        encoding: conn
+            .query_row("PRAGMA encoding", [], |r| r.get::<_, String>(0))
+            .ok(),
+        user_version: conn
+            .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+            .ok(),
+        application_id: conn
+            .query_row("PRAGMA application_id", [], |r| r.get::<_, i64>(0))
+            .ok(),
+        journal_mode: conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get::<_, String>(0))
+            .ok(),
+        auto_vacuum: conn
+            .query_row("PRAGMA auto_vacuum", [], |r| r.get::<_, i64>(0))
+            .ok(),
+    }
+}
+
+fn list_schema_objects(conn: &rusqlite::Connection) -> E2eResult<Vec<SchemaObject>> {
+    let mut stmt = conn.prepare(
+        "SELECT type, name, sql FROM sqlite_master \
+         WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name",
+    )?;
+    let objs: Vec<SchemaObject> = stmt
+        .query_map([], |row| {
+            Ok(SchemaObject {
+                object_type: row.get::<_, String>(0)?,
+                name: row.get::<_, String>(1)?,
+                sql: row.get::<_, Option<String>>(2)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(objs)
+}
+
+fn diff_schema(a: &[SchemaObject], b: &[SchemaObject]) -> SchemaDiff {
+    use std::collections::BTreeMap;
+
+    fn key(o: &SchemaObject) -> String {
+        format!("{}:{}", o.object_type, o.name)
+    }
+
+    let mut map_a: BTreeMap<String, &SchemaObject> = BTreeMap::new();
+    for o in a {
+        map_a.insert(key(o), o);
+    }
+    let mut map_b: BTreeMap<String, &SchemaObject> = BTreeMap::new();
+    for o in b {
+        map_b.insert(key(o), o);
+    }
+
+    let mut only_in_a = Vec::new();
+    let mut only_in_b = Vec::new();
+    let mut different_sql = Vec::new();
+
+    for (k, oa) in &map_a {
+        if let Some(ob) = map_b.get(k) {
+            if oa.sql != ob.sql {
+                different_sql.push(SchemaObjectDiff {
+                    object_type: oa.object_type.clone(),
+                    name: oa.name.clone(),
+                    sql_a: oa.sql.clone(),
+                    sql_b: ob.sql.clone(),
+                });
+            }
+        } else {
+            only_in_a.push((*oa).clone());
+        }
+    }
+
+    for (k, ob) in &map_b {
+        if !map_a.contains_key(k) {
+            only_in_b.push((*ob).clone());
+        }
+    }
+
+    SchemaDiff {
+        only_in_a,
+        only_in_b,
+        different_sql,
+    }
+}
+
+fn escape_ident(s: &str) -> String {
+    s.replace('"', "\"\"")
+}
+
+fn format_row_for_diff(row: &rusqlite::Row<'_>, col_count: usize) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    for i in 0..col_count {
+        if i > 0 {
+            out.push('|');
+        }
+        let v: rusqlite::types::Value = row.get(i).unwrap_or(rusqlite::types::Value::Null);
+        let _ = write!(out, "{v:?}");
+    }
+    out
+}
+
+fn table_digest(conn: &rusqlite::Connection, table: &str) -> E2eResult<TableDigest> {
+    use std::fmt::Write as _;
+
+    let table = escape_ident(table);
+    let sql_by_rowid = format!("SELECT * FROM \"{table}\" ORDER BY rowid");
+    let sql_by_first = format!("SELECT * FROM \"{table}\" ORDER BY 1");
+    let sql_any = format!("SELECT * FROM \"{table}\"");
+
+    let sql = if conn.prepare(&sql_by_rowid).is_ok() {
+        sql_by_rowid
+    } else if conn.prepare(&sql_by_first).is_ok() {
+        sql_by_first
+    } else {
+        sql_any
+    };
+
+    let mut stmt = conn.prepare(&sql)?;
+    let col_count = stmt.column_count();
+    let mut rows = stmt.query([])?;
+
+    let mut hasher = Sha256::new();
+    let mut row_count: i64 = 0;
+    while let Some(row) = rows.next()? {
+        row_count = row_count.saturating_add(1);
+
+        let mut line = String::new();
+        for i in 0..col_count {
+            if i > 0 {
+                line.push('|');
+            }
+            let v: rusqlite::types::Value = row.get(i).unwrap_or(rusqlite::types::Value::Null);
+            let _ = write!(line, "{v:?}");
+        }
+        line.push('\n');
+        hasher.update(line.as_bytes());
+    }
+
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(64);
+    for byte in digest {
+        let _ = write!(hex, "{byte:02x}");
+    }
+
+    Ok(TableDigest {
+        table,
+        row_count,
+        digest_sha256: hex,
+    })
+}
+
+fn sample_rows(
+    conn: &rusqlite::Connection,
+    table: &str,
+    order: &str,
+    limit: usize,
+) -> E2eResult<Vec<String>> {
+    let table = escape_ident(table);
+    let sql_by_rowid = format!("SELECT * FROM \"{table}\" ORDER BY rowid {order} LIMIT {limit}");
+    let sql_by_first = format!("SELECT * FROM \"{table}\" ORDER BY 1 {order} LIMIT {limit}");
+
+    let sql = if conn.prepare(&sql_by_rowid).is_ok() {
+        sql_by_rowid
+    } else {
+        sql_by_first
+    };
+
+    let mut stmt = conn.prepare(&sql)?;
+    let col_count = stmt.column_count();
+    let mut rows = stmt.query([])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        out.push(format_row_for_diff(row, col_count));
+    }
+    Ok(out)
+}
+
+fn compute_logical_diff(
+    conn_a: &rusqlite::Connection,
+    conn_b: &rusqlite::Connection,
+) -> E2eResult<LogicalDiff> {
+    const MAX_TABLE_MISMATCHES: usize = 8;
+    const SAMPLE_LIMIT: usize = 5;
+
+    let tables_a = list_user_tables(conn_a)?;
+    let tables_b = list_user_tables(conn_b)?;
+
+    let mut mismatched_tables = Vec::new();
+    for table in tables_a.iter().filter(|t| tables_b.contains(t)) {
+        let a = table_digest(conn_a, table)?;
+        let b = table_digest(conn_b, table)?;
+        if a.row_count != b.row_count || a.digest_sha256 != b.digest_sha256 {
+            mismatched_tables.push(TableDigestMismatch {
+                table: table.clone(),
+                a,
+                b,
+            });
+            if mismatched_tables.len() >= MAX_TABLE_MISMATCHES {
+                break;
+            }
+        }
+    }
+
+    let sample = mismatched_tables.first().and_then(|m| {
+        let a_first = sample_rows(conn_a, &m.table, "ASC", SAMPLE_LIMIT).ok()?;
+        let b_first = sample_rows(conn_b, &m.table, "ASC", SAMPLE_LIMIT).ok()?;
+        let a_last = sample_rows(conn_a, &m.table, "DESC", SAMPLE_LIMIT).ok()?;
+        let b_last = sample_rows(conn_b, &m.table, "DESC", SAMPLE_LIMIT).ok()?;
+        Some(TableSampleDiff {
+            table: m.table.clone(),
+            a_first_rows: a_first,
+            b_first_rows: b_first,
+            a_last_rows: a_last,
+            b_last_rows: b_last,
+        })
+    });
+
+    Ok(LogicalDiff {
+        mismatched_tables,
+        sample,
+    })
 }
 
 /// Collect triage hints for a potential mismatch between two database files.
@@ -597,13 +909,43 @@ pub fn verify_databases(
             _ => "insufficient_data".to_owned(),
         };
 
-        let triage_hints = collect_triage_hints(path_a, path_b);
+        let mut triage_hints = collect_triage_hints(path_a, path_b);
+        let mut pragmas = None;
+        let mut schema_diff = None;
+        let mut logical_diff = None;
+
+        if let (Ok(ca), Ok(cb)) = (open_readonly_db(path_a), open_readonly_db(path_b)) {
+            pragmas = Some(KeyPragmasComparison {
+                a: read_key_pragmas(&ca),
+                b: read_key_pragmas(&cb),
+            });
+
+            match (list_schema_objects(&ca), list_schema_objects(&cb)) {
+                (Ok(sa), Ok(sb)) => schema_diff = Some(diff_schema(&sa, &sb)),
+                (Err(e), _) | (_, Err(e)) => {
+                    triage_hints.push(format!("failed to diff sqlite_master schema: {e}"));
+                }
+            }
+
+            match compute_logical_diff(&ca, &cb) {
+                Ok(d) => logical_diff = Some(d),
+                Err(e) => triage_hints.push(format!("failed to compute logical diff: {e}")),
+            }
+        } else {
+            triage_hints
+                .push("failed to open one or both DBs read-only for diagnostics".to_owned());
+        }
 
         Some(MismatchDiagnostic {
             failed_tier,
             path_a: path_a.to_path_buf(),
             path_b: path_b.to_path_buf(),
+            correctness_a: cr_a,
+            correctness_b: cr_b,
             comparison: comparison.clone(),
+            pragmas,
+            schema_diff,
+            logical_diff,
             triage_hints,
         })
     };
@@ -611,19 +953,42 @@ pub fn verify_databases(
     Ok((comparison, diagnostic))
 }
 
-/// Format a [`MismatchDiagnostic`] as a human-readable report string.
-#[must_use]
-pub fn format_mismatch_diagnostic(diag: &MismatchDiagnostic) -> String {
-    let mut out = String::new();
-    let _ = writeln!(out, "=== MISMATCH DETECTED ===");
-    let _ = writeln!(out, "Failed tier: {}", diag.failed_tier);
-    let _ = writeln!(out, "Verdict: {:?}", diag.comparison.verdict);
-    let _ = writeln!(out, "Explanation: {}", diag.comparison.explanation);
+fn write_sha256_tiers(out: &mut String, diag: &MismatchDiagnostic) {
+    let _ = writeln!(out, "SHA-256 tiers:");
+    let _ = writeln!(
+        out,
+        "  A raw:       {:?}",
+        diag.correctness_a.raw_sha256.as_deref()
+    );
+    let _ = writeln!(
+        out,
+        "  B raw:       {:?}",
+        diag.correctness_b.raw_sha256.as_deref()
+    );
+    let _ = writeln!(
+        out,
+        "  A canonical: {:?}",
+        diag.correctness_a.canonical_sha256.as_deref()
+    );
+    let _ = writeln!(
+        out,
+        "  B canonical: {:?}",
+        diag.correctness_b.canonical_sha256.as_deref()
+    );
+    let _ = writeln!(
+        out,
+        "  A logical:   {:?}",
+        diag.correctness_a.logical_sha256.as_deref()
+    );
+    let _ = writeln!(
+        out,
+        "  B logical:   {:?}",
+        diag.correctness_b.logical_sha256.as_deref()
+    );
     let _ = writeln!(out);
-    let _ = writeln!(out, "Paths:");
-    let _ = writeln!(out, "  A: {}", diag.path_a.display());
-    let _ = writeln!(out, "  B: {}", diag.path_b.display());
-    let _ = writeln!(out);
+}
+
+fn write_tier_details(out: &mut String, diag: &MismatchDiagnostic) {
     let _ = writeln!(out, "Tier details:");
     let _ = writeln!(
         out,
@@ -641,10 +1006,144 @@ pub fn format_mismatch_diagnostic(diag: &MismatchDiagnostic) -> String {
         diag.comparison.tiers.logical_match
     );
     let _ = writeln!(out);
+}
+
+fn write_key_pragmas(out: &mut String, p: &KeyPragmasComparison) {
+    let _ = writeln!(out, "Key PRAGMAs:");
+    let _ = writeln!(
+        out,
+        "  page_size:      {:?} vs {:?}",
+        p.a.page_size, p.b.page_size
+    );
+    let _ = writeln!(
+        out,
+        "  encoding:       {:?} vs {:?}",
+        p.a.encoding, p.b.encoding
+    );
+    let _ = writeln!(
+        out,
+        "  user_version:   {:?} vs {:?}",
+        p.a.user_version, p.b.user_version
+    );
+    let _ = writeln!(
+        out,
+        "  application_id: {:?} vs {:?}",
+        p.a.application_id, p.b.application_id
+    );
+    let _ = writeln!(
+        out,
+        "  journal_mode:   {:?} vs {:?}",
+        p.a.journal_mode, p.b.journal_mode
+    );
+    let _ = writeln!(
+        out,
+        "  auto_vacuum:    {:?} vs {:?}",
+        p.a.auto_vacuum, p.b.auto_vacuum
+    );
+    let _ = writeln!(out);
+}
+
+fn write_schema_diff(out: &mut String, schema: &SchemaDiff) {
+    if schema.only_in_a.is_empty() && schema.only_in_b.is_empty() && schema.different_sql.is_empty()
+    {
+        return;
+    }
+
+    let _ = writeln!(out, "Schema diff (sqlite_master):");
+    if !schema.only_in_a.is_empty() {
+        let _ = writeln!(out, "  Only in A:");
+        for o in &schema.only_in_a {
+            let _ = writeln!(out, "    - {} {}", o.object_type, o.name);
+        }
+    }
+    if !schema.only_in_b.is_empty() {
+        let _ = writeln!(out, "  Only in B:");
+        for o in &schema.only_in_b {
+            let _ = writeln!(out, "    - {} {}", o.object_type, o.name);
+        }
+    }
+    if !schema.different_sql.is_empty() {
+        let _ = writeln!(out, "  Different SQL:");
+        for d in &schema.different_sql {
+            let _ = writeln!(out, "    - {} {}", d.object_type, d.name);
+        }
+    }
+    let _ = writeln!(out);
+}
+
+fn write_logical_diff(out: &mut String, logical: &LogicalDiff) {
+    if logical.mismatched_tables.is_empty() {
+        return;
+    }
+
+    let _ = writeln!(out, "Logical diff summary:");
+    for m in &logical.mismatched_tables {
+        let _ = writeln!(
+            out,
+            "  - {}: rows a={} b={}, digest a={} b={}",
+            m.table,
+            m.a.row_count,
+            m.b.row_count,
+            &m.a.digest_sha256[..16],
+            &m.b.digest_sha256[..16]
+        );
+    }
+
+    if let Some(sample) = &logical.sample {
+        let _ = writeln!(out);
+        let _ = writeln!(out, "Sample rows for table \"{}\":", sample.table);
+        let _ = writeln!(out, "  First rows (A):");
+        for r in &sample.a_first_rows {
+            let _ = writeln!(out, "    {r}");
+        }
+        let _ = writeln!(out, "  First rows (B):");
+        for r in &sample.b_first_rows {
+            let _ = writeln!(out, "    {r}");
+        }
+        let _ = writeln!(out, "  Last rows (A):");
+        for r in &sample.a_last_rows {
+            let _ = writeln!(out, "    {r}");
+        }
+        let _ = writeln!(out, "  Last rows (B):");
+        for r in &sample.b_last_rows {
+            let _ = writeln!(out, "    {r}");
+        }
+    }
+    let _ = writeln!(out);
+}
+
+fn write_triage_hints(out: &mut String, hints: &[String]) {
     let _ = writeln!(out, "Triage hints:");
-    for hint in &diag.triage_hints {
+    for hint in hints {
         let _ = writeln!(out, "  - {hint}");
     }
+}
+
+/// Format a [`MismatchDiagnostic`] as a human-readable report string.
+#[must_use]
+pub fn format_mismatch_diagnostic(diag: &MismatchDiagnostic) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "=== MISMATCH DETECTED ===");
+    let _ = writeln!(out, "Failed tier: {}", diag.failed_tier);
+    let _ = writeln!(out, "Verdict: {:?}", diag.comparison.verdict);
+    let _ = writeln!(out, "Explanation: {}", diag.comparison.explanation);
+    let _ = writeln!(out);
+    let _ = writeln!(out, "Paths:");
+    let _ = writeln!(out, "  A: {}", diag.path_a.display());
+    let _ = writeln!(out, "  B: {}", diag.path_b.display());
+    let _ = writeln!(out);
+    write_sha256_tiers(&mut out, diag);
+    write_tier_details(&mut out, diag);
+    if let Some(p) = &diag.pragmas {
+        write_key_pragmas(&mut out, p);
+    }
+    if let Some(schema) = &diag.schema_diff {
+        write_schema_diff(&mut out, schema);
+    }
+    if let Some(logical) = &diag.logical_diff {
+        write_logical_diff(&mut out, logical);
+    }
+    write_triage_hints(&mut out, &diag.triage_hints);
     out
 }
 

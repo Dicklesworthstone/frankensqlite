@@ -31,7 +31,7 @@ use fsqlite_vdbe::codegen::{
     CodegenContext, CodegenError, ColumnInfo, TableSchema, codegen_delete, codegen_insert,
     codegen_select, codegen_update,
 };
-use fsqlite_vdbe::engine::{ExecOutcome, MemDatabase, VdbeEngine};
+use fsqlite_vdbe::engine::{ExecOutcome, MemDatabase, MemDbVersionToken, VdbeEngine};
 use fsqlite_vdbe::{ProgramBuilder, VdbeProgram};
 use fsqlite_vfs::MemoryVfs;
 #[cfg(unix)]
@@ -280,7 +280,7 @@ impl PreparedStatement {
 /// Used for transaction rollback and savepoint restore.
 #[derive(Debug, Clone)]
 struct DbSnapshot {
-    db: MemDatabase,
+    db_version: MemDbVersionToken,
     schema: Vec<TableSchema>,
 }
 
@@ -708,15 +708,16 @@ impl Connection {
 
     /// Take a snapshot of the current database + schema state.
     fn snapshot(&self) -> DbSnapshot {
+        let db_version = self.db.borrow().undo_version();
         DbSnapshot {
-            db: self.db.borrow().clone(),
+            db_version,
             schema: self.schema.borrow().clone(),
         }
     }
 
     /// Restore a snapshot, replacing the current database + schema state.
     fn restore_snapshot(&self, snap: &DbSnapshot) {
-        (*self.db.borrow_mut()).clone_from(&snap.db);
+        self.db.borrow_mut().rollback_to(snap.db_version);
         (*self.schema.borrow_mut()).clone_from(&snap.schema);
     }
 
@@ -751,6 +752,7 @@ impl Connection {
         let txn = self.pager.begin(&cx, pager_mode)?;
         *self.active_txn.borrow_mut() = Some(txn);
 
+        self.db.borrow_mut().begin_undo();
         *self.txn_snapshot.borrow_mut() = Some(self.snapshot());
         *self.in_transaction.borrow_mut() = true;
         *self.concurrent_txn.borrow_mut() = is_concurrent;
@@ -784,6 +786,7 @@ impl Connection {
         *self.in_transaction.borrow_mut() = false;
         *self.implicit_txn.borrow_mut() = false;
         *self.concurrent_txn.borrow_mut() = false;
+        self.db.borrow_mut().commit_undo();
         Ok(())
     }
 
@@ -827,6 +830,7 @@ impl Connection {
             *self.in_transaction.borrow_mut() = false;
             *self.implicit_txn.borrow_mut() = false;
             *self.concurrent_txn.borrow_mut() = false;
+            self.db.borrow_mut().commit_undo();
         }
         Ok(())
     }
@@ -840,6 +844,7 @@ impl Connection {
             let txn = self.pager.begin(&cx, TransactionMode::Deferred)?;
             *self.active_txn.borrow_mut() = Some(txn);
 
+            self.db.borrow_mut().begin_undo();
             *self.txn_snapshot.borrow_mut() = Some(self.snapshot());
             *self.in_transaction.borrow_mut() = true;
             *self.implicit_txn.borrow_mut() = true;
@@ -882,6 +887,7 @@ impl Connection {
             *self.txn_snapshot.borrow_mut() = None;
             *self.in_transaction.borrow_mut() = false;
             *self.implicit_txn.borrow_mut() = false;
+            self.db.borrow_mut().commit_undo();
         }
         Ok(())
     }
@@ -1770,7 +1776,10 @@ fn execute_table_program_with_db(
     if let Some(db_value) = engine.take_database() {
         *db.borrow_mut() = db_value;
     }
-    let txn_back = engine.take_transaction();
+    let txn_back = match engine.take_transaction() {
+        Ok(txn) => txn,
+        Err(e) => return (Err(e), None),
+    };
 
     let result = match exec_res {
         Ok(ExecOutcome::Done) => Ok(engine

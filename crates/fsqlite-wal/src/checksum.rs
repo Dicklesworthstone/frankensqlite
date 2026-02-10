@@ -1375,12 +1375,18 @@ fn normalize_first_page_header_offsets(page: &mut [u8]) {
     if first_freeblock >= SQLITE_DB_HEADER_SIZE_U16 {
         let adjusted = first_freeblock.saturating_sub(SQLITE_DB_HEADER_SIZE_U16);
         page[1..3].copy_from_slice(&adjusted.to_be_bytes());
+    } else if first_freeblock != 0 {
+        // Pointer into the DB header is invalid. Force failure in bounds check.
+        page[1..3].copy_from_slice(&u16::MAX.to_be_bytes());
     }
 
     let cell_content_offset = u16::from_be_bytes([page[5], page[6]]);
     if cell_content_offset >= SQLITE_DB_HEADER_SIZE_U16 {
         let adjusted = cell_content_offset.saturating_sub(SQLITE_DB_HEADER_SIZE_U16);
         page[5..7].copy_from_slice(&adjusted.to_be_bytes());
+    } else if cell_content_offset != 0 {
+        // Pointer into the DB header is invalid. Force failure in bounds check.
+        page[5..7].copy_from_slice(&u16::MAX.to_be_bytes());
     }
 }
 
