@@ -396,8 +396,11 @@ fn logical_dump_tables<B: SqlBackend>(backend: &B, tables: &[String]) -> String 
     let mut dump = String::new();
     for table_name in tables {
         let _ = writeln!(dump, "-- TABLE: {table_name}");
-        let sql = format!("SELECT * FROM \"{table_name}\" ORDER BY 1");
-        if let Ok(rows) = backend.query(&sql) {
+        let rows = backend
+            .query(&format!("SELECT * FROM \"{table_name}\" ORDER BY rowid"))
+            .or_else(|_| backend.query(&format!("SELECT * FROM \"{table_name}\" ORDER BY 1")))
+            .or_else(|_| backend.query(&format!("SELECT * FROM \"{table_name}\"")));
+        if let Ok(rows) = rows {
             for data_row in &rows {
                 for (j, val) in data_row.iter().enumerate() {
                     if j > 0 {
@@ -453,6 +456,22 @@ pub struct ReducedRepro {
     pub artifacts: WorkloadArtifacts,
 }
 
+/// Reduce an OpLog to a minimal failing prefix (best-effort) for debugging.
+///
+/// The reduced repro is emitted as an OpLog where every operation is encoded
+/// as `OpKind::Sql` on worker 0 (even if the input used structured ops).
+///
+/// # Errors
+///
+/// Returns an error if the in-memory backends fail to initialize.
+pub fn reduce_oplog_to_minimal_repro(
+    oplog: &crate::oplog::OpLog,
+    max_iterations: usize,
+) -> E2eResult<Option<ReducedRepro>> {
+    let statements = oplog_to_sql_statements(oplog);
+    reduce_statements_to_minimal_repro(&statements, max_iterations, Some(&oplog.header))
+}
+
 /// Reduce a SQL workload to a minimal failing prefix (best-effort).
 ///
 /// Today this uses a monotone prefix bisection strategy:
@@ -470,6 +489,14 @@ pub struct ReducedRepro {
 pub fn reduce_sql_workload_to_minimal_repro(
     statements: &[String],
     max_iterations: usize,
+) -> E2eResult<Option<ReducedRepro>> {
+    reduce_statements_to_minimal_repro(statements, max_iterations, None)
+}
+
+fn reduce_statements_to_minimal_repro(
+    statements: &[String],
+    max_iterations: usize,
+    header: Option<&crate::oplog::OpLogHeader>,
 ) -> E2eResult<Option<ReducedRepro>> {
     if statements.is_empty() {
         return Ok(None);
@@ -512,7 +539,7 @@ pub fn reduce_sql_workload_to_minimal_repro(
     let artifacts = evaluate_sql_workload(&reduced_statements)?;
     iterations = iterations.saturating_add(1);
 
-    let reduced_oplog = statements_to_sql_oplog(&reduced_statements);
+    let reduced_oplog = statements_to_sql_oplog(header, &reduced_statements);
     let reduced_jsonl = reduced_oplog
         .to_jsonl()
         .map_err(|e| E2eError::Divergence(format!("failed to serialize reduced oplog: {e}")))?;
@@ -551,11 +578,83 @@ fn evaluate_sql_workload(statements: &[String]) -> E2eResult<WorkloadArtifacts> 
     })
 }
 
+fn oplog_to_sql_statements(oplog: &crate::oplog::OpLog) -> Vec<String> {
+    use crate::oplog::OpKind;
+
+    oplog
+        .records
+        .iter()
+        .map(|r| match &r.kind {
+            OpKind::Sql { statement } => statement.clone(),
+            OpKind::Begin => "BEGIN".to_owned(),
+            OpKind::Commit => "COMMIT".to_owned(),
+            OpKind::Rollback => "ROLLBACK".to_owned(),
+            OpKind::Insert { table, key, values } => structured_insert_sql(table, *key, values),
+            OpKind::Update { table, key, values } => structured_update_sql(table, *key, values),
+        })
+        .collect()
+}
+
+fn structured_insert_sql(table: &str, key: i64, values: &[(String, String)]) -> String {
+    let mut cols = Vec::with_capacity(values.len() + 1);
+    let mut vals = Vec::with_capacity(values.len() + 1);
+
+    cols.push("\"id\"".to_owned());
+    vals.push(key.to_string());
+
+    for (col, v) in values {
+        cols.push(format!("\"{}\"", escape_ident(col)));
+        vals.push(sql_literal(v));
+    }
+
+    format!(
+        "INSERT INTO \"{}\" ({}) VALUES ({})",
+        escape_ident(table),
+        cols.join(", "),
+        vals.join(", ")
+    )
+}
+
+fn structured_update_sql(table: &str, key: i64, values: &[(String, String)]) -> String {
+    let mut sets = Vec::with_capacity(values.len());
+    for (col, v) in values {
+        sets.push(format!("\"{}\"={}", escape_ident(col), sql_literal(v)));
+    }
+
+    format!(
+        "UPDATE \"{}\" SET {} WHERE id={}",
+        escape_ident(table),
+        sets.join(", "),
+        key
+    )
+}
+
+fn escape_ident(s: &str) -> String {
+    s.replace('"', "\"\"")
+}
+
+fn sql_literal(s: &str) -> String {
+    if s.eq_ignore_ascii_case("null") {
+        return "NULL".to_owned();
+    }
+
+    // Keep numeric values unquoted.
+    if s.parse::<i64>().is_ok() || s.parse::<f64>().is_ok() {
+        return s.to_owned();
+    }
+
+    let escaped = s.replace('\'', "''");
+    format!("'{escaped}'")
+}
+
 /// Produce an OpLog that runs the given statements as `OpKind::Sql` on worker 0.
-fn statements_to_sql_oplog(statements: &[String]) -> crate::oplog::OpLog {
+fn statements_to_sql_oplog(
+    header: Option<&crate::oplog::OpLogHeader>,
+    statements: &[String],
+) -> crate::oplog::OpLog {
     use crate::oplog::{ConcurrencyModel, OpKind, OpLog, OpLogHeader, OpRecord, RngSpec};
 
-    let header = OpLogHeader {
+    let base_header = header.cloned().unwrap_or_else(|| OpLogHeader {
         fixture_id: "reduced".to_owned(),
         seed: 0,
         rng: RngSpec::default(),
@@ -565,13 +664,25 @@ fn statements_to_sql_oplog(statements: &[String]) -> crate::oplog::OpLog {
             commit_order_policy: "deterministic".to_owned(),
         },
         preset: None,
+    });
+
+    let header = OpLogHeader {
+        fixture_id: base_header.fixture_id,
+        seed: base_header.seed,
+        rng: base_header.rng,
+        concurrency: ConcurrencyModel {
+            worker_count: 1,
+            transaction_size: 1,
+            commit_order_policy: "deterministic".to_owned(),
+        },
+        preset: base_header.preset,
     };
 
     let records: Vec<OpRecord> = statements
         .iter()
         .enumerate()
         .map(|(i, s)| OpRecord {
-            op_id: u64::try_from(i).unwrap_or(0),
+            op_id: u64::try_from(i).unwrap_or(u64::MAX),
             worker: 0,
             kind: OpKind::Sql {
                 statement: s.clone(),
@@ -1055,7 +1166,7 @@ mod tests {
             "CREATE TABLE t (id INTEGER PRIMARY KEY)".to_owned(),
             "INSERT INTO t VALUES (1)".to_owned(),
         ];
-        let oplog = statements_to_sql_oplog(&stmts);
+        let oplog = statements_to_sql_oplog(None, &stmts);
         assert_eq!(oplog.records.len(), 2);
         assert_eq!(oplog.header.concurrency.worker_count, 1);
         assert!(oplog.records.iter().all(|r| r.worker == 0));
@@ -1065,7 +1176,7 @@ mod tests {
     fn test_write_repro_package_creates_files() {
         // Build a ReducedRepro with synthetic data.
         let stmts = vec!["CREATE TABLE t (id INTEGER PRIMARY KEY)".to_owned()];
-        let oplog = statements_to_sql_oplog(&stmts);
+        let oplog = statements_to_sql_oplog(None, &stmts);
         let jsonl = oplog.to_jsonl().unwrap();
 
         let repro = ReducedRepro {
