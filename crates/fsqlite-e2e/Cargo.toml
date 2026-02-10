@@ -31,6 +31,10 @@ tempfile = { workspace = true }
 name = "realdb-e2e"
 path = "src/bin/realdb_e2e.rs"
 
+[[bin]]
+name = "profile-db"
+path = "src/bin/profile_db.rs"
+
 [[bench]]
 name = "e2e_bench"
 harness = false

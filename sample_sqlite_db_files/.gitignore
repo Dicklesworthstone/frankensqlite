@@ -1,4 +1,4 @@
-# Ignore all database binary files — only manifests and metadata are tracked.
+# Ignore all database binary files — only small text files are tracked.
 *.db
 *.sqlite
 *.sqlite3
@@ -7,9 +7,13 @@
 *.db-journal
 
 # Working copies are ephemeral — never commit them.
+working/
+
+# Legacy folder (deprecated; do not use).
 work/
 
-# Allow manifest JSON and README to be tracked.
-!manifests/**/*.json
+# Allow metadata + checksums + docs to be tracked.
+!checksums.sha256
+!metadata/**
 !README.md
 !.gitignore

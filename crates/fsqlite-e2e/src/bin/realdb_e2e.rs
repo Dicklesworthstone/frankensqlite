@@ -5,7 +5,7 @@
 //!
 //! - `corpus scan` — Discover SQLite databases under `/dp` and list candidates.
 //! - `corpus import` — Copy selected databases into `sample_sqlite_db_files/golden/`.
-//! - `corpus verify` — Verify golden copies against their manifest checksums.
+//! - `corpus verify` — Verify golden copies against `sample_sqlite_db_files/checksums.sha256`.
 //! - `run` — Execute an OpLog workload against a chosen engine.
 //! - `bench` — Run a Criterion-style benchmark matrix.
 //! - `corrupt` — Inject corruption into a working copy for recovery testing.
@@ -62,8 +62,8 @@ USAGE:
 
 SUBCOMMANDS:
     corpus scan             Discover SQLite databases under /dp
-    corpus import           Copy selected DBs into golden/ with manifest
-    corpus verify           Verify golden copies against manifest checksums
+    corpus import           Copy selected DBs into golden/ with checksums
+    corpus verify           Verify golden copies against checksums.sha256
     run                     Execute an OpLog workload against an engine
     bench                   Run the benchmark matrix (Criterion)
     corrupt                 Inject corruption into a working copy
@@ -353,7 +353,7 @@ STRATEGIES:
     page                Corrupt an entire page (--page N)
 
 OPTIONS:
-    --db <DB_ID>            Database fixture to corrupt (uses work/ copy)
+    --db <DB_ID>            Database fixture to corrupt (uses working/ copy)
     --strategy <STRATEGY>   Corruption strategy (bitflip|zero|page)
     --seed <N>              RNG seed for deterministic corruption (default: 0)
     --count <N>             Number of bits to flip (bitflip strategy)

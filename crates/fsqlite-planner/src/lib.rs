@@ -550,6 +550,7 @@ pub fn best_access_path(
                 .all(|c| idx.columns.iter().any(|ic| ic.eq_ignore_ascii_case(c)))
         });
 
+        let mut cost_multiplier: f64 = 1.0;
         let (kind, est_rows) = match usability {
             IndexUsability::Equality => {
                 let rows = if idx.unique {
@@ -577,13 +578,15 @@ pub fn best_access_path(
                 }
             }
             IndexUsability::InExpansion { probe_count } => {
-                // Each probe is like an equality lookup.
+                // Each probe is like an equality lookup; total cost
+                // and rows are scaled by the number of probes.
                 let per_probe_rows = if idx.unique {
                     1.0
                 } else {
                     (table.n_rows as f64 / 10.0).max(1.0)
                 };
                 let rows = per_probe_rows * probe_count as f64;
+                cost_multiplier = probe_count as f64;
                 (AccessPathKind::IndexScanEquality, rows)
             }
             IndexUsability::LikePrefix { .. } => {
@@ -598,7 +601,7 @@ pub fn best_access_path(
             IndexUsability::NotUsable => unreachable!(),
         };
 
-        let cost = estimate_cost(&kind, table.n_pages, idx.n_pages);
+        let cost = estimate_cost(&kind, table.n_pages, idx.n_pages) * cost_multiplier;
         if cost < best.estimated_cost {
             best = AccessPath {
                 table: table.name.clone(),
@@ -1029,6 +1032,8 @@ struct PartialPath {
     access_paths: Vec<AccessPath>,
     /// Cumulative cost.
     cost: f64,
+    /// Product of estimated rows across all tables joined so far.
+    cumulative_rows: f64,
 }
 
 /// Order tables using bounded beam search (NGQP-style, §10.5).
@@ -1082,10 +1087,12 @@ pub fn order_joins(
             continue;
         }
         let ap = best_access_path(t, indexes, where_terms, needed_columns);
+        let cumulative_rows = ap.estimated_rows;
         paths.push(PartialPath {
             tables: vec![t.name.clone()],
             access_paths: vec![ap.clone()],
             cost: ap.estimated_cost,
+            cumulative_rows,
         });
     }
     paths.sort_by(|a, b| {
@@ -1117,23 +1124,24 @@ pub fn order_joins(
                 }
 
                 let ap = best_access_path(t, indexes, where_terms, needed_columns);
-                // Scale inner table cost by outer rows (nested loop model).
-                let outer_rows = path
-                    .access_paths
-                    .last()
-                    .map_or(1.0, |last| last.estimated_rows);
+                // Scale inner table cost by the cumulative cardinality of
+                // all outer tables (nested loop model).  For a 3-table join
+                // T1⋈T2⋈T3, T3 executes once per (T1, T2) pair.
+                let outer_rows = path.cumulative_rows;
                 let inner_cost = ap.estimated_cost * outer_rows;
 
                 let mut new_tables = path.tables.clone();
                 new_tables.push(t.name.clone());
                 let mut new_aps = path.access_paths.clone();
-                new_aps.push(ap);
+                new_aps.push(ap.clone());
                 let new_cost = path.cost + inner_cost;
+                let new_cumulative_rows = path.cumulative_rows * ap.estimated_rows;
 
                 next_paths.push(PartialPath {
                     tables: new_tables,
                     access_paths: new_aps,
                     cost: new_cost,
+                    cumulative_rows: new_cumulative_rows,
                 });
             }
         }
@@ -1844,6 +1852,29 @@ mod tests {
     }
 
     #[test]
+    fn test_in_expansion_cost_scales_by_probe_count() {
+        // Regression: IN (v1, v2, v3) should cost ~3x a single equality
+        // probe, not the same as a single probe.
+        let table = table_stats("t1", 100, 1000);
+        let idx = index_info("idx_col", "t1", &["col"], false, 50);
+        let single_eq_term = [eq_term("col")];
+        let in_3_term = [in_term("col", 3)];
+
+        let ap_eq = best_access_path(&table, &[idx.clone()], &single_eq_term, None);
+        let ap_in = best_access_path(&table, &[idx], &in_3_term, None);
+
+        // IN with 3 probes should cost approximately 3x a single equality.
+        let ratio = ap_in.estimated_cost / ap_eq.estimated_cost;
+        assert!(
+            (ratio - 3.0).abs() < 0.01,
+            "IN(3) cost should be 3x equality cost: eq={} in3={} ratio={}",
+            ap_eq.estimated_cost,
+            ap_in.estimated_cost,
+            ratio,
+        );
+    }
+
+    #[test]
     fn test_index_usability_like_prefix() {
         let idx = index_info("idx_name", "t1", &["name"], false, 50);
         // LIKE 'Jo%' → usable (constant prefix)
@@ -1981,6 +2012,38 @@ mod tests {
         for t in &tables {
             assert!(plan.join_order.contains(&t.name));
         }
+    }
+
+    #[test]
+    fn test_three_way_join_cost_scales_by_cumulative_rows() {
+        // Regression: the cost of the 3rd table in a nested loop join must
+        // be scaled by T1.rows * T2.rows, not just T2.rows.
+        let small = table_stats("small", 1, 10);
+        let medium = table_stats("medium", 10, 100);
+        let large = table_stats("large", 100, 1000);
+        let plan_sml = order_joins(
+            &[small.clone(), medium.clone(), large.clone()],
+            &[],
+            &[],
+            None,
+            &[],
+        );
+
+        // With correct cumulative scaling, putting the largest table last
+        // is expensive because it scans once per (small * medium) row.
+        // The planner should NOT produce the same cost as it would if
+        // outer_rows were only the second table's rows.
+        let cost_if_only_last = 1.0_f64   // small full scan cost
+            + 10.0 * 10.0   // medium scanned 10 times
+            + 100.0 * 100.0; // BUG cost: large scanned only 100 times (medium.rows)
+        // The plan's total cost should be larger than this naive estimate
+        // because large is actually scanned 10*100=1000 times.
+        assert!(
+            plan_sml.total_cost > cost_if_only_last,
+            "3-way join cost should scale by cumulative rows, not just last table: plan_cost={} bug_cost={}",
+            plan_sml.total_cost,
+            cost_if_only_last,
+        );
     }
 
     #[test]
