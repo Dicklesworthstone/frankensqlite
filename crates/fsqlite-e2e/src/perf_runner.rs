@@ -389,8 +389,7 @@ pub fn write_results_jsonl(result: &PerfResult, path: &Path) -> std::io::Result<
     let mut file = std::fs::File::create(path)?;
     for cell in &result.cells {
         if let Some(ref summary) = cell.summary {
-            let line = serde_json::to_string(summary)
-                .map_err(std::io::Error::other)?;
+            let line = serde_json::to_string(summary).map_err(std::io::Error::other)?;
             writeln!(file, "{line}")?;
         }
     }
