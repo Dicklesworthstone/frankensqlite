@@ -864,19 +864,20 @@ impl VfsFile for WindowsFile {
                 return Err(err);
             }
 
+            let old_level = current;
             state.holders.insert(self.owner_id, next);
+            current = next;
+            self.lock_level = current;
             debug!(
                 target: "fsqlite_vfs::windows",
-                old_level = ?current,
+                old_level = ?old_level,
                 new_level = ?next,
                 path = %self.path.display(),
                 "windows lock transition"
             );
-            current = next;
         }
 
         drop(state);
-        self.lock_level = current;
         Ok(())
     }
 

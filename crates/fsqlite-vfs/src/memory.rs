@@ -483,8 +483,9 @@ mod tests {
         let resolved = vfs.full_pathname(&cx, Path::new("test.db")).unwrap();
         assert!(resolved.is_absolute());
 
-        let already_abs = vfs.full_pathname(&cx, Path::new("/tmp/test.db")).unwrap();
-        assert_eq!(already_abs, Path::new("/tmp/test.db"));
+        let already_abs_input = std::env::current_dir().unwrap().join("tmp").join("test.db");
+        let already_abs = vfs.full_pathname(&cx, &already_abs_input).unwrap();
+        assert_eq!(already_abs, already_abs_input);
     }
 
     #[test]
