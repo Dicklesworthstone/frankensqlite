@@ -441,8 +441,161 @@ fn format_row(row: &Row) -> String {
         .join(" | ")
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatementScanState {
+    Normal,
+    SingleQuote,
+    DoubleQuote,
+    Backtick,
+    BracketIdent,
+    LineComment,
+    BlockComment,
+}
+
+impl StatementScanState {
+    const fn is_unterminated(self) -> bool {
+        matches!(
+            self,
+            Self::SingleQuote
+                | Self::DoubleQuote
+                | Self::Backtick
+                | Self::BracketIdent
+                | Self::BlockComment
+        )
+    }
+}
+
+fn is_line_comment_start(bytes: &[u8], i: usize) -> bool {
+    if bytes.get(i) != Some(&b'-') {
+        return false;
+    }
+    if bytes.get(i + 1) != Some(&b'-') {
+        return false;
+    }
+    // SQLite only recognizes `--` when followed by whitespace/EOL.
+    match bytes.get(i + 2) {
+        None => true,
+        Some(byte) => byte.is_ascii_whitespace(),
+    }
+}
+
+fn is_block_comment_start(bytes: &[u8], i: usize) -> bool {
+    bytes.get(i) == Some(&b'/') && bytes.get(i + 1) == Some(&b'*')
+}
+
+fn is_block_comment_end(bytes: &[u8], i: usize) -> bool {
+    bytes.get(i) == Some(&b'*') && bytes.get(i + 1) == Some(&b'/')
+}
+
 fn statement_complete(buffer: &str) -> bool {
-    buffer.trim_end().ends_with(';')
+    let bytes = buffer.as_bytes();
+    let mut state = StatementScanState::Normal;
+    let mut last_significant: Option<u8> = None;
+
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match state {
+            StatementScanState::Normal => {
+                if b.is_ascii_whitespace() {
+                    i += 1;
+                    continue;
+                }
+
+                if is_line_comment_start(bytes, i) {
+                    state = StatementScanState::LineComment;
+                    i += 2;
+                    continue;
+                }
+
+                if is_block_comment_start(bytes, i) {
+                    state = StatementScanState::BlockComment;
+                    i += 2;
+                    continue;
+                }
+
+                last_significant = Some(b);
+
+                match b {
+                    b'\'' => state = StatementScanState::SingleQuote,
+                    b'"' => state = StatementScanState::DoubleQuote,
+                    b'`' => state = StatementScanState::Backtick,
+                    b'[' => state = StatementScanState::BracketIdent,
+                    _ => {}
+                }
+
+                i += 1;
+            }
+            StatementScanState::SingleQuote => {
+                if b == b'\'' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                        i += 2;
+                    } else {
+                        state = StatementScanState::Normal;
+                        i += 1;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            StatementScanState::DoubleQuote => {
+                if b == b'"' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                        i += 2;
+                    } else {
+                        state = StatementScanState::Normal;
+                        i += 1;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            StatementScanState::Backtick => {
+                if b == b'`' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'`' {
+                        i += 2;
+                    } else {
+                        state = StatementScanState::Normal;
+                        i += 1;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            StatementScanState::BracketIdent => {
+                if b == b']' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b']' {
+                        i += 2;
+                    } else {
+                        state = StatementScanState::Normal;
+                        i += 1;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            StatementScanState::LineComment => {
+                if b == b'\n' || b == b'\r' {
+                    state = StatementScanState::Normal;
+                }
+                i += 1;
+            }
+            StatementScanState::BlockComment => {
+                if is_block_comment_end(bytes, i) {
+                    state = StatementScanState::Normal;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+        }
+    }
+
+    if state.is_unterminated() {
+        return false;
+    }
+
+    last_significant == Some(b';')
 }
 
 fn try_execute_read_command<W, E>(
@@ -605,6 +758,35 @@ mod tests {
         assert!(statement_complete("SELECT 1;"));
         assert!(statement_complete("SELECT 1;\n"));
         assert!(!statement_complete("SELECT 1"));
+    }
+
+    #[test]
+    fn test_statement_complete_allows_trailing_line_comment() {
+        assert!(statement_complete("SELECT 1; -- comment"));
+        assert!(statement_complete("SELECT 1;-- comment"));
+        assert!(statement_complete("SELECT 1;\n-- comment"));
+        assert!(statement_complete("SELECT 1; -- comment\n"));
+    }
+
+    #[test]
+    fn test_statement_complete_allows_trailing_block_comment() {
+        assert!(statement_complete("SELECT 1; /* comment */"));
+        assert!(statement_complete("SELECT 1; /* multi\nline\ncomment */"));
+        assert!(!statement_complete("SELECT 1; /* unterminated"));
+    }
+
+    #[test]
+    fn test_statement_complete_ignores_semicolon_in_string_literal() {
+        assert!(!statement_complete("SELECT ';'"));
+        assert!(statement_complete("SELECT ';';"));
+        assert!(statement_complete("SELECT 'it''s; fine';"));
+    }
+
+    #[test]
+    fn test_statement_complete_does_not_treat_double_minus_as_comment_without_space() {
+        // SQLite only treats `--` as a comment when followed by whitespace/EOL.
+        assert!(statement_complete("SELECT 1--2;")); // 1 - -2
+        assert!(statement_complete("SELECT 1--2; -- ok")); // comment after terminator
     }
 
     #[test]
