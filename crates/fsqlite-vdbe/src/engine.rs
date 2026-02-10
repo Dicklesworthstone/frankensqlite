@@ -14,7 +14,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use fsqlite_btree::{BtreeCursorOps, MockBtreeCursor};
+use fsqlite_btree::{BtCursor, BtreeCursorOps, MemPageStore};
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_func::{ErasedAggregateFunction, FunctionRegistry};
 use fsqlite_types::cx::Cx;
@@ -185,19 +185,14 @@ impl SorterCursor {
 }
 
 /// Storage-backed table cursor used by read scans (`OpenRead`).
+///
+/// Backed by a real [`BtCursor`] over an in-memory [`MemPageStore`] so that
+/// the VDBE exercises the same page-level navigation code path that the
+/// production pager/WAL stack will use.
 #[derive(Debug)]
 struct StorageCursor {
-    cursor: MockBtreeCursor,
+    cursor: BtCursor<MemPageStore>,
     cx: Cx,
-}
-
-impl StorageCursor {
-    fn new(entries: Vec<(i64, Vec<u8>)>) -> Self {
-        Self {
-            cursor: MockBtreeCursor::new(entries),
-            cx: Cx::new(),
-        }
-    }
 }
 
 /// Shared in-memory database backing the VDBE engine's cursor operations.
@@ -1488,11 +1483,12 @@ impl VdbeEngine {
                 }
 
                 Opcode::ZeroOrNull => {
-                    // p2 = 0 if any of p1, p2, p3 is NULL.
-                    let any_null = self.get_reg(op.p1).is_null()
-                        || self.get_reg(op.p2).is_null()
-                        || self.get_reg(op.p3).is_null();
-                    if any_null {
+                    // If either P1 or P3 is NULL, set P2 to NULL.
+                    // Otherwise set P2 to 0.
+                    // Reference: ZeroOrNull semantics (OP_ZeroOrNull spec).
+                    if self.get_reg(op.p1).is_null() || self.get_reg(op.p3).is_null() {
+                        self.set_reg(op.p2, SqliteValue::Null);
+                    } else {
                         self.set_reg(op.p2, SqliteValue::Integer(0));
                     }
                     pc += 1;
@@ -1924,7 +1920,9 @@ impl VdbeEngine {
         Ok(SqliteValue::Null)
     }
 
+    #[allow(clippy::cast_sign_loss)]
     fn open_storage_cursor(&mut self, cursor_id: i32, root_page: i32) -> bool {
+        const PAGE_SIZE: u32 = 4096;
         if !self.storage_read_cursors_enabled {
             return false;
         }
@@ -1935,16 +1933,26 @@ impl VdbeEngine {
             return false;
         };
 
-        let entries = table
-            .rows
-            .iter()
-            .map(|row| {
-                let payload = encode_record(&row.values);
-                (row.rowid, payload)
-            })
-            .collect();
+        // Build a transient B-tree snapshot from the current MemTable rows.
+        // Use the actual root page number (typically 2+) to avoid page-1's
+        // special 100-byte header offset.
+        let Some(root_pgno) = fsqlite_types::PageNumber::new(root_page as u32) else {
+            return false;
+        };
+
+        let store = MemPageStore::with_empty_table(root_pgno, PAGE_SIZE);
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(store, root_pgno, PAGE_SIZE, true);
+
+        for row in &table.rows {
+            let payload = encode_record(&row.values);
+            if cursor.table_insert(&cx, row.rowid, &payload).is_err() {
+                return false;
+            }
+        }
+
         self.storage_cursors
-            .insert(cursor_id, StorageCursor::new(entries));
+            .insert(cursor_id, StorageCursor { cursor, cx });
         true
     }
 

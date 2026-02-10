@@ -1358,4 +1358,48 @@ mod tests {
         let count = conn.execute("SELECT * FROM es;").unwrap();
         assert_eq!(count, 2, "SELECT via execute() should return row count");
     }
+
+    // ── Bug fix regression: SAVEPOINT RELEASE implicit transaction ───
+
+    #[test]
+    fn savepoint_release_ends_implicit_transaction() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE sr (v INTEGER);").unwrap();
+
+        // SAVEPOINT starts an implicit transaction.
+        conn.execute("SAVEPOINT sp1;").unwrap();
+        assert!(conn.in_transaction());
+        conn.execute("INSERT INTO sr VALUES (1);").unwrap();
+
+        // RELEASE ends the implicit transaction.
+        conn.execute("RELEASE sp1;").unwrap();
+        assert!(
+            !conn.in_transaction(),
+            "RELEASE of last implicit savepoint should end transaction"
+        );
+
+        // After release, data should be committed.
+        let rows = conn.query("SELECT * FROM sr;").unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn explicit_begin_savepoint_release_keeps_transaction() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE bsr (v INTEGER);").unwrap();
+
+        // Explicit BEGIN, then SAVEPOINT, then RELEASE.
+        conn.execute("BEGIN;").unwrap();
+        conn.execute("SAVEPOINT sp1;").unwrap();
+        conn.execute("INSERT INTO bsr VALUES (1);").unwrap();
+        conn.execute("RELEASE sp1;").unwrap();
+
+        // Transaction should still be active (explicit BEGIN requires COMMIT).
+        assert!(
+            conn.in_transaction(),
+            "RELEASE after explicit BEGIN should not end the transaction"
+        );
+        conn.execute("COMMIT;").unwrap();
+        assert!(!conn.in_transaction());
+    }
 }

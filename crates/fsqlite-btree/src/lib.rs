@@ -13,7 +13,7 @@ pub use cell::{
     local_payload_size, max_local_payload, min_local_payload, read_cell_pointers,
     write_cell_pointers,
 };
-pub use cursor::{BtCursor, PageReader, PageWriter, TransactionPageIo};
+pub use cursor::{BtCursor, MemPageStore, PageReader, PageWriter, TransactionPageIo};
 pub use traits::{BtreeCursorOps, MockBtreeCursor, SeekResult};
 
 /// Compare two B-tree keys stored as contiguous byte slices.

@@ -19,6 +19,8 @@
 //!               └─────────┘
 //! ```
 
+use std::collections::HashMap;
+
 use crate::balance;
 use crate::cell::{self, BtreePageHeader, CellRef};
 use crate::overflow;
@@ -111,6 +113,99 @@ impl<T: TransactionHandle + ?Sized> PageWriter for TransactionPageIo<'_, T> {
 
     fn free_page(&mut self, cx: &Cx, page_no: PageNumber) -> Result<()> {
         self.txn.free_page(cx, page_no)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// In-memory page store (for VDBE storage cursors)
+// ---------------------------------------------------------------------------
+
+/// Simple in-memory page store implementing [`PageReader`] and [`PageWriter`].
+///
+/// Used by the VDBE storage cursor path to build transient B-trees from
+/// in-memory table data without requiring the full pager/VFS stack.
+#[derive(Debug, Clone)]
+pub struct MemPageStore {
+    pages: HashMap<u32, Vec<u8>>,
+    page_size: u32,
+}
+
+impl MemPageStore {
+    /// Create a new empty page store with the given page size.
+    #[must_use]
+    pub fn new(page_size: u32) -> Self {
+        Self {
+            pages: HashMap::new(),
+            page_size,
+        }
+    }
+
+    /// Initialize an empty leaf-table root page at the given page number.
+    ///
+    /// Call this once before constructing a [`BtCursor`] that will insert
+    /// rows into the store. Avoid page 1 for transient stores since the
+    /// B-tree code applies a 100-byte header offset to page 1.
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn init_leaf_table_root(&mut self, pgno: PageNumber) {
+        let mut page = vec![0u8; self.page_size as usize];
+        page[0] = 0x0D;
+        page[3..5].copy_from_slice(&0u16.to_be_bytes());
+        let content_off = self.page_size as u16;
+        page[5..7].copy_from_slice(&content_off.to_be_bytes());
+        self.pages.insert(pgno.get(), page);
+    }
+
+    /// Create a page store pre-initialized with an empty leaf table B-tree
+    /// at the given root page number.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn with_empty_table(root_page: PageNumber, page_size: u32) -> Self {
+        let mut store = Self::new(page_size);
+        let mut page = vec![0u8; page_size as usize];
+        // Initialize as empty leaf table page (type 0x0D).
+        page[0] = 0x0D;
+        // Bytes 1-2: first freeblock offset = 0 (none).
+        // Bytes 3-4: cell count = 0.
+        // Bytes 5-6: content area offset = page_size (no cells yet).
+        let content_offset = page_size as u16;
+        page[5..7].copy_from_slice(&content_offset.to_be_bytes());
+        // Byte 7: fragmented free bytes = 0.
+        store.pages.insert(root_page.get(), page);
+        store
+    }
+}
+
+impl PageReader for MemPageStore {
+    fn read_page(&self, _cx: &Cx, page_no: PageNumber) -> Result<Vec<u8>> {
+        self.pages
+            .get(&page_no.get())
+            .cloned()
+            .ok_or_else(|| FrankenError::internal("page not found"))
+    }
+}
+
+impl PageWriter for MemPageStore {
+    fn write_page(&mut self, _cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()> {
+        self.pages.insert(page_no.get(), data.to_vec());
+        Ok(())
+    }
+
+    fn allocate_page(&mut self, _cx: &Cx) -> Result<PageNumber> {
+        let next = self
+            .pages
+            .keys()
+            .copied()
+            .max()
+            .unwrap_or(1)
+            .saturating_add(1);
+        let pgno = PageNumber::new(next).ok_or(FrankenError::DatabaseFull)?;
+        self.pages.insert(next, vec![0u8; self.page_size as usize]);
+        Ok(pgno)
+    }
+
+    fn free_page(&mut self, _cx: &Cx, page_no: PageNumber) -> Result<()> {
+        self.pages.remove(&page_no.get());
+        Ok(())
     }
 }
 
@@ -1327,49 +1422,13 @@ mod tests {
     use fsqlite_types::serial_type::write_varint;
     use proptest::strategy::Strategy as _;
     use std::cell::RefCell;
-    use std::collections::{BTreeMap, BTreeSet, HashMap};
+    use std::collections::{BTreeMap, BTreeSet};
     use std::rc::Rc;
     use std::time::{Duration, Instant};
 
-    /// Simple in-memory page store for testing.
-    #[derive(Debug, Clone, Default)]
-    struct MemPageStore {
-        pages: HashMap<u32, Vec<u8>>,
-    }
-
-    impl PageReader for MemPageStore {
-        fn read_page(&self, _cx: &Cx, page_no: PageNumber) -> Result<Vec<u8>> {
-            self.pages
-                .get(&page_no.get())
-                .cloned()
-                .ok_or_else(|| FrankenError::internal("page not found"))
-        }
-    }
-
-    impl PageWriter for MemPageStore {
-        fn write_page(&mut self, _cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()> {
-            self.pages.insert(page_no.get(), data.to_vec());
-            Ok(())
-        }
-
-        fn allocate_page(&mut self, _cx: &Cx) -> Result<PageNumber> {
-            let next = self
-                .pages
-                .keys()
-                .copied()
-                .max()
-                .unwrap_or(1)
-                .saturating_add(1);
-            let pgno = PageNumber::new(next).ok_or(FrankenError::DatabaseFull)?;
-            self.pages.insert(next, vec![0u8; USABLE as usize]);
-            Ok(pgno)
-        }
-
-        fn free_page(&mut self, _cx: &Cx, page_no: PageNumber) -> Result<()> {
-            self.pages.remove(&page_no.get());
-            Ok(())
-        }
-    }
+    // MemPageStore is now defined at module scope (pub) and imported via
+    // `use super::*;`.  Tests use `MemPageStore::new(USABLE)` instead of
+    // the former `MemPageStore::new(USABLE)`.
 
     #[derive(Debug, Clone)]
     struct PrefetchProbeStore {
@@ -1637,7 +1696,7 @@ mod tests {
 
     #[test]
     fn test_prefetch_hint_issued_on_descent() {
-        let mut store = MemPageStore::default();
+        let mut store = MemPageStore::new(USABLE);
         store
             .pages
             .insert(2, build_interior_table(&[(pn(3), 5)], pn(4)));
@@ -1659,7 +1718,7 @@ mod tests {
 
     #[test]
     fn test_prefetch_noop_if_unavailable() {
-        let mut store = MemPageStore::default();
+        let mut store = MemPageStore::new(USABLE);
         store
             .pages
             .insert(2, build_interior_table(&[(pn(3), 5)], pn(4)));
@@ -1695,7 +1754,7 @@ mod tests {
 
     #[test]
     fn test_prefetch_does_not_block() {
-        let mut store = MemPageStore::default();
+        let mut store = MemPageStore::new(USABLE);
         store
             .pages
             .insert(2, build_interior_table(&[(pn(3), 5)], pn(4)));
@@ -1722,7 +1781,7 @@ mod tests {
 
     #[test]
     fn test_prefetch_invalid_page_harmless() {
-        let mut store = MemPageStore::default();
+        let mut store = MemPageStore::new(USABLE);
         store
             .pages
             .insert(2, build_leaf_table(&[(1, b"a"), (2, b"b")]));
@@ -1740,7 +1799,7 @@ mod tests {
 
     #[test]
     fn test_cursor_first_last_single_leaf() {
-        let mut store = MemPageStore::default();
+        let mut store = MemPageStore::new(USABLE);
         store.pages.insert(
             2,
             build_leaf_table(&[(1, b"alice"), (5, b"bob"), (10, b"charlie")]),
@@ -1760,7 +1819,7 @@ mod tests {
 
     #[test]
     fn test_cursor_seek_exact() {
-        let mut store = MemPageStore::default();
+        let mut store = MemPageStore::new(USABLE);
         store.pages.insert(
             2,
             build_leaf_table(&[(1, b"one"), (5, b"five"), (10, b"ten"), (15, b"fifteen")]),
@@ -1776,7 +1835,7 @@ mod tests {
 
     #[test]
     fn test_cursor_seek_not_found() {
-        let mut store = MemPageStore::default();
+        let mut store = MemPageStore::new(USABLE);
         store.pages.insert(
             2,
             build_leaf_table(&[(1, b"one"), (5, b"five"), (10, b"ten")]),
@@ -1799,7 +1858,7 @@ mod tests {
 
     #[test]
     fn test_cursor_table_insert_single_leaf() {
-        let mut store = MemPageStore::default();
+        let mut store = MemPageStore::new(USABLE);
         store
             .pages
             .insert(2, build_leaf_table(&[(1, b"one"), (3, b"three")]));
@@ -1822,7 +1881,7 @@ mod tests {
 
     #[test]
     fn test_cursor_table_insert_duplicate_rowid() {
-        let mut store = MemPageStore::default();
+        let mut store = MemPageStore::new(USABLE);
         store.pages.insert(2, build_leaf_table(&[(7, b"seven")]));
 
         let cx = Cx::new();
@@ -1833,7 +1892,7 @@ mod tests {
 
     #[test]
     fn test_cursor_index_insert_single_leaf() {
-        let mut store = MemPageStore::default();
+        let mut store = MemPageStore::new(USABLE);
         store
             .pages
             .insert(2, build_leaf_index(&[b"apple", b"pear"]));
@@ -1848,7 +1907,7 @@ mod tests {
 
     #[test]
     fn test_cursor_table_insert_with_overflow_payload() {
-        let mut store = MemPageStore::default();
+        let mut store = MemPageStore::new(USABLE);
         store.pages.insert(2, build_leaf_table(&[]));
         let payload: Vec<u8> = (0u8..=255).cycle().take(5000).collect();
 
@@ -1862,7 +1921,7 @@ mod tests {
 
     #[test]
     fn test_cursor_table_insert_triggers_root_split() {
-        let mut store = MemPageStore::default();
+        let mut store = MemPageStore::new(USABLE);
         store.pages.insert(2, build_leaf_table(&[]));
 
         let cx = Cx::new();
@@ -1895,7 +1954,7 @@ mod tests {
 
     #[test]
     fn test_cursor_index_insert_triggers_root_split() {
-        let mut store = MemPageStore::default();
+        let mut store = MemPageStore::new(USABLE);
         store.pages.insert(2, build_leaf_index(&[]));
 
         let cx = Cx::new();
@@ -1928,7 +1987,7 @@ mod tests {
 
     #[test]
     fn test_cursor_table_insert_after_root_split() {
-        let mut store = MemPageStore::default();
+        let mut store = MemPageStore::new(USABLE);
         store.pages.insert(2, build_leaf_table(&[]));
 
         let cx = Cx::new();
@@ -1960,7 +2019,7 @@ mod tests {
 
     #[test]
     fn test_cursor_delete_single_leaf() {
-        let mut store = MemPageStore::default();
+        let mut store = MemPageStore::new(USABLE);
         store.pages.insert(
             2,
             build_leaf_table(&[(1, b"one"), (2, b"two"), (3, b"three")]),
@@ -1985,7 +2044,7 @@ mod tests {
 
     #[test]
     fn test_cursor_delete_after_root_split() {
-        let mut store = MemPageStore::default();
+        let mut store = MemPageStore::new(USABLE);
         store.pages.insert(2, build_leaf_table(&[]));
 
         let cx = Cx::new();
@@ -2032,7 +2091,7 @@ mod tests {
 
     #[test]
     fn test_cursor_delete_rebalances_empty_leftmost_leaf() {
-        let mut store = MemPageStore::default();
+        let mut store = MemPageStore::new(USABLE);
         store.pages.insert(2, build_leaf_table(&[]));
 
         let cx = Cx::new();
@@ -2109,7 +2168,7 @@ mod tests {
 
     #[test]
     fn test_cursor_delete_all_after_root_split() {
-        let mut store = MemPageStore::default();
+        let mut store = MemPageStore::new(USABLE);
         store.pages.insert(2, build_leaf_table(&[]));
 
         let cx = Cx::new();
@@ -2146,7 +2205,7 @@ mod tests {
         const TOTAL_ROWS: i64 = 2_000;
         const DELETE_ROWS: usize = 1_000;
 
-        let mut store = MemPageStore::default();
+        let mut store = MemPageStore::new(USABLE);
         store.pages.insert(2, build_leaf_table(&[]));
 
         let cx = Cx::new();
@@ -2207,7 +2266,7 @@ mod tests {
     fn test_e2e_btree_prefetch_latency() {
         const TOTAL_ROWS: i64 = 1_500;
 
-        let mut seed_store = MemPageStore::default();
+        let mut seed_store = MemPageStore::new(USABLE);
         seed_store.pages.insert(2, build_leaf_table(&[]));
 
         let cx = Cx::new();
@@ -2258,7 +2317,7 @@ mod tests {
 
     #[test]
     fn test_btree_insert_delete_5k() {
-        let mut store = MemPageStore::default();
+        let mut store = MemPageStore::new(USABLE);
         store.pages.insert(2, build_leaf_table(&[]));
 
         let cx = Cx::new();
@@ -2308,7 +2367,7 @@ mod tests {
 
     #[test]
     fn test_btree_insert_10k_random_keys() {
-        let mut store = MemPageStore::default();
+        let mut store = MemPageStore::new(USABLE);
         store.pages.insert(2, build_leaf_table(&[]));
 
         let cx = Cx::new();
@@ -2333,7 +2392,7 @@ mod tests {
 
     #[test]
     fn test_btree_depth_4_cursor_traversal() {
-        let mut store = MemPageStore::default();
+        let mut store = MemPageStore::new(USABLE);
         store
             .pages
             .insert(2, build_interior_table(&[(pn(3), 100)], pn(7)));
@@ -2377,7 +2436,7 @@ mod tests {
 
     #[test]
     fn test_point_read_uses_cell_witness() {
-        let mut store = MemPageStore::default();
+        let mut store = MemPageStore::new(USABLE);
         store.pages.insert(
             2,
             build_leaf_table(&[(1, b"one"), (5, b"five"), (10, b"ten")]),
@@ -2398,7 +2457,7 @@ mod tests {
 
     #[test]
     fn test_descent_pages_not_witnessed() {
-        let mut store = MemPageStore::default();
+        let mut store = MemPageStore::new(USABLE);
         store
             .pages
             .insert(2, build_interior_table(&[(pn(3), 5)], pn(4)));
@@ -2424,7 +2483,7 @@ mod tests {
 
     #[test]
     fn test_negative_read_uses_cell_witness() {
-        let mut store = MemPageStore::default();
+        let mut store = MemPageStore::new(USABLE);
         store.pages.insert(
             2,
             build_leaf_table(&[(1, b"one"), (5, b"five"), (10, b"ten")]),
@@ -2445,7 +2504,7 @@ mod tests {
 
     #[test]
     fn test_range_scan_uses_page_witness() {
-        let mut store = MemPageStore::default();
+        let mut store = MemPageStore::new(USABLE);
         store
             .pages
             .insert(2, build_interior_table(&[(pn(3), 5)], pn(4)));
@@ -2500,7 +2559,7 @@ mod tests {
 
     #[test]
     fn test_e2e_point_ops_use_cell_witnesses() {
-        let mut store = MemPageStore::default();
+        let mut store = MemPageStore::new(USABLE);
         store
             .pages
             .insert(2, build_interior_table(&[(pn(3), 50)], pn(4)));
@@ -2541,7 +2600,7 @@ mod tests {
 
     #[test]
     fn test_cursor_next_prev() {
-        let mut store = MemPageStore::default();
+        let mut store = MemPageStore::new(USABLE);
         store.pages.insert(
             2,
             build_leaf_table(&[(1, b"a"), (2, b"b"), (3, b"c"), (4, b"d")]),
@@ -2576,7 +2635,7 @@ mod tests {
 
     #[test]
     fn test_cursor_empty_tree() {
-        let mut store = MemPageStore::default();
+        let mut store = MemPageStore::new(USABLE);
         store.pages.insert(2, build_leaf_table(&[]));
 
         let cx = Cx::new();
@@ -2597,7 +2656,7 @@ mod tests {
         //
         // In SQLite intkey trees, the interior cell key is the max rowid
         // in the left subtree.
-        let mut store = MemPageStore::default();
+        let mut store = MemPageStore::new(USABLE);
         store
             .pages
             .insert(2, build_interior_table(&[(pn(3), 5)], pn(4)));
@@ -2627,7 +2686,7 @@ mod tests {
 
     #[test]
     fn test_cursor_two_level_tree_traverse() {
-        let mut store = MemPageStore::default();
+        let mut store = MemPageStore::new(USABLE);
         store
             .pages
             .insert(2, build_interior_table(&[(pn(3), 5)], pn(4)));
@@ -2687,7 +2746,7 @@ mod tests {
         //
         //   Leaf pages:
         //     5: (1, 3)  6: (5, 8)  7: (10, 15)  8: (20, 25)  9: (30, 40)
-        let mut store = MemPageStore::default();
+        let mut store = MemPageStore::new(USABLE);
 
         // Root.
         store
@@ -2759,7 +2818,7 @@ mod tests {
 
     #[test]
     fn test_cursor_seek_then_next() {
-        let mut store = MemPageStore::default();
+        let mut store = MemPageStore::new(USABLE);
         store
             .pages
             .insert(2, build_interior_table(&[(pn(3), 5)], pn(4)));
@@ -2781,7 +2840,7 @@ mod tests {
 
     #[test]
     fn test_cursor_eof_at_payload() {
-        let mut store = MemPageStore::default();
+        let mut store = MemPageStore::new(USABLE);
         store.pages.insert(2, build_leaf_table(&[(1, b"x")]));
 
         let cx = Cx::new();
@@ -2804,7 +2863,7 @@ mod tests {
     /// first()/next() enumeration correctly.
     #[test]
     fn test_depth3_collapse_after_sustained_deletes() {
-        let mut store = MemPageStore::default();
+        let mut store = MemPageStore::new(USABLE);
         store.pages.insert(2, build_leaf_table(&[]));
 
         let cx = Cx::new();
@@ -2863,7 +2922,7 @@ mod tests {
     /// rows are still correctly enumerable.
     #[test]
     fn test_depth3_partial_delete_collapse() {
-        let mut store = MemPageStore::default();
+        let mut store = MemPageStore::new(USABLE);
         store.pages.insert(2, build_leaf_table(&[]));
 
         let cx = Cx::new();
@@ -2950,7 +3009,7 @@ mod tests {
     /// correctly across multiple overflow pages.
     #[test]
     fn test_btree_multiple_overflow_pages() {
-        let mut store = MemPageStore::default();
+        let mut store = MemPageStore::new(USABLE);
         store.pages.insert(2, build_leaf_table(&[]));
 
         let cx = Cx::new();
@@ -2984,7 +3043,7 @@ mod tests {
 
     #[test]
     fn test_btree_overflow_page_chain_100kb() {
-        let mut store = MemPageStore::default();
+        let mut store = MemPageStore::new(USABLE);
         store.pages.insert(2, build_leaf_table(&[]));
 
         let cx = Cx::new();
@@ -3004,7 +3063,7 @@ mod tests {
     /// (proving page splits occur), and sorted order is maintained.
     #[test]
     fn test_btree_page_count_grows_with_inserts() {
-        let mut store = MemPageStore::default();
+        let mut store = MemPageStore::new(USABLE);
         store.pages.insert(2, build_leaf_table(&[]));
 
         let cx = Cx::new();
@@ -3050,7 +3109,7 @@ mod tests {
                 1..200
             )
         ) {
-            let mut store = MemPageStore::default();
+            let mut store = MemPageStore::new(USABLE);
             store.pages.insert(2, build_leaf_table(&[]));
 
             let cx = Cx::new();
@@ -3108,7 +3167,7 @@ mod tests {
                 1..500
             )
         ) {
-            let mut store = MemPageStore::default();
+            let mut store = MemPageStore::new(USABLE);
             store.pages.insert(2, build_leaf_table(&[]));
 
             let cx = Cx::new();
