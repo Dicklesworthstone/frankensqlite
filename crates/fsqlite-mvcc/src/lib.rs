@@ -21,6 +21,7 @@ pub mod index_regen;
 pub mod invariants;
 pub mod lifecycle;
 pub mod physical_merge;
+pub mod retry_policy;
 pub mod rowid_alloc;
 pub mod shared_lock_table;
 pub mod sheaf_conformal;
@@ -107,6 +108,12 @@ pub use physical_merge::{
     CellOp, CellOpKind, FreeSpaceOp, HeaderOp, MergeError, MergeLadderResult, ParsedCell,
     ParsedPage, RangeXorPatch, StructuredPagePatch, apply_patch, diff_parsed_pages,
     evaluate_merge_ladder, merge_structured_patches, parse_btree_page, repack_btree_page,
+};
+pub use retry_policy::{
+    BetaPosterior, ContentionBucketKey, DEFAULT_CANDIDATE_WAITS_MS, DEFAULT_STARVATION_THRESHOLD,
+    HazardModelParams, MAX_CONTENTION_BUCKETS, RetryAction, RetryController, RetryCostParams,
+    RetryEvidenceEntry, expected_loss_failnow, expected_loss_retry, gittins_index_approx,
+    gittins_threshold,
 };
 pub use rowid_alloc::{
     AllocatorKey, ConcurrentRowIdAllocator, DEFAULT_RANGE_SIZE, LocalRowIdCache, RangeReservation,

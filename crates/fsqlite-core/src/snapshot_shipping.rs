@@ -17,8 +17,8 @@ use fsqlite_error::{FrankenError, Result};
 use tracing::{debug, error, info, warn};
 
 use crate::replication_sender::{
-    CHANGESET_HEADER_SIZE, ChangesetId, PageEntry, ReplicationPacket, SenderConfig,
-    compute_changeset_id, derive_seed_from_changeset_id, encode_changeset,
+    CHANGESET_HEADER_SIZE, ChangesetId, PageEntry, ReplicationPacket, ReplicationPacketV2Header,
+    SenderConfig, compute_changeset_id, derive_seed_from_changeset_id, encode_changeset,
 };
 use crate::source_block_partition::{K_MAX, SourceBlock, partition_source_blocks};
 
@@ -369,13 +369,20 @@ impl SnapshotSender {
             }
         };
 
-        let packet = ReplicationPacket {
-            changeset_id,
-            sbn: 0, // V1
-            esi: isi,
-            k_source,
+        let seed = derive_seed_from_changeset_id(&changeset_id);
+        let r_repair = max_isi.saturating_sub(k_source);
+        let packet = ReplicationPacket::new_v2(
+            ReplicationPacketV2Header {
+                changeset_id,
+                sbn: 0,
+                esi: isi,
+                k_source,
+                r_repair,
+                symbol_size_t: self.config.symbol_size,
+                seed,
+            },
             symbol_data,
-        };
+        );
 
         self.current_isi += 1;
         Some(packet)

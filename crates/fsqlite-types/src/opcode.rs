@@ -1386,6 +1386,7 @@ impl VdbeProgram {
 #[allow(clippy::approx_constant)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     #[test]
     fn opcode_count() {
@@ -1422,6 +1423,18 @@ mod tests {
                 "from_byte({i}) returned None"
             );
         }
+    }
+
+    #[test]
+    fn test_opcode_distinct_u8_values() {
+        let mut encoded = HashSet::new();
+        for byte in 1..=190_u8 {
+            let opcode = Opcode::from_byte(byte).expect("opcode byte must decode");
+            let inserted = encoded.insert(opcode as u8);
+            assert!(inserted, "duplicate opcode byte value for {:?}", opcode);
+        }
+
+        assert_eq!(encoded.len(), 190, "every opcode must map to a unique byte");
     }
 
     #[test]

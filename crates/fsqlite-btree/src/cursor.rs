@@ -2195,6 +2195,11 @@ mod tests {
     }
 
     #[test]
+    fn test_btree_insert_delete_sorted_order() {
+        test_btree_insert_delete_5k();
+    }
+
+    #[test]
     fn test_btree_insert_10k_random_keys() {
         let mut store = MemPageStore::default();
         store.pages.insert(2, build_leaf_table(&[]));
@@ -2217,6 +2222,50 @@ mod tests {
             assert!(seek.is_found(), "missing rowid after insert: {rowid}");
             assert_eq!(&cursor.payload(&cx).unwrap(), payload);
         }
+    }
+
+    #[test]
+    fn test_btree_depth_4_cursor_traversal() {
+        let mut store = MemPageStore::default();
+        store
+            .pages
+            .insert(2, build_interior_table(&[(pn(3), 100)], pn(7)));
+        store
+            .pages
+            .insert(3, build_interior_table(&[(pn(4), 50)], pn(8)));
+        store
+            .pages
+            .insert(4, build_interior_table(&[(pn(5), 25)], pn(6)));
+        store
+            .pages
+            .insert(5, build_leaf_table(&[(10, b"ten"), (20, b"twenty")]));
+        store
+            .pages
+            .insert(6, build_leaf_table(&[(30, b"thirty"), (40, b"forty")]));
+        store
+            .pages
+            .insert(8, build_leaf_table(&[(60, b"sixty"), (80, b"eighty")]));
+        store
+            .pages
+            .insert(7, build_leaf_table(&[(120, b"one20"), (140, b"one40")]));
+
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+        let depth = measure_tree_depth(&cursor.pager, pn(2), USABLE);
+        assert_eq!(depth, 4, "expected a manually seeded depth-4 tree");
+
+        let expected_rowids = [10_i64, 20, 30, 40, 60, 80, 120, 140];
+        for rowid in expected_rowids {
+            let seek = cursor.table_move_to(&cx, rowid).unwrap();
+            assert!(seek.is_found(), "missing rowid {rowid} in depth-4 tree");
+        }
+
+        assert!(cursor.first(&cx).unwrap());
+        let mut scanned = vec![cursor.rowid(&cx).unwrap()];
+        while cursor.next(&cx).unwrap() {
+            scanned.push(cursor.rowid(&cx).unwrap());
+        }
+        assert_eq!(scanned, expected_rowids);
     }
 
     #[test]
@@ -2824,6 +2873,24 @@ mod tests {
             );
             assert_eq!(&got[..], &expected[..], "payload mismatch at rowid {rowid}");
         }
+    }
+
+    #[test]
+    fn test_btree_overflow_page_chain_100kb() {
+        let mut store = MemPageStore::default();
+        store.pages.insert(2, build_leaf_table(&[]));
+
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+        let payload = vec![0xCD_u8; 100 * 1024];
+
+        cursor.table_insert(&cx, 1, &payload).unwrap();
+        let seek = cursor.table_move_to(&cx, 1).unwrap();
+        assert!(seek.is_found(), "expected rowid 1 to be present");
+
+        let roundtrip = cursor.payload(&cx).unwrap();
+        assert_eq!(roundtrip.len(), payload.len());
+        assert_eq!(roundtrip, payload);
     }
 
     /// Phase 3 acceptance: page count must grow as rows are inserted

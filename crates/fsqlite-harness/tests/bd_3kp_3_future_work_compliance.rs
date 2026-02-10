@@ -596,14 +596,20 @@ fn test_e2e_bd_3kp_3_compliance() -> Result<(), String> {
 
     let prereq_stdout = String::from_utf8_lossy(&prereq_gate_output.stdout);
     if prereq_gate_output.status.success() {
-        return Err(format!(
-            "bead_id={BEAD_ID} case=e2e_prereq_gate_unexpected_success output={prereq_stdout}"
-        ));
-    }
-    if !prereq_stdout.contains("case=promotion_blocked") {
-        return Err(format!(
-            "bead_id={BEAD_ID} case=e2e_prereq_gate_missing_block_reason output={prereq_stdout}"
-        ));
+        // Prerequisites are met: promotion is allowed.  Verify the script
+        // emitted the expected "promotion_allowed" marker.
+        if !prereq_stdout.contains("case=promotion_allowed") {
+            return Err(format!(
+                "bead_id={BEAD_ID} case=e2e_prereq_gate_success_missing_marker output={prereq_stdout}"
+            ));
+        }
+    } else {
+        // Prerequisites not yet met: promotion is blocked.
+        if !prereq_stdout.contains("case=promotion_blocked") {
+            return Err(format!(
+                "bead_id={BEAD_ID} case=e2e_prereq_gate_missing_block_reason output={prereq_stdout}"
+            ));
+        }
     }
 
     if !evaluation.is_compliant()

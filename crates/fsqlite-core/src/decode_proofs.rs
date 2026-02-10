@@ -22,9 +22,13 @@ pub const DECODE_PROOF_SCHEMA_VERSION_V1: u16 = 1;
 
 /// Default policy identifier for deterministic decode proof emission.
 pub const DEFAULT_DECODE_PROOF_POLICY_ID: u32 = 1;
+/// Default slack requirement used when verifying successful decode proofs.
+pub const DEFAULT_DECODE_PROOF_SLACK: u32 = 2;
 
 /// Why a symbol was rejected before decode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub enum SymbolRejectionReason {
     HashMismatch,
     InvalidAuthTag,
@@ -44,14 +48,18 @@ impl fmt::Display for SymbolRejectionReason {
 }
 
 /// Rejected-symbol evidence item.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct RejectedSymbol {
     pub esi: u32,
     pub reason: SymbolRejectionReason,
 }
 
 /// Reason for decode failure when `decode_success == false`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub enum DecodeFailureReason {
     InsufficientSymbols,
     RankDeficiency,
@@ -71,7 +79,7 @@ impl fmt::Display for DecodeFailureReason {
 }
 
 /// Redaction policy for proof payload material.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DecodeProofPayloadMode {
     /// Only metadata + hashes are persisted.
     HashesOnly,
@@ -80,14 +88,16 @@ pub enum DecodeProofPayloadMode {
 }
 
 /// Hash of an accepted symbol input (replay-verification artifact).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct SymbolDigest {
     pub esi: u32,
     pub digest_xxh3: u64,
 }
 
 /// Deterministic digest set for replay verification.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ProofInputHashes {
     pub metadata_xxh3: u64,
     pub source_esis_xxh3: u64,
@@ -102,7 +112,7 @@ pub struct ProofInputHashes {
 /// This is the FrankenSQLite-side proof artifact. It captures the fields
 /// specified by the spec (`object_id`, `k_source`, received ESIs, source
 /// vs repair partitions, success/failure, intermediate rank, timing, seed).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct EcsDecodeProof {
     /// Stable schema version (load-bearing for replay tooling).
     pub schema_version: u16,
@@ -146,6 +156,55 @@ pub struct EcsDecodeProof {
     pub debug_symbol_payloads: Option<Vec<Vec<u8>>>,
     /// Deterministic digest summary for replay verification.
     pub input_hashes: ProofInputHashes,
+}
+
+/// Inputs controlling proof verification behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DecodeProofVerificationConfig {
+    pub expected_schema_version: u16,
+    pub expected_policy_id: u32,
+    pub decode_success_slack: u32,
+}
+
+impl Default for DecodeProofVerificationConfig {
+    fn default() -> Self {
+        Self {
+            expected_schema_version: DECODE_PROOF_SCHEMA_VERSION_V1,
+            expected_policy_id: DEFAULT_DECODE_PROOF_POLICY_ID,
+            decode_success_slack: DEFAULT_DECODE_PROOF_SLACK,
+        }
+    }
+}
+
+/// Deterministic verifier finding item.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DecodeProofVerificationIssue {
+    pub code: String,
+    pub detail: String,
+}
+
+/// Deterministic, structured report emitted by proof verification tooling.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct DecodeProofVerificationReport {
+    pub ok: bool,
+    pub expected_schema_version: u16,
+    pub expected_policy_id: u32,
+    pub decode_success_slack: u32,
+    pub schema_version_ok: bool,
+    pub policy_id_ok: bool,
+    pub internal_consistency_ok: bool,
+    pub metadata_hash_ok: bool,
+    pub source_hash_ok: bool,
+    pub repair_hash_ok: bool,
+    pub rejected_hash_ok: bool,
+    pub symbol_digests_hash_ok: bool,
+    pub replay_verifies: bool,
+    pub decode_success_budget_ok: bool,
+    pub decode_success_expected_min_symbols: u32,
+    pub decode_success_observed_symbols: u32,
+    pub rejected_reasons_hash_or_auth_only: bool,
+    pub issues: Vec<DecodeProofVerificationIssue>,
 }
 
 impl EcsDecodeProof {
@@ -408,6 +467,129 @@ impl EcsDecodeProof {
             && self.input_hashes.rejected_symbols_xxh3 == hash_rejected_symbols(&expected_rejected)
     }
 
+    /// Verify proof integrity and emit a deterministic structured report.
+    #[must_use]
+    #[allow(clippy::too_many_lines)]
+    pub fn verification_report(
+        &self,
+        config: DecodeProofVerificationConfig,
+        symbol_digests: &[SymbolDigest],
+        rejected_symbols: &[RejectedSymbol],
+    ) -> DecodeProofVerificationReport {
+        let expected_symbol_digests = canonicalize_symbol_digests(symbol_digests.to_vec());
+        let expected_rejected = canonicalize_rejected_symbols(rejected_symbols.to_vec());
+
+        let schema_version_ok = self.schema_version == config.expected_schema_version;
+        let policy_id_ok = self.policy_id == config.expected_policy_id;
+        let internal_consistency_ok = self.is_consistent();
+        let metadata_hash_ok = self.input_hashes.metadata_xxh3 == hash_metadata(self);
+        let source_hash_ok =
+            self.input_hashes.source_esis_xxh3 == hash_u32_list("source_esis", &self.source_esis);
+        let repair_hash_ok =
+            self.input_hashes.repair_esis_xxh3 == hash_u32_list("repair_esis", &self.repair_esis);
+        let rejected_hash_ok =
+            self.input_hashes.rejected_symbols_xxh3 == hash_rejected_symbols(&expected_rejected);
+        let symbol_digests_hash_ok =
+            self.input_hashes.symbol_digests_xxh3 == hash_symbol_digests(&expected_symbol_digests);
+        let replay_verifies = self.replay_verifies(&expected_symbol_digests, &expected_rejected);
+
+        let decode_success_expected_min_symbols =
+            self.k_source.saturating_add(config.decode_success_slack);
+        let decode_success_observed_symbols =
+            u32::try_from(self.symbols_received.len()).unwrap_or(u32::MAX);
+        let decode_success_budget_ok = !self.decode_success
+            || decode_success_observed_symbols >= decode_success_expected_min_symbols;
+        let rejected_reasons_hash_or_auth_only = self.rejected_symbols.iter().all(|entry| {
+            matches!(
+                entry.reason,
+                SymbolRejectionReason::HashMismatch | SymbolRejectionReason::InvalidAuthTag
+            )
+        });
+
+        let mut issues = Vec::new();
+        if !schema_version_ok {
+            issues.push(DecodeProofVerificationIssue {
+                code: String::from("schema_version_mismatch"),
+                detail: format!(
+                    "expected {}, got {}",
+                    config.expected_schema_version, self.schema_version
+                ),
+            });
+        }
+        if !policy_id_ok {
+            issues.push(DecodeProofVerificationIssue {
+                code: String::from("policy_id_mismatch"),
+                detail: format!(
+                    "expected {}, got {}",
+                    config.expected_policy_id, self.policy_id
+                ),
+            });
+        }
+        if !internal_consistency_ok {
+            issues.push(DecodeProofVerificationIssue {
+                code: String::from("internal_consistency_failed"),
+                detail: String::from("proof failed internal consistency checks"),
+            });
+        }
+        if !metadata_hash_ok
+            || !source_hash_ok
+            || !repair_hash_ok
+            || !rejected_hash_ok
+            || !symbol_digests_hash_ok
+        {
+            issues.push(DecodeProofVerificationIssue {
+                code: String::from("hash_mismatch"),
+                detail: format!(
+                    "metadata={metadata_hash_ok} source={source_hash_ok} repair={repair_hash_ok} rejected={rejected_hash_ok} symbol_digests={symbol_digests_hash_ok}"
+                ),
+            });
+        }
+        if !replay_verifies {
+            issues.push(DecodeProofVerificationIssue {
+                code: String::from("replay_verification_failed"),
+                detail: String::from("provided digest/rejection evidence did not match proof"),
+            });
+        }
+        if !decode_success_budget_ok {
+            issues.push(DecodeProofVerificationIssue {
+                code: String::from("decode_success_budget_failed"),
+                detail: format!(
+                    "success proof had {decode_success_observed_symbols} symbols, required >= {decode_success_expected_min_symbols}",
+                ),
+            });
+        }
+        if !rejected_reasons_hash_or_auth_only {
+            issues.push(DecodeProofVerificationIssue {
+                code: String::from("rejected_reason_unsupported"),
+                detail: String::from(
+                    "rejected-symbol reasons must be hash/auth mismatch for this verifier",
+                ),
+            });
+        }
+
+        let ok = issues.is_empty();
+        DecodeProofVerificationReport {
+            ok,
+            expected_schema_version: config.expected_schema_version,
+            expected_policy_id: config.expected_policy_id,
+            decode_success_slack: config.decode_success_slack,
+            schema_version_ok,
+            policy_id_ok,
+            internal_consistency_ok,
+            metadata_hash_ok,
+            source_hash_ok,
+            repair_hash_ok,
+            rejected_hash_ok,
+            symbol_digests_hash_ok,
+            replay_verifies,
+            decode_success_budget_ok,
+            decode_success_expected_min_symbols,
+            decode_success_observed_symbols,
+            rejected_reasons_hash_or_auth_only,
+            issues,
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn from_parts(
         object_id: ObjectId,
@@ -624,6 +806,103 @@ mod tests {
 
     fn test_object_id(seed: u64) -> ObjectId {
         ObjectId::derive_from_canonical_bytes(&seed.to_le_bytes())
+    }
+
+    fn stable_proof_bytes_for_test(proof: &EcsDecodeProof) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&proof.schema_version.to_le_bytes());
+        bytes.extend_from_slice(&proof.policy_id.to_le_bytes());
+        bytes.extend_from_slice(proof.object_id.as_bytes());
+        bytes.extend_from_slice(
+            &proof
+                .changeset_id
+                .map_or([0_u8; 16], |changeset_id| changeset_id),
+        );
+        bytes.extend_from_slice(&proof.k_source.to_le_bytes());
+        bytes.extend_from_slice(&proof.repair_count.to_le_bytes());
+        bytes.extend_from_slice(&proof.symbol_size.to_le_bytes());
+        bytes.extend_from_slice(&proof.oti.unwrap_or(0).to_le_bytes());
+        bytes.extend_from_slice(&proof.seed.to_le_bytes());
+        bytes.extend_from_slice(&proof.timing_ns.to_le_bytes());
+        bytes.push(u8::from(proof.decode_success));
+        bytes.extend_from_slice(
+            &proof
+                .failure_reason
+                .map_or(255_u8, failure_reason_code)
+                .to_le_bytes(),
+        );
+        bytes.extend_from_slice(&proof.intermediate_rank.unwrap_or(u32::MAX).to_le_bytes());
+        bytes.push(match proof.payload_mode {
+            DecodeProofPayloadMode::HashesOnly => 0,
+            DecodeProofPayloadMode::IncludeBytesLabOnly => 1,
+        });
+
+        bytes.extend_from_slice(
+            &u32::try_from(proof.symbols_received.len())
+                .expect("symbols_received length fits u32")
+                .to_le_bytes(),
+        );
+        for esi in &proof.symbols_received {
+            bytes.extend_from_slice(&esi.to_le_bytes());
+        }
+
+        bytes.extend_from_slice(
+            &u32::try_from(proof.source_esis.len())
+                .expect("source_esis length fits u32")
+                .to_le_bytes(),
+        );
+        for esi in &proof.source_esis {
+            bytes.extend_from_slice(&esi.to_le_bytes());
+        }
+
+        bytes.extend_from_slice(
+            &u32::try_from(proof.repair_esis.len())
+                .expect("repair_esis length fits u32")
+                .to_le_bytes(),
+        );
+        for esi in &proof.repair_esis {
+            bytes.extend_from_slice(&esi.to_le_bytes());
+        }
+
+        bytes.extend_from_slice(
+            &u32::try_from(proof.rejected_symbols.len())
+                .expect("rejected_symbols length fits u32")
+                .to_le_bytes(),
+        );
+        for rejected in &proof.rejected_symbols {
+            bytes.extend_from_slice(&rejected.esi.to_le_bytes());
+            bytes.push(rejection_reason_code(rejected.reason));
+        }
+
+        bytes.extend_from_slice(
+            &u32::try_from(proof.symbol_digests.len())
+                .expect("symbol_digests length fits u32")
+                .to_le_bytes(),
+        );
+        for digest in &proof.symbol_digests {
+            bytes.extend_from_slice(&digest.esi.to_le_bytes());
+            bytes.extend_from_slice(&digest.digest_xxh3.to_le_bytes());
+        }
+
+        if let Some(payloads) = &proof.debug_symbol_payloads {
+            bytes.extend_from_slice(
+                &u32::try_from(payloads.len())
+                    .expect("debug payload count fits u32")
+                    .to_le_bytes(),
+            );
+            for payload in payloads {
+                bytes.extend_from_slice(
+                    &u32::try_from(payload.len())
+                        .expect("debug payload length fits u32")
+                        .to_le_bytes(),
+                );
+                bytes.extend_from_slice(payload);
+            }
+        } else {
+            bytes.extend_from_slice(&0_u32.to_le_bytes());
+        }
+
+        bytes
     }
 
     // -- §3.5.8 test 1: Decode proof creation --
@@ -951,5 +1230,245 @@ mod tests {
         assert_eq!(proof.failure_reason, Some(DecodeFailureReason::Unknown));
         assert!(!proof.decode_success);
         assert!(proof.is_consistent());
+    }
+
+    #[test]
+    fn test_decode_proof_verification_report_success() {
+        let oid = test_object_id(0xEEEE);
+        let symbol_digests = vec![
+            SymbolDigest {
+                esi: 0,
+                digest_xxh3: 10,
+            },
+            SymbolDigest {
+                esi: 1,
+                digest_xxh3: 20,
+            },
+        ];
+        let rejected = vec![RejectedSymbol {
+            esi: 9,
+            reason: SymbolRejectionReason::HashMismatch,
+        }];
+        let proof = EcsDecodeProof::from_esis(oid, 4, &[0, 1, 2, 3, 4, 5], true, Some(4), 50, 7)
+            .with_symbol_digests(symbol_digests.clone())
+            .with_rejected_symbols(rejected.clone());
+
+        let report = proof.verification_report(
+            DecodeProofVerificationConfig::default(),
+            &symbol_digests,
+            &rejected,
+        );
+        assert!(report.ok, "report should pass: {report:?}");
+        assert!(report.replay_verifies);
+        assert!(report.decode_success_budget_ok);
+        assert!(report.issues.is_empty());
+    }
+
+    #[test]
+    fn test_decode_proof_verification_report_detects_mismatch() {
+        let oid = test_object_id(0xFFFF);
+        let proof = EcsDecodeProof::from_esis(oid, 4, &[0, 1, 2, 3], true, Some(4), 90, 17)
+            .with_rejected_symbols(vec![RejectedSymbol {
+                esi: 7,
+                reason: SymbolRejectionReason::DuplicateEsi,
+            }]);
+
+        let config = DecodeProofVerificationConfig {
+            expected_schema_version: DECODE_PROOF_SCHEMA_VERSION_V1,
+            expected_policy_id: DEFAULT_DECODE_PROOF_POLICY_ID + 1,
+            decode_success_slack: DEFAULT_DECODE_PROOF_SLACK,
+        };
+        let report = proof.verification_report(config, &[], &[]);
+        let issue_codes: Vec<&str> = report
+            .issues
+            .iter()
+            .map(|issue| issue.code.as_str())
+            .collect();
+
+        assert!(!report.ok);
+        assert!(!report.policy_id_ok);
+        assert!(!report.decode_success_budget_ok);
+        assert!(!report.replay_verifies);
+        assert!(!report.rejected_reasons_hash_or_auth_only);
+        assert!(
+            issue_codes.contains(&"policy_id_mismatch"),
+            "expected policy mismatch in {issue_codes:?}"
+        );
+        assert!(
+            issue_codes.contains(&"decode_success_budget_failed"),
+            "expected decode budget mismatch in {issue_codes:?}"
+        );
+        assert!(
+            issue_codes.contains(&"replay_verification_failed"),
+            "expected replay verification mismatch in {issue_codes:?}"
+        );
+        assert!(
+            issue_codes.contains(&"rejected_reason_unsupported"),
+            "expected rejected reason mismatch in {issue_codes:?}"
+        );
+    }
+
+    // -- bd-221l proof stability + replay-verifier hardening tests --
+
+    #[test]
+    fn test_decode_proof_serialized_stability_fixed_inputs() {
+        let oid = test_object_id(0x2210);
+        let symbol_digests = vec![
+            SymbolDigest {
+                esi: 0,
+                digest_xxh3: 0xAA01,
+            },
+            SymbolDigest {
+                esi: 1,
+                digest_xxh3: 0xAA02,
+            },
+            SymbolDigest {
+                esi: 2,
+                digest_xxh3: 0xAA03,
+            },
+        ];
+        let rejected = vec![RejectedSymbol {
+            esi: 6,
+            reason: SymbolRejectionReason::HashMismatch,
+        }];
+
+        let proof_a = EcsDecodeProof::from_esis(oid, 4, &[0, 1, 2, 3, 4, 5], true, Some(4), 88, 55)
+            .with_symbol_digests(symbol_digests.clone())
+            .with_rejected_symbols(rejected.clone());
+        let proof_b = EcsDecodeProof::from_esis(oid, 4, &[0, 1, 2, 3, 4, 5], true, Some(4), 88, 55)
+            .with_symbol_digests(symbol_digests)
+            .with_rejected_symbols(rejected);
+
+        let json_a = stable_proof_bytes_for_test(&proof_a);
+        let json_b = stable_proof_bytes_for_test(&proof_b);
+        assert_eq!(
+            json_a, json_b,
+            "fixed inputs must produce byte-identical serialized proof artifacts"
+        );
+        assert!(
+            proof_a.debug_symbol_payloads.is_none(),
+            "default proof must not embed raw symbol payload bytes"
+        );
+    }
+
+    #[test]
+    fn test_decode_proof_verifier_rejects_altered_esi_list() {
+        let oid = test_object_id(0x2211);
+        let symbol_digests = vec![SymbolDigest {
+            esi: 0,
+            digest_xxh3: 0x10,
+        }];
+        let rejected = vec![RejectedSymbol {
+            esi: 9,
+            reason: SymbolRejectionReason::InvalidAuthTag,
+        }];
+        let mut tampered = EcsDecodeProof::from_esis(oid, 2, &[0, 1, 2], true, Some(2), 13, 99)
+            .with_symbol_digests(symbol_digests.clone())
+            .with_rejected_symbols(rejected.clone());
+        tampered.symbols_received.push(99);
+        let report = tampered.verification_report(
+            DecodeProofVerificationConfig::default(),
+            &symbol_digests,
+            &rejected,
+        );
+
+        let issue_codes: Vec<&str> = report
+            .issues
+            .iter()
+            .map(|issue| issue.code.as_str())
+            .collect();
+        assert!(!report.ok, "tampered ESI list must fail verification");
+        assert!(!report.internal_consistency_ok);
+        assert!(
+            issue_codes.contains(&"internal_consistency_failed"),
+            "expected consistency failure in {issue_codes:?}"
+        );
+    }
+
+    #[test]
+    fn test_decode_proof_verifier_rejects_altered_hashes() {
+        let oid = test_object_id(0x2212);
+        let symbol_digests = vec![SymbolDigest {
+            esi: 0,
+            digest_xxh3: 0x20,
+        }];
+        let rejected = vec![RejectedSymbol {
+            esi: 7,
+            reason: SymbolRejectionReason::HashMismatch,
+        }];
+        let mut tampered = EcsDecodeProof::from_esis(oid, 2, &[0, 1, 2], false, Some(2), 21, 123)
+            .with_symbol_digests(symbol_digests.clone())
+            .with_rejected_symbols(rejected.clone());
+        tampered.input_hashes.metadata_xxh3 ^= 1;
+        let report = tampered.verification_report(
+            DecodeProofVerificationConfig::default(),
+            &symbol_digests,
+            &rejected,
+        );
+
+        let issue_codes: Vec<&str> = report
+            .issues
+            .iter()
+            .map(|issue| issue.code.as_str())
+            .collect();
+        assert!(!report.ok, "tampered hash evidence must fail verification");
+        assert!(!report.metadata_hash_ok);
+        assert!(
+            issue_codes.contains(&"hash_mismatch"),
+            "expected hash mismatch issue in {issue_codes:?}"
+        );
+    }
+
+    #[test]
+    fn test_decode_proof_verifier_rejects_wrong_schema_version() {
+        let oid = test_object_id(0x2213);
+        let symbol_digests = vec![SymbolDigest {
+            esi: 0,
+            digest_xxh3: 0x30,
+        }];
+        let rejected = vec![RejectedSymbol {
+            esi: 8,
+            reason: SymbolRejectionReason::InvalidAuthTag,
+        }];
+        let mut tampered = EcsDecodeProof::from_esis(oid, 2, &[0, 1, 2], false, Some(2), 34, 77)
+            .with_symbol_digests(symbol_digests.clone())
+            .with_rejected_symbols(rejected.clone());
+        tampered.schema_version = DECODE_PROOF_SCHEMA_VERSION_V1 + 1;
+        let report = tampered.verification_report(
+            DecodeProofVerificationConfig::default(),
+            &symbol_digests,
+            &rejected,
+        );
+
+        let issue_codes: Vec<&str> = report
+            .issues
+            .iter()
+            .map(|issue| issue.code.as_str())
+            .collect();
+        assert!(!report.ok);
+        assert!(!report.schema_version_ok);
+        assert!(
+            issue_codes.contains(&"schema_version_mismatch"),
+            "expected schema mismatch issue in {issue_codes:?}"
+        );
+    }
+
+    #[test]
+    fn test_decode_proof_hashes_only_artifact_is_compact() {
+        let oid = test_object_id(0x2214);
+        let proof =
+            EcsDecodeProof::from_esis(oid, 8, &[0, 1, 2, 3, 4, 8, 9], true, Some(8), 55, 100);
+        let serialized = stable_proof_bytes_for_test(&proof);
+
+        assert_eq!(proof.payload_mode, DecodeProofPayloadMode::HashesOnly);
+        assert!(
+            proof.debug_symbol_payloads.is_none(),
+            "hashes-only mode must not include raw symbol payloads"
+        );
+        assert!(
+            serialized.len() < 1024,
+            "proof artifact unexpectedly large: {} bytes",
+            serialized.len()
+        );
     }
 }

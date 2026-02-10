@@ -411,10 +411,14 @@ mod tests {
 
             drop(fut);
 
-            for _ in 0..10_000u32 {
+            // The blocking task sleeps 20ms then drops the PageBuf.
+            // Yield in a loop with a brief real-time sleep per iteration so
+            // the blocking thread has time to finish and return the buffer.
+            for _ in 0..200u32 {
                 if pool.available() == 1 {
                     break;
                 }
+                std::thread::sleep(Duration::from_millis(1));
                 yield_now().await;
             }
             assert_eq!(

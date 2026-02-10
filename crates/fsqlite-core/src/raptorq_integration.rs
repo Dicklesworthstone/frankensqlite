@@ -12,8 +12,11 @@
 //! the operation returns `FrankenError::Abort`.
 
 use fsqlite_error::{FrankenError, Result};
-use fsqlite_types::cx::Cx;
+use fsqlite_types::{ObjectId, cx::Cx};
 use tracing::{debug, error, info, warn};
+use xxhash_rust::xxh3::xxh3_64;
+
+use crate::decode_proofs::EcsDecodeProof;
 
 const BEAD_ID: &str = "bd-1hi.5";
 
@@ -30,6 +33,44 @@ pub const MAX_PIPELINE_SYMBOL_SIZE: u32 = 65_536;
 /// Default Cx checkpoint interval (symbols between cancellation checks).
 pub const DEFAULT_CHECKPOINT_INTERVAL: u32 = 64;
 
+/// Policy surface for decode-proof emission hooks.
+///
+/// This keeps proof generation optional in production while allowing
+/// durability paths and tests to request deterministic proof artifacts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodeProofEmissionPolicy {
+    /// Emit proof records for decode failures.
+    pub emit_on_decode_failure: bool,
+    /// Emit proof records for successful decodes that required repair symbols.
+    pub emit_on_repair_success: bool,
+}
+
+impl DecodeProofEmissionPolicy {
+    /// Default production posture: proof emission disabled.
+    #[must_use]
+    pub const fn disabled() -> Self {
+        Self {
+            emit_on_decode_failure: false,
+            emit_on_repair_success: false,
+        }
+    }
+
+    /// Durability-focused posture for replication/WAL-style decode paths.
+    #[must_use]
+    pub const fn durability_critical() -> Self {
+        Self {
+            emit_on_decode_failure: true,
+            emit_on_repair_success: true,
+        }
+    }
+}
+
+impl Default for DecodeProofEmissionPolicy {
+    fn default() -> Self {
+        Self::disabled()
+    }
+}
+
 /// FrankenSQLite-side RaptorQ pipeline configuration (§3.3).
 ///
 /// Mirrors the needed subset of asupersync's `RaptorQConfig` so that
@@ -45,6 +86,8 @@ pub struct PipelineConfig {
     pub repair_overhead: f64,
     /// Symbols between `Cx::checkpoint()` calls (§4.12.1).
     pub checkpoint_interval: u32,
+    /// Decode-proof emission policy hooks (§3.5.8 / bd-faz4).
+    pub decode_proof_policy: DecodeProofEmissionPolicy,
 }
 
 impl PipelineConfig {
@@ -56,6 +99,7 @@ impl PipelineConfig {
             max_block_size: 64 * 1024,
             repair_overhead: 1.25,
             checkpoint_interval: DEFAULT_CHECKPOINT_INTERVAL,
+            decode_proof_policy: DecodeProofEmissionPolicy::default(),
         }
     }
 
@@ -244,6 +288,8 @@ pub struct DecodeSuccess {
     pub peeled_count: u32,
     /// Symbols resolved during the Gaussian elimination phase.
     pub inactivated_count: u32,
+    /// Optional decode proof emitted under policy control.
+    pub decode_proof: Option<EcsDecodeProof>,
 }
 
 /// Failed decode metadata.
@@ -255,6 +301,8 @@ pub struct DecodeFailure {
     pub symbols_received: u32,
     /// Source symbols required (K).
     pub k_required: u32,
+    /// Optional decode proof emitted under policy control.
+    pub decode_proof: Option<EcsDecodeProof>,
 }
 
 /// Reasons a decode can fail.
@@ -389,7 +437,7 @@ impl<C: SymbolCodec> RaptorQPageDecoder<C> {
     ///
     /// Reads available symbols, delegates to the codec, and returns the
     /// outcome.  Cx checkpoint is called at read boundaries.
-    #[allow(clippy::cast_possible_truncation)]
+    #[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
     pub fn decode_pages(
         &self,
         cx: &Cx,
@@ -428,6 +476,10 @@ impl<C: SymbolCodec> RaptorQPageDecoder<C> {
         let codec_result = self
             .codec
             .decode(&symbols, k_source, self.config.symbol_size)?;
+        let all_esis = canonical_esis(&symbols);
+        let proof_object_id =
+            derive_decode_proof_object_id(k_source, self.config.symbol_size, &all_esis);
+        let proof_seed = xxh3_64(proof_object_id.as_bytes());
 
         match codec_result {
             CodecDecodeResult::Success {
@@ -444,6 +496,26 @@ impl<C: SymbolCodec> RaptorQPageDecoder<C> {
                     inactivated_count,
                     "page decode succeeded"
                 );
+                let decode_proof = if self.config.decode_proof_policy.emit_on_repair_success
+                    && contains_repair_esi(&all_esis, k_source)
+                {
+                    let proof = EcsDecodeProof::from_esis(
+                        proof_object_id,
+                        k_source,
+                        &all_esis,
+                        true,
+                        Some(symbols_used),
+                        deterministic_timing_ns(k_source, self.config.symbol_size, symbols_used),
+                        proof_seed,
+                    );
+                    debug!(
+                        bead_id = "bd-faz4",
+                        symbols_used, k_source, "emitted repair-success decode proof"
+                    );
+                    Some(proof)
+                } else {
+                    None
+                };
                 if symbols_used == k_source {
                     warn!(
                         bead_id = BEAD_ID,
@@ -457,6 +529,7 @@ impl<C: SymbolCodec> RaptorQPageDecoder<C> {
                     symbols_used,
                     peeled_count,
                     inactivated_count,
+                    decode_proof,
                 }))
             }
             CodecDecodeResult::Failure {
@@ -464,6 +537,29 @@ impl<C: SymbolCodec> RaptorQPageDecoder<C> {
                 symbols_received,
                 k_required,
             } => {
+                let decode_proof = if self.config.decode_proof_policy.emit_on_decode_failure {
+                    let intermediate_rank = Some(symbols_received.min(k_required));
+                    let proof = EcsDecodeProof::from_esis(
+                        proof_object_id,
+                        k_source,
+                        &all_esis,
+                        false,
+                        intermediate_rank,
+                        deterministic_timing_ns(
+                            k_source,
+                            self.config.symbol_size,
+                            symbols_received,
+                        ),
+                        proof_seed,
+                    );
+                    debug!(
+                        bead_id = "bd-faz4",
+                        symbols_received, k_required, "emitted decode-failure proof"
+                    );
+                    Some(proof)
+                } else {
+                    None
+                };
                 error!(
                     bead_id = BEAD_ID,
                     k_source,
@@ -476,6 +572,7 @@ impl<C: SymbolCodec> RaptorQPageDecoder<C> {
                     reason,
                     symbols_received,
                     k_required,
+                    decode_proof,
                 }))
             }
         }
@@ -486,6 +583,36 @@ impl<C: SymbolCodec> RaptorQPageDecoder<C> {
     pub const fn config(&self) -> &PipelineConfig {
         &self.config
     }
+}
+
+fn canonical_esis(symbols: &[(u32, Vec<u8>)]) -> Vec<u32> {
+    let mut esis: Vec<u32> = symbols.iter().map(|(esi, _)| *esi).collect();
+    esis.sort_unstable();
+    esis.dedup();
+    esis
+}
+
+fn contains_repair_esi(esis: &[u32], k_source: u32) -> bool {
+    esis.iter().any(|&esi| esi >= k_source)
+}
+
+fn derive_decode_proof_object_id(k_source: u32, symbol_size: u32, esis: &[u32]) -> ObjectId {
+    let mut material = Vec::with_capacity(40 + esis.len() * 4);
+    material.extend_from_slice(b"fsqlite:raptorq:decode-proof:v1");
+    material.extend_from_slice(&k_source.to_le_bytes());
+    material.extend_from_slice(&symbol_size.to_le_bytes());
+    for esi in esis {
+        material.extend_from_slice(&esi.to_le_bytes());
+    }
+    ObjectId::derive_from_canonical_bytes(&material)
+}
+
+fn deterministic_timing_ns(k_source: u32, symbol_size: u32, symbols_used: u32) -> u64 {
+    let mut material = [0_u8; 12];
+    material[..4].copy_from_slice(&k_source.to_le_bytes());
+    material[4..8].copy_from_slice(&symbol_size.to_le_bytes());
+    material[8..12].copy_from_slice(&symbols_used.to_le_bytes());
+    xxh3_64(&material)
 }
 
 // ===========================================================================
@@ -1256,9 +1383,109 @@ mod tests {
                     failure.k_required, outcome.source_count,
                     "bead_id={BEAD_ID} case=decode_failure_k_required"
                 );
+                assert!(
+                    failure.decode_proof.is_none(),
+                    "bead_id={BEAD_ID} case=decode_failure_proof_disabled_by_default"
+                );
             }
             DecodeOutcome::Success(_) => {
                 panic!("bead_id={BEAD_ID} case=decode_should_have_failed");
+            }
+        }
+    }
+
+    #[test]
+    fn test_decode_failure_emits_proof_when_enabled() {
+        let mut config = default_config();
+        config.decode_proof_policy = DecodeProofEmissionPolicy {
+            emit_on_decode_failure: true,
+            emit_on_repair_success: false,
+        };
+        let encoder =
+            RaptorQPageEncoder::new(config.clone(), default_codec()).expect("encoder build");
+        let decoder =
+            RaptorQPageDecoder::new(config.clone(), default_codec()).expect("decoder build");
+        let cx = test_cx();
+        let k = 10_usize;
+        let data = deterministic_page_data(k, config.symbol_size as usize, 0xFA24);
+
+        let mut sink = VecPageSink::new();
+        let outcome = encoder
+            .encode_pages(&cx, &data, &mut sink)
+            .expect("encode must succeed");
+
+        let mut partial = BTreeMap::new();
+        for esi in 0..((k - 2) as u32) {
+            if let Some(sym) = sink.symbols.get(&esi) {
+                partial.insert(esi, sym.clone());
+            }
+        }
+        let mut source = VecPageSource::from_map(partial);
+        let decode_outcome = decoder
+            .decode_pages(&cx, &mut source, outcome.source_count)
+            .expect("decode call itself should not error");
+
+        match decode_outcome {
+            DecodeOutcome::Failure(failure) => {
+                let proof = failure
+                    .decode_proof
+                    .expect("bead_id=bd-faz4 case=decode_failure_proof_emitted");
+                assert!(
+                    !proof.decode_success,
+                    "bead_id=bd-faz4 case=decode_failure_proof_flag"
+                );
+                assert!(
+                    proof.is_consistent(),
+                    "bead_id=bd-faz4 case=decode_failure_proof_consistent"
+                );
+            }
+            DecodeOutcome::Success(_) => {
+                panic!("bead_id=bd-faz4 case=decode_failure_expected");
+            }
+        }
+    }
+
+    #[test]
+    fn test_decode_success_with_repair_emits_proof_when_enabled() {
+        let mut config = default_config();
+        config.decode_proof_policy = DecodeProofEmissionPolicy {
+            emit_on_decode_failure: false,
+            emit_on_repair_success: true,
+        };
+        let encoder =
+            RaptorQPageEncoder::new(config.clone(), default_codec()).expect("encoder build");
+        let decoder =
+            RaptorQPageDecoder::new(config.clone(), default_codec()).expect("decoder build");
+        let cx = test_cx();
+        let k = 10_usize;
+        let data = deterministic_page_data(k, config.symbol_size as usize, 0xF0AA);
+
+        let mut sink = VecPageSink::new();
+        let outcome = encoder
+            .encode_pages(&cx, &data, &mut sink)
+            .expect("encode must succeed");
+        let mut source = VecPageSource::from_sink(&sink);
+        let decode_outcome = decoder
+            .decode_pages(&cx, &mut source, outcome.source_count)
+            .expect("decode must succeed");
+
+        match decode_outcome {
+            DecodeOutcome::Success(success) => {
+                let proof = success
+                    .decode_proof
+                    .expect("bead_id=bd-faz4 case=repair_success_proof_emitted");
+                assert!(proof.decode_success);
+                assert!(proof.is_repair());
+                assert!(
+                    proof.is_consistent(),
+                    "bead_id=bd-faz4 case=repair_success_proof_consistent"
+                );
+            }
+            DecodeOutcome::Failure(failure) => {
+                panic!(
+                    "bead_id=bd-faz4 case=repair_success_should_decode reason={:?}",
+                    failure.reason
+                );
             }
         }
     }

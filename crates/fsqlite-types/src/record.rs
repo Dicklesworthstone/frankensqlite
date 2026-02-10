@@ -379,6 +379,44 @@ mod tests {
     }
 
     #[test]
+    fn test_serial_type_roundtrip_all_categories() {
+        let values = vec![
+            SqliteValue::Null,
+            SqliteValue::Integer(i64::from(i8::MIN)),
+            SqliteValue::Integer(i64::from(i16::MIN)),
+            SqliteValue::Integer(-8_388_608), // 24-bit boundary
+            SqliteValue::Integer(i64::from(i32::MIN)),
+            SqliteValue::Integer(-140_737_488_355_328), // 48-bit boundary
+            SqliteValue::Integer(i64::MIN),
+            SqliteValue::Float(-1234.5),
+            SqliteValue::Integer(0),
+            SqliteValue::Integer(1),
+            SqliteValue::Blob(vec![0xDE, 0xAD, 0xBE, 0xEF]),
+            SqliteValue::Text("serial-type-text".to_owned()),
+        ];
+
+        let encoded = serialize_record(&values);
+        let parsed = parse_record(&encoded).expect("record must decode");
+        assert_eq!(parsed.len(), values.len());
+
+        assert!(parsed[0].is_null());
+        assert_eq!(parsed[1].as_integer(), Some(i64::from(i8::MIN)));
+        assert_eq!(parsed[2].as_integer(), Some(i64::from(i16::MIN)));
+        assert_eq!(parsed[3].as_integer(), Some(-8_388_608));
+        assert_eq!(parsed[4].as_integer(), Some(i64::from(i32::MIN)));
+        assert_eq!(parsed[5].as_integer(), Some(-140_737_488_355_328));
+        assert_eq!(parsed[6].as_integer(), Some(i64::MIN));
+        assert_eq!(
+            parsed[7].as_float().map(f64::to_bits),
+            Some((-1234.5f64).to_bits())
+        );
+        assert_eq!(parsed[8].as_integer(), Some(0));
+        assert_eq!(parsed[9].as_integer(), Some(1));
+        assert_eq!(parsed[10].as_blob(), Some(&[0xDE, 0xAD, 0xBE, 0xEF][..]));
+        assert_eq!(parsed[11].as_text(), Some("serial-type-text"));
+    }
+
+    #[test]
     fn integer_size_boundaries() {
         // Verify that integers at size boundaries roundtrip correctly.
         let test_values: &[i64] = &[

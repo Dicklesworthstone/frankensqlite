@@ -515,7 +515,11 @@ name = "fsqlite-cli"
 version = "0.1.0"
 dependencies = [
  "fsqlite",
+ "fsqlite-core",
  "fsqlite-error",
+ "fsqlite-types",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -537,6 +541,8 @@ dependencies = [
  "fsqlite-vdbe",
  "fsqlite-vfs",
  "fsqlite-wal",
+ "proptest",
+ "serde",
  "tempfile",
  "tracing",
  "xxhash-rust",
@@ -755,8 +761,10 @@ dependencies = [
 name = "fsqlite-wal"
 version = "0.1.0"
 dependencies = [
+ "asupersync",
  "blake3",
  "crc32c",
+ "criterion",
  "fsqlite-error",
  "fsqlite-types",
  "fsqlite-vfs",

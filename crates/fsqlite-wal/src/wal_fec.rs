@@ -618,6 +618,8 @@ pub struct WalFecDecodeProof {
     pub available_symbols: u32,
     pub validated_source_symbols: u32,
     pub validated_repair_symbols: u32,
+    /// Count of repair symbols rejected as corrupt/mismatched during verification.
+    pub corruption_observations: u32,
     pub decode_attempted: bool,
     pub decode_succeeded: bool,
     pub recovered_frame_nos: Vec<u32>,
@@ -1270,6 +1272,7 @@ const BD_1HI_11_BEAD_ID: &str = "bd-1hi.11";
 struct WalFecRecoveryGroupRecord {
     meta: WalFecGroupMeta,
     repair_symbols: Vec<SymbolRecord>,
+    corruption_observations: u32,
 }
 
 /// Locate the commit group containing the first checksum-mismatching frame.
@@ -1396,17 +1399,20 @@ where
         &frame_payload_by_no,
         k_required,
     )?;
-    let (repair_symbols, validated_repair_symbols) =
+    let (repair_symbols, validated_repair_symbols, rejected_repair_symbols) =
         collect_valid_repair_symbols(meta, group_id, &group.repair_symbols);
     source_collection.available_symbols.extend(repair_symbols);
     source_collection
         .available_symbols
         .sort_unstable_by_key(|(esi, _)| *esi);
 
-    let mut stats = RecoveryProofStats::new(meta.k_source);
-    stats.available_symbols = usize_to_u32(source_collection.available_symbols.len());
-    stats.validated_source_symbols = source_collection.validated_source_symbols;
-    stats.validated_repair_symbols = validated_repair_symbols;
+    let mut stats = build_recovery_proof_stats(
+        meta.k_source,
+        &source_collection,
+        validated_repair_symbols,
+        rejected_repair_symbols,
+        group.corruption_observations,
+    );
 
     if source_collection.available_symbols.len() < k_required {
         error!(
@@ -1458,7 +1464,23 @@ where
         return Ok(decoded_mismatch_outcome(meta, group_id, stats));
     }
 
-    let recovered_frame_nos = recovered_frame_numbers(meta, &source_collection.source_pages);
+    Ok(finalize_decoded_success_outcome(
+        meta,
+        group_id,
+        &source_collection.source_pages,
+        decoded_pages,
+        stats,
+    ))
+}
+
+fn finalize_decoded_success_outcome(
+    meta: &WalFecGroupMeta,
+    group_id: WalFecGroupId,
+    source_pages: &[Option<Vec<u8>>],
+    decoded_pages: Vec<Vec<u8>>,
+    mut stats: RecoveryProofStats,
+) -> WalFecRecoveryOutcome {
+    let recovered_frame_nos = recovered_frame_numbers(meta, source_pages);
     let recovered_count = usize_to_u32(recovered_frame_nos.len());
     if recovered_count >= meta.r_repair.saturating_sub(1) {
         warn!(
@@ -1476,16 +1498,9 @@ where
         db_size_pages = meta.db_size_pages,
         "wal-fec recovery succeeded"
     );
-
     stats.decode_succeeded = true;
     stats.recovered_frame_nos.clone_from(&recovered_frame_nos);
-    Ok(decoded_success_outcome(
-        meta,
-        group_id,
-        decoded_pages,
-        recovered_frame_nos,
-        stats,
-    ))
+    decoded_success_outcome(meta, group_id, decoded_pages, recovered_frame_nos, stats)
 }
 
 fn insufficient_symbols_outcome(
@@ -1568,6 +1583,7 @@ struct RecoveryProofStats {
     available_symbols: u32,
     validated_source_symbols: u32,
     validated_repair_symbols: u32,
+    corruption_observations: u32,
     decode_attempted: bool,
     decode_succeeded: bool,
     recovered_frame_nos: Vec<u32>,
@@ -1580,11 +1596,28 @@ impl RecoveryProofStats {
             available_symbols: 0,
             validated_source_symbols: 0,
             validated_repair_symbols: 0,
+            corruption_observations: 0,
             decode_attempted: false,
             decode_succeeded: false,
             recovered_frame_nos: Vec::new(),
         }
     }
+}
+
+fn build_recovery_proof_stats(
+    required_symbols: u32,
+    source_collection: &SourceSymbolCollection,
+    validated_repair_symbols: u32,
+    rejected_repair_symbols: u32,
+    sidecar_corruption_observations: u32,
+) -> RecoveryProofStats {
+    let mut stats = RecoveryProofStats::new(required_symbols);
+    stats.available_symbols = usize_to_u32(source_collection.available_symbols.len());
+    stats.validated_source_symbols = source_collection.validated_source_symbols;
+    stats.validated_repair_symbols = validated_repair_symbols;
+    stats.corruption_observations =
+        sidecar_corruption_observations.saturating_add(rejected_repair_symbols);
+    stats
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1683,9 +1716,10 @@ fn collect_valid_repair_symbols(
     meta: &WalFecGroupMeta,
     group_id: WalFecGroupId,
     repair_symbols: &[SymbolRecord],
-) -> (Vec<(u32, Vec<u8>)>, u32) {
+) -> (Vec<(u32, Vec<u8>)>, u32, u32) {
     let mut validated_symbols = Vec::new();
     let mut validated_repair_symbols = 0_u32;
+    let mut rejected_repair_symbols = 0_u32;
 
     for symbol in repair_symbols {
         if !repair_symbol_matches_meta(meta, symbol) {
@@ -1695,13 +1729,18 @@ fn collect_valid_repair_symbols(
                 esi = symbol.esi,
                 "repair symbol failed metadata binding checks; excluding from decoder input"
             );
+            rejected_repair_symbols = rejected_repair_symbols.saturating_add(1);
             continue;
         }
         validated_repair_symbols = validated_repair_symbols.saturating_add(1);
         validated_symbols.push((symbol.esi, symbol.symbol_data.clone()));
     }
 
-    (validated_symbols, validated_repair_symbols)
+    (
+        validated_symbols,
+        validated_repair_symbols,
+        rejected_repair_symbols,
+    )
 }
 
 fn recovered_frame_numbers(meta: &WalFecGroupMeta, source_pages: &[Option<Vec<u8>>]) -> Vec<u32> {
@@ -1762,6 +1801,7 @@ fn scan_wal_fec_for_recovery(sidecar_path: &Path) -> Result<Vec<WalFecRecoveryGr
         };
         let meta = WalFecGroupMeta::from_record_bytes(meta_bytes)?;
         let mut repair_symbols = Vec::new();
+        let mut corruption_observations = 0_u32;
 
         let mut truncated_tail = false;
         for _ in 0..meta.r_repair {
@@ -1778,6 +1818,7 @@ fn scan_wal_fec_for_recovery(sidecar_path: &Path) -> Result<Vec<WalFecRecoveryGr
                         error = %err,
                         "invalid wal-fec repair SymbolRecord excluded from recovery set"
                     );
+                    corruption_observations = corruption_observations.saturating_add(1);
                 }
             }
         }
@@ -1787,6 +1828,7 @@ fn scan_wal_fec_for_recovery(sidecar_path: &Path) -> Result<Vec<WalFecRecoveryGr
         groups.push(WalFecRecoveryGroupRecord {
             meta,
             repair_symbols,
+            corruption_observations,
         });
     }
 
@@ -1816,6 +1858,7 @@ fn build_decode_proof(
         available_symbols: stats.available_symbols,
         validated_source_symbols: stats.validated_source_symbols,
         validated_repair_symbols: stats.validated_repair_symbols,
+        corruption_observations: stats.corruption_observations,
         decode_attempted: stats.decode_attempted,
         decode_succeeded: stats.decode_succeeded,
         recovered_frame_nos: stats.recovered_frame_nos,
@@ -1974,5 +2017,159 @@ mod tests {
 
         assert!(scan.groups.is_empty());
         assert!(!scan.truncated_tail);
+    }
+
+    // -- bd-2ha1: WalFecGroupMeta unit tests --
+
+    const BEAD_ID_2HA1: &str = "bd-2ha1";
+
+    fn make_test_init(k: u32) -> WalFecGroupMetaInit {
+        let page_size = 4096_u32;
+        WalFecGroupMetaInit {
+            wal_salt1: 0x1234_5678,
+            wal_salt2: 0xABCD_EF01,
+            start_frame_no: 1,
+            end_frame_no: k,
+            db_size_pages: 100,
+            page_size,
+            k_source: k,
+            r_repair: 2,
+            oti: Oti {
+                f: u64::from(k) * u64::from(page_size),
+                al: 0,
+                t: page_size,
+                z: 1,
+                n: 1,
+            },
+            object_id: ObjectId::from_bytes([0xAA; 16]),
+            page_numbers: (1..=k).collect(),
+            source_page_xxh3_128: (0..k)
+                .map(|i| Xxh3Checksum128 {
+                    low: u64::from(i),
+                    high: u64::from(i).wrapping_add(1),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn test_meta_roundtrip() {
+        let init = make_test_init(3);
+        let meta = WalFecGroupMeta::from_init(init).expect("from_init");
+        let serialized = meta.to_record_bytes();
+        let deserialized =
+            WalFecGroupMeta::from_record_bytes(&serialized).expect("from_record_bytes");
+
+        assert_eq!(meta, deserialized, "bead_id={BEAD_ID_2HA1} case=roundtrip");
+        eprintln!(
+            "DEBUG bead_id={BEAD_ID_2HA1} case=meta_roundtrip serialized_len={}",
+            serialized.len()
+        );
+    }
+
+    #[test]
+    fn test_meta_magic() {
+        let init = make_test_init(2);
+        let meta = WalFecGroupMeta::from_init(init).expect("from_init");
+
+        assert_eq!(
+            meta.magic, WAL_FEC_GROUP_META_MAGIC,
+            "bead_id={BEAD_ID_2HA1} case=magic expected=FSQLWFEC"
+        );
+        assert_eq!(
+            &meta.magic, b"FSQLWFEC",
+            "bead_id={BEAD_ID_2HA1} case=magic_bytes"
+        );
+
+        // Serialized form also starts with magic.
+        let bytes = meta.to_record_bytes();
+        assert_eq!(
+            &bytes[..8],
+            b"FSQLWFEC",
+            "bead_id={BEAD_ID_2HA1} case=serialized_magic"
+        );
+    }
+
+    #[test]
+    fn test_meta_invariant_k_source() {
+        let mut init = make_test_init(3);
+        // Break invariant: k_source != frame span.
+        init.k_source = 99;
+        let result = WalFecGroupMeta::from_init(init);
+        assert!(
+            result.is_err(),
+            "bead_id={BEAD_ID_2HA1} case=k_source_mismatch expected=Err"
+        );
+        eprintln!(
+            "INFO bead_id={BEAD_ID_2HA1} case=invariant_k_source error={}",
+            result.unwrap_err()
+        );
+    }
+
+    #[test]
+    fn test_meta_invariant_page_numbers_len() {
+        let mut init = make_test_init(3);
+        // Break invariant: page_numbers.len != k_source.
+        init.page_numbers.push(999);
+        let result = WalFecGroupMeta::from_init(init);
+        assert!(
+            result.is_err(),
+            "bead_id={BEAD_ID_2HA1} case=page_numbers_len_mismatch expected=Err"
+        );
+        eprintln!(
+            "WARN bead_id={BEAD_ID_2HA1} case=invariant_page_numbers_len error={}",
+            result.unwrap_err()
+        );
+    }
+
+    #[test]
+    fn test_meta_invariant_xxh3_len() {
+        let mut init = make_test_init(3);
+        // Break invariant: source_page_xxh3_128.len != k_source.
+        init.source_page_xxh3_128.pop();
+        let result = WalFecGroupMeta::from_init(init);
+        assert!(
+            result.is_err(),
+            "bead_id={BEAD_ID_2HA1} case=xxh3_len_mismatch expected=Err"
+        );
+        eprintln!(
+            "WARN bead_id={BEAD_ID_2HA1} case=invariant_xxh3_len error={}",
+            result.unwrap_err()
+        );
+    }
+
+    #[test]
+    fn test_meta_checksum_valid() {
+        let init = make_test_init(4);
+        let meta = WalFecGroupMeta::from_init(init).expect("from_init");
+        let serialized = meta.to_record_bytes();
+
+        // Deserialization validates checksum internally.
+        let result = WalFecGroupMeta::from_record_bytes(&serialized);
+        assert!(result.is_ok(), "bead_id={BEAD_ID_2HA1} case=checksum_valid");
+        eprintln!(
+            "INFO bead_id={BEAD_ID_2HA1} case=checksum_valid checksum={:#018x}",
+            meta.checksum
+        );
+    }
+
+    #[test]
+    fn test_meta_checksum_corrupt() {
+        let init = make_test_init(4);
+        let meta = WalFecGroupMeta::from_init(init).expect("from_init");
+        let mut serialized = meta.to_record_bytes();
+
+        // Flip one bit in wal_salt1 (bytes 12..16) — no invariant checks on salt
+        // fields, so this corruption is detected only by checksum mismatch.
+        serialized[12] ^= 0x01;
+
+        let result = WalFecGroupMeta::from_record_bytes(&serialized);
+        let err = result.expect_err("bead_id={BEAD_ID_2HA1} case=checksum_corrupt expected=Err");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("checksum mismatch"),
+            "bead_id={BEAD_ID_2HA1} case=checksum_corrupt expected checksum error, got: {msg}"
+        );
+        eprintln!("ERROR bead_id={BEAD_ID_2HA1} case=checksum_corrupt error={err}");
     }
 }

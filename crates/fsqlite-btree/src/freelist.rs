@@ -475,6 +475,17 @@ mod tests {
     }
 
     #[test]
+    fn test_btree_freelist_reclamation() {
+        let mut freelist = Freelist::new(200);
+        let reclaimed = PageNumber::new(150).unwrap();
+
+        freelist.deallocate(reclaimed);
+        assert_eq!(freelist.free_count(), 1);
+        assert_eq!(freelist.allocate().unwrap(), reclaimed);
+        assert_eq!(freelist.free_count(), 0);
+    }
+
+    #[test]
     fn test_read_freelist_single_trunk() {
         let mut pages: HashMap<u32, Vec<u8>> = HashMap::new();
 

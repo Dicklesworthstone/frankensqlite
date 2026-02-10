@@ -740,6 +740,21 @@ mod tests {
     }
 
     #[test]
+    fn test_sqlite_value_integer_real_comparison_equal() {
+        let int_value = SqliteValue::Integer(3);
+        let real_value = SqliteValue::Float(3.0);
+        assert_eq!(int_value.partial_cmp(&real_value), Some(Ordering::Equal));
+        assert_eq!(real_value.partial_cmp(&int_value), Some(Ordering::Equal));
+    }
+
+    #[test]
+    fn test_sqlite_value_text_to_integer_coercion() {
+        let text_value = SqliteValue::Text("123".to_owned());
+        let coerced = text_value.apply_affinity(TypeAffinity::Integer);
+        assert_eq!(coerced, SqliteValue::Integer(123));
+    }
+
+    #[test]
     fn blob_properties() {
         let v = SqliteValue::Blob(vec![0xDE, 0xAD]);
         assert_eq!(v.as_blob(), Some(&[0xDE, 0xAD][..]));

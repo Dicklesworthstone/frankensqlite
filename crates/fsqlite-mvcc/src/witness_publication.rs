@@ -1026,10 +1026,7 @@ mod tests {
             marker_store.resolve_seq_at_or_before_timestamp(3_000),
             Some(CommitSeq::new(30))
         );
-        assert_eq!(
-            marker_store.resolve_seq_at_or_before_timestamp(999),
-            None
-        );
+        assert_eq!(marker_store.resolve_seq_at_or_before_timestamp(999), None);
     }
 
     // -- §5.6.4.8 test 5: Witnesses with commit_seq < safe_gc_seq are prunable --

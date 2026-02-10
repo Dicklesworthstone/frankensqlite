@@ -1386,6 +1386,12 @@ mod tests {
     }
 
     #[test]
+    fn test_page_number_zero_rejected() {
+        assert!(PageNumber::new(0).is_none());
+        assert!(PageNumber::try_from(0u32).is_err());
+    }
+
+    #[test]
     fn page_number_valid() {
         let pn = PageNumber::new(1).unwrap();
         assert_eq!(pn.get(), 1);

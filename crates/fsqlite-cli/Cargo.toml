@@ -14,6 +14,10 @@ path = "src/main.rs"
 [dependencies]
 fsqlite = { workspace = true }
 fsqlite-error = { workspace = true }
+fsqlite-core = { workspace = true }
+fsqlite-types = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

@@ -11,18 +11,18 @@ use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::os::windows::fs::FileExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering, fence};
+use std::sync::atomic::{fence, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use advisory_lock::{AdvisoryFileLock, FileLockError, FileLockMode};
 use fsqlite_error::{FrankenError, Result};
-use fsqlite_types::LockLevel;
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::{AccessFlags, SyncFlags, VfsOpenFlags};
+use fsqlite_types::LockLevel;
 use tracing::{debug, error, info, warn};
 
 use crate::shm::{
-    SQLITE_SHM_EXCLUSIVE, SQLITE_SHM_LOCK, SQLITE_SHM_SHARED, SQLITE_SHM_UNLOCK, ShmRegion,
+    ShmRegion, SQLITE_SHM_EXCLUSIVE, SQLITE_SHM_LOCK, SQLITE_SHM_SHARED, SQLITE_SHM_UNLOCK,
     WAL_TOTAL_LOCKS,
 };
 use crate::traits::{Vfs, VfsFile};
@@ -1200,10 +1200,11 @@ mod tests {
         assert!(file_b.lock(&cx, LockLevel::Reserved).is_err());
         assert!(file_b.check_reserved_lock(&cx).expect("check"));
 
+        file_b.unlock(&cx, LockLevel::None).expect("unlock B");
         file_a.lock(&cx, LockLevel::Pending).expect("pending");
         assert!(file_b.lock(&cx, LockLevel::Shared).is_err());
 
-        file_b.unlock(&cx, LockLevel::None).expect("unlock B");
+        file_b.unlock(&cx, LockLevel::None).expect("unlock B no-op");
         file_a.lock(&cx, LockLevel::Exclusive).expect("exclusive");
         file_a.unlock(&cx, LockLevel::None).expect("unlock A");
         assert!(!file_b.check_reserved_lock(&cx).expect("check"));

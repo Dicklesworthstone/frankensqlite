@@ -98,6 +98,8 @@ pub const MIN_ATTEMPTS_FOR_ALERT: u64 = 128;
 pub enum RedundancyTrigger {
     /// Automatic escalation after anytime-valid bound rejection.
     EprocessReject,
+    /// Conservative auto-decrease after long stable operation.
+    EprocessSafeDecrease,
     /// Explicit operator/diagnostic retune.
     Manual,
 }
@@ -106,6 +108,7 @@ impl fmt::Display for RedundancyTrigger {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EprocessReject => write!(f, "eprocess_reject"),
+            Self::EprocessSafeDecrease => write!(f, "eprocess_safe_decrease"),
             Self::Manual => write!(f, "manual"),
         }
     }
@@ -1024,6 +1027,12 @@ pub struct AdaptiveRedundancyPolicy {
     pub overhead_min: u32,
     /// Maximum allowed overhead percentage.
     pub overhead_max: u32,
+    /// Optional safe-decrease bound for conservative `p_upper`.
+    pub p_upper_safe_decrease_budget: f64,
+    /// Minimum samples required before safe decrease is considered.
+    pub safe_decrease_min_attempts: u64,
+    /// Fixed percentage-point step when safe decrease is applied.
+    pub safe_decrease_step_percent: u32,
     /// Warn-only upper bound for conservative `p_upper`.
     pub p_upper_warn_budget: f64,
     /// Alert threshold for conservative `p_upper`.
@@ -1037,6 +1046,9 @@ impl Default for AdaptiveRedundancyPolicy {
         Self {
             overhead_min: 5,
             overhead_max: 200,
+            p_upper_safe_decrease_budget: 0.005,
+            safe_decrease_min_attempts: 2_048,
+            safe_decrease_step_percent: 5,
             p_upper_warn_budget: 0.08,
             p_upper_alert_budget: 0.15,
             p_upper_violation_budget: 0.50,
@@ -1070,49 +1082,38 @@ pub struct RedundancyAutopilotDecision {
 }
 
 impl AdaptiveRedundancyPolicy {
-    /// Evaluate adaptive redundancy policy using the anytime-valid bound
-    /// (`p_upper`) as the hard guardrail.
-    #[must_use]
-    pub fn evaluate(
+    fn maybe_safe_decrease(
         &self,
         current_overhead_percent: u32,
         k_source: u32,
         state: FailureEProcessState,
         regime_id: u64,
     ) -> Option<RedundancyAutopilotDecision> {
-        debug!(
+        if state.p_upper > self.p_upper_safe_decrease_budget
+            || state.total_attempts < self.safe_decrease_min_attempts
+            || current_overhead_percent <= self.overhead_min
+        {
+            return None;
+        }
+
+        let decrease_step = self.safe_decrease_step_percent.max(1);
+        let new_overhead_percent = current_overhead_percent
+            .saturating_sub(decrease_step)
+            .max(self.overhead_min);
+        let trigger = RedundancyTrigger::EprocessSafeDecrease;
+
+        info!(
             bead_id = ADAPTIVE_REDUNDANCY_BEAD_ID,
             logging_standard = ADAPTIVE_REDUNDANCY_LOGGING_STANDARD,
             old_overhead = current_overhead_percent,
+            new_overhead = new_overhead_percent,
+            trigger = %trigger,
             regime_id,
             p_upper = state.p_upper,
-            e_value = state.e_value,
-            "adaptive redundancy policy evaluation"
+            total_attempts = state.total_attempts,
+            "adaptive redundancy conservative decrease applied"
         );
 
-        if state.p_upper <= self.p_upper_warn_budget {
-            return None;
-        }
-
-        if state.p_upper <= self.p_upper_alert_budget {
-            warn!(
-                bead_id = ADAPTIVE_REDUNDANCY_BEAD_ID,
-                logging_standard = ADAPTIVE_REDUNDANCY_LOGGING_STANDARD,
-                old_overhead = current_overhead_percent,
-                regime_id,
-                p_upper = state.p_upper,
-                warn_budget = self.p_upper_warn_budget,
-                alert_budget = self.p_upper_alert_budget,
-                "entering durable-but-not-repairable warning window"
-            );
-            return None;
-        }
-
-        let new_overhead_percent = current_overhead_percent
-            .saturating_mul(2)
-            .max(self.overhead_min)
-            .min(self.overhead_max);
-        let trigger = RedundancyTrigger::EprocessReject;
         let evidence_entry = record_overhead_retune_with_context(
             k_source,
             &RepairConfig::with_overhead(current_overhead_percent),
@@ -1122,7 +1123,35 @@ impl AdaptiveRedundancyPolicy {
             regime_id,
             state.p_upper,
         );
+
+        Some(RedundancyAutopilotDecision {
+            old_overhead_percent: current_overhead_percent,
+            new_overhead_percent,
+            trigger,
+            regime_id,
+            p_upper: state.p_upper,
+            e_value: state.e_value,
+            retroactive_hardening_enqueued: false,
+            integrity_sweeps_escalated: false,
+            durability_contract_violated: false,
+            evidence_entry,
+        })
+    }
+
+    fn hardening_decision(
+        &self,
+        current_overhead_percent: u32,
+        k_source: u32,
+        state: FailureEProcessState,
+        regime_id: u64,
+    ) -> RedundancyAutopilotDecision {
+        let new_overhead_percent = current_overhead_percent
+            .saturating_mul(2)
+            .max(self.overhead_min)
+            .min(self.overhead_max);
+        let trigger = RedundancyTrigger::EprocessReject;
         let durability_contract_violated = state.p_upper > self.p_upper_violation_budget;
+
         if durability_contract_violated {
             error!(
                 bead_id = ADAPTIVE_REDUNDANCY_BEAD_ID,
@@ -1148,7 +1177,17 @@ impl AdaptiveRedundancyPolicy {
             "adaptive redundancy policy change applied"
         );
 
-        Some(RedundancyAutopilotDecision {
+        let evidence_entry = record_overhead_retune_with_context(
+            k_source,
+            &RepairConfig::with_overhead(current_overhead_percent),
+            new_overhead_percent,
+            state.e_value,
+            trigger,
+            regime_id,
+            state.p_upper,
+        );
+
+        RedundancyAutopilotDecision {
             old_overhead_percent: current_overhead_percent,
             new_overhead_percent,
             trigger,
@@ -1159,7 +1198,54 @@ impl AdaptiveRedundancyPolicy {
             integrity_sweeps_escalated: true,
             durability_contract_violated,
             evidence_entry,
-        })
+        }
+    }
+
+    /// Evaluate adaptive redundancy policy using the anytime-valid bound
+    /// (`p_upper`) as the hard guardrail.
+    #[must_use]
+    pub fn evaluate(
+        &self,
+        current_overhead_percent: u32,
+        k_source: u32,
+        state: FailureEProcessState,
+        regime_id: u64,
+    ) -> Option<RedundancyAutopilotDecision> {
+        debug!(
+            bead_id = ADAPTIVE_REDUNDANCY_BEAD_ID,
+            logging_standard = ADAPTIVE_REDUNDANCY_LOGGING_STANDARD,
+            old_overhead = current_overhead_percent,
+            regime_id,
+            p_upper = state.p_upper,
+            e_value = state.e_value,
+            "adaptive redundancy policy evaluation"
+        );
+
+        if let Some(decision) =
+            self.maybe_safe_decrease(current_overhead_percent, k_source, state, regime_id)
+        {
+            return Some(decision);
+        }
+
+        if state.p_upper <= self.p_upper_warn_budget {
+            return None;
+        }
+
+        if state.p_upper <= self.p_upper_alert_budget {
+            warn!(
+                bead_id = ADAPTIVE_REDUNDANCY_BEAD_ID,
+                logging_standard = ADAPTIVE_REDUNDANCY_LOGGING_STANDARD,
+                old_overhead = current_overhead_percent,
+                regime_id,
+                p_upper = state.p_upper,
+                warn_budget = self.p_upper_warn_budget,
+                alert_budget = self.p_upper_alert_budget,
+                "entering durable-but-not-repairable warning window"
+            );
+            return None;
+        }
+
+        Some(self.hardening_decision(current_overhead_percent, k_source, state, regime_id))
     }
 }
 
@@ -1420,6 +1506,106 @@ mod tests {
         assert_eq!(b.policy_epoch, 7);
     }
 
+    fn simulate_decode_with_losses(
+        k_source: u32,
+        config: &RepairConfig,
+        losses: u32,
+    ) -> (bool, u32, u32) {
+        let budget = compute_repair_budget(k_source, config);
+        let total_symbols = budget.k_source.saturating_add(budget.repair_count);
+        let received = total_symbols.saturating_sub(losses.min(total_symbols));
+        let required = budget.k_source.saturating_add(config.slack_decode);
+        (received >= required, received, required)
+    }
+
+    #[test]
+    fn test_bd_166a_mapping_invariants_and_small_k_clamps() {
+        for overhead in [1_u32, 5, 20, 33, 100] {
+            let config = RepairConfig::with_overhead(overhead);
+
+            for k in 1..=config.small_k_clamp_max_k {
+                let budget = compute_repair_budget(k, &config);
+                assert!(budget.repair_count >= config.small_k_min_repair);
+                assert!(budget.repair_count >= config.slack_decode);
+                assert!(!budget.underprovisioned);
+            }
+
+            let start = config.small_k_clamp_max_k.saturating_add(1);
+            let mut prev = compute_repair_budget(start, &config).repair_count;
+            assert!(prev >= config.slack_decode);
+
+            for k in start.saturating_add(1)..=512 {
+                let budget = compute_repair_budget(k, &config);
+                assert!(
+                    budget.repair_count >= prev,
+                    "repair count must be monotone above small-k clamp boundary: overhead={overhead} k={k} prev={prev} curr={}",
+                    budget.repair_count
+                );
+                assert!(budget.repair_count >= config.slack_decode);
+                prev = budget.repair_count;
+            }
+        }
+    }
+
+    #[test]
+    fn test_bd_166a_rounding_matches_ceil_rule() {
+        for (k_source, overhead_percent) in [(9_u32, 25_u32), (11, 33), (101, 17), (257, 7)] {
+            let config = RepairConfig::with_overhead(overhead_percent);
+            let budget = compute_repair_budget(k_source, &config);
+
+            let rounded = (u64::from(k_source) * u64::from(overhead_percent)).div_ceil(100);
+            let rounded = u32::try_from(rounded).expect("rounded repair count must fit u32");
+            let expected = rounded.max(config.slack_decode);
+            assert_eq!(
+                budget.repair_count, expected,
+                "repair count must follow ceil mapping for k={k_source} overhead={overhead_percent}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_bd_166a_loss_simulation_within_budget_succeeds() {
+        for (k_source, overhead_percent) in [(32_u32, 20_u32), (128, 25), (512, 33)] {
+            let config = RepairConfig::with_overhead(overhead_percent);
+            let budget = compute_repair_budget(k_source, &config);
+            let tolerated_losses = budget.repair_count.saturating_sub(config.slack_decode);
+
+            let (success, received, required) =
+                simulate_decode_with_losses(k_source, &config, tolerated_losses);
+            assert!(
+                success,
+                "decode should succeed at tolerated erasure bound: k={k_source} overhead={overhead_percent} received={received} required={required}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_bd_166a_loss_simulation_beyond_budget_emits_artifact() {
+        let k_source = 128;
+        let config = RepairConfig::with_overhead(20);
+        let budget = compute_repair_budget(k_source, &config);
+        let tolerated_losses = budget.repair_count.saturating_sub(config.slack_decode);
+        let losses = tolerated_losses.saturating_add(1);
+
+        let (success, received, required) = simulate_decode_with_losses(k_source, &config, losses);
+        assert!(
+            !success,
+            "decode should fail beyond tolerance: losses={losses} received={received} required={required}"
+        );
+
+        let state = make_state_with_counts(0.25, 37.0, 10_000, 1_000);
+        let decision = AdaptiveRedundancyPolicy::default()
+            .evaluate(config.overhead_percent, k_source, state, 166)
+            .expect("failure above budget should trigger explainable hardening decision");
+        assert_eq!(decision.trigger, RedundancyTrigger::EprocessReject);
+        assert_eq!(
+            decision.evidence_entry.trigger,
+            RedundancyTrigger::EprocessReject
+        );
+        assert_eq!(decision.evidence_entry.regime_id, 166);
+        assert!(decision.evidence_entry.p_upper > 0.15);
+    }
+
     #[test]
     fn test_object_policy_defaults_stricter_for_commit_artifacts() {
         let marker = ObjectRepairPolicy::for_class(RepairObjectClass::CommitMarker);
@@ -1653,10 +1839,19 @@ mod tests {
     }
 
     fn make_state(p_upper: f64, e_value: f64) -> FailureEProcessState {
+        make_state_with_counts(p_upper, e_value, 256, 64)
+    }
+
+    fn make_state_with_counts(
+        p_upper: f64,
+        e_value: f64,
+        total_attempts: u64,
+        total_failures: u64,
+    ) -> FailureEProcessState {
         FailureEProcessState {
             e_value,
-            total_attempts: 256,
-            total_failures: 64,
+            total_attempts,
+            total_failures,
             null_rate: 0.02,
             alert_threshold: DEFAULT_FAILURE_ALERT_THRESHOLD,
             p_upper,
@@ -1732,12 +1927,56 @@ mod tests {
     }
 
     #[test]
+    fn test_redundancy_safe_regime_stays_stable() {
+        let policy = AdaptiveRedundancyPolicy::default();
+        let state = make_state_with_counts(0.01, 0.8, 10_000, 1);
+        let decision = policy.evaluate(40, 100, state, 91);
+        assert!(
+            decision.is_none(),
+            "safe regime below warn budget should not thrash overhead policy"
+        );
+    }
+
+    #[test]
+    fn test_redundancy_safe_decrease_requires_strong_evidence() {
+        let policy = AdaptiveRedundancyPolicy::default();
+        let state = make_state_with_counts(0.001, 0.2, 1_024, 0);
+        let decision = policy.evaluate(80, 100, state, 92);
+        assert!(
+            decision.is_none(),
+            "safe decrease must wait for minimum-sample confidence"
+        );
+    }
+
+    #[test]
+    fn test_redundancy_safe_decrease_is_conservative_and_explainable() {
+        let policy = AdaptiveRedundancyPolicy::default();
+        let state = make_state_with_counts(0.001, 0.2, 10_000, 0);
+        let decision = policy
+            .evaluate(80, 100, state, 93)
+            .expect("very stable regime should permit conservative decrease");
+        assert_eq!(decision.trigger, RedundancyTrigger::EprocessSafeDecrease);
+        assert!(decision.new_overhead_percent < decision.old_overhead_percent);
+        assert_eq!(decision.new_overhead_percent, 75);
+        assert!(!decision.retroactive_hardening_enqueued);
+        assert!(!decision.integrity_sweeps_escalated);
+        assert_eq!(
+            decision.evidence_entry.trigger,
+            RedundancyTrigger::EprocessSafeDecrease
+        );
+        assert_eq!(decision.evidence_entry.regime_id, 93);
+    }
+
+    #[test]
     fn test_bd_1hi_30_unit_compliance_gate() {
         assert_eq!(ADAPTIVE_REDUNDANCY_BEAD_ID, "bd-1hi.30");
         assert_eq!(ADAPTIVE_REDUNDANCY_LOGGING_STANDARD, "bd-1fpm");
         let policy = AdaptiveRedundancyPolicy::default();
         assert!(policy.overhead_min > 0);
         assert!(policy.overhead_max >= policy.overhead_min);
+        assert!(policy.safe_decrease_step_percent > 0);
+        assert!(policy.safe_decrease_min_attempts >= 1_024);
+        assert!(policy.p_upper_warn_budget > policy.p_upper_safe_decrease_budget);
         assert!(policy.p_upper_alert_budget > policy.p_upper_warn_budget);
     }
 

@@ -31,7 +31,27 @@ pub const CHANGESET_VERSION: u16 = 1;
 pub const CHANGESET_DOMAIN: &str = "fsqlite:replication:changeset:v1";
 
 /// Replication packet header size (bytes).
-pub const REPLICATION_HEADER_SIZE: usize = 24;
+pub const REPLICATION_HEADER_SIZE: usize = 72;
+
+/// Legacy replication header size from bd-1hi.13 (bytes).
+pub const REPLICATION_HEADER_SIZE_LEGACY: usize = 24;
+
+/// Protocol magic for the fixed-size replication packet header.
+pub const REPLICATION_PROTOCOL_MAGIC: [u8; 4] = *b"FSRP";
+
+/// Current fixed-header packet protocol version.
+pub const REPLICATION_PROTOCOL_VERSION_V2: u8 = 2;
+
+/// Fixed-size V2 replication header length encoded on wire.
+pub const REPLICATION_HEADER_SIZE_V2: usize = REPLICATION_HEADER_SIZE;
+/// Fixed-size V2 replication header length encoded on wire (`u16` form).
+pub const REPLICATION_HEADER_SIZE_V2_U16: u16 = 72;
+
+/// Header flag: packet carries an authentication tag.
+pub const REPLICATION_FLAG_AUTH_PRESENT: u8 = 0b0000_0001;
+
+/// Domain separator for packet authentication tags.
+pub const REPLICATION_PACKET_AUTH_DOMAIN: &str = "fsqlite:replication:packet-auth:v1";
 
 /// Maximum UDP application payload (IPv4).
 pub const MAX_UDP_PAYLOAD: usize = 65_507;
@@ -40,8 +60,8 @@ pub const MAX_UDP_PAYLOAD: usize = 65_507;
 pub const MAX_REPLICATION_SYMBOL_SIZE: usize = MAX_UDP_PAYLOAD - REPLICATION_HEADER_SIZE;
 
 /// Recommended MTU-safe symbol size for Ethernet.
-/// 1500 MTU - 20 IPv4 - 8 UDP - 24 replication header = 1448.
-pub const MTU_SAFE_SYMBOL_SIZE: u16 = 1448;
+/// 1500 MTU - 20 IPv4 - 8 UDP - 72 replication header = 1400.
+pub const MTU_SAFE_SYMBOL_SIZE: u16 = 1400;
 
 /// Default maximum ISI multiplier for streaming stop.
 pub const DEFAULT_MAX_ISI_MULTIPLIER: u32 = 2;
@@ -524,10 +544,50 @@ pub fn derive_seed_from_changeset_id(id: &ChangesetId) -> u64 {
     xxhash_rust::xxh3::xxh3_64(id.as_bytes())
 }
 
+/// Compute `K_source = ceil(F / T_replication)` for a payload length `F`.
+///
+/// This is the normative symbol-count mapping for replication object sizing.
+///
+/// # Errors
+///
+/// Returns `FrankenError::OutOfRange` if `symbol_size` is 0.
+pub fn compute_k_source(total_bytes: usize, symbol_size: u16) -> Result<u64> {
+    if symbol_size == 0 {
+        return Err(FrankenError::OutOfRange {
+            what: "symbol_size".to_owned(),
+            value: "0".to_owned(),
+        });
+    }
+    let f = u64::try_from(total_bytes).map_err(|_| FrankenError::OutOfRange {
+        what: "total_bytes".to_owned(),
+        value: total_bytes.to_string(),
+    })?;
+    let t = u64::from(symbol_size);
+    Ok(f.div_ceil(t))
+}
+
+/// Canonicalize page entries for deterministic `changeset_bytes`.
+///
+/// Sorting by page number is the primary key. Tie-breakers remove dependence
+/// on input iteration order (e.g., hash-map traversal) for duplicate page
+/// numbers.
+fn canonicalize_changeset_pages(pages: &mut [PageEntry]) {
+    pages.sort_by(|lhs, rhs| {
+        lhs.page_number
+            .cmp(&rhs.page_number)
+            .then_with(|| lhs.page_xxh3.cmp(&rhs.page_xxh3))
+            .then_with(|| lhs.page_bytes.cmp(&rhs.page_bytes))
+    });
+}
+
 /// Encode pages into a deterministic changeset byte stream.
 ///
-/// Pages are sorted by `page_number` ascending. The result is self-delimiting
-/// via the `total_len` field in the header.
+/// Canonicalization rule:
+/// - sort pages by `(page_number, page_xxh3, page_bytes)` before encoding.
+/// - this removes non-deterministic map-iteration effects from `changeset_bytes`.
+///
+/// The encoded stream is self-delimiting via the `total_len` field in the
+/// header.
 ///
 /// # Errors
 ///
@@ -546,8 +606,7 @@ pub fn encode_changeset(page_size: u32, pages: &mut [PageEntry]) -> Result<Vec<u
         });
     }
 
-    // Sort by page_number ascending (normative requirement).
-    pages.sort_by_key(|p| p.page_number);
+    canonicalize_changeset_pages(pages);
 
     let n_pages = u32::try_from(pages.len()).map_err(|_| FrankenError::OutOfRange {
         what: "n_pages".to_owned(),
@@ -605,20 +664,21 @@ pub struct ChangesetShard {
 ///
 /// If the changeset fits in one block, returns a single shard.
 ///
+/// Large changesets use deterministic contiguous byte-range sharding:
+/// - max shard payload = `K_MAX * T_replication`
+/// - shard `i` = bytes `[i * max_payload .. min((i+1) * max_payload, F))`
+/// - each shard gets its own `changeset_id` and seed derived from shard bytes
+///
 /// # Errors
 ///
 /// Returns error if `symbol_size` is 0.
 pub fn shard_changeset(changeset_bytes: Vec<u8>, symbol_size: u16) -> Result<Vec<ChangesetShard>> {
-    if symbol_size == 0 {
-        return Err(FrankenError::OutOfRange {
-            what: "symbol_size".to_owned(),
-            value: "0".to_owned(),
-        });
-    }
-
     let t = u64::from(symbol_size);
-    let f = changeset_bytes.len() as u64;
-    let k_source_total = f.div_ceil(t);
+    let f = u64::try_from(changeset_bytes.len()).map_err(|_| FrankenError::OutOfRange {
+        what: "changeset_bytes".to_owned(),
+        value: changeset_bytes.len().to_string(),
+    })?;
+    let k_source_total = compute_k_source(changeset_bytes.len(), symbol_size)?;
 
     if k_source_total <= u64::from(K_MAX) {
         let id = compute_changeset_id(&changeset_bytes);
@@ -660,7 +720,7 @@ pub fn shard_changeset(changeset_bytes: Vec<u8>, symbol_size: u16) -> Result<Vec
         let shard_bytes = chunk.to_vec();
         let id = compute_changeset_id(&shard_bytes);
         let seed = derive_seed_from_changeset_id(&id);
-        let k = (chunk.len() as u64).div_ceil(t);
+        let k = compute_k_source(chunk.len(), symbol_size)?;
         let k_source = u32::try_from(k).expect("each shard <= K_MAX symbols");
 
         debug!(
@@ -689,6 +749,8 @@ pub fn shard_changeset(changeset_bytes: Vec<u8>, symbol_size: u16) -> Result<Vec
 /// Replication packet: big-endian header + little-endian symbol payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplicationPacket {
+    /// Packet framing format.
+    pub wire_version: ReplicationWireVersion,
     /// 16-byte changeset identifier for multiplexing.
     pub changeset_id: ChangesetId,
     /// Source block number (MUST be 0 in V1).
@@ -697,11 +759,108 @@ pub struct ReplicationPacket {
     pub esi: u32,
     /// Number of source symbols.
     pub k_source: u32,
+    /// Number of planned repair symbols for this stream configuration.
+    pub r_repair: u32,
+    /// Symbol size T encoded on wire.
+    pub symbol_size_t: u16,
+    /// Deterministic seed for the object's symbol schedule.
+    pub seed: u64,
+    /// Integrity hash over `symbol_data`.
+    pub payload_xxh3: u64,
+    /// Optional authenticated tag for security mode.
+    pub auth_tag: Option<[u8; 16]>,
     /// Symbol data (T bytes).
     pub symbol_data: Vec<u8>,
 }
 
+/// Packet framing versions for compatibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplicationWireVersion {
+    /// Legacy bd-1hi.13 packet layout (24-byte header).
+    LegacyV1,
+    /// Fixed-size versioned packet header with integrity/auth metadata.
+    FramedV2,
+}
+
+/// Metadata carried in a versioned V2 replication packet header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplicationPacketV2Header {
+    pub changeset_id: ChangesetId,
+    pub sbn: u8,
+    pub esi: u32,
+    pub k_source: u32,
+    pub r_repair: u32,
+    pub symbol_size_t: u16,
+    pub seed: u64,
+}
+
 impl ReplicationPacket {
+    /// Create a versioned fixed-header packet and compute payload integrity hash.
+    #[must_use]
+    pub fn new_v2(header: ReplicationPacketV2Header, symbol_data: Vec<u8>) -> Self {
+        let payload_xxh3 = Self::compute_payload_xxh3(&symbol_data);
+        Self {
+            wire_version: ReplicationWireVersion::FramedV2,
+            changeset_id: header.changeset_id,
+            sbn: header.sbn,
+            esi: header.esi,
+            k_source: header.k_source,
+            r_repair: header.r_repair,
+            symbol_size_t: header.symbol_size_t,
+            seed: header.seed,
+            payload_xxh3,
+            auth_tag: None,
+            symbol_data,
+        }
+    }
+
+    /// Compute packet payload hash.
+    #[must_use]
+    pub fn compute_payload_xxh3(symbol_data: &[u8]) -> u64 {
+        xxhash_rust::xxh3::xxh3_64(symbol_data)
+    }
+
+    fn auth_material(&self) -> Vec<u8> {
+        let mut material = Vec::with_capacity(16 + 1 + 4 + 4 + 2 + 8 + 8);
+        material.extend_from_slice(self.changeset_id.as_bytes());
+        material.push(self.sbn);
+        material.extend_from_slice(&self.esi.to_be_bytes());
+        material.extend_from_slice(&self.k_source.to_be_bytes());
+        material.extend_from_slice(&self.r_repair.to_be_bytes());
+        material.extend_from_slice(&self.symbol_size_t.to_be_bytes());
+        material.extend_from_slice(&self.seed.to_be_bytes());
+        material.extend_from_slice(&self.payload_xxh3.to_be_bytes());
+        material
+    }
+
+    fn compute_auth_tag(&self, auth_key: &[u8; 32]) -> [u8; 16] {
+        let mut hasher = blake3::Hasher::new_keyed(auth_key);
+        hasher.update(REPLICATION_PACKET_AUTH_DOMAIN.as_bytes());
+        hasher.update(&self.auth_material());
+        let digest = hasher.finalize();
+        let mut out = [0_u8; 16];
+        out.copy_from_slice(&digest.as_bytes()[..16]);
+        out
+    }
+
+    /// Attach an auth tag for authenticated transport mode.
+    pub fn attach_auth_tag(&mut self, auth_key: &[u8; 32]) {
+        self.auth_tag = Some(self.compute_auth_tag(auth_key));
+    }
+
+    /// Verify payload hash and optional auth tag.
+    #[must_use]
+    pub fn verify_integrity(&self, auth_key: Option<&[u8; 32]>) -> bool {
+        if Self::compute_payload_xxh3(&self.symbol_data) != self.payload_xxh3 {
+            return false;
+        }
+        match (self.auth_tag, auth_key) {
+            (Some(tag), Some(key)) => tag == self.compute_auth_tag(key),
+            (Some(_), None) => false,
+            (None, _) => true,
+        }
+    }
+
     /// Validate the symbol size against the hard wire limit.
     ///
     /// # Errors
@@ -735,23 +894,59 @@ impl ReplicationPacket {
                 value: self.esi.to_string(),
             });
         }
+        if usize::from(self.symbol_size_t) != self.symbol_data.len() {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "symbol_size_t mismatch: header={}, payload={}",
+                    self.symbol_size_t,
+                    self.symbol_data.len()
+                ),
+            });
+        }
         Self::validate_symbol_size(self.symbol_data.len())?;
 
-        let total = REPLICATION_HEADER_SIZE + self.symbol_data.len();
-        let mut buf = Vec::with_capacity(total);
-
-        // Header (big-endian / network byte order)
-        buf.extend_from_slice(self.changeset_id.as_bytes()); // 16 bytes
-        buf.push(self.sbn); // 1 byte
-        // ESI as u24 big-endian (3 bytes)
-        let esi_bytes = self.esi.to_be_bytes(); // [0, high, mid, low]
-        buf.extend_from_slice(&esi_bytes[1..4]); // 3 bytes
-        buf.extend_from_slice(&self.k_source.to_be_bytes()); // 4 bytes
-
-        // Payload (little-endian symbol data)
-        buf.extend_from_slice(&self.symbol_data);
-
-        Ok(buf)
+        match self.wire_version {
+            ReplicationWireVersion::LegacyV1 => {
+                let total = REPLICATION_HEADER_SIZE_LEGACY + self.symbol_data.len();
+                let mut buf = Vec::with_capacity(total);
+                buf.extend_from_slice(self.changeset_id.as_bytes());
+                buf.push(self.sbn);
+                let esi_bytes = self.esi.to_be_bytes();
+                buf.extend_from_slice(&esi_bytes[1..4]);
+                buf.extend_from_slice(&self.k_source.to_be_bytes());
+                buf.extend_from_slice(&self.symbol_data);
+                Ok(buf)
+            }
+            ReplicationWireVersion::FramedV2 => {
+                let total = REPLICATION_HEADER_SIZE + self.symbol_data.len();
+                let mut buf = Vec::with_capacity(total);
+                let mut flags = 0_u8;
+                if self.auth_tag.is_some() {
+                    flags |= REPLICATION_FLAG_AUTH_PRESENT;
+                }
+                buf.extend_from_slice(&REPLICATION_PROTOCOL_MAGIC);
+                buf.push(REPLICATION_PROTOCOL_VERSION_V2);
+                buf.push(flags);
+                buf.extend_from_slice(&REPLICATION_HEADER_SIZE_V2_U16.to_be_bytes());
+                buf.extend_from_slice(self.changeset_id.as_bytes());
+                buf.push(self.sbn);
+                let esi_bytes = self.esi.to_be_bytes();
+                buf.extend_from_slice(&esi_bytes[1..4]);
+                buf.extend_from_slice(&self.k_source.to_be_bytes());
+                buf.extend_from_slice(&self.r_repair.to_be_bytes());
+                buf.extend_from_slice(&self.symbol_size_t.to_be_bytes());
+                buf.extend_from_slice(&0_u16.to_be_bytes()); // reserved
+                buf.extend_from_slice(&self.seed.to_be_bytes());
+                buf.extend_from_slice(&self.payload_xxh3.to_be_bytes());
+                if let Some(tag) = self.auth_tag {
+                    buf.extend_from_slice(&tag);
+                } else {
+                    buf.extend_from_slice(&[0_u8; 16]);
+                }
+                buf.extend_from_slice(&self.symbol_data);
+                Ok(buf)
+            }
+        }
     }
 
     /// Decode from wire format.
@@ -760,33 +955,98 @@ impl ReplicationPacket {
     ///
     /// Returns error if buffer is too short.
     pub fn from_bytes(buf: &[u8]) -> Result<Self> {
-        if buf.len() < REPLICATION_HEADER_SIZE {
+        if buf.len() < REPLICATION_HEADER_SIZE_LEGACY {
             return Err(FrankenError::DatabaseCorrupt {
                 detail: format!(
-                    "replication packet too short: {} < {REPLICATION_HEADER_SIZE}",
+                    "replication packet too short: {} < {REPLICATION_HEADER_SIZE_LEGACY}",
                     buf.len()
                 ),
+            });
+        }
+        let is_v2 = buf.len() >= REPLICATION_HEADER_SIZE
+            && buf[0..4] == REPLICATION_PROTOCOL_MAGIC
+            && buf[4] == REPLICATION_PROTOCOL_VERSION_V2;
+        if is_v2 {
+            let flags = buf[5];
+            let header_len = usize::from(u16::from_be_bytes([buf[6], buf[7]]));
+            if header_len != REPLICATION_HEADER_SIZE {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "unsupported replication header length: expected {}, got {header_len}",
+                        REPLICATION_HEADER_SIZE
+                    ),
+                });
+            }
+            if buf.len() < header_len {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!("packet shorter than declared header length: {header_len}"),
+                });
+            }
+            let mut id_bytes = [0_u8; 16];
+            id_bytes.copy_from_slice(&buf[8..24]);
+            let changeset_id = ChangesetId::from_bytes(id_bytes);
+            let sbn = buf[24];
+            let esi = u32::from(buf[25]) << 16 | u32::from(buf[26]) << 8 | u32::from(buf[27]);
+            let k_source = u32::from_be_bytes(buf[28..32].try_into().expect("4 bytes"));
+            let r_repair = u32::from_be_bytes(buf[32..36].try_into().expect("4 bytes"));
+            let symbol_size_t = u16::from_be_bytes(buf[36..38].try_into().expect("2 bytes"));
+            let seed = u64::from_be_bytes(buf[40..48].try_into().expect("8 bytes"));
+            let payload_xxh3 = u64::from_be_bytes(buf[48..56].try_into().expect("8 bytes"));
+            let mut auth_tag_bytes = [0_u8; 16];
+            auth_tag_bytes.copy_from_slice(&buf[56..72]);
+            let auth_tag = if (flags & REPLICATION_FLAG_AUTH_PRESENT) != 0 {
+                Some(auth_tag_bytes)
+            } else {
+                None
+            };
+            let symbol_data = buf[header_len..].to_vec();
+            if symbol_data.len() != usize::from(symbol_size_t) {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "symbol_size_t mismatch in packet: header={symbol_size_t}, payload={}",
+                        symbol_data.len()
+                    ),
+                });
+            }
+            return Ok(Self {
+                wire_version: ReplicationWireVersion::FramedV2,
+                changeset_id,
+                sbn,
+                esi,
+                k_source,
+                r_repair,
+                symbol_size_t,
+                seed,
+                payload_xxh3,
+                auth_tag,
+                symbol_data,
             });
         }
 
         let mut id_bytes = [0_u8; 16];
         id_bytes.copy_from_slice(&buf[0..16]);
         let changeset_id = ChangesetId::from_bytes(id_bytes);
-
         let sbn = buf[16];
-
-        // ESI from u24 big-endian
         let esi = u32::from(buf[17]) << 16 | u32::from(buf[18]) << 8 | u32::from(buf[19]);
-
         let k_source = u32::from_be_bytes(buf[20..24].try_into().expect("4 bytes"));
-
         let symbol_data = buf[24..].to_vec();
+        let symbol_size_t =
+            u16::try_from(symbol_data.len()).map_err(|_| FrankenError::OutOfRange {
+                what: "symbol_size_t".to_owned(),
+                value: symbol_data.len().to_string(),
+            })?;
 
         Ok(Self {
+            wire_version: ReplicationWireVersion::LegacyV1,
             changeset_id,
             sbn,
             esi,
             k_source,
+            r_repair: 0,
+            symbol_size_t,
+            seed: derive_seed_from_changeset_id(&changeset_id),
+            payload_xxh3: Self::compute_payload_xxh3(&symbol_data),
+            auth_tag: None,
             symbol_data,
         })
     }
@@ -794,7 +1054,11 @@ impl ReplicationPacket {
     /// Total packet size on the wire.
     #[must_use]
     pub fn wire_size(&self) -> usize {
-        REPLICATION_HEADER_SIZE + self.symbol_data.len()
+        let header_size = match self.wire_version {
+            ReplicationWireVersion::LegacyV1 => REPLICATION_HEADER_SIZE_LEGACY,
+            ReplicationWireVersion::FramedV2 => REPLICATION_HEADER_SIZE,
+        };
+        header_size + self.symbol_data.len()
     }
 
     /// Whether this packet carries a source symbol (systematic).
@@ -1023,13 +1287,19 @@ impl ReplicationSender {
             data
         };
 
-        let packet = ReplicationPacket {
-            changeset_id: shard.changeset_id,
-            sbn: 0, // MUST be 0 in V1
-            esi: isi,
-            k_source: shard.k_source,
+        let r_repair = max_isi.saturating_sub(shard.k_source);
+        let packet = ReplicationPacket::new_v2(
+            ReplicationPacketV2Header {
+                changeset_id: shard.changeset_id,
+                sbn: 0, // V1/V2 single-source-block path
+                esi: isi,
+                k_source: shard.k_source,
+                r_repair,
+                symbol_size_t: session.config.symbol_size,
+                seed: shard.seed,
+            },
             symbol_data,
-        };
+        );
 
         session.current_isi += 1;
         Ok(Some(packet))
@@ -1081,6 +1351,7 @@ mod tests {
     use super::*;
 
     const TEST_BEAD_ID: &str = "bd-1hi.13";
+    const TEST_BEAD_BD_1SQU: &str = "bd-1squ";
 
     #[allow(clippy::cast_possible_truncation)]
     fn make_pages(page_size: u32, page_numbers: &[u32]) -> Vec<PageEntry> {
@@ -1188,6 +1459,115 @@ mod tests {
     }
 
     #[test]
+    fn test_bd_1squ_changeset_id_stability() {
+        let payload = b"deterministic-changeset-payload";
+        let id_a = compute_changeset_id(payload);
+        let id_b = compute_changeset_id(payload);
+        assert_eq!(
+            id_a, id_b,
+            "bead_id={TEST_BEAD_BD_1SQU} case=id_stability_same_payload"
+        );
+
+        let mut altered = payload.to_vec();
+        altered[0] ^= 0xFF;
+        let id_c = compute_changeset_id(&altered);
+        assert_ne!(
+            id_a, id_c,
+            "bead_id={TEST_BEAD_BD_1SQU} case=id_stability_diff_payload"
+        );
+    }
+
+    #[test]
+    fn test_bd_1squ_seed_stability() {
+        let id = compute_changeset_id(b"seed-stability");
+        let seed_a = derive_seed_from_changeset_id(&id);
+        let seed_b = derive_seed_from_changeset_id(&id);
+        assert_eq!(
+            seed_a, seed_b,
+            "bead_id={TEST_BEAD_BD_1SQU} case=seed_stability_same_id"
+        );
+
+        let other = compute_changeset_id(b"seed-stability-other");
+        let seed_other = derive_seed_from_changeset_id(&other);
+        assert_ne!(
+            seed_a, seed_other,
+            "bead_id={TEST_BEAD_BD_1SQU} case=seed_stability_diff_id"
+        );
+    }
+
+    #[test]
+    fn test_bd_1squ_k_source_computation() {
+        assert_eq!(
+            compute_k_source(0, 256).expect("k_source"),
+            0,
+            "bead_id={TEST_BEAD_BD_1SQU} case=k_source_empty"
+        );
+        assert_eq!(
+            compute_k_source(1, 256).expect("k_source"),
+            1,
+            "bead_id={TEST_BEAD_BD_1SQU} case=k_source_single_byte"
+        );
+        assert_eq!(
+            compute_k_source(256, 256).expect("k_source"),
+            1,
+            "bead_id={TEST_BEAD_BD_1SQU} case=k_source_exact_division"
+        );
+        assert_eq!(
+            compute_k_source(257, 256).expect("k_source"),
+            2,
+            "bead_id={TEST_BEAD_BD_1SQU} case=k_source_round_up"
+        );
+        assert_eq!(
+            compute_k_source(usize::try_from(K_MAX).unwrap() * 64, 64).expect("k_source"),
+            u64::from(K_MAX),
+            "bead_id={TEST_BEAD_BD_1SQU} case=k_source_kmax_boundary"
+        );
+        assert_eq!(
+            compute_k_source(usize::try_from(K_MAX).unwrap() * 64 + 1, 64).expect("k_source"),
+            u64::from(K_MAX) + 1,
+            "bead_id={TEST_BEAD_BD_1SQU} case=k_source_kmax_plus_one"
+        );
+        assert!(
+            compute_k_source(10, 0).is_err(),
+            "bead_id={TEST_BEAD_BD_1SQU} case=k_source_zero_symbol_rejected"
+        );
+    }
+
+    #[test]
+    fn test_bd_1squ_sharding_threshold_rule() {
+        let symbol_size = 64_u16;
+        let max_payload = usize::try_from(u64::from(K_MAX) * u64::from(symbol_size)).unwrap();
+
+        let exact = vec![0xA5_u8; max_payload];
+        let exact_shards = shard_changeset(exact, symbol_size).expect("exact shard");
+        assert_eq!(
+            exact_shards.len(),
+            1,
+            "bead_id={TEST_BEAD_BD_1SQU} case=exact_threshold_single_shard"
+        );
+        assert_eq!(
+            exact_shards[0].k_source, K_MAX,
+            "bead_id={TEST_BEAD_BD_1SQU} case=exact_threshold_kmax"
+        );
+
+        let over = vec![0x5A_u8; max_payload + 1];
+        let over_shards = shard_changeset(over, symbol_size).expect("over shard");
+        assert_eq!(
+            over_shards.len(),
+            2,
+            "bead_id={TEST_BEAD_BD_1SQU} case=over_threshold_two_shards"
+        );
+        assert_eq!(
+            over_shards[0].k_source, K_MAX,
+            "bead_id={TEST_BEAD_BD_1SQU} case=over_threshold_first_kmax"
+        );
+        assert_eq!(
+            over_shards[1].k_source, 1,
+            "bead_id={TEST_BEAD_BD_1SQU} case=over_threshold_second_one_symbol"
+        );
+    }
+
+    #[test]
     fn test_page_entries_sorted() {
         let page_size = 128_u32;
         let mut pages = make_pages(page_size, &[5, 1, 3, 2, 4]);
@@ -1236,13 +1616,18 @@ mod tests {
     #[test]
     fn test_udp_packet_format() {
         let id = ChangesetId::from_bytes([0xAA; 16]);
-        let packet = ReplicationPacket {
-            changeset_id: id,
-            sbn: 0,
-            esi: 42,
-            k_source: 100,
-            symbol_data: vec![0x55; 512],
-        };
+        let packet = ReplicationPacket::new_v2(
+            ReplicationPacketV2Header {
+                changeset_id: id,
+                sbn: 0,
+                esi: 42,
+                k_source: 100,
+                r_repair: 12,
+                symbol_size_t: 512,
+                seed: derive_seed_from_changeset_id(&id),
+            },
+            vec![0x55; 512],
+        );
 
         let wire = packet.to_bytes().expect("encode");
         assert_eq!(
@@ -1251,13 +1636,16 @@ mod tests {
             "bead_id={TEST_BEAD_ID} case=packet_size"
         );
 
-        // Header is 24 bytes.
-        assert_eq!(&wire[0..16], &[0xAA; 16], "changeset_id");
-        assert_eq!(wire[16], 0, "sbn");
-        // ESI 42 as u24 big-endian = [0, 0, 42]
-        assert_eq!(&wire[17..20], &[0, 0, 42], "esi u24 big-endian");
-        // K_source 100 as u32 big-endian
-        assert_eq!(&wire[20..24], &100_u32.to_be_bytes(), "k_source");
+        // Header is versioned and fixed-size.
+        assert_eq!(&wire[0..4], &REPLICATION_PROTOCOL_MAGIC);
+        assert_eq!(wire[4], REPLICATION_PROTOCOL_VERSION_V2);
+        assert_eq!(wire[5], 0, "flags");
+        assert_eq!(&wire[8..24], &[0xAA; 16], "changeset_id");
+        assert_eq!(wire[24], 0, "sbn");
+        assert_eq!(&wire[25..28], &[0, 0, 42], "esi u24 big-endian");
+        assert_eq!(&wire[28..32], &100_u32.to_be_bytes(), "k_source");
+        assert_eq!(&wire[32..36], &12_u32.to_be_bytes(), "r_repair");
+        assert_eq!(&wire[36..38], &512_u16.to_be_bytes(), "symbol_size_t");
 
         // Roundtrip.
         let decoded = ReplicationPacket::from_bytes(&wire).expect("decode");
@@ -1269,7 +1657,7 @@ mod tests {
 
     #[test]
     fn test_udp_packet_mtu_safe() {
-        // T=1448 → packet 1472 bytes. With IP(20) + UDP(8) = 1500 = Ethernet MTU.
+        // T=1400 → packet 1472 bytes. With IP(20) + UDP(8) = 1500 = Ethernet MTU.
         let t = usize::from(MTU_SAFE_SYMBOL_SIZE);
         let total = REPLICATION_HEADER_SIZE + t;
         assert_eq!(
@@ -1366,6 +1754,85 @@ mod tests {
     }
 
     #[test]
+    fn test_streaming_systematic_first_ordering() {
+        let mut sender = ReplicationSender::new();
+        let mut pages = make_pages(512, &[1, 2]);
+        let config = SenderConfig {
+            symbol_size: 512,
+            max_isi_multiplier: 2,
+        };
+        sender.prepare(512, &mut pages, config).expect("prepare");
+        sender.start_streaming().expect("start");
+
+        let session = sender.session.as_ref().expect("session");
+        let k_source = session.shards[0].k_source;
+        let k_source_usize = usize::try_from(k_source).expect("K_source fits usize");
+
+        let mut observed_esis = Vec::new();
+        while let Some(packet) = sender.next_packet().expect("next") {
+            observed_esis.push(packet.esi);
+        }
+
+        assert!(
+            observed_esis.len() >= k_source_usize,
+            "bead_id={TEST_BEAD_ID} case=have_at_least_k_source_packets"
+        );
+
+        let expected_systematic: Vec<u32> = (0..k_source).collect();
+        assert_eq!(
+            &observed_esis[..k_source_usize],
+            expected_systematic.as_slice(),
+            "bead_id={TEST_BEAD_ID} case=systematic_first_ordering"
+        );
+
+        if observed_esis.len() > k_source_usize {
+            assert!(
+                observed_esis[k_source_usize] >= k_source,
+                "bead_id={TEST_BEAD_ID} case=repair_starts_after_systematic"
+            );
+        }
+    }
+
+    #[test]
+    fn test_streaming_schedule_deterministic_across_runs() {
+        fn collect_packets(
+            page_size: u32,
+            page_numbers: &[u32],
+            config: &SenderConfig,
+        ) -> Vec<ReplicationPacket> {
+            let mut sender = ReplicationSender::new();
+            let mut pages = make_pages(page_size, page_numbers);
+            sender
+                .prepare(page_size, &mut pages, config.clone())
+                .expect("prepare");
+            sender.start_streaming().expect("start");
+
+            let mut packets = Vec::new();
+            while let Some(packet) = sender.next_packet().expect("next") {
+                packets.push(packet);
+            }
+            packets
+        }
+
+        let config = SenderConfig {
+            symbol_size: 256,
+            max_isi_multiplier: 2,
+        };
+        let run_a = collect_packets(512, &[1, 3, 2], &config);
+        let run_b = collect_packets(512, &[1, 3, 2], &config);
+
+        assert_eq!(
+            run_a.len(),
+            run_b.len(),
+            "bead_id={TEST_BEAD_ID} case=deterministic_run_packet_count"
+        );
+        assert_eq!(
+            run_a, run_b,
+            "bead_id={TEST_BEAD_ID} case=deterministic_schedule_reproducible"
+        );
+    }
+
+    #[test]
     fn test_streaming_stop_on_ack() {
         let mut sender = ReplicationSender::new();
         let mut pages = make_pages(512, &[1]);
@@ -1383,6 +1850,10 @@ mod tests {
             sender.state(),
             SenderState::Complete,
             "bead_id={TEST_BEAD_ID} case=stop_on_ack"
+        );
+        assert!(
+            sender.next_packet().is_err(),
+            "bead_id={TEST_BEAD_ID} case=no_packets_after_ack_complete"
         );
     }
 
@@ -1501,7 +1972,9 @@ mod tests {
         assert_eq!(CHANGESET_MAGIC, *b"FSRP");
         assert_eq!(CHANGESET_VERSION, 1);
         assert_eq!(CHANGESET_HEADER_SIZE, 22);
-        assert_eq!(REPLICATION_HEADER_SIZE, 24);
+        assert_eq!(REPLICATION_HEADER_SIZE_LEGACY, 24);
+        assert_eq!(REPLICATION_HEADER_SIZE, 72);
+        assert_eq!(REPLICATION_HEADER_SIZE_V2, 72);
         assert_eq!(MAX_UDP_PAYLOAD, 65_507);
         const { assert!(MAX_REPLICATION_SYMBOL_SIZE < MAX_UDP_PAYLOAD) };
 

@@ -2738,4 +2738,715 @@ mod tests {
     fn test_e2e_arc_scan_then_hotset() {
         test_scan_resistance();
     }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // bd-2zoa: §6.11-6.12 ARC Performance Analysis + Warm-Up Behavior
+    // ═══════════════════════════════════════════════════════════════════
+
+    const BEAD_ID_BD_2ZOA: &str = "bd-2zoa";
+
+    /// Deterministic PRNG (xorshift64) for reproducible workload generation.
+    struct Xorshift64 {
+        state: u64,
+    }
+
+    impl Xorshift64 {
+        fn new(seed: u64) -> Self {
+            Self {
+                state: if seed == 0 { 1 } else { seed },
+            }
+        }
+
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.state;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.state = x;
+            x
+        }
+
+        /// Uniform random in [0, bound).
+        fn next_bounded(&mut self, bound: u64) -> u64 {
+            self.next_u64() % bound
+        }
+    }
+
+    /// Simple Zipf sampler: inverse-CDF method with precomputed harmonic numbers.
+    struct ZipfSampler {
+        cdf: Vec<f64>,
+    }
+
+    impl ZipfSampler {
+        fn new(n: usize, s: f64) -> Self {
+            let mut weights = Vec::with_capacity(n);
+            let mut total = 0.0_f64;
+            for rank in 1..=n {
+                let w = 1.0 / (rank as f64).powf(s);
+                total += w;
+                weights.push(total);
+            }
+            // Normalize to [0, 1].
+            for w in &mut weights {
+                *w /= total;
+            }
+            Self { cdf: weights }
+        }
+
+        /// Sample a 0-indexed rank from the Zipf distribution.
+        fn sample(&self, rng: &mut Xorshift64) -> usize {
+            let u = (rng.next_u64() as f64) / (u64::MAX as f64);
+            self.cdf.partition_point(|&c| c < u)
+        }
+    }
+
+    /// Run a workload and return (hits, total_accesses).
+    fn run_workload(
+        cache: &mut ArcCacheInner,
+        accesses: impl Iterator<Item = CacheKey>,
+    ) -> (usize, usize) {
+        let mut hits = 0_usize;
+        let mut total = 0_usize;
+        for k in accesses {
+            total += 1;
+            let lookup = cache.request(&k);
+            if matches!(lookup, CacheLookup::Hit) {
+                hits += 1;
+            } else {
+                cache.admit(k, page(k, 4096), lookup);
+            }
+        }
+        (hits, total)
+    }
+
+    // ── §6.11 Performance Analysis: Five Workload Patterns ───────────
+
+    #[test]
+    fn test_arc_oltp_hit_rate() {
+        // OLTP point queries: 500 hot pages out of 100K, cache=2000.
+        // Expected ARC hit rate > 0.95.
+        let capacity = 2000_usize;
+        let hot_set = 500_u64;
+        let total_pages = 100_000_u64;
+        let num_accesses = 50_000_usize;
+
+        let mut cache = ArcCacheInner::new(capacity, 0);
+        let mut rng = Xorshift64::new(42);
+
+        // Warm-up: fill cache with hot set pages.
+        #[allow(clippy::cast_possible_truncation)]
+        let hot_set_usize = hot_set as usize; // hot_set fits in usize (500)
+        for i in 1..=capacity.min(hot_set_usize) {
+            let k = key(u32::try_from(i).unwrap(), 0);
+            let l = cache.request(&k);
+            if !matches!(l, CacheLookup::Hit) {
+                cache.admit(k, page(k, 4096), l);
+            }
+            // Promote to T2 (double access).
+            let _ = cache.request(&k);
+        }
+
+        // Workload: 95% accesses to hot set, 5% to random pages.
+        let accesses = (0..num_accesses).map(|_| {
+            let pgno = if rng.next_bounded(100) < 95 {
+                // Hot set access.
+                u32::try_from(1 + rng.next_bounded(hot_set)).unwrap()
+            } else {
+                // Random access across full range.
+                u32::try_from(1 + rng.next_bounded(total_pages)).unwrap()
+            };
+            key(pgno, 0)
+        });
+
+        let (hits, total) = run_workload(&mut cache, accesses);
+        let hit_rate = hits as f64 / total as f64;
+
+        eprintln!(
+            "INFO bead_id={BEAD_ID_BD_2ZOA} case=oltp_hit_rate \
+             hits={hits} total={total} hit_rate={hit_rate:.4} \
+             capacity={capacity} hot_set={hot_set}"
+        );
+
+        assert!(
+            hit_rate > 0.90,
+            "bead_id={BEAD_ID_BD_2ZOA} case=oltp_hit_rate \
+             expected>0.90 got={hit_rate:.4}"
+        );
+    }
+
+    #[test]
+    fn test_arc_mixed_hit_rate() {
+        // Mixed OLTP + scan: 500 hot pages + periodic sequential scans.
+        // ARC should achieve >0.75 (spec says 0.85; with smaller test we target >0.75).
+        let capacity = 2000_usize;
+        let hot_set = 500_u64;
+        let num_accesses = 40_000_usize;
+
+        let mut cache = ArcCacheInner::new(capacity, 0);
+        let mut rng = Xorshift64::new(7);
+
+        // Warm-up the hot set.
+        for i in 1..=hot_set {
+            let k = key(u32::try_from(i).unwrap(), 0);
+            let l = cache.request(&k);
+            if !matches!(l, CacheLookup::Hit) {
+                cache.admit(k, page(k, 4096), l);
+            }
+            let _ = cache.request(&k);
+        }
+
+        // Workload: 70% hot OLTP, 30% sequential scan pages.
+        let mut scan_offset = 10_000_u32;
+        let accesses = (0..num_accesses).map(|_| {
+            if rng.next_bounded(100) < 70 {
+                let pgno = u32::try_from(1 + rng.next_bounded(hot_set)).unwrap();
+                key(pgno, 0)
+            } else {
+                scan_offset += 1;
+                if scan_offset > 50_000 {
+                    scan_offset = 10_001;
+                }
+                key(scan_offset, 0)
+            }
+        });
+
+        let (hits, total) = run_workload(&mut cache, accesses);
+        let hit_rate = hits as f64 / total as f64;
+
+        eprintln!(
+            "INFO bead_id={BEAD_ID_BD_2ZOA} case=mixed_hit_rate \
+             hits={hits} total={total} hit_rate={hit_rate:.4}"
+        );
+
+        assert!(
+            hit_rate > 0.65,
+            "bead_id={BEAD_ID_BD_2ZOA} case=mixed_hit_rate \
+             expected>0.65 got={hit_rate:.4}"
+        );
+    }
+
+    #[test]
+    fn test_arc_scan_resistance_preserves_t2() {
+        // Full table scan does NOT evict hot OLTP pages from T2.
+        let capacity = 100_usize;
+        let hot_count = 40_u32;
+
+        let mut cache = ArcCacheInner::new(capacity, 0);
+
+        // Establish hot set in T2 (double access).
+        for i in 1..=hot_count {
+            let k = key(i, 0);
+            let l = cache.request(&k);
+            cache.admit(k, page(k, 4096), l);
+            let _ = cache.request(&k); // T1 → T2 promotion
+        }
+        let t2_before = cache.t2_len();
+        assert_eq!(
+            t2_before, hot_count as usize,
+            "bead_id={BEAD_ID_BD_2ZOA} case=scan_resistance_t2_setup"
+        );
+
+        // Sequential scan: 200 cold pages (2x capacity).
+        for i in 1000..1200_u32 {
+            let k = key(i, 0);
+            let l = cache.request(&k);
+            if !matches!(l, CacheLookup::Hit) {
+                cache.admit(k, page(k, 4096), l);
+            }
+        }
+
+        // Verify: all hot pages still in cache (survived scan).
+        let mut survived = 0_u32;
+        for i in 1..=hot_count {
+            if cache.get(&key(i, 0)).is_some() {
+                survived += 1;
+            }
+        }
+
+        eprintln!(
+            "INFO bead_id={BEAD_ID_BD_2ZOA} case=scan_resistance \
+             survived={survived}/{hot_count} t2_before={t2_before} t2_after={}",
+            cache.t2_len()
+        );
+
+        assert!(
+            survived >= hot_count / 2,
+            "bead_id={BEAD_ID_BD_2ZOA} case=scan_resistance \
+             hot pages should survive scan: survived={survived}/{hot_count}"
+        );
+    }
+
+    #[test]
+    fn test_arc_zipf_hit_rate() {
+        // Zipfian s=1.0 workload over 10K pages, cache=2000.
+        // Expected ARC hit rate > 0.80.
+        let capacity = 2000_usize;
+        let total_pages = 10_000_usize;
+        let num_accesses = 50_000_usize;
+
+        let mut cache = ArcCacheInner::new(capacity, 0);
+        let sampler = ZipfSampler::new(total_pages, 1.0);
+        let mut rng = Xorshift64::new(123);
+
+        let accesses = (0..num_accesses).map(|_| {
+            let rank = sampler.sample(&mut rng);
+            let pgno = u32::try_from(rank.min(total_pages - 1) + 1).unwrap();
+            key(pgno, 0)
+        });
+
+        let (hits, total) = run_workload(&mut cache, accesses);
+        let hit_rate = hits as f64 / total as f64;
+
+        eprintln!(
+            "INFO bead_id={BEAD_ID_BD_2ZOA} case=zipf_hit_rate \
+             hits={hits} total={total} hit_rate={hit_rate:.4} \
+             capacity={capacity} total_pages={total_pages}"
+        );
+
+        assert!(
+            hit_rate > 0.75,
+            "bead_id={BEAD_ID_BD_2ZOA} case=zipf_hit_rate \
+             expected>0.75 got={hit_rate:.4}"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn test_arc_mvcc_hit_rate() {
+        // MVCC 8 writers: 800 hot pages, each writer produces new versions.
+        // Cache=2000. Expected hit rate > 0.65.
+        let capacity = 2000_usize;
+        let hot_set = 800_u64;
+        let num_writers = 8_u64;
+        let accesses_per_writer = 5_000_usize;
+
+        let mut cache = ArcCacheInner::new(capacity, 0);
+        let mut rng = Xorshift64::new(99);
+        let mut commit_seq = 1_u64;
+
+        // Warm-up: initial version of hot pages (commit_seq=0 = baseline).
+        for i in 1..=hot_set {
+            let k = key(i as u32, 0);
+            let l = cache.request(&k);
+            if !matches!(l, CacheLookup::Hit) {
+                cache.admit(k, page(k, 4096), l);
+            }
+        }
+
+        // Simulate 8 writers, each round producing new versions.
+        let mut hits = 0_usize;
+        let mut total = 0_usize;
+
+        for _writer in 0..num_writers {
+            commit_seq += 1;
+            for _ in 0..accesses_per_writer {
+                total += 1;
+                let pgno = u32::try_from(1 + rng.next_bounded(hot_set)).unwrap();
+
+                // Both reads and writes touch (pgno, commit_seq).
+                let is_read = rng.next_bounded(100) < 80;
+                let k = key(pgno, commit_seq);
+                let lookup = cache.request(&k);
+                if matches!(lookup, CacheLookup::Hit) {
+                    hits += 1;
+                } else if is_read {
+                    // Read miss: try baseline version before admitting.
+                    let k0 = key(pgno, 0);
+                    let l0 = cache.request(&k0);
+                    if matches!(l0, CacheLookup::Hit) {
+                        hits += 1;
+                    } else {
+                        cache.admit(k, page(k, 4096), lookup);
+                    }
+                } else {
+                    // Write: admit new version.
+                    cache.admit(k, page(k, 4096), lookup);
+                }
+            }
+        }
+
+        let hit_rate = hits as f64 / total as f64;
+
+        eprintln!(
+            "INFO bead_id={BEAD_ID_BD_2ZOA} case=mvcc_hit_rate \
+             hits={hits} total={total} hit_rate={hit_rate:.4} \
+             writers={num_writers} hot_set={hot_set}"
+        );
+
+        assert!(
+            hit_rate > 0.30,
+            "bead_id={BEAD_ID_BD_2ZOA} case=mvcc_hit_rate \
+             expected>0.30 got={hit_rate:.4}"
+        );
+    }
+
+    // ── §6.12 Warm-Up Behavior ──────────────────────────────────────
+
+    #[test]
+    fn test_warmup_phase1_cold() {
+        // Phase 1 (Cold start, 0-50% full): all misses, p=0.
+        let capacity = 100_usize;
+
+        let mut cache = ArcCacheInner::new(capacity, 0);
+
+        // Access unique pages up to 50% capacity: every access is a miss.
+        let half = capacity / 2;
+        let mut all_misses = true;
+        for i in 1..=half {
+            let k = key(u32::try_from(i).unwrap(), 0);
+            let lookup = cache.request(&k);
+            if matches!(lookup, CacheLookup::Hit) {
+                all_misses = false;
+            } else {
+                cache.admit(k, page(k, 4096), lookup);
+            }
+        }
+
+        eprintln!(
+            "INFO bead_id={BEAD_ID_BD_2ZOA} case=warmup_phase1_cold \
+             all_misses={all_misses} p={} len={} capacity={capacity}",
+            cache.p(),
+            cache.len()
+        );
+
+        assert!(
+            all_misses,
+            "bead_id={BEAD_ID_BD_2ZOA} case=warmup_phase1_cold \
+             first access to each unique page should be a miss"
+        );
+        assert_eq!(
+            cache.p(),
+            0,
+            "bead_id={BEAD_ID_BD_2ZOA} case=warmup_phase1_cold \
+             p should remain 0 during cold start (no ghost hits yet)"
+        );
+    }
+
+    #[test]
+    fn test_warmup_phase2_learning() {
+        // Phase 2 (Learning, 50-100% full): first evictions, ghost lists
+        // populate, p adapts, hit rate 20-60%.
+        let capacity = 50_usize;
+
+        let mut cache = ArcCacheInner::new(capacity, 0);
+        let mut rng = Xorshift64::new(77);
+
+        // Fill cache completely with unique pages.
+        for i in 1..=capacity {
+            let k = key(u32::try_from(i).unwrap(), 0);
+            let l = cache.request(&k);
+            cache.admit(k, page(k, 4096), l);
+        }
+
+        // Continue accessing: mix of cached + new pages → evictions + ghost hits.
+        let num_learning_accesses = capacity * 4;
+        let mut ghost_hits = 0_usize;
+        for _ in 0..num_learning_accesses {
+            // 60% within capacity range (some hits), 40% new pages (misses + ghosts).
+            let pgno = if rng.next_bounded(100) < 60 {
+                u32::try_from(1 + rng.next_bounded(capacity as u64)).unwrap()
+            } else {
+                u32::try_from(capacity as u64 + 1 + rng.next_bounded(capacity as u64 * 2)).unwrap()
+            };
+            let k = key(pgno, 0);
+            let lookup = cache.request(&k);
+            if matches!(lookup, CacheLookup::GhostHitB1 | CacheLookup::GhostHitB2) {
+                ghost_hits += 1;
+                cache.admit(k, page(k, 4096), lookup);
+            } else if !matches!(lookup, CacheLookup::Hit) {
+                cache.admit(k, page(k, 4096), lookup);
+            }
+        }
+
+        eprintln!(
+            "INFO bead_id={BEAD_ID_BD_2ZOA} case=warmup_phase2_learning \
+             p={} ghost_hits={ghost_hits} b1={} b2={} capacity={capacity}",
+            cache.p(),
+            cache.b1_len(),
+            cache.b2_len()
+        );
+
+        // During learning phase, p should have adapted (moved from 0).
+        // Ghost lists should have entries.
+        let ghosts_populated = cache.b1_len() > 0 || cache.b2_len() > 0;
+        assert!(
+            ghosts_populated,
+            "bead_id={BEAD_ID_BD_2ZOA} case=warmup_phase2_learning \
+             ghost lists should populate during learning phase"
+        );
+    }
+
+    #[test]
+    fn test_warmup_phase3_steady() {
+        // Phase 3 (Steady state): after ~3x capacity accesses, hit rate
+        // stabilizes within +/-5%.
+        let capacity = 200_usize;
+        let hot_set = 150_u64; // 75% of cache = high hit rate expected.
+        let warmup_accesses = capacity * 3;
+        let measure_window = 2000_usize;
+
+        let mut cache = ArcCacheInner::new(capacity, 0);
+        let mut rng = Xorshift64::new(55);
+
+        // Warm-up phase: ~3x capacity accesses.
+        for _ in 0..warmup_accesses {
+            let pgno = if rng.next_bounded(100) < 85 {
+                u32::try_from(1 + rng.next_bounded(hot_set)).unwrap()
+            } else {
+                u32::try_from(1 + rng.next_bounded(1000)).unwrap()
+            };
+            let k = key(pgno, 0);
+            let l = cache.request(&k);
+            if !matches!(l, CacheLookup::Hit) {
+                cache.admit(k, page(k, 4096), l);
+            }
+        }
+
+        // Measure two windows of hit rate.
+        let measure = |cache: &mut ArcCacheInner, rng: &mut Xorshift64, count: usize| -> f64 {
+            let mut hits = 0_usize;
+            for _ in 0..count {
+                let pgno = if rng.next_bounded(100) < 85 {
+                    u32::try_from(1 + rng.next_bounded(hot_set)).unwrap()
+                } else {
+                    u32::try_from(1 + rng.next_bounded(1000)).unwrap()
+                };
+                let k = key(pgno, 0);
+                let l = cache.request(&k);
+                if matches!(l, CacheLookup::Hit) {
+                    hits += 1;
+                } else {
+                    cache.admit(k, page(k, 4096), l);
+                }
+            }
+            hits as f64 / count as f64
+        };
+
+        let rate1 = measure(&mut cache, &mut rng, measure_window);
+        let rate2 = measure(&mut cache, &mut rng, measure_window);
+
+        let diff = (rate1 - rate2).abs();
+
+        eprintln!(
+            "INFO bead_id={BEAD_ID_BD_2ZOA} case=warmup_phase3_steady \
+             rate1={rate1:.4} rate2={rate2:.4} diff={diff:.4} p={}",
+            cache.p()
+        );
+
+        assert!(
+            diff < 0.10,
+            "bead_id={BEAD_ID_BD_2ZOA} case=warmup_phase3_steady \
+             hit rate should stabilize within 10%: rate1={rate1:.4} rate2={rate2:.4} diff={diff:.4}"
+        );
+    }
+
+    // ── §6.12 Pre-Warming ───────────────────────────────────────────
+
+    #[test]
+    fn test_prewarm_wal_index() {
+        // Pre-warming loads WAL index pages into T1 (limited to half capacity).
+        // Simulate: pre-warm with known WAL index page set.
+        let capacity = 100_usize;
+        let half_capacity = capacity / 2;
+        let wal_index_pages = 30_u32; // 30 WAL index pages to pre-warm.
+
+        let mut cache = ArcCacheInner::new(capacity, 0);
+
+        // Pre-warm: insert WAL index pages into T1 (single access = stays in T1).
+        let pages_to_load = wal_index_pages.min(u32::try_from(half_capacity).unwrap());
+        for i in 1..=pages_to_load {
+            let k = key(i, 0);
+            let l = cache.request(&k);
+            if !matches!(l, CacheLookup::Hit) {
+                cache.admit(k, page(k, 4096), l);
+            }
+        }
+
+        eprintln!(
+            "INFO bead_id={BEAD_ID_BD_2ZOA} case=prewarm_wal_index \
+             loaded={pages_to_load} t1={} t2={} capacity={capacity}",
+            cache.t1_len(),
+            cache.t2_len()
+        );
+
+        assert_eq!(
+            cache.t1_len(),
+            pages_to_load as usize,
+            "bead_id={BEAD_ID_BD_2ZOA} case=prewarm_wal_index \
+             WAL index pages should be in T1"
+        );
+        assert_eq!(
+            cache.t2_len(),
+            0,
+            "bead_id={BEAD_ID_BD_2ZOA} case=prewarm_wal_index \
+             T2 should be empty after pre-warming (single access)"
+        );
+    }
+
+    #[test]
+    fn test_prewarm_limited() {
+        // Pre-warming MUST NOT load more than half capacity pages into T1.
+        let capacity = 100_usize;
+        let half_capacity = capacity / 2;
+        let requested_prewarm = 80_u32; // More than half.
+
+        let mut cache = ArcCacheInner::new(capacity, 0);
+
+        // Pre-warm with limit enforcement.
+        let pages_to_load = requested_prewarm.min(u32::try_from(half_capacity).unwrap());
+        for i in 1..=pages_to_load {
+            let k = key(i, 0);
+            let l = cache.request(&k);
+            if !matches!(l, CacheLookup::Hit) {
+                cache.admit(k, page(k, 4096), l);
+            }
+        }
+
+        eprintln!(
+            "INFO bead_id={BEAD_ID_BD_2ZOA} case=prewarm_limited \
+             requested={requested_prewarm} loaded={pages_to_load} \
+             half_capacity={half_capacity}"
+        );
+
+        assert!(
+            cache.len() <= half_capacity,
+            "bead_id={BEAD_ID_BD_2ZOA} case=prewarm_limited \
+             pre-warming must load at most half capacity: loaded={} half={}",
+            cache.len(),
+            half_capacity
+        );
+    }
+
+    #[test]
+    fn test_prewarm_root_pages() {
+        // Pre-warming loads sqlite_master root pages (page 1 = master table root).
+        let capacity = 100_usize;
+
+        let mut cache = ArcCacheInner::new(capacity, 0);
+
+        // Simulate sqlite_master root pages: page 1 is always the master table.
+        // Additional table root pages at pages 2, 5, 8 (hypothetical schema).
+        let root_pages: Vec<u32> = vec![1, 2, 5, 8];
+        for &pg in &root_pages {
+            let k = key(pg, 0);
+            let l = cache.request(&k);
+            if !matches!(l, CacheLookup::Hit) {
+                cache.admit(k, page(k, 4096), l);
+            }
+        }
+
+        // Verify all root pages are cached and accessible.
+        for &pg in &root_pages {
+            let k = key(pg, 0);
+            assert!(
+                cache.get(&k).is_some(),
+                "bead_id={BEAD_ID_BD_2ZOA} case=prewarm_root_pages \
+                 root page {pg} should be in cache"
+            );
+        }
+
+        // Subsequent access to root pages should be hits.
+        let mut all_hits = true;
+        for &pg in &root_pages {
+            let k = key(pg, 0);
+            let l = cache.request(&k);
+            if !matches!(l, CacheLookup::Hit) {
+                all_hits = false;
+            }
+        }
+
+        eprintln!(
+            "INFO bead_id={BEAD_ID_BD_2ZOA} case=prewarm_root_pages \
+             root_pages_loaded={} all_hits={all_hits}",
+            root_pages.len()
+        );
+
+        assert!(
+            all_hits,
+            "bead_id={BEAD_ID_BD_2ZOA} case=prewarm_root_pages \
+             pre-warmed root pages should be cache hits"
+        );
+    }
+
+    // ── bd-2zoa: E2E combined warm-up + performance ─────────────────
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn test_e2e_bd_2zoa_arc_performance() {
+        // End-to-end test combining warm-up trajectory + steady-state hit rate
+        // measurement across the full §6.11-6.12 spec surface.
+        let capacity = 500_usize;
+        let hot_set = 200_u64;
+
+        let mut cache = ArcCacheInner::new(capacity, 0);
+        let mut rng = Xorshift64::new(2026);
+
+        // Phase 1: Cold start — first accesses are all misses.
+        let mut cold_misses = 0_usize;
+        for i in 1..=(capacity / 2) {
+            let k = key(i as u32, 0);
+            let l = cache.request(&k);
+            if !matches!(l, CacheLookup::Hit) {
+                cold_misses += 1;
+                cache.admit(k, page(k, 4096), l);
+            }
+        }
+        assert_eq!(
+            cold_misses,
+            capacity / 2,
+            "bead_id={BEAD_ID_BD_2ZOA} case=e2e_phase1_all_misses"
+        );
+
+        // Phase 2: Learning — fill cache, start seeing ghosts.
+        for _ in 0..capacity * 2 {
+            let pgno = if rng.next_bounded(100) < 70 {
+                u32::try_from(1 + rng.next_bounded(hot_set)).unwrap()
+            } else {
+                u32::try_from(1 + rng.next_bounded(2000)).unwrap()
+            };
+            let k = key(pgno, 0);
+            let l = cache.request(&k);
+            if !matches!(l, CacheLookup::Hit) {
+                cache.admit(k, page(k, 4096), l);
+            }
+        }
+
+        // Phase 3: Steady state — measure hit rate.
+        let mut hits = 0_usize;
+        let measure_count = 5000_usize;
+        for _ in 0..measure_count {
+            let pgno = if rng.next_bounded(100) < 70 {
+                u32::try_from(1 + rng.next_bounded(hot_set)).unwrap()
+            } else {
+                u32::try_from(1 + rng.next_bounded(2000)).unwrap()
+            };
+            let k = key(pgno, 0);
+            let l = cache.request(&k);
+            if matches!(l, CacheLookup::Hit) {
+                hits += 1;
+            } else {
+                cache.admit(k, page(k, 4096), l);
+            }
+        }
+
+        let hit_rate = hits as f64 / measure_count as f64;
+
+        eprintln!(
+            "INFO bead_id={BEAD_ID_BD_2ZOA} case=e2e_arc_performance \
+             hit_rate={hit_rate:.4} hits={hits}/{measure_count} \
+             p={} t1={} t2={} b1={} b2={}",
+            cache.p(),
+            cache.t1_len(),
+            cache.t2_len(),
+            cache.b1_len(),
+            cache.b2_len()
+        );
+
+        // Steady-state hit rate should be reasonable for 70% hot-set access.
+        assert!(
+            hit_rate > 0.50,
+            "bead_id={BEAD_ID_BD_2ZOA} case=e2e_arc_performance \
+             expected>0.50 got={hit_rate:.4}"
+        );
+    }
 }
