@@ -4364,4 +4364,158 @@ mod tests {
         // Unknown pragma should not error.
         conn.execute("PRAGMA some_unknown_pragma=42;").unwrap();
     }
+
+    // ── Connection PRAGMA state tests (bd-1w6k.2.3) ────────────────────
+
+    #[test]
+    fn test_pragma_journal_mode_default_is_wal() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn.query("PRAGMA journal_mode;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            *rows[0].get(0).unwrap(),
+            SqliteValue::Text("wal".to_owned())
+        );
+    }
+
+    #[test]
+    fn test_pragma_journal_mode_set_and_query() {
+        let conn = Connection::open(":memory:").unwrap();
+        // Set returns the new value.
+        let rows = conn.query("PRAGMA journal_mode=delete;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            *rows[0].get(0).unwrap(),
+            SqliteValue::Text("delete".to_owned())
+        );
+        // Query reads back.
+        let rows = conn.query("PRAGMA journal_mode;").unwrap();
+        assert_eq!(
+            *rows[0].get(0).unwrap(),
+            SqliteValue::Text("delete".to_owned())
+        );
+    }
+
+    #[test]
+    fn test_pragma_synchronous_default_is_normal() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn.query("PRAGMA synchronous;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            *rows[0].get(0).unwrap(),
+            SqliteValue::Text("NORMAL".to_owned())
+        );
+    }
+
+    #[test]
+    fn test_pragma_synchronous_set_by_name_and_integer() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("PRAGMA synchronous=FULL;").unwrap();
+        let rows = conn.query("PRAGMA synchronous;").unwrap();
+        assert_eq!(
+            *rows[0].get(0).unwrap(),
+            SqliteValue::Text("FULL".to_owned())
+        );
+        // Integer code: 0 = OFF.
+        conn.execute("PRAGMA synchronous=0;").unwrap();
+        let rows = conn.query("PRAGMA synchronous;").unwrap();
+        assert_eq!(
+            *rows[0].get(0).unwrap(),
+            SqliteValue::Text("OFF".to_owned())
+        );
+    }
+
+    #[test]
+    fn test_pragma_cache_size_default() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn.query("PRAGMA cache_size;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Integer(-2000));
+    }
+
+    #[test]
+    fn test_pragma_cache_size_set_and_query() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("PRAGMA cache_size=-4000;").unwrap();
+        let rows = conn.query("PRAGMA cache_size;").unwrap();
+        assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Integer(-4000));
+    }
+
+    #[test]
+    fn test_pragma_page_size_default() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn.query("PRAGMA page_size;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Integer(4096));
+    }
+
+    #[test]
+    fn test_pragma_page_size_set_valid_and_query() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("PRAGMA page_size=8192;").unwrap();
+        let rows = conn.query("PRAGMA page_size;").unwrap();
+        assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Integer(8192));
+    }
+
+    #[test]
+    fn test_pragma_page_size_rejects_invalid() {
+        let conn = Connection::open(":memory:").unwrap();
+        // Not a power of two.
+        assert!(conn.execute("PRAGMA page_size=3000;").is_err());
+        // Below range.
+        assert!(conn.execute("PRAGMA page_size=256;").is_err());
+        // Above range.
+        assert!(conn.execute("PRAGMA page_size=131072;").is_err());
+    }
+
+    #[test]
+    fn test_pragma_journal_mode_rejects_invalid() {
+        let conn = Connection::open(":memory:").unwrap();
+        assert!(conn.execute("PRAGMA journal_mode=bogus;").is_err());
+    }
+
+    #[test]
+    fn test_pragma_busy_timeout_set_and_query() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("PRAGMA busy_timeout=10000;").unwrap();
+        let rows = conn.query("PRAGMA busy_timeout;").unwrap();
+        assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Integer(10000));
+    }
+
+    #[test]
+    fn test_pragma_busy_timeout_default() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn.query("PRAGMA busy_timeout;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Integer(5000));
+    }
+
+    #[test]
+    fn test_pragma_state_accessor() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("PRAGMA journal_mode=truncate;").unwrap();
+        conn.execute("PRAGMA synchronous=FULL;").unwrap();
+        conn.execute("PRAGMA cache_size=-8000;").unwrap();
+        conn.execute("PRAGMA page_size=16384;").unwrap();
+        conn.execute("PRAGMA busy_timeout=3000;").unwrap();
+
+        let state = conn.pragma_state();
+        assert_eq!(state.journal_mode, "truncate");
+        assert_eq!(state.synchronous, "FULL");
+        assert_eq!(state.cache_size, -8000);
+        assert_eq!(state.page_size, 16384);
+        assert_eq!(state.busy_timeout_ms, 3000);
+    }
+
+    #[test]
+    fn test_pragma_concurrent_mode_returns_value() {
+        let conn = Connection::open(":memory:").unwrap();
+        // Query default (off).
+        let rows = conn.query("PRAGMA concurrent_mode;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Integer(0));
+        // Set on, check return.
+        let rows = conn.query("PRAGMA concurrent_mode=ON;").unwrap();
+        assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Integer(1));
+    }
 }
