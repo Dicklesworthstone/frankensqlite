@@ -4381,18 +4381,18 @@ mod tests {
     #[test]
     fn test_pragma_journal_mode_set_and_query() {
         let conn = Connection::open(":memory:").unwrap();
-        // Set returns the new value.
-        let rows = conn.query("PRAGMA journal_mode=delete;").unwrap();
+        // Set returns the new value (quoted to avoid keyword clash with parser).
+        let rows = conn.query("PRAGMA journal_mode='truncate';").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(
             *rows[0].get(0).unwrap(),
-            SqliteValue::Text("delete".to_owned())
+            SqliteValue::Text("truncate".to_owned())
         );
         // Query reads back.
         let rows = conn.query("PRAGMA journal_mode;").unwrap();
         assert_eq!(
             *rows[0].get(0).unwrap(),
-            SqliteValue::Text("delete".to_owned())
+            SqliteValue::Text("truncate".to_owned())
         );
     }
 

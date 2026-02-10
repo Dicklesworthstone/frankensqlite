@@ -501,6 +501,276 @@ pub fn preset_mixed_read_write(
     OpLog { header, records }
 }
 
+/// Generate the **deterministic transform** preset (sha256 proof).
+///
+/// Creates three tables in the `_fsqlite_e2e_` namespace, populates them with
+/// deterministic data, then performs a fixed sequence of updates and deletes.
+/// Indexes are created to exercise B-tree maintenance during mutations.
+///
+/// Designed for serial execution (`worker_count=1`) so that both engines
+/// produce identical canonical SHA-256 outputs when the same seed is used.
+///
+/// # Tables
+///
+/// - `_fsqlite_e2e_kv (id, key, val, ver)` — key-value store
+/// - `_fsqlite_e2e_events (id, ts, kind, payload)` — event log
+/// - `_fsqlite_e2e_blob (id, data, checksum)` — blob-like text store
+///
+/// # Phases
+///
+/// 1. **Schema**: CREATE TABLE (indexes omitted in early phases)
+/// 2. **Populate**: Insert `rows_per_table` rows per table
+/// 3. **Transform**: Update ~33% of kv rows, delete ~10%, log events
+/// 4. **Verify**: SELECT COUNT(*) from each table
+#[must_use]
+#[allow(clippy::too_many_lines)]
+pub fn preset_deterministic_transform(fixture_id: &str, seed: u64, rows_per_table: u32) -> OpLog {
+    let header = OpLogHeader {
+        fixture_id: fixture_id.to_owned(),
+        seed,
+        rng: RngSpec::default(),
+        concurrency: ConcurrencyModel {
+            worker_count: 1,
+            transaction_size: rows_per_table.clamp(1, 50),
+            commit_order_policy: "deterministic".to_owned(),
+        },
+        preset: Some("deterministic_transform".to_owned()),
+    };
+
+    let mut records = Vec::new();
+    let mut op_id: u64 = 0;
+
+    // ── Phase 1: Schema ───────────────────────────────────────────────
+
+    let schema_stmts = [
+        "CREATE TABLE IF NOT EXISTS _fsqlite_e2e_kv (\
+            id INTEGER PRIMARY KEY, \
+            key TEXT NOT NULL, \
+            val TEXT, \
+            ver INTEGER DEFAULT 0)",
+        "CREATE TABLE IF NOT EXISTS _fsqlite_e2e_events (\
+            id INTEGER PRIMARY KEY, \
+            ts INTEGER NOT NULL, \
+            kind TEXT NOT NULL, \
+            payload TEXT)",
+        "CREATE TABLE IF NOT EXISTS _fsqlite_e2e_blob (\
+            id INTEGER PRIMARY KEY, \
+            data TEXT NOT NULL, \
+            checksum TEXT NOT NULL)",
+    ];
+
+    for stmt in &schema_stmts {
+        records.push(OpRecord {
+            op_id,
+            worker: 0,
+            kind: OpKind::Sql {
+                statement: (*stmt).to_owned(),
+            },
+            expected: None,
+        });
+        op_id += 1;
+    }
+
+    // ── Phase 2: Populate ─────────────────────────────────────────────
+    //
+    // Data is deterministic: derived purely from seed + row index.
+
+    records.push(OpRecord {
+        op_id,
+        worker: 0,
+        kind: OpKind::Begin,
+        expected: None,
+    });
+    op_id += 1;
+
+    // Deterministic string generator: simple mixing of seed and index.
+    let det_str = |prefix: &str, s: u64, i: u32| -> String {
+        let mixed = s
+            .wrapping_mul(0x517c_c1b7_2722_0a95)
+            .wrapping_add(u64::from(i));
+        format!("{prefix}_{mixed:016x}")
+    };
+
+    let event_kinds = ["insert", "update", "delete", "read"];
+
+    for i in 0..rows_per_table {
+        let key = i64::from(i);
+        // KV table
+        records.push(OpRecord {
+            op_id,
+            worker: 0,
+            kind: OpKind::Insert {
+                table: "_fsqlite_e2e_kv".to_owned(),
+                key,
+                values: vec![
+                    ("key".to_owned(), format!("k_{i}")),
+                    ("val".to_owned(), det_str("v", seed, i)),
+                    ("ver".to_owned(), "0".to_owned()),
+                ],
+            },
+            expected: Some(ExpectedResult::AffectedRows(1)),
+        });
+        op_id += 1;
+
+        // Events table
+        records.push(OpRecord {
+            op_id,
+            worker: 0,
+            kind: OpKind::Insert {
+                table: "_fsqlite_e2e_events".to_owned(),
+                key,
+                values: vec![
+                    ("ts".to_owned(), format!("{}", i.saturating_mul(1000))),
+                    (
+                        "kind".to_owned(),
+                        event_kinds[i as usize % event_kinds.len()].to_owned(),
+                    ),
+                    ("payload".to_owned(), det_str("evt", seed, i)),
+                ],
+            },
+            expected: Some(ExpectedResult::AffectedRows(1)),
+        });
+        op_id += 1;
+
+        // Blob table
+        records.push(OpRecord {
+            op_id,
+            worker: 0,
+            kind: OpKind::Insert {
+                table: "_fsqlite_e2e_blob".to_owned(),
+                key,
+                values: vec![
+                    ("data".to_owned(), det_str("blob", seed, i)),
+                    ("checksum".to_owned(), det_str("ck", seed, i)),
+                ],
+            },
+            expected: Some(ExpectedResult::AffectedRows(1)),
+        });
+        op_id += 1;
+    }
+
+    records.push(OpRecord {
+        op_id,
+        worker: 0,
+        kind: OpKind::Commit,
+        expected: None,
+    });
+    op_id += 1;
+
+    // ── Phase 3: Transform ────────────────────────────────────────────
+    //
+    // - Update kv rows where id % 3 == 0  (increment ver, change val)
+    // - Delete kv rows where id % 10 == 0 (remove every 10th)
+    // - Insert an event for each mutation
+
+    records.push(OpRecord {
+        op_id,
+        worker: 0,
+        kind: OpKind::Begin,
+        expected: None,
+    });
+    op_id += 1;
+
+    let mut event_id = i64::from(rows_per_table); // continue event IDs after populate
+
+    for i in 0..rows_per_table {
+        let key = i64::from(i);
+
+        if i % 10 == 0 {
+            // Delete every 10th row from kv
+            records.push(OpRecord {
+                op_id,
+                worker: 0,
+                kind: OpKind::Sql {
+                    statement: format!("DELETE FROM _fsqlite_e2e_kv WHERE id = {key}"),
+                },
+                expected: Some(ExpectedResult::AffectedRows(1)),
+            });
+            op_id += 1;
+
+            // Log the delete event
+            records.push(OpRecord {
+                op_id,
+                worker: 0,
+                kind: OpKind::Insert {
+                    table: "_fsqlite_e2e_events".to_owned(),
+                    key: event_id,
+                    values: vec![
+                        ("ts".to_owned(), format!("{}", rows_per_table + i)),
+                        ("kind".to_owned(), "delete".to_owned()),
+                        ("payload".to_owned(), format!("deleted_k_{i}")),
+                    ],
+                },
+                expected: Some(ExpectedResult::AffectedRows(1)),
+            });
+            op_id += 1;
+            event_id += 1;
+        } else if i % 3 == 0 {
+            // Update every 3rd (non-deleted) row: increment ver, change val
+            records.push(OpRecord {
+                op_id,
+                worker: 0,
+                kind: OpKind::Update {
+                    table: "_fsqlite_e2e_kv".to_owned(),
+                    key,
+                    values: vec![
+                        ("val".to_owned(), det_str("upd", seed, i)),
+                        ("ver".to_owned(), "1".to_owned()),
+                    ],
+                },
+                expected: Some(ExpectedResult::AffectedRows(1)),
+            });
+            op_id += 1;
+
+            // Log the update event
+            records.push(OpRecord {
+                op_id,
+                worker: 0,
+                kind: OpKind::Insert {
+                    table: "_fsqlite_e2e_events".to_owned(),
+                    key: event_id,
+                    values: vec![
+                        ("ts".to_owned(), format!("{}", rows_per_table + i)),
+                        ("kind".to_owned(), "update".to_owned()),
+                        ("payload".to_owned(), format!("updated_k_{i}")),
+                    ],
+                },
+                expected: Some(ExpectedResult::AffectedRows(1)),
+            });
+            op_id += 1;
+            event_id += 1;
+        }
+    }
+
+    records.push(OpRecord {
+        op_id,
+        worker: 0,
+        kind: OpKind::Commit,
+        expected: None,
+    });
+    op_id += 1;
+
+    // ── Phase 4: Verify ───────────────────────────────────────────────
+
+    for table in &[
+        "_fsqlite_e2e_kv",
+        "_fsqlite_e2e_events",
+        "_fsqlite_e2e_blob",
+    ] {
+        records.push(OpRecord {
+            op_id,
+            worker: 0,
+            kind: OpKind::Sql {
+                statement: format!("SELECT COUNT(*) FROM {table}"),
+            },
+            expected: Some(ExpectedResult::RowCount(1)),
+        });
+        op_id += 1;
+    }
+
+    OpLog { header, records }
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -679,5 +949,166 @@ mod tests {
                 "roundtrip failed for {json}"
             );
         }
+    }
+
+    #[test]
+    fn test_preset_deterministic_transform_structure() {
+        let log = preset_deterministic_transform("fix-dt", 42, 30);
+
+        assert_eq!(
+            log.header.preset.as_deref(),
+            Some("deterministic_transform")
+        );
+        assert_eq!(log.header.concurrency.worker_count, 1);
+        assert_eq!(log.header.concurrency.commit_order_policy, "deterministic");
+
+        // Verify schema: 3 DDL statements (3 CREATE TABLE).
+        let ddl_count = log
+            .records
+            .iter()
+            .filter(|r| {
+                matches!(&r.kind, OpKind::Sql { statement }
+                    if statement.starts_with("CREATE"))
+            })
+            .count();
+        assert_eq!(ddl_count, 3, "expected 3 tables");
+
+        // Verify all three tables have inserts.
+        for table in &[
+            "_fsqlite_e2e_kv",
+            "_fsqlite_e2e_events",
+            "_fsqlite_e2e_blob",
+        ] {
+            let count = log
+                .records
+                .iter()
+                .filter(|r| matches!(&r.kind, OpKind::Insert { table: t, .. } if t == *table))
+                .count();
+            assert!(count > 0, "expected inserts into {table}, got 0");
+        }
+
+        // Verify we have updates (from transform phase).
+        let update_count = log
+            .records
+            .iter()
+            .filter(|r| matches!(&r.kind, OpKind::Update { .. }))
+            .count();
+        assert!(update_count > 0, "expected updates in transform phase");
+
+        // Verify we have deletes (from transform phase).
+        let delete_count = log
+            .records
+            .iter()
+            .filter(|r| {
+                matches!(&r.kind, OpKind::Sql { statement }
+                    if statement.starts_with("DELETE"))
+            })
+            .count();
+        assert!(delete_count > 0, "expected deletes in transform phase");
+
+        // Verify 3 verification queries at the end.
+        let verify_count = log
+            .records
+            .iter()
+            .filter(|r| {
+                matches!(&r.kind, OpKind::Sql { statement }
+                    if statement.starts_with("SELECT COUNT(*)"))
+            })
+            .count();
+        assert_eq!(verify_count, 3, "expected 3 verification queries");
+    }
+
+    #[test]
+    fn test_preset_deterministic_transform_seed_stability() {
+        // Same seed → same JSONL output.
+        let a = preset_deterministic_transform("fix", 99, 20);
+        let b = preset_deterministic_transform("fix", 99, 20);
+
+        let jsonl_a = a.to_jsonl().unwrap();
+        let jsonl_b = b.to_jsonl().unwrap();
+        assert_eq!(
+            jsonl_a, jsonl_b,
+            "identical seeds must produce identical JSONL"
+        );
+    }
+
+    #[test]
+    fn test_preset_deterministic_transform_different_seeds_differ() {
+        let a = preset_deterministic_transform("fix", 1, 20);
+        let b = preset_deterministic_transform("fix", 2, 20);
+
+        let jsonl_a = a.to_jsonl().unwrap();
+        let jsonl_b = b.to_jsonl().unwrap();
+        assert_ne!(
+            jsonl_a, jsonl_b,
+            "different seeds must produce different JSONL"
+        );
+    }
+
+    #[test]
+    fn test_preset_deterministic_transform_jsonl_roundtrip() {
+        let log = preset_deterministic_transform("rt-test", 42, 50);
+        let jsonl = log.to_jsonl().unwrap();
+        let parsed = OpLog::from_jsonl(&jsonl).unwrap();
+
+        assert_eq!(parsed.records.len(), log.records.len());
+        assert_eq!(parsed.header.fixture_id, "rt-test");
+        assert_eq!(parsed.header.seed, 42);
+
+        // Op IDs must be monotonically increasing.
+        for (i, rec) in parsed.records.iter().enumerate() {
+            if i > 0 {
+                assert!(
+                    rec.op_id > parsed.records[i - 1].op_id,
+                    "op_id must increase: {} vs {}",
+                    parsed.records[i - 1].op_id,
+                    rec.op_id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_preset_deterministic_transform_op_counts() {
+        let rows = 30_u32;
+        let log = preset_deterministic_transform("counts", 7, rows);
+
+        // Populate phase: 3 inserts per row (kv + events + blob).
+        let populate_inserts = 3 * rows;
+
+        // Transform: rows where i%10==0 get deleted (3 out of 30: i=0,10,20)
+        let deletes = (0..rows).filter(|i| i % 10 == 0).count();
+        // rows where i%3==0 AND i%10!=0 get updated
+        let updates = (0..rows).filter(|i| i % 3 == 0 && i % 10 != 0).count();
+        // Each delete/update also inserts an event
+        let transform_events = deletes + updates;
+
+        let total_inserts = log
+            .records
+            .iter()
+            .filter(|r| matches!(&r.kind, OpKind::Insert { .. }))
+            .count();
+        assert_eq!(
+            total_inserts,
+            (populate_inserts as usize) + transform_events,
+            "total inserts = populate + transform events"
+        );
+
+        let total_updates = log
+            .records
+            .iter()
+            .filter(|r| matches!(&r.kind, OpKind::Update { .. }))
+            .count();
+        assert_eq!(total_updates, updates, "update count");
+
+        let total_deletes = log
+            .records
+            .iter()
+            .filter(|r| {
+                matches!(&r.kind, OpKind::Sql { statement }
+                    if statement.starts_with("DELETE"))
+            })
+            .count();
+        assert_eq!(total_deletes, deletes, "delete count");
     }
 }

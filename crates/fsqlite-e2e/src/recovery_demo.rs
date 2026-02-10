@@ -321,8 +321,17 @@ mod tests {
 
     /// Create a WAL-mode database, insert rows, return the DB path.
     fn setup_wal_database(dir: &Path) -> (std::path::PathBuf, Vec<(i64, String)>) {
-        let db_path = dir.join("demo.db");
-        let conn = rusqlite::Connection::open(&db_path).expect("open db");
+        // SQLite deletes `-wal`/`-shm` on clean close of the last connection.
+        //
+        // For recovery demos we want a "crash residue" fixture: a DB file plus a
+        // WAL file with committed frames that have not been checkpointed into the
+        // DB file. We create that by snapshotting the live DB + WAL *while the
+        // writer connection is still open*, then closing cleanly and operating on
+        // the snapshot copies.
+        let live_db_path = dir.join("demo_live.db");
+        let crash_db_path = dir.join("demo.db");
+
+        let conn = rusqlite::Connection::open(&live_db_path).expect("open live db");
         conn.execute_batch("PRAGMA journal_mode=WAL;")
             .expect("set WAL mode");
         let mode: String = conn
@@ -352,51 +361,26 @@ mod tests {
             expected_rows.push((id, payload));
         }
 
-        let wal_path = db_path.with_extension("db-wal");
-        let wal_backup = db_path.with_extension("db-wal.bak");
-
-        // Open a second reader inside an explicit transaction so it holds a
-        // WAL read-mark across the writer close.  The open read transaction
-        // prevents the close-time passive checkpoint from recycling frames.
-        let reader = rusqlite::Connection::open_with_flags(
-            &db_path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )
-        .expect("open reader");
-        reader
-            .execute_batch("PRAGMA wal_autocheckpoint=0;")
-            .expect("reader autocheckpoint off");
-        // Begin an explicit read transaction to hold the shared lock.
-        reader.execute_batch("BEGIN;").expect("begin reader txn");
-        let _: i64 = reader
-            .query_row("SELECT count(*) FROM demo", [], |r| r.get(0))
-            .expect("reader count");
-
-        // Back up the WAL before dropping the writer connection.  This ensures
-        // we have a non-empty WAL for the corruption demo even if SQLite
-        // truncates the WAL on close.
-        assert!(wal_path.exists(), "WAL file must exist after writes");
-        let wal_len = fs::metadata(&wal_path).expect("wal metadata").len();
+        let live_wal_path = live_db_path.with_extension("db-wal");
+        assert!(live_wal_path.exists(), "WAL file must exist after writes");
+        let wal_len = fs::metadata(&live_wal_path).expect("wal metadata").len();
         let wal_header_len = u64::try_from(WAL_HEADER_SIZE).expect("WAL header size fits u64");
         assert!(
             wal_len > wal_header_len,
             "WAL must contain frames (len={wal_len})"
         );
-        fs::copy(&wal_path, &wal_backup).expect("backup WAL");
 
-        // Close the writer.  The reader's open transaction holds a read
-        // lock so the close-time passive checkpoint cannot truncate the WAL.
-        drop(conn);
-        drop(reader);
+        fs::copy(&live_db_path, &crash_db_path).expect("copy crash db");
+        fs::copy(&live_wal_path, crash_db_path.with_extension("db-wal")).expect("copy crash wal");
 
-        // Restore the WAL if it was removed by the reader's close.
-        let wal_len = fs::metadata(&wal_path).map_or(0, |m| m.len());
-        if wal_len <= wal_header_len && wal_backup.exists() {
-            fs::copy(&wal_backup, &wal_path).expect("restore WAL");
+        let live_shm_path = live_db_path.with_extension("db-shm");
+        if live_shm_path.exists() {
+            fs::copy(&live_shm_path, crash_db_path.with_extension("db-shm"))
+                .expect("copy crash shm");
         }
-        // Clean up backup.
-        let _ = fs::remove_file(&wal_backup);
-        (db_path, expected_rows)
+
+        drop(conn);
+        (crash_db_path, expected_rows)
     }
 
     /// Count rows in the demo table, returning Ok(count) or Err on failure.
@@ -416,6 +400,20 @@ mod tests {
             .map_err(|e| format!("query failed: {e}"))?;
 
         Ok(usize::try_from(count).expect("count fits usize"))
+    }
+
+    fn copy_db_with_sidecars(src_db: &Path, dst_db: &Path) {
+        fs::copy(src_db, dst_db).expect("copy db");
+
+        let wal_src = src_db.with_extension("db-wal");
+        if wal_src.exists() {
+            fs::copy(wal_src, dst_db.with_extension("db-wal")).expect("copy wal");
+        }
+
+        let shm_src = src_db.with_extension("db-shm");
+        if shm_src.exists() {
+            fs::copy(shm_src, dst_db.with_extension("db-shm")).expect("copy shm");
+        }
     }
 
     #[test]
@@ -454,7 +452,10 @@ mod tests {
         let (db_path, expected_rows) = setup_wal_database(dir.path());
 
         // Verify baseline: all rows present before corruption.
-        let baseline = count_rows(&db_path).expect("baseline count");
+        let probe_dir = tempfile::tempdir().unwrap();
+        let probe_db = probe_dir.path().join("probe.db");
+        copy_db_with_sidecars(&db_path, &probe_db);
+        let baseline = count_rows(&probe_db).expect("baseline count");
         assert_eq!(baseline, expected_rows.len());
 
         // Remove SHM file to force WAL replay on next open.
@@ -596,7 +597,10 @@ mod tests {
         let wal_path = db_path.with_extension("db-wal");
 
         // Step 1: Verify all data present before corruption.
-        let baseline = count_rows(&db_path).expect("baseline");
+        let probe_dir = tempfile::tempdir().unwrap();
+        let probe_db = probe_dir.path().join("probe.db");
+        copy_db_with_sidecars(&db_path, &probe_db);
+        let baseline = count_rows(&probe_db).expect("baseline");
         assert_eq!(baseline, expected_rows.len());
 
         // Step 2: Parse WAL, build FEC sidecar.

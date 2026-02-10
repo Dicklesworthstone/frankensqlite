@@ -24,11 +24,10 @@
 //! ```
 
 use std::fmt::Write as FmtWrite;
-use std::path::Path;
 use std::time::Instant;
 
 use fsqlite_e2e::oplog::{
-    preset_commutative_inserts_disjoint_keys, preset_hot_page_contention, OpLog,
+    OpLog, preset_commutative_inserts_disjoint_keys, preset_hot_page_contention,
 };
 use fsqlite_e2e::report::EngineRunReport;
 use fsqlite_e2e::sqlite_executor::{SqliteExecConfig, run_oplog_sqlite};
@@ -83,10 +82,6 @@ impl RunMetrics {
         self.total_aborts.push(report.aborts);
         self.ops_total = report.ops_total;
         self.errors.push(report.error.clone());
-    }
-
-    fn median_wall_ms(&self) -> u64 {
-        percentile_u64(&self.wall_time_ms, 50)
     }
 
     fn p50_ops_per_sec(&self) -> f64 {
@@ -168,8 +163,10 @@ fn run_fsqlite_sequential(oplog: &OpLog) -> EngineRunReport {
                 )
             }
             fsqlite_e2e::oplog::OpKind::Update { table, key, values } => {
-                let sets: Vec<String> =
-                    values.iter().map(|(c, v)| format!("{c}={}", format_val(v))).collect();
+                let sets: Vec<String> = values
+                    .iter()
+                    .map(|(c, v)| format!("{c}={}", format_val(v)))
+                    .collect();
                 format!("UPDATE \"{table}\" SET {} WHERE id={key}", sets.join(", "))
             }
             fsqlite_e2e::oplog::OpKind::Begin => "BEGIN".to_owned(),
@@ -230,7 +227,7 @@ fn run_disjoint_scaling(worker_count: u16) -> RunMetrics {
     for rep in 0..REPETITIONS {
         let oplog = preset_commutative_inserts_disjoint_keys(
             &format!("mvcc-disjoint-{worker_count}w-rep{rep}"),
-            SEED + u64::from(rep as u32),
+            SEED.wrapping_add(rep as u64),
             worker_count,
             DISJOINT_ROWS_PER_WORKER,
         );
@@ -246,7 +243,7 @@ fn run_contention_scaling(worker_count: u16) -> RunMetrics {
     for rep in 0..REPETITIONS {
         let oplog = preset_hot_page_contention(
             &format!("mvcc-contention-{worker_count}w-rep{rep}"),
-            SEED + u64::from(rep as u32),
+            SEED.wrapping_add(rep as u64),
             worker_count,
             CONTENTION_ROUNDS,
         );
@@ -259,10 +256,10 @@ fn run_contention_scaling(worker_count: u16) -> RunMetrics {
 /// Format a scaling report table.
 fn format_scaling_table(mode: &str, results: &[RunMetrics], baseline_ops: f64) -> String {
     let mut out = String::new();
-    let _ = writeln!(out, "\n{'=':.>72}");
+    let _ = writeln!(out, "\n{}", "=".repeat(72));
     let _ = writeln!(out, "  MVCC Scaling Report: {mode}");
     let _ = writeln!(out, "  Repetitions: {REPETITIONS}");
-    let _ = writeln!(out, "{'=':.>72}");
+    let _ = writeln!(out, "{}", "=".repeat(72));
     let _ = writeln!(
         out,
         "  {:>8} {:>12} {:>12} {:>10} {:>10} {:>8}",
@@ -290,7 +287,7 @@ fn format_scaling_table(mode: &str, results: &[RunMetrics], baseline_ops: f64) -
         );
     }
 
-    let _ = writeln!(out, "{'=':.>72}\n");
+    let _ = writeln!(out, "{}\n", "=".repeat(72));
     out
 }
 
@@ -373,16 +370,23 @@ fn mvcc_scaling_report_disjoint_partitions() {
         .map(|&w| run_disjoint_scaling(w))
         .collect();
 
-    let baseline_ops = results
-        .first()
-        .map_or(0.0, |m| m.p50_ops_per_sec());
+    let baseline_ops = results.first().map_or(0.0, RunMetrics::p50_ops_per_sec);
 
-    let table = format_scaling_table("Disjoint Partitions (zero contention)", &results, baseline_ops);
+    let table = format_scaling_table(
+        "Disjoint Partitions (zero contention)",
+        &results,
+        baseline_ops,
+    );
     println!("{table}");
 
     // Verify no fatal errors at any level.
     for m in &results {
-        assert!(!m.any_error(), "errors at {} workers: {:?}", m.worker_count, m.errors);
+        assert!(
+            !m.any_error(),
+            "errors at {} workers: {:?}",
+            m.worker_count,
+            m.errors
+        );
     }
 }
 
@@ -393,9 +397,7 @@ fn mvcc_scaling_report_hot_page_contention() {
         .map(|&w| run_contention_scaling(w))
         .collect();
 
-    let baseline_ops = results
-        .first()
-        .map_or(0.0, |m| m.p50_ops_per_sec());
+    let baseline_ops = results.first().map_or(0.0, RunMetrics::p50_ops_per_sec);
 
     let table = format_scaling_table("Hot-Page Contention (SSI conflict)", &results, baseline_ops);
     println!("{table}");
@@ -450,17 +452,17 @@ fn mvcc_fsqlite_baseline_contention() {
 #[test]
 fn mvcc_combined_scaling_comparison() {
     let mut report = String::new();
-    let _ = writeln!(report, "\n{'#':.>72}");
+    let _ = writeln!(report, "\n{}", "#".repeat(72));
     let _ = writeln!(report, "  MVCC Concurrent Writers — Full Scaling Report");
     let _ = writeln!(report, "  Bead: bd-1w6k.4.3");
-    let _ = writeln!(report, "{'#':.>72}");
+    let _ = writeln!(report, "{}", "#".repeat(72));
 
     // ── Disjoint partition mode ──
     let disjoint: Vec<RunMetrics> = CONCURRENCY_LEVELS
         .iter()
         .map(|&w| run_disjoint_scaling(w))
         .collect();
-    let base_disjoint = disjoint.first().map_or(0.0, |m| m.p50_ops_per_sec());
+    let base_disjoint = disjoint.first().map_or(0.0, RunMetrics::p50_ops_per_sec);
     let _ = writeln!(
         report,
         "{}",
@@ -472,7 +474,7 @@ fn mvcc_combined_scaling_comparison() {
         .iter()
         .map(|&w| run_contention_scaling(w))
         .collect();
-    let base_contention = contention.first().map_or(0.0, |m| m.p50_ops_per_sec());
+    let base_contention = contention.first().map_or(0.0, RunMetrics::p50_ops_per_sec);
     let _ = writeln!(
         report,
         "{}",
@@ -484,7 +486,12 @@ fn mvcc_combined_scaling_comparison() {
     let _ = writeln!(report, "  {:-<72}", "");
 
     let fs_disjoint = {
-        let oplog = preset_commutative_inserts_disjoint_keys("baseline-d", SEED, 4, DISJOINT_ROWS_PER_WORKER);
+        let oplog = preset_commutative_inserts_disjoint_keys(
+            "baseline-d",
+            SEED,
+            4,
+            DISJOINT_ROWS_PER_WORKER,
+        );
         run_fsqlite_sequential(&oplog)
     };
     let _ = writeln!(
@@ -503,6 +510,6 @@ fn mvcc_combined_scaling_comparison() {
         fs_contention.ops_total, fs_contention.ops_per_sec, fs_contention.wall_time_ms
     );
 
-    let _ = writeln!(report, "\n{'#':.>72}");
+    let _ = writeln!(report, "\n{}", "#".repeat(72));
     println!("{report}");
 }

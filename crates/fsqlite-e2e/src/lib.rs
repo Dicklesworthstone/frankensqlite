@@ -9,6 +9,7 @@
 pub mod canonicalize;
 pub mod comparison;
 pub mod corruption;
+pub mod corruption_scenarios;
 pub mod executor;
 pub mod fsqlite_executor;
 pub mod golden;

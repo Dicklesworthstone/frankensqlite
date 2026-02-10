@@ -669,6 +669,23 @@ mod tests {
     }
 
     #[test]
+    fn run_deterministic_transform_sqlite() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("dt_sqlite.db");
+
+        let oplog = crate::oplog::preset_deterministic_transform("dt-sqlite", 42, 30);
+        let report = run_oplog_sqlite(&db_path, &oplog, &SqliteExecConfig::default()).unwrap();
+
+        assert!(report.error.is_none(), "error={:?}", report.error);
+        assert!(report.ops_total > 100);
+        assert_eq!(
+            report.correctness.integrity_check_ok,
+            Some(true),
+            "DB should pass integrity_check after deterministic transform"
+        );
+    }
+
+    #[test]
     fn run_integrity_check_on_healthy_db() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("healthy.db");
