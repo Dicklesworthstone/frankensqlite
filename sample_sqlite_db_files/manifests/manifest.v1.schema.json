@@ -1,0 +1,119 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frankensqlite.local/schemas/sample_sqlite_db_files/manifest.v1.schema.json",
+  "title": "FrankenSQLite RealDB Corpus Manifest (v1)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["manifest_version", "entries"],
+  "properties": {
+    "manifest_version": {
+      "type": "integer",
+      "const": 1,
+      "description": "Schema version for this manifest file."
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Optional timestamp for when this manifest was generated."
+    },
+    "entries": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/entry" },
+      "description": "Corpus DB entries. Each entry corresponds to a file in sample_sqlite_db_files/golden/ (not tracked in git)."
+    },
+    "notes": {
+      "type": "string",
+      "description": "Optional free-form notes about the manifest as a whole."
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "Lowercase hex SHA-256."
+    },
+    "entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["db_id", "golden_filename", "sha256_golden", "size_bytes"],
+      "properties": {
+        "db_id": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9_\\-]{1,63}$",
+          "description": "Stable slug used by harness selectors/logging."
+        },
+        "golden_filename": {
+          "type": "string",
+          "minLength": 1,
+          "description": "File name under sample_sqlite_db_files/golden/ (e.g., 'asupersync.db')."
+        },
+        "source_path": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Absolute source path under /dp used to seed the golden copy (inputs only; never modified)."
+        },
+        "provenance": {
+          "type": "string",
+          "description": "Human-readable provenance: what project/system produced this DB and why it's useful."
+        },
+        "sha256_golden": { "$ref": "#/$defs/sha256" },
+        "size_bytes": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Size of the golden file in bytes."
+        },
+        "sidecars": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "wal_present": { "type": "boolean" },
+            "shm_present": { "type": "boolean" },
+            "journal_present": { "type": "boolean" },
+            "other": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "Any additional relevant sidecar file names (relative to golden/)."
+            }
+          },
+          "description": "Whether the source had -wal/-shm/-journal sidecars at capture time (best-effort metadata)."
+        },
+        "sqlite_meta": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "page_size": { "type": "integer", "minimum": 512, "maximum": 65536 },
+            "encoding": { "type": "string" },
+            "user_version": { "type": "integer" },
+            "application_id": { "type": "integer" },
+            "journal_mode": { "type": "string" },
+            "auto_vacuum": { "type": "integer" }
+          },
+          "description": "SQLite metadata captured from PRAGMAs (best-effort; keys may expand over time)."
+        },
+        "tags": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Short tags (e.g., 'beads', 'small', 'wal', 'many_indexes')."
+        },
+        "safety": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "pii_risk": {
+              "type": "string",
+              "enum": ["unknown", "unlikely", "possible", "likely"],
+              "description": "Best-effort assessment; exclude entries likely to contain secrets/PII."
+            }
+          },
+          "description": "Safety metadata for curation."
+        },
+        "notes": {
+          "type": "string",
+          "description": "Free-form gotchas (corruptions, huge freelist, empty db, etc.)."
+        }
+      }
+    }
+  }
+}
+

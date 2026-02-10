@@ -1860,8 +1860,8 @@ mod tests {
         let single_eq_term = [eq_term("col")];
         let in_3_term = [in_term("col", 3)];
 
-        let ap_eq = best_access_path(&table, &[idx.clone()], &single_eq_term, None);
-        let ap_in = best_access_path(&table, &[idx], &in_3_term, None);
+        let ap_eq = best_access_path(&table, std::slice::from_ref(&idx), &single_eq_term, None);
+        let ap_in = best_access_path(&table, std::slice::from_ref(&idx), &in_3_term, None);
 
         // IN with 3 probes should cost approximately 3x a single equality.
         let ratio = ap_in.estimated_cost / ap_eq.estimated_cost;
@@ -2021,18 +2021,13 @@ mod tests {
         let small = table_stats("small", 1, 10);
         let medium = table_stats("medium", 10, 100);
         let large = table_stats("large", 100, 1000);
-        let plan_sml = order_joins(
-            &[small.clone(), medium.clone(), large.clone()],
-            &[],
-            &[],
-            None,
-            &[],
-        );
+        let plan_sml = order_joins(&[small, medium, large], &[], &[], None, &[]);
 
         // With correct cumulative scaling, putting the largest table last
         // is expensive because it scans once per (small * medium) row.
         // The planner should NOT produce the same cost as it would if
         // outer_rows were only the second table's rows.
+        #[allow(clippy::suboptimal_flops)]
         let cost_if_only_last = 1.0_f64   // small full scan cost
             + 10.0 * 10.0   // medium scanned 10 times
             + 100.0 * 100.0; // BUG cost: large scanned only 100 times (medium.rows)

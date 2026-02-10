@@ -38,7 +38,7 @@ const DB_HEADER_SIZE: usize = 100;
 pub enum CorruptionPattern {
     /// Flip a single bit at a specific byte offset.
     BitFlip { byte_offset: u64, bit_position: u8 },
-    /// Zero out an entire page.
+    /// Zero out an entire page (SQLite page numbers are 1-indexed).
     PageZero { page_number: u32 },
     /// Overwrite N bytes at offset with seeded random data.
     RandomOverwrite {
@@ -56,6 +56,8 @@ pub enum CorruptionPattern {
     /// Zero out the 100-byte database header (page 1, offset 0..100).
     HeaderZero,
     /// Corrupt specific WAL frames with seeded random data.
+    ///
+    /// Note: `frame_numbers` are 0-indexed (first frame starts at offset 32).
     WalFrameCorrupt { frame_numbers: Vec<u32>, seed: u64 },
     /// Corrupt a region of an FEC sidecar file with seeded random data.
     SidecarCorrupt {
@@ -113,7 +115,7 @@ pub struct CorruptionReport {
     pub pattern: CorruptionPattern,
     /// Number of bytes actually modified.
     pub affected_bytes: u64,
-    /// Page numbers that were affected (0-indexed).
+    /// SQLite page numbers that were affected (1-indexed).
     pub affected_pages: Vec<u32>,
     /// SHA-256 of the affected region *before* corruption.
     pub original_sha256: String,
@@ -172,7 +174,11 @@ impl CorruptionInjector {
     /// # Errors
     ///
     /// Returns `E2eError::Io` on file I/O failure.
-    #[allow(clippy::too_many_lines, clippy::cast_possible_truncation)]
+    #[allow(
+        clippy::too_many_lines,
+        clippy::cast_possible_truncation,
+        clippy::match_same_arms
+    )]
     pub fn inject(&self, pattern: &CorruptionPattern) -> E2eResult<CorruptionReport> {
         let mut data = std::fs::read(&self.path)?;
         if data.is_empty() {
@@ -189,6 +195,13 @@ impl CorruptionInjector {
                 byte_offset,
                 bit_position,
             } => {
+                if *bit_position >= 8 {
+                    return Err(E2eError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("bit_position {bit_position} must be in 0..=7"),
+                    )));
+                }
+
                 let off = *byte_offset as usize;
                 if off >= data.len() {
                     return Err(E2eError::Io(std::io::Error::new(
@@ -197,15 +210,32 @@ impl CorruptionInjector {
                     )));
                 }
                 let original = vec![data[off]];
-                data[off] ^= 1 << (bit_position % 8);
-                let page = off / ps;
+                data[off] ^= 1 << bit_position;
+                let page = (off / ps) + 1;
                 (1, vec![page as u32], original)
             }
 
             CorruptionPattern::PageZero { page_number } => {
-                let start = *page_number as usize * ps;
-                let end = (start + ps).min(data.len());
-                if start >= data.len() {
+                let Some(page_index) = page_number.checked_sub(1) else {
+                    return Err(E2eError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "page_number must be >= 1",
+                    )));
+                };
+
+                let Some(start) = (page_index as usize).checked_mul(ps) else {
+                    return Err(E2eError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "page offset overflow",
+                    )));
+                };
+                let Some(end) = start.checked_add(ps) else {
+                    return Err(E2eError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "page end overflow",
+                    )));
+                };
+                if end > data.len() {
                     return Err(E2eError::Io(std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
                         format!("page {page_number} beyond file end"),
@@ -213,31 +243,39 @@ impl CorruptionInjector {
                 }
                 let original = data[start..end].to_vec();
                 data[start..end].fill(0);
-                let bytes = (end - start) as u64;
-                (bytes, vec![*page_number], original)
+                (ps as u64, vec![*page_number], original)
             }
 
             CorruptionPattern::RandomOverwrite {
                 offset,
                 length,
                 seed,
+            }
+            | CorruptionPattern::SidecarCorrupt {
+                offset,
+                length,
+                seed,
             } => {
                 let off = *offset as usize;
-                let end = (off + length).min(data.len());
-                let start = off.min(data.len());
-                if start >= data.len() {
+                let Some(end) = off.checked_add(*length) else {
                     return Err(E2eError::Io(std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
-                        format!("offset {off} exceeds file size {}", data.len()),
+                        "offset+length overflow",
+                    )));
+                };
+                if end > data.len() {
+                    return Err(E2eError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("range {off}..{end} exceeds file size {}", data.len()),
                     )));
                 }
-                let original = data[start..end].to_vec();
+                let original = data[off..end].to_vec();
                 let mut rng = StdRng::seed_from_u64(*seed);
-                for b in &mut data[start..end] {
+                for b in &mut data[off..end] {
                     *b = rng.r#gen();
                 }
-                let pages = pages_in_range(start, end, ps);
-                ((end - start) as u64, pages, original)
+                let pages = pages_in_range(off, end, ps);
+                ((*length) as u64, pages, original)
             }
 
             CorruptionPattern::PagePartialCorrupt {
@@ -246,28 +284,67 @@ impl CorruptionInjector {
                 length,
                 seed,
             } => {
-                let page_start = *page_number as usize * ps;
-                let start = page_start + *offset_within_page as usize;
-                let end = (start + *length as usize).min(data.len());
-                if start >= data.len() {
+                let Some(page_index) = page_number.checked_sub(1) else {
+                    return Err(E2eError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "page_number must be >= 1",
+                    )));
+                };
+
+                let offset_within_page = usize::from(*offset_within_page);
+                let length = usize::from(*length);
+
+                if offset_within_page >= ps {
+                    return Err(E2eError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "offset_within_page exceeds page size",
+                    )));
+                }
+                if offset_within_page.saturating_add(length) > ps {
+                    return Err(E2eError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "page partial corruption crosses page boundary",
+                    )));
+                }
+
+                let Some(page_start) = (page_index as usize).checked_mul(ps) else {
+                    return Err(E2eError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "page offset overflow",
+                    )));
+                };
+                let Some(start) = page_start.checked_add(offset_within_page) else {
+                    return Err(E2eError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "page offset overflow",
+                    )));
+                };
+                let Some(end) = start.checked_add(length) else {
+                    return Err(E2eError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "page end overflow",
+                    )));
+                };
+                if end > data.len() {
                     return Err(E2eError::Io(std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
                         "page partial offset exceeds file size".to_owned(),
                     )));
                 }
+
                 let original = data[start..end].to_vec();
                 let mut rng = StdRng::seed_from_u64(*seed);
                 for b in &mut data[start..end] {
                     *b = rng.r#gen();
                 }
-                ((end - start) as u64, vec![*page_number], original)
+                (length as u64, vec![*page_number], original)
             }
 
             CorruptionPattern::HeaderZero => {
                 let end = DB_HEADER_SIZE.min(data.len());
                 let original = data[..end].to_vec();
                 data[..end].fill(0);
-                (end as u64, vec![0], original)
+                (end as u64, vec![1], original)
             }
 
             CorruptionPattern::WalFrameCorrupt {
@@ -278,48 +355,67 @@ impl CorruptionInjector {
                 let frame_size = WAL_FRAME_HEADER_SIZE + u64::from(self.page_size);
                 let mut total_bytes = 0u64;
                 let mut all_original = Vec::new();
-                let mut affected = Vec::new();
+                let mut affected_pages = Vec::new();
 
                 for &frame_num in frame_numbers {
                     let frame_start = WAL_HEADER_SIZE + u64::from(frame_num) * frame_size;
-                    let start = frame_start as usize;
-                    let end = (start + frame_size as usize).min(data.len());
-                    if start >= data.len() {
-                        continue;
+
+                    let hdr_start = usize::try_from(frame_start).map_err(|_| {
+                        E2eError::Io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "frame offset overflow",
+                        ))
+                    })?;
+                    let hdr_end = hdr_start
+                        .checked_add(WAL_FRAME_HEADER_SIZE as usize)
+                        .ok_or_else(|| {
+                            E2eError::Io(std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                "frame header end overflow",
+                            ))
+                        })?;
+                    let data_start = hdr_end;
+                    let data_end =
+                        data_start
+                            .checked_add(self.page_size as usize)
+                            .ok_or_else(|| {
+                                E2eError::Io(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidInput,
+                                    "frame data end overflow",
+                                ))
+                            })?;
+
+                    if data_end > data.len() {
+                        return Err(E2eError::Io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            format!("wal frame {frame_num} beyond file end"),
+                        )));
                     }
-                    all_original.extend_from_slice(&data[start..end]);
-                    for b in &mut data[start..end] {
+
+                    // WAL frame header begins with big-endian pgno.
+                    let pgno_bytes: [u8; 4] =
+                        data[hdr_start..hdr_start + 4].try_into().map_err(|_| {
+                            E2eError::Io(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "short wal frame header",
+                            ))
+                        })?;
+                    let pgno = u32::from_be_bytes(pgno_bytes);
+                    affected_pages.push(pgno);
+
+                    all_original.extend_from_slice(&data[data_start..data_end]);
+                    for b in &mut data[data_start..data_end] {
                         *b = rng.r#gen();
                     }
-                    total_bytes += (end - start) as u64;
-                    affected.push(frame_num);
+                    total_bytes += u64::from(self.page_size);
                 }
 
-                (total_bytes, affected, all_original)
+                affected_pages.sort_unstable();
+                affected_pages.dedup();
+
+                (total_bytes, affected_pages, all_original)
             }
 
-            CorruptionPattern::SidecarCorrupt {
-                offset,
-                length,
-                seed,
-            } => {
-                let off = *offset as usize;
-                let end = (off + length).min(data.len());
-                let start = off.min(data.len());
-                if start >= data.len() {
-                    return Err(E2eError::Io(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!("sidecar offset {off} exceeds file size {}", data.len()),
-                    )));
-                }
-                let original = data[start..end].to_vec();
-                let mut rng = StdRng::seed_from_u64(*seed);
-                for b in &mut data[start..end] {
-                    *b = rng.r#gen();
-                }
-                let pages = pages_in_range(start, end, ps);
-                ((end - start) as u64, pages, original)
-            }
         };
 
         std::fs::write(&self.path, &data)?;
@@ -367,8 +463,8 @@ fn pages_in_range(start: usize, end: usize, page_size: usize) -> Vec<u32> {
     if start >= end || page_size == 0 {
         return Vec::new();
     }
-    let first_page = start / page_size;
-    let last_page = (end - 1) / page_size;
+    let first_page = (start / page_size) + 1;
+    let last_page = ((end - 1) / page_size) + 1;
     (first_page..=last_page).map(|p| p as u32).collect()
 }
 
@@ -492,7 +588,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(report.affected_bytes, 1);
-        assert_eq!(report.affected_pages, vec![0]);
+        assert_eq!(report.affected_pages, vec![1]);
 
         let data = std::fs::read(&path).unwrap();
         // 0xAA = 0b10101010, flipping bit 3 → 0b10100010 = 0xA2
@@ -505,11 +601,11 @@ mod tests {
         let injector = CorruptionInjector::new(path.clone()).unwrap();
 
         let report = injector
-            .inject(&CorruptionPattern::PageZero { page_number: 1 })
+            .inject(&CorruptionPattern::PageZero { page_number: 2 })
             .unwrap();
 
         assert_eq!(report.affected_bytes, 4096);
-        assert_eq!(report.affected_pages, vec![1]);
+        assert_eq!(report.affected_pages, vec![2]);
 
         let data = std::fs::read(&path).unwrap();
         assert!(data[4096..8192].iter().all(|&b| b == 0));
@@ -551,7 +647,7 @@ mod tests {
 
         let report = injector
             .inject(&CorruptionPattern::PagePartialCorrupt {
-                page_number: 0,
+                page_number: 1,
                 offset_within_page: 10,
                 length: 20,
                 seed: 42,
@@ -559,7 +655,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(report.affected_bytes, 20);
-        assert_eq!(report.affected_pages, vec![0]);
+        assert_eq!(report.affected_pages, vec![1]);
 
         let data = std::fs::read(&path).unwrap();
         // Bytes 0..10 should be untouched
@@ -578,7 +674,7 @@ mod tests {
         let report = injector.inject(&CorruptionPattern::HeaderZero).unwrap();
 
         assert_eq!(report.affected_bytes, 100);
-        assert_eq!(report.affected_pages, vec![0]);
+        assert_eq!(report.affected_pages, vec![1]);
 
         let data = std::fs::read(&path).unwrap();
         assert!(data[..100].iter().all(|&b| b == 0));
@@ -591,6 +687,15 @@ mod tests {
         let frame_size = 24 + 4096;
         let wal_size = 32 + 2 * frame_size;
         let (_dir, path) = temp_db(wal_size);
+        // Write recognizable pgno values into each frame header (big-endian).
+        let mut wal = std::fs::read(&path).unwrap();
+        // Frame 0 header starts at 32
+        wal[32..36].copy_from_slice(&1u32.to_be_bytes());
+        // Frame 1 header starts at 32 + frame_size
+        let frame1 = 32 + frame_size;
+        wal[frame1..frame1 + 4].copy_from_slice(&2u32.to_be_bytes());
+        std::fs::write(&path, &wal).unwrap();
+
         let injector = CorruptionInjector::new(path.clone()).unwrap();
 
         let report = injector
@@ -600,12 +705,15 @@ mod tests {
             })
             .unwrap();
 
-        assert_eq!(report.affected_pages, vec![0, 1]);
-        assert!(report.affected_bytes > 0);
+        assert_eq!(report.affected_pages, vec![1, 2]);
+        assert_eq!(report.affected_bytes, 2 * 4096);
 
         let data = std::fs::read(&path).unwrap();
         // WAL header (first 32 bytes) should be untouched
         assert!(data[..32].iter().all(|&b| b == 0xAA));
+        // Frame header pgno should remain intact (we only corrupt frame data).
+        assert_eq!(&data[32..36], &1u32.to_be_bytes());
+        assert_eq!(&data[frame1..frame1 + 4], &2u32.to_be_bytes());
     }
 
     #[test]
@@ -636,7 +744,7 @@ mod tests {
                 byte_offset: 0,
                 bit_position: 0,
             },
-            CorruptionPattern::PageZero { page_number: 1 },
+            CorruptionPattern::PageZero { page_number: 2 },
         ];
 
         let reports = injector.inject_many(&patterns).unwrap();
@@ -659,9 +767,9 @@ mod tests {
 
     #[test]
     fn test_pages_in_range() {
-        assert_eq!(pages_in_range(0, 4096, 4096), vec![0]);
-        assert_eq!(pages_in_range(0, 4097, 4096), vec![0, 1]);
-        assert_eq!(pages_in_range(4096, 8192, 4096), vec![1]);
+        assert_eq!(pages_in_range(0, 4096, 4096), vec![1]);
+        assert_eq!(pages_in_range(0, 4097, 4096), vec![1, 2]);
+        assert_eq!(pages_in_range(4096, 8192, 4096), vec![2]);
         assert_eq!(pages_in_range(100, 100, 4096), Vec::<u32>::new());
     }
 

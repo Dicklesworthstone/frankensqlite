@@ -8,6 +8,7 @@
 
 pub mod comparison;
 pub mod corruption;
+pub mod executor;
 pub mod golden;
 pub mod oplog;
 pub mod report;

@@ -1,0 +1,618 @@
+{
+  "name": "jeffreys_skills_md",
+  "file_size_bytes": 11345920,
+  "page_size": 4096,
+  "page_count": 2770,
+  "freelist_count": 1,
+  "schema_version": 1,
+  "journal_mode": "wal",
+  "user_version": 0,
+  "application_id": 0,
+  "tables": [
+    {
+      "name": "blocked_issues_cache",
+      "row_count": 2,
+      "columns": [
+        {
+          "name": "issue_id",
+          "type": "TEXT",
+          "primary_key": true,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "blocked_by",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "blocked_at",
+          "type": "DATETIME",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": "CURRENT_TIMESTAMP"
+        }
+      ]
+    },
+    {
+      "name": "child_counters",
+      "row_count": 0,
+      "columns": [
+        {
+          "name": "parent_id",
+          "type": "TEXT",
+          "primary_key": true,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "last_child",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": "0"
+        }
+      ]
+    },
+    {
+      "name": "comments",
+      "row_count": 386,
+      "columns": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "primary_key": true,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "issue_id",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "author",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "text",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "created_at",
+          "type": "DATETIME",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": "CURRENT_TIMESTAMP"
+        }
+      ]
+    },
+    {
+      "name": "config",
+      "row_count": 1,
+      "columns": [
+        {
+          "name": "key",
+          "type": "TEXT",
+          "primary_key": true,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "value",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "dependencies",
+      "row_count": 4026,
+      "columns": [
+        {
+          "name": "issue_id",
+          "type": "TEXT",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "depends_on_id",
+          "type": "TEXT",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "type",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": "'blocks'"
+        },
+        {
+          "name": "created_at",
+          "type": "DATETIME",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": "CURRENT_TIMESTAMP"
+        },
+        {
+          "name": "created_by",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": "''"
+        },
+        {
+          "name": "metadata",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": "'{}'"
+        },
+        {
+          "name": "thread_id",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": "''"
+        }
+      ]
+    },
+    {
+      "name": "dirty_issues",
+      "row_count": 0,
+      "columns": [
+        {
+          "name": "issue_id",
+          "type": "TEXT",
+          "primary_key": true,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "marked_at",
+          "type": "DATETIME",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": "CURRENT_TIMESTAMP"
+        }
+      ]
+    },
+    {
+      "name": "events",
+      "row_count": 5837,
+      "columns": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "primary_key": true,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "issue_id",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "event_type",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "actor",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": "''"
+        },
+        {
+          "name": "old_value",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "new_value",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "comment",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "created_at",
+          "type": "DATETIME",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": "CURRENT_TIMESTAMP"
+        }
+      ]
+    },
+    {
+      "name": "export_hashes",
+      "row_count": 2401,
+      "columns": [
+        {
+          "name": "issue_id",
+          "type": "TEXT",
+          "primary_key": true,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "content_hash",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "exported_at",
+          "type": "DATETIME",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": "CURRENT_TIMESTAMP"
+        }
+      ]
+    },
+    {
+      "name": "issues",
+      "row_count": 2401,
+      "columns": [
+        {
+          "name": "id",
+          "type": "TEXT",
+          "primary_key": true,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "content_hash",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "title",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "description",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": "''"
+        },
+        {
+          "name": "design",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": "''"
+        },
+        {
+          "name": "acceptance_criteria",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": "''"
+        },
+        {
+          "name": "notes",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": "''"
+        },
+        {
+          "name": "status",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": "'open'"
+        },
+        {
+          "name": "priority",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": "2"
+        },
+        {
+          "name": "issue_type",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": "'task'"
+        },
+        {
+          "name": "assignee",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "owner",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": "''"
+        },
+        {
+          "name": "estimated_minutes",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "created_at",
+          "type": "DATETIME",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": "CURRENT_TIMESTAMP"
+        },
+        {
+          "name": "created_by",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": "''"
+        },
+        {
+          "name": "updated_at",
+          "type": "DATETIME",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": "CURRENT_TIMESTAMP"
+        },
+        {
+          "name": "closed_at",
+          "type": "DATETIME",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "close_reason",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": "''"
+        },
+        {
+          "name": "closed_by_session",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": "''"
+        },
+        {
+          "name": "due_at",
+          "type": "DATETIME",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "defer_until",
+          "type": "DATETIME",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "external_ref",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "source_system",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": "''"
+        },
+        {
+          "name": "source_repo",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": "'.'"
+        },
+        {
+          "name": "deleted_at",
+          "type": "DATETIME",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "deleted_by",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": "''"
+        },
+        {
+          "name": "delete_reason",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": "''"
+        },
+        {
+          "name": "original_type",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": "''"
+        },
+        {
+          "name": "compaction_level",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": "0"
+        },
+        {
+          "name": "compacted_at",
+          "type": "DATETIME",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "compacted_at_commit",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "original_size",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "sender",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": "''"
+        },
+        {
+          "name": "ephemeral",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": "0"
+        },
+        {
+          "name": "pinned",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": "0"
+        },
+        {
+          "name": "is_template",
+          "type": "INTEGER",
+          "primary_key": false,
+          "not_null": false,
+          "default_value": "0"
+        }
+      ]
+    },
+    {
+      "name": "labels",
+      "row_count": 924,
+      "columns": [
+        {
+          "name": "issue_id",
+          "type": "TEXT",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        },
+        {
+          "name": "label",
+          "type": "TEXT",
+          "primary_key": true,
+          "not_null": true,
+          "default_value": null
+        }
+      ]
+    },
+    {
+      "name": "metadata",
+      "row_count": 3,
+      "columns": [
+        {
+          "name": "key",
+          "type": "TEXT",
+          "primary_key": true,
+          "not_null": false,
+          "default_value": null
+        },
+        {
+          "name": "value",
+          "type": "TEXT",
+          "primary_key": false,
+          "not_null": true,
+          "default_value": null
+        }
+      ]
+    }
+  ],
+  "indices": [
+    "idx_blocked_cache_blocked_at",
+    "idx_comments_created_at",
+    "idx_comments_issue",
+    "idx_dependencies_blocking",
+    "idx_dependencies_depends_on",
+    "idx_dependencies_depends_on_type",
+    "idx_dependencies_issue",
+    "idx_dependencies_thread",
+    "idx_dependencies_type",
+    "idx_dirty_issues_marked_at",
+    "idx_events_actor",
+    "idx_events_created_at",
+    "idx_events_issue",
+    "idx_events_type",
+    "idx_issues_assignee",
+    "idx_issues_content_hash",
+    "idx_issues_created_at",
+    "idx_issues_defer_until",
+    "idx_issues_due_at",
+    "idx_issues_ephemeral",
+    "idx_issues_external_ref",
+    "idx_issues_external_ref_unique",
+    "idx_issues_issue_type",
+    "idx_issues_pinned",
+    "idx_issues_priority",
+    "idx_issues_ready",
+    "idx_issues_status",
+    "idx_issues_tombstone",
+    "idx_issues_updated_at",
+    "idx_labels_issue",
+    "idx_labels_label"
+  ],
+  "triggers": [],
+  "views": []
+}
