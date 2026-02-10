@@ -166,7 +166,10 @@ fn make_page(seed: u32) -> PageData {
 // -------------------------------------------------------------------------
 
 fn median_sample(mut samples: Vec<f64>) -> f64 {
-    assert!(!samples.is_empty(), "median_sample requires non-empty samples");
+    assert!(
+        !samples.is_empty(),
+        "median_sample requires non-empty samples"
+    );
     samples.sort_by(f64::total_cmp);
     samples[samples.len() / 2]
 }
@@ -524,7 +527,11 @@ fn test_ssi_overhead_oltp_below_7_percent() -> Result<(), String> {
 
     // Alternate ordering to avoid systematic warm-cache bias.
     for i in 0..PERF_MEASURE_RUNS {
-        let (first_ssi, second_ssi) = if i % 2 == 0 { (true, false) } else { (false, true) };
+        let (first_ssi, second_ssi) = if i % 2 == 0 {
+            (true, false)
+        } else {
+            (false, true)
+        };
         let tps_first = run_oltp_workload(2000, 4, 100, first_ssi, 8, 2, 500);
         let tps_second = run_oltp_workload(2000, 4, 100, second_ssi, 8, 2, 500);
 
@@ -665,7 +672,11 @@ fn test_ssi_overhead_microbenchmark_below_20_percent() -> Result<(), String> {
 
     // Alternate ordering to avoid systematic warm-cache bias.
     for i in 0..PERF_MEASURE_RUNS {
-        let (first_ssi, second_ssi) = if i % 2 == 0 { (true, false) } else { (false, true) };
+        let (first_ssi, second_ssi) = if i % 2 == 0 {
+            (true, false)
+        } else {
+            (false, true)
+        };
         let tps_first = run_oltp_workload(1000, 4, 20, first_ssi, 4, 1, 250);
         let tps_second = run_oltp_workload(1000, 4, 20, second_ssi, 4, 1, 250);
 
