@@ -1,6 +1,6 @@
 //! Workspace structure and dependency layer validation (bd-1wwc, §8.1–§8.2).
 //!
-//! These tests enforce the 23-crate workspace layout and the 10-layer
+//! These tests enforce the 24-crate workspace layout and the 10-layer
 //! dependency hierarchy documented in the spec. They run `cargo metadata`
 //! and verify the resolved dependency graph against the documented layering.
 
@@ -15,7 +15,7 @@ const ARCH_BEAD_ID: &str = "bd-3an";
 const DEP_BUILD_BEAD_ID: &str = "bd-2v8x";
 const DESC_BEAD_ID: &str = "bd-sxm2";
 
-/// The 23 crates specified in §8.1.
+/// The 24 crates in the workspace (23 from §8.1 + fsqlite-e2e).
 const EXPECTED_CRATES: [&str; 24] = [
     "fsqlite-ast",
     "fsqlite-btree",
@@ -453,11 +453,11 @@ fn test_layering_document_matches_cargo_metadata() {
         "bead_id={BEAD_ID} case=layer_range expected 0..=9"
     );
 
-    // Total crates across all layers must be 23.
+    // Total crates across all layers must be 24.
     let total: usize = by_layer.values().map(Vec::len).sum();
     assert_eq!(
-        total, 23,
-        "bead_id={BEAD_ID} case=layer_total expected=23 actual={total}"
+        total, 24,
+        "bead_id={BEAD_ID} case=layer_total expected=24 actual={total}"
     );
 }
 

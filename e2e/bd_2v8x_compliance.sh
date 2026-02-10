@@ -63,8 +63,8 @@ trap cleanup EXIT
 (cd "${WORKSPACE_ROOT}" && cargo metadata --format-version=1 >"${metadata_json}")
 
 member_count="$(jq '.workspace_members | length' "${metadata_json}")"
-if [[ "${member_count}" -ne 23 ]]; then
-    printf 'bead_id=%s level=ERROR case=workspace_member_count expected=23 actual=%s\n' \
+if [[ "${member_count}" -ne 24 ]]; then
+    printf 'bead_id=%s level=ERROR case=workspace_member_count expected=24 actual=%s\n' \
         "${BEAD_ID}" "${member_count}"
     exit 1
 fi

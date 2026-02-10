@@ -9,6 +9,7 @@
 pub mod comparison;
 pub mod corruption;
 pub mod golden;
+pub mod report;
 pub mod workload;
 
 /// Result type alias used throughout the E2E harness.
