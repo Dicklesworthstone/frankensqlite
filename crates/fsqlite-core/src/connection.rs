@@ -541,7 +541,7 @@ impl Connection {
             }
             Statement::Update(ref update) => {
                 let affected =
-                    self.count_matching_rows(&update.table.name, update.where_clause.as_ref())?;
+                    self.count_matching_rows(&update.table, update.where_clause.as_ref())?;
                 let program = self.compile_table_update(update)?;
                 self.execute_table_program(&program, params)?;
                 self.persist_if_needed()?;
@@ -550,7 +550,7 @@ impl Connection {
             }
             Statement::Delete(ref delete) => {
                 let affected =
-                    self.count_matching_rows(&delete.table.name, delete.where_clause.as_ref())?;
+                    self.count_matching_rows(&delete.table, delete.where_clause.as_ref())?;
                 let program = self.compile_table_delete(delete)?;
                 self.execute_table_program(&program, params)?;
                 self.persist_if_needed()?;
@@ -632,13 +632,17 @@ impl Connection {
     /// without modifying the VDBE engine.
     fn count_matching_rows(
         &self,
-        table_name: &fsqlite_ast::QualifiedName,
+        table_ref: &fsqlite_ast::QualifiedTableRef,
         where_clause: Option<&Expr>,
     ) -> Result<usize> {
+        let alias_clause = table_ref
+            .alias
+            .as_ref()
+            .map_or(String::new(), |a| format!(" AS {a}"));
         let sql = if let Some(cond) = where_clause {
-            format!("SELECT * FROM {table_name} WHERE {cond}")
+            format!("SELECT * FROM {}{alias_clause} WHERE {cond}", table_ref.name)
         } else {
-            format!("SELECT * FROM {table_name}")
+            format!("SELECT * FROM {}", table_ref.name)
         };
         Ok(self.query(&sql)?.len())
     }

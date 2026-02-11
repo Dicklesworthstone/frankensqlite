@@ -1892,25 +1892,39 @@ fn emit_where_filter(
             right,
             ..
         } => {
-            // Try col = expr or expr = col.
-            if let Some(col_idx) = resolve_column_ref(left, table) {
+            // Try col = expr or expr = col (with alias-aware qualifier validation).
+            if let Some(resolved) = resolve_column_ref(left, table, table_alias) {
                 let col_reg = b.alloc_temp();
                 let val_reg = b.alloc_temp();
-                b.emit_op(Opcode::Column, cursor, col_idx as i32, col_reg, P4::None, 0);
+                match resolved {
+                    SortKeySource::Column(idx) => {
+                        b.emit_op(Opcode::Column, cursor, idx as i32, col_reg, P4::None, 0);
+                    }
+                    SortKeySource::Rowid => {
+                        b.emit_op(Opcode::Rowid, cursor, col_reg, 0, P4::None, 0);
+                    }
+                }
                 emit_expr(b, right, val_reg, None);
                 b.emit_jump_to_label(Opcode::Ne, val_reg, col_reg, skip_label, P4::None, 0);
                 b.free_temp(val_reg);
                 b.free_temp(col_reg);
-            } else if let Some(col_idx) = resolve_column_ref(right, table) {
+            } else if let Some(resolved) = resolve_column_ref(right, table, table_alias) {
                 let col_reg = b.alloc_temp();
                 let val_reg = b.alloc_temp();
-                b.emit_op(Opcode::Column, cursor, col_idx as i32, col_reg, P4::None, 0);
+                match resolved {
+                    SortKeySource::Column(idx) => {
+                        b.emit_op(Opcode::Column, cursor, idx as i32, col_reg, P4::None, 0);
+                    }
+                    SortKeySource::Rowid => {
+                        b.emit_op(Opcode::Rowid, cursor, col_reg, 0, P4::None, 0);
+                    }
+                }
                 emit_expr(b, left, val_reg, None);
                 b.emit_jump_to_label(Opcode::Ne, val_reg, col_reg, skip_label, P4::None, 0);
                 b.free_temp(val_reg);
                 b.free_temp(col_reg);
             }
-            // If neither side is a column ref, skip filtering (match all).
+            // If neither side is a column ref, fall through (match all).
         }
         Expr::BinaryOp {
             left,
@@ -1976,12 +1990,39 @@ fn resolve_sort_key(
     None
 }
 
-/// Resolve a column reference expression to its 0-based column index.
-fn resolve_column_ref(expr: &Expr, table: &TableSchema) -> Option<usize> {
+/// Resolve a column reference expression to either a column index or rowid.
+///
+/// Validates that any table qualifier matches the table name or alias.
+/// Returns `None` if the expression is not a column reference or the
+/// qualifier does not match.
+fn resolve_column_ref(
+    expr: &Expr,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+) -> Option<SortKeySource> {
     if let Expr::Column(col_ref, _) = expr {
-        table.column_index(&col_ref.column)
-    } else {
-        None
+        if let Some(qualifier) = &col_ref.table
+            && !matches_table_or_alias(qualifier, table, table_alias)
+        {
+            return None;
+        }
+        if let Some(idx) = table.column_index(&col_ref.column) {
+            return Some(SortKeySource::Column(idx));
+        }
+        if is_rowid_alias(&col_ref.column) {
+            return Some(SortKeySource::Rowid);
+        }
+    }
+    None
+}
+
+/// Resolve a column reference to its 0-based index (ignoring rowid aliases).
+///
+/// Convenience wrapper for call sites that only care about real table columns.
+fn resolve_column_index(expr: &Expr, table: &TableSchema) -> Option<usize> {
+    match resolve_column_ref(expr, table, None) {
+        Some(SortKeySource::Column(idx)) => Some(idx),
+        _ => None,
     }
 }
 
