@@ -478,6 +478,7 @@ impl Connection {
     /// Prepare SQL into a statement.
     pub fn prepare(&self, sql: &str) -> Result<PreparedStatement> {
         let statement = parse_single_statement(sql)?;
+        let statement = self.rewrite_in_statement(statement)?;
         self.compile_and_wrap(&statement)
     }
 
@@ -555,6 +556,7 @@ impl Connection {
         statement: Statement,
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Row>> {
+        let statement = self.rewrite_in_statement(statement)?;
         match statement {
             Statement::CreateTable(create) => {
                 self.execute_create_table(&create)?;
@@ -562,9 +564,6 @@ impl Connection {
                 Ok(Vec::new())
             }
             Statement::Select(ref select) => {
-                // Pre-process: rewrite IN (SELECT ...) to IN (literal_list).
-                let rewritten = self.rewrite_in_subqueries(select)?;
-                let select = &rewritten;
                 let distinct = is_distinct_select(select);
                 // Compound SELECT (UNION/UNION ALL/INTERSECT/EXCEPT).
                 if !select.body.compounds.is_empty() {
@@ -682,6 +681,33 @@ impl Connection {
             _ => Err(FrankenError::NotImplemented(
                 "only SELECT, INSERT, UPDATE, DELETE, CREATE TABLE, transaction control, and PRAGMA are supported".to_owned(),
             )),
+        }
+    }
+
+    /// Rewrite statement-level `IN (SELECT ...)` expressions into literal lists
+    /// before compilation/execution.
+    fn rewrite_in_statement(&self, statement: Statement) -> Result<Statement> {
+        match statement {
+            Statement::Select(select) => {
+                let rewritten = self.rewrite_in_subqueries(&select)?;
+                Ok(Statement::Select(rewritten))
+            }
+            Statement::Update(mut update) => {
+                for assignment in &mut update.assignments {
+                    rewrite_in_expr(&mut assignment.value, self)?;
+                }
+                if let Some(where_expr) = update.where_clause.as_mut() {
+                    rewrite_in_expr(where_expr, self)?;
+                }
+                Ok(Statement::Update(update))
+            }
+            Statement::Delete(mut delete) => {
+                if let Some(where_expr) = delete.where_clause.as_mut() {
+                    rewrite_in_expr(where_expr, self)?;
+                }
+                Ok(Statement::Delete(delete))
+            }
+            other => Ok(other),
         }
     }
 
@@ -5683,6 +5709,67 @@ mod tests {
             .collect();
         assert!(names.contains(&"Alice"));
         assert!(names.contains(&"Bob"));
+    }
+
+    #[test]
+    fn test_prepared_select_in_subquery() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1 (a INTEGER);").unwrap();
+        conn.execute("CREATE TABLE t2 (b INTEGER);").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1);").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (2);").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (3);").unwrap();
+        conn.execute("INSERT INTO t2 VALUES (2);").unwrap();
+        conn.execute("INSERT INTO t2 VALUES (3);").unwrap();
+
+        let stmt = conn
+            .prepare("SELECT a FROM t1 WHERE a IN (SELECT b FROM t2) ORDER BY a;")
+            .unwrap();
+        let rows = stmt.query().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(2));
+        assert_eq!(rows[1].values()[0], SqliteValue::Integer(3));
+    }
+
+    #[test]
+    fn test_update_where_in_subquery() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1 (a INTEGER, flag TEXT);")
+            .unwrap();
+        conn.execute("CREATE TABLE t2 (b INTEGER);").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1, 'orig');").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (2, 'orig');").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (3, 'orig');").unwrap();
+        conn.execute("INSERT INTO t2 VALUES (2);").unwrap();
+        conn.execute("INSERT INTO t2 VALUES (3);").unwrap();
+
+        conn.execute("UPDATE t1 SET flag='hit' WHERE a IN (SELECT b FROM t2);")
+            .unwrap();
+
+        let rows = conn.query("SELECT a, flag FROM t1 ORDER BY a;").unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("orig".to_owned()));
+        assert_eq!(rows[1].values()[1], SqliteValue::Text("hit".to_owned()));
+        assert_eq!(rows[2].values()[1], SqliteValue::Text("hit".to_owned()));
+    }
+
+    #[test]
+    fn test_delete_where_in_subquery() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1 (a INTEGER);").unwrap();
+        conn.execute("CREATE TABLE t2 (b INTEGER);").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1);").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (2);").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (3);").unwrap();
+        conn.execute("INSERT INTO t2 VALUES (2);").unwrap();
+        conn.execute("INSERT INTO t2 VALUES (3);").unwrap();
+
+        conn.execute("DELETE FROM t1 WHERE a IN (SELECT b FROM t2);")
+            .unwrap();
+
+        let rows = conn.query("SELECT a FROM t1 ORDER BY a;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
     }
 
     #[test]
