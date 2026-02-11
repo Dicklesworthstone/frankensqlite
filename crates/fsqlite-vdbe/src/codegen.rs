@@ -507,7 +507,15 @@ fn codegen_select_full_scan(
     // Evaluate WHERE condition (if any) and skip non-matching rows.
     let skip_label = b.emit_label();
     if let Some(where_expr) = where_clause {
-        emit_where_filter(b, where_expr, cursor, table, table_alias, schema, skip_label);
+        emit_where_filter(
+            b,
+            where_expr,
+            cursor,
+            table,
+            table_alias,
+            schema,
+            skip_label,
+        );
     }
 
     // OFFSET: if offset counter > 0, decrement by 1 and skip this row.
@@ -606,7 +614,15 @@ fn codegen_select_distinct_scan(
     // WHERE filter.
     let skip_label = b.emit_label();
     if let Some(where_expr) = where_clause {
-        emit_where_filter(b, where_expr, cursor, table, table_alias, schema, skip_label);
+        emit_where_filter(
+            b,
+            where_expr,
+            cursor,
+            table,
+            table_alias,
+            schema,
+            skip_label,
+        );
     }
 
     // Read output columns into consecutive registers.
@@ -863,7 +879,15 @@ fn codegen_select_ordered_scan(
     // WHERE filter.
     let skip_label = b.emit_label();
     if let Some(where_expr) = where_clause {
-        emit_where_filter(b, where_expr, cursor, table, table_alias, schema, skip_label);
+        emit_where_filter(
+            b,
+            where_expr,
+            cursor,
+            table,
+            table_alias,
+            schema,
+            skip_label,
+        );
     }
 
     // Read sort-key columns + data columns into consecutive registers.
@@ -1175,7 +1199,15 @@ fn codegen_select_aggregate(
     // WHERE filter.
     let skip_label = b.emit_label();
     if let Some(where_expr) = where_clause {
-        emit_where_filter(b, where_expr, cursor, table, table_alias, schema, skip_label);
+        emit_where_filter(
+            b,
+            where_expr,
+            cursor,
+            table,
+            table_alias,
+            schema,
+            skip_label,
+        );
     }
 
     // AggStep for each aggregate column.
@@ -1516,7 +1548,15 @@ fn codegen_select_group_by_aggregate(
     // WHERE filter.
     let skip_label = b.emit_label();
     if let Some(where_expr) = where_clause {
-        emit_where_filter(b, where_expr, cursor, table, table_alias, schema, skip_label);
+        emit_where_filter(
+            b,
+            where_expr,
+            cursor,
+            table,
+            table_alias,
+            schema,
+            skip_label,
+        );
     }
 
     // Read group-key columns + agg-arg columns into consecutive registers.
@@ -3114,7 +3154,7 @@ fn resolve_in_probe_source<'a>(
 
             let value = match columns.as_slice() {
                 [fsqlite_ast::ResultColumn::Expr { expr, .. }] => InProbeValue::Expr(expr),
-                [fsqlite_ast::ResultColumn::Star] | [fsqlite_ast::ResultColumn::TableStar(_)] => {
+                [fsqlite_ast::ResultColumn::Star | fsqlite_ast::ResultColumn::TableStar(_)] => {
                     if table.columns.is_empty() {
                         return None;
                     }
@@ -4881,7 +4921,7 @@ mod tests {
     }
 
     #[test]
-    fn test_codegen_select_where_in_subquery_rejected_without_rewrite() {
+    fn test_codegen_select_where_in_subquery_supported_without_rewrite() {
         let subquery = SelectStatement {
             with: None,
             body: SelectBody {
@@ -4913,15 +4953,56 @@ mod tests {
         let schema = test_schema_with_subquery_source();
         let ctx = CodegenContext::default();
         let mut b = ProgramBuilder::new();
-        let err = codegen_select(&mut b, &stmt, &schema, &ctx).unwrap_err();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+        let open_reads = prog
+            .ops()
+            .iter()
+            .filter(|op| op.opcode == Opcode::OpenRead)
+            .count();
+        assert_eq!(open_reads, 2, "outer + probe OpenRead expected");
         assert!(
-            matches!(err, CodegenError::Unsupported(ref msg) if msg.contains("IN (SELECT ...)")),
-            "unexpected error: {err:?}"
+            prog.ops().iter().any(|op| op.opcode == Opcode::Eq),
+            "expected Eq comparison in probe scan"
         );
     }
 
     #[test]
-    fn test_codegen_select_where_in_table_rejected_without_rewrite() {
+    fn test_resolve_in_probe_source_subquery_supported() {
+        let subquery = SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Select {
+                    distinct: Distinctness::All,
+                    columns: vec![ResultColumn::Expr {
+                        expr: Expr::Column(ColumnRef::bare("b"), Span::ZERO),
+                        alias: None,
+                    }],
+                    from: Some(from_table("s")),
+                    where_clause: None,
+                    group_by: vec![],
+                    having: None,
+                    windows: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        };
+        let set = InSet::Subquery(Box::new(subquery));
+        let schema = test_schema_with_subquery_source();
+        assert!(super::resolve_in_probe_source(&set, &schema).is_some());
+    }
+
+    #[test]
+    fn test_resolve_in_probe_source_table_supported() {
+        let set = InSet::Table(QualifiedName::bare("s"));
+        let schema = test_schema_with_subquery_source();
+        assert!(super::resolve_in_probe_source(&set, &schema).is_some());
+    }
+
+    #[test]
+    fn test_codegen_select_where_in_table_supported_without_rewrite() {
         let where_expr = Expr::In {
             expr: Box::new(Expr::Column(ColumnRef::bare("a"), Span::ZERO)),
             set: InSet::Table(QualifiedName::bare("s")),
@@ -4933,10 +5014,17 @@ mod tests {
         let schema = test_schema_with_subquery_source();
         let ctx = CodegenContext::default();
         let mut b = ProgramBuilder::new();
-        let err = codegen_select(&mut b, &stmt, &schema, &ctx).unwrap_err();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+        let open_reads = prog
+            .ops()
+            .iter()
+            .filter(|op| op.opcode == Opcode::OpenRead)
+            .count();
+        assert_eq!(open_reads, 2, "outer + probe OpenRead expected");
         assert!(
-            matches!(err, CodegenError::Unsupported(ref msg) if msg.contains("IN (SELECT ...)")),
-            "unexpected error: {err:?}"
+            prog.ops().iter().any(|op| op.opcode == Opcode::Eq),
+            "expected Eq comparison in probe scan"
         );
     }
 
