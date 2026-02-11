@@ -704,19 +704,27 @@ impl Connection {
                 let affected =
                     self.count_matching_rows(&update.table, update.where_clause.as_ref())?;
                 let program = self.compile_table_update(update)?;
-                self.execute_table_program(&program, params)?;
+                let rows = self.execute_table_program(&program, params)?;
                 self.persist_if_needed()?;
                 *self.last_changes.borrow_mut() = affected;
-                Ok(Vec::new())
+                if update.returning.is_empty() {
+                    Ok(Vec::new())
+                } else {
+                    Ok(rows)
+                }
             }
             Statement::Delete(ref delete) => {
                 let affected =
                     self.count_matching_rows(&delete.table, delete.where_clause.as_ref())?;
                 let program = self.compile_table_delete(delete)?;
-                self.execute_table_program(&program, params)?;
+                let rows = self.execute_table_program(&program, params)?;
                 self.persist_if_needed()?;
                 *self.last_changes.borrow_mut() = affected;
-                Ok(Vec::new())
+                if delete.returning.is_empty() {
+                    Ok(Vec::new())
+                } else {
+                    Ok(rows)
+                }
             }
             Statement::Begin(begin) => {
                 self.execute_begin(begin)?;
@@ -1985,10 +1993,17 @@ impl Connection {
             .iter()
             .map(|col| match col {
                 ResultColumn::Expr {
-                    expr: Expr::FunctionCall { name, args, .. },
+                    expr:
+                        Expr::FunctionCall {
+                            name,
+                            args,
+                            distinct: is_distinct,
+                            ..
+                        },
                     ..
                 } if is_agg_fn(name) => {
                     let func = name.to_ascii_lowercase();
+                    let mut separator = None;
                     let arg_col = match args {
                         FunctionArgs::Star => {
                             if func == "count" {
@@ -2021,6 +2036,25 @@ impl Connection {
                             let idx = find_col_in_map(&col_map, table_prefix, col_name)?;
                             Some(idx)
                         }
+                        FunctionArgs::List(exprs)
+                            if exprs.len() == 2
+                                && (func == "group_concat" || func == "string_agg") =>
+                        {
+                            let col_name = expr_col_name(&exprs[0]).ok_or_else(|| {
+                                FrankenError::NotImplemented(format!(
+                                    "non-column argument to aggregate {func}() in GROUP BY+JOIN"
+                                ))
+                            })?;
+                            let table_prefix = match &exprs[0] {
+                                Expr::Column(cr, _) => cr.table.as_deref(),
+                                _ => None,
+                            };
+                            let idx = find_col_in_map(&col_map, table_prefix, col_name)?;
+                            if let Expr::Literal(Literal::String(s), _) = &exprs[1] {
+                                separator = Some(s.clone());
+                            }
+                            Some(idx)
+                        }
                         FunctionArgs::List(_) => {
                             return Err(FrankenError::NotImplemented(format!(
                                 "{func}() with multiple args is not supported in GROUP BY+JOIN path"
@@ -2030,6 +2064,8 @@ impl Connection {
                     Ok(GroupByColumn::Agg {
                         name: func,
                         arg_col,
+                        distinct: *is_distinct,
+                        separator,
                     })
                 }
                 ResultColumn::Expr { expr, .. } => Ok(GroupByColumn::Plain(Box::new(expr.clone()))),
@@ -2068,7 +2104,12 @@ impl Connection {
                         });
                         values.push(val);
                     }
-                    GroupByColumn::Agg { name, arg_col } => {
+                    GroupByColumn::Agg {
+                        name,
+                        arg_col,
+                        distinct,
+                        separator,
+                    } => {
                         if name == "count" && arg_col.is_none() {
                             #[allow(clippy::cast_possible_wrap)]
                             values.push(SqliteValue::Integer(group_rows.len() as i64));
@@ -2078,12 +2119,19 @@ impl Connection {
                                     "aggregate {name} requires a column argument"
                                 )));
                             };
-                            let agg_values: Vec<&SqliteValue> = group_rows
+                            let mut agg_values: Vec<&SqliteValue> = group_rows
                                 .iter()
                                 .filter_map(|r| r.get(idx))
                                 .filter(|v| !matches!(v, SqliteValue::Null))
                                 .collect();
-                            values.push(compute_aggregate(name, &agg_values));
+                            if *distinct {
+                                dedup_values(&mut agg_values);
+                            }
+                            values.push(compute_aggregate_ext(
+                                name,
+                                &agg_values,
+                                separator.as_deref(),
+                            ));
                         }
                     }
                 }
@@ -2273,10 +2321,17 @@ impl Connection {
             .iter()
             .map(|col| match col {
                 ResultColumn::Expr {
-                    expr: Expr::FunctionCall { name, args, .. },
+                    expr:
+                        Expr::FunctionCall {
+                            name,
+                            args,
+                            distinct: is_distinct,
+                            ..
+                        },
                     ..
                 } if is_agg_fn(name) => {
                     let func = name.to_ascii_lowercase();
+                    let mut separator = None;
                     let arg_col = match args {
                         FunctionArgs::Star => {
                             if func == "count" {
@@ -2319,6 +2374,34 @@ impl Connection {
                                 ))
                             })?)
                         }
+                        FunctionArgs::List(exprs)
+                            if exprs.len() == 2
+                                && (func == "group_concat" || func == "string_agg") =>
+                        {
+                            let col_name = expr_col_name(&exprs[0]).ok_or_else(|| {
+                                FrankenError::NotImplemented(format!(
+                                    "non-column argument to aggregate {func}() is not supported in this GROUP BY connection path"
+                                ))
+                            })?;
+                            let idx = table_schema.column_index(col_name).or_else(|| {
+                                if is_rowid_alias(col_name) {
+                                    self.rowid_alias_columns
+                                        .borrow()
+                                        .get(&table_name.to_ascii_lowercase())
+                                        .copied()
+                                } else {
+                                    None
+                                }
+                            });
+                            if let Expr::Literal(Literal::String(s), _) = &exprs[1] {
+                                separator = Some(s.clone());
+                            }
+                            Some(idx.ok_or_else(|| {
+                                FrankenError::Internal(format!(
+                                    "aggregate column not found: {col_name}"
+                                ))
+                            })?)
+                        }
                         FunctionArgs::List(_exprs) => {
                             return Err(FrankenError::NotImplemented(format!(
                                 "{func}() with multiple args is not supported in this GROUP BY connection path"
@@ -2328,6 +2411,8 @@ impl Connection {
                     Ok(GroupByColumn::Agg {
                         name: func,
                         arg_col,
+                        distinct: *is_distinct,
+                        separator,
                     })
                 }
                 ResultColumn::Expr { expr, .. } => {
@@ -2406,7 +2491,12 @@ impl Connection {
                         });
                         values.push(val);
                     }
-                    GroupByColumn::Agg { name, arg_col } => {
+                    GroupByColumn::Agg {
+                        name,
+                        arg_col,
+                        distinct,
+                        separator,
+                    } => {
                         if name == "count" && arg_col.is_none() {
                             #[allow(clippy::cast_possible_wrap)]
                             values.push(SqliteValue::Integer(group_rows.len() as i64));
@@ -2416,12 +2506,19 @@ impl Connection {
                                     "aggregate {name} requires a column argument in this GROUP BY connection path"
                                 )));
                             };
-                            let agg_values: Vec<&SqliteValue> = group_rows
+                            let mut agg_values: Vec<&SqliteValue> = group_rows
                                 .iter()
                                 .filter_map(|r| r.get(idx))
                                 .filter(|v| !matches!(v, SqliteValue::Null))
                                 .collect();
-                            values.push(compute_aggregate(name, &agg_values));
+                            if *distinct {
+                                dedup_values(&mut agg_values);
+                            }
+                            values.push(compute_aggregate_ext(
+                                name,
+                                &agg_values,
+                                separator.as_deref(),
+                            ));
                         }
                     }
                 }
@@ -3275,6 +3372,8 @@ enum GroupByColumn {
     Agg {
         name: String,
         arg_col: Option<usize>,
+        distinct: bool,
+        separator: Option<String>,
     },
 }
 
@@ -3435,6 +3534,7 @@ fn evaluate_having_value(
                 if let GroupByColumn::Agg {
                     name: agg_name,
                     arg_col,
+                    ..
                 } = desc
                 {
                     if *agg_name != lower {
@@ -3818,6 +3918,49 @@ fn compute_aggregate(name: &str, values: &[&SqliteValue]) -> SqliteValue {
         }
         _ => SqliteValue::Null,
     }
+}
+
+/// Extended aggregate computation with optional DISTINCT dedup already applied
+/// and an explicit separator for `GROUP_CONCAT`.
+#[allow(clippy::cast_possible_wrap)]
+fn compute_aggregate_ext(
+    name: &str,
+    values: &[&SqliteValue],
+    separator: Option<&str>,
+) -> SqliteValue {
+    if (name == "group_concat" || name == "string_agg") && separator.is_some() {
+        let sep = separator.unwrap_or(",");
+        let parts: Vec<String> = values
+            .iter()
+            .filter(|v| !matches!(v, SqliteValue::Null))
+            .map(|v| match v {
+                SqliteValue::Text(s) => s.clone(),
+                SqliteValue::Integer(n) => n.to_string(),
+                SqliteValue::Float(f) => f.to_string(),
+                _ => String::new(),
+            })
+            .collect();
+        if parts.is_empty() {
+            SqliteValue::Null
+        } else {
+            SqliteValue::Text(parts.join(sep))
+        }
+    } else {
+        compute_aggregate(name, values)
+    }
+}
+
+/// Remove duplicate values in-place, preserving first-occurrence order.
+fn dedup_values(values: &mut Vec<&SqliteValue>) {
+    let mut seen = Vec::new();
+    values.retain(|v| {
+        if seen.contains(v) {
+            false
+        } else {
+            seen.push(*v);
+            true
+        }
+    });
 }
 
 /// Compare two `SqliteValue`s for ordering.
@@ -11065,5 +11208,105 @@ mod transaction_lifecycle_tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].get(1).unwrap(), &SqliteValue::Text("a".into()));
         assert_eq!(rows[1].get(1).unwrap(), &SqliteValue::Text("b".into()));
+    }
+
+    #[test]
+    fn test_count_distinct() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, category TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 'a')").unwrap();
+        conn.execute("INSERT INTO t VALUES (3, 'b')").unwrap();
+        conn.execute("INSERT INTO t VALUES (4, 'b')").unwrap();
+        conn.execute("INSERT INTO t VALUES (5, 'c')").unwrap();
+        let rows = conn
+            .query("SELECT COUNT(DISTINCT category) FROM t GROUP BY 1")
+            .unwrap();
+        // All rows in one group; 3 distinct categories
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get(0).unwrap(), &SqliteValue::Integer(3));
+    }
+
+    #[test]
+    fn test_count_distinct_per_group() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, grp TEXT, val TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'x', 'a')").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 'x', 'a')").unwrap();
+        conn.execute("INSERT INTO t VALUES (3, 'x', 'b')").unwrap();
+        conn.execute("INSERT INTO t VALUES (4, 'y', 'c')").unwrap();
+        let rows = conn
+            .query("SELECT grp, COUNT(DISTINCT val) FROM t GROUP BY grp ORDER BY grp")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        // group 'x': 2 distinct values ('a', 'b')
+        assert_eq!(rows[0].get(1).unwrap(), &SqliteValue::Integer(2));
+        // group 'y': 1 distinct value ('c')
+        assert_eq!(rows[1].get(1).unwrap(), &SqliteValue::Integer(1));
+    }
+
+    #[test]
+    fn test_group_concat_with_separator() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, grp TEXT, val TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'x', 'a')").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 'x', 'b')").unwrap();
+        conn.execute("INSERT INTO t VALUES (3, 'y', 'c')").unwrap();
+        let rows = conn
+            .query("SELECT grp, GROUP_CONCAT(val, ' | ') FROM t GROUP BY grp ORDER BY grp")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0].get(1).unwrap(),
+            &SqliteValue::Text("a | b".into())
+        );
+        assert_eq!(
+            rows[1].get(1).unwrap(),
+            &SqliteValue::Text("c".into())
+        );
+    }
+
+    #[test]
+    fn test_group_concat_default_separator() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, grp TEXT, val TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'x', 'a')").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 'x', 'b')").unwrap();
+        let rows = conn
+            .query("SELECT GROUP_CONCAT(val) FROM t GROUP BY grp")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        // Default separator is comma
+        assert_eq!(
+            rows[0].get(0).unwrap(),
+            &SqliteValue::Text("a,b".into())
+        );
+    }
+
+    #[test]
+    fn test_count_distinct_join() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INTEGER)")
+            .unwrap();
+        conn.execute("CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO customers VALUES (1, 'Alice')").unwrap();
+        conn.execute("INSERT INTO customers VALUES (2, 'Bob')").unwrap();
+        conn.execute("INSERT INTO orders VALUES (1, 1)").unwrap();
+        conn.execute("INSERT INTO orders VALUES (2, 1)").unwrap();
+        conn.execute("INSERT INTO orders VALUES (3, 2)").unwrap();
+        let rows = conn
+            .query(
+                "SELECT COUNT(DISTINCT orders.customer_id) FROM orders \
+                 JOIN customers ON orders.customer_id = customers.id \
+                 GROUP BY 1",
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get(0).unwrap(), &SqliteValue::Integer(2));
     }
 }

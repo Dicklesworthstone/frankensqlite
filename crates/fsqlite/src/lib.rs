@@ -2124,4 +2124,78 @@ mod tests {
             "Multi-row INSERT RETURNING should produce 2 rows"
         );
     }
+
+    // Test: UPDATE ... RETURNING *
+    #[test]
+    fn probe_update_returning_star() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, age INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'Alice', 30);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 'Bob', 25);")
+            .unwrap();
+        let rows = conn
+            .query("UPDATE t SET age = age + 1 WHERE id = 1 RETURNING *;")
+            .unwrap();
+        assert_eq!(rows.len(), 1, "UPDATE RETURNING should produce 1 row");
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![
+                SqliteValue::Integer(1),
+                SqliteValue::Text("Alice".to_owned()),
+                SqliteValue::Integer(31),
+            ]
+        );
+    }
+
+    // Test: UPDATE ... RETURNING specific columns
+    #[test]
+    fn probe_update_returning_columns() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 10);").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 20);").unwrap();
+        let rows = conn
+            .query("UPDATE t SET val = val * 2 RETURNING id, val;")
+            .unwrap();
+        assert_eq!(rows.len(), 2, "UPDATE RETURNING should produce 2 rows");
+    }
+
+    // Test: DELETE ... RETURNING *
+    #[test]
+    fn probe_delete_returning_star() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'Alice');").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 'Bob');").unwrap();
+        let rows = conn
+            .query("DELETE FROM t WHERE id = 2 RETURNING *;")
+            .unwrap();
+        assert_eq!(rows.len(), 1, "DELETE RETURNING should produce 1 row");
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![SqliteValue::Integer(2), SqliteValue::Text("Bob".to_owned()),]
+        );
+        // Verify the row is actually deleted
+        let remaining = conn.query("SELECT COUNT(*) FROM t;").unwrap();
+        assert_eq!(row_values(&remaining[0])[0], SqliteValue::Integer(1));
+    }
+
+    // Test: DELETE ... RETURNING specific column
+    #[test]
+    fn probe_delete_returning_column() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'a');").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 'b');").unwrap();
+        conn.execute("INSERT INTO t VALUES (3, 'c');").unwrap();
+        let rows = conn
+            .query("DELETE FROM t WHERE id > 1 RETURNING val;")
+            .unwrap();
+        assert_eq!(rows.len(), 2, "DELETE RETURNING should produce 2 rows");
+    }
 }

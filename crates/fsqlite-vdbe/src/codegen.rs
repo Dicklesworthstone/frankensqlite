@@ -2334,6 +2334,11 @@ pub fn codegen_update(
         0x08, // OPFLAG_ISUPDATE
     );
 
+    // RETURNING clause: position cursor on updated row and read columns.
+    if !stmt.returning.is_empty() {
+        emit_returning(b, cursor, table, &stmt.returning, rowid_reg)?;
+    }
+
     // Skip label for WHERE-filtered rows.
     b.resolve_label(skip_label);
 
@@ -2418,6 +2423,14 @@ pub fn codegen_delete(
             schema,
             skip_label,
         );
+    }
+
+    // RETURNING clause: read columns before deletion (row is still present).
+    if !stmt.returning.is_empty() {
+        let ret_count = result_column_count(&stmt.returning, table);
+        let ret_regs = b.alloc_regs(ret_count);
+        emit_column_reads(b, cursor, &stmt.returning, table, None, &[], ret_regs)?;
+        b.emit_op(Opcode::ResultRow, ret_regs, ret_count, 0, P4::None, 0);
     }
 
     // Delete at cursor position.
