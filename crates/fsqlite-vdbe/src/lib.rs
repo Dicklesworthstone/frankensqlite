@@ -19,7 +19,7 @@ pub mod frame;
 /// is known. All labels MUST be resolved before execution begins; unresolved
 /// labels are a codegen bug.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Label(u32);
+pub struct Label(usize);
 
 /// Internal tracking for label resolution.
 #[derive(Debug)]
@@ -240,7 +240,7 @@ impl ProgramBuilder {
 
     /// Create a new label for forward-reference jumps.
     pub fn emit_label(&mut self) -> Label {
-        let id = u32::try_from(self.labels.len()).expect("too many labels");
+        let id = self.labels.len();
         self.labels.push(LabelState::Unresolved(Vec::new()));
         Label(id)
     }
@@ -266,7 +266,7 @@ impl ProgramBuilder {
             p5,
         });
 
-        let idx = label.0 as usize;
+        let idx = label.0;
         match &mut self.labels[idx] {
             LabelState::Unresolved(refs) => refs.push(addr),
             LabelState::Resolved(target) => {
@@ -282,8 +282,12 @@ impl ProgramBuilder {
     ///
     /// All instructions that reference this label have their `p2` patched.
     pub fn resolve_label(&mut self, label: Label) {
-        let target = i32::try_from(self.ops.len()).expect("program too large");
-        let idx = label.0 as usize;
+        let Ok(target) = i32::try_from(self.ops.len()) else {
+            // Keep label unresolved so finish() returns a deterministic internal
+            // error instead of panicking on oversized programs.
+            return;
+        };
+        let idx = label.0;
 
         let refs = match std::mem::replace(&mut self.labels[idx], LabelState::Resolved(target)) {
             LabelState::Unresolved(refs) => refs,
@@ -301,7 +305,7 @@ impl ProgramBuilder {
 
     /// Resolve a label to a specific address (not necessarily current).
     pub fn resolve_label_to(&mut self, label: Label, address: i32) {
-        let idx = label.0 as usize;
+        let idx = label.0;
 
         let refs = match std::mem::replace(&mut self.labels[idx], LabelState::Resolved(address)) {
             LabelState::Unresolved(refs) => refs,
@@ -435,7 +439,7 @@ impl VdbeProgram {
                 P4::Affinity(a) => format!("(aff){a}"),
             };
 
-            writeln!(
+            let _ = writeln!(
                 &mut out,
                 "{addr:<4}  {:<15}  {:<4}  {:<4}  {:<4}  {:<17}  {:<2}",
                 op.opcode.name(),
@@ -444,8 +448,7 @@ impl VdbeProgram {
                 op.p3,
                 p4_str,
                 op.p5,
-            )
-            .expect("write to string");
+            );
         }
 
         out
