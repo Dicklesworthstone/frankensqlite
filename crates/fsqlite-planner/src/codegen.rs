@@ -704,13 +704,18 @@ fn emit_column_reads(
             }
             ResultColumn::Expr { expr, .. } => {
                 if let Expr::Column(col_ref, _) = expr {
-                    let col_idx = table.column_index(&col_ref.column).ok_or_else(|| {
-                        CodegenError::ColumnNotFound {
-                            table: table.name.clone(),
-                            column: col_ref.column.clone(),
-                        }
-                    })?;
-                    b.emit_op(Opcode::Column, cursor, col_idx as i32, reg, P4::None, 0);
+                    if is_rowid_ref(col_ref) {
+                        // Emit OP_Rowid: p1=cursor, p2=target register.
+                        b.emit_op(Opcode::Rowid, cursor, reg, 0, P4::None, 0);
+                    } else {
+                        let col_idx = table.column_index(&col_ref.column).ok_or_else(|| {
+                            CodegenError::ColumnNotFound {
+                                table: table.name.clone(),
+                                column: col_ref.column.clone(),
+                            }
+                        })?;
+                        b.emit_op(Opcode::Column, cursor, col_idx as i32, reg, P4::None, 0);
+                    }
                 } else {
                     // For non-column expressions (literals, placeholders, etc.),
                     // evaluate the expression directly rather than reading a column.
@@ -1686,5 +1691,96 @@ mod tests {
         let mut b = ProgramBuilder::new();
         let err = codegen_delete(&mut b, &stmt, &schema, &ctx).expect_err("should fail");
         assert!(matches!(err, CodegenError::TableNotFound(_)));
+    }
+
+    // ===================================================================
+    // Rowid pseudo-column projection tests (bd-3r24)
+    // ===================================================================
+
+    #[test]
+    fn test_codegen_select_rowid_projection() {
+        let stmt = simple_select(&["rowid"], "t", None);
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        // Should contain OP_Rowid (not OP_Column) for the rowid reference.
+        assert!(
+            has_opcodes(&prog, &[Opcode::Rowid, Opcode::ResultRow]),
+            "SELECT rowid should emit OP_Rowid"
+        );
+    }
+
+    #[test]
+    fn test_codegen_select_rowid_alias_underscore() {
+        let stmt = simple_select(&["_rowid_"], "t", None);
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        assert!(
+            has_opcodes(&prog, &[Opcode::Rowid, Opcode::ResultRow]),
+            "SELECT _rowid_ should emit OP_Rowid"
+        );
+    }
+
+    #[test]
+    fn test_codegen_select_oid_alias() {
+        let stmt = simple_select(&["oid"], "t", None);
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        assert!(
+            has_opcodes(&prog, &[Opcode::Rowid, Opcode::ResultRow]),
+            "SELECT oid should emit OP_Rowid"
+        );
+    }
+
+    #[test]
+    fn test_codegen_select_rowid_with_columns() {
+        // SELECT rowid, a, b FROM t — mixed pseudo-column and real columns.
+        let stmt = simple_select(&["rowid", "a", "b"], "t", None);
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        // Should contain OP_Rowid followed by two OP_Column opcodes.
+        assert!(
+            has_opcodes(
+                &prog,
+                &[
+                    Opcode::Rowid,
+                    Opcode::Column,
+                    Opcode::Column,
+                    Opcode::ResultRow
+                ]
+            ),
+            "SELECT rowid, a, b should emit Rowid + Column + Column"
+        );
+    }
+
+    #[test]
+    fn test_codegen_select_rowid_case_insensitive() {
+        // Uppercase ROWID should also be recognized.
+        let stmt = simple_select(&["ROWID"], "t", None);
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        assert!(
+            has_opcodes(&prog, &[Opcode::Rowid, Opcode::ResultRow]),
+            "SELECT ROWID should emit OP_Rowid (case-insensitive)"
+        );
     }
 }

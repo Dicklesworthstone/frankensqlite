@@ -217,7 +217,9 @@ pub fn resolve_single_table_result_columns(
                         });
                     }
                 }
-                if !column_exists_ignore_case(table_columns, &col_ref.column) {
+                if !column_exists_ignore_case(table_columns, &col_ref.column)
+                    && !is_rowid_alias_name(&col_ref.column)
+                {
                     return Err(SingleTableProjectionError::ColumnNotFound {
                         column: col_ref.column.clone(),
                     });
@@ -250,6 +252,11 @@ fn column_exists_ignore_case(columns: &[String], name: &str) -> bool {
 fn qualifier_matches_table(qualifier: &str, table_name: &str, table_alias: Option<&str>) -> bool {
     qualifier.eq_ignore_ascii_case(table_name)
         || table_alias.is_some_and(|alias| qualifier.eq_ignore_ascii_case(alias))
+}
+
+fn is_rowid_alias_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower == "rowid" || lower == "_rowid_" || lower == "oid"
 }
 
 /// Resolve all ORDER BY terms for a compound SELECT statement.
@@ -1352,6 +1359,44 @@ mod tests {
                 column: "z".to_owned()
             }
         );
+    }
+
+    #[test]
+    fn test_single_table_projection_accepts_rowid_aliases_with_qualifiers() {
+        let core = select_core_single_table(
+            vec![
+                ResultColumn::Expr {
+                    expr: Expr::Column(ColumnRef::bare("rowid"), Span::ZERO),
+                    alias: None,
+                },
+                ResultColumn::Expr {
+                    expr: Expr::Column(
+                        ColumnRef {
+                            table: Some("tt".to_owned()),
+                            column: "_rowid_".to_owned(),
+                        },
+                        Span::ZERO,
+                    ),
+                    alias: None,
+                },
+                ResultColumn::Expr {
+                    expr: Expr::Column(
+                        ColumnRef {
+                            table: Some("t".to_owned()),
+                            column: "oid".to_owned(),
+                        },
+                        Span::ZERO,
+                    ),
+                    alias: None,
+                },
+            ],
+            "t",
+            Some("tt"),
+        );
+        let table_columns = vec!["a".to_owned(), "b".to_owned()];
+        let resolved = resolve_single_table_result_columns(&core, &table_columns)
+            .expect("rowid aliases should be accepted in projection");
+        assert_eq!(resolved.len(), 3);
     }
 
     #[test]
