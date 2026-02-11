@@ -26,6 +26,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::canonicalize::{self, ComparisonTier, TieredComparisonResult};
 use crate::fsqlite_executor::{self, FsqliteExecConfig};
+use crate::golden;
+use crate::mismatch_artifacts;
 use crate::oplog::{self, EquivalenceTier, OpLog, PresetMeta};
 use crate::report::EngineRunReport;
 use crate::run_workspace::{self, WorkspaceConfig};
@@ -100,6 +102,10 @@ pub struct CellResult {
     pub concurrency: u16,
     pub seed: u64,
     pub wall_time_ms: u64,
+    /// Directory containing any mismatch repro artifacts for this cell.
+    ///
+    /// Present only when a mismatch (or late-stage error) occurred.
+    pub artifact_dir: Option<String>,
     pub sqlite_report: Option<EngineRunReport>,
     pub fsqlite_report: Option<EngineRunReport>,
     pub tiered_comparison: Option<TieredComparisonResult>,
@@ -217,6 +223,8 @@ fn run_cell(
     preset: &PresetMeta,
     concurrency: u16,
     seed: u64,
+    settings: &HarnessSettings,
+    bundle_config: &mismatch_artifacts::BundleConfig,
     sqlite_config: &SqliteExecConfig,
     fsqlite_config: &FsqliteExecConfig,
 ) -> CellResult {
@@ -230,6 +238,7 @@ fn run_cell(
             concurrency,
             seed,
             wall_time_ms: elapsed_ms(cell_start),
+            artifact_dir: None,
             sqlite_report: None,
             fsqlite_report: None,
             tiered_comparison: None,
@@ -252,6 +261,7 @@ fn run_cell(
             concurrency,
             seed,
             cell_start,
+            None,
             "workspace creation failed".to_owned(),
         );
     };
@@ -264,6 +274,7 @@ fn run_cell(
             concurrency,
             seed,
             cell_start,
+            Some(workspace.run_dir.display().to_string()),
             format!("fixture {fixture_id} not found in workspace"),
         );
     };
@@ -279,6 +290,7 @@ fn run_cell(
             concurrency,
             seed,
             cell_start,
+            Some(workspace.run_dir.display().to_string()),
             format!("copy for sqlite3 failed: {e}"),
         );
     }
@@ -289,6 +301,7 @@ fn run_cell(
             concurrency,
             seed,
             cell_start,
+            Some(workspace.run_dir.display().to_string()),
             format!("copy for fsqlite failed: {e}"),
         );
     }
@@ -304,6 +317,7 @@ fn run_cell(
                 concurrency,
                 seed,
                 cell_start,
+                Some(workspace.run_dir.display().to_string()),
                 format!("sqlite executor error: {e}"),
             );
         }
@@ -320,6 +334,7 @@ fn run_cell(
                 concurrency,
                 seed,
                 wall_time_ms: elapsed_ms(cell_start),
+                artifact_dir: Some(workspace.run_dir.display().to_string()),
                 sqlite_report: Some(sqlite_report),
                 fsqlite_report: None,
                 tiered_comparison: None,
@@ -338,6 +353,7 @@ fn run_cell(
                 concurrency,
                 seed,
                 wall_time_ms: elapsed_ms(cell_start),
+                artifact_dir: Some(workspace.run_dir.display().to_string()),
                 sqlite_report: Some(sqlite_report),
                 fsqlite_report: Some(fsqlite_report),
                 tiered_comparison: None,
@@ -347,29 +363,65 @@ fn run_cell(
     };
 
     // 6. Assert tier satisfaction.
-    let verdict = if tier_satisfies(preset.expected_tier, &comparison) {
-        CellVerdict::Pass {
-            achieved_tier: tier_to_string(comparison.tier),
+    let expected_tier = equiv_tier_to_string(preset.expected_tier);
+    let achieved_tier = tier_to_string(comparison.tier);
+    let comparison_detail = comparison.detail.clone();
+
+    let mut cell = if tier_satisfies(preset.expected_tier, &comparison) {
+        CellResult {
+            fixture_id: fixture_id.to_owned(),
+            preset_name: preset.name.clone(),
+            concurrency,
+            seed,
+            wall_time_ms: elapsed_ms(cell_start),
+            artifact_dir: None,
+            sqlite_report: Some(sqlite_report),
+            fsqlite_report: Some(fsqlite_report),
+            tiered_comparison: Some(comparison),
+            verdict: CellVerdict::Pass {
+                achieved_tier: achieved_tier.clone(),
+            },
         }
     } else {
-        CellVerdict::Mismatch {
-            expected_tier: equiv_tier_to_string(preset.expected_tier),
-            achieved_tier: Some(tier_to_string(comparison.tier)),
-            detail: comparison.detail.clone(),
+        CellResult {
+            fixture_id: fixture_id.to_owned(),
+            preset_name: preset.name.clone(),
+            concurrency,
+            seed,
+            wall_time_ms: elapsed_ms(cell_start),
+            artifact_dir: None,
+            sqlite_report: Some(sqlite_report),
+            fsqlite_report: Some(fsqlite_report),
+            tiered_comparison: Some(comparison),
+            verdict: CellVerdict::Mismatch {
+                expected_tier,
+                achieved_tier: Some(achieved_tier),
+                detail: comparison_detail,
+            },
         }
     };
 
-    CellResult {
-        fixture_id: fixture_id.to_owned(),
-        preset_name: preset.name.clone(),
-        concurrency,
-        seed,
-        wall_time_ms: elapsed_ms(cell_start),
-        sqlite_report: Some(sqlite_report),
-        fsqlite_report: Some(fsqlite_report),
-        tiered_comparison: Some(comparison),
-        verdict,
+    if matches!(cell.verdict, CellVerdict::Mismatch { .. }) {
+        match mismatch_artifacts::write_mismatch_bundle(
+            &cell,
+            &sqlite_db,
+            &fsqlite_db,
+            Some(&db_entry.golden_source),
+            settings,
+            bundle_config,
+        ) {
+            Ok(bundle_dir) => {
+                cell.artifact_dir = Some(bundle_dir.display().to_string());
+            }
+            Err(e) => {
+                if let CellVerdict::Mismatch { detail, .. } = &mut cell.verdict {
+                    detail.push_str(&format!("; repro_bundle_error: {e}"));
+                }
+            }
+        }
     }
+
+    cell
 }
 
 fn make_error_cell(
@@ -378,6 +430,7 @@ fn make_error_cell(
     concurrency: u16,
     seed: u64,
     start: Instant,
+    artifact_dir: Option<String>,
     error: String,
 ) -> CellResult {
     CellResult {
@@ -386,11 +439,248 @@ fn make_error_cell(
         concurrency,
         seed,
         wall_time_ms: elapsed_ms(start),
+        artifact_dir,
         sqlite_report: None,
         fsqlite_report: None,
         tiered_comparison: None,
         verdict: CellVerdict::Error(error),
     }
+}
+
+#[allow(clippy::too_many_lines)]
+fn write_mismatch_bundle(
+    run_dir: &Path,
+    fixture_id: &str,
+    preset: &PresetMeta,
+    concurrency: u16,
+    seed: u64,
+    golden_source: &Path,
+    oplog: &OpLog,
+    sqlite_config: &SqliteExecConfig,
+    fsqlite_config: &FsqliteExecConfig,
+    sqlite_db: &Path,
+    fsqlite_db: &Path,
+    comparison: &TieredComparisonResult,
+) -> E2eResult<()> {
+    let golden_sha256 = golden::GoldenCopy::hash_file(golden_source).ok();
+
+    let meta_path = run_dir.join("mismatch_meta.json");
+    #[derive(Serialize)]
+    struct MismatchMeta<'a> {
+        schema_version: &'a str,
+        fixture_id: &'a str,
+        preset_name: &'a str,
+        concurrency: u16,
+        seed: u64,
+        golden_source: String,
+        golden_sha256: Option<String>,
+        sqlite_db: String,
+        fsqlite_db: String,
+        sqlite_pragmas: Vec<String>,
+        sqlite_max_busy_retries: u32,
+        fsqlite_pragmas: Vec<String>,
+        fsqlite_concurrent_mode: bool,
+        expected_tier: String,
+        achieved_tier: String,
+        tiered_comparison: &'a TieredComparisonResult,
+    }
+
+    let meta = MismatchMeta {
+        schema_version: "fsqlite-e2e.mismatch_bundle.v1",
+        fixture_id,
+        preset_name: &preset.name,
+        concurrency,
+        seed,
+        golden_source: golden_source.display().to_string(),
+        golden_sha256,
+        sqlite_db: sqlite_db.display().to_string(),
+        fsqlite_db: fsqlite_db.display().to_string(),
+        sqlite_pragmas: sqlite_config.pragmas.clone(),
+        sqlite_max_busy_retries: sqlite_config.max_busy_retries,
+        fsqlite_pragmas: fsqlite_config.pragmas.clone(),
+        fsqlite_concurrent_mode: fsqlite_config.concurrent_mode,
+        expected_tier: equiv_tier_to_string(preset.expected_tier),
+        achieved_tier: tier_to_string(comparison.tier),
+        tiered_comparison: comparison,
+    };
+
+    let meta_json = serde_json::to_string_pretty(&meta).map_err(std::io::Error::other)?;
+    std::fs::write(&meta_path, meta_json)?;
+
+    // Persist the exact OpLog so the workload is reproducible without regenerating.
+    let oplog_json = serde_json::to_string_pretty(oplog).map_err(std::io::Error::other)?;
+    std::fs::write(run_dir.join("oplog.json"), oplog_json)?;
+
+    // Golden-style comparison report + diagnostic bundle.
+    let (report, diagnostic) = golden::verify_databases(sqlite_db, fsqlite_db)?;
+    let report_json = serde_json::to_string_pretty(&report).map_err(std::io::Error::other)?;
+    std::fs::write(run_dir.join("comparison_report.json"), report_json)?;
+
+    if let Some(ref diag) = diagnostic {
+        let diag_json = serde_json::to_string_pretty(diag).map_err(std::io::Error::other)?;
+        std::fs::write(run_dir.join("mismatch_diagnostic.json"), diag_json)?;
+        std::fs::write(
+            run_dir.join("mismatch_diagnostic.md"),
+            golden::format_mismatch_diagnostic(diag),
+        )?;
+    }
+
+    // Canonicalized outputs (Tier 2 artifacts).
+    let _ = canonicalize::canonicalize(sqlite_db, &run_dir.join("canonical_sqlite3.db"))?;
+    let _ = canonicalize::canonicalize(fsqlite_db, &run_dir.join("canonical_fsqlite.db"))?;
+
+    // Schema snapshots (sqlite_master DDL).
+    write_schema_snapshot(sqlite_db, &run_dir.join("schema_sqlite3.sql"))?;
+    write_schema_snapshot(fsqlite_db, &run_dir.join("schema_fsqlite.sql"))?;
+
+    // Deterministic dumps (size-capped).
+    write_logical_dump_limited(
+        sqlite_db,
+        &run_dir.join("dump_sqlite3.txt"),
+        5 * 1024 * 1024,
+    )?;
+    write_logical_dump_limited(
+        fsqlite_db,
+        &run_dir.join("dump_fsqlite.txt"),
+        5 * 1024 * 1024,
+    )?;
+
+    // Cross-engine diff files (best-effort — don't fail the whole bundle).
+    mismatch_artifacts::write_diff_files(run_dir, sqlite_db, fsqlite_db);
+
+    // Human repro instructions.
+    let mut md = String::new();
+    use std::fmt::Write as _;
+    let _ = writeln!(
+        md,
+        "# Repro Bundle\n\nFixture: `{}`\nPreset: `{}`\nConcurrency: `{}`\nSeed: `{}`\n",
+        fixture_id, preset.name, concurrency, seed
+    );
+    let _ = writeln!(md, "- Run dir: `{}`", run_dir.display());
+    let _ = writeln!(md, "- sqlite3 db: `{}`", sqlite_db.display());
+    let _ = writeln!(md, "- fsqlite db: `{}`", fsqlite_db.display());
+    let _ = writeln!(md, "- golden source: `{}`", golden_source.display());
+    let _ = writeln!(md);
+    let _ = writeln!(md, "## Commands\n");
+    let _ = writeln!(
+        md,
+        "1. Compare (JSON):\n   ```bash\n   realdb-e2e compare --db-a \"{}\" --db-b \"{}\" --json\n   ```\n",
+        sqlite_db.display(),
+        fsqlite_db.display()
+    );
+    let _ = writeln!(
+        md,
+        "2. Inspect diagnostic:\n   - `mismatch_diagnostic.md`\n   - `mismatch_diagnostic.json`\n"
+    );
+    let _ = writeln!(
+        md,
+        "3. Inspect canonical outputs:\n   - `canonical_sqlite3.db`\n   - `canonical_fsqlite.db`\n"
+    );
+    let _ = writeln!(
+        md,
+        "4. Inspect dumps (size-capped):\n   - `dump_sqlite3.txt`\n   - `dump_fsqlite.txt`\n"
+    );
+    let _ = writeln!(
+        md,
+        "5. Inspect diffs:\n   - `schema_diff.txt` (schema comparison)\n   - `dump_diff.txt` (row-level differences)\n   - `pragma_diff.txt` (PRAGMA setting differences)\n"
+    );
+
+    std::fs::write(run_dir.join("REPRO.md"), md)?;
+
+    Ok(())
+}
+
+fn write_schema_snapshot(db_path: &Path, out_path: &Path) -> E2eResult<()> {
+    let flags =
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let conn = rusqlite::Connection::open_with_flags(db_path, flags)?;
+
+    let mut stmt =
+        conn.prepare("SELECT sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY name")?;
+    let sqls: Vec<String> = stmt
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut out = String::new();
+    for sql in &sqls {
+        out.push_str(sql);
+        out.push_str(";\n");
+    }
+    std::fs::write(out_path, out)?;
+    Ok(())
+}
+
+fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+fn write_logical_dump_limited(db_path: &Path, out_path: &Path, max_bytes: usize) -> E2eResult<()> {
+    use std::io::Write as _;
+
+    let flags =
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let conn = rusqlite::Connection::open_with_flags(db_path, flags)?;
+
+    let mut file = std::fs::File::create(out_path)?;
+    let mut written = 0usize;
+
+    let mut write_line = |s: &str| -> std::io::Result<bool> {
+        if written.saturating_add(s.len()) > max_bytes {
+            let note = "\n-- TRUNCATED (max_bytes exceeded) --\n";
+            if written.saturating_add(note.len()) <= max_bytes {
+                file.write_all(note.as_bytes())?;
+                written += note.len();
+            }
+            return Ok(false);
+        }
+        file.write_all(s.as_bytes())?;
+        written += s.len();
+        Ok(true)
+    };
+
+    // Schema DDL.
+    let mut schema_stmt =
+        conn.prepare("SELECT sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY name")?;
+    let mut rows = schema_stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let sql: String = row.get(0)?;
+        if !write_line(&format!("{sql};\n"))? {
+            return Ok(());
+        }
+    }
+    if !write_line("---\n")? {
+        return Ok(());
+    }
+
+    // Tables + rows.
+    let mut table_stmt = conn.prepare(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+    )?;
+    let tables: Vec<String> = table_stmt
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    for table in &tables {
+        if !write_line(&format!("TABLE {table}\n"))? {
+            return Ok(());
+        }
+        let q = format!("SELECT * FROM {} ORDER BY 1", quote_ident(table));
+        let mut stmt = conn.prepare(&q)?;
+        let col_count = stmt.column_count();
+        let mut r = stmt.query([])?;
+        while let Some(row) = r.next()? {
+            let mut parts = Vec::with_capacity(col_count);
+            for i in 0..col_count {
+                let v: rusqlite::types::Value = row.get(i)?;
+                parts.push(format!("{v:?}"));
+            }
+            if !write_line(&format!("  {}\n", parts.join("|")))? {
+                return Ok(());
+            }
+        }
+    }
+
+    Ok(())
 }
 
 // ── Matrix orchestrator ────────────────────────────────────────────────
@@ -735,6 +1025,7 @@ mod tests {
             concurrency: 1,
             seed: 42,
             wall_time_ms: 100,
+            artifact_dir: None,
             sqlite_report: None,
             fsqlite_report: None,
             tiered_comparison: None,
@@ -778,6 +1069,7 @@ mod tests {
             concurrency: 4,
             seed: 99,
             wall_time_ms: 250,
+            artifact_dir: None,
             sqlite_report: None,
             fsqlite_report: None,
             tiered_comparison: None,
