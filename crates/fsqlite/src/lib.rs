@@ -1395,7 +1395,7 @@ mod tests {
         conn.execute("INSERT INTO ga VALUES ('b', 20);").unwrap();
 
         let rows = conn
-            .query("SELECT t.* FROM ga AS t GROUP BY k, v ORDER BY k, v;")
+            .query("SELECT t.* FROM ga AS t GROUP BY t.k, t.v ORDER BY t.k, t.v;")
             .unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(
@@ -1465,6 +1465,33 @@ mod tests {
         assert!(projected.contains(&vec![
             SqliteValue::Null,
             SqliteValue::Text("right-c".to_owned())
+        ]));
+    }
+
+    #[test]
+    fn right_join_using_nulls_do_not_match() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE l (id INTEGER, name TEXT);")
+            .unwrap();
+        conn.execute("CREATE TABLE r (id INTEGER, tag TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO l VALUES (NULL, 'left-null'), (1, 'left-one');")
+            .unwrap();
+        conn.execute("INSERT INTO r VALUES (NULL, 'right-null'), (1, 'right-one');")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT l.name, r.tag FROM l RIGHT JOIN r USING (id);")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        let projected: Vec<Vec<SqliteValue>> = rows.iter().map(row_values).collect();
+        assert!(projected.contains(&vec![
+            SqliteValue::Text("left-one".to_owned()),
+            SqliteValue::Text("right-one".to_owned())
+        ]));
+        assert!(projected.contains(&vec![
+            SqliteValue::Null,
+            SqliteValue::Text("right-null".to_owned())
         ]));
     }
 
@@ -2197,5 +2224,37 @@ mod tests {
             .query("DELETE FROM t WHERE id > 1 RETURNING val;")
             .unwrap();
         assert_eq!(rows.len(), 2, "DELETE RETURNING should produce 2 rows");
+    }
+
+    // Test: INSERT DEFAULT VALUES
+    #[test]
+    fn probe_insert_default_values() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO t DEFAULT VALUES;").unwrap();
+        let rows = conn.query("SELECT id, name, val FROM t;").unwrap();
+        assert_eq!(rows.len(), 1, "DEFAULT VALUES should insert 1 row");
+        // name and val should be NULL (defaults)
+        assert_eq!(row_values(&rows[0])[1], SqliteValue::Null);
+        assert_eq!(row_values(&rows[0])[2], SqliteValue::Null);
+    }
+
+    // Test: INSERT DEFAULT VALUES with RETURNING
+    #[test]
+    fn probe_insert_default_values_returning() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);")
+            .unwrap();
+        let rows = conn
+            .query("INSERT INTO t DEFAULT VALUES RETURNING rowid;")
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "DEFAULT VALUES RETURNING should produce 1 row"
+        );
+        // rowid should be auto-assigned (1)
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(1));
     }
 }

@@ -1937,7 +1937,43 @@ pub fn codegen_insert(
             codegen_insert_select(b, select_stmt, cursor, table, schema, &stmt.returning, ctx)?;
         }
         InsertSource::DefaultValues => {
-            return Err(CodegenError::Unsupported("DEFAULT VALUES".to_owned()));
+            // Insert one row with all columns set to NULL.
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            let n_cols = table.columns.len() as i32;
+            let concurrent_flag = i32::from(ctx.concurrent_mode);
+            let col_regs = b.alloc_regs(n_cols);
+            for i in 0..n_cols {
+                b.emit_op(Opcode::Null, 0, col_regs + i, 0, P4::None, 0);
+            }
+            let rowid_reg = b.alloc_reg();
+            b.emit_op(
+                Opcode::NewRowid,
+                cursor,
+                rowid_reg,
+                concurrent_flag,
+                P4::None,
+                0,
+            );
+            let rec_reg = b.alloc_reg();
+            b.emit_op(
+                Opcode::MakeRecord,
+                col_regs,
+                n_cols,
+                rec_reg,
+                P4::Affinity(table.affinity_string()),
+                0,
+            );
+            b.emit_op(
+                Opcode::Insert,
+                cursor,
+                rec_reg,
+                rowid_reg,
+                P4::Table(table.name.clone()),
+                0,
+            );
+            if !stmt.returning.is_empty() {
+                emit_returning(b, cursor, table, &stmt.returning, rowid_reg)?;
+            }
         }
     }
 
@@ -3570,6 +3606,11 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
                 b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
             }
         }
+        Expr::Collate { expr: inner, .. } => {
+            // Evaluate the inner expression; collation affects comparisons
+            // rather than value computation, so a pass-through is correct.
+            emit_expr(b, inner, reg, ctx);
+        }
         _ => {
             // Column refs without scan context and other unhandled expressions: Null.
             b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
@@ -4832,6 +4873,52 @@ mod tests {
             .find(|op| op.opcode == Opcode::NewRowid)
             .unwrap();
         assert_eq!(nr2.p3, 0, "NewRowid p3 should be 0 in normal mode");
+    }
+
+    #[test]
+    fn test_codegen_concurrent_newrowid_default_values() {
+        let stmt = InsertStatement {
+            with: None,
+            or_conflict: None,
+            table: QualifiedName::bare("t"),
+            alias: None,
+            columns: vec![],
+            source: InsertSource::DefaultValues,
+            upsert: vec![],
+            returning: vec![],
+        };
+        let schema = test_schema();
+        let ctx = CodegenContext {
+            concurrent_mode: true,
+        };
+        let mut b = ProgramBuilder::new();
+        codegen_insert(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        let nr = prog
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::NewRowid)
+            .unwrap();
+        assert_ne!(
+            nr.p3, 0,
+            "NewRowid p3 should be non-zero in concurrent mode for DEFAULT VALUES"
+        );
+
+        // In non-concurrent mode, p3 should be 0 for DEFAULT VALUES as well.
+        let ctx_normal = CodegenContext::default();
+        let mut b2 = ProgramBuilder::new();
+        codegen_insert(&mut b2, &stmt, &schema, &ctx_normal).unwrap();
+        let prog2 = b2.finish().unwrap();
+        let nr2 = prog2
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::NewRowid)
+            .unwrap();
+        assert_eq!(
+            nr2.p3, 0,
+            "NewRowid p3 should be 0 in normal mode for DEFAULT VALUES"
+        );
     }
 
     // === Test 8: SELECT full scan ===
