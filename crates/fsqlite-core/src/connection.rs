@@ -2766,6 +2766,38 @@ impl Connection {
         let base_rows = self.execute_statement(Statement::Select(base_select), params)?;
         let mut all_rows: Vec<Vec<SqliteValue>> =
             base_rows.iter().map(|r| r.values().to_vec()).collect();
+        let mut recursive_arms: Vec<(&CompoundOp, &SelectCore)> = Vec::new();
+        for (op, core) in &cte.query.body.compounds {
+            if matches!(op, CompoundOp::Intersect | CompoundOp::Except) {
+                return Err(FrankenError::NotImplemented(
+                    "recursive CTE supports only UNION and UNION ALL".to_owned(),
+                ));
+            }
+            if select_core_references_table(core, cte_name) {
+                recursive_arms.push((op, core));
+                continue;
+            }
+            let arm_select = SelectStatement {
+                with: None,
+                body: SelectBody {
+                    select: core.clone(),
+                    compounds: vec![],
+                },
+                order_by: vec![],
+                limit: None,
+            };
+            let arm_rows = self.execute_statement(Statement::Select(arm_select), params)?;
+            match op {
+                CompoundOp::UnionAll => {
+                    all_rows.extend(arm_rows.iter().map(|row| row.values().to_vec()));
+                }
+                CompoundOp::Union => {
+                    all_rows.extend(arm_rows.iter().map(|row| row.values().to_vec()));
+                    dedup_value_rows(&mut all_rows);
+                }
+                CompoundOp::Intersect | CompoundOp::Except => unreachable!(),
+            }
+        }
         if cte
             .query
             .body
@@ -2794,16 +2826,11 @@ impl Connection {
             }
             // Execute each recursive arm.
             let mut new_rows: Vec<Vec<SqliteValue>> = Vec::new();
-            for (op, recursive_core) in &cte.query.body.compounds {
-                if matches!(op, CompoundOp::Intersect | CompoundOp::Except) {
-                    return Err(FrankenError::NotImplemented(
-                        "recursive CTE supports only UNION and UNION ALL".to_owned(),
-                    ));
-                }
+            for (op, recursive_core) in &recursive_arms {
                 let arm_select = SelectStatement {
                     with: None,
                     body: SelectBody {
-                        select: recursive_core.clone(),
+                        select: (*recursive_core).clone(),
                         compounds: vec![],
                     },
                     order_by: vec![],
@@ -11680,5 +11707,27 @@ mod transaction_lifecycle_tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].get(0).unwrap(), &SqliteValue::Integer(1));
         assert_eq!(rows[1].get(0).unwrap(), &SqliteValue::Integer(2));
+    }
+
+    #[test]
+    fn test_recursive_cte_non_recursive_union_all_arm_runs_once() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn
+            .query(
+                "WITH RECURSIVE t(x) AS (\
+                   SELECT 1 \
+                   UNION ALL \
+                   SELECT 2 \
+                   UNION ALL \
+                   SELECT x + 1 FROM t WHERE x < 3\
+                 ) SELECT x FROM t ORDER BY x",
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 5);
+        assert_eq!(rows[0].get(0).unwrap(), &SqliteValue::Integer(1));
+        assert_eq!(rows[1].get(0).unwrap(), &SqliteValue::Integer(2));
+        assert_eq!(rows[2].get(0).unwrap(), &SqliteValue::Integer(2));
+        assert_eq!(rows[3].get(0).unwrap(), &SqliteValue::Integer(3));
+        assert_eq!(rows[4].get(0).unwrap(), &SqliteValue::Integer(3));
     }
 }
