@@ -30,8 +30,8 @@ use fsqlite_types::flags::{AccessFlags, VfsOpenFlags};
 use fsqlite_types::opcode::{Opcode, P4};
 use fsqlite_types::value::SqliteValue;
 use fsqlite_vdbe::codegen::{
-    CodegenContext, CodegenError, ColumnInfo, TableSchema, codegen_delete, codegen_insert,
-    codegen_select, codegen_update,
+    CodegenContext, CodegenError, ColumnInfo, IndexSchema, TableSchema, codegen_delete,
+    codegen_insert, codegen_select, codegen_update,
 };
 use fsqlite_vdbe::engine::{ExecOutcome, MemDatabase, MemDbVersionToken, VdbeEngine};
 use fsqlite_vdbe::{ProgramBuilder, VdbeProgram};
@@ -353,6 +353,15 @@ impl PreparedStatement {
     }
 }
 
+/// A stored view definition: name + SELECT query.
+#[derive(Debug, Clone)]
+struct ViewDef {
+    name: String,
+    #[allow(dead_code)]
+    columns: Vec<String>,
+    query: SelectStatement,
+}
+
 /// Snapshot of the database + schema state at a point in time.
 /// Used for transaction rollback and savepoint restore.
 #[derive(Debug, Clone)]
@@ -388,6 +397,8 @@ pub struct Connection {
     active_txn: RefCell<Option<Box<dyn TransactionHandle>>>,
     /// Schema registry: table metadata used by the code generator.
     schema: RefCell<Vec<TableSchema>>,
+    /// View definitions stored in-memory.
+    views: RefCell<Vec<ViewDef>>,
     /// Scalar/aggregate/window function registry shared with the VDBE engine.
     func_registry: Arc<FunctionRegistry>,
     /// Whether an explicit transaction is active (BEGIN without matching COMMIT/ROLLBACK).
@@ -453,6 +464,7 @@ impl Connection {
             pager,
             active_txn: RefCell::new(None),
             schema: RefCell::new(Vec::new()),
+            views: RefCell::new(Vec::new()),
             func_registry: default_function_registry(),
             in_transaction: RefCell::new(false),
             txn_snapshot: RefCell::new(None),
@@ -567,6 +579,10 @@ impl Connection {
                 // CTE (WITH clause): materialize as temporary tables.
                 if select.with.is_some() {
                     return self.execute_with_ctes(select, params);
+                }
+                // View expansion: materialize referenced views as temp tables.
+                if self.has_view_references(select) {
+                    return self.execute_with_materialized_views(select, params);
                 }
                 let distinct = is_distinct_select(select);
                 // Compound SELECT (UNION/UNION ALL/INTERSECT/EXCEPT).
@@ -692,8 +708,17 @@ impl Connection {
                 self.persist_if_needed()?;
                 Ok(Vec::new())
             }
+            Statement::CreateIndex(ref create_idx) => {
+                self.execute_create_index(create_idx)?;
+                self.persist_if_needed()?;
+                Ok(Vec::new())
+            }
+            Statement::CreateView(ref create_view) => {
+                self.execute_create_view(create_view)?;
+                Ok(Vec::new())
+            }
             _ => Err(FrankenError::NotImplemented(
-                "only SELECT, INSERT, UPDATE, DELETE, CREATE/DROP/ALTER TABLE, transaction control, and PRAGMA are supported".to_owned(),
+                "only SELECT, INSERT, UPDATE, DELETE, DDL (CREATE/DROP/ALTER TABLE, CREATE INDEX/VIEW), transaction control, and PRAGMA are supported".to_owned(),
             )),
         }
     }
@@ -969,39 +994,69 @@ impl Connection {
         Ok(())
     }
 
-    /// Execute a DROP statement (currently supports DROP TABLE only).
+    /// Execute a DROP statement (TABLE, INDEX, VIEW).
     fn execute_drop(&self, drop_stmt: &fsqlite_ast::DropStatement) -> Result<()> {
-        if drop_stmt.object_type != DropObjectType::Table {
-            return Err(FrankenError::NotImplemented(format!(
-                "DROP {:?} is not supported yet",
-                drop_stmt.object_type
-            )));
-        }
-
-        let table_name = &drop_stmt.name.name;
-        let mut schema = self.schema.borrow_mut();
-        let table_idx = schema
-            .iter()
-            .position(|t| t.name.eq_ignore_ascii_case(table_name));
-
-        match table_idx {
-            Some(idx) => {
-                let root_page = schema[idx].root_page;
-                schema.remove(idx);
-                drop(schema);
-                // Remove associated in-memory table storage (via undo-logged path).
-                self.db.borrow_mut().destroy_table(root_page);
-                Ok(())
+        let obj_name = &drop_stmt.name.name;
+        match drop_stmt.object_type {
+            DropObjectType::Table => {
+                let mut schema = self.schema.borrow_mut();
+                let table_idx = schema
+                    .iter()
+                    .position(|t| t.name.eq_ignore_ascii_case(obj_name));
+                match table_idx {
+                    Some(idx) => {
+                        let root_page = schema[idx].root_page;
+                        schema.remove(idx);
+                        drop(schema);
+                        self.db.borrow_mut().destroy_table(root_page);
+                        Ok(())
+                    }
+                    None => {
+                        if drop_stmt.if_exists {
+                            Ok(())
+                        } else {
+                            Err(FrankenError::NoSuchTable {
+                                name: obj_name.clone(),
+                            })
+                        }
+                    }
+                }
             }
-            None => {
+            DropObjectType::Index => {
+                let mut schema = self.schema.borrow_mut();
+                for table in schema.iter_mut() {
+                    if let Some(pos) = table
+                        .indexes
+                        .iter()
+                        .position(|idx| idx.name.eq_ignore_ascii_case(obj_name))
+                    {
+                        table.indexes.remove(pos);
+                        return Ok(());
+                    }
+                }
                 if drop_stmt.if_exists {
                     Ok(())
                 } else {
-                    Err(FrankenError::NoSuchTable {
-                        name: table_name.clone(),
-                    })
+                    Err(FrankenError::Internal(format!("no such index: {obj_name}")))
                 }
             }
+            DropObjectType::View => {
+                let mut views = self.views.borrow_mut();
+                if let Some(pos) = views
+                    .iter()
+                    .position(|v| v.name.eq_ignore_ascii_case(obj_name))
+                {
+                    views.remove(pos);
+                    Ok(())
+                } else if drop_stmt.if_exists {
+                    Ok(())
+                } else {
+                    Err(FrankenError::Internal(format!("no such view: {obj_name}")))
+                }
+            }
+            DropObjectType::Trigger => Err(FrankenError::NotImplemented(
+                "DROP TRIGGER is not supported yet".to_owned(),
+            )),
         }
     }
 
@@ -1071,6 +1126,220 @@ impl Connection {
                 Ok(())
             }
         }
+    }
+
+    /// Execute a CREATE INDEX statement (schema-only; no physical index yet).
+    fn execute_create_index(&self, stmt: &fsqlite_ast::CreateIndexStatement) -> Result<()> {
+        let table_name = &stmt.table;
+        let mut schema = self.schema.borrow_mut();
+        let table = schema
+            .iter_mut()
+            .find(|t| t.name.eq_ignore_ascii_case(table_name))
+            .ok_or_else(|| FrankenError::NoSuchTable {
+                name: table_name.clone(),
+            })?;
+        // Check for duplicate index name.
+        let index_name = &stmt.name.name;
+        if table
+            .indexes
+            .iter()
+            .any(|idx| idx.name.eq_ignore_ascii_case(index_name))
+        {
+            if stmt.if_not_exists {
+                return Ok(());
+            }
+            return Err(FrankenError::Internal(format!(
+                "index {index_name} already exists"
+            )));
+        }
+        // Validate that all indexed columns exist and collect their names.
+        let mut col_names = Vec::with_capacity(stmt.columns.len());
+        for idx_col in &stmt.columns {
+            let col_name = expr_col_name(&idx_col.expr).ok_or_else(|| {
+                FrankenError::NotImplemented(
+                    "only column references are supported in CREATE INDEX".to_owned(),
+                )
+            })?;
+            if !table
+                .columns
+                .iter()
+                .any(|c| c.name.eq_ignore_ascii_case(col_name))
+            {
+                return Err(FrankenError::Internal(format!(
+                    "no such column: {col_name}"
+                )));
+            }
+            col_names.push(col_name.to_owned());
+        }
+        // Record the index in the schema for metadata purposes.
+        table.indexes.push(IndexSchema {
+            name: stmt.name.name.clone(),
+            columns: col_names,
+            root_page: 0,
+        });
+        Ok(())
+    }
+
+    /// Execute a CREATE VIEW statement (store definition in memory).
+    fn execute_create_view(&self, stmt: &fsqlite_ast::CreateViewStatement) -> Result<()> {
+        let view_name = &stmt.name.name;
+        let views = self.views.borrow();
+        if views.iter().any(|v| v.name.eq_ignore_ascii_case(view_name)) {
+            if stmt.if_not_exists {
+                return Ok(());
+            }
+            return Err(FrankenError::Internal(format!(
+                "view {view_name} already exists"
+            )));
+        }
+        drop(views);
+        self.views.borrow_mut().push(ViewDef {
+            name: view_name.clone(),
+            columns: stmt.columns.clone(),
+            query: stmt.query.clone(),
+        });
+        Ok(())
+    }
+
+    /// Check if a SELECT references any views in its FROM/JOIN sources.
+    fn has_view_references(&self, select: &SelectStatement) -> bool {
+        let views = self.views.borrow();
+        if views.is_empty() {
+            return false;
+        }
+        let schema = self.schema.borrow();
+        // A view reference only counts if there is no real table with that
+        // name already (which would mean the view is already materialized).
+        let is_unmaterialized_view = |source: &TableOrSubquery| -> bool {
+            if let TableOrSubquery::Table { name, .. } = source {
+                let nm = &name.name;
+                views.iter().any(|v| v.name.eq_ignore_ascii_case(nm))
+                    && !schema.iter().any(|t| t.name.eq_ignore_ascii_case(nm))
+            } else {
+                false
+            }
+        };
+        if let SelectCore::Select {
+            from: Some(ref from),
+            ..
+        } = select.body.select
+        {
+            if is_unmaterialized_view(&from.source) {
+                return true;
+            }
+            for join in &from.joins {
+                if is_unmaterialized_view(&join.table) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Materialize views referenced by a SELECT as temporary tables, execute
+    /// the query, then clean up the temp tables.
+    fn execute_with_materialized_views(
+        &self,
+        select: &SelectStatement,
+        params: Option<&[SqliteValue]>,
+    ) -> Result<Vec<Row>> {
+        let view_defs: Vec<ViewDef> = self.views.borrow().clone();
+        let mut materialized: Vec<String> = Vec::new();
+
+        // Collect view names referenced in FROM/JOIN.
+        let mut referenced: Vec<String> = Vec::new();
+        if let SelectCore::Select {
+            from: Some(ref from),
+            ..
+        } = select.body.select
+        {
+            if let TableOrSubquery::Table { ref name, .. } = from.source {
+                if view_defs
+                    .iter()
+                    .any(|v| v.name.eq_ignore_ascii_case(&name.name))
+                {
+                    referenced.push(name.name.clone());
+                }
+            }
+            for join in &from.joins {
+                if let TableOrSubquery::Table { ref name, .. } = join.table {
+                    if view_defs
+                        .iter()
+                        .any(|v| v.name.eq_ignore_ascii_case(&name.name))
+                    {
+                        referenced.push(name.name.clone());
+                    }
+                }
+            }
+        }
+
+        // Materialize each referenced view as a temp table.
+        for ref_name in &referenced {
+            let view = view_defs
+                .iter()
+                .find(|v| v.name.eq_ignore_ascii_case(ref_name))
+                .unwrap();
+            let view_rows =
+                self.execute_statement(Statement::Select(view.query.clone()), params)?;
+            let col_names = infer_select_column_names(&view.query);
+            let width = if col_names.is_empty() {
+                view_rows.first().map_or(1, |r| r.values().len())
+            } else {
+                col_names.len()
+            };
+            let col_infos: Vec<ColumnInfo> = if col_names.is_empty() {
+                (0..width)
+                    .map(|i| ColumnInfo {
+                        name: format!("_c{i}"),
+                        affinity: 'B',
+                    })
+                    .collect()
+            } else {
+                col_names
+                    .iter()
+                    .map(|n| ColumnInfo {
+                        name: n.clone(),
+                        affinity: 'B',
+                    })
+                    .collect()
+            };
+
+            let root_page = self.db.borrow_mut().create_table(col_infos.len());
+            self.schema.borrow_mut().push(TableSchema {
+                name: view.name.clone(),
+                root_page,
+                columns: col_infos,
+                indexes: Vec::new(),
+            });
+            materialized.push(view.name.clone());
+
+            for (i, row) in view_rows.iter().enumerate() {
+                let vals = row.values().to_vec();
+                #[allow(clippy::cast_possible_wrap)]
+                let rowid = (i + 1) as i64;
+                if let Some(table) = self.db.borrow_mut().get_table_mut(root_page) {
+                    table.insert_row(rowid, vals);
+                }
+            }
+        }
+
+        let result = self.execute_statement(Statement::Select(select.clone()), params);
+
+        // Clean up materialized temp tables.
+        for name in &materialized {
+            let mut schema = self.schema.borrow_mut();
+            if let Some(idx) = schema
+                .iter()
+                .position(|t| t.name.eq_ignore_ascii_case(name))
+            {
+                let rp = schema[idx].root_page;
+                schema.remove(idx);
+                drop(schema);
+                self.db.borrow_mut().destroy_table(rp);
+            }
+        }
+
+        result
     }
 
     // ── Transaction control ──────────────────────────────────────────────
@@ -2945,8 +3214,15 @@ fn sort_rows_by_order_terms(
     let resolved: Vec<(usize, bool)> = order_by
         .iter()
         .map(|term| {
-            // Try column reference first (alias or column name match).
-            let idx = if let Some(col_name) = expr_col_name(&term.expr) {
+            // Try integer position reference first (ORDER BY 1, 2).
+            let idx = if let Expr::Literal(Literal::Integer(n), _) = &term.expr {
+                let pos = usize::try_from(*n).unwrap_or(0);
+                if pos >= 1 && pos <= columns.len() {
+                    Some(pos - 1)
+                } else {
+                    None
+                }
+            } else if let Some(col_name) = expr_col_name(&term.expr) {
                 columns.iter().position(|c| match c {
                     ResultColumn::Expr {
                         expr: Expr::Column(r, _),
@@ -5410,6 +5686,190 @@ mod tests {
         let conn = Connection::open(":memory:").unwrap();
         let err = conn.execute("ALTER TABLE nosuch ADD COLUMN x INTEGER;");
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_create_index_basic() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE users (id INTEGER, name TEXT, age INTEGER);")
+            .unwrap();
+        conn.execute("CREATE INDEX idx_name ON users (name);")
+            .unwrap();
+        // Verify the index is recorded in the schema.
+        let schema = conn.schema.borrow();
+        let table = schema.iter().find(|t| t.name == "users").unwrap();
+        assert_eq!(table.indexes.len(), 1);
+        assert_eq!(table.indexes[0].name, "idx_name");
+        assert_eq!(table.indexes[0].columns, vec!["name"]);
+    }
+
+    #[test]
+    fn test_create_index_if_not_exists() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (a INTEGER);").unwrap();
+        conn.execute("CREATE INDEX idx_a ON t (a);").unwrap();
+        // Duplicate without IF NOT EXISTS should fail.
+        assert!(conn.execute("CREATE INDEX idx_a ON t (a);").is_err());
+        // With IF NOT EXISTS should succeed silently.
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_a ON t (a);")
+            .unwrap();
+    }
+
+    #[test]
+    fn test_create_index_bad_column() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (a INTEGER);").unwrap();
+        assert!(conn.execute("CREATE INDEX idx_z ON t (z);").is_err());
+    }
+
+    #[test]
+    fn test_drop_index() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (a INTEGER, b TEXT);").unwrap();
+        conn.execute("CREATE INDEX idx_a ON t (a);").unwrap();
+        {
+            let schema = conn.schema.borrow();
+            assert_eq!(
+                schema.iter().find(|t| t.name == "t").unwrap().indexes.len(),
+                1
+            );
+        }
+        conn.execute("DROP INDEX idx_a;").unwrap();
+        {
+            let schema = conn.schema.borrow();
+            assert!(
+                schema
+                    .iter()
+                    .find(|t| t.name == "t")
+                    .unwrap()
+                    .indexes
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn test_drop_index_if_exists() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("DROP INDEX IF EXISTS nosuch;").unwrap();
+        assert!(conn.execute("DROP INDEX nosuch;").is_err());
+    }
+
+    #[test]
+    fn test_create_view_basic() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE items (id INTEGER, price INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO items VALUES (1, 100);").unwrap();
+        conn.execute("INSERT INTO items VALUES (2, 200);").unwrap();
+        conn.execute("CREATE VIEW expensive AS SELECT id, price FROM items WHERE price > 150;")
+            .unwrap();
+        let rows = conn.query("SELECT * FROM expensive;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(2));
+    }
+
+    #[test]
+    fn test_create_view_if_not_exists() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (a INTEGER);").unwrap();
+        conn.execute("CREATE VIEW v AS SELECT a FROM t;").unwrap();
+        assert!(conn.execute("CREATE VIEW v AS SELECT a FROM t;").is_err());
+        conn.execute("CREATE VIEW IF NOT EXISTS v AS SELECT a FROM t;")
+            .unwrap();
+    }
+
+    #[test]
+    fn test_drop_view() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (a INTEGER);").unwrap();
+        conn.execute("CREATE VIEW v AS SELECT a FROM t;").unwrap();
+        assert_eq!(conn.views.borrow().len(), 1);
+        conn.execute("DROP VIEW v;").unwrap();
+        assert!(conn.views.borrow().is_empty());
+    }
+
+    #[test]
+    fn test_drop_view_if_exists() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("DROP VIEW IF EXISTS nosuch;").unwrap();
+        assert!(conn.execute("DROP VIEW nosuch;").is_err());
+    }
+
+    #[test]
+    fn test_view_with_aggregation() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE sales (product TEXT, amount INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO sales VALUES ('A', 10);").unwrap();
+        conn.execute("INSERT INTO sales VALUES ('A', 20);").unwrap();
+        conn.execute("INSERT INTO sales VALUES ('B', 30);").unwrap();
+        conn.execute(
+            "CREATE VIEW totals AS SELECT product, SUM(amount) AS total FROM sales GROUP BY product;",
+        )
+        .unwrap();
+        let rows = conn.query("SELECT * FROM totals;").unwrap();
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn test_order_by_position_reference() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE items (name TEXT, price INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO items VALUES ('banana', 2);")
+            .unwrap();
+        conn.execute("INSERT INTO items VALUES ('apple', 3);")
+            .unwrap();
+        conn.execute("INSERT INTO items VALUES ('cherry', 1);")
+            .unwrap();
+        // ORDER BY 2 means order by second column (price).
+        let rows = conn
+            .query("SELECT name, price FROM items ORDER BY 2;")
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Text("cherry".into()));
+        assert_eq!(row_values(&rows[1])[0], SqliteValue::Text("banana".into()));
+        assert_eq!(row_values(&rows[2])[0], SqliteValue::Text("apple".into()));
+    }
+
+    #[test]
+    fn test_order_by_position_desc() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE scores (player TEXT, points INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO scores VALUES ('A', 10);")
+            .unwrap();
+        conn.execute("INSERT INTO scores VALUES ('B', 30);")
+            .unwrap();
+        conn.execute("INSERT INTO scores VALUES ('C', 20);")
+            .unwrap();
+        // ORDER BY 2 DESC, 1 ASC
+        let rows = conn
+            .query("SELECT player, points FROM scores ORDER BY 2 DESC, 1;")
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(row_values(&rows[0])[1], SqliteValue::Integer(30));
+        assert_eq!(row_values(&rows[1])[1], SqliteValue::Integer(20));
+        assert_eq!(row_values(&rows[2])[1], SqliteValue::Integer(10));
+    }
+
+    #[test]
+    fn test_order_by_expression() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE nums (a INTEGER, b INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO nums VALUES (1, 10);").unwrap();
+        conn.execute("INSERT INTO nums VALUES (5, 2);").unwrap();
+        conn.execute("INSERT INTO nums VALUES (3, 5);").unwrap();
+        // ORDER BY a + b (expression matching against result columns).
+        let rows = conn
+            .query("SELECT a, b, a + b AS total FROM nums ORDER BY a + b;")
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(row_values(&rows[0])[2], SqliteValue::Integer(7));
+        assert_eq!(row_values(&rows[1])[2], SqliteValue::Integer(11));
+        assert_eq!(row_values(&rows[2])[2], SqliteValue::Integer(15));
     }
 
     #[test]
