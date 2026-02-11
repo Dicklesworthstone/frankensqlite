@@ -5877,11 +5877,16 @@ fn eval_scalar_fn(name: &str, args: &[SqliteValue]) -> SqliteValue {
             SqliteValue::Text(s)
         }
         "random" => {
-            use std::hash::{Hash, Hasher};
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            std::time::SystemTime::now().hash(&mut hasher);
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static COUNTER: AtomicU64 = AtomicU64::new(0x517C_C1B7_2722_0A95);
+            let mut s = COUNTER.fetch_add(1, Ordering::Relaxed);
+            // xorshift64
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            COUNTER.store(s, Ordering::Relaxed);
             #[allow(clippy::cast_possible_wrap)]
-            SqliteValue::Integer(hasher.finish() as i64)
+            SqliteValue::Integer(s as i64)
         }
         "zeroblob" => {
             let n = args.first().map_or(0, |v| v.to_integer().max(0)) as usize;
