@@ -312,7 +312,7 @@ pub fn codegen_select(
         );
 
         // Read columns.
-        emit_column_reads(b, cursor, columns, table, table_alias, out_regs)?;
+        emit_column_reads(b, cursor, columns, table, table_alias, schema, out_regs)?;
 
         // ResultRow.
         b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
@@ -345,7 +345,7 @@ pub fn codegen_select(
             b.emit_op(Opcode::SeekRowid, cursor, 0, rowid_reg, P4::None, 0);
 
             // Read columns.
-            emit_column_reads(b, cursor, columns, table, table_alias, out_regs)?;
+            emit_column_reads(b, cursor, columns, table, table_alias, schema, out_regs)?;
 
             // ResultRow.
             b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
@@ -1138,6 +1138,7 @@ fn codegen_select_aggregate(
     cursor: i32,
     table: &TableSchema,
     table_alias: Option<&str>,
+    schema: &[TableSchema],
     columns: &[ResultColumn],
     where_clause: Option<&Expr>,
     out_regs: i32,
@@ -1174,7 +1175,7 @@ fn codegen_select_aggregate(
     // WHERE filter.
     let skip_label = b.emit_label();
     if let Some(where_expr) = where_clause {
-        emit_where_filter(b, where_expr, cursor, table, table_alias, skip_label);
+        emit_where_filter(b, where_expr, cursor, table, table_alias, schema, skip_label);
     }
 
     // AggStep for each aggregate column.
@@ -1437,6 +1438,7 @@ fn codegen_select_group_by_aggregate(
     cursor: i32,
     table: &TableSchema,
     table_alias: Option<&str>,
+    schema: &[TableSchema],
     columns: &[ResultColumn],
     where_clause: Option<&Expr>,
     group_by: &[Expr],
@@ -1514,7 +1516,7 @@ fn codegen_select_group_by_aggregate(
     // WHERE filter.
     let skip_label = b.emit_label();
     if let Some(where_expr) = where_clause {
-        emit_where_filter(b, where_expr, cursor, table, table_alias, skip_label);
+        emit_where_filter(b, where_expr, cursor, table, table_alias, schema, skip_label);
     }
 
     // Read group-key columns + agg-arg columns into consecutive registers.
@@ -2074,6 +2076,7 @@ fn codegen_insert_select(
             read_cursor,
             src_table,
             src_table_alias,
+            schema,
             skip_label,
         );
     }
@@ -2085,6 +2088,7 @@ fn codegen_insert_select(
         columns,
         src_table,
         src_table_alias,
+        schema,
         val_regs,
     )?;
 
@@ -2223,6 +2227,7 @@ pub fn codegen_update(
             cursor,
             table,
             stmt.table.alias.as_deref(),
+            schema,
             skip_label,
         );
     }
@@ -2357,6 +2362,7 @@ pub fn codegen_delete(
             cursor,
             table,
             stmt.table.alias.as_deref(),
+            schema,
             skip_label,
         );
     }
@@ -2417,6 +2423,7 @@ fn emit_column_reads(
     columns: &[ResultColumn],
     table: &TableSchema,
     table_alias: Option<&str>,
+    schema: &[TableSchema],
     base_reg: i32,
 ) -> Result<(), CodegenError> {
     let mut reg = base_reg;
@@ -2462,7 +2469,7 @@ fn emit_column_reads(
                         cursor,
                         table,
                         table_alias,
-                        schema: None,
+                        schema: Some(schema),
                     };
                     emit_expr(b, expr, reg, Some(&scan));
                 }
@@ -2793,8 +2800,8 @@ fn emit_where_filter(
             ..
         } => {
             // AND: both conditions must pass.
-            emit_where_filter(b, left, cursor, table, table_alias, skip_label);
-            emit_where_filter(b, right, cursor, table, table_alias, skip_label);
+            emit_where_filter(b, left, cursor, table, table_alias, schema, skip_label);
+            emit_where_filter(b, right, cursor, table, table_alias, schema, skip_label);
         }
         _ => {
             // Generic WHERE: evaluate expression with cursor context and test truthiness.

@@ -1671,11 +1671,13 @@ impl Connection {
             });
             temp_names.push(cte_name.clone());
             // Insert the CTE result rows into the temporary table.
-            for row in &cte_rows {
+            for (i, row) in cte_rows.iter().enumerate() {
                 let vals: Vec<SqliteValue> = row.values.iter().cloned().collect();
-                self.db
-                    .borrow_mut()
-                    .insert_row(root_page, &vals);
+                let rowid = (i + 1) as i64;
+                let mut db = self.db.borrow_mut();
+                if let Some(table) = db.get_table_mut(root_page) {
+                    table.insert_row(rowid, vals);
+                }
             }
         }
         // Execute the main query with the WITH clause stripped.
