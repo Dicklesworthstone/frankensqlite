@@ -24,13 +24,14 @@
 //! ```
 
 use std::fmt::Write as FmtWrite;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use fsqlite_e2e::oplog::{
     OpLog, preset_commutative_inserts_disjoint_keys, preset_hot_page_contention,
 };
 use fsqlite_e2e::report::EngineRunReport;
 use fsqlite_e2e::sqlite_executor::{SqliteExecConfig, run_oplog_sqlite};
+use fsqlite_e2e::{HarnessSettings, fairness};
 
 // ── Configuration ────────────────────────────────────────────────────────
 
@@ -136,7 +137,31 @@ fn run_csqlite(oplog: &OpLog) -> EngineRunReport {
     // Create empty DB file so rusqlite can open it.
     rusqlite::Connection::open(&db_path).unwrap();
 
-    run_oplog_sqlite(&db_path, oplog, &SqliteExecConfig::default()).unwrap()
+    run_oplog_sqlite(&db_path, oplog, &sqlite_mvcc_scaling_config()).unwrap()
+}
+
+/// Build a SQLite config tuned for the MVCC scaling report.
+///
+/// The default executor disables SQLite's internal busy handler (`busy_timeout=0`)
+/// so retries are fully instrumented. That is useful for contention diagnostics,
+/// but it amplifies lock-thrash overhead in high-worker disjoint-key tests.
+///
+/// For this scaling workload we keep instrumentation while enabling a bounded
+/// SQLite busy wait, which better reflects steady-state writer serialization.
+fn sqlite_mvcc_scaling_config() -> SqliteExecConfig {
+    let base = HarnessSettings {
+        busy_timeout_ms: 200,
+        ..fairness::benchmark_settings()
+    }
+    .to_sqlite_exec_config();
+
+    SqliteExecConfig {
+        // Keep retry metrics, but avoid very long exponential sleeps.
+        max_busy_retries: 2_000,
+        busy_backoff: Duration::from_micros(200),
+        busy_backoff_max: Duration::from_millis(8),
+        ..base
+    }
 }
 
 /// Run a single oplog against FrankenSQLite (sequential baseline).

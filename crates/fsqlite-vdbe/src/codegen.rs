@@ -6,9 +6,9 @@
 
 use crate::ProgramBuilder;
 use fsqlite_ast::{
-    ColumnRef, DeleteStatement, Expr, FunctionArgs, InsertSource, InsertStatement, LimitClause,
-    Literal, OrderingTerm, QualifiedTableRef, ResultColumn, SelectCore, SelectStatement,
-    SortDirection, UpdateStatement,
+    ColumnRef, DeleteStatement, Distinctness, Expr, FunctionArgs, InsertSource, InsertStatement,
+    LimitClause, Literal, OrderingTerm, QualifiedTableRef, ResultColumn, SelectCore,
+    SelectStatement, SortDirection, UpdateStatement,
 };
 use fsqlite_types::opcode::{Opcode, P4};
 
@@ -143,14 +143,15 @@ pub fn codegen_select(
     schema: &[TableSchema],
     _ctx: &CodegenContext,
 ) -> Result<(), CodegenError> {
-    let (columns, from, where_clause, group_by) = match &stmt.body.select {
+    let (columns, from, where_clause, group_by, distinct) = match &stmt.body.select {
         SelectCore::Select {
             columns,
             from,
             where_clause,
             group_by,
+            distinct,
             ..
-        } => (columns, from, where_clause, group_by),
+        } => (columns, from, where_clause, group_by, *distinct),
         SelectCore::Values(_) => {
             return Err(CodegenError::Unsupported("VALUES in SELECT".to_owned()));
         }
@@ -311,6 +312,22 @@ pub fn codegen_select(
             where_clause.as_deref(),
             &stmt.order_by,
             stmt.limit.as_ref(),
+            distinct,
+            out_regs,
+            out_col_count,
+            done_label,
+            end_label,
+        );
+    } else if distinct == Distinctness::Distinct {
+        // --- Full table scan with DISTINCT ---
+        return codegen_select_distinct_scan(
+            b,
+            cursor,
+            table,
+            table_alias,
+            columns,
+            where_clause.as_deref(),
+            stmt.limit.as_ref(),
             out_regs,
             out_col_count,
             done_label,
@@ -427,6 +444,215 @@ fn codegen_select_full_scan(
     Ok(())
 }
 
+/// Generate VDBE bytecode for `SELECT DISTINCT` without ORDER BY.
+///
+/// Uses a two-pass sorter approach: scan all output columns into the sorter
+/// (all columns are sort keys), sort, then iterate and skip adjacent
+/// duplicate rows using packed-record comparison.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap
+)]
+fn codegen_select_distinct_scan(
+    b: &mut ProgramBuilder,
+    cursor: i32,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+    columns: &[ResultColumn],
+    where_clause: Option<&Expr>,
+    limit_clause: Option<&LimitClause>,
+    out_regs: i32,
+    out_col_count: i32,
+    done_label: crate::Label,
+    end_label: crate::Label,
+) -> Result<(), CodegenError> {
+    let num_data_cols = usize::try_from(out_col_count).map_err(|_| {
+        CodegenError::Unsupported("negative output column count in DISTINCT SELECT".to_owned())
+    })?;
+
+    // Sorter cursor is separate from the table cursor.
+    let sorter_cursor = cursor + 1;
+
+    // Open sorter with all output columns as sort keys (ascending).
+    let sort_order: String = "+".repeat(num_data_cols);
+    b.emit_op(
+        Opcode::SorterOpen,
+        sorter_cursor,
+        out_col_count,
+        0,
+        P4::Str(sort_order),
+        0,
+    );
+
+    // Open table for reading.
+    b.emit_op(
+        Opcode::OpenRead,
+        cursor,
+        table.root_page,
+        0,
+        P4::Table(table.name.clone()),
+        0,
+    );
+
+    // === Pass 1: Scan rows into sorter ===
+    let scan_start = b.current_addr();
+    let scan_done = b.emit_label();
+    b.emit_jump_to_label(Opcode::Rewind, cursor, 0, scan_done, P4::None, 0);
+
+    // WHERE filter.
+    let skip_label = b.emit_label();
+    if let Some(where_expr) = where_clause {
+        emit_where_filter(b, where_expr, cursor, table, table_alias, skip_label);
+    }
+
+    // Read output columns into consecutive registers.
+    let sorter_base = b.alloc_regs(out_col_count);
+    emit_column_reads(b, cursor, columns, table, table_alias, sorter_base)?;
+
+    // MakeRecord from all output columns, then SorterInsert.
+    let record_reg = b.alloc_reg();
+    b.emit_op(
+        Opcode::MakeRecord,
+        sorter_base,
+        out_col_count,
+        record_reg,
+        P4::None,
+        0,
+    );
+    b.emit_op(
+        Opcode::SorterInsert,
+        sorter_cursor,
+        record_reg,
+        0,
+        P4::None,
+        0,
+    );
+
+    // Skip label (for WHERE-filtered rows).
+    b.resolve_label(skip_label);
+
+    // Next row in scan.
+    let scan_body = (scan_start + 1) as i32;
+    b.emit_op(Opcode::Next, cursor, scan_body, 0, P4::None, 0);
+
+    // End of pass 1: close table cursor.
+    b.resolve_label(scan_done);
+    b.emit_op(Opcode::Close, cursor, 0, 0, P4::None, 0);
+
+    // === Pass 2: Iterate sorted rows, skipping duplicates ===
+
+    // Allocate LIMIT/OFFSET counters.
+    let limit_reg = limit_clause.map(|lc| {
+        let r = b.alloc_reg();
+        emit_limit_expr(b, &lc.limit, r);
+        r
+    });
+    let offset_reg = limit_clause.and_then(|lc| {
+        lc.offset.as_ref().map(|off_expr| {
+            let r = b.alloc_reg();
+            emit_limit_expr(b, off_expr, r);
+            r
+        })
+    });
+
+    // SorterSort: sort and position at first row; jump to done if empty.
+    b.emit_jump_to_label(
+        Opcode::SorterSort,
+        sorter_cursor,
+        0,
+        done_label,
+        P4::None,
+        0,
+    );
+
+    let sort_loop_body = b.current_addr();
+
+    // SorterData: decode current sorted row.
+    let sorted_reg = b.alloc_reg();
+    b.emit_op(
+        Opcode::SorterData,
+        sorter_cursor,
+        sorted_reg,
+        0,
+        P4::None,
+        0,
+    );
+
+    // OFFSET: skip rows while offset counter > 0.
+    let output_skip = b.emit_label();
+    if let Some(off_r) = offset_reg {
+        b.emit_jump_to_label(Opcode::IfPos, off_r, 1, output_skip, P4::None, 0);
+    }
+
+    // Extract output columns from sorted record.
+    for i in 0..num_data_cols {
+        b.emit_op(
+            Opcode::Column,
+            sorter_cursor,
+            i as i32,
+            out_regs + i as i32,
+            P4::None,
+            0,
+        );
+    }
+
+    // DISTINCT: pack output into a record and compare with previous row.
+    let cur_rec = b.alloc_reg();
+    let prev_rec = b.alloc_reg();
+    let dup_skip = b.emit_label();
+
+    b.emit_op(
+        Opcode::MakeRecord,
+        out_regs,
+        out_col_count,
+        cur_rec,
+        P4::None,
+        0,
+    );
+
+    // If current record equals previous, skip (duplicate).
+    b.emit_jump_to_label(Opcode::Eq, prev_rec, cur_rec, dup_skip, P4::None, 0);
+
+    // Update previous record to current for next comparison.
+    b.emit_op(Opcode::Copy, cur_rec, prev_rec, 0, P4::None, 0);
+
+    // ResultRow.
+    b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
+
+    // LIMIT: decrement limit counter; jump to done when zero.
+    if let Some(lim_r) = limit_reg {
+        b.emit_jump_to_label(Opcode::DecrJumpZero, lim_r, 0, done_label, P4::None, 0);
+    }
+
+    // Duplicate skip label.
+    b.resolve_label(dup_skip);
+
+    // Output skip label (for OFFSET-skipped rows).
+    b.resolve_label(output_skip);
+
+    // SorterNext: advance to next sorted row.
+    b.emit_op(
+        Opcode::SorterNext,
+        sorter_cursor,
+        sort_loop_body as i32,
+        0,
+        P4::None,
+        0,
+    );
+
+    // Done: Close sorter + Halt.
+    b.resolve_label(done_label);
+    b.emit_op(Opcode::Close, sorter_cursor, 0, 0, P4::None, 0);
+    b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+
+    // End target for Init jump.
+    b.resolve_label(end_label);
+
+    Ok(())
+}
+
 /// Emit a LIMIT or OFFSET expression into a register.
 ///
 /// Handles integer literals and bind parameters; falls back to -1
@@ -472,6 +698,7 @@ fn codegen_select_ordered_scan(
     where_clause: Option<&Expr>,
     order_by: &[OrderingTerm],
     limit_clause: Option<&LimitClause>,
+    distinct: Distinctness,
     out_regs: i32,
     out_col_count: i32,
     done_label: crate::Label,
@@ -663,12 +890,45 @@ fn codegen_select_ordered_scan(
         );
     }
 
+    // DISTINCT: skip rows whose output columns match the previous row.
+    // Pack output into a record, compare with previous record; if equal, skip.
+    let distinct_skip = if distinct == Distinctness::Distinct {
+        let cur_rec = b.alloc_reg();
+        let prev_rec = b.alloc_reg();
+        let skip = b.emit_label();
+
+        // Pack current output columns into a record.
+        b.emit_op(
+            Opcode::MakeRecord,
+            out_regs,
+            out_col_count,
+            cur_rec,
+            P4::None,
+            0,
+        );
+
+        // Compare with previous record; if equal (Eq jumps on match), skip.
+        b.emit_jump_to_label(Opcode::Eq, prev_rec, cur_rec, skip, P4::None, 0);
+
+        // Update previous record to current.
+        b.emit_op(Opcode::Copy, cur_rec, prev_rec, 0, P4::None, 0);
+
+        Some(skip)
+    } else {
+        None
+    };
+
     // ResultRow.
     b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
 
     // LIMIT: decrement limit counter; jump to done when zero.
     if let Some(lim_r) = limit_reg {
         b.emit_jump_to_label(Opcode::DecrJumpZero, lim_r, 0, done_label, P4::None, 0);
+    }
+
+    // Resolve DISTINCT skip label (if active).
+    if let Some(skip) = distinct_skip {
+        b.resolve_label(skip);
     }
 
     // Output skip label (for OFFSET-skipped rows).
@@ -1504,11 +1764,7 @@ pub fn codegen_insert(
 }
 
 /// Emit the INSERT loop for `VALUES (row), (row), ...`.
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap,
-    clippy::unnecessary_wraps
-)]
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 fn codegen_insert_values(
     b: &mut ProgramBuilder,
     rows: &[Vec<Expr>],
@@ -1517,13 +1773,22 @@ fn codegen_insert_values(
     returning: &[ResultColumn],
     ctx: &CodegenContext,
 ) -> Result<(), CodegenError> {
-    let n_cols = rows[0].len();
+    let n_cols = rows
+        .first()
+        .ok_or_else(|| CodegenError::Unsupported("empty VALUES".to_owned()))?
+        .len();
     let rowid_reg = b.alloc_reg();
     let val_regs = b.alloc_regs(n_cols as i32);
     let rec_reg = b.alloc_reg();
     let concurrent_flag = i32::from(ctx.concurrent_mode);
 
     for row_values in rows {
+        if row_values.len() != n_cols {
+            return Err(CodegenError::Unsupported(
+                "VALUES rows must have the same arity".to_owned(),
+            ));
+        }
+
         // NewRowid: generate a new rowid for this row.
         b.emit_op(
             Opcode::NewRowid,
@@ -2678,13 +2943,19 @@ fn emit_comparison(
     emit_expr(b, right, r_right, ctx);
 
     let cmp_opcode = match op {
-        fsqlite_ast::BinaryOp::Eq => Opcode::Eq,
-        fsqlite_ast::BinaryOp::Ne => Opcode::Ne,
-        fsqlite_ast::BinaryOp::Lt => Opcode::Lt,
-        fsqlite_ast::BinaryOp::Le => Opcode::Le,
-        fsqlite_ast::BinaryOp::Gt => Opcode::Gt,
-        fsqlite_ast::BinaryOp::Ge => Opcode::Ge,
-        _ => unreachable!(),
+        fsqlite_ast::BinaryOp::Eq => Some(Opcode::Eq),
+        fsqlite_ast::BinaryOp::Ne => Some(Opcode::Ne),
+        fsqlite_ast::BinaryOp::Lt => Some(Opcode::Lt),
+        fsqlite_ast::BinaryOp::Le => Some(Opcode::Le),
+        fsqlite_ast::BinaryOp::Gt => Some(Opcode::Gt),
+        fsqlite_ast::BinaryOp::Ge => Some(Opcode::Ge),
+        _ => None,
+    };
+    let Some(cmp_opcode) = cmp_opcode else {
+        b.emit_op(Opcode::Integer, 0, reg, 0, P4::None, 0);
+        b.free_temp(r_right);
+        b.free_temp(r_left);
+        return;
     };
 
     // Pattern: assume false (0), jump to true_label if condition holds.
@@ -2722,10 +2993,16 @@ fn emit_is_comparison(
     let done_label = b.emit_label();
 
     // IS uses Eq with NULLEQ flag (p5=0x80). IS NOT uses Ne with NULLEQ.
-    let (cmp_opcode, nulleq_flag) = match op {
-        fsqlite_ast::BinaryOp::Is => (Opcode::Eq, 0x80_u16),
-        fsqlite_ast::BinaryOp::IsNot => (Opcode::Ne, 0x80_u16),
-        _ => unreachable!(),
+    let cmp_and_flag = match op {
+        fsqlite_ast::BinaryOp::Is => Some((Opcode::Eq, 0x80_u16)),
+        fsqlite_ast::BinaryOp::IsNot => Some((Opcode::Ne, 0x80_u16)),
+        _ => None,
+    };
+    let Some((cmp_opcode, nulleq_flag)) = cmp_and_flag else {
+        b.emit_op(Opcode::Integer, 0, reg, 0, P4::None, 0);
+        b.free_temp(r_right);
+        b.free_temp(r_left);
+        return;
     };
 
     b.emit_jump_to_label(
@@ -3095,6 +3372,67 @@ mod tests {
         assert_eq!(txn.p2, 1);
     }
 
+    #[test]
+    fn test_codegen_insert_values_rejects_mixed_arity_rows() {
+        let stmt = InsertStatement {
+            with: None,
+            or_conflict: None,
+            table: QualifiedName::bare("t"),
+            alias: None,
+            columns: vec![],
+            source: InsertSource::Values(vec![
+                vec![placeholder(1), placeholder(2)],
+                vec![placeholder(3)],
+            ]),
+            upsert: vec![],
+            returning: vec![],
+        };
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        let err = codegen_insert(&mut b, &stmt, &schema, &ctx).unwrap_err();
+        assert!(
+            matches!(err, CodegenError::Unsupported(ref msg) if msg.contains("same arity")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_emit_comparison_invalid_operator_emits_false() {
+        let mut b = ProgramBuilder::new();
+        let reg = b.alloc_reg();
+        let one = Expr::Literal(Literal::Integer(1), Span::ZERO);
+        let two = Expr::Literal(Literal::Integer(2), Span::ZERO);
+
+        emit_comparison(&mut b, &one, AstBinaryOp::Add, &two, reg, None);
+
+        let prog = b.finish().unwrap();
+        assert!(
+            prog.ops()
+                .iter()
+                .any(|op| op.opcode == Opcode::Integer && op.p1 == 0 && op.p2 == reg),
+            "expected fallback false assignment for invalid comparison op"
+        );
+    }
+
+    #[test]
+    fn test_emit_is_comparison_invalid_operator_emits_false() {
+        let mut b = ProgramBuilder::new();
+        let reg = b.alloc_reg();
+        let one = Expr::Literal(Literal::Integer(1), Span::ZERO);
+        let two = Expr::Literal(Literal::Integer(2), Span::ZERO);
+
+        emit_is_comparison(&mut b, &one, AstBinaryOp::Eq, &two, reg, None);
+
+        let prog = b.finish().unwrap();
+        assert!(
+            prog.ops()
+                .iter()
+                .any(|op| op.opcode == Opcode::Integer && op.p1 == 0 && op.p2 == reg),
+            "expected fallback false assignment for invalid IS/IS NOT op"
+        );
+    }
+
     // === Test: INSERT ... SELECT ===
     #[test]
     #[allow(clippy::too_many_lines)]
@@ -3322,6 +3660,115 @@ mod tests {
             .filter(|op| op.opcode == Opcode::Column)
             .count();
         assert_eq!(column_count, 2);
+    }
+
+    // === Test: SELECT DISTINCT full scan ===
+    #[test]
+    fn test_codegen_select_distinct_full_scan() {
+        let stmt = SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Select {
+                    distinct: Distinctness::Distinct,
+                    columns: vec![ResultColumn::Star],
+                    from: Some(from_table("t")),
+                    where_clause: None,
+                    group_by: vec![],
+                    having: None,
+                    windows: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        };
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        // DISTINCT scan uses sorter: SorterOpen, Rewind/Next scan,
+        // SorterInsert, SorterSort, SorterData, MakeRecord (for dedup),
+        // Eq (compare), Copy (update prev), ResultRow, SorterNext.
+        assert!(has_opcodes(
+            &prog,
+            &[
+                Opcode::Init,
+                Opcode::Transaction,
+                Opcode::SorterOpen,
+                Opcode::OpenRead,
+                Opcode::Rewind,
+                Opcode::Column,
+                Opcode::Column,
+                Opcode::MakeRecord,
+                Opcode::SorterInsert,
+                Opcode::Next,
+                Opcode::Close,
+                Opcode::SorterSort,
+                Opcode::SorterData,
+                Opcode::Column,
+                Opcode::Column,
+                Opcode::MakeRecord,
+                Opcode::Eq,
+                Opcode::Copy,
+                Opcode::ResultRow,
+                Opcode::SorterNext,
+            ]
+        ));
+    }
+
+    // === Test: SELECT DISTINCT with ORDER BY ===
+    #[test]
+    fn test_codegen_select_distinct_with_order_by() {
+        let stmt = SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Select {
+                    distinct: Distinctness::Distinct,
+                    columns: vec![ResultColumn::Star],
+                    from: Some(from_table("t")),
+                    where_clause: None,
+                    group_by: vec![],
+                    having: None,
+                    windows: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![OrderingTerm {
+                expr: Expr::Column(ColumnRef::bare("a"), Span::ZERO),
+                direction: None,
+                nulls: None,
+            }],
+            limit: None,
+        };
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        // ORDER BY + DISTINCT: uses ordered scan with dedup.
+        // Should include SorterOpen, Rewind scan, SorterInsert, SorterSort,
+        // then SorterData + Column reads + MakeRecord + Eq + Copy + ResultRow.
+        assert!(has_opcodes(
+            &prog,
+            &[
+                Opcode::Init,
+                Opcode::SorterOpen,
+                Opcode::OpenRead,
+                Opcode::Rewind,
+                Opcode::SorterInsert,
+                Opcode::Next,
+                Opcode::SorterSort,
+                Opcode::SorterData,
+                Opcode::MakeRecord,
+                Opcode::Eq,
+                Opcode::Copy,
+                Opcode::ResultRow,
+                Opcode::SorterNext,
+            ]
+        ));
     }
 
     // === Test 3: UPDATE by rowid ===
