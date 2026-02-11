@@ -14,9 +14,9 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use fsqlite_ast::{
-    BinaryOp, CreateTableBody, Distinctness, Expr, FunctionArgs, InSet, LikeOp, LimitClause,
-    Literal, NullsOrder, OrderingTerm, PlaceholderType, ResultColumn, SelectBody, SelectCore,
-    SelectStatement, SortDirection, Statement, UnaryOp,
+    BinaryOp, CompoundOp, CreateTableBody, Distinctness, Expr, FunctionArgs, InSet, LikeOp,
+    LimitClause, Literal, NullsOrder, OrderingTerm, PlaceholderType, ResultColumn, SelectBody,
+    SelectCore, SelectStatement, SortDirection, Statement, UnaryOp,
 };
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_func::FunctionRegistry;
@@ -562,6 +562,10 @@ impl Connection {
             }
             Statement::Select(ref select) => {
                 let distinct = is_distinct_select(select);
+                // Compound SELECT (UNION/UNION ALL/INTERSECT/EXCEPT).
+                if !select.body.compounds.is_empty() {
+                    return self.execute_compound_select(select, params);
+                }
                 // Check if this is an expression-only SELECT (no FROM clause).
                 if is_expression_only_select(select) {
                     let mut rows = execute_program_with_postprocess(
@@ -1380,6 +1384,13 @@ impl Connection {
             })
             .collect::<Result<Vec<_>>>()?;
 
+        // Save column names for HAVING evaluation before dropping the schema borrow.
+        let col_names: Vec<String> = table_schema
+            .columns
+            .iter()
+            .map(|c| c.name.clone())
+            .collect();
+
         drop(schema);
 
         // Compile and execute a raw SELECT * scan (no aggregates, no GROUP BY).
@@ -1439,7 +1450,14 @@ impl Connection {
             }
             // Apply HAVING filter: skip groups that don't satisfy the predicate.
             if let Some(having) = having_expr {
-                if !evaluate_having_predicate(having, &values, &result_descriptors, columns) {
+                if !evaluate_having_predicate(
+                    having,
+                    &values,
+                    &result_descriptors,
+                    columns,
+                    group_rows,
+                    &col_names,
+                ) {
                     continue;
                 }
             }
@@ -1449,6 +1467,75 @@ impl Connection {
         // Post-process: ORDER BY.
         if !select.order_by.is_empty() {
             sort_rows_by_order_terms(&mut result, &select.order_by, columns)?;
+        }
+
+        // Post-process: LIMIT / OFFSET.
+        if let Some(ref limit_clause) = select.limit {
+            apply_limit_offset_postprocess(&mut result, limit_clause);
+        }
+
+        Ok(result)
+    }
+
+    /// Execute a compound SELECT (UNION/UNION ALL/INTERSECT/EXCEPT).
+    ///
+    /// Executes each SELECT arm independently, then combines results according
+    /// to the set operation. ORDER BY and LIMIT are applied to the final result.
+    fn execute_compound_select(
+        &self,
+        select: &SelectStatement,
+        params: Option<&[SqliteValue]>,
+    ) -> Result<Vec<Row>> {
+        // Execute the first SELECT arm.
+        let first_arm = SelectStatement {
+            with: select.with.clone(),
+            body: SelectBody {
+                select: select.body.select.clone(),
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        };
+        let mut result = self.execute_statement(Statement::Select(first_arm), params)?;
+
+        // Process each compound arm.
+        for (op, core) in &select.body.compounds {
+            let arm_select = SelectStatement {
+                with: None,
+                body: SelectBody {
+                    select: core.clone(),
+                    compounds: vec![],
+                },
+                order_by: vec![],
+                limit: None,
+            };
+            let arm_rows = self.execute_statement(Statement::Select(arm_select), params)?;
+
+            match op {
+                CompoundOp::UnionAll => {
+                    result.extend(arm_rows);
+                }
+                CompoundOp::Union => {
+                    result.extend(arm_rows);
+                    dedup_rows(&mut result);
+                }
+                CompoundOp::Intersect => {
+                    // Keep only rows present in both result and arm_rows.
+                    result.retain(|row| arm_rows.iter().any(|ar| ar.values() == row.values()));
+                }
+                CompoundOp::Except => {
+                    // Remove rows from result that appear in arm_rows.
+                    result.retain(|row| !arm_rows.iter().any(|ar| ar.values() == row.values()));
+                }
+            }
+        }
+
+        // Post-process: ORDER BY.
+        if !select.order_by.is_empty() {
+            // For compound SELECT, ORDER BY references output column positions (1-based).
+            if let SelectCore::Select { columns, .. } = &select.body.select {
+                sort_rows_by_order_terms(&mut result, &select.order_by, columns)?;
+            }
         }
 
         // Post-process: LIMIT / OFFSET.
@@ -1702,35 +1789,56 @@ fn build_raw_scan_select(select: &SelectStatement) -> SelectStatement {
     }
 }
 
+/// Test whether a `SqliteValue` is truthy (non-zero, non-NULL).
+fn is_sqlite_truthy(v: &SqliteValue) -> bool {
+    match v {
+        SqliteValue::Null | SqliteValue::Integer(0) => false,
+        SqliteValue::Float(f) if *f == 0.0 => false,
+        _ => true,
+    }
+}
+
 /// Evaluate a HAVING predicate against a group's computed result values.
 ///
-/// Returns `true` if the group passes the HAVING filter.
+/// `group_rows` and `col_names` allow computing aggregates that are not in the
+/// SELECT list (e.g. `HAVING COUNT(*) > 1` when COUNT(*) is not a result column).
 fn evaluate_having_predicate(
     expr: &Expr,
     values: &[SqliteValue],
     descriptors: &[GroupByColumn],
     columns: &[ResultColumn],
+    group_rows: &[Vec<SqliteValue>],
+    col_names: &[String],
 ) -> bool {
-    match evaluate_having_value(expr, values, descriptors, columns) {
-        SqliteValue::Integer(n) => n != 0,
-        SqliteValue::Float(f) => f != 0.0,
-        SqliteValue::Null => false,
-        _ => true,
-    }
+    is_sqlite_truthy(&evaluate_having_value(
+        expr,
+        values,
+        descriptors,
+        columns,
+        group_rows,
+        col_names,
+    ))
 }
 
-/// Evaluate a HAVING expression to a `SqliteValue` using the group's result values.
+/// Evaluate a HAVING expression to a `SqliteValue`.
+///
+/// First tries to resolve from the already-computed result `values` (matching against
+/// `descriptors`/`columns`). Falls back to computing aggregates directly from
+/// `group_rows` for HAVING expressions that reference aggregates not in SELECT.
 #[allow(clippy::too_many_lines)]
 fn evaluate_having_value(
     expr: &Expr,
     values: &[SqliteValue],
     descriptors: &[GroupByColumn],
     columns: &[ResultColumn],
+    group_rows: &[Vec<SqliteValue>],
+    col_names: &[String],
 ) -> SqliteValue {
     match expr {
-        // Aggregate function — find matching result column.
+        // Aggregate function — first try matching a result column, then compute directly.
         Expr::FunctionCall { name, args, .. } if is_agg_fn(name) => {
             let lower = name.to_ascii_lowercase();
+            // Try to find a matching aggregate in the result descriptors.
             for (i, desc) in descriptors.iter().enumerate() {
                 if let GroupByColumn::Agg {
                     name: agg_name,
@@ -1744,9 +1852,7 @@ fn evaluate_having_value(
                         FunctionArgs::Star => arg_col.is_none(),
                         FunctionArgs::List(exprs) if exprs.is_empty() => arg_col.is_none(),
                         FunctionArgs::List(exprs) => {
-                            // Check if the argument column name matches.
                             if let Some(arg_name) = expr_col_name(&exprs[0]) {
-                                // Find the result column's argument column in the AST.
                                 if let Some(ResultColumn::Expr {
                                     expr:
                                         Expr::FunctionCall {
@@ -1759,7 +1865,7 @@ fn evaluate_having_value(
                                     result_args
                                         .first()
                                         .and_then(|e| expr_col_name(e))
-                                        .is_some_and(|n| n == arg_name)
+                                        .is_some_and(|n| n.eq_ignore_ascii_case(arg_name))
                                 } else {
                                     false
                                 }
@@ -1773,21 +1879,44 @@ fn evaluate_having_value(
                     }
                 }
             }
-            SqliteValue::Null
+            // Aggregate not found in SELECT — compute directly from group_rows.
+            compute_having_aggregate(&lower, args, group_rows, col_names)
         }
 
-        // Column reference — find matching plain column in descriptors.
+        // Column reference — find matching plain column in result set or raw data.
         Expr::Column(col_ref, _) => {
             let col_name = &col_ref.column;
-            // Match against the AST result columns to find the right index.
+            // First check result column aliases.
+            for (i, rc) in columns.iter().enumerate() {
+                if let ResultColumn::Expr {
+                    alias: Some(alias), ..
+                } = rc
+                {
+                    if alias.eq_ignore_ascii_case(col_name) {
+                        return values.get(i).cloned().unwrap_or(SqliteValue::Null);
+                    }
+                }
+            }
+            // Then check result column names.
             for (i, rc) in columns.iter().enumerate() {
                 if let ResultColumn::Expr { expr, .. } = rc {
                     if let Some(name) = expr_col_name(expr) {
-                        if name == col_name.as_str() {
+                        if name.eq_ignore_ascii_case(col_name) {
                             return values.get(i).cloned().unwrap_or(SqliteValue::Null);
                         }
                     }
                 }
+            }
+            // Fall back to resolving from raw group data via col_names.
+            if let Some(idx) = col_names
+                .iter()
+                .position(|n| n.eq_ignore_ascii_case(col_name))
+            {
+                return group_rows
+                    .first()
+                    .and_then(|r| r.get(idx))
+                    .cloned()
+                    .unwrap_or(SqliteValue::Null);
             }
             SqliteValue::Null
         }
@@ -1797,6 +1926,8 @@ fn evaluate_having_value(
             fsqlite_ast::Literal::Integer(n) => SqliteValue::Integer(*n),
             fsqlite_ast::Literal::Float(f) => SqliteValue::Float(*f),
             fsqlite_ast::Literal::String(s) => SqliteValue::Text(s.clone()),
+            fsqlite_ast::Literal::True => SqliteValue::Integer(1),
+            fsqlite_ast::Literal::False => SqliteValue::Integer(0),
             _ => SqliteValue::Null,
         },
 
@@ -1804,8 +1935,10 @@ fn evaluate_having_value(
         Expr::BinaryOp {
             left, op, right, ..
         } => {
-            let lv = evaluate_having_value(left, values, descriptors, columns);
-            let rv = evaluate_having_value(right, values, descriptors, columns);
+            let lv =
+                evaluate_having_value(left, values, descriptors, columns, group_rows, col_names);
+            let rv =
+                evaluate_having_value(right, values, descriptors, columns, group_rows, col_names);
             match op {
                 fsqlite_ast::BinaryOp::Gt => SqliteValue::Integer(i64::from(
                     cmp_values(&lv, &rv) == std::cmp::Ordering::Greater,
@@ -1826,24 +1959,129 @@ fn evaluate_having_value(
                     cmp_values(&lv, &rv) != std::cmp::Ordering::Equal,
                 )),
                 fsqlite_ast::BinaryOp::And => {
-                    let lb = matches!(lv, SqliteValue::Integer(n) if n != 0);
-                    let rb = matches!(rv, SqliteValue::Integer(n) if n != 0);
-                    SqliteValue::Integer(i64::from(lb && rb))
+                    SqliteValue::Integer(i64::from(is_sqlite_truthy(&lv) && is_sqlite_truthy(&rv)))
                 }
                 fsqlite_ast::BinaryOp::Or => {
-                    let lb = matches!(lv, SqliteValue::Integer(n) if n != 0);
-                    let rb = matches!(rv, SqliteValue::Integer(n) if n != 0);
-                    SqliteValue::Integer(i64::from(lb || rb))
+                    SqliteValue::Integer(i64::from(is_sqlite_truthy(&lv) || is_sqlite_truthy(&rv)))
                 }
+                fsqlite_ast::BinaryOp::Add => numeric_add(&lv, &rv),
+                fsqlite_ast::BinaryOp::Subtract => numeric_sub(&lv, &rv),
+                fsqlite_ast::BinaryOp::Multiply => numeric_mul(&lv, &rv),
                 _ => SqliteValue::Null,
             }
+        }
+
+        // Unary operations.
+        Expr::UnaryOp {
+            op, expr: inner, ..
+        } => {
+            let v =
+                evaluate_having_value(inner, values, descriptors, columns, group_rows, col_names);
+            match op {
+                fsqlite_ast::UnaryOp::Negate => match v {
+                    SqliteValue::Integer(n) => SqliteValue::Integer(-n),
+                    SqliteValue::Float(f) => SqliteValue::Float(-f),
+                    _ => SqliteValue::Null,
+                },
+                fsqlite_ast::UnaryOp::Not => SqliteValue::Integer(i64::from(!is_sqlite_truthy(&v))),
+                _ => SqliteValue::Null,
+            }
+        }
+
+        // IS NULL / IS NOT NULL.
+        Expr::IsNull {
+            expr: inner, not, ..
+        } => {
+            let v =
+                evaluate_having_value(inner, values, descriptors, columns, group_rows, col_names);
+            let is_null = matches!(v, SqliteValue::Null);
+            SqliteValue::Integer(i64::from(if *not { !is_null } else { is_null }))
         }
 
         _ => SqliteValue::Null,
     }
 }
 
-/// Compare two `SqliteValue`s for ordering.
+/// Compute an aggregate directly from group rows (for HAVING aggregates not in SELECT).
+#[allow(clippy::cast_possible_wrap)]
+fn compute_having_aggregate(
+    func: &str,
+    args: &FunctionArgs,
+    group_rows: &[Vec<SqliteValue>],
+    col_names: &[String],
+) -> SqliteValue {
+    let arg_col_idx = match args {
+        FunctionArgs::Star => None,
+        FunctionArgs::List(exprs) if exprs.is_empty() => None,
+        FunctionArgs::List(exprs) if exprs.len() == 1 => {
+            let Some(col_name) = expr_col_name(&exprs[0]) else {
+                return SqliteValue::Null;
+            };
+            let Some(idx) = col_names
+                .iter()
+                .position(|n| n.eq_ignore_ascii_case(col_name))
+            else {
+                return SqliteValue::Null;
+            };
+            Some(idx)
+        }
+        FunctionArgs::List(_) => return SqliteValue::Null,
+    };
+
+    if func == "count" && arg_col_idx.is_none() {
+        return SqliteValue::Integer(group_rows.len() as i64);
+    }
+    let Some(idx) = arg_col_idx else {
+        return SqliteValue::Null;
+    };
+    let agg_values: Vec<&SqliteValue> = group_rows
+        .iter()
+        .filter_map(|r| r.get(idx))
+        .filter(|v| !matches!(v, SqliteValue::Null))
+        .collect();
+    compute_aggregate(func, &agg_values)
+}
+
+/// Numeric addition for HAVING expression evaluation.
+fn numeric_add(a: &SqliteValue, b: &SqliteValue) -> SqliteValue {
+    match (a, b) {
+        (SqliteValue::Integer(ai), SqliteValue::Integer(bi)) => {
+            SqliteValue::Integer(ai.wrapping_add(*bi))
+        }
+        (SqliteValue::Float(af), SqliteValue::Float(bf)) => SqliteValue::Float(af + bf),
+        (SqliteValue::Integer(ai), SqliteValue::Float(bf)) => SqliteValue::Float(*ai as f64 + bf),
+        (SqliteValue::Float(af), SqliteValue::Integer(bi)) => SqliteValue::Float(af + *bi as f64),
+        _ => SqliteValue::Null,
+    }
+}
+
+/// Numeric subtraction for HAVING expression evaluation.
+fn numeric_sub(a: &SqliteValue, b: &SqliteValue) -> SqliteValue {
+    match (a, b) {
+        (SqliteValue::Integer(ai), SqliteValue::Integer(bi)) => {
+            SqliteValue::Integer(ai.wrapping_sub(*bi))
+        }
+        (SqliteValue::Float(af), SqliteValue::Float(bf)) => SqliteValue::Float(af - bf),
+        (SqliteValue::Integer(ai), SqliteValue::Float(bf)) => SqliteValue::Float(*ai as f64 - bf),
+        (SqliteValue::Float(af), SqliteValue::Integer(bi)) => SqliteValue::Float(af - *bi as f64),
+        _ => SqliteValue::Null,
+    }
+}
+
+/// Numeric multiplication for HAVING expression evaluation.
+fn numeric_mul(a: &SqliteValue, b: &SqliteValue) -> SqliteValue {
+    match (a, b) {
+        (SqliteValue::Integer(ai), SqliteValue::Integer(bi)) => {
+            SqliteValue::Integer(ai.wrapping_mul(*bi))
+        }
+        (SqliteValue::Float(af), SqliteValue::Float(bf)) => SqliteValue::Float(af * bf),
+        (SqliteValue::Integer(ai), SqliteValue::Float(bf)) => SqliteValue::Float(*ai as f64 * bf),
+        (SqliteValue::Float(af), SqliteValue::Integer(bi)) => SqliteValue::Float(af * *bi as f64),
+        _ => SqliteValue::Null,
+    }
+}
+
+/// Compare two `SqliteValue`s for ordering (used by HAVING comparisons).
 fn cmp_values(a: &SqliteValue, b: &SqliteValue) -> std::cmp::Ordering {
     match (a, b) {
         (SqliteValue::Integer(ai), SqliteValue::Integer(bi)) => ai.cmp(bi),
@@ -4323,6 +4561,198 @@ mod tests {
         assert!(a_vals.contains(&1), "group a=1 should pass HAVING");
         assert!(a_vals.contains(&3), "group a=3 should pass HAVING");
         assert!(!a_vals.contains(&2), "group a=2 should be filtered");
+    }
+
+    #[test]
+    fn test_having_aggregate_not_in_select() {
+        // HAVING can reference an aggregate that's not in the SELECT list.
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (dept TEXT, salary INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES ('eng', 100);").unwrap();
+        conn.execute("INSERT INTO t VALUES ('eng', 200);").unwrap();
+        conn.execute("INSERT INTO t VALUES ('sales', 50);").unwrap();
+        // eng: count=2, sum=300; sales: count=1, sum=50
+        // SELECT dept but HAVING COUNT(*) > 1 — aggregate not in SELECT.
+        let rows = conn
+            .query("SELECT dept FROM t GROUP BY dept HAVING COUNT(*) > 1;")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("eng".to_owned()));
+    }
+
+    #[test]
+    fn test_having_sum_not_in_select() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (dept TEXT, salary INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES ('eng', 100);").unwrap();
+        conn.execute("INSERT INTO t VALUES ('eng', 200);").unwrap();
+        conn.execute("INSERT INTO t VALUES ('sales', 50);").unwrap();
+        // HAVING SUM(salary) > 100 — SUM not in SELECT.
+        let rows = conn
+            .query("SELECT dept FROM t GROUP BY dept HAVING SUM(salary) > 100;")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("eng".to_owned()));
+    }
+
+    #[test]
+    fn test_having_with_and_or() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (a INTEGER, b INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 10);").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 20);").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 30);").unwrap();
+        conn.execute("INSERT INTO t VALUES (3, 40);").unwrap();
+        conn.execute("INSERT INTO t VALUES (3, 50);").unwrap();
+        conn.execute("INSERT INTO t VALUES (3, 60);").unwrap();
+        // a=1: count=2, sum(b)=30; a=2: count=1, sum(b)=30; a=3: count=3, sum(b)=150
+        // HAVING COUNT(*) > 1 AND SUM(b) > 100 should only include a=3.
+        let rows = conn
+            .query("SELECT a, COUNT(*) FROM t GROUP BY a HAVING COUNT(*) > 1 AND SUM(b) > 100;")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(3));
+    }
+
+    #[test]
+    fn test_having_comparison_operators() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (a INTEGER, b INTEGER);")
+            .unwrap();
+        for i in 1..=5 {
+            for _ in 0..i {
+                conn.execute(&format!("INSERT INTO t VALUES ({i}, {i});"))
+                    .unwrap();
+            }
+        }
+        // a=1: count=1, a=2: count=2, ..., a=5: count=5
+        let rows = conn
+            .query("SELECT a, COUNT(*) FROM t GROUP BY a HAVING COUNT(*) >= 3;")
+            .unwrap();
+        assert_eq!(rows.len(), 3, "a=3,4,5 should pass >= 3");
+
+        let rows = conn
+            .query("SELECT a, COUNT(*) FROM t GROUP BY a HAVING COUNT(*) < 3;")
+            .unwrap();
+        assert_eq!(rows.len(), 2, "a=1,2 should pass < 3");
+
+        let rows = conn
+            .query("SELECT a, COUNT(*) FROM t GROUP BY a HAVING COUNT(*) = 3;")
+            .unwrap();
+        assert_eq!(rows.len(), 1, "only a=3 should pass = 3");
+
+        let rows = conn
+            .query("SELECT a, COUNT(*) FROM t GROUP BY a HAVING COUNT(*) != 3;")
+            .unwrap();
+        assert_eq!(rows.len(), 4, "all except a=3 should pass != 3");
+    }
+
+    #[test]
+    fn test_compound_select_union_all() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1 (a INTEGER);").unwrap();
+        conn.execute("CREATE TABLE t2 (a INTEGER);").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1);").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (2);").unwrap();
+        conn.execute("INSERT INTO t2 VALUES (2);").unwrap();
+        conn.execute("INSERT INTO t2 VALUES (3);").unwrap();
+
+        // UNION ALL: concatenates all rows (including duplicates).
+        let rows = conn
+            .query("SELECT a FROM t1 UNION ALL SELECT a FROM t2;")
+            .unwrap();
+        assert_eq!(rows.len(), 4);
+        let vals: Vec<i64> = rows
+            .iter()
+            .filter_map(|r| match &r.values()[0] {
+                SqliteValue::Integer(n) => Some(*n),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(vals, vec![1, 2, 2, 3]);
+    }
+
+    #[test]
+    fn test_compound_select_union() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1 (a INTEGER);").unwrap();
+        conn.execute("CREATE TABLE t2 (a INTEGER);").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1);").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (2);").unwrap();
+        conn.execute("INSERT INTO t2 VALUES (2);").unwrap();
+        conn.execute("INSERT INTO t2 VALUES (3);").unwrap();
+
+        // UNION: removes duplicates.
+        let rows = conn
+            .query("SELECT a FROM t1 UNION SELECT a FROM t2;")
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        let mut vals: Vec<i64> = rows
+            .iter()
+            .filter_map(|r| match &r.values()[0] {
+                SqliteValue::Integer(n) => Some(*n),
+                _ => None,
+            })
+            .collect();
+        vals.sort_unstable();
+        assert_eq!(vals, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_compound_select_intersect() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1 (a INTEGER);").unwrap();
+        conn.execute("CREATE TABLE t2 (a INTEGER);").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1);").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (2);").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (3);").unwrap();
+        conn.execute("INSERT INTO t2 VALUES (2);").unwrap();
+        conn.execute("INSERT INTO t2 VALUES (3);").unwrap();
+        conn.execute("INSERT INTO t2 VALUES (4);").unwrap();
+
+        // INTERSECT: only rows in both.
+        let rows = conn
+            .query("SELECT a FROM t1 INTERSECT SELECT a FROM t2;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        let mut vals: Vec<i64> = rows
+            .iter()
+            .filter_map(|r| match &r.values()[0] {
+                SqliteValue::Integer(n) => Some(*n),
+                _ => None,
+            })
+            .collect();
+        vals.sort_unstable();
+        assert_eq!(vals, vec![2, 3]);
+    }
+
+    #[test]
+    fn test_compound_select_except() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1 (a INTEGER);").unwrap();
+        conn.execute("CREATE TABLE t2 (a INTEGER);").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1);").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (2);").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (3);").unwrap();
+        conn.execute("INSERT INTO t2 VALUES (2);").unwrap();
+
+        // EXCEPT: rows in first but not second.
+        let rows = conn
+            .query("SELECT a FROM t1 EXCEPT SELECT a FROM t2;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        let mut vals: Vec<i64> = rows
+            .iter()
+            .filter_map(|r| match &r.values()[0] {
+                SqliteValue::Integer(n) => Some(*n),
+                _ => None,
+            })
+            .collect();
+        vals.sort_unstable();
+        assert_eq!(vals, vec![1, 3]);
     }
 
     #[test]
