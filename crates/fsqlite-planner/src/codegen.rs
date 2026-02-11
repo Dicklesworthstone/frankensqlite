@@ -372,71 +372,19 @@ pub fn codegen_insert(
         0,
     );
 
-    // NewRowid: generate a new rowid.
-    // In concurrent mode, p3 != 0 signals the snapshot-independent allocator.
-    let rowid_reg = b.alloc_reg();
-    let concurrent_flag = i32::from(ctx.concurrent_mode);
-    b.emit_op(
-        Opcode::NewRowid,
-        cursor,
-        rowid_reg,
-        concurrent_flag,
-        P4::None,
-        0,
-    );
-
-    // Emit value expressions (bind parameters from VALUES).
-    let values = match &stmt.source {
+    match &stmt.source {
         InsertSource::Values(rows) => {
             if rows.is_empty() {
                 return Err(CodegenError::Unsupported("empty VALUES".to_owned()));
             }
-            &rows[0] // First row for now (multi-row insert would loop).
+            codegen_insert_values(b, rows, cursor, table, &stmt.returning, ctx)?;
+        }
+        InsertSource::Select(select_stmt) => {
+            codegen_insert_select(b, select_stmt, cursor, table, schema, &stmt.returning, ctx)?;
         }
         InsertSource::DefaultValues => {
             return Err(CodegenError::Unsupported("DEFAULT VALUES".to_owned()));
         }
-        InsertSource::Select(_) => {
-            return Err(CodegenError::Unsupported("INSERT ... SELECT".to_owned()));
-        }
-    };
-
-    let n_cols = values.len();
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    let val_regs = b.alloc_regs(n_cols as i32);
-
-    for (i, val_expr) in values.iter().enumerate() {
-        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-        let reg = val_regs + i as i32;
-        emit_expr(b, val_expr, reg);
-    }
-
-    // MakeRecord: pack columns into a record.
-    let rec_reg = b.alloc_reg();
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    let n_cols_i32 = n_cols as i32;
-    b.emit_op(
-        Opcode::MakeRecord,
-        val_regs,
-        n_cols_i32,
-        rec_reg,
-        P4::Affinity(table.affinity_string()),
-        0,
-    );
-
-    // Insert.
-    b.emit_op(
-        Opcode::Insert,
-        cursor,
-        rec_reg,
-        rowid_reg,
-        P4::Table(table.name.clone()),
-        0,
-    );
-
-    // RETURNING clause: emit ResultRow with rowid if present.
-    if !stmt.returning.is_empty() {
-        b.emit_op(Opcode::ResultRow, rowid_reg, 1, 0, P4::None, 0);
     }
 
     // Close + Halt.
@@ -445,6 +393,185 @@ pub fn codegen_insert(
 
     // End label.
     b.resolve_label(end_label);
+
+    Ok(())
+}
+
+/// Emit the INSERT loop for `VALUES (row), (row), ...` (planner path).
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::unnecessary_wraps
+)]
+fn codegen_insert_values(
+    b: &mut ProgramBuilder,
+    rows: &[Vec<Expr>],
+    cursor: i32,
+    table: &TableSchema,
+    returning: &[ResultColumn],
+    ctx: &CodegenContext,
+) -> Result<(), CodegenError> {
+    let rowid_reg = b.alloc_reg();
+    let concurrent_flag = i32::from(ctx.concurrent_mode);
+
+    // Use first row to determine column count.
+    let n_cols = rows[0].len();
+    let val_regs = b.alloc_regs(n_cols as i32);
+
+    for row_values in rows {
+        b.emit_op(
+            Opcode::NewRowid,
+            cursor,
+            rowid_reg,
+            concurrent_flag,
+            P4::None,
+            0,
+        );
+
+        for (i, val_expr) in row_values.iter().enumerate() {
+            let reg = val_regs + i as i32;
+            emit_expr(b, val_expr, reg);
+        }
+
+        let rec_reg = b.alloc_reg();
+        let n_cols_i32 = n_cols as i32;
+        b.emit_op(
+            Opcode::MakeRecord,
+            val_regs,
+            n_cols_i32,
+            rec_reg,
+            P4::Affinity(table.affinity_string()),
+            0,
+        );
+
+        b.emit_op(
+            Opcode::Insert,
+            cursor,
+            rec_reg,
+            rowid_reg,
+            P4::Table(table.name.clone()),
+            0,
+        );
+
+        if !returning.is_empty() {
+            b.emit_op(Opcode::ResultRow, rowid_reg, 1, 0, P4::None, 0);
+        }
+    }
+
+    Ok(())
+}
+
+/// Emit the INSERT loop for `INSERT INTO target SELECT ... FROM source` (planner path).
+///
+/// Opens the source table for reading, scans all rows, and inserts each
+/// into the target table.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap
+)]
+fn codegen_insert_select(
+    b: &mut ProgramBuilder,
+    select_stmt: &SelectStatement,
+    write_cursor: i32,
+    target_table: &TableSchema,
+    schema: &[TableSchema],
+    returning: &[ResultColumn],
+    ctx: &CodegenContext,
+) -> Result<(), CodegenError> {
+    // Extract columns and FROM from the inner SELECT.
+    let (columns, from) = match &select_stmt.body.select {
+        SelectCore::Select { columns, from, .. } => (columns, from),
+        SelectCore::Values(_) => {
+            return Err(CodegenError::Unsupported(
+                "INSERT ... SELECT with VALUES body".to_owned(),
+            ));
+        }
+    };
+
+    let from_clause = from
+        .as_ref()
+        .ok_or_else(|| CodegenError::Unsupported("INSERT ... SELECT without FROM".to_owned()))?;
+
+    let src_table_name = match &from_clause.source {
+        fsqlite_ast::TableOrSubquery::Table { name, .. } => &name.name,
+        _ => {
+            return Err(CodegenError::Unsupported(
+                "INSERT ... SELECT from non-table source".to_owned(),
+            ));
+        }
+    };
+
+    let src_table = find_table(schema, src_table_name)?;
+    let read_cursor = write_cursor + 1;
+
+    let n_cols = result_column_count(columns, src_table);
+    let rowid_reg = b.alloc_reg();
+    let val_regs = b.alloc_regs(n_cols);
+    let rec_reg = b.alloc_reg();
+    let concurrent_flag = i32::from(ctx.concurrent_mode);
+
+    let done_label = b.emit_label();
+
+    // OpenRead on source table.
+    b.emit_op(
+        Opcode::OpenRead,
+        read_cursor,
+        src_table.root_page,
+        0,
+        P4::Table(src_table.name.clone()),
+        0,
+    );
+
+    // Rewind to first row; jump to done if source is empty.
+    let loop_start = b.current_addr();
+    b.emit_jump_to_label(Opcode::Rewind, read_cursor, 0, done_label, P4::None, 0);
+
+    // Read projected columns from source into val_regs.
+    emit_column_reads(b, read_cursor, columns, src_table, val_regs)?;
+
+    // NewRowid for target table.
+    b.emit_op(
+        Opcode::NewRowid,
+        write_cursor,
+        rowid_reg,
+        concurrent_flag,
+        P4::None,
+        0,
+    );
+
+    // MakeRecord from the read column values.
+    b.emit_op(
+        Opcode::MakeRecord,
+        val_regs,
+        n_cols,
+        rec_reg,
+        P4::Affinity(target_table.affinity_string()),
+        0,
+    );
+
+    // Insert into target table.
+    b.emit_op(
+        Opcode::Insert,
+        write_cursor,
+        rec_reg,
+        rowid_reg,
+        P4::Table(target_table.name.clone()),
+        0,
+    );
+
+    // RETURNING clause: emit ResultRow with rowid if present.
+    if !returning.is_empty() {
+        b.emit_op(Opcode::ResultRow, rowid_reg, 1, 0, P4::None, 0);
+    }
+
+    // Next: advance to next source row.
+    let loop_body = (loop_start + 1) as i32;
+    b.emit_op(Opcode::Next, read_cursor, loop_body, 0, P4::None, 0);
+
+    // Done: close source cursor.
+    b.resolve_label(done_label);
+    b.emit_op(Opcode::Close, read_cursor, 0, 0, P4::None, 0);
 
     Ok(())
 }
@@ -1189,6 +1316,131 @@ mod tests {
             .find(|op| op.opcode == Opcode::Transaction)
             .unwrap();
         assert_eq!(txn.p2, 1);
+    }
+
+    // === Test: INSERT ... SELECT ===
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn test_codegen_insert_select() {
+        // Schema with source "s" and target "t".
+        let schema = vec![
+            TableSchema {
+                name: "t".to_owned(),
+                root_page: 2,
+                columns: vec![
+                    ColumnInfo {
+                        name: "a".to_owned(),
+                        affinity: 'd',
+                    },
+                    ColumnInfo {
+                        name: "b".to_owned(),
+                        affinity: 'C',
+                    },
+                ],
+                indexes: vec![],
+            },
+            TableSchema {
+                name: "s".to_owned(),
+                root_page: 3,
+                columns: vec![
+                    ColumnInfo {
+                        name: "x".to_owned(),
+                        affinity: 'd',
+                    },
+                    ColumnInfo {
+                        name: "y".to_owned(),
+                        affinity: 'C',
+                    },
+                ],
+                indexes: vec![],
+            },
+        ];
+
+        // INSERT INTO t SELECT * FROM s
+        let inner_select = SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Select {
+                    distinct: Distinctness::All,
+                    columns: vec![ResultColumn::Star],
+                    from: Some(FromClause {
+                        source: TableOrSubquery::Table {
+                            name: QualifiedName::bare("s"),
+                            alias: None,
+                            index_hint: None,
+                        },
+                        joins: vec![],
+                    }),
+                    where_clause: None,
+                    group_by: vec![],
+                    having: None,
+                    windows: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        };
+
+        let stmt = InsertStatement {
+            with: None,
+            or_conflict: None,
+            table: QualifiedName::bare("t"),
+            alias: None,
+            columns: vec![],
+            source: InsertSource::Select(Box::new(inner_select)),
+            upsert: vec![],
+            returning: vec![],
+        };
+
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_insert(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        assert!(has_opcodes(
+            &prog,
+            &[
+                Opcode::Init,
+                Opcode::Transaction,
+                Opcode::OpenWrite,
+                Opcode::OpenRead,
+                Opcode::Rewind,
+                Opcode::Column,
+                Opcode::Column,
+                Opcode::NewRowid,
+                Opcode::MakeRecord,
+                Opcode::Insert,
+                Opcode::Next,
+                Opcode::Close,
+                Opcode::Close,
+                Opcode::Halt,
+            ]
+        ));
+
+        // Transaction should be write (p2=1).
+        let txn = prog
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::Transaction)
+            .unwrap();
+        assert_eq!(txn.p2, 1);
+
+        // OpenWrite should target table "t" (root_page=2).
+        let open_write = prog
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::OpenWrite)
+            .unwrap();
+        assert_eq!(open_write.p2, 2);
+
+        // OpenRead should target table "s" (root_page=3).
+        let open_read = prog
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::OpenRead)
+            .unwrap();
+        assert_eq!(open_read.p2, 3);
     }
 
     // === Test 3: UPDATE by rowid ===

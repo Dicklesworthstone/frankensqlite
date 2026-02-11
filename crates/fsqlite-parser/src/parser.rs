@@ -3789,6 +3789,75 @@ mod tests {
     }
 
     #[test]
+    fn test_insert_from_select_without_from_clause() {
+        let stmt = parse_one("INSERT INTO t (a) SELECT 1");
+        if let Statement::Insert(i) = stmt {
+            if let InsertSource::Select(select) = &i.source {
+                if let SelectCore::Select { from, columns, .. } = &select.body.select {
+                    assert!(from.is_none(), "SELECT 1 should parse without FROM");
+                    assert_eq!(columns.len(), 1);
+                } else {
+                    unreachable!("expected Select core");
+                }
+            } else {
+                unreachable!("expected Select source");
+            }
+        } else {
+            unreachable!("expected Insert");
+        }
+    }
+
+    #[test]
+    fn test_insert_from_select_subquery_source() {
+        let stmt = parse_one("INSERT INTO t (a) SELECT sub.x FROM (SELECT 1 AS x) AS sub");
+        if let Statement::Insert(i) = stmt {
+            if let InsertSource::Select(select) = &i.source {
+                if let SelectCore::Select { from, .. } = &select.body.select {
+                    let from = from.as_ref().expect("FROM clause");
+                    match &from.source {
+                        TableOrSubquery::Subquery { alias, .. } => {
+                            assert_eq!(alias.as_deref(), Some("sub"));
+                        }
+                        other => unreachable!("expected subquery source, got {other:?}"),
+                    }
+                } else {
+                    unreachable!("expected Select core");
+                }
+            } else {
+                unreachable!("expected Select source");
+            }
+        } else {
+            unreachable!("expected Insert");
+        }
+    }
+
+    #[test]
+    fn test_insert_from_select_table_function_source() {
+        let stmt = parse_one("INSERT INTO t (a) SELECT gs.value FROM generate_series(1, 3) AS gs");
+        if let Statement::Insert(i) = stmt {
+            if let InsertSource::Select(select) = &i.source {
+                if let SelectCore::Select { from, .. } = &select.body.select {
+                    let from = from.as_ref().expect("FROM clause");
+                    match &from.source {
+                        TableOrSubquery::TableFunction { name, args, alias } => {
+                            assert_eq!(name, "generate_series");
+                            assert_eq!(args.len(), 2);
+                            assert_eq!(alias.as_deref(), Some("gs"));
+                        }
+                        other => unreachable!("expected table function source, got {other:?}"),
+                    }
+                } else {
+                    unreachable!("expected Select core");
+                }
+            } else {
+                unreachable!("expected Select source");
+            }
+        } else {
+            unreachable!("expected Insert");
+        }
+    }
+
+    #[test]
     fn test_insert_default_values() {
         let stmt = parse_one("INSERT INTO t DEFAULT VALUES");
         if let Statement::Insert(i) = stmt {

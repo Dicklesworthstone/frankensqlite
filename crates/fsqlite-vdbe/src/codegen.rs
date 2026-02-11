@@ -1092,18 +1092,20 @@ fn codegen_select_group_by_aggregate(
     let total_sorter_cols = num_group_keys + agg_arg_table_cols.len();
 
     // Map each aggregate's arg to its sorter column index.
-    let agg_sorter_col: Vec<Option<usize>> = agg_columns
-        .iter()
-        .map(|agg| {
-            agg.arg_col_index.map(|ci| {
-                num_group_keys
-                    + agg_arg_table_cols
-                        .iter()
-                        .position(|&x| x == ci)
-                        .expect("arg col must be in agg_arg_table_cols")
-            })
-        })
-        .collect();
+    let mut agg_sorter_col: Vec<Option<usize>> = Vec::with_capacity(agg_columns.len());
+    for agg in &agg_columns {
+        let sorter_col = if let Some(ci) = agg.arg_col_index {
+            let Some(pos) = agg_arg_table_cols.iter().position(|&x| x == ci) else {
+                return Err(CodegenError::Unsupported(
+                    "internal: aggregate argument column missing from sorter layout".to_owned(),
+                ));
+            };
+            Some(num_group_keys + pos)
+        } else {
+            None
+        };
+        agg_sorter_col.push(sorter_col);
+    }
 
     // Sorter cursor.
     let sorter_cursor = cursor + 1;
@@ -1346,7 +1348,11 @@ fn codegen_select_group_by_aggregate(
             );
         } else {
             let arg_reg = b.alloc_temp();
-            let sorter_col = agg_sorter_col[i].expect("non-zero-arg agg must have sorter col");
+            let Some(sorter_col) = agg_sorter_col[i] else {
+                return Err(CodegenError::Unsupported(
+                    "internal: non-zero-arg aggregate missing sorter column".to_owned(),
+                ));
+            };
             b.emit_op(
                 Opcode::Column,
                 sorter_cursor,
@@ -1472,32 +1478,52 @@ pub fn codegen_insert(
         0,
     );
 
-    // Extract all rows from VALUES clause.
-    let all_rows = match &stmt.source {
+    match &stmt.source {
         InsertSource::Values(rows) => {
             if rows.is_empty() {
                 return Err(CodegenError::Unsupported("empty VALUES".to_owned()));
             }
-            rows
+            codegen_insert_values(b, rows, cursor, table, &stmt.returning, ctx)?;
+        }
+        InsertSource::Select(select_stmt) => {
+            codegen_insert_select(b, select_stmt, cursor, table, schema, &stmt.returning, ctx)?;
         }
         InsertSource::DefaultValues => {
             return Err(CodegenError::Unsupported("DEFAULT VALUES".to_owned()));
         }
-        InsertSource::Select(_) => {
-            return Err(CodegenError::Unsupported("INSERT ... SELECT".to_owned()));
-        }
-    };
+    }
 
-    // Allocate registers once using the first row's column count.
-    let n_cols = all_rows[0].len();
+    // Close + Halt.
+    b.emit_op(Opcode::Close, cursor, 0, 0, P4::None, 0);
+    b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+
+    // End label.
+    b.resolve_label(end_label);
+
+    Ok(())
+}
+
+/// Emit the INSERT loop for `VALUES (row), (row), ...`.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::unnecessary_wraps
+)]
+fn codegen_insert_values(
+    b: &mut ProgramBuilder,
+    rows: &[Vec<Expr>],
+    cursor: i32,
+    table: &TableSchema,
+    returning: &[ResultColumn],
+    ctx: &CodegenContext,
+) -> Result<(), CodegenError> {
+    let n_cols = rows[0].len();
     let rowid_reg = b.alloc_reg();
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     let val_regs = b.alloc_regs(n_cols as i32);
     let rec_reg = b.alloc_reg();
     let concurrent_flag = i32::from(ctx.concurrent_mode);
 
-    // Emit insert sequence for each VALUES row.
-    for row_values in all_rows {
+    for row_values in rows {
         // NewRowid: generate a new rowid for this row.
         b.emit_op(
             Opcode::NewRowid,
@@ -1510,13 +1536,11 @@ pub fn codegen_insert(
 
         // Emit value expressions into registers.
         for (i, val_expr) in row_values.iter().enumerate() {
-            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
             let reg = val_regs + i as i32;
             emit_expr(b, val_expr, reg, None);
         }
 
         // MakeRecord: pack columns into a record.
-        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
         let n_cols_i32 = n_cols as i32;
         b.emit_op(
             Opcode::MakeRecord,
@@ -1538,17 +1562,157 @@ pub fn codegen_insert(
         );
 
         // RETURNING clause: emit ResultRow with rowid if present.
-        if !stmt.returning.is_empty() {
+        if !returning.is_empty() {
             b.emit_op(Opcode::ResultRow, rowid_reg, 1, 0, P4::None, 0);
         }
     }
 
-    // Close + Halt.
-    b.emit_op(Opcode::Close, cursor, 0, 0, P4::None, 0);
-    b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+    Ok(())
+}
 
-    // End label.
-    b.resolve_label(end_label);
+/// Emit the INSERT loop for `INSERT INTO target SELECT ... FROM source`.
+///
+/// Opens the source table for reading (cursor = `write_cursor + 1`), scans
+/// rows with an optional WHERE filter, reads projected columns, and inserts
+/// each row into the target table.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap
+)]
+fn codegen_insert_select(
+    b: &mut ProgramBuilder,
+    select_stmt: &SelectStatement,
+    write_cursor: i32,
+    target_table: &TableSchema,
+    schema: &[TableSchema],
+    returning: &[ResultColumn],
+    ctx: &CodegenContext,
+) -> Result<(), CodegenError> {
+    // Extract columns, FROM, and WHERE from the inner SELECT.
+    let (columns, from, where_clause) = match &select_stmt.body.select {
+        SelectCore::Select {
+            columns,
+            from,
+            where_clause,
+            ..
+        } => (columns, from, where_clause),
+        SelectCore::Values(_) => {
+            return Err(CodegenError::Unsupported(
+                "INSERT ... SELECT with VALUES body".to_owned(),
+            ));
+        }
+    };
+
+    let from_clause = from
+        .as_ref()
+        .ok_or_else(|| CodegenError::Unsupported("INSERT ... SELECT without FROM".to_owned()))?;
+
+    let (src_table_name, src_table_alias) = match &from_clause.source {
+        fsqlite_ast::TableOrSubquery::Table { name, alias, .. } => (&name.name, alias.as_deref()),
+        _ => {
+            return Err(CodegenError::Unsupported(
+                "INSERT ... SELECT from non-table source".to_owned(),
+            ));
+        }
+    };
+
+    let src_table = find_table(schema, src_table_name)?;
+    let read_cursor = write_cursor + 1;
+
+    // Determine the number of output columns from the SELECT.
+    let n_cols = result_column_count(columns, src_table);
+
+    // Allocate registers for the scan → insert pipeline.
+    let rowid_reg = b.alloc_reg();
+    let val_regs = b.alloc_regs(n_cols);
+    let rec_reg = b.alloc_reg();
+    let concurrent_flag = i32::from(ctx.concurrent_mode);
+
+    let done_label = b.emit_label();
+
+    // OpenRead on source table.
+    b.emit_op(
+        Opcode::OpenRead,
+        read_cursor,
+        src_table.root_page,
+        0,
+        P4::Table(src_table.name.clone()),
+        0,
+    );
+
+    // Rewind to first row; jump to done if source is empty.
+    let loop_start = b.current_addr();
+    b.emit_jump_to_label(Opcode::Rewind, read_cursor, 0, done_label, P4::None, 0);
+
+    // WHERE filter on source rows (skip non-matching).
+    let skip_label = b.emit_label();
+    if let Some(where_expr) = where_clause {
+        emit_where_filter(
+            b,
+            where_expr,
+            read_cursor,
+            src_table,
+            src_table_alias,
+            skip_label,
+        );
+    }
+
+    // Read projected columns from source into val_regs.
+    emit_column_reads(
+        b,
+        read_cursor,
+        columns,
+        src_table,
+        src_table_alias,
+        val_regs,
+    )?;
+
+    // NewRowid for target table.
+    b.emit_op(
+        Opcode::NewRowid,
+        write_cursor,
+        rowid_reg,
+        concurrent_flag,
+        P4::None,
+        0,
+    );
+
+    // MakeRecord from the read column values.
+    b.emit_op(
+        Opcode::MakeRecord,
+        val_regs,
+        n_cols,
+        rec_reg,
+        P4::Affinity(target_table.affinity_string()),
+        0,
+    );
+
+    // Insert into target table.
+    b.emit_op(
+        Opcode::Insert,
+        write_cursor,
+        rec_reg,
+        rowid_reg,
+        P4::Table(target_table.name.clone()),
+        0,
+    );
+
+    // RETURNING clause: emit ResultRow with rowid if present.
+    if !returning.is_empty() {
+        b.emit_op(Opcode::ResultRow, rowid_reg, 1, 0, P4::None, 0);
+    }
+
+    // Skip label for WHERE-filtered rows.
+    b.resolve_label(skip_label);
+
+    // Next: advance to next source row.
+    let loop_body = (loop_start + 1) as i32;
+    b.emit_op(Opcode::Next, read_cursor, loop_body, 0, P4::None, 0);
+
+    // Done: close source cursor.
+    b.resolve_label(done_label);
+    b.emit_op(Opcode::Close, read_cursor, 0, 0, P4::None, 0);
 
     Ok(())
 }
@@ -1601,9 +1765,8 @@ pub fn codegen_update(
                     table: table.name.clone(),
                     column: col_name.to_owned(),
                 })
-                .expect("column must exist")
         })
-        .collect();
+        .collect::<Result<Vec<_>, _>>()?;
 
     // OpenWrite.
     b.emit_op(
@@ -2403,8 +2566,11 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
                 }
             }
         }
-        Expr::Column(col_ref, _) if ctx.is_some() => {
-            let sc = ctx.unwrap();
+        Expr::Column(col_ref, _) => {
+            let Some(sc) = ctx else {
+                b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
+                return;
+            };
             if let Some(qualifier) = &col_ref.table {
                 if !matches_table_or_alias(qualifier, sc.table, sc.table_alias) {
                     b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
@@ -2927,6 +3093,235 @@ mod tests {
             .find(|op| op.opcode == Opcode::Transaction)
             .unwrap();
         assert_eq!(txn.p2, 1);
+    }
+
+    // === Test: INSERT ... SELECT ===
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn test_codegen_insert_select() {
+        // Schema with two tables: source "s" and target "t".
+        let schema = vec![
+            TableSchema {
+                name: "t".to_owned(),
+                root_page: 2,
+                columns: vec![
+                    ColumnInfo {
+                        name: "a".to_owned(),
+                        affinity: 'd',
+                    },
+                    ColumnInfo {
+                        name: "b".to_owned(),
+                        affinity: 'C',
+                    },
+                ],
+                indexes: vec![],
+            },
+            TableSchema {
+                name: "s".to_owned(),
+                root_page: 3,
+                columns: vec![
+                    ColumnInfo {
+                        name: "x".to_owned(),
+                        affinity: 'd',
+                    },
+                    ColumnInfo {
+                        name: "y".to_owned(),
+                        affinity: 'C',
+                    },
+                ],
+                indexes: vec![],
+            },
+        ];
+
+        // INSERT INTO t SELECT * FROM s
+        let inner_select = SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Select {
+                    distinct: Distinctness::All,
+                    columns: vec![ResultColumn::Star],
+                    from: Some(FromClause {
+                        source: TableOrSubquery::Table {
+                            name: QualifiedName::bare("s"),
+                            alias: None,
+                            index_hint: None,
+                        },
+                        joins: vec![],
+                    }),
+                    where_clause: None,
+                    group_by: vec![],
+                    having: None,
+                    windows: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        };
+
+        let stmt = InsertStatement {
+            with: None,
+            or_conflict: None,
+            table: QualifiedName::bare("t"),
+            alias: None,
+            columns: vec![],
+            source: InsertSource::Select(Box::new(inner_select)),
+            upsert: vec![],
+            returning: vec![],
+        };
+
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_insert(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        // Should contain: Init, Transaction(write), OpenWrite(target),
+        // OpenRead(source), Rewind, Column reads, NewRowid, MakeRecord,
+        // Insert, Next, Close(source), Close(target), Halt.
+        assert!(has_opcodes(
+            &prog,
+            &[
+                Opcode::Init,
+                Opcode::Transaction,
+                Opcode::OpenWrite,
+                Opcode::OpenRead,
+                Opcode::Rewind,
+                Opcode::Column,
+                Opcode::Column,
+                Opcode::NewRowid,
+                Opcode::MakeRecord,
+                Opcode::Insert,
+                Opcode::Next,
+                Opcode::Close,
+                Opcode::Close,
+                Opcode::Halt,
+            ]
+        ));
+
+        // Transaction should be write (p2=1).
+        let txn = prog
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::Transaction)
+            .unwrap();
+        assert_eq!(txn.p2, 1);
+
+        // OpenWrite should target table "t" (root_page=2).
+        let open_write = prog
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::OpenWrite)
+            .unwrap();
+        assert_eq!(open_write.p2, 2);
+
+        // OpenRead should target table "s" (root_page=3).
+        let open_read = prog
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::OpenRead)
+            .unwrap();
+        assert_eq!(open_read.p2, 3);
+    }
+
+    // === Test: INSERT ... SELECT with specific columns ===
+    #[test]
+    fn test_codegen_insert_select_with_columns() {
+        // Schema with source "s" having 3 columns, target "t" with 2.
+        let schema = vec![
+            TableSchema {
+                name: "t".to_owned(),
+                root_page: 2,
+                columns: vec![
+                    ColumnInfo {
+                        name: "a".to_owned(),
+                        affinity: 'd',
+                    },
+                    ColumnInfo {
+                        name: "b".to_owned(),
+                        affinity: 'C',
+                    },
+                ],
+                indexes: vec![],
+            },
+            TableSchema {
+                name: "s".to_owned(),
+                root_page: 3,
+                columns: vec![
+                    ColumnInfo {
+                        name: "x".to_owned(),
+                        affinity: 'd',
+                    },
+                    ColumnInfo {
+                        name: "y".to_owned(),
+                        affinity: 'C',
+                    },
+                    ColumnInfo {
+                        name: "z".to_owned(),
+                        affinity: 'e',
+                    },
+                ],
+                indexes: vec![],
+            },
+        ];
+
+        // INSERT INTO t SELECT x, y FROM s
+        let inner_select = SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Select {
+                    distinct: Distinctness::All,
+                    columns: vec![
+                        ResultColumn::Expr {
+                            expr: Expr::Column(ColumnRef::bare("x"), Span::ZERO),
+                            alias: None,
+                        },
+                        ResultColumn::Expr {
+                            expr: Expr::Column(ColumnRef::bare("y"), Span::ZERO),
+                            alias: None,
+                        },
+                    ],
+                    from: Some(FromClause {
+                        source: TableOrSubquery::Table {
+                            name: QualifiedName::bare("s"),
+                            alias: None,
+                            index_hint: None,
+                        },
+                        joins: vec![],
+                    }),
+                    where_clause: None,
+                    group_by: vec![],
+                    having: None,
+                    windows: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        };
+
+        let stmt = InsertStatement {
+            with: None,
+            or_conflict: None,
+            table: QualifiedName::bare("t"),
+            alias: None,
+            columns: vec![],
+            source: InsertSource::Select(Box::new(inner_select)),
+            upsert: vec![],
+            returning: vec![],
+        };
+
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_insert(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        // Should have exactly 2 Column reads (x and y), not 3.
+        let column_count = prog
+            .ops()
+            .iter()
+            .filter(|op| op.opcode == Opcode::Column)
+            .count();
+        assert_eq!(column_count, 2);
     }
 
     // === Test 3: UPDATE by rowid ===
@@ -4059,5 +4454,176 @@ mod tests {
             "AggFinal P4 should be FuncName(avg), got {:?}",
             fin.p4
         );
+    }
+
+    // === Tests for bd-2vza: UPDATE/DELETE WHERE with qualified alias columns ===
+
+    #[test]
+    fn test_codegen_update_where_qualified_alias() {
+        // UPDATE t AS u SET b = ?1 WHERE u.a = ?2
+        let stmt = UpdateStatement {
+            with: None,
+            or_conflict: None,
+            table: QualifiedTableRef {
+                name: QualifiedName::bare("t"),
+                alias: Some("u".to_owned()),
+                index_hint: None,
+            },
+            assignments: vec![Assignment {
+                target: AssignmentTarget::Column("b".to_owned()),
+                value: placeholder(1),
+            }],
+            from: None,
+            where_clause: Some(Expr::BinaryOp {
+                left: Box::new(Expr::Column(ColumnRef::qualified("u", "a"), Span::ZERO)),
+                op: AstBinaryOp::Eq,
+                right: Box::new(placeholder(2)),
+                span: Span::ZERO,
+            }),
+            returning: vec![],
+            order_by: vec![],
+            limit: None,
+        };
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_update(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        // The qualified alias "u.a" should resolve to Column opcode
+        // for filter comparison (Ne), not silently skip filtering.
+        assert!(has_opcodes(
+            &prog,
+            &[
+                Opcode::Rewind,
+                Opcode::Column, // read u.a for WHERE comparison
+                Opcode::Variable,
+                Opcode::Ne, // filter non-matching rows
+            ]
+        ));
+    }
+
+    #[test]
+    fn test_codegen_delete_where_qualified_alias() {
+        // DELETE FROM t AS u WHERE u.a = ?1
+        let stmt = DeleteStatement {
+            with: None,
+            table: QualifiedTableRef {
+                name: QualifiedName::bare("t"),
+                alias: Some("u".to_owned()),
+                index_hint: None,
+            },
+            where_clause: Some(Expr::BinaryOp {
+                left: Box::new(Expr::Column(ColumnRef::qualified("u", "a"), Span::ZERO)),
+                op: AstBinaryOp::Eq,
+                right: Box::new(placeholder(1)),
+                span: Span::ZERO,
+            }),
+            returning: vec![],
+            order_by: vec![],
+            limit: None,
+        };
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_delete(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        // The qualified alias "u.a" should resolve correctly.
+        assert!(has_opcodes(
+            &prog,
+            &[
+                Opcode::Last,
+                Opcode::Column, // read u.a for WHERE comparison
+                Opcode::Variable,
+                Opcode::Ne, // filter non-matching rows
+                Opcode::Delete,
+            ]
+        ));
+    }
+
+    #[test]
+    fn test_codegen_update_where_qualified_rowid_alias() {
+        // UPDATE t AS u SET b = ?1 WHERE u.rowid = ?2
+        let stmt = UpdateStatement {
+            with: None,
+            or_conflict: None,
+            table: QualifiedTableRef {
+                name: QualifiedName::bare("t"),
+                alias: Some("u".to_owned()),
+                index_hint: None,
+            },
+            assignments: vec![Assignment {
+                target: AssignmentTarget::Column("b".to_owned()),
+                value: placeholder(1),
+            }],
+            from: None,
+            where_clause: Some(Expr::BinaryOp {
+                left: Box::new(Expr::Column(ColumnRef::qualified("u", "rowid"), Span::ZERO)),
+                op: AstBinaryOp::Eq,
+                right: Box::new(placeholder(2)),
+                span: Span::ZERO,
+            }),
+            returning: vec![],
+            order_by: vec![],
+            limit: None,
+        };
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_update(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        // The qualified alias "u.rowid" should emit OP_Rowid for the
+        // WHERE comparison, not silently skip the filter.
+        assert!(has_opcodes(
+            &prog,
+            &[
+                Opcode::Rewind,
+                Opcode::Rowid, // WHERE u.rowid comparison
+                Opcode::Variable,
+                Opcode::Ne, // filter non-matching rows
+            ]
+        ));
+    }
+
+    #[test]
+    fn test_codegen_delete_where_bare_rowid_eq() {
+        // DELETE FROM t WHERE rowid = ?1
+        // Ensures unqualified rowid in Eq fast-path emits Rowid opcode.
+        let stmt = DeleteStatement {
+            with: None,
+            table: QualifiedTableRef {
+                name: QualifiedName::bare("t"),
+                alias: None,
+                index_hint: None,
+            },
+            where_clause: Some(Expr::BinaryOp {
+                left: Box::new(Expr::Column(ColumnRef::bare("rowid"), Span::ZERO)),
+                op: AstBinaryOp::Eq,
+                right: Box::new(placeholder(1)),
+                span: Span::ZERO,
+            }),
+            returning: vec![],
+            order_by: vec![],
+            limit: None,
+        };
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_delete(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        // Bare rowid in DELETE WHERE Eq should emit Rowid + Ne filter.
+        assert!(has_opcodes(
+            &prog,
+            &[
+                Opcode::Last,
+                Opcode::Rowid, // WHERE rowid comparison
+                Opcode::Variable,
+                Opcode::Ne, // filter non-matching rows
+                Opcode::Delete,
+            ]
+        ));
     }
 }

@@ -601,6 +601,14 @@ impl Connection {
                 }
             }
             Statement::Insert(ref insert) => {
+                if let fsqlite_ast::InsertSource::Select(select_stmt) = &insert.source {
+                    let affected =
+                        self.execute_insert_select_fallback(insert, select_stmt, params)?;
+                    self.persist_if_needed()?;
+                    *self.last_changes.borrow_mut() = affected;
+                    return Ok(Vec::new());
+                }
+
                 let affected = match &insert.source {
                     fsqlite_ast::InsertSource::Values(v) => v.len(),
                     fsqlite_ast::InsertSource::DefaultValues => 1,
@@ -661,6 +669,97 @@ impl Connection {
                 "only SELECT, INSERT, UPDATE, DELETE, CREATE TABLE, transaction control, and PRAGMA are supported".to_owned(),
             )),
         }
+    }
+
+    fn execute_insert_select_fallback(
+        &self,
+        insert: &fsqlite_ast::InsertStatement,
+        select_stmt: &fsqlite_ast::SelectStatement,
+        params: Option<&[SqliteValue]>,
+    ) -> Result<usize> {
+        if insert.with.is_some()
+            || insert.or_conflict.is_some()
+            || !insert.upsert.is_empty()
+            || !insert.returning.is_empty()
+        {
+            return Err(FrankenError::NotImplemented(
+                "INSERT ... SELECT fallback does not support WITH/OR CONFLICT/UPSERT/RETURNING"
+                    .to_owned(),
+            ));
+        }
+
+        let source_rows = self.execute_statement(Statement::Select(select_stmt.clone()), params)?;
+        if source_rows.is_empty() {
+            return Ok(0);
+        }
+
+        let (table_columns, source_target_indices) =
+            self.resolve_insert_select_target_layout(insert)?;
+        if table_columns.is_empty() {
+            return Err(FrankenError::Internal(format!(
+                "table '{}' has no insertable columns",
+                insert.table.name
+            )));
+        }
+
+        let source_column_count = source_target_indices.len();
+        for (row_idx, row) in source_rows.iter().enumerate() {
+            if row.values().len() != source_column_count {
+                return Err(FrankenError::Internal(format!(
+                    "INSERT ... SELECT column count mismatch: source row {row_idx} has {} values, SELECT produced {source_column_count}",
+                    row.values().len()
+                )));
+            }
+        }
+
+        let qualified_table = quote_qualified_name(&insert.table);
+        let placeholders = (1..=table_columns.len())
+            .map(|idx| format!("?{idx}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let insert_sql = format!("INSERT INTO {qualified_table} VALUES ({placeholders});");
+
+        for row in &source_rows {
+            let mut ordered_values = vec![SqliteValue::Null; table_columns.len()];
+            for (source_idx, target_idx) in source_target_indices.iter().copied().enumerate() {
+                ordered_values[target_idx] = row.values()[source_idx].clone();
+            }
+            self.execute_with_params(&insert_sql, &ordered_values)?;
+        }
+
+        Ok(source_rows.len())
+    }
+
+    fn resolve_insert_select_target_layout(
+        &self,
+        insert: &fsqlite_ast::InsertStatement,
+    ) -> Result<(Vec<String>, Vec<usize>)> {
+        let schema = self.schema.borrow();
+        let table = schema
+            .iter()
+            .find(|tbl| tbl.name.eq_ignore_ascii_case(&insert.table.name))
+            .ok_or_else(|| {
+                FrankenError::Internal(format!("table not found: {}", insert.table.name))
+            })?;
+
+        let table_columns: Vec<String> = table.columns.iter().map(|col| col.name.clone()).collect();
+
+        if insert.columns.is_empty() {
+            let target_indices = (0..table_columns.len()).collect();
+            return Ok((table_columns, target_indices));
+        }
+
+        let mut target_indices = Vec::with_capacity(insert.columns.len());
+        for col in &insert.columns {
+            let idx = table.column_index(col).ok_or_else(|| {
+                FrankenError::Internal(format!(
+                    "column '{col}' not found in table '{}'",
+                    insert.table.name
+                ))
+            })?;
+            target_indices.push(idx);
+        }
+        Ok((table_columns, target_indices))
     }
 
     /// Compile and wrap a statement into a `PreparedStatement`.
@@ -2194,6 +2293,22 @@ fn parse_statements(sql: &str) -> Result<Vec<Statement>> {
     Ok(statements)
 }
 
+fn quote_identifier(identifier: &str) -> String {
+    let escaped = identifier.replace('"', "\"\"");
+    format!("\"{escaped}\"")
+}
+
+fn quote_qualified_name(name: &fsqlite_ast::QualifiedName) -> String {
+    match &name.schema {
+        Some(schema) => format!(
+            "{}.{}",
+            quote_identifier(schema),
+            quote_identifier(&name.name)
+        ),
+        None => quote_identifier(&name.name),
+    }
+}
+
 /// Parse a PRAGMA value as a boolean.
 ///
 /// Accepts `on`, `off`, `true`, `false`, `1`, `0`, `yes`, `no`
@@ -3549,6 +3664,77 @@ mod tests {
     }
 
     #[test]
+    fn test_insert_select_copies_filtered_rows() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE src (id INTEGER, name TEXT);")
+            .unwrap();
+        conn.execute("CREATE TABLE dst (id INTEGER, name TEXT);")
+            .unwrap();
+
+        conn.execute("INSERT INTO src VALUES (1, 'alpha');")
+            .unwrap();
+        conn.execute("INSERT INTO src VALUES (2, 'beta');").unwrap();
+        conn.execute("INSERT INTO src VALUES (3, 'gamma');")
+            .unwrap();
+
+        let inserted = conn
+            .execute("INSERT INTO dst SELECT id, name FROM src WHERE id >= 2;")
+            .unwrap();
+        assert_eq!(inserted, 2);
+
+        let rows = conn.query("SELECT id, name FROM dst ORDER BY id;").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![
+                SqliteValue::Integer(2),
+                SqliteValue::Text("beta".to_owned()),
+            ]
+        );
+        assert_eq!(
+            row_values(&rows[1]),
+            vec![
+                SqliteValue::Integer(3),
+                SqliteValue::Text("gamma".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_insert_select_respects_target_column_list_order() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE src (a INTEGER, b TEXT);")
+            .unwrap();
+        conn.execute("CREATE TABLE dst (x TEXT, y INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO src VALUES (10, 'ten');").unwrap();
+        conn.execute("INSERT INTO src VALUES (20, 'twenty');")
+            .unwrap();
+
+        let inserted = conn
+            .execute("INSERT INTO dst (y, x) SELECT a, b FROM src;")
+            .unwrap();
+        assert_eq!(inserted, 2);
+
+        let rows = conn.query("SELECT x, y FROM dst ORDER BY y;").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![
+                SqliteValue::Text("ten".to_owned()),
+                SqliteValue::Integer(10),
+            ]
+        );
+        assert_eq!(
+            row_values(&rows[1]),
+            vec![
+                SqliteValue::Text("twenty".to_owned()),
+                SqliteValue::Integer(20),
+            ]
+        );
+    }
+
+    #[test]
     fn test_select_from_empty_table() {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE empty (a INTEGER);").unwrap();
@@ -3746,6 +3932,62 @@ mod tests {
         let rows = conn.query("SELECT a FROM t_alias_del ORDER BY a;").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(row_values(&rows[0]), vec![SqliteValue::Integer(1)]);
+    }
+
+    // === Tests for bd-2vza: qualified alias in Eq WHERE fast-path ===
+
+    #[test]
+    fn test_update_where_qualified_alias_eq() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE items (id INTEGER, val TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO items VALUES (1, 'a');").unwrap();
+        conn.execute("INSERT INTO items VALUES (2, 'b');").unwrap();
+        conn.execute("INSERT INTO items VALUES (3, 'c');").unwrap();
+
+        // Eq path with qualified alias reference.
+        conn.execute("UPDATE items AS i SET val = 'changed' WHERE i.id = 2;")
+            .unwrap();
+
+        let rows = conn.query("SELECT val FROM items ORDER BY id;").unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![SqliteValue::Text("a".to_owned())]
+        );
+        assert_eq!(
+            row_values(&rows[1]),
+            vec![SqliteValue::Text("changed".to_owned())]
+        );
+        assert_eq!(
+            row_values(&rows[2]),
+            vec![SqliteValue::Text("c".to_owned())]
+        );
+    }
+
+    #[test]
+    fn test_delete_where_qualified_alias_eq() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE items2 (id INTEGER, val TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO items2 VALUES (1, 'a');").unwrap();
+        conn.execute("INSERT INTO items2 VALUES (2, 'b');").unwrap();
+        conn.execute("INSERT INTO items2 VALUES (3, 'c');").unwrap();
+
+        // Eq path with qualified alias reference.
+        conn.execute("DELETE FROM items2 AS i WHERE i.id = 2;")
+            .unwrap();
+
+        let rows = conn.query("SELECT val FROM items2 ORDER BY id;").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![SqliteValue::Text("a".to_owned())]
+        );
+        assert_eq!(
+            row_values(&rows[1]),
+            vec![SqliteValue::Text("c".to_owned())]
+        );
     }
 
     #[test]
