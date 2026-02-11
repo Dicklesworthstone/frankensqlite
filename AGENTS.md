@@ -50,7 +50,7 @@ If I tell you to do something, even if it goes against what follows below, YOU M
 We only use **Cargo** in this project, NEVER any other package manager.
 
 - **Edition:** Rust 2024 (nightly required — see `rust-toolchain.toml`)
-- **Workspace:** 23 crates under `crates/` (see members list in root `Cargo.toml`)
+- **Workspace:** 24 crates under `crates/` (see members list in root `Cargo.toml`)
 - **Dependency versions:** Explicit versions for stability
 - **Configuration:** Cargo.toml only (workspace-level and per-crate)
 - **Unsafe code:** Forbidden (`#![forbid(unsafe_code)]` via workspace lints)
@@ -228,7 +228,7 @@ Storage: VFS --> Pager --> WAL --> MVCC --> B-Tree --> Page I/O
 
 | Path | Purpose |
 |------|---------|
-| `Cargo.toml` | Workspace root — all 23 members, shared deps, profiles |
+| `Cargo.toml` | Workspace root — all 24 members, shared deps, profiles |
 | `rust-toolchain.toml` | Nightly toolchain requirement |
 | `crates/fsqlite-types/` | Foundation types used across all crates |
 | `crates/fsqlite-error/` | Error definitions used across all crates |

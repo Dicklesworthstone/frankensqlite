@@ -94,10 +94,10 @@ Database engines live and die by cache behavior and I/O patterns. All page buffe
 
 ## Architecture
 
-FrankenSQLite is organized as a 23-crate Cargo workspace with strict layered dependencies:
+FrankenSQLite is organized as a 24-crate Cargo workspace with strict layered dependencies:
 
 <div align="center">
-  <img src="frankensqlite_diagram.webp" alt="FrankenSQLite architecture diagram — 23-crate layered workspace" width="512">
+  <img src="frankensqlite_diagram.webp" alt="FrankenSQLite architecture diagram — 24-crate layered workspace" width="512">
 </div>
 
 ### Crate Map
@@ -2429,7 +2429,7 @@ cargo bench --bench parser_throughput
 
 FrankenSQLite deliberately omits several components of the C SQLite ecosystem. Each exclusion has a technical rationale; none are omitted from laziness.
 
-**Amalgamation build system.** The C SQLite amalgamation (`sqlite3.c`) is a single-file build artifact produced by concatenating ~150 source files. Its purpose is simplifying C compilation. Rust's Cargo workspace with 23 crates provides superior modularity, parallel compilation, and dependency tracking. There is no analog of the amalgamation in a Rust project.
+**Amalgamation build system.** The C SQLite amalgamation (`sqlite3.c`) is a single-file build artifact produced by concatenating ~150 source files. Its purpose is simplifying C compilation. Rust's Cargo workspace with 24 crates provides superior modularity, parallel compilation, and dependency tracking. There is no analog of the amalgamation in a Rust project.
 
 **TCL test harness.** C SQLite's test suite is driven by ~90,000+ lines of TCL scripts deeply intertwined with the C API. These cannot be meaningfully ported. Instead, FrankenSQLite uses native Rust `#[test]` modules, proptest for property-based testing, a conformance harness comparing SQL output against C SQLite golden files, and asupersync's lab reactor for deterministic concurrency tests.
 
@@ -2552,7 +2552,7 @@ A: Yes. The `fsqlite` crate is the public API. The CLI (`fsqlite-cli`) is a sepa
 
 ```
 frankensqlite/
-├── Cargo.toml                # Workspace: 23 members, shared deps, lint config
+├── Cargo.toml                # Workspace: 24 members, shared deps, lint config
 ├── Cargo.lock                # Pinned dependency versions
 ├── rust-toolchain.toml       # Nightly channel + rustfmt + clippy
 ├── AGENTS.md                 # AI agent development guidelines
