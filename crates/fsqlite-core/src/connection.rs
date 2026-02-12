@@ -700,6 +700,10 @@ pub struct Connection {
     gc_scheduler: RefCell<GcScheduler>,
     /// Per-process touched-page queue for incremental GC pruning.
     gc_todo: RefCell<GcTodo>,
+    /// Logical clock for GC scheduling (milliseconds).  Avoids ambient time
+    /// authority by using a monotonic counter that increments by a fixed
+    /// amount each operation.  This provides deterministic GC behavior.
+    gc_clock_millis: RefCell<u64>,
 }
 
 impl std::fmt::Debug for Connection {
@@ -760,6 +764,7 @@ impl Connection {
             version_store: Rc::new(RefCell::new(VersionStore::new(PageSize::DEFAULT))),
             gc_scheduler: RefCell::new(GcScheduler::new()),
             gc_todo: RefCell::new(GcTodo::new()),
+            gc_clock_millis: RefCell::new(0),
         };
         conn.apply_current_journal_mode_to_pager()?;
         // 5D.4 (bd-3bsn): Load initial state from pager instead of compat_persist.
@@ -1230,39 +1235,12 @@ impl Connection {
             // VACUUM INTO copies the database to a new file.
             // Plain VACUUM is a no-op for now (defragmentation not implemented).
             Statement::Vacuum(ref vacuum_stmt) => {
-                if let Some(ref into_expr) = vacuum_stmt.into {
-                    // Extract target path from the INTO expression
-                    let target_path = match into_expr {
-                        Expr::Literal(Literal::String(s), _) => s.clone(),
-                        _ => {
-                            return Err(FrankenError::internal(
-                                "VACUUM INTO requires a string literal path".to_string(),
-                            ))
-                        }
-                    };
-
-                    if self.path == ":memory:" {
-                        // For in-memory databases, we need to serialize to a file
-                        return Err(FrankenError::not_implemented(
-                            "VACUUM INTO from :memory: database",
-                        ));
-                    }
-
-                    // Ensure any pending changes are flushed
-                    if *self.in_transaction.borrow() {
-                        return Err(FrankenError::internal(
-                            "cannot VACUUM INTO while a transaction is active".to_string(),
-                        ));
-                    }
-
-                    // Copy the database file to the target path
-                    std::fs::copy(&self.path, &target_path).map_err(|e| {
-                        FrankenError::internal(format!(
-                            "VACUUM INTO failed to copy database to '{}': {}",
-                            target_path, e
-                        ))
-                    })?;
+                if vacuum_stmt.into.is_some() {
+                    // VACUUM INTO requires VFS-based file copy to avoid ambient
+                    // filesystem authority.  Not yet implemented.
+                    return Err(FrankenError::not_implemented("VACUUM INTO"));
                 }
+                // Plain VACUUM is a no-op (defragmentation not implemented).
                 Ok(Vec::new())
             }
             // ANALYZE and REINDEX are no-ops for now
@@ -2905,8 +2883,18 @@ impl Connection {
     /// Uses the `GcScheduler` to determine if enough time has elapsed since
     /// the last tick based on version chain pressure. If so, runs `gc_tick`
     /// to prune old page versions from the `VersionStore`.
+    ///
+    /// Time is tracked via a logical clock (`gc_clock_millis`) that advances
+    /// by a fixed increment each call, avoiding ambient time authority.
     fn maybe_gc_tick(&self) -> Option<GcTickResult> {
-        let now = std::time::Instant::now();
+        // Advance the logical clock by a fixed increment (simulates ~10ms per operation).
+        // This provides deterministic GC scheduling without ambient time authority.
+        const GC_CLOCK_INCREMENT_MS: u64 = 10;
+        let now_millis = {
+            let mut clock = self.gc_clock_millis.borrow_mut();
+            *clock = clock.saturating_add(GC_CLOCK_INCREMENT_MS);
+            *clock
+        };
 
         // Estimate version chain pressure from the GcTodo queue length.
         // This is a proxy for actual chain length sampling - a fuller
@@ -2917,7 +2905,10 @@ impl Connection {
             (todo.len() as f64).max(1.0) // minimum pressure of 1.0
         };
 
-        let should_tick = self.gc_scheduler.borrow_mut().should_tick(pressure, now);
+        let should_tick = self
+            .gc_scheduler
+            .borrow_mut()
+            .should_tick(pressure, now_millis);
         if !should_tick {
             return None;
         }

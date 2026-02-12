@@ -7,7 +7,6 @@
 //! - [`prune_page_chain`]: Single-page chain severing and free-list return.
 
 use std::collections::{HashSet, VecDeque};
-use std::time::{Duration, Instant};
 
 use fsqlite_types::{CommitSeq, PageNumber, PageNumberBuildHasher, VersionPointer};
 
@@ -54,12 +53,16 @@ pub const GC_TARGET_CHAIN_LENGTH: f64 = 8.0;
 /// ```text
 /// f_gc = min(f_max, max(f_min, pressure / target))
 /// ```
+///
+/// Time is tracked as milliseconds (u64) for compatibility with the Cx
+/// capability context's deterministic clock, avoiding ambient time authority.
 #[derive(Debug, Clone)]
 pub struct GcScheduler {
     f_max_hz: f64,
     f_min_hz: f64,
     target_chain_length: f64,
-    last_tick: Option<Instant>,
+    /// Milliseconds since an arbitrary epoch when the last tick occurred.
+    last_tick_millis: Option<u64>,
 }
 
 impl GcScheduler {
@@ -70,7 +73,7 @@ impl GcScheduler {
             f_max_hz: GC_F_MAX_HZ,
             f_min_hz: GC_F_MIN_HZ,
             target_chain_length: GC_TARGET_CHAIN_LENGTH,
-            last_tick: None,
+            last_tick_millis: None,
         }
     }
 
@@ -84,24 +87,31 @@ impl GcScheduler {
     }
 
     /// Compute the minimum interval between GC ticks for the given pressure.
+    ///
+    /// Returns interval in milliseconds.
     #[must_use]
-    pub fn compute_interval(&self, version_chain_pressure: f64) -> Duration {
+    pub fn compute_interval_millis(&self, version_chain_pressure: f64) -> u64 {
         let hz = self.compute_frequency(version_chain_pressure);
-        Duration::from_secs_f64(1.0 / hz)
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+        let millis = (1000.0 / hz) as u64;
+        millis.max(1) // at least 1ms
     }
 
     /// Returns `true` if enough time has elapsed since the last tick for the
     /// given pressure level, and updates the last-tick timestamp.
-    pub fn should_tick(&mut self, version_chain_pressure: f64, now: Instant) -> bool {
-        let interval = self.compute_interval(version_chain_pressure);
-        match self.last_tick {
+    ///
+    /// `now_millis` should be the current time in milliseconds (e.g., from
+    /// `Cx::unix_millis()` or similar deterministic source).
+    pub fn should_tick(&mut self, version_chain_pressure: f64, now_millis: u64) -> bool {
+        let interval = self.compute_interval_millis(version_chain_pressure);
+        match self.last_tick_millis {
             None => {
-                self.last_tick = Some(now);
+                self.last_tick_millis = Some(now_millis);
                 true
             }
             Some(last) => {
-                if now.duration_since(last) >= interval {
-                    self.last_tick = Some(now);
+                if now_millis.saturating_sub(last) >= interval {
+                    self.last_tick_millis = Some(now_millis);
                     true
                 } else {
                     false
@@ -110,9 +120,9 @@ impl GcScheduler {
         }
     }
 
-    /// Record that a tick occurred at `now` without the should-tick check.
-    pub fn record_tick(&mut self, now: Instant) {
-        self.last_tick = Some(now);
+    /// Record that a tick occurred at `now_millis` without the should-tick check.
+    pub fn record_tick(&mut self, now_millis: u64) {
+        self.last_tick_millis = Some(now_millis);
     }
 }
 
@@ -491,10 +501,9 @@ mod tests {
     #[test]
     fn test_gc_scheduler_interval_from_frequency() {
         let sched = GcScheduler::new();
-        let interval = sched.compute_interval(80.0); // 80/8 = 10 Hz → 100ms
+        let interval_ms = sched.compute_interval_millis(80.0); // 80/8 = 10 Hz → 100ms
         assert_eq!(
-            interval,
-            Duration::from_millis(100),
+            interval_ms, 100,
             "bead_id={BEAD_ZCDN} interval at 10 Hz should be 100ms"
         );
     }
@@ -502,9 +511,9 @@ mod tests {
     #[test]
     fn test_gc_scheduler_should_tick_first_always_true() {
         let mut sched = GcScheduler::new();
-        let now = Instant::now();
+        let now_millis: u64 = 1000; // arbitrary starting time
         assert!(
-            sched.should_tick(1.0, now),
+            sched.should_tick(1.0, now_millis),
             "bead_id={BEAD_ZCDN} first tick should always fire"
         );
     }
@@ -512,18 +521,18 @@ mod tests {
     #[test]
     fn test_gc_scheduler_should_tick_respects_interval() {
         let mut sched = GcScheduler::new();
-        let t0 = Instant::now();
+        let t0: u64 = 1000; // arbitrary starting time in ms
         assert!(sched.should_tick(80.0, t0)); // 10 Hz → 100ms interval
 
         // 50ms later: too soon.
-        let t1 = t0 + Duration::from_millis(50);
+        let t1 = t0 + 50;
         assert!(
             !sched.should_tick(80.0, t1),
             "bead_id={BEAD_ZCDN} tick should not fire within interval"
         );
 
         // 100ms later: should fire.
-        let t2 = t0 + Duration::from_millis(100);
+        let t2 = t0 + 100;
         assert!(
             sched.should_tick(80.0, t2),
             "bead_id={BEAD_ZCDN} tick should fire after interval"
