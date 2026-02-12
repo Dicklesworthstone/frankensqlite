@@ -19,8 +19,8 @@ use fsqlite_ast::{
     LimitClause, Literal, NullsOrder, OrderingTerm, PlaceholderType, ResultColumn, SelectBody,
     SelectCore, SelectStatement, SortDirection, Span, Statement, TableOrSubquery, UnaryOp,
 };
-use fsqlite_btree::BtreeCursorOps;
 use fsqlite_btree::cursor::TransactionPageIo;
+use fsqlite_btree::BtreeCursorOps;
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_func::FunctionRegistry;
 use fsqlite_pager::traits::{MvccPager, TransactionHandle, TransactionMode};
@@ -33,15 +33,15 @@ use fsqlite_types::record::{parse_record, serialize_record};
 use fsqlite_types::value::SqliteValue;
 use fsqlite_types::{BTreePageHeader, PageNumber, PageSize};
 use fsqlite_vdbe::codegen::{
-    CodegenContext, CodegenError, ColumnInfo, IndexSchema, TableSchema, codegen_delete,
-    codegen_insert, codegen_select, codegen_update,
+    codegen_delete, codegen_insert, codegen_select, codegen_update, CodegenContext, CodegenError,
+    ColumnInfo, IndexSchema, TableSchema,
 };
 use fsqlite_vdbe::engine::{ExecOutcome, MemDatabase, MemDbVersionToken, VdbeEngine};
 use fsqlite_vdbe::{ProgramBuilder, VdbeProgram};
+use fsqlite_vfs::traits::Vfs;
 use fsqlite_vfs::MemoryVfs;
 #[cfg(unix)]
 use fsqlite_vfs::UnixVfs;
-use fsqlite_vfs::traits::Vfs;
 use fsqlite_wal::{WalFile, WalSalts};
 
 use crate::wal_adapter::WalBackendAdapter;
@@ -418,12 +418,47 @@ struct ViewDef {
     query: SelectStatement,
 }
 
+/// A stored trigger definition captured from `CREATE TRIGGER`.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // 5G.2/5G.3 will consume full trigger metadata during DML execution.
+struct TriggerDef {
+    name: String,
+    table_name: String,
+    timing: fsqlite_ast::TriggerTiming,
+    event: fsqlite_ast::TriggerEvent,
+    for_each_row: bool,
+    when_clause: Option<Expr>,
+    body: Vec<Statement>,
+    temporary: bool,
+    create_sql: String,
+}
+
+impl TriggerDef {
+    fn from_create_statement(
+        stmt: &fsqlite_ast::CreateTriggerStatement,
+        create_sql: String,
+    ) -> Self {
+        Self {
+            name: stmt.name.name.clone(),
+            table_name: stmt.table.clone(),
+            timing: stmt.timing,
+            event: stmt.event.clone(),
+            for_each_row: stmt.for_each_row,
+            when_clause: stmt.when.clone(),
+            body: stmt.body.clone(),
+            temporary: stmt.temporary,
+            create_sql,
+        }
+    }
+}
+
 /// Snapshot of the database + schema state at a point in time.
 /// Used for transaction rollback and savepoint restore.
 #[derive(Debug, Clone)]
 struct DbSnapshot {
     db_version: MemDbVersionToken,
     schema: Vec<TableSchema>,
+    triggers: Vec<TriggerDef>,
 }
 
 /// A named savepoint with its pre-state snapshot.
@@ -455,6 +490,8 @@ pub struct Connection {
     schema: RefCell<Vec<TableSchema>>,
     /// View definitions stored in-memory.
     views: RefCell<Vec<ViewDef>>,
+    /// Trigger definitions stored in-memory.
+    triggers: RefCell<Vec<TriggerDef>>,
     /// Scalar/aggregate/window function registry shared with the VDBE engine.
     func_registry: Arc<FunctionRegistry>,
     /// Whether an explicit transaction is active (BEGIN without matching COMMIT/ROLLBACK).
@@ -535,6 +572,7 @@ impl Connection {
             active_txn: RefCell::new(None),
             schema: RefCell::new(Vec::new()),
             views: RefCell::new(Vec::new()),
+            triggers: RefCell::new(Vec::new()),
             func_registry: default_function_registry(),
             in_transaction: RefCell::new(false),
             txn_snapshot: RefCell::new(None),
@@ -923,13 +961,17 @@ impl Connection {
                 self.execute_create_view(create_view)?;
                 Ok(Vec::new())
             }
+            Statement::CreateTrigger(ref create_trigger) => {
+                self.execute_create_trigger(create_trigger)?;
+                Ok(Vec::new())
+            }
             // Maintenance stubs: these are no-ops for in-memory databases but
             // accepted for SQL compatibility (applications often call them).
             Statement::Vacuum(_) | Statement::Analyze(_) | Statement::Reindex(_) => {
                 Ok(Vec::new())
             }
             _ => Err(FrankenError::NotImplemented(
-                "only SELECT, INSERT, UPDATE, DELETE, DDL (CREATE/DROP/ALTER TABLE, CREATE INDEX/VIEW), transaction control, PRAGMA, VACUUM, ANALYZE, and REINDEX are supported".to_owned(),
+                "only SELECT, INSERT, UPDATE, DELETE, DDL (CREATE/DROP/ALTER TABLE, CREATE INDEX/VIEW/TRIGGER), transaction control, PRAGMA, VACUUM, ANALYZE, and REINDEX are supported".to_owned(),
             )),
         }
     }
@@ -1777,6 +1819,50 @@ impl Connection {
         Ok(())
     }
 
+    /// Execute a CREATE TRIGGER statement.
+    fn execute_create_trigger(&self, stmt: &fsqlite_ast::CreateTriggerStatement) -> Result<()> {
+        let trigger_name = &stmt.name.name;
+        let table_name = &stmt.table;
+
+        let schema = self.schema.borrow();
+        let table_exists = schema
+            .iter()
+            .any(|t| t.name.eq_ignore_ascii_case(table_name));
+        drop(schema);
+        if !table_exists {
+            return Err(FrankenError::NoSuchTable {
+                name: table_name.clone(),
+            });
+        }
+
+        let triggers = self.triggers.borrow();
+        if triggers
+            .iter()
+            .any(|trigger| trigger.name.eq_ignore_ascii_case(trigger_name))
+        {
+            if stmt.if_not_exists {
+                return Ok(());
+            }
+            return Err(FrankenError::Internal(format!(
+                "trigger {trigger_name} already exists"
+            )));
+        }
+        drop(triggers);
+
+        let create_sql = stmt.to_string();
+        self.triggers
+            .borrow_mut()
+            .push(TriggerDef::from_create_statement(stmt, create_sql.clone()));
+
+        // TEMP triggers are connection-local and not persisted to sqlite_master.
+        if !stmt.temporary {
+            self.insert_sqlite_master_row("trigger", trigger_name, table_name, 0, &create_sql)?;
+        }
+
+        self.increment_schema_cookie();
+        Ok(())
+    }
+
     /// Check if a SELECT references any views in its FROM/JOIN sources.
     fn has_view_references(&self, select: &SelectStatement) -> bool {
         let views = self.views.borrow();
@@ -1933,6 +2019,7 @@ impl Connection {
         DbSnapshot {
             db_version,
             schema: self.schema.borrow().clone(),
+            triggers: self.triggers.borrow().clone(),
         }
     }
 
@@ -1940,6 +2027,7 @@ impl Connection {
     fn restore_snapshot(&self, snap: &DbSnapshot) {
         self.db.borrow_mut().rollback_to(snap.db_version);
         (*self.schema.borrow_mut()).clone_from(&snap.schema);
+        (*self.triggers.borrow_mut()).clone_from(&snap.triggers);
     }
 
     /// Handle BEGIN [DEFERRED|IMMEDIATE|EXCLUSIVE|CONCURRENT].
@@ -3638,6 +3726,7 @@ impl Connection {
             *self.db.borrow_mut() = MemDatabase::new();
             self.schema.borrow_mut().clear();
             self.views.borrow_mut().clear();
+            self.triggers.borrow_mut().clear();
             self.rowid_alias_columns.borrow_mut().clear();
             *self.next_master_rowid.borrow_mut() = 1;
             *self.schema_cookie.borrow_mut() = 0;
@@ -3674,6 +3763,7 @@ impl Connection {
         // Columns: type(0), name(1), tbl_name(2), rootpage(3), sql(4)
         let mut new_schema = Vec::new();
         let mut new_db = MemDatabase::new();
+        let mut new_triggers = Vec::new();
         let mut new_alias_map = HashMap::new();
 
         for entry in &master_entries {
@@ -3684,8 +3774,20 @@ impl Connection {
                 SqliteValue::Text(s) => s.as_str(),
                 _ => continue,
             };
-            if entry_type != "table" {
-                continue; // Skip indexes, views, triggers for now.
+
+            if entry_type.eq_ignore_ascii_case("trigger") {
+                let create_sql = match &entry[4] {
+                    SqliteValue::Text(s) => s.clone(),
+                    _ => continue,
+                };
+                if let Ok(Statement::CreateTrigger(stmt)) = parse_single_statement(&create_sql) {
+                    new_triggers.push(TriggerDef::from_create_statement(&stmt, create_sql));
+                }
+                continue;
+            }
+
+            if !entry_type.eq_ignore_ascii_case("table") {
+                continue; // Skip indexes/views for now.
             }
 
             let name = match &entry[1] {
@@ -3771,6 +3873,7 @@ impl Connection {
         *self.db.borrow_mut() = new_db;
         *self.schema.borrow_mut() = new_schema;
         self.views.borrow_mut().clear();
+        *self.triggers.borrow_mut() = new_triggers;
         *self.rowid_alias_columns.borrow_mut() = new_alias_map;
         #[allow(clippy::cast_possible_wrap)]
         {
@@ -7697,14 +7800,12 @@ mod tests {
         conn.execute("DROP INDEX idx_a;").unwrap();
         {
             let schema = conn.schema.borrow();
-            assert!(
-                schema
-                    .iter()
-                    .find(|t| t.name == "t")
-                    .unwrap()
-                    .indexes
-                    .is_empty()
-            );
+            assert!(schema
+                .iter()
+                .find(|t| t.name == "t")
+                .unwrap()
+                .indexes
+                .is_empty());
         }
     }
 
@@ -7754,6 +7855,95 @@ mod tests {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("DROP VIEW IF EXISTS nosuch;").unwrap();
         assert!(conn.execute("DROP VIEW nosuch;").is_err());
+    }
+
+    #[test]
+    fn test_create_trigger_basic() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER);").unwrap();
+        conn.execute(
+            "CREATE TRIGGER trg_ai AFTER INSERT ON t BEGIN INSERT INTO t VALUES (999); END;",
+        )
+        .unwrap();
+
+        let triggers = conn.triggers.borrow();
+        assert_eq!(triggers.len(), 1);
+        let trigger = &triggers[0];
+        assert_eq!(trigger.name, "trg_ai");
+        assert_eq!(trigger.table_name, "t");
+        assert_eq!(trigger.timing, fsqlite_ast::TriggerTiming::After);
+        assert!(matches!(trigger.event, fsqlite_ast::TriggerEvent::Insert));
+    }
+
+    #[test]
+    fn test_create_trigger_if_not_exists() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER);").unwrap();
+        conn.execute("CREATE TRIGGER trg_ai AFTER INSERT ON t BEGIN SELECT 1; END;")
+            .unwrap();
+        assert!(conn
+            .execute("CREATE TRIGGER trg_ai AFTER INSERT ON t BEGIN SELECT 1; END;")
+            .is_err());
+        conn.execute("CREATE TRIGGER IF NOT EXISTS trg_ai AFTER INSERT ON t BEGIN SELECT 1; END;")
+            .unwrap();
+    }
+
+    #[test]
+    fn test_create_trigger_nonexistent_table_errors() {
+        let conn = Connection::open(":memory:").unwrap();
+        let err = conn
+            .execute("CREATE TRIGGER trg_missing AFTER INSERT ON missing BEGIN SELECT 1; END;")
+            .expect_err("CREATE TRIGGER should fail when target table does not exist");
+        assert!(matches!(err, FrankenError::NoSuchTable { .. }));
+    }
+
+    #[test]
+    fn test_create_trigger_with_when_clause() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER);").unwrap();
+        conn.execute(
+            "CREATE TRIGGER trg_when BEFORE UPDATE OF id ON t FOR EACH ROW WHEN NEW.id > 0 BEGIN SELECT 1; END;",
+        )
+        .unwrap();
+
+        let triggers = conn.triggers.borrow();
+        let trigger = triggers
+            .iter()
+            .find(|trigger| trigger.name == "trg_when")
+            .unwrap();
+        assert_eq!(trigger.timing, fsqlite_ast::TriggerTiming::Before);
+        assert!(trigger.for_each_row);
+        assert!(trigger.when_clause.is_some());
+        match &trigger.event {
+            fsqlite_ast::TriggerEvent::Update(cols) => assert_eq!(cols, &vec!["id".to_owned()]),
+            other => panic!("expected UPDATE trigger event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_create_trigger_persists_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trigger_round_trip.db");
+        let path_str = path.to_string_lossy().into_owned();
+
+        {
+            let conn = Connection::open(&path_str).unwrap();
+            conn.execute("CREATE TABLE t (id INTEGER);").unwrap();
+            conn.execute("CREATE TRIGGER trg_rt AFTER INSERT ON t BEGIN SELECT 1; END;")
+                .unwrap();
+            conn.close().unwrap();
+        }
+
+        {
+            let conn = Connection::open(&path_str).unwrap();
+            let triggers = conn.triggers.borrow();
+            assert!(
+                triggers
+                    .iter()
+                    .any(|trigger| trigger.name.eq_ignore_ascii_case("trg_rt")),
+                "trigger should reload from sqlite_master on reopen"
+            );
+        }
     }
 
     #[test]
@@ -12492,11 +12682,11 @@ mod transaction_lifecycle_tests {
 #[cfg(test)]
 mod sqlite_master_btree_tests {
     use super::*;
-    use fsqlite_btree::BtreeCursorOps;
     use fsqlite_btree::cursor::TransactionPageIo;
+    use fsqlite_btree::BtreeCursorOps;
     use fsqlite_pager::traits::TransactionMode;
-    use fsqlite_types::PageNumber;
     use fsqlite_types::record::parse_record;
+    use fsqlite_types::PageNumber;
 
     /// Helper: read all sqlite_master rows from the page 1 B-tree.
     /// Returns Vec<(rowid, Vec<SqliteValue>)>.
@@ -12705,8 +12895,8 @@ mod sqlite_master_btree_tests {
 #[cfg(test)]
 mod root_page_allocation_tests {
     use super::*;
-    use fsqlite_btree::BtreeCursorOps;
     use fsqlite_btree::cursor::TransactionPageIo;
+    use fsqlite_btree::BtreeCursorOps;
     use fsqlite_pager::traits::TransactionMode;
 
     #[test]
