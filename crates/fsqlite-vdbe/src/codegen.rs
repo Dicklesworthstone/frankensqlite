@@ -1915,7 +1915,7 @@ pub fn codegen_insert(
     ctx: &CodegenContext,
 ) -> Result<(), CodegenError> {
     let table = find_table(schema, &stmt.table.name)?;
-    let cursor = 0_i32;
+    let table_cursor = 0_i32;
 
     let end_label = b.emit_label();
 
@@ -1925,15 +1925,29 @@ pub fn codegen_insert(
     // Transaction (write, p2=1).
     b.emit_op(Opcode::Transaction, 0, 1, 0, P4::None, 0);
 
-    // OpenWrite.
+    // OpenWrite for table.
     b.emit_op(
         Opcode::OpenWrite,
-        cursor,
+        table_cursor,
         table.root_page,
         0,
         P4::Table(table.name.clone()),
         0,
     );
+
+    // OpenWrite for each index (bd-so1h: Phase 5I.3).
+    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+    for (idx_offset, index) in table.indexes.iter().enumerate() {
+        let idx_cursor = table_cursor + 1 + idx_offset as i32;
+        b.emit_op(
+            Opcode::OpenWrite,
+            idx_cursor,
+            index.root_page,
+            0,
+            P4::Table(index.name.clone()),
+            0,
+        );
+    }
 
     match &stmt.source {
         InsertSource::Values(rows) => {
@@ -1946,7 +1960,7 @@ pub fn codegen_insert(
             // unmentioned columns with NULL.  This ensures MakeRecord always
             // packs fields in the order the table schema expects.
             if stmt.columns.is_empty() {
-                codegen_insert_values(b, rows, cursor, table, &stmt.returning, ctx)?;
+                codegen_insert_values(b, rows, table_cursor, table, &stmt.returning, ctx)?;
             } else {
                 let col_map = build_column_map(&stmt.columns, table)?;
                 let n_table_cols = table.columns.len();
@@ -1963,7 +1977,7 @@ pub fn codegen_insert(
                         table_order
                     })
                     .collect();
-                codegen_insert_values(b, &reordered, cursor, table, &stmt.returning, ctx)?;
+                codegen_insert_values(b, &reordered, table_cursor, table, &stmt.returning, ctx)?;
             }
         }
         InsertSource::Select(select_stmt) => {
@@ -1988,7 +2002,7 @@ pub fn codegen_insert(
             codegen_insert_select(
                 b,
                 select_stmt,
-                cursor,
+                table_cursor,
                 table,
                 schema,
                 &stmt.returning,
@@ -2007,7 +2021,7 @@ pub fn codegen_insert(
             let rowid_reg = b.alloc_reg();
             b.emit_op(
                 Opcode::NewRowid,
-                cursor,
+                table_cursor,
                 rowid_reg,
                 concurrent_flag,
                 P4::None,
@@ -2029,20 +2043,32 @@ pub fn codegen_insert(
             );
             b.emit_op(
                 Opcode::Insert,
-                cursor,
+                table_cursor,
                 rec_reg,
                 rowid_reg,
                 P4::Table(table.name.clone()),
                 0,
             );
+
+            // Index maintenance: insert into each index (bd-so1h).
+            emit_index_inserts(b, table, table_cursor, col_regs, rowid_reg);
+
             if !stmt.returning.is_empty() {
-                emit_returning(b, cursor, table, &stmt.returning, rowid_reg)?;
+                emit_returning(b, table_cursor, table, &stmt.returning, rowid_reg)?;
             }
         }
     }
 
-    // Close + Halt.
-    b.emit_op(Opcode::Close, cursor, 0, 0, P4::None, 0);
+    // Close table cursor.
+    b.emit_op(Opcode::Close, table_cursor, 0, 0, P4::None, 0);
+
+    // Close index cursors (bd-so1h).
+    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+    for idx_offset in 0..table.indexes.len() {
+        let idx_cursor = table_cursor + 1 + idx_offset as i32;
+        b.emit_op(Opcode::Close, idx_cursor, 0, 0, P4::None, 0);
+    }
+
     b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
 
     // End label.
@@ -2145,6 +2171,9 @@ fn codegen_insert_values(
             P4::Table(table.name.clone()),
             0,
         );
+
+        // Index maintenance: insert into each index (bd-so1h).
+        emit_index_inserts(b, table, cursor, val_regs, rowid_reg);
 
         // RETURNING clause: position cursor on inserted row and read columns.
         if !returning.is_empty() {
@@ -2419,19 +2448,34 @@ pub fn codegen_update(
         })
         .collect::<Result<Vec<_>, _>>()?;
 
-    // OpenWrite.
+    // OpenWrite for table.
+    let table_cursor = cursor;
     b.emit_op(
         Opcode::OpenWrite,
-        cursor,
+        table_cursor,
         table.root_page,
         0,
         P4::Table(table.name.clone()),
         0,
     );
 
+    // OpenWrite for each index (bd-2f9t: Phase 5I.5).
+    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+    for (idx_offset, index) in table.indexes.iter().enumerate() {
+        let idx_cursor = table_cursor + 1 + idx_offset as i32;
+        b.emit_op(
+            Opcode::OpenWrite,
+            idx_cursor,
+            index.root_page,
+            0,
+            P4::Table(index.name.clone()),
+            0,
+        );
+    }
+
     // Full table scan: Rewind → loop body → Next.
     let loop_start = b.current_addr();
-    b.emit_jump_to_label(Opcode::Rewind, cursor, 0, done_label, P4::None, 0);
+    b.emit_jump_to_label(Opcode::Rewind, table_cursor, 0, done_label, P4::None, 0);
 
     // Evaluate WHERE condition (if any) and skip non-matching rows.
     let skip_label = b.emit_label();
@@ -2439,7 +2483,7 @@ pub fn codegen_update(
         emit_where_filter(
             b,
             where_expr,
-            cursor,
+            table_cursor,
             table,
             stmt.table.alias.as_deref(),
             schema,
@@ -2454,7 +2498,7 @@ pub fn codegen_update(
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
         b.emit_op(
             Opcode::Column,
-            cursor,
+            table_cursor,
             i as i32,
             col_regs + i as i32,
             P4::None,
@@ -2462,11 +2506,15 @@ pub fn codegen_update(
         );
     }
 
+    // Index maintenance (bd-2f9t): Delete OLD index entries BEFORE updating values.
+    // col_regs currently contains OLD column values.
+    emit_index_deletes(b, table, table_cursor);
+
     // Evaluate new values from AST expressions and overwrite changed columns.
     // A ScanCtx is required so that column references in SET expressions
     // (e.g., `SET val = val + 5`) resolve to the cursor's current row.
     let update_ctx = ScanCtx {
-        cursor,
+        cursor: table_cursor,
         table,
         table_alias: stmt.table.alias.as_deref(),
         schema: Some(schema),
@@ -2484,11 +2532,11 @@ pub fn codegen_update(
 
     // Get the current rowid before deleting the old row.
     let old_rowid_reg = b.alloc_reg();
-    b.emit_op(Opcode::Rowid, cursor, old_rowid_reg, 0, P4::None, 0);
+    b.emit_op(Opcode::Rowid, table_cursor, old_rowid_reg, 0, P4::None, 0);
 
     // UPDATE is delete+insert: remove the current row first, then insert the
     // rewritten record (possibly at a new rowid).
-    b.emit_op(Opcode::Delete, cursor, 0, 0, P4::None, 0);
+    b.emit_op(Opcode::Delete, table_cursor, 0, 0, P4::None, 0);
 
     // Determine destination rowid for re-insertion.
     let mut rowid_reg = old_rowid_reg;
@@ -2499,7 +2547,7 @@ pub fn codegen_update(
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
         let ipk_reg = col_regs + ipk_idx as i32;
         let auto_label = b.emit_label();
-        let done_label = b.emit_label();
+        let rowid_done_label = b.emit_label();
         let concurrent_flag = i32::from(ctx.concurrent_mode);
 
         rowid_reg = b.alloc_reg();
@@ -2507,12 +2555,12 @@ pub fn codegen_update(
         // If the rewritten IPK is NULL, allocate a new rowid.
         b.emit_jump_to_label(Opcode::IsNull, ipk_reg, 0, auto_label, P4::None, 0);
         b.emit_op(Opcode::Copy, ipk_reg, rowid_reg, 0, P4::None, 0);
-        b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+        b.emit_jump_to_label(Opcode::Goto, 0, 0, rowid_done_label, P4::None, 0);
 
         b.resolve_label(auto_label);
         b.emit_op(
             Opcode::NewRowid,
-            cursor,
+            table_cursor,
             rowid_reg,
             concurrent_flag,
             P4::None,
@@ -2520,7 +2568,7 @@ pub fn codegen_update(
         );
         // Keep the IPK payload column consistent with the chosen rowid.
         b.emit_op(Opcode::Copy, rowid_reg, ipk_reg, 0, P4::None, 0);
-        b.resolve_label(done_label);
+        b.resolve_label(rowid_done_label);
     }
 
     // MakeRecord with ALL columns.
@@ -2539,16 +2587,20 @@ pub fn codegen_update(
     // Insert with REPLACE flag (p5=0x08 in C SQLite, we use 0x08).
     b.emit_op(
         Opcode::Insert,
-        cursor,
+        table_cursor,
         rec_reg,
         rowid_reg,
         P4::Table(table.name.clone()),
         0x08, // OPFLAG_ISUPDATE
     );
 
+    // Index maintenance (bd-2f9t): Insert NEW index entries after table insert.
+    // col_regs now contains NEW column values.
+    emit_index_inserts(b, table, table_cursor, col_regs, rowid_reg);
+
     // RETURNING clause: position cursor on updated row and read columns.
     if !stmt.returning.is_empty() {
-        emit_returning(b, cursor, table, &stmt.returning, rowid_reg)?;
+        emit_returning(b, table_cursor, table, &stmt.returning, rowid_reg)?;
     }
 
     // Skip label for WHERE-filtered rows.
@@ -2557,11 +2609,16 @@ pub fn codegen_update(
     // Next: jump back to loop body.
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     let loop_body = (loop_start + 1) as i32;
-    b.emit_op(Opcode::Next, cursor, loop_body, 0, P4::None, 0);
+    b.emit_op(Opcode::Next, table_cursor, loop_body, 0, P4::None, 0);
 
-    // Done: Close + Halt.
+    // Done: Close index cursors, then table cursor.
     b.resolve_label(done_label);
-    b.emit_op(Opcode::Close, cursor, 0, 0, P4::None, 0);
+    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+    for idx_offset in 0..table.indexes.len() {
+        let idx_cursor = table_cursor + 1 + idx_offset as i32;
+        b.emit_op(Opcode::Close, idx_cursor, 0, 0, P4::None, 0);
+    }
+    b.emit_op(Opcode::Close, table_cursor, 0, 0, P4::None, 0);
     b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
 
     // End label.
@@ -2589,7 +2646,7 @@ pub fn codegen_delete(
 ) -> Result<(), CodegenError> {
     let table_name = table_name_from_qualified(&stmt.table);
     let table = find_table(schema, table_name)?;
-    let cursor = 0_i32;
+    let table_cursor = 0_i32;
 
     let end_label = b.emit_label();
     let done_label = b.emit_label();
@@ -2608,20 +2665,34 @@ pub fn codegen_delete(
     // Transaction (write).
     b.emit_op(Opcode::Transaction, 0, 1, 0, P4::None, 0);
 
-    // OpenWrite.
+    // OpenWrite for table.
     b.emit_op(
         Opcode::OpenWrite,
-        cursor,
+        table_cursor,
         table.root_page,
         0,
         P4::Table(table.name.clone()),
         0,
     );
 
+    // OpenWrite for each index (bd-34se: Phase 5I.4).
+    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+    for (idx_offset, index) in table.indexes.iter().enumerate() {
+        let idx_cursor = table_cursor + 1 + idx_offset as i32;
+        b.emit_op(
+            Opcode::OpenWrite,
+            idx_cursor,
+            index.root_page,
+            0,
+            P4::Table(index.name.clone()),
+            0,
+        );
+    }
+
     // Reverse scan (Last/Prev) so that delete_at(pos) does not shift
     // indices of rows we haven't visited yet.
     let loop_start = b.current_addr();
-    b.emit_jump_to_label(Opcode::Last, cursor, 0, done_label, P4::None, 0);
+    b.emit_jump_to_label(Opcode::Last, table_cursor, 0, done_label, P4::None, 0);
 
     // Evaluate WHERE condition (if any) and skip non-matching rows.
     let skip_label = b.emit_label();
@@ -2629,7 +2700,7 @@ pub fn codegen_delete(
         emit_where_filter(
             b,
             where_expr,
-            cursor,
+            table_cursor,
             table,
             stmt.table.alias.as_deref(),
             schema,
@@ -2641,14 +2712,18 @@ pub fn codegen_delete(
     if !stmt.returning.is_empty() {
         let ret_count = result_column_count(&stmt.returning, table);
         let ret_regs = b.alloc_regs(ret_count);
-        emit_column_reads(b, cursor, &stmt.returning, table, None, &[], ret_regs)?;
+        emit_column_reads(b, table_cursor, &stmt.returning, table, None, &[], ret_regs)?;
         b.emit_op(Opcode::ResultRow, ret_regs, ret_count, 0, P4::None, 0);
     }
+
+    // Index maintenance: delete from each index before deleting the row (bd-34se).
+    // Must read column values while the row is still present.
+    emit_index_deletes(b, table, table_cursor);
 
     // Delete at cursor position.
     b.emit_op(
         Opcode::Delete,
-        cursor,
+        table_cursor,
         0,
         0,
         P4::Table(table.name.clone()),
@@ -2661,11 +2736,19 @@ pub fn codegen_delete(
     // Prev: iterate backwards to avoid index-shift issues.
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     let loop_body = (loop_start + 1) as i32;
-    b.emit_op(Opcode::Prev, cursor, loop_body, 0, P4::None, 0);
+    b.emit_op(Opcode::Prev, table_cursor, loop_body, 0, P4::None, 0);
 
-    // Done: Close + Halt.
+    // Done: Close table cursor.
     b.resolve_label(done_label);
-    b.emit_op(Opcode::Close, cursor, 0, 0, P4::None, 0);
+    b.emit_op(Opcode::Close, table_cursor, 0, 0, P4::None, 0);
+
+    // Close index cursors (bd-34se).
+    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+    for idx_offset in 0..table.indexes.len() {
+        let idx_cursor = table_cursor + 1 + idx_offset as i32;
+        b.emit_op(Opcode::Close, idx_cursor, 0, 0, P4::None, 0);
+    }
+
     b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
 
     // End label.
@@ -2677,6 +2760,128 @@ pub fn codegen_delete(
 // ---------------------------------------------------------------------------
 // Helper functions
 // ---------------------------------------------------------------------------
+
+/// Emit `IdxInsert` opcodes for all indexes on the table (bd-so1h: Phase 5I.3).
+///
+/// For each index, this reads the indexed column values from the provided
+/// registers, appends the rowid, builds an index key record, and inserts it.
+///
+/// # Arguments
+/// * `b` - Program builder
+/// * `table` - Table schema (includes index definitions)
+/// * `table_cursor` - Cursor ID for the table (index cursors are table_cursor + 1, +2, etc.)
+/// * `col_regs` - Starting register containing column values in table schema order
+/// * `rowid_reg` - Register containing the rowid
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+fn emit_index_inserts(
+    b: &mut ProgramBuilder,
+    table: &TableSchema,
+    table_cursor: i32,
+    col_regs: i32,
+    rowid_reg: i32,
+) {
+    for (idx_offset, index) in table.indexes.iter().enumerate() {
+        let idx_cursor = table_cursor + 1 + idx_offset as i32;
+        let n_idx_cols = index.columns.len();
+
+        // Allocate registers for index key: (indexed_cols..., rowid).
+        let idx_key_regs = b.alloc_regs((n_idx_cols + 1) as i32);
+
+        // Copy indexed column values to key registers.
+        for (key_pos, col_name) in index.columns.iter().enumerate() {
+            // Find column position in table schema.
+            if let Some(col_idx) = table.column_index(col_name) {
+                let src_reg = col_regs + col_idx as i32;
+                let dst_reg = idx_key_regs + key_pos as i32;
+                b.emit_op(Opcode::Copy, src_reg, dst_reg, 0, P4::None, 0);
+            }
+        }
+
+        // Append rowid as the final key component.
+        let rowid_key_reg = idx_key_regs + n_idx_cols as i32;
+        b.emit_op(Opcode::Copy, rowid_reg, rowid_key_reg, 0, P4::None, 0);
+
+        // Build the index key record.
+        let idx_rec_reg = b.alloc_reg();
+        b.emit_op(
+            Opcode::MakeRecord,
+            idx_key_regs,
+            (n_idx_cols + 1) as i32,
+            idx_rec_reg,
+            P4::None,
+            0,
+        );
+
+        // Insert into the index.
+        b.emit_op(
+            Opcode::IdxInsert,
+            idx_cursor,
+            idx_rec_reg,
+            0,
+            P4::Table(index.name.clone()),
+            0,
+        );
+    }
+}
+
+/// Emit `IdxDelete` opcodes for all indexes on the table (bd-34se: Phase 5I.4).
+///
+/// For each index, this reads the indexed column values from the cursor,
+/// reads the rowid, builds an index key record, and deletes it.
+/// MUST be called BEFORE the table row is deleted, while data is still accessible.
+///
+/// # Arguments
+/// * `b` - Program builder
+/// * `table` - Table schema (includes index definitions)
+/// * `table_cursor` - Cursor ID for the table (index cursors are table_cursor + 1, +2, etc.)
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+fn emit_index_deletes(b: &mut ProgramBuilder, table: &TableSchema, table_cursor: i32) {
+    for (idx_offset, index) in table.indexes.iter().enumerate() {
+        let idx_cursor = table_cursor + 1 + idx_offset as i32;
+        let n_idx_cols = index.columns.len();
+
+        // Allocate registers for index key: (indexed_cols..., rowid).
+        let idx_key_regs = b.alloc_regs((n_idx_cols + 1) as i32);
+
+        // Read indexed column values from the cursor.
+        for (key_pos, col_name) in index.columns.iter().enumerate() {
+            if let Some(col_idx) = table.column_index(col_name) {
+                let dst_reg = idx_key_regs + key_pos as i32;
+                // Check if this column is the INTEGER PRIMARY KEY (rowid alias).
+                if table.columns.get(col_idx).is_some_and(|c| c.is_ipk) {
+                    b.emit_op(Opcode::Rowid, table_cursor, dst_reg, 0, P4::None, 0);
+                } else {
+                    b.emit_op(Opcode::Column, table_cursor, col_idx as i32, dst_reg, P4::None, 0);
+                }
+            }
+        }
+
+        // Read rowid and append as the final key component.
+        let rowid_key_reg = idx_key_regs + n_idx_cols as i32;
+        b.emit_op(Opcode::Rowid, table_cursor, rowid_key_reg, 0, P4::None, 0);
+
+        // Build the index key record.
+        let idx_rec_reg = b.alloc_reg();
+        b.emit_op(
+            Opcode::MakeRecord,
+            idx_key_regs,
+            (n_idx_cols + 1) as i32,
+            idx_rec_reg,
+            P4::None,
+            0,
+        );
+
+        // Delete from the index.
+        b.emit_op(
+            Opcode::IdxDelete,
+            idx_cursor,
+            idx_rec_reg,
+            0,
+            P4::Table(index.name.clone()),
+            0,
+        );
+    }
+}
 
 /// Count result columns (handling `SELECT *`).
 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
