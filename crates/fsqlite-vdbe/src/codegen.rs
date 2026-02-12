@@ -3969,9 +3969,8 @@ fn try_emit_complex_in_subquery(
         return false;
     }
 
-    let from_clause = match from.as_ref() {
-        Some(f) => f,
-        None => return false,
+    let Some(from_clause) = from.as_ref() else {
+        return false;
     };
 
     // Reject JOINs.
@@ -3984,9 +3983,8 @@ fn try_emit_complex_in_subquery(
         _ => return false,
     };
 
-    let table = match find_table(schema, table_name) {
-        Ok(t) => t,
-        Err(_) => return false,
+    let Ok(table) = find_table(schema, table_name) else {
+        return false;
     };
 
     // Determine the value expression to compare.
@@ -4130,7 +4128,7 @@ fn try_emit_complex_in_subquery(
         // Emit value column (last column in sorter record).
         let value_reg = sorter_base + num_sort_keys as i32;
         match value_expr {
-            Some(expr) => emit_expr(b, &expr, value_reg, Some(&subq_scan)),
+            Some(expr) => emit_expr(b, expr, value_reg, Some(&subq_scan)),
             None => {
                 // First column.
                 b.emit_op(Opcode::Column, subq_cursor, 0, value_reg, P4::None, 0);
@@ -4235,9 +4233,6 @@ fn try_emit_complex_in_subquery(
             P4::None,
             0,
         );
-
-        // Fall through to no_match.
-        b.emit_jump_to_label(Opcode::Goto, 0, 0, no_match_label, P4::None, 0);
     } else {
         // No ORDER BY, no LIMIT: simple scan probe (should have been handled
         // by resolve_in_probe_source, but handle here as fallback).
@@ -4288,8 +4283,10 @@ fn try_emit_complex_in_subquery(
         b.emit_op(Opcode::Next, subq_cursor, loop_body, 0, P4::None, 0);
 
         b.free_temp(r_probe);
-        b.emit_jump_to_label(Opcode::Goto, 0, 0, no_match_label, P4::None, 0);
     }
+
+    // Fall through to no_match (common to both paths).
+    b.emit_jump_to_label(Opcode::Goto, 0, 0, no_match_label, P4::None, 0);
 
     // --- Result emission (shared by both paths) ---
 
