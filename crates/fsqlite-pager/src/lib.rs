@@ -18,8 +18,8 @@ pub use journal::{
 };
 pub use page_buf::{PageBuf, PageBufPool};
 pub use page_cache::PageCache;
-pub use pager::{SimplePager, SimpleTransaction};
+pub use pager::{SimplePager, SimplePagerCheckpointWriter, SimpleTransaction};
 pub use traits::{
-    CheckpointPageWriter, JournalMode, MockCheckpointPageWriter, MockMvccPager, MockTransaction,
-    MvccPager, TransactionHandle, TransactionMode, WalBackend,
+    CheckpointMode, CheckpointPageWriter, CheckpointResult, JournalMode, MockCheckpointPageWriter,
+    MockMvccPager, MockTransaction, MvccPager, TransactionHandle, TransactionMode, WalBackend,
 };

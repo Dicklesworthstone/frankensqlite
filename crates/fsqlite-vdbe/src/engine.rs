@@ -1369,19 +1369,17 @@ impl VdbeEngine {
                 // ── Cursor operations ─────────────────────────────────
                 Opcode::OpenRead => {
                     // Phase 5C.1 (bd-35my): ALWAYS route reads through
-                    // StorageCursor (pager-backed B-tree). The read path
-                    // opens a cursor on existing page data without
-                    // reinitializing the root page.
+                    // StorageCursor (pager-backed B-tree). OpenRead no longer
+                    // falls back to MemCursor; failing to open a storage
+                    // cursor is an execution error.
                     let cursor_id = op.p1;
                     let root_page = op.p2;
                     if self.open_storage_cursor(cursor_id, root_page, false) {
                         self.cursors.remove(&cursor_id);
                     } else {
-                        // Fallback to MemCursor when storage cursors are
-                        // disabled (e.g. older tests without txn_page_io).
-                        self.storage_cursors.remove(&cursor_id);
-                        self.cursors
-                            .insert(cursor_id, MemCursor::new(root_page, false));
+                        return Err(FrankenError::Internal(format!(
+                            "OpenRead failed to open storage cursor for root page {root_page}",
+                        )));
                     }
                     pc += 1;
                 }
@@ -2504,46 +2502,54 @@ impl VdbeEngine {
             return false;
         };
 
-        // Phase 5 (bd-2a3y): prefer real pager transaction when available.
+        // Phase 5C.1 (bd-35my): Route through pager when available, UNLESS
+        // this is an ephemeral table that only exists in MemDatabase (not
+        // backed by pager pages). Ephemeral tables are created by
+        // OpenEphemeral and have uninitialized pager pages (0x00 type flag).
         if let Some(ref page_io) = self.txn_page_io {
             let cx = Cx::new();
+            // Check if the page has valid B-tree header (type byte != 0x00).
+            // Real tables have initialized pages; ephemeral tables don't.
+            let page_data = page_io.read_page(&cx, root_pgno).ok();
+            let is_valid_btree = page_data
+                .as_ref()
+                .is_some_and(|p| !p.is_empty() && p[0] != 0x00);
 
-            // Phase 5B.2 (bd-1yi8): open cursor on the EXISTING B-tree
-            // page data for BOTH reads and writes. The pager is the
-            // source of truth — do NOT reinitialize the root page or
-            // hydrate from MemTable.  Prior transactions' committed
-            // data is visible via the pager's cache/VFS.
-            let cursor = BtCursor::new(page_io.clone(), root_pgno, PAGE_SIZE, writable);
-            self.storage_cursors.insert(
-                cursor_id,
-                StorageCursor {
-                    cursor: CursorBackend::Txn(cursor),
-                    cx,
-                    writable,
-                    root_page,
-                    last_alloc_rowid: 0,
-                },
-            );
-            return true;
+            if is_valid_btree {
+                // Real table backed by pager: open cursor on EXISTING page data.
+                let cursor = BtCursor::new(page_io.clone(), root_pgno, PAGE_SIZE, true);
+                self.storage_cursors.insert(
+                    cursor_id,
+                    StorageCursor {
+                        cursor: CursorBackend::Txn(cursor),
+                        cx,
+                        writable,
+                        last_alloc_rowid: 0,
+                    },
+                );
+                return true;
+            }
+            // Fall through to MemPageStore for ephemeral/uninitialized tables.
         }
 
-        // Fallback: build a transient B-tree snapshot from MemTable rows
-        // (Phase 4 path, used by tests without a real pager).
-        let Some(db) = self.db.as_ref() else {
-            return false;
-        };
-        let Some(table) = db.get_table(root_page) else {
-            return false;
-        };
-
+        // Fallback: build a transient B-tree snapshot (Phase 4 path used by
+        // tests without a real pager). For read-only opens we allow missing
+        // MemDatabase tables and expose an empty table view.
         let store = MemPageStore::with_empty_table(root_pgno, PAGE_SIZE);
         let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, root_pgno, PAGE_SIZE, true);
-
-        for row in &table.rows {
-            let payload = encode_record(&row.values);
-            if cursor.table_insert(&cx, row.rowid, &payload).is_err() {
+        let mut cursor = BtCursor::new(store, root_pgno, PAGE_SIZE, writable);
+        {
+            let maybe_table = self.db.as_ref().and_then(|db| db.get_table(root_page));
+            if writable && maybe_table.is_none() {
                 return false;
+            }
+            if let Some(table) = maybe_table {
+                for row in &table.rows {
+                    let payload = encode_record(&row.values);
+                    if cursor.table_insert(&cx, row.rowid, &payload).is_err() {
+                        return false;
+                    }
+                }
             }
         }
 
@@ -5654,6 +5660,36 @@ mod tests {
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0], vec![SqliteValue::Integer(42)]);
+    }
+
+    #[test]
+    fn test_openread_errors_when_storage_cursors_disabled() {
+        let mut db = MemDatabase::new();
+        let root = db.create_table(1);
+        if let Some(table) = db.get_table_mut(root) {
+            table.insert(1, vec![SqliteValue::Integer(7)]);
+        }
+
+        let mut b = ProgramBuilder::new();
+        let end = b.emit_label();
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+        b.emit_op(Opcode::OpenRead, 0, root, 0, P4::Int(1), 0);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end);
+        let prog = b.finish().expect("program should build");
+
+        let mut engine = VdbeEngine::new(prog.register_count());
+        engine.set_database(db);
+        engine.enable_storage_read_cursors(false);
+
+        let err = engine
+            .execute(&prog)
+            .expect_err("OpenRead should fail without storage cursors");
+        assert!(matches!(
+            err,
+            FrankenError::Internal(message)
+                if message.contains("OpenRead failed to open storage cursor")
+        ));
     }
 
     // ── bd-3iw8 / bd-25c6: Storage cursor WRITE path tests ────────────

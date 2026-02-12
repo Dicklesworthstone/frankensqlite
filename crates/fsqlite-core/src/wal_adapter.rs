@@ -9,12 +9,15 @@
 //!   WAL executor's [`CheckpointTarget`] trait (WAL → pager direction).
 
 use fsqlite_error::Result;
-use fsqlite_pager::{CheckpointPageWriter, WalBackend};
+use fsqlite_pager::{CheckpointMode, CheckpointPageWriter, CheckpointResult, WalBackend};
 use fsqlite_types::PageNumber;
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::SyncFlags;
 use fsqlite_vfs::VfsFile;
-use fsqlite_wal::{CheckpointTarget, WalFile};
+use fsqlite_wal::{
+    CheckpointMode as WalCheckpointMode, CheckpointState, CheckpointTarget, WalFile,
+    execute_checkpoint,
+};
 use tracing::debug;
 
 // ---------------------------------------------------------------------------
@@ -55,6 +58,16 @@ impl<F: VfsFile> WalBackendAdapter<F> {
     }
 }
 
+/// Convert pager checkpoint mode to WAL checkpoint mode.
+fn to_wal_mode(mode: CheckpointMode) -> WalCheckpointMode {
+    match mode {
+        CheckpointMode::Passive => WalCheckpointMode::Passive,
+        CheckpointMode::Full => WalCheckpointMode::Full,
+        CheckpointMode::Restart => WalCheckpointMode::Restart,
+        CheckpointMode::Truncate => WalCheckpointMode::Truncate,
+    }
+}
+
 impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
     fn append_frame(
         &mut self,
@@ -92,6 +105,59 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
 
     fn frame_count(&self) -> usize {
         self.wal.frame_count()
+    }
+
+    fn checkpoint(
+        &mut self,
+        cx: &Cx,
+        mode: CheckpointMode,
+        writer: &mut dyn CheckpointPageWriter,
+        backfilled_frames: u32,
+        oldest_reader_frame: Option<u32>,
+    ) -> Result<CheckpointResult> {
+        let total_frames = u32::try_from(self.wal.frame_count()).unwrap_or(u32::MAX);
+
+        // Build checkpoint state for the planner.
+        let state = CheckpointState {
+            total_frames,
+            backfilled_frames,
+            oldest_reader_frame,
+        };
+
+        // Wrap the CheckpointPageWriter in a CheckpointTargetAdapter.
+        let mut target = CheckpointTargetAdapterRef { writer };
+
+        // Execute the checkpoint.
+        let result = execute_checkpoint(cx, &mut self.wal, to_wal_mode(mode), state, &mut target)?;
+
+        Ok(CheckpointResult {
+            total_frames,
+            frames_backfilled: result.frames_backfilled,
+            completed: result.plan.completes_checkpoint(),
+            wal_was_reset: result.wal_was_reset,
+        })
+    }
+}
+
+/// Adapter wrapping a `&mut dyn CheckpointPageWriter` to implement `CheckpointTarget`.
+///
+/// This is used internally by `WalBackendAdapter::checkpoint` to bridge the
+/// pager's writer to the WAL executor's target trait.
+struct CheckpointTargetAdapterRef<'a> {
+    writer: &'a mut dyn CheckpointPageWriter,
+}
+
+impl CheckpointTarget for CheckpointTargetAdapterRef<'_> {
+    fn write_page(&mut self, cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()> {
+        self.writer.write_page(cx, page_no, data)
+    }
+
+    fn truncate_db(&mut self, cx: &Cx, n_pages: u32) -> Result<()> {
+        self.writer.truncate(cx, n_pages)
+    }
+
+    fn sync_db(&mut self, cx: &Cx) -> Result<()> {
+        self.writer.sync(cx)
     }
 }
 

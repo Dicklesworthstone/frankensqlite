@@ -56,6 +56,42 @@ pub enum JournalMode {
 // WAL backend trait (open, for `fsqlite-core` adapter)
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Checkpoint mode (mirrors fsqlite-wal::CheckpointMode without adding a dep)
+// ---------------------------------------------------------------------------
+
+/// Checkpoint mode for WAL checkpointing.
+///
+/// This mirrors `fsqlite_wal::CheckpointMode` but is defined here to avoid
+/// a circular dependency between `fsqlite-pager` and `fsqlite-wal`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CheckpointMode {
+    /// PASSIVE: Checkpoint as many frames as possible without blocking.
+    /// Does not wait for readers or acquire a write lock.
+    #[default]
+    Passive,
+    /// FULL: Checkpoint all frames, waiting for readers if necessary.
+    /// Does not reset the WAL.
+    Full,
+    /// RESTART: Like FULL, but also resets the WAL after completion.
+    Restart,
+    /// TRUNCATE: Like RESTART, but also truncates the WAL file to zero.
+    Truncate,
+}
+
+/// Result of a checkpoint operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckpointResult {
+    /// Number of frames in the WAL before the checkpoint.
+    pub total_frames: u32,
+    /// Number of frames actually transferred to the database.
+    pub frames_backfilled: u32,
+    /// Whether the checkpoint completed (all frames transferred).
+    pub completed: bool,
+    /// Whether the WAL was reset after the checkpoint.
+    pub wal_was_reset: bool,
+}
+
 /// Backend interface for WAL operations consumed by the pager.
 ///
 /// This trait breaks the `pager ↔ wal` circular dependency: it is defined
@@ -90,6 +126,31 @@ pub trait WalBackend: Send {
 
     /// Number of valid frames currently in the WAL.
     fn frame_count(&self) -> usize;
+
+    /// Run a checkpoint to transfer frames from the WAL to the database.
+    ///
+    /// Takes a `CheckpointPageWriter` that handles the actual page writes
+    /// to the database file. The writer is typically provided by the pager.
+    ///
+    /// # Arguments
+    ///
+    /// * `cx` - Cancellation/deadline context
+    /// * `mode` - Checkpoint mode (Passive, Full, Restart, Truncate)
+    /// * `writer` - Writer to transfer pages to the database file
+    /// * `backfilled_frames` - Number of frames already backfilled (for resume)
+    /// * `oldest_reader_frame` - Frame index of oldest active reader (None if no readers)
+    ///
+    /// # Returns
+    ///
+    /// A `CheckpointResult` describing what was accomplished.
+    fn checkpoint(
+        &mut self,
+        cx: &Cx,
+        mode: CheckpointMode,
+        writer: &mut dyn CheckpointPageWriter,
+        backfilled_frames: u32,
+        oldest_reader_frame: Option<u32>,
+    ) -> Result<CheckpointResult>;
 }
 
 // ---------------------------------------------------------------------------
@@ -113,6 +174,13 @@ pub enum TransactionMode {
     /// Exclusive: like Immediate but also prevents new readers from
     /// starting. Used for schema changes and `VACUUM`.
     Exclusive,
+    /// Concurrent: `BEGIN CONCURRENT` mode.
+    ///
+    /// This is the MVCC concurrent-writer entry point from the SQL layer.
+    /// Pager implementations may initially map it to deferred semantics,
+    /// but must preserve the mode so upper layers can engage concurrent
+    /// conflict detection/commit paths.
+    Concurrent,
     /// Read-only: the transaction will never write. The pager can skip
     /// SSI bookkeeping and use a lightweight snapshot.
     ReadOnly,

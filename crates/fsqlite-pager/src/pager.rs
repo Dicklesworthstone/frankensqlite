@@ -23,7 +23,7 @@ use crate::page_cache::PageCache;
 use crate::traits::{self, JournalMode, MvccPager, TransactionHandle, TransactionMode, WalBackend};
 
 /// The inner mutable pager state protected by a mutex.
-struct PagerInner<F: VfsFile> {
+pub(crate) struct PagerInner<F: VfsFile> {
     /// Handle to the main database file.
     db_file: F,
     /// Page cache used for zero-copy read/write-through.
@@ -527,7 +527,7 @@ where
 
         match self.mode {
             TransactionMode::ReadOnly => Err(FrankenError::ReadOnly),
-            TransactionMode::Deferred => {
+            TransactionMode::Deferred | TransactionMode::Concurrent => {
                 let mut inner = self
                     .inner
                     .lock()
@@ -752,6 +752,182 @@ impl<V: Vfs> Drop for SimpleTransaction<V> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// CheckpointPageWriter implementation for WAL checkpointing
+// ---------------------------------------------------------------------------
+
+/// A checkpoint page writer that writes pages directly to the database file.
+///
+/// This type implements [`CheckpointPageWriter`] and is used during WAL
+/// checkpointing to transfer committed pages from the WAL back to the main
+/// database file.
+///
+/// The writer holds a reference to the pager's inner state and acquires the
+/// mutex for each operation. This is acceptable because checkpoint is an
+/// infrequent operation and the writes must be serialized with other pager
+/// operations anyway.
+pub struct SimplePagerCheckpointWriter<V: Vfs>
+where
+    V::File: Send + Sync,
+{
+    inner: Arc<Mutex<PagerInner<V::File>>>,
+}
+
+impl<V: Vfs> traits::sealed::Sealed for SimplePagerCheckpointWriter<V> where V::File: Send + Sync {}
+
+impl<V> traits::CheckpointPageWriter for SimplePagerCheckpointWriter<V>
+where
+    V: Vfs + Send + Sync,
+    V::File: Send + Sync,
+{
+    fn write_page(&mut self, cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| FrankenError::internal("SimplePagerCheckpointWriter lock poisoned"))?;
+
+        // Write directly to the database file, bypassing the cache.
+        // The WAL checkpoint is authoritative, so we overwrite any cached version.
+        let page_size = inner.page_size.as_usize();
+        let offset = u64::from(page_no.get() - 1) * page_size as u64;
+        inner.db_file.write(cx, data, offset)?;
+
+        // Invalidate cache entry if present to avoid stale reads.
+        inner.cache.evict(page_no);
+
+        // Update db_size if this page extends the database.
+        inner.db_size = inner.db_size.max(page_no.get());
+
+        drop(inner);
+        Ok(())
+    }
+
+    fn truncate(&mut self, cx: &Cx, n_pages: u32) -> Result<()> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| FrankenError::internal("SimplePagerCheckpointWriter lock poisoned"))?;
+
+        let old_db_size = inner.db_size;
+        let page_size = inner.page_size.as_usize();
+        let target_size = u64::from(n_pages) * page_size as u64;
+        inner.db_file.truncate(cx, target_size)?;
+        inner.db_size = n_pages;
+
+        // Invalidate cached pages beyond the new size.
+        // We only need to evict pages that are beyond the truncation point.
+        // Note: This is a best-effort cleanup - pages may not all be cached.
+        for pgno in (n_pages + 1)..=old_db_size {
+            if let Some(page_no) = PageNumber::new(pgno) {
+                inner.cache.evict(page_no);
+            }
+        }
+
+        drop(inner);
+        Ok(())
+    }
+
+    fn sync(&mut self, cx: &Cx) -> Result<()> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| FrankenError::internal("SimplePagerCheckpointWriter lock poisoned"))?;
+        inner.db_file.sync(cx, SyncFlags::NORMAL)
+    }
+}
+
+impl<V: Vfs> SimplePager<V>
+where
+    V::File: Send + Sync,
+{
+    /// Create a checkpoint page writer for WAL checkpointing.
+    ///
+    /// The returned writer implements [`CheckpointPageWriter`] and can be
+    /// wrapped in a `CheckpointTargetAdapter` from `fsqlite-core` to satisfy
+    /// the WAL executor's `CheckpointTarget` trait.
+    ///
+    /// # Panics
+    ///
+    /// This method does not panic, but the returned writer's methods may
+    /// return errors if the pager's internal mutex is poisoned.
+    #[must_use]
+    pub fn checkpoint_writer(&self) -> SimplePagerCheckpointWriter<V> {
+        SimplePagerCheckpointWriter {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+
+    /// Run a WAL checkpoint to transfer frames from the WAL to the database.
+    ///
+    /// This is the main checkpoint entry point for WAL mode. It:
+    /// 1. Acquires the pager lock
+    /// 2. Creates a checkpoint writer for database page writes
+    /// 3. Delegates to the WAL backend's checkpoint implementation
+    ///
+    /// # Arguments
+    ///
+    /// * `cx` - Cancellation/deadline context
+    /// * `mode` - Checkpoint mode (Passive, Full, Restart, Truncate)
+    ///
+    /// # Returns
+    ///
+    /// A `CheckpointResult` describing what was accomplished, or an error if:
+    /// - The pager is not in WAL mode
+    /// - The pager lock is poisoned
+    /// - Any I/O error occurs during the checkpoint
+    ///
+    /// # Notes
+    ///
+    /// This implementation assumes no active readers (oldest_reader_frame = None)
+    /// and starts from the beginning (backfilled_frames = 0). For incremental
+    /// checkpoints with reader tracking, use the lower-level WAL backend API.
+    pub fn checkpoint(
+        &self,
+        cx: &Cx,
+        mode: traits::CheckpointMode,
+    ) -> Result<traits::CheckpointResult> {
+        // Take the WAL backend out of the pager so we can run the checkpoint
+        // without holding the pager lock. The checkpoint writer needs to
+        // acquire the lock for each page write, so we can't hold it here.
+        let mut wal = {
+            let mut inner = self
+                .inner
+                .lock()
+                .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
+
+            // Check we're in WAL mode.
+            if inner.journal_mode != JournalMode::Wal {
+                return Err(FrankenError::Unsupported);
+            }
+
+            // Take the WAL backend out temporarily.
+            inner.wal_backend.take().ok_or_else(|| {
+                FrankenError::internal("WAL mode active but no WAL backend installed")
+            })?
+        };
+        // Lock is released here.
+
+        // Create a checkpoint writer that writes directly to the database file.
+        let mut writer = self.checkpoint_writer();
+
+        // Run the checkpoint. For now, assume:
+        // - No frames already backfilled (start from beginning)
+        // - No active readers blocking (oldest_reader_frame = None)
+        let result = wal.checkpoint(cx, mode, &mut writer, 0, None);
+
+        // Put the WAL backend back.
+        {
+            let mut inner = self
+                .inner
+                .lock()
+                .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
+            inner.wal_backend = Some(wal);
+        }
+
+        result
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -833,6 +1009,17 @@ mod tests {
         assert!(
             !txn.is_writer,
             "bead_id={BEAD_ID} case=deferred_starts_readonly"
+        );
+    }
+
+    #[test]
+    fn test_begin_concurrent_transaction_starts_reader() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let txn = pager.begin(&cx, TransactionMode::Concurrent).unwrap();
+        assert!(
+            !txn.is_writer,
+            "bead_id={BEAD_ID} case=concurrent_starts_readonly"
         );
     }
 
@@ -1812,6 +1999,25 @@ mod tests {
 
         fn frame_count(&self) -> usize {
             self.frames.lock().unwrap().len()
+        }
+
+        fn checkpoint(
+            &mut self,
+            _cx: &Cx,
+            _mode: crate::traits::CheckpointMode,
+            _writer: &mut dyn crate::traits::CheckpointPageWriter,
+            _backfilled_frames: u32,
+            _oldest_reader_frame: Option<u32>,
+        ) -> fsqlite_error::Result<crate::traits::CheckpointResult> {
+            let total_frames = u32::try_from(self.frames.lock().unwrap().len()).map_err(|_| {
+                fsqlite_error::FrankenError::internal("mock wal frame count exceeds u32")
+            })?;
+            Ok(crate::traits::CheckpointResult {
+                total_frames,
+                frames_backfilled: total_frames,
+                completed: true,
+                wal_was_reset: false,
+            })
         }
     }
 
