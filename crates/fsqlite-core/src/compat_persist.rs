@@ -383,7 +383,11 @@ const fn affinity_char_to_type(affinity: char) -> &'static str {
 ///
 /// This is a best-effort parser that handles the common case of
 /// `CREATE TABLE "name" ("col1" TYPE, "col2" TYPE, ...)`.
-fn parse_columns_from_create_sql(sql: &str) -> Vec<ColumnInfo> {
+/// Parse column info from a CREATE TABLE SQL string.
+///
+/// Extracts column names and affinities from the column definitions.
+/// Used by `load_from_sqlite` and `reload_memdb_from_pager` (bd-1ene).
+pub fn parse_columns_from_create_sql(sql: &str) -> Vec<ColumnInfo> {
     // Find the parenthesized column list.
     let Some(open) = sql.find('(') else {
         return Vec::new();
