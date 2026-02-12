@@ -373,6 +373,10 @@ struct StorageCursor {
     writable: bool,
     /// Root page number (MemDatabase key), used for MemDatabase sync.
     root_page: i32,
+    /// Highest rowid allocated by `NewRowid` on this cursor (bd-1yi8).
+    /// Ensures consecutive allocations return unique values even when
+    /// no Insert has been issued between them.
+    last_alloc_rowid: i64,
 }
 
 /// Lightweight version token for `MemDatabase` undo/rollback (bd-g6eo).
@@ -1802,31 +1806,42 @@ impl VdbeEngine {
                 Opcode::NewRowid => {
                     // Allocate a new rowid for cursor p1, store in register p2.
                     //
-                    // `p3 != 0` selects the concurrent path (snapshot-independent
-                    // allocator behavior). `p3 == 0` keeps legacy serialized mode.
+                    // Phase 5B.2 (bd-1yi8): when a StorageCursor exists, read
+                    // the max rowid directly from the B-tree (navigate to
+                    // last entry) instead of relying on MemDatabase counters.
+                    // Falls back to MemDatabase for legacy Phase 4 cursors.
                     let cursor_id = op.p1;
                     let target = op.p2;
                     let concurrent_mode = op.p3 != 0;
-                    // Check storage cursor first, falling back to MemCursor.
-                    // Rowid is always allocated from MemTable's counter so
-                    // both the B-tree and MemDatabase stay in sync.
-                    let root = self
-                        .storage_cursors
-                        .get(&cursor_id)
-                        .map(|sc| sc.root_page)
-                        .or_else(|| self.cursors.get(&cursor_id).map(|c| c.root_page));
-                    let rowid = if let Some(root) = root {
-                        if let Some(db) = self.db.as_mut() {
-                            if concurrent_mode {
-                                db.alloc_rowid_concurrent(root)
+                    let rowid = if let Some(sc) = self.storage_cursors.get_mut(&cursor_id) {
+                        // Navigate to last entry to find max rowid from B-tree.
+                        let btree_max = if sc.cursor.last(&sc.cx)? {
+                            sc.cursor.rowid(&sc.cx)?
+                        } else {
+                            0 // empty table
+                        };
+                        // Use the higher of B-tree max and previously allocated
+                        // to ensure uniqueness across consecutive allocations.
+                        let base = btree_max.max(sc.last_alloc_rowid);
+                        let new_rowid = base + 1;
+                        sc.last_alloc_rowid = new_rowid;
+                        new_rowid
+                    } else {
+                        // MemDatabase fallback (Phase 4 in-memory cursors).
+                        let root = self.cursors.get(&cursor_id).map(|c| c.root_page);
+                        if let Some(root) = root {
+                            if let Some(db) = self.db.as_mut() {
+                                if concurrent_mode {
+                                    db.alloc_rowid_concurrent(root)
+                                } else {
+                                    db.alloc_rowid(root)
+                                }
                             } else {
-                                db.alloc_rowid(root)
+                                1
                             }
                         } else {
                             1
                         }
-                    } else {
-                        1
                     };
                     self.set_reg(target, SqliteValue::Integer(rowid));
                     pc += 1;
@@ -1840,9 +1855,10 @@ impl VdbeEngine {
                     let rowid_reg = op.p3;
                     let rowid = self.get_reg(rowid_reg).to_integer();
                     let record_val = self.get_reg(record_reg).clone();
-                    // Phase 5: route through B-tree if a writable storage
-                    // cursor is active for this cursor id.
-                    let storage_root = if let Some(sc) = self.storage_cursors.get_mut(&cursor_id) {
+                    // Phase 5B.2 (bd-1yi8): write-through — route ONLY through
+                    // StorageCursor when one exists; fall back to MemDatabase
+                    // only for legacy Phase 4 cursors.
+                    if let Some(sc) = self.storage_cursors.get_mut(&cursor_id) {
                         if sc.writable {
                             let blob = record_blob_bytes(&record_val);
                             // UPSERT: delete existing row before insert.
@@ -1851,16 +1867,11 @@ impl VdbeEngine {
                             }
                             sc.cursor.table_insert(&sc.cx, rowid, &blob)?;
                         }
-                        Some(sc.root_page)
-                    } else {
-                        None
-                    };
-                    // Sync to MemDatabase (dual-write during Phase 5 transition,
-                    // or pure in-memory path for Phase 4 cursors).
-                    let values = decode_record(&record_val)?;
-                    let root =
-                        storage_root.or_else(|| self.cursors.get(&cursor_id).map(|c| c.root_page));
-                    if let Some(root) = root {
+                    } else if let Some(root) =
+                        self.cursors.get(&cursor_id).map(|c| c.root_page)
+                    {
+                        // MemDatabase fallback (Phase 4 in-memory cursors).
+                        let values = decode_record(&record_val)?;
                         if let Some(db) = self.db.as_mut() {
                             db.upsert_row(root, rowid, values);
                         }
@@ -2552,6 +2563,7 @@ impl VdbeEngine {
                     cx,
                     writable,
                     root_page,
+                    last_alloc_rowid: 0,
                 },
             );
             return true;
@@ -2584,6 +2596,7 @@ impl VdbeEngine {
                 cx,
                 writable,
                 root_page,
+                last_alloc_rowid: 0,
             },
         );
         true
@@ -5745,7 +5758,7 @@ mod tests {
         let mut db = MemDatabase::new();
         let root = db.create_table(2);
 
-        let (_rows, final_db) = run_write_with_storage_cursors(db, |b| {
+        let (rows, final_db) = run_write_with_storage_cursors(db, |b| {
             let end = b.emit_label();
             b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
 
@@ -5780,15 +5793,16 @@ mod tests {
             b.resolve_label(end);
         });
 
-        // MemDatabase should have the row (dual-write sync).
+        // Phase 5B.2 (bd-1yi8): write-through — INSERT goes ONLY through
+        // StorageCursor, MemDatabase is NOT synced.
         let table = final_db.get_table(root).expect("table should exist");
-        assert_eq!(table.rows.len(), 1);
-        assert_eq!(table.rows[0].rowid, 1);
-        assert_eq!(table.rows[0].values[0], SqliteValue::Integer(42));
-        assert_eq!(
-            table.rows[0].values[1],
-            SqliteValue::Text("hello".to_owned())
-        );
+        assert_eq!(table.rows.len(), 0, "MemDatabase should NOT have the row after write-through");
+
+        // The row is readable via B-tree read-back (verified by the
+        // ResultRow output from the OpenRead/Column/Next sequence above).
+        assert_eq!(rows.len(), 1, "should read back exactly one row from B-tree");
+        assert_eq!(rows[0][0], SqliteValue::Integer(42));
+        assert_eq!(rows[0][1], SqliteValue::Text("hello".to_owned()));
     }
 
     #[test]
