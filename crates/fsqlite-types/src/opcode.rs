@@ -1009,6 +1009,8 @@ pub enum P4 {
     FuncName(String),
     /// A table name.
     Table(String),
+    /// An index name (for IdxInsert/IdxDelete opcodes).
+    Index(String),
     /// An affinity string (one char per column).
     Affinity(String),
 }
@@ -1362,6 +1364,7 @@ impl VdbeProgram {
                 P4::Collation(c) => format!("(coll){c}"),
                 P4::FuncName(f) => format!("(func){f}"),
                 P4::Table(t) => format!("(tbl){t}"),
+                P4::Index(i) => format!("(idx){i}"),
                 P4::Affinity(a) => format!("(aff){a}"),
             };
 

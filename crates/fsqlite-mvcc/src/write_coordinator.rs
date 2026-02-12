@@ -292,13 +292,20 @@ impl WriteCoordinator {
     /// `recent_commits` should map page numbers to their last modification
     /// commit sequence, derived from the recent history window (covering
     /// at least the oldest active transaction's snapshot).
-    pub fn restore_state(&self, next_seq: CommitSeq, recent_commits: HashMap<u32, CommitSeq>) {
+    pub fn restore_state(
+        &self,
+        next_seq: CommitSeq,
+        recent_commits: HashMap<u32, CommitSeq>,
+        wal_offset: u64,
+    ) {
         self.next_commit_seq.store(next_seq.get(), Ordering::SeqCst);
+        self.wal_offset.store(wal_offset, Ordering::SeqCst);
         let mut index = self.commit_page_index.write();
         *index = recent_commits;
         info!(
             bead_id = "bd-389e",
             next_seq = next_seq.get(),
+            wal_offset,
             restored_pages = index.len(),
             "coordinator state restored from persistence"
         );
@@ -520,10 +527,13 @@ impl WriteCoordinator {
         );
 
         let mut responses = Vec::with_capacity(requests.len());
-        let mut valid_indices = Vec::new();
+        let mut accepted_commits: Vec<(CommitSeq, BTreeSet<u32>)> = Vec::new();
+        let mut batch_page_owner: HashMap<u32, CommitSeq> = HashMap::new();
+        let frame_header_size = 24_u64;
+        let mut total_batch_bytes = 0_u64;
 
         // Phase 1: Validate all.
-        for (i, req) in requests.iter().enumerate() {
+        for req in requests {
             let page_numbers: Vec<u32> = req
                 .write_set
                 .page_numbers()
@@ -540,68 +550,69 @@ impl WriteCoordinator {
                     conflicting_commit_seq: conflict_seq,
                 });
             } else {
-                valid_indices.push(i);
-                // Placeholder: will be replaced in phase 4.
-                responses.push(CompatCommitResponse::Ok {
-                    wal_offset: 0,
-                    commit_seq: CommitSeq::new(0),
-                });
+                let mut intra_batch_conflicts = Vec::new();
+                let mut intra_batch_conflict_seq = CommitSeq::new(0);
+                for &pgno in &page_set {
+                    if let Some(&owner_seq) = batch_page_owner.get(&pgno) {
+                        if let Some(page) = PageNumber::new(pgno) {
+                            intra_batch_conflicts.push(page);
+                        }
+                        if owner_seq.get() > intra_batch_conflict_seq.get() {
+                            intra_batch_conflict_seq = owner_seq;
+                        }
+                    }
+                }
+
+                if intra_batch_conflicts.is_empty() {
+                    // Phase 2: Allocate commit_seq and WAL offset.
+                    let commit_seq = self.allocate_commit_seq();
+                    let page_size = Self::infer_page_size(&req.write_set);
+                    let page_count = req.write_set.page_count() as u64;
+                    let commit_bytes = page_count * (frame_header_size + page_size);
+                    let wal_offset = self.wal_offset.fetch_add(commit_bytes, Ordering::SeqCst);
+                    total_batch_bytes += commit_bytes;
+
+                    for &pgno in &page_set {
+                        batch_page_owner.insert(pgno, commit_seq);
+                    }
+                    accepted_commits.push((commit_seq, page_set));
+                    responses.push(CompatCommitResponse::Ok {
+                        wal_offset,
+                        commit_seq,
+                    });
+                } else {
+                    responses.push(CompatCommitResponse::Conflict {
+                        conflicting_pages: intra_batch_conflicts,
+                        conflicting_commit_seq: intra_batch_conflict_seq,
+                    });
+                }
             }
         }
 
-        if valid_indices.is_empty() {
+        if accepted_commits.is_empty() {
             return responses;
         }
 
-        // Phase 2: Allocate commit_seqs and compute WAL offsets.
-        let frame_header_size = 24_u64;
-        let mut total_batch_bytes = 0_u64;
-        let mut valid_data: Vec<(CommitSeq, u64, BTreeSet<u32>)> = Vec::new();
-
-        for &i in &valid_indices {
-            let req = &requests[i];
-            let commit_seq = self.allocate_commit_seq();
-            let page_size = Self::infer_page_size(&req.write_set);
-            let page_count = req.write_set.page_count() as u64;
-            let offset = self.wal_offset.fetch_add(
-                page_count * (frame_header_size + page_size),
-                Ordering::SeqCst,
-            );
-
-            let page_set: BTreeSet<u32> = req
-                .write_set
-                .page_numbers()
-                .iter()
-                .map(|p| p.get())
-                .collect();
-            total_batch_bytes += page_count * (frame_header_size + page_size);
-            valid_data.push((commit_seq, offset, page_set));
-        }
+        let accepted_count = accepted_commits.len();
 
         // Phase 3: Single fsync (placeholder).
         debug!(
             bead_id = "bd-389e",
-            batch_size = valid_indices.len(),
+            batch_size = accepted_count,
             total_bytes = total_batch_bytes,
             "compat_commit_batch: single fsync for batch"
         );
 
         // Phase 4: Publish all and fill responses.
-        for (idx, &i) in valid_indices.iter().enumerate() {
-            let (commit_seq, wal_offset, ref page_set) = valid_data[idx];
-            self.update_commit_index(page_set, commit_seq);
-            self.committed_seqs.write().push(commit_seq);
-
-            responses[i] = CompatCommitResponse::Ok {
-                wal_offset,
-                commit_seq,
-            };
+        for (commit_seq, page_set) in &accepted_commits {
+            self.update_commit_index(page_set, *commit_seq);
+            self.committed_seqs.write().push(*commit_seq);
         }
 
         info!(
             bead_id = "bd-389e",
-            batch_size = valid_indices.len(),
-            conflicts = requests.len() - valid_indices.len(),
+            batch_size = accepted_count,
+            conflicts = requests.len() - accepted_count,
             "compat_commit_batch: group commit complete"
         );
 
@@ -967,6 +978,87 @@ mod tests {
                     3 * (24 + 4096),
                     "second commit starts after first"
                 );
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_compat_group_commit_intra_batch_conflict_first_wins() {
+        let coord = WriteCoordinator::new(CoordinatorMode::Compatibility);
+        coord.acquire_lease(1, 0);
+
+        // Two requests in the same batch write the same page.
+        let requests = vec![
+            CompatCommitRequest {
+                txn: test_token(1),
+                mode: TransactionMode::Concurrent,
+                write_set: inline_write_set(&[42]),
+                intent_log: Vec::new(),
+                page_locks: HashSet::from([PageNumber::new(42).unwrap()]),
+                snapshot: test_snapshot(0),
+                has_in_rw: false,
+                has_out_rw: false,
+                wal_fec_r: 0,
+            },
+            CompatCommitRequest {
+                txn: test_token(2),
+                mode: TransactionMode::Concurrent,
+                write_set: inline_write_set(&[42]),
+                intent_log: Vec::new(),
+                page_locks: HashSet::from([PageNumber::new(42).unwrap()]),
+                snapshot: test_snapshot(0),
+                has_in_rw: false,
+                has_out_rw: false,
+                wal_fec_r: 0,
+            },
+        ];
+
+        let responses = coord.compat_commit_batch(&requests);
+        assert_eq!(responses.len(), 2);
+
+        let first_commit_seq = match &responses[0] {
+            CompatCommitResponse::Ok { commit_seq, .. } => *commit_seq,
+            other => panic!("expected first response Ok, got {other:?}"),
+        };
+
+        match &responses[1] {
+            CompatCommitResponse::Conflict {
+                conflicting_pages,
+                conflicting_commit_seq,
+            } => {
+                assert_eq!(conflicting_pages, &vec![PageNumber::new(42).unwrap()]);
+                assert_eq!(*conflicting_commit_seq, first_commit_seq);
+            }
+            other => panic!("expected second response Conflict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_restore_state_restores_wal_offset() {
+        let coord = WriteCoordinator::new(CoordinatorMode::Compatibility);
+        coord.acquire_lease(1, 0);
+        coord.restore_state(CommitSeq::new(11), HashMap::new(), 12_345);
+
+        let req = CompatCommitRequest {
+            txn: test_token(77),
+            mode: TransactionMode::Serialized,
+            write_set: inline_write_set(&[7]),
+            intent_log: Vec::new(),
+            page_locks: HashSet::from([PageNumber::new(7).unwrap()]),
+            snapshot: test_snapshot(0),
+            has_in_rw: false,
+            has_out_rw: false,
+            wal_fec_r: 0,
+        };
+
+        match coord.compat_commit(&req) {
+            CompatCommitResponse::Ok {
+                wal_offset,
+                commit_seq,
+            } => {
+                assert_eq!(wal_offset, 12_345);
+                assert_eq!(commit_seq, CommitSeq::new(11));
             }
             other => panic!("expected Ok, got {other:?}"),
         }

@@ -21,7 +21,9 @@
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 
-use fsqlite_types::{CommitSeq, PageData, PageNumber, Snapshot, TxnEpoch, TxnId, TxnToken, WitnessKey};
+use fsqlite_types::{
+    CommitSeq, PageData, PageNumber, Snapshot, TxnEpoch, TxnId, TxnToken, WitnessKey,
+};
 
 use crate::core_types::{CommitIndex, InProcessPageLockTable, TransactionMode, TransactionState};
 use crate::lifecycle::MvccError;
@@ -169,7 +171,10 @@ impl ConcurrentHandle {
     /// Returns witness keys for all written pages (for SSI validation).
     #[must_use]
     pub fn write_witness_keys(&self) -> Vec<WitnessKey> {
-        self.write_set.keys().map(|&p| WitnessKey::Page(p)).collect()
+        self.write_set
+            .keys()
+            .map(|&p| WitnessKey::Page(p))
+            .collect()
     }
 
     /// Whether this handle has incoming rw-antidependency (SSI).
@@ -539,9 +544,8 @@ pub fn concurrent_commit_with_ssi(
             .find(|(id, _)| *id == session_id)
             .map(|(_, h)| *h);
 
-        let our_handle = match our_handle {
-            Some(h) => h,
-            None => return Err((MvccError::InvalidState, FcwResult::Clean)),
+        let Some(our_handle) = our_handle else {
+            return Err((MvccError::InvalidState, FcwResult::Clean));
         };
 
         let write_keys = our_handle.write_witness_keys();
@@ -1123,12 +1127,24 @@ mod tests {
         }
 
         // Both should commit successfully.
-        let seq1 = concurrent_commit_with_ssi(&mut registry, &commit_index, &lock_table, s1, CommitSeq::new(11))
-            .expect("T1 commits");
+        let seq1 = concurrent_commit_with_ssi(
+            &mut registry,
+            &commit_index,
+            &lock_table,
+            s1,
+            CommitSeq::new(11),
+        )
+        .expect("T1 commits");
         assert_eq!(seq1, CommitSeq::new(11));
 
-        let seq2 = concurrent_commit_with_ssi(&mut registry, &commit_index, &lock_table, s2, CommitSeq::new(12))
-            .expect("T2 commits");
+        let seq2 = concurrent_commit_with_ssi(
+            &mut registry,
+            &commit_index,
+            &lock_table,
+            s2,
+            CommitSeq::new(12),
+        )
+        .expect("T2 commits");
         assert_eq!(seq2, CommitSeq::new(12));
     }
 
@@ -1171,13 +1187,28 @@ mod tests {
         // Incoming: T2 read B (page 10), T1 writes B → edge from T2 to T1
         // Outgoing: T1 read A (page 5), T2 writes A → edge from T1 to T2
         // T1 is pivot and must abort.
-        let result1 = concurrent_commit_with_ssi(&mut registry, &commit_index, &lock_table, s1, CommitSeq::new(11));
-        assert!(result1.is_err(), "T1 should abort as pivot (both in and out edges)");
+        let result1 = concurrent_commit_with_ssi(
+            &mut registry,
+            &commit_index,
+            &lock_table,
+            s1,
+            CommitSeq::new(11),
+        );
+        assert!(
+            result1.is_err(),
+            "T1 should abort as pivot (both in and out edges)"
+        );
         let (err, _) = result1.unwrap_err();
         assert_eq!(err, MvccError::BusySnapshot);
 
         // After T1 aborts, T2 can now commit (T1 is no longer active, so no edges).
-        let result2 = concurrent_commit_with_ssi(&mut registry, &commit_index, &lock_table, s2, CommitSeq::new(11));
+        let result2 = concurrent_commit_with_ssi(
+            &mut registry,
+            &commit_index,
+            &lock_table,
+            s2,
+            CommitSeq::new(11),
+        );
         assert!(result2.is_ok(), "T2 should commit after T1 aborted");
     }
 

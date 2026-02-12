@@ -32,5 +32,9 @@ misc = ["dep:fsqlite-ext-misc"]
 raptorq = []
 mvcc = []
 
+[dev-dependencies]
+rand = { workspace = true }
+tempfile = { workspace = true }
+
 [lints]
 workspace = true

@@ -429,6 +429,22 @@ impl CursorBackend {
             Self::Txn(c) => c.delete(cx),
         }
     }
+
+    /// Position the cursor at the given key in an index B-tree.
+    fn index_move_to(&mut self, cx: &Cx, key: &[u8]) -> Result<SeekResult> {
+        match self {
+            Self::Mem(c) => c.index_move_to(cx, key),
+            Self::Txn(c) => c.index_move_to(cx, key),
+        }
+    }
+
+    /// Insert a key into an index B-tree.
+    fn index_insert(&mut self, cx: &Cx, key: &[u8]) -> Result<()> {
+        match self {
+            Self::Mem(c) => c.index_insert(cx, key),
+            Self::Txn(c) => c.index_insert(cx, key),
+        }
+    }
 }
 
 /// Storage-backed table cursor used by `OpenRead` and `OpenWrite`.
@@ -2032,29 +2048,74 @@ impl VdbeEngine {
 
                 Opcode::Insert => {
                     // Insert record in register p2 with rowid from register p3
-                    // into cursor p1.
+                    // into cursor p1. p5 encodes conflict resolution mode:
+                    // 1=ROLLBACK, 2=ABORT (default), 3=FAIL, 4=IGNORE, 5=REPLACE
+                    //
+                    // OE_* constants matching SQLite (4=IGNORE, 5=REPLACE)
                     let cursor_id = op.p1;
                     let record_reg = op.p2;
                     let rowid_reg = op.p3;
+                    let oe_flag = op.p5 & 0x0F; // Low 4 bits for OE_* mode
                     let rowid = self.get_reg(rowid_reg).to_integer();
                     let record_val = self.get_reg(record_reg).clone();
+
                     // Phase 5B.2 (bd-1yi8): write-through — route ONLY through
                     // StorageCursor when one exists; fall back to MemDatabase
                     // only for legacy Phase 4 cursors.
                     if let Some(sc) = self.storage_cursors.get_mut(&cursor_id) {
                         if sc.writable {
                             let blob = record_blob_bytes(&record_val);
-                            // UPSERT: delete existing row before insert.
-                            if sc.cursor.table_move_to(&sc.cx, rowid)?.is_found() {
-                                sc.cursor.delete(&sc.cx)?;
+                            let exists = sc.cursor.table_move_to(&sc.cx, rowid)?.is_found();
+
+                            if exists {
+                                match oe_flag {
+                                    4 => {
+                                        // OE_IGNORE: Skip insert for conflicting row
+                                    }
+                                    5 => {
+                                        // OE_REPLACE: Delete old, insert new (UPSERT)
+                                        sc.cursor.delete(&sc.cx)?;
+                                        sc.cursor.table_insert(&sc.cx, rowid, &blob)?;
+                                    }
+                                    _ => {
+                                        // Default (ABORT/FAIL/ROLLBACK): UPSERT for now
+                                        // TODO: proper constraint violation handling
+                                        sc.cursor.delete(&sc.cx)?;
+                                        sc.cursor.table_insert(&sc.cx, rowid, &blob)?;
+                                    }
+                                }
+                            } else {
+                                // No conflict — insert normally
+                                sc.cursor.table_insert(&sc.cx, rowid, &blob)?;
                             }
-                            sc.cursor.table_insert(&sc.cx, rowid, &blob)?;
                         }
                     } else if let Some(root) = self.cursors.get(&cursor_id).map(|c| c.root_page) {
                         // MemDatabase fallback (Phase 4 in-memory cursors).
                         let values = decode_record(&record_val)?;
                         if let Some(db) = self.db.as_mut() {
-                            db.upsert_row(root, rowid, values);
+                            let exists = db
+                                .get_table(root)
+                                .and_then(|t| t.find_by_rowid(rowid))
+                                .is_some();
+
+                            if exists {
+                                match oe_flag {
+                                    4 => {
+                                        // OE_IGNORE: Skip insert for conflicting row
+                                    }
+                                    5 => {
+                                        // OE_REPLACE: UPSERT semantics
+                                        db.upsert_row(root, rowid, values);
+                                    }
+                                    _ => {
+                                        // Default: UPSERT for now
+                                        db.upsert_row(root, rowid, values);
+                                    }
+                                }
+                            } else {
+                                // No conflict — insert normally
+                                db.upsert_row(root, rowid, values);
+                            }
                         }
                     }
                     pc += 1;
@@ -2083,7 +2144,21 @@ impl VdbeEngine {
                 }
 
                 Opcode::IdxInsert => {
-                    // Index insert is a no-op in this in-memory backend.
+                    // Insert key from register P2 into index cursor P1.
+                    // bd-qluy: Phase 5I.6 - Wire to B-tree index_insert.
+                    let cursor_id = op.p1;
+                    let key_reg = op.p2;
+                    let key_val = self.get_reg(key_reg).clone();
+
+                    if let Some(sc) = self.storage_cursors.get_mut(&cursor_id) {
+                        if sc.writable {
+                            // Extract key bytes from the register value.
+                            let key_bytes = record_blob_bytes(&key_val);
+                            sc.cursor.index_insert(&sc.cx, &key_bytes)?;
+                        }
+                    }
+                    // No MemDatabase fallback: Phase 4 in-memory backend doesn't
+                    // support indexes (they're a no-op there).
                     pc += 1;
                 }
 
@@ -2097,6 +2172,42 @@ impl VdbeEngine {
                 }
 
                 Opcode::IdxDelete => {
+                    // Delete entry at current position in index cursor P1.
+                    // bd-qluy: Phase 5I.6 - Wire to B-tree delete.
+                    //
+                    // If P2 and P3 are provided, they specify the key to delete:
+                    // P2 = start register, P3 = number of registers forming the key.
+                    // In that case, we first seek to the key, then delete.
+                    let cursor_id = op.p1;
+                    let key_start_reg = op.p2;
+                    let key_count = op.p3;
+
+                    // Collect key bytes BEFORE borrowing cursor (borrow checker).
+                    let key_bytes: Option<Vec<u8>> = if key_count > 0 {
+                        let mut key_values: Vec<SqliteValue> =
+                            Vec::with_capacity(key_count as usize);
+                        for i in 0..key_count {
+                            key_values.push(self.get_reg(key_start_reg + i).clone());
+                        }
+                        Some(encode_record(&key_values))
+                    } else {
+                        None
+                    };
+
+                    if let Some(sc) = self.storage_cursors.get_mut(&cursor_id) {
+                        if sc.writable {
+                            if let Some(ref key) = key_bytes {
+                                // Seek to the key first, then delete.
+                                if sc.cursor.index_move_to(&sc.cx, key)?.is_found() {
+                                    sc.cursor.delete(&sc.cx)?;
+                                }
+                            } else if !sc.cursor.eof() {
+                                // Delete at current position.
+                                sc.cursor.delete(&sc.cx)?;
+                            }
+                        }
+                    }
+                    // No MemDatabase fallback for indexes.
                     pc += 1;
                 }
 

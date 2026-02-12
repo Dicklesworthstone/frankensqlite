@@ -188,6 +188,8 @@ pub struct ProgramBuilder {
     labels: Vec<LabelState>,
     /// Register allocator.
     regs: RegisterAllocator,
+    /// Counter for anonymous placeholder numbering (1-based).
+    next_anon_placeholder: u32,
 }
 
 impl ProgramBuilder {
@@ -197,7 +199,26 @@ impl ProgramBuilder {
             ops: Vec::new(),
             labels: Vec::new(),
             regs: RegisterAllocator::new(),
+            next_anon_placeholder: 1,
         }
+    }
+
+    /// Get the next anonymous placeholder index (1-based) and increment the counter.
+    pub fn next_anon_placeholder_idx(&mut self) -> u32 {
+        let idx = self.next_anon_placeholder;
+        self.next_anon_placeholder += 1;
+        idx
+    }
+
+    /// Set the anonymous placeholder counter to a specific value.
+    /// Used when codegen emission order differs from SQL textual order.
+    pub fn set_next_anon_placeholder(&mut self, val: u32) {
+        self.next_anon_placeholder = val;
+    }
+
+    /// Get the current anonymous placeholder counter without incrementing.
+    pub fn current_anon_placeholder(&self) -> u32 {
+        self.next_anon_placeholder
     }
 
     // ── Instruction emission ────────────────────────────────────────────
@@ -436,6 +457,7 @@ impl VdbeProgram {
                 P4::Collation(c) => format!("(coll){c}"),
                 P4::FuncName(f) => format!("(func){f}"),
                 P4::Table(t) => format!("(tbl){t}"),
+                P4::Index(i) => format!("(idx){i}"),
                 P4::Affinity(a) => format!("(aff){a}"),
             };
 
@@ -469,8 +491,8 @@ pub mod pragma {
     use fsqlite_error::{FrankenError, Result};
     use fsqlite_mvcc::TransactionManager;
     use fsqlite_wal::{
-        MAX_RAPTORQ_REPAIR_SYMBOLS, persist_wal_fec_raptorq_repair_symbols,
-        read_wal_fec_raptorq_repair_symbols,
+        DEFAULT_RAPTORQ_REPAIR_SYMBOLS, MAX_RAPTORQ_REPAIR_SYMBOLS,
+        persist_wal_fec_raptorq_repair_symbols, read_wal_fec_raptorq_repair_symbols,
     };
     use tracing::{debug, error, info, warn};
 
@@ -505,6 +527,26 @@ pub mod pragma {
         pub page_size: u32,
         /// Busy timeout in milliseconds for lock contention.
         pub busy_timeout_ms: i64,
+        /// Temporary storage mode (`0` default, `1` file, `2` memory).
+        pub temp_store: i64,
+        /// Memory-map size in bytes (`PRAGMA mmap_size`).
+        pub mmap_size: i64,
+        /// Auto-vacuum mode (`0` none, `1` full, `2` incremental).
+        pub auto_vacuum: i64,
+        /// WAL auto-checkpoint threshold in pages.
+        pub wal_autocheckpoint: i64,
+        /// User schema version (`PRAGMA user_version`).
+        pub user_version: i64,
+        /// Application ID (`PRAGMA application_id`).
+        pub application_id: i64,
+        /// Foreign key enforcement toggle (`PRAGMA foreign_keys`).
+        pub foreign_keys: bool,
+        /// Recursive trigger toggle (`PRAGMA recursive_triggers`).
+        pub recursive_triggers: bool,
+        /// Connection-level SSI toggle (`PRAGMA fsqlite.serializable`).
+        pub serializable: bool,
+        /// WAL-FEC repair symbol budget (`PRAGMA raptorq_repair_symbols`).
+        pub raptorq_repair_symbols: u8,
     }
 
     impl Default for ConnectionPragmaState {
@@ -515,6 +557,16 @@ pub mod pragma {
                 cache_size: -2000,
                 page_size: 4096,
                 busy_timeout_ms: 5000,
+                temp_store: 0,
+                mmap_size: 0,
+                auto_vacuum: 0,
+                wal_autocheckpoint: 1000,
+                user_version: 0,
+                application_id: 0,
+                foreign_keys: false,
+                recursive_triggers: false,
+                serializable: true,
+                raptorq_repair_symbols: DEFAULT_RAPTORQ_REPAIR_SYMBOLS,
             }
         }
     }
@@ -549,14 +601,20 @@ pub mod pragma {
 
     /// Apply a PRAGMA to connection-level settings.
     ///
-    /// Handles `journal_mode`, `synchronous`, `cache_size`, `page_size`,
-    /// `busy_timeout`. Returns `Unsupported` for pragmas not handled at
+    /// Handles common connection-scoped PRAGMAs used by the harness and
+    /// compatibility paths. Returns `Unsupported` for pragmas not handled at
     /// this layer, allowing the caller to chain with [`apply`].
     pub fn apply_connection_pragma(
         state: &mut ConnectionPragmaState,
         stmt: &PragmaStatement,
     ) -> Result<PragmaOutput> {
         let name = &stmt.name.name;
+        if is_fsqlite_serializable(&stmt.name) {
+            return apply_serializable_connection(state, stmt);
+        }
+        if is_raptorq_repair_symbols(&stmt.name) {
+            return apply_raptorq_repair_symbols_connection(state, stmt);
+        }
         if name.eq_ignore_ascii_case("journal_mode") {
             return apply_journal_mode(state, stmt);
         }
@@ -572,7 +630,68 @@ pub mod pragma {
         if name.eq_ignore_ascii_case("busy_timeout") {
             return apply_busy_timeout(state, stmt);
         }
+        if name.eq_ignore_ascii_case("temp_store") {
+            return apply_temp_store(state, stmt);
+        }
+        if name.eq_ignore_ascii_case("mmap_size") {
+            return apply_mmap_size(state, stmt);
+        }
+        if name.eq_ignore_ascii_case("auto_vacuum") {
+            return apply_auto_vacuum(state, stmt);
+        }
+        if name.eq_ignore_ascii_case("wal_autocheckpoint") {
+            return apply_wal_autocheckpoint(state, stmt);
+        }
+        if name.eq_ignore_ascii_case("user_version") {
+            return apply_user_version(state, stmt);
+        }
+        if name.eq_ignore_ascii_case("application_id") {
+            return apply_application_id(state, stmt);
+        }
+        if name.eq_ignore_ascii_case("foreign_keys") {
+            return apply_foreign_keys(state, stmt);
+        }
+        if name.eq_ignore_ascii_case("recursive_triggers") {
+            return apply_recursive_triggers(state, stmt);
+        }
         Ok(PragmaOutput::Unsupported)
+    }
+
+    fn apply_serializable_connection(
+        state: &mut ConnectionPragmaState,
+        stmt: &PragmaStatement,
+    ) -> Result<PragmaOutput> {
+        match &stmt.value {
+            None => Ok(PragmaOutput::Bool(state.serializable)),
+            Some(PragmaValue::Assign(expr) | PragmaValue::Call(expr)) => {
+                let enabled = parse_bool(expr)?;
+                state.serializable = enabled;
+                Ok(PragmaOutput::Bool(enabled))
+            }
+        }
+    }
+
+    fn apply_raptorq_repair_symbols_connection(
+        state: &mut ConnectionPragmaState,
+        stmt: &PragmaStatement,
+    ) -> Result<PragmaOutput> {
+        match &stmt.value {
+            None => Ok(PragmaOutput::Int(i64::from(state.raptorq_repair_symbols))),
+            Some(PragmaValue::Assign(expr) | PragmaValue::Call(expr)) => {
+                let value = parse_integer_expr(expr)?;
+                if !(0..=i64::from(MAX_RAPTORQ_REPAIR_SYMBOLS)).contains(&value) {
+                    return Err(FrankenError::OutOfRange {
+                        what: "raptorq_repair_symbols".to_owned(),
+                        value: value.to_string(),
+                    });
+                }
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                {
+                    state.raptorq_repair_symbols = value as u8;
+                }
+                Ok(PragmaOutput::Int(i64::from(state.raptorq_repair_symbols)))
+            }
+        }
     }
 
     fn apply_journal_mode(
@@ -686,6 +805,164 @@ pub mod pragma {
                 state.busy_timeout_ms = val.max(0);
                 Ok(PragmaOutput::Int(state.busy_timeout_ms))
             }
+        }
+    }
+
+    fn apply_temp_store(
+        state: &mut ConnectionPragmaState,
+        stmt: &PragmaStatement,
+    ) -> Result<PragmaOutput> {
+        match &stmt.value {
+            None => Ok(PragmaOutput::Int(state.temp_store)),
+            Some(PragmaValue::Assign(expr) | PragmaValue::Call(expr)) => {
+                let val = parse_temp_store_value(expr)?;
+                state.temp_store = val;
+                Ok(PragmaOutput::Int(val))
+            }
+        }
+    }
+
+    fn apply_mmap_size(
+        state: &mut ConnectionPragmaState,
+        stmt: &PragmaStatement,
+    ) -> Result<PragmaOutput> {
+        match &stmt.value {
+            None => Ok(PragmaOutput::Int(state.mmap_size)),
+            Some(PragmaValue::Assign(expr) | PragmaValue::Call(expr)) => {
+                let val = parse_integer_expr(expr)?;
+                state.mmap_size = val.max(0);
+                Ok(PragmaOutput::Int(state.mmap_size))
+            }
+        }
+    }
+
+    fn apply_auto_vacuum(
+        state: &mut ConnectionPragmaState,
+        stmt: &PragmaStatement,
+    ) -> Result<PragmaOutput> {
+        match &stmt.value {
+            None => Ok(PragmaOutput::Int(state.auto_vacuum)),
+            Some(PragmaValue::Assign(expr) | PragmaValue::Call(expr)) => {
+                let val = parse_auto_vacuum_value(expr)?;
+                state.auto_vacuum = val;
+                Ok(PragmaOutput::Int(val))
+            }
+        }
+    }
+
+    fn apply_wal_autocheckpoint(
+        state: &mut ConnectionPragmaState,
+        stmt: &PragmaStatement,
+    ) -> Result<PragmaOutput> {
+        match &stmt.value {
+            None => Ok(PragmaOutput::Int(state.wal_autocheckpoint)),
+            Some(PragmaValue::Assign(expr) | PragmaValue::Call(expr)) => {
+                let val = parse_integer_expr(expr)?;
+                state.wal_autocheckpoint = val.max(0);
+                Ok(PragmaOutput::Int(state.wal_autocheckpoint))
+            }
+        }
+    }
+
+    fn apply_user_version(
+        state: &mut ConnectionPragmaState,
+        stmt: &PragmaStatement,
+    ) -> Result<PragmaOutput> {
+        match &stmt.value {
+            None => Ok(PragmaOutput::Int(state.user_version)),
+            Some(PragmaValue::Assign(expr) | PragmaValue::Call(expr)) => {
+                let val = parse_integer_expr(expr)?;
+                state.user_version = val;
+                Ok(PragmaOutput::Int(val))
+            }
+        }
+    }
+
+    fn apply_application_id(
+        state: &mut ConnectionPragmaState,
+        stmt: &PragmaStatement,
+    ) -> Result<PragmaOutput> {
+        match &stmt.value {
+            None => Ok(PragmaOutput::Int(state.application_id)),
+            Some(PragmaValue::Assign(expr) | PragmaValue::Call(expr)) => {
+                let val = parse_integer_expr(expr)?;
+                state.application_id = val;
+                Ok(PragmaOutput::Int(val))
+            }
+        }
+    }
+
+    fn apply_foreign_keys(
+        state: &mut ConnectionPragmaState,
+        stmt: &PragmaStatement,
+    ) -> Result<PragmaOutput> {
+        match &stmt.value {
+            None => Ok(PragmaOutput::Int(i64::from(state.foreign_keys))),
+            Some(PragmaValue::Assign(expr) | PragmaValue::Call(expr)) => {
+                let enabled = parse_bool(expr)?;
+                state.foreign_keys = enabled;
+                Ok(PragmaOutput::Int(i64::from(enabled)))
+            }
+        }
+    }
+
+    fn apply_recursive_triggers(
+        state: &mut ConnectionPragmaState,
+        stmt: &PragmaStatement,
+    ) -> Result<PragmaOutput> {
+        match &stmt.value {
+            None => Ok(PragmaOutput::Int(i64::from(state.recursive_triggers))),
+            Some(PragmaValue::Assign(expr) | PragmaValue::Call(expr)) => {
+                let enabled = parse_bool(expr)?;
+                state.recursive_triggers = enabled;
+                Ok(PragmaOutput::Int(i64::from(enabled)))
+            }
+        }
+    }
+
+    fn parse_temp_store_value(expr: &Expr) -> Result<i64> {
+        if let Expr::Literal(Literal::Integer(n), _) = expr {
+            return match *n {
+                0..=2 => Ok(*n),
+                _ => Err(FrankenError::OutOfRange {
+                    what: "temp_store".to_owned(),
+                    value: n.to_string(),
+                }),
+            };
+        }
+
+        let text = parse_text_expr(expr)?;
+        match text.to_ascii_lowercase().as_str() {
+            "default" => Ok(0),
+            "file" => Ok(1),
+            "memory" => Ok(2),
+            _ => Err(FrankenError::TypeMismatch {
+                expected: "DEFAULT|FILE|MEMORY|0|1|2".to_owned(),
+                actual: text,
+            }),
+        }
+    }
+
+    fn parse_auto_vacuum_value(expr: &Expr) -> Result<i64> {
+        if let Expr::Literal(Literal::Integer(n), _) = expr {
+            return match *n {
+                0..=2 => Ok(*n),
+                _ => Err(FrankenError::OutOfRange {
+                    what: "auto_vacuum".to_owned(),
+                    value: n.to_string(),
+                }),
+            };
+        }
+
+        let text = parse_text_expr(expr)?;
+        match text.to_ascii_lowercase().as_str() {
+            "none" => Ok(0),
+            "full" => Ok(1),
+            "incremental" => Ok(2),
+            _ => Err(FrankenError::TypeMismatch {
+                expected: "NONE|FULL|INCREMENTAL|0|1|2".to_owned(),
+                actual: text,
+            }),
         }
     }
 

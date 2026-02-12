@@ -6,11 +6,40 @@
 
 use crate::ProgramBuilder;
 use fsqlite_ast::{
-    ColumnRef, DeleteStatement, Distinctness, Expr, FunctionArgs, InsertSource, InsertStatement,
-    LimitClause, Literal, OrderingTerm, QualifiedTableRef, ResultColumn, SelectCore,
-    SelectStatement, SortDirection, UpdateStatement,
+    ColumnRef, ConflictAction, DeleteStatement, Distinctness, Expr, FunctionArgs, InsertSource,
+    InsertStatement, LimitClause, Literal, OrderingTerm, QualifiedTableRef, ResultColumn,
+    SelectCore, SelectStatement, SortDirection, UpdateStatement,
 };
 use fsqlite_types::opcode::{Opcode, P4};
+
+// ---------------------------------------------------------------------------
+// Conflict resolution flags for Insert opcode p5 field
+// ---------------------------------------------------------------------------
+// These match SQLite's OE_* constants for on-error conflict handling.
+// The low 4 bits of p5 encode the conflict action.
+
+/// No conflict clause (default behavior: abort on constraint violation).
+const OE_ABORT: u16 = 2;
+/// ROLLBACK on conflict.
+const OE_ROLLBACK: u16 = 1;
+/// FAIL on conflict (abort statement but don't rollback transaction).
+const OE_FAIL: u16 = 3;
+/// IGNORE conflicting row (skip insert without error).
+const OE_IGNORE: u16 = 4;
+/// REPLACE conflicting row (delete old, insert new).
+const OE_REPLACE: u16 = 5;
+
+/// Convert AST `ConflictAction` to p5 OE_* flag value.
+fn conflict_action_to_oe(action: Option<&ConflictAction>) -> u16 {
+    match action {
+        None => OE_ABORT,
+        Some(ConflictAction::Rollback) => OE_ROLLBACK,
+        Some(ConflictAction::Abort) => OE_ABORT,
+        Some(ConflictAction::Fail) => OE_FAIL,
+        Some(ConflictAction::Ignore) => OE_IGNORE,
+        Some(ConflictAction::Replace) => OE_REPLACE,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Schema metadata (minimal info needed for codegen)
@@ -1959,8 +1988,9 @@ pub fn codegen_insert(
             // row from column-list order to table-schema order, filling
             // unmentioned columns with NULL.  This ensures MakeRecord always
             // packs fields in the order the table schema expects.
+            let oe_flag = conflict_action_to_oe(stmt.or_conflict.as_ref());
             if stmt.columns.is_empty() {
-                codegen_insert_values(b, rows, table_cursor, table, &stmt.returning, ctx)?;
+                codegen_insert_values(b, rows, table_cursor, table, &stmt.returning, ctx, oe_flag)?;
             } else {
                 let col_map = build_column_map(&stmt.columns, table)?;
                 let n_table_cols = table.columns.len();
@@ -1977,7 +2007,15 @@ pub fn codegen_insert(
                         table_order
                     })
                     .collect();
-                codegen_insert_values(b, &reordered, table_cursor, table, &stmt.returning, ctx)?;
+                codegen_insert_values(
+                    b,
+                    &reordered,
+                    table_cursor,
+                    table,
+                    &stmt.returning,
+                    ctx,
+                    oe_flag,
+                )?;
             }
         }
         InsertSource::Select(select_stmt) => {
@@ -2078,6 +2116,9 @@ pub fn codegen_insert(
 }
 
 /// Emit the INSERT loop for `VALUES (row), (row), ...`.
+///
+/// # Arguments
+/// * `oe_flag` - Conflict resolution flag (OE_ABORT, OE_IGNORE, OE_REPLACE, etc.)
 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 fn codegen_insert_values(
     b: &mut ProgramBuilder,
@@ -2086,6 +2127,7 @@ fn codegen_insert_values(
     table: &TableSchema,
     returning: &[ResultColumn],
     ctx: &CodegenContext,
+    oe_flag: u16,
 ) -> Result<(), CodegenError> {
     let n_cols = rows
         .first()
@@ -2162,14 +2204,14 @@ fn codegen_insert_values(
             0,
         );
 
-        // Insert.
+        // Insert with conflict resolution flag.
         b.emit_op(
             Opcode::Insert,
             cursor,
             rec_reg,
             rowid_reg,
             P4::Table(table.name.clone()),
-            0,
+            oe_flag,
         );
 
         // Index maintenance: insert into each index (bd-so1h).
@@ -3771,7 +3813,9 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
         Expr::Placeholder(pt, _) => {
             let idx = match pt {
                 fsqlite_ast::PlaceholderType::Numbered(n) => *n as i32,
-                _ => 1, // Anonymous or other — will be renumbered by caller.
+                fsqlite_ast::PlaceholderType::Anonymous => b.next_anon_placeholder_idx() as i32,
+                // Named placeholders: convert to sequential numbers for now
+                _ => b.next_anon_placeholder_idx() as i32,
             };
             b.emit_op(Opcode::Variable, idx, reg, 0, P4::None, 0);
         }

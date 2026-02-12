@@ -677,6 +677,8 @@ dependencies = [
  "fsqlite-ext-session",
  "fsqlite-types",
  "fsqlite-vfs",
+ "rand 0.8.5",
+ "tempfile",
 ]
 
 [[package]]

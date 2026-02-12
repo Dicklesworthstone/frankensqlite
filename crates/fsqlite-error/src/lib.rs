@@ -442,6 +442,24 @@ impl FrankenError {
         self.error_code() as i32
     }
 
+    /// Get the extended SQLite error code.
+    ///
+    /// SQLite extended error codes encode additional information in the upper bits:
+    /// `extended_code = (ext_num << 8) | base_code`
+    ///
+    /// For most errors, this returns the base error code. For BUSY variants:
+    /// - `Busy` → 5 (SQLITE_BUSY)
+    /// - `BusyRecovery` → 261 (SQLITE_BUSY_RECOVERY = 5 | (1 << 8))
+    /// - `BusySnapshot` → 517 (SQLITE_BUSY_SNAPSHOT = 5 | (2 << 8))
+    pub const fn extended_error_code(&self) -> i32 {
+        match self {
+            Self::Busy => 5,                           // SQLITE_BUSY
+            Self::BusyRecovery => 5 | (1 << 8),        // SQLITE_BUSY_RECOVERY = 261
+            Self::BusySnapshot { .. } => 5 | (2 << 8), // SQLITE_BUSY_SNAPSHOT = 517
+            _ => self.error_code() as i32,
+        }
+    }
+
     /// Create a syntax error.
     pub fn syntax(token: impl Into<String>) -> Self {
         Self::SyntaxError {
@@ -598,6 +616,37 @@ mod tests {
         assert_eq!(FrankenError::Busy.exit_code(), 5);
         assert_eq!(FrankenError::internal("x").exit_code(), 2);
         assert_eq!(FrankenError::syntax("x").exit_code(), 1);
+    }
+
+    #[test]
+    fn extended_error_codes() {
+        // Base SQLITE_BUSY = 5
+        assert_eq!(FrankenError::Busy.extended_error_code(), 5);
+        assert_eq!(FrankenError::Busy.error_code(), ErrorCode::Busy);
+
+        // SQLITE_BUSY_RECOVERY = 5 | (1 << 8) = 261
+        assert_eq!(FrankenError::BusyRecovery.extended_error_code(), 261);
+        assert_eq!(FrankenError::BusyRecovery.error_code(), ErrorCode::Busy);
+
+        // SQLITE_BUSY_SNAPSHOT = 5 | (2 << 8) = 517
+        let busy_snapshot = FrankenError::BusySnapshot {
+            conflicting_pages: "1, 2, 3".to_owned(),
+        };
+        assert_eq!(busy_snapshot.extended_error_code(), 517);
+        assert_eq!(busy_snapshot.error_code(), ErrorCode::Busy);
+
+        // All three share the same base error code but distinct extended codes
+        assert_eq!(FrankenError::Busy.error_code(), ErrorCode::Busy);
+        assert_eq!(FrankenError::BusyRecovery.error_code(), ErrorCode::Busy);
+        assert_eq!(busy_snapshot.error_code(), ErrorCode::Busy);
+        assert_ne!(
+            FrankenError::Busy.extended_error_code(),
+            busy_snapshot.extended_error_code()
+        );
+        assert_ne!(
+            FrankenError::BusyRecovery.extended_error_code(),
+            busy_snapshot.extended_error_code()
+        );
     }
 
     #[test]

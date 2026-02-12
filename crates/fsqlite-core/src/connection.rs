@@ -26,13 +26,13 @@ use fsqlite_func::FunctionRegistry;
 use fsqlite_pager::traits::{MvccPager, TransactionHandle, TransactionMode};
 use fsqlite_pager::{CheckpointMode, JournalMode, SimplePager};
 use fsqlite_parser::Parser;
+use fsqlite_types::DATABASE_HEADER_SIZE;
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::{AccessFlags, VfsOpenFlags};
 use fsqlite_types::opcode::{Opcode, P4};
 use fsqlite_types::record::{parse_record, serialize_record};
 use fsqlite_types::value::SqliteValue;
 use fsqlite_types::{BTreePageHeader, DatabaseHeader, PageNumber, PageSize, TextEncoding};
-use fsqlite_types::DATABASE_HEADER_SIZE;
 use fsqlite_vdbe::codegen::{
     CodegenContext, CodegenError, ColumnInfo, IndexSchema, TableSchema, codegen_delete,
     codegen_insert, codegen_select, codegen_update,
@@ -550,7 +550,10 @@ impl TriggerDef {
 /// For INSERT/DELETE, this is an exact match.
 /// For UPDATE, the trigger event must either be `Update([])` (any column) or
 /// `Update([cols])` where at least one of the specified columns is being updated.
-fn trigger_event_matches(trigger_event: &fsqlite_ast::TriggerEvent, dml_event: &fsqlite_ast::TriggerEvent) -> bool {
+fn trigger_event_matches(
+    trigger_event: &fsqlite_ast::TriggerEvent,
+    dml_event: &fsqlite_ast::TriggerEvent,
+) -> bool {
     use fsqlite_ast::TriggerEvent;
     match (trigger_event, dml_event) {
         (TriggerEvent::Insert, TriggerEvent::Insert)
@@ -565,9 +568,9 @@ fn trigger_event_matches(trigger_event: &fsqlite_ast::TriggerEvent, dml_event: &
                 return true;
             }
             // Otherwise, check if any trigger column is in the DML column list.
-            trigger_cols.iter().any(|tc| {
-                dml_cols.iter().any(|dc| tc.eq_ignore_ascii_case(dc))
-            })
+            trigger_cols
+                .iter()
+                .any(|tc| dml_cols.iter().any(|dc| tc.eq_ignore_ascii_case(dc)))
         }
         _ => false,
     }
@@ -937,6 +940,10 @@ impl Connection {
                 // View expansion: materialize referenced views as temp tables.
                 if self.has_view_references(select) {
                     return self.execute_with_materialized_views(select, params);
+                }
+                // 5G.4 (bd-3ly4): sqlite_master/sqlite_schema virtual table support.
+                if self.has_sqlite_schema_references(select) {
+                    return self.execute_with_materialized_sqlite_schema(select, params);
                 }
                 let distinct = is_distinct_select(select);
                 // Compound SELECT (UNION/UNION ALL/INTERSECT/EXCEPT).
@@ -2401,6 +2408,156 @@ impl Connection {
         result
     }
 
+    /// Check if a SELECT references sqlite_master/sqlite_schema in FROM/JOIN
+    /// and the virtual schema table is not already materialized.
+    fn has_sqlite_schema_references(&self, select: &SelectStatement) -> bool {
+        !self.collect_sqlite_schema_references(select).is_empty()
+    }
+
+    /// Collect sqlite_master/sqlite_schema names referenced by this SELECT.
+    fn collect_sqlite_schema_references(&self, select: &SelectStatement) -> Vec<String> {
+        let schema = self.schema.borrow();
+        let mut referenced = Vec::new();
+
+        let push_if_needed = |source: &TableOrSubquery, out: &mut Vec<String>| {
+            if let TableOrSubquery::Table { name, .. } = source
+                && let Some(canonical) = canonical_sqlite_schema_name(&name.name)
+                && !schema
+                    .iter()
+                    .any(|t| t.name.eq_ignore_ascii_case(canonical))
+                && !out.iter().any(|n| n.eq_ignore_ascii_case(canonical))
+            {
+                out.push(canonical.to_owned());
+            }
+        };
+
+        if let SelectCore::Select {
+            from: Some(from), ..
+        } = &select.body.select
+        {
+            push_if_needed(&from.source, &mut referenced);
+            for join in &from.joins {
+                push_if_needed(&join.table, &mut referenced);
+            }
+        }
+
+        referenced
+    }
+
+    /// Materialize sqlite_master/sqlite_schema as temporary in-memory tables,
+    /// execute the query, then clean up.
+    fn execute_with_materialized_sqlite_schema(
+        &self,
+        select: &SelectStatement,
+        params: Option<&[SqliteValue]>,
+    ) -> Result<Vec<Row>> {
+        let referenced = self.collect_sqlite_schema_references(select);
+        if referenced.is_empty() {
+            return self.execute_statement(Statement::Select(select.clone()), params);
+        }
+
+        let virtual_rows = self.build_sqlite_master_rows();
+        let virtual_columns = sqlite_master_column_infos();
+        let mut materialized: Vec<(String, i32)> = Vec::new();
+
+        for table_name in referenced {
+            let root_page = self.db.borrow_mut().create_table(virtual_columns.len());
+            self.schema.borrow_mut().push(TableSchema {
+                name: table_name.clone(),
+                root_page,
+                columns: virtual_columns.clone(),
+                indexes: Vec::new(),
+            });
+
+            if let Some(table) = self.db.borrow_mut().get_table_mut(root_page) {
+                for (idx, row_values) in virtual_rows.iter().enumerate() {
+                    #[allow(clippy::cast_possible_wrap)]
+                    let rowid = (idx + 1) as i64;
+                    table.insert_row(rowid, row_values.clone());
+                }
+            }
+
+            materialized.push((table_name, root_page));
+        }
+
+        let result = self.execute_statement(Statement::Select(select.clone()), params);
+
+        for (name, root_page) in &materialized {
+            let mut schema = self.schema.borrow_mut();
+            if let Some(idx) = schema
+                .iter()
+                .position(|t| t.root_page == *root_page && t.name.eq_ignore_ascii_case(name))
+            {
+                schema.remove(idx);
+            }
+            drop(schema);
+            self.db.borrow_mut().destroy_table(*root_page);
+        }
+
+        result
+    }
+
+    /// Build virtual sqlite_master rows from in-memory schema metadata.
+    ///
+    /// sqlite_master/sqlite_schema columns:
+    /// (type TEXT, name TEXT, tbl_name TEXT, rootpage INTEGER, sql TEXT)
+    fn build_sqlite_master_rows(&self) -> Vec<Vec<SqliteValue>> {
+        let schema = self.schema.borrow();
+        let views = self.views.borrow();
+        let triggers = self.triggers.borrow();
+        let mut rows = Vec::new();
+
+        for table in schema.iter() {
+            if is_sqlite_schema_name(&table.name)
+                || views
+                    .iter()
+                    .any(|view| view.name.eq_ignore_ascii_case(&table.name))
+            {
+                continue;
+            }
+
+            rows.push(vec![
+                SqliteValue::Text("table".to_owned()),
+                SqliteValue::Text(table.name.clone()),
+                SqliteValue::Text(table.name.clone()),
+                SqliteValue::Integer(i64::from(table.root_page)),
+                SqliteValue::Text(render_create_table_sql(table)),
+            ]);
+
+            for index in &table.indexes {
+                rows.push(vec![
+                    SqliteValue::Text("index".to_owned()),
+                    SqliteValue::Text(index.name.clone()),
+                    SqliteValue::Text(table.name.clone()),
+                    SqliteValue::Integer(i64::from(index.root_page)),
+                    SqliteValue::Text(render_create_index_sql(index, &table.name)),
+                ]);
+            }
+        }
+
+        for view in views.iter() {
+            rows.push(vec![
+                SqliteValue::Text("view".to_owned()),
+                SqliteValue::Text(view.name.clone()),
+                SqliteValue::Text(view.name.clone()),
+                SqliteValue::Integer(0),
+                SqliteValue::Text(format!("CREATE VIEW {}", view.name)),
+            ]);
+        }
+
+        for trigger in triggers.iter().filter(|t| !t.temporary) {
+            rows.push(vec![
+                SqliteValue::Text("trigger".to_owned()),
+                SqliteValue::Text(trigger.name.clone()),
+                SqliteValue::Text(trigger.table_name.clone()),
+                SqliteValue::Integer(0),
+                SqliteValue::Text(trigger.create_sql.clone()),
+            ]);
+        }
+
+        rows
+    }
+
     // ── Transaction control ──────────────────────────────────────────────
 
     /// Returns `true` if an explicit transaction is active.
@@ -2865,11 +3022,9 @@ impl Connection {
         ) {
             let header = self.pragma_database_header()?;
             let value = match name.as_str() {
-                "page_count" => SqliteValue::Integer(
-                    header
-                        .as_ref()
-                        .map_or(1, |hdr| i64::from(hdr.page_count)),
-                ),
+                "page_count" => {
+                    SqliteValue::Integer(header.as_ref().map_or(1, |hdr| i64::from(hdr.page_count)))
+                }
                 "freelist_count" => SqliteValue::Integer(
                     header
                         .as_ref()
@@ -2877,7 +3032,10 @@ impl Connection {
                 ),
                 "schema_version" => SqliteValue::Integer(i64::from(self.schema_cookie())),
                 "encoding" => {
-                    let encoding = match header.as_ref().map_or(TextEncoding::Utf8, |hdr| hdr.text_encoding) {
+                    let encoding = match header
+                        .as_ref()
+                        .map_or(TextEncoding::Utf8, |hdr| hdr.text_encoding)
+                    {
                         TextEncoding::Utf8 => "UTF-8",
                         TextEncoding::Utf16le => "UTF-16le",
                         TextEncoding::Utf16be => "UTF-16be",
@@ -4683,6 +4841,86 @@ fn has_subquery_source(select: &SelectStatement) -> bool {
         }
     }
     false
+}
+
+fn canonical_sqlite_schema_name(name: &str) -> Option<&'static str> {
+    if name.eq_ignore_ascii_case("sqlite_master") {
+        Some("sqlite_master")
+    } else if name.eq_ignore_ascii_case("sqlite_schema") {
+        Some("sqlite_schema")
+    } else {
+        None
+    }
+}
+
+fn is_sqlite_schema_name(name: &str) -> bool {
+    canonical_sqlite_schema_name(name).is_some()
+}
+
+fn sqlite_master_column_infos() -> Vec<ColumnInfo> {
+    vec![
+        ColumnInfo {
+            name: "type".to_owned(),
+            affinity: 'B',
+            is_ipk: false,
+        },
+        ColumnInfo {
+            name: "name".to_owned(),
+            affinity: 'B',
+            is_ipk: false,
+        },
+        ColumnInfo {
+            name: "tbl_name".to_owned(),
+            affinity: 'B',
+            is_ipk: false,
+        },
+        ColumnInfo {
+            name: "rootpage".to_owned(),
+            affinity: 'D',
+            is_ipk: false,
+        },
+        ColumnInfo {
+            name: "sql".to_owned(),
+            affinity: 'B',
+            is_ipk: false,
+        },
+    ]
+}
+
+fn render_create_table_sql(table: &TableSchema) -> String {
+    let column_defs = table
+        .columns
+        .iter()
+        .map(|col| {
+            let mut part = format!("{} {}", col.name, affinity_decl_type(col.affinity));
+            if col.is_ipk {
+                part.push_str(" PRIMARY KEY");
+            }
+            part
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("CREATE TABLE {} ({column_defs})", table.name)
+}
+
+fn render_create_index_sql(index: &IndexSchema, table_name: &str) -> String {
+    format!(
+        "CREATE INDEX {} ON {}({})",
+        index.name,
+        table_name,
+        index.columns.join(", ")
+    )
+}
+
+fn affinity_decl_type(affinity: char) -> &'static str {
+    match affinity.to_ascii_uppercase() {
+        'A' => "BLOB",
+        'B' => "TEXT",
+        'C' => "NUMERIC",
+        'D' => "INTEGER",
+        'E' => "REAL",
+        _ => "NUMERIC",
+    }
 }
 
 /// Check whether a `SelectCore` references a named table/CTE in any FROM source.
@@ -12065,7 +12303,8 @@ mod tests {
             other => panic!("expected integer schema_version, got {other:?}"),
         };
 
-        conn.execute("CREATE TABLE pragma_sv_t(id INTEGER);").unwrap();
+        conn.execute("CREATE TABLE pragma_sv_t(id INTEGER);")
+            .unwrap();
 
         let after_rows = conn.query("PRAGMA schema_version;").unwrap();
         assert_eq!(after_rows.len(), 1);
@@ -12081,7 +12320,10 @@ mod tests {
         let conn = Connection::open(":memory:").unwrap();
         let rows = conn.query("PRAGMA encoding;").unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Text("UTF-8".to_owned()));
+        assert_eq!(
+            *rows[0].get(0).unwrap(),
+            SqliteValue::Text("UTF-8".to_owned())
+        );
     }
 
     #[test]
@@ -12089,7 +12331,10 @@ mod tests {
         let conn = Connection::open(":memory:").unwrap();
         let rows = conn.query("PRAGMA main.encoding;").unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Text("UTF-8".to_owned()));
+        assert_eq!(
+            *rows[0].get(0).unwrap(),
+            SqliteValue::Text("UTF-8".to_owned())
+        );
     }
 
     #[test]
@@ -12136,6 +12381,38 @@ mod tests {
             assert_eq!(rows.len(), 1, "{sql} should return one row");
             assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Integer(expected));
         }
+    }
+
+    #[test]
+    fn test_pragma_serializable_and_raptorq_return_rows() {
+        let conn = Connection::open(":memory:").unwrap();
+
+        let rows = conn.query("PRAGMA fsqlite.serializable;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Integer(1));
+
+        let rows = conn.query("PRAGMA fsqlite.serializable=OFF;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Integer(0));
+
+        let rows = conn.query("PRAGMA fsqlite.serializable;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Integer(0));
+
+        let rows = conn.query("PRAGMA raptorq_repair_symbols;").unwrap();
+        assert_eq!(rows.len(), 1);
+        match rows[0].get(0).unwrap() {
+            SqliteValue::Integer(n) => assert!(*n >= 0),
+            other => panic!("expected integer raptorq_repair_symbols, got {other:?}"),
+        }
+
+        let rows = conn.query("PRAGMA raptorq_repair_symbols=7;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Integer(7));
+
+        let rows = conn.query("PRAGMA fsqlite.raptorq_repair_symbols;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Integer(7));
     }
 
     // ── Connection PRAGMA state tests (bd-1w6k.2.3) ────────────────────
@@ -13991,6 +14268,81 @@ mod sqlite_master_btree_tests {
         );
 
         eprintln!("[5A2][test=record_format][step=verify] cols={cols:?} ✓");
+    }
+
+    #[test]
+    fn test_select_sqlite_master_reports_table_and_index_rows() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT)")
+            .unwrap();
+        conn.execute("CREATE INDEX idx_users_email ON users(email)")
+            .unwrap();
+
+        let rows = conn
+            .query(
+                "SELECT type, name, tbl_name \
+                 FROM sqlite_master \
+                 WHERE type IN ('table', 'index') \
+                 ORDER BY type, name",
+            )
+            .unwrap();
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0].values(),
+            &[
+                SqliteValue::Text("index".to_owned()),
+                SqliteValue::Text("idx_users_email".to_owned()),
+                SqliteValue::Text("users".to_owned()),
+            ]
+        );
+        assert_eq!(
+            rows[1].values(),
+            &[
+                SqliteValue::Text("table".to_owned()),
+                SqliteValue::Text("users".to_owned()),
+                SqliteValue::Text("users".to_owned()),
+            ]
+        );
+
+        let count_rows = conn
+            .query("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='users'")
+            .unwrap();
+        assert_eq!(count_rows.len(), 1);
+        assert_eq!(
+            count_rows[0].get(0),
+            Some(&SqliteValue::Integer(1)),
+            "sqlite_master should contain the users table entry"
+        );
+    }
+
+    #[test]
+    fn test_sqlite_schema_alias_matches_sqlite_master_results() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE logs (id INTEGER PRIMARY KEY, msg TEXT)")
+            .unwrap();
+        conn.execute("CREATE INDEX idx_logs_msg ON logs(msg)")
+            .unwrap();
+
+        let master_rows = conn
+            .query(
+                "SELECT type, name, tbl_name, rootpage \
+                 FROM sqlite_master \
+                 ORDER BY type, name",
+            )
+            .unwrap();
+        let schema_rows = conn
+            .query(
+                "SELECT type, name, tbl_name, rootpage \
+                 FROM sqlite_schema \
+                 ORDER BY type, name",
+            )
+            .unwrap();
+
+        assert_eq!(
+            master_rows, schema_rows,
+            "sqlite_schema alias should return the same rows as sqlite_master"
+        );
     }
 }
 
