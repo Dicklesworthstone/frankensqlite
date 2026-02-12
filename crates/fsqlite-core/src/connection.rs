@@ -1497,6 +1497,20 @@ impl Connection {
         })
     }
 
+    /// Allocate a fresh page from the pager and initialize it as an empty
+    /// B-tree leaf index page (type 0x0A).  Returns the real `PageNumber`.
+    #[allow(clippy::cast_possible_wrap)]
+    fn allocate_index_root_page(&self) -> Result<i32> {
+        self.with_pager_write_txn(|cx, txn| {
+            let page_no = txn.allocate_page(cx)?;
+            let page_size = PageSize::DEFAULT.get();
+            let mut page = vec![0u8; page_size as usize];
+            BTreePageHeader::write_empty_leaf_index(&mut page, 0, page_size);
+            txn.write_page(cx, page_no, &page)?;
+            Ok(page_no.get() as i32)
+        })
+    }
+
     // ── sqlite_master helpers (bd-1b5e / 5A.2) ─────────────────────────
 
     /// Run a closure with a mutable pager transaction, auto-beginning and
@@ -1867,56 +1881,93 @@ impl Connection {
         Ok(())
     }
 
-    /// Execute a CREATE INDEX statement (schema-only; no physical index yet).
+    /// Execute a CREATE INDEX statement, allocating a B-tree root page.
     fn execute_create_index(&self, stmt: &fsqlite_ast::CreateIndexStatement) -> Result<()> {
         let table_name = &stmt.table;
-        let mut schema = self.schema.borrow_mut();
-        let table = schema
-            .iter_mut()
-            .find(|t| t.name.eq_ignore_ascii_case(table_name))
-            .ok_or_else(|| FrankenError::NoSuchTable {
-                name: table_name.clone(),
-            })?;
-        // Check for duplicate index name.
-        let index_name = &stmt.name.name;
-        if table
-            .indexes
-            .iter()
-            .any(|idx| idx.name.eq_ignore_ascii_case(index_name))
+        let index_name = stmt.name.name.clone();
+
+        // Phase 1: Validate schema (with borrow)
         {
-            if stmt.if_not_exists {
-                return Ok(());
-            }
-            return Err(FrankenError::Internal(format!(
-                "index {index_name} already exists"
-            )));
-        }
-        // Validate that all indexed columns exist and collect their names.
-        let mut col_names = Vec::with_capacity(stmt.columns.len());
-        for idx_col in &stmt.columns {
-            let col_name = expr_col_name(&idx_col.expr).ok_or_else(|| {
-                FrankenError::NotImplemented(
-                    "only column references are supported in CREATE INDEX".to_owned(),
-                )
-            })?;
-            if !table
-                .columns
+            let schema = self.schema.borrow();
+            let table = schema
                 .iter()
-                .any(|c| c.name.eq_ignore_ascii_case(col_name))
+                .find(|t| t.name.eq_ignore_ascii_case(table_name))
+                .ok_or_else(|| FrankenError::NoSuchTable {
+                    name: table_name.clone(),
+                })?;
+            // Check for duplicate index name.
+            if table
+                .indexes
+                .iter()
+                .any(|idx| idx.name.eq_ignore_ascii_case(&index_name))
             {
+                if stmt.if_not_exists {
+                    return Ok(());
+                }
                 return Err(FrankenError::Internal(format!(
-                    "no such column: {col_name}"
+                    "index {index_name} already exists"
                 )));
             }
-            col_names.push(col_name.to_owned());
         }
-        // Record the index in the schema for metadata purposes.
-        table.indexes.push(IndexSchema {
-            name: stmt.name.name.clone(),
-            columns: col_names,
-            root_page: 0,
-        });
-        drop(schema);
+
+        // Phase 2: Validate columns and collect names (with borrow)
+        let col_names = {
+            let schema = self.schema.borrow();
+            let table = schema
+                .iter()
+                .find(|t| t.name.eq_ignore_ascii_case(table_name))
+                .ok_or_else(|| FrankenError::NoSuchTable {
+                    name: table_name.clone(),
+                })?;
+            let mut names = Vec::with_capacity(stmt.columns.len());
+            for idx_col in &stmt.columns {
+                let col_name = expr_col_name(&idx_col.expr).ok_or_else(|| {
+                    FrankenError::NotImplemented(
+                        "only column references are supported in CREATE INDEX".to_owned(),
+                    )
+                })?;
+                if !table
+                    .columns
+                    .iter()
+                    .any(|c| c.name.eq_ignore_ascii_case(col_name))
+                {
+                    return Err(FrankenError::Internal(format!(
+                        "no such column: {col_name}"
+                    )));
+                }
+                names.push(col_name.to_owned());
+            }
+            names
+        };
+
+        // Phase 3: Allocate index B-tree root page (no borrow held)
+        let root_page = self.allocate_index_root_page()?;
+
+        // Phase 4: Create B-tree in db layer (for in-memory engine compatibility)
+        // Index B-trees have key = (indexed columns..., rowid), no payload columns
+        self.db.borrow_mut().create_table_at(root_page, 0);
+
+        // Phase 5: Record index in schema (with mut borrow)
+        {
+            let mut schema = self.schema.borrow_mut();
+            let table = schema
+                .iter_mut()
+                .find(|t| t.name.eq_ignore_ascii_case(table_name))
+                .ok_or_else(|| FrankenError::NoSuchTable {
+                    name: table_name.clone(),
+                })?;
+            table.indexes.push(IndexSchema {
+                name: index_name.clone(),
+                columns: col_names.clone(),
+                root_page,
+            });
+        }
+
+        // Phase 6: Persist to sqlite_master
+        let create_sql =
+            crate::compat_persist::build_create_index_sql(&index_name, table_name, &col_names);
+        self.insert_sqlite_master_row("index", &index_name, table_name, root_page, &create_sql)?;
+
         self.increment_schema_cookie();
         Ok(())
     }
@@ -11535,7 +11586,7 @@ mod tests {
         use fsqlite_btree::cursor::PageWriter;
         use fsqlite_mvcc::ConcurrentHandle;
         use fsqlite_pager::traits::TransactionMode;
-        use fsqlite_types::Snapshot;
+        use fsqlite_types::{Snapshot, TxnEpoch, TxnId, TxnToken};
 
         let conn = Connection::open(":memory:").unwrap();
         let cx = Cx::new();
@@ -11545,9 +11596,10 @@ mod tests {
 
         // Create MVCC state.
         let snapshot = Snapshot::new(CommitSeq::ZERO, SchemaEpoch::new(0));
-        let mut handle = ConcurrentHandle::new(snapshot);
-        let lock_table = InProcessPageLockTable::new();
         let session_id = 1;
+        let txn_token = TxnToken::new(TxnId::new(session_id).unwrap(), TxnEpoch::new(1));
+        let mut handle = ConcurrentHandle::new(snapshot, txn_token);
+        let lock_table = InProcessPageLockTable::new();
 
         // Create MvccPageIo wrapper.
         let mut mvcc_io = MvccPageIo::new(&mut *txn, &mut handle, &lock_table, session_id);
@@ -11571,7 +11623,7 @@ mod tests {
         use fsqlite_btree::cursor::{PageReader, PageWriter};
         use fsqlite_mvcc::ConcurrentHandle;
         use fsqlite_pager::traits::TransactionMode;
-        use fsqlite_types::Snapshot;
+        use fsqlite_types::{Snapshot, TxnEpoch, TxnId, TxnToken};
 
         let conn = Connection::open(":memory:").unwrap();
         let cx = Cx::new();
@@ -11579,9 +11631,10 @@ mod tests {
         let mut txn = conn.pager.begin(&cx, TransactionMode::Deferred).unwrap();
 
         let snapshot = Snapshot::new(CommitSeq::ZERO, SchemaEpoch::new(0));
-        let mut handle = ConcurrentHandle::new(snapshot);
-        let lock_table = InProcessPageLockTable::new();
         let session_id = 1;
+        let txn_token = TxnToken::new(TxnId::new(session_id).unwrap(), TxnEpoch::new(1));
+        let mut handle = ConcurrentHandle::new(snapshot, txn_token);
+        let lock_table = InProcessPageLockTable::new();
 
         let mut mvcc_io = MvccPageIo::new(&mut *txn, &mut handle, &lock_table, session_id);
 
@@ -11603,7 +11656,7 @@ mod tests {
         use fsqlite_btree::cursor::PageWriter;
         use fsqlite_mvcc::ConcurrentHandle;
         use fsqlite_pager::traits::TransactionMode;
-        use fsqlite_types::Snapshot;
+        use fsqlite_types::{Snapshot, TxnEpoch, TxnId, TxnToken};
 
         let conn1 = Connection::open(":memory:").unwrap();
         let conn2 = Connection::open(":memory:").unwrap();
@@ -11615,8 +11668,9 @@ mod tests {
         // Session 1 writes to page 2.
         let mut txn1 = conn1.pager.begin(&cx, TransactionMode::Deferred).unwrap();
         let snapshot1 = Snapshot::new(CommitSeq::ZERO, SchemaEpoch::new(0));
-        let mut handle1 = ConcurrentHandle::new(snapshot1);
         let session_id_1 = 1;
+        let txn_token_1 = TxnToken::new(TxnId::new(session_id_1).unwrap(), TxnEpoch::new(1));
+        let mut handle1 = ConcurrentHandle::new(snapshot1, txn_token_1);
 
         {
             let mut mvcc_io1 = MvccPageIo::new(&mut *txn1, &mut handle1, &lock_table, session_id_1);
@@ -11628,8 +11682,9 @@ mod tests {
         // Session 2 tries to write to the same page - should fail with Busy.
         let mut txn2 = conn2.pager.begin(&cx, TransactionMode::Deferred).unwrap();
         let snapshot2 = Snapshot::new(CommitSeq::ZERO, SchemaEpoch::new(0));
-        let mut handle2 = ConcurrentHandle::new(snapshot2);
         let session_id_2 = 2;
+        let txn_token_2 = TxnToken::new(TxnId::new(session_id_2).unwrap(), TxnEpoch::new(2));
+        let mut handle2 = ConcurrentHandle::new(snapshot2, txn_token_2);
 
         {
             let mut mvcc_io2 = MvccPageIo::new(&mut *txn2, &mut handle2, &lock_table, session_id_2);

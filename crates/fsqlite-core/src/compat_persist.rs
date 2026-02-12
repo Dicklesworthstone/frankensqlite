@@ -367,6 +367,24 @@ pub(crate) fn build_create_table_sql(table: &TableSchema) -> String {
     sql
 }
 
+/// Reconstruct a `CREATE INDEX` statement from index metadata.
+pub(crate) fn build_create_index_sql(
+    index_name: &str,
+    table_name: &str,
+    columns: &[String],
+) -> String {
+    use std::fmt::Write as _;
+    let mut sql = format!("CREATE INDEX \"{}\" ON \"{}\" (", index_name, table_name);
+    for (i, col) in columns.iter().enumerate() {
+        if i > 0 {
+            sql.push_str(", ");
+        }
+        let _ = write!(sql, "\"{}\"", col);
+    }
+    sql.push(')');
+    sql
+}
+
 /// Map affinity character to SQL type keyword.
 const fn affinity_char_to_type(affinity: char) -> &'static str {
     match affinity {

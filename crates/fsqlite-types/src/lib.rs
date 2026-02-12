@@ -1346,6 +1346,33 @@ impl BTreePageHeader {
         // fragmented_free_bytes = 0
         page[header_offset + 7] = 0;
     }
+
+    /// Initialize an empty leaf index page (type `0x0A`) with zero cells,
+    /// suitable for a newly created index root page.
+    ///
+    /// `header_offset` is the byte offset of the B-tree header within the
+    /// page buffer (0 for all non-page-1 pages).
+    ///
+    /// `usable_size` equals `page_size − reserved_per_page`.
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn write_empty_leaf_index(page: &mut [u8], header_offset: usize, usable_size: u32) {
+        page[header_offset] = BTreePageType::LeafIndex as u8; // 0x0A
+        // first_freeblock = 0 (no freeblocks)
+        page[header_offset + 1] = 0;
+        page[header_offset + 2] = 0;
+        // cell_count = 0
+        page[header_offset + 3] = 0;
+        page[header_offset + 4] = 0;
+        // cell content area offset (0 encodes 65536)
+        let content_raw = if usable_size >= 65_536 {
+            0u16
+        } else {
+            usable_size as u16
+        };
+        page[header_offset + 5..header_offset + 7].copy_from_slice(&content_raw.to_be_bytes());
+        // fragmented_free_bytes = 0
+        page[header_offset + 7] = 0;
+    }
 }
 
 /// A freeblock entry in a B-tree page freeblock list.
