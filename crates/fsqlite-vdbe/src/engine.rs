@@ -17,7 +17,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use fsqlite_btree::{BtCursor, BtreeCursorOps, MemPageStore, PageReader, PageWriter, SeekResult};
-use fsqlite_error::{FrankenError, Result};
+use fsqlite_error::{ErrorCode, FrankenError, Result};
 use fsqlite_func::{ErasedAggregateFunction, FunctionRegistry};
 use fsqlite_mvcc::{ConcurrentRegistry, InProcessPageLockTable, MvccError, concurrent_write_page};
 use fsqlite_pager::TransactionHandle;
@@ -2095,6 +2095,10 @@ impl VdbeEngine {
                     let oe_flag = op.p5 & 0x0F; // Low 4 bits for OE_* mode
                     let rowid = self.get_reg(rowid_reg).to_integer();
                     let record_val = self.get_reg(record_reg).clone();
+                    let pk_conflict = ExecOutcome::Error {
+                        code: ErrorCode::Constraint as i32,
+                        message: "PRIMARY KEY constraint failed".to_owned(),
+                    };
 
                     // Phase 5B.2 (bd-1yi8): write-through — route ONLY through
                     // StorageCursor when one exists; fall back to MemDatabase
@@ -2115,10 +2119,8 @@ impl VdbeEngine {
                                         sc.cursor.table_insert(&sc.cx, rowid, &blob)?;
                                     }
                                     _ => {
-                                        // Default (ABORT/FAIL/ROLLBACK): UPSERT for now
-                                        // TODO: proper constraint violation handling
-                                        sc.cursor.delete(&sc.cx)?;
-                                        sc.cursor.table_insert(&sc.cx, rowid, &blob)?;
+                                        // Default (ABORT/FAIL/ROLLBACK): constraint error.
+                                        return Ok(pk_conflict);
                                     }
                                 }
                             } else {
@@ -2145,8 +2147,8 @@ impl VdbeEngine {
                                         db.upsert_row(root, rowid, values);
                                     }
                                     _ => {
-                                        // Default: UPSERT for now
-                                        db.upsert_row(root, rowid, values);
+                                        // Default (ABORT/FAIL/ROLLBACK): constraint error.
+                                        return Ok(pk_conflict);
                                     }
                                 }
                             } else {
@@ -2155,6 +2157,12 @@ impl VdbeEngine {
                             }
                         }
                     }
+
+                    // br-22iss: Clear pending_next_after_delete since Insert repositions
+                    // the cursor. This is critical for UPDATE (Delete+Insert) to avoid
+                    // infinite loops when the rowid doesn't change.
+                    self.pending_next_after_delete.remove(&cursor_id);
+
                     pc += 1;
                 }
 
@@ -2375,9 +2383,10 @@ impl VdbeEngine {
 
                 Opcode::Variable => {
                     // Bind parameter (1-indexed). Unbound params read as NULL.
-                    let value = usize::try_from(op.p1)
+                    let idx = usize::try_from(op.p1)
                         .ok()
-                        .and_then(|one_based| one_based.checked_sub(1))
+                        .and_then(|one_based| one_based.checked_sub(1));
+                    let value = idx
                         .and_then(|idx| self.bindings.get(idx))
                         .cloned()
                         .unwrap_or(SqliteValue::Null);
@@ -6391,8 +6400,8 @@ mod tests {
     }
 
     #[test]
-    fn test_insert_upsert_via_btree() {
-        // Insert same rowid twice — second insert should overwrite.
+    fn test_insert_replace_upsert_via_btree() {
+        // Insert same rowid twice with OE_REPLACE — second insert should overwrite.
         let mut db = MemDatabase::new();
         let root = db.create_table(1);
 
@@ -6407,10 +6416,10 @@ mod tests {
             b.emit_op(Opcode::MakeRecord, 2, 1, 3, P4::None, 0);
             b.emit_op(Opcode::Insert, 0, 3, 1, P4::None, 0);
 
-            // Insert rowid=1 again with value=99 (upsert).
+            // Insert rowid=1 again with value=99 (OE_REPLACE upsert).
             b.emit_op(Opcode::Integer, 99, 4, 0, P4::None, 0);
             b.emit_op(Opcode::MakeRecord, 4, 1, 5, P4::None, 0);
-            b.emit_op(Opcode::Insert, 0, 5, 1, P4::None, 0);
+            b.emit_op(Opcode::Insert, 0, 5, 1, P4::None, 5);
 
             // Read back.
             b.emit_jump_to_label(Opcode::Rewind, 0, 0, end, P4::None, 0);
@@ -6428,6 +6437,91 @@ mod tests {
         // Only one row with the updated value.
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0][0], SqliteValue::Integer(99));
+    }
+
+    #[test]
+    fn test_insert_default_conflict_errors_via_btree() {
+        // Default conflict mode (OE_ABORT) must raise constraint error.
+        let mut db = MemDatabase::new();
+        let root = db.create_table(1);
+
+        let mut b = ProgramBuilder::new();
+        let end = b.emit_label();
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+        b.emit_op(Opcode::OpenWrite, 0, root, 0, P4::Int(1), 0);
+
+        // Insert rowid=1.
+        b.emit_op(Opcode::Integer, 1, 1, 0, P4::None, 0);
+        b.emit_op(Opcode::Integer, 10, 2, 0, P4::None, 0);
+        b.emit_op(Opcode::MakeRecord, 2, 1, 3, P4::None, 0);
+        b.emit_op(Opcode::Insert, 0, 3, 1, P4::None, 0);
+
+        // Duplicate rowid=1 with default conflict handling.
+        b.emit_op(Opcode::Integer, 99, 4, 0, P4::None, 0);
+        b.emit_op(Opcode::MakeRecord, 4, 1, 5, P4::None, 0);
+        b.emit_op(Opcode::Insert, 0, 5, 1, P4::None, 0);
+
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end);
+
+        let prog = b.finish().expect("program should build");
+        let mut engine = VdbeEngine::new(prog.register_count());
+        engine.enable_storage_cursors(true);
+        engine.set_database(db);
+
+        let outcome = engine.execute(&prog).expect("execution should succeed");
+        assert_eq!(
+            outcome,
+            ExecOutcome::Error {
+                code: ErrorCode::Constraint as i32,
+                message: "PRIMARY KEY constraint failed".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_insert_default_conflict_errors_memdb_path() {
+        // Same behavior must hold for the legacy MemDatabase cursor path.
+        let mut db = MemDatabase::new();
+        let root = db.create_table(1);
+
+        let mut b = ProgramBuilder::new();
+        let end = b.emit_label();
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+        b.emit_op(Opcode::OpenWrite, 0, root, 0, P4::Int(1), 0);
+
+        // Insert rowid=1.
+        b.emit_op(Opcode::Integer, 1, 1, 0, P4::None, 0);
+        b.emit_op(Opcode::Integer, 10, 2, 0, P4::None, 0);
+        b.emit_op(Opcode::MakeRecord, 2, 1, 3, P4::None, 0);
+        b.emit_op(Opcode::Insert, 0, 3, 1, P4::None, 0);
+
+        // Duplicate rowid=1 with default conflict handling.
+        b.emit_op(Opcode::Integer, 99, 4, 0, P4::None, 0);
+        b.emit_op(Opcode::MakeRecord, 4, 1, 5, P4::None, 0);
+        b.emit_op(Opcode::Insert, 0, 5, 1, P4::None, 0);
+
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end);
+
+        let prog = b.finish().expect("program should build");
+        let mut engine = VdbeEngine::new(prog.register_count());
+        engine.enable_storage_cursors(false);
+        engine.set_database(db);
+
+        let outcome = engine.execute(&prog).expect("execution should succeed");
+        assert_eq!(
+            outcome,
+            ExecOutcome::Error {
+                code: ErrorCode::Constraint as i32,
+                message: "PRIMARY KEY constraint failed".to_owned(),
+            }
+        );
+
+        let db = engine.take_database().expect("database should exist");
+        let table = db.get_table(root).expect("table should exist");
+        assert_eq!(table.rows.len(), 1);
+        assert_eq!(table.rows[0].values, vec![SqliteValue::Integer(10)]);
     }
 
     // ── bd-2a3y: TransactionPageIo / SharedTxnPageIo integration tests ──
