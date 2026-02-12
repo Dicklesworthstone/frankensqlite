@@ -2735,6 +2735,10 @@ pub fn codegen_update(
         .iter()
         .map(|a| count_anon_placeholders(&a.value))
         .sum();
+    let where_placeholder_count = stmt
+        .where_clause
+        .as_ref()
+        .map_or(0, count_anon_placeholders);
 
     // Evaluate WHERE condition (if any) and skip non-matching rows.
     let skip_label = b.emit_label();
@@ -2863,6 +2867,10 @@ pub fn codegen_update(
 
     // RETURNING clause: position cursor on updated row and read columns.
     if !stmt.returning.is_empty() {
+        // RETURNING appears after WHERE in SQL textual order; restore the
+        // post-WHERE placeholder index so RETURNING placeholders don't collide
+        // with SET placeholder numbering.
+        b.set_next_anon_placeholder(set_placeholder_count + where_placeholder_count + 1);
         emit_returning(b, table_cursor, table, &stmt.returning, rowid_reg)?;
     }
 
@@ -7264,8 +7272,11 @@ mod tests {
     }
 
     #[test]
-    fn test_codegen_update_set_subquery_anonymous_placeholder_offsets_where() {
-        // UPDATE t SET b = a IN (SELECT b FROM s WHERE b = ?) WHERE a = ?
+    fn test_codegen_update_set_subquery_anonymous_placeholder_offsets_where_and_returning() {
+        // UPDATE t
+        // SET b = a IN (SELECT b FROM s WHERE b = ?)
+        // WHERE a = ?
+        // RETURNING ?
         //
         // SQL placeholder order: SET-subquery first, WHERE second.
         // Bytecode emission order is WHERE first, then SET; codegen must offset
@@ -7319,7 +7330,10 @@ mod tests {
                 right: Box::new(Expr::Placeholder(PlaceholderType::Anonymous, Span::ZERO)),
                 span: Span::ZERO,
             }),
-            returning: vec![],
+            returning: vec![ResultColumn::Expr {
+                expr: Expr::Placeholder(PlaceholderType::Anonymous, Span::ZERO),
+                alias: None,
+            }],
             order_by: vec![],
             limit: None,
         };
@@ -7338,8 +7352,8 @@ mod tests {
             .collect();
         assert_eq!(
             variable_params,
-            vec![2, 1],
-            "WHERE placeholder must be shifted past SET placeholders, including placeholders nested in SET subqueries"
+            vec![2, 1, 3],
+            "placeholder numbering must follow SQL lexical order across WHERE (emitted first), SET, and RETURNING"
         );
     }
 
