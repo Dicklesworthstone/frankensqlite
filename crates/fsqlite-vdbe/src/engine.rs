@@ -1857,116 +1857,159 @@ impl VdbeEngine {
                     let cursor_id = op.p1;
                     // Seek repositions the cursor, so clear any pending delete state.
                     self.pending_next_after_delete.remove(&cursor_id);
-                    let key = self.get_reg(op.p3).to_integer();
+                    let key_val = self.get_reg(op.p3).clone();
 
-                    let found = if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
-                        // Route through B-tree cursor (Phase 5 path).
-                        //
-                        // table_move_to semantics:
-                        // - Found: cursor positioned at exact key
-                        // - NotFound: cursor positioned at entry that would follow
-                        //   key in sort order (or EOF if no such entry)
-                        let seek_result = cursor.cursor.table_move_to(&cursor.cx, key)?;
-
-                        match op.opcode {
-                            Opcode::SeekGE => {
-                                // Need first row >= key.
-                                // table_move_to already positions at key (Found) or
-                                // at next larger (NotFound). Check for EOF.
-                                !cursor.cursor.eof()
+                    let found = if matches!(key_val, SqliteValue::Blob(_)) {
+                        // Index seek path: probe register contains serialized key
+                        // bytes (typically from MakeRecord).
+                        let key_bytes = record_blob_bytes(&key_val);
+                        if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
+                            let seek_result =
+                                cursor.cursor.index_move_to(&cursor.cx, &key_bytes)?;
+                            match op.opcode {
+                                Opcode::SeekGE => !cursor.cursor.eof(),
+                                Opcode::SeekGT => {
+                                    if seek_result.is_found() {
+                                        cursor.cursor.next(&cursor.cx)?
+                                    } else {
+                                        !cursor.cursor.eof()
+                                    }
+                                }
+                                Opcode::SeekLE => {
+                                    if seek_result.is_found() {
+                                        true
+                                    } else if cursor.cursor.eof() {
+                                        cursor.cursor.last(&cursor.cx)?
+                                    } else {
+                                        cursor.cursor.prev(&cursor.cx)?
+                                    }
+                                }
+                                Opcode::SeekLT => {
+                                    if cursor.cursor.eof() {
+                                        cursor.cursor.last(&cursor.cx)?
+                                    } else {
+                                        cursor.cursor.prev(&cursor.cx)?
+                                    }
+                                }
+                                _ => unreachable!(),
                             }
-                            Opcode::SeekGT => {
-                                // Need first row > key.
-                                // If Found (at exact key), advance past it.
-                                // If NotFound, already past key.
-                                if seek_result.is_found() {
-                                    cursor.cursor.next(&cursor.cx)?
-                                } else {
+                        } else {
+                            false
+                        }
+                    } else {
+                        let key = key_val.to_integer();
+                        if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
+                            // Route through B-tree cursor (Phase 5 path).
+                            //
+                            // table_move_to semantics:
+                            // - Found: cursor positioned at exact key
+                            // - NotFound: cursor positioned at entry that would follow
+                            //   key in sort order (or EOF if no such entry)
+                            let seek_result = cursor.cursor.table_move_to(&cursor.cx, key)?;
+
+                            match op.opcode {
+                                Opcode::SeekGE => {
+                                    // Need first row >= key.
+                                    // table_move_to already positions at key (Found) or
+                                    // at next larger (NotFound). Check for EOF.
                                     !cursor.cursor.eof()
                                 }
-                            }
-                            Opcode::SeekLE => {
-                                // Need last row <= key.
-                                // If Found, we're at the exact key - done.
-                                // If NotFound, cursor is at entry > key, so prev().
-                                if seek_result.is_found() {
-                                    true
-                                } else if cursor.cursor.eof() {
-                                    // All entries < key, position at last.
-                                    cursor.cursor.last(&cursor.cx)?
-                                } else {
-                                    // Cursor at entry > key, move to previous.
-                                    cursor.cursor.prev(&cursor.cx)?
-                                }
-                            }
-                            Opcode::SeekLT => {
-                                // Need last row < key.
-                                // Cursor is either at key (Found) or past key (NotFound).
-                                // Either way, we need to go to the previous entry.
-                                if cursor.cursor.eof() {
-                                    // All entries < key, position at last.
-                                    cursor.cursor.last(&cursor.cx)?
-                                } else {
-                                    // Go to previous entry (which will be < key).
-                                    cursor.cursor.prev(&cursor.cx)?
-                                }
-                            }
-                            _ => unreachable!(),
-                        }
-                    } else if let Some(cursor) = self.cursors.get_mut(&cursor_id) {
-                        // MemCursor fallback (Phase 4 path).
-                        // Implement proper seeking via linear scan for correctness.
-                        if let Some(db) = self.db.as_ref() {
-                            if let Some(table) = db.get_table(cursor.root_page) {
-                                if table.rows.is_empty() {
-                                    false
-                                } else {
-                                    match op.opcode {
-                                        Opcode::SeekGE => {
-                                            // Find first row with rowid >= key.
-                                            let pos =
-                                                table.rows.iter().position(|r| r.rowid >= key);
-                                            if let Some(idx) = pos {
-                                                cursor.position = Some(idx);
-                                                true
-                                            } else {
-                                                false
-                                            }
-                                        }
-                                        Opcode::SeekGT => {
-                                            // Find first row with rowid > key.
-                                            let pos = table.rows.iter().position(|r| r.rowid > key);
-                                            if let Some(idx) = pos {
-                                                cursor.position = Some(idx);
-                                                true
-                                            } else {
-                                                false
-                                            }
-                                        }
-                                        Opcode::SeekLE => {
-                                            // Find last row with rowid <= key.
-                                            let pos =
-                                                table.rows.iter().rposition(|r| r.rowid <= key);
-                                            if let Some(idx) = pos {
-                                                cursor.position = Some(idx);
-                                                true
-                                            } else {
-                                                false
-                                            }
-                                        }
-                                        Opcode::SeekLT => {
-                                            // Find last row with rowid < key.
-                                            let pos =
-                                                table.rows.iter().rposition(|r| r.rowid < key);
-                                            if let Some(idx) = pos {
-                                                cursor.position = Some(idx);
-                                                true
-                                            } else {
-                                                false
-                                            }
-                                        }
-                                        _ => unreachable!(),
+                                Opcode::SeekGT => {
+                                    // Need first row > key.
+                                    // If Found (at exact key), advance past it.
+                                    // If NotFound, already past key.
+                                    if seek_result.is_found() {
+                                        cursor.cursor.next(&cursor.cx)?
+                                    } else {
+                                        !cursor.cursor.eof()
                                     }
+                                }
+                                Opcode::SeekLE => {
+                                    // Need last row <= key.
+                                    // If Found, we're at the exact key - done.
+                                    // If NotFound, cursor is at entry > key, so prev().
+                                    if seek_result.is_found() {
+                                        true
+                                    } else if cursor.cursor.eof() {
+                                        // All entries < key, position at last.
+                                        cursor.cursor.last(&cursor.cx)?
+                                    } else {
+                                        // Cursor at entry > key, move to previous.
+                                        cursor.cursor.prev(&cursor.cx)?
+                                    }
+                                }
+                                Opcode::SeekLT => {
+                                    // Need last row < key.
+                                    // Cursor is either at key (Found) or past key (NotFound).
+                                    // Either way, we need to go to the previous entry.
+                                    if cursor.cursor.eof() {
+                                        // All entries < key, position at last.
+                                        cursor.cursor.last(&cursor.cx)?
+                                    } else {
+                                        // Go to previous entry (which will be < key).
+                                        cursor.cursor.prev(&cursor.cx)?
+                                    }
+                                }
+                                _ => unreachable!(),
+                            }
+                        } else if let Some(cursor) = self.cursors.get_mut(&cursor_id) {
+                            // MemCursor fallback (Phase 4 path).
+                            // Implement proper seeking via linear scan for correctness.
+                            if let Some(db) = self.db.as_ref() {
+                                if let Some(table) = db.get_table(cursor.root_page) {
+                                    if table.rows.is_empty() {
+                                        false
+                                    } else {
+                                        match op.opcode {
+                                            Opcode::SeekGE => {
+                                                // Find first row with rowid >= key.
+                                                let pos =
+                                                    table.rows.iter().position(|r| r.rowid >= key);
+                                                if let Some(idx) = pos {
+                                                    cursor.position = Some(idx);
+                                                    true
+                                                } else {
+                                                    false
+                                                }
+                                            }
+                                            Opcode::SeekGT => {
+                                                // Find first row with rowid > key.
+                                                let pos =
+                                                    table.rows.iter().position(|r| r.rowid > key);
+                                                if let Some(idx) = pos {
+                                                    cursor.position = Some(idx);
+                                                    true
+                                                } else {
+                                                    false
+                                                }
+                                            }
+                                            Opcode::SeekLE => {
+                                                // Find last row with rowid <= key.
+                                                let pos =
+                                                    table.rows.iter().rposition(|r| r.rowid <= key);
+                                                if let Some(idx) = pos {
+                                                    cursor.position = Some(idx);
+                                                    true
+                                                } else {
+                                                    false
+                                                }
+                                            }
+                                            Opcode::SeekLT => {
+                                                // Find last row with rowid < key.
+                                                let pos =
+                                                    table.rows.iter().rposition(|r| r.rowid < key);
+                                                if let Some(idx) = pos {
+                                                    cursor.position = Some(idx);
+                                                    true
+                                                } else {
+                                                    false
+                                                }
+                                            }
+                                            _ => unreachable!(),
+                                        }
+                                    }
+                                } else {
+                                    false
                                 }
                             } else {
                                 false
@@ -1974,8 +2017,6 @@ impl VdbeEngine {
                         } else {
                             false
                         }
-                    } else {
-                        false
                     };
                     if found {
                         pc += 1;

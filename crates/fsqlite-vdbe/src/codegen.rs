@@ -532,6 +532,7 @@ pub fn codegen_select(
     } else {
         None
     };
+    let mut index_cursor_to_close = None;
 
     if let Some(param_idx) = rowid_param {
         // --- Rowid-seek SELECT ---
@@ -563,8 +564,26 @@ pub fn codegen_select(
         // --- Index-seek SELECT ---
         if let Some(idx_schema) = table.index_for_column(col_name) {
             let idx_cursor = 1_i32;
+            index_cursor_to_close = Some(idx_cursor);
+            let full_scan_fallback = b.emit_label();
+
             let param_reg = b.alloc_reg();
             b.emit_op(Opcode::Variable, *param_idx, param_reg, 0, P4::None, 0);
+
+            // Build probe key: [bound_value, i64::MIN] so SeekGE lands on the
+            // first duplicate for the bound value.
+            let min_rowid_reg = b.alloc_reg();
+            b.emit_op(Opcode::Int64, 0, min_rowid_reg, 0, P4::Int64(i64::MIN), 0);
+            let probe_record_reg = b.alloc_reg();
+            b.emit_op(
+                Opcode::MakeRecord,
+                param_reg,
+                2,
+                probe_record_reg,
+                P4::None,
+                0,
+            );
+
             b.emit_op(
                 Opcode::OpenRead,
                 cursor,
@@ -578,20 +597,72 @@ pub fn codegen_select(
                 idx_cursor,
                 idx_schema.root_page,
                 0,
-                P4::Table(idx_schema.name.clone()),
+                P4::Index(idx_schema.name.clone()),
                 0,
             );
-            // SeekGE on index, then check equality with Found.
-            b.emit_jump_to_label(Opcode::SeekGE, idx_cursor, 0, done_label, P4::None, 0);
+            b.emit_jump_to_label(
+                Opcode::SeekGE,
+                idx_cursor,
+                probe_record_reg,
+                full_scan_fallback,
+                P4::None,
+                0,
+            );
+
+            // Guard correctness: if the first key >= probe is not equal to the
+            // requested value, there is no matching row.
+            let idx_key_reg = b.alloc_reg();
+            b.emit_op(Opcode::Column, idx_cursor, 0, idx_key_reg, P4::None, 0);
+            b.emit_jump_to_label(
+                Opcode::Ne,
+                param_reg,
+                idx_key_reg,
+                full_scan_fallback,
+                P4::None,
+                0,
+            );
+
             let rowid_reg = b.alloc_reg();
             b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
-            b.emit_op(Opcode::SeekRowid, cursor, 0, rowid_reg, P4::None, 0);
+            b.emit_jump_to_label(
+                Opcode::SeekRowid,
+                cursor,
+                rowid_reg,
+                full_scan_fallback,
+                P4::None,
+                0,
+            );
 
             // Read columns.
             emit_column_reads(b, cursor, columns, table, table_alias, schema, out_regs)?;
 
             // ResultRow.
             b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+
+            // Safety fallback: if index probe cannot produce a verified row
+            // (e.g. unavailable/stale index backend), run a full table scan.
+            b.resolve_label(full_scan_fallback);
+            let loop_start = b.current_addr();
+            b.emit_jump_to_label(Opcode::Rewind, cursor, 0, done_label, P4::None, 0);
+            let skip_label = b.emit_label();
+            if let Some(where_expr) = where_clause.as_deref() {
+                emit_where_filter(
+                    b,
+                    where_expr,
+                    cursor,
+                    table,
+                    table_alias,
+                    schema,
+                    skip_label,
+                );
+            }
+            emit_column_reads(b, cursor, columns, table, table_alias, schema, out_regs)?;
+            b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
+            b.resolve_label(skip_label);
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            let loop_body = (loop_start + 1) as i32;
+            b.emit_op(Opcode::Next, cursor, loop_body, 0, P4::None, 0);
         } else {
             // Fallback to full scan.
             return codegen_select_full_scan(
@@ -695,6 +766,9 @@ pub fn codegen_select(
 
     // Done: Close + Halt.
     b.resolve_label(done_label);
+    if let Some(idx_cursor) = index_cursor_to_close {
+        b.emit_op(Opcode::Close, idx_cursor, 0, 0, P4::None, 0);
+    }
     b.emit_op(Opcode::Close, cursor, 0, 0, P4::None, 0);
     b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
 
@@ -1388,8 +1462,10 @@ struct AggColumn {
     name: String,
     /// Number of arguments (0 for count(*), 1 for sum(col), etc.).
     num_args: i32,
-    /// Column index of the argument (for single-arg aggregates), or `None` for count(*).
+    /// Column index of the argument (for single-arg aggregates), or `None` for count(*) or rowid.
     arg_col_index: Option<usize>,
+    /// True if the argument is the INTEGER PRIMARY KEY (rowid) column.
+    arg_is_rowid: bool,
 }
 
 /// Generate VDBE bytecode for an aggregate SELECT (no GROUP BY yet).
@@ -1472,8 +1548,13 @@ fn codegen_select_aggregate(
         } else {
             // Single-arg aggregate: read column value into a temp, then AggStep.
             let arg_reg = b.alloc_temp();
-            let col_idx = agg.arg_col_index.unwrap_or(0);
-            b.emit_op(Opcode::Column, cursor, col_idx as i32, arg_reg, P4::None, 0);
+            if agg.arg_is_rowid {
+                // INTEGER PRIMARY KEY: read rowid instead of column.
+                b.emit_op(Opcode::Rowid, cursor, arg_reg, 0, P4::None, 0);
+            } else {
+                let col_idx = agg.arg_col_index.unwrap_or(0);
+                b.emit_op(Opcode::Column, cursor, col_idx as i32, arg_reg, P4::None, 0);
+            }
             let num_args = u16::try_from(agg.num_args).unwrap_or_default();
             b.emit_op(
                 Opcode::AggStep,
@@ -1553,6 +1634,7 @@ fn parse_aggregate_columns(
                             name: lower_name,
                             num_args: 0,
                             arg_col_index: None,
+                            arg_is_rowid: false,
                         });
                     }
                     FunctionArgs::List(exprs) => {
@@ -1562,20 +1644,27 @@ fn parse_aggregate_columns(
                                 name: lower_name,
                                 num_args: 0,
                                 arg_col_index: None,
+                                arg_is_rowid: false,
                             });
                         } else {
                             // Single-arg aggregate: resolve column reference.
-                            let col_idx =
-                                resolve_column_index(&exprs[0], table).ok_or_else(|| {
-                                    CodegenError::Unsupported(
-                                        "non-column argument in aggregate function".to_owned(),
-                                    )
-                                })?;
+                            // Use resolve_column_ref to handle both regular columns and IPK (rowid).
+                            let (col_idx, is_rowid) =
+                                match resolve_column_ref(&exprs[0], table, None) {
+                                    Some(SortKeySource::Column(idx)) => (Some(idx), false),
+                                    Some(SortKeySource::Rowid) => (None, true),
+                                    _ => {
+                                        return Err(CodegenError::Unsupported(
+                                            "non-column argument in aggregate function".to_owned(),
+                                        ));
+                                    }
+                                };
                             #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
                             agg_cols.push(AggColumn {
                                 name: lower_name,
                                 num_args: exprs.len() as i32,
-                                arg_col_index: Some(col_idx),
+                                arg_col_index: col_idx,
+                                arg_is_rowid: is_rowid,
                             });
                         }
                     }
@@ -1646,6 +1735,7 @@ fn parse_group_by_output(
                             name: lower_name,
                             num_args: 0,
                             arg_col_index: None,
+                            arg_is_rowid: false,
                         });
                     }
                     FunctionArgs::List(exprs) => {
@@ -1654,19 +1744,26 @@ fn parse_group_by_output(
                                 name: lower_name,
                                 num_args: 0,
                                 arg_col_index: None,
+                                arg_is_rowid: false,
                             });
                         } else {
-                            let col_idx =
-                                resolve_column_index(&exprs[0], table).ok_or_else(|| {
-                                    CodegenError::Unsupported(
-                                        "non-column argument in aggregate function".to_owned(),
-                                    )
-                                })?;
+                            // Use resolve_column_ref to handle both regular columns and IPK (rowid).
+                            let (col_idx, is_rowid) =
+                                match resolve_column_ref(&exprs[0], table, None) {
+                                    Some(SortKeySource::Column(idx)) => (Some(idx), false),
+                                    Some(SortKeySource::Rowid) => (None, true),
+                                    _ => {
+                                        return Err(CodegenError::Unsupported(
+                                            "non-column argument in aggregate function".to_owned(),
+                                        ));
+                                    }
+                                };
                             #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
                             agg_columns.push(AggColumn {
                                 name: lower_name,
                                 num_args: exprs.len() as i32,
-                                arg_col_index: Some(col_idx),
+                                arg_col_index: col_idx,
+                                arg_is_rowid: is_rowid,
                             });
                         }
                     }
@@ -6331,19 +6428,22 @@ mod tests {
             .count();
         assert_eq!(open_reads, 2, "should open both table and index");
 
-        // Should have SeekGE + IdxRowid + SeekRowid pattern.
-        assert!(has_opcodes(
-            &prog,
-            &[
-                Opcode::OpenRead,
-                Opcode::OpenRead,
-                Opcode::SeekGE,
-                Opcode::IdxRowid,
-                Opcode::SeekRowid,
-                Opcode::Column,
-                Opcode::ResultRow,
-            ]
-        ));
+        assert!(
+            prog.ops().iter().any(|op| op.opcode == Opcode::MakeRecord),
+            "expected probe-key record construction for index seek"
+        );
+        assert!(
+            prog.ops().iter().any(|op| op.opcode == Opcode::SeekGE),
+            "expected SeekGE on index cursor"
+        );
+        assert!(
+            prog.ops().iter().any(|op| op.opcode == Opcode::IdxRowid),
+            "expected IdxRowid to map index entry to table rowid"
+        );
+        assert!(
+            prog.ops().iter().any(|op| op.opcode == Opcode::SeekRowid),
+            "expected table cursor lookup by rowid"
+        );
     }
 
     #[test]

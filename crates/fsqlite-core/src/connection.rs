@@ -8727,6 +8727,144 @@ mod tests {
     }
 
     #[test]
+    fn test_query_with_params_table_where_two_anonymous_placeholders_bind_in_order() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute(
+            "CREATE TABLE inbox_stats (
+                id INTEGER PRIMARY KEY,
+                agent_id INTEGER,
+                project_id INTEGER,
+                payload TEXT
+            )",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO inbox_stats (id, agent_id, project_id, payload) VALUES
+             (1, 2, 7, 'hit'),
+             (2, 2, 8, 'wrong_project'),
+             (3, 3, 7, 'wrong_agent')",
+        )
+        .unwrap();
+
+        let rows = conn
+            .query_with_params(
+                "SELECT payload FROM inbox_stats WHERE agent_id = ? AND project_id = ?",
+                &[SqliteValue::Integer(2), SqliteValue::Integer(7)],
+            )
+            .unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![SqliteValue::Text("hit".to_owned())]
+        );
+    }
+
+    #[test]
+    fn test_query_with_params_table_where_then_limit_keeps_sql_placeholder_order() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute(
+            "CREATE TABLE inbox_stats (
+                id INTEGER PRIMARY KEY,
+                agent_id INTEGER,
+                project_id INTEGER,
+                payload TEXT
+            )",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO inbox_stats (id, agent_id, project_id, payload) VALUES
+             (1, 2, 7, 'a'),
+             (2, 2, 7, 'b'),
+             (3, 2, 8, 'c')",
+        )
+        .unwrap();
+
+        let rows = conn
+            .query_with_params(
+                "SELECT payload FROM inbox_stats \
+                 WHERE agent_id = ? AND project_id = ? \
+                 ORDER BY id LIMIT ?",
+                &[
+                    SqliteValue::Integer(2),
+                    SqliteValue::Integer(7),
+                    SqliteValue::Integer(1),
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![SqliteValue::Text("a".to_owned())]
+        );
+    }
+
+    #[test]
+    fn test_query_with_params_table_index_eq_single_anonymous_uses_bound_value() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute(
+            "CREATE TABLE inbox_stats (
+                id INTEGER PRIMARY KEY,
+                agent_id INTEGER,
+                payload TEXT
+            )",
+        )
+        .unwrap();
+        conn.execute("CREATE INDEX idx_inbox_stats_agent_id ON inbox_stats(agent_id)")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO inbox_stats (id, agent_id, payload) VALUES
+             (1, 1, 'wrong'),
+             (2, 2, 'right')",
+        )
+        .unwrap();
+
+        let rows = conn
+            .query_with_params(
+                "SELECT payload FROM inbox_stats WHERE agent_id = ?",
+                &[SqliteValue::Integer(2)],
+            )
+            .unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![SqliteValue::Text("right".to_owned())]
+        );
+    }
+
+    #[test]
+    fn test_query_with_params_table_index_eq_single_anonymous_no_match_returns_empty() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute(
+            "CREATE TABLE inbox_stats (
+                id INTEGER PRIMARY KEY,
+                agent_id INTEGER,
+                payload TEXT
+            )",
+        )
+        .unwrap();
+        conn.execute("CREATE INDEX idx_inbox_stats_agent_id ON inbox_stats(agent_id)")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO inbox_stats (id, agent_id, payload) VALUES
+             (1, 1, 'a'),
+             (2, 4, 'b')",
+        )
+        .unwrap();
+
+        let rows = conn
+            .query_with_params(
+                "SELECT payload FROM inbox_stats WHERE agent_id = ?",
+                &[SqliteValue::Integer(3)],
+            )
+            .unwrap();
+
+        assert!(rows.is_empty());
+    }
+
+    #[test]
     fn test_query_with_params_named_placeholders_supported() {
         let conn = Connection::open(":memory:").unwrap();
         let rows = conn
