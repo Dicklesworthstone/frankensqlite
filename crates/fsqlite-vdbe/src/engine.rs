@@ -6444,19 +6444,16 @@ mod tests {
         // Default conflict mode (OE_ABORT) must raise constraint error.
         let mut db = MemDatabase::new();
         let root = db.create_table(1);
+        let table = db.get_table_mut(root).expect("table should exist");
+        table.insert(1, vec![SqliteValue::Integer(10)]);
 
         let mut b = ProgramBuilder::new();
         let end = b.emit_label();
         b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
         b.emit_op(Opcode::OpenWrite, 0, root, 0, P4::Int(1), 0);
 
-        // Insert rowid=1.
-        b.emit_op(Opcode::Integer, 1, 1, 0, P4::None, 0);
-        b.emit_op(Opcode::Integer, 10, 2, 0, P4::None, 0);
-        b.emit_op(Opcode::MakeRecord, 2, 1, 3, P4::None, 0);
-        b.emit_op(Opcode::Insert, 0, 3, 1, P4::None, 0);
-
         // Duplicate rowid=1 with default conflict handling.
+        b.emit_op(Opcode::Integer, 1, 1, 0, P4::None, 0);
         b.emit_op(Opcode::Integer, 99, 4, 0, P4::None, 0);
         b.emit_op(Opcode::MakeRecord, 4, 1, 5, P4::None, 0);
         b.emit_op(Opcode::Insert, 0, 5, 1, P4::None, 0);
@@ -6477,6 +6474,11 @@ mod tests {
                 message: "PRIMARY KEY constraint failed".to_owned(),
             }
         );
+
+        let db = engine.take_database().expect("database should exist");
+        let table = db.get_table(root).expect("table should exist");
+        assert_eq!(table.rows.len(), 1);
+        assert_eq!(table.rows[0].values, vec![SqliteValue::Integer(10)]);
     }
 
     #[test]
@@ -6484,19 +6486,16 @@ mod tests {
         // Same behavior must hold for the legacy MemDatabase cursor path.
         let mut db = MemDatabase::new();
         let root = db.create_table(1);
+        let table = db.get_table_mut(root).expect("table should exist");
+        table.insert(1, vec![SqliteValue::Integer(10)]);
 
         let mut b = ProgramBuilder::new();
         let end = b.emit_label();
         b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
         b.emit_op(Opcode::OpenWrite, 0, root, 0, P4::Int(1), 0);
 
-        // Insert rowid=1.
-        b.emit_op(Opcode::Integer, 1, 1, 0, P4::None, 0);
-        b.emit_op(Opcode::Integer, 10, 2, 0, P4::None, 0);
-        b.emit_op(Opcode::MakeRecord, 2, 1, 3, P4::None, 0);
-        b.emit_op(Opcode::Insert, 0, 3, 1, P4::None, 0);
-
         // Duplicate rowid=1 with default conflict handling.
+        b.emit_op(Opcode::Integer, 1, 1, 0, P4::None, 0);
         b.emit_op(Opcode::Integer, 99, 4, 0, P4::None, 0);
         b.emit_op(Opcode::MakeRecord, 4, 1, 5, P4::None, 0);
         b.emit_op(Opcode::Insert, 0, 5, 1, P4::None, 0);
@@ -6517,6 +6516,11 @@ mod tests {
                 message: "PRIMARY KEY constraint failed".to_owned(),
             }
         );
+
+        let db = engine.take_database().expect("database should exist");
+        let table = db.get_table(root).expect("table should exist");
+        assert_eq!(table.rows.len(), 1);
+        assert_eq!(table.rows[0].values, vec![SqliteValue::Integer(10)]);
     }
 
     // ── bd-2a3y: TransactionPageIo / SharedTxnPageIo integration tests ──

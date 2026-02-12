@@ -7792,6 +7792,110 @@ mod tests {
     }
 
     #[test]
+    fn test_codegen_delete_where_not_in_subquery_with_order_by_limit() {
+        // DELETE FROM t WHERE a NOT IN (SELECT b FROM s ORDER BY b LIMIT ?1)
+        // Tests the complex IN subquery path with ORDER BY and LIMIT.
+        let subquery = SelectStatement {
+            with: None,
+            body: fsqlite_ast::SelectBody {
+                select: SelectCore::Select {
+                    distinct: Distinctness::All,
+                    columns: vec![ResultColumn::Expr {
+                        expr: Expr::Column(ColumnRef::bare("b"), Span::ZERO),
+                        alias: None,
+                    }],
+                    from: Some(fsqlite_ast::FromClause {
+                        source: TableOrSubquery::Table {
+                            name: QualifiedName::bare("s"),
+                            alias: None,
+                            index_hint: None,
+                        },
+                        joins: vec![],
+                    }),
+                    where_clause: None,
+                    group_by: vec![],
+                    having: None,
+                    windows: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![OrderingTerm {
+                expr: Expr::Column(ColumnRef::bare("b"), Span::ZERO),
+                direction: None,
+                nulls: None,
+            }],
+            limit: Some(LimitClause {
+                limit: Expr::Placeholder(fsqlite_ast::PlaceholderType::Numbered(1), Span::ZERO),
+                offset: None,
+            }),
+        };
+
+        let stmt = DeleteStatement {
+            with: None,
+            table: QualifiedTableRef {
+                name: QualifiedName::bare("t"),
+                alias: None,
+                index_hint: None,
+            },
+            where_clause: Some(Expr::In {
+                expr: Box::new(Expr::Column(ColumnRef::bare("a"), Span::ZERO)),
+                set: InSet::Subquery(Box::new(subquery)),
+                not: true,
+                span: Span::ZERO,
+            }),
+            returning: vec![],
+            order_by: vec![],
+            limit: None,
+        };
+
+        let schema = test_schema_with_subquery_source();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_delete(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        // Should have SorterOpen for materializing the subquery with ORDER BY.
+        assert!(
+            prog.ops().iter().any(|op| op.opcode == Opcode::SorterOpen),
+            "expected SorterOpen for ORDER BY subquery"
+        );
+
+        // Should have SorterSort to sort the materialized results.
+        assert!(
+            prog.ops().iter().any(|op| op.opcode == Opcode::SorterSort),
+            "expected SorterSort opcode"
+        );
+
+        // Should have SorterInsert to populate the sorter.
+        assert!(
+            prog.ops()
+                .iter()
+                .any(|op| op.opcode == Opcode::SorterInsert),
+            "expected SorterInsert opcode"
+        );
+
+        // Should have DecrJumpZero for LIMIT handling.
+        assert!(
+            prog.ops()
+                .iter()
+                .any(|op| op.opcode == Opcode::DecrJumpZero),
+            "expected DecrJumpZero for LIMIT"
+        );
+
+        // Should have Delete opcode for the deletion.
+        assert!(
+            prog.ops().iter().any(|op| op.opcode == Opcode::Delete),
+            "expected Delete opcode"
+        );
+
+        // Should have Variable opcode for the LIMIT parameter.
+        assert!(
+            prog.ops().iter().any(|op| op.opcode == Opcode::Variable),
+            "expected Variable opcode for LIMIT parameter"
+        );
+    }
+
+    #[test]
     fn test_codegen_delete_where_bare_rowid_eq() {
         // DELETE FROM t WHERE rowid = ?1
         // Ensures unqualified rowid in Eq fast-path emits Rowid opcode.
