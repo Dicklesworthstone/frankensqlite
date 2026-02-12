@@ -1907,6 +1907,7 @@ fn codegen_select_group_by_aggregate(
 ///
 /// Init → Transaction(write) → OpenWrite → Variable* → (IPK routing |
 /// NewRowid) → MakeRecord → Insert → Close → Halt
+#[allow(clippy::too_many_lines)]
 pub fn codegen_insert(
     b: &mut ProgramBuilder,
     stmt: &InsertStatement,
@@ -1934,33 +1935,56 @@ pub fn codegen_insert(
         0,
     );
 
-    // When an explicit column list is provided, remap the IPK index from
-    // table-schema position to VALUES position.  If the IPK column is absent
-    // from the column list, treat it as NULL (auto-generate rowid).
-    let effective_ctx = if stmt.columns.is_empty() {
-        ctx.clone()
-    } else if let Some(ipk_schema_idx) = ctx.rowid_alias_col_idx {
-        let ipk_col_name = &table.columns[ipk_schema_idx].name;
-        let values_pos = stmt
-            .columns
-            .iter()
-            .position(|c| c.eq_ignore_ascii_case(ipk_col_name));
-        CodegenContext {
-            concurrent_mode: ctx.concurrent_mode,
-            rowid_alias_col_idx: values_pos,
-        }
-    } else {
-        ctx.clone()
-    };
-
     match &stmt.source {
         InsertSource::Values(rows) => {
             if rows.is_empty() {
                 return Err(CodegenError::Unsupported("empty VALUES".to_owned()));
             }
-            codegen_insert_values(b, rows, cursor, table, &stmt.returning, &effective_ctx)?;
+
+            // When an explicit column list is provided, reorder each VALUES
+            // row from column-list order to table-schema order, filling
+            // unmentioned columns with NULL.  This ensures MakeRecord always
+            // packs fields in the order the table schema expects.
+            if stmt.columns.is_empty() {
+                codegen_insert_values(b, rows, cursor, table, &stmt.returning, ctx)?;
+            } else {
+                let col_map = build_column_map(&stmt.columns, table)?;
+                let n_table_cols = table.columns.len();
+                let null_expr = Expr::Literal(Literal::Null, fsqlite_ast::Span::ZERO);
+                let reordered: Vec<Vec<Expr>> = rows
+                    .iter()
+                    .map(|row| {
+                        let mut table_order = vec![null_expr.clone(); n_table_cols];
+                        for (val_pos, &tbl_pos) in col_map.iter().enumerate() {
+                            if let Some(expr) = row.get(val_pos) {
+                                table_order[tbl_pos] = expr.clone();
+                            }
+                        }
+                        table_order
+                    })
+                    .collect();
+                codegen_insert_values(b, &reordered, cursor, table, &stmt.returning, ctx)?;
+            }
         }
         InsertSource::Select(select_stmt) => {
+            // INSERT ... SELECT: columns arrive in SELECT output order.
+            // When a column list is present, remap the IPK index from
+            // table-schema position to SELECT output position.
+            let select_ctx = if stmt.columns.is_empty() {
+                ctx.clone()
+            } else if let Some(ipk_schema_idx) = ctx.rowid_alias_col_idx {
+                let ipk_col_name = &table.columns[ipk_schema_idx].name;
+                let select_pos = stmt
+                    .columns
+                    .iter()
+                    .position(|c| c.eq_ignore_ascii_case(ipk_col_name));
+                CodegenContext {
+                    concurrent_mode: ctx.concurrent_mode,
+                    rowid_alias_col_idx: select_pos,
+                }
+            } else {
+                ctx.clone()
+            };
             codegen_insert_select(
                 b,
                 select_stmt,
@@ -1968,7 +1992,7 @@ pub fn codegen_insert(
                 table,
                 schema,
                 &stmt.returning,
-                &effective_ctx,
+                &select_ctx,
             )?;
         }
         InsertSource::DefaultValues => {
@@ -2129,6 +2153,22 @@ fn codegen_insert_values(
     }
 
     Ok(())
+}
+
+/// Map each column in an explicit INSERT column list to its table-schema
+/// position.  Returns a `Vec<usize>` where `result[values_pos] = table_pos`.
+fn build_column_map(columns: &[String], table: &TableSchema) -> Result<Vec<usize>, CodegenError> {
+    columns
+        .iter()
+        .map(|col| {
+            table
+                .column_index(col)
+                .ok_or_else(|| CodegenError::ColumnNotFound {
+                    table: table.name.clone(),
+                    column: col.clone(),
+                })
+        })
+        .collect()
 }
 
 /// Emit the INSERT loop for `INSERT INTO target SELECT ... FROM source`.
@@ -6848,10 +6888,12 @@ mod tests {
     }
 
     /// INSERT with explicit column list that OMITS the IPK column.
+    /// The reorder fills the IPK position with NULL, so IsNull routing is
+    /// emitted but always takes the auto-generate path.
     #[test]
     fn test_codegen_insert_values_ipk_column_list_omitted() {
         // Table: (a INTEGER PRIMARY KEY, b TEXT)
-        // INSERT INTO t(b) VALUES (?)  →  IPK omitted, should auto-generate
+        // INSERT INTO t(b) VALUES (?)  →  IPK omitted, reorder fills NULL
         let stmt = InsertStatement {
             with: None,
             or_conflict: None,
@@ -6872,14 +6914,17 @@ mod tests {
         let prog = b.finish().unwrap();
         let ops = opcode_sequence(&prog);
 
-        // IPK omitted from column list → should auto-generate (NewRowid only).
+        // Reorder fills IPK slot with NULL → IPK routing still emitted
+        // (IsNull will always fire, triggering NewRowid).
         assert!(
             ops.contains(&Opcode::NewRowid),
             "omitted IPK should use NewRowid"
         );
+        // The reordered row has 2 columns (full table width), not 1.
+        let n_null = ops.iter().filter(|&&op| op == Opcode::Null).count();
         assert!(
-            !ops.contains(&Opcode::IsNull),
-            "omitted IPK should NOT emit IsNull routing"
+            n_null >= 1,
+            "reorder should emit Null for the omitted IPK column"
         );
     }
 

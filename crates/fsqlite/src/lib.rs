@@ -2386,6 +2386,53 @@ mod tests {
         assert_eq!(row_values(&rows[1])[0], SqliteValue::Integer(100));
     }
 
+    /// Explicit column list in non-schema order should store values correctly.
+    #[test]
+    fn ipk_column_list_reorder() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);")
+            .unwrap();
+        // Column list reverses schema order: (name, id) vs schema (id, name).
+        let rows = conn
+            .query("INSERT INTO t(name, id) VALUES ('Alice', 42) RETURNING *;")
+            .unwrap();
+        let vals = row_values(&rows[0]);
+        assert_eq!(
+            vals[0],
+            SqliteValue::Integer(42),
+            "id should be 42 (from column-list position 1)"
+        );
+        assert_eq!(
+            vals[1],
+            SqliteValue::Text("Alice".to_owned()),
+            "name should be Alice (from column-list position 0)"
+        );
+        // Also verify via SELECT that the stored record is correct.
+        let sel = conn.query("SELECT id, name FROM t;").unwrap();
+        let sv = row_values(&sel[0]);
+        assert_eq!(sv[0], SqliteValue::Integer(42));
+        assert_eq!(sv[1], SqliteValue::Text("Alice".to_owned()));
+    }
+
+    /// Explicit column list omitting IPK should auto-generate rowid.
+    #[test]
+    fn ipk_column_list_omit_ipk() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);")
+            .unwrap();
+        let rows = conn
+            .query("INSERT INTO t(name) VALUES ('Bob') RETURNING id, name;")
+            .unwrap();
+        let vals = row_values(&rows[0]);
+        // id should be auto-generated (positive integer).
+        assert!(
+            matches!(vals[0], SqliteValue::Integer(n) if n > 0),
+            "omitted IPK should auto-generate, got {:?}",
+            vals[0]
+        );
+        assert_eq!(vals[1], SqliteValue::Text("Bob".to_owned()));
+    }
+
     /// DELETE then reinsert with same IPK should work.
     #[test]
     fn ipk_delete_reinsert_same_id() {
