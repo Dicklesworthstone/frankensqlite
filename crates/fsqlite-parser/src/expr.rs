@@ -849,8 +849,7 @@ impl Parser {
 
     /// Minimal subquery parser for EXISTS/IN expression support.
     ///
-    /// Handles basic `SELECT [DISTINCT] columns [FROM table] [WHERE expr]`.
-    /// Full SELECT parsing is a separate bead.
+    /// Handles `SELECT [DISTINCT] columns [FROM table] [WHERE expr] [ORDER BY ...] [LIMIT ...]`.
     fn parse_subquery_minimal(&mut self) -> Result<SelectStatement, ParseError> {
         if !self.eat_kind(&TokenKind::KwSelect) {
             return Err(self.err_here("expected SELECT in subquery"));
@@ -910,6 +909,17 @@ impl Parser {
             None
         };
 
+        // Parse ORDER BY clause (reuses method from parser.rs)
+        let order_by = if self.eat_kind(&TokenKind::KwOrder) {
+            self.expect_kind(&TokenKind::KwBy)?;
+            self.parse_comma_sep(Self::parse_ordering_term)?
+        } else {
+            Vec::new()
+        };
+
+        // Parse LIMIT clause (reuses method from parser.rs)
+        let limit = self.parse_limit()?;
+
         Ok(SelectStatement {
             with: None,
             body: SelectBody {
@@ -924,8 +934,8 @@ impl Parser {
                 },
                 compounds: Vec::new(),
             },
-            order_by: Vec::new(),
-            limit: None,
+            order_by,
+            limit,
         })
     }
 }
@@ -1156,6 +1166,24 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn test_in_subquery_with_order_by_and_limit() {
+        // This is the pattern used in mcp-agent-mail-db prune queries
+        let expr =
+            parse("id NOT IN (SELECT id FROM search_recipes ORDER BY updated_ts DESC LIMIT 5)");
+        match &expr {
+            Expr::In {
+                not: true,
+                set: InSet::Subquery(stmt),
+                ..
+            } => {
+                assert_eq!(stmt.order_by.len(), 1, "ORDER BY should be parsed");
+                assert!(stmt.limit.is_some(), "LIMIT should be parsed");
+            }
+            other => unreachable!("expected NOT IN subquery, got {other:?}"),
+        }
     }
 
     #[test]

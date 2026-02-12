@@ -676,7 +676,7 @@ impl Parser {
     // ORDER BY / LIMIT
     // -----------------------------------------------------------------------
 
-    fn parse_ordering_term(&mut self) -> Result<OrderingTerm, ParseError> {
+    pub(crate) fn parse_ordering_term(&mut self) -> Result<OrderingTerm, ParseError> {
         let expr = self.parse_expr()?;
         let direction = if self.eat_kw(&TokenKind::KwAsc) {
             Some(SortDirection::Asc)
@@ -702,7 +702,7 @@ impl Parser {
         })
     }
 
-    fn parse_limit(&mut self) -> Result<Option<LimitClause>, ParseError> {
+    pub(crate) fn parse_limit(&mut self) -> Result<Option<LimitClause>, ParseError> {
         if !self.eat_kw(&TokenKind::KwLimit) {
             return Ok(None);
         }
@@ -7276,5 +7276,72 @@ mod tests {
             "persistence dump with reserved-word columns should parse cleanly: {errs:?}"
         );
         assert_eq!(stmts.len(), 3);
+    }
+
+    #[test]
+    fn select_qualified_column_with_alias() {
+        // Bug: "a.name as from_name" was being parsed with alias=None and
+        // col_ref.column="name as" instead of alias=Some("from_name").
+        let stmt = parse_one("SELECT a.name AS from_name FROM users a");
+        if let Statement::Select(s) = stmt {
+            if let SelectCore::Select { columns, .. } = &s.body.select {
+                assert_eq!(columns.len(), 1);
+                match &columns[0] {
+                    ResultColumn::Expr { expr, alias } => {
+                        // Alias should be captured as "from_name".
+                        assert_eq!(
+                            alias.as_deref(),
+                            Some("from_name"),
+                            "alias should be 'from_name', got {alias:?}"
+                        );
+                        // Expression should be a qualified column ref: a.name
+                        if let Expr::Column(col_ref, _) = expr {
+                            assert_eq!(col_ref.table.as_deref(), Some("a"));
+                            assert_eq!(col_ref.column, "name");
+                        } else {
+                            panic!("expected Column expression, got {expr:?}");
+                        }
+                    }
+                    other => panic!("expected Expr variant, got {other:?}"),
+                }
+            } else {
+                panic!("expected Select core");
+            }
+        } else {
+            panic!("expected Select statement");
+        }
+    }
+
+    #[test]
+    fn select_qualified_column_with_implicit_alias() {
+        // Test implicit alias syntax (without AS keyword).
+        let stmt = parse_one("SELECT a.name from_name FROM users a");
+        if let Statement::Select(s) = stmt {
+            if let SelectCore::Select { columns, .. } = &s.body.select {
+                assert_eq!(columns.len(), 1);
+                match &columns[0] {
+                    ResultColumn::Expr { expr, alias } => {
+                        // Alias should be captured as "from_name" even without AS.
+                        assert_eq!(
+                            alias.as_deref(),
+                            Some("from_name"),
+                            "implicit alias should be 'from_name', got {alias:?}"
+                        );
+                        // Expression should be a qualified column ref: a.name
+                        if let Expr::Column(col_ref, _) = expr {
+                            assert_eq!(col_ref.table.as_deref(), Some("a"));
+                            assert_eq!(col_ref.column, "name");
+                        } else {
+                            panic!("expected Column expression, got {expr:?}");
+                        }
+                    }
+                    other => panic!("expected Expr variant, got {other:?}"),
+                }
+            } else {
+                panic!("expected Select core");
+            }
+        } else {
+            panic!("expected Select statement");
+        }
     }
 }
