@@ -1243,8 +1243,8 @@ impl Connection {
 
                     if self.path == ":memory:" {
                         // For in-memory databases, we need to serialize to a file
-                        return Err(FrankenError::NotImplemented(
-                            "VACUUM INTO from :memory: database not yet implemented".to_string(),
+                        return Err(FrankenError::not_implemented(
+                            "VACUUM INTO from :memory: database",
                         ));
                     }
 
