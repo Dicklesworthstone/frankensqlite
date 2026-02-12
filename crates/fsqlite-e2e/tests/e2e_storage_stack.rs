@@ -1,6 +1,11 @@
 //! End-to-end storage stack integration test.
 //!
 //! Bead: bd-jd39 (5F.2)
+#![allow(
+    clippy::too_many_lines,
+    clippy::cast_sign_loss,
+    clippy::manual_checked_ops
+)]
 //!
 //! This test exercises the ENTIRE Phase 5 pipeline from database creation to
 //! transaction lifecycle, with detailed structured logging at every step.

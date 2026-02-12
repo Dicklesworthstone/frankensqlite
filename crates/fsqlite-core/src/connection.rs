@@ -19,8 +19,8 @@ use fsqlite_ast::{
     LimitClause, Literal, NullsOrder, OrderingTerm, PlaceholderType, ResultColumn, SelectBody,
     SelectCore, SelectStatement, SortDirection, Span, Statement, TableOrSubquery, UnaryOp,
 };
-use fsqlite_btree::cursor::TransactionPageIo;
 use fsqlite_btree::BtreeCursorOps;
+use fsqlite_btree::cursor::TransactionPageIo;
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_func::FunctionRegistry;
 use fsqlite_pager::traits::{MvccPager, TransactionHandle, TransactionMode};
@@ -33,16 +33,23 @@ use fsqlite_types::record::{parse_record, serialize_record};
 use fsqlite_types::value::SqliteValue;
 use fsqlite_types::{BTreePageHeader, PageNumber, PageSize};
 use fsqlite_vdbe::codegen::{
-    codegen_delete, codegen_insert, codegen_select, codegen_update, CodegenContext, CodegenError,
-    ColumnInfo, IndexSchema, TableSchema,
+    CodegenContext, CodegenError, ColumnInfo, IndexSchema, TableSchema, codegen_delete,
+    codegen_insert, codegen_select, codegen_update,
 };
 use fsqlite_vdbe::engine::{ExecOutcome, MemDatabase, MemDbVersionToken, VdbeEngine};
 use fsqlite_vdbe::{ProgramBuilder, VdbeProgram};
-use fsqlite_vfs::traits::Vfs;
 use fsqlite_vfs::MemoryVfs;
 #[cfg(unix)]
 use fsqlite_vfs::UnixVfs;
+use fsqlite_vfs::traits::Vfs;
 use fsqlite_wal::{WalFile, WalSalts};
+
+// MVCC concurrent-writer support (bd-14zc / 5E.1)
+use fsqlite_mvcc::{
+    CommitIndex, ConcurrentRegistry, FcwResult, InProcessPageLockTable, MvccError,
+    concurrent_abort, concurrent_commit,
+};
+use fsqlite_types::{CommitSeq, SchemaEpoch, Snapshot};
 
 use crate::wal_adapter::WalBackendAdapter;
 
@@ -534,6 +541,18 @@ pub struct Connection {
     /// File change counter (offset 24 in the database header).  Incremented
     /// on every transaction that modifies the database (DML or DDL).
     change_counter: RefCell<u32>,
+    // ── MVCC concurrent-writer state (bd-14zc / 5E.1) ─────────────────────
+    /// Registry of active concurrent-writer sessions.
+    concurrent_registry: RefCell<ConcurrentRegistry>,
+    /// Session ID for the current concurrent transaction (if any).
+    /// Set by execute_begin() when mode is Concurrent.
+    concurrent_session_id: RefCell<Option<u64>>,
+    /// Page-level lock table for concurrent writers.
+    concurrent_lock_table: InProcessPageLockTable,
+    /// Commit index mapping pages to their latest committed sequence.
+    concurrent_commit_index: CommitIndex,
+    /// Next commit sequence to assign (simple in-process monotonic counter).
+    next_commit_seq: RefCell<u64>,
     /// Guards idempotent shutdown so explicit `close()` and `Drop` do not
     /// double-run rollback/checkpoint logic.
     closed: RefCell<bool>,
@@ -586,6 +605,12 @@ impl Connection {
             next_master_rowid: RefCell::new(1),
             schema_cookie: RefCell::new(0),
             change_counter: RefCell::new(0),
+            // MVCC concurrent-writer state (bd-14zc / 5E.1)
+            concurrent_registry: RefCell::new(ConcurrentRegistry::new()),
+            concurrent_session_id: RefCell::new(None),
+            concurrent_lock_table: InProcessPageLockTable::new(),
+            concurrent_commit_index: CommitIndex::new(),
+            next_commit_seq: RefCell::new(1),
             closed: RefCell::new(false),
         };
         conn.apply_current_journal_mode_to_pager()?;
@@ -2065,6 +2090,26 @@ impl Connection {
         let txn = self.pager.begin(&cx, pager_mode)?;
         *self.active_txn.borrow_mut() = Some(txn);
 
+        // MVCC concurrent-writer session (bd-14zc / 5E.1):
+        // When mode is Concurrent, register with ConcurrentRegistry for
+        // page-level MVCC locking and first-committer-wins validation.
+        if is_concurrent {
+            let commit_seq = *self.next_commit_seq.borrow();
+            let snapshot = Snapshot::new(
+                CommitSeq::new(commit_seq.saturating_sub(1)),
+                SchemaEpoch::new((*self.schema_cookie.borrow()).into()),
+            );
+            let session_id = self
+                .concurrent_registry
+                .borrow_mut()
+                .begin_concurrent(snapshot)
+                .map_err(|e| match e {
+                    MvccError::Busy => FrankenError::Busy,
+                    _ => FrankenError::Internal(format!("MVCC begin failed: {e}")),
+                })?;
+            *self.concurrent_session_id.borrow_mut() = Some(session_id);
+        }
+
         self.db.borrow_mut().begin_undo();
         *self.txn_snapshot.borrow_mut() = Some(self.snapshot());
         *self.in_transaction.borrow_mut() = true;
@@ -2080,8 +2125,68 @@ impl Connection {
             ));
         }
 
+        let is_concurrent = *self.concurrent_txn.borrow();
         let cx = Cx::new();
-        // Attempt commit without consuming the handle (retriable on BUSY).
+
+        // MVCC concurrent-writer commit path (bd-14zc / 5E.1):
+        // When in concurrent mode, use first-committer-wins validation.
+        if is_concurrent {
+            if let Some(session_id) = *self.concurrent_session_id.borrow() {
+                let assign_seq = CommitSeq::new(*self.next_commit_seq.borrow());
+
+                // Get the handle and perform FCW validation + commit.
+                let commit_result = {
+                    let mut registry = self.concurrent_registry.borrow_mut();
+                    if let Some(handle) = registry.get_mut(session_id) {
+                        concurrent_commit(
+                            handle,
+                            &self.concurrent_commit_index,
+                            &self.concurrent_lock_table,
+                            session_id,
+                            assign_seq,
+                        )
+                    } else {
+                        Err((MvccError::InvalidState, FcwResult::Clean))
+                    }
+                };
+
+                match commit_result {
+                    Ok(committed_seq) => {
+                        // Update next_commit_seq for subsequent transactions.
+                        *self.next_commit_seq.borrow_mut() = committed_seq.get() + 1;
+                        // Remove session from registry.
+                        self.concurrent_registry.borrow_mut().remove(session_id);
+                    }
+                    Err((err, fcw_result)) => {
+                        // Clean up on failure.
+                        self.concurrent_registry.borrow_mut().remove(session_id);
+                        *self.concurrent_session_id.borrow_mut() = None;
+                        return Err(match err {
+                            MvccError::BusySnapshot => {
+                                let pages = match fcw_result {
+                                    FcwResult::Conflict {
+                                        conflicting_pages, ..
+                                    } => conflicting_pages
+                                        .iter()
+                                        .map(|p| p.get().to_string())
+                                        .collect::<Vec<_>>()
+                                        .join(", "),
+                                    FcwResult::Clean => String::new(),
+                                };
+                                FrankenError::BusySnapshot {
+                                    conflicting_pages: pages,
+                                }
+                            }
+                            MvccError::Busy => FrankenError::Busy,
+                            _ => FrankenError::Internal(format!("MVCC commit failed: {err}")),
+                        });
+                    }
+                }
+            }
+            *self.concurrent_session_id.borrow_mut() = None;
+        }
+
+        // Attempt pager commit without consuming the handle (retriable on BUSY).
         // We use a scope to limit the mutable borrow of active_txn.
         {
             let mut txn_guard = self.active_txn.borrow_mut();
@@ -2129,6 +2234,18 @@ impl Connection {
                 return Err(FrankenError::Internal(
                     "cannot rollback - no transaction is active".to_owned(),
                 ));
+            }
+
+            // MVCC concurrent-writer abort (bd-14zc / 5E.1):
+            // When in concurrent mode, call concurrent_abort to release page locks.
+            if *self.concurrent_txn.borrow() {
+                if let Some(session_id) = self.concurrent_session_id.borrow_mut().take() {
+                    let mut registry = self.concurrent_registry.borrow_mut();
+                    if let Some(handle) = registry.get_mut(session_id) {
+                        concurrent_abort(handle, &self.concurrent_lock_table, session_id);
+                    }
+                    registry.remove(session_id);
+                }
             }
 
             // Roll back the pager transaction: discard all dirty pages and
@@ -2360,6 +2477,20 @@ impl Connection {
     #[must_use]
     pub fn is_concurrent_mode_default(&self) -> bool {
         *self.concurrent_mode_default.borrow()
+    }
+
+    /// Returns `true` if there is an active MVCC concurrent session for this
+    /// connection (bd-14zc / 5E.1).
+    #[must_use]
+    pub fn has_concurrent_session(&self) -> bool {
+        self.concurrent_session_id.borrow().is_some()
+    }
+
+    /// Returns the number of active concurrent writers across all connections
+    /// sharing this registry (bd-14zc / 5E.1).
+    #[must_use]
+    pub fn concurrent_writer_count(&self) -> usize {
+        self.concurrent_registry.borrow().active_count()
     }
 
     /// Returns a reference to the connection-scoped PRAGMA state.
@@ -7800,12 +7931,14 @@ mod tests {
         conn.execute("DROP INDEX idx_a;").unwrap();
         {
             let schema = conn.schema.borrow();
-            assert!(schema
-                .iter()
-                .find(|t| t.name == "t")
-                .unwrap()
-                .indexes
-                .is_empty());
+            assert!(
+                schema
+                    .iter()
+                    .find(|t| t.name == "t")
+                    .unwrap()
+                    .indexes
+                    .is_empty()
+            );
         }
     }
 
@@ -7881,9 +8014,10 @@ mod tests {
         conn.execute("CREATE TABLE t (id INTEGER);").unwrap();
         conn.execute("CREATE TRIGGER trg_ai AFTER INSERT ON t BEGIN SELECT 1; END;")
             .unwrap();
-        assert!(conn
-            .execute("CREATE TRIGGER trg_ai AFTER INSERT ON t BEGIN SELECT 1; END;")
-            .is_err());
+        assert!(
+            conn.execute("CREATE TRIGGER trg_ai AFTER INSERT ON t BEGIN SELECT 1; END;")
+                .is_err()
+        );
         conn.execute("CREATE TRIGGER IF NOT EXISTS trg_ai AFTER INSERT ON t BEGIN SELECT 1; END;")
             .unwrap();
     }
@@ -11090,6 +11224,78 @@ mod tests {
         assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Integer(2));
     }
 
+    // ── MVCC ConcurrentRegistry wiring tests (bd-14zc / 5E.1) ─────────
+
+    #[test]
+    fn test_begin_concurrent_creates_mvcc_session() {
+        let conn = Connection::open(":memory:").unwrap();
+        assert!(!conn.has_concurrent_session());
+        assert_eq!(conn.concurrent_writer_count(), 0);
+
+        conn.execute("BEGIN CONCURRENT;").unwrap();
+        assert!(conn.has_concurrent_session());
+        assert_eq!(conn.concurrent_writer_count(), 1);
+
+        conn.execute("ROLLBACK;").unwrap();
+        assert!(!conn.has_concurrent_session());
+        assert_eq!(conn.concurrent_writer_count(), 0);
+    }
+
+    #[test]
+    fn test_begin_without_mode_creates_mvcc_session_when_default_on() {
+        let conn = Connection::open(":memory:").unwrap();
+        // Default is concurrent_mode_default=true, so plain BEGIN promotes.
+        conn.execute("BEGIN;").unwrap();
+        assert!(conn.has_concurrent_session());
+        assert_eq!(conn.concurrent_writer_count(), 1);
+        conn.execute("COMMIT;").unwrap();
+        assert!(!conn.has_concurrent_session());
+    }
+
+    #[test]
+    fn test_begin_deferred_does_not_create_mvcc_session() {
+        let conn = Connection::open(":memory:").unwrap();
+        // Explicit DEFERRED should not create MVCC session.
+        conn.execute("BEGIN DEFERRED;").unwrap();
+        assert!(!conn.has_concurrent_session());
+        assert!(!conn.is_concurrent_transaction());
+        conn.execute("ROLLBACK;").unwrap();
+    }
+
+    #[test]
+    fn test_commit_clears_mvcc_session() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY);")
+            .unwrap();
+
+        conn.execute("BEGIN CONCURRENT;").unwrap();
+        assert!(conn.has_concurrent_session());
+        conn.execute("INSERT INTO t VALUES (1);").unwrap();
+        conn.execute("COMMIT;").unwrap();
+
+        assert!(!conn.has_concurrent_session());
+        assert_eq!(conn.concurrent_writer_count(), 0);
+    }
+
+    #[test]
+    fn test_rollback_clears_mvcc_session() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY);")
+            .unwrap();
+
+        conn.execute("BEGIN CONCURRENT;").unwrap();
+        assert!(conn.has_concurrent_session());
+        conn.execute("INSERT INTO t VALUES (1);").unwrap();
+        conn.execute("ROLLBACK;").unwrap();
+
+        assert!(!conn.has_concurrent_session());
+        assert_eq!(conn.concurrent_writer_count(), 0);
+
+        // Verify the insert was rolled back.
+        let rows = conn.query("SELECT COUNT(*) FROM t;").unwrap();
+        assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Integer(0));
+    }
+
     #[test]
     fn test_unrecognised_pragma_silently_ignored() {
         let conn = Connection::open(":memory:").unwrap();
@@ -12682,11 +12888,11 @@ mod transaction_lifecycle_tests {
 #[cfg(test)]
 mod sqlite_master_btree_tests {
     use super::*;
-    use fsqlite_btree::cursor::TransactionPageIo;
     use fsqlite_btree::BtreeCursorOps;
+    use fsqlite_btree::cursor::TransactionPageIo;
     use fsqlite_pager::traits::TransactionMode;
-    use fsqlite_types::record::parse_record;
     use fsqlite_types::PageNumber;
+    use fsqlite_types::record::parse_record;
 
     /// Helper: read all sqlite_master rows from the page 1 B-tree.
     /// Returns Vec<(rowid, Vec<SqliteValue>)>.
@@ -12895,8 +13101,8 @@ mod sqlite_master_btree_tests {
 #[cfg(test)]
 mod root_page_allocation_tests {
     use super::*;
-    use fsqlite_btree::cursor::TransactionPageIo;
     use fsqlite_btree::BtreeCursorOps;
+    use fsqlite_btree::cursor::TransactionPageIo;
     use fsqlite_pager::traits::TransactionMode;
 
     #[test]

@@ -144,6 +144,12 @@ pub enum FrankenError {
     #[error("database is busy (recovery in progress)")]
     BusyRecovery,
 
+    /// Concurrent transaction commit failed due to page conflict (SQLITE_BUSY_SNAPSHOT).
+    /// Another transaction committed changes to pages in the write set since the
+    /// snapshot was established.
+    #[error("database is busy (snapshot conflict on pages: {conflicting_pages})")]
+    BusySnapshot { conflicting_pages: String },
+
     /// BEGIN CONCURRENT is not available without fsqlite-shm (§5.6.6.2).
     #[error(
         "BEGIN CONCURRENT unavailable: fsqlite-shm not present (multi-writer MVCC requires shared memory coordination)"
@@ -355,6 +361,7 @@ impl FrankenError {
             | Self::SerializationFailure { .. }
             | Self::Busy
             | Self::BusyRecovery
+            | Self::BusySnapshot { .. }
             | Self::SnapshotTooOld { .. }
             | Self::LockFailed { .. } => ErrorCode::Busy,
             Self::TypeMismatch { .. } => ErrorCode::Mismatch,
@@ -377,6 +384,7 @@ impl FrankenError {
                 | Self::DatabaseLocked { .. }
                 | Self::Busy
                 | Self::BusyRecovery
+                | Self::BusySnapshot { .. }
                 | Self::Unsupported
                 | Self::SyntaxError { .. }
                 | Self::ParseError { .. }
@@ -396,6 +404,9 @@ impl FrankenError {
                 Some("Close other connections or wait for the lock to be released")
             }
             Self::Busy | Self::BusyRecovery => Some("Retry the operation after a short delay"),
+            Self::BusySnapshot { .. } => {
+                Some("Retry the transaction; another writer committed to the same pages")
+            }
             Self::WriteConflict { .. } | Self::SerializationFailure { .. } => {
                 Some("Retry the transaction; the conflict is transient")
             }
@@ -419,6 +430,7 @@ impl FrankenError {
             self,
             Self::Busy
                 | Self::BusyRecovery
+                | Self::BusySnapshot { .. }
                 | Self::DatabaseLocked { .. }
                 | Self::WriteConflict { .. }
                 | Self::SerializationFailure { .. }
