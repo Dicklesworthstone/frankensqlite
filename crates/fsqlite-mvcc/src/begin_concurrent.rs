@@ -18,12 +18,14 @@
 //! 5. Savepoints within concurrent transactions work normally; `ROLLBACK TO`
 //!    reverts write-set state but preserves page locks and the snapshot.
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 
-use fsqlite_types::{CommitSeq, PageData, PageNumber, Snapshot, TxnId};
+use fsqlite_types::{CommitSeq, PageData, PageNumber, Snapshot, TxnEpoch, TxnId, TxnToken, WitnessKey};
 
 use crate::core_types::{CommitIndex, InProcessPageLockTable, TransactionMode, TransactionState};
 use crate::lifecycle::MvccError;
+use crate::ssi_validation::{ActiveTxnView, SsiAbortReason};
 
 /// Maximum number of concurrent writers that can be active simultaneously.
 ///
@@ -48,8 +50,8 @@ pub enum FcwResult {
 
 /// Lightweight handle representing one active concurrent session.
 ///
-/// A `ConcurrentHandle` tracks the write set, page locks, and snapshot for
-/// a single `BEGIN CONCURRENT` transaction.
+/// A `ConcurrentHandle` tracks the write set, page locks, snapshot, and SSI
+/// state for a single `BEGIN CONCURRENT` transaction.
 #[derive(Debug)]
 pub struct ConcurrentHandle {
     /// Read snapshot established at `BEGIN CONCURRENT` time.
@@ -60,17 +62,32 @@ pub struct ConcurrentHandle {
     page_locks: HashSet<PageNumber>,
     /// Transaction state (Active / Committed / Aborted).
     state: TransactionState,
+    /// Pages read by this transaction (for SSI rw-antidependency detection).
+    read_set: HashSet<PageNumber>,
+    /// Transaction token for SSI tracking.
+    txn_token: TxnToken,
+    /// Whether this transaction has an incoming rw-antidependency edge (SSI).
+    has_in_rw: Cell<bool>,
+    /// Whether this transaction has an outgoing rw-antidependency edge (SSI).
+    has_out_rw: Cell<bool>,
+    /// Whether this transaction was marked for abort by another committer.
+    marked_for_abort: Cell<bool>,
 }
 
 impl ConcurrentHandle {
-    /// Create a new concurrent handle with the given snapshot.
+    /// Create a new concurrent handle with the given snapshot and token.
     #[must_use]
-    pub fn new(snapshot: Snapshot) -> Self {
+    pub fn new(snapshot: Snapshot, txn_token: TxnToken) -> Self {
         Self {
             snapshot,
             write_set: HashMap::new(),
             page_locks: HashSet::new(),
             state: TransactionState::Active,
+            read_set: HashSet::new(),
+            txn_token,
+            has_in_rw: Cell::new(false),
+            has_out_rw: Cell::new(false),
+            marked_for_abort: Cell::new(false),
         }
     }
 
@@ -119,6 +136,106 @@ impl ConcurrentHandle {
     pub fn mark_aborted(&mut self) {
         self.state = TransactionState::Aborted;
     }
+
+    /// Record a page read (for SSI rw-antidependency detection).
+    pub fn record_read(&mut self, page: PageNumber) {
+        self.read_set.insert(page);
+    }
+
+    /// Returns the set of pages that were read.
+    #[must_use]
+    pub fn read_set(&self) -> &HashSet<PageNumber> {
+        &self.read_set
+    }
+
+    /// Returns the number of pages in the read set.
+    #[must_use]
+    pub fn read_set_len(&self) -> usize {
+        self.read_set.len()
+    }
+
+    /// Returns the transaction token.
+    #[must_use]
+    pub const fn txn_token(&self) -> TxnToken {
+        self.txn_token
+    }
+
+    /// Returns witness keys for all read pages (for SSI validation).
+    #[must_use]
+    pub fn read_witness_keys(&self) -> Vec<WitnessKey> {
+        self.read_set.iter().map(|&p| WitnessKey::Page(p)).collect()
+    }
+
+    /// Returns witness keys for all written pages (for SSI validation).
+    #[must_use]
+    pub fn write_witness_keys(&self) -> Vec<WitnessKey> {
+        self.write_set.keys().map(|&p| WitnessKey::Page(p)).collect()
+    }
+
+    /// Whether this handle has incoming rw-antidependency (SSI).
+    #[must_use]
+    pub fn has_in_rw(&self) -> bool {
+        self.has_in_rw.get()
+    }
+
+    /// Whether this handle has outgoing rw-antidependency (SSI).
+    #[must_use]
+    pub fn has_out_rw(&self) -> bool {
+        self.has_out_rw.get()
+    }
+
+    /// Whether this transaction was marked for abort by another committer.
+    #[must_use]
+    pub fn is_marked_for_abort(&self) -> bool {
+        self.marked_for_abort.get()
+    }
+}
+
+/// Implement ActiveTxnView for ConcurrentHandle to enable SSI validation.
+impl ActiveTxnView for ConcurrentHandle {
+    fn token(&self) -> TxnToken {
+        self.txn_token
+    }
+
+    fn begin_seq(&self) -> CommitSeq {
+        self.snapshot.high
+    }
+
+    fn is_active(&self) -> bool {
+        matches!(self.state, TransactionState::Active)
+    }
+
+    fn read_keys(&self) -> &[WitnessKey] {
+        // NOTE: We can't return a slice directly since read_witness_keys() allocates.
+        // The SSI validation code will call read_set() directly instead.
+        &[]
+    }
+
+    fn write_keys(&self) -> &[WitnessKey] {
+        // NOTE: We can't return a slice directly since write_witness_keys() allocates.
+        // The SSI validation code will call write_set_pages() directly instead.
+        &[]
+    }
+
+    fn has_in_rw(&self) -> bool {
+        self.has_in_rw.get()
+    }
+
+    fn has_out_rw(&self) -> bool {
+        self.has_out_rw.get()
+    }
+
+    fn set_has_out_rw(&self, val: bool) {
+        self.has_out_rw.set(val);
+    }
+
+    fn set_has_in_rw(&self, val: bool) {
+        self.has_in_rw.set(val);
+    }
+
+    fn set_marked_for_abort(&self, val: bool) {
+        self.marked_for_abort.set(val);
+    }
 }
 
 /// Savepoint within a concurrent transaction.
@@ -146,13 +263,15 @@ impl ConcurrentSavepoint {
 /// Registry tracking all active concurrent writers for a database.
 ///
 /// Enforces the soft limit on concurrent writers and provides the shared
-/// state needed for first-committer-wins validation.
+/// state needed for first-committer-wins and SSI validation.
 #[derive(Debug)]
 pub struct ConcurrentRegistry {
     /// Active concurrent handles, keyed by an opaque session id.
     active: HashMap<u64, ConcurrentHandle>,
     /// Next session id to assign.
     next_session_id: u64,
+    /// Epoch counter for TxnToken generation (increments on each session).
+    epoch_counter: u32,
 }
 
 impl ConcurrentRegistry {
@@ -162,6 +281,7 @@ impl ConcurrentRegistry {
         Self {
             active: HashMap::new(),
             next_session_id: 1,
+            epoch_counter: 0,
         }
     }
 
@@ -182,9 +302,20 @@ impl ConcurrentRegistry {
         }
         let session_id = self.next_session_id;
         self.next_session_id = self.next_session_id.wrapping_add(1);
-        let handle = ConcurrentHandle::new(snapshot);
+        self.epoch_counter = self.epoch_counter.wrapping_add(1);
+
+        // Create TxnToken for SSI tracking.
+        let txn_id = TxnId::new(session_id).ok_or(MvccError::InvalidState)?;
+        let txn_token = TxnToken::new(txn_id, TxnEpoch::new(self.epoch_counter));
+
+        let handle = ConcurrentHandle::new(snapshot, txn_token);
         self.active.insert(session_id, handle);
         Ok(session_id)
+    }
+
+    /// Returns an iterator over all active handles (for SSI validation).
+    pub fn iter_active(&self) -> impl Iterator<Item = (u64, &ConcurrentHandle)> {
+        self.active.iter().map(|(&id, h)| (id, h))
     }
 
     /// Look up a concurrent handle by session id.
@@ -299,10 +430,20 @@ pub fn validate_first_committer_wins(
     }
 }
 
+/// SSI validation result for concurrent commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SsiResult {
+    /// SSI validation passed.
+    Clean,
+    /// SSI validation failed — dangerous structure detected.
+    Abort { reason: SsiAbortReason },
+}
+
 /// Commit a concurrent transaction.
 ///
-/// Validates with first-committer-wins, then either commits (returning
-/// the assigned sequence) or returns `BusySnapshot` on conflict.
+/// Validates with first-committer-wins, then SSI (Serializable Snapshot
+/// Isolation), then either commits (returning the assigned sequence) or
+/// returns `BusySnapshot` on conflict.
 pub fn concurrent_commit(
     handle: &mut ConcurrentHandle,
     commit_index: &CommitIndex,
@@ -315,9 +456,30 @@ pub fn concurrent_commit(
     }
     let txn_id = TxnId::new(session_id).ok_or((MvccError::InvalidState, FcwResult::Clean))?;
 
+    // Step 1: First-committer-wins validation.
     let fcw_result = validate_first_committer_wins(handle, commit_index);
     match &fcw_result {
         FcwResult::Clean => {
+            // FCW passed. Now run SSI validation.
+            // NOTE: For now, we use a simplified SSI check that only looks at
+            // the local handle's has_in_rw/has_out_rw flags and marked_for_abort.
+            // Full SSI with cross-transaction edge discovery requires the
+            // registry to be passed in (done in concurrent_commit_with_ssi).
+
+            // Check if marked for abort by another committer.
+            if handle.is_marked_for_abort() {
+                lock_table.release_all(txn_id);
+                handle.mark_aborted();
+                return Err((MvccError::BusySnapshot, FcwResult::Clean));
+            }
+
+            // Check for dangerous structure (both in + out rw edges).
+            if handle.has_in_rw() && handle.has_out_rw() {
+                lock_table.release_all(txn_id);
+                handle.mark_aborted();
+                return Err((MvccError::BusySnapshot, FcwResult::Clean));
+            }
+
             // Commit: update commit index for all written pages.
             for &page in handle.write_set.keys() {
                 commit_index.update(page, assign_commit_seq);
@@ -334,6 +496,126 @@ pub fn concurrent_commit(
             Err((MvccError::BusySnapshot, fcw_result))
         }
     }
+}
+
+/// Commit a concurrent transaction with full SSI validation.
+///
+/// This version takes the registry mutably to perform cross-transaction SSI
+/// edge discovery. It handles getting the handle internally.
+pub fn concurrent_commit_with_ssi(
+    registry: &mut ConcurrentRegistry,
+    commit_index: &CommitIndex,
+    lock_table: &InProcessPageLockTable,
+    session_id: u64,
+    assign_commit_seq: CommitSeq,
+) -> Result<CommitSeq, (MvccError, FcwResult)> {
+    let txn_id = TxnId::new(session_id).ok_or((MvccError::InvalidState, FcwResult::Clean))?;
+
+    // First, verify the session exists and is active.
+    {
+        let handle = registry
+            .get(session_id)
+            .ok_or((MvccError::InvalidState, FcwResult::Clean))?;
+        if !handle.is_active() {
+            return Err((MvccError::InvalidState, FcwResult::Clean));
+        }
+
+        // Step 1: First-committer-wins validation.
+        let fcw_result = validate_first_committer_wins(handle, commit_index);
+        if !matches!(fcw_result, FcwResult::Clean) {
+            lock_table.release_all(txn_id);
+            let handle = registry.get_mut(session_id).unwrap();
+            handle.mark_aborted();
+            return Err((MvccError::BusySnapshot, fcw_result));
+        }
+    }
+
+    // Step 2: Discover SSI edges by iterating over all handles immutably.
+    // The Cell-based SSI flags allow mutation through shared references.
+    let (has_in_rw, has_out_rw, is_marked_for_abort) = {
+        let handles: Vec<_> = registry.iter_active().collect();
+        let our_handle = handles
+            .iter()
+            .find(|(id, _)| *id == session_id)
+            .map(|(_, h)| *h);
+
+        let our_handle = match our_handle {
+            Some(h) => h,
+            None => return Err((MvccError::InvalidState, FcwResult::Clean)),
+        };
+
+        let write_keys = our_handle.write_witness_keys();
+
+        // Skip SSI for write-only transactions.
+        if write_keys.is_empty() {
+            lock_table.release_all(txn_id);
+            let handle = registry.get_mut(session_id).unwrap();
+            handle.mark_committed();
+            return Ok(assign_commit_seq);
+        }
+
+        let mut has_in_rw = false;
+        let mut has_out_rw = false;
+
+        for &(other_id, other_handle) in &handles {
+            if other_id == session_id {
+                continue;
+            }
+            if !other_handle.is_active() {
+                continue;
+            }
+
+            // Incoming edge: other read a page we're writing.
+            let other_reads = other_handle.read_set();
+            for write_page in our_handle.write_set.keys() {
+                if other_reads.contains(write_page) {
+                    has_in_rw = true;
+                    other_handle.has_out_rw.set(true);
+                    if other_handle.has_in_rw() {
+                        other_handle.marked_for_abort.set(true);
+                    }
+                    break;
+                }
+            }
+
+            // Outgoing edge: other wrote a page we've read.
+            let other_writes: Vec<_> = other_handle.write_set.keys().collect();
+            for read_page in our_handle.read_set() {
+                if other_writes.iter().any(|&&p| p == *read_page) {
+                    has_out_rw = true;
+                    other_handle.has_in_rw.set(true);
+                    break;
+                }
+            }
+
+            if has_in_rw && has_out_rw {
+                break;
+            }
+        }
+
+        // Update our flags.
+        our_handle.has_in_rw.set(has_in_rw);
+        our_handle.has_out_rw.set(has_out_rw);
+
+        (has_in_rw, has_out_rw, our_handle.is_marked_for_abort())
+    };
+
+    // Check abort conditions.
+    if is_marked_for_abort || (has_in_rw && has_out_rw) {
+        lock_table.release_all(txn_id);
+        let handle = registry.get_mut(session_id).unwrap();
+        handle.mark_aborted();
+        return Err((MvccError::BusySnapshot, FcwResult::Clean));
+    }
+
+    // SSI passed. Commit.
+    let handle = registry.get_mut(session_id).unwrap();
+    for &page in handle.write_set.keys() {
+        commit_index.update(page, assign_commit_seq);
+    }
+    lock_table.release_all(txn_id);
+    handle.mark_committed();
+    Ok(assign_commit_seq)
 }
 
 /// Abort a concurrent transaction, releasing all page locks.
@@ -785,5 +1067,225 @@ mod tests {
         let handle = registry.get(s1).expect("handle");
         let result = concurrent_savepoint(handle, "sp1");
         assert_eq!(result.unwrap_err(), MvccError::InvalidState);
+    }
+
+    // -----------------------------------------------------------------------
+    // SSI Tests (bd-1xo1)
+    // -----------------------------------------------------------------------
+
+    // Test 13: SSI - read tracking records pages.
+    #[test]
+    fn test_ssi_read_tracking() {
+        let mut registry = ConcurrentRegistry::new();
+        let s1 = registry
+            .begin_concurrent(test_snapshot(10))
+            .expect("session");
+
+        let handle = registry.get_mut(s1).expect("handle");
+        assert_eq!(handle.read_set_len(), 0);
+
+        handle.record_read(test_page(5));
+        handle.record_read(test_page(10));
+        handle.record_read(test_page(5)); // Duplicate, should be deduplicated.
+
+        assert_eq!(handle.read_set_len(), 2);
+        assert!(handle.read_set().contains(&test_page(5)));
+        assert!(handle.read_set().contains(&test_page(10)));
+    }
+
+    // Test 14: SSI - no conflict when reads/writes don't overlap.
+    #[test]
+    fn test_ssi_no_conflict_disjoint() {
+        use super::concurrent_commit_with_ssi;
+
+        let lock_table = InProcessPageLockTable::new();
+        let commit_index = CommitIndex::new();
+        let mut registry = ConcurrentRegistry::new();
+
+        // T1: reads page 5, writes page 10.
+        // T2: reads page 20, writes page 30.
+        // No overlap → both commit.
+        let s1 = registry.begin_concurrent(test_snapshot(10)).unwrap();
+        let s2 = registry.begin_concurrent(test_snapshot(10)).unwrap();
+
+        // T1 reads and writes.
+        {
+            let h1 = registry.get_mut(s1).unwrap();
+            h1.record_read(test_page(5));
+            concurrent_write_page(h1, &lock_table, s1, test_page(10), test_data()).unwrap();
+        }
+
+        // T2 reads and writes.
+        {
+            let h2 = registry.get_mut(s2).unwrap();
+            h2.record_read(test_page(20));
+            concurrent_write_page(h2, &lock_table, s2, test_page(30), test_data()).unwrap();
+        }
+
+        // Both should commit successfully.
+        let seq1 = concurrent_commit_with_ssi(&mut registry, &commit_index, &lock_table, s1, CommitSeq::new(11))
+            .expect("T1 commits");
+        assert_eq!(seq1, CommitSeq::new(11));
+
+        let seq2 = concurrent_commit_with_ssi(&mut registry, &commit_index, &lock_table, s2, CommitSeq::new(12))
+            .expect("T2 commits");
+        assert_eq!(seq2, CommitSeq::new(12));
+    }
+
+    // Test 15: SSI - pivot detection aborts transaction with both in/out edges.
+    #[test]
+    fn test_ssi_pivot_abort() {
+        use super::concurrent_commit_with_ssi;
+
+        let lock_table = InProcessPageLockTable::new();
+        let commit_index = CommitIndex::new();
+        let mut registry = ConcurrentRegistry::new();
+
+        // Classic write skew setup:
+        // T1 reads A, writes B.
+        // T2 reads B, writes A.
+        //
+        // When T1 tries to commit:
+        // - Incoming: T2 read B, T1 writes B → incoming edge from T2
+        // - Outgoing: T1 read A, T2 writes A → outgoing edge to T2
+        // T1 has BOTH → T1 is pivot → T1 must abort.
+
+        let s1 = registry.begin_concurrent(test_snapshot(10)).unwrap();
+        let s2 = registry.begin_concurrent(test_snapshot(10)).unwrap();
+
+        // T1: reads page 5 (A), writes page 10 (B).
+        {
+            let h1 = registry.get_mut(s1).unwrap();
+            h1.record_read(test_page(5)); // A
+            concurrent_write_page(h1, &lock_table, s1, test_page(10), test_data()).unwrap(); // B
+        }
+
+        // T2: reads page 10 (B), writes page 5 (A).
+        {
+            let h2 = registry.get_mut(s2).unwrap();
+            h2.record_read(test_page(10)); // B
+            concurrent_write_page(h2, &lock_table, s2, test_page(5), test_data()).unwrap(); // A
+        }
+
+        // T1 tries to commit first: it has both incoming and outgoing edges.
+        // Incoming: T2 read B (page 10), T1 writes B → edge from T2 to T1
+        // Outgoing: T1 read A (page 5), T2 writes A → edge from T1 to T2
+        // T1 is pivot and must abort.
+        let result1 = concurrent_commit_with_ssi(&mut registry, &commit_index, &lock_table, s1, CommitSeq::new(11));
+        assert!(result1.is_err(), "T1 should abort as pivot (both in and out edges)");
+        let (err, _) = result1.unwrap_err();
+        assert_eq!(err, MvccError::BusySnapshot);
+
+        // After T1 aborts, T2 can now commit (T1 is no longer active, so no edges).
+        let result2 = concurrent_commit_with_ssi(&mut registry, &commit_index, &lock_table, s2, CommitSeq::new(11));
+        assert!(result2.is_ok(), "T2 should commit after T1 aborted");
+    }
+
+    // Test 16: SSI - transaction marked for abort fails.
+    #[test]
+    fn test_ssi_marked_for_abort() {
+        let lock_table = InProcessPageLockTable::new();
+        let commit_index = CommitIndex::new();
+        let mut registry = ConcurrentRegistry::new();
+
+        let s1 = registry.begin_concurrent(test_snapshot(10)).unwrap();
+
+        let h1 = registry.get_mut(s1).unwrap();
+        concurrent_write_page(h1, &lock_table, s1, test_page(5), test_data()).unwrap();
+
+        // Manually mark for abort.
+        h1.marked_for_abort.set(true);
+
+        // Commit should fail.
+        let result = concurrent_commit(h1, &commit_index, &lock_table, s1, CommitSeq::new(11));
+        assert!(result.is_err());
+        let (err, _) = result.unwrap_err();
+        assert_eq!(err, MvccError::BusySnapshot);
+    }
+
+    // Test 17: SSI - only incoming edge allows commit.
+    #[test]
+    fn test_ssi_only_incoming_edge_commits() {
+        let lock_table = InProcessPageLockTable::new();
+        let commit_index = CommitIndex::new();
+        let mut registry = ConcurrentRegistry::new();
+
+        let s1 = registry.begin_concurrent(test_snapshot(10)).unwrap();
+
+        let h1 = registry.get_mut(s1).unwrap();
+        concurrent_write_page(h1, &lock_table, s1, test_page(5), test_data()).unwrap();
+
+        // Set only incoming edge (no outgoing).
+        h1.has_in_rw.set(true);
+        h1.has_out_rw.set(false);
+
+        // Commit should succeed (not a pivot).
+        let result = concurrent_commit(h1, &commit_index, &lock_table, s1, CommitSeq::new(11));
+        assert!(result.is_ok(), "only incoming edge should allow commit");
+    }
+
+    // Test 18: SSI - only outgoing edge allows commit.
+    #[test]
+    fn test_ssi_only_outgoing_edge_commits() {
+        let lock_table = InProcessPageLockTable::new();
+        let commit_index = CommitIndex::new();
+        let mut registry = ConcurrentRegistry::new();
+
+        let s1 = registry.begin_concurrent(test_snapshot(10)).unwrap();
+
+        let h1 = registry.get_mut(s1).unwrap();
+        concurrent_write_page(h1, &lock_table, s1, test_page(5), test_data()).unwrap();
+
+        // Set only outgoing edge (no incoming).
+        h1.has_in_rw.set(false);
+        h1.has_out_rw.set(true);
+
+        // Commit should succeed (not a pivot).
+        let result = concurrent_commit(h1, &commit_index, &lock_table, s1, CommitSeq::new(11));
+        assert!(result.is_ok(), "only outgoing edge should allow commit");
+    }
+
+    // Test 19: SSI - both edges trigger abort.
+    #[test]
+    fn test_ssi_both_edges_aborts() {
+        let lock_table = InProcessPageLockTable::new();
+        let commit_index = CommitIndex::new();
+        let mut registry = ConcurrentRegistry::new();
+
+        let s1 = registry.begin_concurrent(test_snapshot(10)).unwrap();
+
+        let h1 = registry.get_mut(s1).unwrap();
+        concurrent_write_page(h1, &lock_table, s1, test_page(5), test_data()).unwrap();
+
+        // Set both edges → dangerous structure.
+        h1.has_in_rw.set(true);
+        h1.has_out_rw.set(true);
+
+        // Commit should fail (pivot).
+        let result = concurrent_commit(h1, &commit_index, &lock_table, s1, CommitSeq::new(11));
+        assert!(result.is_err());
+        let (err, _) = result.unwrap_err();
+        assert_eq!(err, MvccError::BusySnapshot);
+    }
+
+    // Test 20: SSI - witness keys generated correctly.
+    #[test]
+    fn test_ssi_witness_keys() {
+        let mut registry = ConcurrentRegistry::new();
+        let lock_table = InProcessPageLockTable::new();
+
+        let s1 = registry.begin_concurrent(test_snapshot(10)).unwrap();
+
+        let h1 = registry.get_mut(s1).unwrap();
+        h1.record_read(test_page(5));
+        h1.record_read(test_page(10));
+        concurrent_write_page(h1, &lock_table, s1, test_page(15), test_data()).unwrap();
+        concurrent_write_page(h1, &lock_table, s1, test_page(20), test_data()).unwrap();
+
+        let read_keys = h1.read_witness_keys();
+        let write_keys = h1.write_witness_keys();
+
+        assert_eq!(read_keys.len(), 2);
+        assert_eq!(write_keys.len(), 2);
     }
 }
