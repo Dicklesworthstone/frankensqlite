@@ -19,10 +19,7 @@ use std::sync::Arc;
 use fsqlite_btree::{BtCursor, BtreeCursorOps, MemPageStore, PageReader, PageWriter, SeekResult};
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_func::{ErasedAggregateFunction, FunctionRegistry};
-use fsqlite_mvcc::{
-    ConcurrentRegistry, InProcessPageLockTable, MvccError, concurrent_read_page,
-    concurrent_write_page,
-};
+use fsqlite_mvcc::{ConcurrentRegistry, InProcessPageLockTable, MvccError, concurrent_write_page};
 use fsqlite_pager::TransactionHandle;
 use fsqlite_types::cx::Cx;
 use fsqlite_types::opcode::{Opcode, P4, VdbeOp};
@@ -294,17 +291,14 @@ impl SharedTxnPageIo {
 
 impl PageReader for SharedTxnPageIo {
     fn read_page(&self, cx: &Cx, page_no: PageNumber) -> Result<Vec<u8>> {
-        // bd-kivg / 5E.2: Check local write set first if in concurrent mode.
-        if let Some(ref ctx) = self.concurrent {
-            let registry = ctx.registry.borrow();
-            if let Some(handle) = registry.get(ctx.session_id) {
-                if let Some(page_data) = concurrent_read_page(handle, page_no) {
-                    // Return the locally modified page from write set.
-                    return Ok(page_data.as_bytes().to_vec());
-                }
-            }
-        }
-        // Fall through to underlying transaction's page read.
+        // bd-kivg / 5E.2: The write set is used for page-level locking and FCW
+        // validation, not for read-your-own-writes. The pager's transaction
+        // handles read-your-own-writes through its page cache, which also
+        // correctly handles savepoint rollbacks.
+        //
+        // Note: concurrent_read_page is not called here because the pager
+        // provides correct read-your-own-writes semantics, and checking the
+        // write set would bypass savepoint rollback semantics.
         Ok(self.txn.borrow().get_page(cx, page_no)?.into_vec())
     }
 }
