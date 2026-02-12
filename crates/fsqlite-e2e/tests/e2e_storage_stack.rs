@@ -47,7 +47,11 @@ struct StageReport {
 }
 
 impl StageReport {
-    fn success(stage_name: impl Into<String>, elapsed_ms: u128, details: impl Into<String>) -> Self {
+    fn success(
+        stage_name: impl Into<String>,
+        elapsed_ms: u128,
+        details: impl Into<String>,
+    ) -> Self {
         Self {
             stage_name: stage_name.into(),
             elapsed_ms,
@@ -56,7 +60,11 @@ impl StageReport {
         }
     }
 
-    fn failure(stage_name: impl Into<String>, elapsed_ms: u128, details: impl Into<String>) -> Self {
+    fn failure(
+        stage_name: impl Into<String>,
+        elapsed_ms: u128,
+        details: impl Into<String>,
+    ) -> Self {
         Self {
             stage_name: stage_name.into(),
             elapsed_ms,
@@ -107,29 +115,61 @@ fn stage_1_ddl(conn: &fsqlite::Connection, _path: &str) -> StageReport {
     e2e_log!(stage, "start", "Beginning DDL stage");
 
     // Create users table
-    e2e_log!(stage, "create_table", "CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT, email TEXT UNIQUE)");
-    if let Err(e) = conn.execute("CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT, email TEXT UNIQUE)") {
-        return StageReport::failure(stage, start.elapsed().as_millis(), format!("CREATE TABLE failed: {e}"));
+    e2e_log!(
+        stage,
+        "create_table",
+        "CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT, email TEXT UNIQUE)"
+    );
+    if let Err(e) =
+        conn.execute("CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT, email TEXT UNIQUE)")
+    {
+        return StageReport::failure(
+            stage,
+            start.elapsed().as_millis(),
+            format!("CREATE TABLE failed: {e}"),
+        );
     }
 
     // Verify sqlite_master (optional - may not be fully queryable yet, see bd-3ly4)
-    e2e_log!(stage, "verify_sqlite_master", "Checking sqlite_master entries");
+    e2e_log!(
+        stage,
+        "verify_sqlite_master",
+        "Checking sqlite_master entries"
+    );
     match conn.query("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='users'") {
         Ok(rows) => {
             if let Some(row) = rows.first() {
-                e2e_log_kv!(stage, "sqlite_master_check", "table entry", count = row.get(0));
+                e2e_log_kv!(
+                    stage,
+                    "sqlite_master_check",
+                    "table entry",
+                    count = row.get(0)
+                );
             }
         }
         Err(e) => {
             // sqlite_master direct query may not be implemented yet (Phase 5G / bd-3ly4)
-            e2e_log_kv!(stage, "sqlite_master_skip", "sqlite_master query not available yet (Phase 5G)", error = e.to_string());
+            e2e_log_kv!(
+                stage,
+                "sqlite_master_skip",
+                "sqlite_master query not available yet (Phase 5G)",
+                error = e.to_string()
+            );
         }
     }
 
     // Create an index
-    e2e_log!(stage, "create_index", "CREATE INDEX idx_email ON users(email)");
+    e2e_log!(
+        stage,
+        "create_index",
+        "CREATE INDEX idx_email ON users(email)"
+    );
     if let Err(e) = conn.execute("CREATE INDEX idx_email ON users(email)") {
-        return StageReport::failure(stage, start.elapsed().as_millis(), format!("CREATE INDEX failed: {e}"));
+        return StageReport::failure(
+            stage,
+            start.elapsed().as_millis(),
+            format!("CREATE INDEX failed: {e}"),
+        );
     }
 
     // Verify index in sqlite_master (optional - may not be fully queryable yet, see bd-3ly4)
@@ -141,12 +181,22 @@ fn stage_1_ddl(conn: &fsqlite::Connection, _path: &str) -> StageReport {
         }
         Err(e) => {
             // sqlite_master direct query may not be implemented yet (Phase 5G / bd-3ly4)
-            e2e_log_kv!(stage, "index_check_skip", "sqlite_master index query not available yet (Phase 5G)", error = e.to_string());
+            e2e_log_kv!(
+                stage,
+                "index_check_skip",
+                "sqlite_master index query not available yet (Phase 5G)",
+                error = e.to_string()
+            );
         }
     }
 
     let elapsed = start.elapsed().as_millis();
-    e2e_log_kv!(stage, "complete", "DDL stage complete", elapsed_ms = elapsed);
+    e2e_log_kv!(
+        stage,
+        "complete",
+        "DDL stage complete",
+        elapsed_ms = elapsed
+    );
 
     StageReport::success(stage, elapsed, "Created users table and idx_email index")
 }
@@ -161,7 +211,12 @@ fn stage_2_write(conn: &fsqlite::Connection) -> StageReport {
 
     // Insert batch of rows
     let insert_count = 100;
-    e2e_log_kv!(stage, "insert_batch", "Inserting rows", count = insert_count);
+    e2e_log_kv!(
+        stage,
+        "insert_batch",
+        "Inserting rows",
+        count = insert_count
+    );
 
     let insert_start = Instant::now();
     for i in 1..=insert_count {
@@ -170,30 +225,58 @@ fn stage_2_write(conn: &fsqlite::Connection) -> StageReport {
             i, i, i
         );
         if let Err(e) = conn.execute(&sql) {
-            return StageReport::failure(stage, start.elapsed().as_millis(), format!("INSERT {} failed: {e}", i));
+            return StageReport::failure(
+                stage,
+                start.elapsed().as_millis(),
+                format!("INSERT {} failed: {e}", i),
+            );
         }
 
         if i % 25 == 0 {
-            e2e_log_kv!(stage, "insert_progress", "Insert progress",
-                inserted = i, total = insert_count, elapsed_ms = insert_start.elapsed().as_millis());
+            e2e_log_kv!(
+                stage,
+                "insert_progress",
+                "Insert progress",
+                inserted = i,
+                total = insert_count,
+                elapsed_ms = insert_start.elapsed().as_millis()
+            );
         }
     }
 
     let insert_elapsed = insert_start.elapsed().as_millis();
-    let rows_per_sec = if insert_elapsed > 0 { (insert_count as u128 * 1000) / insert_elapsed } else { 0 };
-    e2e_log_kv!(stage, "insert_complete", "Insert complete",
-        inserted = insert_count, total_ms = insert_elapsed, rows_per_sec = rows_per_sec);
+    let rows_per_sec = if insert_elapsed > 0 {
+        (insert_count as u128 * 1000) / insert_elapsed
+    } else {
+        0
+    };
+    e2e_log_kv!(
+        stage,
+        "insert_complete",
+        "Insert complete",
+        inserted = insert_count,
+        total_ms = insert_elapsed,
+        rows_per_sec = rows_per_sec
+    );
 
     // Update some rows
     e2e_log!(stage, "update_batch", "Updating 50 rows");
     if let Err(e) = conn.execute("UPDATE users SET name = name || '_updated' WHERE id <= 50") {
-        return StageReport::failure(stage, start.elapsed().as_millis(), format!("UPDATE failed: {e}"));
+        return StageReport::failure(
+            stage,
+            start.elapsed().as_millis(),
+            format!("UPDATE failed: {e}"),
+        );
     }
 
     // Delete some rows
     e2e_log!(stage, "delete_batch", "Deleting 10 rows");
     if let Err(e) = conn.execute("DELETE FROM users WHERE id > 90") {
-        return StageReport::failure(stage, start.elapsed().as_millis(), format!("DELETE failed: {e}"));
+        return StageReport::failure(
+            stage,
+            start.elapsed().as_millis(),
+            format!("DELETE failed: {e}"),
+        );
     }
 
     // Verify final count
@@ -201,18 +284,37 @@ fn stage_2_write(conn: &fsqlite::Connection) -> StageReport {
         Ok(rows) => {
             if let Some(row) = rows.first() {
                 let count = row.get(0);
-                e2e_log_kv!(stage, "verify_counts", "Final row count", expected = 90, actual = count);
+                e2e_log_kv!(
+                    stage,
+                    "verify_counts",
+                    "Final row count",
+                    expected = 90,
+                    actual = count
+                );
             }
         }
         Err(e) => {
-            return StageReport::failure(stage, start.elapsed().as_millis(), format!("COUNT query failed: {e}"));
+            return StageReport::failure(
+                stage,
+                start.elapsed().as_millis(),
+                format!("COUNT query failed: {e}"),
+            );
         }
     }
 
     let elapsed = start.elapsed().as_millis();
-    e2e_log_kv!(stage, "complete", "Write stage complete", elapsed_ms = elapsed);
+    e2e_log_kv!(
+        stage,
+        "complete",
+        "Write stage complete",
+        elapsed_ms = elapsed
+    );
 
-    StageReport::success(stage, elapsed, format!("Inserted {}, updated 50, deleted 10", insert_count))
+    StageReport::success(
+        stage,
+        elapsed,
+        format!("Inserted {}, updated 50, deleted 10", insert_count),
+    )
 }
 
 // ─── Stage 3: Read Operations ───────────────────────────────────────────────
@@ -228,24 +330,46 @@ fn stage_3_read(conn: &fsqlite::Connection) -> StageReport {
     let scan_start = Instant::now();
     match conn.query("SELECT * FROM users ORDER BY id") {
         Ok(rows) => {
-            e2e_log_kv!(stage, "full_scan_result", "Full scan complete",
-                rows = rows.len(), elapsed_ms = scan_start.elapsed().as_millis());
+            e2e_log_kv!(
+                stage,
+                "full_scan_result",
+                "Full scan complete",
+                rows = rows.len(),
+                elapsed_ms = scan_start.elapsed().as_millis()
+            );
         }
         Err(e) => {
-            return StageReport::failure(stage, start.elapsed().as_millis(), format!("Full scan failed: {e}"));
+            return StageReport::failure(
+                stage,
+                start.elapsed().as_millis(),
+                format!("Full scan failed: {e}"),
+            );
         }
     }
 
     // Index seek (if optimizer uses index)
-    e2e_log!(stage, "index_seek", "SELECT * FROM users WHERE email = 'user50@test.com'");
+    e2e_log!(
+        stage,
+        "index_seek",
+        "SELECT * FROM users WHERE email = 'user50@test.com'"
+    );
     let seek_start = Instant::now();
     match conn.query("SELECT * FROM users WHERE email = 'user50@test.com'") {
         Ok(rows) => {
-            e2e_log_kv!(stage, "index_seek_result", "Index seek complete",
-                rows = rows.len(), elapsed_ms = seek_start.elapsed().as_millis());
+            e2e_log_kv!(
+                stage,
+                "index_seek_result",
+                "Index seek complete",
+                rows = rows.len(),
+                elapsed_ms = seek_start.elapsed().as_millis()
+            );
         }
         Err(e) => {
-            return StageReport::failure(stage, start.elapsed().as_millis(), format!("Index seek failed: {e}"));
+            return StageReport::failure(
+                stage,
+                start.elapsed().as_millis(),
+                format!("Index seek failed: {e}"),
+            );
         }
     }
 
@@ -254,30 +378,61 @@ fn stage_3_read(conn: &fsqlite::Connection) -> StageReport {
     match conn.query("SELECT COUNT(*), SUM(id) FROM users") {
         Ok(rows) => {
             if let Some(row) = rows.first() {
-                e2e_log_kv!(stage, "aggregate_result", "Aggregate result",
-                    count = row.get(0), sum = row.get(1));
+                e2e_log_kv!(
+                    stage,
+                    "aggregate_result",
+                    "Aggregate result",
+                    count = row.get(0),
+                    sum = row.get(1)
+                );
             }
         }
         Err(e) => {
-            return StageReport::failure(stage, start.elapsed().as_millis(), format!("Aggregate query failed: {e}"));
+            return StageReport::failure(
+                stage,
+                start.elapsed().as_millis(),
+                format!("Aggregate query failed: {e}"),
+            );
         }
     }
 
     // Subquery
-    e2e_log!(stage, "subquery", "SELECT name FROM users WHERE id IN (SELECT id FROM users WHERE id < 10)");
+    e2e_log!(
+        stage,
+        "subquery",
+        "SELECT name FROM users WHERE id IN (SELECT id FROM users WHERE id < 10)"
+    );
     match conn.query("SELECT name FROM users WHERE id IN (SELECT id FROM users WHERE id < 10)") {
         Ok(rows) => {
-            e2e_log_kv!(stage, "subquery_result", "Subquery result", rows = rows.len());
+            e2e_log_kv!(
+                stage,
+                "subquery_result",
+                "Subquery result",
+                rows = rows.len()
+            );
         }
         Err(e) => {
-            return StageReport::failure(stage, start.elapsed().as_millis(), format!("Subquery failed: {e}"));
+            return StageReport::failure(
+                stage,
+                start.elapsed().as_millis(),
+                format!("Subquery failed: {e}"),
+            );
         }
     }
 
     let elapsed = start.elapsed().as_millis();
-    e2e_log_kv!(stage, "complete", "Read stage complete", elapsed_ms = elapsed);
+    e2e_log_kv!(
+        stage,
+        "complete",
+        "Read stage complete",
+        elapsed_ms = elapsed
+    );
 
-    StageReport::success(stage, elapsed, "Full scan, index seek, aggregate, subquery all passed")
+    StageReport::success(
+        stage,
+        elapsed,
+        "Full scan, index seek, aggregate, subquery all passed",
+    )
 }
 
 // ─── Stage 4: Transaction Lifecycle ─────────────────────────────────────────
@@ -291,112 +446,217 @@ fn stage_4_txn(conn: &fsqlite::Connection) -> StageReport {
     // Test ROLLBACK
     e2e_log!(stage, "begin", "BEGIN");
     if let Err(e) = conn.execute("BEGIN") {
-        return StageReport::failure(stage, start.elapsed().as_millis(), format!("BEGIN failed: {e}"));
+        return StageReport::failure(
+            stage,
+            start.elapsed().as_millis(),
+            format!("BEGIN failed: {e}"),
+        );
     }
 
-    e2e_log!(stage, "insert", "INSERT INTO users VALUES (10001, 'txn_user', 'txn@test.com')");
+    e2e_log!(
+        stage,
+        "insert",
+        "INSERT INTO users VALUES (10001, 'txn_user', 'txn@test.com')"
+    );
     if let Err(e) = conn.execute("INSERT INTO users VALUES (10001, 'txn_user', 'txn@test.com')") {
         let _ = conn.execute("ROLLBACK");
-        return StageReport::failure(stage, start.elapsed().as_millis(), format!("INSERT in txn failed: {e}"));
+        return StageReport::failure(
+            stage,
+            start.elapsed().as_millis(),
+            format!("INSERT in txn failed: {e}"),
+        );
     }
 
     e2e_log!(stage, "rollback", "ROLLBACK");
     if let Err(e) = conn.execute("ROLLBACK") {
-        return StageReport::failure(stage, start.elapsed().as_millis(), format!("ROLLBACK failed: {e}"));
+        return StageReport::failure(
+            stage,
+            start.elapsed().as_millis(),
+            format!("ROLLBACK failed: {e}"),
+        );
     }
 
     // Verify rollback
     match conn.query("SELECT COUNT(*) FROM users WHERE id = 10001") {
         Ok(rows) => {
             if let Some(row) = rows.first() {
-                e2e_log_kv!(stage, "verify_rollback", "Rollback verification", count = row.get(0));
+                e2e_log_kv!(
+                    stage,
+                    "verify_rollback",
+                    "Rollback verification",
+                    count = row.get(0)
+                );
             }
         }
         Err(e) => {
-            return StageReport::failure(stage, start.elapsed().as_millis(), format!("Rollback verification failed: {e}"));
+            return StageReport::failure(
+                stage,
+                start.elapsed().as_millis(),
+                format!("Rollback verification failed: {e}"),
+            );
         }
     }
 
     // Test COMMIT
     e2e_log!(stage, "begin", "BEGIN (for commit test)");
     if let Err(e) = conn.execute("BEGIN") {
-        return StageReport::failure(stage, start.elapsed().as_millis(), format!("BEGIN failed: {e}"));
+        return StageReport::failure(
+            stage,
+            start.elapsed().as_millis(),
+            format!("BEGIN failed: {e}"),
+        );
     }
 
-    e2e_log!(stage, "insert", "INSERT INTO users VALUES (10001, 'commit_user', 'commit@test.com')");
-    if let Err(e) = conn.execute("INSERT INTO users VALUES (10001, 'commit_user', 'commit@test.com')") {
+    e2e_log!(
+        stage,
+        "insert",
+        "INSERT INTO users VALUES (10001, 'commit_user', 'commit@test.com')"
+    );
+    if let Err(e) =
+        conn.execute("INSERT INTO users VALUES (10001, 'commit_user', 'commit@test.com')")
+    {
         let _ = conn.execute("ROLLBACK");
-        return StageReport::failure(stage, start.elapsed().as_millis(), format!("INSERT for commit failed: {e}"));
+        return StageReport::failure(
+            stage,
+            start.elapsed().as_millis(),
+            format!("INSERT for commit failed: {e}"),
+        );
     }
 
     e2e_log!(stage, "commit", "COMMIT");
     if let Err(e) = conn.execute("COMMIT") {
-        return StageReport::failure(stage, start.elapsed().as_millis(), format!("COMMIT failed: {e}"));
+        return StageReport::failure(
+            stage,
+            start.elapsed().as_millis(),
+            format!("COMMIT failed: {e}"),
+        );
     }
 
     // Verify commit
     match conn.query("SELECT COUNT(*) FROM users WHERE id = 10001") {
         Ok(rows) => {
             if let Some(row) = rows.first() {
-                e2e_log_kv!(stage, "verify_commit", "Commit verification", count = row.get(0));
+                e2e_log_kv!(
+                    stage,
+                    "verify_commit",
+                    "Commit verification",
+                    count = row.get(0)
+                );
             }
         }
         Err(e) => {
-            return StageReport::failure(stage, start.elapsed().as_millis(), format!("Commit verification failed: {e}"));
+            return StageReport::failure(
+                stage,
+                start.elapsed().as_millis(),
+                format!("Commit verification failed: {e}"),
+            );
         }
     }
 
     // Test SAVEPOINT
     e2e_log!(stage, "begin", "BEGIN (for savepoint test)");
     if let Err(e) = conn.execute("BEGIN") {
-        return StageReport::failure(stage, start.elapsed().as_millis(), format!("BEGIN for savepoint failed: {e}"));
+        return StageReport::failure(
+            stage,
+            start.elapsed().as_millis(),
+            format!("BEGIN for savepoint failed: {e}"),
+        );
     }
 
-    e2e_log!(stage, "insert", "INSERT INTO users VALUES (10002, 'sp_base', 'sp_base@test.com')");
-    if let Err(e) = conn.execute("INSERT INTO users VALUES (10002, 'sp_base', 'sp_base@test.com')") {
+    e2e_log!(
+        stage,
+        "insert",
+        "INSERT INTO users VALUES (10002, 'sp_base', 'sp_base@test.com')"
+    );
+    if let Err(e) = conn.execute("INSERT INTO users VALUES (10002, 'sp_base', 'sp_base@test.com')")
+    {
         let _ = conn.execute("ROLLBACK");
-        return StageReport::failure(stage, start.elapsed().as_millis(), format!("INSERT before savepoint failed: {e}"));
+        return StageReport::failure(
+            stage,
+            start.elapsed().as_millis(),
+            format!("INSERT before savepoint failed: {e}"),
+        );
     }
 
     e2e_log!(stage, "savepoint", "SAVEPOINT sp1");
     if let Err(e) = conn.execute("SAVEPOINT sp1") {
         let _ = conn.execute("ROLLBACK");
-        return StageReport::failure(stage, start.elapsed().as_millis(), format!("SAVEPOINT failed: {e}"));
+        return StageReport::failure(
+            stage,
+            start.elapsed().as_millis(),
+            format!("SAVEPOINT failed: {e}"),
+        );
     }
 
-    e2e_log!(stage, "insert", "INSERT INTO users VALUES (10003, 'sp_after', 'sp_after@test.com')");
-    if let Err(e) = conn.execute("INSERT INTO users VALUES (10003, 'sp_after', 'sp_after@test.com')") {
+    e2e_log!(
+        stage,
+        "insert",
+        "INSERT INTO users VALUES (10003, 'sp_after', 'sp_after@test.com')"
+    );
+    if let Err(e) =
+        conn.execute("INSERT INTO users VALUES (10003, 'sp_after', 'sp_after@test.com')")
+    {
         let _ = conn.execute("ROLLBACK");
-        return StageReport::failure(stage, start.elapsed().as_millis(), format!("INSERT after savepoint failed: {e}"));
+        return StageReport::failure(
+            stage,
+            start.elapsed().as_millis(),
+            format!("INSERT after savepoint failed: {e}"),
+        );
     }
 
     e2e_log!(stage, "rollback_to", "ROLLBACK TO sp1");
     if let Err(e) = conn.execute("ROLLBACK TO sp1") {
         let _ = conn.execute("ROLLBACK");
-        return StageReport::failure(stage, start.elapsed().as_millis(), format!("ROLLBACK TO failed: {e}"));
+        return StageReport::failure(
+            stage,
+            start.elapsed().as_millis(),
+            format!("ROLLBACK TO failed: {e}"),
+        );
     }
 
     e2e_log!(stage, "commit", "COMMIT");
     if let Err(e) = conn.execute("COMMIT") {
-        return StageReport::failure(stage, start.elapsed().as_millis(), format!("COMMIT after savepoint rollback failed: {e}"));
+        return StageReport::failure(
+            stage,
+            start.elapsed().as_millis(),
+            format!("COMMIT after savepoint rollback failed: {e}"),
+        );
     }
 
     // Verify savepoint semantics: 10002 should exist, 10003 should not
     match conn.query("SELECT COUNT(*) FROM users WHERE id IN (10002, 10003)") {
         Ok(rows) => {
             if let Some(row) = rows.first() {
-                e2e_log_kv!(stage, "verify_savepoint", "Savepoint verification (expect 1)", count = row.get(0));
+                e2e_log_kv!(
+                    stage,
+                    "verify_savepoint",
+                    "Savepoint verification (expect 1)",
+                    count = row.get(0)
+                );
             }
         }
         Err(e) => {
-            return StageReport::failure(stage, start.elapsed().as_millis(), format!("Savepoint verification failed: {e}"));
+            return StageReport::failure(
+                stage,
+                start.elapsed().as_millis(),
+                format!("Savepoint verification failed: {e}"),
+            );
         }
     }
 
     let elapsed = start.elapsed().as_millis();
-    e2e_log_kv!(stage, "complete", "Transaction stage complete", elapsed_ms = elapsed);
+    e2e_log_kv!(
+        stage,
+        "complete",
+        "Transaction stage complete",
+        elapsed_ms = elapsed
+    );
 
-    StageReport::success(stage, elapsed, "ROLLBACK, COMMIT, and SAVEPOINT all verified")
+    StageReport::success(
+        stage,
+        elapsed,
+        "ROLLBACK, COMMIT, and SAVEPOINT all verified",
+    )
 }
 
 // ─── Stage 5: Persistence and Reopen ────────────────────────────────────────
@@ -412,7 +672,11 @@ fn stage_5_persist(path: &str) -> StageReport {
     let conn = match fsqlite::Connection::open(path) {
         Ok(c) => c,
         Err(e) => {
-            return StageReport::failure(stage, start.elapsed().as_millis(), format!("Open failed: {e}"));
+            return StageReport::failure(
+                stage,
+                start.elapsed().as_millis(),
+                format!("Open failed: {e}"),
+            );
         }
     };
 
@@ -423,23 +687,44 @@ fn stage_5_persist(path: &str) -> StageReport {
             if let Some(row) = rows.first() {
                 if let Some(SqliteValue::Integer(n)) = row.get(0) {
                     count_before = *n;
-                    e2e_log_kv!(stage, "count_before_close", "Row count before close", count = count_before);
+                    e2e_log_kv!(
+                        stage,
+                        "count_before_close",
+                        "Row count before close",
+                        count = count_before
+                    );
                 } else {
-                    return StageReport::failure(stage, start.elapsed().as_millis(), "Unexpected COUNT type".to_string());
+                    return StageReport::failure(
+                        stage,
+                        start.elapsed().as_millis(),
+                        "Unexpected COUNT type".to_string(),
+                    );
                 }
             } else {
-                return StageReport::failure(stage, start.elapsed().as_millis(), "No COUNT result".to_string());
+                return StageReport::failure(
+                    stage,
+                    start.elapsed().as_millis(),
+                    "No COUNT result".to_string(),
+                );
             }
         }
         Err(e) => {
-            return StageReport::failure(stage, start.elapsed().as_millis(), format!("COUNT failed: {e}"));
+            return StageReport::failure(
+                stage,
+                start.elapsed().as_millis(),
+                format!("COUNT failed: {e}"),
+            );
         }
     }
 
     // Close connection (triggers checkpoint)
     e2e_log!(stage, "close", "Connection::close()");
     if let Err(e) = conn.close() {
-        return StageReport::failure(stage, start.elapsed().as_millis(), format!("Close failed: {e}"));
+        return StageReport::failure(
+            stage,
+            start.elapsed().as_millis(),
+            format!("Close failed: {e}"),
+        );
     }
 
     // Reopen
@@ -447,7 +732,11 @@ fn stage_5_persist(path: &str) -> StageReport {
     let conn = match fsqlite::Connection::open(path) {
         Ok(c) => c,
         Err(e) => {
-            return StageReport::failure(stage, start.elapsed().as_millis(), format!("Reopen failed: {e}"));
+            return StageReport::failure(
+                stage,
+                start.elapsed().as_millis(),
+                format!("Reopen failed: {e}"),
+            );
         }
     };
 
@@ -456,18 +745,33 @@ fn stage_5_persist(path: &str) -> StageReport {
         Ok(rows) => {
             if let Some(row) = rows.first() {
                 if let Some(SqliteValue::Integer(count_after)) = row.get(0) {
-                    e2e_log_kv!(stage, "verify", "Persistence verification",
-                        expected = count_before, actual = count_after);
+                    e2e_log_kv!(
+                        stage,
+                        "verify",
+                        "Persistence verification",
+                        expected = count_before,
+                        actual = count_after
+                    );
 
                     if *count_after != count_before {
-                        return StageReport::failure(stage, start.elapsed().as_millis(),
-                            format!("Data loss! Expected {} rows, got {}", count_before, count_after));
+                        return StageReport::failure(
+                            stage,
+                            start.elapsed().as_millis(),
+                            format!(
+                                "Data loss! Expected {} rows, got {}",
+                                count_before, count_after
+                            ),
+                        );
                     }
                 }
             }
         }
         Err(e) => {
-            return StageReport::failure(stage, start.elapsed().as_millis(), format!("Verification query failed: {e}"));
+            return StageReport::failure(
+                stage,
+                start.elapsed().as_millis(),
+                format!("Verification query failed: {e}"),
+            );
         }
     }
 
@@ -475,17 +779,35 @@ fn stage_5_persist(path: &str) -> StageReport {
     e2e_log!(stage, "spot_check", "Spot-checking data integrity");
     match conn.query("SELECT id, name FROM users WHERE id IN (1, 50, 90) ORDER BY id") {
         Ok(rows) => {
-            e2e_log_kv!(stage, "spot_check_result", "Spot check rows returned", count = rows.len());
+            e2e_log_kv!(
+                stage,
+                "spot_check_result",
+                "Spot check rows returned",
+                count = rows.len()
+            );
         }
         Err(e) => {
-            return StageReport::failure(stage, start.elapsed().as_millis(), format!("Spot check failed: {e}"));
+            return StageReport::failure(
+                stage,
+                start.elapsed().as_millis(),
+                format!("Spot check failed: {e}"),
+            );
         }
     }
 
     let elapsed = start.elapsed().as_millis();
-    e2e_log_kv!(stage, "complete", "Persistence stage complete", elapsed_ms = elapsed);
+    e2e_log_kv!(
+        stage,
+        "complete",
+        "Persistence stage complete",
+        elapsed_ms = elapsed
+    );
 
-    StageReport::success(stage, elapsed, format!("Data persisted correctly ({} rows)", count_before))
+    StageReport::success(
+        stage,
+        elapsed,
+        format!("Data persisted correctly ({} rows)", count_before),
+    )
 }
 
 // ─── Stage 6: Final Integrity Check ─────────────────────────────────────────
@@ -500,7 +822,11 @@ fn stage_6_integrity(path: &str) -> StageReport {
     let conn = match fsqlite::Connection::open(path) {
         Ok(c) => c,
         Err(e) => {
-            return StageReport::failure(stage, start.elapsed().as_millis(), format!("Open failed: {e}"));
+            return StageReport::failure(
+                stage,
+                start.elapsed().as_millis(),
+                format!("Open failed: {e}"),
+            );
         }
     };
 
@@ -509,12 +835,22 @@ fn stage_6_integrity(path: &str) -> StageReport {
     match conn.query("PRAGMA integrity_check") {
         Ok(rows) => {
             if let Some(row) = rows.first() {
-                e2e_log_kv!(stage, "result", "Integrity check result", result = row.get(0));
+                e2e_log_kv!(
+                    stage,
+                    "result",
+                    "Integrity check result",
+                    result = row.get(0)
+                );
             }
         }
         Err(e) => {
             // Integrity check might not be implemented yet
-            e2e_log_kv!(stage, "skipped", "Integrity check not available", error = e.to_string());
+            e2e_log_kv!(
+                stage,
+                "skipped",
+                "Integrity check not available",
+                error = e.to_string()
+            );
         }
     }
 
@@ -523,7 +859,12 @@ fn stage_6_integrity(path: &str) -> StageReport {
     match conn.query("PRAGMA page_count") {
         Ok(rows) => {
             if let Some(row) = rows.first() {
-                e2e_log_kv!(stage, "page_count_result", "Total pages", count = row.get(0));
+                e2e_log_kv!(
+                    stage,
+                    "page_count_result",
+                    "Total pages",
+                    count = row.get(0)
+                );
             }
         }
         Err(_) => {
@@ -533,7 +874,12 @@ fn stage_6_integrity(path: &str) -> StageReport {
 
     // Final summary
     let elapsed = start.elapsed().as_millis();
-    e2e_log_kv!(stage, "complete", "Integrity stage complete", elapsed_ms = elapsed);
+    e2e_log_kv!(
+        stage,
+        "complete",
+        "Integrity stage complete",
+        elapsed_ms = elapsed
+    );
 
     StageReport::success(stage, elapsed, "Integrity check passed")
 }
@@ -625,8 +971,10 @@ fn test_e2e_storage_stack_full() {
 
     for report in &reports {
         let status = if report.passed { "✓" } else { "✗" };
-        eprintln!("║  {} {:12} {:8}ms - {}",
-            status, report.stage_name, report.elapsed_ms, report.details);
+        eprintln!(
+            "║  {} {:12} {:8}ms - {}",
+            status, report.stage_name, report.elapsed_ms, report.details
+        );
     }
 
     eprintln!("╠════════════════════════════════════════════════════════════╣");
@@ -635,12 +983,16 @@ fn test_e2e_storage_stack_full() {
     let total_count = reports.len();
 
     if all_passed {
-        eprintln!("║  ALL {} STAGES PASSED | total_elapsed_ms={}",
-            total_count, total_elapsed);
+        eprintln!(
+            "║  ALL {} STAGES PASSED | total_elapsed_ms={}",
+            total_count, total_elapsed
+        );
         eprintln!("╚════════════════════════════════════════════════════════════╝\n");
     } else {
-        eprintln!("║  FAILED: {}/{} stages passed | total_elapsed_ms={}",
-            passed_count, total_count, total_elapsed);
+        eprintln!(
+            "║  FAILED: {}/{} stages passed | total_elapsed_ms={}",
+            passed_count, total_count, total_elapsed
+        );
         eprintln!("╚════════════════════════════════════════════════════════════╝\n");
         panic!("E2E test failed - see above for details");
     }
@@ -686,16 +1038,21 @@ fn test_e2e_stage_3_read() {
     // Need DDL and some data
     conn.execute("CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT, email TEXT UNIQUE)")
         .expect("DDL failed");
-    conn.execute("CREATE INDEX idx_email ON users(email)").expect("INDEX failed");
+    conn.execute("CREATE INDEX idx_email ON users(email)")
+        .expect("INDEX failed");
 
     for i in 1..=100 {
         conn.execute(&format!(
-            "INSERT INTO users VALUES ({}, 'user{}', 'user{}@test.com')", i, i, i
-        )).expect("INSERT failed");
+            "INSERT INTO users VALUES ({}, 'user{}', 'user{}@test.com')",
+            i, i, i
+        ))
+        .expect("INSERT failed");
     }
     // Simulate update/delete from stage 2
-    conn.execute("UPDATE users SET name = name || '_updated' WHERE id <= 50").expect("UPDATE failed");
-    conn.execute("DELETE FROM users WHERE id > 90").expect("DELETE failed");
+    conn.execute("UPDATE users SET name = name || '_updated' WHERE id <= 50")
+        .expect("UPDATE failed");
+    conn.execute("DELETE FROM users WHERE id > 90")
+        .expect("DELETE failed");
 
     let report = stage_3_read(&conn);
 
@@ -715,5 +1072,9 @@ fn test_e2e_stage_4_txn() {
 
     let report = stage_4_txn(&conn);
 
-    assert!(report.passed, "Stage 4 (Transaction) failed: {}", report.details);
+    assert!(
+        report.passed,
+        "Stage 4 (Transaction) failed: {}",
+        report.details
+    );
 }
