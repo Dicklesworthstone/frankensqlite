@@ -36,7 +36,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::differential_v2::{DifferentialResult, Outcome};
-use crate::mismatch_minimizer::Subsystem;
+use crate::mismatch_minimizer::{
+    minimize_workload, MinimalReproduction, MinimizerConfig, ReproducibilityTest, Subsystem,
+};
 
 /// Bead identifier for log correlation.
 #[allow(dead_code)]
@@ -44,6 +46,10 @@ const BEAD_ID: &str = "bd-1dp9.2.4";
 
 /// Schema version for replay harness output format.
 pub const REPLAY_SCHEMA_VERSION: u32 = 1;
+/// Schema version for replay-minimization package artifacts.
+pub const REPLAY_MINIMIZATION_SCHEMA_VERSION: u32 = 1;
+/// Bead identifier for failure replay/minimization packaging.
+pub const REPLAY_MINIMIZATION_BEAD_ID: &str = "bd-mblr.2.3.2";
 /// Schema version for bisect-ready replay manifest contracts.
 pub const BISECT_REPLAY_MANIFEST_SCHEMA_VERSION: &str = "1.0.0";
 
@@ -619,6 +625,160 @@ impl ReplaySummary {
 }
 
 // ===========================================================================
+// Replay + Minimization Package (bd-mblr.2.3.2)
+// ===========================================================================
+
+/// Compact failure snapshot used for before/after minimization evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplayFailureSnapshot {
+    /// Deterministic hash of the failure evidence blob.
+    pub evidence_hash: String,
+    /// Statement count in the replay workload.
+    pub statement_count: usize,
+    /// Number of divergence sites in this snapshot.
+    pub divergence_count: usize,
+}
+
+/// Before/after minimization evidence bundle.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReplayMinimizationEvidence {
+    /// Snapshot from the original replay/failure evidence.
+    pub before: ReplayFailureSnapshot,
+    /// Snapshot after reduction/minimization.
+    pub after: ReplayFailureSnapshot,
+    /// Fractional reduction in statement count.
+    pub reduction_ratio: f64,
+    /// Whether invariant violation is still reproducible post-minimization.
+    pub invariant_violation_preserved: bool,
+}
+
+/// Output package combining replay recipe and minimized reproducer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplayMinimizationPackage {
+    /// Artifact schema version.
+    pub schema_version: u32,
+    /// Bead identifier for traceability.
+    pub bead_id: String,
+    /// Run identifier tying package to structured logs.
+    pub run_id: String,
+    /// Deterministic seed used for replay ordering.
+    pub base_seed: u64,
+    /// Deterministic fault profile identifier.
+    pub fault_profile_id: String,
+    /// Artifact bundle identifier for source failure evidence.
+    pub artifact_bundle_id: String,
+    /// Operator replay recipe with seed/profile/artifact references.
+    pub replay_recipe: String,
+    /// Minimized reproducer with canonical signature.
+    pub minimal_reproduction: MinimalReproduction,
+    /// Before/after evidence proving reduction and violation preservation.
+    pub evidence: ReplayMinimizationEvidence,
+}
+
+impl ReplayMinimizationPackage {
+    /// Serialize package to pretty JSON.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if serialization fails.
+    pub fn to_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string_pretty(self)
+    }
+
+    /// Deserialize package from JSON.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if JSON is malformed.
+    pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
+        serde_json::from_str(json)
+    }
+}
+
+/// Request payload for building replay/minimization artifacts.
+#[derive(Debug, Clone, Copy)]
+pub struct ReplayMinimizationRequest<'a> {
+    /// Run identifier tying package to structured logs.
+    pub run_id: &'a str,
+    /// Deterministic fault profile identifier.
+    pub fault_profile_id: &'a str,
+    /// Artifact bundle identifier for source failure evidence.
+    pub artifact_bundle_id: &'a str,
+    /// Schema setup statements for the failing workload.
+    pub schema: &'a [String],
+    /// Workload statements to minimize.
+    pub workload: &'a [String],
+    /// Minimizer behavior configuration.
+    pub minimizer_config: &'a MinimizerConfig,
+}
+
+/// Build a replay + minimization output package from captured failure artifacts.
+///
+/// This function binds deterministic replay metadata (`seed`, `fault_profile_id`,
+/// `artifact_bundle_id`) to a minimized reproducer and emits before/after evidence
+/// suitable for operator triage or CI artifact publication.
+pub fn build_replay_minimization_package(
+    summary: &ReplaySummary,
+    request: &ReplayMinimizationRequest<'_>,
+    test_fn: &ReproducibilityTest,
+) -> Option<ReplayMinimizationPackage> {
+    if request.run_id.trim().is_empty()
+        || request.fault_profile_id.trim().is_empty()
+        || request.artifact_bundle_id.trim().is_empty()
+    {
+        return None;
+    }
+
+    let mut minimal = minimize_workload(
+        request.schema,
+        request.workload,
+        request.minimizer_config,
+        test_fn,
+    )?;
+    minimal.original_seed = summary.base_seed;
+
+    let violation_preserved = test_fn(request.schema, &minimal.minimal_workload).is_some();
+    if !violation_preserved {
+        return None;
+    }
+
+    let before = ReplayFailureSnapshot {
+        evidence_hash: summary.summary_hash.clone(),
+        statement_count: request.workload.len(),
+        divergence_count: summary.total_divergent,
+    };
+    let after = ReplayFailureSnapshot {
+        evidence_hash: minimal.signature.hash.clone(),
+        statement_count: minimal.minimal_workload.len(),
+        divergence_count: minimal.divergences.len(),
+    };
+    let replay_recipe = format!(
+        "cargo test -p fsqlite-harness -- --seed {} --fault-profile {} --artifact-bundle {}\n{}",
+        summary.base_seed,
+        request.fault_profile_id,
+        request.artifact_bundle_id,
+        minimal.repro_command
+    );
+
+    Some(ReplayMinimizationPackage {
+        schema_version: REPLAY_MINIMIZATION_SCHEMA_VERSION,
+        bead_id: REPLAY_MINIMIZATION_BEAD_ID.to_owned(),
+        run_id: request.run_id.to_owned(),
+        base_seed: summary.base_seed,
+        fault_profile_id: request.fault_profile_id.to_owned(),
+        artifact_bundle_id: request.artifact_bundle_id.to_owned(),
+        replay_recipe,
+        minimal_reproduction: minimal.clone(),
+        evidence: ReplayMinimizationEvidence {
+            before,
+            after,
+            reduction_ratio: minimal.reduction_ratio,
+            invariant_violation_preserved: violation_preserved,
+        },
+    })
+}
+
+// ===========================================================================
 // Bisect Replay Manifest Contract
 // ===========================================================================
 
@@ -897,6 +1057,7 @@ fn hex_encode_truncated(bytes: &[u8], max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::differential_v2::{NormalizedValue, StatementDivergence, StmtOutcome};
 
     fn make_entry_result(
         id: &str,
@@ -939,6 +1100,28 @@ mod tests {
         session.record_entry(make_entry_result("m1", Outcome::Pass, 0, 10));
         session.record_entry(make_entry_result("m2", Outcome::Divergence, 1, 10));
         session.finalize()
+    }
+
+    fn make_select_divergence(index: usize, sql: &str) -> StatementDivergence {
+        StatementDivergence {
+            index,
+            sql: sql.to_owned(),
+            csqlite_outcome: StmtOutcome::Rows(vec![vec![NormalizedValue::Integer(1)]]),
+            fsqlite_outcome: StmtOutcome::Rows(vec![vec![NormalizedValue::Integer(2)]]),
+        }
+    }
+
+    fn make_reproducibility_test(
+    ) -> impl Fn(&[String], &[String]) -> Option<Vec<StatementDivergence>> {
+        |_, workload| {
+            let failing_index = workload
+                .iter()
+                .position(|stmt| stmt.contains("SELECT a FROM t WHERE a = 42"))?;
+            Some(vec![make_select_divergence(
+                failing_index,
+                "SELECT a FROM t WHERE a = 42",
+            )])
+        }
     }
 
     // --- Drift Detector ---
@@ -1302,12 +1485,10 @@ mod tests {
         failing.total_divergent += 1;
         let fail_eval = manifest.evaluate_summary(&failing);
         assert_eq!(fail_eval.verdict, ReplayVerdict::Fail);
-        assert!(
-            fail_eval
-                .reasons
-                .iter()
-                .any(|reason| reason.contains("divergent entries"))
-        );
+        assert!(fail_eval
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("divergent entries")));
     }
 
     // --- Regime Display ---
@@ -1415,5 +1596,133 @@ mod tests {
 
         let summary = session.finalize();
         assert!(summary.entries.is_none());
+    }
+
+    // --- Replay minimization package (bd-mblr.2.3.2) ---
+
+    #[test]
+    fn test_replay_minimization_package_reduces_and_preserves_violation() {
+        let summary = make_manifest_summary();
+        let schema = vec!["CREATE TABLE t(a INTEGER PRIMARY KEY);".to_owned()];
+        let workload = vec![
+            "INSERT INTO t VALUES (1);".to_owned(),
+            "INSERT INTO t VALUES (42);".to_owned(),
+            "UPDATE t SET a = a + 1 WHERE a = 1;".to_owned(),
+            "SELECT a FROM t WHERE a = 42;".to_owned(),
+            "DELETE FROM t WHERE a = 99;".to_owned(),
+        ];
+        let config = MinimizerConfig::default();
+        let repro = make_reproducibility_test();
+        let request = ReplayMinimizationRequest {
+            run_id: "run-replay-min-1",
+            fault_profile_id: "fault-profile-alpha",
+            artifact_bundle_id: "artifact-bundle-alpha",
+            schema: &schema,
+            workload: &workload,
+            minimizer_config: &config,
+        };
+
+        let package = build_replay_minimization_package(&summary, &request, &repro)
+            .expect("package should be produced");
+
+        assert_eq!(
+            package.schema_version, REPLAY_MINIMIZATION_SCHEMA_VERSION,
+            "schema version must match package contract"
+        );
+        assert_eq!(package.bead_id, REPLAY_MINIMIZATION_BEAD_ID);
+        assert_eq!(package.base_seed, summary.base_seed);
+        assert!(
+            package.evidence.invariant_violation_preserved,
+            "minimized workload must still reproduce violation"
+        );
+        assert!(
+            package.evidence.after.statement_count < package.evidence.before.statement_count,
+            "minimization should reduce statement count (before={}, after={})",
+            package.evidence.before.statement_count,
+            package.evidence.after.statement_count,
+        );
+        assert!(
+            !package.minimal_reproduction.minimal_workload.is_empty(),
+            "minimal workload should not be empty"
+        );
+        assert!(
+            package
+                .replay_recipe
+                .contains("--artifact-bundle artifact-bundle-alpha"),
+            "replay recipe must include artifact bundle reference"
+        );
+    }
+
+    #[test]
+    fn test_replay_minimization_package_is_deterministic() {
+        let summary = make_manifest_summary();
+        let schema = vec!["CREATE TABLE t(a INTEGER PRIMARY KEY);".to_owned()];
+        let workload = vec![
+            "INSERT INTO t VALUES (1);".to_owned(),
+            "INSERT INTO t VALUES (42);".to_owned(),
+            "SELECT a FROM t WHERE a = 42;".to_owned(),
+        ];
+        let config = MinimizerConfig::default();
+        let repro = make_reproducibility_test();
+        let request = ReplayMinimizationRequest {
+            run_id: "run-replay-min-det",
+            fault_profile_id: "fault-profile-det",
+            artifact_bundle_id: "artifact-bundle-det",
+            schema: &schema,
+            workload: &workload,
+            minimizer_config: &config,
+        };
+
+        let p1 =
+            build_replay_minimization_package(&summary, &request, &repro).expect("first package");
+        let p2 =
+            build_replay_minimization_package(&summary, &request, &repro).expect("second package");
+
+        assert_eq!(
+            p1.minimal_reproduction.signature.hash, p2.minimal_reproduction.signature.hash,
+            "signature hash should be deterministic"
+        );
+        assert_eq!(
+            p1.replay_recipe, p2.replay_recipe,
+            "replay recipe should be deterministic"
+        );
+        assert_eq!(
+            p1.evidence, p2.evidence,
+            "before/after evidence should be deterministic"
+        );
+    }
+
+    #[test]
+    fn test_replay_minimization_package_json_roundtrip() {
+        let summary = make_manifest_summary();
+        let schema = vec!["CREATE TABLE t(a INTEGER PRIMARY KEY);".to_owned()];
+        let workload = vec![
+            "INSERT INTO t VALUES (1);".to_owned(),
+            "INSERT INTO t VALUES (42);".to_owned(),
+            "SELECT a FROM t WHERE a = 42;".to_owned(),
+        ];
+        let config = MinimizerConfig::default();
+        let repro = make_reproducibility_test();
+        let request = ReplayMinimizationRequest {
+            run_id: "run-replay-min-json",
+            fault_profile_id: "fault-profile-json",
+            artifact_bundle_id: "artifact-bundle-json",
+            schema: &schema,
+            workload: &workload,
+            minimizer_config: &config,
+        };
+
+        let package = build_replay_minimization_package(&summary, &request, &repro)
+            .expect("package should be produced");
+        let json = package.to_json().expect("serialize package");
+        let decoded = ReplayMinimizationPackage::from_json(&json).expect("deserialize package");
+        assert_eq!(decoded.schema_version, package.schema_version);
+        assert_eq!(decoded.bead_id, package.bead_id);
+        assert_eq!(decoded.run_id, package.run_id);
+        assert_eq!(
+            decoded.minimal_reproduction.signature.hash,
+            package.minimal_reproduction.signature.hash
+        );
+        assert_eq!(decoded.evidence, package.evidence);
     }
 }
