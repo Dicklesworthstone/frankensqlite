@@ -133,6 +133,7 @@ pub struct ResourceTelemetryRecord {
 impl ResourceTelemetryRecord {
     /// Build a telemetry record from a checkpoint snapshot.
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn from_snapshot(
         run_id: &str,
         scenario_id: &str,
@@ -649,7 +650,7 @@ impl SoakExecutor {
     fn simulate_transaction(&self, action: StepAction, rand: u64) -> (bool, Option<String>) {
         // Check fault injection
         if !self.fault_config.profiles.is_empty() && self.fault_config.injection_probability > 0.0 {
-            let fault_rand = (rand >> 32) as f64 / u32::MAX as f64;
+            let fault_rand = (rand >> 32) as f64 / f64::from(u32::MAX);
             if fault_rand < self.fault_config.injection_probability {
                 let idx = (rand as usize) % self.fault_config.profiles.len();
                 let profile = &self.fault_config.profiles[idx];
@@ -1016,12 +1017,13 @@ fn detect_scenario_leaks(
     findings
 }
 
+#[allow(clippy::cast_precision_loss)]
 fn metric_value(record: &ResourceTelemetryRecord, resource: TrackedResource) -> f64 {
     match resource {
         TrackedResource::HeapBytes => record.heap_bytes as f64,
         TrackedResource::WalPages => record.wal_pages as f64,
-        TrackedResource::LockTableSize => record.lock_table_size as f64,
-        TrackedResource::ActiveTransactions => record.active_transactions as f64,
+        TrackedResource::LockTableSize => f64::from(record.lock_table_size),
+        TrackedResource::ActiveTransactions => f64::from(record.active_transactions),
     }
 }
 

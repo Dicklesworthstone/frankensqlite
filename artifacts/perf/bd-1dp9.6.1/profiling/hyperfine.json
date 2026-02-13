@@ -1,0 +1,9 @@
+{
+  "command": "cargo test -p fsqlite-harness checkpoint_full_blocked_by_readers -- --nocapture",
+  "results": [
+    {
+      "mean": 5392.571428571428,
+      "unit": "microseconds"
+    }
+  ]
+}

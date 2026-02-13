@@ -460,6 +460,7 @@ impl ValidationReport {
 /// Returns a [`ValidationReport`] with per-event diagnostics and aggregate statistics.
 /// The report's `passed` field is `true` only if there are zero errors.
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn validate_event_stream(events: &[LogEventSchema]) -> ValidationReport {
     let mut diagnostics = Vec::new();
     let mut run_ids = BTreeSet::new();

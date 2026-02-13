@@ -599,7 +599,7 @@ fn validate_perf_baseline_fields(baseline: &PerfBaselineArtifact) -> Result<()> 
 }
 
 fn optimization_lever_key(path: &Path) -> Option<String> {
-    if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+    if path.extension().and_then(std::ffi::OsStr::to_str) != Some("rs") {
         return None;
     }
 

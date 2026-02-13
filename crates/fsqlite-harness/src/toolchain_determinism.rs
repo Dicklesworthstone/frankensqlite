@@ -295,6 +295,7 @@ impl fmt::Display for Subsystem {
 
 /// Build the canonical set of determinism probes.
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn canonical_probes(root_seed: u64) -> Vec<DeterminismProbe> {
     let derive = |probe_id: &str| -> u64 {
         let mut buf = Vec::with_capacity(64);
@@ -812,6 +813,7 @@ pub struct CommandProbeExecutor {
 }
 
 impl DeterminismProbeExecutor for CommandProbeExecutor {
+    #[allow(clippy::similar_names)]
     fn execute_probe(
         &self,
         toolchain: &ToolchainEntry,
@@ -1041,6 +1043,7 @@ pub fn run_determinism_matrix_with_executor<E: DeterminismProbeExecutor>(
     })
 }
 
+#[allow(clippy::type_complexity)]
 fn run_suite_for_probe<E: DeterminismProbeExecutor>(
     toolchains: &[ToolchainEntry],
     reference_toolchain: &ToolchainEntry,

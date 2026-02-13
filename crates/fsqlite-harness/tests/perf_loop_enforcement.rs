@@ -703,6 +703,55 @@ fn test_e2e_matrix_serialization_roundtrip() {
 }
 
 #[test]
+fn test_e2e_only_threshold_qualified_opportunities_promoted() {
+    let matrix = OpportunityMatrix {
+        scenario_id: "bd-1dp9.6.1-baseline-pack".to_string(),
+        threshold: OPPORTUNITY_SCORE_THRESHOLD,
+        entries: vec![
+            OpportunityMatrixEntry {
+                hotspot: "fsqlite_mvcc::writer_hot_path".to_string(),
+                impact: 5,
+                confidence: 4,
+                effort: 2,
+            },
+            OpportunityMatrixEntry {
+                hotspot: "fsqlite_vdbe::minor_opcode".to_string(),
+                impact: 1,
+                confidence: 1,
+                effort: 5,
+            },
+        ],
+    };
+
+    let decisions = evaluate_opportunity_matrix(&matrix).expect("evaluate matrix");
+    let promoted: Vec<_> = decisions
+        .iter()
+        .filter(|decision| decision.selected)
+        .collect();
+    let non_promoted: Vec<_> = decisions
+        .iter()
+        .filter(|decision| !decision.selected)
+        .collect();
+
+    assert!(
+        promoted
+            .iter()
+            .all(|decision| decision.score >= decision.threshold),
+        "bead_id={OPPORTUNITY_MATRIX_BEAD_ID} promoted entries must all satisfy score threshold"
+    );
+    assert!(
+        non_promoted
+            .iter()
+            .all(|decision| decision.score < decision.threshold),
+        "bead_id={OPPORTUNITY_MATRIX_BEAD_ID} non-promoted entries must all be below threshold"
+    );
+    assert!(
+        !promoted.is_empty() && !non_promoted.is_empty(),
+        "bead_id={OPPORTUNITY_MATRIX_BEAD_ID} fixture should exercise both promoted and non-promoted paths"
+    );
+}
+
+#[test]
 fn test_flamegraph_generation() {
     let temp = TempDir::new().expect("tempdir");
     let flamegraph_path = temp.path().join("flamegraph.svg");

@@ -335,7 +335,7 @@ pub struct AcceptanceTestRef {
 // ---------------------------------------------------------------------------
 
 /// A single surface-point contract in the extension parity matrix.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContractEntry {
     /// Unique surface-point ID (e.g., `"EXT-JSON-001"`).
     pub id: String,

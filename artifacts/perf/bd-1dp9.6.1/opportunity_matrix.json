@@ -1,0 +1,132 @@
+{
+  "matrix": {
+    "scenario_id": "bd-1dp9.6.1-opportunity-matrix",
+    "threshold": 2.0,
+    "entries": [
+      {
+        "hotspot": "checkpoint::bm-checkpoint-plan-micro",
+        "impact": 3,
+        "confidence": 4,
+        "effort": 2
+      },
+      {
+        "hotspot": "checkpoint::bm-checkpoint-transaction-mix-macro",
+        "impact": 1,
+        "confidence": 3,
+        "effort": 2
+      },
+      {
+        "hotspot": "write-contention::bm-mvcc-page-conflict-micro",
+        "impact": 2,
+        "confidence": 4,
+        "effort": 2
+      },
+      {
+        "hotspot": "recovery::bm-recovery-crash-replay-macro",
+        "impact": 3,
+        "confidence": 3,
+        "effort": 3
+      },
+      {
+        "hotspot": "sql-operator-mix::bm-sql-operator-mix-macro",
+        "impact": 3,
+        "confidence": 3,
+        "effort": 3
+      },
+      {
+        "hotspot": "recovery::bm-wal-checksum-recovery-micro",
+        "impact": 4,
+        "confidence": 4,
+        "effort": 3
+      },
+      {
+        "hotspot": "write-contention::bm-write-contention-macro",
+        "impact": 3,
+        "confidence": 3,
+        "effort": 2
+      }
+    ]
+  },
+  "decisions": [
+    {
+      "hotspot": "checkpoint::bm-checkpoint-plan-micro",
+      "score": 6.0,
+      "threshold": 2.0,
+      "selected": true
+    },
+    {
+      "hotspot": "checkpoint::bm-checkpoint-transaction-mix-macro",
+      "score": 1.5,
+      "threshold": 2.0,
+      "selected": false
+    },
+    {
+      "hotspot": "write-contention::bm-mvcc-page-conflict-micro",
+      "score": 4.0,
+      "threshold": 2.0,
+      "selected": true
+    },
+    {
+      "hotspot": "recovery::bm-recovery-crash-replay-macro",
+      "score": 3.0,
+      "threshold": 2.0,
+      "selected": true
+    },
+    {
+      "hotspot": "sql-operator-mix::bm-sql-operator-mix-macro",
+      "score": 3.0,
+      "threshold": 2.0,
+      "selected": true
+    },
+    {
+      "hotspot": "recovery::bm-wal-checksum-recovery-micro",
+      "score": 5.333333333333333,
+      "threshold": 2.0,
+      "selected": true
+    },
+    {
+      "hotspot": "write-contention::bm-write-contention-macro",
+      "score": 4.5,
+      "threshold": 2.0,
+      "selected": true
+    }
+  ],
+  "promoted": [
+    {
+      "hotspot": "checkpoint::bm-checkpoint-plan-micro",
+      "score": 6.0,
+      "threshold": 2.0,
+      "selected": true
+    },
+    {
+      "hotspot": "write-contention::bm-mvcc-page-conflict-micro",
+      "score": 4.0,
+      "threshold": 2.0,
+      "selected": true
+    },
+    {
+      "hotspot": "recovery::bm-recovery-crash-replay-macro",
+      "score": 3.0,
+      "threshold": 2.0,
+      "selected": true
+    },
+    {
+      "hotspot": "sql-operator-mix::bm-sql-operator-mix-macro",
+      "score": 3.0,
+      "threshold": 2.0,
+      "selected": true
+    },
+    {
+      "hotspot": "recovery::bm-wal-checksum-recovery-micro",
+      "score": 5.333333333333333,
+      "threshold": 2.0,
+      "selected": true
+    },
+    {
+      "hotspot": "write-contention::bm-write-contention-macro",
+      "score": 4.5,
+      "threshold": 2.0,
+      "selected": true
+    }
+  ]
+}

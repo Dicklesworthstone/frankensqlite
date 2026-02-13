@@ -1,0 +1,18 @@
+{
+  "trace_id": "trace-prof-1770975442851",
+  "scenario_id": "bm-checkpoint-plan-micro",
+  "git_sha": "local-dev",
+  "artifact_paths": {
+    "flamegraph": "profiling/flamegraph.svg",
+    "heaptrack": "profiling/heaptrack.out",
+    "hyperfine": "profiling/hyperfine.json",
+    "strace": "profiling/strace.txt"
+  },
+  "metadata": {
+    "build_flags": "RUSTFLAGS=-C force-frame-pointers=yes;features=perf",
+    "git_sha": "local-dev",
+    "platform": "linux x86_64",
+    "scenario": "bm-checkpoint-plan-micro?seed=3070733372282402248",
+    "seed": "3070733372282402248"
+  }
+}

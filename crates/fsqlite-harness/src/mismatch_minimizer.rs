@@ -264,6 +264,7 @@ impl Default for MinimizerConfig {
 /// Attribute a divergence to a likely subsystem based on SQL content and
 /// divergence pattern.
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn attribute_subsystem(
     divergences: &[StatementDivergence],
     schema: &[String],
@@ -444,7 +445,7 @@ pub fn minimize_workload(
     // Phase 1: Binary partition reduction.
     let mut granularity = 2;
     while granularity <= current.len() && iterations < config.max_iterations {
-        let chunk_size = (current.len() + granularity - 1) / granularity;
+        let chunk_size = current.len().div_ceil(granularity);
         let mut reduced = false;
 
         for chunk_idx in 0..granularity {

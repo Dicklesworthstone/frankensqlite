@@ -1150,6 +1150,22 @@ fn late_phase_gate_specs() -> Vec<GateSpec> {
             expected_exit_code: 0,
         },
         GateSpec {
+            gate_id: "phase7.leak_budget_ci",
+            gate_name: "Phase 7 gate: leak budget CI diagnostics artifact",
+            scope: GateScope::Phase7,
+            command: &[
+                "cargo",
+                "test",
+                "-p",
+                "fsqlite-harness",
+                "--test",
+                "bd_mblr_7_7_3_ci_leak_gate",
+                "ci_leak_gate_enforces_budget_and_emits_actionable_diagnostics",
+            ],
+            env: &[],
+            expected_exit_code: 0,
+        },
+        GateSpec {
             gate_id: "phase8.json1",
             gate_name: "Phase 8 gate: JSON1 conformance (200 tests)",
             scope: GateScope::Phase8,
@@ -1879,6 +1895,17 @@ mod tests {
 
         assert_eq!(gate.scope, GateScope::Phase7);
         assert!(command.contains("test_phase7_gate_index_usage"));
+    }
+
+    #[test]
+    fn test_phase7_gate_leak_budget_ci_diagnostics() {
+        let plan = phase_7_to_9_gate_plan();
+        let gate = find_gate(&plan, "phase7.leak_budget_ci");
+        let command = gate.command.join(" ");
+
+        assert_eq!(gate.scope, GateScope::Phase7);
+        assert!(command.contains("bd_mblr_7_7_3_ci_leak_gate"));
+        assert!(command.contains("ci_leak_gate_enforces_budget_and_emits_actionable_diagnostics"));
     }
 
     #[test]

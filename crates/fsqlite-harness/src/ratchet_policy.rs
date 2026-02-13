@@ -353,6 +353,7 @@ pub struct RatchetDecision {
 /// Returns a [`RatchetDecision`] and mutates `state` to reflect the evaluation.
 /// The caller is responsible for persisting the updated state.
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn evaluate_ratchet(
     scorecard: &BayesianScorecard,
     state: &mut RatchetState,
@@ -568,7 +569,7 @@ pub fn check_rollback_signal(
         };
     }
 
-    let catastrophic_threshold = policy.regression_tolerance * 2.0 + 0.01;
+    let catastrophic_threshold = policy.regression_tolerance.mul_add(2.0, 0.01);
     let is_catastrophic = decision.global_regression > catastrophic_threshold;
 
     let recent_blocks = state

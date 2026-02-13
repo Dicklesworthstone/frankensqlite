@@ -1,0 +1,29 @@
+{
+  "generated_at": "2026-02-13T00:00:00Z",
+  "scenario_id": "bd-1dp9.6.1-baseline-pack",
+  "command": "cargo run -p fsqlite-harness --bin perf_baseline_pack_runner -- --root-seed <seed>",
+  "seed": "13200456914808340481",
+  "trace_fingerprint": "sha256:d2ff4073cdd591783c7b75b9729d1c6e07e80577b5749a20ccf2da29b19c3a75",
+  "git_sha": "local-dev",
+  "config_hash": "sha256:0f617b1384c9edf3a4fb4b8fc2391fbd71a2c0c324358dd1d0804d8e816c378b",
+  "alpha_total": 0.01,
+  "alpha_policy": "bonferroni",
+  "metric_count": 28,
+  "artifacts": {
+    "criterion_dir": "baselines/criterion",
+    "baseline_path": "baselines/criterion/bd-1dp9.6.1-baseline.json",
+    "latest_path": "baselines/criterion/bd-1dp9.6.1-baseline-latest.json"
+  },
+  "env": {
+    "FEATURE_FLAGS": "perf,parity100",
+    "GIT_SHA": "local-dev",
+    "MODE": "baseline_pack",
+    "PLATFORM": "linux-x86_64",
+    "RUSTFLAGS": "-C force-frame-pointers=yes"
+  },
+  "system": {
+    "os": "linux",
+    "arch": "x86_64",
+    "kernel": "portable-kernel"
+  }
+}

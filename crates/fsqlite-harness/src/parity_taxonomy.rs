@@ -614,6 +614,7 @@ pub fn build_canonical_universe() -> FeatureUniverse {
 // SQL Grammar features
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_lines)]
 fn build_sql_grammar_features() -> Vec<Feature> {
     let mut b = FeatureBuilder::new(FeatureCategory::SqlGrammar);
 
@@ -965,6 +966,7 @@ fn build_sql_grammar_features() -> Vec<Feature> {
 // VDBE Opcode features
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_lines)]
 fn build_vdbe_opcode_features() -> Vec<Feature> {
     let mut b = FeatureBuilder::new(FeatureCategory::VdbeOpcodes);
 
@@ -1172,6 +1174,7 @@ fn build_vdbe_opcode_features() -> Vec<Feature> {
 // Storage & Transaction features
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_lines)]
 fn build_storage_transaction_features() -> Vec<Feature> {
     let mut b = FeatureBuilder::new(FeatureCategory::StorageTransaction);
 
@@ -1383,6 +1386,7 @@ fn build_storage_transaction_features() -> Vec<Feature> {
 // PRAGMA features
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_lines)]
 fn build_pragma_features() -> Vec<Feature> {
     let mut b = FeatureBuilder::new(FeatureCategory::Pragma);
 
@@ -1548,6 +1552,7 @@ fn build_pragma_features() -> Vec<Feature> {
 // Built-in function features
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_lines)]
 fn build_builtin_function_features() -> Vec<Feature> {
     let mut b = FeatureBuilder::new(FeatureCategory::BuiltinFunctions);
 
@@ -1911,6 +1916,7 @@ fn build_builtin_function_features() -> Vec<Feature> {
 // Extension features
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_lines)]
 fn build_extension_features() -> Vec<Feature> {
     let mut b = FeatureBuilder::new(FeatureCategory::Extensions);
 
@@ -2286,6 +2292,7 @@ fn build_file_format_features() -> Vec<Feature> {
 // API & CLI features
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_lines)]
 fn build_api_cli_features() -> Vec<Feature> {
     let mut b = FeatureBuilder::new(FeatureCategory::ApiCli);
 
@@ -2623,6 +2630,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn taxonomy_score_deterministic() {
         let u1 = build_canonical_universe();
         let u2 = build_canonical_universe();
@@ -2717,6 +2725,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn taxonomy_truncate_score_determinism() {
         // Verify cross-platform truncation consistency.
         assert_eq!(truncate_score(0.123_456_789), 0.123_456);

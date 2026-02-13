@@ -10,6 +10,7 @@ pub mod commit_pipeline;
 pub mod confidence_gates;
 pub mod corpus_ingest;
 pub mod differential_v2;
+pub mod drift_monitor;
 pub mod durability_matrix;
 pub mod e2e_log_schema;
 pub mod e2e_orchestrator;

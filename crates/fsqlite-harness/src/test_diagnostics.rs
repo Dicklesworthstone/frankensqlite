@@ -40,6 +40,7 @@ use std::fmt;
 use std::fmt::Write as _;
 
 /// Bead identifier for this module's own tests.
+#[cfg(test)]
 const BEAD_ID: &str = "bd-mblr.6.6";
 
 // ─── Diagnostics Context ────────────────────────────────────────────────
@@ -460,13 +461,7 @@ impl DiagReport {
                 Severity::Error => "ERROR",
                 Severity::Warning => "WARN",
             };
-            let _ = write!(
-                out,
-                "  [{}] #{}: {}\n",
-                sev,
-                i + 1,
-                f.context.format_kv()
-            );
+            let _ = write!(out, "  [{}] #{}: {}\n", sev, i + 1, f.context.format_kv());
             let _ = write!(out, "        {}\n", f.message);
             if let Some(ref e) = f.expected {
                 let _ = write!(out, "        expected: {e}\n");

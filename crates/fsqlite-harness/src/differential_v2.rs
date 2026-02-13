@@ -599,7 +599,7 @@ pub fn run_differential<F: SqlExecutor, C: SqlExecutor>(
 
     let envelope_id = envelope.artifact_id();
     let workload_hash = {
-        let combined: String = statements.iter().copied().collect::<Vec<_>>().join("\n");
+        let combined: String = statements.join("\n");
         sha256_hex(combined.as_bytes())
     };
 
@@ -663,7 +663,7 @@ fn rows_match(
     if rules.unordered_results_as_multiset {
         let mut a_sorted = a.to_vec();
         let mut b_sorted = b.to_vec();
-        let key = |row: &Vec<NormalizedValue>| -> String {
+        let key = |row: &[NormalizedValue]| -> String {
             row.iter()
                 .map(|v| format!("{v}"))
                 .collect::<Vec<_>>()

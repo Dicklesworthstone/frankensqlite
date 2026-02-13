@@ -8,9 +8,7 @@
 
 use std::collections::BTreeMap;
 
-use fsqlite_harness::e2e_log_schema::{
-    LogEventSchema, LogEventType, LogPhase, LOG_SCHEMA_VERSION,
-};
+use fsqlite_harness::e2e_log_schema::{LOG_SCHEMA_VERSION, LogEventSchema, LogEventType, LogPhase};
 use fsqlite_harness::log_schema_validator::{
     self, DiagnosticSeverity, FieldSensitivity, decode_jsonl_stream, encode_jsonl_stream,
     redact_event, validate_event_stream, verify_roundtrip,
@@ -136,10 +134,7 @@ fn e2e_full_pipeline_realistic_stream() {
 
     // Step 1: Encode to JSONL
     let jsonl = encode_jsonl_stream(&events).expect("bead_id={BEAD_ID} case=encode");
-    assert!(
-        !jsonl.is_empty(),
-        "bead_id={BEAD_ID} case=encode_nonempty"
-    );
+    assert!(!jsonl.is_empty(), "bead_id={BEAD_ID} case=encode_nonempty");
 
     // Step 2: Decode from JSONL
     let decoded = decode_jsonl_stream(&jsonl);
@@ -379,8 +374,7 @@ fn e2e_validation_diagnostics_ci_output() {
         "bead_id={BEAD_ID} phase=validate event_type=pass \
          run_id={BEAD_ID}-ci-diagnostics-{SEED} seed={SEED} \
          error_count={} warning_count={} result=PASS",
-        report.stats.error_count,
-        report.stats.warning_count,
+        report.stats.error_count, report.stats.warning_count,
     );
 }
 

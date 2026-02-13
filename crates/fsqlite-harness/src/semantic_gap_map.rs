@@ -78,8 +78,7 @@ impl PipelineStage {
             Subsystem::Resolver => Self::Resolve,
             Subsystem::Planner => Self::Plan,
             Subsystem::Vdbe => Self::Execute,
-            Subsystem::Storage => Self::Storage,
-            Subsystem::Wal | Subsystem::Mvcc => Self::Storage,
+            Subsystem::Storage | Subsystem::Wal | Subsystem::Mvcc => Self::Storage,
             Subsystem::Functions
             | Subsystem::Extension
             | Subsystem::TypeSystem
@@ -457,7 +456,7 @@ pub fn closure_backlog(gap_map: &SemanticGapMap) -> ClosureBacklog {
                 entry.behavior_contract.expected, entry.behavior_contract.actual,
             );
             if let Some(ref spec) = entry.behavior_contract.spec_reference {
-                let _ = write!(description, "**Spec ref**: {spec}\n");
+                let _ = writeln!(description, "**Spec ref**: {spec}");
             }
             let _ = write!(
                 description,
@@ -720,7 +719,9 @@ fn compute_stats(entries: &[GapEntry]) -> GapMapStats {
 /// Map subsystem to feature category.
 fn subsystem_to_category(subsystem: Subsystem) -> FeatureCategory {
     match subsystem {
-        Subsystem::Parser | Subsystem::Resolver | Subsystem::Planner => FeatureCategory::SqlGrammar,
+        Subsystem::Parser | Subsystem::Resolver | Subsystem::Planner | Subsystem::Unknown => {
+            FeatureCategory::SqlGrammar
+        }
         Subsystem::Vdbe => FeatureCategory::VdbeOpcodes,
         Subsystem::Storage | Subsystem::Wal | Subsystem::Mvcc => {
             FeatureCategory::StorageTransaction
@@ -729,7 +730,6 @@ fn subsystem_to_category(subsystem: Subsystem) -> FeatureCategory {
         Subsystem::Extension => FeatureCategory::Extensions,
         Subsystem::TypeSystem => FeatureCategory::TypeSystem,
         Subsystem::Pragma => FeatureCategory::Pragma,
-        Subsystem::Unknown => FeatureCategory::SqlGrammar,
     }
 }
 

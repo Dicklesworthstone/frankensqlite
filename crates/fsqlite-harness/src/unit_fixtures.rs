@@ -195,6 +195,7 @@ pub struct PageFixture {
 /// Each fixture uses a deterministic seed derived from `FIXTURE_SEED_BASE`
 /// with the `"page"` domain tag, ensuring identical output on every call.
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn build_page_fixtures() -> Vec<PageFixture> {
     let mut fixtures = Vec::new();
 

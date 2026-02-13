@@ -160,12 +160,10 @@ impl ValidationLane {
     pub fn time_budget_secs(&self) -> u64 {
         match self {
             Self::UnitTests => 120,
-            Self::StorageIntegration => 300,
+            Self::StorageIntegration | Self::RecoveryDurability => 300,
             Self::SqlPipeline => 180,
-            Self::ConcurrencyStress => 600,
-            Self::RecoveryDurability => 300,
+            Self::ConcurrencyStress | Self::MetamorphicDifferential => 600,
             Self::SoakEndurance => 1800,
-            Self::MetamorphicDifferential => 600,
             Self::PerformanceRegression => 900,
             Self::FullE2e => 3600,
         }

@@ -52,6 +52,7 @@ impl ContentionMix {
                 writer_pct: 50,
             };
         }
+        #[allow(clippy::cast_possible_truncation)]
         let r = ((u16::from(reader_pct) * 100) / total) as u8;
         Self {
             reader_pct: r,
@@ -512,6 +513,7 @@ impl fmt::Display for HistoryInvariant {
 
 /// Build the canonical set of soak history invariants.
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn canonical_invariants() -> Vec<HistoryInvariant> {
     vec![
         HistoryInvariant {
@@ -747,7 +749,7 @@ pub fn evaluate_invariants(
         invariants
             .iter()
             .find(|inv| inv.id == v.invariant_id)
-            .is_some_and(|inv| inv.is_abort_on_violation())
+            .is_some_and(HistoryInvariant::is_abort_on_violation)
     });
 
     let checked = invariants.len();

@@ -799,6 +799,7 @@ pub fn build_canonical_catalog() -> InvariantCatalog {
 // Per-category invariant builders
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_lines)]
 fn build_sql_grammar_invariants() -> Vec<ParityInvariant> {
     let mut b = InvariantBuilder::new(FeatureCategory::SqlGrammar);
 
@@ -1400,6 +1401,7 @@ fn build_sql_grammar_invariants() -> Vec<ParityInvariant> {
     b.build()
 }
 
+#[allow(clippy::too_many_lines)]
 fn build_vdbe_invariants() -> Vec<ParityInvariant> {
     let mut b = InvariantBuilder::new(FeatureCategory::VdbeOpcodes);
 
@@ -1649,6 +1651,7 @@ fn build_vdbe_invariants() -> Vec<ParityInvariant> {
     b.build()
 }
 
+#[allow(clippy::too_many_lines)]
 fn build_storage_transaction_invariants() -> Vec<ParityInvariant> {
     let mut b = InvariantBuilder::new(FeatureCategory::StorageTransaction);
 
@@ -2031,6 +2034,7 @@ fn build_storage_transaction_invariants() -> Vec<ParityInvariant> {
     b.build()
 }
 
+#[allow(clippy::too_many_lines)]
 fn build_pragma_invariants() -> Vec<ParityInvariant> {
     let mut b = InvariantBuilder::new(FeatureCategory::Pragma);
 
@@ -2780,12 +2784,9 @@ mod tests {
             "empty catalog must have validation violations"
         );
         // Should fail CAT-VAL-4 for every category
-        let cat_violations: Vec<_> = violations
-            .iter()
-            .filter(|v| v.rule == "CAT-VAL-4")
-            .collect();
+        let cat_violation_count = violations.iter().filter(|v| v.rule == "CAT-VAL-4").count();
         assert_eq!(
-            cat_violations.len(),
+            cat_violation_count,
             FeatureCategory::ALL.len(),
             "empty catalog must violate CAT-VAL-4 for each category"
         );

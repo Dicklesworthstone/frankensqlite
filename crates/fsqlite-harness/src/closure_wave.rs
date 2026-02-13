@@ -328,6 +328,7 @@ pub fn build_canonical_catalog() -> ClosureWaveRegistry {
     registry
 }
 
+#[allow(clippy::too_many_lines)]
 fn add_parser_cases(reg: &mut ClosureWaveRegistry) {
     // Basic statement types.
     let parser_cases = [
@@ -493,6 +494,7 @@ fn add_parser_cases(reg: &mut ClosureWaveRegistry) {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn add_resolver_cases(reg: &mut ClosureWaveRegistry) {
     let resolver_cases = [
         (
@@ -640,6 +642,7 @@ fn add_resolver_cases(reg: &mut ClosureWaveRegistry) {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn add_pragma_cases(reg: &mut ClosureWaveRegistry) {
     let pragma_cases = [
         (
