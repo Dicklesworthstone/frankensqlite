@@ -24,12 +24,12 @@
 //! cargo test -p fsqlite-e2e --test seed_reproducibility -- --nocapture
 //! ```
 
-use rand::rngs::StdRng;
-use rand::SeedableRng;
 use rand::RngCore;
+use rand::SeedableRng;
+use rand::rngs::StdRng;
 
-use fsqlite_e2e::{FRANKEN_SEED, derive_worker_seed, derive_scenario_seed};
 use fsqlite_e2e::oplog::{preset_commutative_inserts_disjoint_keys, preset_hot_page_contention};
+use fsqlite_e2e::{FRANKEN_SEED, derive_scenario_seed, derive_worker_seed};
 
 // ─── Seed Derivation Reproducibility ────────────────────────────────────
 
@@ -149,25 +149,16 @@ fn oplog_generation_is_reproducible() {
     let workers = 4;
     let rows_per_worker = 100;
 
-    let oplog1 = preset_commutative_inserts_disjoint_keys(
-        "repro-test-1",
-        seed,
-        workers,
-        rows_per_worker,
-    );
+    let oplog1 =
+        preset_commutative_inserts_disjoint_keys("repro-test-1", seed, workers, rows_per_worker);
 
-    let oplog2 = preset_commutative_inserts_disjoint_keys(
-        "repro-test-1",
-        seed,
-        workers,
-        rows_per_worker,
-    );
+    let oplog2 =
+        preset_commutative_inserts_disjoint_keys("repro-test-1", seed, workers, rows_per_worker);
 
     // Compare headers.
     assert_eq!(oplog1.header.seed, oplog2.header.seed, "Seeds must match");
     assert_eq!(
-        oplog1.header.concurrency.worker_count,
-        oplog2.header.concurrency.worker_count,
+        oplog1.header.concurrency.worker_count, oplog2.header.concurrency.worker_count,
         "Worker counts must match"
     );
 
@@ -271,7 +262,7 @@ fn database_state_commutative_inserts_seed_independent() {
 
 /// Execute an OpLog on FrankenSQLite and return a hash of the final state.
 fn execute_oplog_and_hash(oplog: &fsqlite_e2e::oplog::OpLog) -> String {
-    use sha2::{Sha256, Digest};
+    use sha2::{Digest, Sha256};
 
     let conn = fsqlite::Connection::open(":memory:").expect("open connection");
 
@@ -355,8 +346,7 @@ fn franken_seed_stability() {
     // This constant is part of the reproducibility contract and MUST NOT change.
     // 0x4652414E4B454E = 19793688809653582 decimal
     assert_eq!(
-        FRANKEN_SEED,
-        19_793_688_809_653_582,
+        FRANKEN_SEED, 19_793_688_809_653_582,
         "FRANKEN_SEED must not change - this breaks reproducibility!"
     );
 }

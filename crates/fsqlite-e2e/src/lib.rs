@@ -19,6 +19,7 @@ pub mod corruption_demo_sqlite;
 pub mod corruption_scenarios;
 pub mod corruption_walkthrough;
 pub mod executor;
+pub mod failure_bundle;
 pub mod fairness;
 pub mod fixture_metadata;
 pub mod fixture_select;

@@ -103,7 +103,10 @@ fn ssi_write_skew_sequential() {
     conn.execute("UPDATE accounts SET balance = 0 WHERE id = 2")
         .expect("t2 update B");
     let t2_commit = conn.execute("COMMIT");
-    assert!(t2_commit.is_ok(), "T2 commit should succeed (saw T1's commit)");
+    assert!(
+        t2_commit.is_ok(),
+        "T2 commit should succeed (saw T1's commit)"
+    );
 
     // Final state: both accounts at 0.
     let final_row = conn
@@ -233,7 +236,9 @@ fn ssi_savepoint_behavior() {
     conn.execute("UPDATE data SET val = 200 WHERE id = 1")
         .expect("update");
 
-    let row = conn.query_row("SELECT val FROM data WHERE id = 1").expect("read");
+    let row = conn
+        .query_row("SELECT val FROM data WHERE id = 1")
+        .expect("read");
     assert_eq!(get_int(&row, 0), 200, "Should see updated value");
 
     // Rollback to savepoint.
@@ -271,7 +276,9 @@ fn ssi_begin_concurrent_basic() {
     conn.execute("BEGIN CONCURRENT").expect("begin concurrent");
 
     // Read and modify.
-    let row = conn.query_row("SELECT val FROM data WHERE id = 1").expect("read");
+    let row = conn
+        .query_row("SELECT val FROM data WHERE id = 1")
+        .expect("read");
     assert_eq!(get_int(&row, 0), 100, "Initial read");
 
     conn.execute("UPDATE data SET val = 200 WHERE id = 1")
