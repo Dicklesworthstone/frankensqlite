@@ -938,12 +938,13 @@ mod tests {
         };
         let report = validate_event_stream(&[event]);
         assert!(!report.passed);
-        let ts_errors: Vec<_> = report
-            .diagnostics
-            .iter()
-            .filter(|d| d.field.as_deref() == Some("timestamp"))
-            .collect();
-        assert!(!ts_errors.is_empty(), "should flag bad timestamp");
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|d| d.field.as_deref() == Some("timestamp")),
+            "should flag bad timestamp"
+        );
     }
 
     #[test]
@@ -961,13 +962,11 @@ mod tests {
         };
         let report = validate_event_stream(&[event]);
         assert!(!report.passed);
-        let seed_errors: Vec<_> = report
-            .diagnostics
-            .iter()
-            .filter(|d| d.field.as_deref() == Some("seed"))
-            .collect();
         assert!(
-            !seed_errors.is_empty(),
+            report
+                .diagnostics
+                .iter()
+                .any(|d| d.field.as_deref() == Some("seed")),
             "should flag missing seed for fail events"
         );
     }
@@ -976,16 +975,11 @@ mod tests {
     fn validate_warns_on_missing_scenario_id() {
         let event = make_minimal_event("test-run-1", LogPhase::Validate, LogEventType::Pass);
         let report = validate_event_stream(&[event]);
-        let scenario_warnings: Vec<_> = report
-            .diagnostics
-            .iter()
-            .filter(|d| {
+        assert!(
+            report.diagnostics.iter().any(|d| {
                 d.severity == DiagnosticSeverity::Warning
                     && d.field.as_deref() == Some("scenario_id")
-            })
-            .collect();
-        assert!(
-            !scenario_warnings.is_empty(),
+            }),
             "should warn about missing scenario_id for pass events",
         );
     }
@@ -1004,16 +998,11 @@ mod tests {
             context: BTreeMap::new(),
         };
         let report = validate_event_stream(&[event]);
-        let hash_warnings: Vec<_> = report
-            .diagnostics
-            .iter()
-            .filter(|d| {
+        assert!(
+            report.diagnostics.iter().any(|d| {
                 d.severity == DiagnosticSeverity::Warning
                     && d.field.as_deref() == Some("artifact_hash")
-            })
-            .collect();
-        assert!(
-            !hash_warnings.is_empty(),
+            }),
             "should warn about missing artifact_hash for artifact_generated events",
         );
     }
@@ -1022,15 +1011,10 @@ mod tests {
     fn validate_warns_on_run_id_without_dashes() {
         let event = make_minimal_event("nodashes", LogPhase::Setup, LogEventType::Start);
         let report = validate_event_stream(&[event]);
-        let warnings: Vec<_> = report
-            .diagnostics
-            .iter()
-            .filter(|d| {
-                d.severity == DiagnosticSeverity::Warning && d.field.as_deref() == Some("run_id")
-            })
-            .collect();
         assert!(
-            !warnings.is_empty(),
+            report.diagnostics.iter().any(|d| {
+                d.severity == DiagnosticSeverity::Warning && d.field.as_deref() == Some("run_id")
+            }),
             "should warn about run_id format without dashes",
         );
     }
