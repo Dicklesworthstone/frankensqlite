@@ -1343,6 +1343,8 @@ const REPAIR_PIPELINE_FLUSH_POLL_INTERVAL: Duration = Duration::from_millis(1);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WalFecRepairPipelineConfig {
     /// Maximum queued work items before backpressure.
+    ///
+    /// This is the bounded async repair-latency window in commit-count units.
     pub queue_capacity: usize,
     /// Optional deterministic delay per generated repair symbol (test hook).
     pub per_symbol_delay: Duration,
@@ -1561,8 +1563,10 @@ impl WalFecRepairPipeline {
     }
 
     /// Stop the worker and join thread.
+    ///
+    /// This is a graceful shutdown: queued work is drained before the worker
+    /// exits. To force immediate cancellation, call [`Self::cancel`] first.
     pub fn shutdown(&mut self) -> Result<WalFecRepairPipelineStats> {
-        self.cancel();
         self.sender.take();
         if let Some(worker) = self.worker.take() {
             worker.join().map_err(|_| FrankenError::WalCorrupt {
