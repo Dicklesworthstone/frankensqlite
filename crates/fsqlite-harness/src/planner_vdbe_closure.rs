@@ -524,7 +524,7 @@ fn add_planner_cases(reg: &mut PlannerVdbeRegistry) {
             expected_behavior: expected.to_owned(),
             outcome: ClosureOutcome::Skip,
             failure_detail: None,
-            feature_tags: tags.iter().map(|s| (*s).to_owned()).collect(),
+            feature_tags: tags.iter().copied().map(ToOwned::to_owned).collect(),
             spec_reference: None,
         });
     }
@@ -840,7 +840,7 @@ fn add_vdbe_cases(reg: &mut PlannerVdbeRegistry) {
             expected_behavior: expected.to_owned(),
             outcome: ClosureOutcome::Skip,
             failure_detail: None,
-            feature_tags: tags.iter().map(|s| (*s).to_owned()).collect(),
+            feature_tags: tags.iter().copied().map(ToOwned::to_owned).collect(),
             spec_reference: None,
         });
     }

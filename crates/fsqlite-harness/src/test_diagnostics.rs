@@ -37,6 +37,7 @@
 //! ```
 
 use std::fmt;
+use std::fmt::Write as _;
 
 /// Bead identifier for this module's own tests.
 const BEAD_ID: &str = "bd-mblr.6.6";
@@ -185,10 +186,10 @@ pub fn simple_diff(expected: &str, actual: &str) -> Option<String> {
         let act = act_lines.get(i).copied().unwrap_or("");
         if exp != act {
             if !exp.is_empty() {
-                diff.push_str(&format!("  line {}: - {exp}\n", i + 1));
+                let _ = write!(diff, "  line {}: - {exp}\n", i + 1);
             }
             if !act.is_empty() {
-                diff.push_str(&format!("  line {}: + {act}\n", i + 1));
+                let _ = write!(diff, "  line {}: + {act}\n", i + 1);
             }
         }
     }
@@ -447,29 +448,31 @@ impl DiagReport {
         }
 
         let mut out = String::new();
-        out.push_str(&format!(
+        let _ = write!(
+            out,
             "DiagReport: {} error(s), {} warning(s)\n",
             self.error_count(),
             self.warning_count()
-        ));
+        );
 
         for (i, f) in self.findings.iter().enumerate() {
             let sev = match f.severity {
                 Severity::Error => "ERROR",
                 Severity::Warning => "WARN",
             };
-            out.push_str(&format!(
+            let _ = write!(
+                out,
                 "  [{}] #{}: {}\n",
                 sev,
                 i + 1,
                 f.context.format_kv()
-            ));
-            out.push_str(&format!("        {}\n", f.message));
+            );
+            let _ = write!(out, "        {}\n", f.message);
             if let Some(ref e) = f.expected {
-                out.push_str(&format!("        expected: {e}\n"));
+                let _ = write!(out, "        expected: {e}\n");
             }
             if let Some(ref a) = f.actual {
-                out.push_str(&format!("        actual:   {a}\n"));
+                let _ = write!(out, "        actual:   {a}\n");
             }
         }
 

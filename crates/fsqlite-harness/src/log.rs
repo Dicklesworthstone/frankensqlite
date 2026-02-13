@@ -401,8 +401,7 @@ fn project_harness_event(meta: &BundleMeta, event: &HarnessEvent) -> LogEventSch
 
 fn map_phase(kind: LifecycleEventKind) -> LogPhase {
     match kind {
-        LifecycleEventKind::RunStart => LogPhase::Setup,
-        LifecycleEventKind::Setup => LogPhase::Setup,
+        LifecycleEventKind::RunStart | LifecycleEventKind::Setup => LogPhase::Setup,
         LifecycleEventKind::Step => LogPhase::Execute,
         LifecycleEventKind::Assertion => LogPhase::Validate,
         LifecycleEventKind::Teardown => LogPhase::Teardown,

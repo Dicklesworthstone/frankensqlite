@@ -830,6 +830,7 @@ pub fn build_coverage_report() -> ScenarioCoverageReport {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn build_critical_scenario_list() -> Vec<(String, FeatureCategory, ScenarioCriticality, String)> {
     vec![
         // SQL Grammar — Critical

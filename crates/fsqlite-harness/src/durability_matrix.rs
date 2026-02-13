@@ -283,6 +283,7 @@ pub fn execute_durability_matrix(
     execute_durability_matrix_with(matrix, options, host_operating_system(), run_probe_command)
 }
 
+#[allow(clippy::too_many_lines)]
 fn execute_durability_matrix_with<F>(
     matrix: &DurabilityMatrix,
     options: DurabilityExecutionOptions,
