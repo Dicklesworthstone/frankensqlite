@@ -17,7 +17,7 @@ use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::SyncFlags;
 use fsqlite_vfs::VfsFile;
-use tracing::debug;
+use tracing::{debug, error};
 
 use crate::checksum::{
     SqliteWalChecksum, WAL_FORMAT_VERSION, WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE, WAL_MAGIC_LE,
@@ -155,6 +155,7 @@ impl<F: VfsFile> WalFile<F> {
         let expected_checksum =
             crate::checksum::wal_header_checksum(&header_buf, big_endian_checksum)?;
         if header_checksum != expected_checksum {
+            error!("WAL header checksum mismatch — file may be corrupt");
             return Err(FrankenError::WalCorrupt {
                 detail: "WAL header checksum mismatch".to_owned(),
             });
@@ -182,6 +183,7 @@ impl<F: VfsFile> WalFile<F> {
             // Verify salt match.
             let frame_header = WalFrameHeader::from_bytes(&frame_buf[..WAL_FRAME_HEADER_SIZE])?;
             if frame_header.salts != header.salts {
+                error!(frame_index, "WAL frame salt mismatch — chain terminated");
                 break; // salt mismatch terminates the chain
             }
 
@@ -193,6 +195,10 @@ impl<F: VfsFile> WalFile<F> {
                 big_endian_checksum,
             )?;
             if frame_header.checksum != expected {
+                error!(
+                    frame_index,
+                    "WAL frame checksum mismatch — chain terminated"
+                );
                 break; // checksum mismatch terminates the chain
             }
 
@@ -270,12 +276,25 @@ impl<F: VfsFile> WalFile<F> {
         self.running_checksum = new_checksum;
         self.frame_count += 1;
 
+        let bytes_written = u64::try_from(frame_size).unwrap_or(u64::MAX);
+        let span = tracing::span!(
+            tracing::Level::DEBUG,
+            "wal_write",
+            frame_count = self.frame_count,
+            bytes_written = bytes_written,
+            page_number = page_number,
+            is_commit = db_size_if_commit > 0,
+        );
+        let _guard = span.enter();
+
         debug!(
             frame_index = self.frame_count - 1,
             page_number,
             is_commit = db_size_if_commit > 0,
             "WAL frame appended"
         );
+
+        crate::metrics::GLOBAL_WAL_METRICS.record_frame_write(bytes_written);
 
         Ok(())
     }
@@ -379,6 +398,8 @@ impl<F: VfsFile> WalFile<F> {
             salt2 = new_salts.salt2,
             "WAL reset"
         );
+
+        crate::metrics::GLOBAL_WAL_METRICS.record_wal_reset();
 
         Ok(())
     }

@@ -86,6 +86,7 @@ pub fn execute_checkpoint<F: VfsFile>(
     state: CheckpointState,
     target: &mut impl CheckpointTarget,
 ) -> Result<CheckpointExecutionResult> {
+    let checkpoint_start = std::time::Instant::now();
     let plan = plan_checkpoint(mode, state);
     let normalized = state.normalized();
 
@@ -170,12 +171,18 @@ pub fn execute_checkpoint<F: VfsFile>(
         CheckpointPostAction::None => false,
     };
 
+    let checkpoint_duration_us = crate::metrics::duration_us_saturating(checkpoint_start.elapsed());
+
     info!(
         frames_backfilled,
         wal_was_reset,
         db_size_pages = ?last_db_size,
+        checkpoint_duration_us,
         "checkpoint execution complete"
     );
+
+    crate::metrics::GLOBAL_WAL_METRICS
+        .record_checkpoint(u64::from(frames_backfilled), checkpoint_duration_us);
 
     Ok(CheckpointExecutionResult {
         plan,
