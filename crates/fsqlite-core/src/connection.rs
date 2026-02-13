@@ -8,9 +8,10 @@
 //! and cursor paths through the real storage stack.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use fsqlite_ast::{
@@ -43,17 +44,23 @@ use fsqlite_vfs::MemoryVfs;
 #[cfg(unix)]
 use fsqlite_vfs::UnixVfs;
 use fsqlite_vfs::traits::Vfs;
-use fsqlite_wal::{WalFile, WalSalts};
+use fsqlite_wal::{
+    WalFecRepairEvidenceCard, WalFecRepairEvidenceQuery, WalFecRepairSeverityBucket, WalFile,
+    WalSalts, query_raptorq_repair_evidence, raptorq_repair_events_snapshot,
+    raptorq_repair_evidence_snapshot, raptorq_repair_metrics_snapshot,
+    reset_raptorq_repair_telemetry,
+};
 
 // MVCC concurrent-writer support (bd-14zc / 5E.1, bd-kivg / 5E.2, bd-3bql / 5E.5)
 use fsqlite_mvcc::{
     CommitIndex, ConcurrentHandle, ConcurrentRegistry, FcwResult, GcScheduler, GcTickResult,
-    GcTodo, InProcessPageLockTable, MvccError, VersionStore, concurrent_abort,
-    concurrent_read_page, concurrent_write_page, validate_first_committer_wins,
+    GcTodo, InProcessPageLockTable, MvccError, SsiDecisionCard, SsiDecisionCardDraft,
+    SsiDecisionQuery, SsiDecisionType, SsiEvidenceLedger, SsiReadSetSummary, VersionStore,
+    concurrent_abort, concurrent_read_page, concurrent_write_page, validate_first_committer_wins,
 };
 // MVCC conflict observability (bd-t6sv2.1)
 use fsqlite_observability::MetricsObserver;
-use fsqlite_types::{CommitSeq, PageData, SchemaEpoch, Snapshot, TxnId};
+use fsqlite_types::{CommitSeq, PageData, SchemaEpoch, Snapshot, TxnId, TxnToken};
 
 use crate::wal_adapter::WalBackendAdapter;
 
@@ -616,6 +623,23 @@ struct SavepointEntry {
     snapshot: DbSnapshot,
 }
 
+#[derive(Debug, Clone)]
+struct SsiTxnEvidenceSnapshot {
+    txn: TxnToken,
+    snapshot_seq: CommitSeq,
+    read_pages: Vec<PageNumber>,
+    write_pages: Vec<PageNumber>,
+    has_in_rw: bool,
+    has_out_rw: bool,
+    marked_for_abort: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveConflictEvidence {
+    conflicting_txns: Vec<TxnToken>,
+    conflict_pages: Vec<PageNumber>,
+}
+
 /// A database connection holding in-memory tables and schema metadata.
 ///
 /// Supports transactions (BEGIN/COMMIT/ROLLBACK) and savepoints
@@ -687,6 +711,9 @@ pub struct Connection {
     /// FCW drift, SSI aborts) and a ring-buffer of recent conflict events.
     /// Exposed via PRAGMA fsqlite.conflict_stats / conflict_log / conflict_reset.
     conflict_observer: Rc<MetricsObserver>,
+    /// Bounded append-only SSI decision cards with tamper-evident chain hashes.
+    /// Queried via `PRAGMA fsqlite.ssi_decisions`.
+    ssi_evidence_ledger: SsiEvidenceLedger,
     // ── MVCC concurrent-writer state (bd-14zc / 5E.1, bd-kivg / 5E.2) ─────
     /// Registry of active concurrent-writer sessions.
     /// Wrapped in Rc for sharing with VdbeEngine during execution (bd-kivg).
@@ -767,6 +794,8 @@ impl Connection {
             change_counter: RefCell::new(0),
             // MVCC conflict observability (bd-t6sv2.1)
             conflict_observer: Rc::new(MetricsObserver::new(1024)),
+            // SSI evidence ledger (bd-1lsfu.3)
+            ssi_evidence_ledger: SsiEvidenceLedger::new(4096),
             // MVCC concurrent-writer state (bd-14zc / 5E.1, bd-kivg / 5E.2)
             concurrent_registry: Rc::new(RefCell::new(ConcurrentRegistry::new())),
             concurrent_session_id: RefCell::new(None),
@@ -2828,6 +2857,116 @@ impl Connection {
         }
     }
 
+    fn capture_ssi_snapshot(handle: &ConcurrentHandle) -> SsiTxnEvidenceSnapshot {
+        let mut read_pages = handle.read_set().iter().copied().collect::<Vec<_>>();
+        read_pages.sort_by_key(|page| page.get());
+        read_pages.dedup();
+
+        let mut write_pages = handle.write_set_pages();
+        write_pages.sort_by_key(|page| page.get());
+        write_pages.dedup();
+
+        SsiTxnEvidenceSnapshot {
+            txn: handle.txn_token(),
+            snapshot_seq: handle.snapshot().high,
+            read_pages,
+            write_pages,
+            has_in_rw: handle.has_in_rw(),
+            has_out_rw: handle.has_out_rw(),
+            marked_for_abort: handle.is_marked_for_abort(),
+        }
+    }
+
+    fn collect_active_conflict_evidence(
+        registry: &ConcurrentRegistry,
+        session_id: u64,
+        snapshot: &SsiTxnEvidenceSnapshot,
+    ) -> ActiveConflictEvidence {
+        let read_lookup: HashSet<PageNumber> = snapshot.read_pages.iter().copied().collect();
+        let write_lookup: HashSet<PageNumber> = snapshot.write_pages.iter().copied().collect();
+
+        let mut conflicting_txns = Vec::new();
+        let mut conflict_pages = HashSet::new();
+
+        for (other_session_id, other_handle) in registry.iter_active() {
+            if other_session_id == session_id || !other_handle.is_active() {
+                continue;
+            }
+
+            let mut matched = false;
+            for page in other_handle.read_set() {
+                if write_lookup.contains(page) {
+                    matched = true;
+                    let _ = conflict_pages.insert(*page);
+                }
+            }
+
+            let other_write_pages = other_handle.write_set_pages();
+            for page in other_write_pages {
+                if write_lookup.contains(&page) || read_lookup.contains(&page) {
+                    matched = true;
+                    let _ = conflict_pages.insert(page);
+                }
+            }
+
+            if matched {
+                conflicting_txns.push(other_handle.txn_token());
+            }
+        }
+
+        conflicting_txns.sort_by(|left, right| {
+            left.id
+                .get()
+                .cmp(&right.id.get())
+                .then_with(|| left.epoch.get().cmp(&right.epoch.get()))
+        });
+        conflicting_txns.dedup();
+
+        let mut conflict_pages = conflict_pages.into_iter().collect::<Vec<_>>();
+        conflict_pages.sort_by_key(|page| page.get());
+        conflict_pages.dedup();
+
+        ActiveConflictEvidence {
+            conflicting_txns,
+            conflict_pages,
+        }
+    }
+
+    fn build_ssi_decision_draft(
+        snapshot: &SsiTxnEvidenceSnapshot,
+        decision_type: SsiDecisionType,
+        conflicting_txns: Vec<TxnToken>,
+        conflict_pages: Vec<PageNumber>,
+        rationale: impl Into<String>,
+    ) -> SsiDecisionCardDraft {
+        SsiDecisionCardDraft::new(
+            decision_type,
+            snapshot.txn,
+            snapshot.snapshot_seq,
+            conflicting_txns,
+            conflict_pages,
+            snapshot.read_pages.clone(),
+            snapshot.write_pages.clone(),
+            rationale,
+        )
+    }
+
+    fn merge_conflict_pages(
+        left: Vec<PageNumber>,
+        right: Vec<PageNumber>,
+        fallback: &[PageNumber],
+    ) -> Vec<PageNumber> {
+        let mut pages = left;
+        pages.extend(right);
+        if pages.is_empty() {
+            pages.extend_from_slice(fallback);
+        }
+        pages.sort_by_key(|page| page.get());
+        pages.dedup();
+        pages
+    }
+
+    #[allow(clippy::too_many_lines)]
     fn plan_concurrent_commit(&self) -> Result<Option<(u64, CommitSeq, Vec<PageNumber>)>> {
         // MVCC concurrent-writer commit path (bd-14zc / 5E.1):
         // Validate FCW/SSI preconditions first, but delay commit-index
@@ -2838,42 +2977,102 @@ impl Connection {
         };
         let assign_seq = CommitSeq::new(*self.next_commit_seq.borrow());
 
+        let mut abort_card: Option<SsiDecisionCardDraft> = None;
+
         let validate_result: std::result::Result<Vec<PageNumber>, (MvccError, FcwResult)> = {
             let mut registry = self.concurrent_registry.borrow_mut();
-            match registry.get_mut(session_id) {
-                Some(handle) => {
-                    if handle.is_active() {
-                        let fcw_result =
-                            validate_first_committer_wins(handle, &self.concurrent_commit_index);
-                        match &fcw_result {
-                            FcwResult::Conflict { .. } => {
-                                if let Some(txn_id) = TxnId::new(session_id) {
-                                    self.concurrent_lock_table.release_all(txn_id);
-                                }
-                                handle.mark_aborted();
-                                Err((MvccError::BusySnapshot, fcw_result))
-                            }
-                            FcwResult::Clean => {
-                                if handle.is_marked_for_abort()
-                                    || (handle.has_in_rw() && handle.has_out_rw())
-                                {
-                                    if let Some(txn_id) = TxnId::new(session_id) {
-                                        self.concurrent_lock_table.release_all(txn_id);
-                                    }
-                                    handle.mark_aborted();
-                                    Err((MvccError::BusySnapshot, FcwResult::Clean))
-                                } else {
-                                    Ok(handle.write_set_pages())
-                                }
-                            }
+            let (fcw_result, snapshot, write_pages) = match registry.get_mut(session_id) {
+                Some(handle) if handle.is_active() => (
+                    validate_first_committer_wins(handle, &self.concurrent_commit_index),
+                    Self::capture_ssi_snapshot(handle),
+                    handle.write_set_pages(),
+                ),
+                Some(_) | None => {
+                    return Err(FrankenError::Internal(
+                        "MVCC session invalid or inactive".to_owned(),
+                    ));
+                }
+            };
+            let active_conflicts =
+                Self::collect_active_conflict_evidence(&registry, session_id, &snapshot);
+
+            match &fcw_result {
+                FcwResult::Conflict {
+                    conflicting_pages,
+                    conflicting_commit_seq,
+                } => {
+                    if let Some(txn_id) = TxnId::new(session_id) {
+                        self.concurrent_lock_table.release_all(txn_id);
+                    }
+                    if let Some(handle) = registry.get_mut(session_id) {
+                        handle.mark_aborted();
+                    }
+                    let conflict_pages = Self::merge_conflict_pages(
+                        conflicting_pages.clone(),
+                        active_conflicts.conflict_pages,
+                        &snapshot.write_pages,
+                    );
+                    abort_card = Some(Self::build_ssi_decision_draft(
+                        &snapshot,
+                        SsiDecisionType::AbortCycle,
+                        active_conflicts.conflicting_txns,
+                        conflict_pages,
+                        format!(
+                            "fcw_conflict_conflicting_commit_seq={}",
+                            conflicting_commit_seq.get()
+                        ),
+                    ));
+                    Err((MvccError::BusySnapshot, fcw_result))
+                }
+                FcwResult::Clean => {
+                    if snapshot.marked_for_abort {
+                        if let Some(txn_id) = TxnId::new(session_id) {
+                            self.concurrent_lock_table.release_all(txn_id);
                         }
+                        if let Some(handle) = registry.get_mut(session_id) {
+                            handle.mark_aborted();
+                        }
+                        abort_card = Some(Self::build_ssi_decision_draft(
+                            &snapshot,
+                            SsiDecisionType::AbortCycle,
+                            active_conflicts.conflicting_txns,
+                            Self::merge_conflict_pages(
+                                Vec::new(),
+                                active_conflicts.conflict_pages,
+                                &snapshot.write_pages,
+                            ),
+                            "marked_for_abort_by_pivot_rule",
+                        ));
+                        Err((MvccError::BusySnapshot, FcwResult::Clean))
+                    } else if snapshot.has_in_rw && snapshot.has_out_rw {
+                        if let Some(txn_id) = TxnId::new(session_id) {
+                            self.concurrent_lock_table.release_all(txn_id);
+                        }
+                        if let Some(handle) = registry.get_mut(session_id) {
+                            handle.mark_aborted();
+                        }
+                        abort_card = Some(Self::build_ssi_decision_draft(
+                            &snapshot,
+                            SsiDecisionType::AbortWriteSkew,
+                            active_conflicts.conflicting_txns,
+                            Self::merge_conflict_pages(
+                                Vec::new(),
+                                active_conflicts.conflict_pages,
+                                &snapshot.write_pages,
+                            ),
+                            "dangerous_structure_in_and_out_rw",
+                        ));
+                        Err((MvccError::BusySnapshot, FcwResult::Clean))
                     } else {
-                        Err((MvccError::InvalidState, FcwResult::Clean))
+                        Ok(write_pages)
                     }
                 }
-                None => Err((MvccError::InvalidState, FcwResult::Clean)),
             }
         };
+
+        if let Some(card) = abort_card {
+            self.ssi_evidence_ledger.record_async(card);
+        }
 
         match validate_result {
             Ok(write_pages) => Ok(Some((session_id, assign_seq, write_pages))),
@@ -2897,12 +3096,29 @@ impl Connection {
         if let Some(txn_id) = TxnId::new(session_id) {
             self.concurrent_lock_table.release_all(txn_id);
         }
-        {
+        let commit_card = {
             let mut registry = self.concurrent_registry.borrow_mut();
-            if let Some(handle) = registry.get_mut(session_id) {
+            registry.remove(session_id).map(|mut handle| {
+                let snapshot = Self::capture_ssi_snapshot(&handle);
+                let active_conflicts =
+                    Self::collect_active_conflict_evidence(&registry, session_id, &snapshot);
                 handle.mark_committed();
-            }
-            registry.remove(session_id);
+                Self::build_ssi_decision_draft(
+                    &snapshot,
+                    SsiDecisionType::CommitAllowed,
+                    active_conflicts.conflicting_txns,
+                    Self::merge_conflict_pages(
+                        Vec::new(),
+                        active_conflicts.conflict_pages,
+                        &snapshot.write_pages,
+                    ),
+                    format!("commit_allowed_commit_seq={}", committed_seq.get()),
+                )
+                .with_commit_seq(committed_seq)
+            })
+        };
+        if let Some(card) = commit_card {
+            self.ssi_evidence_ledger.record_async(card);
         }
         *self.next_commit_seq.borrow_mut() = committed_seq.get() + 1;
         *self.concurrent_session_id.borrow_mut() = None;
@@ -3399,6 +3615,124 @@ impl Connection {
                     values: vec![SqliteValue::Text("ok".into())],
                 }])
             }
+            // ── SSI decision evidence ledger PRAGMAs (bd-1lsfu.3) ─────────
+            "fsqlite.ssi_decisions" | "ssi_decisions" => {
+                let query = if let Some(value) = pragma.value.as_ref() {
+                    parse_ssi_decision_query(value)?
+                } else {
+                    SsiDecisionQuery::default()
+                };
+                let cards = self.ssi_evidence_ledger.query(&query);
+                Ok(ssi_decision_cards_to_rows(&cards))
+            }
+            // ── RaptorQ repair observability PRAGMAs (bd-t6sv2.3) ──────────
+            "fsqlite.raptorq_stats" | "raptorq_stats" | "fsqlite_raptorq_stats" => {
+                let to_i64 = |value: u64| i64::try_from(value).unwrap_or(i64::MAX);
+                let snapshot = raptorq_repair_metrics_snapshot();
+                Ok(vec![
+                    Row {
+                        values: vec![
+                            SqliteValue::Text("repairs_total".into()),
+                            SqliteValue::Integer(to_i64(snapshot.repairs_total)),
+                        ],
+                    },
+                    Row {
+                        values: vec![
+                            SqliteValue::Text("repairs_failed".into()),
+                            SqliteValue::Integer(to_i64(snapshot.repairs_failed)),
+                        ],
+                    },
+                    Row {
+                        values: vec![
+                            SqliteValue::Text("symbols_reclaimed".into()),
+                            SqliteValue::Integer(to_i64(snapshot.symbols_reclaimed)),
+                        ],
+                    },
+                    Row {
+                        values: vec![
+                            SqliteValue::Text("budget_utilization_pct".into()),
+                            SqliteValue::Integer(i64::from(snapshot.budget_utilization_pct)),
+                        ],
+                    },
+                    Row {
+                        values: vec![
+                            SqliteValue::Text("severity_1".into()),
+                            SqliteValue::Integer(to_i64(snapshot.severity_histogram.one)),
+                        ],
+                    },
+                    Row {
+                        values: vec![
+                            SqliteValue::Text("severity_2_5".into()),
+                            SqliteValue::Integer(to_i64(snapshot.severity_histogram.two_to_five)),
+                        ],
+                    },
+                    Row {
+                        values: vec![
+                            SqliteValue::Text("severity_6_10".into()),
+                            SqliteValue::Integer(to_i64(snapshot.severity_histogram.six_to_ten)),
+                        ],
+                    },
+                    Row {
+                        values: vec![
+                            SqliteValue::Text("severity_11_plus".into()),
+                            SqliteValue::Integer(to_i64(snapshot.severity_histogram.eleven_plus)),
+                        ],
+                    },
+                    Row {
+                        values: vec![
+                            SqliteValue::Text("wal_health_score".into()),
+                            SqliteValue::Integer(i64::from(snapshot.wal_health_score)),
+                        ],
+                    },
+                ])
+            }
+            "fsqlite.raptorq_events" | "raptorq_events" | "fsqlite_raptorq_events" => {
+                let limit = if let Some(ref value) = pragma.value {
+                    parse_pragma_nonnegative_usize(value, "raptorq_events limit")?
+                } else {
+                    64
+                };
+                let events = raptorq_repair_events_snapshot(limit);
+                let rows = events
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, event)| Row {
+                        values: vec![
+                            SqliteValue::Integer(i64::try_from(index).unwrap_or(i64::MAX)),
+                            SqliteValue::Integer(i64::from(event.frame_id)),
+                            SqliteValue::Integer(i64::from(event.symbols_lost)),
+                            SqliteValue::Integer(i64::from(event.symbols_used)),
+                            SqliteValue::Integer(i64::from(event.repair_success)),
+                            SqliteValue::Integer(
+                                i64::try_from(event.latency_ns).unwrap_or(i64::MAX),
+                            ),
+                            SqliteValue::Integer(i64::from(event.budget_utilization_pct)),
+                            SqliteValue::Text(event.severity_bucket.as_str().to_owned()),
+                        ],
+                    })
+                    .collect::<Vec<_>>();
+                Ok(rows)
+            }
+            "fsqlite.raptorq_repair_evidence"
+            | "raptorq_repair_evidence"
+            | "fsqlite_raptorq_repair_evidence" => {
+                let query = if let Some(value) = pragma.value.as_ref() {
+                    parse_raptorq_repair_evidence_query(value)?
+                } else {
+                    WalFecRepairEvidenceQuery {
+                        limit: Some(256),
+                        ..WalFecRepairEvidenceQuery::default()
+                    }
+                };
+                let cards = query_raptorq_repair_evidence(&query);
+                Ok(raptorq_repair_evidence_cards_to_rows(&cards))
+            }
+            "fsqlite.raptorq_reset" | "raptorq_reset" | "fsqlite_raptorq_reset" => {
+                reset_raptorq_repair_telemetry();
+                Ok(vec![Row {
+                    values: vec![SqliteValue::Text("ok".into())],
+                }])
+            }
             "wal_checkpoint" => {
                 // Parse checkpoint mode from the value (PASSIVE, FULL, RESTART, TRUNCATE).
                 // Default is PASSIVE if no value provided.
@@ -3515,6 +3849,33 @@ impl Connection {
     #[must_use]
     pub fn concurrent_writer_count(&self) -> usize {
         self.concurrent_registry.borrow().active_count()
+    }
+
+    /// Returns a snapshot of retained SSI decision cards.
+    #[must_use]
+    pub fn ssi_decisions_snapshot(&self) -> Vec<SsiDecisionCard> {
+        self.ssi_evidence_ledger.snapshot()
+    }
+
+    /// Query SSI decision cards by transaction id, decision type, and/or time range.
+    #[must_use]
+    pub fn query_ssi_decisions(&self, query: &SsiDecisionQuery) -> Vec<SsiDecisionCard> {
+        self.ssi_evidence_ledger.query(query)
+    }
+
+    /// Returns a snapshot of retained RaptorQ repair evidence cards.
+    #[must_use]
+    pub fn raptorq_repair_evidence_snapshot(&self) -> Vec<WalFecRepairEvidenceCard> {
+        raptorq_repair_evidence_snapshot(0)
+    }
+
+    /// Query RaptorQ repair evidence cards by page/frame, severity bucket, and/or time range.
+    #[must_use]
+    pub fn query_raptorq_repair_evidence_cards(
+        &self,
+        query: &WalFecRepairEvidenceQuery,
+    ) -> Vec<WalFecRepairEvidenceCard> {
+        query_raptorq_repair_evidence(query)
     }
 
     /// Returns a reference to the connection-scoped PRAGMA state.
@@ -6649,6 +7010,328 @@ fn quote_qualified_name(name: &fsqlite_ast::QualifiedName) -> String {
     }
 }
 
+fn to_i64_clamped(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+fn join_page_numbers(pages: &[PageNumber]) -> String {
+    pages
+        .iter()
+        .map(|page| page.get().to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn join_txn_tokens(tokens: &[TxnToken]) -> String {
+    tokens
+        .iter()
+        .map(|token| format!("{}:{}", token.id.get(), token.epoch.get()))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn read_set_top_k_string(summary: &SsiReadSetSummary) -> String {
+    summary
+        .top_k_pages
+        .iter()
+        .map(|page| page.get().to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn ssi_decision_cards_to_rows(cards: &[SsiDecisionCard]) -> Vec<Row> {
+    cards
+        .iter()
+        .map(|card| Row {
+            values: vec![
+                SqliteValue::Integer(to_i64_clamped(card.txn.id.get())),
+                SqliteValue::Integer(i64::from(card.txn.epoch.get())),
+                SqliteValue::Integer(to_i64_clamped(card.snapshot_seq.get())),
+                SqliteValue::Integer(to_i64_clamped(card.commit_seq.map_or(0, CommitSeq::get))),
+                SqliteValue::Text(card.decision_type.as_str().to_owned()),
+                SqliteValue::Text(join_txn_tokens(&card.conflicting_txns)),
+                SqliteValue::Text(join_page_numbers(&card.conflict_pages)),
+                SqliteValue::Integer(
+                    i64::try_from(card.read_set_summary.page_count).unwrap_or(i64::MAX),
+                ),
+                SqliteValue::Text(read_set_top_k_string(&card.read_set_summary)),
+                SqliteValue::Integer(to_i64_clamped(card.read_set_summary.bloom_fingerprint)),
+                SqliteValue::Text(join_page_numbers(&card.write_set)),
+                SqliteValue::Text(card.rationale.clone()),
+                SqliteValue::Integer(to_i64_clamped(card.timestamp_unix_ns)),
+                SqliteValue::Integer(to_i64_clamped(card.decision_epoch)),
+                SqliteValue::Text(card.chain_hash_hex()),
+            ],
+        })
+        .collect()
+}
+
+fn hex_encode_blake3(bytes: [u8; 32]) -> String {
+    use std::fmt::Write as _;
+
+    let mut encoded = String::with_capacity(64);
+    for byte in bytes {
+        let _ = write!(&mut encoded, "{byte:02x}");
+    }
+    encoded
+}
+
+fn raptorq_repair_evidence_cards_to_rows(cards: &[WalFecRepairEvidenceCard]) -> Vec<Row> {
+    cards
+        .iter()
+        .map(|card| Row {
+            values: vec![
+                SqliteValue::Integer(i64::from(card.frame_id)),
+                card.wal_file_offset_bytes
+                    .map_or(SqliteValue::Null, |offset| {
+                        SqliteValue::Integer(to_i64_clamped(offset))
+                    }),
+                SqliteValue::Integer(to_i64_clamped(card.monotonic_timestamp_ns)),
+                SqliteValue::Integer(to_i64_clamped(card.wall_clock_unix_ns)),
+                SqliteValue::Text(card.corruption_signature_hex()),
+                card.bit_error_pattern
+                    .as_ref()
+                    .map_or(SqliteValue::Null, |pattern| {
+                        SqliteValue::Text(pattern.clone())
+                    }),
+                SqliteValue::Text(card.repair_source.as_str().to_owned()),
+                SqliteValue::Integer(i64::from(card.symbols_used)),
+                SqliteValue::Integer(i64::from(card.validated_source_symbols)),
+                SqliteValue::Integer(i64::from(card.validated_repair_symbols)),
+                SqliteValue::Integer(i64::from(card.required_symbols)),
+                SqliteValue::Integer(i64::from(card.available_symbols)),
+                SqliteValue::Text(hex_encode_blake3(card.witness.corrupted_hash_blake3)),
+                SqliteValue::Text(hex_encode_blake3(card.witness.repaired_hash_blake3)),
+                SqliteValue::Text(hex_encode_blake3(card.witness.expected_hash_blake3)),
+                SqliteValue::Integer(to_i64_clamped(card.repair_latency_ns)),
+                SqliteValue::Integer(i64::from(card.confidence_per_mille)),
+                SqliteValue::Text(card.severity_bucket.as_str().to_owned()),
+                SqliteValue::Integer(to_i64_clamped(card.ledger_epoch)),
+                SqliteValue::Text(card.chain_hash_hex()),
+            ],
+        })
+        .collect()
+}
+
+fn parse_u64_component(raw: &str, label: &str) -> Result<u64> {
+    raw.trim().parse::<u64>().map_err(|_| {
+        FrankenError::Internal(format!(
+            "PRAGMA ssi_decisions {label} must be an unsigned integer, got `{raw}`"
+        ))
+    })
+}
+
+fn parse_ssi_decision_query_spec(spec: &str) -> Result<SsiDecisionQuery> {
+    let trimmed = spec.trim();
+    if trimmed.is_empty() {
+        return Ok(SsiDecisionQuery::default());
+    }
+
+    if trimmed.chars().all(|ch| ch.is_ascii_digit()) {
+        return Ok(SsiDecisionQuery {
+            txn_id: Some(parse_u64_component(trimmed, "txn")?),
+            ..SsiDecisionQuery::default()
+        });
+    }
+
+    let mut query = SsiDecisionQuery::default();
+    for term in trimmed.split(',') {
+        let term = term.trim();
+        if term.is_empty() {
+            continue;
+        }
+
+        if let Some(raw) = term.strip_prefix("txn:") {
+            query.txn_id = Some(parse_u64_component(raw, "txn")?);
+            continue;
+        }
+        if let Some(raw) = term.strip_prefix("type:") {
+            let decision_type = SsiDecisionType::from_str(raw).map_err(|_| {
+                FrankenError::Internal(format!(
+                    "PRAGMA ssi_decisions type must be one of COMMIT_ALLOWED/ABORT_WRITE_SKEW/ABORT_PHANTOM/ABORT_CYCLE, got `{raw}`"
+                ))
+            })?;
+            query.decision_type = Some(decision_type);
+            continue;
+        }
+        if let Some(raw) = term.strip_prefix("time:") {
+            let (start_raw, end_raw) = raw.split_once('-').ok_or_else(|| {
+                FrankenError::Internal(
+                    "PRAGMA ssi_decisions time filter must be `time:<start>-<end>`".to_owned(),
+                )
+            })?;
+            query.timestamp_start_ns = if start_raw.trim().is_empty() {
+                None
+            } else {
+                Some(parse_u64_component(start_raw, "time start")?)
+            };
+            query.timestamp_end_ns = if end_raw.trim().is_empty() {
+                None
+            } else {
+                Some(parse_u64_component(end_raw, "time end")?)
+            };
+            continue;
+        }
+
+        if query.decision_type.is_none() {
+            if let Ok(decision_type) = SsiDecisionType::from_str(term) {
+                query.decision_type = Some(decision_type);
+                continue;
+            }
+        }
+
+        return Err(FrankenError::Internal(format!(
+            "PRAGMA ssi_decisions filter term `{term}` is invalid; use txn:<id>, type:<decision>, or time:<start>-<end>"
+        )));
+    }
+
+    Ok(query)
+}
+
+fn parse_ssi_decision_query(value: &fsqlite_ast::PragmaValue) -> Result<SsiDecisionQuery> {
+    let expr = match value {
+        fsqlite_ast::PragmaValue::Assign(e) | fsqlite_ast::PragmaValue::Call(e) => e,
+    };
+    match expr {
+        Expr::Literal(Literal::Integer(n), _) => {
+            if *n < 0 {
+                return Err(FrankenError::Internal(
+                    "PRAGMA ssi_decisions txn id must be >= 0".to_owned(),
+                ));
+            }
+            Ok(SsiDecisionQuery {
+                txn_id: Some(u64::try_from(*n).unwrap_or(u64::MAX)),
+                ..SsiDecisionQuery::default()
+            })
+        }
+        Expr::Literal(Literal::String(s), _) => parse_ssi_decision_query_spec(s),
+        Expr::Column(col_ref, _) if col_ref.table.is_none() => {
+            parse_ssi_decision_query_spec(&col_ref.column)
+        }
+        _ => Err(FrankenError::Internal(
+            "PRAGMA ssi_decisions value must be an integer txn id or string filter".to_owned(),
+        )),
+    }
+}
+
+fn parse_raptorq_u64_component(raw: &str, label: &str) -> Result<u64> {
+    raw.trim().parse::<u64>().map_err(|_| {
+        FrankenError::Internal(format!(
+            "PRAGMA raptorq_repair_evidence {label} must be an unsigned integer, got `{raw}`"
+        ))
+    })
+}
+
+fn parse_raptorq_repair_evidence_query_spec(spec: &str) -> Result<WalFecRepairEvidenceQuery> {
+    let trimmed = spec.trim();
+    if trimmed.is_empty() {
+        return Ok(WalFecRepairEvidenceQuery::default());
+    }
+
+    if trimmed.chars().all(|ch| ch.is_ascii_digit()) {
+        let frame_id = parse_raptorq_u64_component(trimmed, "frame")?;
+        return Ok(WalFecRepairEvidenceQuery {
+            frame_id: Some(u32::try_from(frame_id).unwrap_or(u32::MAX)),
+            ..WalFecRepairEvidenceQuery::default()
+        });
+    }
+
+    let mut query = WalFecRepairEvidenceQuery::default();
+    for term in trimmed.split(',') {
+        let term = term.trim();
+        if term.is_empty() {
+            continue;
+        }
+
+        if let Some(raw) = term
+            .strip_prefix("frame:")
+            .or_else(|| term.strip_prefix("page:"))
+        {
+            let frame_id = parse_raptorq_u64_component(raw, "frame")?;
+            query.frame_id = Some(u32::try_from(frame_id).unwrap_or(u32::MAX));
+            continue;
+        }
+
+        if let Some(raw) = term.strip_prefix("severity:") {
+            let bucket = WalFecRepairSeverityBucket::from_str(raw).map_err(|_| {
+                FrankenError::Internal(format!(
+                    "PRAGMA raptorq_repair_evidence severity must be one of 1|2-5|6-10|11+, got `{raw}`"
+                ))
+            })?;
+            query.severity_bucket = Some(bucket);
+            continue;
+        }
+
+        if let Some(raw) = term.strip_prefix("time:") {
+            let (start_raw, end_raw) = raw.split_once('-').ok_or_else(|| {
+                FrankenError::Internal(
+                    "PRAGMA raptorq_repair_evidence time filter must be `time:<start>-<end>`"
+                        .to_owned(),
+                )
+            })?;
+            query.wall_clock_start_ns = if start_raw.trim().is_empty() {
+                None
+            } else {
+                Some(parse_raptorq_u64_component(start_raw, "time start")?)
+            };
+            query.wall_clock_end_ns = if end_raw.trim().is_empty() {
+                None
+            } else {
+                Some(parse_raptorq_u64_component(end_raw, "time end")?)
+            };
+            continue;
+        }
+
+        if let Some(raw) = term.strip_prefix("limit:") {
+            let limit = parse_raptorq_u64_component(raw, "limit")?;
+            query.limit = Some(usize::try_from(limit).unwrap_or(usize::MAX));
+            continue;
+        }
+
+        if query.severity_bucket.is_none() {
+            if let Ok(bucket) = WalFecRepairSeverityBucket::from_str(term) {
+                query.severity_bucket = Some(bucket);
+                continue;
+            }
+        }
+
+        return Err(FrankenError::Internal(format!(
+            "PRAGMA raptorq_repair_evidence filter term `{term}` is invalid; use frame:<id>, severity:<bucket>, time:<start>-<end>, or limit:<n>"
+        )));
+    }
+
+    Ok(query)
+}
+
+fn parse_raptorq_repair_evidence_query(
+    value: &fsqlite_ast::PragmaValue,
+) -> Result<WalFecRepairEvidenceQuery> {
+    let expr = match value {
+        fsqlite_ast::PragmaValue::Assign(e) | fsqlite_ast::PragmaValue::Call(e) => e,
+    };
+    match expr {
+        Expr::Literal(Literal::Integer(n), _) => {
+            if *n < 0 {
+                return Err(FrankenError::Internal(
+                    "PRAGMA raptorq_repair_evidence frame id must be >= 0".to_owned(),
+                ));
+            }
+            Ok(WalFecRepairEvidenceQuery {
+                frame_id: Some(u32::try_from(*n).unwrap_or(u32::MAX)),
+                ..WalFecRepairEvidenceQuery::default()
+            })
+        }
+        Expr::Literal(Literal::String(s), _) => parse_raptorq_repair_evidence_query_spec(s),
+        Expr::Column(col_ref, _) if col_ref.table.is_none() => {
+            parse_raptorq_repair_evidence_query_spec(&col_ref.column)
+        }
+        _ => Err(FrankenError::Internal(
+            "PRAGMA raptorq_repair_evidence value must be an integer frame id or string filter"
+                .to_owned(),
+        )),
+    }
+}
+
 /// Parse a PRAGMA value as a boolean.
 ///
 /// Accepts `on`, `off`, `true`, `false`, `1`, `0`, `yes`, `no`
@@ -6684,6 +7367,53 @@ fn parse_pragma_bool(value: &fsqlite_ast::PragmaValue) -> Result<bool> {
             "PRAGMA boolean value must be ON/OFF/TRUE/FALSE/1/0, got `{text}`"
         ))),
     }
+}
+
+/// Parse a PRAGMA value as a non-negative integer (`usize`).
+fn parse_pragma_nonnegative_usize(value: &fsqlite_ast::PragmaValue, what: &str) -> Result<usize> {
+    let expr = match value {
+        fsqlite_ast::PragmaValue::Assign(e) | fsqlite_ast::PragmaValue::Call(e) => e,
+    };
+    let raw = match expr {
+        Expr::Literal(Literal::Integer(n), _) => *n,
+        Expr::UnaryOp {
+            op: UnaryOp::Negate,
+            expr,
+            ..
+        } => match expr.as_ref() {
+            Expr::Literal(Literal::Integer(n), _) => n.saturating_neg(),
+            _ => {
+                return Err(FrankenError::Internal(format!(
+                    "PRAGMA {what} must be a non-negative integer"
+                )));
+            }
+        },
+        Expr::Column(col_ref, _) if col_ref.table.is_none() => {
+            col_ref.column.parse::<i64>().map_err(|_| {
+                FrankenError::Internal(format!(
+                    "PRAGMA {what} must be a non-negative integer, got `{}`",
+                    col_ref.column
+                ))
+            })?
+        }
+        _ => {
+            return Err(FrankenError::Internal(format!(
+                "PRAGMA {what} must be a non-negative integer"
+            )));
+        }
+    };
+
+    if raw < 0 {
+        return Err(FrankenError::Internal(format!(
+            "PRAGMA {what} must be >= 0, got {raw}"
+        )));
+    }
+
+    usize::try_from(raw).map_err(|_| {
+        FrankenError::Internal(format!(
+            "PRAGMA {what} value is too large for this platform: {raw}"
+        ))
+    })
 }
 
 /// Parse a PRAGMA value as a checkpoint mode.
@@ -13413,6 +14143,357 @@ mod tests {
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Integer(7));
+    }
+
+    #[test]
+    fn test_pragma_raptorq_stats_events_and_reset() {
+        let conn = Connection::open(":memory:").unwrap();
+        fsqlite_wal::reset_raptorq_repair_telemetry();
+
+        let group_a = fsqlite_wal::WalFecGroupId {
+            wal_salt1: 0x1111_2222,
+            wal_salt2: 0x3333_4444,
+            end_frame_no: 7,
+        };
+        let group_b = fsqlite_wal::WalFecGroupId {
+            wal_salt1: 0x5555_6666,
+            wal_salt2: 0x7777_8888,
+            end_frame_no: 8,
+        };
+
+        let success_log = fsqlite_wal::WalFecRecoveryLog {
+            group_id: group_a,
+            recovery_enabled: true,
+            outcome_is_recovered: true,
+            fallback_reason: None,
+            validated_source_symbols: 4,
+            validated_repair_symbols: 2,
+            required_symbols: 6,
+            available_symbols: 6,
+            recovered_frame_nos: vec![6, 7],
+            corruption_observations: 0,
+            decode_attempted: true,
+            decode_succeeded: true,
+        };
+        let failed_log = fsqlite_wal::WalFecRecoveryLog {
+            group_id: group_b,
+            recovery_enabled: true,
+            outcome_is_recovered: false,
+            fallback_reason: Some(fsqlite_wal::WalFecRecoveryFallbackReason::InsufficientSymbols),
+            validated_source_symbols: 2,
+            validated_repair_symbols: 2,
+            required_symbols: 6,
+            available_symbols: 4,
+            recovered_frame_nos: Vec::new(),
+            corruption_observations: 1,
+            decode_attempted: true,
+            decode_succeeded: false,
+        };
+
+        fsqlite_wal::record_raptorq_recovery_log(
+            &success_log,
+            std::time::Duration::from_micros(40),
+        );
+        fsqlite_wal::record_raptorq_recovery_log(&failed_log, std::time::Duration::from_micros(80));
+
+        let stats_rows = conn.query("PRAGMA fsqlite_raptorq_stats;").unwrap();
+        let mut stats = std::collections::HashMap::new();
+        for row in stats_rows {
+            let key = match row.get(0).unwrap() {
+                SqliteValue::Text(s) => s.clone(),
+                other => panic!("expected stats key text, got {other:?}"),
+            };
+            let value = match row.get(1).unwrap() {
+                SqliteValue::Integer(n) => *n,
+                other => panic!("expected stats value integer, got {other:?}"),
+            };
+            let _ = stats.insert(key, value);
+        }
+        assert_eq!(stats.get("repairs_total"), Some(&2));
+        assert_eq!(stats.get("repairs_failed"), Some(&1));
+        assert_eq!(stats.get("symbols_reclaimed"), Some(&2));
+        assert_eq!(stats.get("severity_2_5"), Some(&2));
+        assert!(stats.get("wal_health_score").copied().unwrap_or_default() < 100);
+
+        let event_rows = conn.query("PRAGMA raptorq_events;").unwrap();
+        assert_eq!(event_rows.len(), 2);
+        let success_flags: Vec<i64> = event_rows
+            .iter()
+            .map(|row| match row.get(4).unwrap() {
+                SqliteValue::Integer(n) => *n,
+                other => panic!("expected event success flag integer, got {other:?}"),
+            })
+            .collect();
+        assert!(success_flags.contains(&0));
+        assert!(success_flags.contains(&1));
+
+        let limited_rows = conn.query("PRAGMA raptorq_events(1);").unwrap();
+        assert_eq!(limited_rows.len(), 1);
+
+        let reset_rows = conn.query("PRAGMA raptorq_reset;").unwrap();
+        assert_eq!(reset_rows.len(), 1);
+        assert_eq!(
+            *reset_rows[0].get(0).unwrap(),
+            SqliteValue::Text("ok".to_owned())
+        );
+
+        let stats_after_reset = conn.query("PRAGMA raptorq_stats;").unwrap();
+        let mut repairs_total = None;
+        for row in stats_after_reset {
+            if let SqliteValue::Text(key) = row.get(0).unwrap() {
+                if key == "repairs_total" {
+                    repairs_total = match row.get(1).unwrap() {
+                        SqliteValue::Integer(n) => Some(*n),
+                        _ => None,
+                    };
+                }
+            }
+        }
+        assert_eq!(repairs_total, Some(0));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn test_pragma_raptorq_repair_evidence_filters() {
+        let conn = Connection::open(":memory:").unwrap();
+        fsqlite_wal::reset_raptorq_repair_telemetry();
+
+        let group_a = fsqlite_wal::WalFecGroupId {
+            wal_salt1: 0x9090_1111,
+            wal_salt2: 0x9090_2222,
+            end_frame_no: 41,
+        };
+        let group_b = fsqlite_wal::WalFecGroupId {
+            wal_salt1: 0x9090_3333,
+            wal_salt2: 0x9090_4444,
+            end_frame_no: 42,
+        };
+
+        let low_loss_log = fsqlite_wal::WalFecRecoveryLog {
+            group_id: group_a,
+            recovery_enabled: true,
+            outcome_is_recovered: true,
+            fallback_reason: None,
+            validated_source_symbols: 5,
+            validated_repair_symbols: 1,
+            required_symbols: 6,
+            available_symbols: 6,
+            recovered_frame_nos: vec![41],
+            corruption_observations: 1,
+            decode_attempted: true,
+            decode_succeeded: true,
+        };
+        let high_loss_log = fsqlite_wal::WalFecRecoveryLog {
+            group_id: group_b,
+            recovery_enabled: true,
+            outcome_is_recovered: true,
+            fallback_reason: None,
+            validated_source_symbols: 0,
+            validated_repair_symbols: 6,
+            required_symbols: 6,
+            available_symbols: 6,
+            recovered_frame_nos: vec![42],
+            corruption_observations: 3,
+            decode_attempted: true,
+            decode_succeeded: true,
+        };
+
+        fsqlite_wal::record_raptorq_recovery_log(
+            &low_loss_log,
+            std::time::Duration::from_micros(35),
+        );
+        fsqlite_wal::record_raptorq_recovery_log(
+            &high_loss_log,
+            std::time::Duration::from_micros(90),
+        );
+
+        let all_rows = conn.query("PRAGMA raptorq_repair_evidence;").unwrap();
+        assert_eq!(all_rows.len(), 2);
+        assert!(
+            all_rows.iter().all(
+                |row| matches!(row.get(19), Some(SqliteValue::Text(hash)) if !hash.is_empty())
+            ),
+            "every evidence row should include a chain hash in column 19"
+        );
+
+        let page_rows = conn
+            .query("PRAGMA raptorq_repair_evidence='page:41';")
+            .unwrap();
+        assert_eq!(page_rows.len(), 1);
+        assert!(matches!(
+            page_rows[0].get(0),
+            Some(SqliteValue::Integer(frame)) if *frame == 41
+        ));
+
+        let severity_rows = conn
+            .query("PRAGMA raptorq_repair_evidence='severity:6-10';")
+            .unwrap();
+        assert_eq!(severity_rows.len(), 1);
+        assert!(matches!(
+            severity_rows[0].get(17),
+            Some(SqliteValue::Text(bucket)) if bucket == "6-10"
+        ));
+
+        let min_ts = all_rows
+            .iter()
+            .filter_map(|row| match row.get(3) {
+                Some(SqliteValue::Integer(ts)) => Some(*ts),
+                _ => None,
+            })
+            .min()
+            .expect("wall clock timestamp column should be present");
+        let max_ts = all_rows
+            .iter()
+            .filter_map(|row| match row.get(3) {
+                Some(SqliteValue::Integer(ts)) => Some(*ts),
+                _ => None,
+            })
+            .max()
+            .expect("wall clock timestamp column should be present");
+        let time_rows = conn
+            .query(&format!(
+                "PRAGMA raptorq_repair_evidence='time:{min_ts}-{max_ts}';"
+            ))
+            .unwrap();
+        assert_eq!(time_rows.len(), 2);
+
+        let limit_rows = conn
+            .query("PRAGMA raptorq_repair_evidence='limit:1';")
+            .unwrap();
+        assert_eq!(limit_rows.len(), 1);
+        assert!(matches!(
+            limit_rows[0].get(0),
+            Some(SqliteValue::Integer(frame)) if *frame == 42
+        ));
+    }
+
+    #[test]
+    fn test_pragma_ssi_decisions_exposes_commit_and_abort_cards() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE ssi_cards(id INTEGER PRIMARY KEY, v INTEGER);")
+            .unwrap();
+
+        conn.execute("BEGIN CONCURRENT;").unwrap();
+        conn.execute("INSERT INTO ssi_cards VALUES (1, 10);")
+            .unwrap();
+        conn.execute("COMMIT;").unwrap();
+
+        conn.execute("BEGIN CONCURRENT;").unwrap();
+        conn.execute("INSERT INTO ssi_cards VALUES (2, 20);")
+            .unwrap();
+        let session_id = conn
+            .concurrent_session_id
+            .borrow()
+            .expect("concurrent session should exist");
+        {
+            let mut registry = conn.concurrent_registry.borrow_mut();
+            let handle = registry
+                .get_mut(session_id)
+                .expect("session handle should exist");
+            fsqlite_mvcc::ActiveTxnView::set_has_in_rw(handle, true);
+            fsqlite_mvcc::ActiveTxnView::set_has_out_rw(handle, true);
+        }
+        let err = conn.execute("COMMIT;").expect_err("SSI pivot must abort");
+        assert!(
+            matches!(err, FrankenError::BusySnapshot { .. }),
+            "expected BusySnapshot, got {err:?}"
+        );
+
+        let rows = conn.query("PRAGMA ssi_decisions;").unwrap();
+        assert!(rows.len() >= 2, "expected commit+abort cards in ledger");
+
+        let mut decision_types = rows
+            .iter()
+            .filter_map(|row| match row.get(4) {
+                Some(SqliteValue::Text(text)) => Some(text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        decision_types.sort();
+        assert!(
+            decision_types.contains(&"COMMIT_ALLOWED".to_owned()),
+            "commit decision card missing"
+        );
+        assert!(
+            decision_types.contains(&"ABORT_WRITE_SKEW".to_owned()),
+            "write-skew abort decision card missing"
+        );
+    }
+
+    #[test]
+    fn test_pragma_ssi_decisions_filters_txn_type_and_time() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE ssi_filter(id INTEGER PRIMARY KEY, v INTEGER);")
+            .unwrap();
+
+        conn.execute("BEGIN CONCURRENT;").unwrap();
+        conn.execute("INSERT INTO ssi_filter VALUES (1, 1);")
+            .unwrap();
+        conn.execute("COMMIT;").unwrap();
+
+        conn.execute("BEGIN CONCURRENT;").unwrap();
+        conn.execute("INSERT INTO ssi_filter VALUES (2, 2);")
+            .unwrap();
+        let session_id = conn
+            .concurrent_session_id
+            .borrow()
+            .expect("concurrent session should exist");
+        {
+            let mut registry = conn.concurrent_registry.borrow_mut();
+            let handle = registry
+                .get_mut(session_id)
+                .expect("session handle should exist");
+            fsqlite_mvcc::ActiveTxnView::set_has_in_rw(handle, true);
+            fsqlite_mvcc::ActiveTxnView::set_has_out_rw(handle, true);
+        }
+        let _ = conn.execute("COMMIT;");
+
+        let all_rows = conn.query("PRAGMA ssi_decisions;").unwrap();
+        let first_txn_id = match all_rows.first().and_then(|row| row.get(0)) {
+            Some(SqliteValue::Integer(n)) => *n,
+            other => panic!("expected integer txn_id in column 0, got {other:?}"),
+        };
+        let min_ts = all_rows
+            .iter()
+            .filter_map(|row| match row.get(12) {
+                Some(SqliteValue::Integer(n)) => Some(*n),
+                _ => None,
+            })
+            .min()
+            .expect("expected timestamp column");
+        let max_ts = all_rows
+            .iter()
+            .filter_map(|row| match row.get(12) {
+                Some(SqliteValue::Integer(n)) => Some(*n),
+                _ => None,
+            })
+            .max()
+            .expect("expected timestamp column");
+
+        let txn_rows = conn
+            .query(&format!("PRAGMA ssi_decisions='txn:{first_txn_id}';"))
+            .unwrap();
+        assert!(
+            txn_rows.iter().all(
+                |row| matches!(row.get(0), Some(SqliteValue::Integer(n)) if *n == first_txn_id)
+            ),
+            "txn filter should return only requested txn"
+        );
+
+        let type_rows = conn
+            .query("PRAGMA ssi_decisions='type:ABORT_WRITE_SKEW';")
+            .unwrap();
+        assert!(
+            type_rows.iter().all(
+                |row| matches!(row.get(4), Some(SqliteValue::Text(t)) if t == "ABORT_WRITE_SKEW")
+            ),
+            "type filter should return only ABORT_WRITE_SKEW rows"
+        );
+
+        let time_rows = conn
+            .query(&format!("PRAGMA ssi_decisions='time:{min_ts}-{max_ts}';"))
+            .unwrap();
+        assert!(!time_rows.is_empty(), "time range filter should match rows");
     }
 
     // ── Connection PRAGMA state tests (bd-1w6k.2.3) ────────────────────

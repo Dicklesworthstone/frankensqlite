@@ -31,10 +31,14 @@
 
 use std::collections::BTreeMap;
 use std::f64::consts::PI;
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
 use crate::parity_taxonomy::{FeatureCategory, FeatureUniverse, truncate_score};
+use crate::verification_contract_enforcement::{
+    ContractEnforcementOutcome, enforce_gate_decision, evaluate_workspace_verification_contract,
+};
 
 /// Bead identifier for log correlation.
 #[allow(dead_code)]
@@ -379,7 +383,8 @@ pub struct ConformalBand {
 /// Machine-readable scorecard combining Bayesian estimation with conformal bounds.
 ///
 /// This is the primary output consumed by release-gating decisions. The
-/// `release_ready` field is `true` iff `global_lower_bound >= release_threshold`.
+/// `release_ready` field is `true` iff statistical gates pass and any configured
+/// verification-contract enforcement allows release.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BayesianScorecard {
     /// Bead ID for traceability.
@@ -406,6 +411,9 @@ pub struct BayesianScorecard {
     pub effective_features: usize,
     /// Total features in taxonomy (including excluded).
     pub total_features: usize,
+    /// Optional verification-contract enforcement payload (bd-1dp9.7.7).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification_contract: Option<ContractEnforcementOutcome>,
 }
 
 impl BayesianScorecard {
@@ -578,7 +586,26 @@ pub fn compute_bayesian_scorecard(
         release_threshold: config.release_threshold,
         effective_features: total_effective,
         total_features: universe.features.len(),
+        verification_contract: None,
     }
+}
+
+/// Compute a scorecard and enforce the parity verification contract for release.
+///
+/// # Errors
+///
+/// Returns `Err` if workspace parity evidence report generation fails.
+pub fn compute_bayesian_scorecard_with_contract(
+    workspace_root: &Path,
+    universe: &FeatureUniverse,
+    config: &ScoreEngineConfig,
+) -> Result<BayesianScorecard, String> {
+    let mut scorecard = compute_bayesian_scorecard(universe, config);
+    let contract_report = evaluate_workspace_verification_contract(workspace_root)?;
+    let enforcement = enforce_gate_decision(scorecard.release_ready, &contract_report);
+    scorecard.release_ready = enforcement.final_gate_passed;
+    scorecard.verification_contract = Some(enforcement);
+    Ok(scorecard)
 }
 
 /// Compute conformal half-width from calibration residuals.

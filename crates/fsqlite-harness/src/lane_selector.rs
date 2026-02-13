@@ -502,13 +502,10 @@ pub fn write_lane_audit_report(
 }
 
 /// Load a lane selection audit report from a file.
-pub fn load_lane_audit_report(
-    path: &std::path::Path,
-) -> Result<LaneSelectionAuditReport, String> {
-    let data = std::fs::read_to_string(path)
-        .map_err(|e| format!("read {}: {e}", path.display()))?;
-    LaneSelectionAuditReport::from_json(&data)
-        .map_err(|e| format!("parse {}: {e}", path.display()))
+pub fn load_lane_audit_report(path: &std::path::Path) -> Result<LaneSelectionAuditReport, String> {
+    let data =
+        std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    LaneSelectionAuditReport::from_json(&data).map_err(|e| format!("parse {}: {e}", path.display()))
 }
 
 /// Run the lane selection audit: evaluate multiple scenarios against the impact graph.

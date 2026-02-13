@@ -105,12 +105,15 @@ pub use index_regen::{
     eval_rebase_expr, regenerate_index_ops,
 };
 pub use invariants::{
-    SerializedWriteMutex, TxnManager, VersionStore, idx_to_version_pointer, visible,
+    SerializedWriteMutex, SnapshotResolveTrace, TxnManager, VersionStore, VersionVisibilityRange,
+    idx_to_version_pointer, visible,
 };
 pub use lifecycle::{BeginKind, CommitResponse, MvccError, Savepoint, TransactionManager};
 pub use observability::{
-    SharedObserver, emit_conflict_resolved, emit_fcw_base_drift, emit_page_lock_contention,
-    emit_ssi_abort,
+    SharedObserver, SnapshotReadMetricsSnapshot, VersionsTraversedHistogram,
+    emit_conflict_resolved, emit_fcw_base_drift, emit_page_lock_contention, emit_ssi_abort,
+    mvcc_snapshot_established, mvcc_snapshot_metrics_snapshot, mvcc_snapshot_released,
+    record_snapshot_read_versions_traversed, reset_mvcc_snapshot_metrics,
 };
 pub use physical_merge::{
     CellOp, CellOpKind, FreeSpaceOp, HeaderOp, MergeError, MergeLadderResult, ParsedCell,
@@ -139,7 +142,9 @@ pub use sheaf_conformal::{
 pub use shm::{SharedMemoryLayout, ShmSnapshot};
 pub use ssi_abort_policy::{
     AbortDecision, AbortDecisionEnvelope, ConformalCalibrator, ConformalConfig, CycleStatus,
-    LossMatrix, SsiFpMonitor, SsiFpMonitorConfig, TxnCost, Victim, VictimDecision, select_victim,
+    LossMatrix, SsiDecisionCard, SsiDecisionCardDraft, SsiDecisionQuery, SsiDecisionType,
+    SsiEvidenceLedger, SsiFpMonitor, SsiFpMonitorConfig, SsiReadSetSummary, TxnCost, Victim,
+    VictimDecision, select_victim,
 };
 pub use ssi_validation::{
     ActiveTxnView, CommittedReaderInfo, CommittedWriterInfo, DiscoveredEdge, SsiAbortReason,

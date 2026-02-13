@@ -4,6 +4,7 @@ pub mod balance;
 pub mod cell;
 pub mod cursor;
 pub mod freelist;
+pub mod instrumentation;
 pub mod overflow;
 pub mod payload;
 pub mod traits;
@@ -14,6 +15,10 @@ pub use cell::{
     write_cell_pointers,
 };
 pub use cursor::{BtCursor, MemPageStore, PageReader, PageWriter, TransactionPageIo};
+pub use instrumentation::{
+    BtreeMetricsSnapshot, BtreeOpType, BtreeOperationTotals, btree_metrics_snapshot,
+    reset_btree_metrics,
+};
 pub use traits::{BtreeCursorOps, MockBtreeCursor, SeekResult};
 
 /// Compare two B-tree keys stored as contiguous byte slices.

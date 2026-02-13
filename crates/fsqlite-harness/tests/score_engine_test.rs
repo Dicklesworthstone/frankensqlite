@@ -11,6 +11,7 @@
 //! - Score determinism across runs
 
 use std::collections::BTreeMap;
+use std::fs;
 
 use fsqlite_harness::parity_taxonomy::{
     ExclusionRationale, Feature, FeatureCategory, FeatureId, FeatureUniverse, ObservabilityMapping,
@@ -18,6 +19,7 @@ use fsqlite_harness::parity_taxonomy::{
 };
 use fsqlite_harness::score_engine::{
     BayesianScorecard, BetaParams, PriorConfig, ScoreEngineConfig, compute_bayesian_scorecard,
+    compute_bayesian_scorecard_with_contract,
 };
 
 const BEAD_ID: &str = "bd-1dp9.1.3";
@@ -288,6 +290,70 @@ fn release_gating_low_threshold_passes() {
         "[{BEAD_ID}] should be release-ready at 50% threshold, lower bound is {:.4}",
         scorecard.global_lower_bound
     );
+}
+
+#[test]
+fn release_gating_with_contract_blocks_when_evidence_missing() {
+    let temp_dir = tempfile::tempdir().expect("create temporary workspace");
+    let beads_dir = temp_dir.path().join(".beads");
+    fs::create_dir_all(&beads_dir).expect("create .beads directory");
+    fs::write(
+        beads_dir.join("issues.jsonl"),
+        r#"{"id":"bd-1dp9.7.7","issue_type":"task"}"#,
+    )
+    .expect("write issues.jsonl");
+
+    let universe = build_canonical_universe();
+    let config = ScoreEngineConfig {
+        release_threshold: 0.0,
+        ..Default::default()
+    };
+    let scorecard = compute_bayesian_scorecard_with_contract(temp_dir.path(), &universe, &config)
+        .expect("compute scorecard with contract");
+
+    let contract = scorecard
+        .verification_contract
+        .as_ref()
+        .expect("contract enforcement should be present");
+    assert!(
+        contract.base_gate_passed,
+        "[{BEAD_ID}] base statistical gate should pass at 0 threshold"
+    );
+    assert!(
+        !contract.contract_passed,
+        "[{BEAD_ID}] contract should fail with missing evidence"
+    );
+    assert!(
+        !scorecard.release_ready,
+        "[{BEAD_ID}] release_ready should be blocked by contract enforcement"
+    );
+}
+
+#[test]
+fn release_gating_with_contract_allows_when_no_required_parity_beads() {
+    let temp_dir = tempfile::tempdir().expect("create temporary workspace");
+    let beads_dir = temp_dir.path().join(".beads");
+    fs::create_dir_all(&beads_dir).expect("create .beads directory");
+    fs::write(
+        beads_dir.join("issues.jsonl"),
+        r#"{"id":"bd-nonparity.1","issue_type":"task"}"#,
+    )
+    .expect("write issues.jsonl");
+
+    let universe = build_canonical_universe();
+    let config = ScoreEngineConfig {
+        release_threshold: 0.0,
+        ..Default::default()
+    };
+    let scorecard = compute_bayesian_scorecard_with_contract(temp_dir.path(), &universe, &config)
+        .expect("compute scorecard with contract");
+
+    let contract = scorecard
+        .verification_contract
+        .as_ref()
+        .expect("contract enforcement should be present");
+    assert!(contract.contract_passed);
+    assert!(scorecard.release_ready);
 }
 
 // ---------------------------------------------------------------------------

@@ -26,6 +26,7 @@
 //! Ranking is deterministic (sorted by expected loss descending, then by invariant ID).
 
 use std::collections::BTreeMap;
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
@@ -34,6 +35,9 @@ use crate::parity_invariant_catalog::{
 };
 use crate::parity_taxonomy::{FeatureCategory, FeatureUniverse, truncate_score};
 use crate::score_engine::{BetaParams, PriorConfig};
+use crate::verification_contract_enforcement::{
+    ContractEnforcementOutcome, enforce_gate_decision, evaluate_workspace_verification_contract,
+};
 
 /// Bead identifier for log correlation.
 #[allow(dead_code)]
@@ -237,6 +241,9 @@ pub struct GateReport {
     pub passing_invariants: usize,
     /// Decision rationale text.
     pub rationale: String,
+    /// Optional verification-contract enforcement payload (bd-1dp9.7.7).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification_contract: Option<ContractEnforcementOutcome>,
 }
 
 impl GateReport {
@@ -455,7 +462,48 @@ pub fn evaluate_gate(catalog: &InvariantCatalog, config: &GateConfig) -> GateRep
         total_invariants,
         passing_invariants,
         rationale,
+        verification_contract: None,
     }
+}
+
+/// Apply verification-contract enforcement to an existing gate report.
+#[must_use]
+pub fn apply_contract_outcome_to_gate_report(
+    mut report: GateReport,
+    enforcement: ContractEnforcementOutcome,
+) -> GateReport {
+    report.release_ready = enforcement.final_gate_passed;
+    if !report.release_ready {
+        report.global_decision = GateDecision::Fail;
+    }
+    report.rationale = format!(
+        "{}\nVerification contract enforcement: disposition={} contract_passed={} base_gate_passed={} failing_beads={} missing_evidence_beads={} invalid_reference_beads={}",
+        report.rationale,
+        enforcement.disposition,
+        enforcement.contract_passed,
+        enforcement.base_gate_passed,
+        enforcement.failing_beads,
+        enforcement.missing_evidence_beads,
+        enforcement.invalid_reference_beads,
+    );
+    report.verification_contract = Some(enforcement);
+    report
+}
+
+/// Evaluate gate report and enforce verification contract from workspace evidence.
+///
+/// # Errors
+///
+/// Returns `Err` if the workspace parity evidence report cannot be generated.
+pub fn evaluate_gate_with_contract(
+    catalog: &InvariantCatalog,
+    config: &GateConfig,
+    workspace_root: &Path,
+) -> Result<GateReport, String> {
+    let report = evaluate_gate(catalog, config);
+    let contract_report = evaluate_workspace_verification_contract(workspace_root)?;
+    let enforcement = enforce_gate_decision(report.release_ready, &contract_report);
+    Ok(apply_contract_outcome_to_gate_report(report, enforcement))
 }
 
 /// Build human-readable decision rationale.
@@ -658,6 +706,9 @@ pub struct EvidenceLedger {
     pub top_priority_items: Vec<PriorityItem>,
     /// Per-category summaries.
     pub category_summaries: BTreeMap<String, CategorySummary>,
+    /// Optional verification-contract enforcement payload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification_contract: Option<ContractEnforcementOutcome>,
 }
 
 /// Summary of a high-priority item for the evidence ledger.
@@ -724,6 +775,7 @@ pub fn build_evidence_ledger(report: &GateReport, ranking: &ExpectedLossRanking)
         passing_invariants: report.passing_invariants,
         top_priority_items,
         category_summaries,
+        verification_contract: report.verification_contract.clone(),
     }
 }
 
@@ -733,12 +785,51 @@ pub fn build_evidence_ledger(report: &GateReport, ranking: &ExpectedLossRanking)
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
     use crate::parity_invariant_catalog::build_canonical_catalog;
     use crate::parity_taxonomy::build_canonical_universe;
+    use crate::verification_contract_enforcement::{
+        BeadContractVerdict, ContractBeadStatus, ContractEnforcementOutcome, EnforcementDisposition,
+    };
 
     fn default_config() -> GateConfig {
         GateConfig::default()
+    }
+
+    fn synthetic_contract_outcome(
+        base_gate_passed: bool,
+        contract_passed: bool,
+    ) -> ContractEnforcementOutcome {
+        ContractEnforcementOutcome {
+            schema_version: 1,
+            bead_id: "bd-1dp9.7.7".to_owned(),
+            base_gate_passed,
+            contract_passed,
+            final_gate_passed: base_gate_passed && contract_passed,
+            disposition: match (base_gate_passed, contract_passed) {
+                (true, true) => EnforcementDisposition::Allowed,
+                (false, true) => EnforcementDisposition::BlockedByBaseGate,
+                (true, false) => EnforcementDisposition::BlockedByContract,
+                (false, false) => EnforcementDisposition::BlockedByBoth,
+            },
+            total_beads: 1,
+            failing_beads: if contract_passed { 0 } else { 1 },
+            missing_evidence_beads: if contract_passed { 0 } else { 1 },
+            invalid_reference_beads: 0,
+            bead_verdicts: vec![BeadContractVerdict {
+                bead_id: "bd-1dp9.7.7".to_owned(),
+                status: if contract_passed {
+                    ContractBeadStatus::Pass
+                } else {
+                    ContractBeadStatus::FailMissingEvidence
+                },
+                missing_evidence_count: if contract_passed { 0 } else { 1 },
+                invalid_reference_count: 0,
+                details: Vec::new(),
+            }],
+        }
     }
 
     #[test]
@@ -846,6 +937,56 @@ mod tests {
         let deserialized = GateReport::from_json(&json).expect("deserialisation");
         assert_eq!(report.total_invariants, deserialized.total_invariants);
         assert_eq!(report.global_decision, deserialized.global_decision);
+    }
+
+    #[test]
+    fn apply_contract_outcome_can_block_release_ready() {
+        let catalog = build_canonical_catalog();
+        let config = default_config();
+        let mut report = evaluate_gate(&catalog, &config);
+        report.release_ready = true;
+        report.global_decision = GateDecision::Pass;
+
+        let enforced =
+            apply_contract_outcome_to_gate_report(report, synthetic_contract_outcome(true, false));
+        assert!(!enforced.release_ready);
+        assert_eq!(enforced.global_decision, GateDecision::Fail);
+        assert!(enforced.verification_contract.is_some());
+        assert!(
+            enforced
+                .rationale
+                .contains("Verification contract enforcement"),
+            "rationale should include contract enforcement summary"
+        );
+    }
+
+    #[test]
+    fn evaluate_gate_with_contract_attaches_enforcement_payload() {
+        let temp_dir = tempfile::tempdir().expect("create temporary workspace");
+        let beads_dir = temp_dir.path().join(".beads");
+        fs::create_dir_all(&beads_dir).expect("create .beads directory");
+        fs::write(
+            beads_dir.join("issues.jsonl"),
+            r#"{"id":"bd-1dp9.7.7","issue_type":"task"}"#,
+        )
+        .expect("write issues.jsonl");
+
+        let catalog = build_canonical_catalog();
+        let config = default_config();
+        let report = evaluate_gate_with_contract(&catalog, &config, temp_dir.path())
+            .expect("evaluate gate with contract");
+
+        let contract = report
+            .verification_contract
+            .as_ref()
+            .expect("contract payload should be present");
+        assert!(!contract.contract_passed);
+        assert!(
+            report
+                .rationale
+                .contains("Verification contract enforcement"),
+            "rationale should include enforcement details"
+        );
     }
 
     #[test]
@@ -997,6 +1138,29 @@ mod tests {
         assert!(
             ledger.top_priority_items.len() <= 10,
             "top priority items should be capped at 10"
+        );
+    }
+
+    #[test]
+    fn evidence_ledger_carries_contract_enforcement_payload() {
+        let catalog = build_canonical_catalog();
+        let universe = build_canonical_universe();
+        let config = default_config();
+        let (base_report, ranking) = evaluate_full(&catalog, &universe, &config);
+        let report = apply_contract_outcome_to_gate_report(
+            base_report,
+            synthetic_contract_outcome(true, false),
+        );
+        let ledger = build_evidence_ledger(&report, &ranking);
+
+        let contract = ledger
+            .verification_contract
+            .as_ref()
+            .expect("ledger should include contract payload");
+        assert!(!contract.contract_passed);
+        assert_eq!(
+            contract.disposition,
+            EnforcementDisposition::BlockedByContract
         );
     }
 

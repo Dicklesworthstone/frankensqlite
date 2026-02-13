@@ -1,0 +1,150 @@
+//! B-tree operation observability counters.
+//!
+//! This module exposes lightweight process-local counters used by the
+//! `btree_op` tracing lane and bead-level telemetry verification.
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Supported B-tree operation types for observability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BtreeOpType {
+    /// Cursor seek operation (`table_move_to` / `index_move_to`).
+    Seek,
+    /// Mutation insert operation.
+    Insert,
+    /// Mutation delete operation.
+    Delete,
+}
+
+impl BtreeOpType {
+    /// Stable label used in logs and metrics dimensions.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Seek => "seek",
+            Self::Insert => "insert",
+            Self::Delete => "delete",
+        }
+    }
+}
+
+/// Snapshot of per-operation totals for `fsqlite_btree_operations_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BtreeOperationTotals {
+    /// Number of seek operations.
+    pub seek: u64,
+    /// Number of insert operations.
+    pub insert: u64,
+    /// Number of delete operations.
+    pub delete: u64,
+}
+
+/// Snapshot of B-tree observability metrics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BtreeMetricsSnapshot {
+    /// Counter by operation type.
+    pub fsqlite_btree_operations_total: BtreeOperationTotals,
+    /// Total number of split events observed.
+    pub fsqlite_btree_page_splits_total: u64,
+    /// Current B-tree depth gauge.
+    pub fsqlite_btree_depth: u64,
+}
+
+/// Per-operation mutable stats while a `btree_op` span is active.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct BtreeOpRuntimeStats {
+    pub(crate) pages_visited: u64,
+    pub(crate) splits: u64,
+    pub(crate) merges: u64,
+}
+
+impl BtreeOpRuntimeStats {
+    pub(crate) fn record_page_visit(&mut self) {
+        self.pages_visited = self.pages_visited.saturating_add(1);
+    }
+
+    pub(crate) fn record_split(&mut self) {
+        self.splits = self.splits.saturating_add(1);
+    }
+
+    pub(crate) fn record_merge(&mut self) {
+        self.merges = self.merges.saturating_add(1);
+    }
+}
+
+static BTREE_OP_SEEK_TOTAL: AtomicU64 = AtomicU64::new(0);
+static BTREE_OP_INSERT_TOTAL: AtomicU64 = AtomicU64::new(0);
+static BTREE_OP_DELETE_TOTAL: AtomicU64 = AtomicU64::new(0);
+static BTREE_PAGE_SPLITS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static BTREE_DEPTH_GAUGE: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn record_operation(op_type: BtreeOpType) {
+    let counter = match op_type {
+        BtreeOpType::Seek => &BTREE_OP_SEEK_TOTAL,
+        BtreeOpType::Insert => &BTREE_OP_INSERT_TOTAL,
+        BtreeOpType::Delete => &BTREE_OP_DELETE_TOTAL,
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_split_event() {
+    BTREE_PAGE_SPLITS_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn set_depth_gauge(depth: usize) {
+    let depth_u64 = u64::try_from(depth).unwrap_or(u64::MAX);
+    BTREE_DEPTH_GAUGE.store(depth_u64, Ordering::Relaxed);
+}
+
+/// Return a snapshot of B-tree observability counters.
+#[must_use]
+pub fn btree_metrics_snapshot() -> BtreeMetricsSnapshot {
+    BtreeMetricsSnapshot {
+        fsqlite_btree_operations_total: BtreeOperationTotals {
+            seek: BTREE_OP_SEEK_TOTAL.load(Ordering::Relaxed),
+            insert: BTREE_OP_INSERT_TOTAL.load(Ordering::Relaxed),
+            delete: BTREE_OP_DELETE_TOTAL.load(Ordering::Relaxed),
+        },
+        fsqlite_btree_page_splits_total: BTREE_PAGE_SPLITS_TOTAL.load(Ordering::Relaxed),
+        fsqlite_btree_depth: BTREE_DEPTH_GAUGE.load(Ordering::Relaxed),
+    }
+}
+
+/// Reset all B-tree observability counters.
+pub fn reset_btree_metrics() {
+    BTREE_OP_SEEK_TOTAL.store(0, Ordering::Relaxed);
+    BTREE_OP_INSERT_TOTAL.store(0, Ordering::Relaxed);
+    BTREE_OP_DELETE_TOTAL.store(0, Ordering::Relaxed);
+    BTREE_PAGE_SPLITS_TOTAL.store(0, Ordering::Relaxed);
+    BTREE_DEPTH_GAUGE.store(0, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BtreeOpType, btree_metrics_snapshot, record_operation};
+
+    #[test]
+    fn metrics_snapshot_tracks_operation_buckets() {
+        let before = btree_metrics_snapshot();
+        record_operation(BtreeOpType::Seek);
+        record_operation(BtreeOpType::Seek);
+        record_operation(BtreeOpType::Insert);
+
+        let after = btree_metrics_snapshot();
+        assert!(
+            after.fsqlite_btree_operations_total.seek
+                >= before.fsqlite_btree_operations_total.seek.saturating_add(2)
+        );
+        assert!(
+            after.fsqlite_btree_operations_total.insert
+                >= before
+                    .fsqlite_btree_operations_total
+                    .insert
+                    .saturating_add(1)
+        );
+        assert!(
+            after.fsqlite_btree_operations_total.delete
+                >= before.fsqlite_btree_operations_total.delete
+        );
+    }
+}

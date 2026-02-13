@@ -7,9 +7,11 @@ use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::{ObjectId, Oti};
 use fsqlite_wal::{
     WalFecGroupMeta, WalFecGroupMetaInit, WalFecGroupRecord, WalFecRecoveryFallbackReason,
-    WalFecRecoveryOutcome, WalFrameCandidate, WalSalts, append_wal_fec_group,
-    build_source_page_hashes, generate_wal_fec_repair_symbols, identify_damaged_commit_group,
-    recover_wal_fec_group_with_decoder, scan_wal_fec,
+    WalFecRecoveryOutcome, WalFecRepairEvidenceQuery, WalFrameCandidate, WalSalts,
+    append_wal_fec_group, build_source_page_hashes, generate_wal_fec_repair_symbols,
+    identify_damaged_commit_group, query_raptorq_repair_evidence, raptorq_repair_evidence_snapshot,
+    recover_wal_fec_group_with_config, recover_wal_fec_group_with_decoder,
+    reset_raptorq_repair_telemetry, scan_wal_fec,
 };
 use tempfile::tempdir;
 
@@ -783,6 +785,57 @@ fn test_raptorq_symbol_loss_within_R() {
 
 #[test]
 #[allow(non_snake_case)]
+fn test_raptorq_symbol_loss_half_R() {
+    let temp_dir = tempdir().expect("tempdir should be created");
+    let sidecar_path = temp_dir.path().join("loss_half_r.wal-fec");
+    let salts = WalSalts {
+        salt1: 0xAB12_CD34,
+        salt2: 0xEF56_7890,
+    };
+    let fixture = build_fixture(1, 8, 4, salts, b"bd-9nbw-loss-half-r", 29, 1_515);
+    append_fixture(&sidecar_path, &fixture);
+
+    let mut candidates = frame_candidates(&fixture);
+    let first_corrupt = fixture.meta.start_frame_no + 2;
+    let second_corrupt = fixture.meta.start_frame_no + 6;
+    corrupt_frame(&mut candidates, first_corrupt);
+    corrupt_frame(&mut candidates, second_corrupt);
+
+    let outcome = recover_wal_fec_group_with_decoder(
+        &sidecar_path,
+        fixture.meta.group_id(),
+        salts,
+        first_corrupt,
+        &candidates,
+        decoder_from_expected(fixture.source_pages.clone()),
+    )
+    .expect("recovery should run");
+
+    let WalFecRecoveryOutcome::Recovered(recovered) = outcome else {
+        panic!("bead_id={BEAD_9NBW_ID} expected successful recovery when losses <= R/2");
+    };
+    assert!(recovered.decode_proof.decode_attempted);
+    assert!(recovered.decode_proof.decode_succeeded);
+    assert_eq!(recovered.decode_proof.fallback_reason, None);
+    assert_eq!(recovered.recovered_pages, fixture.source_pages);
+    assert!(
+        recovered
+            .decode_proof
+            .recovered_frame_nos
+            .contains(&first_corrupt),
+        "bead_id={BEAD_9NBW_ID} case=half_r_first_corrupt_missing"
+    );
+    assert!(
+        recovered
+            .decode_proof
+            .recovered_frame_nos
+            .contains(&second_corrupt),
+        "bead_id={BEAD_9NBW_ID} case=half_r_second_corrupt_missing"
+    );
+}
+
+#[test]
+#[allow(non_snake_case)]
 fn test_raptorq_symbol_loss_beyond_R() {
     let temp_dir = tempdir().expect("tempdir should be created");
     let sidecar_path = temp_dir.path().join("loss_beyond_r.wal-fec");
@@ -945,6 +998,54 @@ fn test_raptorq_decode_proof() {
         decode_proof.fallback_reason,
         Some(WalFecRecoveryFallbackReason::InsufficientSymbols)
     );
+}
+
+#[test]
+fn test_recovery_with_config_records_evidence_card() {
+    reset_raptorq_repair_telemetry();
+
+    let temp_dir = tempdir().expect("tempdir should be created");
+    let sidecar_path = temp_dir.path().join("config_evidence.wal-fec");
+    let salts = WalSalts {
+        salt1: 0xABCD_AAAA,
+        salt2: 0xEF01_BBBB,
+    };
+    let fixture = build_fixture(1, 5, 2, salts, b"bd-n0g4q.4-evidence", 63, 7_777);
+    append_fixture(&sidecar_path, &fixture);
+
+    let mut candidates = frame_candidates(&fixture);
+    let mismatch_frame = fixture.meta.start_frame_no + 2;
+    corrupt_frame(&mut candidates, mismatch_frame);
+
+    let (outcome, _log) = recover_wal_fec_group_with_config(
+        &sidecar_path,
+        fixture.meta.group_id(),
+        salts,
+        mismatch_frame,
+        &candidates,
+        &fsqlite_wal::WalFecRecoveryConfig::default(),
+        decoder_from_expected(fixture.source_pages.clone()),
+    )
+    .expect("config-aware recovery should run");
+
+    let WalFecRecoveryOutcome::Recovered(recovered) = outcome else {
+        panic!("expected successful recovery with evidence card");
+    };
+    assert!(recovered.decode_proof.decode_attempted);
+
+    let cards = raptorq_repair_evidence_snapshot(0);
+    assert_eq!(cards.len(), 1);
+    let card = &cards[0];
+    assert_eq!(card.frame_id, fixture.meta.group_id().end_frame_no);
+    assert!(card.repair_latency_ns > 0);
+    assert_ne!(card.chain_hash, [0_u8; 32]);
+
+    let by_frame = query_raptorq_repair_evidence(&WalFecRepairEvidenceQuery {
+        frame_id: Some(card.frame_id),
+        ..WalFecRepairEvidenceQuery::default()
+    });
+    assert_eq!(by_frame.len(), 1);
+    assert_eq!(by_frame[0].chain_hash, card.chain_hash);
 }
 
 #[test]

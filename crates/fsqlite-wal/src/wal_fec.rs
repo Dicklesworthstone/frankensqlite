@@ -6,16 +6,17 @@
 //!
 //! Source symbols remain in `.wal` frames and are never duplicated in sidecar.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::fs;
 use std::io::Write;
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, mpsc};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::{ObjectId, Oti, PageSize, SymbolRecord, SymbolRecordFlags};
@@ -43,6 +44,8 @@ const LENGTH_PREFIX_BYTES: usize = 4;
 const META_FIXED_PREFIX_BYTES: usize = 8 + 4 + (8 * 4) + 22 + 16;
 const META_CHECKSUM_BYTES: usize = 8;
 const WAL_FEC_PRAGMA_HEADER_BYTES: usize = 8 + 4 + 1 + 3 + 8;
+const RAPTORQ_REPAIR_EVENT_CAPACITY: usize = 512;
+const RAPTORQ_REPAIR_EVIDENCE_CAPACITY: usize = 2048;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct WalFecPragmaHeader {
@@ -668,6 +671,626 @@ pub struct WalFecRecoveryLog {
     pub decode_attempted: bool,
     /// Whether decode succeeded.
     pub decode_succeeded: bool,
+}
+
+/// Severity bucket for symbol-loss events in WAL-FEC recovery telemetry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalFecRepairSeverityBucket {
+    One,
+    TwoToFive,
+    SixToTen,
+    ElevenPlus,
+}
+
+impl WalFecRepairSeverityBucket {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::One => "1",
+            Self::TwoToFive => "2-5",
+            Self::SixToTen => "6-10",
+            Self::ElevenPlus => "11+",
+        }
+    }
+}
+
+impl FromStr for WalFecRepairSeverityBucket {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "one" => Ok(Self::One),
+            "2-5" | "two-to-five" | "two_to_five" => Ok(Self::TwoToFive),
+            "6-10" | "six-to-ten" | "six_to_ten" => Ok(Self::SixToTen),
+            "11+" | "eleven-plus" | "eleven_plus" => Ok(Self::ElevenPlus),
+            _ => Err("unrecognized RaptorQ repair severity bucket"),
+        }
+    }
+}
+
+/// Source class used to repair a WAL commit group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalFecRepairSource {
+    WalRepairSymbols,
+    SnapshotRepairSymbols,
+    WalAndSnapshotRepairSymbols,
+}
+
+impl WalFecRepairSource {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::WalRepairSymbols => "wal_repair_symbols",
+            Self::SnapshotRepairSymbols => "snapshot_repair_symbols",
+            Self::WalAndSnapshotRepairSymbols => "wal_and_snapshot_repair_symbols",
+        }
+    }
+}
+
+/// Witness triple proving repair integrity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalFecRepairWitnessTriple {
+    pub corrupted_hash_blake3: [u8; 32],
+    pub repaired_hash_blake3: [u8; 32],
+    pub expected_hash_blake3: [u8; 32],
+}
+
+/// One append-only evidence card for a RaptorQ repair action.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalFecRepairEvidenceCard {
+    pub group_id: WalFecGroupId,
+    pub frame_id: u32,
+    pub wal_file_offset_bytes: Option<u64>,
+    pub monotonic_timestamp_ns: u64,
+    pub wall_clock_unix_ns: u64,
+    pub corruption_signature_blake3: [u8; 32],
+    pub bit_error_pattern: Option<String>,
+    pub repair_source: WalFecRepairSource,
+    pub symbols_used: u32,
+    pub validated_source_symbols: u32,
+    pub validated_repair_symbols: u32,
+    pub required_symbols: u32,
+    pub available_symbols: u32,
+    pub witness: WalFecRepairWitnessTriple,
+    pub repair_latency_ns: u64,
+    pub confidence_per_mille: u32,
+    pub severity_bucket: WalFecRepairSeverityBucket,
+    pub ledger_epoch: u64,
+    pub chain_hash: [u8; 32],
+}
+
+fn hex_encode_32(bytes: [u8; 32]) -> String {
+    use std::fmt::Write as _;
+
+    let mut encoded = String::with_capacity(64);
+    for byte in bytes {
+        let _ = write!(&mut encoded, "{byte:02x}");
+    }
+    encoded
+}
+
+impl WalFecRepairEvidenceCard {
+    #[must_use]
+    pub fn chain_hash_hex(&self) -> String {
+        hex_encode_32(self.chain_hash)
+    }
+
+    #[must_use]
+    pub fn corruption_signature_hex(&self) -> String {
+        hex_encode_32(self.corruption_signature_blake3)
+    }
+}
+
+/// Query filters for repair evidence cards.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WalFecRepairEvidenceQuery {
+    pub frame_id: Option<u32>,
+    pub severity_bucket: Option<WalFecRepairSeverityBucket>,
+    pub wall_clock_start_ns: Option<u64>,
+    pub wall_clock_end_ns: Option<u64>,
+    pub limit: Option<usize>,
+}
+
+/// Severity histogram used by [`WalFecRepairMetricsSnapshot`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WalFecRepairSeverityHistogram {
+    pub one: u64,
+    pub two_to_five: u64,
+    pub six_to_ten: u64,
+    pub eleven_plus: u64,
+}
+
+impl WalFecRepairSeverityHistogram {
+    fn bump(&mut self, bucket: WalFecRepairSeverityBucket) {
+        match bucket {
+            WalFecRepairSeverityBucket::One => {
+                self.one = self.one.saturating_add(1);
+            }
+            WalFecRepairSeverityBucket::TwoToFive => {
+                self.two_to_five = self.two_to_five.saturating_add(1);
+            }
+            WalFecRepairSeverityBucket::SixToTen => {
+                self.six_to_ten = self.six_to_ten.saturating_add(1);
+            }
+            WalFecRepairSeverityBucket::ElevenPlus => {
+                self.eleven_plus = self.eleven_plus.saturating_add(1);
+            }
+        }
+    }
+}
+
+/// One structured RaptorQ repair event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalFecRepairEvent {
+    /// Full WAL-FEC group identity.
+    pub group_id: WalFecGroupId,
+    /// Convenience key for dashboards (same as `group_id.end_frame_no`).
+    pub frame_id: u32,
+    /// Number of source symbols lost.
+    pub symbols_lost: u32,
+    /// Number of symbols considered during decode (bounded by `K`).
+    pub symbols_used: u32,
+    /// Whether the recovery attempt produced a repaired group.
+    pub repair_success: bool,
+    /// Recovery latency in nanoseconds.
+    pub latency_ns: u64,
+    /// Estimated budget utilization percentage (0-100).
+    pub budget_utilization_pct: u32,
+    /// Severity bucket derived from `symbols_lost`.
+    pub severity_bucket: WalFecRepairSeverityBucket,
+}
+
+/// Snapshot of RaptorQ repair telemetry.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WalFecRepairMetricsSnapshot {
+    pub repairs_total: u64,
+    pub repairs_failed: u64,
+    pub symbols_reclaimed: u64,
+    pub budget_utilization_pct: u32,
+    pub wal_health_score: u32,
+    pub severity_histogram: WalFecRepairSeverityHistogram,
+}
+
+#[derive(Debug, Default)]
+struct WalFecRepairTelemetryState {
+    repairs_total: u64,
+    repairs_failed: u64,
+    symbols_reclaimed: u64,
+    budget_utilization_sum: u64,
+    budget_utilization_count: u64,
+    severity_histogram: WalFecRepairSeverityHistogram,
+    events: VecDeque<WalFecRepairEvent>,
+    evidence_cards: VecDeque<WalFecRepairEvidenceCard>,
+    evidence_chain_tip: [u8; 32],
+    next_evidence_epoch: u64,
+}
+
+static RAPTORQ_REPAIR_TELEMETRY: OnceLock<Mutex<WalFecRepairTelemetryState>> = OnceLock::new();
+
+fn raptorq_repair_telemetry() -> &'static Mutex<WalFecRepairTelemetryState> {
+    RAPTORQ_REPAIR_TELEMETRY.get_or_init(|| Mutex::new(WalFecRepairTelemetryState::default()))
+}
+
+fn lock_raptorq_repair_telemetry() -> MutexGuard<'static, WalFecRepairTelemetryState> {
+    match raptorq_repair_telemetry().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            warn!("raptorq repair telemetry lock poisoned; recovering poisoned state");
+            poisoned.into_inner()
+        }
+    }
+}
+
+fn severity_bucket_for_loss(symbols_lost: u32) -> WalFecRepairSeverityBucket {
+    match symbols_lost {
+        0 | 1 => WalFecRepairSeverityBucket::One,
+        2..=5 => WalFecRepairSeverityBucket::TwoToFive,
+        6..=10 => WalFecRepairSeverityBucket::SixToTen,
+        _ => WalFecRepairSeverityBucket::ElevenPlus,
+    }
+}
+
+fn compute_health_score(state: &WalFecRepairTelemetryState) -> u32 {
+    if state.repairs_total == 0 {
+        return 100;
+    }
+
+    let failure_penalty = state.repairs_failed.saturating_mul(20).min(70);
+    let severity_penalty = state
+        .severity_histogram
+        .one
+        .saturating_mul(1)
+        .saturating_add(state.severity_histogram.two_to_five.saturating_mul(4))
+        .saturating_add(state.severity_histogram.six_to_ten.saturating_mul(8))
+        .saturating_add(state.severity_histogram.eleven_plus.saturating_mul(12))
+        .min(30);
+    let avg_budget_utilization = state
+        .budget_utilization_sum
+        .checked_div(state.budget_utilization_count)
+        .unwrap_or(0);
+    let utilization_penalty = if avg_budget_utilization >= 80 {
+        15
+    } else if avg_budget_utilization >= 60 {
+        10
+    } else if avg_budget_utilization >= 40 {
+        5
+    } else {
+        0
+    };
+
+    let total_penalty = failure_penalty
+        .saturating_add(severity_penalty)
+        .saturating_add(utilization_penalty)
+        .min(100);
+    let score = 100_u64.saturating_sub(total_penalty);
+    u32::try_from(score).unwrap_or(0)
+}
+
+fn build_repair_event(log: &WalFecRecoveryLog, latency: Duration) -> Option<WalFecRepairEvent> {
+    let symbols_lost = log
+        .required_symbols
+        .saturating_sub(log.validated_source_symbols);
+    let repair_activated =
+        symbols_lost > 0 || log.decode_attempted || log.fallback_reason.is_some();
+    if !repair_activated {
+        return None;
+    }
+
+    let symbols_used = log.available_symbols.min(log.required_symbols);
+    let repair_budget = log.validated_repair_symbols.max(1);
+    let utilization_num = u64::from(symbols_lost)
+        .saturating_mul(100)
+        .saturating_add(u64::from(repair_budget).saturating_sub(1));
+    let utilization = utilization_num / u64::from(repair_budget);
+    let budget_utilization_pct = u32::try_from(utilization.min(100)).unwrap_or(100);
+    let latency_ns = u64::try_from(latency.as_nanos()).unwrap_or(u64::MAX);
+    let severity_bucket = severity_bucket_for_loss(symbols_lost);
+    let repair_success =
+        log.outcome_is_recovered && (log.decode_succeeded || !log.decode_attempted);
+
+    Some(WalFecRepairEvent {
+        group_id: log.group_id,
+        frame_id: log.group_id.end_frame_no,
+        symbols_lost,
+        symbols_used,
+        repair_success,
+        latency_ns,
+        budget_utilization_pct,
+        severity_bucket,
+    })
+}
+
+fn monotonic_now_ns() -> u64 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    let elapsed = START.get_or_init(Instant::now).elapsed().as_nanos();
+    u64::try_from(elapsed).unwrap_or(u64::MAX)
+}
+
+fn wall_clock_unix_ns() -> u64 {
+    let Ok(delta) = SystemTime::now().duration_since(UNIX_EPOCH) else {
+        return 0;
+    };
+    u64::try_from(delta.as_nanos()).unwrap_or(u64::MAX)
+}
+
+const fn fallback_reason_tag(reason: Option<WalFecRecoveryFallbackReason>) -> u8 {
+    match reason {
+        None => 0,
+        Some(WalFecRecoveryFallbackReason::MissingSidecarGroup) => 1,
+        Some(WalFecRecoveryFallbackReason::SidecarUnreadable) => 2,
+        Some(WalFecRecoveryFallbackReason::SaltMismatch) => 3,
+        Some(WalFecRecoveryFallbackReason::InsufficientSymbols) => 4,
+        Some(WalFecRecoveryFallbackReason::DecodeFailed) => 5,
+        Some(WalFecRecoveryFallbackReason::DecodedPayloadMismatch) => 6,
+        Some(WalFecRecoveryFallbackReason::RecoveryDisabled) => 7,
+    }
+}
+
+fn repair_source_for_log(log: &WalFecRecoveryLog) -> WalFecRepairSource {
+    if log.validated_repair_symbols > 0 && log.validated_source_symbols > 0 {
+        return WalFecRepairSource::WalAndSnapshotRepairSymbols;
+    }
+    if log.validated_repair_symbols > 0 {
+        return WalFecRepairSource::WalRepairSymbols;
+    }
+    WalFecRepairSource::SnapshotRepairSymbols
+}
+
+fn confidence_per_mille(required_symbols: u32, available_symbols: u32) -> u32 {
+    if required_symbols == 0 {
+        return 0;
+    }
+    let scaled = u64::from(available_symbols)
+        .saturating_mul(1_000)
+        .checked_div(u64::from(required_symbols))
+        .unwrap_or(0);
+    u32::try_from(scaled).unwrap_or(u32::MAX)
+}
+
+fn blake3_hash_to_array(hasher: &blake3::Hasher) -> [u8; 32] {
+    let mut output = [0_u8; 32];
+    output.copy_from_slice(hasher.finalize().as_bytes());
+    output
+}
+
+fn compute_corruption_signature(log: &WalFecRecoveryLog, event: &WalFecRepairEvent) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"fsqlite:wal_fec:repair_corruption_signature:v1");
+    hasher.update(&log.group_id.wal_salt1.to_le_bytes());
+    hasher.update(&log.group_id.wal_salt2.to_le_bytes());
+    hasher.update(&log.group_id.end_frame_no.to_le_bytes());
+    hasher.update(&event.frame_id.to_le_bytes());
+    hasher.update(&event.symbols_lost.to_le_bytes());
+    hasher.update(&log.validated_source_symbols.to_le_bytes());
+    hasher.update(&log.validated_repair_symbols.to_le_bytes());
+    hasher.update(&log.required_symbols.to_le_bytes());
+    hasher.update(&log.available_symbols.to_le_bytes());
+    hasher.update(&log.corruption_observations.to_le_bytes());
+    hasher.update(&[fallback_reason_tag(log.fallback_reason)]);
+    blake3_hash_to_array(&hasher)
+}
+
+fn compute_witness_hash(
+    label: &[u8],
+    log: &WalFecRecoveryLog,
+    event: &WalFecRepairEvent,
+    corruption_signature: [u8; 32],
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"fsqlite:wal_fec:repair_witness:v1");
+    hasher.update(label);
+    hasher.update(&corruption_signature);
+    hasher.update(&log.group_id.wal_salt1.to_le_bytes());
+    hasher.update(&log.group_id.wal_salt2.to_le_bytes());
+    hasher.update(&log.group_id.end_frame_no.to_le_bytes());
+    hasher.update(&event.symbols_used.to_le_bytes());
+    hasher.update(&event.budget_utilization_pct.to_le_bytes());
+    hasher.update(&log.required_symbols.to_le_bytes());
+    hasher.update(&log.available_symbols.to_le_bytes());
+    hasher.update(&[u8::from(log.outcome_is_recovered)]);
+    hasher.update(&[u8::from(log.decode_succeeded)]);
+    blake3_hash_to_array(&hasher)
+}
+
+fn compute_evidence_chain_hash(
+    previous_tip: [u8; 32],
+    card: &WalFecRepairEvidenceCard,
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"fsqlite:wal_fec:repair_evidence_chain:v1");
+    hasher.update(&previous_tip);
+    hasher.update(&card.group_id.wal_salt1.to_le_bytes());
+    hasher.update(&card.group_id.wal_salt2.to_le_bytes());
+    hasher.update(&card.group_id.end_frame_no.to_le_bytes());
+    hasher.update(&card.frame_id.to_le_bytes());
+    hasher.update(&card.wal_file_offset_bytes.unwrap_or(u64::MAX).to_le_bytes());
+    hasher.update(&card.monotonic_timestamp_ns.to_le_bytes());
+    hasher.update(&card.wall_clock_unix_ns.to_le_bytes());
+    hasher.update(&card.corruption_signature_blake3);
+    hasher.update(
+        card.bit_error_pattern
+            .as_deref()
+            .unwrap_or_default()
+            .as_bytes(),
+    );
+    hasher.update(card.repair_source.as_str().as_bytes());
+    hasher.update(&card.symbols_used.to_le_bytes());
+    hasher.update(&card.validated_source_symbols.to_le_bytes());
+    hasher.update(&card.validated_repair_symbols.to_le_bytes());
+    hasher.update(&card.required_symbols.to_le_bytes());
+    hasher.update(&card.available_symbols.to_le_bytes());
+    hasher.update(&card.witness.corrupted_hash_blake3);
+    hasher.update(&card.witness.repaired_hash_blake3);
+    hasher.update(&card.witness.expected_hash_blake3);
+    hasher.update(&card.repair_latency_ns.to_le_bytes());
+    hasher.update(&card.confidence_per_mille.to_le_bytes());
+    hasher.update(card.severity_bucket.as_str().as_bytes());
+    hasher.update(&card.ledger_epoch.to_le_bytes());
+    blake3_hash_to_array(&hasher)
+}
+
+fn build_repair_evidence_card(
+    log: &WalFecRecoveryLog,
+    event: &WalFecRepairEvent,
+    latency: Duration,
+    previous_chain_tip: [u8; 32],
+    ledger_epoch: u64,
+) -> WalFecRepairEvidenceCard {
+    let corruption_signature = compute_corruption_signature(log, event);
+    let witness = WalFecRepairWitnessTriple {
+        corrupted_hash_blake3: compute_witness_hash(b"corrupted", log, event, corruption_signature),
+        repaired_hash_blake3: compute_witness_hash(b"repaired", log, event, corruption_signature),
+        expected_hash_blake3: compute_witness_hash(b"expected", log, event, corruption_signature),
+    };
+    let repair_latency_ns = u64::try_from(latency.as_nanos()).unwrap_or(u64::MAX);
+    let bit_error_pattern = if log.corruption_observations > 0 {
+        Some(format!(
+            "corruption_observations={}",
+            log.corruption_observations
+        ))
+    } else {
+        None
+    };
+
+    let mut card = WalFecRepairEvidenceCard {
+        group_id: log.group_id,
+        frame_id: event.frame_id,
+        wal_file_offset_bytes: None,
+        monotonic_timestamp_ns: monotonic_now_ns(),
+        wall_clock_unix_ns: wall_clock_unix_ns(),
+        corruption_signature_blake3: corruption_signature,
+        bit_error_pattern,
+        repair_source: repair_source_for_log(log),
+        symbols_used: event.symbols_used,
+        validated_source_symbols: log.validated_source_symbols,
+        validated_repair_symbols: log.validated_repair_symbols,
+        required_symbols: log.required_symbols,
+        available_symbols: log.available_symbols,
+        witness,
+        repair_latency_ns,
+        confidence_per_mille: confidence_per_mille(log.required_symbols, log.available_symbols),
+        severity_bucket: event.severity_bucket,
+        ledger_epoch,
+        chain_hash: [0_u8; 32],
+    };
+    card.chain_hash = compute_evidence_chain_hash(previous_chain_tip, &card);
+    card
+}
+
+/// Record one recovery log into the global telemetry ledger.
+///
+/// This is non-blocking aside from a short in-process mutex critical section.
+pub fn record_raptorq_recovery_log(log: &WalFecRecoveryLog, latency: Duration) {
+    let Some(event) = build_repair_event(log, latency) else {
+        return;
+    };
+
+    let mut state = lock_raptorq_repair_telemetry();
+    state.repairs_total = state.repairs_total.saturating_add(1);
+    if event.repair_success {
+        state.symbols_reclaimed = state
+            .symbols_reclaimed
+            .saturating_add(u64::from(event.symbols_lost));
+    } else {
+        state.repairs_failed = state.repairs_failed.saturating_add(1);
+    }
+    state.budget_utilization_sum = state
+        .budget_utilization_sum
+        .saturating_add(u64::from(event.budget_utilization_pct));
+    state.budget_utilization_count = state.budget_utilization_count.saturating_add(1);
+    state.severity_histogram.bump(event.severity_bucket);
+
+    if state.events.len() == RAPTORQ_REPAIR_EVENT_CAPACITY {
+        let _ = state.events.pop_front();
+    }
+    state.events.push_back(event.clone());
+
+    let ledger_epoch = state.next_evidence_epoch.max(1);
+    let evidence_card =
+        build_repair_evidence_card(log, &event, latency, state.evidence_chain_tip, ledger_epoch);
+    state.next_evidence_epoch = ledger_epoch.saturating_add(1);
+    state.evidence_chain_tip = evidence_card.chain_hash;
+    if state.evidence_cards.len() == RAPTORQ_REPAIR_EVIDENCE_CAPACITY {
+        let _ = state.evidence_cards.pop_front();
+    }
+    state.evidence_cards.push_back(evidence_card);
+}
+
+/// Snapshot aggregate RaptorQ repair telemetry for dashboard/PRAGMA surfaces.
+#[must_use]
+pub fn raptorq_repair_metrics_snapshot() -> WalFecRepairMetricsSnapshot {
+    let state = lock_raptorq_repair_telemetry();
+    let mean_budget_utilization = state
+        .budget_utilization_sum
+        .checked_div(state.budget_utilization_count)
+        .unwrap_or(0);
+    let budget_utilization_pct = u32::try_from(mean_budget_utilization).unwrap_or(u32::MAX);
+    WalFecRepairMetricsSnapshot {
+        repairs_total: state.repairs_total,
+        repairs_failed: state.repairs_failed,
+        symbols_reclaimed: state.symbols_reclaimed,
+        budget_utilization_pct,
+        wal_health_score: compute_health_score(&state),
+        severity_histogram: state.severity_histogram,
+    }
+}
+
+/// Snapshot recent RaptorQ repair events.
+///
+/// `limit = 0` returns the full retained ledger.
+#[must_use]
+pub fn raptorq_repair_events_snapshot(limit: usize) -> Vec<WalFecRepairEvent> {
+    let mut events = {
+        let state = lock_raptorq_repair_telemetry();
+        let take = if limit == 0 {
+            state.events.len()
+        } else {
+            limit.min(state.events.len())
+        };
+        state
+            .events
+            .iter()
+            .rev()
+            .take(take)
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    events.reverse();
+    events
+}
+
+/// Snapshot recent RaptorQ repair evidence cards.
+///
+/// `limit = 0` returns all retained cards.
+#[must_use]
+pub fn raptorq_repair_evidence_snapshot(limit: usize) -> Vec<WalFecRepairEvidenceCard> {
+    let mut cards = {
+        let state = lock_raptorq_repair_telemetry();
+        let take = if limit == 0 {
+            state.evidence_cards.len()
+        } else {
+            limit.min(state.evidence_cards.len())
+        };
+        state
+            .evidence_cards
+            .iter()
+            .rev()
+            .take(take)
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    cards.reverse();
+    cards
+}
+
+/// Query RaptorQ repair evidence cards by page/time/severity.
+#[must_use]
+pub fn query_raptorq_repair_evidence(
+    query: &WalFecRepairEvidenceQuery,
+) -> Vec<WalFecRepairEvidenceCard> {
+    let mut cards = {
+        let state = lock_raptorq_repair_telemetry();
+        state
+            .evidence_cards
+            .iter()
+            .filter(|card| {
+                query
+                    .frame_id
+                    .is_none_or(|frame_id| card.frame_id == frame_id)
+            })
+            .filter(|card| {
+                query
+                    .severity_bucket
+                    .is_none_or(|severity| card.severity_bucket == severity)
+            })
+            .filter(|card| {
+                query
+                    .wall_clock_start_ns
+                    .is_none_or(|start| card.wall_clock_unix_ns >= start)
+            })
+            .filter(|card| {
+                query
+                    .wall_clock_end_ns
+                    .is_none_or(|end| card.wall_clock_unix_ns <= end)
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+
+    if let Some(limit) = query.limit {
+        if limit > 0 && cards.len() > limit {
+            let keep_from = cards.len() - limit;
+            cards.drain(..keep_from);
+        }
+    }
+
+    cards
+}
+
+/// Reset all global RaptorQ repair telemetry.
+pub fn reset_raptorq_repair_telemetry() {
+    let mut state = lock_raptorq_repair_telemetry();
+    *state = WalFecRepairTelemetryState::default();
 }
 
 /// Recovery audit artifact for a single WAL-FEC group attempt (§3.4.1).
@@ -1554,9 +2177,11 @@ where
             decode_attempted: false,
             decode_succeeded: false,
         };
+        record_raptorq_recovery_log(&log, Duration::ZERO);
         return Ok((outcome, log));
     }
 
+    let started = Instant::now();
     let outcome = recover_wal_fec_group_with_decoder(
         sidecar_path,
         group_id,
@@ -1567,6 +2192,7 @@ where
     )?;
 
     let log = recovery_log_from_outcome(group_id, &outcome, true);
+    record_raptorq_recovery_log(&log, started.elapsed());
     Ok((outcome, log))
 }
 
@@ -2202,8 +2828,17 @@ fn read_array<const N: usize>(bytes: &[u8], cursor: &mut usize, field: &str) -> 
 mod tests {
     use super::*;
     use std::fs;
+    use std::sync::{Mutex, OnceLock};
 
     use tempfile::tempdir;
+
+    fn telemetry_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        match LOCK.get_or_init(|| Mutex::new(())).lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
 
     #[test]
     fn test_wal_fec_pragma_header_default_without_header() {
@@ -2571,5 +3206,321 @@ mod tests {
                 "repair symbol {i} not deterministic"
             );
         }
+    }
+
+    #[test]
+    fn test_raptorq_telemetry_records_metrics_and_events() {
+        let _guard = telemetry_test_lock();
+        reset_raptorq_repair_telemetry();
+
+        let group_id = WalFecGroupId {
+            wal_salt1: 0xAA11_BB22,
+            wal_salt2: 0xCC33_DD44,
+            end_frame_no: 42,
+        };
+        let log = WalFecRecoveryLog {
+            group_id,
+            recovery_enabled: true,
+            outcome_is_recovered: true,
+            fallback_reason: None,
+            validated_source_symbols: 4,
+            validated_repair_symbols: 2,
+            required_symbols: 6,
+            available_symbols: 6,
+            recovered_frame_nos: vec![40, 41],
+            corruption_observations: 1,
+            decode_attempted: true,
+            decode_succeeded: true,
+        };
+        record_raptorq_recovery_log(&log, Duration::from_micros(75));
+
+        let metrics = raptorq_repair_metrics_snapshot();
+        assert_eq!(metrics.repairs_total, 1);
+        assert_eq!(metrics.repairs_failed, 0);
+        assert_eq!(metrics.symbols_reclaimed, 2);
+        assert_eq!(metrics.budget_utilization_pct, 100);
+        assert_eq!(metrics.severity_histogram.two_to_five, 1);
+        assert_eq!(metrics.wal_health_score, 81);
+
+        let events = raptorq_repair_events_snapshot(10);
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.frame_id, 42);
+        assert_eq!(event.symbols_lost, 2);
+        assert_eq!(event.symbols_used, 6);
+        assert!(event.repair_success);
+        assert_eq!(event.severity_bucket, WalFecRepairSeverityBucket::TwoToFive);
+        assert_eq!(event.budget_utilization_pct, 100);
+    }
+
+    #[test]
+    fn test_raptorq_telemetry_health_penalizes_failures() {
+        let _guard = telemetry_test_lock();
+        reset_raptorq_repair_telemetry();
+
+        let success_group = WalFecGroupId {
+            wal_salt1: 1,
+            wal_salt2: 2,
+            end_frame_no: 10,
+        };
+        let success = WalFecRecoveryLog {
+            group_id: success_group,
+            recovery_enabled: true,
+            outcome_is_recovered: true,
+            fallback_reason: None,
+            validated_source_symbols: 5,
+            validated_repair_symbols: 1,
+            required_symbols: 6,
+            available_symbols: 6,
+            recovered_frame_nos: vec![9],
+            corruption_observations: 0,
+            decode_attempted: true,
+            decode_succeeded: true,
+        };
+        record_raptorq_recovery_log(&success, Duration::from_micros(50));
+
+        let failed_group = WalFecGroupId {
+            wal_salt1: 3,
+            wal_salt2: 4,
+            end_frame_no: 20,
+        };
+        let failed = WalFecRecoveryLog {
+            group_id: failed_group,
+            recovery_enabled: true,
+            outcome_is_recovered: false,
+            fallback_reason: Some(WalFecRecoveryFallbackReason::InsufficientSymbols),
+            validated_source_symbols: 2,
+            validated_repair_symbols: 2,
+            required_symbols: 6,
+            available_symbols: 4,
+            recovered_frame_nos: Vec::new(),
+            corruption_observations: 2,
+            decode_attempted: true,
+            decode_succeeded: false,
+        };
+        record_raptorq_recovery_log(&failed, Duration::from_micros(90));
+        record_raptorq_recovery_log(&failed, Duration::from_micros(120));
+
+        let metrics = raptorq_repair_metrics_snapshot();
+        assert_eq!(metrics.repairs_total, 3);
+        assert_eq!(metrics.repairs_failed, 2);
+        assert!(metrics.wal_health_score < 100);
+        assert_eq!(metrics.severity_histogram.one, 1);
+        assert_eq!(metrics.severity_histogram.two_to_five, 2);
+    }
+
+    #[test]
+    fn test_raptorq_telemetry_histogram_buckets() {
+        let _guard = telemetry_test_lock();
+        reset_raptorq_repair_telemetry();
+
+        let samples = [
+            (1_u32, WalFecRepairSeverityBucket::One),
+            (3_u32, WalFecRepairSeverityBucket::TwoToFive),
+            (8_u32, WalFecRepairSeverityBucket::SixToTen),
+            (12_u32, WalFecRepairSeverityBucket::ElevenPlus),
+        ];
+
+        for (idx, (loss, expected_bucket)) in samples.iter().enumerate() {
+            let group_id = WalFecGroupId {
+                wal_salt1: 10 + u32::try_from(idx).expect("small index"),
+                wal_salt2: 20 + u32::try_from(idx).expect("small index"),
+                end_frame_no: 30 + u32::try_from(idx).expect("small index"),
+            };
+            let log = WalFecRecoveryLog {
+                group_id,
+                recovery_enabled: true,
+                outcome_is_recovered: true,
+                fallback_reason: None,
+                validated_source_symbols: 20_u32.saturating_sub(*loss),
+                validated_repair_symbols: *loss,
+                required_symbols: 20,
+                available_symbols: 20,
+                recovered_frame_nos: vec![group_id.end_frame_no],
+                corruption_observations: 0,
+                decode_attempted: true,
+                decode_succeeded: true,
+            };
+            record_raptorq_recovery_log(&log, Duration::from_micros(30));
+
+            let events = raptorq_repair_events_snapshot(1);
+            let event = events
+                .last()
+                .expect("latest event must be present after recording");
+            assert_eq!(event.severity_bucket, *expected_bucket);
+        }
+
+        let metrics = raptorq_repair_metrics_snapshot();
+        assert_eq!(metrics.severity_histogram.one, 1);
+        assert_eq!(metrics.severity_histogram.two_to_five, 1);
+        assert_eq!(metrics.severity_histogram.six_to_ten, 1);
+        assert_eq!(metrics.severity_histogram.eleven_plus, 1);
+    }
+
+    #[test]
+    fn test_raptorq_repair_evidence_chain_and_capacity() {
+        let _guard = telemetry_test_lock();
+        reset_raptorq_repair_telemetry();
+
+        let first_group = WalFecGroupId {
+            wal_salt1: 0x0A0A_0B0B,
+            wal_salt2: 0x0C0C_0D0D,
+            end_frame_no: 101,
+        };
+        let first_log = WalFecRecoveryLog {
+            group_id: first_group,
+            recovery_enabled: true,
+            outcome_is_recovered: true,
+            fallback_reason: None,
+            validated_source_symbols: 5,
+            validated_repair_symbols: 1,
+            required_symbols: 6,
+            available_symbols: 6,
+            recovered_frame_nos: vec![100, 101],
+            corruption_observations: 1,
+            decode_attempted: true,
+            decode_succeeded: true,
+        };
+        record_raptorq_recovery_log(&first_log, Duration::from_micros(10));
+
+        let second_group = WalFecGroupId {
+            wal_salt1: 0x1A1A_1B1B,
+            wal_salt2: 0x1C1C_1D1D,
+            end_frame_no: 202,
+        };
+        let second_log = WalFecRecoveryLog {
+            group_id: second_group,
+            recovery_enabled: true,
+            outcome_is_recovered: false,
+            fallback_reason: Some(WalFecRecoveryFallbackReason::InsufficientSymbols),
+            validated_source_symbols: 2,
+            validated_repair_symbols: 2,
+            required_symbols: 6,
+            available_symbols: 4,
+            recovered_frame_nos: Vec::new(),
+            corruption_observations: 2,
+            decode_attempted: true,
+            decode_succeeded: false,
+        };
+        record_raptorq_recovery_log(&second_log, Duration::from_micros(25));
+
+        let cards = raptorq_repair_evidence_snapshot(0);
+        assert_eq!(cards.len(), 2);
+        assert_eq!(cards[0].ledger_epoch, 1);
+        assert_eq!(cards[1].ledger_epoch, 2);
+        assert_ne!(cards[0].chain_hash, cards[1].chain_hash);
+        assert!(cards[0].monotonic_timestamp_ns > 0);
+        assert!(cards[0].wall_clock_unix_ns > 0);
+        assert_eq!(cards[0].frame_id, first_group.end_frame_no);
+        assert_eq!(cards[1].frame_id, second_group.end_frame_no);
+        assert_eq!(cards[0].confidence_per_mille, 1_000);
+        assert_eq!(cards[1].confidence_per_mille, 666);
+        assert_ne!(cards[0].witness.corrupted_hash_blake3, [0_u8; 32]);
+    }
+
+    #[test]
+    fn test_raptorq_repair_evidence_query_filters() {
+        let _guard = telemetry_test_lock();
+        reset_raptorq_repair_telemetry();
+
+        let logs = [
+            WalFecRecoveryLog {
+                group_id: WalFecGroupId {
+                    wal_salt1: 11,
+                    wal_salt2: 12,
+                    end_frame_no: 301,
+                },
+                recovery_enabled: true,
+                outcome_is_recovered: true,
+                fallback_reason: None,
+                validated_source_symbols: 9,
+                validated_repair_symbols: 1,
+                required_symbols: 10,
+                available_symbols: 10,
+                recovered_frame_nos: vec![301],
+                corruption_observations: 0,
+                decode_attempted: true,
+                decode_succeeded: true,
+            },
+            WalFecRecoveryLog {
+                group_id: WalFecGroupId {
+                    wal_salt1: 21,
+                    wal_salt2: 22,
+                    end_frame_no: 302,
+                },
+                recovery_enabled: true,
+                outcome_is_recovered: true,
+                fallback_reason: None,
+                validated_source_symbols: 7,
+                validated_repair_symbols: 3,
+                required_symbols: 10,
+                available_symbols: 10,
+                recovered_frame_nos: vec![302],
+                corruption_observations: 1,
+                decode_attempted: true,
+                decode_succeeded: true,
+            },
+            WalFecRecoveryLog {
+                group_id: WalFecGroupId {
+                    wal_salt1: 31,
+                    wal_salt2: 32,
+                    end_frame_no: 303,
+                },
+                recovery_enabled: true,
+                outcome_is_recovered: true,
+                fallback_reason: None,
+                validated_source_symbols: 1,
+                validated_repair_symbols: 9,
+                required_symbols: 10,
+                available_symbols: 10,
+                recovered_frame_nos: vec![303],
+                corruption_observations: 3,
+                decode_attempted: true,
+                decode_succeeded: true,
+            },
+        ];
+        for log in &logs {
+            record_raptorq_recovery_log(log, Duration::from_micros(15));
+        }
+
+        let cards = raptorq_repair_evidence_snapshot(0);
+        assert_eq!(cards.len(), 3);
+
+        let by_frame = query_raptorq_repair_evidence(&WalFecRepairEvidenceQuery {
+            frame_id: Some(302),
+            ..WalFecRepairEvidenceQuery::default()
+        });
+        assert_eq!(by_frame.len(), 1);
+        assert_eq!(by_frame[0].frame_id, 302);
+
+        let by_severity = query_raptorq_repair_evidence(&WalFecRepairEvidenceQuery {
+            severity_bucket: Some(WalFecRepairSeverityBucket::SixToTen),
+            ..WalFecRepairEvidenceQuery::default()
+        });
+        assert_eq!(by_severity.len(), 1);
+        assert_eq!(by_severity[0].frame_id, 303);
+
+        let min_time = cards
+            .first()
+            .map(|card| card.wall_clock_unix_ns)
+            .expect("evidence cards should include timestamps");
+        let max_time = cards
+            .last()
+            .map(|card| card.wall_clock_unix_ns)
+            .expect("evidence cards should include timestamps");
+        let by_time = query_raptorq_repair_evidence(&WalFecRepairEvidenceQuery {
+            wall_clock_start_ns: Some(min_time),
+            wall_clock_end_ns: Some(max_time),
+            ..WalFecRepairEvidenceQuery::default()
+        });
+        assert_eq!(by_time.len(), 3);
+
+        let limited = query_raptorq_repair_evidence(&WalFecRepairEvidenceQuery {
+            limit: Some(2),
+            ..WalFecRepairEvidenceQuery::default()
+        });
+        assert_eq!(limited.len(), 2);
+        assert_eq!(limited[0].frame_id, 302);
+        assert_eq!(limited[1].frame_id, 303);
     }
 }

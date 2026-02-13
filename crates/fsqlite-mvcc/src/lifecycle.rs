@@ -23,6 +23,9 @@ use crate::core_types::{
     CommitIndex, InProcessPageLockTable, Transaction, TransactionMode, TransactionState,
 };
 use crate::invariants::{SerializedWriteMutex, TxnManager, VersionStore};
+use crate::observability::{
+    mvcc_snapshot_established, mvcc_snapshot_released, record_snapshot_read_versions_traversed,
+};
 use crate::shm::SharedMemoryLayout;
 
 const DEFAULT_BUSY_TIMEOUT_MS: u64 = 100;
@@ -422,6 +425,9 @@ impl TransactionManager {
 
         let mut txn = Transaction::new(txn_id, TxnEpoch::new(0), snapshot, mode);
         txn.snapshot_established = snapshot_established;
+        if snapshot_established {
+            mvcc_snapshot_established();
+        }
         // PRAGMA is per-connection and takes effect at BEGIN (not retroactive).
         txn.ssi_enabled_at_begin = self.ssi_enabled;
 
@@ -478,6 +484,7 @@ impl TransactionManager {
         if txn.mode == TransactionMode::Serialized && !txn.snapshot_established {
             txn.snapshot = self.load_consistent_snapshot();
             txn.snapshot_established = true;
+            mvcc_snapshot_established();
             tracing::debug!(
                 txn_id = %txn.txn_id,
                 snapshot_high = txn.snapshot.high.get(),
@@ -485,8 +492,28 @@ impl TransactionManager {
             );
         }
 
-        // Resolve from version store.
-        let idx = self.version_store.resolve(pgno, &txn.snapshot)?;
+        // Resolve from version store with traversal diagnostics.
+        let snapshot_ts = txn.snapshot.high.get();
+        let span = tracing::span!(
+            tracing::Level::DEBUG,
+            "snapshot_read",
+            txn_id = txn.txn_id.get(),
+            snapshot_ts,
+            versions_traversed = tracing::field::Empty
+        );
+        let _entered = span.enter();
+        let resolve = self.version_store.resolve_with_trace(pgno, &txn.snapshot);
+        span.record("versions_traversed", resolve.versions_traversed);
+        record_snapshot_read_versions_traversed(resolve.versions_traversed);
+        tracing::debug!(
+            txn_id = %txn.txn_id,
+            page = pgno.get(),
+            snapshot_ts,
+            versions_traversed = resolve.versions_traversed,
+            "snapshot version chain traversal"
+        );
+
+        let idx = resolve.version_idx?;
         let version = self.version_store.get_version(idx)?;
         txn.record_page_read(pgno, version.commit_seq);
         Some(version.data)
@@ -733,9 +760,13 @@ impl TransactionManager {
             }
 
             // Establish/refresh snapshot.
+            let had_snapshot = txn.snapshot_established;
             txn.snapshot = snap_now;
             txn.snapshot_established = true;
             txn.serialized_write_lock_held = true;
+            if !had_snapshot {
+                mvcc_snapshot_established();
+            }
 
             tracing::debug!(
                 txn_id = %txn.txn_id,
@@ -1012,6 +1043,11 @@ impl TransactionManager {
 
     /// Release all resources held by a transaction.
     fn release_all_resources(&self, txn: &mut Transaction) {
+        if txn.snapshot_established {
+            mvcc_snapshot_released();
+            txn.snapshot_established = false;
+        }
+
         // Release page locks.
         self.lock_table.release_all(txn.txn_id);
         txn.clear_page_access_tracking();
@@ -1271,6 +1307,30 @@ mod tests {
         let result = tracing::subscriber::with_default(subscriber, f);
         let bytes = buf.lock().expect("log buffer lock").clone();
         (result, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    #[test]
+    fn test_snapshot_read_span_and_metrics() {
+        let m = mgr();
+        let pgno = PageNumber::new(44).unwrap();
+
+        let mut writer = m.begin(BeginKind::Immediate).unwrap();
+        m.write_page(&mut writer, pgno, test_data(0xA5)).unwrap();
+        assert!(m.commit(&mut writer).is_ok());
+
+        let before = crate::observability::mvcc_snapshot_metrics_snapshot();
+        let mut reader = m.begin(BeginKind::Deferred).unwrap();
+        let (read, logs) = with_tracing_capture(|| m.read_page(&mut reader, pgno));
+        assert!(read.is_some());
+
+        let after = crate::observability::mvcc_snapshot_metrics_snapshot();
+        assert!(after.versions_traversed_samples >= before.versions_traversed_samples + 1);
+        assert!(after.versions_traversed_sum >= before.versions_traversed_sum + 1);
+        assert!(after.fsqlite_mvcc_active_snapshots >= 1);
+        assert!(logs.contains("snapshot_read"));
+        assert!(logs.contains("versions_traversed"));
+
+        m.abort(&mut reader);
     }
 
     // -----------------------------------------------------------------------

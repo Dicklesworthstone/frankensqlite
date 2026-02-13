@@ -131,6 +131,37 @@ pub fn visible(version: &PageVersion, snapshot: &Snapshot) -> bool {
     version.commit_seq.get() != 0 && version.commit_seq <= snapshot.high
 }
 
+/// Visibility interval for a committed page version on a chain.
+///
+/// A version is visible for snapshots in `[begin_ts, end_ts)`, where `end_ts`
+/// is `None` for the current chain head.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VersionVisibilityRange {
+    pub begin_ts: CommitSeq,
+    pub end_ts: Option<CommitSeq>,
+}
+
+impl VersionVisibilityRange {
+    /// Whether this interval contains the snapshot high watermark.
+    #[must_use]
+    pub fn contains(self, snapshot_ts: CommitSeq) -> bool {
+        if snapshot_ts < self.begin_ts {
+            return false;
+        }
+        match self.end_ts {
+            Some(end) => snapshot_ts < end,
+            None => true,
+        }
+    }
+}
+
+/// Snapshot resolve result with traversal diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotResolveTrace {
+    pub version_idx: Option<VersionIdx>,
+    pub versions_traversed: u64,
+}
+
 // ---------------------------------------------------------------------------
 // VersionStore — version chain management
 // ---------------------------------------------------------------------------
@@ -143,6 +174,8 @@ pub struct VersionStore {
     arena: RwLock<VersionArena>,
     /// Maps each page to the head of its version chain (most recent committed version).
     chain_heads: RwLock<HashMap<PageNumber, VersionIdx, PageNumberBuildHasher>>,
+    /// Visibility intervals keyed by arena index.
+    visibility_ranges: RwLock<HashMap<VersionIdx, VersionVisibilityRange>>,
     page_size: PageSize,
 }
 
@@ -153,6 +186,7 @@ impl VersionStore {
         Self {
             arena: RwLock::new(VersionArena::new()),
             chain_heads: RwLock::new(HashMap::with_hasher(PageNumberBuildHasher::default())),
+            visibility_ranges: RwLock::new(HashMap::new()),
             page_size,
         }
     }
@@ -166,13 +200,29 @@ impl VersionStore {
     /// Returns the `VersionIdx` of the published version.
     pub fn publish(&self, version: PageVersion) -> VersionIdx {
         let pgno = version.pgno;
+        let begin_ts = version.commit_seq;
         let mut arena = self.arena.write();
         let idx = arena.alloc(version);
         drop(arena);
 
         let mut heads = self.chain_heads.write();
-        heads.insert(pgno, idx);
+        let previous_head = heads.insert(pgno, idx);
         drop(heads);
+
+        let mut ranges = self.visibility_ranges.write();
+        ranges.insert(
+            idx,
+            VersionVisibilityRange {
+                begin_ts,
+                end_ts: None,
+            },
+        );
+        if let Some(old_head) = previous_head
+            && let Some(old_range) = ranges.get_mut(&old_head)
+        {
+            old_range.end_ts = Some(begin_ts);
+        }
+        drop(ranges);
 
         tracing::debug!(pgno = pgno.get(), "version published to chain head");
         idx
@@ -188,21 +238,73 @@ impl VersionStore {
     #[must_use]
     #[allow(clippy::significant_drop_tightening)]
     pub fn resolve(&self, page: PageNumber, snapshot: &Snapshot) -> Option<VersionIdx> {
+        self.resolve_with_trace(page, snapshot).version_idx
+    }
+
+    /// Resolve with traversal diagnostics for snapshot-read instrumentation.
+    #[must_use]
+    #[allow(clippy::significant_drop_tightening)]
+    pub fn resolve_with_trace(
+        &self,
+        page: PageNumber,
+        snapshot: &Snapshot,
+    ) -> SnapshotResolveTrace {
         let heads = self.chain_heads.read();
-        let head_idx = *heads.get(&page)?;
+        let Some(&head_idx) = heads.get(&page) else {
+            return SnapshotResolveTrace {
+                version_idx: None,
+                versions_traversed: 0,
+            };
+        };
         drop(heads);
 
         let arena = self.arena.read();
+        let ranges = self.visibility_ranges.read();
         let mut current_idx = head_idx;
+        let mut traversed = 0_u64;
 
         loop {
-            let version = arena.get(current_idx)?;
-            if visible(version, snapshot) {
-                return Some(current_idx);
+            let Some(version) = arena.get(current_idx) else {
+                return SnapshotResolveTrace {
+                    version_idx: None,
+                    versions_traversed: traversed,
+                };
+            };
+            traversed = traversed.saturating_add(1);
+
+            let range = ranges.get(&current_idx).copied();
+            let begin_ts = range.map_or(version.commit_seq, |window| window.begin_ts);
+            let end_ts = range.and_then(|window| window.end_ts);
+            let is_visible = range.map_or_else(
+                || visible(version, snapshot),
+                |window| window.contains(snapshot.high),
+            );
+
+            tracing::trace!(
+                page = page.get(),
+                snapshot_ts = snapshot.high.get(),
+                version_commit_ts = version.commit_seq.get(),
+                begin_ts = begin_ts.get(),
+                end_ts = end_ts.map(CommitSeq::get),
+                versions_traversed = traversed,
+                visible = is_visible,
+                "snapshot version visibility check"
+            );
+
+            if is_visible {
+                return SnapshotResolveTrace {
+                    version_idx: Some(current_idx),
+                    versions_traversed: traversed,
+                };
             }
 
             // Walk backward through the chain via prev pointer.
-            let prev_ptr = version.prev?;
+            let Some(prev_ptr) = version.prev else {
+                return SnapshotResolveTrace {
+                    version_idx: None,
+                    versions_traversed: traversed,
+                };
+            };
             current_idx = version_pointer_to_idx(prev_ptr);
         }
     }
@@ -238,6 +340,13 @@ impl VersionStore {
     pub fn chain_head(&self, page: PageNumber) -> Option<VersionIdx> {
         let heads = self.chain_heads.read();
         heads.get(&page).copied()
+    }
+
+    /// Look up the stored begin/end visibility range for a version index.
+    #[must_use]
+    pub fn visibility_range(&self, idx: VersionIdx) -> Option<VersionVisibilityRange> {
+        let ranges = self.visibility_ranges.read();
+        ranges.get(&idx).copied()
     }
 
     /// Walk the full version chain for a page, returning all versions
@@ -341,9 +450,11 @@ impl std::fmt::Debug for VersionStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let arena = self.arena.read();
         let heads = self.chain_heads.read();
+        let ranges = self.visibility_ranges.read();
         f.debug_struct("VersionStore")
             .field("page_size", &self.page_size.get())
             .field("page_count", &heads.len())
+            .field("visibility_range_count", &ranges.len())
             .field("arena_high_water", &arena.high_water())
             .finish()
     }
@@ -828,6 +939,54 @@ mod tests {
         // Snapshot high=0: nothing visible (seq 0 is uncommitted marker).
         let snap_at_zero = make_snapshot(0);
         assert!(store.resolve(pgno, &snap_at_zero).is_none());
+    }
+
+    #[test]
+    fn test_version_visibility_ranges_track_begin_end_timestamps() {
+        let store = VersionStore::new(PageSize::DEFAULT);
+
+        let v1 = make_version(1, 1, None);
+        let idx1 = store.publish(v1);
+        let v2 = make_version(1, 5, Some(idx_to_version_pointer(idx1)));
+        let idx2 = store.publish(v2);
+        let v3 = make_version(1, 10, Some(idx_to_version_pointer(idx2)));
+        let idx3 = store.publish(v3);
+
+        let r1 = store.visibility_range(idx1).unwrap();
+        let r2 = store.visibility_range(idx2).unwrap();
+        let r3 = store.visibility_range(idx3).unwrap();
+
+        assert_eq!(r1.begin_ts, CommitSeq::new(1));
+        assert_eq!(r1.end_ts, Some(CommitSeq::new(5)));
+        assert_eq!(r2.begin_ts, CommitSeq::new(5));
+        assert_eq!(r2.end_ts, Some(CommitSeq::new(10)));
+        assert_eq!(r3.begin_ts, CommitSeq::new(10));
+        assert_eq!(r3.end_ts, None);
+    }
+
+    #[test]
+    fn test_resolve_with_trace_reports_versions_traversed() {
+        let store = VersionStore::new(PageSize::DEFAULT);
+        let pgno = PageNumber::new(1).unwrap();
+
+        let v1 = make_version(1, 1, None);
+        let idx1 = store.publish(v1);
+        let v2 = make_version(1, 5, Some(idx_to_version_pointer(idx1)));
+        let idx2 = store.publish(v2);
+        let v3 = make_version(1, 10, Some(idx_to_version_pointer(idx2)));
+        store.publish(v3);
+
+        let trace = store.resolve_with_trace(pgno, &make_snapshot(7));
+        assert_eq!(
+            trace
+                .version_idx
+                .map(|idx| store.get_version(idx).unwrap().commit_seq),
+            Some(CommitSeq::new(5))
+        );
+        assert_eq!(trace.versions_traversed, 2);
+
+        let head_trace = store.resolve_with_trace(pgno, &make_snapshot(10));
+        assert_eq!(head_trace.versions_traversed, 1);
     }
 
     #[test]

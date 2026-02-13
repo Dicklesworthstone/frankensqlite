@@ -4,10 +4,9 @@
 //! matrix (bd-mblr.7.8.1) and cross-toolchain runner (bd-mblr.7.8.2).
 
 use fsqlite_harness::toolchain_determinism::{
-    DeterminismMatrix, DeterminismRunner, WatchdogConfig, WatchdogReport, WatchdogVerdict,
-    build_canonical_corpus, canonical_probes, canonical_toolchains,
-    compute_determinism_coverage, load_watchdog_report, run_watchdog, write_watchdog_report,
-    WATCHDOG_BEAD_ID,
+    DeterminismMatrix, WATCHDOG_BEAD_ID, WatchdogConfig, WatchdogReport, WatchdogVerdict,
+    build_canonical_corpus, canonical_probes, canonical_toolchains, compute_determinism_coverage,
+    load_watchdog_report, run_watchdog, write_watchdog_report,
 };
 
 const BEAD_ID: &str = "bd-mblr.7.8";
@@ -220,19 +219,13 @@ fn canonical_toolchains_nonempty() {
 #[test]
 fn canonical_probes_nonempty() {
     let probes = canonical_probes(0x5678);
-    assert!(
-        !probes.is_empty(),
-        "bead_id={BEAD_ID} case=probes_nonempty"
-    );
+    assert!(!probes.is_empty(), "bead_id={BEAD_ID} case=probes_nonempty");
 }
 
 #[test]
 fn canonical_corpus_nonempty() {
     let corpus = build_canonical_corpus(0x9ABC);
-    assert!(
-        !corpus.is_empty(),
-        "bead_id={BEAD_ID} case=corpus_nonempty"
-    );
+    assert!(!corpus.is_empty(), "bead_id={BEAD_ID} case=corpus_nonempty");
 }
 
 #[test]

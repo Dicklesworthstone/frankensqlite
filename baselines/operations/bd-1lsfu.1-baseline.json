@@ -1,0 +1,151 @@
+{
+  "schema_version": "fsqlite-e2e.operation_baseline.v1",
+  "captured_at": "2026-xx-xxT00:00:00Z (epoch_secs: 1771008287)",
+  "methodology": {
+    "version": "fsqlite-e2e.methodology.v1",
+    "warmup_iterations": 3,
+    "min_measurement_iterations": 20,
+    "measurement_time_secs": 10,
+    "primary_statistic": "median",
+    "tail_statistic": "p95",
+    "fresh_db_per_iteration": true,
+    "identical_pragmas_enforced": true
+  },
+  "environment": {
+    "os": "Linux 6.17.0-14-generic",
+    "arch": "x86_64",
+    "cpu_count": 128,
+    "cpu_model": "AMD Ryzen Threadripper PRO 5995WX 64-Cores",
+    "ram_bytes": 536069931008,
+    "rustc_version": "rustc 1.95.0-nightly (47611e160 2026-02-12)",
+    "cargo_profile": "release"
+  },
+  "baselines": [
+    {
+      "operation": "sequential_scan",
+      "engine": "frankensqlite",
+      "row_count": 1000,
+      "iterations": 100,
+      "warmup_iterations": 10,
+      "latency": {
+        "p50_micros": 815,
+        "p95_micros": 1226,
+        "p99_micros": 1516,
+        "max_micros": 1879
+      },
+      "throughput_ops_per_sec": 1226.993865030675
+    },
+    {
+      "operation": "point_lookup",
+      "engine": "frankensqlite",
+      "row_count": 1000,
+      "iterations": 100,
+      "warmup_iterations": 10,
+      "latency": {
+        "p50_micros": 101,
+        "p95_micros": 181,
+        "p99_micros": 277,
+        "max_micros": 1024
+      },
+      "throughput_ops_per_sec": 9900.990099009901
+    },
+    {
+      "operation": "range_scan",
+      "engine": "frankensqlite",
+      "row_count": 1000,
+      "iterations": 100,
+      "warmup_iterations": 10,
+      "latency": {
+        "p50_micros": 269,
+        "p95_micros": 452,
+        "p99_micros": 616,
+        "max_micros": 760
+      },
+      "throughput_ops_per_sec": 3717.472118959108
+    },
+    {
+      "operation": "single_row_insert",
+      "engine": "frankensqlite",
+      "row_count": 0,
+      "iterations": 100,
+      "warmup_iterations": 10,
+      "latency": {
+        "p50_micros": 30,
+        "p95_micros": 73,
+        "p99_micros": 138,
+        "max_micros": 219
+      },
+      "throughput_ops_per_sec": 33333.333333333336
+    },
+    {
+      "operation": "batch_insert",
+      "engine": "frankensqlite",
+      "row_count": 100,
+      "iterations": 100,
+      "warmup_iterations": 10,
+      "latency": {
+        "p50_micros": 739,
+        "p95_micros": 1260,
+        "p99_micros": 1600,
+        "max_micros": 2071
+      },
+      "throughput_ops_per_sec": 1353.1799729364006
+    },
+    {
+      "operation": "single_row_update",
+      "engine": "frankensqlite",
+      "row_count": 1000,
+      "iterations": 100,
+      "warmup_iterations": 10,
+      "latency": {
+        "p50_micros": 406,
+        "p95_micros": 539,
+        "p99_micros": 672,
+        "max_micros": 840
+      },
+      "throughput_ops_per_sec": 2463.054187192118
+    },
+    {
+      "operation": "single_row_delete",
+      "engine": "frankensqlite",
+      "row_count": 1000,
+      "iterations": 100,
+      "warmup_iterations": 10,
+      "latency": {
+        "p50_micros": 40859,
+        "p95_micros": 44684,
+        "p99_micros": 45781,
+        "max_micros": 47309
+      },
+      "throughput_ops_per_sec": 24.474412002251647
+    },
+    {
+      "operation": "two_way_equi_join",
+      "engine": "frankensqlite",
+      "row_count": 1000,
+      "iterations": 100,
+      "warmup_iterations": 10,
+      "latency": {
+        "p50_micros": 95524,
+        "p95_micros": 100332,
+        "p99_micros": 101003,
+        "max_micros": 103015
+      },
+      "throughput_ops_per_sec": 10.46857334282484
+    },
+    {
+      "operation": "aggregation",
+      "engine": "frankensqlite",
+      "row_count": 1000,
+      "iterations": 100,
+      "warmup_iterations": 10,
+      "latency": {
+        "p50_micros": 1011,
+        "p95_micros": 1547,
+        "p99_micros": 1723,
+        "max_micros": 2366
+      },
+      "throughput_ops_per_sec": 989.1196834817013
+    }
+  ]
+}

@@ -23,6 +23,7 @@ use std::collections::HashMap;
 
 use crate::balance;
 use crate::cell::{self, BtreePageHeader, CellRef};
+use crate::instrumentation::{self, BtreeOpRuntimeStats, BtreeOpType};
 use crate::overflow;
 use crate::traits::{BtreeCursorOps, SeekResult, sealed};
 use fsqlite_error::{FrankenError, Result};
@@ -32,7 +33,7 @@ use fsqlite_types::limits::BTREE_MAX_DEPTH;
 use fsqlite_types::record::parse_record;
 use fsqlite_types::serial_type::write_varint;
 use fsqlite_types::{PageNumber, WitnessKey};
-use tracing::{debug, warn};
+use tracing::{Level, debug, trace, warn};
 
 const MAX_MUTATION_OVERFLOW_CHAIN: usize = 1_000_000;
 
@@ -259,6 +260,8 @@ pub struct BtCursor<P> {
     at_eof: bool,
     /// Read witnesses collected for SSI evidence.
     read_witnesses: Vec<WitnessKey>,
+    /// Active per-operation observability stats while a `btree_op` span is open.
+    active_op_stats: Option<BtreeOpRuntimeStats>,
 }
 
 impl<P: PageReader> BtCursor<P> {
@@ -273,6 +276,7 @@ impl<P: PageReader> BtCursor<P> {
             stack: Vec::with_capacity(BTREE_MAX_DEPTH as usize),
             at_eof: true,
             read_witnesses: Vec::new(),
+            active_op_stats: None,
         }
     }
 
@@ -345,12 +349,131 @@ impl<P: PageReader> BtCursor<P> {
         );
     }
 
+    fn note_page_visit(&mut self, page_no: PageNumber) {
+        if let Some(stats) = self.active_op_stats.as_mut() {
+            stats.record_page_visit();
+            trace!(page_number = page_no.get(), "btree page visit");
+        }
+    }
+
+    fn note_split_event(&mut self) {
+        instrumentation::record_split_event();
+        if let Some(stats) = self.active_op_stats.as_mut() {
+            stats.record_split();
+        }
+    }
+
+    fn note_merge_event(&mut self) {
+        if let Some(stats) = self.active_op_stats.as_mut() {
+            stats.record_merge();
+        }
+    }
+
+    fn measure_tree_depth(&mut self, cx: &Cx) -> Result<usize> {
+        let mut depth = 0usize;
+        let mut current_page = self.root_page;
+
+        loop {
+            if depth >= BTREE_MAX_DEPTH as usize {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!("B-tree depth exceeds maximum of {}", BTREE_MAX_DEPTH),
+                });
+            }
+
+            let entry = self.load_page(cx, current_page)?;
+            depth = depth.saturating_add(1);
+            if entry.header.page_type.is_leaf() {
+                return Ok(depth);
+            }
+
+            current_page = if entry.header.cell_count == 0 {
+                entry
+                    .header
+                    .right_child
+                    .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                        detail: "interior page has no right child".to_owned(),
+                    })?
+            } else {
+                let cell = self.parse_cell_at(&entry, 0)?;
+                cell.left_child
+                    .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                        detail: "interior cell has no left child".to_owned(),
+                    })?
+            };
+        }
+    }
+
+    fn record_depth_gauge(&mut self, cx: &Cx) -> Result<()> {
+        let depth = if self.stack.is_empty() {
+            self.measure_tree_depth(cx)?
+        } else {
+            self.stack.len()
+        };
+        instrumentation::set_depth_gauge(depth);
+        Ok(())
+    }
+
+    fn with_btree_op<T, F>(&mut self, cx: &Cx, op_type: BtreeOpType, work: F) -> Result<T>
+    where
+        F: FnOnce(&mut Self) -> Result<T>,
+    {
+        instrumentation::record_operation(op_type);
+        let span = tracing::span!(
+            Level::DEBUG,
+            "btree_op",
+            op_type = op_type.as_str(),
+            pages_visited = tracing::field::Empty,
+            splits = tracing::field::Empty,
+            merges = tracing::field::Empty
+        );
+        let _entered = span.enter();
+        debug!(op_type = op_type.as_str(), "starting btree operation");
+
+        self.active_op_stats = Some(BtreeOpRuntimeStats::default());
+        let result = work(self);
+
+        if let Err(error) = self.record_depth_gauge(cx) {
+            debug!(
+                op_type = op_type.as_str(),
+                error = %error,
+                "failed to refresh btree depth gauge"
+            );
+        }
+
+        let stats = self.active_op_stats.take().unwrap_or_default();
+        span.record("pages_visited", stats.pages_visited);
+        span.record("splits", stats.splits);
+        span.record("merges", stats.merges);
+
+        if let Err(error) = &result {
+            debug!(
+                op_type = op_type.as_str(),
+                pages_visited = stats.pages_visited,
+                splits = stats.splits,
+                merges = stats.merges,
+                error = %error,
+                "btree operation failed"
+            );
+        } else {
+            debug!(
+                op_type = op_type.as_str(),
+                pages_visited = stats.pages_visited,
+                splits = stats.splits,
+                merges = stats.merges,
+                "btree operation completed"
+            );
+        }
+
+        result
+    }
+
     /// Load a page into a stack entry.
-    fn load_page(&self, cx: &Cx, page_no: PageNumber) -> Result<StackEntry> {
+    fn load_page(&mut self, cx: &Cx, page_no: PageNumber) -> Result<StackEntry> {
         let page_data = self.pager.read_page(cx, page_no)?;
         let header_offset = cell::header_offset_for_page(page_no);
         let header = BtreePageHeader::parse(&page_data, header_offset)?;
         let cell_pointers = cell::read_cell_pointers(&page_data, &header, header_offset)?;
+        self.note_page_visit(page_no);
 
         Ok(StackEntry {
             page_no,
@@ -1080,6 +1203,7 @@ impl<P: PageWriter> BtCursor<P> {
         if depth == 1 {
             // Leaf is the root — push root down first.
             balance::balance_deeper(cx, &mut self.pager, self.root_page, self.usable_size)?;
+            self.note_split_event();
             // Root is now an interior page with 1 child at index 0.
             let outcome = balance::balance_nonroot(
                 cx,
@@ -1120,6 +1244,7 @@ impl<P: PageWriter> BtCursor<P> {
                 new_dividers,
             } = outcome
             {
+                self.note_split_event();
                 if parent_level == 0 {
                     return Err(FrankenError::internal(
                         "balance split bubbled above root (unexpected)",
@@ -1177,6 +1302,7 @@ impl<P: PageWriter> BtCursor<P> {
             let child_idx = usize::from(self.stack[level].cell_idx);
             let parent_is_root = parent_page_no == self.root_page;
 
+            self.note_merge_event();
             let outcome = balance::balance_nonroot(
                 cx,
                 &mut self.pager,
@@ -1298,11 +1424,11 @@ impl<P: PageWriter> sealed::Sealed for BtCursor<P> {}
 #[allow(clippy::missing_errors_doc)]
 impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
     fn index_move_to(&mut self, cx: &Cx, key: &[u8]) -> Result<SeekResult> {
-        self.index_seek(cx, key)
+        self.with_btree_op(cx, BtreeOpType::Seek, |cursor| cursor.index_seek(cx, key))
     }
 
     fn table_move_to(&mut self, cx: &Cx, rowid: i64) -> Result<SeekResult> {
-        self.table_seek(cx, rowid)
+        self.with_btree_op(cx, BtreeOpType::Seek, |cursor| cursor.table_seek(cx, rowid))
     }
 
     fn first(&mut self, cx: &Cx) -> Result<bool> {
@@ -1326,85 +1452,94 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
     }
 
     fn index_insert(&mut self, cx: &Cx, key: &[u8]) -> Result<()> {
-        let seek = self.index_seek(cx, key)?;
-        let mut insert_idx = self
-            .stack
-            .last()
-            .ok_or_else(|| FrankenError::internal("cursor stack is empty"))?
-            .cell_idx;
-        if seek.is_found() {
-            // Index allows duplicate keys; place after the existing one.
-            insert_idx = insert_idx.saturating_add(1);
-        }
-
-        let (cell_data, overflow_head) = self.encode_index_leaf_cell(cx, key)?;
-
-        match self.try_insert_on_leaf(cx, insert_idx, &cell_data) {
-            Ok(true) => Ok(()),
-            Ok(false) => {
-                // Page full — balance and redistribute.
-                self.balance_for_insert(cx, &cell_data, insert_idx)
+        self.with_btree_op(cx, BtreeOpType::Insert, |cursor| {
+            let seek = cursor.index_seek(cx, key)?;
+            let mut insert_idx = cursor
+                .stack
+                .last()
+                .ok_or_else(|| FrankenError::internal("cursor stack is empty"))?
+                .cell_idx;
+            if seek.is_found() {
+                // Index allows duplicate keys; place after the existing one.
+                insert_idx = insert_idx.saturating_add(1);
             }
-            Err(error) => {
-                if let Some(first) = overflow_head {
-                    let _ = self.free_overflow_chain(cx, first);
+
+            let (cell_data, overflow_head) = cursor.encode_index_leaf_cell(cx, key)?;
+
+            match cursor.try_insert_on_leaf(cx, insert_idx, &cell_data) {
+                Ok(true) => Ok(()),
+                Ok(false) => {
+                    // Page full — balance and redistribute.
+                    cursor.balance_for_insert(cx, &cell_data, insert_idx)
                 }
-                Err(error)
+                Err(error) => {
+                    if let Some(first) = overflow_head {
+                        let _ = cursor.free_overflow_chain(cx, first);
+                    }
+                    Err(error)
+                }
             }
-        }
+        })
     }
 
     fn table_insert(&mut self, cx: &Cx, rowid: i64, data: &[u8]) -> Result<()> {
-        let seek = self.table_seek(cx, rowid)?;
-        if seek.is_found() {
-            return Err(FrankenError::PrimaryKeyViolation);
-        }
-
-        let insert_idx = self
-            .stack
-            .last()
-            .ok_or_else(|| FrankenError::internal("cursor stack is empty"))?
-            .cell_idx;
-
-        let (cell_data, overflow_head) = self.encode_table_leaf_cell(cx, rowid, data)?;
-
-        match self.try_insert_on_leaf(cx, insert_idx, &cell_data) {
-            Ok(true) => Ok(()),
-            Ok(false) => {
-                // Page full — balance and redistribute.
-                self.balance_for_insert(cx, &cell_data, insert_idx)
+        self.with_btree_op(cx, BtreeOpType::Insert, |cursor| {
+            let seek = cursor.table_seek(cx, rowid)?;
+            if seek.is_found() {
+                return Err(FrankenError::PrimaryKeyViolation);
             }
-            Err(error) => {
-                if let Some(first) = overflow_head {
-                    let _ = self.free_overflow_chain(cx, first);
+
+            let insert_idx = cursor
+                .stack
+                .last()
+                .ok_or_else(|| FrankenError::internal("cursor stack is empty"))?
+                .cell_idx;
+
+            let (cell_data, overflow_head) = cursor.encode_table_leaf_cell(cx, rowid, data)?;
+
+            match cursor.try_insert_on_leaf(cx, insert_idx, &cell_data) {
+                Ok(true) => Ok(()),
+                Ok(false) => {
+                    // Page full — balance and redistribute.
+                    cursor.balance_for_insert(cx, &cell_data, insert_idx)
                 }
-                Err(error)
+                Err(error) => {
+                    if let Some(first) = overflow_head {
+                        let _ = cursor.free_overflow_chain(cx, first);
+                    }
+                    Err(error)
+                }
             }
-        }
+        })
     }
 
     fn delete(&mut self, cx: &Cx) -> Result<()> {
-        if self.at_eof || self.stack.is_empty() {
-            return Err(FrankenError::internal("cursor at EOF"));
-        }
+        self.with_btree_op(cx, BtreeOpType::Delete, |cursor| {
+            if cursor.at_eof || cursor.stack.is_empty() {
+                return Err(FrankenError::internal("cursor at EOF"));
+            }
 
-        let top = self.stack.last().unwrap();
-        if !top.header.page_type.is_leaf() {
-            return Err(FrankenError::internal("cursor must be on a leaf to delete"));
-        }
+            let top = cursor
+                .stack
+                .last()
+                .ok_or_else(|| FrankenError::internal("cursor stack is empty"))?;
+            if !top.header.page_type.is_leaf() {
+                return Err(FrankenError::internal("cursor must be on a leaf to delete"));
+            }
 
-        // Remove the cell from the leaf. This handles overflow chain
-        // cleanup and refreshes the stack entry.
-        let (_leaf_page_no, new_count) = self.remove_cell_from_leaf(cx)?;
+            // Remove the cell from the leaf. This handles overflow chain
+            // cleanup and refreshes the stack entry.
+            let (_leaf_page_no, new_count) = cursor.remove_cell_from_leaf(cx)?;
 
-        // Trigger structural rebalance only when a non-root leaf drains.
-        // This avoids aggressive full-sibling rewrites on every delete while
-        // still fixing the "empty leftmost leaf breaks first()" failure mode.
-        if new_count == 0 {
-            self.balance_for_delete(cx)?;
-        }
+            // Trigger structural rebalance only when a non-root leaf drains.
+            // This avoids aggressive full-sibling rewrites on every delete while
+            // still fixing the "empty leftmost leaf breaks first()" failure mode.
+            if new_count == 0 {
+                cursor.balance_for_delete(cx)?;
+            }
 
-        Ok(())
+            Ok(())
+        })
     }
 
     fn payload(&self, cx: &Cx) -> Result<Vec<u8>> {
@@ -1453,6 +1588,7 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
 #[allow(clippy::cast_possible_truncation)]
 mod tests {
     use super::*;
+    use crate::instrumentation::btree_metrics_snapshot;
     use fsqlite_pager::{MockMvccPager, MvccPager as _, TransactionMode};
     use fsqlite_types::SqliteValue;
     use fsqlite_types::record::serialize_record;
@@ -1552,6 +1688,73 @@ mod tests {
     }
 
     const USABLE: u32 = 4096;
+
+    #[test]
+    fn test_btree_observability_operation_totals() {
+        let before = btree_metrics_snapshot();
+
+        let cx = Cx::new();
+        let root = PageNumber::new(2).unwrap();
+        let store = MemPageStore::with_empty_table(root, USABLE);
+        let mut cursor = BtCursor::new(store, root, USABLE, true);
+
+        cursor.table_insert(&cx, 7, b"payload").unwrap();
+        assert!(cursor.table_move_to(&cx, 7).unwrap().is_found());
+        cursor.delete(&cx).unwrap();
+
+        let after = btree_metrics_snapshot();
+        assert!(
+            after.fsqlite_btree_operations_total.seek
+                >= before.fsqlite_btree_operations_total.seek.saturating_add(1)
+        );
+        assert!(
+            after.fsqlite_btree_operations_total.insert
+                >= before
+                    .fsqlite_btree_operations_total
+                    .insert
+                    .saturating_add(1)
+        );
+        assert!(
+            after.fsqlite_btree_operations_total.delete
+                >= before
+                    .fsqlite_btree_operations_total
+                    .delete
+                    .saturating_add(1)
+        );
+        assert!(after.fsqlite_btree_depth >= 1);
+    }
+
+    #[test]
+    fn test_btree_observability_split_counter_and_depth_gauge() {
+        let before = btree_metrics_snapshot();
+
+        let cx = Cx::new();
+        let root = PageNumber::new(2).unwrap();
+        let store = MemPageStore::with_empty_table(root, USABLE);
+        let mut cursor = BtCursor::new(store, root, USABLE, true);
+
+        let payload = vec![0xAB; 220];
+        for rowid in 1_i64..=500_i64 {
+            cursor.table_insert(&cx, rowid, &payload).unwrap();
+        }
+
+        let snapshot = btree_metrics_snapshot();
+        assert!(
+            snapshot.fsqlite_btree_page_splits_total > before.fsqlite_btree_page_splits_total,
+            "expected at least one split when loading large rows"
+        );
+        assert!(
+            snapshot.fsqlite_btree_depth >= 2,
+            "depth gauge should reflect root split into multi-level tree"
+        );
+        assert!(
+            snapshot.fsqlite_btree_operations_total.insert
+                >= before
+                    .fsqlite_btree_operations_total
+                    .insert
+                    .saturating_add(500)
+        );
+    }
 
     /// Helper: build a leaf table page with sorted (rowid, payload) entries.
     fn build_leaf_table(entries: &[(i64, &[u8])]) -> Vec<u8> {

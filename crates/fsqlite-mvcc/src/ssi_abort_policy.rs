@@ -4,7 +4,15 @@
 //! dangerous structure is detected, plus continuous monitoring via e-process and
 //! conformal calibration.
 
+use std::collections::VecDeque;
 use std::fmt;
+use std::str::FromStr;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use fsqlite_types::{CommitSeq, PageNumber, TxnToken};
 
 // ---------------------------------------------------------------------------
 // Loss matrix (§5.7.3 Bayesian Decision Framework)
@@ -242,6 +250,439 @@ impl AbortDecisionEnvelope {
 }
 
 // ---------------------------------------------------------------------------
+// SSI Evidence Ledger (galaxy-brain decision cards)
+// ---------------------------------------------------------------------------
+
+/// Decision type emitted by SSI commit-time validation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SsiDecisionType {
+    CommitAllowed,
+    AbortWriteSkew,
+    AbortPhantom,
+    AbortCycle,
+}
+
+impl SsiDecisionType {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CommitAllowed => "COMMIT_ALLOWED",
+            Self::AbortWriteSkew => "ABORT_WRITE_SKEW",
+            Self::AbortPhantom => "ABORT_PHANTOM",
+            Self::AbortCycle => "ABORT_CYCLE",
+        }
+    }
+}
+
+impl fmt::Display for SsiDecisionType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for SsiDecisionType {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let normalized = value.trim().to_ascii_uppercase();
+        match normalized.as_str() {
+            "COMMIT_ALLOWED" => Ok(Self::CommitAllowed),
+            "ABORT_WRITE_SKEW" => Ok(Self::AbortWriteSkew),
+            "ABORT_PHANTOM" => Ok(Self::AbortPhantom),
+            "ABORT_CYCLE" => Ok(Self::AbortCycle),
+            _ => Err("unrecognized SSI decision type"),
+        }
+    }
+}
+
+/// Compact read-set summary stored in each galaxy-brain card.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SsiReadSetSummary {
+    pub page_count: usize,
+    pub top_k_pages: Vec<PageNumber>,
+    pub bloom_fingerprint: u64,
+}
+
+impl SsiReadSetSummary {
+    #[must_use]
+    pub fn from_pages(read_set_pages: &[PageNumber], top_k: usize) -> Self {
+        let mut sorted = read_set_pages.to_vec();
+        sorted.sort_by_key(|page| page.get());
+        sorted.dedup();
+        let top_k_pages = sorted.iter().copied().take(top_k.max(1)).collect();
+        Self {
+            page_count: sorted.len(),
+            top_k_pages,
+            bloom_fingerprint: read_set_fingerprint(&sorted),
+        }
+    }
+}
+
+/// Card payload before chain hash / epoch assignment.
+#[derive(Debug, Clone)]
+pub struct SsiDecisionCardDraft {
+    pub decision_type: SsiDecisionType,
+    pub txn: TxnToken,
+    pub snapshot_seq: CommitSeq,
+    pub commit_seq: Option<CommitSeq>,
+    pub conflicting_txns: Vec<TxnToken>,
+    pub conflict_pages: Vec<PageNumber>,
+    pub read_set_pages: Vec<PageNumber>,
+    pub write_set: Vec<PageNumber>,
+    pub rationale: String,
+    pub timestamp_unix_ns: u64,
+}
+
+impl SsiDecisionCardDraft {
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub fn new(
+        decision_type: SsiDecisionType,
+        txn: TxnToken,
+        snapshot_seq: CommitSeq,
+        conflicting_txns: Vec<TxnToken>,
+        conflict_pages: Vec<PageNumber>,
+        read_set_pages: Vec<PageNumber>,
+        write_set: Vec<PageNumber>,
+        rationale: impl Into<String>,
+    ) -> Self {
+        Self {
+            decision_type,
+            txn,
+            snapshot_seq,
+            commit_seq: None,
+            conflicting_txns,
+            conflict_pages,
+            read_set_pages,
+            write_set,
+            rationale: rationale.into(),
+            timestamp_unix_ns: now_unix_ns(),
+        }
+    }
+
+    #[must_use]
+    pub const fn with_commit_seq(mut self, commit_seq: CommitSeq) -> Self {
+        self.commit_seq = Some(commit_seq);
+        self
+    }
+
+    #[must_use]
+    pub const fn with_timestamp_unix_ns(mut self, timestamp_unix_ns: u64) -> Self {
+        self.timestamp_unix_ns = timestamp_unix_ns;
+        self
+    }
+}
+
+/// Immutable append-only galaxy-brain card persisted by the evidence ledger.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SsiDecisionCard {
+    pub decision_type: SsiDecisionType,
+    pub txn: TxnToken,
+    pub snapshot_seq: CommitSeq,
+    pub commit_seq: Option<CommitSeq>,
+    pub conflicting_txns: Vec<TxnToken>,
+    pub conflict_pages: Vec<PageNumber>,
+    pub read_set_summary: SsiReadSetSummary,
+    pub write_set: Vec<PageNumber>,
+    pub rationale: String,
+    pub timestamp_unix_ns: u64,
+    pub decision_epoch: u64,
+    pub chain_hash: [u8; 32],
+}
+
+impl SsiDecisionCard {
+    #[must_use]
+    pub fn chain_hash_hex(&self) -> String {
+        hex_encode(self.chain_hash)
+    }
+}
+
+/// Filter options for listing evidence cards.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SsiDecisionQuery {
+    pub txn_id: Option<u64>,
+    pub decision_type: Option<SsiDecisionType>,
+    pub timestamp_start_ns: Option<u64>,
+    pub timestamp_end_ns: Option<u64>,
+}
+
+#[derive(Debug)]
+struct SsiEvidenceLedgerState {
+    capacity: usize,
+    next_epoch: u64,
+    chain_tip: [u8; 32],
+    entries: VecDeque<SsiDecisionCard>,
+}
+
+impl SsiEvidenceLedgerState {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            next_epoch: 1,
+            chain_tip: [0_u8; 32],
+            entries: VecDeque::new(),
+        }
+    }
+
+    fn append(&mut self, draft: SsiDecisionCardDraft) {
+        let mut conflicting_txns = draft.conflicting_txns;
+        conflicting_txns.sort_by(|left, right| {
+            left.id
+                .get()
+                .cmp(&right.id.get())
+                .then_with(|| left.epoch.get().cmp(&right.epoch.get()))
+        });
+        conflicting_txns.dedup();
+
+        let mut conflict_pages = draft.conflict_pages;
+        conflict_pages.sort_by_key(|page| page.get());
+        conflict_pages.dedup();
+
+        let mut write_set = draft.write_set;
+        write_set.sort_by_key(|page| page.get());
+        write_set.dedup();
+
+        let mut read_set_pages = draft.read_set_pages;
+        read_set_pages.sort_by_key(|page| page.get());
+        read_set_pages.dedup();
+        let read_set_summary = SsiReadSetSummary::from_pages(&read_set_pages, 8);
+
+        let decision_epoch = self.next_epoch;
+        self.next_epoch = self.next_epoch.saturating_add(1);
+        let chain_hash = compute_chain_hash(
+            self.chain_tip,
+            draft.decision_type,
+            draft.txn,
+            draft.snapshot_seq,
+            draft.commit_seq,
+            decision_epoch,
+            draft.timestamp_unix_ns,
+            &conflicting_txns,
+            &conflict_pages,
+            &read_set_pages,
+            &write_set,
+            &draft.rationale,
+        );
+        self.chain_tip = chain_hash;
+
+        if self.entries.len() == self.capacity {
+            let _ = self.entries.pop_front();
+        }
+        self.entries.push_back(SsiDecisionCard {
+            decision_type: draft.decision_type,
+            txn: draft.txn,
+            snapshot_seq: draft.snapshot_seq,
+            commit_seq: draft.commit_seq,
+            conflicting_txns,
+            conflict_pages,
+            read_set_summary,
+            write_set,
+            rationale: draft.rationale,
+            timestamp_unix_ns: draft.timestamp_unix_ns,
+            decision_epoch,
+            chain_hash,
+        });
+    }
+}
+
+/// Bounded append-only ledger for SSI decision cards.
+#[derive(Debug)]
+pub struct SsiEvidenceLedger {
+    state: Arc<Mutex<SsiEvidenceLedgerState>>,
+    pending: Arc<AtomicUsize>,
+    tx: Option<mpsc::Sender<SsiDecisionCardDraft>>,
+}
+
+impl SsiEvidenceLedger {
+    #[must_use]
+    pub fn new(capacity: usize) -> Self {
+        let state = Arc::new(Mutex::new(SsiEvidenceLedgerState::new(capacity)));
+        let pending = Arc::new(AtomicUsize::new(0));
+        let (tx, rx) = mpsc::channel();
+
+        let worker_state = Arc::clone(&state);
+        let worker_pending = Arc::clone(&pending);
+        let worker = thread::Builder::new()
+            .name("fsqlite-ssi-ledger".to_owned())
+            .spawn(move || {
+                while let Ok(draft) = rx.recv() {
+                    with_locked_state(&worker_state, |inner| inner.append(draft));
+                    let _ = worker_pending.fetch_sub(1, Ordering::AcqRel);
+                }
+            });
+
+        let tx = if worker.is_ok() { Some(tx) } else { None };
+
+        Self { state, pending, tx }
+    }
+
+    /// Non-blocking append path used from commit/abort critical sections.
+    pub fn record_async(&self, draft: SsiDecisionCardDraft) {
+        if let Some(tx) = &self.tx {
+            let _ = self.pending.fetch_add(1, Ordering::AcqRel);
+            if tx.send(draft.clone()).is_ok() {
+                return;
+            }
+            let _ = self.pending.fetch_sub(1, Ordering::AcqRel);
+        }
+        self.record_sync(draft);
+    }
+
+    /// Immediate append fallback used when the async worker is unavailable.
+    pub fn record_sync(&self, draft: SsiDecisionCardDraft) {
+        with_locked_state(&self.state, |inner| inner.append(draft));
+    }
+
+    /// Return all retained cards in insertion order.
+    #[must_use]
+    pub fn snapshot(&self) -> Vec<SsiDecisionCard> {
+        self.await_quiescence(Duration::from_millis(25));
+        with_locked_state(&self.state, |inner| inner.entries.iter().cloned().collect())
+    }
+
+    /// Return cards matching the given query.
+    #[must_use]
+    pub fn query(&self, query: &SsiDecisionQuery) -> Vec<SsiDecisionCard> {
+        self.await_quiescence(Duration::from_millis(25));
+        with_locked_state(&self.state, |inner| {
+            inner
+                .entries
+                .iter()
+                .filter(|entry| query.txn_id.is_none_or(|txn| entry.txn.id.get() == txn))
+                .filter(|entry| {
+                    query
+                        .decision_type
+                        .is_none_or(|decision_type| entry.decision_type == decision_type)
+                })
+                .filter(|entry| {
+                    query
+                        .timestamp_start_ns
+                        .is_none_or(|start| entry.timestamp_unix_ns >= start)
+                })
+                .filter(|entry| {
+                    query
+                        .timestamp_end_ns
+                        .is_none_or(|end| entry.timestamp_unix_ns <= end)
+                })
+                .cloned()
+                .collect()
+        })
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.await_quiescence(Duration::from_millis(25));
+        with_locked_state(&self.state, |inner| inner.entries.len())
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn await_quiescence(&self, timeout: Duration) {
+        let start = Instant::now();
+        while self.pending.load(Ordering::Acquire) > 0 && start.elapsed() < timeout {
+            thread::sleep(Duration::from_micros(50));
+        }
+    }
+}
+
+impl Default for SsiEvidenceLedger {
+    fn default() -> Self {
+        Self::new(1024)
+    }
+}
+
+fn with_locked_state<T>(
+    state: &Arc<Mutex<SsiEvidenceLedgerState>>,
+    f: impl FnOnce(&mut SsiEvidenceLedgerState) -> T,
+) -> T {
+    match state.lock() {
+        Ok(mut guard) => f(&mut guard),
+        Err(poisoned) => {
+            let mut guard = poisoned.into_inner();
+            f(&mut guard)
+        }
+    }
+}
+
+fn now_unix_ns() -> u64 {
+    let Ok(duration) = SystemTime::now().duration_since(UNIX_EPOCH) else {
+        return 0;
+    };
+    let nanos = duration.as_nanos();
+    u64::try_from(nanos).unwrap_or(u64::MAX)
+}
+
+fn read_set_fingerprint(read_set_pages: &[PageNumber]) -> u64 {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"fsqlite:ssi_read_set_fingerprint:v1");
+    for page in read_set_pages {
+        hasher.update(&page.get().to_le_bytes());
+    }
+    let hash = hasher.finalize();
+    let mut bytes = [0_u8; 8];
+    bytes.copy_from_slice(&hash.as_bytes()[..8]);
+    u64::from_le_bytes(bytes)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compute_chain_hash(
+    previous_hash: [u8; 32],
+    decision_type: SsiDecisionType,
+    txn: TxnToken,
+    snapshot_seq: CommitSeq,
+    commit_seq: Option<CommitSeq>,
+    decision_epoch: u64,
+    timestamp_unix_ns: u64,
+    conflicting_txns: &[TxnToken],
+    conflict_pages: &[PageNumber],
+    read_set_pages: &[PageNumber],
+    write_set: &[PageNumber],
+    rationale: &str,
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"fsqlite:ssi_evidence_ledger:v1");
+    hasher.update(&previous_hash);
+    hasher.update(decision_type.as_str().as_bytes());
+    hasher.update(&txn.id.get().to_le_bytes());
+    hasher.update(&txn.epoch.get().to_le_bytes());
+    hasher.update(&snapshot_seq.get().to_le_bytes());
+    hasher.update(&commit_seq.map_or(0_u64, CommitSeq::get).to_le_bytes());
+    hasher.update(&decision_epoch.to_le_bytes());
+    hasher.update(&timestamp_unix_ns.to_le_bytes());
+
+    for token in conflicting_txns {
+        hasher.update(&token.id.get().to_le_bytes());
+        hasher.update(&token.epoch.get().to_le_bytes());
+    }
+    for page in conflict_pages {
+        hasher.update(&page.get().to_le_bytes());
+    }
+    for page in read_set_pages {
+        hasher.update(&page.get().to_le_bytes());
+    }
+    for page in write_set {
+        hasher.update(&page.get().to_le_bytes());
+    }
+    hasher.update(rationale.as_bytes());
+
+    let hash = hasher.finalize();
+    *hash.as_bytes()
+}
+
+fn hex_encode(bytes: [u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = [0_u8; 64];
+    for (idx, byte) in bytes.iter().copied().enumerate() {
+        out[idx * 2] = HEX[usize::from(byte >> 4)];
+        out[idx * 2 + 1] = HEX[usize::from(byte & 0x0F)];
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+// ---------------------------------------------------------------------------
 // E-Process monitor for INV-SSI-FP (§5.7.3)
 // ---------------------------------------------------------------------------
 
@@ -454,6 +895,8 @@ impl ConformalCalibrator {
 
 #[cfg(test)]
 mod tests {
+    use fsqlite_types::{TxnEpoch, TxnId};
+
     use super::*;
 
     const BEAD_ID: &str = "bd-3t3.12";
@@ -728,5 +1171,123 @@ mod tests {
             !v.to_string().is_empty(),
             "bead_id={BEAD_ID} victim_display"
         );
+    }
+
+    fn token(raw: u64, epoch: u32) -> TxnToken {
+        TxnToken::new(
+            TxnId::new(raw).expect("token raw id must be non-zero"),
+            TxnEpoch::new(epoch),
+        )
+    }
+
+    fn page(raw: u32) -> PageNumber {
+        PageNumber::new(raw).expect("page number must be non-zero")
+    }
+
+    #[test]
+    fn test_ssi_evidence_ledger_append_only_chain_and_capacity() {
+        let ledger = SsiEvidenceLedger::new(2);
+        ledger.record_sync(
+            SsiDecisionCardDraft::new(
+                SsiDecisionType::CommitAllowed,
+                token(1, 1),
+                CommitSeq::new(10),
+                Vec::new(),
+                vec![page(7)],
+                vec![page(1), page(2)],
+                vec![page(7)],
+                "clean_commit",
+            )
+            .with_commit_seq(CommitSeq::new(11))
+            .with_timestamp_unix_ns(1_000),
+        );
+        ledger.record_sync(
+            SsiDecisionCardDraft::new(
+                SsiDecisionType::AbortWriteSkew,
+                token(2, 1),
+                CommitSeq::new(11),
+                vec![token(1, 1)],
+                vec![page(7), page(9)],
+                vec![page(7), page(8)],
+                vec![page(9)],
+                "pivot_in_out_rw",
+            )
+            .with_timestamp_unix_ns(2_000),
+        );
+        ledger.record_sync(
+            SsiDecisionCardDraft::new(
+                SsiDecisionType::AbortCycle,
+                token(3, 1),
+                CommitSeq::new(12),
+                vec![token(1, 1), token(2, 1)],
+                vec![page(7)],
+                vec![page(7)],
+                vec![page(7)],
+                "fcw_conflict",
+            )
+            .with_timestamp_unix_ns(3_000),
+        );
+
+        let cards = ledger.snapshot();
+        assert_eq!(cards.len(), 2, "bead_id={BEAD_ID} bounded_capacity");
+        assert_eq!(cards[0].txn.id.get(), 2);
+        assert_eq!(cards[1].txn.id.get(), 3);
+        assert_ne!(
+            cards[0].chain_hash, cards[1].chain_hash,
+            "bead_id={BEAD_ID} chain_hash_must_advance"
+        );
+    }
+
+    #[test]
+    fn test_ssi_evidence_ledger_query_filters() {
+        let ledger = SsiEvidenceLedger::new(8);
+        ledger.record_sync(
+            SsiDecisionCardDraft::new(
+                SsiDecisionType::CommitAllowed,
+                token(10, 1),
+                CommitSeq::new(20),
+                Vec::new(),
+                Vec::new(),
+                vec![page(3), page(4)],
+                vec![page(9)],
+                "commit",
+            )
+            .with_timestamp_unix_ns(10_000),
+        );
+        ledger.record_sync(
+            SsiDecisionCardDraft::new(
+                SsiDecisionType::AbortWriteSkew,
+                token(11, 2),
+                CommitSeq::new(20),
+                vec![token(10, 1)],
+                vec![page(9)],
+                vec![page(9), page(10)],
+                vec![page(11)],
+                "pivot_abort",
+            )
+            .with_timestamp_unix_ns(20_000),
+        );
+
+        let by_txn = ledger.query(&SsiDecisionQuery {
+            txn_id: Some(11),
+            ..SsiDecisionQuery::default()
+        });
+        assert_eq!(by_txn.len(), 1);
+        assert_eq!(by_txn[0].txn.id.get(), 11);
+
+        let by_type = ledger.query(&SsiDecisionQuery {
+            decision_type: Some(SsiDecisionType::AbortWriteSkew),
+            ..SsiDecisionQuery::default()
+        });
+        assert_eq!(by_type.len(), 1);
+        assert_eq!(by_type[0].decision_type, SsiDecisionType::AbortWriteSkew);
+
+        let by_time = ledger.query(&SsiDecisionQuery {
+            timestamp_start_ns: Some(15_000),
+            timestamp_end_ns: Some(25_000),
+            ..SsiDecisionQuery::default()
+        });
+        assert_eq!(by_time.len(), 1);
+        assert_eq!(by_time[0].txn.id.get(), 11);
     }
 }

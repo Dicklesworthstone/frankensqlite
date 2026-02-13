@@ -2399,8 +2399,8 @@ pub fn write_watchdog_report(
 
 /// Load a watchdog report from a file.
 pub fn load_watchdog_report(path: &std::path::Path) -> Result<WatchdogReport, String> {
-    let data = std::fs::read_to_string(path)
-        .map_err(|e| format!("read {}: {e}", path.display()))?;
+    let data =
+        std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
     WatchdogReport::from_json(&data).map_err(|e| format!("parse {}: {e}", path.display()))
 }
 
@@ -2435,11 +2435,7 @@ pub fn run_watchdog(config: &WatchdogConfig) -> WatchdogReport {
 
     let summary = format!(
         "Watchdog: {} probes across {} toolchains, {} failures, {} drift warnings, overall={}",
-        session.probe_count,
-        session.toolchain_count,
-        probe_failures,
-        drift_warnings,
-        verdict,
+        session.probe_count, session.toolchain_count, probe_failures, drift_warnings, verdict,
     );
 
     WatchdogReport {

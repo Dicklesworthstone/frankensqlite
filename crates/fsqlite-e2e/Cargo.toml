@@ -82,3 +82,7 @@ harness = false
 [[bench]]
 name = "concurrent_write_bench"
 harness = false
+
+[[bench]]
+name = "operation_baseline_bench"
+harness = false

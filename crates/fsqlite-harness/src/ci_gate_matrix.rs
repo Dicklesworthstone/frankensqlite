@@ -26,6 +26,8 @@ use std::fmt::Write as FmtWrite;
 
 use serde::{Deserialize, Serialize};
 
+use crate::verification_contract_enforcement::ContractEnforcementOutcome;
+
 #[allow(dead_code)]
 const BEAD_ID: &str = "bd-1dp9.7.3";
 
@@ -498,6 +500,9 @@ pub struct ArtifactManifest {
     pub gate_passed: bool,
     /// Bisect request if regression detected.
     pub bisect_request: Option<BisectRequest>,
+    /// Verification contract enforcement payload (bd-1dp9.7.7).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification_contract: Option<ContractEnforcementOutcome>,
 }
 
 impl ArtifactManifest {
@@ -522,6 +527,14 @@ impl ArtifactManifest {
                 errors.push(format!(
                     "artifact[{i}].content_hash must be 64 hex chars, got {}",
                     artifact.content_hash.len(),
+                ));
+            }
+        }
+        if let Some(contract) = &self.verification_contract {
+            if contract.final_gate_passed != self.gate_passed {
+                errors.push(format!(
+                    "verification_contract.final_gate_passed={} must match gate_passed={}",
+                    contract.final_gate_passed, self.gate_passed
                 ));
             }
         }
@@ -559,6 +572,25 @@ impl ArtifactManifest {
                 bisect.good_commit, bisect.bad_commit, bisect.description,
             );
         }
+        if let Some(ref contract) = self.verification_contract {
+            let _ = writeln!(
+                out,
+                "  Verification contract: {} ({})",
+                if contract.contract_passed {
+                    "PASS"
+                } else {
+                    "FAIL"
+                },
+                contract.disposition,
+            );
+            let _ = writeln!(
+                out,
+                "    failing_beads={} missing_evidence_beads={} invalid_reference_beads={}",
+                contract.failing_beads,
+                contract.missing_evidence_beads,
+                contract.invalid_reference_beads,
+            );
+        }
         out
     }
 }
@@ -574,6 +606,36 @@ pub fn build_artifact_manifest(
     artifacts: Vec<ArtifactEntry>,
     bisect_request: Option<BisectRequest>,
 ) -> ArtifactManifest {
+    build_artifact_manifest_with_contract(
+        lane,
+        run_id,
+        git_sha,
+        seed,
+        gate_passed,
+        artifacts,
+        bisect_request,
+        None,
+    )
+}
+
+/// Build an artifact manifest for a completed gate run with optional
+/// verification-contract enforcement payload.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn build_artifact_manifest_with_contract(
+    lane: CiLane,
+    run_id: &str,
+    git_sha: &str,
+    seed: u64,
+    base_gate_passed: bool,
+    artifacts: Vec<ArtifactEntry>,
+    bisect_request: Option<BisectRequest>,
+    verification_contract: Option<ContractEnforcementOutcome>,
+) -> ArtifactManifest {
+    let gate_passed = verification_contract
+        .as_ref()
+        .map_or(base_gate_passed, |contract| contract.final_gate_passed);
+
     ArtifactManifest {
         schema_version: "1.0.0".to_owned(),
         bead_id: BEAD_ID.to_owned(),
@@ -585,6 +647,7 @@ pub fn build_artifact_manifest(
         artifacts,
         gate_passed,
         bisect_request,
+        verification_contract,
     }
 }
 
@@ -593,6 +656,48 @@ pub fn build_artifact_manifest(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::verification_contract_enforcement::{
+        BeadContractVerdict, ContractBeadStatus, ContractEnforcementOutcome, EnforcementDisposition,
+    };
+
+    fn synthetic_contract_outcome(
+        base_gate_passed: bool,
+        contract_passed: bool,
+    ) -> ContractEnforcementOutcome {
+        let status = if contract_passed {
+            ContractBeadStatus::Pass
+        } else {
+            ContractBeadStatus::FailMissingEvidence
+        };
+        let failing_beads = if contract_passed { 0 } else { 1 };
+        let missing_evidence_beads = if contract_passed { 0 } else { 1 };
+        let disposition = match (base_gate_passed, contract_passed) {
+            (true, true) => EnforcementDisposition::Allowed,
+            (false, true) => EnforcementDisposition::BlockedByBaseGate,
+            (true, false) => EnforcementDisposition::BlockedByContract,
+            (false, false) => EnforcementDisposition::BlockedByBoth,
+        };
+
+        ContractEnforcementOutcome {
+            schema_version: 1,
+            bead_id: "bd-1dp9.7.7".to_owned(),
+            base_gate_passed,
+            contract_passed,
+            final_gate_passed: base_gate_passed && contract_passed,
+            disposition,
+            total_beads: 1,
+            failing_beads,
+            missing_evidence_beads,
+            invalid_reference_beads: 0,
+            bead_verdicts: vec![BeadContractVerdict {
+                bead_id: "bd-1dp9.7.7".to_owned(),
+                status,
+                missing_evidence_count: missing_evidence_beads,
+                invalid_reference_count: 0,
+                details: Vec::new(),
+            }],
+        }
+    }
 
     // ---- Flake Budget Tests ----
 
@@ -891,11 +996,57 @@ mod tests {
             }],
             gate_passed: false,
             bisect_request: None,
+            verification_contract: None,
         };
         let errors = manifest.validate();
         assert!(
             errors.len() >= 4,
             "should catch multiple errors: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn artifact_manifest_with_contract_blocks_gate_when_contract_fails() {
+        let manifest = build_artifact_manifest_with_contract(
+            CiLane::Unit,
+            "run-contract-block",
+            "abc123",
+            42,
+            true,
+            Vec::new(),
+            None,
+            Some(synthetic_contract_outcome(true, false)),
+        );
+
+        assert!(
+            !manifest.gate_passed,
+            "contract enforcement should block final gate pass"
+        );
+        assert!(manifest.verification_contract.is_some());
+        let summary = manifest.render_summary();
+        assert!(summary.contains("Verification contract: FAIL"));
+        assert!(summary.contains("blocked_by_contract"));
+    }
+
+    #[test]
+    fn artifact_manifest_validate_flags_contract_mismatch() {
+        let mut manifest = build_artifact_manifest_with_contract(
+            CiLane::Unit,
+            "run-contract-mismatch",
+            "abc123",
+            42,
+            true,
+            Vec::new(),
+            None,
+            Some(synthetic_contract_outcome(true, false)),
+        );
+
+        manifest.gate_passed = true;
+        let errors = manifest.validate();
+        assert!(
+            errors
+                .iter()
+                .any(|error| { error.contains("verification_contract.final_gate_passed") })
         );
     }
 

@@ -459,20 +459,16 @@ impl ForensicsWorkflowReport {
 }
 
 /// Write a forensics workflow report to a file.
-pub fn write_forensics_report(
-    path: &Path,
-    report: &ForensicsWorkflowReport,
-) -> Result<(), String> {
+pub fn write_forensics_report(path: &Path, report: &ForensicsWorkflowReport) -> Result<(), String> {
     let json = report.to_json().map_err(|e| format!("serialize: {e}"))?;
     std::fs::write(path, json).map_err(|e| format!("write {}: {e}", path.display()))
 }
 
 /// Load a forensics workflow report from a file.
 pub fn load_forensics_report(path: &Path) -> Result<ForensicsWorkflowReport, String> {
-    let data = std::fs::read_to_string(path)
-        .map_err(|e| format!("read {}: {e}", path.display()))?;
-    ForensicsWorkflowReport::from_json(&data)
-        .map_err(|e| format!("parse {}: {e}", path.display()))
+    let data =
+        std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    ForensicsWorkflowReport::from_json(&data).map_err(|e| format!("parse {}: {e}", path.display()))
 }
 
 /// Run the forensics workflow against an evidence index.

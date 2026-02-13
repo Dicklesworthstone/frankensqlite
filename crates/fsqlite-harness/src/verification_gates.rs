@@ -736,6 +736,24 @@ fn gate_specs() -> Vec<GateSpec> {
             expected_exit_code: 0,
         },
         GateSpec {
+            gate_id: "universal.verification_contract_enforcement",
+            gate_name: "Universal gate: parity verification contract enforcement",
+            scope: GateScope::Universal,
+            command: &[
+                "cargo",
+                "run",
+                "-p",
+                "fsqlite-harness",
+                "--bin",
+                "parity_evidence_matrix_gate",
+                "--",
+                "--workspace-root",
+                ".",
+            ],
+            env: &[],
+            expected_exit_code: 0,
+        },
+        GateSpec {
             gate_id: "phase2.memoryvfs_contract",
             gate_name: "Phase 2 gate: MemoryVfs contract tests",
             scope: GateScope::Phase2,
@@ -1576,12 +1594,14 @@ mod tests {
         let audit_authority = find_gate(&plan, "universal.audit_spec_authority");
         let audit_scope = find_gate(&plan, "universal.audit_scope_doctrine");
         let audit_completeness = find_gate(&plan, "universal.audit_spec_beads_completeness");
+        let contract_enforcement = find_gate(&plan, "universal.verification_contract_enforcement");
 
         assert_eq!(dep_cycles.scope, GateScope::Universal);
         assert_eq!(beads_synced.scope, GateScope::Universal);
         assert_eq!(audit_authority.scope, GateScope::Universal);
         assert_eq!(audit_scope.scope, GateScope::Universal);
         assert_eq!(audit_completeness.scope, GateScope::Universal);
+        assert_eq!(contract_enforcement.scope, GateScope::Universal);
 
         assert_eq!(dep_cycles.command.join(" "), "br dep cycles");
         assert!(
@@ -1607,6 +1627,12 @@ mod tests {
                 .command
                 .join(" ")
                 .contains("test_e2e_spec_to_beads_audit_report_schema_stable")
+        );
+        assert!(
+            contract_enforcement
+                .command
+                .join(" ")
+                .contains("parity_evidence_matrix_gate")
         );
     }
 

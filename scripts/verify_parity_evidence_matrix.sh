@@ -6,7 +6,7 @@
 # (`--expect-fail`) for negative-path verification scenarios.
 #
 # Usage:
-#   ./scripts/verify_parity_evidence_matrix.sh [--json] [--expect-fail] [--workspace-root <PATH>]
+#   ./scripts/verify_parity_evidence_matrix.sh [--json] [--expect-fail] [--workspace-root <PATH>] [--traceability-override <PATH>] [--expect-violation-kind <KIND>]
 
 set -euo pipefail
 
@@ -16,6 +16,9 @@ WORKSPACE_ROOT="$REPO_ROOT"
 RUN_ID="parity-evidence-matrix-$(date -u +%Y%m%dT%H%M%SZ)-$$"
 JSON_OUTPUT=false
 EXPECT_FAIL=false
+TRACEABILITY_OVERRIDE=""
+EXPECTED_VIOLATION_KIND=""
+FOUND_EXPECTED_VIOLATION_KIND=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -34,6 +37,24 @@ while [[ $# -gt 0 ]]; do
                 exit 2
             fi
             WORKSPACE_ROOT="$1"
+            shift
+            ;;
+        --traceability-override)
+            shift
+            if [[ $# -eq 0 ]]; then
+                echo "ERROR: --traceability-override requires a value" >&2
+                exit 2
+            fi
+            TRACEABILITY_OVERRIDE="$1"
+            shift
+            ;;
+        --expect-violation-kind)
+            shift
+            if [[ $# -eq 0 ]]; then
+                echo "ERROR: --expect-violation-kind requires a value" >&2
+                exit 2
+            fi
+            EXPECTED_VIOLATION_KIND="$1"
             shift
             ;;
         *)
@@ -66,9 +87,15 @@ else
 fi
 
 GATE_EXIT=0
+GATE_ARGS=(
+    --workspace-root "$WORKSPACE_ROOT"
+    --output "$REPORT_PATH"
+)
+if [[ -n "$TRACEABILITY_OVERRIDE" ]]; then
+    GATE_ARGS+=(--traceability-override "$TRACEABILITY_OVERRIDE")
+fi
 if cargo run -p fsqlite-harness --bin parity_evidence_matrix_gate -- \
-    --workspace-root "$WORKSPACE_ROOT" \
-    --output "$REPORT_PATH" >/dev/null 2>&1; then
+    "${GATE_ARGS[@]}" >/dev/null 2>&1; then
     GATE_RESULT="pass"
 else
     GATE_EXIT=$?
@@ -82,6 +109,14 @@ if [[ ! -f "$REPORT_PATH" ]]; then
 else
     REPORT_HASH="$(sha256sum "$REPORT_PATH" | awk '{print $1}')"
     VIOLATION_COUNT="$(jq -r '.summary.violation_count // 0' "$REPORT_PATH" 2>/dev/null || echo 0)"
+    if [[ -n "$EXPECTED_VIOLATION_KIND" ]]; then
+        if jq -e --arg kind "$EXPECTED_VIOLATION_KIND" \
+            '.violations[]? | select(.kind == $kind)' "$REPORT_PATH" >/dev/null; then
+            FOUND_EXPECTED_VIOLATION_KIND=true
+        else
+            ERRORS=$((ERRORS + 1))
+        fi
+    fi
 fi
 
 if [[ "$EXPECT_FAIL" == "true" ]]; then
@@ -104,7 +139,10 @@ if [[ "$JSON_OUTPUT" == "true" ]]; then
   "bead_id": "bd-1dp9.7.5",
   "module_hash": "$MODULE_HASH",
   "workspace_root": "$WORKSPACE_ROOT",
+  "traceability_override": "$TRACEABILITY_OVERRIDE",
   "expect_fail": $EXPECT_FAIL,
+  "expected_violation_kind": "$EXPECTED_VIOLATION_KIND",
+  "found_expected_violation_kind": $FOUND_EXPECTED_VIOLATION_KIND,
   "unit_tests": {
     "result": "$TEST_RESULT",
     "count": $TEST_COUNT
@@ -125,7 +163,10 @@ else
     echo "Run ID:            $RUN_ID"
     echo "Module hash:       $MODULE_HASH"
     echo "Workspace root:    $WORKSPACE_ROOT"
+    echo "Traceability ovrd: ${TRACEABILITY_OVERRIDE:-<none>}"
     echo "Expect fail mode:  $EXPECT_FAIL"
+    echo "Expected violation:${EXPECTED_VIOLATION_KIND:-<none>}"
+    echo "Violation found:   $FOUND_EXPECTED_VIOLATION_KIND"
     echo ""
     echo "--- Unit Tests ---"
     echo "Result:            $TEST_RESULT"

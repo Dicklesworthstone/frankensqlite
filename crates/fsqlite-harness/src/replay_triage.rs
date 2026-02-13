@@ -20,7 +20,7 @@ use std::fmt::Write as FmtWrite;
 use serde::{Deserialize, Serialize};
 
 use crate::ci_gate_matrix::{ArtifactManifest, BisectRequest};
-use crate::e2e_log_schema::{LogEventSchema, LogEventType, LogPhase};
+use crate::e2e_log_schema::{LogEventSchema, LogEventType};
 use crate::log_schema_validator::{
     DecodedStream, ValidationReport, decode_jsonl_stream, validate_event_stream,
 };
@@ -556,6 +556,202 @@ pub fn render_reproducibility_checklist(config: &ReplayConfig) -> String {
     out
 }
 
+// ---- Orchestrator: Full Replay-Triage Workflow (bd-1dp9.7.4) ----
+
+/// Public bead identifier for the replay-triage workflow.
+pub const REPLAY_TRIAGE_BEAD_ID: &str = "bd-1dp9.7.4";
+
+/// Verdict of the full replay-triage workflow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReplayTriageVerdict {
+    /// No actionable failures detected.
+    Pass,
+    /// Failures detected with partial reproducibility context.
+    Warning,
+    /// Failures detected with full reproducibility context, investigation required.
+    Fail,
+}
+
+impl std::fmt::Display for ReplayTriageVerdict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Pass => write!(f, "PASS"),
+            Self::Warning => write!(f, "WARNING"),
+            Self::Fail => write!(f, "FAIL"),
+        }
+    }
+}
+
+/// Configuration for the replay-triage orchestrator.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplayTriageConfig {
+    /// Context window size for divergence rendering.
+    pub context_window: usize,
+    /// Minimum reproducibility completeness (0-5) to avoid WARNING.
+    pub min_reproducibility: usize,
+}
+
+impl Default for ReplayTriageConfig {
+    fn default() -> Self {
+        Self {
+            context_window: 3,
+            min_reproducibility: 3,
+        }
+    }
+}
+
+/// Result of running the full replay-triage workflow.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplayTriageReport {
+    /// Schema version.
+    pub schema_version: u32,
+    /// Bead identifier.
+    pub bead_id: String,
+    /// Overall verdict.
+    pub verdict: ReplayTriageVerdict,
+    /// The triage session produced from manifest + logs.
+    pub session: TriageSession,
+    /// Rendered triage report text.
+    pub triage_report_text: String,
+    /// Reproducibility checklist text (if replay config available).
+    pub reproducibility_text: Option<String>,
+    /// Divergence context texts (one per divergence).
+    pub divergence_contexts: Vec<String>,
+    /// Reproducibility completeness score (0-5).
+    pub reproducibility_score: usize,
+    /// Human-readable summary.
+    pub summary: String,
+}
+
+impl ReplayTriageReport {
+    /// Serialize to JSON.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if serialization fails.
+    pub fn to_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string_pretty(self)
+    }
+
+    /// Deserialize from JSON.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the JSON is malformed.
+    pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
+        serde_json::from_str(json)
+    }
+
+    /// Compact one-line triage summary.
+    #[must_use]
+    pub fn triage_line(&self) -> String {
+        format!(
+            "{}: divergences={} failures={} repro={}/5 events={}",
+            self.verdict,
+            self.session.divergences.len(),
+            self.session.failure_indices.len(),
+            self.reproducibility_score,
+            self.session.total_events,
+        )
+    }
+}
+
+/// Run the full replay-triage workflow: ingest manifest, decode logs, extract
+/// divergences, build replay config, render triage report.
+#[must_use]
+pub fn run_replay_triage_workflow(
+    manifest: &ArtifactManifest,
+    jsonl_content: &str,
+    config: &ReplayTriageConfig,
+) -> ReplayTriageReport {
+    // Step 1: Build triage session.
+    let session = build_triage_session(manifest, jsonl_content);
+
+    // Step 2: Render full triage report.
+    let triage_report_text = session.render_triage_report();
+
+    // Step 3: Render reproducibility checklist (if replay config available).
+    let (reproducibility_text, reproducibility_score) =
+        if let Some(ref replay) = session.replay_config {
+            let text = render_reproducibility_checklist(replay);
+            let score = [
+                replay.seed != 0,
+                !replay.scenario_id.is_empty(),
+                !replay.replay_command.is_empty(),
+                !replay.git_sha.is_empty(),
+                replay.good_commit.is_some(),
+            ]
+            .iter()
+            .filter(|&&v| v)
+            .count();
+            (Some(text), score)
+        } else {
+            (None, 0)
+        };
+
+    // Step 4: Render divergence contexts.
+    let decoded = crate::log_schema_validator::decode_jsonl_stream(jsonl_content);
+    let divergence_contexts: Vec<String> = session
+        .divergences
+        .iter()
+        .map(|div| render_divergence_context(&decoded.events, div, config.context_window))
+        .collect();
+
+    // Step 5: Determine verdict.
+    let verdict = if !session.needs_investigation() {
+        ReplayTriageVerdict::Pass
+    } else if reproducibility_score < config.min_reproducibility {
+        ReplayTriageVerdict::Warning
+    } else {
+        ReplayTriageVerdict::Fail
+    };
+
+    // Step 6: Build summary.
+    let summary = format!(
+        "Replay triage for run {}: {} divergence(s), {} failure(s), repro {}/5, verdict={}",
+        session.manifest_summary.run_id,
+        session.divergences.len(),
+        session.failure_indices.len(),
+        reproducibility_score,
+        verdict,
+    );
+
+    ReplayTriageReport {
+        schema_version: 1,
+        bead_id: REPLAY_TRIAGE_BEAD_ID.to_owned(),
+        verdict,
+        session,
+        triage_report_text,
+        reproducibility_text,
+        divergence_contexts,
+        reproducibility_score,
+        summary,
+    }
+}
+
+/// Write a replay-triage report to a JSON file.
+///
+/// # Errors
+///
+/// Returns `Err` if serialization or file writing fails.
+pub fn write_replay_triage_report(
+    path: &std::path::Path,
+    report: &ReplayTriageReport,
+) -> Result<(), String> {
+    let json = report.to_json().map_err(|e| format!("serialize: {e}"))?;
+    std::fs::write(path, json).map_err(|e| format!("write: {e}"))
+}
+
+/// Load a replay-triage report from a JSON file.
+///
+/// # Errors
+///
+/// Returns `Err` if reading or deserialization fails.
+pub fn load_replay_triage_report(path: &std::path::Path) -> Result<ReplayTriageReport, String> {
+    let json = std::fs::read_to_string(path).map_err(|e| format!("read: {e}"))?;
+    ReplayTriageReport::from_json(&json).map_err(|e| format!("parse: {e}"))
+}
+
 // ---- Tests ----
 
 #[cfg(test)]
@@ -564,6 +760,7 @@ mod tests {
     use crate::ci_gate_matrix::{
         ArtifactEntry, ArtifactKind, BisectTrigger, build_artifact_manifest, build_bisect_request,
     };
+    use crate::e2e_log_schema::LogPhase;
 
     const SEED: u64 = 20260213;
 

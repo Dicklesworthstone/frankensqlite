@@ -8,8 +8,8 @@ use fsqlite_harness::evidence_index::{
     RunId, RunRecord, ScenarioOutcome, ScenarioVerdict,
 };
 use fsqlite_harness::forensics_navigator::{
-    ForensicsVerdict, ForensicsWorkflowConfig, ForensicsWorkflowReport, QueryFilters, Severity,
-    load_forensics_report, run_forensics_workflow, write_forensics_report, FORENSICS_BEAD_ID,
+    FORENSICS_BEAD_ID, ForensicsVerdict, ForensicsWorkflowConfig, ForensicsWorkflowReport,
+    QueryFilters, Severity, load_forensics_report, run_forensics_workflow, write_forensics_report,
 };
 
 const BEAD_ID: &str = "bd-mblr.7.5";
@@ -56,11 +56,11 @@ fn make_run(id: &str, success: bool, git_sha: &str) -> RunRecord {
             content_hash: "abc123".to_owned(),
             size_bytes: 1024,
             generated_at: "2026-02-13T10:01:00Z".to_owned(),
-            description: "test log".to_owned(),
+            description: Some("test log".to_owned()),
         }],
         logs: vec![LogReference {
             path: format!("logs/{id}.jsonl"),
-            schema_version: 1,
+            schema_version: "1".to_owned(),
             event_count: 10,
             phases: vec!["setup".to_owned(), "run".to_owned()],
             has_divergence_markers: false,

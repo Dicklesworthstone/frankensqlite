@@ -44,6 +44,7 @@ pub mod performance_regression_detector;
 pub mod planner_vdbe_closure;
 pub mod ratchet_policy;
 pub mod realdb_e2e_logging;
+pub mod release_certificate;
 pub mod replay_harness;
 pub mod replay_triage;
 pub mod scheduler;
@@ -59,6 +60,7 @@ pub mod tla;
 pub mod toolchain_determinism;
 pub mod unit_fixtures;
 pub mod unit_matrix;
+pub mod verification_contract_enforcement;
 pub mod verification_gates;
 
 #[cfg(test)]
