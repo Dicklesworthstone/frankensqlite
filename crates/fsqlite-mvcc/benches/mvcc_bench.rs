@@ -18,8 +18,8 @@ use std::time::Duration;
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
 use fsqlite_mvcc::{
-    ActiveTxnView, BeginKind, CommitIndex, CommittedWriterInfo, ConcurrentRegistry,
-    DiscoveredEdge, GcTodo, InProcessPageLockTable, TransactionManager, VersionArena, VersionIdx,
+    ActiveTxnView, BeginKind, CommitIndex, CommittedWriterInfo, ConcurrentRegistry, DiscoveredEdge,
+    GcTodo, InProcessPageLockTable, TransactionManager, VersionArena, VersionIdx,
     discover_incoming_edges, discover_outgoing_edges, gc_tick, prune_page_chain,
     validate_first_committer_wins,
 };
@@ -71,8 +71,30 @@ fn seeded_scan_manager(start_page: u32, end_page: u32) -> TransactionManager {
             )
             .expect("seed write should succeed");
     }
-    manager.commit(&mut writer).expect("seed commit should succeed");
     manager
+        .commit(&mut writer)
+        .expect("seed commit should succeed");
+    manager
+}
+
+fn checksum_visible_rows(rows: &[(PageNumber, Option<PageData>)]) -> u64 {
+    let mut checksum = 0_u64;
+    for (_, page_data) in rows {
+        if let Some(page_data) = page_data {
+            for byte in page_data.as_bytes() {
+                checksum = checksum.wrapping_add(u64::from(*byte));
+            }
+        }
+    }
+    checksum
+}
+
+fn consume_rows_like_oltp(rows: &[(PageNumber, Option<PageData>)]) -> u64 {
+    let mut folded = 0_u64;
+    for _ in 0..4 {
+        folded = folded.rotate_left(7) ^ checksum_visible_rows(rows);
+    }
+    folded
 }
 
 // ---------------------------------------------------------------------------
@@ -532,9 +554,14 @@ fn bench_range_scan_tracking_overhead(c: &mut Criterion) {
                     let mut reader = manager
                         .begin(BeginKind::Concurrent)
                         .expect("reader begin should succeed");
+                    let mut rows = Vec::with_capacity(usize::try_from(pages_per_scan).unwrap_or(0));
                     for raw_page in start_page..=end_page {
-                        black_box(manager.read_page(&mut reader, page(raw_page)));
+                        rows.push((
+                            page(raw_page),
+                            manager.read_page(&mut reader, page(raw_page)),
+                        ));
                     }
+                    black_box(consume_rows_like_oltp(&rows));
                     manager.abort(&mut reader);
                 });
             },
@@ -549,8 +576,9 @@ fn bench_range_scan_tracking_overhead(c: &mut Criterion) {
                     let mut reader = manager
                         .begin(BeginKind::Concurrent)
                         .expect("reader begin should succeed");
-                    let rows = manager.read_page_range(&mut reader, page(start_page), page(end_page));
-                    black_box(rows.len());
+                    let rows =
+                        manager.read_page_range(&mut reader, page(start_page), page(end_page));
+                    black_box(consume_rows_like_oltp(&rows));
                     manager.abort(&mut reader);
                 });
             },

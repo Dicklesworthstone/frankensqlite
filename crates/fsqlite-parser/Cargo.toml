@@ -12,6 +12,7 @@ fsqlite-types = { workspace = true }
 fsqlite-error = { workspace = true }
 fsqlite-ast = { workspace = true }
 memchr = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

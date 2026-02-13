@@ -948,6 +948,7 @@ dependencies = [
  "fsqlite-types",
  "memchr",
  "proptest",
+ "tracing",
 ]
 
 [[package]]

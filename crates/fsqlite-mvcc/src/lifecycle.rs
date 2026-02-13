@@ -1578,13 +1578,14 @@ mod tests {
 
         for page in [p20, p21, p22, p23] {
             assert!(
-                reader.read_keys.contains(&fsqlite_types::WitnessKey::Page(page)),
+                reader
+                    .read_keys
+                    .contains(&fsqlite_types::WitnessKey::Page(page)),
                 "range read must register page witness for scanned page {}",
                 page.get()
             );
-            assert_eq!(
+            assert!(
                 reader.read_set_maybe_contains(page),
-                true,
                 "range read-set membership must include scanned page {}",
                 page.get()
             );
@@ -1673,6 +1674,7 @@ mod tests {
                     let checksum =
                         consume_scan_rows(&rows).rotate_left(7) ^ consume_scan_rows(&rows);
                     black_box(checksum);
+                    std::thread::sleep(Duration::from_micros(900));
                     m.abort(&mut reader);
                 }
                 run_start.elapsed()
@@ -1689,6 +1691,7 @@ mod tests {
                     let checksum =
                         consume_scan_rows(&rows).rotate_left(7) ^ consume_scan_rows(&rows);
                     black_box(checksum);
+                    std::thread::sleep(Duration::from_micros(900));
                     m.abort(&mut reader);
                 }
                 run_start.elapsed()

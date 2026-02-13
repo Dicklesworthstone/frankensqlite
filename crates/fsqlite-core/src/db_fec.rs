@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_vfs::host_fs;
-use tracing::{debug, error, info, warn};
+use tracing::{Level, debug, error, info, span, warn};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -1036,6 +1036,21 @@ pub fn generate_db_fec_from_bytes(db_data: &[u8]) -> Result<Vec<u8>> {
         }
     }
 
+    let sidecar_len = sidecar.len() as u64;
+    let page_count_u64 = u64::from(fields.page_count);
+
+    // Structured tracing span for snapshot FEC encoding.
+    let _span = span!(
+        Level::INFO,
+        "snapshot_raptorq",
+        pages_encoded = page_count_u64,
+        total_bytes = sidecar_len,
+        groups = groups.len(),
+    )
+    .entered();
+
+    GLOBAL_SNAPSHOT_FEC_METRICS.record_encode(page_count_u64, sidecar_len);
+
     info!(
         bead_id = "bd-2r4z",
         page_count = fields.page_count,
@@ -1977,5 +1992,59 @@ mod tests {
             seed_a, seed_b,
             "different groups must produce different seeds"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // Snapshot FEC metrics tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_snapshot_fec_metrics_record_and_snapshot() {
+        let m = SnapshotFecMetrics::new();
+        m.record_encode(100, 4096);
+        m.record_encode(64, 2048);
+        let s = m.snapshot();
+        assert_eq!(s.encoded_pages_total, 164);
+        assert_eq!(s.sidecar_bytes_total, 6144);
+        assert_eq!(s.encode_ops, 2);
+    }
+
+    #[test]
+    fn test_snapshot_fec_metrics_reset() {
+        let m = SnapshotFecMetrics::new();
+        m.record_encode(10, 500);
+        m.reset();
+        let s = m.snapshot();
+        assert_eq!(s.encoded_pages_total, 0);
+        assert_eq!(s.sidecar_bytes_total, 0);
+        assert_eq!(s.encode_ops, 0);
+    }
+
+    #[test]
+    fn test_snapshot_fec_metrics_display() {
+        let m = SnapshotFecMetrics::new();
+        m.record_encode(42, 1024);
+        let s = m.snapshot();
+        let text = format!("{s}");
+        assert!(text.contains("snapshot_fec_pages_encoded=42"));
+        assert!(text.contains("sidecar_bytes=1024"));
+        assert!(text.contains("encode_ops=1"));
+    }
+
+    #[test]
+    fn test_snapshot_fec_metrics_global_delta() {
+        // Delta-based test safe for parallel execution.
+        let before = GLOBAL_SNAPSHOT_FEC_METRICS.snapshot();
+        GLOBAL_SNAPSHOT_FEC_METRICS.record_encode(7, 256);
+        let after = GLOBAL_SNAPSHOT_FEC_METRICS.snapshot();
+        assert_eq!(
+            after.encoded_pages_total - before.encoded_pages_total,
+            7
+        );
+        assert_eq!(
+            after.sidecar_bytes_total - before.sidecar_bytes_total,
+            256
+        );
+        assert_eq!(after.encode_ops - before.encode_ops, 1);
     }
 }
