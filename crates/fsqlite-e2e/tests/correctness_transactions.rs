@@ -18,6 +18,7 @@
 //! transaction pattern must be identical on both engines.
 
 use fsqlite_e2e::comparison::{ComparisonRunner, SqlBackend, SqlValue};
+use tempfile::tempdir;
 
 // ─── Helpers ───────────────────────────────────────────────────────────
 
@@ -71,6 +72,67 @@ fn run_scenario(setup: &[&str], verify: &[(&str, &[SqlValue])]) {
             );
         }
     }
+}
+
+fn csqlite_query_values(conn: &rusqlite::Connection, sql: &str) -> Vec<Vec<SqlValue>> {
+    let mut stmt = conn.prepare(sql).expect("csqlite prepare");
+    let col_count = stmt.column_count();
+    let rows = stmt
+        .query_map([], |row| {
+            let mut values = Vec::with_capacity(col_count);
+            for i in 0..col_count {
+                let value: rusqlite::types::Value =
+                    row.get(i).unwrap_or(rusqlite::types::Value::Null);
+                values.push(match value {
+                    rusqlite::types::Value::Null => SqlValue::Null,
+                    rusqlite::types::Value::Integer(v) => SqlValue::Integer(v),
+                    rusqlite::types::Value::Real(v) => SqlValue::Real(v),
+                    rusqlite::types::Value::Text(v) => SqlValue::Text(v),
+                    rusqlite::types::Value::Blob(v) => SqlValue::Blob(v),
+                });
+            }
+            Ok(values)
+        })
+        .expect("csqlite query_map");
+    rows.collect::<Result<Vec<_>, _>>()
+        .expect("csqlite collect rows")
+}
+
+fn fsqlite_query_values(conn: &fsqlite::Connection, sql: &str) -> Vec<Vec<SqlValue>> {
+    conn.query(sql)
+        .expect("fsqlite query")
+        .into_iter()
+        .map(|row| {
+            row.values()
+                .iter()
+                .map(|value| match value {
+                    fsqlite_types::SqliteValue::Null => SqlValue::Null,
+                    fsqlite_types::SqliteValue::Integer(v) => SqlValue::Integer(*v),
+                    fsqlite_types::SqliteValue::Float(v) => SqlValue::Real(*v),
+                    fsqlite_types::SqliteValue::Text(v) => SqlValue::Text(v.clone()),
+                    fsqlite_types::SqliteValue::Blob(v) => SqlValue::Blob(v.clone()),
+                })
+                .collect()
+        })
+        .collect()
+}
+
+fn checkpoint_triplet(rows: &[Vec<SqlValue>], label: &str) -> (i64, i64, i64) {
+    assert_eq!(rows.len(), 1, "{label}: expected one row");
+    assert_eq!(rows[0].len(), 3, "{label}: expected three columns");
+    let read_i64 = |idx: usize| -> i64 {
+        if let SqlValue::Integer(v) = &rows[0][idx] {
+            *v
+        } else {
+            assert!(
+                matches!(rows[0][idx], SqlValue::Integer(_)),
+                "{label}: expected integer at index {idx}, got {:?}",
+                rows[0][idx]
+            );
+            0
+        }
+    };
+    (read_i64(0), read_i64(1), read_i64(2))
 }
 
 // ─── Scenario A: Simple transaction commit ─────────────────────────────
@@ -420,5 +482,96 @@ fn txn_savepoint_reuse_name() {
                 &[SqlValue::Text("second".to_owned())],
             ),
         ],
+    );
+}
+
+// ─── Scenario K: WAL/checkpoint/journal-mode parity transitions ───────
+
+#[test]
+fn txn_wal_checkpoint_journal_mode_transitions_file_backed() {
+    const BEAD_ID: &str = "bd-1dp9.4.1";
+    const SEED: u64 = 0x1D94_0401;
+    let run_id = format!("bd-1dp9.4.1-seed-{SEED}-wal-checkpoint-journal-transitions");
+
+    let tmp = tempdir().expect("tempdir");
+    let c_path = tmp.path().join("oracle_csqlite.db");
+    let f_path = tmp.path().join("candidate_fsqlite.db");
+
+    let c_conn = rusqlite::Connection::open(&c_path).expect("open csqlite db");
+    let f_conn =
+        fsqlite::Connection::open(f_path.to_string_lossy().as_ref()).expect("open fsqlite db");
+
+    eprintln!(
+        "bead_id={BEAD_ID} run_id={run_id} seed={SEED} phase=start c_db={} f_db={}",
+        c_path.display(),
+        f_path.display()
+    );
+
+    let c_mode_wal = csqlite_query_values(&c_conn, "PRAGMA journal_mode=WAL;");
+    let f_mode_wal = fsqlite_query_values(&f_conn, "PRAGMA journal_mode=WAL;");
+    eprintln!(
+        "bead_id={BEAD_ID} run_id={run_id} seed={SEED} phase=mode_switch_wal c_mode={c_mode_wal:?} f_mode={f_mode_wal:?}"
+    );
+    assert_eq!(c_mode_wal, f_mode_wal, "journal_mode WAL response mismatch");
+
+    let setup_sql = [
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);",
+        "INSERT INTO t VALUES (1, 'alpha');",
+        "INSERT INTO t VALUES (2, 'beta');",
+    ];
+    for sql in setup_sql {
+        c_conn.execute(sql, []).expect("csqlite setup exec");
+        f_conn.execute(sql).expect("fsqlite setup exec");
+    }
+
+    let c_ckpt_passive = csqlite_query_values(&c_conn, "PRAGMA wal_checkpoint(PASSIVE);");
+    let f_ckpt_passive = fsqlite_query_values(&f_conn, "PRAGMA wal_checkpoint(PASSIVE);");
+    let c_triplet = checkpoint_triplet(&c_ckpt_passive, "csqlite passive");
+    let f_triplet = checkpoint_triplet(&f_ckpt_passive, "fsqlite passive");
+    eprintln!(
+        "bead_id={BEAD_ID} run_id={run_id} seed={SEED} phase=checkpoint_passive c={c_triplet:?} f={f_triplet:?}"
+    );
+    assert_eq!(c_triplet.0, 0, "csqlite passive busy should be 0");
+    assert_eq!(f_triplet.0, 0, "fsqlite passive busy should be 0");
+    assert!(c_triplet.1 >= 0 && c_triplet.2 >= 0);
+    assert!(f_triplet.1 >= 0 && f_triplet.2 >= 0);
+
+    let c_mode_delete = csqlite_query_values(&c_conn, "PRAGMA journal_mode='delete';");
+    let f_mode_delete = fsqlite_query_values(&f_conn, "PRAGMA journal_mode='delete';");
+    eprintln!(
+        "bead_id={BEAD_ID} run_id={run_id} seed={SEED} phase=mode_switch_delete c_mode={c_mode_delete:?} f_mode={f_mode_delete:?}"
+    );
+    assert_eq!(
+        c_mode_delete, f_mode_delete,
+        "journal_mode DELETE response mismatch"
+    );
+
+    let c_ckpt_nonwal = csqlite_query_values(&c_conn, "PRAGMA wal_checkpoint(TRUNCATE);");
+    let f_ckpt_nonwal = fsqlite_query_values(&f_conn, "PRAGMA wal_checkpoint(TRUNCATE);");
+    eprintln!(
+        "bead_id={BEAD_ID} run_id={run_id} seed={SEED} phase=checkpoint_nonwal c_rows={c_ckpt_nonwal:?} f_rows={f_ckpt_nonwal:?}"
+    );
+    assert_eq!(
+        c_ckpt_nonwal, f_ckpt_nonwal,
+        "non-WAL wal_checkpoint sentinel mismatch"
+    );
+    assert_eq!(
+        f_ckpt_nonwal,
+        vec![vec![
+            SqlValue::Integer(0),
+            SqlValue::Integer(-1),
+            SqlValue::Integer(-1)
+        ]],
+        "expected SQLite sentinel row (0,-1,-1) in non-WAL mode"
+    );
+
+    let c_count = csqlite_query_values(&c_conn, "SELECT COUNT(*) FROM t;");
+    let f_count = fsqlite_query_values(&f_conn, "SELECT COUNT(*) FROM t;");
+    eprintln!(
+        "bead_id={BEAD_ID} run_id={run_id} seed={SEED} phase=visibility_after_nonwal_ckpt c_count={c_count:?} f_count={f_count:?}"
+    );
+    assert_eq!(
+        c_count, f_count,
+        "row visibility mismatch after non-WAL checkpoint"
     );
 }

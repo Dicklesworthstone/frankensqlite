@@ -11,19 +11,21 @@
 
 use std::collections::HashMap;
 use std::hint::black_box;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Barrier};
 use std::time::Duration;
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 
 use fsqlite_mvcc::{
-    CommitIndex, ConcurrentRegistry, GcTodo, InProcessPageLockTable, VersionArena, VersionIdx,
-    gc_tick, prune_page_chain, validate_first_committer_wins,
+    ActiveTxnView, CommitIndex, CommittedWriterInfo, ConcurrentRegistry, DiscoveredEdge, GcTodo,
+    InProcessPageLockTable, VersionArena, VersionIdx, discover_incoming_edges,
+    discover_outgoing_edges, gc_tick, prune_page_chain, validate_first_committer_wins,
 };
 use fsqlite_observability::{ConflictObserver, MetricsObserver};
 use fsqlite_types::{
     CommitSeq, PageData, PageNumber, PageNumberBuildHasher, PageSize, PageVersion, SchemaEpoch,
-    Snapshot, TxnEpoch, TxnId, TxnToken, VersionPointer,
+    Snapshot, TxnEpoch, TxnId, TxnToken, VersionPointer, WitnessKey,
 };
 
 fn criterion_config() -> Criterion {
@@ -660,6 +662,228 @@ fn bench_hotspot_contention(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
+// SSI edge discovery benchmarks
+// ---------------------------------------------------------------------------
+
+/// Lightweight mock implementing `ActiveTxnView` for benchmarks.
+/// Uses `AtomicBool` for interior-mutable flag setters.
+struct BenchActiveTxn {
+    token: TxnToken,
+    begin_seq: CommitSeq,
+    read_keys: Vec<WitnessKey>,
+    write_keys: Vec<WitnessKey>,
+    has_in_rw: AtomicBool,
+    has_out_rw: AtomicBool,
+}
+
+impl BenchActiveTxn {
+    fn new(id: u64, begin: u64, reads: Vec<WitnessKey>, writes: Vec<WitnessKey>) -> Self {
+        Self {
+            token: TxnToken::new(txn(id), TxnEpoch::new(1)),
+            begin_seq: CommitSeq::new(begin),
+            read_keys: reads,
+            write_keys: writes,
+            has_in_rw: AtomicBool::new(false),
+            has_out_rw: AtomicBool::new(false),
+        }
+    }
+}
+
+impl ActiveTxnView for BenchActiveTxn {
+    fn token(&self) -> TxnToken {
+        self.token
+    }
+    fn begin_seq(&self) -> CommitSeq {
+        self.begin_seq
+    }
+    fn is_active(&self) -> bool {
+        true
+    }
+    fn read_keys(&self) -> &[WitnessKey] {
+        &self.read_keys
+    }
+    fn write_keys(&self) -> &[WitnessKey] {
+        &self.write_keys
+    }
+    fn has_in_rw(&self) -> bool {
+        self.has_in_rw.load(Ordering::Relaxed)
+    }
+    fn has_out_rw(&self) -> bool {
+        self.has_out_rw.load(Ordering::Relaxed)
+    }
+    fn set_has_in_rw(&self, val: bool) {
+        self.has_in_rw.store(val, Ordering::Relaxed);
+    }
+    fn set_has_out_rw(&self, val: bool) {
+        self.has_out_rw.store(val, Ordering::Relaxed);
+    }
+    fn set_marked_for_abort(&self, _val: bool) {}
+}
+
+/// Benchmark: SSI incoming edge discovery with N active readers.
+fn bench_ssi_incoming_edges(c: &mut Criterion) {
+    let mut group = c.benchmark_group("ssi_edge_discovery/incoming");
+    group.sample_size(50);
+    group.measurement_time(Duration::from_secs(10));
+
+    for &n_readers in &[4_u32, 8, 16] {
+        group.throughput(Throughput::Elements(u64::from(n_readers)));
+        group.bench_with_input(
+            BenchmarkId::new("active_readers", n_readers),
+            &n_readers,
+            |b, &count| {
+                b.iter_batched(
+                    || {
+                        // The committing txn writes pages 1..=10.
+                        let write_keys: Vec<WitnessKey> =
+                            (1..=10_u32).map(|i| WitnessKey::Page(page(i))).collect();
+                        let committer = TxnToken::new(txn(1000), TxnEpoch::new(1));
+
+                        // N active readers each read overlapping pages (1..=5).
+                        let readers: Vec<BenchActiveTxn> = (0..count)
+                            .map(|i| {
+                                let reads =
+                                    (1..=5_u32).map(|p| WitnessKey::Page(page(p))).collect();
+                                BenchActiveTxn::new(u64::from(i) + 100, 1, reads, Vec::new())
+                            })
+                            .collect();
+                        (committer, write_keys, readers)
+                    },
+                    |(committer, write_keys, readers)| {
+                        let reader_views: Vec<&dyn ActiveTxnView> =
+                            readers.iter().map(|r| r as &dyn ActiveTxnView).collect();
+                        let edges: Vec<DiscoveredEdge> = discover_incoming_edges(
+                            committer,
+                            CommitSeq::new(10),
+                            &write_keys,
+                            &reader_views,
+                            &[],
+                        );
+                        black_box(edges);
+                    },
+                    BatchSize::SmallInput,
+                );
+            },
+        );
+    }
+
+    group.finish();
+}
+
+/// Benchmark: SSI outgoing edge discovery with N committed writers.
+fn bench_ssi_outgoing_edges(c: &mut Criterion) {
+    let mut group = c.benchmark_group("ssi_edge_discovery/outgoing");
+    group.sample_size(50);
+    group.measurement_time(Duration::from_secs(10));
+
+    for &n_writers in &[4_u32, 8, 16] {
+        group.throughput(Throughput::Elements(u64::from(n_writers)));
+        group.bench_with_input(
+            BenchmarkId::new("committed_writers", n_writers),
+            &n_writers,
+            |b, &count| {
+                b.iter_batched(
+                    || {
+                        // The committing txn reads pages 1..=10.
+                        let read_keys: Vec<WitnessKey> =
+                            (1..=10_u32).map(|i| WitnessKey::Page(page(i))).collect();
+                        let committer = TxnToken::new(txn(1000), TxnEpoch::new(1));
+
+                        // N committed writers each modified overlapping pages.
+                        let committed_writers: Vec<CommittedWriterInfo> = (0..count)
+                            .map(|i| CommittedWriterInfo {
+                                token: TxnToken::new(txn(u64::from(i) + 200), TxnEpoch::new(1)),
+                                commit_seq: CommitSeq::new(u64::from(i) + 5),
+                                pages: (1..=5_u32).map(page).collect(),
+                            })
+                            .collect();
+                        (committer, read_keys, committed_writers)
+                    },
+                    |(committer, read_keys, committed_writers)| {
+                        let edges: Vec<DiscoveredEdge> = discover_outgoing_edges(
+                            committer,
+                            CommitSeq::new(2),
+                            &read_keys,
+                            &[],
+                            &committed_writers,
+                        );
+                        black_box(edges);
+                    },
+                    BatchSize::SmallInput,
+                );
+            },
+        );
+    }
+
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
+// Multi-threaded lock contention benchmarks
+// ---------------------------------------------------------------------------
+
+/// Benchmark: real multi-threaded lock table contention.
+///
+/// N threads each acquire/release locks on a shared page pool. Half the pages
+/// overlap across threads (contention), half are thread-private (parallelism).
+fn bench_multi_thread_contention(c: &mut Criterion) {
+    let mut group = c.benchmark_group("lock_table/multi_thread_contention");
+    group.sample_size(20);
+    group.measurement_time(Duration::from_secs(15));
+
+    for &n_threads in &[2_u32, 4, 8] {
+        let ops_per_thread = 50_u32;
+        group.throughput(Throughput::Elements(
+            u64::from(n_threads) * u64::from(ops_per_thread),
+        ));
+        group.bench_with_input(
+            BenchmarkId::new("threads", n_threads),
+            &n_threads,
+            |b, &threads| {
+                b.iter_batched(
+                    || Arc::new(InProcessPageLockTable::new()),
+                    |table| {
+                        let barrier = Arc::new(Barrier::new(threads as usize));
+                        let handles: Vec<_> = (0..threads)
+                            .map(|t| {
+                                let tbl = Arc::clone(&table);
+                                let bar = Arc::clone(&barrier);
+                                let tid = txn(u64::from(t) + 1);
+                                std::thread::spawn(move || {
+                                    bar.wait();
+                                    // Shared pages 1..=25 (contention).
+                                    for i in 1..=25_u32 {
+                                        let _ = tbl.try_acquire(page(i), tid);
+                                    }
+                                    // Private pages (no contention).
+                                    let base = 1000 + t * 100;
+                                    for i in 1..=25_u32 {
+                                        let _ = tbl.try_acquire(page(base + i), tid);
+                                    }
+                                    // Release all.
+                                    for i in 1..=25_u32 {
+                                        tbl.release(page(i), tid);
+                                    }
+                                    for i in 1..=25_u32 {
+                                        tbl.release(page(base + i), tid);
+                                    }
+                                })
+                            })
+                            .collect();
+                        for h in handles {
+                            h.join().unwrap();
+                        }
+                    },
+                    BatchSize::SmallInput,
+                );
+            },
+        );
+    }
+
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
 // Criterion groups
 // ---------------------------------------------------------------------------
 
@@ -712,11 +936,28 @@ criterion_group!(
         bench_hotspot_contention
 );
 
+criterion_group!(
+    name = ssi_edge_discovery;
+    config = criterion_config();
+    targets =
+        bench_ssi_incoming_edges,
+        bench_ssi_outgoing_edges
+);
+
+criterion_group!(
+    name = multi_thread;
+    config = criterion_config();
+    targets =
+        bench_multi_thread_contention
+);
+
 criterion_main!(
     lock_table,
     version_arena,
     commit_index,
     fcw_validation,
     gc,
-    concurrent_writers
+    concurrent_writers,
+    ssi_edge_discovery,
+    multi_thread
 );
