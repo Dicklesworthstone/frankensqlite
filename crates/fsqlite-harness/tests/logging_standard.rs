@@ -4,11 +4,12 @@ use std::path::{Path, PathBuf};
 use serde_json::{Value, json};
 use tempfile::tempdir;
 
+use fsqlite_harness::e2e_log_schema::LogEventType;
 use fsqlite_harness::log::{
     ConformanceDiff, LOG_SCHEMA_VERSION, LifecycleEventKind, PerfBaselineArtifact,
     REQUIRED_BUNDLE_FILES, RunStatus, detect_optimization_levers, init_repro_bundle,
-    validate_bundle, validate_bundle_meta, validate_events_jsonl, validate_perf_optimization_loop,
-    validate_required_files,
+    parse_unified_log_events, validate_bundle, validate_bundle_meta, validate_events_jsonl,
+    validate_perf_optimization_loop, validate_required_files,
 };
 
 const BEAD_ID: &str = "bd-1fpm";
@@ -115,6 +116,40 @@ fn test_e2e_harness_emits_repro_bundle_on_failure() {
     assert!(
         bundle_root.join("oracle_diff.json").is_file(),
         "bead_id={BEAD_ID} case=e2e_oracle_diff_present"
+    );
+}
+
+#[test]
+fn test_repro_bundle_projects_to_unified_schema() {
+    let temp = tempdir().expect("tempdir should be created");
+    let bundle_root = run_known_failing_harness_case(temp.path())
+        .expect("known failing harness case should still emit bundle");
+
+    let unified_events = parse_unified_log_events(&bundle_root)
+        .expect("legacy events should project into unified schema");
+    assert!(
+        !unified_events.is_empty(),
+        "bead_id={BEAD_ID} case=unified_events_non_empty"
+    );
+    assert_eq!(
+        unified_events[0].event_type,
+        LogEventType::Start,
+        "bead_id={BEAD_ID} case=unified_events_start"
+    );
+    assert!(
+        unified_events
+            .iter()
+            .any(|event| event.event_type == LogEventType::FirstDivergence),
+        "bead_id={BEAD_ID} case=unified_events_first_divergence_present"
+    );
+    assert!(
+        unified_events.iter().all(|event| event.seed == Some(1337)),
+        "bead_id={BEAD_ID} case=unified_events_seed_projection"
+    );
+    let run_id = unified_events[0].run_id.clone();
+    assert!(
+        unified_events.iter().all(|event| event.run_id == run_id),
+        "bead_id={BEAD_ID} case=unified_events_single_run_id"
     );
 }
 

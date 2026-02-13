@@ -4,10 +4,12 @@
 //! verification tooling (trace exporters, schedule exploration harnesses, etc.)
 //! that other crates can call into from their own tests.
 
+pub mod benchmark_corpus;
 pub mod closure_wave;
 pub mod commit_pipeline;
 pub mod corpus_ingest;
 pub mod differential_v2;
+pub mod durability_matrix;
 pub mod e2e_log_schema;
 pub mod e2e_orchestrator;
 pub mod e2e_traceability;
@@ -18,15 +20,19 @@ pub mod failure_bundle;
 pub mod fault_profiles;
 pub mod fault_vfs;
 pub mod fixture_discovery;
+pub mod forensics_navigator;
 pub mod fslab;
 pub mod impact_graph;
 pub mod log;
+pub mod log_schema_validator;
 pub mod metamorphic;
 pub mod mismatch_minimizer;
 pub mod no_mock_evidence;
 pub mod oracle;
+pub mod parity_invariant_catalog;
 pub mod parity_taxonomy;
 pub mod perf_loop;
+pub mod performance_regression_detector;
 pub mod planner_vdbe_closure;
 pub mod ratchet_policy;
 pub mod replay_harness;

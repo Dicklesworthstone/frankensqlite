@@ -16,6 +16,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tracing::{error, info, warn};
 
+use crate::e2e_log_schema::{self, LogEventSchema, LogEventType, LogPhase};
+
 /// Version of the harness logging schema.
 pub const LOG_SCHEMA_VERSION: u32 = 1;
 
@@ -325,6 +327,133 @@ pub fn validate_events_jsonl(bundle_root: &Path) -> Result<Vec<HarnessEvent>> {
     Ok(events)
 }
 
+/// Parse legacy harness events into the unified E2E log schema and validate.
+pub fn parse_unified_log_events(bundle_root: &Path) -> Result<Vec<LogEventSchema>> {
+    let meta = validate_bundle_meta(bundle_root)?;
+    let events = validate_events_jsonl(bundle_root)?;
+    project_and_validate_unified_events(&meta, &events)
+}
+
+fn project_and_validate_unified_events(
+    meta: &BundleMeta,
+    events: &[HarnessEvent],
+) -> Result<Vec<LogEventSchema>> {
+    let projected = events
+        .iter()
+        .map(|event| project_harness_event(meta, event))
+        .collect::<Vec<_>>();
+
+    let mut errors = Vec::new();
+    for event in &projected {
+        let event_errors = e2e_log_schema::validate_log_event(event);
+        if !event_errors.is_empty() {
+            errors.push(format!(
+                "step={} kind={:?}: {}",
+                event
+                    .context
+                    .get("legacy_step")
+                    .map_or("unknown", std::string::String::as_str),
+                event.event_type,
+                event_errors.join("; "),
+            ));
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(projected)
+    } else {
+        Err(internal_error(format!(
+            "unified schema projection failed: {}",
+            errors.join(" | "),
+        )))
+    }
+}
+
+fn project_harness_event(meta: &BundleMeta, event: &HarnessEvent) -> LogEventSchema {
+    let event_type = map_event_type(event.kind, event.status);
+    let mut context = payload_to_context(&event.payload);
+    context.insert("legacy_step".to_owned(), event.step.to_string());
+    context.insert("legacy_message".to_owned(), event.message.clone());
+    context.insert("legacy_kind".to_owned(), format!("{:?}", event.kind));
+    let mut scenario_id = payload_string(&event.payload, "scenario_id");
+    if scenario_id.is_none()
+        && matches!(
+            event_type,
+            LogEventType::Fail | LogEventType::Error | LogEventType::FirstDivergence
+        )
+    {
+        scenario_id = Some("LEGACY-0".to_owned());
+        context.insert("legacy_scenario_fallback".to_owned(), "LEGACY-0".to_owned());
+    }
+
+    LogEventSchema {
+        run_id: format!("{}-{}-{}", meta.suite, meta.case_id, meta.seed),
+        timestamp: synthetic_timestamp_from_step(event.step),
+        phase: map_phase(event.kind),
+        event_type,
+        scenario_id,
+        seed: Some(meta.seed),
+        backend: payload_string(&event.payload, "backend"),
+        artifact_hash: payload_string(&event.payload, "artifact_hash"),
+        context,
+    }
+}
+
+fn map_phase(kind: LifecycleEventKind) -> LogPhase {
+    match kind {
+        LifecycleEventKind::RunStart => LogPhase::Setup,
+        LifecycleEventKind::Setup => LogPhase::Setup,
+        LifecycleEventKind::Step => LogPhase::Execute,
+        LifecycleEventKind::Assertion => LogPhase::Validate,
+        LifecycleEventKind::Teardown => LogPhase::Teardown,
+        LifecycleEventKind::RunEnd => LogPhase::Report,
+    }
+}
+
+fn map_event_type(kind: LifecycleEventKind, status: Option<RunStatus>) -> LogEventType {
+    match kind {
+        LifecycleEventKind::RunStart => LogEventType::Start,
+        LifecycleEventKind::Assertion => LogEventType::FirstDivergence,
+        LifecycleEventKind::RunEnd => match status {
+            Some(RunStatus::Passed) => LogEventType::Pass,
+            Some(RunStatus::Failed) => LogEventType::Fail,
+            None => LogEventType::Info,
+        },
+        LifecycleEventKind::Setup | LifecycleEventKind::Step | LifecycleEventKind::Teardown => {
+            LogEventType::Info
+        }
+    }
+}
+
+fn payload_string(payload: &BTreeMap<String, Value>, key: &str) -> Option<String> {
+    payload.get(key).map(|value| match value {
+        Value::String(text) => text.clone(),
+        other => other.to_string(),
+    })
+}
+
+fn payload_to_context(payload: &BTreeMap<String, Value>) -> BTreeMap<String, String> {
+    payload
+        .iter()
+        .map(|(key, value)| {
+            let rendered = match value {
+                Value::String(text) => text.clone(),
+                other => other.to_string(),
+            };
+            (key.clone(), rendered)
+        })
+        .collect()
+}
+
+fn synthetic_timestamp_from_step(step: u64) -> String {
+    let seconds = step / 1_000;
+    let millis = step % 1_000;
+    let hour = (seconds / 3_600) % 24;
+    let minute = (seconds / 60) % 60;
+    let second = seconds % 60;
+    format!("1970-01-01T{hour:02}:{minute:02}:{second:02}.{millis:03}Z")
+}
+
 pub fn validate_bundle(bundle_root: &Path) -> Result<()> {
     validate_required_files(bundle_root)?;
     let _meta = validate_bundle_meta(bundle_root)?;
@@ -338,6 +467,8 @@ pub fn validate_bundle(bundle_root: &Path) -> Result<()> {
     if events.last().map(|event| event.kind) != Some(LifecycleEventKind::RunEnd) {
         return Err(internal_error("events.jsonl must end with a run_end event"));
     }
+
+    let _unified_events = parse_unified_log_events(bundle_root)?;
 
     Ok(())
 }

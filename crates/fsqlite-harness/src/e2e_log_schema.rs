@@ -28,6 +28,18 @@ const BEAD_ID: &str = "bd-1dp9.7.2";
 
 /// Schema version for the unified E2E log format.
 pub const LOG_SCHEMA_VERSION: &str = "1.0.0";
+/// Oldest schema version this module guarantees compatibility with.
+pub const LOG_SCHEMA_MIN_SUPPORTED_VERSION: &str = "1.0.0";
+/// Fields that must be present in every event.
+pub const REQUIRED_EVENT_FIELDS: &[&str] = &["run_id", "timestamp", "phase", "event_type"];
+/// Replayability keys required for deterministic triage and reruns.
+pub const REPLAYABILITY_KEYS: &[&str] = &[
+    "scenario_id",
+    "seed",
+    "phase",
+    "context.invariant_ids",
+    "context.artifact_paths",
+];
 
 // ─── Log Event Schema ───────────────────────────────────────────────────
 
@@ -69,6 +81,29 @@ pub enum LogPhase {
     Report,
 }
 
+impl LogPhase {
+    /// Canonical phase values used by the schema contract.
+    pub const ALL: [Self; 5] = [
+        Self::Setup,
+        Self::Execute,
+        Self::Validate,
+        Self::Teardown,
+        Self::Report,
+    ];
+
+    /// Stable lowercase representation used in docs and artifacts.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Setup => "setup",
+            Self::Execute => "execute",
+            Self::Validate => "validate",
+            Self::Teardown => "teardown",
+            Self::Report => "report",
+        }
+    }
+}
+
 /// Classification of log event types.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum LogEventType {
@@ -92,6 +127,37 @@ pub enum LogEventType {
     ArtifactGenerated,
 }
 
+impl LogEventType {
+    /// Canonical event type values used by the schema contract.
+    pub const ALL: [Self; 9] = [
+        Self::Start,
+        Self::Pass,
+        Self::Fail,
+        Self::Skip,
+        Self::Info,
+        Self::Warn,
+        Self::Error,
+        Self::FirstDivergence,
+        Self::ArtifactGenerated,
+    ];
+
+    /// Stable lowercase representation used in docs and artifacts.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::Pass => "pass",
+            Self::Fail => "fail",
+            Self::Skip => "skip",
+            Self::Info => "info",
+            Self::Warn => "warn",
+            Self::Error => "error",
+            Self::FirstDivergence => "first_divergence",
+            Self::ArtifactGenerated => "artifact_generated",
+        }
+    }
+}
+
 /// Schema field requirement level.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum FieldRequirement {
@@ -103,12 +169,29 @@ pub enum FieldRequirement {
     Optional,
 }
 
+/// Value category for a schema field.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum FieldValueType {
+    /// UTF-8 string.
+    String,
+    /// Unsigned integer.
+    UnsignedInteger,
+    /// Enumerated string.
+    Enum,
+    /// Structured key-value object.
+    Object,
+}
+
 /// Description of a schema field.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FieldSpec {
     pub name: String,
     pub description: String,
     pub requirement: FieldRequirement,
+    pub value_type: FieldValueType,
+    pub allowed_values: Vec<String>,
+    pub allowed_range: Option<String>,
+    pub semantics: String,
     pub example: String,
 }
 
@@ -118,61 +201,489 @@ pub struct FieldSpec {
 #[must_use]
 pub fn build_field_specs() -> Vec<FieldSpec> {
     vec![
-        FieldSpec {
-            name: "run_id".to_owned(),
-            description: "Unique run identifier for log correlation".to_owned(),
-            requirement: FieldRequirement::Required,
-            example: "bd-mblr-20260213T050000Z-12345".to_owned(),
+        run_id_field_spec(),
+        timestamp_field_spec(),
+        phase_field_spec(),
+        event_type_field_spec(),
+        scenario_id_field_spec(),
+        seed_field_spec(),
+        backend_field_spec(),
+        artifact_hash_field_spec(),
+        context_field_spec(),
+    ]
+}
+
+fn run_id_field_spec() -> FieldSpec {
+    FieldSpec {
+        name: "run_id".to_owned(),
+        description: "Unique run identifier for log correlation".to_owned(),
+        requirement: FieldRequirement::Required,
+        value_type: FieldValueType::String,
+        allowed_values: Vec::new(),
+        allowed_range: Some("non-empty; format `{bead_id}-{timestamp}-{pid}`".to_owned()),
+        semantics: "Correlation key for all events in a single execution run.".to_owned(),
+        example: "bd-mblr-20260213T050000Z-12345".to_owned(),
+    }
+}
+
+fn timestamp_field_spec() -> FieldSpec {
+    FieldSpec {
+        name: "timestamp".to_owned(),
+        description: "ISO 8601 UTC timestamp of the event".to_owned(),
+        requirement: FieldRequirement::Required,
+        value_type: FieldValueType::String,
+        allowed_values: Vec::new(),
+        allowed_range: Some("RFC3339/ISO8601 UTC string ending in `Z`".to_owned()),
+        semantics: "Ordering anchor for timeline reconstruction.".to_owned(),
+        example: "2026-02-13T05:00:00.000Z".to_owned(),
+    }
+}
+
+fn phase_field_spec() -> FieldSpec {
+    FieldSpec {
+        name: "phase".to_owned(),
+        description: "Execution phase (setup/execute/validate/teardown/report)".to_owned(),
+        requirement: FieldRequirement::Required,
+        value_type: FieldValueType::Enum,
+        allowed_values: LogPhase::ALL
+            .iter()
+            .map(|phase| phase.as_str().to_owned())
+            .collect(),
+        allowed_range: None,
+        semantics: "Lifecycle marker used by orchestration and replay tools.".to_owned(),
+        example: "execute".to_owned(),
+    }
+}
+
+fn event_type_field_spec() -> FieldSpec {
+    FieldSpec {
+        name: "event_type".to_owned(),
+        description: "Event classification (start/pass/fail/skip/info/warn/error)".to_owned(),
+        requirement: FieldRequirement::Required,
+        value_type: FieldValueType::Enum,
+        allowed_values: LogEventType::ALL
+            .iter()
+            .map(|event_type| event_type.as_str().to_owned())
+            .collect(),
+        allowed_range: None,
+        semantics: "Categorizes event semantics for analytics and gating.".to_owned(),
+        example: "pass".to_owned(),
+    }
+}
+
+fn scenario_id_field_spec() -> FieldSpec {
+    FieldSpec {
+        name: "scenario_id".to_owned(),
+        description: "Scenario ID from traceability matrix (CATEGORY-NUMBER)".to_owned(),
+        requirement: FieldRequirement::Recommended,
+        value_type: FieldValueType::String,
+        allowed_values: Vec::new(),
+        allowed_range: Some("`[A-Z]+-[0-9]+`".to_owned()),
+        semantics: "Links event to scenario inventory and coverage analytics.".to_owned(),
+        example: "MVCC-3".to_owned(),
+    }
+}
+
+fn seed_field_spec() -> FieldSpec {
+    FieldSpec {
+        name: "seed".to_owned(),
+        description: "Deterministic seed used for reproducibility".to_owned(),
+        requirement: FieldRequirement::Recommended,
+        value_type: FieldValueType::UnsignedInteger,
+        allowed_values: Vec::new(),
+        allowed_range: Some("0..=18446744073709551615".to_owned()),
+        semantics: "Reproduces data generation and schedule choices.".to_owned(),
+        example: "6148914689804861784".to_owned(),
+    }
+}
+
+fn backend_field_spec() -> FieldSpec {
+    FieldSpec {
+        name: "backend".to_owned(),
+        description: "Backend under test (fsqlite/rusqlite/both)".to_owned(),
+        requirement: FieldRequirement::Recommended,
+        value_type: FieldValueType::Enum,
+        allowed_values: vec![
+            "fsqlite".to_owned(),
+            "rusqlite".to_owned(),
+            "both".to_owned(),
+        ],
+        allowed_range: None,
+        semantics: "Disambiguates per-engine behavior and differential runs.".to_owned(),
+        example: "fsqlite".to_owned(),
+    }
+}
+
+fn artifact_hash_field_spec() -> FieldSpec {
+    FieldSpec {
+        name: "artifact_hash".to_owned(),
+        description: "SHA-256 hash of generated artifact".to_owned(),
+        requirement: FieldRequirement::Optional,
+        value_type: FieldValueType::String,
+        allowed_values: Vec::new(),
+        allowed_range: Some("64 lowercase hexadecimal chars".to_owned()),
+        semantics: "Verifies artifact integrity and deduplicates evidence.".to_owned(),
+        example: "a1b2c3d4...".to_owned(),
+    }
+}
+
+fn context_field_spec() -> FieldSpec {
+    FieldSpec {
+        name: "context".to_owned(),
+        description: "Free-form key-value pairs for additional context".to_owned(),
+        requirement: FieldRequirement::Optional,
+        value_type: FieldValueType::Object,
+        allowed_values: Vec::new(),
+        allowed_range: Some(
+            "JSON object of string keys and string values; replay keys include \
+`invariant_ids` and `artifact_paths`"
+                .to_owned(),
+        ),
+        semantics: "Extensible carrier for deterministic replay metadata.".to_owned(),
+        example: "{\"table_count\": \"5\", \"concurrency\": \"4\"}".to_owned(),
+    }
+}
+
+/// Version transition classification for log schema evolution.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum VersionTransition {
+    /// Version did not change.
+    NoChange,
+    /// Backward-compatible bugfix update.
+    Patch,
+    /// Backward-compatible additive change (new optional fields/values).
+    Additive,
+    /// Breaking change requiring major version bump.
+    Breaking,
+}
+
+/// Tooling compatibility outcome for a producer/consumer version pair.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ToolingCompatibility {
+    /// Full read/write compatibility.
+    ReadWrite,
+    /// Can read while ignoring unknown additive fields, but should not write.
+    ReadOnlyForwardCompatible,
+    /// Incompatible schema major versions.
+    Incompatible,
+}
+
+/// Parsed semantic version for schema policy checks.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SchemaVersion {
+    pub major: u32,
+    pub minor: u32,
+    pub patch: u32,
+}
+
+impl SchemaVersion {
+    /// Parse an `MAJOR.MINOR.PATCH` semantic version.
+    pub fn parse(input: &str) -> Result<Self, String> {
+        let parts: Vec<&str> = input.split('.').collect();
+        if parts.len() != 3 {
+            return Err(format!(
+                "invalid schema version '{input}': expected MAJOR.MINOR.PATCH"
+            ));
+        }
+        let major = parts[0]
+            .parse::<u32>()
+            .map_err(|_| format!("invalid major version component '{}'", parts[0]))?;
+        let minor = parts[1]
+            .parse::<u32>()
+            .map_err(|_| format!("invalid minor version component '{}'", parts[1]))?;
+        let patch = parts[2]
+            .parse::<u32>()
+            .map_err(|_| format!("invalid patch version component '{}'", parts[2]))?;
+        Ok(Self {
+            major,
+            minor,
+            patch,
+        })
+    }
+}
+
+impl std::fmt::Display for SchemaVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
+    }
+}
+
+/// Tooling upgrade rule for compatibility handling.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolingUpgradeRule {
+    pub condition: String,
+    pub compatibility: ToolingCompatibility,
+    pub behavior: String,
+}
+
+/// Full schema compatibility policy consumed by emitters and tooling.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SchemaCompatibilityPolicy {
+    pub current_version: String,
+    pub minimum_supported_version: String,
+    pub required_fields: Vec<String>,
+    pub replayability_keys: Vec<String>,
+    pub additive_change_rule: String,
+    pub breaking_change_rule: String,
+    pub downgrade_rule: String,
+    pub tooling_upgrade_rules: Vec<ToolingUpgradeRule>,
+}
+
+/// Build the canonical schema compatibility policy.
+#[must_use]
+pub fn build_schema_compatibility_policy() -> SchemaCompatibilityPolicy {
+    SchemaCompatibilityPolicy {
+        current_version: LOG_SCHEMA_VERSION.to_owned(),
+        minimum_supported_version: LOG_SCHEMA_MIN_SUPPORTED_VERSION.to_owned(),
+        required_fields: REQUIRED_EVENT_FIELDS
+            .iter()
+            .map(|field| (*field).to_owned())
+            .collect(),
+        replayability_keys: REPLAYABILITY_KEYS
+            .iter()
+            .map(|field| (*field).to_owned())
+            .collect(),
+        additive_change_rule: "Additive changes must bump MINOR and keep all prior required fields stable."
+            .to_owned(),
+        breaking_change_rule: "Breaking changes must bump MAJOR and include migration guidance for tooling."
+            .to_owned(),
+        downgrade_rule: "Schema downgrades are unsupported; emitters must not decrease schema version."
+            .to_owned(),
+        tooling_upgrade_rules: vec![
+            ToolingUpgradeRule {
+                condition: "tool.major == event.major && tool.minor >= event.minor".to_owned(),
+                compatibility: ToolingCompatibility::ReadWrite,
+                behavior: "Tool can parse and emit events for this schema version.".to_owned(),
+            },
+            ToolingUpgradeRule {
+                condition: "tool.major == event.major && tool.minor < event.minor".to_owned(),
+                compatibility: ToolingCompatibility::ReadOnlyForwardCompatible,
+                behavior: "Tool must ignore unknown additive fields and avoid re-emitting transformed events."
+                    .to_owned(),
+            },
+            ToolingUpgradeRule {
+                condition: "tool.major != event.major".to_owned(),
+                compatibility: ToolingCompatibility::Incompatible,
+                behavior: "Tool must fail fast and request explicit major-version upgrade.".to_owned(),
+            },
+        ],
+    }
+}
+
+/// Classify a version transition according to schema policy.
+pub fn classify_version_transition(from: &str, to: &str) -> Result<VersionTransition, String> {
+    let from = SchemaVersion::parse(from)?;
+    let to = SchemaVersion::parse(to)?;
+
+    if to < from {
+        return Err(format!(
+            "schema downgrade is not supported: from '{from}' to '{to}'"
+        ));
+    }
+
+    if to.major > from.major {
+        return Ok(VersionTransition::Breaking);
+    }
+    if to.minor > from.minor {
+        return Ok(VersionTransition::Additive);
+    }
+    if to.patch > from.patch {
+        return Ok(VersionTransition::Patch);
+    }
+    Ok(VersionTransition::NoChange)
+}
+
+/// Determine how well a tooling version can consume events for another version.
+pub fn evaluate_tooling_compatibility(
+    tooling_version: &str,
+    event_version: &str,
+) -> Result<ToolingCompatibility, String> {
+    let tooling = SchemaVersion::parse(tooling_version)?;
+    let event = SchemaVersion::parse(event_version)?;
+    if tooling.major != event.major {
+        return Ok(ToolingCompatibility::Incompatible);
+    }
+    if tooling.minor >= event.minor {
+        return Ok(ToolingCompatibility::ReadWrite);
+    }
+    Ok(ToolingCompatibility::ReadOnlyForwardCompatible)
+}
+
+/// Render a Markdown schema contract document from code constants.
+#[must_use]
+pub fn render_schema_contract_markdown() -> String {
+    let field_lines: Vec<String> = build_field_specs()
+        .into_iter()
+        .map(|spec| {
+            let allowed_values = if spec.allowed_values.is_empty() {
+                "-".to_owned()
+            } else {
+                spec.allowed_values.join(", ")
+            };
+            let allowed_range = spec.allowed_range.unwrap_or_else(|| "-".to_owned());
+            format!(
+                "| `{}` | `{:?}` | `{:?}` | {} | {} | {} | {} |",
+                spec.name,
+                spec.requirement,
+                spec.value_type,
+                spec.description,
+                allowed_values,
+                allowed_range,
+                spec.semantics,
+            )
+        })
+        .collect();
+    let policy = build_schema_compatibility_policy();
+    let tooling_rule_lines = policy
+        .tooling_upgrade_rules
+        .iter()
+        .map(|rule| {
+            format!(
+                "- `{}` => `{:?}`: {}",
+                rule.condition, rule.compatibility, rule.behavior
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!(
+        "# Unified E2E Log Schema Contract\n\n\
+Schema version: `{}`\n\n\
+Minimum supported version: `{}`\n\n\
+Required fields: `{}`\n\n\
+Replayability keys: `{}`\n\n\
+## Field Definitions\n\n\
+| Field | Requirement | Type | Description | Allowed Values | Allowed Range | Semantics |\n\
+| --- | --- | --- | --- | --- | --- | --- |\n\
+{}\n\n\
+## Versioning Policy\n\n\
+- {}\n\
+- {}\n\
+- {}\n\n\
+## Tooling Compatibility Rules\n\n\
+{}\n",
+        policy.current_version,
+        policy.minimum_supported_version,
+        policy.required_fields.join("`, `"),
+        policy.replayability_keys.join("`, `"),
+        field_lines.join("\n"),
+        policy.additive_change_rule,
+        policy.breaking_change_rule,
+        policy.downgrade_rule,
+        tooling_rule_lines,
+    )
+}
+
+/// Canonical event examples used by contract tests.
+#[must_use]
+pub fn canonical_event_examples() -> Vec<LogEventSchema> {
+    let mut base_context = BTreeMap::new();
+    base_context.insert("invariant_ids".to_owned(), "INV-1,INV-9".to_owned());
+    base_context.insert(
+        "artifact_paths".to_owned(),
+        "artifacts/events.jsonl,artifacts/diff.json".to_owned(),
+    );
+
+    vec![
+        LogEventSchema {
+            run_id: "bd-mblr.5.3.1-20260213T090000Z-1001".to_owned(),
+            timestamp: "2026-02-13T09:00:00.000Z".to_owned(),
+            phase: LogPhase::Setup,
+            event_type: LogEventType::Start,
+            scenario_id: Some("INFRA-6".to_owned()),
+            seed: Some(1001),
+            backend: Some("both".to_owned()),
+            artifact_hash: None,
+            context: base_context.clone(),
         },
-        FieldSpec {
-            name: "timestamp".to_owned(),
-            description: "ISO 8601 UTC timestamp of the event".to_owned(),
-            requirement: FieldRequirement::Required,
-            example: "2026-02-13T05:00:00.000Z".to_owned(),
+        LogEventSchema {
+            run_id: "bd-mblr.5.3.1-20260213T090000Z-1001".to_owned(),
+            timestamp: "2026-02-13T09:00:03.100Z".to_owned(),
+            phase: LogPhase::Validate,
+            event_type: LogEventType::Pass,
+            scenario_id: Some("MVCC-3".to_owned()),
+            seed: Some(1001),
+            backend: Some("fsqlite".to_owned()),
+            artifact_hash: Some(
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
+            ),
+            context: base_context.clone(),
         },
-        FieldSpec {
-            name: "phase".to_owned(),
-            description: "Execution phase (setup/execute/validate/teardown/report)".to_owned(),
-            requirement: FieldRequirement::Required,
-            example: "execute".to_owned(),
-        },
-        FieldSpec {
-            name: "event_type".to_owned(),
-            description: "Event classification (start/pass/fail/skip/info/warn/error)".to_owned(),
-            requirement: FieldRequirement::Required,
-            example: "pass".to_owned(),
-        },
-        FieldSpec {
-            name: "scenario_id".to_owned(),
-            description: "Scenario ID from traceability matrix (CATEGORY-NUMBER)".to_owned(),
-            requirement: FieldRequirement::Recommended,
-            example: "MVCC-3".to_owned(),
-        },
-        FieldSpec {
-            name: "seed".to_owned(),
-            description: "Deterministic seed used for reproducibility".to_owned(),
-            requirement: FieldRequirement::Recommended,
-            example: "6148914689804861784".to_owned(),
-        },
-        FieldSpec {
-            name: "backend".to_owned(),
-            description: "Backend under test (fsqlite/rusqlite/both)".to_owned(),
-            requirement: FieldRequirement::Recommended,
-            example: "fsqlite".to_owned(),
-        },
-        FieldSpec {
-            name: "artifact_hash".to_owned(),
-            description: "SHA-256 hash of generated artifact".to_owned(),
-            requirement: FieldRequirement::Optional,
-            example: "a1b2c3d4...".to_owned(),
-        },
-        FieldSpec {
-            name: "context".to_owned(),
-            description: "Free-form key-value pairs for additional context".to_owned(),
-            requirement: FieldRequirement::Optional,
-            example: "{\"table_count\": \"5\", \"concurrency\": \"4\"}".to_owned(),
+        LogEventSchema {
+            run_id: "bd-mblr.5.3.1-20260213T090000Z-1001".to_owned(),
+            timestamp: "2026-02-13T09:00:04.250Z".to_owned(),
+            phase: LogPhase::Validate,
+            event_type: LogEventType::FirstDivergence,
+            scenario_id: Some("COR-2".to_owned()),
+            seed: Some(1001),
+            backend: Some("both".to_owned()),
+            artifact_hash: Some(
+                "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".to_owned(),
+            ),
+            context: base_context,
         },
     ]
+}
+
+fn schema_field_value<'a>(event: &'a LogEventSchema, field: &str) -> Option<&'a str> {
+    match field {
+        "run_id" => Some(event.run_id.as_str()),
+        "timestamp" => Some(event.timestamp.as_str()),
+        "phase" => Some(event.phase.as_str()),
+        "event_type" => Some(event.event_type.as_str()),
+        "scenario_id" => event.scenario_id.as_deref(),
+        "backend" => event.backend.as_deref(),
+        "artifact_hash" => event.artifact_hash.as_deref(),
+        _ => None,
+    }
+}
+
+/// Validate an event against the field specification contract.
+#[must_use]
+pub fn validate_event_against_field_specs(
+    event: &LogEventSchema,
+    specs: &[FieldSpec],
+) -> Vec<String> {
+    let mut errors = Vec::new();
+    for spec in specs {
+        if spec.requirement == FieldRequirement::Required {
+            match spec.name.as_str() {
+                "seed" => {
+                    if event.seed.is_none() {
+                        errors.push("required field 'seed' missing".to_owned());
+                    }
+                }
+                "context" => {
+                    if event.context.is_empty() {
+                        errors.push("required field 'context' missing".to_owned());
+                    }
+                }
+                _ => {
+                    let missing = match schema_field_value(event, &spec.name) {
+                        Some(value) => value.trim().is_empty(),
+                        None => true,
+                    };
+                    if missing {
+                        errors.push(format!("required field '{}' missing", spec.name));
+                    }
+                }
+            }
+        }
+
+        if !spec.allowed_values.is_empty()
+            && let Some(value) = schema_field_value(event, &spec.name)
+            && !spec.allowed_values.iter().any(|allowed| allowed == value)
+        {
+            errors.push(format!(
+                "field '{}' has value '{}' outside allowed values [{}]",
+                spec.name,
+                value,
+                spec.allowed_values.join(", "),
+            ));
+        }
+    }
+
+    errors
 }
 
 // ─── Scenario Coverage Assessment ───────────────────────────────────────
@@ -749,23 +1260,50 @@ fn truncate_f64(value: f64, decimals: u32) -> f64 {
 
 /// Validate that a log event conforms to the schema.
 pub fn validate_log_event(event: &LogEventSchema) -> Vec<String> {
-    let mut errors = Vec::new();
+    let specs = build_field_specs();
+    let mut errors = validate_event_against_field_specs(event, &specs);
 
-    if event.run_id.is_empty() {
-        errors.push("run_id is empty".to_owned());
+    if !(event.timestamp.contains('T') && event.timestamp.ends_with('Z')) {
+        errors.push("timestamp must be an ISO8601 UTC value ending in 'Z'".to_owned());
     }
 
-    if event.timestamp.is_empty() {
-        errors.push("timestamp is empty".to_owned());
-    }
-
-    // Scenario ID should follow convention if present
     if let Some(ref sid) = event.scenario_id {
-        if !sid.contains('-') {
+        if let Some((category, number)) = sid.split_once('-') {
+            if category.chars().any(|ch| !ch.is_ascii_uppercase()) {
+                errors.push(format!(
+                    "scenario_id '{}' category must contain uppercase ASCII letters",
+                    sid
+                ));
+            }
+            if number.chars().any(|ch| !ch.is_ascii_digit()) {
+                errors.push(format!(
+                    "scenario_id '{}' numeric suffix must contain ASCII digits",
+                    sid
+                ));
+            }
+        } else {
             errors.push(format!(
                 "scenario_id '{}' doesn't follow CATEGORY-NUMBER convention",
                 sid
             ));
+        }
+    }
+
+    if let Some(ref artifact_hash) = event.artifact_hash
+        && (artifact_hash.len() != 64 || artifact_hash.chars().any(|ch| !ch.is_ascii_hexdigit()))
+    {
+        errors.push("artifact_hash must be a 64-char hexadecimal SHA-256 digest".to_owned());
+    }
+
+    if matches!(
+        event.event_type,
+        LogEventType::Fail | LogEventType::Error | LogEventType::FirstDivergence
+    ) {
+        if event.seed.is_none() {
+            errors.push("seed is required for fail/error/divergence events".to_owned());
+        }
+        if event.scenario_id.is_none() {
+            errors.push("scenario_id is required for fail/error/divergence events".to_owned());
         }
     }
 
@@ -839,15 +1377,37 @@ mod tests {
     #[test]
     fn field_specs_complete() {
         let specs = build_field_specs();
-        let required: Vec<_> = specs
+        let required_count = specs
             .iter()
             .filter(|s| s.requirement == FieldRequirement::Required)
-            .collect();
-        assert!(required.len() >= 4, "Need at least 4 required fields");
+            .count();
+        assert!(required_count >= 4, "Need at least 4 required fields");
+    }
+
+    #[test]
+    fn required_field_constants_match_specs() {
+        let specs = build_field_specs();
+        let required_from_specs = specs
+            .iter()
+            .filter(|spec| spec.requirement == FieldRequirement::Required)
+            .map(|spec| spec.name.clone())
+            .collect::<Vec<_>>();
+        let required_from_constant = REQUIRED_EVENT_FIELDS
+            .iter()
+            .map(|field| (*field).to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(required_from_specs, required_from_constant);
     }
 
     #[test]
     fn log_event_validation() {
+        let mut context = BTreeMap::new();
+        context.insert("invariant_ids".to_owned(), "INV-1,INV-2".to_owned());
+        context.insert(
+            "artifact_paths".to_owned(),
+            "artifacts/events.jsonl,artifacts/report.json".to_owned(),
+        );
+
         let good_event = LogEventSchema {
             run_id: "test-run-001".to_owned(),
             timestamp: "2026-02-13T05:00:00Z".to_owned(),
@@ -857,7 +1417,7 @@ mod tests {
             seed: Some(42),
             backend: Some("fsqlite".to_owned()),
             artifact_hash: None,
-            context: BTreeMap::new(),
+            context,
         };
 
         let errors = validate_log_event(&good_event);
@@ -881,6 +1441,88 @@ mod tests {
 
         let errors = validate_log_event(&bad_event);
         assert!(!errors.is_empty(), "Bad event should have errors");
+    }
+
+    #[test]
+    fn version_transition_policy() {
+        assert_eq!(
+            classify_version_transition("1.0.0", "1.0.0").expect("same version should parse"),
+            VersionTransition::NoChange
+        );
+        assert_eq!(
+            classify_version_transition("1.0.0", "1.0.1").expect("patch should parse"),
+            VersionTransition::Patch
+        );
+        assert_eq!(
+            classify_version_transition("1.0.0", "1.1.0").expect("minor should parse"),
+            VersionTransition::Additive
+        );
+        assert_eq!(
+            classify_version_transition("1.3.2", "2.0.0").expect("major should parse"),
+            VersionTransition::Breaking
+        );
+        assert!(
+            classify_version_transition("1.2.0", "1.1.9").is_err(),
+            "downgrades must be rejected"
+        );
+    }
+
+    #[test]
+    fn tooling_compatibility_policy() {
+        assert_eq!(
+            evaluate_tooling_compatibility("1.0.0", "1.0.0").expect("compat parse"),
+            ToolingCompatibility::ReadWrite
+        );
+        assert_eq!(
+            evaluate_tooling_compatibility("1.2.0", "1.1.0").expect("compat parse"),
+            ToolingCompatibility::ReadWrite
+        );
+        assert_eq!(
+            evaluate_tooling_compatibility("1.0.0", "1.2.0").expect("compat parse"),
+            ToolingCompatibility::ReadOnlyForwardCompatible
+        );
+        assert_eq!(
+            evaluate_tooling_compatibility("1.2.0", "2.0.0").expect("compat parse"),
+            ToolingCompatibility::Incompatible
+        );
+    }
+
+    #[test]
+    fn canonical_examples_validate_against_contract() {
+        let specs = build_field_specs();
+        for event in canonical_event_examples() {
+            let schema_errors = validate_log_event(&event);
+            assert!(
+                schema_errors.is_empty(),
+                "canonical example should satisfy schema validator: {schema_errors:?}"
+            );
+
+            let contract_errors = validate_event_against_field_specs(&event, &specs);
+            assert!(
+                contract_errors.is_empty(),
+                "canonical example should satisfy field specs: {contract_errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn schema_contract_markdown_contains_core_sections() {
+        let markdown = render_schema_contract_markdown();
+        assert!(markdown.contains("# Unified E2E Log Schema Contract"));
+        assert!(markdown.contains(LOG_SCHEMA_VERSION));
+        assert!(markdown.contains(LOG_SCHEMA_MIN_SUPPORTED_VERSION));
+        for field in REQUIRED_EVENT_FIELDS {
+            assert!(
+                markdown.contains(field),
+                "contract markdown missing required field {field}"
+            );
+        }
+        for replay_key in REPLAYABILITY_KEYS {
+            assert!(
+                markdown.contains(replay_key),
+                "contract markdown missing replay key {replay_key}"
+            );
+        }
     }
 
     #[test]
@@ -930,6 +1572,9 @@ mod tests {
         let r1 = build_coverage_report();
         let r2 = build_coverage_report();
         assert_eq!(r1.scenarios.len(), r2.scenarios.len());
-        assert_eq!(r1.stats.coverage_pct, r2.stats.coverage_pct);
+        assert_eq!(
+            r1.stats.coverage_pct.total_cmp(&r2.stats.coverage_pct),
+            std::cmp::Ordering::Equal
+        );
     }
 }

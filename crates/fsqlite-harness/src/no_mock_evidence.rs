@@ -109,9 +109,9 @@ impl EvidenceBuilder {
     }
 
     fn test(mut self, function: &str, crate_name: &str, module: &str) -> Self {
-        self.entry.test_function = function.to_owned();
-        self.entry.test_crate = crate_name.to_owned();
-        self.entry.test_module = module.to_owned();
+        function.clone_into(&mut self.entry.test_function);
+        crate_name.clone_into(&mut self.entry.test_crate);
+        module.clone_into(&mut self.entry.test_module);
         self
     }
 
@@ -121,7 +121,7 @@ impl EvidenceBuilder {
     }
 
     fn rationale(mut self, rationale: &str) -> Self {
-        self.entry.rationale = rationale.to_owned();
+        rationale.clone_into(&mut self.entry.rationale);
         self
     }
 
@@ -697,6 +697,7 @@ fn build_storage_txn_evidence(entries: &mut Vec<NoMockEvidenceEntry>) {
 
 // ─── Pragma Evidence (UT-PRAGMA-001..003) ───────────────────────────────
 
+#[allow(clippy::too_many_lines)]
 fn build_pragma_evidence(entries: &mut Vec<NoMockEvidenceEntry>) {
     // UT-PRAGMA-001: journal_mode
     entries.push(
@@ -973,6 +974,7 @@ fn build_builtin_function_evidence(entries: &mut Vec<NoMockEvidenceEntry>) {
 
 // ─── Extension Evidence (UT-EXT-001..004) ───────────────────────────────
 
+#[allow(clippy::too_many_lines)]
 fn build_extension_evidence(entries: &mut Vec<NoMockEvidenceEntry>) {
     // Extensions are currently feature-gated; evidence via registry + type system
 
@@ -1140,6 +1142,7 @@ fn build_extension_evidence(entries: &mut Vec<NoMockEvidenceEntry>) {
 
 // ─── Type System Evidence (UT-TYPE-001..003) ─────────────────────────────
 
+#[allow(clippy::too_many_lines)]
 fn build_type_system_evidence(entries: &mut Vec<NoMockEvidenceEntry>) {
     let harness = "fsqlite-harness";
 
@@ -1376,6 +1379,7 @@ fn build_file_format_evidence(entries: &mut Vec<NoMockEvidenceEntry>) {
 
 // ─── API/CLI Evidence (UT-API-001..003) ─────────────────────────────────
 
+#[allow(clippy::too_many_lines)]
 fn build_api_cli_evidence(entries: &mut Vec<NoMockEvidenceEntry>) {
     let harness = "fsqlite-harness";
     let pager_mod = "storage_unit_suites::pager_tests";

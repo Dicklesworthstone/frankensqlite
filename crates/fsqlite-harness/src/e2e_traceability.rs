@@ -499,6 +499,23 @@ pub fn build_canonical_inventory() -> TraceabilityMatrix {
 
     scripts.push(
         ScriptEntryBuilder::new(
+            "e2e/extension_integrated_wave_report.sh",
+            ScriptKind::ShellE2e,
+            "Integrated extension parity wave with structured SQL traces and mismatch digests",
+        )
+        .bead("bd-1dp9.5.4")
+        .command("bash e2e/extension_integrated_wave_report.sh --json")
+        .json_output()
+        .scenarios(&["EXT-1", "EXT-2", "EXT-3", "EXT-4"])
+        .storage(&[StorageMode::InMemory, StorageMode::FileBacked])
+        .concurrency(&[ConcurrencyMode::Sequential])
+        .artifacts(&["test-results/bd_1dp9_5_4/"])
+        .timeout(1800)
+        .build(),
+    );
+
+    scripts.push(
+        ScriptEntryBuilder::new(
             "e2e/arc_warmup_report.sh",
             ScriptKind::ShellE2e,
             "ARC cache performance warmup analysis",

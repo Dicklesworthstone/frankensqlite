@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use fsqlite_harness::e2e_log_schema::{self, ScenarioCriticality};
 use fsqlite_harness::e2e_orchestrator::{
-    build_default_manifest, build_execution_manifest, execute_manifest, ManifestExecutionMode,
+    ManifestExecutionMode, build_default_manifest, build_execution_manifest, execute_manifest,
 };
 use fsqlite_harness::e2e_traceability;
 

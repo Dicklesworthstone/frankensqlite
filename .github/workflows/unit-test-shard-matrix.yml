@@ -168,3 +168,70 @@ jobs:
         with:
           name: unit-shard-${{ matrix.shard.id }}-artifacts
           path: artifacts/unit-shards/${{ matrix.shard.id }}/
+          retention-days: 21
+
+  unit-coverage-drift-gate:
+    needs: unit-shards
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      RUST_BACKTRACE: "1"
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly
+
+      - name: Download unit-shard artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/downloaded-unit-shards
+          pattern: unit-shard-*-artifacts
+          merge-multiple: false
+
+      - name: Run unit coverage drift gate
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          artifact_root="artifacts/unit-coverage-drift-gate"
+          report_json="${artifact_root}/unit_coverage_drift_report.json"
+          report_md="${artifact_root}/unit_coverage_drift_summary.md"
+          gate_log="${artifact_root}/unit_coverage_drift_gate_runner.log"
+
+          mkdir -p "${artifact_root}"
+
+          set +e
+          cargo run -p fsqlite-harness --bin unit_coverage_drift_gate_runner -- \
+            --workspace-root "${GITHUB_WORKSPACE}" \
+            --run-dir "${artifact_root}/run" \
+            --unit-shard-root "${GITHUB_WORKSPACE}/artifacts/downloaded-unit-shards" \
+            --output-json "${report_json}" \
+            --output-human "${report_md}" \
+            > "${gate_log}" 2>&1
+          gate_status=$?
+          set -e
+
+          {
+            echo "### Unit coverage drift gate"
+            echo "- exit_code: ${gate_status}"
+            echo "- report: \`${report_json}\`"
+            echo "- summary: \`${report_md}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+          if [[ ${gate_status} -ne 0 ]]; then
+            exit "${gate_status}"
+          fi
+
+      - name: Upload unit coverage drift artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-coverage-drift-gate-artifacts
+          path: artifacts/unit-coverage-drift-gate/
+          retention-days: 21

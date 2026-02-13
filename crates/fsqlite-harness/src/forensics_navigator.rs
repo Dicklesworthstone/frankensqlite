@@ -183,7 +183,12 @@ pub fn render_text_report(result: &ForensicsQueryResult) -> String {
     for event in &result.timeline {
         lines.push(format!(
             "- run_id={} started_at={} severity={} success={} commit={} seed={}",
-            event.run_id, event.started_at, event.severity, event.success, event.git_sha, event.seed
+            event.run_id,
+            event.started_at,
+            event.severity,
+            event.success,
+            event.git_sha,
+            event.seed
         ));
         if !event.failing_scenarios.is_empty() {
             lines.push(format!(
@@ -304,7 +309,11 @@ fn build_timeline_event(run: &RunRecord) -> TimelineEvent {
         .collect();
     violated_invariants.sort();
 
-    let mut artifact_paths: Vec<String> = run.artifacts.iter().map(|artifact| artifact.path.clone()).collect();
+    let mut artifact_paths: Vec<String> = run
+        .artifacts
+        .iter()
+        .map(|artifact| artifact.path.clone())
+        .collect();
     artifact_paths.sort();
     let replay_command = build_replay_command(run);
 
@@ -350,18 +359,14 @@ fn build_correlations(events: &[TimelineEvent]) -> Vec<CorrelationRow> {
     let mut by_key: BTreeMap<String, Bucket> = BTreeMap::new();
     for event in events {
         for component in &event.components {
-            let entry = by_key
-                .entry(format!("component:{component}"))
-                .or_default();
+            let entry = by_key.entry(format!("component:{component}")).or_default();
             entry.run_ids.insert(event.run_id.clone());
             for path in &event.artifact_paths {
                 entry.artifact_paths.insert(path.clone());
             }
         }
         for invariant in &event.violated_invariants {
-            let entry = by_key
-                .entry(format!("invariant:{invariant}"))
-                .or_default();
+            let entry = by_key.entry(format!("invariant:{invariant}")).or_default();
             entry.run_ids.insert(event.run_id.clone());
             for path in &event.artifact_paths {
                 entry.artifact_paths.insert(path.clone());

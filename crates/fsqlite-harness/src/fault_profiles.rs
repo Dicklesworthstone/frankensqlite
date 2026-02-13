@@ -31,6 +31,7 @@ use crate::eprocess::MvccInvariant;
 use crate::fault_vfs::FaultSpec;
 
 /// Bead identifier for tracing and log correlation.
+#[allow(dead_code)]
 const BEAD_ID: &str = "bd-mblr.2.3.1";
 
 // ---------------------------------------------------------------------------
@@ -369,6 +370,7 @@ pub struct FaultProfileCatalog {
 impl FaultProfileCatalog {
     /// Build the default catalog with all standard profiles.
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn default_catalog() -> Self {
         Self {
             profiles: vec![

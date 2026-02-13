@@ -243,7 +243,7 @@ pub struct LogReference {
 ///
 /// This is the unit of storage in the evidence index.  Each record
 /// serializes to a single JSONL line for append-only persistence.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunRecord {
     /// Schema version for this record format.
     pub schema_version: u32,
@@ -580,7 +580,7 @@ mod tests {
     fn insert_and_retrieve_run() {
         let mut index = EvidenceIndex::new();
         let run = sample_run("run-001", true, 42);
-        index.insert(run.clone());
+        index.insert(run);
         assert_eq!(index.run_count(), 1);
         let retrieved = index.get_run(&RunId("run-001".to_owned()));
         assert!(retrieved.is_some());

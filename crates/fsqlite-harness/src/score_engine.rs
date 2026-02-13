@@ -92,6 +92,7 @@ impl BetaParams {
     ///
     /// Returns x such that I_x(alpha, beta) = p.
     #[must_use]
+    #[allow(clippy::float_cmp)]
     pub fn quantile(self, p: f64) -> f64 {
         assert!((0.0..=1.0).contains(&p), "p must be in [0, 1], got {p}");
         if p == 0.0 {
@@ -119,11 +120,12 @@ impl BetaParams {
 // ---------------------------------------------------------------------------
 
 /// Log-gamma via Lanczos approximation (g=7, n=9 coefficients).
+#[allow(clippy::excessive_precision)]
 fn ln_gamma(x: f64) -> f64 {
     const COEFFS: [f64; 9] = [
         0.999_999_999_999_809_93,
         676.520_368_121_885_1,
-        -1259.139_216_722_402_8,
+        -1_259.139_216_722_402_8,
         771.323_428_777_653_13,
         -176.615_029_162_140_59,
         12.507_343_278_686_905,
@@ -145,7 +147,7 @@ fn ln_gamma(x: f64) -> f64 {
             ag += c / denom;
         }
         let t = x + 7.5;
-        0.5 * (2.0 * PI).ln() + (x + 0.5) * t.ln() - t + ag.ln()
+        0.5f64.mul_add((2.0 * PI).ln(), (x + 0.5) * t.ln()) - t + ag.ln()
     }
 }
 
@@ -158,7 +160,12 @@ fn ln_beta_fn(a: f64, b: f64) -> f64 {
 /// (Lentz's modified method).
 ///
 /// Reference: Numerical Recipes in C, 2nd ed., section 6.4.
+#[allow(clippy::many_single_char_names)]
 fn regularized_ibeta(x: f64, a: f64, b: f64) -> f64 {
+    const EPS: f64 = 1e-15;
+    const TINY: f64 = 1e-30;
+    const MAX_ITER: usize = 200;
+
     if x <= 0.0 {
         return 0.0;
     }
@@ -172,12 +179,8 @@ fn regularized_ibeta(x: f64, a: f64, b: f64) -> f64 {
     }
 
     // Prefactor: x^a * (1-x)^b / (a * B(a,b))
-    let ln_prefactor = a * x.ln() + b * (1.0 - x).ln() - ln_beta_fn(a, b) - a.ln();
+    let ln_prefactor = a.mul_add(x.ln(), b * (1.0 - x).ln()) - ln_beta_fn(a, b) - a.ln();
     let prefactor = ln_prefactor.exp();
-
-    const EPS: f64 = 1e-15;
-    const TINY: f64 = 1e-30;
-    const MAX_ITER: usize = 200;
 
     // Lentz's modified method (Numerical Recipes betacf).
     // c and d are carried across iterations.
@@ -244,7 +247,7 @@ fn beta_quantile(p: f64, a: f64, b: f64) -> f64 {
     let mut hi = 1.0_f64;
 
     for _ in 0..MAX_ITER {
-        let mid = (lo + hi) / 2.0;
+        let mid = f64::midpoint(lo, hi);
         let cdf = regularized_ibeta(mid, a, b);
 
         if (cdf - p).abs() < TOL {
@@ -257,7 +260,7 @@ fn beta_quantile(p: f64, a: f64, b: f64) -> f64 {
         }
     }
 
-    (lo + hi) / 2.0
+    f64::midpoint(lo, hi)
 }
 
 // ---------------------------------------------------------------------------
@@ -609,6 +612,7 @@ fn compute_conformal_half_width(residuals: &[f64], coverage: f64) -> f64 {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(clippy::float_cmp)]
 mod tests {
     use super::*;
 
@@ -697,8 +701,8 @@ mod tests {
     fn ibeta_known_value_beta_2_3() {
         // I_x(2,3) = x^2 * (6 - 8x + 3x^2) for x in [0,1]
         // At x = 0.3: 0.09 * (6 - 2.4 + 0.27) = 0.09 * 3.87 = 0.3483
-        let x = 0.3;
-        let expected = x * x * (6.0 - 8.0 * x + 3.0 * x * x);
+        let x: f64 = 0.3;
+        let expected = x * x * ((3.0_f64 * x).mul_add(x, 8.0_f64.mul_add(-x, 6.0)));
         let actual = regularized_ibeta(x, 2.0, 3.0);
         assert!(
             (actual - expected).abs() < 1e-4,
