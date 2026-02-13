@@ -36,6 +36,189 @@ jobs:
           cargo test -p fsqlite-core test_query_with_params_table_index_eq_single_anonymous_no_match_returns_empty -- --nocapture
           cargo test -p fsqlite-vdbe test_codegen_select_with_index -- --nocapture
 
+  e2e-scenario-matrix:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        lane:
+          - id: smoke
+            scenario_tier: infra
+            subcommand: run-smoke
+            seed: 424242
+          - id: correctness
+            scenario_tier: correctness
+            subcommand: run-correctness
+            seed: 525252
+          - id: recovery
+            scenario_tier: recovery
+            subcommand: run-recovery
+            seed: 626262
+    env:
+      RUST_BACKTRACE: "1"
+      CARGO_TERM_COLOR: always
+      MATRIX_MANIFEST_VERSION: fsqlite-ci.e2e-matrix.v1
+      MATRIX_SUMMARY_SCHEMA_VERSION: fsqlite-ci.e2e-matrix-summary.v1
+      LANE_ID: ${{ matrix.lane.id }}
+      SCENARIO_TIER: ${{ matrix.lane.scenario_tier }}
+      LANE_SUBCOMMAND: ${{ matrix.lane.subcommand }}
+      LANE_SEED: ${{ matrix.lane.seed }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly
+
+      - name: Create lane artifacts root
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "artifacts/e2e-matrix/${LANE_ID}/logs"
+
+      - name: Run deterministic E2E lane
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          artifact_root="artifacts/e2e-matrix/${LANE_ID}"
+          run_dir="${artifact_root}/run"
+          summary_json="${artifact_root}/summary.json"
+          summary_md="${artifact_root}/summary.md"
+          log_file="${artifact_root}/logs/e2e_runner.log"
+          manifest_json="${artifact_root}/orchestrator_manifest.json"
+          orchestrator_summary_json="${artifact_root}/orchestrator_summary.json"
+
+          mkdir -p "${run_dir}"
+
+          started_epoch="$(date +%s)"
+          set +e
+          cargo run -p fsqlite-e2e --bin e2e-runner -- \
+            --json \
+            --seed "${LANE_SEED}" \
+            --output "${run_dir}" \
+            "${LANE_SUBCOMMAND}" 2>&1 | tee "${log_file}"
+          lane_status=${PIPESTATUS[0]}
+          set -e
+          duration_seconds="$(( $(date +%s) - started_epoch ))"
+
+          # Capture canonical full-suite manifest/summary for this deterministic seed.
+          # This is evidence-only for bd-mblr.3.2.1 and should not fail the lane yet.
+          set +e
+          cargo run -p fsqlite-harness --bin e2e_full_suite_runner -- \
+            --root-seed "${LANE_SEED}" \
+            --workspace-root "${GITHUB_WORKSPACE}" \
+            --run-dir "${artifact_root}/orchestrator-run" \
+            --manifest-out "${manifest_json}" \
+            --summary-out "${orchestrator_summary_json}" \
+            > "${artifact_root}/logs/e2e_full_suite_runner.log" 2>&1
+          orchestrator_status=$?
+          set -e
+
+          results_file="${run_dir}/results.json"
+          if [[ -f "${results_file}" ]]; then
+            total_tests="$(jq -r '.summary.total_tests // 0' "${results_file}")"
+            passed_tests="$(jq -r '.summary.passed // 0' "${results_file}")"
+            failed_tests="$(jq -r '.summary.failed // 0' "${results_file}")"
+            skipped_tests="$(jq -r '.summary.skipped // 0' "${results_file}")"
+          else
+            total_tests=0
+            passed_tests=0
+            failed_tests=0
+            skipped_tests=0
+          fi
+
+          jq -n \
+            --arg schema_version "${MATRIX_SUMMARY_SCHEMA_VERSION}" \
+            --arg manifest_version "${MATRIX_MANIFEST_VERSION}" \
+            --arg lane_id "${LANE_ID}" \
+            --arg scenario_tier "${SCENARIO_TIER}" \
+            --arg subcommand "${LANE_SUBCOMMAND}" \
+            --argjson seed "${LANE_SEED}" \
+            --argjson lane_exit_code "${lane_status}" \
+            --argjson orchestrator_exit_code "${orchestrator_status}" \
+            --arg results_file "${results_file}" \
+            --arg orchestrator_manifest "${manifest_json}" \
+            --arg orchestrator_summary "${orchestrator_summary_json}" \
+            --arg log_file "${log_file}" \
+            --argjson duration_seconds "${duration_seconds}" \
+            --argjson total_tests "${total_tests}" \
+            --argjson passed_tests "${passed_tests}" \
+            --argjson failed_tests "${failed_tests}" \
+            --argjson skipped_tests "${skipped_tests}" \
+            '{
+              schema_version: $schema_version,
+              manifest_version: $manifest_version,
+              lane_id: $lane_id,
+              scenario_tier: $scenario_tier,
+              subcommand: $subcommand,
+              seed: $seed,
+              lane_exit_code: $lane_exit_code,
+              orchestrator_exit_code: $orchestrator_exit_code,
+              duration_seconds: $duration_seconds,
+              summary: {
+                total_tests: $total_tests,
+                passed: $passed_tests,
+                failed: $failed_tests,
+                skipped: $skipped_tests
+              },
+              artifacts: {
+                results_file: $results_file,
+                log_file: $log_file,
+                orchestrator_manifest: $orchestrator_manifest,
+                orchestrator_summary: $orchestrator_summary
+              }
+            }' > "${summary_json}"
+
+          {
+            echo "# E2E Matrix Lane: ${LANE_ID}"
+            echo
+            echo "- manifest_version: \`${MATRIX_MANIFEST_VERSION}\`"
+            echo "- scenario_tier: \`${SCENARIO_TIER}\`"
+            echo "- subcommand: \`${LANE_SUBCOMMAND}\`"
+            echo "- seed: \`${LANE_SEED}\`"
+            echo "- duration_seconds: ${duration_seconds}"
+            echo "- lane_exit_code: ${lane_status}"
+            echo "- orchestrator_exit_code: ${orchestrator_status} (evidence-only)"
+            echo
+            echo "## Test Summary"
+            echo "- total: ${total_tests}"
+            echo "- passed: ${passed_tests}"
+            echo "- failed: ${failed_tests}"
+            echo "- skipped: ${skipped_tests}"
+            echo
+            echo "## Artifacts"
+            echo "- results: \`${results_file}\`"
+            echo "- lane log: \`${log_file}\`"
+            echo "- orchestrator manifest: \`${manifest_json}\`"
+            echo "- orchestrator summary: \`${orchestrator_summary_json}\`"
+          } > "${summary_md}"
+
+          {
+            echo "### E2E matrix lane ${LANE_ID}"
+            echo "- scenario_tier: \`${SCENARIO_TIER}\`"
+            echo "- seed: \`${LANE_SEED}\`"
+            echo "- lane_exit_code: ${lane_status}"
+            echo "- orchestrator_exit_code: ${orchestrator_status} (non-blocking evidence)"
+            echo "- summary: \`${summary_json}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+          if [[ ${lane_status} -ne 0 ]]; then
+            exit "${lane_status}"
+          fi
+
+      - name: Upload E2E matrix lane artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-matrix-${{ matrix.lane.id }}-artifacts
+          path: artifacts/e2e-matrix/${{ matrix.lane.id }}/
+          retention-days: 21
+
   verification-gates:
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
