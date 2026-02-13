@@ -492,6 +492,14 @@ pub struct SimpleTransaction<V: Vfs> {
 
 impl<V: Vfs> traits::sealed::Sealed for SimpleTransaction<V> {}
 
+impl<V: Vfs> SimpleTransaction<V> {
+    /// Whether this transaction has been upgraded to a writer.
+    #[must_use]
+    pub fn is_writer(&self) -> bool {
+        self.is_writer
+    }
+}
+
 impl<V> SimpleTransaction<V>
 where
     V: Vfs + Send,

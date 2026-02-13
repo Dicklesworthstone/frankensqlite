@@ -3338,26 +3338,36 @@ impl Connection {
             "fsqlite.conflict_stats" | "conflict_stats" => {
                 let snap = self.conflict_observer.metrics().snapshot();
                 Ok(vec![
-                    Row { values: vec![
-                        SqliteValue::Text("conflicts_total".into()),
-                        SqliteValue::Integer(snap.conflicts_total as i64),
-                    ]},
-                    Row { values: vec![
-                        SqliteValue::Text("page_contentions".into()),
-                        SqliteValue::Integer(snap.page_contentions as i64),
-                    ]},
-                    Row { values: vec![
-                        SqliteValue::Text("fcw_drifts".into()),
-                        SqliteValue::Integer(snap.fcw_drifts as i64),
-                    ]},
-                    Row { values: vec![
-                        SqliteValue::Text("ssi_aborts".into()),
-                        SqliteValue::Integer(snap.ssi_aborts as i64),
-                    ]},
-                    Row { values: vec![
-                        SqliteValue::Text("conflicts_resolved".into()),
-                        SqliteValue::Integer(snap.conflicts_resolved as i64),
-                    ]},
+                    Row {
+                        values: vec![
+                            SqliteValue::Text("conflicts_total".into()),
+                            SqliteValue::Integer(snap.conflicts_total as i64),
+                        ],
+                    },
+                    Row {
+                        values: vec![
+                            SqliteValue::Text("page_contentions".into()),
+                            SqliteValue::Integer(snap.page_contentions as i64),
+                        ],
+                    },
+                    Row {
+                        values: vec![
+                            SqliteValue::Text("fcw_drifts".into()),
+                            SqliteValue::Integer(snap.fcw_drifts as i64),
+                        ],
+                    },
+                    Row {
+                        values: vec![
+                            SqliteValue::Text("ssi_aborts".into()),
+                            SqliteValue::Integer(snap.ssi_aborts as i64),
+                        ],
+                    },
+                    Row {
+                        values: vec![
+                            SqliteValue::Text("conflicts_resolved".into()),
+                            SqliteValue::Integer(snap.conflicts_resolved as i64),
+                        ],
+                    },
                 ])
             }
             "fsqlite.conflict_log" | "conflict_log" => {
@@ -3367,11 +3377,13 @@ impl Connection {
                     .enumerate()
                     .map(|(i, e)| {
                         let desc = format!("{e:?}");
-                        Row { values: vec![
-                            SqliteValue::Integer(i as i64),
-                            SqliteValue::Integer(e.timestamp_ns() as i64),
-                            SqliteValue::Text(desc),
-                        ]}
+                        Row {
+                            values: vec![
+                                SqliteValue::Integer(i as i64),
+                                SqliteValue::Integer(e.timestamp_ns() as i64),
+                                SqliteValue::Text(desc),
+                            ],
+                        }
                     })
                     .collect();
                 Ok(rows)
@@ -3390,6 +3402,18 @@ impl Connection {
                 } else {
                     CheckpointMode::Passive
                 };
+
+                // SQLite behavior: when not in WAL mode, wal_checkpoint does not error.
+                // It returns the sentinel tuple (busy=0, log=-1, checkpointed=-1).
+                if self.pager.journal_mode() != JournalMode::Wal {
+                    return Ok(vec![Row {
+                        values: vec![
+                            SqliteValue::Integer(0),
+                            SqliteValue::Integer(-1),
+                            SqliteValue::Integer(-1),
+                        ],
+                    }]);
+                }
 
                 let cx = Cx::new();
                 let result = self.pager.checkpoint(&cx, mode)?;
@@ -13593,7 +13617,7 @@ mod tests {
     }
 
     #[test]
-    fn test_pragma_wal_checkpoint_fails_in_delete_mode() {
+    fn test_pragma_wal_checkpoint_returns_sentinel_in_delete_mode() {
         let conn = Connection::open(":memory:").unwrap();
         // Switch to delete/rollback journal mode.
         conn.execute("PRAGMA journal_mode='delete';").unwrap();
@@ -13602,9 +13626,12 @@ mod tests {
             fsqlite_pager::JournalMode::Delete
         );
 
-        // Checkpoint should fail in non-WAL mode.
-        let result = conn.query("PRAGMA wal_checkpoint;");
-        assert!(result.is_err(), "checkpoint should fail in delete mode");
+        // SQLite-compatible non-WAL sentinel: busy=0, log=-1, checkpointed=-1.
+        let rows = conn.query("PRAGMA wal_checkpoint;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Integer(0));
+        assert_eq!(*rows[0].get(1).unwrap(), SqliteValue::Integer(-1));
+        assert_eq!(*rows[0].get(2).unwrap(), SqliteValue::Integer(-1));
     }
 
     // ─── JOIN tests ─────────────────────────────────────────────
