@@ -10,7 +10,9 @@
 //! planner layer per the workspace layering rules (bd-1wwc).
 
 pub mod codegen;
+pub mod decision_contract;
 
+use decision_contract::access_path_kind_label;
 use fsqlite_ast::{
     BinaryOp as AstBinaryOp, ColumnRef, CompoundOp, Expr, FromClause, InSet, LikeOp, Literal,
     NullsOrder, OrderingTerm, ResultColumn, SelectBody, SelectCore, SortDirection, Span,
@@ -635,6 +637,15 @@ pub fn best_access_path(
         }
     }
 
+    tracing::debug!(
+        table = %table.name,
+        access_path = %access_path_kind_label(&best.kind),
+        index = ?best.index,
+        estimated_cost = best.estimated_cost,
+        estimated_rows = best.estimated_rows,
+        "planner.best_access_path"
+    );
+
     best
 }
 
@@ -1187,11 +1198,22 @@ pub fn order_joins(
         })
         .expect("tables must be non-empty (checked n == 0 above)");
 
-    QueryPlan {
+    let plan = QueryPlan {
         join_order: best.tables,
         access_paths: best.access_paths,
         total_cost: best.cost,
-    }
+    };
+
+    tracing::debug!(
+        join_order = ?plan.join_order,
+        total_cost = plan.total_cost,
+        beam_width = mx_choice,
+        star_query = is_star,
+        table_count = n,
+        "planner.order_joins.complete"
+    );
+
+    plan
 }
 
 /// Check that adding `candidate` to `current_path` does not violate any
