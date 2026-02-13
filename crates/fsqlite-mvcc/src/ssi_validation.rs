@@ -10,12 +10,17 @@
 //! - `CommitProof` for commits
 //! - `AbortWitness` for SSI aborts
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use fsqlite_types::{CommitSeq, ObjectId, PageNumber, TxnToken, WitnessKey};
 use tracing::{debug, info, warn};
 
 use crate::observability;
+use crate::ssi_abort_policy::{
+    SsiDecisionCard, SsiDecisionCardDraft, SsiDecisionQuery, SsiDecisionType, SsiEvidenceLedger,
+};
 
 use crate::witness_objects::{
     AbortPolicy, AbortReason, AbortWitness, DependencyEdgeKind, EcsCommitProof, EcsDependencyEdge,
@@ -49,6 +54,61 @@ pub enum SsiAbortReason {
     CommittedPivot,
     /// The transaction was eagerly marked for abort by another committer.
     MarkedForAbort,
+}
+
+// ---------------------------------------------------------------------------
+// Evidence Ledger Metrics + Accessors
+// ---------------------------------------------------------------------------
+
+static FSQLITE_EVIDENCE_RECORDS_TOTAL_COMMIT: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_EVIDENCE_RECORDS_TOTAL_ABORT: AtomicU64 = AtomicU64::new(0);
+
+/// Snapshot of SSI evidence-record counters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct EvidenceRecordMetricsSnapshot {
+    pub fsqlite_evidence_records_total_commit: u64,
+    pub fsqlite_evidence_records_total_abort: u64,
+}
+
+impl EvidenceRecordMetricsSnapshot {
+    #[must_use]
+    pub fn fsqlite_evidence_records_total(self) -> u64 {
+        self.fsqlite_evidence_records_total_commit + self.fsqlite_evidence_records_total_abort
+    }
+}
+
+fn ssi_evidence_ledger() -> &'static SsiEvidenceLedger {
+    static LEDGER: OnceLock<SsiEvidenceLedger> = OnceLock::new();
+    LEDGER.get_or_init(SsiEvidenceLedger::default)
+}
+
+/// Read the shared SSI decision-evidence store.
+#[must_use]
+pub fn ssi_evidence_snapshot() -> Vec<SsiDecisionCard> {
+    ssi_evidence_ledger().snapshot()
+}
+
+/// Query the shared SSI decision-evidence store.
+#[must_use]
+pub fn ssi_evidence_query(query: &SsiDecisionQuery) -> Vec<SsiDecisionCard> {
+    ssi_evidence_ledger().query(query)
+}
+
+/// Snapshot evidence-record counters.
+#[must_use]
+pub fn ssi_evidence_metrics_snapshot() -> EvidenceRecordMetricsSnapshot {
+    EvidenceRecordMetricsSnapshot {
+        fsqlite_evidence_records_total_commit: FSQLITE_EVIDENCE_RECORDS_TOTAL_COMMIT
+            .load(Ordering::Relaxed),
+        fsqlite_evidence_records_total_abort: FSQLITE_EVIDENCE_RECORDS_TOTAL_ABORT
+            .load(Ordering::Relaxed),
+    }
+}
+
+/// Reset evidence-record counters (tests/diagnostics).
+pub fn reset_ssi_evidence_metrics() {
+    FSQLITE_EVIDENCE_RECORDS_TOTAL_COMMIT.store(0, Ordering::Relaxed);
+    FSQLITE_EVIDENCE_RECORDS_TOTAL_ABORT.store(0, Ordering::Relaxed);
 }
 
 // ---------------------------------------------------------------------------
@@ -180,6 +240,116 @@ pub struct CommittedWriterInfo {
 // Edge Discovery
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone, Copy)]
+struct IndexedTxnRecord {
+    token: TxnToken,
+    begin_seq: CommitSeq,
+    commit_seq: Option<CommitSeq>,
+    source_is_active: bool,
+    source_has_in_rw: bool,
+}
+
+fn interval_end(end: Option<CommitSeq>) -> u64 {
+    end.map_or(u64::MAX, CommitSeq::get)
+}
+
+fn intervals_overlap(
+    left_begin: CommitSeq,
+    left_end: Option<CommitSeq>,
+    right_begin: CommitSeq,
+    right_end: Option<CommitSeq>,
+) -> bool {
+    let left_end = interval_end(left_end);
+    let right_end = interval_end(right_end);
+    left_begin.get() <= right_end && right_begin.get() <= left_end
+}
+
+fn build_reader_index(
+    committing_txn: TxnToken,
+    active_readers: &[&dyn ActiveTxnView],
+    committed_readers: &[CommittedReaderInfo],
+) -> BTreeMap<u32, Vec<IndexedTxnRecord>> {
+    let mut index: BTreeMap<u32, Vec<IndexedTxnRecord>> = BTreeMap::new();
+
+    for reader in active_readers {
+        if reader.token() == committing_txn || !reader.is_active() {
+            continue;
+        }
+        for key in reader.read_keys() {
+            index
+                .entry(witness_key_page(key))
+                .or_default()
+                .push(IndexedTxnRecord {
+                    token: reader.token(),
+                    begin_seq: reader.begin_seq(),
+                    commit_seq: None,
+                    source_is_active: true,
+                    source_has_in_rw: reader.has_in_rw(),
+                });
+        }
+    }
+
+    for reader in committed_readers {
+        if reader.token == committing_txn {
+            continue;
+        }
+        for page in &reader.pages {
+            index.entry(page.get()).or_default().push(IndexedTxnRecord {
+                token: reader.token,
+                begin_seq: reader.begin_seq,
+                commit_seq: Some(reader.commit_seq),
+                source_is_active: false,
+                source_has_in_rw: reader.had_in_rw,
+            });
+        }
+    }
+
+    index
+}
+
+fn build_writer_index(
+    committing_txn: TxnToken,
+    active_writers: &[&dyn ActiveTxnView],
+    committed_writers: &[CommittedWriterInfo],
+) -> BTreeMap<u32, Vec<IndexedTxnRecord>> {
+    let mut index: BTreeMap<u32, Vec<IndexedTxnRecord>> = BTreeMap::new();
+
+    for writer in active_writers {
+        if writer.token() == committing_txn || !writer.is_active() {
+            continue;
+        }
+        for key in writer.write_keys() {
+            index
+                .entry(witness_key_page(key))
+                .or_default()
+                .push(IndexedTxnRecord {
+                    token: writer.token(),
+                    begin_seq: writer.begin_seq(),
+                    commit_seq: None,
+                    source_is_active: true,
+                    source_has_in_rw: false,
+                });
+        }
+    }
+
+    for writer in committed_writers {
+        if writer.token == committing_txn {
+            continue;
+        }
+        for page in &writer.pages {
+            index.entry(page.get()).or_default().push(IndexedTxnRecord {
+                token: writer.token,
+                begin_seq: CommitSeq::ZERO,
+                commit_seq: Some(writer.commit_seq),
+                source_is_active: false,
+                source_has_in_rw: false,
+            });
+        }
+    }
+
+    index
+}
+
 /// Discover incoming rw-antidependency edges (R -rw-> T).
 ///
 /// Checks both active transactions (from `active_readers`) and committed
@@ -191,6 +361,7 @@ pub struct CommittedWriterInfo {
 pub fn discover_incoming_edges(
     committing_txn: TxnToken,
     committing_begin_seq: CommitSeq,
+    committing_commit_seq: CommitSeq,
     write_keys: &[WitnessKey],
     active_readers: &[&dyn ActiveTxnView],
     committed_readers: &[CommittedReaderInfo],
@@ -201,67 +372,44 @@ pub fn discover_incoming_edges(
         return edges;
     }
 
-    // Check active readers (hot plane).
-    for reader in active_readers {
-        let reader_token = reader.token();
-        if reader_token == committing_txn {
-            continue; // Skip self.
-        }
-        // Concurrent check: reader started before our snapshot boundary.
-        for write_key in write_keys {
-            let read_keys = reader.read_keys();
-            for read_key in read_keys {
-                if keys_overlap(read_key, write_key) {
-                    debug!(
-                        bead_id = "bd-31bo",
-                        from = ?reader_token,
-                        to = ?committing_txn,
-                        key = ?write_key,
-                        source = "hot_plane",
-                        "discovered incoming rw-antidependency edge"
-                    );
-                    edges.push(DiscoveredEdge {
-                        from: reader_token,
-                        to: committing_txn,
-                        overlap_key: write_key.clone(),
-                        source_is_active: true,
-                        source_has_in_rw: reader.has_in_rw(),
-                    });
-                    break; // One edge per reader is sufficient.
-                }
-            }
-        }
-    }
-
-    // Check committed readers (RCRI).
-    for reader in committed_readers {
-        if reader.token == committing_txn {
+    let index = build_reader_index(committing_txn, active_readers, committed_readers);
+    let mut seen_sources = HashSet::new();
+    for write_key in write_keys {
+        let page = witness_key_page(write_key);
+        let Some(candidates) = index.get(&page) else {
             continue;
-        }
-        // Committed reader's commit_seq > committing_begin_seq means
-        // it committed after our snapshot — it's concurrent.
-        if reader.commit_seq.get() <= committing_begin_seq.get() {
-            continue; // Not concurrent.
-        }
-        for write_key in write_keys {
-            if committed_reader_overlaps(reader, write_key) {
-                debug!(
-                    bead_id = "bd-31bo",
-                    from = ?reader.token,
-                    to = ?committing_txn,
-                    key = ?write_key,
-                    source = "rcri",
-                    "discovered incoming rw-antidependency edge (committed reader)"
-                );
-                edges.push(DiscoveredEdge {
-                    from: reader.token,
-                    to: committing_txn,
-                    overlap_key: write_key.clone(),
-                    source_is_active: false,
-                    source_has_in_rw: reader.had_in_rw,
-                });
-                break;
+        };
+        for candidate in candidates {
+            let overlaps = intervals_overlap(
+                committing_begin_seq,
+                Some(committing_commit_seq),
+                candidate.begin_seq,
+                candidate.commit_seq,
+            );
+            if !overlaps || !seen_sources.insert(candidate.token) {
+                continue;
             }
+
+            let source = if candidate.source_is_active {
+                "hot_plane_index"
+            } else {
+                "rcri_index"
+            };
+            debug!(
+                bead_id = "bd-31bo",
+                from = ?candidate.token,
+                to = ?committing_txn,
+                key = ?write_key,
+                source,
+                "discovered incoming rw-antidependency edge"
+            );
+            edges.push(DiscoveredEdge {
+                from: candidate.token,
+                to: committing_txn,
+                overlap_key: write_key.clone(),
+                source_is_active: candidate.source_is_active,
+                source_has_in_rw: candidate.source_has_in_rw,
+            });
         }
     }
 
@@ -279,6 +427,7 @@ pub fn discover_incoming_edges(
 pub fn discover_outgoing_edges(
     committing_txn: TxnToken,
     committing_begin_seq: CommitSeq,
+    committing_commit_seq: CommitSeq,
     read_keys: &[WitnessKey],
     active_writers: &[&dyn ActiveTxnView],
     committed_writers: &[CommittedWriterInfo],
@@ -289,65 +438,44 @@ pub fn discover_outgoing_edges(
         return edges;
     }
 
-    // Check active writers (hot plane).
-    for writer in active_writers {
-        let writer_token = writer.token();
-        if writer_token == committing_txn {
+    let index = build_writer_index(committing_txn, active_writers, committed_writers);
+    let mut seen_targets = HashSet::new();
+    for read_key in read_keys {
+        let page = witness_key_page(read_key);
+        let Some(candidates) = index.get(&page) else {
             continue;
-        }
-        for read_key in read_keys {
-            let write_keys = writer.write_keys();
-            for write_key in write_keys {
-                if keys_overlap(read_key, write_key) {
-                    debug!(
-                        bead_id = "bd-31bo",
-                        from = ?committing_txn,
-                        to = ?writer_token,
-                        key = ?read_key,
-                        source = "hot_plane",
-                        "discovered outgoing rw-antidependency edge"
-                    );
-                    edges.push(DiscoveredEdge {
-                        from: committing_txn,
-                        to: writer_token,
-                        overlap_key: read_key.clone(),
-                        source_is_active: true,
-                        source_has_in_rw: false,
-                    });
-                    break;
-                }
+        };
+        for candidate in candidates {
+            let overlaps = intervals_overlap(
+                committing_begin_seq,
+                Some(committing_commit_seq),
+                candidate.begin_seq,
+                candidate.commit_seq,
+            );
+            if !overlaps || !seen_targets.insert(candidate.token) {
+                continue;
             }
-        }
-    }
 
-    // Check committed writers (CommitLog/CommitIndex).
-    for writer in committed_writers {
-        if writer.token == committing_txn {
-            continue;
-        }
-        // Writer committed after our begin_seq → concurrent.
-        if writer.commit_seq.get() <= committing_begin_seq.get() {
-            continue;
-        }
-        for read_key in read_keys {
-            if committed_writer_overlaps(writer, read_key) {
-                debug!(
-                    bead_id = "bd-31bo",
-                    from = ?committing_txn,
-                    to = ?writer.token,
-                    key = ?read_key,
-                    source = "commit_log",
-                    "discovered outgoing rw-antidependency edge (committed writer)"
-                );
-                edges.push(DiscoveredEdge {
-                    from: committing_txn,
-                    to: writer.token,
-                    overlap_key: read_key.clone(),
-                    source_is_active: false,
-                    source_has_in_rw: false,
-                });
-                break;
-            }
+            let source = if candidate.source_is_active {
+                "hot_plane_index"
+            } else {
+                "commit_log_index"
+            };
+            debug!(
+                bead_id = "bd-31bo",
+                from = ?committing_txn,
+                to = ?candidate.token,
+                key = ?read_key,
+                source,
+                "discovered outgoing rw-antidependency edge"
+            );
+            edges.push(DiscoveredEdge {
+                from: committing_txn,
+                to: candidate.token,
+                overlap_key: read_key.clone(),
+                source_is_active: candidate.source_is_active,
+                source_has_in_rw: false,
+            });
         }
     }
 
@@ -357,23 +485,6 @@ pub fn discover_outgoing_edges(
 // ---------------------------------------------------------------------------
 // Key Overlap Helpers
 // ---------------------------------------------------------------------------
-
-/// Conservative key overlap check. False positives OK, false negatives MUST NOT occur.
-fn keys_overlap(a: &WitnessKey, b: &WitnessKey) -> bool {
-    crate::witness_plane::witness_keys_overlap(a, b)
-}
-
-/// Check if a committed reader's page set overlaps with a write key.
-fn committed_reader_overlaps(reader: &CommittedReaderInfo, write_key: &WitnessKey) -> bool {
-    let pgno = witness_key_page(write_key);
-    reader.pages.iter().any(|p| p.get() == pgno)
-}
-
-/// Check if a committed writer's page set overlaps with a read key.
-fn committed_writer_overlaps(writer: &CommittedWriterInfo, read_key: &WitnessKey) -> bool {
-    let pgno = witness_key_page(read_key);
-    writer.pages.iter().any(|p| p.get() == pgno)
-}
 
 /// Extract the page number from a witness key.
 pub(crate) fn witness_key_page(key: &WitnessKey) -> u32 {
@@ -454,6 +565,16 @@ pub fn ssi_validate_and_publish(
 
     // Step 2: Read-only fast path.
     if write_keys.is_empty() {
+        record_evidence_decision(
+            SsiDecisionType::CommitAllowed,
+            txn,
+            begin_seq,
+            Some(commit_seq),
+            read_keys,
+            write_keys,
+            &[],
+            "read_only_fast_path",
+        );
         span.record("conflict_detected", false);
         span.record("decision_reason", "read_only_fast_path");
         debug!(
@@ -473,6 +594,16 @@ pub fn ssi_validate_and_publish(
 
     // Check eagerly marked for abort.
     if marked_for_abort {
+        record_evidence_decision(
+            SsiDecisionType::AbortCycle,
+            txn,
+            begin_seq,
+            Some(commit_seq),
+            read_keys,
+            write_keys,
+            &[],
+            "marked_for_abort",
+        );
         span.record("conflict_detected", true);
         span.record("decision_reason", "marked_for_abort");
         warn!(
@@ -499,12 +630,19 @@ pub fn ssi_validate_and_publish(
     let in_edges = discover_incoming_edges(
         txn,
         begin_seq,
+        commit_seq,
         write_keys,
         active_readers,
         committed_readers,
     );
-    let out_edges =
-        discover_outgoing_edges(txn, begin_seq, read_keys, active_writers, committed_writers);
+    let out_edges = discover_outgoing_edges(
+        txn,
+        begin_seq,
+        commit_seq,
+        read_keys,
+        active_writers,
+        committed_writers,
+    );
 
     state.has_in_rw = !in_edges.is_empty();
     state.has_out_rw = !out_edges.is_empty();
@@ -533,6 +671,22 @@ pub fn ssi_validate_and_publish(
 
     // Step 5: Pivot rule (conservative).
     if state.has_in_rw && state.has_out_rw {
+        let all_edges = build_dependency_edges(&in_edges, &out_edges, txn, commit_seq);
+        let discovered_edges: Vec<DiscoveredEdge> = in_edges
+            .iter()
+            .cloned()
+            .chain(out_edges.iter().cloned())
+            .collect();
+        record_evidence_decision(
+            SsiDecisionType::AbortWriteSkew,
+            txn,
+            begin_seq,
+            Some(commit_seq),
+            read_keys,
+            write_keys,
+            &discovered_edges,
+            "pivot_abort_dangerous_structure",
+        );
         span.record("conflict_detected", true);
         span.record("decision_reason", "pivot_abort");
         warn!(
@@ -543,7 +697,6 @@ pub fn ssi_validate_and_publish(
             "ssi_validate: PIVOT ABORT — dangerous structure detected"
         );
         observability::record_ssi_abort(fsqlite_observability::SsiAbortCategory::Pivot);
-        let all_edges = build_dependency_edges(&in_edges, &out_edges, txn, commit_seq);
         let witness = AbortWitness {
             txn,
             begin_seq,
@@ -581,6 +734,21 @@ pub fn ssi_validate_and_publish(
             // R is committed: if R.has_in_rw at commit time,
             // T MUST abort (committed pivot cannot be undone).
             if edge.source_has_in_rw {
+                let discovered_edges: Vec<DiscoveredEdge> = in_edges
+                    .iter()
+                    .cloned()
+                    .chain(out_edges.iter().cloned())
+                    .collect();
+                record_evidence_decision(
+                    SsiDecisionType::AbortCycle,
+                    txn,
+                    begin_seq,
+                    Some(commit_seq),
+                    read_keys,
+                    write_keys,
+                    &discovered_edges,
+                    "committed_pivot_abort",
+                );
                 span.record("conflict_detected", true);
                 span.record("decision_reason", "committed_pivot_abort");
                 warn!(
@@ -611,6 +779,21 @@ pub fn ssi_validate_and_publish(
 
     // Step 7: Publish edges and build CommitProof.
     let all_edges = build_dependency_edges(&in_edges, &out_edges, txn, commit_seq);
+    let discovered_edges: Vec<DiscoveredEdge> = in_edges
+        .iter()
+        .cloned()
+        .chain(out_edges.iter().cloned())
+        .collect();
+    record_evidence_decision(
+        SsiDecisionType::CommitAllowed,
+        txn,
+        begin_seq,
+        Some(commit_seq),
+        read_keys,
+        write_keys,
+        &discovered_edges,
+        "commit_approved",
+    );
     let edge_ids: Vec<ObjectId> = all_edges
         .iter()
         .enumerate()
@@ -704,12 +887,163 @@ fn build_commit_proof(
     }
 }
 
+fn decision_outcome(decision_type: SsiDecisionType) -> &'static str {
+    match decision_type {
+        SsiDecisionType::CommitAllowed => "commit",
+        SsiDecisionType::AbortWriteSkew
+        | SsiDecisionType::AbortPhantom
+        | SsiDecisionType::AbortCycle => "abort",
+    }
+}
+
+fn witness_keys_to_pages(keys: &[WitnessKey]) -> Vec<PageNumber> {
+    let mut pages: Vec<PageNumber> = keys
+        .iter()
+        .filter_map(|key| PageNumber::new(witness_key_page(key)))
+        .collect();
+    pages.sort_by_key(|page| page.get());
+    pages.dedup();
+    pages
+}
+
+fn edge_conflicting_txns(txn: TxnToken, edges: &[DiscoveredEdge]) -> Vec<TxnToken> {
+    let mut txns = Vec::new();
+    for edge in edges {
+        if edge.from != txn {
+            txns.push(edge.from);
+        }
+        if edge.to != txn {
+            txns.push(edge.to);
+        }
+    }
+    txns.sort_by(|left, right| {
+        left.id
+            .get()
+            .cmp(&right.id.get())
+            .then_with(|| left.epoch.get().cmp(&right.epoch.get()))
+    });
+    txns.dedup();
+    txns
+}
+
+fn edge_conflict_pages(edges: &[DiscoveredEdge]) -> Vec<PageNumber> {
+    let mut pages: Vec<PageNumber> = edges
+        .iter()
+        .filter_map(|edge| PageNumber::new(witness_key_page(&edge.overlap_key)))
+        .collect();
+    pages.sort_by_key(|page| page.get());
+    pages.dedup();
+    pages
+}
+
+fn estimate_evidence_size_bytes(
+    read_pages: &[PageNumber],
+    write_pages: &[PageNumber],
+    conflict_pages: &[PageNumber],
+    conflicting_txns: &[TxnToken],
+    rationale: &str,
+) -> u64 {
+    #[allow(clippy::cast_possible_truncation)]
+    {
+        let words = read_pages.len()
+            + write_pages.len()
+            + conflict_pages.len()
+            + conflicting_txns.len() * 2
+            + rationale.len();
+        (words * std::mem::size_of::<u64>()) as u64
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_evidence_decision(
+    decision_type: SsiDecisionType,
+    txn: TxnToken,
+    begin_seq: CommitSeq,
+    commit_seq: Option<CommitSeq>,
+    read_keys: &[WitnessKey],
+    write_keys: &[WitnessKey],
+    edges: &[DiscoveredEdge],
+    rationale: &str,
+) {
+    let read_pages = witness_keys_to_pages(read_keys);
+    let write_pages = witness_keys_to_pages(write_keys);
+    let conflict_pages = edge_conflict_pages(edges);
+    let conflicting_txns = edge_conflicting_txns(txn, edges);
+
+    let evidence_size_bytes = estimate_evidence_size_bytes(
+        &read_pages,
+        &write_pages,
+        &conflict_pages,
+        &conflicting_txns,
+        rationale,
+    );
+    let outcome = decision_outcome(decision_type);
+    let decision_id = fsqlite_observability::next_decision_id();
+
+    let span = tracing::span!(
+        target: "fsqlite.evidence",
+        tracing::Level::INFO,
+        "evidence_record",
+        decision_id,
+        outcome,
+        evidence_size_bytes
+    );
+    let _guard = span.enter();
+
+    let mut draft = SsiDecisionCardDraft::new(
+        decision_type,
+        txn,
+        begin_seq,
+        conflicting_txns.clone(),
+        conflict_pages.clone(),
+        read_pages.clone(),
+        write_pages.clone(),
+        rationale,
+    )
+    .with_decision_id(decision_id);
+    if let Some(seq) = commit_seq {
+        draft = draft.with_commit_seq(seq);
+    }
+    ssi_evidence_ledger().record_async(draft);
+
+    if matches!(decision_type, SsiDecisionType::CommitAllowed) {
+        FSQLITE_EVIDENCE_RECORDS_TOTAL_COMMIT.fetch_add(1, Ordering::Relaxed);
+    } else {
+        FSQLITE_EVIDENCE_RECORDS_TOTAL_ABORT.fetch_add(1, Ordering::Relaxed);
+    }
+
+    info!(
+        decision_id,
+        outcome,
+        decision_type = %decision_type,
+        txn_id = txn.id.get(),
+        read_pages = read_pages.len(),
+        write_pages = write_pages.len(),
+        conflicting_txns = conflicting_txns.len(),
+        conflict_pages = conflict_pages.len(),
+        "ssi decision evidence recorded"
+    );
+    debug!(
+        decision_id,
+        decision_type = %decision_type,
+        txn = ?txn,
+        read_pages = ?read_pages,
+        write_pages = ?write_pages,
+        conflicting_txns = ?conflicting_txns,
+        conflict_pages = ?conflict_pages,
+        rationale,
+        "ssi decision evidence details"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
     use fsqlite_types::{TxnEpoch, TxnId};
     use std::cell::Cell;
@@ -800,6 +1134,16 @@ mod tests {
         WitnessKey::Page(PageNumber::new(pgno).unwrap())
     }
 
+    fn keys_to_pages(keys: &[WitnessKey]) -> Vec<PageNumber> {
+        let mut pages = Vec::new();
+        for key in keys {
+            if let WitnessKey::Page(page) = key {
+                pages.push(*page);
+            }
+        }
+        pages
+    }
+
     // -- §5.7.3 test 1: Read-only skip --
 
     #[test]
@@ -844,6 +1188,39 @@ mod tests {
         assert!(ok.edges.is_empty());
         assert!(!ok.ssi_state.has_in_rw);
         assert!(!ok.ssi_state.has_out_rw);
+    }
+
+    // -- §5.7.3 test 2b: Safe-snapshot shortcut (no conflicts) --
+
+    #[test]
+    fn test_safe_snapshot_shortcut_no_conflict_commit() {
+        // Safe snapshot: no overlapping active/committed readers or writers.
+        // SSI should produce an immediate commit decision with no edges.
+        let txn = TxnToken::new(TxnId::new(8_001).unwrap(), TxnEpoch::new(0));
+        let result = ssi_validate_and_publish(
+            txn,
+            CommitSeq::new(10),
+            CommitSeq::new(11),
+            &[page_key(1_000)],
+            &[page_key(2_000)],
+            &[],
+            &[],
+            &[],
+            &[],
+            false,
+        )
+        .expect("safe snapshot should commit without conflict work");
+
+        assert!(
+            result.edges.is_empty(),
+            "safe snapshot should emit no edges"
+        );
+        assert!(
+            result.edge_ids.is_empty(),
+            "safe snapshot should emit no edge identifiers"
+        );
+        assert!(!result.ssi_state.has_in_rw);
+        assert!(!result.ssi_state.has_out_rw);
     }
 
     // -- §5.7.3 test 3: Only incoming edge → commit --
@@ -969,7 +1346,14 @@ mod tests {
         let reader = MockActiveTxn::new(2, 0, 1).with_reads(vec![page_key(5)]);
         let readers: Vec<&dyn ActiveTxnView> = vec![&reader];
 
-        let edges = discover_incoming_edges(txn, CommitSeq::new(1), &[page_key(5)], &readers, &[]);
+        let edges = discover_incoming_edges(
+            txn,
+            CommitSeq::new(1),
+            CommitSeq::new(5),
+            &[page_key(5)],
+            &readers,
+            &[],
+        );
         assert_eq!(edges.len(), 1);
         assert!(edges[0].source_is_active);
         assert_eq!(edges[0].from.id.get(), 2);
@@ -983,7 +1367,14 @@ mod tests {
         let writer = MockActiveTxn::new(3, 0, 1).with_writes(vec![page_key(7)]);
         let writers: Vec<&dyn ActiveTxnView> = vec![&writer];
 
-        let edges = discover_outgoing_edges(txn, CommitSeq::new(1), &[page_key(7)], &writers, &[]);
+        let edges = discover_outgoing_edges(
+            txn,
+            CommitSeq::new(1),
+            CommitSeq::new(5),
+            &[page_key(7)],
+            &writers,
+            &[],
+        );
         assert_eq!(edges.len(), 1);
         assert!(edges[0].source_is_active);
         assert_eq!(edges[0].to.id.get(), 3);
@@ -1001,8 +1392,14 @@ mod tests {
             pages: vec![PageNumber::new(7).unwrap()],
         };
 
-        let edges =
-            discover_outgoing_edges(txn, CommitSeq::new(1), &[page_key(7)], &[], &[committed_w]);
+        let edges = discover_outgoing_edges(
+            txn,
+            CommitSeq::new(1),
+            CommitSeq::new(5),
+            &[page_key(7)],
+            &[],
+            &[committed_w],
+        );
         assert_eq!(edges.len(), 1);
         assert!(!edges[0].source_is_active);
     }
@@ -1021,8 +1418,14 @@ mod tests {
             pages: vec![PageNumber::new(5).unwrap()],
         };
 
-        let edges =
-            discover_incoming_edges(txn, CommitSeq::new(1), &[page_key(5)], &[], &[committed_r]);
+        let edges = discover_incoming_edges(
+            txn,
+            CommitSeq::new(1),
+            CommitSeq::new(5),
+            &[page_key(5)],
+            &[],
+            &[committed_r],
+        );
         assert_eq!(edges.len(), 1);
         assert!(!edges[0].source_is_active);
     }
@@ -1043,6 +1446,7 @@ mod tests {
         let edges_hot_only = discover_outgoing_edges(
             txn,
             CommitSeq::new(1),
+            CommitSeq::new(5),
             &[page_key(7)],
             &[], // empty active writers
             &[], // no committed writers
@@ -1053,8 +1457,14 @@ mod tests {
         );
 
         // With committed writers: edge found.
-        let edges_full =
-            discover_outgoing_edges(txn, CommitSeq::new(1), &[page_key(7)], &[], &[committed_w]);
+        let edges_full = discover_outgoing_edges(
+            txn,
+            CommitSeq::new(1),
+            CommitSeq::new(5),
+            &[page_key(7)],
+            &[],
+            &[committed_w],
+        );
         assert_eq!(edges_full.len(), 1, "commit index catches the edge");
     }
 
@@ -1075,6 +1485,7 @@ mod tests {
         let edges_hot_only = discover_incoming_edges(
             txn,
             CommitSeq::new(1),
+            CommitSeq::new(5),
             &[page_key(5)],
             &[],
             &[], // no committed readers
@@ -1085,9 +1496,179 @@ mod tests {
         );
 
         // With RCRI: edge found.
-        let edges_full =
-            discover_incoming_edges(txn, CommitSeq::new(1), &[page_key(5)], &[], &[committed_r]);
+        let edges_full = discover_incoming_edges(
+            txn,
+            CommitSeq::new(1),
+            CommitSeq::new(5),
+            &[page_key(5)],
+            &[],
+            &[committed_r],
+        );
         assert_eq!(edges_full.len(), 1, "RCRI catches the edge");
+    }
+
+    // -- §5.7.3 test 12b: Interval overlap excludes future active reader --
+
+    #[test]
+    fn test_interval_overlap_excludes_future_active_reader() {
+        let txn = TxnToken::new(TxnId::new(1).unwrap(), TxnEpoch::new(0));
+        // Reader starts after our commit sequence and must not be treated as concurrent.
+        let late_reader = MockActiveTxn::new(2, 0, 9).with_reads(vec![page_key(5)]);
+        let readers: Vec<&dyn ActiveTxnView> = vec![&late_reader];
+
+        let edges = discover_incoming_edges(
+            txn,
+            CommitSeq::new(1),
+            CommitSeq::new(5),
+            &[page_key(5)],
+            &readers,
+            &[],
+        );
+        assert!(
+            edges.is_empty(),
+            "reader interval [9,+inf) does not overlap [1,5]"
+        );
+    }
+
+    // -- §5.7.3 test 12c: Interval overlap excludes stale committed writer --
+
+    #[test]
+    fn test_interval_overlap_excludes_stale_committed_writer() {
+        let txn = TxnToken::new(TxnId::new(1).unwrap(), TxnEpoch::new(0));
+        let stale_writer = CommittedWriterInfo {
+            token: TxnToken::new(TxnId::new(3).unwrap(), TxnEpoch::new(0)),
+            commit_seq: CommitSeq::new(4),
+            pages: vec![PageNumber::new(7).unwrap()],
+        };
+
+        let edges = discover_outgoing_edges(
+            txn,
+            CommitSeq::new(5),
+            CommitSeq::new(8),
+            &[page_key(7)],
+            &[],
+            &[stale_writer],
+        );
+        assert!(
+            edges.is_empty(),
+            "writer interval (-inf,4] does not overlap [5,8]"
+        );
+    }
+
+    // -- §5.7.3 test 12d: Bank-transfer write skew prevented --
+
+    #[test]
+    fn test_bank_transfer_write_skew_prevented() {
+        let t1 = TxnToken::new(TxnId::new(11).unwrap(), TxnEpoch::new(0));
+        let t2 = TxnToken::new(TxnId::new(12).unwrap(), TxnEpoch::new(0));
+
+        let t2_active = MockActiveTxn::new(12, 0, 1).with_reads(vec![page_key(100), page_key(200)]);
+        let readers_for_t1: Vec<&dyn ActiveTxnView> = vec![&t2_active];
+        let t1_reads = [page_key(100), page_key(200)];
+        let t1_writes = [page_key(100)];
+        let t1_commit = ssi_validate_and_publish(
+            t1,
+            CommitSeq::new(1),
+            CommitSeq::new(2),
+            &t1_reads,
+            &t1_writes,
+            &readers_for_t1,
+            &[],
+            &[],
+            &[],
+            false,
+        )
+        .expect("first transfer leg should commit");
+
+        let committed_reader_t1 = CommittedReaderInfo {
+            token: t1,
+            begin_seq: CommitSeq::new(1),
+            commit_seq: CommitSeq::new(2),
+            had_in_rw: t1_commit.ssi_state.has_in_rw,
+            pages: vec![PageNumber::new(100).unwrap(), PageNumber::new(200).unwrap()],
+        };
+        let committed_writer_t1 = CommittedWriterInfo {
+            token: t1,
+            commit_seq: CommitSeq::new(2),
+            pages: vec![PageNumber::new(100).unwrap()],
+        };
+
+        let t2_reads = [page_key(100), page_key(200)];
+        let t2_writes = [page_key(200)];
+        let t2_result = ssi_validate_and_publish(
+            t2,
+            CommitSeq::new(1),
+            CommitSeq::new(3),
+            &t2_reads,
+            &t2_writes,
+            &[],
+            &[],
+            &[committed_reader_t1],
+            &[committed_writer_t1],
+            false,
+        );
+        assert!(
+            t2_result.is_err(),
+            "second transfer leg must abort to prevent write skew"
+        );
+    }
+
+    // -- §5.7.3 test 12e: Doctor-on-call write skew prevented --
+
+    #[test]
+    fn test_doctor_on_call_write_skew_prevented() {
+        let d1 = TxnToken::new(TxnId::new(21).unwrap(), TxnEpoch::new(0));
+        let d2 = TxnToken::new(TxnId::new(22).unwrap(), TxnEpoch::new(0));
+
+        let d2_active = MockActiveTxn::new(22, 0, 1).with_reads(vec![page_key(310), page_key(311)]);
+        let readers_for_d1: Vec<&dyn ActiveTxnView> = vec![&d2_active];
+        let d1_reads = [page_key(310), page_key(311)];
+        let d1_writes = [page_key(310)];
+        let d1_commit = ssi_validate_and_publish(
+            d1,
+            CommitSeq::new(1),
+            CommitSeq::new(2),
+            &d1_reads,
+            &d1_writes,
+            &readers_for_d1,
+            &[],
+            &[],
+            &[],
+            false,
+        )
+        .expect("first doctor update should commit");
+
+        let committed_reader_d1 = CommittedReaderInfo {
+            token: d1,
+            begin_seq: CommitSeq::new(1),
+            commit_seq: CommitSeq::new(2),
+            had_in_rw: d1_commit.ssi_state.has_in_rw,
+            pages: vec![PageNumber::new(310).unwrap(), PageNumber::new(311).unwrap()],
+        };
+        let committed_writer_d1 = CommittedWriterInfo {
+            token: d1,
+            commit_seq: CommitSeq::new(2),
+            pages: vec![PageNumber::new(310).unwrap()],
+        };
+
+        let d2_reads = [page_key(310), page_key(311)];
+        let d2_writes = [page_key(311)];
+        let d2_result = ssi_validate_and_publish(
+            d2,
+            CommitSeq::new(1),
+            CommitSeq::new(3),
+            &d2_reads,
+            &d2_writes,
+            &[],
+            &[],
+            &[committed_reader_d1],
+            &[committed_writer_d1],
+            false,
+        );
+        assert!(
+            d2_result.is_err(),
+            "second doctor update must abort to preserve on-call invariant"
+        );
     }
 
     // -- §5.7.3 test 13: T3 rule — active pivot marked --
@@ -1578,5 +2159,450 @@ mod tests {
             false,
         );
         result.expect("different pages → no conflict → both commit");
+    }
+
+    // -- §5.7.3 stress test 27: Phantom-style batch insert + scan --
+
+    #[test]
+    fn test_phantom_batch_insert_scan_conflict_prevented() {
+        // T_scan reads a range witness and writes an aggregate page.
+        // T_insert writes that range witness and reads aggregate state.
+        // This forms a dangerous structure and exactly one side should commit.
+        let t_scan = TxnToken::new(TxnId::new(301).unwrap(), TxnEpoch::new(0));
+        let t_insert = TxnToken::new(TxnId::new(302).unwrap(), TxnEpoch::new(0));
+
+        let range_witness = page_key(900);
+        let aggregate_page = page_key(901);
+        let active_insert = MockActiveTxn::new(302, 0, 1)
+            .with_reads(vec![aggregate_page.clone()])
+            .with_writes(vec![range_witness.clone()]);
+        let readers_for_scan: Vec<&dyn ActiveTxnView> = vec![&active_insert];
+        let writers_for_scan: Vec<&dyn ActiveTxnView> = vec![&active_insert];
+
+        let scan_result = ssi_validate_and_publish(
+            t_scan,
+            CommitSeq::new(1),
+            CommitSeq::new(2),
+            std::slice::from_ref(&range_witness),
+            std::slice::from_ref(&aggregate_page),
+            &readers_for_scan,
+            &writers_for_scan,
+            &[],
+            &[],
+            false,
+        );
+        assert!(
+            scan_result.is_err(),
+            "scan+aggregate transaction should abort under phantom-style cycle"
+        );
+
+        let insert_result = ssi_validate_and_publish(
+            t_insert,
+            CommitSeq::new(1),
+            CommitSeq::new(3),
+            std::slice::from_ref(&aggregate_page),
+            std::slice::from_ref(&range_witness),
+            &[],
+            &[],
+            &[],
+            &[],
+            false,
+        );
+        assert!(
+            insert_result.is_ok(),
+            "one side of the phantom-style cycle must still commit"
+        );
+    }
+
+    // -- §5.7.3 stress test 28: 3-way adversarial cycle breaks --
+
+    #[test]
+    fn test_adversarial_three_way_cycle_breaks_with_single_abort() {
+        let begin_seq = CommitSeq::new(1);
+        let t1 = TxnToken::new(TxnId::new(401).unwrap(), TxnEpoch::new(0));
+        let t2 = TxnToken::new(TxnId::new(402).unwrap(), TxnEpoch::new(0));
+        let t3 = TxnToken::new(TxnId::new(403).unwrap(), TxnEpoch::new(0));
+
+        let v1 = MockActiveTxn::new(401, 0, begin_seq.get())
+            .with_reads(vec![page_key(1000)])
+            .with_writes(vec![page_key(1001)]);
+        let v2 = MockActiveTxn::new(402, 0, begin_seq.get())
+            .with_reads(vec![page_key(1001)])
+            .with_writes(vec![page_key(1002)]);
+        let v3 = MockActiveTxn::new(403, 0, begin_seq.get())
+            .with_reads(vec![page_key(1002)])
+            .with_writes(vec![page_key(1000)]);
+
+        let mut committed_readers = Vec::new();
+        let mut committed_writers = Vec::new();
+        let mut commits = 0_u32;
+        let mut aborts = 0_u32;
+
+        let readers_t1: Vec<&dyn ActiveTxnView> = vec![&v2];
+        let writers_t1: Vec<&dyn ActiveTxnView> = vec![&v3];
+        let t1_res = ssi_validate_and_publish(
+            t1,
+            begin_seq,
+            CommitSeq::new(2),
+            &v1.reads,
+            &v1.writes,
+            &readers_t1,
+            &writers_t1,
+            &committed_readers,
+            &committed_writers,
+            false,
+        );
+        match t1_res {
+            Ok(ok) => {
+                commits += 1;
+                committed_readers.push(CommittedReaderInfo {
+                    token: t1,
+                    begin_seq,
+                    commit_seq: CommitSeq::new(2),
+                    had_in_rw: ok.ssi_state.has_in_rw,
+                    pages: keys_to_pages(&v1.reads),
+                });
+                committed_writers.push(CommittedWriterInfo {
+                    token: t1,
+                    commit_seq: CommitSeq::new(2),
+                    pages: keys_to_pages(&v1.writes),
+                });
+            }
+            Err(_) => aborts += 1,
+        }
+
+        let readers_t2: Vec<&dyn ActiveTxnView> = vec![&v3];
+        let writers_t2: Vec<&dyn ActiveTxnView> = vec![&v3];
+        let t2_res = ssi_validate_and_publish(
+            t2,
+            begin_seq,
+            CommitSeq::new(3),
+            &v2.reads,
+            &v2.writes,
+            &readers_t2,
+            &writers_t2,
+            &committed_readers,
+            &committed_writers,
+            false,
+        );
+        match t2_res {
+            Ok(ok) => {
+                commits += 1;
+                committed_readers.push(CommittedReaderInfo {
+                    token: t2,
+                    begin_seq,
+                    commit_seq: CommitSeq::new(3),
+                    had_in_rw: ok.ssi_state.has_in_rw,
+                    pages: keys_to_pages(&v2.reads),
+                });
+                committed_writers.push(CommittedWriterInfo {
+                    token: t2,
+                    commit_seq: CommitSeq::new(3),
+                    pages: keys_to_pages(&v2.writes),
+                });
+            }
+            Err(_) => aborts += 1,
+        }
+
+        let t3_res = ssi_validate_and_publish(
+            t3,
+            begin_seq,
+            CommitSeq::new(4),
+            &v3.reads,
+            &v3.writes,
+            &[],
+            &[],
+            &committed_readers,
+            &committed_writers,
+            false,
+        );
+        match t3_res {
+            Ok(_) => commits += 1,
+            Err(_) => aborts += 1,
+        }
+
+        assert_eq!(commits + aborts, 3);
+        assert_eq!(aborts, 1, "exactly one abort should break the 3-cycle");
+    }
+
+    // -- §5.7.3 stress test 29: 100-writer adversarial CI-scale schedule --
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn test_100_writer_adversarial_schedule_with_serialization_checker() {
+        struct StressTxn {
+            token_id: u64,
+            token: TxnToken,
+            reads: Vec<WitnessKey>,
+            writes: Vec<WitnessKey>,
+            view: MockActiveTxn,
+        }
+
+        let begin_seq = CommitSeq::new(1);
+        let mut txns = Vec::new();
+        let mut next_id = 1_u64;
+
+        // 10 conflict pairs (20 txns): each pair forms a classic write-skew cycle.
+        for pair in 0..10_u32 {
+            let base = 2000_u32 + pair * 10;
+            let reads = vec![page_key(base), page_key(base + 1)];
+
+            let token_a = TxnToken::new(TxnId::new(next_id).unwrap(), TxnEpoch::new(0));
+            let view_a = MockActiveTxn::new(next_id, 0, begin_seq.get())
+                .with_reads(reads.clone())
+                .with_writes(vec![page_key(base)]);
+            txns.push(StressTxn {
+                token_id: next_id,
+                token: token_a,
+                reads: reads.clone(),
+                writes: vec![page_key(base)],
+                view: view_a,
+            });
+            next_id += 1;
+
+            let token_b = TxnToken::new(TxnId::new(next_id).unwrap(), TxnEpoch::new(0));
+            let view_b = MockActiveTxn::new(next_id, 0, begin_seq.get())
+                .with_reads(reads.clone())
+                .with_writes(vec![page_key(base + 1)]);
+            txns.push(StressTxn {
+                token_id: next_id,
+                token: token_b,
+                reads,
+                writes: vec![page_key(base + 1)],
+                view: view_b,
+            });
+            next_id += 1;
+        }
+
+        // Remaining 80 txns are disjoint and should commit.
+        while txns.len() < 100 {
+            let disjoint = 5000_u32 + u32::try_from(txns.len()).unwrap();
+            let token = TxnToken::new(TxnId::new(next_id).unwrap(), TxnEpoch::new(0));
+            let reads = vec![page_key(disjoint)];
+            let writes = vec![page_key(disjoint + 10_000)];
+            let view = MockActiveTxn::new(next_id, 0, begin_seq.get())
+                .with_reads(reads.clone())
+                .with_writes(writes.clone());
+            txns.push(StressTxn {
+                token_id: next_id,
+                token,
+                reads,
+                writes,
+                view,
+            });
+            next_id += 1;
+        }
+
+        let mut committed_ids = HashSet::new();
+        let mut committed_readers = Vec::new();
+        let mut committed_writers = Vec::new();
+        let mut abort_count = 0_u32;
+
+        for idx in 0..txns.len() {
+            let current = &txns[idx];
+            let active_tail = &txns[idx + 1..];
+            let active_readers: Vec<&dyn ActiveTxnView> = active_tail
+                .iter()
+                .map(|txn| &txn.view as &dyn ActiveTxnView)
+                .collect();
+            let active_writers: Vec<&dyn ActiveTxnView> = active_tail
+                .iter()
+                .map(|txn| &txn.view as &dyn ActiveTxnView)
+                .collect();
+
+            let commit_seq = CommitSeq::new(u64::try_from(idx).unwrap() + 2);
+            let result = ssi_validate_and_publish(
+                current.token,
+                begin_seq,
+                commit_seq,
+                &current.reads,
+                &current.writes,
+                &active_readers,
+                &active_writers,
+                &committed_readers,
+                &committed_writers,
+                false,
+            );
+
+            match result {
+                Ok(ok) => {
+                    committed_ids.insert(current.token_id);
+                    committed_readers.push(CommittedReaderInfo {
+                        token: current.token,
+                        begin_seq,
+                        commit_seq,
+                        had_in_rw: ok.ssi_state.has_in_rw,
+                        pages: keys_to_pages(&current.reads),
+                    });
+                    committed_writers.push(CommittedWriterInfo {
+                        token: current.token,
+                        commit_seq,
+                        pages: keys_to_pages(&current.writes),
+                    });
+                }
+                Err(_) => abort_count += 1,
+            }
+        }
+
+        let total = u32::try_from(txns.len()).unwrap();
+        assert_eq!(
+            u32::try_from(committed_ids.len()).unwrap() + abort_count,
+            total,
+            "all 100 commit attempts must complete (no deadlock/livelock)"
+        );
+
+        // Serialization checker: each conflict pair must have exactly one commit.
+        let mut mandatory_aborts = 0_u32;
+        for pair in 0..10_u64 {
+            let tx_a = pair * 2 + 1;
+            let tx_b = pair * 2 + 2;
+            let a_committed = committed_ids.contains(&tx_a);
+            let b_committed = committed_ids.contains(&tx_b);
+            assert!(
+                a_committed ^ b_committed,
+                "conflict pair ({tx_a},{tx_b}) must commit exactly one member"
+            );
+            mandatory_aborts += 1;
+        }
+
+        // Disjoint workload should commit without aborts.
+        for id in 21_u64..=100_u64 {
+            assert!(
+                committed_ids.contains(&id),
+                "disjoint writer {id} should commit"
+            );
+        }
+
+        let false_positive_aborts = abort_count.saturating_sub(mandatory_aborts);
+        assert!(
+            false_positive_aborts <= 5,
+            "false positive aborts must stay under 5%: {false_positive_aborts}/100"
+        );
+    }
+
+    // -- §5.7.3 stress test 30: Long-running reader under writer churn --
+
+    #[test]
+    fn test_long_running_reader_stable_snapshot_under_writer_churn() {
+        let long_reader =
+            MockActiveTxn::new(9_001, 0, 1).with_reads(vec![page_key(700), page_key(701)]);
+        let active_readers: Vec<&dyn ActiveTxnView> = vec![&long_reader];
+
+        let mut commits = 0_u32;
+        for i in 0..200_u64 {
+            let writer = TxnToken::new(TxnId::new(9_100 + i).unwrap(), TxnEpoch::new(0));
+            // Writers update pages touched by the reader. Reader must remain
+            // active and unmarked unless it becomes a pivot.
+            let write_key = if i % 2 == 0 {
+                page_key(700)
+            } else {
+                page_key(701)
+            };
+            let result = ssi_validate_and_publish(
+                writer,
+                CommitSeq::new(1),
+                CommitSeq::new(i + 2),
+                &[],
+                &[write_key],
+                &active_readers,
+                &[],
+                &[],
+                &[],
+                false,
+            );
+            assert!(
+                result.is_ok(),
+                "writer churn should not deadlock/abort readers"
+            );
+            commits += 1;
+        }
+
+        assert_eq!(commits, 200);
+        assert!(
+            !long_reader.marked.get(),
+            "long-running read-only snapshot must not be marked for abort"
+        );
+    }
+
+    #[test]
+    fn test_evidence_metrics_count_by_outcome() {
+        let before = ssi_evidence_metrics_snapshot();
+
+        let commit_txn = TxnToken::new(TxnId::new(90_001).unwrap(), TxnEpoch::new(0));
+        let commit_result = ssi_validate_and_publish(
+            commit_txn,
+            CommitSeq::new(1),
+            CommitSeq::new(2),
+            &[page_key(500)],
+            &[page_key(600)],
+            &[],
+            &[],
+            &[],
+            &[],
+            false,
+        );
+        commit_result.expect("commit decision should be recorded");
+
+        let abort_txn = TxnToken::new(TxnId::new(90_002).unwrap(), TxnEpoch::new(0));
+        let reader = MockActiveTxn::new(90_003, 0, 1).with_reads(vec![page_key(700)]);
+        let writer = MockActiveTxn::new(90_004, 0, 1).with_writes(vec![page_key(800)]);
+        let readers: Vec<&dyn ActiveTxnView> = vec![&reader];
+        let writers: Vec<&dyn ActiveTxnView> = vec![&writer];
+        let abort_result = ssi_validate_and_publish(
+            abort_txn,
+            CommitSeq::new(1),
+            CommitSeq::new(3),
+            &[page_key(800)],
+            &[page_key(700)],
+            &readers,
+            &writers,
+            &[],
+            &[],
+            false,
+        );
+        abort_result.expect_err("pivot abort should be recorded");
+
+        let after = ssi_evidence_metrics_snapshot();
+        assert!(
+            after.fsqlite_evidence_records_total_commit
+                > before.fsqlite_evidence_records_total_commit
+        );
+        assert!(
+            after.fsqlite_evidence_records_total_abort
+                > before.fsqlite_evidence_records_total_abort
+        );
+        assert!(
+            after.fsqlite_evidence_records_total() >= before.fsqlite_evidence_records_total() + 2
+        );
+    }
+
+    #[test]
+    fn test_evidence_store_queryable_by_txn_id() {
+        let txn = TxnToken::new(TxnId::new(90_101).unwrap(), TxnEpoch::new(0));
+        let result = ssi_validate_and_publish(
+            txn,
+            CommitSeq::new(1),
+            CommitSeq::new(2),
+            &[page_key(901)],
+            &[page_key(902)],
+            &[],
+            &[],
+            &[],
+            &[],
+            false,
+        );
+        result.expect("commit should succeed");
+
+        let rows = ssi_evidence_query(&SsiDecisionQuery {
+            txn_id: Some(txn.id.get()),
+            ..SsiDecisionQuery::default()
+        });
+        assert!(
+            !rows.is_empty(),
+            "evidence ledger should contain row for txn_id"
+        );
+        let last = rows.last().unwrap();
+        assert_eq!(last.txn.id.get(), txn.id.get());
+        assert!(last.decision_id > 0, "decision_id must be populated");
     }
 }

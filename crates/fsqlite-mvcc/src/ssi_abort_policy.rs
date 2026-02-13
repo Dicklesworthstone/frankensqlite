@@ -321,6 +321,7 @@ impl SsiReadSetSummary {
 /// Card payload before chain hash / epoch assignment.
 #[derive(Debug, Clone)]
 pub struct SsiDecisionCardDraft {
+    pub decision_id: u64,
     pub decision_type: SsiDecisionType,
     pub txn: TxnToken,
     pub snapshot_seq: CommitSeq,
@@ -347,6 +348,7 @@ impl SsiDecisionCardDraft {
         rationale: impl Into<String>,
     ) -> Self {
         Self {
+            decision_id: 0,
             decision_type,
             txn,
             snapshot_seq,
@@ -371,11 +373,18 @@ impl SsiDecisionCardDraft {
         self.timestamp_unix_ns = timestamp_unix_ns;
         self
     }
+
+    #[must_use]
+    pub const fn with_decision_id(mut self, decision_id: u64) -> Self {
+        self.decision_id = decision_id;
+        self
+    }
 }
 
 /// Immutable append-only galaxy-brain card persisted by the evidence ledger.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SsiDecisionCard {
+    pub decision_id: u64,
     pub decision_type: SsiDecisionType,
     pub txn: TxnToken,
     pub snapshot_seq: CommitSeq,
@@ -451,6 +460,7 @@ impl SsiEvidenceLedgerState {
         self.next_epoch = self.next_epoch.saturating_add(1);
         let chain_hash = compute_chain_hash(
             self.chain_tip,
+            draft.decision_id,
             draft.decision_type,
             draft.txn,
             draft.snapshot_seq,
@@ -469,6 +479,7 @@ impl SsiEvidenceLedgerState {
             let _ = self.entries.pop_front();
         }
         self.entries.push_back(SsiDecisionCard {
+            decision_id: draft.decision_id,
             decision_type: draft.decision_type,
             txn: draft.txn,
             snapshot_seq: draft.snapshot_seq,
@@ -630,6 +641,7 @@ fn read_set_fingerprint(read_set_pages: &[PageNumber]) -> u64 {
 #[allow(clippy::too_many_arguments)]
 fn compute_chain_hash(
     previous_hash: [u8; 32],
+    decision_id: u64,
     decision_type: SsiDecisionType,
     txn: TxnToken,
     snapshot_seq: CommitSeq,
@@ -645,6 +657,7 @@ fn compute_chain_hash(
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"fsqlite:ssi_evidence_ledger:v1");
     hasher.update(&previous_hash);
+    hasher.update(&decision_id.to_le_bytes());
     hasher.update(decision_type.as_str().as_bytes());
     hasher.update(&txn.id.get().to_le_bytes());
     hasher.update(&txn.epoch.get().to_le_bytes());

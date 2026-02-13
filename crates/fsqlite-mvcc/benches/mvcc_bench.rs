@@ -860,6 +860,7 @@ fn bench_ssi_incoming_edges(c: &mut Criterion) {
                         let edges: Vec<DiscoveredEdge> = discover_incoming_edges(
                             committer,
                             CommitSeq::new(10),
+                            CommitSeq::new(11),
                             &write_keys,
                             &reader_views,
                             &[],
@@ -908,6 +909,7 @@ fn bench_ssi_outgoing_edges(c: &mut Criterion) {
                         let edges: Vec<DiscoveredEdge> = discover_outgoing_edges(
                             committer,
                             CommitSeq::new(2),
+                            CommitSeq::new(11),
                             &read_keys,
                             &[],
                             &committed_writers,

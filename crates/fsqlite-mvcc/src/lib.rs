@@ -150,8 +150,10 @@ pub use ssi_abort_policy::{
     VictimDecision, select_victim,
 };
 pub use ssi_validation::{
-    ActiveTxnView, CommittedReaderInfo, CommittedWriterInfo, DiscoveredEdge, SsiAbortReason,
-    SsiBusySnapshot, SsiState, SsiValidationOk, discover_incoming_edges, discover_outgoing_edges,
+    ActiveTxnView, CommittedReaderInfo, CommittedWriterInfo, DiscoveredEdge,
+    EvidenceRecordMetricsSnapshot, SsiAbortReason, SsiBusySnapshot, SsiState, SsiValidationOk,
+    discover_incoming_edges, discover_outgoing_edges, reset_ssi_evidence_metrics,
+    ssi_evidence_metrics_snapshot, ssi_evidence_query, ssi_evidence_snapshot,
     ssi_validate_and_publish,
 };
 pub use time_travel::{
