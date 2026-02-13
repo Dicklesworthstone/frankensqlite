@@ -17,10 +17,12 @@ pub mod oracle;
 pub mod parity_taxonomy;
 pub mod perf_loop;
 pub mod scheduler;
+pub mod score_engine;
 pub mod seed_taxonomy;
 pub mod spec_to_beads_audit;
 pub mod supervision;
 pub mod tla;
+pub mod unit_matrix;
 pub mod verification_gates;
 
 #[cfg(test)]
