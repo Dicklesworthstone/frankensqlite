@@ -13,6 +13,7 @@
 //! The classification heuristic maps SQL content to the taxonomy families
 //! defined in `parity_taxonomy.toml` (bd-1dp9.1.1).
 
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fmt::Write as _;
@@ -25,7 +26,7 @@ use sha2::{Digest, Sha256};
 const BEAD_ID: &str = "bd-1dp9.2.1";
 
 /// Default seed base for corpus entries (same as FRANKEN_SEED from e2e).
-pub const CORPUS_SEED_BASE: u64 = 0x4652_414E_4B45_4E;
+pub const CORPUS_SEED_BASE: u64 = 0x0046_5241_4E4B_454E;
 
 // ─── Taxonomy Family ─────────────────────────────────────────────────────
 
@@ -224,6 +225,7 @@ const FAMILY_MINIMUMS: &[(Family, usize)] = &[
 /// Uses keyword and pattern analysis to determine the most relevant family.
 /// Returns the primary family and any secondary families.
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn classify_family(statements: &[String]) -> (Family, Vec<Family>) {
     let combined = statements
         .iter()
@@ -410,7 +412,7 @@ pub fn classify_family(statements: &[String]) -> (Family, Vec<Family>) {
 
     // Determine primary and secondary families.
     let mut sorted: Vec<_> = scores.into_iter().collect();
-    sorted.sort_by(|a, b| b.1.cmp(&a.1));
+    sorted.sort_by_key(|item| Reverse(item.1));
 
     let primary = sorted.first().map_or(Family::SQL, |(fam, _)| *fam);
 
@@ -598,8 +600,10 @@ fn compute_coverage(
         let count = fam_entries.len();
         let fill = if min > 0 {
             (count as f64 / min as f64) * 100.0
+        } else if count > 0 {
+            100.0
         } else {
-            if count > 0 { 100.0 } else { 0.0 }
+            0.0
         };
 
         by_family.insert(
@@ -704,6 +708,7 @@ pub fn ingest_conformance_fixtures(
 ///
 /// This provides the "minimum viable corpus" for each taxonomy family,
 /// ensuring no family has zero coverage.
+#[allow(clippy::too_many_lines)]
 pub fn generate_seed_corpus(builder: &mut CorpusBuilder) {
     let src = |name: &str| CorpusSource::Custom {
         author: format!("seed_corpus/{name}"),

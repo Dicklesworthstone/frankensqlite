@@ -393,6 +393,11 @@ if [[ "${#failing_crates[@]}" -gt 0 || "${#zero_test_crates[@]}" -gt 0 || "${#mi
     log_line "ERROR" "terminal_failure" \
         "failing_crates=${failing_crates[*]:-none} zero_test_crates=${zero_test_crates[*]:-none} missing_public_api_test_crates=${missing_public_api_test_crates[*]:-none} workspace_test_exit=${workspace_test_exit} report=${REPORT_JSONL} report_sha256=${summary_sha256}"
     if ${JSON_OUTPUT}; then
+        if (( ${#failing_crates[@]} > 0 )); then
+            failing_crates_json="$(printf '%s\n' "${failing_crates[@]}" | jq -R . | jq -s .)"
+        else
+            failing_crates_json='[]'
+        fi
         cat <<ENDJSON
 {
   "bead_id": "${BEAD_ID}",
@@ -400,7 +405,7 @@ if [[ "${#failing_crates[@]}" -gt 0 || "${#zero_test_crates[@]}" -gt 0 || "${#mi
   "status": "fail",
   "report_jsonl": "${REPORT_JSONL}",
   "report_sha256": "${summary_sha256}",
-  "failing_crates": [$(printf '"%s",' "${failing_crates[@]}" | sed 's/,$//')]
+  "failing_crates": ${failing_crates_json}
 }
 ENDJSON
     fi

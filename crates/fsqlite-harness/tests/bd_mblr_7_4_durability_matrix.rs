@@ -3,7 +3,8 @@
 use std::collections::BTreeSet;
 
 use fsqlite_harness::durability_matrix::{
-    DEFAULT_ROOT_SEED, DurabilityMatrix, OperatingSystem, build_validated_durability_matrix,
+    DEFAULT_ROOT_SEED, DurabilityExecutionMode, DurabilityExecutionOptions, DurabilityMatrix,
+    OperatingSystem, build_validated_durability_matrix, execute_durability_matrix,
     render_operator_workflow,
 };
 
@@ -55,4 +56,20 @@ fn rendered_workflow_contains_seeded_recovery_contracts() {
         workflow.contains("probes:"),
         "bead_id={BEAD_ID} workflow missing probe section"
     );
+}
+
+#[test]
+fn dry_run_execution_summary_is_deterministic_and_non_failing() {
+    let matrix = build_validated_durability_matrix(DEFAULT_ROOT_SEED)
+        .expect("durability matrix should validate");
+    let summary = execute_durability_matrix(&matrix, DurabilityExecutionOptions::default())
+        .expect("dry-run execution summary should succeed");
+
+    assert_eq!(summary.mode, DurabilityExecutionMode::DryRun);
+    assert_eq!(summary.total_probes, matrix.probes.len());
+    assert_eq!(summary.passed_probes, 0);
+    assert_eq!(summary.failed_probes, 0);
+    assert_eq!(summary.timeout_probes, 0);
+    assert_eq!(summary.error_probes, 0);
+    assert_eq!(summary.skipped_probes, matrix.probes.len());
 }

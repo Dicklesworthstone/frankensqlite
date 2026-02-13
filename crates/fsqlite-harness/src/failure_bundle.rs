@@ -472,7 +472,7 @@ pub fn bundle_assertion_failure(
         })
         .failure(FailureInfo {
             failure_type: FailureType::Assertion,
-            message: format!("assertion failed: expected != actual"),
+            message: "assertion failed: expected != actual".to_owned(),
             expected: Some(expected.to_owned()),
             actual: Some(actual.to_owned()),
             diff,
@@ -734,7 +734,7 @@ pub fn build_e2e_adoption_checklist() -> Vec<E2eAdoptionItem> {
             id: "E-3".to_owned(),
             requirement: "Include seed and fixture_id in reproducibility for all deterministic tests"
                 .to_owned(),
-            example: r#".reproducibility(ReproducibilityInfo { seed: Some(0xCAFE), .. })"#
+            example: r".reproducibility(ReproducibilityInfo { seed: Some(0xCAFE), .. })"
                 .to_owned(),
         },
         E2eAdoptionItem {
@@ -1046,8 +1046,8 @@ mod tests {
         .expect("bead_id=bd-mblr.4.4 case=assertion_builder");
 
         assert_eq!(bundle.failure.failure_type, FailureType::Assertion);
-        assert!(bundle.failure.expected.as_deref() == Some("10 rows"));
-        assert!(bundle.failure.actual.as_deref() == Some("9 rows"));
+        assert_eq!(bundle.failure.expected.as_deref(), Some("10 rows"));
+        assert_eq!(bundle.failure.actual.as_deref(), Some("9 rows"));
         let errors = bundle.validate();
         assert!(
             errors.is_empty(),

@@ -7,9 +7,12 @@
 //! - crash/recovery scenarios,
 //! - probe definitions used by CI/workflows for parity and drift detection.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
+use std::io;
 use std::path::Path;
+use std::process::Command;
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
@@ -21,6 +24,10 @@ pub const MATRIX_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_ROOT_SEED: u64 = 0xB740_0000_0000_0001;
 /// Canonical logging/reference standard.
 pub const LOG_STANDARD_REF: &str = "bd-1fpm";
+/// Serialization schema version for `DurabilityExecutionSummary`.
+pub const EXECUTION_SCHEMA_VERSION: u32 = 1;
+/// Default timeout for probe execution mode.
+pub const DEFAULT_EXECUTION_TIMEOUT_SECS: u64 = 1_800;
 
 /// Operating system family for an environment contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -118,6 +125,83 @@ pub struct DurabilityMatrix {
     pub probes: Vec<DurabilityProbe>,
 }
 
+/// Execution mode for durability probes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DurabilityExecutionMode {
+    DryRun,
+    Execute,
+}
+
+/// Probe outcome classification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DurabilityProbeOutcome {
+    Pass,
+    Fail,
+    Timeout,
+    Error,
+    Skipped,
+}
+
+/// Runtime options for executing durability probes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DurabilityExecutionOptions {
+    pub mode: DurabilityExecutionMode,
+    pub timeout_secs: u64,
+    pub max_probes: Option<usize>,
+}
+
+impl Default for DurabilityExecutionOptions {
+    fn default() -> Self {
+        Self {
+            mode: DurabilityExecutionMode::DryRun,
+            timeout_secs: DEFAULT_EXECUTION_TIMEOUT_SECS,
+            max_probes: None,
+        }
+    }
+}
+
+/// Per-probe execution result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DurabilityProbeExecution {
+    pub probe_id: String,
+    pub environment_id: String,
+    pub scenario_id: String,
+    pub seed: u64,
+    pub command: String,
+    pub outcome: DurabilityProbeOutcome,
+    pub reason: Option<String>,
+    pub exit_code: Option<i32>,
+    pub elapsed_ms: u64,
+}
+
+/// Aggregated summary for a matrix execution pass.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DurabilityExecutionSummary {
+    pub bead_id: String,
+    pub schema_version: u32,
+    pub root_seed: u64,
+    pub host_os: String,
+    pub mode: DurabilityExecutionMode,
+    pub timeout_secs: u64,
+    pub total_probes: usize,
+    pub passed_probes: usize,
+    pub failed_probes: usize,
+    pub timeout_probes: usize,
+    pub error_probes: usize,
+    pub skipped_probes: usize,
+    pub results: Vec<DurabilityProbeExecution>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CommandExecution {
+    exit_code: Option<i32>,
+    timed_out: bool,
+    succeeded: bool,
+    elapsed_ms: u64,
+}
+
 impl DurabilityMatrix {
     /// Build canonical matrix for a given deterministic root seed.
     #[must_use]
@@ -164,6 +248,356 @@ pub fn write_matrix_json(path: &Path, matrix: &DurabilityMatrix) -> Result<(), S
             "durability_matrix_write_failed path={} error={error}",
             path.display()
         )
+    })
+}
+
+/// Write execution summary JSON to a file path.
+///
+/// # Errors
+///
+/// Returns an error when serialization fails or when the destination file
+/// cannot be written.
+pub fn write_execution_summary_json(
+    path: &Path,
+    summary: &DurabilityExecutionSummary,
+) -> Result<(), String> {
+    let payload = serde_json::to_string_pretty(summary)
+        .map_err(|error| format!("durability_execution_serialize_failed: {error}"))?;
+    std::fs::write(path, payload).map_err(|error| {
+        format!(
+            "durability_execution_write_failed path={} error={error}",
+            path.display()
+        )
+    })
+}
+
+/// Execute durability probes and return a normalized execution summary.
+///
+/// # Errors
+///
+/// Returns an error when matrix validation fails.
+pub fn execute_durability_matrix(
+    matrix: &DurabilityMatrix,
+    options: DurabilityExecutionOptions,
+) -> Result<DurabilityExecutionSummary, String> {
+    execute_durability_matrix_with(matrix, options, host_operating_system(), run_probe_command)
+}
+
+fn execute_durability_matrix_with<F>(
+    matrix: &DurabilityMatrix,
+    options: DurabilityExecutionOptions,
+    host_os: Option<OperatingSystem>,
+    runner: F,
+) -> Result<DurabilityExecutionSummary, String>
+where
+    F: Fn(&str, u64, &[(String, String)]) -> Result<CommandExecution, String>,
+{
+    let diagnostics = matrix.validate();
+    if !diagnostics.is_empty() {
+        return Err(format!(
+            "durability_matrix_validation_failed: {}",
+            diagnostics.join("; ")
+        ));
+    }
+
+    let environment_index: BTreeMap<&str, &EnvironmentContract> = matrix
+        .environments
+        .iter()
+        .map(|environment| (environment.id.as_str(), environment))
+        .collect();
+    let scenario_index: BTreeMap<&str, &DurabilityScenario> = matrix
+        .scenarios
+        .iter()
+        .map(|scenario| (scenario.id.as_str(), scenario))
+        .collect();
+
+    let mut probes: Vec<&DurabilityProbe> = matrix.probes.iter().collect();
+    probes.sort_by(|left, right| left.id.cmp(&right.id));
+    if let Some(max_probes) = options.max_probes {
+        probes.truncate(max_probes);
+    }
+
+    let timeout_secs = options.timeout_secs.max(1);
+    let host_label = format_host_os(host_os);
+    let mut results = Vec::with_capacity(probes.len());
+
+    for probe in probes {
+        let Some(environment) = environment_index
+            .get(probe.environment_id.as_str())
+            .copied()
+        else {
+            results.push(DurabilityProbeExecution {
+                probe_id: probe.id.clone(),
+                environment_id: probe.environment_id.clone(),
+                scenario_id: probe.scenario_id.clone(),
+                seed: matrix.root_seed,
+                command: String::new(),
+                outcome: DurabilityProbeOutcome::Error,
+                reason: Some(format!(
+                    "unknown_environment_contract id={}",
+                    probe.environment_id
+                )),
+                exit_code: None,
+                elapsed_ms: 0,
+            });
+            continue;
+        };
+        let Some(scenario) = scenario_index.get(probe.scenario_id.as_str()).copied() else {
+            results.push(DurabilityProbeExecution {
+                probe_id: probe.id.clone(),
+                environment_id: probe.environment_id.clone(),
+                scenario_id: probe.scenario_id.clone(),
+                seed: matrix.root_seed,
+                command: String::new(),
+                outcome: DurabilityProbeOutcome::Error,
+                reason: Some(format!(
+                    "unknown_scenario_contract id={}",
+                    probe.scenario_id
+                )),
+                exit_code: None,
+                elapsed_ms: 0,
+            });
+            continue;
+        };
+
+        let scenario_seed = scenario.derived_seed(matrix.root_seed);
+        let command = scenario.command.clone();
+        if !host_matches_environment(host_os, environment) {
+            results.push(DurabilityProbeExecution {
+                probe_id: probe.id.clone(),
+                environment_id: environment.id.clone(),
+                scenario_id: scenario.id.clone(),
+                seed: scenario_seed,
+                command,
+                outcome: DurabilityProbeOutcome::Skipped,
+                reason: Some(format!(
+                    "host_os_mismatch host={} target={:?}",
+                    host_label, environment.os
+                )),
+                exit_code: None,
+                elapsed_ms: 0,
+            });
+            continue;
+        }
+
+        if matches!(options.mode, DurabilityExecutionMode::DryRun) {
+            results.push(DurabilityProbeExecution {
+                probe_id: probe.id.clone(),
+                environment_id: environment.id.clone(),
+                scenario_id: scenario.id.clone(),
+                seed: scenario_seed,
+                command,
+                outcome: DurabilityProbeOutcome::Skipped,
+                reason: Some("dry_run_mode".to_owned()),
+                exit_code: None,
+                elapsed_ms: 0,
+            });
+            continue;
+        }
+
+        let env_values = vec![
+            ("FSQLITE_DURABILITY_PROBE_ID".to_owned(), probe.id.clone()),
+            (
+                "FSQLITE_DURABILITY_ENVIRONMENT_ID".to_owned(),
+                environment.id.clone(),
+            ),
+            (
+                "FSQLITE_DURABILITY_SCENARIO_ID".to_owned(),
+                scenario.id.clone(),
+            ),
+            (
+                "FSQLITE_DURABILITY_SEED".to_owned(),
+                scenario_seed.to_string(),
+            ),
+        ];
+
+        match runner(scenario.command.as_str(), timeout_secs, &env_values) {
+            Ok(run) if run.succeeded => results.push(DurabilityProbeExecution {
+                probe_id: probe.id.clone(),
+                environment_id: environment.id.clone(),
+                scenario_id: scenario.id.clone(),
+                seed: scenario_seed,
+                command,
+                outcome: DurabilityProbeOutcome::Pass,
+                reason: None,
+                exit_code: run.exit_code,
+                elapsed_ms: run.elapsed_ms,
+            }),
+            Ok(run) if run.timed_out => results.push(DurabilityProbeExecution {
+                probe_id: probe.id.clone(),
+                environment_id: environment.id.clone(),
+                scenario_id: scenario.id.clone(),
+                seed: scenario_seed,
+                command,
+                outcome: DurabilityProbeOutcome::Timeout,
+                reason: Some(format!("timeout_secs_exceeded={timeout_secs}")),
+                exit_code: run.exit_code,
+                elapsed_ms: run.elapsed_ms,
+            }),
+            Ok(run) => results.push(DurabilityProbeExecution {
+                probe_id: probe.id.clone(),
+                environment_id: environment.id.clone(),
+                scenario_id: scenario.id.clone(),
+                seed: scenario_seed,
+                command,
+                outcome: DurabilityProbeOutcome::Fail,
+                reason: Some(format_exit_reason(run.exit_code)),
+                exit_code: run.exit_code,
+                elapsed_ms: run.elapsed_ms,
+            }),
+            Err(error) => results.push(DurabilityProbeExecution {
+                probe_id: probe.id.clone(),
+                environment_id: environment.id.clone(),
+                scenario_id: scenario.id.clone(),
+                seed: scenario_seed,
+                command,
+                outcome: DurabilityProbeOutcome::Error,
+                reason: Some(error),
+                exit_code: None,
+                elapsed_ms: 0,
+            }),
+        }
+    }
+
+    let mut passed_probes = 0usize;
+    let mut failed_probes = 0usize;
+    let mut timeout_probes = 0usize;
+    let mut error_probes = 0usize;
+    let mut skipped_probes = 0usize;
+    for result in &results {
+        match result.outcome {
+            DurabilityProbeOutcome::Pass => passed_probes += 1,
+            DurabilityProbeOutcome::Fail => failed_probes += 1,
+            DurabilityProbeOutcome::Timeout => timeout_probes += 1,
+            DurabilityProbeOutcome::Error => error_probes += 1,
+            DurabilityProbeOutcome::Skipped => skipped_probes += 1,
+        }
+    }
+
+    Ok(DurabilityExecutionSummary {
+        bead_id: BEAD_ID.to_owned(),
+        schema_version: EXECUTION_SCHEMA_VERSION,
+        root_seed: matrix.root_seed,
+        host_os: host_label,
+        mode: options.mode,
+        timeout_secs,
+        total_probes: results.len(),
+        passed_probes,
+        failed_probes,
+        timeout_probes,
+        error_probes,
+        skipped_probes,
+        results,
+    })
+}
+
+fn format_exit_reason(exit_code: Option<i32>) -> String {
+    match exit_code {
+        Some(code) => format!("exit_code={code}"),
+        None => "process_terminated_by_signal".to_owned(),
+    }
+}
+
+fn host_matches_environment(
+    host_os: Option<OperatingSystem>,
+    environment: &EnvironmentContract,
+) -> bool {
+    matches!(host_os, Some(current) if current == environment.os)
+}
+
+fn format_host_os(host_os: Option<OperatingSystem>) -> String {
+    match host_os {
+        Some(OperatingSystem::Linux) => "linux".to_owned(),
+        Some(OperatingSystem::MacOs) => "macos".to_owned(),
+        Some(OperatingSystem::Windows) => "windows".to_owned(),
+        Some(OperatingSystem::FreeBsd) => "freebsd".to_owned(),
+        None => "unknown".to_owned(),
+    }
+}
+
+fn host_operating_system() -> Option<OperatingSystem> {
+    if cfg!(target_os = "linux") {
+        Some(OperatingSystem::Linux)
+    } else if cfg!(target_os = "macos") {
+        Some(OperatingSystem::MacOs)
+    } else if cfg!(target_os = "windows") {
+        Some(OperatingSystem::Windows)
+    } else if cfg!(target_os = "freebsd") {
+        Some(OperatingSystem::FreeBsd)
+    } else {
+        None
+    }
+}
+
+fn apply_env(command: &mut Command, env_values: &[(String, String)]) {
+    for (key, value) in env_values {
+        command.env(key, value);
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn shell_command(command: &str) -> Command {
+    let mut shell = Command::new("cmd");
+    shell.arg("/C").arg(command);
+    shell
+}
+
+#[cfg(not(target_os = "windows"))]
+fn shell_command(command: &str) -> Command {
+    let mut shell = Command::new("bash");
+    shell.arg("-lc").arg(command);
+    shell
+}
+
+fn run_probe_command(
+    command: &str,
+    timeout_secs: u64,
+    env_values: &[(String, String)],
+) -> Result<CommandExecution, String> {
+    let start = Instant::now();
+
+    #[cfg(target_os = "windows")]
+    let output = {
+        let mut shell = shell_command(command);
+        apply_env(&mut shell, env_values);
+        shell
+            .output()
+            .map_err(|error| format!("durability_probe_spawn_failed: {error}"))?
+    };
+
+    #[cfg(not(target_os = "windows"))]
+    let output = {
+        let mut timeout_cmd = Command::new("timeout");
+        timeout_cmd
+            .arg(format!("{}s", timeout_secs.max(1)))
+            .arg("bash")
+            .arg("-lc")
+            .arg(command);
+        apply_env(&mut timeout_cmd, env_values);
+
+        match timeout_cmd.output() {
+            Ok(output) => output,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let mut fallback = shell_command(command);
+                apply_env(&mut fallback, env_values);
+                fallback.output().map_err(|fallback_error| {
+                    format!("durability_probe_spawn_failed: {fallback_error}")
+                })?
+            }
+            Err(error) => return Err(format!("durability_probe_spawn_failed: {error}")),
+        }
+    };
+
+    let elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let exit_code = output.status.code();
+    let timed_out = exit_code == Some(124);
+    let succeeded = output.status.success() && !timed_out;
+
+    Ok(CommandExecution {
+        exit_code,
+        timed_out,
+        succeeded,
+        elapsed_ms,
     })
 }
 
@@ -481,6 +915,8 @@ fn lanes_for_scenario(scenario_id: &str) -> Vec<DurabilityLane> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use tempfile::tempdir;
 
     use super::*;
@@ -571,5 +1007,170 @@ mod tests {
             serde_json::from_str(&payload).expect("deserialize matrix json");
         assert_eq!(restored.bead_id, matrix.bead_id);
         assert_eq!(restored.schema_version, MATRIX_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn dry_run_summary_skips_all_probes() {
+        let matrix = DurabilityMatrix::canonical(DEFAULT_ROOT_SEED);
+        let options = DurabilityExecutionOptions {
+            mode: DurabilityExecutionMode::DryRun,
+            timeout_secs: 30,
+            max_probes: None,
+        };
+
+        let summary = execute_durability_matrix_with(
+            &matrix,
+            options,
+            Some(OperatingSystem::Linux),
+            |_, _, _| -> Result<CommandExecution, String> {
+                panic!("runner should not be invoked in dry-run mode");
+            },
+        )
+        .expect("build dry-run summary");
+
+        assert_eq!(summary.total_probes, matrix.probes.len());
+        assert_eq!(summary.skipped_probes, matrix.probes.len());
+        assert_eq!(summary.passed_probes, 0);
+        assert_eq!(summary.failed_probes, 0);
+        assert_eq!(summary.timeout_probes, 0);
+        assert_eq!(summary.error_probes, 0);
+
+        assert!(
+            summary
+                .results
+                .iter()
+                .any(|result| result.reason.as_deref() == Some("dry_run_mode"))
+        );
+        assert!(summary.results.iter().any(|result| {
+            result
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("host_os_mismatch"))
+        }));
+    }
+
+    #[test]
+    fn execute_mode_runs_only_host_compatible_probes() {
+        let matrix = DurabilityMatrix::canonical(DEFAULT_ROOT_SEED);
+        let options = DurabilityExecutionOptions {
+            mode: DurabilityExecutionMode::Execute,
+            timeout_secs: 15,
+            max_probes: None,
+        };
+        let call_count = Cell::new(0usize);
+
+        let summary = execute_durability_matrix_with(
+            &matrix,
+            options,
+            Some(OperatingSystem::Linux),
+            |_, _, _| -> Result<CommandExecution, String> {
+                call_count.set(call_count.get() + 1);
+                Ok(CommandExecution {
+                    exit_code: Some(0),
+                    timed_out: false,
+                    succeeded: true,
+                    elapsed_ms: 7,
+                })
+            },
+        )
+        .expect("execute matrix");
+
+        let expected_runs = matrix
+            .environments
+            .iter()
+            .filter(|environment| environment.os == OperatingSystem::Linux)
+            .count()
+            * matrix.scenarios.len();
+        assert_eq!(call_count.get(), expected_runs);
+        assert_eq!(summary.passed_probes, expected_runs);
+        assert_eq!(summary.skipped_probes, summary.total_probes - expected_runs);
+    }
+
+    #[test]
+    fn execute_mode_classifies_timeout_fail_and_error() {
+        let matrix = DurabilityMatrix::canonical(DEFAULT_ROOT_SEED);
+        let options = DurabilityExecutionOptions {
+            mode: DurabilityExecutionMode::Execute,
+            timeout_secs: 45,
+            max_probes: None,
+        };
+
+        let summary = execute_durability_matrix_with(
+            &matrix,
+            options,
+            Some(OperatingSystem::Linux),
+            |_, _, env_values| -> Result<CommandExecution, String> {
+                let Some((_, scenario_id)) = env_values
+                    .iter()
+                    .find(|(key, _)| key == "FSQLITE_DURABILITY_SCENARIO_ID")
+                else {
+                    return Err("missing_scenario_env".to_owned());
+                };
+                match scenario_id.as_str() {
+                    "REC-1" => Ok(CommandExecution {
+                        exit_code: Some(0),
+                        timed_out: false,
+                        succeeded: true,
+                        elapsed_ms: 11,
+                    }),
+                    "REC-2" => Ok(CommandExecution {
+                        exit_code: Some(124),
+                        timed_out: true,
+                        succeeded: false,
+                        elapsed_ms: 45_000,
+                    }),
+                    "REC-3" => Ok(CommandExecution {
+                        exit_code: Some(1),
+                        timed_out: false,
+                        succeeded: false,
+                        elapsed_ms: 9,
+                    }),
+                    "WAL-2" => Err("injected_runner_error".to_owned()),
+                    _ => Err("unknown_scenario".to_owned()),
+                }
+            },
+        )
+        .expect("execute matrix with injected outcomes");
+
+        let expected_per_scenario = matrix
+            .environments
+            .iter()
+            .filter(|environment| environment.os == OperatingSystem::Linux)
+            .count();
+        assert_eq!(summary.passed_probes, expected_per_scenario);
+        assert_eq!(summary.timeout_probes, expected_per_scenario);
+        assert_eq!(summary.failed_probes, expected_per_scenario);
+        assert_eq!(summary.error_probes, expected_per_scenario);
+        assert!(summary.results.iter().any(|result| {
+            result
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("injected_runner_error"))
+        }));
+    }
+
+    #[test]
+    fn write_execution_summary_json_roundtrip() {
+        let matrix = DurabilityMatrix::canonical(DEFAULT_ROOT_SEED);
+        let options = DurabilityExecutionOptions::default();
+        let summary = execute_durability_matrix_with(
+            &matrix,
+            options,
+            Some(OperatingSystem::Linux),
+            |_, _, _| -> Result<CommandExecution, String> {
+                panic!("runner should not be invoked in dry-run mode");
+            },
+        )
+        .expect("dry-run summary");
+
+        let temp = tempdir().expect("create tempdir");
+        let path = temp.path().join("durability_execution_summary.json");
+        write_execution_summary_json(&path, &summary).expect("write summary json");
+        let payload = std::fs::read_to_string(&path).expect("read summary json");
+        let restored: DurabilityExecutionSummary =
+            serde_json::from_str(&payload).expect("deserialize summary json");
+        assert_eq!(restored.bead_id, BEAD_ID);
+        assert_eq!(restored.schema_version, EXECUTION_SCHEMA_VERSION);
+        assert_eq!(restored.total_probes, summary.total_probes);
     }
 }

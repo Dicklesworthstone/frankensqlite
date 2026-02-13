@@ -351,7 +351,7 @@ pub fn verify_roundtrip(events: &[LogEventSchema]) -> Result<(), String> {
         let mut diff_summary = String::new();
         for (i, (l1, l2)) in lines_1.iter().zip(lines_2.iter()).enumerate() {
             if l1 != l2 {
-                let _ = write!(diff_summary, "line {i}: first divergence\n");
+                let _ = writeln!(diff_summary, "line {i}: first divergence");
                 break;
             }
         }
@@ -444,9 +444,9 @@ impl ValidationReport {
                     .field
                     .as_deref()
                     .map_or(String::new(), |f| format!(" [{f}]"));
-                let _ = write!(
+                let _ = writeln!(
                     out,
-                    "  [{:?}] event[{}] run_id={}{}: {}\n",
+                    "  [{:?}] event[{}] run_id={}{}: {}",
                     diag.severity, diag.event_index, diag.run_id, field_str, diag.message,
                 );
             }
@@ -581,12 +581,10 @@ pub fn validate_event_stream(events: &[LogEventSchema]) -> ValidationReport {
 
 /// Extract the field name from a validation error message (best-effort).
 fn extract_field_from_error(msg: &str) -> Option<String> {
-    if msg.starts_with("required field '") {
-        let rest = &msg["required field '".len()..];
+    if let Some(rest) = msg.strip_prefix("required field '") {
         return rest.split('\'').next().map(str::to_owned);
     }
-    if msg.starts_with("field '") {
-        let rest = &msg["field '".len()..];
+    if let Some(rest) = msg.strip_prefix("field '") {
         return rest.split('\'').next().map(str::to_owned);
     }
     if msg.contains("scenario_id") {

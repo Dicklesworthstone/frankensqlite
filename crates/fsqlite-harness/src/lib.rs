@@ -7,6 +7,7 @@
 pub mod benchmark_corpus;
 pub mod closure_wave;
 pub mod commit_pipeline;
+pub mod confidence_gates;
 pub mod corpus_ingest;
 pub mod differential_v2;
 pub mod durability_matrix;
@@ -29,6 +30,7 @@ pub mod metamorphic;
 pub mod mismatch_minimizer;
 pub mod no_mock_evidence;
 pub mod oracle;
+pub mod parity_evidence_matrix;
 pub mod parity_invariant_catalog;
 pub mod parity_taxonomy;
 pub mod perf_loop;
