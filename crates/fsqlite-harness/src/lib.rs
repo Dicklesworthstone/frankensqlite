@@ -4,13 +4,14 @@
 //! verification tooling (trace exporters, schedule exploration harnesses, etc.)
 //! that other crates can call into from their own tests.
 
-pub mod commit_pipeline;
 pub mod closure_wave;
+pub mod commit_pipeline;
 pub mod corpus_ingest;
 pub mod differential_v2;
 pub mod e2e_log_schema;
 pub mod e2e_traceability;
 pub mod eprocess;
+pub mod evidence_index;
 pub mod extension_parity_matrix;
 pub mod failure_bundle;
 pub mod fault_profiles;
@@ -30,6 +31,7 @@ pub mod scheduler;
 pub mod score_engine;
 pub mod seed_taxonomy;
 pub mod semantic_gap_map;
+pub mod soak_executor;
 pub mod soak_profiles;
 pub mod spec_to_beads_audit;
 pub mod supervision;
@@ -40,6 +42,8 @@ pub mod unit_fixtures;
 pub mod unit_matrix;
 pub mod verification_gates;
 
+#[cfg(test)]
+mod sql_pipeline_suites;
 #[cfg(test)]
 mod storage_unit_suites;
 
