@@ -676,6 +676,7 @@ impl MismatchReduction {
 /// - `Ok(None)` when the baseline envelope does not diverge.
 /// - `Ok(Some(_))` when divergence is present and a minimized repro was found.
 /// - `Err(_)` when executor construction fails.
+#[allow(clippy::similar_names)]
 pub fn minimize_mismatch_workload<FFactory, CFactory, F, C>(
     envelope: &ExecutionEnvelope,
     make_fsqlite: FFactory,
@@ -775,6 +776,7 @@ where
     }))
 }
 
+#[allow(clippy::similar_names)]
 fn run_differential_with_factories<FFactory, CFactory, F, C>(
     envelope: &ExecutionEnvelope,
     make_fsqlite: &FFactory,
@@ -843,8 +845,8 @@ fn rows_match(
                 .collect::<Vec<_>>()
                 .join("|")
         };
-        a_sorted.sort_by(|x, y| key(x).cmp(&key(y)));
-        b_sorted.sort_by(|x, y| key(x).cmp(&key(y)));
+        a_sorted.sort_by_key(|x| key(x));
+        b_sorted.sort_by_key(|x| key(x));
         a_sorted
             .iter()
             .zip(b_sorted.iter())
@@ -897,6 +899,7 @@ fn value_match(a: &NormalizedValue, b: &NormalizedValue, rules: &Canonicalizatio
     }
 }
 
+#[allow(clippy::float_cmp)]
 fn floats_match(a: f64, b: f64, tolerance: f64) -> bool {
     if a == b {
         return true;

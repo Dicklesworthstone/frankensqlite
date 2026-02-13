@@ -195,7 +195,7 @@ pub struct PageFixture {
 /// Each fixture uses a deterministic seed derived from `FIXTURE_SEED_BASE`
 /// with the `"page"` domain tag, ensuring identical output on every call.
 #[must_use]
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::vec_init_then_push)]
 pub fn build_page_fixtures() -> Vec<PageFixture> {
     let mut fixtures = Vec::new();
 
@@ -300,10 +300,10 @@ pub fn build_page_fixtures() -> Vec<PageFixture> {
         id: "page-large-65536-leaf".to_owned(),
         page_type: PageType::LeafTable,
         page_number: 8,
-        page_size: 65536,
+        page_size: 65_536,
         cell_count: 0,
         seed,
-        data: build_empty_page(PageType::LeafTable, 65536),
+        data: build_empty_page(PageType::LeafTable, 65_536),
         description: "Empty leaf table on 65536-byte page — maximum page size boundary".to_owned(),
     });
 
@@ -311,6 +311,7 @@ pub fn build_page_fixtures() -> Vec<PageFixture> {
 }
 
 /// Build an empty B-tree page with a valid header.
+#[allow(clippy::cast_possible_truncation)]
 fn build_empty_page(page_type: PageType, page_size: u32) -> Vec<u8> {
     let size = page_size as usize;
     let mut page = vec![0u8; size];
@@ -337,7 +338,7 @@ fn build_empty_page(page_type: PageType, page_size: u32) -> Vec<u8> {
 
     // Bytes 5-6: offset to first byte of cell content area.
     // For an empty page, this points to the end of the page.
-    let content_offset = if page_size == 65536 {
+    let content_offset = if page_size == 65_536 {
         0u16
     } else {
         page_size as u16
@@ -361,6 +362,7 @@ fn build_empty_page(page_type: PageType, page_size: u32) -> Vec<u8> {
 }
 
 /// Build a leaf table page with a single cell containing (rowid=1, value=42).
+#[allow(clippy::cast_possible_truncation)]
 fn build_single_cell_leaf_page(page_size: u32, _seed: FixtureSeed) -> Vec<u8> {
     let size = page_size as usize;
     let mut page = vec![0u8; size];
@@ -401,6 +403,7 @@ fn build_single_cell_leaf_page(page_size: u32, _seed: FixtureSeed) -> Vec<u8> {
 }
 
 /// Build an interior table page with one divider cell.
+#[allow(clippy::cast_possible_truncation)]
 fn build_interior_table_page(page_size: u32, left_child: u32, right_child: u32) -> Vec<u8> {
     let size = page_size as usize;
     let mut page = vec![0u8; size];
@@ -447,6 +450,7 @@ fn build_interior_table_page(page_size: u32, left_child: u32, right_child: u32) 
 }
 
 /// Build a leaf table page with multiple cells (deterministic content).
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn build_multi_cell_leaf_page(page_size: u32, cell_count: u16, seed: FixtureSeed) -> Vec<u8> {
     let size = page_size as usize;
     let mut page = vec![0u8; size];
@@ -522,7 +526,7 @@ pub struct SqlFixture {
 /// Covers all 8 taxonomy families with deterministic, minimal test cases.
 /// Each fixture is self-contained and can be run independently.
 #[must_use]
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::vec_init_then_push)]
 pub fn build_sql_fixtures() -> Vec<SqlFixture> {
     let mut fixtures = Vec::new();
 
@@ -1301,7 +1305,7 @@ mod tests {
             "bead_id={BEAD_ID} case=page_default_size: missing 4096-byte page"
         );
         assert!(
-            sizes.contains(&65536),
+            sizes.contains(&65_536),
             "bead_id={BEAD_ID} case=page_max_size: missing 65536-byte page"
         );
     }

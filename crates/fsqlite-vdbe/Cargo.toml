@@ -27,5 +27,9 @@ criterion = { workspace = true }
 name = "vectorized_batch"
 harness = false
 
+[[bench]]
+name = "vectorized_scan"
+harness = false
+
 [lints]
 workspace = true

@@ -283,7 +283,9 @@ impl DriftDetector {
 
     /// EMA update.
     fn ema_update(&self, new_value: f64) -> f64 {
-        self.config.ema_alpha * new_value + (1.0 - self.config.ema_alpha) * self.baseline
+        self.config
+            .ema_alpha
+            .mul_add(new_value, (1.0 - self.config.ema_alpha) * self.baseline)
     }
 
     /// Emit a drift alert.
@@ -413,7 +415,7 @@ impl ReplaySession {
 
         let entry = ReplayEntryResult {
             entry_id: entry_id.to_owned(),
-            outcome: result.outcome.clone(),
+            outcome: result.outcome,
             statements_total: result.statements_total,
             statements_mismatched: result.statements_mismatched,
             mismatch_rate,
@@ -621,7 +623,7 @@ impl ReplaySummary {
 // ===========================================================================
 
 /// Pass/fail thresholds applied during bisect candidate evaluation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplayPassCriteria {
     /// Maximum divergent entries allowed for a passing candidate.
     pub max_divergent_entries: usize,
@@ -629,16 +631,6 @@ pub struct ReplayPassCriteria {
     pub max_error_entries: usize,
     /// Maximum regime shifts/alerts allowed for a passing candidate.
     pub max_shift_alerts: usize,
-}
-
-impl Default for ReplayPassCriteria {
-    fn default() -> Self {
-        Self {
-            max_divergent_entries: 0,
-            max_error_entries: 0,
-            max_shift_alerts: 0,
-        }
-    }
 }
 
 /// Optional environment constraints that bisect candidates should match.

@@ -7,6 +7,7 @@
 //! Foundation types (TxnId, CommitSeq, Snapshot, etc.) live in
 //! [`fsqlite_types::glossary`]; this module builds the runtime machinery on top.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
@@ -761,6 +762,97 @@ pub enum TransactionMode {
     Concurrent,
 }
 
+/// Read-set storage mode for per-transaction SSI tracking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ReadSetStorageMode {
+    /// Exact page->version map (default, deterministic).
+    Exact,
+    /// Bloom-backed approximation mode (reserved for large analytical scans).
+    Bloom,
+}
+
+/// Version-tracking metadata for one written page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct WriteVersionEntry {
+    pub old_version: Option<CommitSeq>,
+    pub new_version: Option<CommitSeq>,
+}
+
+impl WriteVersionEntry {
+    #[must_use]
+    pub const fn new(old_version: Option<CommitSeq>) -> Self {
+        Self {
+            old_version,
+            new_version: None,
+        }
+    }
+}
+
+/// Simple Bloom filter for approximate read-set membership.
+#[derive(Debug, Clone)]
+pub struct ReadSetBloom {
+    bits: Vec<u64>,
+}
+
+impl ReadSetBloom {
+    const DEFAULT_BITS: usize = 4096;
+
+    #[must_use]
+    pub fn new(bits: usize) -> Self {
+        let aligned_bits = bits.max(64).next_multiple_of(64);
+        Self {
+            bits: vec![0; aligned_bits / 64],
+        }
+    }
+
+    fn bit_len(&self) -> usize {
+        self.bits.len() * 64
+    }
+
+    fn hash_indices(&self, page: PageNumber) -> [usize; 2] {
+        let raw = u64::from(page.get());
+        let h1 = raw.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let h2 = raw.rotate_left(17) ^ 0xC2B2_AE3D_27D4_EB4F;
+        let bit_len = self.bit_len();
+        let bit_len_u64 = u64::try_from(bit_len).unwrap_or(u64::MAX);
+        let idx1: usize = usize::try_from(h1 % bit_len_u64).unwrap_or_default();
+        let idx2: usize = usize::try_from(h2 % bit_len_u64).unwrap_or_default();
+        [idx1, idx2]
+    }
+
+    pub fn insert(&mut self, page: PageNumber) {
+        for idx in self.hash_indices(page) {
+            let word = idx / 64;
+            let bit = idx % 64;
+            self.bits[word] |= 1_u64 << bit;
+        }
+    }
+
+    #[must_use]
+    pub fn may_contain(&self, page: PageNumber) -> bool {
+        self.hash_indices(page).into_iter().all(|idx| {
+            let word = idx / 64;
+            let bit = idx % 64;
+            (self.bits[word] & (1_u64 << bit)) != 0
+        })
+    }
+
+    pub fn clear(&mut self) {
+        for word in &mut self.bits {
+            *word = 0;
+        }
+    }
+}
+
+thread_local! {
+    static THREAD_LOCAL_READ_SET_VERSIONS: RefCell<
+        HashMap<TxnToken, HashMap<PageNumber, CommitSeq, PageNumberBuildHasher>>
+    > = RefCell::new(HashMap::new());
+    static THREAD_LOCAL_WRITE_SET_VERSIONS: RefCell<
+        HashMap<TxnToken, HashMap<PageNumber, WriteVersionEntry, PageNumberBuildHasher>>
+    > = RefCell::new(HashMap::new());
+}
+
 /// A running MVCC transaction.
 #[derive(Debug)]
 #[allow(clippy::struct_excessive_bools)]
@@ -783,6 +875,14 @@ pub struct Transaction {
     pub ssi_enabled_at_begin: bool,
     /// True iff this txn currently holds the global write mutex (Serialized mode).
     pub serialized_write_lock_held: bool,
+    /// Per-page read-set version ledger used by SSI conflict detection.
+    pub read_set_versions: HashMap<PageNumber, CommitSeq, PageNumberBuildHasher>,
+    /// Per-page write-set version ledger (old/new commit sequence evidence).
+    pub write_set_versions: HashMap<PageNumber, WriteVersionEntry, PageNumberBuildHasher>,
+    /// Storage mode for read-set tracking.
+    pub read_set_storage_mode: ReadSetStorageMode,
+    /// Optional Bloom-backed approximate membership filter for large read sets.
+    pub read_set_bloom: Option<ReadSetBloom>,
     /// SSI witness-plane read evidence (§5.6.4).
     pub read_keys: HashSet<WitnessKey>,
     /// SSI witness-plane write evidence (§5.6.4).
@@ -819,6 +919,10 @@ impl Transaction {
             mode,
             ssi_enabled_at_begin: true,
             serialized_write_lock_held: false,
+            read_set_versions: HashMap::with_hasher(PageNumberBuildHasher::default()),
+            write_set_versions: HashMap::with_hasher(PageNumberBuildHasher::default()),
+            read_set_storage_mode: ReadSetStorageMode::Exact,
+            read_set_bloom: None,
             read_keys: HashSet::new(),
             write_keys: HashSet::new(),
             has_in_rw: false,
@@ -831,6 +935,185 @@ impl Transaction {
     #[must_use]
     pub fn token(&self) -> TxnToken {
         TxnToken::new(self.txn_id, self.txn_epoch)
+    }
+
+    /// Set read-set storage mode.
+    pub fn set_read_set_storage_mode(&mut self, mode: ReadSetStorageMode) {
+        self.read_set_storage_mode = mode;
+        if mode == ReadSetStorageMode::Bloom {
+            if self.read_set_bloom.is_none() {
+                self.read_set_bloom = Some(ReadSetBloom::new(ReadSetBloom::DEFAULT_BITS));
+            }
+        } else {
+            self.read_set_bloom = None;
+        }
+    }
+
+    /// Record a page read with the visible committed version.
+    pub fn record_page_read(&mut self, page: PageNumber, version: CommitSeq) {
+        if let Some(bloom) = self.read_set_bloom.as_mut() {
+            bloom.insert(page);
+        }
+        self.read_set_versions
+            .entry(page)
+            .and_modify(|existing| {
+                if version > *existing {
+                    *existing = version;
+                }
+            })
+            .or_insert(version);
+        self.read_keys.insert(WitnessKey::Page(page));
+        let token = self.token();
+        THREAD_LOCAL_READ_SET_VERSIONS.with(|store| {
+            let mut store = store.borrow_mut();
+            let entry = store
+                .entry(token)
+                .or_insert_with(|| HashMap::with_hasher(PageNumberBuildHasher::default()));
+            entry
+                .entry(page)
+                .and_modify(|existing| {
+                    if version > *existing {
+                        *existing = version;
+                    }
+                })
+                .or_insert(version);
+        });
+    }
+
+    /// Record a range-scan witness set for predicate-style tracking.
+    pub fn record_range_scan(&mut self, leaf_pages: &[PageNumber], version: CommitSeq) {
+        for key in WitnessKey::for_range_scan(leaf_pages) {
+            if let WitnessKey::Page(page) = key {
+                self.record_page_read(page, version);
+            } else {
+                self.read_keys.insert(key);
+            }
+        }
+    }
+
+    /// Record a page write with the visible base version.
+    pub fn record_page_write(&mut self, page: PageNumber, old_version: Option<CommitSeq>) {
+        self.write_set_versions
+            .entry(page)
+            .or_insert_with(|| WriteVersionEntry::new(old_version));
+        self.write_keys.insert(WitnessKey::Page(page));
+        let token = self.token();
+        THREAD_LOCAL_WRITE_SET_VERSIONS.with(|store| {
+            let mut store = store.borrow_mut();
+            let entry = store
+                .entry(token)
+                .or_insert_with(|| HashMap::with_hasher(PageNumberBuildHasher::default()));
+            entry
+                .entry(page)
+                .or_insert_with(|| WriteVersionEntry::new(old_version));
+        });
+    }
+
+    /// Attach the assigned commit sequence to a written page entry.
+    pub fn mark_page_write_committed(&mut self, page: PageNumber, new_version: CommitSeq) {
+        if let Some(entry) = self.write_set_versions.get_mut(&page) {
+            entry.new_version = Some(new_version);
+        }
+        let token = self.token();
+        THREAD_LOCAL_WRITE_SET_VERSIONS.with(|store| {
+            if let Some(entry) = store
+                .borrow_mut()
+                .get_mut(&token)
+                .and_then(|versions| versions.get_mut(&page))
+            {
+                entry.new_version = Some(new_version);
+            }
+        });
+    }
+
+    /// Lookup tracked read version for a page.
+    #[must_use]
+    pub fn read_version_for_page(&self, page: PageNumber) -> Option<CommitSeq> {
+        self.read_set_versions.get(&page).copied()
+    }
+
+    /// Lookup tracked write metadata for a page.
+    #[must_use]
+    pub fn write_version_for_page(&self, page: PageNumber) -> Option<WriteVersionEntry> {
+        self.write_set_versions.get(&page).copied()
+    }
+
+    /// Membership check that uses exact or bloom-backed read-set mode.
+    #[must_use]
+    pub fn read_set_maybe_contains(&self, page: PageNumber) -> bool {
+        if self.read_set_versions.contains_key(&page) {
+            return true;
+        }
+        self.read_set_bloom
+            .as_ref()
+            .is_some_and(|bloom| bloom.may_contain(page))
+    }
+
+    /// Read page version from this thread's per-transaction mirror.
+    #[must_use]
+    pub fn thread_local_read_version_for_page(&self, page: PageNumber) -> Option<CommitSeq> {
+        let token = self.token();
+        THREAD_LOCAL_READ_SET_VERSIONS.with(|store| {
+            store
+                .borrow()
+                .get(&token)
+                .and_then(|versions| versions.get(&page).copied())
+        })
+    }
+
+    /// Write page version metadata from this thread's per-transaction mirror.
+    #[must_use]
+    pub fn thread_local_write_version_for_page(
+        &self,
+        page: PageNumber,
+    ) -> Option<WriteVersionEntry> {
+        let token = self.token();
+        THREAD_LOCAL_WRITE_SET_VERSIONS.with(|store| {
+            store
+                .borrow()
+                .get(&token)
+                .and_then(|versions| versions.get(&page).copied())
+        })
+    }
+
+    /// Number of read-set entries in the current thread-local mirror.
+    #[must_use]
+    pub fn thread_local_read_set_len(&self) -> usize {
+        let token = self.token();
+        THREAD_LOCAL_READ_SET_VERSIONS.with(|store| {
+            store
+                .borrow()
+                .get(&token)
+                .map_or(0_usize, std::collections::HashMap::len)
+        })
+    }
+
+    /// Number of write-set entries in the current thread-local mirror.
+    #[must_use]
+    pub fn thread_local_write_set_len(&self) -> usize {
+        let token = self.token();
+        THREAD_LOCAL_WRITE_SET_VERSIONS.with(|store| {
+            store
+                .borrow()
+                .get(&token)
+                .map_or(0_usize, std::collections::HashMap::len)
+        })
+    }
+
+    /// Clear read/write tracking ledgers (called on txn finalization).
+    pub fn clear_page_access_tracking(&mut self) {
+        self.read_set_versions.clear();
+        self.write_set_versions.clear();
+        if let Some(bloom) = self.read_set_bloom.as_mut() {
+            bloom.clear();
+        }
+        let token = self.token();
+        THREAD_LOCAL_READ_SET_VERSIONS.with(|store| {
+            store.borrow_mut().remove(&token);
+        });
+        THREAD_LOCAL_WRITE_SET_VERSIONS.with(|store| {
+            store.borrow_mut().remove(&token);
+        });
     }
 
     /// Transition to committed state. Panics if not active.
@@ -1876,6 +2159,10 @@ mod tests {
         assert!(txn.page_locks.is_empty());
         assert_eq!(txn.state, TransactionState::Active);
         assert!(!txn.serialized_write_lock_held);
+        assert!(txn.read_set_versions.is_empty());
+        assert!(txn.write_set_versions.is_empty());
+        assert_eq!(txn.read_set_storage_mode, ReadSetStorageMode::Exact);
+        assert!(txn.read_set_bloom.is_none());
         assert!(txn.read_keys.is_empty());
         assert!(txn.write_keys.is_empty());
         assert!(!txn.has_in_rw);
@@ -1895,6 +2182,149 @@ mod tests {
 
         txn.has_out_rw = true;
         assert!(txn.has_dangerous_structure(), "both in+out rw = dangerous");
+    }
+
+    #[test]
+    fn test_transaction_page_access_tracking_records_versions() {
+        let txn_id = TxnId::new(33).unwrap();
+        let snap = Snapshot::new(CommitSeq::new(12), SchemaEpoch::ZERO);
+        let mut txn = Transaction::new(txn_id, TxnEpoch::new(0), snap, TransactionMode::Concurrent);
+        let p_read = PageNumber::new(7).unwrap();
+        let p_write = PageNumber::new(9).unwrap();
+
+        txn.record_page_read(p_read, CommitSeq::new(4));
+        txn.record_page_read(p_read, CommitSeq::new(5));
+        txn.record_page_write(p_write, Some(CommitSeq::new(5)));
+        txn.mark_page_write_committed(p_write, CommitSeq::new(13));
+
+        assert_eq!(txn.read_version_for_page(p_read), Some(CommitSeq::new(5)));
+        let write = txn.write_version_for_page(p_write).unwrap();
+        assert_eq!(write.old_version, Some(CommitSeq::new(5)));
+        assert_eq!(write.new_version, Some(CommitSeq::new(13)));
+        assert!(txn.read_keys.contains(&WitnessKey::Page(p_read)));
+        assert!(txn.write_keys.contains(&WitnessKey::Page(p_write)));
+    }
+
+    #[test]
+    fn test_transaction_clear_page_access_tracking() {
+        let txn_id = TxnId::new(41).unwrap();
+        let snap = Snapshot::new(CommitSeq::new(1), SchemaEpoch::ZERO);
+        let mut txn = Transaction::new(txn_id, TxnEpoch::new(0), snap, TransactionMode::Serialized);
+        let page = PageNumber::new(3).unwrap();
+
+        txn.record_page_read(page, CommitSeq::new(1));
+        txn.record_page_write(page, Some(CommitSeq::new(1)));
+        assert!(!txn.read_set_versions.is_empty());
+        assert!(!txn.write_set_versions.is_empty());
+
+        txn.clear_page_access_tracking();
+        assert!(txn.read_set_versions.is_empty());
+        assert!(txn.write_set_versions.is_empty());
+    }
+
+    #[test]
+    fn test_transaction_bloom_read_set_mode() {
+        let txn_id = TxnId::new(51).unwrap();
+        let snap = Snapshot::new(CommitSeq::new(2), SchemaEpoch::ZERO);
+        let mut txn = Transaction::new(txn_id, TxnEpoch::new(0), snap, TransactionMode::Concurrent);
+        let page = PageNumber::new(19).unwrap();
+
+        txn.set_read_set_storage_mode(ReadSetStorageMode::Bloom);
+        assert!(txn.read_set_bloom.is_some());
+        txn.record_page_read(page, CommitSeq::new(2));
+        assert!(txn.read_set_maybe_contains(page));
+
+        txn.clear_page_access_tracking();
+        assert!(
+            !txn.read_set_maybe_contains(page),
+            "cleared bloom tracking must not claim membership for previously recorded pages"
+        );
+    }
+
+    #[test]
+    fn test_transaction_record_range_scan_adds_page_witnesses() {
+        let txn_id = TxnId::new(61).unwrap();
+        let snap = Snapshot::new(CommitSeq::new(9), SchemaEpoch::ZERO);
+        let mut txn = Transaction::new(txn_id, TxnEpoch::new(0), snap, TransactionMode::Concurrent);
+        let pages = [PageNumber::new(41).unwrap(), PageNumber::new(42).unwrap()];
+
+        txn.record_range_scan(&pages, CommitSeq::new(9));
+
+        for page in pages {
+            assert_eq!(txn.read_version_for_page(page), Some(CommitSeq::new(9)));
+            assert!(
+                txn.read_keys.contains(&WitnessKey::Page(page)),
+                "range-scan recording must include page witness keys"
+            );
+        }
+    }
+
+    #[test]
+    fn test_transaction_thread_local_mirrors_track_and_clear() {
+        let txn_id = TxnId::new(71).unwrap();
+        let snap = Snapshot::new(CommitSeq::new(5), SchemaEpoch::ZERO);
+        let mut txn = Transaction::new(txn_id, TxnEpoch::new(0), snap, TransactionMode::Concurrent);
+        let p_read = PageNumber::new(90).unwrap();
+        let p_write = PageNumber::new(91).unwrap();
+
+        txn.record_page_read(p_read, CommitSeq::new(5));
+        txn.record_page_write(p_write, Some(CommitSeq::new(5)));
+        txn.mark_page_write_committed(p_write, CommitSeq::new(6));
+
+        assert_eq!(txn.thread_local_read_set_len(), 1);
+        assert_eq!(txn.thread_local_write_set_len(), 1);
+        assert_eq!(
+            txn.thread_local_read_version_for_page(p_read),
+            Some(CommitSeq::new(5))
+        );
+        let entry = txn.thread_local_write_version_for_page(p_write).unwrap();
+        assert_eq!(entry.old_version, Some(CommitSeq::new(5)));
+        assert_eq!(entry.new_version, Some(CommitSeq::new(6)));
+
+        txn.clear_page_access_tracking();
+        assert_eq!(txn.thread_local_read_set_len(), 0);
+        assert_eq!(txn.thread_local_write_set_len(), 0);
+    }
+
+    #[test]
+    fn test_transaction_thread_local_mirrors_are_thread_isolated() {
+        let page = PageNumber::new(100).unwrap();
+        let mut main_txn = Transaction::new(
+            TxnId::new(81).unwrap(),
+            TxnEpoch::new(0),
+            Snapshot::new(CommitSeq::new(10), SchemaEpoch::ZERO),
+            TransactionMode::Concurrent,
+        );
+        main_txn.record_page_read(page, CommitSeq::new(10));
+        assert_eq!(
+            main_txn.thread_local_read_version_for_page(page),
+            Some(CommitSeq::new(10))
+        );
+
+        std::thread::spawn(move || {
+            let mut thread_txn = Transaction::new(
+                TxnId::new(82).unwrap(),
+                TxnEpoch::new(0),
+                Snapshot::new(CommitSeq::new(11), SchemaEpoch::ZERO),
+                TransactionMode::Concurrent,
+            );
+            thread_txn.record_page_read(page, CommitSeq::new(11));
+            assert_eq!(thread_txn.thread_local_read_set_len(), 1);
+            assert_eq!(
+                thread_txn.thread_local_read_version_for_page(page),
+                Some(CommitSeq::new(11))
+            );
+            thread_txn.clear_page_access_tracking();
+            assert_eq!(thread_txn.thread_local_read_set_len(), 0);
+        })
+        .join()
+        .unwrap();
+
+        assert_eq!(
+            main_txn.thread_local_read_version_for_page(page),
+            Some(CommitSeq::new(10))
+        );
+        main_txn.clear_page_access_tracking();
     }
 
     // -- CommitRecord / CommitLog --

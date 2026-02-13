@@ -1215,12 +1215,12 @@ mod tests {
 
     #[test]
     fn test_contention_mix_presets() {
-        let r = ContentionMix::read_heavy();
-        assert_eq!(r.reader_pct, 90);
-        let b = ContentionMix::balanced();
-        assert_eq!(b.reader_pct, 50);
-        let w = ContentionMix::write_heavy();
-        assert_eq!(w.reader_pct, 20);
+        let read = ContentionMix::read_heavy();
+        assert_eq!(read.reader_pct, 90);
+        let balanced = ContentionMix::balanced();
+        assert_eq!(balanced.reader_pct, 50);
+        let write = ContentionMix::write_heavy();
+        assert_eq!(write.reader_pct, 20);
     }
 
     #[test]

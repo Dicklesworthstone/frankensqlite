@@ -1115,7 +1115,7 @@ fn run_suite_for_probe<E: DeterminismProbeExecutor>(
     reports
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::useless_let_if_seq)]
 fn build_success_cell_report(
     toolchain: &ToolchainEntry,
     probe: &DeterminismProbe,

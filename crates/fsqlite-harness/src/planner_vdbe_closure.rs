@@ -332,6 +332,7 @@ fn add_planner_cases(reg: &mut PlannerVdbeRegistry) {
         "INSERT INTO c VALUES(1,1,'c1'),(2,2,'c2'),(3,3,'c3');".to_owned(),
     ];
 
+    #[allow(clippy::type_complexity)]
     let planner_cases: Vec<(&str, &str, Vec<String>, Vec<String>, &str, Vec<&str>)> = vec![
         // Access path selection
         (
@@ -386,7 +387,7 @@ fn add_planner_cases(reg: &mut PlannerVdbeRegistry) {
         (
             "PLAN-007",
             "Three-table chain join",
-            schema_three.clone(),
+            schema_three,
             vec!["SELECT a.val, b.val, c.val FROM a JOIN b ON a.id=b.a_id JOIN c ON b.id=c.b_id;".to_owned()],
             "Returns rows from chain join a→b→c",
             vec!["F-PLANNER"],
@@ -427,7 +428,7 @@ fn add_planner_cases(reg: &mut PlannerVdbeRegistry) {
         (
             "PLAN-011",
             "ORDER BY indexed column",
-            schema_idx.clone(),
+            schema_idx,
             vec!["SELECT b FROM t ORDER BY b;".to_owned()],
             "Returns b values in sorted order",
             vec!["F-PLANNER"],
@@ -491,7 +492,7 @@ fn add_planner_cases(reg: &mut PlannerVdbeRegistry) {
         (
             "PLAN-018",
             "Subquery in FROM",
-            schema_t.clone(),
+            schema_t,
             vec!["SELECT sub.m FROM (SELECT MAX(c) AS m FROM t) AS sub;".to_owned()],
             "Returns 5.0",
             vec!["F-PLANNER"],
@@ -499,7 +500,7 @@ fn add_planner_cases(reg: &mut PlannerVdbeRegistry) {
         (
             "PLAN-019",
             "EXISTS subquery",
-            schema_two.clone(),
+            schema_two,
             vec!["SELECT t1.b FROM t1 WHERE EXISTS(SELECT 1 FROM t2 WHERE t2.a_ref = t1.a);".to_owned()],
             "Returns rows with matching t2 entry",
             vec!["F-PLANNER"],
@@ -543,6 +544,7 @@ fn add_vdbe_cases(reg: &mut PlannerVdbeRegistry) {
         "INSERT INTO t VALUES(3,NULL,NULL);".to_owned(),
     ];
 
+    #[allow(clippy::type_complexity)]
     let vdbe_cases: Vec<(&str, &str, Vec<String>, Vec<String>, &str, Vec<&str>)> = vec![
         // Expression evaluation
         (
@@ -702,7 +704,7 @@ fn add_vdbe_cases(reg: &mut PlannerVdbeRegistry) {
         (
             "VDBE-019",
             "SUM/AVG with NULLs",
-            schema_t.clone(),
+            schema_t,
             vec!["SELECT SUM(a), AVG(c) FROM t;".to_owned()],
             "SUM = 6, AVG = 2.0 (NULLs excluded)",
             vec!["F-VDBE"],

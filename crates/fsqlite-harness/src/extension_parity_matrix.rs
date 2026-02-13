@@ -146,6 +146,7 @@ pub struct FeatureFlagTable {
 impl FeatureFlagTable {
     /// Build the canonical truth table.
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn canonical() -> Self {
         let mut flags = BTreeMap::new();
 
@@ -1371,7 +1372,7 @@ pub fn compute_extension_coverage(matrix: &ExtensionParityMatrix) -> ExtensionCo
         let denom = total - excluded;
         #[allow(clippy::cast_precision_loss)]
         let coverage_ratio = if denom > 0 {
-            truncate_6((passing as f64 + 0.5 * partial as f64) / denom as f64)
+            truncate_6(0.5f64.mul_add(partial as f64, passing as f64) / denom as f64)
         } else {
             0.0
         };
@@ -1381,7 +1382,7 @@ pub fn compute_extension_coverage(matrix: &ExtensionParityMatrix) -> ExtensionCo
         missing_all += missing;
         #[allow(clippy::cast_precision_loss)]
         {
-            numerator_all += passing as f64 + 0.5 * partial as f64;
+            numerator_all += 0.5f64.mul_add(partial as f64, passing as f64);
         }
         denominator_all += denom;
 

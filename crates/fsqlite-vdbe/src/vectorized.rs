@@ -321,6 +321,18 @@ impl SelectionVector {
     pub fn from_storage(storage: Arc<[u16]>) -> Self {
         Self { indices: storage }
     }
+
+    fn validate_against_row_count(&self, row_count: usize) -> Result<(), BatchFormatError> {
+        for &idx in self.as_slice() {
+            let row_idx = usize::from(idx);
+            if row_idx >= row_count {
+                return Err(BatchFormatError::new(format!(
+                    "selection index {row_idx} out of bounds for row_count {row_count}"
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Column payload in columnar form.
@@ -462,6 +474,17 @@ impl Batch {
         })
     }
 
+    /// Replace the active row mask for this batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when any selected index is out of bounds.
+    pub fn apply_selection(&mut self, selection: SelectionVector) -> Result<(), BatchFormatError> {
+        selection.validate_against_row_count(self.row_count)?;
+        self.selection = selection;
+        Ok(())
+    }
+
     /// Number of rows in this batch.
     #[must_use]
     pub const fn row_count(&self) -> usize {
@@ -532,11 +555,14 @@ impl Batch {
             });
         }
 
+        let selection = SelectionVector::from_storage(layout.selection);
+        selection.validate_against_row_count(layout.row_count)?;
+
         Ok(Self {
             row_count: layout.row_count,
             capacity: layout.capacity,
             columns,
-            selection: SelectionVector::from_storage(layout.selection),
+            selection,
         })
     }
 
@@ -906,51 +932,54 @@ mod tests {
         let score_column = &batch.columns()[1];
         let payload_column = &batch.columns()[2];
 
-        match &id_column.data {
-            ColumnData::Int64(values) => {
-                assert_eq!(
-                    values.as_slice(),
-                    &[1, 2],
-                    "bead_id={BEAD_ID} id values mismatch"
-                );
-            }
-            other => panic!("bead_id={BEAD_ID} unexpected id column variant: {other:?}"),
+        assert!(
+            matches!(&id_column.data, ColumnData::Int64(_)),
+            "bead_id={BEAD_ID} expected int64 id column"
+        );
+        if let ColumnData::Int64(values) = &id_column.data {
+            assert_eq!(
+                values.as_slice(),
+                &[1, 2],
+                "bead_id={BEAD_ID} id values mismatch"
+            );
         }
 
-        match &score_column.data {
-            ColumnData::Float64(values) => {
-                let first = values.as_slice()[0];
-                let second = values.as_slice()[1];
-                assert!(
-                    (first - 1.5).abs() < f64::EPSILON,
-                    "bead_id={BEAD_ID} score row0 mismatch value={first}"
-                );
-                assert!(
-                    second.abs() < f64::EPSILON,
-                    "bead_id={BEAD_ID} null sentinel mismatch value={second}"
-                );
-                assert!(
-                    !score_column.validity.is_valid(1),
-                    "bead_id={BEAD_ID} row1 should be NULL"
-                );
-            }
-            other => panic!("bead_id={BEAD_ID} unexpected score column variant: {other:?}"),
+        assert!(
+            matches!(&score_column.data, ColumnData::Float64(_)),
+            "bead_id={BEAD_ID} expected float64 score column"
+        );
+        if let ColumnData::Float64(values) = &score_column.data {
+            let first = values.as_slice()[0];
+            let second = values.as_slice()[1];
+            assert!(
+                (first - 1.5).abs() < f64::EPSILON,
+                "bead_id={BEAD_ID} score row0 mismatch value={first}"
+            );
+            assert!(
+                second.abs() < f64::EPSILON,
+                "bead_id={BEAD_ID} null sentinel mismatch value={second}"
+            );
+            assert!(
+                !score_column.validity.is_valid(1),
+                "bead_id={BEAD_ID} row1 should be NULL"
+            );
         }
 
-        match &payload_column.data {
-            ColumnData::Binary { offsets, data } => {
-                assert_eq!(
-                    offsets.as_ref(),
-                    &[0, 3, 5],
-                    "bead_id={BEAD_ID} payload offsets mismatch"
-                );
-                assert_eq!(
-                    data.as_ref(),
-                    &[1, 2, 3, 9, 8],
-                    "bead_id={BEAD_ID} payload data mismatch"
-                );
-            }
-            other => panic!("bead_id={BEAD_ID} unexpected payload column variant: {other:?}"),
+        assert!(
+            matches!(&payload_column.data, ColumnData::Binary { .. }),
+            "bead_id={BEAD_ID} expected binary payload column"
+        );
+        if let ColumnData::Binary { offsets, data } = &payload_column.data {
+            assert_eq!(
+                offsets.as_ref(),
+                &[0, 3, 5],
+                "bead_id={BEAD_ID} payload offsets mismatch"
+            );
+            assert_eq!(
+                data.as_ref(),
+                &[1, 2, 3, 9, 8],
+                "bead_id={BEAD_ID} payload data mismatch"
+            );
         }
     }
 
@@ -971,15 +1000,18 @@ mod tests {
             "bead_id={BEAD_ID} row_count drift"
         );
 
-        match (&batch.columns()[0].data, &exported.columns[0].data) {
-            (ColumnData::Int64(original), ColumnData::Int64(exported_values)) => {
-                assert_eq!(original.as_slice(), exported_values.as_slice());
-                assert!(
-                    Arc::ptr_eq(&original.values, &exported_values.values),
-                    "bead_id={BEAD_ID} expected zero-copy storage share"
-                );
-            }
-            _ => panic!("bead_id={BEAD_ID} expected int64 column"),
+        let lhs = &batch.columns()[0].data;
+        let rhs = &exported.columns[0].data;
+        assert!(
+            matches!(lhs, ColumnData::Int64(_)) && matches!(rhs, ColumnData::Int64(_)),
+            "bead_id={BEAD_ID} expected int64 column"
+        );
+        if let (ColumnData::Int64(original), ColumnData::Int64(exported_values)) = (lhs, rhs) {
+            assert_eq!(original.as_slice(), exported_values.as_slice());
+            assert!(
+                Arc::ptr_eq(&original.values, &exported_values.values),
+                "bead_id={BEAD_ID} expected zero-copy storage share"
+            );
         }
     }
 

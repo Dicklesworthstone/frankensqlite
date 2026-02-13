@@ -465,8 +465,13 @@ impl TransactionManager {
         }
 
         // Check write_set first.
-        if let Some(data) = txn.write_set_data.get(&pgno) {
-            return Some(data.clone());
+        if let Some(data) = txn.write_set_data.get(&pgno).cloned() {
+            let tracked_version = txn
+                .write_version_for_page(pgno)
+                .and_then(|entry| entry.new_version.or(entry.old_version))
+                .unwrap_or(txn.snapshot.high);
+            txn.record_page_read(pgno, tracked_version);
+            return Some(data);
         }
 
         // DEFERRED snapshot establishment on first read.
@@ -483,7 +488,28 @@ impl TransactionManager {
         // Resolve from version store.
         let idx = self.version_store.resolve(pgno, &txn.snapshot)?;
         let version = self.version_store.get_version(idx)?;
+        txn.record_page_read(pgno, version.commit_seq);
         Some(version.data)
+    }
+
+    /// Record a range scan witness/read-set footprint for a transaction.
+    ///
+    /// This hook allows scan operators to capture page-level predicate coverage
+    /// without forcing materialization of all rows. Each leaf page is recorded
+    /// with the currently visible committed version when available.
+    pub fn record_range_scan(&self, txn: &mut Transaction, leaf_pages: &[PageNumber]) {
+        assert_eq!(
+            txn.state,
+            TransactionState::Active,
+            "can only record range scan in active transactions"
+        );
+        let fallback_version = txn.snapshot.high;
+        for &page in leaf_pages {
+            let version = self
+                .resolve_visible_commit_seq(txn, page)
+                .unwrap_or(fallback_version);
+            txn.record_page_read(page, version);
+        }
     }
 
     /// Write a page within a transaction.
@@ -625,6 +651,8 @@ impl TransactionManager {
 
         // Truncate the write_set page list to savepoint length.
         txn.write_set.truncate(savepoint.write_set_len);
+        txn.write_set_versions
+            .retain(|pgno, _| txn.write_set_data.contains_key(pgno));
 
         tracing::debug!(
             txn_id = %txn.txn_id,
@@ -715,6 +743,8 @@ impl TransactionManager {
             );
         }
 
+        txn.record_page_write(pgno, self.resolve_visible_commit_seq(txn, pgno));
+
         // No page lock needed (mutex provides exclusion).
         // Track in write_set.
         if !txn.write_set.contains(&pgno) {
@@ -753,6 +783,8 @@ impl TransactionManager {
                 "concurrent: page lock acquired"
             );
         }
+
+        txn.record_page_write(pgno, self.resolve_visible_commit_seq(txn, pgno));
 
         // Track in write_set.
         if !txn.write_set.contains(&pgno) {
@@ -950,11 +982,12 @@ impl TransactionManager {
     /// Publish a transaction's write set into the version store and commit index.
     ///
     /// Returns the assigned `CommitSeq`.
-    fn publish_write_set(&self, txn: &Transaction) -> CommitSeq {
+    fn publish_write_set(&self, txn: &mut Transaction) -> CommitSeq {
         let commit_seq = self.txn_manager.alloc_commit_seq();
 
-        for &pgno in &txn.write_set {
-            if let Some(data) = txn.write_set_data.get(&pgno) {
+        let pages: Vec<PageNumber> = txn.write_set.iter().copied().collect();
+        for pgno in pages {
+            if let Some(data) = txn.write_set_data.get(&pgno).cloned() {
                 // Look up existing chain head for prev pointer.
                 let prev = self
                     .version_store
@@ -965,11 +998,12 @@ impl TransactionManager {
                     pgno,
                     commit_seq,
                     created_by: TxnToken::new(txn.txn_id, txn.txn_epoch),
-                    data: data.clone(),
+                    data,
                     prev,
                 };
                 self.version_store.publish(version);
                 self.commit_index.update(pgno, commit_seq);
+                txn.mark_page_write_committed(pgno, commit_seq);
             }
         }
 
@@ -980,6 +1014,7 @@ impl TransactionManager {
     fn release_all_resources(&self, txn: &mut Transaction) {
         // Release page locks.
         self.lock_table.release_all(txn.txn_id);
+        txn.clear_page_access_tracking();
 
         // Release serialized write mutex if held.
         if txn.serialized_write_lock_held {
@@ -987,6 +1022,13 @@ impl TransactionManager {
             self.release_serialized_writer_exclusion(txn.txn_id);
             txn.serialized_write_lock_held = false;
         }
+    }
+
+    fn resolve_visible_commit_seq(&self, txn: &Transaction, pgno: PageNumber) -> Option<CommitSeq> {
+        let idx = self.version_store.resolve(pgno, &txn.snapshot)?;
+        self.version_store
+            .get_version(idx)
+            .map(|version| version.commit_seq)
     }
 
     fn ensure_txn_within_max_duration(&self, txn: &mut Transaction) -> Result<(), MvccError> {
@@ -1371,6 +1413,55 @@ mod tests {
         assert_eq!(data.unwrap().as_bytes()[0], 0x01);
     }
 
+    #[test]
+    fn test_read_tracks_visible_version_and_witness_key() {
+        let m = mgr();
+        let pgno = PageNumber::new(11).unwrap();
+
+        let mut writer = m.begin(BeginKind::Immediate).unwrap();
+        m.write_page(&mut writer, pgno, test_data(0x22)).unwrap();
+        let committed = m.commit(&mut writer).unwrap();
+
+        let mut reader = m.begin(BeginKind::Concurrent).unwrap();
+        let data = m.read_page(&mut reader, pgno).unwrap();
+        assert_eq!(data.as_bytes()[0], 0x22);
+        assert_eq!(reader.read_version_for_page(pgno), Some(committed));
+        assert!(
+            reader
+                .read_keys
+                .contains(&fsqlite_types::WitnessKey::Page(pgno)),
+            "page reads must populate SSI witness keys"
+        );
+    }
+
+    #[test]
+    fn test_record_range_scan_tracks_all_pages() {
+        let m = mgr();
+        let p1 = PageNumber::new(12).unwrap();
+        let p2 = PageNumber::new(13).unwrap();
+
+        let mut seed = m.begin(BeginKind::Immediate).unwrap();
+        m.write_page(&mut seed, p1, test_data(0x31)).unwrap();
+        m.write_page(&mut seed, p2, test_data(0x32)).unwrap();
+        let committed = m.commit(&mut seed).unwrap();
+
+        let mut reader = m.begin(BeginKind::Concurrent).unwrap();
+        m.record_range_scan(&mut reader, &[p1, p2]);
+
+        assert_eq!(reader.read_version_for_page(p1), Some(committed));
+        assert_eq!(reader.read_version_for_page(p2), Some(committed));
+        assert!(
+            reader
+                .read_keys
+                .contains(&fsqlite_types::WitnessKey::Page(p1))
+        );
+        assert!(
+            reader
+                .read_keys
+                .contains(&fsqlite_types::WitnessKey::Page(p2))
+        );
+    }
+
     // -----------------------------------------------------------------------
     // WRITE (Serialized) tests
     // -----------------------------------------------------------------------
@@ -1507,6 +1598,39 @@ mod tests {
             txn.write_set.len(),
             5,
             "duplicate write should not increase write_set page count"
+        );
+    }
+
+    #[test]
+    fn test_write_tracks_base_version_and_clears_tracking_on_commit() {
+        let m = mgr();
+        let pgno = PageNumber::new(21).unwrap();
+
+        let mut seed = m.begin(BeginKind::Immediate).unwrap();
+        m.write_page(&mut seed, pgno, test_data(0x10)).unwrap();
+        let base_commit = m.commit(&mut seed).unwrap();
+
+        let mut txn = m.begin(BeginKind::Concurrent).unwrap();
+        m.write_page(&mut txn, pgno, test_data(0x11)).unwrap();
+
+        let tracked_before = txn.write_version_for_page(pgno).unwrap();
+        assert_eq!(tracked_before.old_version, Some(base_commit));
+        assert_eq!(tracked_before.new_version, None);
+        assert!(
+            txn.write_keys
+                .contains(&fsqlite_types::WitnessKey::Page(pgno)),
+            "page writes must populate SSI witness keys"
+        );
+
+        let committed = m.commit(&mut txn).unwrap();
+        assert!(committed > base_commit);
+        assert!(
+            txn.read_set_versions.is_empty(),
+            "read tracking must be cleared after finalization"
+        );
+        assert!(
+            txn.write_set_versions.is_empty(),
+            "write tracking must be cleared after finalization"
         );
     }
 
@@ -1873,14 +1997,23 @@ mod tests {
     fn test_abort_concurrent_witnesses_preserved() {
         let m = mgr();
         let mut txn = m.begin(BeginKind::Concurrent).unwrap();
+        let read_pg = PageNumber::new(1).unwrap();
+        let write_pg = PageNumber::new(2).unwrap();
 
-        // Add SSI witness keys.
-        txn.read_keys
-            .insert(fsqlite_types::WitnessKey::Page(PageNumber::new(1).unwrap()));
-        txn.write_keys
-            .insert(fsqlite_types::WitnessKey::Page(PageNumber::new(2).unwrap()));
+        // Record read/write tracking (also injects witness keys).
+        txn.record_page_read(read_pg, CommitSeq::new(1));
+        txn.record_page_write(write_pg, Some(CommitSeq::new(1)));
 
         m.abort(&mut txn);
+
+        assert!(
+            txn.read_set_versions.is_empty(),
+            "read tracking must be cleared on abort"
+        );
+        assert!(
+            txn.write_set_versions.is_empty(),
+            "write tracking must be cleared on abort"
+        );
 
         // Witnesses are NOT cleared on abort (safe overapproximation per spec).
         assert!(
@@ -1943,6 +2076,29 @@ mod tests {
         assert!(
             !txn.write_set_data.contains_key(&p2),
             "page 2 should be removed from write_set_data"
+        );
+    }
+
+    #[test]
+    fn test_rollback_to_savepoint_prunes_write_version_tracking() {
+        let m = mgr();
+        let mut txn = m.begin(BeginKind::Immediate).unwrap();
+        let p1 = PageNumber::new(1).unwrap();
+        let p2 = PageNumber::new(2).unwrap();
+
+        m.write_page(&mut txn, p1, test_data(0x01)).unwrap();
+        let sp = TransactionManager::savepoint(&txn, "sp_tracking");
+        m.write_page(&mut txn, p2, test_data(0x02)).unwrap();
+
+        assert!(txn.write_version_for_page(p1).is_some());
+        assert!(txn.write_version_for_page(p2).is_some());
+
+        TransactionManager::rollback_to_savepoint(&mut txn, &sp);
+
+        assert!(txn.write_version_for_page(p1).is_some());
+        assert!(
+            txn.write_version_for_page(p2).is_none(),
+            "savepoint rollback must prune write-version entries for removed pages"
         );
     }
 

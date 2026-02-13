@@ -93,3 +93,24 @@ The interchange shape follows Arrow buffer semantics:
 - 1024
 
 This benchmark is intended to catch regressions in row-to-column conversion overhead before scan/filter/join operator work begins.
+
+## Vectorized Scan Source (`bd-14vp7.2`)
+
+Implemented in `crates/fsqlite-vdbe/src/vectorized_scan.rs`.
+
+The scan source reads rows from a B-tree cursor and emits `Batch` values:
+
+- sequential leaf-page traversal through `BtCursor`
+- early filter pushdown by writing active row indexes into the batch `SelectionVector`
+- morsel boundaries as contiguous page ranges (`PageMorsel { start_page, end_page }`)
+- explicit best-effort prefetch hints for upcoming pages within the morsel
+
+`ScanBatchStats` provides per-batch observability:
+
+- `rows_scanned`
+- `rows_selected`
+- `pages_touched`
+- `prefetch_hints_issued`
+
+Correctness is validated against row-at-a-time scans, and scan throughput is
+tracked by `crates/fsqlite-vdbe/benches/vectorized_scan.rs`.

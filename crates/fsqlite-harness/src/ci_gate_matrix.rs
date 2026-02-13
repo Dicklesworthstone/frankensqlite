@@ -202,7 +202,10 @@ pub fn evaluate_flake_budget(
     let total = outcomes.len();
     let pass_count = outcomes.iter().filter(|o| **o == TestOutcome::Pass).count();
     let fail_count = outcomes.iter().filter(|o| **o == TestOutcome::Fail).count();
-    let flake_count = outcomes.iter().filter(|o| **o == TestOutcome::Flake).count();
+    let flake_count = outcomes
+        .iter()
+        .filter(|o| **o == TestOutcome::Flake)
+        .count();
     let skip_count = outcomes.iter().filter(|o| **o == TestOutcome::Skip).count();
 
     let executed = total - skip_count;
@@ -312,7 +315,11 @@ impl GlobalFlakeBudgetResult {
                 lane.flake_rate * 100.0,
                 lane.budget_max_flake_rate * 100.0,
                 lane.fail_count,
-                if lane.blocking { "blocking" } else { "advisory" },
+                if lane.blocking {
+                    "blocking"
+                } else {
+                    "advisory"
+                },
             );
         }
         out
@@ -642,7 +649,10 @@ mod tests {
         outcomes.extend(vec![TestOutcome::Flake; 20]);
         let result = evaluate_flake_budget(CiLane::Performance, &outcomes, &policy);
         assert!(!result.within_budget);
-        assert!(!result.pipeline_fail, "advisory lane should not fail pipeline");
+        assert!(
+            !result.pipeline_fail,
+            "advisory lane should not fail pipeline"
+        );
     }
 
     #[test]
@@ -680,11 +690,7 @@ mod tests {
     fn global_flake_budget_aggregates_lanes() {
         let policy = FlakeBudgetPolicy::canonical();
         let lane_results = vec![
-            evaluate_flake_budget(
-                CiLane::Unit,
-                &[TestOutcome::Pass; 100],
-                &policy,
-            ),
+            evaluate_flake_budget(CiLane::Unit, &[TestOutcome::Pass; 100], &policy),
             evaluate_flake_budget(
                 CiLane::E2eCorrectness,
                 &{
@@ -705,16 +711,8 @@ mod tests {
     fn global_flake_budget_fails_if_lane_fails() {
         let policy = FlakeBudgetPolicy::canonical();
         let lane_results = vec![
-            evaluate_flake_budget(
-                CiLane::Unit,
-                &[TestOutcome::Fail],
-                &policy,
-            ),
-            evaluate_flake_budget(
-                CiLane::E2eCorrectness,
-                &[TestOutcome::Pass; 100],
-                &policy,
-            ),
+            evaluate_flake_budget(CiLane::Unit, &[TestOutcome::Fail], &policy),
+            evaluate_flake_budget(CiLane::E2eCorrectness, &[TestOutcome::Pass; 100], &policy),
         ];
         let global = evaluate_global_flake_budget(&lane_results, &policy);
         assert!(!global.pipeline_pass, "should fail if any lane fails");
@@ -878,14 +876,14 @@ mod tests {
         let manifest = ArtifactManifest {
             schema_version: "1.0.0".to_owned(),
             bead_id: BEAD_ID.to_owned(),
-            run_id: String::new(), // invalid
-            lane: String::new(),   // invalid
+            run_id: String::new(),  // invalid
+            lane: String::new(),    // invalid
             git_sha: String::new(), // invalid
             seed: 0,
             created_at: "2026-02-13T09:00:00Z".to_owned(),
             artifacts: vec![ArtifactEntry {
                 kind: ArtifactKind::Log,
-                path: String::new(), // invalid
+                path: String::new(),              // invalid
                 content_hash: "short".to_owned(), // invalid
                 size_bytes: 0,
                 description: "test".to_owned(),
@@ -894,7 +892,10 @@ mod tests {
             bisect_request: None,
         };
         let errors = manifest.validate();
-        assert!(errors.len() >= 4, "should catch multiple errors: {errors:?}");
+        assert!(
+            errors.len() >= 4,
+            "should catch multiple errors: {errors:?}"
+        );
     }
 
     #[test]

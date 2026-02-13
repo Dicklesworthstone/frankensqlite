@@ -187,10 +187,10 @@ pub fn simple_diff(expected: &str, actual: &str) -> Option<String> {
         let act = act_lines.get(i).copied().unwrap_or("");
         if exp != act {
             if !exp.is_empty() {
-                let _ = write!(diff, "  line {}: - {exp}\n", i + 1);
+                let _ = writeln!(diff, "  line {}: - {exp}", i + 1);
             }
             if !act.is_empty() {
-                let _ = write!(diff, "  line {}: + {act}\n", i + 1);
+                let _ = writeln!(diff, "  line {}: + {act}", i + 1);
             }
         }
     }
@@ -449,9 +449,9 @@ impl DiagReport {
         }
 
         let mut out = String::new();
-        let _ = write!(
+        let _ = writeln!(
             out,
-            "DiagReport: {} error(s), {} warning(s)\n",
+            "DiagReport: {} error(s), {} warning(s)",
             self.error_count(),
             self.warning_count()
         );
@@ -461,13 +461,13 @@ impl DiagReport {
                 Severity::Error => "ERROR",
                 Severity::Warning => "WARN",
             };
-            let _ = write!(out, "  [{}] #{}: {}\n", sev, i + 1, f.context.format_kv());
-            let _ = write!(out, "        {}\n", f.message);
+            let _ = writeln!(out, "  [{}] #{}: {}", sev, i + 1, f.context.format_kv());
+            let _ = writeln!(out, "        {}", f.message);
             if let Some(ref e) = f.expected {
-                let _ = write!(out, "        expected: {e}\n");
+                let _ = writeln!(out, "        expected: {e}");
             }
             if let Some(ref a) = f.actual {
-                let _ = write!(out, "        actual:   {a}\n");
+                let _ = writeln!(out, "        actual:   {a}");
             }
         }
 
@@ -479,9 +479,7 @@ impl DiagReport {
     /// Call this at the end of a multi-assertion test to get a unified
     /// failure summary instead of dying on the first assertion.
     pub fn assert_ok(&self) {
-        if !self.is_ok() {
-            panic!("{}", self.render());
-        }
+        assert!(self.is_ok(), "{}", self.render());
     }
 }
 
@@ -511,6 +509,7 @@ pub struct AdoptionChecklistItem {
 /// This is the reference document for migrating existing tests to the
 /// standardized diagnostics contract.
 #[must_use]
+#[allow(clippy::literal_string_with_formatting_args)]
 pub fn build_adoption_checklist() -> Vec<AdoptionChecklistItem> {
     vec![
         AdoptionChecklistItem {
@@ -548,9 +547,9 @@ diag_assert_eq!(ctx, actual, expected);"#
             id: "D-6".to_owned(),
             requirement: "Multi-invariant tests use DiagReport for unified failure summaries"
                 .to_owned(),
-            example: r#"let mut report = DiagReport::new();
+            example: r"let mut report = DiagReport::new();
 // ... check multiple invariants ...
-report.assert_ok();"#
+report.assert_ok();"
                 .to_owned(),
         },
         AdoptionChecklistItem {

@@ -13,6 +13,7 @@ pub mod frame;
 #[cfg(test)]
 mod repro_delete_skip;
 pub mod vectorized;
+pub mod vectorized_scan;
 
 // ── Label System ────────────────────────────────────────────────────────────
 

@@ -287,6 +287,25 @@ impl<P: PageReader> BtCursor<P> {
         self.read_witnesses.clear();
     }
 
+    /// Return the current leaf page when positioned on a row.
+    ///
+    /// Returns `None` when the cursor is at EOF or not yet positioned.
+    #[must_use]
+    pub fn current_leaf_page(&self) -> Option<PageNumber> {
+        if self.at_eof {
+            return None;
+        }
+        self.stack.last().map(|entry| entry.page_no)
+    }
+
+    /// Issue an explicit best-effort prefetch hint for `page_no`.
+    ///
+    /// This is a non-blocking hint only; callers must not rely on it for
+    /// correctness.
+    pub fn prefetch_page_hint(&self, cx: &Cx, page_no: PageNumber) {
+        self.issue_prefetch_hint(cx, page_no);
+    }
+
     #[inline]
     fn cell_tag_from_rowid(rowid: i64) -> u64 {
         u64::from_ne_bytes(rowid.to_ne_bytes())

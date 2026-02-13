@@ -6,6 +6,8 @@
 
 pub mod adversarial_search;
 pub mod benchmark_corpus;
+pub mod ci_coverage_gate;
+pub mod ci_gate_matrix;
 pub mod closure_wave;
 pub mod commit_pipeline;
 pub mod confidence_gates;
