@@ -164,6 +164,12 @@ Categories:
 - **Invariants**: INV-6 (SSI)
 - **Evidence**: `crates/fsqlite-harness/tests/bd_2d3i_1_ssi_witness_plane_deterministic_scenarios_compliance.rs`
 
+### E2E-CNC-006: Pointer swizzle protocol pilot (tagged CAS transitions)
+- **Description**: Validate deterministic swizzle/unswizzle CAS transitions and HOT/COOLING/COLD state contract for B-tree child references.
+- **Pass criteria**: Swizzle prototype tests pass, structured log schema fields validate, replay command reproduces run.
+- **Invariants**: INV-C2 (No Deadlock), swizzle protocol design invariants in `docs/design/pointer-swizzle-protocol.md`
+- **Evidence**: `e2e/bd_2uza4_1_swizzle_protocol_pilot.sh`, `crates/fsqlite-btree/src/swizzle.rs` tests
+
 ---
 
 ## Recovery Scenarios

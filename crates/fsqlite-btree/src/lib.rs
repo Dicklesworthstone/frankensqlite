@@ -7,6 +7,7 @@ pub mod freelist;
 pub mod instrumentation;
 pub mod overflow;
 pub mod payload;
+pub mod swizzle;
 pub mod traits;
 
 pub use cell::{
@@ -19,6 +20,7 @@ pub use instrumentation::{
     BtreeMetricsSnapshot, BtreeOpType, BtreeOperationTotals, btree_metrics_snapshot,
     reset_btree_metrics,
 };
+pub use swizzle::{PageTemperature, SwizzleError, SwizzlePtr, SwizzleState};
 pub use traits::{BtreeCursorOps, MockBtreeCursor, SeekResult};
 
 /// Compare two B-tree keys stored as contiguous byte slices.
