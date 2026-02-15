@@ -19,12 +19,15 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::path::Path;
 
 use crate::e2e_traceability::{self, TraceabilityMatrix};
 use crate::parity_taxonomy::FeatureCategory;
 
 #[allow(dead_code)]
 const BEAD_ID: &str = "bd-1dp9.7.2";
+const SHELL_SCRIPT_CONFORMANCE_BEAD_ID: &str = "bd-mblr.5.5";
 
 /// Schema version for the unified E2E log format.
 pub const LOG_SCHEMA_VERSION: &str = "1.0.0";
@@ -501,6 +504,54 @@ pub struct ShellScriptLogProfile {
     pub migration_aliases: Vec<ShellScriptMigrationAlias>,
     pub normative_examples: Vec<ShellScriptNormativeExample>,
     pub replay_instructions: Vec<String>,
+}
+
+/// Severity for shell-script conformance findings.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum ShellScriptConformanceSeverity {
+    /// Non-fatal issue that should be migrated but does not block all gates.
+    Warning,
+    /// Contract-breaking issue that should fail CI.
+    Error,
+}
+
+/// One shell-script conformance finding.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ShellScriptConformanceIssue {
+    /// Workspace-relative script path.
+    pub script_path: String,
+    /// Stable issue code for machine triage.
+    pub issue_code: String,
+    /// Finding severity.
+    pub severity: ShellScriptConformanceSeverity,
+    /// Human-readable details.
+    pub detail: String,
+}
+
+/// Static conformance report for `e2e/*.sh` entrypoints.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ShellScriptConformanceReport {
+    /// Report schema version.
+    pub schema_version: String,
+    /// Owning bead identifier.
+    pub bead_id: String,
+    /// Profile version used for validation.
+    pub profile_version: String,
+    /// Total shell scripts discovered on disk.
+    pub total_shell_scripts: usize,
+    /// Number of scripts explicitly profiled with `log_schema_version=1.0.0`.
+    pub profiled_shell_scripts: usize,
+    /// Number of profiled scripts that passed all marker checks.
+    pub compliant_profiled_scripts: usize,
+    /// Number of warning findings.
+    pub warning_count: usize,
+    /// Number of error findings.
+    pub error_count: usize,
+    /// Ordered findings.
+    pub issues: Vec<ShellScriptConformanceIssue>,
+    /// Fail-closed verdict (`false` when any error is present).
+    pub overall_pass: bool,
 }
 
 /// Build the canonical shell-script logging profile for E2E scripts.

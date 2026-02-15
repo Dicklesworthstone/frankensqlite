@@ -399,7 +399,26 @@ pub fn build_canonical_inventory() -> TraceabilityMatrix {
         .storage(&[StorageMode::InMemory, StorageMode::FileBacked])
         .concurrency(&[ConcurrencyMode::Sequential])
         .artifacts(&["test-results/bd_2ddl_compliance_report.jsonl"])
+        .log_schema("1.0.0")
         .timeout(900)
+        .build(),
+    );
+
+    scripts.push(
+        ScriptEntryBuilder::new(
+            "e2e/bd_2uza4_1_swizzle_protocol_pilot.sh",
+            ScriptKind::ShellE2e,
+            "Cache-line swizzle protocol pilot with structured telemetry",
+        )
+        .bead("bd-2uza4.1")
+        .command("bash e2e/bd_2uza4_1_swizzle_protocol_pilot.sh --json")
+        .json_output()
+        .scenarios(&["CON-6"])
+        .storage(&[StorageMode::InMemory])
+        .concurrency(&[ConcurrencyMode::Sequential])
+        .artifacts(&["artifacts/swizzle_protocol_pilot/"])
+        .log_schema("1.0.0")
+        .timeout(300)
         .build(),
     );
 
@@ -447,6 +466,7 @@ pub fn build_canonical_inventory() -> TraceabilityMatrix {
         .scenarios(&["ARCH-1"])
         .storage(&[StorageMode::InMemory, StorageMode::FileBacked])
         .concurrency(&[ConcurrencyMode::Sequential])
+        .log_schema("1.0.0")
         .timeout(300)
         .build(),
     );
@@ -493,6 +513,7 @@ pub fn build_canonical_inventory() -> TraceabilityMatrix {
         .storage(&[StorageMode::InMemory, StorageMode::FileBacked])
         .concurrency(&[ConcurrencyMode::Sequential])
         .artifacts(&["test-results/bd_1dp9_5_2/"])
+        .log_schema("1.0.0")
         .timeout(1200)
         .build(),
     );
@@ -510,6 +531,7 @@ pub fn build_canonical_inventory() -> TraceabilityMatrix {
         .storage(&[StorageMode::InMemory, StorageMode::FileBacked])
         .concurrency(&[ConcurrencyMode::Sequential])
         .artifacts(&["test-results/bd_1dp9_5_4/"])
+        .log_schema("1.0.0")
         .timeout(1800)
         .build(),
     );
@@ -530,6 +552,24 @@ pub fn build_canonical_inventory() -> TraceabilityMatrix {
 
     scripts.push(
         ScriptEntryBuilder::new(
+            "e2e/bd_1dp9_9_1_execution_waves_report.sh",
+            ScriptKind::ShellE2e,
+            "Dependency-aware execution waves and staffing-lane report",
+        )
+        .bead("bd-1dp9.9.1")
+        .command("bash e2e/bd_1dp9_9_1_execution_waves_report.sh --json")
+        .json_output()
+        .scenarios(&["PLAN-1", "INFRA-6"])
+        .storage(&[StorageMode::InMemory])
+        .concurrency(&[ConcurrencyMode::Sequential])
+        .artifacts(&["test-results/bd_1dp9_9_1/"])
+        .log_schema("1.0.0")
+        .timeout(900)
+        .build(),
+    );
+
+    scripts.push(
+        ScriptEntryBuilder::new(
             "e2e/realdb_integrity_check.sh",
             ScriptKind::ShellE2e,
             "Real database format integrity verification",
@@ -538,6 +578,7 @@ pub fn build_canonical_inventory() -> TraceabilityMatrix {
         .scenarios(&["COMPAT-1", "COMPAT-2"])
         .storage(&[StorageMode::FileBacked])
         .concurrency(&[ConcurrencyMode::Sequential])
+        .log_schema("1.0.0")
         .timeout(300)
         .build(),
     );

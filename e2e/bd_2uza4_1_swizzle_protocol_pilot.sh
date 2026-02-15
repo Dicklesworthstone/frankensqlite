@@ -2,7 +2,7 @@
 set -euo pipefail
 
 BEAD_ID="bd-2uza4.1"
-SCENARIO_ID="E2E-CNC-006"
+SCENARIO_ID="CON-6"
 SEED=2026021501
 WORKSPACE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPORT_ROOT="${WORKSPACE_ROOT}/artifacts/swizzle_protocol_pilot"
@@ -10,7 +10,7 @@ RUN_ID="${BEAD_ID}-$(date -u +%Y%m%dT%H%M%SZ)-$$"
 TRACE_ID="${RUN_ID}"
 REPORT_JSONL="${REPORT_ROOT}/${RUN_ID}.jsonl"
 LOG_PATH="${REPORT_ROOT}/${RUN_ID}.log"
-LOG_SCHEMA_REF="docs/e2e_log_schema_contract.md"
+LOG_STANDARD_REF="bd-1fpm"
 JSON_OUTPUT=false
 
 if [[ "${1:-}" == "--json" ]]; then
@@ -47,7 +47,7 @@ emit_event() {
         --arg log_path "${LOG_PATH}" \
         --arg log_sha256 "${log_sha256}" \
         --argjson seed "${SEED}" \
-        --arg schema_ref "${LOG_SCHEMA_REF}" \
+        --arg log_standard_ref "${LOG_STANDARD_REF}" \
         '{
             trace_id: $trace_id,
             run_id: $run_id,
@@ -67,12 +67,12 @@ emit_event() {
             seed: $seed,
             artifact_paths: [$log_path],
             log_sha256: $log_sha256,
-            schema_ref: $schema_ref
+            log_standard_ref: $log_standard_ref
         }' >>"${REPORT_JSONL}"
 }
 
 printf 'bead_id=%s level=INFO run_id=%s trace_id=%s scenario_id=%s phase=start seed=%s reference=%s\n' \
-    "${BEAD_ID}" "${RUN_ID}" "${TRACE_ID}" "${SCENARIO_ID}" "${SEED}" "${LOG_SCHEMA_REF}"
+    "${BEAD_ID}" "${RUN_ID}" "${TRACE_ID}" "${SCENARIO_ID}" "${SEED}" "${LOG_STANDARD_REF}"
 
 start_ns="$(date +%s%N)"
 set +e
