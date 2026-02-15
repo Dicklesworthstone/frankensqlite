@@ -103,5 +103,11 @@ flamegraph*.svg
 # Codex build artifacts
 target-codex*/
 
+# Ephemeral agent scratch files
+bead_comment.md
+new_version
+old_version
+visible
+
 # Beads history snapshots
 .beads/.br_history/
