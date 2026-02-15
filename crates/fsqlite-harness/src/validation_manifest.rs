@@ -509,13 +509,8 @@ pub fn build_validation_manifest_bundle(
 
     normalize_gate_records(&mut gate_records);
 
-    let preliminary_overall_outcome = aggregate_outcome(
-        gate_records
-            .iter()
-            .map(|gate| gate.outcome)
-            .collect::<Vec<_>>()
-            .as_slice(),
-    );
+    let preliminary_overall_outcome =
+        aggregate_outcome_from_iter(gate_records.iter().map(|gate| gate.outcome));
 
     let log_events = build_manifest_log_events(
         config,
@@ -535,6 +530,7 @@ pub fn build_validation_manifest_bundle(
     let log_validation = validate_event_stream(&log_events);
     let shell_profile = e2e_log_schema::build_shell_script_log_profile();
     let profile_errors = e2e_log_schema::validate_shell_script_log_profile(&shell_profile);
+    let logging_pass = profile_errors.is_empty() && log_validation.passed;
 
     let logging_conformance = LoggingConformanceStatus {
         schema_version: VALIDATION_MANIFEST_SCHEMA_VERSION.to_owned(),
@@ -543,8 +539,7 @@ pub fn build_validation_manifest_bundle(
         profile_version: shell_profile.profile_version,
         profile_errors,
         log_validation,
-        overall_pass: shell_profile_valid(&e2e_log_schema::build_shell_script_log_profile())
-            && validate_event_stream(&log_events).passed,
+        overall_pass: logging_pass,
     };
     gate_artifacts.insert(
         logging_uri.clone(),
@@ -569,13 +564,7 @@ pub fn build_validation_manifest_bundle(
     });
     normalize_gate_records(&mut gate_records);
 
-    let overall_outcome = aggregate_outcome(
-        gate_records
-            .iter()
-            .map(|gate| gate.outcome)
-            .collect::<Vec<_>>()
-            .as_slice(),
-    );
+    let overall_outcome = aggregate_outcome_from_iter(gate_records.iter().map(|gate| gate.outcome));
     let overall_pass = overall_outcome != GateOutcome::Fail;
 
     let root_seed = config.root_seed.unwrap_or(424_242);
@@ -665,10 +654,6 @@ fn logging_outcome(status: &LoggingConformanceStatus) -> GateOutcome {
     }
 }
 
-fn shell_profile_valid(profile: &e2e_log_schema::ShellScriptLogProfile) -> bool {
-    e2e_log_schema::validate_shell_script_log_profile(profile).is_empty()
-}
-
 fn build_manifest_summary(manifest: &ValidationManifest) -> String {
     format!(
         "Validation manifest {}: outcome={} gates={} artifacts={} commit_sha={}",
@@ -721,6 +706,26 @@ fn aggregate_outcome(outcomes: &[GateOutcome]) -> GateOutcome {
     if outcomes.contains(&GateOutcome::Fail) {
         GateOutcome::Fail
     } else if outcomes.contains(&GateOutcome::PassWithWarnings) {
+        GateOutcome::PassWithWarnings
+    } else {
+        GateOutcome::Pass
+    }
+}
+
+fn aggregate_outcome_from_iter<I>(outcomes: I) -> GateOutcome
+where
+    I: Iterator<Item = GateOutcome>,
+{
+    let mut saw_warning = false;
+    for outcome in outcomes {
+        if outcome == GateOutcome::Fail {
+            return GateOutcome::Fail;
+        }
+        if outcome == GateOutcome::PassWithWarnings {
+            saw_warning = true;
+        }
+    }
+    if saw_warning {
         GateOutcome::PassWithWarnings
     } else {
         GateOutcome::Pass
