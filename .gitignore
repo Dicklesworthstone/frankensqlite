@@ -111,3 +111,8 @@ visible
 
 # Beads history snapshots
 .beads/.br_history/
+
+# Ephemeral files (agent-generated, build artifacts, test detritus)
+ci-artifacts/
+proptest-regressions/
+test_meminfo
