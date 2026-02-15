@@ -24,6 +24,7 @@ pub mod e2e_orchestrator;
 pub mod e2e_traceability;
 pub mod eprocess;
 pub mod evidence_index;
+pub mod execution_waves;
 pub mod extension_parity_matrix;
 pub mod failure_bundle;
 pub mod fault_profiles;

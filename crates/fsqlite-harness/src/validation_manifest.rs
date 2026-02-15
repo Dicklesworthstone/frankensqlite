@@ -676,7 +676,7 @@ fn unique_sorted_strings(mut values: Vec<String>) -> Vec<String> {
 }
 
 fn normalize_gate_records(gates: &mut Vec<GateRecord>) {
-    for gate in gates {
+    for gate in gates.iter_mut() {
         gate.artifact_uris = unique_sorted_strings(std::mem::take(&mut gate.artifact_uris));
     }
     gates.sort_by(|left, right| left.gate_id.cmp(&right.gate_id));
@@ -961,7 +961,7 @@ pub fn evaluate_invariant_drift_status() -> InvariantDriftStatus {
     InvariantDriftStatus {
         schema_version: VALIDATION_MANIFEST_SCHEMA_VERSION.to_owned(),
         gate_id: INVARIANT_DRIFT_GATE_ID.to_owned(),
-        unit_matrix_schema_version: matrix.schema_version,
+        unit_matrix_schema_version: matrix.schema_version.clone(),
         evidence_schema_version: evidence_map.schema_version,
         total_matrix_tests: matrix.tests.len(),
         total_matrix_invariants,
