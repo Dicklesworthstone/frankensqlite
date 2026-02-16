@@ -677,6 +677,12 @@ pub struct AutoBisectConfig {
     pub max_steps: u32,
     /// Timeout per bisect step in seconds.
     pub step_timeout_secs: u64,
+    /// Maximum concurrently running bisect jobs across all lanes.
+    pub max_concurrent_runs: u32,
+    /// Maximum concurrently running bisect jobs for a single lane.
+    pub max_concurrent_per_lane: u32,
+    /// Maximum queued bisect jobs waiting for worker capacity.
+    pub max_pending_runs: u32,
     /// Lanes eligible for auto-bisect.
     pub eligible_lanes: Vec<String>,
 }
@@ -689,12 +695,153 @@ impl AutoBisectConfig {
             enabled: true,
             max_steps: 20,
             step_timeout_secs: 300,
+            max_concurrent_runs: 4,
+            max_concurrent_per_lane: 2,
+            max_pending_runs: 16,
             eligible_lanes: CiLane::ALL
                 .iter()
                 .filter(|l| l.supports_retry())
                 .map(|l| l.as_str().to_owned())
                 .collect(),
         }
+    }
+}
+
+/// Runtime queue/concurrency snapshot used when deciding whether a bisect can
+/// be dispatched now or must be deferred.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BisectDispatchContext {
+    /// Number of active bisect runs across all lanes.
+    pub active_runs: u32,
+    /// Number of active bisect runs for the candidate lane.
+    pub active_for_lane: u32,
+    /// Number of queued bisect runs waiting for capacity.
+    pub pending_runs: u32,
+}
+
+impl BisectDispatchContext {
+    /// Empty context: no active or pending jobs.
+    #[must_use]
+    pub const fn idle() -> Self {
+        Self {
+            active_runs: 0,
+            active_for_lane: 0,
+            pending_runs: 0,
+        }
+    }
+}
+
+/// Outcome of evaluating dispatch policy for an auto-bisect trigger.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BisectDispatchStatus {
+    /// Trigger accepted; request may be enqueued.
+    Enqueued,
+    /// Auto-bisect is disabled globally.
+    SkippedDisabled,
+    /// Lane is not eligible for auto-bisect.
+    SkippedIneligibleLane,
+    /// No hard failures detected, so no bisect is needed.
+    SkippedNoRegression,
+    /// Global active bisect cap reached.
+    SkippedGlobalConcurrencyCap,
+    /// Per-lane active bisect cap reached.
+    SkippedLaneConcurrencyCap,
+    /// Pending queue cap reached.
+    SkippedPendingCap,
+}
+
+impl BisectDispatchStatus {
+    /// Whether this status represents an accepted dispatch.
+    #[must_use]
+    pub const fn is_enqueued(self) -> bool {
+        matches!(self, Self::Enqueued)
+    }
+}
+
+/// Detailed dispatch policy decision for operator/CI diagnostics.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BisectDispatchDecision {
+    /// Decision status.
+    pub status: BisectDispatchStatus,
+    /// Trigger chosen when status is `Enqueued`.
+    pub trigger: Option<BisectTrigger>,
+    /// Human-readable policy reason.
+    pub reason: String,
+    /// Queue position if enqueued.
+    pub queue_position: Option<u32>,
+}
+
+/// Evaluate auto-bisect trigger and bounded-concurrency dispatch policy.
+#[must_use]
+pub fn evaluate_bisect_dispatch(
+    lane_result: &FlakeBudgetResult,
+    config: &AutoBisectConfig,
+    context: BisectDispatchContext,
+) -> BisectDispatchDecision {
+    if !config.enabled {
+        return BisectDispatchDecision {
+            status: BisectDispatchStatus::SkippedDisabled,
+            trigger: None,
+            reason: "auto-bisect disabled".to_owned(),
+            queue_position: None,
+        };
+    }
+    if !config.eligible_lanes.contains(&lane_result.lane) {
+        return BisectDispatchDecision {
+            status: BisectDispatchStatus::SkippedIneligibleLane,
+            trigger: None,
+            reason: format!("lane '{}' is not auto-bisect eligible", lane_result.lane),
+            queue_position: None,
+        };
+    }
+    if lane_result.fail_count == 0 {
+        return BisectDispatchDecision {
+            status: BisectDispatchStatus::SkippedNoRegression,
+            trigger: None,
+            reason: "no hard failures observed".to_owned(),
+            queue_position: None,
+        };
+    }
+    if context.active_runs >= config.max_concurrent_runs {
+        return BisectDispatchDecision {
+            status: BisectDispatchStatus::SkippedGlobalConcurrencyCap,
+            trigger: None,
+            reason: format!(
+                "global bisect concurrency cap reached: active={} cap={}",
+                context.active_runs, config.max_concurrent_runs
+            ),
+            queue_position: None,
+        };
+    }
+    if context.active_for_lane >= config.max_concurrent_per_lane {
+        return BisectDispatchDecision {
+            status: BisectDispatchStatus::SkippedLaneConcurrencyCap,
+            trigger: None,
+            reason: format!(
+                "lane bisect concurrency cap reached: lane_active={} lane_cap={}",
+                context.active_for_lane, config.max_concurrent_per_lane
+            ),
+            queue_position: None,
+        };
+    }
+    if context.pending_runs >= config.max_pending_runs {
+        return BisectDispatchDecision {
+            status: BisectDispatchStatus::SkippedPendingCap,
+            trigger: None,
+            reason: format!(
+                "pending bisect queue cap reached: pending={} cap={}",
+                context.pending_runs, config.max_pending_runs
+            ),
+            queue_position: None,
+        };
+    }
+
+    BisectDispatchDecision {
+        status: BisectDispatchStatus::Enqueued,
+        trigger: Some(BisectTrigger::GateRegression),
+        reason: "regression accepted for auto-bisect dispatch".to_owned(),
+        queue_position: Some(context.pending_runs.saturating_add(1)),
     }
 }
 
@@ -738,17 +885,169 @@ pub fn should_trigger_bisect(
     lane_result: &FlakeBudgetResult,
     config: &AutoBisectConfig,
 ) -> Option<BisectTrigger> {
-    if !config.enabled {
-        return None;
+    let decision = evaluate_bisect_dispatch(lane_result, config, BisectDispatchContext::idle());
+    if decision.status.is_enqueued() {
+        decision.trigger
+    } else {
+        None
     }
-    if !config.eligible_lanes.contains(&lane_result.lane) {
-        return None;
+}
+
+/// Operator-visible outcome from running an automated bisect.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BisectExecutionOutcome {
+    /// Run completed with a likely culprit range.
+    Success,
+    /// Run ended with uncertain verdict (e.g., flakiness).
+    Uncertain,
+    /// Run cancelled by operator action.
+    Cancelled,
+    /// Run exceeded configured timeout budget.
+    Timeout,
+}
+
+/// Structured telemetry for a bisect run summary.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BisectRunTelemetry {
+    /// Correlation identifiers required by logging contract.
+    pub trace_id: String,
+    pub run_id: String,
+    pub scenario_id: String,
+    /// Queue and execution timing.
+    pub queue_wait_ms: u64,
+    pub execution_ms: u64,
+    /// Number of bisect candidate steps attempted.
+    pub step_count: u32,
+}
+
+/// Operator/CI summary for a completed/terminated bisect run.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BisectResultSummary {
+    /// Schema version for summary payload.
+    pub schema_version: String,
+    /// Request correlation.
+    pub request_id: String,
+    pub lane: String,
+    /// Terminal run outcome.
+    pub outcome: BisectExecutionOutcome,
+    /// Likely culprit commit range (inclusive lower, inclusive upper).
+    pub likely_culprit_start: String,
+    pub likely_culprit_end: String,
+    /// Confidence in the inferred culprit range [0.0, 1.0].
+    pub confidence: f64,
+    /// Linked replay artifacts useful for debugging.
+    pub replay_artifacts: Vec<String>,
+    /// Actionable operator context lines.
+    pub actionable_context: Vec<String>,
+    /// Structured telemetry contract.
+    pub telemetry: BisectRunTelemetry,
+}
+
+impl BisectResultSummary {
+    /// Validate summary completeness and schema constraints.
+    #[must_use]
+    pub fn validate(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        if self.schema_version.is_empty() {
+            errors.push("summary.schema_version is empty".to_owned());
+        }
+        if self.request_id.is_empty() {
+            errors.push("summary.request_id is empty".to_owned());
+        }
+        if self.lane.is_empty() {
+            errors.push("summary.lane is empty".to_owned());
+        }
+        if self.likely_culprit_start.is_empty() {
+            errors.push("summary.likely_culprit_start is empty".to_owned());
+        }
+        if self.likely_culprit_end.is_empty() {
+            errors.push("summary.likely_culprit_end is empty".to_owned());
+        }
+        if !(0.0..=1.0).contains(&self.confidence) {
+            errors.push(format!(
+                "summary.confidence must be within [0,1], got {}",
+                self.confidence
+            ));
+        }
+        if self.telemetry.trace_id.is_empty() {
+            errors.push("summary.telemetry.trace_id is empty".to_owned());
+        }
+        if self.telemetry.run_id.is_empty() {
+            errors.push("summary.telemetry.run_id is empty".to_owned());
+        }
+        if self.telemetry.scenario_id.is_empty() {
+            errors.push("summary.telemetry.scenario_id is empty".to_owned());
+        }
+        if self.replay_artifacts.is_empty() {
+            errors.push("summary.replay_artifacts is empty".to_owned());
+        }
+        errors
     }
-    // Trigger on consistent failures (not flakes)
-    if lane_result.fail_count > 0 {
-        return Some(BisectTrigger::GateRegression);
+
+    /// Render operator-facing one-page summary.
+    #[must_use]
+    pub fn render_summary(&self) -> String {
+        let mut out = String::new();
+        let _ = writeln!(
+            out,
+            "Bisect Result: lane={} request={} outcome={:?}",
+            self.lane, self.request_id, self.outcome
+        );
+        let _ = writeln!(
+            out,
+            "  Culprit range: {}..{} | confidence={:.2}",
+            self.likely_culprit_start, self.likely_culprit_end, self.confidence
+        );
+        let _ = writeln!(
+            out,
+            "  trace_id={} run_id={} scenario_id={} queue_wait_ms={} execution_ms={} steps={}",
+            self.telemetry.trace_id,
+            self.telemetry.run_id,
+            self.telemetry.scenario_id,
+            self.telemetry.queue_wait_ms,
+            self.telemetry.execution_ms,
+            self.telemetry.step_count,
+        );
+        if !self.replay_artifacts.is_empty() {
+            let _ = writeln!(
+                out,
+                "  Replay artifacts: {}",
+                self.replay_artifacts.join(", ")
+            );
+        }
+        for line in &self.actionable_context {
+            let _ = writeln!(out, "  Context: {line}");
+        }
+        out
     }
-    None
+}
+
+/// Build a structured bisect result summary.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn build_bisect_result_summary(
+    request: &BisectRequest,
+    outcome: BisectExecutionOutcome,
+    likely_culprit_start: &str,
+    likely_culprit_end: &str,
+    confidence: f64,
+    replay_artifacts: Vec<String>,
+    telemetry: BisectRunTelemetry,
+    actionable_context: Vec<String>,
+) -> BisectResultSummary {
+    BisectResultSummary {
+        schema_version: "1.0.0".to_owned(),
+        request_id: request.request_id.clone(),
+        lane: request.lane.clone(),
+        outcome,
+        likely_culprit_start: likely_culprit_start.to_owned(),
+        likely_culprit_end: likely_culprit_end.to_owned(),
+        confidence,
+        replay_artifacts,
+        actionable_context,
+        telemetry,
+    }
 }
 
 // ---- Artifact Publication ----
@@ -800,12 +1099,22 @@ pub struct ArtifactManifest {
     pub gate_passed: bool,
     /// Bisect request if regression detected.
     pub bisect_request: Option<BisectRequest>,
+    /// Optional terminal bisect result summary for operator/CI publication.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bisect_result_summary: Option<BisectResultSummary>,
     /// Verification contract enforcement payload (bd-1dp9.7.7).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verification_contract: Option<ContractEnforcementOutcome>,
 }
 
 impl ArtifactManifest {
+    /// Attach a bisect result summary to this artifact manifest.
+    #[must_use]
+    pub fn with_bisect_result_summary(mut self, summary: BisectResultSummary) -> Self {
+        self.bisect_result_summary = Some(summary);
+        self
+    }
+
     /// Validate the manifest for completeness.
     #[must_use]
     pub fn validate(&self) -> Vec<String> {
@@ -836,6 +1145,11 @@ impl ArtifactManifest {
                     "verification_contract.final_gate_passed={} must match gate_passed={}",
                     contract.final_gate_passed, self.gate_passed
                 ));
+            }
+        }
+        if let Some(summary) = &self.bisect_result_summary {
+            for error in summary.validate() {
+                errors.push(format!("bisect_result_summary.{error}"));
             }
         }
         errors
@@ -871,6 +1185,31 @@ impl ArtifactManifest {
                 "  Bisect requested: {} -> {} ({})",
                 bisect.good_commit, bisect.bad_commit, bisect.description,
             );
+        }
+        if let Some(ref summary) = self.bisect_result_summary {
+            let _ = writeln!(
+                out,
+                "  Bisect result: outcome={:?} range={}..{} confidence={:.2}",
+                summary.outcome,
+                summary.likely_culprit_start,
+                summary.likely_culprit_end,
+                summary.confidence,
+            );
+            let _ = writeln!(
+                out,
+                "    trace_id={} run_id={} scenario_id={} execution_ms={}",
+                summary.telemetry.trace_id,
+                summary.telemetry.run_id,
+                summary.telemetry.scenario_id,
+                summary.telemetry.execution_ms,
+            );
+            if !summary.replay_artifacts.is_empty() {
+                let _ = writeln!(
+                    out,
+                    "    replay_artifacts={}",
+                    summary.replay_artifacts.join(", "),
+                );
+            }
         }
         if let Some(ref contract) = self.verification_contract {
             let _ = writeln!(
@@ -947,6 +1286,7 @@ pub fn build_artifact_manifest_with_contract(
         artifacts,
         gate_passed,
         bisect_request,
+        bisect_result_summary: None,
         verification_contract,
     }
 }
@@ -1301,6 +1641,75 @@ mod tests {
     }
 
     #[test]
+    fn bisect_dispatch_enqueued_when_capacity_available() {
+        let config = AutoBisectConfig::default_config();
+        let lane_result = FlakeBudgetResult {
+            lane: "unit".to_owned(),
+            total_tests: 10,
+            pass_count: 9,
+            fail_count: 1,
+            flake_count: 0,
+            skip_count: 0,
+            flake_rate: 0.0,
+            budget_max_flake_rate: 0.05,
+            escalation_warn_flake_rate: 0.03,
+            escalation_critical_flake_rate: 0.08,
+            escalation_level: FlakeEscalationLevel::None,
+            within_budget: true,
+            blocking: true,
+            pipeline_fail: true,
+        };
+        let decision = evaluate_bisect_dispatch(
+            &lane_result,
+            &config,
+            BisectDispatchContext {
+                active_runs: 1,
+                active_for_lane: 0,
+                pending_runs: 2,
+            },
+        );
+        assert_eq!(decision.status, BisectDispatchStatus::Enqueued);
+        assert_eq!(decision.trigger, Some(BisectTrigger::GateRegression));
+        assert_eq!(decision.queue_position, Some(3));
+    }
+
+    #[test]
+    fn bisect_dispatch_skips_on_global_capacity_cap() {
+        let mut config = AutoBisectConfig::default_config();
+        config.max_concurrent_runs = 1;
+        let lane_result = FlakeBudgetResult {
+            lane: "unit".to_owned(),
+            total_tests: 10,
+            pass_count: 9,
+            fail_count: 1,
+            flake_count: 0,
+            skip_count: 0,
+            flake_rate: 0.0,
+            budget_max_flake_rate: 0.05,
+            escalation_warn_flake_rate: 0.03,
+            escalation_critical_flake_rate: 0.08,
+            escalation_level: FlakeEscalationLevel::None,
+            within_budget: true,
+            blocking: true,
+            pipeline_fail: true,
+        };
+        let decision = evaluate_bisect_dispatch(
+            &lane_result,
+            &config,
+            BisectDispatchContext {
+                active_runs: 1,
+                active_for_lane: 0,
+                pending_runs: 0,
+            },
+        );
+        assert_eq!(
+            decision.status,
+            BisectDispatchStatus::SkippedGlobalConcurrencyCap
+        );
+        assert!(decision.trigger.is_none());
+    }
+
+    #[test]
     fn no_bisect_when_disabled() {
         let mut config = AutoBisectConfig::default_config();
         config.enabled = false;
@@ -1403,6 +1812,46 @@ mod tests {
         assert_eq!(deserialized, request);
     }
 
+    #[test]
+    fn bisect_result_summary_validate_and_render() {
+        let request = build_bisect_request(
+            BisectTrigger::GateRegression,
+            CiLane::E2eCorrectness,
+            "scenario_17",
+            "good-sha",
+            "bad-sha",
+            77,
+            "cargo test -p fsqlite-harness -- scenario_17",
+            "synthetic regression",
+        );
+        let summary = build_bisect_result_summary(
+            &request,
+            BisectExecutionOutcome::Success,
+            "good-sha",
+            "bad-sha",
+            0.92,
+            vec![
+                "artifacts/bisect/report.json".to_owned(),
+                "artifacts/bisect/replay.jsonl".to_owned(),
+            ],
+            BisectRunTelemetry {
+                trace_id: "trace-123".to_owned(),
+                run_id: "run-123".to_owned(),
+                scenario_id: "scenario_17".to_owned(),
+                queue_wait_ms: 15,
+                execution_ms: 1820,
+                step_count: 4,
+            },
+            vec!["first failing midpoint was bad-sha".to_owned()],
+        );
+        let errors = summary.validate();
+        assert!(errors.is_empty(), "summary should validate: {errors:?}");
+        let rendered = summary.render_summary();
+        assert!(rendered.contains("confidence=0.92"));
+        assert!(rendered.contains("trace_id=trace-123"));
+        assert!(rendered.contains("replay.jsonl"));
+    }
+
     // ---- Artifact Manifest Tests ----
 
     #[test]
@@ -1445,6 +1894,7 @@ mod tests {
             }],
             gate_passed: false,
             bisect_request: None,
+            bisect_result_summary: None,
             verification_contract: None,
         };
         let errors = manifest.validate();

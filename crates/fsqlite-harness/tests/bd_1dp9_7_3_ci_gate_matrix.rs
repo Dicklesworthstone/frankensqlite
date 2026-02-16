@@ -4,15 +4,35 @@
 //! trigger auto-bisect → publish artifact manifests → verify deterministic output.
 
 use fsqlite_harness::ci_gate_matrix::{
-    ArtifactEntry, ArtifactKind, AutoBisectConfig, BisectTrigger, CiLane, FlakeBudgetPolicy,
+    ArtifactEntry, ArtifactKind, AutoBisectConfig, BisectDispatchContext, BisectDispatchStatus,
+    BisectExecutionOutcome, BisectRunTelemetry, BisectTrigger, CiLane, FlakeBudgetPolicy,
     QuarantinePolicy, QuarantineTicket, RetryFailureClass, RetryPolicy, TestOutcome,
-    build_artifact_manifest, build_bisect_request, evaluate_flake_budget,
-    evaluate_global_flake_budget, evaluate_quarantine_ticket, evaluate_retry_decision,
-    should_trigger_bisect,
+    build_artifact_manifest, build_bisect_request, build_bisect_result_summary,
+    evaluate_bisect_dispatch, evaluate_flake_budget, evaluate_global_flake_budget,
+    evaluate_quarantine_ticket, evaluate_retry_decision, should_trigger_bisect,
 };
 
 const BEAD_ID: &str = "bd-1dp9.7.3";
 const SEED: u64 = 20260213;
+
+fn build_regression_lane_result() -> fsqlite_harness::ci_gate_matrix::FlakeBudgetResult {
+    fsqlite_harness::ci_gate_matrix::FlakeBudgetResult {
+        lane: CiLane::E2eCorrectness.as_str().to_owned(),
+        total_tests: 64,
+        pass_count: 63,
+        fail_count: 1,
+        flake_count: 0,
+        skip_count: 0,
+        flake_rate: 0.0,
+        budget_max_flake_rate: 0.05,
+        escalation_warn_flake_rate: 0.03,
+        escalation_critical_flake_rate: 0.08,
+        escalation_level: fsqlite_harness::ci_gate_matrix::FlakeEscalationLevel::None,
+        within_budget: true,
+        blocking: true,
+        pipeline_fail: true,
+    }
+}
 
 #[test]
 fn e2e_full_pipeline_pass_all_lanes() {
@@ -150,6 +170,191 @@ fn e2e_full_pipeline_regression_triggers_bisect() {
          run_id={BEAD_ID}-regression-{SEED} seed={SEED} \
          trigger=GateRegression result=PASS",
     );
+}
+
+#[test]
+fn e2e_auto_bisect_operator_success_path() {
+    let config = AutoBisectConfig::default_config();
+    let lane_result = build_regression_lane_result();
+    let dispatch = evaluate_bisect_dispatch(
+        &lane_result,
+        &config,
+        BisectDispatchContext {
+            active_runs: 1,
+            active_for_lane: 0,
+            pending_runs: 1,
+        },
+    );
+    assert_eq!(dispatch.status, BisectDispatchStatus::Enqueued);
+    assert_eq!(dispatch.trigger, Some(BisectTrigger::GateRegression));
+
+    let request = build_bisect_request(
+        BisectTrigger::GateRegression,
+        CiLane::E2eCorrectness,
+        "scenario_success",
+        "good001",
+        "bad001",
+        SEED,
+        "cargo test -p fsqlite-harness -- scenario_success",
+        "synthetic success path",
+    );
+    let summary = build_bisect_result_summary(
+        &request,
+        BisectExecutionOutcome::Success,
+        "good001",
+        "bad001",
+        0.91,
+        vec![
+            "artifacts/bisect/success/report.json".to_owned(),
+            "artifacts/bisect/success/replay.jsonl".to_owned(),
+        ],
+        BisectRunTelemetry {
+            trace_id: "trace-success".to_owned(),
+            run_id: "run-success".to_owned(),
+            scenario_id: "scenario_success".to_owned(),
+            queue_wait_ms: 11,
+            execution_ms: 1380,
+            step_count: 5,
+        },
+        vec!["first bad commit isolated by deterministic midpoint search".to_owned()],
+    );
+    assert!(summary.validate().is_empty());
+    let manifest = build_artifact_manifest(
+        CiLane::E2eCorrectness,
+        &format!("{BEAD_ID}-success-{SEED}"),
+        "bad001",
+        SEED,
+        false,
+        vec![ArtifactEntry {
+            kind: ArtifactKind::Report,
+            path: "artifacts/bisect/success/report.json".to_owned(),
+            content_hash: "e".repeat(64),
+            size_bytes: 2048,
+            description: "Bisect success report".to_owned(),
+        }],
+        Some(request),
+    )
+    .with_bisect_result_summary(summary.clone());
+    let errors = manifest.validate();
+    assert!(
+        errors.is_empty(),
+        "success manifest should validate: {errors:?}"
+    );
+    let rendered = manifest.render_summary();
+    assert!(rendered.contains("Bisect result"));
+    assert!(rendered.contains("confidence=0.91"));
+    assert!(rendered.contains("trace-success"));
+    eprintln!(
+        "bead_id={BEAD_ID} phase=report event_type=pass \
+         trace_id={} run_id={} scenario_id={} outcome=success execution_ms={} \
+         replay_artifacts={} result=PASS",
+        summary.telemetry.trace_id,
+        summary.telemetry.run_id,
+        summary.telemetry.scenario_id,
+        summary.telemetry.execution_ms,
+        summary.replay_artifacts.join(","),
+    );
+}
+
+#[test]
+fn e2e_auto_bisect_operator_uncertain_path() {
+    let request = build_bisect_request(
+        BisectTrigger::GateRegression,
+        CiLane::E2eCorrectness,
+        "scenario_uncertain",
+        "good010",
+        "bad010",
+        SEED,
+        "cargo test -p fsqlite-harness -- scenario_uncertain",
+        "synthetic uncertain path",
+    );
+    let summary = build_bisect_result_summary(
+        &request,
+        BisectExecutionOutcome::Uncertain,
+        "good010",
+        "bad010",
+        0.42,
+        vec!["artifacts/bisect/uncertain/replay.jsonl".to_owned()],
+        BisectRunTelemetry {
+            trace_id: "trace-uncertain".to_owned(),
+            run_id: "run-uncertain".to_owned(),
+            scenario_id: "scenario_uncertain".to_owned(),
+            queue_wait_ms: 27,
+            execution_ms: 2001,
+            step_count: 3,
+        },
+        vec!["flaky_conflict: both PASS and FAIL observed across retries".to_owned()],
+    );
+    assert!(summary.validate().is_empty());
+    let rendered = summary.render_summary();
+    assert!(rendered.contains("Uncertain"));
+    assert!(rendered.contains("confidence=0.42"));
+}
+
+#[test]
+fn e2e_auto_bisect_operator_cancellation_path() {
+    let request = build_bisect_request(
+        BisectTrigger::GateRegression,
+        CiLane::E2eRecovery,
+        "scenario_cancel",
+        "good020",
+        "bad020",
+        SEED,
+        "cargo test -p fsqlite-harness -- scenario_cancel",
+        "synthetic cancellation path",
+    );
+    let summary = build_bisect_result_summary(
+        &request,
+        BisectExecutionOutcome::Cancelled,
+        "good020",
+        "bad020",
+        0.10,
+        vec!["artifacts/bisect/cancel/request.json".to_owned()],
+        BisectRunTelemetry {
+            trace_id: "trace-cancel".to_owned(),
+            run_id: "run-cancel".to_owned(),
+            scenario_id: "scenario_cancel".to_owned(),
+            queue_wait_ms: 5,
+            execution_ms: 120,
+            step_count: 1,
+        },
+        vec!["cancelled by operator due to release freeze".to_owned()],
+    );
+    assert!(summary.validate().is_empty());
+    assert!(summary.render_summary().contains("Cancelled"));
+}
+
+#[test]
+fn e2e_auto_bisect_operator_timeout_path() {
+    let request = build_bisect_request(
+        BisectTrigger::GateRegression,
+        CiLane::E2eDifferential,
+        "scenario_timeout",
+        "good030",
+        "bad030",
+        SEED,
+        "cargo test -p fsqlite-harness -- scenario_timeout",
+        "synthetic timeout path",
+    );
+    let summary = build_bisect_result_summary(
+        &request,
+        BisectExecutionOutcome::Timeout,
+        "good030",
+        "bad030",
+        0.25,
+        vec!["artifacts/bisect/timeout/replay.jsonl".to_owned()],
+        BisectRunTelemetry {
+            trace_id: "trace-timeout".to_owned(),
+            run_id: "run-timeout".to_owned(),
+            scenario_id: "scenario_timeout".to_owned(),
+            queue_wait_ms: 9,
+            execution_ms: 30_000,
+            step_count: 2,
+        },
+        vec!["timeout while evaluating midpoint candidate bad030".to_owned()],
+    );
+    assert!(summary.validate().is_empty());
+    assert!(summary.render_summary().contains("Timeout"));
 }
 
 #[test]
