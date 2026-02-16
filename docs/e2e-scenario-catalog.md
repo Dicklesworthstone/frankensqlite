@@ -170,6 +170,12 @@ Categories:
 - **Invariants**: INV-C2 (No Deadlock), swizzle protocol design invariants in `docs/design/pointer-swizzle-protocol.md`
 - **Evidence**: `e2e/bd_2uza4_1_swizzle_protocol_pilot.sh`, `crates/fsqlite-btree/src/swizzle.rs` tests
 
+### E2E-CNC-007: Per-core WAL buffer pilot (`bd-ncivz.1`)
+- **Description**: Validate per-core WAL buffer lane transitions, overflow policy behavior, deterministic fallback latch, and no-contention append path with one writer per core.
+- **Pass criteria**: `bd_ncivz_1_` unit tests pass, pilot JSON report sets `schema_conforms=true`, and replay command reproduces deterministic artifact output.
+- **Invariants**: INV-C3 (Per-core WAL buffer lane safety), INV-C2 (No Deadlock)
+- **Evidence**: `e2e/bd_ncivz_1_parallel_wal_buffer_pilot.sh`, `crates/fsqlite-wal/src/per_core_buffer.rs` tests
+
 ---
 
 ## Recovery Scenarios

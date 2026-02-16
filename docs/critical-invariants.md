@@ -207,6 +207,27 @@ This document catalogs the critical invariants that FrankenSQLite must maintain 
 
 ---
 
+### INV-C3: Per-Core WAL Buffer Lane Safety (`bd-ncivz.1`)
+
+**Definition**: Per-core WAL buffering enforces deterministic double-buffer lane transitions (`Writable -> Sealed -> Flushing -> Writable`) and deterministic fallback when overflow exceeds budget.
+
+**Owner**: `fsqlite-wal::per_core_buffer` (prototype contract for `bd-ncivz.*`)
+
+**Pass Signal**:
+- invalid lane transitions fail closed (no partial mutation)
+- overflow policy is explicit (`BlockWriter` or `AllocateOverflow`)
+- fallback latch deterministically triggers serialized drain on overflow budget breach
+- one-writer-per-core prototype run shows zero lock contention
+
+**Evidence Hooks**:
+- `crates/fsqlite-wal/src/per_core_buffer.rs::bd_ncivz_1_state_machine_double_buffering`
+- `crates/fsqlite-wal/src/per_core_buffer.rs::bd_ncivz_1_overflow_block_writer_policy`
+- `crates/fsqlite-wal/src/per_core_buffer.rs::bd_ncivz_1_overflow_allocate_triggers_deterministic_fallback`
+- `crates/fsqlite-wal/src/per_core_buffer.rs::bd_ncivz_1_per_core_pool_concurrent_writers_no_contention`
+- `docs/design/per-core-wal-buffer-architecture.md`
+
+---
+
 ## Schema Invariants (fsqlite-core)
 
 ### INV-S1: Schema Epoch Consistency

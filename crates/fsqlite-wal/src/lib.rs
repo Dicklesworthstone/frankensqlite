@@ -5,6 +5,8 @@ pub mod checkpoint_executor;
 pub mod checksum;
 pub mod metrics;
 pub mod native_commit;
+#[cfg(test)]
+mod per_core_buffer;
 pub mod recovery_compaction;
 pub mod wal;
 pub mod wal_fec;

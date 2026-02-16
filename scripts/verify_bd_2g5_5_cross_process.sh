@@ -81,9 +81,21 @@ if ! BD_2G5_5_CYCLES="$CYCLES" \
   RESULT="fail"
 fi
 
-REPORT_PATH="$({ rg -o 'path=[^ ]+' "$TEST_LOG" | tail -n1 | sed 's/^path=//'; } || true)"
-EVENTS_PATH="$({ rg -o 'events_path=[^ ]+' "$TEST_LOG" | tail -n1 | sed 's/^events_path=//'; } || true)"
-REPLAY_COMMAND="$({ rg -o 'replay_command=.*' "$TEST_LOG" | tail -n1 | sed 's/^replay_command=//'; } || true)"
+REPORT_PATH="$({
+  rg '^bead_id=bd-2g5\.5\.1 path=' "$TEST_LOG" \
+    | tail -n1 \
+    | sed 's/^bead_id=bd-2g5\.5\.1 path=//'
+} || true)"
+EVENTS_PATH="$({
+  rg '^bead_id=bd-2g5\.5\.1 events_path=' "$TEST_LOG" \
+    | tail -n1 \
+    | sed 's/^bead_id=bd-2g5\.5\.1 events_path=//'
+} || true)"
+REPLAY_COMMAND="$({
+  rg '^bead_id=bd-2g5\.5\.1 replay_command=' "$TEST_LOG" \
+    | tail -n1 \
+    | sed 's/^bead_id=bd-2g5\.5\.1 replay_command=//'
+} || true)"
 
 if [[ -n "$REPORT_PATH" && "$REPORT_PATH" != /* ]]; then
   REPORT_PATH="$REPO_ROOT/$REPORT_PATH"
