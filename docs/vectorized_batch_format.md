@@ -122,6 +122,9 @@ Implemented in `crates/fsqlite-vdbe/src/vectorized_dispatch.rs`.
 Current scope:
 
 - Page-range morsel partitioning: `partition_page_morsels(start, end, pages_per_morsel, numa_nodes)`
+- L2-aware auto-tuning helper:
+  - `auto_tuned_pages_per_morsel(l2_cache_bytes, page_size_bytes)`
+  - `partition_page_morsels_auto_tuned(...)`
 - Pipeline task model:
   - `PipelineId`
   - `PipelineKind`
@@ -133,6 +136,13 @@ Current scope:
   - NUMA locality hints via `preferred_numa_node` assignment
 - Pipeline barriers:
   - `execute_with_barriers(...)` runs pipeline wave `i` to completion before wave `i+1`
+- Structured observability:
+  - per-morsel span: `morsel_exec` with fields `morsel_size`, `worker_id`, `pipeline_id`, `task_id`
+  - scheduling logs at `DEBUG` (`morsel.schedule`, `morsel.execute.start`, `morsel.execute.complete`)
+  - pipeline completion logs at `INFO` (`morsel.pipeline.complete`)
+  - gauges:
+    - `fsqlite_morsel_throughput_rows_per_sec` (task-throughput proxy until row counters are threaded through operators)
+    - `fsqlite_morsel_workers_active`
 
 Validation:
 

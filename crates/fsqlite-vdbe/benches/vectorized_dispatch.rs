@@ -1,8 +1,8 @@
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use fsqlite_types::PageNumber;
 use fsqlite_vdbe::vectorized_dispatch::{
-    DispatcherConfig, PipelineId, PipelineKind, WorkStealingDispatcher, build_pipeline_tasks,
-    partition_page_morsels,
+    DEFAULT_L2_CACHE_BYTES, DEFAULT_PAGE_SIZE_BYTES, DispatcherConfig, PipelineId, PipelineKind,
+    WorkStealingDispatcher, build_pipeline_tasks, partition_page_morsels_auto_tuned,
 };
 
 fn synthetic_task_cost(task_id: usize, worker_id: usize) -> u64 {
@@ -19,8 +19,14 @@ fn synthetic_task_cost(task_id: usize, worker_id: usize) -> u64 {
 fn bench_dispatcher_scaling(c: &mut Criterion) {
     let start_page = PageNumber::new(1).expect("start page should be non-zero");
     let end_page = PageNumber::new(4_096).expect("end page should be non-zero");
-    let morsels = partition_page_morsels(start_page, end_page, 4, 2)
-        .expect("morsel partitioning should succeed");
+    let morsels = partition_page_morsels_auto_tuned(
+        start_page,
+        end_page,
+        DEFAULT_L2_CACHE_BYTES,
+        DEFAULT_PAGE_SIZE_BYTES,
+        2,
+    )
+    .expect("morsel partitioning should succeed");
     let tasks = build_pipeline_tasks(PipelineId(0), PipelineKind::ScanFilterProject, &morsels);
 
     let mut group = c.benchmark_group("vectorized_dispatch_scaling");

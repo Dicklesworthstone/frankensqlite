@@ -7,8 +7,10 @@
 //! - pipeline barriers between pipeline waves.
 
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Barrier};
 use std::thread;
+use std::time::Instant;
 
 use crossbeam_deque::{Steal, Stealer, Worker};
 use fsqlite_types::PageNumber;
@@ -49,6 +51,46 @@ impl std::error::Error for DispatchError {}
 
 /// Result alias for dispatcher operations.
 pub type DispatchResult<T> = std::result::Result<T, DispatchError>;
+
+/// Fallback L2 cache size used for morsel auto-tuning when host details are unavailable.
+pub const DEFAULT_L2_CACHE_BYTES: usize = 1_048_576;
+/// Default database page size used for morsel auto-tuning.
+pub const DEFAULT_PAGE_SIZE_BYTES: usize = 4_096;
+
+// ── Morsel Dispatch Metrics (bd-1rw.2) ─────────────────────────────────────
+
+/// Rows-per-second gauge for morsel execution throughput.
+///
+/// The current dispatcher tracks task-level throughput and uses that as a
+/// stable proxy until row-level accounting is threaded through operator outputs.
+static FSQLITE_MORSEL_THROUGHPUT_ROWS_PER_SEC: AtomicU64 = AtomicU64::new(0);
+/// Active-workers gauge for the most recent pipeline dispatch.
+static FSQLITE_MORSEL_WORKERS_ACTIVE: AtomicU64 = AtomicU64::new(0);
+
+/// Snapshot of morsel dispatch gauges.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MorselDispatchMetricsSnapshot {
+    /// Gauge: `fsqlite_morsel_throughput_rows_per_sec`.
+    pub fsqlite_morsel_throughput_rows_per_sec: u64,
+    /// Gauge: `fsqlite_morsel_workers_active`.
+    pub fsqlite_morsel_workers_active: u64,
+}
+
+/// Read a point-in-time snapshot of morsel dispatch gauges.
+#[must_use]
+pub fn morsel_dispatch_metrics_snapshot() -> MorselDispatchMetricsSnapshot {
+    MorselDispatchMetricsSnapshot {
+        fsqlite_morsel_throughput_rows_per_sec: FSQLITE_MORSEL_THROUGHPUT_ROWS_PER_SEC
+            .load(AtomicOrdering::Relaxed),
+        fsqlite_morsel_workers_active: FSQLITE_MORSEL_WORKERS_ACTIVE.load(AtomicOrdering::Relaxed),
+    }
+}
+
+/// Reset morsel dispatch gauges (tests/diagnostics).
+pub fn reset_morsel_dispatch_metrics() {
+    FSQLITE_MORSEL_THROUGHPUT_ROWS_PER_SEC.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_MORSEL_WORKERS_ACTIVE.store(0, AtomicOrdering::Relaxed);
+}
 
 /// A contiguous scan morsel plus locality hint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,6 +152,51 @@ pub fn partition_page_morsels(
     }
 
     Ok(out)
+}
+
+/// Compute an L2-aware pages-per-morsel target.
+///
+/// Heuristic: reserve half of L2 for the working morsel and half for operator
+/// state/auxiliary data. This keeps the active morsel cache-resident while
+/// avoiding overfitting to any one operator shape.
+///
+/// # Errors
+///
+/// Returns an error when `l2_cache_bytes == 0` or `page_size_bytes == 0`.
+pub fn auto_tuned_pages_per_morsel(
+    l2_cache_bytes: usize,
+    page_size_bytes: usize,
+) -> DispatchResult<u32> {
+    if l2_cache_bytes == 0 {
+        return Err(DispatchError::InvalidConfig(
+            "l2_cache_bytes must be greater than zero",
+        ));
+    }
+    if page_size_bytes == 0 {
+        return Err(DispatchError::InvalidConfig(
+            "page_size_bytes must be greater than zero",
+        ));
+    }
+    let target_bytes = l2_cache_bytes / 2;
+    let pages = (target_bytes / page_size_bytes).max(1);
+    let pages_u32 = u32::try_from(pages).unwrap_or(u32::MAX);
+    Ok(pages_u32.max(1))
+}
+
+/// Partition a page interval into L2 auto-tuned morsels.
+///
+/// # Errors
+///
+/// Returns an error when auto-tuning inputs are invalid or page bounds are invalid.
+pub fn partition_page_morsels_auto_tuned(
+    start_page: PageNumber,
+    end_page: PageNumber,
+    l2_cache_bytes: usize,
+    page_size_bytes: usize,
+    numa_nodes: usize,
+) -> DispatchResult<Vec<MorselDescriptor>> {
+    let pages_per_morsel = auto_tuned_pages_per_morsel(l2_cache_bytes, page_size_bytes)?;
+    partition_page_morsels(start_page, end_page, pages_per_morsel, numa_nodes)
 }
 
 /// Logical pipeline identifier.
@@ -195,6 +282,12 @@ pub struct WorkStealingDispatcher {
     worker_numa: Vec<usize>,
 }
 
+fn morsel_page_span(morsel: MorselDescriptor) -> u64 {
+    let start = u64::from(morsel.page_range.start_page.get());
+    let end = u64::from(morsel.page_range.end_page.get());
+    end.saturating_sub(start).saturating_add(1)
+}
+
 impl WorkStealingDispatcher {
     /// Create a dispatcher from explicit config.
     ///
@@ -268,6 +361,7 @@ impl WorkStealingDispatcher {
         F: Fn(&PipelineTask, usize) -> R + Send + Sync + 'static,
     {
         let expected_pipeline = tasks[0].pipeline;
+        let pipeline_started = Instant::now();
         for task in tasks {
             if task.pipeline != expected_pipeline {
                 return Err(DispatchError::InvalidTaskSet {
@@ -286,6 +380,16 @@ impl WorkStealingDispatcher {
         let mut next_by_numa = vec![0usize; self.config.numa_nodes];
         for task in tasks.iter().cloned() {
             let target = self.select_worker(task.morsel.preferred_numa_node, &mut next_by_numa);
+            tracing::debug!(
+                pipeline_id = expected_pipeline.0,
+                task_id = task.task_id,
+                target_worker = target,
+                preferred_numa_node = task.morsel.preferred_numa_node,
+                morsel_start_page = task.morsel.page_range.start_page.get(),
+                morsel_end_page = task.morsel.page_range.end_page.get(),
+                morsel_size = morsel_page_span(task.morsel),
+                "morsel.schedule"
+            );
             workers[target].push(task);
         }
 
@@ -299,29 +403,87 @@ impl WorkStealingDispatcher {
                 start_barrier.wait();
                 let mut completed = Vec::new();
                 let mut count = 0usize;
+                let mut rows_processed = 0u64;
                 while let Some(task) = pop_or_steal(&local_worker, worker_id, &stealers) {
-                    let result = execute(&task, worker_id);
+                    let morsel_size = morsel_page_span(task.morsel);
+                    let span = tracing::info_span!(
+                        "morsel_exec",
+                        morsel_size,
+                        worker_id,
+                        pipeline_id = task.pipeline.0,
+                        task_id = task.task_id
+                    );
+                    let result = {
+                        let _guard = span.enter();
+                        tracing::debug!(
+                            worker_id,
+                            pipeline_id = task.pipeline.0,
+                            task_id = task.task_id,
+                            morsel_size,
+                            "morsel.execute.start"
+                        );
+                        let result = execute(&task, worker_id);
+                        tracing::debug!(
+                            worker_id,
+                            pipeline_id = task.pipeline.0,
+                            task_id = task.task_id,
+                            morsel_size,
+                            "morsel.execute.complete"
+                        );
+                        result
+                    };
                     completed.push(CompletedTask {
                         task_id: task.task_id,
                         worker_id,
                         result,
                     });
                     count = count.saturating_add(1);
+                    rows_processed = rows_processed.saturating_add(morsel_size);
                 }
-                (completed, count)
+                (completed, count, rows_processed)
             }));
         }
 
         let mut completed = Vec::with_capacity(tasks.len());
         let mut per_worker_task_counts = vec![0usize; self.config.worker_threads];
+        let mut total_rows_processed = 0u64;
         for (worker_id, handle) in handles.into_iter().enumerate() {
-            let (mut worker_completed, count) =
+            let (mut worker_completed, count, rows_processed) =
                 handle.join().map_err(|_| DispatchError::WorkerPanicked)?;
             per_worker_task_counts[worker_id] = count;
+            total_rows_processed = total_rows_processed.saturating_add(rows_processed);
             completed.append(&mut worker_completed);
         }
 
         completed.sort_by_key(|entry| entry.task_id);
+        let active_workers = u64::try_from(
+            per_worker_task_counts
+                .iter()
+                .filter(|&&count| count > 0)
+                .count(),
+        )
+        .unwrap_or(u64::MAX);
+        let elapsed = pipeline_started.elapsed();
+        let elapsed_micros = elapsed.as_micros().max(1);
+        let throughput_rows_per_sec_u128 =
+            (u128::from(total_rows_processed) * 1_000_000) / elapsed_micros;
+        let throughput_rows_per_sec =
+            u64::try_from(throughput_rows_per_sec_u128).unwrap_or(u64::MAX);
+
+        FSQLITE_MORSEL_WORKERS_ACTIVE.store(active_workers, AtomicOrdering::Relaxed);
+        FSQLITE_MORSEL_THROUGHPUT_ROWS_PER_SEC
+            .store(throughput_rows_per_sec, AtomicOrdering::Relaxed);
+
+        tracing::info!(
+            pipeline_id = expected_pipeline.0,
+            completed_tasks = completed.len(),
+            worker_threads = self.config.worker_threads,
+            active_workers,
+            rows_processed = total_rows_processed,
+            fsqlite_morsel_throughput_rows_per_sec = throughput_rows_per_sec,
+            elapsed_ms = elapsed.as_millis(),
+            "morsel.pipeline.complete"
+        );
 
         Ok(PipelineExecution {
             pipeline: expected_pipeline,
@@ -381,6 +543,7 @@ mod tests {
     use super::*;
 
     const BEAD_ID: &str = "bd-14vp7.6";
+    const MORSEL_BEAD_ID: &str = "bd-1rw.2";
 
     #[test]
     fn partition_page_morsels_covers_range_without_gaps() {
@@ -501,6 +664,79 @@ mod tests {
         assert!(
             workers_used.len() >= 2,
             "bead_id={BEAD_ID} expected work across multiple workers"
+        );
+    }
+
+    #[test]
+    fn auto_tuned_pages_per_morsel_uses_half_l2_budget() {
+        let pages = auto_tuned_pages_per_morsel(1_048_576, 4_096)
+            .expect("bead_id={MORSEL_BEAD_ID} auto tuning should succeed");
+        assert_eq!(
+            pages, 128,
+            "bead_id={MORSEL_BEAD_ID} expected 1MiB L2 and 4KiB pages to yield 128 pages per morsel",
+        );
+    }
+
+    #[test]
+    fn auto_tuned_partition_covers_full_range() {
+        let start = PageNumber::new(1).expect("page should be valid");
+        let end = PageNumber::new(512).expect("page should be valid");
+        let morsels = partition_page_morsels_auto_tuned(start, end, 1_048_576, 4_096, 2)
+            .expect("bead_id={MORSEL_BEAD_ID} auto tuned partition should succeed");
+        assert!(
+            !morsels.is_empty(),
+            "bead_id={MORSEL_BEAD_ID} expected non-empty morsel partition",
+        );
+
+        let first = morsels
+            .first()
+            .expect("bead_id={MORSEL_BEAD_ID} expected first morsel");
+        let last = morsels
+            .last()
+            .expect("bead_id={MORSEL_BEAD_ID} expected last morsel");
+        assert_eq!(
+            first.page_range.start_page, start,
+            "bead_id={MORSEL_BEAD_ID} first morsel should start at requested page",
+        );
+        assert_eq!(
+            last.page_range.end_page, end,
+            "bead_id={MORSEL_BEAD_ID} last morsel should end at requested page",
+        );
+    }
+
+    #[test]
+    fn dispatcher_updates_morsel_metrics_gauges() {
+        reset_morsel_dispatch_metrics();
+        let morsels = partition_page_morsels(
+            PageNumber::new(1).expect("page should be valid"),
+            PageNumber::new(128).expect("page should be valid"),
+            2,
+            2,
+        )
+        .expect("partition should succeed");
+        let tasks = build_pipeline_tasks(PipelineId(0), PipelineKind::ScanFilterProject, &morsels);
+
+        let dispatcher = WorkStealingDispatcher::try_new(DispatcherConfig {
+            worker_threads: 4,
+            numa_nodes: 2,
+        })
+        .expect("dispatcher should build");
+        dispatcher
+            .execute_with_barriers(&[tasks], |task, _worker_id| task.task_id)
+            .expect("dispatch should succeed");
+
+        let snapshot = morsel_dispatch_metrics_snapshot();
+        assert!(
+            snapshot.fsqlite_morsel_workers_active >= 1,
+            "bead_id={MORSEL_BEAD_ID} expected active worker gauge to be positive",
+        );
+        assert!(
+            snapshot.fsqlite_morsel_workers_active <= 4,
+            "bead_id={MORSEL_BEAD_ID} active workers should not exceed configured worker count",
+        );
+        assert!(
+            snapshot.fsqlite_morsel_throughput_rows_per_sec > 0,
+            "bead_id={MORSEL_BEAD_ID} throughput gauge should be positive",
         );
     }
 }
