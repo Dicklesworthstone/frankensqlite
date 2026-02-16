@@ -1172,6 +1172,7 @@ dependencies = [
  "smallvec",
  "tracing",
  "unicode-segmentation",
+ "unicode-width",
 ]
 
 [[package]]

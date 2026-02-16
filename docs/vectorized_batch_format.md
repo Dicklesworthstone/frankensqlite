@@ -136,7 +136,13 @@ Current scope:
   - NUMA locality hints via `preferred_numa_node` assignment
 - Pipeline barriers:
   - `execute_with_barriers(...)` runs pipeline wave `i` to completion before wave `i+1`
+- Exchange operators:
+  - `hash_partition_exchange(...)` (hash partition with hot-partition spill for skew)
+  - `broadcast_exchange(...)` (replicate task ids to all partitions)
+  - `build_exchange_task_ids(...)` (exchange assignment from pipeline tasks)
+  - `execute_single_pipeline(...)` now applies `hash_exchange` scheduling for all-`HashJoinProbe` task sets; other pipeline kinds keep `numa_round_robin`
 - Structured observability:
+  - run correlation fields: `run_id`, `trace_id`, `scenario_id` (via `DispatchRunContext`)
   - per-morsel span: `morsel_exec` with fields `morsel_size`, `worker_id`, `pipeline_id`, `task_id`
   - scheduling logs at `DEBUG` (`morsel.schedule`, `morsel.execute.start`, `morsel.execute.complete`)
   - pipeline completion logs at `INFO` (`morsel.pipeline.complete`)
@@ -150,6 +156,10 @@ Validation:
   - partition coverage/no gaps
   - barrier ordering
   - multi-worker utilization
+- Deterministic e2e verifier script + artifact capture:
+  - `scripts/verify_bd_1rw_2_morsel_dispatch.sh`
+  - emits `artifacts/bd-1rw.2/morsel_dispatch_e2e_artifact.json`
+  - artifact includes `run_id`, `trace_id`, `scenario_id`, seed, replay command, and per-worker-count throughput/checksum measurements
 - Micro-benchmark scaffold:
   - `crates/fsqlite-vdbe/benches/vectorized_dispatch.rs`
   - scaling harness for worker counts `1, 2, 4, 8`
