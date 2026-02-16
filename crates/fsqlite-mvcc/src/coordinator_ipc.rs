@@ -1358,11 +1358,11 @@ pub fn authenticate_peer(
 ///
 /// We intentionally keep this as a raw fd and close it via `nix` in `Drop` to
 /// avoid `unsafe` `FromRawFd` conversions.
-#[cfg(target_family = "unix")]
+#[cfg(target_os = "linux")]
 #[derive(Debug)]
 pub struct ReceivedFd(std::os::unix::io::RawFd);
 
-#[cfg(target_family = "unix")]
+#[cfg(target_os = "linux")]
 impl ReceivedFd {
     #[must_use]
     pub fn raw_fd(&self) -> std::os::unix::io::RawFd {
@@ -1370,7 +1370,7 @@ impl ReceivedFd {
     }
 }
 
-#[cfg(target_family = "unix")]
+#[cfg(target_os = "linux")]
 impl Drop for ReceivedFd {
     fn drop(&mut self) {
         // Best-effort close; ignore errors since we can't recover meaningfully here.
@@ -1379,7 +1379,7 @@ impl Drop for ReceivedFd {
 }
 
 /// Send raw bytes plus a file descriptor over a Unix stream.
-#[cfg(target_family = "unix")]
+#[cfg(target_os = "linux")]
 pub fn send_with_fd(
     stream: &std::os::unix::net::UnixStream,
     data: &[u8],
@@ -1422,7 +1422,7 @@ pub fn send_with_fd(
 /// Receive raw bytes plus a file descriptor from a Unix stream.
 ///
 /// Returns `(bytes_read, Option<ReceivedFd>)`.
-#[cfg(target_family = "unix")]
+#[cfg(target_os = "linux")]
 pub fn recv_with_fd(
     stream: &std::os::unix::net::UnixStream,
     buf: &mut [u8],
@@ -1480,7 +1480,7 @@ pub fn recv_with_fd(
 mod tests {
     use super::*;
 
-    #[cfg(target_family = "unix")]
+    #[cfg(target_os = "linux")]
     fn recv_frame_with_optional_fd(
         stream: &std::os::unix::net::UnixStream,
     ) -> std::io::Result<(Frame, Option<ReceivedFd>)> {
@@ -1757,7 +1757,7 @@ mod tests {
     }
 
     // -- bd-1m07 test 7: SCM_RIGHTS fd passing --
-    #[cfg(target_family = "unix")]
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_scm_rights_fd_passing() {
         use std::io::Write;
@@ -1860,7 +1860,7 @@ mod tests {
     }
 
     // -- bd-1m07 E2E: Full protocol exercise over UnixStream --
-    #[cfg(target_family = "unix")]
+    #[cfg(target_os = "linux")]
     #[test]
     #[allow(clippy::too_many_lines)]
     fn test_e2e_bd_1m07() {

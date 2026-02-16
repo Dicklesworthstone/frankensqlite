@@ -1,5 +1,5 @@
 #![cfg_attr(target_family = "unix", feature(peer_credentials_unix_socket))]
-#![cfg_attr(target_family = "unix", feature(unix_socket_ancillary_data))]
+#![cfg_attr(target_os = "linux", feature(unix_socket_ancillary_data))]
 
 //! MVCC page-level versioning for concurrent writers.
 //!
