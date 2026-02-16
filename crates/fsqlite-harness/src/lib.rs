@@ -66,6 +66,7 @@ pub mod sql_pipeline_optimization;
 pub mod sql_semantic_differential;
 pub mod supervision;
 pub mod tcl_conformance;
+pub mod t6sv2_checklist;
 pub mod test_diagnostics;
 pub mod tla;
 pub mod toolchain_determinism;
