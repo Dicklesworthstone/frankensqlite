@@ -463,6 +463,10 @@ fn execute_cycle(
 
     // Crash recovery: reclaim slot and repair seqlock if needed.
     if crashed {
+        if state.slots[slot_idx].is_some() {
+            metrics.orphan_slots_reclaimed_total += 1;
+            slot_reclaimed = true;
+        }
         state.slots[slot_idx] = None;
         if is_torn_snapshot(state.seqlock_seq, state.seqlock_left, state.seqlock_right) {
             let repaired = state.seqlock_left.max(state.seqlock_right);
