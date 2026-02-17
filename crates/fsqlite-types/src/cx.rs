@@ -356,10 +356,17 @@ fn propagate_cancel(inner: &CxInner, reason: CancelReason) {
 }
 
 /// Capability context passed through all effectful operations.
+///
+/// Carries tracing identifiers (`trace_id`, `decision_id`, `policy_id`) that
+/// propagate through all context derivations (clone, restrict, scope, child).
+/// A value of `0` means "unset / not assigned".
 #[derive(Debug)]
 pub struct Cx<Caps: cap::SubsetOf<cap::All> = FullCaps> {
     inner: Arc<CxInner>,
     budget: Budget,
+    trace_id: u64,
+    decision_id: u64,
+    policy_id: u64,
     // fn() -> Caps ensures Send+Sync regardless of Caps marker type.
     _caps: PhantomData<fn() -> Caps>,
 }
@@ -369,6 +376,9 @@ impl<Caps: cap::SubsetOf<cap::All>> Clone for Cx<Caps> {
         Self {
             inner: Arc::clone(&self.inner),
             budget: self.budget,
+            trace_id: self.trace_id,
+            decision_id: self.decision_id,
+            policy_id: self.policy_id,
             _caps: PhantomData,
         }
     }
@@ -393,6 +403,9 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
         Self {
             inner: Arc::new(CxInner::new()),
             budget,
+            trace_id: 0,
+            decision_id: 0,
+            policy_id: 0,
             _caps: PhantomData,
         }
     }
@@ -402,15 +415,68 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
         self.budget
     }
 
+    // -----------------------------------------------------------------------
+    // Tracing IDs (§4 Cx capability context threading)
+    // -----------------------------------------------------------------------
+
+    /// The trace ID for this context (0 = unset).
+    #[must_use]
+    pub fn trace_id(&self) -> u64 {
+        self.trace_id
+    }
+
+    /// The decision ID for this context (0 = unset).
+    #[must_use]
+    pub fn decision_id(&self) -> u64 {
+        self.decision_id
+    }
+
+    /// The policy ID for this context (0 = unset).
+    #[must_use]
+    pub fn policy_id(&self) -> u64 {
+        self.policy_id
+    }
+
+    /// Set all three tracing identifiers at once.
+    ///
+    /// Typically called once when a connection or request is initialized.
+    #[must_use]
+    pub fn with_trace_context(mut self, trace_id: u64, decision_id: u64, policy_id: u64) -> Self {
+        self.trace_id = trace_id;
+        self.decision_id = decision_id;
+        self.policy_id = policy_id;
+        self
+    }
+
+    /// Return a new context with only the `decision_id` changed.
+    ///
+    /// Used when starting a new operation within the same trace.
+    #[must_use]
+    pub fn with_decision_id(mut self, decision_id: u64) -> Self {
+        self.decision_id = decision_id;
+        self
+    }
+
+    /// Return a new context with only the `policy_id` changed.
+    #[must_use]
+    pub fn with_policy_id(mut self, policy_id: u64) -> Self {
+        self.policy_id = policy_id;
+        self
+    }
+
     /// Returns a view of this context with a tighter effective budget.
     ///
     /// The effective budget is computed as `self.budget.meet(child)`, so the
     /// child cannot loosen its parent's constraints.
+    /// Tracing IDs propagate unchanged.
     #[must_use]
     pub fn scope_with_budget(&self, child: Budget) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
             budget: self.budget.meet(child),
+            trace_id: self.trace_id,
+            decision_id: self.decision_id,
+            policy_id: self.policy_id,
             _caps: PhantomData,
         }
     }
@@ -441,6 +507,9 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
         Cx {
             inner: Arc::clone(&self.inner),
             budget: self.budget,
+            trace_id: self.trace_id,
+            decision_id: self.decision_id,
+            policy_id: self.policy_id,
             _caps: PhantomData,
         }
     }
@@ -648,10 +717,13 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
 
     /// Create a child `Cx` that shares the parent's budget but has
     /// independent cancellation state. Cancelling the parent propagates
-    /// to this child.
+    /// to this child. Tracing IDs propagate to the child.
     #[must_use]
     pub fn create_child(&self) -> Self {
-        let child = Self::with_budget(self.budget);
+        let mut child = Self::with_budget(self.budget);
+        child.trace_id = self.trace_id;
+        child.decision_id = self.decision_id;
+        child.policy_id = self.policy_id;
         {
             let mut children = self
                 .inner
@@ -1620,5 +1692,118 @@ mod tests {
 
         // After commit section, cancellation is visible.
         assert!(cx.checkpoint().is_err());
+    }
+
+    // ===================================================================
+    // Tracing ID propagation tests (bd-2g5.6)
+    // ===================================================================
+
+    #[test]
+    fn test_trace_ids_default_to_zero() {
+        let cx = Cx::<FullCaps>::new();
+        assert_eq!(cx.trace_id(), 0);
+        assert_eq!(cx.decision_id(), 0);
+        assert_eq!(cx.policy_id(), 0);
+    }
+
+    #[test]
+    fn test_with_trace_context_sets_all_ids() {
+        let cx = Cx::<FullCaps>::new().with_trace_context(42, 99, 7);
+        assert_eq!(cx.trace_id(), 42);
+        assert_eq!(cx.decision_id(), 99);
+        assert_eq!(cx.policy_id(), 7);
+    }
+
+    #[test]
+    fn test_with_decision_id_preserves_other_ids() {
+        let cx = Cx::<FullCaps>::new()
+            .with_trace_context(10, 20, 30)
+            .with_decision_id(55);
+        assert_eq!(cx.trace_id(), 10);
+        assert_eq!(cx.decision_id(), 55);
+        assert_eq!(cx.policy_id(), 30);
+    }
+
+    #[test]
+    fn test_with_policy_id_preserves_other_ids() {
+        let cx = Cx::<FullCaps>::new()
+            .with_trace_context(10, 20, 30)
+            .with_policy_id(88);
+        assert_eq!(cx.trace_id(), 10);
+        assert_eq!(cx.decision_id(), 20);
+        assert_eq!(cx.policy_id(), 88);
+    }
+
+    #[test]
+    fn test_clone_propagates_trace_ids() {
+        let cx = Cx::<FullCaps>::new().with_trace_context(1, 2, 3);
+        let cloned = cx.clone();
+        assert_eq!(cloned.trace_id(), 1);
+        assert_eq!(cloned.decision_id(), 2);
+        assert_eq!(cloned.policy_id(), 3);
+    }
+
+    #[test]
+    fn test_restrict_propagates_trace_ids() {
+        let cx = Cx::<FullCaps>::new().with_trace_context(100, 200, 300);
+        let compute = cx.restrict::<ComputeCaps>();
+        assert_eq!(compute.trace_id(), 100);
+        assert_eq!(compute.decision_id(), 200);
+        assert_eq!(compute.policy_id(), 300);
+    }
+
+    #[test]
+    fn test_scope_with_budget_propagates_trace_ids() {
+        let cx = Cx::<FullCaps>::new().with_trace_context(5, 6, 7);
+        let scoped = cx.scope_with_budget(Budget::MINIMAL);
+        assert_eq!(scoped.trace_id(), 5);
+        assert_eq!(scoped.decision_id(), 6);
+        assert_eq!(scoped.policy_id(), 7);
+        // Budget should be tightened.
+        assert_eq!(scoped.budget().poll_quota, Budget::MINIMAL.poll_quota);
+    }
+
+    #[test]
+    fn test_cleanup_scope_propagates_trace_ids() {
+        let cx = Cx::<FullCaps>::new().with_trace_context(11, 22, 33);
+        let cleanup = cx.cleanup_scope();
+        assert_eq!(cleanup.trace_id(), 11);
+        assert_eq!(cleanup.decision_id(), 22);
+        assert_eq!(cleanup.policy_id(), 33);
+    }
+
+    #[test]
+    fn test_create_child_propagates_trace_ids() {
+        let parent = Cx::<FullCaps>::new().with_trace_context(50, 60, 70);
+        let child = parent.create_child();
+        assert_eq!(child.trace_id(), 50);
+        assert_eq!(child.decision_id(), 60);
+        assert_eq!(child.policy_id(), 70);
+        // Child should have independent cancellation.
+        parent.cancel();
+        assert!(parent.is_cancel_requested());
+        assert!(child.is_cancel_requested()); // Propagated.
+    }
+
+    #[test]
+    fn test_trace_ids_independent_across_children() {
+        let parent = Cx::<FullCaps>::new().with_trace_context(1, 2, 3);
+        let child1 = parent.create_child().with_decision_id(100);
+        let child2 = parent.create_child().with_decision_id(200);
+        // Children share trace_id but have different decision_ids.
+        assert_eq!(child1.trace_id(), 1);
+        assert_eq!(child2.trace_id(), 1);
+        assert_eq!(child1.decision_id(), 100);
+        assert_eq!(child2.decision_id(), 200);
+        // Parent's decision_id unchanged.
+        assert_eq!(parent.decision_id(), 2);
+    }
+
+    #[test]
+    fn test_with_budget_starts_at_zero_trace_ids() {
+        let cx = Cx::<FullCaps>::with_budget(Budget::MINIMAL);
+        assert_eq!(cx.trace_id(), 0);
+        assert_eq!(cx.decision_id(), 0);
+        assert_eq!(cx.policy_id(), 0);
     }
 }

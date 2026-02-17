@@ -298,6 +298,9 @@ pub struct PreparedStatement {
     /// Schema cookie captured at prepare time (bd-3mmj).  Used by the
     /// engine's `ReadCookie` opcode and for future stale-schema detection.
     schema_cookie: u32,
+    /// Root capability context inherited from the Connection that prepared
+    /// this statement. Carries trace/decision/policy IDs for observability.
+    root_cx: Cx,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -426,13 +429,11 @@ impl PreparedStatement {
             // Phase 5 (bd-35my): start a deferred transaction to read from the
             // pager. This ensures PreparedStatement::query() can see data written
             // by prior INSERT statements through the Connection.
+            let op_cx = self.root_cx.clone().with_decision_id(next_decision_id());
             let txn = self
                 .pager
                 .as_ref()
-                .map(|p| {
-                    let cx = Cx::new();
-                    p.begin(&cx, TransactionMode::Deferred)
-                })
+                .map(|p| p.begin(&op_cx, TransactionMode::Deferred))
                 .transpose()?;
             // PreparedStatement doesn't have concurrent context (it manages its own txns).
             let (result, mut txn_back) = execute_table_program_with_db(
@@ -446,8 +447,7 @@ impl PreparedStatement {
             );
             // Commit the read transaction (no-op for deferred reads).
             if let Some(ref mut txn) = txn_back {
-                let cx = Cx::new();
-                txn.commit(&cx)?;
+                txn.commit(&op_cx)?;
             }
             result?
         } else {
@@ -922,6 +922,10 @@ pub struct Connection {
     /// Guards idempotent shutdown so explicit `close()` and `Drop` do not
     /// double-run rollback/checkpoint logic.
     closed: RefCell<bool>,
+    // ── Cx capability context (bd-2g5.6) ──────────────────────────────────────
+    /// Root capability context for this connection. All per-operation contexts
+    /// are derived from this via `op_cx()`, inheriting the connection's trace ID.
+    root_cx: Cx,
     // ── MVCC garbage collection (bd-3bql / 5E.5) ─────────────────────────────
     /// Version store for MVCC page versioning.  Stores committed page versions
     /// in an arena with version chains for snapshot resolution.
@@ -996,6 +1000,8 @@ impl Connection {
             concurrent_commit_index: CommitIndex::new(),
             next_commit_seq: RefCell::new(1),
             closed: RefCell::new(false),
+            // Cx capability context (bd-2g5.6)
+            root_cx: Cx::new().with_trace_context(next_trace_id(), 0, 0),
             // MVCC garbage collection (bd-3bql / 5E.5)
             version_store: Rc::new(RefCell::new(VersionStore::new(PageSize::DEFAULT))),
             gc_scheduler: RefCell::new(GcScheduler::new()),
@@ -1005,13 +1011,27 @@ impl Connection {
         conn.apply_current_journal_mode_to_pager()?;
         // 5D.4 (bd-3bsn): Load initial state from pager instead of compat_persist.
         // The pager already opened the database file; we load schema + data from it.
-        conn.reload_memdb_from_pager(&Cx::new())?;
+        conn.reload_memdb_from_pager(&conn.op_cx())?;
         Ok(conn)
     }
 
     /// Returns the configured database path.
     pub fn path(&self) -> &str {
         &self.path
+    }
+
+    /// Returns a reference to the root capability context for this connection.
+    #[must_use]
+    pub fn root_cx(&self) -> &Cx {
+        &self.root_cx
+    }
+
+    /// Derive a per-operation capability context from this connection's root.
+    ///
+    /// Each call allocates a new `decision_id` so that per-operation tracing
+    /// can distinguish individual SQL operations within a connection's trace.
+    fn op_cx(&self) -> Cx {
+        self.root_cx.clone().with_decision_id(next_decision_id())
     }
 
     /// Register or clear sqlite3_trace_v2-compatible callbacks.
@@ -1039,7 +1059,7 @@ impl Connection {
         }
         let trace_registration = self.trace_registration.get_mut().clone();
 
-        let cx = Cx::new();
+        let cx = self.op_cx();
         let active_txn = self.active_txn.get_mut();
         let txn_was_open = *self.in_transaction.get_mut() || active_txn.is_some();
 
@@ -2089,6 +2109,7 @@ impl Connection {
                     pager: None,
                     post_distinct_limit: None,
                     schema_cookie: self.schema_cookie(),
+                    root_cx: self.root_cx.clone(),
                 })
             }
             Statement::Select(select) => {
@@ -2110,6 +2131,7 @@ impl Connection {
                     pager: Some(self.pager.clone()),
                     post_distinct_limit: if distinct { limit_clause } else { None },
                     schema_cookie: self.schema_cookie(),
+                    root_cx: self.root_cx.clone(),
                 })
             }
             _ => Err(FrankenError::NotImplemented(
@@ -2378,7 +2400,7 @@ impl Connection {
         if *self.in_transaction.borrow() || self.active_txn.borrow().is_some() {
             return Ok(false);
         }
-        let cx = Cx::new();
+        let cx = self.op_cx();
         let mut txn = self.pager.begin(&cx, mode)?;
         let is_concurrent = mode == TransactionMode::Concurrent;
         let concurrent_session = if is_concurrent {
@@ -2417,7 +2439,7 @@ impl Connection {
         if !was_auto {
             return Ok(());
         }
-        let cx = Cx::new();
+        let cx = self.op_cx();
         let mut txn = {
             let mut guard = self.active_txn.borrow_mut();
             let Some(txn) = guard.take() else {
@@ -2520,7 +2542,7 @@ impl Connection {
         &self,
         f: impl FnOnce(&Cx, &mut dyn TransactionHandle) -> Result<R>,
     ) -> Result<R> {
-        let cx = Cx::new();
+        let cx = self.op_cx();
         let auto = self.active_txn.borrow().is_none();
         if auto {
             let txn = self.pager.begin(&cx, TransactionMode::Immediate)?;
@@ -3608,7 +3630,7 @@ impl Connection {
             }
         };
 
-        let cx = Cx::new();
+        let cx = self.op_cx();
         let mut txn = self.pager.begin(&cx, pager_mode)?;
         // MVCC concurrent-writer session (bd-14zc / 5E.1):
         // When mode is Concurrent, register with ConcurrentRegistry for
@@ -3950,7 +3972,7 @@ impl Connection {
         } else {
             None
         };
-        let cx = Cx::new();
+        let cx = self.op_cx();
 
         // Attempt pager commit without consuming the handle (retriable on BUSY).
         // We use a scope to limit the mutable borrow of active_txn.
@@ -3985,7 +4007,7 @@ impl Connection {
 
     /// Handle ROLLBACK [TO SAVEPOINT name].
     fn execute_rollback(&self, rb: &fsqlite_ast::RollbackStatement) -> Result<()> {
-        let cx = Cx::new();
+        let cx = self.op_cx();
         if let Some(ref sp_name) = rb.to_savepoint {
             let (idx, snap, canonical_name, concurrent_snap) = {
                 let savepoints = self.savepoints.borrow();
@@ -4190,7 +4212,7 @@ impl Connection {
     /// Handle SAVEPOINT name.
     #[allow(clippy::unnecessary_wraps)] // will return errors once pager is wired
     fn execute_savepoint(&self, name: &str) -> Result<()> {
-        let cx = Cx::new();
+        let cx = self.op_cx();
         // If no explicit transaction, implicitly begin one.
         if !*self.in_transaction.borrow() {
             let is_concurrent = *self.concurrent_mode_default.borrow();
@@ -4268,7 +4290,7 @@ impl Connection {
 
     /// Handle RELEASE \[SAVEPOINT\] name.
     fn execute_release(&self, name: &str) -> Result<()> {
-        let cx = Cx::new();
+        let cx = self.op_cx();
         let (idx, canonical_name) = {
             let savepoints = self.savepoints.borrow();
             let idx = savepoints
@@ -4653,7 +4675,7 @@ impl Connection {
                     }]);
                 }
 
-                let cx = Cx::new();
+                let cx = self.op_cx();
                 let result = self.pager.checkpoint(&cx, mode)?;
 
                 // Return: busy (always 0), log (total frames), checkpointed (frames backfilled)
@@ -4672,7 +4694,7 @@ impl Connection {
     }
 
     fn pragma_database_header(&self) -> Result<Option<DatabaseHeader>> {
-        let cx = Cx::new();
+        let cx = self.op_cx();
 
         if let Some(active_txn) = self.active_txn.borrow_mut().as_mut() {
             let page1 = active_txn.get_page(&cx, PageNumber::ONE)?;
@@ -4694,7 +4716,7 @@ impl Connection {
     }
 
     fn apply_journal_mode_to_pager(&self, journal_mode: &str) -> Result<()> {
-        let cx = Cx::new();
+        let cx = self.op_cx();
         let requested_mode = if journal_mode.eq_ignore_ascii_case("wal") {
             JournalMode::Wal
         } else {
@@ -10780,6 +10802,38 @@ mod tests {
 
     fn row_values(row: &Row) -> Vec<SqliteValue> {
         row.values().to_vec()
+    }
+
+    // ── Cx trace context propagation tests (bd-2g5.6) ─────────────────
+
+    #[test]
+    fn test_connection_root_cx_has_nonzero_trace_id() {
+        let conn = Connection::open(":memory:").unwrap();
+        let root = conn.root_cx();
+        assert_ne!(root.trace_id(), 0, "root_cx should get a unique trace_id");
+        assert_eq!(root.decision_id(), 0, "root_cx decision_id starts at 0");
+        assert_eq!(root.policy_id(), 0, "root_cx policy_id starts at 0");
+    }
+
+    #[test]
+    fn test_two_connections_get_different_trace_ids() {
+        let conn1 = Connection::open(":memory:").unwrap();
+        let conn2 = Connection::open(":memory:").unwrap();
+        assert_ne!(
+            conn1.root_cx().trace_id(),
+            conn2.root_cx().trace_id(),
+            "each connection should have a unique trace_id"
+        );
+    }
+
+    #[test]
+    fn test_prepared_statement_inherits_trace_id() {
+        let conn = Connection::open(":memory:").unwrap();
+        let stmt = conn.prepare("SELECT 1 + 1").unwrap();
+        // Execute the prepared statement — should succeed (traces propagate).
+        let rows = stmt.query().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(2));
     }
 
     #[test]
