@@ -831,12 +831,25 @@ impl Parser {
         let tok = self.advance_token();
         match &tok.kind {
             TokenKind::Integer(i) => Ok(i.to_string()),
+            TokenKind::Float(f) => Ok(f.to_string()),
             TokenKind::Minus => {
                 let next = self.advance_token();
                 match &next.kind {
                     TokenKind::Integer(i) => Ok(format!("-{i}")),
+                    TokenKind::Float(f) => Ok(format!("-{f}")),
                     _ => Err(ParseError::at(
-                        "expected integer in type argument",
+                        "expected number in type argument",
+                        Some(&next),
+                    )),
+                }
+            }
+            TokenKind::Plus => {
+                let next = self.advance_token();
+                match &next.kind {
+                    TokenKind::Integer(i) => Ok(format!("+{i}")),
+                    TokenKind::Float(f) => Ok(format!("+{f}")),
+                    _ => Err(ParseError::at(
+                        "expected number in type argument",
                         Some(&next),
                     )),
                 }
@@ -988,6 +1001,34 @@ mod tests {
                 assert_eq!(type_name.name, "INTEGER");
             }
             other => unreachable!("expected Cast, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_cast_float_argument() {
+        // CAST(x AS DECIMAL(10.5, -2.5))
+        let expr = parse("CAST(x AS DECIMAL(10.5, -2.5))");
+        match &expr {
+            Expr::Cast { type_name, .. } => {
+                assert_eq!(type_name.name, "DECIMAL");
+                assert_eq!(type_name.arg1.as_deref(), Some("10.5"));
+                assert_eq!(type_name.arg2.as_deref(), Some("-2.5"));
+            }
+            other => unreachable!("expected Cast with float args, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_cast_signed_args() {
+        // CAST(x AS NUMERIC(+5, -5))
+        let expr = parse("CAST(x AS NUMERIC(+5, -5))");
+        match &expr {
+            Expr::Cast { type_name, .. } => {
+                assert_eq!(type_name.name, "NUMERIC");
+                assert_eq!(type_name.arg1.as_deref(), Some("+5"));
+                assert_eq!(type_name.arg2.as_deref(), Some("-5"));
+            }
+            other => unreachable!("expected Cast with signed args, got {other:?}"),
         }
     }
 

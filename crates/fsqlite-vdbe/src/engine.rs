@@ -878,9 +878,12 @@ pub struct VdbeEngine {
     /// Aggregate accumulators keyed by accumulator register.
     aggregates: HashMap<i32, AggregateContext>,
     /// Schema cookie value provided by the Connection (bd-3mmj).
+    /// Schema cookie value provided by the Connection (bd-3mmj).
     /// Used by `ReadCookie` (p3=1) and `SetCookie` opcodes, and
     /// by `Transaction` for stale-schema detection.
     schema_cookie: u32,
+    /// Result of the last `Opcode::Compare` operation.
+    last_compare_result: Option<Ordering>,
 }
 
 struct AggregateContext {
@@ -910,6 +913,7 @@ impl VdbeEngine {
             func_registry: None,
             aggregates: HashMap::new(),
             schema_cookie: 0,
+            last_compare_result: None,
         }
     }
 
@@ -2553,19 +2557,50 @@ impl VdbeEngine {
                     }
                 }
 
-                Opcode::TypeCheck
-                | Opcode::Permutation
-                | Opcode::Compare
-                | Opcode::CollSeq
-                | Opcode::ElseEq
-                | Opcode::FkCheck => {
+                Opcode::Compare => {
+                    // Compare P1..P1+P3-1 with P2..P2+P3-1.
+                    let start_a = op.p1;
+                    let start_b = op.p2;
+                    let count = op.p3;
+                    let mut result = Ordering::Equal;
+                    for i in 0..count {
+                        let val_a = self.get_reg(start_a + i);
+                        let val_b = self.get_reg(start_b + i);
+                        // TODO: Apply collation from P4 if present.
+                        // For now, use default collation (binary/numeric-aware).
+                        if let Some(ord) = val_a.partial_cmp(val_b) {
+                            if ord != Ordering::Equal {
+                                result = ord;
+                                break;
+                            }
+                        }
+                    }
+                    self.last_compare_result = Some(result);
                     pc += 1;
                 }
 
                 Opcode::Jump => {
                     // Jump to one of p1/p2/p3 based on last comparison.
-                    // Stub: jump to p2 (neutral).
-                    pc = op.p2 as usize;
+                    let target = match self.last_compare_result {
+                        Some(Ordering::Less) => op.p1,
+                        Some(Ordering::Equal) => op.p2,
+                        Some(Ordering::Greater) => op.p3,
+                        None => {
+                            // If no comparison has happened, fall through or use p2?
+                            // SQLite spec says Jump logic depends on the preceding Compare.
+                            // If we haven't compared, neutral path (p2) is a safe fallback.
+                            op.p2
+                        }
+                    };
+                    pc = target as usize;
+                }
+
+                Opcode::TypeCheck
+                | Opcode::Permutation
+                | Opcode::CollSeq
+                | Opcode::ElseEq
+                | Opcode::FkCheck => {
+                    pc += 1;
                 }
 
                 Opcode::IsType => {

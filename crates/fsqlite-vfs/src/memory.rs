@@ -471,11 +471,14 @@ impl VfsFile for MemoryFile {
 
     fn truncate(&mut self, _cx: &Cx, size: u64) -> Result<()> {
         let size = u64_to_usize(size, "truncate size")?;
-        self.storage
-            .lock()
-            .map_err(|_| lock_err())?
-            .data
-            .truncate(size);
+        let mut storage = self.storage.lock().map_err(|_| lock_err())?;
+        storage.data.resize(size, 0);
+
+        // Opportunistically shrink allocation if we've truncated significantly.
+        // Heuristic: if size < capacity / 2, shrink.
+        if storage.data.capacity() > 1024 && size < storage.data.capacity() / 2 {
+            storage.data.shrink_to_fit();
+        }
         Ok(())
     }
 

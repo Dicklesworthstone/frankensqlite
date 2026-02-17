@@ -269,8 +269,15 @@ impl Parser {
             return Ok(Some(self.parse_identifier()?));
         }
         // Peek for an identifier that isn't a keyword starting the next clause.
-        if matches!(self.peek(), TokenKind::Id(_) | TokenKind::QuotedId(_, _)) {
-            return Ok(Some(self.parse_identifier()?));
+        // We also accept non-reserved keywords as implicit aliases.
+        match self.peek() {
+            TokenKind::Id(_) | TokenKind::QuotedId(_, _) => {
+                return Ok(Some(self.parse_identifier()?));
+            }
+            k if is_nonreserved_kw(k) => {
+                return Ok(Some(self.parse_identifier()?));
+            }
+            _ => {}
         }
         Ok(None)
     }
@@ -776,19 +783,6 @@ impl Parser {
         let source = if self.eat_kw(&TokenKind::KwDefault) {
             self.expect_kw(&TokenKind::KwValues)?;
             InsertSource::DefaultValues
-        } else if self.check_kw(&TokenKind::KwValues) {
-            self.advance();
-            let mut rows = Vec::new();
-            loop {
-                self.expect_token(&TokenKind::LeftParen)?;
-                let row = self.parse_comma_sep(Self::parse_expr)?;
-                self.expect_token(&TokenKind::RightParen)?;
-                rows.push(row);
-                if !self.eat(&TokenKind::Comma) {
-                    break;
-                }
-            }
-            InsertSource::Values(rows)
         } else {
             InsertSource::Select(Box::new(self.parse_select_stmt(None)?))
         };
@@ -7593,6 +7587,30 @@ mod tests {
             }
         } else {
             panic!("expected Select statement");
+        }
+    }
+
+    #[test]
+    fn select_implicit_alias_non_reserved_keyword() {
+        // 'action' is a non-reserved keyword (TokenKind::KwAction).
+        // It should be accepted as an implicit alias: SELECT 1 action
+        let stmt = parse_one("SELECT 1 action");
+        if let Statement::Select(s) = stmt {
+            if let SelectCore::Select { columns, .. } = &s.body.select {
+                if let ResultColumn::Expr { alias, .. } = &columns[0] {
+                    assert_eq!(
+                        alias.as_deref(),
+                        Some("action"),
+                        "implicit alias 'action' (keyword) failed to parse"
+                    );
+                } else {
+                    unreachable!("expected Expr result column");
+                }
+            } else {
+                unreachable!("expected Select core");
+            }
+        } else {
+            unreachable!("expected Select");
         }
     }
 }

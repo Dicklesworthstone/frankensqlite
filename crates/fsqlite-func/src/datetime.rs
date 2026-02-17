@@ -390,12 +390,15 @@ fn apply_month_year_exact(jdn: f64, m: &str) -> Option<f64> {
     let (h, mi, s, frac) = jdn_to_hms(jdn);
 
     let total_months = match unit.trim_end_matches('s') {
-        "month" => sign * num,
-        "year" => sign * num * 12,
+        "month" => num.checked_mul(sign)?,
+        "year" => num.checked_mul(sign)?.checked_mul(12)?,
         _ => return None,
     };
 
-    let new_total = (y * 12 + (mo - 1)) + total_months;
+    // (y * 12 + (mo - 1)) + total_months
+    let current_months = y.checked_mul(12)?.checked_add(mo - 1)?;
+    let new_total = current_months.checked_add(total_months)?;
+
     let new_y = new_total.div_euclid(12);
     let new_mo = new_total.rem_euclid(12) + 1;
     let new_d = d.min(days_in_month(new_y, new_mo));
@@ -1284,6 +1287,18 @@ mod tests {
     }
 
     // ── JDN roundtrip ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_modifier_year_overflow() {
+        // "+9223372036854775807 years" causes i64 overflow in year calculation.
+        // Should return NULL, not panic.
+        let huge = i64::MAX;
+        let modifier = format!("+{huge} years");
+        let r = DateFunc.invoke(&[text("2000-01-01"), text(&modifier)]);
+        // The implementation should catch overflow and return Ok(Null), or at least not panic.
+        // If it panics, the test harness catches it (but we want to prevent panics).
+        assert_eq!(r.unwrap(), SqliteValue::Null);
+    }
 
     #[test]
     fn test_jdn_roundtrip() {

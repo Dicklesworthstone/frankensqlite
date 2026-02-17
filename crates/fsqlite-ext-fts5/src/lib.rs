@@ -1153,7 +1153,7 @@ pub fn evaluate_expr(index: &InvertedIndex, expr: &Fts5Expr) -> Vec<i64> {
             evaluate_expr(index, inner)
         }
         Fts5Expr::InitialToken(inner) => {
-            // For initial token (^), filter results to those where the term
+            // For initial token (^), filter results to those where the term/phrase
             // appears at position 0.
             match inner.as_ref() {
                 Fts5Expr::Term(term) => {
@@ -1161,12 +1161,60 @@ pub fn evaluate_expr(index: &InvertedIndex, expr: &Fts5Expr) -> Vec<i64> {
                     let mut docs: Vec<i64> = index
                         .get_postings(&lower)
                         .iter()
-                        .filter(|p| p.positions.first() == Some(&0))
+                        .filter(|p| p.positions.contains(&0))
                         .map(|p| p.docid)
                         .collect();
                     docs.sort_unstable();
                     docs.dedup();
                     docs
+                }
+                Fts5Expr::Prefix(prefix) => {
+                    let lower = prefix.to_lowercase();
+                    let mut docs: Vec<i64> = index
+                        .get_prefix_postings(&lower)
+                        .iter()
+                        .filter(|p| p.positions.contains(&0))
+                        .map(|p| p.docid)
+                        .collect();
+                    docs.sort_unstable();
+                    docs.dedup();
+                    docs
+                }
+                Fts5Expr::Phrase(words) => {
+                    // Evaluate phrase but require the first word to be at position 0.
+                    if words.is_empty() {
+                        return Vec::new();
+                    }
+                    let first_lower = words[0].to_lowercase();
+                    let first_postings = index.get_postings(&first_lower);
+                    let mut result = Vec::new();
+
+                    for first_p in first_postings {
+                        // Optimization: if first word isn't at 0, this doc can't match ^phrase.
+                        if !first_p.positions.contains(&0) {
+                            continue;
+                        }
+
+                        // Check subsequent words
+                        let mut match_found = true;
+                        for (offset, word) in words.iter().enumerate().skip(1) {
+                            let target_pos = offset as u32; // implied start_pos = 0
+                            let found = index.get_postings(&word.to_lowercase()).iter().any(|p| {
+                                p.docid == first_p.docid
+                                    && p.column == first_p.column
+                                    && p.positions.contains(&target_pos)
+                            });
+                            if !found {
+                                match_found = false;
+                                break;
+                            }
+                        }
+                        if match_found && !result.contains(&first_p.docid) {
+                            result.push(first_p.docid);
+                        }
+                    }
+                    result.sort_unstable();
+                    result
                 }
                 _ => evaluate_expr(index, inner),
             }
@@ -2807,6 +2855,36 @@ mod tests {
         let expr = Fts5Expr::Phrase(vec![]);
         let docs = evaluate_expr(&index, &expr);
         assert!(docs.is_empty());
+    }
+
+    #[test]
+    fn test_initial_token_prefix() {
+        let mut index = InvertedIndex::new();
+        let tok = Unicode61Tokenizer::new();
+
+        // Doc 1: "hello world" (starts with 'hel')
+        index.add_document(1, 0, &tok.tokenize("hello world"));
+        // Doc 2: "world hello" (contains 'hel' but not at start)
+        index.add_document(2, 0, &tok.tokenize("world hello"));
+
+        let expr = build_expr(&parse_fts5_query("^ hel*").unwrap()).unwrap();
+        let docs = evaluate_expr(&index, &expr);
+        assert_eq!(docs, vec![1]);
+    }
+
+    #[test]
+    fn test_initial_token_phrase() {
+        let mut index = InvertedIndex::new();
+        let tok = Unicode61Tokenizer::new();
+
+        // Doc 1: "hello world" (matches ^ "hello world")
+        index.add_document(1, 0, &tok.tokenize("hello world"));
+        // Doc 2: "say hello world" (contains phrase but not at start)
+        index.add_document(2, 0, &tok.tokenize("say hello world"));
+
+        let expr = build_expr(&parse_fts5_query("^ \"hello world\"").unwrap()).unwrap();
+        let docs = evaluate_expr(&index, &expr);
+        assert_eq!(docs, vec![1]);
     }
 
     #[test]

@@ -267,23 +267,26 @@ impl fmt::Display for PageSize {
 /// Raw page data as an owned byte buffer.
 ///
 /// The length always matches the database page size.
+/// Uses `Arc` for cheap cloning (Copy-On-Write).
 #[derive(Clone, PartialEq, Eq)]
 pub struct PageData {
-    data: Vec<u8>,
+    data: std::sync::Arc<Vec<u8>>,
 }
 
 impl PageData {
     /// Create a zero-filled page of the given size.
     pub fn zeroed(size: PageSize) -> Self {
         Self {
-            data: vec![0u8; size.as_usize()],
+            data: std::sync::Arc::new(vec![0u8; size.as_usize()]),
         }
     }
 
     /// Create from existing bytes. The caller must ensure the length matches
     /// the page size.
     pub fn from_vec(data: Vec<u8>) -> Self {
-        Self { data }
+        Self {
+            data: std::sync::Arc::new(data),
+        }
     }
 
     /// Get the page data as a byte slice.
@@ -293,9 +296,11 @@ impl PageData {
     }
 
     /// Get the page data as a mutable byte slice.
+    ///
+    /// This performs a clone if the data is shared (Copy-On-Write).
     #[inline]
     pub fn as_bytes_mut(&mut self) -> &mut [u8] {
-        &mut self.data
+        std::sync::Arc::make_mut(&mut self.data).as_mut_slice()
     }
 
     /// Get the length in bytes.
@@ -311,8 +316,13 @@ impl PageData {
     }
 
     /// Consume self and return the inner `Vec<u8>`.
+    ///
+    /// If the data is shared, this clones the vector.
     pub fn into_vec(self) -> Vec<u8> {
-        self.data
+        match std::sync::Arc::try_unwrap(self.data) {
+            Ok(v) => v,
+            Err(arc) => (*arc).clone(),
+        }
     }
 }
 
@@ -332,7 +342,7 @@ impl AsRef<[u8]> for PageData {
 
 impl AsMut<[u8]> for PageData {
     fn as_mut(&mut self) -> &mut [u8] {
-        &mut self.data
+        std::sync::Arc::make_mut(&mut self.data).as_mut_slice()
     }
 }
 

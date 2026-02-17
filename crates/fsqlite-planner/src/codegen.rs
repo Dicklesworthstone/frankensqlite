@@ -527,13 +527,17 @@ fn codegen_insert_select(
     returning: &[ResultColumn],
     ctx: &CodegenContext,
 ) -> Result<(), CodegenError> {
+    if !select_stmt.body.compounds.is_empty() {
+        return Err(CodegenError::Unsupported(
+            "INSERT ... SELECT with compounds (UNION, etc.)".to_owned(),
+        ));
+    }
+
     // Extract columns and FROM from the inner SELECT.
     let (columns, from) = match &select_stmt.body.select {
         SelectCore::Select { columns, from, .. } => (columns, from),
-        SelectCore::Values(_) => {
-            return Err(CodegenError::Unsupported(
-                "INSERT ... SELECT with VALUES body".to_owned(),
-            ));
+        SelectCore::Values(rows) => {
+            return codegen_insert_values(b, rows, write_cursor, target_table, returning, ctx);
         }
     };
 
@@ -1401,6 +1405,54 @@ mod tests {
     }
 
     // === Test: INSERT ... SELECT ===
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn test_codegen_insert_select_values() {
+        // INSERT INTO t VALUES (1) parsed as InsertSource::Select
+        let inner_values = SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Values(vec![vec![placeholder(1)]]),
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        };
+
+        let stmt = InsertStatement {
+            with: None,
+            or_conflict: None,
+            table: QualifiedName::bare("t"),
+            alias: None,
+            columns: vec![],
+            source: InsertSource::Select(Box::new(inner_values)),
+            upsert: vec![],
+            returning: vec![],
+        };
+
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_insert(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        // Should look like normal INSERT VALUES
+        assert!(has_opcodes(
+            &prog,
+            &[
+                Opcode::Init,
+                Opcode::Transaction,
+                Opcode::OpenWrite,
+                Opcode::NewRowid,
+                Opcode::Variable,
+                Opcode::MakeRecord,
+                Opcode::Insert,
+                Opcode::Close,
+                Opcode::Halt,
+            ]
+        ));
+    }
+
     #[test]
     #[allow(clippy::too_many_lines)]
     fn test_codegen_insert_select() {

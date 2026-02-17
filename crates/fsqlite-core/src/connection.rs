@@ -53,10 +53,11 @@ use fsqlite_wal::{
 
 // MVCC concurrent-writer support (bd-14zc / 5E.1, bd-kivg / 5E.2, bd-3bql / 5E.5)
 use fsqlite_mvcc::{
-    CommitIndex, ConcurrentHandle, ConcurrentRegistry, FcwResult, GcScheduler, GcTickResult,
-    GcTodo, InProcessPageLockTable, MvccError, SsiDecisionCard, SsiDecisionCardDraft,
+    CommitIndex, ConcurrentHandle, ConcurrentRegistry, ConcurrentSavepoint, FcwResult, GcScheduler,
+    GcTickResult, GcTodo, InProcessPageLockTable, MvccError, SsiDecisionCard, SsiDecisionCardDraft,
     SsiDecisionQuery, SsiDecisionType, SsiEvidenceLedger, SsiReadSetSummary, VersionStore,
-    concurrent_abort, concurrent_read_page, concurrent_write_page, validate_first_committer_wins,
+    concurrent_abort, concurrent_read_page, concurrent_rollback_to_savepoint, concurrent_savepoint,
+    concurrent_write_page, validate_first_committer_wins,
 };
 // MVCC conflict observability (bd-t6sv2.1)
 use fsqlite_observability::{
@@ -67,107 +68,6 @@ use fsqlite_observability::{
 use fsqlite_types::{CommitSeq, PageData, SchemaEpoch, Snapshot, TxnId, TxnToken};
 
 use crate::wal_adapter::WalBackendAdapter;
-
-// ---------------------------------------------------------------------------
-// MVCC Page I/O Wrapper (bd-kivg / 5E.2)
-// ---------------------------------------------------------------------------
-
-/// Page I/O wrapper that adds MVCC page-level locking for concurrent transactions.
-///
-/// Implements [`fsqlite_btree::cursor::PageReader`] and [`PageWriter`] by:
-/// 1. Intercepting writes to acquire page locks via `concurrent_write_page()`
-/// 2. Intercepting reads to check the local write set via `concurrent_read_page()`
-/// 3. Delegating to the underlying pager transaction for physical I/O
-///
-/// This wrapper is used when in `BEGIN CONCURRENT` mode to enable MVCC
-/// page-level conflict detection.
-pub struct MvccPageIo<'a, 'b> {
-    /// The underlying pager transaction.
-    txn: &'a mut dyn TransactionHandle,
-    /// The concurrent handle for this session (from ConcurrentRegistry).
-    handle: &'b mut ConcurrentHandle,
-    /// Page-level lock table for concurrent writers.
-    lock_table: &'b InProcessPageLockTable,
-    /// Session ID for this concurrent transaction.
-    session_id: u64,
-}
-
-impl<'a, 'b> MvccPageIo<'a, 'b> {
-    /// Create a new MVCC page I/O wrapper.
-    #[must_use]
-    pub fn new(
-        txn: &'a mut dyn TransactionHandle,
-        handle: &'b mut ConcurrentHandle,
-        lock_table: &'b InProcessPageLockTable,
-        session_id: u64,
-    ) -> Self {
-        Self {
-            txn,
-            handle,
-            lock_table,
-            session_id,
-        }
-    }
-}
-
-impl fsqlite_btree::cursor::PageReader for MvccPageIo<'_, '_> {
-    fn read_page(&self, cx: &Cx, page_no: PageNumber) -> Result<Vec<u8>> {
-        let storage_span = tracing::span!(
-            target: "fsqlite.storage",
-            tracing::Level::TRACE,
-            "storage",
-            op = "read_page",
-            page_no = page_no.get(),
-            session_id = self.session_id
-        );
-        record_trace_span_created();
-        let _storage_guard = storage_span.enter();
-        // Check the local write set first (read-your-own-writes).
-        if let Some(page_data) = concurrent_read_page(self.handle, page_no) {
-            return Ok(page_data.as_bytes().to_vec());
-        }
-        // Not in write set, delegate to pager transaction.
-        Ok(self.txn.get_page(cx, page_no)?.into_vec())
-    }
-}
-
-impl fsqlite_btree::cursor::PageWriter for MvccPageIo<'_, '_> {
-    fn write_page(&mut self, cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()> {
-        let storage_span = tracing::span!(
-            target: "fsqlite.storage",
-            tracing::Level::TRACE,
-            "storage",
-            op = "write_page",
-            page_no = page_no.get(),
-            session_id = self.session_id,
-            bytes = data.len()
-        );
-        record_trace_span_created();
-        let _storage_guard = storage_span.enter();
-        // Acquire page lock and record in write set.
-        concurrent_write_page(
-            self.handle,
-            self.lock_table,
-            self.session_id,
-            page_no,
-            PageData::from_vec(data.to_vec()),
-        )
-        .map_err(|e| match e {
-            MvccError::Busy => FrankenError::Busy,
-            _ => FrankenError::Internal(format!("MVCC write_page failed: {e}")),
-        })?;
-        // Delegate to pager transaction for physical durability.
-        self.txn.write_page(cx, page_no, data)
-    }
-
-    fn allocate_page(&mut self, cx: &Cx) -> Result<PageNumber> {
-        self.txn.allocate_page(cx)
-    }
-
-    fn free_page(&mut self, cx: &Cx, page_no: PageNumber) -> Result<()> {
-        self.txn.free_page(cx, page_no)
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Phase 5: Pager backend abstraction (bd-3iw8)
@@ -902,10 +802,12 @@ struct DbSnapshot {
 }
 
 /// A named savepoint with its pre-state snapshot.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct SavepointEntry {
     name: String,
     snapshot: DbSnapshot,
+    /// Concurrent savepoint state (MVCC mode only).
+    concurrent_snapshot: Option<ConcurrentSavepoint>,
 }
 
 #[derive(Debug, Clone)]
@@ -1591,8 +1493,16 @@ impl Connection {
                 }
 
                 if let fsqlite_ast::InsertSource::Select(select_stmt) = &insert.source {
-                    // Use VDBE path when RETURNING is present; fallback otherwise.
-                    if insert.returning.is_empty() {
+                    // Detect simple VALUES clause (no compounds).
+                    // We must use the VDBE path for simple VALUES to avoid infinite recursion
+                    // in the fallback (which implements inserts by generating simple VALUES inserts).
+                    let is_simple_values =
+                        matches!(select_stmt.body.select, SelectCore::Values(_))
+                            && select_stmt.body.compounds.is_empty();
+
+                    // Use VDBE path when RETURNING is present OR it's a simple VALUES clause;
+                    // fallback otherwise (e.g. complex SELECTs, compounds).
+                    if insert.returning.is_empty() && !is_simple_values {
                         let affected =
                             self.execute_insert_select_fallback(insert, select_stmt, params)?;
                         // Phase 5G.3: Fire AFTER INSERT triggers.
@@ -4077,7 +3987,7 @@ impl Connection {
     fn execute_rollback(&self, rb: &fsqlite_ast::RollbackStatement) -> Result<()> {
         let cx = Cx::new();
         if let Some(ref sp_name) = rb.to_savepoint {
-            let (idx, snap, canonical_name) = {
+            let (idx, snap, canonical_name, concurrent_snap) = {
                 let savepoints = self.savepoints.borrow();
                 let idx = savepoints
                     .iter()
@@ -4086,13 +3996,35 @@ impl Connection {
                         FrankenError::Internal(format!("no such savepoint: {sp_name}"))
                     })?;
                 let entry = &savepoints[idx];
-                (idx, entry.snapshot.clone(), entry.name.clone())
+                (
+                    idx,
+                    entry.snapshot.clone(),
+                    entry.name.clone(),
+                    entry.concurrent_snapshot.clone(),
+                )
             };
 
             // ROLLBACK TO SAVEPOINT: restore to the named savepoint's snapshot
             // but keep the savepoint (don't pop it).
             if let Some(txn) = self.active_txn.borrow_mut().as_mut() {
                 txn.rollback_to_savepoint(&cx, &canonical_name)?;
+            }
+
+            // MVCC concurrent-writer rollback (bd-14zc / 5E.1):
+            // Restore concurrent write set state if in concurrent mode.
+            if let Some(concurrent_snap) = concurrent_snap {
+                let session_id = self.concurrent_session_id.borrow().ok_or_else(|| {
+                    FrankenError::Internal(
+                        "concurrent savepoint present but no active session".to_owned(),
+                    )
+                })?;
+                let mut registry = self.concurrent_registry.borrow_mut();
+                let handle = registry.get_mut(session_id).ok_or_else(|| {
+                    FrankenError::Internal("concurrent session handle not found".to_owned())
+                })?;
+                concurrent_rollback_to_savepoint(handle, &concurrent_snap).map_err(|e| {
+                    FrankenError::Internal(format!("concurrent rollback failed: {e}"))
+                })?;
             }
 
             {
@@ -4307,9 +4239,29 @@ impl Connection {
             txn.savepoint(&cx, name)?;
         }
 
+        // MVCC concurrent-writer savepoint (bd-14zc / 5E.1):
+        // Capture concurrent write set state if in concurrent mode.
+        let concurrent_snapshot = if *self.concurrent_txn.borrow() {
+            let session_id = self.concurrent_session_id.borrow().ok_or_else(|| {
+                FrankenError::Internal("concurrent transaction active but no session ID".to_owned())
+            })?;
+            let registry = self.concurrent_registry.borrow();
+            let handle = registry.get(session_id).ok_or_else(|| {
+                FrankenError::Internal("concurrent session handle not found".to_owned())
+            })?;
+            Some(
+                concurrent_savepoint(handle, name).map_err(|e| {
+                    FrankenError::Internal(format!("concurrent savepoint failed: {e}"))
+                })?,
+            )
+        } else {
+            None
+        };
+
         self.savepoints.borrow_mut().push(SavepointEntry {
             name: name.to_owned(),
             snapshot: self.snapshot(),
+            concurrent_snapshot,
         });
         Ok(())
     }

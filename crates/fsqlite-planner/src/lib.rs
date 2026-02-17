@@ -2428,6 +2428,7 @@ mod tests {
             n_pages: 500,
             n_rows: 10000,
             source: StatsSource::Analyze,
+            detailed: None,
         };
         assert_eq!(table.source, StatsSource::Analyze);
         let ap = best_access_path(&table, &[], &[], None);
@@ -3129,6 +3130,7 @@ mod tests {
                     n_pages,
                     n_rows,
                     source: StatsSource::Heuristic,
+                    detailed: None,
                 })
                 .boxed()
         }
