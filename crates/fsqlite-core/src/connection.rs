@@ -56,8 +56,8 @@ use fsqlite_mvcc::{
     CommitIndex, ConcurrentHandle, ConcurrentRegistry, ConcurrentSavepoint, FcwResult, GcScheduler,
     GcTickResult, GcTodo, InProcessPageLockTable, MvccError, SsiDecisionCard, SsiDecisionCardDraft,
     SsiDecisionQuery, SsiDecisionType, SsiEvidenceLedger, SsiReadSetSummary, VersionStore,
-    concurrent_abort, concurrent_read_page, concurrent_rollback_to_savepoint, concurrent_savepoint,
-    concurrent_write_page, validate_first_committer_wins,
+    concurrent_abort, concurrent_rollback_to_savepoint, concurrent_savepoint,
+    validate_first_committer_wins,
 };
 // MVCC conflict observability (bd-t6sv2.1)
 use fsqlite_observability::{
@@ -65,7 +65,7 @@ use fsqlite_observability::{
     record_trace_export, record_trace_export_error, record_trace_span_created, reset_trace_metrics,
     trace_metrics_snapshot,
 };
-use fsqlite_types::{CommitSeq, PageData, SchemaEpoch, Snapshot, TxnId, TxnToken};
+use fsqlite_types::{CommitSeq, SchemaEpoch, Snapshot, TxnId, TxnToken};
 
 use crate::wal_adapter::WalBackendAdapter;
 
@@ -10775,7 +10775,7 @@ mod tests {
     };
     use fsqlite_ast::Statement;
     use fsqlite_error::FrankenError;
-    use fsqlite_types::PageNumber;
+    use fsqlite_types::{PageData, PageNumber};
     use fsqlite_types::cx::Cx;
     use fsqlite_types::opcode::{Opcode, P4};
     use fsqlite_types::value::SqliteValue;

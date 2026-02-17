@@ -320,7 +320,7 @@ impl VersionStore {
         page: PageNumber,
         snapshot: &Snapshot,
     ) -> SnapshotResolveTrace {
-        loop {
+        'retry: loop {
             let heads = self.chain_heads.read();
             let Some(&head_idx) = heads.get(&page) else {
                 return SnapshotResolveTrace {
@@ -334,7 +334,6 @@ impl VersionStore {
             let ranges = self.visibility_ranges.read();
             let mut current_idx = head_idx;
             let mut traversed = 0_u64;
-            let mut race_detected = false;
 
             loop {
                 let Some(version) = arena.get(current_idx) else {
@@ -342,8 +341,7 @@ impl VersionStore {
                     // (or prev pointer), but was GC'd before we could read it from the arena.
                     // This implies a newer version exists (making this one stale).
                     // We must retry the lookup from the top to find the new head.
-                    race_detected = true;
-                    break;
+                    continue 'retry;
                 };
                 traversed = traversed.saturating_add(1);
 
@@ -381,10 +379,6 @@ impl VersionStore {
                     };
                 };
                 current_idx = version_pointer_to_idx(prev_ptr);
-            }
-
-            if race_detected {
-                continue;
             }
         }
     }
