@@ -101,6 +101,7 @@ libc = "0.2"
 chacha20poly1305 = "0.10"
 argon2 = "0.5"
 rand = "0.8"
+hashbrown = { version = "0.14", features = ["serde"] }
 rusqlite = { version = "0.32", features = ["bundled", "backup"] }
 asupersync = { version = "0.2.0", path = "../asupersync" }
 

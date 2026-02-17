@@ -7,6 +7,7 @@ pub mod freelist;
 pub mod instrumentation;
 pub mod overflow;
 pub mod payload;
+pub mod swiss_index;
 pub mod swizzle;
 pub mod traits;
 

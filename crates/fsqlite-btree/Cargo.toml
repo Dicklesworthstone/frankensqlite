@@ -12,6 +12,7 @@ fsqlite-types = { workspace = true }
 fsqlite-error = { workspace = true }
 fsqlite-pager = { workspace = true }
 tracing = { workspace = true }
+hashbrown = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

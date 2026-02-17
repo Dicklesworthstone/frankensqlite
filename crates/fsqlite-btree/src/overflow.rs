@@ -16,11 +16,12 @@
 
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::PageNumber;
+use fsqlite_types::limits::MAX_ALLOCATION_SIZE;
 use tracing::warn;
 
 /// Maximum number of overflow pages in a chain (safety bound to prevent
 /// infinite loops on corrupt databases).
-const MAX_OVERFLOW_CHAIN: usize = 1_000_000;
+pub const MAX_OVERFLOW_CHAIN: usize = 1_000_000;
 
 /// Read a complete payload that spans local data and an overflow chain.
 ///
@@ -41,6 +42,9 @@ pub fn read_overflow_chain<F>(
 where
     F: FnMut(PageNumber) -> Result<Vec<u8>>,
 {
+    if total_payload_size > MAX_ALLOCATION_SIZE {
+        return Err(FrankenError::TooBig);
+    }
     let total = total_payload_size as usize;
     let mut payload = Vec::with_capacity(total);
     payload.extend_from_slice(local_data);
@@ -384,5 +388,23 @@ mod tests {
             &mut |_, _| Ok(()),
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_read_overflow_too_big() {
+        let usable = 4096u32;
+        let local_data = b"local";
+        // MAX_ALLOCATION_SIZE + 1
+        let total_size = MAX_ALLOCATION_SIZE.saturating_add(1);
+
+        let result = read_overflow_chain(
+            local_data,
+            PageNumber::new(5).unwrap(),
+            total_size,
+            usable,
+            &mut |_| Ok(vec![]),
+        );
+
+        assert!(matches!(result, Err(FrankenError::TooBig)));
     }
 }

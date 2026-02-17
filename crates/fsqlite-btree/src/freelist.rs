@@ -21,6 +21,7 @@
 
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::PageNumber;
+use fsqlite_types::limits::MAX_PAGE_COUNT;
 
 /// Maximum leaf entries that fit on a single trunk page.
 #[must_use]
@@ -146,6 +147,9 @@ impl Freelist {
             return Ok(pgno);
         }
         // Extend the database file.
+        if self.db_page_count >= MAX_PAGE_COUNT {
+            return Err(FrankenError::DatabaseFull);
+        }
         self.db_page_count += 1;
         PageNumber::new(self.db_page_count).ok_or(FrankenError::DatabaseFull)
     }
@@ -472,6 +476,12 @@ mod tests {
 
         let p = fl.allocate().unwrap();
         assert_eq!(p.get(), 50);
+    }
+
+    #[test]
+    fn test_freelist_max_page_count() {
+        let mut fl = Freelist::new(MAX_PAGE_COUNT);
+        assert!(fl.allocate().is_err());
     }
 
     #[test]

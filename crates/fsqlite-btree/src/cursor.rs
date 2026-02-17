@@ -31,11 +31,9 @@ use fsqlite_pager::TransactionHandle;
 use fsqlite_types::cx::Cx;
 use fsqlite_types::limits::BTREE_MAX_DEPTH;
 use fsqlite_types::record::parse_record;
-use fsqlite_types::serial_type::write_varint;
+use fsqlite_types::serial_type::{read_varint, write_varint};
 use fsqlite_types::{PageNumber, WitnessKey};
 use tracing::{Level, debug, trace, warn};
-
-const MAX_MUTATION_OVERFLOW_CHAIN: usize = 1_000_000;
 
 // ---------------------------------------------------------------------------
 // Page reader trait (for testability)
@@ -1044,11 +1042,11 @@ impl<P: PageWriter> BtCursor<P> {
 
         while let Some(pgno) = current {
             visited += 1;
-            if visited > MAX_MUTATION_OVERFLOW_CHAIN {
+            if visited > overflow::MAX_OVERFLOW_CHAIN {
                 return Err(FrankenError::DatabaseCorrupt {
                     detail: format!(
                         "overflow chain exceeds {} pages while freeing",
-                        MAX_MUTATION_OVERFLOW_CHAIN
+                        overflow::MAX_OVERFLOW_CHAIN
                     ),
                 });
             }
@@ -1225,6 +1223,38 @@ impl<P: PageWriter> BtCursor<P> {
             let child_idx = self.stack[depth - 2].cell_idx as usize;
             let parent_is_root = parent_page_no == self.root_page;
 
+            // Attempt balance_quick optimization for sequential inserts.
+            // This avoids full 3-sibling balancing when just appending to the right.
+            let leaf_entry = &self.stack[depth - 1];
+            let parent_entry = &self.stack[depth - 2];
+
+            if leaf_entry.header.page_type == cell::BtreePageType::LeafTable
+                && insert_idx == leaf_entry.header.cell_count
+                && child_idx == parent_entry.header.cell_count as usize
+            {
+                if let Some((_, n)) = read_varint(cell_data) {
+                    if let Some((rowid, _)) = read_varint(&cell_data[n..]) {
+                        #[allow(clippy::cast_possible_wrap)]
+                        let rowid = rowid as i64;
+                        if let Ok(Some(_new_pgno)) = balance::balance_quick(
+                            cx,
+                            &mut self.pager,
+                            parent_page_no,
+                            leaf_entry.page_no,
+                            cell_data,
+                            rowid,
+                            self.usable_size,
+                        ) {
+                            self.note_split_event();
+                            // Invalidate cursor stack as tree structure changed.
+                            self.stack.clear();
+                            self.at_eof = true;
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+
             let mut outcome = balance::balance_nonroot(
                 cx,
                 &mut self.pager,
@@ -1367,11 +1397,17 @@ impl<P: PageWriter> BtCursor<P> {
             return Err(FrankenError::internal("cursor position out of bounds"));
         }
 
-        // Free overflow chain if present.
+        // Identify overflow chain to free, but DO NOT free it yet.
+        // We must remove the pointer from the leaf page first. If we freed
+        // the chain first and then failed to update the leaf, the leaf would
+        // contain a dangling pointer to a freed (and potentially reused) page,
+        // causing corruption.
+        //
+        // If we update the leaf first and then fail to free the chain, we leak
+        // pages but preserve database integrity. Leaks are recoverable (VACUUM);
+        // corruption is not.
         let cell_ref = self.parse_cell_at(&top, top.cell_idx)?;
-        if let Some(first) = cell_ref.overflow_page {
-            self.free_overflow_chain(cx, first)?;
-        }
+        let overflow_head = cell_ref.overflow_page;
 
         let leaf_page_no = top.page_no;
         let mut page_data = self.pager.read_page(cx, leaf_page_no)?;
@@ -1410,6 +1446,11 @@ impl<P: PageWriter> BtCursor<P> {
             self.at_eof = false;
         }
         self.stack[depth - 1] = refreshed;
+
+        // Now it is safe to free the overflow chain.
+        if let Some(first) = overflow_head {
+            self.free_overflow_chain(cx, first)?;
+        }
 
         Ok((leaf_page_no, new_count))
     }
@@ -1527,6 +1568,27 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
                 return Err(FrankenError::internal("cursor must be on a leaf to delete"));
             }
 
+            // If the leaf is about to become empty (and it's not the root),
+            // balancing will occur, which clears the cursor stack (invalidating position).
+            // We must save the current key/rowid to re-establish position (at the successor)
+            // after balancing.
+            let depth = cursor.stack.len();
+            let needs_anchor = depth > 1 && top.header.cell_count == 1;
+
+            enum Anchor {
+                Rowid(i64),
+                Key(Vec<u8>),
+            }
+            let anchor = if needs_anchor {
+                if cursor.is_table {
+                    Some(Anchor::Rowid(cursor.rowid(cx)?))
+                } else {
+                    Some(Anchor::Key(cursor.payload(cx)?))
+                }
+            } else {
+                None
+            };
+
             // Remove the cell from the leaf. This handles overflow chain
             // cleanup and refreshes the stack entry.
             let (_leaf_page_no, new_count) = cursor.remove_cell_from_leaf(cx)?;
@@ -1536,6 +1598,20 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
             // still fixing the "empty leftmost leaf breaks first()" failure mode.
             if new_count == 0 {
                 cursor.balance_for_delete(cx)?;
+
+                // If we balanced, the stack was cleared. Re-seek to the anchor.
+                // Since the anchor key was just deleted, the seek will land on
+                // the *next* entry (or EOF), which is exactly what we want.
+                if let Some(anc) = anchor {
+                    match anc {
+                        Anchor::Rowid(r) => {
+                            cursor.table_move_to(cx, r)?;
+                        }
+                        Anchor::Key(k) => {
+                            cursor.index_move_to(cx, &k)?;
+                        }
+                    }
+                }
             }
 
             Ok(())

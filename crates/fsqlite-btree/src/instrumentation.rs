@@ -48,6 +48,10 @@ pub struct BtreeMetricsSnapshot {
     pub fsqlite_btree_page_splits_total: u64,
     /// Current B-tree depth gauge.
     pub fsqlite_btree_depth: u64,
+    /// Total number of Swiss Table probes (lookups/inserts/removes).
+    pub fsqlite_swiss_table_probes_total: u64,
+    /// Current Swiss Table load factor (scaled by 1000, e.g. 875 = 0.875).
+    pub fsqlite_swiss_table_load_factor: u64,
 }
 
 /// Per-operation mutable stats while a `btree_op` span is active.
@@ -77,6 +81,8 @@ static BTREE_OP_INSERT_TOTAL: AtomicU64 = AtomicU64::new(0);
 static BTREE_OP_DELETE_TOTAL: AtomicU64 = AtomicU64::new(0);
 static BTREE_PAGE_SPLITS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static BTREE_DEPTH_GAUGE: AtomicU64 = AtomicU64::new(0);
+static SWISS_TABLE_PROBES_TOTAL: AtomicU64 = AtomicU64::new(0);
+static SWISS_TABLE_LOAD_FACTOR: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn record_operation(op_type: BtreeOpType) {
     let counter = match op_type {
@@ -96,6 +102,16 @@ pub(crate) fn set_depth_gauge(depth: usize) {
     BTREE_DEPTH_GAUGE.store(depth_u64, Ordering::Relaxed);
 }
 
+/// Record a Swiss Table probe (lookup/insert/remove).
+pub fn record_swiss_probe() {
+    SWISS_TABLE_PROBES_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Set Swiss Table load factor (scaled by 1000).
+pub fn set_swiss_load_factor(load_factor_milli: u64) {
+    SWISS_TABLE_LOAD_FACTOR.store(load_factor_milli, Ordering::Relaxed);
+}
+
 /// Return a snapshot of B-tree observability counters.
 #[must_use]
 pub fn btree_metrics_snapshot() -> BtreeMetricsSnapshot {
@@ -107,6 +123,8 @@ pub fn btree_metrics_snapshot() -> BtreeMetricsSnapshot {
         },
         fsqlite_btree_page_splits_total: BTREE_PAGE_SPLITS_TOTAL.load(Ordering::Relaxed),
         fsqlite_btree_depth: BTREE_DEPTH_GAUGE.load(Ordering::Relaxed),
+        fsqlite_swiss_table_probes_total: SWISS_TABLE_PROBES_TOTAL.load(Ordering::Relaxed),
+        fsqlite_swiss_table_load_factor: SWISS_TABLE_LOAD_FACTOR.load(Ordering::Relaxed),
     }
 }
 
@@ -117,6 +135,8 @@ pub fn reset_btree_metrics() {
     BTREE_OP_DELETE_TOTAL.store(0, Ordering::Relaxed);
     BTREE_PAGE_SPLITS_TOTAL.store(0, Ordering::Relaxed);
     BTREE_DEPTH_GAUGE.store(0, Ordering::Relaxed);
+    SWISS_TABLE_PROBES_TOTAL.store(0, Ordering::Relaxed);
+    SWISS_TABLE_LOAD_FACTOR.store(0, Ordering::Relaxed);
 }
 
 #[cfg(test)]

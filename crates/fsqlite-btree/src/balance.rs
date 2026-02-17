@@ -28,9 +28,9 @@ use fsqlite_types::serial_type::write_varint;
 const NB: usize = 3;
 
 /// Maximum cells that can be gathered across NB pages plus dividers.
-/// Conservative upper bound: each page can hold at most ~usable/4 cells,
-/// plus NB-1 divider cells.
-const MAX_GATHERED_CELLS: usize = 4096;
+/// Conservative upper bound: max page size (65536) / min cell size (~4 bytes) * NB (3).
+/// We use 65536 as a safe static limit.
+const MAX_GATHERED_CELLS: usize = 65_536;
 
 /// Result of a balancing operation that may require updating higher levels.
 #[derive(Debug)]
@@ -185,7 +185,8 @@ pub fn balance_deeper<W: PageWriter>(
 /// `overflow_cell` is the raw cell bytes that need to move.
 /// `overflow_rowid` is the rowid of the overflow cell.
 ///
-/// Returns the page number of the new sibling.
+/// Returns `Ok(Some(new_page))` if successful, or `Ok(None)` if the
+/// parent page is full and cannot accept the divider cell.
 pub fn balance_quick<W: PageWriter>(
     cx: &Cx,
     writer: &mut W,
@@ -194,7 +195,37 @@ pub fn balance_quick<W: PageWriter>(
     overflow_cell: &[u8],
     overflow_rowid: i64,
     usable_size: u32,
-) -> Result<PageNumber> {
+) -> Result<Option<PageNumber>> {
+    // Read parent page to check for space.
+    let parent_data = writer.read_page(cx, parent_page_no)?;
+    let parent_offset = header_offset_for_page(parent_page_no);
+    let parent_header = BtreePageHeader::parse(&parent_data, parent_offset)?;
+
+    // Calculate required space for the divider cell.
+    // Divider: [4-byte child ptr] [rowid varint]
+    // We don't know the exact divider rowid yet (depends on leaf content),
+    // but we can upper-bound it or estimate it.
+    // Actually, we can read the leaf to get the exact divider rowid,
+    // OR we can just use a conservative estimate (max varint size = 9).
+    // Let's read the leaf first, as we need it anyway for the divider.
+    // But `balance_quick` is an optimization, avoiding the leaf read if parent is full is better?
+    // No, we need to know if parent is full.
+    // Let's assume max divider size (4 + 9 = 13) + 2 byte pointer = 15 bytes.
+    // If parent has < 15 bytes free, abort.
+
+    let free_space = parent_header.cell_content_offset as usize
+        - (parent_offset
+            + usize::from(parent_header.page_type.header_size())
+            + (usize::from(parent_header.cell_count) * 2));
+
+    // We need space for:
+    // 1. The new cell pointer (2 bytes)
+    // 2. The divider cell (4 bytes + varint). Max varint is 9.
+    // Total max requirement: 2 + 4 + 9 = 15 bytes.
+    if free_space < 15 {
+        return Ok(None);
+    }
+
     // Allocate new sibling page.
     let new_pgno = writer.allocate_page(cx)?;
     let mut new_page = vec![0u8; usable_size as usize];
@@ -254,6 +285,8 @@ pub fn balance_quick<W: PageWriter>(
     let divider_size = 4 + varint_size;
 
     // Insert divider into parent and update right_child.
+    // We already checked for space, so this should succeed unless concurrent modification
+    // (which shouldn't happen with exclusive latching).
     insert_cell_into_page(
         cx,
         writer,
@@ -270,7 +303,7 @@ pub fn balance_quick<W: PageWriter>(
         .copy_from_slice(&new_pgno.get().to_be_bytes());
     writer.write_page(cx, parent_page_no, &parent_data)?;
 
-    Ok(new_pgno)
+    Ok(Some(new_pgno))
 }
 
 // ---------------------------------------------------------------------------
@@ -1976,7 +2009,8 @@ mod tests {
             30,
             USABLE,
         )
-        .unwrap();
+        .unwrap()
+        .expect("balance_quick should succeed");
 
         // New sibling should have the overflow cell.
         let new_data = store.pages.get(&new_pgno.get()).unwrap();
@@ -2000,6 +2034,38 @@ mod tests {
         let parent_header = BtreePageHeader::parse(parent_data, 0).unwrap();
         assert_eq!(parent_header.cell_count, 2);
         assert_eq!(parent_header.right_child, Some(new_pgno));
+    }
+
+    #[test]
+    fn test_balance_quick_parent_full_returns_none() {
+        let cx = Cx::new();
+        let mut store = MemPageStore::new(20);
+
+        // Create a parent page that is almost full.
+        // We'll fill it with cells so that only < 15 bytes remain.
+        // Header size = 12.
+        // Set cell_content_offset = 20. Free space = 20 - 12 = 8 bytes.
+        // That's < 15, so balance_quick should fail.
+        let mut full_parent = vec![0u8; USABLE as usize];
+        let header = BtreePageHeader {
+            page_type: BtreePageType::InteriorTable,
+            first_freeblock: 0,
+            cell_count: 0,
+            cell_content_offset: 20, // artificially low
+            fragmented_free_bytes: 0,
+            right_child: Some(pn(3)),
+        };
+        header.write(&mut full_parent, 0);
+        store.pages.insert(2, full_parent);
+
+        store.pages.insert(3, build_leaf_table(&[(10, b"ten")]));
+
+        let result = balance_quick(&cx, &mut store, pn(2), pn(3), b"overflow", 30, USABLE).unwrap();
+
+        assert!(
+            result.is_none(),
+            "balance_quick should return None when parent is full"
+        );
     }
 
     // -- compute_distribution tests --
