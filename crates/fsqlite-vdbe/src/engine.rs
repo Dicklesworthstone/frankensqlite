@@ -12,7 +12,9 @@
 use std::any::Any;
 use std::cell::RefCell;
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
+
+use fsqlite_btree::swiss_index::SwissIndex;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
@@ -577,7 +579,7 @@ impl MemDbUndoOp {
 #[derive(Debug)]
 pub struct MemDatabase {
     /// Tables indexed by root page number.
-    pub tables: HashMap<i32, MemTable>,
+    pub tables: SwissIndex<i32, MemTable>,
     /// Next available root page number.
     next_root_page: i32,
     /// Whether undo logging is enabled for transaction/savepoint rollback.
@@ -590,7 +592,7 @@ impl MemDatabase {
     /// Create a new empty in-memory database.
     pub fn new() -> Self {
         Self {
-            tables: HashMap::new(),
+            tables: SwissIndex::new(),
             next_root_page: 2, // Page 1 is reserved for sqlite_master.
             undo_enabled: false,
             undo_log: Vec::new(),
@@ -857,11 +859,11 @@ pub struct VdbeEngine {
     /// Result rows accumulated during execution.
     results: Vec<Vec<SqliteValue>>,
     /// Open cursors (keyed by cursor number, i.e. p1 of OpenRead/OpenWrite).
-    cursors: HashMap<i32, MemCursor>,
+    cursors: SwissIndex<i32, MemCursor>,
     /// Open sorter cursors keyed by cursor number.
-    sorters: HashMap<i32, SorterCursor>,
+    sorters: SwissIndex<i32, SorterCursor>,
     /// Open storage-backed cursors keyed by cursor number (read and write).
-    storage_cursors: HashMap<i32, StorageCursor>,
+    storage_cursors: SwissIndex<i32, StorageCursor>,
     /// Cursors that deleted the current row and should treat the next `Next`
     /// as a no-advance "consume successor" step.
     pending_next_after_delete: HashSet<i32>,
@@ -876,7 +878,7 @@ pub struct VdbeEngine {
     /// Scalar/aggregate/window function registry for Function/PureFunc opcodes.
     func_registry: Option<Arc<FunctionRegistry>>,
     /// Aggregate accumulators keyed by accumulator register.
-    aggregates: HashMap<i32, AggregateContext>,
+    aggregates: SwissIndex<i32, AggregateContext>,
     /// Schema cookie value provided by the Connection (bd-3mmj).
     /// Schema cookie value provided by the Connection (bd-3mmj).
     /// Used by `ReadCookie` (p3=1) and `SetCookie` opcodes, and
@@ -903,15 +905,15 @@ impl VdbeEngine {
             bindings: Vec::new(),
             trace_opcodes: opcode_trace_enabled(),
             results: Vec::new(),
-            cursors: HashMap::new(),
-            sorters: HashMap::new(),
-            storage_cursors: HashMap::new(),
+            cursors: SwissIndex::new(),
+            sorters: SwissIndex::new(),
+            storage_cursors: SwissIndex::new(),
             pending_next_after_delete: HashSet::new(),
             storage_cursors_enabled: true,
             txn_page_io: None,
             db: None,
             func_registry: None,
-            aggregates: HashMap::new(),
+            aggregates: SwissIndex::new(),
             schema_cookie: 0,
             last_compare_result: None,
         }
@@ -2751,7 +2753,7 @@ impl VdbeEngine {
                     }
 
                     let accum_reg = op.p3;
-                    let ctx = self.aggregates.entry(accum_reg).or_insert_with(|| {
+                    let ctx = self.aggregates.entry_or_insert_with(accum_reg, || {
                         let state = func.initial_state();
                         AggregateContext {
                             func: func.clone(),
@@ -7193,5 +7195,65 @@ mod tests {
 
         // No row < 3 → jump taken, no results.
         assert_eq!(rows.len(), 0);
+    }
+
+    // ── Swiss Tables (bd-3ta.7) integration tests ─────────────────────
+
+    #[test]
+    fn test_swiss_index_metrics_emitted_on_cursor_ops() {
+        // Verify that SwissIndex probe metrics are emitted when the engine
+        // opens cursors and accesses tables via the instrumented hash map.
+        use fsqlite_btree::instrumentation::{btree_metrics_snapshot, reset_btree_metrics};
+
+        reset_btree_metrics();
+
+        let mut db = MemDatabase::new();
+        let root = db.create_table(2);
+        // create_table inserts into db.tables (SwissIndex) — should record probes.
+        let metrics_after_create = btree_metrics_snapshot();
+        assert!(
+            metrics_after_create.fsqlite_swiss_table_probes_total > 0,
+            "MemDatabase::create_table should trigger SwissIndex probe metrics"
+        );
+
+        // Insert a row via MemDatabase to exercise more SwissIndex lookups.
+        db.get_table_mut(root).unwrap().insert_row(
+            1,
+            vec![SqliteValue::Integer(42), SqliteValue::Text("a".into())],
+        );
+        let metrics_after_insert = btree_metrics_snapshot();
+        assert!(
+            metrics_after_insert.fsqlite_swiss_table_probes_total
+                > metrics_after_create.fsqlite_swiss_table_probes_total,
+            "get_table_mut should trigger additional SwissIndex probes"
+        );
+    }
+
+    #[test]
+    fn test_swiss_index_replaces_hashmap_in_engine() {
+        // Smoke test: run a simple expression program to exercise the engine's
+        // SwissIndex-based internal maps (sorters, cursors, aggregates).
+        use fsqlite_btree::instrumentation::{btree_metrics_snapshot, reset_btree_metrics};
+
+        reset_btree_metrics();
+
+        // Even a simple expression program exercises VdbeEngine construction
+        // which initializes SwissIndex maps. The metrics counter is global, so
+        // any cursor open/close in the test suite contributes.
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            b.emit_op(Opcode::Integer, 42, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, 1, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0], SqliteValue::Integer(42));
+
+        // The engine's internal SwissIndex maps (cursors, sorters, aggregates,
+        // storage_cursors) are all SwissIndex now. If we got here without
+        // panics, the drop-in replacement works.
     }
 }

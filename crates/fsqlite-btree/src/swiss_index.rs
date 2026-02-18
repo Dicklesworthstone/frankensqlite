@@ -68,8 +68,37 @@ where
         Q: Hash + Eq + ?Sized,
     {
         self.record_probe();
-        // Read-only, load factor doesn't change
         self.inner.get(key)
+    }
+
+    /// Returns a mutable reference to the value corresponding to the key.
+    ///
+    /// Triggers observability events.
+    pub fn get_mut<Q>(&mut self, key: &Q) -> Option<&mut V>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        self.record_probe();
+        self.inner.get_mut(key)
+    }
+
+    /// Gets the given key's corresponding entry in the map for in-place manipulation.
+    ///
+    /// Triggers observability events.
+    /// Gets the given key's corresponding entry for in-place manipulation,
+    /// inserting a default value if the key is absent.
+    ///
+    /// Triggers observability events (probe count; load factor updated on
+    /// next insert/remove since entry borrows prevent self-access).
+    pub fn entry_or_insert_with(&mut self, key: K, default: impl FnOnce() -> V) -> &mut V {
+        record_swiss_probe();
+        self.inner.entry(key).or_insert_with(default)
+    }
+
+    /// Returns an iterator visiting all values in arbitrary order.
+    pub fn values(&self) -> hashbrown::hash_map::Values<'_, K, V> {
+        self.inner.values()
     }
 
     /// Returns true if the map contains a value for the specified key.
@@ -145,6 +174,18 @@ where
         } else {
             (self.inner.len() as u64 * 1000) / capacity as u64
         }
+    }
+}
+
+impl<K, V, Q> std::ops::Index<&Q> for SwissIndex<K, V>
+where
+    K: Eq + Hash + Borrow<Q>,
+    Q: Hash + Eq + ?Sized,
+{
+    type Output = V;
+
+    fn index(&self, key: &Q) -> &V {
+        self.inner.get(key).expect("no entry found for key")
     }
 }
 
