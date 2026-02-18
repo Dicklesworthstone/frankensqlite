@@ -15,6 +15,7 @@ mod repro_delete_skip;
 pub mod vectorized;
 pub mod vectorized_agg;
 pub mod vectorized_dispatch;
+pub mod vectorized_hash_join;
 pub mod vectorized_join;
 pub mod vectorized_ops;
 pub mod vectorized_scan;
