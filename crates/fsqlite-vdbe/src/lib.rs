@@ -21,6 +21,9 @@ pub mod vectorized_ops;
 pub mod vectorized_scan;
 pub mod vectorized_sort;
 
+#[cfg(test)]
+mod vectorized_prop_tests;
+
 // ── Label System ────────────────────────────────────────────────────────────
 
 /// An opaque handle representing a forward-reference label.
