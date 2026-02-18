@@ -165,6 +165,11 @@ impl MemCursor {
 }
 
 /// Cursor state for sorter opcodes (`SorterOpen`, `SorterInsert`, ...).
+///
+/// Supports external merge sort: when in-memory rows exceed `spill_threshold`
+/// bytes, the current batch is sorted and flushed to a temporary file as a
+/// "run".  At `SorterSort` time, all runs (plus any remaining in-memory rows)
+/// are merged via k-way merge.
 #[derive(Debug, Clone)]
 struct SorterCursor {
     /// Number of leading columns used as sort key.
@@ -175,12 +180,44 @@ struct SorterCursor {
     rows: Vec<Vec<SqliteValue>>,
     /// Current position after `SorterSort`/`SorterNext`.
     position: Option<usize>,
+    /// Estimated bytes consumed by `rows` (approximate).
+    memory_used: usize,
+    /// Memory limit before spilling to disk (default 100 MiB).
+    spill_threshold: usize,
+    /// Sorted runs that have been spilled to disk.
+    spill_runs: Vec<SpillRun>,
+    /// Total rows sorted (across all runs + final merge).
+    rows_sorted_total: u64,
+    /// Total pages spilled to disk.
+    spill_pages_total: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SortKeyOrder {
     Asc,
     Desc,
+}
+
+/// Default spill threshold: 100 MiB.
+const SORTER_DEFAULT_SPILL_THRESHOLD: usize = 100 * 1024 * 1024;
+
+/// Approximate page size for spill accounting (4 KiB).
+const SORTER_SPILL_PAGE_SIZE: usize = 4096;
+
+/// A sorted run that has been flushed to a temporary file.
+///
+/// Each run stores length-prefixed serialized records in sorted order.
+/// Format per record: `[u32-le length][serialized record bytes]`.
+#[derive(Debug, Clone)]
+struct SpillRun {
+    /// Path to the temporary file containing serialized sorted records.
+    path: std::path::PathBuf,
+    /// Number of records in this run (used for merge accounting).
+    #[allow(dead_code)]
+    record_count: u64,
+    /// Total bytes written (used for page accounting).
+    #[allow(dead_code)]
+    bytes_written: u64,
 }
 
 impl SorterCursor {
@@ -195,14 +232,276 @@ impl SorterCursor {
             sort_key_orders,
             rows: Vec::new(),
             position: None,
+            memory_used: 0,
+            spill_threshold: SORTER_DEFAULT_SPILL_THRESHOLD,
+            spill_runs: Vec::new(),
+            rows_sorted_total: 0,
+            spill_pages_total: 0,
         }
     }
 
-    fn sort(&mut self) {
+    /// Estimate the memory footprint of a decoded row.
+    fn estimate_row_size(row: &[SqliteValue]) -> usize {
+        // Base overhead per Vec element + per-value overhead
+        let mut size = std::mem::size_of::<Vec<SqliteValue>>() + row.len() * 24;
+        for val in row {
+            match val {
+                SqliteValue::Text(s) => size += s.len(),
+                SqliteValue::Blob(b) => size += b.len(),
+                _ => {}
+            }
+        }
+        size
+    }
+
+    /// Insert a row and spill to disk if memory exceeds the threshold.
+    fn insert_row(&mut self, row: Vec<SqliteValue>) -> Result<()> {
+        self.memory_used += Self::estimate_row_size(&row);
+        self.rows.push(row);
+
+        if self.memory_used >= self.spill_threshold {
+            self.spill_to_disk()?;
+        }
+        Ok(())
+    }
+
+    /// Sort the in-memory rows, write them to a temp file, and clear them.
+    fn spill_to_disk(&mut self) -> Result<()> {
+        use std::io::Write;
+
+        if self.rows.is_empty() {
+            return Ok(());
+        }
+
+        // Sort current batch
         let key_columns = self.key_columns;
         let orders = self.sort_key_orders.clone();
         self.rows
             .sort_by(|lhs, rhs| compare_sorter_rows(lhs, rhs, key_columns, &orders));
+
+        // Write to temp file.  We use `keep()` to detach the auto-delete
+        // guard so the file persists until we explicitly remove it in
+        // `sort()` / `reset()`.
+        let tmp = tempfile::NamedTempFile::new()
+            .map_err(|e| FrankenError::internal(format!("sorter spill tempfile: {e}")))?;
+        let (file, path) = tmp
+            .keep()
+            .map_err(|e| FrankenError::internal(format!("sorter spill keep: {e}")))?;
+        let mut writer = std::io::BufWriter::new(file);
+
+        let record_count = self.rows.len() as u64;
+        let mut bytes_written: u64 = 0;
+        for row in &self.rows {
+            let blob = serialize_record(row);
+            let len_bytes = (blob.len() as u32).to_le_bytes();
+            writer
+                .write_all(&len_bytes)
+                .map_err(|e| FrankenError::internal(format!("sorter spill write len: {e}")))?;
+            writer
+                .write_all(&blob)
+                .map_err(|e| FrankenError::internal(format!("sorter spill write data: {e}")))?;
+            bytes_written += 4 + blob.len() as u64;
+        }
+        writer
+            .flush()
+            .map_err(|e| FrankenError::internal(format!("sorter spill flush: {e}")))?;
+
+        let pages = (bytes_written as usize + SORTER_SPILL_PAGE_SIZE - 1) / SORTER_SPILL_PAGE_SIZE;
+        self.spill_pages_total += pages as u64;
+
+        tracing::warn!(
+            rows = record_count,
+            bytes = bytes_written,
+            pages,
+            run_index = self.spill_runs.len(),
+            "sorter spilling to disk"
+        );
+
+        self.spill_runs.push(SpillRun {
+            path,
+            record_count,
+            bytes_written,
+        });
+
+        self.rows_sorted_total += record_count;
+        self.rows.clear();
+        self.memory_used = 0;
+        Ok(())
+    }
+
+    /// Sort the sorter, merging any spilled runs with in-memory rows.
+    ///
+    /// After this call, `self.rows` contains the fully sorted result and
+    /// `self.spill_runs` is drained.
+    #[allow(clippy::too_many_lines)]
+    fn sort(&mut self) -> Result<()> {
+        if self.spill_runs.is_empty() {
+            // Pure in-memory sort — fast path.
+            let key_columns = self.key_columns;
+            let orders = self.sort_key_orders.clone();
+            self.rows
+                .sort_by(|lhs, rhs| compare_sorter_rows(lhs, rhs, key_columns, &orders));
+            self.rows_sorted_total += self.rows.len() as u64;
+            return Ok(());
+        }
+
+        // Sort remaining in-memory rows as one more "run".
+        let key_columns = self.key_columns;
+        let orders = self.sort_key_orders.clone();
+        self.rows
+            .sort_by(|lhs, rhs| compare_sorter_rows(lhs, rhs, key_columns, &orders));
+
+        // Collect all runs: disk runs first, then in-memory remainder.
+        let mut run_iters: Vec<RunIterator> = Vec::with_capacity(self.spill_runs.len() + 1);
+        for run in &self.spill_runs {
+            run_iters.push(RunIterator::from_file(&run.path)?);
+        }
+        if !self.rows.is_empty() {
+            let mem_rows = std::mem::take(&mut self.rows);
+            self.rows_sorted_total += mem_rows.len() as u64;
+            run_iters.push(RunIterator::from_memory(mem_rows));
+        }
+
+        // K-way merge using a simple tournament approach.
+        let mut merged: Vec<Vec<SqliteValue>> = Vec::new();
+
+        // Advance all iterators to their first element.
+        for iter in &mut run_iters {
+            iter.advance()?;
+        }
+
+        loop {
+            // Find the run with the smallest current element.
+            let mut best_idx: Option<usize> = None;
+            for (i, iter) in run_iters.iter().enumerate() {
+                let Some(row) = iter.current() else {
+                    continue;
+                };
+                if let Some(bi) = best_idx {
+                    if let Some(best_row) = run_iters[bi].current() {
+                        if compare_sorter_rows(row, best_row, key_columns, &orders)
+                            == Ordering::Less
+                        {
+                            best_idx = Some(i);
+                        }
+                    }
+                } else {
+                    best_idx = Some(i);
+                }
+            }
+
+            let Some(idx) = best_idx else {
+                break; // All runs exhausted.
+            };
+
+            if let Some(row) = run_iters[idx].take_current() {
+                merged.push(row);
+            }
+            run_iters[idx].advance()?;
+        }
+
+        tracing::debug!(
+            rows = merged.len(),
+            runs = self.spill_runs.len() + 1,
+            "sorter merge complete"
+        );
+
+        // Clean up temp files.
+        for run in &self.spill_runs {
+            let _ = std::fs::remove_file(&run.path);
+        }
+        self.spill_runs.clear();
+        self.rows = merged;
+        self.memory_used = 0;
+        Ok(())
+    }
+
+    /// Clear all rows and spill state (for `ResetSorter`).
+    fn reset(&mut self) {
+        self.rows.clear();
+        self.position = None;
+        self.memory_used = 0;
+        // Clean up temp files.
+        for run in &self.spill_runs {
+            let _ = std::fs::remove_file(&run.path);
+        }
+        self.spill_runs.clear();
+    }
+}
+
+/// Iterator over records in a sorted run (either disk-backed or in-memory).
+enum RunIterator {
+    /// Records read from a temporary file.
+    File {
+        reader: std::io::BufReader<std::fs::File>,
+        current: Option<Vec<SqliteValue>>,
+    },
+    /// Records from an in-memory Vec (used for the final unsorted batch).
+    Memory {
+        rows: std::vec::IntoIter<Vec<SqliteValue>>,
+        current: Option<Vec<SqliteValue>>,
+    },
+}
+
+impl RunIterator {
+    fn from_file(path: &std::path::Path) -> Result<Self> {
+        let file = std::fs::File::open(path)
+            .map_err(|e| FrankenError::internal(format!("sorter run open: {e}")))?;
+        Ok(Self::File {
+            reader: std::io::BufReader::new(file),
+            current: None,
+        })
+    }
+
+    fn from_memory(rows: Vec<Vec<SqliteValue>>) -> Self {
+        Self::Memory {
+            rows: rows.into_iter(),
+            current: None,
+        }
+    }
+
+    fn current(&self) -> Option<&Vec<SqliteValue>> {
+        match self {
+            Self::File { current, .. } | Self::Memory { current, .. } => current.as_ref(),
+        }
+    }
+
+    fn take_current(&mut self) -> Option<Vec<SqliteValue>> {
+        match self {
+            Self::File { current, .. } | Self::Memory { current, .. } => current.take(),
+        }
+    }
+
+    fn advance(&mut self) -> Result<()> {
+        match self {
+            Self::File { reader, current } => {
+                use std::io::Read;
+                let mut len_buf = [0u8; 4];
+                match reader.read_exact(&mut len_buf) {
+                    Ok(()) => {
+                        let len = u32::from_le_bytes(len_buf) as usize;
+                        let mut buf = vec![0u8; len];
+                        reader
+                            .read_exact(&mut buf)
+                            .map_err(|e| FrankenError::internal(format!("sorter run read: {e}")))?;
+                        let row = parse_record(&buf).ok_or_else(|| {
+                            FrankenError::internal("sorter run: malformed record")
+                        })?;
+                        *current = Some(row);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                        *current = None;
+                    }
+                    Err(e) => {
+                        return Err(FrankenError::internal(format!("sorter run read len: {e}")));
+                    }
+                }
+            }
+            Self::Memory { rows, current } => {
+                *current = rows.next();
+            }
+        }
+        Ok(())
     }
 }
 
@@ -788,6 +1087,13 @@ static FSQLITE_VDBE_STATEMENT_DURATION_US_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// Monotonic program ID counter for tracing correlation.
 static VDBE_PROGRAM_ID_SEQ: AtomicU64 = AtomicU64::new(1);
 
+// ── Sort metrics (bd-1rw.4) ─────────────────────────────────────────────────
+
+/// Total rows sorted across all sorter invocations.
+static FSQLITE_SORT_ROWS_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Total pages spilled to disk by sorters.
+static FSQLITE_SORT_SPILL_PAGES_TOTAL: AtomicU64 = AtomicU64::new(0);
+
 /// Snapshot of VDBE execution metrics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VdbeMetricsSnapshot {
@@ -797,6 +1103,10 @@ pub struct VdbeMetricsSnapshot {
     pub statements_total: u64,
     /// Cumulative statement duration in microseconds.
     pub statement_duration_us_total: u64,
+    /// Total rows sorted across all sorter invocations.
+    pub sort_rows_total: u64,
+    /// Total pages spilled to disk by sorters.
+    pub sort_spill_pages_total: u64,
 }
 
 /// Read a point-in-time snapshot of VDBE execution metrics.
@@ -807,6 +1117,8 @@ pub fn vdbe_metrics_snapshot() -> VdbeMetricsSnapshot {
         statements_total: FSQLITE_VDBE_STATEMENTS_TOTAL.load(AtomicOrdering::Relaxed),
         statement_duration_us_total: FSQLITE_VDBE_STATEMENT_DURATION_US_TOTAL
             .load(AtomicOrdering::Relaxed),
+        sort_rows_total: FSQLITE_SORT_ROWS_TOTAL.load(AtomicOrdering::Relaxed),
+        sort_spill_pages_total: FSQLITE_SORT_SPILL_PAGES_TOTAL.load(AtomicOrdering::Relaxed),
     }
 }
 
@@ -815,6 +1127,8 @@ pub fn reset_vdbe_metrics() {
     FSQLITE_VDBE_OPCODES_EXECUTED_TOTAL.store(0, AtomicOrdering::Relaxed);
     FSQLITE_VDBE_STATEMENTS_TOTAL.store(0, AtomicOrdering::Relaxed);
     FSQLITE_VDBE_STATEMENT_DURATION_US_TOTAL.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_SORT_ROWS_TOTAL.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_SORT_SPILL_PAGES_TOTAL.store(0, AtomicOrdering::Relaxed);
 }
 
 /// Register spans touched by an opcode.
@@ -1644,7 +1958,30 @@ impl VdbeEngine {
                     self.pending_next_after_delete.remove(&cursor_id);
                     let is_empty = if let Some(sorter) = self.sorters.get_mut(&cursor_id) {
                         if matches!(op.opcode, Opcode::Sort | Opcode::SorterSort) {
-                            sorter.sort();
+                            sorter.sort()?;
+                            // Flush per-sorter metrics to global counters.
+                            let rows = sorter.rows_sorted_total;
+                            let spill_pages = sorter.spill_pages_total;
+                            let merge_runs = sorter.spill_runs.len() as u64;
+                            FSQLITE_SORT_ROWS_TOTAL.fetch_add(rows, AtomicOrdering::Relaxed);
+                            FSQLITE_SORT_SPILL_PAGES_TOTAL
+                                .fetch_add(spill_pages, AtomicOrdering::Relaxed);
+                            sorter.rows_sorted_total = 0;
+                            sorter.spill_pages_total = 0;
+                            // Tracing span for sort observability.
+                            let _span = tracing::debug_span!(
+                                "sort",
+                                rows_sorted = rows,
+                                spill_pages = spill_pages,
+                                merge_runs = merge_runs,
+                            )
+                            .entered();
+                            tracing::debug!(
+                                rows_sorted = rows,
+                                spill_pages = spill_pages,
+                                merge_runs = merge_runs,
+                                "sort completed"
+                            );
                         }
                         if sorter.rows.is_empty() {
                             sorter.position = None;
@@ -2336,7 +2673,8 @@ impl VdbeEngine {
                     let cursor_id = op.p1;
                     let record = self.get_reg(op.p2).clone();
                     if let Some(sorter) = self.sorters.get_mut(&cursor_id) {
-                        sorter.rows.push(decode_record(&record)?);
+                        let decoded = decode_record(&record)?;
+                        sorter.insert_row(decoded)?;
                     }
                     pc += 1;
                 }
@@ -2678,8 +3016,7 @@ impl VdbeEngine {
 
                 Opcode::ResetSorter => {
                     if let Some(sorter) = self.sorters.get_mut(&op.p1) {
-                        sorter.rows.clear();
-                        sorter.position = None;
+                        sorter.reset();
                     }
                     pc += 1;
                 }
@@ -7255,5 +7592,219 @@ mod tests {
         // The engine's internal SwissIndex maps (cursors, sorters, aggregates,
         // storage_cursors) are all SwissIndex now. If we got here without
         // panics, the drop-in replacement works.
+    }
+
+    // ── External Sort Tests (bd-1rw.4) ──────────────────────────────────
+
+    #[test]
+    fn test_sort_metrics_emitted_on_sorter_sort() {
+        // Verify that sort row metrics are updated when a sorter sorts rows.
+        reset_vdbe_metrics();
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            let loop_start = b.emit_label();
+            let empty = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+
+            let r_value = b.alloc_reg();
+            let r_record = b.alloc_reg();
+            let r_sorted = b.alloc_reg();
+
+            b.emit_op(Opcode::SorterOpen, 0, 1, 0, P4::None, 0);
+
+            for value in [50, 30, 10, 40, 20] {
+                b.emit_op(Opcode::Integer, value, r_value, 0, P4::None, 0);
+                b.emit_op(Opcode::MakeRecord, r_value, 1, r_record, P4::None, 0);
+                b.emit_op(Opcode::SorterInsert, 0, r_record, 0, P4::None, 0);
+            }
+
+            b.emit_jump_to_label(Opcode::SorterSort, 0, 0, empty, P4::None, 0);
+            b.resolve_label(loop_start);
+            b.emit_op(Opcode::SorterData, 0, r_sorted, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_sorted, 1, 0, P4::None, 0);
+            b.emit_jump_to_label(Opcode::SorterNext, 0, 0, loop_start, P4::None, 0);
+            b.resolve_label(empty);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+
+        assert_eq!(rows.len(), 5);
+        let metrics = vdbe_metrics_snapshot();
+        assert!(
+            metrics.sort_rows_total >= 5,
+            "sort_rows_total should be >= 5, got {}",
+            metrics.sort_rows_total
+        );
+        // No spill expected for 5 tiny rows.
+        assert_eq!(
+            metrics.sort_spill_pages_total, 0,
+            "no spill expected for small dataset"
+        );
+    }
+
+    #[test]
+    fn test_sorter_spill_to_disk_under_low_threshold() {
+        // Set an artificially low spill threshold to trigger disk spill
+        // with a small dataset, then verify the external merge produces
+        // correct sorted output.
+
+        // Build the sorter cursor directly to test spill logic.
+        let mut sorter = SorterCursor::new(1, vec![SortKeyOrder::Asc]);
+        // Set threshold to 1 byte to force immediate spill on first insert.
+        sorter.spill_threshold = 1;
+
+        // Insert several rows — each should trigger a spill.
+        for value in [50i64, 30, 10, 40, 20] {
+            sorter
+                .insert_row(vec![SqliteValue::Integer(value)])
+                .expect("insert should succeed");
+        }
+
+        // We should have spilled runs.
+        assert!(
+            !sorter.spill_runs.is_empty(),
+            "low threshold should cause spills"
+        );
+        let spill_count = sorter.spill_runs.len();
+        assert!(
+            sorter.spill_pages_total > 0,
+            "spill_pages_total should be > 0"
+        );
+
+        // Sort (triggers merge).
+        sorter.sort().expect("sort should succeed");
+
+        // After merge, all runs should be cleaned up.
+        assert!(sorter.spill_runs.is_empty(), "runs should be drained");
+
+        // Verify sorted order.
+        let values: Vec<i64> = sorter.rows.iter().map(|r| r[0].to_integer()).collect();
+        assert_eq!(values, vec![10, 20, 30, 40, 50]);
+
+        // All 5 rows should have been counted (spill batches + in-memory remainder).
+        assert!(
+            sorter.rows_sorted_total >= 5,
+            "rows_sorted_total should be >= 5, got {}",
+            sorter.rows_sorted_total
+        );
+        // At least one spill run was created.
+        assert!(spill_count >= 1, "at least one spill run expected");
+    }
+
+    #[test]
+    fn test_sorter_reset_cleans_spill_state() {
+        // Verify that reset() clears in-memory rows, position, and spill runs.
+        let mut sorter = SorterCursor::new(1, vec![SortKeyOrder::Asc]);
+        sorter.spill_threshold = 1;
+
+        for value in [3i64, 1, 2] {
+            sorter
+                .insert_row(vec![SqliteValue::Integer(value)])
+                .expect("insert should succeed");
+        }
+        assert!(!sorter.spill_runs.is_empty());
+
+        sorter.reset();
+
+        assert!(sorter.rows.is_empty(), "rows should be cleared");
+        assert!(sorter.position.is_none(), "position should be None");
+        assert!(sorter.spill_runs.is_empty(), "spill_runs should be cleared");
+        assert_eq!(sorter.memory_used, 0, "memory_used should be 0");
+    }
+
+    #[test]
+    fn test_sorter_desc_key_order_with_external_merge() {
+        // Verify that DESC sort order works correctly through the external
+        // merge path.
+        let mut sorter = SorterCursor::new(1, vec![SortKeyOrder::Desc]);
+        sorter.spill_threshold = 1;
+
+        for value in [10i64, 50, 30, 20, 40] {
+            sorter
+                .insert_row(vec![SqliteValue::Integer(value)])
+                .expect("insert should succeed");
+        }
+
+        sorter.sort().expect("sort should succeed");
+
+        let values: Vec<i64> = sorter.rows.iter().map(|r| r[0].to_integer()).collect();
+        assert_eq!(values, vec![50, 40, 30, 20, 10]);
+    }
+
+    #[test]
+    fn test_sorter_multi_column_key_with_mixed_order() {
+        // Test sorting with 2 key columns: first ASC, second DESC.
+        let mut sorter = SorterCursor::new(2, vec![SortKeyOrder::Asc, SortKeyOrder::Desc]);
+
+        // Insert rows: (group, value)
+        for (group, value) in [(1i64, 30i64), (2, 10), (1, 20), (2, 40), (1, 10)] {
+            sorter
+                .insert_row(vec![
+                    SqliteValue::Integer(group),
+                    SqliteValue::Integer(value),
+                ])
+                .expect("insert should succeed");
+        }
+
+        sorter.sort().expect("sort should succeed");
+
+        let values: Vec<(i64, i64)> = sorter
+            .rows
+            .iter()
+            .map(|r| (r[0].to_integer(), r[1].to_integer()))
+            .collect();
+        // Group 1 first (ASC), within group value DESC: 30, 20, 10.
+        // Group 2 second, within group value DESC: 40, 10.
+        assert_eq!(values, vec![(1, 30), (1, 20), (1, 10), (2, 40), (2, 10)]);
+    }
+
+    #[test]
+    fn test_sorter_memory_estimation() {
+        // Verify memory tracking increases with row insertions.
+        let mut sorter = SorterCursor::new(1, vec![SortKeyOrder::Asc]);
+        assert_eq!(sorter.memory_used, 0);
+
+        sorter
+            .insert_row(vec![SqliteValue::Integer(42)])
+            .expect("insert should succeed");
+        let after_one = sorter.memory_used;
+        assert!(after_one > 0, "memory should increase after insert");
+
+        sorter
+            .insert_row(vec![SqliteValue::Text("hello world".into())])
+            .expect("insert should succeed");
+        let after_two = sorter.memory_used;
+        assert!(
+            after_two > after_one,
+            "memory should increase with text value"
+        );
+    }
+
+    #[test]
+    fn test_sorter_empty_sort() {
+        // Sorting an empty sorter should succeed and leave rows empty.
+        let mut sorter = SorterCursor::new(1, vec![SortKeyOrder::Asc]);
+        sorter.sort().expect("empty sort should succeed");
+        assert!(sorter.rows.is_empty());
+    }
+
+    #[test]
+    fn test_sorter_pure_inmemory_sort_path() {
+        // Verify the fast in-memory path works when no spill occurs.
+        let mut sorter = SorterCursor::new(1, vec![SortKeyOrder::Asc]);
+        // Default threshold is 100 MiB — won't spill.
+
+        for value in [5i64, 3, 1, 4, 2] {
+            sorter
+                .insert_row(vec![SqliteValue::Integer(value)])
+                .expect("insert should succeed");
+        }
+
+        assert!(sorter.spill_runs.is_empty(), "no spill expected");
+        sorter.sort().expect("sort should succeed");
+
+        let values: Vec<i64> = sorter.rows.iter().map(|r| r[0].to_integer()).collect();
+        assert_eq!(values, vec![1, 2, 3, 4, 5]);
+        assert_eq!(sorter.rows_sorted_total, 5);
     }
 }
