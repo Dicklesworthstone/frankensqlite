@@ -164,6 +164,164 @@ const fn decode_state(raw: u64) -> SwizzleState {
     }
 }
 
+// ── Swizzle Registry (bd-3ta.3) ─────────────────────────────────────────────
+
+use std::collections::HashMap;
+use std::sync::Mutex;
+
+use crate::instrumentation::{
+    record_swizzle_fault, record_swizzle_in, record_swizzle_out, set_swizzle_ratio,
+};
+
+/// Tracks the swizzle state of pages for buffer hot-path optimization.
+///
+/// The registry maintains a mapping from page IDs to their current swizzle
+/// state, temperature, and frame address.  It coordinates with the
+/// instrumentation layer to emit metrics and tracing spans.
+///
+/// Thread-safe: all operations are protected by a `Mutex`.
+#[derive(Debug)]
+pub struct SwizzleRegistry {
+    /// Page ID → entry mapping.
+    entries: Mutex<HashMap<u64, SwizzleEntry>>,
+}
+
+/// Per-page swizzle tracking entry.
+#[derive(Debug, Clone, Copy)]
+struct SwizzleEntry {
+    /// Current temperature state.
+    temperature: PageTemperature,
+    /// Whether this page is currently swizzled (frame resident).
+    swizzled: bool,
+    /// Frame address if swizzled, 0 otherwise.
+    frame_addr: u64,
+}
+
+impl SwizzleRegistry {
+    /// Create an empty registry.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Register a page as tracked (initially unswizzled, cold).
+    pub fn register_page(&self, page_id: u64) {
+        let mut entries = self.entries.lock().expect("swizzle registry lock");
+        entries.entry(page_id).or_insert(SwizzleEntry {
+            temperature: PageTemperature::Cold,
+            swizzled: false,
+            frame_addr: 0,
+        });
+    }
+
+    /// Attempt to swizzle a page (mark it as buffer-resident at `frame_addr`).
+    ///
+    /// Returns `true` if the swizzle succeeded, `false` if the page was
+    /// already swizzled or not registered.
+    pub fn try_swizzle(&self, page_id: u64, frame_addr: u64) -> bool {
+        let mut entries = self.entries.lock().expect("swizzle registry lock");
+        if let Some(entry) = entries.get_mut(&page_id) {
+            if entry.swizzled {
+                record_swizzle_fault();
+                return false;
+            }
+            entry.swizzled = true;
+            entry.frame_addr = frame_addr;
+            entry.temperature = PageTemperature::Hot;
+            drop(entries);
+            record_swizzle_in(page_id);
+            self.update_ratio();
+            true
+        } else {
+            record_swizzle_fault();
+            false
+        }
+    }
+
+    /// Attempt to unswizzle a page (mark as evicted from buffer).
+    ///
+    /// Returns `true` if the unswizzle succeeded, `false` if the page was
+    /// not swizzled or not registered.
+    pub fn try_unswizzle(&self, page_id: u64) -> bool {
+        let mut entries = self.entries.lock().expect("swizzle registry lock");
+        if let Some(entry) = entries.get_mut(&page_id) {
+            if !entry.swizzled {
+                record_swizzle_fault();
+                return false;
+            }
+            entry.swizzled = false;
+            entry.frame_addr = 0;
+            entry.temperature = PageTemperature::Cold;
+            drop(entries);
+            record_swizzle_out(page_id);
+            self.update_ratio();
+            true
+        } else {
+            record_swizzle_fault();
+            false
+        }
+    }
+
+    /// Check whether a page is currently swizzled.
+    #[must_use]
+    pub fn is_swizzled(&self, page_id: u64) -> bool {
+        let entries = self.entries.lock().expect("swizzle registry lock");
+        entries.get(&page_id).is_some_and(|entry| entry.swizzled)
+    }
+
+    /// Return the frame address for a swizzled page, or `None`.
+    #[must_use]
+    pub fn frame_addr(&self, page_id: u64) -> Option<u64> {
+        let entries = self.entries.lock().expect("swizzle registry lock");
+        entries.get(&page_id).and_then(|entry| {
+            if entry.swizzled {
+                Some(entry.frame_addr)
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Number of tracked pages.
+    #[must_use]
+    pub fn tracked_count(&self) -> usize {
+        self.entries.lock().expect("swizzle registry lock").len()
+    }
+
+    /// Number of currently swizzled pages.
+    #[must_use]
+    pub fn swizzled_count(&self) -> usize {
+        self.entries
+            .lock()
+            .expect("swizzle registry lock")
+            .values()
+            .filter(|e| e.swizzled)
+            .count()
+    }
+
+    /// Compute and update the global swizzle ratio gauge.
+    fn update_ratio(&self) {
+        let entries = self.entries.lock().expect("swizzle registry lock");
+        let total = entries.len();
+        if total == 0 {
+            set_swizzle_ratio(0);
+            return;
+        }
+        let swizzled = entries.values().filter(|e| e.swizzled).count();
+        drop(entries);
+        let ratio_milli = (swizzled as u64 * 1000) / total as u64;
+        set_swizzle_ratio(ratio_milli);
+    }
+}
+
+impl Default for SwizzleRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -288,6 +446,223 @@ mod tests {
                 to: PageTemperature::Cold,
             },
             "bead_id={BEAD_ID} case=reject_hot_to_cold"
+        );
+    }
+
+    // ── SwizzleRegistry tests (bd-3ta.3) ────────────────────────────────
+
+    const BEAD_REGISTRY: &str = "bd-3ta.3";
+
+    #[test]
+    fn registry_register_and_query() {
+        let reg = SwizzleRegistry::new();
+        reg.register_page(1);
+        assert_eq!(
+            reg.tracked_count(),
+            1,
+            "bead_id={BEAD_REGISTRY} case=tracked_count_after_register"
+        );
+        assert!(
+            !reg.is_swizzled(1),
+            "bead_id={BEAD_REGISTRY} case=newly_registered_not_swizzled"
+        );
+        assert_eq!(
+            reg.frame_addr(1),
+            None,
+            "bead_id={BEAD_REGISTRY} case=no_frame_addr_when_unswizzled"
+        );
+    }
+
+    #[test]
+    fn registry_try_swizzle_success() {
+        let reg = SwizzleRegistry::new();
+        reg.register_page(10);
+        assert!(
+            reg.try_swizzle(10, 0x8000),
+            "bead_id={BEAD_REGISTRY} case=swizzle_registered_page"
+        );
+        assert!(
+            reg.is_swizzled(10),
+            "bead_id={BEAD_REGISTRY} case=swizzled_after_try_swizzle"
+        );
+        assert_eq!(
+            reg.frame_addr(10),
+            Some(0x8000),
+            "bead_id={BEAD_REGISTRY} case=frame_addr_after_swizzle"
+        );
+        assert_eq!(
+            reg.swizzled_count(),
+            1,
+            "bead_id={BEAD_REGISTRY} case=swizzled_count_one"
+        );
+    }
+
+    #[test]
+    fn registry_double_swizzle_returns_false() {
+        let reg = SwizzleRegistry::new();
+        reg.register_page(20);
+        assert!(reg.try_swizzle(20, 0x4000));
+        assert!(
+            !reg.try_swizzle(20, 0x6000),
+            "bead_id={BEAD_REGISTRY} case=double_swizzle_rejected"
+        );
+        // Frame addr should remain at original value.
+        assert_eq!(
+            reg.frame_addr(20),
+            Some(0x4000),
+            "bead_id={BEAD_REGISTRY} case=frame_addr_unchanged_after_double_swizzle"
+        );
+    }
+
+    #[test]
+    fn registry_swizzle_unregistered_page_returns_false() {
+        let reg = SwizzleRegistry::new();
+        assert!(
+            !reg.try_swizzle(999, 0x2000),
+            "bead_id={BEAD_REGISTRY} case=swizzle_unregistered"
+        );
+    }
+
+    #[test]
+    fn registry_try_unswizzle_success() {
+        let reg = SwizzleRegistry::new();
+        reg.register_page(30);
+        reg.try_swizzle(30, 0xA000);
+        assert!(
+            reg.try_unswizzle(30),
+            "bead_id={BEAD_REGISTRY} case=unswizzle_success"
+        );
+        assert!(
+            !reg.is_swizzled(30),
+            "bead_id={BEAD_REGISTRY} case=not_swizzled_after_unswizzle"
+        );
+        assert_eq!(
+            reg.frame_addr(30),
+            None,
+            "bead_id={BEAD_REGISTRY} case=no_frame_addr_after_unswizzle"
+        );
+        assert_eq!(
+            reg.swizzled_count(),
+            0,
+            "bead_id={BEAD_REGISTRY} case=swizzled_count_zero_after_unswizzle"
+        );
+    }
+
+    #[test]
+    fn registry_unswizzle_already_cold_returns_false() {
+        let reg = SwizzleRegistry::new();
+        reg.register_page(40);
+        assert!(
+            !reg.try_unswizzle(40),
+            "bead_id={BEAD_REGISTRY} case=unswizzle_cold_page"
+        );
+    }
+
+    #[test]
+    fn registry_unswizzle_unregistered_returns_false() {
+        let reg = SwizzleRegistry::new();
+        assert!(
+            !reg.try_unswizzle(777),
+            "bead_id={BEAD_REGISTRY} case=unswizzle_unregistered"
+        );
+    }
+
+    #[test]
+    fn registry_duplicate_register_is_idempotent() {
+        let reg = SwizzleRegistry::new();
+        reg.register_page(50);
+        reg.try_swizzle(50, 0xC000);
+        // Re-registering should not overwrite existing state.
+        reg.register_page(50);
+        assert!(
+            reg.is_swizzled(50),
+            "bead_id={BEAD_REGISTRY} case=duplicate_register_preserves_state"
+        );
+    }
+
+    #[test]
+    fn registry_swizzle_ratio_updates() {
+        let reg = SwizzleRegistry::new();
+        reg.register_page(1);
+        reg.register_page(2);
+        reg.register_page(3);
+        reg.register_page(4);
+        // 0/4 swizzled
+        assert_eq!(reg.swizzled_count(), 0);
+        reg.try_swizzle(1, 0x1000);
+        reg.try_swizzle(2, 0x2000);
+        // 2/4 = 500 milli
+        assert_eq!(
+            reg.swizzled_count(),
+            2,
+            "bead_id={BEAD_REGISTRY} case=swizzled_count_two_of_four"
+        );
+        reg.try_swizzle(3, 0x3000);
+        reg.try_swizzle(4, 0x4000);
+        // 4/4 = 1000 milli
+        assert_eq!(
+            reg.swizzled_count(),
+            4,
+            "bead_id={BEAD_REGISTRY} case=all_four_swizzled"
+        );
+    }
+
+    #[test]
+    fn registry_default_impl() {
+        let reg = SwizzleRegistry::default();
+        assert_eq!(
+            reg.tracked_count(),
+            0,
+            "bead_id={BEAD_REGISTRY} case=default_empty"
+        );
+    }
+
+    #[test]
+    fn registry_swizzle_unswizzle_cycle() {
+        let reg = SwizzleRegistry::new();
+        reg.register_page(60);
+        // Cold -> Hot (swizzle)
+        assert!(reg.try_swizzle(60, 0xD000));
+        assert!(reg.is_swizzled(60));
+        // Hot -> Cold (unswizzle)
+        assert!(reg.try_unswizzle(60));
+        assert!(!reg.is_swizzled(60));
+        // Cold -> Hot again (re-swizzle)
+        assert!(
+            reg.try_swizzle(60, 0xE000),
+            "bead_id={BEAD_REGISTRY} case=re_swizzle_after_unswizzle"
+        );
+        assert_eq!(
+            reg.frame_addr(60),
+            Some(0xE000),
+            "bead_id={BEAD_REGISTRY} case=new_frame_addr_after_re_swizzle"
+        );
+    }
+
+    // ── Swizzle metrics tests (bd-3ta.3) ────────────────────────────────
+
+    #[test]
+    fn swizzle_metrics_appear_in_btree_snapshot() {
+        use crate::instrumentation::{btree_metrics_snapshot, record_swizzle_in};
+        let before = btree_metrics_snapshot();
+        record_swizzle_in(42);
+        let after = btree_metrics_snapshot();
+        assert!(
+            after.fsqlite_swizzle_in_total > before.fsqlite_swizzle_in_total,
+            "bead_id={BEAD_REGISTRY} case=swizzle_in_metric_increments"
+        );
+    }
+
+    #[test]
+    fn swizzle_fault_metric_increments() {
+        use crate::instrumentation::{btree_metrics_snapshot, record_swizzle_fault};
+        let before = btree_metrics_snapshot();
+        record_swizzle_fault();
+        record_swizzle_fault();
+        let after = btree_metrics_snapshot();
+        assert!(
+            after.fsqlite_swizzle_faults_total >= before.fsqlite_swizzle_faults_total + 2,
+            "bead_id={BEAD_REGISTRY} case=swizzle_fault_metric"
         );
     }
 }

@@ -52,6 +52,14 @@ pub struct BtreeMetricsSnapshot {
     pub fsqlite_swiss_table_probes_total: u64,
     /// Current Swiss Table load factor (scaled by 1000, e.g. 875 = 0.875).
     pub fsqlite_swiss_table_load_factor: u64,
+    /// Swizzle ratio gauge (0–1000, where 1000 = 100% swizzled).
+    pub fsqlite_swizzle_ratio: u64,
+    /// Total swizzle faults (CAS failures).
+    pub fsqlite_swizzle_faults_total: u64,
+    /// Total successful swizzle-in operations.
+    pub fsqlite_swizzle_in_total: u64,
+    /// Total successful unswizzle-out operations.
+    pub fsqlite_swizzle_out_total: u64,
 }
 
 /// Per-operation mutable stats while a `btree_op` span is active.
@@ -84,6 +92,17 @@ static BTREE_DEPTH_GAUGE: AtomicU64 = AtomicU64::new(0);
 static SWISS_TABLE_PROBES_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SWISS_TABLE_LOAD_FACTOR: AtomicU64 = AtomicU64::new(0);
 
+// ── Swizzle metrics (bd-3ta.3) ──────────────────────────────────────────────
+
+/// Swizzle ratio gauge: (swizzled_count / total_tracked) * 1000.
+static SWIZZLE_RATIO_GAUGE: AtomicU64 = AtomicU64::new(0);
+/// Total swizzle faults (CAS failures + retry attempts).
+static SWIZZLE_FAULTS_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Total successful swizzle operations.
+static SWIZZLE_IN_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Total successful unswizzle operations.
+static SWIZZLE_OUT_TOTAL: AtomicU64 = AtomicU64::new(0);
+
 pub(crate) fn record_operation(op_type: BtreeOpType) {
     let counter = match op_type {
         BtreeOpType::Seek => &BTREE_OP_SEEK_TOTAL,
@@ -112,6 +131,40 @@ pub fn set_swiss_load_factor(load_factor_milli: u64) {
     SWISS_TABLE_LOAD_FACTOR.store(load_factor_milli, Ordering::Relaxed);
 }
 
+/// Record a successful swizzle-in event and emit a tracing span.
+pub fn record_swizzle_in(page_id: u64) {
+    SWIZZLE_IN_TOTAL.fetch_add(1, Ordering::Relaxed);
+    let _span = tracing::trace_span!(
+        "swizzle",
+        page_id,
+        swizzled_in = true,
+        unswizzled_out = false,
+    )
+    .entered();
+}
+
+/// Record a successful unswizzle-out event and emit a tracing span.
+pub fn record_swizzle_out(page_id: u64) {
+    SWIZZLE_OUT_TOTAL.fetch_add(1, Ordering::Relaxed);
+    let _span = tracing::trace_span!(
+        "swizzle",
+        page_id,
+        swizzled_in = false,
+        unswizzled_out = true,
+    )
+    .entered();
+}
+
+/// Record a swizzle fault (CAS failure or retry).
+pub fn record_swizzle_fault() {
+    SWIZZLE_FAULTS_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Update the swizzle ratio gauge (0–1000, where 1000 = 100% swizzled).
+pub fn set_swizzle_ratio(ratio_milli: u64) {
+    SWIZZLE_RATIO_GAUGE.store(ratio_milli, Ordering::Relaxed);
+}
+
 /// Return a snapshot of B-tree observability counters.
 #[must_use]
 pub fn btree_metrics_snapshot() -> BtreeMetricsSnapshot {
@@ -125,6 +178,10 @@ pub fn btree_metrics_snapshot() -> BtreeMetricsSnapshot {
         fsqlite_btree_depth: BTREE_DEPTH_GAUGE.load(Ordering::Relaxed),
         fsqlite_swiss_table_probes_total: SWISS_TABLE_PROBES_TOTAL.load(Ordering::Relaxed),
         fsqlite_swiss_table_load_factor: SWISS_TABLE_LOAD_FACTOR.load(Ordering::Relaxed),
+        fsqlite_swizzle_ratio: SWIZZLE_RATIO_GAUGE.load(Ordering::Relaxed),
+        fsqlite_swizzle_faults_total: SWIZZLE_FAULTS_TOTAL.load(Ordering::Relaxed),
+        fsqlite_swizzle_in_total: SWIZZLE_IN_TOTAL.load(Ordering::Relaxed),
+        fsqlite_swizzle_out_total: SWIZZLE_OUT_TOTAL.load(Ordering::Relaxed),
     }
 }
 
@@ -137,6 +194,10 @@ pub fn reset_btree_metrics() {
     BTREE_DEPTH_GAUGE.store(0, Ordering::Relaxed);
     SWISS_TABLE_PROBES_TOTAL.store(0, Ordering::Relaxed);
     SWISS_TABLE_LOAD_FACTOR.store(0, Ordering::Relaxed);
+    SWIZZLE_RATIO_GAUGE.store(0, Ordering::Relaxed);
+    SWIZZLE_FAULTS_TOTAL.store(0, Ordering::Relaxed);
+    SWIZZLE_IN_TOTAL.store(0, Ordering::Relaxed);
+    SWIZZLE_OUT_TOTAL.store(0, Ordering::Relaxed);
 }
 
 #[cfg(test)]
