@@ -1306,7 +1306,12 @@ fn validate_manifest_embedded_reports(manifest: &ValidationManifest) -> Vec<Stri
     if manifest.logging_conformance.gate_id != LOGGING_GATE_ID {
         errors.push("logging_conformance gate_id mismatch".to_owned());
     }
-    if manifest.logging_conformance.shell_script_conformance.bead_id != "bd-mblr.5.5" {
+    if manifest
+        .logging_conformance
+        .shell_script_conformance
+        .bead_id
+        != "bd-mblr.5.5"
+    {
         errors.push("logging_conformance shell_script_conformance bead_id mismatch".to_owned());
     }
     if manifest.logging_conformance.overall_pass

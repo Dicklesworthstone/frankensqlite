@@ -20,17 +20,17 @@ const REPORT_SCHEMA_VERSION: &str = "1.0.0";
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 enum GapReason {
-    MissingScenarioMapping,
-    MissingRequiredExecutionLane,
-    MissingCatalogEntryForManifestScenario,
+    ScenarioMappingMissing,
+    RequiredExecutionLaneMissing,
+    CatalogEntryAbsentForManifestScenario,
 }
 
 impl fmt::Display for GapReason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::MissingScenarioMapping => write!(f, "missing_scenario_mapping"),
-            Self::MissingRequiredExecutionLane => write!(f, "missing_required_execution_lane"),
-            Self::MissingCatalogEntryForManifestScenario => {
+            Self::ScenarioMappingMissing => write!(f, "missing_scenario_mapping"),
+            Self::RequiredExecutionLaneMissing => write!(f, "missing_required_execution_lane"),
+            Self::CatalogEntryAbsentForManifestScenario => {
                 write!(f, "missing_catalog_entry_for_manifest_scenario")
             }
         }
@@ -264,7 +264,7 @@ fn build_report(config: &Config) -> Result<ScenarioCoverageDriftReport, String> 
         if !scenario.covered {
             gaps.push(ScenarioGap {
                 scenario_id: scenario.scenario_id.clone(),
-                reason: GapReason::MissingScenarioMapping,
+                reason: GapReason::ScenarioMappingMissing,
                 severity: GapSeverity::Required,
                 criticality: Some(scenario.criticality),
                 description: Some(scenario.description.clone()),
@@ -277,7 +277,7 @@ fn build_report(config: &Config) -> Result<ScenarioCoverageDriftReport, String> 
         if missing_manifest.contains(&scenario.scenario_id) {
             gaps.push(ScenarioGap {
                 scenario_id: scenario.scenario_id.clone(),
-                reason: GapReason::MissingRequiredExecutionLane,
+                reason: GapReason::RequiredExecutionLaneMissing,
                 severity: GapSeverity::Required,
                 criticality: Some(scenario.criticality),
                 description: Some(scenario.description.clone()),
@@ -295,7 +295,7 @@ fn build_report(config: &Config) -> Result<ScenarioCoverageDriftReport, String> 
         let idx = scenario_index.get(missing);
         gaps.push(ScenarioGap {
             scenario_id: missing.clone(),
-            reason: GapReason::MissingCatalogEntryForManifestScenario,
+            reason: GapReason::CatalogEntryAbsentForManifestScenario,
             severity: GapSeverity::Required,
             criticality: None,
             description: None,
