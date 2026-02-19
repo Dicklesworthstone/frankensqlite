@@ -783,6 +783,11 @@ impl Parser {
         let source = if self.eat_kw(&TokenKind::KwDefault) {
             self.expect_kw(&TokenKind::KwValues)?;
             InsertSource::DefaultValues
+        } else if self.eat_kw(&TokenKind::KwValues) {
+            match self.parse_values_core()? {
+                SelectCore::Values(rows) => InsertSource::Values(rows),
+                SelectCore::Select { .. } => unreachable!("parse_values_core must return VALUES"),
+            }
         } else {
             InsertSource::Select(Box::new(self.parse_select_stmt(None)?))
         };
