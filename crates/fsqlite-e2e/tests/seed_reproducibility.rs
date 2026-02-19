@@ -31,6 +31,14 @@ use rand::rngs::StdRng;
 use fsqlite_e2e::oplog::{preset_commutative_inserts_disjoint_keys, preset_hot_page_contention};
 use fsqlite_e2e::{FRANKEN_SEED, derive_scenario_seed, derive_worker_seed};
 
+const SCENARIO_HASHES: [u64; 5] = [
+    0x0053_4348_u64,
+    0x0054_584E,
+    0x0043_4F4E,
+    0x0043_4F52,
+    0x0043_4D50,
+];
+
 // ─── Seed Derivation Reproducibility ────────────────────────────────────
 
 #[test]
@@ -53,8 +61,7 @@ fn scenario_derivation_is_deterministic() {
     // derive_scenario_seed must be a pure function.
     let base = FRANKEN_SEED;
 
-    let scenarios = [0x534348u64, 0x54584E, 0x434F4E, 0x434F52, 0x434D50];
-    for hash in scenarios {
+    for hash in SCENARIO_HASHES {
         let seed1 = derive_scenario_seed(base, hash);
         let seed2 = derive_scenario_seed(base, hash);
         assert_eq!(
@@ -83,10 +90,9 @@ fn worker_seeds_are_distinct() {
 fn scenario_seeds_are_distinct() {
     // Different scenarios must get different seeds.
     let base = FRANKEN_SEED;
-    let scenarios = [0x534348u64, 0x54584E, 0x434F4E, 0x434F52, 0x434D50];
     let mut seeds = std::collections::HashSet::new();
 
-    for hash in scenarios {
+    for hash in SCENARIO_HASHES {
         let seed = derive_scenario_seed(base, hash);
         assert!(
             seeds.insert(seed),
@@ -328,7 +334,7 @@ fn format_val(v: &str) -> String {
 #[test]
 fn franken_seed_is_correct_value() {
     // Verify the constant matches "FRANKEN" in ASCII.
-    assert_eq!(FRANKEN_SEED, 0x4652_414E_4B45_4E);
+    assert_eq!(FRANKEN_SEED, 0x0046_5241_4E4B_454E);
 
     // Verify it decodes to "FRANKEN" (7 bytes, padded with leading zero).
     let bytes = FRANKEN_SEED.to_be_bytes();

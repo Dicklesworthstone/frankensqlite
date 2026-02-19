@@ -44,8 +44,7 @@ fn assert_expected_class(
                     classification,
                     RecoveryClassification::Lost {
                         reason: fsqlite_e2e::recovery_runner::LostReason::InsufficientSymbols { .. }
-                    } | RecoveryClassification::Lost {
-                        reason: fsqlite_e2e::recovery_runner::LostReason::SidecarMissing
+                            | fsqlite_e2e::recovery_runner::LostReason::SidecarMissing
                     }
                 ),
                 "scenario '{name}' must classify as Lost(InsufficientSymbols|SidecarMissing), got: {classification:?}"
@@ -79,8 +78,7 @@ fn assert_expected_class(
                     classification,
                     RecoveryClassification::Lost {
                         reason: fsqlite_e2e::recovery_runner::LostReason::SidecarDamaged { .. }
-                    } | RecoveryClassification::Lost {
-                        reason: fsqlite_e2e::recovery_runner::LostReason::SidecarMissing
+                            | fsqlite_e2e::recovery_runner::LostReason::SidecarMissing
                     }
                 ),
                 "scenario '{name}' must classify as Lost(SidecarDamaged|SidecarMissing), got: {classification:?}"

@@ -74,13 +74,17 @@ fn setup_frankensqlite() -> fsqlite::Connection {
     conn
 }
 
+#[allow(clippy::too_many_lines)]
 fn capture_baseline(engine: &str, conn: &fsqlite::Connection) -> Vec<OperationBaseline> {
     let mut baselines = Vec::new();
 
     // 1. Sequential scan.
     let (lat, thr) = measure_operation(WARMUP, ITERATIONS, || {
         let rows = conn.query("SELECT * FROM bench").unwrap();
-        assert_eq!(rows.len() as i64, ROW_COUNT);
+        assert_eq!(
+            i64::try_from(rows.len()).expect("row count must fit i64"),
+            ROW_COUNT
+        );
     });
     baselines.push(OperationBaseline {
         operation: Operation::SequentialScan,
@@ -269,7 +273,7 @@ fn capture_baseline(engine: &str, conn: &fsqlite::Connection) -> Vec<OperationBa
 /// This test is `#[ignore]`d by default because it takes ~30 seconds
 /// and produces a file artifact. Run it explicitly to refresh baselines.
 #[test]
-#[ignore]
+#[ignore = "baseline artifact generation is long-running and writes files"]
 fn generate_operation_baseline() {
     let conn = setup_frankensqlite();
     let baselines = capture_baseline("frankensqlite", &conn);

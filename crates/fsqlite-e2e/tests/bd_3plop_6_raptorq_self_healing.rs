@@ -47,6 +47,8 @@ const NUM_GROUPS: u32 = 10;
 /// Total page count across all groups.
 const TOTAL_PAGES: u32 = GROUP_K * NUM_GROUPS;
 
+type RepairGroup = (DbFecGroupMeta, Vec<(u32, Vec<u8>)>);
+
 // ── Corruption variants ─────────────────────────────────────────────────
 
 /// Four corruption variants as specified in the bead acceptance criteria.
@@ -111,7 +113,7 @@ fn build_group(
 }
 
 /// Build all groups for the simulated database.
-fn build_all_groups(original_pages: &[Vec<u8>]) -> Vec<(DbFecGroupMeta, Vec<(u32, Vec<u8>)>)> {
+fn build_all_groups(original_pages: &[Vec<u8>]) -> Vec<RepairGroup> {
     (0..NUM_GROUPS)
         .map(|g| {
             let start_pgno = g * GROUP_K + 1;
@@ -142,7 +144,7 @@ fn apply_corruption(data: &mut [u8], variant: CorruptionVariant, rng: &mut StdRn
         }
         CorruptionVariant::HeaderCorrupt => {
             let header_len = 16.min(data.len());
-            for b in data[..header_len].iter_mut() {
+            for b in &mut data[..header_len] {
                 *b = rng.r#gen();
             }
         }
@@ -183,6 +185,7 @@ fn corruption_per_group(targets: &[(u32, CorruptionVariant)]) -> Vec<u32> {
 /// Main showcase test: 5% random corruption with all four variants, full
 /// repair, evidence validation, witness proofs, and permanent repair.
 #[test]
+#[allow(clippy::too_many_lines)]
 fn test_bd_3plop_6_five_percent_corruption_fully_repaired() {
     let mut rng = StdRng::seed_from_u64(SEED);
 
@@ -343,7 +346,7 @@ fn test_bd_3plop_6_five_percent_corruption_fully_repaired() {
     // been individually repaired above, so here we verify the batch API
     // sees repaired data as intact when using the repaired snapshot.
     for (g, (meta, repair_syms)) in groups.iter().enumerate() {
-        let start = (g as u32) * GROUP_K + 1;
+        let start = u32::try_from(g).expect("group index fits u32") * GROUP_K + 1;
         let pgnos: Vec<u32> = (start..start + GROUP_K).collect();
 
         let repaired_snapshot = repaired_pages.clone();

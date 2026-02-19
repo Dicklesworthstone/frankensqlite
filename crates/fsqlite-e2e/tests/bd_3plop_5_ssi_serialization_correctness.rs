@@ -8,7 +8,7 @@
 //! - Abort rate and throughput stay within target bounds for CI scale.
 
 use std::collections::{BTreeSet, VecDeque};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
@@ -220,7 +220,7 @@ fn initialize_db(path: &Path) {
 }
 
 fn run_worker(
-    db_path: &PathBuf,
+    db_path: &Path,
     worker_id: usize,
     txns_per_worker: usize,
     seed: u64,

@@ -13,8 +13,8 @@ fn json1_contract_rows_match_csqlite() {
         r#"SELECT json_type('{"a":[1,2]}', '$.a');"#.to_owned(),
         r#"SELECT json_set('{"a":1}', '$.b', 2);"#.to_owned(),
         r#"SELECT json_remove('{"a":1,"b":2}', '$.b');"#.to_owned(),
-        r#"SELECT json_array(1,'x',NULL);"#.to_owned(),
-        r#"SELECT json_object('a',1,'b',2);"#.to_owned(),
+        r"SELECT json_array(1,'x',NULL);".to_owned(),
+        r"SELECT json_object('a',1,'b',2);".to_owned(),
     ];
 
     eprintln!(

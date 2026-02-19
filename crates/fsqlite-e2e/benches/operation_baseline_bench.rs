@@ -167,7 +167,10 @@ fn bench_sequential_scan(c: &mut Criterion) {
                 .unwrap()
                 .collect::<Result<Vec<_>, _>>()
                 .unwrap();
-            assert_eq!(rows.len() as i64, SEED_ROWS);
+            assert_eq!(
+                i64::try_from(rows.len()).expect("row count must fit i64"),
+                SEED_ROWS
+            );
         });
     });
 
@@ -175,7 +178,10 @@ fn bench_sequential_scan(c: &mut Criterion) {
         let conn = setup_fsqlite_seeded();
         b.iter(|| {
             let rows = conn.query("SELECT * FROM bench").unwrap();
-            assert_eq!(rows.len() as i64, SEED_ROWS);
+            assert_eq!(
+                i64::try_from(rows.len()).expect("row count must fit i64"),
+                SEED_ROWS
+            );
         });
     });
 
@@ -432,10 +438,7 @@ fn bench_single_row_delete(c: &mut Criterion) {
     // Each iteration needs a fresh table since we delete from it.
     group.bench_function("csqlite", |b| {
         b.iter_batched(
-            || {
-                let conn = setup_csqlite_seeded();
-                conn
-            },
+            setup_csqlite_seeded,
             |conn| {
                 conn.execute("DELETE FROM bench WHERE id = 500", [])
                     .unwrap();
@@ -452,7 +455,7 @@ fn bench_single_row_delete(c: &mut Criterion) {
 
     group.bench_function("frankensqlite", |b| {
         b.iter_batched(
-            || setup_fsqlite_seeded(),
+            setup_fsqlite_seeded,
             |conn| {
                 conn.execute("DELETE FROM bench WHERE id = 500").unwrap();
                 let rows = conn.query("SELECT COUNT(*) FROM bench").unwrap();

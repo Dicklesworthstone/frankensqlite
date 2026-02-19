@@ -19,7 +19,7 @@ use fsqlite_e2e::baseline::{
 fn all_nine_operations_have_unique_names() {
     let ops = Operation::all();
     assert_eq!(ops.len(), 9);
-    let mut names: Vec<&str> = ops.iter().map(|o| o.display_name()).collect();
+    let mut names: Vec<&str> = ops.iter().map(Operation::display_name).collect();
     let orig_len = names.len();
     names.sort_unstable();
     names.dedup();
@@ -252,6 +252,7 @@ fn save_load_roundtrip_with_all_operations() {
 // ─── Full 9-operation baseline capture ──────────────────────────────────
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn capture_all_nine_baselines_frankensqlite() {
     let conn = fsqlite::Connection::open(":memory:").unwrap();
 

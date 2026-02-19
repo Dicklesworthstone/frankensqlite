@@ -312,20 +312,21 @@ fn ssi_sequential_concurrent_transactions() {
     // Run 5 sequential increment transactions.
     for i in 1..=5 {
         conn.execute("BEGIN CONCURRENT")
-            .expect(&format!("begin txn {i}"));
+            .unwrap_or_else(|_| panic!("begin txn {i}"));
 
         let row = conn
             .query_row("SELECT count FROM counter WHERE id = 1")
-            .expect(&format!("read txn {i}"));
+            .unwrap_or_else(|_| panic!("read txn {i}"));
         let current = get_int(&row, 0);
 
         conn.execute(&format!(
             "UPDATE counter SET count = {} WHERE id = 1",
             current + 1
         ))
-        .expect(&format!("update txn {i}"));
+        .unwrap_or_else(|_| panic!("update txn {i}"));
 
-        conn.execute("COMMIT").expect(&format!("commit txn {i}"));
+        conn.execute("COMMIT")
+            .unwrap_or_else(|_| panic!("commit txn {i}"));
     }
 
     // Verify final count.
