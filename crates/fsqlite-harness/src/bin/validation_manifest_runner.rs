@@ -7,10 +7,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use sha2::{Digest, Sha256};
 
 use fsqlite_harness::validation_manifest::{
-    ValidationManifestConfig, build_validation_manifest_bundle, validate_manifest_contract,
+    VALIDATION_MANIFEST_SCENARIO_ID, ValidationManifestConfig, build_validation_manifest_bundle,
+    validate_manifest_contract,
 };
 
-const DEFAULT_SCENARIO_ID: &str = "QUALITY-VALIDATION-MANIFEST";
 const DEFAULT_ARTIFACT_PREFIX: &str = "artifacts/validation-manifest";
 
 #[derive(Debug, Clone)]
@@ -38,7 +38,7 @@ impl Config {
         let mut commit_sha: Option<String> = None;
         let mut run_id: Option<String> = None;
         let mut trace_id: Option<String> = None;
-        let mut scenario_id = DEFAULT_SCENARIO_ID.to_owned();
+        let mut scenario_id = VALIDATION_MANIFEST_SCENARIO_ID.to_owned();
         let mut root_seed = Some(424_242_u64);
         let mut generated_unix_ms = now_unix_ms();
         let mut artifact_uri_prefix = DEFAULT_ARTIFACT_PREFIX.to_owned();
@@ -191,7 +191,7 @@ OPTIONS:
   --commit-sha <SHA>           Commit SHA to embed (default: git rev-parse HEAD or unknown)
   --run-id <ID>                Deterministic run identifier
   --trace-id <ID>              Deterministic trace identifier
-  --scenario-id <ID>           Scenario identifier (default: QUALITY-VALIDATION-MANIFEST)
+  --scenario-id <ID>           Scenario identifier (default: QUALITY-351)
   --root-seed <U64>            Deterministic orchestrator root seed (default: 424242)
   --no-root-seed               Use canonical orchestrator default seed source
   --generated-unix-ms <U128>   Deterministic timestamp for manifest and gate records

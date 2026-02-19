@@ -749,7 +749,7 @@ mod tests {
         // Structural test: verify FsLab can schedule two tasks deterministically
         // under seed 0xDEAD_BEEF. This tests the scheduling infrastructure
         // that will underpin SI verification once Database is implemented.
-        use crate::fslab::FsLab;
+        use crate::fslab::{FsLab, SchedulerLockExt};
 
         let lab = FsLab::new(0xDEAD_BEEF).worker_count(4).max_steps(100_000);
 
@@ -769,12 +769,9 @@ mod tests {
                 999_u64
             });
 
-            let mut sched = runtime
-                .scheduler
-                .lock()
-                .expect("FsLab: scheduler lock poisoned");
-            sched.schedule(t1, 0);
-            sched.schedule(t2, 1);
+            let mut sched = runtime.scheduler.lock();
+            sched.schedule_task(t1, 0);
+            sched.schedule_task(t2, 1);
         });
 
         assert!(

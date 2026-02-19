@@ -34,6 +34,8 @@ const BEAD_ID: &str = "bd-mblr.3.5.1";
 
 /// Schema version of the machine-readable validation manifest.
 pub const VALIDATION_MANIFEST_SCHEMA_VERSION: &str = "1.0.0";
+/// Canonical scenario ID used by validation-manifest runs.
+pub const VALIDATION_MANIFEST_SCENARIO_ID: &str = "QUALITY-351";
 
 /// Gate ID for coverage threshold enforcement.
 pub const COVERAGE_GATE_ID: &str = "bd-mblr.3.1.1";
@@ -386,7 +388,7 @@ impl Default for ValidationManifestConfig {
             commit_sha: "unknown".to_owned(),
             run_id: format!("{BEAD_ID}-run"),
             trace_id: "trace-unknown".to_owned(),
-            scenario_id: "QUALITY-VALIDATION-MANIFEST".to_owned(),
+            scenario_id: VALIDATION_MANIFEST_SCENARIO_ID.to_owned(),
             generated_unix_ms: 1_700_000_000_000,
             root_seed: Some(424_242),
             artifact_uri_prefix: "artifacts/validation-manifest".to_owned(),
@@ -816,7 +818,7 @@ fn build_manifest_log_events(
         event_type: LogEventType::Start,
         scenario_id: Some(config.scenario_id.clone()),
         seed: config.root_seed,
-        backend: Some("fsqlite-harness".to_owned()),
+        backend: Some("fsqlite".to_owned()),
         artifact_hash: Some(sha256_hex(&artifact_paths)),
         context: make_event_context(&config.trace_id, "start", "0", &artifact_paths, BEAD_ID),
     });
@@ -831,7 +833,7 @@ fn build_manifest_log_events(
             event_type: LogEventType::ArtifactGenerated,
             scenario_id: Some(config.scenario_id.clone()),
             seed: config.root_seed,
-            backend: Some("fsqlite-harness".to_owned()),
+            backend: Some("fsqlite".to_owned()),
             artifact_hash: Some(sha256_hex(&joined_gate_artifacts)),
             context: make_event_context(
                 &config.trace_id,
@@ -856,7 +858,7 @@ fn build_manifest_log_events(
         event_type: final_type,
         scenario_id: Some(config.scenario_id.clone()),
         seed: config.root_seed,
-        backend: Some("fsqlite-harness".to_owned()),
+        backend: Some("fsqlite".to_owned()),
         artifact_hash: Some(sha256_hex(&artifact_paths)),
         context: make_event_context(
             &config.trace_id,
@@ -1410,7 +1412,7 @@ mod tests {
             commit_sha: "0123456789abcdef".to_owned(),
             run_id: "bd-mblr.3.5.1-seed-424242".to_owned(),
             trace_id: "trace-424242".to_owned(),
-            scenario_id: "QUALITY-VALIDATION-MANIFEST".to_owned(),
+            scenario_id: VALIDATION_MANIFEST_SCENARIO_ID.to_owned(),
             generated_unix_ms: 1_700_000_000_000,
             root_seed: Some(424_242),
             artifact_uri_prefix: "artifacts/validation-manifest".to_owned(),
