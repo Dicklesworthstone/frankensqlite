@@ -11,8 +11,8 @@
 //! - `AbortWitness` for SSI aborts
 
 use std::collections::{BTreeMap, HashSet};
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 
 use fsqlite_types::{CommitSeq, ObjectId, PageNumber, TxnToken, WitnessKey};
 use tracing::{debug, info, warn};
@@ -271,6 +271,7 @@ fn build_reader_index<'a>(
     committing_txn: TxnToken,
     active_readers: &[&'a dyn ActiveTxnView],
     committed_readers: &[CommittedReaderInfo],
+    target_pages: &HashSet<u32>,
 ) -> BTreeMap<u32, Vec<IndexedTxnRecord<'a>>> {
     let mut index: BTreeMap<u32, Vec<IndexedTxnRecord<'a>>> = BTreeMap::new();
 
@@ -279,17 +280,18 @@ fn build_reader_index<'a>(
             continue;
         }
         for key in reader.read_keys() {
-            index
-                .entry(witness_key_page(key))
-                .or_default()
-                .push(IndexedTxnRecord {
-                    token: reader.token(),
-                    begin_seq: reader.begin_seq(),
-                    commit_seq: None,
-                    source_is_active: true,
-                    source_has_in_rw: reader.has_in_rw(),
-                    key: Some(key),
-                });
+            let page = witness_key_page(key);
+            if !target_pages.contains(&page) {
+                continue;
+            }
+            index.entry(page).or_default().push(IndexedTxnRecord {
+                token: reader.token(),
+                begin_seq: reader.begin_seq(),
+                commit_seq: None,
+                source_is_active: true,
+                source_has_in_rw: reader.has_in_rw(),
+                key: Some(key),
+            });
         }
     }
 
@@ -298,7 +300,11 @@ fn build_reader_index<'a>(
             continue;
         }
         for page in &reader.pages {
-            index.entry(page.get()).or_default().push(IndexedTxnRecord {
+            let page_no = page.get();
+            if !target_pages.contains(&page_no) {
+                continue;
+            }
+            index.entry(page_no).or_default().push(IndexedTxnRecord {
                 token: reader.token,
                 begin_seq: reader.begin_seq,
                 commit_seq: Some(reader.commit_seq),
@@ -316,6 +322,7 @@ fn build_writer_index<'a>(
     committing_txn: TxnToken,
     active_writers: &[&'a dyn ActiveTxnView],
     committed_writers: &[CommittedWriterInfo],
+    target_pages: &HashSet<u32>,
 ) -> BTreeMap<u32, Vec<IndexedTxnRecord<'a>>> {
     let mut index: BTreeMap<u32, Vec<IndexedTxnRecord<'a>>> = BTreeMap::new();
 
@@ -324,17 +331,18 @@ fn build_writer_index<'a>(
             continue;
         }
         for key in writer.write_keys() {
-            index
-                .entry(witness_key_page(key))
-                .or_default()
-                .push(IndexedTxnRecord {
-                    token: writer.token(),
-                    begin_seq: writer.begin_seq(),
-                    commit_seq: None,
-                    source_is_active: true,
-                    source_has_in_rw: false,
-                    key: Some(key),
-                });
+            let page = witness_key_page(key);
+            if !target_pages.contains(&page) {
+                continue;
+            }
+            index.entry(page).or_default().push(IndexedTxnRecord {
+                token: writer.token(),
+                begin_seq: writer.begin_seq(),
+                commit_seq: None,
+                source_is_active: true,
+                source_has_in_rw: false,
+                key: Some(key),
+            });
         }
     }
 
@@ -343,7 +351,11 @@ fn build_writer_index<'a>(
             continue;
         }
         for page in &writer.pages {
-            index.entry(page.get()).or_default().push(IndexedTxnRecord {
+            let page_no = page.get();
+            if !target_pages.contains(&page_no) {
+                continue;
+            }
+            index.entry(page_no).or_default().push(IndexedTxnRecord {
                 token: writer.token,
                 begin_seq: CommitSeq::ZERO,
                 commit_seq: Some(writer.commit_seq),
@@ -379,7 +391,13 @@ pub fn discover_incoming_edges(
         return edges;
     }
 
-    let index = build_reader_index(committing_txn, active_readers, committed_readers);
+    let target_pages: HashSet<u32> = write_keys.iter().map(witness_key_page).collect();
+    let index = build_reader_index(
+        committing_txn,
+        active_readers,
+        committed_readers,
+        &target_pages,
+    );
     let mut seen_sources = HashSet::new();
     for write_key in write_keys {
         let page = witness_key_page(write_key);
@@ -458,7 +476,13 @@ pub fn discover_outgoing_edges(
         return edges;
     }
 
-    let index = build_writer_index(committing_txn, active_writers, committed_writers);
+    let target_pages: HashSet<u32> = read_keys.iter().map(witness_key_page).collect();
+    let index = build_writer_index(
+        committing_txn,
+        active_writers,
+        committed_writers,
+        &target_pages,
+    );
     let mut seen_targets = HashSet::new();
     for read_key in read_keys {
         let page = witness_key_page(read_key);
