@@ -1545,7 +1545,7 @@ impl VirtualTable for Fts5Table {
                                 .split_whitespace()
                                 .next()
                                 .unwrap_or("unicode61");
-                            tokenizer_name = tok.to_owned();
+                            tok.clone_into(&mut tokenizer_name);
                         }
                         "content" => {
                             if value_unquoted.is_empty() {
