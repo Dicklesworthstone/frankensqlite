@@ -42,11 +42,10 @@ use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::SyncFlags;
 use fsqlite_vfs::VfsFile;
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, info, trace};
 
 use crate::checksum::{
-    SqliteWalChecksum, WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE, WalSalts,
-    compute_wal_frame_checksum, write_wal_frame_checksum, write_wal_frame_salts,
+    WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE, write_wal_frame_checksum, write_wal_frame_salts,
 };
 use crate::metrics::GLOBAL_WAL_METRICS;
 use crate::wal::WalFile;
