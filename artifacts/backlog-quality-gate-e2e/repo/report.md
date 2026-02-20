@@ -1,0 +1,171 @@
+# Backlog Quality Gate Report
+
+- overall_pass: `false`
+- scanned_active_beads: `111`
+- scanned_critical_beads: `110`
+- total_failures: `47`
+- critical_failures: `46`
+- regression_failures: `46`
+- missing_unit_property_count: `5`
+- missing_deterministic_e2e_count: `9`
+- missing_structured_logging_count: `47`
+
+## Regression Failures
+
+- `bd-106dk` (P3 critical) missing: structured_logging
+- `bd-1dp9.6.2` (P1 critical) missing: structured_logging
+- `bd-1dp9.6.4` (P1 critical) missing: structured_logging
+- `bd-1dp9.6.6` (P1 critical) missing: structured_logging
+- `bd-1dp9.9.2` (P1 critical) missing: structured_logging
+- `bd-1dp9.9.3` (P1 critical) missing: structured_logging
+- `bd-1dp9.9.4` (P1 critical) missing: structured_logging
+- `bd-1dp9.9.5` (P1 critical) missing: structured_logging
+- `bd-1dp9.9.6` (P1 critical) missing: unit_property_tests, deterministic_e2e, structured_logging
+- `bd-1k39z` (P3 critical) missing: structured_logging
+- `bd-2bg7t` (P3 critical) missing: structured_logging
+- `bd-2csg6.1` (P2 critical) missing: structured_logging
+- `bd-2csg6.2` (P2 critical) missing: structured_logging
+- `bd-2qr3a` (P1 critical) missing: unit_property_tests, deterministic_e2e, structured_logging
+- `bd-2qr3a.3` (P2 critical) missing: structured_logging
+- `bd-2qr3a.5` (P2 critical) missing: structured_logging
+- `bd-2qr3a.6` (P2 critical) missing: structured_logging
+- `bd-2uza4.1` (P2 critical) missing: structured_logging
+- `bd-2uza4.2` (P2 critical) missing: structured_logging
+- `bd-2uza4.3` (P2 critical) missing: structured_logging
+- `bd-2uza4.5` (P2 critical) missing: deterministic_e2e, structured_logging
+- `bd-2y306.2` (P2 critical) missing: structured_logging
+- `bd-2y306.3` (P2 critical) missing: structured_logging
+- `bd-2y306.5` (P2 critical) missing: deterministic_e2e, structured_logging
+- `bd-2y306.6` (P2 critical) missing: deterministic_e2e, structured_logging
+- `bd-2y306.7` (P1 critical) missing: structured_logging
+- `bd-31br0` (P3 critical) missing: structured_logging
+- `bd-368z9` (P3 critical) missing: structured_logging
+- `bd-3bw.5` (P1 critical) missing: unit_property_tests, deterministic_e2e, structured_logging
+- `bd-3mr81` (P3 critical) missing: structured_logging
+- `bd-3plop.4` (P2 critical) missing: structured_logging
+- `bd-3plop.5` (P1 critical) missing: structured_logging
+- `bd-3plop.7` (P1 critical) missing: structured_logging
+- `bd-52a8k` (P3 critical) missing: structured_logging
+- `bd-5ew.1` (P1 critical) missing: unit_property_tests, deterministic_e2e, structured_logging
+- `bd-j2cfs` (P4 critical) missing: structured_logging
+- `bd-mblr.3.5` (P1 critical) missing: unit_property_tests, deterministic_e2e, structured_logging
+- `bd-mblr.3.5.1` (P1 critical) missing: structured_logging
+- `bd-mblr.3.5.1.1` (P1 critical) missing: structured_logging
+- `bd-ncivz.3` (P2 critical) missing: structured_logging
+- `bd-ncivz.5` (P2 critical) missing: structured_logging
+- `bd-ncivz.6` (P2 critical) missing: deterministic_e2e, structured_logging
+- `bd-ncivz.7` (P1 critical) missing: structured_logging
+- `bd-nlcyx` (P3 critical) missing: structured_logging
+- `bd-u43hx` (P3 critical) missing: structured_logging
+- `bd-z4mtc` (P2 critical) missing: structured_logging
+
+## All Failures
+
+- `bd-106dk` (Swiss Tables for index lookups (§7.7)) missing: structured_logging
+  - remediation: Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context.
+- `bd-14vp7.6` (Implement morsel-driven parallel dispatcher) missing: structured_logging
+  - remediation: Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context.
+- `bd-1dp9.6.2` (T6.2 SQL pipeline hotspot optimization sprints (single lever, proof-preserving)) missing: structured_logging
+  - remediation: Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context.
+- `bd-1dp9.6.4` (T6.4 Final performance parity report and regression guard) missing: structured_logging
+  - remediation: Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context.
+- `bd-1dp9.6.6` (Alien Contract Pack: EV/risk/fallback enforcement across all open beads) missing: structured_logging
+  - remediation: Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context.
+- `bd-1dp9.9.2` (T9.2 Parity closure scorecard and machine-readable evidence manifest) missing: structured_logging
+  - remediation: Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context.
+- `bd-1dp9.9.3` (T9.3 Post-100% ratchet guardrails and regression prevention) missing: structured_logging
+  - remediation: Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context.
+- `bd-1dp9.9.4` (T9.4 Final verification gate and release handoff package) missing: structured_logging
+  - remediation: Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context.
+- `bd-1dp9.9.5` (T9.5 User-facing parity navigator and divergence transparency pack) missing: structured_logging
+  - remediation: Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context.
+- `bd-1dp9.9.6` (Backlog quality gate: enforce unit/e2e/log acceptance completeness) missing: unit_property_tests, deterministic_e2e, structured_logging
+  - remediation: Add explicit acceptance text for unit/property coverage (normal, boundary, adversarial) with deterministic seeds.
+  - remediation: Add deterministic end-to-end scenario requirement with replay instructions and artifact capture.
+  - remediation: Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context.
+- `bd-1k39z` (Learned Index Structures for static lookup (§8.4)) missing: structured_logging
+  - remediation: Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context.
+- `bd-2bg7t` (Left-Right Sync for metadata hot paths (§14.3)) missing: structured_logging
+  - remediation: Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context.
+- `bd-2csg6.1` (Self-healing durability demo: flip bits, show repair with evidence ledger) missing: structured_logging
+  - remediation: Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context.
+- `bd-2csg6.2` (Concurrent writer scaling demo: SQLite baseline vs page-MVCC + SSI) missing: structured_logging
+  - remediation: Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context.
+- `bd-2qr3a` (Leapfrog Triejoin Implementation (§8.1)) missing: unit_property_tests, deterministic_e2e, structured_logging
+  - remediation: Add explicit acceptance text for unit/property coverage (normal, boundary, adversarial) with deterministic seeds.
+  - remediation: Add deterministic end-to-end scenario requirement with replay instructions and artifact capture.
+  - remediation: Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context.
+- `bd-2qr3a.3` (Integrate Leapfrog into query planner for 3+ table joins) missing: structured_logging
+  - remediation: Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context.
+- `bd-2qr3a.5` (Golden output checksums for Leapfrog join results) missing: structured_logging
+  - remediation: Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context.
+- `bd-2qr3a.6` (Property-based tests: Leapfrog output matches hash-join for all inputs) missing: structured_logging
+  - remediation: Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context.
+- `bd-2uza4.1` (Design pointer swizzle/unswizzle protocol for B-tree pages) missing: structured_logging
+  - remediation: Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context.
+- `bd-2uza4.2` (Implement SwizzlePtr and B-tree swizzle/unswizzle operations) missing: structured_logging
+  - remediation: Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context.
+- `bd-2uza4.3` (Implement page cooling/heating state machine with eviction integration) missing: structured_logging
+  - remediation: Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context.
+- `bd-2uza4.5` (Property tests: SwizzlePtr and cooling state machine invariants) missing: deterministic_e2e, structured_logging
+  - remediation: Add deterministic end-to-end scenario requirement with replay instructions and artifact capture.
+  - remediation: Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context.
+- `bd-2y306.2` (Implement chain-length controls and bounds) missing: structured_logging
+  - remediation: Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context.
+- `bd-2y306.3` (Tune epoch advance frequency for tail latency) missing: structured_logging
+  - remediation: Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context.
+- `bd-2y306.5` (Property tests: EBR version chain invariants under concurrent access) missing: deterministic_e2e, structured_logging
+  - remediation: Add deterministic end-to-end scenario requirement with replay instructions and artifact capture.
+  - remediation: Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context.
+- `bd-2y306.6` (Unit tests: EBR VersionGuard lifecycle and eager GC trigger) missing: deterministic_e2e, structured_logging
+  - remediation: Add deterministic end-to-end scenario requirement with replay instructions and artifact capture.
+  - remediation: Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context.
+- `bd-2y306.7` (Alien Contract: EBR Version-Chain GC rollout (budgeted + stale-reader safe-mode)) missing: structured_logging
+  - remediation: Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context.
+- `bd-31br0` (Provenance Semirings for query lineage (§8.9)) missing: structured_logging
+  - remediation: Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context.
+- `bd-368z9` (Proofs of Retrievability for durability audit (§11.11)) missing: structured_logging
+  - remediation: Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context.
+- `bd-3bw.5` (TEST: RaptorQ repair correctness, symbol efficiency, PoR audit) missing: unit_property_tests, deterministic_e2e, structured_logging
+  - remediation: Add explicit acceptance text for unit/property coverage (normal, boundary, adversarial) with deterministic seeds.
+  - remediation: Add deterministic end-to-end scenario requirement with replay instructions and artifact capture.
+  - remediation: Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context.
+- `bd-3mr81` (NitroSketch for streaming query statistics (§15.5)) missing: structured_logging
+  - remediation: Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context.
+- `bd-3plop.4` (Fault injection: lock contention storms) missing: structured_logging
+  - remediation: Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context.
+- `bd-3plop.5` (E2E test: SSI serialization correctness under 100 concurrent writers) missing: structured_logging
+  - remediation: Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context.
+- `bd-3plop.7` (Conformance: run SQLite TCL test harness) missing: structured_logging
+  - remediation: Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context.
+- `bd-52a8k` (Seqlocks for rarely-changing config (§14.9)) missing: structured_logging
+  - remediation: Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context.
+- `bd-5ew.1` (Tokenizer with full SQLite 3.52 dialect coverage) missing: unit_property_tests, deterministic_e2e, structured_logging
+  - remediation: Add explicit acceptance text for unit/property coverage (normal, boundary, adversarial) with deterministic seeds.
+  - remediation: Add deterministic end-to-end scenario requirement with replay instructions and artifact capture.
+  - remediation: Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context.
+- `bd-j2cfs` (Differential Privacy for aggregate queries (§12.5)) missing: structured_logging
+  - remediation: Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context.
+- `bd-mblr.3.5` (Unified quality evidence rollup and release-readiness gate) missing: unit_property_tests, deterministic_e2e, structured_logging
+  - remediation: Add explicit acceptance text for unit/property coverage (normal, boundary, adversarial) with deterministic seeds.
+  - remediation: Add deterministic end-to-end scenario requirement with replay instructions and artifact capture.
+  - remediation: Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context.
+- `bd-mblr.3.5.1` (Machine-readable validation manifest (coverage + unit + e2e + logging)) missing: structured_logging
+  - remediation: Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context.
+- `bd-mblr.3.5.1.1` (Manifest ingestion regression: unit+e2e+logging evidence replay) missing: structured_logging
+  - remediation: Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context.
+- `bd-ncivz.3` (Implement group commit with consolidation) missing: structured_logging
+  - remediation: Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context.
+- `bd-ncivz.5` (E2E test: crash recovery with parallel WAL multi-buffer replay) missing: structured_logging
+  - remediation: Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context.
+- `bd-ncivz.6` (Unit tests: per-core WAL buffer correctness and epoch ordering) missing: deterministic_e2e, structured_logging
+  - remediation: Add deterministic end-to-end scenario requirement with replay instructions and artifact capture.
+  - remediation: Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context.
+- `bd-ncivz.7` (Alien Contract: Parallel WAL group-commit with deterministic fallback) missing: structured_logging
+  - remediation: Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context.
+- `bd-nlcyx` (Database Cracking / Adaptive Indexing (§8.8)) missing: structured_logging
+  - remediation: Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context.
+- `bd-u43hx` (Flat Combining for lock contention hot spots (§14.2)) missing: structured_logging
+  - remediation: Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context.
+- `bd-z4mtc` (RCU/QSBR for hot metadata paths (§14.8)) missing: structured_logging
+  - remediation: Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context.

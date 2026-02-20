@@ -1,0 +1,10 @@
+{
+  "bead_id": "bd-1dp9.9.6",
+  "deterministic_fixture_pass": true,
+  "fixture_regression_detected": true,
+  "fixture_pass_report": "artifacts/backlog-quality-gate-e2e/fixture/report_a.json",
+  "fixture_regression_report": "artifacts/backlog-quality-gate-e2e/fixture/report_fail.json",
+  "repo_gate_enabled": false,
+  "repo_gate_exit_code": 0,
+  "repo_report": "artifacts/backlog-quality-gate-e2e/repo/report.json"
+}

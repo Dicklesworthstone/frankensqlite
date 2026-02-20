@@ -1,0 +1,293 @@
+  [2m2026-02-20T08:59:26.234798Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mSelected worker: vmi1227854 at ubuntu@109.123.245.77 (0 slots, speed 50.0)[0m
+    [2;3mat[0m rch/src/hook.rs:282 [2;3mon[0m ThreadId(1)
+
+  [2m2026-02-20T08:59:28.092378Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mStarting remote compilation pipeline for frankensqlite (hash: cd6c2822f41d049c)[0m
+    [2;3mat[0m rch/src/hook.rs:3406 [2;3mon[0m ThreadId(1)
+
+  [2m2026-02-20T08:59:28.092806Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mPrepared dependency sync manifest for 26 roots[0m
+    [2;3mat[0m rch/src/hook.rs:3428 [2;3mon[0m ThreadId(1)
+
+  [2m2026-02-20T08:59:33.520489Z[0m [33m WARN[0m [1;33mrch::hook[0m[33m: [33mrepo_updater sync-apply failed on vmi1227854 (status Some(1)): → Syncing 1 repo(s)...
+✗ Pull failed: Dicklesworthstone/frankensqlite[0m
+    [2;3mat[0m rch/src/hook.rs:2564 [2;3mon[0m ThreadId(1)
+
+  [2m2026-02-20T08:59:33.521830Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mSyncing project to worker vmi1227854...[0m
+    [2;3mat[0m rch/src/hook.rs:3452 [2;3mon[0m ThreadId(1)
+
+  [2m2026-02-20T08:59:33.522770Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite -> /data/projects/frankensqlite on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:908 [2;3mon[0m ThreadId(1)
+
+  [2m2026-02-20T08:59:36.879026Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 3356ms[0m
+    [2;3mat[0m rch/src/transfer.rs:977 [2;3mon[0m ThreadId(1)
+
+  [2m2026-02-20T08:59:36.879590Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite -> /data/projects/frankensqlite/crates/fsqlite on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:908 [2;3mon[0m ThreadId(1)
+
+  [2m2026-02-20T08:59:38.879903Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2000ms[0m
+    [2;3mat[0m rch/src/transfer.rs:977 [2;3mon[0m ThreadId(1)
+
+  [2m2026-02-20T08:59:38.881293Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-ast -> /data/projects/frankensqlite/crates/fsqlite-ast on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:908 [2;3mon[0m ThreadId(1)
+
+  [2m2026-02-20T08:59:40.915927Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2034ms[0m
+    [2;3mat[0m rch/src/transfer.rs:977 [2;3mon[0m ThreadId(1)
+
+  [2m2026-02-20T08:59:40.918233Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-btree -> /data/projects/frankensqlite/crates/fsqlite-btree on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:908 [2;3mon[0m ThreadId(1)
+
+  [2m2026-02-20T08:59:42.921980Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2003ms[0m
+    [2;3mat[0m rch/src/transfer.rs:977 [2;3mon[0m ThreadId(1)
+
+  [2m2026-02-20T08:59:42.923417Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-cli -> /data/projects/frankensqlite/crates/fsqlite-cli on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:908 [2;3mon[0m ThreadId(1)
+
+  [2m2026-02-20T08:59:44.970104Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2046ms[0m
+    [2;3mat[0m rch/src/transfer.rs:977 [2;3mon[0m ThreadId(1)
+
+  [2m2026-02-20T08:59:44.971455Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-core -> /data/projects/frankensqlite/crates/fsqlite-core on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:908 [2;3mon[0m ThreadId(1)
+
+  [2m2026-02-20T08:59:47.096324Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2124ms[0m
+    [2;3mat[0m rch/src/transfer.rs:977 [2;3mon[0m ThreadId(1)
+
+  [2m2026-02-20T08:59:47.097722Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-e2e -> /data/projects/frankensqlite/crates/fsqlite-e2e on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:908 [2;3mon[0m ThreadId(1)
+
+  [2m2026-02-20T08:59:49.196604Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2098ms[0m
+    [2;3mat[0m rch/src/transfer.rs:977 [2;3mon[0m ThreadId(1)
+
+  [2m2026-02-20T08:59:49.197874Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-error -> /data/projects/frankensqlite/crates/fsqlite-error on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:908 [2;3mon[0m ThreadId(1)
+
+  [2m2026-02-20T08:59:51.258767Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2060ms[0m
+    [2;3mat[0m rch/src/transfer.rs:977 [2;3mon[0m ThreadId(1)
+
+  [2m2026-02-20T08:59:51.261202Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-ext-fts3 -> /data/projects/frankensqlite/crates/fsqlite-ext-fts3 on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:908 [2;3mon[0m ThreadId(1)
+
+  [2m2026-02-20T08:59:53.395706Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2134ms[0m
+    [2;3mat[0m rch/src/transfer.rs:977 [2;3mon[0m ThreadId(1)
+
+  [2m2026-02-20T08:59:53.396512Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-ext-fts5 -> /data/projects/frankensqlite/crates/fsqlite-ext-fts5 on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:908 [2;3mon[0m ThreadId(1)
+
+  [2m2026-02-20T08:59:55.481016Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2084ms[0m
+    [2;3mat[0m rch/src/transfer.rs:977 [2;3mon[0m ThreadId(1)
+
+  [2m2026-02-20T08:59:55.482003Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-ext-icu -> /data/projects/frankensqlite/crates/fsqlite-ext-icu on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:908 [2;3mon[0m ThreadId(1)
+
+  [2m2026-02-20T08:59:57.436023Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1953ms[0m
+    [2;3mat[0m rch/src/transfer.rs:977 [2;3mon[0m ThreadId(1)
+
+  [2m2026-02-20T08:59:57.437027Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-ext-json -> /data/projects/frankensqlite/crates/fsqlite-ext-json on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:908 [2;3mon[0m ThreadId(1)
+
+  [2m2026-02-20T08:59:59.492784Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2055ms[0m
+    [2;3mat[0m rch/src/transfer.rs:977 [2;3mon[0m ThreadId(1)
+
+  [2m2026-02-20T08:59:59.493006Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-ext-misc -> /data/projects/frankensqlite/crates/fsqlite-ext-misc on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:908 [2;3mon[0m ThreadId(1)
+
+  [2m2026-02-20T09:00:01.517579Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2024ms[0m
+    [2;3mat[0m rch/src/transfer.rs:977 [2;3mon[0m ThreadId(1)
+
+  [2m2026-02-20T09:00:01.518279Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-ext-rtree -> /data/projects/frankensqlite/crates/fsqlite-ext-rtree on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:908 [2;3mon[0m ThreadId(1)
+
+  [2m2026-02-20T09:00:03.822361Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2303ms[0m
+    [2;3mat[0m rch/src/transfer.rs:977 [2;3mon[0m ThreadId(1)
+
+  [2m2026-02-20T09:00:03.823523Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-ext-session -> /data/projects/frankensqlite/crates/fsqlite-ext-session on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:908 [2;3mon[0m ThreadId(1)
+
+  [2m2026-02-20T09:00:05.899685Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2075ms[0m
+    [2;3mat[0m rch/src/transfer.rs:977 [2;3mon[0m ThreadId(1)
+
+  [2m2026-02-20T09:00:05.901421Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-func -> /data/projects/frankensqlite/crates/fsqlite-func on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:908 [2;3mon[0m ThreadId(1)
+
+  [2m2026-02-20T09:00:07.926877Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2025ms[0m
+    [2;3mat[0m rch/src/transfer.rs:977 [2;3mon[0m ThreadId(1)
+
+  [2m2026-02-20T09:00:07.927641Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-harness -> /data/projects/frankensqlite/crates/fsqlite-harness on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:908 [2;3mon[0m ThreadId(1)
+
+  [2m2026-02-20T09:00:10.030208Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2102ms[0m
+    [2;3mat[0m rch/src/transfer.rs:977 [2;3mon[0m ThreadId(1)
+
+  [2m2026-02-20T09:00:10.031185Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-mvcc -> /data/projects/frankensqlite/crates/fsqlite-mvcc on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:908 [2;3mon[0m ThreadId(1)
+
+  [2m2026-02-20T09:00:12.092863Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2061ms[0m
+    [2;3mat[0m rch/src/transfer.rs:977 [2;3mon[0m ThreadId(1)
+
+  [2m2026-02-20T09:00:12.093794Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-observability -> /data/projects/frankensqlite/crates/fsqlite-observability on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:908 [2;3mon[0m ThreadId(1)
+
+  [2m2026-02-20T09:00:14.128445Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2034ms[0m
+    [2;3mat[0m rch/src/transfer.rs:977 [2;3mon[0m ThreadId(1)
+
+  [2m2026-02-20T09:00:14.129435Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-pager -> /data/projects/frankensqlite/crates/fsqlite-pager on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:908 [2;3mon[0m ThreadId(1)
+
+  [2m2026-02-20T09:00:16.546752Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2417ms[0m
+    [2;3mat[0m rch/src/transfer.rs:977 [2;3mon[0m ThreadId(1)
+
+  [2m2026-02-20T09:00:16.547569Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-parser -> /data/projects/frankensqlite/crates/fsqlite-parser on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:908 [2;3mon[0m ThreadId(1)
+
+  [2m2026-02-20T09:00:18.538261Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1990ms[0m
+    [2;3mat[0m rch/src/transfer.rs:977 [2;3mon[0m ThreadId(1)
+
+  [2m2026-02-20T09:00:18.538627Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-planner -> /data/projects/frankensqlite/crates/fsqlite-planner on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:908 [2;3mon[0m ThreadId(1)
+
+  [2m2026-02-20T09:00:20.522554Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1983ms[0m
+    [2;3mat[0m rch/src/transfer.rs:977 [2;3mon[0m ThreadId(1)
+
+  [2m2026-02-20T09:00:20.523194Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-types -> /data/projects/frankensqlite/crates/fsqlite-types on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:908 [2;3mon[0m ThreadId(1)
+
+  [2m2026-02-20T09:00:22.553290Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2029ms[0m
+    [2;3mat[0m rch/src/transfer.rs:977 [2;3mon[0m ThreadId(1)
+
+  [2m2026-02-20T09:00:22.554009Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-vdbe -> /data/projects/frankensqlite/crates/fsqlite-vdbe on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:908 [2;3mon[0m ThreadId(1)
+
+  [2m2026-02-20T09:00:24.576717Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2022ms[0m
+    [2;3mat[0m rch/src/transfer.rs:977 [2;3mon[0m ThreadId(1)
+
+  [2m2026-02-20T09:00:24.577870Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-vfs -> /data/projects/frankensqlite/crates/fsqlite-vfs on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:908 [2;3mon[0m ThreadId(1)
+
+  [2m2026-02-20T09:00:26.614736Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2036ms[0m
+    [2;3mat[0m rch/src/transfer.rs:977 [2;3mon[0m ThreadId(1)
+
+  [2m2026-02-20T09:00:26.616420Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-wal -> /data/projects/frankensqlite/crates/fsqlite-wal on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:908 [2;3mon[0m ThreadId(1)
+
+  [2m2026-02-20T09:00:28.742816Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2126ms[0m
+    [2;3mat[0m rch/src/transfer.rs:977 [2;3mon[0m ThreadId(1)
+
+  [2m2026-02-20T09:00:28.743211Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mSync complete: 18132 files, 850435 bytes in 55174ms[0m
+    [2;3mat[0m rch/src/hook.rs:3527 [2;3mon[0m ThreadId(1)
+
+  [2m2026-02-20T09:00:30.183157Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mExecuting command remotely: cargo test -p fsqlite-e2e --test mvcc_concurrent_writers -- --nocapture[0m
+    [2;3mat[0m rch/src/hook.rs:3547 [2;3mon[0m ThreadId(1)
+
+  [2m2026-02-20T09:00:30.183464Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mWrapping command with external timeout protection, [1;32mkind[0m[32m: cargo test, [1;32mtimeout_secs[0m[32m: 1800[0m
+    [2;3mat[0m rch/src/transfer.rs:669 [2;3mon[0m ThreadId(1)
+
+    Finished `test` profile [optimized + debuginfo] target(s) in 0.17s
+     Running tests/mvcc_concurrent_writers.rs (target/debug/deps/mvcc_concurrent_writers-6748954967ac28d4)
+
+running 15 tests
+test mvcc_contention_1_worker ... ok
+test mvcc_contention_2_workers ... ok
+test mvcc_disjoint_1_worker ... ok
+FrankenSQLite baseline (4w contention, sequential): 1004 ops, 53494.8 ops/s, 18ms
+test mvcc_fsqlite_baseline_contention ... ok
+test mvcc_disjoint_2_workers ... ok
+test mvcc_contention_4_workers ... ok
+FrankenSQLite baseline (4w sequential): 2802 ops, 33395.7 ops/s, 83ms
+test mvcc_fsqlite_baseline_disjoint ... ok
+test mvcc_disjoint_4_workers ... ok
+test mvcc_disjoint_8_workers ... ok
+test mvcc_contention_8_workers ... ok
+test mvcc_contention_16_workers ... ok
+test mvcc_disjoint_16_workers ... ok
+
+========================================================================
+  MVCC Scaling Report: Hot-Page Contention (SSI conflict)
+  Repetitions: 3
+========================================================================
+   Workers    p50 ops/s    p95 ops/s    Speedup    Retries   Aborts
+  ------------------------------------------------------------------------
+         1      41331.3      42926.1      1.00x          0        0
+         2      46236.1      61734.5      1.12x          0        0
+         4      31031.7      31910.4      0.75x          0        0
+         8      14371.6      61068.7      0.35x          0        0
+        16      14644.0      14685.5      0.35x          4        4
+========================================================================
+
+
+test mvcc_scaling_report_hot_page_contention ... ok
+
+========================================================================
+  MVCC Scaling Report: Disjoint Partitions (zero contention)
+  Repetitions: 3
+========================================================================
+   Workers    p50 ops/s    p95 ops/s    Speedup    Retries   Aborts
+  ------------------------------------------------------------------------
+         1      56585.0      58551.1      1.00x          0        0
+         2      43579.7      47888.3      0.77x          0        0
+         4      44268.4      44821.8      0.78x          0        0
+         8      28737.7      33945.6      0.51x          0        0
+        16      29808.7      30020.2      0.53x          5        5
+========================================================================
+
+
+test mvcc_scaling_report_disjoint_partitions ... ok
+
+########################################################################
+  MVCC Concurrent Writers — Full Scaling Report
+  Bead: bd-1w6k.4.3
+########################################################################
+
+========================================================================
+  MVCC Scaling Report: Disjoint Partitions
+  Repetitions: 3
+========================================================================
+   Workers    p50 ops/s    p95 ops/s    Speedup    Retries   Aborts
+  ------------------------------------------------------------------------
+         1      35759.5      51325.7      1.00x          0        0
+         2      46737.1      54621.9      1.31x          0        0
+         4      43306.0      45039.9      1.21x          0        0
+         8      33597.2      40635.2      0.94x          0        0
+        16      32496.6      34269.8      0.91x          4        4
+========================================================================
+
+
+
+========================================================================
+  MVCC Scaling Report: Hot-Page Contention
+  Repetitions: 3
+========================================================================
+   Workers    p50 ops/s    p95 ops/s    Speedup    Retries   Aborts
+  ------------------------------------------------------------------------
+         1      59238.4      61162.2      1.00x          0        0
+         2      61159.4      66849.3      1.03x          0        0
+         4      36556.2      59900.3      0.62x          0        0
+         8      14440.9      19117.9      0.24x          0        0
+        16      14729.8      15309.5      0.25x          3        3
+========================================================================
+
+
+  FrankenSQLite Sequential Baselines:
+  ------------------------------------------------------------------------
+  Disjoint (4w seq):       2802 ops     30539.3 ops/s      91ms
+  Contention (4w seq):     1004 ops     57142.1 ops/s      17ms
+
+########################################################################
+
+test mvcc_combined_scaling_comparison ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.86s
+
+  [2m2026-02-20T09:00:34.792898Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mRemote command finished: exit=0 in 4608ms[0m
+    [2;3mat[0m rch/src/hook.rs:3656 [2;3mon[0m ThreadId(1)
+
+  [2m2026-02-20T09:00:34.793101Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mRetrieving build artifacts...[0m
+    [2;3mat[0m rch/src/hook.rs:3698 [2;3mon[0m ThreadId(1)
+
+  [2m2026-02-20T09:00:34.793310Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mRetrieving artifacts from /data/projects/frankensqlite on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:1511 [2;3mon[0m ThreadId(1)
+
+  [2m2026-02-20T09:00:37.271781Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mArtifacts retrieved in 2478ms (1202 files, 255 bytes)[0m
+    [2;3mat[0m rch/src/transfer.rs:1550 [2;3mon[0m ThreadId(1)
+
+  [2m2026-02-20T09:00:37.271970Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mArtifacts retrieved: 1202 files, 255 bytes in 2478ms[0m
+    [2;3mat[0m rch/src/hook.rs:3725 [2;3mon[0m ThreadId(1)
+
+[RCH] remote vmi1227854 (76.1s)

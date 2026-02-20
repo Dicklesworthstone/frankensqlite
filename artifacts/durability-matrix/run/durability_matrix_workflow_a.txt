@@ -1,0 +1,38 @@
+durability_matrix bead_id=bd-mblr.7.4 schema_version=1 root_seed=13204554107450294273 log_standard_ref=bd-1fpm
+environments:
+- id=env-freebsd-zfs-nightly os=FreeBsd fs=Zfs toolchain=Nightly atomic_rename=true fsync=true notes=ZFS durability semantics and metadata checksums
+- id=env-linux-ext4-nightly os=Linux fs=Ext4Ordered toolchain=Nightly atomic_rename=true fsync=true notes=Primary CI lane baseline
+- id=env-linux-ext4-stable os=Linux fs=Ext4Ordered toolchain=Stable atomic_rename=true fsync=true notes=Regression guard against nightly drift
+- id=env-linux-xfs-nightly os=Linux fs=XfsBarrier toolchain=Nightly atomic_rename=true fsync=true notes=Barrier-heavy metadata ordering behavior
+- id=env-macos-apfs-nightly os=MacOs fs=Apfs toolchain=Nightly atomic_rename=true fsync=true notes=APFS crash-recovery ordering semantics
+- id=env-windows-ntfs-nightly os=Windows fs=Ntfs toolchain=Nightly atomic_rename=true fsync=true notes=NTFS rename + flush behavior
+scenarios:
+- id=REC-1 crash_mode=MidCommit seed=13204554107450294530 command=cargo test -p fsqlite-e2e --test recovery_crash_wal_replay -- --nocapture scenario_ids=REC-1,WAL-1 invariants=INV-5,WAL-1,PAGER-1
+- id=REC-2 crash_mode=CorruptionInjection seed=13204554107450294531 command=cargo test -p fsqlite-e2e --test recovery_single_page -- --nocapture scenario_ids=REC-2 invariants=PAGER-1,BTREE-1
+- id=REC-3 crash_mode=CorruptionInjection seed=13204554107450294532 command=cargo test -p fsqlite-e2e --test recovery_wal_corruption -- --nocapture scenario_ids=REC-3,CORRUPT-1 invariants=WAL-1,INV-6,INV-7
+- id=WAL-2 crash_mode=DuringCheckpoint seed=13204554107450294533 command=cargo test -p fsqlite-e2e --test correctness_transactions -- --nocapture scenario_ids=WAL-2,TXN-2 invariants=WAL-1,INV-4
+probes:
+- id=probe-env-freebsd-zfs-nightly-rec-1 environment=env-freebsd-zfs-nightly scenario=REC-1 lanes=RecoveryReplay,CheckpointParity,FullSuiteFallback
+- id=probe-env-freebsd-zfs-nightly-rec-2 environment=env-freebsd-zfs-nightly scenario=REC-2 lanes=CorruptionRecovery,FullSuiteFallback
+- id=probe-env-freebsd-zfs-nightly-rec-3 environment=env-freebsd-zfs-nightly scenario=REC-3 lanes=CorruptionRecovery,FullSuiteFallback
+- id=probe-env-freebsd-zfs-nightly-wal-2 environment=env-freebsd-zfs-nightly scenario=WAL-2 lanes=CheckpointParity,FullSuiteFallback
+- id=probe-env-linux-ext4-nightly-rec-1 environment=env-linux-ext4-nightly scenario=REC-1 lanes=RecoveryReplay,CheckpointParity,FullSuiteFallback
+- id=probe-env-linux-ext4-nightly-rec-2 environment=env-linux-ext4-nightly scenario=REC-2 lanes=CorruptionRecovery,FullSuiteFallback
+- id=probe-env-linux-ext4-nightly-rec-3 environment=env-linux-ext4-nightly scenario=REC-3 lanes=CorruptionRecovery,FullSuiteFallback
+- id=probe-env-linux-ext4-nightly-wal-2 environment=env-linux-ext4-nightly scenario=WAL-2 lanes=CheckpointParity,FullSuiteFallback
+- id=probe-env-linux-ext4-stable-rec-1 environment=env-linux-ext4-stable scenario=REC-1 lanes=RecoveryReplay,CheckpointParity,FullSuiteFallback
+- id=probe-env-linux-ext4-stable-rec-2 environment=env-linux-ext4-stable scenario=REC-2 lanes=CorruptionRecovery,FullSuiteFallback
+- id=probe-env-linux-ext4-stable-rec-3 environment=env-linux-ext4-stable scenario=REC-3 lanes=CorruptionRecovery,FullSuiteFallback
+- id=probe-env-linux-ext4-stable-wal-2 environment=env-linux-ext4-stable scenario=WAL-2 lanes=CheckpointParity,FullSuiteFallback
+- id=probe-env-linux-xfs-nightly-rec-1 environment=env-linux-xfs-nightly scenario=REC-1 lanes=RecoveryReplay,CheckpointParity,FullSuiteFallback
+- id=probe-env-linux-xfs-nightly-rec-2 environment=env-linux-xfs-nightly scenario=REC-2 lanes=CorruptionRecovery,FullSuiteFallback
+- id=probe-env-linux-xfs-nightly-rec-3 environment=env-linux-xfs-nightly scenario=REC-3 lanes=CorruptionRecovery,FullSuiteFallback
+- id=probe-env-linux-xfs-nightly-wal-2 environment=env-linux-xfs-nightly scenario=WAL-2 lanes=CheckpointParity,FullSuiteFallback
+- id=probe-env-macos-apfs-nightly-rec-1 environment=env-macos-apfs-nightly scenario=REC-1 lanes=RecoveryReplay,CheckpointParity,FullSuiteFallback
+- id=probe-env-macos-apfs-nightly-rec-2 environment=env-macos-apfs-nightly scenario=REC-2 lanes=CorruptionRecovery,FullSuiteFallback
+- id=probe-env-macos-apfs-nightly-rec-3 environment=env-macos-apfs-nightly scenario=REC-3 lanes=CorruptionRecovery,FullSuiteFallback
+- id=probe-env-macos-apfs-nightly-wal-2 environment=env-macos-apfs-nightly scenario=WAL-2 lanes=CheckpointParity,FullSuiteFallback
+- id=probe-env-windows-ntfs-nightly-rec-1 environment=env-windows-ntfs-nightly scenario=REC-1 lanes=RecoveryReplay,CheckpointParity,FullSuiteFallback
+- id=probe-env-windows-ntfs-nightly-rec-2 environment=env-windows-ntfs-nightly scenario=REC-2 lanes=CorruptionRecovery,FullSuiteFallback
+- id=probe-env-windows-ntfs-nightly-rec-3 environment=env-windows-ntfs-nightly scenario=REC-3 lanes=CorruptionRecovery,FullSuiteFallback
+- id=probe-env-windows-ntfs-nightly-wal-2 environment=env-windows-ntfs-nightly scenario=WAL-2 lanes=CheckpointParity,FullSuiteFallback

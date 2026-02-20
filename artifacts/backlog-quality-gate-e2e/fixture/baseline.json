@@ -1,0 +1,12 @@
+{
+  "schema_version": "1.0.0",
+  "entries": [
+    {
+      "issue_id": "bd-fixture-known",
+      "missing_requirements": [
+        "deterministic_e2e",
+        "structured_logging"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,55 @@
+{
+  "bead_id": "bd-2g5.1",
+  "run_id": "bd-2g5.1-seed-20260219",
+  "trace_id": 20260219,
+  "scenario_id": "TXNSLOT-1",
+  "seed": 20260219,
+  "overall_status": "pass",
+  "timing": {
+    "total_elapsed_us": 424,
+    "alloc_release_elapsed_us": 182,
+    "alloc_release_avg_ns": 355,
+    "crash_cycle_elapsed_us": 74
+  },
+  "checks": [
+    {
+      "id": "alloc_release_latency_budget",
+      "status": "pass",
+      "detail": "avg_alloc_release_ns=355 target_lt_ns=1000"
+    },
+    {
+      "id": "crash_detection_within_two_heartbeats",
+      "status": "pass",
+      "detail": "elapsed_secs=6 heartbeat_period_secs=5"
+    },
+    {
+      "id": "no_orphans_after_100_cycles",
+      "status": "pass",
+      "detail": "released_count=100 expected=100"
+    },
+    {
+      "id": "cross_process_visibility",
+      "status": "pass",
+      "detail": "published txn_id/pid/begin_seq observed via shared slot reader"
+    }
+  ],
+  "metric_delta": {
+    "fsqlite_txn_slots_active": 0,
+    "fsqlite_txn_slot_crashes_detected_total": 100
+  },
+  "observability": {
+    "required_fields": [
+      "run_id",
+      "trace_id",
+      "scenario_id",
+      "operation",
+      "operation_elapsed_us",
+      "slot_id",
+      "process_id",
+      "failure_context"
+    ],
+    "event_target": "fsqlite.txn_slot",
+    "span_name": "txn_slot"
+  },
+  "replay_command": "RUN_ID='bd-2g5.1-seed-20260219' TRACE_ID=20260219 SCENARIO_ID='TXNSLOT-1' SEED=20260219 FSQLITE_TXN_SLOT_E2E_ARTIFACT='artifacts/bd-2g5.1/txn_slots_e2e_artifact.json' cargo test -p fsqlite-mvcc core_types::tests::txn_slot_crash_recovery_e2e_replay_emits_artifact -- --exact --nocapture"
+}

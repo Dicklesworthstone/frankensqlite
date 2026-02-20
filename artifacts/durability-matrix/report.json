@@ -1,0 +1,74 @@
+{
+  "schema_version": "fsqlite.durability-matrix.v1",
+  "bead_id": "bd-mblr.7.4",
+  "run": {
+    "run_id": "bd-mblr.7.4-20260220T102526Z",
+    "trace_id": "trace-ce0899ffad69238d",
+    "commit_sha": "af7fee7b8bf28a68c3cdd3d396b6fa5b981c3ede",
+    "root_seed": 13204554107450294273
+  },
+  "lane": {
+    "outcome": "pass",
+    "highest_severity": "none",
+    "violation_count": 0,
+    "runner_failure": false
+  },
+  "checks": {
+    "matrix_determinism": {
+      "pass": true,
+      "severity": "none"
+    },
+    "workflow_determinism": {
+      "pass": true,
+      "severity": "none"
+    },
+    "matrix_contract": {
+      "pass": true,
+      "severity": "none"
+    },
+    "dry_run_contract": {
+      "pass": true,
+      "severity": "none"
+    },
+    "matrix_dry_run_counts": {
+      "pass": true,
+      "severity": "none"
+    }
+  },
+  "matrix": {
+    "environment_count": 6,
+    "scenario_count": 4,
+    "probe_count": 24
+  },
+  "dry_run": {
+    "total_probes": 24,
+    "skipped_probes": 24
+  },
+  "drift": {
+    "owner": "bd-mblr.7.4",
+    "violations": []
+  },
+  "release_gate": {
+    "owner": "bd-mblr.7.4",
+    "blocking_threshold": "high",
+    "block_release": false
+  },
+  "artifacts": {
+    "matrix_a": "artifacts/durability-matrix/run/durability_matrix_a.json",
+    "matrix_b": "artifacts/durability-matrix/run/durability_matrix_b.json",
+    "matrix_diff": "artifacts/durability-matrix/run/matrix_diff.txt",
+    "workflow_a": "artifacts/durability-matrix/run/durability_matrix_workflow_a.txt",
+    "workflow_b": "artifacts/durability-matrix/run/durability_matrix_workflow_b.txt",
+    "workflow_diff": "artifacts/durability-matrix/run/workflow_diff.txt",
+    "dry_run": "artifacts/durability-matrix/run/durability_probe_dry_run.json",
+    "log_matrix_a": "artifacts/durability-matrix/run/matrix_a.log",
+    "log_matrix_b": "artifacts/durability-matrix/run/matrix_b.log",
+    "log_workflow_a": "artifacts/durability-matrix/run/workflow_a.log",
+    "log_workflow_b": "artifacts/durability-matrix/run/workflow_b.log",
+    "log_dry_run": "artifacts/durability-matrix/run/dry_run.log"
+  },
+  "replay": {
+    "matrix_command": "cargo run -p fsqlite-harness --bin durability_matrix_manifest -- --root-seed 0xB740000000000001 --output /data/projects/frankensqlite/artifacts/durability-matrix/run/durability_matrix_a.json",
+    "dry_run_command": "cargo run -p fsqlite-harness --bin durability_matrix_manifest -- --root-seed 0xB740000000000001 --probe-dry-run --output /data/projects/frankensqlite/artifacts/durability-matrix/run/durability_probe_dry_run.json"
+  }
+}

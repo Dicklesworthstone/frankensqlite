@@ -1,0 +1,1381 @@
+{
+  "schema_version": "1.0.0",
+  "bead_id": "bd-1dp9.9.6",
+  "generated_unix_ms": 1771583647764,
+  "beads_path": "/data/projects/frankensqlite/.beads/issues.jsonl",
+  "baseline_path": "/data/projects/frankensqlite/conformance/backlog_quality_gate_baseline.json",
+  "critical_priority_max": 1,
+  "overall_pass": false,
+  "summary": {
+    "scanned_active_beads": 111,
+    "scanned_critical_beads": 110,
+    "total_failures": 47,
+    "critical_failures": 46,
+    "regression_failures": 46,
+    "missing_unit_property_count": 5,
+    "missing_deterministic_e2e_count": 9,
+    "missing_structured_logging_count": 47
+  },
+  "failures": [
+    {
+      "issue_id": "bd-106dk",
+      "title": "Swiss Tables for index lookups (§7.7)",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 3,
+      "is_critical": true,
+      "missing_requirements": [
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-14vp7.6",
+      "title": "Implement morsel-driven parallel dispatcher",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 2,
+      "is_critical": false,
+      "missing_requirements": [
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-1dp9.6.2",
+      "title": "T6.2 SQL pipeline hotspot optimization sprints (single lever, proof-preserving)",
+      "status": "in_progress",
+      "issue_type": "task",
+      "priority": 1,
+      "is_critical": true,
+      "missing_requirements": [
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-1dp9.6.4",
+      "title": "T6.4 Final performance parity report and regression guard",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 1,
+      "is_critical": true,
+      "missing_requirements": [
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-1dp9.6.6",
+      "title": "Alien Contract Pack: EV/risk/fallback enforcement across all open beads",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 1,
+      "is_critical": true,
+      "missing_requirements": [
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-1dp9.9.2",
+      "title": "T9.2 Parity closure scorecard and machine-readable evidence manifest",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 1,
+      "is_critical": true,
+      "missing_requirements": [
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-1dp9.9.3",
+      "title": "T9.3 Post-100% ratchet guardrails and regression prevention",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 1,
+      "is_critical": true,
+      "missing_requirements": [
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-1dp9.9.4",
+      "title": "T9.4 Final verification gate and release handoff package",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 1,
+      "is_critical": true,
+      "missing_requirements": [
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-1dp9.9.5",
+      "title": "T9.5 User-facing parity navigator and divergence transparency pack",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 1,
+      "is_critical": true,
+      "missing_requirements": [
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-1dp9.9.6",
+      "title": "Backlog quality gate: enforce unit/e2e/log acceptance completeness",
+      "status": "in_progress",
+      "issue_type": "task",
+      "priority": 1,
+      "is_critical": true,
+      "missing_requirements": [
+        "unit_property_tests",
+        "deterministic_e2e",
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add explicit acceptance text for unit/property coverage (normal, boundary, adversarial) with deterministic seeds.",
+        "Add deterministic end-to-end scenario requirement with replay instructions and artifact capture.",
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-1k39z",
+      "title": "Learned Index Structures for static lookup (§8.4)",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 3,
+      "is_critical": true,
+      "missing_requirements": [
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-2bg7t",
+      "title": "Left-Right Sync for metadata hot paths (§14.3)",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 3,
+      "is_critical": true,
+      "missing_requirements": [
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-2csg6.1",
+      "title": "Self-healing durability demo: flip bits, show repair with evidence ledger",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 2,
+      "is_critical": true,
+      "missing_requirements": [
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-2csg6.2",
+      "title": "Concurrent writer scaling demo: SQLite baseline vs page-MVCC + SSI",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 2,
+      "is_critical": true,
+      "missing_requirements": [
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-2qr3a",
+      "title": "Leapfrog Triejoin Implementation (§8.1)",
+      "status": "open",
+      "issue_type": "epic",
+      "priority": 1,
+      "is_critical": true,
+      "missing_requirements": [
+        "unit_property_tests",
+        "deterministic_e2e",
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add explicit acceptance text for unit/property coverage (normal, boundary, adversarial) with deterministic seeds.",
+        "Add deterministic end-to-end scenario requirement with replay instructions and artifact capture.",
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-2qr3a.3",
+      "title": "Integrate Leapfrog into query planner for 3+ table joins",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 2,
+      "is_critical": true,
+      "missing_requirements": [
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-2qr3a.5",
+      "title": "Golden output checksums for Leapfrog join results",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 2,
+      "is_critical": true,
+      "missing_requirements": [
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-2qr3a.6",
+      "title": "Property-based tests: Leapfrog output matches hash-join for all inputs",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 2,
+      "is_critical": true,
+      "missing_requirements": [
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-2uza4.1",
+      "title": "Design pointer swizzle/unswizzle protocol for B-tree pages",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 2,
+      "is_critical": true,
+      "missing_requirements": [
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-2uza4.2",
+      "title": "Implement SwizzlePtr and B-tree swizzle/unswizzle operations",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 2,
+      "is_critical": true,
+      "missing_requirements": [
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-2uza4.3",
+      "title": "Implement page cooling/heating state machine with eviction integration",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 2,
+      "is_critical": true,
+      "missing_requirements": [
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-2uza4.5",
+      "title": "Property tests: SwizzlePtr and cooling state machine invariants",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 2,
+      "is_critical": true,
+      "missing_requirements": [
+        "deterministic_e2e",
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add deterministic end-to-end scenario requirement with replay instructions and artifact capture.",
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-2y306.2",
+      "title": "Implement chain-length controls and bounds",
+      "status": "in_progress",
+      "issue_type": "task",
+      "priority": 2,
+      "is_critical": true,
+      "missing_requirements": [
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-2y306.3",
+      "title": "Tune epoch advance frequency for tail latency",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 2,
+      "is_critical": true,
+      "missing_requirements": [
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-2y306.5",
+      "title": "Property tests: EBR version chain invariants under concurrent access",
+      "status": "in_progress",
+      "issue_type": "task",
+      "priority": 2,
+      "is_critical": true,
+      "missing_requirements": [
+        "deterministic_e2e",
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add deterministic end-to-end scenario requirement with replay instructions and artifact capture.",
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-2y306.6",
+      "title": "Unit tests: EBR VersionGuard lifecycle and eager GC trigger",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 2,
+      "is_critical": true,
+      "missing_requirements": [
+        "deterministic_e2e",
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add deterministic end-to-end scenario requirement with replay instructions and artifact capture.",
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-2y306.7",
+      "title": "Alien Contract: EBR Version-Chain GC rollout (budgeted + stale-reader safe-mode)",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 1,
+      "is_critical": true,
+      "missing_requirements": [
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-31br0",
+      "title": "Provenance Semirings for query lineage (§8.9)",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 3,
+      "is_critical": true,
+      "missing_requirements": [
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-368z9",
+      "title": "Proofs of Retrievability for durability audit (§11.11)",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 3,
+      "is_critical": true,
+      "missing_requirements": [
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-3bw.5",
+      "title": "TEST: RaptorQ repair correctness, symbol efficiency, PoR audit",
+      "status": "in_progress",
+      "issue_type": "task",
+      "priority": 1,
+      "is_critical": true,
+      "missing_requirements": [
+        "unit_property_tests",
+        "deterministic_e2e",
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add explicit acceptance text for unit/property coverage (normal, boundary, adversarial) with deterministic seeds.",
+        "Add deterministic end-to-end scenario requirement with replay instructions and artifact capture.",
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-3mr81",
+      "title": "NitroSketch for streaming query statistics (§15.5)",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 3,
+      "is_critical": true,
+      "missing_requirements": [
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-3plop.4",
+      "title": "Fault injection: lock contention storms",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 2,
+      "is_critical": true,
+      "missing_requirements": [
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-3plop.5",
+      "title": "E2E test: SSI serialization correctness under 100 concurrent writers",
+      "status": "in_progress",
+      "issue_type": "task",
+      "priority": 1,
+      "is_critical": true,
+      "missing_requirements": [
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-3plop.7",
+      "title": "Conformance: run SQLite TCL test harness",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 1,
+      "is_critical": true,
+      "missing_requirements": [
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-52a8k",
+      "title": "Seqlocks for rarely-changing config (§14.9)",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 3,
+      "is_critical": true,
+      "missing_requirements": [
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-5ew.1",
+      "title": "Tokenizer with full SQLite 3.52 dialect coverage",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 1,
+      "is_critical": true,
+      "missing_requirements": [
+        "unit_property_tests",
+        "deterministic_e2e",
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add explicit acceptance text for unit/property coverage (normal, boundary, adversarial) with deterministic seeds.",
+        "Add deterministic end-to-end scenario requirement with replay instructions and artifact capture.",
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-j2cfs",
+      "title": "Differential Privacy for aggregate queries (§12.5)",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 4,
+      "is_critical": true,
+      "missing_requirements": [
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-mblr.3.5",
+      "title": "Unified quality evidence rollup and release-readiness gate",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 1,
+      "is_critical": true,
+      "missing_requirements": [
+        "unit_property_tests",
+        "deterministic_e2e",
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add explicit acceptance text for unit/property coverage (normal, boundary, adversarial) with deterministic seeds.",
+        "Add deterministic end-to-end scenario requirement with replay instructions and artifact capture.",
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-mblr.3.5.1",
+      "title": "Machine-readable validation manifest (coverage + unit + e2e + logging)",
+      "status": "in_progress",
+      "issue_type": "task",
+      "priority": 1,
+      "is_critical": true,
+      "missing_requirements": [
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-mblr.3.5.1.1",
+      "title": "Manifest ingestion regression: unit+e2e+logging evidence replay",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 1,
+      "is_critical": true,
+      "missing_requirements": [
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-ncivz.3",
+      "title": "Implement group commit with consolidation",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 2,
+      "is_critical": true,
+      "missing_requirements": [
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-ncivz.5",
+      "title": "E2E test: crash recovery with parallel WAL multi-buffer replay",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 2,
+      "is_critical": true,
+      "missing_requirements": [
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-ncivz.6",
+      "title": "Unit tests: per-core WAL buffer correctness and epoch ordering",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 2,
+      "is_critical": true,
+      "missing_requirements": [
+        "deterministic_e2e",
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add deterministic end-to-end scenario requirement with replay instructions and artifact capture.",
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-ncivz.7",
+      "title": "Alien Contract: Parallel WAL group-commit with deterministic fallback",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 1,
+      "is_critical": true,
+      "missing_requirements": [
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-nlcyx",
+      "title": "Database Cracking / Adaptive Indexing (§8.8)",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 3,
+      "is_critical": true,
+      "missing_requirements": [
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-u43hx",
+      "title": "Flat Combining for lock contention hot spots (§14.2)",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 3,
+      "is_critical": true,
+      "missing_requirements": [
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-z4mtc",
+      "title": "RCU/QSBR for hot metadata paths (§14.8)",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 2,
+      "is_critical": true,
+      "missing_requirements": [
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    }
+  ],
+  "regression_failures": [
+    {
+      "issue_id": "bd-106dk",
+      "title": "Swiss Tables for index lookups (§7.7)",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 3,
+      "is_critical": true,
+      "missing_requirements": [
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-1dp9.6.2",
+      "title": "T6.2 SQL pipeline hotspot optimization sprints (single lever, proof-preserving)",
+      "status": "in_progress",
+      "issue_type": "task",
+      "priority": 1,
+      "is_critical": true,
+      "missing_requirements": [
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-1dp9.6.4",
+      "title": "T6.4 Final performance parity report and regression guard",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 1,
+      "is_critical": true,
+      "missing_requirements": [
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-1dp9.6.6",
+      "title": "Alien Contract Pack: EV/risk/fallback enforcement across all open beads",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 1,
+      "is_critical": true,
+      "missing_requirements": [
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-1dp9.9.2",
+      "title": "T9.2 Parity closure scorecard and machine-readable evidence manifest",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 1,
+      "is_critical": true,
+      "missing_requirements": [
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-1dp9.9.3",
+      "title": "T9.3 Post-100% ratchet guardrails and regression prevention",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 1,
+      "is_critical": true,
+      "missing_requirements": [
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-1dp9.9.4",
+      "title": "T9.4 Final verification gate and release handoff package",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 1,
+      "is_critical": true,
+      "missing_requirements": [
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-1dp9.9.5",
+      "title": "T9.5 User-facing parity navigator and divergence transparency pack",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 1,
+      "is_critical": true,
+      "missing_requirements": [
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-1dp9.9.6",
+      "title": "Backlog quality gate: enforce unit/e2e/log acceptance completeness",
+      "status": "in_progress",
+      "issue_type": "task",
+      "priority": 1,
+      "is_critical": true,
+      "missing_requirements": [
+        "unit_property_tests",
+        "deterministic_e2e",
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add explicit acceptance text for unit/property coverage (normal, boundary, adversarial) with deterministic seeds.",
+        "Add deterministic end-to-end scenario requirement with replay instructions and artifact capture.",
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-1k39z",
+      "title": "Learned Index Structures for static lookup (§8.4)",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 3,
+      "is_critical": true,
+      "missing_requirements": [
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-2bg7t",
+      "title": "Left-Right Sync for metadata hot paths (§14.3)",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 3,
+      "is_critical": true,
+      "missing_requirements": [
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-2csg6.1",
+      "title": "Self-healing durability demo: flip bits, show repair with evidence ledger",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 2,
+      "is_critical": true,
+      "missing_requirements": [
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-2csg6.2",
+      "title": "Concurrent writer scaling demo: SQLite baseline vs page-MVCC + SSI",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 2,
+      "is_critical": true,
+      "missing_requirements": [
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-2qr3a",
+      "title": "Leapfrog Triejoin Implementation (§8.1)",
+      "status": "open",
+      "issue_type": "epic",
+      "priority": 1,
+      "is_critical": true,
+      "missing_requirements": [
+        "unit_property_tests",
+        "deterministic_e2e",
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add explicit acceptance text for unit/property coverage (normal, boundary, adversarial) with deterministic seeds.",
+        "Add deterministic end-to-end scenario requirement with replay instructions and artifact capture.",
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-2qr3a.3",
+      "title": "Integrate Leapfrog into query planner for 3+ table joins",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 2,
+      "is_critical": true,
+      "missing_requirements": [
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-2qr3a.5",
+      "title": "Golden output checksums for Leapfrog join results",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 2,
+      "is_critical": true,
+      "missing_requirements": [
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-2qr3a.6",
+      "title": "Property-based tests: Leapfrog output matches hash-join for all inputs",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 2,
+      "is_critical": true,
+      "missing_requirements": [
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-2uza4.1",
+      "title": "Design pointer swizzle/unswizzle protocol for B-tree pages",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 2,
+      "is_critical": true,
+      "missing_requirements": [
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-2uza4.2",
+      "title": "Implement SwizzlePtr and B-tree swizzle/unswizzle operations",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 2,
+      "is_critical": true,
+      "missing_requirements": [
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-2uza4.3",
+      "title": "Implement page cooling/heating state machine with eviction integration",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 2,
+      "is_critical": true,
+      "missing_requirements": [
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-2uza4.5",
+      "title": "Property tests: SwizzlePtr and cooling state machine invariants",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 2,
+      "is_critical": true,
+      "missing_requirements": [
+        "deterministic_e2e",
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add deterministic end-to-end scenario requirement with replay instructions and artifact capture.",
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-2y306.2",
+      "title": "Implement chain-length controls and bounds",
+      "status": "in_progress",
+      "issue_type": "task",
+      "priority": 2,
+      "is_critical": true,
+      "missing_requirements": [
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-2y306.3",
+      "title": "Tune epoch advance frequency for tail latency",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 2,
+      "is_critical": true,
+      "missing_requirements": [
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-2y306.5",
+      "title": "Property tests: EBR version chain invariants under concurrent access",
+      "status": "in_progress",
+      "issue_type": "task",
+      "priority": 2,
+      "is_critical": true,
+      "missing_requirements": [
+        "deterministic_e2e",
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add deterministic end-to-end scenario requirement with replay instructions and artifact capture.",
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-2y306.6",
+      "title": "Unit tests: EBR VersionGuard lifecycle and eager GC trigger",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 2,
+      "is_critical": true,
+      "missing_requirements": [
+        "deterministic_e2e",
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add deterministic end-to-end scenario requirement with replay instructions and artifact capture.",
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-2y306.7",
+      "title": "Alien Contract: EBR Version-Chain GC rollout (budgeted + stale-reader safe-mode)",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 1,
+      "is_critical": true,
+      "missing_requirements": [
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-31br0",
+      "title": "Provenance Semirings for query lineage (§8.9)",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 3,
+      "is_critical": true,
+      "missing_requirements": [
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-368z9",
+      "title": "Proofs of Retrievability for durability audit (§11.11)",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 3,
+      "is_critical": true,
+      "missing_requirements": [
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-3bw.5",
+      "title": "TEST: RaptorQ repair correctness, symbol efficiency, PoR audit",
+      "status": "in_progress",
+      "issue_type": "task",
+      "priority": 1,
+      "is_critical": true,
+      "missing_requirements": [
+        "unit_property_tests",
+        "deterministic_e2e",
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add explicit acceptance text for unit/property coverage (normal, boundary, adversarial) with deterministic seeds.",
+        "Add deterministic end-to-end scenario requirement with replay instructions and artifact capture.",
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-3mr81",
+      "title": "NitroSketch for streaming query statistics (§15.5)",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 3,
+      "is_critical": true,
+      "missing_requirements": [
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-3plop.4",
+      "title": "Fault injection: lock contention storms",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 2,
+      "is_critical": true,
+      "missing_requirements": [
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-3plop.5",
+      "title": "E2E test: SSI serialization correctness under 100 concurrent writers",
+      "status": "in_progress",
+      "issue_type": "task",
+      "priority": 1,
+      "is_critical": true,
+      "missing_requirements": [
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-3plop.7",
+      "title": "Conformance: run SQLite TCL test harness",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 1,
+      "is_critical": true,
+      "missing_requirements": [
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-52a8k",
+      "title": "Seqlocks for rarely-changing config (§14.9)",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 3,
+      "is_critical": true,
+      "missing_requirements": [
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-5ew.1",
+      "title": "Tokenizer with full SQLite 3.52 dialect coverage",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 1,
+      "is_critical": true,
+      "missing_requirements": [
+        "unit_property_tests",
+        "deterministic_e2e",
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add explicit acceptance text for unit/property coverage (normal, boundary, adversarial) with deterministic seeds.",
+        "Add deterministic end-to-end scenario requirement with replay instructions and artifact capture.",
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-j2cfs",
+      "title": "Differential Privacy for aggregate queries (§12.5)",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 4,
+      "is_critical": true,
+      "missing_requirements": [
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-mblr.3.5",
+      "title": "Unified quality evidence rollup and release-readiness gate",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 1,
+      "is_critical": true,
+      "missing_requirements": [
+        "unit_property_tests",
+        "deterministic_e2e",
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add explicit acceptance text for unit/property coverage (normal, boundary, adversarial) with deterministic seeds.",
+        "Add deterministic end-to-end scenario requirement with replay instructions and artifact capture.",
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-mblr.3.5.1",
+      "title": "Machine-readable validation manifest (coverage + unit + e2e + logging)",
+      "status": "in_progress",
+      "issue_type": "task",
+      "priority": 1,
+      "is_critical": true,
+      "missing_requirements": [
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-mblr.3.5.1.1",
+      "title": "Manifest ingestion regression: unit+e2e+logging evidence replay",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 1,
+      "is_critical": true,
+      "missing_requirements": [
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-ncivz.3",
+      "title": "Implement group commit with consolidation",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 2,
+      "is_critical": true,
+      "missing_requirements": [
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-ncivz.5",
+      "title": "E2E test: crash recovery with parallel WAL multi-buffer replay",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 2,
+      "is_critical": true,
+      "missing_requirements": [
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-ncivz.6",
+      "title": "Unit tests: per-core WAL buffer correctness and epoch ordering",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 2,
+      "is_critical": true,
+      "missing_requirements": [
+        "deterministic_e2e",
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add deterministic end-to-end scenario requirement with replay instructions and artifact capture.",
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-ncivz.7",
+      "title": "Alien Contract: Parallel WAL group-commit with deterministic fallback",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 1,
+      "is_critical": true,
+      "missing_requirements": [
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-nlcyx",
+      "title": "Database Cracking / Adaptive Indexing (§8.8)",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 3,
+      "is_critical": true,
+      "missing_requirements": [
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-u43hx",
+      "title": "Flat Combining for lock contention hot spots (§14.2)",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 3,
+      "is_critical": true,
+      "missing_requirements": [
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-z4mtc",
+      "title": "RCU/QSBR for hot metadata paths (§14.8)",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 2,
+      "is_critical": true,
+      "missing_requirements": [
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    }
+  ]
+}

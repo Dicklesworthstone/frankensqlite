@@ -1,0 +1,345 @@
+{
+  "bead_id": "bd-mblr.7.4",
+  "schema_version": 1,
+  "root_seed": 13204554107450294273,
+  "log_standard_ref": "bd-1fpm",
+  "environments": [
+    {
+      "id": "env-freebsd-zfs-nightly",
+      "os": "FreeBsd",
+      "filesystem": "Zfs",
+      "toolchain": "Nightly",
+      "requires_atomic_rename": true,
+      "requires_fsync_durability": true,
+      "notes": "ZFS durability semantics and metadata checksums"
+    },
+    {
+      "id": "env-linux-ext4-nightly",
+      "os": "Linux",
+      "filesystem": "Ext4Ordered",
+      "toolchain": "Nightly",
+      "requires_atomic_rename": true,
+      "requires_fsync_durability": true,
+      "notes": "Primary CI lane baseline"
+    },
+    {
+      "id": "env-linux-ext4-stable",
+      "os": "Linux",
+      "filesystem": "Ext4Ordered",
+      "toolchain": "Stable",
+      "requires_atomic_rename": true,
+      "requires_fsync_durability": true,
+      "notes": "Regression guard against nightly drift"
+    },
+    {
+      "id": "env-linux-xfs-nightly",
+      "os": "Linux",
+      "filesystem": "XfsBarrier",
+      "toolchain": "Nightly",
+      "requires_atomic_rename": true,
+      "requires_fsync_durability": true,
+      "notes": "Barrier-heavy metadata ordering behavior"
+    },
+    {
+      "id": "env-macos-apfs-nightly",
+      "os": "MacOs",
+      "filesystem": "Apfs",
+      "toolchain": "Nightly",
+      "requires_atomic_rename": true,
+      "requires_fsync_durability": true,
+      "notes": "APFS crash-recovery ordering semantics"
+    },
+    {
+      "id": "env-windows-ntfs-nightly",
+      "os": "Windows",
+      "filesystem": "Ntfs",
+      "toolchain": "Nightly",
+      "requires_atomic_rename": true,
+      "requires_fsync_durability": true,
+      "notes": "NTFS rename + flush behavior"
+    }
+  ],
+  "scenarios": [
+    {
+      "id": "REC-1",
+      "crash_mode": "MidCommit",
+      "command": "cargo test -p fsqlite-e2e --test recovery_crash_wal_replay -- --nocapture",
+      "scenario_ids": [
+        "REC-1",
+        "WAL-1"
+      ],
+      "invariants": [
+        "INV-5",
+        "WAL-1",
+        "PAGER-1"
+      ],
+      "seed_offset": 257
+    },
+    {
+      "id": "REC-2",
+      "crash_mode": "CorruptionInjection",
+      "command": "cargo test -p fsqlite-e2e --test recovery_single_page -- --nocapture",
+      "scenario_ids": [
+        "REC-2"
+      ],
+      "invariants": [
+        "PAGER-1",
+        "BTREE-1"
+      ],
+      "seed_offset": 258
+    },
+    {
+      "id": "REC-3",
+      "crash_mode": "CorruptionInjection",
+      "command": "cargo test -p fsqlite-e2e --test recovery_wal_corruption -- --nocapture",
+      "scenario_ids": [
+        "REC-3",
+        "CORRUPT-1"
+      ],
+      "invariants": [
+        "WAL-1",
+        "INV-6",
+        "INV-7"
+      ],
+      "seed_offset": 259
+    },
+    {
+      "id": "WAL-2",
+      "crash_mode": "DuringCheckpoint",
+      "command": "cargo test -p fsqlite-e2e --test correctness_transactions -- --nocapture",
+      "scenario_ids": [
+        "WAL-2",
+        "TXN-2"
+      ],
+      "invariants": [
+        "WAL-1",
+        "INV-4"
+      ],
+      "seed_offset": 260
+    }
+  ],
+  "probes": [
+    {
+      "id": "probe-env-freebsd-zfs-nightly-rec-1",
+      "environment_id": "env-freebsd-zfs-nightly",
+      "scenario_id": "REC-1",
+      "required_lanes": [
+        "RecoveryReplay",
+        "CheckpointParity",
+        "FullSuiteFallback"
+      ]
+    },
+    {
+      "id": "probe-env-freebsd-zfs-nightly-rec-2",
+      "environment_id": "env-freebsd-zfs-nightly",
+      "scenario_id": "REC-2",
+      "required_lanes": [
+        "CorruptionRecovery",
+        "FullSuiteFallback"
+      ]
+    },
+    {
+      "id": "probe-env-freebsd-zfs-nightly-rec-3",
+      "environment_id": "env-freebsd-zfs-nightly",
+      "scenario_id": "REC-3",
+      "required_lanes": [
+        "CorruptionRecovery",
+        "FullSuiteFallback"
+      ]
+    },
+    {
+      "id": "probe-env-freebsd-zfs-nightly-wal-2",
+      "environment_id": "env-freebsd-zfs-nightly",
+      "scenario_id": "WAL-2",
+      "required_lanes": [
+        "CheckpointParity",
+        "FullSuiteFallback"
+      ]
+    },
+    {
+      "id": "probe-env-linux-ext4-nightly-rec-1",
+      "environment_id": "env-linux-ext4-nightly",
+      "scenario_id": "REC-1",
+      "required_lanes": [
+        "RecoveryReplay",
+        "CheckpointParity",
+        "FullSuiteFallback"
+      ]
+    },
+    {
+      "id": "probe-env-linux-ext4-nightly-rec-2",
+      "environment_id": "env-linux-ext4-nightly",
+      "scenario_id": "REC-2",
+      "required_lanes": [
+        "CorruptionRecovery",
+        "FullSuiteFallback"
+      ]
+    },
+    {
+      "id": "probe-env-linux-ext4-nightly-rec-3",
+      "environment_id": "env-linux-ext4-nightly",
+      "scenario_id": "REC-3",
+      "required_lanes": [
+        "CorruptionRecovery",
+        "FullSuiteFallback"
+      ]
+    },
+    {
+      "id": "probe-env-linux-ext4-nightly-wal-2",
+      "environment_id": "env-linux-ext4-nightly",
+      "scenario_id": "WAL-2",
+      "required_lanes": [
+        "CheckpointParity",
+        "FullSuiteFallback"
+      ]
+    },
+    {
+      "id": "probe-env-linux-ext4-stable-rec-1",
+      "environment_id": "env-linux-ext4-stable",
+      "scenario_id": "REC-1",
+      "required_lanes": [
+        "RecoveryReplay",
+        "CheckpointParity",
+        "FullSuiteFallback"
+      ]
+    },
+    {
+      "id": "probe-env-linux-ext4-stable-rec-2",
+      "environment_id": "env-linux-ext4-stable",
+      "scenario_id": "REC-2",
+      "required_lanes": [
+        "CorruptionRecovery",
+        "FullSuiteFallback"
+      ]
+    },
+    {
+      "id": "probe-env-linux-ext4-stable-rec-3",
+      "environment_id": "env-linux-ext4-stable",
+      "scenario_id": "REC-3",
+      "required_lanes": [
+        "CorruptionRecovery",
+        "FullSuiteFallback"
+      ]
+    },
+    {
+      "id": "probe-env-linux-ext4-stable-wal-2",
+      "environment_id": "env-linux-ext4-stable",
+      "scenario_id": "WAL-2",
+      "required_lanes": [
+        "CheckpointParity",
+        "FullSuiteFallback"
+      ]
+    },
+    {
+      "id": "probe-env-linux-xfs-nightly-rec-1",
+      "environment_id": "env-linux-xfs-nightly",
+      "scenario_id": "REC-1",
+      "required_lanes": [
+        "RecoveryReplay",
+        "CheckpointParity",
+        "FullSuiteFallback"
+      ]
+    },
+    {
+      "id": "probe-env-linux-xfs-nightly-rec-2",
+      "environment_id": "env-linux-xfs-nightly",
+      "scenario_id": "REC-2",
+      "required_lanes": [
+        "CorruptionRecovery",
+        "FullSuiteFallback"
+      ]
+    },
+    {
+      "id": "probe-env-linux-xfs-nightly-rec-3",
+      "environment_id": "env-linux-xfs-nightly",
+      "scenario_id": "REC-3",
+      "required_lanes": [
+        "CorruptionRecovery",
+        "FullSuiteFallback"
+      ]
+    },
+    {
+      "id": "probe-env-linux-xfs-nightly-wal-2",
+      "environment_id": "env-linux-xfs-nightly",
+      "scenario_id": "WAL-2",
+      "required_lanes": [
+        "CheckpointParity",
+        "FullSuiteFallback"
+      ]
+    },
+    {
+      "id": "probe-env-macos-apfs-nightly-rec-1",
+      "environment_id": "env-macos-apfs-nightly",
+      "scenario_id": "REC-1",
+      "required_lanes": [
+        "RecoveryReplay",
+        "CheckpointParity",
+        "FullSuiteFallback"
+      ]
+    },
+    {
+      "id": "probe-env-macos-apfs-nightly-rec-2",
+      "environment_id": "env-macos-apfs-nightly",
+      "scenario_id": "REC-2",
+      "required_lanes": [
+        "CorruptionRecovery",
+        "FullSuiteFallback"
+      ]
+    },
+    {
+      "id": "probe-env-macos-apfs-nightly-rec-3",
+      "environment_id": "env-macos-apfs-nightly",
+      "scenario_id": "REC-3",
+      "required_lanes": [
+        "CorruptionRecovery",
+        "FullSuiteFallback"
+      ]
+    },
+    {
+      "id": "probe-env-macos-apfs-nightly-wal-2",
+      "environment_id": "env-macos-apfs-nightly",
+      "scenario_id": "WAL-2",
+      "required_lanes": [
+        "CheckpointParity",
+        "FullSuiteFallback"
+      ]
+    },
+    {
+      "id": "probe-env-windows-ntfs-nightly-rec-1",
+      "environment_id": "env-windows-ntfs-nightly",
+      "scenario_id": "REC-1",
+      "required_lanes": [
+        "RecoveryReplay",
+        "CheckpointParity",
+        "FullSuiteFallback"
+      ]
+    },
+    {
+      "id": "probe-env-windows-ntfs-nightly-rec-2",
+      "environment_id": "env-windows-ntfs-nightly",
+      "scenario_id": "REC-2",
+      "required_lanes": [
+        "CorruptionRecovery",
+        "FullSuiteFallback"
+      ]
+    },
+    {
+      "id": "probe-env-windows-ntfs-nightly-rec-3",
+      "environment_id": "env-windows-ntfs-nightly",
+      "scenario_id": "REC-3",
+      "required_lanes": [
+        "CorruptionRecovery",
+        "FullSuiteFallback"
+      ]
+    },
+    {
+      "id": "probe-env-windows-ntfs-nightly-wal-2",
+      "environment_id": "env-windows-ntfs-nightly",
+      "scenario_id": "WAL-2",
+      "required_lanes": [
+        "CheckpointParity",
+        "FullSuiteFallback"
+      ]
+    }
+  ]
+}

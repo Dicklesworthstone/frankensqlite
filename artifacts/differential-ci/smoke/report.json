@@ -1,0 +1,42 @@
+{
+  "schema_version": "fsqlite.differential-ci-lane.v1",
+  "bead_id": "bd-mblr.7.1.3",
+  "lane": {
+    "id": "smoke",
+    "mode": "warning",
+    "outcome": "pass",
+    "promotion_criteria": [
+      "two consecutive weeks of deterministic_match=true on mainline",
+      "zero harness-infrastructure failures across smoke + expanded lanes",
+      "mismatch class trends triaged with owners and replay artifacts attached"
+    ]
+  },
+  "run": {
+    "run_id": "bd-mblr.7.1.3-smoke-seed-424242",
+    "trace_id": "trace-75a51ff6414e95c5",
+    "scenario_id": "DIFF-CI-713",
+    "commit_sha": "af7fee7b8bf28a68c3cdd3d396b6fa5b981c3ede",
+    "root_seed": 424242,
+    "generated_unix_ms": 1700000000000,
+    "run_a_exit_code": 0,
+    "run_b_exit_code": 0,
+    "deterministic_match": true
+  },
+  "results": {
+    "total_cases": 52,
+    "passed_cases": 52,
+    "diverged_cases": 0,
+    "mismatch_class_counts": {},
+    "deduplicated_unique_failures": 0,
+    "deduplicated_total_failures": 0
+  },
+  "artifacts": {
+    "manifest_a": "artifacts/differential-ci/smoke/run-a/differential_manifest.json",
+    "manifest_b": "artifacts/differential-ci/smoke/run-b/differential_manifest.json",
+    "summary_a": "artifacts/differential-ci/smoke/run-a/differential_manifest.md",
+    "summary_b": "artifacts/differential-ci/smoke/run-b/differential_manifest.md",
+    "runner_log_a": "artifacts/differential-ci/smoke/run-a/differential_manifest_runner.log",
+    "runner_log_b": "artifacts/differential-ci/smoke/run-b/differential_manifest_runner.log"
+  },
+  "replay_command": "cargo run -p fsqlite-harness --bin differential_manifest_runner -- --workspace-root /data/projects/frankensqlite --run-id bd-mblr.7.1.3-smoke-seed-424242 --trace-id trace-75a51ff6414e95c5 --scenario-id DIFF-CI-713 --root-seed 424242 --max-cases-per-entry 4 --generated-unix-ms 1700000000000 --max-entries 32 --fixtures-dir /data/projects/frankensqlite/conformance --output-json /data/projects/frankensqlite/artifacts/differential-ci/smoke/run-a/differential_manifest.json --output-human /data/projects/frankensqlite/artifacts/differential-ci/smoke/run-a/differential_manifest.md"
+}

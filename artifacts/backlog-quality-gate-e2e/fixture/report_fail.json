@@ -1,0 +1,71 @@
+{
+  "schema_version": "1.0.0",
+  "bead_id": "bd-1dp9.9.6",
+  "generated_unix_ms": 1700000000000,
+  "beads_path": "/data/projects/frankensqlite/artifacts/backlog-quality-gate-e2e/fixture/issues_fail.jsonl",
+  "baseline_path": "/data/projects/frankensqlite/artifacts/backlog-quality-gate-e2e/fixture/baseline.json",
+  "critical_priority_max": 1,
+  "overall_pass": false,
+  "summary": {
+    "scanned_active_beads": 2,
+    "scanned_critical_beads": 2,
+    "total_failures": 2,
+    "critical_failures": 2,
+    "regression_failures": 1,
+    "missing_unit_property_count": 0,
+    "missing_deterministic_e2e_count": 2,
+    "missing_structured_logging_count": 2
+  },
+  "failures": [
+    {
+      "issue_id": "bd-fixture-known",
+      "title": "Known debt",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 1,
+      "is_critical": true,
+      "missing_requirements": [
+        "deterministic_e2e",
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add deterministic end-to-end scenario requirement with replay instructions and artifact capture.",
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    },
+    {
+      "issue_id": "bd-fixture-new",
+      "title": "New regression",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 1,
+      "is_critical": true,
+      "missing_requirements": [
+        "deterministic_e2e",
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add deterministic end-to-end scenario requirement with replay instructions and artifact capture.",
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    }
+  ],
+  "regression_failures": [
+    {
+      "issue_id": "bd-fixture-new",
+      "title": "New regression",
+      "status": "open",
+      "issue_type": "task",
+      "priority": 1,
+      "is_critical": true,
+      "missing_requirements": [
+        "deterministic_e2e",
+        "structured_logging"
+      ],
+      "remediation": [
+        "Add deterministic end-to-end scenario requirement with replay instructions and artifact capture.",
+        "Add structured logging/metrics requirement including trace/run/scenario identifiers and actionable failure context."
+      ]
+    }
+  ]
+}

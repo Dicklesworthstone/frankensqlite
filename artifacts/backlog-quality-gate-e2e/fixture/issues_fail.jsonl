@@ -1,0 +1,2 @@
+{"id":"bd-fixture-known","title":"Known debt","status":"open","issue_type":"task","priority":1,"acceptance_criteria":"Unit tests only. Missing deterministic e2e seed/replay and trace_id logging.","labels":["ev-gated"]}
+{"id":"bd-fixture-new","title":"New regression","status":"open","issue_type":"task","priority":1,"acceptance_criteria":"Unit tests only.","labels":["ev-gated"]}
