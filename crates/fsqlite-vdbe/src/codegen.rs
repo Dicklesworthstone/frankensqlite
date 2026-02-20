@@ -2294,26 +2294,46 @@ pub fn codegen_insert(
             // packs fields in the order the table schema expects.
             let oe_flag = conflict_action_to_oe(stmt.or_conflict.as_ref());
             if stmt.columns.is_empty() {
-                codegen_insert_values(b, rows, table_cursor, table, &stmt.returning, ctx, oe_flag)?;
+                codegen_insert_values(
+                    b,
+                    rows,
+                    None,
+                    table_cursor,
+                    table,
+                    &stmt.returning,
+                    ctx,
+                    oe_flag,
+                )?;
             } else {
-                let col_map = build_column_map(&stmt.columns, table)?;
                 let n_table_cols = table.columns.len();
                 let null_expr = Expr::Literal(Literal::Null, fsqlite_ast::Span::ZERO);
-                let reordered: Vec<Vec<Expr>> = rows
-                    .iter()
-                    .map(|row| {
-                        let mut table_order = vec![null_expr.clone(); n_table_cols];
-                        for (val_pos, &tbl_pos) in col_map.iter().enumerate() {
-                            if let Some(expr) = row.get(val_pos) {
+                let mut explicit_rowids: Vec<Option<Expr>> = Vec::with_capacity(rows.len());
+                let mut reordered: Vec<Vec<Expr>> = Vec::with_capacity(rows.len());
+                for row in rows {
+                    let mut table_order = vec![null_expr.clone(); n_table_cols];
+                    let mut explicit_rowid = None;
+                    for (val_pos, col_name) in stmt.columns.iter().enumerate() {
+                        if let Some(expr) = row.get(val_pos) {
+                            if is_rowid_alias(col_name) {
+                                explicit_rowid = Some(expr.clone());
+                            } else {
+                                let tbl_pos = table.column_index(col_name).ok_or_else(|| {
+                                    CodegenError::ColumnNotFound {
+                                        table: table.name.clone(),
+                                        column: col_name.clone(),
+                                    }
+                                })?;
                                 table_order[tbl_pos] = expr.clone();
                             }
                         }
-                        table_order
-                    })
-                    .collect();
+                    }
+                    explicit_rowids.push(explicit_rowid);
+                    reordered.push(table_order);
+                }
                 codegen_insert_values(
                     b,
                     &reordered,
+                    Some(&explicit_rowids),
                     table_cursor,
                     table,
                     &stmt.returning,
@@ -2427,6 +2447,7 @@ pub fn codegen_insert(
 fn codegen_insert_values(
     b: &mut ProgramBuilder,
     rows: &[Vec<Expr>],
+    explicit_rowids: Option<&[Option<Expr>]>,
     cursor: i32,
     table: &TableSchema,
     returning: &[ResultColumn],
@@ -2442,7 +2463,9 @@ fn codegen_insert_values(
     let rec_reg = b.alloc_reg();
     let concurrent_flag = i32::from(ctx.concurrent_mode);
 
-    for row_values in rows {
+    let explicit_rowid_reg = explicit_rowids.map(|_| b.alloc_reg());
+
+    for (row_idx, row_values) in rows.iter().enumerate() {
         if row_values.len() != n_cols {
             return Err(CodegenError::Unsupported(
                 "VALUES rows must have the same arity".to_owned(),
@@ -2455,10 +2478,41 @@ fn codegen_insert_values(
             emit_expr(b, val_expr, reg, None);
         }
 
-        // Rowid determination: if an INTEGER PRIMARY KEY column exists, use
-        // the user-supplied value as the rowid (falling back to NewRowid when
-        // the supplied value is NULL).  Otherwise always auto-generate.
-        if let Some(ipk_idx) = ctx.rowid_alias_col_idx {
+        let explicit_rowid_expr = explicit_rowids
+            .and_then(|rows| rows.get(row_idx))
+            .and_then(Option::as_ref);
+
+        // Rowid determination precedence:
+        // 1. explicit rowid/_rowid_/oid in INSERT column list
+        // 2. INTEGER PRIMARY KEY column value
+        // 3. auto-generated rowid
+        if let Some(rowid_expr) = explicit_rowid_expr {
+            let rowid_value_reg = explicit_rowid_reg.expect("explicit rowid register allocated");
+            emit_expr(b, rowid_expr, rowid_value_reg, None);
+            let auto_label = b.emit_label();
+            let done_label = b.emit_label();
+
+            b.emit_jump_to_label(Opcode::IsNull, rowid_value_reg, 0, auto_label, P4::None, 0);
+            b.emit_op(Opcode::Copy, rowid_value_reg, rowid_reg, 0, P4::None, 0);
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+
+            b.resolve_label(auto_label);
+            b.emit_op(
+                Opcode::NewRowid,
+                cursor,
+                rowid_reg,
+                concurrent_flag,
+                P4::None,
+                0,
+            );
+            if let Some(ipk_idx) = ctx.rowid_alias_col_idx {
+                #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+                let ipk_reg = val_regs + ipk_idx as i32;
+                b.emit_op(Opcode::Copy, rowid_reg, ipk_reg, 0, P4::None, 0);
+            }
+
+            b.resolve_label(done_label);
+        } else if let Some(ipk_idx) = ctx.rowid_alias_col_idx {
             #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
             let ipk_reg = val_regs + ipk_idx as i32;
             let auto_label = b.emit_label();
@@ -2528,22 +2582,6 @@ fn codegen_insert_values(
     }
 
     Ok(())
-}
-
-/// Map each column in an explicit INSERT column list to its table-schema
-/// position.  Returns a `Vec<usize>` where `result[values_pos] = table_pos`.
-fn build_column_map(columns: &[String], table: &TableSchema) -> Result<Vec<usize>, CodegenError> {
-    columns
-        .iter()
-        .map(|col| {
-            table
-                .column_index(col)
-                .ok_or_else(|| CodegenError::ColumnNotFound {
-                    table: table.name.clone(),
-                    column: col.clone(),
-                })
-        })
-        .collect()
 }
 
 /// Emit the INSERT loop for `INSERT INTO target SELECT ... FROM source`.

@@ -1333,6 +1333,7 @@ impl Connection {
             Statement::Update(_) => "update",
             Statement::Delete(_) => "delete",
             Statement::CreateTable(_) => "create_table",
+            Statement::CreateVirtualTable(_) => "create_virtual_table",
             Statement::Drop(_) => "drop",
             Statement::AlterTable(_) => "alter_table",
             Statement::CreateIndex(_) => "create_index",
@@ -1390,6 +1391,7 @@ impl Connection {
                 | Statement::Update(_)
                 | Statement::Delete(_)
                 | Statement::CreateTable(_)
+                | Statement::CreateVirtualTable(_)
                 | Statement::Drop(_)
                 | Statement::AlterTable(_)
                 | Statement::CreateIndex(_)
@@ -1457,6 +1459,11 @@ impl Connection {
                 // 5D.4: Persistence now handled by pager WAL, not compat_persist.
                 Ok(Vec::new())
             }
+            Statement::CreateVirtualTable(ref create_virtual) => {
+                self.execute_create_virtual_table(create_virtual)?;
+                // 5D.4: Persistence now handled by pager WAL, not compat_persist.
+                Ok(Vec::new())
+            }
             Statement::Select(ref select) => {
                 // CTE (WITH clause): materialize as temporary tables.
                 if select.with.is_some() {
@@ -1517,6 +1524,16 @@ impl Connection {
                         dedup_rows(&mut rows);
                     }
                     Ok(rows)
+                } else if select_contains_match_operator(select) {
+                    // The VDBE path does not yet support MATCH/REGEXP in this
+                    // connection path. Route through fallback evaluation.
+                    let rewritten = self.rewrite_in_subqueries_select(select)?;
+                    let bound = bind_placeholders_in_select_for_fallback(&rewritten, params)?;
+                    let mut rows = self.execute_join_select(&bound, None)?;
+                    if distinct {
+                        dedup_rows(&mut rows);
+                    }
+                    Ok(rows)
                 } else if has_joins(select) || has_subquery_source(select) {
                     // Fallback path: eagerly rewrite IN subqueries.
                     // Also handles subquery in FROM (derived tables) even
@@ -1559,6 +1576,14 @@ impl Connection {
                 }
             }
             Statement::Insert(ref insert) => {
+                // FTS5 maintenance command compatibility:
+                //   INSERT INTO <table>(<table>) VALUES('optimize')
+                // is treated as a no-op in this compatibility path.
+                if is_fts5_optimize_noop_insert(insert) {
+                    *self.last_changes.borrow_mut() = 0;
+                    return Ok(Vec::new());
+                }
+
                 let table_name = &insert.table.name;
                 let insert_event = fsqlite_ast::TriggerEvent::Insert;
                 let has_before_insert = self.has_matching_triggers(
@@ -3211,6 +3236,61 @@ impl Connection {
             }
         }
 
+        self.increment_schema_cookie();
+        Ok(())
+    }
+
+    /// Process a CREATE VIRTUAL TABLE statement.
+    ///
+    /// The current compatibility path materializes FTS5 virtual tables as
+    /// regular row tables while preserving the original virtual-table SQL in
+    /// `sqlite_master` for schema introspection.
+    fn execute_create_virtual_table(
+        &self,
+        create: &fsqlite_ast::CreateVirtualTableStatement,
+    ) -> Result<()> {
+        if !create.module.eq_ignore_ascii_case("fts5") {
+            return Err(FrankenError::NotImplemented(format!(
+                "CREATE VIRTUAL TABLE USING {} is not supported in this connection path",
+                create.module
+            )));
+        }
+
+        let table_name = create.name.name.clone();
+
+        let schema = self.schema.borrow();
+        if schema
+            .iter()
+            .any(|t| t.name.eq_ignore_ascii_case(&table_name))
+        {
+            if create.if_not_exists {
+                return Ok(());
+            }
+            return Err(FrankenError::Internal(format!(
+                "table {table_name} already exists",
+            )));
+        }
+        drop(schema);
+
+        let col_infos = parse_virtual_table_column_infos(&create.args);
+        let root_page = self.allocate_root_page()?;
+        self.db
+            .borrow_mut()
+            .create_table_at(root_page, col_infos.len());
+        self.schema.borrow_mut().push(TableSchema {
+            name: table_name.clone(),
+            root_page,
+            columns: col_infos,
+            indexes: Vec::new(),
+        });
+
+        self.insert_sqlite_master_row(
+            "table",
+            &table_name,
+            &table_name,
+            root_page,
+            &create.to_string(),
+        )?;
         self.increment_schema_cookie();
         Ok(())
     }
@@ -5454,7 +5534,9 @@ impl Connection {
                     ..
                 } if is_agg_fn(name) => {
                     let func = name.to_ascii_lowercase();
+                    let mut arg_expr = None;
                     let mut separator = None;
+                    let mut separator_expr = None;
                     let arg_col = match args {
                         FunctionArgs::Star => {
                             if func == "count" {
@@ -5491,20 +5573,22 @@ impl Connection {
                             if exprs.len() == 2
                                 && (func == "group_concat" || func == "string_agg") =>
                         {
-                            let col_name = expr_col_name(&exprs[0]).ok_or_else(|| {
-                                FrankenError::NotImplemented(format!(
-                                    "non-column argument to aggregate {func}() in GROUP BY+JOIN"
-                                ))
-                            })?;
-                            let table_prefix = match &exprs[0] {
-                                Expr::Column(cr, _) => cr.table.as_deref(),
-                                _ => None,
+                            let idx = if let Some(col_name) = expr_col_name(&exprs[0]) {
+                                let table_prefix = match &exprs[0] {
+                                    Expr::Column(cr, _) => cr.table.as_deref(),
+                                    _ => None,
+                                };
+                                Some(find_col_in_map(&col_map, table_prefix, col_name)?)
+                            } else {
+                                arg_expr = Some(Box::new(exprs[0].clone()));
+                                None
                             };
-                            let idx = find_col_in_map(&col_map, table_prefix, col_name)?;
                             if let Expr::Literal(Literal::String(s), _) = &exprs[1] {
                                 separator = Some(s.clone());
+                            } else {
+                                separator_expr = Some(Box::new(exprs[1].clone()));
                             }
-                            Some(idx)
+                            idx
                         }
                         FunctionArgs::List(_) => {
                             return Err(FrankenError::NotImplemented(format!(
@@ -5515,8 +5599,10 @@ impl Connection {
                     Ok(GroupByColumn::Agg {
                         name: func,
                         arg_col,
+                        arg_expr,
                         distinct: *is_distinct,
                         separator,
+                        separator_expr,
                     })
                 }
                 ResultColumn::Expr { expr, .. } => Ok(GroupByColumn::Plain(Box::new(expr.clone()))),
@@ -5558,30 +5644,55 @@ impl Connection {
                     GroupByColumn::Agg {
                         name,
                         arg_col,
+                        arg_expr,
                         distinct,
                         separator,
+                        separator_expr,
                     } => {
-                        if name == "count" && arg_col.is_none() {
+                        if name == "count" && arg_col.is_none() && arg_expr.is_none() {
                             #[allow(clippy::cast_possible_wrap)]
                             values.push(SqliteValue::Integer(group_rows.len() as i64));
                         } else {
-                            let Some(idx) = *arg_col else {
+                            let mut owned_values: Vec<SqliteValue> = if let Some(idx) = *arg_col {
+                                group_rows
+                                    .iter()
+                                    .filter_map(|r| r.get(idx).cloned())
+                                    .filter(|v| !matches!(v, SqliteValue::Null))
+                                    .collect()
+                            } else if let Some(expr) = arg_expr {
+                                group_rows
+                                    .iter()
+                                    .map(|r| {
+                                        eval_join_expr(expr, r, &col_map)
+                                            .unwrap_or(SqliteValue::Null)
+                                    })
+                                    .filter(|v| !matches!(v, SqliteValue::Null))
+                                    .collect()
+                            } else {
                                 return Err(FrankenError::NotImplemented(format!(
-                                    "aggregate {name} requires a column argument"
+                                    "aggregate {name} requires an argument"
                                 )));
                             };
-                            let mut agg_values: Vec<&SqliteValue> = group_rows
-                                .iter()
-                                .filter_map(|r| r.get(idx))
-                                .filter(|v| !matches!(v, SqliteValue::Null))
-                                .collect();
                             if *distinct {
-                                dedup_values(&mut agg_values);
+                                let mut refs: Vec<&SqliteValue> = owned_values.iter().collect();
+                                dedup_values(&mut refs);
+                                owned_values = refs.into_iter().cloned().collect();
                             }
+                            let agg_values: Vec<&SqliteValue> = owned_values.iter().collect();
+                            let evaluated_separator = separator.clone().or_else(|| {
+                                separator_expr.as_ref().and_then(|expr| {
+                                    group_rows.first().and_then(|r| {
+                                        let val =
+                                            eval_join_expr(expr, r, &col_map).ok()?;
+                                        (!matches!(val, SqliteValue::Null))
+                                            .then(|| sqlite_value_to_text(&val))
+                                    })
+                                })
+                            });
                             values.push(compute_aggregate_ext(
                                 name,
                                 &agg_values,
-                                separator.as_deref(),
+                                evaluated_separator.as_deref(),
                             ));
                         }
                     }
@@ -5782,7 +5893,9 @@ impl Connection {
                     ..
                 } if is_agg_fn(name) => {
                     let func = name.to_ascii_lowercase();
+                    let mut arg_expr = None;
                     let mut separator = None;
+                    let mut separator_expr = None;
                     let arg_col = match args {
                         FunctionArgs::Star => {
                             if func == "count" {
@@ -5829,29 +5942,27 @@ impl Connection {
                             if exprs.len() == 2
                                 && (func == "group_concat" || func == "string_agg") =>
                         {
-                            let col_name = expr_col_name(&exprs[0]).ok_or_else(|| {
-                                FrankenError::NotImplemented(format!(
-                                    "non-column argument to aggregate {func}() is not supported in this GROUP BY connection path"
-                                ))
-                            })?;
-                            let idx = table_schema.column_index(col_name).or_else(|| {
-                                if is_rowid_alias(col_name) {
-                                    self.rowid_alias_columns
-                                        .borrow()
-                                        .get(&table_name.to_ascii_lowercase())
-                                        .copied()
-                                } else {
-                                    None
-                                }
-                            });
+                            let idx = if let Some(col_name) = expr_col_name(&exprs[0]) {
+                                table_schema.column_index(col_name).or_else(|| {
+                                    if is_rowid_alias(col_name) {
+                                        self.rowid_alias_columns
+                                            .borrow()
+                                            .get(&table_name.to_ascii_lowercase())
+                                            .copied()
+                                    } else {
+                                        None
+                                    }
+                                })
+                            } else {
+                                arg_expr = Some(Box::new(exprs[0].clone()));
+                                None
+                            };
                             if let Expr::Literal(Literal::String(s), _) = &exprs[1] {
                                 separator = Some(s.clone());
+                            } else {
+                                separator_expr = Some(Box::new(exprs[1].clone()));
                             }
-                            Some(idx.ok_or_else(|| {
-                                FrankenError::Internal(format!(
-                                    "aggregate column not found: {col_name}"
-                                ))
-                            })?)
+                            idx
                         }
                         FunctionArgs::List(_exprs) => {
                             return Err(FrankenError::NotImplemented(format!(
@@ -5862,8 +5973,10 @@ impl Connection {
                     Ok(GroupByColumn::Agg {
                         name: func,
                         arg_col,
+                        arg_expr,
                         distinct: *is_distinct,
                         separator,
+                        separator_expr,
                     })
                 }
                 ResultColumn::Expr { expr, .. } => {
@@ -5902,8 +6015,20 @@ impl Connection {
                 rewrite_rowid_aliases_in_expr(expr, real_col);
             }
             for desc in &mut result_descriptors {
-                if let GroupByColumn::Plain(expr) = desc {
-                    rewrite_rowid_aliases_in_expr(expr, real_col);
+                match desc {
+                    GroupByColumn::Plain(expr) => rewrite_rowid_aliases_in_expr(expr, real_col),
+                    GroupByColumn::Agg {
+                        arg_expr,
+                        separator_expr,
+                        ..
+                    } => {
+                        if let Some(expr) = arg_expr.as_mut() {
+                            rewrite_rowid_aliases_in_expr(expr, real_col);
+                        }
+                        if let Some(expr) = separator_expr.as_mut() {
+                            rewrite_rowid_aliases_in_expr(expr, real_col);
+                        }
+                    }
                 }
             }
         }
@@ -5945,30 +6070,55 @@ impl Connection {
                     GroupByColumn::Agg {
                         name,
                         arg_col,
+                        arg_expr,
                         distinct,
                         separator,
+                        separator_expr,
                     } => {
-                        if name == "count" && arg_col.is_none() {
+                        if name == "count" && arg_col.is_none() && arg_expr.is_none() {
                             #[allow(clippy::cast_possible_wrap)]
                             values.push(SqliteValue::Integer(group_rows.len() as i64));
                         } else {
-                            let Some(idx) = *arg_col else {
+                            let mut owned_values: Vec<SqliteValue> = if let Some(idx) = *arg_col {
+                                group_rows
+                                    .iter()
+                                    .filter_map(|r| r.get(idx).cloned())
+                                    .filter(|v| !matches!(v, SqliteValue::Null))
+                                    .collect()
+                            } else if let Some(expr) = arg_expr {
+                                group_rows
+                                    .iter()
+                                    .map(|r| {
+                                        eval_join_expr(expr, r, &col_map)
+                                            .unwrap_or(SqliteValue::Null)
+                                    })
+                                    .filter(|v| !matches!(v, SqliteValue::Null))
+                                    .collect()
+                            } else {
                                 return Err(FrankenError::NotImplemented(format!(
-                                    "aggregate {name} requires a column argument in this GROUP BY connection path"
+                                    "aggregate {name} requires an argument in this GROUP BY connection path"
                                 )));
                             };
-                            let mut agg_values: Vec<&SqliteValue> = group_rows
-                                .iter()
-                                .filter_map(|r| r.get(idx))
-                                .filter(|v| !matches!(v, SqliteValue::Null))
-                                .collect();
                             if *distinct {
-                                dedup_values(&mut agg_values);
+                                let mut refs: Vec<&SqliteValue> = owned_values.iter().collect();
+                                dedup_values(&mut refs);
+                                owned_values = refs.into_iter().cloned().collect();
                             }
+                            let agg_values: Vec<&SqliteValue> = owned_values.iter().collect();
+                            let evaluated_separator = separator.clone().or_else(|| {
+                                separator_expr.as_ref().and_then(|expr| {
+                                    group_rows.first().and_then(|r| {
+                                        let val =
+                                            eval_join_expr(expr, r, &col_map).ok()?;
+                                        (!matches!(val, SqliteValue::Null))
+                                            .then(|| sqlite_value_to_text(&val))
+                                    })
+                                })
+                            });
                             values.push(compute_aggregate_ext(
                                 name,
                                 &agg_values,
-                                separator.as_deref(),
+                                evaluated_separator.as_deref(),
                             ));
                         }
                     }
@@ -7027,6 +7177,235 @@ fn has_subquery_source(select: &SelectStatement) -> bool {
     false
 }
 
+/// Detect whether a SELECT contains at least one MATCH operator.
+fn select_contains_match_operator(select: &SelectStatement) -> bool {
+    fn result_col_has_match(col: &ResultColumn) -> bool {
+        match col {
+            ResultColumn::Expr { expr, .. } => expr_contains_match_operator(expr),
+            ResultColumn::Star | ResultColumn::TableStar(_) => false,
+        }
+    }
+
+    fn table_source_has_match(src: &TableOrSubquery) -> bool {
+        match src {
+            TableOrSubquery::Subquery { query, .. } => select_contains_match_operator(query),
+            TableOrSubquery::Table { .. } => false,
+            TableOrSubquery::TableFunction { args, .. } => {
+                args.iter().any(expr_contains_match_operator)
+            }
+            TableOrSubquery::ParenJoin(from_clause) => {
+                table_source_has_match(&from_clause.source)
+                    || from_clause.joins.iter().any(|join| {
+                        table_source_has_match(&join.table)
+                            || match &join.constraint {
+                                Some(JoinConstraint::On(expr)) => expr_contains_match_operator(expr),
+                                Some(JoinConstraint::Using(_)) | None => false,
+                            }
+                    })
+            }
+        }
+    }
+
+    match &select.body.select {
+        SelectCore::Values(rows) => rows
+            .iter()
+            .flat_map(|row| row.iter())
+            .any(expr_contains_match_operator),
+        SelectCore::Select {
+            columns,
+            from,
+            where_clause,
+            group_by,
+            having,
+            ..
+        } => {
+            columns.iter().any(result_col_has_match)
+                || where_clause
+                    .as_ref()
+                    .is_some_and(|expr| expr_contains_match_operator(expr))
+                || group_by.iter().any(expr_contains_match_operator)
+                || having
+                    .as_deref()
+                    .is_some_and(expr_contains_match_operator)
+                || from.as_ref().is_some_and(|f| {
+                    table_source_has_match(&f.source)
+                        || f.joins.iter().any(|j| {
+                            table_source_has_match(&j.table)
+                                || match &j.constraint {
+                                    Some(JoinConstraint::On(expr)) => {
+                                        expr_contains_match_operator(expr)
+                                    }
+                                    Some(JoinConstraint::Using(_)) | None => false,
+                                }
+                        })
+                })
+        }
+    }
+}
+
+/// Recursively detect whether an expression tree contains MATCH.
+fn expr_contains_match_operator(expr: &Expr) -> bool {
+    match expr {
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            op,
+            ..
+        } => {
+            *op == LikeOp::Match
+                || expr_contains_match_operator(expr)
+                || expr_contains_match_operator(pattern)
+                || escape
+                    .as_deref()
+                    .is_some_and(expr_contains_match_operator)
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            expr_contains_match_operator(left) || expr_contains_match_operator(right)
+        }
+        Expr::UnaryOp { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Collate { expr, .. }
+        | Expr::IsNull { expr, .. } => expr_contains_match_operator(expr),
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            expr_contains_match_operator(expr)
+                || expr_contains_match_operator(low)
+                || expr_contains_match_operator(high)
+        }
+        Expr::In { expr, set, .. } => {
+            expr_contains_match_operator(expr)
+                || match set {
+                    InSet::List(exprs) => exprs.iter().any(expr_contains_match_operator),
+                    InSet::Subquery(query) => select_contains_match_operator(query),
+                    InSet::Table(_) => false,
+                }
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            operand
+                .as_deref()
+                .is_some_and(expr_contains_match_operator)
+                || whens.iter().any(|(w, t)| {
+                    expr_contains_match_operator(w) || expr_contains_match_operator(t)
+                })
+                || else_expr
+                    .as_deref()
+                    .is_some_and(expr_contains_match_operator)
+        }
+        Expr::Exists { subquery, .. } | Expr::Subquery(subquery, _) => {
+            select_contains_match_operator(subquery)
+        }
+        Expr::FunctionCall { args, filter, over, .. } => {
+            let args_has_match = match args {
+                FunctionArgs::List(exprs) => exprs.iter().any(expr_contains_match_operator),
+                FunctionArgs::Star => false,
+            };
+            let over_has_match = over.as_ref().is_some_and(|window| {
+                window
+                    .partition_by
+                    .iter()
+                    .any(expr_contains_match_operator)
+                    || window.order_by.iter().any(|ordering| {
+                        expr_contains_match_operator(&ordering.expr)
+                    })
+                    || match &window.frame {
+                        Some(frame) => {
+                            frame_bound_contains_match(&frame.start)
+                                || frame.end.as_ref().is_some_and(frame_bound_contains_match)
+                        }
+                        None => false,
+                    }
+            });
+            args_has_match
+                || filter
+                    .as_deref()
+                    .is_some_and(expr_contains_match_operator)
+                || over_has_match
+        }
+        Expr::JsonAccess { expr, path, .. } => {
+            expr_contains_match_operator(expr) || expr_contains_match_operator(path)
+        }
+        Expr::RowValue(values, _) => values.iter().any(expr_contains_match_operator),
+        Expr::Literal(_, _) | Expr::Column(_, _) | Expr::Placeholder(_, _) | Expr::Raise { .. } => false,
+    }
+}
+
+fn frame_bound_contains_match(bound: &fsqlite_ast::FrameBound) -> bool {
+    match bound {
+        fsqlite_ast::FrameBound::Preceding(expr) | fsqlite_ast::FrameBound::Following(expr) => {
+            expr_contains_match_operator(expr)
+        }
+        fsqlite_ast::FrameBound::UnboundedPreceding
+        | fsqlite_ast::FrameBound::CurrentRow
+        | fsqlite_ast::FrameBound::UnboundedFollowing => false,
+    }
+}
+
+/// Parse virtual-table column definitions from module args.
+fn parse_virtual_table_column_infos(args: &[String]) -> Vec<ColumnInfo> {
+    let mut columns = Vec::new();
+    let mut seen = std::collections::HashSet::<String>::new();
+
+    for arg in args {
+        let trimmed = arg.trim();
+        if trimmed.is_empty() || trimmed.contains('=') {
+            continue;
+        }
+        let raw_name = trimmed
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .trim_matches(|ch| matches!(ch, '"' | '\'' | '`' | '[' | ']'));
+        if raw_name.is_empty() {
+            continue;
+        }
+        let key = raw_name.to_ascii_lowercase();
+        if !seen.insert(key) {
+            continue;
+        }
+        columns.push(ColumnInfo {
+            name: raw_name.to_owned(),
+            affinity: 'C',
+            is_ipk: false,
+        });
+    }
+
+    if columns.is_empty() {
+        columns.push(ColumnInfo {
+            name: "content".to_owned(),
+            affinity: 'C',
+            is_ipk: false,
+        });
+    }
+
+    columns
+}
+
+/// Detect INSERT INTO t(t) VALUES('optimize') maintenance commands.
+fn is_fts5_optimize_noop_insert(insert: &fsqlite_ast::InsertStatement) -> bool {
+    if insert.columns.len() != 1
+        || !insert.columns[0].eq_ignore_ascii_case(&insert.table.name)
+    {
+        return false;
+    }
+    match &insert.source {
+        fsqlite_ast::InsertSource::Values(rows) if rows.len() == 1 && rows[0].len() == 1 => {
+            matches!(
+                &rows[0][0],
+                Expr::Literal(Literal::String(command), _)
+                    if command.eq_ignore_ascii_case("optimize")
+            )
+        }
+        _ => false,
+    }
+}
+
 fn canonical_sqlite_schema_name(name: &str) -> Option<&'static str> {
     if name.eq_ignore_ascii_case("sqlite_master") {
         Some("sqlite_master")
@@ -7359,8 +7738,10 @@ enum GroupByColumn {
     Agg {
         name: String,
         arg_col: Option<usize>,
+        arg_expr: Option<Box<Expr>>,
         distinct: bool,
         separator: Option<String>,
+        separator_expr: Option<Box<Expr>>,
     },
 }
 
@@ -10612,8 +10993,30 @@ fn eval_join_expr(
         Expr::Column(col_ref, _) => {
             let col_name = &col_ref.column;
             let table_prefix = col_ref.table.as_deref();
-            let idx = find_col_in_map(col_map, table_prefix, col_name)?;
-            Ok(row.get(idx).cloned().unwrap_or(SqliteValue::Null))
+            if let Ok(idx) = find_col_in_map(col_map, table_prefix, col_name) {
+                return Ok(row.get(idx).cloned().unwrap_or(SqliteValue::Null));
+            }
+
+            // FTS-style shorthand: `<table_name> MATCH 'query'` uses the table
+            // identifier as an implicit document-text operand.
+            if table_prefix.is_none()
+                && col_map
+                    .iter()
+                    .any(|(table, _)| table.eq_ignore_ascii_case(col_name))
+            {
+                let text = col_map
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (table, _))| table.eq_ignore_ascii_case(col_name))
+                    .filter_map(|(idx, _)| row.get(idx))
+                    .filter(|value| !matches!(value, SqliteValue::Null))
+                    .map(sqlite_value_to_text)
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                return Ok(SqliteValue::Text(text));
+            }
+
+            Err(FrankenError::Internal(format!("column not found: {col_name}")))
         }
         Expr::Literal(lit, _) => Ok(literal_to_join_value(lit)),
         Expr::BinaryOp {
@@ -10720,7 +11123,8 @@ fn eval_join_expr(
                 (SqliteValue::Text(s), SqliteValue::Text(p)) => match op {
                     LikeOp::Like => simple_like_match(p, s),
                     LikeOp::Glob => simple_glob_match(p, s),
-                    _ => false,
+                    LikeOp::Match => simple_match_query(p, s),
+                    LikeOp::Regexp => false,
                 },
                 _ => false,
             };
@@ -10954,6 +11358,50 @@ fn like_dp(pat: &[char], txt: &[char], pi: usize, ti: usize) -> bool {
         }
         c => ti < txt.len() && txt[ti] == c && like_dp(pat, txt, pi + 1, ti + 1),
     }
+}
+
+/// Lightweight MATCH predicate for fallback paths.
+///
+/// Supports single-term search, quoted phrases, `AND`/`OR`, and `prefix*`.
+fn simple_match_query(query: &str, document: &str) -> bool {
+    fn matches_term(term: &str, text_lower: &str) -> bool {
+        let mut normalized = term
+            .trim()
+            .trim_matches('"')
+            .trim_matches('\'')
+            .to_ascii_lowercase();
+        if normalized.is_empty() {
+            return false;
+        }
+        if normalized.ends_with('*') {
+            normalized.pop();
+            if normalized.is_empty() {
+                return true;
+            }
+            return text_lower
+                .split_whitespace()
+                .any(|word| word.starts_with(&normalized));
+        }
+        text_lower.contains(&normalized)
+    }
+
+    fn eval_clause(clause: &str, text_lower: &str) -> bool {
+        let trimmed = clause.trim();
+        if trimmed.contains(" OR ") {
+            return trimmed
+                .split(" OR ")
+                .any(|part| eval_clause(part, text_lower));
+        }
+        if trimmed.contains(" AND ") {
+            return trimmed
+                .split(" AND ")
+                .all(|part| eval_clause(part, text_lower));
+        }
+        matches_term(trimmed, text_lower)
+    }
+
+    let text_lower = document.to_ascii_lowercase();
+    eval_clause(query, &text_lower)
 }
 
 /// Simple GLOB pattern match (`*` = any sequence, `?` = any char, case-sensitive).
@@ -11423,6 +11871,28 @@ mod tests {
             .query("SELECT COUNT(*) FROM t;")
             .expect("COUNT should succeed");
         assert_eq!(row_values(&rows[0]), vec![SqliteValue::Integer(1)]);
+    }
+
+    #[test]
+    fn test_create_virtual_table_fts5_with_match_and_optimize() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE VIRTUAL TABLE docs USING fts5(subject, body, tokenize='porter')")
+            .unwrap();
+
+        conn.execute("INSERT INTO docs(rowid, subject, body) VALUES (1, 'Hello', 'Rust world')")
+            .unwrap();
+        conn.execute("INSERT INTO docs(rowid, subject, body) VALUES (2, 'Other', 'Nothing')")
+            .unwrap();
+
+        let rows = conn
+            .query("SELECT rowid FROM docs WHERE docs MATCH 'hello'")
+            .unwrap();
+        assert_eq!(rows.len(), 1, "MATCH should find one matching row");
+
+        conn.execute("INSERT INTO docs(docs) VALUES('optimize')")
+            .unwrap();
+        let count_rows = conn.query("SELECT COUNT(*) FROM docs").unwrap();
+        assert_eq!(count_rows[0].get(0).unwrap(), &SqliteValue::Integer(2));
     }
 
     #[test]
@@ -18732,6 +19202,24 @@ mod transaction_lifecycle_tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].get(1).unwrap(), &SqliteValue::Text("a | b".into()));
         assert_eq!(rows[1].get(1).unwrap(), &SqliteValue::Text("c".into()));
+    }
+
+    #[test]
+    fn test_group_concat_expression_argument() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, grp TEXT, val TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'x', 'a')").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 'x', NULL)").unwrap();
+        conn.execute("INSERT INTO t VALUES (3, 'x', 'b')").unwrap();
+        let rows = conn
+            .query(
+                "SELECT grp, GROUP_CONCAT(COALESCE(val, ''), ', ') \
+                 FROM t GROUP BY grp",
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get(1).unwrap(), &SqliteValue::Text("a, , b".into()));
     }
 
     #[test]

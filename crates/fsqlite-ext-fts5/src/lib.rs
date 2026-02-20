@@ -134,6 +134,27 @@ fn parse_bool_like(value: &str) -> Option<bool> {
     }
 }
 
+fn parse_option_assignment(input: &str) -> Option<(&str, &str)> {
+    let (key, value) = input.split_once('=')?;
+    Some((key.trim(), value.trim()))
+}
+
+fn unquote_fts_arg(value: &str) -> &str {
+    let trimmed = value.trim();
+    if trimmed.len() >= 2 {
+        let bytes = trimmed.as_bytes();
+        let first = bytes[0];
+        let last = bytes[trimmed.len() - 1];
+        if (first == b'\'' && last == b'\'')
+            || (first == b'"' && last == b'"')
+            || (first == b'`' && last == b'`')
+        {
+            return &trimmed[1..trimmed.len() - 1];
+        }
+    }
+    trimmed
+}
+
 // ---------------------------------------------------------------------------
 // Tokenizer API
 // ---------------------------------------------------------------------------
@@ -1504,16 +1525,79 @@ impl VirtualTable for Fts5Table {
     where
         Self: Sized,
     {
-        // Parse column names from args (after module name).
-        let columns: Vec<String> = if args.len() > 3 {
-            args[3..].iter().map(|s| (*s).to_owned()).collect()
-        } else {
-            vec!["content".to_owned()]
-        };
+        let mut columns: Vec<String> = Vec::new();
+        let mut config = Fts5Config::default();
+        let mut tokenizer_name = "unicode61".to_owned();
 
-        debug!(columns = ?columns, "fts5: connecting virtual table");
+        if args.len() > 3 {
+            for raw in &args[3..] {
+                let trimmed = raw.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
 
-        Ok(Self::with_columns(columns))
+                if let Some((key, value)) = parse_option_assignment(trimmed) {
+                    let key_lower = key.to_ascii_lowercase();
+                    let value_unquoted = unquote_fts_arg(value).to_ascii_lowercase();
+                    match key_lower.as_str() {
+                        "tokenize" => {
+                            let tok = value_unquoted
+                                .split_whitespace()
+                                .next()
+                                .unwrap_or("unicode61");
+                            tokenizer_name = tok.to_owned();
+                        }
+                        "content" => {
+                            if value_unquoted.is_empty() {
+                                config.content_mode = ContentMode::Contentless;
+                            } else {
+                                config.content_mode = ContentMode::Stored;
+                            }
+                        }
+                        "contentless_delete" | "secure_delete" | "secure-delete" => {
+                            let _ = config.apply_control_command(&format!("{key}={value}"));
+                        }
+                        // Parsed for compatibility but not used in this in-memory path yet.
+                        "prefix" | "detail" | "columnsize" | "insttoken" => {}
+                        _ => {
+                            return Err(FrankenError::function_error(format!(
+                                "fts5: unsupported option '{key}'"
+                            )));
+                        }
+                    }
+                    continue;
+                }
+
+                // Column declarations may include `UNINDEXED` or collation hints;
+                // keep the leading identifier as the column name.
+                let column = trimmed
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or_default()
+                    .trim_matches(|ch| matches!(ch, '"' | '\'' | '`' | '[' | ']'));
+                if !column.is_empty() {
+                    columns.push(column.to_owned());
+                }
+            }
+        }
+
+        if columns.is_empty() {
+            columns.push("content".to_owned());
+        }
+
+        debug!(
+            columns = ?columns,
+            tokenizer = %tokenizer_name,
+            content_mode = ?config.content_mode,
+            secure_delete = config.secure_delete,
+            contentless_delete = config.contentless_delete,
+            "fts5: connecting virtual table"
+        );
+
+        let mut table = Self::with_columns(columns);
+        table.config = config;
+        table.tokenizer_name = tokenizer_name;
+        Ok(table)
     }
 
     fn best_index(&self, info: &mut IndexInfo) -> Result<()> {
@@ -2325,6 +2409,37 @@ mod tests {
         let cx = Cx::new();
         let vtab = Fts5Table::connect(&cx, &["fts5"]).unwrap();
         assert_eq!(vtab.columns(), &["content"]);
+    }
+
+    #[test]
+    fn test_fts5_vtab_connect_applies_options() {
+        let cx = Cx::new();
+        let vtab = Fts5Table::connect(
+            &cx,
+            &[
+                "fts5",
+                "main",
+                "docs",
+                "title",
+                "body UNINDEXED",
+                "tokenize='porter'",
+                "content=''",
+                "contentless_delete=1",
+            ],
+        )
+        .unwrap();
+        assert_eq!(vtab.columns(), &["title", "body"]);
+        assert_eq!(vtab.tokenizer_name, "porter");
+        assert_eq!(vtab.config.content_mode(), ContentMode::Contentless);
+        assert!(vtab.config.contentless_delete_enabled());
+    }
+
+    #[test]
+    fn test_fts5_vtab_connect_rejects_unknown_option() {
+        let cx = Cx::new();
+        let err = Fts5Table::connect(&cx, &["fts5", "main", "docs", "title", "mystery=1"])
+            .expect_err("unsupported option should fail");
+        assert!(err.to_string().contains("unsupported option"));
     }
 
     #[test]
