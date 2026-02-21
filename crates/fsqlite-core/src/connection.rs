@@ -8608,9 +8608,8 @@ fn build_raw_scan_select(select: &SelectStatement) -> SelectStatement {
 /// Test whether a `SqliteValue` is truthy (non-zero, non-NULL).
 fn is_sqlite_truthy(v: &SqliteValue) -> bool {
     match v {
-        SqliteValue::Null | SqliteValue::Integer(0) => false,
-        SqliteValue::Float(f) if *f == 0.0 => false,
-        _ => true,
+        SqliteValue::Null => false,
+        v => v.to_float() != 0.0,
     }
 }
 
