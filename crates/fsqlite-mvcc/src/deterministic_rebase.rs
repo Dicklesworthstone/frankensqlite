@@ -310,13 +310,14 @@ fn enforce_constraints(
             })?;
         // Per SQLite: CHECK passes if result is true (non-zero) OR NULL.
         // Fails only if result is exactly false (zero).
-        match result {
-            SqliteValue::Integer(0) | SqliteValue::Float(0.0) => {
-                return Err(RebaseError::CheckViolation {
-                    table: constraints.table_id,
-                });
-            }
-            _ => {} // NULL or non-zero passes.
+        let is_false = match result {
+            SqliteValue::Null => false,
+            v => v.to_float() == 0.0,
+        };
+        if is_false {
+            return Err(RebaseError::CheckViolation {
+                table: constraints.table_id,
+            });
         }
     }
 

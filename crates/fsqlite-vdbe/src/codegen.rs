@@ -4683,7 +4683,7 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
                     Literal::CurrentTime => format!("{h:02}:{m:02}:{s:02}"),
                     _ => unreachable!(),
                 };
-                b.emit_op(Opcode::String8, 0, reg, 0, P4::String(ts), 0);
+                b.emit_op(Opcode::String8, 0, reg, 0, P4::Str(ts), 0);
             }
             _ => {
                 b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);

@@ -229,7 +229,7 @@ impl<'a> Lexer<'a> {
             b'.' if self.peek_at(1).is_some_and(|c| c.is_ascii_digit()) => self.lex_number(),
 
             // Identifiers and keywords
-            b'a'..=b'z' | b'A'..=b'Z' | b'_' => self.lex_identifier(),
+            b'a'..=b'z' | b'A'..=b'Z' | b'_' | 0x80..=0xFF => self.lex_identifier(),
 
             // Bind parameters
             b'?' => self.lex_question(),
@@ -692,7 +692,7 @@ impl<'a> Lexer<'a> {
 
         while self.pos < self.src.len() {
             let ch = self.src[self.pos];
-            if ch.is_ascii_alphanumeric() || ch == b'_' {
+            if ch.is_ascii_alphanumeric() || ch == b'_' || ch >= 0x80 {
                 self.advance();
             } else {
                 break;
@@ -733,7 +733,7 @@ impl<'a> Lexer<'a> {
         let name_start = self.pos;
         while self.pos < self.src.len() {
             let ch = self.src[self.pos];
-            if ch.is_ascii_alphanumeric() || ch == b'_' {
+            if ch.is_ascii_alphanumeric() || ch == b'_' || ch >= 0x80 {
                 self.advance();
             } else {
                 break;
@@ -752,7 +752,7 @@ impl<'a> Lexer<'a> {
         let name_start = self.pos;
         while self.pos < self.src.len() {
             let ch = self.src[self.pos];
-            if ch.is_ascii_alphanumeric() || ch == b'_' {
+            if ch.is_ascii_alphanumeric() || ch == b'_' || ch >= 0x80 {
                 self.advance();
             } else {
                 break;
@@ -771,7 +771,7 @@ impl<'a> Lexer<'a> {
         let name_start = self.pos;
         while self.pos < self.src.len() {
             let ch = self.src[self.pos];
-            if ch.is_ascii_alphanumeric() || ch == b'_' {
+            if ch.is_ascii_alphanumeric() || ch == b'_' || ch >= 0x80 {
                 self.advance();
             } else {
                 break;
