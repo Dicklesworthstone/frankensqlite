@@ -794,11 +794,12 @@ impl ScalarFunction for RandomblobFunc {
         }
         let n = args[0].to_integer().max(0) as usize;
         let mut buf = vec![0u8; n];
-        for (i, byte) in buf.iter_mut().enumerate() {
-            #[allow(clippy::cast_possible_truncation)]
-            {
-                *byte = (simple_random_i64().wrapping_add(i as i64) & 0xFF) as u8;
-            }
+        let mut i = 0;
+        while i < n {
+            let rnd = simple_random_i64().to_ne_bytes();
+            let to_copy = (n - i).min(8);
+            buf[i..i + to_copy].copy_from_slice(&rnd[..to_copy]);
+            i += to_copy;
         }
         Ok(SqliteValue::Blob(buf))
     }
