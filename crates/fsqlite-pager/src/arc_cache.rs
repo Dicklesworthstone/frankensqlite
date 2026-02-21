@@ -976,12 +976,9 @@ impl ArcCacheInner {
         self.total_bytes += byte_size;
         *self.page_versions.entry(key.pgno).or_insert(0) += 1;
 
-        // Phase 2.5: opportunistic version coalescing for the admitted page.
-        if self.page_versions.get(&key.pgno).copied().unwrap_or(0) > 1
-            && self.gc_horizon != CommitSeq::ZERO
-        {
-            self.coalesce_versions_for_pgno(key.pgno);
-        }
+        // Phase 2.5 was removed: opportunistic version coalescing here caused O(N)
+        // latency spikes on the hot path. Superseded versions are reclaimed
+        // asynchronously by the GC thread or lazily by `evict_one_preferred`.
 
         // Phase 3: enforce byte limit (dual trigger).
         while self.max_bytes > 0 && self.total_bytes > self.max_bytes && self.len() > 1 {
@@ -1114,7 +1111,7 @@ impl ArcCacheInner {
     /// more than one version cached, AND whose `commit_seq` is below the
     /// GC horizon.
     fn find_superseded_victim(&self, list: &IntrusiveList<CachedPage>) -> Option<SlabIdx> {
-        for (idx, page) in list.iter() {
+        for (idx, page) in list.iter().take(64) {
             if page.is_pinned() {
                 continue;
             }
@@ -1156,33 +1153,89 @@ impl ArcCacheInner {
     }
 
     fn coalesce_one_superseded_for_replace(&mut self) -> bool {
-        let mut page_numbers: Vec<PageNumber> = self
-            .page_versions
-            .iter()
-            .filter_map(|(pgno, count)| (*count > 1).then_some(*pgno))
-            .collect();
-        page_numbers.sort_by_key(|pgno| pgno.get());
-
-        for pgno in page_numbers {
-            if self.coalesce_versions_for_pgno(pgno) > 0 {
-                return true;
-            }
+        // Find one superseded victim from T1 or T2, scanning from LRU to MRU.
+        // We use the bounded find_superseded_victim to ensure this is O(1).
+        if let Some(idx) = self.find_superseded_victim(&self.t1) {
+            let page = self.t1.remove(idx);
+            let key = page.key;
+            self.total_bytes -= page.byte_size;
+            self.decrement_page_version(key.pgno);
+            self.directory.remove(&key);
+            let ghost_idx = self.b1.push_back(key);
+            self.directory.insert(key, Location::B1(ghost_idx));
+            return true;
         }
-
+        if let Some(idx) = self.find_superseded_victim(&self.t2) {
+            let page = self.t2.remove(idx);
+            let key = page.key;
+            self.total_bytes -= page.byte_size;
+            self.decrement_page_version(key.pgno);
+            self.directory.remove(&key);
+            let ghost_idx = self.b2.push_back(key);
+            self.directory.insert(key, Location::B2(ghost_idx));
+            return true;
+        }
         false
     }
 
     fn coalesce_all_versions(&mut self) {
-        let mut page_numbers: Vec<PageNumber> = self
-            .page_versions
-            .iter()
-            .filter_map(|(pgno, count)| (*count > 1).then_some(*pgno))
-            .collect();
-        page_numbers.sort_by_key(|pgno| pgno.get());
+        let mut candidates: HashMap<PageNumber, Vec<(u64, CacheKey, SlabIdx, bool)>> = HashMap::new();
 
-        for pgno in page_numbers {
-            let _ = self.coalesce_versions_for_pgno(pgno);
+        // Single pass over T1 and T2 to find all versions <= gc_horizon.
+        for (idx, page) in self.t1.iter() {
+            if page.key.commit_seq != CommitSeq::ZERO && page.key.commit_seq <= self.gc_horizon {
+                candidates.entry(page.key.pgno).or_default().push((
+                    page.key.commit_seq.get(),
+                    page.key,
+                    idx,
+                    true, // is_t1
+                ));
+            }
         }
+        for (idx, page) in self.t2.iter() {
+            if page.key.commit_seq != CommitSeq::ZERO && page.key.commit_seq <= self.gc_horizon {
+                candidates.entry(page.key.pgno).or_default().push((
+                    page.key.commit_seq.get(),
+                    page.key,
+                    idx,
+                    false, // is_t1
+                ));
+            }
+        }
+
+        let mut removed = 0;
+        for (_, mut versions) in candidates {
+            if versions.len() > 1 {
+                // Sort by commit sequence descending to keep the newest version.
+                versions.sort_by_key(|entry| std::cmp::Reverse(entry.0));
+                for (_, key, idx, is_t1) in versions.into_iter().skip(1) {
+                    // Skip pinned pages.
+                    let is_pinned = if is_t1 {
+                        self.t1.get(idx).map_or(false, |p| p.is_pinned())
+                    } else {
+                        self.t2.get(idx).map_or(false, |p| p.is_pinned())
+                    };
+
+                    if is_pinned {
+                        continue;
+                    }
+
+                    let page = if is_t1 {
+                        self.t1.remove(idx)
+                    } else {
+                        self.t2.remove(idx)
+                    };
+
+                    self.total_bytes = self.total_bytes.saturating_sub(page.byte_size);
+                    self.decrement_page_version(key.pgno);
+                    self.directory.remove(&key);
+                    removed += 1;
+                }
+            }
+        }
+
+        let removed_u64 = u64::try_from(removed).unwrap_or(u64::MAX);
+        self.version_coalesce_count = self.version_coalesce_count.saturating_add(removed_u64);
     }
 
     fn coalesce_versions_for_pgno(&mut self, pgno: PageNumber) -> usize {

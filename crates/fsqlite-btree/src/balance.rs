@@ -93,48 +93,37 @@ pub fn balance_deeper<W: PageWriter>(
     let root_offset = header_offset_for_page(root_page_no);
     let root_header = BtreePageHeader::parse(&root_data, root_offset)?;
 
+    // Extract cells from the root page safely to avoid offset shifting bugs.
+    let cell_ptrs = read_cell_pointers(&root_data, &root_header, root_offset)?;
+    let mut root_cells: Vec<GatheredCell> = Vec::with_capacity(cell_ptrs.len());
+    for &ptr in &cell_ptrs {
+        let cell_offset = usize::from(ptr);
+        let cell_ref = CellRef::parse(
+            &root_data,
+            cell_offset,
+            root_header.page_type,
+            usable_size,
+        )?;
+        let cell_end = cell_offset + cell_on_page_size_from_ref(&cell_ref, cell_offset);
+        let data = root_data[cell_offset..cell_end].to_vec();
+        let size = u16::try_from(data.len()).map_err(|_| {
+            FrankenError::Internal("cell too large during balance_deeper".to_owned())
+        })?;
+        root_cells.push(GatheredCell { data, size });
+    }
+
     // Allocate a new child page.
     let child_pgno = writer.allocate_page(cx)?;
-
-    // Copy root contents to child.
-    let mut child_data = vec![0u8; usable_size as usize];
     let child_offset = header_offset_for_page(child_pgno);
 
-    // Copy the page header, cell pointer array, and cell content area.
-    // Cell content starts at cell_content_offset and runs to usable_size.
-    let content_start = root_header.cell_content_offset as usize;
-    let content_end = usable_size as usize;
-
-    // Adjust header for child page (different header offset if root is page 1).
-    let mut child_header = root_header;
-    let cell_ptrs = read_cell_pointers(&root_data, &root_header, root_offset)?;
-
-    #[allow(clippy::cast_possible_truncation)]
-    if root_offset == child_offset {
-        // Same offset — direct copy.
-        child_header.write(&mut child_data, child_offset);
-        write_cell_pointers(&mut child_data, child_offset, &child_header, &cell_ptrs);
-        child_data[content_start..content_end]
-            .copy_from_slice(&root_data[content_start..content_end]);
-    } else {
-        // Root is page 1 (offset=100), child is offset=0.
-        // All byte offsets shift down by root_offset.
-        let delta = root_offset as u32;
-        child_header.cell_content_offset = root_header.cell_content_offset.saturating_sub(delta);
-        child_header.write(&mut child_data, child_offset);
-
-        let adjusted: Vec<u16> = cell_ptrs
-            .iter()
-            .map(|&p| p.saturating_sub(delta as u16))
-            .collect();
-        write_cell_pointers(&mut child_data, child_offset, &child_header, &adjusted);
-
-        // Copy cell content area with adjusted destination.
-        let child_content_start = child_header.cell_content_offset as usize;
-        let src_len = content_end - content_start;
-        child_data[child_content_start..child_content_start + src_len]
-            .copy_from_slice(&root_data[content_start..content_end]);
-    }
+    // Build the child page using the extracted cells.
+    let child_data = build_page(
+        &root_cells,
+        root_header.page_type,
+        child_offset,
+        usable_size,
+        root_header.right_child,
+    )?;
 
     writer.write_page(cx, child_pgno, &child_data)?;
 

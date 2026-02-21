@@ -8,6 +8,7 @@
 //! This module is the *plumbing layer* for zero-copy I/O; the full ARC
 //! eviction policy lives in a higher-level module (bd-7pu).
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 
@@ -22,6 +23,42 @@ use crate::page_buf::{PageBuf, PageBufPool};
 // PageCache
 // ---------------------------------------------------------------------------
 
+/// Point-in-time page-cache counters and gauges.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PageCacheMetricsSnapshot {
+    /// Number of successful cache probes.
+    pub hits: u64,
+    /// Number of failed cache probes.
+    pub misses: u64,
+    /// Number of fresh pages admitted into the cache.
+    pub admits: u64,
+    /// Number of pages evicted from the cache.
+    pub evictions: u64,
+    /// Number of pages currently resident in the cache.
+    pub cached_pages: usize,
+    /// Configured buffer-pool capacity (max page buffers).
+    pub pool_capacity: usize,
+}
+
+impl PageCacheMetricsSnapshot {
+    /// Total cache probes (`hits + misses`).
+    #[must_use]
+    pub fn total_accesses(self) -> u64 {
+        self.hits.saturating_add(self.misses)
+    }
+
+    /// Hit-rate as a percentage in `[0.0, 100.0]`.
+    #[must_use]
+    pub fn hit_rate_percent(self) -> f64 {
+        let total = self.total_accesses();
+        if total == 0 {
+            0.0
+        } else {
+            (self.hits as f64 * 100.0) / total as f64
+        }
+    }
+}
+
 /// Simple page cache: `PageNumber → PageBuf`.
 ///
 /// All buffers are drawn from a shared [`PageBufPool`].  On eviction the
@@ -35,6 +72,10 @@ pub struct PageCache {
     pool: PageBufPool,
     pages: HashMap<PageNumber, PageBuf>,
     page_size: PageSize,
+    hits: Cell<u64>,
+    misses: Cell<u64>,
+    admits: Cell<u64>,
+    evictions: Cell<u64>,
 }
 
 impl PageCache {
@@ -48,6 +89,10 @@ impl PageCache {
             pool: PageBufPool::new(page_size, pool_capacity),
             pages: HashMap::new(),
             page_size,
+            hits: Cell::new(0),
+            misses: Cell::new(0),
+            admits: Cell::new(0),
+            evictions: Cell::new(0),
         }
     }
 
@@ -63,6 +108,10 @@ impl PageCache {
             pool,
             pages: HashMap::new(),
             page_size,
+            hits: Cell::new(0),
+            misses: Cell::new(0),
+            admits: Cell::new(0),
+            evictions: Cell::new(0),
         }
     }
 
@@ -103,7 +152,13 @@ impl PageCache {
     #[inline]
     #[must_use]
     pub fn get(&self, page_no: PageNumber) -> Option<&[u8]> {
-        self.pages.get(&page_no).map(PageBuf::as_slice)
+        if let Some(page) = self.pages.get(&page_no) {
+            self.hits.set(self.hits.get().saturating_add(1));
+            Some(page.as_slice())
+        } else {
+            self.misses.set(self.misses.get().saturating_add(1));
+            None
+        }
     }
 
     /// Get a mutable reference to a cached page.
@@ -113,7 +168,13 @@ impl PageCache {
     /// layer.
     #[inline]
     pub fn get_mut(&mut self, page_no: PageNumber) -> Option<&mut [u8]> {
-        self.pages.get_mut(&page_no).map(PageBuf::as_mut_slice)
+        if let Some(page) = self.pages.get_mut(&page_no) {
+            self.hits.set(self.hits.get().saturating_add(1));
+            Some(page.as_mut_slice())
+        } else {
+            self.misses.set(self.misses.get().saturating_add(1));
+            None
+        }
     }
 
     /// Returns `true` if the page is present in the cache.
@@ -140,11 +201,12 @@ impl PageCache {
         file: &mut impl VfsFile,
         page_no: PageNumber,
     ) -> Result<&[u8]> {
-        if !self.pages.contains_key(&page_no) {
+        if self.get(page_no).is_none() {
             let mut buf = self.pool.acquire()?;
             let offset = page_offset(page_no, self.page_size);
             let _ = file.read(cx, buf.as_mut_slice(), offset)?;
             self.pages.insert(page_no, buf);
+            self.admits.set(self.admits.get().saturating_add(1));
         }
         // SAFETY (logical): we just ensured the key exists above.
         Ok(self.pages.get(&page_no).expect("just inserted").as_slice())
@@ -157,9 +219,14 @@ impl PageCache {
     ///
     /// Returns `Err` if the page is not in the cache.
     pub fn write_page(&self, cx: &Cx, file: &mut impl VfsFile, page_no: PageNumber) -> Result<()> {
-        let buf = self.pages.get(&page_no).ok_or_else(|| {
-            fsqlite_error::FrankenError::internal(format!("page {} not in cache", page_no))
-        })?;
+        let Some(buf) = self.pages.get(&page_no) else {
+            self.misses.set(self.misses.get().saturating_add(1));
+            return Err(fsqlite_error::FrankenError::internal(format!(
+                "page {} not in cache",
+                page_no
+            )));
+        };
+        self.hits.set(self.hits.get().saturating_add(1));
         let offset = page_offset(page_no, self.page_size);
         file.write(cx, buf.as_slice(), offset)?;
         Ok(())
@@ -174,13 +241,16 @@ impl PageCache {
         let mut buf = self.pool.acquire()?;
         buf.as_mut_slice().fill(0);
 
-        let out = match self.pages.entry(page_no) {
+        let (out, admitted_new) = match self.pages.entry(page_no) {
             Entry::Occupied(mut entry) => {
                 entry.insert(buf);
-                entry.into_mut().as_mut_slice()
+                (entry.into_mut().as_mut_slice(), false)
             }
-            Entry::Vacant(entry) => entry.insert(buf).as_mut_slice(),
+            Entry::Vacant(entry) => (entry.insert(buf).as_mut_slice(), true),
         };
+        if admitted_new {
+            self.admits.set(self.admits.get().saturating_add(1));
+        }
         Ok(out)
     }
 
@@ -191,7 +261,11 @@ impl PageCache {
     /// Returns `true` if the page was present.
     pub fn evict(&mut self, page_no: PageNumber) -> bool {
         // Dropping the PageBuf returns it to the pool via Drop impl.
-        self.pages.remove(&page_no).is_some()
+        let removed = self.pages.remove(&page_no).is_some();
+        if removed {
+            self.evictions.set(self.evictions.get().saturating_add(1));
+        }
+        removed
     }
 
     /// Evict an arbitrary page from the cache to free up space.
@@ -203,6 +277,7 @@ impl PageCache {
         let key = self.pages.keys().next().copied();
         if let Some(key) = key {
             self.pages.remove(&key);
+            self.evictions.set(self.evictions.get().saturating_add(1));
             true
         } else {
             false
@@ -211,7 +286,32 @@ impl PageCache {
 
     /// Evict all pages from the cache.
     pub fn clear(&mut self) {
+        let removed = self.pages.len();
+        let removed_u64 = u64::try_from(removed).unwrap_or(u64::MAX);
+        self.evictions
+            .set(self.evictions.get().saturating_add(removed_u64));
         self.pages.clear();
+    }
+
+    /// Capture current cache metrics.
+    #[must_use]
+    pub fn metrics_snapshot(&self) -> PageCacheMetricsSnapshot {
+        PageCacheMetricsSnapshot {
+            hits: self.hits.get(),
+            misses: self.misses.get(),
+            admits: self.admits.get(),
+            evictions: self.evictions.get(),
+            cached_pages: self.pages.len(),
+            pool_capacity: self.pool.capacity(),
+        }
+    }
+
+    /// Reset cache counters while preserving resident pages and configuration.
+    pub fn reset_metrics(&mut self) {
+        self.hits.set(0);
+        self.misses.set(0);
+        self.admits.set(0);
+        self.evictions.set(0);
     }
 }
 
@@ -221,6 +321,11 @@ impl std::fmt::Debug for PageCache {
             .field("page_size", &self.page_size)
             .field("cached_pages", &self.pages.len())
             .field("pool", &self.pool)
+            .field("hits", &self.hits)
+            .field("misses", &self.misses)
+            .field("admits", &self.admits)
+            .field("evictions", &self.evictions)
+            .field("metrics", &self.metrics_snapshot())
             .finish()
     }
 }
@@ -941,6 +1046,46 @@ mod tests {
         assert!(
             debug.contains("PageCache"),
             "bead_id={BEAD_ID} case=debug_format"
+        );
+    }
+
+    #[test]
+    fn test_metrics_snapshot_and_reset() {
+        let mut cache = PageCache::new(PageSize::DEFAULT, 4);
+        let page1 = PageNumber::ONE;
+
+        assert!(cache.get(page1).is_none());
+        let fresh = cache.insert_fresh(page1).unwrap();
+        fresh[0] = 7;
+        assert!(cache.get(page1).is_some());
+        assert!(cache.evict(page1));
+
+        let snapshot = cache.metrics_snapshot();
+        assert_eq!(snapshot.hits, 1, "bead_id={BEAD_ID} case=metrics_hits");
+        assert_eq!(snapshot.misses, 1, "bead_id={BEAD_ID} case=metrics_misses");
+        assert_eq!(snapshot.admits, 1, "bead_id={BEAD_ID} case=metrics_admits");
+        assert_eq!(
+            snapshot.evictions, 1,
+            "bead_id={BEAD_ID} case=metrics_evictions"
+        );
+        assert_eq!(
+            snapshot.total_accesses(),
+            2,
+            "bead_id={BEAD_ID} case=metrics_total_accesses"
+        );
+        assert!(
+            (snapshot.hit_rate_percent() - 50.0).abs() < f64::EPSILON,
+            "bead_id={BEAD_ID} case=metrics_hit_rate"
+        );
+
+        cache.reset_metrics();
+        let reset = cache.metrics_snapshot();
+        assert_eq!(reset.hits, 0, "bead_id={BEAD_ID} case=reset_hits");
+        assert_eq!(reset.misses, 0, "bead_id={BEAD_ID} case=reset_misses");
+        assert_eq!(reset.admits, 0, "bead_id={BEAD_ID} case=reset_admits");
+        assert_eq!(
+            reset.evictions, 0,
+            "bead_id={BEAD_ID} case=reset_evictions"
         );
     }
 

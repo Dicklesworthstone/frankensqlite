@@ -19,7 +19,7 @@ use fsqlite_vfs::{Vfs, VfsFile};
 
 use crate::journal::{JournalHeader, JournalPageRecord};
 use crate::page_buf::{PageBuf, PageBufPool};
-use crate::page_cache::PageCache;
+use crate::page_cache::{PageCache, PageCacheMetricsSnapshot};
 use crate::traits::{self, JournalMode, MvccPager, TransactionHandle, TransactionMode, WalBackend};
 
 /// The inner mutable pager state protected by a mutex.
@@ -280,6 +280,25 @@ impl<V: Vfs> SimplePager<V>
 where
     V::File: Send + Sync,
 {
+    /// Capture point-in-time page-cache counters.
+    pub fn cache_metrics_snapshot(&self) -> Result<PageCacheMetricsSnapshot> {
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
+        Ok(inner.cache.metrics_snapshot())
+    }
+
+    /// Reset page-cache counters without altering resident pages.
+    pub fn reset_cache_metrics(&self) -> Result<()> {
+        self.inner
+            .lock()
+            .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?
+            .cache
+            .reset_metrics();
+        Ok(())
+    }
+
     /// Compute the journal path from the database path.
     fn journal_path(db_path: &Path) -> PathBuf {
         let mut jp = db_path.as_os_str().to_owned();
@@ -780,7 +799,9 @@ where
                 value: page_no.get().to_string(),
             });
         }
-        self.freed_pages.push(page_no);
+        if !self.freed_pages.contains(&page_no) {
+            self.freed_pages.push(page_no);
+        }
         self.write_set.remove(&page_no);
         Ok(())
     }
