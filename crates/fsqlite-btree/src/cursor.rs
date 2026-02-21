@@ -661,14 +661,12 @@ impl<P: PageReader> BtCursor<P> {
                     BinarySearchResult::NotFound(idx) => {
                         let mut entry = entry;
                         if idx >= entry.header.cell_count {
-                            if entry.header.cell_count > 0 {
-                                entry.cell_idx = entry.header.cell_count - 1;
-                            } else {
-                                entry.cell_idx = 0;
-                            }
+                            // Target is strictly greater than the last key on this leaf.
+                            // Keep the path anchored to this right-most leaf and mark EOF,
+                            // so callers (notably INSERT) still have a valid stack context.
+                            entry.cell_idx = entry.header.cell_count.saturating_sub(1);
                             self.stack.push(entry);
-                            self.at_eof = false;
-                            self.advance_next(cx)?;
+                            self.at_eof = true;
                         } else {
                             entry.cell_idx = idx;
                             self.stack.push(entry);
@@ -788,14 +786,11 @@ impl<P: PageReader> BtCursor<P> {
                     BinarySearchResult::NotFound(idx) => {
                         let mut entry = entry;
                         if idx >= entry.header.cell_count {
-                            if entry.header.cell_count > 0 {
-                                entry.cell_idx = entry.header.cell_count - 1;
-                            } else {
-                                entry.cell_idx = 0;
-                            }
+                            // Target is strictly greater than the last key on this leaf.
+                            // Preserve stack context for insertion paths while flagging EOF.
+                            entry.cell_idx = entry.header.cell_count.saturating_sub(1);
                             self.stack.push(entry);
-                            self.at_eof = false;
-                            self.advance_next(cx)?;
+                            self.at_eof = true;
                         } else {
                             entry.cell_idx = idx;
                             self.stack.push(entry);
@@ -911,9 +906,14 @@ impl<P: PageReader> BtCursor<P> {
 
     /// Advance to the next entry. Returns false if at EOF.
     fn advance_next(&mut self, cx: &Cx) -> Result<bool> {
-        if self.at_eof || self.stack.is_empty() {
+        if self.at_eof {
             self.at_eof = true;
             return Ok(false);
+        }
+        if self.stack.is_empty() {
+            // Allow recovering from a before-first state created by prev()
+            // at the beginning of iteration.
+            return self.move_to_leftmost_leaf(cx, self.root_page, true);
         }
 
         let depth = self.stack.len();
@@ -967,6 +967,27 @@ impl<P: PageReader> BtCursor<P> {
 
     /// Move to the previous entry. Returns false if at the beginning.
     fn advance_prev(&mut self, cx: &Cx) -> Result<bool> {
+        if self.at_eof {
+            // Recover from an after-last state (e.g., next() from last row).
+            if self.stack.is_empty() {
+                return self.move_to_rightmost_leaf(cx, self.root_page, true);
+            }
+
+            // Recover from a seek-past-end EOF sentinel while preserving leaf context.
+            let top = self
+                .stack
+                .last()
+                .ok_or_else(|| FrankenError::internal("cursor stack is empty"))?;
+            if top.header.page_type.is_leaf() && top.header.cell_count > 0 {
+                self.stack.last_mut().unwrap().cell_idx = top.header.cell_count - 1;
+                self.at_eof = false;
+                return Ok(true);
+            }
+
+            // Fallback to canonical rightmost positioning for any odd interior/empty state.
+            return self.move_to_rightmost_leaf(cx, self.root_page, true);
+        }
+
         if self.stack.is_empty() {
             return Ok(false);
         }
@@ -1544,11 +1565,15 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
     fn index_insert(&mut self, cx: &Cx, key: &[u8]) -> Result<()> {
         self.with_btree_op(cx, BtreeOpType::Insert, |cursor| {
             let seek = cursor.index_seek(cx, key)?;
-            let mut insert_idx = cursor
+            let top = cursor
                 .stack
                 .last()
-                .ok_or_else(|| FrankenError::internal("cursor stack is empty"))?
-                .cell_idx;
+                .ok_or_else(|| FrankenError::internal("cursor stack is empty"))?;
+            let mut insert_idx = if cursor.at_eof {
+                top.header.cell_count
+            } else {
+                top.cell_idx
+            };
             if seek.is_found() {
                 // Index allows duplicate keys; place after the existing one.
                 insert_idx = insert_idx.saturating_add(1);
@@ -1579,11 +1604,15 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
                 return Err(FrankenError::PrimaryKeyViolation);
             }
 
-            let insert_idx = cursor
+            let top = cursor
                 .stack
                 .last()
-                .ok_or_else(|| FrankenError::internal("cursor stack is empty"))?
-                .cell_idx;
+                .ok_or_else(|| FrankenError::internal("cursor stack is empty"))?;
+            let insert_idx = if cursor.at_eof {
+                top.header.cell_count
+            } else {
+                top.cell_idx
+            };
 
             let (cell_data, overflow_head) = cursor.encode_table_leaf_cell(cx, rowid, data)?;
 
@@ -2374,6 +2403,92 @@ mod tests {
 
         assert!(cursor.table_move_to(&cx, 42).unwrap().is_found());
         assert_eq!(cursor.payload(&cx).unwrap(), payload);
+    }
+
+    #[test]
+    fn test_cursor_table_seek_past_end_then_insert() {
+        let mut store = MemPageStore::new(USABLE);
+        store.pages.insert(2, build_leaf_table(&[(1, b"one"), (2, b"two")]));
+
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+
+        let seek = cursor.table_move_to(&cx, 99).unwrap();
+        assert!(!seek.is_found());
+        assert!(cursor.eof(), "seek past end should set eof");
+
+        cursor.table_insert(&cx, 99, b"tail").unwrap();
+        assert!(cursor.table_move_to(&cx, 99).unwrap().is_found());
+        assert_eq!(cursor.payload(&cx).unwrap(), b"tail");
+    }
+
+    #[test]
+    fn test_cursor_index_seek_past_end_then_insert() {
+        let mut store = MemPageStore::new(USABLE);
+        store.pages.insert(2, build_leaf_index(&[b"alpha", b"mid"]));
+
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(store, pn(2), USABLE, false);
+        let key = b"zz-top";
+
+        let seek = cursor.index_move_to(&cx, key).unwrap();
+        assert!(!seek.is_found());
+        assert!(cursor.eof(), "seek past end should set eof");
+
+        cursor.index_insert(&cx, key).unwrap();
+        assert!(cursor.index_move_to(&cx, key).unwrap().is_found());
+        assert_eq!(cursor.payload(&cx).unwrap(), key);
+    }
+
+    #[test]
+    fn test_cursor_prev_from_seek_past_end_lands_on_last_entry() {
+        let mut store = MemPageStore::new(USABLE);
+        store.pages.insert(2, build_leaf_table(&[(1, b"a"), (2, b"b"), (3, b"c")]));
+
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+
+        let seek = cursor.table_move_to(&cx, 99).unwrap();
+        assert!(!seek.is_found());
+        assert!(cursor.eof());
+
+        assert!(cursor.prev(&cx).unwrap());
+        assert_eq!(cursor.rowid(&cx).unwrap(), 3);
+    }
+
+    #[test]
+    fn test_cursor_next_after_prev_from_first_recovers() {
+        let mut store = MemPageStore::new(USABLE);
+        store.pages.insert(2, build_leaf_table(&[(1, b"a"), (2, b"b"), (3, b"c")]));
+
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+
+        assert!(cursor.first(&cx).unwrap());
+        assert_eq!(cursor.rowid(&cx).unwrap(), 1);
+        assert!(!cursor.prev(&cx).unwrap());
+
+        assert!(cursor.next(&cx).unwrap());
+        assert_eq!(cursor.rowid(&cx).unwrap(), 1);
+        assert!(cursor.next(&cx).unwrap());
+        assert_eq!(cursor.rowid(&cx).unwrap(), 2);
+    }
+
+    #[test]
+    fn test_cursor_prev_after_next_from_last_recovers() {
+        let mut store = MemPageStore::new(USABLE);
+        store.pages.insert(2, build_leaf_table(&[(1, b"a"), (2, b"b"), (3, b"c")]));
+
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+
+        assert!(cursor.last(&cx).unwrap());
+        assert_eq!(cursor.rowid(&cx).unwrap(), 3);
+        assert!(!cursor.next(&cx).unwrap());
+        assert!(cursor.eof());
+
+        assert!(cursor.prev(&cx).unwrap());
+        assert_eq!(cursor.rowid(&cx).unwrap(), 3);
     }
 
     #[test]
