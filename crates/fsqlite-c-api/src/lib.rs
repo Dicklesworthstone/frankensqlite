@@ -8,9 +8,17 @@
 // Log level: INFO API calls via compat layer, WARN for unsupported features.
 // Metric: fsqlite_compat_api_calls_total counter by api_func.
 
-#![allow(unsafe_code, unsafe_op_in_unsafe_fn)]
+#![allow(
+    unsafe_code,
+    unsafe_op_in_unsafe_fn,
+    clippy::borrow_as_ptr,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap
+)]
 
 use std::ffi::{CStr, CString};
+use std::fmt::Write as _;
 use std::os::raw::{c_char, c_double, c_int, c_void};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::LazyLock;
@@ -185,20 +193,15 @@ pub unsafe extern "C" fn sqlite3_open(
 
     let path = if filename.is_null() {
         ":memory:".to_owned()
-    } else {
-        match CStr::from_ptr(filename).to_str() {
-            Ok(s) => {
-                if s.is_empty() {
-                    ":memory:".to_owned()
-                } else {
-                    s.to_owned()
-                }
-            }
-            Err(_) => {
-                *pp_db = std::ptr::null_mut();
-                return SQLITE_CANTOPEN;
-            }
+    } else if let Ok(s) = CStr::from_ptr(filename).to_str() {
+        if s.is_empty() {
+            ":memory:".to_owned()
+        } else {
+            s.to_owned()
         }
+    } else {
+        *pp_db = std::ptr::null_mut();
+        return SQLITE_CANTOPEN;
     };
 
     tracing::info!(target: "fsqlite.compat", path = %path, "sqlite3_open");
@@ -282,9 +285,8 @@ pub unsafe extern "C" fn sqlite3_exec(
     }
 
     let handle = &*db;
-    let sql_str = match CStr::from_ptr(sql).to_str() {
-        Ok(s) => s,
-        Err(_) => return SQLITE_ERROR,
+    let Ok(sql_str) = CStr::from_ptr(sql).to_str() else {
+        return SQLITE_ERROR;
     };
 
     tracing::info!(target: "fsqlite.compat", sql = %sql_str, "sqlite3_exec");
@@ -319,7 +321,7 @@ pub unsafe extern "C" fn sqlite3_exec(
                                 let mut hex = String::with_capacity(2 + b.len() * 2);
                                 hex.push_str("X'");
                                 for byte in b {
-                                    hex.push_str(&format!("{byte:02X}"));
+                                    let _ = write!(hex, "{byte:02X}");
                                 }
                                 hex.push('\'');
                                 hex
@@ -338,6 +340,9 @@ pub unsafe extern "C" fn sqlite3_exec(
 
                     let rc =
                         cb(parg, ncols, c_values.as_mut_ptr(), c_names.as_mut_ptr());
+                    // Keep owned CStrings alive until the callback returns.
+                    drop(owned_vals);
+                    drop(owned_names);
                     if rc != 0 {
                         handle.set_error(&FrankenError::Abort);
                         return SQLITE_ABORT;
@@ -535,10 +540,10 @@ pub unsafe extern "C" fn sqlite3_step(stmt: *mut Sqlite3Stmt) -> c_int {
     if let Some(ref rows) = s.rows {
         if s.cursor < rows.len() {
             // Clear text cache for this row.
-            let ncols = if !rows.is_empty() {
-                rows[s.cursor].values().len()
-            } else {
+            let ncols = if rows.is_empty() {
                 0
+            } else {
+                rows[s.cursor].values().len()
             };
             s.text_cache = vec![None; ncols];
 
@@ -716,7 +721,7 @@ pub unsafe extern "C" fn sqlite3_column_text(
             // Return blob as hex string for text accessor.
             let mut hex = String::with_capacity(b.len() * 2);
             for byte in b {
-                hex.push_str(&format!("{byte:02X}"));
+                let _ = write!(hex, "{byte:02X}");
             }
             hex
         }
@@ -724,26 +729,25 @@ pub unsafe extern "C" fn sqlite3_column_text(
     };
 
     let s = &mut *stmt;
-    if let Ok(cstr) = CString::new(text) {
-        // Cache the CString so the pointer stays valid.
-        if (i_col as usize) < s.text_cache.len() {
-            s.text_cache[i_col as usize] = Some(cstr);
-            // Re-read the pointer from the cached location.
-            return s.text_cache[i_col as usize]
-                .as_ref()
-                .map_or(std::ptr::null(), |c| c.as_ptr());
-        }
-        // Fallback: extend cache.
-        while s.text_cache.len() <= i_col as usize {
-            s.text_cache.push(None);
-        }
+    let Ok(cstr) = CString::new(text) else {
+        return std::ptr::null();
+    };
+    // Cache the CString so the pointer stays valid.
+    if (i_col as usize) < s.text_cache.len() {
         s.text_cache[i_col as usize] = Some(cstr);
+        // Re-read the pointer from the cached location.
         return s.text_cache[i_col as usize]
             .as_ref()
             .map_or(std::ptr::null(), |c| c.as_ptr());
     }
-
-    std::ptr::null()
+    // Fallback: extend cache.
+    while s.text_cache.len() <= i_col as usize {
+        s.text_cache.push(None);
+    }
+    s.text_cache[i_col as usize] = Some(cstr);
+    s.text_cache[i_col as usize]
+        .as_ref()
+        .map_or(std::ptr::null(), |c| c.as_ptr())
 }
 
 /// Get a blob pointer from column `i_col`.
@@ -765,17 +769,14 @@ pub unsafe extern "C" fn sqlite3_column_blob(
     }
 
     let s = &*stmt;
-    let rows = match s.rows.as_ref() {
-        Some(r) => r,
-        None => return std::ptr::null(),
+    let Some(rows) = s.rows.as_ref() else {
+        return std::ptr::null();
     };
-    let row_idx = match s.cursor.checked_sub(1) {
-        Some(i) => i,
-        None => return std::ptr::null(),
+    let Some(row_idx) = s.cursor.checked_sub(1) else {
+        return std::ptr::null();
     };
-    let row = match rows.get(row_idx) {
-        Some(r) => r,
-        None => return std::ptr::null(),
+    let Some(row) = rows.get(row_idx) else {
+        return std::ptr::null();
     };
 
     match row.get(i_col as usize) {
@@ -811,10 +812,8 @@ pub unsafe extern "C" fn sqlite3_column_bytes(
     match current_value(stmt, i_col) {
         Some(SqliteValue::Blob(b)) => b.len() as c_int,
         Some(SqliteValue::Text(s)) => s.len() as c_int,
-        Some(SqliteValue::Integer(_)) => {
-            // SQLite returns the byte length of the text representation.
-            0
-        }
+        // SQLite returns the byte length of the text representation for integers;
+        // we return 0 for all other types.
         _ => 0,
     }
 }
@@ -827,10 +826,10 @@ pub unsafe extern "C" fn sqlite3_column_bytes(
 /// `db` must be a valid handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sqlite3_errmsg(db: *mut Sqlite3) -> *const c_char {
-    COMPAT_ERRMSG.fetch_add(1, Ordering::Relaxed);
-
     static DEFAULT_MSG: LazyLock<CString> =
         LazyLock::new(|| CString::new("not an error").expect("static"));
+
+    COMPAT_ERRMSG.fetch_add(1, Ordering::Relaxed);
 
     if db.is_null() {
         return DEFAULT_MSG.as_ptr();
@@ -930,6 +929,17 @@ mod tests {
     #[test]
     fn test_exec_create_insert_select() {
         unsafe {
+            unsafe extern "C" fn count_cb(
+                parg: *mut c_void,
+                _ncols: c_int,
+                _values: *mut *mut c_char,
+                _names: *mut *mut c_char,
+            ) -> c_int {
+                let counter = &*(parg.cast::<AtomicU64>());
+                counter.fetch_add(1, Ordering::Relaxed);
+                0
+            }
+
             let db = open_memory();
 
             let sql = CString::new(
@@ -948,24 +958,13 @@ mod tests {
             assert_eq!(rc, SQLITE_OK);
 
             // SELECT with callback: pass counter through parg.
-            unsafe extern "C" fn count_cb(
-                parg: *mut c_void,
-                _ncols: c_int,
-                _values: *mut *mut c_char,
-                _names: *mut *mut c_char,
-            ) -> c_int {
-                let counter = &*(parg.cast::<AtomicU64>());
-                counter.fetch_add(1, Ordering::Relaxed);
-                0
-            }
-
             let row_count = AtomicU64::new(0);
             let sql = CString::new("SELECT * FROM t1;").unwrap();
             let rc = sqlite3_exec(
                 db,
                 sql.as_ptr(),
                 Some(count_cb),
-                (&row_count as *const AtomicU64).cast_mut().cast(),
+                std::ptr::from_ref::<AtomicU64>(&row_count).cast_mut().cast(),
                 ptr::null_mut(),
             );
             assert_eq!(rc, SQLITE_OK);
@@ -1044,6 +1043,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::approx_constant)]
     fn test_column_type_variants() {
         unsafe {
             let db = open_memory();
@@ -1270,14 +1270,6 @@ mod tests {
     #[test]
     fn test_exec_callback_abort() {
         unsafe {
-            let db = open_memory();
-
-            let sql = CString::new(
-                "CREATE TABLE t1(x); INSERT INTO t1 VALUES(1); INSERT INTO t1 VALUES(2);",
-            )
-            .unwrap();
-            sqlite3_exec(db, sql.as_ptr(), None, ptr::null_mut(), ptr::null_mut());
-
             unsafe extern "C" fn abort_cb(
                 _parg: *mut c_void,
                 _ncols: c_int,
@@ -1286,6 +1278,14 @@ mod tests {
             ) -> c_int {
                 1 // non-zero → abort
             }
+
+            let db = open_memory();
+
+            let sql = CString::new(
+                "CREATE TABLE t1(x); INSERT INTO t1 VALUES(1); INSERT INTO t1 VALUES(2);",
+            )
+            .unwrap();
+            sqlite3_exec(db, sql.as_ptr(), None, ptr::null_mut(), ptr::null_mut());
 
             let sql = CString::new("SELECT * FROM t1;").unwrap();
             let rc = sqlite3_exec(
