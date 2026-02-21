@@ -603,9 +603,14 @@ impl<'a> Lexer<'a> {
                 return TokenKind::Error("empty hex literal".to_owned());
             }
             let hex_str = String::from_utf8_lossy(&self.src[hex_start..self.pos]);
+            let parse_str = if hex_str.len() > 16 {
+                &hex_str[hex_str.len() - 16..]
+            } else {
+                &hex_str
+            };
             // Parse as u64 and bitwise-cast to i64 — matching C SQLite's
             // sqlite3DecOrHexToI64 which uses memcpy(pOut, &u, 8).
-            return match u64::from_str_radix(&hex_str, 16) {
+            return match u64::from_str_radix(parse_str, 16) {
                 Ok(v) => {
                     #[allow(clippy::cast_possible_wrap)]
                     let i = v as i64;

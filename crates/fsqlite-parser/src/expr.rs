@@ -364,17 +364,14 @@ impl Parser {
         let tok = self.advance_token();
         match &tok.kind {
             TokenKind::KwCollate => {
-                let name_tok = self.advance_token();
-                let collation = match &name_tok.kind {
-                    TokenKind::Id(s) | TokenKind::QuotedId(s, _) => s.clone(),
-                    _ => {
-                        return Err(ParseError::at(
-                            "expected collation name after COLLATE",
-                            Some(&name_tok),
-                        ));
+                let collation = match self.parse_identifier() {
+                    Ok(s) => s,
+                    Err(_) => {
+                        return Err(self.err_here("expected collation name after COLLATE"));
                     }
                 };
-                let span = lhs.span().merge(name_tok.span);
+                let name_span = self.tokens[self.pos.saturating_sub(1)].span;
+                let span = lhs.span().merge(name_span);
                 Ok(Expr::Collate {
                     expr: Box::new(lhs),
                     collation,
@@ -643,9 +640,12 @@ impl Parser {
             });
         }
 
-        let mut exprs = vec![self.parse_expr()?];
-        while self.eat_kind(&TokenKind::Comma) {
+        let mut exprs = Vec::new();
+        if !self.at_kind(&TokenKind::RightParen) {
             exprs.push(self.parse_expr()?);
+            while self.eat_kind(&TokenKind::Comma) {
+                exprs.push(self.parse_expr()?);
+            }
         }
         let end = self.expect_kind(&TokenKind::RightParen)?;
         let span = start.merge(end);

@@ -1205,6 +1205,7 @@ impl Parser {
                 | TokenKind::KwReferences
                 | TokenKind::KwGenerated
                 | TokenKind::KwConstraint
+                | TokenKind::KwAs
         )
     }
 
@@ -1256,9 +1257,11 @@ impl Parser {
             ColumnConstraintKind::Collate(self.parse_identifier()?)
         } else if self.eat_kw(&TokenKind::KwReferences) {
             ColumnConstraintKind::ForeignKey(self.parse_fk_clause()?)
-        } else if self.eat_kw(&TokenKind::KwGenerated) {
-            let _ = self.eat_kw(&TokenKind::KwAlways);
-            let _ = self.eat_kw(&TokenKind::KwAs);
+        } else if self.eat_kw(&TokenKind::KwGenerated) || self.eat_kw(&TokenKind::KwAs) {
+            if self.tokens[self.pos.saturating_sub(1)].kind == TokenKind::KwGenerated {
+                let _ = self.eat_kw(&TokenKind::KwAlways);
+                let _ = self.eat_kw(&TokenKind::KwAs);
+            }
             self.expect_token(&TokenKind::LeftParen)?;
             let expr = self.parse_expr()?;
             self.expect_token(&TokenKind::RightParen)?;
