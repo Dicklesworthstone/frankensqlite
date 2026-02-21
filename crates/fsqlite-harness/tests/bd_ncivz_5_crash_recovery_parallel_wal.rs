@@ -471,7 +471,7 @@ fn multi_epoch_consolidator_with_interleaved_batches() {
     let batches = consolidator.begin_flush().unwrap();
     assert_eq!(batches.len(), 3);
     // Total frames across batches.
-    let total_frames: usize = batches.iter().map(|b| b.frame_count()).sum();
+    let total_frames: usize = batches.iter().map(fsqlite_wal::TransactionFrameBatch::frame_count).sum();
     assert_eq!(total_frames, 6);
 
     consolidator.complete_flush().unwrap();
@@ -511,6 +511,7 @@ fn conformance_summary() {
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
+#[allow(clippy::cast_possible_truncation)]
 fn make_batch(num_frames: usize) -> TransactionFrameBatch {
     let frames: Vec<_> = (0..num_frames)
         .map(|i| FrameSubmission {

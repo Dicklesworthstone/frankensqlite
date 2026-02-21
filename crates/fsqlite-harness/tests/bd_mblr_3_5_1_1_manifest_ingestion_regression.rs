@@ -9,9 +9,9 @@
 use std::collections::BTreeMap;
 
 use fsqlite_harness::validation_manifest::{
-    GateOutcome, ValidationManifest, ValidationManifestConfig,
+    ValidationManifest, ValidationManifestConfig,
     COVERAGE_GATE_ID, INVARIANT_DRIFT_GATE_ID, LOGGING_GATE_ID, NO_MOCK_GATE_ID,
-    SCENARIO_DRIFT_GATE_ID, VALIDATION_MANIFEST_SCENARIO_ID, VALIDATION_MANIFEST_SCHEMA_VERSION,
+    SCENARIO_DRIFT_GATE_ID, VALIDATION_MANIFEST_SCENARIO_ID,
     build_validation_manifest_bundle, detect_backward_incompatible_change,
     validate_manifest_contract,
 };

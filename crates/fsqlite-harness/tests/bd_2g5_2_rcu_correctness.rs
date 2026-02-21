@@ -267,13 +267,13 @@ fn test_stress_no_torn_reads() {
         r.join().unwrap();
     }
 
-    let writes = global_writes.load(Ordering::Relaxed);
+    let total_writes = global_writes.load(Ordering::Relaxed);
     let reads = global_reads.load(Ordering::Relaxed);
 
-    assert!(writes > 0, "writer must complete some publishes");
+    assert!(total_writes > 0, "writer must complete some publishes");
     assert!(reads > 0, "readers must complete some reads");
 
-    println!("[PASS] stress no-torn-reads: writes={writes} reads={reads}");
+    println!("[PASS] stress no-torn-reads: writes={total_writes} reads={reads}");
 }
 
 // ---------------------------------------------------------------------------
@@ -281,6 +281,7 @@ fn test_stress_no_torn_reads() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn test_conformance_summary() {
     struct TestResult {
         name: &'static str,

@@ -109,7 +109,7 @@ fn test_e2e_commit_pipeline_cancel_safety() {
 
     let expected_messages = total_writers.saturating_sub(cancelled_before_send_count);
 
-    let (pipeline, receiver) = CommitPipeline::with_default_capacity();
+    let (pipeline, mut receiver) = CommitPipeline::with_default_capacity();
 
     let (ready_tx, ready_rx) = mpsc::channel::<()>();
     let (done_tx, done_rx) = mpsc::channel::<()>();

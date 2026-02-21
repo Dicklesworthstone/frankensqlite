@@ -10,7 +10,7 @@ use std::sync::Arc;
 use proptest::prelude::*;
 
 use fsqlite_btree::swizzle::{
-    PageTemperature, SwizzleError, SwizzlePtr, SwizzleRegistry, SwizzleState,
+    PageTemperature, SwizzlePtr, SwizzleRegistry, SwizzleState,
     MAX_PAGE_ID, SWIZZLED_TAG,
 };
 
@@ -182,7 +182,7 @@ proptest! {
 #[test]
 fn test_temperature_fsm_exhaustive() {
     // Exhaustively test all 9 (from, to) pairs.
-    let temps = [PageTemperature::Hot, PageTemperature::Cooling, PageTemperature::Cold];
+    let _temps = [PageTemperature::Hot, PageTemperature::Cooling, PageTemperature::Cold];
 
     let expected_valid = [
         // (Hot, Hot), (Hot, Cooling)

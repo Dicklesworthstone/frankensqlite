@@ -200,7 +200,7 @@ fn artifact_upload_on_passing_lane() {
         "abc1234",
         42,
         true,
-        result.artifacts.clone(),
+        result.artifacts,
         None,
     );
 
@@ -234,7 +234,7 @@ fn artifact_upload_on_failing_lane_includes_repro_bundles() {
         "def5678",
         43,
         false,
-        result.artifacts.clone(),
+        result.artifacts,
         None,
     );
 

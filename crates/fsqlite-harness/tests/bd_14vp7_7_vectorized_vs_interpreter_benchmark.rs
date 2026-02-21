@@ -8,6 +8,15 @@
 //! Validates: result correctness (same aggregates), speedup ratios, deterministic
 //! results across worker counts, and metrics reporting.
 
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::cast_lossless,
+    clippy::unreadable_literal
+)]
+
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -151,16 +160,13 @@ fn vectorized_q6(batch: &Batch) -> (f64, usize) {
 }
 
 /// Interpreter baseline: compute Q1 aggregate by iterating rows.
+#[allow(clippy::type_complexity)]
 fn interpreter_q1(rows: &[Vec<SqliteValue>]) -> (Vec<(i64, i64, i64, f64, usize)>, usize) {
-    use std::collections::HashMap;
     let mut groups: HashMap<(i64, i64), (i64, f64, usize)> = HashMap::new();
     let mut filtered_count = 0usize;
 
     for row in rows {
-        let quantity = match row[0] {
-            SqliteValue::Integer(v) => v,
-            _ => continue,
-        };
+        let SqliteValue::Integer(quantity) = row[0] else { continue };
         if quantity > 24 {
             continue;
         }
@@ -197,20 +203,11 @@ fn interpreter_q6(rows: &[Vec<SqliteValue>]) -> (f64, usize) {
     let mut revenue = 0.0f64;
     let mut count = 0usize;
     for row in rows {
-        let quantity = match row[0] {
-            SqliteValue::Integer(v) => v,
-            _ => continue,
-        };
-        let price = match row[1] {
-            SqliteValue::Float(v) => v,
-            _ => continue,
-        };
-        let discount = match row[2] {
-            SqliteValue::Float(v) => v,
-            _ => continue,
-        };
+        let SqliteValue::Integer(quantity) = row[0] else { continue };
+        let SqliteValue::Float(price) = row[1] else { continue };
+        let SqliteValue::Float(discount) = row[2] else { continue };
 
-        if quantity < 24 && discount >= 0.05 && discount <= 0.07 {
+        if quantity < 24 && (0.05..=0.07).contains(&discount) {
             revenue += price * discount;
             count += 1;
         }
@@ -552,7 +549,6 @@ fn test_hash_join_benchmark() {
     let interp_start = Instant::now();
     for _ in 0..10 {
         let mut result_count = 0usize;
-        use std::collections::HashMap;
         let mut ht_interp: HashMap<i64, Vec<usize>> = HashMap::new();
         for (i, row) in build_rows.iter().enumerate() {
             if let SqliteValue::Integer(k) = row[0] {
@@ -661,7 +657,7 @@ fn test_conformance_summary() {
 
     // 3. Vectorized filter works.
     let sel = filter_batch_int64(&batch, 0, CompareOp::Le, 24).unwrap();
-    let pass_filter = sel.len() > 0 && sel.len() < rows.len();
+    let pass_filter = !sel.is_empty() && sel.len() < rows.len();
 
     // 4. Aggregate produces groups.
     let (agg_result, _) = vectorized_q1(&batch);

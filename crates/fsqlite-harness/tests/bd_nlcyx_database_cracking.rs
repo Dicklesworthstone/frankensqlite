@@ -326,7 +326,8 @@ fn test_edge_cases() {
     assert!(empty.is_empty());
     assert_eq!(empty.len(), 0);
     assert!(empty.is_fully_sorted());
-    assert_eq!(empty.avg_segment_size(), 0.0);
+    #[allow(clippy::float_cmp)]
+    { assert_eq!(empty.avg_segment_size(), 0.0); }
 
     // Single element.
     let mut single = CrackedColumn::new(vec![42u32]);
@@ -365,7 +366,7 @@ fn test_edge_cases() {
 #[test]
 fn test_conformance_summary() {
     let data = make_reversed_column(50);
-    let mut col = CrackedColumn::new(data.clone());
+    let mut col = CrackedColumn::new(data);
 
     // Property 1: Range query returns correct elements.
     let result = col.range_query(10, 20);

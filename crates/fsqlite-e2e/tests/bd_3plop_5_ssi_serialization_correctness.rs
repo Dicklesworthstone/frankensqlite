@@ -333,6 +333,7 @@ fn run_worker(db_path: &Path, worker_id: usize, txns_per_worker: usize, seed: u6
     result
 }
 
+#[allow(clippy::type_complexity)]
 fn execute_single_txn(
     conn: &fsqlite::Connection,
     rng: &mut StdRng,

@@ -64,17 +64,17 @@ fn test_waitfree_reads_under_writer() {
     thread::sleep(Duration::from_millis(300));
     stop.store(true, Ordering::Release);
 
-    let writes = writer.join().unwrap();
+    let write_count = writer.join().unwrap();
     for r in readers {
         r.join().unwrap();
     }
     let reads = read_count.load(Ordering::Relaxed);
 
-    assert!(writes > 0, "writer must have written");
+    assert!(write_count > 0, "writer must have written");
     assert!(reads > 0, "readers must have read");
 
     println!(
-        "[PASS] Wait-free reads: writes={writes} reads={reads} (all succeeded, no blocking)"
+        "[PASS] Wait-free reads: writes={write_count} reads={reads} (all succeeded, no blocking)"
     );
 }
 
@@ -83,6 +83,7 @@ fn test_waitfree_reads_under_writer() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[allow(clippy::needless_collect)]
 fn test_pair_consistency() {
     let lr = Arc::new(LeftRightPair::new(0, 0));
     let stop = Arc::new(AtomicBool::new(false));
@@ -144,6 +145,7 @@ fn test_pair_consistency() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[allow(clippy::needless_collect)]
 fn test_triple_consistency() {
     let lr = Arc::new(LeftRightTriple::new(0, 0, 0));
     let stop = Arc::new(AtomicBool::new(false));
@@ -185,14 +187,14 @@ fn test_triple_consistency() {
     thread::sleep(Duration::from_millis(400));
     stop.store(true, Ordering::Release);
 
-    let writes = writer.join().unwrap();
+    let write_count = writer.join().unwrap();
     let total_reads: u64 = readers.into_iter().map(|r| r.join().unwrap()).sum();
 
-    assert!(writes > 0);
+    assert!(write_count > 0);
     assert!(total_reads > 0);
 
     println!(
-        "[PASS] Triple consistency: {writes} writes, {total_reads} reads, zero torn"
+        "[PASS] Triple consistency: {write_count} writes, {total_reads} reads, zero torn"
     );
 }
 
@@ -201,6 +203,7 @@ fn test_triple_consistency() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[allow(clippy::cast_possible_truncation)]
 fn test_leftright_vs_mutex_latency() {
     let iterations = 100_000u64;
 
@@ -274,18 +277,18 @@ fn test_read_dominated_ratio() {
     thread::sleep(Duration::from_millis(300));
     stop.store(true, Ordering::Release);
 
-    let writes = writer.join().unwrap();
+    let write_count = writer.join().unwrap();
     for r in readers {
         r.join().unwrap();
     }
     let reads = read_count.load(Ordering::Relaxed);
 
-    assert!(writes > 0);
+    assert!(write_count > 0);
     assert!(reads > 0);
-    let ratio = reads / writes.max(1);
+    let ratio = reads / write_count.max(1);
 
     println!(
-        "[PASS] Read-dominated: writes={writes} reads={reads} ratio={ratio}:1"
+        "[PASS] Read-dominated: writes={write_count} reads={reads} ratio={ratio}:1"
     );
 }
 
@@ -441,14 +444,14 @@ fn test_pair_monotonic_progression() {
     thread::sleep(Duration::from_millis(300));
     stop.store(true, Ordering::Release);
 
-    let writes = writer.join().unwrap();
+    let write_count = writer.join().unwrap();
     let checks = reader.join().unwrap();
 
-    assert!(writes > 0);
+    assert!(write_count > 0);
     assert!(checks > 0);
 
     println!(
-        "[PASS] Pair monotonic: {writes} writes, {checks} checks, never decreased"
+        "[PASS] Pair monotonic: {write_count} writes, {checks} checks, never decreased"
     );
 }
 

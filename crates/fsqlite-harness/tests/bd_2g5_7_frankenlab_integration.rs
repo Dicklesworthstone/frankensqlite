@@ -304,7 +304,7 @@ fn test_schedule_exploration() {
 
     // Count distinct fingerprints (different seeds may produce different schedules).
     let mut unique = all_fingerprints.clone();
-    unique.sort();
+    unique.sort_unstable();
     unique.dedup();
 
     tracing::info!(
@@ -382,6 +382,7 @@ fn test_trace_certificates() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn test_conformance_summary() {
     struct TestResult {
         name: &'static str,

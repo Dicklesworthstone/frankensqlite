@@ -5,7 +5,7 @@
 //! metrics fidelity.
 
 use fsqlite_btree::be_tree::{
-    BeTree, BeTreeConfig, BeTreeMetricsSnapshot, betree_metrics_snapshot, reset_betree_metrics,
+    BeTree, BeTreeConfig, betree_metrics_snapshot, reset_betree_metrics,
 };
 
 const BEAD_ID: &str = "bd-3ta.4";
@@ -199,6 +199,7 @@ fn test_range_query_with_deletes() {
 // ── 6. Large-scale correctness ───────────────────────────────────────────
 
 #[test]
+#[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 fn test_large_scale_correctness() {
     let config = BeTreeConfig {
         buffer_capacity: 8,

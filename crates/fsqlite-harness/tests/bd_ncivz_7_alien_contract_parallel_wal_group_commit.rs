@@ -394,7 +394,7 @@ fn wal_journal_parity_infrastructure() {
     assert!(config.require_mode_transitions);
 
     // Schema version.
-    assert!(WAL_JOURNAL_SCHEMA_VERSION >= 1);
+    const { assert!(WAL_JOURNAL_SCHEMA_VERSION >= 1) };
 
     // Verdict variants.
     assert_eq!(ParityVerdict::Parity.to_string(), "PARITY");
@@ -434,7 +434,7 @@ fn concurrent_writer_parity_invariant_areas() {
     assert_eq!(config.min_writer_concurrency, 2);
 
     // Schema version and verdict.
-    assert!(CONCURRENT_WRITER_SCHEMA_VERSION >= 1);
+    const { assert!(CONCURRENT_WRITER_SCHEMA_VERSION >= 1) };
     assert_eq!(ConcurrentWriterVerdict::Parity.to_string(), "PARITY");
     assert_eq!(ConcurrentWriterVerdict::Regression.to_string(), "REGRESSION");
 }
@@ -450,7 +450,7 @@ fn replay_harness_regime_classification() {
     assert_eq!(Regime::ShiftDetected.to_string(), "shift_detected");
 
     // Schema version.
-    assert!(REPLAY_SCHEMA_VERSION >= 1);
+    const { assert!(REPLAY_SCHEMA_VERSION >= 1) };
 
     // Equality.
     assert_eq!(Regime::Stable, Regime::Stable);

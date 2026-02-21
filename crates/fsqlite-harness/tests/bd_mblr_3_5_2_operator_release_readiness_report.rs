@@ -10,7 +10,7 @@
 use fsqlite_harness::validation_manifest::{
     GateOutcome, ValidationManifest, ValidationManifestConfig,
     COVERAGE_GATE_ID, INVARIANT_DRIFT_GATE_ID, LOGGING_GATE_ID, NO_MOCK_GATE_ID,
-    SCENARIO_DRIFT_GATE_ID, VALIDATION_MANIFEST_SCENARIO_ID, VALIDATION_MANIFEST_SCHEMA_VERSION,
+    SCENARIO_DRIFT_GATE_ID, VALIDATION_MANIFEST_SCENARIO_ID,
     build_validation_manifest_bundle, validate_manifest_contract,
 };
 
@@ -255,14 +255,14 @@ fn artifact_links_resolve_to_content() {
 fn artifact_content_is_parseable_for_drilldown() {
     let bundle = build_bundle();
     for (uri, content) in &bundle.gate_artifacts {
-        if uri.ends_with(".json") {
+        if std::path::Path::new(uri.as_str()).extension().is_some_and(|ext| ext.eq_ignore_ascii_case("json")) {
             let parsed: Result<serde_json::Value, _> = serde_json::from_str(content);
             assert!(
                 parsed.is_ok(),
                 "artifact {uri} must be parseable JSON for drill-down: {}",
                 parsed.unwrap_err()
             );
-        } else if uri.ends_with(".jsonl") {
+        } else if std::path::Path::new(uri.as_str()).extension().is_some_and(|ext| ext.eq_ignore_ascii_case("jsonl")) {
             for line in content.lines() {
                 if line.trim().is_empty() {
                     continue;
@@ -415,7 +415,7 @@ fn readiness_manifest_passes_contract() {
 fn all_artifact_uris_are_in_top_level_index() {
     let bundle = build_bundle();
     let top_level: std::collections::BTreeSet<&str> =
-        bundle.manifest.artifact_uris.iter().map(|u| u.as_str()).collect();
+        bundle.manifest.artifact_uris.iter().map(String::as_str).collect();
 
     for gate in &bundle.manifest.gates {
         for uri in &gate.artifact_uris {

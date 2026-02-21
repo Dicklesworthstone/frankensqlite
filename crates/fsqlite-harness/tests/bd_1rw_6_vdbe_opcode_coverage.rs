@@ -28,6 +28,7 @@ fn open_mem() -> Connection {
     Connection::open(":memory:").expect("in-memory connection")
 }
 
+#[allow(dead_code)]
 fn row_values(row: &fsqlite::Row) -> Vec<SqliteValue> {
     row.values().to_vec()
 }

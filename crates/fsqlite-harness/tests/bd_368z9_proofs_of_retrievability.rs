@@ -65,7 +65,7 @@ fn test_challenge_determinism() {
 #[test]
 fn test_challenge_diversity() {
     let seeds = [1u64, 2, 42, 0xCAFE, 0xBEEF, 0xDEAD];
-    let mut challenges: Vec<PorChallenge> = seeds
+    let challenges: Vec<PorChallenge> = seeds
         .iter()
         .map(|&s| PorChallenge::from_seed(s, 1000, 20))
         .collect();

@@ -81,6 +81,7 @@ fn tpch_tables() -> Vec<TableStats> {
     ]
 }
 
+#[allow(dead_code)]
 fn tpch_indexes() -> Vec<IndexInfo> {
     vec![
         IndexInfo {

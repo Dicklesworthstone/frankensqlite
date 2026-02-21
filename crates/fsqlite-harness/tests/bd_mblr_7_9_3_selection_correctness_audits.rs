@@ -8,7 +8,7 @@
 use fsqlite_harness::ci_gate_matrix::CiLane;
 use fsqlite_harness::impact_graph::ImpactGraph;
 use fsqlite_harness::lane_selector::{
-    LaneSelectionAuditConfig, LaneSelectionAuditReport, LaneSelectionReport,
+    LaneSelectionAuditConfig, LaneSelectionReport,
     LaneSelectionVerdict, LANE_SELECTION_BEAD_ID, load_lane_audit_report,
     run_lane_selection_audit, select_ci_lanes_for_paths, write_lane_audit_report,
 };

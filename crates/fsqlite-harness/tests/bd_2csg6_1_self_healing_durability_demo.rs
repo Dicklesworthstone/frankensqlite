@@ -57,6 +57,7 @@ fn build_group(
     (meta, repair_symbols)
 }
 
+#[allow(clippy::type_complexity)]
 fn build_all_groups(original_pages: &[Vec<u8>]) -> Vec<(DbFecGroupMeta, Vec<(u32, Vec<u8>)>)> {
     let num_groups = TOTAL_PAGES / GROUP_K;
     (0..num_groups)
@@ -71,11 +72,12 @@ fn build_all_groups(original_pages: &[Vec<u8>]) -> Vec<(DbFecGroupMeta, Vec<(u32
 }
 
 /// Apply bit-flip corruption to a page (deterministic, LCG-based).
+#[allow(clippy::cast_possible_truncation)]
 fn corrupt_bit_flip(data: &mut [u8], seed: u64) {
     let mut state = seed;
     let flips = 4;
     for _ in 0..flips {
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
         let byte_idx = (state >> 16) as usize % data.len();
         let bit_idx = (state >> 8) as u8 % 8;
         data[byte_idx] ^= 1 << bit_idx;
@@ -115,7 +117,7 @@ fn test_encode_repair_symbols() {
     }
 
     let num_groups = TOTAL_PAGES / GROUP_K;
-    let overhead_pct = (total_repair_symbols as f64 / TOTAL_PAGES as f64) * 100.0;
+    let overhead_pct = (total_repair_symbols as f64 / f64::from(TOTAL_PAGES)) * 100.0;
 
     println!(
         "[{BEAD_ID}] encode: {num_groups} groups, {TOTAL_PAGES} pages, {total_repair_symbols} repair symbols ({overhead_pct:.0}% overhead)"
@@ -141,7 +143,7 @@ fn test_blake3_corruption_detection() {
     );
 
     // Corrupted page should NOT verify.
-    let mut corrupted = page.clone();
+    let mut corrupted = page;
     corrupted[0] ^= 0xFF;
     assert!(
         !verify_page_blake3(&corrupted, &checksum),
@@ -164,7 +166,7 @@ fn test_single_page_repair_with_witness() {
     let expected_blake3 = blake3_page_checksum(original);
 
     let mut corrupted = original.clone();
-    corrupt_bit_flip(&mut corrupted, 0xDEADBEEF);
+    corrupt_bit_flip(&mut corrupted, 0xDEAD_BEEF);
     assert!(!verify_page_blake3(&corrupted, &expected_blake3));
 
     let (ref meta, ref repair_syms) = groups[0]; // Group 0 covers pages 1..=20.
@@ -221,7 +223,7 @@ fn test_multi_page_batch_repair() {
     let corrupt_targets = [2_u32, 7, 14];
     let mut corrupted_pages = pages.clone();
     for &pgno in &corrupt_targets {
-        corrupt_bit_flip(&mut corrupted_pages[(pgno - 1) as usize], pgno as u64 * 12345);
+        corrupt_bit_flip(&mut corrupted_pages[(pgno - 1) as usize], u64::from(pgno) * 12345);
     }
 
     let (ref meta, ref repair_syms) = groups[0];
@@ -400,7 +402,7 @@ fn test_witness_proof_completeness() {
     let expected_blake3 = blake3_page_checksum(original);
 
     let mut corrupted = original.clone();
-    corrupt_bit_flip(&mut corrupted, 0xCAFEBABE);
+    corrupt_bit_flip(&mut corrupted, 0xCAFE_BABE);
 
     let (ref meta, ref repair_syms) = groups[0];
     let all_pages = pages.clone();

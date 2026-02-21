@@ -4,6 +4,8 @@
 //! MVCC divergence cataloging, per-category parity breakdowns, feature matrix
 //! serialization, dashboard report determinism, and conformance summary.
 
+#![allow(clippy::float_cmp)]
+
 use std::collections::BTreeSet;
 
 use fsqlite_harness::parity_taxonomy::{
@@ -368,8 +370,8 @@ fn test_prior_sensitivity_analysis() {
 
     // Prior sensitivity: max spread between estimates should be < 0.3
     // (priors shouldn't drastically change the score with enough data).
-    let max_spread = estimates.iter().cloned().fold(0.0_f64, f64::max)
-        - estimates.iter().cloned().fold(1.0_f64, f64::min);
+    let max_spread = estimates.iter().copied().fold(0.0_f64, f64::max)
+        - estimates.iter().copied().fold(1.0_f64, f64::min);
     println!("[{BEAD_ID}] prior sensitivity spread: {max_spread:.4}");
     assert!(
         max_spread < 0.3,

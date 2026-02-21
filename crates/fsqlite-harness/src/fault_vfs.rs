@@ -794,7 +794,7 @@ impl FaultState {
     }
 
     /// Check if a write should be faulted.
-    #[allow(clippy::significant_drop_tightening)]
+    #[allow(clippy::significant_drop_tightening, clippy::too_many_lines)]
     pub fn check_write(&self, path: &Path, offset: u64, buf_len: usize) -> WriteDecision {
         if self.powered_off.load(Ordering::Acquire) {
             return WriteDecision::PoweredOff;
@@ -1043,6 +1043,7 @@ impl FaultState {
 
     /// Return a snapshot of `fsqlite_test_vfs_faults_injected_total`.
     #[must_use]
+    #[allow(clippy::significant_drop_tightening)]
     pub fn metrics_snapshot(&self) -> FaultMetricsSnapshot {
         let counters = self.fault_counters.lock().expect("lock");
         let mut by_fault_type = BTreeMap::new();
@@ -1087,16 +1088,18 @@ impl FaultState {
             spec_index,
             spec_trigger_count,
         );
-        let jitter_span = jitter_millis.checked_add(1).unwrap_or(u64::MAX);
+        let jitter_span = jitter_millis.saturating_add(1);
         base_millis.saturating_add(sample % jitter_span)
     }
 
+    #[allow(clippy::unused_self)]
     fn apply_latency(&self, delay_ms: u64) {
         if delay_ms > 0 {
             std::thread::sleep(Duration::from_millis(delay_ms));
         }
     }
 
+    #[allow(clippy::significant_drop_tightening)]
     fn record_trigger(
         &self,
         spec_index: usize,

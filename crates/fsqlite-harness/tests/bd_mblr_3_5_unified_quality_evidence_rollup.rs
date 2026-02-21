@@ -101,7 +101,7 @@ fn manifest_gates_sorted_by_id() {
     let bundle = build_bundle();
     let gate_ids: Vec<&str> = bundle.manifest.gates.iter().map(|g| g.gate_id.as_str()).collect();
     let mut sorted = gate_ids.clone();
-    sorted.sort();
+    sorted.sort_unstable();
     assert_eq!(gate_ids, sorted, "gates must be sorted by gate_id");
 }
 
@@ -131,7 +131,7 @@ fn each_gate_has_artifact_uris() {
 fn all_gate_artifacts_in_top_level_index() {
     let bundle = build_bundle();
     let top_level: std::collections::BTreeSet<&str> =
-        bundle.manifest.artifact_uris.iter().map(|u| u.as_str()).collect();
+        bundle.manifest.artifact_uris.iter().map(String::as_str).collect();
 
     for gate in &bundle.manifest.gates {
         for uri in &gate.artifact_uris {
@@ -242,10 +242,10 @@ fn manifest_json_roundtrip() {
 fn gate_artifacts_are_valid_json() {
     let bundle = build_bundle();
     for (uri, content) in &bundle.gate_artifacts {
-        if uri.ends_with(".json") {
+        if std::path::Path::new(uri).extension().is_some_and(|ext| ext.eq_ignore_ascii_case("json")) {
             let parsed: Result<serde_json::Value, _> = serde_json::from_str(content);
             assert!(parsed.is_ok(), "artifact {uri} must be valid JSON");
-        } else if uri.ends_with(".jsonl") {
+        } else if std::path::Path::new(uri).extension().is_some_and(|ext| ext.eq_ignore_ascii_case("jsonl")) {
             for line in content.lines() {
                 if line.trim().is_empty() {
                     continue;

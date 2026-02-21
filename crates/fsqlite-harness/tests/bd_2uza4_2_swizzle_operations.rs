@@ -11,7 +11,7 @@ use fsqlite_btree::swizzle::{
     PageTemperature, SwizzleError, SwizzlePtr, SwizzleRegistry, SwizzleState,
     MAX_PAGE_ID, SWIZZLED_TAG,
 };
-use fsqlite_btree::instrumentation::{btree_metrics_snapshot, reset_btree_metrics};
+use fsqlite_btree::instrumentation::btree_metrics_snapshot;
 
 const BEAD_ID: &str = "bd-2uza4.2";
 

@@ -49,7 +49,7 @@ impl fmt::Display for DeltaKind {
 
 impl DeltaKind {
     /// All variants for exhaustive testing.
-    pub const ALL: [DeltaKind; 3] = [Self::Insert, Self::Update, Self::Delete];
+    pub const ALL: [Self; 3] = [Self::Insert, Self::Update, Self::Delete];
 }
 
 /// A single algebraic delta representing one row change.
@@ -151,7 +151,7 @@ impl BindingState {
     }
 
     /// All variants.
-    pub const ALL: [BindingState; 3] = [Self::Active, Self::Suspended, Self::Detached];
+    pub const ALL: [Self; 3] = [Self::Active, Self::Suspended, Self::Detached];
 }
 
 /// A binding between a SQL materialized view and a render tree widget.
@@ -255,8 +255,8 @@ impl PropagationResult {
     /// Number of widgets invalidated.
     pub fn widgets_invalidated(&self) -> usize {
         match self {
-            Self::Success { widgets_invalidated } => *widgets_invalidated,
-            Self::Partial { widgets_invalidated, .. } => *widgets_invalidated,
+            Self::Success { widgets_invalidated }
+            | Self::Partial { widgets_invalidated, .. } => *widgets_invalidated,
             Self::NoMatch | Self::Shutdown => 0,
         }
     }
@@ -268,7 +268,7 @@ impl PropagationResult {
 }
 
 /// Configuration for the delta propagation engine.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PropagationConfig {
     /// Maximum batch size before forced flush.
     pub max_batch_size: usize,
@@ -297,7 +297,7 @@ impl Default for PropagationConfig {
 ///   counter `bloodstream_deltas_total`
 ///   histogram `bloodstream_propagation_duration_us`
 ///   gauge `bloodstream_active_bindings`
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PropagationMetrics {
     /// Total deltas propagated (counter).
     pub deltas_total: u64,
@@ -342,6 +342,7 @@ impl PropagationMetrics {
     }
 
     /// P99 propagation duration in microseconds.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     pub fn p99_duration_us(&self) -> u64 {
         if self.propagation_durations_us.is_empty() {
             return 0;
@@ -675,6 +676,7 @@ pub const REQUIRED_METRICS: &[&str] = &[
 pub const DELTA_SPAN_NAME: &str = "bloodstream.delta";
 
 /// Verify that a propagation metrics snapshot satisfies the tracing contract.
+#[allow(clippy::too_many_lines)]
 pub fn verify_metrics_contract(metrics: &PropagationMetrics) -> Vec<ContractViolation> {
     let mut violations = Vec::new();
 
@@ -688,6 +690,7 @@ pub fn verify_metrics_contract(metrics: &PropagationMetrics) -> Vec<ContractViol
     }
 
     // Duration histogram should have one entry per batch.
+    #[allow(clippy::cast_possible_truncation)]
     if metrics.propagation_durations_us.len() != metrics.batches_total as usize {
         violations.push(ContractViolation {
             field: "propagation_durations_us".to_string(),

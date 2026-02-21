@@ -456,6 +456,7 @@ fn conformance_summary() {
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
+#[allow(clippy::cast_possible_truncation)]
 fn make_batch(num_frames: usize) -> TransactionFrameBatch {
     let frames: Vec<_> = (0..num_frames)
         .map(|i| FrameSubmission {
