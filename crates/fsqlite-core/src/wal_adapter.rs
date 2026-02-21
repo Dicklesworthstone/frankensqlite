@@ -5,7 +5,7 @@
 //!
 //! - [`WalBackendAdapter`] wraps `WalFile` to satisfy the pager's
 //!   [`WalBackend`] trait (pager → WAL direction).
-//! - [`CheckpointTargetAdapter`] wraps `CheckpointPageWriter` to satisfy the
+//! - [`CheckpointTargetAdapterRef`] wraps `CheckpointPageWriter` to satisfy the
 //!   WAL executor's [`CheckpointTarget`] trait (WAL → pager direction).
 
 use fsqlite_error::Result;
@@ -553,13 +553,13 @@ mod tests {
         assert_eq!(page, Some(sample_page(0x77)));
     }
 
-    // -- CheckpointTargetAdapter tests --
+    // -- CheckpointTargetAdapterRef tests --
 
     #[test]
     fn test_checkpoint_adapter_write_page() {
         let cx = test_cx();
-        let writer = MockCheckpointPageWriter;
-        let mut adapter = CheckpointTargetAdapter::new(Box::new(writer));
+        let mut writer = MockCheckpointPageWriter;
+        let mut adapter = CheckpointTargetAdapterRef { writer: &mut writer };
 
         let page_no = PageNumber::new(1).expect("valid page number");
         adapter
@@ -570,8 +570,8 @@ mod tests {
     #[test]
     fn test_checkpoint_adapter_truncate_db() {
         let cx = test_cx();
-        let writer = MockCheckpointPageWriter;
-        let mut adapter = CheckpointTargetAdapter::new(Box::new(writer));
+        let mut writer = MockCheckpointPageWriter;
+        let mut adapter = CheckpointTargetAdapterRef { writer: &mut writer };
 
         adapter.truncate_db(&cx, 10).expect("truncate_db");
     }
@@ -579,8 +579,8 @@ mod tests {
     #[test]
     fn test_checkpoint_adapter_sync_db() {
         let cx = test_cx();
-        let writer = MockCheckpointPageWriter;
-        let mut adapter = CheckpointTargetAdapter::new(Box::new(writer));
+        let mut writer = MockCheckpointPageWriter;
+        let mut adapter = CheckpointTargetAdapterRef { writer: &mut writer };
 
         adapter.sync_db(&cx).expect("sync_db");
     }
@@ -588,8 +588,8 @@ mod tests {
     #[test]
     fn test_checkpoint_adapter_as_dyn_target() {
         let cx = test_cx();
-        let writer = MockCheckpointPageWriter;
-        let mut adapter = CheckpointTargetAdapter::new(Box::new(writer));
+        let mut writer = MockCheckpointPageWriter;
+        let mut adapter = CheckpointTargetAdapterRef { writer: &mut writer };
 
         // Verify it can be used as a trait object.
         let target: &mut dyn CheckpointTarget = &mut adapter;

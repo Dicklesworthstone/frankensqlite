@@ -2511,6 +2511,12 @@ impl VdbeEngine {
                 Opcode::NotFound | Opcode::NotExists | Opcode::IfNoHope => {
                     // Check if rowid in register p3 exists in cursor p1.
                     let cursor_id = op.p1;
+                    // Storage-cursor probe repositions via table_move_to; clear
+                    // pending delete/next state so a following Next advances
+                    // relative to the new cursor position.
+                    if self.storage_cursors.contains_key(&cursor_id) {
+                        self.pending_next_after_delete.remove(&cursor_id);
+                    }
                     let rowid_val = self.get_reg(op.p3).to_integer();
                     let exists = if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
                         cursor
@@ -2540,6 +2546,12 @@ impl VdbeEngine {
                 Opcode::Found | Opcode::NoConflict => {
                     // Check if key exists; jump to p2 if found.
                     let cursor_id = op.p1;
+                    // Storage-cursor probe repositions via table_move_to; clear
+                    // pending delete/next state so subsequent iteration state
+                    // is based on the probe position, not stale pre-probe state.
+                    if self.storage_cursors.contains_key(&cursor_id) {
+                        self.pending_next_after_delete.remove(&cursor_id);
+                    }
                     let rowid_val = self.get_reg(op.p3).to_integer();
                     let exists = if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
                         cursor
@@ -6961,6 +6973,61 @@ mod tests {
             rows,
             vec![vec![SqliteValue::Integer(1)], vec![SqliteValue::Integer(3)]],
             "Delete->Prev->Next should land on rowids 1 then 3 without repeating row 1"
+        );
+    }
+
+    #[test]
+    fn test_delete_then_notexists_then_next_advances_from_probe_position() {
+        // Regression: NotExists on storage cursor repositions via table_move_to.
+        // If pending_next_after_delete is left stale, a following Next can
+        // incorrectly repeat the probe row instead of advancing.
+        let mut db = MemDatabase::new();
+        let root = db.create_table(1);
+        let table = db.get_table_mut(root).unwrap();
+        table.insert(1, vec![SqliteValue::Integer(10)]);
+        table.insert(2, vec![SqliteValue::Integer(20)]);
+        table.insert(3, vec![SqliteValue::Integer(30)]);
+
+        let (rows, _) = run_write_with_storage_cursors(db, |b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            b.emit_op(Opcode::OpenWrite, 0, root, 0, P4::Int(1), 0);
+
+            // Delete rowid=2.
+            b.emit_op(Opcode::Integer, 2, 1, 0, P4::None, 0);
+            b.emit_jump_to_label(Opcode::SeekRowid, 0, 1, end, P4::None, 0);
+            b.emit_op(Opcode::Delete, 0, 0, 0, P4::None, 0);
+
+            // Probe rowid=1 via NotExists (falls through when row exists).
+            let probe_missing = b.emit_label();
+            b.emit_op(Opcode::Integer, 1, 2, 0, P4::None, 0);
+            b.emit_jump_to_label(Opcode::NotExists, 0, 2, probe_missing, P4::None, 0);
+
+            // Emit current probe position (rowid=1).
+            b.emit_op(Opcode::Rowid, 0, 3, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, 3, 1, 0, P4::None, 0);
+
+            // Next should advance to rowid=3 (not repeat rowid=1).
+            let next_ok = b.emit_label();
+            b.emit_jump_to_label(Opcode::Next, 0, 0, next_ok, P4::None, 0);
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, end, P4::None, 0);
+            b.resolve_label(next_ok);
+            b.emit_op(Opcode::Rowid, 0, 4, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, 4, 1, 0, P4::None, 0);
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, end, P4::None, 0);
+
+            // Missing-probe path (not expected in this fixture).
+            b.resolve_label(probe_missing);
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, end, P4::None, 0);
+
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+
+        assert_eq!(
+            rows,
+            vec![vec![SqliteValue::Integer(1)], vec![SqliteValue::Integer(3)]],
+            "Delete->NotExists->Next should advance from probe row 1 to row 3"
         );
     }
 
