@@ -8931,7 +8931,13 @@ fn evaluate_having_value(
                     SqliteValue::Float(f) => SqliteValue::Float(-f),
                     _ => SqliteValue::Null,
                 },
-                fsqlite_ast::UnaryOp::Not => SqliteValue::Integer(i64::from(!is_sqlite_truthy(&v))),
+                fsqlite_ast::UnaryOp::Not => {
+                    if matches!(v, SqliteValue::Null) {
+                        SqliteValue::Null
+                    } else {
+                        SqliteValue::Integer(i64::from(!is_sqlite_truthy(&v)))
+                    }
+                },
                 _ => SqliteValue::Null,
             }
         }
