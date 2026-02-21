@@ -279,7 +279,12 @@ fn sqlite_value_is_truthy(v: &SqliteValue) -> bool {
     match v {
         SqliteValue::Integer(i) => *i != 0,
         SqliteValue::Float(f) => *f != 0.0,
-        _ => false,
+        SqliteValue::Null => false,
+        other => match other.clone().apply_affinity(TypeAffinity::Numeric) {
+            SqliteValue::Integer(i) => i != 0,
+            SqliteValue::Float(f) => f != 0.0,
+            _ => false,
+        },
     }
 }
 
@@ -307,20 +312,19 @@ use fsqlite_types::glossary::{RebaseBinaryOp, RebaseUnaryOp};
 /// Evaluate a unary operation.
 fn eval_unary_op(op: RebaseUnaryOp, v: SqliteValue) -> SqliteValue {
     match op {
-        RebaseUnaryOp::Negate => match v {
-            SqliteValue::Integer(i) => SqliteValue::Integer(i.wrapping_neg()),
-            SqliteValue::Float(f) => SqliteValue::Float(-f),
-            SqliteValue::Null => SqliteValue::Null,
-            other => {
-                // Attempt numeric coercion.
-                let coerced = other.apply_affinity(TypeAffinity::Numeric);
-                match coerced {
-                    SqliteValue::Integer(i) => SqliteValue::Integer(i.wrapping_neg()),
-                    SqliteValue::Float(f) => SqliteValue::Float(-f),
-                    _ => SqliteValue::Integer(0),
-                }
+        RebaseUnaryOp::Negate => {
+            if matches!(v, SqliteValue::Null) {
+                return SqliteValue::Null;
             }
-        },
+            match v.apply_affinity(TypeAffinity::Numeric) {
+                SqliteValue::Integer(i) => match i.checked_neg() {
+                    Some(val) => SqliteValue::Integer(val),
+                    None => SqliteValue::Float(-(i as f64)),
+                },
+                SqliteValue::Float(f) => SqliteValue::Float(-f),
+                _ => SqliteValue::Integer(0),
+            }
+        }
         RebaseUnaryOp::BitwiseNot => match v {
             SqliteValue::Integer(i) => SqliteValue::Integer(!i),
             SqliteValue::Null => SqliteValue::Null,
@@ -333,12 +337,13 @@ fn eval_unary_op(op: RebaseUnaryOp, v: SqliteValue) -> SqliteValue {
                 }
             }
         },
-        RebaseUnaryOp::Not => match v {
-            SqliteValue::Null => SqliteValue::Null,
-            SqliteValue::Integer(i) => SqliteValue::Integer(i64::from(i == 0)),
-            SqliteValue::Float(f) => SqliteValue::Integer(i64::from(f == 0.0)),
-            _ => SqliteValue::Integer(1),
-        },
+        RebaseUnaryOp::Not => {
+            if matches!(v, SqliteValue::Null) {
+                SqliteValue::Null
+            } else {
+                SqliteValue::Integer(i64::from(!sqlite_value_is_truthy(&v)))
+            }
+        }
     }
 }
 
@@ -364,18 +369,24 @@ fn eval_binary_op(op: RebaseBinaryOp, left: SqliteValue, right: SqliteValue) -> 
         RebaseBinaryOp::BitwiseOr => integer_bitop(&left, &right, |a, b| a | b),
         #[allow(clippy::cast_sign_loss)]
         RebaseBinaryOp::ShiftLeft => integer_bitop(&left, &right, |a, b| {
-            if b < 0 {
-                a.wrapping_shr(b.unsigned_abs() as u32)
+            let shift = b.unsigned_abs() as u32;
+            if shift >= 64 {
+                0
+            } else if b < 0 {
+                a >> shift
             } else {
-                a.wrapping_shl(b as u32)
+                a << shift
             }
         }),
         #[allow(clippy::cast_sign_loss)]
         RebaseBinaryOp::ShiftRight => integer_bitop(&left, &right, |a, b| {
-            if b < 0 {
-                a.wrapping_shl(b.unsigned_abs() as u32)
+            let shift = b.unsigned_abs() as u32;
+            if shift >= 64 {
+                0
+            } else if b < 0 {
+                a << shift
             } else {
-                a.wrapping_shr(b as u32)
+                a >> shift
             }
         }),
     }
@@ -401,7 +412,10 @@ fn to_float(v: &SqliteValue) -> f64 {
 
 fn numeric_add(l: &SqliteValue, r: &SqliteValue) -> SqliteValue {
     if let (SqliteValue::Integer(a), SqliteValue::Integer(b)) = (l, r) {
-        SqliteValue::Integer(a.wrapping_add(*b))
+        match a.checked_add(*b) {
+            Some(v) => SqliteValue::Integer(v),
+            None => SqliteValue::Float((*a as f64) + (*b as f64)),
+        }
     } else {
         SqliteValue::Float(to_float(l) + to_float(r))
     }
@@ -409,7 +423,10 @@ fn numeric_add(l: &SqliteValue, r: &SqliteValue) -> SqliteValue {
 
 fn numeric_sub(l: &SqliteValue, r: &SqliteValue) -> SqliteValue {
     if let (SqliteValue::Integer(a), SqliteValue::Integer(b)) = (l, r) {
-        SqliteValue::Integer(a.wrapping_sub(*b))
+        match a.checked_sub(*b) {
+            Some(v) => SqliteValue::Integer(v),
+            None => SqliteValue::Float((*a as f64) - (*b as f64)),
+        }
     } else {
         SqliteValue::Float(to_float(l) - to_float(r))
     }
@@ -417,7 +434,10 @@ fn numeric_sub(l: &SqliteValue, r: &SqliteValue) -> SqliteValue {
 
 fn numeric_mul(l: &SqliteValue, r: &SqliteValue) -> SqliteValue {
     if let (SqliteValue::Integer(a), SqliteValue::Integer(b)) = (l, r) {
-        SqliteValue::Integer(a.wrapping_mul(*b))
+        match a.checked_mul(*b) {
+            Some(v) => SqliteValue::Integer(v),
+            None => SqliteValue::Float((*a as f64) * (*b as f64)),
+        }
     } else {
         SqliteValue::Float(to_float(l) * to_float(r))
     }
@@ -463,18 +483,17 @@ fn eval_function(name: &str, args: &[SqliteValue]) -> Result<SqliteValue, IndexR
     match name.to_ascii_lowercase().as_str() {
         "abs" => {
             if let Some(v) = args.first() {
-                Ok(match v {
-                    SqliteValue::Null => SqliteValue::Null,
-                    SqliteValue::Integer(i) => SqliteValue::Integer(i.wrapping_abs()),
+                if matches!(v, SqliteValue::Null) {
+                    return Ok(SqliteValue::Null);
+                }
+                let coerced = v.clone().apply_affinity(TypeAffinity::Numeric);
+                Ok(match coerced {
+                    SqliteValue::Integer(i) => match i.checked_abs() {
+                        Some(val) => SqliteValue::Integer(val),
+                        None => SqliteValue::Float((i as f64).abs()),
+                    },
                     SqliteValue::Float(f) => SqliteValue::Float(f.abs()),
-                    other => {
-                        let coerced = other.clone().apply_affinity(TypeAffinity::Numeric);
-                        match coerced {
-                            SqliteValue::Integer(i) => SqliteValue::Integer(i.wrapping_abs()),
-                            SqliteValue::Float(f) => SqliteValue::Float(f.abs()),
-                            _ => SqliteValue::Integer(0),
-                        }
-                    }
+                    _ => SqliteValue::Integer(0),
                 })
             } else {
                 Ok(SqliteValue::Null)

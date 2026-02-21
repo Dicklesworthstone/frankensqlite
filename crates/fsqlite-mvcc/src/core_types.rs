@@ -882,7 +882,7 @@ impl ReadSetBloom {
     fn hash_indices(&self, page: PageNumber) -> [usize; 2] {
         let raw = u64::from(page.get());
         let h1 = raw.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        let h2 = raw.rotate_left(17) ^ 0xC2B2_AE3D_27D4_EB4F;
+        let h2 = raw.wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
         let bit_len = self.bit_len();
         let bit_len_u64 = u64::try_from(bit_len).unwrap_or(u64::MAX);
         let idx1: usize = usize::try_from(h1 % bit_len_u64).unwrap_or_default();
