@@ -186,8 +186,17 @@ impl IoUringFile {
 
         let data = self.inner.with_inode_io_file(|file| {
             seek_to(file, offset)?;
-            let ring = ring_mutex.lock().expect("io_uring runtime lock poisoned");
-            pollster::block_on(ring.read(file, requested)).map_err(FrankenError::Io)
+            let read_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let ring = ring_mutex.lock().expect("io_uring runtime lock poisoned");
+                pollster::block_on(ring.read(file, requested))
+            }));
+            match read_result {
+                Ok(Ok(data)) => Ok(data),
+                Ok(Err(err)) => Err(FrankenError::Io(err)),
+                Err(_) => Err(FrankenError::Io(io::Error::other(
+                    "io_uring read panicked",
+                ))),
+            }
         })?;
 
         let total = data.len();
@@ -220,9 +229,18 @@ impl IoUringFile {
                 seek_to(file, off)?;
                 let before = current_offset(file)?;
                 let payload = buf[total..].to_vec();
-                {
+                let write_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let ring = ring_mutex.lock().expect("io_uring runtime lock poisoned");
-                    pollster::block_on(ring.write(file, payload)).map_err(FrankenError::Io)?;
+                    pollster::block_on(ring.write(file, payload))
+                }));
+                match write_result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => return Err(FrankenError::Io(err)),
+                    Err(_) => {
+                        return Err(FrankenError::Io(io::Error::other(
+                            "io_uring write panicked",
+                        )))
+                    }
                 }
                 let after = current_offset(file)?;
                 let advanced_u64 = after.checked_sub(before).ok_or_else(|| {
@@ -261,19 +279,21 @@ impl VfsFile for IoUringFile {
     fn read(&mut self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
         checkpoint_or_abort(cx)?;
         if self.runtime.is_available() {
-            self.read_via_uring(buf, offset)
-        } else {
-            self.inner.read(cx, buf, offset)
+            if let Ok(bytes) = self.read_via_uring(buf, offset) {
+                return Ok(bytes);
+            }
         }
+        self.inner.read(cx, buf, offset)
     }
 
     fn write(&mut self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
         checkpoint_or_abort(cx)?;
         if self.runtime.is_available() {
-            self.write_via_uring(buf, offset)
-        } else {
-            self.inner.write(cx, buf, offset)
+            if self.write_via_uring(buf, offset).is_ok() {
+                return Ok(());
+            }
         }
+        self.inner.write(cx, buf, offset)
     }
 
     fn truncate(&mut self, cx: &Cx, size: u64) -> Result<()> {
