@@ -117,6 +117,12 @@ ci-artifacts/
 proptest-regressions/
 test_meminfo
 
+# Benchmark database files
+bench_*.db
+
+# One-off test scripts at repo root
+/test_hash.rs
+
 # Agent session ephemeral files
 SESSION_TODO.md
 SESSION_REPORT.md
