@@ -807,27 +807,16 @@ impl<P: PageReader> BtCursor<P> {
 
             // Interior index page: binary search to find which child to descend.
             let search_result = self.binary_search_index_interior(cx, &entry, target_key)?;
-            match search_result {
-                BinarySearchResult::Found(idx) => {
-                    let mut entry = entry;
-                    entry.cell_idx = idx;
-                    self.stack.push(entry);
-                    self.at_eof = false;
-                    self.record_point_witness(WitnessKey::Cell {
-                        btree_root: self.root_page,
-                        tag: Self::cell_tag_from_index_key(target_key),
-                    });
-                    return Ok(SeekResult::Found);
-                }
-                BinarySearchResult::NotFound(child_idx) => {
-                    let child = self.child_page_at(&entry, child_idx)?;
-                    let mut entry = entry;
-                    entry.cell_idx = child_idx;
-                    self.stack.push(entry);
-                    self.issue_prefetch_hint(cx, child);
-                    current_page = child;
-                }
-            }
+            let child_idx = match search_result {
+                BinarySearchResult::NotFound(idx) => idx,
+                BinarySearchResult::Found(_) => unreachable!("binary_search_index_interior should not return Found"),
+            };
+            let child = self.child_page_at(&entry, child_idx)?;
+            let mut entry = entry;
+            entry.cell_idx = child_idx;
+            self.stack.push(entry);
+            self.issue_prefetch_hint(cx, child);
+            current_page = child;
         }
     }
 
@@ -895,10 +884,10 @@ impl<P: PageReader> BtCursor<P> {
             let cell = self.parse_cell_at(entry, mid)?;
             let key = self.read_cell_payload(cx, entry, &cell)?;
 
-            match key.as_slice().cmp(target) {
-                std::cmp::Ordering::Equal => return Ok(BinarySearchResult::Found(mid)),
-                std::cmp::Ordering::Less => lo = mid + 1,
-                std::cmp::Ordering::Greater => hi = mid,
+            if target < key.as_slice() {
+                hi = mid;
+            } else {
+                lo = mid + 1;
             }
         }
         Ok(BinarySearchResult::NotFound(lo))

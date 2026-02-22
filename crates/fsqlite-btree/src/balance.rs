@@ -405,7 +405,7 @@ pub(crate) fn balance_nonroot<W: PageWriter>(
             }
         }
 
-        // Add divider cell (for non-leaf pages, the divider becomes a regular cell).
+        // Add divider cell (for non-leaf pages and index leaves, the divider becomes a regular cell).
         if sib_idx < sibling_count - 1 {
             let page_type = page_header.page_type;
             if page_type.is_interior() {
@@ -421,8 +421,24 @@ pub(crate) fn balance_nonroot<W: PageWriter>(
                     size: u16::try_from(div.len()).unwrap_or(u16::MAX),
                     data: div,
                 });
+            } else if page_type == BtreePageType::LeafIndex {
+                // For index leaf pages, the parent divider is an InteriorIndex cell.
+                // It contains a unique key that must not be lost. We strip the 4-byte
+                // left-child pointer to turn it into a LeafIndex cell.
+                let div = &divider_cells[sib_idx];
+                if div.len() >= 4 {
+                    let leaf_cell_data = div[4..].to_vec();
+                    all_cells.push(GatheredCell {
+                        size: u16::try_from(leaf_cell_data.len()).unwrap_or(u16::MAX),
+                        data: leaf_cell_data,
+                    });
+                } else {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: "index divider cell too small".to_owned(),
+                    });
+                }
             }
-            // For leaf pages: divider is not added to cells (it's extracted from keys).
+            // For LeafTable: divider is not added to cells (it's extracted from keys).
         }
 
         if all_cells.len() > MAX_GATHERED_CELLS {
@@ -446,7 +462,7 @@ pub(crate) fn balance_nonroot<W: PageWriter>(
     let hdr_size = page_type.header_size() as usize;
 
     // Compute cell distribution across pages.
-    let distribution = compute_distribution(&all_cells, usable_size, hdr_size, is_leaf)?;
+    let distribution = compute_distribution(&all_cells, usable_size, hdr_size, page_type)?;
 
     // Allocate/reuse pages.
     let new_page_count = distribution.len();
@@ -527,12 +543,13 @@ pub(crate) fn balance_nonroot<W: PageWriter>(
                 let vlen = write_varint(&mut div[4..], rowid_u64);
                 div[..4 + vlen].to_vec()
             } else if is_leaf {
-                // Index leaf: divider is the first cell of the next page,
-                // prefixed with the child pointer.
-                let next_first = &all_cells[cell_cursor + cell_count];
-                let mut div = Vec::with_capacity(4 + next_first.data.len());
+                // Index leaf: the divider is the promoted cell. It is consumed from
+                // all_cells. We prefix it with the 4-byte child pointer to turn it
+                // into an InteriorIndex cell.
+                let div_cell = &all_cells[cell_cursor + cell_count];
+                let mut div = Vec::with_capacity(4 + div_cell.data.len());
                 div.extend_from_slice(&pgno.get().to_be_bytes());
-                div.extend_from_slice(&next_first.data);
+                div.extend_from_slice(&div_cell.data);
                 div
             } else {
                 // Interior page: the divider cell is consumed from the
@@ -550,8 +567,8 @@ pub(crate) fn balance_nonroot<W: PageWriter>(
         }
 
         cell_cursor += cell_count;
-        // For interior pages, skip the divider cell between pages.
-        if !is_leaf && page_idx < new_page_count - 1 {
+        // For interior pages and index leaves, skip the divider cell between pages.
+        if page_type != BtreePageType::LeafTable && page_idx < new_page_count - 1 {
             cell_cursor += 1;
         }
     }
@@ -658,9 +675,9 @@ fn compute_distribution(
     cells: &[GatheredCell],
     usable_size: u32,
     hdr_size: usize,
-    is_leaf: bool,
+    page_type: BtreePageType,
 ) -> Result<Vec<usize>> {
-    if is_leaf {
+    if page_type == BtreePageType::LeafTable {
         return compute_leaf_distribution(cells, usable_size, hdr_size);
     }
     compute_interior_distribution(cells, usable_size, hdr_size)
