@@ -705,6 +705,9 @@ impl Parser {
         } else {
             let distinct = self.eat_kind(&TokenKind::KwDistinct);
             let args = if matches!(self.peek_kind(), TokenKind::RightParen) {
+                if distinct {
+                    return Err(self.err_here("DISTINCT requires at least one argument"));
+                }
                 FunctionArgs::List(Vec::new())
             } else {
                 let mut list = vec![self.parse_expr()?];
@@ -864,7 +867,12 @@ impl Parser {
 
     /// Subquery parser for EXISTS/IN expression support.
     fn parse_subquery_minimal(&mut self) -> Result<SelectStatement, ParseError> {
-        self.parse_select_stmt(None)
+        let with = if self.at_kind(&TokenKind::KwWith) {
+            Some(self.parse_with_clause()?)
+        } else {
+            None
+        };
+        self.parse_select_stmt(with)
     }
 }
 

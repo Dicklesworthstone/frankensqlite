@@ -433,7 +433,7 @@ impl Parser {
         }
     }
 
-    fn parse_with_clause(&mut self) -> Result<WithClause, ParseError> {
+    pub(crate) fn parse_with_clause(&mut self) -> Result<WithClause, ParseError> {
         self.expect_kw(&TokenKind::KwWith)?;
         let recursive = self.eat_kw(&TokenKind::KwRecursive);
         let ctes = self.parse_comma_sep(Self::parse_cte)?;
@@ -639,7 +639,12 @@ impl Parser {
                 self.peek(),
                 TokenKind::KwSelect | TokenKind::KwWith | TokenKind::KwValues
             ) {
-                let q = self.parse_select_stmt(None)?;
+                let with = if self.check_kw(&TokenKind::KwWith) {
+                    Some(self.parse_with_clause()?)
+                } else {
+                    None
+                };
+                let q = self.parse_select_stmt(with)?;
                 self.expect_token(&TokenKind::RightParen)?;
                 let alias = self.try_alias()?;
                 return Ok(TableOrSubquery::Subquery {
@@ -836,7 +841,12 @@ impl Parser {
                 SelectCore::Select { .. } => unreachable!("parse_values_core must return VALUES"),
             }
         } else {
-            InsertSource::Select(Box::new(self.parse_select_stmt(None)?))
+            let inner_with = if self.check_kw(&TokenKind::KwWith) {
+                Some(self.parse_with_clause()?)
+            } else {
+                None
+            };
+            InsertSource::Select(Box::new(self.parse_select_stmt(inner_with)?))
         };
         let upsert = self.parse_upsert_clauses()?;
         let returning = self.parse_returning()?;
@@ -1047,7 +1057,12 @@ impl Parser {
         let if_not_exists = self.parse_if_not_exists();
         let name = self.parse_qualified_name()?;
         let body = if self.eat_kw(&TokenKind::KwAs) {
-            CreateTableBody::AsSelect(Box::new(self.parse_select_stmt(None)?))
+            let with = if self.check_kw(&TokenKind::KwWith) {
+                Some(self.parse_with_clause()?)
+            } else {
+                None
+            };
+            CreateTableBody::AsSelect(Box::new(self.parse_select_stmt(with)?))
         } else {
             self.expect_token(&TokenKind::LeftParen)?;
             let mut columns = Vec::new();
@@ -1460,7 +1475,12 @@ impl Parser {
             vec![]
         };
         self.expect_kw(&TokenKind::KwAs)?;
-        let query = self.parse_select_stmt(None)?;
+        let with = if self.check_kw(&TokenKind::KwWith) {
+            Some(self.parse_with_clause()?)
+        } else {
+            None
+        };
+        let query = self.parse_select_stmt(with)?;
         Ok(Statement::CreateView(CreateViewStatement {
             if_not_exists,
             temporary,
@@ -1785,13 +1805,19 @@ impl Parser {
 
     pub(crate) fn parse_window_spec(&mut self) -> Result<WindowSpec, ParseError> {
         // Optional base window name.
-        let base_window = if matches!(self.peek(), TokenKind::Id(_))
-            && !self.check_kw(&TokenKind::KwPartition)
-            && !self.check_kw(&TokenKind::KwOrder)
-            && !self.check_kw(&TokenKind::KwRange)
-            && !self.check_kw(&TokenKind::KwRows)
-            && !self.check_kw(&TokenKind::KwGroups)
-        {
+        let has_base_window = match self.peek() {
+            TokenKind::Id(_) | TokenKind::QuotedId(_, _) => true,
+            k if is_nonreserved_kw(k) => !matches!(
+                k,
+                TokenKind::KwPartition
+                    | TokenKind::KwOrder
+                    | TokenKind::KwRange
+                    | TokenKind::KwRows
+                    | TokenKind::KwGroups
+            ),
+            _ => false,
+        };
+        let base_window = if has_base_window {
             Some(self.parse_identifier()?)
         } else {
             None
@@ -1844,9 +1870,6 @@ impl Parser {
                     return Err(self.err_expected("OTHERS"));
                 }
                 Some(FrameExclude::NoOthers)
-            } else if self.check_kw(&TokenKind::KwOthers) {
-                self.advance();
-                Some(FrameExclude::NoOthers)
             } else if self.eat_kw(&TokenKind::KwTies) {
                 Some(FrameExclude::Ties)
             } else if self.eat_kw(&TokenKind::KwGroup) {
@@ -1856,7 +1879,7 @@ impl Parser {
                 self.expect_kw(&TokenKind::KwRow)?;
                 Some(FrameExclude::CurrentRow)
             } else {
-                return Err(self.err_expected("GROUP or CURRENT ROW after EXCLUDE"));
+                return Err(self.err_expected("NO OTHERS, TIES, GROUP, or CURRENT ROW after EXCLUDE"));
             }
         } else {
             None
