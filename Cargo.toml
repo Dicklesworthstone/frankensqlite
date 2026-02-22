@@ -110,7 +110,7 @@ unnecessary_literal_bound = { level = "allow", priority = 1 }
 # Internal crates
 fsqlite-types = { version = "0.1.1", path = "crates/fsqlite-types" }
 fsqlite-error = { version = "0.1.1", path = "crates/fsqlite-error" }
-fsqlite-vfs = { version = "0.1.1", path = "crates/fsqlite-vfs" }
+fsqlite-vfs = { version = "0.1.2", path = "crates/fsqlite-vfs" }
 fsqlite-pager = { version = "0.1.1", path = "crates/fsqlite-pager" }
 fsqlite-wal = { version = "0.1.1", path = "crates/fsqlite-wal" }
 fsqlite-mvcc = { version = "0.1.1", path = "crates/fsqlite-mvcc" }
