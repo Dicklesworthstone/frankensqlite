@@ -204,7 +204,16 @@ impl PageCache {
         if self.get(page_no).is_none() {
             let mut buf = self.pool.acquire()?;
             let offset = page_offset(page_no, self.page_size);
-            let _ = file.read(cx, buf.as_mut_slice(), offset)?;
+            let bytes_read = file.read(cx, buf.as_mut_slice(), offset)?;
+            if bytes_read < self.page_size.as_usize() {
+                return Err(fsqlite_error::FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "short read fetching page {page}: got {bytes_read} of {page_size}",
+                        page = page_no.get(),
+                        page_size = self.page_size.as_usize()
+                    ),
+                });
+            }
             self.pages.insert(page_no, buf);
             self.admits.set(self.admits.get().saturating_add(1));
         }

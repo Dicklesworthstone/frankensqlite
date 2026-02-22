@@ -1060,26 +1060,7 @@ impl ArcCacheInner {
     /// Evict one page, preferring superseded versions.
     fn evict_one_preferred(&mut self) -> bool {
         // First: try to find a superseded victim in T1 or T2.
-        if let Some(idx) = self.find_superseded_victim(&self.t1) {
-            let page = self.t1.remove(idx);
-            let key = page.key;
-            self.total_bytes -= page.byte_size;
-            self.decrement_page_version(key.pgno);
-            self.directory.remove(&key);
-            let ghost_idx = self.b1.push_back(key);
-            self.directory.insert(key, Location::B1(ghost_idx));
-            self.version_coalesce_count = self.version_coalesce_count.saturating_add(1);
-            return true;
-        }
-        if let Some(idx) = self.find_superseded_victim(&self.t2) {
-            let page = self.t2.remove(idx);
-            let key = page.key;
-            self.total_bytes -= page.byte_size;
-            self.decrement_page_version(key.pgno);
-            self.directory.remove(&key);
-            let ghost_idx = self.b2.push_back(key);
-            self.directory.insert(key, Location::B2(ghost_idx));
-            self.version_coalesce_count = self.version_coalesce_count.saturating_add(1);
+        if self.coalesce_one_superseded_for_replace() {
             return true;
         }
         // Fallback: standard REPLACE with pinned-page fallback.

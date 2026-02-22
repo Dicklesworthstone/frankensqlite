@@ -79,53 +79,30 @@ impl<F: VfsFile> PagerInner<F> {
             return Ok(vec![0_u8; self.page_size.as_usize()]);
         }
 
-        // Acquire a buffer for reading from disk. If the pool is exhausted,
-        // try evicting a page from the cache to free up a buffer.
-        let mut buf = match self.cache.pool().clone().acquire() {
-            Ok(buf) => buf,
+        let slice = match self.cache.read_page(cx, &mut self.db_file, page_no) {
+            Ok(slice) => slice,
             Err(FrankenError::OutOfMemory) => {
                 if self.cache.evict_any() {
-                    self.cache.pool().clone().acquire()?
+                    self.cache.read_page(cx, &mut self.db_file, page_no)?
                 } else {
-                    return Err(FrankenError::OutOfMemory);
-                }
-            }
-            Err(err) => return Err(err),
-        };
-
-        let page_size = self.page_size.as_usize();
-        let offset = u64::from(page_no.get() - 1) * page_size as u64;
-        let bytes_read = self.db_file.read(cx, buf.as_mut_slice(), offset)?;
-        if bytes_read < page_size {
-            return Err(FrankenError::DatabaseCorrupt {
-                detail: format!(
-                    "short read fetching page {page}: got {bytes_read} of {page_size}",
-                    page = page_no.get()
-                ),
-            });
-        }
-        let out = buf.as_slice()[..page_size].to_vec();
-
-        // Insert into cache. If pool is exhausted (because we're holding one
-        // buffer in `buf` and the rest are cached), try evicting again.
-        // Note: insert_fresh acquires a *new* buffer from the pool.
-        let fresh = match self.cache.insert_fresh(page_no) {
-            Ok(fresh) => fresh,
-            Err(FrankenError::OutOfMemory) => {
-                if self.cache.evict_any() {
-                    // Retry insertion.
-                    self.cache.insert_fresh(page_no)?
-                } else {
-                    // If we can't cache it, we just return the read data.
-                    // This is a valid degradation (cache miss).
+                    let page_size = self.page_size.as_usize();
+                    let offset = u64::from(page_no.get() - 1) * page_size as u64;
+                    let mut out = vec![0_u8; page_size];
+                    let bytes_read = self.db_file.read(cx, &mut out, offset)?;
+                    if bytes_read < page_size {
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "short read fetching page {page}: got {bytes_read} of {page_size}",
+                                page = page_no.get()
+                            ),
+                        });
+                    }
                     return Ok(out);
                 }
             }
             Err(err) => return Err(err),
         };
-
-        fresh.copy_from_slice(&out);
-        Ok(out)
+        Ok(slice.to_vec())
     }
 
     /// Flush page data to cache and file.
