@@ -160,7 +160,6 @@ impl<K: Ord + Clone, V: Clone> BeNode<K, V> {
 pub struct BeTree<K: Ord + Clone, V: Clone> {
     root: BeNode<K, V>,
     config: BeTreeConfig,
-    len: usize,
 }
 
 impl<K: Ord + Clone, V: Clone> BeTree<K, V> {
@@ -172,20 +171,21 @@ impl<K: Ord + Clone, V: Clone> BeTree<K, V> {
         Self {
             root: BeNode::new_leaf(),
             config,
-            len: 0,
         }
     }
 
     /// Return the number of live key-value pairs in the tree.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.len
+        let mut pending: BTreeMap<K, Option<V>> = BTreeMap::new();
+        self.collect_all(&self.root, &mut pending);
+        pending.into_values().filter(|v| v.is_some()).count()
     }
 
     /// Return whether the tree is empty.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.len == 0
+        self.len() == 0
     }
 
     /// Return the configuration.
@@ -273,14 +273,6 @@ impl<K: Ord + Clone, V: Clone> BeTree<K, V> {
 
     /// Apply a message to the tree by buffering it at the root.
     fn apply_message(&mut self, msg: BeMessage<K, V>) {
-        // Track whether this is an insert of a new key.
-        let is_insert = matches!(&msg, BeMessage::Insert { .. });
-        let is_delete = matches!(&msg, BeMessage::Delete { .. });
-        let target_key = msg.key().clone();
-
-        // Check if key currently exists (for len tracking).
-        let key_exists = self.get(&target_key).is_some();
-
         BETREE_MESSAGES_BUFFERED_TOTAL.fetch_add(1, Ordering::Relaxed);
 
         match &mut self.root {
@@ -295,13 +287,6 @@ impl<K: Ord + Clone, V: Clone> BeTree<K, V> {
 
         // Flush if root interior buffer overflows.
         self.flush_if_needed();
-
-        // Update len.
-        if is_insert && !key_exists {
-            self.len += 1;
-        } else if is_delete && key_exists {
-            self.len -= 1;
-        }
 
         // Handle root split.
         self.maybe_split_root();
@@ -540,7 +525,7 @@ impl<K: Ord + Clone, V: Clone> BeTree<K, V> {
 impl<K: Ord + Clone + fmt::Debug, V: Clone + fmt::Debug> fmt::Debug for BeTree<K, V> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("BeTree")
-            .field("len", &self.len)
+            .field("len", &self.len())
             .field("depth", &self.depth())
             .field("config", &self.config)
             .finish()
