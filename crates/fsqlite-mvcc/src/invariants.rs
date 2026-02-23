@@ -253,7 +253,7 @@ pub enum CasInstallResult {
 /// - A vector of atomic head pointer slots (read-locked for CAS, write-locked only when growing).
 struct ChainHeadShard {
     /// Maps page numbers to slot indices within `slots`.
-    directory: Mutex<HashMap<PageNumber, usize, PageNumberBuildHasher>>,
+    directory: RwLock<HashMap<PageNumber, usize, PageNumberBuildHasher>>,
     /// Atomic head pointer slots. Each slot stores a packed `VersionIdx` as u64,
     /// or `CHAIN_HEAD_EMPTY` for an empty chain.
     slots: RwLock<Vec<CacheAligned<AtomicU64>>>,
@@ -262,7 +262,7 @@ struct ChainHeadShard {
 impl ChainHeadShard {
     fn new() -> Self {
         Self {
-            directory: Mutex::new(HashMap::with_hasher(PageNumberBuildHasher::default())),
+            directory: RwLock::new(HashMap::with_hasher(PageNumberBuildHasher::default())),
             slots: RwLock::new(Vec::new()),
         }
     }
@@ -271,14 +271,14 @@ impl ChainHeadShard {
     fn ensure_slot(&self, pgno: PageNumber) -> usize {
         // Fast path: check if already registered.
         {
-            let dir = self.directory.lock();
+            let dir = self.directory.read();
             if let Some(&idx) = dir.get(&pgno) {
                 return idx;
             }
         }
 
         // Slow path: register a new slot.
-        let mut dir = self.directory.lock();
+        let mut dir = self.directory.write();
         // Double-check after acquiring lock.
         if let Some(&idx) = dir.get(&pgno) {
             return idx;
@@ -293,7 +293,7 @@ impl ChainHeadShard {
 
     /// Get the slot index for a page, if registered.
     fn slot_index(&self, pgno: PageNumber) -> Option<usize> {
-        let dir = self.directory.lock();
+        let dir = self.directory.read();
         dir.get(&pgno).copied()
     }
 }
@@ -448,7 +448,7 @@ impl ChainHeadTable {
     /// diagnostics/sampling, not hot paths.
     pub fn for_each_head(&self, mut f: impl FnMut(PageNumber, VersionIdx)) {
         for shard in self.shards.iter() {
-            let dir = shard.directory.lock();
+            let dir = shard.directory.read();
             let slots = shard.slots.read();
             for (&pgno, &slot_idx) in dir.iter() {
                 let raw = slots[slot_idx].load(Ordering::Acquire);
@@ -464,7 +464,7 @@ impl ChainHeadTable {
     pub fn page_count(&self) -> usize {
         let mut count = 0;
         for shard in self.shards.iter() {
-            let dir = shard.directory.lock();
+            let dir = shard.directory.read();
             let slots = shard.slots.read();
             for &slot_idx in dir.values() {
                 let raw = slots[slot_idx].load(Ordering::Relaxed);
