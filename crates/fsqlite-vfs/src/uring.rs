@@ -262,7 +262,7 @@ impl IoUringFile {
                             "offset overflow during io_uring read",
                         ))
                     })?;
-                
+
                 let requested = u32::try_from(buf.len() - total).map_err(|_| {
                     FrankenError::Io(io::Error::new(
                         io::ErrorKind::InvalidInput,

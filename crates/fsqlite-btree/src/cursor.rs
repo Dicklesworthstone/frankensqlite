@@ -919,7 +919,11 @@ impl<P: PageReader> BtCursor<P> {
         let depth = self.stack.len();
         let (is_leaf, cell_idx, cell_count) = {
             let top = &self.stack[depth - 1];
-            (top.header.page_type.is_leaf(), top.cell_idx, top.header.cell_count)
+            (
+                top.header.page_type.is_leaf(),
+                top.cell_idx,
+                top.header.cell_count,
+            )
         };
 
         // On a leaf page: try to advance to the next cell.
@@ -1503,8 +1507,9 @@ impl<P: PageWriter> BtCursor<P> {
         // This avoids maintaining a complex freeblock list and keeps fragmented_free_bytes at 0.
         let mut new_content_offset = self.usable_size as usize;
         let old_page_data = page_data.clone();
-        let ptr_array_end = header_offset + usize::from(header.page_type.header_size()) + ptrs.len() * 2;
-        
+        let ptr_array_end =
+            header_offset + usize::from(header.page_type.header_size()) + ptrs.len() * 2;
+
         for ptr_mut in &mut ptrs {
             let ptr = *ptr_mut as usize;
             let cell = CellRef::parse(&old_page_data, ptr, header.page_type, self.usable_size)?;
@@ -1520,7 +1525,8 @@ impl<P: PageWriter> BtCursor<P> {
                     detail: "cell content overlaps pointer array during defragmentation".to_owned(),
                 });
             }
-            page_data[new_content_offset..new_content_offset + size].copy_from_slice(&old_page_data[ptr..ptr + size]);
+            page_data[new_content_offset..new_content_offset + size]
+                .copy_from_slice(&old_page_data[ptr..ptr + size]);
             *ptr_mut = new_content_offset as u16;
         }
 
@@ -1627,7 +1633,7 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
                     cursor.child_page_at(top, cell_idx + 1)?
                 };
                 cursor.move_to_leftmost_leaf(cx, right_child, false)?;
-                
+
                 insert_idx = 0; // The new key goes at the very beginning of the right subtree.
             } else {
                 let top = cursor.stack.last().unwrap();

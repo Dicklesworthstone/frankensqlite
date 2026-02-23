@@ -867,10 +867,14 @@ mod tests {
 
         // 1 row should be returned for a scalar aggregate on an empty set.
         assert_eq!(result.row_count(), 1, "bead_id={BEAD_AGG} case=total_empty");
-        
+
         let col = &result.columns()[0];
         if let ColumnData::Float64(v) = &col.data {
-            assert_eq!(v.as_slice()[0], 0.0, "TOTAL() on empty set should return 0.0");
+            assert_eq!(
+                v.as_slice()[0],
+                0.0,
+                "TOTAL() on empty set should return 0.0"
+            );
         } else {
             panic!("Expected Float64 column");
         }

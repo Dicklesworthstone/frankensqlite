@@ -380,7 +380,7 @@
     },
     {
       "fixture_id": "fuzz_sql_parser/03b7b80f05a93157343745ad93ff9261743cbdf3",
-      "parser_blake3": "0b7b5279215b7bb07b27b265c63fca66197c4406d90ec24c9c2f69d2da43da1c",
+      "parser_blake3": "2c1356c14526e9f34407b1c45a35e41c8bb6378fe6e8a94a950f5ec292b894ba",
       "planner_blake3": "167ef331d413a52682afe57ce431fb655222ea3db78659e98981d5e4eb11eb5c",
       "execution_blake3": "4e293665a26e978ea8119b4768d40211fb35f24dd37cfc433d4fe1135d05da1e",
       "statement_count": 1,
@@ -708,7 +708,7 @@
     },
     {
       "fixture_id": "fuzz_sql_parser/0846e9b656cf515dd4f268a41c6dcfc5a136fc54",
-      "parser_blake3": "3793555be709a5fa454599698521fa7668e238427a4da6512049a6d70b8a389d",
+      "parser_blake3": "c2dcc1789ee0880bc5618644e4081173e1704c4f7679a94d7e9ba6d6f4d14329",
       "planner_blake3": "5492e6d8206fa3b48a760b1731494c93d8716465e5126eace9bfa31265fae36d",
       "execution_blake3": "99c3ea4fb119c8bf49ca059707e23ed5e4c65a6e38561c5b295d1c930b64f4e6",
       "statement_count": 1,
@@ -1236,7 +1236,7 @@
     },
     {
       "fixture_id": "fuzz_sql_parser/0fc3d966621ba8e07c83e4bf85022a72d0b88993",
-      "parser_blake3": "9812e26ccdcb115f7ac420004e6b5c005f54a8e586cf98046e76d7a21cee8f5f",
+      "parser_blake3": "c434e384cf75d9cf099ab5d39359eca2e552fe34e7684a7fd19c0da97383a4d5",
       "planner_blake3": "42ae30abb6b1d546fc38e5488978007ee75ea74ebd9e3d8bd70074b86e934341",
       "execution_blake3": "6b60be4ea79807b2cabbe0c48be7b87f1f4957e5ee9f1d1fdbc0c948a584ac68",
       "statement_count": 1,
@@ -2236,7 +2236,7 @@
     },
     {
       "fixture_id": "fuzz_sql_parser/20db09103a969ec65d30834231086cfe5950d5de",
-      "parser_blake3": "860a7b80516b41d26228346835e5dc253684d0a1c0d0f0faf40ffa505f542318",
+      "parser_blake3": "428c839354f30f888fd29d611164fa6164ac62d43f15b0f45b4ab92f4c884d42",
       "planner_blake3": "9f818a5b5d2db2374b8d16b49a79af11b4f3f10a33857b7ca9ee0a3e191c1d65",
       "execution_blake3": "1145da05aad9cda838e2256de352d19ad7ba10980925c54f81019267ee9b0800",
       "statement_count": 1,
@@ -2772,7 +2772,7 @@
     },
     {
       "fixture_id": "fuzz_sql_parser/28d034951fce38328e21476d28d3189f634a932e",
-      "parser_blake3": "30c8799b2ef8f060f488ea0b6d6668aee896b096f138e72651bb8a483637e6ed",
+      "parser_blake3": "22ac225c9d46a96e55c6abe54270353010a83b65a22e1af41103831802af49c5",
       "planner_blake3": "917ad732135cdd31710c76a48110400a697a7a82726e9ce31b004af1ebc9c1aa",
       "execution_blake3": "6157dca585e50a621f266ea382b96255f63a40c6c58b2cba5fdd7f3efe72c69e",
       "statement_count": 1,
