@@ -807,18 +807,27 @@ impl<P: PageReader> BtCursor<P> {
 
             // Interior index page: binary search to find which child to descend.
             let search_result = self.binary_search_index_interior(cx, &entry, target_key)?;
-            let child_idx = match search_result {
-                BinarySearchResult::NotFound(idx) => idx,
-                BinarySearchResult::Found(_) => {
-                    unreachable!("binary_search_index_interior should not return Found")
+            match search_result {
+                BinarySearchResult::Found(idx) => {
+                    let mut entry = entry;
+                    entry.cell_idx = idx;
+                    self.stack.push(entry);
+                    self.at_eof = false;
+                    self.record_point_witness(WitnessKey::Cell {
+                        btree_root: self.root_page,
+                        tag: Self::cell_tag_from_index_key(target_key),
+                    });
+                    return Ok(SeekResult::Found);
                 }
-            };
-            let child = self.child_page_at(&entry, child_idx)?;
-            let mut entry = entry;
-            entry.cell_idx = child_idx;
-            self.stack.push(entry);
-            self.issue_prefetch_hint(cx, child);
-            current_page = child;
+                BinarySearchResult::NotFound(idx) => {
+                    let child = self.child_page_at(&entry, idx)?;
+                    let mut entry = entry;
+                    entry.cell_idx = idx;
+                    self.stack.push(entry);
+                    self.issue_prefetch_hint(cx, child);
+                    current_page = child;
+                }
+            }
         }
     }
 
@@ -886,10 +895,10 @@ impl<P: PageReader> BtCursor<P> {
             let cell = self.parse_cell_at(entry, mid)?;
             let key = self.read_cell_payload(cx, entry, &cell)?;
 
-            if target < key.as_slice() {
-                hi = mid;
-            } else {
-                lo = mid + 1;
+            match target.cmp(key.as_slice()) {
+                std::cmp::Ordering::Equal => return Ok(BinarySearchResult::Found(mid)),
+                std::cmp::Ordering::Less => hi = mid,
+                std::cmp::Ordering::Greater => lo = mid + 1,
             }
         }
         Ok(BinarySearchResult::NotFound(lo))
@@ -908,12 +917,15 @@ impl<P: PageReader> BtCursor<P> {
         }
 
         let depth = self.stack.len();
-        let top = &self.stack[depth - 1];
+        let (is_leaf, cell_idx, cell_count) = {
+            let top = &self.stack[depth - 1];
+            (top.header.page_type.is_leaf(), top.cell_idx, top.header.cell_count)
+        };
 
         // On a leaf page: try to advance to the next cell.
-        if top.header.page_type.is_leaf() {
-            let next_idx = top.cell_idx + 1;
-            if next_idx < top.header.cell_count {
+        if is_leaf {
+            let next_idx = cell_idx + 1;
+            if next_idx < cell_count {
                 self.stack[depth - 1].cell_idx = next_idx;
                 return Ok(true);
             }
@@ -927,7 +939,9 @@ impl<P: PageReader> BtCursor<P> {
                     if self.is_table {
                         // Table B-trees are B+trees. Skip the separator cell.
                         let next_child_idx = parent.cell_idx + 1;
-                        let child = self.child_page_at(parent, next_child_idx)?;
+                        // Clone parent to drop the borrow so we can mutate `self`.
+                        let parent_clone = parent.clone();
+                        let child = self.child_page_at(&parent_clone, next_child_idx)?;
                         self.stack.last_mut().unwrap().cell_idx = next_child_idx;
                         self.issue_prefetch_hint(cx, child);
                         return self.move_to_leftmost_leaf(cx, child, true);
@@ -948,8 +962,11 @@ impl<P: PageReader> BtCursor<P> {
         // On an interior page (only happens for index B-trees).
         // The current position is the separator cell itself.
         // The next logical entry is the leftmost descendant of the right subtree.
-        let next_child_idx = top.cell_idx + 1;
-        let child = self.child_page_at(top, next_child_idx)?;
+        let next_child_idx = cell_idx + 1;
+        let child = {
+            let top = &self.stack[depth - 1];
+            self.child_page_at(top, next_child_idx)?
+        };
         self.stack.last_mut().unwrap().cell_idx = next_child_idx;
         self.issue_prefetch_hint(cx, child);
         self.move_to_leftmost_leaf(cx, child, true)
@@ -964,12 +981,15 @@ impl<P: PageReader> BtCursor<P> {
             }
 
             // Recover from a seek-past-end EOF sentinel while preserving leaf context.
-            let top = self
-                .stack
-                .last()
-                .ok_or_else(|| FrankenError::internal("cursor stack is empty"))?;
-            if top.header.page_type.is_leaf() && top.header.cell_count > 0 {
-                self.stack.last_mut().unwrap().cell_idx = top.header.cell_count - 1;
+            let (is_leaf, cell_count) = {
+                let top = self
+                    .stack
+                    .last()
+                    .ok_or_else(|| FrankenError::internal("cursor stack is empty"))?;
+                (top.header.page_type.is_leaf(), top.header.cell_count)
+            };
+            if is_leaf && cell_count > 0 {
+                self.stack.last_mut().unwrap().cell_idx = cell_count - 1;
                 self.at_eof = false;
                 return Ok(true);
             }
@@ -983,10 +1003,13 @@ impl<P: PageReader> BtCursor<P> {
         }
 
         let depth = self.stack.len();
-        let top = &self.stack[depth - 1];
+        let (is_leaf, cell_idx) = {
+            let top = &self.stack[depth - 1];
+            (top.header.page_type.is_leaf(), top.cell_idx)
+        };
 
-        if top.header.page_type.is_leaf() {
-            if top.cell_idx > 0 {
+        if is_leaf {
+            if cell_idx > 0 {
                 self.stack[depth - 1].cell_idx -= 1;
                 self.at_eof = false;
                 return Ok(true);
@@ -999,7 +1022,8 @@ impl<P: PageReader> BtCursor<P> {
                     let prev_child_idx = parent.cell_idx - 1;
                     if self.is_table {
                         // Table B-trees are B+trees. Skip separator.
-                        let child = self.child_page_at(parent, prev_child_idx)?;
+                        let parent_clone = parent.clone();
+                        let child = self.child_page_at(&parent_clone, prev_child_idx)?;
                         self.stack.last_mut().unwrap().cell_idx = prev_child_idx;
                         self.issue_prefetch_hint(cx, child);
                         return self.move_to_rightmost_leaf(cx, child, true);
@@ -1020,7 +1044,10 @@ impl<P: PageReader> BtCursor<P> {
         // On an interior page (only happens for index B-trees).
         // The current position is the separator cell itself.
         // The previous logical entry is the rightmost descendant of the left subtree.
-        let child = self.child_page_at(top, top.cell_idx)?;
+        let child = {
+            let top = &self.stack[depth - 1];
+            self.child_page_at(top, cell_idx)?
+        };
         self.issue_prefetch_hint(cx, child);
         self.move_to_rightmost_leaf(cx, child, true)
     }
@@ -1554,18 +1581,36 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
     fn index_insert(&mut self, cx: &Cx, key: &[u8]) -> Result<()> {
         self.with_btree_op(cx, BtreeOpType::Insert, |cursor| {
             let seek = cursor.index_seek(cx, key)?;
-            let top = cursor
-                .stack
-                .last()
-                .ok_or_else(|| FrankenError::internal("cursor stack is empty"))?;
-            let mut insert_idx = if cursor.at_eof {
-                top.header.cell_count
-            } else {
-                top.cell_idx
+            let (is_leaf, cell_idx) = {
+                let top = cursor
+                    .stack
+                    .last()
+                    .ok_or_else(|| FrankenError::internal("cursor stack is empty"))?;
+                (top.header.page_type.is_leaf(), top.cell_idx)
             };
-            if seek.is_found() {
-                // Index allows duplicate keys; place after the existing one.
-                insert_idx = insert_idx.saturating_add(1);
+
+            let mut insert_idx;
+
+            if !is_leaf {
+                // Matched exactly on an interior page. Descend to the right child's leftmost leaf.
+                let right_child = {
+                    let top = cursor.stack.last().unwrap();
+                    cursor.child_page_at(top, cell_idx + 1)?
+                };
+                cursor.move_to_leftmost_leaf(cx, right_child, false)?;
+                
+                insert_idx = 0; // The new key goes at the very beginning of the right subtree.
+            } else {
+                let top = cursor.stack.last().unwrap();
+                insert_idx = if cursor.at_eof {
+                    top.header.cell_count
+                } else {
+                    top.cell_idx
+                };
+                if seek.is_found() {
+                    // Duplicate key on a leaf; place after the existing one.
+                    insert_idx = insert_idx.saturating_add(1);
+                }
             }
 
             let (cell_data, overflow_head) = cursor.encode_index_leaf_cell(cx, key)?;
@@ -1593,14 +1638,16 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
                 return Err(FrankenError::PrimaryKeyViolation);
             }
 
-            let top = cursor
-                .stack
-                .last()
-                .ok_or_else(|| FrankenError::internal("cursor stack is empty"))?;
-            let insert_idx = if cursor.at_eof {
-                top.header.cell_count
-            } else {
-                top.cell_idx
+            let insert_idx = {
+                let top = cursor
+                    .stack
+                    .last()
+                    .ok_or_else(|| FrankenError::internal("cursor stack is empty"))?;
+                if cursor.at_eof {
+                    top.header.cell_count
+                } else {
+                    top.cell_idx
+                }
             };
 
             let (cell_data, overflow_head) = cursor.encode_table_leaf_cell(cx, rowid, data)?;
