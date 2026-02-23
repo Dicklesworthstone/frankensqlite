@@ -517,9 +517,8 @@ impl<'a> Resolver<'a> {
 
                 // Register the subquery alias with empty columns (we don't
                 // track subquery output columns at this stage).
-                if let Some(alias) = alias {
-                    scope.add_alias(alias, "<subquery>", None);
-                }
+                let alias_name = alias.as_deref().unwrap_or("");
+                scope.add_alias(alias_name, "<subquery>", None);
             }
             TableOrSubquery::TableFunction { name, alias, .. } => {
                 let alias_name = alias.as_deref().unwrap_or(name);
