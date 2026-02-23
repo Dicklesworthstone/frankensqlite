@@ -335,14 +335,21 @@ impl ScalarFunction for InstrFunc {
         }
         match (&args[0], &args[1]) {
             (SqliteValue::Blob(haystack), SqliteValue::Blob(needle)) => {
-                // Blob: byte-level search
+                // SQLite returns 0 when either haystack or needle is empty.
+                if haystack.is_empty() || needle.is_empty() {
+                    return Ok(SqliteValue::Integer(0));
+                }
                 let pos = find_bytes(haystack, needle).map_or(0, |p| p + 1);
                 Ok(SqliteValue::Integer(i64::try_from(pos).unwrap_or(0)))
             }
             _ => {
-                // Text: character-level search
+                // Text: character-level search.
+                // SQLite returns 0 when either string is empty.
                 let haystack = args[0].to_text();
                 let needle = args[1].to_text();
+                if haystack.is_empty() || needle.is_empty() {
+                    return Ok(SqliteValue::Integer(0));
+                }
                 let pos = haystack
                     .find(&needle)
                     .map_or(0, |byte_pos| haystack[..byte_pos].chars().count() + 1);
@@ -2314,6 +2321,46 @@ mod tests {
                 &InstrFunc,
                 SqliteValue::Text("hello".to_owned()),
                 SqliteValue::Text("xyz".to_owned())
+            )
+            .unwrap(),
+            SqliteValue::Integer(0)
+        );
+    }
+
+    #[test]
+    fn test_instr_empty_needle_returns_zero() {
+        // SQLite returns 0 for empty needle (not 1).
+        assert_eq!(
+            invoke2(
+                &InstrFunc,
+                SqliteValue::Text("hello".to_owned()),
+                SqliteValue::Text(String::new())
+            )
+            .unwrap(),
+            SqliteValue::Integer(0)
+        );
+    }
+
+    #[test]
+    fn test_instr_empty_haystack_returns_zero() {
+        assert_eq!(
+            invoke2(
+                &InstrFunc,
+                SqliteValue::Text(String::new()),
+                SqliteValue::Text("x".to_owned())
+            )
+            .unwrap(),
+            SqliteValue::Integer(0)
+        );
+    }
+
+    #[test]
+    fn test_instr_blob_empty_needle_returns_zero() {
+        assert_eq!(
+            invoke2(
+                &InstrFunc,
+                SqliteValue::Blob(vec![1, 2, 3]),
+                SqliteValue::Blob(vec![])
             )
             .unwrap(),
             SqliteValue::Integer(0)

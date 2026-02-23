@@ -603,10 +603,17 @@ impl<'a> Lexer<'a> {
                 return TokenKind::Error("empty hex literal".to_owned());
             }
             let hex_str = String::from_utf8_lossy(&self.src[hex_start..self.pos]);
-            let parse_str = if hex_str.len() > 16 {
-                &hex_str[hex_str.len() - 16..]
+            // Strip leading zeros then check significant digit count,
+            // matching C SQLite's sqlite3DecOrHexToI64 which rejects
+            // hex literals with >16 significant digits.
+            let significant = hex_str.trim_start_matches('0');
+            if significant.len() > 16 {
+                return TokenKind::Error(format!("hex literal out of range at byte {start}"));
+            }
+            let parse_str = if significant.is_empty() {
+                "0"
             } else {
-                &hex_str
+                significant
             };
             // Parse as u64 and bitwise-cast to i64 — matching C SQLite's
             // sqlite3DecOrHexToI64 which uses memcpy(pOut, &u, 8).
@@ -616,7 +623,7 @@ impl<'a> Lexer<'a> {
                     let i = v as i64;
                     TokenKind::Integer(i)
                 }
-                Err(_) => TokenKind::Error(format!("hex literal out of range at byte {}", start)),
+                Err(_) => TokenKind::Error(format!("hex literal out of range at byte {start}")),
             };
         }
 
@@ -1121,6 +1128,26 @@ mod tests {
         // 0x7FFFFFFFFFFFFFFF = i64::MAX.
         let tokens = kinds("0x7FFFFFFFFFFFFFFF");
         assert_eq!(tokens[0], TokenKind::Integer(i64::MAX));
+    }
+
+    #[test]
+    fn test_lex_hex_overflow_17_digits_rejects() {
+        // 0x10000000000000000 has 17 significant hex digits → must error,
+        // not silently truncate to 0.
+        let tokens = kinds("0x10000000000000000");
+        assert!(
+            matches!(&tokens[0], TokenKind::Error(msg) if msg.contains("out of range")),
+            "expected error for 17-digit hex, got {:?}",
+            tokens[0]
+        );
+    }
+
+    #[test]
+    fn test_lex_hex_leading_zeros_accepted() {
+        // Leading zeros are stripped before the length check, so
+        // 0x00000000000000001 (17 chars, 1 significant) is valid.
+        let tokens = kinds("0x00000000000000001");
+        assert_eq!(tokens[0], TokenKind::Integer(1));
     }
 
     fn histogram_total(hist: &TokenizeDurationSecondsHistogram) -> u64 {
