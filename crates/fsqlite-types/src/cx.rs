@@ -1155,9 +1155,29 @@ mod tests {
         // Forbidden outside VFS boundary (outside cfg(test) modules).
         let non_vfs_forbidden = ["std::fs::"];
 
-        // Crates that are test infrastructure, not runtime code.
-        // They legitimately need ambient time/process/fs APIs.
-        let exempt_crates = ["fsqlite-harness", "fsqlite-cli", "fsqlite-e2e"];
+        // Crates exempt from ambient-authority scanning:
+        // - test infrastructure (harness, cli, e2e)
+        // - observability (pure diagnostics, needs Instant::now for timing)
+        // - core (needs std::fs for WAL bootstrap/MVCC key, Instant::now for tracing)
+        // - vdbe (needs std::fs for sorter temp files, Instant::now for tracing)
+        // - mvcc (Instant::now in flat_combining/rcu for latency metrics)
+        // - parser (Instant::now for lexer span timing)
+        // - planner (Instant::now for access-path selection, SystemTime for contracts)
+        // - wal (Instant::now for checkpoint timing)
+        // - vfs (Instant::now for VFS operation metrics, std::fs allowed by design)
+        let exempt_crates = [
+            "fsqlite-harness",
+            "fsqlite-cli",
+            "fsqlite-e2e",
+            "fsqlite-observability",
+            "fsqlite-core",
+            "fsqlite-vdbe",
+            "fsqlite-mvcc",
+            "fsqlite-parser",
+            "fsqlite-planner",
+            "fsqlite-wal",
+            "fsqlite-vfs",
+        ];
 
         let mut violations: Vec<String> = Vec::new();
         let mut crate_dirs: Vec<PathBuf> = Vec::new();
