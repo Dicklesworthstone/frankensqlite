@@ -8,7 +8,9 @@
 //! - [`CheckpointTargetAdapterRef`] wraps `CheckpointPageWriter` to satisfy the
 //!   WAL executor's [`CheckpointTarget`] trait (WAL → pager direction).
 
-use fsqlite_error::Result;
+use std::collections::HashMap;
+
+use fsqlite_error::{FrankenError, Result};
 use fsqlite_pager::{CheckpointMode, CheckpointPageWriter, CheckpointResult, WalBackend};
 use fsqlite_types::PageNumber;
 use fsqlite_types::cx::Cx;
@@ -18,7 +20,8 @@ use fsqlite_wal::{
     CheckpointMode as WalCheckpointMode, CheckpointState, CheckpointTarget, WalFile,
     execute_checkpoint,
 };
-use tracing::{debug, warn};
+use fsqlite_wal::checksum::WalSalts;
+use tracing::{debug, trace, warn};
 
 use crate::wal_fec_adapter::{FecCommitHook, FecCommitResult};
 
@@ -39,28 +42,46 @@ pub struct WalBackendAdapter<F: VfsFile> {
     fec_hook: Option<FecCommitHook>,
     /// Accumulated FEC commit results (for later sidecar persistence).
     fec_pending: Vec<FecCommitResult>,
+    /// Cached mapping from page_number → frame_index for O(1) WAL page lookups.
+    /// Maps each page to the index of the most recent committed frame containing it.
+    page_index: HashMap<u32, usize>,
+    /// The last committed frame index through which `page_index` has been built,
+    /// or `None` if the index needs a full rebuild (e.g. after WAL reset).
+    index_built_to: Option<usize>,
+    /// WAL salts at the time `page_index` was last built.  If the current
+    /// WAL header salts differ, the WAL was reset (new generation) and the
+    /// index must be fully rebuilt — even if frame counts happen to match.
+    index_salts: WalSalts,
 }
 
 impl<F: VfsFile> WalBackendAdapter<F> {
     /// Wrap an existing [`WalFile`] in the adapter (FEC disabled).
     #[must_use]
     pub fn new(wal: WalFile<F>) -> Self {
+        let salts = wal.header().salts;
         Self {
             wal,
             refresh_before_append: true,
             fec_hook: None,
             fec_pending: Vec::new(),
+            page_index: HashMap::new(),
+            index_built_to: None,
+            index_salts: salts,
         }
     }
 
     /// Wrap an existing [`WalFile`] with an FEC commit hook.
     #[must_use]
     pub fn with_fec_hook(wal: WalFile<F>, hook: FecCommitHook) -> Self {
+        let salts = wal.header().salts;
         Self {
             wal,
             refresh_before_append: true,
             fec_hook: Some(hook),
             fec_pending: Vec::new(),
+            page_index: HashMap::new(),
+            index_built_to: None,
+            index_salts: salts,
         }
     }
 
@@ -77,13 +98,34 @@ impl<F: VfsFile> WalBackendAdapter<F> {
     }
 
     /// Mutably borrow the inner [`WalFile`].
+    ///
+    /// Invalidates the page index so that the next `read_page` rebuilds
+    /// from scratch, preventing stale lookups after structural WAL
+    /// mutations (append, reset, truncate).
+    ///
+    /// # Warning
+    ///
+    /// FEC state (`fec_pending`, `fec_hook`) is **not** invalidated.
+    /// Intended for test fixtures and one-off administrative operations,
+    /// not production read/write paths.
     pub fn inner_mut(&mut self) -> &mut WalFile<F> {
+        self.page_index.clear();
+        self.index_built_to = None;
         &mut self.wal
     }
 
     /// Take any pending FEC commit results for sidecar persistence.
+    ///
+    /// Retains the Vec's capacity (capped at 256) so the next commit cycle
+    /// avoids reallocation while shedding anomalous spikes from bulk
+    /// transactions.
+    #[must_use]
     pub fn take_fec_pending(&mut self) -> Vec<FecCommitResult> {
-        std::mem::take(&mut self.fec_pending)
+        if self.fec_pending.is_empty() {
+            return Vec::new();
+        }
+        let cap = self.fec_pending.capacity().min(256);
+        std::mem::replace(&mut self.fec_pending, Vec::with_capacity(cap))
     }
 
     /// Whether FEC encoding is active.
@@ -99,6 +141,89 @@ impl<F: VfsFile> WalBackendAdapter<F> {
         if let Some(hook) = &mut self.fec_hook {
             hook.discard_buffered();
         }
+    }
+
+    /// Ensure `page_index` is up to date through `last_commit_frame`.
+    ///
+    /// Scans only the frames added since the last call, building the index
+    /// incrementally.  Each page maps to the frame index of its most recent
+    /// committed version (newest frame wins, matching SQLite WAL read protocol).
+    ///
+    /// The initial build reads one frame header per WAL frame (O(N) I/O).
+    /// This is a one-time cost per WAL generation; subsequent lookups are O(1).
+    fn ensure_index_current(&mut self, cx: &Cx, last_commit_frame: usize) -> Result<()> {
+        // Detect WAL generation change via salt comparison.  If the WAL was
+        // reset (checkpoint + truncate), the salts will differ even if frame
+        // counts happen to match.
+        let current_salts = self.wal.header().salts;
+        let generation_changed = current_salts != self.index_salts;
+
+        let start = if generation_changed {
+            debug!(last_commit_frame, "WAL generation change detected (salts differ); full index rebuild");
+            self.shrink_or_clear_index();
+            0
+        } else {
+            match self.index_built_to {
+                Some(prev) if prev == last_commit_frame => return Ok(()), // already current
+                Some(prev) if prev < last_commit_frame => prev + 1,      // incremental extend
+                Some(_) => {
+                    // prev > last_commit_frame: WAL shrank externally.
+                    debug!(last_commit_frame, "WAL shrank (prev > last_commit_frame); full index rebuild");
+                    self.shrink_or_clear_index();
+                    0
+                }
+                None => {
+                    debug!(last_commit_frame, "Building WAL page index from scratch");
+                    0
+                }
+            }
+        };
+
+        let result = self.build_index_range(cx, start, last_commit_frame);
+        if result.is_err() {
+            // On I/O error, discard the partially-built index to prevent
+            // stale reads (a page might have a newer version in the
+            // un-indexed tail).
+            self.page_index.clear();
+            self.index_built_to = None;
+        } else if generation_changed {
+            // Only record the new salts after a successful build.
+            self.index_salts = current_salts;
+        }
+        result
+    }
+
+    /// Maximum entries to pre-allocate in `page_index.reserve()`.
+    const MAX_RESERVE: usize = 65_536;
+
+    /// Scan frame headers in `[start, end]` and insert into `page_index`.
+    fn build_index_range(&mut self, cx: &Cx, start: usize, end: usize) -> Result<()> {
+        debug_assert!(start <= end, "build_index_range: start ({start}) > end ({end})");
+        let count = end.saturating_sub(start).saturating_add(1);
+        if count > 1 {
+            self.page_index.reserve(count.min(Self::MAX_RESERVE));
+        }
+        for i in start..=end {
+            let header = self.wal.read_frame_header(cx, i)?;
+            self.page_index.insert(header.page_number, i);
+        }
+        self.index_built_to = Some(end);
+        Ok(())
+    }
+
+    /// Clear the page index, retaining capacity if within reasonable bounds.
+    fn shrink_or_clear_index(&mut self) {
+        if self.page_index.capacity() > Self::MAX_RESERVE {
+            self.page_index = HashMap::new();
+        } else {
+            self.page_index.clear();
+        }
+    }
+
+    /// Invalidate the page index, forcing a full rebuild on the next read.
+    fn invalidate_page_index(&mut self) {
+        self.page_index = HashMap::new();
+        self.index_built_to = None;
     }
 }
 
@@ -128,6 +253,7 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
         page_data: &[u8],
         db_size_if_commit: u32,
     ) -> Result<()> {
+        debug_assert!(page_number > 0, "page_number must be 1-based, got 0");
         if self.refresh_before_append {
             // Keep this handle synchronized with external WAL growth/reset
             // before choosing append offset and checksum seed.
@@ -153,6 +279,9 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
                 Ok(None) => {}
                 Err(e) => {
                     // FEC encoding failure is non-fatal — log and continue.
+                    // Discard the hook's buffered pages to prevent a partial
+                    // FEC block from being emitted on the next commit frame.
+                    hook.discard_buffered();
                     warn!(error = %e, "FEC encoding failed; commit proceeds without repair symbols");
                 }
             }
@@ -162,29 +291,35 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
     }
 
     fn read_page(&mut self, cx: &Cx, page_number: u32) -> Result<Option<Vec<u8>>> {
+        debug_assert!(page_number > 0, "page_number must be 1-based, got 0");
         // Restrict visibility to committed frames only.
         let Some(last_commit_frame) = self.wal.last_commit_frame(cx)? else {
             return Ok(None);
         };
 
-        // Scan backwards from the most recent committed frame to find the
-        // latest version of the requested page — matching SQLite's WAL read
-        // protocol (newest frame wins).
-        for i in (0..=last_commit_frame).rev() {
-            let header = self.wal.read_frame_header(cx, i)?;
-            if header.page_number == page_number {
-                let mut frame_buf = vec![0u8; self.wal.frame_size()];
-                self.wal.read_frame_into(cx, i, &mut frame_buf)?;
-                let data = frame_buf[fsqlite_wal::checksum::WAL_FRAME_HEADER_SIZE..].to_vec();
-                debug!(
-                    page_number,
-                    frame_index = i,
-                    "WAL adapter: page found in WAL"
-                );
-                return Ok(Some(data));
+        // Build/extend the page index so lookups are O(1) instead of O(n).
+        self.ensure_index_current(cx, last_commit_frame)?;
+
+        if let Some(&frame_index) = self.page_index.get(&page_number) {
+            let (header, data) = self.wal.read_frame(cx, frame_index)?;
+            // Verify the physical frame header matches the requested page.
+            // The old scan-based code implicitly validated this via its loop
+            // condition; the HashMap lookup must check explicitly.  This is a
+            // runtime check (not debug_assert) because a mismatch in release
+            // builds would silently return wrong page data.
+            if header.page_number != page_number {
+                return Err(FrankenError::WalCorrupt {
+                    detail: format!(
+                        "page index inconsistency: frame {frame_index} contains page {}, expected {page_number}",
+                        header.page_number
+                    ),
+                });
             }
+            trace!(page_number, frame_index, "WAL adapter: page found in WAL");
+            Ok(Some(data))
+        } else {
+            Ok(None)
         }
-        Ok(None)
     }
 
     fn sync(&mut self, cx: &Cx) -> Result<()> {
@@ -208,7 +343,13 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
         // Refresh so planner state reflects the latest on-disk WAL shape.
         self.wal.refresh(cx)?;
         self.refresh_before_append = true;
-        let total_frames = u32::try_from(self.wal.frame_count()).unwrap_or(u32::MAX);
+
+        let frame_count = self.wal.frame_count();
+        debug_assert!(
+            frame_count <= u32::MAX as usize,
+            "WAL frame count {frame_count} exceeds u32::MAX; checkpoint state will be wrong"
+        );
+        let total_frames = u32::try_from(frame_count).unwrap_or(u32::MAX);
 
         // Build checkpoint state for the planner.
         let state = CheckpointState {
@@ -224,11 +365,15 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
         let result = execute_checkpoint(cx, &mut self.wal, to_wal_mode(mode), state, &mut target)?;
 
         // Checkpoint-aware FEC lifecycle: once frames are backfilled to the
-        // database file, their FEC symbols are no longer needed.  Clear
-        // pending FEC results for the checkpointed range.
+        // database file, their FEC symbols are no longer needed.
+        // TODO: This clears ALL pending symbols regardless of how many frames
+        // were actually backfilled.  For partial (passive) checkpoints where
+        // readers block full backfill, symbols for non-backfilled frames are
+        // lost.
         if result.frames_backfilled > 0 {
             let drained = self.fec_pending.len();
             self.fec_pending.clear();
+            self.fec_pending.shrink_to(256);
             if drained > 0 {
                 debug!(
                     drained_groups = drained,
@@ -238,9 +383,16 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
             }
         }
 
-        // If the WAL was fully reset, also discard any buffered FEC pages.
+        // If the WAL was fully reset, also discard any buffered FEC pages
+        // and invalidate the page index.
         if result.wal_was_reset {
             self.fec_discard();
+            if !self.fec_pending.is_empty() {
+                self.fec_pending.clear();
+                self.fec_pending.shrink_to(256);
+            }
+            self.invalidate_page_index();
+            self.index_salts = self.wal.header().salts;
         }
 
         Ok(CheckpointResult {
@@ -261,14 +413,17 @@ struct CheckpointTargetAdapterRef<'a> {
 }
 
 impl CheckpointTarget for CheckpointTargetAdapterRef<'_> {
+    #[inline]
     fn write_page(&mut self, cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()> {
         self.writer.write_page(cx, page_no, data)
     }
 
+    #[inline]
     fn truncate_db(&mut self, cx: &Cx, n_pages: u32) -> Result<()> {
         self.writer.truncate(cx, n_pages)
     }
 
+    #[inline]
     fn sync_db(&mut self, cx: &Cx) -> Result<()> {
         self.writer.sync(cx)
     }
@@ -551,6 +706,48 @@ mod tests {
 
         let page = backend.read_page(&cx, 1).expect("read via dyn");
         assert_eq!(page, Some(sample_page(0x77)));
+    }
+
+    #[test]
+    fn test_adapter_index_rebuilds_after_wal_reset() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let mut adapter = make_adapter(&vfs, &cx);
+
+        // Write and commit page 1.
+        let original = sample_page(0xAA);
+        adapter
+            .append_frame(&cx, 1, &original, 1)
+            .expect("append committed");
+
+        // Force-read to build the index.
+        let result = adapter.read_page(&cx, 1).expect("first read");
+        assert_eq!(result, Some(original.clone()));
+
+        // Simulate WAL reset: reset the WAL with new salts.
+        let new_salts = WalSalts {
+            salt1: 0x1111_1111,
+            salt2: 0x2222_2222,
+        };
+        adapter
+            .inner_mut()
+            .reset(&cx, 1, new_salts)
+            .expect("reset WAL");
+
+        // Write a different page 1 in the new WAL generation.
+        let updated = sample_page(0xBB);
+        adapter
+            .append_frame(&cx, 1, &updated, 1)
+            .expect("append in new generation");
+
+        // The adapter must detect the salt change and rebuild the index,
+        // returning the new data — not the stale cached version.
+        let result = adapter.read_page(&cx, 1).expect("read after reset");
+        assert_eq!(
+            result,
+            Some(updated),
+            "adapter must detect WAL generation change and return fresh data"
+        );
     }
 
     // -- CheckpointTargetAdapterRef tests --
