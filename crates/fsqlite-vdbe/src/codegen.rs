@@ -5628,10 +5628,8 @@ mod tests {
         let prog = b.finish().unwrap();
 
         assert!(
-            prog.ops().iter().any(
-                |op| op.opcode == Opcode::Int64
-                    && matches!(op.p4, P4::Int64(value) if value == big)
-            ),
+            prog.ops().iter().any(|op| op.opcode == Opcode::Int64
+                && matches!(op.p4, P4::Int64(value) if value == big)),
             "expected OP_Int64 carrying the full i64 literal in INSERT VALUES codegen"
         );
     }
@@ -5647,11 +5645,9 @@ mod tests {
 
         let prog = b.finish().unwrap();
         assert!(
-            prog.ops().iter().any(
-                |op| op.opcode == Opcode::Int64
-                    && op.p2 == reg
-                    && matches!(op.p4, P4::Int64(value) if value == big)
-            ),
+            prog.ops().iter().any(|op| op.opcode == Opcode::Int64
+                && op.p2 == reg
+                && matches!(op.p4, P4::Int64(value) if value == big)),
             "expected OP_Int64 for large LIMIT literals"
         );
     }
