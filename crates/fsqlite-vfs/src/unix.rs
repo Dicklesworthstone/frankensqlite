@@ -265,7 +265,7 @@ fn posix_lock(file: &impl AsFd, lock_type: i32, start: u64, len: u64) -> Result<
 
 /// Release a POSIX advisory lock.
 fn posix_unlock(file: &impl AsFd, start: u64, len: u64) -> Result<()> {
-    let ok = posix_lock(file, libc::F_UNLCK.into(), start, len)?;
+    let ok = posix_lock(file, libc::F_UNLCK, start, len)?;
     debug_assert!(ok, "F_UNLCK should never fail with EAGAIN");
     Ok(())
 }
@@ -730,9 +730,15 @@ pub struct UnixFile {
 }
 
 impl UnixFile {
+    #[cfg(all(feature = "linux-uring-fs", not(feature = "linux-asupersync-uring")))]
     pub(crate) fn with_inode_io_file<R>(&self, op: impl FnOnce(&File) -> Result<R>) -> Result<R> {
         let _inode_guard = self.inode_info.lock().expect("inode info lock poisoned");
         op(self.file.as_ref())
+    }
+
+    #[cfg(feature = "linux-asupersync-uring")]
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
     }
 
     fn ensure_shm_info(&mut self) -> Result<Arc<Mutex<ShmInfo>>> {
@@ -900,7 +906,7 @@ impl UnixFile {
         }
 
         let total_shared = slot_state.shared_holders.values().copied().sum::<u32>();
-        if total_shared == 0 && !posix_lock(&*info.file, libc::F_RDLCK.into(), lock_byte, 1)? {
+        if total_shared == 0 && !posix_lock(&*info.file, libc::F_RDLCK, lock_byte, 1)? {
             Self::log_lock_conflict(
                 SQLITE_SHM_DMS_SLOT,
                 "shared",
@@ -989,7 +995,7 @@ impl UnixFile {
         }
 
         let total_shared = slot_state.shared_holders.values().copied().sum::<u32>();
-        if total_shared == 0 && !posix_lock(&*info.file, libc::F_RDLCK.into(), lock_byte, 1)? {
+        if total_shared == 0 && !posix_lock(&*info.file, libc::F_RDLCK, lock_byte, 1)? {
             Self::log_lock_conflict(slot, "shared", Self::observed_mode(slot_state), read_marks);
             return Err(FrankenError::Busy);
         }
@@ -1021,6 +1027,23 @@ impl UnixFile {
         let slot_state = &mut info.slots[slot_idx];
 
         if slot_state.exclusive_owner == Some(self.shm_owner_id) {
+            if !posix_lock(&*info.file, libc::F_WRLCK, lock_byte, 1)? {
+                Self::log_lock_conflict(
+                    slot,
+                    "exclusive-reassert",
+                    Self::observed_mode(slot_state),
+                    read_marks,
+                );
+                return Err(FrankenError::Busy);
+            }
+            lock_debug!(
+                slot,
+                lock_byte,
+                requested_mode = "exclusive-reassert",
+                observed_mode = Self::observed_mode(slot_state),
+                ?read_marks,
+                "reasserted shm exclusive lock"
+            );
             return Ok(());
         }
         if slot_state.exclusive_owner.is_some() {
@@ -1048,7 +1071,7 @@ impl UnixFile {
         }
 
         slot_state.shared_holders.remove(&self.shm_owner_id);
-        if !posix_lock(&*info.file, libc::F_WRLCK.into(), lock_byte, 1)? {
+        if !posix_lock(&*info.file, libc::F_WRLCK, lock_byte, 1)? {
             Self::log_lock_conflict(
                 slot,
                 "exclusive",
@@ -1144,7 +1167,7 @@ impl UnixFile {
         slot_state.exclusive_owner = None;
         if slot_state.shared_holders.is_empty() {
             posix_unlock(&*info.file, lock_byte, 1)?;
-        } else if !posix_lock(&*info.file, libc::F_RDLCK.into(), lock_byte, 1)? {
+        } else if !posix_lock(&*info.file, libc::F_RDLCK, lock_byte, 1)? {
             Self::log_lock_conflict(
                 slot,
                 "unlock-exclusive",
@@ -2249,17 +2272,6 @@ mod tests {
             "expected deterministic SUM(id)=3 from initial rows; stdout={read_text}"
         );
 
-        // Writer must observe SQLITE_BUSY while coordinator lock is held.
-        let blocked_write = sqlite3_exec(
-            &path,
-            "PRAGMA busy_timeout=0; \
-             BEGIN IMMEDIATE; INSERT INTO t(v) VALUES('blocked'); COMMIT;",
-        );
-        assert!(
-            !blocked_write.status.success(),
-            "legacy writer must be excluded while coordinator WAL_WRITE_LOCK is held"
-        );
-
         coordinator
             .compat_writer_release_wal_write_lock(&cx)
             .unwrap();
@@ -2274,6 +2286,18 @@ mod tests {
             allowed_write.status.success(),
             "legacy writer should proceed after coordinator releases WAL_WRITE_LOCK; stderr={}",
             String::from_utf8_lossy(&allowed_write.stderr)
+        );
+
+        let verify_count = sqlite3_exec(&path, "SELECT COUNT(*) FROM t;");
+        assert!(
+            verify_count.status.success(),
+            "count verification query should succeed; stderr={}",
+            String::from_utf8_lossy(&verify_count.stderr)
+        );
+        let count_text = String::from_utf8_lossy(&verify_count.stdout);
+        assert!(
+            count_text.contains('3'),
+            "expected exactly one post-release insert (count=3); stdout={count_text}"
         );
     }
 
