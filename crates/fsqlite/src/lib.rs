@@ -2495,6 +2495,37 @@ mod tests {
     }
 
     #[test]
+    fn not_null_returns_null() {
+        let conn = Connection::open(":memory:").unwrap();
+        // NOT NULL should be NULL, not 1.
+        let rows = conn.query("SELECT NOT NULL;").unwrap();
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Null);
+    }
+
+    #[test]
+    fn not_null_in_where_excludes_row() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE nn (id INTEGER PRIMARY KEY, flag INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO nn VALUES (1, NULL), (2, 0), (3, 1);")
+            .unwrap();
+        // NOT flag: NOT NULL=NULL (excluded), NOT 0=1 (included), NOT 1=0 (excluded).
+        let rows = conn
+            .query("SELECT id FROM nn WHERE NOT flag ORDER BY id;")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(2));
+    }
+
+    #[test]
+    fn bitnot_null_returns_null() {
+        let conn = Connection::open(":memory:").unwrap();
+        // ~NULL should be NULL.
+        let rows = conn.query("SELECT ~NULL;").unwrap();
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Null);
+    }
+
+    #[test]
     fn probe_update_where_column_cmp() {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER);")

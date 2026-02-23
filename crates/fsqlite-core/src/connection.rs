@@ -9024,7 +9024,14 @@ fn evaluate_having_value(
                         SqliteValue::Integer(i64::from(!is_sqlite_truthy(&v)))
                     }
                 }
-                _ => SqliteValue::Null,
+                fsqlite_ast::UnaryOp::BitNot => {
+                    if matches!(v, SqliteValue::Null) {
+                        SqliteValue::Null
+                    } else {
+                        SqliteValue::Integer(!v.to_integer())
+                    }
+                }
+                fsqlite_ast::UnaryOp::Plus => v,
             }
         }
 
@@ -12368,7 +12375,22 @@ fn eval_join_expr(
                     SqliteValue::Float(f) => SqliteValue::Float(-f),
                     _ => SqliteValue::Null,
                 },
-                UnaryOp::Not => SqliteValue::Integer(i64::from(!is_sqlite_truthy(&val))),
+                // NOT NULL is NULL per three-valued logic.
+                UnaryOp::Not => {
+                    if val.is_null() {
+                        SqliteValue::Null
+                    } else {
+                        SqliteValue::Integer(i64::from(!is_sqlite_truthy(&val)))
+                    }
+                }
+                // ~NULL is NULL.
+                UnaryOp::BitNot => {
+                    if val.is_null() {
+                        SqliteValue::Null
+                    } else {
+                        SqliteValue::Integer(!val.to_integer())
+                    }
+                }
                 _ => SqliteValue::Null,
             })
         }
