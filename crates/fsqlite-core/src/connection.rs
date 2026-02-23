@@ -11717,31 +11717,70 @@ fn emit_between_expr(
     emit_expr(builder, low, low_reg, bind_state)?;
     emit_expr(builder, high, high_reg, bind_state)?;
 
-    // Labels for the short-circuit evaluation.
+    // Three-valued NULL logic for BETWEEN.  BETWEEN is equivalent to
+    // (expr >= low) AND (expr <= high) with three-valued AND:
+    //   FALSE AND x     = FALSE
+    //   NULL  AND TRUE  = NULL
+    //   NULL  AND NULL  = NULL
+    //   TRUE  AND TRUE  = TRUE
     let lbl_false = builder.emit_label();
+    let lbl_null = builder.emit_label();
     let lbl_true = builder.emit_label();
     let lbl_done = builder.emit_label();
+    let lbl_low_null = builder.emit_label();
 
-    // expr >= low  (jump to true_of_ge if true, fall through to false)
+    // If operand is NULL, short-circuit to NULL result.
+    builder.emit_jump_to_label(Opcode::IsNull, expr_reg, 0, lbl_null, P4::None, 0);
+
+    // Check: expr >= low.  Ge jumps when true with non-NULL operands.
     let lbl_ge_ok = builder.emit_label();
     builder.emit_jump_to_label(Opcode::Ge, low_reg, expr_reg, lbl_ge_ok, P4::None, 0);
-    // expr < low → not between
+    // Ge didn't fire: either (a) low is NULL, or (b) expr < low → FALSE.
+    builder.emit_jump_to_label(Opcode::IsNull, low_reg, 0, lbl_low_null, P4::None, 0);
     builder.emit_jump_to_label(Opcode::Goto, 0, 0, lbl_false, P4::None, 0);
+
+    // expr >= low confirmed (low is not NULL since Ge fired).
     builder.resolve_label(lbl_ge_ok);
-
-    // expr <= high
+    // Check: expr <= high.
     builder.emit_jump_to_label(Opcode::Le, high_reg, expr_reg, lbl_true, P4::None, 0);
-    // expr > high → not between
+    // Le didn't fire: either high is NULL → TRUE AND NULL = NULL,
+    // or expr > high → FALSE.
+    builder.emit_jump_to_label(Opcode::IsNull, high_reg, 0, lbl_null, P4::None, 0);
     builder.emit_jump_to_label(Opcode::Goto, 0, 0, lbl_false, P4::None, 0);
 
-    // Both conditions satisfied: BETWEEN is true.
+    // Low was NULL — the >= result is NULL.  Must still evaluate <=
+    // because NULL AND FALSE = FALSE (short-circuit on FALSE).
+    builder.resolve_label(lbl_low_null);
+    let lbl_low_null_le_ok = builder.emit_label();
+    builder.emit_jump_to_label(
+        Opcode::Le,
+        high_reg,
+        expr_reg,
+        lbl_low_null_le_ok,
+        P4::None,
+        0,
+    );
+    // Le didn't fire: high is NULL → NULL AND NULL = NULL,
+    // or expr > high → NULL AND FALSE = FALSE.
+    builder.emit_jump_to_label(Opcode::IsNull, high_reg, 0, lbl_null, P4::None, 0);
+    builder.emit_jump_to_label(Opcode::Goto, 0, 0, lbl_false, P4::None, 0);
+    // expr <= high confirmed but low was NULL → NULL AND TRUE = NULL.
+    builder.resolve_label(lbl_low_null_le_ok);
+    builder.emit_jump_to_label(Opcode::Goto, 0, 0, lbl_null, P4::None, 0);
+
+    // Both conditions satisfied with non-NULL bounds.
     builder.resolve_label(lbl_true);
     builder.emit_op(Opcode::Integer, i32::from(!not), target_reg, 0, P4::None, 0);
     builder.emit_jump_to_label(Opcode::Goto, 0, 0, lbl_done, P4::None, 0);
 
-    // At least one condition failed: BETWEEN is false.
+    // At least one condition is definitely FALSE.
     builder.resolve_label(lbl_false);
     builder.emit_op(Opcode::Integer, i32::from(not), target_reg, 0, P4::None, 0);
+    builder.emit_jump_to_label(Opcode::Goto, 0, 0, lbl_done, P4::None, 0);
+
+    // NULL involvement without definite FALSE → result is NULL.
+    builder.resolve_label(lbl_null);
+    builder.emit_op(Opcode::Null, 0, target_reg, 0, P4::None, 0);
 
     builder.resolve_label(lbl_done);
 
@@ -11787,25 +11826,51 @@ fn emit_in_expr(
     let expr_reg = builder.alloc_temp();
     emit_expr(builder, expr, expr_reg, bind_state)?;
 
+    let lbl_null = builder.emit_label();
     let lbl_found = builder.emit_label();
     let lbl_done = builder.emit_label();
+
+    // Three-valued NULL semantics for IN:
+    //   NULL IN (...)            → NULL
+    //   v IN (a, NULL, b) miss   → NULL  (NULL in list)
+    //   v IN (a, b, c) miss      → FALSE (no NULLs)
+    //   v IN (...) hit           → TRUE
+    builder.emit_jump_to_label(Opcode::IsNull, expr_reg, 0, lbl_null, P4::None, 0);
+
+    // r_saw_null: set to 1 at runtime if any list element is NULL.
+    let r_saw_null = builder.alloc_temp();
+    builder.emit_op(Opcode::Integer, 0, r_saw_null, 0, P4::None, 0);
 
     // Check each list element against expr.
     let elem_reg = builder.alloc_temp();
     for elem in list {
         emit_expr(builder, elem, elem_reg, bind_state)?;
         builder.emit_jump_to_label(Opcode::Eq, elem_reg, expr_reg, lbl_found, P4::None, 0);
+        // Eq with NULL never jumps.  If this value was NULL, flag it.
+        let next_val = builder.emit_label();
+        let set_flag = builder.emit_label();
+        builder.emit_jump_to_label(Opcode::IsNull, elem_reg, 0, set_flag, P4::None, 0);
+        builder.emit_jump_to_label(Opcode::Goto, 0, 0, next_val, P4::None, 0);
+        builder.resolve_label(set_flag);
+        builder.emit_op(Opcode::Integer, 1, r_saw_null, 0, P4::None, 0);
+        builder.resolve_label(next_val);
     }
     builder.free_temp(elem_reg);
 
-    // No match found.
+    // No match.  If any element was NULL → result is NULL.
+    builder.emit_jump_to_label(Opcode::If, r_saw_null, 0, lbl_null, P4::None, 0);
+    builder.free_temp(r_saw_null);
     builder.emit_op(Opcode::Integer, i32::from(not), target_reg, 0, P4::None, 0);
+    builder.emit_jump_to_label(Opcode::Goto, 0, 0, lbl_done, P4::None, 0);
+
+    // NULL result.
+    builder.resolve_label(lbl_null);
+    builder.emit_op(Opcode::Null, 0, target_reg, 0, P4::None, 0);
     builder.emit_jump_to_label(Opcode::Goto, 0, 0, lbl_done, P4::None, 0);
 
     // Match found.
     builder.resolve_label(lbl_found);
-    let found_val = i32::from(!not);
-    builder.emit_op(Opcode::Integer, found_val, target_reg, 0, P4::None, 0);
+    builder.emit_op(Opcode::Integer, i32::from(!not), target_reg, 0, P4::None, 0);
 
     builder.resolve_label(lbl_done);
     builder.free_temp(expr_reg);
@@ -12084,13 +12149,23 @@ fn eval_join_expr(
             let val = eval_join_expr(inner, row, col_map)?;
             let low_val = eval_join_expr(low, row, col_map)?;
             let high_val = eval_join_expr(high, row, col_map)?;
-            let in_range = cmp_values(&val, &low_val) != std::cmp::Ordering::Less
-                && cmp_values(&val, &high_val) != std::cmp::Ordering::Greater;
-            Ok(SqliteValue::Integer(i64::from(if *not {
-                !in_range
+            // Three-valued BETWEEN: (val >= low) AND (val <= high).
+            let ge_low = if val.is_null() || low_val.is_null() {
+                None // NULL comparison → unknown
             } else {
-                in_range
-            })))
+                Some(cmp_values(&val, &low_val) != std::cmp::Ordering::Less)
+            };
+            let le_high = if val.is_null() || high_val.is_null() {
+                None
+            } else {
+                Some(cmp_values(&val, &high_val) != std::cmp::Ordering::Greater)
+            };
+            // Three-valued AND: FALSE wins over NULL.
+            match (ge_low, le_high) {
+                (Some(false), _) | (_, Some(false)) => Ok(SqliteValue::Integer(i64::from(*not))),
+                (Some(true), Some(true)) => Ok(SqliteValue::Integer(i64::from(!*not))),
+                _ => Ok(SqliteValue::Null),
+            }
         }
         Expr::In {
             expr: inner,
@@ -12099,11 +12174,20 @@ fn eval_join_expr(
             ..
         } => {
             let val = eval_join_expr(inner, row, col_map)?;
+            // Three-valued IN: NULL operand → NULL result.
+            if val.is_null() {
+                return Ok(SqliteValue::Null);
+            }
+            let mut saw_null = false;
             let found = match set {
                 InSet::List(exprs) => {
                     let mut found = false;
                     for e in exprs {
                         let set_val = eval_join_expr(e, row, col_map)?;
+                        if set_val.is_null() {
+                            saw_null = true;
+                            continue;
+                        }
                         if cmp_values(&val, &set_val) == std::cmp::Ordering::Equal {
                             found = true;
                             break;
@@ -12117,11 +12201,13 @@ fn eval_join_expr(
                     ));
                 }
             };
-            Ok(SqliteValue::Integer(i64::from(if *not {
-                !found
+            if found {
+                Ok(SqliteValue::Integer(i64::from(!*not)))
+            } else if saw_null {
+                Ok(SqliteValue::Null)
             } else {
-                found
-            })))
+                Ok(SqliteValue::Integer(i64::from(*not)))
+            }
         }
         Expr::FunctionCall { name, args, .. } => {
             let arg_vals: Vec<SqliteValue> = match args {

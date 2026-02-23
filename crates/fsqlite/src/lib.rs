@@ -1459,6 +1459,72 @@ mod tests {
         assert!(vals.contains(&SqliteValue::Integer(5)));
     }
 
+    // ── NULL semantics for IN / BETWEEN ────────────────────────────────
+
+    #[test]
+    fn between_null_operand_returns_null() {
+        let conn = Connection::open(":memory:").unwrap();
+        // NULL BETWEEN 1 AND 5 → NULL (not TRUE)
+        let row = conn.query_row("SELECT NULL BETWEEN 1 AND 5;").unwrap();
+        assert_eq!(row_values(&row), vec![SqliteValue::Null]);
+    }
+
+    #[test]
+    fn between_null_low_bound() {
+        let conn = Connection::open(":memory:").unwrap();
+        // 3 BETWEEN NULL AND 5: (3 >= NULL) AND (3 <= 5) = NULL AND TRUE = NULL
+        let row = conn.query_row("SELECT 3 BETWEEN NULL AND 5;").unwrap();
+        assert_eq!(row_values(&row), vec![SqliteValue::Null]);
+    }
+
+    #[test]
+    fn between_null_high_bound() {
+        let conn = Connection::open(":memory:").unwrap();
+        // 3 BETWEEN 1 AND NULL: (3 >= 1) AND (3 <= NULL) = TRUE AND NULL = NULL
+        let row = conn.query_row("SELECT 3 BETWEEN 1 AND NULL;").unwrap();
+        assert_eq!(row_values(&row), vec![SqliteValue::Null]);
+    }
+
+    #[test]
+    fn between_null_bound_out_of_range_returns_false() {
+        let conn = Connection::open(":memory:").unwrap();
+        // 3 BETWEEN 4 AND NULL: (3 >= 4) AND (3 <= NULL) = FALSE AND NULL = FALSE
+        let row = conn.query_row("SELECT 3 BETWEEN 4 AND NULL;").unwrap();
+        assert_eq!(row_values(&row), vec![SqliteValue::Integer(0)]);
+    }
+
+    #[test]
+    fn in_null_operand_returns_null() {
+        let conn = Connection::open(":memory:").unwrap();
+        // NULL IN (1, 2, 3) → NULL (not FALSE)
+        let row = conn.query_row("SELECT NULL IN (1, 2, 3);").unwrap();
+        assert_eq!(row_values(&row), vec![SqliteValue::Null]);
+    }
+
+    #[test]
+    fn in_list_with_null_no_match_returns_null() {
+        let conn = Connection::open(":memory:").unwrap();
+        // 2 IN (1, NULL, 3): no exact match, but NULL in list → NULL
+        let row = conn.query_row("SELECT 2 IN (1, NULL, 3);").unwrap();
+        assert_eq!(row_values(&row), vec![SqliteValue::Null]);
+    }
+
+    #[test]
+    fn in_list_with_null_match_returns_true() {
+        let conn = Connection::open(":memory:").unwrap();
+        // 1 IN (1, NULL, 3): exact match on 1 → TRUE (integer 1)
+        let row = conn.query_row("SELECT 1 IN (1, NULL, 3);").unwrap();
+        assert_eq!(row_values(&row), vec![SqliteValue::Integer(1)]);
+    }
+
+    #[test]
+    fn not_in_null_operand_returns_null() {
+        let conn = Connection::open(":memory:").unwrap();
+        // NULL NOT IN (1, 2) → NULL
+        let row = conn.query_row("SELECT NULL NOT IN (1, 2);").unwrap();
+        assert_eq!(row_values(&row), vec![SqliteValue::Null]);
+    }
+
     // ── DISTINCT ──────────────────────────────────────────────────────
 
     #[test]

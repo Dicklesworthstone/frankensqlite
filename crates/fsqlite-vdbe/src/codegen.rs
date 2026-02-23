@@ -4641,6 +4641,14 @@ fn emit_in_probe_expr(
 
     emit_expr(b, operand, r_operand, Some(scan_ctx));
 
+    let null_label = b.emit_label();
+    let no_match_label = b.emit_label();
+    let matched_label = b.emit_label();
+    let done_label = b.emit_label();
+
+    // Three-valued NULL semantics: if operand is NULL, result is NULL.
+    b.emit_jump_to_label(Opcode::IsNull, r_operand, 0, null_label, P4::None, 0);
+
     b.emit_op(
         Opcode::OpenRead,
         probe_cursor,
@@ -4650,9 +4658,9 @@ fn emit_in_probe_expr(
         0,
     );
 
-    let no_match_label = b.emit_label();
-    let matched_label = b.emit_label();
-    let done_label = b.emit_label();
+    // Track whether any subquery row value is NULL (for three-valued IN).
+    let r_saw_null = b.alloc_temp();
+    b.emit_op(Opcode::Integer, 0, r_saw_null, 0, P4::None, 0);
 
     let loop_start = b.current_addr();
     b.emit_jump_to_label(Opcode::Rewind, probe_cursor, 0, no_match_label, P4::None, 0);
@@ -4683,6 +4691,14 @@ fn emit_in_probe_expr(
         }
     }
     b.emit_jump_to_label(Opcode::Eq, r_probe, r_operand, matched_label, P4::None, 0);
+    // If probe value was NULL, flag it (Eq never matches NULLs).
+    let after_flag = b.emit_label();
+    let set_flag = b.emit_label();
+    b.emit_jump_to_label(Opcode::IsNull, r_probe, 0, set_flag, P4::None, 0);
+    b.emit_jump_to_label(Opcode::Goto, 0, 0, after_flag, P4::None, 0);
+    b.resolve_label(set_flag);
+    b.emit_op(Opcode::Integer, 1, r_saw_null, 0, P4::None, 0);
+    b.resolve_label(after_flag);
 
     if let Some(skip) = skip_label {
         b.resolve_label(skip);
@@ -4691,7 +4707,14 @@ fn emit_in_probe_expr(
     b.emit_op(Opcode::Next, probe_cursor, loop_body, 0, P4::None, 0);
 
     b.resolve_label(no_match_label);
+    // No match.  If any subquery value was NULL → result is NULL.
+    b.emit_jump_to_label(Opcode::If, r_saw_null, 0, null_label, P4::None, 0);
+    b.free_temp(r_saw_null);
     b.emit_op(Opcode::Integer, i32::from(not), reg, 0, P4::None, 0);
+    b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+
+    b.resolve_label(null_label);
+    b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
     b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
 
     b.resolve_label(matched_label);
@@ -4886,6 +4909,10 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
             ..
         } => {
             // BETWEEN low AND high → (operand >= low) AND (operand <= high)
+            // with three-valued NULL logic:
+            //   NULL BETWEEN x AND y  → NULL
+            //   v BETWEEN NULL AND y  → NULL when v <= y, FALSE when v > y
+            //   v BETWEEN x AND NULL  → NULL when v >= x, FALSE when v < x
             let r_operand = b.alloc_temp();
             let r_low = b.alloc_temp();
             let r_high = b.alloc_temp();
@@ -4893,16 +4920,27 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
             emit_expr(b, low, r_low, ctx);
             emit_expr(b, high, r_high, ctx);
             let false_label = b.emit_label();
+            let null_label = b.emit_label();
             let done_label = b.emit_label();
-            // Jump to false if operand < low.
+            // If operand is NULL, short-circuit to NULL result.
+            b.emit_jump_to_label(Opcode::IsNull, r_operand, 0, null_label, P4::None, 0);
+            // Jump to false if operand < low (NULL low → no jump, handled below).
             b.emit_jump_to_label(Opcode::Lt, r_low, r_operand, false_label, P4::None, 0);
-            // Jump to false if operand > high.
+            // Jump to false if operand > high (NULL high → no jump, handled below).
             b.emit_jump_to_label(Opcode::Gt, r_high, r_operand, false_label, P4::None, 0);
-            // In range.
+            // Passed both comparisons.  If either bound was NULL the comparison
+            // silently fell through instead of confirming the range, so the
+            // correct three-valued result is NULL, not TRUE.
+            b.emit_jump_to_label(Opcode::IsNull, r_low, 0, null_label, P4::None, 0);
+            b.emit_jump_to_label(Opcode::IsNull, r_high, 0, null_label, P4::None, 0);
+            // Genuinely in range with no NULLs involved.
             b.emit_op(Opcode::Integer, i32::from(!*not), reg, 0, P4::None, 0);
             b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
             b.resolve_label(false_label);
             b.emit_op(Opcode::Integer, i32::from(*not), reg, 0, P4::None, 0);
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+            b.resolve_label(null_label);
+            b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
             b.resolve_label(done_label);
             b.free_temp(r_high);
             b.free_temp(r_low);
@@ -4915,19 +4953,44 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
             ..
         } => {
             if let fsqlite_ast::InSet::List(values) = set {
-                // IN (v1, v2, ...) → chain of equality checks.
+                // IN (v1, v2, ...) → chain of equality checks with
+                // three-valued NULL semantics (SQL standard):
+                //   NULL IN (...)            → NULL
+                //   v IN (a, NULL, b) miss   → NULL  (NULL in list)
+                //   v IN (a, b, c) miss      → FALSE (no NULLs)
+                //   v IN (...) hit           → TRUE
                 let r_operand = b.alloc_temp();
                 emit_expr(b, operand, r_operand, ctx);
+                let null_label = b.emit_label();
                 let true_label = b.emit_label();
                 let done_label = b.emit_label();
+                // If operand is NULL, short-circuit to NULL result.
+                b.emit_jump_to_label(Opcode::IsNull, r_operand, 0, null_label, P4::None, 0);
+                // r_saw_null: set to 1 at runtime if any list element is NULL.
+                let r_saw_null = b.alloc_temp();
+                b.emit_op(Opcode::Integer, 0, r_saw_null, 0, P4::None, 0);
                 let r_val = b.alloc_temp();
                 for val_expr in values {
                     emit_expr(b, val_expr, r_val, ctx);
                     b.emit_jump_to_label(Opcode::Eq, r_val, r_operand, true_label, P4::None, 0);
+                    // Eq with NULL never jumps.  If this value was NULL, flag it.
+                    let next_val = b.emit_label();
+                    let set_flag = b.emit_label();
+                    b.emit_jump_to_label(Opcode::IsNull, r_val, 0, set_flag, P4::None, 0);
+                    b.emit_jump_to_label(Opcode::Goto, 0, 0, next_val, P4::None, 0);
+                    b.resolve_label(set_flag);
+                    b.emit_op(Opcode::Integer, 1, r_saw_null, 0, P4::None, 0);
+                    b.resolve_label(next_val);
                 }
                 b.free_temp(r_val);
-                // No match.
+                // No match.  If any list element was NULL → result is NULL.
+                b.emit_jump_to_label(Opcode::If, r_saw_null, 0, null_label, P4::None, 0);
+                b.free_temp(r_saw_null);
+                // Definite no-match with no NULLs → FALSE (or TRUE for NOT IN).
                 b.emit_op(Opcode::Integer, i32::from(*not), reg, 0, P4::None, 0);
+                b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+                b.resolve_label(null_label);
+                b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
                 b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
                 b.resolve_label(true_label);
                 b.emit_op(Opcode::Integer, i32::from(!*not), reg, 0, P4::None, 0);
