@@ -2061,6 +2061,54 @@ mod tests {
     }
 
     #[test]
+    fn having_between_filters_groups() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE hb (grp INTEGER, val INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO hb VALUES (1, 10), (1, 20), (2, 30), (3, 40), (3, 50), (3, 60);")
+            .unwrap();
+        // COUNT(*) for groups: 1→2, 2→1, 3→3. HAVING cnt BETWEEN 2 AND 3 keeps 1,3.
+        let rows = conn
+            .query("SELECT grp, COUNT(*) as cnt FROM hb GROUP BY grp HAVING cnt BETWEEN 2 AND 3;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        let grps: Vec<_> = rows.iter().map(|r| row_values(r)[0].clone()).collect();
+        assert!(grps.contains(&SqliteValue::Integer(1)));
+        assert!(grps.contains(&SqliteValue::Integer(3)));
+    }
+
+    #[test]
+    fn having_in_filters_groups() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE hi (grp TEXT, val INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO hi VALUES ('A', 1), ('B', 2), ('C', 3);")
+            .unwrap();
+        let rows = conn
+            .query("SELECT grp FROM hi GROUP BY grp HAVING grp IN ('A', 'C');")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        let grps: Vec<_> = rows.iter().map(|r| row_values(r)[0].clone()).collect();
+        assert!(grps.contains(&SqliteValue::Text("A".to_owned())));
+        assert!(grps.contains(&SqliteValue::Text("C".to_owned())));
+    }
+
+    #[test]
+    fn having_case_expression() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE hc (grp TEXT, val INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO hc VALUES ('X', 1), ('Y', 2), ('X', 3);")
+            .unwrap();
+        // CASE grp WHEN 'X' THEN 1 ELSE 0 END = 1 keeps only 'X'
+        let rows = conn
+            .query("SELECT grp, SUM(val) FROM hc GROUP BY grp HAVING CASE grp WHEN 'X' THEN 1 ELSE 0 END = 1;")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Text("X".to_owned()));
+    }
+
+    #[test]
     fn probe_nested_functions() {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);")

@@ -9038,6 +9038,146 @@ fn evaluate_having_value(
             SqliteValue::Integer(i64::from(if *not { !is_null } else { is_null }))
         }
 
+        // BETWEEN with three-valued NULL logic.
+        Expr::Between {
+            expr: inner,
+            low,
+            high,
+            not,
+            ..
+        } => {
+            let eval =
+                |e| evaluate_having_value(e, values, descriptors, columns, group_rows, col_names);
+            let val = eval(inner);
+            let low_val = eval(low);
+            let high_val = eval(high);
+            let ge_low = if val.is_null() || low_val.is_null() {
+                None
+            } else {
+                Some(cmp_values(&val, &low_val) != std::cmp::Ordering::Less)
+            };
+            let le_high = if val.is_null() || high_val.is_null() {
+                None
+            } else {
+                Some(cmp_values(&val, &high_val) != std::cmp::Ordering::Greater)
+            };
+            match (ge_low, le_high) {
+                (Some(false), _) | (_, Some(false)) => SqliteValue::Integer(i64::from(*not)),
+                (Some(true), Some(true)) => SqliteValue::Integer(i64::from(!*not)),
+                _ => SqliteValue::Null,
+            }
+        }
+
+        // IN with three-valued NULL logic.
+        Expr::In {
+            expr: inner,
+            set,
+            not,
+            ..
+        } => {
+            let val =
+                evaluate_having_value(inner, values, descriptors, columns, group_rows, col_names);
+            if val.is_null() {
+                return SqliteValue::Null;
+            }
+            match set {
+                InSet::List(exprs) => {
+                    let mut found = false;
+                    let mut saw_null = false;
+                    for e in exprs {
+                        let set_val = evaluate_having_value(
+                            e,
+                            values,
+                            descriptors,
+                            columns,
+                            group_rows,
+                            col_names,
+                        );
+                        if set_val.is_null() {
+                            saw_null = true;
+                            continue;
+                        }
+                        if cmp_values(&val, &set_val) == std::cmp::Ordering::Equal {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if found {
+                        SqliteValue::Integer(i64::from(!*not))
+                    } else if saw_null {
+                        SqliteValue::Null
+                    } else {
+                        SqliteValue::Integer(i64::from(*not))
+                    }
+                }
+                _ => SqliteValue::Null,
+            }
+        }
+
+        // CASE expression.
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            let eval =
+                |e| evaluate_having_value(e, values, descriptors, columns, group_rows, col_names);
+            let base = operand.as_deref().map(eval);
+            for (when_expr, then_expr) in whens {
+                let when_val = eval(when_expr);
+                let matches = if let Some(ref b) = base {
+                    // Simple CASE: NULL base never matches (NULL = x is NULL).
+                    !b.is_null()
+                        && !when_val.is_null()
+                        && cmp_values(b, &when_val) == std::cmp::Ordering::Equal
+                } else {
+                    // Searched CASE: evaluate condition truthiness.
+                    is_sqlite_truthy(&when_val)
+                };
+                if matches {
+                    return eval(then_expr);
+                }
+            }
+            else_expr.as_deref().map_or(SqliteValue::Null, eval)
+        }
+
+        // CAST expression.
+        Expr::Cast {
+            expr: inner,
+            type_name,
+            ..
+        } => {
+            let v =
+                evaluate_having_value(inner, values, descriptors, columns, group_rows, col_names);
+            if v.is_null() {
+                return SqliteValue::Null;
+            }
+            let upper = type_name.name.to_ascii_uppercase();
+            if upper.contains("INT") {
+                SqliteValue::Integer(v.to_integer())
+            } else if upper.contains("REAL") || upper.contains("FLOAT") || upper.contains("DOUB") {
+                SqliteValue::Float(v.to_float())
+            } else if upper.contains("TEXT") || upper.contains("CHAR") || upper.contains("CLOB") {
+                SqliteValue::Text(v.to_text())
+            } else if upper.contains("BLOB") {
+                match v {
+                    SqliteValue::Blob(_) => v,
+                    _ => SqliteValue::Blob(v.to_text().into_bytes()),
+                }
+            } else {
+                // NUMERIC affinity: try integer, then float, else text.
+                let txt = v.to_text();
+                if let Ok(i) = txt.parse::<i64>() {
+                    SqliteValue::Integer(i)
+                } else if let Ok(f) = txt.parse::<f64>() {
+                    SqliteValue::Float(f)
+                } else {
+                    SqliteValue::Text(txt)
+                }
+            }
+        }
+
         _ => SqliteValue::Null,
     }
 }
