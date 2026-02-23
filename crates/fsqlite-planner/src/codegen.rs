@@ -714,6 +714,9 @@ pub fn codegen_update(
             Expr::Placeholder(pt, _) => {
                 #[allow(clippy::cast_possible_wrap)]
                 let idx = if let fsqlite_ast::PlaceholderType::Numbered(n) = pt {
+                    // Keep param_idx ahead of numbered placeholders so
+                    // subsequent anonymous `?` parameters get the next index.
+                    param_idx = param_idx.max(*n as i32 + 1);
                     *n as i32
                 } else {
                     let p = param_idx;

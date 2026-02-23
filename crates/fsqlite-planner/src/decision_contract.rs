@@ -256,6 +256,7 @@ pub struct DecisionContract {
 
 /// Maximum query text length stored in a contract.
 const MAX_QUERY_TEXT_LEN: usize = 4096;
+const TRUNCATION_SUFFIX: &str = "...[truncated]";
 
 /// The genesis hash used as `prev_hash` for the first record.
 pub const GENESIS_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
@@ -276,6 +277,29 @@ fn compute_record_hash(contract: &DecisionContract) -> String {
     hasher.update(&contract.loss.estimated_cost.to_le_bytes());
     hasher.update(&contract.loss.estimated_rows.to_le_bytes());
     format!("{}", hasher.finalize())
+}
+
+fn truncate_query_text_for_contract(query_text: &str) -> String {
+    if query_text.len() <= MAX_QUERY_TEXT_LEN {
+        return query_text.to_owned();
+    }
+
+    if MAX_QUERY_TEXT_LEN <= TRUNCATION_SUFFIX.len() {
+        let mut end = MAX_QUERY_TEXT_LEN;
+        while end > 0 && !query_text.is_char_boundary(end) {
+            end -= 1;
+        }
+        return query_text[..end].to_owned();
+    }
+
+    let mut end = MAX_QUERY_TEXT_LEN - TRUNCATION_SUFFIX.len();
+    while end > 0 && !query_text.is_char_boundary(end) {
+        end -= 1;
+    }
+
+    let mut truncated = query_text[..end].to_owned();
+    truncated.push_str(TRUNCATION_SUFFIX);
+    truncated
 }
 
 // ---------------------------------------------------------------------------
@@ -301,11 +325,7 @@ pub fn build_contract(
     star_query_detected: bool,
     prev_hash: &str,
 ) -> DecisionContract {
-    let mut text = query_text.to_owned();
-    if text.len() > MAX_QUERY_TEXT_LEN {
-        text.truncate(MAX_QUERY_TEXT_LEN);
-        text.push_str("...[truncated]");
-    }
+    let text = truncate_query_text_for_contract(query_text);
 
     let estimated_rows: f64 = plan
         .access_paths
@@ -959,8 +979,36 @@ mod tests {
             false,
             GENESIS_HASH,
         );
-        assert!(contract.query_text.len() <= MAX_QUERY_TEXT_LEN + 20); // +20 for "[truncated]"
-        assert!(contract.query_text.ends_with("...[truncated]"));
+        assert_eq!(contract.query_text.len(), MAX_QUERY_TEXT_LEN);
+        assert!(contract.query_text.ends_with(TRUNCATION_SUFFIX));
+    }
+
+    #[test]
+    fn query_text_truncation_preserves_utf8_boundaries() {
+        let tables = sample_tables();
+        let indexes = sample_indexes();
+        let plan = sample_plan();
+
+        let long_query = format!("SELECT '{}'", "é".repeat(3000));
+        let contract = build_contract(
+            &long_query,
+            &tables,
+            &indexes,
+            0,
+            None,
+            0,
+            &plan,
+            1,
+            false,
+            GENESIS_HASH,
+        );
+
+        assert!(
+            std::str::from_utf8(contract.query_text.as_bytes()).is_ok(),
+            "truncated query text must remain valid UTF-8"
+        );
+        assert_eq!(contract.query_text.len(), MAX_QUERY_TEXT_LEN);
+        assert!(contract.query_text.ends_with(TRUNCATION_SUFFIX));
     }
 
     #[test]
