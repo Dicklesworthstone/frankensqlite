@@ -274,7 +274,7 @@ impl Parser {
 
             // ── Parenthesized expr / subquery / row-value ───────────────
             TokenKind::LeftParen => {
-                if matches!(self.peek_kind(), TokenKind::KwSelect) {
+                if matches!(self.peek_kind(), TokenKind::KwSelect | TokenKind::KwWith | TokenKind::KwValues) {
                     let subquery = self.parse_subquery_minimal()?;
                     let end = self.expect_kind(&TokenKind::RightParen)?;
                     let span = tok.span.merge(end);
@@ -628,7 +628,7 @@ impl Parser {
 
         self.expect_kind(&TokenKind::LeftParen)?;
 
-        if matches!(self.peek_kind(), TokenKind::KwSelect) {
+        if matches!(self.peek_kind(), TokenKind::KwSelect | TokenKind::KwWith | TokenKind::KwValues) {
             let subquery = self.parse_subquery_minimal()?;
             let end = self.expect_kind(&TokenKind::RightParen)?;
             let span = start.merge(end);
