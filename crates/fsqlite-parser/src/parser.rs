@@ -1879,7 +1879,9 @@ impl Parser {
                 self.expect_kw(&TokenKind::KwRow)?;
                 Some(FrameExclude::CurrentRow)
             } else {
-                return Err(self.err_expected("NO OTHERS, TIES, GROUP, or CURRENT ROW after EXCLUDE"));
+                return Err(
+                    self.err_expected("NO OTHERS, TIES, GROUP, or CURRENT ROW after EXCLUDE")
+                );
             }
         } else {
             None
@@ -2029,8 +2031,12 @@ fn is_alias_terminator_kw(k: &TokenKind) -> bool {
 }
 
 pub(crate) fn kw_to_str(k: &TokenKind) -> String {
-    let dbg = format!("{k:?}");
-    dbg.strip_prefix("Kw").unwrap_or(&dbg).to_ascii_lowercase()
+    k.keyword_str()
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_else(|| {
+            let dbg = format!("{k:?}");
+            dbg.strip_prefix("Kw").unwrap_or(&dbg).to_ascii_lowercase()
+        })
 }
 
 // ---------------------------------------------------------------------------
