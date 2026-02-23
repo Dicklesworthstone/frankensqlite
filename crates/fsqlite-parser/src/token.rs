@@ -459,7 +459,7 @@ impl TokenKind {
                 hex
             }
             Self::Id(s) | Self::Error(s) => s.clone(),
-            Self::QuotedId(s, _) => format!("\"{s}\""),
+            Self::QuotedId(s, _) => format!("\"{}\"", s.replace('"', "\"\"")),
             Self::Question => "?".to_owned(),
             Self::QuestionNum(n) => format!("?{n}"),
             Self::ColonParam(s) => format!(":{s}"),
