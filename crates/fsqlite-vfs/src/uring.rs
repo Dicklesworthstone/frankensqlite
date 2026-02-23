@@ -129,15 +129,22 @@ impl IoUringRuntime {
     fn new() -> Self {
         #[cfg(all(feature = "linux-uring-fs", not(feature = "linux-asupersync-uring")))]
         {
-            match uring_fs::IoUring::new() {
-                Ok(ring) => Self {
+            let init_result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(uring_fs::IoUring::new));
+            match init_result {
+                Ok(Ok(ring)) => Self {
                     ring: Some(Mutex::new(ring)),
                     status: "available:uring-fs".to_owned(),
                     disabled: AtomicBool::new(false),
                 },
-                Err(error) => Self {
+                Ok(Err(error)) => Self {
                     ring: None,
                     status: format!("unavailable:uring-fs:{error}"),
+                    disabled: AtomicBool::new(false),
+                },
+                Err(_) => Self {
+                    ring: None,
+                    status: "unavailable:uring-fs:init-panicked".to_owned(),
                     disabled: AtomicBool::new(false),
                 },
             }

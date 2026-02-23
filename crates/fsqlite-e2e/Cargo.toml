@@ -13,7 +13,7 @@ description = "End-to-end differential testing and benchmark harness for Franken
 workspace = true
 
 [features]
-default = ["linux-asupersync-uring"]
+default = ["linux-uring-fs"]
 linux-uring-fs = [
     "fsqlite/linux-uring-fs",
     "fsqlite-core/linux-uring-fs",

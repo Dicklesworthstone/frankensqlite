@@ -1724,18 +1724,25 @@ impl VdbeEngine {
                 }
 
                 Opcode::MustBeInt => {
-                    let val = self.get_reg(op.p1);
-                    if val.as_integer().is_none() && !val.is_null() {
+                    let val = self.get_reg(op.p1).clone();
+                    if val.is_null() {
+                        pc += 1;
+                        continue;
+                    }
+                    let coerced = val.apply_affinity(fsqlite_types::TypeAffinity::Integer);
+                    if coerced.as_integer().is_some() {
+                        self.set_reg(op.p1, coerced);
+                        pc += 1;
+                    } else {
                         if op.p2 > 0 {
                             pc = op.p2 as usize;
                             continue;
                         }
                         return Err(FrankenError::TypeMismatch {
                             expected: "integer".to_owned(),
-                            actual: val.typeof_str().to_owned(),
+                            actual: self.get_reg(op.p1).typeof_str().to_owned(),
                         });
                     }
-                    pc += 1;
                 }
 
                 #[allow(clippy::cast_precision_loss)]

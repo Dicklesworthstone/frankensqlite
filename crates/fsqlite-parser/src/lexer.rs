@@ -628,12 +628,28 @@ impl<'a> Lexer<'a> {
             self.advance();
         }
 
+        // Helper to check if the current position (+ offset) starts a valid exponent.
+        let is_valid_exponent = |lexer: &Self, mut offset: usize| -> bool {
+            if let Some(c) = lexer.peek_at(offset) {
+                if c == b'e' || c == b'E' {
+                    offset += 1;
+                    if let Some(s) = lexer.peek_at(offset) {
+                        if s == b'+' || s == b'-' {
+                            offset += 1;
+                        }
+                    }
+                    if let Some(d) = lexer.peek_at(offset) {
+                        return d.is_ascii_digit();
+                    }
+                }
+            }
+            false
+        };
+
         // Fractional part
         if self.pos < self.src.len()
             && self.src[self.pos] == b'.'
-            && self
-                .peek_at(1)
-                .is_some_and(|c| c.is_ascii_digit() || c == b'e' || c == b'E')
+            && (self.peek_at(1).is_some_and(|c| c.is_ascii_digit()) || is_valid_exponent(self, 1))
         {
             is_float = true;
             self.advance(); // skip dot
@@ -656,7 +672,7 @@ impl<'a> Lexer<'a> {
         }
 
         // Exponent
-        if self.pos < self.src.len() && (self.src[self.pos] == b'e' || self.src[self.pos] == b'E') {
+        if is_valid_exponent(self, 0) {
             is_float = true;
             self.advance(); // skip e/E
             if self.pos < self.src.len()

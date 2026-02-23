@@ -30,9 +30,10 @@ const SINGLE_WRITER_TXNS_RELEASE: usize = 1_000;
 const STRESS_WRITERS: usize = 100;
 const STRESS_TXNS_PER_WRITER: usize = 10_000;
 // Keep the logical workload hot, but not pathologically single-page hot.
-// With 100 concurrent writers, 128 rows collapses onto too few leaf pages and
-// measures page-hotspot collapse more than SSI behavior.
-const ACCOUNT_COUNT: i64 = 4_096;
+// With 100 concurrent writers, very small account sets collapse onto too few
+// leaf pages and measure hotspot collapse more than SSI behavior.
+const ACCOUNT_COUNT_DEBUG: i64 = 1_024;
+const ACCOUNT_COUNT_RELEASE: i64 = 4_096;
 const INITIAL_BALANCE: i64 = 1_000;
 const MAX_RETRIES_PER_TXN: usize = 16;
 const BUSY_TIMEOUT_MS: u64 = 5_000;
@@ -226,12 +227,26 @@ fn configured_single_writer_max_elapsed_seconds() -> f64 {
     })
 }
 
+fn configured_account_count() -> i64 {
+    env_i64("FSQLITE_SSI_ACCOUNT_COUNT").unwrap_or_else(|| {
+        if cfg!(debug_assertions) {
+            ACCOUNT_COUNT_DEBUG
+        } else {
+            ACCOUNT_COUNT_RELEASE
+        }
+    })
+}
+
 fn env_usize(var: &str) -> Option<usize> {
     std::env::var(var).ok()?.parse::<usize>().ok().filter(|v| *v > 0)
 }
 
 fn env_f64(var: &str) -> Option<f64> {
     std::env::var(var).ok()?.parse::<f64>().ok().filter(|v| *v > 0.0)
+}
+
+fn env_i64(var: &str) -> Option<i64> {
+    std::env::var(var).ok()?.parse::<i64>().ok().filter(|v| *v > 0)
 }
 
 fn run_ssi_workload(
@@ -242,7 +257,8 @@ fn run_ssi_workload(
 ) -> WorkloadSummary {
     let db_dir = tempfile::tempdir().expect("create temp directory for workload");
     let db_path = db_dir.path().join("ssi_serialization.db");
-    initialize_db(&db_path);
+    let account_count = configured_account_count();
+    initialize_db(&db_path, account_count);
 
     let started = Instant::now();
     let mut handles = Vec::with_capacity(writers);
@@ -250,7 +266,7 @@ fn run_ssi_workload(
         let path = db_path.clone();
         let worker_seed = derive_worker_seed(seed, worker_id);
         handles.push(thread::spawn(move || {
-            run_worker(&path, worker_id, txns_per_writer, worker_seed)
+            run_worker(&path, worker_id, txns_per_writer, worker_seed, account_count)
         }));
     }
 
@@ -280,7 +296,7 @@ fn run_ssi_workload(
     );
 
     let (final_sum, min_balance) = read_account_invariants(&db_path);
-    let initial_sum = ACCOUNT_COUNT * INITIAL_BALANCE;
+    let initial_sum = account_count * INITIAL_BALANCE;
     let expected_sum = initial_sum + sum_delta;
 
     assert_eq!(
@@ -308,7 +324,7 @@ fn run_ssi_workload(
     }
 }
 
-fn initialize_db(path: &Path) {
+fn initialize_db(path: &Path, account_count: i64) {
     let conn = fsqlite::Connection::open(path.to_string_lossy().as_ref())
         .expect("open db for initialization");
     conn.execute("PRAGMA journal_mode=WAL;")
@@ -325,7 +341,7 @@ fn initialize_db(path: &Path) {
     )
     .expect("create accounts table");
 
-    for id in 1..=ACCOUNT_COUNT {
+    for id in 1..=account_count {
         conn.execute(&format!(
             "INSERT INTO accounts (id, balance) VALUES ({id}, {INITIAL_BALANCE});"
         ))
@@ -333,7 +349,13 @@ fn initialize_db(path: &Path) {
     }
 }
 
-fn run_worker(db_path: &Path, worker_id: usize, txns_per_worker: usize, seed: u64) -> WorkerResult {
+fn run_worker(
+    db_path: &Path,
+    worker_id: usize,
+    txns_per_worker: usize,
+    seed: u64,
+    account_count: i64,
+) -> WorkerResult {
     let mut result = WorkerResult::default();
     let mut rng = StdRng::seed_from_u64(seed);
     // Keep retries adaptive instead of hot-looping under page-level contention.
@@ -356,7 +378,8 @@ fn run_worker(db_path: &Path, worker_id: usize, txns_per_worker: usize, seed: u6
         loop {
             let kind = choose_txn_kind(&mut rng);
 
-            let execute_result: Result<_, FrankenError> = execute_single_txn(&conn, &mut rng, kind);
+            let execute_result: Result<_, FrankenError> =
+                execute_single_txn(&conn, &mut rng, kind, account_count);
             match execute_result {
                 Ok((start_order, commit_order, read_set, write_set, delta_sum)) => {
                     if let Some(wait_ms) = last_wait_ms.take() {
@@ -436,6 +459,7 @@ fn execute_single_txn(
     conn: &fsqlite::Connection,
     rng: &mut StdRng,
     kind: TxnKind,
+    account_count: i64,
 ) -> Result<(u64, u64, BTreeSet<i64>, BTreeSet<i64>, i64), FrankenError> {
     conn.execute("BEGIN CONCURRENT;")?;
     let start_order = conn.current_concurrent_snapshot_seq().ok_or_else(|| {
@@ -450,10 +474,10 @@ fn execute_single_txn(
 
     match kind {
         TxnKind::Transfer => {
-            let from = random_account(rng);
-            let mut to = random_account(rng);
+            let from = random_account(rng, account_count);
+            let mut to = random_account(rng, account_count);
             if to == from {
-                to = if to == ACCOUNT_COUNT { 1 } else { to + 1 };
+                to = if to == account_count { 1 } else { to + 1 };
             }
             let amount = i64::from(rng.gen_range(1_u8..=5_u8));
 
@@ -472,7 +496,7 @@ fn execute_single_txn(
             }
         }
         TxnKind::Deposit => {
-            let account = random_account(rng);
+            let account = random_account(rng, account_count);
             let amount = i64::from(rng.gen_range(1_u8..=3_u8));
 
             conn.execute(&format!(
@@ -508,8 +532,8 @@ fn choose_txn_kind(rng: &mut StdRng) -> TxnKind {
     }
 }
 
-fn random_account(rng: &mut StdRng) -> i64 {
-    rng.gen_range(1_i64..=ACCOUNT_COUNT)
+fn random_account(rng: &mut StdRng, account_count: i64) -> i64 {
+    rng.gen_range(1_i64..=account_count)
 }
 
 fn rollback_best_effort(conn: &fsqlite::Connection) {
