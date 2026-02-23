@@ -2301,6 +2301,59 @@ mod tests {
     }
 
     #[test]
+    fn replace_null_arg_returns_null() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn.query("SELECT REPLACE(NULL, 'a', 'b');").unwrap();
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Null);
+        let rows = conn.query("SELECT REPLACE('hello', NULL, 'b');").unwrap();
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Null);
+    }
+
+    #[test]
+    fn trim_null_returns_null() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn.query("SELECT TRIM(NULL);").unwrap();
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Null);
+        let rows = conn.query("SELECT LTRIM(NULL);").unwrap();
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Null);
+        let rows = conn.query("SELECT RTRIM(NULL);").unwrap();
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Null);
+    }
+
+    #[test]
+    fn hex_null_returns_null() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn.query("SELECT HEX(NULL);").unwrap();
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Null);
+    }
+
+    #[test]
+    fn instr_null_returns_null() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn.query("SELECT INSTR(NULL, 'x');").unwrap();
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Null);
+        let rows = conn.query("SELECT INSTR('hello', NULL);").unwrap();
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Null);
+    }
+
+    #[test]
+    fn substr_null_returns_null() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn.query("SELECT SUBSTR(NULL, 1, 3);").unwrap();
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Null);
+    }
+
+    #[test]
+    fn substr_negative_start() {
+        let conn = Connection::open(":memory:").unwrap();
+        // Negative start counts from right: -1 = last char.
+        let rows = conn.query("SELECT SUBSTR('hello', -1);").unwrap();
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Text("o".to_owned()));
+        let rows = conn.query("SELECT SUBSTR('hello', -3);").unwrap();
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Text("llo".to_owned()));
+    }
+
+    #[test]
     fn probe_update_where_column_cmp() {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER);")

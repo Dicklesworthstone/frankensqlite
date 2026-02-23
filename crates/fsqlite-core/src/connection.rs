@@ -12772,6 +12772,18 @@ fn sqlite_value_to_text(v: &SqliteValue) -> String {
 )]
 fn eval_scalar_fn(name: &str, args: &[SqliteValue]) -> SqliteValue {
     let lower = name.to_ascii_lowercase();
+
+    // Standard SQL NULL propagation: if any argument is NULL, most scalar
+    // functions return NULL.  Functions with special NULL handling are exempt.
+    match lower.as_str() {
+        "coalesce" | "ifnull" | "nullif" | "typeof" | "quote" | "iif" | "max" | "min" => {}
+        _ => {
+            if args.iter().any(SqliteValue::is_null) {
+                return SqliteValue::Null;
+            }
+        }
+    }
+
     match lower.as_str() {
         "length" | "len" => {
             if let Some(SqliteValue::Text(s)) = args.first() {
@@ -12868,18 +12880,36 @@ fn eval_scalar_fn(name: &str, args: &[SqliteValue]) -> SqliteValue {
         }
         "substr" | "substring" => {
             if let Some(SqliteValue::Text(s)) = args.first() {
-                let start = args
-                    .get(1)
-                    .map_or(1, fsqlite_types::SqliteValue::to_integer)
-                    .max(1) as usize
-                    - 1;
                 let chars: Vec<char> = s.chars().collect();
-                if let Some(len_val) = args.get(2) {
-                    let len = len_val.to_integer().max(0) as usize;
-                    let end = (start + len).min(chars.len());
-                    SqliteValue::Text(chars[start..end].iter().collect())
+                let n = chars.len() as i64;
+                let raw_start = args
+                    .get(1)
+                    .map_or(1, fsqlite_types::SqliteValue::to_integer);
+                // SQLite: negative start counts from right (-1 = last char).
+                // Zero is treated as 1.
+                let one_based = if raw_start < 0 {
+                    n + 1 + raw_start // -1 → n, -2 → n-1, etc.
+                } else if raw_start == 0 {
+                    1
                 } else {
-                    SqliteValue::Text(chars[start..].iter().collect())
+                    raw_start
+                };
+                if let Some(len_val) = args.get(2) {
+                    let raw_len = len_val.to_integer();
+                    // Negative length means chars before the start position.
+                    let (begin, count) = if raw_len < 0 {
+                        let end_1b = one_based;
+                        let begin_1b = (end_1b + raw_len).max(1);
+                        (begin_1b, (end_1b - begin_1b) as usize)
+                    } else {
+                        (one_based, raw_len as usize)
+                    };
+                    let idx = ((begin - 1).max(0) as usize).min(chars.len());
+                    let end = (idx + count).min(chars.len());
+                    SqliteValue::Text(chars[idx..end].iter().collect())
+                } else {
+                    let idx = ((one_based - 1).max(0) as usize).min(chars.len());
+                    SqliteValue::Text(chars[idx..].iter().collect())
                 }
             } else {
                 SqliteValue::Null
