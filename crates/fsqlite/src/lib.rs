@@ -2845,6 +2845,59 @@ mod tests {
         assert_eq!(row_values(&rows[0])[2], SqliteValue::Null);
     }
 
+    #[test]
+    fn insert_default_values_uses_column_defaults() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute(
+            "CREATE TABLE td (id INTEGER PRIMARY KEY, status TEXT DEFAULT 'active', count INTEGER DEFAULT 42, ratio REAL DEFAULT 3.14);",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO td DEFAULT VALUES;").unwrap();
+        let rows = conn
+            .query("SELECT id, status, count, ratio FROM td;")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(1));
+        assert_eq!(
+            row_values(&rows[0])[1],
+            SqliteValue::Text("active".to_string()),
+            "status should use DEFAULT 'active'"
+        );
+        assert_eq!(
+            row_values(&rows[0])[2],
+            SqliteValue::Integer(42),
+            "count should use DEFAULT 42"
+        );
+        assert_eq!(
+            row_values(&rows[0])[3],
+            SqliteValue::Float(3.14),
+            "ratio should use DEFAULT 3.14"
+        );
+    }
+
+    #[test]
+    fn insert_explicit_cols_uses_defaults_for_omitted() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute(
+            "CREATE TABLE te (id INTEGER PRIMARY KEY, name TEXT, status TEXT DEFAULT 'pending');",
+        )
+        .unwrap();
+        // Only specify name, omit status — should get DEFAULT 'pending'.
+        conn.execute("INSERT INTO te (name) VALUES ('alice');")
+            .unwrap();
+        let rows = conn.query("SELECT id, name, status FROM te;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            row_values(&rows[0])[1],
+            SqliteValue::Text("alice".to_string())
+        );
+        assert_eq!(
+            row_values(&rows[0])[2],
+            SqliteValue::Text("pending".to_string()),
+            "omitted column should use DEFAULT 'pending'"
+        );
+    }
+
     // Test: INSERT DEFAULT VALUES with RETURNING (IPK column)
     #[test]
     fn probe_insert_default_values_returning() {

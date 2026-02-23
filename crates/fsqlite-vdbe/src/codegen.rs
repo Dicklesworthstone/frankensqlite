@@ -2442,12 +2442,12 @@ pub fn codegen_insert(
                     oe_flag,
                 )?;
             } else {
-                let n_table_cols = table.columns.len();
-                let null_expr = Expr::Literal(Literal::Null, fsqlite_ast::Span::ZERO);
+                // Build default expressions: use column DEFAULT if available, else NULL.
+                let defaults: Vec<Expr> = table.columns.iter().map(default_value_to_expr).collect();
                 let mut explicit_rowids: Vec<Option<Expr>> = Vec::with_capacity(rows.len());
                 let mut reordered: Vec<Vec<Expr>> = Vec::with_capacity(rows.len());
                 for row in rows {
-                    let mut table_order = vec![null_expr.clone(); n_table_cols];
+                    let mut table_order = defaults.clone();
                     let mut explicit_rowid = None;
                     for (val_pos, col_name) in stmt.columns.iter().enumerate() {
                         if let Some(expr) = row.get(val_pos) {
@@ -2509,13 +2509,15 @@ pub fn codegen_insert(
             )?;
         }
         InsertSource::DefaultValues => {
-            // Insert one row with all columns set to NULL.
+            // Insert one row using column DEFAULT values (or NULL if none).
             #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
             let n_cols = table.columns.len() as i32;
             let concurrent_flag = i32::from(ctx.concurrent_mode);
             let col_regs = b.alloc_regs(n_cols);
-            for i in 0..n_cols {
-                b.emit_op(Opcode::Null, 0, col_regs + i, 0, P4::None, 0);
+            for (idx, col) in table.columns.iter().enumerate() {
+                #[allow(clippy::cast_possible_wrap)]
+                let reg = col_regs + idx as i32;
+                emit_default_value(b, col, reg);
             }
             let rowid_reg = b.alloc_reg();
             b.emit_op(
@@ -3317,6 +3319,118 @@ pub fn codegen_delete(
 // ---------------------------------------------------------------------------
 // Helper functions
 // ---------------------------------------------------------------------------
+
+/// Convert a column's DEFAULT value text to an AST `Expr`.
+///
+/// Used by INSERT with explicit column lists to fill unmentioned columns
+/// with their declared DEFAULT rather than NULL.
+fn default_value_to_expr(col: &ColumnInfo) -> Expr {
+    let span = fsqlite_ast::Span::ZERO;
+    let Some(dv) = col.default_value.as_deref() else {
+        return Expr::Literal(Literal::Null, span);
+    };
+    let trimmed = dv.trim();
+    // Integer literal.
+    if let Ok(n) = trimmed.parse::<i64>() {
+        return Expr::Literal(Literal::Integer(n), span);
+    }
+    // Float literal.
+    if let Ok(f) = trimmed.parse::<f64>() {
+        return Expr::Literal(Literal::Float(f), span);
+    }
+    // String literal: 'value'.
+    if trimmed.len() >= 2 && trimmed.starts_with('\'') && trimmed.ends_with('\'') {
+        let inner = trimmed[1..trimmed.len() - 1].replace("''", "'");
+        return Expr::Literal(Literal::String(inner), span);
+    }
+    // Special keywords.
+    let upper = trimmed.to_ascii_uppercase();
+    match upper.as_str() {
+        "NULL" => Expr::Literal(Literal::Null, span),
+        "CURRENT_TIMESTAMP" => Expr::Literal(Literal::CurrentTimestamp, span),
+        "CURRENT_DATE" => Expr::Literal(Literal::CurrentDate, span),
+        "CURRENT_TIME" => Expr::Literal(Literal::CurrentTime, span),
+        "TRUE" => Expr::Literal(Literal::True, span),
+        "FALSE" => Expr::Literal(Literal::False, span),
+        // Fallback: emit as string.
+        _ => Expr::Literal(Literal::String(trimmed.to_owned()), span),
+    }
+}
+
+/// Emit a column's DEFAULT value into a register.
+///
+/// Parses the column's `default_value` SQL text and emits the appropriate
+/// opcode. Falls back to `Null` when no default is specified.
+fn emit_default_value(b: &mut ProgramBuilder, col: &ColumnInfo, reg: i32) {
+    match col.default_value.as_deref() {
+        None => {
+            b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
+        }
+        Some(dv) => {
+            let trimmed = dv.trim();
+            // Try integer literal.
+            if let Ok(n) = trimmed.parse::<i64>() {
+                if let Ok(as_i32) = i32::try_from(n) {
+                    b.emit_op(Opcode::Integer, as_i32, reg, 0, P4::None, 0);
+                } else {
+                    b.emit_op(Opcode::Int64, 0, reg, 0, P4::Int64(n), 0);
+                }
+                return;
+            }
+            // Try float literal.
+            if let Ok(f) = trimmed.parse::<f64>() {
+                b.emit_op(Opcode::Real, 0, reg, 0, P4::Real(f), 0);
+                return;
+            }
+            // String literal: 'value' (strip surrounding quotes).
+            if trimmed.len() >= 2 && trimmed.starts_with('\'') && trimmed.ends_with('\'') {
+                let inner = trimmed[1..trimmed.len() - 1].replace("''", "'");
+                b.emit_op(Opcode::String8, 0, reg, 0, P4::Str(inner), 0);
+                return;
+            }
+            // NULL literal.
+            if trimmed.eq_ignore_ascii_case("null") {
+                b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
+                return;
+            }
+            // CURRENT_TIMESTAMP / CURRENT_DATE / CURRENT_TIME.
+            let upper = trimmed.to_ascii_uppercase();
+            if upper == "CURRENT_TIMESTAMP" || upper == "CURRENT_DATE" || upper == "CURRENT_TIME" {
+                use std::time::SystemTime;
+                let secs = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let days = secs / 86400;
+                let day_secs = secs % 86400;
+                let h = day_secs / 3600;
+                let m = (day_secs % 3600) / 60;
+                let s = day_secs % 60;
+                let (y, mo, d) = epoch_days_to_ymd(days);
+                let ts = if upper == "CURRENT_TIMESTAMP" {
+                    format!("{y:04}-{mo:02}-{d:02} {h:02}:{m:02}:{s:02}")
+                } else if upper == "CURRENT_DATE" {
+                    format!("{y:04}-{mo:02}-{d:02}")
+                } else {
+                    format!("{h:02}:{m:02}:{s:02}")
+                };
+                b.emit_op(Opcode::String8, 0, reg, 0, P4::Str(ts), 0);
+                return;
+            }
+            // TRUE / FALSE.
+            if upper == "TRUE" || upper == "1" {
+                b.emit_op(Opcode::Integer, 1, reg, 0, P4::None, 0);
+                return;
+            }
+            if upper == "FALSE" || upper == "0" {
+                b.emit_op(Opcode::Integer, 0, reg, 0, P4::None, 0);
+                return;
+            }
+            // Fallback: emit the default text as a string value.
+            b.emit_op(Opcode::String8, 0, reg, 0, P4::Str(trimmed.to_owned()), 0);
+        }
+    }
+}
 
 /// Emit `IdxInsert` opcodes for all indexes on the table (bd-so1h: Phase 5I.3).
 ///
