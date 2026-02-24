@@ -42,6 +42,13 @@ pub struct WalBackendAdapter<F: VfsFile> {
     wal: WalFile<F>,
     /// Guard so commit-time append refresh runs only once per commit batch.
     refresh_before_append: bool,
+    /// Whether read visibility is pinned to a transaction-bounded snapshot.
+    read_snapshot_pinned: bool,
+    /// Highest committed frame visible to the current read snapshot.
+    ///
+    /// `Some(idx)` means committed frames `0..=idx` are visible.
+    /// `None` means the snapshot saw no committed frame.
+    read_snapshot_last_commit: Option<usize>,
     /// Optional FEC commit hook for encoding repair symbols on commit.
     fec_hook: Option<FecCommitHook>,
     /// Accumulated FEC commit results (for later sidecar persistence).
@@ -71,6 +78,8 @@ impl<F: VfsFile> WalBackendAdapter<F> {
         Self {
             wal,
             refresh_before_append: true,
+            read_snapshot_pinned: false,
+            read_snapshot_last_commit: None,
             fec_hook: None,
             fec_pending: Vec::new(),
             page_index: HashMap::new(),
@@ -87,6 +96,8 @@ impl<F: VfsFile> WalBackendAdapter<F> {
         Self {
             wal,
             refresh_before_append: true,
+            read_snapshot_pinned: false,
+            read_snapshot_last_commit: None,
             fec_hook: Some(hook),
             fec_pending: Vec::new(),
             page_index: HashMap::new(),
@@ -264,6 +275,8 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
         // Establish a transaction-bounded snapshot once, instead of doing an
         // expensive refresh for every page read.
         self.wal.refresh(cx)?;
+        self.read_snapshot_last_commit = self.wal.last_commit_frame(cx)?;
+        self.read_snapshot_pinned = true;
         self.refresh_before_append = true;
         Ok(())
     }
@@ -309,9 +322,19 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
     }
 
     fn read_page(&mut self, cx: &Cx, page_number: u32) -> Result<Option<Vec<u8>>> {
-        // Restrict visibility to committed frames only.
-        let Some(last_commit_frame) = self.wal.last_commit_frame(cx)? else {
-            return Ok(None);
+        // Restrict visibility to committed frames only.  If a transaction
+        // snapshot is pinned, keep the commit horizon stable until the next
+        // begin_transaction() call.
+        let last_commit_frame = if self.read_snapshot_pinned {
+            let Some(pinned) = self.read_snapshot_last_commit else {
+                return Ok(None);
+            };
+            pinned
+        } else {
+            let Some(current) = self.wal.last_commit_frame(cx)? else {
+                return Ok(None);
+            };
+            current
         };
 
         // Build or extend the O(1) page index covering all committed frames.
@@ -637,6 +660,51 @@ mod tests {
             2,
             "shared WAL should contain both commit frames"
         );
+    }
+
+    #[test]
+    fn test_adapter_pins_read_snapshot_until_next_begin() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+
+        let file_writer = open_wal_file(&vfs, &cx);
+        let wal_writer =
+            WalFile::create(&cx, file_writer, PAGE_SIZE, 0, test_salts()).expect("create WAL");
+        let mut writer = WalBackendAdapter::new(wal_writer);
+
+        let file_reader = open_wal_file(&vfs, &cx);
+        let wal_reader = WalFile::open(&cx, file_reader).expect("open WAL");
+        let mut reader = WalBackendAdapter::new(wal_reader);
+
+        let v1 = sample_page(0x41);
+        writer.append_frame(&cx, 3, &v1, 3).expect("append v1");
+        writer.sync(&cx).expect("sync v1");
+
+        reader
+            .begin_transaction(&cx)
+            .expect("begin reader snapshot 1");
+        assert_eq!(
+            reader.read_page(&cx, 3).expect("reader sees v1"),
+            Some(v1.clone())
+        );
+
+        let v2 = sample_page(0x42);
+        writer.append_frame(&cx, 3, &v2, 3).expect("append v2");
+        writer.sync(&cx).expect("sync v2");
+
+        // Same transaction snapshot must stay stable (no mid-transaction drift).
+        assert_eq!(
+            reader
+                .read_page(&cx, 3)
+                .expect("reader remains on pinned snapshot"),
+            Some(v1.clone())
+        );
+
+        // A new transaction snapshot should pick up the latest commit.
+        reader
+            .begin_transaction(&cx)
+            .expect("begin reader snapshot 2");
+        assert_eq!(reader.read_page(&cx, 3).expect("reader sees v2"), Some(v2));
     }
 
     #[test]
