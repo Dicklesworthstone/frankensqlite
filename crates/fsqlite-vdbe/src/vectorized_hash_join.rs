@@ -52,8 +52,12 @@ enum KeyValue {
 /// Hash table built from one or more build-side batches.
 #[derive(Debug)]
 pub struct HashJoinTable {
-    /// Buckets keyed by hash, each holding rows with that hash.
-    buckets: HashMap<u64, Vec<BuildRow>>,
+    /// Dense array of all valid build rows.
+    rows: Vec<BuildRow>,
+    /// Maps a hash to the index of the first row in `rows` (the head of the collision chain).
+    head: HashMap<u64, usize>,
+    /// Parallel array to `rows`. Maps a row index to the next row index in the collision chain.
+    next: Vec<Option<usize>>,
     /// The build batch (for column extraction during output).
     build_batch: Batch,
     /// Column indices used for join keys on the build side.
@@ -74,7 +78,9 @@ pub fn hash_join_build(
     let sel = build_batch.selection();
     let hashes = hash_batch_columns(&build_batch, build_key_columns)?;
 
-    let mut buckets: HashMap<u64, Vec<BuildRow>> = HashMap::new();
+    let mut rows = Vec::with_capacity(sel.len());
+    let mut head: HashMap<u64, usize> = HashMap::new();
+    let mut next: Vec<Option<usize>> = Vec::with_capacity(sel.len());
 
     for (sel_idx, &row_idx) in sel.as_slice().iter().enumerate() {
         let row = usize::from(row_idx);
@@ -86,14 +92,25 @@ pub fn hash_join_build(
         }
 
         let hash = hashes[sel_idx];
-        buckets.entry(hash).or_default().push(BuildRow {
+        let current_idx = rows.len();
+
+        rows.push(BuildRow {
             key,
             row_index: row,
         });
+
+        if let Some(&prev_head) = head.get(&hash) {
+            next.push(Some(prev_head));
+        } else {
+            next.push(None);
+        }
+        head.insert(hash, current_idx);
     }
 
     Ok(HashJoinTable {
-        buckets,
+        rows,
+        head,
+        next,
         build_batch,
         build_key_columns: build_key_columns.to_vec(),
     })
@@ -145,7 +162,7 @@ pub fn hash_join_probe(
         }
 
         let hash = probe_hashes[sel_idx];
-        let matches = find_build_matches(&table.buckets, hash, &probe_key);
+        let matches = find_build_matches(table, hash, &probe_key);
 
         if matches.is_empty() {
             match join_type {
@@ -272,19 +289,20 @@ fn extract_key(batch: &Batch, key_columns: &[usize], row: usize) -> Result<Vec<K
     Ok(key)
 }
 
-fn find_build_matches(
-    buckets: &HashMap<u64, Vec<BuildRow>>,
-    hash: u64,
-    probe_key: &[KeyValue],
-) -> Vec<usize> {
-    let Some(bucket) = buckets.get(&hash) else {
-        return Vec::new();
-    };
-    bucket
-        .iter()
-        .filter(|build_row| build_row.key == *probe_key)
-        .map(|build_row| build_row.row_index)
-        .collect()
+fn find_build_matches(table: &HashJoinTable, hash: u64, probe_key: &[KeyValue]) -> Vec<usize> {
+    let mut matches = Vec::new();
+    let mut current = table.head.get(&hash).copied();
+    while let Some(idx) = current {
+        let build_row = &table.rows[idx];
+        if build_row.key == *probe_key {
+            matches.push(build_row.row_index);
+        }
+        current = table.next[idx];
+    }
+    // We inserted items by pushing onto the head, meaning we traverse from newest to oldest.
+    // We reverse to maintain the stable insertion order of the original build side, matching the old HashMap bucket ordering.
+    matches.reverse();
+    matches
 }
 
 /// Gather values from a column at specified row indices.

@@ -2974,7 +2974,7 @@ impl VdbeEngine {
 
                 Opcode::IsTrue => {
                     let val = self.get_reg(op.p1);
-                    let truth = !val.is_null() && val.to_integer() != 0;
+                    let truth = !val.is_null() && val.to_float() != 0.0;
                     self.set_reg(op.p2, SqliteValue::Integer(i64::from(truth)));
                     pc += 1;
                 }
