@@ -407,12 +407,83 @@ impl<'a> Resolver<'a> {
             Statement::Select(select) => self.resolve_select(select, scope),
             Statement::Insert(insert) => {
                 self.resolve_table_name(&insert.table.name, scope);
+                match &insert.source {
+                    fsqlite_ast::InsertSource::Select(select) => self.resolve_select(select, scope),
+                    fsqlite_ast::InsertSource::Values(rows) => {
+                        for row in rows {
+                            for expr in row {
+                                self.resolve_expr(expr, scope);
+                            }
+                        }
+                    }
+                    fsqlite_ast::InsertSource::DefaultValues => {}
+                }
+                for upsert in &insert.upsert {
+                    if let Some(target) = &upsert.target {
+                        for col in &target.columns {
+                            self.resolve_expr(&col.expr, scope);
+                        }
+                        if let Some(where_clause) = &target.where_clause {
+                            self.resolve_expr(where_clause, scope);
+                        }
+                    }
+                    match &upsert.action {
+                        fsqlite_ast::UpsertAction::Update { assignments, where_clause } => {
+                            for assignment in assignments {
+                                self.resolve_expr(&assignment.value, scope);
+                            }
+                            if let Some(w) = where_clause {
+                                self.resolve_expr(w, scope);
+                            }
+                        }
+                        fsqlite_ast::UpsertAction::Nothing => {}
+                    }
+                }
+                for ret in &insert.returning {
+                    self.resolve_result_column(ret, scope);
+                }
             }
             Statement::Update(update) => {
                 self.resolve_table_name(&update.table.name.name, scope);
+                for assignment in &update.assignments {
+                    self.resolve_expr(&assignment.value, scope);
+                }
+                if let Some(from) = &update.from {
+                    self.resolve_from(from, scope);
+                }
+                if let Some(where_clause) = &update.where_clause {
+                    self.resolve_expr(where_clause, scope);
+                }
+                for ret in &update.returning {
+                    self.resolve_result_column(ret, scope);
+                }
+                for term in &update.order_by {
+                    self.resolve_expr(&term.expr, scope);
+                }
+                if let Some(limit) = &update.limit {
+                    self.resolve_expr(&limit.limit, scope);
+                    if let Some(offset) = &limit.offset {
+                        self.resolve_expr(offset, scope);
+                    }
+                }
             }
             Statement::Delete(delete) => {
                 self.resolve_table_name(&delete.table.name.name, scope);
+                if let Some(where_clause) = &delete.where_clause {
+                    self.resolve_expr(where_clause, scope);
+                }
+                for ret in &delete.returning {
+                    self.resolve_result_column(ret, scope);
+                }
+                for term in &delete.order_by {
+                    self.resolve_expr(&term.expr, scope);
+                }
+                if let Some(limit) = &delete.limit {
+                    self.resolve_expr(&limit.limit, scope);
+                    if let Some(offset) = &delete.limit.offset {
+                        self.resolve_expr(offset, scope);
+                    }
+                }
             }
             // DDL and control statements don't need name resolution.
             _ => {}
@@ -434,6 +505,19 @@ impl<'a> Resolver<'a> {
         for (_op, core) in &select.body.compounds {
             self.resolve_select_core(core, scope);
         }
+
+        // Resolve ORDER BY.
+        for term in &select.order_by {
+            self.resolve_expr(&term.expr, scope);
+        }
+
+        // Resolve LIMIT.
+        if let Some(limit) = &select.limit {
+            self.resolve_expr(&limit.limit, scope);
+            if let Some(offset) = &limit.offset {
+                self.resolve_expr(offset, scope);
+            }
+        }
     }
 
     fn resolve_select_core(&mut self, core: &SelectCore, scope: &mut Scope) {
@@ -444,6 +528,7 @@ impl<'a> Resolver<'a> {
                 where_clause,
                 group_by,
                 having,
+                windows,
                 ..
             } => {
                 // Resolve FROM clause first (registers table aliases).
@@ -470,6 +555,34 @@ impl<'a> Resolver<'a> {
                 if let Some(having_expr) = having {
                     self.resolve_expr(having_expr, scope);
                 }
+
+                // Resolve WINDOW definitions.
+                for window_def in windows {
+                    for expr in &window_def.spec.partition_by {
+                        self.resolve_expr(expr, scope);
+                    }
+                    for term in &window_def.spec.order_by {
+                        self.resolve_expr(&term.expr, scope);
+                    }
+                    if let Some(frame) = &window_def.spec.frame {
+                        match &frame.start {
+                            fsqlite_ast::FrameBound::Preceding(expr)
+                            | fsqlite_ast::FrameBound::Following(expr) => {
+                                self.resolve_expr(expr, scope);
+                            }
+                            _ => {}
+                        }
+                        if let Some(end) = &frame.end {
+                            match end {
+                                fsqlite_ast::FrameBound::Preceding(expr)
+                                | fsqlite_ast::FrameBound::Following(expr) => {
+                                    self.resolve_expr(expr, scope);
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
             }
             SelectCore::Values(_) => {
                 // VALUES doesn't reference columns.
@@ -491,8 +604,8 @@ impl<'a> Resolver<'a> {
                 let table_name = &name.name;
                 let alias_name = alias.as_deref().unwrap_or(table_name);
 
-                // Check for duplicate alias.
-                if scope.has_alias(alias_name) {
+                // Check for duplicate alias in the CURRENT scope only.
+                if scope.has_alias_local(alias_name) {
                     self.push_error(SemanticErrorKind::DuplicateAlias {
                         alias: alias_name.to_owned(),
                     });
@@ -525,10 +638,28 @@ impl<'a> Resolver<'a> {
                 // Register the subquery alias with empty columns (we don't
                 // track subquery output columns at this stage).
                 let alias_name = alias.as_deref().unwrap_or("");
+
+                if !alias_name.is_empty() && scope.has_alias_local(alias_name) {
+                    self.push_error(SemanticErrorKind::DuplicateAlias {
+                        alias: alias_name.to_owned(),
+                    });
+                }
+
                 scope.add_alias(alias_name, "<subquery>", None);
             }
-            TableOrSubquery::TableFunction { name, alias, .. } => {
+            TableOrSubquery::TableFunction { name, args, alias, .. } => {
+                for arg in args {
+                    self.resolve_expr(arg, scope);
+                }
+
                 let alias_name = alias.as_deref().unwrap_or(name);
+
+                if scope.has_alias_local(alias_name) {
+                    self.push_error(SemanticErrorKind::DuplicateAlias {
+                        alias: alias_name.to_owned(),
+                    });
+                }
+
                 scope.add_alias(alias_name, name, None);
                 self.tables_resolved += 1;
             }
@@ -641,7 +772,7 @@ impl<'a> Resolver<'a> {
                 self.resolve_select(select, &mut child);
             }
             Expr::FunctionCall {
-                name, args, filter, ..
+                name, args, filter, over, ..
             } => {
                 let arg_slice: &[Expr] = match args {
                     FunctionArgs::Star => &[],
@@ -650,6 +781,32 @@ impl<'a> Resolver<'a> {
                 self.resolve_function(name, arg_slice, scope);
                 if let Some(filter) = filter {
                     self.resolve_expr(filter, scope);
+                }
+                if let Some(window_spec) = over {
+                    for expr in &window_spec.partition_by {
+                        self.resolve_expr(expr, scope);
+                    }
+                    for term in &window_spec.order_by {
+                        self.resolve_expr(&term.expr, scope);
+                    }
+                    if let Some(frame) = &window_spec.frame {
+                        match &frame.start {
+                            fsqlite_ast::FrameBound::Preceding(expr)
+                            | fsqlite_ast::FrameBound::Following(expr) => {
+                                self.resolve_expr(expr, scope);
+                            }
+                            _ => {}
+                        }
+                        if let Some(end) = &frame.end {
+                            match end {
+                                fsqlite_ast::FrameBound::Preceding(expr)
+                                | fsqlite_ast::FrameBound::Following(expr) => {
+                                    self.resolve_expr(expr, scope);
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
                 }
             }
             Expr::Case {

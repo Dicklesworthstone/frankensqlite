@@ -118,17 +118,27 @@ impl Parser {
     }
 
     pub(crate) fn enter_recursion(&mut self) -> Result<(), ParseError> {
-        self.depth += 1;
-        if self.depth > MAX_PARSE_DEPTH {
+        if self.depth >= MAX_PARSE_DEPTH {
             return Err(self.err_msg(format!(
                 "expression tree is too deep (maximum depth {MAX_PARSE_DEPTH})"
             )));
         }
+        self.depth += 1;
         Ok(())
     }
 
     pub(crate) fn leave_recursion(&mut self) {
         self.depth = self.depth.saturating_sub(1);
+    }
+
+    fn with_recursion_guard<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> Result<T, ParseError>,
+    ) -> Result<T, ParseError> {
+        self.enter_recursion()?;
+        let result = f(self);
+        self.leave_recursion();
+        result
     }
 
     #[must_use]
@@ -376,65 +386,62 @@ impl Parser {
     // -----------------------------------------------------------------------
 
     fn parse_statement_inner(&mut self) -> Result<Statement, ParseError> {
-        self.enter_recursion()?;
-        let result = match self.peek().clone() {
+        self.with_recursion_guard(|parser| match parser.peek().clone() {
             TokenKind::KwSelect | TokenKind::KwValues => {
-                Ok(Statement::Select(self.parse_select_stmt(None)?))
+                Ok(Statement::Select(parser.parse_select_stmt(None)?))
             }
-            TokenKind::KwWith => self.parse_with_leading(),
-            TokenKind::KwInsert | TokenKind::KwReplace => self.parse_insert_stmt(None),
-            TokenKind::KwUpdate => self.parse_update_stmt(None),
-            TokenKind::KwDelete => self.parse_delete_stmt(None),
-            TokenKind::KwCreate => self.parse_create(),
-            TokenKind::KwDrop => self.parse_drop(),
-            TokenKind::KwAlter => self.parse_alter(),
-            TokenKind::KwBegin => self.parse_begin(),
+            TokenKind::KwWith => parser.parse_with_leading(),
+            TokenKind::KwInsert | TokenKind::KwReplace => parser.parse_insert_stmt(None),
+            TokenKind::KwUpdate => parser.parse_update_stmt(None),
+            TokenKind::KwDelete => parser.parse_delete_stmt(None),
+            TokenKind::KwCreate => parser.parse_create(),
+            TokenKind::KwDrop => parser.parse_drop(),
+            TokenKind::KwAlter => parser.parse_alter(),
+            TokenKind::KwBegin => parser.parse_begin(),
             TokenKind::KwCommit | TokenKind::KwEnd => {
-                self.advance();
-                let _ = self.eat_kw(&TokenKind::KwTransaction);
+                parser.advance();
+                let _ = parser.eat_kw(&TokenKind::KwTransaction);
                 Ok(Statement::Commit)
             }
-            TokenKind::KwRollback => self.parse_rollback(),
+            TokenKind::KwRollback => parser.parse_rollback(),
             TokenKind::KwSavepoint => {
-                self.advance();
-                Ok(Statement::Savepoint(self.parse_identifier()?))
+                parser.advance();
+                Ok(Statement::Savepoint(parser.parse_identifier()?))
             }
             TokenKind::KwRelease => {
-                self.advance();
-                let _ = self.eat_kw(&TokenKind::KwSavepoint);
-                Ok(Statement::Release(self.parse_identifier()?))
+                parser.advance();
+                let _ = parser.eat_kw(&TokenKind::KwSavepoint);
+                Ok(Statement::Release(parser.parse_identifier()?))
             }
-            TokenKind::KwAttach => self.parse_attach(),
+            TokenKind::KwAttach => parser.parse_attach(),
             TokenKind::KwDetach => {
-                self.advance();
-                let _ = self.eat_kw(&TokenKind::KwDatabase);
-                Ok(Statement::Detach(self.parse_identifier()?))
+                parser.advance();
+                let _ = parser.eat_kw(&TokenKind::KwDatabase);
+                Ok(Statement::Detach(parser.parse_identifier()?))
             }
-            TokenKind::KwPragma => self.parse_pragma(),
-            TokenKind::KwVacuum => self.parse_vacuum(),
+            TokenKind::KwPragma => parser.parse_pragma(),
+            TokenKind::KwVacuum => parser.parse_vacuum(),
             TokenKind::KwReindex => {
-                self.advance();
-                let name = if !self.at_eof() && !self.check(&TokenKind::Semicolon) {
-                    Some(self.parse_qualified_name()?)
+                parser.advance();
+                let name = if !parser.at_eof() && !parser.check(&TokenKind::Semicolon) {
+                    Some(parser.parse_qualified_name()?)
                 } else {
                     None
                 };
                 Ok(Statement::Reindex(name))
             }
             TokenKind::KwAnalyze => {
-                self.advance();
-                let name = if !self.at_eof() && !self.check(&TokenKind::Semicolon) {
-                    Some(self.parse_qualified_name()?)
+                parser.advance();
+                let name = if !parser.at_eof() && !parser.check(&TokenKind::Semicolon) {
+                    Some(parser.parse_qualified_name()?)
                 } else {
                     None
                 };
                 Ok(Statement::Analyze(name))
             }
-            TokenKind::KwExplain => self.parse_explain(),
-            _ => Err(self.err_msg("unexpected token at start of statement")),
-        };
-        self.leave_recursion();
-        result
+            TokenKind::KwExplain => parser.parse_explain(),
+            _ => Err(parser.err_msg("unexpected token at start of statement")),
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -500,10 +507,7 @@ impl Parser {
         &mut self,
         with: Option<WithClause>,
     ) -> Result<SelectStatement, ParseError> {
-        self.enter_recursion()?;
-        let result = self.parse_select_stmt_inner(with);
-        self.leave_recursion();
-        result
+        self.with_recursion_guard(|parser| parser.parse_select_stmt_inner(with))
     }
 
     fn parse_select_stmt_inner(
@@ -2089,6 +2093,37 @@ mod tests {
         let stmts = parse_ok(sql);
         assert_eq!(stmts.len(), 1, "expected 1 statement, got {}", stmts.len());
         stmts.into_iter().next().unwrap()
+    }
+
+    #[test]
+    fn test_parse_depth_overflow_does_not_poison_following_statement() {
+        let mut parser = Parser::from_sql("SELECT 1; SELECT 42;");
+        parser.depth = MAX_PARSE_DEPTH - 1;
+
+        // First statement overflows in nested parse entry (statement -> select)
+        // and should unwind depth cleanly back to MAX_PARSE_DEPTH - 1.
+        let first = parser.parse_statement();
+        assert!(first.is_err(), "first statement should hit depth guard");
+        assert_eq!(
+            parser.depth,
+            MAX_PARSE_DEPTH - 1,
+            "depth must not leak upward on recursion-limit error"
+        );
+
+        // Consume separator and parse the next statement; it should still be
+        // reachable and fail for the same controlled reason (not because depth
+        // was poisoned by the prior attempt).
+        let _ = parser.eat(&TokenKind::Semicolon);
+        let second = parser.parse_statement();
+        assert!(
+            second.is_err(),
+            "second statement should still be parseable"
+        );
+        assert_eq!(
+            parser.depth,
+            MAX_PARSE_DEPTH - 1,
+            "depth must remain stable across repeated recursion-limit errors"
+        );
     }
 
     #[test]
