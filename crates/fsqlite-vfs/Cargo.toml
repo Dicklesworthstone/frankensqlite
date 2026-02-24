@@ -8,11 +8,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [features]
-default = ["linux-uring-fs"]
-# Linux io_uring backend powered by `uring-fs` (existing default path).
-linux-uring-fs = ["dep:uring-fs"]
-# Linux io_uring backend powered by `asupersync` for A/B backend validation.
-linux-asupersync-uring = ["dep:asupersync"]
+default = []
 
 [dependencies]
 fsqlite-types = { workspace = true }
@@ -20,11 +16,6 @@ fsqlite-error = { workspace = true }
 nix = { workspace = true }
 libc = { workspace = true }
 tracing = { workspace = true }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-pollster = "0.4.0"
-uring-fs = { version = "1.4.0", optional = true }
-asupersync = { workspace = true, features = ["io-uring"], optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 advisory-lock = "0.3.0"

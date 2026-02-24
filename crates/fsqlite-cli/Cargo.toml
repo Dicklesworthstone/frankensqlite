@@ -13,11 +13,6 @@ path = "src/main.rs"
 
 [features]
 default = []
-linux-uring-fs = ["fsqlite/linux-uring-fs", "fsqlite-core/linux-uring-fs"]
-linux-asupersync-uring = [
-    "fsqlite/linux-asupersync-uring",
-    "fsqlite-core/linux-asupersync-uring",
-]
 
 [dependencies]
 fsqlite = { workspace = true }

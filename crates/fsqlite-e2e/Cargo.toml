@@ -13,17 +13,7 @@ description = "End-to-end differential testing and benchmark harness for Franken
 workspace = true
 
 [features]
-default = ["linux-uring-fs"]
-linux-uring-fs = [
-    "fsqlite/linux-uring-fs",
-    "fsqlite-core/linux-uring-fs",
-    "fsqlite-vfs/linux-uring-fs",
-]
-linux-asupersync-uring = [
-    "fsqlite/linux-asupersync-uring",
-    "fsqlite-core/linux-asupersync-uring",
-    "fsqlite-vfs/linux-asupersync-uring",
-]
+default = []
 
 [dependencies]
 fsqlite = { path = "../fsqlite", version = "0.1.1", default-features = false, features = ["json", "fts5", "rtree"] }

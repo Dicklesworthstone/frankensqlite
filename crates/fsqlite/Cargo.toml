@@ -21,12 +21,7 @@ fsqlite-ext-icu = { workspace = true, optional = true }
 fsqlite-ext-misc = { workspace = true, optional = true }
 
 [features]
-default = ["json", "fts5", "rtree", "linux-uring-fs"]
-linux-uring-fs = ["fsqlite-core/linux-uring-fs", "fsqlite-vfs/linux-uring-fs"]
-linux-asupersync-uring = [
-    "fsqlite-core/linux-asupersync-uring",
-    "fsqlite-vfs/linux-asupersync-uring",
-]
+default = ["json", "fts5", "rtree"]
 json = ["dep:fsqlite-ext-json"]
 fts5 = ["dep:fsqlite-ext-fts5"]
 fts3 = ["dep:fsqlite-ext-fts3"]

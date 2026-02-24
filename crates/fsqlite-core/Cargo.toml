@@ -8,9 +8,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [features]
-default = ["linux-uring-fs"]
-linux-uring-fs = ["fsqlite-vfs/linux-uring-fs"]
-linux-asupersync-uring = ["fsqlite-vfs/linux-asupersync-uring"]
+default = []
 
 [dependencies]
 fsqlite-types = { workspace = true }

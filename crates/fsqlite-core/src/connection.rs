@@ -46,10 +46,8 @@ use fsqlite_vdbe::codegen::{
 };
 use fsqlite_vdbe::engine::{ExecOutcome, MemDatabase, MemDbVersionToken, VdbeEngine};
 use fsqlite_vdbe::{ProgramBuilder, VdbeProgram};
-#[cfg(target_os = "linux")]
-use fsqlite_vfs::IoUringVfs;
 use fsqlite_vfs::MemoryVfs;
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(unix)]
 use fsqlite_vfs::UnixVfs;
 use fsqlite_vfs::traits::Vfs;
 use fsqlite_wal::{
@@ -98,11 +96,8 @@ use crate::wal_adapter::WalBackendAdapter;
 pub enum PagerBackend {
     /// In-memory VFS backend (`:memory:` databases).
     Memory(Arc<SimplePager<MemoryVfs>>),
-    /// Linux io_uring VFS backend (file-backed databases).
-    #[cfg(target_os = "linux")]
-    IoUring(Arc<SimplePager<IoUringVfs>>),
-    /// Unix filesystem VFS backend (file-backed databases).
-    #[cfg(all(unix, not(target_os = "linux")))]
+    /// Unix filesystem VFS backend (file-backed databases on all unix platforms).
+    #[cfg(unix)]
     Unix(Arc<SimplePager<UnixVfs>>),
 }
 
@@ -110,9 +105,7 @@ impl std::fmt::Debug for PagerBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Memory(_) => f.write_str("PagerBackend::Memory"),
-            #[cfg(target_os = "linux")]
-            Self::IoUring(_) => f.write_str("PagerBackend::IoUring"),
-            #[cfg(all(unix, not(target_os = "linux")))]
+            #[cfg(unix)]
             Self::Unix(_) => f.write_str("PagerBackend::Unix"),
         }
     }
@@ -123,8 +116,7 @@ impl PagerBackend {
     ///
     /// Uses [`MemoryVfs`] for `:memory:`.
     ///
-    /// File-backed paths use [`IoUringVfs`] on Linux and [`UnixVfs`] on other
-    /// Unix platforms.
+    /// File-backed paths use [`UnixVfs`] on all unix platforms.
     fn open(path: &str) -> Result<Self> {
         if path == ":memory:" {
             let vfs = MemoryVfs::new();
@@ -132,14 +124,7 @@ impl PagerBackend {
             let pager = SimplePager::open(vfs, &db_path, PageSize::DEFAULT)?;
             Ok(Self::Memory(Arc::new(pager)))
         } else {
-            #[cfg(target_os = "linux")]
-            {
-                let vfs = IoUringVfs::new();
-                let db_path = PathBuf::from(path);
-                let pager = SimplePager::open(vfs, &db_path, PageSize::DEFAULT)?;
-                Ok(Self::IoUring(Arc::new(pager)))
-            }
-            #[cfg(all(unix, not(target_os = "linux")))]
+            #[cfg(unix)]
             {
                 let vfs = UnixVfs::new();
                 let db_path = PathBuf::from(path);
@@ -159,9 +144,7 @@ impl PagerBackend {
     fn begin(&self, cx: &Cx, mode: TransactionMode) -> Result<Box<dyn TransactionHandle>> {
         match self {
             Self::Memory(p) => Ok(Box::new(p.begin(cx, mode)?)),
-            #[cfg(target_os = "linux")]
-            Self::IoUring(p) => Ok(Box::new(p.begin(cx, mode)?)),
-            #[cfg(all(unix, not(target_os = "linux")))]
+            #[cfg(unix)]
             Self::Unix(p) => Ok(Box::new(p.begin(cx, mode)?)),
         }
     }
@@ -169,9 +152,7 @@ impl PagerBackend {
     fn journal_mode(&self) -> JournalMode {
         match self {
             Self::Memory(p) => p.journal_mode(),
-            #[cfg(target_os = "linux")]
-            Self::IoUring(p) => p.journal_mode(),
-            #[cfg(all(unix, not(target_os = "linux")))]
+            #[cfg(unix)]
             Self::Unix(p) => p.journal_mode(),
         }
     }
@@ -179,9 +160,7 @@ impl PagerBackend {
     fn set_journal_mode(&self, cx: &Cx, mode: JournalMode) -> Result<JournalMode> {
         match self {
             Self::Memory(p) => p.set_journal_mode(cx, mode),
-            #[cfg(target_os = "linux")]
-            Self::IoUring(p) => p.set_journal_mode(cx, mode),
-            #[cfg(all(unix, not(target_os = "linux")))]
+            #[cfg(unix)]
             Self::Unix(p) => p.set_journal_mode(cx, mode),
         }
     }
@@ -193,12 +172,7 @@ impl PagerBackend {
                 let vfs = MemoryVfs::new();
                 install_wal_backend_with_vfs(p, &vfs, cx, &wal_path)
             }
-            #[cfg(target_os = "linux")]
-            Self::IoUring(p) => {
-                let vfs = IoUringVfs::new();
-                install_wal_backend_with_vfs(p, &vfs, cx, &wal_path)
-            }
-            #[cfg(all(unix, not(target_os = "linux")))]
+            #[cfg(unix)]
             Self::Unix(p) => {
                 let vfs = UnixVfs::new();
                 install_wal_backend_with_vfs(p, &vfs, cx, &wal_path)
@@ -214,9 +188,7 @@ impl PagerBackend {
     ) -> Result<fsqlite_pager::CheckpointResult> {
         match self {
             Self::Memory(p) => p.checkpoint(cx, mode),
-            #[cfg(target_os = "linux")]
-            Self::IoUring(p) => p.checkpoint(cx, mode),
-            #[cfg(all(unix, not(target_os = "linux")))]
+            #[cfg(unix)]
             Self::Unix(p) => p.checkpoint(cx, mode),
         }
     }
@@ -225,9 +197,7 @@ impl PagerBackend {
     fn cache_metrics_snapshot(&self) -> Result<PageCacheMetricsSnapshot> {
         match self {
             Self::Memory(p) => p.cache_metrics_snapshot(),
-            #[cfg(target_os = "linux")]
-            Self::IoUring(p) => p.cache_metrics_snapshot(),
-            #[cfg(all(unix, not(target_os = "linux")))]
+            #[cfg(unix)]
             Self::Unix(p) => p.cache_metrics_snapshot(),
         }
     }
@@ -236,9 +206,7 @@ impl PagerBackend {
     fn reset_cache_metrics(&self) -> Result<()> {
         match self {
             Self::Memory(p) => p.reset_cache_metrics(),
-            #[cfg(target_os = "linux")]
-            Self::IoUring(p) => p.reset_cache_metrics(),
-            #[cfg(all(unix, not(target_os = "linux")))]
+            #[cfg(unix)]
             Self::Unix(p) => p.reset_cache_metrics(),
         }
     }
@@ -3824,6 +3792,28 @@ impl Connection {
                     self.rowid_alias_columns
                         .borrow_mut()
                         .remove(&obj_name.to_ascii_lowercase());
+                    
+                    let mut triggers_to_drop = Vec::new();
+                    {
+                        let mut triggers = self.triggers.borrow_mut();
+                        let mut i = 0;
+                        while i < triggers.len() {
+                            if triggers[i].table_name.eq_ignore_ascii_case(obj_name) {
+                                let trigger = triggers.remove(i);
+                                if !trigger.temporary {
+                                    triggers_to_drop.push(trigger.name);
+                                }
+                            } else {
+                                i += 1;
+                            }
+                        }
+                    }
+                    for trigger_name in triggers_to_drop {
+                        if let Err(err) = self.delete_sqlite_master_row(&trigger_name) {
+                            swallow_missing_master(err)?;
+                        }
+                    }
+
                     if let Err(err) = self.delete_sqlite_master_row(obj_name) {
                         swallow_missing_master(err)?;
                     }
@@ -3875,6 +3865,32 @@ impl Connection {
                     .position(|v| v.name.eq_ignore_ascii_case(obj_name))
                 {
                     views.remove(pos);
+                    drop(views);
+
+                    let mut triggers_to_drop = Vec::new();
+                    {
+                        let mut triggers = self.triggers.borrow_mut();
+                        let mut i = 0;
+                        while i < triggers.len() {
+                            if triggers[i].table_name.eq_ignore_ascii_case(obj_name) {
+                                let trigger = triggers.remove(i);
+                                if !trigger.temporary {
+                                    triggers_to_drop.push(trigger.name);
+                                }
+                            } else {
+                                i += 1;
+                            }
+                        }
+                    }
+                    for trigger_name in triggers_to_drop {
+                        if let Err(err) = self.delete_sqlite_master_row(&trigger_name) {
+                            swallow_missing_master(err)?;
+                        }
+                    }
+
+                    if let Err(err) = self.delete_sqlite_master_row(obj_name) {
+                        swallow_missing_master(err)?;
+                    }
                     true
                 } else if drop_stmt.if_exists {
                     return Ok(());
@@ -4137,11 +4153,22 @@ impl Connection {
             )));
         }
         drop(views);
+        
+        let create_sql = stmt.to_string();
         self.views.borrow_mut().push(ViewDef {
             name: view_name.clone(),
             columns: stmt.columns.clone(),
             query: stmt.query.clone(),
         });
+        
+        self.insert_sqlite_master_row(
+            "view",
+            view_name,
+            view_name,
+            0,
+            &create_sql,
+        )?;
+        
         self.increment_schema_cookie();
         Ok(())
     }
@@ -7374,7 +7401,7 @@ impl Connection {
                 table_rows.push(rows);
             } else {
                 // Named table: scan from database.
-                let scan_sql = format!("SELECT * FROM {}", src.table_name);
+                let scan_sql = format!("SELECT * FROM \"{}\"", src.table_name.replace('"', "\"\""));
                 let rows = self.query(&scan_sql)?;
                 table_rows.push(rows.iter().map(|r| r.values().to_vec()).collect());
             }
@@ -13402,17 +13429,7 @@ mod tests {
         assert!(matches!(conn.pager, PagerBackend::Memory(_)));
     }
 
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn test_file_backed_connection_uses_iouring_pager_backend() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("pager_backend_iouring.db");
-        let path_str = path.to_string_lossy().into_owned();
-        let conn = Connection::open(path_str).unwrap();
-        assert!(matches!(conn.pager, PagerBackend::IoUring(_)));
-    }
-
-    #[cfg(all(unix, not(target_os = "linux")))]
+    #[cfg(unix)]
     #[test]
     fn test_file_backed_connection_uses_unix_pager_backend() {
         let dir = tempfile::tempdir().unwrap();
