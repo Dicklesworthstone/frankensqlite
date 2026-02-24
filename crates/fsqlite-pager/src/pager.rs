@@ -867,17 +867,15 @@ where
             inner.freelist.push(page);
         }
 
-        if self.is_writer {
-            if self.mode != TransactionMode::Concurrent {
-                inner.db_size = self.original_db_size;
+        if self.is_writer && self.mode != TransactionMode::Concurrent {
+            inner.db_size = self.original_db_size;
 
-                // Reset next_page to avoid holes if we allocated pages that are now discarded.
-                // Logic matches SimplePager::open.
-                let db_size = inner.db_size;
-                inner.next_page = if db_size >= 2 { db_size + 1 } else { 2 };
+            // Reset next_page to avoid holes if we allocated pages that are now discarded.
+            // Logic matches SimplePager::open.
+            let db_size = inner.db_size;
+            inner.next_page = if db_size >= 2 { db_size + 1 } else { 2 };
 
-                inner.writer_active = false;
-            }
+            inner.writer_active = false;
         }
         inner.active_transactions = inner.active_transactions.saturating_sub(1);
         drop(inner);
@@ -977,17 +975,15 @@ impl<V: Vfs> Drop for SimpleTransaction<V> {
                 inner.freelist.push(page);
             }
 
-            if self.is_writer {
-                if self.mode != TransactionMode::Concurrent {
-                    inner.db_size = self.original_db_size;
+            if self.is_writer && self.mode != TransactionMode::Concurrent {
+                inner.db_size = self.original_db_size;
 
-                    // Reset next_page to avoid holes if we allocated pages that are now discarded.
-                    // Logic matches SimplePager::open and SimpleTransaction::rollback.
-                    let db_size = inner.db_size;
-                    inner.next_page = if db_size >= 2 { db_size + 1 } else { 2 };
+                // Reset next_page to avoid holes if we allocated pages that are now discarded.
+                // Logic matches SimplePager::open and SimpleTransaction::rollback.
+                let db_size = inner.db_size;
+                inner.next_page = if db_size >= 2 { db_size + 1 } else { 2 };
 
-                    inner.writer_active = false;
-                }
+                inner.writer_active = false;
             }
             inner.active_transactions = inner.active_transactions.saturating_sub(1);
         }
