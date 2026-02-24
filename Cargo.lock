@@ -799,6 +799,7 @@ dependencies = [
  "proptest",
  "rusqlite",
  "serde",
+ "serde_json",
  "tempfile",
  "tracing",
  "xxhash-rust",

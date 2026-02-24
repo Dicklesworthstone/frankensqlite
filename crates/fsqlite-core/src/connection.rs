@@ -16,6 +16,8 @@ use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Instant;
 
+use serde_json::json;
+
 use fsqlite_ast::{
     AlterTableAction, BinaryOp, ColumnConstraintKind, ColumnRef, CompoundOp, CreateTableBody,
     DefaultValue, Distinctness, DropObjectType, Expr, FunctionArgs, InSet, JoinConstraint,
@@ -3225,47 +3227,109 @@ impl Connection {
 
     fn txn_timeline_json_rows(&self) -> Vec<Row> {
         let metrics = self.txn_lifecycle_metrics.borrow();
-        let active = if metrics.active_started_at.is_some() {
-            "true"
-        } else {
-            "false"
-        };
-        let snapshot = format!(
-            concat!(
-                "{{",
-                "\"active\":{},",
-                "\"snapshot_age_ms\":{},",
-                "\"first_read_ms\":{},",
-                "\"first_write_ms\":{},",
-                "\"read_ops\":{},",
-                "\"write_ops\":{},",
-                "\"savepoint_depth\":{},",
-                "\"active_rollbacks\":{},",
-                "\"completed_count\":{},",
-                "\"rollback_count_total\":{},",
-                "\"advisor\":{{",
-                "\"long_txn_threshold_ms\":{},",
-                "\"large_read_ops_threshold\":{},",
-                "\"savepoint_depth_threshold\":{},",
-                "\"rollback_ratio_percent_threshold\":{}",
-                "}}",
-                "}}"
-            ),
-            active,
-            metrics.current_snapshot_age_ms(),
-            metrics.current_first_read_ms(),
-            metrics.current_first_write_ms(),
-            metrics.active_read_ops,
-            metrics.active_write_ops,
-            metrics.active_savepoint_depth,
-            metrics.active_rollbacks,
-            metrics.completed_count,
-            metrics.rollback_count_total,
-            metrics.long_txn_threshold_ms,
-            metrics.advisor_large_read_ops_threshold,
-            metrics.advisor_savepoint_depth_threshold,
-            metrics.advisor_rollback_ratio_percent,
-        );
+        let active = metrics.active_started_at.is_some();
+        let snapshot_age_ms = metrics.current_snapshot_age_ms();
+        let first_read_ms = metrics.current_first_read_ms();
+        let first_write_ms = metrics.current_first_write_ms();
+        let snapshot_age_us = snapshot_age_ms.saturating_mul(1_000);
+        let first_read_us = first_read_ms.saturating_mul(1_000);
+        let first_write_us = first_write_ms.saturating_mul(1_000);
+
+        let mut trace_events = vec![json!({
+            "name": "txn_lifecycle",
+            "cat": "transaction",
+            "ph": "B",
+            "ts": 0_u64,
+            "pid": 1_u64,
+            "tid": 1_u64,
+            "args": {
+                "active": active
+            }
+        })];
+
+        if first_read_ms > 0 {
+            trace_events.push(json!({
+                "name": "first_read",
+                "cat": "transaction",
+                "ph": "i",
+                "s": "t",
+                "ts": first_read_us,
+                "pid": 1_u64,
+                "tid": 1_u64,
+                "args": {
+                    "read_ops": metrics.active_read_ops
+                }
+            }));
+        }
+
+        if first_write_ms > 0 {
+            trace_events.push(json!({
+                "name": "first_write",
+                "cat": "transaction",
+                "ph": "i",
+                "s": "t",
+                "ts": first_write_us,
+                "pid": 1_u64,
+                "tid": 1_u64,
+                "args": {
+                    "write_ops": metrics.active_write_ops
+                }
+            }));
+        }
+
+        trace_events.push(json!({
+            "name": "txn_counters",
+            "cat": "transaction",
+            "ph": "C",
+            "ts": snapshot_age_us,
+            "pid": 1_u64,
+            "tid": 1_u64,
+            "args": {
+                "snapshot_age_ms": snapshot_age_ms,
+                "read_ops": metrics.active_read_ops,
+                "write_ops": metrics.active_write_ops,
+                "savepoint_depth": metrics.active_savepoint_depth,
+                "active_rollbacks": metrics.active_rollbacks
+            }
+        }));
+
+        if !active {
+            trace_events.push(json!({
+                "name": "txn_lifecycle",
+                "cat": "transaction",
+                "ph": "E",
+                "ts": snapshot_age_us,
+                "pid": 1_u64,
+                "tid": 1_u64,
+                "args": {
+                    "completed_count": metrics.completed_count,
+                    "rollback_count_total": metrics.rollback_count_total
+                }
+            }));
+        }
+
+        let snapshot = json!({
+            "active": active,
+            "snapshot_age_ms": snapshot_age_ms,
+            "first_read_ms": first_read_ms,
+            "first_write_ms": first_write_ms,
+            "read_ops": metrics.active_read_ops,
+            "write_ops": metrics.active_write_ops,
+            "savepoint_depth": metrics.active_savepoint_depth,
+            "active_rollbacks": metrics.active_rollbacks,
+            "completed_count": metrics.completed_count,
+            "rollback_count_total": metrics.rollback_count_total,
+            "advisor": {
+                "long_txn_threshold_ms": metrics.long_txn_threshold_ms,
+                "large_read_ops_threshold": metrics.advisor_large_read_ops_threshold,
+                "savepoint_depth_threshold": metrics.advisor_savepoint_depth_threshold,
+                "rollback_ratio_percent_threshold": metrics.advisor_rollback_ratio_percent
+            },
+            // Chrome trace-compatible timeline while preserving existing top-level fields.
+            "traceEvents": trace_events
+        })
+        .to_string();
+
         vec![Row {
             values: vec![SqliteValue::Text(snapshot)],
         }]
@@ -23246,6 +23310,26 @@ mod schema_loading_tests {
             active_payload.contains("\"active_rollbacks\":1"),
             "expected active_rollbacks=1 in timeline payload: {active_payload}"
         );
+        let active_value: serde_json::Value =
+            serde_json::from_str(active_payload).expect("timeline payload should be valid JSON");
+        let active_trace = active_value
+            .get("traceEvents")
+            .and_then(serde_json::Value::as_array)
+            .expect("traceEvents should be an array");
+        assert!(
+            active_trace.iter().any(|event| {
+                event.get("name") == Some(&serde_json::Value::String("txn_lifecycle".to_owned()))
+                    && event.get("ph") == Some(&serde_json::Value::String("B".to_owned()))
+            }),
+            "expected trace begin event in active payload: {active_payload}"
+        );
+        assert!(
+            active_trace.iter().any(|event| {
+                event.get("name") == Some(&serde_json::Value::String("txn_counters".to_owned()))
+                    && event.get("ph") == Some(&serde_json::Value::String("C".to_owned()))
+            }),
+            "expected trace counter event in active payload: {active_payload}"
+        );
 
         conn.execute("COMMIT;").unwrap();
         let committed_rows = conn.query("PRAGMA fsqlite.txn_timeline_json;").unwrap();
@@ -23265,6 +23349,19 @@ mod schema_loading_tests {
         assert!(
             committed_payload.contains("\"active_rollbacks\":0"),
             "expected active_rollbacks=0 after commit: {committed_payload}"
+        );
+        let committed_value: serde_json::Value = serde_json::from_str(committed_payload)
+            .expect("committed timeline payload should be valid JSON");
+        let committed_trace = committed_value
+            .get("traceEvents")
+            .and_then(serde_json::Value::as_array)
+            .expect("traceEvents should be an array");
+        assert!(
+            committed_trace.iter().any(|event| {
+                event.get("name") == Some(&serde_json::Value::String("txn_lifecycle".to_owned()))
+                    && event.get("ph") == Some(&serde_json::Value::String("E".to_owned()))
+            }),
+            "expected trace end event after commit: {committed_payload}"
         );
     }
 

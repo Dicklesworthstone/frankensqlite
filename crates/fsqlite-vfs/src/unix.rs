@@ -729,17 +729,6 @@ pub struct UnixFile {
 }
 
 impl UnixFile {
-    #[cfg(all(feature = "linux-uring-fs", not(feature = "linux-asupersync-uring")))]
-    pub(crate) fn with_inode_io_file<R>(&self, op: impl FnOnce(&File) -> Result<R>) -> Result<R> {
-        let _inode_guard = self.inode_info.lock().expect("inode info lock poisoned");
-        op(self.file.as_ref())
-    }
-
-    #[cfg(feature = "linux-asupersync-uring")]
-    pub(crate) fn path(&self) -> &Path {
-        &self.path
-    }
-
     fn ensure_shm_info(&mut self) -> Result<Arc<Mutex<ShmInfo>>> {
         if let Some(info) = &self.shm_info {
             return Ok(Arc::clone(info));
@@ -1527,7 +1516,7 @@ impl VfsFile for UnixFile {
 
     fn check_reserved_lock(&self, _cx: &Cx) -> Result<bool> {
         let flock = posix_getlk(&*self.file, libc::F_WRLCK, RESERVED_BYTE, 1)?;
-        Ok(flock.l_type != libc::F_UNLCK)
+        Ok(i32::from(flock.l_type) != libc::F_UNLCK)
     }
 
     fn shm_map(

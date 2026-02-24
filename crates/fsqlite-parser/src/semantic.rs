@@ -480,7 +480,7 @@ impl<'a> Resolver<'a> {
                 }
                 if let Some(limit) = &delete.limit {
                     self.resolve_expr(&limit.limit, scope);
-                    if let Some(offset) = &delete.limit.offset {
+                    if let Some(offset) = &limit.offset {
                         self.resolve_expr(offset, scope);
                     }
                 }
