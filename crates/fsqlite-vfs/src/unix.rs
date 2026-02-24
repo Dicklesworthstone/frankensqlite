@@ -274,7 +274,6 @@ fn posix_unlock(file: &impl AsFd, start: u64, len: u64) -> Result<()> {
 ///
 /// Uses `fcntl(F_GETLK)` and returns the kernel-filled `flock`.
 #[allow(clippy::cast_possible_wrap)]
-#[allow(dead_code)]
 fn posix_getlk(file: &impl AsFd, lock_type: i32, start: u64, len: u64) -> Result<libc::flock> {
     let lock_type = i16::try_from(lock_type).expect("fcntl lock type must fit in i16");
     let whence = i16::try_from(libc::SEEK_SET).expect("SEEK_SET must fit in i16");
@@ -1527,7 +1526,8 @@ impl VfsFile for UnixFile {
     }
 
     fn check_reserved_lock(&self, _cx: &Cx) -> Result<bool> {
-        Ok(false)
+        let flock = posix_getlk(&*self.file, libc::F_WRLCK, RESERVED_BYTE, 1)?;
+        Ok(flock.l_type != libc::F_UNLCK)
     }
 
     fn shm_map(
