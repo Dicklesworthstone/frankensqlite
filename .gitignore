@@ -63,6 +63,9 @@ spec_review_findings.md
 # Local scratch SQLite DBs (never tracked)
 storage.sqlite3
 storage.sqlite3-*
+*.sqlite3.bak
+*.sqlite3-wal.bak
+*.sqlite3.corrupt-*
 
 # E2E fixture corpus (local only; DB bytes never tracked)
 sample_sqlite_db_files/golden/*
