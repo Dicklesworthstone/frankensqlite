@@ -5048,7 +5048,10 @@ impl Connection {
         // Validate FCW/SSI preconditions first, but delay commit-side
         // publication until pager commit succeeds.
         let Some(session_id) = *self.concurrent_session_id.borrow() else {
-            return Ok(None);
+            return Err(FrankenError::Internal(
+                "concurrent transaction missing session during commit planning; rollback required"
+                    .to_owned(),
+            ));
         };
 
         let mut abort_card: Option<SsiDecisionCardDraft> = None;
@@ -18954,6 +18957,34 @@ mod tests {
     }
 
     #[test]
+    fn test_commit_fails_when_concurrent_session_is_missing() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER);")
+            .unwrap();
+        conn.execute("BEGIN CONCURRENT;").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 1);").unwrap();
+
+        // Simulate a stale/missing MVCC session and ensure COMMIT fails closed
+        // instead of bypassing FCW/SSI planning.
+        *conn.concurrent_session_id.borrow_mut() = None;
+
+        let err = conn.execute("COMMIT;").expect_err(
+            "concurrent commit must fail when session is missing; rollback is required",
+        );
+        match err {
+            FrankenError::Internal(message) => {
+                assert!(
+                    message.contains("rollback required"),
+                    "expected rollback-required guardrail message, got: {message}"
+                );
+            }
+            other => panic!(
+                "expected Internal rollback-required error for missing concurrent session, got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
     fn test_concurrent_mode_with_single_vs_mvcc_workload() {
         // Run the same workload in both modes and verify the report
         // notes capture the correct mode label.
@@ -19293,6 +19324,121 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_concurrent_deposit_sum_invariant_probe_bd_rjc() {
+        const WORKERS: usize = 8;
+        const TXNS_PER_WORKER: usize = 240;
+        const ACCOUNT_COUNT: i64 = 64;
+        const INITIAL_BALANCE: i64 = 1_000;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("bd_rjc_sum_probe.db");
+        let db = db_path.to_string_lossy().to_string();
+
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute("PRAGMA busy_timeout=5000;").unwrap();
+            conn.execute("PRAGMA fsqlite.concurrent_mode=ON;").unwrap();
+            conn.execute(
+                "CREATE TABLE accounts (id INTEGER PRIMARY KEY, balance INTEGER NOT NULL);",
+            )
+            .unwrap();
+            for id in 1..=ACCOUNT_COUNT {
+                conn.execute(&format!(
+                    "INSERT INTO accounts (id, balance) VALUES ({id}, {INITIAL_BALANCE});"
+                ))
+                .unwrap();
+            }
+        }
+
+        let start_barrier = Arc::new(std::sync::Barrier::new(WORKERS));
+        let mut handles = Vec::with_capacity(WORKERS);
+        for worker_id in 0..WORKERS {
+            let db = db.clone();
+            let barrier = Arc::clone(&start_barrier);
+            handles.push(std::thread::spawn(move || -> (i64, u64) {
+                let conn = Connection::open(&db).unwrap();
+                conn.execute("PRAGMA busy_timeout=5000;").unwrap();
+                conn.execute("PRAGMA fsqlite.concurrent_mode=ON;").unwrap();
+
+                // Synchronize worker start to maximize overlap while preserving
+                // deterministic per-worker operation streams.
+                barrier.wait();
+
+                let mut committed_delta = 0_i64;
+                let mut transient_retries = 0_u64;
+                for txn_index in 0..TXNS_PER_WORKER {
+                    let account = ((worker_id * TXNS_PER_WORKER + txn_index)
+                        % usize::try_from(ACCOUNT_COUNT).unwrap())
+                        + 1;
+                    let amount = i64::try_from((worker_id + txn_index) % 3 + 1).unwrap();
+
+                    loop {
+                        conn.execute("BEGIN CONCURRENT;").unwrap();
+                        match conn.execute(&format!(
+                            "UPDATE accounts SET balance = balance + {amount} WHERE id = {account};"
+                        )) {
+                            Ok(changes) => {
+                                assert_eq!(changes, 1, "expected one-row account update");
+                            }
+                            Err(err) if err.is_transient() => {
+                                transient_retries += 1;
+                                let _ = conn.execute("ROLLBACK;");
+                                continue;
+                            }
+                            Err(err) => {
+                                panic!(
+                                    "non-transient update failure in worker={worker_id} txn={txn_index}: {err}"
+                                );
+                            }
+                        }
+
+                        match conn.execute("COMMIT;") {
+                            Ok(_) => {
+                                committed_delta += amount;
+                                break;
+                            }
+                            Err(err) if err.is_transient() => {
+                                transient_retries += 1;
+                                let _ = conn.execute("ROLLBACK;");
+                            }
+                            Err(err) => {
+                                panic!(
+                                    "non-transient commit failure in worker={worker_id} txn={txn_index}: {err}"
+                                );
+                            }
+                        }
+                    }
+                }
+
+                (committed_delta, transient_retries)
+            }));
+        }
+
+        let mut expected_delta = 0_i64;
+        let mut total_retries = 0_u64;
+        for handle in handles {
+            let (delta, retries) = handle.join().expect("worker thread should not panic");
+            expected_delta += delta;
+            total_retries += retries;
+        }
+
+        let verifier = Connection::open(&db).unwrap();
+        let sum_row = verifier.query_row("SELECT SUM(balance) FROM accounts;").unwrap();
+        let final_sum = match sum_row.get(0) {
+            Some(SqliteValue::Integer(value)) => *value,
+            Some(other) => panic!("expected integer sum row, got {other:?}"),
+            None => panic!("sum query returned no column"),
+        };
+        let initial_sum = ACCOUNT_COUNT * INITIAL_BALANCE;
+        assert_eq!(
+            final_sum,
+            initial_sum + expected_delta,
+            "bd-rjc sum probe mismatch: final_sum={final_sum} expected_sum={} initial_sum={initial_sum} expected_delta={expected_delta} retries={total_retries}",
+            initial_sum + expected_delta
+        );
     }
 
     #[test]

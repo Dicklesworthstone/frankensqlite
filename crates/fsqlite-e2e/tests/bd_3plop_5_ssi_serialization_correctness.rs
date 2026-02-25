@@ -384,12 +384,15 @@ fn run_worker(
     // Keep retries adaptive instead of hot-looping under page-level contention.
     let mut retry_controller =
         RetryController::with_candidates(RetryCostParams::default(), vec![1, 2, 5, 10, 20], 8);
-    let conn = fsqlite::Connection::open(db_path.to_string_lossy().as_ref())
-        .expect("open worker connection");
-    conn.execute(&format!("PRAGMA busy_timeout={BUSY_TIMEOUT_MS};"))
-        .expect("set worker busy timeout");
-    conn.execute("PRAGMA fsqlite.concurrent_mode=ON;")
-        .expect("enable worker concurrent mode");
+    let mut conn = match open_worker_connection(db_path) {
+        Ok(conn) => conn,
+        Err(err) => {
+            result.hard_failures.push(format!(
+                "worker={worker_id} failed to open configured connection: {err}"
+            ));
+            return result;
+        }
+    };
 
     for txn_index in 0..txns_per_worker {
         let worker_token = u64::try_from(worker_id).expect("worker id should fit in u64");
@@ -426,7 +429,14 @@ fn run_worker(
                     }
 
                     result.retry_conflicts += 1;
-                    rollback_best_effort(&conn);
+                    if let Err(rollback_err) = rollback_required(&conn) {
+                        retry_controller.clear_conflict(logical_txn_id);
+                        result.aborted += 1;
+                        result.hard_failures.push(format!(
+                            "worker={worker_id} txn_index={txn_index} rollback failed after transient error ({err}): {rollback_err}"
+                        ));
+                        break;
+                    }
                     retries += 1;
                     if retries > MAX_RETRIES_PER_TXN {
                         retry_controller.clear_conflict(logical_txn_id);
@@ -457,13 +467,28 @@ fn run_worker(
                         }
                     };
                     thread::sleep(Duration::from_millis(retry_sleep_ms));
+                    conn = match open_worker_connection(db_path) {
+                        Ok(conn) => conn,
+                        Err(open_err) => {
+                            retry_controller.clear_conflict(logical_txn_id);
+                            result.aborted += 1;
+                            result.hard_failures.push(format!(
+                                "worker={worker_id} txn_index={txn_index} reopen failed after transient error ({err}): {open_err}"
+                            ));
+                            break;
+                        }
+                    };
                 }
                 Err(err) => {
                     if let Some(wait_ms) = last_wait_ms.take() {
                         retry_controller.observe(wait_ms, false);
                     }
                     result.aborted += 1;
-                    rollback_best_effort(&conn);
+                    if let Err(rollback_err) = rollback_required(&conn) {
+                        result.hard_failures.push(format!(
+                            "worker={worker_id} txn_index={txn_index} rollback failed after non-transient error ({err}): {rollback_err}"
+                        ));
+                    }
                     retry_controller.clear_conflict(logical_txn_id);
                     result.hard_failures.push(format!(
                         "worker={worker_id} txn_index={txn_index} non-transient error: {err}"
@@ -509,10 +534,13 @@ fn execute_single_txn(
 
             if from_balance >= amount {
                 conn.execute(&format!(
-                    "UPDATE accounts SET balance = balance - {amount} WHERE id = {from};"
-                ))?;
-                conn.execute(&format!(
-                    "UPDATE accounts SET balance = balance + {amount} WHERE id = {to};"
+                    "UPDATE accounts \
+                     SET balance = CASE \
+                         WHEN id = {from} THEN balance - {amount} \
+                         WHEN id = {to} THEN balance + {amount} \
+                         ELSE balance \
+                     END \
+                     WHERE id IN ({from}, {to});"
                 ))?;
                 write_set.insert(from);
                 write_set.insert(to);
@@ -559,8 +587,15 @@ fn random_account(rng: &mut StdRng, account_count: i64) -> i64 {
     rng.gen_range(1_i64..=account_count)
 }
 
-fn rollback_best_effort(conn: &fsqlite::Connection) {
-    let _ = conn.execute("ROLLBACK;");
+fn open_worker_connection(db_path: &Path) -> Result<fsqlite::Connection, FrankenError> {
+    let conn = fsqlite::Connection::open(db_path.to_string_lossy().as_ref())?;
+    conn.execute(&format!("PRAGMA busy_timeout={BUSY_TIMEOUT_MS};"))?;
+    conn.execute("PRAGMA fsqlite.concurrent_mode=ON;")?;
+    Ok(conn)
+}
+
+fn rollback_required(conn: &fsqlite::Connection) -> Result<(), FrankenError> {
+    conn.execute("ROLLBACK;").map(|_| ())
 }
 
 fn read_balance(conn: &fsqlite::Connection, account_id: i64) -> Result<i64, FrankenError> {
