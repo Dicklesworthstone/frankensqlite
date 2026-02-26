@@ -5,7 +5,7 @@
 <h1 align="center">FrankenSQLite</h1>
 
 <p align="center">
-  <strong>A clean-room Rust reimplementation of SQLite with concurrent writers and information-theoretic durability.</strong>
+  <strong>An independent ground-up Rust reimplementation of SQLite with concurrent writers and information-theoretic durability.</strong>
 </p>
 
 <p align="center">
@@ -50,7 +50,7 @@ The file format stays 100% compatible with existing `.sqlite` databases in Compa
 
 ## Design Philosophy
 
-### 1. Clean-Room, Not a Translation
+### 1. Independent Reimplementation, Not a Translation
 
 FrankenSQLite is not a C-to-Rust transpilation. It references the C source only for behavioral specification. Every function is written in idiomatic Rust, using the type system and ownership model rather than translating C idioms.
 
@@ -2525,7 +2525,7 @@ A: If the page lock is held, the second writer gets `SQLITE_BUSY` immediately (n
 A: Safe Rust with proper data structures is fast. The type system prevents entire categories of bugs that would require extensive testing to catch in C. The performance ceiling of safe Rust is more than sufficient for a database engine.
 
 **Q: Why reimplement rather than fork?**
-A: SQLite's C codebase is well-engineered but carries 24 years of accumulated complexity (218K LOC in the amalgamation). A clean-room Rust implementation enables MVCC without fighting the existing architecture, provides compile-time memory safety, and produces a codebase that Rust developers can work with naturally.
+A: SQLite's C codebase is well-engineered but carries 24 years of accumulated complexity (218K LOC in the amalgamation). An independent ground-up Rust reimplementation enables MVCC without fighting the existing architecture, provides compile-time memory safety, and produces a codebase that Rust developers can work with naturally.
 
 **Q: What's the conformance target?**
 A: **100% behavioral parity target** with C SQLite 3.52.0 for the supported
