@@ -64,6 +64,7 @@ struct GatheredCell {
     data: Vec<u8>,
     /// Size of this cell including left-child pointer, varints, local
     /// payload, and overflow pointer.
+    #[allow(dead_code)]
     size: u16,
 }
 
@@ -218,7 +219,12 @@ pub fn balance_quick<W: PageWriter>(
 
     // Initialize as leaf table page with one cell.
     let cell_size = overflow_cell.len();
-    let content_start = usable_size as usize - cell_size;
+    let Some(content_start) = (usable_size as usize).checked_sub(cell_size) else {
+        return Ok(None);
+    };
+    if content_start < new_offset + BTREE_LEAF_HEADER_SIZE as usize + 2 {
+        return Ok(None); // Cell too large, falls back to standard balance.
+    }
 
     let new_header = BtreePageHeader {
         page_type: BtreePageType::LeafTable,

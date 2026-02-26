@@ -14,6 +14,7 @@
 //! The envelope captures:
 //! - Query/input seeds for RNG reproducibility
 //! - Engine version strings
+//! - Subject/reference backend identity metadata for parity preflight
 //! - PRAGMA configuration
 //! - Schema setup SQL
 //! - Workload SQL statements
@@ -29,9 +30,12 @@ use std::fmt::Write as _;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tracing::info;
 
 /// Bead identifier for log correlation.
 const BEAD_ID: &str = "bd-1dp9.1.2";
+const SUBJECT_IDENTITY_LABEL: &str = "frankensqlite";
+const REFERENCE_IDENTITY_LABEL: &str = "csqlite-oracle";
 
 /// Current envelope format version.
 pub const FORMAT_VERSION: u32 = 1;
@@ -72,6 +76,10 @@ pub struct EngineVersions {
     pub fsqlite: String,
     /// C SQLite version (from rusqlite bundled library).
     pub csqlite: String,
+    /// Declared subject backend identity (must be FrankenSQLite in parity mode).
+    pub subject_identity: String,
+    /// Declared reference backend identity (must be C SQLite oracle in parity mode).
+    pub reference_identity: String,
 }
 
 /// PRAGMA configuration applied to both engines before a run.
@@ -171,6 +179,8 @@ impl ExecutionEnvelope {
             engines: EngineVersions {
                 fsqlite: env!("CARGO_PKG_VERSION").to_owned(),
                 csqlite: rusqlite::version().to_owned(),
+                subject_identity: SUBJECT_IDENTITY_LABEL.to_owned(),
+                reference_identity: REFERENCE_IDENTITY_LABEL.to_owned(),
             },
             pragmas: PragmaConfig::default(),
             schema: Vec::new(),
@@ -216,6 +226,18 @@ impl EnvelopeBuilder {
     pub fn engines(mut self, fsqlite: impl Into<String>, csqlite: impl Into<String>) -> Self {
         self.engines.fsqlite = fsqlite.into();
         self.engines.csqlite = csqlite.into();
+        self
+    }
+
+    /// Set declared backend identities for parity preflight checks.
+    #[must_use]
+    pub fn engine_identities(
+        mut self,
+        subject_identity: impl Into<String>,
+        reference_identity: impl Into<String>,
+    ) -> Self {
+        self.engines.subject_identity = subject_identity.into();
+        self.engines.reference_identity = reference_identity.into();
         self
     }
 
@@ -666,18 +688,71 @@ fn run_differential_with_mode<F: SqlExecutor, C: SqlExecutor>(
     mode: DifferentialMode,
 ) -> DifferentialResult {
     if matches!(mode, DifferentialMode::Parity) {
+        if is_missing_identity_metadata(&envelope.engines.subject_identity) {
+            return parity_contract_violation(
+                envelope,
+                "parity_contract_violation: envelope.engines.subject_identity must be non-empty",
+                "subject_identity_missing",
+            );
+        }
+        if !envelope
+            .engines
+            .subject_identity
+            .eq_ignore_ascii_case(SUBJECT_IDENTITY_LABEL)
+        {
+            return parity_contract_violation(
+                envelope,
+                "parity_contract_violation: envelope.engines.subject_identity must be 'frankensqlite'",
+                "subject_identity_mismatch",
+            );
+        }
+        if is_missing_identity_metadata(&envelope.engines.reference_identity) {
+            return parity_contract_violation(
+                envelope,
+                "parity_contract_violation: envelope.engines.reference_identity must be non-empty",
+                "reference_identity_missing",
+            );
+        }
+        if !envelope
+            .engines
+            .reference_identity
+            .eq_ignore_ascii_case(REFERENCE_IDENTITY_LABEL)
+        {
+            return parity_contract_violation(
+                envelope,
+                "parity_contract_violation: envelope.engines.reference_identity must be 'csqlite-oracle'",
+                "reference_identity_mismatch",
+            );
+        }
+        if fsqlite_exec.engine_identity() != EngineIdentity::FrankenSqlite {
+            return parity_contract_violation(
+                envelope,
+                "parity_contract_violation: subject executor must identify as FrankenSqlite",
+                "subject_executor_identity_mismatch",
+            );
+        }
         if envelope.engines.csqlite.trim().is_empty() {
-            return parity_contract_error_result(
+            return parity_contract_violation(
                 envelope,
                 "parity_contract_violation: envelope.engines.csqlite must be non-empty",
+                "csqlite_version_missing",
+            );
+        }
+        if is_missing_oracle_metadata(&envelope.engines.csqlite) {
+            return parity_contract_violation(
+                envelope,
+                "parity_contract_violation: envelope.engines.csqlite must contain concrete oracle metadata",
+                "csqlite_version_placeholder",
             );
         }
         if csqlite_exec.engine_identity() != EngineIdentity::CSqliteOracle {
-            return parity_contract_error_result(
+            return parity_contract_violation(
                 envelope,
                 "parity_contract_violation: reference executor must identify as CSqliteOracle",
+                "reference_executor_identity_mismatch",
             );
         }
+        log_identity_check(envelope, "pass", "ok");
     }
 
     // Apply PRAGMAs to both engines (ignore errors — some PRAGMAs return rows).
@@ -773,6 +848,15 @@ fn run_differential_with_mode<F: SqlExecutor, C: SqlExecutor>(
     result
 }
 
+fn parity_contract_violation(
+    envelope: &ExecutionEnvelope,
+    message: &str,
+    reason_code: &str,
+) -> DifferentialResult {
+    log_identity_check(envelope, "fail", reason_code);
+    parity_contract_error_result(envelope, message)
+}
+
 fn parity_contract_error_result(envelope: &ExecutionEnvelope, message: &str) -> DifferentialResult {
     let statements: Vec<&str> = envelope
         .schema
@@ -808,6 +892,38 @@ fn parity_contract_error_result(envelope: &ExecutionEnvelope, message: &str) -> 
     };
     result.artifact_hashes.result_hash = result.compute_result_hash();
     result
+}
+
+fn log_identity_check(envelope: &ExecutionEnvelope, outcome: &str, reason_code: &str) {
+    let trace_id = envelope.artifact_id();
+    let run_id = envelope.run_id.as_deref().unwrap_or("none");
+    info!(
+        bead_id = BEAD_ID,
+        trace_id,
+        run_id,
+        scenario_id = "oracle_identity_check",
+        outcome,
+        reason_code,
+        subject_identity = %envelope.engines.subject_identity,
+        reference_identity = %envelope.engines.reference_identity,
+        "oracle/backend identity check"
+    );
+}
+
+fn is_missing_identity_metadata(value: &str) -> bool {
+    let normalized = value.trim().to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "" | "unknown" | "n/a" | "na" | "unset" | "none" | "null" | "missing"
+    )
+}
+
+fn is_missing_oracle_metadata(value: &str) -> bool {
+    let normalized = value.trim().to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "unknown" | "n/a" | "na" | "unset" | "none" | "null" | "missing"
+    )
 }
 
 fn extract_schema_table_names(schema: &[String]) -> Vec<String> {
@@ -1061,6 +1177,134 @@ fn has_divergence(result: &DifferentialResult) -> bool {
 
 // ─── Outcome comparison with canonicalization ────────────────────────────
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ErrorCategory {
+    MissingTable,
+    MissingColumn,
+    Syntax,
+    Constraint,
+    Busy,
+    Locked,
+    ReadOnly,
+    Datatype,
+    Transaction,
+    Io,
+    Corrupt,
+    Permission,
+    Other,
+}
+
+fn error_messages_match_by_category(left: &str, right: &str) -> bool {
+    let left_category = classify_error_category(left);
+    let right_category = classify_error_category(right);
+    if left_category != right_category {
+        return false;
+    }
+    if left_category == ErrorCategory::Other {
+        normalize_error_message(left) == normalize_error_message(right)
+    } else {
+        true
+    }
+}
+
+fn classify_error_category(message: &str) -> ErrorCategory {
+    let normalized = normalize_error_message(message);
+    if contains_any(&normalized, &["no such table"]) {
+        return ErrorCategory::MissingTable;
+    }
+    if contains_any(&normalized, &["no such column"]) {
+        return ErrorCategory::MissingColumn;
+    }
+    if contains_any(
+        &normalized,
+        &[
+            "syntax error",
+            "parse error",
+            "unrecognized token",
+            "incomplete input",
+        ],
+    ) {
+        return ErrorCategory::Syntax;
+    }
+    if contains_any(
+        &normalized,
+        &[
+            "constraint failed",
+            "constraint violation",
+            "unique constraint",
+            "not null constraint",
+            "check constraint",
+            "foreign key constraint",
+            "constraintviolation",
+        ],
+    ) {
+        return ErrorCategory::Constraint;
+    }
+    if contains_any(
+        &normalized,
+        &["database is locked", "database table is locked", "locked"],
+    ) {
+        return ErrorCategory::Locked;
+    }
+    if contains_any(&normalized, &["busy", "busy_snapshot"]) {
+        return ErrorCategory::Busy;
+    }
+    if contains_any(
+        &normalized,
+        &["readonly", "read-only", "attempt to write a readonly"],
+    ) {
+        return ErrorCategory::ReadOnly;
+    }
+    if contains_any(&normalized, &["datatype mismatch", "type mismatch"]) {
+        return ErrorCategory::Datatype;
+    }
+    if contains_any(
+        &normalized,
+        &[
+            "cannot start a transaction within a transaction",
+            "transaction",
+            "savepoint",
+        ],
+    ) {
+        return ErrorCategory::Transaction;
+    }
+    if contains_any(
+        &normalized,
+        &[
+            "disk i/o error",
+            "i/o error",
+            "ioerr",
+            "short read",
+            "short write",
+        ],
+    ) {
+        return ErrorCategory::Io;
+    }
+    if contains_any(
+        &normalized,
+        &[
+            "database disk image is malformed",
+            "malformed",
+            "corrupt",
+            "not a database",
+        ],
+    ) {
+        return ErrorCategory::Corrupt;
+    }
+    if contains_any(&normalized, &["permission denied", "access denied"]) {
+        return ErrorCategory::Permission;
+    }
+    ErrorCategory::Other
+}
+
+fn normalize_error_message(message: &str) -> String {
+    message.trim().to_ascii_lowercase()
+}
+
+fn contains_any(haystack: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| haystack.contains(needle))
+}
+
 fn outcomes_match(
     fsqlite: &StmtOutcome,
     csqlite: &StmtOutcome,
@@ -1069,9 +1313,8 @@ fn outcomes_match(
     match (fsqlite, csqlite) {
         (StmtOutcome::Execute(a), StmtOutcome::Execute(b)) => a == b,
         (StmtOutcome::Rows(a), StmtOutcome::Rows(b)) => rows_match(a, b, rules),
-        (StmtOutcome::Error(_), StmtOutcome::Error(_)) if rules.error_match_by_category => {
-            // Both errored — match by category (both failed = match).
-            true
+        (StmtOutcome::Error(a), StmtOutcome::Error(b)) if rules.error_match_by_category => {
+            error_messages_match_by_category(a, b)
         }
         (StmtOutcome::Error(a), StmtOutcome::Error(b)) => a == b,
         _ => false,

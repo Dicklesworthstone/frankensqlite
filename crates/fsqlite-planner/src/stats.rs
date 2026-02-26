@@ -106,17 +106,26 @@ impl Histogram {
     }
 }
 
+fn bytes_to_fraction(bytes: &[u8]) -> f64 {
+    let mut fraction = 0.0;
+    let mut weight = 1.0 / 256.0;
+    for &b in bytes.iter().take(8) {
+        fraction += f64::from(b) * weight;
+        weight /= 256.0;
+    }
+    fraction
+}
+
 /// Heuristic linear interpolation of `val` between `min` and `max`.
 /// Returns a value in [0.0, 1.0].
 fn interpolate_position(min: &SqliteValue, max: &SqliteValue, val: &SqliteValue) -> f64 {
-    // Only interpolate numeric types. For others, assume 0.5.
     match (min, max, val) {
         (SqliteValue::Integer(min_i), SqliteValue::Integer(max_i), SqliteValue::Integer(val_i)) => {
             if max_i <= min_i {
                 return 0.5;
             }
-            let range = (max_i - min_i) as f64;
-            let offset = (val_i - min_i) as f64;
+            let range = (*max_i - *min_i) as f64;
+            let offset = (*val_i - *min_i) as f64;
             (offset / range).clamp(0.0, 1.0)
         }
         (SqliteValue::Float(min_f), SqliteValue::Float(max_f), SqliteValue::Float(val_f)) => {
@@ -127,7 +136,34 @@ fn interpolate_position(min: &SqliteValue, max: &SqliteValue, val: &SqliteValue)
             let offset = val_f - min_f;
             (offset / range).clamp(0.0, 1.0)
         }
-        // TODO: Could implement lexicographical interpolation for strings/blobs
+        (SqliteValue::Text(min_s), SqliteValue::Text(max_s), SqliteValue::Text(val_s)) => {
+            if max_s <= min_s {
+                return 0.5;
+            }
+            let min_frac = bytes_to_fraction(min_s.as_bytes());
+            let max_frac = bytes_to_fraction(max_s.as_bytes());
+            let val_frac = bytes_to_fraction(val_s.as_bytes());
+            let range = max_frac - min_frac;
+            if range <= 0.0 {
+                return 0.5;
+            }
+            let offset = val_frac - min_frac;
+            (offset / range).clamp(0.0, 1.0)
+        }
+        (SqliteValue::Blob(min_b), SqliteValue::Blob(max_b), SqliteValue::Blob(val_b)) => {
+            if max_b <= min_b {
+                return 0.5;
+            }
+            let min_frac = bytes_to_fraction(min_b);
+            let max_frac = bytes_to_fraction(max_b);
+            let val_frac = bytes_to_fraction(val_b);
+            let range = max_frac - min_frac;
+            if range <= 0.0 {
+                return 0.5;
+            }
+            let offset = val_frac - min_frac;
+            (offset / range).clamp(0.0, 1.0)
+        }
         _ => 0.5,
     }
 }

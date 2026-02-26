@@ -24,6 +24,8 @@ fn builder_default_sets_non_empty_csqlite_version_metadata() {
         !envelope.engines.csqlite.trim().is_empty(),
         "default csqlite version metadata must be non-empty"
     );
+    assert_eq!(envelope.engines.subject_identity, "frankensqlite");
+    assert_eq!(envelope.engines.reference_identity, "csqlite-oracle");
 }
 
 #[test]
@@ -66,6 +68,36 @@ fn diagnostic_mode_allows_explicit_self_compare() {
         Outcome::Pass,
         "diagnostic mode should allow explicit self-comparison"
     );
+}
+
+#[test]
+fn parity_mode_rejects_blank_reference_identity_metadata() {
+    let envelope = ExecutionEnvelope::builder(SEED)
+        .run_id(format!("{BEAD_ID}-blank-reference-identity"))
+        .engines("fsqlite-test", "3.52.0-test")
+        .engine_identities("frankensqlite", "")
+        .workload(["SELECT 1".to_owned()])
+        .build();
+    let fsqlite = FsqliteExecutor::open_in_memory().expect("fsqlite open");
+    let csqlite = CsqliteExecutor::open_in_memory().expect("csqlite open");
+
+    let result = run_differential(&envelope, &fsqlite, &csqlite);
+    assert_eq!(result.outcome, Outcome::Error);
+}
+
+#[test]
+fn parity_mode_rejects_non_oracle_reference_identity_metadata() {
+    let envelope = ExecutionEnvelope::builder(SEED)
+        .run_id(format!("{BEAD_ID}-bad-reference-identity"))
+        .engines("fsqlite-test", "3.52.0-test")
+        .engine_identities("frankensqlite", "sqlmodel-frankensqlite")
+        .workload(["SELECT 1".to_owned()])
+        .build();
+    let fsqlite = FsqliteExecutor::open_in_memory().expect("fsqlite open");
+    let csqlite = CsqliteExecutor::open_in_memory().expect("csqlite open");
+
+    let result = run_differential(&envelope, &fsqlite, &csqlite);
+    assert_eq!(result.outcome, Outcome::Error);
 }
 
 proptest! {

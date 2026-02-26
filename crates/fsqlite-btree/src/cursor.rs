@@ -946,7 +946,7 @@ impl<P: PageReader> BtCursor<P> {
                         // Clone parent to drop the borrow so we can mutate `self`.
                         let parent_clone = parent.clone();
                         let child = self.child_page_at(&parent_clone, next_child_idx)?;
-                        self.stack.last_mut().unwrap().cell_idx = next_child_idx;
+                        self.stack.last_mut().ok_or_else(|| FrankenError::internal("cursor stack empty"))?.cell_idx = next_child_idx;
                         self.issue_prefetch_hint(cx, child);
                         return self.move_to_leftmost_leaf(cx, child, true);
                     }
@@ -971,7 +971,7 @@ impl<P: PageReader> BtCursor<P> {
             let top = &self.stack[depth - 1];
             self.child_page_at(top, next_child_idx)?
         };
-        self.stack.last_mut().unwrap().cell_idx = next_child_idx;
+        self.stack.last_mut().ok_or_else(|| FrankenError::internal("cursor stack empty"))?.cell_idx = next_child_idx;
         self.issue_prefetch_hint(cx, child);
         self.move_to_leftmost_leaf(cx, child, true)
     }
@@ -993,7 +993,7 @@ impl<P: PageReader> BtCursor<P> {
                 (top.header.page_type.is_leaf(), top.header.cell_count)
             };
             if is_leaf && cell_count > 0 {
-                self.stack.last_mut().unwrap().cell_idx = cell_count - 1;
+                self.stack.last_mut().ok_or_else(|| FrankenError::internal("cursor stack empty"))?.cell_idx = cell_count - 1;
                 self.at_eof = false;
                 return Ok(true);
             }
@@ -1028,12 +1028,12 @@ impl<P: PageReader> BtCursor<P> {
                         // Table B-trees are B+trees. Skip separator.
                         let parent_clone = parent.clone();
                         let child = self.child_page_at(&parent_clone, prev_child_idx)?;
-                        self.stack.last_mut().unwrap().cell_idx = prev_child_idx;
+                        self.stack.last_mut().ok_or_else(|| FrankenError::internal("cursor stack empty"))?.cell_idx = prev_child_idx;
                         self.issue_prefetch_hint(cx, child);
                         return self.move_to_rightmost_leaf(cx, child, true);
                     }
                     // Index B-trees: stop at the separator cell.
-                    self.stack.last_mut().unwrap().cell_idx = prev_child_idx;
+                    self.stack.last_mut().ok_or_else(|| FrankenError::internal("cursor stack empty"))?.cell_idx = prev_child_idx;
                     self.at_eof = false;
                     return Ok(true);
                 }
@@ -1629,14 +1629,14 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
             if !is_leaf {
                 // Matched exactly on an interior page. Descend to the right child's leftmost leaf.
                 let right_child = {
-                    let top = cursor.stack.last().unwrap();
+                    let top = cursor.stack.last().ok_or_else(|| FrankenError::internal("cursor stack is empty"))?;
                     cursor.child_page_at(top, cell_idx + 1)?
                 };
                 cursor.move_to_leftmost_leaf(cx, right_child, false)?;
 
                 insert_idx = 0; // The new key goes at the very beginning of the right subtree.
             } else {
-                let top = cursor.stack.last().unwrap();
+                let top = cursor.stack.last().ok_or_else(|| FrankenError::internal("cursor stack is empty"))?;
                 insert_idx = if cursor.at_eof {
                     top.header.cell_count
                 } else {
@@ -1784,7 +1784,7 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
         if self.at_eof || self.stack.is_empty() {
             return Err(FrankenError::internal("cursor at EOF"));
         }
-        let top = self.stack.last().unwrap();
+        let top = self.stack.last().ok_or_else(|| FrankenError::internal("cursor stack empty"))?;
         let cell = self.parse_cell_at(top, top.cell_idx)?;
         self.read_cell_payload(cx, top, &cell)
     }
@@ -1793,7 +1793,7 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
         if self.at_eof || self.stack.is_empty() {
             return Err(FrankenError::internal("cursor at EOF"));
         }
-        let top = self.stack.last().unwrap();
+        let top = self.stack.last().ok_or_else(|| FrankenError::internal("cursor stack empty"))?;
         let cell = self.parse_cell_at(top, top.cell_idx)?;
         if let Some(rowid) = cell.rowid {
             return Ok(rowid);

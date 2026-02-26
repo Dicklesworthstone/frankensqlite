@@ -208,7 +208,7 @@ impl SwizzleRegistry {
 
     /// Register a page as tracked (initially unswizzled, cold).
     pub fn register_page(&self, page_id: u64) {
-        let mut entries = self.entries.lock().expect("swizzle registry lock");
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         entries.entry(page_id).or_insert(SwizzleEntry {
             temperature: PageTemperature::Cold,
             swizzled: false,
@@ -221,7 +221,7 @@ impl SwizzleRegistry {
     /// Returns `true` if the swizzle succeeded, `false` if the page was
     /// already swizzled or not registered.
     pub fn try_swizzle(&self, page_id: u64, frame_addr: u64) -> bool {
-        let mut entries = self.entries.lock().expect("swizzle registry lock");
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(entry) = entries.get_mut(&page_id) {
             if entry.swizzled {
                 record_swizzle_fault();
@@ -245,7 +245,7 @@ impl SwizzleRegistry {
     /// Returns `true` if the unswizzle succeeded, `false` if the page was
     /// not swizzled or not registered.
     pub fn try_unswizzle(&self, page_id: u64) -> bool {
-        let mut entries = self.entries.lock().expect("swizzle registry lock");
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(entry) = entries.get_mut(&page_id) {
             if !entry.swizzled {
                 record_swizzle_fault();
@@ -267,14 +267,14 @@ impl SwizzleRegistry {
     /// Check whether a page is currently swizzled.
     #[must_use]
     pub fn is_swizzled(&self, page_id: u64) -> bool {
-        let entries = self.entries.lock().expect("swizzle registry lock");
+        let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         entries.get(&page_id).is_some_and(|entry| entry.swizzled)
     }
 
     /// Return the frame address for a swizzled page, or `None`.
     #[must_use]
     pub fn frame_addr(&self, page_id: u64) -> Option<u64> {
-        let entries = self.entries.lock().expect("swizzle registry lock");
+        let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         entries.get(&page_id).and_then(|entry| {
             if entry.swizzled {
                 Some(entry.frame_addr)
@@ -287,7 +287,7 @@ impl SwizzleRegistry {
     /// Number of tracked pages.
     #[must_use]
     pub fn tracked_count(&self) -> usize {
-        self.entries.lock().expect("swizzle registry lock").len()
+        self.entries.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
     /// Number of currently swizzled pages.
@@ -295,7 +295,7 @@ impl SwizzleRegistry {
     pub fn swizzled_count(&self) -> usize {
         self.entries
             .lock()
-            .expect("swizzle registry lock")
+            .unwrap_or_else(|e| e.into_inner())
             .values()
             .filter(|e| e.swizzled)
             .count()
@@ -303,7 +303,7 @@ impl SwizzleRegistry {
 
     /// Compute and update the global swizzle ratio gauge.
     fn update_ratio(&self) {
-        let entries = self.entries.lock().expect("swizzle registry lock");
+        let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         let total = entries.len();
         if total == 0 {
             set_swizzle_ratio(0);

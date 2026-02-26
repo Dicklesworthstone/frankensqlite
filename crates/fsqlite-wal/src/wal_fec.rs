@@ -615,6 +615,21 @@ pub enum WalFecRecoveryFallbackReason {
     RecoveryDisabled,
 }
 
+impl WalFecRecoveryFallbackReason {
+    #[must_use]
+    pub const fn reason_code(self) -> &'static str {
+        match self {
+            Self::MissingSidecarGroup => "missing_sidecar_group",
+            Self::SidecarUnreadable => "sidecar_unreadable",
+            Self::SaltMismatch => "salt_mismatch",
+            Self::InsufficientSymbols => "insufficient_symbols",
+            Self::DecodeFailed => "decode_failed",
+            Self::DecodedPayloadMismatch => "decoded_payload_mismatch",
+            Self::RecoveryDisabled => "recovery_disabled",
+        }
+    }
+}
+
 /// Configuration for WAL-FEC recovery behaviour.
 ///
 /// When `recovery_enabled` is `false`, the recovery path immediately returns
@@ -958,6 +973,45 @@ fn build_repair_event(log: &WalFecRecoveryLog, latency: Duration) -> Option<WalF
         budget_utilization_pct,
         severity_bucket,
     })
+}
+
+const fn recovery_outcome_code(log: &WalFecRecoveryLog) -> &'static str {
+    if log.outcome_is_recovered {
+        "recovered"
+    } else {
+        "truncate_before_group"
+    }
+}
+
+const fn recovery_reason_code_for_log(log: &WalFecRecoveryLog) -> &'static str {
+    if let Some(reason) = log.fallback_reason {
+        return reason.reason_code();
+    }
+    if log.decode_attempted {
+        return "decode_recovered";
+    }
+    "intact_fast_path"
+}
+
+const fn repair_attempt_for_log(log: &WalFecRecoveryLog) -> bool {
+    log.recovery_enabled
+        && (log.decode_attempted
+            || log.fallback_reason.is_some()
+            || log.corruption_observations > 0
+            || log.validated_source_symbols < log.required_symbols)
+}
+
+fn symbol_state_for_log(log: &WalFecRecoveryLog) -> String {
+    format!(
+        "source_validated={}/{};repair_validated={};available={};required={};decode_attempted={};decode_succeeded={}",
+        log.validated_source_symbols,
+        log.required_symbols,
+        log.validated_repair_symbols,
+        log.available_symbols,
+        log.required_symbols,
+        log.decode_attempted,
+        log.decode_succeeded
+    )
 }
 
 fn monotonic_now_ns() -> u64 {
@@ -2217,6 +2271,10 @@ where
     let log = recovery_log_from_outcome(group_id, &outcome, true);
     let elapsed = started.elapsed();
     let duration_us = crate::metrics::duration_us_saturating(elapsed);
+    let repair_attempt = repair_attempt_for_log(&log);
+    let reason_code = recovery_reason_code_for_log(&log);
+    let outcome_code = recovery_outcome_code(&log);
+    let symbol_state = symbol_state_for_log(&log);
 
     span.record("corruption_detected", log.corruption_observations > 0);
     span.record(
@@ -2225,6 +2283,15 @@ where
     );
     span.record("repair_success", log.outcome_is_recovered);
     span.record("repair_duration_us", duration_us);
+    info!(
+        bead_id = BD_1W6K_25_BEAD_ID,
+        group_id = %group_id,
+        repair_attempt,
+        symbol_state = %symbol_state,
+        reason_code,
+        outcome = outcome_code,
+        "wal-fec recovery decision"
+    );
 
     record_raptorq_recovery_log(&log, elapsed);
     crate::metrics::GLOBAL_WAL_FEC_REPAIR_METRICS
@@ -3081,6 +3148,76 @@ mod tests {
             "bead_id={BEAD_ID_2HA1} case=checksum_corrupt expected checksum error, got: {msg}"
         );
         eprintln!("ERROR bead_id={BEAD_ID_2HA1} case=checksum_corrupt error={err}");
+    }
+
+    #[test]
+    fn test_recovery_reason_codes_are_stable() {
+        let base = WalFecRecoveryLog {
+            group_id: WalFecGroupId {
+                wal_salt1: 1,
+                wal_salt2: 2,
+                end_frame_no: 3,
+            },
+            recovery_enabled: true,
+            outcome_is_recovered: true,
+            fallback_reason: None,
+            validated_source_symbols: 5,
+            validated_repair_symbols: 1,
+            required_symbols: 6,
+            available_symbols: 6,
+            recovered_frame_nos: vec![2],
+            corruption_observations: 1,
+            decode_attempted: true,
+            decode_succeeded: true,
+        };
+
+        assert_eq!(recovery_outcome_code(&base), "recovered");
+        assert_eq!(recovery_reason_code_for_log(&base), "decode_recovered");
+        assert!(repair_attempt_for_log(&base));
+
+        let mut fast_path = base.clone();
+        fast_path.decode_attempted = false;
+        fast_path.corruption_observations = 0;
+        assert_eq!(recovery_reason_code_for_log(&fast_path), "intact_fast_path");
+
+        let mut truncated = base.clone();
+        truncated.outcome_is_recovered = false;
+        truncated.fallback_reason = Some(WalFecRecoveryFallbackReason::InsufficientSymbols);
+        assert_eq!(recovery_outcome_code(&truncated), "truncate_before_group");
+        assert_eq!(
+            recovery_reason_code_for_log(&truncated),
+            WalFecRecoveryFallbackReason::InsufficientSymbols.reason_code()
+        );
+    }
+
+    #[test]
+    fn test_symbol_state_serialization_includes_required_fields() {
+        let log = WalFecRecoveryLog {
+            group_id: WalFecGroupId {
+                wal_salt1: 10,
+                wal_salt2: 20,
+                end_frame_no: 30,
+            },
+            recovery_enabled: true,
+            outcome_is_recovered: false,
+            fallback_reason: Some(WalFecRecoveryFallbackReason::DecodeFailed),
+            validated_source_symbols: 2,
+            validated_repair_symbols: 1,
+            required_symbols: 6,
+            available_symbols: 3,
+            recovered_frame_nos: Vec::new(),
+            corruption_observations: 2,
+            decode_attempted: true,
+            decode_succeeded: false,
+        };
+
+        let symbol_state = symbol_state_for_log(&log);
+        assert!(symbol_state.contains("source_validated=2/6"));
+        assert!(symbol_state.contains("repair_validated=1"));
+        assert!(symbol_state.contains("available=3"));
+        assert!(symbol_state.contains("required=6"));
+        assert!(symbol_state.contains("decode_attempted=true"));
+        assert!(symbol_state.contains("decode_succeeded=false"));
     }
 
     /// Build deterministic source pages of `page_size` bytes each.

@@ -131,7 +131,7 @@ impl CoolingStateMachine {
 
     /// Register a page as tracked. Starts in COLD state.
     pub fn register_page(&self, page_id: u64) {
-        let mut pages = self.pages.lock().expect("cooling lock");
+        let mut pages = self.pages.lock().unwrap_or_else(|e| e.into_inner());
         pages.entry(page_id).or_insert(PageState {
             temperature: PageTemperature::Cold,
             access_count: 0,
@@ -144,7 +144,7 @@ impl CoolingStateMachine {
         self.register_page(page_id);
         self.pinned_roots
             .lock()
-            .expect("pinned lock")
+            .unwrap_or_else(|e| e.into_inner())
             .insert(page_id);
     }
 
@@ -153,7 +153,7 @@ impl CoolingStateMachine {
     pub fn is_pinned(&self, page_id: u64) -> bool {
         self.pinned_roots
             .lock()
-            .expect("pinned lock")
+            .unwrap_or_else(|e| e.into_inner())
             .contains(&page_id)
     }
 
@@ -163,7 +163,7 @@ impl CoolingStateMachine {
     /// was already Hot or Cooling (in which case it's re-heated if Cooling).
     #[allow(clippy::significant_drop_tightening)]
     pub fn load_page(&self, page_id: u64, frame_addr: u64) -> bool {
-        let mut pages = self.pages.lock().expect("cooling lock");
+        let mut pages = self.pages.lock().unwrap_or_else(|e| e.into_inner());
         let entry = pages.entry(page_id).or_insert(PageState {
             temperature: PageTemperature::Cold,
             access_count: 0,
@@ -194,7 +194,7 @@ impl CoolingStateMachine {
 
     /// Record an access to a page. If COOLING, re-heats to HOT.
     pub fn access_page(&self, page_id: u64) {
-        let mut pages = self.pages.lock().expect("cooling lock");
+        let mut pages = self.pages.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(entry) = pages.get_mut(&page_id) {
             entry.access_count += 1;
             if entry.temperature == PageTemperature::Cooling {
@@ -213,7 +213,7 @@ impl CoolingStateMachine {
             return Err("page is a pinned root");
         }
 
-        let mut pages = self.pages.lock().expect("cooling lock");
+        let mut pages = self.pages.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(entry) = pages.get_mut(&page_id) {
             match entry.temperature {
                 PageTemperature::Cooling => {
@@ -238,8 +238,8 @@ impl CoolingStateMachine {
     pub fn run_cooling_scan(&self) -> CoolingScanResult {
         COOLING_SCANS_TOTAL.fetch_add(1, Ordering::Relaxed);
 
-        let mut pages = self.pages.lock().expect("cooling lock");
-        let pinned = self.pinned_roots.lock().expect("pinned lock");
+        let mut pages = self.pages.lock().unwrap_or_else(|e| e.into_inner());
+        let pinned = self.pinned_roots.lock().unwrap_or_else(|e| e.into_inner());
 
         let mut scanned = 0u32;
         let mut cooled = 0u32;
@@ -277,7 +277,7 @@ impl CoolingStateMachine {
     pub fn temperature(&self, page_id: u64) -> Option<PageTemperature> {
         self.pages
             .lock()
-            .expect("cooling lock")
+            .unwrap_or_else(|e| e.into_inner())
             .get(&page_id)
             .map(|e| e.temperature)
     }
@@ -287,7 +287,7 @@ impl CoolingStateMachine {
     pub fn frame_addr(&self, page_id: u64) -> Option<u64> {
         self.pages
             .lock()
-            .expect("cooling lock")
+            .unwrap_or_else(|e| e.into_inner())
             .get(&page_id)
             .and_then(|e| {
                 if e.temperature == PageTemperature::Cold {
@@ -301,7 +301,7 @@ impl CoolingStateMachine {
     /// Count pages in each thermal state.
     #[must_use]
     pub fn temperature_counts(&self) -> TemperatureCounts {
-        let pages = self.pages.lock().expect("cooling lock");
+        let pages = self.pages.lock().unwrap_or_else(|e| e.into_inner());
         let mut counts = TemperatureCounts::default();
         for entry in pages.values() {
             match entry.temperature {
@@ -317,13 +317,13 @@ impl CoolingStateMachine {
     /// Return the total number of tracked pages.
     #[must_use]
     pub fn tracked_count(&self) -> usize {
-        self.pages.lock().expect("cooling lock").len()
+        self.pages.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
     /// Return the number of pinned root pages.
     #[must_use]
     pub fn pinned_count(&self) -> usize {
-        self.pinned_roots.lock().expect("pinned lock").len()
+        self.pinned_roots.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 }
 

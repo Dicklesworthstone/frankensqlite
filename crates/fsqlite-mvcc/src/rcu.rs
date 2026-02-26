@@ -141,7 +141,7 @@ impl QsbrRegistry {
         let ge = self.global_epoch.load(Ordering::Acquire);
         for i in 0..MAX_RCU_THREADS {
             if self.slots[i]
-                .compare_exchange(INACTIVE_EPOCH, ge, Ordering::AcqRel, Ordering::Relaxed)
+                .compare_exchange(INACTIVE_EPOCH, ge, Ordering::SeqCst, Ordering::Relaxed)
                 .is_ok()
             {
                 return Some(QsbrHandle {
@@ -180,12 +180,12 @@ impl QsbrRegistry {
         let start = Instant::now();
 
         // Advance global epoch.
-        let new_epoch = self.global_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        let new_epoch = self.global_epoch.fetch_add(1, Ordering::SeqCst) + 1;
 
         // Auto-quiesce the caller's slot at the new epoch (the caller is by
         // definition quiescent — it's executing synchronize, not reading).
         if let Some(slot) = caller_slot {
-            self.slots[slot].store(new_epoch, Ordering::Release);
+            self.slots[slot].store(new_epoch, Ordering::SeqCst);
         }
 
         // Wait for every active slot to reach `new_epoch`.
@@ -282,7 +282,7 @@ impl QsbrHandle<'_> {
     #[inline]
     pub fn quiescent(&self) {
         let ge = self.registry.global_epoch.load(Ordering::Acquire);
-        self.registry.slots[self.slot].store(ge, Ordering::Release);
+        self.registry.slots[self.slot].store(ge, Ordering::SeqCst);
     }
 
     /// Wait for a grace period as a writer that also holds a reader handle.

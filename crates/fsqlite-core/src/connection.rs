@@ -1189,6 +1189,42 @@ impl Connection {
         *self.reject_mem_fallback.borrow_mut() = reject;
     }
 
+    #[must_use]
+    fn backend_mode_label(&self) -> &'static str {
+        if *self.reject_mem_fallback.borrow() {
+            "parity_cert"
+        } else {
+            "fallback_allowed"
+        }
+    }
+
+    fn log_mem_execution_fallback(
+        &self,
+        statement_kind: &'static str,
+        decision_reason: &'static str,
+    ) {
+        let mode = self.backend_mode_label();
+        if *self.reject_mem_fallback.borrow() {
+            tracing::warn!(
+                target: "fsqlite.storage_wiring",
+                backend_kind = "mem",
+                mode,
+                statement_kind,
+                decision_reason,
+                "execute_statement_dispatch: using in-memory fallback path while parity-cert mode is enabled"
+            );
+        } else {
+            tracing::debug!(
+                target: "fsqlite.storage_wiring",
+                backend_kind = "mem",
+                mode,
+                statement_kind,
+                decision_reason,
+                "execute_statement_dispatch: using in-memory fallback path"
+            );
+        }
+    }
+
     /// Returns the kind of pager backend in use (e.g. "memory" or "unix").
     #[must_use]
     pub fn pager_backend_kind(&self) -> &'static str {
@@ -1753,14 +1789,20 @@ impl Connection {
             Statement::Select(ref select) => {
                 // CTE (WITH clause): materialize as temporary tables.
                 if select.with.is_some() {
+                    self.log_mem_execution_fallback("select", "with_clause_materialization");
                     return self.execute_with_ctes(select, params);
                 }
                 // View expansion: materialize referenced views as temp tables.
                 if self.has_view_references(select) {
+                    self.log_mem_execution_fallback("select", "view_materialization");
                     return self.execute_with_materialized_views(select, params);
                 }
                 // 5G.4 (bd-3ly4): sqlite_master/sqlite_schema virtual table support.
                 if self.has_sqlite_schema_references(select) {
+                    self.log_mem_execution_fallback(
+                        "select",
+                        "sqlite_schema_virtual_materialization",
+                    );
                     return self.execute_with_materialized_sqlite_schema(select, params);
                 }
                 let distinct = is_distinct_select(select);
@@ -1795,6 +1837,7 @@ impl Connection {
                 } else if has_group_by(select) && (has_joins(select) || has_subquery_source(select)) {
                     // GROUP BY + JOIN: materialize the join as a temp table,
                     // then GROUP BY on that temp table.
+                    self.log_mem_execution_fallback("select", "group_by_join_fallback");
                     let rewritten = self.rewrite_in_subqueries_select(select, params)?;
                     let bound = bind_placeholders_in_select_for_fallback(&rewritten, params)?;
                     let mut rows = self.execute_group_by_join_select(&bound, None)?;
@@ -1804,6 +1847,7 @@ impl Connection {
                     Ok(rows)
                 } else if has_group_by(select) {
                     // Fallback path: eagerly rewrite IN subqueries.
+                    self.log_mem_execution_fallback("select", "group_by_fallback");
                     let rewritten = self.rewrite_in_subqueries_select(select, params)?;
                     let bound = bind_placeholders_in_select_for_fallback(&rewritten, params)?;
                     let mut rows = self.execute_group_by_select(&bound, None)?;
@@ -1814,6 +1858,7 @@ impl Connection {
                 } else if select_contains_match_operator(select) {
                     // The VDBE path does not yet support MATCH/REGEXP in this
                     // connection path. Route through fallback evaluation.
+                    self.log_mem_execution_fallback("select", "match_operator_fallback");
                     let rewritten = self.rewrite_in_subqueries_select(select, params)?;
                     let bound = bind_placeholders_in_select_for_fallback(&rewritten, params)?;
                     let mut rows = self.execute_join_select(&bound, None)?;
@@ -1825,6 +1870,7 @@ impl Connection {
                     // Fallback path: eagerly rewrite IN subqueries.
                     // Also handles subquery in FROM (derived tables) even
                     // without explicit JOINs.
+                    self.log_mem_execution_fallback("select", "join_or_subquery_fallback");
                     let rewritten = self.rewrite_in_subqueries_select(select, params)?;
                     let bound = bind_placeholders_in_select_for_fallback(&rewritten, params)?;
                     let mut rows = self.execute_join_select(&bound, None)?;
@@ -1924,6 +1970,10 @@ impl Connection {
                     // Use VDBE path when RETURNING is present OR it's a simple VALUES clause;
                     // fallback otherwise (e.g. complex SELECTs, compounds).
                     if insert.returning.is_empty() && !is_simple_values {
+                        self.log_mem_execution_fallback(
+                            "insert_select",
+                            "insert_select_row_by_row_fallback",
+                        );
                         let affected =
                             self.execute_insert_select_fallback(insert, select_stmt, params)?;
                         // Phase 5G.3: Fire AFTER INSERT triggers.
@@ -2572,17 +2622,15 @@ impl Connection {
                     ConflictAction::Replace => {
                         // insert_row delegates to insert() which has upsert
                         // semantics: replaces if rowid already exists.
-                        if let Some(table) = db.get_table_mut(root_page) {
-                            table.insert_row(rowid, col_values);
-                        }
+                        let table = db.get_table_mut(root_page).ok_or_else(|| FrankenError::Internal(format!("table not found at root page {root_page}")))?;
+                        table.insert_row(rowid, col_values);
                         set_last_insert_rowid(rowid);
                         affected += 1;
                     }
                     ConflictAction::Ignore => {
                         if !exists {
-                            if let Some(table) = db.get_table_mut(root_page) {
-                                table.insert_row(rowid, col_values);
-                            }
+                            let table = db.get_table_mut(root_page).ok_or_else(|| FrankenError::Internal(format!("table not found at root page {root_page}")))?;
+                            table.insert_row(rowid, col_values);
                             set_last_insert_rowid(rowid);
                             affected += 1;
                         }
@@ -2594,9 +2642,8 @@ impl Connection {
                                 columns: format!("{table_name}.rowid"),
                             });
                         }
-                        if let Some(table) = db.get_table_mut(root_page) {
-                            table.insert_row(rowid, col_values);
-                        }
+                        let table = db.get_table_mut(root_page).ok_or_else(|| FrankenError::Internal(format!("table not found at root page {root_page}")))?;
+                        table.insert_row(rowid, col_values);
                         set_last_insert_rowid(rowid);
                         affected += 1;
                     }
@@ -2604,11 +2651,10 @@ impl Connection {
             } else {
                 // No explicit rowid; auto-allocate.  Conflict on auto-generated
                 // rowid is practically impossible.
-                if let Some(table) = db.get_table_mut(root_page) {
-                    let new_rowid = table.alloc_rowid();
-                    table.insert_row(new_rowid, col_values);
-                    set_last_insert_rowid(new_rowid);
-                }
+                let table = db.get_table_mut(root_page).ok_or_else(|| FrankenError::Internal(format!("table not found at root page {root_page}")))?;
+                let new_rowid = table.alloc_rowid();
+                table.insert_row(new_rowid, col_values);
+                set_last_insert_rowid(new_rowid);
                 affected += 1;
             }
         }
@@ -3501,7 +3547,7 @@ impl Connection {
 
     /// Finalize an implicit (autocommit) transaction: commit on success,
     /// rollback on error.  No-op when `was_auto` is `false`.
-    fn resolve_autocommit_txn(&self, was_auto: bool, ok: bool) -> Result<()> {
+    fn resolve_autocommit_txn(&self, was_auto: bool, mut ok: bool) -> Result<()> {
         if !was_auto {
             return Ok(());
         }
@@ -3517,6 +3563,19 @@ impl Connection {
             txn
         };
 
+        let mut commit_err = None;
+        let mut concurrent_plan = None;
+
+        if ok && *self.concurrent_txn.borrow() {
+            match self.plan_concurrent_commit() {
+                Ok(plan) => concurrent_plan = Some(plan),
+                Err(e) => {
+                    ok = false;
+                    commit_err = Some(e);
+                }
+            }
+        }
+
         if !ok && *self.concurrent_txn.borrow() {
             if let Some(session_id) = self.concurrent_session_id.borrow_mut().take() {
                 let mut registry = lock_unpoisoned(&self.concurrent_registry);
@@ -3530,24 +3589,28 @@ impl Connection {
         if !ok {
             self.txn_metrics_note_rollback();
         }
+
         let txn_result = if ok {
             let _commit_guard = lock_unpoisoned(&self.commit_write_mutex);
-            let concurrent_plan = if *self.concurrent_txn.borrow() {
-                self.plan_concurrent_commit()?
-            } else {
-                None
-            };
-
-            txn.commit(&cx)?;
-            let committed_seq = self.advance_commit_clock();
-
-            if let Some(plan) = concurrent_plan {
-                self.finalize_concurrent_commit(plan, committed_seq);
+            match txn.commit(&cx) {
+                Ok(()) => {
+                    let committed_seq = self.advance_commit_clock();
+                    if let Some(plan) = concurrent_plan.flatten() {
+                        self.finalize_concurrent_commit(plan, committed_seq);
+                    }
+                    Ok(())
+                }
+                Err(e) => Err(e),
             }
-            Ok(())
         } else {
-            txn.rollback(&cx)
+            let rollback_res = txn.rollback(&cx);
+            if let Some(e) = commit_err {
+                Err(e)
+            } else {
+                rollback_res
+            }
         };
+
         if let Err(err) = txn_result {
             if ok {
                 self.txn_metrics_note_rollback();
@@ -3620,7 +3683,7 @@ impl Connection {
         }
         let result = {
             let mut guard = self.active_txn.borrow_mut();
-            let txn = guard.as_deref_mut().expect("txn just ensured");
+            let txn = guard.as_deref_mut().ok_or_else(|| FrankenError::internal("transaction missing after ensure"))?;
             f(&cx, txn)
         };
         if auto {
@@ -4647,11 +4710,15 @@ impl Connection {
 
     /// Materialize views referenced by a SELECT as temporary tables, execute
     /// the query, then clean up the temp tables.
-    fn execute_with_materialized_views(
+fn execute_with_materialized_views(
         &self,
         select: &SelectStatement,
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Row>> {
+        let prev_reject = *self.reject_mem_fallback.borrow();
+        self.set_reject_mem_fallback(false);
+        let result = (|| -> Result<Vec<Row>> {
+
         let view_defs: Vec<ViewDef> = self.views.borrow().clone();
         let mut materialized: Vec<String> = Vec::new();
 
@@ -4687,7 +4754,7 @@ impl Connection {
             let view = view_defs
                 .iter()
                 .find(|v| v.name.eq_ignore_ascii_case(ref_name))
-                .unwrap();
+                .ok_or_else(|| FrankenError::internal(format!("view {} not found in definitions", ref_name)))?;
             let view_rows =
                 self.execute_statement(Statement::Select(view.query.clone()), params)?;
             let col_names = infer_select_column_names(&view.query);
@@ -4760,6 +4827,10 @@ impl Connection {
         }
 
         result
+    
+        })();
+        self.set_reject_mem_fallback(prev_reject);
+        result
     }
 
     /// Check if a SELECT references sqlite_master/sqlite_schema in FROM/JOIN
@@ -4800,11 +4871,15 @@ impl Connection {
 
     /// Materialize sqlite_master/sqlite_schema as temporary in-memory tables,
     /// execute the query, then clean up.
-    fn execute_with_materialized_sqlite_schema(
+fn execute_with_materialized_sqlite_schema(
         &self,
         select: &SelectStatement,
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Row>> {
+        let prev_reject = *self.reject_mem_fallback.borrow();
+        self.set_reject_mem_fallback(false);
+        let result = (|| -> Result<Vec<Row>> {
+
         let referenced = self.collect_sqlite_schema_references(select);
         if referenced.is_empty() {
             return self.execute_statement(Statement::Select(select.clone()), params);
@@ -4849,6 +4924,10 @@ impl Connection {
             self.db.borrow_mut().destroy_table(*root_page);
         }
 
+        result
+    
+        })();
+        self.set_reject_mem_fallback(prev_reject);
         result
     }
 
@@ -7366,12 +7445,16 @@ impl Connection {
     /// Materialize CTEs as temporary in-memory tables, execute the main query
     /// with `with` stripped, then clean up the temporary tables.
     #[allow(clippy::too_many_lines)]
-    fn execute_with_ctes(
+fn execute_with_ctes(
         &self,
         select: &SelectStatement,
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Row>> {
-        let with_clause = select.with.as_ref().unwrap();
+        let prev_reject = *self.reject_mem_fallback.borrow();
+        self.set_reject_mem_fallback(false);
+        let result = (|| -> Result<Vec<Row>> {
+
+        let with_clause = select.with.as_ref().ok_or_else(|| FrankenError::internal("expected CTE with clause"))?;
         let is_recursive = with_clause.recursive;
         let ctes = &with_clause.ctes;
         let mut temp_names: Vec<String> = Vec::with_capacity(ctes.len());
@@ -7452,6 +7535,10 @@ impl Connection {
                 self.db.borrow_mut().destroy_table(rp);
             }
         }
+        result
+    
+        })();
+        self.set_reject_mem_fallback(prev_reject);
         result
     }
 
@@ -10426,6 +10513,7 @@ struct ConcurrentExecContext {
     busy_timeout_ms: u64,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_table_program_with_db(
     program: &VdbeProgram,
     params: Option<&[SqliteValue]>,
@@ -24650,6 +24738,16 @@ mod pager_routing_tests {
     }
 
     #[test]
+    fn test_backend_mode_label_tracks_parity_toggle() {
+        let conn = Connection::open(":memory:").expect("open db");
+        assert_eq!(conn.backend_mode_label(), "parity_cert");
+        conn.set_reject_mem_fallback(false);
+        assert_eq!(conn.backend_mode_label(), "fallback_allowed");
+        conn.set_reject_mem_fallback(true);
+        assert_eq!(conn.backend_mode_label(), "parity_cert");
+    }
+
+    #[test]
     fn test_set_reject_mem_fallback() {
         let conn = Connection::open(":memory:").expect("open db");
         // Default is now true.
@@ -26513,7 +26611,7 @@ mod pager_routing_tests {
                                     );
                                     break;
                                 }
-                                Err(e) if e.is_transient() => continue,
+                                Err(e) if e.is_transient() => {}
                                 Err(e) => panic!("unexpected error: {e}"),
                             }
                         }

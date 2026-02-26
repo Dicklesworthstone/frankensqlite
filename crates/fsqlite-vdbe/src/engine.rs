@@ -799,6 +799,7 @@ impl CursorBackend {
 
     /// Returns a string identifying the backend kind for diagnostics.
     #[must_use]
+    #[allow(dead_code)]
     fn kind_str(&self) -> &'static str {
         match self {
             Self::Mem(_) => "mem",
@@ -1874,10 +1875,6 @@ impl VdbeEngine {
 
                 Opcode::MustBeInt => {
                     let val = self.get_reg(op.p1).clone();
-                    if val.is_null() {
-                        pc += 1;
-                        continue;
-                    }
                     let coerced = val.apply_affinity(fsqlite_types::TypeAffinity::Integer);
                     if coerced.as_integer().is_some() {
                         self.set_reg(op.p1, coerced);
@@ -3745,12 +3742,18 @@ impl VdbeEngine {
         const PAGE_SIZE: u32 = 4096;
         // bd-1xrs: storage_cursors_enabled check removed.
         // StorageCursor is now the ONLY cursor path.
+        let mode = if self.reject_mem_fallback {
+            "parity_cert"
+        } else {
+            "fallback_allowed"
+        };
 
         let Some(root_pgno) = PageNumber::new(root_page as u32) else {
             tracing::debug!(
                 cursor_id,
                 root_page,
                 writable,
+                mode,
                 backend_kind = "none",
                 decision_reason = "invalid_page_number",
                 "open_storage_cursor: invalid root page number"
@@ -3782,6 +3785,7 @@ impl VdbeEngine {
                         page_id = root_page,
                         writable,
                         has_txn,
+                        mode,
                         backend_kind = "txn",
                         decision_reason = "pager_read_failed",
                         error = %err,
@@ -3810,6 +3814,7 @@ impl VdbeEngine {
                     page_id = root_page,
                     writable,
                     has_txn,
+                    mode,
                     backend_kind = "txn",
                     decision_reason = "valid_btree_page",
                     "open_storage_cursor: routed through pager transaction"
@@ -3839,6 +3844,7 @@ impl VdbeEngine {
                         page_id = root_page,
                         writable,
                         has_txn,
+                        mode,
                         backend_kind = "txn",
                         decision_reason = "zero_page_init_failed",
                         error = %err,
@@ -3861,6 +3867,7 @@ impl VdbeEngine {
                     page_id = root_page,
                     writable,
                     has_txn,
+                    mode,
                     backend_kind = "txn",
                     decision_reason = "zero_page_initialized",
                     "open_storage_cursor: initialized empty root page via pager"
@@ -3882,6 +3889,7 @@ impl VdbeEngine {
                     page_id = root_page,
                     writable,
                     has_txn,
+                    mode,
                     backend_kind = "none",
                     decision_reason = "invalid_page_no_mem_fallback",
                     first_byte = page_data.first().copied().unwrap_or_default(),
@@ -3896,6 +3904,7 @@ impl VdbeEngine {
                 page_id = root_page,
                 writable,
                 has_txn,
+                mode,
                 backend_kind = "mem",
                 decision_reason = "txn_page_invalid_mem_fallback",
                 "open_storage_cursor: pager page invalid, falling through to MemDatabase"
@@ -3909,6 +3918,7 @@ impl VdbeEngine {
                 page_id = root_page,
                 writable,
                 has_txn,
+                mode,
                 backend_kind = "mem",
                 decision_reason = "parity_cert_rejection",
                 "open_storage_cursor: MemPageStore fallback rejected in parity-cert mode"
@@ -3946,6 +3956,7 @@ impl VdbeEngine {
             page_id = root_page,
             writable,
             has_txn,
+            mode,
             backend_kind = "mem",
             decision_reason = "no_pager_transaction",
             "open_storage_cursor: routed through MemPageStore fallback"

@@ -1604,7 +1604,10 @@ impl ResolverScope {
                     span,
                 })
             }
-            1 => Ok(found.expect("candidates len is 1")),
+            1 => found.ok_or_else(|| ResolveError::ColumnNotFound {
+                column: column.to_owned(),
+                span,
+            }),
             _ => Err(ResolveError::AmbiguousColumn {
                 column: column.to_owned(),
                 candidates,

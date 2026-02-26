@@ -185,7 +185,7 @@ where
     type Output = V;
 
     fn index(&self, key: &Q) -> &V {
-        self.inner.get(key).expect("no entry found for key")
+        &self.inner[key]
     }
 }
 

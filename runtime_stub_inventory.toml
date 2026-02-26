@@ -1,0 +1,1038 @@
+# Runtime Stub Inventory v1.0.0
+#
+# Bead: bd-2yqp6.4.1
+# Purpose: exhaustive machine-readable catalog of parity-critical runtime
+# NotImplemented/Unsupported/TODO placeholder paths, with ownership and
+# closure strategy. Generated from live source scan on 2026-02-26.
+
+[meta]
+schema_version = "1.0.0"
+bead_id = "bd-2yqp6.4.1"
+track_id = "bd-2yqp6.4"
+sqlite_target = "3.52.0"
+generated_at = "2026-02-26"
+contract_owner = "track-d-engine-runtime"
+inventory_scope = "runtime-src-only-pre-cfgtest"
+source_patterns = ["FrankenError::NotImplemented(", "CodegenError::Unsupported(", "TODO: Apply collation from P4 if present."]
+parity_critical_severities = ["critical", "high"]
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0001"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 167
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "high"
+feature_id = "SURF-CONFORMANCE-NATIVE-019"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "Err(FrankenError::NotImplemented( \"file-backed pager not available on this platform\".to_owned(), ))"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0002"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 2295
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "_ => Err(FrankenError::NotImplemented( \"only SELECT, INSERT, UPDATE, DELETE, DDL (CREATE/DROP/ALTER TABLE, CREATE INDEX/VIEW/TRIGGER), transaction control, PRAGMA, VACUUM, ANALYZE, REINDEX, and EXPLAIN are supported\".to_"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0003"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 2347
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented( \"INSERT ... SELECT fallback does not support WITH/UPSERT/RETURNING\".to_owned(), ));"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0004"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 2742
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "_ => Err(FrankenError::NotImplemented( \"prepare() currently supports SELECT statements only\".to_owned(), )),"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0005"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 3897
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-SQL-STRICT-004"
+owner = "track-d-engine-runtime"
+closure_strategy = "explicit_exclusion"
+anchor = "return Err(FrankenError::NotImplemented( \"CREATE TABLE ... AS SELECT ... STRICT is not yet supported\".to_owned(), ));"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0006"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 3987
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-EXT-FTS5-015"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented(format!( \"CREATE VIRTUAL TABLE USING {} is not supported in this connection path\", create.module"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0007"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 4361
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "FrankenError::NotImplemented( \"only column references are supported in CREATE INDEX\".to_owned(), )"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0008"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 6701
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented( \"GROUP BY JOIN on non-SELECT core\".to_owned(), ));"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0009"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 6760
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented(format!( \"{func}(*) is not supported in GROUP BY+JOIN path\" )));"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0010"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 6769
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented(format!( \"{func}() with no args is not supported in GROUP BY+JOIN path\" )));"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0011"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 6808
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented(format!( \"{func}() with multiple args is not supported in GROUP BY+JOIN path\" )));"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0012"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 6824
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "FrankenError::NotImplemented(\"SELECT * with GROUP BY+JOIN\".to_owned()), ), })"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0013"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 6885
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented(format!( \"aggregate {name} requires an argument\" )));"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0014"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 6984
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-SQL-COMPOUND-002"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented( \"compound SELECT is not supported with GROUP BY in this connection path\".to_owned(), ));"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0015"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 6998
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented( \"GROUP BY on non-SELECT core\".to_owned(), ));"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0016"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 7004
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-FUNC-WINDOW-012"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented( \"WINDOW is not supported in this GROUP BY connection path\".to_owned(), ));"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0017"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 7018
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented( \"GROUP BY with non-table source\".to_owned(), ));"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0018"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 7024
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented( \"GROUP BY without FROM\".to_owned(), ));"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0019"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 7116
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented(format!( \"{func}(*) is not supported in this GROUP BY connection path\" )));"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0020"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 7125
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented(format!( \"{func}() with no args is not supported in this GROUP BY connection path\" )));"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0021"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 7132
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "FrankenError::NotImplemented(format!( \"non-column argument to aggregate {func}() is not supported in this GROUP BY connection path\" ))"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0022"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 7180
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented(format!( \"{func}() with multiple args is not supported in this GROUP BY connection path\" )));"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0023"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 7200
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented(format!( \"non-aggregate result column '{label}' must appear in GROUP BY\" )));"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0024"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 7207
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "FrankenError::NotImplemented(\"SELECT * with GROUP BY\".to_owned()), ), })"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0025"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 7309
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented(format!( \"aggregate {name} requires an argument in this GROUP BY connection path\" )));"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0026"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 7586
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-SQL-COMPOUND-002"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented( \"recursive CTE supports only UNION and UNION ALL\".to_owned(), ));"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0027"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 7740
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented( \"JOIN on non-SELECT core\".to_owned(), ));"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0028"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 7794
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "_ => Err(FrankenError::NotImplemented( \"only named tables and subqueries are supported in JOIN\".to_owned(), )),"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0029"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 10394
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "CodegenError::Unsupported(msg) => FrankenError::NotImplemented(msg), } }"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0030"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 10680
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "FrankenError::NotImplemented( \"expression-only ORDER BY currently supports output-column positions or aliases only\".to_owned(), )"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0031"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 10736
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "_ => Err(FrankenError::NotImplemented( \"expression-only LIMIT/OFFSET currently supports integer literals only\".to_owned(), )),"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0032"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 10817
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented( \"multiple statements are not supported in this API path\".to_owned(), ));"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0033"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 11397
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-SQL-COMPOUND-002"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented( \"compound SELECT is not supported in this connection path\".to_owned(), ));"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0034"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 11420
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented( \"SELECT ... FROM is not supported in this connection path\".to_owned(), ));"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0035"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 11425
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented( \"GROUP BY is not supported in this connection path\".to_owned(), ));"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0036"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 11430
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented( \"HAVING is not supported in this connection path\".to_owned(), ));"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0037"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 11435
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-FUNC-WINDOW-012"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented( \"WINDOW is not supported in this connection path\".to_owned(), ));"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0038"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 11474
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented( \"star expansion requires name resolution and FROM sources\".to_owned(), ));"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0039"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 11663
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "_ => Err(FrankenError::NotImplemented(format!( \"expression form is not supported in this connection path: {expr:?}\", ))),"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0040"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 11814
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-FUNC-WINDOW-012"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented( \"function modifiers (DISTINCT/FILTER/OVER) are not supported\".to_owned(), ));"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0041"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 11822
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented( \"function(*) is not supported in expression-only SELECT\".to_owned(), ));"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0042"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 12777
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-SQL-COMPOUND-002"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented( \"IN (SELECT ...) subquery is not yet supported\".to_owned(), ));"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0043"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 12782
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented( \"IN table_name is not yet supported\".to_owned(), ));"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0044"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 12869
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented(format!( \"{op:?} operator is not yet supported\", )));"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0045"
+file = "crates/fsqlite-core/src/connection.rs"
+line = 13183
+kind = "not_implemented"
+kind_description = "FrankenError::NotImplemented runtime guard"
+severity = "critical"
+feature_id = "SURF-SQL-COMPOUND-002"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(FrankenError::NotImplemented( \"IN subquery in JOIN not supported\".to_owned(), ));"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0046"
+file = "crates/fsqlite-planner/src/codegen.rs"
+line = 153
+kind = "unsupported_codegen"
+kind_description = "CodegenError::Unsupported planner/VDBE guard"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(CodegenError::Unsupported(\"VALUES in SELECT\".to_owned())); } };"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0047"
+file = "crates/fsqlite-planner/src/codegen.rs"
+line = 170
+kind = "unsupported_codegen"
+kind_description = "CodegenError::Unsupported planner/VDBE guard"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = ".ok_or_else(|| CodegenError::Unsupported(\"SELECT without FROM\".to_owned()))?;  let table_name = match &from_clause.source {"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0048"
+file = "crates/fsqlite-planner/src/codegen.rs"
+line = 175
+kind = "unsupported_codegen"
+kind_description = "CodegenError::Unsupported planner/VDBE guard"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(CodegenError::Unsupported( \"non-table FROM source\".to_owned(), ));"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0049"
+file = "crates/fsqlite-planner/src/codegen.rs"
+line = 207
+kind = "unsupported_codegen"
+kind_description = "CodegenError::Unsupported planner/VDBE guard"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(CodegenError::Unsupported( \"SELECT WHERE currently supports only `rowid = ?` or `indexed_col = ?`\".to_owned(), ));"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0050"
+file = "crates/fsqlite-planner/src/codegen.rs"
+line = 243
+kind = "unsupported_codegen"
+kind_description = "CodegenError::Unsupported planner/VDBE guard"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "CodegenError::Unsupported(format!( \"SELECT WHERE `{col_name} = ?` requires an index on `{col_name}`\" ))"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0051"
+file = "crates/fsqlite-planner/src/codegen.rs"
+line = 426
+kind = "unsupported_codegen"
+kind_description = "CodegenError::Unsupported planner/VDBE guard"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(CodegenError::Unsupported(\"empty VALUES\".to_owned())); } codegen_insert_values(b, rows, cursor, table, &stmt.returning, ctx)?;"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0052"
+file = "crates/fsqlite-planner/src/codegen.rs"
+line = 434
+kind = "unsupported_codegen"
+kind_description = "CodegenError::Unsupported planner/VDBE guard"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(CodegenError::Unsupported(\"DEFAULT VALUES\".to_owned())); } }"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0053"
+file = "crates/fsqlite-planner/src/codegen.rs"
+line = 498
+kind = "unsupported_codegen"
+kind_description = "CodegenError::Unsupported planner/VDBE guard"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(CodegenError::Unsupported( \"INSERT currently supports only literal and placeholder values\".to_owned(), ));"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0054"
+file = "crates/fsqlite-planner/src/codegen.rs"
+line = 552
+kind = "unsupported_codegen"
+kind_description = "CodegenError::Unsupported planner/VDBE guard"
+severity = "critical"
+feature_id = "SURF-SQL-COMPOUND-002"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(CodegenError::Unsupported( \"INSERT ... SELECT with compounds (UNION, etc.)\".to_owned(), ));"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0055"
+file = "crates/fsqlite-planner/src/codegen.rs"
+line = 567
+kind = "unsupported_codegen"
+kind_description = "CodegenError::Unsupported planner/VDBE guard"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = ".ok_or_else(|| CodegenError::Unsupported(\"INSERT ... SELECT without FROM\".to_owned()))?;  let src_table_name = match &from_clause.source {"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0056"
+file = "crates/fsqlite-planner/src/codegen.rs"
+line = 572
+kind = "unsupported_codegen"
+kind_description = "CodegenError::Unsupported planner/VDBE guard"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(CodegenError::Unsupported( \"INSERT ... SELECT from non-table source\".to_owned(), ));"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0057"
+file = "crates/fsqlite-planner/src/codegen.rs"
+line = 732
+kind = "unsupported_codegen"
+kind_description = "CodegenError::Unsupported planner/VDBE guard"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(CodegenError::Unsupported( \"UPDATE currently supports only literal and placeholder assignments\".to_owned(), ));"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0058"
+file = "crates/fsqlite-planner/src/codegen.rs"
+line = 741
+kind = "unsupported_codegen"
+kind_description = "CodegenError::Unsupported planner/VDBE guard"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "CodegenError::Unsupported(\"UPDATE currently supports only `WHERE rowid = ?`\".to_owned()) })?; let rowid_reg = b.alloc_reg();"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0059"
+file = "crates/fsqlite-planner/src/codegen.rs"
+line = 1119
+kind = "unsupported_codegen"
+kind_description = "CodegenError::Unsupported planner/VDBE guard"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "_ => Err(CodegenError::Unsupported( \"planner expression codegen for this expression type\".to_owned(), )),"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0060"
+file = "crates/fsqlite-vdbe/src/codegen.rs"
+line = 571
+kind = "unsupported_codegen"
+kind_description = "CodegenError::Unsupported planner/VDBE guard"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(CodegenError::Unsupported(\"VALUES in SELECT\".to_owned())); } };"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0061"
+file = "crates/fsqlite-vdbe/src/codegen.rs"
+line = 588
+kind = "unsupported_codegen"
+kind_description = "CodegenError::Unsupported planner/VDBE guard"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(CodegenError::Unsupported(unsupported_in_message())); } "
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0062"
+file = "crates/fsqlite-vdbe/src/codegen.rs"
+line = 594
+kind = "unsupported_codegen"
+kind_description = "CodegenError::Unsupported planner/VDBE guard"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = ".ok_or_else(|| CodegenError::Unsupported(\"SELECT without FROM\".to_owned()))?;  let (table_name, table_alias) = match &from_clause.source {"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0063"
+file = "crates/fsqlite-vdbe/src/codegen.rs"
+line = 599
+kind = "unsupported_codegen"
+kind_description = "CodegenError::Unsupported planner/VDBE guard"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(CodegenError::Unsupported( \"non-table FROM source\".to_owned(), ));"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0064"
+file = "crates/fsqlite-vdbe/src/codegen.rs"
+line = 1192
+kind = "unsupported_codegen"
+kind_description = "CodegenError::Unsupported planner/VDBE guard"
+severity = "medium"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "CodegenError::Unsupported(\"negative output column count in DISTINCT SELECT\".to_owned()) })?; "
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0065"
+file = "crates/fsqlite-vdbe/src/codegen.rs"
+line = 1451
+kind = "unsupported_codegen"
+kind_description = "CodegenError::Unsupported planner/VDBE guard"
+severity = "medium"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "CodegenError::Unsupported(\"negative output column count in ordered SELECT\".to_owned()) })?; let total_sorter_cols = num_sort_keys + num_data_cols;"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0066"
+file = "crates/fsqlite-vdbe/src/codegen.rs"
+line = 2015
+kind = "unsupported_codegen"
+kind_description = "CodegenError::Unsupported planner/VDBE guard"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(CodegenError::Unsupported( \"non-column argument in aggregate function\".to_owned(), ));"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0067"
+file = "crates/fsqlite-vdbe/src/codegen.rs"
+line = 2032
+kind = "unsupported_codegen"
+kind_description = "CodegenError::Unsupported planner/VDBE guard"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(CodegenError::Unsupported( \"mixed aggregate and non-aggregate columns without GROUP BY\".to_owned(), ));"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0068"
+file = "crates/fsqlite-vdbe/src/codegen.rs"
+line = 2074
+kind = "unsupported_codegen"
+kind_description = "CodegenError::Unsupported planner/VDBE guard"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "CodegenError::Unsupported(\"non-column GROUP BY expression\".to_owned()) }) })"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0069"
+file = "crates/fsqlite-vdbe/src/codegen.rs"
+line = 2114
+kind = "unsupported_codegen"
+kind_description = "CodegenError::Unsupported planner/VDBE guard"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(CodegenError::Unsupported( \"non-column argument in aggregate function\".to_owned(), ));"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0070"
+file = "crates/fsqlite-vdbe/src/codegen.rs"
+line = 2134
+kind = "unsupported_codegen"
+kind_description = "CodegenError::Unsupported planner/VDBE guard"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "CodegenError::Unsupported( \"non-aggregate, non-column expression in GROUP BY query\".to_owned(), )"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0071"
+file = "crates/fsqlite-vdbe/src/codegen.rs"
+line = 2142
+kind = "unsupported_codegen"
+kind_description = "CodegenError::Unsupported planner/VDBE guard"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "CodegenError::Unsupported(\"result column not in GROUP BY clause\".to_owned()) })?; output_cols.push(GroupByOutputCol::GroupKey {"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0072"
+file = "crates/fsqlite-vdbe/src/codegen.rs"
+line = 2150
+kind = "unsupported_codegen"
+kind_description = "CodegenError::Unsupported planner/VDBE guard"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(CodegenError::Unsupported( \"Star in GROUP BY query\".to_owned(), ));"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0073"
+file = "crates/fsqlite-vdbe/src/codegen.rs"
+line = 2206
+kind = "unsupported_codegen"
+kind_description = "CodegenError::Unsupported planner/VDBE guard"
+severity = "medium"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(CodegenError::Unsupported( \"internal: aggregate argument column missing from sorter layout\".to_owned(), ));"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0074"
+file = "crates/fsqlite-vdbe/src/codegen.rs"
+line = 2482
+kind = "unsupported_codegen"
+kind_description = "CodegenError::Unsupported planner/VDBE guard"
+severity = "medium"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(CodegenError::Unsupported( \"internal: non-zero-arg aggregate missing sorter column\".to_owned(), ));"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0075"
+file = "crates/fsqlite-vdbe/src/codegen.rs"
+line = 2646
+kind = "unsupported_codegen"
+kind_description = "CodegenError::Unsupported planner/VDBE guard"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(CodegenError::Unsupported(\"empty VALUES\".to_owned())); } "
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0076"
+file = "crates/fsqlite-vdbe/src/codegen.rs"
+line = 2824
+kind = "unsupported_codegen"
+kind_description = "CodegenError::Unsupported planner/VDBE guard"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = ".ok_or_else(|| CodegenError::Unsupported(\"empty VALUES\".to_owned()))? .len(); let rowid_reg = b.alloc_reg();"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0077"
+file = "crates/fsqlite-vdbe/src/codegen.rs"
+line = 2835
+kind = "unsupported_codegen"
+kind_description = "CodegenError::Unsupported planner/VDBE guard"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(CodegenError::Unsupported( \"VALUES rows must have the same arity\".to_owned(), ));"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0078"
+file = "crates/fsqlite-vdbe/src/codegen.rs"
+line = 2982
+kind = "unsupported_codegen"
+kind_description = "CodegenError::Unsupported planner/VDBE guard"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(CodegenError::Unsupported( \"INSERT ... SELECT with VALUES body\".to_owned(), ));"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0079"
+file = "crates/fsqlite-vdbe/src/codegen.rs"
+line = 2990
+kind = "unsupported_codegen"
+kind_description = "CodegenError::Unsupported planner/VDBE guard"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = ".ok_or_else(|| CodegenError::Unsupported(\"INSERT ... SELECT without FROM\".to_owned()))?;  if columns.iter().any(contains_unsupported_in_result_column)"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0080"
+file = "crates/fsqlite-vdbe/src/codegen.rs"
+line = 2997
+kind = "unsupported_codegen"
+kind_description = "CodegenError::Unsupported planner/VDBE guard"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(CodegenError::Unsupported(unsupported_in_message())); } "
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0081"
+file = "crates/fsqlite-vdbe/src/codegen.rs"
+line = 3003
+kind = "unsupported_codegen"
+kind_description = "CodegenError::Unsupported planner/VDBE guard"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(CodegenError::Unsupported( \"INSERT ... SELECT from non-table source\".to_owned(), ));"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0082"
+file = "crates/fsqlite-vdbe/src/codegen.rs"
+line = 3173
+kind = "unsupported_codegen"
+kind_description = "CodegenError::Unsupported planner/VDBE guard"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(CodegenError::Unsupported(unsupported_in_message())); } "
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0083"
+file = "crates/fsqlite-vdbe/src/codegen.rs"
+line = 3443
+kind = "unsupported_codegen"
+kind_description = "CodegenError::Unsupported planner/VDBE guard"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(CodegenError::Unsupported(unsupported_in_message())); } "
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0084"
+file = "crates/fsqlite-vdbe/src/codegen.rs"
+line = 4423
+kind = "unsupported_codegen"
+kind_description = "CodegenError::Unsupported planner/VDBE guard"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "return Err(CodegenError::Unsupported( \"non-column result expression in table-backed SELECT\".to_owned(), ));"
+
+[[runtime_stubs]]
+stub_id = "RSTUB-0085"
+file = "crates/fsqlite-vdbe/src/engine.rs"
+line = 3179
+kind = "todo_placeholder"
+kind_description = "TODO placeholder in runtime execution path"
+severity = "critical"
+feature_id = "SURF-SQL-CORE-001"
+owner = "track-d-engine-runtime"
+closure_strategy = "implement"
+anchor = "// TODO: Apply collation from P4 if present. // For now, use default collation (binary/numeric-aware). if let Some(ord) = val_a.partial_cmp(val_b) {"
+

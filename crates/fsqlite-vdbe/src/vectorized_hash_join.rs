@@ -372,7 +372,7 @@ fn gather_column_inner(
             let src = v.as_slice();
             let mut values = Vec::with_capacity(output_rows);
             for (out_idx, &row) in indices.iter().enumerate() {
-                values.push(src[row]);
+                values.push(src.get(row).copied().unwrap_or_default());
                 set_valid(&mut validity_bytes, out_idx, row, extra_nulls, validity);
             }
             ColumnData::Int8(
@@ -384,7 +384,7 @@ fn gather_column_inner(
             let src = v.as_slice();
             let mut values = Vec::with_capacity(output_rows);
             for (out_idx, &row) in indices.iter().enumerate() {
-                values.push(src[row]);
+                values.push(src.get(row).copied().unwrap_or_default());
                 set_valid(&mut validity_bytes, out_idx, row, extra_nulls, validity);
             }
             ColumnData::Int16(
@@ -396,7 +396,7 @@ fn gather_column_inner(
             let src = v.as_slice();
             let mut values = Vec::with_capacity(output_rows);
             for (out_idx, &row) in indices.iter().enumerate() {
-                values.push(src[row]);
+                values.push(src.get(row).copied().unwrap_or_default());
                 set_valid(&mut validity_bytes, out_idx, row, extra_nulls, validity);
             }
             ColumnData::Int32(
@@ -408,7 +408,7 @@ fn gather_column_inner(
             let src = v.as_slice();
             let mut values = Vec::with_capacity(output_rows);
             for (out_idx, &row) in indices.iter().enumerate() {
-                values.push(src[row]);
+                values.push(src.get(row).copied().unwrap_or_default());
                 set_valid(&mut validity_bytes, out_idx, row, extra_nulls, validity);
             }
             ColumnData::Int64(
@@ -420,7 +420,7 @@ fn gather_column_inner(
             let src = v.as_slice();
             let mut values = Vec::with_capacity(output_rows);
             for (out_idx, &row) in indices.iter().enumerate() {
-                values.push(src[row]);
+                values.push(src.get(row).copied().unwrap_or_default());
                 set_valid(&mut validity_bytes, out_idx, row, extra_nulls, validity);
             }
             ColumnData::Float32(
@@ -432,7 +432,7 @@ fn gather_column_inner(
             let src = v.as_slice();
             let mut values = Vec::with_capacity(output_rows);
             for (out_idx, &row) in indices.iter().enumerate() {
-                values.push(src[row]);
+                values.push(src.get(row).copied().unwrap_or_default());
                 set_valid(&mut validity_bytes, out_idx, row, extra_nulls, validity);
             }
             ColumnData::Float64(
@@ -445,9 +445,11 @@ fn gather_column_inner(
             let mut new_data: Vec<u8> = Vec::new();
             new_offsets.push(0);
             for (out_idx, &row) in indices.iter().enumerate() {
-                let start = offsets[row] as usize;
-                let end = offsets[row + 1] as usize;
-                new_data.extend_from_slice(&src[start..end]);
+                let start = offsets.get(row).copied().unwrap_or_default() as usize;
+                let end = offsets.get(row + 1).copied().unwrap_or_default() as usize;
+                if start <= end && end <= src.len() {
+                    new_data.extend_from_slice(&src[start..end]);
+                }
                 #[allow(clippy::cast_possible_truncation)]
                 new_offsets.push(new_data.len() as u32);
                 set_valid(&mut validity_bytes, out_idx, row, extra_nulls, validity);
@@ -462,9 +464,11 @@ fn gather_column_inner(
             let mut new_data: Vec<u8> = Vec::new();
             new_offsets.push(0);
             for (out_idx, &row) in indices.iter().enumerate() {
-                let start = offsets[row] as usize;
-                let end = offsets[row + 1] as usize;
-                new_data.extend_from_slice(&src[start..end]);
+                let start = offsets.get(row).copied().unwrap_or_default() as usize;
+                let end = offsets.get(row + 1).copied().unwrap_or_default() as usize;
+                if start <= end && end <= src.len() {
+                    new_data.extend_from_slice(&src[start..end]);
+                }
                 #[allow(clippy::cast_possible_truncation)]
                 new_offsets.push(new_data.len() as u32);
                 set_valid(&mut validity_bytes, out_idx, row, extra_nulls, validity);

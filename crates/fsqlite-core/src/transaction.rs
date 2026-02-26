@@ -382,10 +382,10 @@ impl TransactionController {
     // Internal helpers
     // -----------------------------------------------------------------------
 
-    /// Find a savepoint by name (case-sensitive, searches from top of stack).
+    /// Find a savepoint by name (case-insensitive, searches from top of stack).
     fn find_savepoint(&self, name: &str) -> Result<usize> {
         for (i, sp) in self.savepoints.iter().enumerate().rev() {
-            if sp.name == name {
+            if sp.name.eq_ignore_ascii_case(name) {
                 return Ok(i);
             }
         }

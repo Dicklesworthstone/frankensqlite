@@ -257,7 +257,7 @@ impl Scope {
                 }
                 ResolveResult::ColumnNotFound
             }
-            1 => ResolveResult::Resolved(matches.into_iter().next().unwrap()),
+            1 => ResolveResult::Resolved(matches.into_iter().next().unwrap_or_default()),
             _ => ResolveResult::Ambiguous(matches),
         }
     }
@@ -406,10 +406,6 @@ impl<'a> Resolver<'a> {
         match stmt {
             Statement::Select(select) => self.resolve_select(select, scope),
             Statement::Insert(insert) => {
-                self.bind_table_to_scope(&insert.table.name, None, scope);
-                for col in &insert.columns {
-                    self.resolve_unqualified_column(col, scope, false);
-                }
                 match &insert.source {
                     fsqlite_ast::InsertSource::Select(select) => self.resolve_select(select, scope),
                     fsqlite_ast::InsertSource::Values(rows) => {
@@ -421,6 +417,12 @@ impl<'a> Resolver<'a> {
                     }
                     fsqlite_ast::InsertSource::DefaultValues => {}
                 }
+
+                self.bind_table_to_scope(&insert.table.name, None, scope);
+                for col in &insert.columns {
+                    self.resolve_unqualified_column(col, scope, false);
+                }
+
                 for upsert in &insert.upsert {
                     if let Some(target) = &upsert.target {
                         for col in &target.columns {
@@ -435,6 +437,20 @@ impl<'a> Resolver<'a> {
                             assignments,
                             where_clause,
                         } => {
+                            let mut upsert_scope = Scope::child(scope.clone());
+                            if let Some(table_def) = self.schema.find_table(&insert.table.name) {
+                                let col_set: HashSet<String> = table_def
+                                    .columns
+                                    .iter()
+                                    .map(|c| c.name.to_ascii_lowercase())
+                                    .collect();
+                                upsert_scope.add_alias("excluded", &insert.table.name, Some(col_set.clone()));
+                                upsert_scope.add_alias(&insert.table.name, &insert.table.name, Some(col_set));
+                            } else {
+                                upsert_scope.add_alias("excluded", "<pseudo>", None);
+                                upsert_scope.add_alias(&insert.table.name, "<pseudo>", None);
+                            }
+
                             for assignment in assignments {
                                 match &assignment.target {
                                     fsqlite_ast::AssignmentTarget::Column(col) => {
@@ -446,10 +462,10 @@ impl<'a> Resolver<'a> {
                                         }
                                     }
                                 }
-                                self.resolve_expr(&assignment.value, scope);
+                                self.resolve_expr(&assignment.value, &upsert_scope);
                             }
                             if let Some(w) = where_clause {
-                                self.resolve_expr(w, scope);
+                                self.resolve_expr(w, &upsert_scope);
                             }
                         }
                         fsqlite_ast::UpsertAction::Nothing => {}
@@ -472,10 +488,12 @@ impl<'a> Resolver<'a> {
                             }
                         }
                     }
-                    self.resolve_expr(&assignment.value, scope);
                 }
                 if let Some(from) = &update.from {
                     self.resolve_from(from, scope);
+                }
+                for assignment in &update.assignments {
+                    self.resolve_expr(&assignment.value, scope);
                 }
                 if let Some(where_clause) = &update.where_clause {
                     self.resolve_expr(where_clause, scope);

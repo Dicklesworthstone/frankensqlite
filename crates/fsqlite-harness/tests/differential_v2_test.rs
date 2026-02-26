@@ -8,7 +8,7 @@
 
 use fsqlite_harness::differential_v2::{
     self, CanonicalizationRules, DifferentialResult, EngineIdentity, ExecutionEnvelope,
-    FsqliteExecutor, NormalizedValue, Outcome, PragmaConfig, SqlExecutor, FORMAT_VERSION,
+    FORMAT_VERSION, FsqliteExecutor, NormalizedValue, Outcome, PragmaConfig, SqlExecutor,
 };
 
 /// Rusqlite executor for the C SQLite oracle.
@@ -56,6 +56,35 @@ impl SqlExecutor for RusqliteExecutor {
 
     fn engine_identity(&self) -> EngineIdentity {
         EngineIdentity::CSqliteOracle
+    }
+}
+
+/// Fixed-error executor used to validate error-category matching behavior.
+struct FixedErrorExecutor {
+    engine: EngineIdentity,
+    error_message: String,
+}
+
+impl FixedErrorExecutor {
+    fn new(engine: EngineIdentity, error_message: impl Into<String>) -> Self {
+        Self {
+            engine,
+            error_message: error_message.into(),
+        }
+    }
+}
+
+impl SqlExecutor for FixedErrorExecutor {
+    fn execute(&self, _sql: &str) -> Result<usize, String> {
+        Err(self.error_message.clone())
+    }
+
+    fn query(&self, _sql: &str) -> Result<Vec<Vec<NormalizedValue>>, String> {
+        Err(self.error_message.clone())
+    }
+
+    fn engine_identity(&self) -> EngineIdentity {
+        self.engine
     }
 }
 
@@ -309,12 +338,30 @@ fn canonicalization_error_match_by_category() {
     let envelope = make_test_envelope(42, vec![], vec!["SELECT * FROM nonexistent_table_xyz"]);
     let result = run_test(&envelope);
 
-    // With error_match_by_category = true (default), both-error = match.
+    // With error_match_by_category = true (default), equivalent categories match.
     assert_eq!(
         result.outcome,
         Outcome::Pass,
-        "both engines erroring should count as a match with error_match_by_category"
+        "equivalent missing-table errors should match under category mode"
     );
+}
+
+#[test]
+fn canonicalization_error_match_by_category_rejects_different_categories() {
+    let envelope = make_test_envelope(77, vec![], vec!["SELECT * FROM missing_table"]);
+    let f = FixedErrorExecutor::new(
+        EngineIdentity::FrankenSqlite,
+        "no such table: missing_table",
+    );
+    let c = FixedErrorExecutor::new(
+        EngineIdentity::CSqliteOracle,
+        "SqliteFailure(Error { code: ConstraintViolation, extended_code: 2067 }, Some(\"UNIQUE constraint failed: t.id\"))",
+    );
+
+    let result = differential_v2::run_differential(&envelope, &f, &c);
+    assert_eq!(result.outcome, Outcome::Divergence);
+    assert_eq!(result.statements_mismatched, 1);
+    assert_eq!(result.first_divergence_index, Some(0));
 }
 
 #[test]
@@ -331,6 +378,36 @@ fn builder_sets_defaults_correctly() {
         !e.engines.csqlite.trim().is_empty(),
         "default csqlite version metadata must be non-empty"
     );
+    assert_eq!(e.engines.subject_identity, "frankensqlite");
+    assert_eq!(e.engines.reference_identity, "csqlite-oracle");
+}
+
+#[test]
+fn parity_rejects_empty_subject_identity_metadata() {
+    let envelope = ExecutionEnvelope::builder(42)
+        .engines("0.1.0-test", "3.52.0-test")
+        .engine_identities("", "csqlite-oracle")
+        .workload(["SELECT 1".to_owned()])
+        .build();
+    let f = FsqliteExecutor::open_in_memory().expect("fsqlite open");
+    let c = RusqliteExecutor::open_in_memory();
+
+    let result = differential_v2::run_differential(&envelope, &f, &c);
+    assert_eq!(result.outcome, Outcome::Error);
+}
+
+#[test]
+fn parity_rejects_mismatched_reference_identity_metadata() {
+    let envelope = ExecutionEnvelope::builder(42)
+        .engines("0.1.0-test", "3.52.0-test")
+        .engine_identities("frankensqlite", "unknown")
+        .workload(["SELECT 1".to_owned()])
+        .build();
+    let f = FsqliteExecutor::open_in_memory().expect("fsqlite open");
+    let c = RusqliteExecutor::open_in_memory();
+
+    let result = differential_v2::run_differential(&envelope, &f, &c);
+    assert_eq!(result.outcome, Outcome::Error);
 }
 
 #[test]
@@ -343,6 +420,35 @@ fn parity_rejects_empty_csqlite_version_metadata() {
     let c = RusqliteExecutor::open_in_memory();
 
     let result = differential_v2::run_differential(&envelope, &f, &c);
+    assert_eq!(result.outcome, Outcome::Error);
+}
+
+#[test]
+fn parity_rejects_placeholder_csqlite_version_metadata() {
+    for placeholder in ["unknown", "n/a", "unset", "none", "null", "missing"] {
+        let envelope = ExecutionEnvelope::builder(42)
+            .engines("0.1.0-test", placeholder)
+            .workload(["SELECT 1".to_owned()])
+            .build();
+        let f = FsqliteExecutor::open_in_memory().expect("fsqlite open");
+        let c = RusqliteExecutor::open_in_memory();
+
+        let result = differential_v2::run_differential(&envelope, &f, &c);
+        assert_eq!(
+            result.outcome,
+            Outcome::Error,
+            "placeholder metadata '{placeholder}' must fail parity preflight"
+        );
+    }
+}
+
+#[test]
+fn parity_rejects_non_fsqlite_subject_executor() {
+    let envelope = make_test_envelope(42, vec![], vec!["SELECT 1"]);
+    let not_subject = RusqliteExecutor::open_in_memory();
+    let oracle = RusqliteExecutor::open_in_memory();
+
+    let result = differential_v2::run_differential(&envelope, &not_subject, &oracle);
     assert_eq!(result.outcome, Outcome::Error);
 }
 
@@ -501,7 +607,7 @@ fn mismatch_reducer_returns_none_for_passing_workload() {
 
     let reduction = differential_v2::minimize_mismatch_workload(
         &envelope,
-        || Ok(ReducerMockExecutor::new(MockEngine::Csqlite)),
+        || Ok(ReducerMockExecutor::new(MockEngine::Fsqlite)),
         || Ok(ReducerMockExecutor::new(MockEngine::Csqlite)),
     )
     .expect("reducer should execute");

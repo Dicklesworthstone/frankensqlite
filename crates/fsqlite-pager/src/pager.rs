@@ -3770,7 +3770,7 @@ mod tests {
         // Write 100 pages.
         let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
         let mut pages = Vec::new();
-        for i in 0..100u32 {
+        for _ in 0..100u32 {
             let p = txn.allocate_page(&cx).unwrap();
             let mut data = vec![0u8; ps];
             // Unique fingerprint: page number in first 4 bytes.
@@ -3987,6 +3987,12 @@ mod tests {
             "bead_id={BEAD_E2E} case=alloc_free_reuse reused={reused}"
         );
         txn.commit(&cx).unwrap();
+
+        let final_db_size = {
+            let inner = pager.inner.lock().unwrap();
+            inner.db_size
+        };
+        assert_eq!(final_db_size, initial_db_size + 1, "DB size should only grow by 1 page (the one currently allocated)");
     }
 
     #[test]

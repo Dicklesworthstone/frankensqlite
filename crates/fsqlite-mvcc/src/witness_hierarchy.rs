@@ -100,6 +100,9 @@ pub fn derive_range_keys(key: &WitnessKey, config: &WitnessHierarchyConfigV1) ->
 #[must_use]
 #[allow(clippy::cast_possible_truncation)]
 pub fn range_key_bucket_index(range_key: RangeKey, mask: u32) -> u32 {
+    if mask == 0 {
+        return 0;
+    }
     // Combine level + prefix into a single key for hashing.
     let combined = u64::from(range_key.level) << 32 | u64::from(range_key.hash_prefix);
     // Fibonacci hash: multiply by golden ratio constant, take top bits.

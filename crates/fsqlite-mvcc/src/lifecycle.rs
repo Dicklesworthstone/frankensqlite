@@ -1049,9 +1049,9 @@ impl TransactionManager {
         };
 
         // Get latest committed version (chain head = "theirs").
-        let latest_data = match self.version_store.chain_head(pgno) {
+        let (latest_data, latest_seq) = match self.version_store.chain_head(pgno) {
             Some(idx) => match self.version_store.get_version(idx) {
-                Some(v) => v.data,
+                Some(v) => (v.data.clone(), v.commit_seq),
                 None => return false,
             },
             None => return false,
@@ -1076,6 +1076,10 @@ impl TransactionManager {
         match compose_disjoint_gf256_patches(base_data.as_bytes(), &delta_ours, &delta_theirs) {
             Some(merged) => {
                 txn.write_set_data.insert(pgno, PageData::from_vec(merged));
+                txn.record_page_read(pgno, latest_seq);
+                if let Some(entry) = txn.write_set_versions.get_mut(&pgno) {
+                    entry.old_version = Some(latest_seq);
+                }
                 true
             }
             None => false,
