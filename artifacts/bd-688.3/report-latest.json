@@ -1,11 +1,11 @@
 {
   "bead_id": "bd-688.3",
-  "run_id": "bd-688.3-20260225T081341Z",
-  "trace_id": "bd-688.3-20260225T081341Z-trace",
+  "run_id": "bd-688.3-20260226T063506Z",
+  "trace_id": "bd-688.3-20260226T063506Z-trace",
   "scenario_id": "bd6883_latchfree_version_chain_verify",
-  "created_at_utc": "20260225T081341Z",
-  "overall_status": "failed",
-  "log_file": "artifacts/bd-688.3/bd-688.3-20260225T081341Z.log",
+  "created_at_utc": "20260226T063506Z",
+  "overall_status": "passed",
+  "log_file": "artifacts/bd-688.3/bd-688.3-20260226T063506Z.log",
   "steps": [
     {
       "name": "mvcc_unit_tests",
@@ -20,11 +20,11 @@
     {
       "name": "harness_integration_tests",
       "status": "passed",
-      "command": "cargo test --test bd_688_3_latchfree_version_chain -- --nocapture"
+      "command": "cargo test -p fsqlite-harness --test bd_688_3_latchfree_version_chain -- --nocapture"
     },
     {
       "name": "clippy",
-      "status": "failed",
+      "status": "passed",
       "command": "cargo clippy -p fsqlite-mvcc --all-targets -- -D warnings"
     }
   ],

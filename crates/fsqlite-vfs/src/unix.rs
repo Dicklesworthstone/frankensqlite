@@ -265,7 +265,7 @@ fn posix_lock(file: &impl AsFd, lock_type: i32, start: u64, len: u64) -> Result<
 
 /// Release a POSIX advisory lock.
 fn posix_unlock(file: &impl AsFd, start: u64, len: u64) -> Result<()> {
-    let ok = posix_lock(file, libc::F_UNLCK.into(), start, len)?;
+    let ok = posix_lock(file, libc::F_UNLCK, start, len)?;
     debug_assert!(ok, "F_UNLCK should never fail with EAGAIN");
     Ok(())
 }
@@ -772,7 +772,7 @@ impl UnixFile {
                                 first_error = Some(err);
                             }
                         }
-                    } else if let Err(err) = posix_lock(&*shm_file, libc::F_RDLCK.into(), lock_byte, 1) {
+                    } else if let Err(err) = posix_lock(&*shm_file, libc::F_RDLCK, lock_byte, 1) {
                         if first_error.is_none() {
                             first_error = Some(err);
                         }
@@ -812,7 +812,7 @@ impl UnixFile {
                                 first_error = Some(err);
                             }
                         }
-                    } else if let Err(err) = posix_lock(&*shm_file, libc::F_RDLCK.into(), lock_byte, 1) {
+                    } else if let Err(err) = posix_lock(&*shm_file, libc::F_RDLCK, lock_byte, 1) {
                         if first_error.is_none() {
                             first_error = Some(err);
                         }
@@ -902,7 +902,7 @@ impl UnixFile {
         }
 
         let total_shared = slot_state.shared_holders.values().copied().sum::<u32>();
-        if total_shared == 0 && !posix_lock(&*info.file, libc::F_RDLCK.into(), lock_byte, 1)? {
+        if total_shared == 0 && !posix_lock(&*info.file, libc::F_RDLCK, lock_byte, 1)? {
             Self::log_lock_conflict(
                 SQLITE_SHM_DMS_SLOT,
                 "shared",
@@ -991,7 +991,7 @@ impl UnixFile {
         }
 
         let total_shared = slot_state.shared_holders.values().copied().sum::<u32>();
-        if total_shared == 0 && !posix_lock(&*info.file, libc::F_RDLCK.into(), lock_byte, 1)? {
+        if total_shared == 0 && !posix_lock(&*info.file, libc::F_RDLCK, lock_byte, 1)? {
             Self::log_lock_conflict(slot, "shared", Self::observed_mode(slot_state), read_marks);
             return Err(FrankenError::Busy);
         }
@@ -1023,7 +1023,7 @@ impl UnixFile {
         let slot_state = &mut info.slots[slot_idx];
 
         if slot_state.exclusive_owner == Some(self.shm_owner_id) {
-            if !posix_lock(&*info.file, libc::F_WRLCK.into(), lock_byte, 1)? {
+            if !posix_lock(&*info.file, libc::F_WRLCK, lock_byte, 1)? {
                 Self::log_lock_conflict(
                     slot,
                     "exclusive-reassert",
@@ -1067,7 +1067,7 @@ impl UnixFile {
         }
 
         slot_state.shared_holders.remove(&self.shm_owner_id);
-        if !posix_lock(&*info.file, libc::F_WRLCK.into(), lock_byte, 1)? {
+        if !posix_lock(&*info.file, libc::F_WRLCK, lock_byte, 1)? {
             Self::log_lock_conflict(
                 slot,
                 "exclusive",
@@ -1163,7 +1163,7 @@ impl UnixFile {
         slot_state.exclusive_owner = None;
         if slot_state.shared_holders.is_empty() {
             posix_unlock(&*info.file, lock_byte, 1)?;
-        } else if !posix_lock(&*info.file, libc::F_RDLCK.into(), lock_byte, 1)? {
+        } else if !posix_lock(&*info.file, libc::F_RDLCK, lock_byte, 1)? {
             Self::log_lock_conflict(
                 slot,
                 "unlock-exclusive",
@@ -1515,8 +1515,9 @@ impl VfsFile for UnixFile {
     }
 
     fn check_reserved_lock(&self, _cx: &Cx) -> Result<bool> {
-        let flock = posix_getlk(&*self.file, libc::F_WRLCK.into(), RESERVED_BYTE, 1)?;
-        Ok(i32::from(flock.l_type) != i32::from(libc::F_UNLCK))
+        let flock = posix_getlk(&*self.file, libc::F_WRLCK, RESERVED_BYTE, 1)?;
+        let unlocked_type = i16::try_from(libc::F_UNLCK).expect("F_UNLCK must fit in i16");
+        Ok(flock.l_type != unlocked_type)
     }
 
     fn shm_map(

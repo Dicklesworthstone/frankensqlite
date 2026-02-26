@@ -575,14 +575,12 @@ impl<'a> Resolver<'a> {
                             }
                             _ => {}
                         }
-                        if let Some(end) = &frame.end {
-                            match end {
-                                fsqlite_ast::FrameBound::Preceding(expr)
-                                | fsqlite_ast::FrameBound::Following(expr) => {
-                                    self.resolve_expr(expr, scope);
-                                }
-                                _ => {}
-                            }
+                        if let Some(
+                            fsqlite_ast::FrameBound::Preceding(expr)
+                            | fsqlite_ast::FrameBound::Following(expr),
+                        ) = &frame.end
+                        {
+                            self.resolve_expr(expr, scope);
                         }
                     }
                 }
@@ -806,14 +804,12 @@ impl<'a> Resolver<'a> {
                             }
                             _ => {}
                         }
-                        if let Some(end) = &frame.end {
-                            match end {
-                                fsqlite_ast::FrameBound::Preceding(expr)
-                                | fsqlite_ast::FrameBound::Following(expr) => {
-                                    self.resolve_expr(expr, scope);
-                                }
-                                _ => {}
-                            }
+                        if let Some(
+                            fsqlite_ast::FrameBound::Preceding(expr)
+                            | fsqlite_ast::FrameBound::Following(expr),
+                        ) = &frame.end
+                        {
+                            self.resolve_expr(expr, scope);
                         }
                     }
                 }

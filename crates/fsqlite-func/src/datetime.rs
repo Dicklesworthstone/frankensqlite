@@ -50,20 +50,27 @@ fn ymd_to_jdn(y: i64, m: i64, d: i64) -> f64 {
 }
 
 /// Julian Day Number → Gregorian (year, month, day).
+///
+/// Uses saturating/wrapping-safe arithmetic so that extreme JDN values
+/// (from overflowed modifier chains) produce deterministic garbage rather
+/// than panicking.  Callers that care about validity should bounds-check
+/// the JDN before calling.
 fn jdn_to_ymd(jdn: f64) -> (i64, i64, i64) {
     let z = (jdn + 0.5).floor() as i64;
     let a = if z < 2_299_161 {
         z
     } else {
         let alpha = ((z as f64 - 1_867_216.25) / 36524.25).floor() as i64;
-        z + 1 + alpha - alpha / 4
+        z.saturating_add(1)
+            .saturating_add(alpha)
+            .saturating_sub(alpha / 4)
     };
-    let b = a + 1524;
+    let b = a.saturating_add(1524);
     let c = ((b as f64 - 122.1) / 365.25).floor() as i64;
     let d = (365.25 * c as f64).floor() as i64;
-    let e = ((b - d) as f64 / 30.6001).floor() as i64;
+    let e = ((b.saturating_sub(d)) as f64 / 30.6001).floor() as i64;
 
-    let day = b - d - (30.6001 * e as f64).floor() as i64;
+    let day = b.saturating_sub(d).saturating_sub((30.6001 * e as f64).floor() as i64);
     let month = if e < 14 { e - 1 } else { e - 13 };
     let year = if month > 2 { c - 4716 } else { c - 4715 };
     (year, month, day)
@@ -358,11 +365,13 @@ fn apply_modifiers(jdn: f64, modifiers: &[String]) -> Option<(f64, bool)> {
             subsec = true;
         }
         // Month/year modifiers need special handling for exact date math.
+        // If exact arithmetic overflows (returns None), the modifier is
+        // out of representable range — return NULL rather than falling
+        // through to the approximate path which would produce overflow
+        // panics in jdn_to_ymd.
         if is_month_year_modifier(&m_lower) {
-            if let Some(exact_jdn) = apply_month_year_exact(j, &m_lower) {
-                j = exact_jdn;
-                continue;
-            }
+            j = apply_month_year_exact(j, &m_lower)?;
+            continue;
         }
         j = apply_modifier(j, m)?;
     }
