@@ -44,6 +44,7 @@ mod tests {
         let program = b.finish().expect("program builds");
         let mut engine = VdbeEngine::new(program.register_count());
         engine.set_database(db);
+        engine.set_reject_mem_fallback(false);
 
         let outcome = engine.execute(&program).expect("program executes");
         assert!(matches!(outcome, ExecOutcome::Done));
