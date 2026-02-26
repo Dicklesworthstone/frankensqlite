@@ -7687,6 +7687,7 @@ mod tests {
         let mut engine = VdbeEngine::new(prog.register_count());
         engine.enable_storage_cursors(false);
         engine.set_database(db);
+        engine.set_reject_mem_fallback(false);
 
         let outcome = engine.execute(&prog).expect("execution should succeed");
         assert_eq!(
@@ -7820,6 +7821,7 @@ mod tests {
         let mut engine = VdbeEngine::new(8);
         engine.enable_storage_cursors(true);
         engine.set_database(db);
+        engine.set_reject_mem_fallback(false);
 
         // Without a transaction, should fall back to Mem backend.
         let opened = engine.open_storage_cursor(0, root, false);
