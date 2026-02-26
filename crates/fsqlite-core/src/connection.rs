@@ -19358,7 +19358,7 @@ mod tests {
         for worker_id in 0..WORKERS {
             let db = db.clone();
             let barrier = Arc::clone(&start_barrier);
-            handles.push(std::thread::spawn(move || -> (i64, u64) {
+            handles.push(std::thread::spawn(move || -> (Vec<i64>, u64) {
                 let conn = Connection::open(&db).unwrap();
                 conn.execute("PRAGMA busy_timeout=5000;").unwrap();
                 conn.execute("PRAGMA fsqlite.concurrent_mode=ON;").unwrap();
@@ -19367,7 +19367,7 @@ mod tests {
                 // deterministic per-worker operation streams.
                 barrier.wait();
 
-                let mut committed_delta = 0_i64;
+                let mut per_account_delta = vec![0_i64; usize::try_from(ACCOUNT_COUNT).unwrap()];
                 let mut transient_retries = 0_u64;
                 for txn_index in 0..TXNS_PER_WORKER {
                     let account = ((worker_id * TXNS_PER_WORKER + txn_index)
@@ -19382,6 +19382,22 @@ mod tests {
                         )) {
                             Ok(changes) => {
                                 assert_eq!(changes, 1, "expected one-row account update");
+                                let session_id = conn
+                                    .concurrent_session_id
+                                    .borrow()
+                                    .expect("concurrent session should stay active after UPDATE");
+                                let write_set_len = {
+                                    let registry = lock_unpoisoned(&conn.concurrent_registry);
+                                    registry
+                                        .get(session_id)
+                                        .expect("concurrent session handle missing after UPDATE")
+                                        .write_set_len()
+                                };
+                                assert!(
+                                    write_set_len > 0,
+                                    "UPDATE reported success but concurrent write set is empty \
+                                     (worker={worker_id} txn={txn_index} account={account} amount={amount})"
+                                );
                             }
                             Err(err) if err.is_transient() => {
                                 transient_retries += 1;
@@ -19397,7 +19413,7 @@ mod tests {
 
                         match conn.execute("COMMIT;") {
                             Ok(_) => {
-                                committed_delta += amount;
+                                per_account_delta[account - 1] += amount;
                                 break;
                             }
                             Err(err) if err.is_transient() => {
@@ -19413,15 +19429,19 @@ mod tests {
                     }
                 }
 
-                (committed_delta, transient_retries)
+                (per_account_delta, transient_retries)
             }));
         }
 
+        let mut expected_per_account = vec![0_i64; usize::try_from(ACCOUNT_COUNT).unwrap()];
         let mut expected_delta = 0_i64;
         let mut total_retries = 0_u64;
         for handle in handles {
-            let (delta, retries) = handle.join().expect("worker thread should not panic");
-            expected_delta += delta;
+            let (deltas, retries) = handle.join().expect("worker thread should not panic");
+            for (index, delta) in deltas.into_iter().enumerate() {
+                expected_per_account[index] += delta;
+                expected_delta += delta;
+            }
             total_retries += retries;
         }
 
@@ -19433,11 +19453,131 @@ mod tests {
             None => panic!("sum query returned no column"),
         };
         let initial_sum = ACCOUNT_COUNT * INITIAL_BALANCE;
+        let expected_sum = initial_sum + expected_delta;
+
+        let rows = verifier
+            .query("SELECT id, balance FROM accounts ORDER BY id;")
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            usize::try_from(ACCOUNT_COUNT).unwrap(),
+            "expected one balance row per account"
+        );
+        let mut mismatches = Vec::new();
+        for (index, row) in rows.iter().enumerate() {
+            let expected_id = i64::try_from(index + 1).unwrap();
+            let id = match row.get(0) {
+                Some(SqliteValue::Integer(value)) => *value,
+                Some(other) => panic!("expected integer account id, got {other:?}"),
+                None => panic!("account row missing id column"),
+            };
+            assert_eq!(id, expected_id, "unexpected account id ordering");
+            let balance = match row.get(1) {
+                Some(SqliteValue::Integer(value)) => *value,
+                Some(other) => panic!("expected integer balance, got {other:?}"),
+                None => panic!("account row missing balance column"),
+            };
+            let expected_balance = INITIAL_BALANCE + expected_per_account[index];
+            if balance != expected_balance {
+                mismatches.push(format!(
+                    "id={id} expected_balance={expected_balance} actual_balance={balance}"
+                ));
+            }
+        }
+        let mismatch_preview = mismatches
+            .iter()
+            .take(8)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
         assert_eq!(
             final_sum,
-            initial_sum + expected_delta,
-            "bd-rjc sum probe mismatch: final_sum={final_sum} expected_sum={} initial_sum={initial_sum} expected_delta={expected_delta} retries={total_retries}",
-            initial_sum + expected_delta
+            expected_sum,
+            "bd-rjc sum probe mismatch: final_sum={final_sum} expected_sum={expected_sum} initial_sum={initial_sum} expected_delta={expected_delta} retries={total_retries} mismatches={} sample=[{}]",
+            mismatches.len(),
+            mismatch_preview
+        );
+        assert!(
+            mismatches.is_empty(),
+            "bd-rjc per-account drift detected ({} mismatches): {}",
+            mismatches.len(),
+            mismatch_preview
+        );
+    }
+
+    #[test]
+    fn test_concurrent_single_account_increment_invariant_probe_bd_rjc() {
+        const WORKERS: usize = 2;
+        const TXNS_PER_WORKER: usize = 320;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("bd_rjc_single_account_probe.db");
+        let db = db_path.to_string_lossy().to_string();
+
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute("PRAGMA busy_timeout=5000;").unwrap();
+            conn.execute("PRAGMA fsqlite.concurrent_mode=ON;").unwrap();
+            conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL);")
+                .unwrap();
+            conn.execute("INSERT INTO t (id, v) VALUES (1, 0);").unwrap();
+        }
+
+        let start_barrier = Arc::new(std::sync::Barrier::new(WORKERS));
+        let mut handles = Vec::with_capacity(WORKERS);
+        for _worker_id in 0..WORKERS {
+            let db = db.clone();
+            let barrier = Arc::clone(&start_barrier);
+            handles.push(std::thread::spawn(move || -> u64 {
+                let conn = Connection::open(&db).unwrap();
+                conn.execute("PRAGMA busy_timeout=5000;").unwrap();
+                conn.execute("PRAGMA fsqlite.concurrent_mode=ON;").unwrap();
+                barrier.wait();
+                let mut retries = 0_u64;
+                for _ in 0..TXNS_PER_WORKER {
+                    loop {
+                        conn.execute("BEGIN CONCURRENT;").unwrap();
+                        match conn.execute("UPDATE t SET v = v + 1 WHERE id = 1;") {
+                            Ok(changes) => {
+                                assert_eq!(changes, 1, "expected one-row update");
+                            }
+                            Err(err) if err.is_transient() => {
+                                retries += 1;
+                                let _ = conn.execute("ROLLBACK;");
+                                continue;
+                            }
+                            Err(err) => panic!("non-transient update failure: {err}"),
+                        }
+                        match conn.execute("COMMIT;") {
+                            Ok(_) => break,
+                            Err(err) if err.is_transient() => {
+                                retries += 1;
+                                let _ = conn.execute("ROLLBACK;");
+                            }
+                            Err(err) => panic!("non-transient commit failure: {err}"),
+                        }
+                    }
+                }
+                retries
+            }));
+        }
+
+        let mut retries = 0_u64;
+        for handle in handles {
+            retries += handle.join().expect("worker should not panic");
+        }
+
+        let verifier = Connection::open(&db).unwrap();
+        let row = verifier.query_row("SELECT v FROM t WHERE id = 1;").unwrap();
+        let final_value = match row.get(0) {
+            Some(SqliteValue::Integer(value)) => *value,
+            Some(other) => panic!("expected integer final value, got {other:?}"),
+            None => panic!("missing final value column"),
+        };
+        let expected = i64::try_from(WORKERS * TXNS_PER_WORKER).unwrap();
+        assert_eq!(
+            final_value, expected,
+            "bd-rjc single-account probe mismatch: final_value={final_value} expected={expected} retries={retries}"
         );
     }
 
