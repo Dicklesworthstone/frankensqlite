@@ -1,0 +1,310 @@
+# Corpus Manifest v1.0.0
+#
+# Bead: bd-2yqp6.3.1
+# Purpose: category-complete golden corpus contract with deterministic shard
+# replay metadata and stable shard bundle hashes.
+
+[meta]
+schema_version = "1.0.0"
+bead_id = "bd-2yqp6.3.1"
+track_id = "bd-2yqp6.3"
+sqlite_target = "3.52.0"
+generated_at = "2026-02-26"
+contract_owner = "track-c-corpus-owner"
+root_seed = 3520
+
+[[category_floors]]
+category = "ddl"
+min_entries = 4
+
+[[category_floors]]
+category = "dml"
+min_entries = 4
+
+[[category_floors]]
+category = "joins"
+min_entries = 2
+
+[[category_floors]]
+category = "windows"
+min_entries = 1
+
+[[category_floors]]
+category = "ctes"
+min_entries = 1
+
+[[category_floors]]
+category = "triggers"
+min_entries = 1
+
+[[category_floors]]
+category = "views"
+min_entries = 1
+
+[[category_floors]]
+category = "functions"
+min_entries = 3
+
+[[category_floors]]
+category = "pragma"
+min_entries = 2
+
+[[category_floors]]
+category = "error_paths"
+min_entries = 3
+
+# --- Core DDL / DML / JOINS shard ---
+
+[[entries]]
+entry_id = "C1-001"
+title = "CREATE TABLE baseline"
+category = "ddl"
+source = "crates/fsqlite-harness/conformance/001_basic_create_insert_select.json"
+in_scope = true
+feature_ids = ["F-SQL.16"]
+shard_id = "core-ddl-dml-joins"
+execution_required = true
+
+[[entries]]
+entry_id = "C1-002"
+title = "CREATE INDEX and ORDER BY"
+category = "ddl"
+source = "crates/fsqlite-harness/conformance/010_index_and_ordering.json"
+in_scope = true
+feature_ids = ["F-SQL.22"]
+shard_id = "core-ddl-dml-joins"
+execution_required = true
+
+[[entries]]
+entry_id = "C1-003"
+title = "ALTER TABLE add column"
+category = "ddl"
+source = "seed://ddl/alter_table_add_column"
+in_scope = true
+feature_ids = ["F-SQL.26"]
+shard_id = "core-ddl-dml-joins"
+execution_required = false
+
+[[entries]]
+entry_id = "C1-004"
+title = "DROP TABLE with IF EXISTS"
+category = "ddl"
+source = "seed://ddl/drop_table_if_exists"
+in_scope = true
+feature_ids = ["F-SQL.27"]
+shard_id = "core-ddl-dml-joins"
+execution_required = false
+
+[[entries]]
+entry_id = "C1-005"
+title = "INSERT basic and multi-row"
+category = "dml"
+source = "crates/fsqlite-harness/conformance/001_basic_create_insert_select.json"
+in_scope = true
+feature_ids = ["F-SQL.10"]
+shard_id = "core-ddl-dml-joins"
+execution_required = true
+
+[[entries]]
+entry_id = "C1-006"
+title = "INSERT conflict resolution"
+category = "dml"
+source = "crates/fsqlite-harness/conformance/003_unique_constraint.json"
+in_scope = true
+feature_ids = ["F-SQL.11"]
+shard_id = "core-ddl-dml-joins"
+execution_required = true
+
+[[entries]]
+entry_id = "C1-007"
+title = "UPDATE with predicate"
+category = "dml"
+source = "crates/fsqlite-harness/conformance/008_update_delete.json"
+in_scope = true
+feature_ids = ["F-SQL.14"]
+shard_id = "core-ddl-dml-joins"
+execution_required = true
+
+[[entries]]
+entry_id = "C1-008"
+title = "DELETE with predicate"
+category = "dml"
+source = "crates/fsqlite-harness/conformance/008_update_delete.json"
+in_scope = true
+feature_ids = ["F-SQL.15"]
+shard_id = "core-ddl-dml-joins"
+execution_required = true
+
+[[entries]]
+entry_id = "C1-009"
+title = "JOIN inner and left coverage"
+category = "joins"
+source = "crates/fsqlite-harness/conformance/006_join_basic.json"
+in_scope = true
+feature_ids = ["F-SQL.02"]
+shard_id = "core-ddl-dml-joins"
+execution_required = true
+
+[[entries]]
+entry_id = "C1-010"
+title = "JOIN with subquery predicate"
+category = "joins"
+source = "crates/fsqlite-harness/conformance/007_subquery.json"
+in_scope = true
+feature_ids = ["F-SQL.02", "F-SQL.06"]
+shard_id = "core-ddl-dml-joins"
+execution_required = true
+
+# --- Advanced SQL features shard ---
+
+[[entries]]
+entry_id = "C1-011"
+title = "Window function ranking"
+category = "windows"
+source = "seed://sql/window_rank_row_number"
+in_scope = true
+feature_ids = ["F-SQL.05", "F-FUN.16"]
+shard_id = "advanced-sql-features"
+execution_required = false
+
+[[entries]]
+entry_id = "C1-012"
+title = "WITH RECURSIVE expansion"
+category = "ctes"
+source = "seed://sql/cte_recursive"
+in_scope = true
+feature_ids = ["F-SQL.04"]
+shard_id = "advanced-sql-features"
+execution_required = false
+
+[[entries]]
+entry_id = "C1-013"
+title = "CREATE TRIGGER before insert"
+category = "triggers"
+source = "seed://sql/trigger_before_insert"
+in_scope = true
+feature_ids = ["F-SQL.24"]
+shard_id = "advanced-sql-features"
+execution_required = false
+
+[[entries]]
+entry_id = "C1-014"
+title = "CREATE VIEW and query expansion"
+category = "views"
+source = "seed://sql/view_projection"
+in_scope = true
+feature_ids = ["F-SQL.23"]
+shard_id = "advanced-sql-features"
+execution_required = false
+
+[[entries]]
+entry_id = "C1-015"
+title = "Aggregate function suite"
+category = "functions"
+source = "crates/fsqlite-harness/conformance/005_aggregate_functions.json"
+in_scope = true
+feature_ids = ["F-FUN.05"]
+shard_id = "advanced-sql-features"
+execution_required = true
+
+[[entries]]
+entry_id = "C1-016"
+title = "Scalar function suite"
+category = "functions"
+source = "crates/fsqlite-harness/conformance/009_expressions_and_functions.json"
+in_scope = true
+feature_ids = ["F-FUN.01", "F-FUN.02"]
+shard_id = "advanced-sql-features"
+execution_required = true
+
+[[entries]]
+entry_id = "C1-017"
+title = "NULL and expression function semantics"
+category = "functions"
+source = "crates/fsqlite-harness/conformance/002_null_handling.json"
+in_scope = true
+feature_ids = ["F-FUN.03", "F-SQL.32"]
+shard_id = "advanced-sql-features"
+execution_required = true
+
+# --- PRAGMA + Error-path shard ---
+
+[[entries]]
+entry_id = "C1-018"
+title = "PRAGMA page/cache settings"
+category = "pragma"
+source = "seed://pragma/page_cache_controls"
+in_scope = true
+feature_ids = ["F-PGM.01", "F-PGM.04"]
+shard_id = "pragma-and-error-paths"
+execution_required = true
+
+[[entries]]
+entry_id = "C1-019"
+title = "PRAGMA journal/synchronous controls"
+category = "pragma"
+source = "seed://pragma/journal_synchronous"
+in_scope = true
+feature_ids = ["F-PGM.02", "F-PGM.03"]
+shard_id = "pragma-and-error-paths"
+execution_required = true
+
+[[entries]]
+entry_id = "C1-020"
+title = "Parser syntax error path"
+category = "error_paths"
+source = "crates/fsqlite-harness/conformance/012_syntax_error.json"
+in_scope = true
+feature_ids = ["F-SQL.32"]
+shard_id = "pragma-and-error-paths"
+execution_required = true
+
+[[entries]]
+entry_id = "C1-021"
+title = "Compound ORDER BY error path"
+category = "error_paths"
+source = "crates/fsqlite-harness/conformance/015_compound_order_by_error.json"
+in_scope = true
+feature_ids = ["F-SQL.03"]
+shard_id = "pragma-and-error-paths"
+execution_required = true
+
+[[entries]]
+entry_id = "C1-022"
+title = "UNIQUE conflict error path"
+category = "error_paths"
+source = "crates/fsqlite-harness/conformance/003_unique_constraint.json"
+in_scope = true
+feature_ids = ["F-SQL.11"]
+shard_id = "pragma-and-error-paths"
+execution_required = true
+
+[[shards]]
+shard_id = "core-ddl-dml-joins"
+scenario_id = "PARITY-CORPUS-C1-SHARD-CORE"
+seed = 3520
+run_id_template = "bd-2yqp6.3.1-core-ddl-dml-joins-{seed}"
+trace_id_template = "trace-bd-2yqp6.3.1-core-ddl-dml-joins-{seed}"
+replay_command = "SHARD_ID=core-ddl-dml-joins SEED=3520 bash scripts/verify_bd_2yqp6_3_1_corpus_manifest.sh"
+entry_ids = ["C1-001", "C1-002", "C1-003", "C1-004", "C1-005", "C1-006", "C1-007", "C1-008", "C1-009", "C1-010"]
+bundle_hash = "d003ab79b6182b01bdc62d2c22f277be804bea4f125b097781b5f9437afe2f07"
+
+[[shards]]
+shard_id = "advanced-sql-features"
+scenario_id = "PARITY-CORPUS-C1-SHARD-ADV"
+seed = 3521
+run_id_template = "bd-2yqp6.3.1-advanced-sql-features-{seed}"
+trace_id_template = "trace-bd-2yqp6.3.1-advanced-sql-features-{seed}"
+replay_command = "SHARD_ID=advanced-sql-features SEED=3521 bash scripts/verify_bd_2yqp6_3_1_corpus_manifest.sh"
+entry_ids = ["C1-011", "C1-012", "C1-013", "C1-014", "C1-015", "C1-016", "C1-017"]
+bundle_hash = "42109d8d35840ea9f943d22e2c86350b35f8e68a7c33222fb20341fdf017da4b"
+
+[[shards]]
+shard_id = "pragma-and-error-paths"
+scenario_id = "PARITY-CORPUS-C1-SHARD-GUARD"
+seed = 3522
+run_id_template = "bd-2yqp6.3.1-pragma-and-error-paths-{seed}"
+trace_id_template = "trace-bd-2yqp6.3.1-pragma-and-error-paths-{seed}"
+replay_command = "SHARD_ID=pragma-and-error-paths SEED=3522 bash scripts/verify_bd_2yqp6_3_1_corpus_manifest.sh"
+entry_ids = ["C1-018", "C1-019", "C1-020", "C1-021", "C1-022"]
+bundle_hash = "59765af1c2ef2f8607b99c1ce36012d8fb00b7df728a59d20e0e7ad0e094e37b"

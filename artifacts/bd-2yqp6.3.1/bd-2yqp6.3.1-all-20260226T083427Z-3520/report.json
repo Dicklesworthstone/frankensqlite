@@ -1,0 +1,14 @@
+{
+  "trace_id": "trace-bd-2yqp6.3.1-all-20260226T083427Z-3520",
+  "run_id": "bd-2yqp6.3.1-all-20260226T083427Z-3520",
+  "scenario_id": "PARITY-CORPUS-C1",
+  "seed": 3520,
+  "shard_id": "all",
+  "bead_id": "bd-2yqp6.3.1",
+  "manifest_path": "corpus_manifest.toml",
+  "manifest_sha256": "cad2f1b2fb0c566ffb0d4c4caa8fe3b7b62f7531641881b6f25c77d5f2867bd7",
+  "events_jsonl": "artifacts/bd-2yqp6.3.1/bd-2yqp6.3.1-all-20260226T083427Z-3520/events.jsonl",
+  "test_log": "artifacts/bd-2yqp6.3.1/bd-2yqp6.3.1-all-20260226T083427Z-3520/cargo-test.log",
+  "test_log_sha256": "5ffe96d231a133bec073d4b249eec7efb3f2d188a10e68924ebe9c3240228d3f",
+  "result": "pass"
+}
