@@ -1654,7 +1654,13 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
                 Ok(true) => Ok(()),
                 Ok(false) => {
                     // Page full — balance and redistribute.
-                    cursor.balance_for_insert(cx, &cell_data, insert_idx)
+                    let balance_result = cursor.balance_for_insert(cx, &cell_data, insert_idx);
+                    if balance_result.is_err() {
+                        if let Some(first) = overflow_head {
+                            let _ = cursor.free_overflow_chain(cx, first);
+                        }
+                    }
+                    balance_result
                 }
                 Err(error) => {
                     if let Some(first) = overflow_head {
@@ -1691,7 +1697,13 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
                 Ok(true) => Ok(()),
                 Ok(false) => {
                     // Page full — balance and redistribute.
-                    cursor.balance_for_insert(cx, &cell_data, insert_idx)
+                    let balance_result = cursor.balance_for_insert(cx, &cell_data, insert_idx);
+                    if balance_result.is_err() {
+                        if let Some(first) = overflow_head {
+                            let _ = cursor.free_overflow_chain(cx, first);
+                        }
+                    }
+                    balance_result
                 }
                 Err(error) => {
                     if let Some(first) = overflow_head {

@@ -244,6 +244,10 @@ pub enum FrankenError {
     /// Attempt to write a read-only database or virtual table.
     #[error("attempt to write a readonly database")]
     ReadOnly,
+
+    /// Execution error within the VDBE bytecode engine.
+    #[error("VDBE execution error: {detail}")]
+    VdbeExecutionError { detail: String },
 }
 
 /// SQLite result/error codes for wire protocol compatibility.
@@ -373,6 +377,7 @@ impl FrankenError {
             Self::OutOfMemory => ErrorCode::NoMem,
             Self::Unsupported => ErrorCode::NoLfs,
             Self::ReadOnly => ErrorCode::ReadOnly,
+            Self::VdbeExecutionError { .. } => ErrorCode::Error,
         }
     }
 

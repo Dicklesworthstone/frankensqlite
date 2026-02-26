@@ -20,6 +20,7 @@ sha2 = { workspace = true }
 tracing = { workspace = true }
 xxhash-rust = { workspace = true }
 parking_lot = { workspace = true }
+rusqlite = { workspace = true }
 
 [dev-dependencies]
 blake3 = { workspace = true }
@@ -28,7 +29,6 @@ serde_json = { workspace = true }
 tempfile = { workspace = true }
 toml = { workspace = true }
 trybuild = "1.0"
-rusqlite = { workspace = true }
 fsqlite-ast = { workspace = true }
 fsqlite-btree = { workspace = true }
 fsqlite-core = { workspace = true }

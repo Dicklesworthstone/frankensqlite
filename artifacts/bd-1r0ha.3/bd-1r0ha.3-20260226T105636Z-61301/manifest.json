@@ -1,0 +1,13 @@
+{
+  "bead_id": "bd-1r0ha.3",
+  "scenario_id": "MVCC-CONCURRENT-WRITER-E2E",
+  "run_id": "bd-1r0ha.3-20260226T105636Z-61301",
+  "trace_id": "trace-bd-1r0ha.3-20260226T105636Z-61301",
+  "seed": 61301,
+  "replay_command": "cargo test -p fsqlite-e2e --test bd_1r0ha_3_concurrent_writer_e2e -- --nocapture --test-threads=1",
+  "artifacts": [
+    {"path":"artifacts/bd-1r0ha.3/bd-1r0ha.3-20260226T105636Z-61301/events.jsonl","sha256":"1d5158874f106e3cc9e3c66e52ec445bdf1fa64b31f2c6e910518a58ac21257e"},
+    {"path":"artifacts/bd-1r0ha.3/bd-1r0ha.3-20260226T105636Z-61301/bd_1r0ha_3_test.log","sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},
+    {"path":"artifacts/bd-1r0ha.3/bd-1r0ha.3-20260226T105636Z-61301/scenario_summary.jsonl","sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}
+  ]
+}

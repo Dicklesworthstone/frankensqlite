@@ -441,14 +441,14 @@ fn eval_function(name: &str, args: &[SqliteValue]) -> Result<SqliteValue, IndexR
         }
         "lower" => {
             if let Some(SqliteValue::Text(s)) = args.first() {
-                Ok(SqliteValue::Text(s.to_lowercase()))
+                Ok(SqliteValue::Text(s.to_ascii_lowercase()))
             } else {
                 Ok(args.first().cloned().unwrap_or(SqliteValue::Null))
             }
         }
         "upper" => {
             if let Some(SqliteValue::Text(s)) = args.first() {
-                Ok(SqliteValue::Text(s.to_uppercase()))
+                Ok(SqliteValue::Text(s.to_ascii_uppercase()))
             } else {
                 Ok(args.first().cloned().unwrap_or(SqliteValue::Null))
             }

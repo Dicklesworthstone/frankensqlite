@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use fsqlite_harness::differential_v2::{
-    self, DifferentialResult, ExecutionEnvelope, FsqliteExecutor, NormalizedValue, Outcome,
-    SqlExecutor,
+    self, DifferentialResult, EngineIdentity, ExecutionEnvelope, FsqliteExecutor, NormalizedValue,
+    Outcome, SqlExecutor,
 };
 use serde_json::json;
 
@@ -60,6 +60,10 @@ impl SqlExecutor for RusqliteExecutor {
         rows.collect::<Result<Vec<_>, _>>().map_err(|error| {
             format!("bead_id={BEAD_ID} case=sqlite_collect_failed sql={sql:?} error={error}")
         })
+    }
+
+    fn engine_identity(&self) -> EngineIdentity {
+        EngineIdentity::CSqliteOracle
     }
 }
 

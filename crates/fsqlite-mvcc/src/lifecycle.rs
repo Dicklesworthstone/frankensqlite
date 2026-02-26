@@ -1095,6 +1095,10 @@ impl TransactionManager {
                 let prev_idx = self.version_store.chain_head(pgno);
                 let prev = prev_idx.map(crate::invariants::idx_to_version_pointer);
 
+                if let Some(idx) = prev_idx {
+                    txn.defer_retire_version(idx);
+                }
+
                 let version = PageVersion {
                     pgno,
                     commit_seq,

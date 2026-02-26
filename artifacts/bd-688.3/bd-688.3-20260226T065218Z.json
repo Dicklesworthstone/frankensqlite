@@ -1,0 +1,40 @@
+{
+  "bead_id": "bd-688.3",
+  "run_id": "bd-688.3-20260226T065218Z",
+  "trace_id": "bd-688.3-20260226T065218Z-trace",
+  "scenario_id": "bd6883_latchfree_version_chain_verify",
+  "created_at_utc": "20260226T065218Z",
+  "overall_status": "failed",
+  "log_file": "artifacts/bd-688.3/bd-688.3-20260226T065218Z.log",
+  "steps": [
+    {
+      "name": "mvcc_unit_tests",
+      "status": "passed",
+      "command": "cargo test -p fsqlite-mvcc -- invariants::tests gc::tests --nocapture"
+    },
+    {
+      "name": "loom_model_check",
+      "status": "passed",
+      "command": "cargo test -p fsqlite-mvcc loom_chain_head_publication_linearizable -- --nocapture"
+    },
+    {
+      "name": "harness_integration_tests",
+      "status": "failed",
+      "command": "cargo test -p fsqlite-harness --test bd_688_3_latchfree_version_chain -- --nocapture"
+    },
+    {
+      "name": "clippy",
+      "status": "passed",
+      "command": "cargo clippy -p fsqlite-mvcc --all-targets -- -D warnings"
+    }
+  ],
+  "acceptance_mapping": {
+    "1_lock_free_cas_first_attempt_ratio_gt_95": true,
+    "2_no_aba_problems": false,
+    "3_correct_under_64_thread_stress": true,
+    "4_loom_model_check_passes": true,
+    "5_comprehensive_unit_property_tests": true,
+    "6_deterministic_e2e_script_with_replay": true,
+    "7_structured_logging_metrics_context": true
+  }
+}

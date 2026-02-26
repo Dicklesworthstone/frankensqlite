@@ -1,0 +1,19 @@
+{
+  "trace_id": "trace-bd-26631.1-20260226T114105Z-2663101",
+  "run_id": "bd-26631.1-20260226T114105Z-2663101",
+  "scenario_id": "WAL-REPLAY-STARTUP-DETERMINISTIC",
+  "seed": 2663101,
+  "bead_id": "bd-26631.1",
+  "events_jsonl": "artifacts/bd-26631.1/bd-26631.1-20260226T114105Z-2663101/events.jsonl",
+  "scenario_summary_jsonl": "artifacts/bd-26631.1/bd-26631.1-20260226T114105Z-2663101/scenario_summary.jsonl",
+  "scenario_summary_rows": 4,
+  "contract_log": "artifacts/bd-26631.1/bd-26631.1-20260226T114105Z-2663101/contract-check.log",
+  "contract_log_sha256": "20e5cf0bb5986af74018b1f6a7d38d3a115ded48a9797aa688e7327c16287baf",
+  "test_log": "artifacts/bd-26631.1/bd-26631.1-20260226T114105Z-2663101/cargo-test-bd_26631_1_deterministic_replay_startup.log",
+  "test_log_sha256": "39cf177e50e0a8d3f9f1d61182d7092846ebb72ea9ffd133439d8b5c7d2b3a8a",
+  "regression_log": "artifacts/bd-26631.1/bd-26631.1-20260226T114105Z-2663101/cargo-test-replay-regression.log",
+  "regression_log_sha256": "81055b871371ae35fa3d832605cc5a6c2db257d9215dbd18fae243384ff97371",
+  "manifest_json": "artifacts/bd-26631.1/bd-26631.1-20260226T114105Z-2663101/manifest.json",
+  "manifest_sha256": "d1969b823b8afdaf9428d9f30f40c4497ab26a577843ca0e3836662fb3a31f37",
+  "result": "pass"
+}

@@ -1,0 +1,14 @@
+{
+  "trace_id": "trace-bd-xfn30.3-20260226T100017Z-40101",
+  "run_id": "bd-xfn30.3-20260226T100017Z-40101",
+  "scenario_id": "WAL-FAULT-MATRIX-E2E",
+  "seed": 40101,
+  "bead_id": "bd-xfn30.3",
+  "files": [
+    {"path":"artifacts/bd-xfn30.3/bd-xfn30.3-20260226T100017Z-40101/events.jsonl"},
+    {"path":"artifacts/bd-xfn30.3/bd-xfn30.3-20260226T100017Z-40101/contract-check.log","sha256":"deae6239b2859b878e521f6cacaea6be9e419d3468f86437e0b106f0c8da35a3"},
+    {"path":"artifacts/bd-xfn30.3/bd-xfn30.3-20260226T100017Z-40101/cargo-test-bd_xfn30_3_fault_injection_matrix.log","sha256":"0efae0990aa7230ecca85b5bc59ccb07bbcb2f3aabc820b19f731c316112a2a8"},
+    {"path":"artifacts/bd-xfn30.3/bd-xfn30.3-20260226T100017Z-40101/cargo-test-wal-crash-matrix-regression.log","sha256":"d1eb0115004434d5e334393953249dee5535bdc60f371a7c336497a3b7346182"},
+    {"path":"artifacts/bd-xfn30.3/bd-xfn30.3-20260226T100017Z-40101/scenario_summary.jsonl","sha256":"a3f6d458b602df3a69c75357656805af41748985f159b93f16e50729bd6b1d29"}
+  ]
+}

@@ -1015,4 +1015,431 @@ mod tests {
         );
         assert_eq!(cache.io_writes(), 0, "eviction must remain memory-only");
     }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // bd-2ttd8.2: Pager invariant suite — ARC structural invariants
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// Assert all ARC structural invariants hold for a given cache state.
+    fn assert_arc_invariants(cache: &ArcCache) {
+        let bead = "bd-2ttd8.2";
+
+        // INV-1: Every indexed page is in exactly T1 xor T2.
+        for key in cache.index.keys().copied() {
+            let in_t1 = cache.in_t1(key);
+            let in_t2 = cache.in_t2(key);
+            assert!(
+                in_t1 ^ in_t2,
+                "bead_id={bead} inv=resident_in_exactly_one key={key:?} in_t1={in_t1} in_t2={in_t2}"
+            );
+        }
+
+        // INV-2: T1 and T2 entries are all in the index.
+        for key in cache.t1.ordered_keys() {
+            assert!(
+                cache.index.contains_key(&key),
+                "bead_id={bead} inv=t1_entry_in_index key={key:?}"
+            );
+        }
+        for key in cache.t2.ordered_keys() {
+            assert!(
+                cache.index.contains_key(&key),
+                "bead_id={bead} inv=t2_entry_in_index key={key:?}"
+            );
+        }
+
+        // INV-3: |T1| + |T2| == |index|
+        assert_eq!(
+            cache.t1.len() + cache.t2.len(),
+            cache.index.len(),
+            "bead_id={bead} inv=resident_count_matches"
+        );
+
+        // INV-4: Ghost lists B1/B2 are disjoint from each other.
+        for key in cache.b1.ordered_keys() {
+            assert!(
+                !cache.in_b2(key),
+                "bead_id={bead} inv=b1_b2_disjoint key={key:?}"
+            );
+        }
+
+        // INV-5: Ghost lists are disjoint from resident sets.
+        for key in cache.b1.ordered_keys() {
+            assert!(
+                !cache.index.contains_key(&key),
+                "bead_id={bead} inv=b1_not_resident key={key:?}"
+            );
+        }
+        for key in cache.b2.ordered_keys() {
+            assert!(
+                !cache.index.contains_key(&key),
+                "bead_id={bead} inv=b2_not_resident key={key:?}"
+            );
+        }
+
+        // INV-6: total_bytes == Σ page.byte_size for all indexed pages.
+        let computed_bytes: usize = cache.index.values().map(|p| p.byte_size).sum();
+        assert_eq!(
+            cache.total_bytes, computed_bytes,
+            "bead_id={bead} inv=total_bytes_consistent"
+        );
+
+        // INV-7: 0 ≤ p ≤ capacity.
+        assert!(
+            cache.p <= cache.capacity,
+            "bead_id={bead} inv=p_in_range p={} capacity={}",
+            cache.p,
+            cache.capacity
+        );
+
+        // INV-8: Ghost lists are bounded (≤ capacity after trim).
+        assert!(
+            cache.b1.len() <= cache.capacity,
+            "bead_id={bead} inv=b1_bounded len={} cap={}",
+            cache.b1.len(),
+            cache.capacity
+        );
+        assert!(
+            cache.b2.len() <= cache.capacity,
+            "bead_id={bead} inv=b2_bounded len={} cap={}",
+            cache.b2.len(),
+            cache.capacity
+        );
+
+        // INV-9: io_writes always zero (eviction is memory-only).
+        assert_eq!(
+            cache.io_writes, 0,
+            "bead_id={bead} inv=eviction_zero_io"
+        );
+    }
+
+    #[test]
+    fn test_inv_pin_unpin_symmetry_single() {
+        let mut cache = ArcCache::new(4, 4 * 4096);
+        let k = key(1, 0);
+        let _ = cache.access_or_insert(page(k, PageSize::DEFAULT, 0xAA));
+
+        let p = cache.get(k).unwrap();
+        assert!(!p.is_pinned());
+
+        p.pin();
+        assert!(p.is_pinned());
+        assert_eq!(p.ref_count.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+        p.unpin();
+        assert!(!p.is_pinned());
+        assert_eq!(p.ref_count.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_inv_pin_unpin_symmetry_multiple() {
+        let mut cache = ArcCache::new(4, 4 * 4096);
+        let k = key(1, 0);
+        let _ = cache.access_or_insert(page(k, PageSize::DEFAULT, 0xBB));
+
+        let p = cache.get(k).unwrap();
+        for _ in 0..5 {
+            p.pin();
+        }
+        assert_eq!(p.ref_count.load(std::sync::atomic::Ordering::Relaxed), 5);
+
+        for i in (0..5).rev() {
+            p.unpin();
+            assert_eq!(
+                p.ref_count.load(std::sync::atomic::Ordering::Relaxed),
+                i as u32
+            );
+        }
+        assert!(!p.is_pinned());
+    }
+
+    #[test]
+    fn test_inv_structural_after_sequential_inserts() {
+        let mut cache = ArcCache::new(4, 4 * 4096);
+        for pgno in 1..=8 {
+            let k = key(pgno, 0);
+            let _ = cache.access_or_insert(page(
+                k,
+                PageSize::DEFAULT,
+                u8::try_from(pgno).unwrap(),
+            ));
+            assert_arc_invariants(&cache);
+        }
+    }
+
+    #[test]
+    fn test_inv_structural_after_promotions() {
+        let mut cache = ArcCache::new(4, 4 * 4096);
+        for pgno in 1..=4 {
+            let k = key(pgno, 0);
+            let _ = cache.access_or_insert(page(k, PageSize::DEFAULT, pgno as u8));
+        }
+        // Promote pages 1 and 3 to T2.
+        let _ = cache.access(key(1, 0));
+        let _ = cache.access(key(3, 0));
+        assert_arc_invariants(&cache);
+
+        // Insert more to force evictions.
+        for pgno in 5..=10 {
+            let k = key(pgno, 0);
+            let _ = cache.access_or_insert(page(k, PageSize::DEFAULT, pgno as u8));
+            assert_arc_invariants(&cache);
+        }
+    }
+
+    #[test]
+    fn test_inv_structural_after_ghost_hits() {
+        let mut cache = ArcCache::new(2, 2 * 4096);
+        // Fill → evict → readmit via ghost.
+        let a = key(1, 0);
+        let b = key(2, 0);
+        let c = key(3, 0);
+
+        let _ = cache.access_or_insert(page(a, PageSize::DEFAULT, 1));
+        let _ = cache.access_or_insert(page(b, PageSize::DEFAULT, 2));
+        assert_arc_invariants(&cache);
+
+        let _ = cache.access_or_insert(page(c, PageSize::DEFAULT, 3)); // evicts a → B1
+        assert_arc_invariants(&cache);
+
+        let _ = cache.access_or_insert(page(a, PageSize::DEFAULT, 4)); // B1 hit → T2
+        assert_arc_invariants(&cache);
+        assert!(cache.in_t2(a));
+    }
+
+    #[test]
+    fn test_inv_structural_pinned_overflow() {
+        let mut cache = ArcCache::new(2, 2 * 4096);
+        let a = key(1, 0);
+        let b = key(2, 0);
+
+        let _ = cache.access_or_insert(page(a, PageSize::DEFAULT, 1));
+        let _ = cache.access_or_insert(page(b, PageSize::DEFAULT, 2));
+        cache.get(a).unwrap().pin();
+        cache.get(b).unwrap().pin();
+
+        // All pinned → overflow safety valve.
+        let c = key(3, 0);
+        let outcome = cache.access_or_insert(page(c, PageSize::DEFAULT, 3));
+        assert_eq!(outcome, AccessOutcome::MissInsertedOverflow);
+        assert_arc_invariants(&cache);
+        assert_eq!(cache.len(), 3); // temporary growth
+    }
+
+    #[test]
+    fn test_inv_mvcc_multi_version_coexistence() {
+        let mut cache = ArcCache::new(4, 4 * 4096);
+        let pg7_v1 = key(7, 1);
+        let pg7_v2 = key(7, 2);
+        let pg7_v3 = key(7, 3);
+
+        let _ = cache.access_or_insert(page(pg7_v1, PageSize::DEFAULT, 0x10));
+        let _ = cache.access_or_insert(page(pg7_v2, PageSize::DEFAULT, 0x20));
+        let _ = cache.access_or_insert(page(pg7_v3, PageSize::DEFAULT, 0x30));
+
+        // All three versions coexist within capacity.
+        assert!(cache.contains(pg7_v1));
+        assert!(cache.contains(pg7_v2));
+        assert!(cache.contains(pg7_v3));
+        assert_arc_invariants(&cache);
+    }
+
+    #[test]
+    fn test_inv_mvcc_superseded_eviction_order() {
+        let mut cache = ArcCache::new(3, 3 * 4096);
+        let pg1_v1 = key(1, 1);
+        let pg1_v2 = key(1, 2);
+        let other = key(2, 1);
+
+        let _ = cache.access_or_insert(page(pg1_v1, PageSize::DEFAULT, 0x10));
+        let _ = cache.access_or_insert(page(pg1_v2, PageSize::DEFAULT, 0x20));
+        let _ = cache.access_or_insert(page(other, PageSize::DEFAULT, 0x30));
+        assert_arc_invariants(&cache);
+
+        // Force eviction: v1 should be evicted first (superseded by v2).
+        let trigger = key(3, 1);
+        let _ = cache.access_or_insert(page(trigger, PageSize::DEFAULT, 0x40));
+
+        assert!(!cache.contains(pg1_v1), "older version should be evicted first");
+        assert!(cache.contains(pg1_v2), "newer version should remain");
+        assert_arc_invariants(&cache);
+    }
+
+    #[test]
+    fn test_inv_byte_limit_enforced() {
+        let tiny = PageSize::new(512).unwrap();
+        let mut cache = ArcCache::new(10, 2048); // 10 entries, but only 2048 bytes (4 × 512)
+
+        for pgno in 1..=8 {
+            let k = key(pgno, 0);
+            let _ = cache.access_or_insert(page(k, tiny, pgno as u8));
+            assert_arc_invariants(&cache);
+            // Byte limit should constrain before entry limit.
+            assert!(
+                cache.total_bytes() <= 2048 || cache.capacity_overflow_events() > 0,
+                "bead_id=bd-2ttd8.2 inv=byte_limit_respected total={}",
+                cache.total_bytes()
+            );
+        }
+    }
+
+    #[test]
+    fn test_inv_data_integrity_after_eviction_readmission() {
+        let mut cache = ArcCache::new(2, 2 * 4096);
+        let a = key(1, 0);
+        let b = key(2, 0);
+        let c = key(3, 0);
+
+        let _ = cache.access_or_insert(page(a, PageSize::DEFAULT, 0xAA));
+        let _ = cache.access_or_insert(page(b, PageSize::DEFAULT, 0xBB));
+
+        // Evict a.
+        let _ = cache.access_or_insert(page(c, PageSize::DEFAULT, 0xCC));
+        assert!(!cache.contains(a));
+
+        // Re-insert a with DIFFERENT data.
+        let _ = cache.access_or_insert(page(a, PageSize::DEFAULT, 0xDD));
+        let readback = cache.get(a).unwrap();
+        assert_eq!(
+            readback.data.as_slice()[0],
+            0xDD,
+            "re-admitted page must have new data, not stale"
+        );
+        assert_arc_invariants(&cache);
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Property-based tests (proptest)
+    // ─────────────────────────────────────────────────────────────────
+
+    mod prop {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Represents an operation on the ARC cache.
+        #[derive(Debug, Clone)]
+        enum ArcOp {
+            Insert { pgno: u32, commit_seq: u64, seed: u8 },
+            Access { pgno: u32, commit_seq: u64 },
+            Pin { pgno: u32, commit_seq: u64 },
+            Unpin { pgno: u32, commit_seq: u64 },
+        }
+
+        fn arc_op_strategy() -> impl Strategy<Value = ArcOp> {
+            prop_oneof![
+                4 => (1..20u32, 0..5u64, any::<u8>()).prop_map(|(pgno, cs, seed)| {
+                    ArcOp::Insert { pgno, commit_seq: cs, seed }
+                }),
+                3 => (1..20u32, 0..5u64).prop_map(|(pgno, cs)| {
+                    ArcOp::Access { pgno, commit_seq: cs }
+                }),
+                2 => (1..20u32, 0..5u64).prop_map(|(pgno, cs)| {
+                    ArcOp::Pin { pgno, commit_seq: cs }
+                }),
+                1 => (1..20u32, 0..5u64).prop_map(|(pgno, cs)| {
+                    ArcOp::Unpin { pgno, commit_seq: cs }
+                }),
+            ]
+        }
+
+        proptest! {
+            #[test]
+            fn prop_arc_structural_invariants_hold(
+                capacity in 1..8usize,
+                ops in proptest::collection::vec(arc_op_strategy(), 1..50)
+            ) {
+                let max_bytes = capacity * 4096;
+                let mut cache = ArcCache::new(capacity, max_bytes);
+
+                for op in &ops {
+                    match op {
+                        ArcOp::Insert { pgno, commit_seq, seed } => {
+                            let k = key(*pgno, *commit_seq);
+                            let _ = cache.access_or_insert(page(k, PageSize::DEFAULT, *seed));
+                        }
+                        ArcOp::Access { pgno, commit_seq } => {
+                            let k = key(*pgno, *commit_seq);
+                            let _ = cache.access(k);
+                        }
+                        ArcOp::Pin { pgno, commit_seq } => {
+                            let k = key(*pgno, *commit_seq);
+                            if let Some(p) = cache.get(k) {
+                                p.pin();
+                            }
+                        }
+                        ArcOp::Unpin { pgno, commit_seq } => {
+                            let k = key(*pgno, *commit_seq);
+                            if let Some(p) = cache.get(k) {
+                                if p.is_pinned() {
+                                    p.unpin();
+                                }
+                            }
+                        }
+                    }
+                    assert_arc_invariants(&cache);
+                }
+            }
+
+            #[test]
+            fn prop_pinned_pages_never_evicted(
+                capacity in 1..6usize,
+                pin_pgno in 1..5u32,
+                flood in proptest::collection::vec(5..30u32, 1..30)
+            ) {
+                let max_bytes = capacity * 4096;
+                let mut cache = ArcCache::new(capacity, max_bytes);
+
+                // Insert and pin a page.
+                let pinned_key = key(pin_pgno, 0);
+                let _ = cache.access_or_insert(page(pinned_key, PageSize::DEFAULT, 0xFF));
+                cache.get(pinned_key).unwrap().pin();
+
+                // Flood with other pages to force evictions.
+                for pgno in flood {
+                    let k = key(pgno, 0);
+                    let _ = cache.access_or_insert(page(k, PageSize::DEFAULT, pgno as u8));
+                    assert!(
+                        cache.contains(pinned_key),
+                        "pinned page {pin_pgno} must survive eviction"
+                    );
+                }
+                assert_arc_invariants(&cache);
+            }
+
+            #[test]
+            fn prop_eviction_metrics_consistent(
+                capacity in 2..6usize,
+                ops in proptest::collection::vec(1..50u32, 1..40)
+            ) {
+                let max_bytes = capacity * 4096;
+                let mut cache = ArcCache::new(capacity, max_bytes);
+                let mut total_inserts = 0usize;
+
+                for pgno in &ops {
+                    let k = key(*pgno, 0);
+                    let outcome = cache.access_or_insert(page(k, PageSize::DEFAULT, *pgno as u8));
+                    if outcome != AccessOutcome::Hit {
+                        total_inserts += 1;
+                    }
+                }
+
+                // Evictions ≤ total inserts (can't evict more than we inserted).
+                assert!(
+                    cache.evictions() <= total_inserts,
+                    "evictions={} > inserts={total_inserts}",
+                    cache.evictions()
+                );
+
+                // Current resident = inserts - evictions + overflows.
+                // (overflow pages are admitted without eviction)
+                assert_eq!(
+                    cache.len(),
+                    total_inserts - cache.evictions() + cache.capacity_overflow_events(),
+                    "resident = inserts - evictions + overflows"
+                );
+
+                assert_arc_invariants(&cache);
+            }
+        }
+    }
 }

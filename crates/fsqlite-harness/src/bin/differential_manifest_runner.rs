@@ -9,12 +9,12 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use fsqlite_harness::corpus_ingest::{
-    CorpusBuilder, generate_seed_corpus, ingest_conformance_fixtures,
+    generate_seed_corpus, ingest_conformance_fixtures, CorpusBuilder,
 };
 use fsqlite_harness::differential_runner::{
-    DifferentialRunReport, RunConfig, run_metamorphic_differential,
+    run_metamorphic_differential, DifferentialRunReport, RunConfig,
 };
-use fsqlite_harness::differential_v2::FsqliteExecutor;
+use fsqlite_harness::differential_v2::{CsqliteExecutor, FsqliteExecutor};
 
 const BEAD_ID: &str = "bd-mblr.7.1.2";
 const DEFAULT_SCENARIO_ID: &str = "DIFF-712";
@@ -391,7 +391,7 @@ fn run() -> Result<bool, String> {
         &entries,
         &run_config,
         FsqliteExecutor::open_in_memory,
-        FsqliteExecutor::open_in_memory,
+        CsqliteExecutor::open_in_memory,
     )?;
 
     let manifest = DifferentialManifest {
@@ -499,16 +499,10 @@ mod tests {
         assert!(replay.contains("--max-entries 64"));
         assert!(replay.contains("--generated-unix-ms 1700000000000"));
         assert!(replay.contains("--skip-fixtures"));
-        assert!(
-            replay.contains(
-                "--output-json artifacts/differential-manifest/differential_manifest.json"
-            )
-        );
-        assert!(
-            replay.contains(
-                "--output-human artifacts/differential-manifest/differential_manifest.md"
-            )
-        );
+        assert!(replay
+            .contains("--output-json artifacts/differential-manifest/differential_manifest.json"));
+        assert!(replay
+            .contains("--output-human artifacts/differential-manifest/differential_manifest.md"));
     }
 
     #[test]

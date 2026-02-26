@@ -9,6 +9,7 @@ pub mod native_commit;
 #[cfg(test)]
 mod per_core_buffer;
 pub mod recovery_compaction;
+pub mod telemetry;
 pub mod wal;
 pub mod wal_fec;
 pub mod wal_index;
@@ -49,6 +50,10 @@ pub use metrics::{
     GLOBAL_WAL_RECOVERY_METRICS, GroupCommitMetrics, GroupCommitMetricsSnapshot,
     WalFecRepairCounters, WalFecRepairCountersSnapshot, WalMetrics, WalMetricsSnapshot,
     WalRecoveryCounters, WalRecoveryCountersSnapshot,
+};
+pub use telemetry::{
+    NoOpWalObserver, WalTelemetryEvent, WalTelemetryObserver, WalTelemetryRingBuffer,
+    WalTelemetrySnapshot, wal_telemetry_snapshot,
 };
 pub use wal::WalFile;
 pub use wal_fec::{

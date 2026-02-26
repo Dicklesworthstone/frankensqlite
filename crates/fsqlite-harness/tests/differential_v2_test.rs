@@ -7,8 +7,8 @@
 //! - Reproducibility (two runs with identical envelopes produce identical results)
 
 use fsqlite_harness::differential_v2::{
-    self, CanonicalizationRules, DifferentialResult, ExecutionEnvelope, FORMAT_VERSION,
-    FsqliteExecutor, NormalizedValue, Outcome, PragmaConfig, SqlExecutor,
+    self, CanonicalizationRules, DifferentialResult, EngineIdentity, ExecutionEnvelope,
+    FsqliteExecutor, NormalizedValue, Outcome, PragmaConfig, SqlExecutor, FORMAT_VERSION,
 };
 
 /// Rusqlite executor for the C SQLite oracle.
@@ -52,6 +52,10 @@ impl SqlExecutor for RusqliteExecutor {
 
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|e| e.to_string())
+    }
+
+    fn engine_identity(&self) -> EngineIdentity {
+        EngineIdentity::CSqliteOracle
     }
 }
 
@@ -323,6 +327,43 @@ fn builder_sets_defaults_correctly() {
     assert!(e.schema.is_empty());
     assert!(e.workload.is_empty());
     assert!(e.run_id.is_none());
+    assert!(
+        !e.engines.csqlite.trim().is_empty(),
+        "default csqlite version metadata must be non-empty"
+    );
+}
+
+#[test]
+fn parity_rejects_empty_csqlite_version_metadata() {
+    let envelope = ExecutionEnvelope::builder(42)
+        .engines("0.1.0-test", "")
+        .workload(["SELECT 1".to_owned()])
+        .build();
+    let f = FsqliteExecutor::open_in_memory().expect("fsqlite open");
+    let c = RusqliteExecutor::open_in_memory();
+
+    let result = differential_v2::run_differential(&envelope, &f, &c);
+    assert_eq!(result.outcome, Outcome::Error);
+}
+
+#[test]
+fn parity_rejects_non_csqlite_reference_executor() {
+    let envelope = make_test_envelope(42, vec![], vec!["SELECT 1"]);
+    let f = FsqliteExecutor::open_in_memory().expect("fsqlite open");
+    let not_oracle = FsqliteExecutor::open_in_memory().expect("fsqlite open");
+
+    let result = differential_v2::run_differential(&envelope, &f, &not_oracle);
+    assert_eq!(result.outcome, Outcome::Error);
+}
+
+#[test]
+fn diagnostic_mode_allows_explicit_self_compare() {
+    let envelope = make_test_envelope(42, vec![], vec!["SELECT 1", "SELECT 'ok'"]);
+    let left = FsqliteExecutor::open_in_memory().expect("fsqlite open");
+    let right = FsqliteExecutor::open_in_memory().expect("fsqlite open");
+
+    let result = differential_v2::run_differential_diagnostic(&envelope, &left, &right);
+    assert_eq!(result.outcome, Outcome::Pass);
 }
 
 #[test]
@@ -413,6 +454,13 @@ impl SqlExecutor for ReducerMockExecutor {
             1
         };
         Ok(vec![vec![NormalizedValue::Integer(value)]])
+    }
+
+    fn engine_identity(&self) -> EngineIdentity {
+        match self.engine {
+            MockEngine::Fsqlite => EngineIdentity::FrankenSqlite,
+            MockEngine::Csqlite => EngineIdentity::CSqliteOracle,
+        }
     }
 }
 

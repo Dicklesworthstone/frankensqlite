@@ -1,0 +1,10 @@
+{
+  "trace_id": "trace-bd-2yqp6.1.1-20260226T072403Z-3520",
+  "run_id": "bd-2yqp6.1.1-20260226T072403Z-3520",
+  "scenario_id": "PARITY-SURFACE-A1",
+  "seed": 3520,
+  "bead_id": "bd-2yqp6.1.1",
+  "manifest_path": "supported_surface_matrix.toml",
+  "events_jsonl": "artifacts/bd-2yqp6.1.1/bd-2yqp6.1.1-20260226T072403Z-3520/events.jsonl",
+  "result": "fail"
+}

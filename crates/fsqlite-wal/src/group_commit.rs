@@ -652,16 +652,10 @@ pub fn write_consolidated_frames<F: VfsFile>(
     // We use a helper that directly sets internal state since we've already
     // computed the checksums ourselves.
     //
-    // Note: WalFile doesn't expose direct setters for frame_count/running_checksum,
-    // so we update by calling append_frame individually. However, the I/O already
-    // happened above, so we need a way to update the bookkeeping. For now, we
-    // re-read the frames we just wrote to update the WalFile state via refresh.
     wal.file_mut().sync(cx, SyncFlags::FULL)?;
 
-    // Refresh WalFile to pick up the frames we just wrote.
-    wal.refresh(cx)?;
-
-    let frames_written = wal.frame_count().saturating_sub(base_frame_count);
+    let frames_written = total_frames;
+    wal.advance_state_after_write(frames_written, running_checksum);
 
     // Record metrics.
     let bytes_written = u64::try_from(total_bytes).unwrap_or(u64::MAX);

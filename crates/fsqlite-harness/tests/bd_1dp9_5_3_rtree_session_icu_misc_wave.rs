@@ -13,8 +13,8 @@ use fsqlite_ext_session::{
 use fsqlite_func::collation::CollationFunction;
 use fsqlite_func::scalar::ScalarFunction;
 use fsqlite_harness::differential_v2::{
-    self, DifferentialResult, ExecutionEnvelope, FsqliteExecutor, NormalizedValue, Outcome,
-    SqlExecutor,
+    self, DifferentialResult, EngineIdentity, ExecutionEnvelope, FsqliteExecutor, NormalizedValue,
+    Outcome, SqlExecutor,
 };
 use fsqlite_types::SqliteValue;
 use serde_json::json;
@@ -71,6 +71,10 @@ impl SqlExecutor for RusqliteExecutor {
         rows.collect::<Result<Vec<_>, _>>().map_err(|error| {
             format!("bead_id={BEAD_ID} case=sqlite_collect_failed sql={sql:?} error={error}")
         })
+    }
+
+    fn engine_identity(&self) -> EngineIdentity {
+        EngineIdentity::CSqliteOracle
     }
 }
 

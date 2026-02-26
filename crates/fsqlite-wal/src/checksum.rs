@@ -1,6 +1,7 @@
 //! WAL checksum and integrity helpers.
 
 use fsqlite_error::{FrankenError, Result};
+use serde::Serialize;
 use xxhash_rust::xxh3::xxh3_128;
 
 /// SQLite database header size.
@@ -229,7 +230,7 @@ impl WalFrameHeader {
 }
 
 /// First failure reason encountered while validating a WAL chain.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum WalChainInvalidReason {
     HeaderChecksumMismatch,
     TruncatedFrame,
@@ -357,7 +358,7 @@ pub const BTREE_PAGE_TYPE_FLAGS: [u8; 4] = [0x02, 0x05, 0x0A, 0x0D];
 pub const CRASH_MODEL_SECTOR_SIZES: [usize; 3] = [512, 1024, 4096];
 
 /// Checksum families used for recovery routing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum ChecksumFailureKind {
     WalFrameChecksumMismatch,
     Xxh3PageChecksumMismatch,
@@ -366,7 +367,7 @@ pub enum ChecksumFailureKind {
 }
 
 /// Recovery policy selected for a checksum failure.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum RecoveryAction {
     AttemptWalFecRepair,
     TruncateWalAtFirstInvalidFrame,
@@ -376,7 +377,7 @@ pub enum RecoveryAction {
 }
 
 /// Result of an attempted WAL-FEC repair.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum WalFecRepairOutcome {
     Repaired,
     InsufficientSymbols,
@@ -2276,5 +2277,395 @@ mod tests {
             bad_validation.reason,
             Some(WalChainInvalidReason::FrameChecksumMismatch)
         );
+    }
+
+    // ── bd-xfn30.2: Corruption classification & repair-decision tests ──
+
+    /// Build a valid WAL byte stream with `n` frames (all commits).
+    fn build_valid_wal(n: usize) -> Vec<u8> {
+        let salts = WalSalts {
+            salt1: 0xAAAA_BBBB,
+            salt2: 0xCCCC_DDDD,
+        };
+        let mut header_buf = [0u8; WAL_HEADER_SIZE];
+        header_buf[..4].copy_from_slice(&WAL_MAGIC_LE.to_be_bytes());
+        header_buf[4..8].copy_from_slice(&WAL_FORMAT_VERSION.to_be_bytes());
+        header_buf[8..12].copy_from_slice(
+            &u32::try_from(PAGE_SIZE).expect("fits").to_be_bytes(),
+        );
+        write_wal_header_salts(&mut header_buf, salts).expect("write salts");
+        write_wal_header_checksum(&mut header_buf, false).expect("write hdr cksum");
+
+        let frame_size = WAL_FRAME_HEADER_SIZE + PAGE_SIZE;
+        let mut wal = Vec::with_capacity(WAL_HEADER_SIZE + n * frame_size);
+        wal.extend_from_slice(&header_buf);
+
+        let mut running = read_wal_header_checksum(&header_buf).expect("read hdr cksum");
+        for i in 0..n {
+            let pg = u32::try_from(i + 1).unwrap();
+            let mut frame = vec![0u8; frame_size];
+            frame[..4].copy_from_slice(&pg.to_be_bytes());
+            frame[4..8].copy_from_slice(&pg.to_be_bytes()); // commit
+            write_wal_frame_salts(&mut frame[..WAL_FRAME_HEADER_SIZE], salts)
+                .expect("frame salts");
+            for (off, byte) in frame[WAL_FRAME_HEADER_SIZE..].iter_mut().enumerate() {
+                let r = u8::try_from(off % 251).unwrap();
+                let s = u8::try_from(i % 251).unwrap();
+                *byte = r ^ s;
+            }
+            running =
+                write_wal_frame_checksum(&mut frame, PAGE_SIZE, running, false).expect("cksum");
+            wal.extend_from_slice(&frame);
+        }
+        wal
+    }
+
+    #[test]
+    fn test_classify_clean_wal_valid() {
+        let wal = build_valid_wal(10);
+        let v = validate_wal_chain(&wal, PAGE_SIZE, false).expect("validate");
+        assert!(v.valid);
+        assert_eq!(v.valid_frames, 10);
+        assert_eq!(v.replayable_frames, 10);
+        assert!(v.reason.is_none());
+        assert!(v.header_valid);
+    }
+
+    #[test]
+    fn test_classify_header_corruption() {
+        let mut wal = build_valid_wal(5);
+        // Corrupt header magic.
+        wal[0] ^= 0xFF;
+        let v = validate_wal_chain(&wal, PAGE_SIZE, false);
+        // Header corruption should error or report HeaderChecksumMismatch.
+        match v {
+            Ok(val) => {
+                assert!(!val.header_valid);
+                assert_eq!(
+                    val.reason,
+                    Some(WalChainInvalidReason::HeaderChecksumMismatch)
+                );
+            }
+            Err(_) => {} // Also acceptable: outright error
+        }
+    }
+
+    #[test]
+    fn test_classify_single_bit_flip_in_frame_data() {
+        let mut wal = build_valid_wal(5);
+        let frame_size = WAL_FRAME_HEADER_SIZE + PAGE_SIZE;
+        // Flip one bit in frame 3's page data.
+        let offset = WAL_HEADER_SIZE + 2 * frame_size + WAL_FRAME_HEADER_SIZE + 100;
+        wal[offset] ^= 0x01;
+        let v = validate_wal_chain(&wal, PAGE_SIZE, false).expect("validate");
+        assert!(!v.valid);
+        assert_eq!(v.valid_frames, 2, "first 2 frames should survive");
+        assert_eq!(v.first_invalid_frame, Some(2));
+        assert_eq!(
+            v.reason,
+            Some(WalChainInvalidReason::FrameChecksumMismatch)
+        );
+    }
+
+    #[test]
+    fn test_classify_torn_write_mid_frame() {
+        let wal = build_valid_wal(5);
+        let frame_size = WAL_FRAME_HEADER_SIZE + PAGE_SIZE;
+        // Truncate in the middle of frame 4 (index 3).
+        let cut_at = WAL_HEADER_SIZE + 3 * frame_size + frame_size / 2;
+        let torn = &wal[..cut_at];
+        let v = validate_wal_chain(torn, PAGE_SIZE, false).expect("validate");
+        assert_eq!(v.valid_frames, 3, "only 3 complete frames before truncation");
+        assert_eq!(v.reason, Some(WalChainInvalidReason::TruncatedFrame));
+    }
+
+    #[test]
+    fn test_classify_torn_write_in_header() {
+        let wal = build_valid_wal(3);
+        // Truncate to partial header.
+        let torn = &wal[..16];
+        let v = validate_wal_chain(torn, PAGE_SIZE, false);
+        // Should error or report header issue.
+        assert!(v.is_err() || !v.unwrap().header_valid);
+    }
+
+    #[test]
+    fn test_classify_salt_mismatch_in_frame() {
+        let mut wal = build_valid_wal(5);
+        let frame_size = WAL_FRAME_HEADER_SIZE + PAGE_SIZE;
+        // Corrupt salt1 in frame 2's header (bytes 8..12).
+        let salt_offset = WAL_HEADER_SIZE + frame_size + 8;
+        wal[salt_offset] ^= 0xFF;
+        let v = validate_wal_chain(&wal, PAGE_SIZE, false).expect("validate");
+        // Chain should break at frame 2 due to salt or checksum mismatch.
+        assert!(v.valid_frames <= 1, "at most frame 0 should survive");
+    }
+
+    #[test]
+    fn test_classify_zero_fill_corruption() {
+        let mut wal = build_valid_wal(5);
+        // Zero-fill frame 1's data (simulating media erasure).
+        let start = WAL_HEADER_SIZE + WAL_FRAME_HEADER_SIZE;
+        for byte in &mut wal[start..start + PAGE_SIZE] {
+            *byte = 0;
+        }
+        let v = validate_wal_chain(&wal, PAGE_SIZE, false).expect("validate");
+        assert_eq!(v.valid_frames, 0, "frame 0 corrupted so 0 valid frames");
+        assert_eq!(
+            v.reason,
+            Some(WalChainInvalidReason::FrameChecksumMismatch)
+        );
+    }
+
+    #[test]
+    fn test_classify_corruption_at_first_frame() {
+        let mut wal = build_valid_wal(3);
+        // Corrupt very first frame's page data byte 0.
+        let offset = WAL_HEADER_SIZE + WAL_FRAME_HEADER_SIZE;
+        wal[offset] ^= 0xAA;
+        let v = validate_wal_chain(&wal, PAGE_SIZE, false).expect("validate");
+        assert_eq!(v.valid_frames, 0);
+        assert_eq!(v.first_invalid_frame, Some(0));
+    }
+
+    #[test]
+    fn test_classify_corruption_at_last_frame() {
+        let mut wal = build_valid_wal(5);
+        let frame_size = WAL_FRAME_HEADER_SIZE + PAGE_SIZE;
+        // Corrupt the last frame.
+        let offset = WAL_HEADER_SIZE + 4 * frame_size + WAL_FRAME_HEADER_SIZE + 50;
+        wal[offset] ^= 0xBB;
+        let v = validate_wal_chain(&wal, PAGE_SIZE, false).expect("validate");
+        assert_eq!(v.valid_frames, 4, "first 4 should survive");
+        assert_eq!(v.first_invalid_frame, Some(4));
+    }
+
+    #[test]
+    fn test_detect_torn_write_true_on_truncation() {
+        let wal = build_valid_wal(5);
+        let frame_size = WAL_FRAME_HEADER_SIZE + PAGE_SIZE;
+        let cut = WAL_HEADER_SIZE + 2 * frame_size + 10;
+        let torn = &wal[..cut];
+        assert!(detect_torn_write_in_wal(torn, PAGE_SIZE, false).expect("detect"));
+    }
+
+    #[test]
+    fn test_detect_torn_write_false_on_clean() {
+        let wal = build_valid_wal(5);
+        assert!(!detect_torn_write_in_wal(&wal, PAGE_SIZE, false).expect("detect"));
+    }
+
+    #[test]
+    fn test_detect_torn_write_true_on_bit_flip() {
+        let mut wal = build_valid_wal(3);
+        let offset = WAL_HEADER_SIZE + WAL_FRAME_HEADER_SIZE + 200;
+        wal[offset] ^= 0x01;
+        assert!(detect_torn_write_in_wal(&wal, PAGE_SIZE, false).expect("detect"));
+    }
+
+    // ── Repair-decision edge cases ──
+
+    #[test]
+    fn test_repair_decision_exact_boundary_symbols() {
+        // Exactly enough symbols: should attempt repair.
+        let action = recovery_action_for_checksum_failure(
+            ChecksumFailureKind::WalFrameChecksumMismatch,
+            Some(6),
+            Some(6),
+        );
+        assert_eq!(action, RecoveryAction::AttemptWalFecRepair);
+    }
+
+    #[test]
+    fn test_repair_decision_one_short() {
+        // One symbol short: must truncate.
+        let action = recovery_action_for_checksum_failure(
+            ChecksumFailureKind::WalFrameChecksumMismatch,
+            Some(5),
+            Some(6),
+        );
+        assert_eq!(action, RecoveryAction::TruncateWalAtFirstInvalidFrame);
+    }
+
+    #[test]
+    fn test_repair_decision_no_symbol_info() {
+        // No symbol info at all: must truncate.
+        let action = recovery_action_for_checksum_failure(
+            ChecksumFailureKind::WalFrameChecksumMismatch,
+            None,
+            None,
+        );
+        assert_eq!(action, RecoveryAction::TruncateWalAtFirstInvalidFrame);
+    }
+
+    #[test]
+    fn test_repair_decision_partial_symbol_info() {
+        // Only one side of symbol info available.
+        let a1 = recovery_action_for_checksum_failure(
+            ChecksumFailureKind::WalFrameChecksumMismatch,
+            Some(10),
+            None,
+        );
+        assert_eq!(a1, RecoveryAction::TruncateWalAtFirstInvalidFrame);
+
+        let a2 = recovery_action_for_checksum_failure(
+            ChecksumFailureKind::WalFrameChecksumMismatch,
+            None,
+            Some(6),
+        );
+        assert_eq!(a2, RecoveryAction::TruncateWalAtFirstInvalidFrame);
+    }
+
+    #[test]
+    fn test_repair_decision_db_corruption_always_report() {
+        let action = recovery_action_for_checksum_failure(
+            ChecksumFailureKind::DbFileCorruption,
+            Some(100),
+            Some(1),
+        );
+        assert_eq!(action, RecoveryAction::ReportPersistentCorruption);
+    }
+
+    #[test]
+    fn test_attempt_fec_repair_insufficient_symbols() {
+        let payload = sample_page(1);
+        let hash = wal_fec_source_hash_xxh3_128(&payload);
+        let result = attempt_wal_fec_repair(&payload, hash, 3, 6);
+        assert_eq!(result, WalFecRepairOutcome::InsufficientSymbols);
+    }
+
+    #[test]
+    fn test_attempt_fec_repair_correct_hash() {
+        let payload = sample_page(42);
+        let hash = wal_fec_source_hash_xxh3_128(&payload);
+        let result = attempt_wal_fec_repair(&payload, hash, 8, 6);
+        assert_eq!(result, WalFecRepairOutcome::Repaired);
+    }
+
+    #[test]
+    fn test_attempt_fec_repair_wrong_hash() {
+        let payload = sample_page(42);
+        let wrong_hash = wal_fec_source_hash_xxh3_128(&sample_page(99));
+        let result = attempt_wal_fec_repair(&payload, wrong_hash, 8, 6);
+        assert_eq!(result, WalFecRepairOutcome::SourceHashMismatch);
+    }
+
+    #[test]
+    fn test_recover_decision_no_payload_truncates() {
+        let decision =
+            recover_wal_frame_checksum_mismatch(None, None, 10, 6);
+        assert_eq!(decision, WalRecoveryDecision::Truncated);
+    }
+
+    #[test]
+    fn test_recover_decision_payload_but_no_hash_truncates() {
+        let payload = sample_page(1);
+        let decision =
+            recover_wal_frame_checksum_mismatch(Some(&payload), None, 10, 6);
+        assert_eq!(decision, WalRecoveryDecision::Truncated);
+    }
+
+    #[test]
+    fn test_recover_decision_full_repair_path() {
+        let payload = sample_page(7);
+        let hash = wal_fec_source_hash_xxh3_128(&payload);
+        let decision =
+            recover_wal_frame_checksum_mismatch(Some(&payload), Some(hash), 8, 6);
+        assert_eq!(decision, WalRecoveryDecision::Repaired);
+    }
+
+    #[test]
+    fn test_all_failure_kinds_have_deterministic_action() {
+        // Exhaustive check: every ChecksumFailureKind produces a valid action.
+        let kinds = [
+            ChecksumFailureKind::WalFrameChecksumMismatch,
+            ChecksumFailureKind::Xxh3PageChecksumMismatch,
+            ChecksumFailureKind::Crc32cSymbolMismatch,
+            ChecksumFailureKind::DbFileCorruption,
+        ];
+        for kind in kinds {
+            let action = recovery_action_for_checksum_failure(kind, Some(10), Some(5));
+            // Must be one of the known variants.
+            assert!(matches!(
+                action,
+                RecoveryAction::AttemptWalFecRepair
+                    | RecoveryAction::TruncateWalAtFirstInvalidFrame
+                    | RecoveryAction::EvictCacheAndRetryFromWal
+                    | RecoveryAction::ExcludeCorruptedSymbolAndContinue
+                    | RecoveryAction::ReportPersistentCorruption
+            ));
+        }
+    }
+
+    #[test]
+    fn test_multi_corruption_sites_first_wins() {
+        // When multiple frames are corrupt, only the first is detected.
+        let mut wal = build_valid_wal(10);
+        let frame_size = WAL_FRAME_HEADER_SIZE + PAGE_SIZE;
+        // Corrupt frames 3 and 7.
+        let off3 = WAL_HEADER_SIZE + 2 * frame_size + WAL_FRAME_HEADER_SIZE + 10;
+        let off7 = WAL_HEADER_SIZE + 6 * frame_size + WAL_FRAME_HEADER_SIZE + 10;
+        wal[off3] ^= 0xCC;
+        wal[off7] ^= 0xDD;
+        let v = validate_wal_chain(&wal, PAGE_SIZE, false).expect("validate");
+        assert_eq!(v.valid_frames, 2, "stops at first corruption (frame 3)");
+        assert_eq!(v.first_invalid_frame, Some(2));
+    }
+
+    #[test]
+    fn test_crash_model_contract_flags_exhaustive() {
+        let contract = crash_model_contract();
+        assert!(contract.crash_at_any_point());
+        assert!(contract.fsync_is_durability_barrier());
+        assert!(contract.writes_reorder_without_fsync());
+        assert!(contract.bitrot_exists());
+        assert!(contract.metadata_may_require_directory_fsync());
+    }
+
+    #[test]
+    fn test_replayable_frames_stop_at_last_commit() {
+        // Build WAL where frames 1-3 are commits, frames 4-5 are non-commit.
+        // Technically all 5 pass checksum chain but only 3 are "replayable"
+        // (up to last commit in the valid prefix).
+        let salts = WalSalts {
+            salt1: 0x1111_2222,
+            salt2: 0x3333_4444,
+        };
+        let mut hdr = [0u8; WAL_HEADER_SIZE];
+        hdr[..4].copy_from_slice(&WAL_MAGIC_LE.to_be_bytes());
+        hdr[4..8].copy_from_slice(&WAL_FORMAT_VERSION.to_be_bytes());
+        hdr[8..12].copy_from_slice(
+            &u32::try_from(PAGE_SIZE).unwrap().to_be_bytes(),
+        );
+        write_wal_header_salts(&mut hdr, salts).expect("salts");
+        write_wal_header_checksum(&mut hdr, false).expect("hdr cksum");
+
+        let frame_size = WAL_FRAME_HEADER_SIZE + PAGE_SIZE;
+        let mut wal = Vec::with_capacity(WAL_HEADER_SIZE + 5 * frame_size);
+        wal.extend_from_slice(&hdr);
+        let mut running = read_wal_header_checksum(&hdr).expect("seed");
+
+        for i in 0..5u32 {
+            let mut frame = vec![0u8; frame_size];
+            frame[..4].copy_from_slice(&(i + 1).to_be_bytes());
+            // Commit on frames 1-3 (indices 0-2), non-commit on 4-5 (indices 3-4).
+            let db_size = if i < 3 { i + 1 } else { 0 };
+            frame[4..8].copy_from_slice(&db_size.to_be_bytes());
+            write_wal_frame_salts(&mut frame[..WAL_FRAME_HEADER_SIZE], salts)
+                .expect("salts");
+            for (off, byte) in frame[WAL_FRAME_HEADER_SIZE..].iter_mut().enumerate() {
+                *byte = u8::try_from((off + usize::try_from(i).unwrap()) % 251).unwrap();
+            }
+            running = write_wal_frame_checksum(&mut frame, PAGE_SIZE, running, false)
+                .expect("cksum");
+            wal.extend_from_slice(&frame);
+        }
+
+        let v = validate_wal_chain(&wal, PAGE_SIZE, false).expect("validate");
+        assert!(v.valid, "all 5 pass checksum");
+        assert_eq!(v.valid_frames, 5);
+        // Replayable should be 3 (last commit is at index 2).
+        assert_eq!(v.replayable_frames, 3);
+        assert_eq!(v.last_commit_frame, Some(2));
     }
 }

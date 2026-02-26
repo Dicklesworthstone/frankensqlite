@@ -1,0 +1,19 @@
+{
+  "trace_id": "trace-bd-xfn30.3-20260226T100017Z-40101",
+  "run_id": "bd-xfn30.3-20260226T100017Z-40101",
+  "scenario_id": "WAL-FAULT-MATRIX-E2E",
+  "seed": 40101,
+  "bead_id": "bd-xfn30.3",
+  "events_jsonl": "artifacts/bd-xfn30.3/bd-xfn30.3-20260226T100017Z-40101/events.jsonl",
+  "scenario_summary_jsonl": "artifacts/bd-xfn30.3/bd-xfn30.3-20260226T100017Z-40101/scenario_summary.jsonl",
+  "scenario_summary_rows": 5,
+  "contract_log": "artifacts/bd-xfn30.3/bd-xfn30.3-20260226T100017Z-40101/contract-check.log",
+  "contract_log_sha256": "deae6239b2859b878e521f6cacaea6be9e419d3468f86437e0b106f0c8da35a3",
+  "matrix_test_log": "artifacts/bd-xfn30.3/bd-xfn30.3-20260226T100017Z-40101/cargo-test-bd_xfn30_3_fault_injection_matrix.log",
+  "matrix_test_log_sha256": "0efae0990aa7230ecca85b5bc59ccb07bbcb2f3aabc820b19f731c316112a2a8",
+  "regression_test_log": "artifacts/bd-xfn30.3/bd-xfn30.3-20260226T100017Z-40101/cargo-test-wal-crash-matrix-regression.log",
+  "regression_test_log_sha256": "d1eb0115004434d5e334393953249dee5535bdc60f371a7c336497a3b7346182",
+  "manifest_json": "artifacts/bd-xfn30.3/bd-xfn30.3-20260226T100017Z-40101/manifest.json",
+  "manifest_sha256": "c2665d49e2af8dd047d16b30a638d6958ae4b06e5c904dcf232226a2bd820e25",
+  "result": "pass"
+}

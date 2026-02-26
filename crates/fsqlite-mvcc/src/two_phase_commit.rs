@@ -432,7 +432,7 @@ impl TwoPhaseCoordinator {
             return Err(TwoPhaseError::InvalidState(self.state));
         }
 
-        let participants: Vec<(DatabaseId, u64)> = self
+        let mut participants: Vec<(DatabaseId, u64)> = self
             .participants
             .values()
             .filter_map(|p| {
@@ -443,6 +443,7 @@ impl TwoPhaseCoordinator {
                 }
             })
             .collect();
+        participants.sort_unstable_by_key(|&(db_id, _)| db_id);
 
         let marker = GlobalCommitMarker::new(self.txn_id, commit_seq, participants, timestamp_ns);
         self.commit_marker = Some(marker.clone());

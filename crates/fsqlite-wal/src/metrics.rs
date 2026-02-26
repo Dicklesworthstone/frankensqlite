@@ -10,6 +10,8 @@
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use serde::Serialize;
+
 // ---------------------------------------------------------------------------
 // Metric counters
 // ---------------------------------------------------------------------------
@@ -107,7 +109,7 @@ impl Default for WalMetrics {
 // ---------------------------------------------------------------------------
 
 /// Point-in-time snapshot of WAL metrics.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct WalMetricsSnapshot {
     pub frames_written_total: u64,
     pub bytes_written_total: u64,
@@ -223,7 +225,7 @@ impl Default for WalFecRepairCounters {
 }
 
 /// Point-in-time snapshot of WAL FEC repair counters.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct WalFecRepairCountersSnapshot {
     pub repairs_total: u64,
     pub repairs_succeeded: u64,
@@ -325,7 +327,7 @@ impl Default for WalRecoveryCounters {
 }
 
 /// Point-in-time snapshot of WAL recovery counters.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct WalRecoveryCountersSnapshot {
     pub recovery_frames_total: u64,
     pub corruption_detected_total: u64,
@@ -469,7 +471,7 @@ impl Default for GroupCommitMetrics {
 }
 
 /// Point-in-time snapshot of group commit metrics.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct GroupCommitMetricsSnapshot {
     pub group_commits_total: u64,
     pub group_commit_size_sum: u64,

@@ -80,6 +80,8 @@ pub struct TransactionController {
     write_set: HashMap<u64, Vec<u8>>,
     /// Whether we are in CONCURRENT (MVCC) mode.
     concurrent: bool,
+    /// Whether the transaction was implicitly started by a SAVEPOINT.
+    implicit_txn: bool,
 }
 
 impl TransactionController {
@@ -93,6 +95,7 @@ impl TransactionController {
             savepoints: Vec::new(),
             write_set: HashMap::new(),
             concurrent: false,
+            implicit_txn: false,
         }
     }
 
@@ -248,6 +251,7 @@ impl TransactionController {
     pub fn savepoint(&mut self, name: String) -> Result<()> {
         if self.state == TxnState::Idle {
             self.begin(Some(TransactionMode::Deferred))?;
+            self.implicit_txn = true;
         }
 
         let entry = SavepointEntry {
@@ -286,7 +290,7 @@ impl TransactionController {
 
         // If releasing the last savepoint and we implicitly began a
         // transaction, commit it.
-        if self.savepoints.is_empty() && self.state == TxnState::Active {
+        if self.savepoints.is_empty() && self.state == TxnState::Active && self.implicit_txn {
             // Per SQLite: RELEASE of the outermost savepoint is equivalent to COMMIT.
             self.commit()?;
         }
@@ -396,6 +400,7 @@ impl TransactionController {
         self.savepoints.clear();
         self.write_set.clear();
         self.concurrent = false;
+        self.implicit_txn = false;
     }
 }
 
@@ -650,6 +655,21 @@ mod tests {
         tc.savepoint("sp1".to_owned()).unwrap();
         assert_eq!(tc.state(), TxnState::Active);
         assert_eq!(tc.savepoint_depth(), 1);
+        tc.release("sp1").unwrap();
+        assert_eq!(tc.state(), TxnState::Idle);
+    }
+
+    // === Test: Explicit transaction does not commit on outermost release ===
+    #[test]
+    fn test_savepoint_explicit_transaction_no_commit_on_release() {
+        let mut tc = TransactionController::new();
+        tc.begin(Some(TransactionMode::Deferred)).unwrap();
+        tc.savepoint("sp1".to_owned()).unwrap();
+        assert_eq!(tc.state(), TxnState::Active);
+        tc.release("sp1").unwrap();
+        assert_eq!(tc.state(), TxnState::Active); // Remains active
+        tc.commit().unwrap();
+        assert_eq!(tc.state(), TxnState::Idle);
     }
 
     // === Test: ROLLBACK TO clears error state ===

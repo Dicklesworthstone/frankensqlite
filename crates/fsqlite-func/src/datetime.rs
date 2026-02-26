@@ -70,7 +70,9 @@ fn jdn_to_ymd(jdn: f64) -> (i64, i64, i64) {
     let d = (365.25 * c as f64).floor() as i64;
     let e = ((b.saturating_sub(d)) as f64 / 30.6001).floor() as i64;
 
-    let day = b.saturating_sub(d).saturating_sub((30.6001 * e as f64).floor() as i64);
+    let day = b
+        .saturating_sub(d)
+        .saturating_sub((30.6001 * e as f64).floor() as i64);
     let month = if e < 14 { e - 1 } else { e - 13 };
     let year = if month > 2 { c - 4716 } else { c - 4715 };
     (year, month, day)

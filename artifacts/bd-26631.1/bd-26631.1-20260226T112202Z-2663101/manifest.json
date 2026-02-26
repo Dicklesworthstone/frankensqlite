@@ -1,0 +1,14 @@
+{
+  "trace_id": "trace-bd-26631.1-20260226T112202Z-2663101",
+  "run_id": "bd-26631.1-20260226T112202Z-2663101",
+  "scenario_id": "WAL-REPLAY-STARTUP-DETERMINISTIC",
+  "seed": 2663101,
+  "bead_id": "bd-26631.1",
+  "files": [
+    {"path":"artifacts/bd-26631.1/bd-26631.1-20260226T112202Z-2663101/events.jsonl"},
+    {"path":"artifacts/bd-26631.1/bd-26631.1-20260226T112202Z-2663101/contract-check.log","sha256":"c06855e300304b745f6ed546817fbbae0233cd7de8bd2f80dc6b7df285f5f369"},
+    {"path":"artifacts/bd-26631.1/bd-26631.1-20260226T112202Z-2663101/cargo-test-bd_26631_1_deterministic_replay_startup.log","sha256":"e297cfbb1b8f3b947a0bfec5f067bb8529ef9aefae28ea28ff18ab77d14eb174"},
+    {"path":"artifacts/bd-26631.1/bd-26631.1-20260226T112202Z-2663101/cargo-test-replay-regression.log","sha256":"1a0f2e779faea966313b57e0456f7edbf18aa77f3598a743669beaf15dbb0fea"},
+    {"path":"artifacts/bd-26631.1/bd-26631.1-20260226T112202Z-2663101/scenario_summary.jsonl","sha256":"81d6bf0ba45379ad9bb2f5123442a7fcd046aa9f3004f0ea52c1c57fe7881952"}
+  ]
+}

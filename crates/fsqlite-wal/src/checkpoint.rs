@@ -3,8 +3,10 @@
 //! This module models the mode semantics as deterministic pure functions so
 //! higher layers can execute checkpoint I/O while preserving mode behavior.
 
+use serde::Serialize;
+
 /// Checkpoint modes matching SQLite WAL checkpoint variants.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum CheckpointMode {
     /// Opportunistically backfill frames that do not require waiting.
     Passive,

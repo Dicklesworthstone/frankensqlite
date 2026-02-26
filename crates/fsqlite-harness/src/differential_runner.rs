@@ -42,12 +42,12 @@ use crate::differential_v2::{
     SqlExecutor, StatementDivergence,
 };
 use crate::metamorphic::{
-    EquivalenceExpectation, MetamorphicTestCase, MismatchClassification, TransformRegistry,
-    generate_metamorphic_corpus,
+    generate_metamorphic_corpus, EquivalenceExpectation, MetamorphicTestCase,
+    MismatchClassification, TransformRegistry,
 };
 use crate::mismatch_minimizer::{
-    DeduplicatedFailures, MinimalReproduction, MinimizerConfig, attribute_subsystem, deduplicate,
-    minimize_workload,
+    attribute_subsystem, deduplicate, minimize_workload, DeduplicatedFailures, MinimalReproduction,
+    MinimizerConfig,
 };
 
 /// Bead identifier for log correlation.
@@ -667,6 +667,10 @@ mod tests {
             } else {
                 Ok(Vec::new())
             }
+        }
+
+        fn engine_identity(&self) -> crate::differential_v2::EngineIdentity {
+            crate::differential_v2::EngineIdentity::CSqliteOracle
         }
     }
 

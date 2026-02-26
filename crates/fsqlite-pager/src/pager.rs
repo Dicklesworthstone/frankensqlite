@@ -3111,4 +3111,945 @@ mod tests {
             );
         }
     }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // bd-2ttd8.2: Pager invariant suite — SimplePager correctness
+    // ═══════════════════════════════════════════════════════════════════
+
+    const BEAD_INV: &str = "bd-2ttd8.2";
+
+    #[test]
+    fn test_inv_write_set_not_in_freelist_during_txn() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        // Allocate, write, commit.
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let p = txn.allocate_page(&cx).unwrap();
+        txn.write_page(&cx, p, &vec![0xAA; ps]).unwrap();
+        txn.commit(&cx).unwrap();
+
+        // Free the page.
+        let mut txn2 = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        txn2.free_page(&cx, p).unwrap();
+
+        // The freed page should be in freed_pages, not in write_set.
+        assert!(
+            txn2.freed_pages.contains(&p),
+            "bead_id={BEAD_INV} inv=freed_page_tracked"
+        );
+        assert!(
+            !txn2.write_set.contains_key(&p),
+            "bead_id={BEAD_INV} inv=freed_not_in_write_set"
+        );
+
+        txn2.commit(&cx).unwrap();
+    }
+
+    #[test]
+    fn test_inv_allocated_pages_sequential_and_nonzero() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let mut pages = Vec::new();
+        for _ in 0..10 {
+            let p = txn.allocate_page(&cx).unwrap();
+            assert!(p.get() > 0, "bead_id={BEAD_INV} inv=page_nonzero");
+            // No duplicates.
+            assert!(
+                !pages.contains(&p),
+                "bead_id={BEAD_INV} inv=page_unique p={p}"
+            );
+            pages.push(p);
+        }
+        txn.commit(&cx).unwrap();
+    }
+
+    #[test]
+    fn test_inv_writer_serialization_single_writer() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+
+        let _w1 = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+
+        // Second immediate should fail (writer_active).
+        let err = pager.begin(&cx, TransactionMode::Immediate);
+        assert!(
+            err.is_err(),
+            "bead_id={BEAD_INV} inv=single_writer_enforced"
+        );
+
+        // Exclusive also fails.
+        let err2 = pager.begin(&cx, TransactionMode::Exclusive);
+        assert!(
+            err2.is_err(),
+            "bead_id={BEAD_INV} inv=exclusive_blocked_by_writer"
+        );
+    }
+
+    #[test]
+    fn test_inv_writer_released_on_commit() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+
+        let mut w1 = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        w1.commit(&cx).unwrap();
+
+        // Writer lock should be released; new writer should succeed.
+        let _w2 = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+    }
+
+    #[test]
+    fn test_inv_writer_released_on_rollback() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+
+        let mut w1 = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        w1.rollback(&cx).unwrap();
+
+        let _w2 = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+    }
+
+    #[test]
+    fn test_inv_writer_released_on_drop() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+
+        {
+            let _w1 = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+            // Drop without commit or rollback.
+        }
+
+        let _w2 = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+    }
+
+    #[test]
+    fn test_inv_commit_persists_all_dirty_pages() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let mut pages = Vec::new();
+        for i in 0..5u8 {
+            let p = txn.allocate_page(&cx).unwrap();
+            let mut data = vec![0u8; ps];
+            data[0] = 0xD0 + i;
+            data[ps - 1] = i;
+            txn.write_page(&cx, p, &data).unwrap();
+            pages.push((p, 0xD0 + i, i));
+        }
+        txn.commit(&cx).unwrap();
+
+        // Read back in a new read-only transaction.
+        let txn2 = pager.begin(&cx, TransactionMode::ReadOnly).unwrap();
+        for (p, first_byte, last_byte) in &pages {
+            let data = txn2.get_page(&cx, *p).unwrap();
+            assert_eq!(
+                data.as_ref()[0], *first_byte,
+                "bead_id={BEAD_INV} inv=dirty_page_committed p={p}"
+            );
+            assert_eq!(
+                data.as_ref()[ps - 1], *last_byte,
+                "bead_id={BEAD_INV} inv=dirty_page_last_byte p={p}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_inv_rollback_discards_all_dirty_pages() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        // Initial committed data.
+        let mut txn1 = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let p = txn1.allocate_page(&cx).unwrap();
+        txn1.write_page(&cx, p, &vec![0xAA; ps]).unwrap();
+        txn1.commit(&cx).unwrap();
+
+        // Overwrite and rollback.
+        let mut txn2 = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        txn2.write_page(&cx, p, &vec![0xBB; ps]).unwrap();
+        txn2.rollback(&cx).unwrap();
+
+        // Verify original data survives.
+        let txn3 = pager.begin(&cx, TransactionMode::ReadOnly).unwrap();
+        let data = txn3.get_page(&cx, p).unwrap();
+        assert_eq!(
+            data.as_ref()[0],
+            0xAA,
+            "bead_id={BEAD_INV} inv=rollback_preserves_committed"
+        );
+    }
+
+    #[test]
+    fn test_inv_savepoint_nested_stack_order() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let p = txn.allocate_page(&cx).unwrap();
+
+        txn.write_page(&cx, p, &vec![0x01; ps]).unwrap();
+        txn.savepoint(&cx, "sp1").unwrap();
+
+        txn.write_page(&cx, p, &vec![0x02; ps]).unwrap();
+        txn.savepoint(&cx, "sp2").unwrap();
+
+        txn.write_page(&cx, p, &vec![0x03; ps]).unwrap();
+        txn.savepoint(&cx, "sp3").unwrap();
+
+        txn.write_page(&cx, p, &vec![0x04; ps]).unwrap();
+
+        // Rollback to sp2 → data should be 0x02.
+        txn.rollback_to_savepoint(&cx, "sp2").unwrap();
+        let data = txn.get_page(&cx, p).unwrap();
+        assert_eq!(
+            data.as_ref()[0],
+            0x02,
+            "bead_id={BEAD_INV} inv=nested_rollback_sp2"
+        );
+
+        // sp3 should no longer exist.
+        let err = txn.rollback_to_savepoint(&cx, "sp3");
+        assert!(
+            err.is_err(),
+            "bead_id={BEAD_INV} inv=sp3_removed_after_rollback_to_sp2"
+        );
+
+        // sp1 should still exist.
+        txn.rollback_to_savepoint(&cx, "sp1").unwrap();
+        let data = txn.get_page(&cx, p).unwrap();
+        assert_eq!(
+            data.as_ref()[0],
+            0x01,
+            "bead_id={BEAD_INV} inv=nested_rollback_sp1"
+        );
+
+        txn.commit(&cx).unwrap();
+    }
+
+    #[test]
+    fn test_inv_savepoint_release_merges_to_parent() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let p = txn.allocate_page(&cx).unwrap();
+
+        txn.write_page(&cx, p, &vec![0x10; ps]).unwrap();
+        txn.savepoint(&cx, "outer").unwrap();
+
+        txn.write_page(&cx, p, &vec![0x20; ps]).unwrap();
+        txn.savepoint(&cx, "inner").unwrap();
+
+        txn.write_page(&cx, p, &vec![0x30; ps]).unwrap();
+
+        // Release inner → changes kept.
+        txn.release_savepoint(&cx, "inner").unwrap();
+        let data = txn.get_page(&cx, p).unwrap();
+        assert_eq!(
+            data.as_ref()[0],
+            0x30,
+            "bead_id={BEAD_INV} inv=release_keeps_changes"
+        );
+
+        // Rollback to outer → restores data from before inner.
+        txn.rollback_to_savepoint(&cx, "outer").unwrap();
+        let data = txn.get_page(&cx, p).unwrap();
+        assert_eq!(
+            data.as_ref()[0],
+            0x10,
+            "bead_id={BEAD_INV} inv=rollback_outer_after_release_inner"
+        );
+
+        txn.commit(&cx).unwrap();
+    }
+
+    #[test]
+    fn test_inv_freelist_restored_on_rollback() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        // Allocate + commit.
+        let mut txn1 = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let p = txn1.allocate_page(&cx).unwrap();
+        txn1.write_page(&cx, p, &vec![0xAA; ps]).unwrap();
+        txn1.commit(&cx).unwrap();
+
+        // Free + commit → moves to freelist.
+        let mut txn2 = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        txn2.free_page(&cx, p).unwrap();
+        txn2.commit(&cx).unwrap();
+
+        let freelist_before = {
+            let inner = pager.inner.lock().unwrap();
+            inner.freelist.clone()
+        };
+        assert!(
+            freelist_before.contains(&p),
+            "bead_id={BEAD_INV} inv=freed_in_freelist"
+        );
+
+        // Allocate from freelist, then rollback → page returns to freelist.
+        let mut txn3 = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let reused = txn3.allocate_page(&cx).unwrap();
+        assert_eq!(reused, p, "should reuse freed page");
+        txn3.rollback(&cx).unwrap();
+
+        let freelist_after = {
+            let inner = pager.inner.lock().unwrap();
+            inner.freelist.clone()
+        };
+        assert_eq!(
+            freelist_after, freelist_before,
+            "bead_id={BEAD_INV} inv=freelist_restored_after_rollback"
+        );
+    }
+
+    #[test]
+    fn test_inv_page_identity_read_before_write() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        // Allocate a page, write, commit.
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let p = txn.allocate_page(&cx).unwrap();
+        txn.write_page(&cx, p, &vec![0xEE; ps]).unwrap();
+        txn.commit(&cx).unwrap();
+
+        // Read in new transaction → should see committed data.
+        let txn2 = pager.begin(&cx, TransactionMode::ReadOnly).unwrap();
+        let data = txn2.get_page(&cx, p).unwrap();
+        assert_eq!(
+            data.as_ref()[0],
+            0xEE,
+            "bead_id={BEAD_INV} inv=committed_visible"
+        );
+    }
+
+    #[test]
+    fn test_inv_write_set_isolation() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        // Commit baseline data.
+        let mut txn1 = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let p = txn1.allocate_page(&cx).unwrap();
+        txn1.write_page(&cx, p, &vec![0x11; ps]).unwrap();
+        txn1.commit(&cx).unwrap();
+
+        // Start a reader → sees committed.
+        let reader = pager.begin(&cx, TransactionMode::ReadOnly).unwrap();
+        let r_data = reader.get_page(&cx, p).unwrap();
+        assert_eq!(r_data.as_ref()[0], 0x11);
+
+        // Writer modifies.
+        let mut writer = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        writer.write_page(&cx, p, &vec![0x22; ps]).unwrap();
+
+        // Reader still sees committed data (write-set is txn-private).
+        let r_data2 = reader.get_page(&cx, p).unwrap();
+        assert_eq!(
+            r_data2.as_ref()[0],
+            0x11,
+            "bead_id={BEAD_INV} inv=write_set_isolated_from_readers"
+        );
+
+        writer.commit(&cx).unwrap();
+    }
+
+    #[test]
+    fn test_inv_db_size_grows_on_allocate_commit() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        let initial_size = {
+            let inner = pager.inner.lock().unwrap();
+            inner.db_size
+        };
+
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        for _ in 0..5 {
+            let p = txn.allocate_page(&cx).unwrap();
+            txn.write_page(&cx, p, &vec![0x00; ps]).unwrap();
+        }
+        txn.commit(&cx).unwrap();
+
+        let final_size = {
+            let inner = pager.inner.lock().unwrap();
+            inner.db_size
+        };
+
+        assert!(
+            final_size > initial_size,
+            "bead_id={BEAD_INV} inv=db_size_grows initial={initial_size} final={final_size}"
+        );
+    }
+
+    #[test]
+    fn test_inv_db_size_restored_on_rollback() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        let size_before = {
+            let inner = pager.inner.lock().unwrap();
+            inner.db_size
+        };
+
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        for _ in 0..5 {
+            let p = txn.allocate_page(&cx).unwrap();
+            txn.write_page(&cx, p, &vec![0x00; ps]).unwrap();
+        }
+        txn.rollback(&cx).unwrap();
+
+        let size_after = {
+            let inner = pager.inner.lock().unwrap();
+            inner.db_size
+        };
+
+        assert_eq!(
+            size_after, size_before,
+            "bead_id={BEAD_INV} inv=db_size_restored_on_rollback"
+        );
+    }
+
+    #[test]
+    fn test_inv_active_transaction_count() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+
+        let count_before = {
+            let inner = pager.inner.lock().unwrap();
+            inner.active_transactions
+        };
+        assert_eq!(count_before, 0, "bead_id={BEAD_INV} inv=initial_zero_txns");
+
+        let r1 = pager.begin(&cx, TransactionMode::ReadOnly).unwrap();
+        let r2 = pager.begin(&cx, TransactionMode::ReadOnly).unwrap();
+
+        {
+            let inner = pager.inner.lock().unwrap();
+            assert_eq!(
+                inner.active_transactions, 2,
+                "bead_id={BEAD_INV} inv=two_active_txns"
+            );
+        }
+
+        drop(r1);
+        {
+            let inner = pager.inner.lock().unwrap();
+            assert_eq!(
+                inner.active_transactions, 1,
+                "bead_id={BEAD_INV} inv=one_after_drop"
+            );
+        }
+
+        drop(r2);
+        {
+            let inner = pager.inner.lock().unwrap();
+            assert_eq!(
+                inner.active_transactions, 0,
+                "bead_id={BEAD_INV} inv=zero_after_all_dropped"
+            );
+        }
+    }
+
+    #[test]
+    fn test_inv_journal_mode_default_delete() {
+        let (pager, _) = test_pager();
+        assert_eq!(
+            pager.journal_mode(),
+            JournalMode::Delete,
+            "bead_id={BEAD_INV} inv=default_journal_delete"
+        );
+    }
+
+    #[test]
+    fn test_inv_commit_seq_monotonic() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        let mut prev_seq = {
+            let inner = pager.inner.lock().unwrap();
+            inner.commit_seq.get()
+        };
+
+        for _ in 0..5 {
+            let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+            let p = txn.allocate_page(&cx).unwrap();
+            txn.write_page(&cx, p, &vec![0x00; ps]).unwrap();
+            txn.commit(&cx).unwrap();
+
+            let seq = {
+                let inner = pager.inner.lock().unwrap();
+                inner.commit_seq.get()
+            };
+            assert!(
+                seq >= prev_seq,
+                "bead_id={BEAD_INV} inv=commit_seq_monotonic seq={seq} prev={prev_seq}"
+            );
+            prev_seq = seq;
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // bd-2ttd8.3: Deterministic pager e2e scenarios with cache-pressure
+    //             telemetry
+    // ═══════════════════════════════════════════════════════════════════
+
+    const BEAD_E2E: &str = "bd-2ttd8.3";
+
+    #[test]
+    fn test_e2e_sequential_write_read_with_metrics() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        pager.reset_cache_metrics().unwrap();
+
+        // Phase 1: Sequential write of 20 pages.
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let mut pages = Vec::new();
+        for i in 0..20u32 {
+            let p = txn.allocate_page(&cx).unwrap();
+            let mut data = vec![0u8; ps];
+            data[0] = (i & 0xFF) as u8;
+            data[1] = ((i >> 8) & 0xFF) as u8;
+            txn.write_page(&cx, p, &data).unwrap();
+            pages.push(p);
+        }
+        txn.commit(&cx).unwrap();
+
+        let post_write = pager.cache_metrics_snapshot().unwrap();
+        assert!(
+            post_write.admits > 0,
+            "bead_id={BEAD_E2E} case=seq_write_admits"
+        );
+
+        // Phase 2: Sequential read — all pages should be cached.
+        pager.reset_cache_metrics().unwrap();
+        let txn2 = pager.begin(&cx, TransactionMode::ReadOnly).unwrap();
+        for (i, &p) in pages.iter().enumerate() {
+            let data = txn2.get_page(&cx, p).unwrap();
+            assert_eq!(
+                data.as_ref()[0],
+                (i & 0xFF) as u8,
+                "bead_id={BEAD_E2E} case=seq_read_content page={p}"
+            );
+        }
+
+        let post_read = pager.cache_metrics_snapshot().unwrap();
+        assert!(
+            post_read.total_accesses() >= 20,
+            "bead_id={BEAD_E2E} case=seq_read_accesses total={}",
+            post_read.total_accesses()
+        );
+        // Most pages should be cache hits (written data stays in cache).
+        assert!(
+            post_read.hit_rate_percent() >= 50.0,
+            "bead_id={BEAD_E2E} case=seq_read_hit_rate rate={}",
+            post_read.hit_rate_percent()
+        );
+    }
+
+    #[test]
+    fn test_e2e_cache_pressure_eviction_telemetry() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        // Pool capacity is 1024. Write 300 pages — all fit in cache.
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let mut pages = Vec::new();
+        for i in 0..300u32 {
+            let p = txn.allocate_page(&cx).unwrap();
+            let byte = (i % 256) as u8;
+            txn.write_page(&cx, p, &vec![byte; ps]).unwrap();
+            pages.push((p, byte));
+        }
+        txn.commit(&cx).unwrap();
+
+        pager.reset_cache_metrics().unwrap();
+
+        // Sequential read of all 300 pages.
+        let txn2 = pager.begin(&cx, TransactionMode::ReadOnly).unwrap();
+        for (p, expected) in &pages {
+            let data = txn2.get_page(&cx, *p).unwrap();
+            assert_eq!(
+                data.as_ref()[0], *expected,
+                "bead_id={BEAD_E2E} case=pressure_content page={p}"
+            );
+        }
+
+        let metrics = pager.cache_metrics_snapshot().unwrap();
+        // All 300 pages should be cache hits (committed pages are cached).
+        assert!(
+            metrics.total_accesses() >= 300,
+            "bead_id={BEAD_E2E} case=pressure_total_accesses total={}",
+            metrics.total_accesses()
+        );
+        // Cache admits should reflect the committed pages from flush_page.
+        let overall_metrics = pager.cache_metrics_snapshot().unwrap();
+        assert!(
+            overall_metrics.cached_pages > 0,
+            "bead_id={BEAD_E2E} case=pressure_pages_cached cached={}",
+            overall_metrics.cached_pages
+        );
+    }
+
+    #[test]
+    fn test_e2e_hot_cold_workload_hit_rate() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        // Write 50 pages.
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let mut pages = Vec::new();
+        for i in 0..50u32 {
+            let p = txn.allocate_page(&cx).unwrap();
+            txn.write_page(&cx, p, &vec![(i % 256) as u8; ps]).unwrap();
+            pages.push(p);
+        }
+        txn.commit(&cx).unwrap();
+
+        // Define hot set (first 5 pages) and cold set (remaining 45).
+        let hot = &pages[..5];
+
+        pager.reset_cache_metrics().unwrap();
+        let txn2 = pager.begin(&cx, TransactionMode::ReadOnly).unwrap();
+
+        // Zipfian-like access: 80% hot, 20% cold.
+        // Deterministic sequence: hot pages repeated, cold pages scattered.
+        for round in 0..10u32 {
+            // 8 hot accesses.
+            for h in hot {
+                let _ = txn2.get_page(&cx, *h).unwrap();
+            }
+            // 2 cold accesses (rotating through cold pages).
+            let cold_idx = (round as usize * 2) % 45;
+            let _ = txn2.get_page(&cx, pages[5 + cold_idx]).unwrap();
+            let _ = txn2
+                .get_page(&cx, pages[5 + (cold_idx + 1) % 45])
+                .unwrap();
+        }
+
+        let metrics = pager.cache_metrics_snapshot().unwrap();
+        let total = metrics.total_accesses();
+        assert_eq!(
+            total, 70,
+            "bead_id={BEAD_E2E} case=hot_cold_total_accesses"
+        );
+        // Hot pages should achieve high hit rate after first access.
+        assert!(
+            metrics.hit_rate_percent() > 50.0,
+            "bead_id={BEAD_E2E} case=hot_cold_hit_rate rate={}",
+            metrics.hit_rate_percent()
+        );
+    }
+
+    #[test]
+    fn test_e2e_random_access_pattern_deterministic() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        // Write 100 pages.
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let mut pages = Vec::new();
+        for i in 0..100u32 {
+            let p = txn.allocate_page(&cx).unwrap();
+            let mut data = vec![0u8; ps];
+            // Unique fingerprint: page number in first 4 bytes.
+            data[..4].copy_from_slice(&p.get().to_le_bytes());
+            txn.write_page(&cx, p, &data).unwrap();
+            pages.push(p);
+        }
+        txn.commit(&cx).unwrap();
+
+        // Deterministic "random" access via linear congruential generator.
+        // LCG: next = (a * prev + c) mod m, with a=13, c=7, m=100.
+        pager.reset_cache_metrics().unwrap();
+        let txn2 = pager.begin(&cx, TransactionMode::ReadOnly).unwrap();
+        let mut idx: usize = 0;
+        for _ in 0..200 {
+            idx = (13 * idx + 7) % 100;
+            let p = pages[idx];
+            let data = txn2.get_page(&cx, p).unwrap();
+            let stored_pgno = u32::from_le_bytes(data.as_ref()[..4].try_into().unwrap());
+            assert_eq!(
+                stored_pgno,
+                p.get(),
+                "bead_id={BEAD_E2E} case=random_fingerprint page={p}"
+            );
+        }
+
+        let metrics = pager.cache_metrics_snapshot().unwrap();
+        assert_eq!(
+            metrics.total_accesses(),
+            200,
+            "bead_id={BEAD_E2E} case=random_total_accesses"
+        );
+        // With 100 pages and 256-page cache, everything fits → high hit rate.
+        assert!(
+            metrics.hit_rate_percent() > 40.0,
+            "bead_id={BEAD_E2E} case=random_hit_rate rate={}",
+            metrics.hit_rate_percent()
+        );
+    }
+
+    #[test]
+    fn test_e2e_mixed_read_write_workload() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        // Phase 1: Seed 30 pages.
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let mut pages = Vec::new();
+        for i in 0..30u32 {
+            let p = txn.allocate_page(&cx).unwrap();
+            txn.write_page(&cx, p, &vec![(i % 256) as u8; ps]).unwrap();
+            pages.push(p);
+        }
+        txn.commit(&cx).unwrap();
+
+        // Phase 2: Mixed read/write in batches (deterministic).
+        for batch in 0..5u32 {
+            let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+
+            // Read existing pages.
+            for i in 0..10 {
+                let idx = ((batch as usize * 3) + i) % pages.len();
+                let _ = txn.get_page(&cx, pages[idx]).unwrap();
+            }
+
+            // Write/overwrite some pages.
+            for i in 0..3 {
+                let idx = ((batch as usize * 5) + i) % pages.len();
+                let new_val = ((batch * 10 + i as u32) % 256) as u8;
+                txn.write_page(&cx, pages[idx], &vec![new_val; ps]).unwrap();
+            }
+
+            // Allocate a new page per batch.
+            let p = txn.allocate_page(&cx).unwrap();
+            txn.write_page(&cx, p, &vec![0xF0 + batch as u8; ps])
+                .unwrap();
+            pages.push(p);
+
+            txn.commit(&cx).unwrap();
+        }
+
+        // Phase 3: Verify final state.
+        let metrics = pager.cache_metrics_snapshot().unwrap();
+        assert!(
+            metrics.total_accesses() > 0,
+            "bead_id={BEAD_E2E} case=mixed_total_accesses"
+        );
+
+        let txn = pager.begin(&cx, TransactionMode::ReadOnly).unwrap();
+        // Verify the 5 newly allocated pages.
+        for batch in 0..5u32 {
+            let p = pages[30 + batch as usize];
+            let data = txn.get_page(&cx, p).unwrap();
+            assert_eq!(
+                data.as_ref()[0],
+                0xF0 + batch as u8,
+                "bead_id={BEAD_E2E} case=mixed_new_page batch={batch}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_e2e_write_overwrite_verify_latest() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        // Allocate and commit.
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let p = txn.allocate_page(&cx).unwrap();
+        txn.write_page(&cx, p, &vec![0x01; ps]).unwrap();
+        txn.commit(&cx).unwrap();
+
+        // Overwrite 10 times across separate transactions.
+        for version in 2..=11u8 {
+            let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+            txn.write_page(&cx, p, &vec![version; ps]).unwrap();
+            txn.commit(&cx).unwrap();
+        }
+
+        // Final read should see version 11.
+        let txn = pager.begin(&cx, TransactionMode::ReadOnly).unwrap();
+        let data = txn.get_page(&cx, p).unwrap();
+        assert_eq!(
+            data.as_ref()[0],
+            11,
+            "bead_id={BEAD_E2E} case=overwrite_latest_version"
+        );
+    }
+
+    #[test]
+    fn test_e2e_savepoint_heavy_workload() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let mut pages = Vec::new();
+
+        // Allocate 10 pages.
+        for i in 0..10u8 {
+            let p = txn.allocate_page(&cx).unwrap();
+            txn.write_page(&cx, p, &vec![i; ps]).unwrap();
+            pages.push(p);
+        }
+
+        // Savepoint → more writes → rollback → verify.
+        txn.savepoint(&cx, "sp_heavy").unwrap();
+        for &p in &pages {
+            txn.write_page(&cx, p, &vec![0xFF; ps]).unwrap();
+        }
+
+        // All pages should read 0xFF before rollback.
+        for &p in &pages {
+            let data = txn.get_page(&cx, p).unwrap();
+            assert_eq!(data.as_ref()[0], 0xFF);
+        }
+
+        txn.rollback_to_savepoint(&cx, "sp_heavy").unwrap();
+
+        // After rollback, original values restored.
+        for (i, &p) in pages.iter().enumerate() {
+            let data = txn.get_page(&cx, p).unwrap();
+            assert_eq!(
+                data.as_ref()[0], i as u8,
+                "bead_id={BEAD_E2E} case=savepoint_heavy_restored page={p}"
+            );
+        }
+
+        txn.commit(&cx).unwrap();
+    }
+
+    #[test]
+    fn test_e2e_alloc_free_cycle_no_leak() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        let initial_db_size = {
+            let inner = pager.inner.lock().unwrap();
+            inner.db_size
+        };
+
+        // Cycle: allocate → commit → free → commit, 10 times.
+        let mut freed_pages = Vec::new();
+        for _ in 0..10 {
+            let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+            let p = txn.allocate_page(&cx).unwrap();
+            txn.write_page(&cx, p, &vec![0xCC; ps]).unwrap();
+            txn.commit(&cx).unwrap();
+
+            let mut txn2 = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+            txn2.free_page(&cx, p).unwrap();
+            txn2.commit(&cx).unwrap();
+            freed_pages.push(p);
+        }
+
+        // Freelist should have pages available for reuse.
+        let freelist_len = {
+            let inner = pager.inner.lock().unwrap();
+            inner.freelist.len()
+        };
+        assert!(
+            freelist_len > 0,
+            "bead_id={BEAD_E2E} case=alloc_free_freelist_populated"
+        );
+
+        // Allocate again — should reuse freed pages.
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let reused = txn.allocate_page(&cx).unwrap();
+        assert!(
+            freed_pages.contains(&reused),
+            "bead_id={BEAD_E2E} case=alloc_free_reuse reused={reused}"
+        );
+        txn.commit(&cx).unwrap();
+    }
+
+    #[test]
+    fn test_e2e_metrics_monotonic_across_transactions() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        let mut prev_hits = 0u64;
+        let mut prev_misses = 0u64;
+
+        for round in 0..5u32 {
+            let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+            let p = txn.allocate_page(&cx).unwrap();
+            txn.write_page(&cx, p, &vec![round as u8; ps]).unwrap();
+            txn.commit(&cx).unwrap();
+
+            // Read back.
+            let txn2 = pager.begin(&cx, TransactionMode::ReadOnly).unwrap();
+            let _ = txn2.get_page(&cx, p).unwrap();
+
+            let metrics = pager.cache_metrics_snapshot().unwrap();
+            assert!(
+                metrics.hits + metrics.misses >= prev_hits + prev_misses,
+                "bead_id={BEAD_E2E} case=metrics_monotonic round={round} \
+                 total={} prev={}",
+                metrics.hits + metrics.misses,
+                prev_hits + prev_misses
+            );
+            prev_hits = metrics.hits;
+            prev_misses = metrics.misses;
+        }
+    }
+
+    #[test]
+    fn test_e2e_journal_recovery_after_crash_simulation() {
+        let vfs = MemoryVfs::new();
+        let path = PathBuf::from("/crash_sim.db");
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        // Write committed data.
+        let pager = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT).unwrap();
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let p = txn.allocate_page(&cx).unwrap();
+        txn.write_page(&cx, p, &vec![0xAA; ps]).unwrap();
+        txn.commit(&cx).unwrap();
+
+        // Start another write but DON'T commit → simulates crash mid-journal.
+        let mut txn2 = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        txn2.write_page(&cx, p, &vec![0xBB; ps]).unwrap();
+        // Drop without commit → implicit rollback.
+        drop(txn2);
+        drop(pager);
+
+        // Re-open: hot journal recovery should restore original data.
+        let pager2 = SimplePager::open(vfs, &path, PageSize::DEFAULT).unwrap();
+        let txn3 = pager2.begin(&cx, TransactionMode::ReadOnly).unwrap();
+        let data = txn3.get_page(&cx, p).unwrap();
+        assert_eq!(
+            data.as_ref()[0],
+            0xAA,
+            "bead_id={BEAD_E2E} case=journal_recovery_restores_committed"
+        );
+    }
 }

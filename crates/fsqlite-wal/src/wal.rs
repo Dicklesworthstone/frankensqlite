@@ -25,6 +25,19 @@ use crate::checksum::{
     wal_header_checksum, write_wal_frame_checksum, write_wal_frame_salts,
 };
 
+#[inline]
+fn log_replay_decision(
+    replay_cursor: &'static str,
+    frame_no: usize,
+    commit_boundary: usize,
+    decision_reason: &'static str,
+) {
+    debug!(
+        replay_cursor,
+        frame_no, commit_boundary, decision_reason, "WAL replay decision"
+    );
+}
+
 /// A WAL file backed by a VFS file handle.
 ///
 /// Manages the write-ahead log: creation, sequential frame append with
@@ -61,6 +74,7 @@ impl<F: VfsFile> WalFile<F> {
         // or changed in a way we cannot safely reason about incrementally,
         // rebuild state from the on-disk WAL from scratch.
         if file_size < expected_size {
+            log_replay_decision("refresh", 0, self.frame_count, "file_shrank_rebuild");
             return self.rebuild_state_from_file(cx);
         }
 
@@ -70,6 +84,7 @@ impl<F: VfsFile> WalFile<F> {
         let mut header_buf = [0u8; WAL_HEADER_SIZE];
         let header_read = self.file.read(cx, &mut header_buf, 0)?;
         if header_read < WAL_HEADER_SIZE {
+            log_replay_decision("refresh", 0, self.frame_count, "header_short_read_corrupt");
             return Err(FrankenError::WalCorrupt {
                 detail: format!(
                     "WAL file too small for header during refresh: read {header_read}, need {WAL_HEADER_SIZE}"
@@ -82,6 +97,12 @@ impl<F: VfsFile> WalFile<F> {
         let disk_header_checksum = read_wal_header_checksum(&header_buf)?;
         let expected_header_checksum = wal_header_checksum(&header_buf, disk_big_endian)?;
         if disk_header_checksum != expected_header_checksum {
+            log_replay_decision(
+                "refresh",
+                0,
+                self.frame_count,
+                "header_checksum_mismatch_corrupt",
+            );
             return Err(FrankenError::WalCorrupt {
                 detail: "WAL header checksum mismatch during refresh".to_owned(),
             });
@@ -93,6 +114,12 @@ impl<F: VfsFile> WalFile<F> {
             || disk_header.page_size != self.header.page_size
             || disk_header.salts != self.header.salts
         {
+            log_replay_decision(
+                "refresh",
+                0,
+                self.frame_count,
+                "header_generation_changed_rebuild",
+            );
             return self.rebuild_state_from_file(cx);
         }
 
@@ -125,14 +152,27 @@ impl<F: VfsFile> WalFile<F> {
 
         let mut frame_buf = vec![0u8; frame_size];
         for frame_index in self.frame_count..available_frames {
+            let frame_no = frame_index.saturating_add(1);
             let offset = self.frame_offset(frame_index);
             let bytes_read = self.file.read(cx, &mut frame_buf, offset)?;
             if bytes_read < frame_size {
+                log_replay_decision(
+                    "refresh_incremental",
+                    frame_no,
+                    last_commit_count,
+                    "truncated_tail_stop",
+                );
                 break; // Partial/torn tail frame; keep prior valid prefix.
             }
 
             let frame_header = WalFrameHeader::from_bytes(&frame_buf[..WAL_FRAME_HEADER_SIZE])?;
             if frame_header.salts != self.header.salts {
+                log_replay_decision(
+                    "refresh_incremental",
+                    frame_no,
+                    last_commit_count,
+                    "salt_mismatch_stop",
+                );
                 break; // End of valid chain for this generation.
             }
 
@@ -143,6 +183,12 @@ impl<F: VfsFile> WalFile<F> {
                 self.big_endian_checksum,
             )?;
             if frame_header.checksum != expected {
+                log_replay_decision(
+                    "refresh_incremental",
+                    frame_no,
+                    last_commit_count,
+                    "checksum_mismatch_stop",
+                );
                 break; // Checksum mismatch
             }
 
@@ -152,6 +198,19 @@ impl<F: VfsFile> WalFile<F> {
             if frame_header.is_commit() {
                 last_commit_count = new_frame_count;
                 last_commit_checksum = new_running_checksum;
+                log_replay_decision(
+                    "refresh_incremental",
+                    frame_no,
+                    last_commit_count,
+                    "accept_commit",
+                );
+            } else {
+                log_replay_decision(
+                    "refresh_incremental",
+                    frame_no,
+                    last_commit_count,
+                    "accept_non_commit",
+                );
             }
         }
 
@@ -165,6 +224,7 @@ impl<F: VfsFile> WalFile<F> {
         let mut header_buf = [0u8; WAL_HEADER_SIZE];
         let header_read = self.file.read(cx, &mut header_buf, 0)?;
         if header_read < WAL_HEADER_SIZE {
+            log_replay_decision("rebuild", 0, self.frame_count, "header_short_read_corrupt");
             return Err(FrankenError::WalCorrupt {
                 detail: format!(
                     "WAL file too small for header during rebuild: read {header_read}, need {WAL_HEADER_SIZE}"
@@ -178,6 +238,12 @@ impl<F: VfsFile> WalFile<F> {
         let header_checksum = read_wal_header_checksum(&header_buf)?;
         let expected_header_checksum = wal_header_checksum(&header_buf, big_endian_checksum)?;
         if header_checksum != expected_header_checksum {
+            log_replay_decision(
+                "rebuild",
+                0,
+                self.frame_count,
+                "header_checksum_mismatch_corrupt",
+            );
             return Err(FrankenError::WalCorrupt {
                 detail: "WAL header checksum mismatch during rebuild".to_owned(),
             });
@@ -204,14 +270,22 @@ impl<F: VfsFile> WalFile<F> {
 
         let mut frame_buf = vec![0u8; frame_size];
         for frame_index in 0..max_frames {
+            let frame_no = frame_index.saturating_add(1);
             let offset = self.frame_offset(frame_index);
             let bytes_read = self.file.read(cx, &mut frame_buf, offset)?;
             if bytes_read < frame_size {
+                log_replay_decision(
+                    "rebuild",
+                    frame_no,
+                    last_commit_count,
+                    "truncated_tail_stop",
+                );
                 break;
             }
 
             let frame_header = WalFrameHeader::from_bytes(&frame_buf[..WAL_FRAME_HEADER_SIZE])?;
             if frame_header.salts != self.header.salts {
+                log_replay_decision("rebuild", frame_no, last_commit_count, "salt_mismatch_stop");
                 break;
             }
 
@@ -222,6 +296,12 @@ impl<F: VfsFile> WalFile<F> {
                 self.big_endian_checksum,
             )?;
             if frame_header.checksum != expected {
+                log_replay_decision(
+                    "rebuild",
+                    frame_no,
+                    last_commit_count,
+                    "checksum_mismatch_stop",
+                );
                 break;
             }
 
@@ -231,6 +311,9 @@ impl<F: VfsFile> WalFile<F> {
             if frame_header.is_commit() {
                 last_commit_count = new_frame_count;
                 last_commit_checksum = new_running_checksum;
+                log_replay_decision("rebuild", frame_no, last_commit_count, "accept_commit");
+            } else {
+                log_replay_decision("rebuild", frame_no, last_commit_count, "accept_non_commit");
             }
         }
 
@@ -342,6 +425,7 @@ impl<F: VfsFile> WalFile<F> {
         let mut header_buf = [0u8; WAL_HEADER_SIZE];
         let bytes_read = file.read(cx, &mut header_buf, 0)?;
         if bytes_read < WAL_HEADER_SIZE {
+            log_replay_decision("startup_open", 0, 0, "header_short_read_corrupt");
             return Err(FrankenError::WalCorrupt {
                 detail: format!(
                     "WAL file too small for header: read {bytes_read}, need {WAL_HEADER_SIZE}"
@@ -359,6 +443,7 @@ impl<F: VfsFile> WalFile<F> {
             crate::checksum::wal_header_checksum(&header_buf, big_endian_checksum)?;
         if header_checksum != expected_checksum {
             error!("WAL header checksum mismatch — file may be corrupt");
+            log_replay_decision("startup_open", 0, 0, "header_checksum_mismatch_corrupt");
             return Err(FrankenError::WalCorrupt {
                 detail: "WAL header checksum mismatch".to_owned(),
             });
@@ -378,6 +463,7 @@ impl<F: VfsFile> WalFile<F> {
         let mut frame_buf = vec![0u8; frame_size];
 
         for frame_index in 0..max_frames {
+            let frame_no = frame_index.saturating_add(1);
             // Compute in u64 to prevent usize overflow on 32-bit targets.
             // Use the helper method which is guaranteed safe.
             // Note: we can't call self.frame_offset because we don't have self yet.
@@ -389,6 +475,12 @@ impl<F: VfsFile> WalFile<F> {
 
             let bytes_read = file.read(cx, &mut frame_buf, file_offset)?;
             if bytes_read < frame_size {
+                log_replay_decision(
+                    "startup_open",
+                    frame_no,
+                    last_commit_frames,
+                    "truncated_tail_stop",
+                );
                 break; // truncated frame
             }
 
@@ -396,6 +488,12 @@ impl<F: VfsFile> WalFile<F> {
             let frame_header = WalFrameHeader::from_bytes(&frame_buf[..WAL_FRAME_HEADER_SIZE])?;
             if frame_header.salts != header.salts {
                 error!(frame_index, "WAL frame salt mismatch — chain terminated");
+                log_replay_decision(
+                    "startup_open",
+                    frame_no,
+                    last_commit_frames,
+                    "salt_mismatch_stop",
+                );
                 break; // salt mismatch terminates the chain
             }
 
@@ -411,6 +509,12 @@ impl<F: VfsFile> WalFile<F> {
                     frame_index,
                     "WAL frame checksum mismatch — chain terminated"
                 );
+                log_replay_decision(
+                    "startup_open",
+                    frame_no,
+                    last_commit_frames,
+                    "checksum_mismatch_stop",
+                );
                 break; // checksum mismatch terminates the chain
             }
 
@@ -420,6 +524,19 @@ impl<F: VfsFile> WalFile<F> {
             if frame_header.is_commit() {
                 last_commit_frames = valid_frames;
                 last_commit_checksum = running_checksum;
+                log_replay_decision(
+                    "startup_open",
+                    frame_no,
+                    last_commit_frames,
+                    "accept_commit",
+                );
+            } else {
+                log_replay_decision(
+                    "startup_open",
+                    frame_no,
+                    last_commit_frames,
+                    "accept_non_commit",
+                );
             }
         }
 
@@ -439,6 +556,20 @@ impl<F: VfsFile> WalFile<F> {
             running_checksum: last_commit_checksum,
             frame_count: last_commit_frames,
         })
+    }
+
+    /// Advance the internal WAL state after a direct, consolidated file write.
+    ///
+    /// This avoids re-reading the written frames just to update bookkeeping.
+    /// The caller must guarantee the frames were successfully synced to disk
+    /// and that the provided checksum exactly matches the end of the chain.
+    pub fn advance_state_after_write(
+        &mut self,
+        frames_written: usize,
+        new_running_checksum: SqliteWalChecksum,
+    ) {
+        self.frame_count = self.frame_count.saturating_add(frames_written);
+        self.running_checksum = new_running_checksum;
     }
 
     /// Append a frame to the WAL.
@@ -1309,5 +1440,824 @@ mod tests {
 
         // We can't easily instantiate a WalFile with this many frames without massive I/O,
         // but we've verified the arithmetic logic in the test body matches the implementation.
+    }
+
+    // ── bd-xfn30.1: WAL append path correctness ──
+    //
+    // Frame ordering, checksum determinism, commit boundary semantics.
+
+    #[test]
+    fn test_frame_offsets_sequential_no_gaps() {
+        // Verify that file offsets match the expected formula:
+        //   offset(i) = WAL_HEADER_SIZE + i * frame_size
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let file = open_wal_file(&vfs, &cx);
+
+        let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create WAL");
+
+        let n = 20u32;
+        for i in 0..n {
+            let db_size = if i == n - 1 { n } else { 0 };
+            wal.append_frame(
+                &cx,
+                i + 1,
+                &sample_page(u8::try_from(i % 251).unwrap()),
+                db_size,
+            )
+            .expect("append");
+        }
+
+        let frame_size = wal.frame_size();
+        let file_size = wal.file().file_size(&cx).expect("file_size");
+        let expected_size =
+            u64::try_from(WAL_HEADER_SIZE + usize::try_from(n).unwrap() * frame_size).unwrap();
+        assert_eq!(
+            file_size, expected_size,
+            "WAL file size must equal header + n*frame_size with no padding or gaps"
+        );
+
+        // Verify each frame header's page_number at the right offset.
+        for i in 0..n {
+            let header = wal
+                .read_frame_header(&cx, usize::try_from(i).unwrap())
+                .expect("read header");
+            assert_eq!(header.page_number, i + 1, "frame {i} page_number");
+        }
+
+        wal.close(&cx).expect("close WAL");
+    }
+
+    #[test]
+    fn test_checksum_determinism_same_input() {
+        // Two separate WALs created with identical params and identical frames
+        // must produce byte-for-byte identical checksum chains.
+        let cx = test_cx();
+        let vfs1 = MemoryVfs::new();
+        let vfs2 = MemoryVfs::new();
+
+        let mut checksums_a = Vec::new();
+        let mut checksums_b = Vec::new();
+
+        for (vfs, checksums) in [(&vfs1, &mut checksums_a), (&vfs2, &mut checksums_b)] {
+            let file = open_wal_file(vfs, &cx);
+            let mut wal =
+                WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create WAL");
+
+            for i in 0..10u8 {
+                let db_size = if i == 9 { 10 } else { 0 };
+                wal.append_frame(&cx, u32::from(i) + 1, &sample_page(i), db_size)
+                    .expect("append");
+                checksums.push(wal.running_checksum());
+            }
+            wal.close(&cx).expect("close WAL");
+        }
+
+        assert_eq!(
+            checksums_a, checksums_b,
+            "identical inputs must produce identical checksum chains"
+        );
+    }
+
+    #[test]
+    fn test_checksum_sensitivity_one_byte_difference() {
+        // Changing one byte in one frame's page data must produce a different
+        // running checksum from that frame onward.
+        let cx = test_cx();
+        let vfs1 = MemoryVfs::new();
+        let vfs2 = MemoryVfs::new();
+
+        let mut checksums_a = Vec::new();
+        let mut checksums_b = Vec::new();
+
+        let file1 = open_wal_file(&vfs1, &cx);
+        let mut wal1 = WalFile::create(&cx, file1, PAGE_SIZE, 0, test_salts()).expect("create");
+        let file2 = open_wal_file(&vfs2, &cx);
+        let mut wal2 = WalFile::create(&cx, file2, PAGE_SIZE, 0, test_salts()).expect("create");
+
+        for i in 0..5u8 {
+            let mut page = sample_page(i);
+            let db_size = if i == 4 { 5 } else { 0 };
+            wal1.append_frame(&cx, u32::from(i) + 1, &page, db_size)
+                .expect("append");
+            checksums_a.push(wal1.running_checksum());
+
+            // Flip one byte in frame 2 only.
+            if i == 2 {
+                page[0] ^= 0x01;
+            }
+            wal2.append_frame(&cx, u32::from(i) + 1, &page, db_size)
+                .expect("append");
+            checksums_b.push(wal2.running_checksum());
+        }
+
+        // Frames 0..2 should match, frames 2..5 should diverge.
+        assert_eq!(checksums_a[0], checksums_b[0], "frame 0 should match");
+        assert_eq!(checksums_a[1], checksums_b[1], "frame 1 should match");
+        assert_ne!(checksums_a[2], checksums_b[2], "frame 2 must diverge");
+        assert_ne!(checksums_a[3], checksums_b[3], "frame 3 must diverge");
+        assert_ne!(checksums_a[4], checksums_b[4], "frame 4 must diverge");
+
+        wal1.close(&cx).expect("close");
+        wal2.close(&cx).expect("close");
+    }
+
+    #[test]
+    fn test_commit_boundary_every_frame() {
+        // All frames are commit frames (db_size > 0).
+        // Recovery should see all frames after reopen.
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let file = open_wal_file(&vfs, &cx);
+
+        let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
+
+        let n = 8u32;
+        for i in 0..n {
+            wal.append_frame(&cx, i + 1, &sample_page(u8::try_from(i).unwrap()), i + 1)
+                .expect("append");
+        }
+        assert_eq!(wal.frame_count(), usize::try_from(n).unwrap());
+        wal.close(&cx).expect("close");
+
+        let file2 = open_wal_file(&vfs, &cx);
+        let mut wal2 = WalFile::open(&cx, file2).expect("reopen");
+        assert_eq!(
+            wal2.frame_count(),
+            usize::try_from(n).unwrap(),
+            "all frames are commits so all should survive reopen"
+        );
+
+        // Every frame should have is_commit() == true.
+        for i in 0..n {
+            let h = wal2
+                .read_frame_header(&cx, usize::try_from(i).unwrap())
+                .expect("read");
+            assert!(h.is_commit(), "frame {i} must be a commit");
+            assert_eq!(h.db_size, i + 1);
+        }
+
+        // last_commit_frame should be the final frame.
+        let last = wal2.last_commit_frame(&cx).expect("query");
+        assert_eq!(last, Some(usize::try_from(n - 1).unwrap()));
+
+        wal2.close(&cx).expect("close");
+    }
+
+    #[test]
+    fn test_commit_boundary_interleaved_multi_txn() {
+        // Three transactions with interleaved commit markers:
+        //   Txn1: pages 1,2,3 (commit at frame 3, db_size=3)
+        //   Txn2: pages 4,5 (commit at frame 5, db_size=5)
+        //   Txn3: pages 6 (commit at frame 6, db_size=6)
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let file = open_wal_file(&vfs, &cx);
+        let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
+
+        let frames: [(u32, u32); 6] = [
+            (1, 0),
+            (2, 0),
+            (3, 3), // commit txn1
+            (4, 0),
+            (5, 5), // commit txn2
+            (6, 6), // commit txn3
+        ];
+
+        for (pg, db_sz) in frames {
+            wal.append_frame(&cx, pg, &sample_page(u8::try_from(pg).unwrap()), db_sz)
+                .expect("append");
+        }
+        assert_eq!(wal.frame_count(), 6);
+        wal.close(&cx).expect("close");
+
+        // Reopen: all 6 should survive (3 commits).
+        let file2 = open_wal_file(&vfs, &cx);
+        let mut wal2 = WalFile::open(&cx, file2).expect("reopen");
+        assert_eq!(wal2.frame_count(), 6);
+
+        let last = wal2.last_commit_frame(&cx).expect("query");
+        assert_eq!(last, Some(5), "last commit is frame 6 (index 5)");
+
+        wal2.close(&cx).expect("close");
+    }
+
+    #[test]
+    fn test_same_page_overwritten_multiple_times() {
+        // Write the same page number multiple times. The WAL should record
+        // each write at a sequential frame index. The last write's data
+        // should be readable.
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let file = open_wal_file(&vfs, &cx);
+        let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
+
+        let page_num = 42u32;
+        let versions = 5;
+        for v in 0..versions {
+            let db_size = if v == versions - 1 { 100 } else { 0 };
+            wal.append_frame(&cx, page_num, &sample_page(v), db_size)
+                .expect("append");
+        }
+        assert_eq!(wal.frame_count(), usize::from(versions));
+
+        // Each frame should contain its unique version of the page.
+        for v in 0..versions {
+            let (header, data) = wal.read_frame(&cx, usize::from(v)).expect("read");
+            assert_eq!(header.page_number, page_num);
+            assert_eq!(data, sample_page(v), "frame {v} data mismatch");
+        }
+
+        wal.close(&cx).expect("close");
+    }
+
+    #[test]
+    fn test_refresh_detects_concurrent_append() {
+        // Simulate a second writer appending frames that the first handle
+        // doesn't know about. After refresh(), the first handle should see them.
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let file1 = open_wal_file(&vfs, &cx);
+        let mut wal1 = WalFile::create(&cx, file1, PAGE_SIZE, 0, test_salts()).expect("create");
+
+        // First writer commits 3 frames.
+        for i in 0..3u8 {
+            let db_size = if i == 2 { 3 } else { 0 };
+            wal1.append_frame(&cx, u32::from(i) + 1, &sample_page(i), db_size)
+                .expect("append");
+        }
+        let checksum_after_3 = wal1.running_checksum();
+        wal1.close(&cx).expect("close wal1");
+
+        // "Reader" opens, sees 3 frames.
+        let file_reader = open_wal_file(&vfs, &cx);
+        let mut reader = WalFile::open(&cx, file_reader).expect("open reader");
+        assert_eq!(reader.frame_count(), 3);
+
+        // "Second writer" appends 2 more frames (frames 4,5 with commit at 5).
+        let file_w2 = open_wal_file(&vfs, &cx);
+        let mut w2 = WalFile::open(&cx, file_w2).expect("open w2");
+        assert_eq!(w2.running_checksum(), checksum_after_3);
+        w2.append_frame(&cx, 4, &sample_page(3), 0).expect("append");
+        w2.append_frame(&cx, 5, &sample_page(4), 5)
+            .expect("append commit");
+        assert_eq!(w2.frame_count(), 5);
+        w2.close(&cx).expect("close w2");
+
+        // Reader still sees 3 until refresh().
+        assert_eq!(reader.frame_count(), 3);
+        reader.refresh(&cx).expect("refresh");
+        assert_eq!(
+            reader.frame_count(),
+            5,
+            "after refresh, reader must see the 2 new committed frames"
+        );
+
+        reader.close(&cx).expect("close reader");
+    }
+
+    #[test]
+    fn test_refresh_after_reset_detects_new_generation() {
+        // After a checkpoint reset, refresh should detect the salt change
+        // and rebuild state.
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let file = open_wal_file(&vfs, &cx);
+        let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
+
+        // Write and commit.
+        wal.append_frame(&cx, 1, &sample_page(1), 1)
+            .expect("append");
+        wal.close(&cx).expect("close");
+
+        // Open as "reader".
+        let file_r = open_wal_file(&vfs, &cx);
+        let mut reader = WalFile::open(&cx, file_r).expect("open reader");
+        assert_eq!(reader.frame_count(), 1);
+
+        // "Checkpointer" opens, resets with new salts.
+        let file_cp = open_wal_file(&vfs, &cx);
+        let mut cp = WalFile::open(&cx, file_cp).expect("open cp");
+        let new_salts = WalSalts {
+            salt1: 0xAAAA_BBBB,
+            salt2: 0xCCCC_DDDD,
+        };
+        cp.reset(&cx, 1, new_salts).expect("reset");
+        cp.append_frame(&cx, 1, &sample_page(0xAA), 1)
+            .expect("append after reset");
+        cp.close(&cx).expect("close cp");
+
+        // Reader refresh: should rebuild and see the new generation.
+        reader.refresh(&cx).expect("refresh");
+        assert_eq!(reader.frame_count(), 1);
+        assert_eq!(
+            reader.header().salts,
+            new_salts,
+            "salts should be new generation"
+        );
+
+        reader.close(&cx).expect("close reader");
+    }
+
+    #[test]
+    fn test_group_commit_checksum_chain_matches_single_append() {
+        // Verify that writing frames via group commit produces the exact same
+        // checksum chain as writing them one-at-a-time via append_frame().
+        use crate::group_commit::{
+            FrameSubmission, TransactionFrameBatch, write_consolidated_frames,
+        };
+
+        let cx = test_cx();
+        let vfs_single = MemoryVfs::new();
+        let vfs_group = MemoryVfs::new();
+
+        let pages: Vec<Vec<u8>> = (0..6u8).map(sample_page).collect();
+        let page_nums: Vec<u32> = (1..=6u32).collect();
+        // Commit at frame 3 and frame 6.
+        let commit_sizes: Vec<u32> = vec![0, 0, 3, 0, 0, 6];
+
+        // Single-frame path.
+        let file_s = open_wal_file(&vfs_single, &cx);
+        let mut wal_s =
+            WalFile::create(&cx, file_s, PAGE_SIZE, 0, test_salts()).expect("create single");
+        for i in 0..6 {
+            wal_s
+                .append_frame(&cx, page_nums[i], &pages[i], commit_sizes[i])
+                .expect("append single");
+        }
+        let single_checksum = wal_s.running_checksum();
+        let single_count = wal_s.frame_count();
+
+        // Group commit path: two batches of 3 frames each.
+        let file_g = open_wal_file(&vfs_group, &cx);
+        let mut wal_g =
+            WalFile::create(&cx, file_g, PAGE_SIZE, 0, test_salts()).expect("create group");
+
+        let batch1 = TransactionFrameBatch::new(
+            (0..3)
+                .map(|i| FrameSubmission {
+                    page_number: page_nums[i],
+                    page_data: pages[i].clone(),
+                    db_size_if_commit: commit_sizes[i],
+                })
+                .collect(),
+        );
+        let batch2 = TransactionFrameBatch::new(
+            (3..6)
+                .map(|i| FrameSubmission {
+                    page_number: page_nums[i],
+                    page_data: pages[i].clone(),
+                    db_size_if_commit: commit_sizes[i],
+                })
+                .collect(),
+        );
+
+        write_consolidated_frames(&cx, &mut wal_g, &[batch1, batch2]).expect("group write");
+        let group_checksum = wal_g.running_checksum();
+        let group_count = wal_g.frame_count();
+
+        assert_eq!(single_count, group_count, "frame counts must match");
+        assert_eq!(
+            single_checksum, group_checksum,
+            "group commit must produce identical checksum chain as single-frame append"
+        );
+
+        // Verify byte-level frame content equality.
+        for i in 0..6 {
+            let (h_s, d_s) = wal_s.read_frame(&cx, i).expect("read single");
+            let (h_g, d_g) = wal_g.read_frame(&cx, i).expect("read group");
+            assert_eq!(h_s.page_number, h_g.page_number, "frame {i} page_number");
+            assert_eq!(h_s.db_size, h_g.db_size, "frame {i} db_size");
+            assert_eq!(h_s.checksum, h_g.checksum, "frame {i} checksum");
+            assert_eq!(h_s.salts, h_g.salts, "frame {i} salts");
+            assert_eq!(d_s, d_g, "frame {i} data");
+        }
+
+        wal_s.close(&cx).expect("close single");
+        wal_g.close(&cx).expect("close group");
+    }
+
+    #[test]
+    fn test_uncommitted_tail_trimmed_on_reopen() {
+        // Write 5 frames: commit at frame 3, no commit after.
+        // On reopen, only frames up to the last commit (3) should survive.
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let file = open_wal_file(&vfs, &cx);
+        let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
+
+        let commit_map: [(u32, u32); 5] = [(1, 0), (2, 0), (3, 3), (4, 0), (5, 0)];
+        for (pg, db_sz) in commit_map {
+            wal.append_frame(&cx, pg, &sample_page(u8::try_from(pg).unwrap()), db_sz)
+                .expect("append");
+        }
+        assert_eq!(wal.frame_count(), 5);
+        wal.close(&cx).expect("close");
+
+        // Reopen: uncommitted tail (frames 4,5) should be trimmed.
+        let file2 = open_wal_file(&vfs, &cx);
+        let wal2 = WalFile::open(&cx, file2).expect("reopen");
+        assert_eq!(
+            wal2.frame_count(),
+            3,
+            "frames after last commit should be trimmed on reopen"
+        );
+        wal2.close(&cx).expect("close");
+    }
+
+    #[test]
+    fn test_large_transaction_50_frames() {
+        // A single transaction writing 50 frames (commit only on last).
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let file = open_wal_file(&vfs, &cx);
+        let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
+
+        let n = 50u32;
+        for i in 0..n {
+            let db_size = if i == n - 1 { n } else { 0 };
+            let seed = u8::try_from(i % 251).unwrap();
+            wal.append_frame(&cx, i + 1, &sample_page(seed), db_size)
+                .expect("append");
+        }
+        assert_eq!(wal.frame_count(), usize::try_from(n).unwrap());
+        let final_checksum = wal.running_checksum();
+        wal.close(&cx).expect("close");
+
+        // Reopen and verify all 50 frames survived (single commit at end).
+        let file2 = open_wal_file(&vfs, &cx);
+        let mut wal2 = WalFile::open(&cx, file2).expect("reopen");
+        assert_eq!(wal2.frame_count(), usize::try_from(n).unwrap());
+        assert_eq!(wal2.running_checksum(), final_checksum);
+
+        // Spot-check first, middle, last frames.
+        for idx in [0, 24, 49] {
+            let (h, d) = wal2.read_frame(&cx, idx).expect("read");
+            let i = u32::try_from(idx).unwrap();
+            assert_eq!(h.page_number, i + 1);
+            assert_eq!(d, sample_page(u8::try_from(i % 251).unwrap()));
+        }
+
+        wal2.close(&cx).expect("close");
+    }
+
+    #[test]
+    fn test_append_after_reset_checksum_independent() {
+        // After reset, the checksum chain starts fresh from the new header.
+        // Identical frames appended to a fresh WAL and a reset WAL with the
+        // same salts should yield the same checksums.
+        let cx = test_cx();
+
+        let salts = WalSalts {
+            salt1: 0x1234_5678,
+            salt2: 0x9ABC_DEF0,
+        };
+
+        // Fresh WAL.
+        let vfs1 = MemoryVfs::new();
+        let file1 = open_wal_file(&vfs1, &cx);
+        let mut wal_fresh = WalFile::create(&cx, file1, PAGE_SIZE, 1, salts).expect("create fresh");
+        wal_fresh
+            .append_frame(&cx, 1, &sample_page(0x42), 1)
+            .expect("append fresh");
+        let fresh_checksum = wal_fresh.running_checksum();
+        wal_fresh.close(&cx).expect("close fresh");
+
+        // WAL that was written to, then reset to same salts and checkpoint_seq.
+        let vfs2 = MemoryVfs::new();
+        let file2 = open_wal_file(&vfs2, &cx);
+        let mut wal_reset =
+            WalFile::create(&cx, file2, PAGE_SIZE, 0, test_salts()).expect("create reset");
+        // Write some frames.
+        wal_reset
+            .append_frame(&cx, 99, &sample_page(0xFF), 99)
+            .expect("append old");
+        // Reset to same salts as fresh.
+        wal_reset.reset(&cx, 1, salts).expect("reset");
+        wal_reset
+            .append_frame(&cx, 1, &sample_page(0x42), 1)
+            .expect("append after reset");
+        let reset_checksum = wal_reset.running_checksum();
+        wal_reset.close(&cx).expect("close reset");
+
+        assert_eq!(
+            fresh_checksum, reset_checksum,
+            "after reset with same salts, checksum chain must match fresh WAL"
+        );
+    }
+
+    // ── bd-xfn30.3: Fault-injection e2e crash matrix ──
+    //
+    // Deterministic crash-at-every-boundary scenarios with recovery validation.
+
+    /// Build a WAL with two committed transactions and return the VFS.
+    /// Txn1: frames 1-3 (commit at 3, db_size=3)
+    /// Txn2: frames 4-6 (commit at 6, db_size=6)
+    fn build_two_txn_wal() -> (MemoryVfs, Vec<Vec<u8>>) {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let file = open_wal_file(&vfs, &cx);
+        let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
+
+        let mut pages = Vec::new();
+        let frame_specs: [(u32, u32); 6] = [
+            (1, 0),
+            (2, 0),
+            (3, 3), // txn1
+            (4, 0),
+            (5, 0),
+            (6, 6), // txn2
+        ];
+        for (pg, db_sz) in frame_specs {
+            let page = sample_page(u8::try_from(pg).unwrap());
+            wal.append_frame(&cx, pg, &page, db_sz).expect("append");
+            pages.push(page);
+        }
+        wal.close(&cx).expect("close");
+        (vfs, pages)
+    }
+
+    #[test]
+    fn test_crash_matrix_truncate_at_every_frame_boundary() {
+        // For a WAL with 6 frames (2 txns), truncate at every possible
+        // frame boundary and verify recovery gives the right frame count.
+        let cx = test_cx();
+        let frame_size = WAL_FRAME_HEADER_SIZE + usize::try_from(PAGE_SIZE).unwrap();
+
+        for cut_frames in 0..=6usize {
+            // Rebuild fresh WAL for each truncation point.
+            let (vfs, _) = build_two_txn_wal();
+
+            let cut_at = WAL_HEADER_SIZE + cut_frames * frame_size;
+            let mut f = open_wal_file(&vfs, &cx);
+            f.truncate(&cx, u64::try_from(cut_at).unwrap())
+                .expect("truncate");
+            drop(f);
+
+            let f2 = open_wal_file(&vfs, &cx);
+            let wal = WalFile::open(&cx, f2).expect("open after truncation");
+            let expected = match cut_frames {
+                0..=2 => 0, // no commit yet
+                3..=5 => 3, // first txn committed
+                6 => 6,     // both txns committed
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                wal.frame_count(),
+                expected,
+                "truncated at {cut_frames} frames should give {expected} committed"
+            );
+            wal.close(&cx).expect("close");
+        }
+
+        // Also test partial-frame truncation at various byte offsets.
+        for partial in 0..20usize {
+            let (vfs, _) = build_two_txn_wal();
+
+            let cut_byte = WAL_HEADER_SIZE + partial * frame_size / 3;
+            let mut f = open_wal_file(&vfs, &cx);
+            f.truncate(&cx, u64::try_from(cut_byte).unwrap())
+                .expect("truncate");
+            drop(f);
+
+            let f2 = open_wal_file(&vfs, &cx);
+            let wal = WalFile::open(&cx, f2).expect("open");
+            // Recovery should give 0, 3, or 6 committed frames (never partial).
+            assert!(
+                wal.frame_count() == 0 || wal.frame_count() == 3 || wal.frame_count() == 6,
+                "cut_byte={cut_byte} gave frame_count={}, expected 0/3/6",
+                wal.frame_count()
+            );
+            wal.close(&cx).expect("close");
+        }
+    }
+
+    #[test]
+    fn test_crash_matrix_bit_flip_at_every_frame() {
+        // Flip a byte in each frame's data and verify recovery truncates
+        // to the correct committed prefix.
+        for target_frame in 0..6usize {
+            let (vfs, _) = build_two_txn_wal();
+            let cx = test_cx();
+
+            let frame_size = WAL_FRAME_HEADER_SIZE + usize::try_from(PAGE_SIZE).unwrap();
+            let corrupt_offset =
+                WAL_HEADER_SIZE + target_frame * frame_size + WAL_FRAME_HEADER_SIZE + 42;
+
+            // Corrupt one byte.
+            let mut f = open_wal_file(&vfs, &cx);
+            let mut buf = [0u8; 1];
+            let off = u64::try_from(corrupt_offset).unwrap();
+            f.read(&cx, &mut buf, off).expect("read");
+            buf[0] ^= 0xFF;
+            f.write(&cx, &buf, off).expect("write corrupt");
+            drop(f);
+
+            let f2 = open_wal_file(&vfs, &cx);
+            let wal = WalFile::open(&cx, f2).expect("open");
+            let expected = if target_frame < 3 {
+                0 // corruption in txn1 — no committed frames
+            } else {
+                3 // corruption in txn2 — txn1 survives
+            };
+            assert_eq!(
+                wal.frame_count(),
+                expected,
+                "bit flip in frame {target_frame} should give {expected}"
+            );
+            wal.close(&cx).expect("close");
+        }
+    }
+
+    #[test]
+    fn test_crash_matrix_continue_after_recovery() {
+        // After recovery from a crash, verify that new frames can be appended
+        // and the checksum chain continues correctly.
+        let (vfs, _) = build_two_txn_wal();
+        let cx = test_cx();
+
+        let frame_size = WAL_FRAME_HEADER_SIZE + usize::try_from(PAGE_SIZE).unwrap();
+
+        // Corrupt frame 5 (in txn2), so recovery yields 3 frames (txn1).
+        let corrupt_offset = WAL_HEADER_SIZE + 4 * frame_size + WAL_FRAME_HEADER_SIZE + 10;
+        let mut f = open_wal_file(&vfs, &cx);
+        let mut buf = [0u8; 1];
+        let off = u64::try_from(corrupt_offset).unwrap();
+        f.read(&cx, &mut buf, off).expect("read");
+        buf[0] ^= 0xAA;
+        f.write(&cx, &buf, off).expect("write corrupt");
+        drop(f);
+
+        // Recover.
+        let f2 = open_wal_file(&vfs, &cx);
+        let mut wal = WalFile::open(&cx, f2).expect("open");
+        assert_eq!(wal.frame_count(), 3);
+
+        // Append new transaction (frames 4-5, commit at 5).
+        wal.append_frame(&cx, 10, &sample_page(0xAA), 0)
+            .expect("append");
+        wal.append_frame(&cx, 11, &sample_page(0xBB), 5)
+            .expect("append commit");
+        assert_eq!(wal.frame_count(), 5);
+        let checksum_after = wal.running_checksum();
+        wal.close(&cx).expect("close");
+
+        // Verify the new transaction persists.
+        let f3 = open_wal_file(&vfs, &cx);
+        let mut wal2 = WalFile::open(&cx, f3).expect("reopen");
+        assert_eq!(wal2.frame_count(), 5);
+        assert_eq!(wal2.running_checksum(), checksum_after);
+
+        // Verify original txn1 data intact.
+        for i in 0..3 {
+            let (h, d) = wal2.read_frame(&cx, i).expect("read");
+            let pg = u32::try_from(i + 1).unwrap();
+            assert_eq!(h.page_number, pg);
+            assert_eq!(d, sample_page(u8::try_from(pg).unwrap()));
+        }
+
+        // Verify new data.
+        let (h4, d4) = wal2.read_frame(&cx, 3).expect("read new frame 4");
+        assert_eq!(h4.page_number, 10);
+        assert_eq!(d4, sample_page(0xAA));
+
+        wal2.close(&cx).expect("close");
+    }
+
+    #[test]
+    fn test_crash_matrix_zero_length_wal() {
+        // WAL file with only a header (no frames) simulates crash before any write.
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let file = open_wal_file(&vfs, &cx);
+        let wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
+        wal.close(&cx).expect("close");
+
+        let f2 = open_wal_file(&vfs, &cx);
+        let wal2 = WalFile::open(&cx, f2).expect("open");
+        assert_eq!(wal2.frame_count(), 0);
+        wal2.close(&cx).expect("close");
+    }
+
+    #[test]
+    fn test_crash_matrix_header_only_partial_first_frame() {
+        // WAL header plus partial first frame.
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let file = open_wal_file(&vfs, &cx);
+        let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
+        wal.append_frame(&cx, 1, &sample_page(1), 1)
+            .expect("append");
+        // Truncate to leave partial frame.
+        let partial_size = WAL_HEADER_SIZE + WAL_FRAME_HEADER_SIZE + 10;
+        wal.file_mut()
+            .truncate(&cx, u64::try_from(partial_size).unwrap())
+            .expect("truncate");
+        wal.close(&cx).expect("close");
+
+        let f2 = open_wal_file(&vfs, &cx);
+        let wal2 = WalFile::open(&cx, f2).expect("open");
+        assert_eq!(wal2.frame_count(), 0, "partial frame should be dropped");
+        wal2.close(&cx).expect("close");
+    }
+
+    #[test]
+    fn test_crash_matrix_many_txns_deterministic_recovery() {
+        // 10 transactions of 3 frames each (30 total frames).
+        // Crash at each transaction boundary and verify recovery.
+        let cx = test_cx();
+
+        for crash_txn in 0..=10usize {
+            let vfs = MemoryVfs::new();
+            let file = open_wal_file(&vfs, &cx);
+            let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
+
+            let total_frames = crash_txn * 3;
+            for txn in 0..crash_txn {
+                for f in 0..3u32 {
+                    let pg = u32::try_from(txn * 3).unwrap() + f + 1;
+                    let db_size = if f == 2 {
+                        u32::try_from(txn * 3 + 3).unwrap()
+                    } else {
+                        0
+                    };
+                    let seed = u8::try_from(pg % 251).unwrap();
+                    wal.append_frame(&cx, pg, &sample_page(seed), db_size)
+                        .expect("append");
+                }
+            }
+            assert_eq!(wal.frame_count(), total_frames);
+            wal.close(&cx).expect("close");
+
+            // Reopen: all frames should survive (all txns committed).
+            let f2 = open_wal_file(&vfs, &cx);
+            let wal2 = WalFile::open(&cx, f2).expect("open");
+            assert_eq!(
+                wal2.frame_count(),
+                total_frames,
+                "crash_txn={crash_txn}: all {total_frames} committed frames should survive"
+            );
+            wal2.close(&cx).expect("close");
+
+            // Now truncate mid-way through the next (incomplete) txn.
+            if crash_txn < 10 {
+                // Write 1 more uncommitted frame.
+                let f3 = open_wal_file(&vfs, &cx);
+                let mut wal3 = WalFile::open(&cx, f3).expect("open");
+                let extra_pg = u32::try_from(total_frames + 1).unwrap();
+                wal3.append_frame(
+                    &cx,
+                    extra_pg,
+                    &sample_page(u8::try_from(extra_pg % 251).unwrap()),
+                    0,
+                )
+                .expect("append uncommitted");
+                wal3.close(&cx).expect("close");
+
+                // Reopen: uncommitted frame should be dropped.
+                let f4 = open_wal_file(&vfs, &cx);
+                let wal4 = WalFile::open(&cx, f4).expect("open");
+                assert_eq!(
+                    wal4.frame_count(),
+                    total_frames,
+                    "crash_txn={crash_txn}: uncommitted extra frame dropped"
+                );
+                wal4.close(&cx).expect("close");
+            }
+        }
+    }
+
+    #[test]
+    fn test_crash_matrix_reset_then_crash() {
+        // Reset WAL, write partial txn, crash. Recovery should give 0 frames.
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let file = open_wal_file(&vfs, &cx);
+        let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, test_salts()).expect("create");
+
+        // Write and commit.
+        wal.append_frame(&cx, 1, &sample_page(1), 1)
+            .expect("append");
+        // Reset.
+        let new_salts = WalSalts {
+            salt1: 0x5555_6666,
+            salt2: 0x7777_8888,
+        };
+        wal.reset(&cx, 1, new_salts).expect("reset");
+        assert_eq!(wal.frame_count(), 0);
+
+        // Write partial txn (no commit).
+        wal.append_frame(&cx, 1, &sample_page(0xCC), 0)
+            .expect("append");
+        wal.append_frame(&cx, 2, &sample_page(0xDD), 0)
+            .expect("append");
+        wal.close(&cx).expect("close");
+
+        // Reopen: no committed frames after reset.
+        let f2 = open_wal_file(&vfs, &cx);
+        let wal2 = WalFile::open(&cx, f2).expect("open");
+        assert_eq!(wal2.frame_count(), 0, "no commits after reset");
+        assert_eq!(wal2.header().salts, new_salts);
+        wal2.close(&cx).expect("close");
     }
 }

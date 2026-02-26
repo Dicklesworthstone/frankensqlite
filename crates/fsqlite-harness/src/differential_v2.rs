@@ -170,7 +170,7 @@ impl ExecutionEnvelope {
             run_id: None,
             engines: EngineVersions {
                 fsqlite: env!("CARGO_PKG_VERSION").to_owned(),
-                csqlite: String::new(),
+                csqlite: rusqlite::version().to_owned(),
             },
             pragmas: PragmaConfig::default(),
             schema: Vec::new(),
@@ -417,6 +417,17 @@ struct ResultHashable<'a> {
 
 // ─── Execution Engine (trait-based for testability) ──────────────────────
 
+/// Identity of a SQL executor backend used for oracle wiring checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EngineIdentity {
+    /// FrankenSQLite engine under test.
+    FrankenSqlite,
+    /// C SQLite oracle implementation.
+    CSqliteOracle,
+    /// Test/diagnostic executor with unknown identity.
+    Unknown,
+}
+
 /// Trait for a SQL execution backend (implemented by both fsqlite and rusqlite).
 pub trait SqlExecutor {
     /// Execute a non-query statement, returning affected row count.
@@ -432,6 +443,14 @@ pub trait SqlExecutor {
     ///
     /// Returns the error message as a string.
     fn query(&self, sql: &str) -> Result<Vec<Vec<NormalizedValue>>, String>;
+
+    /// Stable executor identity for parity wiring checks.
+    ///
+    /// Implementors used in strict parity mode SHOULD return either
+    /// [`EngineIdentity::FrankenSqlite`] or [`EngineIdentity::CSqliteOracle`].
+    fn engine_identity(&self) -> EngineIdentity {
+        EngineIdentity::Unknown
+    }
 
     /// Run a statement (auto-detecting query vs DML).
     fn run_stmt(&self, sql: &str) -> StmtOutcome {
@@ -539,9 +558,71 @@ impl SqlExecutor for FsqliteExecutor {
             })
             .collect())
     }
+
+    fn engine_identity(&self) -> EngineIdentity {
+        EngineIdentity::FrankenSqlite
+    }
+}
+
+/// C SQLite oracle executor wrapping `rusqlite::Connection`.
+pub struct CsqliteExecutor {
+    conn: rusqlite::Connection,
+}
+
+impl CsqliteExecutor {
+    /// Open an in-memory C SQLite database.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error string if the connection fails.
+    pub fn open_in_memory() -> Result<Self, String> {
+        let conn = rusqlite::Connection::open_in_memory().map_err(|e| e.to_string())?;
+        Ok(Self { conn })
+    }
+}
+
+impl SqlExecutor for CsqliteExecutor {
+    fn execute(&self, sql: &str) -> Result<usize, String> {
+        self.conn.execute(sql.trim(), []).map_err(|e| e.to_string())
+    }
+
+    fn query(&self, sql: &str) -> Result<Vec<Vec<NormalizedValue>>, String> {
+        let mut stmt = self.conn.prepare(sql.trim()).map_err(|e| e.to_string())?;
+        let col_count = stmt.column_count();
+        let rows = stmt
+            .query_map([], |row| {
+                let mut vals = Vec::with_capacity(col_count);
+                for i in 0..col_count {
+                    let v: rusqlite::types::Value =
+                        row.get(i).unwrap_or(rusqlite::types::Value::Null);
+                    vals.push(match v {
+                        rusqlite::types::Value::Null => NormalizedValue::Null,
+                        rusqlite::types::Value::Integer(i) => NormalizedValue::Integer(i),
+                        rusqlite::types::Value::Real(f) => NormalizedValue::Real(f),
+                        rusqlite::types::Value::Text(s) => NormalizedValue::Text(s),
+                        rusqlite::types::Value::Blob(b) => NormalizedValue::Blob(b),
+                    });
+                }
+                Ok(vals)
+            })
+            .map_err(|e| e.to_string())?;
+
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
+    }
+
+    fn engine_identity(&self) -> EngineIdentity {
+        EngineIdentity::CSqliteOracle
+    }
 }
 
 // ─── Harness Runner ──────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DifferentialMode {
+    Parity,
+    Diagnostic,
+}
 
 /// Run a differential test from an execution envelope.
 ///
@@ -552,6 +633,53 @@ pub fn run_differential<F: SqlExecutor, C: SqlExecutor>(
     fsqlite_exec: &F,
     csqlite_exec: &C,
 ) -> DifferentialResult {
+    run_differential_with_mode(
+        envelope,
+        fsqlite_exec,
+        csqlite_exec,
+        DifferentialMode::Parity,
+    )
+}
+
+/// Run differential execution in explicit diagnostic mode.
+///
+/// This mode skips strict parity oracle identity preflight checks and is only
+/// intended for debugging workflows where self-comparison is deliberate.
+pub fn run_differential_diagnostic<F: SqlExecutor, C: SqlExecutor>(
+    envelope: &ExecutionEnvelope,
+    fsqlite_exec: &F,
+    csqlite_exec: &C,
+) -> DifferentialResult {
+    run_differential_with_mode(
+        envelope,
+        fsqlite_exec,
+        csqlite_exec,
+        DifferentialMode::Diagnostic,
+    )
+}
+
+#[allow(clippy::similar_names)]
+fn run_differential_with_mode<F: SqlExecutor, C: SqlExecutor>(
+    envelope: &ExecutionEnvelope,
+    fsqlite_exec: &F,
+    csqlite_exec: &C,
+    mode: DifferentialMode,
+) -> DifferentialResult {
+    if matches!(mode, DifferentialMode::Parity) {
+        if envelope.engines.csqlite.trim().is_empty() {
+            return parity_contract_error_result(
+                envelope,
+                "parity_contract_violation: envelope.engines.csqlite must be non-empty",
+            );
+        }
+        if csqlite_exec.engine_identity() != EngineIdentity::CSqliteOracle {
+            return parity_contract_error_result(
+                envelope,
+                "parity_contract_violation: reference executor must identify as CSqliteOracle",
+            );
+        }
+    }
+
     // Apply PRAGMAs to both engines (ignore errors — some PRAGMAs return rows).
     for pragma in &envelope.pragmas.to_pragma_sql() {
         let _ = fsqlite_exec.run_stmt(pragma);
@@ -641,6 +769,43 @@ pub fn run_differential<F: SqlExecutor, C: SqlExecutor>(
         outcome,
     };
 
+    result.artifact_hashes.result_hash = result.compute_result_hash();
+    result
+}
+
+fn parity_contract_error_result(envelope: &ExecutionEnvelope, message: &str) -> DifferentialResult {
+    let statements: Vec<&str> = envelope
+        .schema
+        .iter()
+        .chain(envelope.workload.iter())
+        .map(String::as_str)
+        .collect();
+
+    let envelope_id = envelope.artifact_id();
+    let workload_hash = {
+        let combined: String = statements.join("\n");
+        sha256_hex(combined.as_bytes())
+    };
+    let error_state_hash = sha256_hex(message.as_bytes());
+
+    let mut result = DifferentialResult {
+        bead_id: BEAD_ID.to_owned(),
+        envelope: envelope.clone(),
+        statements_total: statements.len(),
+        statements_matched: 0,
+        statements_mismatched: 0,
+        first_divergence_index: None,
+        divergences: Vec::new(),
+        logical_state_hash_fsqlite: error_state_hash.clone(),
+        logical_state_hash_csqlite: error_state_hash,
+        logical_state_matched: false,
+        artifact_hashes: ArtifactHashes {
+            envelope_id,
+            result_hash: String::new(),
+            workload_hash,
+        },
+        outcome: Outcome::Error,
+    };
     result.artifact_hashes.result_hash = result.compute_result_hash();
     result
 }

@@ -1,0 +1,15 @@
+{
+  "trace_id": "trace-bd-2yqp6.2.1-20260226T092259Z-3520",
+  "run_id": "bd-2yqp6.2.1-20260226T092259Z-3520",
+  "scenario_id": "PARITY-ORACLE-B1",
+  "seed": 3520,
+  "bead_id": "bd-2yqp6.2.1",
+  "events_jsonl": "artifacts/bd-2yqp6.2.1/bd-2yqp6.2.1-20260226T092259Z-3520/events.jsonl",
+  "contract_log": "artifacts/bd-2yqp6.2.1/bd-2yqp6.2.1-20260226T092259Z-3520/contract-check.log",
+  "contract_log_sha256": "4a2d6f9d8338f05d83239a70216a5b35c514149e81d21cde6bf21f4678c270e8",
+  "bead_test_log": "artifacts/bd-2yqp6.2.1/bd-2yqp6.2.1-20260226T092259Z-3520/cargo-test-bd_2yqp6_2_1_oracle_wiring.log",
+  "bead_test_log_sha256": "6cb30c7f536172d25c5fc61ef08569ad751e5274d445152325bd80124326d2ec",
+  "regression_test_log": "artifacts/bd-2yqp6.2.1/bd-2yqp6.2.1-20260226T092259Z-3520/cargo-test-differential_v2_test.log",
+  "regression_test_log_sha256": "c8cb36d2b5d24ce97b7344fd105308655758179ad3cdc1d1cdc7bd3275835261",
+  "result": "pass"
+}

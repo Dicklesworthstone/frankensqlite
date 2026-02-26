@@ -23,7 +23,10 @@ use std::time::{Duration, Instant};
 use fsqlite_btree::{BtCursor, BtreeCursorOps, MemPageStore, PageReader, PageWriter, SeekResult};
 use fsqlite_error::{ErrorCode, FrankenError, Result};
 use fsqlite_func::{ErasedAggregateFunction, FunctionRegistry};
-use fsqlite_mvcc::{ConcurrentRegistry, InProcessPageLockTable, MvccError, concurrent_write_page};
+use fsqlite_mvcc::{
+    ConcurrentRegistry, InProcessPageLockTable, MvccError, concurrent_read_page,
+    concurrent_write_page,
+};
 use fsqlite_pager::TransactionHandle;
 use fsqlite_types::cx::Cx;
 use fsqlite_types::opcode::{Opcode, P4, VdbeOp};
@@ -607,25 +610,49 @@ impl SharedTxnPageIo {
 
 impl PageReader for SharedTxnPageIo {
     fn read_page(&self, cx: &Cx, page_no: PageNumber) -> Result<Vec<u8>> {
-        let page = self.txn.borrow().get_page(cx, page_no)?.into_vec();
-
-        // bd-kivg / 5E.2 + SSI: every page read in a concurrent transaction
-        // must be tracked so commit-time SSI edge detection can identify
-        // dangerous structures and abort pivots when required.
         if let Some(ctx) = &self.concurrent {
-            ctx.registry
+            // Read-own-writes visibility: if this txn already wrote the page,
+            // return that version first and still record the read for SSI.
+            let mut guard = ctx
+                .registry
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .get_mut(ctx.session_id)
-                .ok_or_else(|| {
-                    FrankenError::Internal(format!(
-                        "MVCC session {} not found in registry during read",
-                        ctx.session_id
-                    ))
-                })?
-                .record_read(page_no);
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let handle = guard.get_mut(ctx.session_id).ok_or_else(|| {
+                FrankenError::Internal(format!(
+                    "MVCC session {} not found in registry during read",
+                    ctx.session_id
+                ))
+            })?;
+            let txn_id = handle.txn_token().id.get();
+            let snapshot_high = handle.snapshot().high.get();
+            let write_set_page = concurrent_read_page(handle, page_no).cloned();
+            handle.record_read(page_no);
+
+            if let Some(page) = write_set_page {
+                tracing::debug!(
+                    txn_id,
+                    commit_seq = snapshot_high,
+                    snapshot_high,
+                    page_id = page_no.get(),
+                    visibility_decision = "write_set_hit",
+                    conflict_reason = "none",
+                    "mvcc visibility decision"
+                );
+                return Ok(page.into_vec());
+            }
+
+            tracing::debug!(
+                txn_id,
+                commit_seq = snapshot_high,
+                snapshot_high,
+                page_id = page_no.get(),
+                visibility_decision = "snapshot_pager_read",
+                conflict_reason = "none",
+                "mvcc visibility decision"
+            );
         }
 
+        let page = self.txn.borrow().get_page(cx, page_no)?.into_vec();
         Ok(page)
     }
 }
@@ -640,26 +667,52 @@ impl PageWriter for SharedTxnPageIo {
 
             loop {
                 let page_data = PageData::from_vec(data.to_vec());
-                let write_result = concurrent_write_page(
-                    ctx.registry
+                let (write_result, txn_id, snapshot_high) = {
+                    let mut guard = ctx
+                        .registry
                         .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .get_mut(ctx.session_id)
-                        .ok_or_else(|| {
-                            FrankenError::Internal(format!(
-                                "MVCC session {} not found in registry during write",
-                                ctx.session_id
-                            ))
-                        })?,
-                    &ctx.lock_table,
-                    ctx.session_id,
-                    page_no,
-                    page_data,
-                );
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let handle = guard.get_mut(ctx.session_id).ok_or_else(|| {
+                        FrankenError::Internal(format!(
+                            "MVCC session {} not found in registry during write",
+                            ctx.session_id
+                        ))
+                    })?;
+                    let txn_id = handle.txn_token().id.get();
+                    let snapshot_high = handle.snapshot().high.get();
+                    let write_result = concurrent_write_page(
+                        handle,
+                        &ctx.lock_table,
+                        ctx.session_id,
+                        page_no,
+                        page_data,
+                    );
+                    (write_result, txn_id, snapshot_high)
+                };
 
                 match write_result {
-                    Ok(()) => break,
+                    Ok(()) => {
+                        tracing::debug!(
+                            txn_id,
+                            commit_seq = snapshot_high,
+                            snapshot_high,
+                            page_id = page_no.get(),
+                            visibility_decision = "write_set_recorded",
+                            conflict_reason = "none",
+                            "mvcc write visibility decision"
+                        );
+                        break;
+                    }
                     Err(MvccError::Busy) => {
+                        tracing::warn!(
+                            txn_id,
+                            commit_seq = snapshot_high,
+                            snapshot_high,
+                            page_id = page_no.get(),
+                            visibility_decision = "write_retry",
+                            conflict_reason = "page_lock_busy",
+                            "mvcc write conflict detected"
+                        );
                         if deadline.is_zero() || started.elapsed() >= deadline {
                             return Err(FrankenError::Busy);
                         }
@@ -678,6 +731,15 @@ impl PageWriter for SharedTxnPageIo {
                         backoff = (backoff * 2).min(Duration::from_millis(5));
                     }
                     Err(e) => {
+                        tracing::warn!(
+                            txn_id,
+                            commit_seq = snapshot_high,
+                            snapshot_high,
+                            page_id = page_no.get(),
+                            visibility_decision = "write_abort",
+                            conflict_reason = %e,
+                            "mvcc write failed"
+                        );
                         return Err(FrankenError::Internal(format!(
                             "MVCC write_page failed: {e}"
                         )));
@@ -718,6 +780,29 @@ impl std::fmt::Debug for CursorBackend {
         match self {
             Self::Mem(c) => f.debug_tuple("Mem").field(c).finish(),
             Self::Txn(c) => f.debug_tuple("Txn").field(c).finish(),
+        }
+    }
+}
+
+impl CursorBackend {
+    /// Returns `true` if this cursor is backed by the in-memory page store.
+    #[must_use]
+    fn is_mem(&self) -> bool {
+        matches!(self, Self::Mem(_))
+    }
+
+    /// Returns `true` if this cursor is backed by the real pager transaction.
+    #[must_use]
+    fn is_txn(&self) -> bool {
+        matches!(self, Self::Txn(_))
+    }
+
+    /// Returns a string identifying the backend kind for diagnostics.
+    #[must_use]
+    fn kind_str(&self) -> &'static str {
+        match self {
+            Self::Mem(_) => "mem",
+            Self::Txn(_) => "txn",
         }
     }
 }
@@ -1247,6 +1332,11 @@ pub struct VdbeEngine {
     /// When set, `open_storage_cursor` routes through the real pager/WAL
     /// stack instead of building transient `MemPageStore` snapshots.
     txn_page_io: Option<SharedTxnPageIo>,
+    /// When true, `open_storage_cursor` will reject the MemPageStore fallback
+    /// path and return false instead of silently routing through in-memory
+    /// storage. Used in parity-certification mode (bd-2ttd8.1) to verify all
+    /// cursor operations flow through the real Pager+BtreeCursor stack.
+    reject_mem_fallback: bool,
     /// In-memory database backing cursor operations (shared with Connection).
     db: Option<MemDatabase>,
     /// Scalar/aggregate/window function registry for Function/PureFunc opcodes.
@@ -1287,6 +1377,8 @@ impl VdbeEngine {
             pending_next_after_delete: HashSet::new(),
             storage_cursors_enabled: true,
             txn_page_io: None,
+            // bd-zjisk.1: Default to parity-cert mode — reject MemPageStore fallback.
+            reject_mem_fallback: true,
             db: None,
             func_registry: None,
             aggregates: SwissIndex::new(),
@@ -1319,6 +1411,58 @@ impl VdbeEngine {
     /// Backwards-compatible alias for [`Self::enable_storage_cursors`].
     pub fn enable_storage_read_cursors(&mut self, enabled: bool) {
         self.enable_storage_cursors(enabled);
+    }
+
+    /// Enable parity-certification mode (bd-2ttd8.1).
+    ///
+    /// When enabled, `open_storage_cursor` will refuse to fall back to the
+    /// in-memory `MemPageStore` path and instead return an error. This
+    /// verifies that all cursor operations route through the real
+    /// Pager+BtreeCursor stack (`txn_page_io`).
+    pub fn set_reject_mem_fallback(&mut self, reject: bool) {
+        self.reject_mem_fallback = reject;
+    }
+
+    /// Returns `true` if all open storage cursors use the real pager backend
+    /// (`CursorBackend::Txn`). Returns `true` vacuously when no cursors are open.
+    ///
+    /// Used by parity-certification (bd-2ttd8.4) to verify that no cursor
+    /// accidentally routed through MemPageStore.
+    #[must_use]
+    pub fn all_cursors_are_txn_backed(&self) -> bool {
+        self.storage_cursors.values().all(|sc| sc.cursor.is_txn())
+    }
+
+    /// Returns `true` if any open storage cursor uses the in-memory backend.
+    #[must_use]
+    pub fn has_mem_cursor(&self) -> bool {
+        self.storage_cursors.values().any(|sc| sc.cursor.is_mem())
+    }
+
+    /// Validate the parity-certification invariant: if `reject_mem_fallback`
+    /// is enabled, no storage cursor should be backed by MemPageStore.
+    ///
+    /// Returns `Ok(())` if the invariant holds, or `Err` with a diagnostic
+    /// message listing the offending cursor IDs.
+    pub fn validate_parity_cert_invariant(&self) -> std::result::Result<(), String> {
+        if !self.reject_mem_fallback {
+            return Ok(());
+        }
+        let mem_cursors: Vec<i32> = self
+            .storage_cursors
+            .iter()
+            .filter(|(_, sc)| sc.cursor.is_mem())
+            .map(|(id, _)| *id)
+            .collect();
+        if mem_cursors.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "bd-2ttd8.4: parity-cert violation — {} cursor(s) routed through MemPageStore: {:?}",
+                mem_cursors.len(),
+                mem_cursors
+            ))
+        }
     }
 
     /// Lend a pager transaction to the engine for storage cursor I/O.
@@ -1712,7 +1856,10 @@ impl VdbeEngine {
                 // ── Type Conversion ─────────────────────────────────────
                 Opcode::AddImm => {
                     // Add integer p2 to register p1.
-                    let val = self.get_reg(op.p1).to_integer() + i64::from(op.p2);
+                    let val = self
+                        .get_reg(op.p1)
+                        .to_integer()
+                        .wrapping_add(i64::from(op.p2));
                     self.set_reg(op.p1, SqliteValue::Integer(val));
                     pc += 1;
                 }
@@ -1896,6 +2043,12 @@ impl VdbeEngine {
                 Opcode::Return => {
                     // Jump to address stored in p1.
                     let addr = self.get_reg(op.p1).to_integer();
+                    if addr < 0 || addr as usize >= ops.len() {
+                        return Err(FrankenError::Internal(format!(
+                            "Return address {} out of bounds",
+                            addr
+                        )));
+                    }
                     pc = addr as usize;
                 }
 
@@ -3506,6 +3659,11 @@ impl VdbeEngine {
 
     #[allow(clippy::cast_sign_loss)]
     fn set_reg(&mut self, r: i32, val: SqliteValue) {
+        if r < 0 || r > 65535 {
+            // Drop out-of-bounds register writes to prevent OOM.
+            // SQLite defines a max register limit (SQLITE_MAX_COLUMN + some overhead).
+            return;
+        }
         let idx = r as usize;
         if idx >= self.registers.len() {
             self.registers.resize(idx + 1, SqliteValue::Null);
@@ -3589,8 +3747,18 @@ impl VdbeEngine {
         // StorageCursor is now the ONLY cursor path.
 
         let Some(root_pgno) = PageNumber::new(root_page as u32) else {
+            tracing::debug!(
+                cursor_id,
+                root_page,
+                writable,
+                backend_kind = "none",
+                decision_reason = "invalid_page_number",
+                "open_storage_cursor: invalid root page number"
+            );
             return false;
         };
+
+        let has_txn = self.txn_page_io.is_some();
 
         // Phase 5C.1 (bd-35my): Route through pager when available.
         //
@@ -3610,10 +3778,14 @@ impl VdbeEngine {
                 Ok(bytes) => bytes,
                 Err(err) => {
                     tracing::warn!(
-                        root_page,
+                        cursor_id,
+                        page_id = root_page,
                         writable,
+                        has_txn,
+                        backend_kind = "txn",
+                        decision_reason = "pager_read_failed",
                         error = %err,
-                        "failed to read root page for storage cursor open"
+                        "open_storage_cursor: failed to read root page from pager"
                     );
                     return false;
                 }
@@ -3632,6 +3804,15 @@ impl VdbeEngine {
                         writable,
                         last_alloc_rowid: 0,
                     },
+                );
+                tracing::debug!(
+                    cursor_id,
+                    page_id = root_page,
+                    writable,
+                    has_txn,
+                    backend_kind = "txn",
+                    decision_reason = "valid_btree_page",
+                    "open_storage_cursor: routed through pager transaction"
                 );
                 return true;
             }
@@ -3654,9 +3835,14 @@ impl VdbeEngine {
                 // Write the initialized page to pager.
                 if let Err(err) = page_io.write_page(&cx, root_pgno, &page) {
                     tracing::warn!(
-                        root_page,
+                        cursor_id,
+                        page_id = root_page,
+                        writable,
+                        has_txn,
+                        backend_kind = "txn",
+                        decision_reason = "zero_page_init_failed",
                         error = %err,
-                        "failed to initialize writable root page in pager"
+                        "open_storage_cursor: failed to initialize writable root page in pager"
                     );
                     return false;
                 }
@@ -3669,6 +3855,15 @@ impl VdbeEngine {
                         writable,
                         last_alloc_rowid: 0,
                     },
+                );
+                tracing::debug!(
+                    cursor_id,
+                    page_id = root_page,
+                    writable,
+                    has_txn,
+                    backend_kind = "txn",
+                    decision_reason = "zero_page_initialized",
+                    "open_storage_cursor: initialized empty root page via pager"
                 );
                 return true;
             }
@@ -3683,15 +3878,42 @@ impl VdbeEngine {
             if !has_mem_table {
                 // No MemDatabase fallback available — refuse to open.
                 tracing::warn!(
-                    root_page,
+                    cursor_id,
+                    page_id = root_page,
                     writable,
+                    has_txn,
+                    backend_kind = "none",
+                    decision_reason = "invalid_page_no_mem_fallback",
                     first_byte = page_data.first().copied().unwrap_or_default(),
                     is_zero_page,
-                    "refusing storage cursor open on invalid transaction-backed root page"
+                    "open_storage_cursor: refusing on invalid transaction-backed root page"
                 );
                 return false;
             }
             // else: fall through to MemDatabase path
+            tracing::debug!(
+                cursor_id,
+                page_id = root_page,
+                writable,
+                has_txn,
+                backend_kind = "mem",
+                decision_reason = "txn_page_invalid_mem_fallback",
+                "open_storage_cursor: pager page invalid, falling through to MemDatabase"
+            );
+        }
+
+        // bd-2ttd8.1: Parity-certification mode — reject MemPageStore fallback.
+        if self.reject_mem_fallback {
+            tracing::warn!(
+                cursor_id,
+                page_id = root_page,
+                writable,
+                has_txn,
+                backend_kind = "mem",
+                decision_reason = "parity_cert_rejection",
+                "open_storage_cursor: MemPageStore fallback rejected in parity-cert mode"
+            );
+            return false;
         }
 
         // Fallback: build a transient B-tree snapshot (Phase 4 path used by
@@ -3718,6 +3940,15 @@ impl VdbeEngine {
                 writable,
                 last_alloc_rowid: 0,
             },
+        );
+        tracing::debug!(
+            cursor_id,
+            page_id = root_page,
+            writable,
+            has_txn,
+            backend_kind = "mem",
+            decision_reason = "no_pager_transaction",
+            "open_storage_cursor: routed through MemPageStore fallback"
         );
         true
     }
@@ -4915,6 +5146,7 @@ mod tests {
             let prog = b.finish().expect("program should build");
 
             let mut engine = VdbeEngine::new(prog.register_count());
+            engine.set_reject_mem_fallback(false);
             let outcome = engine.execute(&prog).expect("execution should succeed");
             assert_eq!(outcome, ExecOutcome::Done);
         }
@@ -4949,6 +5181,7 @@ mod tests {
 
             // Engine should execute without panic (cursor ops are stubbed).
             let mut engine = VdbeEngine::new(prog.register_count());
+            engine.set_reject_mem_fallback(false);
             let outcome = engine.execute(&prog).expect("execution should succeed");
             assert_eq!(outcome, ExecOutcome::Done);
         }
@@ -4971,6 +5204,7 @@ mod tests {
             let mut engine = VdbeEngine::new(prog.register_count());
             engine.enable_storage_read_cursors(true);
             engine.set_database(db);
+            engine.set_reject_mem_fallback(false);
             let outcome = engine.execute(&prog).expect("execution should succeed");
             assert_eq!(outcome, ExecOutcome::Done);
             assert!(engine.storage_cursors.contains_key(&0));
@@ -5021,6 +5255,7 @@ mod tests {
             let prog = b.finish().expect("program should build");
 
             let mut engine = VdbeEngine::new(prog.register_count());
+            engine.set_reject_mem_fallback(false);
             let outcome = engine.execute(&prog).expect("execution should succeed");
             assert_eq!(outcome, ExecOutcome::Done);
         }
@@ -5063,6 +5298,7 @@ mod tests {
             let prog = b.finish().expect("program should build");
 
             let mut engine = VdbeEngine::new(prog.register_count());
+            engine.set_reject_mem_fallback(false);
             let outcome = engine.execute(&prog).expect("execution should succeed");
             assert_eq!(outcome, ExecOutcome::Done);
         }
@@ -5102,6 +5338,7 @@ mod tests {
 
             let mut engine = VdbeEngine::new(prog.register_count());
             engine.set_database(db);
+            engine.set_reject_mem_fallback(false);
             let outcome = engine.execute(&prog).expect("execution should succeed");
             assert_eq!(outcome, ExecOutcome::Done);
             // RETURNING * emits a ResultRow with all columns.
@@ -5190,6 +5427,7 @@ mod tests {
             assert!(asm.contains("Integer"), "should have Integer opcodes");
 
             let mut engine = VdbeEngine::new(prog.register_count());
+            engine.set_reject_mem_fallback(false);
             let outcome = engine.execute(&prog).expect("execution should succeed");
             assert_eq!(outcome, ExecOutcome::Done);
         }
@@ -5232,6 +5470,7 @@ mod tests {
             assert!(asm.contains("Multiply"), "negation emits Multiply by -1");
 
             let mut engine = VdbeEngine::new(prog.register_count());
+            engine.set_reject_mem_fallback(false);
             let outcome = engine.execute(&prog).expect("execution should succeed");
             assert_eq!(outcome, ExecOutcome::Done);
         }
@@ -5277,6 +5516,7 @@ mod tests {
             assert!(asm.contains("Goto"), "CASE branches with Goto");
 
             let mut engine = VdbeEngine::new(prog.register_count());
+            engine.set_reject_mem_fallback(false);
             let outcome = engine.execute(&prog).expect("execution should succeed");
             assert_eq!(outcome, ExecOutcome::Done);
         }
@@ -5318,6 +5558,7 @@ mod tests {
             assert!(asm.contains("Gt"), "comparison emits Gt opcode");
 
             let mut engine = VdbeEngine::new(prog.register_count());
+            engine.set_reject_mem_fallback(false);
             let outcome = engine.execute(&prog).expect("execution should succeed");
             assert_eq!(outcome, ExecOutcome::Done);
         }
@@ -6753,6 +6994,8 @@ mod tests {
         let mut engine = VdbeEngine::new(prog.register_count());
         engine.enable_storage_read_cursors(true);
         engine.set_database(db);
+        // These tests exercise the MemPageStore path without a real pager txn.
+        engine.set_reject_mem_fallback(false);
         let outcome = engine.execute(&prog).expect("execution should succeed");
         assert_eq!(outcome, ExecOutcome::Done);
         engine.take_results()
@@ -6845,6 +7088,8 @@ mod tests {
         let mut engine = VdbeEngine::new(prog.register_count());
         engine.enable_storage_cursors(true);
         engine.set_database(db);
+        // These tests exercise the MemPageStore path without a real pager txn.
+        engine.set_reject_mem_fallback(false);
         let outcome = engine.execute(&prog).expect("execution should succeed");
         assert_eq!(outcome, ExecOutcome::Done);
         let results = engine.take_results();
@@ -6871,6 +7116,7 @@ mod tests {
         let mut engine = VdbeEngine::new(prog.register_count());
         engine.enable_storage_cursors(true);
         engine.set_database(db);
+        engine.set_reject_mem_fallback(false);
         let outcome = engine.execute(&prog).expect("execution should succeed");
         assert_eq!(outcome, ExecOutcome::Done);
         // Verify the cursor was opened as a storage cursor, not a MemCursor.
@@ -7398,6 +7644,7 @@ mod tests {
         let mut engine = VdbeEngine::new(prog.register_count());
         engine.enable_storage_cursors(true);
         engine.set_database(db);
+        engine.set_reject_mem_fallback(false);
 
         let outcome = engine.execute(&prog).expect("execution should succeed");
         assert_eq!(
@@ -8188,5 +8435,394 @@ mod tests {
         let values: Vec<i64> = sorter.rows.iter().map(|r| r[0].to_integer()).collect();
         assert_eq!(values, vec![1, 2, 3, 4, 5]);
         assert_eq!(sorter.rows_sorted_total, 5);
+    }
+
+    // ── bd-2ttd8.1: Pager routing and parity-cert tests ──────────────
+
+    #[test]
+    fn test_reject_mem_fallback_default_on() {
+        // bd-zjisk.1: Parity-cert mode is enabled by default.
+        let engine = VdbeEngine::new(8);
+        assert!(engine.reject_mem_fallback);
+    }
+
+    #[test]
+    fn test_set_reject_mem_fallback() {
+        let mut engine = VdbeEngine::new(8);
+        engine.set_reject_mem_fallback(true);
+        assert!(engine.reject_mem_fallback);
+        engine.set_reject_mem_fallback(false);
+        assert!(!engine.reject_mem_fallback);
+    }
+
+    #[test]
+    fn test_open_storage_cursor_mem_fallback_without_parity_cert() {
+        // Without parity-cert mode, OpenRead should succeed via MemPageStore
+        // fallback when no pager transaction is set.
+        let mut db = MemDatabase::new();
+        let root = db.create_table(1);
+        let table = db.get_table_mut(root).expect("table should exist");
+        table.insert(1, vec![SqliteValue::Integer(42)]);
+
+        let mut engine = VdbeEngine::new(8);
+        engine.set_database(db);
+        // Explicitly opt out of parity-cert mode to test fallback path.
+        engine.set_reject_mem_fallback(false);
+
+        // No txn_page_io set — should fall back to MemPageStore.
+        assert!(engine.open_storage_cursor(0, root, false));
+        assert!(engine.storage_cursors.get(&0).is_some());
+    }
+
+    #[test]
+    fn test_open_storage_cursor_rejected_in_parity_cert_mode() {
+        // In parity-cert mode (now the default), OpenRead should FAIL when
+        // no pager transaction is available and MemPageStore fallback would
+        // be used.
+        let mut db = MemDatabase::new();
+        let root = db.create_table(1);
+        let table = db.get_table_mut(root).expect("table should exist");
+        table.insert(1, vec![SqliteValue::Integer(42)]);
+
+        let mut engine = VdbeEngine::new(8);
+        engine.set_database(db);
+        // Default is already true (parity-cert mode), but be explicit.
+        engine.set_reject_mem_fallback(true);
+
+        // No txn_page_io set — parity-cert should reject the fallback.
+        assert!(!engine.open_storage_cursor(0, root, false));
+        assert!(engine.storage_cursors.get(&0).is_none());
+    }
+
+    #[test]
+    fn test_open_storage_cursor_invalid_page_number() {
+        // Root page 0 is invalid (PageNumber requires nonzero).
+        let mut engine = VdbeEngine::new(8);
+        assert!(!engine.open_storage_cursor(0, 0, false));
+    }
+
+    #[test]
+    fn test_bd_2ttd8_set_transaction_enables_storage_cursors() {
+        // set_transaction should auto-enable storage cursors and set txn_page_io.
+        use fsqlite_pager::{MockMvccPager, MvccPager as _, TransactionMode};
+
+        let pager = MockMvccPager;
+        let cx = Cx::new();
+        let txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+
+        let mut engine = VdbeEngine::new(8);
+        engine.set_transaction(Box::new(txn));
+        assert!(engine.storage_cursors_enabled);
+        assert!(engine.txn_page_io.is_some());
+    }
+
+    #[test]
+    fn test_open_read_opcode_with_mem_fallback() {
+        // OpenRead via VDBE execution should succeed when MemDatabase has the
+        // table, verifying the full cursor lifecycle.
+        let mut db = MemDatabase::new();
+        let root = db.create_table(1);
+        let table = db.get_table_mut(root).expect("table should exist");
+        table.insert(1, vec![SqliteValue::Integer(100)]);
+
+        let mut b = ProgramBuilder::new();
+        let end = b.emit_label();
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+        b.emit_op(Opcode::OpenRead, 0, root, 0, P4::Int(1), 0);
+        // Rewind to first row.
+        let halt_label = b.emit_label();
+        b.emit_jump_to_label(Opcode::Rewind, 0, 0, halt_label, P4::None, 0);
+        // Read column 0 into register 1.
+        b.emit_op(Opcode::Column, 0, 0, 1, P4::None, 0);
+        b.emit_op(Opcode::ResultRow, 1, 1, 0, P4::None, 0);
+        b.resolve_label(halt_label);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end);
+
+        let prog = b.finish().expect("program should build");
+        let mut engine = VdbeEngine::new(prog.register_count());
+        engine.set_database(db);
+        // Explicitly opt out of parity-cert to test the MemPageStore fallback.
+        engine.set_reject_mem_fallback(false);
+
+        let outcome = engine.execute(&prog).expect("execution should succeed");
+        assert_eq!(outcome, ExecOutcome::Done);
+
+        let results = engine.take_results();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0], vec![SqliteValue::Integer(100)]);
+    }
+
+    #[test]
+    fn test_open_write_insert_delete_cursor_lifecycle() {
+        // Verify full cursor lifecycle: OpenWrite → Insert → Rewind →
+        // Column → Delete → verify empty.
+        let mut db = MemDatabase::new();
+        let root = db.create_table(1);
+
+        let mut b = ProgramBuilder::new();
+        let end = b.emit_label();
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+        b.emit_op(Opcode::OpenWrite, 0, root, 0, P4::Int(1), 0);
+
+        // Insert rowid=1 with value 42.
+        b.emit_op(Opcode::Integer, 1, 1, 0, P4::None, 0); // rowid in r1
+        b.emit_op(Opcode::Integer, 42, 2, 0, P4::None, 0); // value in r2
+        b.emit_op(Opcode::MakeRecord, 2, 1, 3, P4::None, 0); // record in r3
+        b.emit_op(Opcode::Insert, 0, 3, 1, P4::None, 0);
+
+        // Rewind and read back.
+        let eof_label = b.emit_label();
+        b.emit_jump_to_label(Opcode::Rewind, 0, 0, eof_label, P4::None, 0);
+        b.emit_op(Opcode::Column, 0, 0, 4, P4::None, 0);
+        b.emit_op(Opcode::ResultRow, 4, 1, 0, P4::None, 0);
+        // Delete the row.
+        b.emit_op(Opcode::Delete, 0, 0, 0, P4::None, 0);
+        b.resolve_label(eof_label);
+
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end);
+
+        let prog = b.finish().expect("program should build");
+        let mut engine = VdbeEngine::new(prog.register_count());
+        engine.set_database(db);
+        // Explicitly opt out of parity-cert to test the MemPageStore fallback.
+        engine.set_reject_mem_fallback(false);
+
+        let outcome = engine.execute(&prog).expect("execution should succeed");
+        assert_eq!(outcome, ExecOutcome::Done);
+
+        let results = engine.take_results();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0], vec![SqliteValue::Integer(42)]);
+    }
+
+    #[test]
+    fn test_parity_cert_rejects_open_read_without_txn() {
+        // In parity-cert mode, OpenRead should fail execution when no pager
+        // transaction is available.
+        let mut db = MemDatabase::new();
+        let root = db.create_table(1);
+        let table = db.get_table_mut(root).expect("table should exist");
+        table.insert(1, vec![SqliteValue::Integer(1)]);
+
+        let mut b = ProgramBuilder::new();
+        let end = b.emit_label();
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+        b.emit_op(Opcode::OpenRead, 0, root, 0, P4::Int(1), 0);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end);
+
+        let prog = b.finish().expect("program should build");
+        let mut engine = VdbeEngine::new(prog.register_count());
+        engine.set_database(db);
+        engine.set_reject_mem_fallback(true);
+
+        let result = engine.execute(&prog);
+        assert!(
+            result.is_err(),
+            "OpenRead should fail in parity-cert mode without txn"
+        );
+    }
+
+    #[test]
+    fn test_parity_cert_rejects_open_write_without_txn() {
+        // In parity-cert mode, OpenWrite should also fail without a txn.
+        let mut db = MemDatabase::new();
+        let root = db.create_table(1);
+
+        let mut b = ProgramBuilder::new();
+        let end = b.emit_label();
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+        b.emit_op(Opcode::OpenWrite, 0, root, 0, P4::Int(1), 0);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end);
+
+        let prog = b.finish().expect("program should build");
+        let mut engine = VdbeEngine::new(prog.register_count());
+        engine.set_database(db);
+        engine.set_reject_mem_fallback(true);
+
+        let result = engine.execute(&prog);
+        assert!(
+            result.is_err(),
+            "OpenWrite should fail in parity-cert mode without txn"
+        );
+    }
+
+    // ── bd-2ttd8.4: Backend-identity ratchet tests ──────────────────
+
+    #[test]
+    fn test_cursor_backend_kind_mem() {
+        let mut db = MemDatabase::new();
+        let root = db.create_table(1);
+
+        let mut engine = VdbeEngine::new(8);
+        engine.set_database(db);
+        engine.set_reject_mem_fallback(false);
+
+        assert!(engine.open_storage_cursor(0, root, false));
+        assert!(
+            engine.has_mem_cursor(),
+            "cursor should be mem-backed without txn"
+        );
+        assert!(!engine.all_cursors_are_txn_backed());
+    }
+
+    #[test]
+    fn test_cursor_backend_kind_txn() {
+        use fsqlite_pager::{MockMvccPager, MvccPager as _, TransactionMode};
+        let pager = MockMvccPager;
+        let cx = Cx::new();
+        let txn = pager.begin(&cx, TransactionMode::Deferred).unwrap();
+
+        let mut engine = VdbeEngine::new(8);
+        engine.set_database(MemDatabase::new());
+        engine.set_transaction(Box::new(txn));
+
+        // Open cursor on page 1 (valid with pager txn).
+        assert!(engine.open_storage_cursor(0, 1, false));
+        assert!(
+            engine.all_cursors_are_txn_backed(),
+            "cursor should be txn-backed with pager transaction"
+        );
+        assert!(!engine.has_mem_cursor());
+    }
+
+    #[test]
+    fn test_validate_parity_cert_invariant_no_cursors() {
+        let mut engine = VdbeEngine::new(8);
+        engine.set_reject_mem_fallback(true);
+        assert!(
+            engine.validate_parity_cert_invariant().is_ok(),
+            "vacuously valid with no cursors"
+        );
+    }
+
+    #[test]
+    fn test_validate_parity_cert_invariant_with_txn_cursor() {
+        use fsqlite_pager::{MockMvccPager, MvccPager as _, TransactionMode};
+        let pager = MockMvccPager;
+        let cx = Cx::new();
+        let txn = pager.begin(&cx, TransactionMode::Deferred).unwrap();
+
+        let mut engine = VdbeEngine::new(8);
+        engine.set_database(MemDatabase::new());
+        engine.set_transaction(Box::new(txn));
+        engine.set_reject_mem_fallback(true);
+
+        assert!(engine.open_storage_cursor(0, 1, false));
+        assert!(
+            engine.validate_parity_cert_invariant().is_ok(),
+            "txn-backed cursor satisfies parity-cert invariant"
+        );
+    }
+
+    #[test]
+    fn test_validate_parity_cert_invariant_disabled_allows_mem() {
+        let mut db = MemDatabase::new();
+        let root = db.create_table(1);
+
+        let mut engine = VdbeEngine::new(8);
+        engine.set_database(db);
+        // Explicitly disable parity-cert — mem cursors allowed.
+        engine.set_reject_mem_fallback(false);
+        assert!(engine.open_storage_cursor(0, root, false));
+        assert!(
+            engine.validate_parity_cert_invariant().is_ok(),
+            "parity-cert disabled should always pass"
+        );
+    }
+
+    #[test]
+    fn test_all_cursors_txn_backed_vacuous() {
+        let engine = VdbeEngine::new(8);
+        assert!(
+            engine.all_cursors_are_txn_backed(),
+            "no cursors → vacuously true"
+        );
+        assert!(!engine.has_mem_cursor(), "no cursors → no mem cursor");
+    }
+
+    #[test]
+    fn test_cursor_kind_str_values() {
+        let mut db = MemDatabase::new();
+        let root = db.create_table(1);
+
+        let mut engine = VdbeEngine::new(8);
+        engine.set_database(db);
+        engine.set_reject_mem_fallback(false);
+        engine.open_storage_cursor(0, root, false);
+
+        let sc = engine.storage_cursors.get(&0).unwrap();
+        assert_eq!(sc.cursor.kind_str(), "mem");
+    }
+
+    #[test]
+    fn test_ratchet_prevents_mem_cursor_creation_in_parity_mode() {
+        // This is the core anti-regression ratchet: when parity-cert is
+        // enabled and no txn is set, cursor creation MUST fail — it cannot
+        // silently fall through to MemPageStore.
+        let mut db = MemDatabase::new();
+        let root = db.create_table(1);
+        let table = db.get_table_mut(root).unwrap();
+        table.insert(1, vec![SqliteValue::Integer(99)]);
+
+        let mut engine = VdbeEngine::new(8);
+        engine.set_database(db);
+        engine.set_reject_mem_fallback(true);
+
+        // Attempt to open cursor — should fail.
+        let opened = engine.open_storage_cursor(0, root, false);
+        assert!(
+            !opened,
+            "ratchet must prevent cursor creation in parity-cert mode"
+        );
+
+        // Validate invariant still holds.
+        assert!(engine.validate_parity_cert_invariant().is_ok());
+        assert!(!engine.has_mem_cursor());
+    }
+
+    #[test]
+    fn test_ratchet_allows_txn_cursor_in_parity_mode() {
+        use fsqlite_pager::{MockMvccPager, MvccPager as _, TransactionMode};
+        let pager = MockMvccPager;
+        let cx = Cx::new();
+        let txn = pager.begin(&cx, TransactionMode::Deferred).unwrap();
+
+        let mut engine = VdbeEngine::new(8);
+        engine.set_database(MemDatabase::new());
+        engine.set_transaction(Box::new(txn));
+        engine.set_reject_mem_fallback(true);
+
+        // With txn set, cursor creation should succeed via pager path.
+        let opened = engine.open_storage_cursor(0, 1, false);
+        assert!(opened, "txn-backed cursor should work in parity-cert mode");
+        assert!(engine.all_cursors_are_txn_backed());
+        assert!(engine.validate_parity_cert_invariant().is_ok());
+    }
+
+    #[test]
+    fn test_ratchet_multiple_cursors_mixed_rejection() {
+        use fsqlite_pager::{MockMvccPager, MvccPager as _, TransactionMode};
+        let pager = MockMvccPager;
+        let cx = Cx::new();
+        let txn = pager.begin(&cx, TransactionMode::Deferred).unwrap();
+
+        let mut engine = VdbeEngine::new(8);
+        engine.set_database(MemDatabase::new());
+        engine.set_transaction(Box::new(txn));
+        engine.set_reject_mem_fallback(true);
+
+        // Open cursor 0 on page 1 — should succeed (txn path).
+        assert!(engine.open_storage_cursor(0, 1, false));
+        assert!(engine.all_cursors_are_txn_backed());
+
+        // Attempt cursor 1 on non-existent high page — should still
+        // succeed via txn path (MockMvccPager returns zero-filled pages).
+        assert!(engine.open_storage_cursor(1, 1, false));
+        assert!(engine.all_cursors_are_txn_backed());
+        assert!(engine.validate_parity_cert_invariant().is_ok());
     }
 }

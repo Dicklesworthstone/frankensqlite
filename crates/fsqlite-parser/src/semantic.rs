@@ -406,7 +406,10 @@ impl<'a> Resolver<'a> {
         match stmt {
             Statement::Select(select) => self.resolve_select(select, scope),
             Statement::Insert(insert) => {
-                self.resolve_table_name(&insert.table.name, scope);
+                self.bind_table_to_scope(&insert.table.name, None, scope);
+                for col in &insert.columns {
+                    self.resolve_unqualified_column(col, scope, false);
+                }
                 match &insert.source {
                     fsqlite_ast::InsertSource::Select(select) => self.resolve_select(select, scope),
                     fsqlite_ast::InsertSource::Values(rows) => {
@@ -433,6 +436,16 @@ impl<'a> Resolver<'a> {
                             where_clause,
                         } => {
                             for assignment in assignments {
+                                match &assignment.target {
+                                    fsqlite_ast::AssignmentTarget::Column(col) => {
+                                        self.resolve_unqualified_column(col, scope, false);
+                                    }
+                                    fsqlite_ast::AssignmentTarget::ColumnList(cols) => {
+                                        for col in cols {
+                                            self.resolve_unqualified_column(col, scope, false);
+                                        }
+                                    }
+                                }
                                 self.resolve_expr(&assignment.value, scope);
                             }
                             if let Some(w) = where_clause {
@@ -447,8 +460,18 @@ impl<'a> Resolver<'a> {
                 }
             }
             Statement::Update(update) => {
-                self.resolve_table_name(&update.table.name.name, scope);
+                self.bind_table_to_scope(&update.table.name.name, update.table.alias.as_deref(), scope);
                 for assignment in &update.assignments {
+                    match &assignment.target {
+                        fsqlite_ast::AssignmentTarget::Column(col) => {
+                            self.resolve_unqualified_column(col, scope, false);
+                        }
+                        fsqlite_ast::AssignmentTarget::ColumnList(cols) => {
+                            for col in cols {
+                                self.resolve_unqualified_column(col, scope, false);
+                            }
+                        }
+                    }
                     self.resolve_expr(&assignment.value, scope);
                 }
                 if let Some(from) = &update.from {
@@ -471,7 +494,7 @@ impl<'a> Resolver<'a> {
                 }
             }
             Statement::Delete(delete) => {
-                self.resolve_table_name(&delete.table.name.name, scope);
+                self.bind_table_to_scope(&delete.table.name.name, delete.table.alias.as_deref(), scope);
                 if let Some(where_clause) = &delete.where_clause {
                     self.resolve_expr(where_clause, scope);
                 }
@@ -679,7 +702,7 @@ impl<'a> Resolver<'a> {
                 JoinConstraint::On(expr) => self.resolve_expr(expr, scope),
                 JoinConstraint::Using(cols) => {
                     for col in cols {
-                        self.resolve_unqualified_column(col, scope);
+                        self.resolve_unqualified_column(col, scope, true);
                     }
                 }
             }
@@ -892,11 +915,21 @@ impl<'a> Resolver<'a> {
         }
     }
 
-    fn resolve_unqualified_column(&mut self, name: &str, scope: &Scope) {
+    fn resolve_unqualified_column(&mut self, name: &str, scope: &Scope, is_using_clause: bool) {
         let result = scope.resolve_column(None, name);
         match result {
             ResolveResult::Resolved(_) => {
                 self.columns_bound += 1;
+            }
+            ResolveResult::Ambiguous(candidates) => {
+                if is_using_clause {
+                    self.columns_bound += 1;
+                } else {
+                    self.push_error(SemanticErrorKind::AmbiguousColumn {
+                        column: name.to_owned(),
+                        candidates,
+                    });
+                }
             }
             ResolveResult::ColumnNotFound | ResolveResult::TableNotFound => {
                 self.push_error(SemanticErrorKind::UnresolvedColumn {
@@ -904,12 +937,26 @@ impl<'a> Resolver<'a> {
                     column: name.to_owned(),
                 });
             }
-            ResolveResult::Ambiguous(candidates) => {
-                self.push_error(SemanticErrorKind::AmbiguousColumn {
-                    column: name.to_owned(),
-                    candidates,
-                });
-            }
+        }
+    }
+
+    fn bind_table_to_scope(&mut self, name: &str, alias: Option<&str>, scope: &mut Scope) {
+        let alias_name = alias.unwrap_or(name);
+        if scope.ctes.contains(&name.to_ascii_lowercase()) {
+            scope.add_alias(alias_name, name, None);
+            self.tables_resolved += 1;
+        } else if let Some(table_def) = self.schema.find_table(name) {
+            let col_set: HashSet<String> = table_def
+                .columns
+                .iter()
+                .map(|c| c.name.to_ascii_lowercase())
+                .collect();
+            scope.add_alias(alias_name, name, Some(col_set));
+            self.tables_resolved += 1;
+        } else {
+            self.push_error(SemanticErrorKind::UnresolvedTable {
+                name: name.to_owned(),
+            });
         }
     }
 
@@ -1242,6 +1289,17 @@ mod tests {
         assert!(errors.is_empty(), "unexpected errors: {errors:?}");
         assert_eq!(resolver.tables_resolved, 2);
         assert_eq!(resolver.columns_bound, 4); // u.name, o.amount, u.id, o.user_id
+    }
+
+    #[test]
+    fn test_resolve_join_using() {
+        let schema = make_schema();
+        let stmt = parse_one("SELECT u.name, o.amount FROM users u JOIN orders o USING (id)");
+        let mut resolver = Resolver::new(&schema);
+        let errors = resolver.resolve_statement(&stmt);
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+        assert_eq!(resolver.tables_resolved, 2);
+        assert_eq!(resolver.columns_bound, 3); // u.name, o.amount, id (resolved redundantly but bounded once)
     }
 
     #[test]

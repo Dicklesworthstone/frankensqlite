@@ -1,0 +1,280 @@
+# Supported Surface Matrix v1.0.0
+#
+# Bead: bd-2yqp6.1.1
+# Purpose: freeze the declared SQLite 3.52.0 supported surface with explicit
+# exclusions and ownership so downstream parity work has one machine-readable
+# contract.
+
+[meta]
+schema_version = "1.0.0"
+bead_id = "bd-2yqp6.1.1"
+track_id = "bd-2yqp6.1"
+sqlite_target = "3.52.0"
+generated_at = "2026-02-26"
+contract_owner = "track-a-spec-owner"
+
+[[surface]]
+feature_id = "SURF-SQL-CORE-001"
+area = "sql"
+title = "Core SQL DDL and DML (CREATE TABLE, INSERT, UPDATE, DELETE, SELECT)"
+support_state = "supported"
+rationale = "Core SQL behavior is required for declared parity surface."
+owner = "track-d-engine-runtime"
+target_evidence = [
+  "crates/fsqlite-harness/conformance/001_basic_create_insert_select.json",
+  "crates/fsqlite-harness/conformance/008_update_delete.json",
+  "crates/fsqlite-harness/conformance/006_join_basic.json",
+]
+verification_status = "in_progress"
+
+[[surface]]
+feature_id = "SURF-SQL-COMPOUND-002"
+area = "sql"
+title = "Compound queries and subqueries (UNION, INTERSECT, EXCEPT, nested SELECT)"
+support_state = "supported"
+rationale = "Required by conformance fixtures and planner parity checks."
+owner = "track-d-engine-runtime"
+target_evidence = [
+  "crates/fsqlite-harness/conformance/013_compound_order_by_alias.json",
+  "crates/fsqlite-harness/conformance/014_compound_order_by_numeric.json",
+  "crates/fsqlite-harness/conformance/015_compound_order_by_error.json",
+]
+verification_status = "in_progress"
+
+[[surface]]
+feature_id = "SURF-SQL-WITHOUT-ROWID-003"
+area = "sql"
+title = "WITHOUT ROWID tables"
+support_state = "excluded"
+rationale = "Excluded from declared supported surface until clustered primary-key storage semantics are complete."
+owner = "track-d-engine-runtime"
+target_evidence = [
+  "parity_taxonomy.toml#F-SQL.17",
+  "crates/fsqlite-harness/tests/parity_taxonomy_test.rs",
+]
+verification_status = "planned"
+
+[[surface]]
+feature_id = "SURF-SQL-STRICT-004"
+area = "sql"
+title = "STRICT tables"
+support_state = "excluded"
+rationale = "Excluded until strict type-enforcement semantics are implemented and differentially verified."
+owner = "track-d-engine-runtime"
+target_evidence = [
+  "parity_taxonomy.toml#F-SQL.18",
+  "crates/fsqlite-harness/tests/parity_taxonomy_test.rs",
+]
+verification_status = "planned"
+
+[[surface]]
+feature_id = "SURF-SQL-GENERATED-COLUMNS-005"
+area = "sql"
+title = "Generated columns (VIRTUAL and STORED)"
+support_state = "excluded"
+rationale = "Excluded pending parser/runtime completion for generated-column expression persistence and update semantics."
+owner = "track-d-engine-runtime"
+target_evidence = [
+  "parity_taxonomy.toml#F-SQL.19",
+  "crates/fsqlite-harness/tests/parity_taxonomy_test.rs",
+]
+verification_status = "planned"
+
+[[surface]]
+feature_id = "SURF-TXN-MVCC-CONCURRENT-006"
+area = "transaction"
+title = "Page-level MVCC concurrent writers (BEGIN promotes to BEGIN CONCURRENT by default)"
+support_state = "supported"
+rationale = "Core project value proposition and mandatory default behavior."
+owner = "track-f-concurrency"
+target_evidence = [
+  "crates/fsqlite-core/src/connection.rs",
+  "crates/fsqlite-e2e/src/lib.rs",
+  "crates/fsqlite-e2e/src/fsqlite_executor.rs",
+  "crates/fsqlite-e2e/src/fairness.rs",
+]
+verification_status = "in_progress"
+
+[[surface]]
+feature_id = "SURF-TXN-SERIALIZED-WRITER-LOCK-007"
+area = "transaction"
+title = "SQLite-style single-writer serialized lock escalation"
+support_state = "excluded"
+rationale = "Intentionally excluded because FrankenSQLite replaces this bottleneck with page-level MVCC."
+owner = "track-f-concurrency"
+target_evidence = [
+  "AGENTS.md",
+  "crates/fsqlite-vfs/src/lib.rs",
+]
+verification_status = "verified"
+
+[[surface]]
+feature_id = "SURF-WAL-CRASH-RECOVERY-008"
+area = "storage"
+title = "WAL crash recovery and checkpoint behavior"
+support_state = "supported"
+rationale = "Required durability contract for declared supported surface."
+owner = "track-f-concurrency"
+target_evidence = [
+  "crates/fsqlite-harness/tests/bd_1dp9_4_4_crash_recovery_parity.rs",
+  "crates/fsqlite-harness/tests/bd_1dp9_4_1_wal_journal_parity.rs",
+]
+verification_status = "in_progress"
+
+[[surface]]
+feature_id = "SURF-PRAGMA-CORE-009"
+area = "pragma"
+title = "Core FrankenSQLite and SQLite-compatible PRAGMA controls"
+support_state = "partial"
+rationale = "Core PRAGMAs are wired; full SQLite pragma surface is not yet complete."
+owner = "track-d-engine-runtime"
+target_evidence = [
+  "crates/fsqlite-core/src/connection.rs",
+  "crates/fsqlite-harness/tests/bd_1dp9_4_3_maintenance_parity.rs",
+]
+verification_status = "in_progress"
+
+[[surface]]
+feature_id = "SURF-PRAGMA-LEGACY-010"
+area = "pragma"
+title = "Full legacy/edge SQLite PRAGMA compatibility surface"
+support_state = "excluded"
+rationale = "Excluded from current supported surface pending explicit implementation and differential verification."
+owner = "track-d-engine-runtime"
+target_evidence = [
+  "crates/fsqlite-core/src/connection.rs",
+  "crates/fsqlite-harness/src/maintenance_parity.rs",
+]
+verification_status = "planned"
+
+[[surface]]
+feature_id = "SURF-FUNC-CORE-011"
+area = "functions"
+title = "Core scalar and aggregate built-in functions"
+support_state = "supported"
+rationale = "Required for baseline SQL compatibility and existing fixture coverage."
+owner = "track-e-extensions-functions"
+target_evidence = [
+  "crates/fsqlite-func/src/lib.rs",
+  "crates/fsqlite-harness/conformance/005_aggregate_functions.json",
+  "crates/fsqlite-harness/conformance/009_expressions_and_functions.json",
+]
+verification_status = "in_progress"
+
+[[surface]]
+feature_id = "SURF-FUNC-WINDOW-012"
+area = "functions"
+title = "Full window-function parity"
+support_state = "partial"
+rationale = "Window-function coverage exists but full SQLite semantics still need differential closure."
+owner = "track-e-extensions-functions"
+target_evidence = [
+  "crates/fsqlite-func/src/lib.rs",
+  "parity_taxonomy.toml#F-SQL.05",
+]
+verification_status = "in_progress"
+
+[[surface]]
+feature_id = "SURF-EXT-JSON1-013"
+area = "extension"
+title = "JSON1 extension surface"
+support_state = "partial"
+rationale = "JSON1 support is present but requires expanded differential evidence."
+owner = "track-e-extensions-functions"
+target_evidence = [
+  "crates/fsqlite-ext-json/src/lib.rs",
+  "crates/fsqlite-e2e/tests/extension_json_fts_parity.rs",
+]
+verification_status = "in_progress"
+
+[[surface]]
+feature_id = "SURF-EXT-FTS3-014"
+area = "extension"
+title = "FTS3 extension surface"
+support_state = "excluded"
+rationale = "Excluded from declared supported surface until tokenizer/match semantics are fully verified against SQLite."
+owner = "track-e-extensions-functions"
+target_evidence = [
+  "crates/fsqlite-ext-fts3/src/lib.rs",
+  "crates/fsqlite-e2e/tests/extension_json_fts_parity.rs",
+]
+verification_status = "planned"
+
+[[surface]]
+feature_id = "SURF-EXT-FTS5-015"
+area = "extension"
+title = "FTS5 extension surface"
+support_state = "excluded"
+rationale = "Excluded from declared supported surface until rank/tokenization behavior reaches differential parity."
+owner = "track-e-extensions-functions"
+target_evidence = [
+  "crates/fsqlite-ext-fts5/src/lib.rs",
+  "crates/fsqlite-e2e/tests/extension_json_fts_parity.rs",
+]
+verification_status = "planned"
+
+[[surface]]
+feature_id = "SURF-EXT-RTREE-016"
+area = "extension"
+title = "R-Tree extension surface"
+support_state = "partial"
+rationale = "R-Tree extension exists but needs broader conformance evidence for edge-case geometry predicates."
+owner = "track-e-extensions-functions"
+target_evidence = [
+  "crates/fsqlite-ext-rtree/src/lib.rs",
+  "crates/fsqlite-e2e/tests/extension_rtree_session_icu_misc_parity.rs",
+]
+verification_status = "in_progress"
+
+[[surface]]
+feature_id = "SURF-EXT-SESSION-017"
+area = "extension"
+title = "Session extension (changesets)"
+support_state = "excluded"
+rationale = "Excluded pending deterministic replay and differential checks for changeset generation and apply semantics."
+owner = "track-e-extensions-functions"
+target_evidence = [
+  "crates/fsqlite-ext-session/src/lib.rs",
+  "crates/fsqlite-e2e/tests/extension_rtree_session_icu_misc_parity.rs",
+]
+verification_status = "planned"
+
+[[surface]]
+feature_id = "SURF-CLI-COMPAT-018"
+area = "api-cli"
+title = "sqlite3-like CLI command compatibility"
+support_state = "partial"
+rationale = "CLI shell supports core workflows; full sqlite3 command parity remains in progress."
+owner = "track-g-release-gates"
+target_evidence = [
+  "crates/fsqlite-cli/src/main.rs",
+  "crates/fsqlite-harness/tests/bd_3fve_2_phase9_cli_conformance_replication_compliance.rs",
+]
+verification_status = "in_progress"
+
+[[surface]]
+feature_id = "SURF-CONFORMANCE-NATIVE-019"
+area = "conformance"
+title = "Native Rust differential conformance harness"
+support_state = "supported"
+rationale = "Native conformance harness is the required proof mechanism for declared supported surface."
+owner = "track-b-harness-integrity"
+target_evidence = [
+  "crates/fsqlite-harness/src/lib.rs",
+  "crates/fsqlite-harness/conformance/core_sql_golden_blake3.json",
+  "crates/fsqlite-harness/tests/bd_3d5b_conformance_testing_compliance.rs",
+]
+verification_status = "in_progress"
+
+[[surface]]
+feature_id = "SURF-CONFORMANCE-TCL-020"
+area = "conformance"
+title = "Direct TCL test-harness execution parity with upstream SQLite"
+support_state = "excluded"
+rationale = "Excluded because project policy uses native Rust conformance harness instead of direct TCL harness porting."
+owner = "track-b-harness-integrity"
+target_evidence = [
+  "README.md",
+  "crates/fsqlite-harness/tests/bd_3plop_7_tcl_conformance.rs",
+]
+verification_status = "planned"

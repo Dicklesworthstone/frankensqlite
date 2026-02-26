@@ -1,0 +1,253 @@
+# Canonical Feature Universe Ledger v1.0.0
+#
+# Bead: bd-2yqp6.1.2
+# Purpose: spec-first canonical ledger mapping declared features to parser,
+# planner, VDBE, core, and extension surfaces with lifecycle progress.
+
+[meta]
+schema_version = "1.0.0"
+bead_id = "bd-2yqp6.1.2"
+track_id = "bd-2yqp6.1"
+sqlite_target = "3.52.0"
+generated_at = "2026-02-26"
+contract_owner = "track-a-ledger-owner"
+
+[[features]]
+feature_id = "LEDGER-0001"
+surface_id = "SURF-SQL-CORE-001"
+component = "parser"
+feature_name = "SELECT core grammar"
+lifecycle_state = "tested"
+owner = "track-d-engine-runtime"
+test_links = ["crates/fsqlite-parser/src/lib.rs", "crates/fsqlite-harness/conformance/001_basic_create_insert_select.json"]
+evidence_links = ["parity_taxonomy.toml#F-SQL.01", "crates/fsqlite-harness/conformance/core_sql_golden_blake3.json"]
+
+[[features]]
+feature_id = "LEDGER-0002"
+surface_id = "SURF-SQL-CORE-001"
+component = "parser"
+feature_name = "INSERT grammar and values forms"
+lifecycle_state = "tested"
+owner = "track-d-engine-runtime"
+test_links = ["crates/fsqlite-parser/src/lib.rs", "crates/fsqlite-harness/conformance/001_basic_create_insert_select.json"]
+evidence_links = ["parity_taxonomy.toml#F-SQL.10", "crates/fsqlite-harness/conformance/core_sql_golden_blake3.json"]
+
+[[features]]
+feature_id = "LEDGER-0003"
+surface_id = "SURF-SQL-COMPOUND-002"
+component = "parser"
+feature_name = "Compound query grammar (UNION/INTERSECT/EXCEPT)"
+lifecycle_state = "tested"
+owner = "track-d-engine-runtime"
+test_links = ["crates/fsqlite-parser/src/lib.rs", "crates/fsqlite-harness/conformance/013_compound_order_by_alias.json"]
+evidence_links = ["parity_taxonomy.toml#F-SQL.03", "crates/fsqlite-harness/conformance/core_sql_golden_blake3.json"]
+
+[[features]]
+feature_id = "LEDGER-0004"
+surface_id = "SURF-SQL-COMPOUND-002"
+component = "parser"
+feature_name = "CTE and recursive WITH parsing"
+lifecycle_state = "implemented"
+owner = "track-d-engine-runtime"
+test_links = ["crates/fsqlite-parser/src/lib.rs", "parity_taxonomy.toml#F-SQL.04"]
+evidence_links = ["parity_taxonomy.toml#F-SQL.04", "README.md"]
+
+[[features]]
+feature_id = "LEDGER-0005"
+surface_id = "SURF-SQL-CORE-001"
+component = "planner"
+feature_name = "Single-table scan planning"
+lifecycle_state = "differentially_verified"
+owner = "track-d-engine-runtime"
+test_links = ["crates/fsqlite-planner/src/lib.rs", "crates/fsqlite-harness/conformance/001_basic_create_insert_select.json"]
+evidence_links = ["crates/fsqlite-harness/conformance/core_sql_golden_blake3.json", "crates/fsqlite-harness/src/parity_taxonomy.rs"]
+
+[[features]]
+feature_id = "LEDGER-0006"
+surface_id = "SURF-SQL-CORE-001"
+component = "planner"
+feature_name = "WHERE predicate pushdown and filter planning"
+lifecycle_state = "tested"
+owner = "track-d-engine-runtime"
+test_links = ["crates/fsqlite-planner/src/lib.rs", "crates/fsqlite-harness/conformance/009_expressions_and_functions.json"]
+evidence_links = ["parity_taxonomy.toml#F-PLN.02", "crates/fsqlite-harness/conformance/core_sql_golden_blake3.json"]
+
+[[features]]
+feature_id = "LEDGER-0007"
+surface_id = "SURF-SQL-COMPOUND-002"
+component = "planner"
+feature_name = "Compound query plan shaping"
+lifecycle_state = "tested"
+owner = "track-d-engine-runtime"
+test_links = ["crates/fsqlite-planner/src/lib.rs", "crates/fsqlite-harness/conformance/014_compound_order_by_numeric.json"]
+evidence_links = ["parity_taxonomy.toml#F-PLN.07", "crates/fsqlite-harness/conformance/core_sql_golden_blake3.json"]
+
+[[features]]
+feature_id = "LEDGER-0008"
+surface_id = "SURF-SQL-CORE-001"
+component = "planner"
+feature_name = "Index selection and ORDER BY planning"
+lifecycle_state = "implemented"
+owner = "track-d-engine-runtime"
+test_links = ["crates/fsqlite-planner/src/lib.rs", "crates/fsqlite-harness/conformance/010_index_and_ordering.json"]
+evidence_links = ["parity_taxonomy.toml#F-PLN.04", "crates/fsqlite-harness/src/parity_evidence_matrix.rs"]
+
+[[features]]
+feature_id = "LEDGER-0009"
+surface_id = "SURF-SQL-CORE-001"
+component = "vdbe"
+feature_name = "Row scan cursor opcodes"
+lifecycle_state = "tested"
+owner = "track-d-engine-runtime"
+test_links = ["crates/fsqlite-vdbe/src/engine.rs", "crates/fsqlite-harness/conformance/001_basic_create_insert_select.json"]
+evidence_links = ["parity_taxonomy.toml#F-VDB.01", "crates/fsqlite-harness/conformance/core_sql_golden_blake3.json"]
+
+[[features]]
+feature_id = "LEDGER-0010"
+surface_id = "SURF-SQL-CORE-001"
+component = "vdbe"
+feature_name = "Result emission and expression evaluation opcodes"
+lifecycle_state = "tested"
+owner = "track-d-engine-runtime"
+test_links = ["crates/fsqlite-vdbe/src/engine.rs", "crates/fsqlite-harness/conformance/009_expressions_and_functions.json"]
+evidence_links = ["parity_taxonomy.toml#F-VDB.03", "crates/fsqlite-harness/conformance/core_sql_golden_blake3.json"]
+
+[[features]]
+feature_id = "LEDGER-0011"
+surface_id = "SURF-SQL-CORE-001"
+component = "vdbe"
+feature_name = "Transaction and savepoint opcodes"
+lifecycle_state = "implemented"
+owner = "track-f-concurrency"
+test_links = ["crates/fsqlite-vdbe/src/engine.rs", "crates/fsqlite-harness/conformance/011_transactions_rollback.json"]
+evidence_links = ["parity_taxonomy.toml#F-VDB.08", "crates/fsqlite-harness/src/lock_txn_parity.rs"]
+
+[[features]]
+feature_id = "LEDGER-0012"
+surface_id = "SURF-SQL-COMPOUND-002"
+component = "vdbe"
+feature_name = "Sorter and compound-select execution opcodes"
+lifecycle_state = "implemented"
+owner = "track-d-engine-runtime"
+test_links = ["crates/fsqlite-vdbe/src/engine.rs", "crates/fsqlite-harness/conformance/013_compound_order_by_alias.json"]
+evidence_links = ["parity_taxonomy.toml#F-VDB.14", "crates/fsqlite-harness/src/parity_taxonomy.rs"]
+
+[[features]]
+feature_id = "LEDGER-0013"
+surface_id = "SURF-TXN-MVCC-CONCURRENT-006"
+component = "core"
+feature_name = "Connection-level concurrent-mode default behavior"
+lifecycle_state = "differentially_verified"
+owner = "track-f-concurrency"
+test_links = ["crates/fsqlite-core/src/connection.rs", "crates/fsqlite-e2e/src/lib.rs"]
+evidence_links = ["AGENTS.md", "crates/fsqlite-e2e/src/fsqlite_executor.rs", "crates/fsqlite-e2e/src/fairness.rs"]
+
+[[features]]
+feature_id = "LEDGER-0014"
+surface_id = "SURF-TXN-MVCC-CONCURRENT-006"
+component = "core"
+feature_name = "BEGIN/COMMIT transaction routing with pager wiring"
+lifecycle_state = "tested"
+owner = "track-f-concurrency"
+test_links = ["crates/fsqlite-core/src/connection.rs", "crates/fsqlite-harness/conformance/011_transactions_rollback.json"]
+evidence_links = ["crates/fsqlite-harness/src/lock_txn_parity.rs", "crates/fsqlite-harness/src/concurrent_writer_parity.rs"]
+
+[[features]]
+feature_id = "LEDGER-0015"
+surface_id = "SURF-PRAGMA-CORE-009"
+component = "core"
+feature_name = "PRAGMA dispatch and compatibility guards"
+lifecycle_state = "implemented"
+owner = "track-d-engine-runtime"
+test_links = ["crates/fsqlite-core/src/connection.rs", "crates/fsqlite-harness/src/maintenance_parity.rs"]
+evidence_links = ["parity_taxonomy.toml#F-PGM.01", "crates/fsqlite-harness/tests/bd_1dp9_4_3_maintenance_parity.rs"]
+
+[[features]]
+feature_id = "LEDGER-0016"
+surface_id = "SURF-WAL-CRASH-RECOVERY-008"
+component = "core"
+feature_name = "Crash-recovery orchestration across VFS/Pager/WAL stack"
+lifecycle_state = "tested"
+owner = "track-f-concurrency"
+test_links = ["crates/fsqlite-harness/src/crash_recovery_parity.rs", "crates/fsqlite-harness/tests/bd_1dp9_4_4_crash_recovery_parity.rs"]
+evidence_links = ["crates/fsqlite-harness/tests/bd_1dp9_4_1_wal_journal_parity.rs", "README.md"]
+
+[[features]]
+feature_id = "LEDGER-0017"
+surface_id = "SURF-EXT-JSON1-013"
+component = "extension"
+feature_name = "JSON1 scalar and table-valued functions"
+lifecycle_state = "tested"
+owner = "track-e-extensions-functions"
+test_links = ["crates/fsqlite-ext-json/src/lib.rs", "crates/fsqlite-e2e/tests/extension_json_fts_parity.rs"]
+evidence_links = ["parity_taxonomy.toml#F-EXT.05", "crates/fsqlite-harness/src/extension_parity_matrix.rs"]
+
+[[features]]
+feature_id = "LEDGER-0018"
+surface_id = "SURF-EXT-RTREE-016"
+component = "extension"
+feature_name = "R-Tree extension DDL and query behavior"
+lifecycle_state = "implemented"
+owner = "track-e-extensions-functions"
+test_links = ["crates/fsqlite-ext-rtree/src/lib.rs", "crates/fsqlite-e2e/tests/extension_rtree_session_icu_misc_parity.rs"]
+evidence_links = ["parity_taxonomy.toml#F-EXT.03", "crates/fsqlite-harness/src/extension_parity_matrix.rs"]
+
+[[features]]
+feature_id = "LEDGER-0019"
+surface_id = "SURF-EXT-FTS3-014"
+component = "extension"
+feature_name = "FTS3 extension compatibility"
+lifecycle_state = "declared"
+owner = "track-e-extensions-functions"
+test_links = ["crates/fsqlite-ext-fts3/src/lib.rs", "crates/fsqlite-e2e/tests/extension_json_fts_parity.rs"]
+evidence_links = ["supported_surface_matrix.toml#SURF-EXT-FTS3-014", "parity_taxonomy.toml#F-EXT.01"]
+
+[[features]]
+feature_id = "LEDGER-0020"
+surface_id = "SURF-EXT-FTS5-015"
+component = "extension"
+feature_name = "FTS5 extension compatibility"
+lifecycle_state = "declared"
+owner = "track-e-extensions-functions"
+test_links = ["crates/fsqlite-ext-fts5/src/lib.rs", "crates/fsqlite-e2e/tests/extension_json_fts_parity.rs"]
+evidence_links = ["supported_surface_matrix.toml#SURF-EXT-FTS5-015", "parity_taxonomy.toml#F-EXT.02"]
+
+[[features]]
+feature_id = "LEDGER-0021"
+surface_id = "SURF-EXT-SESSION-017"
+component = "extension"
+feature_name = "Session/changeset extension compatibility"
+lifecycle_state = "declared"
+owner = "track-e-extensions-functions"
+test_links = ["crates/fsqlite-ext-session/src/lib.rs", "crates/fsqlite-e2e/tests/extension_rtree_session_icu_misc_parity.rs"]
+evidence_links = ["supported_surface_matrix.toml#SURF-EXT-SESSION-017", "parity_taxonomy.toml#F-EXT.06"]
+
+[[features]]
+feature_id = "LEDGER-0022"
+surface_id = "SURF-CONFORMANCE-NATIVE-019"
+component = "core"
+feature_name = "Native Rust differential harness orchestration"
+lifecycle_state = "differentially_verified"
+owner = "track-b-harness-integrity"
+test_links = ["crates/fsqlite-harness/src/lib.rs", "crates/fsqlite-harness/tests/bd_3d5b_conformance_testing_compliance.rs"]
+evidence_links = ["crates/fsqlite-harness/conformance/core_sql_golden_blake3.json", "crates/fsqlite-harness/src/parity_evidence_matrix.rs"]
+
+[[features]]
+feature_id = "LEDGER-0023"
+surface_id = "SURF-CLI-COMPAT-018"
+component = "core"
+feature_name = "CLI command parsing and sqlite3-compatible shell behavior"
+lifecycle_state = "implemented"
+owner = "track-g-release-gates"
+test_links = ["crates/fsqlite-cli/src/main.rs", "crates/fsqlite-harness/tests/bd_3fve_2_phase9_cli_conformance_replication_compliance.rs"]
+evidence_links = ["parity_taxonomy.toml#F-CLI.01", "README.md"]
+
+[[features]]
+feature_id = "LEDGER-0024"
+surface_id = "SURF-CONFORMANCE-TCL-020"
+component = "core"
+feature_name = "TCL-harness interoperability accounting"
+lifecycle_state = "declared"
+owner = "track-b-harness-integrity"
+test_links = ["crates/fsqlite-harness/tests/bd_3plop_7_tcl_conformance.rs", "README.md"]
+evidence_links = ["supported_surface_matrix.toml#SURF-CONFORMANCE-TCL-020", "README.md"]

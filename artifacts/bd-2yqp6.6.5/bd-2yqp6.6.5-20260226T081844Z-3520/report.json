@@ -1,0 +1,9 @@
+{
+  "trace_id": "trace-bd-2yqp6.6.5-20260226T081844Z-3520",
+  "run_id": "bd-2yqp6.6.5-20260226T081844Z-3520",
+  "scenario_id": "CONCURRENT-DEFAULTS-F5",
+  "seed": 3520,
+  "bead_id": "bd-2yqp6.6.5",
+  "events_jsonl": "artifacts/bd-2yqp6.6.5/bd-2yqp6.6.5-20260226T081844Z-3520/events.jsonl",
+  "result": "pass"
+}

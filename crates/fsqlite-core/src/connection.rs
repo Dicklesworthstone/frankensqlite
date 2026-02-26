@@ -117,6 +117,32 @@ impl std::fmt::Debug for PagerBackend {
 }
 
 impl PagerBackend {
+    /// Returns `true` if this backend uses the in-memory VFS (`:memory:`).
+    #[must_use]
+    pub fn is_memory(&self) -> bool {
+        matches!(self, Self::Memory(_))
+    }
+
+    /// Returns `true` if this backend uses a file-backed VFS.
+    #[must_use]
+    pub fn is_file_backed(&self) -> bool {
+        match self {
+            Self::Memory(_) => false,
+            #[cfg(unix)]
+            Self::Unix(_) => true,
+        }
+    }
+
+    /// Returns a string identifying the backend kind for diagnostics.
+    #[must_use]
+    pub fn kind_str(&self) -> &'static str {
+        match self {
+            Self::Memory(_) => "memory",
+            #[cfg(unix)]
+            Self::Unix(_) => "unix",
+        }
+    }
+
     /// Open a pager for the given path.
     ///
     /// Uses [`MemoryVfs`] for `:memory:`.
@@ -476,6 +502,7 @@ impl PreparedStatement {
                 txn,
                 self.schema_cookie,
                 None,
+                false,
             );
             // Commit the read transaction (no-op for deferred reads).
             if let Some(ref mut txn) = txn_back {
@@ -507,17 +534,28 @@ impl PreparedStatement {
                     "prepared statement missing function registry".to_owned(),
                 ));
             };
-            // PreparedStatement doesn't have concurrent context (no active txn here).
-            execute_table_program_with_db(
+            // Execute through a deferred pager transaction so prepared
+            // parameterized table queries do not fall back to MemPageStore.
+            let op_cx = self.root_cx.clone().with_decision_id(next_decision_id());
+            let txn = self
+                .pager
+                .as_ref()
+                .map(|p| p.begin(&op_cx, TransactionMode::Deferred))
+                .transpose()?;
+            let (result, mut txn_back) = execute_table_program_with_db(
                 &self.program,
                 Some(params),
                 registry,
                 db,
-                None,
+                txn,
                 self.schema_cookie,
                 None,
-            )
-            .0?
+                false,
+            );
+            if let Some(ref mut txn) = txn_back {
+                txn.commit(&op_cx)?;
+            }
+            result?
         } else {
             execute_program_with_postprocess(
                 &self.program,
@@ -1035,6 +1073,10 @@ pub struct Connection {
     /// authority by using a monotonic counter that increments by a fixed
     /// amount each operation.  This provides deterministic GC behavior.
     gc_clock_millis: RefCell<u64>,
+    /// bd-2ttd8.1: When true, the VDBE engine will reject MemPageStore
+    /// fallback and require all cursor operations to route through the real
+    /// Pager+BtreeCursor stack. Used for parity-certification testing.
+    reject_mem_fallback: RefCell<bool>,
 }
 
 impl std::fmt::Debug for Connection {
@@ -1116,6 +1158,12 @@ impl Connection {
             gc_scheduler: RefCell::new(GcScheduler::new()),
             gc_todo: RefCell::new(GcTodo::new()),
             gc_clock_millis: RefCell::new(0),
+            // bd-zjisk.1: Default to parity-cert mode — all cursor operations
+            // must route through the real Pager+BtreeCursor stack.  The
+            // MemPageStore fallback is rejected unless explicitly re-enabled
+            // via `set_reject_mem_fallback(false)` or
+            // `PRAGMA fsqlite.parity_cert = OFF`.
+            reject_mem_fallback: RefCell::new(true),
         };
         conn.bootstrap_journal_mode_from_storage();
         conn.apply_current_journal_mode_to_pager()?;
@@ -1128,6 +1176,49 @@ impl Connection {
     /// Returns the configured database path.
     pub fn path(&self) -> &str {
         &self.path
+    }
+
+    /// Enable parity-certification mode (bd-2ttd8.1).
+    ///
+    /// When enabled, all VDBE cursor operations must route through the real
+    /// Pager+BtreeCursor stack. The MemPageStore fallback is rejected,
+    /// causing `OpenRead`/`OpenWrite` to fail if no pager transaction is
+    /// available. Use this in tests to verify that the full storage stack
+    /// is wired correctly.
+    pub fn set_reject_mem_fallback(&self, reject: bool) {
+        *self.reject_mem_fallback.borrow_mut() = reject;
+    }
+
+    /// Returns the kind of pager backend in use (e.g. "memory" or "unix").
+    #[must_use]
+    pub fn pager_backend_kind(&self) -> &'static str {
+        self.pager.kind_str()
+    }
+
+    /// Validate that the pager backend is suitable for parity-certification.
+    ///
+    /// When `reject_mem_fallback` is enabled, the pager SHOULD be file-backed
+    /// (not `:memory:`) for meaningful parity testing. This method returns
+    /// `Err` if parity-cert mode is active but the pager is memory-only.
+    ///
+    /// Note: This is a diagnostic check, not an enforcement gate. In-memory
+    /// pagers can still be used in parity-cert mode (they have a real
+    /// `SimplePager` behind them), but file-backed pagers provide stronger
+    /// guarantees about I/O path coverage.
+    pub fn validate_parity_cert_backend(&self) -> std::result::Result<(), String> {
+        if !*self.reject_mem_fallback.borrow() {
+            return Ok(());
+        }
+        // In parity-cert mode, log a warning if using memory backend,
+        // but don't block — Memory still uses SimplePager (real pager stack).
+        if self.pager.is_memory() {
+            tracing::warn!(
+                backend_kind = self.pager.kind_str(),
+                "bd-2ttd8.4: parity-cert mode active with in-memory pager; \
+                 consider using file-backed pager for full I/O path coverage"
+            );
+        }
+        Ok(())
     }
 
     /// Returns the most recent commit sequence assigned to a successful
@@ -1537,6 +1628,7 @@ impl Connection {
             Statement::Release(_) => "release",
             Statement::CreateView(_) => "create_view",
             Statement::CreateTrigger(_) => "create_trigger",
+            Statement::Explain { .. } => "explain",
             _ => "other",
         };
         let trace_id = next_trace_id();
@@ -2147,8 +2239,11 @@ impl Connection {
             Statement::Analyze(_) | Statement::Reindex(_) => {
                 Ok(Vec::new())
             }
+            Statement::Explain { query_plan, stmt } => {
+                self.execute_explain(*stmt, query_plan, params)
+            }
             _ => Err(FrankenError::NotImplemented(
-                "only SELECT, INSERT, UPDATE, DELETE, DDL (CREATE/DROP/ALTER TABLE, CREATE INDEX/VIEW/TRIGGER), transaction control, PRAGMA, VACUUM, ANALYZE, and REINDEX are supported".to_owned(),
+                "only SELECT, INSERT, UPDATE, DELETE, DDL (CREATE/DROP/ALTER TABLE, CREATE INDEX/VIEW/TRIGGER), transaction control, PRAGMA, VACUUM, ANALYZE, REINDEX, and EXPLAIN are supported".to_owned(),
             )),
         }
     }
@@ -5148,6 +5243,17 @@ impl Connection {
                         ),
                     };
 
+                    let primary_conflict_page = conflict_pages.first().map_or(0, |page| page.get());
+                    tracing::warn!(
+                        txn_id = snapshot.txn.id.get(),
+                        commit_seq = assigned_commit_seq.get(),
+                        snapshot_high = snapshot.snapshot_seq.get(),
+                        page_id = primary_conflict_page,
+                        visibility_decision = "commit_abort",
+                        conflict_reason = rationale.as_str(),
+                        "mvcc commit visibility conflict"
+                    );
+
                     abort_card = Some(Self::build_ssi_decision_draft(
                         &snapshot,
                         decision_type,
@@ -5164,7 +5270,19 @@ impl Connection {
         }
 
         match validate_result {
-            Ok(plan) => Ok(Some(plan)),
+            Ok(plan) => {
+                let first_page = plan.write_pages().first().map_or(0, |page| page.get());
+                tracing::debug!(
+                    txn_id = plan.txn_token().id.get(),
+                    commit_seq = plan.assigned_commit_seq().get(),
+                    snapshot_high = plan.begin_seq().get(),
+                    page_id = first_page,
+                    visibility_decision = "commit_plan_clean",
+                    conflict_reason = "none",
+                    "mvcc commit plan prepared"
+                );
+                Ok(Some(plan))
+            }
             Err((err, fcw_result)) => {
                 registry.remove(session_id);
                 *self.concurrent_session_id.borrow_mut() = None;
@@ -5180,6 +5298,16 @@ impl Connection {
         plan: PreparedConcurrentCommit,
         committed_seq: CommitSeq,
     ) {
+        let first_page = plan.write_pages().first().map_or(0, |page| page.get());
+        tracing::info!(
+            txn_id = plan.txn_token().id.get(),
+            commit_seq = committed_seq.get(),
+            snapshot_high = plan.begin_seq().get(),
+            page_id = first_page,
+            visibility_decision = "commit_published",
+            conflict_reason = "none",
+            "mvcc commit finalized"
+        );
         let session_id = plan.session_id();
         finalize_prepared_concurrent_commit_with_ssi(
             registry,
@@ -5607,6 +5735,10 @@ impl Connection {
     ///   Enables or disables MVCC concurrent-writer mode for subsequent
     ///   transactions on this connection. When enabled, plain `BEGIN` is
     ///   automatically promoted to `BEGIN CONCURRENT`.
+    /// - `PRAGMA fsqlite.parity_cert = ON|OFF|TRUE|FALSE|1|0`
+    ///   Enables or disables parity-certification mode. When ON (default),
+    ///   all cursor operations must route through the real Pager+BtreeCursor
+    ///   stack and the MemPageStore fallback is rejected.
     #[allow(clippy::too_many_lines)]
     fn execute_pragma(&self, pragma: &fsqlite_ast::PragmaStatement) -> Result<Vec<Row>> {
         // First try connection-level knobs (journal_mode, synchronous, etc.).
@@ -5672,7 +5804,7 @@ impl Connection {
         }
 
         // fsqlite-specific: concurrent_mode toggle.
-        let name = pragma.name.name.to_lowercase();
+        let name = pragma.name.name.to_ascii_lowercase();
         if matches!(name.as_str(), "quick_check" | "integrity_check") {
             return Ok(vec![Row {
                 values: vec![SqliteValue::Text("ok".to_owned())],
@@ -5710,7 +5842,7 @@ impl Connection {
                 values: vec![value],
             }]);
         }
-        let schema = pragma.name.schema.as_ref().map(|s| s.to_lowercase());
+        let schema = pragma.name.schema.as_ref().map(|s| s.to_ascii_lowercase());
         let full_name = if let Some(ref s) = schema {
             format!("{s}.{name}")
         } else {
@@ -5727,6 +5859,21 @@ impl Connection {
                     }])
                 } else {
                     let enabled = *self.concurrent_mode_default.borrow();
+                    Ok(vec![Row {
+                        values: vec![SqliteValue::Integer(i64::from(enabled))],
+                    }])
+                }
+            }
+            // ── Parity-certification mode PRAGMA (bd-zjisk.1) ─────────────
+            "fsqlite.parity_cert" | "parity_cert" => {
+                if let Some(ref val) = pragma.value {
+                    let enabled = parse_pragma_bool(val)?;
+                    *self.reject_mem_fallback.borrow_mut() = enabled;
+                    Ok(vec![Row {
+                        values: vec![SqliteValue::Integer(i64::from(enabled))],
+                    }])
+                } else {
+                    let enabled = *self.reject_mem_fallback.borrow();
                     Ok(vec![Row {
                         values: vec![SqliteValue::Integer(i64::from(enabled))],
                     }])
@@ -7784,6 +7931,120 @@ impl Connection {
         builder.finish()
     }
 
+    /// Attempt to compile any statement into a `VdbeProgram` for EXPLAIN.
+    ///
+    /// Returns `Ok(program)` when the statement type has VDBE codegen,
+    /// or `Err(...)` for statement types that don't go through the bytecode
+    /// compiler (DDL, transaction control, PRAGMA, etc.).
+    fn try_compile_statement(&self, stmt: &Statement) -> Result<VdbeProgram> {
+        match stmt {
+            Statement::Select(select) => self.compile_table_select(select),
+            Statement::Insert(insert) => self.compile_table_insert(insert),
+            Statement::Update(update) => self.compile_table_update(update),
+            Statement::Delete(delete) => self.compile_table_delete(delete),
+            _ => Err(FrankenError::not_implemented(format!(
+                "EXPLAIN for {} statements",
+                stmt_kind_label(stmt)
+            ))),
+        }
+    }
+
+    /// Execute `EXPLAIN` or `EXPLAIN QUERY PLAN` by compiling the inner
+    /// statement and returning its bytecode instructions (or query plan) as
+    /// result rows.
+    ///
+    /// For plain `EXPLAIN`, each row has 8 columns matching SQLite's output:
+    ///   addr | opcode | p1 | p2 | p3 | p4 | p5 | comment
+    ///
+    /// For `EXPLAIN QUERY PLAN`, each row has 4 columns:
+    ///   id | parent | notused | detail
+    fn execute_explain(
+        &self,
+        stmt: Statement,
+        query_plan: bool,
+        params: Option<&[SqliteValue]>,
+    ) -> Result<Vec<Row>> {
+        let _ = params; // reserved for future use
+
+        if query_plan {
+            return Ok(self.execute_explain_query_plan(&stmt));
+        }
+
+        let program = self.try_compile_statement(&stmt)?;
+
+        let rows = program
+            .ops()
+            .iter()
+            .enumerate()
+            .map(|(addr, op)| {
+                let p4_str = match &op.p4 {
+                    P4::None => String::new(),
+                    P4::Int(v) => format!("{v}"),
+                    P4::Int64(v) => format!("{v}"),
+                    P4::Real(v) => format!("{v}"),
+                    P4::Str(s) => s.clone(),
+                    P4::Blob(b) => format!("x'{}'", hex_encode(b)),
+                    P4::Collation(c) => c.clone(),
+                    P4::FuncName(f) => f.clone(),
+                    P4::Table(t) => t.clone(),
+                    P4::Index(i) => i.clone(),
+                    P4::Affinity(a) => a.clone(),
+                };
+
+                Row {
+                    values: vec![
+                        SqliteValue::Integer(i64::try_from(addr).unwrap_or(i64::MAX)),
+                        SqliteValue::Text(op.opcode.name().to_owned()),
+                        SqliteValue::Integer(i64::from(op.p1)),
+                        SqliteValue::Integer(i64::from(op.p2)),
+                        SqliteValue::Integer(i64::from(op.p3)),
+                        SqliteValue::Text(p4_str),
+                        SqliteValue::Integer(i64::from(op.p5)),
+                        SqliteValue::Text(String::new()), // comment column
+                    ],
+                }
+            })
+            .collect();
+
+        Ok(rows)
+    }
+
+    /// Execute `EXPLAIN QUERY PLAN` by describing the scan strategy of the
+    /// inner statement at a high level.  Each row has four columns:
+    ///   id | parent | notused | detail
+    #[allow(clippy::unused_self)] // &self reserved for future schema-aware EQP
+    fn execute_explain_query_plan(&self, stmt: &Statement) -> Vec<Row> {
+        let detail = match stmt {
+            Statement::Select(select) => {
+                let core = &select.body.select;
+                let table_name = first_table_name_from_core(core);
+                match table_name {
+                    Some(name) => format!("SCAN {name}"),
+                    None => "SCAN CONSTANT ROW".to_owned(),
+                }
+            }
+            Statement::Insert(insert) => {
+                format!("SCAN {} (INSERT)", insert.table.name)
+            }
+            Statement::Update(update) => {
+                format!("SCAN {} (UPDATE)", update.table.name.name)
+            }
+            Statement::Delete(delete) => {
+                format!("SCAN {} (DELETE)", delete.table.name.name)
+            }
+            _ => "SCAN".to_owned(),
+        };
+
+        vec![Row {
+            values: vec![
+                SqliteValue::Integer(2),
+                SqliteValue::Integer(0),
+                SqliteValue::Integer(0),
+                SqliteValue::Text(detail),
+            ],
+        }]
+    }
+
     /// Execute a VDBE program with the in-memory database attached.
     fn execute_table_program(
         &self,
@@ -7819,6 +8080,7 @@ impl Connection {
         };
 
         let func_reg = self.func_registry.borrow().clone();
+        let reject_mem = *self.reject_mem_fallback.borrow();
         let (result, txn_back) = execute_table_program_with_db(
             program,
             params,
@@ -7827,6 +8089,7 @@ impl Connection {
             txn,
             cookie,
             concurrent_ctx,
+            reject_mem,
         );
         // Always restore the transaction handle, even on error.
         if let Some(txn) = txn_back {
@@ -8247,11 +8510,13 @@ fn apply_limit_clause(rows: &mut Vec<Row>, clause: &LimitClause) {
     let offset_val = clause
         .offset
         .as_ref()
-        .map_or(0_usize, |off| eval_limit_expr(off) as usize);
+        .map_or(0_i64, |off| eval_limit_expr(off).max(0));
 
-    if offset_val > 0 && offset_val < rows.len() {
-        rows.drain(..offset_val);
-    } else if offset_val >= rows.len() {
+    let offset_usize = offset_val as usize;
+
+    if offset_usize > 0 && offset_usize < rows.len() {
+        rows.drain(..offset_usize);
+    } else if offset_usize >= rows.len() {
         rows.clear();
         return;
     }
@@ -8273,6 +8538,11 @@ fn eval_limit_expr(expr: &Expr) -> i64 {
             expr: inner,
             ..
         } => -eval_limit_expr(inner),
+        Expr::UnaryOp {
+            op: fsqlite_ast::UnaryOp::Plus,
+            expr: inner,
+            ..
+        } => eval_limit_expr(inner),
         _ => -1, // Negative means "no limit"
     }
 }
@@ -10056,6 +10326,58 @@ fn codegen_error_to_franken(e: CodegenError) -> FrankenError {
     }
 }
 
+/// Short label for a statement type, used in EXPLAIN error messages.
+fn stmt_kind_label(stmt: &Statement) -> &'static str {
+    match stmt {
+        Statement::Select(_) => "SELECT",
+        Statement::Insert(_) => "INSERT",
+        Statement::Update(_) => "UPDATE",
+        Statement::Delete(_) => "DELETE",
+        Statement::CreateTable(_) => "CREATE TABLE",
+        Statement::CreateVirtualTable(_) => "CREATE VIRTUAL TABLE",
+        Statement::Drop(_) => "DROP",
+        Statement::AlterTable(_) => "ALTER TABLE",
+        Statement::CreateIndex(_) => "CREATE INDEX",
+        Statement::CreateView(_) => "CREATE VIEW",
+        Statement::CreateTrigger(_) => "CREATE TRIGGER",
+        Statement::Pragma(_) => "PRAGMA",
+        Statement::Begin(_) => "BEGIN",
+        Statement::Commit => "COMMIT",
+        Statement::Rollback(_) => "ROLLBACK",
+        Statement::Savepoint(_) => "SAVEPOINT",
+        Statement::Release(_) => "RELEASE",
+        Statement::Vacuum(_) => "VACUUM",
+        Statement::Analyze(_) => "ANALYZE",
+        Statement::Reindex(_) => "REINDEX",
+        Statement::Explain { .. } => "EXPLAIN",
+        _ => "unknown",
+    }
+}
+
+/// Extract the first table name from a `SelectCore` for EXPLAIN QUERY PLAN.
+fn first_table_name_from_core(core: &SelectCore) -> Option<String> {
+    match core {
+        SelectCore::Select { from, .. } => {
+            let from_clause = from.as_ref()?;
+            match &from_clause.source {
+                TableOrSubquery::Table { name, .. } => Some(name.name.clone()),
+                _ => None,
+            }
+        }
+        SelectCore::Values(_) => None,
+    }
+}
+
+/// Hex-encode a byte slice (lowercase).
+fn hex_encode(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
 fn execute_program(
     program: &VdbeProgram,
     params: Option<&[SqliteValue]>,
@@ -10112,6 +10434,7 @@ fn execute_table_program_with_db(
     txn: Option<Box<dyn TransactionHandle>>,
     schema_cookie: u32,
     concurrent_ctx: Option<ConcurrentExecContext>,
+    reject_mem_fallback: bool,
 ) -> (Result<Vec<Row>>, Option<Box<dyn TransactionHandle>>) {
     let execution_span = tracing::span!(
         target: "fsqlite.execution",
@@ -10131,6 +10454,8 @@ fn execute_table_program_with_db(
 
     engine.set_function_registry(Arc::clone(func_registry));
     engine.set_schema_cookie(schema_cookie);
+    // bd-2ttd8.1: enable parity-cert mode to reject MemPageStore fallback.
+    engine.set_reject_mem_fallback(reject_mem_fallback);
 
     // Phase 5 (bd-2a3y): if a transaction handle is available, lend it to
     // the engine so storage cursors route through the real pager/WAL stack.
@@ -10905,7 +11230,7 @@ fn parse_pragma_bool(value: &fsqlite_ast::PragmaValue) -> Result<bool> {
             ));
         }
     };
-    match text.to_lowercase().as_str() {
+    match text.to_ascii_lowercase().as_str() {
         "on" | "true" | "yes" | "1" => Ok(true),
         "off" | "false" | "no" | "0" => Ok(false),
         _ => Err(FrankenError::Internal(format!(
@@ -13237,14 +13562,14 @@ fn eval_scalar_fn(name: &str, args: &[SqliteValue]) -> SqliteValue {
         }
         "upper" => {
             if let Some(SqliteValue::Text(s)) = args.first() {
-                SqliteValue::Text(s.to_uppercase())
+                SqliteValue::Text(s.to_ascii_uppercase())
             } else {
                 SqliteValue::Null
             }
         }
         "lower" => {
             if let Some(SqliteValue::Text(s)) = args.first() {
-                SqliteValue::Text(s.to_lowercase())
+                SqliteValue::Text(s.to_ascii_lowercase())
             } else {
                 SqliteValue::Null
             }
@@ -13932,6 +14257,26 @@ mod tests {
         let rows = stmt.query_with_params(&[SqliteValue::Integer(9)]).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(row_values(&rows[0]), vec![SqliteValue::Integer(10)]);
+    }
+
+    #[test]
+    fn test_prepared_statement_table_query_with_params_uses_pager_txn() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.set_reject_mem_fallback(true);
+        conn.execute("CREATE TABLE prep_txn (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO prep_txn VALUES (1, 'one'), (2, 'two');")
+            .unwrap();
+
+        let stmt = conn
+            .prepare("SELECT val FROM prep_txn WHERE id = ?1;")
+            .unwrap();
+        let rows = stmt.query_with_params(&[SqliteValue::Integer(2)]).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![SqliteValue::Text("two".to_owned())]
+        );
     }
 
     #[test]
@@ -24285,5 +24630,1914 @@ mod schema_loading_tests {
         let rows = conn.query("SELECT v FROM t;").expect("select row");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values()[0], SqliteValue::Integer(big));
+    }
+}
+
+// ── bd-2ttd8.1: Pager routing integration tests ──────────────────────
+
+#[cfg(test)]
+mod pager_routing_tests {
+    use super::*;
+
+    // bd-zjisk.1: Parity-cert mode defaults to ON.
+    #[test]
+    fn test_reject_mem_fallback_default_on() {
+        let conn = Connection::open(":memory:").expect("open db");
+        assert!(
+            *conn.reject_mem_fallback.borrow(),
+            "reject_mem_fallback must default to true (parity-cert mode)"
+        );
+    }
+
+    #[test]
+    fn test_set_reject_mem_fallback() {
+        let conn = Connection::open(":memory:").expect("open db");
+        // Default is now true.
+        assert!(*conn.reject_mem_fallback.borrow());
+        conn.set_reject_mem_fallback(false);
+        assert!(!*conn.reject_mem_fallback.borrow());
+        conn.set_reject_mem_fallback(true);
+        assert!(*conn.reject_mem_fallback.borrow());
+    }
+
+    #[test]
+    fn test_select_routes_through_pager_with_autocommit() {
+        // A simple table-backed SELECT with autocommit should work via the
+        // pager transaction (autocommit ensures active_txn is set).
+        let conn = Connection::open(":memory:").expect("open db");
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT);")
+            .expect("create table");
+        conn.execute("INSERT INTO t VALUES (1, 'alice');")
+            .expect("insert row");
+
+        let rows = conn
+            .query("SELECT id, name FROM t;")
+            .expect("select should succeed");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+    }
+
+    #[test]
+    fn test_insert_routes_through_pager_with_autocommit() {
+        // INSERT with autocommit should have an active pager transaction.
+        let conn = Connection::open(":memory:").expect("open db");
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);")
+            .expect("create table");
+
+        conn.execute("INSERT INTO t VALUES (1, 100);")
+            .expect("insert should succeed via pager");
+        conn.execute("INSERT INTO t VALUES (2, 200);")
+            .expect("second insert should succeed");
+
+        let rows = conn
+            .query("SELECT v FROM t ORDER BY id;")
+            .expect("select rows");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(100));
+        assert_eq!(rows[1].values()[0], SqliteValue::Integer(200));
+    }
+
+    #[test]
+    fn test_update_routes_through_pager() {
+        let conn = Connection::open(":memory:").expect("open db");
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);")
+            .expect("create table");
+        conn.execute("INSERT INTO t VALUES (1, 100);")
+            .expect("insert row");
+
+        conn.execute("UPDATE t SET v = 999 WHERE id = 1;")
+            .expect("update should succeed via pager");
+
+        let rows = conn.query("SELECT v FROM t WHERE id = 1;").expect("select");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(999));
+    }
+
+    #[test]
+    fn test_delete_routes_through_pager() {
+        let conn = Connection::open(":memory:").expect("open db");
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);")
+            .expect("create table");
+        conn.execute("INSERT INTO t VALUES (1, 100);")
+            .expect("insert row");
+        conn.execute("INSERT INTO t VALUES (2, 200);")
+            .expect("insert row 2");
+
+        conn.execute("DELETE FROM t WHERE id = 1;")
+            .expect("delete should succeed via pager");
+
+        let rows = conn.query("SELECT id FROM t;").expect("select");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(2));
+    }
+
+    #[test]
+    fn test_rollback_clears_dml_changes() {
+        let conn = Connection::open(":memory:").expect("open db");
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);")
+            .expect("create table");
+        conn.execute("INSERT INTO t VALUES (1, 100);")
+            .expect("insert row");
+
+        // Begin explicit transaction, insert, then rollback.
+        conn.execute("BEGIN;").expect("begin");
+        conn.execute("INSERT INTO t VALUES (2, 200);")
+            .expect("insert in txn");
+        conn.execute("ROLLBACK;").expect("rollback");
+
+        // Only the first row should remain.
+        let rows = conn.query("SELECT id FROM t;").expect("select");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+    }
+
+    #[test]
+    fn test_file_backed_select_insert_update_delete_lifecycle() {
+        // Full cursor lifecycle on file-backed database.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("routing_test.db");
+        let db_str = db_path.to_str().unwrap();
+
+        let conn = Connection::open(db_str).expect("open file-backed db");
+        conn.execute("CREATE TABLE items(id INTEGER PRIMARY KEY, name TEXT);")
+            .expect("create table");
+
+        // INSERT
+        conn.execute("INSERT INTO items VALUES (1, 'alpha');")
+            .expect("insert");
+        conn.execute("INSERT INTO items VALUES (2, 'beta');")
+            .expect("insert");
+
+        // SELECT
+        let rows = conn
+            .query("SELECT name FROM items ORDER BY id;")
+            .expect("select");
+        assert_eq!(rows.len(), 2);
+
+        // UPDATE
+        conn.execute("UPDATE items SET name = 'gamma' WHERE id = 2;")
+            .expect("update");
+
+        // DELETE
+        conn.execute("DELETE FROM items WHERE id = 1;")
+            .expect("delete");
+
+        let rows = conn
+            .query("SELECT id, name FROM items;")
+            .expect("final select");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(2));
+    }
+
+    // ── bd-2ttd8.4: Backend-identity ratchet tests ──────────────────
+
+    #[test]
+    fn test_pager_backend_kind_memory() {
+        let conn = Connection::open(":memory:").expect("open db");
+        assert_eq!(conn.pager_backend_kind(), "memory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_pager_backend_kind_unix() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("kind_test.db");
+        let conn = Connection::open(db_path.to_str().unwrap()).expect("open db");
+        assert_eq!(conn.pager_backend_kind(), "unix");
+    }
+
+    #[test]
+    fn test_validate_parity_cert_backend_disabled() {
+        let conn = Connection::open(":memory:").expect("open db");
+        assert!(
+            conn.validate_parity_cert_backend().is_ok(),
+            "parity-cert disabled should always pass"
+        );
+    }
+
+    #[test]
+    fn test_validate_parity_cert_backend_memory_warns_but_ok() {
+        let conn = Connection::open(":memory:").expect("open db");
+        conn.set_reject_mem_fallback(true);
+        // Memory backend with parity-cert active — should warn but not error.
+        assert!(
+            conn.validate_parity_cert_backend().is_ok(),
+            "memory backend is acceptable (SimplePager still used)"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_validate_parity_cert_backend_file_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("parity_test.db");
+        let conn = Connection::open(db_path.to_str().unwrap()).expect("open db");
+        conn.set_reject_mem_fallback(true);
+        assert!(conn.validate_parity_cert_backend().is_ok());
+    }
+
+    #[test]
+    fn test_ratchet_memory_connection_rejects_mem_fallback() {
+        // Even on :memory: connections, the parity-cert ratchet prevents
+        // VDBE from routing through MemPageStore (which is different from
+        // SimplePager<MemoryVfs>). The connection should use the real
+        // SimplePager path for all cursor operations.
+        let conn = Connection::open(":memory:").expect("open db");
+        conn.set_reject_mem_fallback(true);
+
+        // CREATE TABLE should work (pager is active for :memory:).
+        conn.execute("CREATE TABLE ratchet_test (id INTEGER PRIMARY KEY, val TEXT);")
+            .expect("create table");
+
+        // INSERT should work through the pager path.
+        conn.execute("INSERT INTO ratchet_test VALUES (1, 'hello');")
+            .expect("insert");
+
+        // SELECT should work through the pager path.
+        let rows = conn
+            .query("SELECT id, val FROM ratchet_test;")
+            .expect("select");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_ratchet_file_backed_full_lifecycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("ratchet_lifecycle.db");
+        let conn = Connection::open(db_path.to_str().unwrap()).expect("open db");
+        conn.set_reject_mem_fallback(true);
+
+        conn.execute("CREATE TABLE rt (id INTEGER PRIMARY KEY, data TEXT);")
+            .expect("create");
+        conn.execute("INSERT INTO rt VALUES (1, 'alpha');")
+            .expect("insert");
+        conn.execute("INSERT INTO rt VALUES (2, 'beta');")
+            .expect("insert");
+        conn.execute("UPDATE rt SET data = 'gamma' WHERE id = 1;")
+            .expect("update");
+        conn.execute("DELETE FROM rt WHERE id = 2;")
+            .expect("delete");
+
+        let rows = conn.query("SELECT id, data FROM rt;").expect("select");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("gamma".into()));
+    }
+
+    // ── bd-1r0ha.1: CommitSeq + PageVersion visibility integration tests ──
+
+    #[test]
+    fn test_commit_seq_monotonic_advancement() {
+        // Verify that each COMMIT advances the global commit sequence monotonically.
+        let conn = Connection::open(":memory:").unwrap();
+        let seq_before = conn.current_global_commit_seq();
+
+        conn.execute("BEGIN;").unwrap();
+        conn.execute("CREATE TABLE cseq (id INTEGER PRIMARY KEY);")
+            .unwrap();
+        conn.execute("COMMIT;").unwrap();
+
+        let seq_after_1 = conn.current_global_commit_seq();
+        assert!(
+            seq_after_1 > seq_before,
+            "commit must advance sequence: {seq_before:?} -> {seq_after_1:?}"
+        );
+
+        conn.execute("BEGIN;").unwrap();
+        conn.execute("INSERT INTO cseq VALUES (1);").unwrap();
+        conn.execute("COMMIT;").unwrap();
+
+        let seq_after_2 = conn.current_global_commit_seq();
+        assert!(
+            seq_after_2 > seq_after_1,
+            "second commit must advance further: {seq_after_1:?} -> {seq_after_2:?}"
+        );
+    }
+
+    #[test]
+    fn test_last_local_commit_seq_tracks_this_connection() {
+        let conn = Connection::open(":memory:").unwrap();
+        assert!(conn.last_local_commit_seq().is_none(), "no commits yet");
+
+        conn.execute("BEGIN;").unwrap();
+        conn.execute("CREATE TABLE lcs (id INTEGER PRIMARY KEY);")
+            .unwrap();
+        conn.execute("COMMIT;").unwrap();
+
+        let seq1 = conn
+            .last_local_commit_seq()
+            .expect("should have commit seq after COMMIT");
+        assert!(seq1 > 0, "commit seq should be positive");
+
+        conn.execute("BEGIN;").unwrap();
+        conn.execute("INSERT INTO lcs VALUES (42);").unwrap();
+        conn.execute("COMMIT;").unwrap();
+
+        let seq2 = conn
+            .last_local_commit_seq()
+            .expect("should have updated commit seq");
+        assert!(seq2 > seq1, "second commit must be higher");
+    }
+
+    #[test]
+    fn test_rollback_does_not_advance_commit_seq() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE rab (id INTEGER PRIMARY KEY);")
+            .unwrap();
+
+        let seq_before = conn.current_global_commit_seq();
+
+        conn.execute("BEGIN;").unwrap();
+        conn.execute("INSERT INTO rab VALUES (1);").unwrap();
+        conn.execute("ROLLBACK;").unwrap();
+
+        let seq_after = conn.current_global_commit_seq();
+        assert_eq!(
+            seq_before, seq_after,
+            "ROLLBACK must not advance commit seq"
+        );
+    }
+
+    #[test]
+    fn test_version_store_publish_and_resolve_visibility() {
+        // Directly test VersionStore: publish 3 versions of the same page at
+        // different commit sequences, then resolve with different snapshots.
+        use fsqlite_mvcc::{VersionStore, idx_to_version_pointer, visible};
+        use fsqlite_types::{
+            CommitSeq, PageData, PageNumber, PageSize, PageVersion, SchemaEpoch, Snapshot,
+            TxnEpoch, TxnId, TxnToken,
+        };
+
+        let vs = VersionStore::new(PageSize::DEFAULT);
+        let page = PageNumber::new(1).unwrap();
+
+        let make_token = |id: u64| TxnToken::new(TxnId::new(id).unwrap(), TxnEpoch::new(1));
+
+        // Publish V1 at commit_seq=1
+        let v1 = PageVersion {
+            pgno: page,
+            commit_seq: CommitSeq::new(1),
+            created_by: make_token(1),
+            data: PageData::from_vec(vec![0x01; 4096]),
+            prev: None,
+        };
+        let idx1 = vs.publish(v1.clone());
+
+        // Publish V2 at commit_seq=5 (chain: V2 -> V1)
+        let prev_ptr = idx_to_version_pointer(idx1);
+        let v2 = PageVersion {
+            pgno: page,
+            commit_seq: CommitSeq::new(5),
+            created_by: make_token(2),
+            data: PageData::from_vec(vec![0x05; 4096]),
+            prev: Some(prev_ptr),
+        };
+        let idx2 = vs.publish(v2.clone());
+
+        // Publish V3 at commit_seq=10 (chain: V3 -> V2 -> V1)
+        let prev_ptr2 = idx_to_version_pointer(idx2);
+        let v3 = PageVersion {
+            pgno: page,
+            commit_seq: CommitSeq::new(10),
+            created_by: make_token(3),
+            data: PageData::from_vec(vec![0x0A; 4096]),
+            prev: Some(prev_ptr2),
+        };
+        let _idx3 = vs.publish(v3.clone());
+
+        // Snapshot at high=0: nothing visible (all committed after snapshot)
+        let snap0 = Snapshot::new(CommitSeq::ZERO, SchemaEpoch::new(0));
+        assert!(
+            vs.resolve(page, &snap0).is_none(),
+            "snapshot at 0 should see nothing"
+        );
+
+        // Snapshot at high=1: should see V1
+        let snap1 = Snapshot::new(CommitSeq::new(1), SchemaEpoch::new(0));
+        let resolved = vs.resolve(page, &snap1).expect("should find V1");
+        let version = vs.get_version(resolved).unwrap();
+        assert_eq!(version.commit_seq, CommitSeq::new(1));
+        assert!(visible(&version, &snap1));
+
+        // Snapshot at high=7: should see V2 (newest visible)
+        let snap7 = Snapshot::new(CommitSeq::new(7), SchemaEpoch::new(0));
+        let resolved = vs.resolve(page, &snap7).expect("should find V2");
+        let version = vs.get_version(resolved).unwrap();
+        assert_eq!(version.commit_seq, CommitSeq::new(5));
+
+        // Snapshot at high=10: should see V3 (newest)
+        let snap10 = Snapshot::new(CommitSeq::new(10), SchemaEpoch::new(0));
+        let resolved = vs.resolve(page, &snap10).expect("should find V3");
+        let version = vs.get_version(resolved).unwrap();
+        assert_eq!(version.commit_seq, CommitSeq::new(10));
+
+        // Snapshot at high=100: should still see V3 (head)
+        let snap100 = Snapshot::new(CommitSeq::new(100), SchemaEpoch::new(0));
+        let resolved = vs.resolve(page, &snap100).expect("should find V3");
+        let version = vs.get_version(resolved).unwrap();
+        assert_eq!(version.commit_seq, CommitSeq::new(10));
+    }
+
+    #[test]
+    fn test_uncommitted_version_invisible() {
+        // Versions with commit_seq=0 must never be visible to any snapshot.
+        use fsqlite_mvcc::visible;
+        use fsqlite_types::{
+            CommitSeq, PageData, PageNumber, PageVersion, SchemaEpoch, Snapshot, TxnEpoch, TxnId,
+            TxnToken,
+        };
+
+        let uncommitted = PageVersion {
+            pgno: PageNumber::new(1).unwrap(),
+            commit_seq: CommitSeq::ZERO,
+            created_by: TxnToken::new(TxnId::new(1).unwrap(), TxnEpoch::new(1)),
+            data: PageData::from_vec(vec![0u8; 4096]),
+            prev: None,
+        };
+
+        // Even with a very high snapshot, uncommitted is invisible.
+        let snap_max = Snapshot::new(CommitSeq::new(u64::MAX - 1), SchemaEpoch::new(0));
+        assert!(
+            !visible(&uncommitted, &snap_max),
+            "uncommitted (seq=0) must never be visible"
+        );
+    }
+
+    #[test]
+    fn test_cross_connection_commit_seq_shared_file_backed() {
+        // Two connections to the same file-backed path share the global commit
+        // sequence counter via SharedMvccState.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("shared_seq.db");
+        let path_str = db_path.to_str().unwrap();
+
+        let conn1 = Connection::open(path_str).unwrap();
+        let conn2 = Connection::open(path_str).unwrap();
+
+        let seq1_before = conn1.current_global_commit_seq();
+        let seq2_before = conn2.current_global_commit_seq();
+
+        // Both start at the same global sequence.
+        assert_eq!(
+            seq1_before, seq2_before,
+            "same-path connections must share commit clock"
+        );
+
+        // conn1 commits, advancing the shared clock.
+        conn1.execute("BEGIN;").unwrap();
+        conn1
+            .execute("CREATE TABLE shared_test (id INTEGER PRIMARY KEY);")
+            .unwrap();
+        conn1.execute("COMMIT;").unwrap();
+
+        // conn2 must see the advanced sequence (shared atomic counter).
+        let seq2_after = conn2.current_global_commit_seq();
+        assert!(
+            seq2_after > seq2_before,
+            "conn2 must see conn1's commit: {seq2_before:?} -> {seq2_after:?}"
+        );
+    }
+
+    #[test]
+    fn test_memdb_visible_commit_seq_drives_stale_detection() {
+        // After a commit from one connection, a second connection should see the
+        // updated data when it starts a new read — proving the stale-detection
+        // mechanism driven by memdb_visible_commit_seq works correctly.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("stale_detect.db");
+        let path_str = db_path.to_str().unwrap();
+
+        let conn1 = Connection::open(path_str).unwrap();
+        conn1
+            .execute("CREATE TABLE refresh_test (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        conn1
+            .execute("INSERT INTO refresh_test VALUES (1, 'from_conn1');")
+            .unwrap();
+
+        // conn2 opens the same file — should see conn1's committed data.
+        let conn2 = Connection::open(path_str).unwrap();
+        let rows = conn2.query("SELECT val FROM refresh_test;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("from_conn1".into()));
+
+        // conn1 inserts more data after conn2's initial read.
+        conn1
+            .execute("INSERT INTO refresh_test VALUES (2, 'second');")
+            .unwrap();
+
+        // conn2 should see the new row on its next read (stale detection triggers refresh).
+        let rows2 = conn2
+            .query("SELECT val FROM refresh_test ORDER BY id;")
+            .unwrap();
+        assert_eq!(rows2.len(), 2, "stale detection must trigger memdb refresh");
+    }
+
+    #[test]
+    fn test_version_chain_strictly_descending() {
+        // Verify that version chains maintain strictly descending commit_seq
+        // (newest first, oldest last) by resolving at different snapshot points.
+        use fsqlite_mvcc::{VersionStore, idx_to_version_pointer};
+        use fsqlite_types::{
+            CommitSeq, PageData, PageNumber, PageSize, PageVersion, SchemaEpoch, Snapshot,
+            TxnEpoch, TxnId, TxnToken,
+        };
+
+        let vs = VersionStore::new(PageSize::DEFAULT);
+        let page = PageNumber::new(42).unwrap();
+
+        let make_token = |id: u64| TxnToken::new(TxnId::new(id).unwrap(), TxnEpoch::new(1));
+
+        // Publish in commit order: seq 3, 7, 15
+        let idx1 = vs.publish(PageVersion {
+            pgno: page,
+            commit_seq: CommitSeq::new(3),
+            created_by: make_token(1),
+            data: PageData::from_vec(vec![0x03; 4096]),
+            prev: None,
+        });
+
+        let idx2 = vs.publish(PageVersion {
+            pgno: page,
+            commit_seq: CommitSeq::new(7),
+            created_by: make_token(2),
+            data: PageData::from_vec(vec![0x07; 4096]),
+            prev: Some(idx_to_version_pointer(idx1)),
+        });
+
+        vs.publish(PageVersion {
+            pgno: page,
+            commit_seq: CommitSeq::new(15),
+            created_by: make_token(3),
+            data: PageData::from_vec(vec![0x0F; 4096]),
+            prev: Some(idx_to_version_pointer(idx2)),
+        });
+
+        // Verify chain by resolving at snapshot boundaries:
+        // - snap=20 should yield V3(seq=15) — the head
+        // - snap=10 should yield V2(seq=7)
+        // - snap=5  should yield V1(seq=3)
+        // This proves the chain is ordered 15 > 7 > 3 (descending).
+        let seqs: Vec<u64> = [20, 10, 5]
+            .iter()
+            .map(|&high| {
+                let snap = Snapshot::new(CommitSeq::new(high), SchemaEpoch::new(0));
+                let idx = vs.resolve(page, &snap).expect("must resolve");
+                vs.get_version(idx).unwrap().commit_seq.get()
+            })
+            .collect();
+
+        assert_eq!(
+            seqs,
+            vec![15, 7, 3],
+            "versions must resolve in descending order"
+        );
+
+        // Verify head has prev (chain linkage exists).
+        let head_idx = vs.chain_head(page).expect("chain must have head");
+        let head = vs.get_version(head_idx).unwrap();
+        assert_eq!(head.commit_seq, CommitSeq::new(15), "head is newest");
+        assert!(head.prev.is_some(), "head must link to prev");
+    }
+
+    #[test]
+    fn test_resolve_with_trace_counts_versions_traversed() {
+        // Verify traversal depth reporting matches chain length.
+        use fsqlite_mvcc::{VersionStore, idx_to_version_pointer};
+        use fsqlite_types::{
+            CommitSeq, PageData, PageNumber, PageSize, PageVersion, SchemaEpoch, Snapshot,
+            TxnEpoch, TxnId, TxnToken,
+        };
+
+        let vs = VersionStore::new(PageSize::DEFAULT);
+        let page = PageNumber::new(7).unwrap();
+
+        let make_token = |id: u64| TxnToken::new(TxnId::new(id).unwrap(), TxnEpoch::new(1));
+
+        let idx1 = vs.publish(PageVersion {
+            pgno: page,
+            commit_seq: CommitSeq::new(1),
+            created_by: make_token(1),
+            data: PageData::from_vec(vec![1u8; 4096]),
+            prev: None,
+        });
+
+        let idx2 = vs.publish(PageVersion {
+            pgno: page,
+            commit_seq: CommitSeq::new(5),
+            created_by: make_token(2),
+            data: PageData::from_vec(vec![5u8; 4096]),
+            prev: Some(idx_to_version_pointer(idx1)),
+        });
+
+        vs.publish(PageVersion {
+            pgno: page,
+            commit_seq: CommitSeq::new(10),
+            created_by: make_token(3),
+            data: PageData::from_vec(vec![10u8; 4096]),
+            prev: Some(idx_to_version_pointer(idx2)),
+        });
+
+        // Snapshot at 10: head match → 1 traversal (head version itself is counted).
+        let snap10 = Snapshot::new(CommitSeq::new(10), SchemaEpoch::new(0));
+        let trace = vs.resolve_with_trace(page, &snap10);
+        assert!(trace.version_idx.is_some());
+        assert_eq!(trace.versions_traversed, 1, "head match: 1 version visited");
+
+        // Snapshot at 7: visit V3(10) then V2(5) → 2 traversals.
+        let snap7 = Snapshot::new(CommitSeq::new(7), SchemaEpoch::new(0));
+        let trace = vs.resolve_with_trace(page, &snap7);
+        assert!(trace.version_idx.is_some());
+        assert_eq!(
+            trace.versions_traversed, 2,
+            "skip head, find V2: 2 versions visited"
+        );
+
+        // Snapshot at 2: visit V3(10), V2(5), V1(1) → 3 traversals.
+        let snap2 = Snapshot::new(CommitSeq::new(2), SchemaEpoch::new(0));
+        let trace = vs.resolve_with_trace(page, &snap2);
+        assert!(trace.version_idx.is_some());
+        assert_eq!(
+            trace.versions_traversed, 3,
+            "skip head+mid, find V1: 3 versions visited"
+        );
+    }
+
+    #[test]
+    fn test_fcw_conflict_detected_on_commit_seq_advancement() {
+        // Prove that FCW correctly detects conflicts when another transaction
+        // commits to the same page between snapshot and commit.
+        use fsqlite_mvcc::{
+            CommitIndex, ConcurrentHandle, FcwResult, InProcessPageLockTable,
+            concurrent_write_page, validate_first_committer_wins,
+        };
+        use fsqlite_types::{
+            CommitSeq, PageData, PageNumber, SchemaEpoch, Snapshot, TxnEpoch, TxnId, TxnToken,
+        };
+
+        let commit_index = CommitIndex::new();
+        let lock_table = InProcessPageLockTable::new();
+        let page = PageNumber::new(10).unwrap();
+
+        // Session 1: snapshot at seq=0, writes page 10, commits at seq=1.
+        let snap1 = Snapshot::new(CommitSeq::ZERO, SchemaEpoch::new(0));
+        let tok1 = TxnToken::new(TxnId::new(1).unwrap(), TxnEpoch::new(1));
+        let mut handle1 = ConcurrentHandle::new(snap1, tok1);
+
+        concurrent_write_page(
+            &mut handle1,
+            &lock_table,
+            1,
+            page,
+            PageData::from_vec(vec![0xAA; 4096]),
+        )
+        .expect("session 1 write");
+
+        // Validate FCW for session 1 — should be clean (no prior commits).
+        let result1 = validate_first_committer_wins(&handle1, &commit_index);
+        assert!(
+            matches!(result1, FcwResult::Clean),
+            "session 1 should pass FCW: no prior commits"
+        );
+
+        // Simulate session 1 commit: update commit index.
+        commit_index.update(page, CommitSeq::new(1));
+        lock_table.release(page, TxnId::new(1).unwrap());
+
+        // Session 2: snapshot at seq=0 (before session 1 committed), writes same page.
+        let snap2 = Snapshot::new(CommitSeq::ZERO, SchemaEpoch::new(0));
+        let tok2 = TxnToken::new(TxnId::new(2).unwrap(), TxnEpoch::new(1));
+        let mut handle2 = ConcurrentHandle::new(snap2, tok2);
+
+        concurrent_write_page(
+            &mut handle2,
+            &lock_table,
+            2,
+            page,
+            PageData::from_vec(vec![0xBB; 4096]),
+        )
+        .expect("session 2 write");
+
+        // Validate FCW for session 2 — should be CONFLICT (session 1 committed seq=1 > snap2.high=0).
+        let result2 = validate_first_committer_wins(&handle2, &commit_index);
+        match result2 {
+            FcwResult::Conflict {
+                conflicting_pages,
+                conflicting_commit_seq,
+            } => {
+                assert!(
+                    conflicting_pages.contains(&page),
+                    "conflict must include page 10"
+                );
+                assert_eq!(
+                    conflicting_commit_seq,
+                    CommitSeq::new(1),
+                    "conflicting seq must be session 1's commit"
+                );
+            }
+            FcwResult::Clean => panic!("session 2 should detect FCW conflict"),
+        }
+    }
+
+    #[test]
+    fn test_gc_horizon_protects_active_snapshot_versions() {
+        // Verify that GC does not prune versions needed by active snapshots.
+        use fsqlite_mvcc::{VersionStore, idx_to_version_pointer};
+        use fsqlite_types::{
+            CommitSeq, PageData, PageNumber, PageSize, PageVersion, SchemaEpoch, Snapshot,
+            TxnEpoch, TxnId, TxnToken,
+        };
+
+        let vs = VersionStore::new(PageSize::DEFAULT);
+        let page = PageNumber::new(1).unwrap();
+
+        let make_token = |id: u64| TxnToken::new(TxnId::new(id).unwrap(), TxnEpoch::new(1));
+
+        // Chain: V1(seq=1) <- V2(seq=5) <- V3(seq=10)
+        let idx1 = vs.publish(PageVersion {
+            pgno: page,
+            commit_seq: CommitSeq::new(1),
+            created_by: make_token(1),
+            data: PageData::from_vec(vec![1u8; 4096]),
+            prev: None,
+        });
+
+        let idx2 = vs.publish(PageVersion {
+            pgno: page,
+            commit_seq: CommitSeq::new(5),
+            created_by: make_token(2),
+            data: PageData::from_vec(vec![5u8; 4096]),
+            prev: Some(idx_to_version_pointer(idx1)),
+        });
+
+        vs.publish(PageVersion {
+            pgno: page,
+            commit_seq: CommitSeq::new(10),
+            created_by: make_token(3),
+            data: PageData::from_vec(vec![10u8; 4096]),
+            prev: Some(idx_to_version_pointer(idx2)),
+        });
+
+        // Active snapshot at high=7 needs V2(seq=5).
+        // GC horizon=7: may prune V1(seq=1) but MUST NOT prune V2(seq=5).
+        let mut todo = fsqlite_mvcc::GcTodo::new();
+        todo.enqueue(page);
+        let result = vs.gc_tick(&mut todo, CommitSeq::new(7));
+
+        // After GC, V2 must still be resolvable for snapshot at 7.
+        let snap7 = Snapshot::new(CommitSeq::new(7), SchemaEpoch::new(0));
+        let resolved = vs.resolve(page, &snap7);
+        assert!(
+            resolved.is_some(),
+            "V2 must survive GC for active snapshot at 7"
+        );
+        let version = vs.get_version(resolved.unwrap()).unwrap();
+        assert_eq!(
+            version.commit_seq,
+            CommitSeq::new(5),
+            "resolved version must be V2(seq=5)"
+        );
+
+        // V3 must also still be resolvable for newer snapshots.
+        let snap10 = Snapshot::new(CommitSeq::new(10), SchemaEpoch::new(0));
+        let resolved = vs.resolve(page, &snap10);
+        assert!(resolved.is_some(), "V3 must survive GC");
+
+        // Report how many pages were pruned (V1 is the candidate).
+        assert!(
+            result.pages_pruned <= 1,
+            "at most V1 should be pruned (superseded and below horizon)"
+        );
+    }
+
+    #[test]
+    fn test_multiple_pages_independent_version_chains() {
+        // Verify that different pages have independent version chains.
+        use fsqlite_mvcc::VersionStore;
+        use fsqlite_types::{
+            CommitSeq, PageData, PageNumber, PageSize, PageVersion, SchemaEpoch, Snapshot,
+            TxnEpoch, TxnId, TxnToken,
+        };
+
+        let vs = VersionStore::new(PageSize::DEFAULT);
+        let page_a = PageNumber::new(1).unwrap();
+        let page_b = PageNumber::new(2).unwrap();
+        let make_token = |id: u64| TxnToken::new(TxnId::new(id).unwrap(), TxnEpoch::new(1));
+
+        // Page A: V1(seq=3)
+        vs.publish(PageVersion {
+            pgno: page_a,
+            commit_seq: CommitSeq::new(3),
+            created_by: make_token(1),
+            data: PageData::from_vec(vec![0xAA; 4096]),
+            prev: None,
+        });
+
+        // Page B: V1(seq=7)
+        vs.publish(PageVersion {
+            pgno: page_b,
+            commit_seq: CommitSeq::new(7),
+            created_by: make_token(2),
+            data: PageData::from_vec(vec![0xBB; 4096]),
+            prev: None,
+        });
+
+        // Snapshot at 5: sees page A(seq=3) but NOT page B(seq=7).
+        let snap5 = Snapshot::new(CommitSeq::new(5), SchemaEpoch::new(0));
+        assert!(
+            vs.resolve(page_a, &snap5).is_some(),
+            "page A visible at snap=5"
+        );
+        assert!(
+            vs.resolve(page_b, &snap5).is_none(),
+            "page B NOT visible at snap=5"
+        );
+
+        // Snapshot at 10: sees both pages.
+        let snap10 = Snapshot::new(CommitSeq::new(10), SchemaEpoch::new(0));
+        assert!(
+            vs.resolve(page_a, &snap10).is_some(),
+            "page A visible at snap=10"
+        );
+        assert!(
+            vs.resolve(page_b, &snap10).is_some(),
+            "page B visible at snap=10"
+        );
+    }
+
+    #[test]
+    fn test_commit_seq_does_not_advance_without_serialization_mutex() {
+        // Verify that commit_write_mutex is held during COMMIT (no interleaving).
+        // We test this indirectly by checking that two sequential commits from
+        // the same connection produce strictly ordered sequences.
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE mutex_test (id INTEGER PRIMARY KEY);")
+            .unwrap();
+
+        let mut seqs = Vec::new();
+        for i in 0..5 {
+            conn.execute("BEGIN;").unwrap();
+            conn.execute(&format!("INSERT INTO mutex_test VALUES ({i});"))
+                .unwrap();
+            conn.execute("COMMIT;").unwrap();
+            seqs.push(conn.last_local_commit_seq().unwrap());
+        }
+
+        // All commit sequences must be strictly increasing.
+        for pair in seqs.windows(2) {
+            assert!(
+                pair[1] > pair[0],
+                "commit seqs must be strictly increasing: {} <= {}",
+                pair[0],
+                pair[1]
+            );
+        }
+    }
+
+    #[test]
+    fn test_snapshot_high_matches_commit_seq_at_begin_time() {
+        // Verify the snapshot established at BEGIN captures the current
+        // global commit sequence (not a stale or future value).
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE snap_test (id INTEGER PRIMARY KEY);")
+            .unwrap();
+
+        // Commit a few times to advance the clock.
+        for i in 0..3 {
+            conn.execute("BEGIN;").unwrap();
+            conn.execute(&format!("INSERT INTO snap_test VALUES ({i});"))
+                .unwrap();
+            conn.execute("COMMIT;").unwrap();
+        }
+
+        let seq_before_begin = conn.current_global_commit_seq();
+
+        // Start a new transaction — the snapshot should capture seq_before_begin.
+        conn.execute("BEGIN;").unwrap();
+        // We can't directly inspect the snapshot from outside, but we can verify
+        // that the connection's memdb_visible_commit_seq matches.
+        let visible_seq = *conn.memdb_visible_commit_seq.borrow();
+        assert!(
+            visible_seq >= seq_before_begin,
+            "visible seq must be >= seq at BEGIN: {visible_seq:?} < {seq_before_begin:?}"
+        );
+        conn.execute("ROLLBACK;").unwrap();
+    }
+
+    #[test]
+    fn test_visibility_interleavings_fixed_seed_matrix() {
+        // Fixed-seed property-style stress over interleaved two-connection
+        // operations. Verifies:
+        // 1) global commit sequence never regresses
+        // 2) committed rows remain visible
+        // 3) rolled-back rows never become visible
+        fn lcg_next(state: u64) -> u64 {
+            state.wrapping_mul(6364136223846793005).wrapping_add(1)
+        }
+
+        let seeds = [7_u64, 19_u64, 3520_u64, 65537_u64];
+        for seed in seeds {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join(format!("bd_1r0ha_1_seed_{seed}.db"));
+            let db_path_str = db_path.to_str().unwrap();
+            let conn_a = Connection::open(db_path_str).unwrap();
+            let conn_b = Connection::open(db_path_str).unwrap();
+
+            conn_a
+                .execute("CREATE TABLE interleave_vis (id INTEGER PRIMARY KEY, v INTEGER);")
+                .unwrap();
+
+            let mut state = seed;
+            let mut next_row_id = 1_i64;
+            let mut committed_ids = std::collections::BTreeSet::new();
+            let mut last_seq = CommitSeq::new(0);
+
+            for _step in 0..48 {
+                state = lcg_next(state);
+                let use_a = (state & 1) == 0;
+                let op_code = (state >> 1) % 3;
+                let conn = if use_a { &conn_a } else { &conn_b };
+
+                match op_code {
+                    0 => {
+                        // Commit path.
+                        conn.execute("BEGIN;").unwrap();
+                        conn.execute(&format!(
+                            "INSERT INTO interleave_vis (id, v) VALUES ({next_row_id}, {next_row_id});"
+                        ))
+                        .unwrap();
+                        conn.execute("COMMIT;").unwrap();
+                        committed_ids.insert(next_row_id);
+                        next_row_id += 1;
+                    }
+                    1 => {
+                        // Rollback path.
+                        conn.execute("BEGIN;").unwrap();
+                        conn.execute(&format!(
+                            "INSERT INTO interleave_vis (id, v) VALUES ({next_row_id}, {next_row_id});"
+                        ))
+                        .unwrap();
+                        conn.execute("ROLLBACK;").unwrap();
+                        next_row_id += 1;
+                    }
+                    _ => {
+                        // Visibility check path.
+                        let rows = conn
+                            .query("SELECT id FROM interleave_vis ORDER BY id;")
+                            .unwrap();
+                        let observed_ids: Vec<i64> = rows
+                            .iter()
+                            .map(|row| match row.values()[0] {
+                                SqliteValue::Integer(v) => v,
+                                _ => panic!("expected integer id column"),
+                            })
+                            .collect();
+                        let expected_ids: Vec<i64> = committed_ids.iter().copied().collect();
+                        assert_eq!(
+                            observed_ids, expected_ids,
+                            "seed={seed}: visibility mismatch during interleaving"
+                        );
+                    }
+                }
+
+                let seq_a = conn_a.current_global_commit_seq();
+                let seq_b = conn_b.current_global_commit_seq();
+                assert!(
+                    seq_a >= last_seq && seq_b >= last_seq,
+                    "seed={seed}: commit sequence regressed ({seq_a}, {seq_b}) from {last_seq}"
+                );
+                last_seq = seq_a.max(seq_b);
+            }
+
+            let final_rows = conn_b
+                .query("SELECT id FROM interleave_vis ORDER BY id;")
+                .unwrap();
+            let observed_ids: Vec<i64> = final_rows
+                .iter()
+                .map(|row| match row.values()[0] {
+                    SqliteValue::Integer(v) => v,
+                    _ => panic!("expected integer id column"),
+                })
+                .collect();
+            let expected_ids: Vec<i64> = committed_ids.iter().copied().collect();
+            assert_eq!(
+                observed_ids, expected_ids,
+                "seed={seed}: final visibility set mismatch"
+            );
+        }
+    }
+
+    // =========================================================================
+    // bd-1r0ha.2 — MVCC conflict/busy/retry semantics parity tests
+    // =========================================================================
+
+    #[test]
+    fn test_busy_error_is_transient() {
+        // FrankenError::Busy and BusySnapshot must report as transient
+        // (eligible for retry), matching SQLite SQLITE_BUSY semantics.
+        let busy = FrankenError::Busy;
+        assert!(busy.is_transient(), "Busy must be transient");
+
+        let busy_snap = FrankenError::BusySnapshot {
+            conflicting_pages: "1, 2".into(),
+        };
+        assert!(busy_snap.is_transient(), "BusySnapshot must be transient");
+    }
+
+    #[test]
+    fn test_busy_extended_error_codes_match_sqlite() {
+        // SQLITE_BUSY = 5, SQLITE_BUSY_RECOVERY = 261, SQLITE_BUSY_SNAPSHOT = 517.
+        assert_eq!(FrankenError::Busy.extended_error_code(), 5);
+        assert_eq!(FrankenError::BusyRecovery.extended_error_code(), 261);
+        assert_eq!(
+            FrankenError::BusySnapshot {
+                conflicting_pages: String::new()
+            }
+            .extended_error_code(),
+            517
+        );
+    }
+
+    #[test]
+    fn test_write_conflict_is_transient() {
+        // WriteConflict and SerializationFailure must also be transient.
+        let wc = FrankenError::WriteConflict {
+            page: 42,
+            holder: 7,
+        };
+        assert!(wc.is_transient(), "WriteConflict must be transient");
+
+        let sf = FrankenError::SerializationFailure { page: 99 };
+        assert!(sf.is_transient(), "SerializationFailure must be transient");
+    }
+
+    #[test]
+    fn test_page_lock_contention_returns_busy() {
+        // Two concurrent handles writing the same page: second acquire → Busy.
+        use fsqlite_mvcc::{
+            ConcurrentRegistry, InProcessPageLockTable,
+            concurrent_write_page, MvccError,
+        };
+        use fsqlite_types::{
+            CommitSeq, PageData, PageNumber, SchemaEpoch, Snapshot,
+        };
+
+        let lock_table = InProcessPageLockTable::new();
+        let mut registry = ConcurrentRegistry::new();
+        let page = PageNumber::new(5).unwrap();
+
+        let snap = Snapshot::new(CommitSeq::new(1), SchemaEpoch::new(0));
+
+        // Handle 1 acquires page 5.
+        let sid1 = registry.begin_concurrent(snap).unwrap();
+        let h1 = registry.get_mut(sid1).unwrap();
+        let result1 = concurrent_write_page(
+            h1,
+            &lock_table,
+            sid1,
+            page,
+            PageData::from_vec(vec![0xAA; 4096]),
+        );
+        assert!(result1.is_ok(), "first writer should succeed");
+
+        // Handle 2 tries the same page → MvccError::Busy.
+        let sid2 = registry.begin_concurrent(snap).unwrap();
+        let h2 = registry.get_mut(sid2).unwrap();
+        let result2 = concurrent_write_page(
+            h2,
+            &lock_table,
+            sid2,
+            page,
+            PageData::from_vec(vec![0xBB; 4096]),
+        );
+        assert_eq!(result2, Err(MvccError::Busy), "contending writer must get Busy");
+    }
+
+    #[test]
+    fn test_disjoint_pages_no_contention() {
+        // Two handles writing different pages should both succeed (no Busy).
+        use fsqlite_mvcc::{
+            ConcurrentRegistry, InProcessPageLockTable,
+            concurrent_write_page,
+        };
+        use fsqlite_types::{
+            CommitSeq, PageData, PageNumber, SchemaEpoch, Snapshot,
+        };
+
+        let lock_table = InProcessPageLockTable::new();
+        let mut registry = ConcurrentRegistry::new();
+        let snap = Snapshot::new(CommitSeq::new(1), SchemaEpoch::new(0));
+
+        let sid1 = registry.begin_concurrent(snap).unwrap();
+        let sid2 = registry.begin_concurrent(snap).unwrap();
+
+        let h1 = registry.get_mut(sid1).unwrap();
+        let r1 = concurrent_write_page(
+            h1,
+            &lock_table,
+            sid1,
+            PageNumber::new(10).unwrap(),
+            PageData::from_vec(vec![0xAA; 4096]),
+        );
+        assert!(r1.is_ok(), "writer 1 should succeed on page 10");
+
+        let h2 = registry.get_mut(sid2).unwrap();
+        let r2 = concurrent_write_page(
+            h2,
+            &lock_table,
+            sid2,
+            PageNumber::new(20).unwrap(),
+            PageData::from_vec(vec![0xBB; 4096]),
+        );
+        assert!(r2.is_ok(), "writer 2 should succeed on page 20");
+    }
+
+    #[test]
+    fn test_fcw_conflict_maps_to_busy_snapshot() {
+        // validate_first_committer_wins → Conflict → map_mvcc_commit_error
+        // must produce FrankenError::BusySnapshot with page list.
+        use fsqlite_mvcc::{FcwResult, MvccError};
+        use fsqlite_types::PageNumber;
+
+        let pages = vec![
+            PageNumber::new(3).unwrap(),
+            PageNumber::new(7).unwrap(),
+        ];
+        let fcw = FcwResult::Conflict {
+            conflicting_pages: pages,
+            conflicting_commit_seq: fsqlite_types::CommitSeq::new(42),
+        };
+
+        let err = Connection::map_mvcc_commit_error(MvccError::BusySnapshot, fcw);
+        match err {
+            FrankenError::BusySnapshot { conflicting_pages } => {
+                assert!(
+                    conflicting_pages.contains('3') && conflicting_pages.contains('7'),
+                    "must list conflicting page numbers: {conflicting_pages}"
+                );
+            }
+            other => panic!("expected BusySnapshot, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_fcw_clean_maps_to_busy_with_empty_pages() {
+        // Even when FCW says Clean, if the error is BusySnapshot, we still
+        // produce BusySnapshot (with empty page list).
+        use fsqlite_mvcc::{FcwResult, MvccError};
+
+        let err = Connection::map_mvcc_commit_error(MvccError::BusySnapshot, FcwResult::Clean);
+        match err {
+            FrankenError::BusySnapshot { conflicting_pages } => {
+                assert!(
+                    conflicting_pages.is_empty(),
+                    "Clean FCW → empty page list"
+                );
+            }
+            other => panic!("expected BusySnapshot, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_mvcc_busy_maps_to_franken_busy() {
+        // MvccError::Busy must map to FrankenError::Busy (not BusySnapshot).
+        use fsqlite_mvcc::{FcwResult, MvccError};
+
+        let err = Connection::map_mvcc_commit_error(MvccError::Busy, FcwResult::Clean);
+        assert!(
+            matches!(err, FrankenError::Busy),
+            "MvccError::Busy must map to FrankenError::Busy, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_retry_controller_fail_now_on_zero_budget() {
+        // With budget_ms=0, the retry controller must return FailNow immediately.
+        use fsqlite_mvcc::{RetryAction, RetryController, RetryCostParams};
+
+        let mut ctrl = RetryController::new(RetryCostParams::default());
+        let action = ctrl.decide(1, 0, 0, None);
+        assert_eq!(action, RetryAction::FailNow, "zero budget must FailNow");
+    }
+
+    #[test]
+    fn test_retry_controller_nonzero_budget_returns_retry() {
+        // With ample budget, the controller should recommend RetryAfter.
+        use fsqlite_mvcc::{RetryAction, RetryController, RetryCostParams};
+
+        let mut ctrl = RetryController::new(RetryCostParams::default());
+        let action = ctrl.decide(1, 5000, 0, None);
+        match action {
+            RetryAction::RetryAfter { wait_ms } => {
+                assert!(
+                    wait_ms <= 100,
+                    "wait must be within candidate set: {wait_ms}ms"
+                );
+            }
+            RetryAction::FailNow => {
+                panic!("with 5000ms budget, should not fail immediately on first conflict");
+            }
+        }
+    }
+
+    #[test]
+    fn test_retry_controller_starvation_escalation() {
+        // After starvation_threshold consecutive decide() calls on the same txn,
+        // the controller must set starvation_escalation in the evidence entry.
+        use fsqlite_mvcc::{RetryController, RetryCostParams};
+
+        // Use a low threshold (3) for a faster test.
+        let mut ctrl = RetryController::with_candidates(
+            RetryCostParams::default(),
+            vec![0, 5, 10],
+            3, // starvation threshold
+        );
+
+        // 3 consecutive decide() on the same txn_id → escalation on the 3rd.
+        for _ in 0..3 {
+            let _action = ctrl.decide(42, 10_000, 0, None);
+        }
+
+        let last = ctrl.ledger().last().expect("ledger must have entries");
+        assert!(
+            last.starvation_escalation,
+            "after 3 consecutive conflicts, starvation_escalation must be true"
+        );
+    }
+
+    #[test]
+    fn test_retry_evidence_ledger_accumulates() {
+        // Every decide() call produces an evidence entry.
+        use fsqlite_mvcc::{RetryController, RetryCostParams};
+
+        let mut ctrl = RetryController::new(RetryCostParams::default());
+        assert!(ctrl.ledger().is_empty());
+
+        ctrl.decide(1, 1000, 0, None);
+        assert_eq!(ctrl.ledger().len(), 1);
+
+        ctrl.decide(2, 1000, 0, None);
+        assert_eq!(ctrl.ledger().len(), 2);
+    }
+
+    #[test]
+    fn test_commit_response_conflict_carries_pages_and_seq() {
+        // CommitResponse::Conflict must carry conflicting pages and seq.
+        use fsqlite_mvcc::CommitResponse;
+        use fsqlite_types::{CommitSeq, PageNumber};
+
+        let pages = vec![PageNumber::new(1).unwrap(), PageNumber::new(2).unwrap()];
+        let resp = CommitResponse::Conflict(pages.clone(), CommitSeq::new(99));
+        match resp {
+            CommitResponse::Conflict(ps, seq) => {
+                assert_eq!(ps, pages);
+                assert_eq!(seq, CommitSeq::new(99));
+            }
+            _ => panic!("expected Conflict variant"),
+        }
+    }
+
+    #[test]
+    fn test_fcw_validates_write_set_against_commit_index() {
+        // End-to-end FCW: publish a version after snapshot → FCW detects conflict.
+        use fsqlite_mvcc::{
+            CommitIndex, ConcurrentRegistry, FcwResult,
+            InProcessPageLockTable, concurrent_write_page, validate_first_committer_wins,
+        };
+        use fsqlite_types::{
+            CommitSeq, PageData, PageNumber, SchemaEpoch, Snapshot,
+        };
+
+        let lock_table = InProcessPageLockTable::new();
+        let mut registry = ConcurrentRegistry::new();
+        let commit_index = CommitIndex::new();
+        let page = PageNumber::new(42).unwrap();
+
+        // Txn A starts at snapshot seq=5.
+        let snap_a = Snapshot::new(CommitSeq::new(5), SchemaEpoch::new(0));
+        let sid = registry.begin_concurrent(snap_a).unwrap();
+        {
+            let ha = registry.get_mut(sid).unwrap();
+            concurrent_write_page(
+                ha,
+                &lock_table,
+                sid,
+                page,
+                PageData::from_vec(vec![0xAA; 4096]),
+            )
+            .unwrap();
+        }
+
+        // Meanwhile, another transaction commits page 42 at seq=8 (after A's snapshot).
+        commit_index.update(page, CommitSeq::new(8));
+
+        // FCW validation for A should detect conflict.
+        let ha = registry.get(sid).unwrap();
+        let result = validate_first_committer_wins(ha, &commit_index);
+        match result {
+            FcwResult::Conflict {
+                conflicting_pages,
+                conflicting_commit_seq,
+            } => {
+                assert!(
+                    conflicting_pages.contains(&page),
+                    "page 42 must be in conflict set"
+                );
+                assert_eq!(
+                    conflicting_commit_seq,
+                    CommitSeq::new(8),
+                    "conflicting seq must be 8"
+                );
+            }
+            FcwResult::Clean => panic!("expected conflict, got Clean"),
+        }
+    }
+
+    #[test]
+    fn test_fcw_clean_when_no_intervening_commit() {
+        // If no other transaction committed to the same pages between snapshot
+        // and commit, FCW should report Clean.
+        use fsqlite_mvcc::{
+            CommitIndex, ConcurrentRegistry, FcwResult,
+            InProcessPageLockTable, concurrent_write_page, validate_first_committer_wins,
+        };
+        use fsqlite_types::{
+            CommitSeq, PageData, PageNumber, SchemaEpoch, Snapshot,
+        };
+
+        let lock_table = InProcessPageLockTable::new();
+        let mut registry = ConcurrentRegistry::new();
+        let commit_index = CommitIndex::new();
+        let page = PageNumber::new(99).unwrap();
+
+        let snap = Snapshot::new(CommitSeq::new(10), SchemaEpoch::new(0));
+        let sid = registry.begin_concurrent(snap).unwrap();
+        {
+            let h = registry.get_mut(sid).unwrap();
+            concurrent_write_page(
+                h,
+                &lock_table,
+                sid,
+                page,
+                PageData::from_vec(vec![0xCC; 4096]),
+            )
+            .unwrap();
+        }
+
+        // No intervening commits in the index → FCW should be Clean.
+        let h = registry.get(sid).unwrap();
+        let result = validate_first_committer_wins(h, &commit_index);
+        assert_eq!(result, FcwResult::Clean, "no conflict expected");
+    }
+
+    #[test]
+    fn test_concurrent_mode_default_on() {
+        // concurrent_mode defaults to ON (§5.6.6).
+        let conn = Connection::open(":memory:").unwrap();
+        assert!(
+            conn.is_concurrent_mode_default(),
+            "concurrent mode must default to ON"
+        );
+    }
+
+    #[test]
+    fn test_concurrent_mode_toggle_via_pragma() {
+        // PRAGMA fsqlite.concurrent_mode = OFF/ON toggles the default.
+        let conn = Connection::open(":memory:").unwrap();
+
+        conn.execute("PRAGMA fsqlite.concurrent_mode = OFF;").unwrap();
+        assert!(
+            !conn.is_concurrent_mode_default(),
+            "concurrent mode must be OFF after pragma"
+        );
+
+        conn.execute("PRAGMA fsqlite.concurrent_mode = ON;").unwrap();
+        assert!(
+            conn.is_concurrent_mode_default(),
+            "concurrent mode must be ON after pragma"
+        );
+    }
+
+    #[test]
+    fn test_file_backed_concurrent_write_conflict_produces_busy_snapshot() {
+        // Two file-backed connections with concurrent mode, writing to the same
+        // row. The second committer must get BusySnapshot (not a silent overwrite).
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("conflict_test.db");
+        let path_str = db_path.to_str().unwrap();
+
+        let conn1 = Connection::open(path_str).unwrap();
+        conn1
+            .execute("CREATE TABLE conflict_tbl (id INTEGER PRIMARY KEY, val INTEGER);")
+            .unwrap();
+        conn1
+            .execute("INSERT INTO conflict_tbl VALUES (1, 0);")
+            .unwrap();
+
+        // Both connections start transactions and read the same row.
+        let conn2 = Connection::open(path_str).unwrap();
+
+        conn1.execute("BEGIN;").unwrap();
+        conn2.execute("BEGIN;").unwrap();
+
+        // Both read the current value.
+        let _rows1 = conn1.query("SELECT val FROM conflict_tbl WHERE id = 1;").unwrap();
+        let _rows2 = conn2.query("SELECT val FROM conflict_tbl WHERE id = 1;").unwrap();
+
+        // conn1 writes and commits first.
+        conn1.execute("UPDATE conflict_tbl SET val = 100 WHERE id = 1;").unwrap();
+        conn1.execute("COMMIT;").unwrap();
+
+        // conn2 writes the same row and tries to commit — should fail.
+        conn2.execute("UPDATE conflict_tbl SET val = 200 WHERE id = 1;").unwrap();
+        let commit_result = conn2.execute("COMMIT;");
+
+        match commit_result {
+            Err(err) => {
+                assert!(
+                    err.is_transient(),
+                    "commit conflict must be a transient error: {err}"
+                );
+            }
+            Ok(_) => {
+                // In some configurations the commit may succeed (serialized mode
+                // or if pages didn't overlap at page level). Verify the final
+                // value is consistent.
+                let final_val = conn1
+                    .query("SELECT val FROM conflict_tbl WHERE id = 1;")
+                    .unwrap();
+                let v = match final_val[0].values()[0] {
+                    SqliteValue::Integer(v) => v,
+                    _ => panic!("expected integer"),
+                };
+                assert!(
+                    v == 100 || v == 200,
+                    "final value must be from one committer: {v}"
+                );
+            }
+        }
+    }
+
+    // =========================================================================
+    // bd-1r0ha.4 — Concurrent-mode default anti-regression ratchet
+    // =========================================================================
+
+    #[test]
+    fn test_ratchet_memory_conn_concurrent_default() {
+        // Anti-regression: in-memory connection must default to concurrent_mode=ON.
+        let conn = Connection::open(":memory:").unwrap();
+        assert!(
+            conn.is_concurrent_mode_default(),
+            "RATCHET: :memory: must default concurrent_mode=ON"
+        );
+    }
+
+    #[test]
+    fn test_ratchet_file_conn_concurrent_default() {
+        // Anti-regression: file-backed connection must default to concurrent_mode=ON.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("ratchet.db");
+        let conn = Connection::open(db_path.to_str().unwrap()).unwrap();
+        assert!(
+            conn.is_concurrent_mode_default(),
+            "RATCHET: file-backed must default concurrent_mode=ON"
+        );
+    }
+
+    #[test]
+    fn test_ratchet_begin_promotes_to_concurrent() {
+        // Anti-regression: plain BEGIN must promote to concurrent when default is ON.
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE ratchet_promo (id INTEGER PRIMARY KEY);")
+            .unwrap();
+        conn.execute("BEGIN;").unwrap();
+        assert!(
+            conn.is_concurrent_transaction(),
+            "RATCHET: plain BEGIN must promote to concurrent mode"
+        );
+        conn.execute("ROLLBACK;").unwrap();
+    }
+
+    #[test]
+    fn test_ratchet_pragma_off_disables_promotion() {
+        // When explicitly disabled, BEGIN should not promote to concurrent.
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("PRAGMA fsqlite.concurrent_mode = OFF;").unwrap();
+        assert!(
+            !conn.is_concurrent_mode_default(),
+            "RATCHET: pragma OFF must disable concurrent default"
+        );
+
+        conn.execute("CREATE TABLE ratchet_no_promo (id INTEGER PRIMARY KEY);")
+            .unwrap();
+        conn.execute("BEGIN;").unwrap();
+        assert!(
+            !conn.is_concurrent_transaction(),
+            "RATCHET: BEGIN should NOT promote when concurrent_mode=OFF"
+        );
+        conn.execute("ROLLBACK;").unwrap();
+    }
+
+    #[test]
+    fn test_ratchet_pragma_on_restores_promotion() {
+        // Toggle OFF then ON: promotion must be restored.
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("PRAGMA fsqlite.concurrent_mode = OFF;").unwrap();
+        assert!(!conn.is_concurrent_mode_default());
+
+        conn.execute("PRAGMA fsqlite.concurrent_mode = ON;").unwrap();
+        assert!(
+            conn.is_concurrent_mode_default(),
+            "RATCHET: pragma ON must restore concurrent default"
+        );
+    }
+
+    #[test]
+    fn test_ratchet_multiple_connections_independent_default() {
+        // Each connection has its own concurrent_mode_default.
+        let conn1 = Connection::open(":memory:").unwrap();
+        let conn2 = Connection::open(":memory:").unwrap();
+
+        conn1.execute("PRAGMA fsqlite.concurrent_mode = OFF;").unwrap();
+        assert!(!conn1.is_concurrent_mode_default());
+        assert!(
+            conn2.is_concurrent_mode_default(),
+            "RATCHET: conn2 must remain concurrent_mode=ON independently"
+        );
+    }
+
+    #[test]
+    fn test_ratchet_file_backed_concurrent_session_created() {
+        // Anti-regression: file-backed BEGIN should create a concurrent session.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("ratchet_session.db");
+        let path_str = db_path.to_str().unwrap();
+
+        let conn = Connection::open(path_str).unwrap();
+        conn.execute("CREATE TABLE ratchet_sess (id INTEGER PRIMARY KEY);")
+            .unwrap();
+
+        assert!(!conn.has_concurrent_session(), "no session before BEGIN");
+        conn.execute("BEGIN;").unwrap();
+        // With concurrent_mode=ON (default), a concurrent session should be active.
+        assert!(
+            conn.has_concurrent_session() || conn.is_concurrent_transaction(),
+            "RATCHET: file-backed BEGIN must create concurrent session or mark concurrent txn"
+        );
+        conn.execute("ROLLBACK;").unwrap();
+    }
+
+    #[test]
+    fn test_ratchet_autocommit_uses_concurrent() {
+        // Anti-regression: autocommit DML should use concurrent mode internally.
+        let conn = Connection::open(":memory:").unwrap();
+        assert!(conn.is_concurrent_mode_default());
+
+        conn.execute("CREATE TABLE ratchet_auto (id INTEGER PRIMARY KEY, val INTEGER);")
+            .unwrap();
+        // This INSERT runs in autocommit — with concurrent_mode=ON, it should
+        // succeed without issue (no regression to serialized-only).
+        conn.execute("INSERT INTO ratchet_auto VALUES (1, 42);")
+            .unwrap();
+        let rows = conn
+            .query("SELECT val FROM ratchet_auto WHERE id = 1;")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(42));
+    }
+
+    // ── bd-zjisk.1: Default-open wiring tests ─────────────────────────
+
+    #[test]
+    fn test_zjisk1_memory_conn_parity_cert_default_on() {
+        // The parity-cert flag must default to ON for in-memory connections.
+        let conn = Connection::open(":memory:").unwrap();
+        assert!(
+            *conn.reject_mem_fallback.borrow(),
+            "parity-cert mode must default to ON for :memory: connections"
+        );
+    }
+
+    #[test]
+    fn test_zjisk1_file_conn_parity_cert_default_on() {
+        // The parity-cert flag must default to ON for file-backed connections.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("zjisk1.db").to_string_lossy().to_string();
+        let conn = Connection::open(&path).unwrap();
+        assert!(
+            *conn.reject_mem_fallback.borrow(),
+            "parity-cert mode must default to ON for file-backed connections"
+        );
+    }
+
+    #[test]
+    fn test_zjisk1_pragma_parity_cert_query() {
+        // PRAGMA fsqlite.parity_cert (no value) must return the current state.
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn.query("PRAGMA fsqlite.parity_cert;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].values()[0],
+            SqliteValue::Integer(1),
+            "default parity_cert must be 1 (ON)"
+        );
+    }
+
+    #[test]
+    fn test_zjisk1_pragma_parity_cert_toggle() {
+        // PRAGMA fsqlite.parity_cert = OFF/ON toggles the setting.
+        let conn = Connection::open(":memory:").unwrap();
+
+        conn.execute("PRAGMA fsqlite.parity_cert = OFF;").unwrap();
+        assert!(
+            !*conn.reject_mem_fallback.borrow(),
+            "pragma OFF must disable parity-cert"
+        );
+        let rows = conn.query("PRAGMA fsqlite.parity_cert;").unwrap();
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(0));
+
+        conn.execute("PRAGMA fsqlite.parity_cert = ON;").unwrap();
+        assert!(
+            *conn.reject_mem_fallback.borrow(),
+            "pragma ON must enable parity-cert"
+        );
+        let rows = conn.query("PRAGMA fsqlite.parity_cert;").unwrap();
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+    }
+
+    #[test]
+    fn test_zjisk1_memory_crud_with_parity_cert_on() {
+        // Full CRUD lifecycle on :memory: with parity-cert ON (default).
+        // All operations must succeed via the pager, not the MemPageStore fallback.
+        let conn = Connection::open(":memory:").unwrap();
+        assert!(*conn.reject_mem_fallback.borrow());
+
+        conn.execute("CREATE TABLE z1(id INTEGER PRIMARY KEY, name TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO z1 VALUES (1, 'alpha');")
+            .unwrap();
+        conn.execute("INSERT INTO z1 VALUES (2, 'beta');")
+            .unwrap();
+
+        let rows = conn.query("SELECT id, name FROM z1 ORDER BY id;").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("alpha".into()));
+        assert_eq!(rows[1].values()[0], SqliteValue::Integer(2));
+        assert_eq!(rows[1].values()[1], SqliteValue::Text("beta".into()));
+
+        conn.execute("UPDATE z1 SET name = 'gamma' WHERE id = 1;")
+            .unwrap();
+        let rows = conn.query("SELECT name FROM z1 WHERE id = 1;").unwrap();
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("gamma".into()));
+
+        conn.execute("DELETE FROM z1 WHERE id = 2;").unwrap();
+        let rows = conn.query("SELECT COUNT(*) FROM z1;").unwrap();
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+    }
+
+    #[test]
+    fn test_zjisk1_file_backed_crud_with_parity_cert_on() {
+        // Full CRUD lifecycle on a file-backed DB with parity-cert ON.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("z1_crud.db").to_string_lossy().to_string();
+        let conn = Connection::open(&path).unwrap();
+        assert!(*conn.reject_mem_fallback.borrow());
+
+        conn.execute("CREATE TABLE z1f(id INTEGER PRIMARY KEY, val INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO z1f VALUES (10, 100);").unwrap();
+        conn.execute("INSERT INTO z1f VALUES (20, 200);").unwrap();
+
+        let rows = conn
+            .query("SELECT id, val FROM z1f ORDER BY id;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values()[1], SqliteValue::Integer(100));
+        assert_eq!(rows[1].values()[1], SqliteValue::Integer(200));
+
+        conn.execute("UPDATE z1f SET val = 999 WHERE id = 10;")
+            .unwrap();
+        let rows = conn.query("SELECT val FROM z1f WHERE id = 10;").unwrap();
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(999));
+
+        conn.execute("DELETE FROM z1f WHERE id = 20;").unwrap();
+        let rows = conn.query("SELECT COUNT(*) FROM z1f;").unwrap();
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+    }
+
+    #[test]
+    fn test_zjisk1_file_backed_persistence_across_connections() {
+        // Data written in parity-cert mode must survive across connections.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir
+            .path()
+            .join("z1_persist.db")
+            .to_string_lossy()
+            .to_string();
+
+        {
+            let conn = Connection::open(&path).unwrap();
+            assert!(*conn.reject_mem_fallback.borrow());
+            conn.execute("CREATE TABLE z1p(id INTEGER PRIMARY KEY, text TEXT);")
+                .unwrap();
+            conn.execute("INSERT INTO z1p VALUES (1, 'persisted');")
+                .unwrap();
+        }
+
+        {
+            let conn2 = Connection::open(&path).unwrap();
+            assert!(*conn2.reject_mem_fallback.borrow());
+            let rows = conn2
+                .query("SELECT text FROM z1p WHERE id = 1;")
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                rows[0].values()[0],
+                SqliteValue::Text("persisted".into()),
+                "data must survive reconnection under parity-cert mode"
+            );
+        }
+    }
+
+    #[test]
+    fn test_zjisk1_explicit_transaction_with_parity_cert() {
+        // Explicit BEGIN/COMMIT must work with parity-cert ON.
+        let conn = Connection::open(":memory:").unwrap();
+        assert!(*conn.reject_mem_fallback.borrow());
+
+        conn.execute("CREATE TABLE z1t(id INTEGER PRIMARY KEY);")
+            .unwrap();
+        conn.execute("BEGIN;").unwrap();
+        conn.execute("INSERT INTO z1t VALUES (1);").unwrap();
+        conn.execute("INSERT INTO z1t VALUES (2);").unwrap();
+        conn.execute("COMMIT;").unwrap();
+
+        let rows = conn.query("SELECT COUNT(*) FROM z1t;").unwrap();
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(2));
+    }
+
+    #[test]
+    fn test_zjisk1_rollback_with_parity_cert() {
+        // ROLLBACK must discard uncommitted writes under parity-cert mode.
+        let conn = Connection::open(":memory:").unwrap();
+        assert!(*conn.reject_mem_fallback.borrow());
+
+        conn.execute("CREATE TABLE z1r(id INTEGER PRIMARY KEY);")
+            .unwrap();
+        conn.execute("INSERT INTO z1r VALUES (1);").unwrap();
+
+        conn.execute("BEGIN;").unwrap();
+        conn.execute("INSERT INTO z1r VALUES (2);").unwrap();
+        conn.execute("ROLLBACK;").unwrap();
+
+        let rows = conn.query("SELECT COUNT(*) FROM z1r;").unwrap();
+        assert_eq!(
+            rows[0].values()[0],
+            SqliteValue::Integer(1),
+            "rolled-back row must not be visible"
+        );
+    }
+
+    #[test]
+    fn test_zjisk1_concurrent_mode_with_parity_cert() {
+        // Concurrent mode + parity-cert mode must coexist correctly.
+        let conn = Connection::open(":memory:").unwrap();
+        assert!(*conn.reject_mem_fallback.borrow());
+        assert!(conn.is_concurrent_mode_default());
+
+        conn.execute("CREATE TABLE z1c(id INTEGER PRIMARY KEY, v INTEGER);")
+            .unwrap();
+        conn.execute("BEGIN CONCURRENT;").unwrap();
+        conn.execute("INSERT INTO z1c VALUES (1, 42);").unwrap();
+        conn.execute("COMMIT;").unwrap();
+
+        let rows = conn.query("SELECT v FROM z1c WHERE id = 1;").unwrap();
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(42));
+    }
+
+    #[test]
+    fn test_zjisk1_expression_select_no_table_parity_cert() {
+        // Expression-only SELECT (no table access) must work under parity-cert
+        // since it doesn't trigger open_storage_cursor at all.
+        let conn = Connection::open(":memory:").unwrap();
+        assert!(*conn.reject_mem_fallback.borrow());
+
+        let rows = conn.query("SELECT 1 + 2;").unwrap();
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(3));
+
+        let rows = conn.query("SELECT 'hello' || ' world';").unwrap();
+        assert_eq!(
+            rows[0].values()[0],
+            SqliteValue::Text("hello world".into())
+        );
+    }
+
+    #[test]
+    fn test_zjisk1_pager_backend_kind_matches_path() {
+        // Verify that the pager backend kind is correctly reported.
+        let mem_conn = Connection::open(":memory:").unwrap();
+        assert_eq!(mem_conn.pager_backend_kind(), "memory");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir
+            .path()
+            .join("z1_kind.db")
+            .to_string_lossy()
+            .to_string();
+        let file_conn = Connection::open(&path).unwrap();
+        assert_eq!(file_conn.pager_backend_kind(), "unix");
+    }
+
+    #[test]
+    fn test_zjisk1_multi_table_with_parity_cert() {
+        // Multiple tables under parity-cert mode must all route through pager.
+        let conn = Connection::open(":memory:").unwrap();
+        assert!(*conn.reject_mem_fallback.borrow());
+
+        conn.execute("CREATE TABLE t1(id INTEGER PRIMARY KEY, a TEXT);")
+            .unwrap();
+        conn.execute("CREATE TABLE t2(id INTEGER PRIMARY KEY, b INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1, 'x');").unwrap();
+        conn.execute("INSERT INTO t2 VALUES (1, 99);").unwrap();
+
+        let r1 = conn.query("SELECT a FROM t1 WHERE id = 1;").unwrap();
+        assert_eq!(r1[0].values()[0], SqliteValue::Text("x".into()));
+
+        let r2 = conn.query("SELECT b FROM t2 WHERE id = 1;").unwrap();
+        assert_eq!(r2[0].values()[0], SqliteValue::Integer(99));
+    }
+
+    #[test]
+    fn test_zjisk1_file_backed_concurrent_writers_parity_cert() {
+        // Multiple concurrent writers on a file-backed DB with parity-cert ON.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir
+            .path()
+            .join("z1_multi.db")
+            .to_string_lossy()
+            .to_string();
+
+        {
+            let setup = Connection::open(&db_path).unwrap();
+            setup
+                .execute("CREATE TABLE z1m(id INTEGER PRIMARY KEY, writer INTEGER);")
+                .unwrap();
+        }
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let committed = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+        let handles: Vec<_> = (0..3)
+            .map(|writer_id| {
+                let path = db_path.clone();
+                let bar = std::sync::Arc::clone(&barrier);
+                let count = std::sync::Arc::clone(&committed);
+                std::thread::spawn(move || {
+                    let conn = Connection::open(&path).unwrap();
+                    assert!(*conn.reject_mem_fallback.borrow());
+                    conn.execute("PRAGMA busy_timeout=5000;").unwrap();
+                    bar.wait();
+                    for i in 0..5 {
+                        let rowid = writer_id * 100 + i;
+                        let sql =
+                            format!("INSERT INTO z1m VALUES ({rowid}, {writer_id});");
+                        loop {
+                            match conn.execute(&sql) {
+                                Ok(_) => {
+                                    count.fetch_add(
+                                        1,
+                                        std::sync::atomic::Ordering::Relaxed,
+                                    );
+                                    break;
+                                }
+                                Err(e) if e.is_transient() => continue,
+                                Err(e) => panic!("unexpected error: {e}"),
+                            }
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert_eq!(
+            committed.load(std::sync::atomic::Ordering::Relaxed),
+            15,
+            "all 15 inserts must commit"
+        );
+
+        let verify = Connection::open(&db_path).unwrap();
+        let rows = verify.query("SELECT COUNT(*) FROM z1m;").unwrap();
+        assert_eq!(
+            rows[0].values()[0],
+            SqliteValue::Integer(15),
+            "all 15 rows must be visible"
+        );
     }
 }

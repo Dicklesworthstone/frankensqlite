@@ -776,7 +776,7 @@ fn compute_leaf_distribution(
                 // Try moving the last cell from left to right.
                 if left_count > 1 {
                     let last_cell = &cells[right_start - 1];
-                    let cell_cost = last_cell.size as usize + CELL_POINTER_SIZE as usize;
+                    let cell_cost = last_cell.data.len() + CELL_POINTER_SIZE as usize;
 
                     let left_usage = page_sizes[i] - cell_cost;
                     let right_usage = page_sizes[i + 1] + cell_cost;
@@ -801,7 +801,7 @@ fn compute_leaf_distribution(
                 // Try moving the first cell from right to left.
                 if right_count > 1 {
                     let first_cell = &cells[right_start];
-                    let cell_cost = first_cell.size as usize + CELL_POINTER_SIZE as usize;
+                    let cell_cost = first_cell.data.len() + CELL_POINTER_SIZE as usize;
 
                     let left_usage = page_sizes[i] + cell_cost;
                     let right_usage = page_sizes[i + 1] - cell_cost;
