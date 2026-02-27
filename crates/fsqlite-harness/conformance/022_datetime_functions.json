@@ -1,0 +1,31 @@
+{
+  "id": "022_datetime_functions",
+  "description": "Date/time functions: date(), time(), datetime(), julianday(), unixepoch(), strftime(), modifiers",
+  "ops": [
+    { "op": "open", "path": ":memory:" },
+    { "op": "query", "sql": "SELECT date('2024-03-15')", "expect": { "rows": [["2024-03-15"]], "ordered": true } },
+    { "op": "query", "sql": "SELECT time('14:30:45')", "expect": { "rows": [["14:30:45"]], "ordered": true } },
+    { "op": "query", "sql": "SELECT datetime('2024-03-15 14:30:45')", "expect": { "rows": [["2024-03-15 14:30:45"]], "ordered": true } },
+    { "op": "query", "sql": "SELECT date('2024-03-15', '+1 day')", "expect": { "rows": [["2024-03-16"]], "ordered": true } },
+    { "op": "query", "sql": "SELECT date('2024-03-15', '-1 day')", "expect": { "rows": [["2024-03-14"]], "ordered": true } },
+    { "op": "query", "sql": "SELECT date('2024-03-15', '+1 month')", "expect": { "rows": [["2024-04-15"]], "ordered": true } },
+    { "op": "query", "sql": "SELECT date('2024-03-15', '+1 year')", "expect": { "rows": [["2025-03-15"]], "ordered": true } },
+    { "op": "query", "sql": "SELECT date('2024-03-15', 'start of month')", "expect": { "rows": [["2024-03-01"]], "ordered": true } },
+    { "op": "query", "sql": "SELECT date('2024-03-15', 'start of year')", "expect": { "rows": [["2024-01-01"]], "ordered": true } },
+    { "op": "query", "sql": "SELECT time('14:30:45', '+1 hour')", "expect": { "rows": [["15:30:45"]], "ordered": true } },
+    { "op": "query", "sql": "SELECT time('14:30:45', '+30 minutes')", "expect": { "rows": [["15:00:45"]], "ordered": true } },
+    { "op": "query", "sql": "SELECT time('14:30:45', '+15 seconds')", "expect": { "rows": [["14:31:00"]], "ordered": true } },
+    { "op": "query", "sql": "SELECT strftime('%Y', '2024-03-15')", "expect": { "rows": [["2024"]], "ordered": true } },
+    { "op": "query", "sql": "SELECT strftime('%m', '2024-03-15')", "expect": { "rows": [["03"]], "ordered": true } },
+    { "op": "query", "sql": "SELECT strftime('%d', '2024-03-15')", "expect": { "rows": [["15"]], "ordered": true } },
+    { "op": "query", "sql": "SELECT strftime('%H:%M:%S', '14:30:45')", "expect": { "rows": [["14:30:45"]], "ordered": true } },
+    { "op": "query", "sql": "SELECT strftime('%j', '2024-03-15')", "expect": { "rows": [["075"]], "ordered": true } },
+    { "op": "query", "sql": "SELECT typeof(julianday('2024-03-15'))", "expect": { "rows": [["real"]], "ordered": true } },
+    { "op": "query", "sql": "SELECT typeof(unixepoch('2024-03-15'))", "expect": { "rows": [["integer"]], "ordered": true } },
+    { "op": "query", "sql": "SELECT date(NULL)", "expect": { "rows": [[""]], "ordered": true } },
+    { "op": "query", "sql": "SELECT time(NULL)", "expect": { "rows": [[""]], "ordered": true } },
+    { "op": "query", "sql": "SELECT datetime(NULL)", "expect": { "rows": [[""]], "ordered": true } },
+    { "op": "query", "sql": "SELECT date('2024-03-15', 'localtime', 'utc')", "expect": { "rows": [["2024-03-15"]], "ordered": true } }
+  ],
+  "fsqlite_modes": ["compatibility", "native"]
+}
