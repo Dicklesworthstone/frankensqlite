@@ -3735,7 +3735,7 @@ impl Connection {
             match txn.commit(&cx) {
                 Ok(()) => {
                     let committed_seq = self.advance_commit_clock();
-                    if let Some(plan) = concurrent_plan.flatten() {
+                    if let Some(plan) = concurrent_plan {
                         self.finalize_concurrent_commit(plan, committed_seq);
                     }
                     Ok(())
