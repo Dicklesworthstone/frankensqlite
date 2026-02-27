@@ -43,6 +43,16 @@ pub struct EbrMetrics {
     pub stale_reader_warnings_total: AtomicU64,
     /// High-water mark of concurrently active guards observed.
     pub active_guards_high_water: AtomicU64,
+    /// Maximum version-chain length observed at write-time.
+    pub max_chain_length_observed: AtomicU64,
+    /// Number of recorded chain-length samples.
+    pub chain_length_samples_total: AtomicU64,
+    /// Sum of recorded chain-length samples.
+    pub chain_length_sum_total: AtomicU64,
+    /// Total versions freed by eager chain-bound GC passes.
+    pub gc_freed_count: AtomicU64,
+    /// Number of times chain-bound backpressure could not be relieved in time.
+    pub gc_blocked_count: AtomicU64,
 }
 
 impl EbrMetrics {
@@ -56,6 +66,11 @@ impl EbrMetrics {
             guards_unpinned_total: AtomicU64::new(0),
             stale_reader_warnings_total: AtomicU64::new(0),
             active_guards_high_water: AtomicU64::new(0),
+            max_chain_length_observed: AtomicU64::new(0),
+            chain_length_samples_total: AtomicU64::new(0),
+            chain_length_sum_total: AtomicU64::new(0),
+            gc_freed_count: AtomicU64::new(0),
+            gc_blocked_count: AtomicU64::new(0),
         }
     }
 
@@ -73,20 +88,8 @@ impl EbrMetrics {
     /// Record a guard pin event and update the high-water mark.
     pub fn record_guard_pinned(&self, current_active: u64) {
         self.guards_pinned_total.fetch_add(1, Ordering::Relaxed);
-        // CAS loop to update high-water mark.
-        loop {
-            let prev = self.active_guards_high_water.load(Ordering::Relaxed);
-            if current_active <= prev {
-                break;
-            }
-            if self
-                .active_guards_high_water
-                .compare_exchange_weak(prev, current_active, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-            {
-                break;
-            }
-        }
+        self.active_guards_high_water
+            .fetch_max(current_active, Ordering::Relaxed);
     }
 
     /// Record a guard unpin event.
@@ -100,6 +103,26 @@ impl EbrMetrics {
             .fetch_add(count, Ordering::Relaxed);
     }
 
+    /// Record a version-chain length sample.
+    pub fn record_chain_length_sample(&self, chain_len: u64) {
+        self.chain_length_samples_total
+            .fetch_add(1, Ordering::Relaxed);
+        self.chain_length_sum_total
+            .fetch_add(chain_len, Ordering::Relaxed);
+        self.max_chain_length_observed
+            .fetch_max(chain_len, Ordering::Relaxed);
+    }
+
+    /// Record versions freed during eager chain-bound GC.
+    pub fn record_gc_freed(&self, count: u64) {
+        self.gc_freed_count.fetch_add(count, Ordering::Relaxed);
+    }
+
+    /// Record a chain-bound backpressure event.
+    pub fn record_gc_blocked(&self) {
+        self.gc_blocked_count.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Read a point-in-time snapshot.
     #[must_use]
     pub fn snapshot(&self) -> EbrMetricsSnapshot {
@@ -110,6 +133,11 @@ impl EbrMetrics {
             guards_unpinned_total: self.guards_unpinned_total.load(Ordering::Relaxed),
             stale_reader_warnings_total: self.stale_reader_warnings_total.load(Ordering::Relaxed),
             active_guards_high_water: self.active_guards_high_water.load(Ordering::Relaxed),
+            max_chain_length_observed: self.max_chain_length_observed.load(Ordering::Relaxed),
+            chain_length_samples_total: self.chain_length_samples_total.load(Ordering::Relaxed),
+            chain_length_sum_total: self.chain_length_sum_total.load(Ordering::Relaxed),
+            gc_freed_count: self.gc_freed_count.load(Ordering::Relaxed),
+            gc_blocked_count: self.gc_blocked_count.load(Ordering::Relaxed),
         }
     }
 
@@ -121,6 +149,11 @@ impl EbrMetrics {
         self.guards_unpinned_total.store(0, Ordering::Relaxed);
         self.stale_reader_warnings_total.store(0, Ordering::Relaxed);
         self.active_guards_high_water.store(0, Ordering::Relaxed);
+        self.max_chain_length_observed.store(0, Ordering::Relaxed);
+        self.chain_length_samples_total.store(0, Ordering::Relaxed);
+        self.chain_length_sum_total.store(0, Ordering::Relaxed);
+        self.gc_freed_count.store(0, Ordering::Relaxed);
+        self.gc_blocked_count.store(0, Ordering::Relaxed);
     }
 }
 
@@ -139,19 +172,41 @@ pub struct EbrMetricsSnapshot {
     pub guards_unpinned_total: u64,
     pub stale_reader_warnings_total: u64,
     pub active_guards_high_water: u64,
+    pub max_chain_length_observed: u64,
+    pub chain_length_samples_total: u64,
+    pub chain_length_sum_total: u64,
+    pub gc_freed_count: u64,
+    pub gc_blocked_count: u64,
+}
+
+impl EbrMetricsSnapshot {
+    /// Average sampled chain length.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn avg_chain_length(self) -> f64 {
+        if self.chain_length_samples_total == 0 {
+            0.0
+        } else {
+            self.chain_length_sum_total as f64 / self.chain_length_samples_total as f64
+        }
+    }
 }
 
 impl std::fmt::Display for EbrMetricsSnapshot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "ebr(retired={} flushed={} pinned={} unpinned={} stale_warn={} hw={})",
+            "ebr(retired={} flushed={} pinned={} unpinned={} stale_warn={} hw={} chain_max={} chain_avg={:.2} gc_freed={} gc_blocked={})",
             self.retirements_deferred_total,
             self.flush_calls_total,
             self.guards_pinned_total,
             self.guards_unpinned_total,
             self.stale_reader_warnings_total,
             self.active_guards_high_water,
+            self.max_chain_length_observed,
+            self.avg_chain_length(),
+            self.gc_freed_count,
+            self.gc_blocked_count,
         )
     }
 }
@@ -735,6 +790,10 @@ mod tests {
         m.record_guard_pinned(1);
         m.record_guard_unpinned();
         m.record_stale_warnings(2);
+        m.record_chain_length_sample(5);
+        m.record_chain_length_sample(9);
+        m.record_gc_freed(7);
+        m.record_gc_blocked();
 
         let snap = m.snapshot();
         assert_eq!(snap.retirements_deferred_total, 2);
@@ -743,6 +802,12 @@ mod tests {
         assert_eq!(snap.guards_unpinned_total, 1);
         assert_eq!(snap.stale_reader_warnings_total, 2);
         assert_eq!(snap.active_guards_high_water, 1);
+        assert_eq!(snap.max_chain_length_observed, 9);
+        assert_eq!(snap.chain_length_samples_total, 2);
+        assert_eq!(snap.chain_length_sum_total, 14);
+        assert_eq!(snap.gc_freed_count, 7);
+        assert_eq!(snap.gc_blocked_count, 1);
+        assert!((snap.avg_chain_length() - 7.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -750,6 +815,9 @@ mod tests {
         let m = EbrMetrics::new();
         m.record_retirement_deferred();
         m.record_guard_pinned(5);
+        m.record_chain_length_sample(12);
+        m.record_gc_freed(3);
+        m.record_gc_blocked();
         assert!(m.retirements_deferred_total.load(Ordering::Relaxed) > 0);
 
         m.reset();
@@ -757,6 +825,11 @@ mod tests {
         assert_eq!(snap.retirements_deferred_total, 0);
         assert_eq!(snap.guards_pinned_total, 0);
         assert_eq!(snap.active_guards_high_water, 0);
+        assert_eq!(snap.max_chain_length_observed, 0);
+        assert_eq!(snap.chain_length_samples_total, 0);
+        assert_eq!(snap.chain_length_sum_total, 0);
+        assert_eq!(snap.gc_freed_count, 0);
+        assert_eq!(snap.gc_blocked_count, 0);
     }
 
     #[test]
@@ -781,10 +854,12 @@ mod tests {
         m.record_retirement_deferred();
         m.record_flush();
         m.record_guard_pinned(1);
+        m.record_chain_length_sample(8);
         let display = format!("{}", m.snapshot());
         assert!(display.contains("retired=1"));
         assert!(display.contains("flushed=1"));
         assert!(display.contains("pinned=1"));
+        assert!(display.contains("chain_max=8"));
     }
 
     #[test]
@@ -792,10 +867,12 @@ mod tests {
         let m = EbrMetrics::new();
         m.record_retirement_deferred();
         m.record_guard_pinned(2);
+        m.record_chain_length_sample(4);
         let snap = m.snapshot();
         let json = serde_json::to_string(&snap).unwrap();
         assert!(json.contains("\"retirements_deferred_total\":1"));
         assert!(json.contains("\"active_guards_high_water\":2"));
+        assert!(json.contains("\"max_chain_length_observed\":4"));
     }
 
     #[test]

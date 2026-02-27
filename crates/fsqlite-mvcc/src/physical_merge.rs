@@ -676,14 +676,15 @@ pub fn apply_patch(
     // Return cells sorted by rowid (table) or key bytes (index) for canonical order
     let usable = base.page_size.usable(base.reserved_per_page);
     let mut cells: Vec<ParsedCell> = cell_map.into_values().collect();
-    cells.sort_by(|a, b| {
-        if let (Some(ra), Some(rb)) = (a.rowid, b.rowid) {
-            ra.cmp(&rb)
-        } else {
+    cells.sort_by(|a, b| match (a.rowid, b.rowid) {
+        (Some(ra), Some(rb)) => ra.cmp(&rb),
+        (None, None) => {
             let key_a = extract_index_key_from_cell(&a.cell_bytes, base.page_type, usable);
             let key_b = extract_index_key_from_cell(&b.cell_bytes, base.page_type, usable);
             key_a.cmp(key_b)
         }
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
     });
 
     Ok(cells)

@@ -103,7 +103,8 @@ pub use differential_privacy::{
     reset_dp_metrics, sensitivity,
 };
 pub use ebr::{
-    ReaderPinSnapshot, StaleReaderConfig, VersionGuard, VersionGuardRegistry, VersionGuardTicket,
+    EbrMetrics, EbrMetricsSnapshot, GLOBAL_EBR_METRICS, ReaderPinSnapshot, StaleReaderConfig,
+    VersionGuard, VersionGuardRegistry, VersionGuardTicket,
 };
 pub use flat_combining::{
     FcHandle, FlatCombiner, FlatCombiningMetrics, MAX_FC_THREADS, OP_ADD, OP_READ,

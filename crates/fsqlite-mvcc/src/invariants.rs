@@ -22,7 +22,7 @@ use fsqlite_types::{
 use crate::cache_aligned::CacheAligned;
 use crate::core_types::{Transaction, VersionArena, VersionIdx};
 use crate::ebr::VersionGuardRegistry;
-use crate::gc::{GcTickResult, GcTodo, gc_tick_with_registry};
+use crate::gc::{GcTickResult, GcTodo, gc_tick_with_registry, prune_page_chain_with_registry};
 use crate::observability::record_cas_attempt;
 
 // ---------------------------------------------------------------------------
@@ -843,6 +843,67 @@ impl VersionStore {
         } else {
             total_length as f64 / sampled as f64
         }
+    }
+
+    /// Return the current committed chain length for one page.
+    ///
+    /// Retries when racing with GC to avoid reporting torn intermediate state.
+    #[must_use]
+    #[allow(clippy::significant_drop_tightening)]
+    pub fn chain_length(&self, page: PageNumber) -> usize {
+        loop {
+            let Some(head_idx) = self.chain_heads.get_head(page) else {
+                return 0;
+            };
+
+            let arena = self.arena.read();
+            let mut len = 0_usize;
+            let mut current_idx = head_idx;
+            let mut raced = false;
+
+            loop {
+                let Some(version) = arena.get(current_idx) else {
+                    raced = true;
+                    break;
+                };
+                len = len.saturating_add(1);
+                match version.prev {
+                    Some(ptr) => current_idx = version_pointer_to_idx(ptr),
+                    None => break,
+                }
+            }
+
+            if raced {
+                continue;
+            }
+            return len;
+        }
+    }
+
+    /// Run eager GC on one page chain at a caller-selected horizon.
+    ///
+    /// Returns the number of versions freed from the chain.
+    #[must_use]
+    #[allow(clippy::significant_drop_tightening)]
+    pub fn prune_page_chain_eager(&self, page: PageNumber, horizon: CommitSeq) -> usize {
+        let mut arena = self.arena.write();
+        let result = prune_page_chain_with_registry(
+            page,
+            horizon,
+            &mut arena,
+            &self.chain_heads,
+            self.guard_registry(),
+        );
+        drop(arena);
+
+        if !result.pruned_indices.is_empty() {
+            let mut ranges = self.visibility_ranges.write();
+            for idx in &result.pruned_indices {
+                ranges.remove(idx);
+            }
+        }
+
+        usize::try_from(result.freed).unwrap_or(usize::MAX)
     }
 }
 

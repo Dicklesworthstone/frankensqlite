@@ -886,8 +886,17 @@ pub fn ssi_validate_and_publish(
         }
     }
 
-    // Keep outgoing edges deterministic for proof/evidence generation.
-    // (Incoming edges are already deterministic by construction.)
+    // Keep edges deterministic for proof/evidence generation.
+    let mut in_edges = in_edges;
+    in_edges.sort_by(|a, b| {
+        a.from
+            .id
+            .get()
+            .cmp(&b.from.id.get())
+            .then_with(|| a.from.epoch.get().cmp(&b.from.epoch.get()))
+            .then_with(|| witness_key_page(&a.overlap_key).cmp(&witness_key_page(&b.overlap_key)))
+    });
+
     let mut out_edges = out_edges;
     out_edges.sort_by(|a, b| {
         a.to.id

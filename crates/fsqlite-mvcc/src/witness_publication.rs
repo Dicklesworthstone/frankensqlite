@@ -143,7 +143,7 @@ impl WitnessPublisherInner {
             drop(pending);
             self.aborted
                 .lock()
-                .expect("aborted lock poisoned")
+                .unwrap_or_else(|e| e.into_inner())
                 .push(id.0);
             info!(
                 reservation_id = id.0,
@@ -316,7 +316,7 @@ impl WitnessPublisher {
         self.inner
             .committed
             .lock()
-            .expect("committed lock poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .push(committed.clone());
 
         token.phase = PublicationPhase::Committed;
@@ -354,7 +354,7 @@ impl WitnessPublisher {
             .inner
             .committed
             .lock()
-            .expect("committed lock poisoned");
+            .unwrap_or_else(|e| e.into_inner());
         committed.clone()
     }
 
@@ -393,7 +393,7 @@ impl std::fmt::Debug for WitnessPublisher {
             .inner
             .committed
             .lock()
-            .expect("committed lock poisoned");
+            .unwrap_or_else(|e| e.into_inner());
         let aborted = self.inner.aborted.lock().unwrap_or_else(|e| e.into_inner());
         f.debug_struct("WitnessPublisher")
             .field("pending", &pending.len())
