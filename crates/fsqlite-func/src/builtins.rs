@@ -142,10 +142,7 @@ impl ScalarFunction for CharFunc {
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
         let mut result = String::new();
         for arg in args {
-            // NULL args are silently skipped
-            if arg.is_null() {
-                continue;
-            }
+            // C SQLite: sqlite3_value_int(NULL) returns 0, so NULL → U+0000.
             #[allow(clippy::cast_sign_loss)]
             let cp = arg.to_integer() as u32;
             if let Some(c) = char::from_u32(cp) {
@@ -228,11 +225,11 @@ impl ScalarFunction for ConcatWsFunc {
         if args.is_empty() {
             return Ok(SqliteValue::Text(String::new()));
         }
-        let sep = if args[0].is_null() {
-            String::new()
-        } else {
-            args[0].to_text()
-        };
+        // C SQLite: concat_ws(NULL, ...) returns NULL when separator is NULL.
+        if args[0].is_null() {
+            return Ok(SqliteValue::Null);
+        }
+        let sep = args[0].to_text();
         let mut parts = Vec::new();
         for arg in &args[1..] {
             // NULL args are skipped entirely
@@ -258,8 +255,11 @@ pub struct HexFunc;
 
 impl ScalarFunction for HexFunc {
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
+        // C SQLite hex() calls sqlite3_value_blob(arg) + sqlite3_value_bytes(arg).
+        // For NULL: blob returns NULL ptr, bytes returns 0, producing "" (empty string).
+        // This has been consistent across all SQLite versions including 3.52.0.
         if args[0].is_null() {
-            return Ok(SqliteValue::Null);
+            return Ok(SqliteValue::Text(String::new()));
         }
         let bytes = match &args[0] {
             SqliteValue::Blob(b) => b.clone(),
@@ -321,16 +321,13 @@ impl ScalarFunction for IifFunc {
         };
         if is_true {
             Ok(args[1].clone())
-        } else if args.len() > 2 {
-            Ok(args[2].clone())
         } else {
-            // Two-argument form: iif(COND, X) returns NULL when false
-            Ok(SqliteValue::Null)
+            Ok(args[2].clone())
         }
     }
 
     fn num_args(&self) -> i32 {
-        -1 // 2 or 3 args
+        3
     }
 
     fn name(&self) -> &str {
@@ -851,8 +848,9 @@ pub struct ZeroblobFunc;
 impl ScalarFunction for ZeroblobFunc {
     #[allow(clippy::cast_sign_loss)]
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
+        // C SQLite: zeroblob(NULL) returns x'' (empty blob), not NULL.
         if args[0].is_null() {
-            return Ok(SqliteValue::Null);
+            return Ok(SqliteValue::Blob(Vec::new()));
         }
         let n = args[0].to_integer().max(0) as usize;
         Ok(SqliteValue::Blob(vec![0u8; n]))
@@ -1787,7 +1785,7 @@ pub fn register_builtins(registry: &mut FunctionRegistry) {
         }
 
         fn num_args(&self) -> i32 {
-            -1
+            3
         }
 
         fn name(&self) -> &str {
@@ -1813,8 +1811,7 @@ pub fn register_builtins(registry: &mut FunctionRegistry) {
     }
     registry.register_scalar(SubstringFunc);
 
-    // "printf" is an alias for "format" (both unimplemented format/printf)
-    // Registered as stub that concatenates args for now.
+    // "printf" is an alias for "format".
     struct PrintfFunc;
     impl ScalarFunction for PrintfFunc {
         fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
@@ -1969,11 +1966,12 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<String> {
                 result.push_str(&pad_string(&formatted, width, left_align));
             }
             's' | 'z' => {
-                let val = params
-                    .get(param_idx)
-                    .map(SqliteValue::to_text)
-                    .unwrap_or_default();
+                let param = params.get(param_idx);
                 param_idx += 1;
+                let val = match param {
+                    Some(SqliteValue::Null) | None => "(null)".to_owned(),
+                    Some(v) => v.to_text(),
+                };
                 let truncated = if let Some(prec) = precision {
                     val.chars().take(prec).collect::<String>()
                 } else {
@@ -1982,14 +1980,17 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<String> {
                 result.push_str(&pad_string(&truncated, width, left_align));
             }
             'q' => {
-                // Single-quote escaping
-                let val = params
-                    .get(param_idx)
-                    .map(SqliteValue::to_text)
-                    .unwrap_or_default();
+                // Single-quote escaping; NULL → literal "NULL" (no quotes)
+                let param = params.get(param_idx);
                 param_idx += 1;
-                let escaped = val.replace('\'', "''");
-                result.push_str(&escaped);
+                match param {
+                    Some(SqliteValue::Null) | None => result.push_str("NULL"),
+                    Some(v) => {
+                        let val = v.to_text();
+                        let escaped = val.replace('\'', "''");
+                        result.push_str(&escaped);
+                    }
+                }
             }
             'Q' => {
                 // Like %q but wrapped in quotes, NULL -> "NULL"
@@ -2017,6 +2018,36 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<String> {
                 result.push('"');
                 result.push_str(&escaped);
                 result.push('"');
+            }
+            'x' | 'X' => {
+                let val = params.get(param_idx).map_or(0, SqliteValue::to_integer);
+                param_idx += 1;
+                #[allow(clippy::cast_sign_loss)]
+                let formatted = if spec == 'x' {
+                    format!("{:x}", val as u64)
+                } else {
+                    format!("{:X}", val as u64)
+                };
+                let padded = if zero_pad && width > formatted.len() {
+                    let pad = "0".repeat(width - formatted.len());
+                    format!("{pad}{formatted}")
+                } else {
+                    pad_string(&formatted, width, left_align)
+                };
+                result.push_str(&padded);
+            }
+            'o' => {
+                let val = params.get(param_idx).map_or(0, SqliteValue::to_integer);
+                param_idx += 1;
+                #[allow(clippy::cast_sign_loss)]
+                let formatted = format!("{:o}", val as u64);
+                let padded = if zero_pad && width > formatted.len() {
+                    let pad = "0".repeat(width - formatted.len());
+                    format!("{pad}{formatted}")
+                } else {
+                    pad_string(&formatted, width, left_align)
+                };
+                result.push_str(&padded);
             }
             'c' => {
                 let val = params.get(param_idx).map_or(0, SqliteValue::to_integer);
@@ -2199,6 +2230,7 @@ mod tests {
     #[test]
     fn test_char_null_skipped() {
         let f = CharFunc;
+        // C SQLite: NULL → sqlite3_value_int()=0 → U+0000 (NUL byte).
         let result = f
             .invoke(&[
                 SqliteValue::Integer(65),
@@ -2206,7 +2238,7 @@ mod tests {
                 SqliteValue::Integer(66),
             ])
             .unwrap();
-        assert_eq!(result, SqliteValue::Text("AB".to_owned()));
+        assert_eq!(result, SqliteValue::Text("A\0B".to_owned()));
     }
 
     // ── coalesce ─────────────────────────────────────────────────────────
