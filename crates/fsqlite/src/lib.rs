@@ -2321,10 +2321,11 @@ mod tests {
     }
 
     #[test]
-    fn hex_null_returns_null() {
+    fn hex_null_returns_empty_string() {
+        // C SQLite: hex(NULL) returns '' (empty string), not NULL.
         let conn = Connection::open(":memory:").unwrap();
         let rows = conn.query("SELECT HEX(NULL);").unwrap();
-        assert_eq!(row_values(&rows[0])[0], SqliteValue::Null);
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Text(String::new()));
     }
 
     #[test]
@@ -4205,5 +4206,1767 @@ mod tests {
         let result = conn.execute("BEGIN");
         assert!(result.is_err(), "Nested BEGIN should produce an error");
         conn.execute("ROLLBACK").unwrap();
+    }
+
+    // ── SQL Parity: REPLACE statement ────────────────────────────────────
+
+    #[test]
+    fn parity_replace_into_inserts_new_row() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        conn.execute("REPLACE INTO t VALUES (1, 'first');").unwrap();
+        let rows = conn.query("SELECT id, val FROM t;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0])[1], SqliteValue::Text("first".into()));
+    }
+
+    #[test]
+    fn parity_replace_into_overwrites_existing() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'old');").unwrap();
+        conn.execute("REPLACE INTO t VALUES (1, 'new');").unwrap();
+        let rows = conn.query("SELECT val FROM t WHERE id = 1;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Text("new".into()));
+    }
+
+    // ── SQL Parity: INSERT OR IGNORE ─────────────────────────────────────
+
+    #[test]
+    fn parity_insert_or_ignore_skips_conflict() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'first');").unwrap();
+        // INSERT OR IGNORE should silently skip the conflicting row
+        conn.execute("INSERT OR IGNORE INTO t VALUES (1, 'dup');")
+            .unwrap();
+        let rows = conn.query("SELECT val FROM t WHERE id = 1;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Text("first".into()));
+    }
+
+    // ── SQL Parity: Multi-column ORDER BY ────────────────────────────────
+
+    #[test]
+    fn parity_multi_column_order_by() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (a INTEGER, b INTEGER, c TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 1, 'x');").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 2, 'y');").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 1, 'z');").unwrap();
+        let rows = conn.query("SELECT c FROM t ORDER BY a, b;").unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Text("z".into()));
+        assert_eq!(row_values(&rows[1])[0], SqliteValue::Text("y".into()));
+        assert_eq!(row_values(&rows[2])[0], SqliteValue::Text("x".into()));
+    }
+
+    // ── SQL Parity: LIMIT with OFFSET ────────────────────────────────────
+
+    #[test]
+    fn parity_limit_with_offset() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        for i in 1..=5 {
+            conn.execute(&format!("INSERT INTO t VALUES ({i}, 'r{i}');"))
+                .unwrap();
+        }
+        let rows = conn
+            .query("SELECT val FROM t ORDER BY id LIMIT 2 OFFSET 2;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Text("r3".into()));
+        assert_eq!(row_values(&rows[1])[0], SqliteValue::Text("r4".into()));
+    }
+
+    // ── SQL Parity: Subquery in WHERE ────────────────────────────────────
+
+    #[test]
+    fn parity_subquery_in_where() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1 (id INTEGER, val TEXT);")
+            .unwrap();
+        conn.execute("CREATE TABLE t2 (ref_id INTEGER);").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1, 'a');").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (2, 'b');").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (3, 'c');").unwrap();
+        conn.execute("INSERT INTO t2 VALUES (1);").unwrap();
+        conn.execute("INSERT INTO t2 VALUES (3);").unwrap();
+        let rows = conn
+            .query("SELECT val FROM t1 WHERE id IN (SELECT ref_id FROM t2) ORDER BY id;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Text("a".into()));
+        assert_eq!(row_values(&rows[1])[0], SqliteValue::Text("c".into()));
+    }
+
+    // ── SQL Parity: CAST in expressions ──────────────────────────────────
+
+    #[test]
+    fn parity_cast_integer_to_text() {
+        let conn = Connection::open(":memory:").unwrap();
+        let row = conn.query_row("SELECT CAST(42 AS TEXT);").unwrap();
+        assert_eq!(row_values(&row)[0], SqliteValue::Text("42".into()));
+    }
+
+    #[test]
+    fn parity_cast_text_to_integer() {
+        let conn = Connection::open(":memory:").unwrap();
+        let row = conn.query_row("SELECT CAST('123' AS INTEGER);").unwrap();
+        assert_eq!(row_values(&row)[0], SqliteValue::Integer(123));
+    }
+
+    // ── SQL Parity: EXISTS subquery ──────────────────────────────────────
+
+    #[test]
+    fn parity_exists_subquery() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER);").unwrap();
+        conn.execute("INSERT INTO t VALUES (1);").unwrap();
+        let row = conn
+            .query_row("SELECT EXISTS (SELECT 1 FROM t WHERE id = 1);")
+            .unwrap();
+        assert_eq!(row_values(&row)[0], SqliteValue::Integer(1));
+        let row = conn
+            .query_row("SELECT EXISTS (SELECT 1 FROM t WHERE id = 999);")
+            .unwrap();
+        assert_eq!(row_values(&row)[0], SqliteValue::Integer(0));
+    }
+
+    // ── SQL Parity: COUNT(DISTINCT ...) ──────────────────────────────────
+
+    #[test]
+    fn parity_count_distinct() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (val INTEGER);").unwrap();
+        conn.execute("INSERT INTO t VALUES (1);").unwrap();
+        conn.execute("INSERT INTO t VALUES (2);").unwrap();
+        conn.execute("INSERT INTO t VALUES (1);").unwrap();
+        conn.execute("INSERT INTO t VALUES (3);").unwrap();
+        conn.execute("INSERT INTO t VALUES (2);").unwrap();
+        let row = conn
+            .query_row("SELECT COUNT(DISTINCT val) FROM t;")
+            .unwrap();
+        assert_eq!(row_values(&row)[0], SqliteValue::Integer(3));
+    }
+
+    // ── SQL Parity: GROUP_CONCAT ─────────────────────────────────────────
+
+    #[test]
+    fn parity_group_concat_basic() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (grp TEXT, val TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES ('a', 'x');").unwrap();
+        conn.execute("INSERT INTO t VALUES ('a', 'y');").unwrap();
+        conn.execute("INSERT INTO t VALUES ('b', 'z');").unwrap();
+        let rows = conn
+            .query("SELECT grp, GROUP_CONCAT(val, ',') FROM t GROUP BY grp ORDER BY grp;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        // Group 'a' should have x,y (in insertion order)
+        let a_val = &row_values(&rows[0])[1];
+        match a_val {
+            SqliteValue::Text(s) => {
+                assert!(s == "x,y" || s == "y,x", "group_concat for 'a' = {s}");
+            }
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    // ── DISTINCT aggregate edge-case tests ─────────────────────────────
+
+    #[test]
+    fn parity_count_distinct_with_nulls() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE d2(x INTEGER);").unwrap();
+        conn.execute("INSERT INTO d2 VALUES(1);").unwrap();
+        conn.execute("INSERT INTO d2 VALUES(NULL);").unwrap();
+        conn.execute("INSERT INTO d2 VALUES(2);").unwrap();
+        conn.execute("INSERT INTO d2 VALUES(NULL);").unwrap();
+        let row = conn.query_row("SELECT COUNT(DISTINCT x) FROM d2;").unwrap();
+        // COUNT(DISTINCT x) ignores NULLs → 2 (values 1, 2)
+        assert_eq!(row_values(&row)[0], SqliteValue::Integer(2));
+    }
+
+    #[test]
+    fn parity_sum_distinct() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE d3(x INTEGER);").unwrap();
+        conn.execute("INSERT INTO d3 VALUES(10);").unwrap();
+        conn.execute("INSERT INTO d3 VALUES(20);").unwrap();
+        conn.execute("INSERT INTO d3 VALUES(10);").unwrap();
+        conn.execute("INSERT INTO d3 VALUES(30);").unwrap();
+        conn.execute("INSERT INTO d3 VALUES(20);").unwrap();
+        let row = conn.query_row("SELECT SUM(DISTINCT x) FROM d3;").unwrap();
+        // SUM(DISTINCT x) = 10 + 20 + 30 = 60
+        assert_eq!(row_values(&row)[0], SqliteValue::Integer(60));
+    }
+
+    #[test]
+    fn parity_count_vs_count_distinct() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE d4(x INTEGER);").unwrap();
+        conn.execute("INSERT INTO d4 VALUES(1);").unwrap();
+        conn.execute("INSERT INTO d4 VALUES(1);").unwrap();
+        conn.execute("INSERT INTO d4 VALUES(2);").unwrap();
+        conn.execute("INSERT INTO d4 VALUES(2);").unwrap();
+        conn.execute("INSERT INTO d4 VALUES(2);").unwrap();
+        let r1 = conn.query_row("SELECT COUNT(x) FROM d4;").unwrap();
+        assert_eq!(row_values(&r1)[0], SqliteValue::Integer(5));
+        let r2 = conn.query_row("SELECT COUNT(DISTINCT x) FROM d4;").unwrap();
+        assert_eq!(row_values(&r2)[0], SqliteValue::Integer(2));
+    }
+
+    #[test]
+    fn parity_count_distinct_group_by() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE d5(grp TEXT, val INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO d5 VALUES('a', 1);").unwrap();
+        conn.execute("INSERT INTO d5 VALUES('a', 2);").unwrap();
+        conn.execute("INSERT INTO d5 VALUES('a', 1);").unwrap();
+        conn.execute("INSERT INTO d5 VALUES('b', 10);").unwrap();
+        conn.execute("INSERT INTO d5 VALUES('b', 10);").unwrap();
+        conn.execute("INSERT INTO d5 VALUES('b', 20);").unwrap();
+        let rows = conn
+            .query("SELECT grp, COUNT(DISTINCT val) FROM d5 GROUP BY grp ORDER BY grp;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        // Group 'a': {1,2} → 2
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Text("a".into()));
+        assert_eq!(row_values(&rows[0])[1], SqliteValue::Integer(2));
+        // Group 'b': {10,20} → 2
+        assert_eq!(row_values(&rows[1])[0], SqliteValue::Text("b".into()));
+        assert_eq!(row_values(&rows[1])[1], SqliteValue::Integer(2));
+    }
+
+    #[test]
+    fn parity_count_distinct_all_same() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE d6(x INTEGER);").unwrap();
+        conn.execute("INSERT INTO d6 VALUES(42);").unwrap();
+        conn.execute("INSERT INTO d6 VALUES(42);").unwrap();
+        conn.execute("INSERT INTO d6 VALUES(42);").unwrap();
+        let row = conn.query_row("SELECT COUNT(DISTINCT x) FROM d6;").unwrap();
+        assert_eq!(row_values(&row)[0], SqliteValue::Integer(1));
+    }
+
+    #[test]
+    fn parity_count_distinct_empty_table() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE d7(x INTEGER);").unwrap();
+        let row = conn.query_row("SELECT COUNT(DISTINCT x) FROM d7;").unwrap();
+        assert_eq!(row_values(&row)[0], SqliteValue::Integer(0));
+    }
+
+    // ── Scalar subquery tests ──────────────────────────────────────────
+
+    #[test]
+    fn parity_scalar_subquery_aggregate() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t(x INTEGER);").unwrap();
+        conn.execute("INSERT INTO t VALUES(10);").unwrap();
+        conn.execute("INSERT INTO t VALUES(20);").unwrap();
+        conn.execute("INSERT INTO t VALUES(30);").unwrap();
+        let row = conn.query_row("SELECT (SELECT COUNT(*) FROM t);").unwrap();
+        assert_eq!(row_values(&row)[0], SqliteValue::Integer(3));
+    }
+
+    #[test]
+    fn parity_scalar_subquery_max() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t(x INTEGER);").unwrap();
+        conn.execute("INSERT INTO t VALUES(5);").unwrap();
+        conn.execute("INSERT INTO t VALUES(15);").unwrap();
+        conn.execute("INSERT INTO t VALUES(10);").unwrap();
+        let row = conn.query_row("SELECT (SELECT MAX(x) FROM t);").unwrap();
+        assert_eq!(row_values(&row)[0], SqliteValue::Integer(15));
+    }
+
+    #[test]
+    fn parity_scalar_subquery_no_from() {
+        let conn = Connection::open(":memory:").unwrap();
+        let row = conn.query_row("SELECT (SELECT 42);").unwrap();
+        assert_eq!(row_values(&row)[0], SqliteValue::Integer(42));
+    }
+
+    #[test]
+    fn parity_scalar_subquery_first_row() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t(x INTEGER);").unwrap();
+        conn.execute("INSERT INTO t VALUES(100);").unwrap();
+        conn.execute("INSERT INTO t VALUES(200);").unwrap();
+        let row = conn.query_row("SELECT (SELECT x FROM t);").unwrap();
+        // Should return the first row value (100).
+        assert_eq!(row_values(&row)[0], SqliteValue::Integer(100));
+    }
+
+    #[test]
+    fn parity_scalar_subquery_empty_table_is_null() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t(x INTEGER);").unwrap();
+        let row = conn.query_row("SELECT (SELECT x FROM t);").unwrap();
+        assert_eq!(row_values(&row)[0], SqliteValue::Null);
+    }
+
+    // ── EXISTS subquery tests ──────────────────────────────────────────
+
+    #[test]
+    fn parity_exists_true() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t(x INTEGER);").unwrap();
+        conn.execute("INSERT INTO t VALUES(1);").unwrap();
+        let row = conn.query_row("SELECT EXISTS (SELECT 1 FROM t);").unwrap();
+        assert_eq!(row_values(&row)[0], SqliteValue::Integer(1));
+    }
+
+    #[test]
+    fn parity_exists_false_empty() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t(x INTEGER);").unwrap();
+        let row = conn.query_row("SELECT EXISTS (SELECT 1 FROM t);").unwrap();
+        assert_eq!(row_values(&row)[0], SqliteValue::Integer(0));
+    }
+
+    #[test]
+    fn parity_not_exists_true_empty() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t(x INTEGER);").unwrap();
+        let row = conn
+            .query_row("SELECT NOT EXISTS (SELECT 1 FROM t);")
+            .unwrap();
+        assert_eq!(row_values(&row)[0], SqliteValue::Integer(1));
+    }
+
+    #[test]
+    fn parity_exists_no_from() {
+        // EXISTS (SELECT 1) is always true — no table needed.
+        let conn = Connection::open(":memory:").unwrap();
+        let row = conn.query_row("SELECT EXISTS (SELECT 1);").unwrap();
+        assert_eq!(row_values(&row)[0], SqliteValue::Integer(1));
+    }
+
+    #[test]
+    fn parity_exists_with_where() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t(x INTEGER);").unwrap();
+        conn.execute("INSERT INTO t VALUES(10);").unwrap();
+        conn.execute("INSERT INTO t VALUES(20);").unwrap();
+
+        // EXISTS with WHERE that matches.
+        let row = conn
+            .query_row("SELECT EXISTS (SELECT 1 FROM t WHERE x = 10);")
+            .unwrap();
+        assert_eq!(row_values(&row)[0], SqliteValue::Integer(1));
+
+        // EXISTS with WHERE that doesn't match.
+        let row = conn
+            .query_row("SELECT EXISTS (SELECT 1 FROM t WHERE x = 99);")
+            .unwrap();
+        assert_eq!(row_values(&row)[0], SqliteValue::Integer(0));
+    }
+
+    // ── FILTER clause parity tests ──────────────────────────────────────
+
+    #[test]
+    fn parity_count_filter() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE f1(x INTEGER);").unwrap();
+        conn.execute("INSERT INTO f1 VALUES(1);").unwrap();
+        conn.execute("INSERT INTO f1 VALUES(2);").unwrap();
+        conn.execute("INSERT INTO f1 VALUES(3);").unwrap();
+        conn.execute("INSERT INTO f1 VALUES(4);").unwrap();
+        conn.execute("INSERT INTO f1 VALUES(5);").unwrap();
+        // COUNT(*) FILTER (WHERE x > 3) → 2 rows (4, 5).
+        let row = conn
+            .query_row("SELECT COUNT(*) FILTER (WHERE x > 3) FROM f1;")
+            .unwrap();
+        assert_eq!(row_values(&row)[0], SqliteValue::Integer(2));
+    }
+
+    #[test]
+    fn parity_sum_filter() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE f2(x INTEGER);").unwrap();
+        conn.execute("INSERT INTO f2 VALUES(10);").unwrap();
+        conn.execute("INSERT INTO f2 VALUES(20);").unwrap();
+        conn.execute("INSERT INTO f2 VALUES(30);").unwrap();
+        // SUM(x) FILTER (WHERE x >= 20) → 50.
+        let row = conn
+            .query_row("SELECT SUM(x) FILTER (WHERE x >= 20) FROM f2;")
+            .unwrap();
+        assert_eq!(row_values(&row)[0], SqliteValue::Integer(50));
+    }
+
+    #[test]
+    fn parity_count_filter_none_match() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE f3(x INTEGER);").unwrap();
+        conn.execute("INSERT INTO f3 VALUES(1);").unwrap();
+        conn.execute("INSERT INTO f3 VALUES(2);").unwrap();
+        // COUNT(*) FILTER (WHERE x > 100) → 0.
+        let row = conn
+            .query_row("SELECT COUNT(*) FILTER (WHERE x > 100) FROM f3;")
+            .unwrap();
+        assert_eq!(row_values(&row)[0], SqliteValue::Integer(0));
+    }
+
+    #[test]
+    fn parity_filter_no_group_by_same_table() {
+        // Diagnostic: verify FILTER works on the SAME table/query without GROUP BY.
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE f4b(city TEXT, age INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO f4b VALUES('A', 10);").unwrap();
+        conn.execute("INSERT INTO f4b VALUES('A', 30);").unwrap();
+        conn.execute("INSERT INTO f4b VALUES('B', 20);").unwrap();
+        conn.execute("INSERT INTO f4b VALUES('B', 40);").unwrap();
+        // COUNT(*) FILTER (WHERE age > 25) → 2 rows (30, 40).
+        let row = conn
+            .query_row("SELECT COUNT(*) FILTER (WHERE age > 25) FROM f4b;")
+            .unwrap();
+        assert_eq!(row_values(&row)[0], SqliteValue::Integer(2));
+    }
+
+    #[test]
+    fn parity_filter_group_by_always_false() {
+        // FILTER (WHERE 0) should always exclude → count = 0 per group.
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE f4z(city TEXT, val INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO f4z VALUES('A', 1);").unwrap();
+        conn.execute("INSERT INTO f4z VALUES('A', 2);").unwrap();
+        conn.execute("INSERT INTO f4z VALUES('B', 3);").unwrap();
+        let rows = conn
+            .query("SELECT city, COUNT(*) FILTER (WHERE 0) FROM f4z GROUP BY city;")
+            .unwrap();
+        let mut results: Vec<(String, i64)> = rows
+            .iter()
+            .map(|r| {
+                let vals = row_values(r);
+                let city = match &vals[0] {
+                    SqliteValue::Text(s) => s.clone(),
+                    _ => panic!("expected text"),
+                };
+                let cnt = match vals[1] {
+                    SqliteValue::Integer(n) => n,
+                    _ => panic!("expected integer, got {:?}", vals[1]),
+                };
+                (city, cnt)
+            })
+            .collect();
+        results.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(results, vec![("A".into(), 0), ("B".into(), 0)]);
+    }
+
+    #[test]
+    fn parity_filter_with_group_by() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE f4(city TEXT, age INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO f4 VALUES('A', 10);").unwrap();
+        conn.execute("INSERT INTO f4 VALUES('A', 30);").unwrap();
+        conn.execute("INSERT INTO f4 VALUES('B', 20);").unwrap();
+        conn.execute("INSERT INTO f4 VALUES('B', 40);").unwrap();
+        // COUNT(*) FILTER (WHERE age > 25) per group:
+        //   A: 1 (only age=30), B: 1 (only age=40).
+        let rows = conn
+            .query("SELECT city, COUNT(*) FILTER (WHERE age > 25) FROM f4 GROUP BY city;")
+            .unwrap();
+        let mut results: Vec<(String, i64)> = rows
+            .iter()
+            .map(|r| {
+                let vals = row_values(r);
+                let city = match &vals[0] {
+                    SqliteValue::Text(s) => s.clone(),
+                    _ => panic!("expected text"),
+                };
+                let cnt = match vals[1] {
+                    SqliteValue::Integer(n) => n,
+                    _ => panic!("expected integer"),
+                };
+                (city, cnt)
+            })
+            .collect();
+        results.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(results, vec![("A".into(), 1), ("B".into(), 1)]);
+    }
+
+    #[test]
+    fn parity_filter_multiple_aggregates() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE f5(x INTEGER);").unwrap();
+        conn.execute("INSERT INTO f5 VALUES(1);").unwrap();
+        conn.execute("INSERT INTO f5 VALUES(2);").unwrap();
+        conn.execute("INSERT INTO f5 VALUES(3);").unwrap();
+        conn.execute("INSERT INTO f5 VALUES(4);").unwrap();
+        // Two aggregates with different filters in the same query.
+        let row = conn
+            .query_row(
+                "SELECT COUNT(*) FILTER (WHERE x <= 2), COUNT(*) FILTER (WHERE x >= 3) FROM f5;",
+            )
+            .unwrap();
+        let vals = row_values(&row);
+        assert_eq!(vals[0], SqliteValue::Integer(2)); // x<=2: 1,2
+        assert_eq!(vals[1], SqliteValue::Integer(2)); // x>=3: 3,4
+    }
+
+    #[test]
+    fn parity_count_filter_vs_no_filter() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE f6(x INTEGER);").unwrap();
+        conn.execute("INSERT INTO f6 VALUES(1);").unwrap();
+        conn.execute("INSERT INTO f6 VALUES(2);").unwrap();
+        conn.execute("INSERT INTO f6 VALUES(3);").unwrap();
+        // Mix of filtered and unfiltered aggregates.
+        let row = conn
+            .query_row("SELECT COUNT(*), COUNT(*) FILTER (WHERE x > 1) FROM f6;")
+            .unwrap();
+        let vals = row_values(&row);
+        assert_eq!(vals[0], SqliteValue::Integer(3)); // all rows
+        assert_eq!(vals[1], SqliteValue::Integer(2)); // only x>1: 2,3
+    }
+
+    // ── CASE WHEN parity tests ───────────────────────────────────────────
+
+    #[test]
+    fn parity_case_simple() {
+        let conn = Connection::open(":memory:").unwrap();
+        let row = conn
+            .query_row("SELECT CASE 2 WHEN 1 THEN 'one' WHEN 2 THEN 'two' ELSE 'other' END;")
+            .unwrap();
+        assert_eq!(row_values(&row)[0], SqliteValue::Text("two".into()));
+    }
+
+    #[test]
+    fn parity_case_searched() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t(x INTEGER);").unwrap();
+        conn.execute("INSERT INTO t VALUES(15);").unwrap();
+        let row = conn
+            .query_row(
+                "SELECT CASE WHEN x < 10 THEN 'low' WHEN x < 20 THEN 'mid' ELSE 'high' END FROM t;",
+            )
+            .unwrap();
+        assert_eq!(row_values(&row)[0], SqliteValue::Text("mid".into()));
+    }
+
+    #[test]
+    fn parity_case_no_else_returns_null() {
+        let conn = Connection::open(":memory:").unwrap();
+        let row = conn
+            .query_row("SELECT CASE 5 WHEN 1 THEN 'one' WHEN 2 THEN 'two' END;")
+            .unwrap();
+        assert_eq!(row_values(&row)[0], SqliteValue::Null);
+    }
+
+    // ── COALESCE / NULLIF / IIF parity tests ─────────────────────────────
+
+    #[test]
+    fn parity_coalesce_basic() {
+        let conn = Connection::open(":memory:").unwrap();
+        let row = conn
+            .query_row("SELECT COALESCE(NULL, NULL, 42, 10);")
+            .unwrap();
+        assert_eq!(row_values(&row)[0], SqliteValue::Integer(42));
+    }
+
+    #[test]
+    fn parity_coalesce_all_null() {
+        let conn = Connection::open(":memory:").unwrap();
+        let row = conn.query_row("SELECT COALESCE(NULL, NULL);").unwrap();
+        assert_eq!(row_values(&row)[0], SqliteValue::Null);
+    }
+
+    #[test]
+    fn parity_nullif_equal() {
+        let conn = Connection::open(":memory:").unwrap();
+        let row = conn.query_row("SELECT NULLIF(5, 5);").unwrap();
+        assert_eq!(row_values(&row)[0], SqliteValue::Null);
+    }
+
+    #[test]
+    fn parity_nullif_not_equal() {
+        let conn = Connection::open(":memory:").unwrap();
+        let row = conn.query_row("SELECT NULLIF(5, 3);").unwrap();
+        assert_eq!(row_values(&row)[0], SqliteValue::Integer(5));
+    }
+
+    #[test]
+    fn parity_iif_true() {
+        let conn = Connection::open(":memory:").unwrap();
+        let row = conn.query_row("SELECT IIF(1=1, 'yes', 'no');").unwrap();
+        assert_eq!(row_values(&row)[0], SqliteValue::Text("yes".into()));
+    }
+
+    #[test]
+    fn parity_iif_false() {
+        let conn = Connection::open(":memory:").unwrap();
+        let row = conn.query_row("SELECT IIF(1=0, 'yes', 'no');").unwrap();
+        assert_eq!(row_values(&row)[0], SqliteValue::Text("no".into()));
+    }
+
+    // ── BETWEEN parity tests ─────────────────────────────────────────────
+
+    #[test]
+    fn parity_between_basic() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t(x INTEGER);").unwrap();
+        conn.execute("INSERT INTO t VALUES(1);").unwrap();
+        conn.execute("INSERT INTO t VALUES(5);").unwrap();
+        conn.execute("INSERT INTO t VALUES(10);").unwrap();
+        conn.execute("INSERT INTO t VALUES(15);").unwrap();
+        let rows = conn
+            .query("SELECT x FROM t WHERE x BETWEEN 5 AND 10 ORDER BY x;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(5));
+        assert_eq!(row_values(&rows[1])[0], SqliteValue::Integer(10));
+    }
+
+    #[test]
+    fn parity_not_between() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t(x INTEGER);").unwrap();
+        conn.execute("INSERT INTO t VALUES(1);").unwrap();
+        conn.execute("INSERT INTO t VALUES(5);").unwrap();
+        conn.execute("INSERT INTO t VALUES(10);").unwrap();
+        let rows = conn
+            .query("SELECT x FROM t WHERE x NOT BETWEEN 3 AND 7 ORDER BY x;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(1));
+        assert_eq!(row_values(&rows[1])[0], SqliteValue::Integer(10));
+    }
+
+    // ── LIKE parity tests ────────────────────────────────────────────────
+
+    #[test]
+    fn parity_like_percent() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t(name TEXT);").unwrap();
+        conn.execute("INSERT INTO t VALUES('apple');").unwrap();
+        conn.execute("INSERT INTO t VALUES('banana');").unwrap();
+        conn.execute("INSERT INTO t VALUES('apricot');").unwrap();
+        let rows = conn
+            .query("SELECT name FROM t WHERE name LIKE 'ap%' ORDER BY name;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Text("apple".into()));
+        assert_eq!(row_values(&rows[1])[0], SqliteValue::Text("apricot".into()));
+    }
+
+    #[test]
+    fn parity_like_underscore() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t(code TEXT);").unwrap();
+        conn.execute("INSERT INTO t VALUES('a1');").unwrap();
+        conn.execute("INSERT INTO t VALUES('b2');").unwrap();
+        conn.execute("INSERT INTO t VALUES('abc');").unwrap();
+        let rows = conn
+            .query("SELECT code FROM t WHERE code LIKE '_2';")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Text("b2".into()));
+    }
+
+    #[test]
+    fn parity_not_like() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t(name TEXT);").unwrap();
+        conn.execute("INSERT INTO t VALUES('cat');").unwrap();
+        conn.execute("INSERT INTO t VALUES('dog');").unwrap();
+        conn.execute("INSERT INTO t VALUES('car');").unwrap();
+        let rows = conn
+            .query("SELECT name FROM t WHERE name NOT LIKE 'ca%' ORDER BY name;")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Text("dog".into()));
+    }
+
+    // ── JOIN parity tests ────────────────────────────────────────────────
+
+    #[test]
+    fn parity_inner_join() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT);")
+            .unwrap();
+        conn.execute("CREATE TABLE orders(id INTEGER PRIMARY KEY, user_id INTEGER, item TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO users VALUES(1, 'Alice');")
+            .unwrap();
+        conn.execute("INSERT INTO users VALUES(2, 'Bob');").unwrap();
+        conn.execute("INSERT INTO orders VALUES(1, 1, 'Book');")
+            .unwrap();
+        conn.execute("INSERT INTO orders VALUES(2, 1, 'Pen');")
+            .unwrap();
+        conn.execute("INSERT INTO orders VALUES(3, 2, 'Notebook');")
+            .unwrap();
+        let rows = conn
+            .query(
+                "SELECT users.name, orders.item FROM users JOIN orders ON users.id = orders.user_id;",
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        // Verify all expected name-item pairs (order may vary).
+        let mut pairs: Vec<(String, String)> = rows
+            .iter()
+            .map(|r| {
+                let v = row_values(r);
+                let name = match &v[0] {
+                    SqliteValue::Text(s) => s.clone(),
+                    other => panic!("expected Text, got {other:?}"),
+                };
+                let item = match &v[1] {
+                    SqliteValue::Text(s) => s.clone(),
+                    other => panic!("expected Text, got {other:?}"),
+                };
+                (name, item)
+            })
+            .collect();
+        pairs.sort();
+        assert_eq!(
+            pairs,
+            vec![
+                ("Alice".into(), "Book".into()),
+                ("Alice".into(), "Pen".into()),
+                ("Bob".into(), "Notebook".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn parity_left_join_with_nulls() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE a(id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        conn.execute("CREATE TABLE b(id INTEGER PRIMARY KEY, a_id INTEGER, info TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO a VALUES(1, 'x');").unwrap();
+        conn.execute("INSERT INTO a VALUES(2, 'y');").unwrap();
+        conn.execute("INSERT INTO b VALUES(1, 1, 'linked');")
+            .unwrap();
+        let rows = conn
+            .query("SELECT a.val, b.info FROM a LEFT JOIN b ON a.id = b.a_id;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        // Collect results (order may vary).
+        let mut results: Vec<(String, Option<String>)> = rows
+            .iter()
+            .map(|r| {
+                let v = row_values(r);
+                let val = match &v[0] {
+                    SqliteValue::Text(s) => s.clone(),
+                    other => panic!("expected Text, got {other:?}"),
+                };
+                let info = match &v[1] {
+                    SqliteValue::Text(s) => Some(s.clone()),
+                    SqliteValue::Null => None,
+                    other => panic!("expected Text or Null, got {other:?}"),
+                };
+                (val, info)
+            })
+            .collect();
+        results.sort();
+        assert_eq!(
+            results,
+            vec![("x".into(), Some("linked".into())), ("y".into(), None),]
+        );
+    }
+
+    #[test]
+    fn parity_cross_join() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE a(x INTEGER);").unwrap();
+        conn.execute("CREATE TABLE b(y INTEGER);").unwrap();
+        conn.execute("INSERT INTO a VALUES(1);").unwrap();
+        conn.execute("INSERT INTO a VALUES(2);").unwrap();
+        conn.execute("INSERT INTO b VALUES(10);").unwrap();
+        conn.execute("INSERT INTO b VALUES(20);").unwrap();
+        let rows = conn.query("SELECT x, y FROM a, b ORDER BY x, y;").unwrap();
+        // Cross product: 2*2 = 4 rows
+        assert_eq!(rows.len(), 4);
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(1));
+        assert_eq!(row_values(&rows[0])[1], SqliteValue::Integer(10));
+        assert_eq!(row_values(&rows[3])[0], SqliteValue::Integer(2));
+        assert_eq!(row_values(&rows[3])[1], SqliteValue::Integer(20));
+    }
+
+    // ── UNION / set operations parity tests ──────────────────────────────
+
+    #[test]
+    fn parity_union_removes_duplicates() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE a(x INTEGER);").unwrap();
+        conn.execute("CREATE TABLE b(x INTEGER);").unwrap();
+        conn.execute("INSERT INTO a VALUES(1);").unwrap();
+        conn.execute("INSERT INTO a VALUES(2);").unwrap();
+        conn.execute("INSERT INTO b VALUES(2);").unwrap();
+        conn.execute("INSERT INTO b VALUES(3);").unwrap();
+        let rows = conn
+            .query("SELECT x FROM a UNION SELECT x FROM b ORDER BY x;")
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(1));
+        assert_eq!(row_values(&rows[1])[0], SqliteValue::Integer(2));
+        assert_eq!(row_values(&rows[2])[0], SqliteValue::Integer(3));
+    }
+
+    #[test]
+    fn parity_union_all_keeps_duplicates() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE a(x INTEGER);").unwrap();
+        conn.execute("CREATE TABLE b(x INTEGER);").unwrap();
+        conn.execute("INSERT INTO a VALUES(1);").unwrap();
+        conn.execute("INSERT INTO a VALUES(2);").unwrap();
+        conn.execute("INSERT INTO b VALUES(2);").unwrap();
+        conn.execute("INSERT INTO b VALUES(3);").unwrap();
+        let rows = conn
+            .query("SELECT x FROM a UNION ALL SELECT x FROM b ORDER BY x;")
+            .unwrap();
+        assert_eq!(rows.len(), 4);
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(1));
+        assert_eq!(row_values(&rows[1])[0], SqliteValue::Integer(2));
+        assert_eq!(row_values(&rows[2])[0], SqliteValue::Integer(2));
+        assert_eq!(row_values(&rows[3])[0], SqliteValue::Integer(3));
+    }
+
+    // ── UPDATE / DELETE parity tests ─────────────────────────────────────
+
+    #[test]
+    fn parity_update_multiple_columns() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t(a INTEGER, b TEXT, c REAL);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES(1, 'old', 1.0);")
+            .unwrap();
+        conn.execute("UPDATE t SET b = 'new', c = 2.5 WHERE a = 1;")
+            .unwrap();
+        let row = conn.query_row("SELECT a, b, c FROM t;").unwrap();
+        let vals = row_values(&row);
+        assert_eq!(vals[0], SqliteValue::Integer(1));
+        assert_eq!(vals[1], SqliteValue::Text("new".into()));
+        assert_eq!(vals[2], SqliteValue::Float(2.5));
+    }
+
+    #[test]
+    fn parity_delete_with_where() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES(1, 'a');").unwrap();
+        conn.execute("INSERT INTO t VALUES(2, 'b');").unwrap();
+        conn.execute("INSERT INTO t VALUES(3, 'c');").unwrap();
+        conn.execute("DELETE FROM t WHERE id > 1;").unwrap();
+        let rows = conn.query("SELECT val FROM t;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Text("a".into()));
+    }
+
+    // ── HAVING parity tests ──────────────────────────────────────────────
+
+    #[test]
+    fn parity_having_basic() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE sales(product TEXT, amount INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO sales VALUES('A', 10);").unwrap();
+        conn.execute("INSERT INTO sales VALUES('A', 20);").unwrap();
+        conn.execute("INSERT INTO sales VALUES('B', 5);").unwrap();
+        conn.execute("INSERT INTO sales VALUES('C', 30);").unwrap();
+        conn.execute("INSERT INTO sales VALUES('C', 40);").unwrap();
+        let rows = conn
+            .query(
+                "SELECT product, SUM(amount) FROM sales GROUP BY product HAVING SUM(amount) > 15 ORDER BY product;",
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Text("A".into()));
+        assert_eq!(row_values(&rows[0])[1], SqliteValue::Integer(30));
+        assert_eq!(row_values(&rows[1])[0], SqliteValue::Text("C".into()));
+        assert_eq!(row_values(&rows[1])[1], SqliteValue::Integer(70));
+    }
+
+    // ── IN operator parity tests ─────────────────────────────────────────
+
+    #[test]
+    fn parity_in_values_list() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t(x INTEGER);").unwrap();
+        conn.execute("INSERT INTO t VALUES(1);").unwrap();
+        conn.execute("INSERT INTO t VALUES(2);").unwrap();
+        conn.execute("INSERT INTO t VALUES(3);").unwrap();
+        conn.execute("INSERT INTO t VALUES(4);").unwrap();
+        let rows = conn
+            .query("SELECT x FROM t WHERE x IN (1, 3) ORDER BY x;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(1));
+        assert_eq!(row_values(&rows[1])[0], SqliteValue::Integer(3));
+    }
+
+    #[test]
+    fn parity_not_in_values_list() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t(x INTEGER);").unwrap();
+        conn.execute("INSERT INTO t VALUES(1);").unwrap();
+        conn.execute("INSERT INTO t VALUES(2);").unwrap();
+        conn.execute("INSERT INTO t VALUES(3);").unwrap();
+        let rows = conn
+            .query("SELECT x FROM t WHERE x NOT IN (1, 3) ORDER BY x;")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(2));
+    }
+
+    // ── Expression tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn parity_unary_minus() {
+        let conn = Connection::open(":memory:").unwrap();
+        let row = conn.query_row("SELECT -42;").unwrap();
+        assert_eq!(row_values(&row)[0], SqliteValue::Integer(-42));
+    }
+
+    #[test]
+    fn parity_string_concat_operator() {
+        let conn = Connection::open(":memory:").unwrap();
+        let row = conn.query_row("SELECT 'hello' || ' ' || 'world';").unwrap();
+        assert_eq!(row_values(&row)[0], SqliteValue::Text("hello world".into()));
+    }
+
+    #[test]
+    fn parity_typeof_function() {
+        let conn = Connection::open(":memory:").unwrap();
+        let row = conn.query_row("SELECT typeof(42);").unwrap();
+        assert_eq!(row_values(&row)[0], SqliteValue::Text("integer".into()));
+        let row = conn.query_row("SELECT typeof(3.14);").unwrap();
+        assert_eq!(row_values(&row)[0], SqliteValue::Text("real".into()));
+        let row = conn.query_row("SELECT typeof('hi');").unwrap();
+        assert_eq!(row_values(&row)[0], SqliteValue::Text("text".into()));
+        let row = conn.query_row("SELECT typeof(NULL);").unwrap();
+        assert_eq!(row_values(&row)[0], SqliteValue::Text("null".into()));
+    }
+
+    #[test]
+    fn parity_abs_function() {
+        let conn = Connection::open(":memory:").unwrap();
+        let row = conn.query_row("SELECT ABS(-10);").unwrap();
+        assert_eq!(row_values(&row)[0], SqliteValue::Integer(10));
+        let row = conn.query_row("SELECT ABS(10);").unwrap();
+        assert_eq!(row_values(&row)[0], SqliteValue::Integer(10));
+    }
+
+    #[test]
+    fn parity_upper_lower_functions() {
+        let conn = Connection::open(":memory:").unwrap();
+        let row = conn.query_row("SELECT UPPER('hello');").unwrap();
+        assert_eq!(row_values(&row)[0], SqliteValue::Text("HELLO".into()));
+        let row = conn.query_row("SELECT LOWER('WORLD');").unwrap();
+        assert_eq!(row_values(&row)[0], SqliteValue::Text("world".into()));
+    }
+
+    #[test]
+    fn parity_length_function() {
+        let conn = Connection::open(":memory:").unwrap();
+        let row = conn.query_row("SELECT LENGTH('hello');").unwrap();
+        assert_eq!(row_values(&row)[0], SqliteValue::Integer(5));
+        let row = conn.query_row("SELECT LENGTH('');").unwrap();
+        assert_eq!(row_values(&row)[0], SqliteValue::Integer(0));
+    }
+
+    #[test]
+    fn parity_min_max_aggregate() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t(x INTEGER);").unwrap();
+        conn.execute("INSERT INTO t VALUES(3);").unwrap();
+        conn.execute("INSERT INTO t VALUES(1);").unwrap();
+        conn.execute("INSERT INTO t VALUES(4);").unwrap();
+        conn.execute("INSERT INTO t VALUES(1);").unwrap();
+        conn.execute("INSERT INTO t VALUES(5);").unwrap();
+        let row = conn.query_row("SELECT MIN(x), MAX(x) FROM t;").unwrap();
+        let vals = row_values(&row);
+        assert_eq!(vals[0], SqliteValue::Integer(1));
+        assert_eq!(vals[1], SqliteValue::Integer(5));
+    }
+
+    #[test]
+    fn parity_avg_aggregate() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t(x INTEGER);").unwrap();
+        conn.execute("INSERT INTO t VALUES(10);").unwrap();
+        conn.execute("INSERT INTO t VALUES(20);").unwrap();
+        conn.execute("INSERT INTO t VALUES(30);").unwrap();
+        let row = conn.query_row("SELECT AVG(x) FROM t;").unwrap();
+        assert_eq!(row_values(&row)[0], SqliteValue::Float(20.0));
+    }
+
+    // ── UPDATE with subquery in WHERE ────────────────────────────────────
+
+    #[test]
+    fn parity_update_where_in_subquery() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE items(id INTEGER PRIMARY KEY, name TEXT, price INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO items VALUES(1, 'apple', 10);")
+            .unwrap();
+        conn.execute("INSERT INTO items VALUES(2, 'banana', 20);")
+            .unwrap();
+        conn.execute("INSERT INTO items VALUES(3, 'cherry', 30);")
+            .unwrap();
+        conn.execute("CREATE TABLE expensive(id INTEGER);").unwrap();
+        conn.execute("INSERT INTO expensive VALUES(2);").unwrap();
+        conn.execute("INSERT INTO expensive VALUES(3);").unwrap();
+        // UPDATE items SET price = price * 2 WHERE id IN (SELECT id FROM expensive);
+        conn.execute("UPDATE items SET price = price * 2 WHERE id IN (SELECT id FROM expensive);")
+            .unwrap();
+        let rows = conn
+            .query("SELECT id, price FROM items ORDER BY id;")
+            .unwrap();
+        let results: Vec<(i64, i64)> = rows
+            .iter()
+            .map(|r| {
+                let vals = row_values(r);
+                (vals[0].to_integer(), vals[1].to_integer())
+            })
+            .collect();
+        assert_eq!(results, vec![(1, 10), (2, 40), (3, 60)]);
+    }
+
+    // ── DELETE with subquery in WHERE ────────────────────────────────────
+
+    #[test]
+    fn parity_delete_where_in_subquery() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE data(id INTEGER, val TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO data VALUES(1, 'a');").unwrap();
+        conn.execute("INSERT INTO data VALUES(2, 'b');").unwrap();
+        conn.execute("INSERT INTO data VALUES(3, 'c');").unwrap();
+        conn.execute("CREATE TABLE to_remove(id INTEGER);").unwrap();
+        conn.execute("INSERT INTO to_remove VALUES(1);").unwrap();
+        conn.execute("INSERT INTO to_remove VALUES(3);").unwrap();
+        // DELETE FROM data WHERE id IN (SELECT id FROM to_remove);
+        conn.execute("DELETE FROM data WHERE id IN (SELECT id FROM to_remove);")
+            .unwrap();
+        let rows = conn.query("SELECT id, val FROM data ORDER BY id;").unwrap();
+        let results: Vec<(i64, String)> = rows
+            .iter()
+            .map(|r| {
+                let vals = row_values(r);
+                (
+                    vals[0].to_integer(),
+                    match &vals[1] {
+                        SqliteValue::Text(s) => s.clone(),
+                        _ => panic!("expected text"),
+                    },
+                )
+            })
+            .collect();
+        assert_eq!(results, vec![(2, "b".into())]);
+    }
+
+    // ── DateTime function probes ─────────────────────────────────────────
+
+    #[test]
+    fn parity_datetime_date_function() {
+        let conn = Connection::open(":memory:").unwrap();
+        let row = conn
+            .query_row("SELECT date('2023-06-15 14:30:00');")
+            .unwrap();
+        assert_eq!(row_values(&row)[0], SqliteValue::Text("2023-06-15".into()));
+    }
+
+    #[test]
+    fn parity_datetime_time_function() {
+        let conn = Connection::open(":memory:").unwrap();
+        let row = conn
+            .query_row("SELECT time('2023-06-15 14:30:45');")
+            .unwrap();
+        assert_eq!(row_values(&row)[0], SqliteValue::Text("14:30:45".into()));
+    }
+
+    #[test]
+    fn parity_datetime_strftime() {
+        let conn = Connection::open(":memory:").unwrap();
+        let row = conn
+            .query_row("SELECT strftime('%Y', '2023-06-15');")
+            .unwrap();
+        assert_eq!(row_values(&row)[0], SqliteValue::Text("2023".into()));
+    }
+
+    // ── TOTAL aggregate ──────────────────────────────────────────────────
+
+    #[test]
+    fn parity_total_aggregate() {
+        // TOTAL() returns 0.0 for empty set, unlike SUM() which returns NULL.
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t(x INTEGER);").unwrap();
+        let row = conn.query_row("SELECT TOTAL(x) FROM t;").unwrap();
+        assert_eq!(row_values(&row)[0], SqliteValue::Float(0.0));
+    }
+
+    #[test]
+    fn parity_total_aggregate_with_values() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t(x INTEGER);").unwrap();
+        conn.execute("INSERT INTO t VALUES(10);").unwrap();
+        conn.execute("INSERT INTO t VALUES(20);").unwrap();
+        let row = conn.query_row("SELECT TOTAL(x) FROM t;").unwrap();
+        assert_eq!(row_values(&row)[0], SqliteValue::Float(30.0));
+    }
+
+    // ── GLOB operator ────────────────────────────────────────────────────
+
+    #[test]
+    fn parity_glob_operator() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE files(name TEXT);").unwrap();
+        conn.execute("INSERT INTO files VALUES('readme.txt');")
+            .unwrap();
+        conn.execute("INSERT INTO files VALUES('main.rs');")
+            .unwrap();
+        conn.execute("INSERT INTO files VALUES('test.txt');")
+            .unwrap();
+        let rows = conn
+            .query("SELECT name FROM files WHERE name GLOB '*.txt' ORDER BY name;")
+            .unwrap();
+        let results: Vec<String> = rows
+            .iter()
+            .map(|r| match &row_values(r)[0] {
+                SqliteValue::Text(s) => s.clone(),
+                _ => panic!("expected text"),
+            })
+            .collect();
+        assert_eq!(results, vec!["readme.txt", "test.txt"]);
+    }
+
+    // ── REPLACE function ─────────────────────────────────────────────────
+
+    #[test]
+    fn parity_replace_function() {
+        let conn = Connection::open(":memory:").unwrap();
+        let row = conn
+            .query_row("SELECT replace('hello world', 'world', 'rust');")
+            .unwrap();
+        assert_eq!(row_values(&row)[0], SqliteValue::Text("hello rust".into()));
+    }
+
+    // ── ZEROBLOB function ────────────────────────────────────────────────
+
+    #[test]
+    fn parity_zeroblob_function() {
+        let conn = Connection::open(":memory:").unwrap();
+        let row = conn
+            .query_row("SELECT typeof(zeroblob(4)), length(zeroblob(4));")
+            .unwrap();
+        let vals = row_values(&row);
+        assert_eq!(vals[0], SqliteValue::Text("blob".into()));
+        assert_eq!(vals[1], SqliteValue::Integer(4));
+    }
+
+    // ── UNICODE / CHAR functions ─────────────────────────────────────────
+
+    #[test]
+    fn parity_unicode_function() {
+        let conn = Connection::open(":memory:").unwrap();
+        let row = conn.query_row("SELECT unicode('A');").unwrap();
+        assert_eq!(row_values(&row)[0], SqliteValue::Integer(65));
+    }
+
+    #[test]
+    fn parity_char_function() {
+        let conn = Connection::open(":memory:").unwrap();
+        let row = conn.query_row("SELECT char(65, 66, 67);").unwrap();
+        assert_eq!(row_values(&row)[0], SqliteValue::Text("ABC".into()));
+    }
+
+    // ── INSTR with multi-byte ────────────────────────────────────────────
+
+    #[test]
+    fn parity_instr_multi_occurrence() {
+        let conn = Connection::open(":memory:").unwrap();
+        // INSTR returns position of FIRST occurrence (1-based).
+        let row = conn.query_row("SELECT instr('abcabc', 'bc');").unwrap();
+        assert_eq!(row_values(&row)[0], SqliteValue::Integer(2));
+    }
+
+    // ── PRINTF / FORMAT function ─────────────────────────────────────────
+
+    #[test]
+    fn parity_printf_function() {
+        let conn = Connection::open(":memory:").unwrap();
+        let row = conn
+            .query_row("SELECT printf('%d + %d = %d', 1, 2, 3);")
+            .unwrap();
+        assert_eq!(row_values(&row)[0], SqliteValue::Text("1 + 2 = 3".into()));
+    }
+
+    // ── Window function probe ────────────────────────────────────────────
+
+    #[test]
+    #[ignore = "window functions not yet implemented"]
+    fn parity_row_number_window() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE w(name TEXT, val INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO w VALUES('a', 10);").unwrap();
+        conn.execute("INSERT INTO w VALUES('b', 20);").unwrap();
+        conn.execute("INSERT INTO w VALUES('c', 30);").unwrap();
+        let rows = conn
+            .query("SELECT name, ROW_NUMBER() OVER (ORDER BY val) FROM w;")
+            .unwrap();
+        let results: Vec<(String, i64)> = rows
+            .iter()
+            .map(|r| {
+                let vals = row_values(r);
+                let name = match &vals[0] {
+                    SqliteValue::Text(s) => s.clone(),
+                    _ => panic!("expected text"),
+                };
+                (name, vals[1].to_integer())
+            })
+            .collect();
+        assert_eq!(
+            results,
+            vec![("a".into(), 1), ("b".into(), 2), ("c".into(), 3),]
+        );
+    }
+
+    // ── CTE (WITH) probe ─────────────────────────────────────────────────
+
+    #[test]
+    fn parity_cte_basic() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t(x INTEGER);").unwrap();
+        conn.execute("INSERT INTO t VALUES(1);").unwrap();
+        conn.execute("INSERT INTO t VALUES(2);").unwrap();
+        conn.execute("INSERT INTO t VALUES(3);").unwrap();
+        let rows = conn
+            .query("WITH doubled AS (SELECT x * 2 AS d FROM t) SELECT d FROM doubled ORDER BY d;")
+            .unwrap();
+        let results: Vec<i64> = rows.iter().map(|r| row_values(r)[0].to_integer()).collect();
+        assert_eq!(results, vec![2, 4, 6]);
+    }
+
+    // ── Recursive CTE probe ─────────────────────────────────────────────
+
+    #[test]
+    fn parity_recursive_cte() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn
+            .query(
+                "WITH RECURSIVE cnt(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM cnt WHERE x<5) \
+                 SELECT x FROM cnt;",
+            )
+            .unwrap();
+        let results: Vec<i64> = rows.iter().map(|r| row_values(r)[0].to_integer()).collect();
+        assert_eq!(results, vec![1, 2, 3, 4, 5]);
+    }
+
+    // ── HAVING with multiple conditions ──────────────────────────────────
+
+    #[test]
+    fn parity_having_count_and_sum() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE sales(region TEXT, amount INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO sales VALUES('East', 100);")
+            .unwrap();
+        conn.execute("INSERT INTO sales VALUES('East', 200);")
+            .unwrap();
+        conn.execute("INSERT INTO sales VALUES('West', 50);")
+            .unwrap();
+        conn.execute("INSERT INTO sales VALUES('West', 60);")
+            .unwrap();
+        conn.execute("INSERT INTO sales VALUES('West', 70);")
+            .unwrap();
+        // HAVING COUNT(*) > 2 → only West (3 rows)
+        let rows = conn
+            .query("SELECT region, SUM(amount) FROM sales GROUP BY region HAVING COUNT(*) > 2;")
+            .unwrap();
+        let results: Vec<(String, i64)> = rows
+            .iter()
+            .map(|r| {
+                let vals = row_values(r);
+                (
+                    match &vals[0] {
+                        SqliteValue::Text(s) => s.clone(),
+                        _ => panic!("expected text"),
+                    },
+                    vals[1].to_integer(),
+                )
+            })
+            .collect();
+        assert_eq!(results, vec![("West".into(), 180)]);
+    }
+
+    // ── Multi-table UPDATE with JOIN subquery ────────────────────────────
+
+    #[test]
+    fn parity_update_with_exists_subquery() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE products(pid INTEGER, name TEXT, active INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO products VALUES(1, 'Widget', 1);")
+            .unwrap();
+        conn.execute("INSERT INTO products VALUES(2, 'Gadget', 1);")
+            .unwrap();
+        conn.execute("INSERT INTO products VALUES(3, 'Doohickey', 1);")
+            .unwrap();
+        conn.execute("CREATE TABLE discontinued(product_id INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO discontinued VALUES(1);").unwrap();
+        conn.execute("INSERT INTO discontinued VALUES(3);").unwrap();
+        // Correlated EXISTS subquery: update rows where a matching row exists.
+        conn.execute(
+            "UPDATE products SET active = 0 WHERE EXISTS \
+             (SELECT 1 FROM discontinued WHERE discontinued.product_id = products.pid);",
+        )
+        .unwrap();
+        let rows = conn
+            .query("SELECT pid, active FROM products ORDER BY pid;")
+            .unwrap();
+        let results: Vec<(i64, i64)> = rows
+            .iter()
+            .map(|r| {
+                let vals = row_values(r);
+                (vals[0].to_integer(), vals[1].to_integer())
+            })
+            .collect();
+        assert_eq!(results, vec![(1, 0), (2, 1), (3, 0)]);
+    }
+
+    #[test]
+    fn probe_correlated_exists_select() {
+        // Diagnostic: does correlated EXISTS work in a SELECT context?
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE a(x INTEGER);").unwrap();
+        conn.execute("INSERT INTO a VALUES(1);").unwrap();
+        conn.execute("INSERT INTO a VALUES(2);").unwrap();
+        conn.execute("INSERT INTO a VALUES(3);").unwrap();
+        conn.execute("CREATE TABLE b(y INTEGER);").unwrap();
+        conn.execute("INSERT INTO b VALUES(1);").unwrap();
+        conn.execute("INSERT INTO b VALUES(3);").unwrap();
+        let rows = conn
+            .query("SELECT x FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.y = a.x) ORDER BY x;")
+            .unwrap();
+        let results: Vec<i64> = rows.iter().map(|r| row_values(r)[0].to_integer()).collect();
+        assert_eq!(results, vec![1, 3]);
+    }
+
+    // ── Conformance Probes: Edge Cases ──────────────────────────────────
+
+    #[test]
+    fn probe_order_by_expression() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t(x INTEGER, y TEXT);").unwrap();
+        conn.execute("INSERT INTO t VALUES(3, 'c');").unwrap();
+        conn.execute("INSERT INTO t VALUES(1, 'a');").unwrap();
+        conn.execute("INSERT INTO t VALUES(2, 'b');").unwrap();
+        let rows = conn.query("SELECT y FROM t ORDER BY x * -1;").unwrap();
+        let results: Vec<String> = rows
+            .iter()
+            .map(|r| match &row_values(r)[0] {
+                SqliteValue::Text(s) => s.clone(),
+                _ => panic!("expected text"),
+            })
+            .collect();
+        assert_eq!(results, vec!["c", "b", "a"]);
+    }
+
+    #[test]
+    fn probe_group_by_expression() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t(x INTEGER, v INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES(1, 10);").unwrap();
+        conn.execute("INSERT INTO t VALUES(2, 20);").unwrap();
+        conn.execute("INSERT INTO t VALUES(3, 30);").unwrap();
+        conn.execute("INSERT INTO t VALUES(4, 40);").unwrap();
+        let rows = conn
+            .query("SELECT x % 2 AS grp, SUM(v) FROM t GROUP BY x % 2 ORDER BY grp;")
+            .unwrap();
+        let results: Vec<(i64, i64)> = rows
+            .iter()
+            .map(|r| {
+                let vals = row_values(r);
+                (vals[0].to_integer(), vals[1].to_integer())
+            })
+            .collect();
+        assert_eq!(results, vec![(0, 60), (1, 40)]);
+    }
+
+    #[test]
+    fn probe_having_with_expression() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t(cat TEXT, val INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES('a', 10);").unwrap();
+        conn.execute("INSERT INTO t VALUES('a', 20);").unwrap();
+        conn.execute("INSERT INTO t VALUES('b', 5);").unwrap();
+        let rows = conn
+            .query(
+                "SELECT cat, SUM(val) AS s FROM t GROUP BY cat HAVING SUM(val) > 10 ORDER BY cat;",
+            )
+            .unwrap();
+        let results: Vec<(String, i64)> = rows
+            .iter()
+            .map(|r| {
+                let vals = row_values(r);
+                let cat = match &vals[0] {
+                    SqliteValue::Text(s) => s.clone(),
+                    _ => panic!("expected text"),
+                };
+                (cat, vals[1].to_integer())
+            })
+            .collect();
+        assert_eq!(results, vec![("a".to_string(), 30)]);
+    }
+
+    #[test]
+    fn probe_scalar_subquery_in_select() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t(x INTEGER);").unwrap();
+        conn.execute("INSERT INTO t VALUES(1);").unwrap();
+        conn.execute("INSERT INTO t VALUES(2);").unwrap();
+        conn.execute("INSERT INTO t VALUES(3);").unwrap();
+        let rows = conn
+            .query("SELECT x, (SELECT MAX(x) FROM t) AS mx FROM t ORDER BY x;")
+            .unwrap();
+        let results: Vec<(i64, i64)> = rows
+            .iter()
+            .map(|r| {
+                let vals = row_values(r);
+                (vals[0].to_integer(), vals[1].to_integer())
+            })
+            .collect();
+        assert_eq!(results, vec![(1, 3), (2, 3), (3, 3)]);
+    }
+
+    #[test]
+    fn probe_nested_case_when() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t(x INTEGER);").unwrap();
+        conn.execute("INSERT INTO t VALUES(1);").unwrap();
+        conn.execute("INSERT INTO t VALUES(2);").unwrap();
+        conn.execute("INSERT INTO t VALUES(3);").unwrap();
+        let rows = conn
+            .query(
+                "SELECT CASE WHEN x < 2 THEN 'low' \
+                 WHEN x < 3 THEN 'mid' ELSE 'high' END AS label FROM t ORDER BY x;",
+            )
+            .unwrap();
+        let results: Vec<String> = rows
+            .iter()
+            .map(|r| match &row_values(r)[0] {
+                SqliteValue::Text(s) => s.clone(),
+                _ => panic!("expected text"),
+            })
+            .collect();
+        assert_eq!(results, vec!["low", "mid", "high"]);
+    }
+
+    #[test]
+    fn probe_coalesce_multi_arg() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn
+            .query("SELECT COALESCE(NULL, NULL, NULL, 42);")
+            .unwrap();
+        assert_eq!(row_values(&rows[0])[0].to_integer(), 42);
+    }
+
+    #[test]
+    fn probe_nullif_function() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn.query("SELECT NULLIF(5, 5), NULLIF(5, 3);").unwrap();
+        let vals = row_values(&rows[0]);
+        assert_eq!(vals[0], SqliteValue::Null);
+        assert_eq!(vals[1].to_integer(), 5);
+    }
+
+    #[test]
+    fn probe_iif_function() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn
+            .query("SELECT IIF(1 > 0, 'yes', 'no'), IIF(1 < 0, 'yes', 'no');")
+            .unwrap();
+        let vals = row_values(&rows[0]);
+        let a = match &vals[0] {
+            SqliteValue::Text(s) => s.clone(),
+            _ => panic!("expected text"),
+        };
+        let b = match &vals[1] {
+            SqliteValue::Text(s) => s.clone(),
+            _ => panic!("expected text"),
+        };
+        assert_eq!(a, "yes");
+        assert_eq!(b, "no");
+    }
+
+    #[test]
+    fn probe_like_escape() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t(s TEXT);").unwrap();
+        conn.execute("INSERT INTO t VALUES('100% done');").unwrap();
+        conn.execute("INSERT INTO t VALUES('50 percent');").unwrap();
+        let rows = conn
+            .query("SELECT s FROM t WHERE s LIKE '%!%%' ESCAPE '!';")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        let val = match &row_values(&rows[0])[0] {
+            SqliteValue::Text(s) => s.clone(),
+            _ => panic!("expected text"),
+        };
+        assert_eq!(val, "100% done");
+    }
+
+    #[test]
+    fn probe_between_with_expressions() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t(x INTEGER);").unwrap();
+        conn.execute("INSERT INTO t VALUES(1);").unwrap();
+        conn.execute("INSERT INTO t VALUES(5);").unwrap();
+        conn.execute("INSERT INTO t VALUES(10);").unwrap();
+        let rows = conn
+            .query("SELECT x FROM t WHERE x BETWEEN 2 + 1 AND 4 * 2 ORDER BY x;")
+            .unwrap();
+        let results: Vec<i64> = rows.iter().map(|r| row_values(r)[0].to_integer()).collect();
+        assert_eq!(results, vec![5]);
+    }
+
+    #[test]
+    fn probe_distinct_with_expression() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t(x INTEGER);").unwrap();
+        conn.execute("INSERT INTO t VALUES(1);").unwrap();
+        conn.execute("INSERT INTO t VALUES(2);").unwrap();
+        conn.execute("INSERT INTO t VALUES(3);").unwrap();
+        conn.execute("INSERT INTO t VALUES(4);").unwrap();
+        let rows = conn
+            .query("SELECT DISTINCT x % 2 AS mod2 FROM t ORDER BY mod2;")
+            .unwrap();
+        let results: Vec<i64> = rows.iter().map(|r| row_values(r)[0].to_integer()).collect();
+        assert_eq!(results, vec![0, 1]);
+    }
+
+    #[test]
+    fn probe_insert_or_ignore_keeps_existing() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES(1, 'first');").unwrap();
+        conn.execute("INSERT OR IGNORE INTO t VALUES(1, 'second');")
+            .unwrap();
+        let rows = conn.query("SELECT v FROM t WHERE id = 1;").unwrap();
+        let val = match &row_values(&rows[0])[0] {
+            SqliteValue::Text(s) => s.clone(),
+            _ => panic!("expected text"),
+        };
+        assert_eq!(val, "first");
+    }
+
+    #[test]
+    fn probe_insert_or_replace_overwrites() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES(1, 'first');").unwrap();
+        conn.execute("INSERT OR REPLACE INTO t VALUES(1, 'second');")
+            .unwrap();
+        let rows = conn.query("SELECT v FROM t WHERE id = 1;").unwrap();
+        let val = match &row_values(&rows[0])[0] {
+            SqliteValue::Text(s) => s.clone(),
+            _ => panic!("expected text"),
+        };
+        assert_eq!(val, "second");
+    }
+
+    #[test]
+    fn probe_delete_with_correlated_exists() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE items(id INTEGER, active INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO items VALUES(1, 1);").unwrap();
+        conn.execute("INSERT INTO items VALUES(2, 1);").unwrap();
+        conn.execute("INSERT INTO items VALUES(3, 1);").unwrap();
+        conn.execute("CREATE TABLE retired(item_id INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO retired VALUES(2);").unwrap();
+        conn.execute(
+            "DELETE FROM items WHERE EXISTS \
+             (SELECT 1 FROM retired WHERE retired.item_id = items.id);",
+        )
+        .unwrap();
+        let rows = conn.query("SELECT id FROM items ORDER BY id;").unwrap();
+        let results: Vec<i64> = rows.iter().map(|r| row_values(r)[0].to_integer()).collect();
+        assert_eq!(results, vec![1, 3]);
+    }
+
+    #[test]
+    fn probe_aggregate_in_order_by() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t(cat TEXT, val INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES('b', 10);").unwrap();
+        conn.execute("INSERT INTO t VALUES('a', 30);").unwrap();
+        conn.execute("INSERT INTO t VALUES('c', 20);").unwrap();
+        let rows = conn
+            .query("SELECT cat, SUM(val) AS s FROM t GROUP BY cat ORDER BY SUM(val) DESC;")
+            .unwrap();
+        let results: Vec<(String, i64)> = rows
+            .iter()
+            .map(|r| {
+                let vals = row_values(r);
+                let cat = match &vals[0] {
+                    SqliteValue::Text(s) => s.clone(),
+                    _ => panic!("expected text"),
+                };
+                (cat, vals[1].to_integer())
+            })
+            .collect();
+        assert_eq!(
+            results,
+            vec![
+                ("a".to_string(), 30),
+                ("c".to_string(), 20),
+                ("b".to_string(), 10)
+            ]
+        );
+    }
+
+    #[test]
+    fn probe_subquery_in_from() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t(x INTEGER);").unwrap();
+        conn.execute("INSERT INTO t VALUES(1);").unwrap();
+        conn.execute("INSERT INTO t VALUES(2);").unwrap();
+        conn.execute("INSERT INTO t VALUES(3);").unwrap();
+        let rows = conn
+            .query("SELECT sub.doubled FROM (SELECT x * 2 AS doubled FROM t) AS sub ORDER BY sub.doubled;")
+            .unwrap();
+        let results: Vec<i64> = rows.iter().map(|r| row_values(r)[0].to_integer()).collect();
+        assert_eq!(results, vec![2, 4, 6]);
+    }
+
+    #[test]
+    fn probe_multi_column_order_by_mixed() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t(a INTEGER, b INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES(1, 3);").unwrap();
+        conn.execute("INSERT INTO t VALUES(1, 1);").unwrap();
+        conn.execute("INSERT INTO t VALUES(2, 2);").unwrap();
+        conn.execute("INSERT INTO t VALUES(2, 4);").unwrap();
+        let rows = conn
+            .query("SELECT a, b FROM t ORDER BY a ASC, b DESC;")
+            .unwrap();
+        let results: Vec<(i64, i64)> = rows
+            .iter()
+            .map(|r| {
+                let vals = row_values(r);
+                (vals[0].to_integer(), vals[1].to_integer())
+            })
+            .collect();
+        assert_eq!(results, vec![(1, 3), (1, 1), (2, 4), (2, 2)]);
+    }
+
+    #[test]
+    fn probe_null_handling_order_by() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t(x INTEGER);").unwrap();
+        conn.execute("INSERT INTO t VALUES(3);").unwrap();
+        conn.execute("INSERT INTO t VALUES(NULL);").unwrap();
+        conn.execute("INSERT INTO t VALUES(1);").unwrap();
+        // SQLite: NULLs sort first in ASC order.
+        let rows = conn.query("SELECT x FROM t ORDER BY x ASC;").unwrap();
+        let results: Vec<SqliteValue> = rows.iter().map(|r| row_values(r)[0].clone()).collect();
+        assert_eq!(results[0], SqliteValue::Null);
+        assert_eq!(results[1].to_integer(), 1);
+        assert_eq!(results[2].to_integer(), 3);
+    }
+
+    #[test]
+    fn probe_count_distinct() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t(x INTEGER);").unwrap();
+        conn.execute("INSERT INTO t VALUES(1);").unwrap();
+        conn.execute("INSERT INTO t VALUES(2);").unwrap();
+        conn.execute("INSERT INTO t VALUES(1);").unwrap();
+        conn.execute("INSERT INTO t VALUES(NULL);").unwrap();
+        let rows = conn.query("SELECT COUNT(DISTINCT x) FROM t;").unwrap();
+        // COUNT(DISTINCT x) should count distinct non-NULL values → 2
+        assert_eq!(row_values(&rows[0])[0].to_integer(), 2);
+    }
+
+    #[test]
+    fn probe_cast_in_where() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t(x TEXT);").unwrap();
+        conn.execute("INSERT INTO t VALUES('123');").unwrap();
+        conn.execute("INSERT INTO t VALUES('456');").unwrap();
+        conn.execute("INSERT INTO t VALUES('abc');").unwrap();
+        let rows = conn
+            .query("SELECT x FROM t WHERE CAST(x AS INTEGER) > 200;")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        let val = match &row_values(&rows[0])[0] {
+            SqliteValue::Text(s) => s.clone(),
+            _ => panic!("expected text"),
+        };
+        assert_eq!(val, "456");
+    }
+
+    #[test]
+    fn probe_union_all_three_way() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn
+            .query("SELECT 1 AS v UNION ALL SELECT 2 UNION ALL SELECT 1;")
+            .unwrap();
+        let results: Vec<i64> = rows.iter().map(|r| row_values(r)[0].to_integer()).collect();
+        assert_eq!(results, vec![1, 2, 1]);
+    }
+
+    #[test]
+    fn probe_union_dedup_three_way() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn
+            .query("SELECT 1 AS v UNION SELECT 2 UNION SELECT 1 ORDER BY v;")
+            .unwrap();
+        let results: Vec<i64> = rows.iter().map(|r| row_values(r)[0].to_integer()).collect();
+        assert_eq!(results, vec![1, 2]);
+    }
+
+    #[test]
+    fn probe_except_compound() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn
+            .query("SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 EXCEPT SELECT 2;")
+            .unwrap();
+        let results: Vec<i64> = rows.iter().map(|r| row_values(r)[0].to_integer()).collect();
+        // EXCEPT removes rows from right. Order: 1, 3
+        assert!(results.contains(&1));
+        assert!(results.contains(&3));
+        assert!(!results.contains(&2));
+    }
+
+    #[test]
+    fn probe_intersect_compound() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn
+            .query(
+                "SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 \
+                 INTERSECT SELECT 2 UNION ALL SELECT 3;",
+            )
+            .unwrap();
+        let results: Vec<i64> = rows.iter().map(|r| row_values(r)[0].to_integer()).collect();
+        assert!(results.contains(&2) || results.contains(&3));
     }
 }
