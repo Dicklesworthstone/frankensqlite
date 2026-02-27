@@ -1839,20 +1839,28 @@ impl Connection {
                     // then GROUP BY on that temp table.
                     self.log_mem_execution_fallback("select", "group_by_join_fallback");
                     let rewritten = self.rewrite_in_subqueries_select(select, params)?;
-                    let bound = bind_placeholders_in_select_for_fallback(&rewritten, params)?;
+                    let mut bound = bind_placeholders_in_select_for_fallback(&rewritten, params)?;
+                    let limit_clause = bound.limit.take();
                     let mut rows = self.execute_group_by_join_select(&bound, None)?;
                     if distinct {
                         dedup_rows(&mut rows);
+                    }
+                    if let Some(limit) = limit_clause {
+                        apply_limit_clause(&mut rows, &limit);
                     }
                     Ok(rows)
                 } else if has_group_by(select) {
                     // Fallback path: eagerly rewrite IN subqueries.
                     self.log_mem_execution_fallback("select", "group_by_fallback");
                     let rewritten = self.rewrite_in_subqueries_select(select, params)?;
-                    let bound = bind_placeholders_in_select_for_fallback(&rewritten, params)?;
+                    let mut bound = bind_placeholders_in_select_for_fallback(&rewritten, params)?;
+                    let limit_clause = bound.limit.take();
                     let mut rows = self.execute_group_by_select(&bound, None)?;
                     if distinct {
                         dedup_rows(&mut rows);
+                    }
+                    if let Some(limit) = limit_clause {
+                        apply_limit_clause(&mut rows, &limit);
                     }
                     Ok(rows)
                 } else if select_contains_match_operator(select) {
@@ -1860,10 +1868,14 @@ impl Connection {
                     // connection path. Route through fallback evaluation.
                     self.log_mem_execution_fallback("select", "match_operator_fallback");
                     let rewritten = self.rewrite_in_subqueries_select(select, params)?;
-                    let bound = bind_placeholders_in_select_for_fallback(&rewritten, params)?;
+                    let mut bound = bind_placeholders_in_select_for_fallback(&rewritten, params)?;
+                    let limit_clause = bound.limit.take();
                     let mut rows = self.execute_join_select(&bound, None)?;
                     if distinct {
                         dedup_rows(&mut rows);
+                    }
+                    if let Some(limit) = limit_clause {
+                        apply_limit_clause(&mut rows, &limit);
                     }
                     Ok(rows)
                 } else if has_joins(select) || has_subquery_source(select) {
@@ -1872,10 +1884,14 @@ impl Connection {
                     // without explicit JOINs.
                     self.log_mem_execution_fallback("select", "join_or_subquery_fallback");
                     let rewritten = self.rewrite_in_subqueries_select(select, params)?;
-                    let bound = bind_placeholders_in_select_for_fallback(&rewritten, params)?;
+                    let mut bound = bind_placeholders_in_select_for_fallback(&rewritten, params)?;
+                    let limit_clause = bound.limit.take();
                     let mut rows = self.execute_join_select(&bound, None)?;
                     if distinct {
                         dedup_rows(&mut rows);
+                    }
+                    if let Some(limit) = limit_clause {
+                        apply_limit_clause(&mut rows, &limit);
                     }
                     Ok(rows)
                 } else {
@@ -2622,14 +2638,22 @@ impl Connection {
                     ConflictAction::Replace => {
                         // insert_row delegates to insert() which has upsert
                         // semantics: replaces if rowid already exists.
-                        let table = db.get_table_mut(root_page).ok_or_else(|| FrankenError::Internal(format!("table not found at root page {root_page}")))?;
+                        let table = db.get_table_mut(root_page).ok_or_else(|| {
+                            FrankenError::Internal(format!(
+                                "table not found at root page {root_page}"
+                            ))
+                        })?;
                         table.insert_row(rowid, col_values);
                         set_last_insert_rowid(rowid);
                         affected += 1;
                     }
                     ConflictAction::Ignore => {
                         if !exists {
-                            let table = db.get_table_mut(root_page).ok_or_else(|| FrankenError::Internal(format!("table not found at root page {root_page}")))?;
+                            let table = db.get_table_mut(root_page).ok_or_else(|| {
+                                FrankenError::Internal(format!(
+                                    "table not found at root page {root_page}"
+                                ))
+                            })?;
                             table.insert_row(rowid, col_values);
                             set_last_insert_rowid(rowid);
                             affected += 1;
@@ -2642,7 +2666,11 @@ impl Connection {
                                 columns: format!("{table_name}.rowid"),
                             });
                         }
-                        let table = db.get_table_mut(root_page).ok_or_else(|| FrankenError::Internal(format!("table not found at root page {root_page}")))?;
+                        let table = db.get_table_mut(root_page).ok_or_else(|| {
+                            FrankenError::Internal(format!(
+                                "table not found at root page {root_page}"
+                            ))
+                        })?;
                         table.insert_row(rowid, col_values);
                         set_last_insert_rowid(rowid);
                         affected += 1;
@@ -2651,7 +2679,9 @@ impl Connection {
             } else {
                 // No explicit rowid; auto-allocate.  Conflict on auto-generated
                 // rowid is practically impossible.
-                let table = db.get_table_mut(root_page).ok_or_else(|| FrankenError::Internal(format!("table not found at root page {root_page}")))?;
+                let table = db.get_table_mut(root_page).ok_or_else(|| {
+                    FrankenError::Internal(format!("table not found at root page {root_page}"))
+                })?;
                 let new_rowid = table.alloc_rowid();
                 table.insert_row(new_rowid, col_values);
                 set_last_insert_rowid(new_rowid);
@@ -3683,7 +3713,9 @@ impl Connection {
         }
         let result = {
             let mut guard = self.active_txn.borrow_mut();
-            let txn = guard.as_deref_mut().ok_or_else(|| FrankenError::internal("transaction missing after ensure"))?;
+            let txn = guard
+                .as_deref_mut()
+                .ok_or_else(|| FrankenError::internal("transaction missing after ensure"))?;
             f(&cx, txn)
         };
         if auto {
@@ -4710,7 +4742,7 @@ impl Connection {
 
     /// Materialize views referenced by a SELECT as temporary tables, execute
     /// the query, then clean up the temp tables.
-fn execute_with_materialized_views(
+    fn execute_with_materialized_views(
         &self,
         select: &SelectStatement,
         params: Option<&[SqliteValue]>,
@@ -4718,27 +4750,17 @@ fn execute_with_materialized_views(
         let prev_reject = *self.reject_mem_fallback.borrow();
         self.set_reject_mem_fallback(false);
         let result = (|| -> Result<Vec<Row>> {
+            let view_defs: Vec<ViewDef> = self.views.borrow().clone();
+            let mut materialized: Vec<String> = Vec::new();
 
-        let view_defs: Vec<ViewDef> = self.views.borrow().clone();
-        let mut materialized: Vec<String> = Vec::new();
-
-        // Collect view names referenced in FROM/JOIN.
-        let mut referenced: Vec<String> = Vec::new();
-        if let SelectCore::Select {
-            from: Some(ref from),
-            ..
-        } = select.body.select
-        {
-            if let TableOrSubquery::Table { ref name, .. } = from.source {
-                if view_defs
-                    .iter()
-                    .any(|v| v.name.eq_ignore_ascii_case(&name.name))
-                {
-                    referenced.push(name.name.clone());
-                }
-            }
-            for join in &from.joins {
-                if let TableOrSubquery::Table { ref name, .. } = join.table {
+            // Collect view names referenced in FROM/JOIN.
+            let mut referenced: Vec<String> = Vec::new();
+            if let SelectCore::Select {
+                from: Some(ref from),
+                ..
+            } = select.body.select
+            {
+                if let TableOrSubquery::Table { ref name, .. } = from.source {
                     if view_defs
                         .iter()
                         .any(|v| v.name.eq_ignore_ascii_case(&name.name))
@@ -4746,88 +4768,101 @@ fn execute_with_materialized_views(
                         referenced.push(name.name.clone());
                     }
                 }
-            }
-        }
-
-        // Materialize each referenced view as a temp table.
-        for ref_name in &referenced {
-            let view = view_defs
-                .iter()
-                .find(|v| v.name.eq_ignore_ascii_case(ref_name))
-                .ok_or_else(|| FrankenError::internal(format!("view {} not found in definitions", ref_name)))?;
-            let view_rows =
-                self.execute_statement(Statement::Select(view.query.clone()), params)?;
-            let col_names = infer_select_column_names(&view.query);
-            let width = if col_names.is_empty() {
-                view_rows.first().map_or(1, |r| r.values().len())
-            } else {
-                col_names.len()
-            };
-            let col_infos: Vec<ColumnInfo> = if col_names.is_empty() {
-                (0..width)
-                    .map(|i| ColumnInfo {
-                        name: format!("_c{i}"),
-                        affinity: 'B',
-                        is_ipk: false,
-                        type_name: None,
-                        notnull: false,
-                        default_value: None,
-                        strict_type: None,
-                    })
-                    .collect()
-            } else {
-                col_names
-                    .iter()
-                    .map(|n| ColumnInfo {
-                        name: n.clone(),
-                        affinity: 'B',
-                        is_ipk: false,
-                        type_name: None,
-                        notnull: false,
-                        default_value: None,
-                        strict_type: None,
-                    })
-                    .collect()
-            };
-
-            let root_page = self.db.borrow_mut().create_table(col_infos.len());
-            self.schema.borrow_mut().push(TableSchema {
-                name: view.name.clone(),
-                root_page,
-                columns: col_infos,
-                indexes: Vec::new(),
-                strict: false,
-            });
-            materialized.push(view.name.clone());
-
-            for (i, row) in view_rows.iter().enumerate() {
-                let vals = row.values().to_vec();
-                #[allow(clippy::cast_possible_wrap)]
-                let rowid = (i + 1) as i64;
-                if let Some(table) = self.db.borrow_mut().get_table_mut(root_page) {
-                    table.insert_row(rowid, vals);
+                for join in &from.joins {
+                    if let TableOrSubquery::Table { ref name, .. } = join.table {
+                        if view_defs
+                            .iter()
+                            .any(|v| v.name.eq_ignore_ascii_case(&name.name))
+                        {
+                            referenced.push(name.name.clone());
+                        }
+                    }
                 }
             }
-        }
 
-        let result = self.execute_statement(Statement::Select(select.clone()), params);
+            // Materialize each referenced view as a temp table.
+            for ref_name in &referenced {
+                let view = view_defs
+                    .iter()
+                    .find(|v| v.name.eq_ignore_ascii_case(ref_name))
+                    .ok_or_else(|| {
+                        FrankenError::internal(format!(
+                            "view {} not found in definitions",
+                            ref_name
+                        ))
+                    })?;
+                let view_rows =
+                    self.execute_statement(Statement::Select(view.query.clone()), params)?;
+                let col_names = infer_select_column_names(&view.query);
+                let width = if col_names.is_empty() {
+                    view_rows.first().map_or(1, |r| r.values().len())
+                } else {
+                    col_names.len()
+                };
+                let col_infos: Vec<ColumnInfo> = if col_names.is_empty() {
+                    (0..width)
+                        .map(|i| ColumnInfo {
+                            name: format!("_c{i}"),
+                            affinity: 'B',
+                            is_ipk: false,
+                            type_name: None,
+                            notnull: false,
+                            default_value: None,
+                            strict_type: None,
+                        })
+                        .collect()
+                } else {
+                    col_names
+                        .iter()
+                        .map(|n| ColumnInfo {
+                            name: n.clone(),
+                            affinity: 'B',
+                            is_ipk: false,
+                            type_name: None,
+                            notnull: false,
+                            default_value: None,
+                            strict_type: None,
+                        })
+                        .collect()
+                };
 
-        // Clean up materialized temp tables.
-        for name in &materialized {
-            let mut schema = self.schema.borrow_mut();
-            if let Some(idx) = schema
-                .iter()
-                .position(|t| t.name.eq_ignore_ascii_case(name))
-            {
-                let rp = schema[idx].root_page;
-                schema.remove(idx);
-                drop(schema);
-                self.db.borrow_mut().destroy_table(rp);
+                let root_page = self.db.borrow_mut().create_table(col_infos.len());
+                self.schema.borrow_mut().push(TableSchema {
+                    name: view.name.clone(),
+                    root_page,
+                    columns: col_infos,
+                    indexes: Vec::new(),
+                    strict: false,
+                });
+                materialized.push(view.name.clone());
+
+                for (i, row) in view_rows.iter().enumerate() {
+                    let vals = row.values().to_vec();
+                    #[allow(clippy::cast_possible_wrap)]
+                    let rowid = (i + 1) as i64;
+                    if let Some(table) = self.db.borrow_mut().get_table_mut(root_page) {
+                        table.insert_row(rowid, vals);
+                    }
+                }
             }
-        }
 
-        result
-    
+            let result = self.execute_statement(Statement::Select(select.clone()), params);
+
+            // Clean up materialized temp tables.
+            for name in &materialized {
+                let mut schema = self.schema.borrow_mut();
+                if let Some(idx) = schema
+                    .iter()
+                    .position(|t| t.name.eq_ignore_ascii_case(name))
+                {
+                    let rp = schema[idx].root_page;
+                    schema.remove(idx);
+                    drop(schema);
+                    self.db.borrow_mut().destroy_table(rp);
+                }
+            }
+
+            result
         })();
         self.set_reject_mem_fallback(prev_reject);
         result
@@ -4871,7 +4906,7 @@ fn execute_with_materialized_views(
 
     /// Materialize sqlite_master/sqlite_schema as temporary in-memory tables,
     /// execute the query, then clean up.
-fn execute_with_materialized_sqlite_schema(
+    fn execute_with_materialized_sqlite_schema(
         &self,
         select: &SelectStatement,
         params: Option<&[SqliteValue]>,
@@ -4879,53 +4914,51 @@ fn execute_with_materialized_sqlite_schema(
         let prev_reject = *self.reject_mem_fallback.borrow();
         self.set_reject_mem_fallback(false);
         let result = (|| -> Result<Vec<Row>> {
+            let referenced = self.collect_sqlite_schema_references(select);
+            if referenced.is_empty() {
+                return self.execute_statement(Statement::Select(select.clone()), params);
+            }
 
-        let referenced = self.collect_sqlite_schema_references(select);
-        if referenced.is_empty() {
-            return self.execute_statement(Statement::Select(select.clone()), params);
-        }
+            let virtual_rows = self.build_sqlite_master_rows();
+            let virtual_columns = sqlite_master_column_infos();
+            let mut materialized: Vec<(String, i32)> = Vec::new();
 
-        let virtual_rows = self.build_sqlite_master_rows();
-        let virtual_columns = sqlite_master_column_infos();
-        let mut materialized: Vec<(String, i32)> = Vec::new();
+            for table_name in referenced {
+                let root_page = self.db.borrow_mut().create_table(virtual_columns.len());
+                self.schema.borrow_mut().push(TableSchema {
+                    name: table_name.clone(),
+                    root_page,
+                    columns: virtual_columns.clone(),
+                    indexes: Vec::new(),
+                    strict: false,
+                });
 
-        for table_name in referenced {
-            let root_page = self.db.borrow_mut().create_table(virtual_columns.len());
-            self.schema.borrow_mut().push(TableSchema {
-                name: table_name.clone(),
-                root_page,
-                columns: virtual_columns.clone(),
-                indexes: Vec::new(),
-                strict: false,
-            });
-
-            if let Some(table) = self.db.borrow_mut().get_table_mut(root_page) {
-                for (idx, row_values) in virtual_rows.iter().enumerate() {
-                    #[allow(clippy::cast_possible_wrap)]
-                    let rowid = (idx + 1) as i64;
-                    table.insert_row(rowid, row_values.clone());
+                if let Some(table) = self.db.borrow_mut().get_table_mut(root_page) {
+                    for (idx, row_values) in virtual_rows.iter().enumerate() {
+                        #[allow(clippy::cast_possible_wrap)]
+                        let rowid = (idx + 1) as i64;
+                        table.insert_row(rowid, row_values.clone());
+                    }
                 }
+
+                materialized.push((table_name, root_page));
             }
 
-            materialized.push((table_name, root_page));
-        }
+            let result = self.execute_statement(Statement::Select(select.clone()), params);
 
-        let result = self.execute_statement(Statement::Select(select.clone()), params);
-
-        for (name, root_page) in &materialized {
-            let mut schema = self.schema.borrow_mut();
-            if let Some(idx) = schema
-                .iter()
-                .position(|t| t.root_page == *root_page && t.name.eq_ignore_ascii_case(name))
-            {
-                schema.remove(idx);
+            for (name, root_page) in &materialized {
+                let mut schema = self.schema.borrow_mut();
+                if let Some(idx) = schema
+                    .iter()
+                    .position(|t| t.root_page == *root_page && t.name.eq_ignore_ascii_case(name))
+                {
+                    schema.remove(idx);
+                }
+                drop(schema);
+                self.db.borrow_mut().destroy_table(*root_page);
             }
-            drop(schema);
-            self.db.borrow_mut().destroy_table(*root_page);
-        }
 
-        result
-    
+            result
         })();
         self.set_reject_mem_fallback(prev_reject);
         result
@@ -6940,7 +6973,7 @@ fn execute_with_materialized_sqlite_schema(
             sort_rows_by_order_terms(&mut result, &select.order_by, &expanded_columns)?;
         }
         if let Some(ref limit_clause) = select.limit {
-            apply_limit_offset_postprocess(&mut result, limit_clause);
+            apply_limit_clause(&mut result, limit_clause);
         }
 
         Ok(result)
@@ -7367,7 +7400,7 @@ fn execute_with_materialized_sqlite_schema(
 
         // Post-process: LIMIT / OFFSET.
         if let Some(ref limit_clause) = select.limit {
-            apply_limit_offset_postprocess(&mut result, limit_clause);
+            apply_limit_clause(&mut result, limit_clause);
         }
 
         Ok(result)
@@ -7436,7 +7469,7 @@ fn execute_with_materialized_sqlite_schema(
 
         // Post-process: LIMIT / OFFSET.
         if let Some(ref limit_clause) = select.limit {
-            apply_limit_offset_postprocess(&mut result, limit_clause);
+            apply_limit_clause(&mut result, limit_clause);
         }
 
         Ok(result)
@@ -7445,7 +7478,7 @@ fn execute_with_materialized_sqlite_schema(
     /// Materialize CTEs as temporary in-memory tables, execute the main query
     /// with `with` stripped, then clean up the temporary tables.
     #[allow(clippy::too_many_lines)]
-fn execute_with_ctes(
+    fn execute_with_ctes(
         &self,
         select: &SelectStatement,
         params: Option<&[SqliteValue]>,
@@ -7453,90 +7486,91 @@ fn execute_with_ctes(
         let prev_reject = *self.reject_mem_fallback.borrow();
         self.set_reject_mem_fallback(false);
         let result = (|| -> Result<Vec<Row>> {
+            let with_clause = select
+                .with
+                .as_ref()
+                .ok_or_else(|| FrankenError::internal("expected CTE with clause"))?;
+            let is_recursive = with_clause.recursive;
+            let ctes = &with_clause.ctes;
+            let mut temp_names: Vec<String> = Vec::with_capacity(ctes.len());
+            for cte in ctes {
+                let cte_name = &cte.name;
+                let has_self_ref = is_recursive
+                    && cte
+                        .query
+                        .body
+                        .compounds
+                        .iter()
+                        .any(|(_, core)| select_core_references_table(core, cte_name));
 
-        let with_clause = select.with.as_ref().ok_or_else(|| FrankenError::internal("expected CTE with clause"))?;
-        let is_recursive = with_clause.recursive;
-        let ctes = &with_clause.ctes;
-        let mut temp_names: Vec<String> = Vec::with_capacity(ctes.len());
-        for cte in ctes {
-            let cte_name = &cte.name;
-            let has_self_ref = is_recursive
-                && cte
-                    .query
-                    .body
-                    .compounds
-                    .iter()
-                    .any(|(_, core)| select_core_references_table(core, cte_name));
-
-            if has_self_ref {
-                self.materialize_recursive_cte(cte, params, &mut temp_names)?;
-            } else {
-                // Non-recursive CTE: execute body, then create table.
-                let cte_rows =
-                    self.execute_statement(Statement::Select(cte.query.clone()), params)?;
-                let col_names: Vec<String> = if cte.columns.is_empty() {
-                    let inferred = infer_select_column_names(&cte.query);
-                    if inferred.is_empty() {
-                        let width = cte_rows.first().map_or(1, |r| r.values().len());
-                        (0..width).map(|i| format!("_c{i}")).collect()
-                    } else {
-                        inferred
-                    }
+                if has_self_ref {
+                    self.materialize_recursive_cte(cte, params, &mut temp_names)?;
                 } else {
-                    cte.columns.clone()
-                };
-                let col_infos: Vec<ColumnInfo> = col_names
-                    .iter()
-                    .map(|name| ColumnInfo {
-                        name: name.clone(),
-                        affinity: 'B',
-                        is_ipk: false,
-                        type_name: None,
-                        notnull: false,
-                        default_value: None,
-                        strict_type: None,
-                    })
-                    .collect();
-                let num_columns = col_infos.len();
-                let root_page = self.db.borrow_mut().create_table(num_columns);
-                self.schema.borrow_mut().push(TableSchema {
-                    name: cte_name.clone(),
-                    root_page,
-                    columns: col_infos,
-                    indexes: Vec::new(),
-                    strict: false,
-                });
-                temp_names.push(cte_name.clone());
-                for (i, row) in cte_rows.iter().enumerate() {
-                    let vals: Vec<SqliteValue> = row.values().to_vec();
-                    #[allow(clippy::cast_possible_wrap)]
-                    let rowid = (i + 1) as i64;
-                    let mut db = self.db.borrow_mut();
-                    if let Some(table) = db.get_table_mut(root_page) {
-                        table.insert_row(rowid, vals);
+                    // Non-recursive CTE: execute body, then create table.
+                    let cte_rows =
+                        self.execute_statement(Statement::Select(cte.query.clone()), params)?;
+                    let col_names: Vec<String> = if cte.columns.is_empty() {
+                        let inferred = infer_select_column_names(&cte.query);
+                        if inferred.is_empty() {
+                            let width = cte_rows.first().map_or(1, |r| r.values().len());
+                            (0..width).map(|i| format!("_c{i}")).collect()
+                        } else {
+                            inferred
+                        }
+                    } else {
+                        cte.columns.clone()
+                    };
+                    let col_infos: Vec<ColumnInfo> = col_names
+                        .iter()
+                        .map(|name| ColumnInfo {
+                            name: name.clone(),
+                            affinity: 'B',
+                            is_ipk: false,
+                            type_name: None,
+                            notnull: false,
+                            default_value: None,
+                            strict_type: None,
+                        })
+                        .collect();
+                    let num_columns = col_infos.len();
+                    let root_page = self.db.borrow_mut().create_table(num_columns);
+                    self.schema.borrow_mut().push(TableSchema {
+                        name: cte_name.clone(),
+                        root_page,
+                        columns: col_infos,
+                        indexes: Vec::new(),
+                        strict: false,
+                    });
+                    temp_names.push(cte_name.clone());
+                    for (i, row) in cte_rows.iter().enumerate() {
+                        let vals: Vec<SqliteValue> = row.values().to_vec();
+                        #[allow(clippy::cast_possible_wrap)]
+                        let rowid = (i + 1) as i64;
+                        let mut db = self.db.borrow_mut();
+                        if let Some(table) = db.get_table_mut(root_page) {
+                            table.insert_row(rowid, vals);
+                        }
                     }
                 }
             }
-        }
-        // Execute the main query with the WITH clause stripped.
-        let mut stripped = select.clone();
-        stripped.with = None;
-        let result = self.execute_statement(Statement::Select(stripped), params);
-        // Clean up temporary CTE tables.
-        for name in &temp_names {
-            let mut schema = self.schema.borrow_mut();
-            if let Some(idx) = schema
-                .iter()
-                .position(|t| t.name.eq_ignore_ascii_case(name))
-            {
-                let rp = schema[idx].root_page;
-                schema.remove(idx);
-                drop(schema);
-                self.db.borrow_mut().destroy_table(rp);
+            // Execute the main query with the WITH clause stripped.
+            let mut stripped = select.clone();
+            stripped.with = None;
+            let result = self.execute_statement(Statement::Select(stripped), params);
+            // Clean up temporary CTE tables.
+            for name in &temp_names {
+                let mut schema = self.schema.borrow_mut();
+                if let Some(idx) = schema
+                    .iter()
+                    .position(|t| t.name.eq_ignore_ascii_case(name))
+                {
+                    let rp = schema[idx].root_page;
+                    schema.remove(idx);
+                    drop(schema);
+                    self.db.borrow_mut().destroy_table(rp);
+                }
             }
-        }
-        result
-    
+            result
         })();
         self.set_reject_mem_fallback(prev_reject);
         result
@@ -7966,7 +8000,7 @@ fn execute_with_ctes(
 
         // ── 8. Post-process: LIMIT / OFFSET ──
         if let Some(ref limit_clause) = select.limit {
-            apply_limit_offset_postprocess(&mut result, limit_clause);
+            apply_limit_clause(&mut result, limit_clause);
         }
 
         Ok(result)
@@ -10334,47 +10368,6 @@ fn sort_rows_by_order_terms(
     });
 
     Ok(())
-}
-
-/// Apply LIMIT and OFFSET to a result set (GROUP BY post-processing).
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-fn apply_limit_offset_postprocess(rows: &mut Vec<Row>, limit_clause: &LimitClause) {
-    let limit_raw = match &limit_clause.limit {
-        Expr::Literal(Literal::Integer(n), _) => *n,
-        _ => return,
-    };
-    // SQLite: negative LIMIT means unlimited.
-    if limit_raw < 0 {
-        // Still apply offset if present.
-        let offset_val = limit_clause
-            .offset
-            .as_ref()
-            .and_then(|off| match off {
-                Expr::Literal(Literal::Integer(n), _) if *n > 0 => Some(*n as usize),
-                _ => None,
-            })
-            .unwrap_or(0);
-        if offset_val > 0 {
-            let start = offset_val.min(rows.len());
-            *rows = rows[start..].to_vec();
-        }
-        return;
-    }
-    #[allow(clippy::cast_sign_loss)]
-    let limit_val = limit_raw as usize;
-    // SQLite: negative OFFSET is treated as 0.
-    let offset_val = limit_clause
-        .offset
-        .as_ref()
-        .and_then(|off| match off {
-            Expr::Literal(Literal::Integer(n), _) if *n > 0 => Some(*n as usize),
-            _ => None,
-        })
-        .unwrap_or(0);
-
-    let start = offset_val.min(rows.len());
-    let end = (start + limit_val).min(rows.len());
-    *rows = rows[start..end].to_vec();
 }
 
 /// Map an AST type name to a codegen affinity character.
@@ -13926,7 +13919,7 @@ fn eval_scalar_fn(name: &str, args: &[SqliteValue]) -> SqliteValue {
                 SqliteValue::Null
             }
         }
-        "sqlite_version" => SqliteValue::Text("3.45.0".to_owned()),
+        "sqlite_version" => SqliteValue::Text("3.52.0".to_owned()),
         "last_insert_rowid" => SqliteValue::Integer(get_last_insert_rowid()),
         "changes" => SqliteValue::Integer(get_last_changes()),
         "total_changes" => {
@@ -25774,12 +25767,9 @@ mod pager_routing_tests {
     fn test_page_lock_contention_returns_busy() {
         // Two concurrent handles writing the same page: second acquire → Busy.
         use fsqlite_mvcc::{
-            ConcurrentRegistry, InProcessPageLockTable,
-            concurrent_write_page, MvccError,
+            ConcurrentRegistry, InProcessPageLockTable, MvccError, concurrent_write_page,
         };
-        use fsqlite_types::{
-            CommitSeq, PageData, PageNumber, SchemaEpoch, Snapshot,
-        };
+        use fsqlite_types::{CommitSeq, PageData, PageNumber, SchemaEpoch, Snapshot};
 
         let lock_table = InProcessPageLockTable::new();
         let mut registry = ConcurrentRegistry::new();
@@ -25809,19 +25799,18 @@ mod pager_routing_tests {
             page,
             PageData::from_vec(vec![0xBB; 4096]),
         );
-        assert_eq!(result2, Err(MvccError::Busy), "contending writer must get Busy");
+        assert_eq!(
+            result2,
+            Err(MvccError::Busy),
+            "contending writer must get Busy"
+        );
     }
 
     #[test]
     fn test_disjoint_pages_no_contention() {
         // Two handles writing different pages should both succeed (no Busy).
-        use fsqlite_mvcc::{
-            ConcurrentRegistry, InProcessPageLockTable,
-            concurrent_write_page,
-        };
-        use fsqlite_types::{
-            CommitSeq, PageData, PageNumber, SchemaEpoch, Snapshot,
-        };
+        use fsqlite_mvcc::{ConcurrentRegistry, InProcessPageLockTable, concurrent_write_page};
+        use fsqlite_types::{CommitSeq, PageData, PageNumber, SchemaEpoch, Snapshot};
 
         let lock_table = InProcessPageLockTable::new();
         let mut registry = ConcurrentRegistry::new();
@@ -25858,10 +25847,7 @@ mod pager_routing_tests {
         use fsqlite_mvcc::{FcwResult, MvccError};
         use fsqlite_types::PageNumber;
 
-        let pages = vec![
-            PageNumber::new(3).unwrap(),
-            PageNumber::new(7).unwrap(),
-        ];
+        let pages = vec![PageNumber::new(3).unwrap(), PageNumber::new(7).unwrap()];
         let fcw = FcwResult::Conflict {
             conflicting_pages: pages,
             conflicting_commit_seq: fsqlite_types::CommitSeq::new(42),
@@ -25888,10 +25874,7 @@ mod pager_routing_tests {
         let err = Connection::map_mvcc_commit_error(MvccError::BusySnapshot, FcwResult::Clean);
         match err {
             FrankenError::BusySnapshot { conflicting_pages } => {
-                assert!(
-                    conflicting_pages.is_empty(),
-                    "Clean FCW → empty page list"
-                );
+                assert!(conflicting_pages.is_empty(), "Clean FCW → empty page list");
             }
             other => panic!("expected BusySnapshot, got {other:?}"),
         }
@@ -26000,12 +25983,10 @@ mod pager_routing_tests {
     fn test_fcw_validates_write_set_against_commit_index() {
         // End-to-end FCW: publish a version after snapshot → FCW detects conflict.
         use fsqlite_mvcc::{
-            CommitIndex, ConcurrentRegistry, FcwResult,
-            InProcessPageLockTable, concurrent_write_page, validate_first_committer_wins,
+            CommitIndex, ConcurrentRegistry, FcwResult, InProcessPageLockTable,
+            concurrent_write_page, validate_first_committer_wins,
         };
-        use fsqlite_types::{
-            CommitSeq, PageData, PageNumber, SchemaEpoch, Snapshot,
-        };
+        use fsqlite_types::{CommitSeq, PageData, PageNumber, SchemaEpoch, Snapshot};
 
         let lock_table = InProcessPageLockTable::new();
         let mut registry = ConcurrentRegistry::new();
@@ -26057,12 +26038,10 @@ mod pager_routing_tests {
         // If no other transaction committed to the same pages between snapshot
         // and commit, FCW should report Clean.
         use fsqlite_mvcc::{
-            CommitIndex, ConcurrentRegistry, FcwResult,
-            InProcessPageLockTable, concurrent_write_page, validate_first_committer_wins,
+            CommitIndex, ConcurrentRegistry, FcwResult, InProcessPageLockTable,
+            concurrent_write_page, validate_first_committer_wins,
         };
-        use fsqlite_types::{
-            CommitSeq, PageData, PageNumber, SchemaEpoch, Snapshot,
-        };
+        use fsqlite_types::{CommitSeq, PageData, PageNumber, SchemaEpoch, Snapshot};
 
         let lock_table = InProcessPageLockTable::new();
         let mut registry = ConcurrentRegistry::new();
@@ -26104,13 +26083,15 @@ mod pager_routing_tests {
         // PRAGMA fsqlite.concurrent_mode = OFF/ON toggles the default.
         let conn = Connection::open(":memory:").unwrap();
 
-        conn.execute("PRAGMA fsqlite.concurrent_mode = OFF;").unwrap();
+        conn.execute("PRAGMA fsqlite.concurrent_mode = OFF;")
+            .unwrap();
         assert!(
             !conn.is_concurrent_mode_default(),
             "concurrent mode must be OFF after pragma"
         );
 
-        conn.execute("PRAGMA fsqlite.concurrent_mode = ON;").unwrap();
+        conn.execute("PRAGMA fsqlite.concurrent_mode = ON;")
+            .unwrap();
         assert!(
             conn.is_concurrent_mode_default(),
             "concurrent mode must be ON after pragma"
@@ -26140,15 +26121,23 @@ mod pager_routing_tests {
         conn2.execute("BEGIN;").unwrap();
 
         // Both read the current value.
-        let _rows1 = conn1.query("SELECT val FROM conflict_tbl WHERE id = 1;").unwrap();
-        let _rows2 = conn2.query("SELECT val FROM conflict_tbl WHERE id = 1;").unwrap();
+        let _rows1 = conn1
+            .query("SELECT val FROM conflict_tbl WHERE id = 1;")
+            .unwrap();
+        let _rows2 = conn2
+            .query("SELECT val FROM conflict_tbl WHERE id = 1;")
+            .unwrap();
 
         // conn1 writes and commits first.
-        conn1.execute("UPDATE conflict_tbl SET val = 100 WHERE id = 1;").unwrap();
+        conn1
+            .execute("UPDATE conflict_tbl SET val = 100 WHERE id = 1;")
+            .unwrap();
         conn1.execute("COMMIT;").unwrap();
 
         // conn2 writes the same row and tries to commit — should fail.
-        conn2.execute("UPDATE conflict_tbl SET val = 200 WHERE id = 1;").unwrap();
+        conn2
+            .execute("UPDATE conflict_tbl SET val = 200 WHERE id = 1;")
+            .unwrap();
         let commit_result = conn2.execute("COMMIT;");
 
         match commit_result {
@@ -26221,7 +26210,8 @@ mod pager_routing_tests {
     fn test_ratchet_pragma_off_disables_promotion() {
         // When explicitly disabled, BEGIN should not promote to concurrent.
         let conn = Connection::open(":memory:").unwrap();
-        conn.execute("PRAGMA fsqlite.concurrent_mode = OFF;").unwrap();
+        conn.execute("PRAGMA fsqlite.concurrent_mode = OFF;")
+            .unwrap();
         assert!(
             !conn.is_concurrent_mode_default(),
             "RATCHET: pragma OFF must disable concurrent default"
@@ -26241,10 +26231,12 @@ mod pager_routing_tests {
     fn test_ratchet_pragma_on_restores_promotion() {
         // Toggle OFF then ON: promotion must be restored.
         let conn = Connection::open(":memory:").unwrap();
-        conn.execute("PRAGMA fsqlite.concurrent_mode = OFF;").unwrap();
+        conn.execute("PRAGMA fsqlite.concurrent_mode = OFF;")
+            .unwrap();
         assert!(!conn.is_concurrent_mode_default());
 
-        conn.execute("PRAGMA fsqlite.concurrent_mode = ON;").unwrap();
+        conn.execute("PRAGMA fsqlite.concurrent_mode = ON;")
+            .unwrap();
         assert!(
             conn.is_concurrent_mode_default(),
             "RATCHET: pragma ON must restore concurrent default"
@@ -26257,7 +26249,9 @@ mod pager_routing_tests {
         let conn1 = Connection::open(":memory:").unwrap();
         let conn2 = Connection::open(":memory:").unwrap();
 
-        conn1.execute("PRAGMA fsqlite.concurrent_mode = OFF;").unwrap();
+        conn1
+            .execute("PRAGMA fsqlite.concurrent_mode = OFF;")
+            .unwrap();
         assert!(!conn1.is_concurrent_mode_default());
         assert!(
             conn2.is_concurrent_mode_default(),
@@ -26373,10 +26367,8 @@ mod pager_routing_tests {
 
         conn.execute("CREATE TABLE z1(id INTEGER PRIMARY KEY, name TEXT);")
             .unwrap();
-        conn.execute("INSERT INTO z1 VALUES (1, 'alpha');")
-            .unwrap();
-        conn.execute("INSERT INTO z1 VALUES (2, 'beta');")
-            .unwrap();
+        conn.execute("INSERT INTO z1 VALUES (1, 'alpha');").unwrap();
+        conn.execute("INSERT INTO z1 VALUES (2, 'beta');").unwrap();
 
         let rows = conn.query("SELECT id, name FROM z1 ORDER BY id;").unwrap();
         assert_eq!(rows.len(), 2);
@@ -26408,9 +26400,7 @@ mod pager_routing_tests {
         conn.execute("INSERT INTO z1f VALUES (10, 100);").unwrap();
         conn.execute("INSERT INTO z1f VALUES (20, 200);").unwrap();
 
-        let rows = conn
-            .query("SELECT id, val FROM z1f ORDER BY id;")
-            .unwrap();
+        let rows = conn.query("SELECT id, val FROM z1f ORDER BY id;").unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].values()[1], SqliteValue::Integer(100));
         assert_eq!(rows[1].values()[1], SqliteValue::Integer(200));
@@ -26447,9 +26437,7 @@ mod pager_routing_tests {
         {
             let conn2 = Connection::open(&path).unwrap();
             assert!(*conn2.reject_mem_fallback.borrow());
-            let rows = conn2
-                .query("SELECT text FROM z1p WHERE id = 1;")
-                .unwrap();
+            let rows = conn2.query("SELECT text FROM z1p WHERE id = 1;").unwrap();
             assert_eq!(rows.len(), 1);
             assert_eq!(
                 rows[0].values()[0],
@@ -26526,10 +26514,7 @@ mod pager_routing_tests {
         assert_eq!(rows[0].values()[0], SqliteValue::Integer(3));
 
         let rows = conn.query("SELECT 'hello' || ' world';").unwrap();
-        assert_eq!(
-            rows[0].values()[0],
-            SqliteValue::Text("hello world".into())
-        );
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("hello world".into()));
     }
 
     #[test]
@@ -26539,11 +26524,7 @@ mod pager_routing_tests {
         assert_eq!(mem_conn.pager_backend_kind(), "memory");
 
         let dir = tempfile::tempdir().unwrap();
-        let path = dir
-            .path()
-            .join("z1_kind.db")
-            .to_string_lossy()
-            .to_string();
+        let path = dir.path().join("z1_kind.db").to_string_lossy().to_string();
         let file_conn = Connection::open(&path).unwrap();
         assert_eq!(file_conn.pager_backend_kind(), "unix");
     }
@@ -26572,11 +26553,7 @@ mod pager_routing_tests {
     fn test_zjisk1_file_backed_concurrent_writers_parity_cert() {
         // Multiple concurrent writers on a file-backed DB with parity-cert ON.
         let dir = tempfile::tempdir().unwrap();
-        let db_path = dir
-            .path()
-            .join("z1_multi.db")
-            .to_string_lossy()
-            .to_string();
+        let db_path = dir.path().join("z1_multi.db").to_string_lossy().to_string();
 
         {
             let setup = Connection::open(&db_path).unwrap();
@@ -26600,15 +26577,11 @@ mod pager_routing_tests {
                     bar.wait();
                     for i in 0..5 {
                         let rowid = writer_id * 100 + i;
-                        let sql =
-                            format!("INSERT INTO z1m VALUES ({rowid}, {writer_id});");
+                        let sql = format!("INSERT INTO z1m VALUES ({rowid}, {writer_id});");
                         loop {
                             match conn.execute(&sql) {
                                 Ok(_) => {
-                                    count.fetch_add(
-                                        1,
-                                        std::sync::atomic::Ordering::Relaxed,
-                                    );
+                                    count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     break;
                                 }
                                 Err(e) if e.is_transient() => {}

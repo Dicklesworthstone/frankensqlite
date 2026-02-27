@@ -270,7 +270,7 @@ fn posix_lock(file: &impl AsFd, lock_type: impl Into<i32>, start: u64, len: u64)
 
 /// Release a POSIX advisory lock.
 fn posix_unlock(file: &impl AsFd, start: u64, len: u64) -> Result<()> {
-    let ok = posix_lock(file, i32::from(libc::F_UNLCK), start, len)?;
+    let ok = posix_lock(file, libc::F_UNLCK, start, len)?;
     debug_assert!(ok, "F_UNLCK should never fail with EAGAIN");
     Ok(())
 }
@@ -279,7 +279,12 @@ fn posix_unlock(file: &impl AsFd, start: u64, len: u64) -> Result<()> {
 ///
 /// Uses `fcntl(F_GETLK)` and returns the kernel-filled `flock`.
 #[allow(clippy::cast_possible_wrap)]
-fn posix_getlk(file: &impl AsFd, lock_type: impl Into<i32>, start: u64, len: u64) -> Result<libc::flock> {
+fn posix_getlk(
+    file: &impl AsFd,
+    lock_type: impl Into<i32>,
+    start: u64,
+    len: u64,
+) -> Result<libc::flock> {
     let lock_type_i32: i32 = lock_type.into();
     #[allow(clippy::cast_possible_truncation)]
     let lock_type_short = lock_type_i32 as libc::c_short;
@@ -349,13 +354,13 @@ impl InodeTable {
 
     /// Get the inode info for the given key if present.
     fn get(&self, key: InodeKey) -> Option<Arc<Mutex<InodeInfo>>> {
-        let map = self.map.lock().expect("inode table lock poisoned");
+        let map = self.map.lock().unwrap_or_else(|e| e.into_inner());
         map.get(&key).cloned()
     }
 
     /// Get or create the inode info for the given key.
     fn get_or_create(&self, key: InodeKey, file: Arc<File>) -> Arc<Mutex<InodeInfo>> {
-        let mut map = self.map.lock().expect("inode table lock poisoned");
+        let mut map = self.map.lock().unwrap_or_else(|e| e.into_inner());
         Arc::clone(
             map.entry(key)
                 .or_insert_with(|| Arc::new(Mutex::new(InodeInfo::new(file)))),
@@ -364,9 +369,9 @@ impl InodeTable {
 
     /// Remove the inode entry if its refcount reaches zero.
     fn maybe_remove(&self, key: InodeKey) {
-        let mut map = self.map.lock().expect("inode table lock poisoned");
+        let mut map = self.map.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(info) = map.get(&key) {
-            let guard = info.lock().expect("inode info lock poisoned");
+            let guard = info.lock().unwrap_or_else(|e| e.into_inner());
             if guard.n_ref == 0 {
                 drop(guard);
                 map.remove(&key);
@@ -439,7 +444,7 @@ impl ShmTable {
         // fd to an already-locked `*-shm` file, we can drop all locks held by this
         // process on that file. To avoid that, only ever open `*-shm` while holding
         // this mutex and only when we're definitely creating the canonical entry.
-        let mut map = self.map.lock().expect("shm table lock poisoned");
+        let mut map = self.map.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(existing) = map.get(&path) {
             return Ok(Arc::clone(existing));
         }
@@ -459,9 +464,9 @@ impl ShmTable {
     }
 
     fn remove_if_orphaned(&self, path: &Path) {
-        let mut map = self.map.lock().expect("shm table lock poisoned");
+        let mut map = self.map.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(entry) = map.get(path) {
-            let info = entry.lock().expect("shm info lock poisoned");
+            let info = entry.lock().unwrap_or_else(|e| e.into_inner());
             if info.owner_refs.is_empty() {
                 drop(info);
                 map.remove(path);
@@ -544,7 +549,7 @@ impl Vfs for UnixVfs {
             if let Some(inode_key) = inode_key_from_path(&resolved)? {
                 if let Some(inode_info) = global_inode_table().get(inode_key) {
                     let file = {
-                        let mut info = inode_info.lock().expect("inode info lock poisoned");
+                        let mut info = inode_info.lock().unwrap_or_else(|e| e.into_inner());
                         info.n_ref += 1;
                         Arc::clone(&info.file)
                     };
@@ -596,7 +601,7 @@ impl Vfs for UnixVfs {
         let inode_key = inode_key_from_file(opened.as_ref())?;
         let inode_info = global_inode_table().get_or_create(inode_key, Arc::clone(&opened));
         let file = {
-            let mut info = inode_info.lock().expect("inode info lock poisoned");
+            let mut info = inode_info.lock().unwrap_or_else(|e| e.into_inner());
             info.n_ref += 1;
             Arc::clone(&info.file)
         };
@@ -743,7 +748,7 @@ impl UnixFile {
 
         let info = global_shm_table().get_or_create(self.shm_path.clone())?;
         {
-            let mut guard = info.lock().expect("shm info lock poisoned");
+            let mut guard = info.lock().unwrap_or_else(|e| e.into_inner());
             *guard.owner_refs.entry(self.shm_owner_id).or_insert(0) += 1;
         }
         self.shm_info = Some(Arc::clone(&info));
@@ -759,7 +764,7 @@ impl UnixFile {
         };
 
         {
-            let mut info = info_arc.lock().expect("shm info lock poisoned");
+            let mut info = info_arc.lock().unwrap_or_else(|e| e.into_inner());
             let mut first_error: Option<FrankenError> = None;
             let shm_file = Arc::clone(&info.file);
 
@@ -1224,7 +1229,7 @@ impl UnixFile {
 
         let shm_info = self.ensure_shm_info()?;
         let needs_update = {
-            let info = shm_info.lock().expect("shm info lock poisoned");
+            let info = shm_info.lock().unwrap_or_else(|e| e.into_inner());
             let slot_idx = usize::try_from(reader_slot).expect("reader slot fits usize");
             info.read_marks[slot_idx] != snapshot_mark
         };
@@ -1237,7 +1242,7 @@ impl UnixFile {
         // Legacy protocol: EXCLUSIVE only for aReadMark mutation, then downgrade to SHARED.
         self.shm_lock(cx, slot, 1, SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE)?;
         {
-            let mut info = shm_info.lock().expect("shm info lock poisoned");
+            let mut info = shm_info.lock().unwrap_or_else(|e| e.into_inner());
             let slot_idx = usize::try_from(reader_slot).expect("reader slot fits usize");
             info.read_marks[slot_idx] = snapshot_mark;
         }
@@ -1315,14 +1320,14 @@ impl UnixFile {
     fn compat_shm_hold_dms_shared(&mut self, cx: &Cx) -> Result<()> {
         checkpoint_or_abort(cx)?;
         let shm_info = self.ensure_shm_info()?;
-        let mut info = shm_info.lock().expect("shm info lock poisoned");
+        let mut info = shm_info.lock().unwrap_or_else(|e| e.into_inner());
         self.acquire_shm_dms_shared(&mut info)
     }
 
     fn compat_shm_release_dms_shared(&mut self, cx: &Cx) -> Result<()> {
         checkpoint_or_abort(cx)?;
         let shm_info = self.ensure_shm_info()?;
-        let mut info = shm_info.lock().expect("shm info lock poisoned");
+        let mut info = shm_info.lock().unwrap_or_else(|e| e.into_inner());
         self.release_shm_dms_shared(&mut info)
     }
 
@@ -1334,7 +1339,7 @@ impl UnixFile {
         // grab WAL_WRITE_LOCK just to initialize `*-shm`.
         let shm_info = self.ensure_shm_info()?;
         let shm_file = {
-            let info = shm_info.lock().expect("shm info lock poisoned");
+            let info = shm_info.lock().unwrap_or_else(|e| e.into_inner());
             Arc::clone(&info.file)
         };
 
@@ -1412,7 +1417,7 @@ impl UnixFile {
     pub fn compat_read_marks(&self) -> Option<[u32; WAL_NREADER_USIZE]> {
         self.shm_info
             .as_ref()
-            .map(|info| info.lock().expect("shm info lock poisoned").read_marks())
+            .map(|info| info.lock().unwrap_or_else(|e| e.into_inner()).read_marks())
     }
 }
 
@@ -1430,7 +1435,7 @@ impl VfsFile for UnixFile {
 
         // Decrement refcount.
         {
-            let mut info = self.inode_info.lock().expect("inode info lock poisoned");
+            let mut info = self.inode_info.lock().unwrap_or_else(|e| e.into_inner());
             info.n_ref = info.n_ref.saturating_sub(1);
         }
         global_inode_table().maybe_remove(self.inode_key);
@@ -1542,7 +1547,7 @@ impl VfsFile for UnixFile {
         }
 
         let shm_info = self.ensure_shm_info()?;
-        let mut info = shm_info.lock().expect("shm info lock poisoned");
+        let mut info = shm_info.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(existing) = info.regions.get(&region).cloned() {
             let requested_size = usize::try_from(size).map_err(|_| FrankenError::LockFailed {
                 detail: format!("shm_map size too large: {size}"),
@@ -1630,7 +1635,7 @@ impl VfsFile for UnixFile {
         }
 
         let shm_info = self.ensure_shm_info()?;
-        let mut info = shm_info.lock().expect("shm info lock poisoned");
+        let mut info = shm_info.lock().unwrap_or_else(|e| e.into_inner());
 
         if lock_requested {
             let mut acquired = Vec::new();
@@ -1717,7 +1722,7 @@ mod tests {
 
         if let Ok(shm_info) = coordinator.ensure_shm_info() {
             let shm_file = {
-                let info = shm_info.lock().expect("shm info lock poisoned");
+                let info = shm_info.lock().unwrap_or_else(|e| e.into_inner());
                 Arc::clone(&info.file)
             };
             let mut header = [0_u8; SQLITE_WAL_SHM_HEADER_BYTES];

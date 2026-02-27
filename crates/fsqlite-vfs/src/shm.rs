@@ -114,7 +114,7 @@ impl ShmRegion {
     #[must_use]
     pub fn lock(&self) -> ShmRegionGuard<'_> {
         ShmRegionGuard {
-            guard: self.data.lock().expect("shm region mutex poisoned"),
+            guard: self.data.lock().unwrap_or_else(|e| e.into_inner()),
         }
     }
 

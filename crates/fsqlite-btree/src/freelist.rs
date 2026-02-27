@@ -90,10 +90,11 @@ impl FreelistTrunk {
         let next = self.next_trunk.map_or(0u32, PageNumber::get);
         page[0..4].copy_from_slice(&next.to_be_bytes());
 
-        let count = self.leaf_pages.len() as u32;
+        let max_entries = (page.len() as u32 / 4).saturating_sub(2);
+        let count = (self.leaf_pages.len() as u32).min(max_entries);
         page[4..8].copy_from_slice(&count.to_be_bytes());
 
-        for (i, &pgno) in self.leaf_pages.iter().enumerate() {
+        for (i, &pgno) in self.leaf_pages.iter().take(count as usize).enumerate() {
             let offset = 8 + i * 4;
             page[offset..offset + 4].copy_from_slice(&pgno.get().to_be_bytes());
         }

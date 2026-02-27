@@ -347,6 +347,7 @@ impl Parser {
             let col_name = match &col_tok.kind {
                 TokenKind::Id(c) | TokenKind::QuotedId(c, _) => c.clone(),
                 TokenKind::Star => "*".to_owned(),
+                k if is_nonreserved_kw(k) => kw_to_str(k),
                 _ => {
                     return Err(ParseError::at(
                         format!("expected column name after '.', got {:?}", col_tok.kind),

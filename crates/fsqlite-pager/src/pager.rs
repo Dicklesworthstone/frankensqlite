@@ -3248,11 +3248,13 @@ mod tests {
         for (p, first_byte, last_byte) in &pages {
             let data = txn2.get_page(&cx, *p).unwrap();
             assert_eq!(
-                data.as_ref()[0], *first_byte,
+                data.as_ref()[0],
+                *first_byte,
                 "bead_id={BEAD_INV} inv=dirty_page_committed p={p}"
             );
             assert_eq!(
-                data.as_ref()[ps - 1], *last_byte,
+                data.as_ref()[ps - 1],
+                *last_byte,
                 "bead_id={BEAD_INV} inv=dirty_page_last_byte p={p}"
             );
         }
@@ -3689,7 +3691,8 @@ mod tests {
         for (p, expected) in &pages {
             let data = txn2.get_page(&cx, *p).unwrap();
             assert_eq!(
-                data.as_ref()[0], *expected,
+                data.as_ref()[0],
+                *expected,
                 "bead_id={BEAD_E2E} case=pressure_content page={p}"
             );
         }
@@ -3742,17 +3745,12 @@ mod tests {
             // 2 cold accesses (rotating through cold pages).
             let cold_idx = (round as usize * 2) % 45;
             let _ = txn2.get_page(&cx, pages[5 + cold_idx]).unwrap();
-            let _ = txn2
-                .get_page(&cx, pages[5 + (cold_idx + 1) % 45])
-                .unwrap();
+            let _ = txn2.get_page(&cx, pages[5 + (cold_idx + 1) % 45]).unwrap();
         }
 
         let metrics = pager.cache_metrics_snapshot().unwrap();
         let total = metrics.total_accesses();
-        assert_eq!(
-            total, 70,
-            "bead_id={BEAD_E2E} case=hot_cold_total_accesses"
-        );
+        assert_eq!(total, 70, "bead_id={BEAD_E2E} case=hot_cold_total_accesses");
         // Hot pages should achieve high hit rate after first access.
         assert!(
             metrics.hit_rate_percent() > 50.0,
@@ -3936,7 +3934,8 @@ mod tests {
         for (i, &p) in pages.iter().enumerate() {
             let data = txn.get_page(&cx, p).unwrap();
             assert_eq!(
-                data.as_ref()[0], i as u8,
+                data.as_ref()[0],
+                i as u8,
                 "bead_id={BEAD_E2E} case=savepoint_heavy_restored page={p}"
             );
         }
@@ -3992,7 +3991,11 @@ mod tests {
             let inner = pager.inner.lock().unwrap();
             inner.db_size
         };
-        assert_eq!(final_db_size, initial_db_size + 1, "DB size should only grow by 1 page (the one currently allocated)");
+        assert_eq!(
+            final_db_size,
+            initial_db_size + 1,
+            "DB size should only grow by 1 page (the one currently allocated)"
+        );
     }
 
     #[test]

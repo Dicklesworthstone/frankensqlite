@@ -796,7 +796,7 @@ mod tests {
     fn test_lock_mutex_or_io_handles_poison_without_panicking() {
         let mutex = Mutex::new(7_u8);
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = mutex.lock().expect("lock should succeed");
+            let _guard = mutex.lock().unwrap_or_else(|e| e.into_inner());
             panic!("poison mutex");
         }));
         let err = lock_mutex_or_io(&mutex).expect_err("lock should fail");
@@ -820,7 +820,7 @@ mod tests {
 
         if let Some(ring_mutex) = file.runtime.ring.as_ref() {
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let _guard = ring_mutex.lock().expect("lock should succeed");
+                let _guard = ring_mutex.lock().unwrap_or_else(|e| e.into_inner());
                 panic!("poison io_uring runtime lock");
             }));
         }

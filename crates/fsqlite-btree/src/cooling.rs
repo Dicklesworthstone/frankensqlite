@@ -323,7 +323,10 @@ impl CoolingStateMachine {
     /// Return the number of pinned root pages.
     #[must_use]
     pub fn pinned_count(&self) -> usize {
-        self.pinned_roots.lock().unwrap_or_else(|e| e.into_inner()).len()
+        self.pinned_roots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
     }
 }
 

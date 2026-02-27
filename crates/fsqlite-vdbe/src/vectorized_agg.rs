@@ -175,10 +175,8 @@ pub fn aggregate_batch_hash(
         hash_batch_columns(batch, group_by_columns)?
     };
 
-    // Map from (hash, group_key_values) -> (group_index, accumulators).
-    #[allow(clippy::type_complexity)]
-    let mut group_map: HashMap<u64, Vec<(Vec<GroupKeyValue>, Vec<Accumulator>)>> = HashMap::new();
-    let mut group_order: Vec<u64> = Vec::new(); // Preserve insertion order for determinism.
+    // Map from hash -> list of (group_key, global_index_into_ordered)
+    let mut group_map: HashMap<u64, Vec<(Vec<GroupKeyValue>, usize)>> = HashMap::new();
     let mut group_keys_ordered: Vec<Vec<GroupKeyValue>> = Vec::new();
     let mut all_accumulators: Vec<Vec<Accumulator>> = Vec::new();
 
@@ -195,33 +193,25 @@ pub fn aggregate_batch_hash(
 
         // Look up or insert group.
         let bucket = group_map.entry(hash).or_default();
-        let group_idx = bucket
-            .iter()
-            .position(|(k, _)| *k == key)
-            .unwrap_or_else(|| {
+        let ordered_idx = match bucket.iter().find(|(k, _)| *k == key) {
+            Some((_, idx)) => *idx,
+            None => {
                 let accs: Vec<Accumulator> =
                     agg_specs.iter().map(|s| Accumulator::new(s.op)).collect();
-                bucket.push((key.clone(), accs.clone()));
-                group_order.push(hash);
-                group_keys_ordered.push(key.clone());
+                let idx = all_accumulators.len();
+                bucket.push((key.clone(), idx));
+                group_keys_ordered.push(key);
                 all_accumulators.push(accs);
-                bucket.len() - 1
-            });
+                idx
+            }
+        };
 
         // Update accumulators.
-        let accs = &mut bucket[group_idx].1;
-        // Also update the ordered copy.
-        let ordered_idx = group_order
-            .iter()
-            .zip(group_keys_ordered.iter())
-            .position(|(&h, k)| h == hash && *k == key)
-            .expect("group must exist");
-        let ordered_accs = &mut all_accumulators[ordered_idx];
+        let accs = &mut all_accumulators[ordered_idx];
 
         for (agg_idx, spec) in agg_specs.iter().enumerate() {
             if spec.op == AggregateOp::CountStar {
                 accs[agg_idx].update_count_star();
-                ordered_accs[agg_idx].update_count_star();
             } else {
                 let col = batch
                     .columns()
@@ -231,7 +221,6 @@ pub fn aggregate_batch_hash(
                     continue;
                 }
                 update_accumulator(&mut accs[agg_idx], &col.data, row);
-                update_accumulator(&mut ordered_accs[agg_idx], &col.data, row);
             }
         }
     }

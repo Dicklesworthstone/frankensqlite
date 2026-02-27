@@ -3235,8 +3235,15 @@ impl VdbeEngine {
                         if let Some(expected) = strict_type {
                             let checked =
                                 value.clone().validate_strict(expected).map_err(|err| {
+                                    tracing::warn!(
+                                        register = reg,
+                                        expected = ?expected,
+                                        actual = ?err.actual,
+                                        value = ?value,
+                                        "STRICT type violation"
+                                    );
                                     FrankenError::Internal(format!(
-                                        "STRICT type check failed at register {reg}: {err}"
+                                        "SQLITE_CONSTRAINT_DATATYPE: STRICT type check failed at register {reg}: {err}"
                                     ))
                                 })?;
                             self.set_reg(reg, checked);
@@ -3656,7 +3663,7 @@ impl VdbeEngine {
 
     #[allow(clippy::cast_sign_loss)]
     fn set_reg(&mut self, r: i32, val: SqliteValue) {
-        if r < 0 || r > 65535 {
+        if !(0..=65535).contains(&r) {
             // Drop out-of-bounds register writes to prevent OOM.
             // SQLite defines a max register limit (SQLITE_MAX_COLUMN + some overhead).
             return;
@@ -6704,6 +6711,31 @@ mod tests {
             b.resolve_label(end);
         });
         assert_eq!(rows[0], vec![SqliteValue::Integer(42)]);
+    }
+
+    #[test]
+    fn test_typecheck_reports_sqlite_constraint_datatype_marker() {
+        let mut b = ProgramBuilder::new();
+        let end = b.emit_label();
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+        let r = b.alloc_reg();
+        b.emit_op(Opcode::String8, 0, r, 0, P4::Str("bad".to_owned()), 0);
+        b.emit_op(Opcode::TypeCheck, r, 1, 0, P4::Affinity("I".to_owned()), 0);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end);
+
+        let prog = b.finish().expect("program should build");
+        let mut engine = VdbeEngine::new(prog.register_count());
+        let err = engine
+            .execute(&prog)
+            .expect_err("typecheck should fail for TEXT into INTEGER STRICT slot");
+        let err_text = err.to_string();
+        assert!(
+            matches!(&err, FrankenError::Internal(msg) if msg.contains("SQLITE_CONSTRAINT_DATATYPE")
+                && msg.contains("STRICT type check failed")
+                && msg.to_ascii_lowercase().contains("cannot store")),
+            "unexpected strict typecheck error: {err_text}"
+        );
     }
 
     // ── Miscellaneous Opcodes ──────────────────────────────────────────

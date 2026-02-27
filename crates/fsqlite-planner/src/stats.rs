@@ -124,17 +124,27 @@ fn interpolate_position(min: &SqliteValue, max: &SqliteValue, val: &SqliteValue)
             if max_i <= min_i {
                 return 0.5;
             }
-            let range = (*max_i - *min_i) as f64;
-            let offset = (*val_i - *min_i) as f64;
-            (offset / range).clamp(0.0, 1.0)
+            let range = *max_i as f64 - *min_i as f64;
+            let offset = *val_i as f64 - *min_i as f64;
+            let fraction = offset / range;
+            if fraction.is_nan() {
+                0.5
+            } else {
+                fraction.clamp(0.0, 1.0)
+            }
         }
         (SqliteValue::Float(min_f), SqliteValue::Float(max_f), SqliteValue::Float(val_f)) => {
-            if max_f <= min_f {
+            if max_f <= min_f || min_f.is_nan() || max_f.is_nan() || val_f.is_nan() {
                 return 0.5;
             }
             let range = max_f - min_f;
             let offset = val_f - min_f;
-            (offset / range).clamp(0.0, 1.0)
+            let fraction = offset / range;
+            if fraction.is_nan() {
+                0.5
+            } else {
+                fraction.clamp(0.0, 1.0)
+            }
         }
         (SqliteValue::Text(min_s), SqliteValue::Text(max_s), SqliteValue::Text(val_s)) => {
             if max_s <= min_s {
@@ -264,7 +274,16 @@ impl ColumnStats {
             _ => non_null_count * 0.1, // Fallback heuristic
         };
 
-        (estimated_matches / self.table_row_count as f64).clamp(0.0, 1.0)
+        if self.table_row_count == 0 {
+            return 0.0;
+        }
+
+        let fraction = estimated_matches / self.table_row_count as f64;
+        if fraction.is_nan() {
+            0.0
+        } else {
+            fraction.clamp(0.0, 1.0)
+        }
     }
 }
 

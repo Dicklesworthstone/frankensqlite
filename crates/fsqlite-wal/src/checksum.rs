@@ -2290,9 +2290,7 @@ mod tests {
         let mut header_buf = [0u8; WAL_HEADER_SIZE];
         header_buf[..4].copy_from_slice(&WAL_MAGIC_LE.to_be_bytes());
         header_buf[4..8].copy_from_slice(&WAL_FORMAT_VERSION.to_be_bytes());
-        header_buf[8..12].copy_from_slice(
-            &u32::try_from(PAGE_SIZE).expect("fits").to_be_bytes(),
-        );
+        header_buf[8..12].copy_from_slice(&u32::try_from(PAGE_SIZE).expect("fits").to_be_bytes());
         write_wal_header_salts(&mut header_buf, salts).expect("write salts");
         write_wal_header_checksum(&mut header_buf, false).expect("write hdr cksum");
 
@@ -2306,8 +2304,7 @@ mod tests {
             let mut frame = vec![0u8; frame_size];
             frame[..4].copy_from_slice(&pg.to_be_bytes());
             frame[4..8].copy_from_slice(&pg.to_be_bytes()); // commit
-            write_wal_frame_salts(&mut frame[..WAL_FRAME_HEADER_SIZE], salts)
-                .expect("frame salts");
+            write_wal_frame_salts(&mut frame[..WAL_FRAME_HEADER_SIZE], salts).expect("frame salts");
             for (off, byte) in frame[WAL_FRAME_HEADER_SIZE..].iter_mut().enumerate() {
                 let r = u8::try_from(off % 251).unwrap();
                 let s = u8::try_from(i % 251).unwrap();
@@ -2338,16 +2335,13 @@ mod tests {
         wal[0] ^= 0xFF;
         let v = validate_wal_chain(&wal, PAGE_SIZE, false);
         // Header corruption should error or report HeaderChecksumMismatch.
-        match v {
-            Ok(val) => {
-                assert!(!val.header_valid);
-                assert_eq!(
-                    val.reason,
-                    Some(WalChainInvalidReason::HeaderChecksumMismatch)
-                );
-            }
-            Err(_) => {} // Also acceptable: outright error
-        }
+        if let Ok(val) = v {
+            assert!(!val.header_valid);
+            assert_eq!(
+                val.reason,
+                Some(WalChainInvalidReason::HeaderChecksumMismatch)
+            );
+        } // Also acceptable: outright error
     }
 
     #[test]
@@ -2361,10 +2355,7 @@ mod tests {
         assert!(!v.valid);
         assert_eq!(v.valid_frames, 2, "first 2 frames should survive");
         assert_eq!(v.first_invalid_frame, Some(2));
-        assert_eq!(
-            v.reason,
-            Some(WalChainInvalidReason::FrameChecksumMismatch)
-        );
+        assert_eq!(v.reason, Some(WalChainInvalidReason::FrameChecksumMismatch));
     }
 
     #[test]
@@ -2375,7 +2366,10 @@ mod tests {
         let cut_at = WAL_HEADER_SIZE + 3 * frame_size + frame_size / 2;
         let torn = &wal[..cut_at];
         let v = validate_wal_chain(torn, PAGE_SIZE, false).expect("validate");
-        assert_eq!(v.valid_frames, 3, "only 3 complete frames before truncation");
+        assert_eq!(
+            v.valid_frames, 3,
+            "only 3 complete frames before truncation"
+        );
         assert_eq!(v.reason, Some(WalChainInvalidReason::TruncatedFrame));
     }
 
@@ -2411,10 +2405,7 @@ mod tests {
         }
         let v = validate_wal_chain(&wal, PAGE_SIZE, false).expect("validate");
         assert_eq!(v.valid_frames, 0, "frame 0 corrupted so 0 valid frames");
-        assert_eq!(
-            v.reason,
-            Some(WalChainInvalidReason::FrameChecksumMismatch)
-        );
+        assert_eq!(v.reason, Some(WalChainInvalidReason::FrameChecksumMismatch));
     }
 
     #[test]
@@ -2552,16 +2543,14 @@ mod tests {
 
     #[test]
     fn test_recover_decision_no_payload_truncates() {
-        let decision =
-            recover_wal_frame_checksum_mismatch(None, None, 10, 6);
+        let decision = recover_wal_frame_checksum_mismatch(None, None, 10, 6);
         assert_eq!(decision, WalRecoveryDecision::Truncated);
     }
 
     #[test]
     fn test_recover_decision_payload_but_no_hash_truncates() {
         let payload = sample_page(1);
-        let decision =
-            recover_wal_frame_checksum_mismatch(Some(&payload), None, 10, 6);
+        let decision = recover_wal_frame_checksum_mismatch(Some(&payload), None, 10, 6);
         assert_eq!(decision, WalRecoveryDecision::Truncated);
     }
 
@@ -2569,8 +2558,7 @@ mod tests {
     fn test_recover_decision_full_repair_path() {
         let payload = sample_page(7);
         let hash = wal_fec_source_hash_xxh3_128(&payload);
-        let decision =
-            recover_wal_frame_checksum_mismatch(Some(&payload), Some(hash), 8, 6);
+        let decision = recover_wal_frame_checksum_mismatch(Some(&payload), Some(hash), 8, 6);
         assert_eq!(decision, WalRecoveryDecision::Repaired);
     }
 
@@ -2634,9 +2622,7 @@ mod tests {
         let mut hdr = [0u8; WAL_HEADER_SIZE];
         hdr[..4].copy_from_slice(&WAL_MAGIC_LE.to_be_bytes());
         hdr[4..8].copy_from_slice(&WAL_FORMAT_VERSION.to_be_bytes());
-        hdr[8..12].copy_from_slice(
-            &u32::try_from(PAGE_SIZE).unwrap().to_be_bytes(),
-        );
+        hdr[8..12].copy_from_slice(&u32::try_from(PAGE_SIZE).unwrap().to_be_bytes());
         write_wal_header_salts(&mut hdr, salts).expect("salts");
         write_wal_header_checksum(&mut hdr, false).expect("hdr cksum");
 
@@ -2651,13 +2637,12 @@ mod tests {
             // Commit on frames 1-3 (indices 0-2), non-commit on 4-5 (indices 3-4).
             let db_size = if i < 3 { i + 1 } else { 0 };
             frame[4..8].copy_from_slice(&db_size.to_be_bytes());
-            write_wal_frame_salts(&mut frame[..WAL_FRAME_HEADER_SIZE], salts)
-                .expect("salts");
+            write_wal_frame_salts(&mut frame[..WAL_FRAME_HEADER_SIZE], salts).expect("salts");
             for (off, byte) in frame[WAL_FRAME_HEADER_SIZE..].iter_mut().enumerate() {
                 *byte = u8::try_from((off + usize::try_from(i).unwrap()) % 251).unwrap();
             }
-            running = write_wal_frame_checksum(&mut frame, PAGE_SIZE, running, false)
-                .expect("cksum");
+            running =
+                write_wal_frame_checksum(&mut frame, PAGE_SIZE, running, false).expect("cksum");
             wal.extend_from_slice(&frame);
         }
 

@@ -42,10 +42,17 @@ use crate::{FunctionRegistry, ScalarFunction};
 
 /// Gregorian (y, m, d, h, min, sec, frac_sec) → Julian Day Number.
 fn ymd_to_jdn(y: i64, m: i64, d: i64) -> f64 {
-    let (y, m) = if m <= 2 { (y - 1, m + 12) } else { (y, m) };
+    let (y, m) = if m <= 2 {
+        (y.saturating_sub(1), m.saturating_add(12))
+    } else {
+        (y, m)
+    };
     let a = y / 100;
-    let b = 2 - a + a / 4;
-    (365.25 * (y + 4716) as f64).floor() + (30.6001 * (m + 1) as f64).floor() + d as f64 + b as f64
+    let b = 2_i64.saturating_sub(a).saturating_add(a / 4);
+    (365.25 * y.saturating_add(4716) as f64).floor()
+        + (30.6001 * m.saturating_add(1) as f64).floor()
+        + d as f64
+        + b as f64
         - 1524.5
 }
 
@@ -73,8 +80,16 @@ fn jdn_to_ymd(jdn: f64) -> (i64, i64, i64) {
     let day = b
         .saturating_sub(d)
         .saturating_sub((30.6001 * e as f64).floor() as i64);
-    let month = if e < 14 { e - 1 } else { e - 13 };
-    let year = if month > 2 { c - 4716 } else { c - 4715 };
+    let month = if e < 14 {
+        e.saturating_sub(1)
+    } else {
+        e.saturating_sub(13)
+    };
+    let year = if month > 2 {
+        c.saturating_sub(4716)
+    } else {
+        c.saturating_sub(4715)
+    };
     (year, month, day)
 }
 
@@ -135,7 +150,7 @@ fn days_in_month(y: i64, m: i64) -> i64 {
 fn day_of_year(y: i64, m: i64, d: i64) -> i64 {
     let mut doy = d;
     for mo in 1..m {
-        doy += days_in_month(y, mo);
+        doy = doy.saturating_add(days_in_month(y, mo));
     }
     doy
 }
@@ -589,13 +604,13 @@ fn timediff_impl(jdn1: f64, jdn2: f64) -> String {
         end_ms = 999;
     }
 
-    let mut years = end_y - start_y;
-    let mut months = end_mo - start_mo;
-    let mut days = end_d - start_d;
-    let mut hours = end_h - start_h;
-    let mut minutes = end_mi - start_mi;
-    let mut seconds = end_s - start_s;
-    let mut millis = end_ms - start_ms;
+    let mut years = end_y.saturating_sub(start_y);
+    let mut months = end_mo.saturating_sub(start_mo);
+    let mut days = end_d.saturating_sub(start_d);
+    let mut hours = end_h.saturating_sub(start_h);
+    let mut minutes = end_mi.saturating_sub(start_mi);
+    let mut seconds = end_s.saturating_sub(start_s);
+    let mut millis = end_ms.saturating_sub(start_ms);
 
     if millis < 0 {
         millis += 1000;

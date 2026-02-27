@@ -16,7 +16,9 @@
 use serde::Serialize;
 
 use crate::checkpoint::CheckpointMode;
-use crate::checksum::{ChecksumFailureKind, RecoveryAction, WalChainInvalidReason, WalFecRepairOutcome};
+use crate::checksum::{
+    ChecksumFailureKind, RecoveryAction, WalChainInvalidReason, WalFecRepairOutcome,
+};
 
 // ---------------------------------------------------------------------------
 // Telemetry event schema
@@ -434,8 +436,7 @@ mod tests {
         c.record_repair(true, 500);
         c.record_encode();
         let s = c.snapshot();
-        let json =
-            serde_json::to_string(&s).expect("WalFecRepairCountersSnapshot must serialize");
+        let json = serde_json::to_string(&s).expect("WalFecRepairCountersSnapshot must serialize");
         assert!(json.contains("repairs_succeeded"));
         assert!(json.contains("encode_ops"));
     }
@@ -445,8 +446,7 @@ mod tests {
         let r = crate::metrics::WalRecoveryCounters::new();
         r.record_recovery(10, 2, 1);
         let s = r.snapshot();
-        let json =
-            serde_json::to_string(&s).expect("WalRecoveryCountersSnapshot must serialize");
+        let json = serde_json::to_string(&s).expect("WalRecoveryCountersSnapshot must serialize");
         assert!(json.contains("recovery_frames_total"));
         assert!(json.contains("corruption_detected_total"));
     }
@@ -457,8 +457,7 @@ mod tests {
         g.record_group_commit(3, 1000);
         g.record_submission();
         let s = g.snapshot();
-        let json =
-            serde_json::to_string(&s).expect("GroupCommitMetricsSnapshot must serialize");
+        let json = serde_json::to_string(&s).expect("GroupCommitMetricsSnapshot must serialize");
         assert!(json.contains("group_commits_total"));
         assert!(json.contains("submissions_total"));
     }

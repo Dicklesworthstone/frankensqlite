@@ -155,6 +155,8 @@ pub struct Scope {
     /// Columns visible from each alias: alias → set of column names.
     /// None means the columns are unknown (CTE or subquery), so any column reference is optimistically accepted.
     columns: HashMap<String, Option<HashSet<String>>>,
+    /// Columns that were joined via `USING` and are therefore unambiguous.
+    pub using_columns: HashSet<String>,
     /// CTE names visible in this scope.
     ctes: HashSet<String>,
     /// Parent scope (for subquery nesting).
@@ -168,6 +170,7 @@ impl Scope {
         Self {
             aliases: HashMap::new(),
             columns: HashMap::new(),
+            using_columns: HashSet::new(),
             ctes: HashSet::new(),
             parent: None,
         }
@@ -179,6 +182,7 @@ impl Scope {
         Self {
             aliases: HashMap::new(),
             columns: HashMap::new(),
+            using_columns: HashSet::new(),
             ctes: HashSet::new(),
             parent: Some(Box::new(parent)),
         }
@@ -258,7 +262,13 @@ impl Scope {
                 ResolveResult::ColumnNotFound
             }
             1 => ResolveResult::Resolved(matches.into_iter().next().unwrap_or_default()),
-            _ => ResolveResult::Ambiguous(matches),
+            _ => {
+                if self.using_columns.contains(&col_lower) {
+                    ResolveResult::Resolved(matches.into_iter().next().unwrap_or_default())
+                } else {
+                    ResolveResult::Ambiguous(matches)
+                }
+            }
         }
     }
 
@@ -438,17 +448,26 @@ impl<'a> Resolver<'a> {
                             where_clause,
                         } => {
                             let mut upsert_scope = Scope::child(scope.clone());
+                            let alias_name = insert.alias.as_deref().unwrap_or(&insert.table.name);
                             if let Some(table_def) = self.schema.find_table(&insert.table.name) {
                                 let col_set: HashSet<String> = table_def
                                     .columns
                                     .iter()
                                     .map(|c| c.name.to_ascii_lowercase())
                                     .collect();
-                                upsert_scope.add_alias("excluded", &insert.table.name, Some(col_set.clone()));
-                                upsert_scope.add_alias(&insert.table.name, &insert.table.name, Some(col_set));
+                                upsert_scope.add_alias(
+                                    "excluded",
+                                    &insert.table.name,
+                                    Some(col_set.clone()),
+                                );
+                                upsert_scope.add_alias(
+                                    alias_name,
+                                    &insert.table.name,
+                                    Some(col_set),
+                                );
                             } else {
                                 upsert_scope.add_alias("excluded", "<pseudo>", None);
-                                upsert_scope.add_alias(&insert.table.name, "<pseudo>", None);
+                                upsert_scope.add_alias(alias_name, "<pseudo>", None);
                             }
 
                             for assignment in assignments {
@@ -476,7 +495,11 @@ impl<'a> Resolver<'a> {
                 }
             }
             Statement::Update(update) => {
-                self.bind_table_to_scope(&update.table.name.name, update.table.alias.as_deref(), scope);
+                self.bind_table_to_scope(
+                    &update.table.name.name,
+                    update.table.alias.as_deref(),
+                    scope,
+                );
                 for assignment in &update.assignments {
                     match &assignment.target {
                         fsqlite_ast::AssignmentTarget::Column(col) => {
@@ -512,7 +535,11 @@ impl<'a> Resolver<'a> {
                 }
             }
             Statement::Delete(delete) => {
-                self.bind_table_to_scope(&delete.table.name.name, delete.table.alias.as_deref(), scope);
+                self.bind_table_to_scope(
+                    &delete.table.name.name,
+                    delete.table.alias.as_deref(),
+                    scope,
+                );
                 if let Some(where_clause) = &delete.where_clause {
                     self.resolve_expr(where_clause, scope);
                 }
@@ -720,6 +747,7 @@ impl<'a> Resolver<'a> {
                 JoinConstraint::On(expr) => self.resolve_expr(expr, scope),
                 JoinConstraint::Using(cols) => {
                     for col in cols {
+                        scope.using_columns.insert(col.to_ascii_lowercase());
                         self.resolve_unqualified_column(col, scope, true);
                     }
                 }
@@ -1069,12 +1097,12 @@ fn known_function_arity(name: &str) -> Option<FunctionArity> {
         }
         // Aggregate (1-arg) and scalar (1-arg) functions
         "sum" | "total" | "avg" | "abs" | "hex" | "length" | "lower" | "upper" | "typeof"
-        | "unicode" | "quote" | "zeroblob" | "soundex" | "likelihood" | "randomblob" => {
+        | "unicode" | "quote" | "zeroblob" | "soundex" | "likely" | "unlikely" | "randomblob" => {
             Some(FunctionArity::Exact(1))
         }
-        "ifnull" | "nullif" | "instr" | "glob" => Some(FunctionArity::Exact(2)),
+        "ifnull" | "nullif" | "instr" | "glob" | "likelihood" => Some(FunctionArity::Exact(2)),
         "iif" | "replace" => Some(FunctionArity::Exact(3)),
-        "count" => Some(FunctionArity::Range(0, 1)),
+        "count" => Some(FunctionArity::Exact(1)),
         "group_concat" | "trim" | "ltrim" | "rtrim" => Some(FunctionArity::Range(1, 2)),
         "substr" | "substring" | "like" => Some(FunctionArity::Range(2, 3)),
         // Variadic: aggregates, scalars, date/time, and JSON functions

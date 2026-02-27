@@ -886,18 +886,18 @@ mod tests {
 
         let tree = Arc::new(Mutex::new(RegionTree::new()));
         let root = {
-            let mut t = tree.lock().expect("lock");
+            let mut t = tree.lock().unwrap_or_else(|e| e.into_inner());
             t.create_root(RegionKind::DbRoot, Cx::new()).expect("root")
         };
         let wc = {
-            let mut t = tree.lock().expect("lock");
+            let mut t = tree.lock().unwrap_or_else(|e| e.into_inner());
             t.create_child(root, RegionKind::WriteCoordinator, Cx::new())
                 .expect("wc")
         };
 
         // Register tasks before spawning threads.
-        let task1 = tree.lock().expect("lock").register_task(wc).expect("t1");
-        let task2 = tree.lock().expect("lock").register_task(wc).expect("t2");
+        let task1 = tree.lock().unwrap_or_else(|e| e.into_inner()).register_task(wc).expect("t1");
+        let task2 = tree.lock().unwrap_or_else(|e| e.into_inner()).register_task(wc).expect("t2");
 
         let completed = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&completed);
@@ -914,7 +914,7 @@ mod tests {
 
         // close_and_drain blocks until all tasks complete.
         {
-            let mut t = tree.lock().expect("lock");
+            let mut t = tree.lock().unwrap_or_else(|e| e.into_inner());
             t.close_and_drain(root).expect("close_and_drain");
         }
         flag.store(true, Ordering::Release);
@@ -927,7 +927,7 @@ mod tests {
             "bead_id={BEAD_ID} case=threaded_close_completed"
         );
         assert_eq!(
-            tree.lock().expect("lock").state(root),
+            tree.lock().unwrap_or_else(|e| e.into_inner()).state(root),
             Some(RegionState::Closed),
             "bead_id={BEAD_ID} case=threaded_root_closed"
         );

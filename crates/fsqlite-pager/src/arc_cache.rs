@@ -937,7 +937,7 @@ impl ArcCacheInner {
                 }
             } else {
                 // T1 alone fills capacity — evict LRU from T1 directly.
-                if !self.evict_lru_from_t1() && !self.evict_lru_from_t2() {
+                if !self.delete_lru_from_t1() && !self.delete_lru_from_t2() {
                     self.capacity_overflow_events = self.capacity_overflow_events.saturating_add(1);
                 }
             }
@@ -1049,6 +1049,38 @@ impl ArcCacheInner {
             // Move ghost to B2.
             let ghost_idx = self.b2.push_back(key);
             self.directory.insert(key, Location::B2(ghost_idx));
+            drop(page);
+            self.evictions_t2 += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Delete the LRU unpinned page from T1 (removed entirely, not moved to B1).
+    fn delete_lru_from_t1(&mut self) -> bool {
+        if let Some(victim_idx) = Self::find_unpinned_victim(&self.t1) {
+            let page = self.t1.remove(victim_idx);
+            let key = page.key;
+            self.total_bytes -= page.byte_size;
+            self.decrement_page_version(key.pgno);
+            self.directory.remove(&key);
+            drop(page);
+            self.evictions_t1 += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Delete the LRU unpinned page from T2 (removed entirely, not moved to B2).
+    fn delete_lru_from_t2(&mut self) -> bool {
+        if let Some(victim_idx) = Self::find_unpinned_victim(&self.t2) {
+            let page = self.t2.remove(victim_idx);
+            let key = page.key;
+            self.total_bytes -= page.byte_size;
+            self.decrement_page_version(key.pgno);
+            self.directory.remove(&key);
             drop(page);
             self.evictions_t2 += 1;
             true
@@ -1719,17 +1751,22 @@ mod tests {
         let k3 = key(3, 0);
         let k4 = key(4, 0);
 
-        for &k in &[k1, k2, k3] {
+        // Put k1 in T2 so |L1| < c and |L1| + |L2| >= c later
+        let l = cache.request(&k1);
+        cache.admit(k1, page(k1, 4096), l);
+        cache.request(&k1);
+
+        for &k in &[k2, k3] {
             let l = cache.request(&k);
             cache.admit(k, page(k, 4096), l);
         }
         cache.set_p_for_tests(1);
 
-        // |T1|=3 > p=1, so REPLACE should evict from T1.
+        // |T1|=2 > p=1, so REPLACE should evict from T1 (k2 goes to B1).
         let l = cache.request(&k4);
         cache.admit(k4, page(k4, 4096), l);
 
-        assert!(cache.in_b1(&k1), "bead_id={BEAD_ID} case=prefer_t1");
+        assert!(cache.in_b1(&k2), "bead_id={BEAD_ID} case=prefer_t1");
         assert!(cache.get(&k4).is_some());
     }
 
@@ -1740,28 +1777,29 @@ mod tests {
         let k2 = key(2, 0);
         let k3 = key(3, 0);
         let k4 = key(4, 0);
-        let k5 = key(5, 0);
 
-        for &k in &[k1, k2, k3] {
+        // Put k1, k2 in T2
+        for &k in &[k1, k2] {
             let l = cache.request(&k);
             cache.admit(k, page(k, 4096), l);
+            cache.request(&k);
         }
 
-        // Push k1 to B1, then back to cache via B1 ghost hit (lands in T2).
+        // Put k3 in T1
+        let l = cache.request(&k3);
+        cache.admit(k3, page(k3, 4096), l);
+
+        cache.set_p_for_tests(1);
+
+        // Insert k4. |L1|=1<3, sum=3. p=1. |T1|=1 == p. not from_b2. prefer_t1=false.
+        // Evicts from T2 (k1 -> B2). T1=[k3, k4], T2=[k2], B2=[k1].
         let l = cache.request(&k4);
         cache.admit(k4, page(k4, 4096), l);
-        let l = cache.request(&k1);
-        assert_eq!(l, CacheLookup::GhostHitB1);
-        cache.admit(k1, page(k1, 4096), l);
 
-        // Force one T2 eviction so k1 becomes a B2 ghost entry.
-        let _ = cache.request(&k3); // promote k3 to T2
-        let l = cache.request(&k5);
-        cache.admit(k5, page(k5, 4096), l);
         assert!(cache.in_b2(&k1), "setup requires k1 in B2");
 
-        // Set |T1| == p so B2 ghost hit should use the tie-breaker.
-        let t1_before = cache.t1_lru_key().expect("T1 must be non-empty");
+        // Set |T1| == p so B2 ghost hit uses the tie-breaker.
+        let t1_before = cache.t1_lru_key().expect("T1 must be non-empty"); // k3
         cache.set_p_for_tests(cache.t1_len());
         let l = cache.request(&k1);
         assert_eq!(l, CacheLookup::GhostHitB2);
@@ -1840,30 +1878,35 @@ mod tests {
 
     #[test]
     fn test_request_b1_ghost_increases_p() {
-        // capacity=2: fill T1, cause eviction to B1, then ghost-hit.
         let mut cache = ArcCacheInner::new(2, 0);
 
         let k1 = key(1, 0);
         let k2 = key(2, 0);
         let k3 = key(3, 0);
 
-        // Fill T1 to capacity.
-        for &k in &[k1, k2] {
-            let l = cache.request(&k);
-            cache.admit(k, page(k, 4096), l);
-        }
-        assert_eq!(cache.t1_len(), 2);
+        // 1. Insert k1. T1=[k1].
+        let l = cache.request(&k1);
+        cache.admit(k1, page(k1, 4096), l);
 
-        let p_before = cache.p();
+        // 2. Hit k1 -> moves to T2. T1=[], T2=[k1].
+        cache.request(&k1);
 
-        // Insert k3: forces eviction of k1 from T1 → B1.
+        // 3. Insert k2. |L1|=0, |L1|+|L2|=1 < c. Wait, my code does replace if directory sum >= c.
+        // Let's insert k2. T1=[k2], T2=[k1].
+        let l = cache.request(&k2);
+        cache.admit(k2, page(k2, 4096), l);
+
+        // 4. Insert k3. |L1|=1 < c. Total directory = 2 >= c.
+        // It will call replace(). p=0, |T1|=1 > p. So it evicts from T1 (k2) to B1.
         let l = cache.request(&k3);
         cache.admit(k3, page(k3, 4096), l);
 
-        // k1 should now be a ghost in B1.
-        let lookup_k1 = cache.request(&k1);
+        let p_before = cache.p();
+
+        // 5. k2 should now be a ghost in B1.
+        let lookup_k2 = cache.request(&k2);
         assert_eq!(
-            lookup_k1,
+            lookup_k2,
             CacheLookup::GhostHitB1,
             "bead_id={BEAD_ID} case=ghost_hit_b1"
         );
@@ -1889,40 +1932,26 @@ mod tests {
         let k2 = key(2, 0);
         let k3 = key(3, 0);
         let k4 = key(4, 0);
-        let k5 = key(5, 0);
 
-        // Step 1: Fill T1 to capacity.
-        for &k in &[k1, k2, k3] {
+        for &k in &[k1, k2] {
             let l = cache.request(&k);
             cache.admit(k, page(k, 4096), l);
+            cache.request(&k); // promote to T2
         }
-        // T1=[k1,k2,k3]
 
-        // Step 2: Insert k4 → evicts k1 from T1 → B1.
+        let l = cache.request(&k3);
+        cache.admit(k3, page(k3, 4096), l);
+
         let l = cache.request(&k4);
-        cache.admit(k4, page(k4, 4096), l);
-        // T1=[k2,k3,k4], B1=[k1]
+        cache.admit(k4, page(k4, 4096), l); // evicts k3 to B1
 
-        // Step 3: B1 ghost hit on k1 → increases p.
-        let l = cache.request(&k1);
+        let l = cache.request(&k3);
         assert_eq!(l, CacheLookup::GhostHitB1, "setup: B1 ghost hit");
-        cache.admit(k1, page(k1, 4096), l);
-        // p went from 0 to ≥1. k1 admitted to T2.
-        assert!(cache.p() >= 1, "setup: p >= 1 after B1 ghost hit");
-
-        // Step 4: Promote k3 to T2 (double access).
-        cache.request(&k3);
-        // T1=[...], T2=[k1, k3]
-
-        // Step 5: Insert k5 → force eviction from T2 → B2.
-        let l = cache.request(&k5);
-        cache.admit(k5, page(k5, 4096), l);
-        // The eviction should remove LRU of T2 (k1) → B2.
+        cache.admit(k3, page(k3, 4096), l); // p=1. |T1|=1. evicts k1 from T2 to B2.
 
         let p_before = cache.p();
         assert!(p_before > 0, "setup: p > 0 before B2 ghost hit");
 
-        // Step 6: Ghost hit k1 in B2.
         let lookup_k1 = cache.request(&k1);
         assert_eq!(
             lookup_k1,
@@ -1930,7 +1959,6 @@ mod tests {
             "bead_id={BEAD_ID} case=ghost_hit_b2"
         );
 
-        // p should have decreased (favour frequency).
         assert!(
             cache.p() < p_before,
             "bead_id={BEAD_ID} case=p_decreased_on_b2_hit p_before={p_before} p_after={}",
@@ -2406,13 +2434,15 @@ mod tests {
         let k2 = key(2, 1);
         let k3 = key(3, 1);
 
-        for &k in &[k_v1, k2] {
-            let lookup = cache.request(&k);
-            cache.admit(k, page(k, 4096), lookup);
-        }
+        let lookup = cache.request(&k2);
+        cache.admit(k2, page(k2, 4096), lookup);
+        cache.request(&k2); // T2=[k2]
+
+        let lookup = cache.request(&k_v1);
+        cache.admit(k_v1, page(k_v1, 4096), lookup);
 
         let lookup = cache.request(&k3);
-        cache.admit(k3, page(k3, 4096), lookup);
+        cache.admit(k3, page(k3, 4096), lookup); // evicts k_v1 to B1
         assert!(cache.in_b1(&k_v1), "setup requires ghost entry in B1");
 
         assert_eq!(
@@ -2430,13 +2460,15 @@ mod tests {
         let k2 = key(2, 1);
         let k3 = key(3, 1);
 
-        for &k in &[k_v1, k2] {
-            let lookup = cache.request(&k);
-            cache.admit(k, page(k, 4096), lookup);
-        }
+        let lookup = cache.request(&k2);
+        cache.admit(k2, page(k2, 4096), lookup);
+        cache.request(&k2); // T2=[k2]
+
+        let lookup = cache.request(&k_v1);
+        cache.admit(k_v1, page(k_v1, 4096), lookup);
 
         let lookup = cache.request(&k3);
-        cache.admit(k3, page(k3, 4096), lookup);
+        cache.admit(k3, page(k3, 4096), lookup); // evicts k_v1 to B1
         assert!(cache.in_b1(&k_v1), "setup requires ghost entry in B1");
 
         assert_eq!(
@@ -2453,12 +2485,15 @@ mod tests {
         let k2 = key(2, 1);
         let k3 = key(3, 1);
 
-        for &k in &[k1, k2] {
-            let lookup = cache.request(&k);
-            cache.admit(k, page(k, 4096), lookup);
-        }
+        let lookup = cache.request(&k2);
+        cache.admit(k2, page(k2, 4096), lookup);
+        cache.request(&k2); // T2=[k2]
+
+        let lookup = cache.request(&k1);
+        cache.admit(k1, page(k1, 4096), lookup);
+
         let lookup = cache.request(&k3);
-        cache.admit(k3, page(k3, 4096), lookup);
+        cache.admit(k3, page(k3, 4096), lookup); // evicts k1 to B1
         assert!(cache.in_b1(&k1), "setup requires B1 ghost");
 
         cache.set_gc_horizon(CommitSeq::new(2));

@@ -83,9 +83,6 @@ where
         self.inner.get_mut(key)
     }
 
-    /// Gets the given key's corresponding entry in the map for in-place manipulation.
-    ///
-    /// Triggers observability events.
     /// Gets the given key's corresponding entry for in-place manipulation,
     /// inserting a default value if the key is absent.
     ///

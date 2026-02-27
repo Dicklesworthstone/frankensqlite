@@ -459,11 +459,9 @@ pub(crate) fn balance_nonroot<W: PageWriter>(
         }
     }
 
-    if all_cells.is_empty() {
-        return Ok(BalanceResult::Done);
-    }
-
-    // Determine the page type for new pages.
+    // We cannot return early if all_cells is empty, because we still need to
+    // call apply_child_replacement so that balance_shallower can reduce the
+    // tree depth (e.g. collapsing an empty interior root back into an empty leaf).
     let page_type = sibling_types[0];
     let is_leaf = page_type.is_leaf();
     let hdr_size = page_type.header_size() as usize;
@@ -1444,7 +1442,7 @@ fn split_overflowing_root<W: PageWriter>(
     let mut chosen_dividers: Option<Vec<Vec<u8>>> = None;
     let mut chosen_right_children: Option<Vec<PageNumber>> = None;
 
-    for child_count in 3usize..=8usize {
+    for child_count in 2usize..=8usize {
         if final_cells.len() < child_count.saturating_mul(2).saturating_sub(1) {
             break;
         }

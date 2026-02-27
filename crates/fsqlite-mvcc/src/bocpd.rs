@@ -247,6 +247,7 @@ fn ln_gamma(x: f64) -> f64 {
 
 #[derive(Clone)]
 struct RunEntry {
+    run_length: usize,
     log_prob: f64,
     ng_stats: Option<NormalGammaStats>,
     bb_stats: Option<BetaBinomialStats>,
@@ -339,6 +340,7 @@ impl BocpdMonitor {
     pub fn new(config: BocpdConfig) -> Self {
         // Start with a single entry: run length 0 with probability 1.
         let initial_entry = RunEntry {
+            run_length: 0,
             log_prob: 0.0, // ln(1) = 0
             ng_stats: match config.model {
                 ConjugateModel::NormalGamma { .. } => Some(NormalGammaStats::new()),
@@ -384,7 +386,7 @@ impl BocpdMonitor {
         // P(x_t | r_{t-1}) * H(r_{t-1}) * P(r_{t-1}).
         let mut log_cp_terms: Vec<f64> = Vec::with_capacity(n);
         for (i, entry) in self.entries.iter().enumerate() {
-            let h_i = self.config.hazard.evaluate(i);
+            let h_i = self.config.hazard.evaluate(entry.run_length);
             let log_h = h_i.ln();
             log_cp_terms.push(entry.log_prob + log_preds[i] + log_h);
         }
@@ -392,6 +394,7 @@ impl BocpdMonitor {
 
         // New changepoint entry (r_t = 0).
         let cp_entry = RunEntry {
+            run_length: 0,
             log_prob: log_cp_prob,
             ng_stats: match self.config.model {
                 ConjugateModel::NormalGamma { .. } => Some(NormalGammaStats::new()),
@@ -406,12 +409,13 @@ impl BocpdMonitor {
 
         // Growth entries (r_t = r_{t-1} + 1).
         for (i, entry) in self.entries.iter().enumerate() {
-            let h_i = self.config.hazard.evaluate(i);
+            let h_i = self.config.hazard.evaluate(entry.run_length);
             let log_1mh = (1.0 - h_i).ln();
             let log_prob = entry.log_prob + log_preds[i] + log_1mh;
             let ng_stats = entry.ng_stats.map(|ng| ng.update(x));
             let bb_stats = entry.bb_stats.map(|bb| bb.update(x));
             new_entries.push(RunEntry {
+                run_length: entry.run_length + 1,
                 log_prob,
                 ng_stats,
                 bb_stats,
@@ -431,13 +435,12 @@ impl BocpdMonitor {
         // Track MAP run length for public API.
         let map_run_length = new_entries
             .iter()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| {
+            .max_by(|a, b| {
                 a.log_prob
                     .partial_cmp(&b.log_prob)
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
-            .map_or(0, |(idx, _)| idx);
+            .map_or(0, |entry| entry.run_length);
 
         // Canonical: P(r_t = 0) > threshold (spec §4.8, Bayes-optimal).
         // Practical: MAP run length collapsed from stable regime to short.
@@ -467,6 +470,7 @@ impl BocpdMonitor {
         // Ensure at least the CP entry survives.
         if new_entries.is_empty() {
             new_entries.push(RunEntry {
+                run_length: 0,
                 log_prob: 0.0,
                 ng_stats: match self.config.model {
                     ConjugateModel::NormalGamma { .. } => Some(NormalGammaStats::new()),
@@ -526,13 +530,12 @@ impl BocpdMonitor {
     pub fn map_run_length(&self) -> usize {
         self.entries
             .iter()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| {
+            .max_by(|a, b| {
                 a.log_prob
                     .partial_cmp(&b.log_prob)
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
-            .map_or(0, |(idx, _)| idx)
+            .map_or(0, |entry| entry.run_length)
     }
 }
 

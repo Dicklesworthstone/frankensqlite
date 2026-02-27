@@ -137,7 +137,7 @@ struct WitnessPublisherInner {
 
 impl WitnessPublisherInner {
     fn mark_aborted(&self, id: ReservationId) {
-        let mut pending = self.pending.lock().expect("pending lock poisoned");
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(mut pub_) = pending.remove(&id.0) {
             pub_.phase = PublicationPhase::Aborted;
             drop(pending);
@@ -211,7 +211,7 @@ impl WitnessPublisher {
             edges: Vec::new(),
         };
         {
-            let mut pending = self.inner.pending.lock().expect("pending lock poisoned");
+            let mut pending = self.inner.pending.lock().unwrap_or_else(|e| e.into_inner());
             pending.insert(id.0, pub_);
         }
         debug!(
@@ -255,7 +255,7 @@ impl WitnessPublisher {
         let write_count = writes.len();
         let edge_count = edges.len();
         {
-            let mut pending = self.inner.pending.lock().expect("pending lock poisoned");
+            let mut pending = self.inner.pending.lock().unwrap_or_else(|e| e.into_inner());
             let Some(pub_) = pending.get_mut(&token.id.0) else {
                 return Err(PublicationError::ReservationNotFound(token.id));
             };
@@ -298,7 +298,7 @@ impl WitnessPublisher {
             });
         }
         let committed = {
-            let mut pending = self.inner.pending.lock().expect("pending lock poisoned");
+            let mut pending = self.inner.pending.lock().unwrap_or_else(|e| e.into_inner());
             let Some(pub_) = pending.remove(&token.id.0) else {
                 return Err(PublicationError::ReservationNotFound(token.id));
             };
@@ -361,21 +361,21 @@ impl WitnessPublisher {
     /// Query: check if a reservation was aborted.
     #[must_use]
     pub fn is_aborted(&self, reservation_id: ReservationId) -> bool {
-        let aborted = self.inner.aborted.lock().expect("aborted lock poisoned");
+        let aborted = self.inner.aborted.lock().unwrap_or_else(|e| e.into_inner());
         aborted.contains(&reservation_id.0)
     }
 
     /// Query: check if a reservation is still pending (not committed, not aborted).
     #[must_use]
     pub fn is_pending(&self, reservation_id: ReservationId) -> bool {
-        let pending = self.inner.pending.lock().expect("pending lock poisoned");
+        let pending = self.inner.pending.lock().unwrap_or_else(|e| e.into_inner());
         pending.contains_key(&reservation_id.0)
     }
 
     /// Query: count of aborted reservations (for GC tracking).
     #[must_use]
     pub fn aborted_count(&self) -> usize {
-        let aborted = self.inner.aborted.lock().expect("aborted lock poisoned");
+        let aborted = self.inner.aborted.lock().unwrap_or_else(|e| e.into_inner());
         aborted.len()
     }
 }
@@ -388,13 +388,13 @@ impl Default for WitnessPublisher {
 
 impl std::fmt::Debug for WitnessPublisher {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let pending = self.inner.pending.lock().expect("pending lock poisoned");
+        let pending = self.inner.pending.lock().unwrap_or_else(|e| e.into_inner());
         let committed = self
             .inner
             .committed
             .lock()
             .expect("committed lock poisoned");
-        let aborted = self.inner.aborted.lock().expect("aborted lock poisoned");
+        let aborted = self.inner.aborted.lock().unwrap_or_else(|e| e.into_inner());
         f.debug_struct("WitnessPublisher")
             .field("pending", &pending.len())
             .field("committed", &committed.len())

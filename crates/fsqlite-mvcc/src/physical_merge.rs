@@ -674,7 +674,7 @@ pub fn apply_patch(
     }
 
     // Return cells sorted by rowid (table) or key bytes (index) for canonical order
-    let usable = base.page_size.usable(base.reserved_per_page) as u32;
+    let usable = base.page_size.usable(base.reserved_per_page);
     let mut cells: Vec<ParsedCell> = cell_map.into_values().collect();
     cells.sort_by(|a, b| {
         if let (Some(ra), Some(rb)) = (a.rowid, b.rowid) {

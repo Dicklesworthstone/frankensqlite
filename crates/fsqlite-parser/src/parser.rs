@@ -1629,7 +1629,9 @@ impl Parser {
                         }
                         _ => {
                             // Reconstruct token text from token kind.
-                            let t = self.current().ok_or_else(|| self.err_expected("virtual table argument token"))?;
+                            let t = self
+                                .current()
+                                .ok_or_else(|| self.err_expected("virtual table argument token"))?;
                             let text = t.kind.to_sql();
                             if !current_arg.is_empty()
                                 && !current_arg.ends_with(' ')

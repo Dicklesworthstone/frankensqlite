@@ -45,7 +45,7 @@ use fsqlite_vfs::VfsFile;
 use tracing::{debug, info, trace};
 
 use crate::checksum::{
-    WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE, write_wal_frame_checksum, write_wal_frame_salts,
+    WAL_FRAME_HEADER_SIZE, write_wal_frame_checksum, write_wal_frame_salts,
 };
 use crate::metrics::GLOBAL_WAL_METRICS;
 use crate::wal::WalFile;
@@ -642,9 +642,9 @@ pub fn write_consolidated_frames<F: VfsFile>(
 
     // Single write for all frames.
     let base_frame_count = wal.frame_count();
-    let file_offset = u64::try_from(WAL_HEADER_SIZE).expect("header size fits u64")
-        + u64::try_from(base_frame_count).unwrap_or(u64::MAX)
-            * u64::try_from(frame_size).unwrap_or(u64::MAX);
+    let file_offset = wal
+        .frame_offset(base_frame_count)
+        ;
 
     wal.file_mut().write(cx, &consolidated_buf, file_offset)?;
 

@@ -331,7 +331,7 @@ impl<F: VfsFile> WalFile<F> {
 
     /// Byte offset of frame `index` (0-based) within the WAL file.
     #[allow(clippy::cast_possible_truncation)]
-    fn frame_offset(&self, index: usize) -> u64 {
+    pub(crate) fn frame_offset(&self, index: usize) -> u64 {
         // Compute in u64 to prevent usize overflow on 32-bit targets.
         // WAL_HEADER_SIZE is 32.
         let header_size = WAL_HEADER_SIZE as u64;
