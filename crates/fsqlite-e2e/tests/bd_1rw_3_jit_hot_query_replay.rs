@@ -108,10 +108,7 @@ struct ReplayArtifact<'a> {
     unsupported_last: i64,
 }
 
-fn write_artifact(
-    artifact_path: &Path,
-    replay: &ReplayArtifact<'_>,
-) {
+fn write_artifact(artifact_path: &Path, replay: &ReplayArtifact<'_>) {
     if let Some(parent) = artifact_path.parent() {
         fs::create_dir_all(parent).expect("create artifact dir");
     }

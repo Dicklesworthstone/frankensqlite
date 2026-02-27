@@ -262,6 +262,17 @@ pub struct BtCursor<P> {
     active_op_stats: Option<BtreeOpRuntimeStats>,
 }
 
+impl<P> BtCursor<P> {
+    /// Force the cursor into EOF state (not positioned on any row).
+    ///
+    /// Used by `OP_NullRow` to ensure subsequent `Column`/`Rowid` reads
+    /// return NULL without having to navigate the B-tree.
+    pub fn invalidate(&mut self) {
+        self.at_eof = true;
+        self.stack.clear();
+    }
+}
+
 impl<P: PageReader> BtCursor<P> {
     /// Create a new cursor positioned before the first entry (at EOF).
     #[must_use]

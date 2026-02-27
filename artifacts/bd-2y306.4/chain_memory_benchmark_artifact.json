@@ -9,17 +9,17 @@
     {
       "test_id": "mvcc_chain_bound_guard",
       "crate": "fsqlite-mvcc",
-      "filter": "test_chain_length_bounded_after_10000_updates_same_page",
-      "status": "fail",
-      "elapsed_ms": 320437,
+      "filter": "lifecycle::tests::test_chain_length_bounded_after_10000_updates_same_page",
+      "status": "pass",
+      "elapsed_ms": 260509,
       "log_path": "artifacts/bd-2y306.4/mvcc_chain_bound_guard.log"
     },
     {
       "test_id": "mvcc_backpressure_guard",
       "crate": "fsqlite-mvcc",
-      "filter": "test_chain_backpressure_reports_blocked_when_horizon_pinned",
-      "status": "fail",
-      "elapsed_ms": 225389,
+      "filter": "lifecycle::tests::test_chain_backpressure_reports_blocked_when_horizon_pinned",
+      "status": "pass",
+      "elapsed_ms": 185663,
       "log_path": "artifacts/bd-2y306.4/mvcc_backpressure_guard.log"
     },
     {
@@ -27,7 +27,7 @@
       "crate": "fsqlite-e2e",
       "filter": "bd_2y306_4_workloads_plateau_vs_unbounded_control",
       "status": "fail",
-      "elapsed_ms": 105323,
+      "elapsed_ms": 135555,
       "log_path": "artifacts/bd-2y306.4/e2e_chain_memory_workloads.log"
     },
     {
@@ -35,7 +35,7 @@
       "crate": "fsqlite-e2e",
       "filter": "bd_2y306_4_long_reader_impact_documented_and_recovery_bounded",
       "status": "fail",
-      "elapsed_ms": 110603,
+      "elapsed_ms": 80321,
       "log_path": "artifacts/bd-2y306.4/e2e_chain_memory_long_reader.log"
     },
     {
@@ -43,7 +43,7 @@
       "crate": "fsqlite-e2e",
       "filter": "bd_2y306_4_chain_memory_benchmark_e2e_replay_emits_artifact",
       "status": "fail",
-      "elapsed_ms": 85473,
+      "elapsed_ms": 85340,
       "log_path": "artifacts/bd-2y306.4/e2e_chain_memory_replay_artifact.log",
       "artifact_path": "artifacts/bd-2y306.4/chain_memory_benchmark_e2e_test_artifact.json"
     }

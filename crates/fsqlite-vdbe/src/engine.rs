@@ -909,6 +909,17 @@ impl CursorBackend {
             Self::Txn(c) => c.index_insert_unique(cx, key, n_unique_cols, columns_label),
         }
     }
+
+    /// Force the cursor into EOF state so subsequent reads return NULL.
+    ///
+    /// Used by `OP_NullRow` to satisfy the SQLite contract that Column/Rowid
+    /// after NullRow must return NULL.
+    fn clear_position(&mut self) {
+        match self {
+            Self::Mem(c) => c.invalidate(),
+            Self::Txn(c) => c.invalidate(),
+        }
+    }
 }
 
 /// Storage-backed table cursor used by `OpenRead` and `OpenWrite`.
@@ -2960,7 +2971,14 @@ impl VdbeEngine {
                     // Store raw row data as a blob in register p2.
                     let cursor_id = op.p1;
                     let target = op.p2;
-                    if let Some(cursor) = self.cursors.get(&cursor_id) {
+                    if let Some(cursor) = self.storage_cursors.get(&cursor_id) {
+                        if cursor.cursor.eof() {
+                            self.set_reg(target, SqliteValue::Null);
+                        } else {
+                            let payload = cursor.cursor.payload(&cursor.cx)?;
+                            self.set_reg(target, SqliteValue::Blob(payload));
+                        }
+                    } else if let Some(cursor) = self.cursors.get(&cursor_id) {
                         if cursor.is_pseudo {
                             if let Some(reg) = cursor.pseudo_reg {
                                 let blob = self.get_reg(reg).clone();
@@ -2978,7 +2996,14 @@ impl VdbeEngine {
                 }
 
                 Opcode::NullRow => {
-                    // Set cursor p1 to a null row.
+                    // Set cursor p1 to a null row. Subsequent Column/Rowid
+                    // reads will return NULL (storage cursor via eof(),
+                    // mem cursor via position=None).
+                    if let Some(cursor) = self.storage_cursors.get_mut(&op.p1) {
+                        // Move storage cursor past the last entry so eof()
+                        // returns true for subsequent Column/Rowid reads.
+                        cursor.cursor.clear_position();
+                    }
                     if let Some(cursor) = self.cursors.get_mut(&op.p1) {
                         cursor.position = None;
                     }
