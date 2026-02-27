@@ -3693,35 +3693,45 @@ impl Connection {
             txn
         };
 
-        let mut commit_err = None;
-        let mut concurrent_plan = None;
-
-        if ok && *self.concurrent_txn.borrow() {
-            match self.plan_concurrent_commit() {
-                Ok(plan) => concurrent_plan = Some(plan),
-                Err(e) => {
-                    ok = false;
-                    commit_err = Some(e);
-                }
-            }
-        }
-
-        if !ok && *self.concurrent_txn.borrow() {
-            if let Some(session_id) = self.concurrent_session_id.borrow_mut().take() {
-                let mut registry = lock_unpoisoned(&self.concurrent_registry);
-                if let Some(handle) = registry.get_mut(session_id) {
-                    concurrent_abort(handle, &self.concurrent_lock_table, session_id);
-                }
-                registry.remove(session_id);
-            }
-        }
-
-        if !ok {
-            self.txn_metrics_note_rollback();
-        }
-
+        // bd-rjc fix: plan_concurrent_commit() must be called under
+        // commit_write_mutex to prevent another connection from advancing
+        // next_commit_seq between plan (which reads it) and finalize (which
+        // bumps it).  Without this, assigned_commit_seq != committed_seq,
+        // corrupting the MVCC commit index.
         let txn_result = if ok {
             let _commit_guard = lock_unpoisoned(&self.commit_write_mutex);
+            let concurrent_plan = if *self.concurrent_txn.borrow() {
+                match self.plan_concurrent_commit() {
+                    Ok(plan) => plan,
+                    Err(e) => {
+                        // Plan failed (SSI conflict, etc.) — abort under the
+                        // mutex so we still hold sequencing invariants.
+                        drop(_commit_guard);
+                        if let Some(session_id) =
+                            self.concurrent_session_id.borrow_mut().take()
+                        {
+                            let mut registry =
+                                lock_unpoisoned(&self.concurrent_registry);
+                            if let Some(handle) = registry.get_mut(session_id) {
+                                concurrent_abort(
+                                    handle,
+                                    &self.concurrent_lock_table,
+                                    session_id,
+                                );
+                            }
+                            registry.remove(session_id);
+                        }
+                        self.txn_metrics_note_rollback();
+                        let _ = txn.rollback(&cx);
+                        *self.concurrent_txn.borrow_mut() = false;
+                        *self.concurrent_session_id.borrow_mut() = None;
+                        self.txn_metrics_mark_finished();
+                        return Err(e);
+                    }
+                }
+            } else {
+                None
+            };
             match txn.commit(&cx) {
                 Ok(()) => {
                     let committed_seq = self.advance_commit_clock();
@@ -3733,12 +3743,17 @@ impl Connection {
                 Err(e) => Err(e),
             }
         } else {
-            let rollback_res = txn.rollback(&cx);
-            if let Some(e) = commit_err {
-                Err(e)
-            } else {
-                rollback_res
+            if *self.concurrent_txn.borrow() {
+                if let Some(session_id) = self.concurrent_session_id.borrow_mut().take() {
+                    let mut registry = lock_unpoisoned(&self.concurrent_registry);
+                    if let Some(handle) = registry.get_mut(session_id) {
+                        concurrent_abort(handle, &self.concurrent_lock_table, session_id);
+                    }
+                    registry.remove(session_id);
+                }
             }
+            self.txn_metrics_note_rollback();
+            txn.rollback(&cx)
         };
 
         if let Err(err) = txn_result {
@@ -4854,16 +4869,19 @@ impl Connection {
         if let AlterTableAction::RenameTo(new_name) = &alter.action {
             let old_key = old_name.to_ascii_lowercase();
             let new_key = new_name.to_ascii_lowercase();
-            if let Some(idx) = self.rowid_alias_columns.borrow_mut().remove(&old_key) {
+            let removed_rowid = self.rowid_alias_columns.borrow_mut().remove(&old_key);
+            if let Some(idx) = removed_rowid {
                 self.rowid_alias_columns
                     .borrow_mut()
                     .insert(new_key.clone(), idx);
             }
-            if self.autoincrement_tables.borrow_mut().remove(&old_key) {
+            let had_autoincrement = self.autoincrement_tables.borrow_mut().remove(&old_key);
+            if had_autoincrement {
                 self.autoincrement_tables
                     .borrow_mut()
                     .insert(new_key.clone());
-                if let Some(seq) = self.sqlite_sequence_cache.borrow_mut().remove(&old_key) {
+                let removed_seq = self.sqlite_sequence_cache.borrow_mut().remove(&old_key);
+                if let Some(seq) = removed_seq {
                     self.sqlite_sequence_cache
                         .borrow_mut()
                         .insert(new_key.clone(), seq);
@@ -30519,8 +30537,6 @@ mod pager_routing_tests {
 
     #[test]
     fn test_alter_table_rename_succeeds() {
-        // NOTE: Querying renamed table by new name hits RefCell borrow bug.
-        // Test just verifies rename succeeds and old name is gone.
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE old_name (id INTEGER PRIMARY KEY, val TEXT);")
             .unwrap();
@@ -30528,8 +30544,15 @@ mod pager_routing_tests {
             .unwrap();
         conn.execute("ALTER TABLE old_name RENAME TO new_name;")
             .unwrap();
-        // NOTE: Querying old_name also triggers RefCell borrow bug,
-        // so we only verify rename itself succeeds without panic.
+        // Old name should no longer work
+        assert!(conn.query("SELECT val FROM old_name;").is_err());
+        // New name should work and data should be intact
+        let rows = conn.query("SELECT val FROM new_name;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].values()[0],
+            SqliteValue::Text("data".to_owned())
+        );
     }
 
     #[test]
