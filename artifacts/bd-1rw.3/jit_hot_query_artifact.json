@@ -1,0 +1,44 @@
+{
+  "bead_id": "bd-1rw.3",
+  "run_id": "bd-1rw.3-seed-1003202603",
+  "trace_id": "1003202603",
+  "scenario_id": "JIT-HOT-QUERY-E2E",
+  "seed": 1003202603,
+  "overall_status": "pass",
+  "tests": [
+    {
+      "test_id": "vdbe_jit_metrics_unit",
+      "crate": "fsqlite-vdbe",
+      "filter": "test_jit_scaffold_metrics_compile_and_cache_hit",
+      "status": "pass",
+      "elapsed_ms": 90346,
+      "log_path": "artifacts/bd-1rw.3/vdbe_jit_metrics_unit.log"
+    },
+    {
+      "test_id": "vdbe_jit_fallback_unit",
+      "crate": "fsqlite-vdbe",
+      "filter": "test_jit_scaffold_compile_failure_falls_back_to_interpreter",
+      "status": "pass",
+      "elapsed_ms": 150383,
+      "log_path": "artifacts/bd-1rw.3/vdbe_jit_fallback_unit.log"
+    },
+    {
+      "test_id": "core_jit_pragma_unit",
+      "crate": "fsqlite-core",
+      "filter": "test_pragma_jit_controls_stats_and_reset",
+      "status": "pass",
+      "elapsed_ms": 105437,
+      "log_path": "artifacts/bd-1rw.3/core_jit_pragma_unit.log"
+    },
+    {
+      "test_id": "jit_e2e_replay_artifact",
+      "crate": "fsqlite-e2e",
+      "filter": "bd_1rw_3_jit_e2e_replay_emits_artifact",
+      "status": "pass",
+      "elapsed_ms": 110287,
+      "log_path": "artifacts/bd-1rw.3/jit_e2e_replay_artifact.log",
+      "artifact_path": "artifacts/bd-1rw.3/jit_e2e_test_artifact.json"
+    }
+  ],
+  "replay_command": "scripts/bd_1rw_3_jit_hot_query_e2e.sh --json"
+}
