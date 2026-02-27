@@ -1,0 +1,48 @@
+{
+  "id": "024_string_functions",
+  "description": "String function parity: substr, replace, trim, ltrim, rtrim, instr, printf, quote, hex, zeroblob, char, unicode",
+  "ops": [
+    { "op": "open", "path": ":memory:" },
+
+    { "op": "query", "sql": "SELECT substr('hello world', 1, 5)", "expect": { "rows": [["hello"]], "ordered": true } },
+    { "op": "query", "sql": "SELECT substr('hello world', 7)", "expect": { "rows": [["world"]], "ordered": true } },
+    { "op": "query", "sql": "SELECT substr('hello', -3)", "expect": { "rows": [["llo"]], "ordered": true } },
+    { "op": "query", "sql": "SELECT substr('hello', 2, 3)", "expect": { "rows": [["ell"]], "ordered": true } },
+    { "op": "query", "sql": "SELECT substr('hello', 0, 3)", "expect": { "rows": [["he"]], "ordered": true } },
+    { "op": "query", "sql": "SELECT substr(NULL, 1, 3)", "expect": { "rows": [[null]], "ordered": true } },
+
+    { "op": "query", "sql": "SELECT replace('hello world', 'world', 'rust')", "expect": { "rows": [["hello rust"]], "ordered": true } },
+    { "op": "query", "sql": "SELECT replace('aaa', 'a', 'bb')", "expect": { "rows": [["bbbbbb"]], "ordered": true } },
+    { "op": "query", "sql": "SELECT replace('hello', 'xyz', 'abc')", "expect": { "rows": [["hello"]], "ordered": true } },
+    { "op": "query", "sql": "SELECT replace('hello', '', 'x')", "expect": { "rows": [["hello"]], "ordered": true } },
+
+    { "op": "query", "sql": "SELECT trim('  hello  ')", "expect": { "rows": [["hello"]], "ordered": true } },
+    { "op": "query", "sql": "SELECT ltrim('  hello  ')", "expect": { "rows": [["hello  "]], "ordered": true } },
+    { "op": "query", "sql": "SELECT rtrim('  hello  ')", "expect": { "rows": [["  hello"]], "ordered": true } },
+    { "op": "query", "sql": "SELECT trim('xxhelloxx', 'x')", "expect": { "rows": [["hello"]], "ordered": true } },
+    { "op": "query", "sql": "SELECT ltrim('xxhello', 'x')", "expect": { "rows": [["hello"]], "ordered": true } },
+    { "op": "query", "sql": "SELECT rtrim('helloxx', 'x')", "expect": { "rows": [["hello"]], "ordered": true } },
+
+    { "op": "query", "sql": "SELECT instr('hello world', 'world')", "expect": { "rows": [["7"]], "ordered": true } },
+    { "op": "query", "sql": "SELECT instr('hello world', 'xyz')", "expect": { "rows": [["0"]], "ordered": true } },
+    { "op": "query", "sql": "SELECT instr('hello', '')", "expect": { "rows": [["1"]], "ordered": true } },
+    { "op": "query", "sql": "SELECT instr('hello', 'l')", "expect": { "rows": [["3"]], "ordered": true } },
+
+    { "op": "query", "sql": "SELECT quote(NULL)", "expect": { "rows": [["NULL"]], "ordered": true } },
+    { "op": "query", "sql": "SELECT quote(42)", "expect": { "rows": [["42"]], "ordered": true } },
+    { "op": "query", "sql": "SELECT quote('hello')", "expect": { "rows": [["'hello'"]], "ordered": true } },
+    { "op": "query", "sql": "SELECT quote('it''s')", "expect": { "rows": [["'it''s'"]], "ordered": true } },
+
+    { "op": "query", "sql": "SELECT hex(X'48454C4C4F')", "expect": { "rows": [["48454C4C4F"]], "ordered": true } },
+    { "op": "query", "sql": "SELECT hex('ABC')", "expect": { "rows": [["414243"]], "ordered": true } },
+
+    { "op": "query", "sql": "SELECT typeof(zeroblob(4))", "expect": { "rows": [["blob"]], "ordered": true } },
+    { "op": "query", "sql": "SELECT length(zeroblob(10))", "expect": { "rows": [["10"]], "ordered": true } },
+    { "op": "query", "sql": "SELECT hex(zeroblob(3))", "expect": { "rows": [["000000"]], "ordered": true } },
+
+    { "op": "query", "sql": "SELECT char(72, 101, 108, 108, 111)", "expect": { "rows": [["Hello"]], "ordered": true } },
+    { "op": "query", "sql": "SELECT unicode('A')", "expect": { "rows": [["65"]], "ordered": true } },
+    { "op": "query", "sql": "SELECT unicode('hello')", "expect": { "rows": [["104"]], "ordered": true } }
+  ],
+  "fsqlite_modes": ["compatibility", "native"]
+}

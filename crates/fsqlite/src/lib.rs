@@ -5412,7 +5412,6 @@ mod tests {
     // ── Window function probe ────────────────────────────────────────────
 
     #[test]
-    #[ignore = "window functions not yet implemented"]
     fn parity_row_number_window() {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE w(name TEXT, val INTEGER);")
@@ -5437,6 +5436,140 @@ mod tests {
         assert_eq!(
             results,
             vec![("a".into(), 1), ("b".into(), 2), ("c".into(), 3),]
+        );
+    }
+
+    #[test]
+    fn window_row_number_partition_by() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE wp(dept TEXT, name TEXT, val INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO wp VALUES('eng','a',10);")
+            .unwrap();
+        conn.execute("INSERT INTO wp VALUES('eng','b',20);")
+            .unwrap();
+        conn.execute("INSERT INTO wp VALUES('sales','c',5);")
+            .unwrap();
+        conn.execute("INSERT INTO wp VALUES('sales','d',15);")
+            .unwrap();
+        let rows = conn
+            .query("SELECT dept, name, ROW_NUMBER() OVER (PARTITION BY dept ORDER BY val) FROM wp;")
+            .unwrap();
+        let results: Vec<(String, String, i64)> = rows
+            .iter()
+            .map(|r| {
+                let vals = row_values(r);
+                let dept = match &vals[0] {
+                    SqliteValue::Text(s) => s.clone(),
+                    _ => panic!("expected text"),
+                };
+                let name = match &vals[1] {
+                    SqliteValue::Text(s) => s.clone(),
+                    _ => panic!("expected text"),
+                };
+                (dept, name, vals[2].to_integer())
+            })
+            .collect();
+        assert_eq!(
+            results,
+            vec![
+                ("eng".into(), "a".into(), 1),
+                ("eng".into(), "b".into(), 2),
+                ("sales".into(), "c".into(), 1),
+                ("sales".into(), "d".into(), 2),
+            ]
+        );
+    }
+
+    #[test]
+    fn window_rank_and_dense_rank() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE wr(name TEXT, score INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO wr VALUES('a', 100);").unwrap();
+        conn.execute("INSERT INTO wr VALUES('b', 100);").unwrap();
+        conn.execute("INSERT INTO wr VALUES('c', 90);").unwrap();
+        conn.execute("INSERT INTO wr VALUES('d', 80);").unwrap();
+        let rows = conn
+            .query(
+                "SELECT name, RANK() OVER (ORDER BY score DESC), \
+                 DENSE_RANK() OVER (ORDER BY score DESC) FROM wr;",
+            )
+            .unwrap();
+        let results: Vec<(String, i64, i64)> = rows
+            .iter()
+            .map(|r| {
+                let vals = row_values(r);
+                let name = match &vals[0] {
+                    SqliteValue::Text(s) => s.clone(),
+                    _ => panic!("expected text"),
+                };
+                (name, vals[1].to_integer(), vals[2].to_integer())
+            })
+            .collect();
+        // a=100, b=100 are tied at rank 1; c=90 rank 3; d=80 rank 4
+        // dense_rank: a,b=1; c=2; d=3
+        assert_eq!(
+            results,
+            vec![
+                ("a".into(), 1, 1),
+                ("b".into(), 1, 1),
+                ("c".into(), 3, 2),
+                ("d".into(), 4, 3),
+            ]
+        );
+    }
+
+    #[test]
+    fn window_row_number_desc_order() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE wd(x INTEGER);").unwrap();
+        conn.execute("INSERT INTO wd VALUES(1);").unwrap();
+        conn.execute("INSERT INTO wd VALUES(2);").unwrap();
+        conn.execute("INSERT INTO wd VALUES(3);").unwrap();
+        let rows = conn
+            .query("SELECT x, ROW_NUMBER() OVER (ORDER BY x DESC) FROM wd;")
+            .unwrap();
+        let results: Vec<(i64, i64)> = rows
+            .iter()
+            .map(|r| {
+                let vals = row_values(r);
+                (vals[0].to_integer(), vals[1].to_integer())
+            })
+            .collect();
+        // x=3 is first (row_number=1), x=2 second, x=1 third
+        assert_eq!(results, vec![(3, 1), (2, 2), (1, 3)]);
+    }
+
+    #[test]
+    fn window_multiple_window_functions() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE wm(name TEXT, val INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO wm VALUES('a', 10);").unwrap();
+        conn.execute("INSERT INTO wm VALUES('b', 20);").unwrap();
+        conn.execute("INSERT INTO wm VALUES('c', 30);").unwrap();
+        let rows = conn
+            .query(
+                "SELECT name, ROW_NUMBER() OVER (ORDER BY val), \
+                 DENSE_RANK() OVER (ORDER BY val) FROM wm;",
+            )
+            .unwrap();
+        let results: Vec<(String, i64, i64)> = rows
+            .iter()
+            .map(|r| {
+                let vals = row_values(r);
+                let name = match &vals[0] {
+                    SqliteValue::Text(s) => s.clone(),
+                    _ => panic!("expected text"),
+                };
+                (name, vals[1].to_integer(), vals[2].to_integer())
+            })
+            .collect();
+        // All values distinct, so rank matches row_number
+        assert_eq!(
+            results,
+            vec![("a".into(), 1, 1), ("b".into(), 2, 2), ("c".into(), 3, 3),]
         );
     }
 
@@ -5968,5 +6101,793 @@ mod tests {
             .unwrap();
         let results: Vec<i64> = rows.iter().map(|r| row_values(r)[0].to_integer()).collect();
         assert!(results.contains(&2) || results.contains(&3));
+    }
+
+    // -----------------------------------------------------------------------
+    // Conformance suite 024: string functions
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn conformance_024_substr() {
+        let conn = Connection::open(":memory:").unwrap();
+        let r = conn.query("SELECT substr('hello world', 7)").unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "world");
+        let r = conn.query("SELECT substr('hello world', 1, 5)").unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "hello");
+        let r = conn.query("SELECT substr('hello', -3)").unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "llo");
+    }
+
+    #[test]
+    fn conformance_024_replace() {
+        let conn = Connection::open(":memory:").unwrap();
+        let r = conn
+            .query("SELECT replace('hello world', 'world', 'rust')")
+            .unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "hello rust");
+        let r = conn.query("SELECT replace('aaa', 'a', 'bb')").unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "bbbbbb");
+    }
+
+    #[test]
+    fn conformance_024_trim() {
+        let conn = Connection::open(":memory:").unwrap();
+        let r = conn.query("SELECT trim('  hello  ')").unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "hello");
+        let r = conn.query("SELECT ltrim('  hello  ')").unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "hello  ");
+        let r = conn.query("SELECT rtrim('  hello  ')").unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "  hello");
+    }
+
+    #[test]
+    fn conformance_024_instr() {
+        let conn = Connection::open(":memory:").unwrap();
+        let r = conn.query("SELECT instr('hello world', 'world')").unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "7");
+        let r = conn.query("SELECT instr('hello', 'xyz')").unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "0");
+        let r = conn.query("SELECT instr('hello', '')").unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "1");
+    }
+
+    #[test]
+    fn conformance_024_hex_zeroblob() {
+        let conn = Connection::open(":memory:").unwrap();
+        let r = conn.query("SELECT hex(zeroblob(4))").unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "00000000");
+        let r = conn.query("SELECT typeof(zeroblob(4))").unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "blob");
+    }
+
+    #[test]
+    fn conformance_024_char_unicode() {
+        let conn = Connection::open(":memory:").unwrap();
+        let r = conn.query("SELECT char(65, 66, 67)").unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "ABC");
+        let r = conn.query("SELECT unicode('A')").unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "65");
+    }
+
+    // -----------------------------------------------------------------------
+    // Conformance suite 025: expression operators
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn conformance_025_between() {
+        let conn = Connection::open(":memory:").unwrap();
+        let r = conn.query("SELECT 5 BETWEEN 1 AND 10").unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "1");
+        let r = conn.query("SELECT 15 BETWEEN 1 AND 10").unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "0");
+        let r = conn.query("SELECT 5 NOT BETWEEN 1 AND 10").unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "0");
+    }
+
+    #[test]
+    fn conformance_025_in_operator() {
+        let conn = Connection::open(":memory:").unwrap();
+        let r = conn.query("SELECT 3 IN (1, 2, 3, 4)").unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "1");
+        let r = conn.query("SELECT 5 IN (1, 2, 3, 4)").unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "0");
+        let r = conn.query("SELECT 3 NOT IN (1, 2, 3, 4)").unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "0");
+    }
+
+    #[test]
+    fn conformance_025_like_glob() {
+        let conn = Connection::open(":memory:").unwrap();
+        let r = conn.query("SELECT 'hello' LIKE 'hel%'").unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "1");
+        let r = conn.query("SELECT 'hello' LIKE 'HEL%'").unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "1");
+        let r = conn.query("SELECT 'hello' GLOB 'hel*'").unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "1");
+        let r = conn.query("SELECT 'hello' GLOB 'HEL*'").unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "0");
+    }
+
+    #[test]
+    fn conformance_025_coalesce_nullif_iif() {
+        let conn = Connection::open(":memory:").unwrap();
+        let r = conn.query("SELECT coalesce(NULL, NULL, 'found')").unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "found");
+        let r = conn.query("SELECT nullif(5, 5)").unwrap();
+        assert!(row_values(&r[0])[0].is_null());
+        let r = conn.query("SELECT nullif(5, 3)").unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "5");
+        let r = conn.query("SELECT iif(1, 'yes', 'no')").unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "yes");
+        let r = conn.query("SELECT iif(0, 'yes', 'no')").unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "no");
+    }
+
+    #[test]
+    fn conformance_025_bitwise() {
+        let conn = Connection::open(":memory:").unwrap();
+        let r = conn.query("SELECT 6 & 3").unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "2");
+        let r = conn.query("SELECT 6 | 3").unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "7");
+        let r = conn.query("SELECT ~0").unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "-1");
+        let r = conn.query("SELECT 1 << 4").unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "16");
+        let r = conn.query("SELECT 16 >> 2").unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "4");
+    }
+
+    #[test]
+    fn conformance_025_cast() {
+        let conn = Connection::open(":memory:").unwrap();
+        let r = conn.query("SELECT CAST('123' AS INTEGER)").unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "123");
+        let r = conn.query("SELECT typeof(CAST(123 AS TEXT))").unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "text");
+        let r = conn.query("SELECT CAST(3.14 AS INTEGER)").unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "3");
+    }
+
+    #[test]
+    fn conformance_025_unary_operators() {
+        let conn = Connection::open(":memory:").unwrap();
+        let r = conn.query("SELECT -(-5)").unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "5");
+        let r = conn.query("SELECT +42").unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "42");
+        let r = conn.query("SELECT NOT 0").unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "1");
+        let r = conn.query("SELECT NOT 1").unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "0");
+    }
+
+    #[test]
+    fn conformance_025_is_null() {
+        let conn = Connection::open(":memory:").unwrap();
+        let r = conn.query("SELECT NULL IS NULL").unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "1");
+        let r = conn.query("SELECT 5 IS NOT NULL").unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "1");
+        let r = conn.query("SELECT NULL IS NOT NULL").unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "0");
+    }
+
+    // -----------------------------------------------------------------------
+    // Conformance suite 026: subquery and CTE
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn conformance_026_scalar_subquery() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1(id INTEGER PRIMARY KEY, val INTEGER)")
+            .unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1, 10), (2, 20), (3, 30)")
+            .unwrap();
+        let r = conn.query("SELECT (SELECT MAX(val) FROM t1)").unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "30");
+        let r = conn.query("SELECT (SELECT COUNT(*) FROM t1)").unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "3");
+    }
+
+    #[test]
+    fn conformance_026_exists_subquery() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE items(id INTEGER PRIMARY KEY, name TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO items VALUES (1, 'apple'), (2, 'banana')")
+            .unwrap();
+        let r = conn
+            .query("SELECT EXISTS(SELECT 1 FROM items WHERE name = 'apple')")
+            .unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "1");
+        let r = conn
+            .query("SELECT EXISTS(SELECT 1 FROM items WHERE name = 'cherry')")
+            .unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "0");
+    }
+
+    #[test]
+    fn conformance_026_cte_basic() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute(
+            "CREATE TABLE employees(id INTEGER PRIMARY KEY, name TEXT, dept TEXT, salary INTEGER)",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO employees VALUES \
+             (1, 'Alice', 'eng', 100000), \
+             (2, 'Bob', 'eng', 95000), \
+             (3, 'Charlie', 'sales', 80000)",
+        )
+        .unwrap();
+        let r = conn
+            .query(
+                "WITH eng AS (SELECT * FROM employees WHERE dept = 'eng') \
+                 SELECT name FROM eng ORDER BY name",
+            )
+            .unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "Alice");
+        assert_eq!(row_values(&r[1])[0].to_text(), "Bob");
+        assert_eq!(r.len(), 2);
+    }
+
+    #[test]
+    fn conformance_026_cte_explicit_columns() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE nums(n INTEGER)").unwrap();
+        conn.execute("INSERT INTO nums VALUES (10), (20), (30)")
+            .unwrap();
+        let r = conn
+            .query(
+                "WITH doubled(val) AS (SELECT n * 2 FROM nums) \
+                 SELECT val FROM doubled ORDER BY val",
+            )
+            .unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "20");
+        assert_eq!(row_values(&r[1])[0].to_text(), "40");
+        assert_eq!(row_values(&r[2])[0].to_text(), "60");
+    }
+
+    #[test]
+    fn conformance_026_recursive_cte() {
+        let conn = Connection::open(":memory:").unwrap();
+        let r = conn
+            .query(
+                "WITH RECURSIVE cnt(x) AS (\
+                 SELECT 1 UNION ALL SELECT x + 1 FROM cnt WHERE x < 5\
+                 ) SELECT x FROM cnt",
+            )
+            .unwrap();
+        let vals: Vec<String> = r.iter().map(|row| row_values(row)[0].to_text()).collect();
+        assert_eq!(vals, ["1", "2", "3", "4", "5"]);
+    }
+
+    #[test]
+    fn conformance_026_derived_table() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE scores(student TEXT, score INTEGER)")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO scores VALUES \
+             ('Alice', 90), ('Alice', 85), ('Bob', 70), ('Bob', 80)",
+        )
+        .unwrap();
+        let r = conn
+            .query(
+                "SELECT student, avg_score FROM \
+                 (SELECT student, AVG(score) as avg_score \
+                  FROM scores GROUP BY student) ORDER BY student",
+            )
+            .unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "Alice");
+        assert_eq!(row_values(&r[1])[0].to_text(), "Bob");
+    }
+
+    // -----------------------------------------------------------------------
+    // Conformance suite 027: window functions (not yet implemented)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[ignore = "window functions not yet implemented"]
+    fn conformance_027_row_number() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE sales(id INTEGER PRIMARY KEY, region TEXT, amount REAL)")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO sales VALUES \
+             (1, 'North', 100.0), (2, 'South', 200.0), \
+             (3, 'North', 150.0), (4, 'South', 175.0)",
+        )
+        .unwrap();
+        let r = conn
+            .query(
+                "SELECT region, amount, \
+                 ROW_NUMBER() OVER (ORDER BY amount DESC) as rn \
+                 FROM sales",
+            )
+            .unwrap();
+        assert_eq!(row_values(&r[0])[2].to_text(), "1");
+    }
+
+    #[test]
+    #[ignore = "window functions not yet implemented"]
+    fn conformance_027_rank_dense_rank() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE scores(id INTEGER PRIMARY KEY, name TEXT, score INTEGER)")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO scores VALUES \
+             (1, 'A', 100), (2, 'B', 100), (3, 'C', 90), (4, 'D', 80)",
+        )
+        .unwrap();
+        let r = conn
+            .query(
+                "SELECT name, RANK() OVER (ORDER BY score DESC) as rnk \
+                 FROM scores",
+            )
+            .unwrap();
+        assert_eq!(row_values(&r[0])[1].to_text(), "1");
+        assert_eq!(row_values(&r[1])[1].to_text(), "1");
+        assert_eq!(row_values(&r[2])[1].to_text(), "3");
+    }
+
+    #[test]
+    #[ignore = "window functions not yet implemented"]
+    fn conformance_027_sum_over() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE txns(id INTEGER PRIMARY KEY, amount REAL)")
+            .unwrap();
+        conn.execute("INSERT INTO txns VALUES (1, 10.0), (2, 20.0), (3, 30.0)")
+            .unwrap();
+        let r = conn
+            .query(
+                "SELECT id, SUM(amount) OVER (ORDER BY id) as running \
+                 FROM txns",
+            )
+            .unwrap();
+        assert_eq!(row_values(&r[0])[1].to_text(), "10.0");
+        assert_eq!(row_values(&r[1])[1].to_text(), "30.0");
+        assert_eq!(row_values(&r[2])[1].to_text(), "60.0");
+    }
+
+    #[test]
+    #[ignore = "window functions not yet implemented"]
+    fn conformance_027_lag_lead() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE seq(id INTEGER PRIMARY KEY, val TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO seq VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+            .unwrap();
+        let r = conn
+            .query(
+                "SELECT val, LAG(val) OVER (ORDER BY id) as prev \
+                 FROM seq",
+            )
+            .unwrap();
+        assert!(row_values(&r[0])[1].is_null());
+        assert_eq!(row_values(&r[1])[1].to_text(), "a");
+    }
+
+    // -----------------------------------------------------------------------
+    // Conformance suite 028: views
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn conformance_028_create_select_drop_view() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute(
+            "CREATE TABLE products(\
+             id INTEGER PRIMARY KEY, name TEXT, price REAL, category TEXT)",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO products VALUES \
+             (1, 'Widget', 9.99, 'gadgets'), \
+             (2, 'Gizmo', 24.99, 'gadgets'), \
+             (3, 'Doohickey', 4.99, 'tools')",
+        )
+        .unwrap();
+        conn.execute("CREATE VIEW expensive AS SELECT * FROM products WHERE price > 10.0")
+            .unwrap();
+        let r = conn
+            .query("SELECT name FROM expensive ORDER BY name")
+            .unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "Gizmo");
+        assert_eq!(r.len(), 1);
+        conn.execute("DROP VIEW expensive").unwrap();
+    }
+
+    #[test]
+    fn conformance_028_view_with_aggregate() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute(
+            "CREATE TABLE products(\
+             id INTEGER PRIMARY KEY, name TEXT, price REAL, category TEXT)",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO products VALUES \
+             (1, 'Widget', 9.99, 'gadgets'), \
+             (2, 'Gizmo', 24.99, 'gadgets'), \
+             (3, 'Doohickey', 4.99, 'tools'), \
+             (4, 'Thingamajig', 14.99, 'tools'), \
+             (5, 'Whatchamacallit', 49.99, 'gadgets')",
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE VIEW category_stats AS \
+             SELECT category, COUNT(*) as cnt \
+             FROM products GROUP BY category",
+        )
+        .unwrap();
+        let r = conn
+            .query("SELECT category, cnt FROM category_stats ORDER BY category")
+            .unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "gadgets");
+        assert_eq!(row_values(&r[0])[1].to_text(), "3");
+        assert_eq!(row_values(&r[1])[0].to_text(), "tools");
+        assert_eq!(row_values(&r[1])[1].to_text(), "2");
+    }
+
+    #[test]
+    fn conformance_028_view_with_join() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute(
+            "CREATE TABLE products(\
+             id INTEGER PRIMARY KEY, name TEXT, price REAL)",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO products VALUES \
+             (1, 'Widget', 9.99), (2, 'Gizmo', 24.99)",
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE orders(\
+             id INTEGER PRIMARY KEY, product_id INTEGER, qty INTEGER)",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO orders VALUES (1, 1, 10), (2, 2, 5)")
+            .unwrap();
+        conn.execute(
+            "CREATE VIEW order_details AS \
+             SELECT o.id as order_id, p.name, o.qty, \
+             p.price * o.qty as total \
+             FROM orders o JOIN products p ON o.product_id = p.id",
+        )
+        .unwrap();
+        let r = conn
+            .query(
+                "SELECT order_id, name, total \
+                 FROM order_details ORDER BY order_id",
+            )
+            .unwrap();
+        assert_eq!(row_values(&r[0])[1].to_text(), "Widget");
+        assert_eq!(row_values(&r[0])[2].to_text(), "99.9");
+        assert_eq!(row_values(&r[1])[1].to_text(), "Gizmo");
+    }
+
+    #[test]
+    fn conformance_028_create_view_if_not_exists() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1(a INTEGER)").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1), (2), (3)").unwrap();
+        conn.execute("CREATE VIEW v1 AS SELECT a FROM t1").unwrap();
+        conn.execute("CREATE VIEW IF NOT EXISTS v1 AS SELECT 999")
+            .unwrap();
+        let r = conn.query("SELECT COUNT(*) FROM v1").unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "3");
+    }
+
+    // -----------------------------------------------------------------------
+    // Conformance suite 029: GROUP BY and HAVING
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn conformance_029_group_by_basic() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute(
+            "CREATE TABLE orders(\
+             id INTEGER PRIMARY KEY, customer TEXT, amount REAL)",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO orders VALUES \
+             (1,'Alice',50.0),(2,'Bob',30.0),(3,'Alice',70.0),\
+             (4,'Bob',20.0),(5,'Charlie',100.0)",
+        )
+        .unwrap();
+        let r = conn
+            .query(
+                "SELECT customer, SUM(amount) as total \
+                 FROM orders GROUP BY customer ORDER BY customer",
+            )
+            .unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "Alice");
+        assert_eq!(row_values(&r[0])[1].to_text(), "120.0");
+        assert_eq!(row_values(&r[1])[0].to_text(), "Bob");
+        assert_eq!(row_values(&r[1])[1].to_text(), "50.0");
+    }
+
+    #[test]
+    fn conformance_029_having() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute(
+            "CREATE TABLE orders(\
+             id INTEGER PRIMARY KEY, customer TEXT, amount REAL)",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO orders VALUES \
+             (1,'Alice',50.0),(2,'Bob',30.0),(3,'Alice',70.0),\
+             (4,'Bob',20.0),(5,'Charlie',100.0)",
+        )
+        .unwrap();
+        let r = conn
+            .query(
+                "SELECT customer, SUM(amount) as total \
+                 FROM orders GROUP BY customer \
+                 HAVING total > 60 ORDER BY customer",
+            )
+            .unwrap();
+        assert_eq!(r.len(), 2);
+        assert_eq!(row_values(&r[0])[0].to_text(), "Alice");
+        assert_eq!(row_values(&r[1])[0].to_text(), "Charlie");
+    }
+
+    #[test]
+    fn conformance_029_group_by_count_min_max_avg() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute(
+            "CREATE TABLE scores(\
+             student TEXT, subject TEXT, score INTEGER)",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO scores VALUES \
+             ('Alice','Math',90),('Alice','Sci',85),\
+             ('Bob','Math',70),('Bob','Sci',80)",
+        )
+        .unwrap();
+        let r = conn
+            .query(
+                "SELECT student, COUNT(*) as cnt, MIN(score), MAX(score) \
+                 FROM scores GROUP BY student ORDER BY student",
+            )
+            .unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "Alice");
+        assert_eq!(row_values(&r[0])[1].to_text(), "2");
+        assert_eq!(row_values(&r[0])[2].to_text(), "85");
+        assert_eq!(row_values(&r[0])[3].to_text(), "90");
+    }
+
+    #[test]
+    fn conformance_029_group_by_multi_column() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute(
+            "CREATE TABLE log(\
+             dept TEXT, year INTEGER, revenue REAL)",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO log VALUES \
+             ('eng',2024,100.0),('eng',2024,200.0),\
+             ('eng',2025,150.0),('sales',2024,80.0)",
+        )
+        .unwrap();
+        let r = conn
+            .query(
+                "SELECT dept, year, SUM(revenue) as total \
+                 FROM log GROUP BY dept, year ORDER BY dept, year",
+            )
+            .unwrap();
+        assert_eq!(r.len(), 3);
+        assert_eq!(row_values(&r[0])[0].to_text(), "eng");
+        assert_eq!(row_values(&r[0])[1].to_text(), "2024");
+        assert_eq!(row_values(&r[0])[2].to_text(), "300.0");
+    }
+
+    // -----------------------------------------------------------------------
+    // Conformance suite 030: CASE expressions
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn conformance_030_case_searched() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1(id INTEGER PRIMARY KEY, score INTEGER)")
+            .unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1, 95), (2, 72), (3, 45)")
+            .unwrap();
+        let r = conn
+            .query(
+                "SELECT id, \
+                 CASE WHEN score >= 90 THEN 'A' \
+                      WHEN score >= 70 THEN 'B' \
+                      ELSE 'F' END as grade \
+                 FROM t1 ORDER BY id",
+            )
+            .unwrap();
+        assert_eq!(row_values(&r[0])[1].to_text(), "A");
+        assert_eq!(row_values(&r[1])[1].to_text(), "B");
+        assert_eq!(row_values(&r[2])[1].to_text(), "F");
+    }
+
+    #[test]
+    fn conformance_030_case_simple() {
+        let conn = Connection::open(":memory:").unwrap();
+        let r = conn
+            .query(
+                "SELECT CASE 2 \
+                 WHEN 1 THEN 'one' \
+                 WHEN 2 THEN 'two' \
+                 WHEN 3 THEN 'three' \
+                 ELSE 'other' END",
+            )
+            .unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "two");
+    }
+
+    #[test]
+    fn conformance_030_case_null() {
+        let conn = Connection::open(":memory:").unwrap();
+        let r = conn
+            .query(
+                "SELECT CASE NULL \
+                 WHEN NULL THEN 'match' \
+                 ELSE 'no match' END",
+            )
+            .unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "no match");
+        let r = conn
+            .query(
+                "SELECT CASE WHEN NULL THEN 'truthy' \
+                 ELSE 'falsy' END",
+            )
+            .unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "falsy");
+    }
+
+    #[test]
+    fn conformance_030_case_in_aggregate() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE items(id INTEGER PRIMARY KEY, status TEXT)")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO items VALUES \
+             (1,'active'),(2,'inactive'),(3,'active'),\
+             (4,'active'),(5,'inactive')",
+        )
+        .unwrap();
+        let r = conn
+            .query(
+                "SELECT SUM(CASE WHEN status = 'active' \
+                 THEN 1 ELSE 0 END) as active_count FROM items",
+            )
+            .unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "3");
+    }
+
+    // -----------------------------------------------------------------------
+    // Conformance suite 031: INSERT conflict handling
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[ignore = "INSERT OR REPLACE conflict handling not yet implemented"]
+    fn conformance_031_insert_or_replace() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE kv(key TEXT PRIMARY KEY, value TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO kv VALUES ('a', 'first')")
+            .unwrap();
+        conn.execute("INSERT OR REPLACE INTO kv VALUES ('a', 'replaced')")
+            .unwrap();
+        let r = conn.query("SELECT value FROM kv WHERE key = 'a'").unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "replaced");
+    }
+
+    #[test]
+    #[ignore = "INSERT OR IGNORE conflict handling not yet implemented"]
+    fn conformance_031_insert_or_ignore() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE kv(key TEXT PRIMARY KEY, value TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO kv VALUES ('a', 'first')")
+            .unwrap();
+        conn.execute("INSERT OR IGNORE INTO kv VALUES ('a', 'ignored')")
+            .unwrap();
+        let r = conn.query("SELECT value FROM kv WHERE key = 'a'").unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "first");
+        conn.execute("INSERT OR IGNORE INTO kv VALUES ('b', 'new')")
+            .unwrap();
+        let r = conn.query("SELECT COUNT(*) FROM kv").unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "2");
+    }
+
+    #[test]
+    #[ignore = "REPLACE INTO conflict handling not yet implemented"]
+    fn conformance_031_replace_into() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute(
+            "CREATE TABLE t1(\
+             id INTEGER PRIMARY KEY, name TEXT, \
+             score INTEGER DEFAULT 0)",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1, 'Alice', 100)")
+            .unwrap();
+        conn.execute("REPLACE INTO t1 VALUES (1, 'Alice Updated', 200)")
+            .unwrap();
+        let r = conn
+            .query("SELECT name, score FROM t1 WHERE id = 1")
+            .unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "Alice Updated");
+        assert_eq!(row_values(&r[0])[1].to_text(), "200");
+    }
+
+    // -----------------------------------------------------------------------
+    // Conformance suite 032: ALTER TABLE
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn conformance_032_rename_table() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute(
+            "CREATE TABLE original(\
+             id INTEGER PRIMARY KEY, name TEXT)",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO original VALUES (1, 'Alice'), (2, 'Bob')")
+            .unwrap();
+        conn.execute("ALTER TABLE original RENAME TO renamed")
+            .unwrap();
+        let r = conn.query("SELECT name FROM renamed ORDER BY id").unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "Alice");
+        assert_eq!(row_values(&r[1])[0].to_text(), "Bob");
+    }
+
+    #[test]
+    #[ignore = "ALTER TABLE ADD COLUMN DEFAULT values not yet returned for existing rows"]
+    fn conformance_032_add_column() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1(id INTEGER PRIMARY KEY, name TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1, 'Alice'), (2, 'Bob')")
+            .unwrap();
+        conn.execute("ALTER TABLE t1 ADD COLUMN score INTEGER DEFAULT 0")
+            .unwrap();
+        let r = conn
+            .query("SELECT name, score FROM t1 ORDER BY id")
+            .unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "Alice");
+        assert_eq!(row_values(&r[0])[1].to_text(), "0");
+        conn.execute("INSERT INTO t1 VALUES (3, 'Charlie', 95)")
+            .unwrap();
+        let r = conn
+            .query("SELECT name, score FROM t1 WHERE id = 3")
+            .unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "Charlie");
+        assert_eq!(row_values(&r[0])[1].to_text(), "95");
+    }
+
+    #[test]
+    #[ignore = "ALTER TABLE ADD COLUMN DEFAULT values not yet returned for existing rows"]
+    fn conformance_032_add_multiple_columns() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1(id INTEGER PRIMARY KEY, name TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1, 'Alice'), (2, 'Bob')")
+            .unwrap();
+        conn.execute("ALTER TABLE t1 ADD COLUMN score INTEGER DEFAULT 0")
+            .unwrap();
+        conn.execute("ALTER TABLE t1 ADD COLUMN active INTEGER DEFAULT 1")
+            .unwrap();
+        let r = conn
+            .query("SELECT name, active FROM t1 ORDER BY id")
+            .unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "Alice");
+        assert_eq!(row_values(&r[0])[1].to_text(), "1");
+        assert_eq!(row_values(&r[1])[0].to_text(), "Bob");
+        assert_eq!(row_values(&r[1])[1].to_text(), "1");
     }
 }

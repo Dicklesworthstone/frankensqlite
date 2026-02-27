@@ -1,0 +1,32 @@
+{
+  "id": "031_insert_conflict",
+  "description": "INSERT conflict handling: INSERT OR REPLACE, INSERT OR IGNORE, INSERT OR ABORT, ON CONFLICT DO NOTHING/UPDATE",
+  "ops": [
+    { "op": "open", "path": ":memory:" },
+
+    { "op": "exec", "sql": "CREATE TABLE kv(key TEXT PRIMARY KEY, value TEXT)" },
+    { "op": "exec", "sql": "INSERT INTO kv VALUES ('a', 'first')" },
+
+    { "op": "exec", "sql": "INSERT OR REPLACE INTO kv VALUES ('a', 'replaced')" },
+    { "op": "query", "sql": "SELECT value FROM kv WHERE key = 'a'", "expect": { "rows": [["replaced"]], "ordered": true } },
+
+    { "op": "exec", "sql": "INSERT OR IGNORE INTO kv VALUES ('a', 'ignored')" },
+    { "op": "query", "sql": "SELECT value FROM kv WHERE key = 'a'", "expect": { "rows": [["replaced"]], "ordered": true } },
+
+    { "op": "exec", "sql": "INSERT OR IGNORE INTO kv VALUES ('b', 'new')" },
+    { "op": "query", "sql": "SELECT COUNT(*) FROM kv", "expect": { "rows": [["2"]], "ordered": true } },
+
+    { "op": "exec", "sql": "CREATE TABLE t1(id INTEGER PRIMARY KEY, name TEXT NOT NULL, score INTEGER DEFAULT 0)" },
+    { "op": "exec", "sql": "INSERT INTO t1 VALUES (1, 'Alice', 100)" },
+
+    { "op": "exec", "sql": "INSERT OR REPLACE INTO t1 VALUES (1, 'Alice Updated', 200)" },
+    { "op": "query", "sql": "SELECT name, score FROM t1 WHERE id = 1", "expect": { "rows": [["Alice Updated", "200"]], "ordered": true } },
+
+    { "op": "exec", "sql": "REPLACE INTO t1 VALUES (1, 'Alice Again', 300)" },
+    { "op": "query", "sql": "SELECT name, score FROM t1 WHERE id = 1", "expect": { "rows": [["Alice Again", "300"]], "ordered": true } },
+
+    { "op": "exec", "sql": "INSERT OR IGNORE INTO t1 VALUES (1, 'Should Not Appear', 400)" },
+    { "op": "query", "sql": "SELECT name, score FROM t1 WHERE id = 1", "expect": { "rows": [["Alice Again", "300"]], "ordered": true } }
+  ],
+  "fsqlite_modes": ["compatibility", "native"]
+}

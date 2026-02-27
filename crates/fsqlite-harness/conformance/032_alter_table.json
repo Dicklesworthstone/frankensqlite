@@ -1,0 +1,23 @@
+{
+  "id": "032_alter_table",
+  "description": "ALTER TABLE parity: RENAME TABLE, ADD COLUMN, RENAME COLUMN",
+  "ops": [
+    { "op": "open", "path": ":memory:" },
+
+    { "op": "exec", "sql": "CREATE TABLE original(id INTEGER PRIMARY KEY, name TEXT)" },
+    { "op": "exec", "sql": "INSERT INTO original VALUES (1, 'Alice'), (2, 'Bob')" },
+
+    { "op": "exec", "sql": "ALTER TABLE original RENAME TO renamed" },
+    { "op": "query", "sql": "SELECT name FROM renamed ORDER BY id", "expect": { "rows": [["Alice"], ["Bob"]], "ordered": true } },
+
+    { "op": "exec", "sql": "ALTER TABLE renamed ADD COLUMN score INTEGER DEFAULT 0" },
+    { "op": "query", "sql": "SELECT name, score FROM renamed ORDER BY id", "expect": { "rows": [["Alice", "0"], ["Bob", "0"]], "ordered": true } },
+
+    { "op": "exec", "sql": "INSERT INTO renamed VALUES (3, 'Charlie', 95)" },
+    { "op": "query", "sql": "SELECT name, score FROM renamed WHERE id = 3", "expect": { "rows": [["Charlie", "95"]], "ordered": true } },
+
+    { "op": "exec", "sql": "ALTER TABLE renamed ADD COLUMN active INTEGER DEFAULT 1" },
+    { "op": "query", "sql": "SELECT name, active FROM renamed ORDER BY id", "expect": { "rows": [["Alice", "1"], ["Bob", "1"], ["Charlie", "1"]], "ordered": true } }
+  ],
+  "fsqlite_modes": ["compatibility", "native"]
+}

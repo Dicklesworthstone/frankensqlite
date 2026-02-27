@@ -1,0 +1,29 @@
+{
+  "id": "030_case_expressions",
+  "description": "CASE expression parity: simple CASE, searched CASE, CASE with NULL, nested CASE, CASE in ORDER BY, CASE in aggregate",
+  "ops": [
+    { "op": "open", "path": ":memory:" },
+
+    { "op": "exec", "sql": "CREATE TABLE students(id INTEGER PRIMARY KEY, name TEXT, grade INTEGER)" },
+    { "op": "exec", "sql": "INSERT INTO students VALUES (1, 'Alice', 95), (2, 'Bob', 82), (3, 'Charlie', 71), (4, 'Diana', 60), (5, 'Eve', 45), (6, 'Frank', NULL)" },
+
+    { "op": "query", "sql": "SELECT name, CASE WHEN grade >= 90 THEN 'A' WHEN grade >= 80 THEN 'B' WHEN grade >= 70 THEN 'C' WHEN grade >= 60 THEN 'D' ELSE 'F' END as letter FROM students WHERE grade IS NOT NULL ORDER BY name", "expect": { "rows": [["Alice", "A"], ["Bob", "B"], ["Charlie", "C"], ["Diana", "D"], ["Eve", "F"]], "ordered": true } },
+
+    { "op": "query", "sql": "SELECT name, CASE WHEN grade IS NULL THEN 'N/A' ELSE CAST(grade AS TEXT) END as display FROM students ORDER BY name", "expect": { "rows": [["Alice", "95"], ["Bob", "82"], ["Charlie", "71"], ["Diana", "60"], ["Eve", "45"], ["Frank", "N/A"]], "ordered": true } },
+
+    { "op": "query", "sql": "SELECT CASE 1 WHEN 1 THEN 'one' WHEN 2 THEN 'two' ELSE 'other' END", "expect": { "rows": [["one"]], "ordered": true } },
+    { "op": "query", "sql": "SELECT CASE 3 WHEN 1 THEN 'one' WHEN 2 THEN 'two' ELSE 'other' END", "expect": { "rows": [["other"]], "ordered": true } },
+    { "op": "query", "sql": "SELECT CASE NULL WHEN NULL THEN 'match' ELSE 'no match' END", "expect": { "rows": [["no match"]], "ordered": true } },
+
+    { "op": "query", "sql": "SELECT CASE WHEN NULL THEN 'true' ELSE 'false' END", "expect": { "rows": [["false"]], "ordered": true } },
+
+    { "op": "query", "sql": "SELECT CASE WHEN grade >= 70 THEN CASE WHEN grade >= 90 THEN 'honors' ELSE 'pass' END ELSE 'fail' END as result, name FROM students WHERE grade IS NOT NULL ORDER BY name", "expect": { "rows": [["honors", "Alice"], ["pass", "Bob"], ["pass", "Charlie"], ["fail", "Diana"], ["fail", "Eve"]], "ordered": true } },
+
+    { "op": "query", "sql": "SELECT COUNT(CASE WHEN grade >= 70 THEN 1 END) as passing, COUNT(CASE WHEN grade < 70 THEN 1 END) as failing FROM students", "expect": { "rows": [["3", "2"]], "ordered": true } },
+
+    { "op": "query", "sql": "SELECT SUM(CASE WHEN grade >= 80 THEN grade ELSE 0 END) as top_sum FROM students", "expect": { "rows": [["177"]], "ordered": true } },
+
+    { "op": "query", "sql": "SELECT name FROM students WHERE grade IS NOT NULL ORDER BY CASE WHEN grade >= 90 THEN 0 WHEN grade >= 80 THEN 1 ELSE 2 END, name", "expect": { "rows": [["Alice"], ["Bob"], ["Charlie"], ["Diana"], ["Eve"]], "ordered": true } }
+  ],
+  "fsqlite_modes": ["compatibility", "native"]
+}

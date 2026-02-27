@@ -1,0 +1,29 @@
+{
+  "id": "029_group_by_having",
+  "description": "GROUP BY and HAVING parity: basic grouping, HAVING filter, multi-column GROUP BY, GROUP BY with expressions, aggregate in HAVING",
+  "ops": [
+    { "op": "open", "path": ":memory:" },
+
+    { "op": "exec", "sql": "CREATE TABLE sales(id INTEGER PRIMARY KEY, product TEXT, region TEXT, amount INTEGER, year INTEGER)" },
+    { "op": "exec", "sql": "INSERT INTO sales VALUES (1,'A','north',100,2024),(2,'B','north',200,2024),(3,'A','south',150,2024),(4,'B','south',300,2024),(5,'A','north',120,2025),(6,'B','north',250,2025),(7,'A','south',180,2025),(8,'C','north',50,2024)" },
+
+    { "op": "query", "sql": "SELECT product, SUM(amount) as total FROM sales GROUP BY product ORDER BY product", "expect": { "rows": [["A", "550"], ["B", "750"], ["C", "50"]], "ordered": true } },
+
+    { "op": "query", "sql": "SELECT product, COUNT(*) as cnt FROM sales GROUP BY product ORDER BY product", "expect": { "rows": [["A", "4"], ["B", "4"], ["C", "1"]], "ordered": true } },
+
+    { "op": "query", "sql": "SELECT region, SUM(amount) as total FROM sales GROUP BY region ORDER BY region", "expect": { "rows": [["north", "720"], ["south", "630"]], "ordered": true } },
+
+    { "op": "query", "sql": "SELECT product, SUM(amount) as total FROM sales GROUP BY product HAVING SUM(amount) > 100 ORDER BY product", "expect": { "rows": [["A", "550"], ["B", "750"]], "ordered": true } },
+
+    { "op": "query", "sql": "SELECT product, COUNT(*) as cnt FROM sales GROUP BY product HAVING COUNT(*) > 1 ORDER BY product", "expect": { "rows": [["A", "4"], ["B", "4"]], "ordered": true } },
+
+    { "op": "query", "sql": "SELECT product, region, SUM(amount) as total FROM sales GROUP BY product, region ORDER BY product, region", "expect": { "rows": [["A", "north", "220"], ["A", "south", "330"], ["B", "north", "450"], ["B", "south", "300"], ["C", "north", "50"]], "ordered": true } },
+
+    { "op": "query", "sql": "SELECT year, SUM(amount) as total FROM sales GROUP BY year ORDER BY year", "expect": { "rows": [["2024", "800"], ["2025", "550"]], "ordered": true } },
+
+    { "op": "query", "sql": "SELECT product, MIN(amount) as min_amt, MAX(amount) as max_amt, AVG(amount) as avg_amt FROM sales GROUP BY product ORDER BY product", "expect": { "rows": [["A", "100", "180", "137.5"], ["B", "200", "300", "250.0"], ["C", "50", "50", "50.0"]], "ordered": true } },
+
+    { "op": "query", "sql": "SELECT product, region, SUM(amount) as total FROM sales GROUP BY product, region HAVING SUM(amount) > 200 ORDER BY total DESC", "expect": { "rows": [["B", "north", "450"], ["A", "south", "330"], ["B", "south", "300"], ["A", "north", "220"]], "ordered": true } }
+  ],
+  "fsqlite_modes": ["compatibility", "native"]
+}

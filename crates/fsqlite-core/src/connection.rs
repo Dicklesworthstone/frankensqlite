@@ -29,8 +29,8 @@ use fsqlite_btree::BtreeCursorOps;
 use fsqlite_btree::cursor::TransactionPageIo;
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_func::{
-    FunctionRegistry, get_last_changes, get_last_insert_rowid, get_total_changes,
-    reset_total_changes, set_last_changes, set_last_insert_rowid,
+    ErasedWindowFunction, FunctionRegistry, get_last_changes, get_last_insert_rowid,
+    get_total_changes, reset_total_changes, set_last_changes, set_last_insert_rowid,
 };
 use fsqlite_pager::traits::{MvccPager, TransactionHandle, TransactionMode};
 use fsqlite_pager::{CheckpointMode, JournalMode, PageCacheMetricsSnapshot, SimplePager};
@@ -1911,6 +1911,22 @@ impl Connection {
                         apply_limit_clause(&mut rows, &limit);
                     }
                     Ok(rows)
+                } else if has_window_functions(select) {
+                    // Window function fallback: materialize rows, sort by
+                    // window spec, compute window functions at connection level.
+                    self.log_mem_execution_fallback("select", "window_function_fallback")?;
+                    let rewritten = self.rewrite_in_subqueries_select(select, params)?;
+                    let mut bound =
+                        bind_placeholders_in_select_for_fallback(&rewritten, params)?;
+                    let limit_clause = bound.limit.take();
+                    let mut rows = self.execute_window_select(&bound, None)?;
+                    if distinct {
+                        dedup_rows(&mut rows);
+                    }
+                    if let Some(limit) = limit_clause {
+                        apply_limit_clause(&mut rows, &limit);
+                    }
+                    Ok(rows)
                 } else if select_contains_match_operator(select) {
                     // The VDBE path does not yet support MATCH/REGEXP in this
                     // connection path. Route through fallback evaluation.
@@ -3677,7 +3693,7 @@ impl Connection {
 
     /// Finalize an implicit (autocommit) transaction: commit on success,
     /// rollback on error.  No-op when `was_auto` is `false`.
-    fn resolve_autocommit_txn(&self, was_auto: bool, mut ok: bool) -> Result<()> {
+    fn resolve_autocommit_txn(&self, was_auto: bool, ok: bool) -> Result<()> {
         if !was_auto {
             return Ok(());
         }
@@ -3707,17 +3723,10 @@ impl Connection {
                         // Plan failed (SSI conflict, etc.) — abort under the
                         // mutex so we still hold sequencing invariants.
                         drop(_commit_guard);
-                        if let Some(session_id) =
-                            self.concurrent_session_id.borrow_mut().take()
-                        {
-                            let mut registry =
-                                lock_unpoisoned(&self.concurrent_registry);
+                        if let Some(session_id) = self.concurrent_session_id.borrow_mut().take() {
+                            let mut registry = lock_unpoisoned(&self.concurrent_registry);
                             if let Some(handle) = registry.get_mut(session_id) {
-                                concurrent_abort(
-                                    handle,
-                                    &self.concurrent_lock_table,
-                                    session_id,
-                                );
+                                concurrent_abort(handle, &self.concurrent_lock_table, session_id);
                             }
                             registry.remove(session_id);
                         }
@@ -4450,7 +4459,13 @@ impl Connection {
                 // Execute the SELECT to get result rows.
                 let rows = self.execute_statement(Statement::Select(*select_stmt.clone()), None)?;
                 // Infer column names from the SELECT columns.
-                let col_names = infer_select_column_names(select_stmt);
+                let inferred_cols = infer_select_column_names(select_stmt);
+                let col_names = if inferred_cols.is_empty() {
+                    inferred_cols
+                } else {
+                    let schema_ref = self.schema.borrow();
+                    resolve_cte_column_names_with_schema(&inferred_cols, select_stmt, &schema_ref)
+                };
                 let width = rows.first().map_or(
                     if col_names.is_empty() {
                         1
@@ -5356,7 +5371,13 @@ impl Connection {
                     })?;
                 let view_rows =
                     self.execute_statement(Statement::Select(view.query.clone()), params)?;
-                let col_names = infer_select_column_names(&view.query);
+                let inferred = infer_select_column_names(&view.query);
+                let col_names = if inferred.is_empty() {
+                    inferred
+                } else {
+                    let schema_ref = self.schema.borrow();
+                    resolve_cte_column_names_with_schema(&inferred, &view.query, &schema_ref)
+                };
                 let width = if col_names.is_empty() {
                     view_rows.first().map_or(1, |r| r.values().len())
                 } else {
@@ -8151,6 +8172,289 @@ impl Connection {
         Ok(result)
     }
 
+    /// Execute a SELECT containing window functions at the connection level.
+    ///
+    /// Pipeline:
+    /// 1. Materialize all rows via `SELECT *` raw scan
+    /// 2. Sort by PARTITION BY then ORDER BY from the window spec
+    /// 3. Group rows into partitions
+    /// 4. For each partition, step/value through each window function
+    /// 5. Assemble result rows with window values alongside plain columns
+    #[allow(clippy::too_many_lines)]
+    fn execute_window_select(
+        &self,
+        select: &SelectStatement,
+        params: Option<&[SqliteValue]>,
+    ) -> Result<Vec<Row>> {
+        let SelectCore::Select { columns, from, .. } = &select.body.select else {
+            return Err(FrankenError::NotImplemented(
+                "window functions on VALUES".to_owned(),
+            ));
+        };
+
+        // Resolve table name and alias.
+        let (table_name, table_alias) = match from {
+            Some(from) => match &from.source {
+                TableOrSubquery::Table { name, alias, .. } => (name.name.clone(), alias.clone()),
+                _ => {
+                    return Err(FrankenError::NotImplemented(
+                        "window functions with non-table source".to_owned(),
+                    ));
+                }
+            },
+            None => {
+                return Err(FrankenError::NotImplemented(
+                    "window functions without FROM".to_owned(),
+                ));
+            }
+        };
+
+        // Build column map and expand Star/TableStar under schema borrow.
+        let (col_map, expanded_columns) = {
+            let schema = self.schema.borrow();
+            let table_schema = schema
+                .iter()
+                .find(|t| t.name.eq_ignore_ascii_case(&table_name))
+                .ok_or_else(|| FrankenError::Internal(format!("table not found: {table_name}")))?;
+            let effective_label = table_alias.as_deref().unwrap_or(&table_name);
+            let cmap: Vec<(String, String)> = table_schema
+                .columns
+                .iter()
+                .map(|c| (effective_label.to_owned(), c.name.clone()))
+                .collect();
+            let expanded: Vec<ResultColumn> = columns
+                .iter()
+                .flat_map(|col| match col {
+                    ResultColumn::Star => table_schema
+                        .columns
+                        .iter()
+                        .map(|c| ResultColumn::Expr {
+                            expr: Expr::Column(ColumnRef::bare(c.name.clone()), Span::new(0, 0)),
+                            alias: None,
+                        })
+                        .collect::<Vec<_>>(),
+                    ResultColumn::TableStar(tbl)
+                        if tbl.eq_ignore_ascii_case(&table_name)
+                            || table_alias
+                                .as_ref()
+                                .is_some_and(|a| tbl.eq_ignore_ascii_case(a)) =>
+                    {
+                        table_schema
+                            .columns
+                            .iter()
+                            .map(|c| ResultColumn::Expr {
+                                expr: Expr::Column(
+                                    ColumnRef::bare(c.name.clone()),
+                                    Span::new(0, 0),
+                                ),
+                                alias: None,
+                            })
+                            .collect::<Vec<_>>()
+                    }
+                    other => vec![other.clone()],
+                })
+                .collect();
+            (cmap, expanded)
+        };
+
+        // Classify each result column as plain or window-function.
+        // Window columns store their index into the parallel win_* vecs.
+        enum ColKind {
+            Plain(Expr),
+            Window(usize),
+        }
+        let registry = self.func_registry.borrow().clone();
+        let mut col_kinds = Vec::with_capacity(expanded_columns.len());
+        let mut win_funcs: Vec<Arc<ErasedWindowFunction>> = Vec::new();
+        let mut win_args: Vec<Vec<Expr>> = Vec::new();
+        let mut win_order_by: Vec<Vec<(Expr, bool)>> = Vec::new();
+        let mut win_partition_by: Vec<Vec<Expr>> = Vec::new();
+        let mut win_two_pass: Vec<bool> = Vec::new();
+
+        for col in &expanded_columns {
+            match col {
+                ResultColumn::Expr {
+                    expr:
+                        Expr::FunctionCall {
+                            name,
+                            args,
+                            over: Some(spec),
+                            ..
+                        },
+                    ..
+                } => {
+                    let arg_exprs = match args {
+                        FunctionArgs::List(exprs) => exprs.clone(),
+                        FunctionArgs::Star => vec![],
+                    };
+                    #[allow(clippy::cast_possible_wrap)]
+                    let num_args = arg_exprs.len() as i32;
+                    let func = registry.find_window(name, num_args).ok_or_else(|| {
+                        FrankenError::Internal(format!(
+                            "no such window function: {name}/{num_args}"
+                        ))
+                    })?;
+                    let ob: Vec<(Expr, bool)> = spec
+                        .order_by
+                        .iter()
+                        .map(|t| {
+                            (
+                                t.expr.clone(),
+                                matches!(t.direction, Some(SortDirection::Desc)),
+                            )
+                        })
+                        .collect();
+                    let pb = spec.partition_by.clone();
+                    let two_pass = name.eq_ignore_ascii_case("lead");
+                    let idx = win_funcs.len();
+                    win_funcs.push(func);
+                    win_args.push(arg_exprs);
+                    win_order_by.push(ob);
+                    win_partition_by.push(pb);
+                    win_two_pass.push(two_pass);
+                    col_kinds.push(ColKind::Window(idx));
+                }
+                ResultColumn::Expr { expr, .. } => {
+                    col_kinds.push(ColKind::Plain(expr.clone()));
+                }
+                _ => {
+                    return Err(FrankenError::Internal(
+                        "unexpected Star/TableStar after expansion".to_owned(),
+                    ));
+                }
+            }
+        }
+
+        // Execute raw SELECT * scan.
+        let raw_select = build_raw_scan_select(select);
+        let program = self.compile_table_select(&raw_select)?;
+        let raw_rows = self.execute_table_program(&program, params)?;
+
+        let mut row_values: Vec<Vec<SqliteValue>> =
+            raw_rows.iter().map(|r| r.values().to_vec()).collect();
+
+        // Sort rows by PARTITION BY then ORDER BY from the first window spec.
+        if let (Some(pb), Some(ob)) = (win_partition_by.first(), win_order_by.first()) {
+            let pb = pb.clone();
+            let ob = ob.clone();
+            row_values.sort_by(|a, b| {
+                for pexpr in &pb {
+                    let va = eval_join_expr(pexpr, a, &col_map).unwrap_or(SqliteValue::Null);
+                    let vb = eval_join_expr(pexpr, b, &col_map).unwrap_or(SqliteValue::Null);
+                    let ord = cmp_sqlite_values(&va, &vb);
+                    if ord != std::cmp::Ordering::Equal {
+                        return ord;
+                    }
+                }
+                for (oexpr, desc) in &ob {
+                    let va = eval_join_expr(oexpr, a, &col_map).unwrap_or(SqliteValue::Null);
+                    let vb = eval_join_expr(oexpr, b, &col_map).unwrap_or(SqliteValue::Null);
+                    let ord = cmp_sqlite_values(&va, &vb);
+                    let ord = if *desc { ord.reverse() } else { ord };
+                    if ord != std::cmp::Ordering::Equal {
+                        return ord;
+                    }
+                }
+                std::cmp::Ordering::Equal
+            });
+        }
+
+        // Build partitions: groups of row indices with equal PARTITION BY keys.
+        let partition_by = win_partition_by
+            .first()
+            .map_or(&[] as &[Expr], Vec::as_slice);
+        let partitions: Vec<Vec<usize>> = if partition_by.is_empty() {
+            vec![(0..row_values.len()).collect()]
+        } else {
+            let mut parts: Vec<(Vec<SqliteValue>, Vec<usize>)> = Vec::new();
+            for (i, row) in row_values.iter().enumerate() {
+                let key: Vec<SqliteValue> = partition_by
+                    .iter()
+                    .map(|e| eval_join_expr(e, row, &col_map).unwrap_or(SqliteValue::Null))
+                    .collect();
+                if let Some(part) = parts.iter_mut().find(|(k, _)| k == &key) {
+                    part.1.push(i);
+                } else {
+                    parts.push((key, vec![i]));
+                }
+            }
+            parts.into_iter().map(|(_, indices)| indices).collect()
+        };
+
+        // Compute window function values for each partition.
+        let total_rows = row_values.len();
+        let mut window_results: Vec<Vec<SqliteValue>> =
+            vec![Vec::with_capacity(total_rows); win_funcs.len()];
+
+        for partition_indices in &partitions {
+            for (wi, func) in win_funcs.iter().enumerate() {
+                let mut state = func.initial_state();
+                if win_two_pass[wi] {
+                    // Two-pass (lead): step all rows, then value+inverse.
+                    for &ri in partition_indices {
+                        let args = build_window_args(
+                            &win_args[wi],
+                            &win_order_by[wi],
+                            &row_values[ri],
+                            &col_map,
+                        )?;
+                        func.step(&mut state, &args)?;
+                    }
+                    for _ in partition_indices {
+                        window_results[wi].push(func.value(&state)?);
+                        func.inverse(&mut state, &[])?;
+                    }
+                } else {
+                    // Single-pass: step then value per row.
+                    for &ri in partition_indices {
+                        let args = build_window_args(
+                            &win_args[wi],
+                            &win_order_by[wi],
+                            &row_values[ri],
+                            &col_map,
+                        )?;
+                        func.step(&mut state, &args)?;
+                        window_results[wi].push(func.value(&state)?);
+                    }
+                }
+            }
+        }
+
+        // Build result rows in partition order.
+        let mut result = Vec::with_capacity(total_rows);
+        let mut win_row = 0;
+        for partition_indices in &partitions {
+            for &ri in partition_indices {
+                let row = &row_values[ri];
+                let mut values = Vec::with_capacity(col_kinds.len());
+                for kind in &col_kinds {
+                    match kind {
+                        ColKind::Plain(expr) => {
+                            values.push(eval_join_expr(expr, row, &col_map)?);
+                        }
+                        ColKind::Window(wi) => {
+                            values.push(window_results[*wi][win_row].clone());
+                        }
+                    }
+                }
+                result.push(Row { values });
+                win_row += 1;
+            }
+        }
+
+        // Apply outer ORDER BY if present.
+        if !select.order_by.is_empty() {
+            sort_rows_by_order_terms(&mut result, &select.order_by, &expanded_columns)?;
+        }
+
+        // Apply LIMIT/OFFSET.
+        if let Some(ref limit_clause) = select.limit {
+            apply_limit_clause(&mut result, limit_clause);
+        }
+
+        Ok(result)
+    }
+
     /// Execute a compound SELECT (UNION/UNION ALL/INTERSECT/EXCEPT).
     ///
     /// Executes each SELECT arm independently, then combines results according
@@ -8262,7 +8566,8 @@ impl Connection {
                             let width = cte_rows.first().map_or(1, |r| r.values().len());
                             (0..width).map(|i| format!("_c{i}")).collect()
                         } else {
-                            inferred
+                            let schema_ref = self.schema.borrow();
+                            resolve_cte_column_names_with_schema(&inferred, &cte.query, &schema_ref)
                         }
                     } else {
                         cte.columns.clone()
@@ -8339,7 +8644,8 @@ impl Connection {
             if inferred.is_empty() {
                 vec!["_c0".to_owned()]
             } else {
-                inferred
+                let schema_ref = self.schema.borrow();
+                resolve_cte_column_names_with_schema(&inferred, &cte.query, &schema_ref)
             }
         } else {
             cte.columns.clone()
@@ -9485,6 +9791,36 @@ fn has_group_by(select: &SelectStatement) -> bool {
     )
 }
 
+/// Check whether any result column in a SELECT contains a window function
+/// (a function call with an OVER clause).
+fn has_window_functions(select: &SelectStatement) -> bool {
+    if let SelectCore::Select { columns, .. } = &select.body.select {
+        columns.iter().any(|col| {
+            if let ResultColumn::Expr { expr, .. } = col {
+                expr_has_window_function(expr)
+            } else {
+                false
+            }
+        })
+    } else {
+        false
+    }
+}
+
+/// Recursively check whether an expression contains a window function call.
+fn expr_has_window_function(expr: &Expr) -> bool {
+    match expr {
+        Expr::FunctionCall { over: Some(_), .. } => true,
+        Expr::BinaryOp { left, right, .. } => {
+            expr_has_window_function(left) || expr_has_window_function(right)
+        }
+        Expr::UnaryOp { expr: inner, .. } | Expr::Cast { expr: inner, .. } => {
+            expr_has_window_function(inner)
+        }
+        _ => false,
+    }
+}
+
 /// Check whether a table-backed SELECT has JOINs in the FROM clause.
 fn has_joins(select: &SelectStatement) -> bool {
     matches!(
@@ -9915,6 +10251,81 @@ fn infer_select_column_names(select: &SelectStatement) -> Vec<String> {
             .collect()
     } else {
         Vec::new()
+    }
+}
+
+/// Resolve CTE/view column names by expanding `*` and `table.*` using the schema.
+fn resolve_cte_column_names_with_schema(
+    inferred: &[String],
+    select: &SelectStatement,
+    schema: &[TableSchema],
+) -> Vec<String> {
+    if !inferred.iter().any(|n| n == "*" || n.ends_with(".*")) {
+        return inferred.to_vec();
+    }
+    let core = &select.body.select;
+    let from_tables = extract_from_table_names(core);
+    let mut result = Vec::new();
+    for name in inferred {
+        if name == "*" {
+            let mut expanded = false;
+            for tbl_name in &from_tables {
+                if let Some(tbl_schema) = schema
+                    .iter()
+                    .find(|t| t.name.eq_ignore_ascii_case(tbl_name))
+                {
+                    for col in &tbl_schema.columns {
+                        result.push(col.name.clone());
+                    }
+                    expanded = true;
+                }
+            }
+            if !expanded {
+                result.push(name.clone());
+            }
+        } else if let Some(prefix) = name.strip_suffix(".*") {
+            if let Some(tbl_schema) = schema.iter().find(|t| t.name.eq_ignore_ascii_case(prefix)) {
+                for col in &tbl_schema.columns {
+                    result.push(col.name.clone());
+                }
+            } else {
+                result.push(name.clone());
+            }
+        } else {
+            result.push(name.clone());
+        }
+    }
+    result
+}
+
+fn extract_from_table_names(core: &SelectCore) -> Vec<String> {
+    if let SelectCore::Select {
+        from: Some(from), ..
+    } = core
+    {
+        let mut names = Vec::new();
+        collect_table_names_from_source(&from.source, &mut names);
+        for join in &from.joins {
+            collect_table_names_from_source(&join.table, &mut names);
+        }
+        names
+    } else {
+        Vec::new()
+    }
+}
+
+fn collect_table_names_from_source(source: &TableOrSubquery, out: &mut Vec<String>) {
+    match source {
+        TableOrSubquery::Table { name, .. } => {
+            out.push(name.name.clone());
+        }
+        TableOrSubquery::ParenJoin(from) => {
+            collect_table_names_from_source(&from.source, out);
+            for join in &from.joins {
+                collect_table_names_from_source(&join.table, out);
+            }
+        }
+        TableOrSubquery::Subquery { .. } | TableOrSubquery::TableFunction { .. } => {}
     }
 }
 
@@ -10388,6 +10799,30 @@ fn normalize_indexed_column_term(
         collation,
         direction: indexed.direction,
     })
+}
+
+/// Build arguments for a window function `step()` call.
+///
+/// For functions with explicit args (lag, lead, etc.), evaluates those args.
+/// For pure-numbering functions (row_number, rank, dense_rank) with no
+/// explicit args, passes the ORDER BY values so they can detect peer groups.
+fn build_window_args(
+    func_args: &[Expr],
+    order_by: &[(Expr, bool)],
+    row: &[SqliteValue],
+    col_map: &[(String, String)],
+) -> Result<Vec<SqliteValue>> {
+    if func_args.is_empty() {
+        order_by
+            .iter()
+            .map(|(expr, _)| eval_join_expr(expr, row, col_map))
+            .collect()
+    } else {
+        func_args
+            .iter()
+            .map(|expr| eval_join_expr(expr, row, col_map))
+            .collect()
+    }
 }
 
 /// Build a `SELECT *` scan from a GROUP BY SELECT (strips aggregates and GROUP BY).
@@ -14564,14 +14999,29 @@ fn eval_scalar_fn(name: &str, args: &[SqliteValue]) -> SqliteValue {
     }
 
     match lower.as_str() {
-        "length" | "len" => {
-            if let Some(SqliteValue::Text(s)) = args.first() {
+        "length" | "len" => match args.first() {
+            Some(SqliteValue::Text(s)) => {
+                // C SQLite: length() returns character count, not byte count.
                 #[allow(clippy::cast_possible_wrap)]
-                SqliteValue::Integer(s.len() as i64)
-            } else {
-                SqliteValue::Null
+                SqliteValue::Integer(s.chars().count() as i64)
             }
-        }
+            Some(SqliteValue::Blob(b)) =>
+            {
+                #[allow(clippy::cast_possible_wrap)]
+                SqliteValue::Integer(b.len() as i64)
+            }
+            Some(SqliteValue::Integer(n)) =>
+            {
+                #[allow(clippy::cast_possible_wrap)]
+                SqliteValue::Integer(n.to_string().len() as i64)
+            }
+            Some(SqliteValue::Float(f)) =>
+            {
+                #[allow(clippy::cast_possible_wrap)]
+                SqliteValue::Integer(f.to_string().len() as i64)
+            }
+            _ => SqliteValue::Null,
+        },
         "upper" => {
             if let Some(SqliteValue::Text(s)) = args.first() {
                 SqliteValue::Text(s.to_ascii_uppercase())
@@ -14696,8 +15146,11 @@ fn eval_scalar_fn(name: &str, args: &[SqliteValue]) -> SqliteValue {
             if args.len() >= 2 {
                 let haystack = sqlite_value_to_text(&args[0]);
                 let needle = sqlite_value_to_text(&args[1]);
+                // C SQLite: instr() returns 1-based character position, not byte offset.
                 #[allow(clippy::cast_possible_wrap)]
-                let pos = haystack.find(&needle).map_or(0i64, |i| (i + 1) as i64);
+                let pos = haystack.find(&needle).map_or(0i64, |byte_pos| {
+                    (haystack[..byte_pos].chars().count() + 1) as i64
+                });
                 SqliteValue::Integer(pos)
             } else {
                 SqliteValue::Null
@@ -14747,7 +15200,22 @@ fn eval_scalar_fn(name: &str, args: &[SqliteValue]) -> SqliteValue {
         "quote" => match args.first() {
             Some(SqliteValue::Null) => SqliteValue::Text("NULL".to_owned()),
             Some(SqliteValue::Integer(n)) => SqliteValue::Text(n.to_string()),
-            Some(SqliteValue::Float(f)) => SqliteValue::Text(f.to_string()),
+            Some(SqliteValue::Float(f)) => {
+                // C SQLite always includes a decimal point for floats.
+                let s = f.to_string();
+                SqliteValue::Text(
+                    if s.contains('.')
+                        || s.contains('e')
+                        || s.contains('E')
+                        || s.contains("inf")
+                        || s.contains("nan")
+                    {
+                        s
+                    } else {
+                        format!("{s}.0")
+                    },
+                )
+            }
             Some(SqliteValue::Text(s)) => SqliteValue::Text(format!("'{}'", s.replace('\'', "''"))),
             Some(SqliteValue::Blob(b)) => {
                 use std::fmt::Write;
@@ -30549,10 +31017,7 @@ mod pager_routing_tests {
         // New name should work and data should be intact
         let rows = conn.query("SELECT val FROM new_name;").unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].values()[0],
-            SqliteValue::Text("data".to_owned())
-        );
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("data".to_owned()));
     }
 
     #[test]
@@ -30567,10 +31032,7 @@ mod pager_routing_tests {
         conn.execute("INSERT INTO acd (id, a) VALUES (1, 'hello');")
             .unwrap();
         let rows = conn.query("SELECT a, b FROM acd;").unwrap();
-        assert_eq!(
-            rows[0].values()[0],
-            SqliteValue::Text("hello".to_owned())
-        );
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("hello".to_owned()));
         assert_eq!(rows[0].values()[1], SqliteValue::Integer(0));
     }
 

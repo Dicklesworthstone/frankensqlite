@@ -1,0 +1,30 @@
+{
+  "id": "028_views",
+  "description": "View parity: CREATE VIEW, SELECT from view, DROP VIEW, view with joins, view with aggregates",
+  "ops": [
+    { "op": "open", "path": ":memory:" },
+
+    { "op": "exec", "sql": "CREATE TABLE products(id INTEGER PRIMARY KEY, name TEXT, price REAL, category TEXT)" },
+    { "op": "exec", "sql": "INSERT INTO products VALUES (1, 'Widget', 9.99, 'gadgets'), (2, 'Gizmo', 24.99, 'gadgets'), (3, 'Doohickey', 4.99, 'tools'), (4, 'Thingamajig', 14.99, 'tools'), (5, 'Whatchamacallit', 49.99, 'gadgets')" },
+
+    { "op": "exec", "sql": "CREATE VIEW expensive_products AS SELECT * FROM products WHERE price > 10.0" },
+    { "op": "query", "sql": "SELECT name FROM expensive_products ORDER BY name", "expect": { "rows": [["Gizmo"], ["Thingamajig"], ["Whatchamacallit"]], "ordered": true } },
+
+    { "op": "exec", "sql": "CREATE VIEW category_stats AS SELECT category, COUNT(*) as cnt, AVG(price) as avg_price FROM products GROUP BY category" },
+    { "op": "query", "sql": "SELECT category, cnt FROM category_stats ORDER BY category", "expect": { "rows": [["gadgets", "3"], ["tools", "2"]], "ordered": true } },
+
+    { "op": "exec", "sql": "CREATE TABLE orders(id INTEGER PRIMARY KEY, product_id INTEGER, qty INTEGER)" },
+    { "op": "exec", "sql": "INSERT INTO orders VALUES (1, 1, 10), (2, 2, 5), (3, 1, 3), (4, 5, 1)" },
+
+    { "op": "exec", "sql": "CREATE VIEW order_details AS SELECT o.id as order_id, p.name, o.qty, p.price * o.qty as total FROM orders o JOIN products p ON o.product_id = p.id" },
+    { "op": "query", "sql": "SELECT order_id, name, total FROM order_details ORDER BY order_id", "expect": { "rows": [["1", "Widget", "99.9"], ["2", "Gizmo", "124.95"], ["3", "Widget", "29.97"], ["4", "Whatchamacallit", "49.99"]], "ordered": true } },
+
+    { "op": "exec", "sql": "DROP VIEW expensive_products" },
+
+    { "op": "query", "sql": "SELECT name FROM category_stats ORDER BY category", "expect": { "rows": [["gadgets"], ["tools"]], "ordered": false } },
+
+    { "op": "exec", "sql": "CREATE VIEW IF NOT EXISTS category_stats AS SELECT 1" },
+    { "op": "query", "sql": "SELECT cnt FROM category_stats ORDER BY category", "expect": { "rows": [["3"], ["2"]], "ordered": true } }
+  ],
+  "fsqlite_modes": ["compatibility", "native"]
+}

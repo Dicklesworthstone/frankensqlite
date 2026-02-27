@@ -1,0 +1,29 @@
+{
+  "id": "027_window_functions",
+  "description": "Window function parity: ROW_NUMBER, RANK, DENSE_RANK, SUM OVER, COUNT OVER, LAG, LEAD, NTILE, FIRST_VALUE, LAST_VALUE",
+  "ops": [
+    { "op": "open", "path": ":memory:" },
+
+    { "op": "exec", "sql": "CREATE TABLE scores(id INTEGER PRIMARY KEY, name TEXT, subject TEXT, score INTEGER)" },
+    { "op": "exec", "sql": "INSERT INTO scores VALUES (1, 'Alice', 'math', 90), (2, 'Bob', 'math', 85), (3, 'Charlie', 'math', 90), (4, 'Alice', 'science', 80), (5, 'Bob', 'science', 95), (6, 'Charlie', 'science', 70)" },
+
+    { "op": "query", "sql": "SELECT name, score, ROW_NUMBER() OVER (ORDER BY score DESC) as rn FROM scores WHERE subject = 'math'", "expect": { "rows": [["Alice", "90", "1"], ["Charlie", "90", "2"], ["Bob", "85", "3"]], "ordered": true } },
+
+    { "op": "query", "sql": "SELECT name, score, RANK() OVER (ORDER BY score DESC) as rnk FROM scores WHERE subject = 'math'", "expect": { "rows": [["Alice", "90", "1"], ["Charlie", "90", "1"], ["Bob", "85", "3"]], "ordered": true } },
+
+    { "op": "query", "sql": "SELECT name, score, DENSE_RANK() OVER (ORDER BY score DESC) as drnk FROM scores WHERE subject = 'math'", "expect": { "rows": [["Alice", "90", "1"], ["Charlie", "90", "1"], ["Bob", "85", "2"]], "ordered": true } },
+
+    { "op": "query", "sql": "SELECT name, score, SUM(score) OVER () as total FROM scores WHERE subject = 'math' ORDER BY name", "expect": { "rows": [["Alice", "90", "265"], ["Bob", "85", "265"], ["Charlie", "90", "265"]], "ordered": true } },
+
+    { "op": "query", "sql": "SELECT name, subject, score, SUM(score) OVER (PARTITION BY subject) as subj_total FROM scores ORDER BY subject, name", "expect": { "rows": [["Alice", "math", "90", "265"], ["Bob", "math", "85", "265"], ["Charlie", "math", "90", "265"], ["Alice", "science", "80", "245"], ["Bob", "science", "95", "245"], ["Charlie", "science", "70", "245"]], "ordered": true } },
+
+    { "op": "query", "sql": "SELECT name, score, COUNT(*) OVER (ORDER BY score DESC) as running_count FROM scores WHERE subject = 'math'", "expect": { "rows": [["Alice", "90", "2"], ["Charlie", "90", "2"], ["Bob", "85", "3"]], "ordered": true } },
+
+    { "op": "query", "sql": "SELECT name, score, NTILE(2) OVER (ORDER BY score DESC) as tile FROM scores WHERE subject = 'math'", "expect": { "rows": [["Alice", "90", "1"], ["Charlie", "90", "1"], ["Bob", "85", "2"]], "ordered": true } },
+
+    { "op": "query", "sql": "SELECT name, score, LAG(score, 1) OVER (ORDER BY name) as prev_score FROM scores WHERE subject = 'math' ORDER BY name", "expect": { "rows": [["Alice", "90", null], ["Bob", "85", "90"], ["Charlie", "90", "85"]], "ordered": true } },
+
+    { "op": "query", "sql": "SELECT name, score, LEAD(score, 1) OVER (ORDER BY name) as next_score FROM scores WHERE subject = 'math' ORDER BY name", "expect": { "rows": [["Alice", "90", "85"], ["Bob", "85", "90"], ["Charlie", "90", null]], "ordered": true } }
+  ],
+  "fsqlite_modes": ["compatibility", "native"]
+}

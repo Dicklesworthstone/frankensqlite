@@ -1,0 +1,36 @@
+{
+  "id": "026_subquery_and_cte",
+  "description": "Subquery and CTE (Common Table Expression) parity: scalar subqueries, EXISTS, correlated subqueries, WITH clauses, recursive CTEs",
+  "ops": [
+    { "op": "open", "path": ":memory:" },
+
+    { "op": "exec", "sql": "CREATE TABLE employees(id INTEGER PRIMARY KEY, name TEXT, dept TEXT, salary INTEGER)" },
+    { "op": "exec", "sql": "INSERT INTO employees VALUES (1, 'Alice', 'eng', 100000), (2, 'Bob', 'eng', 90000), (3, 'Charlie', 'sales', 80000), (4, 'Diana', 'sales', 85000), (5, 'Eve', 'eng', 110000)" },
+
+    { "op": "query", "sql": "SELECT name FROM employees WHERE salary = (SELECT MAX(salary) FROM employees)", "expect": { "rows": [["Eve"]], "ordered": true } },
+
+    { "op": "query", "sql": "SELECT name FROM employees WHERE salary > (SELECT AVG(salary) FROM employees) ORDER BY name", "expect": { "rows": [["Alice"], ["Eve"]], "ordered": true } },
+
+    { "op": "exec", "sql": "CREATE TABLE departments(name TEXT PRIMARY KEY, budget INTEGER)" },
+    { "op": "exec", "sql": "INSERT INTO departments VALUES ('eng', 500000), ('sales', 300000), ('hr', 200000)" },
+
+    { "op": "query", "sql": "SELECT d.name FROM departments d WHERE EXISTS (SELECT 1 FROM employees e WHERE e.dept = d.name) ORDER BY d.name", "expect": { "rows": [["eng"], ["sales"]], "ordered": true } },
+
+    { "op": "query", "sql": "SELECT d.name FROM departments d WHERE NOT EXISTS (SELECT 1 FROM employees e WHERE e.dept = d.name)", "expect": { "rows": [["hr"]], "ordered": true } },
+
+    { "op": "query", "sql": "SELECT name, (SELECT COUNT(*) FROM employees e WHERE e.dept = d.name) as emp_count FROM departments d ORDER BY d.name", "expect": { "rows": [["eng", "3"], ["hr", "0"], ["sales", "2"]], "ordered": true } },
+
+    { "op": "query", "sql": "WITH eng_employees AS (SELECT * FROM employees WHERE dept = 'eng') SELECT name FROM eng_employees ORDER BY salary DESC", "expect": { "rows": [["Eve"], ["Alice"], ["Bob"]], "ordered": true } },
+
+    { "op": "query", "sql": "WITH dept_stats AS (SELECT dept, AVG(salary) as avg_sal FROM employees GROUP BY dept) SELECT dept, avg_sal FROM dept_stats ORDER BY dept", "expect": { "rows": [["eng", "100000.0"], ["sales", "82500.0"]], "ordered": true } },
+
+    { "op": "query", "sql": "WITH RECURSIVE cnt(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM cnt WHERE x < 5) SELECT x FROM cnt", "expect": { "rows": [["1"], ["2"], ["3"], ["4"], ["5"]], "ordered": true } },
+
+    { "op": "query", "sql": "WITH RECURSIVE fib(a, b) AS (VALUES(0, 1) UNION ALL SELECT b, a+b FROM fib WHERE b < 100) SELECT a FROM fib", "expect": { "rows": [["0"], ["1"], ["1"], ["2"], ["3"], ["5"], ["8"], ["13"], ["21"], ["34"], ["55"], ["89"]], "ordered": true } },
+
+    { "op": "query", "sql": "SELECT name FROM employees WHERE dept IN (SELECT name FROM departments WHERE budget > 250000) ORDER BY name", "expect": { "rows": [["Alice"], ["Bob"], ["Charlie"], ["Diana"], ["Eve"]], "ordered": true } },
+
+    { "op": "query", "sql": "SELECT * FROM (SELECT dept, COUNT(*) as cnt FROM employees GROUP BY dept) sub WHERE cnt > 1 ORDER BY dept", "expect": { "rows": [["eng", "3"], ["sales", "2"]], "ordered": true } }
+  ],
+  "fsqlite_modes": ["compatibility", "native"]
+}
