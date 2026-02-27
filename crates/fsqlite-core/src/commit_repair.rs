@@ -1177,21 +1177,15 @@ where
 
         // ---- Phase 1: Validate ----
         phase_order.push(BatchPhase::Validate);
-        let committed_snapshot =
+        let mut merged_committed =
             lock_with_recovery(&self.committed_pages, "committed_pages").clone();
         // Within a batch, earlier requests (by position) win over later ones
         // when their write sets overlap.
-        let mut batch_pages = BTreeSet::new();
         for req in requests {
-            // Check against globally committed pages
-            let mut global_merged = committed_snapshot.clone();
-            for &p in &batch_pages {
-                global_merged.insert(p);
-            }
-            match self.validator.validate(&req, &global_merged) {
+            match self.validator.validate(&req, &merged_committed) {
                 Ok(()) => {
                     for &page in &req.write_set_pages {
-                        batch_pages.insert(page);
+                        merged_committed.insert(page);
                     }
                     valid_requests.push(req);
                 }

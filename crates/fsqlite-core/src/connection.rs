@@ -23,14 +23,14 @@ use fsqlite_ast::{
     DefaultValue, Distinctness, DropObjectType, Expr, FunctionArgs, InSet, JoinConstraint,
     JoinKind, LikeOp, LimitClause, Literal, NullsOrder, OrderingTerm, PlaceholderType, PragmaValue,
     ResultColumn, SelectBody, SelectCore, SelectStatement, SortDirection, Span, Statement,
-    TableOrSubquery, UnaryOp,
+    TableConstraintKind, TableOrSubquery, UnaryOp,
 };
 use fsqlite_btree::BtreeCursorOps;
 use fsqlite_btree::cursor::TransactionPageIo;
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_func::{
-    FunctionRegistry, get_last_changes, get_last_insert_rowid, set_last_changes,
-    set_last_insert_rowid,
+    FunctionRegistry, get_last_changes, get_last_insert_rowid, get_total_changes,
+    reset_total_changes, set_last_changes, set_last_insert_rowid,
 };
 use fsqlite_pager::traits::{MvccPager, TransactionHandle, TransactionMode};
 use fsqlite_pager::{CheckpointMode, JournalMode, PageCacheMetricsSnapshot, SimplePager};
@@ -502,6 +502,7 @@ impl PreparedStatement {
                 txn,
                 self.schema_cookie,
                 None,
+                HashMap::new(),
                 false,
             );
             // Commit the read transaction (no-op for deferred reads).
@@ -550,6 +551,7 @@ impl PreparedStatement {
                 txn,
                 self.schema_cookie,
                 None,
+                HashMap::new(),
                 false,
             );
             if let Some(ref mut txn) = txn_back {
@@ -841,6 +843,8 @@ struct DbSnapshot {
     views: Vec<ViewDef>,
     triggers: Vec<TriggerDef>,
     rowid_alias_columns: HashMap<String, usize>,
+    autoincrement_tables: HashSet<String>,
+    sqlite_sequence_cache: HashMap<String, i64>,
     next_master_rowid: i64,
 }
 
@@ -1005,6 +1009,11 @@ pub struct Connection {
     /// `INTEGER PRIMARY KEY` column, which is an alias for `rowid`.
     /// Used by fallback paths (GROUP BY, JOIN) to resolve rowid/\_rowid\_/oid.
     rowid_alias_columns: RefCell<HashMap<String, usize>>,
+    /// Set of table names (lowercased) declared as
+    /// `INTEGER PRIMARY KEY AUTOINCREMENT`.
+    autoincrement_tables: RefCell<HashSet<String>>,
+    /// Cached sqlite_sequence high-water values keyed by lowercased table name.
+    sqlite_sequence_cache: RefCell<HashMap<String, i64>>,
     /// Next rowid to use when inserting into the sqlite_master B-tree on
     /// page 1.  Starts at 1 for a fresh database; 5A.4 (schema loading)
     /// will advance this past any existing entries.
@@ -1077,6 +1086,11 @@ pub struct Connection {
     /// fallback and require all cursor operations to route through the real
     /// Pager+BtreeCursor stack. Used for parity-certification testing.
     reject_mem_fallback: RefCell<bool>,
+    /// bd-zjisk.1: When true, non-VDBE in-memory fallback dispatches become
+    /// hard failures while parity-cert mode is enabled. This allows harness
+    /// certifying runs to fail fast on unsupported fallback paths without
+    /// changing default developer ergonomics.
+    reject_mem_fallback_strict: RefCell<bool>,
 }
 
 impl std::fmt::Debug for Connection {
@@ -1132,6 +1146,8 @@ impl Connection {
             concurrent_mode_default: RefCell::new(true),
             pragma_state: RefCell::new(fsqlite_vdbe::pragma::ConnectionPragmaState::default()),
             rowid_alias_columns: RefCell::new(HashMap::new()),
+            autoincrement_tables: RefCell::new(HashSet::new()),
+            sqlite_sequence_cache: RefCell::new(HashMap::new()),
             next_master_rowid: RefCell::new(1),
             schema_cookie: RefCell::new(0),
             change_counter: RefCell::new(0),
@@ -1164,7 +1180,11 @@ impl Connection {
             // via `set_reject_mem_fallback(false)` or
             // `PRAGMA fsqlite.parity_cert = OFF`.
             reject_mem_fallback: RefCell::new(true),
+            // Strict fallback rejection is opt-in for certifying runs.
+            reject_mem_fallback_strict: RefCell::new(false),
         };
+        // Reset cumulative total_changes counter for this new connection.
+        reset_total_changes();
         conn.bootstrap_journal_mode_from_storage();
         conn.apply_current_journal_mode_to_pager()?;
         // 5D.4 (bd-3bsn): Load initial state from pager instead of compat_persist.
@@ -1189,10 +1209,24 @@ impl Connection {
         *self.reject_mem_fallback.borrow_mut() = reject;
     }
 
+    /// Enable strict non-VDBE fallback rejection for certifying runs.
+    ///
+    /// When enabled together with `reject_mem_fallback`, dispatching to
+    /// interpreted in-memory fallback paths (for example JOIN/GROUP BY
+    /// materialization fallbacks) returns an error instead of silently
+    /// continuing.
+    pub fn set_strict_mem_fallback_rejection(&self, strict: bool) {
+        *self.reject_mem_fallback_strict.borrow_mut() = strict;
+    }
+
     #[must_use]
     fn backend_mode_label(&self) -> &'static str {
         if *self.reject_mem_fallback.borrow() {
-            "parity_cert"
+            if *self.reject_mem_fallback_strict.borrow() {
+                "parity_cert_strict"
+            } else {
+                "parity_cert"
+            }
         } else {
             "fallback_allowed"
         }
@@ -1202,27 +1236,37 @@ impl Connection {
         &self,
         statement_kind: &'static str,
         decision_reason: &'static str,
-    ) {
+    ) -> Result<()> {
         let mode = self.backend_mode_label();
-        if *self.reject_mem_fallback.borrow() {
+        let reject_mem = *self.reject_mem_fallback.borrow();
+        let strict_reject = *self.reject_mem_fallback_strict.borrow();
+        if reject_mem {
             tracing::warn!(
                 target: "fsqlite.storage_wiring",
                 backend_kind = "mem",
                 mode,
+                strict_reject,
                 statement_kind,
                 decision_reason,
                 "execute_statement_dispatch: using in-memory fallback path while parity-cert mode is enabled"
             );
+            if strict_reject {
+                return Err(FrankenError::not_implemented(format!(
+                    "in-memory fallback disabled in strict parity-cert mode: statement_kind={statement_kind}, decision_reason={decision_reason}"
+                )));
+            }
         } else {
             tracing::debug!(
                 target: "fsqlite.storage_wiring",
                 backend_kind = "mem",
                 mode,
+                strict_reject,
                 statement_kind,
                 decision_reason,
                 "execute_statement_dispatch: using in-memory fallback path"
             );
         }
+        Ok(())
     }
 
     /// Returns the kind of pager backend in use (e.g. "memory" or "unix").
@@ -1789,12 +1833,12 @@ impl Connection {
             Statement::Select(ref select) => {
                 // CTE (WITH clause): materialize as temporary tables.
                 if select.with.is_some() {
-                    self.log_mem_execution_fallback("select", "with_clause_materialization");
+                    self.log_mem_execution_fallback("select", "with_clause_materialization")?;
                     return self.execute_with_ctes(select, params);
                 }
                 // View expansion: materialize referenced views as temp tables.
                 if self.has_view_references(select) {
-                    self.log_mem_execution_fallback("select", "view_materialization");
+                    self.log_mem_execution_fallback("select", "view_materialization")?;
                     return self.execute_with_materialized_views(select, params);
                 }
                 // 5G.4 (bd-3ly4): sqlite_master/sqlite_schema virtual table support.
@@ -1802,7 +1846,7 @@ impl Connection {
                     self.log_mem_execution_fallback(
                         "select",
                         "sqlite_schema_virtual_materialization",
-                    );
+                    )?;
                     return self.execute_with_materialized_sqlite_schema(select, params);
                 }
                 let distinct = is_distinct_select(select);
@@ -1837,7 +1881,7 @@ impl Connection {
                 } else if has_group_by(select) && (has_joins(select) || has_subquery_source(select)) {
                     // GROUP BY + JOIN: materialize the join as a temp table,
                     // then GROUP BY on that temp table.
-                    self.log_mem_execution_fallback("select", "group_by_join_fallback");
+                    self.log_mem_execution_fallback("select", "group_by_join_fallback")?;
                     let rewritten = self.rewrite_in_subqueries_select(select, params)?;
                     let mut bound = bind_placeholders_in_select_for_fallback(&rewritten, params)?;
                     let limit_clause = bound.limit.take();
@@ -1851,7 +1895,7 @@ impl Connection {
                     Ok(rows)
                 } else if has_group_by(select) {
                     // Fallback path: eagerly rewrite IN subqueries.
-                    self.log_mem_execution_fallback("select", "group_by_fallback");
+                    self.log_mem_execution_fallback("select", "group_by_fallback")?;
                     let rewritten = self.rewrite_in_subqueries_select(select, params)?;
                     let mut bound = bind_placeholders_in_select_for_fallback(&rewritten, params)?;
                     let limit_clause = bound.limit.take();
@@ -1866,7 +1910,7 @@ impl Connection {
                 } else if select_contains_match_operator(select) {
                     // The VDBE path does not yet support MATCH/REGEXP in this
                     // connection path. Route through fallback evaluation.
-                    self.log_mem_execution_fallback("select", "match_operator_fallback");
+                    self.log_mem_execution_fallback("select", "match_operator_fallback")?;
                     let rewritten = self.rewrite_in_subqueries_select(select, params)?;
                     let mut bound = bind_placeholders_in_select_for_fallback(&rewritten, params)?;
                     let limit_clause = bound.limit.take();
@@ -1882,7 +1926,7 @@ impl Connection {
                     // Fallback path: eagerly rewrite IN subqueries.
                     // Also handles subquery in FROM (derived tables) even
                     // without explicit JOINs.
-                    self.log_mem_execution_fallback("select", "join_or_subquery_fallback");
+                    self.log_mem_execution_fallback("select", "join_or_subquery_fallback")?;
                     let rewritten = self.rewrite_in_subqueries_select(select, params)?;
                     let mut bound = bind_placeholders_in_select_for_fallback(&rewritten, params)?;
                     let limit_clause = bound.limit.take();
@@ -1989,7 +2033,7 @@ impl Connection {
                         self.log_mem_execution_fallback(
                             "insert_select",
                             "insert_select_row_by_row_fallback",
-                        );
+                        )?;
                         let affected =
                             self.execute_insert_select_fallback(insert, select_stmt, params)?;
                         // Phase 5G.3: Fire AFTER INSERT triggers.
@@ -2049,6 +2093,12 @@ impl Connection {
                     for new_values in &trigger_new_rows {
                         self.fire_after_triggers(table_name, &insert_event, None, Some(new_values))?;
                     }
+                }
+
+                if table_name.eq_ignore_ascii_case("sqlite_sequence") {
+                    self.refresh_sqlite_sequence_cache()?;
+                } else {
+                    self.refresh_autoincrement_sequence_after_insert(table_name)?;
                 }
 
                 // 5D.4: Persistence now handled by pager WAL, not compat_persist.
@@ -2563,7 +2613,8 @@ impl Connection {
         let table_schema = schema
             .iter()
             .find(|t| t.name.eq_ignore_ascii_case(table_name))
-            .ok_or_else(|| FrankenError::Internal(format!("no such table: {table_name}")))?;
+            .ok_or_else(|| FrankenError::Internal(format!("no such table: {table_name}")))?
+            .clone();
         let root_page = table_schema.root_page;
         let num_cols = table_schema.columns.len();
 
@@ -2628,6 +2679,51 @@ impl Connection {
             }
 
             let mut db = self.db.borrow_mut();
+
+            // Check UNIQUE constraints on columns.
+            let mut unique_violation = None;
+            if let Some(table) = db.get_table(root_page) {
+                for (i, col_info) in table_schema.columns.iter().enumerate() {
+                    if col_info.unique && !col_info.is_ipk {
+                        let new_val = &col_values[i];
+                        if !new_val.is_null() {
+                            for mem_row in table.iter_rows() {
+                                if Some(mem_row.0) == explicit_rowid {
+                                    continue; // Replacing this rowid.
+                                }
+                                if let Some(existing_val) = mem_row.1.get(i) {
+                                    if existing_val == new_val {
+                                        unique_violation = Some(col_info.name.clone());
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if unique_violation.is_some() {
+                        break;
+                    }
+                }
+            }
+
+            if let Some(col_name) = unique_violation {
+                match conflict {
+                    ConflictAction::Ignore => continue,
+                    ConflictAction::Replace => {
+                        // True SQLite REPLACE deletes the conflicting row. For Phase 4 we can return an error
+                        // since this fallback is temporary, but let's at least support basic test cases.
+                        return Err(FrankenError::NotImplemented(
+                            "REPLACE on non-IPK UNIQUE constraint".to_owned(),
+                        ));
+                    }
+                    _ => {
+                        return Err(FrankenError::UniqueViolation {
+                            columns: format!("{}.{}", table_name, col_name),
+                        });
+                    }
+                }
+            }
+
             if let Some(rowid) = explicit_rowid {
                 let exists = db
                     .get_table(root_page)
@@ -3818,6 +3914,335 @@ impl Connection {
         })
     }
 
+    fn sqlite_sequence_root_page(&self) -> Option<i32> {
+        self.schema
+            .borrow()
+            .iter()
+            .find(|t| t.name.eq_ignore_ascii_case("sqlite_sequence"))
+            .map(|t| t.root_page)
+    }
+
+    fn is_autoincrement_table(&self, table_name: &str) -> bool {
+        self.autoincrement_tables
+            .borrow()
+            .contains(&table_name.to_ascii_lowercase())
+    }
+
+    fn ensure_sqlite_sequence_table_exists(&self) -> Result<()> {
+        if self.sqlite_sequence_root_page().is_some() {
+            return Ok(());
+        }
+
+        let root_page = self.allocate_root_page()?;
+        self.db.borrow_mut().create_table_at(root_page, 2);
+        self.schema.borrow_mut().push(TableSchema {
+            name: "sqlite_sequence".to_owned(),
+            root_page,
+            columns: vec![
+                ColumnInfo {
+                    name: "name".to_owned(),
+                    affinity: 'B',
+                    is_ipk: false,
+                    type_name: Some("TEXT".to_owned()),
+                    notnull: false,
+                    unique: false,
+                    default_value: None,
+                    strict_type: None,
+                },
+                ColumnInfo {
+                    name: "seq".to_owned(),
+                    affinity: 'D',
+                    is_ipk: false,
+                    type_name: Some("INTEGER".to_owned()),
+                    notnull: false,
+                    unique: false,
+                    default_value: None,
+                    strict_type: None,
+                },
+            ],
+            indexes: Vec::new(),
+            strict: false,
+        });
+        self.insert_sqlite_master_row(
+            "table",
+            "sqlite_sequence",
+            "sqlite_sequence",
+            root_page,
+            "CREATE TABLE sqlite_sequence(name,seq)",
+        )?;
+        tracing::trace!("sqlite_sequence table auto-created");
+        Ok(())
+    }
+
+    fn read_sqlite_sequence_cache_in_txn(
+        &self,
+        cx: &Cx,
+        txn: &mut dyn TransactionHandle,
+    ) -> Result<HashMap<String, i64>> {
+        let mut cache = HashMap::new();
+        let Some(root_page) = self.sqlite_sequence_root_page() else {
+            return Ok(cache);
+        };
+        let Some(root) = PageNumber::new(u32::try_from(root_page).unwrap_or(0)) else {
+            return Ok(cache);
+        };
+
+        let mut cursor = fsqlite_btree::BtCursor::new(
+            TransactionPageIo::new(txn),
+            root,
+            PageSize::DEFAULT.get(),
+            false,
+        );
+        tracing::trace!(root_page, "sqlite_sequence cache refresh begin");
+        if cursor.first(cx)? {
+            loop {
+                let payload = cursor.payload(cx)?;
+                if let Some(values) = parse_record(&payload)
+                    && values.len() >= 2
+                    && let Some(SqliteValue::Text(table_name)) = values.first()
+                {
+                    let seq = values[1].to_integer();
+                    cache.insert(table_name.to_ascii_lowercase(), seq);
+                }
+                if !cursor.next(cx)? {
+                    break;
+                }
+            }
+        }
+        tracing::trace!(entries = cache.len(), "sqlite_sequence cache refresh end");
+        Ok(cache)
+    }
+
+    fn refresh_sqlite_sequence_cache(&self) -> Result<()> {
+        self.with_pager_write_txn(|cx, txn| {
+            let cache = self.read_sqlite_sequence_cache_in_txn(cx, txn)?;
+            *self.sqlite_sequence_cache.borrow_mut() = cache;
+            Ok(())
+        })
+    }
+
+    #[allow(clippy::unused_self)]
+    fn table_max_rowid_in_txn(
+        &self,
+        cx: &Cx,
+        txn: &mut dyn TransactionHandle,
+        root_page: i32,
+    ) -> Result<i64> {
+        let Some(root) = PageNumber::new(u32::try_from(root_page).unwrap_or(0)) else {
+            return Ok(0);
+        };
+        let mut cursor = fsqlite_btree::BtCursor::new(
+            TransactionPageIo::new(txn),
+            root,
+            PageSize::DEFAULT.get(),
+            false,
+        );
+        if cursor.last(cx)? {
+            cursor.rowid(cx)
+        } else {
+            Ok(0)
+        }
+    }
+
+    fn upsert_sqlite_sequence_in_txn(
+        &self,
+        cx: &Cx,
+        txn: &mut dyn TransactionHandle,
+        table_name: &str,
+        seq: i64,
+    ) -> Result<()> {
+        let Some(root_page) = self.sqlite_sequence_root_page() else {
+            return Ok(());
+        };
+        let Some(root) = PageNumber::new(u32::try_from(root_page).unwrap_or(0)) else {
+            return Ok(());
+        };
+        let mut cursor = fsqlite_btree::BtCursor::new(
+            TransactionPageIo::new(txn),
+            root,
+            PageSize::DEFAULT.get(),
+            true,
+        );
+
+        let mut found_rowid = None;
+        let mut max_rowid = 0_i64;
+        if cursor.first(cx)? {
+            loop {
+                let rowid = cursor.rowid(cx)?;
+                max_rowid = max_rowid.max(rowid);
+                let payload = cursor.payload(cx)?;
+                if let Some(values) = parse_record(&payload)
+                    && let Some(SqliteValue::Text(existing_name)) = values.first()
+                    && existing_name.eq_ignore_ascii_case(table_name)
+                {
+                    found_rowid = Some(rowid);
+                }
+                if !cursor.next(cx)? {
+                    break;
+                }
+            }
+        }
+
+        let rowid = if let Some(existing_rowid) = found_rowid {
+            if cursor.table_move_to(cx, existing_rowid)?.is_found() {
+                cursor.delete(cx)?;
+            }
+            existing_rowid
+        } else {
+            max_rowid.saturating_add(1).max(1)
+        };
+
+        let record = serialize_record(&[
+            SqliteValue::Text(table_name.to_owned()),
+            SqliteValue::Integer(seq),
+        ]);
+        cursor.table_insert(cx, rowid, &record)?;
+        tracing::trace!(table = table_name, seq, rowid, "sqlite_sequence upsert");
+        Ok(())
+    }
+
+    fn delete_sqlite_sequence_entry(&self, table_name: &str) -> Result<()> {
+        self.with_pager_write_txn(|cx, txn| {
+            let Some(root_page) = self.sqlite_sequence_root_page() else {
+                return Ok(());
+            };
+            let Some(root) = PageNumber::new(u32::try_from(root_page).unwrap_or(0)) else {
+                return Ok(());
+            };
+            let mut cursor = fsqlite_btree::BtCursor::new(
+                TransactionPageIo::new(txn),
+                root,
+                PageSize::DEFAULT.get(),
+                true,
+            );
+            if !cursor.first(cx)? {
+                return Ok(());
+            }
+            loop {
+                let payload = cursor.payload(cx)?;
+                if let Some(values) = parse_record(&payload)
+                    && let Some(SqliteValue::Text(existing_name)) = values.first()
+                    && existing_name.eq_ignore_ascii_case(table_name)
+                {
+                    tracing::trace!(table = table_name, "sqlite_sequence delete entry");
+                    return cursor.delete(cx);
+                }
+                if !cursor.next(cx)? {
+                    break;
+                }
+            }
+            Ok(())
+        })
+    }
+
+    fn rename_sqlite_sequence_entry(&self, old_name: &str, new_name: &str) -> Result<()> {
+        let old_key = old_name.to_ascii_lowercase();
+        let new_key = new_name.to_ascii_lowercase();
+        let seq = {
+            let mut cache = self.sqlite_sequence_cache.borrow_mut();
+            let Some(seq) = cache.remove(&old_key) else {
+                return Ok(());
+            };
+            cache.insert(new_key.clone(), seq);
+            seq
+        };
+
+        self.with_pager_write_txn(|cx, txn| {
+            self.upsert_sqlite_sequence_in_txn(cx, txn, new_name, seq)?;
+            let Some(root_page) = self.sqlite_sequence_root_page() else {
+                return Ok(());
+            };
+            let Some(root) = PageNumber::new(u32::try_from(root_page).unwrap_or(0)) else {
+                return Ok(());
+            };
+            let mut cursor = fsqlite_btree::BtCursor::new(
+                TransactionPageIo::new(txn),
+                root,
+                PageSize::DEFAULT.get(),
+                true,
+            );
+            if !cursor.first(cx)? {
+                return Ok(());
+            }
+            loop {
+                let rowid = cursor.rowid(cx)?;
+                let payload = cursor.payload(cx)?;
+                if let Some(values) = parse_record(&payload)
+                    && let Some(SqliteValue::Text(existing_name)) = values.first()
+                    && existing_name.eq_ignore_ascii_case(old_name)
+                {
+                    if cursor.table_move_to(cx, rowid)?.is_found() {
+                        cursor.delete(cx)?;
+                    }
+                    tracing::trace!(
+                        old = old_name,
+                        new = new_name,
+                        "sqlite_sequence rename entry"
+                    );
+                    break;
+                }
+                if !cursor.next(cx)? {
+                    break;
+                }
+            }
+            Ok(())
+        })
+    }
+
+    fn refresh_autoincrement_sequence_after_insert(&self, table_name: &str) -> Result<()> {
+        if !self.is_autoincrement_table(table_name) {
+            return Ok(());
+        }
+        self.ensure_sqlite_sequence_table_exists()?;
+        self.with_pager_write_txn(|cx, txn| {
+            let Some(root_page) = self
+                .schema
+                .borrow()
+                .iter()
+                .find(|t| t.name.eq_ignore_ascii_case(table_name))
+                .map(|t| t.root_page)
+            else {
+                return Ok(());
+            };
+            let max_rowid = self.table_max_rowid_in_txn(cx, txn, root_page)?;
+            let key = table_name.to_ascii_lowercase();
+            let current_seq = self
+                .sqlite_sequence_cache
+                .borrow()
+                .get(&key)
+                .copied()
+                .unwrap_or(0);
+            let new_seq = current_seq.max(max_rowid);
+            if new_seq > current_seq {
+                self.upsert_sqlite_sequence_in_txn(cx, txn, table_name, new_seq)?;
+                self.sqlite_sequence_cache.borrow_mut().insert(key, new_seq);
+            }
+            tracing::trace!(
+                table = table_name,
+                max_rowid,
+                current_seq,
+                new_seq,
+                "sqlite_sequence autoincrement refresh"
+            );
+            Ok(())
+        })
+    }
+
+    fn autoincrement_sequence_by_root_page(&self) -> HashMap<i32, i64> {
+        let schema = self.schema.borrow();
+        let autoincrement_tables = self.autoincrement_tables.borrow();
+        let sqlite_sequence_cache = self.sqlite_sequence_cache.borrow();
+        let mut out = HashMap::new();
+        for table in schema.iter() {
+            let key = table.name.to_ascii_lowercase();
+            if autoincrement_tables.contains(&key) {
+                let seq = sqlite_sequence_cache.get(&key).copied().unwrap_or(0);
+                out.insert(table.root_page, seq);
+            }
+        }
+        out
+    }
+
     /// Process a CREATE TABLE statement: register the schema and create the
     /// in-memory table, and insert a row into sqlite_master on page 1.
     #[allow(clippy::too_many_lines)]
@@ -3841,17 +4266,27 @@ impl Connection {
 
         match &create.body {
             CreateTableBody::Columns { columns, .. } => {
-                // Detect INTEGER PRIMARY KEY column (rowid alias).
+                // Detect INTEGER PRIMARY KEY column (rowid alias) and whether
+                // it carries AUTOINCREMENT.
+                let mut is_autoincrement = false;
                 let rowid_col_idx = columns.iter().enumerate().find_map(|(i, col)| {
                     let is_integer = col
                         .type_name
                         .as_ref()
                         .is_some_and(|tn| tn.name.eq_ignore_ascii_case("INTEGER"));
-                    let is_pk = col
-                        .constraints
-                        .iter()
-                        .any(|c| matches!(c.kind, ColumnConstraintKind::PrimaryKey { .. }));
-                    (is_integer && is_pk).then_some(i)
+                    let pk = col.constraints.iter().find_map(|c| {
+                        if let ColumnConstraintKind::PrimaryKey { autoincrement, .. } = c.kind {
+                            Some(autoincrement)
+                        } else {
+                            None
+                        }
+                    });
+                    if is_integer && pk.is_some() {
+                        is_autoincrement = pk.unwrap_or(false);
+                        Some(i)
+                    } else {
+                        None
+                    }
                 });
                 let col_infos: Vec<ColumnInfo> = columns
                     .iter()
@@ -3866,6 +4301,10 @@ impl Connection {
                             .constraints
                             .iter()
                             .any(|c| matches!(c.kind, ColumnConstraintKind::NotNull { .. }));
+                        let unique = col
+                            .constraints
+                            .iter()
+                            .any(|c| matches!(c.kind, ColumnConstraintKind::Unique { .. }));
                         let default_value = col.constraints.iter().find_map(|c| match &c.kind {
                             ColumnConstraintKind::Default(dv) => Some(format_default_value(dv)),
                             _ => None,
@@ -3892,6 +4331,7 @@ impl Connection {
                             is_ipk: rowid_col_idx.is_some_and(|idx| idx == i),
                             type_name,
                             notnull,
+                            unique,
                             default_value,
                             strict_type,
                         })
@@ -3902,6 +4342,59 @@ impl Connection {
                         .borrow_mut()
                         .insert(table_name.to_ascii_lowercase(), idx);
                 }
+                // Collect implicit UNIQUE indexes from column constraints.
+                let mut implicit_indexes = Vec::new();
+                for col in &col_infos {
+                    if col.unique && !col.is_ipk {
+                        let idx_root = self.allocate_index_root_page()?;
+                        self.db.borrow_mut().create_table_at(idx_root, 0);
+                        implicit_indexes.push(IndexSchema {
+                            name: format!(
+                                "sqlite_autoindex_{}_{}",
+                                table_name,
+                                implicit_indexes.len() + 1
+                            ),
+                            root_page: idx_root,
+                            columns: vec![col.name.clone()],
+                            is_unique: true,
+                        });
+                    }
+                }
+                // Collect implicit UNIQUE indexes from table-level constraints.
+                if let CreateTableBody::Columns { constraints, .. } = &create.body {
+                    for tc in constraints {
+                        if let TableConstraintKind::Unique {
+                            columns: idx_cols, ..
+                        } = &tc.kind
+                        {
+                            let col_names: Vec<String> = idx_cols
+                                .iter()
+                                .filter_map(|ic| {
+                                    if let fsqlite_ast::Expr::Column(col_ref, _) = &ic.expr {
+                                        Some(col_ref.column.clone())
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect();
+                            if !col_names.is_empty() {
+                                let idx_root = self.allocate_index_root_page()?;
+                                self.db.borrow_mut().create_table_at(idx_root, 0);
+                                implicit_indexes.push(IndexSchema {
+                                    name: format!(
+                                        "sqlite_autoindex_{}_{}",
+                                        table_name,
+                                        implicit_indexes.len() + 1
+                                    ),
+                                    root_page: idx_root,
+                                    columns: col_names,
+                                    is_unique: true,
+                                });
+                            }
+                        }
+                    }
+                }
+
                 let num_columns = col_infos.len();
                 let root_page = self.allocate_root_page()?;
                 self.db.borrow_mut().create_table_at(root_page, num_columns);
@@ -3909,14 +4402,25 @@ impl Connection {
                     name: table_name,
                     root_page,
                     columns: col_infos,
-                    indexes: Vec::new(),
+                    indexes: implicit_indexes,
                     strict: create.strict,
                 };
-                let create_sql = crate::compat_persist::build_create_table_sql(&table_schema);
+                let create_sql = render_create_table_sql(&table_schema, is_autoincrement);
                 let rp = table_schema.root_page;
                 let tbl_name = table_schema.name.clone();
                 self.schema.borrow_mut().push(table_schema);
                 self.insert_sqlite_master_row("table", &tbl_name, &tbl_name, rp, &create_sql)?;
+                if is_autoincrement {
+                    self.ensure_sqlite_sequence_table_exists()?;
+                    let table_key = tbl_name.to_ascii_lowercase();
+                    self.autoincrement_tables
+                        .borrow_mut()
+                        .insert(table_key.clone());
+                    self.sqlite_sequence_cache
+                        .borrow_mut()
+                        .entry(table_key)
+                        .or_insert(0);
+                }
             }
             CreateTableBody::AsSelect(select_stmt) => {
                 if create.strict {
@@ -3962,6 +4466,7 @@ impl Connection {
                             is_ipk: false,
                             type_name: None,
                             notnull: false,
+                            unique: false,
                             default_value: None,
                             strict_type: None,
                         }
@@ -4086,6 +4591,14 @@ impl Connection {
                     self.rowid_alias_columns
                         .borrow_mut()
                         .remove(&obj_name.to_ascii_lowercase());
+                    let dropped_key = obj_name.to_ascii_lowercase();
+                    self.autoincrement_tables.borrow_mut().remove(&dropped_key);
+                    self.sqlite_sequence_cache.borrow_mut().remove(&dropped_key);
+                    if obj_name.eq_ignore_ascii_case("sqlite_sequence") {
+                        self.sqlite_sequence_cache.borrow_mut().clear();
+                    } else {
+                        self.delete_sqlite_sequence_entry(obj_name)?;
+                    }
 
                     let mut triggers_to_drop = Vec::new();
                     {
@@ -4280,6 +4793,10 @@ impl Connection {
                     .constraints
                     .iter()
                     .any(|c| matches!(c.kind, ColumnConstraintKind::NotNull { .. }));
+                let unique = col_def
+                    .constraints
+                    .iter()
+                    .any(|c| matches!(c.kind, ColumnConstraintKind::Unique { .. }));
                 let default_value = col_def.constraints.iter().find_map(|c| match &c.kind {
                     ColumnConstraintKind::Default(dv) => Some(format_default_value(dv)),
                     _ => None,
@@ -4306,6 +4823,7 @@ impl Connection {
                     is_ipk: false,
                     type_name,
                     notnull,
+                    unique,
                     default_value,
                     strict_type,
                 });
@@ -4329,8 +4847,30 @@ impl Connection {
             }
         };
 
+        if let AlterTableAction::RenameTo(new_name) = &alter.action {
+            let old_key = old_name.to_ascii_lowercase();
+            let new_key = new_name.to_ascii_lowercase();
+            if let Some(idx) = self.rowid_alias_columns.borrow_mut().remove(&old_key) {
+                self.rowid_alias_columns
+                    .borrow_mut()
+                    .insert(new_key.clone(), idx);
+            }
+            if self.autoincrement_tables.borrow_mut().remove(&old_key) {
+                self.autoincrement_tables
+                    .borrow_mut()
+                    .insert(new_key.clone());
+                if let Some(seq) = self.sqlite_sequence_cache.borrow_mut().remove(&old_key) {
+                    self.sqlite_sequence_cache
+                        .borrow_mut()
+                        .insert(new_key.clone(), seq);
+                }
+                self.rename_sqlite_sequence_entry(&old_name, new_name)?;
+            }
+        }
+
         self.delete_sqlite_master_row(&old_name)?;
-        let create_sql = crate::compat_persist::build_create_table_sql(&new_schema);
+        let create_sql =
+            render_create_table_sql(&new_schema, self.is_autoincrement_table(&new_schema.name));
         self.insert_sqlite_master_row(
             "table",
             &new_schema.name,
@@ -4427,6 +4967,7 @@ impl Connection {
                 name: index_name.clone(),
                 columns: col_names,
                 root_page,
+                is_unique: stmt.unique,
             });
         }
 
@@ -4807,6 +5348,7 @@ impl Connection {
                             is_ipk: false,
                             type_name: None,
                             notnull: false,
+                            unique: false,
                             default_value: None,
                             strict_type: None,
                         })
@@ -4820,6 +5362,7 @@ impl Connection {
                             is_ipk: false,
                             type_name: None,
                             notnull: false,
+                            unique: false,
                             default_value: None,
                             strict_type: None,
                         })
@@ -4982,13 +5525,17 @@ impl Connection {
             {
                 continue;
             }
+            let is_autoincrement = self
+                .autoincrement_tables
+                .borrow()
+                .contains(&table.name.to_ascii_lowercase());
 
             rows.push(vec![
                 SqliteValue::Text("table".to_owned()),
                 SqliteValue::Text(table.name.clone()),
                 SqliteValue::Text(table.name.clone()),
                 SqliteValue::Integer(i64::from(table.root_page)),
-                SqliteValue::Text(render_create_table_sql(table)),
+                SqliteValue::Text(render_create_table_sql(table, is_autoincrement)),
             ]);
 
             for index in &table.indexes {
@@ -5041,6 +5588,8 @@ impl Connection {
             views: self.views.borrow().clone(),
             triggers: self.triggers.borrow().clone(),
             rowid_alias_columns: self.rowid_alias_columns.borrow().clone(),
+            autoincrement_tables: self.autoincrement_tables.borrow().clone(),
+            sqlite_sequence_cache: self.sqlite_sequence_cache.borrow().clone(),
             next_master_rowid: *self.next_master_rowid.borrow(),
         }
     }
@@ -5052,6 +5601,8 @@ impl Connection {
         (*self.views.borrow_mut()).clone_from(&snap.views);
         (*self.triggers.borrow_mut()).clone_from(&snap.triggers);
         (*self.rowid_alias_columns.borrow_mut()).clone_from(&snap.rowid_alias_columns);
+        (*self.autoincrement_tables.borrow_mut()).clone_from(&snap.autoincrement_tables);
+        (*self.sqlite_sequence_cache.borrow_mut()).clone_from(&snap.sqlite_sequence_cache);
         *self.next_master_rowid.borrow_mut() = snap.next_master_rowid;
     }
 
@@ -5851,6 +6402,9 @@ impl Connection {
     ///   Enables or disables parity-certification mode. When ON (default),
     ///   all cursor operations must route through the real Pager+BtreeCursor
     ///   stack and the MemPageStore fallback is rejected.
+    /// - `PRAGMA fsqlite.parity_cert_strict = ON|OFF|TRUE|FALSE|1|0`
+    ///   When ON, interpreted in-memory fallback dispatches hard-fail while
+    ///   parity-cert mode is enabled. This is intended for certifying runs.
     #[allow(clippy::too_many_lines)]
     fn execute_pragma(&self, pragma: &fsqlite_ast::PragmaStatement) -> Result<Vec<Row>> {
         // First try connection-level knobs (journal_mode, synchronous, etc.).
@@ -5986,6 +6540,20 @@ impl Connection {
                     }])
                 } else {
                     let enabled = *self.reject_mem_fallback.borrow();
+                    Ok(vec![Row {
+                        values: vec![SqliteValue::Integer(i64::from(enabled))],
+                    }])
+                }
+            }
+            "fsqlite.parity_cert_strict" | "parity_cert_strict" => {
+                if let Some(ref val) = pragma.value {
+                    let enabled = parse_pragma_bool(val)?;
+                    *self.reject_mem_fallback_strict.borrow_mut() = enabled;
+                    Ok(vec![Row {
+                        values: vec![SqliteValue::Integer(i64::from(enabled))],
+                    }])
+                } else {
+                    let enabled = *self.reject_mem_fallback_strict.borrow();
                     Ok(vec![Row {
                         values: vec![SqliteValue::Integer(i64::from(enabled))],
                     }])
@@ -7528,6 +8096,7 @@ impl Connection {
                             is_ipk: false,
                             type_name: None,
                             notnull: false,
+                            unique: false,
                             default_value: None,
                             strict_type: None,
                         })
@@ -7604,6 +8173,7 @@ impl Connection {
                 is_ipk: false,
                 type_name: None,
                 notnull: false,
+                unique: false,
                 default_value: None,
                 strict_type: None,
             })
@@ -8202,6 +8772,7 @@ impl Connection {
 
         let func_reg = self.func_registry.borrow().clone();
         let reject_mem = *self.reject_mem_fallback.borrow();
+        let autoincrement_seq_by_root_page = self.autoincrement_sequence_by_root_page();
         let (result, txn_back) = execute_table_program_with_db(
             program,
             params,
@@ -8210,6 +8781,7 @@ impl Connection {
             txn,
             cookie,
             concurrent_ctx,
+            autoincrement_seq_by_root_page,
             reject_mem,
         );
         // Always restore the transaction handle, even on error.
@@ -8317,6 +8889,8 @@ impl Connection {
             self.views.borrow_mut().clear();
             self.triggers.borrow_mut().clear();
             self.rowid_alias_columns.borrow_mut().clear();
+            self.autoincrement_tables.borrow_mut().clear();
+            self.sqlite_sequence_cache.borrow_mut().clear();
             *self.next_master_rowid.borrow_mut() = 1;
             *self.schema_cookie.borrow_mut() = 0;
             *self.change_counter.borrow_mut() = 0;
@@ -8357,8 +8931,10 @@ impl Connection {
         let mut new_schema = Vec::new();
         let mut new_db = MemDatabase::new();
         let mut new_triggers = Vec::new();
-        let mut pending_indexes: Vec<(String, String, i32, Vec<String>)> = Vec::new();
+        let mut pending_indexes: Vec<(String, String, i32, Vec<String>, bool)> = Vec::new();
         let mut new_alias_map = HashMap::new();
+        let mut new_autoincrement_tables = HashSet::new();
+        let mut new_sqlite_sequence_cache = HashMap::new();
 
         for entry in &master_entries {
             if entry.len() < 5 {
@@ -8401,19 +8977,28 @@ impl Connection {
                 if root_page <= 0 {
                     continue;
                 }
-                let indexed_columns = match parse_single_statement(&create_sql) {
-                    Ok(Statement::CreateIndex(stmt)) => stmt
-                        .columns
-                        .iter()
-                        .filter_map(normalize_indexed_column_term)
-                        .map(|term| term.column_name)
-                        .collect::<Vec<_>>(),
-                    _ => Vec::new(),
+                let (indexed_columns, is_unique) = match parse_single_statement(&create_sql) {
+                    Ok(Statement::CreateIndex(stmt)) => {
+                        let cols = stmt
+                            .columns
+                            .iter()
+                            .filter_map(normalize_indexed_column_term)
+                            .map(|term| term.column_name)
+                            .collect::<Vec<_>>();
+                        (cols, stmt.unique)
+                    }
+                    _ => (Vec::new(), false),
                 };
                 if indexed_columns.is_empty() {
                     continue;
                 }
-                pending_indexes.push((index_name, table_name, root_page, indexed_columns));
+                pending_indexes.push((
+                    index_name,
+                    table_name,
+                    root_page,
+                    indexed_columns,
+                    is_unique,
+                ));
                 continue;
             }
 
@@ -8437,6 +9022,7 @@ impl Connection {
             // Parse the CREATE TABLE to extract column info.
             let columns = crate::compat_persist::parse_columns_from_create_sql(&create_sql);
             let num_columns = columns.len();
+            let is_autoincrement = crate::compat_persist::is_autoincrement_table_sql(&create_sql);
 
             // Track rowid alias columns (INTEGER PRIMARY KEY).
             // When a column is INTEGER PRIMARY KEY, its value is NOT stored in the
@@ -8445,6 +9031,9 @@ impl Connection {
             let ipk_col_idx = columns.iter().position(|c| c.is_ipk);
             if let Some(idx) = ipk_col_idx {
                 new_alias_map.insert(name.to_ascii_lowercase(), idx);
+                if is_autoincrement {
+                    new_autoincrement_tables.insert(name.to_ascii_lowercase());
+                }
             }
 
             #[allow(clippy::cast_possible_truncation)]
@@ -8452,7 +9041,7 @@ impl Connection {
             new_db.create_table_at(real_root_page, num_columns);
 
             new_schema.push(TableSchema {
-                name,
+                name: name.clone(),
                 root_page: real_root_page,
                 columns,
                 indexes: Vec::new(),
@@ -8482,6 +9071,14 @@ impl Connection {
                             if let Some(ipk_idx) = ipk_col_idx {
                                 values.insert(ipk_idx, SqliteValue::Integer(rowid));
                             }
+                            if name.eq_ignore_ascii_case("sqlite_sequence")
+                                && values.len() >= 2
+                                && let (SqliteValue::Text(tbl_name), SqliteValue::Integer(seq)) =
+                                    (&values[0], &values[1])
+                            {
+                                new_sqlite_sequence_cache
+                                    .insert(tbl_name.to_ascii_lowercase(), *seq);
+                            }
                             mem_table.insert_row(rowid, values);
                         }
                         if !cursor.next(cx)? {
@@ -8493,7 +9090,7 @@ impl Connection {
         }
 
         // Attach indexes after all table schemas are available.
-        for (index_name, table_name, root_page, columns) in pending_indexes {
+        for (index_name, table_name, root_page, columns, is_unique) in pending_indexes {
             if let Some(table) = new_schema
                 .iter_mut()
                 .find(|t| t.name.eq_ignore_ascii_case(&table_name))
@@ -8509,6 +9106,7 @@ impl Connection {
                     name: index_name,
                     root_page,
                     columns,
+                    is_unique,
                 });
                 if !new_db.tables.contains_key(&root_page) {
                     new_db.create_table_at(root_page, 0);
@@ -8551,6 +9149,8 @@ impl Connection {
         self.views.borrow_mut().clear();
         *self.triggers.borrow_mut() = new_triggers;
         *self.rowid_alias_columns.borrow_mut() = new_alias_map;
+        *self.autoincrement_tables.borrow_mut() = new_autoincrement_tables;
+        *self.sqlite_sequence_cache.borrow_mut() = new_sqlite_sequence_cache;
         #[allow(clippy::cast_possible_wrap)]
         {
             *self.next_master_rowid.borrow_mut() = max_master_rowid.saturating_add(1).max(1);
@@ -8897,6 +9497,7 @@ fn parse_virtual_table_column_infos(args: &[String]) -> Vec<ColumnInfo> {
             is_ipk: false,
             type_name: None,
             notnull: false,
+            unique: false,
             default_value: None,
             strict_type: None,
         });
@@ -8909,6 +9510,7 @@ fn parse_virtual_table_column_infos(args: &[String]) -> Vec<ColumnInfo> {
             is_ipk: false,
             type_name: None,
             notnull: false,
+            unique: false,
             default_value: None,
             strict_type: None,
         });
@@ -8960,6 +9562,7 @@ fn sqlite_master_column_infos() -> Vec<ColumnInfo> {
             is_ipk: false,
             type_name: None,
             notnull: false,
+            unique: false,
             default_value: None,
             strict_type: None,
         },
@@ -8969,6 +9572,7 @@ fn sqlite_master_column_infos() -> Vec<ColumnInfo> {
             is_ipk: false,
             type_name: None,
             notnull: false,
+            unique: false,
             default_value: None,
             strict_type: None,
         },
@@ -8978,6 +9582,7 @@ fn sqlite_master_column_infos() -> Vec<ColumnInfo> {
             is_ipk: false,
             type_name: None,
             notnull: false,
+            unique: false,
             default_value: None,
             strict_type: None,
         },
@@ -8987,6 +9592,7 @@ fn sqlite_master_column_infos() -> Vec<ColumnInfo> {
             is_ipk: false,
             type_name: None,
             notnull: false,
+            unique: false,
             default_value: None,
             strict_type: None,
         },
@@ -8996,13 +9602,14 @@ fn sqlite_master_column_infos() -> Vec<ColumnInfo> {
             is_ipk: false,
             type_name: None,
             notnull: false,
+            unique: false,
             default_value: None,
             strict_type: None,
         },
     ]
 }
 
-fn render_create_table_sql(table: &TableSchema) -> String {
+fn render_create_table_sql(table: &TableSchema, is_autoincrement: bool) -> String {
     let column_defs = table
         .columns
         .iter()
@@ -9010,6 +9617,9 @@ fn render_create_table_sql(table: &TableSchema) -> String {
             let mut part = format!("{} {}", col.name, affinity_decl_type(col.affinity));
             if col.is_ipk {
                 part.push_str(" PRIMARY KEY");
+                if is_autoincrement {
+                    part.push_str(" AUTOINCREMENT");
+                }
             }
             part
         })
@@ -10515,6 +11125,7 @@ fn execute_table_program_with_db(
     txn: Option<Box<dyn TransactionHandle>>,
     schema_cookie: u32,
     concurrent_ctx: Option<ConcurrentExecContext>,
+    autoincrement_seq_by_root_page: HashMap<i32, i64>,
     reject_mem_fallback: bool,
 ) -> (Result<Vec<Row>>, Option<Box<dyn TransactionHandle>>) {
     let execution_span = tracing::span!(
@@ -10535,6 +11146,7 @@ fn execute_table_program_with_db(
 
     engine.set_function_registry(Arc::clone(func_registry));
     engine.set_schema_cookie(schema_cookie);
+    engine.set_autoincrement_sequence_by_root_page(autoincrement_seq_by_root_page);
     // bd-2ttd8.1: enable parity-cert mode to reject MemPageStore fallback.
     engine.set_reject_mem_fallback(reject_mem_fallback);
 
@@ -11672,9 +12284,21 @@ fn emit_expr(
             bind_state,
         ),
 
+        // ── COLLATE: transparent wrapper – evaluate inner expression ─
+        Expr::Collate { expr: inner, .. } => emit_expr(builder, inner, target_reg, bind_state),
+
         _ => Err(FrankenError::NotImplemented(format!(
             "expression form is not supported in this connection path: {expr:?}",
         ))),
+    }
+}
+
+/// Extract the collation name from a COLLATE expression wrapper, if any.
+fn extract_collation(expr: &Expr) -> Option<&str> {
+    if let Expr::Collate { collation, .. } = expr {
+        Some(collation.as_str())
+    } else {
+        None
     }
 }
 
@@ -11715,9 +12339,13 @@ fn emit_binary_expr(
                 BinaryOp::Ge => Opcode::Ge,
                 _ => unreachable!(),
             };
+            // Extract explicit COLLATE from either operand for the comparison.
+            let coll_p4 = extract_collation(left)
+                .or_else(|| extract_collation(right))
+                .map_or(P4::None, |c| P4::Collation(c.to_owned()));
             let true_label = builder.emit_label();
             let done_label = builder.emit_label();
-            builder.emit_jump_to_label(cmp_opcode, right_reg, left_reg, true_label, P4::None, 0);
+            builder.emit_jump_to_label(cmp_opcode, right_reg, left_reg, true_label, coll_p4, 0);
             builder.emit_op(Opcode::Integer, 0, target_reg, 0, P4::None, 0);
             builder.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
             builder.resolve_label(true_label);
@@ -13922,11 +14550,7 @@ fn eval_scalar_fn(name: &str, args: &[SqliteValue]) -> SqliteValue {
         "sqlite_version" => SqliteValue::Text("3.52.0".to_owned()),
         "last_insert_rowid" => SqliteValue::Integer(get_last_insert_rowid()),
         "changes" => SqliteValue::Integer(get_last_changes()),
-        "total_changes" => {
-            // total_changes tracks cumulative changes across the connection lifetime;
-            // approximate with per-statement changes for now.
-            SqliteValue::Integer(get_last_changes())
-        }
+        "total_changes" => SqliteValue::Integer(get_total_changes()),
         "likely" | "unlikely" => args.first().cloned().unwrap_or(SqliteValue::Null),
         _ => SqliteValue::Null,
     }
@@ -26356,6 +26980,75 @@ mod pager_routing_tests {
         );
         let rows = conn.query("PRAGMA fsqlite.parity_cert;").unwrap();
         assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+    }
+
+    #[test]
+    fn test_zjisk1_pragma_parity_cert_strict_toggle() {
+        // Strict parity-cert fallback rejection is opt-in for certifying runs.
+        let conn = Connection::open(":memory:").unwrap();
+
+        let rows = conn.query("PRAGMA fsqlite.parity_cert_strict;").unwrap();
+        assert_eq!(
+            rows[0].values()[0],
+            SqliteValue::Integer(0),
+            "default strict parity-cert mode must be OFF"
+        );
+
+        conn.execute("PRAGMA fsqlite.parity_cert_strict = ON;")
+            .unwrap();
+        assert!(
+            *conn.reject_mem_fallback_strict.borrow(),
+            "strict parity-cert pragma ON must enable hard rejection"
+        );
+        let rows = conn.query("PRAGMA fsqlite.parity_cert_strict;").unwrap();
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+
+        conn.execute("PRAGMA fsqlite.parity_cert_strict = OFF;")
+            .unwrap();
+        assert!(
+            !*conn.reject_mem_fallback_strict.borrow(),
+            "strict parity-cert pragma OFF must disable hard rejection"
+        );
+        let rows = conn.query("PRAGMA fsqlite.parity_cert_strict;").unwrap();
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(0));
+    }
+
+    #[test]
+    fn test_zjisk1_strict_mode_rejects_join_fallback_dispatch() {
+        // JOIN currently uses interpreted fallback dispatch in this path.
+        // In strict parity-cert mode, that fallback must hard-fail.
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE items (id INTEGER, name TEXT);")
+            .unwrap();
+        conn.execute("CREATE TABLE tags (item_id INTEGER, tag TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO items VALUES (1, 'alpha');")
+            .unwrap();
+        conn.execute("INSERT INTO tags VALUES (1, 'fruit');")
+            .unwrap();
+
+        let sql = "SELECT items.name, tags.tag \
+                   FROM items JOIN tags ON items.id = tags.item_id;";
+
+        // Default behavior (non-strict) still allows fallback execution.
+        let rows = conn.query(sql).unwrap();
+        assert_eq!(rows.len(), 1);
+
+        conn.execute("PRAGMA fsqlite.parity_cert_strict = ON;")
+            .unwrap();
+        let err = conn
+            .query(sql)
+            .expect_err("strict parity-cert mode must reject fallback dispatch");
+        assert!(
+            err.to_string()
+                .contains("in-memory fallback disabled in strict parity-cert mode"),
+            "unexpected strict fallback error: {err}"
+        );
+
+        // parity_cert OFF should allow fallback even when strict flag is ON.
+        conn.execute("PRAGMA fsqlite.parity_cert = OFF;").unwrap();
+        let rows = conn.query(sql).unwrap();
+        assert_eq!(rows.len(), 1);
     }
 
     #[test]

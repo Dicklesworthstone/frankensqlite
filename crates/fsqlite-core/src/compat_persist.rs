@@ -158,12 +158,10 @@ pub fn persist_to_sqlite(
     {
         let mut hdr_page = txn.get_page(&cx, PageNumber::ONE)?.into_vec();
 
-        // Compute actual page count: max page number written.
-        let max_page = master_entries
-            .iter()
-            .map(|(_, rp, _)| *rp)
-            .max()
-            .unwrap_or(1);
+        // Compute actual page count by finding the highest page number that was allocated.
+        // In a fresh database with no freelist, allocating one more page gives us (max_page + 1).
+        let next_page = txn.allocate_page(&cx)?.get();
+        let max_page = next_page.saturating_sub(1).max(1);
 
         // page_count at offset 28 (4 bytes, big-endian)
         hdr_page[28..32].copy_from_slice(&max_page.to_be_bytes());
@@ -482,6 +480,7 @@ pub fn parse_columns_from_create_sql(sql: &str) -> Vec<ColumnInfo> {
                 is_ipk,
                 type_name,
                 notnull: upper.contains("NOT NULL"),
+                unique: upper.contains("UNIQUE") || (is_ipk && upper.contains("PRIMARY KEY")),
                 default_value: None,
                 strict_type,
             })
@@ -508,6 +507,23 @@ pub fn is_strict_table_sql(sql: &str) -> bool {
         }
     }
     token == "STRICT"
+}
+
+/// Return true when CREATE TABLE SQL declares AUTOINCREMENT.
+#[must_use]
+pub fn is_autoincrement_table_sql(sql: &str) -> bool {
+    let mut token = String::new();
+    for ch in sql.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            token.push(ch.to_ascii_uppercase());
+        } else if !token.is_empty() {
+            if token == "AUTOINCREMENT" {
+                return true;
+            }
+            token.clear();
+        }
+    }
+    token == "AUTOINCREMENT"
 }
 
 fn parse_column_name_and_remainder(def: &str) -> Option<(String, &str)> {
@@ -732,6 +748,7 @@ mod tests {
                     is_ipk: false,
                     type_name: None,
                     notnull: false,
+                    unique: false,
                     default_value: None,
                     strict_type: None,
                 },
@@ -741,6 +758,7 @@ mod tests {
                     is_ipk: false,
                     type_name: None,
                     notnull: false,
+                    unique: false,
                     default_value: None,
                     strict_type: None,
                 },
@@ -891,6 +909,7 @@ mod tests {
                     is_ipk: false,
                     type_name: None,
                     notnull: false,
+                    unique: false,
                     default_value: None,
                     strict_type: None,
                 }],
@@ -906,6 +925,7 @@ mod tests {
                     is_ipk: false,
                     type_name: None,
                     notnull: false,
+                    unique: false,
                     default_value: None,
                     strict_type: None,
                 }],
@@ -997,6 +1017,7 @@ mod tests {
                 is_ipk: false,
                 type_name: Some("INTEGER".to_owned()),
                 notnull: false,
+                unique: false,
                 default_value: None,
                 strict_type: Some(StrictColumnType::Integer),
             }],
@@ -1021,6 +1042,16 @@ mod tests {
         ));
         assert!(!is_strict_table_sql(
             "CREATE TABLE s (id INTEGER, body TEXT) WITHOUT ROWID"
+        ));
+    }
+
+    #[test]
+    fn test_is_autoincrement_table_sql_detects_keyword() {
+        assert!(is_autoincrement_table_sql(
+            "CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)"
+        ));
+        assert!(!is_autoincrement_table_sql(
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)"
         ));
     }
 

@@ -896,8 +896,16 @@ mod tests {
         };
 
         // Register tasks before spawning threads.
-        let task1 = tree.lock().unwrap_or_else(|e| e.into_inner()).register_task(wc).expect("t1");
-        let task2 = tree.lock().unwrap_or_else(|e| e.into_inner()).register_task(wc).expect("t2");
+        let task1 = tree
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .register_task(wc)
+            .expect("t1");
+        let task2 = tree
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .register_task(wc)
+            .expect("t2");
 
         let completed = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&completed);
