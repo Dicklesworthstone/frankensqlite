@@ -4071,4 +4071,139 @@ mod tests {
             assert!(consistent, "Reader thread {} saw inconsistent data", i);
         }
     }
+
+    // ── Conformance gap probes (fixtures 017–021) ──────────────────────
+
+    #[test]
+    fn conformance_017_type_affinity_edge_numeric_coercion() {
+        // '3.0e+5' into NUMERIC should coerce to integer 300000
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE q1(a NUMERIC, b TEXT, c INTEGER)")
+            .unwrap();
+        conn.execute("INSERT INTO q1 VALUES('3.0e+5', 123, '0042')")
+            .unwrap();
+        let rows = conn
+            .query("SELECT typeof(a), a, typeof(b), b, typeof(c), c FROM q1")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        let vals = row_values(&rows[0]);
+        // SQLite behavior: '3.0e+5' → NUMERIC → integer 300000
+        assert_eq!(vals[0], SqliteValue::Text("integer".to_owned()));
+        assert_eq!(vals[1], SqliteValue::Integer(300_000));
+        // 123 into TEXT → text "123"
+        assert_eq!(vals[2], SqliteValue::Text("text".to_owned()));
+        assert_eq!(vals[3], SqliteValue::Text("123".to_owned()));
+        // '0042' into INTEGER → integer 42
+        assert_eq!(vals[4], SqliteValue::Text("integer".to_owned()));
+        assert_eq!(vals[5], SqliteValue::Integer(42));
+    }
+
+    #[test]
+    fn conformance_018_collation_nocase_ascii_only() {
+        // NOCASE is ASCII-insensitive: 'a' = 'A' → 1
+        // but Unicode-sensitive: 'æ' ≠ 'Æ' → 0
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn.query("SELECT 'a' = 'A' COLLATE NOCASE").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(1));
+    }
+
+    #[test]
+    fn conformance_018_collation_nocase_unicode_sensitive() {
+        let conn = Connection::open(":memory:").unwrap();
+        // Unicode chars: NOCASE does NOT fold them
+        let rows = conn.query("SELECT 'æ' = 'Æ' COLLATE NOCASE").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(0));
+    }
+
+    #[test]
+    fn conformance_019_null_unique_allows_multiple_nulls() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE q3(a INTEGER UNIQUE, note TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO q3(a, note) VALUES(NULL, 'first-null')")
+            .unwrap();
+        // UNIQUE allows multiple NULLs
+        conn.execute("INSERT INTO q3(a, note) VALUES(NULL, 'second-null')")
+            .unwrap();
+        conn.execute("INSERT INTO q3(a, note) VALUES(7, 'first-seven')")
+            .unwrap();
+        let rows = conn.query("SELECT COUNT(*) FROM q3").unwrap();
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(3));
+    }
+
+    #[test]
+    fn conformance_019_null_unique_rejects_duplicate_non_null() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE q3b(a INTEGER UNIQUE, note TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO q3b(a, note) VALUES(7, 'first-seven')")
+            .unwrap();
+        // Duplicate non-NULL should be rejected
+        let result = conn.execute("INSERT INTO q3b(a, note) VALUES(7, 'dup')");
+        assert!(
+            result.is_err(),
+            "Duplicate non-NULL unique value should fail"
+        );
+    }
+
+    #[test]
+    fn conformance_020_integer_overflow_promotes_to_real() {
+        let conn = Connection::open(":memory:").unwrap();
+        // i64::MAX + 1 should overflow to real
+        let rows = conn
+            .query("SELECT typeof(9223372036854775807 + 1)")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            row_values(&rows[0])[0],
+            SqliteValue::Text("real".to_owned())
+        );
+    }
+
+    #[test]
+    fn conformance_020_integer_underflow_promotes_to_real() {
+        let conn = Connection::open(":memory:").unwrap();
+        // i64::MIN - 1 should underflow to real
+        let rows = conn
+            .query("SELECT typeof(-9223372036854775808 - 1)")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            row_values(&rows[0])[0],
+            SqliteValue::Text("real".to_owned())
+        );
+    }
+
+    #[test]
+    fn conformance_021_savepoint_rollback_preserves_outer() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE q5(id INTEGER PRIMARY KEY, note TEXT)")
+            .unwrap();
+        conn.execute("BEGIN").unwrap();
+        conn.execute("INSERT INTO q5 VALUES(1, 'outer')").unwrap();
+        conn.execute("SAVEPOINT s1").unwrap();
+        conn.execute("INSERT INTO q5 VALUES(2, 'inner')").unwrap();
+        conn.execute("ROLLBACK TO s1").unwrap();
+        conn.execute("RELEASE s1").unwrap();
+        conn.execute("COMMIT").unwrap();
+        let rows = conn.query("SELECT id, note FROM q5 ORDER BY id").unwrap();
+        assert_eq!(rows.len(), 1, "ROLLBACK TO s1 should undo inner insert");
+        assert_eq!(row_values(&rows[0])[0], SqliteValue::Integer(1));
+        assert_eq!(
+            row_values(&rows[0])[1],
+            SqliteValue::Text("outer".to_owned())
+        );
+    }
+
+    #[test]
+    fn conformance_021_nested_begin_errors() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("BEGIN").unwrap();
+        // Nested BEGIN inside an active transaction should error
+        let result = conn.execute("BEGIN");
+        assert!(result.is_err(), "Nested BEGIN should produce an error");
+        conn.execute("ROLLBACK").unwrap();
+    }
 }

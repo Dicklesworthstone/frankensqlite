@@ -603,14 +603,16 @@ pub unsafe extern "C" fn sqlite3_reset(stmt: *mut Sqlite3Stmt) -> c_int {
 
 // ── Column accessors ────────────────────────────────────────────────
 
-/// Return the current row's value at column `i_col`, or None if out of bounds.
-unsafe fn current_value(stmt: *const Sqlite3Stmt, i_col: c_int) -> Option<SqliteValue> {
+/// Return a reference to the current row's value at column `i_col`, or None if out of bounds.
+unsafe fn current_value_ref<'a>(stmt: *const Sqlite3Stmt, i_col: c_int) -> Option<&'a SqliteValue> {
+    if i_col < 0 {
+        return None;
+    }
     let s = &*stmt;
     let rows = s.rows.as_ref()?;
-    // cursor was incremented after returning SQLITE_ROW, so current row is cursor-1.
     let row_idx = s.cursor.checked_sub(1)?;
     let row = rows.get(row_idx)?;
-    row.get(i_col as usize).cloned()
+    row.get(i_col as usize)
 }
 
 /// Number of columns in the result set.
@@ -636,7 +638,7 @@ pub unsafe extern "C" fn sqlite3_column_count(stmt: *mut Sqlite3Stmt) -> c_int {
 pub unsafe extern "C" fn sqlite3_column_type(stmt: *mut Sqlite3Stmt, i_col: c_int) -> c_int {
     COMPAT_COLUMN.fetch_add(1, Ordering::Relaxed);
 
-    match current_value(stmt, i_col) {
+    match current_value_ref(stmt, i_col) {
         Some(SqliteValue::Integer(_)) => SQLITE_INTEGER,
         Some(SqliteValue::Float(_)) => SQLITE_FLOAT,
         Some(SqliteValue::Text(_)) => SQLITE_TEXT,
@@ -653,10 +655,10 @@ pub unsafe extern "C" fn sqlite3_column_type(stmt: *mut Sqlite3Stmt, i_col: c_in
 pub unsafe extern "C" fn sqlite3_column_int64(stmt: *mut Sqlite3Stmt, i_col: c_int) -> i64 {
     COMPAT_COLUMN.fetch_add(1, Ordering::Relaxed);
 
-    match current_value(stmt, i_col) {
-        Some(SqliteValue::Integer(n)) => n,
-        Some(SqliteValue::Float(f)) => f as i64,
-        Some(SqliteValue::Text(ref s)) => s.parse::<i64>().unwrap_or(0),
+    match current_value_ref(stmt, i_col) {
+        Some(SqliteValue::Integer(n)) => *n,
+        Some(SqliteValue::Float(f)) => *f as i64,
+        Some(SqliteValue::Text(s)) => s.parse::<i64>().unwrap_or(0),
         _ => 0,
     }
 }
@@ -680,10 +682,10 @@ pub unsafe extern "C" fn sqlite3_column_int(stmt: *mut Sqlite3Stmt, i_col: c_int
 pub unsafe extern "C" fn sqlite3_column_double(stmt: *mut Sqlite3Stmt, i_col: c_int) -> c_double {
     COMPAT_COLUMN.fetch_add(1, Ordering::Relaxed);
 
-    match current_value(stmt, i_col) {
-        Some(SqliteValue::Float(f)) => f,
-        Some(SqliteValue::Integer(n)) => n as f64,
-        Some(SqliteValue::Text(ref s)) => s.parse::<f64>().unwrap_or(0.0),
+    match current_value_ref(stmt, i_col) {
+        Some(SqliteValue::Float(f)) => *f,
+        Some(SqliteValue::Integer(n)) => *n as f64,
+        Some(SqliteValue::Text(s)) => s.parse::<f64>().unwrap_or(0.0),
         _ => 0.0,
     }
 }
@@ -706,11 +708,11 @@ pub unsafe extern "C" fn sqlite3_column_text(
         return std::ptr::null();
     }
 
-    let text = match current_value(stmt, i_col) {
-        Some(SqliteValue::Text(s)) => s,
+    let text = match current_value_ref(stmt, i_col) {
+        Some(SqliteValue::Text(s)) => s.clone(),
         Some(SqliteValue::Integer(n)) => n.to_string(),
         Some(SqliteValue::Float(f)) => f.to_string(),
-        Some(SqliteValue::Blob(ref b)) => {
+        Some(SqliteValue::Blob(b)) => {
             // Return blob as hex string for text accessor.
             let mut hex = String::with_capacity(b.len() * 2);
             for byte in b {
@@ -799,7 +801,7 @@ pub unsafe extern "C" fn sqlite3_column_blob(
 pub unsafe extern "C" fn sqlite3_column_bytes(stmt: *mut Sqlite3Stmt, i_col: c_int) -> c_int {
     COMPAT_COLUMN.fetch_add(1, Ordering::Relaxed);
 
-    match current_value(stmt, i_col) {
+    match current_value_ref(stmt, i_col) {
         Some(SqliteValue::Blob(b)) => b.len() as c_int,
         Some(SqliteValue::Text(s)) => s.len() as c_int,
         // SQLite returns the byte length of the text representation for integers;

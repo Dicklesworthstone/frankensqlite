@@ -44,9 +44,7 @@ use fsqlite_types::flags::SyncFlags;
 use fsqlite_vfs::VfsFile;
 use tracing::{debug, info, trace};
 
-use crate::checksum::{
-    WAL_FRAME_HEADER_SIZE, write_wal_frame_checksum, write_wal_frame_salts,
-};
+use crate::checksum::{WAL_FRAME_HEADER_SIZE, write_wal_frame_checksum, write_wal_frame_salts};
 use crate::metrics::GLOBAL_WAL_METRICS;
 use crate::wal::WalFile;
 
@@ -211,19 +209,9 @@ impl ConsolidationMetrics {
         self.fsyncs_total.fetch_add(1, Ordering::Relaxed);
         self.flush_duration_us_total
             .fetch_add(duration_us, Ordering::Relaxed);
-        // Update max group size (relaxed CAS loop).
-        let mut current = self.max_group_size_observed.load(Ordering::Relaxed);
-        while frames > current {
-            match self.max_group_size_observed.compare_exchange_weak(
-                current,
-                frames,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(actual) => current = actual,
-            }
-        }
+        // Update max group size.
+        self.max_group_size_observed
+            .fetch_max(frames, Ordering::Relaxed);
     }
 
     /// Record waiter wait time.
@@ -642,9 +630,7 @@ pub fn write_consolidated_frames<F: VfsFile>(
 
     // Single write for all frames.
     let base_frame_count = wal.frame_count();
-    let file_offset = wal
-        .frame_offset(base_frame_count)
-        ;
+    let file_offset = wal.frame_offset(base_frame_count);
 
     wal.file_mut().write(cx, &consolidated_buf, file_offset)?;
 

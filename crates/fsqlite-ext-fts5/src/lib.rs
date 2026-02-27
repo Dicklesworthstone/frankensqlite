@@ -1080,10 +1080,11 @@ pub fn bm25_score(
     let mut score = 0.0;
 
     for term in query_terms {
-        let df = index.doc_frequency(term) as f64;
-        if df == 0.0 {
+        let df_int = index.doc_frequency(term);
+        if df_int == 0 {
             continue;
         }
+        let df = df_int as f64;
 
         // IDF component
         let idf = ((n - df + 0.5) / (df + 0.5)).ln_1p();

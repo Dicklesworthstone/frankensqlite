@@ -1157,7 +1157,10 @@ impl ArcCacheInner {
             return;
         }
 
-        if self.len() <= self.capacity {
+        let over_capacity = self.len() > self.capacity;
+        let over_bytes = self.max_bytes > 0 && self.total_bytes > self.max_bytes;
+
+        if !over_capacity && !over_bytes {
             self.capacity_overflow_events = self.capacity_overflow_events.saturating_sub(1);
             return;
         }
@@ -1385,7 +1388,10 @@ impl ArcCacheInner {
     /// the cache to shrink back to normal capacity if it previously grew
     /// due to all-pinned overflow.
     pub fn notify_unpin(&mut self) {
-        while self.capacity_overflow_events > 0 && self.len() > self.capacity {
+        while self.capacity_overflow_events > 0
+            && (self.len() > self.capacity
+                || (self.max_bytes > 0 && self.total_bytes > self.max_bytes))
+        {
             if self.evict_one_preferred() {
                 self.capacity_overflow_events -= 1;
             } else {

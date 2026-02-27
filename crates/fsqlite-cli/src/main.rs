@@ -478,11 +478,7 @@ fn is_line_comment_start(bytes: &[u8], i: usize) -> bool {
     if bytes.get(i + 1) != Some(&b'-') {
         return false;
     }
-    // SQLite only recognizes `--` when followed by whitespace/EOL.
-    match bytes.get(i + 2) {
-        None => true,
-        Some(byte) => byte.is_ascii_whitespace(),
-    }
+    true
 }
 
 fn is_block_comment_start(bytes: &[u8], i: usize) -> bool {
@@ -831,10 +827,10 @@ mod tests {
     }
 
     #[test]
-    fn test_statement_complete_does_not_treat_double_minus_as_comment_without_space() {
-        // SQLite only treats `--` as a comment when followed by whitespace/EOL.
-        assert!(statement_complete("SELECT 1--2;")); // 1 - -2
-        assert!(statement_complete("SELECT 1--2; -- ok")); // comment after terminator
+    fn test_statement_complete_treats_double_minus_as_comment() {
+        // SQLite treats `--` as a comment regardless of whitespace.
+        assert!(!statement_complete("SELECT 1--2;")); // semicolon is part of the comment
+        assert!(statement_complete("SELECT 1--2;\n;")); // semicolon on next line completes it
     }
 
     #[test]

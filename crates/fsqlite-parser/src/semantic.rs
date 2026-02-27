@@ -850,11 +850,7 @@ impl<'a> Resolver<'a> {
                 over,
                 ..
             } => {
-                let arg_slice: &[Expr] = match args {
-                    FunctionArgs::Star => &[],
-                    FunctionArgs::List(list) => list,
-                };
-                self.resolve_function(name, arg_slice, scope);
+                self.resolve_function(name, args, scope);
                 if let Some(filter) = filter {
                     self.resolve_expr(filter, scope);
                 }
@@ -1017,15 +1013,20 @@ impl<'a> Resolver<'a> {
         }
     }
 
-    fn resolve_function(&mut self, name: &str, args: &[Expr], scope: &Scope) {
+    fn resolve_function(&mut self, name: &str, args: &FunctionArgs, scope: &Scope) {
         // Resolve argument expressions.
-        for arg in args {
-            self.resolve_expr(arg, scope);
-        }
+        let actual = match args {
+            FunctionArgs::Star => 1, // `*` counts as 1 argument for arity purposes (e.g. count(*))
+            FunctionArgs::List(list) => {
+                for arg in list {
+                    self.resolve_expr(arg, scope);
+                }
+                list.len()
+            }
+        };
 
         // Validate known function arity.
         if let Some(expected) = known_function_arity(name) {
-            let actual = args.len();
             let valid = match &expected {
                 FunctionArity::Exact(n) => actual == *n,
                 FunctionArity::Range(lo, hi) => actual >= *lo && actual <= *hi,
