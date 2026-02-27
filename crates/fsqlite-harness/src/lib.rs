@@ -47,6 +47,7 @@ pub mod mismatch_minimizer;
 pub mod no_mock_critical_path_gate;
 pub mod no_mock_evidence;
 pub mod oracle;
+pub mod oracle_preflight_doctor;
 pub mod parity_evidence_matrix;
 pub mod parity_invariant_catalog;
 pub mod parity_taxonomy;

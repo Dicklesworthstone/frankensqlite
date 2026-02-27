@@ -54,6 +54,14 @@ const SCENARIO_DRIFT_ARTIFACT_NAME: &str = "scenario_coverage_drift_report.json"
 const NO_MOCK_ARTIFACT_NAME: &str = "no_mock_critical_path_report.json";
 const LOGGING_ARTIFACT_NAME: &str = "logging_conformance_report.json";
 const LOG_EVENTS_ARTIFACT_NAME: &str = "validation_manifest_events.jsonl";
+const ARTIFACT_BUNDLE_INTEGRITY_ARTIFACT_NAME: &str = "artifact_bundle_integrity_report.json";
+
+/// Schema version for artifact-bundle integrity reports (bd-2yqp6.2.9).
+pub const ARTIFACT_BUNDLE_INTEGRITY_SCHEMA_VERSION: &str = "1.0.0";
+/// Schema version for persisted artifact-hash ratchet baselines (bd-2yqp6.2.9).
+pub const ARTIFACT_HASH_RATCHET_BASELINE_SCHEMA_VERSION: &str = "1.0.0";
+/// Owning bead for artifact bundle hash ratchet policy.
+pub const ARTIFACT_HASH_RATCHET_BEAD_ID: &str = "bd-2yqp6.2.9";
 
 /// Outcome class for a single gate or aggregate manifest verdict.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -268,6 +276,112 @@ pub struct LoggingConformanceStatus {
     pub overall_pass: bool,
 }
 
+/// Single artifact payload hash entry used by integrity signatures.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArtifactPayloadHash {
+    /// Artifact URI (must match manifest artifact index entry).
+    pub artifact_uri: String,
+    /// SHA-256 hash of the serialized artifact payload.
+    pub payload_sha256: String,
+}
+
+/// Deterministic signed integrity report for manifest artifact bundles.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArtifactBundleIntegrityReport {
+    /// Integrity report schema version.
+    pub schema_version: String,
+    /// Owning bead identifier.
+    pub bead_id: String,
+    /// Referenced manifest schema version.
+    pub manifest_schema_version: String,
+    /// Referenced manifest bead identifier.
+    pub manifest_bead_id: String,
+    /// Referenced scenario identifier.
+    pub scenario_id: String,
+    /// Hashing algorithm used for artifact and bundle digests.
+    pub algorithm: String,
+    /// Sorted artifact payload hashes.
+    pub artifact_payload_hashes: Vec<ArtifactPayloadHash>,
+    /// Canonical payload string used for signing.
+    pub canonical_payload: String,
+    /// SHA-256 digest of `canonical_payload`.
+    pub bundle_hash: String,
+}
+
+impl ArtifactBundleIntegrityReport {
+    /// Serialize to deterministic pretty JSON.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when serialization fails.
+    pub fn to_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string_pretty(self)
+    }
+
+    /// Deserialize from JSON.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` for malformed JSON.
+    pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
+        serde_json::from_str(json)
+    }
+}
+
+/// Persisted baseline used by the artifact-hash ratchet policy.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArtifactHashRatchetBaseline {
+    /// Baseline schema version.
+    pub schema_version: String,
+    /// Owning bead identifier.
+    pub bead_id: String,
+    /// Scenario identifier this baseline applies to.
+    pub scenario_id: String,
+    /// Approved baseline bundle hash.
+    pub bundle_hash: String,
+    /// Deterministic timestamp when baseline was updated.
+    pub updated_unix_ms: u128,
+    /// Human-reviewed rationale for this baseline state.
+    pub update_reason: String,
+}
+
+impl ArtifactHashRatchetBaseline {
+    /// Serialize baseline to deterministic pretty JSON.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when serialization fails.
+    pub fn to_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string_pretty(self)
+    }
+
+    /// Deserialize baseline from JSON.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` for malformed JSON.
+    pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
+        serde_json::from_str(json)
+    }
+}
+
+/// Decision output for artifact-hash ratchet evaluation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArtifactHashRatchetDecision {
+    /// Whether the candidate hash is approved.
+    pub approved: bool,
+    /// Whether baseline update is required to proceed.
+    pub requires_baseline_update: bool,
+    /// Existing baseline hash, if any.
+    pub baseline_hash: Option<String>,
+    /// Candidate bundle hash being evaluated.
+    pub candidate_hash: String,
+    /// Structured policy decision reason.
+    pub reason: String,
+    /// Optional reviewed update reason provided by caller.
+    pub update_reason: Option<String>,
+}
+
 /// Full machine-readable validation manifest.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ValidationManifest {
@@ -403,6 +517,8 @@ pub struct ValidationManifestBundle {
     pub manifest: ValidationManifest,
     /// URI -> serialized JSON/JSONL content.
     pub gate_artifacts: BTreeMap<String, String>,
+    /// Deterministic signed integrity report for artifact bundle payloads.
+    pub artifact_bundle_integrity: ArtifactBundleIntegrityReport,
     /// Human-readable summary derived from the manifest.
     pub human_summary: String,
 }
@@ -625,12 +741,304 @@ pub fn build_validation_manifest_bundle(
         ));
     }
 
+    let artifact_bundle_integrity =
+        build_artifact_bundle_integrity_report(&manifest, &gate_artifacts)?;
+    let integrity_errors = validate_artifact_bundle_integrity_report(
+        &manifest,
+        &gate_artifacts,
+        &artifact_bundle_integrity,
+    );
+    if !integrity_errors.is_empty() {
+        return Err(format!(
+            "artifact_bundle_integrity_validation_failed: {}",
+            integrity_errors.join("; ")
+        ));
+    }
+
+    let integrity_uri = format!("{artifact_prefix}/{ARTIFACT_BUNDLE_INTEGRITY_ARTIFACT_NAME}");
+    gate_artifacts.insert(
+        integrity_uri,
+        artifact_bundle_integrity
+            .to_json()
+            .map_err(|error| format!("artifact_bundle_integrity_serialize_failed: {error}"))?,
+    );
+
     let human_summary = manifest.render_summary();
     Ok(ValidationManifestBundle {
         manifest,
         gate_artifacts,
+        artifact_bundle_integrity,
         human_summary,
     })
+}
+
+/// Build deterministic artifact-bundle integrity report for the manifest.
+///
+/// # Errors
+///
+/// Returns `Err` when required artifact payloads are missing.
+pub fn build_artifact_bundle_integrity_report(
+    manifest: &ValidationManifest,
+    gate_artifacts: &BTreeMap<String, String>,
+) -> Result<ArtifactBundleIntegrityReport, String> {
+    let mut artifact_payload_hashes = Vec::with_capacity(manifest.artifact_uris.len());
+    for uri in &manifest.artifact_uris {
+        let payload = gate_artifacts
+            .get(uri)
+            .ok_or_else(|| format!("missing_gate_artifact_payload_for_uri: {uri}"))?;
+        artifact_payload_hashes.push(ArtifactPayloadHash {
+            artifact_uri: uri.clone(),
+            payload_sha256: sha256_hex(payload),
+        });
+    }
+
+    let canonical_payload = artifact_bundle_canonical_payload(manifest, &artifact_payload_hashes);
+    let bundle_hash = sha256_hex(&canonical_payload);
+
+    Ok(ArtifactBundleIntegrityReport {
+        schema_version: ARTIFACT_BUNDLE_INTEGRITY_SCHEMA_VERSION.to_owned(),
+        bead_id: ARTIFACT_HASH_RATCHET_BEAD_ID.to_owned(),
+        manifest_schema_version: manifest.schema_version.clone(),
+        manifest_bead_id: manifest.bead_id.clone(),
+        scenario_id: manifest.scenario_id.clone(),
+        algorithm: "sha256".to_owned(),
+        artifact_payload_hashes,
+        canonical_payload,
+        bundle_hash,
+    })
+}
+
+/// Validate artifact-bundle integrity report against manifest and artifact payloads.
+#[must_use]
+pub fn validate_artifact_bundle_integrity_report(
+    manifest: &ValidationManifest,
+    gate_artifacts: &BTreeMap<String, String>,
+    report: &ArtifactBundleIntegrityReport,
+) -> Vec<String> {
+    let mut errors = Vec::new();
+
+    if report.schema_version != ARTIFACT_BUNDLE_INTEGRITY_SCHEMA_VERSION {
+        errors.push(format!(
+            "artifact_bundle_integrity schema_version '{}' must equal '{}'",
+            report.schema_version, ARTIFACT_BUNDLE_INTEGRITY_SCHEMA_VERSION
+        ));
+    }
+    if report.bead_id != ARTIFACT_HASH_RATCHET_BEAD_ID {
+        errors.push(format!(
+            "artifact_bundle_integrity bead_id '{}' must equal '{}'",
+            report.bead_id, ARTIFACT_HASH_RATCHET_BEAD_ID
+        ));
+    }
+    if report.manifest_schema_version != manifest.schema_version {
+        errors.push("artifact_bundle_integrity manifest_schema_version mismatch".to_owned());
+    }
+    if report.manifest_bead_id != manifest.bead_id {
+        errors.push("artifact_bundle_integrity manifest_bead_id mismatch".to_owned());
+    }
+    if report.scenario_id != manifest.scenario_id {
+        errors.push("artifact_bundle_integrity scenario_id mismatch".to_owned());
+    }
+    if report.algorithm != "sha256" {
+        errors.push("artifact_bundle_integrity algorithm must be sha256".to_owned());
+    }
+    if !is_sha256_hex_64(&report.bundle_hash) {
+        errors.push(
+            "artifact_bundle_integrity bundle_hash must be 64 lowercase hex chars".to_owned(),
+        );
+    }
+
+    if report.artifact_payload_hashes.len() != manifest.artifact_uris.len() {
+        errors.push(format!(
+            "artifact_bundle_integrity artifact count mismatch: report={} manifest={}",
+            report.artifact_payload_hashes.len(),
+            manifest.artifact_uris.len()
+        ));
+    }
+
+    let mut previous_uri: Option<&str> = None;
+    let mut seen_uris = BTreeSet::new();
+    for (index, entry) in report.artifact_payload_hashes.iter().enumerate() {
+        if entry.artifact_uri.trim().is_empty() {
+            errors.push(format!(
+                "artifact_payload_hashes[{index}] artifact_uri must be non-empty"
+            ));
+        }
+        if !is_sha256_hex_64(&entry.payload_sha256) {
+            errors.push(format!(
+                "artifact_payload_hashes[{index}] payload_sha256 must be 64 lowercase hex chars"
+            ));
+        }
+        if !seen_uris.insert(entry.artifact_uri.clone()) {
+            errors.push(format!(
+                "artifact_payload_hashes contains duplicate artifact_uri '{}'",
+                entry.artifact_uri
+            ));
+        }
+        if let Some(prev) = previous_uri
+            && prev > entry.artifact_uri.as_str()
+        {
+            errors.push("artifact_payload_hashes must be sorted by artifact_uri".to_owned());
+        }
+        previous_uri = Some(entry.artifact_uri.as_str());
+
+        if manifest
+            .artifact_uris
+            .get(index)
+            .is_some_and(|uri| uri != &entry.artifact_uri)
+        {
+            errors.push(format!(
+                "artifact_payload_hashes[{index}] uri '{}' does not match manifest artifact uri '{}'",
+                entry.artifact_uri,
+                manifest.artifact_uris[index]
+            ));
+        }
+
+        match gate_artifacts.get(&entry.artifact_uri) {
+            Some(payload) => {
+                let actual = sha256_hex(payload);
+                if actual != entry.payload_sha256 {
+                    errors.push(format!(
+                        "artifact payload hash mismatch for '{}': expected {} got {}",
+                        entry.artifact_uri, entry.payload_sha256, actual
+                    ));
+                }
+            }
+            None => errors.push(format!(
+                "artifact payload missing for uri '{}'",
+                entry.artifact_uri
+            )),
+        }
+    }
+
+    let expected_payload =
+        artifact_bundle_canonical_payload(manifest, &report.artifact_payload_hashes);
+    if report.canonical_payload != expected_payload {
+        errors.push("artifact_bundle_integrity canonical_payload mismatch".to_owned());
+    }
+    let expected_hash = sha256_hex(&expected_payload);
+    if report.bundle_hash != expected_hash {
+        errors.push(
+            "artifact_bundle_integrity bundle_hash does not match canonical_payload".to_owned(),
+        );
+    }
+
+    errors
+}
+
+/// Validate persisted artifact-hash ratchet baseline structure.
+#[must_use]
+pub fn validate_artifact_hash_baseline(baseline: &ArtifactHashRatchetBaseline) -> Vec<String> {
+    let mut errors = Vec::new();
+    if baseline.schema_version != ARTIFACT_HASH_RATCHET_BASELINE_SCHEMA_VERSION {
+        errors.push(format!(
+            "artifact_hash_baseline schema_version '{}' must equal '{}'",
+            baseline.schema_version, ARTIFACT_HASH_RATCHET_BASELINE_SCHEMA_VERSION
+        ));
+    }
+    if baseline.bead_id != ARTIFACT_HASH_RATCHET_BEAD_ID {
+        errors.push(format!(
+            "artifact_hash_baseline bead_id '{}' must equal '{}'",
+            baseline.bead_id, ARTIFACT_HASH_RATCHET_BEAD_ID
+        ));
+    }
+    if baseline.scenario_id.trim().is_empty() {
+        errors.push("artifact_hash_baseline scenario_id must be non-empty".to_owned());
+    }
+    if !is_sha256_hex_64(&baseline.bundle_hash) {
+        errors.push("artifact_hash_baseline bundle_hash must be 64 lowercase hex chars".to_owned());
+    }
+    if baseline.update_reason.trim().is_empty() {
+        errors.push("artifact_hash_baseline update_reason must be non-empty".to_owned());
+    }
+    errors
+}
+
+/// Evaluate artifact-bundle hash ratchet policy.
+#[must_use]
+pub fn evaluate_artifact_hash_ratchet(
+    baseline: Option<&ArtifactHashRatchetBaseline>,
+    candidate_hash: &str,
+    update_reason: Option<&str>,
+    allow_bootstrap: bool,
+) -> ArtifactHashRatchetDecision {
+    let normalized_reason = update_reason
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(std::borrow::ToOwned::to_owned);
+
+    if !is_sha256_hex_64(candidate_hash) {
+        return ArtifactHashRatchetDecision {
+            approved: false,
+            requires_baseline_update: false,
+            baseline_hash: baseline.map(|value| value.bundle_hash.clone()),
+            candidate_hash: candidate_hash.to_owned(),
+            reason: "candidate_hash_invalid_format".to_owned(),
+            update_reason: normalized_reason,
+        };
+    }
+
+    match baseline {
+        Some(existing) if existing.bundle_hash == candidate_hash => ArtifactHashRatchetDecision {
+            approved: true,
+            requires_baseline_update: false,
+            baseline_hash: Some(existing.bundle_hash.clone()),
+            candidate_hash: candidate_hash.to_owned(),
+            reason: "hash_matches_baseline".to_owned(),
+            update_reason: normalized_reason,
+        },
+        Some(existing) => {
+            let approved = normalized_reason.is_some();
+            ArtifactHashRatchetDecision {
+                approved,
+                requires_baseline_update: true,
+                baseline_hash: Some(existing.bundle_hash.clone()),
+                candidate_hash: candidate_hash.to_owned(),
+                reason: if approved {
+                    "hash_drift_reviewed".to_owned()
+                } else {
+                    "hash_drift_without_review_reason".to_owned()
+                },
+                update_reason: normalized_reason,
+            }
+        }
+        None => {
+            let approved = allow_bootstrap && normalized_reason.is_some();
+            ArtifactHashRatchetDecision {
+                approved,
+                requires_baseline_update: true,
+                baseline_hash: None,
+                candidate_hash: candidate_hash.to_owned(),
+                reason: if !allow_bootstrap {
+                    "baseline_missing_bootstrap_disallowed".to_owned()
+                } else if normalized_reason.is_none() {
+                    "baseline_missing_requires_update_reason".to_owned()
+                } else {
+                    "baseline_bootstrap_reviewed".to_owned()
+                },
+                update_reason: normalized_reason,
+            }
+        }
+    }
+}
+
+fn artifact_bundle_canonical_payload(
+    manifest: &ValidationManifest,
+    artifact_payload_hashes: &[ArtifactPayloadHash],
+) -> String {
+    let payload_entries = artifact_payload_hashes
+        .iter()
+        .map(|entry| format!("{}={}", entry.artifact_uri, entry.payload_sha256))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "bundle_schema_version={}|manifest_schema_version={}|manifest_bead_id={}|scenario_id={}|root_seed={}|artifact_hashes={}",
+        ARTIFACT_BUNDLE_INTEGRITY_SCHEMA_VERSION,
+        manifest.schema_version,
+        manifest.bead_id,
+        manifest.scenario_id,
+        manifest.replay.root_seed,
+        payload_entries
+    )
 }
 
 fn coverage_outcome(report: &CoverageGateReport) -> GateOutcome {
@@ -772,6 +1180,13 @@ fn sha256_hex(input: &str) -> String {
     hasher.update(input.as_bytes());
     let digest = hasher.finalize();
     format!("{digest:x}")
+}
+
+fn is_sha256_hex_64(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_uppercase())
 }
 
 fn synthetic_timestamp(unix_ms: u128, offset_ms: u128) -> String {

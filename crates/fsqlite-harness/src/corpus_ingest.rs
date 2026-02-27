@@ -22,6 +22,8 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::oracle::{SltKind, parse_slt};
+
 /// Bead identifier for log correlation.
 const BEAD_ID: &str = "bd-1dp9.2.1";
 
@@ -645,16 +647,38 @@ fn compute_coverage(
 
 // ─── Conformance Fixture Ingestion ───────────────────────────────────────
 
+/// Why a fixture JSON file did not produce corpus entries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FixtureSkipDetail {
+    /// Fixture file name.
+    pub file: String,
+    /// Human-readable reason for the skip.
+    pub reason: String,
+}
+
+/// Summary report for conformance fixture ingestion.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FixtureIngestReport {
+    /// Number of fixture JSON files discovered in the directory.
+    pub fixture_json_files_seen: usize,
+    /// Number of fixture files that produced at least one corpus entry.
+    pub fixture_entries_ingested: usize,
+    /// Total SQL statements extracted from fixture files.
+    pub sql_statements_ingested: usize,
+    /// Fixture files that were skipped and why.
+    pub skipped_files: Vec<FixtureSkipDetail>,
+}
+
 /// Ingest conformance fixture JSON files from a directory into corpus entries.
 ///
 /// # Errors
 ///
 /// Returns an error if a fixture file cannot be read or parsed.
-pub fn ingest_conformance_fixtures(
+pub fn ingest_conformance_fixtures_with_report(
     dir: &Path,
     builder: &mut CorpusBuilder,
-) -> Result<usize, String> {
-    let mut count = 0;
+) -> Result<FixtureIngestReport, String> {
+    let mut report = FixtureIngestReport::default();
     let entries = std::fs::read_dir(dir)
         .map_err(|e| format!("failed to read conformance dir {}: {e}", dir.display()))?;
 
@@ -663,43 +687,197 @@ pub fn ingest_conformance_fixtures(
         .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
         .collect();
     files.sort_by_key(std::fs::DirEntry::path);
+    report.fixture_json_files_seen = files.len();
 
     for entry in files {
         let path = entry.path();
+        let file_name = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
         let content = std::fs::read_to_string(&path)
             .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
 
         let fixture: serde_json::Value = serde_json::from_str(&content)
             .map_err(|e| format!("failed to parse {}: {e}", path.display()))?;
 
-        let ops = fixture["ops"].as_array().unwrap_or(&Vec::new()).clone();
+        let ops = fixture.get("ops").and_then(serde_json::Value::as_array);
         let statements: Vec<String> = ops
+            .map_or(&[][..], Vec::as_slice)
             .iter()
-            .filter_map(|op| op["sql"].as_str().map(String::from))
+            .filter_map(|op| op.get("sql").and_then(serde_json::Value::as_str))
+            .map(str::to_owned)
             .collect();
 
         if statements.is_empty() {
+            let reason = if ops.is_none() {
+                "missing ops array".to_owned()
+            } else {
+                "no ops[].sql statements found".to_owned()
+            };
+            report.skipped_files.push(FixtureSkipDetail {
+                file: file_name,
+                reason,
+            });
             continue;
         }
 
         let fixture_id = fixture["id"].as_str().unwrap_or("unknown").to_owned();
         let description = fixture["description"].as_str().unwrap_or("").to_owned();
+        report.sql_statements_ingested += statements.len();
 
         builder.add_statements(
             statements,
-            CorpusSource::Fixture {
-                file: path
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string(),
-            },
+            CorpusSource::Fixture { file: file_name },
             format!("{fixture_id}: {description}"),
         );
-        count += 1;
+        report.fixture_entries_ingested += 1;
     }
 
-    Ok(count)
+    Ok(report)
+}
+
+/// Ingest conformance fixture JSON files and return number of ingested fixtures.
+///
+/// # Errors
+///
+/// Returns an error if a fixture file cannot be read or parsed.
+pub fn ingest_conformance_fixtures(
+    dir: &Path,
+    builder: &mut CorpusBuilder,
+) -> Result<usize, String> {
+    let report = ingest_conformance_fixtures_with_report(dir, builder)?;
+    Ok(report.fixture_entries_ingested)
+}
+
+// ─── SQLLogicTest Ingestion ─────────────────────────────────────────────
+
+/// Why an SLT file did not produce corpus entries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SltSkipDetail {
+    /// SLT file name.
+    pub file: String,
+    /// Human-readable reason for the skip.
+    pub reason: String,
+}
+
+/// Summary report for SQLLogicTest ingestion.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SltIngestReport {
+    /// Number of `.slt`-style files discovered.
+    pub slt_files_seen: usize,
+    /// Number of parsed SLT entries that produced SQL statements.
+    pub slt_entries_ingested: usize,
+    /// Total SQL statements extracted from SLT entries.
+    pub sql_statements_ingested: usize,
+    /// SLT files that were skipped and why.
+    pub skipped_files: Vec<SltSkipDetail>,
+}
+
+/// Ingest SQLLogicTest (`.slt`/`.sqllogictest`/`.test`) files into corpus entries.
+///
+/// # Errors
+///
+/// Returns an error if an SLT file cannot be read.
+pub fn ingest_slt_files_with_report(
+    dir: &Path,
+    builder: &mut CorpusBuilder,
+) -> Result<SltIngestReport, String> {
+    let mut report = SltIngestReport::default();
+    let entries = std::fs::read_dir(dir)
+        .map_err(|error| format!("failed to read slt dir {}: {error}", dir.display()))?;
+
+    let mut files: Vec<_> = entries
+        .filter_map(std::result::Result::ok)
+        .filter(|entry| {
+            entry
+                .path()
+                .extension()
+                .and_then(std::ffi::OsStr::to_str)
+                .map(|ext| {
+                    ext.eq_ignore_ascii_case("slt")
+                        || ext.eq_ignore_ascii_case("sqllogictest")
+                        || ext.eq_ignore_ascii_case("test")
+                })
+                .unwrap_or(false)
+        })
+        .collect();
+    files.sort_by_key(std::fs::DirEntry::path);
+    report.slt_files_seen = files.len();
+
+    for entry in files {
+        let path = entry.path();
+        let file_name = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        let content = std::fs::read_to_string(&path)
+            .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+
+        let parsed_entries = parse_slt(&content);
+        if parsed_entries.is_empty() {
+            report.skipped_files.push(SltSkipDetail {
+                file: file_name,
+                reason: "no SLT entries parsed".to_owned(),
+            });
+            continue;
+        }
+
+        let mut statements = Vec::new();
+        let mut ingestable_entries = 0_usize;
+        for parsed in parsed_entries {
+            if matches!(parsed.kind, SltKind::Statement | SltKind::Query) {
+                let normalized = normalize_slt_sql(&parsed.sql);
+                if !normalized.is_empty() {
+                    statements.push(normalized);
+                    ingestable_entries += 1;
+                }
+            }
+        }
+
+        if statements.is_empty() {
+            report.skipped_files.push(SltSkipDetail {
+                file: file_name,
+                reason: "parsed SLT entries contained no SQL statements".to_owned(),
+            });
+            continue;
+        }
+
+        report.slt_entries_ingested += ingestable_entries;
+        report.sql_statements_ingested += statements.len();
+        let statement_count = statements.len();
+
+        builder.add_statements(
+            statements,
+            CorpusSource::Slt {
+                file: file_name.clone(),
+            },
+            format!("SLT file {file_name} ({statement_count} statements)"),
+        );
+    }
+
+    Ok(report)
+}
+
+/// Ingest SQLLogicTest files and return number of SQL statements ingested.
+///
+/// # Errors
+///
+/// Returns an error if an SLT file cannot be read.
+pub fn ingest_slt_files(dir: &Path, builder: &mut CorpusBuilder) -> Result<usize, String> {
+    let report = ingest_slt_files_with_report(dir, builder)?;
+    Ok(report.sql_statements_ingested)
+}
+
+fn normalize_slt_sql(sql: &str) -> String {
+    sql.lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_owned()
 }
 
 // ─── Built-in Seed Corpus ────────────────────────────────────────────────

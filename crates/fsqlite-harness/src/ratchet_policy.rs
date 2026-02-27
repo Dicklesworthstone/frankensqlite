@@ -85,7 +85,7 @@ impl Default for RatchetPolicy {
             quarantine_enabled: true,
             quarantine_max_evaluations: 5,
             waivers_enabled: true,
-            minimum_release_threshold: 0.70,
+            minimum_release_threshold: 1.0,
         }
     }
 }
@@ -100,7 +100,7 @@ impl RatchetPolicy {
             quarantine_enabled: false,
             quarantine_max_evaluations: 0,
             waivers_enabled: false,
-            minimum_release_threshold: 0.70,
+            minimum_release_threshold: 1.0,
         }
     }
 
@@ -113,7 +113,7 @@ impl RatchetPolicy {
             quarantine_enabled: true,
             quarantine_max_evaluations: 10,
             waivers_enabled: true,
-            minimum_release_threshold: 0.70,
+            minimum_release_threshold: 1.0,
         }
     }
 }
@@ -1087,7 +1087,7 @@ mod tests {
         assert!(p.quarantine_enabled);
         assert_eq!(p.quarantine_max_evaluations, 5);
         assert!(p.waivers_enabled);
-        assert!((p.minimum_release_threshold - 0.70).abs() < TOL);
+        assert!((p.minimum_release_threshold - 1.0).abs() < TOL);
     }
 
     #[test]

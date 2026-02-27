@@ -42,12 +42,12 @@ use crate::differential_v2::{
     SqlExecutor, StatementDivergence,
 };
 use crate::metamorphic::{
-    generate_metamorphic_corpus, EquivalenceExpectation, MetamorphicTestCase,
-    MismatchClassification, TransformRegistry,
+    EquivalenceExpectation, MetamorphicTestCase, MismatchClassification, TransformRegistry,
+    generate_metamorphic_corpus,
 };
 use crate::mismatch_minimizer::{
-    attribute_subsystem, deduplicate, minimize_workload, DeduplicatedFailures, MinimalReproduction,
-    MinimizerConfig,
+    DeduplicatedFailures, MinimalReproduction, MinimizerConfig, attribute_subsystem, deduplicate,
+    minimize_workload,
 };
 
 /// Bead identifier for log correlation.

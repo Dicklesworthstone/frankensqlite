@@ -455,7 +455,7 @@ impl Default for ScoreEngineConfig {
     fn default() -> Self {
         Self {
             prior: PriorConfig::default(),
-            release_threshold: 0.70,
+            release_threshold: 1.0,
             conformal_coverage: 0.95,
         }
     }

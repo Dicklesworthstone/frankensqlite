@@ -27,6 +27,7 @@
 use std::collections::HashSet;
 use std::fmt;
 use std::fmt::Write as _;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -36,9 +37,28 @@ use tracing::info;
 const BEAD_ID: &str = "bd-1dp9.1.2";
 const SUBJECT_IDENTITY_LABEL: &str = "frankensqlite";
 const REFERENCE_IDENTITY_LABEL: &str = "csqlite-oracle";
+/// Canonical C SQLite target version for parity reports.
+pub const TARGET_SQLITE_VERSION: &str = "3.52.0";
+/// Canonical version contract path embedded in parity report metadata.
+pub const SQLITE_VERSION_CONTRACT_PATH: &str = "sqlite_version_contract.toml";
 
 /// Current envelope format version.
 pub const FORMAT_VERSION: u32 = 1;
+/// Current differential metadata schema version.
+pub const DIFFERENTIAL_METADATA_SCHEMA_VERSION: &str = "1.0.0";
+const DEFAULT_SCENARIO_ID: &str = "DIFF-UNKNOWN";
+
+fn default_target_sqlite_version() -> String {
+    TARGET_SQLITE_VERSION.to_owned()
+}
+
+fn default_sqlite_version_contract_path() -> String {
+    SQLITE_VERSION_CONTRACT_PATH.to_owned()
+}
+
+fn default_scenario_id() -> String {
+    DEFAULT_SCENARIO_ID.to_owned()
+}
 
 // ─── Execution Envelope ──────────────────────────────────────────────────
 
@@ -53,6 +73,9 @@ pub struct ExecutionEnvelope {
     /// Unique run identifier for log correlation (not part of the artifact ID).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub run_id: Option<String>,
+    /// Scenario identifier used for traceability and triage.
+    #[serde(default = "default_scenario_id")]
+    pub scenario_id: String,
     /// Base seed for deterministic RNG derivation.
     pub seed: u64,
     /// Engine version metadata.
@@ -160,6 +183,7 @@ impl ExecutionEnvelope {
         let canonical = CanonicalEnvelope {
             format_version: self.format_version,
             seed: self.seed,
+            scenario_id: &self.scenario_id,
             engines: &self.engines,
             pragmas: &self.pragmas,
             schema: &self.schema,
@@ -176,6 +200,7 @@ impl ExecutionEnvelope {
         EnvelopeBuilder {
             seed,
             run_id: None,
+            scenario_id: default_scenario_id(),
             engines: EngineVersions {
                 fsqlite: env!("CARGO_PKG_VERSION").to_owned(),
                 csqlite: rusqlite::version().to_owned(),
@@ -195,6 +220,7 @@ impl ExecutionEnvelope {
 struct CanonicalEnvelope<'a> {
     format_version: u32,
     seed: u64,
+    scenario_id: &'a str,
     engines: &'a EngineVersions,
     pragmas: &'a PragmaConfig,
     schema: &'a [String],
@@ -206,6 +232,7 @@ struct CanonicalEnvelope<'a> {
 pub struct EnvelopeBuilder {
     seed: u64,
     run_id: Option<String>,
+    scenario_id: String,
     engines: EngineVersions,
     pragmas: PragmaConfig,
     schema: Vec<String>,
@@ -218,6 +245,13 @@ impl EnvelopeBuilder {
     #[must_use]
     pub fn run_id(mut self, id: impl Into<String>) -> Self {
         self.run_id = Some(id.into());
+        self
+    }
+
+    /// Set the scenario identifier for the run.
+    #[must_use]
+    pub fn scenario_id(mut self, id: impl Into<String>) -> Self {
+        self.scenario_id = id.into();
         self
     }
 
@@ -275,6 +309,7 @@ impl EnvelopeBuilder {
         ExecutionEnvelope {
             format_version: FORMAT_VERSION,
             run_id: self.run_id,
+            scenario_id: self.scenario_id,
             seed: self.seed,
             engines: self.engines,
             pragmas: self.pragmas,
@@ -357,6 +392,12 @@ pub struct ArtifactHashes {
 pub struct DifferentialResult {
     /// Bead ID for log correlation.
     pub bead_id: String,
+    /// Canonical C SQLite parity target version.
+    #[serde(default = "default_target_sqlite_version")]
+    pub target_sqlite_version: String,
+    /// Path to the canonical SQLite version contract.
+    #[serde(default = "default_sqlite_version_contract_path")]
+    pub sqlite_version_contract: String,
     /// The envelope that was executed (input specification).
     pub envelope: ExecutionEnvelope,
     /// Total statements executed (schema + workload).
@@ -377,6 +418,8 @@ pub struct DifferentialResult {
     pub logical_state_matched: bool,
     /// Deterministic artifact hashes.
     pub artifact_hashes: ArtifactHashes,
+    /// Versioned machine-readable metadata contract for differential evidence.
+    pub metadata: DifferentialMetadata,
     /// Overall outcome.
     pub outcome: Outcome,
 }
@@ -400,6 +443,162 @@ impl fmt::Display for Outcome {
             Self::Error => write!(f, "error"),
         }
     }
+}
+
+/// First failure reference for deterministic triage linking.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DifferentialFirstFailure {
+    /// Zero-based index in the combined (schema + workload) statement stream.
+    pub statement_index: usize,
+    /// SQL text at the first detected failure point.
+    pub sql: String,
+}
+
+/// Execution timing metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DifferentialTiming {
+    /// End-to-end execution time in milliseconds.
+    pub total_ms: u64,
+}
+
+/// Versioned differential metadata schema contract.
+///
+/// Backward-incompatible field changes require a major-version bump and
+/// migration notes in the calling workflow.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DifferentialMetadata {
+    /// Schema version of this metadata contract.
+    pub schema_version: String,
+    /// Deterministic trace identifier for run-level correlation.
+    pub trace_id: String,
+    /// Logical run identifier.
+    pub run_id: String,
+    /// Scenario identifier.
+    pub scenario_id: String,
+    /// Deterministic seed used for the run.
+    pub seed: u64,
+    /// Oracle identity label (for example `csqlite-oracle`).
+    pub oracle_identity: String,
+    /// Oracle version string.
+    pub oracle_version: String,
+    /// SHA-256 hash over fixture-manifest inputs (`schema` + `workload`).
+    pub fixture_manifest_hash: String,
+    /// Execution timing.
+    pub timing: DifferentialTiming,
+    /// Normalized outcome (`pass`, `divergence`, `error`).
+    pub normalized_outcome: String,
+    /// First-failure reference, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_failure: Option<DifferentialFirstFailure>,
+}
+
+impl DifferentialMetadata {
+    /// Validate metadata contract field requirements.
+    #[must_use]
+    pub fn validate(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+
+        if self.schema_version.trim().is_empty() {
+            errors.push("schema_version must be non-empty".to_owned());
+        }
+        if self.trace_id.trim().is_empty() {
+            errors.push("trace_id must be non-empty".to_owned());
+        }
+        if self.run_id.trim().is_empty() {
+            errors.push("run_id must be non-empty".to_owned());
+        }
+        if self.scenario_id.trim().is_empty() {
+            errors.push("scenario_id must be non-empty".to_owned());
+        }
+        if is_missing_identity_metadata(&self.oracle_identity) {
+            errors.push("oracle_identity must be concrete".to_owned());
+        }
+        if self.oracle_version.trim().is_empty() {
+            errors.push("oracle_version must be non-empty".to_owned());
+        }
+        if is_missing_oracle_metadata(&self.oracle_version) {
+            errors.push("oracle_version must be concrete".to_owned());
+        }
+        if !is_sha256_hex(&self.fixture_manifest_hash) {
+            errors.push("fixture_manifest_hash must be 64 lowercase hex chars".to_owned());
+        }
+        if !matches!(
+            self.normalized_outcome.as_str(),
+            "pass" | "divergence" | "error"
+        ) {
+            errors.push("normalized_outcome must be pass|divergence|error".to_owned());
+        }
+        if let Some(first_failure) = &self.first_failure {
+            if first_failure.sql.trim().is_empty() {
+                errors.push("first_failure.sql must be non-empty".to_owned());
+            }
+        }
+
+        errors
+    }
+
+    /// Serialize using canonical field ordering.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if serialization fails, which should be unreachable for this
+    /// fully-serializable struct.
+    #[must_use]
+    pub fn to_canonical_json(&self) -> String {
+        serde_json::to_string(self).expect("metadata serialization must not fail")
+    }
+
+    /// Decode metadata with strict schema and validation checks.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for schema mismatches or validation failures.
+    pub fn from_json_strict(json: &str) -> Result<Self, String> {
+        let metadata: Self =
+            serde_json::from_str(json).map_err(|error| format!("decode error: {error}"))?;
+        if metadata.schema_version != DIFFERENTIAL_METADATA_SCHEMA_VERSION {
+            return Err(format!(
+                "schema mismatch: expected {DIFFERENTIAL_METADATA_SCHEMA_VERSION}, got {}",
+                metadata.schema_version
+            ));
+        }
+        let errors = metadata.validate();
+        if errors.is_empty() {
+            Ok(metadata)
+        } else {
+            Err(format!("metadata validation failed: {}", errors.join("; ")))
+        }
+    }
+}
+
+/// Schema evolution policy helper for the metadata contract.
+///
+/// Policy:
+/// - Major-version changes are treated as backward-incompatible and require
+///   migration notes in calling workflows.
+/// - Minor/patch changes are expected to remain backward-compatible.
+#[must_use]
+pub fn differential_metadata_schema_evolution_issues(
+    previous_version: &str,
+    candidate_version: &str,
+) -> Vec<String> {
+    let mut issues = Vec::new();
+
+    match (
+        parse_semver_major(previous_version),
+        parse_semver_major(candidate_version),
+    ) {
+        (Some(previous_major), Some(candidate_major)) if previous_major != candidate_major => {
+            issues.push(format!(
+                "schema major changed from {previous_version} to {candidate_version}; \
+                 treat as backward-incompatible and require migration notes"
+            ));
+        }
+        (Some(_), Some(_)) => {}
+        _ => issues.push("unable to parse schema_version major component".to_owned()),
+    }
+
+    issues
 }
 
 impl DifferentialResult {
@@ -687,12 +886,15 @@ fn run_differential_with_mode<F: SqlExecutor, C: SqlExecutor>(
     csqlite_exec: &C,
     mode: DifferentialMode,
 ) -> DifferentialResult {
+    let started_at = Instant::now();
+
     if matches!(mode, DifferentialMode::Parity) {
         if is_missing_identity_metadata(&envelope.engines.subject_identity) {
             return parity_contract_violation(
                 envelope,
                 "parity_contract_violation: envelope.engines.subject_identity must be non-empty",
                 "subject_identity_missing",
+                elapsed_millis(started_at.elapsed()),
             );
         }
         if !envelope
@@ -704,6 +906,7 @@ fn run_differential_with_mode<F: SqlExecutor, C: SqlExecutor>(
                 envelope,
                 "parity_contract_violation: envelope.engines.subject_identity must be 'frankensqlite'",
                 "subject_identity_mismatch",
+                elapsed_millis(started_at.elapsed()),
             );
         }
         if is_missing_identity_metadata(&envelope.engines.reference_identity) {
@@ -711,6 +914,7 @@ fn run_differential_with_mode<F: SqlExecutor, C: SqlExecutor>(
                 envelope,
                 "parity_contract_violation: envelope.engines.reference_identity must be non-empty",
                 "reference_identity_missing",
+                elapsed_millis(started_at.elapsed()),
             );
         }
         if !envelope
@@ -722,6 +926,7 @@ fn run_differential_with_mode<F: SqlExecutor, C: SqlExecutor>(
                 envelope,
                 "parity_contract_violation: envelope.engines.reference_identity must be 'csqlite-oracle'",
                 "reference_identity_mismatch",
+                elapsed_millis(started_at.elapsed()),
             );
         }
         if fsqlite_exec.engine_identity() != EngineIdentity::FrankenSqlite {
@@ -729,6 +934,7 @@ fn run_differential_with_mode<F: SqlExecutor, C: SqlExecutor>(
                 envelope,
                 "parity_contract_violation: subject executor must identify as FrankenSqlite",
                 "subject_executor_identity_mismatch",
+                elapsed_millis(started_at.elapsed()),
             );
         }
         if envelope.engines.csqlite.trim().is_empty() {
@@ -736,6 +942,7 @@ fn run_differential_with_mode<F: SqlExecutor, C: SqlExecutor>(
                 envelope,
                 "parity_contract_violation: envelope.engines.csqlite must be non-empty",
                 "csqlite_version_missing",
+                elapsed_millis(started_at.elapsed()),
             );
         }
         if is_missing_oracle_metadata(&envelope.engines.csqlite) {
@@ -743,6 +950,7 @@ fn run_differential_with_mode<F: SqlExecutor, C: SqlExecutor>(
                 envelope,
                 "parity_contract_violation: envelope.engines.csqlite must contain concrete oracle metadata",
                 "csqlite_version_placeholder",
+                elapsed_millis(started_at.elapsed()),
             );
         }
         if csqlite_exec.engine_identity() != EngineIdentity::CSqliteOracle {
@@ -750,6 +958,7 @@ fn run_differential_with_mode<F: SqlExecutor, C: SqlExecutor>(
                 envelope,
                 "parity_contract_violation: reference executor must identify as CSqliteOracle",
                 "reference_executor_identity_mismatch",
+                elapsed_millis(started_at.elapsed()),
             );
         }
         log_identity_check(envelope, "pass", "ok");
@@ -824,9 +1033,26 @@ fn run_differential_with_mode<F: SqlExecutor, C: SqlExecutor>(
     } else {
         Outcome::Divergence
     };
+    let first_failure = first_divergence_index.and_then(|first_index| {
+        divergences
+            .iter()
+            .find(|divergence| divergence.index == first_index)
+            .map(|divergence| DifferentialFirstFailure {
+                statement_index: divergence.index,
+                sql: divergence.sql.clone(),
+            })
+    });
+    let metadata = build_differential_metadata(
+        envelope,
+        outcome,
+        first_failure,
+        elapsed_millis(started_at.elapsed()),
+    );
 
     let mut result = DifferentialResult {
         bead_id: BEAD_ID.to_owned(),
+        target_sqlite_version: TARGET_SQLITE_VERSION.to_owned(),
+        sqlite_version_contract: SQLITE_VERSION_CONTRACT_PATH.to_owned(),
         envelope: envelope.clone(),
         statements_total: statements.len(),
         statements_matched: matched,
@@ -841,23 +1067,88 @@ fn run_differential_with_mode<F: SqlExecutor, C: SqlExecutor>(
             result_hash: String::new(),
             workload_hash,
         },
+        metadata,
         outcome,
     };
 
     result.artifact_hashes.result_hash = result.compute_result_hash();
+    log_differential_summary(&result);
     result
+}
+
+fn build_differential_metadata(
+    envelope: &ExecutionEnvelope,
+    outcome: Outcome,
+    first_failure: Option<DifferentialFirstFailure>,
+    timing_ms: u64,
+) -> DifferentialMetadata {
+    let trace_id = envelope.artifact_id();
+    let run_id = envelope
+        .run_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| format!("run-{trace_id}"));
+    let scenario_id = envelope.scenario_id.trim();
+    let scenario_id = if scenario_id.is_empty() {
+        default_scenario_id()
+    } else {
+        scenario_id.to_owned()
+    };
+    let oracle_identity = envelope.engines.reference_identity.trim();
+    let oracle_identity = if is_missing_identity_metadata(oracle_identity) {
+        "csqlite-oracle-unspecified".to_owned()
+    } else {
+        oracle_identity.to_owned()
+    };
+    let oracle_version = envelope.engines.csqlite.trim();
+    let oracle_version = if is_missing_oracle_metadata(oracle_version) || oracle_version.is_empty()
+    {
+        "0.0.0+unspecified".to_owned()
+    } else {
+        oracle_version.to_owned()
+    };
+    let fixture_manifest_hash = fixture_manifest_hash(envelope);
+
+    let metadata = DifferentialMetadata {
+        schema_version: DIFFERENTIAL_METADATA_SCHEMA_VERSION.to_owned(),
+        trace_id,
+        run_id,
+        scenario_id,
+        seed: envelope.seed,
+        oracle_identity,
+        oracle_version,
+        fixture_manifest_hash,
+        timing: DifferentialTiming {
+            total_ms: timing_ms,
+        },
+        normalized_outcome: outcome.to_string(),
+        first_failure,
+    };
+
+    debug_assert!(
+        metadata.validate().is_empty(),
+        "internal metadata construction must satisfy validator"
+    );
+    metadata
 }
 
 fn parity_contract_violation(
     envelope: &ExecutionEnvelope,
     message: &str,
     reason_code: &str,
+    timing_ms: u64,
 ) -> DifferentialResult {
     log_identity_check(envelope, "fail", reason_code);
-    parity_contract_error_result(envelope, message)
+    parity_contract_error_result(envelope, message, timing_ms)
 }
 
-fn parity_contract_error_result(envelope: &ExecutionEnvelope, message: &str) -> DifferentialResult {
+fn parity_contract_error_result(
+    envelope: &ExecutionEnvelope,
+    message: &str,
+    timing_ms: u64,
+) -> DifferentialResult {
     let statements: Vec<&str> = envelope
         .schema
         .iter()
@@ -871,9 +1162,12 @@ fn parity_contract_error_result(envelope: &ExecutionEnvelope, message: &str) -> 
         sha256_hex(combined.as_bytes())
     };
     let error_state_hash = sha256_hex(message.as_bytes());
+    let metadata = build_differential_metadata(envelope, Outcome::Error, None, timing_ms);
 
     let mut result = DifferentialResult {
         bead_id: BEAD_ID.to_owned(),
+        target_sqlite_version: TARGET_SQLITE_VERSION.to_owned(),
+        sqlite_version_contract: SQLITE_VERSION_CONTRACT_PATH.to_owned(),
         envelope: envelope.clone(),
         statements_total: statements.len(),
         statements_matched: 0,
@@ -888,9 +1182,11 @@ fn parity_contract_error_result(envelope: &ExecutionEnvelope, message: &str) -> 
             result_hash: String::new(),
             workload_hash,
         },
+        metadata,
         outcome: Outcome::Error,
     };
     result.artifact_hashes.result_hash = result.compute_result_hash();
+    log_differential_summary(&result);
     result
 }
 
@@ -910,6 +1206,26 @@ fn log_identity_check(envelope: &ExecutionEnvelope, outcome: &str, reason_code: 
     );
 }
 
+fn log_differential_summary(result: &DifferentialResult) {
+    let first_failure = result.metadata.first_failure.as_ref();
+    info!(
+        bead_id = BEAD_ID,
+        trace_id = %result.metadata.trace_id,
+        run_id = %result.metadata.run_id,
+        scenario_id = %result.metadata.scenario_id,
+        seed = result.metadata.seed,
+        timing_ms = result.metadata.timing.total_ms,
+        outcome = %result.metadata.normalized_outcome,
+        first_failure_index = ?first_failure.map(|failure| failure.statement_index),
+        first_failure_sql = ?first_failure.map(|failure| failure.sql.as_str()),
+        "differential_v2 execution summary"
+    );
+}
+
+fn elapsed_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
 fn is_missing_identity_metadata(value: &str) -> bool {
     let normalized = value.trim().to_ascii_lowercase();
     matches!(
@@ -924,6 +1240,22 @@ fn is_missing_oracle_metadata(value: &str) -> bool {
         normalized.as_str(),
         "unknown" | "n/a" | "na" | "unset" | "none" | "null" | "missing"
     )
+}
+
+fn parse_semver_major(version: &str) -> Option<u64> {
+    let trimmed = version.trim().trim_start_matches('v');
+    let major = trimmed.split('.').next()?;
+    if major.is_empty() {
+        return None;
+    }
+    major.parse::<u64>().ok()
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte: u8| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn extract_schema_table_names(schema: &[String]) -> Vec<String> {
@@ -1419,4 +1751,20 @@ fn sha256_hex(data: &[u8]) -> String {
         let _ = write!(hex, "{byte:02x}");
     }
     hex
+}
+
+fn fixture_manifest_hash(envelope: &ExecutionEnvelope) -> String {
+    #[derive(Serialize)]
+    struct FixtureManifest<'a> {
+        schema: &'a [String],
+        workload: &'a [String],
+    }
+
+    let fixture_manifest = FixtureManifest {
+        schema: &envelope.schema,
+        workload: &envelope.workload,
+    };
+    let encoded =
+        serde_json::to_string(&fixture_manifest).expect("fixture manifest serialization must work");
+    sha256_hex(encoded.as_bytes())
 }

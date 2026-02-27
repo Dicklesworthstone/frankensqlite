@@ -7,7 +7,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use sha2::{Digest, Sha256};
 
 use fsqlite_harness::validation_manifest::{
-    VALIDATION_MANIFEST_SCENARIO_ID, ValidationManifestConfig, build_validation_manifest_bundle,
+    ARTIFACT_HASH_RATCHET_BASELINE_SCHEMA_VERSION, ARTIFACT_HASH_RATCHET_BEAD_ID,
+    ArtifactHashRatchetBaseline, VALIDATION_MANIFEST_SCENARIO_ID, ValidationManifestConfig,
+    build_validation_manifest_bundle, evaluate_artifact_hash_ratchet,
+    validate_artifact_bundle_integrity_report, validate_artifact_hash_baseline,
     validate_manifest_contract,
 };
 
@@ -26,6 +29,10 @@ struct Config {
     root_seed: Option<u64>,
     generated_unix_ms: u128,
     artifact_uri_prefix: String,
+    artifact_hash_baseline: Option<PathBuf>,
+    artifact_hash_update_reason: Option<String>,
+    allow_artifact_hash_bootstrap: bool,
+    write_artifact_hash_baseline: bool,
 }
 
 impl Config {
@@ -42,6 +49,10 @@ impl Config {
         let mut root_seed = Some(424_242_u64);
         let mut generated_unix_ms = now_unix_ms();
         let mut artifact_uri_prefix = DEFAULT_ARTIFACT_PREFIX.to_owned();
+        let mut artifact_hash_baseline: Option<PathBuf> = None;
+        let mut artifact_hash_update_reason: Option<String> = None;
+        let mut allow_artifact_hash_bootstrap = false;
+        let mut write_artifact_hash_baseline = false;
 
         let args: Vec<String> = env::args().skip(1).collect();
         let mut index = 0_usize;
@@ -132,6 +143,29 @@ impl Config {
                         .ok_or_else(|| "missing value for --artifact-uri-prefix".to_owned())?;
                     value.clone_into(&mut artifact_uri_prefix);
                 }
+                "--artifact-hash-baseline" => {
+                    index += 1;
+                    let value = args
+                        .get(index)
+                        .ok_or_else(|| "missing value for --artifact-hash-baseline".to_owned())?;
+                    artifact_hash_baseline = Some(PathBuf::from(value));
+                }
+                "--no-artifact-hash-baseline" => {
+                    artifact_hash_baseline = None;
+                }
+                "--artifact-hash-update-reason" => {
+                    index += 1;
+                    let value = args.get(index).ok_or_else(|| {
+                        "missing value for --artifact-hash-update-reason".to_owned()
+                    })?;
+                    artifact_hash_update_reason = Some(value.to_owned());
+                }
+                "--allow-artifact-hash-bootstrap" => {
+                    allow_artifact_hash_bootstrap = true;
+                }
+                "--write-artifact-hash-baseline" => {
+                    write_artifact_hash_baseline = true;
+                }
                 "--help" | "-h" => {
                     print_help();
                     std::process::exit(0);
@@ -171,6 +205,10 @@ impl Config {
             root_seed,
             generated_unix_ms,
             artifact_uri_prefix,
+            artifact_hash_baseline,
+            artifact_hash_update_reason,
+            allow_artifact_hash_bootstrap,
+            write_artifact_hash_baseline,
         })
     }
 }
@@ -196,6 +234,15 @@ OPTIONS:
   --no-root-seed               Use canonical orchestrator default seed source
   --generated-unix-ms <U128>   Deterministic timestamp for manifest and gate records
   --artifact-uri-prefix <URI>  URI prefix for gate artifacts (default: artifacts/validation-manifest)
+  --artifact-hash-baseline <PATH>
+                               Artifact hash ratchet baseline JSON path (optional)
+  --no-artifact-hash-baseline  Disable artifact hash ratchet baseline checks
+  --artifact-hash-update-reason <TEXT>
+                               Reviewed rationale for expected hash drift / baseline bootstrap
+  --allow-artifact-hash-bootstrap
+                               Allow baseline bootstrap when baseline file is missing
+  --write-artifact-hash-baseline
+                               Write/update baseline file when ratchet decision requires update
   -h, --help                   Show help
 "
     );
@@ -258,6 +305,51 @@ fn write_text(path: &Path, content: &str) -> Result<(), String> {
         .map_err(|error| format!("output_write_failed path={} error={error}", path.display()))
 }
 
+fn read_optional_artifact_hash_baseline(
+    baseline_path: &Path,
+) -> Result<Option<ArtifactHashRatchetBaseline>, String> {
+    if !baseline_path.exists() {
+        return Ok(None);
+    }
+    let raw = fs::read_to_string(baseline_path).map_err(|error| {
+        format!(
+            "artifact_hash_baseline_read_failed path={} error={error}",
+            baseline_path.display()
+        )
+    })?;
+    let baseline = ArtifactHashRatchetBaseline::from_json(&raw).map_err(|error| {
+        format!(
+            "artifact_hash_baseline_parse_failed path={} error={error}",
+            baseline_path.display()
+        )
+    })?;
+    let baseline_errors = validate_artifact_hash_baseline(&baseline);
+    if !baseline_errors.is_empty() {
+        return Err(format!(
+            "artifact_hash_baseline_validation_failed path={} errors={}",
+            baseline_path.display(),
+            baseline_errors.join("; ")
+        ));
+    }
+    Ok(Some(baseline))
+}
+
+fn build_artifact_hash_baseline(
+    scenario_id: &str,
+    bundle_hash: &str,
+    generated_unix_ms: u128,
+    update_reason: &str,
+) -> ArtifactHashRatchetBaseline {
+    ArtifactHashRatchetBaseline {
+        schema_version: ARTIFACT_HASH_RATCHET_BASELINE_SCHEMA_VERSION.to_owned(),
+        bead_id: ARTIFACT_HASH_RATCHET_BEAD_ID.to_owned(),
+        scenario_id: scenario_id.to_owned(),
+        bundle_hash: bundle_hash.to_owned(),
+        updated_unix_ms: generated_unix_ms,
+        update_reason: update_reason.to_owned(),
+    }
+}
+
 fn run() -> Result<bool, String> {
     let config = Config::parse()?;
 
@@ -286,6 +378,77 @@ fn run() -> Result<bool, String> {
         ));
     }
 
+    let integrity_errors = validate_artifact_bundle_integrity_report(
+        &bundle.manifest,
+        &bundle.gate_artifacts,
+        &bundle.artifact_bundle_integrity,
+    );
+    if !integrity_errors.is_empty() {
+        return Err(format!(
+            "artifact_bundle_integrity_validation_failed: {}",
+            integrity_errors.join("; ")
+        ));
+    }
+
+    if let Some(baseline_path) = &config.artifact_hash_baseline {
+        let baseline = read_optional_artifact_hash_baseline(baseline_path)?;
+        if let Some(existing) = &baseline
+            && existing.scenario_id != bundle.manifest.scenario_id
+        {
+            return Err(format!(
+                "artifact_hash_baseline_scenario_mismatch baseline={} manifest={}",
+                existing.scenario_id, bundle.manifest.scenario_id
+            ));
+        }
+
+        let decision = evaluate_artifact_hash_ratchet(
+            baseline.as_ref(),
+            &bundle.artifact_bundle_integrity.bundle_hash,
+            config.artifact_hash_update_reason.as_deref(),
+            config.allow_artifact_hash_bootstrap,
+        );
+
+        if !decision.approved {
+            return Err(format!(
+                "artifact_hash_ratchet_blocked reason={} baseline_hash={} candidate_hash={} update_reason={}",
+                decision.reason,
+                decision
+                    .baseline_hash
+                    .clone()
+                    .unwrap_or_else(|| "none".to_owned()),
+                decision.candidate_hash,
+                decision
+                    .update_reason
+                    .clone()
+                    .unwrap_or_else(|| "none".to_owned()),
+            ));
+        }
+
+        if decision.requires_baseline_update {
+            if !config.write_artifact_hash_baseline {
+                return Err(format!(
+                    "artifact_hash_ratchet_requires_baseline_update reason={} baseline_path={} (rerun with --write-artifact-hash-baseline)",
+                    decision.reason,
+                    baseline_path.display()
+                ));
+            }
+            let reason = decision
+                .update_reason
+                .as_deref()
+                .ok_or_else(|| "artifact_hash_ratchet_missing_update_reason".to_owned())?;
+            let updated_baseline = build_artifact_hash_baseline(
+                &bundle.manifest.scenario_id,
+                &bundle.artifact_bundle_integrity.bundle_hash,
+                config.generated_unix_ms,
+                reason,
+            );
+            let baseline_json = updated_baseline
+                .to_json()
+                .map_err(|error| format!("artifact_hash_baseline_serialize_failed: {error}"))?;
+            write_text(baseline_path, &baseline_json)?;
+        }
+    }
+
     for (artifact_uri, payload) in &bundle.gate_artifacts {
         let artifact_path = config.workspace_root.join(artifact_uri);
         write_text(&artifact_path, payload)?;
@@ -312,6 +475,14 @@ fn run() -> Result<bool, String> {
     println!(
         "INFO validation_manifest_replay command=\"{}\"",
         bundle.manifest.replay.command
+    );
+    println!(
+        "INFO artifact_bundle_integrity hash={} artifacts={}",
+        bundle.artifact_bundle_integrity.bundle_hash,
+        bundle
+            .artifact_bundle_integrity
+            .artifact_payload_hashes
+            .len(),
     );
 
     Ok(bundle.manifest.overall_pass)

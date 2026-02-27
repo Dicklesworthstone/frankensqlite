@@ -71,7 +71,7 @@ impl Default for GateConfig {
         Self {
             prior: PriorConfig::default(),
             confidence_level: 0.95,
-            release_threshold: 0.70,
+            release_threshold: 1.0,
             category_min_verification_pct: 50.0,
             loss_asymmetry_ratio: 5.0,
         }
