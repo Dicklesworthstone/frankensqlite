@@ -794,7 +794,10 @@ pub fn load_fixture(path: &Path) -> Result<TestFixture> {
 
 /// Load all fixtures from a directory.
 pub fn load_fixtures_from_dir(dir: &Path) -> Result<Vec<TestFixture>> {
-    const NON_FIXTURE_JSON_FILES: [&str; 1] = ["core_sql_golden_blake3.json"];
+    const NON_FIXTURE_JSON_FILES: [&str; 2] = [
+        "core_sql_golden_blake3.json",
+        "leapfrog_join_golden_blake3.json",
+    ];
     let mut fixtures = Vec::new();
     if !dir.is_dir() {
         return Err(FrankenError::Internal(format!(

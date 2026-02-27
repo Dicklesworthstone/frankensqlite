@@ -475,6 +475,8 @@ pub fn apply_contract_outcome_to_gate_report(
     report.release_ready = enforcement.final_gate_passed;
     if !report.release_ready {
         report.global_decision = GateDecision::Fail;
+    } else {
+        report.global_decision = GateDecision::Pass;
     }
     report.rationale = format!(
         "{}\nVerification contract enforcement: disposition={} contract_passed={} base_gate_passed={} failing_beads={} missing_evidence_beads={} invalid_reference_beads={}",

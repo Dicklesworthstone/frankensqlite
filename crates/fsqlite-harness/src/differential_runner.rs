@@ -631,17 +631,23 @@ mod tests {
     #[derive(Clone)]
     struct StubExecutor {
         results: std::collections::HashMap<String, crate::differential_v2::StmtOutcome>,
+        identity: crate::differential_v2::EngineIdentity,
     }
 
     impl StubExecutor {
-        fn new() -> Self {
+        fn new(identity: crate::differential_v2::EngineIdentity) -> Self {
             Self {
                 results: std::collections::HashMap::new(),
+                identity,
             }
         }
 
-        fn with_default() -> Self {
-            Self::new()
+        fn fsqlite_stub() -> Self {
+            Self::new(crate::differential_v2::EngineIdentity::FrankenSqlite)
+        }
+
+        fn csqlite_stub() -> Self {
+            Self::new(crate::differential_v2::EngineIdentity::CSqliteOracle)
         }
     }
 
@@ -670,7 +676,7 @@ mod tests {
         }
 
         fn engine_identity(&self) -> crate::differential_v2::EngineIdentity {
-            crate::differential_v2::EngineIdentity::CSqliteOracle
+            self.identity
         }
     }
 
@@ -730,8 +736,8 @@ mod tests {
         let report = run_metamorphic_differential(
             &[],
             &config,
-            || Ok(StubExecutor::with_default()),
-            || Ok(StubExecutor::with_default()),
+            || Ok(StubExecutor::fsqlite_stub()),
+            || Ok(StubExecutor::csqlite_stub()),
         )
         .expect("empty corpus should succeed");
 
@@ -760,8 +766,8 @@ mod tests {
         let report = run_metamorphic_differential(
             &entries,
             &config,
-            || Ok(StubExecutor::with_default()),
-            || Ok(StubExecutor::with_default()),
+            || Ok(StubExecutor::fsqlite_stub()),
+            || Ok(StubExecutor::csqlite_stub()),
         )
         .expect("matching stubs should succeed");
 
@@ -886,13 +892,13 @@ mod tests {
     fn test_try_minimize_preserves_non_true_divergence_classification() {
         use crate::differential_v2::{NormalizedValue, StmtOutcome};
 
-        let mut fsqlite = StubExecutor::new();
+        let mut fsqlite = StubExecutor::fsqlite_stub();
         fsqlite.results.insert(
             "SELECT 1".to_owned(),
             StmtOutcome::Rows(vec![vec![NormalizedValue::Integer(1)]]),
         );
 
-        let mut csqlite = StubExecutor::new();
+        let mut csqlite = StubExecutor::csqlite_stub();
         csqlite.results.insert(
             "SELECT 1".to_owned(),
             StmtOutcome::Rows(vec![vec![NormalizedValue::Integer(2)]]),

@@ -403,6 +403,7 @@ pub fn evaluate_ratchet(
         } else if let Some(qr) = quarantine_request {
             try_quarantine(state, policy, qr)
         } else if state.quarantine_reason.is_some()
+            && policy.quarantine_enabled
             && state.quarantine_streak < policy.quarantine_max_evaluations
         {
             RatchetVerdict::Quarantine

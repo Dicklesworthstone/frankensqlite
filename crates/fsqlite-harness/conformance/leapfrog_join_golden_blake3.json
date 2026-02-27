@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "hash_algorithm": "blake3",
+  "entries": [
+    {
+      "scenario_id": "tpch_q2_sf1_like",
+      "relation_count": 5,
+      "relation_sizes": [
+        1000,
+        500,
+        400,
+        200,
+        100
+      ],
+      "hash_join_blake3": "e0f56d032849fc21cb3bbb9f79a5ba811b38aa1ee0d118f16770e504c56df03a",
+      "leapfrog_blake3": "e0f56d032849fc21cb3bbb9f79a5ba811b38aa1ee0d118f16770e504c56df03a",
+      "row_count": 4
+    },
+    {
+      "scenario_id": "tpch_q7_sf1_like",
+      "relation_count": 4,
+      "relation_sizes": [
+        2000,
+        800,
+        500,
+        310
+      ],
+      "hash_join_blake3": "599f324dbdbf7a067ea78d031d3a99e448484c1c0fd3b76fda43d81bdaef2cc3",
+      "leapfrog_blake3": "599f324dbdbf7a067ea78d031d3a99e448484c1c0fd3b76fda43d81bdaef2cc3",
+      "row_count": 46
+    },
+    {
+      "scenario_id": "tpch_q9_sf1_like",
+      "relation_count": 6,
+      "relation_sizes": [
+        500,
+        300,
+        400,
+        300,
+        300,
+        300
+      ],
+      "hash_join_blake3": "e298371923207ea5c1870f3822377f922f5cbeac19b5d8f5fa97e5ca6a4e5700",
+      "leapfrog_blake3": "e298371923207ea5c1870f3822377f922f5cbeac19b5d8f5fa97e5ca6a4e5700",
+      "row_count": 150
+    }
+  ]
+}
