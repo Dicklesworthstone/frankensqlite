@@ -1,0 +1,36 @@
+{
+  "bead_id": "bd-2y306.2",
+  "run_id": "bd-2y306.2-seed-20260227",
+  "trace_id": "20260227",
+  "scenario_id": "CHAIN-LENGTH-CONTROLS-E2E",
+  "seed": 20260227,
+  "overall_status": "fail",
+  "tests": [
+    {
+      "test_id": "mvcc_chain_bound_unit",
+      "crate": "fsqlite-mvcc",
+      "filter": "test_chain_length_bounded_after_10000_updates_same_page",
+      "status": "pass",
+      "elapsed_ms": 175394,
+      "log_path": "artifacts/bd-2y306.2/mvcc_chain_bound_unit.log"
+    },
+    {
+      "test_id": "mvcc_chain_backpressure_unit",
+      "crate": "fsqlite-mvcc",
+      "filter": "test_chain_backpressure_reports_blocked_when_horizon_pinned",
+      "status": "pass",
+      "elapsed_ms": 90341,
+      "log_path": "artifacts/bd-2y306.2/mvcc_chain_backpressure_unit.log"
+    },
+    {
+      "test_id": "e2e_chain_length_replay_artifact",
+      "crate": "fsqlite-e2e",
+      "filter": "bd_2y306_2_chain_length_e2e_replay_emits_artifact",
+      "status": "fail",
+      "elapsed_ms": 242053,
+      "log_path": "artifacts/bd-2y306.2/e2e_chain_length_replay_artifact.log",
+      "artifact_path": "artifacts/bd-2y306.2/chain_length_e2e_test_artifact.json"
+    }
+  ],
+  "replay_command": "scripts/bd_2y306_2_chain_length_controls_e2e.sh --json"
+}

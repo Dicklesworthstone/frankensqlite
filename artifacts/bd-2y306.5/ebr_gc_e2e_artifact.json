@@ -11,7 +11,7 @@
       "crate": "fsqlite-mvcc",
       "filter": "prop_gc_prune_preserves_horizon_visibility_and_expected_freed",
       "status": "pass",
-      "elapsed_ms": 70883,
+      "elapsed_ms": 190372,
       "log_path": "artifacts/bd-2y306.5/mvcc_prop_horizon_visibility.log"
     },
     {
@@ -19,7 +19,7 @@
       "crate": "fsqlite-mvcc",
       "filter": "prop_deferred_retire_respects_pin_lifetime_and_eventually_reclaims",
       "status": "pass",
-      "elapsed_ms": 66234,
+      "elapsed_ms": 85339,
       "log_path": "artifacts/bd-2y306.5/ebr_prop_deferred_retire_lifetime.log"
     },
     {
@@ -27,7 +27,7 @@
       "crate": "fsqlite-mvcc",
       "filter": "prop_thread_termination_does_not_lose_deferred_retirements",
       "status": "pass",
-      "elapsed_ms": 66444,
+      "elapsed_ms": 85338,
       "log_path": "artifacts/bd-2y306.5/ebr_prop_thread_retirements.log"
     },
     {
@@ -35,7 +35,7 @@
       "crate": "fsqlite-e2e",
       "filter": "integrity_check_populates_report_for_file_db",
       "status": "pass",
-      "elapsed_ms": 90388,
+      "elapsed_ms": 155359,
       "log_path": "artifacts/bd-2y306.5/file_backed_integrity_check.log"
     }
   ],
