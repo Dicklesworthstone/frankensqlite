@@ -79,8 +79,8 @@ fn conflict_action_to_oe(action: Option<&ConflictAction>) -> u16 {
 pub struct ColumnInfo {
     /// Column name.
     pub name: String,
-    /// Type affinity character: 'd' (integer), 'e' (real), 'B' (blob),
-    /// 'C' (text), 'A' (numeric). Lowercase = exact, uppercase = heuristic.
+    /// Type affinity character: 'D'/'d' (integer), 'E'/'e' (real), 'B' (text),
+    /// 'C' (numeric), 'A' or other (blob/none).
     pub affinity: char,
     /// True if this column is the INTEGER PRIMARY KEY (rowid alias).
     /// Column reads for IPK columns must emit `Rowid` instead of `Column`
@@ -572,8 +572,8 @@ pub fn codegen_select(
             distinct,
             ..
         } => (columns, from, where_clause, group_by, having, *distinct),
-        SelectCore::Values(_) => {
-            return Err(CodegenError::Unsupported("VALUES in SELECT".to_owned()));
+        SelectCore::Values(rows) => {
+            return codegen_values_select(b, rows);
         }
     };
 
@@ -591,6 +591,12 @@ pub fn codegen_select(
             .any(|term| contains_unsupported_in_expr(&term.expr))
     {
         return Err(CodegenError::Unsupported(unsupported_in_message()));
+    }
+
+    // Handle SELECT without FROM (e.g. SELECT 1, SELECT 1+1, SELECT abs(-5)).
+    if from.is_none() {
+        codegen_select_without_from(b, columns, where_clause.as_deref());
+        return Ok(());
     }
 
     // Determine the table from the FROM clause.
@@ -1390,8 +1396,8 @@ fn codegen_select_distinct_scan(
 
 /// Emit a LIMIT or OFFSET expression into a register.
 ///
-/// Handles integer literals and bind parameters; falls back to -1
-/// (unlimited) for complex expressions.
+/// Handles integer literals and bind parameters; evaluates arbitrary
+/// expressions via `emit_expr` for computed limits (e.g. `LIMIT 5+0`).
 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 fn emit_limit_expr(b: &mut ProgramBuilder, expr: &Expr, target_reg: i32) {
     match expr {
@@ -1411,8 +1417,9 @@ fn emit_limit_expr(b: &mut ProgramBuilder, expr: &Expr, target_reg: i32) {
             b.emit_op(Opcode::Variable, param_idx, target_reg, 0, P4::None, 0);
         }
         _ => {
-            // Unsupported expression — use -1 (unlimited).
-            b.emit_op(Opcode::Integer, -1, target_reg, 0, P4::None, 0);
+            // Evaluate arbitrary expression (e.g. `5+0`, `abs(-3)`).
+            // No table context needed — LIMIT expressions don't reference columns.
+            emit_expr(b, expr, target_reg, None);
         }
     }
 }
@@ -1829,6 +1836,111 @@ struct AggColumn {
     arg_col_index: Option<usize>,
     /// True if the argument is the INTEGER PRIMARY KEY (rowid) column.
     arg_is_rowid: bool,
+    /// True if the aggregate uses DISTINCT (e.g. `COUNT(DISTINCT col)`).
+    distinct: bool,
+    /// Non-column expression argument (e.g. `SUM(a + b)`), evaluated via `emit_expr`.
+    /// `None` when arg is a simple column ref (use `arg_col_index` instead).
+    arg_expr: Option<Box<Expr>>,
+    /// Additional argument expressions beyond the first (e.g. separator for group_concat).
+    extra_args: Vec<Expr>,
+    /// FILTER clause expression, e.g. `COUNT(*) FILTER (WHERE x > 5)`.
+    /// When present, the AggStep is only executed if this evaluates to true.
+    filter: Option<Box<Expr>>,
+}
+
+/// Generate VDBE bytecode for a standalone `VALUES` clause.
+///
+/// Pattern: `Init → Transaction → [for each row: eval exprs → ResultRow] → Halt`
+///
+/// Handles `VALUES (1, 'a'), (2, 'b')` etc.
+fn codegen_values_select(b: &mut ProgramBuilder, rows: &[Vec<Expr>]) -> Result<(), CodegenError> {
+    if rows.is_empty() {
+        return Err(CodegenError::Unsupported("empty VALUES".to_owned()));
+    }
+
+    let end_label = b.emit_label();
+
+    // Init: jump to end (standard SQLite pattern).
+    b.emit_jump_to_label(Opcode::Init, 0, 0, end_label, P4::None, 0);
+
+    // Transaction (read-only, p2=0).
+    b.emit_op(Opcode::Transaction, 0, 0, 0, P4::None, 0);
+
+    // Determine column count from the first row.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let num_cols = rows[0].len() as i32;
+    let out_regs = b.alloc_regs(num_cols);
+
+    // Emit each row: evaluate expressions, then ResultRow.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    for row in rows {
+        for (i, expr) in row.iter().enumerate() {
+            let reg = out_regs + i as i32;
+            emit_expr(b, expr, reg, None);
+        }
+        b.emit_op(Opcode::ResultRow, out_regs, num_cols, 0, P4::None, 0);
+    }
+
+    b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+
+    // End target for Init jump.
+    b.resolve_label(end_label);
+
+    Ok(())
+}
+
+/// Generate VDBE bytecode for SELECT without FROM clause.
+///
+/// Pattern: `Init → Transaction → [eval exprs] → ResultRow → Halt`
+///
+/// Handles `SELECT 1`, `SELECT 1+2, 'abc'`, `SELECT abs(-5)`, etc.
+/// If a WHERE clause is present and evaluates to false/NULL, no row is emitted.
+fn codegen_select_without_from(
+    b: &mut ProgramBuilder,
+    columns: &[ResultColumn],
+    where_clause: Option<&Expr>,
+) {
+    let end_label = b.emit_label();
+    let halt_label = b.emit_label();
+
+    // Init: jump to end (standard SQLite pattern).
+    b.emit_jump_to_label(Opcode::Init, 0, 0, end_label, P4::None, 0);
+
+    // Transaction (read-only, p2=0).
+    b.emit_op(Opcode::Transaction, 0, 0, 0, P4::None, 0);
+
+    // WHERE clause: if present and false/NULL, skip to Halt.
+    if let Some(where_expr) = where_clause {
+        let cond_reg = b.alloc_temp();
+        emit_expr(b, where_expr, cond_reg, None);
+        b.emit_jump_to_label(Opcode::IfNot, cond_reg, 1, halt_label, P4::None, 0);
+        b.free_temp(cond_reg);
+    }
+
+    // Evaluate each result column expression into consecutive output registers.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let num_cols = columns.len() as i32;
+    let out_regs = b.alloc_regs(num_cols);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    for (i, col) in columns.iter().enumerate() {
+        let reg = out_regs + i as i32;
+        match col {
+            ResultColumn::Expr { expr, .. } => {
+                emit_expr(b, expr, reg, None);
+            }
+            ResultColumn::Star | ResultColumn::TableStar(_) => {
+                // No table → Star has no meaning; emit NULL.
+                b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
+            }
+        }
+    }
+
+    b.emit_op(Opcode::ResultRow, out_regs, num_cols, 0, P4::None, 0);
+    b.resolve_label(halt_label);
+    b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+
+    // End target for Init jump.
+    b.resolve_label(end_label);
 }
 
 /// Generate VDBE bytecode for an aggregate SELECT (no GROUP BY yet).
@@ -1898,36 +2010,96 @@ fn codegen_select_aggregate(
     for (i, agg) in agg_columns.iter().enumerate() {
         let accum_reg = accum_base + i as i32;
 
+        // FILTER clause: evaluate and skip AggStep if false/NULL.
+        let filter_skip_label = if let Some(ref filter_expr) = agg.filter {
+            let skip_lbl = b.emit_label();
+            let filter_reg = b.alloc_temp();
+            let scan_ctx = ScanCtx {
+                cursor,
+                table,
+                table_alias,
+                schema: Some(schema),
+            };
+            emit_expr(b, filter_expr, filter_reg, Some(&scan_ctx));
+            // p3=1: treat NULL as false (skip AggStep).
+            b.emit_jump_to_label(Opcode::IfNot, filter_reg, 1, skip_lbl, P4::None, 0);
+            b.free_temp(filter_reg);
+            Some(skip_lbl)
+        } else {
+            None
+        };
+
+        let distinct_flag = i32::from(agg.distinct);
         if agg.num_args == 0 {
             // count(*): no arguments, p2 is unused (0), p5=0.
             b.emit_op(
                 Opcode::AggStep,
-                0,
+                distinct_flag,
                 0,
                 accum_reg,
                 P4::FuncName(agg.name.clone()),
                 0,
             );
         } else {
-            // Single-arg aggregate: read column value into a temp, then AggStep.
-            let arg_reg = b.alloc_temp();
+            // Aggregate with arguments: allocate consecutive registers
+            // for all args so the engine can read them as a contiguous block.
+            let total_args = agg.num_args.max(1);
+            // alloc_regs guarantees contiguous register block.
+            let arg_base = b.alloc_regs(total_args);
+
+            // First argument.
             if agg.arg_is_rowid {
-                // INTEGER PRIMARY KEY: read rowid instead of column.
-                b.emit_op(Opcode::Rowid, cursor, arg_reg, 0, P4::None, 0);
+                b.emit_op(Opcode::Rowid, cursor, arg_base, 0, P4::None, 0);
+            } else if let Some(ref expr) = agg.arg_expr {
+                let scan_ctx = ScanCtx {
+                    cursor,
+                    table,
+                    table_alias,
+                    schema: Some(schema),
+                };
+                emit_expr(b, expr, arg_base, Some(&scan_ctx));
             } else {
                 let col_idx = agg.arg_col_index.unwrap_or(0);
-                b.emit_op(Opcode::Column, cursor, col_idx as i32, arg_reg, P4::None, 0);
+                #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+                b.emit_op(
+                    Opcode::Column,
+                    cursor,
+                    col_idx as i32,
+                    arg_base,
+                    P4::None,
+                    0,
+                );
             }
+
+            // Extra arguments (e.g. separator for group_concat).
+            if !agg.extra_args.is_empty() {
+                let scan_ctx = ScanCtx {
+                    cursor,
+                    table,
+                    table_alias,
+                    schema: Some(schema),
+                };
+                for (j, extra_expr) in agg.extra_args.iter().enumerate() {
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+                    let extra_reg = arg_base + 1 + j as i32;
+                    emit_expr(b, extra_expr, extra_reg, Some(&scan_ctx));
+                }
+            }
+
             let num_args = u16::try_from(agg.num_args).unwrap_or_default();
             b.emit_op(
                 Opcode::AggStep,
-                0,
-                arg_reg,
+                distinct_flag,
+                arg_base,
                 accum_reg,
                 P4::FuncName(agg.name.clone()),
                 num_args,
             );
-            b.free_temp(arg_reg);
+        }
+
+        // Resolve FILTER skip label after AggStep.
+        if let Some(skip_lbl) = filter_skip_label {
+            b.resolve_label(skip_lbl);
         }
     }
 
@@ -1986,10 +2158,18 @@ fn parse_aggregate_columns(
     for col in columns {
         match col {
             ResultColumn::Expr {
-                expr: Expr::FunctionCall { name, args, .. },
+                expr:
+                    Expr::FunctionCall {
+                        name,
+                        args,
+                        distinct,
+                        filter,
+                        ..
+                    },
                 ..
             } if is_aggregate_function(name) => {
                 let lower_name = name.to_ascii_lowercase();
+                let filt = filter.clone();
                 match args {
                     FunctionArgs::Star => {
                         // count(*)
@@ -1998,6 +2178,10 @@ fn parse_aggregate_columns(
                             num_args: 0,
                             arg_col_index: None,
                             arg_is_rowid: false,
+                            distinct: *distinct,
+                            arg_expr: None,
+                            extra_args: Vec::new(),
+                            filter: filt,
                         });
                     }
                     FunctionArgs::List(exprs) => {
@@ -2008,26 +2192,32 @@ fn parse_aggregate_columns(
                                 num_args: 0,
                                 arg_col_index: None,
                                 arg_is_rowid: false,
+                                distinct: *distinct,
+                                arg_expr: None,
+                                extra_args: Vec::new(),
+                                filter: filt,
                             });
                         } else {
-                            // Single-arg aggregate: resolve column reference.
-                            // Use resolve_column_ref to handle both regular columns and IPK (rowid).
-                            let (col_idx, is_rowid) =
+                            // First argument: try column reference first,
+                            // fall back to storing the expression for emit_expr.
+                            let (col_idx, is_rowid, expr) =
                                 match resolve_column_ref(&exprs[0], table, None) {
-                                    Some(SortKeySource::Column(idx)) => (Some(idx), false),
-                                    Some(SortKeySource::Rowid) => (None, true),
-                                    _ => {
-                                        return Err(CodegenError::Unsupported(
-                                            "non-column argument in aggregate function".to_owned(),
-                                        ));
-                                    }
+                                    Some(SortKeySource::Column(idx)) => (Some(idx), false, None),
+                                    Some(SortKeySource::Rowid) => (None, true, None),
+                                    _ => (None, false, Some(Box::new(exprs[0].clone()))),
                                 };
+                            // Extra arguments (e.g. separator for group_concat).
+                            let extra: Vec<Expr> = exprs[1..].to_vec();
                             #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
                             agg_cols.push(AggColumn {
                                 name: lower_name,
                                 num_args: exprs.len() as i32,
                                 arg_col_index: col_idx,
                                 arg_is_rowid: is_rowid,
+                                distinct: *distinct,
+                                arg_expr: expr,
+                                extra_args: extra,
+                                filter: filt,
                             });
                         }
                     }
@@ -2047,6 +2237,15 @@ fn parse_aggregate_columns(
 // GROUP BY aggregate codegen
 // ---------------------------------------------------------------------------
 
+/// A GROUP BY key that is either a simple column reference or an arbitrary
+/// expression (e.g. `length(name)`, `substr(city, 1, 1)`).
+enum GroupByKey {
+    /// Direct table column — read via `Opcode::Column`.
+    Column(usize),
+    /// Arbitrary expression — evaluated via `emit_expr` during the scan phase.
+    Expression(Expr),
+}
+
 /// Describes one output column in a GROUP BY query.
 enum GroupByOutputCol {
     /// A GROUP BY key column. `key_index` is the position within the group key
@@ -2059,27 +2258,40 @@ enum GroupByOutputCol {
     /// An aggregate function column. `agg_index` is the position within the
     /// aggregate accumulator vector.
     Aggregate { agg_index: usize },
+    /// A non-grouped column from `SELECT *`. SQLite allows non-grouped,
+    /// non-aggregated columns in GROUP BY queries, returning an arbitrary
+    /// row's value. `table_col_index` is the column index in the table;
+    /// `sorter_col` is the column index in the sorter record; `is_ipk` is
+    /// true if this is an INTEGER PRIMARY KEY (rowid alias).
+    NonGroupedColumn {
+        table_col_index: usize,
+        sorter_col: usize,
+        is_ipk: bool,
+    },
 }
 
 /// Parse result columns for a GROUP BY query into output-column descriptors,
-/// a list of group-key table-column indices, and a list of aggregate metadata.
+/// a list of group keys (column refs or expressions), and aggregate metadata.
 ///
-/// Returns `(output_cols, group_key_table_cols, agg_columns)`.
+/// Returns `(output_cols, group_by_keys, agg_columns)`.
 #[allow(clippy::type_complexity)]
 fn parse_group_by_output(
     columns: &[ResultColumn],
     table: &TableSchema,
     group_by: &[Expr],
-) -> Result<(Vec<GroupByOutputCol>, Vec<usize>, Vec<AggColumn>), CodegenError> {
-    // Resolve GROUP BY expressions to table column indices.
-    let group_key_table_cols: Vec<usize> = group_by
+) -> Result<(Vec<GroupByOutputCol>, Vec<GroupByKey>, Vec<AggColumn>), CodegenError> {
+    // Resolve GROUP BY expressions: column references become Column(idx),
+    // arbitrary expressions (e.g. length(name)) become Expression(expr).
+    let group_by_keys: Vec<GroupByKey> = group_by
         .iter()
         .map(|expr| {
-            resolve_column_index(expr, table).ok_or_else(|| {
-                CodegenError::Unsupported("non-column GROUP BY expression".to_owned())
-            })
+            if let Some(col_idx) = resolve_column_index(expr, table) {
+                GroupByKey::Column(col_idx)
+            } else {
+                GroupByKey::Expression(expr.clone())
+            }
         })
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect();
 
     let mut output_cols = Vec::new();
     let mut agg_columns = Vec::new();
@@ -2087,11 +2299,19 @@ fn parse_group_by_output(
     for col in columns {
         match col {
             ResultColumn::Expr {
-                expr: Expr::FunctionCall { name, args, .. },
+                expr:
+                    Expr::FunctionCall {
+                        name,
+                        args,
+                        distinct,
+                        filter,
+                        ..
+                    },
                 ..
             } if is_aggregate_function(name) => {
                 let agg_index = agg_columns.len();
                 let lower_name = name.to_ascii_lowercase();
+                let filt = filter.clone();
                 match args {
                     FunctionArgs::Star => {
                         agg_columns.push(AggColumn {
@@ -2099,6 +2319,10 @@ fn parse_group_by_output(
                             num_args: 0,
                             arg_col_index: None,
                             arg_is_rowid: false,
+                            distinct: *distinct,
+                            arg_expr: None,
+                            extra_args: Vec::new(),
+                            filter: filt,
                         });
                     }
                     FunctionArgs::List(exprs) => {
@@ -2108,25 +2332,30 @@ fn parse_group_by_output(
                                 num_args: 0,
                                 arg_col_index: None,
                                 arg_is_rowid: false,
+                                distinct: *distinct,
+                                arg_expr: None,
+                                extra_args: Vec::new(),
+                                filter: filt,
                             });
                         } else {
-                            // Use resolve_column_ref to handle both regular columns and IPK (rowid).
-                            let (col_idx, is_rowid) =
+                            // Try column reference first, fall back to expression.
+                            let (col_idx, is_rowid, expr) =
                                 match resolve_column_ref(&exprs[0], table, None) {
-                                    Some(SortKeySource::Column(idx)) => (Some(idx), false),
-                                    Some(SortKeySource::Rowid) => (None, true),
-                                    _ => {
-                                        return Err(CodegenError::Unsupported(
-                                            "non-column argument in aggregate function".to_owned(),
-                                        ));
-                                    }
+                                    Some(SortKeySource::Column(idx)) => (Some(idx), false, None),
+                                    Some(SortKeySource::Rowid) => (None, true, None),
+                                    _ => (None, false, Some(Box::new(exprs[0].clone()))),
                                 };
+                            let extra: Vec<Expr> = exprs[1..].to_vec();
                             #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
                             agg_columns.push(AggColumn {
                                 name: lower_name,
                                 num_args: exprs.len() as i32,
                                 arg_col_index: col_idx,
                                 arg_is_rowid: is_rowid,
+                                distinct: *distinct,
+                                arg_expr: expr,
+                                extra_args: extra,
+                                filter: filt,
                             });
                         }
                     }
@@ -2134,32 +2363,53 @@ fn parse_group_by_output(
                 output_cols.push(GroupByOutputCol::Aggregate { agg_index });
             }
             ResultColumn::Expr { expr, .. } => {
-                // Must be a GROUP BY column reference.
-                let col_idx = resolve_column_index(expr, table).ok_or_else(|| {
-                    CodegenError::Unsupported(
-                        "non-aggregate, non-column expression in GROUP BY query".to_owned(),
-                    )
+                // Match result column to a GROUP BY key: try column index
+                // first, then structural expression equality.
+                let key_index = if let Some(col_idx) = resolve_column_index(expr, table) {
+                    group_by_keys
+                        .iter()
+                        .position(|k| matches!(k, GroupByKey::Column(c) if *c == col_idx))
+                } else {
+                    group_by_keys
+                        .iter()
+                        .position(|k| matches!(k, GroupByKey::Expression(e) if e == expr))
+                }
+                .ok_or_else(|| {
+                    CodegenError::Unsupported("result column not in GROUP BY clause".to_owned())
                 })?;
-                let key_index = group_key_table_cols
-                    .iter()
-                    .position(|&k| k == col_idx)
-                    .ok_or_else(|| {
-                        CodegenError::Unsupported("result column not in GROUP BY clause".to_owned())
-                    })?;
                 output_cols.push(GroupByOutputCol::GroupKey {
                     key_index,
                     sorter_col: key_index,
                 });
             }
             ResultColumn::Star | ResultColumn::TableStar(_) => {
-                return Err(CodegenError::Unsupported(
-                    "Star in GROUP BY query".to_owned(),
-                ));
+                // Expand * to all table columns. Each column is either a
+                // GROUP BY key or a non-grouped column (SQLite allows this,
+                // returning an arbitrary row's value for non-grouped cols).
+                for (col_idx, col_info) in table.columns.iter().enumerate() {
+                    if let Some(key_index) = group_by_keys
+                        .iter()
+                        .position(|k| matches!(k, GroupByKey::Column(c) if *c == col_idx))
+                    {
+                        output_cols.push(GroupByOutputCol::GroupKey {
+                            key_index,
+                            sorter_col: key_index,
+                        });
+                    } else {
+                        // Non-grouped column — sorter_col assigned later
+                        // in codegen_select_group_by_aggregate.
+                        output_cols.push(GroupByOutputCol::NonGroupedColumn {
+                            table_col_index: col_idx,
+                            sorter_col: usize::MAX,
+                            is_ipk: col_info.is_ipk,
+                        });
+                    }
+                }
             }
         }
     }
 
-    Ok((output_cols, group_key_table_cols, agg_columns))
+    Ok((output_cols, group_by_keys, agg_columns))
 }
 
 /// Generate VDBE bytecode for an aggregate SELECT **with GROUP BY**.
@@ -2184,10 +2434,10 @@ fn codegen_select_group_by_aggregate(
     done_label: crate::Label,
     end_label: crate::Label,
 ) -> Result<(), CodegenError> {
-    let (output_cols, group_key_table_cols, agg_columns) =
+    let (mut output_cols, group_by_keys, agg_columns) =
         parse_group_by_output(columns, table, group_by)?;
 
-    let num_group_keys = group_key_table_cols.len();
+    let num_group_keys = group_by_keys.len();
     let num_aggs = agg_columns.len();
 
     // Collect unique table-column indices needed for aggregate arguments.
@@ -2200,13 +2450,43 @@ fn codegen_select_group_by_aggregate(
         }
     }
 
-    // Sorter layout: [group_key_0, ..., group_key_n, agg_arg_0, ..., agg_arg_m]
-    let total_sorter_cols = num_group_keys + agg_arg_table_cols.len();
+    // Count expression-arg aggregates (each gets its own sorter slot).
+    let num_expr_args = agg_columns.iter().filter(|a| a.arg_expr.is_some()).count();
+
+    // Count aggregates with FILTER clauses (each gets a boolean sorter slot).
+    let num_filter_cols = agg_columns.iter().filter(|a| a.filter.is_some()).count();
+
+    // Count non-grouped columns (from SELECT * expansion) and assign sorter slots.
+    let num_nongrouped = output_cols
+        .iter()
+        .filter(|c| matches!(c, GroupByOutputCol::NonGroupedColumn { .. }))
+        .count();
+    let nongrouped_start =
+        num_group_keys + agg_arg_table_cols.len() + num_expr_args + num_filter_cols;
+    let mut next_nongrouped_slot = nongrouped_start;
+    for col in &mut output_cols {
+        if let GroupByOutputCol::NonGroupedColumn { sorter_col, .. } = col {
+            *sorter_col = next_nongrouped_slot;
+            next_nongrouped_slot += 1;
+        }
+    }
+
+    // Sorter layout: [group_keys..., col_args..., expr_args..., filter_bools..., nongrouped_cols...]
+    let total_sorter_cols = num_group_keys
+        + agg_arg_table_cols.len()
+        + num_expr_args
+        + num_filter_cols
+        + num_nongrouped;
 
     // Map each aggregate's arg to its sorter column index.
     let mut agg_sorter_col: Vec<Option<usize>> = Vec::with_capacity(agg_columns.len());
+    let mut next_expr_slot = num_group_keys + agg_arg_table_cols.len();
     for agg in &agg_columns {
-        let sorter_col = if let Some(ci) = agg.arg_col_index {
+        let sorter_col = if agg.arg_expr.is_some() {
+            let slot = next_expr_slot;
+            next_expr_slot += 1;
+            Some(slot)
+        } else if let Some(ci) = agg.arg_col_index {
             let Some(pos) = agg_arg_table_cols.iter().position(|&x| x == ci) else {
                 return Err(CodegenError::Unsupported(
                     "internal: aggregate argument column missing from sorter layout".to_owned(),
@@ -2217,6 +2497,18 @@ fn codegen_select_group_by_aggregate(
             None
         };
         agg_sorter_col.push(sorter_col);
+    }
+
+    // Map each FILTER-bearing aggregate to its boolean sorter column.
+    let mut filter_sorter_col: Vec<Option<usize>> = Vec::with_capacity(agg_columns.len());
+    let mut next_filter_slot = num_group_keys + agg_arg_table_cols.len() + num_expr_args;
+    for agg in &agg_columns {
+        if agg.filter.is_some() {
+            filter_sorter_col.push(Some(next_filter_slot));
+            next_filter_slot += 1;
+        } else {
+            filter_sorter_col.push(None);
+        }
     }
 
     // Sorter cursor.
@@ -2263,20 +2555,74 @@ fn codegen_select_group_by_aggregate(
         );
     }
 
-    // Read group-key columns + agg-arg columns into consecutive registers.
+    // Read group-key values + agg-arg columns into consecutive registers.
+    // For column-based keys, use Opcode::Column; for expression-based keys,
+    // evaluate the expression via emit_expr.
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     let sorter_base = b.alloc_regs(total_sorter_cols as i32);
     {
+        let scan_ctx = ScanCtx {
+            cursor,
+            table,
+            table_alias,
+            schema: Some(schema),
+        };
         let mut reg = sorter_base;
-        for &col_idx in &group_key_table_cols {
-            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-            b.emit_op(Opcode::Column, cursor, col_idx as i32, reg, P4::None, 0);
+        for key in &group_by_keys {
+            match key {
+                GroupByKey::Column(col_idx) => {
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+                    b.emit_op(Opcode::Column, cursor, *col_idx as i32, reg, P4::None, 0);
+                }
+                GroupByKey::Expression(expr) => {
+                    emit_expr(b, expr, reg, Some(&scan_ctx));
+                }
+            }
             reg += 1;
         }
         for &col_idx in &agg_arg_table_cols {
             #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
             b.emit_op(Opcode::Column, cursor, col_idx as i32, reg, P4::None, 0);
             reg += 1;
+        }
+        // Expression-arg aggregates: evaluate each expression into its sorter slot.
+        for agg in &agg_columns {
+            if let Some(ref expr) = agg.arg_expr {
+                emit_expr(b, expr, reg, Some(&scan_ctx));
+                reg += 1;
+            }
+        }
+        // FILTER clause booleans: evaluate each filter and store 0/1 in sorter.
+        for agg in &agg_columns {
+            if let Some(ref filter_expr) = agg.filter {
+                emit_expr(b, filter_expr, reg, Some(&scan_ctx));
+                reg += 1;
+            }
+        }
+
+        // Non-grouped columns (from SELECT * expansion): store in sorter.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        for col in &output_cols {
+            if let GroupByOutputCol::NonGroupedColumn {
+                table_col_index,
+                is_ipk,
+                ..
+            } = col
+            {
+                if *is_ipk {
+                    b.emit_op(Opcode::Rowid, cursor, reg, 0, P4::None, 0);
+                } else {
+                    b.emit_op(
+                        Opcode::Column,
+                        cursor,
+                        *table_col_index as i32,
+                        reg,
+                        P4::None,
+                        0,
+                    );
+                }
+                reg += 1;
+            }
         }
     }
 
@@ -2314,13 +2660,16 @@ fn codegen_select_group_by_aggregate(
 
     // === Pass 2: Iterate sorted rows, accumulate per-group ===
 
-    // Allocate registers for current group keys, previous group keys, accumulators.
+    // Allocate registers for current group keys, previous group keys, accumulators,
+    // and non-grouped column values.
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     let cur_key_base = b.alloc_regs(num_group_keys as i32);
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     let prev_key_base = b.alloc_regs(num_group_keys as i32);
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     let accum_base = b.alloc_regs(num_aggs as i32);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let prev_nongrouped_base = b.alloc_regs(num_nongrouped.max(1) as i32);
     let first_flag = b.alloc_reg();
 
     // Initialize: first_flag = 1, accumulators = Null.
@@ -2402,29 +2751,43 @@ fn codegen_select_group_by_aggregate(
             0,
         );
     }
-    // Build output row from prev_key + accum.
+    // Build output row from prev_key + accum + prev_nongrouped.
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    for (i, out_col) in output_cols.iter().enumerate() {
-        match out_col {
-            GroupByOutputCol::GroupKey { sorter_col, .. } => {
-                b.emit_op(
-                    Opcode::Copy,
-                    prev_key_base + *sorter_col as i32,
-                    out_regs + i as i32,
-                    0,
-                    P4::None,
-                    0,
-                );
-            }
-            GroupByOutputCol::Aggregate { agg_index } => {
-                b.emit_op(
-                    Opcode::Copy,
-                    accum_base + *agg_index as i32,
-                    out_regs + i as i32,
-                    0,
-                    P4::None,
-                    0,
-                );
+    {
+        let mut ng_idx = 0i32;
+        for (i, out_col) in output_cols.iter().enumerate() {
+            match out_col {
+                GroupByOutputCol::GroupKey { sorter_col, .. } => {
+                    b.emit_op(
+                        Opcode::Copy,
+                        prev_key_base + *sorter_col as i32,
+                        out_regs + i as i32,
+                        0,
+                        P4::None,
+                        0,
+                    );
+                }
+                GroupByOutputCol::Aggregate { agg_index } => {
+                    b.emit_op(
+                        Opcode::Copy,
+                        accum_base + *agg_index as i32,
+                        out_regs + i as i32,
+                        0,
+                        P4::None,
+                        0,
+                    );
+                }
+                GroupByOutputCol::NonGroupedColumn { .. } => {
+                    b.emit_op(
+                        Opcode::Copy,
+                        prev_nongrouped_base + ng_idx,
+                        out_regs + i as i32,
+                        0,
+                        P4::None,
+                        0,
+                    );
+                    ng_idx += 1;
+                }
             }
         }
     }
@@ -2436,7 +2799,7 @@ fn codegen_select_group_by_aggregate(
             having_expr,
             &output_cols,
             &agg_columns,
-            &group_key_table_cols,
+            &group_by_keys,
             table,
             out_regs,
             having_skip_label,
@@ -2467,45 +2830,101 @@ fn codegen_select_group_by_aggregate(
         );
     }
 
+    // Copy non-grouped columns from sorter to prev_nongrouped registers.
+    // These hold the latest (arbitrary) value for each non-grouped column.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    {
+        let mut ng_idx = 0i32;
+        for col in &output_cols {
+            if let GroupByOutputCol::NonGroupedColumn { sorter_col, .. } = col {
+                b.emit_op(
+                    Opcode::Column,
+                    sorter_cursor,
+                    *sorter_col as i32,
+                    prev_nongrouped_base + ng_idx,
+                    P4::None,
+                    0,
+                );
+                ng_idx += 1;
+            }
+        }
+    }
+
     // AggStep for each aggregate.
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     for (i, agg) in agg_columns.iter().enumerate() {
         let accum_reg = accum_base + i as i32;
+
+        // FILTER clause: read boolean from sorter and skip AggStep if false/NULL.
+        let filter_skip_label = if let Some(filt_col) = filter_sorter_col[i] {
+            let skip_lbl = b.emit_label();
+            let filt_reg = b.alloc_temp();
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            b.emit_op(
+                Opcode::Column,
+                sorter_cursor,
+                filt_col as i32,
+                filt_reg,
+                P4::None,
+                0,
+            );
+            // p3=1: treat NULL as false (skip AggStep).
+            b.emit_jump_to_label(Opcode::IfNot, filt_reg, 1, skip_lbl, P4::None, 0);
+            b.free_temp(filt_reg);
+            Some(skip_lbl)
+        } else {
+            None
+        };
+
+        let distinct_flag = i32::from(agg.distinct);
         if agg.num_args == 0 {
             // count(*): no arguments.
             b.emit_op(
                 Opcode::AggStep,
-                0,
+                distinct_flag,
                 0,
                 accum_reg,
                 P4::FuncName(agg.name.clone()),
                 0,
             );
         } else {
-            let arg_reg = b.alloc_temp();
+            let total_args = agg.num_args.max(1);
+            let arg_base = b.alloc_regs(total_args);
             let Some(sorter_col) = agg_sorter_col[i] else {
                 return Err(CodegenError::Unsupported(
                     "internal: non-zero-arg aggregate missing sorter column".to_owned(),
                 ));
             };
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
             b.emit_op(
                 Opcode::Column,
                 sorter_cursor,
                 sorter_col as i32,
-                arg_reg,
+                arg_base,
                 P4::None,
                 0,
             );
+            // Extra arguments (e.g. separator for group_concat):
+            // re-evaluate inline since they are typically constant expressions.
+            for (j, extra_expr) in agg.extra_args.iter().enumerate() {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+                let extra_reg = arg_base + 1 + j as i32;
+                emit_expr(b, extra_expr, extra_reg, None);
+            }
             let step_p5 = u16::try_from(agg.num_args).unwrap_or_default();
             b.emit_op(
                 Opcode::AggStep,
-                0,
-                arg_reg,
+                distinct_flag,
+                arg_base,
                 accum_reg,
                 P4::FuncName(agg.name.clone()),
                 step_p5,
             );
-            b.free_temp(arg_reg);
+        }
+
+        // Resolve FILTER skip label after AggStep.
+        if let Some(skip_lbl) = filter_skip_label {
+            b.resolve_label(skip_lbl);
         }
     }
 
@@ -2537,29 +2956,43 @@ fn codegen_select_group_by_aggregate(
             0,
         );
     }
-    // Build output row from prev_key (last group's keys) + accum.
+    // Build output row from prev_key (last group's keys) + accum + prev_nongrouped.
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    for (i, out_col) in output_cols.iter().enumerate() {
-        match out_col {
-            GroupByOutputCol::GroupKey { sorter_col, .. } => {
-                b.emit_op(
-                    Opcode::Copy,
-                    prev_key_base + *sorter_col as i32,
-                    out_regs + i as i32,
-                    0,
-                    P4::None,
-                    0,
-                );
-            }
-            GroupByOutputCol::Aggregate { agg_index } => {
-                b.emit_op(
-                    Opcode::Copy,
-                    accum_base + *agg_index as i32,
-                    out_regs + i as i32,
-                    0,
-                    P4::None,
-                    0,
-                );
+    {
+        let mut ng_idx = 0i32;
+        for (i, out_col) in output_cols.iter().enumerate() {
+            match out_col {
+                GroupByOutputCol::GroupKey { sorter_col, .. } => {
+                    b.emit_op(
+                        Opcode::Copy,
+                        prev_key_base + *sorter_col as i32,
+                        out_regs + i as i32,
+                        0,
+                        P4::None,
+                        0,
+                    );
+                }
+                GroupByOutputCol::Aggregate { agg_index } => {
+                    b.emit_op(
+                        Opcode::Copy,
+                        accum_base + *agg_index as i32,
+                        out_regs + i as i32,
+                        0,
+                        P4::None,
+                        0,
+                    );
+                }
+                GroupByOutputCol::NonGroupedColumn { .. } => {
+                    b.emit_op(
+                        Opcode::Copy,
+                        prev_nongrouped_base + ng_idx,
+                        out_regs + i as i32,
+                        0,
+                        P4::None,
+                        0,
+                    );
+                    ng_idx += 1;
+                }
             }
         }
     }
@@ -2571,7 +3004,7 @@ fn codegen_select_group_by_aggregate(
             having_expr,
             &output_cols,
             &agg_columns,
-            &group_key_table_cols,
+            &group_by_keys,
             table,
             out_regs,
             final_having_skip,
@@ -2749,18 +3182,40 @@ pub fn codegen_insert(
                 emit_default_value(b, col, reg);
             }
             let rowid_reg = b.alloc_reg();
-            b.emit_op(
-                Opcode::NewRowid,
-                table_cursor,
-                rowid_reg,
-                concurrent_flag,
-                P4::None,
-                0,
-            );
             if let Some(ipk_idx) = ctx.rowid_alias_col_idx {
+                // IPK column has a DEFAULT value — use it when non-NULL,
+                // otherwise auto-generate via NewRowid (matching VALUES path).
                 #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
                 let ipk_reg = col_regs + ipk_idx as i32;
+                let auto_label = b.emit_label();
+                let done_label = b.emit_label();
+
+                b.emit_jump_to_label(Opcode::IsNull, ipk_reg, 0, auto_label, P4::None, 0);
+                b.emit_op(Opcode::Copy, ipk_reg, rowid_reg, 0, P4::None, 0);
+                b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+
+                b.resolve_label(auto_label);
+                b.emit_op(
+                    Opcode::NewRowid,
+                    table_cursor,
+                    rowid_reg,
+                    concurrent_flag,
+                    P4::None,
+                    0,
+                );
                 b.emit_op(Opcode::Copy, rowid_reg, ipk_reg, 0, P4::None, 0);
+
+                b.resolve_label(done_label);
+            } else {
+                // No IPK column — always auto-generate.
+                b.emit_op(
+                    Opcode::NewRowid,
+                    table_cursor,
+                    rowid_reg,
+                    concurrent_flag,
+                    P4::None,
+                    0,
+                );
             }
             let rec_reg = b.alloc_reg();
             emit_strict_type_check(b, table, col_regs);
@@ -2778,7 +3233,7 @@ pub fn codegen_insert(
                 rec_reg,
                 rowid_reg,
                 P4::Table(table.name.clone()),
-                0,
+                oe_flag,
             );
 
             // Index maintenance: insert into each index (bd-so1h).
@@ -3924,7 +4379,7 @@ fn emit_having_filter(
     having_expr: &Expr,
     output_cols: &[GroupByOutputCol],
     agg_columns: &[AggColumn],
-    group_key_table_cols: &[usize],
+    group_by_keys: &[GroupByKey],
     table: &TableSchema,
     out_regs: i32,
     skip_label: crate::Label,
@@ -3936,7 +4391,7 @@ fn emit_having_filter(
         result_reg,
         output_cols,
         agg_columns,
-        group_key_table_cols,
+        group_by_keys,
         table,
         out_regs,
     );
@@ -3962,7 +4417,7 @@ fn emit_having_expr(
     dest_reg: i32,
     output_cols: &[GroupByOutputCol],
     agg_columns: &[AggColumn],
-    group_key_table_cols: &[usize],
+    group_by_keys: &[GroupByKey],
     table: &TableSchema,
     out_regs: i32,
 ) {
@@ -4010,7 +4465,8 @@ fn emit_having_expr(
                 // Find the output column whose group key maps to this table column.
                 for (i, oc) in output_cols.iter().enumerate() {
                     if let GroupByOutputCol::GroupKey { key_index, .. } = oc {
-                        if group_key_table_cols.get(*key_index) == Some(&col_idx) {
+                        if matches!(group_by_keys.get(*key_index), Some(GroupByKey::Column(c)) if *c == col_idx)
+                        {
                             b.emit_op(Opcode::Copy, out_regs + i as i32, dest_reg, 0, P4::None, 0);
                             return;
                         }
@@ -4033,7 +4489,7 @@ fn emit_having_expr(
                 left_reg,
                 output_cols,
                 agg_columns,
-                group_key_table_cols,
+                group_by_keys,
                 table,
                 out_regs,
             );
@@ -4043,7 +4499,7 @@ fn emit_having_expr(
                 right_reg,
                 output_cols,
                 agg_columns,
-                group_key_table_cols,
+                group_by_keys,
                 table,
                 out_regs,
             );
@@ -4155,6 +4611,17 @@ fn emit_where_filter(
             ..
         } => {
             // Try col = expr or expr = col (with alias-aware qualifier validation).
+            let scan = ScanCtx {
+                cursor,
+                table,
+                table_alias,
+                schema: Some(schema),
+            };
+            // Check for COLLATE on either operand.
+            let collation_p4 = extract_collation(left)
+                .or_else(|| extract_collation(right))
+                .map_or(P4::None, |coll| P4::Collation(coll.to_owned()));
+
             if let Some(resolved) = resolve_column_ref(left, table, table_alias) {
                 let col_reg = b.alloc_temp();
                 let val_reg = b.alloc_temp();
@@ -4166,19 +4633,15 @@ fn emit_where_filter(
                         b.emit_op(Opcode::Rowid, cursor, col_reg, 0, P4::None, 0);
                     }
                     SortKeySource::Expression(expr) => {
-                        let scan = ScanCtx {
-                            cursor,
-                            table,
-                            table_alias,
-                            schema: Some(schema),
-                        };
                         emit_expr(b, &expr, col_reg, Some(&scan));
                     }
                 }
-                emit_expr(b, right, val_reg, None);
-                // Use NULLEQ flag (0x80) so NULL != value returns true, skipping NULL rows.
-                // In SQL, NULL = 'alice' is unknown, which evaluates to false for WHERE.
-                b.emit_jump_to_label(Opcode::Ne, val_reg, col_reg, skip_label, P4::None, 0x80);
+                emit_expr(b, right, val_reg, Some(&scan));
+                // SQL semantics: `col = NULL` is UNKNOWN (false in WHERE). If the
+                // value expression evaluates to NULL, skip the row unconditionally.
+                b.emit_jump_to_label(Opcode::IsNull, val_reg, 0, skip_label, P4::None, 0);
+                // Use NULLEQ flag (0x80) so NULL column != non-NULL value → skip.
+                b.emit_jump_to_label(Opcode::Ne, val_reg, col_reg, skip_label, collation_p4, 0x80);
                 b.free_temp(val_reg);
                 b.free_temp(col_reg);
             } else if let Some(resolved) = resolve_column_ref(right, table, table_alias) {
@@ -4192,22 +4655,23 @@ fn emit_where_filter(
                         b.emit_op(Opcode::Rowid, cursor, col_reg, 0, P4::None, 0);
                     }
                     SortKeySource::Expression(expr) => {
-                        let scan = ScanCtx {
-                            cursor,
-                            table,
-                            table_alias,
-                            schema: Some(schema),
-                        };
                         emit_expr(b, &expr, col_reg, Some(&scan));
                     }
                 }
-                emit_expr(b, left, val_reg, None);
-                // Use NULLEQ flag (0x80) so NULL != value returns true, skipping NULL rows.
-                b.emit_jump_to_label(Opcode::Ne, val_reg, col_reg, skip_label, P4::None, 0x80);
+                emit_expr(b, left, val_reg, Some(&scan));
+                // SQL semantics: `NULL = col` is UNKNOWN (false in WHERE).
+                b.emit_jump_to_label(Opcode::IsNull, val_reg, 0, skip_label, P4::None, 0);
+                b.emit_jump_to_label(Opcode::Ne, val_reg, col_reg, skip_label, collation_p4, 0x80);
                 b.free_temp(val_reg);
                 b.free_temp(col_reg);
+            } else {
+                // Neither side is a column ref (e.g. WHERE 1 = 0, WHERE length(name) = 5).
+                // Fall through to generic boolean evaluation.
+                let cond_reg = b.alloc_temp();
+                emit_expr(b, where_expr, cond_reg, Some(&scan));
+                b.emit_jump_to_label(Opcode::IfNot, cond_reg, 1, skip_label, P4::None, 0);
+                b.free_temp(cond_reg);
             }
-            // If neither side is a column ref, fall through (match all).
         }
         Expr::BinaryOp {
             left,
@@ -4218,6 +4682,25 @@ fn emit_where_filter(
             // AND: both conditions must pass.
             emit_where_filter(b, left, cursor, table, table_alias, schema, skip_label);
             emit_where_filter(b, right, cursor, table, table_alias, schema, skip_label);
+        }
+        Expr::BinaryOp {
+            left,
+            op: fsqlite_ast::BinaryOp::Or,
+            right,
+            ..
+        } => {
+            // OR: at least one condition must pass.
+            // If left passes → skip right, proceed to row processing.
+            // If left fails → try right; if right also fails → skip row.
+            let left_skip = b.emit_label();
+            let pass_label = b.emit_label();
+            emit_where_filter(b, left, cursor, table, table_alias, schema, left_skip);
+            // Left passed — jump past right-side evaluation.
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, pass_label, P4::None, 0);
+            b.resolve_label(left_skip);
+            // Left failed — try right.
+            emit_where_filter(b, right, cursor, table, table_alias, schema, skip_label);
+            b.resolve_label(pass_label);
         }
         _ => {
             // Generic WHERE: evaluate expression with cursor context and test truthiness.
@@ -4303,7 +4786,13 @@ fn resolve_column_ref(
     table: &TableSchema,
     table_alias: Option<&str>,
 ) -> Option<SortKeySource> {
-    if let Expr::Column(col_ref, _) = expr {
+    // Unwrap COLLATE wrapper to reach the inner column reference.
+    let inner = if let Expr::Collate { expr: inner, .. } = expr {
+        inner.as_ref()
+    } else {
+        expr
+    };
+    if let Expr::Column(col_ref, _) = inner {
         if let Some(qualifier) = &col_ref.table
             && !matches_table_or_alias(qualifier, table, table_alias)
         {
@@ -5511,11 +6000,524 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
             // rather than value computation, so a pass-through is correct.
             emit_expr(b, inner, reg, ctx);
         }
+        Expr::Exists { subquery, not, .. } => {
+            if let Some(scan_ctx) = ctx {
+                if let Some(schema) = scan_ctx.schema {
+                    emit_exists_subquery(b, subquery, *not, reg, scan_ctx, schema);
+                    return;
+                }
+            }
+            // No schema context — emit 0 (false) for EXISTS, 1 for NOT EXISTS.
+            let val = i32::from(*not);
+            b.emit_op(Opcode::Integer, val, reg, 0, P4::None, 0);
+        }
+        Expr::Subquery(subquery, _) => {
+            if let Some(scan_ctx) = ctx {
+                if let Some(schema) = scan_ctx.schema {
+                    emit_scalar_subquery(b, subquery, reg, scan_ctx, schema);
+                    return;
+                }
+            }
+            // No schema context — emit NULL.
+            b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
+        }
+        Expr::JsonAccess {
+            expr: inner, path, ..
+        } => {
+            // Rewrite `expr -> path` and `expr ->> path` as json_extract(expr, path).
+            // Both arrow variants use json_extract; the subtle -> vs ->> distinction
+            // (JSON text vs SQL-native) is handled identically by our json_extract
+            // implementation which returns SQL-native values.
+            let arg_base = b.alloc_regs(2);
+            emit_expr(b, inner, arg_base, ctx);
+            emit_expr(b, path, arg_base + 1, ctx);
+            b.emit_op(
+                Opcode::PureFunc,
+                0,
+                arg_base,
+                reg,
+                P4::FuncName("json_extract".to_owned()),
+                2,
+            );
+        }
         _ => {
             // Column refs without scan context and other unhandled expressions: Null.
             b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
         }
     }
+}
+
+/// Emit bytecode for an EXISTS or NOT EXISTS subquery expression.
+///
+/// Pattern: open cursor on subquery table, scan with WHERE filter, set reg to
+/// 1 (found) or 0 (not found). For NOT EXISTS, the result is inverted.
+#[allow(clippy::too_many_lines)]
+fn emit_exists_subquery(
+    b: &mut ProgramBuilder,
+    subquery: &SelectStatement,
+    not: bool,
+    reg: i32,
+    outer_ctx: &ScanCtx<'_>,
+    schema: &[TableSchema],
+) {
+    // Extract the subquery's FROM table and WHERE clause.
+    let (from, where_clause) = match &subquery.body.select {
+        SelectCore::Select {
+            from, where_clause, ..
+        } => (from, where_clause),
+        _ => {
+            let val = i32::from(not);
+            b.emit_op(Opcode::Integer, val, reg, 0, P4::None, 0);
+            return;
+        }
+    };
+
+    let from_clause = match from {
+        Some(f) => f,
+        None => {
+            // EXISTS on a no-FROM query like `EXISTS (SELECT 1)` — always true.
+            let val = i32::from(!not);
+            b.emit_op(Opcode::Integer, val, reg, 0, P4::None, 0);
+            return;
+        }
+    };
+
+    let (table_name, sub_alias) = match &from_clause.source {
+        fsqlite_ast::TableOrSubquery::Table { name, alias, .. } => (&name.name, alias.as_deref()),
+        _ => {
+            let val = i32::from(not);
+            b.emit_op(Opcode::Integer, val, reg, 0, P4::None, 0);
+            return;
+        }
+    };
+
+    let table = match find_table(schema, table_name) {
+        Ok(t) => t,
+        Err(_) => {
+            let val = i32::from(not);
+            b.emit_op(Opcode::Integer, val, reg, 0, P4::None, 0);
+            return;
+        }
+    };
+
+    // Use cursor offset far from the main scan cursors.
+    let sub_cursor = outer_ctx.cursor + 128;
+    let found_label = b.emit_label();
+    let done_label = b.emit_label();
+
+    // Default result: 0 (not found) for EXISTS, 1 for NOT EXISTS.
+    let default_val = i32::from(not);
+    b.emit_op(Opcode::Integer, default_val, reg, 0, P4::None, 0);
+
+    // Open a read cursor on the subquery table.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    b.emit_op(
+        Opcode::OpenRead,
+        sub_cursor,
+        table.root_page as i32,
+        0,
+        P4::Int(table.columns.len() as i32),
+        0,
+    );
+
+    let rewind_addr = b.current_addr();
+    b.emit_jump_to_label(Opcode::Rewind, sub_cursor, 0, done_label, P4::None, 0);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let loop_body = (rewind_addr + 1) as i32;
+
+    // Build scan context for the subquery table so correlated WHERE refs resolve.
+    let sub_ctx = ScanCtx {
+        cursor: sub_cursor,
+        table,
+        table_alias: sub_alias,
+        schema: Some(schema),
+    };
+
+    // Apply WHERE filter if present.
+    if let Some(where_expr) = where_clause {
+        let r_cond = b.alloc_temp();
+        emit_expr_with_fallback(b, where_expr, r_cond, &sub_ctx, Some(outer_ctx));
+        let next_label = b.emit_label();
+        b.emit_jump_to_label(Opcode::IfNot, r_cond, 1, next_label, P4::None, 0);
+        b.free_temp(r_cond);
+
+        // Row matches WHERE — found.
+        let found_val = i32::from(!not);
+        b.emit_op(Opcode::Integer, found_val, reg, 0, P4::None, 0);
+        b.emit_jump_to_label(Opcode::Goto, 0, 0, found_label, P4::None, 0);
+
+        b.resolve_label(next_label);
+    } else {
+        // No WHERE — if any row exists, result is found.
+        let found_val = i32::from(!not);
+        b.emit_op(Opcode::Integer, found_val, reg, 0, P4::None, 0);
+        b.emit_jump_to_label(Opcode::Goto, 0, 0, found_label, P4::None, 0);
+    }
+
+    // Next row.
+    b.emit_op(Opcode::Next, sub_cursor, loop_body, 0, P4::None, 0);
+
+    // Fall through: no row matched.
+    b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+
+    b.resolve_label(found_label);
+
+    b.resolve_label(done_label);
+    b.emit_op(Opcode::Close, sub_cursor, 0, 0, P4::None, 0);
+}
+
+/// Emit bytecode for a scalar subquery expression `(SELECT expr FROM ...)`.
+///
+/// Evaluates the subquery and places the first result value into `reg`.
+/// If the subquery returns no rows, `reg` is set to NULL.
+#[allow(clippy::too_many_lines)]
+fn emit_scalar_subquery(
+    b: &mut ProgramBuilder,
+    subquery: &SelectStatement,
+    reg: i32,
+    outer_ctx: &ScanCtx<'_>,
+    schema: &[TableSchema],
+) {
+    let (columns, from, where_clause, group_by) = match &subquery.body.select {
+        SelectCore::Select {
+            columns,
+            from,
+            where_clause,
+            group_by,
+            ..
+        } => (columns, from, where_clause, group_by),
+        _ => {
+            b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
+            return;
+        }
+    };
+
+    // No-FROM scalar subquery: `(SELECT 1)`, `(SELECT 1 + 2)`.
+    if from.is_none() {
+        if let Some(ResultColumn::Expr { expr, .. }) = columns.first() {
+            emit_expr(b, expr, reg, Some(outer_ctx));
+            return;
+        }
+        b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
+        return;
+    }
+
+    let from_clause = from.as_ref().unwrap();
+    let (table_name, sub_alias) = match &from_clause.source {
+        fsqlite_ast::TableOrSubquery::Table { name, alias, .. } => (&name.name, alias.as_deref()),
+        _ => {
+            b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
+            return;
+        }
+    };
+
+    let table = match find_table(schema, table_name) {
+        Ok(t) => t,
+        Err(_) => {
+            b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
+            return;
+        }
+    };
+
+    // Use cursor offset far from main scan cursors.
+    let sub_cursor = outer_ctx.cursor + 129;
+
+    let done_label = b.emit_label();
+
+    // Default: NULL (subquery returns no rows).
+    b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    b.emit_op(
+        Opcode::OpenRead,
+        sub_cursor,
+        table.root_page as i32,
+        0,
+        P4::Int(table.columns.len() as i32),
+        0,
+    );
+
+    let sub_ctx = ScanCtx {
+        cursor: sub_cursor,
+        table,
+        table_alias: sub_alias,
+        schema: Some(schema),
+    };
+
+    // Check if this is an aggregate query (e.g., SELECT MAX(x) FROM t).
+    let is_agg = has_aggregate_columns(columns);
+
+    if is_agg && group_by.is_empty() {
+        // Simple aggregate subquery without GROUP BY:
+        // e.g., (SELECT COUNT(*) FROM t), (SELECT MAX(x) FROM t WHERE ...)
+        emit_scalar_aggregate_subquery(
+            b,
+            columns,
+            &sub_ctx,
+            outer_ctx,
+            where_clause.as_deref(),
+            reg,
+            done_label,
+        );
+    } else {
+        // Non-aggregate scalar subquery: grab first row's first column value.
+        let rewind_addr = b.current_addr();
+        b.emit_jump_to_label(Opcode::Rewind, sub_cursor, 0, done_label, P4::None, 0);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let loop_body = (rewind_addr + 1) as i32;
+
+        // Apply WHERE filter.
+        let next_label = b.emit_label();
+        if let Some(where_expr) = where_clause {
+            let r_cond = b.alloc_temp();
+            emit_expr_with_fallback(b, where_expr, r_cond, &sub_ctx, Some(outer_ctx));
+            b.emit_jump_to_label(Opcode::IfNot, r_cond, 1, next_label, P4::None, 0);
+            b.free_temp(r_cond);
+        }
+
+        // Evaluate the first result column expression.
+        if let Some(ResultColumn::Expr { expr, .. }) = columns.first() {
+            emit_expr_with_fallback(b, expr, reg, &sub_ctx, Some(outer_ctx));
+        }
+
+        // Got our value — jump to done (only need one row).
+        b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+
+        b.resolve_label(next_label);
+        b.emit_op(Opcode::Next, sub_cursor, loop_body, 0, P4::None, 0);
+    }
+
+    b.resolve_label(done_label);
+    b.emit_op(Opcode::Close, sub_cursor, 0, 0, P4::None, 0);
+}
+
+/// Emit bytecode for a simple aggregate scalar subquery (no GROUP BY).
+///
+/// Handles `(SELECT COUNT(*) FROM t)`, `(SELECT MAX(x) FROM t WHERE ...)`, etc.
+fn emit_scalar_aggregate_subquery(
+    b: &mut ProgramBuilder,
+    columns: &[ResultColumn],
+    sub_ctx: &ScanCtx<'_>,
+    outer_ctx: &ScanCtx<'_>,
+    where_clause: Option<&Expr>,
+    reg: i32,
+    _done_label: crate::Label,
+) {
+    // Parse the aggregate columns.
+    let Ok(agg_cols) = parse_aggregate_columns(columns, sub_ctx.table) else {
+        return;
+    };
+
+    if agg_cols.is_empty() {
+        return;
+    }
+
+    let accum_reg = b.alloc_temp();
+    b.emit_op(Opcode::Null, 0, accum_reg, 0, P4::None, 0);
+
+    let finalize_label = b.emit_label();
+    let rewind_addr = b.current_addr();
+    b.emit_jump_to_label(
+        Opcode::Rewind,
+        sub_ctx.cursor,
+        0,
+        finalize_label,
+        P4::None,
+        0,
+    );
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let loop_body = (rewind_addr + 1) as i32;
+
+    // Apply WHERE filter.
+    let skip_label = b.emit_label();
+    if let Some(where_expr) = where_clause {
+        let r_cond = b.alloc_temp();
+        emit_expr_with_fallback(b, where_expr, r_cond, sub_ctx, Some(outer_ctx));
+        b.emit_jump_to_label(Opcode::IfNot, r_cond, 1, skip_label, P4::None, 0);
+        b.free_temp(r_cond);
+    }
+
+    // AggStep for each aggregate.
+    let agg = &agg_cols[0]; // scalar subquery uses first aggregate only
+    let total_args = agg.num_args.max(1);
+    let arg_base = b.alloc_regs(total_args);
+    if agg.num_args > 0 {
+        if agg.arg_is_rowid {
+            b.emit_op(Opcode::Rowid, sub_ctx.cursor, arg_base, 0, P4::None, 0);
+        } else if let Some(ref expr) = agg.arg_expr {
+            emit_expr_with_fallback(b, expr, arg_base, sub_ctx, Some(outer_ctx));
+        } else if let Some(col_idx) = agg.arg_col_index {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            b.emit_op(
+                Opcode::Column,
+                sub_ctx.cursor,
+                col_idx as i32,
+                arg_base,
+                P4::None,
+                0,
+            );
+        }
+        // Extra arguments (e.g. separator for group_concat).
+        for (j, extra_expr) in agg.extra_args.iter().enumerate() {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            let extra_reg = arg_base + 1 + j as i32;
+            emit_expr_with_fallback(b, extra_expr, extra_reg, sub_ctx, Some(outer_ctx));
+        }
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    let num_args = agg.num_args as u16;
+    let distinct_flag = i32::from(agg.distinct);
+    b.emit_op(
+        Opcode::AggStep,
+        distinct_flag,
+        arg_base,
+        accum_reg,
+        P4::FuncName(agg.name.clone()),
+        num_args,
+    );
+
+    b.resolve_label(skip_label);
+    b.emit_op(Opcode::Next, sub_ctx.cursor, loop_body, 0, P4::None, 0);
+
+    b.resolve_label(finalize_label);
+    b.emit_op(
+        Opcode::AggFinal,
+        accum_reg,
+        agg.num_args,
+        0,
+        P4::FuncName(agg.name.clone()),
+        0,
+    );
+    // Copy result to target register.
+    b.emit_op(Opcode::Copy, accum_reg, reg, 0, P4::None, 0);
+    b.free_temp(accum_reg);
+}
+
+/// Evaluate an expression with fallback context for correlated subqueries.
+///
+/// For column references, tries the inner (subquery) context first; if the
+/// column doesn't belong to the inner table, falls back to the outer context.
+/// For compound expressions, recurses so nested column refs get fallback logic.
+fn emit_expr_with_fallback(
+    b: &mut ProgramBuilder,
+    expr: &Expr,
+    reg: i32,
+    inner_ctx: &ScanCtx<'_>,
+    outer_ctx: Option<&ScanCtx<'_>>,
+) {
+    match expr {
+        Expr::Column(col_ref, _) => {
+            if resolve_column_in_ctx(col_ref, inner_ctx).is_some() {
+                emit_expr(b, expr, reg, Some(inner_ctx));
+            } else if let Some(outer) = outer_ctx {
+                emit_expr(b, expr, reg, Some(outer));
+            } else {
+                b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
+            }
+        }
+        Expr::BinaryOp {
+            left, op, right, ..
+        } => {
+            // Recursively resolve column refs in children, then apply the op.
+            let r_left = b.alloc_temp();
+            let r_right = b.alloc_temp();
+            emit_expr_with_fallback(b, left, r_left, inner_ctx, outer_ctx);
+            emit_expr_with_fallback(b, right, r_right, inner_ctx, outer_ctx);
+
+            if matches!(
+                op,
+                fsqlite_ast::BinaryOp::Eq
+                    | fsqlite_ast::BinaryOp::Ne
+                    | fsqlite_ast::BinaryOp::Lt
+                    | fsqlite_ast::BinaryOp::Le
+                    | fsqlite_ast::BinaryOp::Gt
+                    | fsqlite_ast::BinaryOp::Ge
+            ) {
+                let cmp_opcode = match op {
+                    fsqlite_ast::BinaryOp::Eq => Opcode::Eq,
+                    fsqlite_ast::BinaryOp::Ne => Opcode::Ne,
+                    fsqlite_ast::BinaryOp::Lt => Opcode::Lt,
+                    fsqlite_ast::BinaryOp::Le => Opcode::Le,
+                    fsqlite_ast::BinaryOp::Gt => Opcode::Gt,
+                    fsqlite_ast::BinaryOp::Ge => Opcode::Ge,
+                    _ => unreachable!(),
+                };
+                // Comparison: p1=rhs, p3=lhs, label→p2.
+                let true_label = b.emit_label();
+                let done_label = b.emit_label();
+                b.emit_jump_to_label(cmp_opcode, r_right, r_left, true_label, P4::None, 0);
+                b.emit_op(Opcode::Integer, 0, reg, 0, P4::None, 0);
+                b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+                b.resolve_label(true_label);
+                b.emit_op(Opcode::Integer, 1, reg, 0, P4::None, 0);
+                b.resolve_label(done_label);
+            } else if matches!(op, fsqlite_ast::BinaryOp::Is | fsqlite_ast::BinaryOp::IsNot) {
+                let (cmp_opcode, flag) = match op {
+                    fsqlite_ast::BinaryOp::Is => (Opcode::Eq, 0x80_u16),
+                    _ => (Opcode::Ne, 0x80_u16),
+                };
+                let true_label = b.emit_label();
+                let done_label = b.emit_label();
+                b.emit_jump_to_label(cmp_opcode, r_right, r_left, true_label, P4::None, flag);
+                b.emit_op(Opcode::Integer, 0, reg, 0, P4::None, 0);
+                b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+                b.resolve_label(true_label);
+                b.emit_op(Opcode::Integer, 1, reg, 0, P4::None, 0);
+                b.resolve_label(done_label);
+            } else {
+                // Arithmetic / logical / bitwise.
+                let vdbe_op = binary_op_to_opcode(*op);
+                b.emit_op(vdbe_op, r_left, r_right, reg, P4::None, 0);
+            }
+            b.free_temp(r_left);
+            b.free_temp(r_right);
+        }
+        Expr::UnaryOp {
+            op, expr: inner, ..
+        } => {
+            emit_expr_with_fallback(b, inner, reg, inner_ctx, outer_ctx);
+            match op {
+                fsqlite_ast::UnaryOp::Negate => {
+                    let tmp = b.alloc_temp();
+                    b.emit_op(Opcode::Integer, -1, tmp, 0, P4::None, 0);
+                    b.emit_op(Opcode::Multiply, tmp, reg, reg, P4::None, 0);
+                    b.free_temp(tmp);
+                }
+                fsqlite_ast::UnaryOp::Plus => {}
+                fsqlite_ast::UnaryOp::BitNot => {
+                    b.emit_op(Opcode::BitNot, reg, reg, 0, P4::None, 0);
+                }
+                fsqlite_ast::UnaryOp::Not => {
+                    b.emit_op(Opcode::Not, reg, reg, 0, P4::None, 0);
+                }
+            }
+        }
+        // For other expression types, use the inner context.
+        _ => {
+            emit_expr(b, expr, reg, Some(inner_ctx));
+        }
+    }
+}
+
+/// Check if a column reference resolves in a given scan context.
+fn resolve_column_in_ctx(col_ref: &ColumnRef, ctx: &ScanCtx<'_>) -> Option<usize> {
+    // Qualified: table.column
+    if let Some(ref table_name) = col_ref.table {
+        if table_name == &ctx.table.name || ctx.table_alias == Some(table_name.as_str()) {
+            return ctx
+                .table
+                .columns
+                .iter()
+                .position(|c| c.name == col_ref.column);
+        }
+        return None;
+    }
+    // Unqualified: just column name
+    ctx.table
+        .columns
+        .iter()
+        .position(|c| c.name == col_ref.column)
 }
 
 /// Map an AST `BinaryOp` to the corresponding VDBE opcode.
@@ -5586,6 +6588,15 @@ fn emit_binary_op(
     b.free_temp(tmp);
 }
 
+/// Extract collation name from a `COLLATE` wrapper, if present.
+fn extract_collation(expr: &Expr) -> Option<&str> {
+    if let Expr::Collate { collation, .. } = expr {
+        Some(collation.as_str())
+    } else {
+        None
+    }
+}
+
 /// Emit a comparison expression that produces 1 (true) or 0 (false).
 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 fn emit_comparison(
@@ -5617,12 +6628,17 @@ fn emit_comparison(
         return;
     };
 
+    // Check for COLLATE on either operand and propagate to comparison opcode.
+    let p4 = extract_collation(left)
+        .or_else(|| extract_collation(right))
+        .map_or(P4::None, |coll| P4::Collation(coll.to_owned()));
+
     // Pattern: assume false (0), jump to true_label if condition holds.
     let true_label = b.emit_label();
     let done_label = b.emit_label();
 
     // Comparison: p1=rhs_reg, p2=jump_target (label), p3=lhs_reg
-    b.emit_jump_to_label(cmp_opcode, r_right, r_left, true_label, P4::None, 0);
+    b.emit_jump_to_label(cmp_opcode, r_right, r_left, true_label, p4, 0);
     b.emit_op(Opcode::Integer, 0, reg, 0, P4::None, 0);
     b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
     b.resolve_label(true_label);
@@ -8733,6 +9749,82 @@ mod tests {
         assert!(
             if_not_count >= 1,
             "HAVING should generate at least one IfNot, got {if_not_count}"
+        );
+    }
+
+    // === Test: GROUP BY with FILTER clause emits IfNot ===
+    #[test]
+    fn test_codegen_select_group_by_filter_emits_ifnot() {
+        // SELECT a, count(*) FILTER (WHERE b > 0) FROM t GROUP BY a
+        let stmt = SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Select {
+                    distinct: Distinctness::All,
+                    columns: vec![
+                        ResultColumn::Expr {
+                            expr: Expr::Column(ColumnRef::bare("a"), Span::ZERO),
+                            alias: None,
+                        },
+                        ResultColumn::Expr {
+                            expr: Expr::FunctionCall {
+                                name: "count".to_owned(),
+                                args: FunctionArgs::Star,
+                                distinct: false,
+                                filter: Some(Box::new(Expr::BinaryOp {
+                                    left: Box::new(Expr::Column(ColumnRef::bare("b"), Span::ZERO)),
+                                    op: AstBinaryOp::Gt,
+                                    right: Box::new(Expr::Literal(Literal::Integer(0), Span::ZERO)),
+                                    span: Span::ZERO,
+                                })),
+                                over: None,
+                                span: Span::ZERO,
+                            },
+                            alias: None,
+                        },
+                    ],
+                    from: Some(from_table("t")),
+                    where_clause: None,
+                    group_by: vec![Expr::Column(ColumnRef::bare("a"), Span::ZERO)],
+                    having: None,
+                    windows: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        };
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        // There should be an IfNot opcode BEFORE AggStep (the FILTER check).
+        let agg_step_positions: Vec<usize> = prog
+            .ops()
+            .iter()
+            .enumerate()
+            .filter(|(_, op)| op.opcode == Opcode::AggStep)
+            .map(|(i, _)| i)
+            .collect();
+
+        // There should be at least one AggStep (in the sort iteration loop).
+        assert!(
+            !agg_step_positions.is_empty(),
+            "GROUP BY FILTER should have AggStep"
+        );
+
+        // There should be IfNot before AggStep (FILTER check).
+        let if_not_before_agg = prog.ops().iter().enumerate().any(|(i, op)| {
+            op.opcode == Opcode::IfNot
+                && agg_step_positions
+                    .iter()
+                    .any(|&as_pos| i < as_pos && as_pos - i <= 5)
+        });
+        assert!(
+            if_not_before_agg,
+            "GROUP BY FILTER should emit IfNot before AggStep"
         );
     }
 
