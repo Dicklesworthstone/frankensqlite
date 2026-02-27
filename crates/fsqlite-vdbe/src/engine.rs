@@ -6923,8 +6923,8 @@ mod tests {
     }
 
     #[test]
-    fn test_ifnot_null_jumps() {
-        // IfNot with NULL → jump (NULL is treated as false/zero)
+    fn test_ifnot_null_p3_zero_no_jump() {
+        // IfNot with NULL and p3=0 → no jump (SQLite: p3 controls NULL behavior)
         let rows = run_program(|b| {
             let end = b.emit_label();
             b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
@@ -6943,6 +6943,57 @@ mod tests {
             b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
             b.resolve_label(end);
         });
+        // p3=0: NULL → don't jump → r_out stays 0
+        assert_eq!(rows[0], vec![SqliteValue::Integer(0)]);
+    }
+
+    #[test]
+    fn test_ifnot_null_p3_one_jumps() {
+        // IfNot with NULL and p3=1 → jump (SQLite: p3!=0 means jump on NULL)
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r_cond = b.alloc_reg();
+            let r_out = b.alloc_reg();
+            b.emit_op(Opcode::Null, 0, r_cond, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 0, r_out, 0, P4::None, 0);
+            let taken = b.emit_label();
+            b.emit_jump_to_label(Opcode::IfNot, r_cond, 1, taken, P4::None, 0);
+            let done = b.emit_label();
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, done, P4::None, 0);
+            b.resolve_label(taken);
+            b.emit_op(Opcode::Integer, 1, r_out, 0, P4::None, 0);
+            b.resolve_label(done);
+            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        // p3=1: NULL → jump → r_out = 1
+        assert_eq!(rows[0], vec![SqliteValue::Integer(1)]);
+    }
+
+    #[test]
+    fn test_if_null_p3_one_jumps() {
+        // If with NULL and p3=1 → jump (SQLite: p3!=0 means jump on NULL)
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r_cond = b.alloc_reg();
+            let r_out = b.alloc_reg();
+            b.emit_op(Opcode::Null, 0, r_cond, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 0, r_out, 0, P4::None, 0);
+            let taken = b.emit_label();
+            b.emit_jump_to_label(Opcode::If, r_cond, 1, taken, P4::None, 0);
+            let done = b.emit_label();
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, done, P4::None, 0);
+            b.resolve_label(taken);
+            b.emit_op(Opcode::Integer, 1, r_out, 0, P4::None, 0);
+            b.resolve_label(done);
+            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        // p3=1: NULL → jump → r_out = 1
         assert_eq!(rows[0], vec![SqliteValue::Integer(1)]);
     }
 

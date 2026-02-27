@@ -11,7 +11,7 @@
       "crate": "fsqlite-mvcc",
       "filter": "test_chain_length_bounded_after_10000_updates_same_page",
       "status": "pass",
-      "elapsed_ms": 175394,
+      "elapsed_ms": 195378,
       "log_path": "artifacts/bd-2y306.2/mvcc_chain_bound_unit.log"
     },
     {
@@ -19,7 +19,7 @@
       "crate": "fsqlite-mvcc",
       "filter": "test_chain_backpressure_reports_blocked_when_horizon_pinned",
       "status": "pass",
-      "elapsed_ms": 90341,
+      "elapsed_ms": 85336,
       "log_path": "artifacts/bd-2y306.2/mvcc_chain_backpressure_unit.log"
     },
     {
@@ -27,7 +27,7 @@
       "crate": "fsqlite-e2e",
       "filter": "bd_2y306_2_chain_length_e2e_replay_emits_artifact",
       "status": "fail",
-      "elapsed_ms": 242053,
+      "elapsed_ms": 225429,
       "log_path": "artifacts/bd-2y306.2/e2e_chain_length_replay_artifact.log",
       "artifact_path": "artifacts/bd-2y306.2/chain_length_e2e_test_artifact.json"
     }

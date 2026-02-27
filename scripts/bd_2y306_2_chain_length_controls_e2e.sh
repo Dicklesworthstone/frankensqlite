@@ -83,12 +83,13 @@ run_e2e_test() {
   local start_ms end_ms elapsed_ms status
 
   start_ms="$(date +%s%3N)"
-  if RUN_ID="$RUN_ID" \
+  if "${RUNNER[@]}" env \
+    RUN_ID="$RUN_ID" \
     TRACE_ID="$TRACE_ID" \
     SCENARIO_ID="$SCENARIO_ID" \
     SEED="$SEED" \
     FSQLITE_CHAIN_LENGTH_E2E_ARTIFACT="$CHAIN_E2E_ARTIFACT" \
-    "${RUNNER[@]}" cargo test -p fsqlite-e2e --test bd_2y306_2_chain_length_controls "$TEST3_FILTER" -- --exact --nocapture --test-threads=1 >"$log_path" 2>&1; then
+    cargo test -p fsqlite-e2e --test bd_2y306_2_chain_length_controls "$TEST3_FILTER" -- --exact --nocapture --test-threads=1 >"$log_path" 2>&1; then
     status="pass"
   else
     status="fail"
