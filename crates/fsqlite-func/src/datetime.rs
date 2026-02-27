@@ -324,10 +324,10 @@ fn apply_modifier(jdn: f64, modifier: &str) -> Option<f64> {
         let current_jdn_int = (jdn + 0.5).floor() as i64;
         let current_wd = (current_jdn_int + 1) % 7; // 0=Sunday
         let mut diff = wd - current_wd;
-        if diff <= 0 {
+        if diff < 0 {
             diff += 7;
         }
-        // If already the target weekday, advance 7 days (SQLite behavior).
+        // If already the target weekday, this is a no-op (SQLite behavior).
         return Some(jdn + diff as f64);
     }
 
@@ -591,26 +591,28 @@ fn timediff_impl(jdn1: f64, jdn2: f64) -> String {
     };
 
     let (start_y, start_mo, start_d) = jdn_to_ymd(start_jdn);
-    let (start_h, start_mi, start_s, start_frac) = jdn_to_hms(start_jdn);
+    let (start_h, start_mi, mut start_s, start_frac) = jdn_to_hms(start_jdn);
     let mut start_ms = (start_frac * 1000.0).round() as i64;
     if start_ms >= 1000 {
-        start_ms = 999;
+        start_ms = 0;
+        start_s += 1;
     }
 
     let (end_y, end_mo, end_d) = jdn_to_ymd(end_jdn);
-    let (end_h, end_mi, end_s, end_frac) = jdn_to_hms(end_jdn);
+    let (end_h, end_mi, mut end_s, end_frac) = jdn_to_hms(end_jdn);
     let mut end_ms = (end_frac * 1000.0).round() as i64;
     if end_ms >= 1000 {
-        end_ms = 999;
+        end_ms = 0;
+        end_s += 1;
     }
 
-    let mut years = end_y.saturating_sub(start_y);
-    let mut months = end_mo.saturating_sub(start_mo);
-    let mut days = end_d.saturating_sub(start_d);
-    let mut hours = end_h.saturating_sub(start_h);
-    let mut minutes = end_mi.saturating_sub(start_mi);
-    let mut seconds = end_s.saturating_sub(start_s);
-    let mut millis = end_ms.saturating_sub(start_ms);
+    let mut years = end_y - start_y;
+    let mut months = end_mo - start_mo;
+    let mut days = end_d - start_d;
+    let mut hours = end_h - start_h;
+    let mut minutes = end_mi - start_mi;
+    let mut seconds = end_s - start_s;
+    let mut millis = end_ms - start_ms;
 
     if millis < 0 {
         millis += 1000;
@@ -1059,12 +1061,12 @@ mod tests {
     }
 
     #[test]
-    fn test_modifier_weekday_same_day_advances_next_week() {
-        // 2024-03-17 is Sunday; SQLite semantics advance to the NEXT Sunday.
+    fn test_modifier_weekday_same_day_is_noop() {
+        // 2024-03-17 is Sunday; SQLite semantics: already on target weekday, no-op.
         let r = DateFunc
             .invoke(&[text("2024-03-17"), text("weekday 0")])
             .unwrap();
-        assert_text(&r, "2024-03-24");
+        assert_text(&r, "2024-03-17");
     }
 
     // ── Input formats ─────────────────────────────────────────────────

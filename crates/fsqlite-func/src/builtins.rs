@@ -39,6 +39,7 @@ use crate::{FunctionRegistry, ScalarFunction};
 thread_local! {
     static LAST_INSERT_ROWID: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
     static LAST_CHANGES: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
+    static TOTAL_CHANGES: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
 }
 
 /// Set the last insert rowid (called by Connection after INSERT).
@@ -52,13 +53,26 @@ pub fn get_last_insert_rowid() -> i64 {
 }
 
 /// Set the last changes count (called by Connection after DML).
+///
+/// Also accumulates into the cumulative `total_changes` counter.
 pub fn set_last_changes(count: i64) {
     LAST_CHANGES.set(count);
+    TOTAL_CHANGES.set(TOTAL_CHANGES.get().saturating_add(count));
 }
 
 /// Get the current last changes count.
 pub fn get_last_changes() -> i64 {
     LAST_CHANGES.get()
+}
+
+/// Get the cumulative total changes since the connection was opened.
+pub fn get_total_changes() -> i64 {
+    TOTAL_CHANGES.get()
+}
+
+/// Reset the cumulative total changes counter (called on new connection open).
+pub fn reset_total_changes() {
+    TOTAL_CHANGES.set(0);
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────
@@ -1660,7 +1674,7 @@ pub struct TotalChangesFunc;
 
 impl ScalarFunction for TotalChangesFunc {
     fn invoke(&self, _args: &[SqliteValue]) -> Result<SqliteValue> {
-        Ok(SqliteValue::Integer(LAST_CHANGES.get()))
+        Ok(SqliteValue::Integer(TOTAL_CHANGES.get()))
     }
 
     fn is_deterministic(&self) -> bool {
@@ -2041,7 +2055,7 @@ fn format_integer(
     } else {
         String::new()
     };
-    let digits = format!("{}", val.abs());
+    let digits = format!("{}", val.unsigned_abs());
     let body = format!("{sign}{digits}");
     if body.len() >= width {
         return body;
