@@ -48,7 +48,11 @@ use fsqlite_vdbe::codegen::{
     CodegenContext, CodegenError, ColumnInfo, IndexSchema, TableSchema, codegen_delete,
     codegen_insert, codegen_select, codegen_update,
 };
-use fsqlite_vdbe::engine::{ExecOutcome, MemDatabase, MemDbVersionToken, VdbeEngine};
+use fsqlite_vdbe::engine::{
+    ExecOutcome, MemDatabase, MemDbVersionToken, VdbeEngine, reset_vdbe_jit_metrics,
+    set_vdbe_jit_cache_capacity, set_vdbe_jit_enabled, set_vdbe_jit_hot_threshold,
+    vdbe_jit_cache_capacity, vdbe_jit_enabled, vdbe_jit_hot_threshold, vdbe_jit_metrics_snapshot,
+};
 use fsqlite_vdbe::{ProgramBuilder, VdbeProgram};
 use fsqlite_vfs::MemoryVfs;
 #[cfg(unix)]
@@ -6405,6 +6409,15 @@ impl Connection {
     /// - `PRAGMA fsqlite.parity_cert_strict = ON|OFF|TRUE|FALSE|1|0`
     ///   When ON, interpreted in-memory fallback dispatches hard-fail while
     ///   parity-cert mode is enabled. This is intended for certifying runs.
+    /// - `PRAGMA fsqlite.jit_enable = ON|OFF|TRUE|FALSE|1|0`
+    ///   Enables/disables hot-query JIT triggering (interpreter remains
+    ///   authoritative in the current scaffold implementation).
+    /// - `PRAGMA fsqlite.jit_hot_threshold = N`
+    ///   Number of executions before a statement becomes JIT-hot.
+    /// - `PRAGMA fsqlite.jit_cache_capacity = N`
+    ///   Maximum number of cached JIT plan stubs (LRU eviction).
+    /// - `PRAGMA fsqlite.jit_stats` / `PRAGMA fsqlite.jit_reset`
+    ///   Inspect/reset JIT scaffold metrics and cache state.
     #[allow(clippy::too_many_lines)]
     fn execute_pragma(&self, pragma: &fsqlite_ast::PragmaStatement) -> Result<Vec<Row>> {
         // First try connection-level knobs (journal_mode, synchronous, etc.).
@@ -6558,6 +6571,120 @@ impl Connection {
                         values: vec![SqliteValue::Integer(i64::from(enabled))],
                     }])
                 }
+            }
+            "fsqlite.jit_enable" | "jit_enable" | "fsqlite_jit_enable" => {
+                if let Some(ref val) = pragma.value {
+                    let enabled = parse_pragma_bool(val)?;
+                    set_vdbe_jit_enabled(enabled);
+                    Ok(vec![Row {
+                        values: vec![SqliteValue::Integer(i64::from(enabled))],
+                    }])
+                } else {
+                    let enabled = vdbe_jit_enabled();
+                    Ok(vec![Row {
+                        values: vec![SqliteValue::Integer(i64::from(enabled))],
+                    }])
+                }
+            }
+            "fsqlite.jit_hot_threshold" | "jit_hot_threshold" | "fsqlite_jit_hot_threshold" => {
+                let threshold = if let Some(ref value) = pragma.value {
+                    let parsed = parse_pragma_nonnegative_usize(value, "jit_hot_threshold")?;
+                    let parsed_u64 = u64::try_from(parsed).unwrap_or(u64::MAX);
+                    set_vdbe_jit_hot_threshold(parsed_u64)
+                } else {
+                    vdbe_jit_hot_threshold()
+                };
+                Ok(vec![Row {
+                    values: vec![SqliteValue::Integer(
+                        i64::try_from(threshold).unwrap_or(i64::MAX),
+                    )],
+                }])
+            }
+            "fsqlite.jit_cache_capacity" | "jit_cache_capacity" | "fsqlite_jit_cache_capacity" => {
+                let capacity = if let Some(ref value) = pragma.value {
+                    let parsed = parse_pragma_nonnegative_usize(value, "jit_cache_capacity")?;
+                    set_vdbe_jit_cache_capacity(parsed)
+                } else {
+                    vdbe_jit_cache_capacity()
+                };
+                Ok(vec![Row {
+                    values: vec![SqliteValue::Integer(
+                        i64::try_from(capacity).unwrap_or(i64::MAX),
+                    )],
+                }])
+            }
+            "fsqlite.jit_stats" | "jit_stats" | "fsqlite_jit_stats" => {
+                let to_i64_u64 = |value: u64| i64::try_from(value).unwrap_or(i64::MAX);
+                let to_i64_usize = |value: usize| i64::try_from(value).unwrap_or(i64::MAX);
+                let snapshot = vdbe_jit_metrics_snapshot();
+                Ok(vec![
+                    Row {
+                        values: vec![
+                            SqliteValue::Text("enabled".into()),
+                            SqliteValue::Integer(i64::from(snapshot.enabled)),
+                        ],
+                    },
+                    Row {
+                        values: vec![
+                            SqliteValue::Text("hot_threshold".into()),
+                            SqliteValue::Integer(to_i64_u64(snapshot.hot_threshold)),
+                        ],
+                    },
+                    Row {
+                        values: vec![
+                            SqliteValue::Text("cache_capacity".into()),
+                            SqliteValue::Integer(to_i64_usize(snapshot.cache_capacity)),
+                        ],
+                    },
+                    Row {
+                        values: vec![
+                            SqliteValue::Text("cache_entries".into()),
+                            SqliteValue::Integer(to_i64_usize(snapshot.cache_entries)),
+                        ],
+                    },
+                    Row {
+                        values: vec![
+                            SqliteValue::Text("fsqlite_jit_compilations_total".into()),
+                            SqliteValue::Integer(to_i64_u64(snapshot.jit_compilations_total)),
+                        ],
+                    },
+                    Row {
+                        values: vec![
+                            SqliteValue::Text("fsqlite_jit_compile_failures_total".into()),
+                            SqliteValue::Integer(to_i64_u64(snapshot.jit_compile_failures_total)),
+                        ],
+                    },
+                    Row {
+                        values: vec![
+                            SqliteValue::Text("fsqlite_jit_triggers_total".into()),
+                            SqliteValue::Integer(to_i64_u64(snapshot.jit_triggers_total)),
+                        ],
+                    },
+                    Row {
+                        values: vec![
+                            SqliteValue::Text("fsqlite_jit_cache_hits_total".into()),
+                            SqliteValue::Integer(to_i64_u64(snapshot.jit_cache_hits_total)),
+                        ],
+                    },
+                    Row {
+                        values: vec![
+                            SqliteValue::Text("fsqlite_jit_cache_misses_total".into()),
+                            SqliteValue::Integer(to_i64_u64(snapshot.jit_cache_misses_total)),
+                        ],
+                    },
+                    Row {
+                        values: vec![
+                            SqliteValue::Text("fsqlite_jit_cache_hit_ratio".into()),
+                            SqliteValue::Integer(to_i64_u64(snapshot.jit_cache_hit_ratio_percent)),
+                        ],
+                    },
+                ])
+            }
+            "fsqlite.jit_reset" | "jit_reset" | "fsqlite_jit_reset" => {
+                reset_vdbe_jit_metrics();
+                Ok(vec![Row {
+                    values: vec![SqliteValue::Text("ok".into())],
+                }])
             }
             // ── MVCC conflict observability PRAGMAs (bd-t6sv2.1) ──────────
             "fsqlite.conflict_stats" | "conflict_stats" => {
@@ -8017,12 +8144,14 @@ impl Connection {
                     dedup_rows(&mut result);
                 }
                 CompoundOp::Intersect => {
-                    // Keep only rows present in both result and arm_rows.
+                    // Keep only distinct rows present in both result and arm_rows.
                     result.retain(|row| arm_rows.iter().any(|ar| ar.values() == row.values()));
+                    dedup_rows(&mut result);
                 }
                 CompoundOp::Except => {
-                    // Remove rows from result that appear in arm_rows.
+                    // Remove rows from result that appear in arm_rows, then deduplicate.
                     result.retain(|row| !arm_rows.iter().any(|ar| ar.values() == row.values()));
+                    dedup_rows(&mut result);
                 }
             }
         }
@@ -8565,7 +8694,37 @@ impl Connection {
 
         // ── 7. Post-process: ORDER BY ──
         if !select.order_by.is_empty() {
-            sort_rows_by_order_terms(&mut result, &select.order_by, columns)?;
+            // Expand Star / TableStar into explicit column references so that
+            // sort_rows_by_order_terms can resolve integer positions and column
+            // name lookups against the actual projected columns.
+            let expanded_columns: Vec<ResultColumn> = columns
+                .iter()
+                .flat_map(|col| match col {
+                    ResultColumn::Star => col_map
+                        .iter()
+                        .map(|(tbl, c)| ResultColumn::Expr {
+                            expr: Expr::Column(
+                                ColumnRef::qualified(tbl.clone(), c.clone()),
+                                Span::new(0, 0),
+                            ),
+                            alias: None,
+                        })
+                        .collect::<Vec<_>>(),
+                    ResultColumn::TableStar(tbl_name) => col_map
+                        .iter()
+                        .filter(|(t, _)| t.eq_ignore_ascii_case(tbl_name))
+                        .map(|(t, c)| ResultColumn::Expr {
+                            expr: Expr::Column(
+                                ColumnRef::qualified(t.clone(), c.clone()),
+                                Span::new(0, 0),
+                            ),
+                            alias: None,
+                        })
+                        .collect::<Vec<_>>(),
+                    other @ ResultColumn::Expr { .. } => vec![other.clone()],
+                })
+                .collect();
+            sort_rows_by_order_terms(&mut result, &select.order_by, &expanded_columns)?;
         }
 
         // ── 8. Post-process: LIMIT / OFFSET ──
@@ -12080,7 +12239,7 @@ fn compile_expression_select(select: &SelectStatement) -> Result<VdbeProgram> {
                 builder.emit_jump_to_label(
                     Opcode::IfNot,
                     predicate_reg,
-                    0,
+                    1,
                     skip_label,
                     P4::None,
                     0,
@@ -13911,7 +14070,9 @@ fn eval_join_expr(
             Ok(apply_cast(val, &type_name.name))
         }
         Expr::Collate { expr: inner, .. } => eval_join_expr(inner, row, col_map),
-        _ => Ok(SqliteValue::Null),
+        other => Err(FrankenError::NotImplemented(format!(
+            "eval_join_expr: unsupported expression type: {other:?}"
+        ))),
     }
 }
 
@@ -16620,6 +16781,46 @@ mod tests {
     }
 
     #[test]
+    fn test_order_by_with_star_join() {
+        // Regression: SELECT * FROM … JOIN … ORDER BY <col> must expand Star
+        // before resolving ORDER BY column positions/names.
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE items (id INTEGER, name TEXT, price INTEGER);")
+            .unwrap();
+        conn.execute("CREATE TABLE tags (item_id INTEGER, tag TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO items VALUES (1, 'banana', 2);")
+            .unwrap();
+        conn.execute("INSERT INTO items VALUES (2, 'apple', 3);")
+            .unwrap();
+        conn.execute("INSERT INTO items VALUES (3, 'cherry', 1);")
+            .unwrap();
+        conn.execute("INSERT INTO tags VALUES (1, 'fruit');")
+            .unwrap();
+        conn.execute("INSERT INTO tags VALUES (2, 'fruit');")
+            .unwrap();
+        conn.execute("INSERT INTO tags VALUES (3, 'fruit');")
+            .unwrap();
+        // ORDER BY position 3 (price) with Star — previously broken because
+        // Star made columns.len() == 1, failing for positions > 1.
+        let rows = conn
+            .query("SELECT * FROM items JOIN tags ON items.id = tags.item_id ORDER BY 3;")
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        // price column is index 2 (third column): cherry=1, banana=2, apple=3
+        assert_eq!(row_values(&rows[0])[2], SqliteValue::Integer(1));
+        assert_eq!(row_values(&rows[1])[2], SqliteValue::Integer(2));
+        assert_eq!(row_values(&rows[2])[2], SqliteValue::Integer(3));
+        // Also verify column name ORDER BY with Star.
+        let rows2 = conn
+            .query("SELECT * FROM items JOIN tags ON items.id = tags.item_id ORDER BY price DESC;")
+            .unwrap();
+        assert_eq!(rows2.len(), 3);
+        assert_eq!(row_values(&rows2[0])[2], SqliteValue::Integer(3));
+        assert_eq!(row_values(&rows2[2])[2], SqliteValue::Integer(1));
+    }
+
+    #[test]
     fn test_order_by_position_desc_group_by() {
         // Uses GROUP BY to exercise sort_rows_by_order_terms with position refs.
         let conn = Connection::open(":memory:").unwrap();
@@ -18160,6 +18361,44 @@ mod tests {
             .collect();
         vals.sort_unstable();
         assert_eq!(vals, vec![1, 3]);
+    }
+
+    #[test]
+    fn test_compound_intersect_deduplicates() {
+        // Per SQL standard and SQLite: INTERSECT returns DISTINCT rows.
+        // If the left arm has duplicate rows that also appear in the right,
+        // the result must contain each matching row only once.
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn
+            .query("SELECT 1 UNION ALL SELECT 1 UNION ALL SELECT 1 INTERSECT SELECT 1;")
+            .unwrap();
+        // SQLite evaluates left-to-right: (SELECT 1 UNION ALL SELECT 1 UNION ALL SELECT 1) INTERSECT (SELECT 1)
+        // Left has [1, 1, 1], right has [1]. INTERSECT → distinct intersection → [1].
+        assert_eq!(
+            rows.len(),
+            1,
+            "INTERSECT must deduplicate: [1,1,1] INTERSECT [1] → [1]"
+        );
+    }
+
+    #[test]
+    fn test_compound_except_deduplicates() {
+        // Per SQL standard and SQLite: EXCEPT returns DISTINCT rows from the left
+        // that do not appear in the right.
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (v INTEGER);").unwrap();
+        conn.execute("INSERT INTO t VALUES (1);").unwrap();
+        conn.execute("INSERT INTO t VALUES (1);").unwrap();
+        conn.execute("INSERT INTO t VALUES (1);").unwrap();
+        conn.execute("INSERT INTO t VALUES (2);").unwrap();
+        // Left: [1,1,1,2], Right: [2]. EXCEPT → distinct(left) minus right → [1].
+        let rows = conn.query("SELECT v FROM t EXCEPT SELECT 2;").unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "EXCEPT must deduplicate: [1,1,1,2] EXCEPT [2] → [1]"
+        );
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
     }
 
     #[test]
@@ -25101,6 +25340,83 @@ mod schema_loading_tests {
         assert_eq!(after_reset.get("unix_fallbacks_total"), Some(&0));
         assert_eq!(after_reset.get("read_tail_violations_total"), Some(&0));
         assert_eq!(after_reset.get("write_tail_violations_total"), Some(&0));
+    }
+
+    #[test]
+    fn test_pragma_jit_controls_stats_and_reset() {
+        let conn = Connection::open(":memory:").unwrap();
+        let prev_enabled = vdbe_jit_enabled();
+        let prev_threshold = vdbe_jit_hot_threshold();
+        let prev_capacity = vdbe_jit_cache_capacity();
+
+        reset_vdbe_jit_metrics();
+        conn.execute("PRAGMA fsqlite.jit_enable = OFF;").unwrap();
+        let rows = conn.query("PRAGMA jit_enable;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Integer(0));
+
+        conn.execute("PRAGMA jit_enable = ON;").unwrap();
+        let rows = conn.query("PRAGMA fsqlite.jit_enable;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Integer(1));
+
+        conn.execute("PRAGMA fsqlite.jit_hot_threshold = 0;")
+            .unwrap();
+        let threshold_rows = conn.query("PRAGMA jit_hot_threshold;").unwrap();
+        assert_eq!(threshold_rows.len(), 1);
+        assert_eq!(*threshold_rows[0].get(0).unwrap(), SqliteValue::Integer(1));
+
+        conn.execute("PRAGMA fsqlite.jit_cache_capacity = 2;")
+            .unwrap();
+        let capacity_rows = conn.query("PRAGMA fsqlite_jit_cache_capacity;").unwrap();
+        assert_eq!(capacity_rows.len(), 1);
+        assert_eq!(*capacity_rows[0].get(0).unwrap(), SqliteValue::Integer(2));
+
+        for _ in 0..3 {
+            let rows = conn.query("SELECT 42;").unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Integer(42));
+        }
+
+        let stats = txn_metrics_map(&conn.query("PRAGMA fsqlite.jit_stats;").unwrap());
+        assert_eq!(stats.get("enabled"), Some(&1));
+        assert_eq!(stats.get("hot_threshold"), Some(&1));
+        assert_eq!(stats.get("cache_capacity"), Some(&2));
+        assert!(
+            stats
+                .get("fsqlite_jit_compilations_total")
+                .copied()
+                .unwrap_or_default()
+                >= 1
+        );
+        assert!(
+            stats
+                .get("fsqlite_jit_cache_hit_ratio")
+                .copied()
+                .unwrap_or_default()
+                >= 0
+        );
+
+        let reset_rows = conn.query("PRAGMA jit_reset;").unwrap();
+        assert_eq!(reset_rows.len(), 1);
+        assert_eq!(
+            *reset_rows[0].get(0).unwrap(),
+            SqliteValue::Text("ok".to_owned())
+        );
+        let after_reset = txn_metrics_map(&conn.query("PRAGMA jit_stats;").unwrap());
+        assert_eq!(after_reset.get("cache_entries"), Some(&0));
+        assert_eq!(after_reset.get("fsqlite_jit_compilations_total"), Some(&0));
+        assert_eq!(
+            after_reset.get("fsqlite_jit_compile_failures_total"),
+            Some(&0)
+        );
+        assert_eq!(after_reset.get("fsqlite_jit_triggers_total"), Some(&0));
+        assert_eq!(after_reset.get("fsqlite_jit_cache_hits_total"), Some(&0));
+        assert_eq!(after_reset.get("fsqlite_jit_cache_misses_total"), Some(&0));
+
+        set_vdbe_jit_enabled(prev_enabled);
+        let _ = set_vdbe_jit_hot_threshold(prev_threshold);
+        let _ = set_vdbe_jit_cache_capacity(prev_capacity);
     }
 
     #[test]

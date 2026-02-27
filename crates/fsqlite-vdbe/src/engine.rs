@@ -12,7 +12,7 @@
 use std::any::Any;
 use std::cell::RefCell;
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use fsqlite_btree::swiss_index::SwissIndex;
 use std::rc::Rc;
@@ -1255,6 +1255,213 @@ static FSQLITE_VDBE_STATEMENT_DURATION_US_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// Monotonic program ID counter for tracing correlation.
 static VDBE_PROGRAM_ID_SEQ: AtomicU64 = AtomicU64::new(1);
 
+// ── JIT scaffolding metrics/state (bd-1rw.3) ───────────────────────────────
+
+/// Total number of JIT compilation attempts that succeeded.
+static FSQLITE_JIT_COMPILATIONS_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Total number of JIT compilation attempts that failed and fell back.
+static FSQLITE_JIT_COMPILE_FAILURES_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Total number of hot-query trigger events.
+static FSQLITE_JIT_TRIGGERS_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Total number of JIT code cache hits.
+static FSQLITE_JIT_CACHE_HITS_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Total number of JIT code cache misses.
+static FSQLITE_JIT_CACHE_MISSES_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Global JIT enable flag.
+static FSQLITE_JIT_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+/// Hot-query threshold (`N` executions before JIT trigger).
+static FSQLITE_JIT_HOT_THRESHOLD: AtomicU64 = AtomicU64::new(8);
+/// Maximum cached JIT plan stubs.
+static FSQLITE_JIT_CACHE_CAPACITY: AtomicU64 = AtomicU64::new(128);
+
+/// In-memory JIT code-cache entry (scaffold).
+#[derive(Debug, Clone, Copy)]
+struct JitCacheEntry {
+    code_size_bytes: u64,
+}
+
+#[derive(Debug, Default)]
+struct JitRuntimeState {
+    executions_by_plan: HashMap<u64, u64>,
+    cache: HashMap<u64, JitCacheEntry>,
+    lru: VecDeque<u64>,
+}
+
+impl JitRuntimeState {
+    fn touch_lru(&mut self, plan_hash: u64) {
+        self.lru.retain(|candidate| *candidate != plan_hash);
+        self.lru.push_back(plan_hash);
+    }
+
+    fn insert_cache(
+        &mut self,
+        plan_hash: u64,
+        entry: JitCacheEntry,
+        cache_capacity: usize,
+    ) -> Option<u64> {
+        if cache_capacity == 0 {
+            return None;
+        }
+        let mut evicted = None;
+        if let std::collections::hash_map::Entry::Occupied(mut occupied) =
+            self.cache.entry(plan_hash)
+        {
+            occupied.insert(entry);
+            self.touch_lru(plan_hash);
+            return None;
+        }
+        if self.cache.len() >= cache_capacity
+            && let Some(oldest) = self.lru.pop_front()
+        {
+            self.cache.remove(&oldest);
+            evicted = Some(oldest);
+        }
+        self.cache.insert(plan_hash, entry);
+        self.touch_lru(plan_hash);
+        evicted
+    }
+
+    fn apply_capacity(&mut self, cache_capacity: usize) {
+        if cache_capacity == 0 {
+            self.cache.clear();
+            self.lru.clear();
+            return;
+        }
+        while self.cache.len() > cache_capacity {
+            if let Some(oldest) = self.lru.pop_front() {
+                self.cache.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+    }
+}
+
+static VDBE_JIT_RUNTIME: std::sync::OnceLock<Mutex<JitRuntimeState>> = std::sync::OnceLock::new();
+
+fn jit_runtime() -> &'static Mutex<JitRuntimeState> {
+    VDBE_JIT_RUNTIME.get_or_init(|| Mutex::new(JitRuntimeState::default()))
+}
+
+fn lock_jit_runtime() -> std::sync::MutexGuard<'static, JitRuntimeState> {
+    jit_runtime()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Snapshot of JIT scaffold metrics/configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VdbeJitMetricsSnapshot {
+    /// Whether JIT triggering is enabled.
+    pub enabled: bool,
+    /// Hot-query threshold (`N` executions before a JIT trigger).
+    pub hot_threshold: u64,
+    /// Maximum number of cached JIT plan stubs.
+    pub cache_capacity: usize,
+    /// Current number of cached JIT plan stubs.
+    pub cache_entries: usize,
+    /// Total successful compilation attempts.
+    pub jit_compilations_total: u64,
+    /// Total failed compilation attempts.
+    pub jit_compile_failures_total: u64,
+    /// Total hot-query trigger events.
+    pub jit_triggers_total: u64,
+    /// Total cache hits.
+    pub jit_cache_hits_total: u64,
+    /// Total cache misses.
+    pub jit_cache_misses_total: u64,
+    /// Integer cache hit ratio (percent).
+    pub jit_cache_hit_ratio_percent: u64,
+}
+
+/// Read a point-in-time snapshot of JIT scaffold metrics/configuration.
+#[must_use]
+pub fn vdbe_jit_metrics_snapshot() -> VdbeJitMetricsSnapshot {
+    let runtime = lock_jit_runtime();
+    let hits = FSQLITE_JIT_CACHE_HITS_TOTAL.load(AtomicOrdering::Relaxed);
+    let misses = FSQLITE_JIT_CACHE_MISSES_TOTAL.load(AtomicOrdering::Relaxed);
+    let denom = hits.saturating_add(misses);
+    let ratio_percent = if denom == 0 {
+        0
+    } else {
+        hits.saturating_mul(100).saturating_add(denom / 2) / denom
+    };
+    VdbeJitMetricsSnapshot {
+        enabled: FSQLITE_JIT_ENABLED.load(AtomicOrdering::Relaxed),
+        hot_threshold: FSQLITE_JIT_HOT_THRESHOLD.load(AtomicOrdering::Relaxed),
+        cache_capacity: usize::try_from(FSQLITE_JIT_CACHE_CAPACITY.load(AtomicOrdering::Relaxed))
+            .unwrap_or(usize::MAX),
+        cache_entries: runtime.cache.len(),
+        jit_compilations_total: FSQLITE_JIT_COMPILATIONS_TOTAL.load(AtomicOrdering::Relaxed),
+        jit_compile_failures_total: FSQLITE_JIT_COMPILE_FAILURES_TOTAL
+            .load(AtomicOrdering::Relaxed),
+        jit_triggers_total: FSQLITE_JIT_TRIGGERS_TOTAL.load(AtomicOrdering::Relaxed),
+        jit_cache_hits_total: hits,
+        jit_cache_misses_total: misses,
+        jit_cache_hit_ratio_percent: ratio_percent,
+    }
+}
+
+/// Enable/disable JIT triggering.
+pub fn set_vdbe_jit_enabled(enabled: bool) {
+    FSQLITE_JIT_ENABLED.store(enabled, AtomicOrdering::Relaxed);
+}
+
+/// Current JIT trigger enable flag.
+#[must_use]
+pub fn vdbe_jit_enabled() -> bool {
+    FSQLITE_JIT_ENABLED.load(AtomicOrdering::Relaxed)
+}
+
+/// Set hot-query threshold (`N` executions before a JIT trigger).
+///
+/// Values below 1 are clamped to 1.
+#[must_use]
+pub fn set_vdbe_jit_hot_threshold(threshold: u64) -> u64 {
+    let clamped = threshold.max(1);
+    FSQLITE_JIT_HOT_THRESHOLD.store(clamped, AtomicOrdering::Relaxed);
+    clamped
+}
+
+/// Current hot-query threshold.
+#[must_use]
+pub fn vdbe_jit_hot_threshold() -> u64 {
+    FSQLITE_JIT_HOT_THRESHOLD.load(AtomicOrdering::Relaxed)
+}
+
+/// Set JIT code cache capacity (number of plans).
+///
+/// Shrinks current cache immediately if needed.
+#[must_use]
+pub fn set_vdbe_jit_cache_capacity(capacity: usize) -> usize {
+    let value_u64 = u64::try_from(capacity).unwrap_or(u64::MAX);
+    FSQLITE_JIT_CACHE_CAPACITY.store(value_u64, AtomicOrdering::Relaxed);
+    let mut runtime = lock_jit_runtime();
+    runtime.apply_capacity(capacity);
+    capacity
+}
+
+/// Current JIT code-cache capacity.
+#[must_use]
+pub fn vdbe_jit_cache_capacity() -> usize {
+    usize::try_from(FSQLITE_JIT_CACHE_CAPACITY.load(AtomicOrdering::Relaxed)).unwrap_or(usize::MAX)
+}
+
+/// Reset JIT scaffold metrics and in-memory state.
+pub fn reset_vdbe_jit_metrics() {
+    FSQLITE_JIT_COMPILATIONS_TOTAL.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_JIT_COMPILE_FAILURES_TOTAL.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_JIT_TRIGGERS_TOTAL.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_JIT_CACHE_HITS_TOTAL.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_JIT_CACHE_MISSES_TOTAL.store(0, AtomicOrdering::Relaxed);
+    let mut runtime = lock_jit_runtime();
+    runtime.executions_by_plan.clear();
+    runtime.cache.clear();
+    runtime.lru.clear();
+}
+
 // ── Sort metrics (bd-1rw.4) ─────────────────────────────────────────────────
 
 /// Total rows sorted across all sorter invocations.
@@ -1297,6 +1504,169 @@ pub fn reset_vdbe_metrics() {
     FSQLITE_VDBE_STATEMENT_DURATION_US_TOTAL.store(0, AtomicOrdering::Relaxed);
     FSQLITE_SORT_ROWS_TOTAL.store(0, AtomicOrdering::Relaxed);
     FSQLITE_SORT_SPILL_PAGES_TOTAL.store(0, AtomicOrdering::Relaxed);
+    reset_vdbe_jit_metrics();
+}
+
+#[derive(Debug, Clone, Copy)]
+enum JitDecision {
+    Disabled,
+    Warming {
+        plan_hash: u64,
+        execution_count: u64,
+    },
+    CacheHit {
+        plan_hash: u64,
+        code_size_bytes: u64,
+    },
+    Compiled {
+        plan_hash: u64,
+        compile_time_us: u64,
+        code_size_bytes: u64,
+        evicted_plan_hash: Option<u64>,
+    },
+    CompileFailed {
+        plan_hash: u64,
+        compile_time_us: u64,
+        reason: &'static str,
+    },
+}
+
+fn hash_program(program: &VdbeProgram) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+
+    fn mix(hash: &mut u64, bytes: &[u8]) {
+        for byte in bytes {
+            *hash ^= u64::from(*byte);
+            *hash = hash.wrapping_mul(FNV_PRIME);
+        }
+    }
+
+    let mut hash = FNV_OFFSET;
+    mix(&mut hash, &program.register_count().to_le_bytes());
+    for op in program.ops() {
+        mix(&mut hash, &[op.opcode as u8]);
+        mix(&mut hash, &op.p1.to_le_bytes());
+        mix(&mut hash, &op.p2.to_le_bytes());
+        mix(&mut hash, &op.p3.to_le_bytes());
+        mix(&mut hash, &op.p5.to_le_bytes());
+    }
+    hash
+}
+
+fn jit_scaffold_supports_opcode(opcode: Opcode) -> bool {
+    !matches!(
+        opcode,
+        Opcode::OpenRead
+            | Opcode::OpenWrite
+            | Opcode::OpenDup
+            | Opcode::OpenEphemeral
+            | Opcode::OpenAutoindex
+            | Opcode::OpenPseudo
+            | Opcode::SorterOpen
+            | Opcode::Close
+            | Opcode::Column
+            | Opcode::SeekLT
+            | Opcode::SeekLE
+            | Opcode::SeekGE
+            | Opcode::SeekGT
+            | Opcode::SeekRowid
+            | Opcode::Insert
+            | Opcode::Delete
+            | Opcode::SorterData
+            | Opcode::Rowid
+            | Opcode::Last
+            | Opcode::SorterSort
+            | Opcode::Rewind
+            | Opcode::SorterNext
+            | Opcode::Prev
+            | Opcode::Next
+            | Opcode::IdxInsert
+            | Opcode::SorterInsert
+            | Opcode::IdxDelete
+            | Opcode::IdxRowid
+            | Opcode::VOpen
+            | Opcode::VFilter
+            | Opcode::VColumn
+            | Opcode::VNext
+            | Opcode::VUpdate
+    )
+}
+
+fn compile_jit_stub(program: &VdbeProgram) -> std::result::Result<u64, &'static str> {
+    if program
+        .ops()
+        .iter()
+        .any(|op| !jit_scaffold_supports_opcode(op.opcode))
+    {
+        return Err("unsupported opcode in JIT scaffold compiler");
+    }
+    let op_count = u64::try_from(program.ops().len()).unwrap_or(u64::MAX);
+    Ok(op_count.saturating_mul(32).max(64))
+}
+
+fn maybe_trigger_jit(program: &VdbeProgram) -> JitDecision {
+    if !vdbe_jit_enabled() {
+        return JitDecision::Disabled;
+    }
+    let plan_hash = hash_program(program);
+    let hot_threshold = vdbe_jit_hot_threshold();
+    let cache_capacity = vdbe_jit_cache_capacity();
+
+    let mut runtime = lock_jit_runtime();
+    let execution_count = {
+        let count = runtime.executions_by_plan.entry(plan_hash).or_insert(0);
+        *count = count.saturating_add(1);
+        *count
+    };
+    if execution_count < hot_threshold {
+        return JitDecision::Warming {
+            plan_hash,
+            execution_count,
+        };
+    }
+
+    FSQLITE_JIT_TRIGGERS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
+    if let Some(code_size_bytes) = runtime
+        .cache
+        .get(&plan_hash)
+        .map(|entry| entry.code_size_bytes)
+    {
+        FSQLITE_JIT_CACHE_HITS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
+        runtime.touch_lru(plan_hash);
+        return JitDecision::CacheHit {
+            plan_hash,
+            code_size_bytes,
+        };
+    }
+
+    FSQLITE_JIT_CACHE_MISSES_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
+    let compile_started = Instant::now();
+    match compile_jit_stub(program) {
+        Ok(code_size_bytes) => {
+            FSQLITE_JIT_COMPILATIONS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
+            let compile_time_us =
+                u64::try_from(compile_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+            let evicted_plan_hash =
+                runtime.insert_cache(plan_hash, JitCacheEntry { code_size_bytes }, cache_capacity);
+            JitDecision::Compiled {
+                plan_hash,
+                compile_time_us,
+                code_size_bytes,
+                evicted_plan_hash,
+            }
+        }
+        Err(reason) => {
+            FSQLITE_JIT_COMPILE_FAILURES_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
+            let compile_time_us =
+                u64::try_from(compile_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+            JitDecision::CompileFailed {
+                plan_hash,
+                compile_time_us,
+                reason,
+            }
+        }
+    }
 }
 
 /// Register spans touched by an opcode.
@@ -1651,6 +2021,83 @@ impl VdbeEngine {
             num_ops = ops.len(),
             "vdbe statement begin",
         );
+
+        match maybe_trigger_jit(program) {
+            JitDecision::Disabled => {}
+            JitDecision::Warming {
+                plan_hash,
+                execution_count,
+            } => {
+                tracing::debug!(
+                    target: "fsqlite_vdbe::jit",
+                    program_id,
+                    plan_hash = format_args!("{plan_hash:016x}"),
+                    execution_count,
+                    hot_threshold = vdbe_jit_hot_threshold(),
+                    "jit warmup (interpreter tier)"
+                );
+            }
+            JitDecision::CacheHit {
+                plan_hash,
+                code_size_bytes,
+            } => {
+                tracing::info!(
+                    target: "fsqlite_vdbe::jit",
+                    program_id,
+                    plan_hash = format_args!("{plan_hash:016x}"),
+                    code_size_bytes,
+                    "jit trigger cache hit (interpreter fallback path)"
+                );
+            }
+            JitDecision::Compiled {
+                plan_hash,
+                compile_time_us,
+                code_size_bytes,
+                evicted_plan_hash,
+            } => {
+                let plan_hash_hex = format!("{plan_hash:016x}");
+                let span = tracing::info_span!(
+                    target: "fsqlite_vdbe::jit",
+                    "jit_compile",
+                    plan_hash = %plan_hash_hex,
+                    compile_time_us,
+                    code_size_bytes,
+                );
+                let _compile_guard = span.enter();
+                tracing::info!(
+                    target: "fsqlite_vdbe::jit",
+                    program_id,
+                    plan_hash = %plan_hash_hex,
+                    compile_time_us,
+                    code_size_bytes,
+                    evicted_plan_hash = evicted_plan_hash.map(|value| format!("{value:016x}")),
+                    "jit trigger compile completed (interpreter fallback path)"
+                );
+            }
+            JitDecision::CompileFailed {
+                plan_hash,
+                compile_time_us,
+                reason,
+            } => {
+                let plan_hash_hex = format!("{plan_hash:016x}");
+                let span = tracing::info_span!(
+                    target: "fsqlite_vdbe::jit",
+                    "jit_compile",
+                    plan_hash = %plan_hash_hex,
+                    compile_time_us,
+                    code_size_bytes = 0_u64,
+                );
+                let _compile_guard = span.enter();
+                tracing::warn!(
+                    target: "fsqlite_vdbe::jit",
+                    program_id,
+                    plan_hash = %plan_hash_hex,
+                    compile_time_us,
+                    reason,
+                    "jit compilation failed; falling back to interpreter"
+                );
+            }
+        }
 
         let mut pc: usize = 0;
         // "once" flags: one bit per instruction address.
@@ -8819,6 +9266,96 @@ mod tests {
             metrics.sort_spill_pages_total, 0,
             "no spill expected for small dataset"
         );
+    }
+
+    #[test]
+    fn test_jit_scaffold_metrics_compile_and_cache_hit() {
+        let prev_enabled = vdbe_jit_enabled();
+        let prev_threshold = vdbe_jit_hot_threshold();
+        let prev_capacity = vdbe_jit_cache_capacity();
+
+        reset_vdbe_metrics();
+        set_vdbe_jit_enabled(true);
+        let _ = set_vdbe_jit_hot_threshold(2);
+        let _ = set_vdbe_jit_cache_capacity(8);
+
+        for _ in 0..3 {
+            let rows = run_program(|b| {
+                let end = b.emit_label();
+                b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+                b.emit_op(Opcode::Integer, 42, 1, 0, P4::None, 0);
+                b.emit_op(Opcode::ResultRow, 1, 1, 0, P4::None, 0);
+                b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+                b.resolve_label(end);
+            });
+            assert_eq!(rows, vec![vec![SqliteValue::Integer(42)]]);
+        }
+
+        let snapshot = vdbe_jit_metrics_snapshot();
+        assert!(
+            snapshot.jit_compilations_total >= 1,
+            "expected at least one JIT compile, got {}",
+            snapshot.jit_compilations_total
+        );
+        assert!(
+            snapshot.jit_cache_hits_total >= 1,
+            "expected at least one JIT cache hit, got {}",
+            snapshot.jit_cache_hits_total
+        );
+        assert!(
+            snapshot.jit_cache_hit_ratio_percent > 0,
+            "expected positive cache hit ratio, got {}",
+            snapshot.jit_cache_hit_ratio_percent
+        );
+        assert!(
+            snapshot.cache_entries >= 1,
+            "expected non-empty JIT cache after hot runs"
+        );
+
+        set_vdbe_jit_enabled(prev_enabled);
+        let _ = set_vdbe_jit_hot_threshold(prev_threshold);
+        let _ = set_vdbe_jit_cache_capacity(prev_capacity);
+    }
+
+    #[test]
+    fn test_jit_scaffold_compile_failure_falls_back_to_interpreter() {
+        let prev_enabled = vdbe_jit_enabled();
+        let prev_threshold = vdbe_jit_hot_threshold();
+        let prev_capacity = vdbe_jit_cache_capacity();
+
+        reset_vdbe_metrics();
+        set_vdbe_jit_enabled(true);
+        let _ = set_vdbe_jit_hot_threshold(1);
+        let _ = set_vdbe_jit_cache_capacity(8);
+
+        let mut db = MemDatabase::new();
+        let root = db.create_table(1);
+        db.get_table_mut(root)
+            .expect("table should exist")
+            .insert_row(7, vec![SqliteValue::Integer(700)]);
+
+        let rows = run_with_storage_cursors(db, |b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            b.emit_op(Opcode::OpenRead, 0, root, 0, P4::Int(1), 0);
+            b.emit_jump_to_label(Opcode::Rewind, 0, 0, end, P4::None, 0);
+            b.emit_op(Opcode::Column, 0, 0, 1, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, 1, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+
+        assert_eq!(rows, vec![vec![SqliteValue::Integer(700)]]);
+        let snapshot = vdbe_jit_metrics_snapshot();
+        assert!(
+            snapshot.jit_compile_failures_total >= 1,
+            "expected at least one JIT compile failure, got {}",
+            snapshot.jit_compile_failures_total
+        );
+
+        set_vdbe_jit_enabled(prev_enabled);
+        let _ = set_vdbe_jit_hot_threshold(prev_threshold);
+        let _ = set_vdbe_jit_cache_capacity(prev_capacity);
     }
 
     #[test]
