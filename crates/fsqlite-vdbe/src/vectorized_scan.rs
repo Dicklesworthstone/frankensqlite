@@ -324,9 +324,9 @@ where
     }
 
     fn current_page_or_internal_error(&self) -> ScanResult<PageNumber> {
-        self.cursor.current_leaf_page().ok_or_else(|| {
+        self.cursor.current_page().ok_or_else(|| {
             VectorizedScanError::Cursor(FrankenError::internal(
-                "cursor positioned on row without a current leaf page",
+                "cursor positioned on row without a current page",
             ))
         })
     }
@@ -582,7 +582,7 @@ mod tests {
             }
 
             let current_page = cursor
-                .current_leaf_page()
+                .current_page()
                 .expect("cursor at row should have current leaf page");
             if let Some(m) = morsel {
                 if current_page < m.start_page {

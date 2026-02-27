@@ -304,7 +304,7 @@ impl<P: PageReader> BtCursor<P> {
     ///
     /// Returns `None` when the cursor is at EOF or not yet positioned.
     #[must_use]
-    pub fn current_leaf_page(&self) -> Option<PageNumber> {
+    pub fn current_page(&self) -> Option<PageNumber> {
         if self.at_eof {
             return None;
         }
@@ -1744,45 +1744,23 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
         let new_prefix = &new_fields[..n_unique_cols.min(new_fields.len())];
 
         // Use index_seek to position cursor, then scan adjacent entries for
-        // prefix matches. The cursor lands on a leaf at or near the insertion
-        // point. We check the current cell and the predecessor because the
-        // full key includes the rowid suffix, so two records with the same
-        // indexed columns but different rowids sort adjacently.
+        // prefix matches. We check the current entry and the predecessor.
+        // Because the full key includes the rowid suffix, two records with the
+        // same indexed columns but different rowids sort adjacently.
         self.with_btree_op(cx, BtreeOpType::Seek, |cursor| {
             let _seek = cursor.index_seek(cx, key)?;
 
-            // Determine which cell indices to check on the current leaf.
-            let mut check_indices: Vec<u16> = Vec::with_capacity(2);
-            if let Some(top) = cursor.stack.last() {
-                if top.header.page_type.is_leaf() {
-                    // Current cell (successor).
-                    if !cursor.at_eof && top.cell_idx < top.header.cell_count {
-                        check_indices.push(top.cell_idx);
-                    }
-                    // Predecessor cell.
-                    if cursor.at_eof && top.header.cell_count > 0 {
-                        check_indices.push(top.header.cell_count - 1);
-                    } else if !cursor.at_eof && top.cell_idx > 0 {
-                        check_indices.push(top.cell_idx - 1);
-                    }
-                }
+            let mut to_check = Vec::with_capacity(2);
+
+            if !cursor.at_eof {
+                to_check.push(cursor.payload(cx)?);
             }
 
-            for cell_idx in check_indices {
-                let top = match cursor.stack.last() {
-                    Some(t) => t,
-                    None => continue,
-                };
-                let cell = match cursor.parse_cell_at(top, cell_idx) {
-                    Ok(c) => c,
-                    Err(_) => continue,
-                };
-                let existing_key = match cursor.read_cell_payload(cx, top, &cell) {
-                    Ok(k) => k,
-                    Err(_) => continue,
-                };
+            if cursor.prev(cx)? {
+                to_check.push(cursor.payload(cx)?);
+            }
 
-                // Parse the existing key and compare prefixes.
+            for existing_key in to_check {
                 if let Some(existing_fields) = parse_record(&existing_key) {
                     if existing_fields.len() >= n_unique_cols
                         && new_prefix == &existing_fields[..n_unique_cols]
