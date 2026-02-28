@@ -73,6 +73,31 @@ LOG_WORKFLOW_B="${RUN_DIR}/workflow_b.log"
 LOG_DRY_RUN="${RUN_DIR}/dry_run.log"
 REPORT_JSON="${ART_ROOT}/report.json"
 
+RCH_PREFIX=(rch exec --)
+if [[ -n "${TMPDIR:-}" ]]; then
+  if [[ "${TMPDIR}" != /* ]]; then
+    TMPDIR="${WORKSPACE_ROOT}/${TMPDIR}"
+  fi
+  mkdir -p "${TMPDIR}"
+  RCH_PREFIX+=(env "TMPDIR=${TMPDIR}")
+fi
+if [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
+  if [[ "${CARGO_TARGET_DIR}" != /* ]]; then
+    CARGO_TARGET_DIR="${WORKSPACE_ROOT}/${CARGO_TARGET_DIR}"
+  fi
+  mkdir -p "${CARGO_TARGET_DIR}"
+  if [[ ${#RCH_PREFIX[@]} -eq 3 ]]; then
+    RCH_PREFIX+=(env)
+  fi
+  RCH_PREFIX+=("CARGO_TARGET_DIR=${CARGO_TARGET_DIR}")
+fi
+if [[ -n "${CFLAGS:-}" ]]; then
+  if [[ ${#RCH_PREFIX[@]} -eq 3 ]]; then
+    RCH_PREFIX+=(env)
+  fi
+  RCH_PREFIX+=("CFLAGS=${CFLAGS}")
+fi
+
 RUNNER_BIN="${DURABILITY_MATRIX_RUNNER_BIN:-}"
 RUNNER=(cargo run -p fsqlite-harness --bin durability_matrix_manifest --)
 if [[ "${FORCE_RCH}" == "1" ]]; then
@@ -80,7 +105,7 @@ if [[ "${FORCE_RCH}" == "1" ]]; then
     echo "ERROR: DURABILITY_MATRIX_FORCE_RCH=1 but rch is unavailable" >&2
     exit 2
   fi
-  RUNNER=(rch exec -- cargo run -p fsqlite-harness --bin durability_matrix_manifest --)
+  RUNNER=("${RCH_PREFIX[@]}" cargo run -p fsqlite-harness --bin durability_matrix_manifest --)
 elif [[ -n "${RUNNER_BIN}" ]]; then
   if [[ ! -x "${RUNNER_BIN}" ]]; then
     echo "ERROR: DURABILITY_MATRIX_RUNNER_BIN is not executable: ${RUNNER_BIN}" >&2
@@ -88,7 +113,7 @@ elif [[ -n "${RUNNER_BIN}" ]]; then
   fi
   RUNNER=("${RUNNER_BIN}")
 elif [[ "${DURABILITY_MATRIX_USE_RCH:-0}" == "1" ]] && command -v rch >/dev/null 2>&1; then
-  RUNNER=(rch exec -- cargo run -p fsqlite-harness --bin durability_matrix_manifest --)
+  RUNNER=("${RCH_PREFIX[@]}" cargo run -p fsqlite-harness --bin durability_matrix_manifest --)
 fi
 
 log_event() {

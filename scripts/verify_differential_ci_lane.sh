@@ -125,6 +125,31 @@ resolve_runner_path() {
   return 1
 }
 
+RCH_PREFIX=(rch exec --)
+if [[ -n "${TMPDIR:-}" ]]; then
+  if [[ "${TMPDIR}" != /* ]]; then
+    TMPDIR="${WORKSPACE_ROOT}/${TMPDIR}"
+  fi
+  mkdir -p "${TMPDIR}"
+  RCH_PREFIX+=(env "TMPDIR=${TMPDIR}")
+fi
+if [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
+  if [[ "${CARGO_TARGET_DIR}" != /* ]]; then
+    CARGO_TARGET_DIR="${WORKSPACE_ROOT}/${CARGO_TARGET_DIR}"
+  fi
+  mkdir -p "${CARGO_TARGET_DIR}"
+  if [[ ${#RCH_PREFIX[@]} -eq 3 ]]; then
+    RCH_PREFIX+=(env)
+  fi
+  RCH_PREFIX+=("CARGO_TARGET_DIR=${CARGO_TARGET_DIR}")
+fi
+if [[ -n "${CFLAGS:-}" ]]; then
+  if [[ ${#RCH_PREFIX[@]} -eq 3 ]]; then
+    RCH_PREFIX+=(env)
+  fi
+  RCH_PREFIX+=("CFLAGS=${CFLAGS}")
+fi
+
 RUNNER_BIN="${DIFF_LANE_RUNNER_BIN:-}"
 RUNNER=(cargo run -p fsqlite-harness --bin differential_manifest_runner --)
 if [[ "${FORCE_RCH}" == "1" ]]; then
@@ -132,7 +157,7 @@ if [[ "${FORCE_RCH}" == "1" ]]; then
     echo "ERROR: DIFF_LANE_FORCE_RCH=1 but rch is unavailable" >&2
     exit 2
   fi
-  RUNNER=(rch exec -- cargo run -p fsqlite-harness --bin differential_manifest_runner --)
+  RUNNER=("${RCH_PREFIX[@]}" cargo run -p fsqlite-harness --bin differential_manifest_runner --)
 elif [[ -n "${RUNNER_BIN}" ]]; then
   if ! RUNNER_BIN="$(resolve_runner_path "${RUNNER_BIN}")"; then
     echo "ERROR: DIFF_LANE_RUNNER_BIN is not executable: ${RUNNER_BIN}" >&2
@@ -146,7 +171,7 @@ elif RUNNER_BIN="$(resolve_runner_path "/data/tmp/cargo-target/debug/differentia
 elif RUNNER_BIN="$(resolve_runner_path "target/debug/differential_manifest_runner")"; then
   RUNNER=("${RUNNER_BIN}")
 elif [[ "${DIFF_LANE_USE_RCH:-0}" == "1" ]] && command -v rch >/dev/null 2>&1; then
-  RUNNER=(rch exec -- cargo run -p fsqlite-harness --bin differential_manifest_runner --)
+  RUNNER=("${RCH_PREFIX[@]}" cargo run -p fsqlite-harness --bin differential_manifest_runner --)
 fi
 
 DOCTOR_RUNNER_BIN="${DIFF_DOCTOR_RUNNER_BIN:-}"
@@ -156,7 +181,7 @@ if [[ "${FORCE_RCH}" == "1" ]]; then
     echo "ERROR: DIFF_LANE_FORCE_RCH=1 but rch is unavailable" >&2
     exit 2
   fi
-  DOCTOR_RUNNER=(rch exec -- cargo run -p fsqlite-harness --bin oracle_preflight_doctor_runner --)
+  DOCTOR_RUNNER=("${RCH_PREFIX[@]}" cargo run -p fsqlite-harness --bin oracle_preflight_doctor_runner --)
 elif [[ -n "${DOCTOR_RUNNER_BIN}" ]]; then
   if ! DOCTOR_RUNNER_BIN="$(resolve_runner_path "${DOCTOR_RUNNER_BIN}")"; then
     echo "ERROR: DIFF_DOCTOR_RUNNER_BIN is not executable: ${DOCTOR_RUNNER_BIN}" >&2
@@ -170,7 +195,7 @@ elif DOCTOR_RUNNER_BIN="$(resolve_runner_path "/data/tmp/cargo-target/debug/orac
 elif DOCTOR_RUNNER_BIN="$(resolve_runner_path "target/debug/oracle_preflight_doctor_runner")"; then
   DOCTOR_RUNNER=("${DOCTOR_RUNNER_BIN}")
 elif [[ "${DIFF_LANE_USE_RCH:-0}" == "1" ]] && command -v rch >/dev/null 2>&1; then
-  DOCTOR_RUNNER=(rch exec -- cargo run -p fsqlite-harness --bin oracle_preflight_doctor_runner --)
+  DOCTOR_RUNNER=("${RCH_PREFIX[@]}" cargo run -p fsqlite-harness --bin oracle_preflight_doctor_runner --)
 fi
 
 COMMON_ARGS=(

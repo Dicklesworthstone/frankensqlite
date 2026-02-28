@@ -27,6 +27,7 @@ GENERATED_UNIX_MS="${ZJISK3_GENERATED_UNIX_MS:-1700000000000}"
 DURABILITY_SEED="${ZJISK3_DURABILITY_SEED:-0xB740000000000001}"
 REMOTE_TARGET_DIR="${ZJISK3_REMOTE_TARGET_DIR:-target-local/bd-zjisk_3_cert}"
 REMOTE_TMP_DIR="${ZJISK3_REMOTE_TMP_DIR:-target-local/bd-zjisk_3_tmp}"
+REMOTE_CFLAGS="${ZJISK3_REMOTE_CFLAGS:--pipe}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -73,6 +74,15 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+if [[ "${REMOTE_TARGET_DIR}" != /* ]]; then
+  REMOTE_TARGET_DIR="${WORKSPACE_ROOT}/${REMOTE_TARGET_DIR}"
+fi
+if [[ "${REMOTE_TMP_DIR}" != /* ]]; then
+  REMOTE_TMP_DIR="${WORKSPACE_ROOT}/${REMOTE_TMP_DIR}"
+fi
+
+mkdir -p "${REMOTE_TARGET_DIR}" "${REMOTE_TMP_DIR}"
+
 RUN_TS="$(date -u +%Y%m%dT%H%M%SZ)"
 RUN_ID="${BEAD_ID}-${RUN_TS}"
 TRACE_ID="trace-$(printf '%s' "${RUN_ID}" | sha256sum | awk '{print $1}' | cut -c1-16)"
@@ -113,23 +123,24 @@ run_checked() {
 run_checked \
   "unit_replay_command_generation" \
   "${UNIT_REPLAY_LOG}" \
-  rch exec -- env TMPDIR="${REMOTE_TMP_DIR}" CARGO_TARGET_DIR="${REMOTE_TARGET_DIR}" cargo test -p fsqlite-harness --bin differential_manifest_runner replay_command_includes_deterministic_controls -- --nocapture
+  rch exec -- env TMPDIR="${REMOTE_TMP_DIR}" CARGO_TARGET_DIR="${REMOTE_TARGET_DIR}" CFLAGS="${REMOTE_CFLAGS}" cargo test -p fsqlite-harness --bin differential_manifest_runner replay_command_includes_deterministic_controls -- --nocapture
 
 run_checked \
   "unit_human_summary_replay_embedding" \
   "${UNIT_SUMMARY_LOG}" \
-  rch exec -- env TMPDIR="${REMOTE_TMP_DIR}" CARGO_TARGET_DIR="${REMOTE_TARGET_DIR}" cargo test -p fsqlite-harness --bin differential_manifest_runner human_summary_contains_replay_and_counts -- --nocapture
+  rch exec -- env TMPDIR="${REMOTE_TMP_DIR}" CARGO_TARGET_DIR="${REMOTE_TARGET_DIR}" CFLAGS="${REMOTE_CFLAGS}" cargo test -p fsqlite-harness --bin differential_manifest_runner human_summary_contains_replay_and_counts -- --nocapture
 
 run_checked \
   "unit_artifact_manifest_assembly" \
   "${UNIT_MANIFEST_LOG}" \
-  rch exec -- env TMPDIR="${REMOTE_TMP_DIR}" CARGO_TARGET_DIR="${REMOTE_TARGET_DIR}" cargo test -p fsqlite-harness --lib artifact_manifest_validation_pass -- --nocapture
+  rch exec -- env TMPDIR="${REMOTE_TMP_DIR}" CARGO_TARGET_DIR="${REMOTE_TARGET_DIR}" CFLAGS="${REMOTE_CFLAGS}" cargo test -p fsqlite-harness --lib artifact_manifest_validation_pass -- --nocapture
 
 set +e
 (
   cd "${WORKSPACE_ROOT}"
   TMPDIR="${REMOTE_TMP_DIR}" \
   CARGO_TARGET_DIR="${REMOTE_TARGET_DIR}" \
+  CFLAGS="${REMOTE_CFLAGS}" \
   DIFF_LANE_USE_RCH=1 \
   DIFF_LANE_FORCE_RCH=1 \
   ./scripts/verify_differential_ci_lane.sh \
@@ -152,6 +163,7 @@ set +e
   cd "${WORKSPACE_ROOT}"
   TMPDIR="${REMOTE_TMP_DIR}" \
   CARGO_TARGET_DIR="${REMOTE_TARGET_DIR}" \
+  CFLAGS="${REMOTE_CFLAGS}" \
   DURABILITY_MATRIX_USE_RCH=1 \
   DURABILITY_MATRIX_FORCE_RCH=1 \
   ./scripts/verify_durability_matrix.sh \
@@ -255,6 +267,7 @@ REPORT_PAYLOAD="$(
     --arg durability_seed "${DURABILITY_SEED}" \
     --arg remote_target_dir "${REMOTE_TARGET_DIR}" \
     --arg remote_tmp_dir "${REMOTE_TMP_DIR}" \
+    --arg remote_cflags "${REMOTE_CFLAGS}" \
     --arg diff_report "${DIFF_REPORT#${WORKSPACE_ROOT}/}" \
     --arg durability_report "${DURABILITY_REPORT#${WORKSPACE_ROOT}/}" \
     --arg unit_replay_log "${UNIT_REPLAY_LOG#${WORKSPACE_ROOT}/}" \
@@ -285,7 +298,8 @@ REPORT_PAYLOAD="$(
           generated_unix_ms: $generated_unix_ms,
           durability_seed: $durability_seed,
           remote_target_dir: $remote_target_dir,
-          remote_tmp_dir: $remote_tmp_dir
+          remote_tmp_dir: $remote_tmp_dir,
+          remote_cflags: $remote_cflags
         },
         checks: {
           unit_replay_command_generation: "pass",
