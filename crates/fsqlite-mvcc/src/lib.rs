@@ -1,5 +1,6 @@
-#![cfg_attr(target_family = "unix", feature(peer_credentials_unix_socket))]
-#![cfg_attr(target_os = "linux", feature(unix_socket_ancillary_data))]
+// Peer credentials and ancillary fd passing now use the `nix` crate (stable Rust)
+// instead of nightly #![feature(peer_credentials_unix_socket)] and
+// #![feature(unix_socket_ancillary_data)].
 
 //! MVCC page-level versioning for concurrent writers.
 //!

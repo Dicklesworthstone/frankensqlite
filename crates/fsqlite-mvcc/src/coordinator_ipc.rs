@@ -1331,16 +1331,18 @@ impl std::error::Error for PeerAuthError {}
 
 /// Authenticate a Unix domain socket peer by UID.
 ///
-/// Uses the nightly `UnixStream::peer_cred()` API (gated by the crate-level
-/// `peer_credentials_unix_socket` feature) to retrieve the peer UID and compare
-/// it to the expected UID.
-#[cfg(target_family = "unix")]
+/// Uses the stable `nix::sys::socket::getsockopt` with `PeerCredentials`
+/// to retrieve the peer UID and compare it to the expected UID.
+#[cfg(target_os = "linux")]
 pub fn authenticate_peer(
     stream: &std::os::unix::net::UnixStream,
     expected_uid: u32,
 ) -> Result<(), PeerAuthError> {
-    let cred = stream.peer_cred().map_err(|_| PeerAuthError::NoCreds)?;
-    let actual_uid = cred.uid;
+    use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
+
+    let cred = getsockopt(stream, PeerCredentials)
+        .map_err(|_| PeerAuthError::NoCreds)?;
+    let actual_uid = cred.uid();
     if actual_uid != expected_uid {
         return Err(PeerAuthError::UidMismatch {
             expected: expected_uid,
@@ -1385,9 +1387,10 @@ pub fn send_with_fd(
     data: &[u8],
     fd: std::os::unix::io::RawFd,
 ) -> std::io::Result<usize> {
-    use std::io::IoSlice;
     use std::io::Write as _;
-    use std::os::unix::net::SocketAncillary;
+    use std::os::unix::io::AsRawFd;
+    use nix::sys::socket::{ControlMessage, MsgFlags, sendmsg};
+    use std::io::IoSlice;
 
     if data.is_empty() {
         return Err(std::io::Error::other(
@@ -1395,21 +1398,20 @@ pub fn send_with_fd(
         ));
     }
 
-    let mut ancillary_buf = [0u8; 128];
-    let mut ancillary = SocketAncillary::new(&mut ancillary_buf);
-    if !ancillary.add_fds(&[fd]) {
-        return Err(std::io::Error::other("ancillary buffer too small for fd"));
-    }
+    let iov = [IoSlice::new(data)];
+    let fds = [fd];
+    let cmsg = [ControlMessage::ScmRights(&fds)];
 
     // The ancillary control message (SCM_RIGHTS) is delivered with the first
     // byte(s) received for this send call; subsequent writes should not repeat
     // it. We therefore send once with ancillary, then (if needed) write the
     // remaining bytes without ancillary.
-    let mut sent = stream.send_vectored_with_ancillary(&[IoSlice::new(data)], &mut ancillary)?;
+    let mut sent = sendmsg::<()>(stream.as_raw_fd(), &iov, &cmsg, MsgFlags::empty(), None)
+        .map_err(std::io::Error::other)?;
     if sent == 0 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::WriteZero,
-            "send_vectored_with_ancillary wrote 0 bytes",
+            "sendmsg wrote 0 bytes",
         ));
     }
     if sent < data.len() {
@@ -1427,16 +1429,19 @@ pub fn recv_with_fd(
     stream: &std::os::unix::net::UnixStream,
     buf: &mut [u8],
 ) -> std::io::Result<(usize, Option<ReceivedFd>)> {
+    use std::os::unix::io::AsRawFd;
+    use nix::cmsg_space;
+    use nix::sys::socket::{MsgFlags, recvmsg};
     use std::io::IoSliceMut;
-    use std::os::unix::net::{AncillaryData, SocketAncillary};
 
-    let mut ancillary_buf = [0u8; 128];
-    let mut ancillary = SocketAncillary::new(&mut ancillary_buf);
-
+    let mut cmsg_buf = cmsg_space!(std::os::unix::io::RawFd);
     let mut iov = [IoSliceMut::new(buf)];
-    let n = stream.recv_vectored_with_ancillary(&mut iov, &mut ancillary)?;
+    let msg = recvmsg::<()>(stream.as_raw_fd(), &mut iov, Some(&mut cmsg_buf), MsgFlags::empty())
+        .map_err(std::io::Error::other)?;
 
-    if ancillary.truncated() {
+    let n = msg.bytes;
+
+    if msg.flags.contains(MsgFlags::MSG_CTRUNC) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "ancillary data truncated",
@@ -1444,15 +1449,10 @@ pub fn recv_with_fd(
     }
 
     let mut fds = Vec::<std::os::unix::io::RawFd>::new();
-    for msg in ancillary.messages() {
-        let msg = msg.map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("ancillary message decode error: {e:?}"),
-            )
-        })?;
-        if let AncillaryData::ScmRights(scm_rights) = msg {
-            fds.extend(scm_rights);
+    let cmsgs = msg.cmsgs().map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    for cmsg in cmsgs {
+        if let nix::sys::socket::ControlMessageOwned::ScmRights(scm_fds) = cmsg {
+            fds.extend(scm_fds);
         }
     }
 
@@ -1736,14 +1736,16 @@ mod tests {
     }
 
     // -- bd-1m07 test 6: Peer auth rejects wrong UID --
-    #[cfg(target_family = "unix")]
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_peer_auth_rejects_wrong_uid() {
         use std::os::unix::net::UnixStream;
 
         let (a, _b) = UnixStream::pair().expect("socketpair");
 
-        let actual_uid = a.peer_cred().expect("peer_cred").uid;
+        use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
+        let actual_uid = getsockopt(&a, PeerCredentials)
+            .expect("peer_cred").uid();
         authenticate_peer(&a, actual_uid).expect("peer auth ok");
 
         let wrong_uid = actual_uid ^ 1;
@@ -1875,7 +1877,9 @@ mod tests {
 
         let (client_sock, server_sock) = UnixStream::pair().expect("socketpair");
 
-        let expected_uid = server_sock.peer_cred().expect("peer_cred").uid;
+        use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
+        let expected_uid = getsockopt(&server_sock, PeerCredentials)
+            .expect("peer_cred").uid();
         authenticate_peer(&server_sock, expected_uid).expect("E2E peer auth");
 
         let pm_server = Arc::clone(&pm);

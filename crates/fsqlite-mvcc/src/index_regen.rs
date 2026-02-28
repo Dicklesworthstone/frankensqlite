@@ -625,9 +625,9 @@ fn apply_collation(val: SqliteValue, collation: Collation) -> SqliteValue {
         Collation::Binary => val,
         Collation::Nocase => {
             if let SqliteValue::Text(s) = val {
-                // SQLite NOCASE only folds ASCII a-z → A-Z; we lowercase for
-                // index key encoding so binary comparison works.
-                SqliteValue::Text(s.to_ascii_lowercase())
+                // SQLite NOCASE only folds ASCII a-z → A-Z. We must uppercase
+                // for index key encoding so binary comparison matches SQLite.
+                SqliteValue::Text(s.to_ascii_uppercase())
             } else {
                 val
             }
@@ -1332,7 +1332,7 @@ mod tests {
     fn test_nocase_collation_key_normalization() {
         let base = record_bytes(&[
             SqliteValue::Integer(1),
-            SqliteValue::Text("HELLO".to_owned()),
+            SqliteValue::Text("hello".to_owned()),
         ]);
 
         let indexes = vec![IndexDef {
@@ -1348,17 +1348,17 @@ mod tests {
             table_column_affinities: vec![TypeAffinity::Integer, TypeAffinity::Text],
         }];
 
-        // Update from "HELLO" to "hello" — NOCASE means these are the SAME key.
+        // Update from "hello" to "HELLO" — NOCASE means these are the SAME key.
         let updates = vec![(
             ColumnIdx::new(1),
-            RebaseExpr::Literal(SqliteValue::Text("hello".to_owned())),
+            RebaseExpr::Literal(SqliteValue::Text("HELLO".to_owned())),
         )];
 
         let result =
             regenerate_index_ops(&base, &updates, &indexes, RowId::new(1), &NoOpUniqueChecker)
                 .unwrap();
 
-        // With NOCASE, "HELLO" and "hello" normalize to same key → no op.
+        // With NOCASE, "hello" and "HELLO" normalize to same key → no op.
         assert!(result.ops.is_empty(), "bead_id={BEAD_ID} nocase_same_key");
     }
 

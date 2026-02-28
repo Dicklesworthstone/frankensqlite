@@ -152,7 +152,7 @@ blake3 = "1.5"
 crossbeam-epoch = "0.9"
 crossbeam-deque = "0.8"
 sha2 = "0.10"
-nix = { version = "0.29", default-features = false, features = ["fs"] }
+nix = { version = "0.29", default-features = false, features = ["fs", "socket", "uio", "user"] }
 libc = "0.2"
 chacha20poly1305 = "0.10"
 argon2 = "0.5"

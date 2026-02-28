@@ -971,8 +971,9 @@ pub fn compute_raptorq_repair_symbols(
 
 /// Read a single page from raw database bytes, zero-padding if file is short.
 fn read_page_from_bytes(db_data: &[u8], pgno: u32, page_size: usize) -> Vec<u8> {
-    let offset = (pgno as usize - 1) * page_size;
-    if offset + page_size <= db_data.len() {
+    let offset_u64 = (u64::from(pgno) - 1) * (page_size as u64);
+    let offset = usize::try_from(offset_u64).unwrap_or(usize::MAX);
+    if offset.saturating_add(page_size) <= db_data.len() {
         db_data[offset..offset + page_size].to_vec()
     } else {
         let mut page = vec![0u8; page_size];

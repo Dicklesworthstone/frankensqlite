@@ -3829,11 +3829,14 @@ impl VdbeEngine {
                     for i in 0..count {
                         let val_a = self.get_reg(start_a + i);
                         let val_b = self.get_reg(start_b + i);
-                        // TODO: Apply collation from P4 if present.
-                        // For now, use default collation (binary/numeric-aware).
-                        if let Some(ord) = val_a.partial_cmp(val_b) {
-                            if ord != Ordering::Equal {
-                                result = ord;
+                        let ord = if let P4::Collation(ref coll_name) = op.p4 {
+                            collate_compare(val_a, val_b, coll_name)
+                        } else {
+                            val_a.partial_cmp(val_b)
+                        };
+                        if let Some(o) = ord {
+                            if o != Ordering::Equal {
+                                result = o;
                                 break;
                             }
                         }
@@ -5000,8 +5003,8 @@ fn collate_compare(
             let upper = coll_name.to_ascii_uppercase();
             Some(match upper.as_str() {
                 "NOCASE" => {
-                    let li = l.as_bytes().iter().map(u8::to_ascii_lowercase);
-                    let ri = r.as_bytes().iter().map(u8::to_ascii_lowercase);
+                    let li = l.as_bytes().iter().map(u8::to_ascii_uppercase);
+                    let ri = r.as_bytes().iter().map(u8::to_ascii_uppercase);
                     li.cmp(ri)
                 }
                 "RTRIM" => {

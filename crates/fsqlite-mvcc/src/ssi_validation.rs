@@ -397,16 +397,12 @@ pub fn discover_incoming_edges(
             continue;
         };
         for candidate in candidates {
-            // Fine-grained filtering: if both keys are Cells, check tags.
-            // This prevents table-level false positives when multiple transactions
-            // touch different rows in the same table (same btree_root).
+            // Fine-grained filtering: check exact witness overlap.
+            // This prevents false positives when transactions touch different
+            // non-overlapping parts of the same page.
             if let Some(reader_key) = candidate.key {
-                if let (WitnessKey::Cell { tag: t1, .. }, WitnessKey::Cell { tag: t2, .. }) =
-                    (write_key, reader_key)
-                {
-                    if t1 != t2 {
-                        continue;
-                    }
+                if !crate::witness_plane::witness_keys_overlap(write_key, reader_key) {
+                    continue;
                 }
             }
 
@@ -481,14 +477,10 @@ pub fn discover_outgoing_edges(
             continue;
         };
         for candidate in candidates {
-            // Fine-grained filtering: if both keys are Cells, check tags.
+            // Fine-grained filtering: check exact witness overlap.
             if let Some(writer_key) = candidate.key {
-                if let (WitnessKey::Cell { tag: t1, .. }, WitnessKey::Cell { tag: t2, .. }) =
-                    (read_key, writer_key)
-                {
-                    if t1 != t2 {
-                        continue;
-                    }
+                if !crate::witness_plane::witness_keys_overlap(read_key, writer_key) {
+                    continue;
                 }
             }
 

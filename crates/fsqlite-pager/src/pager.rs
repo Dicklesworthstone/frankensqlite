@@ -493,6 +493,8 @@ where
             let current_size = db_file.file_size(cx)?;
             if current_size > target_size {
                 db_file.truncate(cx, target_size)?;
+                // Sync after truncation to ensure durability of the new file size.
+                db_file.sync(cx, SyncFlags::NORMAL)?;
             }
         }
 
@@ -642,15 +644,17 @@ where
                 FrankenError::internal("WAL mode active but no WAL backend installed")
             })?;
 
-            let page_count = write_set.len();
-            let mut written = 0_usize;
+            // Sort page numbers for deterministic WAL frame ordering.
+            // The commit marker goes on the last frame written.
+            let mut sorted_pages: Vec<_> = write_set.keys().copied().collect();
+            sorted_pages.sort_unstable();
+            let page_count = sorted_pages.len();
+            let max_written = sorted_pages.last().map_or(0, |p| p.get());
 
-            for (page_no, data) in write_set {
-                written += 1;
+            for (idx, page_no) in sorted_pages.iter().enumerate() {
+                let data = &write_set[page_no];
                 // The last frame in the commit gets db_size > 0 as commit marker.
-                let db_size_if_commit = if written == page_count {
-                    // Compute final database size: max of current and all written pages.
-                    let max_written = write_set.keys().map(|p| p.get()).max().unwrap_or(0);
+                let db_size_if_commit = if idx + 1 == page_count {
                     inner.db_size.max(max_written)
                 } else {
                     0

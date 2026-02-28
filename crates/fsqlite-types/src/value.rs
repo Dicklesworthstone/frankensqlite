@@ -674,9 +674,13 @@ fn try_coerce_text_to_numeric(s: &str) -> Option<SqliteValue> {
     }
     // Try float. Reject non-finite results (NaN, Infinity) since SQLite
     // does not recognise "nan", "inf", or "infinity" as numeric literals.
+    // However, it does recognize literals like "1e999" which evaluate to Inf.
     if let Ok(f) = trimmed.parse::<f64>() {
         if !f.is_finite() {
-            return None;
+            let lower = trimmed.to_ascii_lowercase();
+            if lower.contains("inf") || lower.contains("nan") {
+                return None;
+            }
         }
         // If the float is an exact integer value within bounds, store as integer.
         // Checking bounds prevents incorrect saturation for values >= 2^63.

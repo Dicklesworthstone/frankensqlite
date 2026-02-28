@@ -1089,7 +1089,9 @@ fn insert_cell_into_page<W: PageWriter>(
     let mut ptrs = read_cell_pointers(&page_data, &header, offset)?;
 
     let cell_len = cell_data.len();
-    let new_content_offset = header.cell_content_offset as usize - cell_len;
+    let new_content_offset = (header.cell_content_offset as usize)
+        .checked_sub(cell_len)
+        .ok_or_else(|| FrankenError::internal("cell too large for page content area"))?;
 
     // Check there's room for the cell + pointer.
     let ptr_array_end = offset

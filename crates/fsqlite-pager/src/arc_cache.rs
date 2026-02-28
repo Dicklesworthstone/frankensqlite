@@ -1328,7 +1328,7 @@ impl ArcCacheInner {
     fn prune_ghosts_below_horizon(&mut self) {
         let mut stale_b1 = Vec::new();
         for (idx, key) in self.b1.iter() {
-            if key.commit_seq.get() < self.gc_horizon.get() {
+            if key.commit_seq.get() <= self.gc_horizon.get() {
                 stale_b1.push(idx);
             }
         }
@@ -1339,7 +1339,7 @@ impl ArcCacheInner {
 
         let mut stale_b2 = Vec::new();
         for (idx, key) in self.b2.iter() {
-            if key.commit_seq.get() < self.gc_horizon.get() {
+            if key.commit_seq.get() <= self.gc_horizon.get() {
                 stale_b2.push(idx);
             }
         }
@@ -1351,7 +1351,7 @@ impl ArcCacheInner {
 
     fn decrement_page_version(&mut self, pgno: PageNumber) {
         if let Some(count) = self.page_versions.get_mut(&pgno) {
-            *count -= 1;
+            *count = count.saturating_sub(1);
             if *count == 0 {
                 self.page_versions.remove(&pgno);
             }

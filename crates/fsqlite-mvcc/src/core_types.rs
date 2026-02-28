@@ -1790,9 +1790,6 @@ pub fn try_cleanup_orphaned_slot(
         );
 
         let cleaning_word = encode_cleaning(orphan_txn_id);
-        // Clear payload fields BEFORE publishing txn_id=0 so no stale data
-        // is visible once the slot appears free for reuse.
-        slot.clear_payload_fields();
         if slot
             .txn_id
             .compare_exchange(cleaning_word, 0, Ordering::AcqRel, Ordering::Acquire)
@@ -1847,9 +1844,6 @@ pub fn try_cleanup_orphaned_slot(
 
     tracing::info!(orphan_txn_id, "reclaiming orphaned real TxnId slot");
 
-    // Clear payload fields BEFORE publishing txn_id=0 so no stale data
-    // is visible once the slot appears free for reuse.
-    slot.clear_payload_fields();
     if slot
         .txn_id
         .compare_exchange(cleaning_word, 0, Ordering::AcqRel, Ordering::Acquire)

@@ -284,27 +284,7 @@ impl SharedTxnSlot {
         }
     }
 
-    /// Zero all payload fields **except** `txn_id`.
-    ///
-    /// Must be called *before* the final CAS that publishes `txn_id = 0`,
-    /// so that no stale data is visible once the slot appears free.
-    pub fn clear_payload_fields(&self) {
-        self.begin_seq.store(0, Ordering::Release);
-        self.commit_seq.store(0, Ordering::Release);
-        self.snapshot_high.store(0, Ordering::Release);
-        self.write_set_pages.store(0, Ordering::Release);
-        self.state.store(0, Ordering::Release);
-        self.mode.store(0, Ordering::Release);
-        self.has_in_rw.store(false, Ordering::Release);
-        self.has_out_rw.store(false, Ordering::Release);
-        self.marked_for_abort.store(false, Ordering::Release);
-        self.pid_birth.store(0, Ordering::Release);
-        self.lease_expiry.store(0, Ordering::Release);
-        self.claiming_timestamp.store(0, Ordering::Release);
-        self.cleanup_txn_id.store(0, Ordering::Release);
-        self.witness_epoch.store(0, Ordering::Release);
-        self.pid.store(0, Ordering::Release);
-    }
+
 }
 
 impl Default for SharedTxnSlot {

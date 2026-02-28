@@ -45,6 +45,14 @@ where
     if total_payload_size > MAX_ALLOCATION_SIZE {
         return Err(FrankenError::TooBig);
     }
+    if usable_size <= 4 {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "invalid usable page size {} for overflow chain",
+                usable_size
+            ),
+        });
+    }
     let total = total_payload_size as usize;
     let mut payload = Vec::with_capacity(total);
     payload.extend_from_slice(local_data);
@@ -149,6 +157,11 @@ where
         return Err(FrankenError::internal(
             "write_overflow_chain called with empty data",
         ));
+    }
+    if usable_size <= 4 {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!("invalid usable page size {} for overflow chain", usable_size),
+        });
     }
 
     let bytes_per_page = (usable_size - 4) as usize;
