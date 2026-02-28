@@ -14,6 +14,7 @@
 #   ./scripts/verify_differential_ci_lane.sh --lane smoke --seed 424242 --generated-unix-ms 1700000000000
 # Env overrides:
 #   DIFF_LANE_USE_RCH=1
+#   DIFF_LANE_FORCE_RCH=1     Force rch execution even when local runner binaries exist.
 #   DIFF_LANE_RUNNER_BIN=target/debug/differential_manifest_runner
 #   DIFF_DOCTOR_RUNNER_BIN=target/debug/oracle_preflight_doctor_runner
 
@@ -28,6 +29,7 @@ GENERATED_UNIX_MS="${DIFF_LANE_GENERATED_UNIX_MS:-1700000000000}"
 SCENARIO_ID="DIFF-CI-713"
 MAX_ENTRIES=""
 MAX_CASES_PER_ENTRY=""
+FORCE_RCH="${DIFF_LANE_FORCE_RCH:-0}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -125,7 +127,13 @@ resolve_runner_path() {
 
 RUNNER_BIN="${DIFF_LANE_RUNNER_BIN:-}"
 RUNNER=(cargo run -p fsqlite-harness --bin differential_manifest_runner --)
-if [[ -n "${RUNNER_BIN}" ]]; then
+if [[ "${FORCE_RCH}" == "1" ]]; then
+  if ! command -v rch >/dev/null 2>&1; then
+    echo "ERROR: DIFF_LANE_FORCE_RCH=1 but rch is unavailable" >&2
+    exit 2
+  fi
+  RUNNER=(rch exec -- cargo run -p fsqlite-harness --bin differential_manifest_runner --)
+elif [[ -n "${RUNNER_BIN}" ]]; then
   if ! RUNNER_BIN="$(resolve_runner_path "${RUNNER_BIN}")"; then
     echo "ERROR: DIFF_LANE_RUNNER_BIN is not executable: ${RUNNER_BIN}" >&2
     exit 2
@@ -143,7 +151,13 @@ fi
 
 DOCTOR_RUNNER_BIN="${DIFF_DOCTOR_RUNNER_BIN:-}"
 DOCTOR_RUNNER=(cargo run -p fsqlite-harness --bin oracle_preflight_doctor_runner --)
-if [[ -n "${DOCTOR_RUNNER_BIN}" ]]; then
+if [[ "${FORCE_RCH}" == "1" ]]; then
+  if ! command -v rch >/dev/null 2>&1; then
+    echo "ERROR: DIFF_LANE_FORCE_RCH=1 but rch is unavailable" >&2
+    exit 2
+  fi
+  DOCTOR_RUNNER=(rch exec -- cargo run -p fsqlite-harness --bin oracle_preflight_doctor_runner --)
+elif [[ -n "${DOCTOR_RUNNER_BIN}" ]]; then
   if ! DOCTOR_RUNNER_BIN="$(resolve_runner_path "${DOCTOR_RUNNER_BIN}")"; then
     echo "ERROR: DIFF_DOCTOR_RUNNER_BIN is not executable: ${DOCTOR_RUNNER_BIN}" >&2
     exit 2
@@ -282,17 +296,19 @@ jq -e \
     (.run_report.passed >= 0) and
     (.run_report.diverged >= 0) and
     (.run_report.deduplicated.total_before_dedup >= 0) and
-    (.replay.command | length) > 0
+    (.replay.command | type == "string" and length > 0 and (contains("\n") | not) and (contains("\r") | not)) and
+    ((.run_report.diverged == 0) or (.first_failure != null and (.first_failure.replay_command | type == "string" and length > 0 and (contains("\n") | not) and (contains("\r") | not)))) and
+    ((.run_report.passed == 0) or ((.sampled_passing_replays | length) > 0 and (.sampled_passing_replays | all(.replay_command | type == "string" and length > 0 and (contains("\n") | not) and (contains("\r") | not)))))
   ' "${MANIFEST_A}" >/dev/null
 
 if ! diff -u \
-  <(jq -S 'del(.replay.command)' "${MANIFEST_A}") \
-  <(jq -S 'del(.replay.command)' "${MANIFEST_B}") \
+  <(jq -S '.' "${MANIFEST_A}") \
+  <(jq -S '.' "${MANIFEST_B}") \
   >/dev/null; then
   echo "ERROR: deterministic replay check failed; manifests differ" >&2
   diff -u \
-    <(jq -S 'del(.replay.command)' "${MANIFEST_A}") \
-    <(jq -S 'del(.replay.command)' "${MANIFEST_B}") \
+    <(jq -S '.' "${MANIFEST_A}") \
+    <(jq -S '.' "${MANIFEST_B}") \
     >&2 || true
   exit 1
 fi
@@ -310,6 +326,8 @@ if ! diff -u \
 fi
 
 REPLAY_COMMAND="$(jq -r '.replay.command' "${MANIFEST_A}")"
+FIRST_FAILURE_REPLAY_COMMAND="$(jq -r '.first_failure.replay_command // ""' "${MANIFEST_A}")"
+SAMPLED_PASSING_REPLAY_COUNT="$(jq -r '.sampled_passing_replays | length' "${MANIFEST_A}")"
 TOTAL_CASES="$(jq -r '.run_report.total_cases' "${MANIFEST_A}")"
 PASSED_CASES="$(jq -r '.run_report.passed' "${MANIFEST_A}")"
 DIVERGED_CASES="$(jq -r '.run_report.diverged' "${MANIFEST_A}")"
@@ -363,6 +381,8 @@ if ${JSON_OUTPUT}; then
     --argjson dedup_unique_count "${DEDUP_UNIQUE_COUNT}" \
     --argjson dedup_total_count "${DEDUP_TOTAL_COUNT}" \
     --arg replay_command "${REPLAY_COMMAND}" \
+    --arg first_failure_replay_command "${FIRST_FAILURE_REPLAY_COMMAND}" \
+    --argjson sampled_passing_replay_count "${SAMPLED_PASSING_REPLAY_COUNT}" \
     --arg mismatch_class_counts "${MISMATCH_CLASS_COUNTS}" \
     --arg manifest_a "${MANIFEST_A#${WORKSPACE_ROOT}/}" \
     --arg manifest_b "${MANIFEST_B#${WORKSPACE_ROOT}/}" \
@@ -406,7 +426,8 @@ if ${JSON_OUTPUT}; then
           diverged_cases: $diverged_cases,
           mismatch_class_counts: ($mismatch_class_counts | fromjson),
           deduplicated_unique_failures: $dedup_unique_count,
-          deduplicated_total_failures: $dedup_total_count
+          deduplicated_total_failures: $dedup_total_count,
+          sampled_passing_replay_count: $sampled_passing_replay_count
         },
         artifacts: {
           manifest_a: $manifest_a,
@@ -419,7 +440,8 @@ if ${JSON_OUTPUT}; then
           doctor_human: $doctor_human,
           doctor_log: $doctor_log
         },
-        replay_command: $replay_command
+        replay_command: $replay_command,
+        first_failure_replay_command: $first_failure_replay_command
       }
     '
 else
@@ -446,6 +468,7 @@ else
   echo "Dedup unique:         ${DEDUP_UNIQUE_COUNT}"
   echo "Dedup total:          ${DEDUP_TOTAL_COUNT}"
   echo "Mismatch classes:     ${MISMATCH_CLASS_COUNTS}"
+  echo "Sampled pass replays: ${SAMPLED_PASSING_REPLAY_COUNT}"
   echo "Manifest A:           ${MANIFEST_A#${WORKSPACE_ROOT}/}"
   echo "Manifest B:           ${MANIFEST_B#${WORKSPACE_ROOT}/}"
   echo "Runner log A:         ${RUN_A_LOG#${WORKSPACE_ROOT}/}"
@@ -458,4 +481,8 @@ else
   done
   echo "Replay command:"
   echo "  ${REPLAY_COMMAND}"
+  if [[ -n "${FIRST_FAILURE_REPLAY_COMMAND}" ]]; then
+    echo "First-failure replay command:"
+    echo "  ${FIRST_FAILURE_REPLAY_COMMAND}"
+  fi
 fi

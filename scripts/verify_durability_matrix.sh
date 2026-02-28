@@ -7,6 +7,7 @@
 # Env overrides:
 #   DURABILITY_MATRIX_ROOT_SEED=<u64|0xhex>
 #   DURABILITY_MATRIX_USE_RCH=1
+#   DURABILITY_MATRIX_FORCE_RCH=1  Force rch execution even when local runner binary exists.
 #   DURABILITY_MATRIX_RUNNER_BIN=target/debug/durability_matrix_manifest
 
 set -euo pipefail
@@ -15,6 +16,7 @@ WORKSPACE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BEAD_ID="bd-mblr.7.4"
 JSON_OUTPUT=false
 ROOT_SEED="${DURABILITY_MATRIX_ROOT_SEED:-0xB740000000000001}"
+FORCE_RCH="${DURABILITY_MATRIX_FORCE_RCH:-0}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -73,7 +75,13 @@ REPORT_JSON="${ART_ROOT}/report.json"
 
 RUNNER_BIN="${DURABILITY_MATRIX_RUNNER_BIN:-}"
 RUNNER=(cargo run -p fsqlite-harness --bin durability_matrix_manifest --)
-if [[ -n "${RUNNER_BIN}" ]]; then
+if [[ "${FORCE_RCH}" == "1" ]]; then
+  if ! command -v rch >/dev/null 2>&1; then
+    echo "ERROR: DURABILITY_MATRIX_FORCE_RCH=1 but rch is unavailable" >&2
+    exit 2
+  fi
+  RUNNER=(rch exec -- cargo run -p fsqlite-harness --bin durability_matrix_manifest --)
+elif [[ -n "${RUNNER_BIN}" ]]; then
   if [[ ! -x "${RUNNER_BIN}" ]]; then
     echo "ERROR: DURABILITY_MATRIX_RUNNER_BIN is not executable: ${RUNNER_BIN}" >&2
     exit 2
