@@ -1114,6 +1114,7 @@ impl fmt::Display for ColumnConstraintKind {
                 }
                 Ok(())
             }
+            Self::Null => f.write_str("NULL"),
             Self::Unique { conflict } => {
                 f.write_str("UNIQUE")?;
                 if let Some(action) = conflict {

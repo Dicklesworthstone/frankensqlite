@@ -1052,6 +1052,7 @@ pub enum ColumnConstraintKind {
     NotNull {
         conflict: Option<ConflictAction>,
     },
+    Null,
     Unique {
         conflict: Option<ConflictAction>,
     },

@@ -367,6 +367,14 @@ impl Parser {
         match self.peek_kind() {
             TokenKind::KwCollate => Some(bp::COLLATE),
             TokenKind::KwIsnull | TokenKind::KwNotnull => Some(bp::EQUALITY.0),
+            TokenKind::KwNot => {
+                if let Some(next) = self.tokens.get(self.pos + 1) {
+                    if matches!(next.kind, TokenKind::KwNull) {
+                        return Some(bp::EQUALITY.0);
+                    }
+                }
+                None
+            }
             _ => None,
         }
     }
@@ -399,6 +407,15 @@ impl Parser {
             }
             TokenKind::KwNotnull => {
                 let span = lhs.span().merge(tok.span);
+                Ok(Expr::IsNull {
+                    expr: Box::new(lhs),
+                    not: true,
+                    span,
+                })
+            }
+            TokenKind::KwNot => {
+                let null_tok = self.advance_token(); // we know from postfix_bp that this is KwNull
+                let span = lhs.span().merge(null_tok.span);
                 Ok(Expr::IsNull {
                     expr: Box::new(lhs),
                     not: true,
@@ -487,9 +504,23 @@ impl Parser {
             TokenKind::KwOr => self.make_binop(lhs, BinaryOp::Or, r_bp),
             TokenKind::KwAnd => self.make_binop(lhs, BinaryOp::And, r_bp),
 
-            // ── IS [NOT] [NULL | expr] ──────────────────────────────────
+            // ── IS [NOT] [DISTINCT FROM | NULL | expr] ──────────────────────────────────
             TokenKind::KwIs => {
                 let not = self.eat_kind(&TokenKind::KwNot);
+                if self.eat_kind(&TokenKind::KwDistinct) {
+                    self.expect_kind(&TokenKind::KwFrom)?;
+                    let rhs = self.parse_expr_bp(r_bp)?;
+                    let span = lhs.span().merge(rhs.span());
+                    // IS DISTINCT FROM is equivalent to IS NOT
+                    // IS NOT DISTINCT FROM is equivalent to IS
+                    let op = if not { BinaryOp::Is } else { BinaryOp::IsNot };
+                    return Ok(Expr::BinaryOp {
+                        left: Box::new(lhs),
+                        op,
+                        right: Box::new(rhs),
+                        span,
+                    });
+                }
                 if matches!(self.peek_kind(), TokenKind::KwNull) {
                     let end = self.advance_token().span;
                     let span = lhs.span().merge(end);

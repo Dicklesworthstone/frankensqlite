@@ -1248,6 +1248,7 @@ impl Parser {
             self.peek(),
             TokenKind::KwPrimary
                 | TokenKind::KwNot
+                | TokenKind::KwNull
                 | TokenKind::KwUnique
                 | TokenKind::KwCheck
                 | TokenKind::KwDefault
@@ -1286,6 +1287,8 @@ impl Parser {
             self.advance();
             let conflict = self.parse_on_conflict()?;
             ColumnConstraintKind::NotNull { conflict }
+        } else if self.eat_kw(&TokenKind::KwNull) {
+            ColumnConstraintKind::Null
         } else if self.eat_kw(&TokenKind::KwUnique) {
             let conflict = self.parse_on_conflict()?;
             ColumnConstraintKind::Unique { conflict }

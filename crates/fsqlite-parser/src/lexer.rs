@@ -379,23 +379,17 @@ impl<'a> Lexer<'a> {
                 continue;
             }
 
-            // Block comment: `/* ... */` (supports nesting per SQLite spec)
+            // Block comment: `/* ... */` (SQLite does NOT support nesting)
             if self.src[self.pos] == b'/' && self.peek_at(1) == Some(b'*') {
                 self.advance(); // skip /
                 self.advance(); // skip *
-                let mut depth = 1u32;
-                while self.pos < self.src.len() && depth > 0 {
-                    if self.src[self.pos] == b'/' && self.peek_at(1) == Some(b'*') {
+                while self.pos < self.src.len() {
+                    if self.src[self.pos] == b'*' && self.peek_at(1) == Some(b'/') {
                         self.advance();
                         self.advance();
-                        depth += 1;
-                    } else if self.src[self.pos] == b'*' && self.peek_at(1) == Some(b'/') {
-                        self.advance();
-                        self.advance();
-                        depth -= 1;
-                    } else {
-                        self.advance();
+                        break;
                     }
+                    self.advance();
                 }
                 continue;
             }
