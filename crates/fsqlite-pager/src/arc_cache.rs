@@ -509,8 +509,8 @@ pub struct ArcCacheInner {
     max_bytes: usize,
     /// Unified directory: key → location in one of the four lists.
     directory: HashMap<CacheKey, Location>,
-    /// Per-page version count (for superseded detection).
-    page_versions: HashMap<PageNumber, usize>,
+    /// Per-page version list (for precise superseded detection).
+    page_versions: HashMap<PageNumber, Vec<CommitSeq>>,
     /// GC horizon for superseded version preference.
     gc_horizon: CommitSeq,
     /// Number of times ARC had to allow temporary growth because all
@@ -655,7 +655,7 @@ impl ArcCacheInner {
         let multi_version_pages = self
             .page_versions
             .values()
-            .filter(|&&count| count > 1)
+            .filter(|&versions| versions.len() > 1)
             .count();
 
         CacheMetricsSnapshot {
@@ -974,7 +974,10 @@ impl ArcCacheInner {
         };
 
         self.total_bytes += byte_size;
-        *self.page_versions.entry(key.pgno).or_insert(0) += 1;
+        self.page_versions
+            .entry(key.pgno)
+            .or_default()
+            .push(key.commit_seq);
 
         // Phase 2.5 was removed: opportunistic version coalescing here caused O(N)
         // latency spikes on the hot path. Superseded versions are reclaimed
@@ -1025,7 +1028,7 @@ impl ArcCacheInner {
             let page = self.t1.remove(victim_idx);
             let key = page.key;
             self.total_bytes -= page.byte_size;
-            self.decrement_page_version(key.pgno);
+            self.remove_page_version(key.pgno, key.commit_seq);
             self.directory.remove(&key);
             // Move ghost to B1.
             let ghost_idx = self.b1.push_back(key);
@@ -1044,7 +1047,7 @@ impl ArcCacheInner {
             let page = self.t2.remove(victim_idx);
             let key = page.key;
             self.total_bytes -= page.byte_size;
-            self.decrement_page_version(key.pgno);
+            self.remove_page_version(key.pgno, key.commit_seq);
             self.directory.remove(&key);
             // Move ghost to B2.
             let ghost_idx = self.b2.push_back(key);
@@ -1063,7 +1066,7 @@ impl ArcCacheInner {
             let page = self.t1.remove(victim_idx);
             let key = page.key;
             self.total_bytes -= page.byte_size;
-            self.decrement_page_version(key.pgno);
+            self.remove_page_version(key.pgno, key.commit_seq);
             self.directory.remove(&key);
             drop(page);
             self.evictions_t1 += 1;
@@ -1079,7 +1082,7 @@ impl ArcCacheInner {
             let page = self.t2.remove(victim_idx);
             let key = page.key;
             self.total_bytes -= page.byte_size;
-            self.decrement_page_version(key.pgno);
+            self.remove_page_version(key.pgno, key.commit_seq);
             self.directory.remove(&key);
             drop(page);
             self.evictions_t2 += 1;
@@ -1130,12 +1133,17 @@ impl ArcCacheInner {
             if page.is_pinned() {
                 continue;
             }
-            let count = self.page_versions.get(&page.key.pgno).copied().unwrap_or(0);
-            if count > 1
-                && page.key.commit_seq != CommitSeq::ZERO
-                && page.key.commit_seq <= self.gc_horizon
-            {
-                return Some(idx);
+            let versions = self
+                .page_versions
+                .get(&page.key.pgno)
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]);
+            let seq = page.key.commit_seq;
+            if seq != CommitSeq::ZERO && seq <= self.gc_horizon {
+                let is_superseded = versions.iter().any(|&v| v > seq && v <= self.gc_horizon);
+                if is_superseded {
+                    return Some(idx);
+                }
             }
         }
         None
@@ -1179,7 +1187,7 @@ impl ArcCacheInner {
             let page = self.t1.remove(idx);
             let key = page.key;
             self.total_bytes -= page.byte_size;
-            self.decrement_page_version(key.pgno);
+            self.remove_page_version(key.pgno, key.commit_seq);
             self.directory.remove(&key);
             self.version_coalesce_count = self.version_coalesce_count.saturating_add(1);
             return true;
@@ -1188,7 +1196,7 @@ impl ArcCacheInner {
             let page = self.t2.remove(idx);
             let key = page.key;
             self.total_bytes -= page.byte_size;
-            self.decrement_page_version(key.pgno);
+            self.remove_page_version(key.pgno, key.commit_seq);
             self.directory.remove(&key);
             self.version_coalesce_count = self.version_coalesce_count.saturating_add(1);
             return true;
@@ -1246,7 +1254,7 @@ impl ArcCacheInner {
                     };
 
                     self.total_bytes = self.total_bytes.saturating_sub(page.byte_size);
-                    self.decrement_page_version(key.pgno);
+                    self.remove_page_version(key.pgno, key.commit_seq);
                     self.directory.remove(&key);
                     removed += 1;
                 }
@@ -1314,7 +1322,7 @@ impl ArcCacheInner {
                 ResidentList::T2 => self.t2.remove(idx),
             };
             self.total_bytes = self.total_bytes.saturating_sub(page.byte_size);
-            self.decrement_page_version(key.pgno);
+            self.remove_page_version(key.pgno, key.commit_seq);
             self.directory.remove(&key);
             removed += 1;
         }
@@ -1349,10 +1357,10 @@ impl ArcCacheInner {
         }
     }
 
-    fn decrement_page_version(&mut self, pgno: PageNumber) {
-        if let Some(count) = self.page_versions.get_mut(&pgno) {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
+    fn remove_page_version(&mut self, pgno: PageNumber, seq: CommitSeq) {
+        if let Some(versions) = self.page_versions.get_mut(&pgno) {
+            versions.retain(|&v| v != seq);
+            if versions.is_empty() {
                 self.page_versions.remove(&pgno);
             }
         }

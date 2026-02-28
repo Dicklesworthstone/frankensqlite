@@ -495,7 +495,17 @@ impl<P: PageReader> BtCursor<P> {
 
     /// Parse a cell at the given index on the top-of-stack page.
     fn parse_cell_at(&self, entry: &StackEntry, idx: u16) -> Result<CellRef> {
-        let offset = entry.cell_pointers[idx as usize] as usize;
+        let idx_usize = idx as usize;
+        if idx_usize >= entry.cell_pointers.len() {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "cell index {} out of bounds ({})",
+                    idx,
+                    entry.cell_pointers.len()
+                ),
+            });
+        }
+        let offset = entry.cell_pointers[idx_usize] as usize;
         CellRef::parse(
             &entry.page_data,
             offset,

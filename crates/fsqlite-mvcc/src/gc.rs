@@ -272,6 +272,7 @@ pub fn prune_page_chain_with_registry(
     while let Some(idx) = cur_idx {
         let Some(version) = arena.get(idx) else {
             // Broken chain — stop.
+            cur_idx = None;
             break;
         };
         if version.commit_seq <= horizon {
