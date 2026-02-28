@@ -507,6 +507,7 @@ impl PreparedStatement {
                 self.schema_cookie,
                 None,
                 HashMap::new(),
+                HashMap::new(),
                 false,
             );
             // Commit the read transaction (no-op for deferred reads).
@@ -555,6 +556,7 @@ impl PreparedStatement {
                 txn,
                 self.schema_cookie,
                 None,
+                HashMap::new(),
                 HashMap::new(),
                 false,
             );
@@ -4266,6 +4268,30 @@ impl Connection {
             if autoincrement_tables.contains(&key) {
                 let seq = sqlite_sequence_cache.get(&key).copied().unwrap_or(0);
                 out.insert(table.root_page, seq);
+            }
+        }
+        out
+    }
+
+    /// Build evaluated column default values keyed by root page.
+    /// Used by the VDBE engine to apply ALTER TABLE ADD COLUMN defaults
+    /// when a row's record has fewer columns than the current schema.
+    fn column_defaults_by_root_page(&self) -> HashMap<i32, Vec<Option<SqliteValue>>> {
+        let schema = self.schema.borrow();
+        let mut out = HashMap::new();
+        for table in schema.iter() {
+            let defaults: Vec<Option<SqliteValue>> = table
+                .columns
+                .iter()
+                .map(|col| {
+                    col.default_value
+                        .as_deref()
+                        .and_then(|sql| self.evaluate_column_default_value(Some(sql)).ok())
+                })
+                .collect();
+            // Only include tables that have at least one non-None default.
+            if defaults.iter().any(Option::is_some) {
+                out.insert(table.root_page, defaults);
             }
         }
         out
@@ -9288,6 +9314,7 @@ impl Connection {
         let func_reg = self.func_registry.borrow().clone();
         let reject_mem = *self.reject_mem_fallback.borrow();
         let autoincrement_seq_by_root_page = self.autoincrement_sequence_by_root_page();
+        let col_defaults_by_root_page = self.column_defaults_by_root_page();
         let (result, txn_back) = execute_table_program_with_db(
             program,
             params,
@@ -9297,6 +9324,7 @@ impl Connection {
             cookie,
             concurrent_ctx,
             autoincrement_seq_by_root_page,
+            col_defaults_by_root_page,
             reject_mem,
         );
         // Always restore the transaction handle, even on error.
@@ -11108,7 +11136,9 @@ fn evaluate_having_value(
                 evaluate_having_value(inner, values, descriptors, columns, group_rows, col_names);
             match op {
                 fsqlite_ast::UnaryOp::Negate => match v {
-                    SqliteValue::Integer(n) => SqliteValue::Integer(-n),
+                    SqliteValue::Integer(n) => n
+                        .checked_neg()
+                        .map_or_else(|| SqliteValue::Float(-(n as f64)), SqliteValue::Integer),
                     SqliteValue::Float(f) => SqliteValue::Float(-f),
                     _ => SqliteValue::Null,
                 },
@@ -11862,6 +11892,7 @@ fn execute_table_program_with_db(
     schema_cookie: u32,
     concurrent_ctx: Option<ConcurrentExecContext>,
     autoincrement_seq_by_root_page: HashMap<i32, i64>,
+    column_defaults_by_root_page: HashMap<i32, Vec<Option<SqliteValue>>>,
     reject_mem_fallback: bool,
 ) -> (Result<Vec<Row>>, Option<Box<dyn TransactionHandle>>) {
     let execution_span = tracing::span!(
@@ -11883,6 +11914,7 @@ fn execute_table_program_with_db(
     engine.set_function_registry(Arc::clone(func_registry));
     engine.set_schema_cookie(schema_cookie);
     engine.set_autoincrement_sequence_by_root_page(autoincrement_seq_by_root_page);
+    engine.set_column_defaults_by_root_page(column_defaults_by_root_page);
     // bd-2ttd8.1: enable parity-cert mode to reject MemPageStore fallback.
     engine.set_reject_mem_fallback(reject_mem_fallback);
 
@@ -14465,7 +14497,9 @@ fn eval_join_expr(
             let val = eval_join_expr(inner, row, col_map)?;
             Ok(match op {
                 UnaryOp::Negate => match val {
-                    SqliteValue::Integer(n) => SqliteValue::Integer(-n),
+                    SqliteValue::Integer(n) => n
+                        .checked_neg()
+                        .map_or_else(|| SqliteValue::Float(-(n as f64)), SqliteValue::Integer),
                     SqliteValue::Float(f) => SqliteValue::Float(-f),
                     _ => SqliteValue::Null,
                 },

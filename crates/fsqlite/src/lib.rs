@@ -6847,7 +6847,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "ALTER TABLE ADD COLUMN DEFAULT values not yet returned for existing rows"]
     fn conformance_032_add_column() {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE t1(id INTEGER PRIMARY KEY, name TEXT)")
@@ -6871,7 +6870,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "ALTER TABLE ADD COLUMN DEFAULT values not yet returned for existing rows"]
     fn conformance_032_add_multiple_columns() {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE t1(id INTEGER PRIMARY KEY, name TEXT)")

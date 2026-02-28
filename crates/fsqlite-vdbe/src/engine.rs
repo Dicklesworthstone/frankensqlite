@@ -1763,6 +1763,14 @@ pub struct VdbeEngine {
     /// AUTOINCREMENT high-water marks keyed by root page number (bd-31j76).
     /// Populated from `sqlite_sequence` by the Connection before execution.
     autoincrement_seq_by_root_page: HashMap<i32, i64>,
+    /// Per-cursor monotonic sequence counters for `Opcode::Sequence`.
+    sequence_counters: HashMap<i32, i64>,
+    /// Column default values by root page number (for ALTER TABLE ADD COLUMN).
+    /// When a row has fewer columns than the schema expects, defaults from this
+    /// map are applied instead of returning NULL.
+    column_defaults_by_root_page: HashMap<i32, Vec<Option<SqliteValue>>>,
+    /// Mapping from cursor_id to root_page for default value lookup.
+    cursor_root_pages: HashMap<i32, i32>,
 }
 
 /// A set of rowids for RowSetAdd/RowSetRead/RowSetTest opcodes.
@@ -1877,6 +1885,9 @@ impl VdbeEngine {
             rowsets: SwissIndex::new(),
             fk_counter: 0,
             autoincrement_seq_by_root_page: HashMap::new(),
+            sequence_counters: HashMap::new(),
+            column_defaults_by_root_page: HashMap::new(),
+            cursor_root_pages: HashMap::new(),
         }
     }
 
@@ -2033,6 +2044,15 @@ impl VdbeEngine {
     /// for tables declared with `AUTOINCREMENT`.
     pub fn set_autoincrement_sequence_by_root_page(&mut self, map: HashMap<i32, i64>) {
         self.autoincrement_seq_by_root_page = map;
+    }
+
+    /// Set column default values by root page, used for ALTER TABLE ADD COLUMN.
+    /// Each entry maps a root page to a list of per-column defaults (None = no default).
+    pub fn set_column_defaults_by_root_page(
+        &mut self,
+        map: HashMap<i32, Vec<Option<SqliteValue>>>,
+    ) {
+        self.column_defaults_by_root_page = map;
     }
 
     /// Execute a VDBE program to completion.
@@ -2553,7 +2573,9 @@ impl VdbeEngine {
                     let result = if a.is_null() {
                         SqliteValue::Null
                     } else {
-                        SqliteValue::Integer(i64::from(a.to_float() == 0.0))
+                        // C SQLite uses sqlite3VdbeIntValue (integer truncation),
+                        // not float comparison. NOT 0.5 → 1 (0.5 truncates to 0).
+                        SqliteValue::Integer(i64::from(a.to_integer() == 0))
                     };
                     self.set_reg(op.p2, result);
                     pc += 1;
@@ -2689,6 +2711,7 @@ impl VdbeEngine {
                             "OpenRead failed: could not open storage cursor on root page {root_page}"
                         )));
                     }
+                    self.cursor_root_pages.insert(cursor_id, root_page);
                     self.cursors.remove(&cursor_id);
                     pc += 1;
                 }
@@ -2703,6 +2726,7 @@ impl VdbeEngine {
                             "OpenWrite failed: could not open storage cursor on root page {root_page}"
                         )));
                     }
+                    self.cursor_root_pages.insert(cursor_id, root_page);
                     self.cursors.remove(&cursor_id);
                     pc += 1;
                 }
@@ -3721,7 +3745,10 @@ impl VdbeEngine {
                 }
 
                 Opcode::Sequence => {
-                    self.set_reg(op.p2, SqliteValue::Integer(0));
+                    let counter = self.sequence_counters.entry(op.p1).or_insert(0);
+                    let val = *counter;
+                    *counter += 1;
+                    self.set_reg(op.p2, SqliteValue::Integer(val));
                     pc += 1;
                 }
 
@@ -4633,7 +4660,18 @@ impl VdbeEngine {
             }
             let payload = cursor.cursor.payload(&cursor.cx)?;
             let values = decode_record(&SqliteValue::Blob(payload))?;
-            return Ok(values.get(col_idx).cloned().unwrap_or(SqliteValue::Null));
+            if col_idx < values.len() {
+                return Ok(values[col_idx].clone());
+            }
+            // Column beyond record width — check ALTER TABLE ADD COLUMN defaults.
+            if let Some(&root_page) = self.cursor_root_pages.get(&cursor_id) {
+                if let Some(defaults) = self.column_defaults_by_root_page.get(&root_page) {
+                    if let Some(Some(default_val)) = defaults.get(col_idx) {
+                        return Ok(default_val.clone());
+                    }
+                }
+            }
+            return Ok(SqliteValue::Null);
         }
 
         if let Some(cursor) = self.cursors.get(&cursor_id) {
@@ -5231,18 +5269,24 @@ fn sql_rem(dividend: &SqliteValue, divisor: &SqliteValue) -> SqliteValue {
     if dividend.is_null() || divisor.is_null() {
         return SqliteValue::Null;
     }
-    let a = dividend.to_integer();
-    let b = divisor.to_integer();
-    if b == 0 {
-        SqliteValue::Null
-    } else {
-        // checked_rem handles i64::MIN % -1 which would overflow.
-        match a.checked_rem(b) {
+    // C SQLite: if both operands are integers, use integer remainder.
+    // Otherwise, use float remainder (fmod).
+    if let (SqliteValue::Integer(a), SqliteValue::Integer(b)) = (dividend, divisor) {
+        if *b == 0 {
+            return SqliteValue::Null;
+        }
+        return match a.checked_rem(*b) {
             Some(result) => SqliteValue::Integer(result),
             // i64::MIN % -1 = 0 mathematically (no remainder).
             None => SqliteValue::Integer(0),
-        }
+        };
     }
+    let fa = dividend.to_float();
+    let fb = divisor.to_float();
+    if fb == 0.0 {
+        return SqliteValue::Null;
+    }
+    SqliteValue::Float(fa % fb)
 }
 
 /// SQL shift left (SQLite semantics: negative shift = shift right).
@@ -5324,6 +5368,13 @@ fn sql_cast(val: SqliteValue, target: i32) -> SqliteValue {
     // But more commonly p2 is used as an affinity character.
     #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
     let target_byte = target as u8;
+    // C SQLite interprets blob bytes as UTF-8 text before numeric casts.
+    let val = match (val, target_byte) {
+        (SqliteValue::Blob(b), b'C' | b'c' | b'D' | b'd' | b'E' | b'e') => {
+            SqliteValue::Text(String::from_utf8_lossy(&b).into_owned())
+        }
+        (other, _) => other,
+    };
     match target_byte {
         b'A' | b'a' => SqliteValue::Blob(match val {
             SqliteValue::Blob(b) => b,
