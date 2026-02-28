@@ -4321,7 +4321,12 @@ impl Connection {
                         .as_ref()
                         .is_some_and(|tn| tn.name.eq_ignore_ascii_case("INTEGER"));
                     let pk = col.constraints.iter().find_map(|c| {
-                        if let ColumnConstraintKind::PrimaryKey { autoincrement, direction, .. } = c.kind {
+                        if let ColumnConstraintKind::PrimaryKey {
+                            autoincrement,
+                            direction,
+                            ..
+                        } = c.kind
+                        {
                             if direction != Some(fsqlite_ast::SortDirection::Desc) {
                                 Some(autoincrement)
                             } else {
@@ -4351,10 +4356,20 @@ impl Connection {
                             .constraints
                             .iter()
                             .any(|c| matches!(c.kind, ColumnConstraintKind::NotNull { .. }));
-                        let unique = col
-                            .constraints
-                            .iter()
-                            .any(|c| matches!(c.kind, ColumnConstraintKind::Unique { .. }));
+                        let col_is_integer = col
+                            .type_name
+                            .as_ref()
+                            .is_some_and(|tn| tn.name.eq_ignore_ascii_case("INTEGER"));
+                        let is_non_ipk_pk = !col_is_integer
+                            && col
+                                .constraints
+                                .iter()
+                                .any(|c| matches!(c.kind, ColumnConstraintKind::PrimaryKey { .. }));
+                        let unique = is_non_ipk_pk
+                            || col
+                                .constraints
+                                .iter()
+                                .any(|c| matches!(c.kind, ColumnConstraintKind::Unique { .. }));
                         let default_value = col.constraints.iter().find_map(|c| match &c.kind {
                             ColumnConstraintKind::Default(dv) => Some(format_default_value(dv)),
                             _ => None,
@@ -4415,7 +4430,8 @@ impl Connection {
                     for tc in constraints {
                         if let TableConstraintKind::Unique {
                             columns: idx_cols, ..
-                        } | TableConstraintKind::PrimaryKey {
+                        }
+                        | TableConstraintKind::PrimaryKey {
                             columns: idx_cols, ..
                         } = &tc.kind
                         {
@@ -4450,6 +4466,58 @@ impl Connection {
                 let num_columns = col_infos.len();
                 let root_page = self.allocate_root_page()?;
                 self.db.borrow_mut().create_table_at(root_page, num_columns);
+
+                // Register UNIQUE column groups with MemTable for in-memory
+                // constraint enforcement. This is needed because MemDatabase
+                // indexes are no-ops, so unique constraints must be checked
+                // directly during Insert.
+                {
+                    let mut db = self.db.borrow_mut();
+                    if let Some(mem_table) = db.get_table_mut(root_page) {
+                        // Column-level UNIQUE/non-IPK-PRIMARY KEY constraints.
+                        for (i, col) in col_infos.iter().enumerate() {
+                            if col.unique && !col.is_ipk {
+                                mem_table.add_unique_column_group(vec![i]);
+                            }
+                        }
+                        // Table-level UNIQUE/PRIMARY KEY constraints.
+                        if let CreateTableBody::Columns { constraints, .. } = &create.body {
+                            for tc in constraints {
+                                if let TableConstraintKind::Unique {
+                                    columns: idx_cols, ..
+                                }
+                                | TableConstraintKind::PrimaryKey {
+                                    columns: idx_cols, ..
+                                } = &tc.kind
+                                {
+                                    let col_indices: Vec<usize> = idx_cols
+                                        .iter()
+                                        .filter_map(|ic| {
+                                            if let fsqlite_ast::Expr::Column(col_ref, _) = &ic.expr
+                                            {
+                                                col_infos.iter().position(|c| {
+                                                    c.name.eq_ignore_ascii_case(&col_ref.column)
+                                                })
+                                            } else {
+                                                None
+                                            }
+                                        })
+                                        .collect();
+                                    if !col_indices.is_empty() {
+                                        // Skip if this is an IPK-only primary key (already
+                                        // enforced by rowid uniqueness).
+                                        let all_ipk =
+                                            col_indices.iter().all(|&i| col_infos[i].is_ipk);
+                                        if !all_ipk {
+                                            mem_table.add_unique_column_group(col_indices);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 let table_schema = TableSchema {
                     name: table_name,
                     root_page,

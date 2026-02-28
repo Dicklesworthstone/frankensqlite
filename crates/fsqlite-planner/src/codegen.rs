@@ -522,7 +522,7 @@ pub fn codegen_insert(
             )?;
         }
         InsertSource::DefaultValues => {
-            return Err(CodegenError::Unsupported("DEFAULT VALUES".to_owned()));
+            codegen_insert_default_values(b, cursor, table, &stmt.returning, ctx, oe_flag)?;
         }
     }
 
@@ -583,13 +583,10 @@ fn codegen_insert_values(
                     };
                     b.emit_op(Opcode::Variable, idx, reg, 0, P4::None, 0);
                 }
-                Expr::Literal(_, _) => {
-                    emit_expr(b, val_expr, reg)?;
-                }
                 _ => {
-                    return Err(CodegenError::Unsupported(
-                        "INSERT currently supports only literal and placeholder values".to_owned(),
-                    ));
+                    // All other expressions (literals, arithmetic, function
+                    // calls, CASE, CAST, etc.) are handled by emit_expr.
+                    emit_expr(b, val_expr, reg)?;
                 }
             }
         }
@@ -617,6 +614,70 @@ fn codegen_insert_values(
         if !returning.is_empty() {
             b.emit_op(Opcode::ResultRow, rowid_reg, 1, 0, P4::None, 0);
         }
+    }
+
+    Ok(())
+}
+
+/// Emit an INSERT with DEFAULT VALUES (all columns get NULL).
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::unnecessary_wraps
+)]
+fn codegen_insert_default_values(
+    b: &mut ProgramBuilder,
+    cursor: i32,
+    table: &TableSchema,
+    returning: &[ResultColumn],
+    ctx: &CodegenContext,
+    oe_flag: u16,
+) -> Result<(), CodegenError> {
+    let rowid_reg = b.alloc_reg();
+    let concurrent_flag = i32::from(ctx.concurrent_mode);
+    let n_cols = table.columns.len() as i32;
+
+    b.emit_op(
+        Opcode::NewRowid,
+        cursor,
+        rowid_reg,
+        concurrent_flag,
+        P4::None,
+        0,
+    );
+
+    // Allocate registers for columns and set all to NULL.
+    let val_regs = b.alloc_regs(n_cols);
+    b.emit_op(
+        Opcode::Null,
+        0,
+        val_regs,
+        val_regs + n_cols - 1,
+        P4::None,
+        0,
+    );
+
+    let rec_reg = b.alloc_reg();
+    b.emit_op(
+        Opcode::MakeRecord,
+        val_regs,
+        n_cols,
+        rec_reg,
+        P4::Affinity(table.affinity_string()),
+        0,
+    );
+
+    b.emit_op(
+        Opcode::Insert,
+        cursor,
+        rec_reg,
+        rowid_reg,
+        P4::Table(table.name.clone()),
+        oe_flag,
+    );
+
+    if !returning.is_empty() {
+        b.emit_op(Opcode::ResultRow, rowid_reg, 1, 0, P4::None, 0);
     }
 
     Ok(())
@@ -826,13 +887,10 @@ pub fn codegen_update(
                 };
                 b.emit_op(Opcode::Variable, idx, reg, 0, P4::None, 0);
             }
-            Expr::Literal(_, _) => {
-                emit_expr(b, &assign.value, reg)?;
-            }
             _ => {
-                return Err(CodegenError::Unsupported(
-                    "UPDATE currently supports only literal and placeholder assignments".to_owned(),
-                ));
+                // All other expressions (literals, arithmetic, function
+                // calls, CASE, CAST, etc.) are handled by emit_expr.
+                emit_expr(b, &assign.value, reg)?;
             }
         }
     }
