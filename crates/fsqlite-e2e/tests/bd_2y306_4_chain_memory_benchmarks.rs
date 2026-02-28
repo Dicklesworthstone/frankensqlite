@@ -324,7 +324,7 @@ fn run_long_reader_scenario(seed: u64) -> LongReaderMetrics {
         let byte = u8::try_from((step + rng.gen_range(1..17)) % 251).expect("u8 bounded");
         mgr.write_page(&mut writer, hot_pgno, test_data(byte))
             .expect("writer write phase1");
-        if let Err(MvccError::Busy) = mgr.commit(&mut writer) {
+        if mgr.commit(&mut writer) == Err(MvccError::Busy) {
             busy_before_release = busy_before_release.saturating_add(1);
         }
     }
@@ -340,7 +340,7 @@ fn run_long_reader_scenario(seed: u64) -> LongReaderMetrics {
         let byte = u8::try_from((step + rng.gen_range(5..29)) % 251).expect("u8 bounded");
         mgr.write_page(&mut writer, hot_pgno, test_data(byte))
             .expect("writer write phase2");
-        if let Err(MvccError::Busy) = mgr.commit(&mut writer) {
+        if mgr.commit(&mut writer) == Err(MvccError::Busy) {
             busy_after_release = busy_after_release.saturating_add(1);
         }
     }

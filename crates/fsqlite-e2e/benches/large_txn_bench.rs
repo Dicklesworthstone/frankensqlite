@@ -98,14 +98,18 @@ fn bench_large_txn_100k(c: &mut Criterion) {
             },
             |conn| {
                 conn.execute("BEGIN").unwrap();
+                let stmt = conn
+                    .prepare(
+                        "INSERT INTO bench VALUES (\
+                             ?1, ('name_' || ?1), ('user_' || ?1 || '@test.com'), (?1 * 7), \
+                             ('2026-01-' || ((?1 % 28) + 1))\
+                         )",
+                    )
+                    .unwrap();
                 #[allow(clippy::cast_possible_wrap)]
                 for i in 0..ROW_COUNT_100K as i64 {
-                    conn.execute(&format!(
-                        "INSERT INTO bench VALUES ({i}, 'name_{i}', 'user_{i}@test.com', {}, '2026-01-{}')",
-                        i * 7,
-                        (i % 28) + 1,
-                    ))
-                    .unwrap();
+                    stmt.execute_with_params(&[SqliteValue::Integer(i)])
+                        .unwrap();
                 }
                 conn.execute("COMMIT").unwrap();
 
@@ -173,16 +177,20 @@ fn bench_large_txn_100k_batched(c: &mut Criterion) {
                 conn
             },
             |conn| {
+                let stmt = conn
+                    .prepare(
+                        "INSERT INTO bench VALUES (\
+                             ?1, ('name_' || ?1), ('user_' || ?1 || '@test.com'), (?1 * 7), \
+                             ('2026-01-' || ((?1 % 28) + 1))\
+                         )",
+                    )
+                    .unwrap();
                 for batch in 0..10_i64 {
                     conn.execute("BEGIN").unwrap();
                     let base = batch * 10_000;
                     for i in base..base + 10_000 {
-                        conn.execute(&format!(
-                            "INSERT INTO bench VALUES ({i}, 'name_{i}', 'user_{i}@test.com', {}, '2026-01-{}')",
-                            i * 7,
-                            (i % 28) + 1,
-                        ))
-                        .unwrap();
+                        stmt.execute_with_params(&[SqliteValue::Integer(i)])
+                            .unwrap();
                     }
                     conn.execute("COMMIT").unwrap();
                 }
