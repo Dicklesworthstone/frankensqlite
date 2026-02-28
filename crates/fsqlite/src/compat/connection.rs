@@ -76,14 +76,14 @@ impl ConnectionExt for Connection {
         &self,
         sql: &str,
         params: &[ParamValue],
-        mut f: F,
+        f: F,
     ) -> Result<Vec<T>, FrankenError>
     where
         F: FnMut(&Row) -> Result<T, FrankenError>,
     {
         let values: Vec<SqliteValue> = params.iter().map(|p| p.0.clone()).collect();
         let rows = self.query_with_params(sql, &values)?;
-        rows.iter().map(|row| f(row)).collect()
+        rows.iter().map(f).collect()
     }
 
     fn execute_params(&self, sql: &str, params: &[ParamValue]) -> Result<usize, FrankenError> {

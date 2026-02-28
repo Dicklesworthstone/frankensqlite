@@ -6775,7 +6775,6 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    #[ignore = "INSERT OR REPLACE conflict handling not yet implemented"]
     fn conformance_031_insert_or_replace() {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE kv(key TEXT PRIMARY KEY, value TEXT)")
@@ -6789,7 +6788,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "INSERT OR IGNORE conflict handling not yet implemented"]
     fn conformance_031_insert_or_ignore() {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE kv(key TEXT PRIMARY KEY, value TEXT)")
@@ -6802,12 +6800,15 @@ mod tests {
         assert_eq!(row_values(&r[0])[0].to_text(), "first");
         conn.execute("INSERT OR IGNORE INTO kv VALUES ('b', 'new')")
             .unwrap();
-        let r = conn.query("SELECT COUNT(*) FROM kv").unwrap();
-        assert_eq!(row_values(&r[0])[0].to_text(), "2");
+        // Verify both rows exist (original 'a' + new 'b').
+        let r = conn.query("SELECT key FROM kv ORDER BY key").unwrap();
+        assert_eq!(r.len(), 2);
+        assert_eq!(row_values(&r[0])[0].to_text(), "a");
+        assert_eq!(row_values(&r[1])[0].to_text(), "b");
     }
 
     #[test]
-    #[ignore = "REPLACE INTO conflict handling not yet implemented"]
+    #[ignore = "MVCC Busy on REPLACE INTO with 3-column table — pre-existing pager issue"]
     fn conformance_031_replace_into() {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute(
@@ -7425,5 +7426,1102 @@ mod tests {
         assert_eq!(row_values(&r[0])[2].to_text(), "9");
         // AVG skips NULLs: 9/3=3.0
         assert_eq!(row_values(&r[0])[3].to_text(), "3.0");
+    }
+
+    // -----------------------------------------------------------------------
+    // Conformance suite 040: CREATE INDEX / DROP INDEX
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn conformance_040_create_index_basic() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1(id INTEGER PRIMARY KEY, name TEXT, age INTEGER)")
+            .unwrap();
+        conn.execute("CREATE INDEX idx_name ON t1(name)").unwrap();
+        // Index should appear in sqlite_master
+        let r = conn
+            .query("SELECT type, name, tbl_name FROM sqlite_master WHERE type = 'index' AND name = 'idx_name'")
+            .unwrap();
+        assert_eq!(r.len(), 1);
+        assert_eq!(row_values(&r[0])[0].to_text(), "index");
+        assert_eq!(row_values(&r[0])[1].to_text(), "idx_name");
+        assert_eq!(row_values(&r[0])[2].to_text(), "t1");
+    }
+
+    #[test]
+    fn conformance_040_create_index_if_not_exists() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1(id INTEGER PRIMARY KEY, val TEXT)")
+            .unwrap();
+        conn.execute("CREATE INDEX idx1 ON t1(val)").unwrap();
+        // Second create with IF NOT EXISTS should succeed silently
+        conn.execute("CREATE INDEX IF NOT EXISTS idx1 ON t1(val)")
+            .unwrap();
+        let r = conn
+            .query("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx1'")
+            .unwrap();
+        assert_eq!(r.len(), 1);
+    }
+
+    #[test]
+    fn conformance_040_drop_index() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1(id INTEGER PRIMARY KEY, val TEXT)")
+            .unwrap();
+        conn.execute("CREATE INDEX idx1 ON t1(val)").unwrap();
+        conn.execute("DROP INDEX idx1").unwrap();
+        let r = conn
+            .query("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx1'")
+            .unwrap();
+        assert_eq!(r.len(), 0);
+    }
+
+    #[test]
+    fn conformance_040_unique_index() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1(id INTEGER PRIMARY KEY, code TEXT)")
+            .unwrap();
+        conn.execute("CREATE UNIQUE INDEX idx_code ON t1(code)")
+            .unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1, 'abc')").unwrap();
+        // Inserting duplicate should fail
+        let result = conn.execute("INSERT INTO t1 VALUES (2, 'abc')");
+        assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Conformance suite 041: Triggers
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn conformance_041_trigger_after_insert() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1(id INTEGER PRIMARY KEY, val TEXT)")
+            .unwrap();
+        conn.execute("CREATE TABLE log(msg TEXT)").unwrap();
+        conn.execute(
+            "CREATE TRIGGER t1_after_insert AFTER INSERT ON t1 \
+             BEGIN INSERT INTO log VALUES ('inserted ' || NEW.val); END",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1, 'hello')").unwrap();
+        let r = conn.query("SELECT msg FROM log").unwrap();
+        assert_eq!(r.len(), 1);
+        assert_eq!(row_values(&r[0])[0].to_text(), "inserted hello");
+    }
+
+    #[test]
+    fn conformance_041_trigger_before_insert() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1(id INTEGER PRIMARY KEY, val INTEGER)")
+            .unwrap();
+        conn.execute("CREATE TABLE audit(action TEXT)").unwrap();
+        conn.execute(
+            "CREATE TRIGGER t1_before BEFORE INSERT ON t1 \
+             BEGIN INSERT INTO audit VALUES ('before_insert'); END",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1, 42)").unwrap();
+        let r = conn.query("SELECT action FROM audit").unwrap();
+        assert_eq!(r.len(), 1);
+        assert_eq!(row_values(&r[0])[0].to_text(), "before_insert");
+    }
+
+    #[test]
+    fn conformance_041_trigger_drop() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1(id INTEGER PRIMARY KEY)")
+            .unwrap();
+        conn.execute("CREATE TABLE log(x TEXT)").unwrap();
+        conn.execute(
+            "CREATE TRIGGER trg1 AFTER INSERT ON t1 \
+             BEGIN INSERT INTO log VALUES ('fired'); END",
+        )
+        .unwrap();
+        conn.execute("DROP TRIGGER trg1").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1)").unwrap();
+        let r = conn.query("SELECT x FROM log").unwrap();
+        // Trigger was dropped, so log should be empty
+        assert_eq!(r.len(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Conformance suite 042: AUTOINCREMENT
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn conformance_042_autoincrement_basic() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1(id INTEGER PRIMARY KEY AUTOINCREMENT, val TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t1(val) VALUES ('a')").unwrap();
+        conn.execute("INSERT INTO t1(val) VALUES ('b')").unwrap();
+        conn.execute("INSERT INTO t1(val) VALUES ('c')").unwrap();
+        let r = conn.query("SELECT id, val FROM t1 ORDER BY id").unwrap();
+        assert_eq!(r.len(), 3);
+        assert_eq!(row_values(&r[0])[0].to_text(), "1");
+        assert_eq!(row_values(&r[1])[0].to_text(), "2");
+        assert_eq!(row_values(&r[2])[0].to_text(), "3");
+    }
+
+    #[test]
+    #[ignore = "AUTOINCREMENT does not yet prevent rowid reuse after deletion"]
+    fn conformance_042_autoincrement_after_delete() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1(id INTEGER PRIMARY KEY AUTOINCREMENT, val TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t1(val) VALUES ('a')").unwrap();
+        conn.execute("INSERT INTO t1(val) VALUES ('b')").unwrap();
+        // Delete row with id=2
+        conn.execute("DELETE FROM t1 WHERE id = 2").unwrap();
+        // Next insert should get id=3, not reuse id=2
+        conn.execute("INSERT INTO t1(val) VALUES ('c')").unwrap();
+        let r = conn.query("SELECT id FROM t1 ORDER BY id").unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "1");
+        assert_eq!(row_values(&r[1])[0].to_text(), "3");
+    }
+
+    #[test]
+    fn conformance_042_sqlite_sequence_table() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1(id INTEGER PRIMARY KEY AUTOINCREMENT, val TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t1(val) VALUES ('x')").unwrap();
+        conn.execute("INSERT INTO t1(val) VALUES ('y')").unwrap();
+        // sqlite_sequence should track the max assigned rowid
+        let r = conn
+            .query("SELECT seq FROM sqlite_sequence WHERE name = 't1'")
+            .unwrap();
+        assert_eq!(r.len(), 1);
+        assert_eq!(row_values(&r[0])[0].to_text(), "2");
+    }
+
+    // -----------------------------------------------------------------------
+    // Conformance suite 043: DEFAULT values
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn conformance_043_default_literal() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute(
+            "CREATE TABLE t1(\
+             id INTEGER PRIMARY KEY, \
+             status TEXT DEFAULT 'active', \
+             count INTEGER DEFAULT 0)",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO t1(id) VALUES (1)").unwrap();
+        let r = conn
+            .query("SELECT status, count FROM t1 WHERE id = 1")
+            .unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "active");
+        assert_eq!(row_values(&r[0])[1].to_text(), "0");
+    }
+
+    #[test]
+    fn conformance_043_default_null() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1(id INTEGER PRIMARY KEY, val TEXT)")
+            .unwrap();
+        // Column without DEFAULT clause defaults to NULL
+        conn.execute("INSERT INTO t1(id) VALUES (1)").unwrap();
+        let r = conn.query("SELECT val FROM t1 WHERE id = 1").unwrap();
+        assert!(row_values(&r[0])[0].is_null());
+    }
+
+    #[test]
+    fn conformance_043_default_override() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1(id INTEGER PRIMARY KEY, val TEXT DEFAULT 'default_val')")
+            .unwrap();
+        // Explicit value should override DEFAULT
+        conn.execute("INSERT INTO t1 VALUES (1, 'custom')").unwrap();
+        let r = conn.query("SELECT val FROM t1 WHERE id = 1").unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "custom");
+    }
+
+    // -----------------------------------------------------------------------
+    // Conformance suite 044: Multi-column ORDER BY and expression sorting
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn conformance_044_order_by_expression() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1(id INTEGER PRIMARY KEY, val INTEGER)")
+            .unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1, 10), (2, -5), (3, 3)")
+            .unwrap();
+        let r = conn
+            .query("SELECT id, ABS(val) as a FROM t1 ORDER BY ABS(val)")
+            .unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "3"); // ABS(3)=3
+        assert_eq!(row_values(&r[1])[0].to_text(), "2"); // ABS(-5)=5
+        assert_eq!(row_values(&r[2])[0].to_text(), "1"); // ABS(10)=10
+    }
+
+    #[test]
+    #[ignore = "ORDER BY numeric column index not yet supported"]
+    fn conformance_044_order_by_column_index() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1(a TEXT, b INTEGER)").unwrap();
+        conn.execute("INSERT INTO t1 VALUES ('x', 3), ('y', 1), ('z', 2)")
+            .unwrap();
+        // ORDER BY column index (1-based)
+        let r = conn.query("SELECT a, b FROM t1 ORDER BY 2").unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "y"); // b=1
+        assert_eq!(row_values(&r[1])[0].to_text(), "z"); // b=2
+        assert_eq!(row_values(&r[2])[0].to_text(), "x"); // b=3
+    }
+
+    #[test]
+    fn conformance_044_order_by_alias() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1(id INTEGER PRIMARY KEY, first TEXT, last TEXT)")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO t1 VALUES (1, 'Bob', 'Smith'), \
+             (2, 'Alice', 'Jones'), (3, 'Charlie', 'Adams')",
+        )
+        .unwrap();
+        // ORDER BY using column alias
+        let r = conn
+            .query("SELECT first || ' ' || last AS full_name FROM t1 ORDER BY full_name")
+            .unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "Alice Jones");
+        assert_eq!(row_values(&r[1])[0].to_text(), "Bob Smith");
+        assert_eq!(row_values(&r[2])[0].to_text(), "Charlie Adams");
+    }
+
+    // ── Conformance 048: Math functions (§13.2) via SQL pipeline ─────
+
+    #[test]
+    fn conformance_048_abs() {
+        let conn = Connection::open(":memory:").unwrap();
+        let r = conn.query("SELECT abs(-42), abs(3.14), abs(0)").unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "42");
+        assert_eq!(row_values(&r[0])[1].to_text(), "3.14");
+        assert_eq!(row_values(&r[0])[2].to_text(), "0");
+    }
+
+    #[test]
+    fn conformance_048_abs_null() {
+        let conn = Connection::open(":memory:").unwrap();
+        let r = conn.query("SELECT abs(NULL)").unwrap();
+        assert!(row_values(&r[0])[0].is_null());
+    }
+
+    #[test]
+    fn conformance_048_round() {
+        let conn = Connection::open(":memory:").unwrap();
+        let r = conn
+            .query("SELECT round(3.14159), round(3.14159, 2), round(3.5)")
+            .unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "3.0");
+        assert_eq!(row_values(&r[0])[1].to_text(), "3.14");
+        assert_eq!(row_values(&r[0])[2].to_text(), "4.0");
+    }
+
+    #[test]
+    fn conformance_048_sign() {
+        let conn = Connection::open(":memory:").unwrap();
+        let r = conn
+            .query("SELECT sign(-5), sign(0), sign(42), sign(NULL)")
+            .unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "-1");
+        assert_eq!(row_values(&r[0])[1].to_text(), "0");
+        assert_eq!(row_values(&r[0])[2].to_text(), "1");
+        assert!(row_values(&r[0])[3].is_null());
+    }
+
+    #[test]
+    fn conformance_048_trig_basic() {
+        let conn = Connection::open(":memory:").unwrap();
+        let r = conn.query("SELECT sin(0), cos(0), tan(0)").unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "0.0");
+        assert_eq!(row_values(&r[0])[1].to_text(), "1.0");
+        assert_eq!(row_values(&r[0])[2].to_text(), "0.0");
+    }
+
+    #[test]
+    fn conformance_048_acos_asin_atan() {
+        let conn = Connection::open(":memory:").unwrap();
+        let r = conn.query("SELECT acos(1), asin(0), atan(0)").unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "0.0");
+        assert_eq!(row_values(&r[0])[1].to_text(), "0.0");
+        assert_eq!(row_values(&r[0])[2].to_text(), "0.0");
+    }
+
+    #[test]
+    fn conformance_048_acos_domain_error() {
+        let conn = Connection::open(":memory:").unwrap();
+        let r = conn.query("SELECT acos(2.0)").unwrap();
+        assert!(row_values(&r[0])[0].is_null());
+    }
+
+    #[test]
+    fn conformance_048_sqrt() {
+        let conn = Connection::open(":memory:").unwrap();
+        let r = conn.query("SELECT sqrt(144), sqrt(2)").unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "12.0");
+        let v = row_values(&r[0])[1].to_text();
+        assert!(v.starts_with("1.41421356"), "got {v}");
+    }
+
+    #[test]
+    fn conformance_048_sqrt_negative() {
+        let conn = Connection::open(":memory:").unwrap();
+        let r = conn.query("SELECT sqrt(-1)").unwrap();
+        assert!(row_values(&r[0])[0].is_null());
+    }
+
+    #[test]
+    fn conformance_048_pow() {
+        let conn = Connection::open(":memory:").unwrap();
+        let r = conn.query("SELECT pow(2, 10), power(3, 2)").unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "1024.0");
+        assert_eq!(row_values(&r[0])[1].to_text(), "9.0");
+    }
+
+    #[test]
+    fn conformance_048_exp_ln() {
+        let conn = Connection::open(":memory:").unwrap();
+        let r = conn.query("SELECT exp(0), ln(1)").unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "1.0");
+        assert_eq!(row_values(&r[0])[1].to_text(), "0.0");
+    }
+
+    #[test]
+    fn conformance_048_log_variants() {
+        let conn = Connection::open(":memory:").unwrap();
+        let r = conn.query("SELECT log(100), log10(1000), log2(8)").unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "2.0");
+        assert_eq!(row_values(&r[0])[1].to_text(), "3.0");
+        assert_eq!(row_values(&r[0])[2].to_text(), "3.0");
+    }
+
+    #[test]
+    fn conformance_048_log_two_arg() {
+        let conn = Connection::open(":memory:").unwrap();
+        let r = conn.query("SELECT log(2, 8)").unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "3.0");
+    }
+
+    #[test]
+    fn conformance_048_ln_negative_null() {
+        let conn = Connection::open(":memory:").unwrap();
+        let r = conn.query("SELECT ln(-1), ln(0)").unwrap();
+        assert!(row_values(&r[0])[0].is_null());
+        assert!(row_values(&r[0])[1].is_null());
+    }
+
+    #[test]
+    fn conformance_048_pi() {
+        let conn = Connection::open(":memory:").unwrap();
+        let r = conn.query("SELECT pi()").unwrap();
+        let v = row_values(&r[0])[0].to_text();
+        assert!(v.starts_with("3.14159265"), "got {v}");
+    }
+
+    #[test]
+    fn conformance_048_ceil_floor_trunc() {
+        let conn = Connection::open(":memory:").unwrap();
+        let r = conn
+            .query("SELECT ceil(1.2), floor(1.7), trunc(2.9)")
+            .unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "2.0");
+        assert_eq!(row_values(&r[0])[1].to_text(), "1.0");
+        assert_eq!(row_values(&r[0])[2].to_text(), "2.0");
+    }
+
+    #[test]
+    fn conformance_048_ceil_floor_negative() {
+        let conn = Connection::open(":memory:").unwrap();
+        let r = conn
+            .query("SELECT ceil(-1.2), floor(-1.2), trunc(-2.9)")
+            .unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "-1.0");
+        assert_eq!(row_values(&r[0])[1].to_text(), "-2.0");
+        assert_eq!(row_values(&r[0])[2].to_text(), "-2.0");
+    }
+
+    #[test]
+    fn conformance_048_degrees_radians() {
+        let conn = Connection::open(":memory:").unwrap();
+        let r = conn.query("SELECT degrees(pi()), radians(180)").unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "180.0");
+        let v = row_values(&r[0])[1].to_text();
+        assert!(v.starts_with("3.14159265"), "got {v}");
+    }
+
+    #[test]
+    fn conformance_048_mod_func() {
+        let conn = Connection::open(":memory:").unwrap();
+        let r = conn.query("SELECT mod(10, 3), mod(10, 0)").unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "1.0");
+        assert!(row_values(&r[0])[1].is_null());
+    }
+
+    #[test]
+    fn conformance_048_atan2() {
+        let conn = Connection::open(":memory:").unwrap();
+        let r = conn.query("SELECT atan2(0, 1), atan2(1, 0)").unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "0.0");
+        let v = row_values(&r[0])[1].to_text();
+        assert!(v.starts_with("1.57079632"), "got {v}");
+    }
+
+    #[test]
+    fn conformance_048_math_null_propagation() {
+        let conn = Connection::open(":memory:").unwrap();
+        let r = conn
+            .query("SELECT sin(NULL), sqrt(NULL), pow(NULL, 2), mod(NULL, 3)")
+            .unwrap();
+        assert!(row_values(&r[0])[0].is_null());
+        assert!(row_values(&r[0])[1].is_null());
+        assert!(row_values(&r[0])[2].is_null());
+        assert!(row_values(&r[0])[3].is_null());
+    }
+
+    #[test]
+    fn conformance_048_math_with_table() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE nums(x REAL)").unwrap();
+        conn.execute("INSERT INTO nums VALUES (4.0),(9.0),(16.0),(25.0)")
+            .unwrap();
+        let r = conn.query("SELECT sqrt(x) FROM nums ORDER BY x").unwrap();
+        assert_eq!(r.len(), 4);
+        assert_eq!(row_values(&r[0])[0].to_text(), "2.0");
+        assert_eq!(row_values(&r[1])[0].to_text(), "3.0");
+        assert_eq!(row_values(&r[2])[0].to_text(), "4.0");
+        assert_eq!(row_values(&r[3])[0].to_text(), "5.0");
+    }
+
+    #[test]
+    fn conformance_048_hyperbolic() {
+        let conn = Connection::open(":memory:").unwrap();
+        let r = conn.query("SELECT sinh(0), cosh(0), tanh(0)").unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "0.0");
+        assert_eq!(row_values(&r[0])[1].to_text(), "1.0");
+        assert_eq!(row_values(&r[0])[2].to_text(), "0.0");
+    }
+
+    // ── Conformance 049: String functions and typeof ─────────────────
+
+    #[test]
+    fn conformance_049_length() {
+        let conn = Connection::open(":memory:").unwrap();
+        let r = conn
+            .query("SELECT length('hello'), length(''), length(NULL)")
+            .unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "5");
+        assert_eq!(row_values(&r[0])[1].to_text(), "0");
+        assert!(row_values(&r[0])[2].is_null());
+    }
+
+    #[test]
+    fn conformance_049_upper_lower() {
+        let conn = Connection::open(":memory:").unwrap();
+        let r = conn.query("SELECT upper('hello'), lower('WORLD')").unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "HELLO");
+        assert_eq!(row_values(&r[0])[1].to_text(), "world");
+    }
+
+    #[test]
+    fn conformance_049_typeof() {
+        let conn = Connection::open(":memory:").unwrap();
+        let r = conn
+            .query("SELECT typeof(42), typeof(3.14), typeof('hi'), typeof(NULL), typeof(X'00')")
+            .unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "integer");
+        assert_eq!(row_values(&r[0])[1].to_text(), "real");
+        assert_eq!(row_values(&r[0])[2].to_text(), "text");
+        assert_eq!(row_values(&r[0])[3].to_text(), "null");
+        assert_eq!(row_values(&r[0])[4].to_text(), "blob");
+    }
+
+    #[test]
+    fn conformance_049_max_min_scalar() {
+        let conn = Connection::open(":memory:").unwrap();
+        let r = conn.query("SELECT max(1, 5, 3), min(10, 2, 7)").unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "5");
+        assert_eq!(row_values(&r[0])[1].to_text(), "2");
+    }
+
+    #[test]
+    fn conformance_049_total_changes() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1(x INTEGER)").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1),(2),(3)").unwrap();
+        let r = conn.query("SELECT changes()").unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "3");
+    }
+
+    // ── Conformance 050: Type coercion and string concatenation ──────
+
+    #[test]
+    fn conformance_050_string_concat() {
+        let conn = Connection::open(":memory:").unwrap();
+        let r = conn.query("SELECT 'hello' || ' ' || 'world'").unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "hello world");
+    }
+
+    #[test]
+    fn conformance_050_concat_with_numbers() {
+        let conn = Connection::open(":memory:").unwrap();
+        let r = conn.query("SELECT 'val=' || 42").unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "val=42");
+    }
+
+    #[test]
+    fn conformance_050_concat_null() {
+        let conn = Connection::open(":memory:").unwrap();
+        let r = conn.query("SELECT 'abc' || NULL").unwrap();
+        assert!(row_values(&r[0])[0].is_null());
+    }
+
+    #[test]
+    fn conformance_050_numeric_string_comparison() {
+        let conn = Connection::open(":memory:").unwrap();
+        let r = conn
+            .query("SELECT CASE WHEN 10 = '10' THEN 'equal' ELSE 'not_equal' END")
+            .unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "equal");
+    }
+
+    #[test]
+    fn conformance_050_mixed_arithmetic() {
+        let conn = Connection::open(":memory:").unwrap();
+        let r = conn.query("SELECT 1 + 2.5, 10 / 3, 10.0 / 3").unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "3.5");
+        assert_eq!(row_values(&r[0])[1].to_text(), "3");
+        let v = row_values(&r[0])[2].to_text();
+        assert!(v.starts_with("3.333"), "got {v}");
+    }
+
+    #[test]
+    fn conformance_050_cast_types() {
+        let conn = Connection::open(":memory:").unwrap();
+        let r = conn
+            .query("SELECT CAST('123' AS INTEGER), CAST(3.14 AS INTEGER), CAST(42 AS TEXT)")
+            .unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "123");
+        assert_eq!(row_values(&r[0])[1].to_text(), "3");
+        assert_eq!(row_values(&r[0])[2].to_text(), "42");
+    }
+
+    // ── Conformance 051: Expression edge cases ──────────────────────
+
+    #[test]
+    fn conformance_051_unary_minus() {
+        let conn = Connection::open(":memory:").unwrap();
+        let r = conn.query("SELECT -(-5), -(3.14)").unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "5");
+        assert_eq!(row_values(&r[0])[1].to_text(), "-3.14");
+    }
+
+    #[test]
+    fn conformance_051_modulo_operator() {
+        let conn = Connection::open(":memory:").unwrap();
+        let r = conn.query("SELECT 17 % 5, -7 % 3").unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "2");
+        assert_eq!(row_values(&r[0])[1].to_text(), "-1");
+    }
+
+    #[test]
+    fn conformance_051_boolean_expressions() {
+        let conn = Connection::open(":memory:").unwrap();
+        let r = conn
+            .query("SELECT 1 AND 1, 1 AND 0, 0 OR 1, 0 OR 0, NOT 0, NOT 1")
+            .unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "1");
+        assert_eq!(row_values(&r[0])[1].to_text(), "0");
+        assert_eq!(row_values(&r[0])[2].to_text(), "1");
+        assert_eq!(row_values(&r[0])[3].to_text(), "0");
+        assert_eq!(row_values(&r[0])[4].to_text(), "1");
+        assert_eq!(row_values(&r[0])[5].to_text(), "0");
+    }
+
+    #[test]
+    fn conformance_051_comparison_operators() {
+        let conn = Connection::open(":memory:").unwrap();
+        let r = conn
+            .query("SELECT 5 > 3, 5 < 3, 5 >= 5, 5 <= 4, 5 != 3, 5 == 5")
+            .unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "1");
+        assert_eq!(row_values(&r[0])[1].to_text(), "0");
+        assert_eq!(row_values(&r[0])[2].to_text(), "1");
+        assert_eq!(row_values(&r[0])[3].to_text(), "0");
+        assert_eq!(row_values(&r[0])[4].to_text(), "1");
+        assert_eq!(row_values(&r[0])[5].to_text(), "1");
+    }
+
+    // ── Conformance 052: Complex multi-table queries ─────────────────
+
+    #[test]
+    fn conformance_052_multi_table_join_aggregate() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE departments(id INTEGER PRIMARY KEY, name TEXT)")
+            .unwrap();
+        conn.execute("CREATE TABLE employees(id INTEGER PRIMARY KEY, name TEXT, dept_id INTEGER, salary REAL)")
+            .unwrap();
+        conn.execute("INSERT INTO departments VALUES (1,'Engineering'),(2,'Sales'),(3,'HR')")
+            .unwrap();
+        conn.execute("INSERT INTO employees VALUES (1,'Alice',1,80000),(2,'Bob',1,90000),(3,'Charlie',2,70000),(4,'Diana',2,75000),(5,'Eve',3,60000)")
+            .unwrap();
+        let r = conn
+            .query("SELECT d.name, COUNT(e.id), SUM(e.salary) FROM departments d JOIN employees e ON d.id = e.dept_id GROUP BY d.name ORDER BY d.name")
+            .unwrap();
+        assert_eq!(r.len(), 3);
+        assert_eq!(row_values(&r[0])[0].to_text(), "Engineering");
+        assert_eq!(row_values(&r[0])[1].to_text(), "2");
+        assert_eq!(row_values(&r[0])[2].to_text(), "170000.0");
+        assert_eq!(row_values(&r[1])[0].to_text(), "HR");
+        assert_eq!(row_values(&r[1])[1].to_text(), "1");
+        assert_eq!(row_values(&r[1])[2].to_text(), "60000.0");
+        assert_eq!(row_values(&r[2])[0].to_text(), "Sales");
+        assert_eq!(row_values(&r[2])[1].to_text(), "2");
+        assert_eq!(row_values(&r[2])[2].to_text(), "145000.0");
+    }
+
+    #[test]
+    fn conformance_052_subquery_in_where() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE products(id INTEGER PRIMARY KEY, name TEXT, price REAL)")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO products VALUES (1,'A',10.0),(2,'B',20.0),(3,'C',30.0),(4,'D',15.0)",
+        )
+        .unwrap();
+        let r = conn
+            .query("SELECT name FROM products WHERE price > (SELECT AVG(price) FROM products) ORDER BY name")
+            .unwrap();
+        assert_eq!(r.len(), 2);
+        assert_eq!(row_values(&r[0])[0].to_text(), "B");
+        assert_eq!(row_values(&r[1])[0].to_text(), "C");
+    }
+
+    #[test]
+    fn conformance_052_insert_with_subquery() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE src(val INTEGER)").unwrap();
+        conn.execute("CREATE TABLE dst(val INTEGER)").unwrap();
+        conn.execute("INSERT INTO src VALUES (1),(2),(3),(4),(5)")
+            .unwrap();
+        conn.execute("INSERT INTO dst SELECT val FROM src WHERE val > 3")
+            .unwrap();
+        let r = conn.query("SELECT val FROM dst ORDER BY val").unwrap();
+        assert_eq!(r.len(), 2);
+        assert_eq!(row_values(&r[0])[0].to_text(), "4");
+        assert_eq!(row_values(&r[1])[0].to_text(), "5");
+    }
+
+    // -----------------------------------------------------------------------
+    // Conformance suite 053: GROUP_CONCAT aggregate
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn conformance_053_group_concat_basic() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1(id INTEGER PRIMARY KEY, grp TEXT, val TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1,'a','x'),(2,'a','y'),(3,'b','z'),(4,'a','w')")
+            .unwrap();
+        let r = conn
+            .query("SELECT grp, GROUP_CONCAT(val) FROM t1 GROUP BY grp ORDER BY grp")
+            .unwrap();
+        assert_eq!(r.len(), 2);
+        // Default separator is comma
+        let a_vals = row_values(&r[0])[1].to_text();
+        assert!(a_vals.contains('x'));
+        assert!(a_vals.contains('y'));
+        assert!(a_vals.contains('w'));
+        assert_eq!(row_values(&r[1])[1].to_text(), "z");
+    }
+
+    #[test]
+    fn conformance_053_group_concat_custom_separator() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1(id INTEGER PRIMARY KEY, val TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1,'a'),(2,'b'),(3,'c')")
+            .unwrap();
+        let r = conn
+            .query("SELECT GROUP_CONCAT(val, ' | ') FROM t1")
+            .unwrap();
+        let result = row_values(&r[0])[0].to_text();
+        // All values should be present with custom separator
+        assert!(result.contains('a'));
+        assert!(result.contains('b'));
+        assert!(result.contains('c'));
+        assert!(result.contains('|'));
+    }
+
+    #[test]
+    fn conformance_053_group_concat_null_skip() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1(val TEXT)").unwrap();
+        conn.execute("INSERT INTO t1 VALUES ('a'),(NULL),('c')")
+            .unwrap();
+        let r = conn.query("SELECT GROUP_CONCAT(val) FROM t1").unwrap();
+        let result = row_values(&r[0])[0].to_text();
+        // NULL values should be skipped
+        assert!(result.contains('a'));
+        assert!(result.contains('c'));
+        assert!(!result.contains("NULL"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Conformance suite 054: PRAGMA
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn conformance_054_pragma_table_info() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute(
+            "CREATE TABLE t1(id INTEGER PRIMARY KEY, name TEXT NOT NULL, score REAL DEFAULT 0.0)",
+        )
+        .unwrap();
+        let r = conn.query("PRAGMA table_info(t1)").unwrap();
+        assert!(r.len() >= 3);
+        // Check column names are present
+        let col_names: Vec<String> = r.iter().map(|row| row_values(row)[1].to_text()).collect();
+        assert!(col_names.contains(&"id".to_owned()));
+        assert!(col_names.contains(&"name".to_owned()));
+        assert!(col_names.contains(&"score".to_owned()));
+    }
+
+    #[test]
+    fn conformance_054_pragma_user_version() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("PRAGMA user_version = 42").unwrap();
+        let r = conn.query("PRAGMA user_version").unwrap();
+        assert_eq!(r.len(), 1);
+        assert_eq!(row_values(&r[0])[0].to_text(), "42");
+    }
+
+    #[test]
+    fn conformance_054_pragma_table_list() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE alpha(x INTEGER)").unwrap();
+        conn.execute("CREATE TABLE beta(y TEXT)").unwrap();
+        // sqlite_master should list both tables
+        let r = conn
+            .query("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+            .unwrap();
+        assert!(r.len() >= 2);
+        let names: Vec<String> = r.iter().map(|row| row_values(row)[0].to_text()).collect();
+        assert!(names.contains(&"alpha".to_owned()));
+        assert!(names.contains(&"beta".to_owned()));
+    }
+
+    // -----------------------------------------------------------------------
+    // Conformance suite 055: Nested and correlated subqueries
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn conformance_055_nested_subquery() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1(id INTEGER PRIMARY KEY, val INTEGER)")
+            .unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1,10),(2,20),(3,30),(4,40),(5,50)")
+            .unwrap();
+        // Subquery in subquery
+        let r = conn
+            .query(
+                "SELECT val FROM t1 WHERE val > \
+                 (SELECT AVG(val) FROM t1 WHERE val < \
+                 (SELECT MAX(val) FROM t1)) ORDER BY val",
+            )
+            .unwrap();
+        // AVG of vals < 50 = (10+20+30+40)/4 = 25
+        // vals > 25: 30, 40, 50
+        assert_eq!(r.len(), 3);
+        assert_eq!(row_values(&r[0])[0].to_text(), "30");
+        assert_eq!(row_values(&r[1])[0].to_text(), "40");
+        assert_eq!(row_values(&r[2])[0].to_text(), "50");
+    }
+
+    #[test]
+    fn conformance_055_in_subquery() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1(id INTEGER PRIMARY KEY, name TEXT)")
+            .unwrap();
+        conn.execute("CREATE TABLE t2(id INTEGER PRIMARY KEY, t1_id INTEGER)")
+            .unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1,'Alice'),(2,'Bob'),(3,'Charlie')")
+            .unwrap();
+        conn.execute("INSERT INTO t2 VALUES (1,1),(2,3)").unwrap();
+        let r = conn
+            .query("SELECT name FROM t1 WHERE id IN (SELECT t1_id FROM t2) ORDER BY name")
+            .unwrap();
+        assert_eq!(r.len(), 2);
+        assert_eq!(row_values(&r[0])[0].to_text(), "Alice");
+        assert_eq!(row_values(&r[1])[0].to_text(), "Charlie");
+    }
+
+    #[test]
+    fn conformance_055_not_in_subquery() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1(id INTEGER PRIMARY KEY, name TEXT)")
+            .unwrap();
+        conn.execute("CREATE TABLE t2(ref_id INTEGER)").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1,'A'),(2,'B'),(3,'C')")
+            .unwrap();
+        conn.execute("INSERT INTO t2 VALUES (1),(3)").unwrap();
+        let r = conn
+            .query("SELECT name FROM t1 WHERE id NOT IN (SELECT ref_id FROM t2)")
+            .unwrap();
+        assert_eq!(r.len(), 1);
+        assert_eq!(row_values(&r[0])[0].to_text(), "B");
+    }
+
+    // -----------------------------------------------------------------------
+    // Conformance suite 056: Multi-table relationships
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn conformance_056_three_table_join() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE departments(id INTEGER PRIMARY KEY, name TEXT)")
+            .unwrap();
+        conn.execute("CREATE TABLE employees(id INTEGER PRIMARY KEY, name TEXT, dept_id INTEGER)")
+            .unwrap();
+        conn.execute("CREATE TABLE projects(id INTEGER PRIMARY KEY, title TEXT, emp_id INTEGER)")
+            .unwrap();
+        conn.execute("INSERT INTO departments VALUES (1,'Eng'),(2,'Sales')")
+            .unwrap();
+        conn.execute("INSERT INTO employees VALUES (1,'Alice',1),(2,'Bob',1),(3,'Charlie',2)")
+            .unwrap();
+        conn.execute("INSERT INTO projects VALUES (1,'Widget',1),(2,'Gadget',2),(3,'Deal',3)")
+            .unwrap();
+        let r = conn
+            .query(
+                "SELECT d.name, e.name, p.title \
+                 FROM departments d \
+                 JOIN employees e ON e.dept_id = d.id \
+                 JOIN projects p ON p.emp_id = e.id \
+                 WHERE d.name = 'Eng' \
+                 ORDER BY e.name",
+            )
+            .unwrap();
+        assert_eq!(r.len(), 2);
+        assert_eq!(row_values(&r[0])[1].to_text(), "Alice");
+        assert_eq!(row_values(&r[0])[2].to_text(), "Widget");
+        assert_eq!(row_values(&r[1])[1].to_text(), "Bob");
+        assert_eq!(row_values(&r[1])[2].to_text(), "Gadget");
+    }
+
+    #[test]
+    fn conformance_056_left_join_with_aggregate() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE teams(id INTEGER PRIMARY KEY, name TEXT)")
+            .unwrap();
+        conn.execute("CREATE TABLE members(id INTEGER PRIMARY KEY, team_id INTEGER, name TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO teams VALUES (1,'Alpha'),(2,'Beta'),(3,'Gamma')")
+            .unwrap();
+        conn.execute("INSERT INTO members VALUES (1,1,'A1'),(2,1,'A2'),(3,2,'B1')")
+            .unwrap();
+        let r = conn
+            .query(
+                "SELECT t.name, SUM(CASE WHEN m.id IS NOT NULL THEN 1 ELSE 0 END) as member_count \
+                 FROM teams t \
+                 LEFT JOIN members m ON m.team_id = t.id \
+                 GROUP BY t.id, t.name \
+                 ORDER BY t.name",
+            )
+            .unwrap();
+        assert_eq!(r.len(), 3);
+        assert_eq!(row_values(&r[0])[0].to_text(), "Alpha");
+        assert_eq!(row_values(&r[0])[1].to_text(), "2");
+        assert_eq!(row_values(&r[1])[0].to_text(), "Beta");
+        assert_eq!(row_values(&r[1])[1].to_text(), "1");
+        assert_eq!(row_values(&r[2])[0].to_text(), "Gamma");
+        assert_eq!(row_values(&r[2])[1].to_text(), "0");
+    }
+
+    // -----------------------------------------------------------------------
+    // Conformance suite 057: Expression edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn conformance_057_integer_division() {
+        let conn = Connection::open(":memory:").unwrap();
+        // SQLite integer division truncates toward zero
+        let r = conn.query("SELECT 7/2, -7/2, 1/3").unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "3");
+        assert_eq!(row_values(&r[0])[1].to_text(), "-3");
+        assert_eq!(row_values(&r[0])[2].to_text(), "0");
+    }
+
+    #[test]
+    fn conformance_057_real_division() {
+        let conn = Connection::open(":memory:").unwrap();
+        let r = conn.query("SELECT 7.0/2, 1.0/3.0").unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "3.5");
+        // 1/3 as float
+        let third: f64 = row_values(&r[0])[1].to_text().parse().unwrap();
+        assert!((third - 1.0 / 3.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn conformance_057_string_concatenation_operator() {
+        let conn = Connection::open(":memory:").unwrap();
+        let r = conn.query("SELECT 'hello' || ' ' || 'world'").unwrap();
+        assert_eq!(row_values(&r[0])[0].to_text(), "hello world");
+    }
+
+    #[test]
+    fn conformance_057_null_arithmetic() {
+        let conn = Connection::open(":memory:").unwrap();
+        // Any arithmetic with NULL produces NULL
+        let r = conn
+            .query("SELECT NULL + 1, NULL * 5, NULL || 'text'")
+            .unwrap();
+        assert!(row_values(&r[0])[0].is_null());
+        assert!(row_values(&r[0])[1].is_null());
+        assert!(row_values(&r[0])[2].is_null());
+    }
+
+    // -----------------------------------------------------------------------
+    // Conformance suite 058: Correlated subqueries and CREATE TABLE AS SELECT
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn conformance_058_correlated_subquery_in_where() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1(id INTEGER PRIMARY KEY, val INTEGER)")
+            .unwrap();
+        conn.execute("CREATE TABLE t2(id INTEGER, t1_id INTEGER, score INTEGER)")
+            .unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1, 100), (2, 200), (3, 300)")
+            .unwrap();
+        conn.execute("INSERT INTO t2 VALUES (1,1,10),(2,1,20),(3,2,30),(4,3,5)")
+            .unwrap();
+        // Correlated subquery: get t1 rows where max t2 score > 15
+        let r = conn
+            .query(
+                "SELECT t1.id, t1.val FROM t1 WHERE (SELECT MAX(score) FROM t2 WHERE t2.t1_id = t1.id) > 15 ORDER BY t1.id",
+            )
+            .unwrap();
+        assert_eq!(r.len(), 2);
+        assert_eq!(row_values(&r[0])[0], SqliteValue::Integer(1));
+        assert_eq!(row_values(&r[0])[1], SqliteValue::Integer(100));
+        assert_eq!(row_values(&r[1])[0], SqliteValue::Integer(2));
+        assert_eq!(row_values(&r[1])[1], SqliteValue::Integer(200));
+    }
+
+    #[test]
+    fn conformance_058_correlated_subquery_in_select() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute(
+            "CREATE TABLE orders(id INTEGER PRIMARY KEY, customer_id INTEGER, amount REAL)",
+        )
+        .unwrap();
+        conn.execute("CREATE TABLE customers(id INTEGER PRIMARY KEY, name TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO customers VALUES (1, 'Alice'), (2, 'Bob')")
+            .unwrap();
+        conn.execute("INSERT INTO orders VALUES (1,1,100.0),(2,1,200.0),(3,2,50.0)")
+            .unwrap();
+        // Correlated subquery in SELECT list
+        let r = conn
+            .query(
+                "SELECT c.name, (SELECT SUM(amount) FROM orders o WHERE o.customer_id = c.id) AS total FROM customers c ORDER BY c.name",
+            )
+            .unwrap();
+        assert_eq!(r.len(), 2);
+        assert_eq!(row_values(&r[0])[0].to_text(), "Alice");
+        assert_eq!(row_values(&r[0])[1].to_text(), "300.0");
+        assert_eq!(row_values(&r[1])[0].to_text(), "Bob");
+        assert_eq!(row_values(&r[1])[1].to_text(), "50.0");
+    }
+
+    #[test]
+    fn conformance_058_create_table_as_select() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE src(id INTEGER PRIMARY KEY, val INTEGER)")
+            .unwrap();
+        conn.execute("INSERT INTO src VALUES (1, 100), (2, 200), (3, 300)")
+            .unwrap();
+        // CREATE TABLE AS SELECT
+        conn.execute("CREATE TABLE dst AS SELECT id, val * 2 AS doubled FROM src WHERE id <= 2")
+            .unwrap();
+        let r = conn.query("SELECT * FROM dst ORDER BY id").unwrap();
+        assert_eq!(r.len(), 2);
+        assert_eq!(row_values(&r[0])[0], SqliteValue::Integer(1));
+        assert_eq!(row_values(&r[0])[1], SqliteValue::Integer(200));
+        assert_eq!(row_values(&r[1])[0], SqliteValue::Integer(2));
+        assert_eq!(row_values(&r[1])[1], SqliteValue::Integer(400));
+    }
+
+    // -----------------------------------------------------------------------
+    // Conformance suite 059: GROUP BY expressions and HAVING edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn conformance_059_group_by_expression() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1(id INTEGER PRIMARY KEY, val INTEGER)")
+            .unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1, 100), (2, 200), (3, 300)")
+            .unwrap();
+        // GROUP BY an expression, not just a column
+        let r = conn
+            .query(
+                "SELECT val / 100 AS bucket, COUNT(*) FROM t1 GROUP BY val / 100 ORDER BY bucket",
+            )
+            .unwrap();
+        assert_eq!(r.len(), 3);
+        assert_eq!(row_values(&r[0])[0], SqliteValue::Integer(1));
+        assert_eq!(row_values(&r[0])[1], SqliteValue::Integer(1));
+        assert_eq!(row_values(&r[1])[0], SqliteValue::Integer(2));
+        assert_eq!(row_values(&r[1])[1], SqliteValue::Integer(1));
+        assert_eq!(row_values(&r[2])[0], SqliteValue::Integer(3));
+        assert_eq!(row_values(&r[2])[1], SqliteValue::Integer(1));
+    }
+
+    #[test]
+    fn conformance_059_group_by_function() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE names(id INTEGER PRIMARY KEY, name TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO names VALUES (1,'Alice'),(2,'alice'),(3,'Bob'),(4,'BOB')")
+            .unwrap();
+        // GROUP BY UPPER(name) collapses case-variants
+        let r = conn
+            .query("SELECT UPPER(name) AS uname, COUNT(*) FROM names GROUP BY UPPER(name) ORDER BY uname")
+            .unwrap();
+        assert_eq!(r.len(), 2);
+        assert_eq!(row_values(&r[0])[0].to_text(), "ALICE");
+        assert_eq!(row_values(&r[0])[1], SqliteValue::Integer(2));
+        assert_eq!(row_values(&r[1])[0].to_text(), "BOB");
+        assert_eq!(row_values(&r[1])[1], SqliteValue::Integer(2));
+    }
+
+    #[test]
+    fn conformance_059_having_without_group_by() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1(val INTEGER)").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1),(2),(3)").unwrap();
+        // HAVING without GROUP BY: implicit single-group aggregation
+        // C SQLite verified: returns one row with COUNT(*) = 3
+        let r = conn
+            .query("SELECT COUNT(*) FROM t1 HAVING COUNT(*) > 2")
+            .unwrap();
+        assert_eq!(r.len(), 1);
+        assert_eq!(row_values(&r[0])[0], SqliteValue::Integer(3));
+    }
+
+    #[test]
+    fn conformance_059_having_without_group_by_no_match() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1(val INTEGER)").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1),(2),(3)").unwrap();
+        // HAVING condition not met: returns empty result
+        let r = conn
+            .query("SELECT COUNT(*) FROM t1 HAVING COUNT(*) > 5")
+            .unwrap();
+        assert_eq!(r.len(), 0);
     }
 }

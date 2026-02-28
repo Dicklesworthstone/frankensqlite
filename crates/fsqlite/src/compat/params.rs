@@ -110,7 +110,7 @@ impl From<usize> for ParamValue {
     }
 }
 
-impl<T: Into<ParamValue>> From<Option<T>> for ParamValue {
+impl<T: Into<Self>> From<Option<T>> for ParamValue {
     fn from(v: Option<T>) -> Self {
         match v {
             Some(inner) => inner.into(),

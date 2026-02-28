@@ -16,7 +16,7 @@ pub trait FromSqliteValue: Sized {
 impl FromSqliteValue for i32 {
     fn from_sqlite_value(val: &SqliteValue) -> Result<Self, FrankenError> {
         match val {
-            SqliteValue::Integer(n) => i32::try_from(*n).map_err(|_| FrankenError::TypeMismatch {
+            SqliteValue::Integer(n) => Self::try_from(*n).map_err(|_| FrankenError::TypeMismatch {
                 expected: "i32".into(),
                 actual: format!("integer({n})"),
             }),
@@ -43,7 +43,7 @@ impl FromSqliteValue for i64 {
 impl FromSqliteValue for u32 {
     fn from_sqlite_value(val: &SqliteValue) -> Result<Self, FrankenError> {
         match val {
-            SqliteValue::Integer(n) => u32::try_from(*n).map_err(|_| FrankenError::TypeMismatch {
+            SqliteValue::Integer(n) => Self::try_from(*n).map_err(|_| FrankenError::TypeMismatch {
                 expected: "u32".into(),
                 actual: format!("integer({n})"),
             }),
@@ -58,7 +58,7 @@ impl FromSqliteValue for u32 {
 impl FromSqliteValue for u64 {
     fn from_sqlite_value(val: &SqliteValue) -> Result<Self, FrankenError> {
         match val {
-            SqliteValue::Integer(n) => u64::try_from(*n).map_err(|_| FrankenError::TypeMismatch {
+            SqliteValue::Integer(n) => Self::try_from(*n).map_err(|_| FrankenError::TypeMismatch {
                 expected: "u64".into(),
                 actual: format!("integer({n})"),
             }),
@@ -73,12 +73,10 @@ impl FromSqliteValue for u64 {
 impl FromSqliteValue for usize {
     fn from_sqlite_value(val: &SqliteValue) -> Result<Self, FrankenError> {
         match val {
-            SqliteValue::Integer(n) => {
-                usize::try_from(*n).map_err(|_| FrankenError::TypeMismatch {
-                    expected: "usize".into(),
-                    actual: format!("integer({n})"),
-                })
-            }
+            SqliteValue::Integer(n) => Self::try_from(*n).map_err(|_| FrankenError::TypeMismatch {
+                expected: "usize".into(),
+                actual: format!("integer({n})"),
+            }),
             other => Err(FrankenError::TypeMismatch {
                 expected: "integer".into(),
                 actual: other.typeof_str().into(),
@@ -91,7 +89,7 @@ impl FromSqliteValue for f64 {
     fn from_sqlite_value(val: &SqliteValue) -> Result<Self, FrankenError> {
         match val {
             SqliteValue::Float(f) => Ok(*f),
-            SqliteValue::Integer(n) => Ok(*n as f64),
+            SqliteValue::Integer(n) => Ok(*n as Self),
             other => Err(FrankenError::TypeMismatch {
                 expected: "real".into(),
                 actual: other.typeof_str().into(),
