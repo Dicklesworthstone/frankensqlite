@@ -6,6 +6,8 @@
 pub use fsqlite_core::connection::{Connection, PreparedStatement, Row, TraceEvent, TraceMask};
 pub use fsqlite_vfs;
 
+pub mod compat;
+
 #[cfg(test)]
 #[allow(
     clippy::too_many_lines,

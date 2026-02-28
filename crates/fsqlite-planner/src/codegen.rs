@@ -164,9 +164,10 @@ enum BindParamRef {
 
 /// Generate VDBE bytecode for a SELECT statement.
 ///
-/// Handles two patterns:
-/// 1. **Rowid lookup**: `SELECT cols FROM t WHERE rowid = ?`
-/// 2. **Full table scan**: `SELECT cols FROM t`
+/// Handles three patterns:
+/// 1. **Expression-only**: `SELECT 1+1`, `SELECT abs(-5)` (no FROM)
+/// 2. **Rowid lookup**: `SELECT cols FROM t WHERE rowid = ?`
+/// 3. **Full table scan**: `SELECT cols FROM t`
 ///
 /// Returns the cursor number used (for composability).
 #[allow(clippy::too_many_lines)]
@@ -193,10 +194,11 @@ pub fn codegen_select(
         SelectCore::Values(_) => unreachable!(),
     };
 
-    // Determine the table from the FROM clause.
-    let from_clause = from
-        .as_ref()
-        .ok_or_else(|| CodegenError::Unsupported("SELECT without FROM".to_owned()))?;
+    // Handle SELECT without FROM (expression-only queries like SELECT 1+1).
+    if from.is_none() {
+        return codegen_select_no_from(b, columns);
+    }
+    let from_clause = from.as_ref().expect("checked above");
 
     let table_name = match &from_clause.source {
         fsqlite_ast::TableOrSubquery::Table { name, .. } => &name.name,
@@ -404,6 +406,55 @@ fn codegen_select_full_scan(
     // Done: Close + Halt.
     b.resolve_label(done_label);
     b.emit_op(Opcode::Close, cursor, 0, 0, P4::None, 0);
+    b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+
+    // End target for Init jump.
+    b.resolve_label(end_label);
+
+    Ok(())
+}
+
+/// Codegen for `SELECT <expr>, ...` without a FROM clause.
+///
+/// Examples: `SELECT 1+1`, `SELECT abs(-5)`, `SELECT CURRENT_TIMESTAMP`.
+/// Produces exactly one result row with the evaluated expressions.
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+fn codegen_select_no_from(
+    b: &mut ProgramBuilder,
+    columns: &[ResultColumn],
+) -> Result<(), CodegenError> {
+    // Star or TableStar don't make sense without a table.
+    for col in columns {
+        if matches!(col, ResultColumn::Star | ResultColumn::TableStar(_)) {
+            return Err(CodegenError::Unsupported(
+                "SELECT * without FROM".to_owned(),
+            ));
+        }
+    }
+
+    let out_col_count = columns.len() as i32;
+    let end_label = b.emit_label();
+
+    // Init: jump to end.
+    b.emit_jump_to_label(Opcode::Init, 0, 0, end_label, P4::None, 0);
+
+    // Read-only transaction.
+    b.emit_op(Opcode::Transaction, 0, 0, 0, P4::None, 0);
+
+    // Allocate output registers and evaluate each expression.
+    let out_regs = b.alloc_regs(out_col_count);
+    let mut reg = out_regs;
+    for col in columns {
+        if let ResultColumn::Expr { expr, .. } = col {
+            emit_expr(b, expr, reg)?;
+        }
+        reg += 1;
+    }
+
+    // Emit a single result row.
+    b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
+
+    // Halt.
     b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
 
     // End target for Init jump.
@@ -1120,8 +1171,8 @@ fn binary_op_to_opcode(op: AstBinaryOp) -> Opcode {
         AstBinaryOp::ShiftRight => Opcode::ShiftRight,
         AstBinaryOp::And => Opcode::And,
         AstBinaryOp::Or => Opcode::Or,
-        AstBinaryOp::Eq | AstBinaryOp::Is | AstBinaryOp::IsNot => Opcode::Eq,
-        AstBinaryOp::Ne => Opcode::Ne,
+        AstBinaryOp::Eq | AstBinaryOp::Is => Opcode::Eq,
+        AstBinaryOp::Ne | AstBinaryOp::IsNot => Opcode::Ne,
         AstBinaryOp::Lt => Opcode::Lt,
         AstBinaryOp::Le => Opcode::Le,
         AstBinaryOp::Gt => Opcode::Gt,
@@ -1158,11 +1209,17 @@ fn emit_comparison_expr(
     emit_expr(b, right, rhs)?;
 
     let opcode = binary_op_to_opcode(op);
+    // IS / IS NOT need the NULLEQ flag (0x80) so NULL IS NULL → true.
+    let p5 = if matches!(op, AstBinaryOp::Is | AstBinaryOp::IsNot) {
+        0x80
+    } else {
+        0
+    };
     let true_label = b.emit_label();
     let done_label = b.emit_label();
 
     // Jump to true_label if comparison holds.
-    b.emit_jump_to_label(opcode, rhs, lhs, true_label, P4::None, 0);
+    b.emit_jump_to_label(opcode, rhs, lhs, true_label, P4::None, p5);
     b.emit_op(Opcode::Integer, 0, dest, 0, P4::None, 0);
     b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
     b.resolve_label(true_label);

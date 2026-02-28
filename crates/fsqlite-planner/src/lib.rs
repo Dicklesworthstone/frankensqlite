@@ -1455,12 +1455,14 @@ pub fn classify_where_term(expr: &Expr) -> WhereTerm<'_> {
         }
 
         // col < expr, col <= expr, col > expr, col >= expr
+        // Also handles reversed forms like `5 < col` by checking both sides.
         Expr::BinaryOp {
             left,
             op: AstBinaryOp::Lt | AstBinaryOp::Le | AstBinaryOp::Gt | AstBinaryOp::Ge,
+            right,
             ..
         } => {
-            let column = extract_where_column(left);
+            let column = extract_where_column(left).or_else(|| extract_where_column(right));
             WhereTerm {
                 expr,
                 column,

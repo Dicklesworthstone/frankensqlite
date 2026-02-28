@@ -1,11 +1,11 @@
-//! SQL connection API with Phase 5 pager/WAL/B-tree storage wiring.
+//! SQL connection API with pager/WAL/B-tree storage wiring on the default path.
 //!
 //! Supports expression-only SELECT statements as well as table-backed DML:
-//! CREATE TABLE, DROP TABLE, INSERT, SELECT (with FROM), UPDATE, and DELETE. Table
-//! storage currently uses the in-memory `MemDatabase` backend for execution,
-//! while a [`PagerBackend`] is initialized alongside for future Phase 5
-//! sub-tasks (bd-1dqg, bd-25c6) that will wire the transaction lifecycle
-//! and cursor paths through the real storage stack.
+//! CREATE TABLE, DROP TABLE, INSERT, SELECT (with FROM), UPDATE, and DELETE.
+//! The default runtime executes table-backed work through [`PagerBackend`]
+//! transactions and storage cursors. `MemDatabase` is still maintained as the
+//! VDBE execution image and compatibility fallback for selected paths while
+//! cutover work continues.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -86,21 +86,14 @@ use fsqlite_types::{CommitSeq, SchemaEpoch, Snapshot, TxnToken};
 use crate::wal_adapter::WalBackendAdapter;
 
 // ---------------------------------------------------------------------------
-// Phase 5: Pager backend abstraction (bd-3iw8)
+// Storage backend abstraction
 // ---------------------------------------------------------------------------
 
 /// Pager backend that dispatches across VFS implementations.
 ///
 /// Wraps [`SimplePager`] for both in-memory (`:memory:`) and on-disk
 /// connections without making [`Connection`] generic.
-///
-/// # Future sub-tasks
-///
-/// - **bd-1dqg**: Wire `begin()` / `commit()` / `rollback()` through the
-///   pager transaction lifecycle.
-/// - **bd-25c6**: Wire `OpenWrite` opcode through `StorageCursor` to the
-///   B-tree write path using [`TransactionPageIo`].
-#[allow(dead_code)] // Fields used by upcoming sub-tasks bd-1dqg and bd-25c6
+#[allow(dead_code)] // Variant usage depends on platform/path configuration.
 #[derive(Clone)]
 pub enum PagerBackend {
     /// In-memory VFS backend (`:memory:` databases).
@@ -956,20 +949,19 @@ struct ActiveConflictEvidence {
     conflict_pages: Vec<PageNumber>,
 }
 
-/// A database connection holding in-memory tables and schema metadata.
+/// A database connection holding schema metadata and execution/cache state.
 ///
 /// Supports transactions (BEGIN/COMMIT/ROLLBACK) and savepoints
-/// (SAVEPOINT/RELEASE/ROLLBACK TO). All table storage uses `MemDatabase`
-/// until the B-tree + pager + VFS stack replaces this in Phase 5+.
+/// (SAVEPOINT/RELEASE/ROLLBACK TO). The default runtime path uses pager/WAL/B-tree
+/// storage, while `MemDatabase` is retained as an execution image and limited
+/// compatibility fallback.
 pub struct Connection {
     path: String,
-    /// In-memory table storage (shared with the VDBE engine during execution).
-    /// Will be gradually replaced by pager-backed storage in Phase 5 sub-tasks.
+    /// In-memory execution image shared with the VDBE engine.
+    /// Kept in sync with pager-backed state and used for compatibility fallback paths.
     db: Rc<RefCell<MemDatabase>>,
-    /// Phase 5 pager backend (bd-3iw8). Initialized for all connections;
-    /// sub-tasks bd-1dqg (transaction lifecycle) and bd-25c6 (write path)
-    /// will wire this into the execution pipeline.
-    #[allow(dead_code)] // Used by upcoming sub-tasks
+    /// Pager-backed storage backend used by default execution paths.
+    #[allow(dead_code)] // Referenced by selected runtime paths depending on query shape.
     pager: PagerBackend,
     /// Active transaction handle (Phase 5/bd-1dqg).
     /// Stores the pager transaction state during BEGIN/COMMIT/ROLLBACK.
@@ -4329,8 +4321,12 @@ impl Connection {
                         .as_ref()
                         .is_some_and(|tn| tn.name.eq_ignore_ascii_case("INTEGER"));
                     let pk = col.constraints.iter().find_map(|c| {
-                        if let ColumnConstraintKind::PrimaryKey { autoincrement, .. } = c.kind {
-                            Some(autoincrement)
+                        if let ColumnConstraintKind::PrimaryKey { autoincrement, direction, .. } = c.kind {
+                            if direction != Some(fsqlite_ast::SortDirection::Desc) {
+                                Some(autoincrement)
+                            } else {
+                                None
+                            }
                         } else {
                             None
                         }
@@ -4418,6 +4414,8 @@ impl Connection {
                 if let CreateTableBody::Columns { constraints, .. } = &create.body {
                     for tc in constraints {
                         if let TableConstraintKind::Unique {
+                            columns: idx_cols, ..
+                        } | TableConstraintKind::PrimaryKey {
                             columns: idx_cols, ..
                         } = &tc.kind
                         {

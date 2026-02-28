@@ -264,8 +264,10 @@ impl Scope {
             1 => ResolveResult::Resolved(matches.into_iter().next().unwrap_or_default()),
             _ => {
                 if self.using_columns.contains(&col_lower) {
+                    matches.sort();
                     ResolveResult::Resolved(matches.into_iter().next().unwrap_or_default())
                 } else {
+                    matches.sort();
                     ResolveResult::Ambiguous(matches)
                 }
             }
@@ -417,7 +419,10 @@ impl<'a> Resolver<'a> {
             Statement::Select(select) => self.resolve_select(select, scope),
             Statement::Insert(insert) => {
                 match &insert.source {
-                    fsqlite_ast::InsertSource::Select(select) => self.resolve_select(select, scope),
+                    fsqlite_ast::InsertSource::Select(select) => {
+                        let mut source_scope = scope.clone();
+                        self.resolve_select(select, &mut source_scope);
+                    }
                     fsqlite_ast::InsertSource::Values(rows) => {
                         for row in rows {
                             for expr in row {
@@ -569,20 +574,22 @@ impl<'a> Resolver<'a> {
             }
         }
 
-        // Resolve the primary select core.
-        self.resolve_select_core(&select.body.select, scope);
+        // Resolve the primary select core in an isolated scope.
+        let mut first_core_scope = scope.clone();
+        self.resolve_select_core(&select.body.select, &mut first_core_scope);
 
-        // Resolve any compound queries (UNION, INTERSECT, EXCEPT).
+        // Resolve any compound queries (UNION, INTERSECT, EXCEPT) in isolated scopes.
         for (_op, core) in &select.body.compounds {
-            self.resolve_select_core(core, scope);
+            let mut comp_scope = scope.clone();
+            self.resolve_select_core(core, &mut comp_scope);
         }
 
-        // Resolve ORDER BY.
+        // Resolve ORDER BY against the first core's scope (which contains its FROM aliases).
         for term in &select.order_by {
-            self.resolve_expr(&term.expr, scope);
+            self.resolve_expr(&term.expr, &first_core_scope);
         }
 
-        // Resolve LIMIT.
+        // Resolve LIMIT against the base scope (no FROM aliases).
         if let Some(limit) = &select.limit {
             self.resolve_expr(&limit.limit, scope);
             if let Some(offset) = &limit.offset {

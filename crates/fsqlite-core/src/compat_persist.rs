@@ -460,7 +460,9 @@ pub fn parse_columns_from_create_sql(sql: &str) -> Vec<ColumnInfo> {
             let type_decl = extract_type_declaration(&tokens);
             let affinity = type_to_affinity(&type_decl);
             let upper = col_def.to_ascii_uppercase();
-            let is_ipk = upper.contains("PRIMARY KEY") && type_decl.eq_ignore_ascii_case("INTEGER");
+            let is_ipk = upper.contains("PRIMARY KEY") 
+                && !upper.contains("PRIMARY KEY DESC") 
+                && type_decl.eq_ignore_ascii_case("INTEGER");
             let type_name = if type_decl.is_empty() {
                 None
             } else {
