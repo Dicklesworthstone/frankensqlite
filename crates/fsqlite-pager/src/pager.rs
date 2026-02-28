@@ -653,6 +653,10 @@ where
                     // counter so SQLite trusts the header page_count.
                     page1[92..96].copy_from_slice(&new_change_counter.to_be_bytes());
                     inner.db_file.write(cx, &page1, 0)?;
+                    // Evict page 1 from cache so subsequent reads see the
+                    // patched header (page_count, change_counter,
+                    // version_valid_for) rather than stale cached values.
+                    inner.cache.evict(PageNumber::ONE);
                 }
             }
 
