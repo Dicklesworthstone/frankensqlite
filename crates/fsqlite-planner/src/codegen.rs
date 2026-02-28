@@ -5,11 +5,37 @@
 //! UPDATE, and DELETE with correct opcode patterns matching C SQLite behavior.
 
 use fsqlite_ast::{
-    BinaryOp as AstBinaryOp, ColumnRef, DeleteStatement, Expr, FunctionArgs, InsertSource,
-    InsertStatement, Literal, PlaceholderType, QualifiedTableRef, ResultColumn, SelectCore,
-    SelectStatement, UnaryOp as AstUnaryOp, UpdateStatement,
+    BinaryOp as AstBinaryOp, ColumnRef, ConflictAction, DeleteStatement, Expr, FunctionArgs,
+    InsertSource, InsertStatement, Literal, PlaceholderType, QualifiedTableRef, ResultColumn,
+    SelectCore, SelectStatement, UnaryOp as AstUnaryOp, UpdateStatement,
 };
 use fsqlite_types::opcode::{Label, Opcode, P4, ProgramBuilder};
+
+// ---------------------------------------------------------------------------
+// INSERT conflict-mode p5 flags (must match fsqlite-vdbe/src/codegen.rs)
+// ---------------------------------------------------------------------------
+
+/// ROLLBACK on conflict.
+const OE_ROLLBACK: u16 = 1;
+/// ABORT on conflict (default).
+const OE_ABORT: u16 = 2;
+/// FAIL on conflict.
+const OE_FAIL: u16 = 3;
+/// IGNORE conflicting row.
+const OE_IGNORE: u16 = 4;
+/// REPLACE conflicting row.
+const OE_REPLACE: u16 = 5;
+
+/// Convert AST `ConflictAction` to p5 OE_* flag value.
+fn conflict_action_to_oe(action: Option<&ConflictAction>) -> u16 {
+    match action {
+        Some(ConflictAction::Rollback) => OE_ROLLBACK,
+        None | Some(ConflictAction::Abort) => OE_ABORT,
+        Some(ConflictAction::Fail) => OE_FAIL,
+        Some(ConflictAction::Ignore) => OE_IGNORE,
+        Some(ConflictAction::Replace) => OE_REPLACE,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Schema metadata (minimal info needed for codegen)
@@ -423,15 +449,26 @@ pub fn codegen_insert(
         0,
     );
 
+    let oe_flag = conflict_action_to_oe(stmt.or_conflict.as_ref());
+
     match &stmt.source {
         InsertSource::Values(rows) => {
             if rows.is_empty() {
                 return Err(CodegenError::Unsupported("empty VALUES".to_owned()));
             }
-            codegen_insert_values(b, rows, cursor, table, &stmt.returning, ctx)?;
+            codegen_insert_values(b, rows, cursor, table, &stmt.returning, ctx, oe_flag)?;
         }
         InsertSource::Select(select_stmt) => {
-            codegen_insert_select(b, select_stmt, cursor, table, schema, &stmt.returning, ctx)?;
+            codegen_insert_select(
+                b,
+                select_stmt,
+                cursor,
+                table,
+                schema,
+                &stmt.returning,
+                ctx,
+                oe_flag,
+            )?;
         }
         InsertSource::DefaultValues => {
             return Err(CodegenError::Unsupported("DEFAULT VALUES".to_owned()));
@@ -461,6 +498,7 @@ fn codegen_insert_values(
     table: &TableSchema,
     returning: &[ResultColumn],
     ctx: &CodegenContext,
+    oe_flag: u16,
 ) -> Result<(), CodegenError> {
     let rowid_reg = b.alloc_reg();
     let concurrent_flag = i32::from(ctx.concurrent_mode);
@@ -522,7 +560,7 @@ fn codegen_insert_values(
             rec_reg,
             rowid_reg,
             P4::Table(table.name.clone()),
-            0,
+            oe_flag,
         );
 
         if !returning.is_empty() {
@@ -550,6 +588,7 @@ fn codegen_insert_select(
     schema: &[TableSchema],
     returning: &[ResultColumn],
     ctx: &CodegenContext,
+    oe_flag: u16,
 ) -> Result<(), CodegenError> {
     if !select_stmt.body.compounds.is_empty() {
         return Err(CodegenError::Unsupported(
@@ -561,7 +600,15 @@ fn codegen_insert_select(
     let (columns, from) = match &select_stmt.body.select {
         SelectCore::Select { columns, from, .. } => (columns, from),
         SelectCore::Values(rows) => {
-            return codegen_insert_values(b, rows, write_cursor, target_table, returning, ctx);
+            return codegen_insert_values(
+                b,
+                rows,
+                write_cursor,
+                target_table,
+                returning,
+                ctx,
+                oe_flag,
+            );
         }
     };
 
@@ -633,7 +680,7 @@ fn codegen_insert_select(
         rec_reg,
         rowid_reg,
         P4::Table(target_table.name.clone()),
-        0,
+        oe_flag,
     );
 
     // RETURNING clause: emit ResultRow with rowid if present.
