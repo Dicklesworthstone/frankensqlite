@@ -19,6 +19,7 @@ fsqlite-func = { workspace = true }
 fsqlite-parser = { workspace = true }
 tracing = { workspace = true }
 crossbeam-deque = { workspace = true }
+smallvec = { workspace = true }
 tempfile = { workspace = true }
 
 [dev-dependencies]

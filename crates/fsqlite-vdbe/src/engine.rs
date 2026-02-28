@@ -59,6 +59,12 @@ pub struct MemTable {
     rows: Vec<MemRow>,
     /// Next auto-increment rowid.
     next_rowid: i64,
+    /// Groups of column indices forming UNIQUE constraints (including
+    /// non-IPK PRIMARY KEY). Each inner `Vec<usize>` is one UNIQUE
+    /// constraint; a conflict occurs when all columns in a group match
+    /// an existing row. Used by the Insert opcode to enforce unique
+    /// constraints in MemDatabase mode (where indexes are no-ops).
+    unique_column_groups: Vec<Vec<usize>>,
 }
 
 impl MemTable {
@@ -68,7 +74,37 @@ impl MemTable {
             num_columns,
             rows: Vec::new(),
             next_rowid: 1,
+            unique_column_groups: Vec::new(),
         }
+    }
+
+    /// Register a group of columns that together form a UNIQUE constraint.
+    pub fn add_unique_column_group(&mut self, cols: Vec<usize>) {
+        self.unique_column_groups.push(cols);
+    }
+
+    /// Find a row that conflicts with `new_values` on any UNIQUE constraint.
+    /// Returns the rowid of the first conflicting row, or `None`.
+    pub fn find_unique_conflict(&self, new_values: &[SqliteValue]) -> Option<i64> {
+        for group in &self.unique_column_groups {
+            for row in &self.rows {
+                let all_match = group.iter().all(|&col_idx| {
+                    let new_val = new_values.get(col_idx);
+                    let existing_val = row.values.get(col_idx);
+                    match (new_val, existing_val) {
+                        // NULL never conflicts with NULL in UNIQUE constraints.
+                        // Missing columns also don't conflict.
+                        (Some(SqliteValue::Null) | None, _)
+                        | (_, Some(SqliteValue::Null) | None) => false,
+                        (Some(a), Some(b)) => a == b,
+                    }
+                });
+                if all_match {
+                    return Some(row.rowid);
+                }
+            }
+        }
+        None
     }
 
     /// Allocate a new unique rowid.
@@ -1817,19 +1853,22 @@ impl RowSet {
     }
 }
 
+/// Stack-backed byte buffer for distinct keys (avoids heap allocation for small keys).
+type DistinctKeyBuf = smallvec::SmallVec<[u8; 64]>;
+
 struct AggregateContext {
     func: Arc<ErasedAggregateFunction>,
     state: Box<dyn Any + Send>,
     /// When DISTINCT is active, tracks seen argument byte-keys to skip duplicates.
-    distinct_seen: Option<std::collections::HashSet<Vec<u8>>>,
+    distinct_seen: Option<std::collections::HashSet<DistinctKeyBuf>>,
 }
 
 /// Encode aggregate arguments into a canonical byte key for DISTINCT deduplication.
 ///
 /// Each value is tagged with a type discriminant followed by its payload so that
 /// values of different types with the same byte representation don't collide.
-fn distinct_key(args: &[SqliteValue]) -> Vec<u8> {
-    let mut key = Vec::new();
+fn distinct_key(args: &[SqliteValue]) -> DistinctKeyBuf {
+    let mut key = DistinctKeyBuf::new();
     for val in args {
         match val {
             SqliteValue::Null => key.push(0),
@@ -1843,11 +1882,13 @@ fn distinct_key(args: &[SqliteValue]) -> Vec<u8> {
             }
             SqliteValue::Text(s) => {
                 key.push(3);
+                #[allow(clippy::cast_possible_truncation)]
                 key.extend_from_slice(&(s.len() as u64).to_le_bytes());
                 key.extend_from_slice(s.as_bytes());
             }
             SqliteValue::Blob(b) => {
                 key.push(4);
+                #[allow(clippy::cast_possible_truncation)]
                 key.extend_from_slice(&(b.len() as u64).to_le_bytes());
                 key.extend_from_slice(b);
             }
@@ -2165,8 +2206,19 @@ impl VdbeEngine {
         }
 
         let mut pc: usize = 0;
-        // "once" flags: one bit per instruction address.
-        let mut once_flags = vec![false; ops.len()];
+        // "once" flags: one bit per instruction address (stack-backed for small programs).
+        let n_ops = ops.len();
+        let mut once_stack = [0u64; 4]; // covers up to 256 opcodes on the stack
+        let mut once_heap: Vec<u64> = if n_ops > 256 {
+            vec![0u64; n_ops.div_ceil(64)]
+        } else {
+            Vec::new()
+        };
+        let once_bits: &mut [u64] = if n_ops > 256 {
+            &mut once_heap
+        } else {
+            &mut once_stack
+        };
 
         let outcome = loop {
             if pc >= ops.len() {
@@ -2175,7 +2227,9 @@ impl VdbeEngine {
 
             let op = &ops[pc];
             opcode_count += 1;
-            self.trace_opcode(pc, op);
+            if self.trace_opcodes {
+                self.trace_opcode(pc, op);
+            }
             match op.opcode {
                 // ── Control Flow ────────────────────────────────────────
                 Opcode::Init => {
@@ -2216,7 +2270,7 @@ impl VdbeEngine {
                 // ── Constants ───────────────────────────────────────────
                 Opcode::Integer => {
                     // Set register p2 to integer value p1.
-                    self.set_reg(op.p2, SqliteValue::Integer(i64::from(op.p1)));
+                    self.set_reg_fast(op.p2, SqliteValue::Integer(i64::from(op.p1)));
                     pc += 1;
                 }
 
@@ -2225,7 +2279,7 @@ impl VdbeEngine {
                         P4::Int64(v) => *v,
                         _ => 0,
                     };
-                    self.set_reg(op.p2, SqliteValue::Integer(val));
+                    self.set_reg_fast(op.p2, SqliteValue::Integer(val));
                     pc += 1;
                 }
 
@@ -2286,10 +2340,16 @@ impl VdbeEngine {
                 // ── Register Operations ─────────────────────────────────
                 Opcode::Move => {
                     // Move p3 registers from p1 to p2.
+                    #[allow(clippy::cast_sign_loss)]
                     for i in 0..op.p3 {
-                        let val = self.get_reg(op.p1 + i).clone();
-                        self.set_reg(op.p2 + i, val);
-                        self.set_reg(op.p1 + i, SqliteValue::Null);
+                        let src_idx = (op.p1 + i) as usize;
+                        if src_idx < self.registers.len() {
+                            let val =
+                                std::mem::replace(&mut self.registers[src_idx], SqliteValue::Null);
+                            self.set_reg(op.p2 + i, val);
+                        } else {
+                            self.set_reg(op.p2 + i, SqliteValue::Null);
+                        }
                     }
                     pc += 1;
                 }
@@ -2332,7 +2392,7 @@ impl VdbeEngine {
                     let a = self.get_reg(op.p2);
                     let b = self.get_reg(op.p1);
                     let result = a.sql_add(b);
-                    self.set_reg(op.p3, result);
+                    self.set_reg_fast(op.p3, result);
                     pc += 1;
                 }
 
@@ -2341,7 +2401,7 @@ impl VdbeEngine {
                     let a = self.get_reg(op.p2);
                     let b = self.get_reg(op.p1);
                     let result = a.sql_sub(b);
-                    self.set_reg(op.p3, result);
+                    self.set_reg_fast(op.p3, result);
                     pc += 1;
                 }
 
@@ -2350,7 +2410,7 @@ impl VdbeEngine {
                     let a = self.get_reg(op.p2);
                     let b = self.get_reg(op.p1);
                     let result = a.sql_mul(b);
-                    self.set_reg(op.p3, result);
+                    self.set_reg_fast(op.p3, result);
                     pc += 1;
                 }
 
@@ -2359,7 +2419,7 @@ impl VdbeEngine {
                     let divisor = self.get_reg(op.p1);
                     let dividend = self.get_reg(op.p2);
                     let result = sql_div(dividend, divisor);
-                    self.set_reg(op.p3, result);
+                    self.set_reg_fast(op.p3, result);
                     pc += 1;
                 }
 
@@ -2368,7 +2428,7 @@ impl VdbeEngine {
                     let divisor = self.get_reg(op.p1);
                     let dividend = self.get_reg(op.p2);
                     let result = sql_rem(dividend, divisor);
-                    self.set_reg(op.p3, result);
+                    self.set_reg_fast(op.p3, result);
                     pc += 1;
                 }
 
@@ -2633,11 +2693,13 @@ impl VdbeEngine {
                 }
 
                 Opcode::Once => {
-                    // Jump to p2 on first execution only.
-                    if once_flags[pc] {
+                    // Jump to p2 on first execution only (bitset-backed).
+                    let word = pc / 64;
+                    let bit = 1u64 << (pc % 64);
+                    if once_bits[word] & bit != 0 {
                         pc += 1;
                     } else {
-                        once_flags[pc] = true;
+                        once_bits[word] |= bit;
                         pc = op.p2 as usize;
                     }
                 }
@@ -3480,18 +3542,34 @@ impl VdbeEngine {
                         // MemDatabase fallback (Phase 4 in-memory cursors).
                         let values = decode_record(&record_val)?;
                         if let Some(db) = self.db.as_mut() {
-                            let exists = db
+                            // Check rowid conflict first.
+                            let rowid_conflict = db
                                 .get_table(root)
                                 .and_then(|t| t.find_by_rowid(rowid))
                                 .is_some();
 
-                            if exists {
+                            // Check UNIQUE column constraint conflicts (non-IPK).
+                            let unique_conflict_rowid = if !rowid_conflict {
+                                db.get_table(root)
+                                    .and_then(|t| t.find_unique_conflict(&values))
+                            } else {
+                                None
+                            };
+
+                            let has_conflict = rowid_conflict || unique_conflict_rowid.is_some();
+
+                            if has_conflict {
                                 match oe_flag {
                                     4 => {
                                         // OE_IGNORE: Skip insert for conflicting row
                                     }
                                     5 | 8 => {
-                                        // OE_REPLACE / OPFLAG_ISUPDATE: UPSERT semantics
+                                        // OE_REPLACE / OPFLAG_ISUPDATE: Delete conflicting
+                                        // row(s), then insert new.
+                                        if let Some(conflict_rid) = unique_conflict_rowid {
+                                            db.get_table_mut(root)
+                                                .map(|t| t.delete_by_rowid(conflict_rid));
+                                        }
                                         db.upsert_row(root, rowid, values);
                                     }
                                     _ => {
@@ -3696,14 +3774,13 @@ impl VdbeEngine {
                 // ── Record building (SQLite record format) ──────────────
                 Opcode::MakeRecord => {
                     // Build a record from registers p1..p1+p2-1 into register p3.
-                    let start = op.p1;
-                    let count = op.p2;
+                    #[allow(clippy::cast_sign_loss)]
+                    let s = op.p1 as usize;
+                    #[allow(clippy::cast_sign_loss)]
+                    let c = op.p2 as usize;
                     let target = op.p3;
-                    let mut values = Vec::with_capacity(count as usize);
-                    for i in 0..count {
-                        values.push(self.get_reg(start + i).clone());
-                    }
-                    self.set_reg(target, SqliteValue::Blob(encode_record(&values)));
+                    let blob = encode_record(&self.registers[s..s + c]);
+                    self.set_reg(target, SqliteValue::Blob(blob));
                     pc += 1;
                 }
 
@@ -4269,57 +4346,36 @@ impl VdbeEngine {
 
                     #[allow(clippy::cast_possible_wrap)]
                     let func = registry
-                        .find_scalar(func_name, arg_count as i32)
+                        .find_scalar_precanonical(func_name, arg_count as i32)
                         .ok_or_else(|| {
                             FrankenError::Internal(format!(
                                 "no such function: {func_name}/{arg_count}",
                             ))
                         })?;
 
-                    let mut args = Vec::with_capacity(arg_count);
-                    for i in 0..arg_count {
-                        #[allow(clippy::cast_possible_wrap)]
-                        let reg_idx = first_arg_reg + i as i32;
-                        args.push(self.get_reg(reg_idx).clone());
-                    }
+                    #[allow(clippy::cast_sign_loss)]
+                    let s = first_arg_reg as usize;
+                    let result = func.invoke(&self.registers[s..s + arg_count])?;
 
-                    // func_eval span with tracing (bd-2wt.1).
-                    let func_start = Instant::now();
-                    let result = func.invoke(&args)?;
-                    let func_elapsed = func_start.elapsed();
-
-                    // TRACE-level per-call log (bd-2wt.1).
-                    let result_type = match &result {
-                        SqliteValue::Null => "null",
-                        SqliteValue::Integer(_) => "integer",
-                        SqliteValue::Float(_) => "real",
-                        SqliteValue::Text(_) => "text",
-                        SqliteValue::Blob(_) => "blob",
-                    };
-                    tracing::trace!(
-                        target: "fsqlite_func::eval",
-                        func_name,
-                        arg_count,
-                        result_type,
-                        "func_eval",
-                    );
-
-                    // DEBUG-level for slow functions (>1ms).
-                    #[allow(clippy::cast_possible_truncation)]
-                    let func_us = func_elapsed.as_micros() as u64;
-                    if func_us >= 1000 {
-                        tracing::debug!(
-                            target: "fsqlite_func::slow",
+                    if self.trace_opcodes {
+                        let result_type = match &result {
+                            SqliteValue::Null => "null",
+                            SqliteValue::Integer(_) => "integer",
+                            SqliteValue::Float(_) => "real",
+                            SqliteValue::Text(_) => "text",
+                            SqliteValue::Blob(_) => "blob",
+                        };
+                        tracing::trace!(
+                            target: "fsqlite_func::eval",
                             func_name,
                             arg_count,
                             result_type,
-                            elapsed_us = func_us,
-                            "slow func_eval",
+                            "func_eval",
                         );
                     }
 
-                    // Update global metrics counter (bd-2wt.1).
-                    fsqlite_func::record_func_call(func_us);
+                    // Update global call count (fast path: no Instant::now).
+                    fsqlite_func::record_func_call_count_only();
 
                     self.set_reg(output_reg, result);
                     pc += 1;
@@ -4650,6 +4706,22 @@ impl VdbeEngine {
             self.registers.resize(idx + 1, SqliteValue::Null);
         }
         self.registers[idx] = match val {
+            SqliteValue::Float(f) if f.is_nan() => SqliteValue::Null,
+            other => other,
+        };
+    }
+
+    /// Fast-path register write: skips range check and resize (register file
+    /// is pre-allocated in `new()`). Keeps NaN -> Null normalization.
+    #[inline]
+    #[allow(clippy::cast_sign_loss)]
+    fn set_reg_fast(&mut self, r: i32, val: SqliteValue) {
+        debug_assert!(
+            (r as usize) < self.registers.len(),
+            "set_reg_fast: register {r} out of bounds (len={})",
+            self.registers.len()
+        );
+        self.registers[r as usize] = match val {
             SqliteValue::Float(f) if f.is_nan() => SqliteValue::Null,
             other => other,
         };

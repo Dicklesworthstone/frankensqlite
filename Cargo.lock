@@ -1070,6 +1070,7 @@ dependencies = [
  "fsqlite-types",
  "fsqlite-wal",
  "proptest",
+ "smallvec",
  "tempfile",
  "tracing",
 ]

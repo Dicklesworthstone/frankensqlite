@@ -55,6 +55,11 @@ pub fn record_func_call(duration_us: u64) {
     FSQLITE_FUNC_EVAL_DURATION_US_TOTAL.fetch_add(duration_us, Ordering::Relaxed);
 }
 
+/// Record a function call count only, without timing (fast path).
+pub fn record_func_call_count_only() {
+    FSQLITE_FUNC_CALLS_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
 // ── UDF registration metrics (bd-2wt.3) ────────────────────────────────
 
 /// Total number of UDF registrations.
@@ -217,22 +222,35 @@ impl FunctionRegistry {
     #[must_use]
     pub fn find_scalar(&self, name: &str, num_args: i32) -> Option<Arc<dyn ScalarFunction>> {
         let canon = canonical_name(name);
+        self.find_scalar_precanonical(&canon, num_args)
+    }
+
+    /// Look up a scalar function by already-uppercased name (avoids allocation).
+    ///
+    /// Used by the VDBE engine where `P4::FuncName` values are already
+    /// canonicalized by codegen.
+    #[must_use]
+    pub fn find_scalar_precanonical(
+        &self,
+        canonical: &str,
+        num_args: i32,
+    ) -> Option<Arc<dyn ScalarFunction>> {
         let exact = FunctionKey {
-            name: canon.clone(),
+            name: canonical.to_owned(),
             num_args,
         };
         if let Some(f) = self.scalars.get(&exact) {
-            debug!(name = %canon, arity = num_args, kind = "scalar", hit = "exact", "registry lookup");
+            debug!(name = %canonical, arity = num_args, kind = "scalar", hit = "exact", "registry lookup");
             return Some(Arc::clone(f));
         }
         // Variadic fallback
         let variadic = FunctionKey {
-            name: canon.clone(),
+            name: canonical.to_owned(),
             num_args: -1,
         };
         let result = self.scalars.get(&variadic).map(Arc::clone);
         debug!(
-            name = %canon,
+            name = %canonical,
             arity = num_args,
             kind = "scalar",
             hit = if result.is_some() { "variadic" } else { "miss" },
@@ -251,21 +269,31 @@ impl FunctionRegistry {
         num_args: i32,
     ) -> Option<Arc<ErasedAggregateFunction>> {
         let canon = canonical_name(name);
+        self.find_aggregate_precanonical(&canon, num_args)
+    }
+
+    /// Look up an aggregate function by already-uppercased name (avoids allocation).
+    #[must_use]
+    pub fn find_aggregate_precanonical(
+        &self,
+        canonical: &str,
+        num_args: i32,
+    ) -> Option<Arc<ErasedAggregateFunction>> {
         let exact = FunctionKey {
-            name: canon.clone(),
+            name: canonical.to_owned(),
             num_args,
         };
         if let Some(f) = self.aggregates.get(&exact) {
-            debug!(name = %canon, arity = num_args, kind = "aggregate", hit = "exact", "registry lookup");
+            debug!(name = %canonical, arity = num_args, kind = "aggregate", hit = "exact", "registry lookup");
             return Some(Arc::clone(f));
         }
         let variadic = FunctionKey {
-            name: canon.clone(),
+            name: canonical.to_owned(),
             num_args: -1,
         };
         let result = self.aggregates.get(&variadic).map(Arc::clone);
         debug!(
-            name = %canon,
+            name = %canonical,
             arity = num_args,
             kind = "aggregate",
             hit = if result.is_some() { "variadic" } else { "miss" },
