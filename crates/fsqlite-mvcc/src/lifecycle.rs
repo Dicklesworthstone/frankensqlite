@@ -38,8 +38,37 @@ const DEFAULT_SERIALIZED_WRITER_LEASE_SECS: u64 = 30;
 const DEFAULT_MAX_CHAIN_LENGTH: usize = 64;
 const DEFAULT_CHAIN_LENGTH_WARNING: usize = 32;
 const NO_GC_HORIZON: u64 = u64::MAX;
+const PID_BIRTH_PROCFS_TAG: u64 = 1_u64 << 63;
 
 static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(unix)]
+fn read_proc_start_time_ticks(pid: u32) -> Option<u64> {
+    let stat_path = std::path::Path::new("/proc")
+        .join(pid.to_string())
+        .join("stat");
+    let stat = std::fs::read_to_string(stat_path).ok()?;
+    let comm_end = stat.rfind(')')?;
+    let tail = stat.get(comm_end + 1..)?.trim_start();
+    tail.split_whitespace().nth(19)?.parse::<u64>().ok()
+}
+
+fn current_process_birth_token(now_fallback: u64) -> u64 {
+    #[cfg(unix)]
+    {
+        if !std::path::Path::new("/proc").exists() {
+            return now_fallback;
+        }
+        if let Some(start_ticks) = read_proc_start_time_ticks(std::process::id()) {
+            return PID_BIRTH_PROCFS_TAG | (start_ticks & !PID_BIRTH_PROCFS_TAG);
+        }
+        now_fallback
+    }
+    #[cfg(not(unix))]
+    {
+        now_fallback
+    }
+}
 
 fn process_alive_os(pid: u32, pid_birth: u64) -> bool {
     #[cfg(unix)]
@@ -53,9 +82,19 @@ fn process_alive_os(pid: u32, pid_birth: u64) -> bool {
         if !std::path::Path::new("/proc").exists() {
             return true;
         }
+        let proc_dir = std::path::Path::new("/proc").join(pid.to_string());
+        if !proc_dir.exists() {
+            return false;
+        }
 
-        let _ = pid_birth;
-        std::path::Path::new("/proc").join(pid.to_string()).exists()
+        if pid_birth & PID_BIRTH_PROCFS_TAG == 0 {
+            // Legacy token format (pre-proc-starttime tagging): keep conservative
+            // liveness behavior to avoid false stale clears during rolling upgrades.
+            return true;
+        }
+
+        let expected_ticks = pid_birth & !PID_BIRTH_PROCFS_TAG;
+        read_proc_start_time_ticks(pid).is_some_and(|start_ticks| start_ticks == expected_ticks)
     }
     #[cfg(not(unix))]
     {
@@ -1360,7 +1399,7 @@ impl TransactionManager {
         // Step 2: Clear stale indicator if needed, then publish indicator.
         let now = logical_now_epoch_secs();
         let pid = std::process::id();
-        let pid_birth = now; // simplified; real impl uses epoch nanos + OS liveness
+        let pid_birth = current_process_birth_token(now);
         let lease_expiry = now.saturating_add(self.serialized_writer_lease_secs);
 
         // If a serialized-writer token is present and not stale, treat as BUSY.
@@ -2163,6 +2202,21 @@ mod tests {
             MvccError::Busy,
             "concurrent write while serialized writer active should fail"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_process_alive_os_rejects_tagged_birth_mismatch() {
+        let pid = std::process::id();
+        let birth = current_process_birth_token(logical_now_epoch_secs());
+        if birth & PID_BIRTH_PROCFS_TAG == 0 {
+            return;
+        }
+
+        assert!(process_alive_os(pid, birth));
+
+        let mismatched = PID_BIRTH_PROCFS_TAG | ((birth & !PID_BIRTH_PROCFS_TAG).wrapping_add(1));
+        assert!(!process_alive_os(pid, mismatched));
     }
 
     #[cfg(unix)]

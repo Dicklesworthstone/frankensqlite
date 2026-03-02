@@ -1487,6 +1487,17 @@ mod tests {
     use super::*;
 
     #[cfg(target_os = "linux")]
+    const MULTIPROC_CHILD_MODE_ENV: &str = "FSQLITE_COORD_IPC_CHILD_MODE";
+    #[cfg(target_os = "linux")]
+    const MULTIPROC_SOCKET_PATH_ENV: &str = "FSQLITE_COORD_IPC_SOCKET_PATH";
+    #[cfg(target_os = "linux")]
+    const MULTIPROC_SEED_ENV: &str = "FSQLITE_COORD_IPC_SEED";
+    #[cfg(target_os = "linux")]
+    const MULTIPROC_ROUNDS_ENV: &str = "FSQLITE_COORD_IPC_ROUNDS";
+    #[cfg(target_os = "linux")]
+    const MULTIPROC_SUMMARY_PREFIX: &str = "IPC_MULTIPROC_SUMMARY";
+
+    #[cfg(target_os = "linux")]
     fn recv_frame_with_optional_fd(
         stream: &std::os::unix::net::UnixStream,
     ) -> std::io::Result<(Frame, Option<ReceivedFd>)> {
@@ -1560,6 +1571,268 @@ mod tests {
         let frame = Frame::decode(&wire)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
         Ok((frame, fd))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn deterministic_txn(seed: u64, round: u32) -> WireTxnToken {
+        let mixed = seed
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(u64::from(round) + 1)
+            ^ (u64::from(round) << 32);
+        WireTxnToken {
+            txn_id: mixed.max(1),
+            txn_epoch: round.saturating_add(1),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn fold_commit_digest(acc: u64, commit_seq: u64) -> u64 {
+        acc.rotate_left(9) ^ commit_seq.wrapping_mul(0x9E37_79B1_85EB_CA87)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn parse_child_summary(stdout: &str) -> Option<(u32, u32, u64)> {
+        for line in stdout.lines() {
+            let Some(start_idx) = line.find(MULTIPROC_SUMMARY_PREFIX) else {
+                continue;
+            };
+            let summary = &line[start_idx..];
+
+            let mut ok: Option<u32> = None;
+            let mut busy: Option<u32> = None;
+            let mut digest: Option<u64> = None;
+
+            for token in summary.split_whitespace().skip(1) {
+                let (k, v) = token.split_once('=')?;
+                match k {
+                    "ok" => ok = v.parse::<u32>().ok(),
+                    "busy" => busy = v.parse::<u32>().ok(),
+                    "digest" => digest = v.parse::<u64>().ok(),
+                    _ => {}
+                }
+            }
+
+            return Some((ok?, busy?, digest?));
+        }
+        None
+    }
+
+    #[cfg(target_os = "linux")]
+    fn connect_with_retry(
+        path: &std::path::Path,
+    ) -> std::io::Result<std::os::unix::net::UnixStream> {
+        use std::io::ErrorKind;
+        use std::os::unix::net::UnixStream;
+        use std::thread;
+        use std::time::Duration;
+
+        let mut last_err: Option<std::io::Error> = None;
+        for _ in 0..100_u32 {
+            match UnixStream::connect(path) {
+                Ok(stream) => return Ok(stream),
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        ErrorKind::NotFound
+                            | ErrorKind::ConnectionRefused
+                            | ErrorKind::ConnectionReset
+                    ) =>
+                {
+                    last_err = Some(err);
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(err) => return Err(err),
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| {
+            std::io::Error::new(
+                ErrorKind::TimedOut,
+                format!("timed out connecting to {}", path.display()),
+            )
+        }))
+    }
+
+    #[cfg(target_os = "linux")]
+    #[allow(clippy::too_many_lines)]
+    fn run_multiprocess_child_client_script(
+        socket_path: &std::path::Path,
+        seed: u64,
+        rounds: u32,
+    ) -> std::io::Result<(u32, u32, u64)> {
+        use std::io::ErrorKind;
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+
+        let stream = connect_with_retry(socket_path)?;
+        let mut request_id = 1_u64;
+        let mut ok_count = 0_u32;
+        let mut busy_count = 0_u32;
+        let mut digest = 0_u64;
+
+        for round in 0..rounds {
+            let txn = deterministic_txn(seed, round);
+
+            let reserve_frame = Frame {
+                kind: MessageKind::Reserve,
+                request_id,
+                payload: ReservePayload { purpose: 1, txn }.to_bytes(),
+            };
+            request_id = request_id.saturating_add(1);
+            (&stream).write_all(&reserve_frame.encode())?;
+
+            let (reserve_resp_frame, reserve_resp_fd) = recv_frame_with_optional_fd(&stream)?;
+            if reserve_resp_fd.is_some() {
+                return Err(std::io::Error::new(
+                    ErrorKind::InvalidData,
+                    "reserve response carried unexpected fd",
+                ));
+            }
+            if reserve_resp_frame.kind != MessageKind::Response {
+                return Err(std::io::Error::new(
+                    ErrorKind::InvalidData,
+                    format!(
+                        "expected reserve response frame, got {:?}",
+                        reserve_resp_frame.kind
+                    ),
+                ));
+            }
+
+            let reserve_resp = ReserveResponse::from_bytes(&reserve_resp_frame.payload)
+                .ok_or_else(|| {
+                    std::io::Error::new(ErrorKind::InvalidData, "invalid reserve response payload")
+                })?;
+
+            let permit_id = match reserve_resp {
+                ReserveResponse::Ok { permit_id } => permit_id,
+                ReserveResponse::Busy { .. } => {
+                    busy_count = busy_count.saturating_add(1);
+                    continue;
+                }
+                ReserveResponse::Err { code } => {
+                    return Err(std::io::Error::new(
+                        ErrorKind::InvalidData,
+                        format!("unexpected reserve error code {code}"),
+                    ));
+                }
+            };
+
+            let wal = SubmitWalPayload {
+                permit_id,
+                txn,
+                mode: 0,
+                snapshot_high: 10 + u64::from(round),
+                schema_epoch: 1,
+                has_in_rw: false,
+                has_out_rw: false,
+                wal_fec_r: 0,
+                spill_pages: vec![SpillPageEntry {
+                    pgno: 1 + round,
+                    offset: 0,
+                    len: 4096,
+                    xxh3_64: seed ^ u64::from(round),
+                }],
+                read_witness_refs: vec![],
+                write_witness_refs: vec![],
+                edge_refs: vec![],
+                merge_refs: vec![],
+            };
+
+            let (_spill_r, spill_w) = std::io::pipe()?;
+            let submit_frame = Frame {
+                kind: MessageKind::SubmitWalCommit,
+                request_id,
+                payload: wal.to_bytes(),
+            };
+            request_id = request_id.saturating_add(1);
+            send_with_fd(&stream, &submit_frame.encode(), spill_w.as_raw_fd())?;
+
+            let (submit_resp_frame, submit_resp_fd) = recv_frame_with_optional_fd(&stream)?;
+            if submit_resp_fd.is_some() {
+                return Err(std::io::Error::new(
+                    ErrorKind::InvalidData,
+                    "submit response carried unexpected fd",
+                ));
+            }
+            if submit_resp_frame.kind != MessageKind::Response {
+                return Err(std::io::Error::new(
+                    ErrorKind::InvalidData,
+                    format!(
+                        "expected submit response frame, got {:?}",
+                        submit_resp_frame.kind
+                    ),
+                ));
+            }
+            let commit_resp = WalCommitResponse::from_bytes(&submit_resp_frame.payload)
+                .ok_or_else(|| {
+                    std::io::Error::new(ErrorKind::InvalidData, "invalid submit response payload")
+                })?;
+            let commit_seq = match commit_resp {
+                WalCommitResponse::Ok { commit_seq } => commit_seq,
+                WalCommitResponse::Conflict { .. }
+                | WalCommitResponse::Err { .. }
+                | WalCommitResponse::IoError { .. } => {
+                    return Err(std::io::Error::new(
+                        ErrorKind::InvalidData,
+                        format!("unexpected submit response: {commit_resp:?}"),
+                    ));
+                }
+            };
+
+            let (_dup_spill_r, dup_spill_w) = std::io::pipe()?;
+            let dup_submit = Frame {
+                kind: MessageKind::SubmitWalCommit,
+                request_id,
+                payload: wal.to_bytes(),
+            };
+            request_id = request_id.saturating_add(1);
+            send_with_fd(&stream, &dup_submit.encode(), dup_spill_w.as_raw_fd())?;
+            let (dup_resp_frame, dup_resp_fd) = recv_frame_with_optional_fd(&stream)?;
+            if dup_resp_fd.is_some() {
+                return Err(std::io::Error::new(
+                    ErrorKind::InvalidData,
+                    "duplicate submit response carried unexpected fd",
+                ));
+            }
+            let dup_commit =
+                WalCommitResponse::from_bytes(&dup_resp_frame.payload).ok_or_else(|| {
+                    std::io::Error::new(
+                        ErrorKind::InvalidData,
+                        "invalid duplicate submit response payload",
+                    )
+                })?;
+            if dup_commit != (WalCommitResponse::Ok { commit_seq }) {
+                return Err(std::io::Error::new(
+                    ErrorKind::InvalidData,
+                    format!("idempotency mismatch: first={commit_seq} duplicate={dup_commit:?}"),
+                ));
+            }
+
+            ok_count = ok_count.saturating_add(1);
+            digest = fold_commit_digest(digest, commit_seq);
+        }
+
+        let ping = Frame {
+            kind: MessageKind::Ping,
+            request_id,
+            payload: vec![],
+        };
+        (&stream).write_all(&ping.encode())?;
+        let (pong, pong_fd) = recv_frame_with_optional_fd(&stream)?;
+        if pong_fd.is_some() {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidData,
+                "pong carried unexpected fd",
+            ));
+        }
+        if pong.kind != MessageKind::Pong {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidData,
+                format!("expected pong, got {:?}", pong.kind),
+            ));
+        }
+
+        Ok((ok_count, busy_count, digest))
     }
 
     // -- bd-1m07 test 1: Frame round-trip encode/decode for all 7 kinds --
@@ -2092,6 +2365,211 @@ mod tests {
         assert_eq!(resp.request_id, 4);
 
         server.join().expect("server thread");
+    }
+
+    // -- bd-2l5jk: deterministic true multi-process IPC stress over Unix socket --
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn test_e2e_bd_1m07_multiprocess_seeded_stress() {
+        use std::io::{ErrorKind, Write};
+        use std::os::unix::net::UnixListener;
+        use std::process::Command;
+        use std::sync::Arc;
+
+        if std::env::var(MULTIPROC_CHILD_MODE_ENV).ok().as_deref() == Some("client") {
+            let socket_path = std::path::PathBuf::from(
+                std::env::var(MULTIPROC_SOCKET_PATH_ENV).expect("child socket path"),
+            );
+            let seed = std::env::var(MULTIPROC_SEED_ENV)
+                .expect("child seed")
+                .parse::<u64>()
+                .expect("parse child seed");
+            let rounds = std::env::var(MULTIPROC_ROUNDS_ENV)
+                .expect("child rounds")
+                .parse::<u32>()
+                .expect("parse child rounds");
+            let (ok, busy, digest) =
+                run_multiprocess_child_client_script(&socket_path, seed, rounds)
+                    .expect("child client script");
+            println!("{MULTIPROC_SUMMARY_PREFIX} ok={ok} busy={busy} digest={digest}");
+            return;
+        }
+
+        let seed = 0xC0FF_EE11_AAA5_5501_u64;
+        let rounds = 96_u32;
+        let mut socket_path = std::env::temp_dir();
+        let unique = format!(
+            "coord-ipc-seeded-{}-{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0_u128, |duration| duration.as_nanos())
+        );
+        socket_path.push(unique);
+        if socket_path.exists() {
+            let _ = std::fs::remove_file(&socket_path);
+        }
+        let listener = UnixListener::bind(&socket_path).expect("bind unix listener");
+
+        let pm = Arc::new(PermitManager::new(MAX_OUTSTANDING_PERMITS));
+        let cache = Arc::new(IdempotencyCache::new());
+        let pm_server = Arc::clone(&pm);
+        let cache_server = Arc::clone(&cache);
+
+        let server = std::thread::spawn(move || -> (u32, u32, u64) {
+            let (server_sock, _) = listener.accept().expect("accept child connection");
+            let mut next_commit_seq = 1_000_u64;
+            let mut ok_count = 0_u32;
+            let mut busy_count = 0_u32;
+            let mut digest = 0_u64;
+
+            loop {
+                let (frame, maybe_fd) = match recv_frame_with_optional_fd(&server_sock) {
+                    Ok(frame) => frame,
+                    Err(err) if err.kind() == ErrorKind::UnexpectedEof => break,
+                    Err(err) => panic!("server recv frame failed: {err}"),
+                };
+
+                match frame.kind {
+                    MessageKind::Reserve => {
+                        let _reserve = ReservePayload::from_bytes(&frame.payload)
+                            .expect("parse reserve payload");
+                        let response_payload = match pm_server.reserve() {
+                            Ok(permit_id) => ReserveResponse::Ok { permit_id }.to_bytes(),
+                            Err(PermitError::Busy) => {
+                                busy_count = busy_count.saturating_add(1);
+                                ReserveResponse::Busy { retry_after_ms: 1 }.to_bytes()
+                            }
+                            Err(err) => panic!("reserve failed unexpectedly: {err:?}"),
+                        };
+
+                        let response = Frame {
+                            kind: MessageKind::Response,
+                            request_id: frame.request_id,
+                            payload: response_payload,
+                        };
+                        (&server_sock)
+                            .write_all(&response.encode())
+                            .expect("server write reserve response");
+                    }
+                    MessageKind::SubmitWalCommit => {
+                        let _spill_fd = maybe_fd.expect("submit must carry spill fd");
+                        let wal = SubmitWalPayload::from_bytes(&frame.payload)
+                            .expect("parse submit wal payload");
+                        let key = wal.txn.idempotency_key();
+                        let response_payload = if let Some(cached) = cache_server.get(key.0, key.1)
+                        {
+                            cached
+                        } else {
+                            pm_server
+                                .consume(wal.permit_id)
+                                .expect("consume permit for submit");
+                            next_commit_seq = next_commit_seq.saturating_add(1);
+                            let response = WalCommitResponse::Ok {
+                                commit_seq: next_commit_seq,
+                            }
+                            .to_bytes();
+                            cache_server.insert(key.0, key.1, response.clone());
+                            ok_count = ok_count.saturating_add(1);
+                            digest = fold_commit_digest(digest, next_commit_seq);
+                            response
+                        };
+
+                        let response = Frame {
+                            kind: MessageKind::Response,
+                            request_id: frame.request_id,
+                            payload: response_payload,
+                        };
+                        (&server_sock)
+                            .write_all(&response.encode())
+                            .expect("server write submit response");
+                    }
+                    MessageKind::Ping => {
+                        if let Some(fd) = maybe_fd {
+                            panic!("ping must not carry fd: {}", fd.raw_fd());
+                        }
+                        let pong = Frame {
+                            kind: MessageKind::Pong,
+                            request_id: frame.request_id,
+                            payload: vec![],
+                        };
+                        (&server_sock)
+                            .write_all(&pong.encode())
+                            .expect("server write pong");
+                    }
+                    other => panic!("unexpected frame kind in stress server: {other:?}"),
+                }
+            }
+
+            assert_eq!(
+                pm_server.outstanding(),
+                0,
+                "all permits must be consumed or released at end of stress run"
+            );
+            (ok_count, busy_count, digest)
+        });
+
+        let child_output = Command::new(std::env::current_exe().expect("current test exe"))
+            .arg("--exact")
+            .arg("coordinator_ipc::tests::test_e2e_bd_1m07_multiprocess_seeded_stress")
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env(MULTIPROC_CHILD_MODE_ENV, "client")
+            .env(
+                MULTIPROC_SOCKET_PATH_ENV,
+                socket_path
+                    .to_str()
+                    .expect("socket path must be valid UTF-8 for env transport"),
+            )
+            .env(MULTIPROC_SEED_ENV, seed.to_string())
+            .env(MULTIPROC_ROUNDS_ENV, rounds.to_string())
+            .output()
+            .expect("spawn child stress process");
+
+        let child_stdout = String::from_utf8_lossy(&child_output.stdout).into_owned();
+        let child_stderr = String::from_utf8_lossy(&child_output.stderr).into_owned();
+        assert!(
+            child_output.status.success(),
+            "child process failed\nstatus: {:?}\nstdout:\n{}\nstderr:\n{}",
+            child_output.status.code(),
+            child_stdout,
+            child_stderr
+        );
+
+        let (child_ok, child_busy, child_digest) = parse_child_summary(&child_stdout)
+            .unwrap_or_else(|| {
+                panic!(
+                    "missing child summary line `{MULTIPROC_SUMMARY_PREFIX}`\nstdout:\n{child_stdout}\nstderr:\n{child_stderr}"
+                )
+            });
+
+        let (server_ok, server_busy, server_digest) = server.join().expect("server thread join");
+
+        assert_eq!(
+            child_ok + child_busy,
+            rounds,
+            "child must account for all scripted rounds"
+        );
+        assert_eq!(server_ok + server_busy, rounds);
+        assert_eq!(
+            child_ok, server_ok,
+            "ok-count mismatch between child/server"
+        );
+        assert_eq!(
+            child_busy, server_busy,
+            "busy-count mismatch between child/server"
+        );
+        assert_eq!(
+            child_digest, server_digest,
+            "commit digest mismatch between child and server"
+        );
+        let cache_len = u32::try_from(cache.len()).expect("cache len must fit in u32");
+        assert_eq!(
+            cache_len, server_ok,
+            "cache cardinality must match committed txns"
+        );
+        let _ = std::fs::remove_file(&socket_path);
     }
 
     // ===================================================================

@@ -32,6 +32,66 @@ const DRAINING_NONE: u32 = 0xFFFF_FFFF;
 
 /// Default rebuild lease duration in seconds.
 const DEFAULT_LEASE_SECS: u64 = 5;
+const PID_BIRTH_PROCFS_TAG: u64 = 1_u64 << 63;
+
+#[cfg(unix)]
+fn read_proc_start_time_ticks(pid: u32) -> Option<u64> {
+    let stat_path = std::path::Path::new("/proc")
+        .join(pid.to_string())
+        .join("stat");
+    let stat = std::fs::read_to_string(stat_path).ok()?;
+    let comm_end = stat.rfind(')')?;
+    let tail = stat.get(comm_end + 1..)?.trim_start();
+    tail.split_whitespace().nth(19)?.parse::<u64>().ok()
+}
+
+fn current_process_birth_token(now_fallback: u64) -> u64 {
+    #[cfg(unix)]
+    {
+        if !std::path::Path::new("/proc").exists() {
+            return now_fallback;
+        }
+        if let Some(start_ticks) = read_proc_start_time_ticks(std::process::id()) {
+            return PID_BIRTH_PROCFS_TAG | (start_ticks & !PID_BIRTH_PROCFS_TAG);
+        }
+        now_fallback
+    }
+    #[cfg(not(unix))]
+    {
+        now_fallback
+    }
+}
+
+fn process_alive_os(pid: u32, pid_birth: u64) -> bool {
+    #[cfg(unix)]
+    {
+        if pid == 0 {
+            return false;
+        }
+
+        if !std::path::Path::new("/proc").exists() {
+            return true;
+        }
+        let proc_dir = std::path::Path::new("/proc").join(pid.to_string());
+        if !proc_dir.exists() {
+            return false;
+        }
+
+        if pid_birth & PID_BIRTH_PROCFS_TAG == 0 {
+            // Legacy token format: keep conservative behavior to avoid
+            // false stale clears for already-published leases.
+            return true;
+        }
+
+        let expected_ticks = pid_birth & !PID_BIRTH_PROCFS_TAG;
+        read_proc_start_time_ticks(pid).is_some_and(|start_ticks| start_ticks == expected_ticks)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (pid, pid_birth);
+        true
+    }
+}
 
 // ---------------------------------------------------------------------------
 // PageLockEntry
@@ -448,7 +508,7 @@ impl SharedPageLockTable {
                 .duration_since(UNIX_EPOCH)
                 .map_or(0, |duration| duration.as_secs());
             let pid = std::process::id();
-            let pid_birth = now_secs;
+            let pid_birth = current_process_birth_token(now_secs);
 
             if self
                 .acquire_rebuild_lease(pid, pid_birth, now_secs)
@@ -474,7 +534,7 @@ impl SharedPageLockTable {
             .duration_since(UNIX_EPOCH)
             .map_or(0, |duration| duration.as_secs());
         let pid = std::process::id();
-        let pid_birth = now_secs;
+        let pid_birth = current_process_birth_token(now_secs);
 
         // Use a tiny non-zero timeout so we can still yield once if needed,
         // while keeping this helper effectively best-effort.
@@ -648,9 +708,16 @@ impl SharedPageLockTable {
                 Ok(())
             }
             Err(current_pid) => {
-                // Check if the lease is stale (expired + holder dead).
+                // Check if the lease is stale (expired or holder process dead).
                 let expiry = self.rebuild_lease_expiry.load(Ordering::Acquire);
-                if expiry < now_secs {
+                let current_pid_birth = self.rebuild_pid_birth.load(Ordering::Acquire);
+                // Boundary is stale: a lease that expires at `now_secs` can be
+                // stolen immediately for deterministic handoff semantics.
+                let lease_expired = expiry <= now_secs;
+                let process_dead = current_pid != 0
+                    && current_pid_birth != 0
+                    && !process_alive_os(current_pid, current_pid_birth);
+                if lease_expired || process_dead {
                     // Lease expired — try to steal.
                     match self.rebuild_pid.compare_exchange(
                         current_pid,
@@ -665,7 +732,9 @@ impl SharedPageLockTable {
                             warn!(
                                 old_pid = current_pid,
                                 new_pid = pid,
-                                "rebuild lease stolen from expired holder"
+                                lease_expired,
+                                process_dead,
+                                "rebuild lease stolen from stale holder"
                             );
                             Ok(())
                         }
@@ -1119,6 +1188,54 @@ mod tests {
 
         // Process 2 tries at time 1006 — lease expired, steal succeeds.
         assert!(table.acquire_rebuild_lease(1002, 0, 1006).is_ok());
+        assert_eq!(table.rebuild_pid.load(Ordering::Relaxed), 1002);
+    }
+
+    #[test]
+    fn test_rebuild_stale_lease_stolen_at_expiry_boundary() {
+        let table = SharedPageLockTable::new(TEST_CAP);
+
+        // Process 1 acquires lease at time 1000 (expires at 1005).
+        assert!(table.acquire_rebuild_lease(1001, 0, 1000).is_ok());
+
+        // Before expiry boundary, lease is still held.
+        let err = table.acquire_rebuild_lease(1002, 0, 1004).unwrap_err();
+        assert_eq!(err, RebuildLeaseError::LeaseHeld { pid: 1001 });
+
+        // Exact boundary is stale (matches serialized-writer semantics in shm.rs).
+        assert!(table.acquire_rebuild_lease(1002, 0, 1005).is_ok());
+        assert_eq!(table.rebuild_pid.load(Ordering::Relaxed), 1002);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_process_alive_os_rejects_tagged_birth_mismatch() {
+        let pid = std::process::id();
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_secs());
+        let birth = current_process_birth_token(now_secs);
+        if birth & PID_BIRTH_PROCFS_TAG == 0 {
+            return;
+        }
+
+        assert!(process_alive_os(pid, birth));
+
+        let mismatched = PID_BIRTH_PROCFS_TAG | ((birth & !PID_BIRTH_PROCFS_TAG).wrapping_add(1));
+        assert!(!process_alive_os(pid, mismatched));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_rebuild_lease_stolen_when_holder_process_dead_before_expiry() {
+        let table = SharedPageLockTable::new(TEST_CAP);
+
+        // Holder publishes a future expiry but with a dead process identity.
+        assert!(table.acquire_rebuild_lease(u32::MAX, 42, 1000).is_ok());
+        assert_eq!(table.rebuild_lease_expiry.load(Ordering::Relaxed), 1005);
+
+        // Another process can steal before expiry because holder is dead.
+        assert!(table.acquire_rebuild_lease(1002, 7, 1001).is_ok());
         assert_eq!(table.rebuild_pid.load(Ordering::Relaxed), 1002);
     }
 
@@ -1619,10 +1736,10 @@ mod tests {
         assert_eq!(table.holder(100), Some(100));
     }
 
-    // -- bd-3t3.8 E2E: cross-process contention --
+    // -- bd-3t3.8 E2E: cross-thread contention simulation --
 
     #[test]
-    fn test_e2e_shared_page_lock_table_cross_process_contention() {
+    fn test_e2e_shared_page_lock_table_cross_thread_contention() {
         use std::sync::Barrier;
         use std::sync::atomic::AtomicBool;
 
@@ -1630,7 +1747,7 @@ mod tests {
         let barrier = Arc::new(Barrier::new(2));
         let done = Arc::new(AtomicBool::new(false));
 
-        // "Process 1" (thread 1): Writer that acquires and holds page locks.
+        // Thread 1: writer that acquires and holds page locks.
         let table1 = Arc::clone(&table);
         let barrier1 = Arc::clone(&barrier);
         let done1 = Arc::clone(&done);
@@ -1659,7 +1776,7 @@ mod tests {
             acquired_count
         });
 
-        // "Process 2" (thread 2): Contender that checks mutual exclusion.
+        // Thread 2: contender that checks mutual exclusion.
         let table2 = Arc::clone(&table);
         let barrier2 = Arc::clone(&barrier);
         let done2 = Arc::clone(&done);
