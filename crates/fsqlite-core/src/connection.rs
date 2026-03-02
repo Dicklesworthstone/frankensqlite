@@ -5275,7 +5275,7 @@ impl Connection {
                 // SQLite rule: cannot add a NOT NULL column without a DEFAULT value.
                 if notnull && default_value.is_none() {
                     return Err(FrankenError::Internal(
-                        "Cannot add a NOT NULL column with default value NULL".to_owned(),
+                        "Cannot add a NOT NULL column without a default value".to_owned(),
                     ));
                 }
                 let mut schema = self.schema.borrow_mut();
@@ -5333,6 +5333,12 @@ impl Connection {
                     .iter()
                     .position(|c| c.name.eq_ignore_ascii_case(col_name))
                     .ok_or_else(|| FrankenError::Internal(format!("no such column: {col_name}")))?;
+                // SQLite rule: cannot drop the last remaining column.
+                if table.columns.len() == 1 {
+                    return Err(FrankenError::Internal(format!(
+                        "cannot drop column {col_name}: only one column remains"
+                    )));
+                }
                 table.columns.remove(col_idx);
                 // Remove indexes that reference the dropped column.
                 let dropped_indexes: Vec<String> = table
@@ -5344,9 +5350,37 @@ impl Connection {
                 table
                     .indexes
                     .retain(|idx| !dropped_indexes.contains(&idx.name));
+
+                // Remove FKs that reference the dropped column, and adjust
+                // column indices for remaining FKs whose child_columns point
+                // past the removed position.
+                table
+                    .foreign_keys
+                    .retain(|fk| !fk.child_columns.contains(&col_idx));
+                for fk in &mut table.foreign_keys {
+                    for ci in &mut fk.child_columns {
+                        if *ci > col_idx {
+                            *ci -= 1;
+                        }
+                    }
+                }
+
+                // If the dropped column was the rowid alias (INTEGER PRIMARY
+                // KEY), remove the mapping so future inserts use auto-rowid.
+                let tbl_key = table.name.to_ascii_lowercase();
                 let table_clone = table.clone();
                 // Drop the schema borrow before calling delete_sqlite_master_row.
                 drop(schema);
+                if let Some(&alias_idx) = self.rowid_alias_columns.borrow().get(&tbl_key) {
+                    if alias_idx == col_idx {
+                        self.rowid_alias_columns.borrow_mut().remove(&tbl_key);
+                    } else if alias_idx > col_idx {
+                        // Adjust index for the shifted column positions.
+                        self.rowid_alias_columns
+                            .borrow_mut()
+                            .insert(tbl_key, alias_idx - 1);
+                    }
+                }
                 for idx_name in &dropped_indexes {
                     let _ = self.delete_sqlite_master_row(idx_name);
                 }

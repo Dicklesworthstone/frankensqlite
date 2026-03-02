@@ -1874,6 +1874,10 @@ impl ScalarFunction for JsonExtractFunc {
         if matches!(args[0], SqliteValue::Null) {
             return Ok(SqliteValue::Null);
         }
+        // SQLite returns NULL when any path argument is NULL.
+        if args[1..].iter().any(|a| matches!(a, SqliteValue::Null)) {
+            return Ok(SqliteValue::Null);
+        }
         let input = text_arg(self.name(), args, 0)?;
         let paths = collect_path_args(self.name(), args, 1)?;
         json_extract(input, &paths)
@@ -1953,6 +1957,14 @@ impl ScalarFunction for JsonSetFunc {
         if matches!(args[0], SqliteValue::Null) {
             return Ok(SqliteValue::Null);
         }
+        // SQLite returns NULL when any path argument is NULL.
+        if args[1..]
+            .iter()
+            .step_by(2)
+            .any(|a| matches!(a, SqliteValue::Null))
+        {
+            return Ok(SqliteValue::Null);
+        }
         let input = text_arg(self.name(), args, 0)?;
         let pairs_owned = collect_path_value_pairs(self.name(), args, 1)?;
         let pairs = pairs_owned
@@ -1985,6 +1997,14 @@ impl ScalarFunction for JsonInsertFunc {
         if matches!(args[0], SqliteValue::Null) {
             return Ok(SqliteValue::Null);
         }
+        // SQLite returns NULL when any path argument is NULL.
+        if args[1..]
+            .iter()
+            .step_by(2)
+            .any(|a| matches!(a, SqliteValue::Null))
+        {
+            return Ok(SqliteValue::Null);
+        }
         let input = text_arg(self.name(), args, 0)?;
         let pairs_owned = collect_path_value_pairs(self.name(), args, 1)?;
         let pairs = pairs_owned
@@ -2015,6 +2035,14 @@ impl ScalarFunction for JsonReplaceFunc {
             ));
         }
         if matches!(args[0], SqliteValue::Null) {
+            return Ok(SqliteValue::Null);
+        }
+        // SQLite returns NULL when any path argument is NULL.
+        if args[1..]
+            .iter()
+            .step_by(2)
+            .any(|a| matches!(a, SqliteValue::Null))
+        {
             return Ok(SqliteValue::Null);
         }
         let input = text_arg(self.name(), args, 0)?;
@@ -2053,6 +2081,10 @@ impl ScalarFunction for JsonRemoveFunc {
         if args.len() == 1 {
             // With just the JSON argument, validate and return minified.
             return Ok(SqliteValue::Text(json(input)?));
+        }
+        // SQLite returns NULL when any path argument is NULL.
+        if args[1..].iter().any(|a| matches!(a, SqliteValue::Null)) {
+            return Ok(SqliteValue::Null);
         }
         let paths = collect_path_args(self.name(), args, 1)?;
         Ok(SqliteValue::Text(json_remove(input, &paths)?))

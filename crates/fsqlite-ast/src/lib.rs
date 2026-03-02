@@ -440,6 +440,8 @@ pub enum Expr {
         name: String,
         args: FunctionArgs,
         distinct: bool,
+        /// In-aggregate ORDER BY (SQLite 3.44+), e.g. `group_concat(x ORDER BY y)`.
+        order_by: Vec<OrderingTerm>,
         filter: Option<Box<Self>>,
         over: Option<WindowSpec>,
         span: Span,
@@ -706,6 +708,7 @@ pub enum Distinctness {
 
 /// A single column in the SELECT result list.
 #[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum ResultColumn {
     /// `*` — all columns from all tables.
     Star,
@@ -1996,6 +1999,7 @@ mod tests {
                 name: "count".to_owned(),
                 args: FunctionArgs::Star,
                 distinct: false,
+                order_by: vec![],
                 filter: None,
                 over: None,
                 span,
@@ -2025,6 +2029,7 @@ mod tests {
             name: "row_number".to_owned(),
             args: FunctionArgs::List(vec![]),
             distinct: false,
+            order_by: vec![],
             filter: None,
             over: Some(WindowSpec {
                 base_window: None,

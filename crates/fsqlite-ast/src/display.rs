@@ -295,6 +295,7 @@ impl fmt::Display for Expr {
                 name,
                 args,
                 distinct,
+                order_by,
                 filter,
                 over,
                 ..
@@ -307,6 +308,10 @@ impl fmt::Display for Expr {
                 match args {
                     FunctionArgs::Star => f.write_str("*")?,
                     FunctionArgs::List(items) => comma_list(f, items)?,
+                }
+                if !order_by.is_empty() {
+                    f.write_str(" ORDER BY ")?;
+                    comma_list(f, order_by)?;
                 }
                 f.write_str(")")?;
                 if let Some(filter_expr) = filter {

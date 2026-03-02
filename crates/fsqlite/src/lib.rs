@@ -4,6 +4,7 @@
 //! phases it also re-exports selected internal crates for integration tests.
 
 pub use fsqlite_core::connection::{Connection, PreparedStatement, Row, TraceEvent, TraceMask};
+pub use fsqlite_error::FrankenError;
 pub use fsqlite_vfs;
 
 pub mod compat;

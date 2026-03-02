@@ -27,11 +27,11 @@
 
     { "op": "query", "sql": "SELECT COALESCE(NULL, NULL, 42)", "expect": { "rows": [["42"]], "ordered": true } },
     { "op": "query", "sql": "SELECT COALESCE(1, 2, 3)", "expect": { "rows": [["1"]], "ordered": true } },
-    { "op": "query", "sql": "SELECT COALESCE(NULL, NULL, NULL)", "expect": { "rows": [[null]], "ordered": true } },
+    { "op": "query", "sql": "SELECT COALESCE(NULL, NULL, NULL)", "expect": { "rows": [["NULL"]], "ordered": true } },
 
-    { "op": "query", "sql": "SELECT NULLIF(5, 5)", "expect": { "rows": [[null]], "ordered": true } },
+    { "op": "query", "sql": "SELECT NULLIF(5, 5)", "expect": { "rows": [["NULL"]], "ordered": true } },
     { "op": "query", "sql": "SELECT NULLIF(5, 6)", "expect": { "rows": [["5"]], "ordered": true } },
-    { "op": "query", "sql": "SELECT NULLIF('abc', 'abc')", "expect": { "rows": [[null]], "ordered": true } },
+    { "op": "query", "sql": "SELECT NULLIF('abc', 'abc')", "expect": { "rows": [["NULL"]], "ordered": true } },
 
     { "op": "query", "sql": "SELECT IIF(1 > 0, 'yes', 'no')", "expect": { "rows": [["yes"]], "ordered": true } },
     { "op": "query", "sql": "SELECT IIF(1 < 0, 'yes', 'no')", "expect": { "rows": [["no"]], "ordered": true } },

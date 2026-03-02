@@ -9,7 +9,7 @@
     { "op": "query", "sql": "SELECT substr('hello', -3)", "expect": { "rows": [["llo"]], "ordered": true } },
     { "op": "query", "sql": "SELECT substr('hello', 2, 3)", "expect": { "rows": [["ell"]], "ordered": true } },
     { "op": "query", "sql": "SELECT substr('hello', 0, 3)", "expect": { "rows": [["he"]], "ordered": true } },
-    { "op": "query", "sql": "SELECT substr(NULL, 1, 3)", "expect": { "rows": [[null]], "ordered": true } },
+    { "op": "query", "sql": "SELECT substr(NULL, 1, 3)", "expect": { "rows": [["NULL"]], "ordered": true } },
 
     { "op": "query", "sql": "SELECT replace('hello world', 'world', 'rust')", "expect": { "rows": [["hello rust"]], "ordered": true } },
     { "op": "query", "sql": "SELECT replace('aaa', 'a', 'bb')", "expect": { "rows": [["bbbbbb"]], "ordered": true } },

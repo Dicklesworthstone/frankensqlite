@@ -13,7 +13,7 @@ use tracing::{debug, info};
 
 use fsqlite_types::{
     BTreePageHeader, BTreePageType, BtreeRef, CommitSeq, IntentOp, MergePageKind, PageNumber,
-    PageSize, SchemaEpoch, SemanticKeyKind, SemanticKeyRef, Snapshot, TableId,
+    PageSize, SchemaEpoch, SemanticKeyKind, SemanticKeyRef, Snapshot,
 };
 
 use crate::deterministic_rebase::{

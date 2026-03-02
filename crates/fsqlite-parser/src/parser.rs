@@ -693,6 +693,9 @@ impl Parser {
             if let Some(jt) = self.try_join_type()? {
                 let table = self.parse_table_or_subquery()?;
                 let constraint = self.parse_join_constraint()?;
+                if jt.natural && constraint.is_some() {
+                    return Err(self.err_msg("a NATURAL join may not have an ON or USING clause"));
+                }
                 joins.push(JoinClause {
                     join_type: jt,
                     table,

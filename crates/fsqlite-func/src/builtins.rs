@@ -318,7 +318,10 @@ impl ScalarFunction for IifFunc {
             SqliteValue::Integer(i) => *i != 0,
             SqliteValue::Float(f) => *f != 0.0,
             SqliteValue::Text(s) => s.parse::<f64>().is_ok_and(|f| f != 0.0),
-            SqliteValue::Blob(_) => false,
+            SqliteValue::Blob(b) => std::str::from_utf8(b)
+                .ok()
+                .and_then(|s| s.trim().parse::<f64>().ok())
+                .is_some_and(|f| f != 0.0),
         };
         if is_true {
             Ok(args[1].clone())

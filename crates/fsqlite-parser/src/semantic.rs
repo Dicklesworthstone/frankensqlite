@@ -366,6 +366,8 @@ pub enum SemanticErrorKind {
         expected: FunctionArity,
         actual: usize,
     },
+    /// SELECT * used without any tables in scope.
+    NoTablesSpecifiedForStar,
     /// Type coercion warning (not fatal).
     ImplicitTypeCoercion {
         from: TypeAffinity,
@@ -823,39 +825,33 @@ impl<'a> Resolver<'a> {
 
     fn resolve_join(&mut self, join: &JoinClause, scope: &mut Scope) {
         // Snapshot column names from existing aliases BEFORE adding the new
-        // table, so we can compute shared columns for NATURAL JOIN.
-        let pre_join_columns: Vec<HashSet<String>> = if join.join_type.natural {
-            scope
-                .known_local_column_sets()
-                .into_iter()
-                .cloned()
-                .collect()
-        } else {
-            Vec::new()
-        };
+        // table, so we can compute shared columns for NATURAL JOIN and USING.
+        let pre_join_columns: Vec<HashSet<String>> = scope
+            .known_local_column_sets()
+            .into_iter()
+            .cloned()
+            .collect();
+        let pre_join_aliases: HashSet<String> = scope.aliases.keys().cloned().collect();
 
         self.resolve_table_or_subquery(&join.table, scope);
 
         if join.join_type.natural && join.constraint.is_none() {
             // NATURAL JOIN: implicitly equate all columns with matching names
-            // between the pre-existing tables and the newly joined table.
-            // Determine the alias name of the join target.
-            let join_alias = match &join.table {
-                TableOrSubquery::Table { name, alias, .. } => {
-                    alias.as_deref().unwrap_or(&name.name).to_ascii_lowercase()
-                }
-                TableOrSubquery::Subquery { alias, .. }
-                | TableOrSubquery::TableFunction { alias, .. } => {
-                    alias.as_deref().unwrap_or("").to_ascii_lowercase()
-                }
-                TableOrSubquery::ParenJoin(_) => String::new(),
-            };
-            if let Some(new_cols) = scope.columns_for_alias(&join_alias).cloned() {
-                for col_name in &new_cols {
-                    if pre_join_columns.iter().any(|cs| cs.contains(col_name)) {
-                        scope.using_columns.insert(col_name.clone());
+            // between the pre-existing tables and the newly joined table(s).
+            let mut to_insert = Vec::new();
+            for (alias, cols_opt) in &scope.columns {
+                if !pre_join_aliases.contains(alias) {
+                    if let Some(new_cols) = cols_opt {
+                        for col_name in new_cols {
+                            if pre_join_columns.iter().any(|cs| cs.contains(col_name)) {
+                                to_insert.push(col_name.clone());
+                            }
+                        }
                     }
                 }
+            }
+            for col_name in to_insert {
+                scope.using_columns.insert(col_name);
             }
         }
 
@@ -864,7 +860,40 @@ impl<'a> Resolver<'a> {
                 JoinConstraint::On(expr) => self.resolve_expr(expr, scope),
                 JoinConstraint::Using(cols) => {
                     for col in cols {
-                        scope.using_columns.insert(col.to_ascii_lowercase());
+                        let col_lower = col.to_ascii_lowercase();
+                        scope.using_columns.insert(col_lower.clone());
+
+                        // Validate that column exists on the left side
+                        let in_left = pre_join_columns.iter().any(|cs| cs.contains(&col_lower));
+                        // Validate that column exists on the right side
+                        let mut in_right = false;
+                        for (alias, cols_opt) in &scope.columns {
+                            if !pre_join_aliases.contains(alias) {
+                                if let Some(new_cols) = cols_opt {
+                                    if new_cols.contains(&col_lower) {
+                                        in_right = true;
+                                        break;
+                                    }
+                                } else {
+                                    // If right side columns are unknown (e.g. subquery), assume it exists
+                                    in_right = true;
+                                    break;
+                                }
+                            }
+                        }
+
+                        // If left side has unknown columns, we might not find it in `pre_join_columns`
+                        let left_has_unknown = scope.columns.iter().any(|(alias, cols_opt)| {
+                            pre_join_aliases.contains(alias) && cols_opt.is_none()
+                        });
+
+                        if (!in_left && !left_has_unknown) || !in_right {
+                            self.push_error(SemanticErrorKind::UnresolvedColumn {
+                                table: None,
+                                column: col.clone(),
+                            });
+                        }
+
                         self.resolve_unqualified_column(col, scope, true);
                     }
                 }
@@ -877,10 +906,7 @@ impl<'a> Resolver<'a> {
             ResultColumn::Star => {
                 // SELECT * is valid if there's at least one table in scope.
                 if scope.alias_count() == 0 && scope.parent.is_none() {
-                    tracing::warn!(
-                        target: "fsqlite.parse",
-                        "SELECT * with no tables in scope"
-                    );
+                    self.push_error(SemanticErrorKind::NoTablesSpecifiedForStar);
                 }
             }
             ResultColumn::TableStar(table_name) => {
@@ -1192,6 +1218,7 @@ impl<'a> Resolver<'a> {
                     "wrong number of arguments to function {function}: expected {expected:?}, got {actual}"
                 )
             }
+            SemanticErrorKind::NoTablesSpecifiedForStar => "no tables specified".to_string(),
             SemanticErrorKind::ImplicitTypeCoercion {
                 from, to, context, ..
             } => {
@@ -1240,6 +1267,10 @@ fn known_function_arity(name: &str) -> Option<FunctionArity> {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[path = "semantic_test.rs"]
+mod semantic_test;
 
 #[cfg(test)]
 mod tests {

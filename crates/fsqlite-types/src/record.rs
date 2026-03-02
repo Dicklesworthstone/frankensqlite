@@ -162,10 +162,9 @@ fn decode_value(serial_type: u64, bytes: &[u8]) -> Option<SqliteValue> {
                 Some(SqliteValue::Float(value))
             }
         }
-        SerialTypeClass::Text => {
-            let s = std::str::from_utf8(bytes).ok()?;
-            Some(SqliteValue::Text(s.to_owned()))
-        }
+        SerialTypeClass::Text => Some(SqliteValue::Text(
+            String::from_utf8_lossy(bytes).into_owned(),
+        )),
         SerialTypeClass::Blob => Some(SqliteValue::Blob(bytes.to_vec())),
         SerialTypeClass::Reserved => None,
     }

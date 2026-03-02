@@ -4191,8 +4191,32 @@ impl VdbeEngine {
                 }
 
                 Opcode::Count => {
-                    // Stub: set p2 to 0 (no cursor).
-                    self.set_reg(op.p2, SqliteValue::Integer(0));
+                    // Count rows in cursor P1, store result in register P2.
+                    let cursor_id = op.p1;
+                    let count: i64 = if let Some(cursor) = self.cursors.get(&cursor_id) {
+                        if let Some(db) = self.db.as_ref()
+                            && let Some(table) = db.get_table(cursor.root_page)
+                        {
+                            i64::try_from(table.rows.len()).unwrap_or(0)
+                        } else {
+                            0
+                        }
+                    } else if let Some(sc) = self.storage_cursors.get_mut(&cursor_id) {
+                        // Walk the cursor to count rows.
+                        let has_first = sc.cursor.first(&sc.cx)?;
+                        if !has_first {
+                            0
+                        } else {
+                            let mut n: i64 = 1;
+                            while sc.cursor.next(&sc.cx)? {
+                                n += 1;
+                            }
+                            n
+                        }
+                    } else {
+                        0
+                    };
+                    self.set_reg(op.p2, SqliteValue::Integer(count));
                     pc += 1;
                 }
 
@@ -4381,13 +4405,92 @@ impl VdbeEngine {
                 }
 
                 Opcode::IsType => {
-                    // Type check; stub: fall through.
-                    pc += 1;
+                    // Check datatype of a value against the P5 type bitmask.
+                    // If P1 >= 0: check column P3 of cursor P1.
+                    // If P1 == -1: check register P3.
+                    // P4 (Int) = default type code if column is beyond row width.
+                    // P5 bitmask: 0x01=INTEGER, 0x02=FLOAT, 0x04=TEXT, 0x08=BLOB, 0x10=NULL
+                    // Jump to P2 if the value's type matches a bit in P5.
+                    let val = if op.p1 < 0 {
+                        self.get_reg(op.p3).clone()
+                    } else {
+                        self.cursor_column(op.p1, op.p3 as usize)?
+                    };
+                    let type_bit: u16 = match &val {
+                        SqliteValue::Integer(_) => 0x01,
+                        SqliteValue::Float(_) => 0x02,
+                        SqliteValue::Text(_) => 0x04,
+                        SqliteValue::Blob(_) => 0x08,
+                        SqliteValue::Null => 0x10,
+                    };
+                    if op.p5 & type_bit != 0 {
+                        pc = op.p2 as usize;
+                    } else {
+                        pc += 1;
+                    }
                 }
 
-                Opcode::IfSizeBetween | Opcode::IfEmpty => {
-                    // Stub: jump to p2.
-                    pc = op.p2 as usize;
+                Opcode::IfEmpty => {
+                    // Jump to P2 if the table/index at cursor P1 is empty.
+                    let cursor_id = op.p1;
+                    let empty = if let Some(sc) = self.storage_cursors.get_mut(&cursor_id) {
+                        // Try moving to first; false means empty.
+                        let had_row = sc.cursor.first(&sc.cx)?;
+                        !had_row
+                    } else if let Some(cursor) = self.cursors.get(&cursor_id) {
+                        if let Some(db) = self.db.as_ref()
+                            && let Some(table) = db.get_table(cursor.root_page)
+                        {
+                            table.rows.is_empty()
+                        } else {
+                            true // no table = empty
+                        }
+                    } else {
+                        true
+                    };
+                    if empty {
+                        pc = op.p2 as usize;
+                    } else {
+                        pc += 1;
+                    }
+                }
+
+                Opcode::IfSizeBetween => {
+                    // Compute X = 10*log2(N) where N = approx row count of
+                    // cursor P1 (or -1 if empty). Jump to P2 if X is in
+                    // [P3, P4]. When we lack exact stats, estimate from the
+                    // MemTable row count or assume 0 (empty) for storage
+                    // cursors (conservative).
+                    let cursor_id = op.p1;
+                    let row_count: i64 = if let Some(cursor) = self.cursors.get(&cursor_id) {
+                        if let Some(db) = self.db.as_ref()
+                            && let Some(table) = db.get_table(cursor.root_page)
+                        {
+                            i64::try_from(table.rows.len()).unwrap_or(0)
+                        } else {
+                            0
+                        }
+                    } else {
+                        // For storage cursors, we don't have a cheap row count.
+                        // Default to -1 (empty) which maps to X = -10.
+                        -1
+                    };
+                    #[allow(clippy::cast_precision_loss)]
+                    let x = if row_count <= 0 {
+                        -10_i32 // empty sentinel
+                    } else {
+                        ((row_count as f64).log2() * 10.0) as i32
+                    };
+                    let lo = op.p3;
+                    let hi = match &op.p4 {
+                        P4::Int(v) => *v,
+                        _ => i32::MAX,
+                    };
+                    if x >= lo && x <= hi {
+                        pc = op.p2 as usize;
+                    } else {
+                        pc += 1;
+                    }
                 }
 
                 Opcode::IdxRowid => {

@@ -1378,7 +1378,7 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32) -> Result<(), Codege
                     0,
                     arg_reg,
                     reg,
-                    P4::FuncName("time".to_owned()),
+                    P4::FuncName("TIME".to_owned()),
                     1,
                 );
                 b.free_temp(arg_reg);
@@ -1392,7 +1392,7 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32) -> Result<(), Codege
                     0,
                     arg_reg,
                     reg,
-                    P4::FuncName("date".to_owned()),
+                    P4::FuncName("DATE".to_owned()),
                     1,
                 );
                 b.free_temp(arg_reg);
@@ -1406,7 +1406,7 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32) -> Result<(), Codege
                     0,
                     arg_reg,
                     reg,
-                    P4::FuncName("datetime".to_owned()),
+                    P4::FuncName("DATETIME".to_owned()),
                     1,
                 );
                 b.free_temp(arg_reg);

@@ -2267,13 +2267,13 @@ fn parse_aggregate_columns(
                     },
                 ..
             } if is_aggregate_function(name) => {
-                let lower_name = name.to_ascii_lowercase();
+                let canon_name = name.to_ascii_uppercase();
                 let filt = filter.clone();
                 match args {
                     FunctionArgs::Star => {
                         // count(*)
                         agg_cols.push(AggColumn {
-                            name: lower_name,
+                            name: canon_name,
                             num_args: 0,
                             arg_col_index: None,
                             arg_is_rowid: false,
@@ -2287,7 +2287,7 @@ fn parse_aggregate_columns(
                         if exprs.is_empty() {
                             // count() with no args — treat like count(*)
                             agg_cols.push(AggColumn {
-                                name: lower_name,
+                                name: canon_name,
                                 num_args: 0,
                                 arg_col_index: None,
                                 arg_is_rowid: false,
@@ -2309,7 +2309,7 @@ fn parse_aggregate_columns(
                             let extra: Vec<Expr> = exprs[1..].to_vec();
                             #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
                             agg_cols.push(AggColumn {
-                                name: lower_name,
+                                name: canon_name,
                                 num_args: exprs.len() as i32,
                                 arg_col_index: col_idx,
                                 arg_is_rowid: is_rowid,
@@ -2409,12 +2409,12 @@ fn parse_group_by_output(
                 ..
             } if is_aggregate_function(name) => {
                 let agg_index = agg_columns.len();
-                let lower_name = name.to_ascii_lowercase();
+                let canon_name = name.to_ascii_uppercase();
                 let filt = filter.clone();
                 match args {
                     FunctionArgs::Star => {
                         agg_columns.push(AggColumn {
-                            name: lower_name,
+                            name: canon_name,
                             num_args: 0,
                             arg_col_index: None,
                             arg_is_rowid: false,
@@ -2427,7 +2427,7 @@ fn parse_group_by_output(
                     FunctionArgs::List(exprs) => {
                         if exprs.is_empty() {
                             agg_columns.push(AggColumn {
-                                name: lower_name,
+                                name: canon_name,
                                 num_args: 0,
                                 arg_col_index: None,
                                 arg_is_rowid: false,
@@ -2447,7 +2447,7 @@ fn parse_group_by_output(
                             let extra: Vec<Expr> = exprs[1..].to_vec();
                             #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
                             agg_columns.push(AggColumn {
-                                name: lower_name,
+                                name: canon_name,
                                 num_args: exprs.len() as i32,
                                 arg_col_index: col_idx,
                                 arg_is_rowid: is_rowid,
@@ -2529,10 +2529,10 @@ fn collect_having_aggregates(
             filter,
             ..
         } if is_aggregate_function(name) => {
-            let lower = name.to_ascii_lowercase();
+            let upper = name.to_ascii_uppercase();
             // Check if this aggregate already exists in agg_columns.
             let already_exists = agg_columns.iter().any(|agg| {
-                if agg.name != lower {
+                if agg.name != upper {
                     return false;
                 }
                 match args {
@@ -2557,7 +2557,7 @@ fn collect_having_aggregates(
                 match args {
                     FunctionArgs::Star => {
                         agg_columns.push(AggColumn {
-                            name: lower,
+                            name: upper.clone(),
                             num_args: 0,
                             arg_col_index: None,
                             arg_is_rowid: false,
@@ -2570,7 +2570,7 @@ fn collect_having_aggregates(
                     FunctionArgs::List(exprs) => {
                         if exprs.is_empty() {
                             agg_columns.push(AggColumn {
-                                name: lower,
+                                name: upper.clone(),
                                 num_args: 0,
                                 arg_col_index: None,
                                 arg_is_rowid: false,
@@ -2589,7 +2589,7 @@ fn collect_having_aggregates(
                             let extra: Vec<Expr> = exprs[1..].to_vec();
                             #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
                             agg_columns.push(AggColumn {
-                                name: lower,
+                                name: upper,
                                 num_args: exprs.len() as i32,
                                 arg_col_index: col_idx,
                                 arg_is_rowid: is_rowid,
@@ -4894,10 +4894,10 @@ fn emit_having_expr(
     match expr {
         // Aggregate function call — resolve to the corresponding output register.
         Expr::FunctionCall { name, args, .. } if is_aggregate_function(name) => {
-            let lower = name.to_ascii_lowercase();
+            let upper = name.to_ascii_uppercase();
             // Find the matching aggregate by name + argument structure.
             let agg_idx = agg_columns.iter().position(|agg| {
-                if agg.name != lower {
+                if agg.name != upper {
                     return false;
                 }
                 match args {
@@ -6309,10 +6309,10 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
             ..
         } => {
             let func_name = match like_op {
-                fsqlite_ast::LikeOp::Like => "like",
-                fsqlite_ast::LikeOp::Glob => "glob",
-                fsqlite_ast::LikeOp::Match => "match",
-                fsqlite_ast::LikeOp::Regexp => "regexp",
+                fsqlite_ast::LikeOp::Like => "LIKE",
+                fsqlite_ast::LikeOp::Glob => "GLOB",
+                fsqlite_ast::LikeOp::Match => "MATCH",
+                fsqlite_ast::LikeOp::Regexp => "REGEXP",
             };
             let nargs: u16 = if escape.is_some() { 3 } else { 2 };
             let arg_base = b.alloc_regs(i32::from(nargs));
@@ -6440,10 +6440,11 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
         }
         Expr::FunctionCall { name, args, .. } if !is_aggregate_function(name) => {
             // Scalar function call: emit args, then PureFunc.
+            let canon = name.to_ascii_uppercase();
             match args {
                 fsqlite_ast::FunctionArgs::Star => {
                     // func(*) for non-aggregate → 0 args.
-                    b.emit_op(Opcode::PureFunc, 0, 0, reg, P4::FuncName(name.clone()), 0);
+                    b.emit_op(Opcode::PureFunc, 0, 0, reg, P4::FuncName(canon), 0);
                 }
                 fsqlite_ast::FunctionArgs::List(arg_list) => {
                     let Ok(nargs) = u16::try_from(arg_list.len()) else {
@@ -6460,7 +6461,7 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
                         0,
                         arg_base,
                         reg,
-                        P4::FuncName(name.clone()),
+                        P4::FuncName(canon),
                         nargs,
                     );
                 }
@@ -10020,6 +10021,7 @@ mod tests {
                                 Span::ZERO,
                             )]),
                             distinct: false,
+                            order_by: Vec::new(),
                             filter: None,
                             over: None,
                             span: Span::ZERO,
@@ -10067,6 +10069,7 @@ mod tests {
                                     Span::ZERO,
                                 )]),
                                 distinct: false,
+                                order_by: Vec::new(),
                                 filter: None,
                                 over: None,
                                 span: Span::ZERO,
@@ -10124,15 +10127,15 @@ mod tests {
             .unwrap();
         assert_eq!(rr.p2, 1, "count(*) produces 1 result column");
 
-        // AggStep should have P4 = FuncName("count").
+        // AggStep should have P4 = FuncName("COUNT").
         let step = prog
             .ops()
             .iter()
             .find(|op| op.opcode == Opcode::AggStep)
             .unwrap();
         assert!(
-            matches!(&step.p4, P4::FuncName(f) if f == "count"),
-            "AggStep P4 should be FuncName(count), got {:?}",
+            matches!(&step.p4, P4::FuncName(f) if f == "COUNT"),
+            "AggStep P4 should be FuncName(COUNT), got {:?}",
             step.p4
         );
     }
@@ -10169,15 +10172,15 @@ mod tests {
             .unwrap();
         assert_eq!(step.p5, 1, "sum(col) should have p5=1 (one arg)");
 
-        // AggFinal P4 should be FuncName("sum").
+        // AggFinal P4 should be FuncName("SUM").
         let fin = prog
             .ops()
             .iter()
             .find(|op| op.opcode == Opcode::AggFinal)
             .unwrap();
         assert!(
-            matches!(&fin.p4, P4::FuncName(f) if f == "sum"),
-            "AggFinal P4 should be FuncName(sum), got {:?}",
+            matches!(&fin.p4, P4::FuncName(f) if f == "SUM"),
+            "AggFinal P4 should be FuncName(SUM), got {:?}",
             fin.p4
         );
     }
@@ -10221,8 +10224,8 @@ mod tests {
             .iter()
             .filter(|op| op.opcode == Opcode::AggStep)
             .collect();
-        assert!(matches!(&steps[0].p4, P4::FuncName(f) if f == "count"));
-        assert!(matches!(&steps[1].p4, P4::FuncName(f) if f == "sum"));
+        assert!(matches!(&steps[0].p4, P4::FuncName(f) if f == "COUNT"));
+        assert!(matches!(&steps[1].p4, P4::FuncName(f) if f == "SUM"));
     }
 
     // === Test 23: Non-aggregate SELECT does not emit AggStep ===
@@ -10336,27 +10339,27 @@ mod tests {
         codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
         let prog = b.finish().unwrap();
 
-        // AggStep P4 should be "avg".
+        // AggStep P4 should be "AVG".
         let step = prog
             .ops()
             .iter()
             .find(|op| op.opcode == Opcode::AggStep)
             .unwrap();
         assert!(
-            matches!(&step.p4, P4::FuncName(f) if f == "avg"),
-            "AggStep P4 should be FuncName(avg), got {:?}",
+            matches!(&step.p4, P4::FuncName(f) if f == "AVG"),
+            "AggStep P4 should be FuncName(AVG), got {:?}",
             step.p4
         );
 
-        // AggFinal should also be "avg".
+        // AggFinal should also be "AVG".
         let fin = prog
             .ops()
             .iter()
             .find(|op| op.opcode == Opcode::AggFinal)
             .unwrap();
         assert!(
-            matches!(&fin.p4, P4::FuncName(f) if f == "avg"),
-            "AggFinal P4 should be FuncName(avg), got {:?}",
+            matches!(&fin.p4, P4::FuncName(f) if f == "AVG"),
+            "AggFinal P4 should be FuncName(AVG), got {:?}",
             fin.p4
         );
     }

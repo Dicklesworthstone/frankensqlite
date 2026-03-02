@@ -143,12 +143,13 @@ pub fn expr_is_rebase_safe(
             name,
             args,
             distinct,
+            order_by,
             filter,
             over,
             ..
         } => {
-            // Window functions, DISTINCT, and FILTER are not rebase-safe.
-            if over.is_some() || *distinct || filter.is_some() {
+            // Window functions, DISTINCT, FILTER, and ORDER BY are not rebase-safe.
+            if over.is_some() || *distinct || filter.is_some() || !order_by.is_empty() {
                 return None;
             }
 
@@ -428,6 +429,7 @@ mod tests {
             name: "random".to_owned(),
             args: FunctionArgs::List(vec![]),
             distinct: false,
+            order_by: vec![],
             filter: None,
             over: None,
             span: span(),
@@ -442,6 +444,7 @@ mod tests {
             name: "last_insert_rowid".to_owned(),
             args: FunctionArgs::List(vec![]),
             distinct: false,
+            order_by: vec![],
             filter: None,
             over: None,
             span: span(),
@@ -456,6 +459,7 @@ mod tests {
             name: "my_custom_func".to_owned(),
             args: FunctionArgs::List(vec![lit_int(1)]),
             distinct: false,
+            order_by: vec![],
             filter: None,
             over: None,
             span: span(),
@@ -477,6 +481,7 @@ mod tests {
             name: "changes".to_owned(),
             args: FunctionArgs::List(vec![]),
             distinct: false,
+            order_by: vec![],
             filter: None,
             over: None,
             span: span(),
@@ -491,6 +496,7 @@ mod tests {
             name: "abs".to_owned(),
             args: FunctionArgs::List(vec![col("a")]),
             distinct: false,
+            order_by: vec![],
             filter: None,
             over: Some(crate::WindowSpec {
                 base_window: None,
@@ -598,6 +604,7 @@ mod tests {
             name: "abs".to_owned(),
             args: FunctionArgs::List(vec![col("a")]),
             distinct: false,
+            order_by: vec![],
             filter: None,
             over: None,
             span: span(),
@@ -629,6 +636,7 @@ mod tests {
             name: "coalesce".to_owned(),
             args: FunctionArgs::List(vec![col("a"), lit_int(0)]),
             distinct: false,
+            order_by: vec![],
             filter: None,
             over: None,
             span: span(),
@@ -691,6 +699,7 @@ mod tests {
             name: "nullif".to_owned(),
             args: FunctionArgs::List(vec![col("a"), lit_int(0)]),
             distinct: false,
+            order_by: vec![],
             filter: None,
             over: None,
             span: span(),
@@ -736,6 +745,7 @@ mod tests {
             name: "count".to_owned(),
             args: FunctionArgs::Star,
             distinct: false,
+            order_by: vec![],
             filter: None,
             over: None,
             span: span(),
@@ -749,6 +759,7 @@ mod tests {
             name: "abs".to_owned(),
             args: FunctionArgs::List(vec![col("a")]),
             distinct: true,
+            order_by: vec![],
             filter: None,
             over: None,
             span: span(),
@@ -790,6 +801,7 @@ mod tests {
             name: "abs".to_owned(),
             args: FunctionArgs::List(vec![inner_add]),
             distinct: false,
+            order_by: vec![],
             filter: None,
             over: None,
             span: span(),
@@ -798,6 +810,7 @@ mod tests {
             name: "coalesce".to_owned(),
             args: FunctionArgs::List(vec![col("b"), lit_int(0)]),
             distinct: false,
+            order_by: vec![],
             filter: None,
             over: None,
             span: span(),
@@ -827,6 +840,7 @@ mod tests {
             name: "random".to_owned(),
             args: FunctionArgs::List(vec![]),
             distinct: false,
+            order_by: vec![],
             filter: None,
             over: None,
             span: span(),
@@ -835,6 +849,7 @@ mod tests {
             name: "abs".to_owned(),
             args: FunctionArgs::List(vec![random_call]),
             distinct: false,
+            order_by: vec![],
             filter: None,
             over: None,
             span: span(),

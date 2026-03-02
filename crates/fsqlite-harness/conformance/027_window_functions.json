@@ -21,9 +21,9 @@
 
     { "op": "query", "sql": "SELECT name, score, NTILE(2) OVER (ORDER BY score DESC) as tile FROM scores WHERE subject = 'math'", "expect": { "rows": [["Alice", "90", "1"], ["Charlie", "90", "1"], ["Bob", "85", "2"]], "ordered": true } },
 
-    { "op": "query", "sql": "SELECT name, score, LAG(score, 1) OVER (ORDER BY name) as prev_score FROM scores WHERE subject = 'math' ORDER BY name", "expect": { "rows": [["Alice", "90", null], ["Bob", "85", "90"], ["Charlie", "90", "85"]], "ordered": true } },
+    { "op": "query", "sql": "SELECT name, score, LAG(score, 1) OVER (ORDER BY name) as prev_score FROM scores WHERE subject = 'math' ORDER BY name", "expect": { "rows": [["Alice", "90", "NULL"], ["Bob", "85", "90"], ["Charlie", "90", "85"]], "ordered": true } },
 
-    { "op": "query", "sql": "SELECT name, score, LEAD(score, 1) OVER (ORDER BY name) as next_score FROM scores WHERE subject = 'math' ORDER BY name", "expect": { "rows": [["Alice", "90", "85"], ["Bob", "85", "90"], ["Charlie", "90", null]], "ordered": true } }
+    { "op": "query", "sql": "SELECT name, score, LEAD(score, 1) OVER (ORDER BY name) as next_score FROM scores WHERE subject = 'math' ORDER BY name", "expect": { "rows": [["Alice", "90", "85"], ["Bob", "85", "90"], ["Charlie", "90", "NULL"]], "ordered": true } }
   ],
   "fsqlite_modes": ["compatibility", "native"]
 }

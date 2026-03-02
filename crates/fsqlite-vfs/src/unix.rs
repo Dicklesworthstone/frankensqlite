@@ -1568,13 +1568,8 @@ impl VfsFile for UnixFile {
                 });
             }
 
-            let replacement = ShmRegion::new(requested_size);
-            {
-                let existing_guard = existing.lock();
-                let mut replacement_guard = replacement.lock();
-                let copy_len = existing_guard.len().min(replacement_guard.len());
-                replacement_guard[..copy_len].copy_from_slice(&existing_guard[..copy_len]);
-            }
+            let mut updated_region = existing.clone();
+            updated_region.resize(requested_size);
             let region_count = u64::from(region) + 1;
             let target_len = region_count.checked_mul(u64::from(size)).ok_or_else(|| {
                 FrankenError::LockFailed {
@@ -1582,9 +1577,9 @@ impl VfsFile for UnixFile {
                 }
             })?;
             info.file.set_len(target_len).map_err(FrankenError::Io)?;
-            info.regions.insert(region, replacement.clone());
+            info.regions.insert(region, updated_region.clone());
             drop(info);
-            return Ok(replacement);
+            return Ok(updated_region);
         }
         if !extend {
             return Err(FrankenError::CannotOpen {
