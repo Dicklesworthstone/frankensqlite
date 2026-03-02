@@ -4114,6 +4114,36 @@ impl Connection {
         })
     }
 
+    /// Destroy an on-disk B-tree root by deleting all rows and freeing the
+    /// root page back to the pager freelist.
+    fn destroy_btree_root_page(&self, root_page: i32, is_table: bool) -> Result<()> {
+        if root_page <= 1 {
+            return Ok(());
+        }
+
+        self.with_pager_write_txn(|cx, txn| {
+            let root_raw = u32::try_from(root_page)
+                .map_err(|_| FrankenError::internal(format!("invalid root page: {root_page}")))?;
+            let root = PageNumber::new(root_raw)
+                .ok_or_else(|| FrankenError::internal(format!("invalid root page: {root_page}")))?;
+
+            let usable_size = PageSize::DEFAULT.get();
+            {
+                let mut cursor = fsqlite_btree::BtCursor::new(
+                    TransactionPageIo::new(txn),
+                    root,
+                    usable_size,
+                    is_table,
+                );
+                while cursor.first(cx)? {
+                    cursor.delete(cx)?;
+                }
+            }
+
+            txn.free_page(cx, root)
+        })
+    }
+
     // ── sqlite_master helpers (bd-1b5e / 5A.2) ─────────────────────────
 
     /// Run a closure with a mutable pager transaction, auto-beginning and
@@ -5064,8 +5094,10 @@ impl Connection {
                 if let Some(idx) = table_idx {
                     let table = schema.remove(idx);
                     drop(schema);
+                    self.destroy_btree_root_page(table.root_page, true)?;
                     self.db.borrow_mut().destroy_table(table.root_page);
                     for index in &table.indexes {
+                        self.destroy_btree_root_page(index.root_page, false)?;
                         self.db.borrow_mut().destroy_table(index.root_page);
                         if let Err(err) = self.delete_sqlite_master_row(&index.name) {
                             swallow_missing_master(err)?;
@@ -5141,6 +5173,7 @@ impl Connection {
                     return Err(FrankenError::Internal(format!("no such index: {obj_name}")));
                 }
                 if let Some(root_page) = dropped_root_page {
+                    self.destroy_btree_root_page(root_page, false)?;
                     self.db.borrow_mut().destroy_table(root_page);
                 }
                 if let Err(err) = self.delete_sqlite_master_row(obj_name) {
@@ -17463,6 +17496,30 @@ mod tests {
             .delete_sqlite_master_row("idx_t_drop_idx_x")
             .expect_err("dropped index row should be absent from sqlite_master");
         assert!(is_sqlite_master_entry_missing(&index_missing));
+    }
+
+    #[test]
+    fn test_drop_releases_on_disk_pages_for_external_sqlite() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("drop_releases_pages.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+
+        conn.execute("CREATE TABLE t_drop_idx (x INTEGER, y TEXT);")
+            .unwrap();
+        conn.execute("CREATE INDEX idx_t_drop_idx_x ON t_drop_idx(x);")
+            .unwrap();
+        conn.execute("INSERT INTO t_drop_idx VALUES (1, 'a');")
+            .unwrap();
+        conn.execute("DROP INDEX idx_t_drop_idx_x;").unwrap();
+        conn.execute("DROP TABLE t_drop_idx;").unwrap();
+
+        drop(conn);
+
+        let sqlite = rusqlite::Connection::open(db_path).unwrap();
+        let quick_check: String = sqlite
+            .query_row("PRAGMA quick_check;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(quick_check, "ok");
     }
 
     #[test]

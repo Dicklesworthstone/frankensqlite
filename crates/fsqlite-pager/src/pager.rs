@@ -253,11 +253,7 @@ fn persist_freelist_to_disk<F: VfsFile>(cx: &Cx, inner: &mut PagerInner<F>) -> R
     } else {
         let max_leaf_entries = (ps / 4).saturating_sub(2).max(1);
         let trunk_count = freelist.len().div_ceil(max_leaf_entries + 1);
-        let trunks: Vec<u32> = freelist
-            .iter()
-            .take(trunk_count)
-            .map(|p| p.get())
-            .collect();
+        let trunks: Vec<u32> = freelist.iter().take(trunk_count).map(|p| p.get()).collect();
         (trunks[0], trunks)
     };
 
@@ -3471,7 +3467,10 @@ mod tests {
 
         let mut txn3 = reopened.begin(&cx, TransactionMode::Immediate).unwrap();
         let reused = txn3.allocate_page(&cx).unwrap();
-        assert_eq!(reused, p, "reopened pager should reuse persisted freelist page");
+        assert_eq!(
+            reused, p,
+            "reopened pager should reuse persisted freelist page"
+        );
         txn3.commit(&cx).unwrap();
     }
 
