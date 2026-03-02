@@ -10317,6 +10317,7 @@ impl Connection {
         let mut new_triggers = Vec::new();
         let mut new_views: Vec<ViewDef> = Vec::new();
         let mut pending_indexes: Vec<(String, String, i32, Vec<String>, bool)> = Vec::new();
+        let mut table_autoindex_columns: HashMap<String, Vec<Vec<String>>> = HashMap::new();
         let mut new_alias_map = HashMap::new();
         let mut new_autoincrement_tables = HashSet::new();
         let mut new_sqlite_sequence_cache = HashMap::new();
@@ -10354,36 +10355,44 @@ impl Connection {
                     SqliteValue::Integer(n) => *n,
                     _ => continue,
                 };
-                let create_sql = match &entry[4] {
-                    SqliteValue::Text(s) => s.clone(),
-                    _ => continue,
-                };
                 let root_page = i32::try_from(root_page_num).unwrap_or(0);
                 if root_page <= 0 {
                     continue;
                 }
-                let (indexed_columns, is_unique) = match parse_single_statement(&create_sql) {
-                    Ok(Statement::CreateIndex(stmt)) => {
-                        let cols = stmt
-                            .columns
-                            .iter()
-                            .filter_map(normalize_indexed_column_term)
-                            .map(|term| term.column_name)
-                            .collect::<Vec<_>>();
-                        (cols, stmt.unique)
+                match &entry[4] {
+                    SqliteValue::Text(create_sql) => {
+                        let (indexed_columns, is_unique) = match parse_single_statement(create_sql)
+                        {
+                            Ok(Statement::CreateIndex(stmt)) => {
+                                let cols = stmt
+                                    .columns
+                                    .iter()
+                                    .filter_map(normalize_indexed_column_term)
+                                    .map(|term| term.column_name)
+                                    .collect::<Vec<_>>();
+                                (cols, stmt.unique)
+                            }
+                            _ => (Vec::new(), false),
+                        };
+                        if indexed_columns.is_empty() {
+                            continue;
+                        }
+                        pending_indexes.push((
+                            index_name,
+                            table_name,
+                            root_page,
+                            indexed_columns,
+                            is_unique,
+                        ));
                     }
-                    _ => (Vec::new(), false),
-                };
-                if indexed_columns.is_empty() {
-                    continue;
+                    SqliteValue::Null => {
+                        if parse_autoindex_ordinal(&index_name, &table_name).is_none() {
+                            continue;
+                        }
+                        pending_indexes.push((index_name, table_name, root_page, Vec::new(), true));
+                    }
+                    _ => continue,
                 }
-                pending_indexes.push((
-                    index_name,
-                    table_name,
-                    root_page,
-                    indexed_columns,
-                    is_unique,
-                ));
                 continue;
             }
 
@@ -10443,6 +10452,7 @@ impl Connection {
 
             // Parse FK definitions and UNIQUE column groups from the CREATE TABLE AST.
             let mut fk_defs = Vec::new();
+            let mut autoindex_groups: Vec<Vec<String>> = Vec::new();
             if let Ok(Statement::CreateTable(ref create_stmt)) = parse_single_statement(&create_sql)
             {
                 if let CreateTableBody::Columns {
@@ -10484,6 +10494,7 @@ impl Connection {
                         // Column-level UNIQUE/non-IPK PRIMARY KEY.
                         for (i, col_info) in columns.iter().enumerate() {
                             if col_info.unique && !col_info.is_ipk {
+                                autoindex_groups.push(vec![col_info.name.clone()]);
                                 mem_table.add_unique_column_group(vec![i]);
                             }
                         }
@@ -10513,6 +10524,12 @@ impl Connection {
                                 if !col_indices.is_empty() {
                                     let all_ipk = col_indices.iter().all(|&i| columns[i].is_ipk);
                                     if !all_ipk {
+                                        autoindex_groups.push(
+                                            col_indices
+                                                .iter()
+                                                .map(|&i| columns[i].name.clone())
+                                                .collect(),
+                                        );
                                         mem_table.add_unique_column_group(col_indices);
                                     }
                                 }
@@ -10530,6 +10547,7 @@ impl Connection {
                 strict: crate::compat_persist::is_strict_table_sql(&create_sql),
                 foreign_keys: fk_defs,
             });
+            table_autoindex_columns.insert(name.to_ascii_lowercase(), autoindex_groups);
 
             // Read all rows from this table's B-tree.
             let file_root = PageNumber::new(u32::try_from(root_page_num).unwrap_or(1))
@@ -10572,8 +10590,29 @@ impl Connection {
             }
         }
 
+        for (index_name, table_name, _, columns, _) in &mut pending_indexes {
+            if !columns.is_empty() {
+                continue;
+            }
+            let Some(ordinal) = parse_autoindex_ordinal(index_name, table_name) else {
+                continue;
+            };
+            let Some(groups) = table_autoindex_columns.get(&table_name.to_ascii_lowercase()) else {
+                continue;
+            };
+            if ordinal == 0 {
+                continue;
+            }
+            if let Some(group) = groups.get(ordinal - 1) {
+                columns.clone_from(group);
+            }
+        }
+
         // Attach indexes after all table schemas are available.
         for (index_name, table_name, root_page, columns, is_unique) in pending_indexes {
+            if columns.is_empty() {
+                continue;
+            }
             if let Some(table) = new_schema
                 .iter_mut()
                 .find(|t| t.name.eq_ignore_ascii_case(&table_name))
@@ -11218,6 +11257,14 @@ fn render_create_index_sql(index: &IndexSchema, table_name: &str) -> String {
         "CREATE {unique}INDEX \"{}\" ON \"{}\"({})",
         index.name, table_name, cols
     )
+}
+
+fn parse_autoindex_ordinal(index_name: &str, table_name: &str) -> Option<usize> {
+    let index_lower = index_name.to_ascii_lowercase();
+    let table_lower = table_name.to_ascii_lowercase();
+    let prefix = format!("sqlite_autoindex_{table_lower}_");
+    let suffix = index_lower.strip_prefix(&prefix)?;
+    suffix.parse::<usize>().ok()
 }
 
 fn affinity_decl_type(affinity: char) -> &'static str {
