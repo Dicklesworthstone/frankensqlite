@@ -11134,7 +11134,7 @@ fn sqlite_master_column_infos() -> Vec<ColumnInfo> {
 }
 
 fn render_create_table_sql(table: &TableSchema, is_autoincrement: bool) -> String {
-    let column_defs = table
+    let mut defs: Vec<String> = table
         .columns
         .iter()
         .map(|col| {
@@ -11171,8 +11171,34 @@ fn render_create_table_sql(table: &TableSchema, is_autoincrement: bool) -> Strin
             }
             part
         })
-        .collect::<Vec<_>>()
-        .join(", ");
+        .collect();
+
+    for index in &table.indexes {
+        if !index.is_unique || index.columns.is_empty() {
+            continue;
+        }
+
+        // Column-level UNIQUE constraints are already rendered inline.
+        if index.columns.len() == 1
+            && table.columns.iter().any(|column| {
+                column.unique
+                    && !column.is_ipk
+                    && column.name.eq_ignore_ascii_case(&index.columns[0])
+            })
+        {
+            continue;
+        }
+
+        let cols = index
+            .columns
+            .iter()
+            .map(|name| format!("\"{name}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        defs.push(format!("UNIQUE ({cols})"));
+    }
+
+    let column_defs = defs.join(", ");
     let strict_suffix = if table.strict { " STRICT" } else { "" };
     format!(
         "CREATE TABLE \"{}\" ({column_defs}){strict_suffix}",
@@ -17566,9 +17592,30 @@ mod tests {
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='sqlite_autoindex_t_1';",
                 [],
                 |row| row.get(0),
-            )
-            .unwrap();
+        )
+        .unwrap();
         assert_eq!(autoindex_count, 1);
+    }
+
+    #[test]
+    fn test_composite_primary_key_autoindex_is_visible_to_external_sqlite() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("composite_pk_autoindex.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+
+        conn.execute(
+            "CREATE TABLE dep (issue_id TEXT, depends_on TEXT, PRIMARY KEY(issue_id, depends_on));",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO dep VALUES ('a', 'b');").unwrap();
+        conn.execute("INSERT INTO dep VALUES ('a', 'c');").unwrap();
+        drop(conn);
+
+        let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+        let quick_check: String = sqlite
+            .query_row("PRAGMA quick_check;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(quick_check, "ok");
     }
 
     #[test]
