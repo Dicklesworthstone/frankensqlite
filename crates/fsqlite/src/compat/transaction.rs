@@ -84,6 +84,12 @@ impl<'a> Transaction<'a> {
         self.conn.query_with_params(sql, params)
     }
 
+    /// Query with `ParamValue` parameters within this transaction.
+    pub fn query_params(&self, sql: &str, params: &[ParamValue]) -> Result<Vec<Row>, FrankenError> {
+        let values: Vec<SqliteValue> = params.iter().map(|p| p.0.clone()).collect();
+        self.conn.query_with_params(sql, &values)
+    }
+
     /// Query returning exactly one row within this transaction.
     pub fn query_row(&self, sql: &str) -> Result<Row, FrankenError> {
         self.conn.query_row(sql)

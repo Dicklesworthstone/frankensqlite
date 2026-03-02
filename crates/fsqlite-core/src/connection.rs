@@ -5264,6 +5264,20 @@ impl Connection {
                     .type_name
                     .as_ref()
                     .map_or('A', |tn| type_name_to_affinity_char(&tn.name));
+                let notnull = col_def
+                    .constraints
+                    .iter()
+                    .any(|c| matches!(c.kind, ColumnConstraintKind::NotNull { .. }));
+                let default_value = col_def.constraints.iter().find_map(|c| match &c.kind {
+                    ColumnConstraintKind::Default(dv) => Some(format_default_value(dv)),
+                    _ => None,
+                });
+                // SQLite rule: cannot add a NOT NULL column without a DEFAULT value.
+                if notnull && default_value.is_none() {
+                    return Err(FrankenError::Internal(
+                        "Cannot add a NOT NULL column with default value NULL".to_owned(),
+                    ));
+                }
                 let mut schema = self.schema.borrow_mut();
                 let table = schema
                     .iter_mut()
@@ -5272,18 +5286,10 @@ impl Connection {
                         name: table_name.clone(),
                     })?;
                 let type_name = col_def.type_name.as_ref().map(|tn| tn.name.clone());
-                let notnull = col_def
-                    .constraints
-                    .iter()
-                    .any(|c| matches!(c.kind, ColumnConstraintKind::NotNull { .. }));
                 let unique = col_def
                     .constraints
                     .iter()
                     .any(|c| matches!(c.kind, ColumnConstraintKind::Unique { .. }));
-                let default_value = col_def.constraints.iter().find_map(|c| match &c.kind {
-                    ColumnConstraintKind::Default(dv) => Some(format_default_value(dv)),
-                    _ => None,
-                });
                 let strict_type = if table.strict {
                     let type_decl = type_name.as_deref().ok_or_else(|| {
                         FrankenError::Internal(format!(
@@ -5328,7 +5334,23 @@ impl Connection {
                     .position(|c| c.name.eq_ignore_ascii_case(col_name))
                     .ok_or_else(|| FrankenError::Internal(format!("no such column: {col_name}")))?;
                 table.columns.remove(col_idx);
-                table.clone()
+                // Remove indexes that reference the dropped column.
+                let dropped_indexes: Vec<String> = table
+                    .indexes
+                    .iter()
+                    .filter(|idx| idx.columns.iter().any(|c| c.eq_ignore_ascii_case(col_name)))
+                    .map(|idx| idx.name.clone())
+                    .collect();
+                table
+                    .indexes
+                    .retain(|idx| !dropped_indexes.contains(&idx.name));
+                let table_clone = table.clone();
+                // Drop the schema borrow before calling delete_sqlite_master_row.
+                drop(schema);
+                for idx_name in &dropped_indexes {
+                    let _ = self.delete_sqlite_master_row(idx_name);
+                }
+                table_clone
             }
         };
 
@@ -5366,6 +5388,23 @@ impl Connection {
             new_schema.root_page,
             &create_sql,
         )?;
+
+        // When renaming a table, also update sqlite_master tbl_name for indexes.
+        if let AlterTableAction::RenameTo(new_name) = &alter.action {
+            for index in &new_schema.indexes {
+                // Delete old index entry and re-insert with new tbl_name.
+                if self.delete_sqlite_master_row(&index.name).is_ok() {
+                    let idx_sql = render_create_index_sql(index, new_name);
+                    let _ = self.insert_sqlite_master_row(
+                        "index",
+                        &index.name,
+                        new_name,
+                        index.root_page,
+                        &idx_sql,
+                    );
+                }
+            }
+        }
 
         self.increment_schema_cookie();
         Ok(())
@@ -10188,6 +10227,7 @@ impl Connection {
         let mut new_schema = Vec::new();
         let mut new_db = MemDatabase::new();
         let mut new_triggers = Vec::new();
+        let mut new_views: Vec<ViewDef> = Vec::new();
         let mut pending_indexes: Vec<(String, String, i32, Vec<String>, bool)> = Vec::new();
         let mut new_alias_map = HashMap::new();
         let mut new_autoincrement_tables = HashSet::new();
@@ -10259,8 +10299,24 @@ impl Connection {
                 continue;
             }
 
+            // Handle view entries — parse and rebuild ViewDef.
+            if entry_type.eq_ignore_ascii_case("view") {
+                let create_sql = match &entry[4] {
+                    SqliteValue::Text(s) => s.clone(),
+                    _ => continue,
+                };
+                if let Ok(Statement::CreateView(stmt)) = parse_single_statement(&create_sql) {
+                    new_views.push(ViewDef {
+                        name: stmt.name.name.clone(),
+                        columns: stmt.columns.clone(),
+                        query: stmt.query.clone(),
+                    });
+                }
+                continue;
+            }
+
             if !entry_type.eq_ignore_ascii_case("table") {
-                continue; // Skip indexes/views for now.
+                continue;
             }
 
             let name = match &entry[1] {
@@ -10297,13 +10353,94 @@ impl Connection {
             let real_root_page = root_page_num as i32;
             new_db.create_table_at(real_root_page, num_columns);
 
+            // Parse FK definitions and UNIQUE column groups from the CREATE TABLE AST.
+            let mut fk_defs = Vec::new();
+            if let Ok(Statement::CreateTable(ref create_stmt)) = parse_single_statement(&create_sql)
+            {
+                if let CreateTableBody::Columns {
+                    columns: ref col_defs,
+                    ref constraints,
+                } = create_stmt.body
+                {
+                    // Column-level FK constraints.
+                    for (i, col) in col_defs.iter().enumerate() {
+                        for c in &col.constraints {
+                            if let ColumnConstraintKind::ForeignKey(ref fk_clause) = c.kind {
+                                fk_defs.push(fk_clause_to_def(&[i], fk_clause));
+                            }
+                        }
+                    }
+                    // Table-level FK constraints.
+                    for tc in constraints {
+                        if let TableConstraintKind::ForeignKey {
+                            columns: ref fk_cols,
+                            ref clause,
+                        } = tc.kind
+                        {
+                            let child_indices: Vec<usize> = fk_cols
+                                .iter()
+                                .filter_map(|fk_name| {
+                                    columns
+                                        .iter()
+                                        .position(|c| c.name.eq_ignore_ascii_case(fk_name))
+                                })
+                                .collect();
+                            if !child_indices.is_empty() {
+                                fk_defs.push(fk_clause_to_def(&child_indices, clause));
+                            }
+                        }
+                    }
+
+                    // UNIQUE column groups for in-memory constraint enforcement.
+                    if let Some(mem_table) = new_db.get_table_mut(real_root_page) {
+                        // Column-level UNIQUE/non-IPK PRIMARY KEY.
+                        for (i, col_info) in columns.iter().enumerate() {
+                            if col_info.unique && !col_info.is_ipk {
+                                mem_table.add_unique_column_group(vec![i]);
+                            }
+                        }
+                        // Table-level UNIQUE/PRIMARY KEY constraints.
+                        for tc in constraints {
+                            if let TableConstraintKind::Unique {
+                                columns: ref idx_cols,
+                                ..
+                            }
+                            | TableConstraintKind::PrimaryKey {
+                                columns: ref idx_cols,
+                                ..
+                            } = tc.kind
+                            {
+                                let col_indices: Vec<usize> = idx_cols
+                                    .iter()
+                                    .filter_map(|ic| {
+                                        if let fsqlite_ast::Expr::Column(ref col_ref, _) = ic.expr {
+                                            columns.iter().position(|c| {
+                                                c.name.eq_ignore_ascii_case(&col_ref.column)
+                                            })
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .collect();
+                                if !col_indices.is_empty() {
+                                    let all_ipk = col_indices.iter().all(|&i| columns[i].is_ipk);
+                                    if !all_ipk {
+                                        mem_table.add_unique_column_group(col_indices);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             new_schema.push(TableSchema {
                 name: name.clone(),
                 root_page: real_root_page,
                 columns,
                 indexes: Vec::new(),
                 strict: crate::compat_persist::is_strict_table_sql(&create_sql),
-                foreign_keys: Vec::new(),
+                foreign_keys: fk_defs,
             });
 
             // Read all rows from this table's B-tree.
@@ -10399,12 +10536,9 @@ impl Connection {
         };
 
         // Apply the reloaded state.
-        // NOTE: Views are cleared here. View loading from sqlite_master (type='view')
-        // is not yet implemented; views created during a rolled-back transaction
-        // will be discarded.
         *self.db.borrow_mut() = new_db;
         *self.schema.borrow_mut() = new_schema;
-        self.views.borrow_mut().clear();
+        *self.views.borrow_mut() = new_views;
         *self.triggers.borrow_mut() = new_triggers;
         *self.rowid_alias_columns.borrow_mut() = new_alias_map;
         *self.autoincrement_tables.borrow_mut() = new_autoincrement_tables;
@@ -10916,11 +11050,35 @@ fn render_create_table_sql(table: &TableSchema, is_autoincrement: bool) -> Strin
         .columns
         .iter()
         .map(|col| {
-            let mut part = format!("{} {}", col.name, affinity_decl_type(col.affinity));
+            let type_decl = col
+                .type_name
+                .as_deref()
+                .unwrap_or_else(|| affinity_decl_type(col.affinity));
+            let mut part = format!("\"{}\" {}", col.name, type_decl);
             if col.is_ipk {
                 part.push_str(" PRIMARY KEY");
                 if is_autoincrement {
                     part.push_str(" AUTOINCREMENT");
+                }
+            }
+            if col.notnull && !col.is_ipk {
+                part.push_str(" NOT NULL");
+            }
+            if col.unique && !col.is_ipk {
+                part.push_str(" UNIQUE");
+            }
+            if let Some(ref default) = col.default_value {
+                part.push_str(" DEFAULT ");
+                part.push_str(default);
+            }
+            if let Some(ref gen_expr) = col.generated_expr {
+                part.push_str(" GENERATED ALWAYS AS (");
+                part.push_str(gen_expr);
+                part.push(')');
+                if col.generated_stored == Some(true) {
+                    part.push_str(" STORED");
+                } else {
+                    part.push_str(" VIRTUAL");
                 }
             }
             part
@@ -10928,15 +11086,23 @@ fn render_create_table_sql(table: &TableSchema, is_autoincrement: bool) -> Strin
         .collect::<Vec<_>>()
         .join(", ");
     let strict_suffix = if table.strict { " STRICT" } else { "" };
-    format!("CREATE TABLE {} ({column_defs}){strict_suffix}", table.name)
+    format!(
+        "CREATE TABLE \"{}\" ({column_defs}){strict_suffix}",
+        table.name
+    )
 }
 
 fn render_create_index_sql(index: &IndexSchema, table_name: &str) -> String {
+    let unique = if index.is_unique { "UNIQUE " } else { "" };
+    let cols = index
+        .columns
+        .iter()
+        .map(|c| format!("\"{}\"", c))
+        .collect::<Vec<_>>()
+        .join(", ");
     format!(
-        "CREATE INDEX {} ON {}({})",
-        index.name,
-        table_name,
-        index.columns.join(", ")
+        "CREATE {unique}INDEX \"{}\" ON \"{}\"({})",
+        index.name, table_name, cols
     )
 }
 

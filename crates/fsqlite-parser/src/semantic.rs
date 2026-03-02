@@ -297,6 +297,24 @@ impl Scope {
     pub fn alias_count(&self) -> usize {
         self.aliases.len()
     }
+
+    /// Return known column sets from all local aliases (for NATURAL JOIN).
+    /// Aliases with unknown columns (`None`) are omitted.
+    #[must_use]
+    pub fn known_local_column_sets(&self) -> Vec<&HashSet<String>> {
+        self.columns
+            .values()
+            .filter_map(|opt| opt.as_ref())
+            .collect()
+    }
+
+    /// Return the column set for a specific alias (lowercased lookup).
+    #[must_use]
+    pub fn columns_for_alias(&self, alias: &str) -> Option<&HashSet<String>> {
+        self.columns
+            .get(&alias.to_ascii_lowercase())
+            .and_then(|opt| opt.as_ref())
+    }
 }
 
 /// Result of resolving a column reference.
@@ -436,6 +454,16 @@ impl<'a> Resolver<'a> {
         match stmt {
             Statement::Select(select) => self.resolve_select(select, scope),
             Statement::Insert(insert) => {
+                // Process WITH clause CTEs if present.
+                if let Some(ref with) = insert.with {
+                    for cte in &with.ctes {
+                        scope.add_cte(&cte.name);
+                    }
+                    for cte in &with.ctes {
+                        let mut cte_scope = scope.clone();
+                        self.resolve_select(&cte.query, &mut cte_scope);
+                    }
+                }
                 match &insert.source {
                     fsqlite_ast::InsertSource::Select(select) => {
                         let mut source_scope = scope.clone();
@@ -518,6 +546,16 @@ impl<'a> Resolver<'a> {
                 }
             }
             Statement::Update(update) => {
+                // Process WITH clause CTEs if present.
+                if let Some(ref with) = update.with {
+                    for cte in &with.ctes {
+                        scope.add_cte(&cte.name);
+                    }
+                    for cte in &with.ctes {
+                        let mut cte_scope = scope.clone();
+                        self.resolve_select(&cte.query, &mut cte_scope);
+                    }
+                }
                 self.bind_table_to_scope(
                     &update.table.name.name,
                     update.table.alias.as_deref(),
@@ -558,6 +596,16 @@ impl<'a> Resolver<'a> {
                 }
             }
             Statement::Delete(delete) => {
+                // Process WITH clause CTEs if present.
+                if let Some(ref with) = delete.with {
+                    for cte in &with.ctes {
+                        scope.add_cte(&cte.name);
+                    }
+                    for cte in &with.ctes {
+                        let mut cte_scope = scope.clone();
+                        self.resolve_select(&cte.query, &mut cte_scope);
+                    }
+                }
                 self.bind_table_to_scope(
                     &delete.table.name.name,
                     delete.table.alias.as_deref(),
@@ -585,10 +633,16 @@ impl<'a> Resolver<'a> {
     }
 
     fn resolve_select(&mut self, select: &SelectStatement, scope: &mut Scope) {
-        // Register CTEs first (they are visible in the entire WITH scope).
+        // Register CTEs first (they are visible in the entire WITH scope),
+        // then resolve each CTE body query so that column errors inside CTEs
+        // are detected.
         if let Some(ref with) = select.with {
             for cte in &with.ctes {
                 scope.add_cte(&cte.name);
+            }
+            for cte in &with.ctes {
+                let mut cte_scope = scope.clone();
+                self.resolve_select(&cte.query, &mut cte_scope);
             }
         }
 
@@ -766,7 +820,43 @@ impl<'a> Resolver<'a> {
     }
 
     fn resolve_join(&mut self, join: &JoinClause, scope: &mut Scope) {
+        // Snapshot column names from existing aliases BEFORE adding the new
+        // table, so we can compute shared columns for NATURAL JOIN.
+        let pre_join_columns: Vec<HashSet<String>> = if join.join_type.natural {
+            scope
+                .known_local_column_sets()
+                .into_iter()
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         self.resolve_table_or_subquery(&join.table, scope);
+
+        if join.join_type.natural && join.constraint.is_none() {
+            // NATURAL JOIN: implicitly equate all columns with matching names
+            // between the pre-existing tables and the newly joined table.
+            // Determine the alias name of the join target.
+            let join_alias = match &join.table {
+                TableOrSubquery::Table { name, alias, .. } => {
+                    alias.as_deref().unwrap_or(&name.name).to_ascii_lowercase()
+                }
+                TableOrSubquery::Subquery { alias, .. }
+                | TableOrSubquery::TableFunction { alias, .. } => {
+                    alias.as_deref().unwrap_or("").to_ascii_lowercase()
+                }
+                TableOrSubquery::ParenJoin(_) => String::new(),
+            };
+            if let Some(new_cols) = scope.columns_for_alias(&join_alias).cloned() {
+                for col_name in &new_cols {
+                    if pre_join_columns.iter().any(|cs| cs.contains(col_name)) {
+                        scope.using_columns.insert(col_name.clone());
+                    }
+                }
+            }
+        }
+
         if let Some(ref constraint) = join.constraint {
             match constraint {
                 JoinConstraint::On(expr) => self.resolve_expr(expr, scope),

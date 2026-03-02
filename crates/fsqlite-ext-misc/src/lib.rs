@@ -59,6 +59,7 @@ impl VirtualTable for GenerateSeriesTable {
     fn open(&self) -> Result<Self::Cursor> {
         Ok(GenerateSeriesCursor {
             current: 0,
+            start: 0,
             stop: 0,
             step: 1,
             done: true,
@@ -69,6 +70,7 @@ impl VirtualTable for GenerateSeriesTable {
 /// Cursor for iterating over a generated integer series.
 pub struct GenerateSeriesCursor {
     current: i64,
+    start: i64,
     stop: i64,
     step: i64,
     done: bool,
@@ -83,6 +85,7 @@ impl GenerateSeriesCursor {
                 "generate_series: step cannot be zero",
             ));
         }
+        self.start = start;
         self.current = start;
         self.stop = stop;
         self.step = step;
@@ -127,10 +130,10 @@ impl VirtualTableCursor for GenerateSeriesCursor {
 
     fn column(&self, ctx: &mut ColumnContext, col: i32) -> Result<()> {
         let val = match col {
-            0 => SqliteValue::Integer(self.current),             // value
-            1 => SqliteValue::Integer(self.current - self.step), // start (approx)
-            2 => SqliteValue::Integer(self.stop),                // stop
-            3 => SqliteValue::Integer(self.step),                // step
+            0 => SqliteValue::Integer(self.current), // value
+            1 => SqliteValue::Integer(self.start),   // start
+            2 => SqliteValue::Integer(self.stop),    // stop
+            3 => SqliteValue::Integer(self.step),    // step
             _ => SqliteValue::Null,
         };
         ctx.set_value(val);
@@ -201,8 +204,16 @@ fn parse_decimal(s: &str) -> (bool, Vec<u8>, Vec<u8>) {
         None => (s, ""),
     };
 
-    let int_digits: Vec<u8> = int_str.bytes().map(|b| b - b'0').collect();
-    let frac_digits: Vec<u8> = frac_str.bytes().map(|b| b - b'0').collect();
+    let int_digits: Vec<u8> = int_str
+        .bytes()
+        .filter(|b| b.is_ascii_digit())
+        .map(|b| b - b'0')
+        .collect();
+    let frac_digits: Vec<u8> = frac_str
+        .bytes()
+        .filter(|b| b.is_ascii_digit())
+        .map(|b| b - b'0')
+        .collect();
 
     (negative, int_digits, frac_digits)
 }

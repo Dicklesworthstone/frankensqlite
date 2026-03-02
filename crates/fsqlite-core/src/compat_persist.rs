@@ -477,6 +477,8 @@ pub fn parse_columns_from_create_sql(sql: &str) -> Vec<ColumnInfo> {
                 None
             };
 
+            let default_value = extract_default_value(remainder);
+
             Some(ColumnInfo {
                 name,
                 affinity,
@@ -484,7 +486,7 @@ pub fn parse_columns_from_create_sql(sql: &str) -> Vec<ColumnInfo> {
                 type_name,
                 notnull: upper.contains("NOT NULL"),
                 unique: upper.contains("UNIQUE") || (is_ipk && upper.contains("PRIMARY KEY")),
-                default_value: None,
+                default_value,
                 strict_type,
                 generated_expr: None,
                 generated_stored: None,
@@ -700,6 +702,59 @@ fn extract_type_declaration(tokens: &[&str]) -> String {
         }
     }
     parts.join(" ")
+}
+
+/// Extract a DEFAULT value from a column definition remainder (the part after
+/// the column name).  Handles `DEFAULT literal`, `DEFAULT -number`,
+/// `DEFAULT 'string'`, and `DEFAULT (expr)`.
+fn extract_default_value(remainder: &str) -> Option<String> {
+    let upper = remainder.to_ascii_uppercase();
+    let pos = upper.find("DEFAULT")?;
+    let after = remainder[pos + 7..].trim_start();
+    if after.is_empty() {
+        return None;
+    }
+    // Parenthesized expression: DEFAULT (...)
+    if after.starts_with('(') {
+        let mut depth = 0i32;
+        for (i, ch) in after.char_indices() {
+            if ch == '(' {
+                depth += 1;
+            } else if ch == ')' {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(after[..=i].to_owned());
+                }
+            }
+        }
+        return None;
+    }
+    // Quoted string: DEFAULT '...'
+    if let Some(rest) = after.strip_prefix('\'') {
+        let mut i = 0;
+        let bytes = rest.as_bytes();
+        while i < bytes.len() {
+            if bytes[i] == b'\'' {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                    i += 2;
+                    continue;
+                }
+                return Some(after[..i + 2].to_owned());
+            }
+            i += 1;
+        }
+        return None;
+    }
+    // Unquoted token: DEFAULT NULL, DEFAULT 0, DEFAULT -1, DEFAULT CURRENT_TIMESTAMP
+    let end = after
+        .find(|c: char| c.is_ascii_whitespace() || c == ',')
+        .unwrap_or(after.len());
+    let token = &after[..end];
+    if token.is_empty() {
+        None
+    } else {
+        Some(token.to_owned())
+    }
 }
 
 /// Map a SQL type keyword to an affinity character.

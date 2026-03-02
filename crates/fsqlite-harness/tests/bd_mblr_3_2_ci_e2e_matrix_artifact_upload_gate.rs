@@ -6,17 +6,17 @@
 //! bd-mblr.4.4 (failure artifact bundling).
 
 use fsqlite_harness::ci_gate_matrix::{
+    ArtifactEntry, ArtifactKind, ArtifactManifest, AutoBisectConfig, BisectDispatchContext,
+    BisectRunTelemetry, BisectTrigger, CiLane, FlakeBudgetPolicy, FlakeEscalationLevel,
+    QuarantinePolicy, QuarantineTicket, RetryFailureClass, RetryPolicy, TestOutcome,
     build_artifact_manifest, build_bisect_request, build_bisect_result_summary,
     evaluate_bisect_dispatch, evaluate_flake_budget, evaluate_global_flake_budget,
-    evaluate_quarantine_ticket, evaluate_retry_decision, should_trigger_bisect, ArtifactEntry,
-    ArtifactKind, ArtifactManifest, AutoBisectConfig, BisectDispatchContext, BisectRunTelemetry,
-    BisectTrigger, CiLane, FlakeBudgetPolicy, FlakeEscalationLevel, QuarantinePolicy,
-    QuarantineTicket, RetryFailureClass, RetryPolicy, TestOutcome,
+    evaluate_quarantine_ticket, evaluate_retry_decision, should_trigger_bisect,
 };
 use fsqlite_harness::e2e_logging_init::{E2eLoggingConfig, LogOutputFormat, RunContext};
 use fsqlite_harness::failure_bundle::{
-    EnvironmentInfo, FailureBundle, FailureInfo, FailureType, FirstDivergence, ReproducibilityInfo,
-    ScenarioInfo, BUNDLE_SCHEMA_VERSION,
+    BUNDLE_SCHEMA_VERSION, EnvironmentInfo, FailureBundle, FailureInfo, FailureType,
+    FirstDivergence, ReproducibilityInfo, ScenarioInfo,
 };
 
 const BEAD_ID: &str = "bd-mblr.3.2";

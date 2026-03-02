@@ -140,3 +140,5 @@ crates/*/target/
 
 # Archived mailbox state snapshots
 **/archived_mailbox_states/
+.env
+.claude/settings.local.json

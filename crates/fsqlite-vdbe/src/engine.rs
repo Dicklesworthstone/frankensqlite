@@ -3656,30 +3656,47 @@ impl VdbeEngine {
                 Opcode::Found | Opcode::NoConflict => {
                     // Check if key exists; jump to p2 if found.
                     let cursor_id = op.p1;
-                    // Storage-cursor probe repositions via table_move_to; clear
-                    // pending delete/next state so subsequent iteration state
-                    // is based on the probe position, not stale pre-probe state.
+                    // Probe repositions the cursor; clear pending delete/next
+                    // state so subsequent iteration is based on the probe
+                    // position, not stale pre-probe state.
                     if self.storage_cursors.contains_key(&cursor_id) {
                         self.pending_next_after_delete.remove(&cursor_id);
                     }
-                    let rowid_val = self.get_reg(op.p3).to_integer();
-                    let exists = if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
-                        cursor
-                            .cursor
-                            .table_move_to(&cursor.cx, rowid_val)?
-                            .is_found()
-                    } else if let Some(cursor) = self.cursors.get(&cursor_id) {
-                        if let Some(db) = self.db.as_ref() {
-                            if let Some(table) = db.get_table(cursor.root_page) {
-                                table.find_by_rowid(rowid_val).is_some()
+                    let key_val = self.get_reg(op.p3).clone();
+                    let exists = if matches!(key_val, SqliteValue::Blob(_)) {
+                        // Index seek path: P3 contains a packed record blob
+                        // (from MakeRecord).  Use index_move_to instead of
+                        // table_move_to to find the key in the index B-tree.
+                        let key_bytes = record_blob_bytes(&key_val);
+                        if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
+                            cursor
+                                .cursor
+                                .index_move_to(&cursor.cx, &key_bytes)?
+                                .is_found()
+                        } else {
+                            false
+                        }
+                    } else {
+                        // Table seek path: P3 contains an integer rowid.
+                        let rowid_val = key_val.to_integer();
+                        if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
+                            cursor
+                                .cursor
+                                .table_move_to(&cursor.cx, rowid_val)?
+                                .is_found()
+                        } else if let Some(cursor) = self.cursors.get(&cursor_id) {
+                            if let Some(db) = self.db.as_ref() {
+                                if let Some(table) = db.get_table(cursor.root_page) {
+                                    table.find_by_rowid(rowid_val).is_some()
+                                } else {
+                                    false
+                                }
                             } else {
                                 false
                             }
                         } else {
                             false
                         }
-                    } else {
-                        false
                     };
                     if exists {
                         pc = op.p2 as usize;

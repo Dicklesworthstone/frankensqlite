@@ -280,7 +280,13 @@ pub fn json_quote(value: &SqliteValue) -> String {
         SqliteValue::Integer(i) => i.to_string(),
         SqliteValue::Float(f) => {
             if f.is_finite() {
-                format!("{f}")
+                // Ensure float always has a decimal point in JSON output.
+                let repr = format!("{f}");
+                if repr.contains('.') || repr.contains('e') || repr.contains('E') {
+                    repr
+                } else {
+                    format!("{repr}.0")
+                }
             } else {
                 "null".to_owned()
             }
@@ -289,11 +295,14 @@ pub fn json_quote(value: &SqliteValue) -> String {
             serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_owned())
         }
         SqliteValue::Blob(bytes) => {
-            let mut hex = String::with_capacity(bytes.len() * 2);
+            // SQLite emits blob values as the SQL hex literal X'...'
+            use std::fmt::Write;
+            let mut hex = String::with_capacity(bytes.len() * 2 + 4);
+            hex.push_str("X'");
             for byte in bytes {
-                use std::fmt::Write;
                 let _ = write!(hex, "{byte:02x}");
             }
+            hex.push('\'');
             serde_json::to_string(&hex).unwrap_or_else(|_| "\"\"".to_owned())
         }
     }
@@ -1775,6 +1784,9 @@ impl ScalarFunction for JsonFunc {
         if args.len() != 1 {
             return Err(invalid_arity(self.name(), "exactly 1 argument", args.len()));
         }
+        if matches!(args[0], SqliteValue::Null) {
+            return Ok(SqliteValue::Null);
+        }
         let input = text_arg(self.name(), args, 0)?;
         Ok(SqliteValue::Text(json(input)?))
     }
@@ -1797,6 +1809,7 @@ impl ScalarFunction for JsonValidFunc {
         }
         let flags = optional_flags_arg(self.name(), args, 1)?;
         let value = match &args[0] {
+            SqliteValue::Null => return Ok(SqliteValue::Null),
             SqliteValue::Text(text) => json_valid(text, flags),
             SqliteValue::Blob(bytes) => json_valid_blob(bytes, flags),
             _ => 0,
@@ -1819,6 +1832,9 @@ impl ScalarFunction for JsonTypeFunc {
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
         if !(1..=2).contains(&args.len()) {
             return Err(invalid_arity(self.name(), "1 or 2 arguments", args.len()));
+        }
+        if matches!(args[0], SqliteValue::Null) {
+            return Ok(SqliteValue::Null);
         }
         let input = text_arg(self.name(), args, 0)?;
         let path = if args.len() == 2 {
@@ -1854,6 +1870,9 @@ impl ScalarFunction for JsonExtractFunc {
                 "at least 2 arguments (json, path...)",
                 args.len(),
             ));
+        }
+        if matches!(args[0], SqliteValue::Null) {
+            return Ok(SqliteValue::Null);
         }
         let input = text_arg(self.name(), args, 0)?;
         let paths = collect_path_args(self.name(), args, 1)?;
@@ -1931,6 +1950,9 @@ impl ScalarFunction for JsonSetFunc {
                 args.len(),
             ));
         }
+        if matches!(args[0], SqliteValue::Null) {
+            return Ok(SqliteValue::Null);
+        }
         let input = text_arg(self.name(), args, 0)?;
         let pairs_owned = collect_path_value_pairs(self.name(), args, 1)?;
         let pairs = pairs_owned
@@ -1959,6 +1981,9 @@ impl ScalarFunction for JsonInsertFunc {
                 "an odd argument count >= 3 (json, path, value, ...)",
                 args.len(),
             ));
+        }
+        if matches!(args[0], SqliteValue::Null) {
+            return Ok(SqliteValue::Null);
         }
         let input = text_arg(self.name(), args, 0)?;
         let pairs_owned = collect_path_value_pairs(self.name(), args, 1)?;
@@ -1989,6 +2014,9 @@ impl ScalarFunction for JsonReplaceFunc {
                 args.len(),
             ));
         }
+        if matches!(args[0], SqliteValue::Null) {
+            return Ok(SqliteValue::Null);
+        }
         let input = text_arg(self.name(), args, 0)?;
         let pairs_owned = collect_path_value_pairs(self.name(), args, 1)?;
         let pairs = pairs_owned
@@ -2011,14 +2039,21 @@ pub struct JsonRemoveFunc;
 
 impl ScalarFunction for JsonRemoveFunc {
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
-        if args.len() < 2 {
+        if args.is_empty() {
             return Err(invalid_arity(
                 self.name(),
-                "at least 2 arguments (json, path...)",
+                "at least 1 argument (json [, path...])",
                 args.len(),
             ));
         }
+        if matches!(args[0], SqliteValue::Null) {
+            return Ok(SqliteValue::Null);
+        }
         let input = text_arg(self.name(), args, 0)?;
+        if args.len() == 1 {
+            // With just the JSON argument, validate and return minified.
+            return Ok(SqliteValue::Text(json(input)?));
+        }
         let paths = collect_path_args(self.name(), args, 1)?;
         Ok(SqliteValue::Text(json_remove(input, &paths)?))
     }
@@ -2043,6 +2078,9 @@ impl ScalarFunction for JsonPatchFunc {
                 args.len(),
             ));
         }
+        if matches!(args[0], SqliteValue::Null) || matches!(args[1], SqliteValue::Null) {
+            return Ok(SqliteValue::Null);
+        }
         let input = text_arg(self.name(), args, 0)?;
         let patch = text_arg(self.name(), args, 1)?;
         Ok(SqliteValue::Text(json_patch(input, patch)?))
@@ -2063,6 +2101,9 @@ impl ScalarFunction for JsonArrayLengthFunc {
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
         if !(1..=2).contains(&args.len()) {
             return Err(invalid_arity(self.name(), "1 or 2 arguments", args.len()));
+        }
+        if matches!(args[0], SqliteValue::Null) {
+            return Ok(SqliteValue::Null);
         }
         let input = text_arg(self.name(), args, 0)?;
         let path = if args.len() == 2 {
@@ -2095,6 +2136,9 @@ impl ScalarFunction for JsonErrorPositionFunc {
         if args.len() != 1 {
             return Err(invalid_arity(self.name(), "exactly 1 argument", args.len()));
         }
+        if matches!(args[0], SqliteValue::Null) {
+            return Ok(SqliteValue::Null);
+        }
         let input = text_arg(self.name(), args, 0)?;
         Ok(SqliteValue::Integer(usize_to_i64(
             self.name(),
@@ -2117,6 +2161,9 @@ impl ScalarFunction for JsonPrettyFunc {
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
         if !(1..=2).contains(&args.len()) {
             return Err(invalid_arity(self.name(), "1 or 2 arguments", args.len()));
+        }
+        if matches!(args[0], SqliteValue::Null) {
+            return Ok(SqliteValue::Null);
         }
         let input = text_arg(self.name(), args, 0)?;
         let indent = if args.len() == 2 {
@@ -3089,8 +3136,9 @@ mod tests {
 
     #[test]
     fn test_json_quote_blob() {
+        // SQLite formats blob as the SQL hex literal X'...'
         let result = json_quote(&SqliteValue::Blob(vec![0xDE, 0xAD]));
-        assert_eq!(result, r#""dead""#);
+        assert_eq!(result, r#""X'dead'""#);
     }
 
     #[test]

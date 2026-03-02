@@ -55,7 +55,7 @@ fn fresh_database_applies_all_migrations() {
     // Verify schema was applied
     conn.execute_params(
         "INSERT INTO conversations (id, agent, created_at, model) VALUES (?1, ?2, ?3, ?4)",
-        &params!["s-001", "claude", 1700000000_i64, "opus"],
+        params!["s-001", "claude", 1700000000_i64, "opus"],
     )
     .unwrap();
 
@@ -352,25 +352,25 @@ fn cass_like_migration_sequence() {
     // Insert realistic data
     conn.execute_params(
         "INSERT INTO conversations (id, agent, created_at, title, tags) VALUES (?1, ?2, ?3, ?4, ?5)",
-        &params!["s-001", "claude_code", 1700000000_i64, "Debug auth", "rust,auth"],
+        params!["s-001", "claude_code", 1700000000_i64, "Debug auth", "rust,auth"],
     ).unwrap();
 
     conn.execute_params(
         "INSERT INTO messages (conversation_id, role, content, timestamp) VALUES (?1, ?2, ?3, ?4)",
-        &params!["s-001", "user", "Why is auth broken?", 1700000000_i64],
+        params!["s-001", "user", "Why is auth broken?", 1700000000_i64],
     )
     .unwrap();
 
     conn.execute_params(
         "INSERT INTO bookmarks (conversation_id, message_index, note, created_at) VALUES (?1, ?2, ?3, ?4)",
-        &params!["s-001", 0_i64, "Key insight", 1700000001_i64],
+        params!["s-001", 0_i64, "Key insight", 1700000001_i64],
     ).unwrap();
 
     // Verify data roundtrip
     let title: String = conn
         .query_row_map(
             "SELECT title FROM conversations WHERE id = ?1",
-            &params!["s-001"],
+            params!["s-001"],
             |row| row.get_typed(0),
         )
         .unwrap();
@@ -379,7 +379,7 @@ fn cass_like_migration_sequence() {
     let msg_count: i64 = conn
         .query_row_map(
             "SELECT COUNT(*) FROM messages WHERE conversation_id = ?1",
-            &params!["s-001"],
+            params!["s-001"],
             |row| row.get_typed(0),
         )
         .unwrap();
@@ -388,7 +388,7 @@ fn cass_like_migration_sequence() {
     let bm_note: String = conn
         .query_row_map(
             "SELECT note FROM bookmarks WHERE conversation_id = ?1",
-            &params!["s-001"],
+            params!["s-001"],
             |row| row.get_typed(0),
         )
         .unwrap();

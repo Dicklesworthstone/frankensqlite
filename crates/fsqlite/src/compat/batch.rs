@@ -107,7 +107,6 @@ fn split_sql_statements(sql: &str) -> Vec<&str> {
                 stmts.push(&sql[start..i]);
                 i += 1;
                 start = i;
-                continue;
             }
             _ => {
                 i += 1;

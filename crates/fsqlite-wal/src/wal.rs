@@ -772,6 +772,10 @@ impl<F: VfsFile> WalFile<F> {
             )?;
         }
 
+        // Sync the WAL header to stable storage before writing new frames,
+        // matching SQLite's walRestartHdr() behaviour.
+        self.file.sync(cx, SyncFlags::NORMAL)?;
+
         self.running_checksum = read_wal_header_checksum(&header_bytes)?;
         self.header = WalHeader::from_bytes(&header_bytes)?;
         self.frame_count = 0;

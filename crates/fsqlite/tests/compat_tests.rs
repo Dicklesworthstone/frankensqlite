@@ -25,35 +25,32 @@ fn params_macro_empty_produces_empty_slice() {
 fn params_macro_mixed_types_correct_values() {
     let p = params![1_i64, "hello", 3.14_f64];
     assert_eq!(p.len(), 3);
-    assert_eq!(p[0].as_sqlite_value().unwrap(), &SqliteValue::Integer(1));
+    assert_eq!(p[0].as_sqlite_value(), &SqliteValue::Integer(1));
     assert_eq!(
-        p[1].as_sqlite_value().unwrap(),
+        p[1].as_sqlite_value(),
         &SqliteValue::Text("hello".to_string())
     );
-    assert_eq!(p[2].as_sqlite_value().unwrap(), &SqliteValue::Float(3.14));
+    assert_eq!(p[2].as_sqlite_value(), &SqliteValue::Float(3.14));
 }
 
 #[test]
 fn params_macro_none_produces_null() {
     let p = params![None::<i64>];
     assert_eq!(p.len(), 1);
-    assert_eq!(p[0].as_sqlite_value().unwrap(), &SqliteValue::Null);
+    assert_eq!(p[0].as_sqlite_value(), &SqliteValue::Null);
 }
 
 #[test]
 fn params_macro_bool_true_and_false() {
     let p = params![true, false];
-    assert_eq!(p[0].as_sqlite_value().unwrap(), &SqliteValue::Integer(1));
-    assert_eq!(p[1].as_sqlite_value().unwrap(), &SqliteValue::Integer(0));
+    assert_eq!(p[0].as_sqlite_value(), &SqliteValue::Integer(1));
+    assert_eq!(p[1].as_sqlite_value(), &SqliteValue::Integer(0));
 }
 
 #[test]
 fn params_macro_blob() {
     let p = params![vec![1_u8, 2, 3]];
-    assert_eq!(
-        p[0].as_sqlite_value().unwrap(),
-        &SqliteValue::Blob(vec![1, 2, 3])
-    );
+    assert_eq!(p[0].as_sqlite_value(), &SqliteValue::Blob(vec![1, 2, 3]));
 }
 
 #[test]
@@ -68,12 +65,9 @@ fn params_macro_trailing_comma() {
 
 #[test]
 fn param_value_from_bool() {
+    assert_eq!(ParamValue::from(true).into_inner(), SqliteValue::Integer(1));
     assert_eq!(
-        ParamValue::from(true).into_inner().unwrap(),
-        SqliteValue::Integer(1)
-    );
-    assert_eq!(
-        ParamValue::from(false).into_inner().unwrap(),
+        ParamValue::from(false).into_inner(),
         SqliteValue::Integer(0)
     );
 }
@@ -81,56 +75,50 @@ fn param_value_from_bool() {
 #[test]
 fn param_value_from_option_some_and_none() {
     let some: ParamValue = Some(42_i64).into();
-    assert_eq!(some.into_inner().unwrap(), SqliteValue::Integer(42));
+    assert_eq!(some.into_inner(), SqliteValue::Integer(42));
 
     let none: ParamValue = None::<i64>.into();
-    assert_eq!(none.into_inner().unwrap(), SqliteValue::Null);
+    assert_eq!(none.into_inner(), SqliteValue::Null);
 }
 
 #[test]
 fn param_value_from_u32() {
     let p: ParamValue = 42_u32.into();
-    assert_eq!(p.into_inner().unwrap(), SqliteValue::Integer(42));
+    assert_eq!(p.into_inner(), SqliteValue::Integer(42));
 }
 
 #[test]
 fn param_value_from_u64_valid() {
     let p: ParamValue = 100_u64.into();
-    assert_eq!(p.into_inner().unwrap(), SqliteValue::Integer(100));
+    assert_eq!(p.into_inner(), SqliteValue::Integer(100));
 }
 
 #[test]
-fn param_value_from_u64_overflow_is_error() {
+fn param_value_from_u64_overflow_clamps() {
     let p: ParamValue = u64::MAX.into();
-    assert!(p.into_inner().is_err());
+    assert_eq!(p.into_inner(), SqliteValue::Integer(i64::MAX));
 }
 
 #[test]
 fn param_value_from_usize() {
     let p: ParamValue = 99_usize.into();
-    assert_eq!(p.into_inner().unwrap(), SqliteValue::Integer(99));
+    assert_eq!(p.into_inner(), SqliteValue::Integer(99));
 }
 
 #[test]
 fn param_value_from_string_and_str() {
     let p: ParamValue = "hello".into();
-    assert_eq!(
-        p.into_inner().unwrap(),
-        SqliteValue::Text("hello".to_string())
-    );
+    assert_eq!(p.into_inner(), SqliteValue::Text("hello".to_string()));
 
     let p: ParamValue = String::from("world").into();
-    assert_eq!(
-        p.into_inner().unwrap(),
-        SqliteValue::Text("world".to_string())
-    );
+    assert_eq!(p.into_inner(), SqliteValue::Text("world".to_string()));
 }
 
 #[test]
 fn param_value_from_byte_slice() {
     let data: &[u8] = &[0xDE, 0xAD];
     let p: ParamValue = data.into();
-    assert_eq!(p.into_inner().unwrap(), SqliteValue::Blob(vec![0xDE, 0xAD]));
+    assert_eq!(p.into_inner(), SqliteValue::Blob(vec![0xDE, 0xAD]));
 }
 
 // ===========================================================================
@@ -214,7 +202,7 @@ fn query_row_map_with_params() {
     conn.execute("INSERT INTO t VALUES (2, 'bob')").unwrap();
 
     let name: String = conn
-        .query_row_map("SELECT name FROM t WHERE id = ?1", &params![2_i64], |row| {
+        .query_row_map("SELECT name FROM t WHERE id = ?1", params![2_i64], |row| {
             row.get_typed(0)
         })
         .unwrap();
@@ -269,7 +257,7 @@ fn execute_params_inserts_rows() {
         .unwrap();
 
     let changed = conn
-        .execute_params("INSERT INTO t VALUES (?1, ?2)", &params![1_i64, "hello"])
+        .execute_params("INSERT INTO t VALUES (?1, ?2)", params![1_i64, "hello"])
         .unwrap();
     assert_eq!(changed, 1);
 
@@ -439,7 +427,7 @@ fn transaction_execute_params_compat() {
     let tx = conn.transaction().unwrap();
     tx.execute_params(
         "INSERT INTO t VALUES (?1, ?2)",
-        &params![1_i64, "via_params"],
+        params![1_i64, "via_params"],
     )
     .unwrap();
     tx.commit().unwrap();
@@ -550,7 +538,7 @@ fn open_with_flags_read_write_creates_db() {
 
 #[test]
 fn params_from_iter_vec_of_i64() {
-    let values = params_from_iter(vec![1_i64, 2, 3]).unwrap();
+    let values = params_from_iter(vec![1_i64, 2, 3]);
     assert_eq!(values.len(), 3);
     assert_eq!(values[0], SqliteValue::Integer(1));
     assert_eq!(values[1], SqliteValue::Integer(2));
@@ -559,22 +547,23 @@ fn params_from_iter_vec_of_i64() {
 
 #[test]
 fn params_from_iter_empty() {
-    let values = params_from_iter(std::iter::empty::<i64>()).unwrap();
+    let values = params_from_iter(std::iter::empty::<i64>());
     assert!(values.is_empty());
 }
 
 #[test]
 fn param_slice_to_values_converts_correctly() {
     let p = params![42_i64, "text"];
-    let values = param_slice_to_values(&p).unwrap();
+    let values = param_slice_to_values(p);
     assert_eq!(values[0], SqliteValue::Integer(42));
     assert_eq!(values[1], SqliteValue::Text("text".to_string()));
 }
 
 #[test]
-fn param_slice_to_values_with_overflow_returns_error() {
+fn param_slice_to_values_with_overflow_clamps() {
     let p = [ParamValue::from(u64::MAX)];
-    assert!(param_slice_to_values(&p).is_err());
+    let values = param_slice_to_values(&p);
+    assert_eq!(values[0], SqliteValue::Integer(i64::MAX));
 }
 
 // ===========================================================================
@@ -599,13 +588,13 @@ fn full_compat_round_trip() {
     // Insert via execute_params
     conn.execute_params(
         "INSERT INTO users (id, name, email, active) VALUES (?1, ?2, ?3, ?4)",
-        &params![1_i64, "Alice", "alice@example.com", true],
+        params![1_i64, "Alice", "alice@example.com", true],
     )
     .unwrap();
 
     conn.execute_params(
         "INSERT INTO users (id, name, email, active) VALUES (?1, ?2, ?3, ?4)",
-        &params![2_i64, "Bob", None::<String>, false],
+        params![2_i64, "Bob", None::<String>, false],
     )
     .unwrap();
 
@@ -613,7 +602,7 @@ fn full_compat_round_trip() {
     let name: String = conn
         .query_row_map(
             "SELECT name FROM users WHERE id = ?1",
-            &params![1_i64],
+            params![1_i64],
             |row| row.get_typed(0),
         )
         .unwrap();
@@ -623,7 +612,7 @@ fn full_compat_round_trip() {
     let names: Vec<String> = conn
         .query_map_collect(
             "SELECT name FROM users WHERE active = ?1 ORDER BY name",
-            &params![true],
+            params![true],
             |row| row.get_typed(0),
         )
         .unwrap();
@@ -633,7 +622,7 @@ fn full_compat_round_trip() {
     let missing = conn
         .query_row_map(
             "SELECT name FROM users WHERE id = ?1",
-            &params![999_i64],
+            params![999_i64],
             |row| row.get_typed::<String>(0),
         )
         .optional()
@@ -644,7 +633,7 @@ fn full_compat_round_trip() {
     let email: Option<String> = conn
         .query_row_map(
             "SELECT email FROM users WHERE id = ?1",
-            &params![2_i64],
+            params![2_i64],
             |row| row.get_typed(0),
         )
         .unwrap();
@@ -655,7 +644,7 @@ fn full_compat_round_trip() {
         let tx = conn.transaction().unwrap();
         tx.execute_params(
             "INSERT INTO users (id, name) VALUES (?1, ?2)",
-            &params![3_i64, "Charlie"],
+            params![3_i64, "Charlie"],
         )
         .unwrap();
         // drop without commit → rollback
@@ -671,7 +660,7 @@ fn full_compat_round_trip() {
         let tx = conn.transaction().unwrap();
         tx.execute_params(
             "INSERT INTO users (id, name) VALUES (?1, ?2)",
-            &params![3_i64, "Charlie"],
+            params![3_i64, "Charlie"],
         )
         .unwrap();
         tx.commit().unwrap();

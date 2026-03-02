@@ -1483,41 +1483,24 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32) -> Result<(), Codege
         } => {
             emit_expr(b, inner, reg)?;
             let affinity = type_to_affinity(&type_name.name);
-            b.emit_op(
-                Opcode::Affinity,
-                reg,
-                1,
-                0,
-                P4::Str(affinity.to_string()),
-                0,
-            );
+            // Cast opcode: p1 = register, p2 = affinity character code.
+            // 'A'=65 Blob, 'B'=66 Text, 'C'=67 Numeric, 'D'=68 Integer, 'E'=69 Real
+            b.emit_op(Opcode::Cast, reg, i32::from(affinity as u8), 0, P4::None, 0);
             Ok(())
         }
 
         // Scalar function call.
         Expr::FunctionCall { name, args, .. } => {
+            // Function registry stores names in uppercase via canonical_name().
+            let canon = name.trim().to_ascii_uppercase();
             match args {
                 FunctionArgs::Star => {
-                    b.emit_op(
-                        Opcode::PureFunc,
-                        0,
-                        0,
-                        reg,
-                        P4::FuncName(name.to_lowercase()),
-                        0,
-                    );
+                    b.emit_op(Opcode::PureFunc, 0, 0, reg, P4::FuncName(canon), 0);
                 }
                 FunctionArgs::List(arg_list) => {
                     let n_args = arg_list.len();
                     if n_args == 0 {
-                        b.emit_op(
-                            Opcode::PureFunc,
-                            0,
-                            0,
-                            reg,
-                            P4::FuncName(name.to_lowercase()),
-                            0,
-                        );
+                        b.emit_op(Opcode::PureFunc, 0, 0, reg, P4::FuncName(canon), 0);
                     } else {
                         let first_arg_reg = b.alloc_regs(n_args as i32);
                         for (i, arg) in arg_list.iter().enumerate() {
@@ -1528,7 +1511,7 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32) -> Result<(), Codege
                             0,
                             first_arg_reg,
                             reg,
-                            P4::FuncName(name.to_lowercase()),
+                            P4::FuncName(canon),
                             n_args as u16,
                         );
                     }
