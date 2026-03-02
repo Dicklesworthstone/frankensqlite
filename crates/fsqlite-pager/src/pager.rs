@@ -4,7 +4,7 @@
 //! VFS-backed database file and a zero-copy [`PageCache`].
 //! Full concurrent MVCC behavior is layered on top in Phase 6.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -137,6 +137,173 @@ impl<F: VfsFile> PagerInner<F> {
         self.db_file.write(cx, data, offset)?;
         Ok(())
     }
+}
+
+fn normalize_freelist(pages: &[PageNumber], db_size: u32) -> Vec<PageNumber> {
+    let mut normalized: Vec<PageNumber> = pages
+        .iter()
+        .copied()
+        .filter(|p| {
+            let raw = p.get();
+            raw > 1 && raw <= db_size
+        })
+        .collect();
+    normalized.sort_unstable_by_key(|p| p.get());
+    normalized.dedup_by_key(|p| p.get());
+    normalized
+}
+
+fn load_freelist_from_disk<F: VfsFile>(
+    cx: &Cx,
+    db_file: &mut F,
+    page_size: PageSize,
+    db_size: u32,
+    first_trunk: u32,
+    freelist_count: u32,
+) -> Result<Vec<PageNumber>> {
+    if first_trunk == 0 || freelist_count == 0 {
+        return Ok(Vec::new());
+    }
+
+    let ps = page_size.as_usize();
+    let mut visited: HashSet<u32> = HashSet::new();
+    let mut out: Vec<PageNumber> = Vec::with_capacity(freelist_count as usize);
+    let mut trunk = first_trunk;
+
+    while trunk != 0 && out.len() < freelist_count as usize {
+        if trunk > db_size {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!("freelist trunk page {trunk} exceeds db_size {db_size}"),
+            });
+        }
+        if !visited.insert(trunk) {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!("freelist loop detected at trunk page {trunk}"),
+            });
+        }
+
+        let trunk_page = PageNumber::new(trunk).ok_or_else(|| FrankenError::DatabaseCorrupt {
+            detail: format!("invalid freelist trunk page number {trunk}"),
+        })?;
+        out.push(trunk_page);
+
+        let mut buf = vec![0u8; ps];
+        let offset = u64::from(trunk.saturating_sub(1)) * ps as u64;
+        let bytes_read = db_file.read(cx, &mut buf, offset)?;
+        if bytes_read < ps {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "short read loading freelist trunk page {trunk}: got {bytes_read} of {ps}"
+                ),
+            });
+        }
+
+        let next_trunk = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        let leaf_count = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
+        let max_leaf_entries = (ps / 4).saturating_sub(2);
+        if leaf_count > max_leaf_entries {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "freelist trunk {trunk} leaf_count {leaf_count} exceeds max {max_leaf_entries}"
+                ),
+            });
+        }
+
+        for idx in 0..leaf_count {
+            if out.len() >= freelist_count as usize {
+                break;
+            }
+            let base = 8 + idx * 4;
+            let leaf = u32::from_be_bytes([buf[base], buf[base + 1], buf[base + 2], buf[base + 3]]);
+            if leaf == 0 {
+                continue;
+            }
+            if leaf > db_size {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!("freelist leaf page {leaf} exceeds db_size {db_size}"),
+                });
+            }
+            let leaf_page = PageNumber::new(leaf).ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: format!("invalid freelist leaf page number {leaf}"),
+            })?;
+            out.push(leaf_page);
+        }
+
+        trunk = next_trunk;
+    }
+
+    out.truncate(freelist_count as usize);
+    Ok(normalize_freelist(&out, db_size))
+}
+
+fn persist_freelist_to_disk<F: VfsFile>(cx: &Cx, inner: &mut PagerInner<F>) -> Result<()> {
+    if inner.db_size == 0 {
+        inner.freelist.clear();
+        return Ok(());
+    }
+
+    let freelist = normalize_freelist(&inner.freelist, inner.db_size);
+    inner.freelist.clone_from(&freelist);
+
+    let ps = inner.page_size.as_usize();
+    let total_free = freelist.len() as u32;
+
+    let (first_trunk, trunk_pages) = if freelist.is_empty() {
+        (0u32, Vec::<u32>::new())
+    } else {
+        let max_leaf_entries = (ps / 4).saturating_sub(2).max(1);
+        let trunk_count = freelist.len().div_ceil(max_leaf_entries + 1);
+        let trunks: Vec<u32> = freelist
+            .iter()
+            .take(trunk_count)
+            .map(|p| p.get())
+            .collect();
+        (trunks[0], trunks)
+    };
+
+    if !trunk_pages.is_empty() {
+        let mut leaf_index = trunk_pages.len();
+        let max_leaf_entries = (ps / 4).saturating_sub(2).max(1);
+
+        for (idx, trunk_pg) in trunk_pages.iter().enumerate() {
+            let next = trunk_pages.get(idx + 1).copied().unwrap_or(0);
+            let remaining = freelist.len().saturating_sub(leaf_index);
+            let take = remaining.min(max_leaf_entries);
+
+            let mut buf = vec![0u8; ps];
+            buf[0..4].copy_from_slice(&next.to_be_bytes());
+            buf[4..8].copy_from_slice(&(take as u32).to_be_bytes());
+
+            for i in 0..take {
+                let leaf = freelist[leaf_index + i].get();
+                let base = 8 + i * 4;
+                buf[base..base + 4].copy_from_slice(&leaf.to_be_bytes());
+            }
+            leaf_index += take;
+
+            let offset = u64::from(trunk_pg.saturating_sub(1)) * ps as u64;
+            inner.db_file.write(cx, &buf, offset)?;
+            if let Some(pg) = PageNumber::new(*trunk_pg) {
+                inner.cache.evict(pg);
+            }
+        }
+    }
+
+    let mut page1 = vec![0u8; ps];
+    let bytes_read = inner.db_file.read(cx, &mut page1, 0)?;
+    if bytes_read < DATABASE_HEADER_SIZE {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "short read while updating freelist header: got {bytes_read} bytes, need at least {DATABASE_HEADER_SIZE}",
+            ),
+        });
+    }
+    page1[32..36].copy_from_slice(&first_trunk.to_be_bytes());
+    page1[36..40].copy_from_slice(&total_free.to_be_bytes());
+    inner.db_file.write(cx, &page1, 0)?;
+    inner.cache.evict(PageNumber::ONE);
+
+    Ok(())
 }
 
 /// A concrete single-writer pager backed by a VFS file.
@@ -304,7 +471,7 @@ where
         }
 
         let mut file_size = db_file.file_size(&cx)?;
-        if file_size == 0 {
+        let header = if file_size == 0 {
             // SQLite databases are never truly empty: page 1 contains the
             // 100-byte database header followed by the sqlite_master root page.
             //
@@ -332,6 +499,7 @@ where
             db_file.write(&cx, &page1, 0)?;
             db_file.sync(&cx, SyncFlags::NORMAL)?;
             file_size = db_file.file_size(&cx)?;
+            header
         } else {
             if file_size < DATABASE_HEADER_SIZE as u64 {
                 return Err(FrankenError::DatabaseCorrupt {
@@ -364,7 +532,8 @@ where
                     ),
                 });
             }
-        }
+            header
+        };
 
         let page_size_u64 = page_size.as_usize() as u64;
         if file_size % page_size_u64 != 0 {
@@ -382,7 +551,19 @@ where
             what: "database page count".to_owned(),
             value: db_pages.to_string(),
         })?;
-        let next_page = if db_size >= 2 { db_size + 1 } else { 2 };
+        let next_page = if db_size >= 2 {
+            db_size.saturating_add(1)
+        } else {
+            2
+        };
+        let freelist = load_freelist_from_disk(
+            &cx,
+            &mut db_file,
+            page_size,
+            db_size,
+            header.freelist_trunk,
+            header.freelist_count,
+        )?;
 
         Ok(Self {
             vfs,
@@ -396,7 +577,7 @@ where
                 writer_active: false,
                 active_transactions: 0,
                 checkpoint_active: false,
-                freelist: Vec::new(),
+                freelist,
                 journal_mode: JournalMode::Delete,
                 wal_backend: None,
                 commit_seq: CommitSeq::ZERO,
@@ -665,6 +846,7 @@ where
         for page_no in freed_pages.drain(..) {
             inner.freelist.push(page_no);
         }
+        persist_freelist_to_disk(cx, inner)?;
         Ok(())
     }
 
@@ -1188,7 +1370,7 @@ where
         // Invalidate cached pages beyond the new size.
         // We only need to evict pages that are beyond the truncation point.
         // Note: This is a best-effort cleanup - pages may not all be cached.
-        for pgno in (n_pages + 1)..=old_db_size {
+        for pgno in (n_pages.saturating_add(1))..=old_db_size {
             if let Some(page_no) = PageNumber::new(pgno) {
                 inner.cache.evict(page_no);
             }
@@ -1206,6 +1388,7 @@ where
         // Ensure header page_count reflects the final db_size after all
         // checkpoint writes/truncation, even if page 1 was checkpointed early.
         Self::patch_page1_header(&mut inner, cx)?;
+        persist_freelist_to_disk(cx, &mut inner)?;
         inner.db_file.sync(cx, SyncFlags::NORMAL)
     }
 }
@@ -3253,6 +3436,43 @@ mod tests {
             assert_eq!(inner.freelist[0], p);
             drop(inner);
         }
+    }
+
+    #[test]
+    fn test_freelist_persisted_and_reloaded_on_reopen() {
+        let vfs = MemoryVfs::new();
+        let path = PathBuf::from("/freelist_persist.db");
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        let pager = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT).unwrap();
+        let mut txn1 = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let p = txn1.allocate_page(&cx).unwrap();
+        txn1.write_page(&cx, p, &vec![0xAB; ps]).unwrap();
+        txn1.commit(&cx).unwrap();
+
+        let mut txn2 = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        txn2.free_page(&cx, p).unwrap();
+        txn2.commit(&cx).unwrap();
+
+        let txn_ro = pager.begin(&cx, TransactionMode::ReadOnly).unwrap();
+        let raw = txn_ro.get_page(&cx, PageNumber::ONE).unwrap().into_vec();
+        let hdr_bytes: [u8; DATABASE_HEADER_SIZE] = raw[..DATABASE_HEADER_SIZE].try_into().unwrap();
+        let hdr = DatabaseHeader::from_bytes(&hdr_bytes).unwrap();
+        assert_eq!(hdr.freelist_count, 1);
+        assert_eq!(hdr.freelist_trunk, p.get());
+
+        let reopened = SimplePager::open(vfs, &path, PageSize::DEFAULT).unwrap();
+        {
+            let inner = reopened.inner.lock().unwrap();
+            assert_eq!(inner.freelist.len(), 1);
+            assert_eq!(inner.freelist[0], p);
+        }
+
+        let mut txn3 = reopened.begin(&cx, TransactionMode::Immediate).unwrap();
+        let reused = txn3.allocate_page(&cx).unwrap();
+        assert_eq!(reused, p, "reopened pager should reuse persisted freelist page");
+        txn3.commit(&cx).unwrap();
     }
 
     #[test]
