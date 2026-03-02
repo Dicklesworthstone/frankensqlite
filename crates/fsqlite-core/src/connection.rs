@@ -4190,6 +4190,17 @@ impl Connection {
         rootpage: i32,
         sql: &str,
     ) -> Result<()> {
+        self.insert_sqlite_master_row_with_sql(type_, name, tbl_name, rootpage, Some(sql))
+    }
+
+    fn insert_sqlite_master_row_with_sql(
+        &self,
+        type_: &str,
+        name: &str,
+        tbl_name: &str,
+        rootpage: i32,
+        sql: Option<&str>,
+    ) -> Result<()> {
         self.with_pager_write_txn(|cx, txn| {
             let usable_size = PageSize::DEFAULT.get();
             let mut cursor = fsqlite_btree::BtCursor::new(
@@ -4223,7 +4234,7 @@ impl Connection {
                 SqliteValue::Text(name.to_owned()),
                 SqliteValue::Text(tbl_name.to_owned()),
                 SqliteValue::Integer(i64::from(rootpage)),
-                SqliteValue::Text(sql.to_owned()),
+                sql.map_or(SqliteValue::Null, |s| SqliteValue::Text(s.to_owned())),
             ]);
             cursor.table_insert(cx, rowid, &record)
         })
@@ -4908,11 +4919,21 @@ impl Connection {
                     strict: create.strict,
                     foreign_keys: fk_defs,
                 };
+                let implicit_indexes_for_master = table_schema.indexes.clone();
                 let create_sql = render_create_table_sql(&table_schema, is_autoincrement);
                 let rp = table_schema.root_page;
                 let tbl_name = table_schema.name.clone();
                 self.schema.borrow_mut().push(table_schema);
                 self.insert_sqlite_master_row("table", &tbl_name, &tbl_name, rp, &create_sql)?;
+                for index in &implicit_indexes_for_master {
+                    self.insert_sqlite_master_row_with_sql(
+                        "index",
+                        &index.name,
+                        &tbl_name,
+                        index.root_page,
+                        None,
+                    )?;
+                }
                 if is_autoincrement {
                     self.ensure_sqlite_sequence_table_exists()?;
                     let table_key = tbl_name.to_ascii_lowercase();
@@ -17520,6 +17541,34 @@ mod tests {
             .query_row("PRAGMA quick_check;", [], |row| row.get(0))
             .unwrap();
         assert_eq!(quick_check, "ok");
+    }
+
+    #[test]
+    fn test_implicit_unique_index_is_visible_to_external_sqlite() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("implicit_unique_index.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+
+        conn.execute("CREATE TABLE t (id TEXT PRIMARY KEY, payload TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES ('a', 'x');").unwrap();
+        conn.execute("INSERT INTO t VALUES ('b', 'y');").unwrap();
+        drop(conn);
+
+        let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+        let quick_check: String = sqlite
+            .query_row("PRAGMA quick_check;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(quick_check, "ok");
+
+        let autoindex_count: i64 = sqlite
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='sqlite_autoindex_t_1';",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(autoindex_count, 1);
     }
 
     #[test]
