@@ -886,7 +886,7 @@ pub fn ssi_validate_and_publish(
             .get()
             .cmp(&b.from.id.get())
             .then_with(|| a.from.epoch.get().cmp(&b.from.epoch.get()))
-            .then_with(|| witness_key_page(&a.overlap_key).cmp(&witness_key_page(&b.overlap_key)))
+            .then_with(|| a.overlap_key.cmp(&b.overlap_key))
     });
 
     let mut out_edges = out_edges;
@@ -895,7 +895,7 @@ pub fn ssi_validate_and_publish(
             .get()
             .cmp(&b.to.id.get())
             .then_with(|| a.to.epoch.get().cmp(&b.to.epoch.get()))
-            .then_with(|| witness_key_page(&a.overlap_key).cmp(&witness_key_page(&b.overlap_key)))
+            .then_with(|| a.overlap_key.cmp(&b.overlap_key))
     });
 
     if !out_edges.is_empty() {

@@ -277,6 +277,7 @@ pub fn load_from_sqlite(path: &Path) -> Result<LoadedState> {
             indexes: Vec::new(),
             strict: is_strict_table_sql(&create_sql),
             foreign_keys: Vec::new(),
+            check_constraints: Vec::new(),
         });
 
         // Read all rows from this table's B-tree.
@@ -389,6 +390,7 @@ pub(crate) fn build_create_index_sql(
     table_name: &str,
     unique: bool,
     terms: &[CreateIndexSqlTerm<'_>],
+    where_clause: Option<&fsqlite_ast::Expr>,
 ) -> String {
     use std::fmt::Write as _;
     let mut sql = if unique {
@@ -414,6 +416,9 @@ pub(crate) fn build_create_index_sql(
         }
     }
     sql.push(')');
+    if let Some(expr) = where_clause {
+        let _ = write!(sql, " WHERE {expr}");
+    }
     sql
 }
 
@@ -479,6 +484,21 @@ pub fn parse_columns_from_create_sql(sql: &str) -> Vec<ColumnInfo> {
 
             let default_value = extract_default_value(remainder);
 
+            // Extract COLLATE name from column definition.
+            let collation = upper
+                .find("COLLATE ")
+                .map(|pos| {
+                    // Read the collation name from the original (non-uppercased) text.
+                    let after = &col_def[pos + 8..];
+                    after
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("")
+                        .trim_end_matches(',')
+                        .to_owned()
+                })
+                .filter(|s| !s.is_empty());
+
             Some(ColumnInfo {
                 name,
                 affinity,
@@ -490,6 +510,7 @@ pub fn parse_columns_from_create_sql(sql: &str) -> Vec<ColumnInfo> {
                 strict_type,
                 generated_expr: None,
                 generated_stored: None,
+                collation,
             })
         })
         .collect()
@@ -531,6 +552,59 @@ pub fn is_autoincrement_table_sql(sql: &str) -> bool {
         }
     }
     token == "AUTOINCREMENT"
+}
+
+/// Extract CHECK constraint expressions from a CREATE TABLE SQL string.
+///
+/// Finds `CHECK(...)` clauses in the column-def body and returns the
+/// expression text (inside the parentheses) for each one.
+#[must_use]
+pub fn extract_check_constraints_from_sql(sql: &str) -> Vec<String> {
+    let Some(open) = sql.find('(') else {
+        return Vec::new();
+    };
+    let Some(close) = sql.rfind(')') else {
+        return Vec::new();
+    };
+    if open >= close {
+        return Vec::new();
+    }
+    let body = &sql[open + 1..close];
+    let upper = body.to_ascii_uppercase();
+    let mut checks = Vec::new();
+    let mut search_from = 0;
+    while let Some(pos) = upper[search_from..].find("CHECK") {
+        let abs_pos = search_from + pos;
+        let after = &body[abs_pos + 5..].trim_start();
+        if after.starts_with('(') {
+            // Find matching closing paren.
+            let mut depth = 0_i32;
+            let mut end = None;
+            for (i, ch) in after.char_indices() {
+                match ch {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = Some(i);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(end_idx) = end {
+                let expr = &after[1..end_idx];
+                checks.push(expr.trim().to_owned());
+                search_from = abs_pos + 5 + end_idx + 1;
+            } else {
+                search_from = abs_pos + 5;
+            }
+        } else {
+            search_from = abs_pos + 5;
+        }
+    }
+    checks
 }
 
 fn parse_column_name_and_remainder(def: &str) -> Option<(String, &str)> {
@@ -813,6 +887,7 @@ mod tests {
                     strict_type: None,
                     generated_expr: None,
                     generated_stored: None,
+                    collation: None,
                 },
                 ColumnInfo {
                     name: "name".to_owned(),
@@ -825,11 +900,13 @@ mod tests {
                     strict_type: None,
                     generated_expr: None,
                     generated_stored: None,
+                    collation: None,
                 },
             ],
             indexes: Vec::new(),
             strict: false,
             foreign_keys: Vec::new(),
+            check_constraints: Vec::new(),
         }];
 
         (schema, db)
@@ -979,10 +1056,12 @@ mod tests {
                     strict_type: None,
                     generated_expr: None,
                     generated_stored: None,
+                    collation: None,
                 }],
                 indexes: Vec::new(),
                 strict: false,
                 foreign_keys: Vec::new(),
+                check_constraints: Vec::new(),
             },
             TableSchema {
                 name: "beta".to_owned(),
@@ -998,10 +1077,12 @@ mod tests {
                     strict_type: None,
                     generated_expr: None,
                     generated_stored: None,
+                    collation: None,
                 }],
                 indexes: Vec::new(),
                 strict: false,
                 foreign_keys: Vec::new(),
+                check_constraints: Vec::new(),
             },
         ];
 
@@ -1093,10 +1174,12 @@ mod tests {
                 strict_type: Some(StrictColumnType::Integer),
                 generated_expr: None,
                 generated_stored: None,
+                collation: None,
             }],
             indexes: Vec::new(),
             strict: true,
             foreign_keys: Vec::new(),
+            check_constraints: Vec::new(),
         };
 
         let sql = build_create_table_sql(&table);
@@ -1168,7 +1251,13 @@ mod tests {
             },
         ];
 
-        let sql = build_create_index_sql("idx_agents_project_name_nocase", "agents", true, &terms);
+        let sql = build_create_index_sql(
+            "idx_agents_project_name_nocase",
+            "agents",
+            true,
+            &terms,
+            None,
+        );
 
         assert_eq!(
             sql,

@@ -8,10 +8,10 @@ use std::cell::RefCell;
 
 use crate::ProgramBuilder;
 use fsqlite_ast::{
-    ColumnRef, ConflictAction, DeleteStatement, Distinctness, Expr, FunctionArgs, InsertSource,
-    InsertStatement, LimitClause, Literal, OrderingTerm, QualifiedTableRef, ResultColumn,
-    SelectCore, SelectStatement, SortDirection, Statement, TableOrSubquery, TimeTravelClause,
-    TimeTravelTarget, UpdateStatement,
+    AssignmentTarget, ColumnRef, ConflictAction, DeleteStatement, Distinctness, Expr, FunctionArgs,
+    InsertSource, InsertStatement, LimitClause, Literal, OrderingTerm, QualifiedTableRef,
+    ResultColumn, SelectCore, SelectStatement, SortDirection, Statement, TableOrSubquery,
+    TimeTravelClause, TimeTravelTarget, UpdateStatement, UpsertAction, UpsertClause, UpsertTarget,
 };
 use fsqlite_parser::Parser as SqlParser;
 use fsqlite_types::StrictColumnType;
@@ -102,6 +102,9 @@ pub struct ColumnInfo {
     /// Whether the generated column is STORED (`true`) or VIRTUAL (`false`).
     /// `None` for non-generated columns.
     pub generated_stored: Option<bool>,
+    /// Column collation sequence name (e.g. "NOCASE", "BINARY", "RTRIM").
+    /// `None` means the default (BINARY).
+    pub collation: Option<String>,
 }
 
 impl ColumnInfo {
@@ -119,6 +122,7 @@ impl ColumnInfo {
             strict_type: None,
             generated_expr: None,
             generated_stored: None,
+            collation: None,
         }
     }
 }
@@ -183,6 +187,9 @@ pub struct TableSchema {
     pub strict: bool,
     /// Foreign key constraints declared on this table (child side).
     pub foreign_keys: Vec<FkDef>,
+    /// CHECK constraint expressions as SQL text, collected from both
+    /// column-level and table-level constraints.
+    pub check_constraints: Vec<String>,
 }
 
 impl TableSchema {
@@ -240,14 +247,166 @@ fn emit_strict_type_check(b: &mut ProgramBuilder, table: &TableSchema, first_reg
     if let Some(pattern) = table.strict_type_pattern() {
         #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
         let n_cols = table.columns.len() as i32;
-        b.emit_op(
-            Opcode::TypeCheck,
-            first_reg,
-            n_cols,
-            0,
-            P4::Affinity(pattern),
-            0,
-        );
+        // Encode "pattern\ttable_name\tcol1\tcol2\t..." for error messages.
+        let mut encoded = pattern;
+        encoded.push('\t');
+        encoded.push_str(&table.name);
+        for col in &table.columns {
+            encoded.push('\t');
+            encoded.push_str(&col.name);
+        }
+        b.emit_op(Opcode::TypeCheck, first_reg, n_cols, 0, P4::Str(encoded), 0);
+    }
+}
+
+/// Find the UNIQUE index matching the UPSERT target columns, if any.
+///
+/// Returns `(index_offset, &IndexSchema)` when the target columns match a
+/// UNIQUE index on the table.  Returns `None` when the target is absent,
+/// refers to the PRIMARY KEY, or does not match any UNIQUE index.
+fn find_upsert_target_index<'a>(
+    table: &'a TableSchema,
+    target: Option<&UpsertTarget>,
+) -> Option<(usize, &'a IndexSchema)> {
+    let target = target?;
+    // Extract column names from target expressions.
+    let target_cols: Vec<&str> = target
+        .columns
+        .iter()
+        .filter_map(|ic| match &ic.expr {
+            Expr::Column(col_ref, _) => Some(col_ref.column.as_str()),
+            _ => None,
+        })
+        .collect();
+    if target_cols.is_empty() {
+        return None;
+    }
+    // Check if the target matches a UNIQUE index (not the PK).
+    for (idx_offset, index) in table.indexes.iter().enumerate() {
+        if !index.is_unique || index.columns.len() != target_cols.len() {
+            continue;
+        }
+        let all_match = target_cols
+            .iter()
+            .all(|tc| index.columns.iter().any(|ic| ic.eq_ignore_ascii_case(tc)));
+        if all_match {
+            return Some((idx_offset, index));
+        }
+    }
+    None
+}
+
+/// Emit UPSERT DO UPDATE assignments into `target_regs`.
+///
+/// For each assignment, evaluates the RHS expression using two contexts:
+/// - `existing_ctx`: resolves unqualified column refs to existing row values
+/// - `excluded_ctx`: resolves `excluded.col` refs to the attempted insert values
+///
+/// The result is written into the appropriate slot of `target_regs`.
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+fn emit_upsert_assignments(
+    b: &mut ProgramBuilder,
+    assignments: &[fsqlite_ast::Assignment],
+    table: &TableSchema,
+    target_regs: i32,
+    existing_ctx: &ScanCtx<'_>,
+    excluded_ctx: &ScanCtx<'_>,
+) {
+    for assign in assignments {
+        let col_name = match &assign.target {
+            AssignmentTarget::Column(name) => name.as_str(),
+            AssignmentTarget::ColumnList(names) => {
+                // Multi-column assignment: only use first column.
+                names.first().map(String::as_str).unwrap_or("")
+            }
+        };
+        if let Some(col_idx) = table.column_index(col_name) {
+            let dest_reg = target_regs + col_idx as i32;
+            emit_upsert_expr(
+                b,
+                &assign.value,
+                dest_reg,
+                existing_ctx,
+                excluded_ctx,
+                table,
+            );
+        }
+    }
+}
+
+/// Emit an expression that may reference both `excluded.*` and existing row columns.
+///
+/// Walks the expression looking for `excluded.col` references (resolved via
+/// `excluded_ctx`) and plain column references (resolved via `existing_ctx`).
+/// For non-column expressions, delegates to the standard `emit_expr`.
+fn emit_upsert_expr(
+    b: &mut ProgramBuilder,
+    expr: &Expr,
+    reg: i32,
+    existing_ctx: &ScanCtx<'_>,
+    excluded_ctx: &ScanCtx<'_>,
+    _table: &TableSchema,
+) {
+    match expr {
+        Expr::Column(col_ref, _) => {
+            if col_ref
+                .table
+                .as_deref()
+                .is_some_and(|t| t.eq_ignore_ascii_case("excluded"))
+            {
+                // excluded.col → read from excluded registers (val_regs).
+                emit_expr(b, expr, reg, Some(excluded_ctx));
+            } else {
+                // Plain column ref → read from existing row registers.
+                emit_expr(b, expr, reg, Some(existing_ctx));
+            }
+        }
+        Expr::BinaryOp {
+            left, op, right, ..
+        } => {
+            use fsqlite_ast::BinaryOp;
+            match op {
+                // Arithmetic and string concat: emit inline with dual-context
+                // resolution so `excluded.*` refs in operands work correctly.
+                BinaryOp::Add
+                | BinaryOp::Subtract
+                | BinaryOp::Multiply
+                | BinaryOp::Divide
+                | BinaryOp::Modulo
+                | BinaryOp::Concat => {
+                    let left_reg = b.alloc_reg();
+                    let right_reg = b.alloc_reg();
+                    emit_upsert_expr(b, left, left_reg, existing_ctx, excluded_ctx, _table);
+                    emit_upsert_expr(b, right, right_reg, existing_ctx, excluded_ctx, _table);
+                    let opcode = match op {
+                        BinaryOp::Add => Opcode::Add,
+                        BinaryOp::Subtract => Opcode::Subtract,
+                        BinaryOp::Multiply => Opcode::Multiply,
+                        BinaryOp::Divide => Opcode::Divide,
+                        BinaryOp::Modulo => Opcode::Remainder,
+                        BinaryOp::Concat => Opcode::Concat,
+                        _ => unreachable!(),
+                    };
+                    // Arithmetic opcodes: P3 = P2 op P1.
+                    // P1=right operand, P2=left operand, P3=destination register.
+                    b.emit_op(opcode, right_reg, left_reg, reg, P4::None, 0);
+                }
+                // Comparisons (Lt, Le, Gt, Ge, Eq, Ne, Is, IsNot) are JUMP
+                // instructions — not value-producing arithmetic.  Delegate to
+                // the standard `emit_expr` which uses the proper jump-based
+                // boolean encoding (1/0/NULL).  Also handles AND, OR, LIKE,
+                // GLOB, IN, BETWEEN, bit ops, etc.
+                _ => {
+                    emit_expr(b, expr, reg, Some(existing_ctx));
+                }
+            }
+        }
+        _ => {
+            // For literals, function calls, etc. — no column refs to resolve.
+            // Use existing_ctx as default so any unqualified column refs
+            // resolve to the existing row.
+            emit_expr(b, expr, reg, Some(existing_ctx));
+        }
     }
 }
 
@@ -882,6 +1041,7 @@ pub fn codegen_select(
             where_clause.as_deref(),
             group_by,
             having.as_deref(),
+            stmt.limit.as_ref(),
             out_regs,
             out_col_count,
             done_label,
@@ -2033,13 +2193,28 @@ fn codegen_select_aggregate(
     end_label: crate::Label,
 ) -> Result<(), CodegenError> {
     // Parse aggregate columns: extract function name, arg count, arg column index.
-    let agg_columns = parse_aggregate_columns(columns, table)?;
+    let mut agg_columns = parse_aggregate_columns(columns, table)?;
 
-    // Allocate one accumulator register per aggregate.
-    let accum_base = b.alloc_regs(out_col_count);
+    // Collect aggregates from the HAVING clause that are not in the SELECT list.
+    // Without this, HAVING-only aggregates (e.g. `HAVING SUM(x) > 10` when SUM(x)
+    // is not in SELECT) would never be accumulated and silently evaluate to 0.
+    let mut having_output_cols: Vec<GroupByOutputCol> = Vec::new();
+    if let Some(having_expr) = having {
+        collect_having_aggregates(
+            having_expr,
+            table,
+            &mut agg_columns,
+            &mut having_output_cols,
+        );
+    }
+
+    // Allocate one accumulator register per aggregate (SELECT + HAVING-only).
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let total_agg_count = agg_columns.len() as i32;
+    let accum_base = b.alloc_regs(total_agg_count);
 
     // Initialize accumulators to Null (required by AggStep protocol).
-    for i in 0..out_col_count {
+    for i in 0..total_agg_count {
         b.emit_op(Opcode::Null, 0, accum_base + i, 0, P4::None, 0);
     }
 
@@ -2535,7 +2710,7 @@ fn collect_having_aggregates(
             let upper = name.to_ascii_uppercase();
             // Check if this aggregate already exists in agg_columns.
             let already_exists = agg_columns.iter().any(|agg| {
-                if agg.name != upper {
+                if agg.name != upper || agg.distinct != *distinct {
                     return false;
                 }
                 match args {
@@ -2646,6 +2821,7 @@ fn codegen_select_group_by_aggregate(
     where_clause: Option<&Expr>,
     group_by: &[Expr],
     having: Option<&Expr>,
+    limit_clause: Option<&LimitClause>,
     out_regs: i32,
     out_col_count: i32,
     done_label: crate::Label,
@@ -2658,6 +2834,20 @@ fn codegen_select_group_by_aggregate(
     if let Some(having_expr) = having {
         collect_having_aggregates(having_expr, table, &mut agg_columns, &mut output_cols);
     }
+
+    // LIMIT/OFFSET registers.
+    let limit_reg = limit_clause.map(|lc| {
+        let r = b.alloc_reg();
+        emit_limit_expr(b, &lc.limit, r);
+        r
+    });
+    let offset_reg = limit_clause.and_then(|lc| {
+        lc.offset.as_ref().map(|off_expr| {
+            let r = b.alloc_reg();
+            emit_limit_expr(b, off_expr, r);
+            r
+        })
+    });
 
     let num_group_keys = group_by_keys.len();
     let num_aggs = agg_columns.len();
@@ -2975,10 +3165,14 @@ fn codegen_select_group_by_aggregate(
         );
     }
     // Build output row from prev_key + accum + prev_nongrouped.
+    // Only iterate the SELECT output columns (first out_col_count entries);
+    // HAVING-only aggregates appended by collect_having_aggregates are
+    // accumulated and used by emit_having_filter, but NOT included in the
+    // output row.
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     {
         let mut ng_idx = 0i32;
-        for (i, out_col) in output_cols.iter().enumerate() {
+        for (i, out_col) in output_cols.iter().take(out_col_count as usize).enumerate() {
             match out_col {
                 GroupByOutputCol::GroupKey { sorter_col, .. } => {
                     b.emit_op(
@@ -3028,7 +3222,15 @@ fn codegen_select_group_by_aggregate(
             having_skip_label,
         );
     }
+    // OFFSET: if offset counter > 0, skip this group's output.
+    if let Some(off_r) = offset_reg {
+        b.emit_jump_to_label(Opcode::IfPos, off_r, 1, having_skip_label, P4::None, 0);
+    }
     b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
+    // LIMIT: decrement limit counter; jump to done when exhausted.
+    if let Some(lim_r) = limit_reg {
+        b.emit_jump_to_label(Opcode::DecrJumpZero, lim_r, 0, done_label, P4::None, 0);
+    }
     b.resolve_label(having_skip_label);
     // Reset accumulators for next group.
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
@@ -3180,10 +3382,11 @@ fn codegen_select_group_by_aggregate(
         );
     }
     // Build output row from prev_key (last group's keys) + accum + prev_nongrouped.
+    // Same as above: skip HAVING-only aggregate entries beyond out_col_count.
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     {
         let mut ng_idx = 0i32;
-        for (i, out_col) in output_cols.iter().enumerate() {
+        for (i, out_col) in output_cols.iter().take(out_col_count as usize).enumerate() {
             match out_col {
                 GroupByOutputCol::GroupKey { sorter_col, .. } => {
                     b.emit_op(
@@ -3220,8 +3423,8 @@ fn codegen_select_group_by_aggregate(
         }
     }
     // HAVING filter for the final group.
+    let final_skip = b.emit_label();
     if let Some(having_expr) = having {
-        let final_having_skip = b.emit_label();
         emit_having_filter(
             b,
             having_expr,
@@ -3230,13 +3433,15 @@ fn codegen_select_group_by_aggregate(
             &group_by_keys,
             table,
             out_regs,
-            final_having_skip,
+            final_skip,
         );
-        b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
-        b.resolve_label(final_having_skip);
-    } else {
-        b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
     }
+    // OFFSET: if offset counter > 0, skip this group's output.
+    if let Some(off_r) = offset_reg {
+        b.emit_jump_to_label(Opcode::IfPos, off_r, 1, final_skip, P4::None, 0);
+    }
+    b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
+    b.resolve_label(final_skip);
 
     // Done: Close sorter + Halt.
     b.resolve_label(done_label);
@@ -3301,8 +3506,18 @@ pub fn codegen_insert(
         );
     }
 
-    // Conflict behavior applies uniformly across INSERT sources.
-    let oe_flag = conflict_action_to_oe(stmt.or_conflict.as_ref());
+    // Conflict behavior: ON CONFLICT clause from upsert takes precedence.
+    let (oe_flag, upsert_clause) = if !stmt.upsert.is_empty() {
+        // Use the first upsert clause (multiple ON CONFLICT clauses
+        // are parsed but we process the first one).
+        let clause = &stmt.upsert[0];
+        match &clause.action {
+            UpsertAction::Nothing => (OE_IGNORE, None),
+            UpsertAction::Update { .. } => (OE_IGNORE, Some(clause)),
+        }
+    } else {
+        (conflict_action_to_oe(stmt.or_conflict.as_ref()), None)
+    };
 
     match &stmt.source {
         InsertSource::Values(rows) => {
@@ -3324,6 +3539,7 @@ pub fn codegen_insert(
                     &stmt.returning,
                     ctx,
                     oe_flag,
+                    upsert_clause,
                 )?;
             } else {
                 // Build default expressions: use column DEFAULT if available, else NULL.
@@ -3360,6 +3576,7 @@ pub fn codegen_insert(
                     &stmt.returning,
                     ctx,
                     oe_flag,
+                    upsert_clause,
                 )?;
             }
         }
@@ -3517,6 +3734,7 @@ fn codegen_insert_values(
     returning: &[ResultColumn],
     ctx: &CodegenContext,
     oe_flag: u16,
+    upsert: Option<&UpsertClause>,
 ) -> Result<(), CodegenError> {
     let n_cols = rows
         .first()
@@ -3618,6 +3836,10 @@ fn codegen_insert_values(
         // Evaluate STORED generated columns before packing the record.
         emit_stored_generated_columns(b, table, val_regs);
 
+        // STRICT type check BEFORE affinity (SQLite validates raw storage
+        // classes, then applies affinity for the on-disk format).
+        emit_strict_type_check(b, table, val_regs);
+
         // Apply column type affinities before packing the record.
         let aff_str = table.affinity_string();
         b.emit_op(
@@ -3630,33 +3852,310 @@ fn codegen_insert_values(
         );
 
         // MakeRecord: pack columns into a record.
-        emit_strict_type_check(b, table, val_regs);
         let n_cols_i32 = n_cols as i32;
-        b.emit_op(
-            Opcode::MakeRecord,
-            val_regs,
-            n_cols_i32,
-            rec_reg,
-            P4::Affinity(aff_str),
-            0,
-        );
 
-        // Insert with conflict resolution flag.
-        b.emit_op(
-            Opcode::Insert,
-            cursor,
-            rec_reg,
-            rowid_reg,
-            P4::Table(table.name.clone()),
-            oe_flag,
-        );
+        // UPSERT DO UPDATE: check-before-insert pattern.
+        if let Some(upsert_clause) = upsert {
+            if let UpsertAction::Update {
+                assignments,
+                where_clause,
+            } = &upsert_clause.action
+            {
+                let insert_label = b.emit_label();
+                let done_label = b.emit_label();
 
-        // Index maintenance: insert into each index (bd-so1h).
-        emit_index_inserts(b, table, cursor, val_regs, rowid_reg, oe_flag);
+                // Determine conflict check method: UNIQUE index or PK.
+                let update_rowid_reg = if let Some((idx_offset, index)) =
+                    find_upsert_target_index(table, upsert_clause.target.as_ref())
+                {
+                    // UNIQUE index conflict check.
+                    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+                    let idx_cursor = cursor + 1 + idx_offset as i32;
+                    let n_key_cols = index.columns.len() as i32;
 
-        // RETURNING clause: position cursor on inserted row and read columns.
-        if !returning.is_empty() {
-            emit_returning(b, cursor, table, returning, rowid_reg)?;
+                    // Build probe key from attempted insert values.
+                    let key_val_regs = b.alloc_regs(n_key_cols);
+                    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+                    for (key_pos, col_name) in index.columns.iter().enumerate() {
+                        if let Some(col_idx) = table.column_index(col_name) {
+                            b.emit_op(
+                                Opcode::Copy,
+                                val_regs + col_idx as i32,
+                                key_val_regs + key_pos as i32,
+                                0,
+                                P4::None,
+                                0,
+                            );
+                        }
+                    }
+                    let key_rec_reg = b.alloc_reg();
+                    b.emit_op(
+                        Opcode::MakeRecord,
+                        key_val_regs,
+                        n_key_cols,
+                        key_rec_reg,
+                        P4::None,
+                        0,
+                    );
+
+                    // NoConflict: jump to insert_label if no match found.
+                    b.emit_jump_to_label(
+                        Opcode::NoConflict,
+                        idx_cursor,
+                        key_rec_reg,
+                        insert_label,
+                        P4::None,
+                        0,
+                    );
+
+                    // Conflict: extract existing row's rowid from index.
+                    let existing_rowid_reg = b.alloc_reg();
+                    b.emit_op(
+                        Opcode::IdxRowid,
+                        idx_cursor,
+                        existing_rowid_reg,
+                        0,
+                        P4::None,
+                        0,
+                    );
+
+                    // Seek table cursor to the existing row.
+                    b.emit_jump_to_label(
+                        Opcode::NotExists,
+                        cursor,
+                        existing_rowid_reg,
+                        insert_label,
+                        P4::None,
+                        0,
+                    );
+
+                    existing_rowid_reg
+                } else {
+                    // PK conflict check.
+                    b.emit_jump_to_label(
+                        Opcode::NotExists,
+                        cursor,
+                        rowid_reg,
+                        insert_label,
+                        P4::None,
+                        0,
+                    );
+                    rowid_reg
+                };
+
+                // --- Conflict path: row exists, do UPDATE ---
+
+                // Allocate registers for existing row columns.
+                let existing_regs = b.alloc_regs(n_cols_i32);
+
+                // Read existing column values from cursor.
+                for col_idx in 0..n_cols {
+                    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+                    let col_i = col_idx as i32;
+                    if table.columns.get(col_idx).is_some_and(|c| c.is_ipk) {
+                        b.emit_op(Opcode::Rowid, cursor, existing_regs + col_i, 0, P4::None, 0);
+                    } else {
+                        b.emit_op(
+                            Opcode::Column,
+                            cursor,
+                            col_i,
+                            existing_regs + col_i,
+                            P4::None,
+                            0,
+                        );
+                    }
+                }
+
+                // Build ScanCtx for evaluating DO UPDATE expressions.
+                // "excluded" maps to val_regs (the attempted insert values).
+                // Unqualified column refs resolve from existing_regs (the current row).
+                let excluded_ctx = ScanCtx {
+                    cursor,
+                    table,
+                    table_alias: Some("excluded"),
+                    schema: None,
+                    register_base: Some(val_regs),
+                };
+                let existing_ctx = ScanCtx {
+                    cursor,
+                    table,
+                    table_alias: None,
+                    schema: None,
+                    register_base: Some(existing_regs),
+                };
+
+                // Optional WHERE clause on the DO UPDATE action.
+                if let Some(where_expr) = where_clause {
+                    let skip_update_label = b.emit_label();
+                    let where_reg = b.alloc_reg();
+                    emit_upsert_expr(
+                        b,
+                        where_expr,
+                        where_reg,
+                        &existing_ctx,
+                        &excluded_ctx,
+                        table,
+                    );
+                    // If WHERE is false/NULL, skip the update (jump to done).
+                    b.emit_jump_to_label(
+                        Opcode::IfNot,
+                        where_reg,
+                        0,
+                        skip_update_label,
+                        P4::None,
+                        1, // P5=1: treat NULL as false
+                    );
+                    // Evaluate assignments into existing_regs.
+                    emit_upsert_assignments(
+                        b,
+                        assignments,
+                        table,
+                        existing_regs,
+                        &existing_ctx,
+                        &excluded_ctx,
+                    );
+                    // Delete old index entries while cursor is still on
+                    // the old row (reads column values from the cursor).
+                    emit_index_deletes(b, table, cursor);
+                    // Pack updated record and insert with REPLACE.
+                    let update_rec = b.alloc_reg();
+                    b.emit_op(
+                        Opcode::MakeRecord,
+                        existing_regs,
+                        n_cols_i32,
+                        update_rec,
+                        P4::Affinity(aff_str.clone()),
+                        0,
+                    );
+                    b.emit_op(
+                        Opcode::Insert,
+                        cursor,
+                        update_rec,
+                        update_rowid_reg,
+                        P4::Table(table.name.clone()),
+                        OE_REPLACE,
+                    );
+                    emit_index_inserts(
+                        b,
+                        table,
+                        cursor,
+                        existing_regs,
+                        update_rowid_reg,
+                        OE_REPLACE,
+                    );
+                    b.resolve_label(skip_update_label);
+                } else {
+                    // No WHERE clause — always update on conflict.
+                    emit_upsert_assignments(
+                        b,
+                        assignments,
+                        table,
+                        existing_regs,
+                        &existing_ctx,
+                        &excluded_ctx,
+                    );
+                    // Delete old index entries while cursor is still on
+                    // the old row (reads column values from the cursor).
+                    emit_index_deletes(b, table, cursor);
+                    let update_rec = b.alloc_reg();
+                    b.emit_op(
+                        Opcode::MakeRecord,
+                        existing_regs,
+                        n_cols_i32,
+                        update_rec,
+                        P4::Affinity(aff_str.clone()),
+                        0,
+                    );
+                    b.emit_op(
+                        Opcode::Insert,
+                        cursor,
+                        update_rec,
+                        update_rowid_reg,
+                        P4::Table(table.name.clone()),
+                        OE_REPLACE,
+                    );
+                    emit_index_inserts(
+                        b,
+                        table,
+                        cursor,
+                        existing_regs,
+                        update_rowid_reg,
+                        OE_REPLACE,
+                    );
+                }
+
+                b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+
+                // --- No conflict path: normal insert ---
+                b.resolve_label(insert_label);
+                b.emit_op(
+                    Opcode::MakeRecord,
+                    val_regs,
+                    n_cols_i32,
+                    rec_reg,
+                    P4::Affinity(aff_str),
+                    0,
+                );
+                b.emit_op(
+                    Opcode::Insert,
+                    cursor,
+                    rec_reg,
+                    rowid_reg,
+                    P4::Table(table.name.clone()),
+                    oe_flag,
+                );
+                emit_index_inserts(b, table, cursor, val_regs, rowid_reg, oe_flag);
+
+                if !returning.is_empty() {
+                    emit_returning(b, cursor, table, returning, rowid_reg)?;
+                }
+
+                b.resolve_label(done_label);
+            } else {
+                // DO NOTHING — oe_flag is already OE_IGNORE, just do normal insert.
+                b.emit_op(
+                    Opcode::MakeRecord,
+                    val_regs,
+                    n_cols_i32,
+                    rec_reg,
+                    P4::Affinity(aff_str),
+                    0,
+                );
+                b.emit_op(
+                    Opcode::Insert,
+                    cursor,
+                    rec_reg,
+                    rowid_reg,
+                    P4::Table(table.name.clone()),
+                    oe_flag,
+                );
+                emit_index_inserts(b, table, cursor, val_regs, rowid_reg, oe_flag);
+                if !returning.is_empty() {
+                    emit_returning(b, cursor, table, returning, rowid_reg)?;
+                }
+            }
+        } else {
+            // No upsert — normal insert path.
+            b.emit_op(
+                Opcode::MakeRecord,
+                val_regs,
+                n_cols_i32,
+                rec_reg,
+                P4::Affinity(aff_str),
+                0,
+            );
+            b.emit_op(
+                Opcode::Insert,
+                cursor,
+                rec_reg,
+                rowid_reg,
+                P4::Table(table.name.clone()),
+                oe_flag,
+            );
+            emit_index_inserts(b, table, cursor, val_regs, rowid_reg, oe_flag);
+            if !returning.is_empty() {
+                emit_returning(b, cursor, table, returning, rowid_reg)?;
+            }
         }
     }
 
@@ -3831,6 +4330,9 @@ fn codegen_insert_select(
     emit_stored_generated_columns(b, target_table, val_regs);
 
     // Apply column type affinities before packing the record.
+    // STRICT type check before affinity.
+    emit_strict_type_check(b, target_table, val_regs);
+
     let aff_str = target_table.affinity_string();
     b.emit_op(
         Opcode::Affinity,
@@ -3842,7 +4344,6 @@ fn codegen_insert_select(
     );
 
     // MakeRecord from the read column values.
-    emit_strict_type_check(b, target_table, val_regs);
     b.emit_op(
         Opcode::MakeRecord,
         val_regs,
@@ -3954,6 +4455,9 @@ fn codegen_insert_select_without_from(
     // Evaluate STORED generated columns before packing the record.
     emit_stored_generated_columns(b, target_table, val_regs);
 
+    // STRICT type check before affinity.
+    emit_strict_type_check(b, target_table, val_regs);
+
     // Apply column type affinities before packing the record.
     let aff_str = target_table.affinity_string();
     b.emit_op(
@@ -3965,7 +4469,6 @@ fn codegen_insert_select_without_from(
         0,
     );
 
-    emit_strict_type_check(b, target_table, val_regs);
     b.emit_op(
         Opcode::MakeRecord,
         val_regs,
@@ -4246,19 +4749,22 @@ pub fn codegen_update(
         0,
     );
 
-    // Insert with REPLACE flag (p5=0x08 in C SQLite, we use 0x08).
+    // Conflict resolution for UPDATE: use explicit OR clause if present,
+    // otherwise default to OE_ABORT (standard UPDATE raises constraint error
+    // on PK/UNIQUE conflicts rather than silently replacing).
+    let oe_flag = conflict_action_to_oe(stmt.or_conflict.as_ref());
     b.emit_op(
         Opcode::Insert,
         table_cursor,
         rec_reg,
         rowid_reg,
         P4::Table(table.name.clone()),
-        0x08, // OPFLAG_ISUPDATE
+        oe_flag,
     );
 
     // Index maintenance (bd-2f9t): Insert NEW index entries after table insert.
     // col_regs now contains NEW column values.
-    emit_index_inserts(b, table, table_cursor, col_regs, rowid_reg, 0);
+    emit_index_inserts(b, table, table_cursor, col_regs, rowid_reg, oe_flag);
 
     // RETURNING clause: position cursor on updated row and read columns.
     if !stmt.returning.is_empty() {
@@ -4383,7 +4889,15 @@ pub fn codegen_delete(
     if !stmt.returning.is_empty() {
         let ret_count = result_column_count(&stmt.returning, table);
         let ret_regs = b.alloc_regs(ret_count);
-        emit_column_reads(b, table_cursor, &stmt.returning, table, None, &[], ret_regs)?;
+        emit_column_reads(
+            b,
+            table_cursor,
+            &stmt.returning,
+            table,
+            stmt.table.alias.as_deref(),
+            schema,
+            ret_regs,
+        )?;
         b.emit_op(Opcode::ResultRow, ret_regs, ret_count, 0, P4::None, 0);
     }
 
@@ -6712,7 +7226,7 @@ fn emit_scalar_subquery(
         return;
     }
 
-    let from_clause = from.as_ref().unwrap();
+    let from_clause = from.as_ref().expect("checked is_none() above");
     let (table_name, sub_alias) = match &from_clause.source {
         fsqlite_ast::TableOrSubquery::Table { name, alias, .. } => (&name.name, alias.as_deref()),
         _ => {
@@ -6984,8 +7498,9 @@ fn emit_expr_with_fallback(
                 b.resolve_label(done_label);
             } else {
                 // Arithmetic / logical / bitwise.
+                // VDBE convention: P3 = P2 op P1 (P1=rhs, P2=lhs).
                 let vdbe_op = binary_op_to_opcode(*op);
-                b.emit_op(vdbe_op, r_left, r_right, reg, P4::None, 0);
+                b.emit_op(vdbe_op, r_right, r_left, reg, P4::None, 0);
             }
             b.free_temp(r_left);
             b.free_temp(r_right);
@@ -7346,6 +7861,7 @@ mod tests {
             indexes: vec![],
             strict: false,
             foreign_keys: Vec::new(),
+            check_constraints: Vec::new(),
         }]
     }
 
@@ -7365,6 +7881,7 @@ mod tests {
             }],
             strict: false,
             foreign_keys: Vec::new(),
+            check_constraints: Vec::new(),
         }]
     }
 
@@ -7385,6 +7902,7 @@ mod tests {
                         strict_type: None,
                         generated_expr: None,
                         generated_stored: None,
+                        collation: None,
                     },
                     ColumnInfo {
                         name: "b".to_owned(),
@@ -7397,11 +7915,13 @@ mod tests {
                         strict_type: None,
                         generated_expr: None,
                         generated_stored: None,
+                        collation: None,
                     },
                 ],
                 indexes: vec![],
                 strict: false,
                 foreign_keys: Vec::new(),
+                check_constraints: Vec::new(),
             },
             TableSchema {
                 name: "s".to_owned(),
@@ -7410,6 +7930,7 @@ mod tests {
                 indexes: vec![],
                 strict: false,
                 foreign_keys: Vec::new(),
+                check_constraints: Vec::new(),
             },
         ]
     }
@@ -7571,6 +8092,7 @@ mod tests {
             indexes: vec![],
             strict: false,
             foreign_keys: Vec::new(),
+            check_constraints: Vec::new(),
         }]
     }
 
@@ -7819,6 +8341,7 @@ mod tests {
                         strict_type: None,
                         generated_expr: None,
                         generated_stored: None,
+                        collation: None,
                     },
                     ColumnInfo {
                         name: "b".to_owned(),
@@ -7831,11 +8354,13 @@ mod tests {
                         strict_type: None,
                         generated_expr: None,
                         generated_stored: None,
+                        collation: None,
                     },
                 ],
                 indexes: vec![],
                 strict: false,
                 foreign_keys: Vec::new(),
+                check_constraints: Vec::new(),
             },
             TableSchema {
                 name: "s".to_owned(),
@@ -7852,6 +8377,7 @@ mod tests {
                         strict_type: None,
                         generated_expr: None,
                         generated_stored: None,
+                        collation: None,
                     },
                     ColumnInfo {
                         name: "y".to_owned(),
@@ -7864,11 +8390,13 @@ mod tests {
                         strict_type: None,
                         generated_expr: None,
                         generated_stored: None,
+                        collation: None,
                     },
                 ],
                 indexes: vec![],
                 strict: false,
                 foreign_keys: Vec::new(),
+                check_constraints: Vec::new(),
             },
         ];
 
@@ -7975,6 +8503,7 @@ mod tests {
             indexes: vec![],
             strict: false,
             foreign_keys: Vec::new(),
+            check_constraints: Vec::new(),
         }];
 
         let inner_select = SelectStatement {
@@ -8038,6 +8567,7 @@ mod tests {
             indexes: vec![],
             strict: false,
             foreign_keys: Vec::new(),
+            check_constraints: Vec::new(),
         }];
 
         let inner_select = SelectStatement {
@@ -8095,6 +8625,7 @@ mod tests {
                 indexes: vec![],
                 strict: false,
                 foreign_keys: Vec::new(),
+                check_constraints: Vec::new(),
             },
             TableSchema {
                 name: "s".to_owned(),
@@ -8106,6 +8637,7 @@ mod tests {
                 indexes: vec![],
                 strict: false,
                 foreign_keys: Vec::new(),
+                check_constraints: Vec::new(),
             },
         ];
 
@@ -8179,6 +8711,7 @@ mod tests {
                 }],
                 strict: false,
                 foreign_keys: Vec::new(),
+                check_constraints: Vec::new(),
             },
             TableSchema {
                 name: "s".to_owned(),
@@ -8190,6 +8723,7 @@ mod tests {
                 indexes: vec![],
                 strict: false,
                 foreign_keys: Vec::new(),
+                check_constraints: Vec::new(),
             },
         ];
 
@@ -8268,6 +8802,7 @@ mod tests {
                         strict_type: None,
                         generated_expr: None,
                         generated_stored: None,
+                        collation: None,
                     },
                     ColumnInfo {
                         name: "b".to_owned(),
@@ -8280,11 +8815,13 @@ mod tests {
                         strict_type: None,
                         generated_expr: None,
                         generated_stored: None,
+                        collation: None,
                     },
                 ],
                 indexes: vec![],
                 strict: false,
                 foreign_keys: Vec::new(),
+                check_constraints: Vec::new(),
             },
             TableSchema {
                 name: "s".to_owned(),
@@ -8301,6 +8838,7 @@ mod tests {
                         strict_type: None,
                         generated_expr: None,
                         generated_stored: None,
+                        collation: None,
                     },
                     ColumnInfo {
                         name: "y".to_owned(),
@@ -8313,12 +8851,14 @@ mod tests {
                         strict_type: None,
                         generated_expr: None,
                         generated_stored: None,
+                        collation: None,
                     },
                     ColumnInfo::basic("z", 'e', false),
                 ],
                 indexes: vec![],
                 strict: false,
                 foreign_keys: Vec::new(),
+                check_constraints: Vec::new(),
             },
         ];
 
@@ -10093,6 +10633,99 @@ mod tests {
         }
     }
 
+    /// Build `SELECT count(*) FROM table HAVING sum(col) > threshold`.
+    fn agg_count_star_having_sum_gt(col: &str, threshold: i64, table: &str) -> SelectStatement {
+        SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Select {
+                    distinct: Distinctness::All,
+                    columns: vec![ResultColumn::Expr {
+                        expr: Expr::FunctionCall {
+                            name: "count".to_owned(),
+                            args: FunctionArgs::Star,
+                            distinct: false,
+                            order_by: vec![],
+                            filter: None,
+                            over: None,
+                            span: Span::ZERO,
+                        },
+                        alias: None,
+                    }],
+                    from: Some(from_table(table)),
+                    where_clause: None,
+                    group_by: vec![],
+                    having: Some(Box::new(Expr::BinaryOp {
+                        left: Box::new(Expr::FunctionCall {
+                            name: "sum".to_owned(),
+                            args: FunctionArgs::List(vec![Expr::Column(
+                                ColumnRef::bare(col),
+                                Span::ZERO,
+                            )]),
+                            distinct: false,
+                            order_by: vec![],
+                            filter: None,
+                            over: None,
+                            span: Span::ZERO,
+                        }),
+                        op: AstBinaryOp::Gt,
+                        right: Box::new(Expr::Literal(Literal::Integer(threshold), Span::ZERO)),
+                        span: Span::ZERO,
+                    })),
+                    windows: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        }
+    }
+
+    /// Build `SELECT count(*) FROM table HAVING count(*) > threshold`.
+    fn agg_count_star_having_count_gt(threshold: i64, table: &str) -> SelectStatement {
+        SelectStatement {
+            with: None,
+            body: SelectBody {
+                select: SelectCore::Select {
+                    distinct: Distinctness::All,
+                    columns: vec![ResultColumn::Expr {
+                        expr: Expr::FunctionCall {
+                            name: "count".to_owned(),
+                            args: FunctionArgs::Star,
+                            distinct: false,
+                            order_by: vec![],
+                            filter: None,
+                            over: None,
+                            span: Span::ZERO,
+                        },
+                        alias: None,
+                    }],
+                    from: Some(from_table(table)),
+                    where_clause: None,
+                    group_by: vec![],
+                    having: Some(Box::new(Expr::BinaryOp {
+                        left: Box::new(Expr::FunctionCall {
+                            name: "count".to_owned(),
+                            args: FunctionArgs::Star,
+                            distinct: false,
+                            order_by: vec![],
+                            filter: None,
+                            over: None,
+                            span: Span::ZERO,
+                        }),
+                        op: AstBinaryOp::Gt,
+                        right: Box::new(Expr::Literal(Literal::Integer(threshold), Span::ZERO)),
+                        span: Span::ZERO,
+                    })),
+                    windows: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        }
+    }
+
     // === Test 20: SELECT count(*) ===
     #[test]
     fn test_codegen_select_count_star() {
@@ -10229,6 +10862,84 @@ mod tests {
             .collect();
         assert!(matches!(&steps[0].p4, P4::FuncName(f) if f == "COUNT"));
         assert!(matches!(&steps[1].p4, P4::FuncName(f) if f == "SUM"));
+    }
+
+    // === Test 22b: HAVING-only aggregate is accumulated (bd-3ew8w) ===
+    #[test]
+    fn test_codegen_select_having_only_aggregate_is_accumulated() {
+        let stmt = agg_count_star_having_sum_gt("a", 10, "t");
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        // COUNT(*) in SELECT + SUM(a) in HAVING must both be stepped/finalized.
+        let step_count = prog
+            .ops()
+            .iter()
+            .filter(|op| op.opcode == Opcode::AggStep)
+            .count();
+        assert_eq!(step_count, 2, "HAVING-only SUM(a) must emit AggStep");
+
+        let final_count = prog
+            .ops()
+            .iter()
+            .filter(|op| op.opcode == Opcode::AggFinal)
+            .count();
+        assert_eq!(final_count, 2, "HAVING-only SUM(a) must emit AggFinal");
+
+        assert!(
+            prog.ops().iter().any(
+                |op| matches!(&op.p4, P4::FuncName(f) if op.opcode == Opcode::AggStep && f == "SUM")
+            ),
+            "expected AggStep for SUM(a) referenced only by HAVING"
+        );
+        assert!(
+            prog.ops().iter().any(
+                |op| matches!(&op.p4, P4::FuncName(f) if op.opcode == Opcode::AggFinal && f == "SUM")
+            ),
+            "expected AggFinal for SUM(a) referenced only by HAVING"
+        );
+
+        assert!(
+            has_opcodes(&prog, &[Opcode::IfNot, Opcode::ResultRow]),
+            "HAVING clause should emit IfNot guard before ResultRow"
+        );
+        let rr = prog
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::ResultRow)
+            .unwrap();
+        assert_eq!(rr.p2, 1, "query still returns one SELECT column");
+    }
+
+    // === Test 22c: HAVING aggregate deduplicates with SELECT aggregate ===
+    #[test]
+    fn test_codegen_select_having_aggregate_reuses_select_aggregate() {
+        let stmt = agg_count_star_having_count_gt(1, "t");
+        let schema = test_schema();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        let step_count = prog
+            .ops()
+            .iter()
+            .filter(|op| op.opcode == Opcode::AggStep)
+            .count();
+        assert_eq!(step_count, 1, "COUNT(*) should not be duplicated");
+
+        let final_count = prog
+            .ops()
+            .iter()
+            .filter(|op| op.opcode == Opcode::AggFinal)
+            .count();
+        assert_eq!(
+            final_count, 1,
+            "COUNT(*) finalization should not be duplicated"
+        );
     }
 
     // === Test 23: Non-aggregate SELECT does not emit AggStep ===
@@ -11404,11 +12115,13 @@ mod tests {
                     strict_type: None,
                     generated_expr: Some("a + b".to_owned()),
                     generated_stored: Some(true),
+                    collation: None,
                 },
             ],
             indexes: vec![],
             strict: false,
             foreign_keys: Vec::new(),
+            check_constraints: Vec::new(),
         }]
     }
 
@@ -11431,11 +12144,13 @@ mod tests {
                     strict_type: None,
                     generated_expr: Some("a * 2".to_owned()),
                     generated_stored: Some(false),
+                    collation: None,
                 },
             ],
             indexes: vec![],
             strict: false,
             foreign_keys: Vec::new(),
+            check_constraints: Vec::new(),
         }]
     }
 

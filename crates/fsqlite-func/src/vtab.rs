@@ -297,6 +297,155 @@ pub trait VirtualTableCursor: Send {
 }
 
 // ---------------------------------------------------------------------------
+// Module factory & type erasure
+// ---------------------------------------------------------------------------
+
+/// A type-erased virtual table module factory.
+///
+/// Registered with the connection via `register_module("name", factory)`.
+/// When `CREATE VIRTUAL TABLE ... USING name(args)` is executed, the
+/// factory's `create` method is called to produce a concrete vtab instance.
+#[allow(clippy::missing_errors_doc)]
+pub trait VtabModuleFactory: Send + Sync {
+    /// Create a new virtual table instance for `CREATE VIRTUAL TABLE`.
+    fn create(&self, cx: &Cx, args: &[&str]) -> Result<Box<dyn ErasedVtabInstance>>;
+
+    /// Connect to an existing virtual table (subsequent opens).
+    fn connect(&self, cx: &Cx, args: &[&str]) -> Result<Box<dyn ErasedVtabInstance>> {
+        self.create(cx, args)
+    }
+
+    /// Column names and affinities for the virtual table schema.
+    fn column_info(&self, _args: &[&str]) -> Vec<(String, char)> {
+        Vec::new()
+    }
+}
+
+/// A type-erased virtual table instance.
+#[allow(clippy::missing_errors_doc)]
+pub trait ErasedVtabInstance: Send + Sync {
+    /// Open a new scan cursor.
+    fn open_cursor(&self) -> Result<Box<dyn ErasedVtabCursor>>;
+    /// INSERT/UPDATE/DELETE on the virtual table.
+    fn update(&mut self, cx: &Cx, args: &[SqliteValue]) -> Result<Option<i64>>;
+    /// Begin a virtual table transaction.
+    fn begin(&mut self, cx: &Cx) -> Result<()>;
+    /// Commit a virtual table transaction.
+    fn commit(&mut self, cx: &Cx) -> Result<()>;
+    /// Roll back a virtual table transaction.
+    fn rollback(&mut self, cx: &Cx) -> Result<()>;
+    /// Destroy the virtual table.
+    fn destroy(&mut self, cx: &Cx) -> Result<()>;
+    /// Rename the virtual table.
+    fn rename(&mut self, cx: &Cx, new_name: &str) -> Result<()>;
+    /// Inform the query planner about available indexes.
+    fn best_index(&self, info: &mut IndexInfo) -> Result<()>;
+}
+
+/// A type-erased virtual table cursor.
+#[allow(clippy::missing_errors_doc)]
+pub trait ErasedVtabCursor: Send {
+    /// Begin a scan with filter parameters.
+    fn erased_filter(
+        &mut self,
+        cx: &Cx,
+        idx_num: i32,
+        idx_str: Option<&str>,
+        args: &[SqliteValue],
+    ) -> Result<()>;
+    /// Advance to the next row.
+    fn erased_next(&mut self, cx: &Cx) -> Result<()>;
+    /// Whether the cursor has moved past the last row.
+    fn erased_eof(&self) -> bool;
+    /// Write the value of column `col` into `ctx`.
+    fn erased_column(&self, ctx: &mut ColumnContext, col: i32) -> Result<()>;
+    /// Return the rowid of the current row.
+    fn erased_rowid(&self) -> Result<i64>;
+}
+
+/// Blanket `ErasedVtabCursor` for any concrete cursor.
+impl<C: VirtualTableCursor + 'static> ErasedVtabCursor for C {
+    fn erased_filter(
+        &mut self,
+        cx: &Cx,
+        idx_num: i32,
+        idx_str: Option<&str>,
+        args: &[SqliteValue],
+    ) -> Result<()> {
+        VirtualTableCursor::filter(self, cx, idx_num, idx_str, args)
+    }
+    fn erased_next(&mut self, cx: &Cx) -> Result<()> {
+        VirtualTableCursor::next(self, cx)
+    }
+    fn erased_eof(&self) -> bool {
+        VirtualTableCursor::eof(self)
+    }
+    fn erased_column(&self, ctx: &mut ColumnContext, col: i32) -> Result<()> {
+        VirtualTableCursor::column(self, ctx, col)
+    }
+    fn erased_rowid(&self) -> Result<i64> {
+        VirtualTableCursor::rowid(self)
+    }
+}
+
+/// Blanket `ErasedVtabInstance` for any concrete `VirtualTable`.
+impl<T: VirtualTable + 'static> ErasedVtabInstance for T
+where
+    T::Cursor: 'static,
+{
+    fn open_cursor(&self) -> Result<Box<dyn ErasedVtabCursor>> {
+        let cursor = VirtualTable::open(self)?;
+        Ok(Box::new(cursor))
+    }
+    fn update(&mut self, cx: &Cx, args: &[SqliteValue]) -> Result<Option<i64>> {
+        VirtualTable::update(self, cx, args)
+    }
+    fn begin(&mut self, cx: &Cx) -> Result<()> {
+        VirtualTable::begin(self, cx)
+    }
+    fn commit(&mut self, cx: &Cx) -> Result<()> {
+        VirtualTable::commit(self, cx)
+    }
+    fn rollback(&mut self, cx: &Cx) -> Result<()> {
+        VirtualTable::rollback(self, cx)
+    }
+    fn destroy(&mut self, cx: &Cx) -> Result<()> {
+        VirtualTable::destroy(self, cx)
+    }
+    fn rename(&mut self, cx: &Cx, new_name: &str) -> Result<()> {
+        VirtualTable::rename(self, cx, new_name)
+    }
+    fn best_index(&self, info: &mut IndexInfo) -> Result<()> {
+        VirtualTable::best_index(self, info)
+    }
+}
+
+/// Create a `VtabModuleFactory` from a `VirtualTable` type.
+pub fn module_factory_from<T>() -> impl VtabModuleFactory
+where
+    T: VirtualTable + 'static,
+    T::Cursor: 'static,
+{
+    struct Factory<T: Send + Sync>(std::marker::PhantomData<T>);
+
+    impl<T: VirtualTable + 'static> VtabModuleFactory for Factory<T>
+    where
+        T::Cursor: 'static,
+    {
+        fn create(&self, cx: &Cx, args: &[&str]) -> Result<Box<dyn ErasedVtabInstance>> {
+            let vtab = T::create(cx, args)?;
+            Ok(Box::new(vtab))
+        }
+        fn connect(&self, cx: &Cx, args: &[&str]) -> Result<Box<dyn ErasedVtabInstance>> {
+            let vtab = T::connect(cx, args)?;
+            Ok(Box::new(vtab))
+        }
+    }
+
+    Factory::<T>(std::marker::PhantomData)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -549,7 +698,7 @@ mod tests {
             vec![],
         );
 
-        vtab.best_index(&mut info).unwrap();
+        VirtualTable::best_index(&vtab, &mut info).unwrap();
 
         assert_eq!(info.idx_num, 1);
         assert!((info.estimated_cost - 10.0).abs() < f64::EPSILON);
@@ -595,16 +744,16 @@ mod tests {
 
         // INSERT: args[0] = Null (no old rowid), args[1] = new rowid (ignored),
         // args[2..] = column values
-        let result = vtab
-            .update(
-                &cx,
-                &[
-                    SqliteValue::Null,
-                    SqliteValue::Null,
-                    SqliteValue::Text("hello".to_owned()),
-                ],
-            )
-            .unwrap();
+        let result = VirtualTable::update(
+            &mut vtab,
+            &cx,
+            &[
+                SqliteValue::Null,
+                SqliteValue::Null,
+                SqliteValue::Text("hello".to_owned()),
+            ],
+        )
+        .unwrap();
 
         assert_eq!(result, Some(1));
         assert_eq!(vtab.rows.len(), 1);
@@ -615,7 +764,7 @@ mod tests {
     fn test_vtab_update_readonly_default() {
         let cx = Cx::new();
         let mut vtab = ReadOnlyVtab::connect(&cx, &[]).unwrap();
-        let err = vtab.update(&cx, &[SqliteValue::Null]).unwrap_err();
+        let err = VirtualTable::update(&mut vtab, &cx, &[SqliteValue::Null]).unwrap_err();
         assert!(matches!(err, FrankenError::ReadOnly));
     }
 
@@ -625,13 +774,13 @@ mod tests {
 
         // Default: destroy delegates to disconnect (both no-ops for ReadOnlyVtab).
         let mut vtab = ReadOnlyVtab::connect(&cx, &[]).unwrap();
-        vtab.disconnect(&cx).unwrap();
-        vtab.destroy(&cx).unwrap();
+        VirtualTable::disconnect(&mut vtab, &cx).unwrap();
+        VirtualTable::destroy(&mut vtab, &cx).unwrap();
 
         // Custom destroy sets a flag.
         let mut vtab = GenerateSeries::connect(&cx, &[]).unwrap();
         assert!(!vtab.destroyed);
-        vtab.destroy(&cx).unwrap();
+        VirtualTable::destroy(&mut vtab, &cx).unwrap();
         assert!(vtab.destroyed);
     }
 

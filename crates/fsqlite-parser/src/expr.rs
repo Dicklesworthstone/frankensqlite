@@ -346,7 +346,9 @@ impl Parser {
             let col_name = match &col_tok.kind {
                 TokenKind::Id(c) | TokenKind::QuotedId(c, _) => c.clone(),
                 TokenKind::Star => "*".to_owned(),
-                k if is_nonreserved_kw(k) => kw_to_str(k),
+                // After a dot, ANY keyword is a valid column name (SQLite
+                // allows reserved keywords in table-qualified positions).
+                k if k.keyword_str().is_some() => kw_to_str(k),
                 _ => {
                     return Err(ParseError::at(
                         format!("expected column name after '.', got {:?}", col_tok.kind),
@@ -618,9 +620,8 @@ impl Parser {
     fn parse_like(&mut self, lhs: Expr, op: LikeOp, not: bool) -> Result<Expr, ParseError> {
         let pattern = self.parse_expr_bp(bp::EQUALITY.1)?;
         let escape = if self.eat_kind(&TokenKind::KwEscape) {
-            if op != LikeOp::Like {
-                return Err(self.err_here(format!("ESCAPE clause is not supported for {:?}", op)));
-            }
+            // SQLite's grammar accepts ESCAPE for all pattern-matching operators
+            // (LIKE, GLOB, MATCH, REGEXP), not just LIKE.
             Some(Box::new(self.parse_expr_bp(bp::EQUALITY.1)?))
         } else {
             None
@@ -778,7 +779,15 @@ impl Parser {
         };
 
         let mut end = self.expect_kind(&TokenKind::RightParen)?;
-        let filter = if self.eat_kind(&TokenKind::KwFilter) {
+        // Peek ahead: only consume FILTER if followed by '(' to avoid
+        // swallowing FILTER when used as a column alias (it's non-reserved).
+        let filter = if matches!(self.peek_kind(), TokenKind::KwFilter)
+            && self
+                .tokens
+                .get(self.pos + 1)
+                .is_some_and(|t| t.kind == TokenKind::LeftParen)
+        {
+            self.advance_token(); // consume FILTER
             self.expect_kind(&TokenKind::LeftParen)?;
             self.expect_kind(&TokenKind::KwWhere)?;
             let predicate = self.parse_expr()?;
@@ -788,7 +797,16 @@ impl Parser {
         } else {
             None
         };
-        let over = if self.eat_kind(&TokenKind::KwOver) {
+        // Peek: only consume OVER if followed by '(' or an identifier
+        // (window name), to avoid swallowing OVER as a column alias.
+        let over = if matches!(self.peek_kind(), TokenKind::KwOver)
+            && self.tokens.get(self.pos + 1).is_some_and(|t| {
+                matches!(
+                    t.kind,
+                    TokenKind::LeftParen | TokenKind::Id(_) | TokenKind::QuotedId(_, _)
+                )
+            }) {
+            self.advance_token(); // consume OVER
             if self.eat_kind(&TokenKind::LeftParen) {
                 let spec = self.parse_window_spec()?;
                 let over_end = self.expect_kind(&TokenKind::RightParen)?;

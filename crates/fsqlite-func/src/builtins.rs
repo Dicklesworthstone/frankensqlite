@@ -92,9 +92,10 @@ fn coerce_numeric(v: &SqliteValue) -> SqliteValue {
     match v {
         SqliteValue::Integer(_) | SqliteValue::Float(_) => v.clone(),
         SqliteValue::Text(s) => {
-            if let Ok(i) = s.parse::<i64>() {
+            let t = s.trim();
+            if let Ok(i) = t.parse::<i64>() {
                 SqliteValue::Integer(i)
-            } else if let Ok(f) = s.parse::<f64>() {
+            } else if let Ok(f) = t.parse::<f64>() {
                 SqliteValue::Float(f)
             } else {
                 SqliteValue::Integer(0)
@@ -317,7 +318,7 @@ impl ScalarFunction for IifFunc {
             SqliteValue::Null => false,
             SqliteValue::Integer(i) => *i != 0,
             SqliteValue::Float(f) => *f != 0.0,
-            SqliteValue::Text(s) => s.parse::<f64>().is_ok_and(|f| f != 0.0),
+            SqliteValue::Text(s) => s.trim().parse::<f64>().is_ok_and(|f| f != 0.0),
             SqliteValue::Blob(b) => std::str::from_utf8(b)
                 .ok()
                 .and_then(|s| s.trim().parse::<f64>().ok())
@@ -739,9 +740,10 @@ impl ScalarFunction for SignFunc {
             }
             SqliteValue::Text(s) => {
                 // Non-numeric strings => NULL per spec
-                if let Ok(i) = s.parse::<i64>() {
+                let t = s.trim();
+                if let Ok(i) = t.parse::<i64>() {
                     Ok(SqliteValue::Integer(i.signum()))
-                } else if let Ok(f) = s.parse::<f64>() {
+                } else if let Ok(f) = t.parse::<f64>() {
                     if f > 0.0 {
                         Ok(SqliteValue::Integer(1))
                     } else if f < 0.0 {
@@ -2276,6 +2278,20 @@ mod tests {
     }
 
     #[test]
+    fn test_abs_whitespace_padded_text() {
+        // Regression: ABS('  42  ') must return 42, not 0.
+        // coerce_numeric must trim text before parsing.
+        assert_eq!(
+            invoke1(&AbsFunc, SqliteValue::Text("  42  ".to_owned())).unwrap(),
+            SqliteValue::Integer(42)
+        );
+        assert_eq!(
+            invoke1(&AbsFunc, SqliteValue::Text("  -7.5  ".to_owned())).unwrap(),
+            SqliteValue::Float(7.5)
+        );
+    }
+
+    #[test]
     #[allow(clippy::approx_constant)]
     fn test_abs_float() {
         assert_eq!(
@@ -2403,6 +2419,21 @@ mod tests {
             ])
             .unwrap();
         assert_eq!(result, SqliteValue::Text("no".to_owned()));
+    }
+
+    #[test]
+    fn test_iif_whitespace_padded_text_truthy() {
+        // Regression: IIF('  5  ', 'yes', 'no') must return 'yes'
+        // because SQLite trims text before numeric coercion.
+        let f = IifFunc;
+        let result = f
+            .invoke(&[
+                SqliteValue::Text("  5  ".to_owned()),
+                SqliteValue::Text("yes".to_owned()),
+                SqliteValue::Text("no".to_owned()),
+            ])
+            .unwrap();
+        assert_eq!(result, SqliteValue::Text("yes".to_owned()));
     }
 
     // ── ifnull ───────────────────────────────────────────────────────────
@@ -2783,6 +2814,20 @@ mod tests {
         assert_eq!(
             invoke1(&SignFunc, SqliteValue::Text("abc".to_owned())).unwrap(),
             SqliteValue::Null
+        );
+    }
+
+    #[test]
+    fn test_sign_whitespace_padded_text() {
+        // Regression: SIGN('  5  ') must return 1, not NULL.
+        // SQLite trims text before numeric parsing.
+        assert_eq!(
+            invoke1(&SignFunc, SqliteValue::Text("  5  ".to_owned())).unwrap(),
+            SqliteValue::Integer(1)
+        );
+        assert_eq!(
+            invoke1(&SignFunc, SqliteValue::Text("  -3.14  ".to_owned())).unwrap(),
+            SqliteValue::Integer(-1)
         );
     }
 

@@ -109,6 +109,14 @@ pub enum FrankenError {
     #[error("PRIMARY KEY constraint failed")]
     PrimaryKeyViolation,
 
+    /// STRICT table datatype constraint violation (SQLITE_CONSTRAINT_DATATYPE).
+    #[error("cannot store {actual} value in {column_type} column {column}")]
+    DatatypeViolation {
+        column: String,
+        column_type: String,
+        actual: String,
+    },
+
     // === Transaction Errors ===
     /// Cannot start a transaction within a transaction.
     #[error("cannot start a transaction within a transaction")]
@@ -360,7 +368,8 @@ impl FrankenError {
             | Self::NotNullViolation { .. }
             | Self::CheckViolation { .. }
             | Self::ForeignKeyViolation
-            | Self::PrimaryKeyViolation => ErrorCode::Constraint,
+            | Self::PrimaryKeyViolation
+            | Self::DatatypeViolation { .. } => ErrorCode::Constraint,
             Self::WriteConflict { .. }
             | Self::SerializationFailure { .. }
             | Self::Busy
@@ -461,6 +470,7 @@ impl FrankenError {
             Self::Busy => 5,                           // SQLITE_BUSY
             Self::BusyRecovery => 5 | (1 << 8),        // SQLITE_BUSY_RECOVERY = 261
             Self::BusySnapshot { .. } => 5 | (2 << 8), // SQLITE_BUSY_SNAPSHOT = 517
+            Self::DatatypeViolation { .. } => 3091,    // SQLITE_CONSTRAINT_DATATYPE
             _ => self.error_code() as i32,
         }
     }
@@ -1397,6 +1407,18 @@ mod tests {
             FrankenError::PrimaryKeyViolation.to_string(),
             "PRIMARY KEY constraint failed"
         );
+
+        let err = FrankenError::DatatypeViolation {
+            column: "t1.name".to_owned(),
+            column_type: "INTEGER".to_owned(),
+            actual: "TEXT".to_owned(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "cannot store TEXT value in INTEGER column t1.name"
+        );
+        assert_eq!(err.error_code(), ErrorCode::Constraint);
+        assert_eq!(err.extended_error_code(), 3091);
     }
 
     #[test]

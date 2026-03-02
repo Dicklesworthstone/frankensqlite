@@ -776,7 +776,8 @@ fn append_jsonb_node(node_type: u8, payload: &[u8], out: &mut Vec<u8>) -> Result
     let len_size_u8 = u8::try_from(len_size).map_err(|error| {
         FrankenError::function_error(format!("jsonb length-size conversion failed: {error}"))
     })?;
-    let header = (node_type << 4) | len_size_u8;
+    // JSONB spec: lower 4 bits = node type, upper 4 bits = payload size category.
+    let header = (len_size_u8 << 4) | node_type;
     out.push(header);
     out.extend_from_slice(&len_bytes[..len_size]);
     out.extend_from_slice(payload);
@@ -914,8 +915,9 @@ fn decode_jsonb_node(input: &[u8]) -> Result<(u8, &[u8], usize)> {
     }
 
     let header = input[0];
-    let node_type = header >> 4;
-    let len_size = usize::from(header & 0x0f);
+    // JSONB spec: lower 4 bits = node type, upper 4 bits = payload size category.
+    let node_type = header & 0x0f;
+    let len_size = usize::from(header >> 4);
     if !matches!(len_size, 0 | 1 | 2 | 4 | 8) {
         return Err(FrankenError::function_error(
             "invalid JSONB length-size nibble",
@@ -977,8 +979,9 @@ fn is_superficially_valid_jsonb(input: &[u8]) -> bool {
         return false;
     }
     let header = input[0];
-    let node_type = header >> 4;
-    let len_size = usize::from(header & 0x0f);
+    // JSONB spec: lower 4 bits = node type, upper 4 bits = payload size category.
+    let node_type = header & 0x0f;
+    let len_size = usize::from(header >> 4);
     if !matches!(len_size, 0 | 1 | 2 | 4 | 8) {
         return false;
     }
@@ -1161,7 +1164,13 @@ fn resolve_path<'a>(root: &'a Value, path: &str) -> Result<Option<&'a Value>> {
 }
 
 fn append_object_path(base: &str, key: &str) -> String {
-    format!("{base}.{key}")
+    // Quote keys containing special characters that would make the path
+    // ambiguous (dots, brackets, quotes, whitespace).
+    if key.contains(|c: char| matches!(c, '.' | '[' | ']' | '"' | '\'') || c.is_whitespace()) {
+        format!("{base}.\"{}\"", key.replace('"', "\\\""))
+    } else {
+        format!("{base}.{key}")
+    }
 }
 
 fn append_array_path(base: &str, index: usize) -> String {

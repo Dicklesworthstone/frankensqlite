@@ -1420,12 +1420,25 @@ pub fn classify_where_term(expr: &Expr) -> WhereTerm<'_> {
         }
 
         // col = expr or expr = col
+        //
+        // `col = NULL` is special-cased: in SQL, `x = NULL` evaluates to NULL
+        // (unknown), never TRUE, so it cannot drive an index seek or equality
+        // constraint.  Classify it as Other instead of Equality.
         Expr::BinaryOp {
             left,
             op: AstBinaryOp::Eq,
             right,
             ..
         } => {
+            if matches!(left.as_ref(), Expr::Literal(Literal::Null, _))
+                || matches!(right.as_ref(), Expr::Literal(Literal::Null, _))
+            {
+                return WhereTerm {
+                    expr,
+                    column: None,
+                    kind: WhereTermKind::Other,
+                };
+            }
             if let Some(wc) = extract_where_column(left) {
                 if is_rowid_column(&wc) {
                     return WhereTerm {
@@ -1508,20 +1521,23 @@ pub fn classify_where_term(expr: &Expr) -> WhereTerm<'_> {
             }
         }
 
-        // col LIKE 'prefix%' or col GLOB 'prefix*'
+        // col GLOB 'prefix*' — prefix-to-range optimisation.
+        //
+        // LIKE is intentionally excluded: SQLite LIKE is case-INSENSITIVE by
+        // default (for ASCII), so converting `col LIKE 'abc%'` into the range
+        // `col >= 'abc' AND col < 'abd'` would miss rows like 'ABC…'.  The
+        // optimisation is only safe when `PRAGMA case_sensitive_like = ON` or
+        // when the column has BINARY collation; neither is tracked yet.
+        // GLOB is always case-sensitive, so prefix extraction is safe.
         Expr::Like {
             expr: inner,
             pattern,
             op,
             not,
             ..
-        } if !not && matches!(op, LikeOp::Like | LikeOp::Glob) => {
+        } if !not && matches!(op, LikeOp::Glob) => {
             let column = extract_where_column(inner);
-            let (prefix, operator) = match op {
-                LikeOp::Like => (extract_like_prefix(pattern), "LIKE"),
-                LikeOp::Glob => (extract_glob_prefix(pattern), "GLOB"),
-                _ => unreachable!("guard restricts to LIKE/GLOB"),
-            };
+            let (prefix, operator) = (extract_glob_prefix(pattern), "GLOB");
             if let Some(pfx) = prefix {
                 let upper_bound = like_prefix_upper_bound(&pfx);
                 tracing::debug!(
@@ -1581,29 +1597,6 @@ fn has_rowid_equality(terms: &[WhereTerm<'_>]) -> bool {
     terms
         .iter()
         .any(|t| matches!(t.kind, WhereTermKind::RowidEquality))
-}
-
-/// Extract a constant prefix from a LIKE pattern (e.g. `'abc%'` → `"abc"`).
-///
-/// Returns `None` if the pattern has no constant prefix (starts with `%` or `_`)
-/// or is not a string literal.
-fn extract_like_prefix(pattern: &Expr) -> Option<String> {
-    if let Expr::Literal(Literal::String(s), _) = pattern {
-        let mut prefix = String::new();
-        for ch in s.chars() {
-            if ch == '%' || ch == '_' {
-                break;
-            }
-            prefix.push(ch);
-        }
-        if prefix.is_empty() {
-            None
-        } else {
-            Some(prefix)
-        }
-    } else {
-        None
-    }
 }
 
 /// Extract a constant prefix from a GLOB pattern (e.g. `'abc*'` → `"abc"`).
@@ -3161,6 +3154,95 @@ fn order_indices_to_names(order: &[usize], tables: &[TableStats]) -> Vec<String>
 // Predicate pushdown (bd-1as.3)
 // ---------------------------------------------------------------------------
 
+/// Collect all distinct table qualifiers referenced by column expressions
+/// within an AST node.  Used to determine whether a predicate is a
+/// single-table filter (pushable) or a cross-table join condition (not
+/// pushable).
+fn collect_table_refs(expr: &Expr, out: &mut HashSet<String>) {
+    match expr {
+        Expr::Column(col_ref, _) => {
+            if let Some(ref tq) = col_ref.table {
+                out.insert(tq.to_ascii_lowercase());
+            }
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            collect_table_refs(left, out);
+            collect_table_refs(right, out);
+        }
+        Expr::UnaryOp { expr: inner, .. }
+        | Expr::Collate { expr: inner, .. }
+        | Expr::IsNull { expr: inner, .. } => {
+            collect_table_refs(inner, out);
+        }
+        Expr::Between {
+            expr: e, low, high, ..
+        } => {
+            collect_table_refs(e, out);
+            collect_table_refs(low, out);
+            collect_table_refs(high, out);
+        }
+        Expr::In { expr: e, set, .. } => {
+            collect_table_refs(e, out);
+            if let InSet::List(items) = set {
+                for item in items {
+                    collect_table_refs(item, out);
+                }
+            }
+        }
+        Expr::Like {
+            expr: e,
+            pattern,
+            escape,
+            ..
+        } => {
+            collect_table_refs(e, out);
+            collect_table_refs(pattern, out);
+            if let Some(esc) = escape {
+                collect_table_refs(esc, out);
+            }
+        }
+        Expr::FunctionCall { args, filter, .. } => {
+            if let fsqlite_ast::FunctionArgs::List(exprs) = args {
+                for arg in exprs {
+                    collect_table_refs(arg, out);
+                }
+            }
+            if let Some(f) = filter {
+                collect_table_refs(f, out);
+            }
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            if let Some(op) = operand {
+                collect_table_refs(op, out);
+            }
+            for (when_e, then_e) in whens {
+                collect_table_refs(when_e, out);
+                collect_table_refs(then_e, out);
+            }
+            if let Some(el) = else_expr {
+                collect_table_refs(el, out);
+            }
+        }
+        Expr::Cast { expr: e, .. } => collect_table_refs(e, out),
+        Expr::JsonAccess { expr: e, path, .. } => {
+            collect_table_refs(e, out);
+            collect_table_refs(path, out);
+        }
+        Expr::RowValue(exprs, _) => {
+            for e in exprs {
+                collect_table_refs(e, out);
+            }
+        }
+        // Literals, placeholders, subqueries, exists — no column refs to collect.
+        _ => {}
+    }
+}
+
 /// A pushed-down predicate: WHERE term assigned to a specific table.
 #[derive(Debug, Clone)]
 pub struct PushedPredicate<'a> {
@@ -3193,31 +3275,39 @@ pub fn pushdown_predicates<'a>(
     let mut remaining = Vec::new();
 
     for term in where_terms {
-        if let Some(ref col) = term.column {
-            // Check if the column's table qualifier matches exactly one table.
-            if let Some(ref tq) = col.table {
-                let matching: Vec<_> = table_names
-                    .iter()
-                    .filter(|t| t.eq_ignore_ascii_case(tq))
-                    .collect();
-                if matching.len() == 1 {
+        // Collect all table qualifiers referenced anywhere in the expression.
+        // A predicate is only pushable if it references at most one table;
+        // cross-table predicates (join conditions) must remain as join filters.
+        let mut refs = HashSet::new();
+        collect_table_refs(term.expr, &mut refs);
+
+        if refs.len() == 1 {
+            // Single qualified table — push to that table.
+            let tq = refs.into_iter().next().unwrap();
+            let matching: Vec<_> = table_names
+                .iter()
+                .filter(|t| t.to_ascii_lowercase() == tq)
+                .collect();
+            if matching.len() == 1 {
+                pushed.push(PushedPredicate {
+                    table: matching[0].clone(),
+                    term,
+                });
+                continue;
+            }
+        } else if refs.is_empty() {
+            // No table qualifiers (unqualified columns or pure literals).
+            if let Some(ref _col) = term.column {
+                if table_names.len() == 1 {
                     pushed.push(PushedPredicate {
-                        table: matching[0].clone(),
+                        table: table_names[0].clone(),
                         term,
                     });
                     continue;
                 }
             }
-
-            // Unqualified column: if only one table in scope, push there.
-            if table_names.len() == 1 {
-                pushed.push(PushedPredicate {
-                    table: table_names[0].clone(),
-                    term,
-                });
-                continue;
-            }
         }
+        // Multi-table references or ambiguous — keep as join condition.
         remaining.push(term);
     }
 
@@ -3274,6 +3364,8 @@ pub fn try_constant_fold(expr: &Expr) -> FoldResult {
                     fsqlite_ast::UnaryOp::Plus => FoldResult::Literal(Literal::Float(f)),
                     _ => FoldResult::NotConstant,
                 },
+                // NULL propagation: any unary op on NULL yields NULL.
+                FoldResult::Literal(Literal::Null) => FoldResult::Literal(Literal::Null),
                 _ => FoldResult::NotConstant,
             }
         }
@@ -3339,6 +3431,12 @@ pub fn try_constant_fold(expr: &Expr) -> FoldResult {
                     }),
                     _ => FoldResult::NotConstant,
                 },
+                // NULL propagation: any arithmetic or comparison with NULL
+                // yields NULL in SQL.
+                (FoldResult::Literal(Literal::Null), FoldResult::Literal(_))
+                | (FoldResult::Literal(_), FoldResult::Literal(Literal::Null)) => {
+                    FoldResult::Literal(Literal::Null)
+                }
                 _ => FoldResult::NotConstant,
             }
         }
@@ -4174,20 +4272,16 @@ mod tests {
     }
 
     #[test]
-    fn test_index_usability_like_prefix() {
+    fn test_index_usability_like_not_usable() {
         let idx = index_info("idx_name", "t1", &["name"], false, 50);
-        // LIKE 'Jo%' → usable (constant prefix)
+        // LIKE is case-insensitive by default — prefix optimisation disabled,
+        // so the index is not usable for LIKE terms.
         let terms = [like_term("name", "Jo%")];
-        let result = analyze_index_usability(&idx, &terms);
         assert!(matches!(
-            result,
-            IndexUsability::LikePrefix {
-                ref low,
-                high: Some(ref high)
-            } if low == "Jo" && high == "Jp"
+            analyze_index_usability(&idx, &terms),
+            IndexUsability::NotUsable
         ));
 
-        // LIKE '%Jo%' → not usable (no constant prefix)
         let terms = [like_term("name", "%Jo%")];
         assert!(matches!(
             analyze_index_usability(&idx, &terms),
@@ -4263,18 +4357,6 @@ mod tests {
         };
         let terms = decompose_where(&inner);
         assert_eq!(terms.len(), 2);
-    }
-
-    #[test]
-    fn test_extract_like_prefix_constant() {
-        let pat = Expr::Literal(Literal::String("abc%def".to_owned()), Span::ZERO);
-        assert_eq!(extract_like_prefix(&pat), Some("abc".to_owned()));
-    }
-
-    #[test]
-    fn test_extract_like_prefix_none() {
-        let pat = Expr::Literal(Literal::String("%xyz".to_owned()), Span::ZERO);
-        assert_eq!(extract_like_prefix(&pat), None);
     }
 
     // ===================================================================
@@ -5176,20 +5258,13 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_where_term_like_prefix() {
+    fn test_classify_where_term_like_is_other() {
+        // LIKE is case-insensitive by default, so prefix optimisation is
+        // intentionally disabled — it must classify as Other regardless of
+        // whether a constant prefix exists.
         let term = like_term("name", "abc%");
-        assert!(matches!(
-            term.kind,
-            WhereTermKind::LikePrefix {
-                ref prefix,
-                upper_bound: Some(ref upper_bound),
-            } if prefix == "abc" && upper_bound == "abd"
-        ));
-        assert_eq!(term.column.as_ref().unwrap().column, "name");
-    }
+        assert!(matches!(term.kind, WhereTermKind::Other));
 
-    #[test]
-    fn test_classify_where_term_like_no_prefix_is_other() {
         let term = like_term("name", "%wildcard");
         assert!(matches!(term.kind, WhereTermKind::Other));
     }
@@ -5211,6 +5286,37 @@ mod tests {
     fn test_classify_where_term_glob_no_prefix_is_other() {
         let term = glob_term("name", "*wildcard");
         assert!(matches!(term.kind, WhereTermKind::Other));
+    }
+
+    #[test]
+    fn test_classify_where_term_eq_null_is_other() {
+        // `col = NULL` is always NULL (unknown) in SQL — not a usable equality.
+        let expr: &'static Expr = Box::leak(Box::new(Expr::BinaryOp {
+            left: Box::new(Expr::Column(ColumnRef::bare("x"), Span::ZERO)),
+            op: AstBinaryOp::Eq,
+            right: Box::new(Expr::Literal(Literal::Null, Span::ZERO)),
+            span: Span::ZERO,
+        }));
+        let term = classify_where_term(expr);
+        assert!(
+            matches!(term.kind, WhereTermKind::Other),
+            "col = NULL should be Other, got {:?}",
+            term.kind
+        );
+
+        // Also check NULL = col (reversed)
+        let expr2: &'static Expr = Box::leak(Box::new(Expr::BinaryOp {
+            left: Box::new(Expr::Literal(Literal::Null, Span::ZERO)),
+            op: AstBinaryOp::Eq,
+            right: Box::new(Expr::Column(ColumnRef::bare("x"), Span::ZERO)),
+            span: Span::ZERO,
+        }));
+        let term2 = classify_where_term(expr2);
+        assert!(
+            matches!(term2.kind, WhereTermKind::Other),
+            "NULL = col should be Other, got {:?}",
+            term2.kind
+        );
     }
 
     #[test]
@@ -5388,31 +5494,6 @@ mod tests {
         assert_eq!(terms.len(), 1);
     }
 
-    // ===================================================================
-    // extract_like_prefix edge cases
-    // ===================================================================
-
-    #[test]
-    fn test_extract_like_prefix_underscore_wildcard() {
-        // "abc_def" → prefix = "abc" (underscore is wildcard)
-        let pat = Expr::Literal(Literal::String("abc_def".to_owned()), Span::ZERO);
-        assert_eq!(extract_like_prefix(&pat), Some("abc".to_owned()));
-    }
-
-    #[test]
-    fn test_extract_like_prefix_no_wildcards() {
-        // "exact" → prefix = "exact" (no wildcards)
-        let pat = Expr::Literal(Literal::String("exact".to_owned()), Span::ZERO);
-        assert_eq!(extract_like_prefix(&pat), Some("exact".to_owned()));
-    }
-
-    #[test]
-    fn test_extract_like_prefix_non_string_expr() {
-        // Non-string expression → None
-        let pat = Expr::Literal(Literal::Integer(42), Span::ZERO);
-        assert_eq!(extract_like_prefix(&pat), None);
-    }
-
     #[test]
     fn test_extract_glob_prefix_star_wildcard() {
         // "abc*def" → prefix = "abc" (star is wildcard)
@@ -5479,18 +5560,16 @@ mod tests {
     }
 
     #[test]
-    fn test_best_access_path_like_prefix() {
+    fn test_best_access_path_like_no_index() {
         let table = table_stats("t1", 100, 1000);
         let idx = index_info("idx_name", "t1", &["name"], false, 20);
         let terms = [like_term("name", "Jo%")];
         let ap = best_access_path(&table, &[idx], &terms, None);
-        // LIKE prefix should use index range scan
+        // LIKE is case-insensitive by default — prefix optimisation disabled,
+        // so a full table scan is expected.
         assert!(
-            matches!(
-                ap.kind,
-                AccessPathKind::IndexScanRange { .. } | AccessPathKind::CoveringIndexScan { .. }
-            ),
-            "LIKE prefix should use index scan, got {:?}",
+            matches!(ap.kind, AccessPathKind::FullTableScan),
+            "LIKE should fall back to full scan, got {:?}",
             ap.kind
         );
     }
@@ -6140,6 +6219,8 @@ mod tests {
             #[test]
             fn test_cost_hierarchy(
                 table_pages in 10u64..100_000,
+                // Constrain index_pages ≤ table_pages (realistic: indices are
+                // typically smaller than the table they index).
                 index_pages in 2u64..10_000,
             ) {
                 let rowid_cost = estimate_cost(
@@ -6158,16 +6239,24 @@ mod tests {
                     index_pages,
                 );
 
+                // Rowid lookup (log2(tp)) is always ≤ index equality
+                // (log2(ip) + log2(tp)) since log2(ip) ≥ 0.
                 prop_assert!(
                     rowid_cost <= eq_cost + f64::EPSILON,
                     "rowid lookup ({rowid_cost}) should be ≤ index equality ({eq_cost}) \
                      for table_pages={table_pages}, index_pages={index_pages}"
                 );
-                prop_assert!(
-                    eq_cost <= full_cost + f64::EPSILON,
-                    "index equality ({eq_cost}) should be ≤ full scan ({full_cost}) \
-                     for table_pages={table_pages}, index_pages={index_pages}"
-                );
+
+                // Index equality ≤ full scan only when index is not
+                // disproportionately large: log2(ip) + log2(tp) ≤ tp.
+                // For huge indices on tiny tables, full scan can be cheaper.
+                if index_pages <= table_pages {
+                    prop_assert!(
+                        eq_cost <= full_cost + f64::EPSILON,
+                        "index equality ({eq_cost}) should be ≤ full scan ({full_cost}) \
+                         for table_pages={table_pages}, index_pages={index_pages}"
+                    );
+                }
             }
         }
 

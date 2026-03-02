@@ -1897,6 +1897,8 @@ trait VtabInstance: Send + Sync {
     fn rollback(&mut self, cx: &Cx) -> Result<()>;
     fn destroy(&mut self, cx: &Cx) -> Result<()>;
     fn rename(&mut self, cx: &Cx, new_name: &str) -> Result<()>;
+    fn open_cursor(&self) -> Result<Box<dyn ErasedVtabCursor>>;
+    fn vtab_update(&mut self, cx: &Cx, args: &[SqliteValue]) -> Result<Option<i64>>;
 }
 
 /// A type-erased virtual table cursor.
@@ -1940,6 +1942,61 @@ impl<C: fsqlite_func::vtab::VirtualTableCursor + 'static> ErasedVtabCursor for C
     }
     fn rowid(&self) -> Result<i64> {
         fsqlite_func::vtab::VirtualTableCursor::rowid(self)
+    }
+}
+
+/// Bridge from `fsqlite_func::vtab::ErasedVtabInstance` to engine's `VtabInstance`.
+struct ErasedVtabBridge(Box<dyn fsqlite_func::vtab::ErasedVtabInstance>);
+
+impl VtabInstance for ErasedVtabBridge {
+    fn begin(&mut self, cx: &Cx) -> Result<()> {
+        self.0.begin(cx)
+    }
+    fn commit(&mut self, cx: &Cx) -> Result<()> {
+        self.0.commit(cx)
+    }
+    fn rollback(&mut self, cx: &Cx) -> Result<()> {
+        self.0.rollback(cx)
+    }
+    fn destroy(&mut self, cx: &Cx) -> Result<()> {
+        self.0.destroy(cx)
+    }
+    fn rename(&mut self, cx: &Cx, new_name: &str) -> Result<()> {
+        self.0.rename(cx, new_name)
+    }
+    fn open_cursor(&self) -> Result<Box<dyn ErasedVtabCursor>> {
+        let func_cursor = self.0.open_cursor()?;
+        Ok(Box::new(FuncVtabCursorBridge(func_cursor)))
+    }
+    fn vtab_update(&mut self, cx: &Cx, args: &[SqliteValue]) -> Result<Option<i64>> {
+        self.0.update(cx, args)
+    }
+}
+
+/// Bridge from `fsqlite_func::vtab::ErasedVtabCursor` to engine's `ErasedVtabCursor`.
+struct FuncVtabCursorBridge(Box<dyn fsqlite_func::vtab::ErasedVtabCursor>);
+
+impl ErasedVtabCursor for FuncVtabCursorBridge {
+    fn filter(
+        &mut self,
+        cx: &Cx,
+        idx_num: i32,
+        idx_str: Option<&str>,
+        args: &[SqliteValue],
+    ) -> Result<()> {
+        self.0.erased_filter(cx, idx_num, idx_str, args)
+    }
+    fn next(&mut self, cx: &Cx) -> Result<()> {
+        self.0.erased_next(cx)
+    }
+    fn eof(&self) -> bool {
+        self.0.erased_eof()
+    }
+    fn column(&self, ctx: &mut ColumnContext, col: i32) -> Result<()> {
+        self.0.erased_column(ctx, col)
+    }
+    fn rowid(&self) -> Result<i64> {
+        self.0.erased_rowid()
     }
 }
 
@@ -2149,6 +2206,16 @@ impl VdbeEngine {
     pub fn register_vtab_cursor(&mut self, cursor_id: i32, cursor: Box<dyn ErasedVtabCursor>) {
         self.vtab_cursors
             .insert(cursor_id, VtabCursorState { cursor });
+    }
+
+    /// Register a virtual table instance for lifecycle and cursor operations.
+    pub fn register_vtab_instance(
+        &mut self,
+        cursor_id: i32,
+        instance: Box<dyn fsqlite_func::vtab::ErasedVtabInstance>,
+    ) {
+        self.vtab_instances
+            .insert(cursor_id, Box::new(ErasedVtabBridge(instance)));
     }
 
     /// Enable/disable storage-backed cursor execution for `OpenRead`/`OpenWrite`.
@@ -2796,22 +2863,38 @@ impl VdbeEngine {
                 Opcode::Eq | Opcode::Ne | Opcode::Lt | Opcode::Le | Opcode::Gt | Opcode::Ge => {
                     let lhs = self.get_reg(op.p3);
                     let rhs = self.get_reg(op.p1);
+                    let store_p2 = (op.p5 & 0x20) != 0; // SQLITE_STOREP2
 
-                    // NULL handling: if either is NULL, jump depends on p5
-                    // flag (SQLITE_NULLEQ).
-                    let should_jump = if lhs.is_null() || rhs.is_null() {
+                    if lhs.is_null() || rhs.is_null() {
                         let null_eq = (op.p5 & 0x80) != 0;
                         if null_eq {
                             // IS / IS NOT semantics: NULL == NULL is true.
                             let both_null = lhs.is_null() && rhs.is_null();
-                            match op.opcode {
+                            let should_jump = match op.opcode {
                                 Opcode::Eq => both_null,
                                 Opcode::Ne => !both_null,
                                 _ => false,
+                            };
+                            if store_p2 {
+                                self.set_reg(op.p2, SqliteValue::Integer(i64::from(should_jump)));
+                                pc += 1;
+                            } else if should_jump {
+                                pc = op.p2 as usize;
+                            } else {
+                                pc += 1;
                             }
+                        } else if store_p2 {
+                            // STOREP2 with NULL: store NULL in P2.
+                            self.set_reg(op.p2, SqliteValue::Null);
+                            pc += 1;
                         } else {
-                            // Standard SQL: comparison with NULL is NULL (no jump).
-                            false
+                            // JUMPIFNULL (0x10): jump to P2 when either is NULL.
+                            let jump_if_null = (op.p5 & 0x10) != 0;
+                            if jump_if_null {
+                                pc = op.p2 as usize;
+                            } else {
+                                pc += 1;
+                            }
                         }
                     } else {
                         // Apply SQLite comparison affinity rules (§3.2):
@@ -2823,7 +2906,7 @@ impl VdbeEngine {
                         } else {
                             cmp_lhs.partial_cmp(&cmp_rhs)
                         };
-                        matches!(
+                        let should_jump = matches!(
                             (op.opcode, cmp),
                             (Opcode::Eq, Some(std::cmp::Ordering::Equal))
                                 | (Opcode::Lt, Some(std::cmp::Ordering::Less))
@@ -2839,13 +2922,16 @@ impl VdbeEngine {
                         ) || matches!(
                             (op.opcode, cmp),
                             (Opcode::Ne, Some(ord)) if ord != std::cmp::Ordering::Equal
-                        )
-                    };
+                        );
 
-                    if should_jump {
-                        pc = op.p2 as usize;
-                    } else {
-                        pc += 1;
+                        if store_p2 {
+                            self.set_reg(op.p2, SqliteValue::Integer(i64::from(should_jump)));
+                            pc += 1;
+                        } else if should_jump {
+                            pc = op.p2 as usize;
+                        } else {
+                            pc += 1;
+                        }
                     }
                 }
 
@@ -3383,11 +3469,16 @@ impl VdbeEngine {
                 // ── Seek operations (in-memory) ─────────────────────────
                 Opcode::SeekRowid => {
                     // Seek cursor p1 to the row with rowid in register p3.
-                    // If not found, jump to p2.
+                    // If not found, jump to p2.  NULL key → not found.
                     let cursor_id = op.p1;
                     // Seek repositions the cursor, so clear any pending delete state.
                     self.pending_next_after_delete.remove(&cursor_id);
-                    let rowid_val = self.get_reg(op.p3).to_integer();
+                    let key = self.get_reg(op.p3);
+                    if key.is_null() {
+                        pc = op.p2 as usize;
+                        continue;
+                    }
+                    let rowid_val = key.to_integer();
                     let found = if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
                         cursor
                             .cursor
@@ -3427,11 +3518,15 @@ impl VdbeEngine {
                     // - SeekLE: Position at last row <= key
                     // - SeekLT: Position at last row < key
                     //
-                    // Jump to p2 if no matching row exists.
+                    // Jump to p2 if no matching row exists.  NULL key → not found.
                     let cursor_id = op.p1;
                     // Seek repositions the cursor, so clear any pending delete state.
                     self.pending_next_after_delete.remove(&cursor_id);
                     let key_val = self.get_reg(op.p3).clone();
+                    if key_val.is_null() {
+                        pc = op.p2 as usize;
+                        continue;
+                    }
 
                     let found = if matches!(key_val, SqliteValue::Blob(_)) {
                         // Index seek path: probe register contains serialized key
@@ -3619,54 +3714,24 @@ impl VdbeEngine {
                 }
 
                 Opcode::NotFound | Opcode::NotExists | Opcode::IfNoHope => {
-                    // Check if rowid in register p3 exists in cursor p1.
-                    let cursor_id = op.p1;
-                    // Storage-cursor probe repositions via table_move_to; clear
-                    // pending delete/next state so a following Next advances
-                    // relative to the new cursor position.
-                    if self.storage_cursors.contains_key(&cursor_id) {
-                        self.pending_next_after_delete.remove(&cursor_id);
-                    }
-                    let rowid_val = self.get_reg(op.p3).to_integer();
-                    let exists = if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
-                        cursor
-                            .cursor
-                            .table_move_to(&cursor.cx, rowid_val)?
-                            .is_found()
-                    } else if let Some(cursor) = self.cursors.get(&cursor_id) {
-                        if let Some(db) = self.db.as_ref() {
-                            if let Some(table) = db.get_table(cursor.root_page) {
-                                table.find_by_rowid(rowid_val).is_some()
-                            } else {
-                                false
-                            }
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
-                    };
-                    if exists {
-                        pc += 1; // Found: fall through.
-                    } else {
-                        pc = op.p2 as usize; // Not found: jump.
-                    }
-                }
-
-                Opcode::Found | Opcode::NoConflict => {
-                    // Check if key exists; jump to p2 if found.
+                    // Check if key in register P3 exists in cursor P1.
+                    // Jump to P2 if NOT found; fall through if found.
+                    // NULL key → always "not found".
                     let cursor_id = op.p1;
                     // Probe repositions the cursor; clear pending delete/next
-                    // state so subsequent iteration is based on the probe
-                    // position, not stale pre-probe state.
+                    // state so a following Next advances relative to the new
+                    // cursor position.
                     if self.storage_cursors.contains_key(&cursor_id) {
                         self.pending_next_after_delete.remove(&cursor_id);
                     }
                     let key_val = self.get_reg(op.p3).clone();
+                    if key_val.is_null() {
+                        pc = op.p2 as usize;
+                        continue;
+                    }
                     let exists = if matches!(key_val, SqliteValue::Blob(_)) {
                         // Index seek path: P3 contains a packed record blob
-                        // (from MakeRecord).  Use index_move_to instead of
-                        // table_move_to to find the key in the index B-tree.
+                        // (from MakeRecord). Use index_move_to to find the key.
                         let key_bytes = record_blob_bytes(&key_val);
                         if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
                             cursor
@@ -3699,9 +3764,115 @@ impl VdbeEngine {
                         }
                     };
                     if exists {
+                        pc += 1; // Found: fall through.
+                    } else {
+                        pc = op.p2 as usize; // Not found: jump.
+                    }
+                }
+
+                Opcode::Found => {
+                    // Jump to P2 if key found in cursor P1 (exact match).
+                    let cursor_id = op.p1;
+                    if self.storage_cursors.contains_key(&cursor_id) {
+                        self.pending_next_after_delete.remove(&cursor_id);
+                    }
+                    let key_val = self.get_reg(op.p3).clone();
+                    let exists = if matches!(key_val, SqliteValue::Blob(_)) {
+                        let key_bytes = record_blob_bytes(&key_val);
+                        if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
+                            cursor
+                                .cursor
+                                .index_move_to(&cursor.cx, &key_bytes)?
+                                .is_found()
+                        } else {
+                            false
+                        }
+                    } else {
+                        let rowid_val = key_val.to_integer();
+                        if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
+                            cursor
+                                .cursor
+                                .table_move_to(&cursor.cx, rowid_val)?
+                                .is_found()
+                        } else if let Some(cursor) = self.cursors.get(&cursor_id) {
+                            if let Some(db) = self.db.as_ref() {
+                                if let Some(table) = db.get_table(cursor.root_page) {
+                                    table.find_by_rowid(rowid_val).is_some()
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        }
+                    };
+                    if exists {
                         pc = op.p2 as usize;
                     } else {
                         pc += 1;
+                    }
+                }
+
+                Opcode::NoConflict => {
+                    // Jump to P2 if NO matching key prefix exists in index
+                    // cursor P1.  Falls through when a conflict IS found
+                    // (cursor positioned on the conflicting entry).
+                    // NULL in any key field → always jump (no conflict).
+                    let cursor_id = op.p1;
+                    if self.storage_cursors.contains_key(&cursor_id) {
+                        self.pending_next_after_delete.remove(&cursor_id);
+                    }
+                    let key_val = self.get_reg(op.p3).clone();
+
+                    // NULL short-circuit: NULL != NULL for UNIQUE purposes.
+                    if let SqliteValue::Blob(ref bytes) = key_val {
+                        if let Some(fields) = parse_record(bytes) {
+                            if fields.iter().any(SqliteValue::is_null) {
+                                pc = op.p2 as usize;
+                                continue;
+                            }
+                        }
+                    } else if key_val.is_null() {
+                        pc = op.p2 as usize;
+                        continue;
+                    }
+
+                    // Prefix-based conflict check: seek the index, then
+                    // compare only the first N fields (where N = number of
+                    // fields in the probe key) against the entry at the
+                    // cursor position.  The index stores (columns, rowid)
+                    // but the probe key has only (columns).
+                    let conflict = if let SqliteValue::Blob(ref bytes) = key_val {
+                        let probe_fields = parse_record(bytes);
+                        if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
+                            cursor.cursor.index_move_to(&cursor.cx, bytes)?;
+                            // Read the entry at the current cursor position.
+                            if let Ok(entry_bytes) = cursor.cursor.payload(&cursor.cx) {
+                                if let (Some(probe), Some(entry)) =
+                                    (&probe_fields, parse_record(&entry_bytes))
+                                {
+                                    let n = probe.len();
+                                    entry.len() >= n && entry[..n] == probe[..]
+                                } else {
+                                    false
+                                }
+                            } else {
+                                // Cursor at EOF — no conflict.
+                                false
+                            }
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+
+                    if conflict {
+                        pc += 1; // Conflict found: fall through.
+                    } else {
+                        pc = op.p2 as usize; // No conflict: jump.
                     }
                 }
 
@@ -4154,6 +4325,9 @@ impl VdbeEngine {
                     #[allow(clippy::cast_sign_loss)]
                     let c = op.p2 as usize;
                     let target = op.p3;
+                    if s + c > self.registers.len() {
+                        self.registers.resize(s + c, SqliteValue::Null);
+                    }
                     let blob = encode_record(&self.registers[s..s + c]);
                     self.set_reg(target, SqliteValue::Blob(blob));
                     pc += 1;
@@ -4251,9 +4425,20 @@ impl VdbeEngine {
                 }
 
                 Opcode::IsTrue => {
+                    // Synopsis: r[P2] = coalesce(IsTrue(r[P1]),P3) ^ P4
+                    // Implements IS TRUE, IS FALSE, IS NOT TRUE, IS NOT FALSE.
                     let val = self.get_reg(op.p1);
-                    let truth = !val.is_null() && val.to_float() != 0.0;
-                    self.set_reg(op.p2, SqliteValue::Integer(i64::from(truth)));
+                    let p4_val = match &op.p4 {
+                        P4::Int(n) => *n,
+                        _ => 0,
+                    };
+                    if val.is_null() {
+                        self.set_reg(op.p2, SqliteValue::Integer(i64::from(op.p3 ^ p4_val)));
+                    } else {
+                        // SQLite uses sqlite3VdbeMemIntegerify for truthiness.
+                        let v = i32::from(val.to_integer() != 0);
+                        self.set_reg(op.p2, SqliteValue::Integer(i64::from((v ^ p4_val) & 1)));
+                    }
                     pc += 1;
                 }
 
@@ -4355,10 +4540,16 @@ impl VdbeEngine {
                 }
 
                 Opcode::TypeCheck => {
-                    let pattern = match &op.p4 {
-                        P4::Affinity(pattern) => pattern.as_bytes(),
-                        _ => &[],
+                    // P4 is either Affinity("IRT") or Str("IRT\ttable\tcol1\tcol2\tcol3")
+                    let p4_str = match &op.p4 {
+                        P4::Affinity(s) | P4::Str(s) => s.as_str(),
+                        _ => "",
                     };
+                    // Split on tab: first part is affinity pattern, rest is table+columns.
+                    let mut parts = p4_str.split('\t');
+                    let pattern = parts.next().unwrap_or("").as_bytes();
+                    let table_name = parts.next().unwrap_or("");
+                    let col_names: Vec<&str> = parts.collect();
 
                     #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
                     let count = op.p2.max(0) as usize;
@@ -4383,16 +4574,34 @@ impl VdbeEngine {
                         if let Some(expected) = strict_type {
                             let checked =
                                 value.clone().validate_strict(expected).map_err(|err| {
+                                    let col_label = col_names
+                                        .get(offset)
+                                        .filter(|s| !s.is_empty())
+                                        .map_or_else(
+                                            || format!("column {offset}"),
+                                            |name| {
+                                                if table_name.is_empty() {
+                                                    (*name).to_owned()
+                                                } else {
+                                                    format!("{table_name}.{name}")
+                                                }
+                                            },
+                                        );
+                                    let col_type = format!("{expected:?}").to_ascii_uppercase();
+                                    let actual_str = err.actual.to_string();
                                     tracing::warn!(
                                         register = reg,
                                         expected = ?expected,
-                                        actual = ?err.actual,
+                                        actual = %actual_str,
+                                        column = %col_label,
                                         value = ?value,
                                         "STRICT type violation"
                                     );
-                                    FrankenError::Internal(format!(
-                                        "SQLITE_CONSTRAINT_DATATYPE: STRICT type check failed at register {reg}: {err}"
-                                    ))
+                                    FrankenError::DatatypeViolation {
+                                        column: col_label,
+                                        column_type: col_type,
+                                        actual: actual_str,
+                                    }
                                 })?;
                             self.set_reg(reg, checked);
                         }
@@ -4850,6 +5059,9 @@ impl VdbeEngine {
 
                     #[allow(clippy::cast_sign_loss)]
                     let s = first_arg_reg as usize;
+                    if s + arg_count > self.registers.len() {
+                        self.registers.resize(s + arg_count, SqliteValue::Null);
+                    }
                     let result = func.invoke(&self.registers[s..s + arg_count])?;
 
                     if self.trace_opcodes {
@@ -5121,9 +5333,24 @@ impl VdbeEngine {
                 Opcode::VOpen => {
                     // Open a virtual table cursor.
                     // P1 = cursor number.
-                    // The Connection layer pre-creates cursors or VFilter
-                    // initialises them; this is a no-op at the VDBE level.
-                    let _cursor_id = op.p1;
+                    // If a vtab instance is registered, call open_cursor().
+                    let cursor_id = op.p1;
+                    if !self.vtab_cursors.contains_key(&cursor_id) {
+                        if let Some(vtab) = self.vtab_instances.get(&cursor_id) {
+                            match vtab.open_cursor() {
+                                Ok(cursor) => {
+                                    self.vtab_cursors
+                                        .insert(cursor_id, VtabCursorState { cursor });
+                                }
+                                Err(e) => {
+                                    break ExecOutcome::Error {
+                                        code: 1,
+                                        message: format!("VOpen error: {e}"),
+                                    };
+                                }
+                            }
+                        }
+                    }
                     pc += 1;
                 }
 
@@ -5224,16 +5451,47 @@ impl VdbeEngine {
 
                 Opcode::VUpdate => {
                     // INSERT/UPDATE/DELETE on a virtual table.
-                    // P1 = number of argument registers
-                    // P2 = first argument register
-                    // P3 = destination register for new rowid (INSERT)
-                    // Currently a placeholder; stores NULL in dest register.
-                    let _n_args = op.p1;
-                    let _first_reg = op.p2;
-                    let dest_reg = op.p3;
+                    // P1 = cursor number, P2 = arg count, P3 = first arg reg
+                    let cursor_id = op.p1;
+                    let n_args = op.p2;
+                    let first_reg = op.p3;
+                    let dest_reg = op.p5 as i32;
                     #[allow(clippy::cast_sign_loss)]
-                    if let Some(reg) = self.registers.get_mut(dest_reg as usize) {
-                        *reg = SqliteValue::Null;
+                    let args: Vec<SqliteValue> = (0..n_args)
+                        .map(|i| {
+                            self.registers
+                                .get((first_reg + i) as usize)
+                                .cloned()
+                                .unwrap_or(SqliteValue::Null)
+                        })
+                        .collect();
+                    if let Some(vtab) = self.vtab_instances.get_mut(&cursor_id) {
+                        let cx = Cx::new();
+                        match vtab.vtab_update(&cx, &args) {
+                            Ok(Some(rowid)) => {
+                                #[allow(clippy::cast_sign_loss)]
+                                if let Some(reg) = self.registers.get_mut(dest_reg as usize) {
+                                    *reg = SqliteValue::Integer(rowid);
+                                }
+                            }
+                            Ok(None) => {
+                                #[allow(clippy::cast_sign_loss)]
+                                if let Some(reg) = self.registers.get_mut(dest_reg as usize) {
+                                    *reg = SqliteValue::Null;
+                                }
+                            }
+                            Err(e) => {
+                                break ExecOutcome::Error {
+                                    code: 1,
+                                    message: format!("VUpdate error: {e}"),
+                                };
+                            }
+                        }
+                    } else {
+                        #[allow(clippy::cast_sign_loss)]
+                        if let Some(reg) = self.registers.get_mut(dest_reg as usize) {
+                            *reg = SqliteValue::Null;
+                        }
                     }
                     pc += 1;
                 }
@@ -6006,15 +6264,26 @@ fn compare_sorter_rows(
 ) -> Ordering {
     let key_count = key_columns.max(1);
     for idx in 0..key_count {
+        let is_desc = sort_key_orders.get(idx) == Some(&SortKeyOrder::Desc);
         let Some(lhs_value) = lhs.get(idx) else {
             return if rhs.get(idx).is_some() {
-                Ordering::Less
+                // Missing lhs, present rhs — respect DESC ordering.
+                if is_desc {
+                    Ordering::Greater
+                } else {
+                    Ordering::Less
+                }
             } else {
                 break;
             };
         };
         let Some(rhs_value) = rhs.get(idx) else {
-            return Ordering::Greater;
+            // Present lhs, missing rhs — respect DESC ordering.
+            return if is_desc {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            };
         };
 
         let mut ord = lhs_value.partial_cmp(rhs_value).unwrap_or(Ordering::Equal);
@@ -6022,7 +6291,7 @@ fn compare_sorter_rows(
             continue;
         }
 
-        if sort_key_orders.get(idx) == Some(&SortKeyOrder::Desc) {
+        if is_desc {
             ord = ord.reverse();
         }
         return ord;
@@ -6258,15 +6527,17 @@ fn sql_shift_right(val: i64, amount: i64) -> SqliteValue {
 
 /// Three-valued SQL AND.
 fn sql_and(a: &SqliteValue, b: &SqliteValue) -> SqliteValue {
+    // SQLite uses integer truncation for truthiness in And/Or (sqlite3VdbeIntValue),
+    // NOT float comparison. This matches the Not opcode behavior.
     let a_val = if a.is_null() {
         None
     } else {
-        Some(a.to_float() != 0.0)
+        Some(a.to_integer() != 0)
     };
     let b_val = if b.is_null() {
         None
     } else {
-        Some(b.to_float() != 0.0)
+        Some(b.to_integer() != 0)
     };
 
     match (a_val, b_val) {
@@ -6278,15 +6549,17 @@ fn sql_and(a: &SqliteValue, b: &SqliteValue) -> SqliteValue {
 
 /// Three-valued SQL OR.
 fn sql_or(a: &SqliteValue, b: &SqliteValue) -> SqliteValue {
+    // SQLite uses integer truncation for truthiness in And/Or (sqlite3VdbeIntValue),
+    // NOT float comparison. This matches the Not opcode behavior.
     let a_val = if a.is_null() {
         None
     } else {
-        Some(a.to_float() != 0.0)
+        Some(a.to_integer() != 0)
     };
     let b_val = if b.is_null() {
         None
     } else {
-        Some(b.to_float() != 0.0)
+        Some(b.to_integer() != 0)
     };
 
     match (a_val, b_val) {
@@ -6294,6 +6567,49 @@ fn sql_or(a: &SqliteValue, b: &SqliteValue) -> SqliteValue {
         (Some(false), Some(false)) => SqliteValue::Integer(0),
         _ => SqliteValue::Null,
     }
+}
+
+/// Scan the leading numeric prefix from a byte slice.
+///
+/// Recognises `[+-]? [0-9]* ('.' [0-9]*)? ([eE] [+-]? [0-9]+)?`.
+/// Returns the byte offset where the prefix ends (0 if no prefix).
+fn scan_numeric_prefix(bytes: &[u8]) -> usize {
+    if bytes.is_empty() {
+        return 0;
+    }
+    let mut end = 0;
+    // Optional leading sign.
+    if bytes[0] == b'+' || bytes[0] == b'-' || bytes[0].is_ascii_digit() {
+        end = 1;
+        // Integer digits.
+        while end < bytes.len() && bytes[end].is_ascii_digit() {
+            end += 1;
+        }
+        // Optional decimal part.
+        if end < bytes.len() && bytes[end] == b'.' {
+            end += 1;
+            while end < bytes.len() && bytes[end].is_ascii_digit() {
+                end += 1;
+            }
+        }
+        // Optional exponent (e.g. e+10, E-3, e5).
+        if end < bytes.len() && (bytes[end] == b'e' || bytes[end] == b'E') {
+            let exp_start = end;
+            end += 1;
+            if end < bytes.len() && (bytes[end] == b'+' || bytes[end] == b'-') {
+                end += 1;
+            }
+            if end < bytes.len() && bytes[end].is_ascii_digit() {
+                while end < bytes.len() && bytes[end].is_ascii_digit() {
+                    end += 1;
+                }
+            } else {
+                // No digits after 'e' — revert to before exponent.
+                end = exp_start;
+            }
+        }
+    }
+    end
 }
 
 /// SQL CAST operation (p2 encodes target type).
@@ -6337,23 +6653,11 @@ fn sql_cast(val: SqliteValue, target: i32) -> SqliteValue {
                     if let Ok(i) = trimmed.parse::<i64>() {
                         return SqliteValue::Integer(i);
                     }
-                    // Parse leading numeric prefix (digits, optional sign, optional decimal).
+                    // Parse leading numeric prefix (digits, optional sign, optional
+                    // decimal, optional exponent).  Matches SQLite's sqlite3Atoi64
+                    // / sqlite3AtoF prefix extraction.
                     let bytes = trimmed.as_bytes();
-                    let mut end = 0;
-                    if !bytes.is_empty()
-                        && (bytes[0] == b'+' || bytes[0] == b'-' || bytes[0].is_ascii_digit())
-                    {
-                        end = 1;
-                        while end < bytes.len() && bytes[end].is_ascii_digit() {
-                            end += 1;
-                        }
-                        if end < bytes.len() && bytes[end] == b'.' {
-                            end += 1;
-                            while end < bytes.len() && bytes[end].is_ascii_digit() {
-                                end += 1;
-                            }
-                        }
-                    }
+                    let end = scan_numeric_prefix(bytes);
                     if end > 0 {
                         let prefix = &trimmed[..end];
                         if let Ok(i) = prefix.parse::<i64>() {
@@ -6369,7 +6673,25 @@ fn sql_cast(val: SqliteValue, target: i32) -> SqliteValue {
                 _ => SqliteValue::Integer(val.to_integer()),
             }
         }
-        b'E' | b'e' => SqliteValue::Float(val.to_float()),
+        b'E' | b'e' => {
+            // C SQLite: CAST('3.14abc' AS REAL) extracts leading numeric prefix.
+            match &val {
+                SqliteValue::Text(s) => {
+                    let trimmed = s.trim();
+                    if let Ok(f) = trimmed.parse::<f64>() {
+                        return SqliteValue::Float(f);
+                    }
+                    let end = scan_numeric_prefix(trimmed.as_bytes());
+                    if end > 0 {
+                        if let Ok(f) = trimmed[..end].parse::<f64>() {
+                            return SqliteValue::Float(f);
+                        }
+                    }
+                    SqliteValue::Float(0.0)
+                }
+                _ => SqliteValue::Float(val.to_float()),
+            }
+        }
         _ => val, // unknown: no-op
     }
 }
@@ -7234,6 +7556,7 @@ mod tests {
                         strict_type: None,
                         generated_expr: None,
                         generated_stored: None,
+                        collation: None,
                     },
                     ColumnInfo {
                         name: "b".to_owned(),
@@ -7246,11 +7569,13 @@ mod tests {
                         strict_type: None,
                         generated_expr: None,
                         generated_stored: None,
+                        collation: None,
                     },
                 ],
                 indexes: vec![],
                 strict: false,
                 foreign_keys: Vec::new(),
+                check_constraints: Vec::new(),
             }]
         }
 
@@ -8461,6 +8786,87 @@ mod tests {
         assert_eq!(rows[0], vec![SqliteValue::Integer(1)]);
     }
 
+    #[test]
+    fn test_comparison_jumpifnull_flag() {
+        // JUMPIFNULL (0x10): jump to P2 when either operand is NULL.
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r_null = b.alloc_reg();
+            let r_five = b.alloc_reg();
+            let r_out = b.alloc_reg();
+            b.emit_op(Opcode::Null, 0, r_null, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 5, r_five, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 0, r_out, 0, P4::None, 0);
+            let taken = b.emit_label();
+            // Eq with JUMPIFNULL (0x10): NULL = 5 should jump
+            b.emit_jump_to_label(Opcode::Eq, r_five, r_null, taken, P4::None, 0x10);
+            let done = b.emit_label();
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, done, P4::None, 0);
+            b.resolve_label(taken);
+            b.emit_op(Opcode::Integer, 1, r_out, 0, P4::None, 0);
+            b.resolve_label(done);
+            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        // With JUMPIFNULL, NULL = 5 should jump to P2
+        assert_eq!(rows[0], vec![SqliteValue::Integer(1)]);
+    }
+
+    #[test]
+    fn test_comparison_storep2_non_null() {
+        // STOREP2 (0x20): store boolean result in P2 instead of jumping.
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r_a = b.alloc_reg();
+            let r_b = b.alloc_reg();
+            let o_eq = b.alloc_reg();
+            let o_ne = b.alloc_reg();
+            let o_lt = b.alloc_reg();
+            b.emit_op(Opcode::Integer, 5, r_a, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 10, r_b, 0, P4::None, 0);
+            // Eq with STOREP2: 5 == 10 → store 0
+            b.emit_op(Opcode::Eq, r_b, o_eq, r_a, P4::None, 0x20);
+            // Ne with STOREP2: 5 != 10 → store 1
+            b.emit_op(Opcode::Ne, r_b, o_ne, r_a, P4::None, 0x20);
+            // Lt with STOREP2: 5 < 10 → store 1
+            b.emit_op(Opcode::Lt, r_b, o_lt, r_a, P4::None, 0x20);
+            b.emit_op(Opcode::ResultRow, o_eq, 3, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(
+            rows[0],
+            vec![
+                SqliteValue::Integer(0), // 5 == 10 → false
+                SqliteValue::Integer(1), // 5 != 10 → true
+                SqliteValue::Integer(1), // 5 < 10 → true
+            ]
+        );
+    }
+
+    #[test]
+    fn test_comparison_storep2_null_gives_null() {
+        // STOREP2 (0x20) with NULL operand: store NULL in P2.
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r_null = b.alloc_reg();
+            let r_five = b.alloc_reg();
+            let o1 = b.alloc_reg();
+            b.emit_op(Opcode::Null, 0, r_null, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 5, r_five, 0, P4::None, 0);
+            // Eq with STOREP2: NULL == 5 → store NULL
+            b.emit_op(Opcode::Eq, r_five, o1, r_null, P4::None, 0x20);
+            b.emit_op(Opcode::ResultRow, o1, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows[0], vec![SqliteValue::Null]);
+    }
+
     // ── Logic Edge Cases ───────────────────────────────────────────────
 
     #[test]
@@ -8779,6 +9185,54 @@ mod tests {
     }
 
     #[test]
+    fn test_cast_text_sci_notation_to_integer() {
+        // Regression: CAST('1.5e2abc' AS INTEGER) must yield 150, not 1.
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r = b.alloc_reg();
+            b.emit_op(Opcode::String8, 0, r, 0, P4::Str("1.5e2abc".to_owned()), 0);
+            b.emit_op(Opcode::Cast, r, 68, 0, P4::None, 0); // 'D' = INTEGER
+            b.emit_op(Opcode::ResultRow, r, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows[0], vec![SqliteValue::Integer(150)]);
+    }
+
+    #[test]
+    fn test_cast_text_prefix_to_real() {
+        // Regression: CAST('3.14abc' AS REAL) must yield 3.14, not 0.0.
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r = b.alloc_reg();
+            b.emit_op(Opcode::String8, 0, r, 0, P4::Str("3.14abc".to_owned()), 0);
+            b.emit_op(Opcode::Cast, r, 69, 0, P4::None, 0); // 'E' = REAL
+            b.emit_op(Opcode::ResultRow, r, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows[0], vec![SqliteValue::Float(3.14)]);
+    }
+
+    #[test]
+    fn test_cast_sci_notation_to_real() {
+        // CAST('2.5e3xyz' AS REAL) must yield 2500.0.
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r = b.alloc_reg();
+            b.emit_op(Opcode::String8, 0, r, 0, P4::Str("2.5e3xyz".to_owned()), 0);
+            b.emit_op(Opcode::Cast, r, 69, 0, P4::None, 0); // 'E' = REAL
+            b.emit_op(Opcode::ResultRow, r, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows[0], vec![SqliteValue::Float(2500.0)]);
+    }
+
+    #[test]
     fn test_must_be_int_accepts_integer() {
         let rows = run_program(|b| {
             let end = b.emit_label();
@@ -8910,7 +9364,15 @@ mod tests {
         b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
         let r = b.alloc_reg();
         b.emit_op(Opcode::String8, 0, r, 0, P4::Str("bad".to_owned()), 0);
-        b.emit_op(Opcode::TypeCheck, r, 1, 0, P4::Affinity("I".to_owned()), 0);
+        // Encoded TypeCheck P4: "I\ttbl\tcol_a"
+        b.emit_op(
+            Opcode::TypeCheck,
+            r,
+            1,
+            0,
+            P4::Str("I\ttbl\tcol_a".to_owned()),
+            0,
+        );
         b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
         b.resolve_label(end);
 
@@ -8921,11 +9383,15 @@ mod tests {
             .expect_err("typecheck should fail for TEXT into INTEGER STRICT slot");
         let err_text = err.to_string();
         assert!(
-            matches!(&err, FrankenError::Internal(msg) if msg.contains("SQLITE_CONSTRAINT_DATATYPE")
-                && msg.contains("STRICT type check failed")
-                && msg.to_ascii_lowercase().contains("cannot store")),
-            "unexpected strict typecheck error: {err_text}"
+            err_text.contains("cannot store"),
+            "error should mention 'cannot store': {err_text}"
         );
+        assert!(
+            err_text.contains("tbl.col_a"),
+            "error should mention column: {err_text}"
+        );
+        assert_eq!(err.error_code(), ErrorCode::Constraint);
+        assert_eq!(err.extended_error_code(), 3091); // SQLITE_CONSTRAINT_DATATYPE
     }
 
     // ── Miscellaneous Opcodes ──────────────────────────────────────────
@@ -8956,6 +9422,93 @@ mod tests {
         assert_eq!(rows[0], vec![SqliteValue::Integer(1)]); // 42 is true
         assert_eq!(rows[1], vec![SqliteValue::Integer(0)]); // 0 is false
         assert_eq!(rows[2], vec![SqliteValue::Integer(0)]); // NULL is not true
+    }
+
+    #[test]
+    fn test_is_true_is_false_semantics() {
+        // IS FALSE: P3=1, P4=1  →  NULL→0, truthy→0, falsy→1
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r_true = b.alloc_reg();
+            let r_false = b.alloc_reg();
+            let r_null = b.alloc_reg();
+            let o1 = b.alloc_reg();
+            let o2 = b.alloc_reg();
+            let o3 = b.alloc_reg();
+            b.emit_op(Opcode::Integer, 42, r_true, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 0, r_false, 0, P4::None, 0);
+            b.emit_op(Opcode::Null, 0, r_null, 0, P4::None, 0);
+            b.emit_op(Opcode::IsTrue, r_true, o1, 1, P4::Int(1), 0);
+            b.emit_op(Opcode::IsTrue, r_false, o2, 1, P4::Int(1), 0);
+            b.emit_op(Opcode::IsTrue, r_null, o3, 1, P4::Int(1), 0);
+            b.emit_op(Opcode::ResultRow, o1, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, o2, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, o3, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows[0], vec![SqliteValue::Integer(0)]); // 42 IS FALSE → 0
+        assert_eq!(rows[1], vec![SqliteValue::Integer(1)]); // 0 IS FALSE → 1
+        assert_eq!(rows[2], vec![SqliteValue::Integer(0)]); // NULL IS FALSE → 0
+    }
+
+    #[test]
+    fn test_is_true_is_not_true_semantics() {
+        // IS NOT TRUE: P3=0, P4=1  →  NULL→1, truthy→0, falsy→1
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r_true = b.alloc_reg();
+            let r_false = b.alloc_reg();
+            let r_null = b.alloc_reg();
+            let o1 = b.alloc_reg();
+            let o2 = b.alloc_reg();
+            let o3 = b.alloc_reg();
+            b.emit_op(Opcode::Integer, 42, r_true, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 0, r_false, 0, P4::None, 0);
+            b.emit_op(Opcode::Null, 0, r_null, 0, P4::None, 0);
+            b.emit_op(Opcode::IsTrue, r_true, o1, 0, P4::Int(1), 0);
+            b.emit_op(Opcode::IsTrue, r_false, o2, 0, P4::Int(1), 0);
+            b.emit_op(Opcode::IsTrue, r_null, o3, 0, P4::Int(1), 0);
+            b.emit_op(Opcode::ResultRow, o1, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, o2, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, o3, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows[0], vec![SqliteValue::Integer(0)]); // 42 IS NOT TRUE → 0
+        assert_eq!(rows[1], vec![SqliteValue::Integer(1)]); // 0 IS NOT TRUE → 1
+        assert_eq!(rows[2], vec![SqliteValue::Integer(1)]); // NULL IS NOT TRUE → 1
+    }
+
+    #[test]
+    fn test_is_true_is_not_false_semantics() {
+        // IS NOT FALSE: P3=1, P4=0  →  NULL→1, truthy→1, falsy→0
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r_true = b.alloc_reg();
+            let r_false = b.alloc_reg();
+            let r_null = b.alloc_reg();
+            let o1 = b.alloc_reg();
+            let o2 = b.alloc_reg();
+            let o3 = b.alloc_reg();
+            b.emit_op(Opcode::Integer, 42, r_true, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 0, r_false, 0, P4::None, 0);
+            b.emit_op(Opcode::Null, 0, r_null, 0, P4::None, 0);
+            b.emit_op(Opcode::IsTrue, r_true, o1, 1, P4::Int(0), 0);
+            b.emit_op(Opcode::IsTrue, r_false, o2, 1, P4::Int(0), 0);
+            b.emit_op(Opcode::IsTrue, r_null, o3, 1, P4::Int(0), 0);
+            b.emit_op(Opcode::ResultRow, o1, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, o2, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, o3, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows[0], vec![SqliteValue::Integer(1)]); // 42 IS NOT FALSE → 1
+        assert_eq!(rows[1], vec![SqliteValue::Integer(0)]); // 0 IS NOT FALSE → 0
+        assert_eq!(rows[2], vec![SqliteValue::Integer(1)]); // NULL IS NOT FALSE → 1
     }
 
     #[test]
@@ -11701,13 +12254,20 @@ mod tests {
 
     #[test]
     fn test_vupdate_stores_null_in_dest() {
+        // VUpdate P1=cursor, P2=n_args, P3=first_arg_reg, P5=dest_reg.
+        // When no vtab instance is registered for the cursor, VUpdate
+        // writes Null into dest_reg (P5).
         let rows = run_program(|b| {
             let end = b.emit_label();
             b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
-            let r_out = b.alloc_reg();
-            b.emit_op(Opcode::Integer, 77, r_out, 0, P4::None, 0);
-            b.emit_op(Opcode::VUpdate, 0, r_out, r_out, P4::None, 0);
-            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            let r_arg = b.alloc_reg();
+            let r_dest = b.alloc_reg();
+            b.emit_op(Opcode::Integer, 77, r_arg, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 99, r_dest, 0, P4::None, 0);
+            // P1=cursor 0, P2=1 arg, P3=r_arg, P5=r_dest as dest
+            #[allow(clippy::cast_possible_truncation)]
+            b.emit_op(Opcode::VUpdate, 0, 1, r_arg, P4::None, r_dest as u16);
+            b.emit_op(Opcode::ResultRow, r_dest, 1, 0, P4::None, 0);
             b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
             b.resolve_label(end);
         });

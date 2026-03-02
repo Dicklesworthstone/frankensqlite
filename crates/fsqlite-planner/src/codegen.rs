@@ -917,12 +917,14 @@ pub fn codegen_update(
     );
 
     // NotExists: if rowid doesn't exist, jump to done.
-    b.emit_jump_to_label(Opcode::NotExists, cursor, 0, done_label, P4::None, 0);
-    // Patch: NotExists needs the rowid in p3.
-    let ne_addr = b.current_addr() - 1;
-    if let Some(op) = b.op_at_mut(ne_addr) {
-        op.p3 = rowid_reg;
-    }
+    b.emit_jump_to_label(
+        Opcode::NotExists,
+        cursor,
+        rowid_reg,
+        done_label,
+        P4::None,
+        0,
+    );
 
     // Read ALL existing columns into registers.
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
@@ -1024,11 +1026,14 @@ pub fn codegen_delete(
     );
 
     // NotExists: if rowid not found, skip delete.
-    b.emit_jump_to_label(Opcode::NotExists, cursor, 0, done_label, P4::None, 0);
-    let ne_addr = b.current_addr() - 1;
-    if let Some(op) = b.op_at_mut(ne_addr) {
-        op.p3 = rowid_reg;
-    }
+    b.emit_jump_to_label(
+        Opcode::NotExists,
+        cursor,
+        rowid_reg,
+        done_label,
+        P4::None,
+        0,
+    );
 
     // Delete at cursor position.
     b.emit_op(

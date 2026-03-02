@@ -337,7 +337,7 @@ impl<F: VfsFile> WalFile<F> {
         let header_size = WAL_HEADER_SIZE as u64;
         let idx = index as u64;
         let frame_sz = self.frame_size() as u64;
-        header_size + idx * frame_sz
+        header_size.saturating_add(idx.saturating_mul(frame_sz))
     }
 
     /// Number of valid frames in the WAL.
@@ -471,7 +471,7 @@ impl<F: VfsFile> WalFile<F> {
             let header_size = WAL_HEADER_SIZE as u64;
             let idx = frame_index as u64;
             let frame_sz = frame_size as u64;
-            let file_offset = header_size + idx * frame_sz;
+            let file_offset = header_size.saturating_add(idx.saturating_mul(frame_sz));
 
             let bytes_read = file.read(cx, &mut frame_buf, file_offset)?;
             if bytes_read < frame_size {

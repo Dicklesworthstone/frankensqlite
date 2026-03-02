@@ -905,7 +905,15 @@ impl<'a> Resolver<'a> {
         match col {
             ResultColumn::Star => {
                 // SELECT * is valid if there's at least one table in scope.
-                if scope.alias_count() == 0 && scope.parent.is_none() {
+                // Suppress this error if we already reported an UnresolvedTable
+                // error — the missing star target is a cascading consequence.
+                if scope.alias_count() == 0
+                    && scope.parent.is_none()
+                    && !self
+                        .errors
+                        .iter()
+                        .any(|e| matches!(e.kind, SemanticErrorKind::UnresolvedTable { .. }))
+                {
                     self.push_error(SemanticErrorKind::NoTablesSpecifiedForStar);
                 }
             }

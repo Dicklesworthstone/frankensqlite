@@ -251,7 +251,7 @@ fn posix_lock(file: &impl AsFd, lock_type: impl Into<i32>, start: u64, len: u64)
     let lock_type_i32: i32 = lock_type.into();
     #[allow(clippy::cast_possible_truncation)]
     let lock_type_short = lock_type_i32 as libc::c_short;
-    let whence: libc::c_short = 0; // SEEK_SET
+    let whence: libc::c_short = libc::SEEK_SET as libc::c_short;
     let flock = libc::flock {
         l_type: lock_type_short,
         l_whence: whence,
@@ -290,7 +290,7 @@ fn posix_getlk(
     let lock_type_i32: i32 = lock_type.into();
     #[allow(clippy::cast_possible_truncation)]
     let lock_type_short = lock_type_i32 as libc::c_short;
-    let whence: libc::c_short = 0; // SEEK_SET
+    let whence: libc::c_short = libc::SEEK_SET as libc::c_short;
     let mut flock = libc::flock {
         l_type: lock_type_short,
         l_whence: whence,
@@ -819,17 +819,37 @@ impl UnixFile {
                 let lock_byte = sqlite_shm_dms_lock_byte();
 
                 if slot_state.exclusive_owner == Some(self.shm_owner_id) {
-                    slot_state.exclusive_owner = None;
-                    if slot_state.shared_holders.is_empty() {
-                        if let Err(err) = posix_unlock(&*shm_file, lock_byte, 1) {
-                            if first_error.is_none() {
-                                first_error = Some(err);
+                    // Perform OS-level lock operation first; only clear
+                    // exclusive_owner if it succeeds.
+                    let os_ok = if slot_state.shared_holders.is_empty() {
+                        match posix_unlock(&*shm_file, lock_byte, 1) {
+                            Ok(()) => true,
+                            Err(err) => {
+                                if first_error.is_none() {
+                                    first_error = Some(err);
+                                }
+                                false
                             }
                         }
-                    } else if let Err(err) = posix_lock(&*shm_file, libc::F_RDLCK, lock_byte, 1) {
-                        if first_error.is_none() {
-                            first_error = Some(err);
+                    } else {
+                        match posix_lock(&*shm_file, libc::F_RDLCK, lock_byte, 1) {
+                            Ok(true) => true,
+                            Ok(false) => {
+                                if first_error.is_none() {
+                                    first_error = Some(FrankenError::Busy);
+                                }
+                                false
+                            }
+                            Err(err) => {
+                                if first_error.is_none() {
+                                    first_error = Some(err);
+                                }
+                                false
+                            }
                         }
+                    };
+                    if os_ok {
+                        slot_state.exclusive_owner = None;
                     }
                 }
 
@@ -1080,7 +1100,6 @@ impl UnixFile {
             return Err(FrankenError::Busy);
         }
 
-        slot_state.shared_holders.remove(&self.shm_owner_id);
         if !posix_lock(&*info.file, libc::F_WRLCK, lock_byte, 1)? {
             Self::log_lock_conflict(
                 slot,
@@ -1091,6 +1110,8 @@ impl UnixFile {
             return Err(FrankenError::Busy);
         }
 
+        // Only update in-memory state after the OS-level lock succeeds.
+        slot_state.shared_holders.remove(&self.shm_owner_id);
         slot_state.exclusive_owner = Some(self.shm_owner_id);
         lock_debug!(
             slot,
@@ -1174,7 +1195,8 @@ impl UnixFile {
             });
         }
 
-        slot_state.exclusive_owner = None;
+        // Perform OS-level lock operation BEFORE updating in-memory state,
+        // so a failure doesn't leave state inconsistent.
         if slot_state.shared_holders.is_empty() {
             posix_unlock(&*info.file, lock_byte, 1)?;
         } else if !posix_lock(&*info.file, libc::F_RDLCK, lock_byte, 1)? {
@@ -1186,6 +1208,7 @@ impl UnixFile {
             );
             return Err(FrankenError::Busy);
         }
+        slot_state.exclusive_owner = None;
 
         lock_debug!(
             slot,

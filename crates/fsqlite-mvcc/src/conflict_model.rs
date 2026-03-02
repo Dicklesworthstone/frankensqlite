@@ -405,7 +405,7 @@ impl AmsSketch {
             .iter()
             .map(|&z| {
                 let abs = z.unsigned_abs();
-                abs * abs
+                abs.saturating_mul(abs)
             })
             .collect();
         squares.sort_unstable();

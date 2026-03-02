@@ -360,7 +360,7 @@ pub enum JsonArrow {
 ///
 /// Every variant carries a [`Span`] for source-location tracking. The Expr
 /// enum covers all expression forms in the SQLite SQL dialect.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum Expr {
     /// A literal constant.
     Literal(Literal, Span),
@@ -506,6 +506,200 @@ impl Expr {
             | Self::IsNull { span, .. }
             | Self::Raise { span, .. }
             | Self::JsonAccess { span, .. } => *span,
+        }
+    }
+}
+
+/// Span-ignoring structural equality for expressions.
+///
+/// Two expressions are equal if they have the same structure and all semantic
+/// fields match, regardless of their source-location [`Span`] values. This is
+/// essential for partial-index predicate matching and expression-index lookup,
+/// where the same logical expression is parsed from different source texts.
+impl PartialEq for Expr {
+    #[allow(clippy::too_many_lines)]
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Literal(a, _), Self::Literal(b, _)) => a == b,
+            (Self::Column(a, _), Self::Column(b, _)) => a == b,
+            (
+                Self::BinaryOp {
+                    left: l1,
+                    op: o1,
+                    right: r1,
+                    ..
+                },
+                Self::BinaryOp {
+                    left: l2,
+                    op: o2,
+                    right: r2,
+                    ..
+                },
+            ) => o1 == o2 && l1 == l2 && r1 == r2,
+            (
+                Self::UnaryOp {
+                    op: o1, expr: e1, ..
+                },
+                Self::UnaryOp {
+                    op: o2, expr: e2, ..
+                },
+            ) => o1 == o2 && e1 == e2,
+            (
+                Self::Between {
+                    expr: e1,
+                    low: l1,
+                    high: h1,
+                    not: n1,
+                    ..
+                },
+                Self::Between {
+                    expr: e2,
+                    low: l2,
+                    high: h2,
+                    not: n2,
+                    ..
+                },
+            ) => n1 == n2 && e1 == e2 && l1 == l2 && h1 == h2,
+            (
+                Self::In {
+                    expr: e1,
+                    set: s1,
+                    not: n1,
+                    ..
+                },
+                Self::In {
+                    expr: e2,
+                    set: s2,
+                    not: n2,
+                    ..
+                },
+            ) => n1 == n2 && e1 == e2 && s1 == s2,
+            (
+                Self::Like {
+                    expr: e1,
+                    pattern: p1,
+                    escape: esc1,
+                    op: o1,
+                    not: n1,
+                    ..
+                },
+                Self::Like {
+                    expr: e2,
+                    pattern: p2,
+                    escape: esc2,
+                    op: o2,
+                    not: n2,
+                    ..
+                },
+            ) => o1 == o2 && n1 == n2 && e1 == e2 && p1 == p2 && esc1 == esc2,
+            (
+                Self::Case {
+                    operand: o1,
+                    whens: w1,
+                    else_expr: e1,
+                    ..
+                },
+                Self::Case {
+                    operand: o2,
+                    whens: w2,
+                    else_expr: e2,
+                    ..
+                },
+            ) => o1 == o2 && w1 == w2 && e1 == e2,
+            (
+                Self::Cast {
+                    expr: e1,
+                    type_name: t1,
+                    ..
+                },
+                Self::Cast {
+                    expr: e2,
+                    type_name: t2,
+                    ..
+                },
+            ) => e1 == e2 && t1 == t2,
+            (
+                Self::Exists {
+                    subquery: s1,
+                    not: n1,
+                    ..
+                },
+                Self::Exists {
+                    subquery: s2,
+                    not: n2,
+                    ..
+                },
+            ) => n1 == n2 && s1 == s2,
+            (Self::Subquery(s1, _), Self::Subquery(s2, _)) => s1 == s2,
+            (
+                Self::FunctionCall {
+                    name: n1,
+                    args: a1,
+                    distinct: d1,
+                    order_by: ob1,
+                    filter: f1,
+                    over: ov1,
+                    ..
+                },
+                Self::FunctionCall {
+                    name: n2,
+                    args: a2,
+                    distinct: d2,
+                    order_by: ob2,
+                    filter: f2,
+                    over: ov2,
+                    ..
+                },
+            ) => n1 == n2 && a1 == a2 && d1 == d2 && ob1 == ob2 && f1 == f2 && ov1 == ov2,
+            (
+                Self::Collate {
+                    expr: e1,
+                    collation: c1,
+                    ..
+                },
+                Self::Collate {
+                    expr: e2,
+                    collation: c2,
+                    ..
+                },
+            ) => e1 == e2 && c1 == c2,
+            (
+                Self::IsNull {
+                    expr: e1, not: n1, ..
+                },
+                Self::IsNull {
+                    expr: e2, not: n2, ..
+                },
+            ) => n1 == n2 && e1 == e2,
+            (
+                Self::Raise {
+                    action: a1,
+                    message: m1,
+                    ..
+                },
+                Self::Raise {
+                    action: a2,
+                    message: m2,
+                    ..
+                },
+            ) => a1 == a2 && m1 == m2,
+            (
+                Self::JsonAccess {
+                    expr: e1,
+                    path: p1,
+                    arrow: a1,
+                    ..
+                },
+                Self::JsonAccess {
+                    expr: e2,
+                    path: p2,
+                    arrow: a2,
+                    ..
+                },
+            ) => a1 == a2 && e1 == e2 && p1 == p2,
+            (Self::RowValue(v1, _), Self::RowValue(v2, _)) => v1 == v2,
+            (Self::Placeholder(p1, _), Self::Placeholder(p2, _)) => p1 == p2,
+            _ => false,
         }
     }
 }
@@ -2993,5 +3187,33 @@ mod tests {
         };
         assert_ne!(star, table_star);
         assert!(matches!(expr, ResultColumn::Expr { alias: Some(_), .. }));
+    }
+
+    #[test]
+    fn test_expr_eq_ignores_span() {
+        // Two identical literal expressions at different source positions
+        // must compare equal (spans are ignored).
+        let a = Expr::Literal(Literal::Integer(42), Span::new(0, 2));
+        let b = Expr::Literal(Literal::Integer(42), Span::new(100, 102));
+        assert_eq!(a, b);
+
+        // Same structure, different spans, nested binary op.
+        let c = Expr::BinaryOp {
+            left: Box::new(Expr::Column(ColumnRef::bare("x"), Span::new(0, 1))),
+            op: BinaryOp::Gt,
+            right: Box::new(Expr::Literal(Literal::Integer(0), Span::new(4, 5))),
+            span: Span::new(0, 5),
+        };
+        let d = Expr::BinaryOp {
+            left: Box::new(Expr::Column(ColumnRef::bare("x"), Span::new(50, 51))),
+            op: BinaryOp::Gt,
+            right: Box::new(Expr::Literal(Literal::Integer(0), Span::new(55, 56))),
+            span: Span::new(50, 56),
+        };
+        assert_eq!(c, d);
+
+        // Different values must still be unequal.
+        let e = Expr::Literal(Literal::Integer(99), Span::ZERO);
+        assert_ne!(a, e);
     }
 }

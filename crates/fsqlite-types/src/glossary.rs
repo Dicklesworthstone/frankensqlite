@@ -697,7 +697,9 @@ impl Region {
 /// Canonical key space for SSI rw-antidependency tracking. Always valid to
 /// fall back to `Page(pgno)` — finer keys reduce false positives but never
 /// compromise correctness.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub enum WitnessKey {
     /// Coarse witness: entire page.
     Page(PageNumber),

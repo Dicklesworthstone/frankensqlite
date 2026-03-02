@@ -542,6 +542,7 @@ pub fn run_sqlite3_oracle(
                 || kw.eq_ignore_ascii_case("PRAGMA")
                 || kw.eq_ignore_ascii_case("EXPLAIN")
                 || kw.eq_ignore_ascii_case("VALUES")
+                || kw.eq_ignore_ascii_case("WITH")
         });
 
         // Emit start sentinel (one script line).
@@ -1690,7 +1691,7 @@ SELECT a FROM t1 ORDER BY a
                 .reports
                 .iter()
                 .filter(|r| !r.passed)
-                .flat_map(|r| r.diffs.iter())
+                .flat_map(|r| r.diffs.iter().map(|d| format!("[{}] {d}", r.fixture_id)))
                 .collect::<Vec<_>>()
         );
     }

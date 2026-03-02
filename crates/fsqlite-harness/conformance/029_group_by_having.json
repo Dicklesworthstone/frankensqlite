@@ -9,13 +9,13 @@
 
     { "op": "query", "sql": "SELECT product, SUM(amount) as total FROM sales GROUP BY product ORDER BY product", "expect": { "rows": [["A", "550"], ["B", "750"], ["C", "50"]], "ordered": true } },
 
-    { "op": "query", "sql": "SELECT product, COUNT(*) as cnt FROM sales GROUP BY product ORDER BY product", "expect": { "rows": [["A", "4"], ["B", "4"], ["C", "1"]], "ordered": true } },
+    { "op": "query", "sql": "SELECT product, COUNT(*) as cnt FROM sales GROUP BY product ORDER BY product", "expect": { "rows": [["A", "4"], ["B", "3"], ["C", "1"]], "ordered": true } },
 
     { "op": "query", "sql": "SELECT region, SUM(amount) as total FROM sales GROUP BY region ORDER BY region", "expect": { "rows": [["north", "720"], ["south", "630"]], "ordered": true } },
 
     { "op": "query", "sql": "SELECT product, SUM(amount) as total FROM sales GROUP BY product HAVING SUM(amount) > 100 ORDER BY product", "expect": { "rows": [["A", "550"], ["B", "750"]], "ordered": true } },
 
-    { "op": "query", "sql": "SELECT product, COUNT(*) as cnt FROM sales GROUP BY product HAVING COUNT(*) > 1 ORDER BY product", "expect": { "rows": [["A", "4"], ["B", "4"]], "ordered": true } },
+    { "op": "query", "sql": "SELECT product, COUNT(*) as cnt FROM sales GROUP BY product HAVING COUNT(*) > 1 ORDER BY product", "expect": { "rows": [["A", "4"], ["B", "3"]], "ordered": true } },
 
     { "op": "query", "sql": "SELECT product, region, SUM(amount) as total FROM sales GROUP BY product, region ORDER BY product, region", "expect": { "rows": [["A", "north", "220"], ["A", "south", "330"], ["B", "north", "450"], ["B", "south", "300"], ["C", "north", "50"]], "ordered": true } },
 

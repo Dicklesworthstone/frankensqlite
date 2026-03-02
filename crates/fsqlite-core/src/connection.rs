@@ -9,6 +9,7 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::str::FromStr;
@@ -1134,6 +1135,14 @@ pub struct Connection {
     /// Each entry is created by `execute_create_virtual_table` and registered
     /// with the VDBE engine before program execution.
     vtab_instances: RefCell<HashMap<String, Box<dyn ErasedVtabInstance>>>,
+    // ── Parse cache (br-legjy.7.3) ──────────────────────────────────────────
+    /// LRU-bounded cache of parsed SQL ASTs keyed by SQL text hash.
+    /// Avoids re-parsing the same SQL string on repeated query/execute calls.
+    /// Invalidated on DDL operations (schema cookie increment).
+    parse_cache: RefCell<HashMap<u64, Statement>>,
+    /// Schema cookie value at time of last cache fill.  When schema_cookie
+    /// changes (DDL executed), the entire cache is invalidated.
+    parse_cache_cookie: RefCell<u32>,
 }
 
 impl std::fmt::Debug for Connection {
@@ -1235,6 +1244,9 @@ impl Connection {
             // Virtual table module registry (bd-196x4)
             vtab_modules: RefCell::new(HashMap::new()),
             vtab_instances: RefCell::new(HashMap::new()),
+            // Parse cache (br-legjy.7.3)
+            parse_cache: RefCell::new(HashMap::with_capacity(64)),
+            parse_cache_cookie: RefCell::new(0),
         };
         // Reset cumulative total_changes counter for this new connection.
         reset_total_changes();
@@ -1641,7 +1653,7 @@ impl Connection {
             );
             record_trace_span_created();
             let _parse_guard = parse_span.enter();
-            parse_single_statement(sql)?
+            self.cached_parse_single(sql)?
         };
         let statement = {
             let parse_span = tracing::span!(
@@ -1677,7 +1689,7 @@ impl Connection {
             );
             record_trace_span_created();
             let _parse_guard = parse_span.enter();
-            parse_statements(sql)?
+            self.cached_parse_multi(sql)?
         };
         let mut rows = Vec::new();
         for statement in statements {
@@ -1698,7 +1710,7 @@ impl Connection {
             );
             record_trace_span_created();
             let _parse_guard = parse_span.enter();
-            parse_single_statement(sql)?
+            self.cached_parse_single(sql)?
         };
         self.execute_statement(statement, Some(params))
     }
@@ -1729,7 +1741,7 @@ impl Connection {
             );
             record_trace_span_created();
             let _parse_guard = parse_span.enter();
-            parse_statements(sql)?
+            self.cached_parse_multi(sql)?
         };
         let mut last_count = 0;
         for statement in statements {
@@ -1759,7 +1771,7 @@ impl Connection {
             );
             record_trace_span_created();
             let _parse_guard = parse_span.enter();
-            parse_single_statement(sql)?
+            self.cached_parse_single(sql)?
         };
         let is_dml = matches!(
             &statement,
@@ -1771,6 +1783,69 @@ impl Connection {
         } else {
             rows.len()
         })
+    }
+
+    // ── Parse cache helpers (br-legjy.7.3) ─────────────────────────────
+
+    /// Compute a 64-bit hash of an SQL string for parse cache lookup.
+    fn sql_hash(sql: &str) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        sql.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// Return a cached parsed single statement, or parse fresh and cache it.
+    /// The cache is invalidated whenever the schema cookie changes (DDL).
+    fn cached_parse_single(&self, sql: &str) -> Result<Statement> {
+        let current_cookie = *self.schema_cookie.borrow();
+        // Invalidate cache if schema changed since last fill.
+        {
+            let cached_cookie = *self.parse_cache_cookie.borrow();
+            if cached_cookie != current_cookie {
+                self.parse_cache.borrow_mut().clear();
+                *self.parse_cache_cookie.borrow_mut() = current_cookie;
+            }
+        }
+        let key = Self::sql_hash(sql);
+        if let Some(cached) = self.parse_cache.borrow().get(&key) {
+            return Ok(cached.clone());
+        }
+        let stmt = parse_single_statement(sql)?;
+        // Bound cache size to avoid unbounded growth.
+        let mut cache = self.parse_cache.borrow_mut();
+        if cache.len() >= 256 {
+            cache.clear();
+        }
+        cache.insert(key, stmt.clone());
+        Ok(stmt)
+    }
+
+    /// Return cached parsed multi-statement list, or parse fresh.
+    /// Multi-statement SQL is less common and cache hit rate is lower,
+    /// so we only cache single-statement SQL in this path.
+    fn cached_parse_multi(&self, sql: &str) -> Result<Vec<Statement>> {
+        // For single-statement SQL, use the cache.
+        let stmts = parse_statements(sql)?;
+        if stmts.len() == 1 {
+            // Re-check cache for single statements.
+            let current_cookie = *self.schema_cookie.borrow();
+            {
+                let cached_cookie = *self.parse_cache_cookie.borrow();
+                if cached_cookie != current_cookie {
+                    self.parse_cache.borrow_mut().clear();
+                    *self.parse_cache_cookie.borrow_mut() = current_cookie;
+                }
+            }
+            let key = Self::sql_hash(sql);
+            let mut cache = self.parse_cache.borrow_mut();
+            if !cache.contains_key(&key) {
+                if cache.len() >= 256 {
+                    cache.clear();
+                }
+                cache.insert(key, stmts[0].clone());
+            }
+        }
+        Ok(stmts)
     }
 
     // ── Internal helpers ──────────────────────────────────────────────────
@@ -4348,6 +4423,7 @@ impl Connection {
                     strict_type: None,
                     generated_expr: None,
                     generated_stored: None,
+                    collation: None,
                 },
                 ColumnInfo {
                     name: "seq".to_owned(),
@@ -4360,11 +4436,13 @@ impl Connection {
                     strict_type: None,
                     generated_expr: None,
                     generated_stored: None,
+                    collation: None,
                 },
             ],
             indexes: Vec::new(),
             strict: false,
             foreign_keys: Vec::new(),
+            check_constraints: Vec::new(),
         });
         self.insert_sqlite_master_row(
             "table",
@@ -4785,6 +4863,13 @@ impl Connection {
                                 _ => None,
                             })
                             .unwrap_or((None, None));
+                        let collation = col.constraints.iter().find_map(|c| {
+                            if let ColumnConstraintKind::Collate(ref name) = c.kind {
+                                Some(name.clone())
+                            } else {
+                                None
+                            }
+                        });
                         Ok(ColumnInfo {
                             name: col.name.clone(),
                             affinity,
@@ -4796,6 +4881,7 @@ impl Connection {
                             strict_type,
                             generated_expr,
                             generated_stored,
+                            collation,
                         })
                     })
                     .collect::<Result<_>>()?;
@@ -4947,6 +5033,24 @@ impl Connection {
                     }
                 }
 
+                // Extract CHECK constraints from column-level and
+                // table-level CHECK clauses.
+                let mut check_defs = Vec::new();
+                for col in columns {
+                    for c in &col.constraints {
+                        if let ColumnConstraintKind::Check(ref expr) = c.kind {
+                            check_defs.push(format!("{expr}"));
+                        }
+                    }
+                }
+                if let CreateTableBody::Columns { constraints, .. } = &create.body {
+                    for tc in constraints {
+                        if let TableConstraintKind::Check(ref expr) = tc.kind {
+                            check_defs.push(format!("{expr}"));
+                        }
+                    }
+                }
+
                 let table_schema = TableSchema {
                     name: table_name,
                     root_page,
@@ -4954,6 +5058,7 @@ impl Connection {
                     indexes: implicit_indexes,
                     strict: create.strict,
                     foreign_keys: fk_defs,
+                    check_constraints: check_defs,
                 };
                 let create_sql = render_create_table_sql(&table_schema, is_autoincrement);
                 let rp = table_schema.root_page;
@@ -5027,6 +5132,7 @@ impl Connection {
                             strict_type: None,
                             generated_expr: None,
                             generated_stored: None,
+                            collation: None,
                         }
                     })
                     .collect();
@@ -5039,6 +5145,7 @@ impl Connection {
                     indexes: Vec::new(),
                     strict: false,
                     foreign_keys: Vec::new(),
+                    check_constraints: Vec::new(),
                 };
                 let create_sql = crate::compat_persist::build_create_table_sql(&table_schema);
                 let rp = table_schema.root_page;
@@ -5110,6 +5217,7 @@ impl Connection {
                 indexes: Vec::new(),
                 strict: false,
                 foreign_keys: Vec::new(),
+                check_constraints: Vec::new(),
             });
             self.vtab_instances
                 .borrow_mut()
@@ -5147,6 +5255,7 @@ impl Connection {
             indexes: Vec::new(),
             strict: false,
             foreign_keys: Vec::new(),
+            check_constraints: Vec::new(),
         });
 
         self.insert_sqlite_master_row(
@@ -5433,6 +5542,7 @@ impl Connection {
                     strict_type,
                     generated_expr: None,
                     generated_stored: None,
+                    collation: None,
                 });
                 table.clone()
             }
@@ -5662,6 +5772,7 @@ impl Connection {
             table_name,
             stmt.unique,
             &create_sql_terms,
+            stmt.where_clause.as_ref(),
         );
         self.insert_sqlite_master_row("index", &index_name, table_name, root_page, &create_sql)?;
 
@@ -6315,6 +6426,7 @@ impl Connection {
                             strict_type: None,
                             generated_expr: None,
                             generated_stored: None,
+                            collation: None,
                         })
                         .collect()
                 } else {
@@ -6331,6 +6443,7 @@ impl Connection {
                             strict_type: None,
                             generated_expr: None,
                             generated_stored: None,
+                            collation: None,
                         })
                         .collect()
                 };
@@ -6343,6 +6456,7 @@ impl Connection {
                     indexes: Vec::new(),
                     strict: false,
                     foreign_keys: Vec::new(),
+                    check_constraints: Vec::new(),
                 });
                 materialized.push(view.name.clone());
 
@@ -6442,6 +6556,7 @@ impl Connection {
                     indexes: Vec::new(),
                     strict: false,
                     foreign_keys: Vec::new(),
+                    check_constraints: Vec::new(),
                 });
 
                 if let Some(table) = self.db.borrow_mut().get_table_mut(root_page) {
@@ -9541,6 +9656,7 @@ impl Connection {
                             strict_type: None,
                             generated_expr: None,
                             generated_stored: None,
+                            collation: None,
                         })
                         .collect();
                     let num_columns = col_infos.len();
@@ -9552,6 +9668,7 @@ impl Connection {
                         indexes: Vec::new(),
                         strict: false,
                         foreign_keys: Vec::new(),
+                        check_constraints: Vec::new(),
                     });
                     temp_names.push(cte_name.clone());
                     for (i, row) in cte_rows.iter().enumerate() {
@@ -9622,6 +9739,7 @@ impl Connection {
                 strict_type: None,
                 generated_expr: None,
                 generated_stored: None,
+                collation: None,
             })
             .collect();
         let num_columns = col_infos.len();
@@ -9633,6 +9751,7 @@ impl Connection {
             indexes: Vec::new(),
             strict: false,
             foreign_keys: Vec::new(),
+            check_constraints: Vec::new(),
         });
         temp_names.push(cte_name.clone());
 
@@ -10324,6 +10443,8 @@ impl Connection {
     fn increment_schema_cookie(&self) {
         let mut cookie = self.schema_cookie.borrow_mut();
         *cookie = cookie.wrapping_add(1);
+        // Invalidate parse cache — schema change may affect name resolution.
+        self.parse_cache.borrow_mut().clear();
     }
 
     /// Increment the file change counter.  Must be called for every
@@ -10626,6 +10747,8 @@ impl Connection {
                 }
             }
 
+            let check_defs = crate::compat_persist::extract_check_constraints_from_sql(&create_sql);
+
             new_schema.push(TableSchema {
                 name: name.clone(),
                 root_page: real_root_page,
@@ -10633,6 +10756,7 @@ impl Connection {
                 indexes: Vec::new(),
                 strict: crate::compat_persist::is_strict_table_sql(&create_sql),
                 foreign_keys: fk_defs,
+                check_constraints: check_defs,
             });
 
             // Read all rows from this table's B-tree.
@@ -11116,6 +11240,7 @@ fn parse_virtual_table_column_infos(args: &[String]) -> Vec<ColumnInfo> {
             strict_type: None,
             generated_expr: None,
             generated_stored: None,
+            collation: None,
         });
     }
 
@@ -11131,6 +11256,7 @@ fn parse_virtual_table_column_infos(args: &[String]) -> Vec<ColumnInfo> {
             strict_type: None,
             generated_expr: None,
             generated_stored: None,
+            collation: None,
         });
     }
 
@@ -11185,6 +11311,7 @@ fn sqlite_master_column_infos() -> Vec<ColumnInfo> {
             strict_type: None,
             generated_expr: None,
             generated_stored: None,
+            collation: None,
         },
         ColumnInfo {
             name: "name".to_owned(),
@@ -11197,6 +11324,7 @@ fn sqlite_master_column_infos() -> Vec<ColumnInfo> {
             strict_type: None,
             generated_expr: None,
             generated_stored: None,
+            collation: None,
         },
         ColumnInfo {
             name: "tbl_name".to_owned(),
@@ -11209,6 +11337,7 @@ fn sqlite_master_column_infos() -> Vec<ColumnInfo> {
             strict_type: None,
             generated_expr: None,
             generated_stored: None,
+            collation: None,
         },
         ColumnInfo {
             name: "rootpage".to_owned(),
@@ -11221,6 +11350,7 @@ fn sqlite_master_column_infos() -> Vec<ColumnInfo> {
             strict_type: None,
             generated_expr: None,
             generated_stored: None,
+            collation: None,
         },
         ColumnInfo {
             name: "sql".to_owned(),
@@ -11233,6 +11363,7 @@ fn sqlite_master_column_infos() -> Vec<ColumnInfo> {
             strict_type: None,
             generated_expr: None,
             generated_stored: None,
+            collation: None,
         },
     ]
 }
@@ -11263,6 +11394,10 @@ fn render_create_table_sql(table: &TableSchema, is_autoincrement: bool) -> Strin
                 part.push_str(" DEFAULT ");
                 part.push_str(default);
             }
+            if let Some(ref collation) = col.collation {
+                part.push_str(" COLLATE ");
+                part.push_str(collation);
+            }
             if let Some(ref gen_expr) = col.generated_expr {
                 part.push_str(" GENERATED ALWAYS AS (");
                 part.push_str(gen_expr);
@@ -11277,11 +11412,70 @@ fn render_create_table_sql(table: &TableSchema, is_autoincrement: bool) -> Strin
         })
         .collect::<Vec<_>>()
         .join(", ");
+    // Append table-level FOREIGN KEY constraints so they survive
+    // round-tripping through sqlite_master.
+    let mut fk_clauses = String::new();
+    for fk in &table.foreign_keys {
+        use std::fmt::Write;
+        let child_cols: Vec<&str> = fk
+            .child_columns
+            .iter()
+            .filter_map(|&idx| table.columns.get(idx).map(|c| c.name.as_str()))
+            .collect();
+        if child_cols.is_empty() {
+            continue;
+        }
+        write!(
+            fk_clauses,
+            ", FOREIGN KEY({}) REFERENCES \"{}\"",
+            child_cols
+                .iter()
+                .map(|c| format!("\"{}\"", c))
+                .collect::<Vec<_>>()
+                .join(", "),
+            fk.parent_table,
+        )
+        .ok();
+        if !fk.parent_columns.is_empty() {
+            write!(
+                fk_clauses,
+                "({})",
+                fk.parent_columns
+                    .iter()
+                    .map(|c| format!("\"{}\"", c))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+            .ok();
+        }
+        if fk.on_delete != FkActionType::NoAction {
+            write!(fk_clauses, " ON DELETE {}", fk_action_sql(fk.on_delete)).ok();
+        }
+        if fk.on_update != FkActionType::NoAction {
+            write!(fk_clauses, " ON UPDATE {}", fk_action_sql(fk.on_update)).ok();
+        }
+    }
+    // Append table-level CHECK constraints.
+    let mut check_clauses = String::new();
+    for check_expr in &table.check_constraints {
+        use std::fmt::Write;
+        write!(check_clauses, ", CHECK({check_expr})").ok();
+    }
     let strict_suffix = if table.strict { " STRICT" } else { "" };
     format!(
-        "CREATE TABLE \"{}\" ({column_defs}){strict_suffix}",
+        "CREATE TABLE \"{}\" ({column_defs}{fk_clauses}{check_clauses}){strict_suffix}",
         table.name
     )
+}
+
+fn fk_action_sql(action: FkActionType) -> &'static str {
+    match action {
+        FkActionType::NoAction => "NO ACTION",
+        FkActionType::Restrict => "RESTRICT",
+        FkActionType::SetNull => "SET NULL",
+        FkActionType::SetDefault => "SET DEFAULT",
+        FkActionType::Cascade => "CASCADE",
+    }
 }
 
 fn render_create_index_sql(index: &IndexSchema, table_name: &str) -> String {
@@ -11868,6 +12062,18 @@ fn exprs_match(a: &Expr, b: &Expr) -> bool {
                 expr: eb, not: nb, ..
             },
         ) => na == nb && exprs_match(ea, eb),
+        (
+            Expr::Cast {
+                expr: ea,
+                type_name: ta,
+                ..
+            },
+            Expr::Cast {
+                expr: eb,
+                type_name: tb,
+                ..
+            },
+        ) => ta.name.eq_ignore_ascii_case(&tb.name) && exprs_match(ea, eb),
         _ => false,
     }
 }
@@ -32685,5 +32891,109 @@ mod pager_routing_tests {
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values()[0], SqliteValue::Text("Alice".to_owned()));
+    }
+
+    // ── Parse cache regression tests (br-legjy.7.3) ────────────────────
+
+    #[test]
+    fn test_parse_cache_repeated_select_returns_same_results() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE pc (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO pc VALUES (1, 'a'), (2, 'b'), (3, 'c');")
+            .unwrap();
+
+        let sql = "SELECT val FROM pc WHERE id = ?1";
+        let params = [SqliteValue::Integer(2)];
+
+        // First call: populates cache.
+        let rows1 = conn.query_with_params(sql, &params).unwrap();
+        // Second call: should use cached parse.
+        let rows2 = conn.query_with_params(sql, &params).unwrap();
+
+        assert_eq!(rows1.len(), 1);
+        assert_eq!(rows2.len(), 1);
+        assert_eq!(rows1[0].values(), rows2[0].values());
+        assert_eq!(rows1[0].values()[0], SqliteValue::Text("b".to_owned()));
+    }
+
+    #[test]
+    fn test_parse_cache_invalidated_by_ddl() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE pc2 (id INTEGER PRIMARY KEY, x TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO pc2 VALUES (1, 'before');").unwrap();
+
+        // Populate cache.
+        let rows = conn.query("SELECT x FROM pc2 WHERE id = 1").unwrap();
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("before".to_owned()));
+
+        // DDL invalidates cache (schema cookie increment).
+        conn.execute("ALTER TABLE pc2 ADD COLUMN y TEXT DEFAULT 'new';")
+            .unwrap();
+
+        // After DDL, re-parsed query must still work.
+        let rows = conn.query("SELECT x FROM pc2 WHERE id = 1").unwrap();
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("before".to_owned()));
+    }
+
+    #[test]
+    fn test_parse_cache_execute_with_params_repeated_dml() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE pc3 (id INTEGER PRIMARY KEY, n INTEGER);")
+            .unwrap();
+
+        let sql = "INSERT INTO pc3 VALUES (?1, ?2)";
+        // Insert using same SQL (cached parse).
+        conn.execute_with_params(sql, &[SqliteValue::Integer(1), SqliteValue::Integer(10)])
+            .unwrap();
+        conn.execute_with_params(sql, &[SqliteValue::Integer(2), SqliteValue::Integer(20)])
+            .unwrap();
+        conn.execute_with_params(sql, &[SqliteValue::Integer(3), SqliteValue::Integer(30)])
+            .unwrap();
+
+        let rows = conn.query("SELECT n FROM pc3 ORDER BY id").unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(10));
+        assert_eq!(rows[1].values()[0], SqliteValue::Integer(20));
+        assert_eq!(rows[2].values()[0], SqliteValue::Integer(30));
+    }
+
+    #[test]
+    fn test_parse_cache_different_queries_dont_collide() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE pc4 (id INTEGER PRIMARY KEY, a TEXT, b TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO pc4 VALUES (1, 'alpha', 'beta');")
+            .unwrap();
+
+        let rows_a = conn.query("SELECT a FROM pc4").unwrap();
+        let rows_b = conn.query("SELECT b FROM pc4").unwrap();
+
+        assert_eq!(rows_a[0].values()[0], SqliteValue::Text("alpha".to_owned()));
+        assert_eq!(rows_b[0].values()[0], SqliteValue::Text("beta".to_owned()));
+    }
+
+    #[test]
+    fn test_parse_cache_drop_table_invalidates() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE pc5 (id INTEGER PRIMARY KEY, v TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO pc5 VALUES (1, 'val');").unwrap();
+
+        // Populate cache.
+        let rows = conn.query("SELECT v FROM pc5").unwrap();
+        assert_eq!(rows.len(), 1);
+
+        // Drop + recreate with different schema.
+        conn.execute("DROP TABLE pc5;").unwrap();
+        conn.execute("CREATE TABLE pc5 (id INTEGER PRIMARY KEY, v TEXT, extra INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO pc5 VALUES (1, 'new', 42);")
+            .unwrap();
+
+        // Cache must be invalidated: fresh parse succeeds.
+        let rows = conn.query("SELECT v FROM pc5").unwrap();
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("new".to_owned()));
     }
 }

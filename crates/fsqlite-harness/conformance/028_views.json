@@ -21,7 +21,7 @@
 
     { "op": "exec", "sql": "DROP VIEW expensive_products" },
 
-    { "op": "query", "sql": "SELECT name FROM category_stats ORDER BY category", "expect": { "rows": [["gadgets"], ["tools"]], "ordered": false } },
+    { "op": "query", "sql": "SELECT category FROM category_stats ORDER BY category", "expect": { "rows": [["gadgets"], ["tools"]], "ordered": false } },
 
     { "op": "exec", "sql": "CREATE VIEW IF NOT EXISTS category_stats AS SELECT 1" },
     { "op": "query", "sql": "SELECT cnt FROM category_stats ORDER BY category", "expect": { "rows": [["3"], ["2"]], "ordered": true } }

@@ -680,7 +680,7 @@ pub unsafe extern "C" fn sqlite3_column_int64(stmt: *mut Sqlite3Stmt, i_col: c_i
     match current_value_ref(stmt, i_col) {
         Some(SqliteValue::Integer(n)) => *n,
         Some(SqliteValue::Float(f)) => *f as i64,
-        Some(SqliteValue::Text(s)) => s.parse::<i64>().unwrap_or(0),
+        Some(SqliteValue::Text(s)) => s.trim().parse::<i64>().unwrap_or(0),
         _ => 0,
     }
 }
@@ -707,7 +707,7 @@ pub unsafe extern "C" fn sqlite3_column_double(stmt: *mut Sqlite3Stmt, i_col: c_
     match current_value_ref(stmt, i_col) {
         Some(SqliteValue::Float(f)) => *f,
         Some(SqliteValue::Integer(n)) => *n as f64,
-        Some(SqliteValue::Text(s)) => s.parse::<f64>().unwrap_or(0.0),
+        Some(SqliteValue::Text(s)) => s.trim().parse::<f64>().unwrap_or(0.0),
         _ => 0.0,
     }
 }

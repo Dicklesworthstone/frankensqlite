@@ -7,15 +7,15 @@ use fsqlite_error::FrankenError;
 use fsqlite_harness::fault_vfs::{
     FaultInjectingVfs, FaultMetricsSnapshot, FaultSpec, TEST_VFS_FAULT_COUNTER_NAME,
 };
-use fsqlite_types::LockLevel;
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::{SyncFlags, VfsOpenFlags};
+use fsqlite_types::LockLevel;
+use fsqlite_vfs::traits::{Vfs, VfsFile};
 #[cfg(target_os = "linux")]
 use fsqlite_vfs::IoUringVfs;
 use fsqlite_vfs::MemoryVfs;
 #[cfg(unix)]
 use fsqlite_vfs::UnixVfs;
-use fsqlite_vfs::traits::{Vfs, VfsFile};
 use serde::Serialize;
 #[cfg(unix)]
 use tempfile::TempDir;
@@ -406,16 +406,18 @@ fn run_unix_lock_probe() -> Result<String, String> {
     let reserved_seen = file_b
         .check_reserved_lock(&cx)
         .map_err(|error| format!("unix_probe_reserved_probe_failed error={error}"))?;
-    if !reserved_seen {
-        return Err("unix_probe_expected_reserved_lock_visibility".to_owned());
+    // Unix advisory locks are process-scoped, not fd-scoped. In this same-process probe,
+    // check_reserved_lock should not report our own reservation as "held by others".
+    if reserved_seen {
+        return Err("unix_probe_unexpected_reserved_lock_visibility_same_process".to_owned());
     }
 
     file_b
         .lock(&cx, LockLevel::Shared)
         .map_err(|error| format!("unix_probe_lock_b_shared_failed error={error}"))?;
-    if file_b.lock(&cx, LockLevel::Reserved).is_ok() {
-        return Err("unix_probe_reserved_lock_should_conflict".to_owned());
-    }
+    file_b
+        .lock(&cx, LockLevel::Reserved)
+        .map_err(|error| format!("unix_probe_lock_b_reserved_failed error={error}"))?;
 
     file_a
         .unlock(&cx, LockLevel::None)

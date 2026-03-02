@@ -1111,7 +1111,11 @@ where
             // Reset next_page to avoid holes if we allocated pages that are now discarded.
             // Logic matches SimplePager::open.
             let db_size = inner.db_size;
-            inner.next_page = if db_size >= 2 { db_size + 1 } else { 2 };
+            inner.next_page = if db_size >= 2 {
+                db_size.saturating_add(1)
+            } else {
+                2
+            };
 
             inner.writer_active = false;
         } else if self.is_writer && self.mode == TransactionMode::Concurrent {
@@ -1171,25 +1175,10 @@ where
             .iter()
             .rposition(|sp| sp.name == name)
             .ok_or_else(|| FrankenError::internal(format!("no savepoint named '{name}'")))?;
-        // Restore write-set and freed-pages to the snapshot state.
-        // Convert Vec<u8> snapshots back to PageBuf (allocated from pool).
+        // Restore allocation state FIRST — this doesn't allocate and can't
+        // fail, so we always leave the pager in a consistent state even if
+        // the write-set reconstruction below encounters an OOM.
         let entry = &self.savepoint_stack[pos];
-        self.write_set = entry
-            .write_set_snapshot
-            .iter()
-            .map(|(&k, v)| -> Result<(PageNumber, PageBuf)> {
-                let mut buf = self.pool.acquire()?;
-                let len = buf.len().min(v.len());
-                buf.as_mut_slice()[..len].copy_from_slice(&v[..len]);
-                if len < buf.len() {
-                    buf[len..].fill(0);
-                }
-                Ok((k, buf))
-            })
-            .collect::<Result<HashMap<_, _>>>()?;
-        self.freed_pages = entry.freed_pages_snapshot.clone();
-
-        // Restore allocation state.
         {
             let mut inner = self
                 .inner
@@ -1215,6 +1204,22 @@ where
         }
         self.allocated_from_freelist = entry.allocated_from_freelist_snapshot.clone();
         self.allocated_from_eof = entry.allocated_from_eof_snapshot.clone();
+        self.freed_pages = entry.freed_pages_snapshot.clone();
+
+        // Restore write-set by converting Vec<u8> snapshots back to PageBuf.
+        self.write_set = entry
+            .write_set_snapshot
+            .iter()
+            .map(|(&k, v)| -> Result<(PageNumber, PageBuf)> {
+                let mut buf = self.pool.acquire()?;
+                let len = buf.len().min(v.len());
+                buf.as_mut_slice()[..len].copy_from_slice(&v[..len]);
+                if len < buf.len() {
+                    buf[len..].fill(0);
+                }
+                Ok((k, buf))
+            })
+            .collect::<Result<HashMap<_, _>>>()?;
 
         // Discard savepoints created after the named one, but keep
         // the named savepoint itself (it can be rolled back to again).
@@ -1240,7 +1245,11 @@ impl<V: Vfs> Drop for SimpleTransaction<V> {
                 // Reset next_page to avoid holes if we allocated pages that are now discarded.
                 // Logic matches SimplePager::open and SimpleTransaction::rollback.
                 let db_size = inner.db_size;
-                inner.next_page = if db_size >= 2 { db_size + 1 } else { 2 };
+                inner.next_page = if db_size >= 2 {
+                    db_size.saturating_add(1)
+                } else {
+                    2
+                };
 
                 inner.writer_active = false;
             } else if self.is_writer && self.mode == TransactionMode::Concurrent {
