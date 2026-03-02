@@ -149,8 +149,10 @@ fn sqlite_wal_checksum_native_8byte_chunks(data: &[u8]) -> Result<(u32, u32)> {
     for chunk in data.chunks_exact(8) {
         let w1 = u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
         let w2 = u32::from_ne_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
-        s1 = s1.wrapping_add(w1).wrapping_add(s2);
-        s2 = s2.wrapping_add(w2).wrapping_add(s1);
+        s1 = s1.wrapping_add(w1);
+        s2 = s2.wrapping_add(s1);
+        s1 = s1.wrapping_add(w2);
+        s2 = s2.wrapping_add(s1);
     }
     Ok((s1, s2))
 }
