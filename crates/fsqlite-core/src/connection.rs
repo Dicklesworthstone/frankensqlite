@@ -13557,23 +13557,13 @@ fn first_row_or_error(rows: Vec<Row>) -> Result<Row> {
 }
 
 fn validate_bound_parameters(program: &VdbeProgram, params: &[SqliteValue]) -> Result<()> {
-    let mut max_required: usize = 0;
-    for op in program.ops() {
-        if op.opcode != Opcode::Variable {
-            continue;
-        }
-        let one_based = usize::try_from(op.p1).map_err(|_| FrankenError::OutOfRange {
-            what: "bind parameter index".to_owned(),
-            value: op.p1.to_string(),
-        })?;
-        if one_based == 0 {
-            return Err(FrankenError::OutOfRange {
+    let max_required =
+        program
+            .max_bind_parameter_index()
+            .map_err(|raw_index| FrankenError::OutOfRange {
                 what: "bind parameter index".to_owned(),
-                value: op.p1.to_string(),
-            });
-        }
-        max_required = max_required.max(one_based);
-    }
+                value: raw_index.to_string(),
+            })?;
 
     if max_required > params.len() {
         return Err(FrankenError::OutOfRange {
@@ -16848,6 +16838,7 @@ mod tests {
     use fsqlite_types::PageNumber;
     use fsqlite_types::opcode::{Opcode, P4};
     use fsqlite_types::value::SqliteValue;
+    use fsqlite_vdbe::ProgramBuilder;
     use std::collections::HashSet;
     use std::sync::Arc;
 
@@ -17328,6 +17319,48 @@ mod tests {
             .query_with_params("SELECT ?1 + ?2;", &[SqliteValue::Integer(1)])
             .expect_err("missing bind param should fail");
         assert!(matches!(error, FrankenError::OutOfRange { .. }));
+    }
+
+    #[test]
+    fn test_validate_bound_parameters_uses_precomputed_max_index() {
+        let mut builder = ProgramBuilder::new();
+        builder.emit_op(Opcode::Variable, 1, 1, 0, P4::None, 0);
+        builder.emit_op(Opcode::Variable, 3, 2, 0, P4::None, 0);
+        let program = builder.finish().expect("program should build");
+
+        let error = super::validate_bound_parameters(
+            &program,
+            &[SqliteValue::Integer(1), SqliteValue::Integer(2)],
+        )
+        .expect_err("missing third parameter should fail");
+        assert!(matches!(
+            error,
+            FrankenError::OutOfRange { value, .. } if value == "3"
+        ));
+
+        super::validate_bound_parameters(
+            &program,
+            &[
+                SqliteValue::Integer(1),
+                SqliteValue::Integer(2),
+                SqliteValue::Null,
+            ],
+        )
+        .expect("sufficient bindings should pass");
+    }
+
+    #[test]
+    fn test_validate_bound_parameters_rejects_invalid_precomputed_index() {
+        let mut builder = ProgramBuilder::new();
+        builder.emit_op(Opcode::Variable, 0, 1, 0, P4::None, 0);
+        let program = builder.finish().expect("program should build");
+
+        let error = super::validate_bound_parameters(&program, &[])
+            .expect_err("invalid variable index should fail");
+        assert!(matches!(
+            error,
+            FrankenError::OutOfRange { value, .. } if value == "0"
+        ));
     }
 
     #[test]

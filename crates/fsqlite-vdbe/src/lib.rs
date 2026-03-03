@@ -393,10 +393,12 @@ impl ProgramBuilder {
                 }
             }
         }
+        let bind_parameter_requirement = compute_bind_parameter_requirement(&self.ops);
 
         Ok(VdbeProgram {
             ops: self.ops,
             register_count: self.regs.count(),
+            bind_parameter_requirement,
         })
     }
 }
@@ -416,6 +418,11 @@ pub struct VdbeProgram {
     ops: Vec<VdbeOp>,
     /// Number of registers needed (high water mark from allocation).
     register_count: i32,
+    /// Precomputed bind parameter requirement for `Opcode::Variable` opcodes.
+    ///
+    /// `Ok(max_index)` means all variable opcodes carry valid 1-based indexes.
+    /// `Err(raw_index)` stores the first invalid raw index encountered.
+    bind_parameter_requirement: std::result::Result<usize, i32>,
 }
 
 impl VdbeProgram {
@@ -437,6 +444,15 @@ impl VdbeProgram {
     /// Number of registers required.
     pub fn register_count(&self) -> i32 {
         self.register_count
+    }
+
+    /// Highest 1-based bind parameter index referenced by the program.
+    ///
+    /// Returns `Ok(0)` when no `Variable` opcodes are present.
+    /// Returns `Err(raw_index)` if the bytecode contains an invalid
+    /// parameter index (`<= 0` or not representable as `usize`).
+    pub fn max_bind_parameter_index(&self) -> std::result::Result<usize, i32> {
+        self.bind_parameter_requirement
     }
 
     /// Get the instruction at the given program counter.
@@ -490,6 +506,21 @@ impl VdbeProgram {
 
         out
     }
+}
+
+fn compute_bind_parameter_requirement(ops: &[VdbeOp]) -> std::result::Result<usize, i32> {
+    let mut max_required = 0_usize;
+    for op in ops {
+        if op.opcode != Opcode::Variable {
+            continue;
+        }
+        let one_based = match usize::try_from(op.p1) {
+            Ok(index) if index > 0 => index,
+            _ => return Err(op.p1),
+        };
+        max_required = max_required.max(one_based);
+    }
+    Ok(max_required)
 }
 
 // ── PRAGMA Handling ──────────────────────────────────────────────────────────
@@ -1448,10 +1479,29 @@ mod tests {
         let prog = b.finish().unwrap();
         assert_eq!(prog.len(), 4);
         assert_eq!(prog.register_count(), 1);
+        assert_eq!(prog.max_bind_parameter_index().unwrap(), 0);
 
         // The Init instruction's p2 should point to address 4 (after Halt).
         assert_eq!(prog.get(0).unwrap().opcode, Opcode::Init);
         assert_eq!(prog.get(0).unwrap().p2, 4);
+    }
+
+    #[test]
+    fn test_program_precomputes_max_bind_parameter_index() {
+        let mut b = ProgramBuilder::new();
+        b.emit_op(Opcode::Variable, 1, 1, 0, P4::None, 0);
+        b.emit_op(Opcode::Variable, 4, 2, 0, P4::None, 0);
+        b.emit_op(Opcode::Variable, 2, 3, 0, P4::None, 0);
+        let prog = b.finish().unwrap();
+        assert_eq!(prog.max_bind_parameter_index(), Ok(4));
+    }
+
+    #[test]
+    fn test_program_tracks_invalid_bind_parameter_index() {
+        let mut b = ProgramBuilder::new();
+        b.emit_op(Opcode::Variable, 0, 1, 0, P4::None, 0);
+        let prog = b.finish().unwrap();
+        assert_eq!(prog.max_bind_parameter_index(), Err(0));
     }
 
     // ── test_disassemble ────────────────────────────────────────────────

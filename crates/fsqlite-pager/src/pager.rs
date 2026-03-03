@@ -1175,10 +1175,25 @@ where
             .iter()
             .rposition(|sp| sp.name == name)
             .ok_or_else(|| FrankenError::internal(format!("no savepoint named '{name}'")))?;
-        // Restore allocation state FIRST — this doesn't allocate and can't
-        // fail, so we always leave the pager in a consistent state even if
-        // the write-set reconstruction below encounters an OOM.
+        
         let entry = &self.savepoint_stack[pos];
+        
+        // Restore write-set FIRST to ensure we don't leave the transaction in an
+        // inconsistent state if PageBuf allocation fails (OOM).
+        let new_write_set = entry
+            .write_set_snapshot
+            .iter()
+            .map(|(&k, v)| -> Result<(PageNumber, PageBuf)> {
+                let mut buf = self.pool.acquire()?;
+                let len = buf.len().min(v.len());
+                buf.as_mut_slice()[..len].copy_from_slice(&v[..len]);
+                if len < buf.len() {
+                    buf[len..].fill(0);
+                }
+                Ok((k, buf))
+            })
+            .collect::<Result<HashMap<_, _>>>()?;
+
         {
             let mut inner = self
                 .inner
@@ -1205,21 +1220,7 @@ where
         self.allocated_from_freelist = entry.allocated_from_freelist_snapshot.clone();
         self.allocated_from_eof = entry.allocated_from_eof_snapshot.clone();
         self.freed_pages = entry.freed_pages_snapshot.clone();
-
-        // Restore write-set by converting Vec<u8> snapshots back to PageBuf.
-        self.write_set = entry
-            .write_set_snapshot
-            .iter()
-            .map(|(&k, v)| -> Result<(PageNumber, PageBuf)> {
-                let mut buf = self.pool.acquire()?;
-                let len = buf.len().min(v.len());
-                buf.as_mut_slice()[..len].copy_from_slice(&v[..len]);
-                if len < buf.len() {
-                    buf[len..].fill(0);
-                }
-                Ok((k, buf))
-            })
-            .collect::<Result<HashMap<_, _>>>()?;
+        self.write_set = new_write_set;
 
         // Discard savepoints created after the named one, but keep
         // the named savepoint itself (it can be rolled back to again).
@@ -1456,7 +1457,7 @@ where
         // Take the WAL backend out of the pager while marking checkpoint active.
         // `begin()` and deferred writer upgrades are blocked while this flag is
         // set so commits cannot observe "WAL mode but no backend".
-        let mut wal = {
+        let wal = {
             let mut inner = self
                 .inner
                 .lock()
@@ -1483,29 +1484,37 @@ where
                     "WAL mode active but no WAL backend installed",
                 ));
             };
-            drop(inner);
             wal
         };
         // Lock is released here.
+
+        struct CheckpointGuard<'a, F: VfsFile> {
+            inner: &'a std::sync::Mutex<PagerInner<F>>,
+            wal: Option<Box<dyn WalBackend>>,
+        }
+
+        impl<F: VfsFile> Drop for CheckpointGuard<'_, F> {
+            fn drop(&mut self) {
+                if let Ok(mut inner) = self.inner.lock() {
+                    if let Some(wal) = self.wal.take() {
+                        inner.wal_backend = Some(wal);
+                    }
+                    inner.checkpoint_active = false;
+                }
+            }
+        }
+
+        let mut guard = CheckpointGuard {
+            inner: &self.inner,
+            wal: Some(wal),
+        };
 
         // Create a checkpoint writer that writes directly to the database file.
         let mut writer = self.checkpoint_writer();
 
         // Run the checkpoint from the beginning. Reader-aware incremental
         // checkpointing requires exposing oldest-reader tracking from pager.
-        let result = wal.checkpoint(cx, mode, &mut writer, 0, None);
-
-        // Put the WAL backend back and clear checkpoint state.
-        {
-            let mut inner = self
-                .inner
-                .lock()
-                .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
-            inner.wal_backend = Some(wal);
-            inner.checkpoint_active = false;
-        }
-
-        result
+        guard.wal.as_mut().expect("wal was just inserted").checkpoint(cx, mode, &mut writer, 0, None)
     }
 }
 
