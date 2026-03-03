@@ -236,7 +236,11 @@ fn load_freelist_from_disk<F: VfsFile>(
     Ok(normalize_freelist(&out, db_size))
 }
 
-fn persist_freelist_to_disk<F: VfsFile>(cx: &Cx, inner: &mut PagerInner<F>) -> Result<()> {
+fn serialize_freelist_to_write_set<F: VfsFile>(
+    cx: &Cx,
+    inner: &mut PagerInner<F>,
+    write_set: &mut HashMap<PageNumber, PageBuf>,
+) -> Result<()> {
     if inner.db_size == 0 {
         inner.freelist.clear();
         return Ok(());
@@ -270,7 +274,7 @@ fn persist_freelist_to_disk<F: VfsFile>(cx: &Cx, inner: &mut PagerInner<F>) -> R
             let remaining = freelist.len().saturating_sub(leaf_index);
             let take = remaining.min(max_leaf_entries);
 
-            let mut buf = vec![0u8; ps];
+            let mut buf = inner.cache.pool().acquire()?;
             buf[0..4].copy_from_slice(&next.to_be_bytes());
             buf[4..8].copy_from_slice(&(take as u32).to_be_bytes());
 
@@ -281,27 +285,30 @@ fn persist_freelist_to_disk<F: VfsFile>(cx: &Cx, inner: &mut PagerInner<F>) -> R
             }
             leaf_index += take;
 
-            let offset = u64::from(trunk_pg.saturating_sub(1)) * ps as u64;
-            inner.db_file.write(cx, &buf, offset)?;
             if let Some(pg) = PageNumber::new(*trunk_pg) {
-                inner.cache.evict(pg);
+                write_set.insert(pg, buf);
             }
         }
     }
 
-    let mut page1 = vec![0u8; ps];
-    let bytes_read = inner.db_file.read(cx, &mut page1, 0)?;
-    if bytes_read < DATABASE_HEADER_SIZE {
-        return Err(FrankenError::DatabaseCorrupt {
-            detail: format!(
-                "short read while updating freelist header: got {bytes_read} bytes, need at least {DATABASE_HEADER_SIZE}",
-            ),
-        });
-    }
+    let mut page1 = if let Some(buf) = write_set.remove(&PageNumber::ONE) {
+        buf
+    } else {
+        let mut buf = inner.cache.pool().acquire()?;
+        let bytes_read = inner.db_file.read(cx, &mut buf, 0)?;
+        if bytes_read < DATABASE_HEADER_SIZE {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "short read while updating freelist header: got {bytes_read} bytes, need at least {DATABASE_HEADER_SIZE}",
+                ),
+            });
+        }
+        buf
+    };
+
     page1[32..36].copy_from_slice(&first_trunk.to_be_bytes());
     page1[36..40].copy_from_slice(&total_free.to_be_bytes());
-    inner.db_file.write(cx, &page1, 0)?;
-    inner.cache.evict(PageNumber::ONE);
+    write_set.insert(PageNumber::ONE, page1);
 
     Ok(())
 }
@@ -750,7 +757,6 @@ where
         journal_path: &Path,
         inner: &mut PagerInner<V::File>,
         write_set: &HashMap<PageNumber, PageBuf>,
-        freed_pages: &mut Vec<PageNumber>,
         original_db_size: u32,
     ) -> Result<()> {
         if !write_set.is_empty() {
@@ -815,8 +821,7 @@ where
         for page_no in freed_pages.drain(..) {
             inner.freelist.push(page_no);
         }
-        persist_freelist_to_disk(cx, inner)?;
-        Ok(())
+                Ok(())
     }
 
     /// Commit using the WAL protocol (append frames to WAL file).
@@ -1016,9 +1021,9 @@ where
         // ── Header Patching ──
         // Patch page 1 header with correct page_count and change_counter in the write set.
         // This ensures the commit functions write a consistent header without needing extra I/O.
+        let max_written = self.write_set.keys().map(|p| p.get()).max().unwrap_or(0);
         if let Some(page1) = self.write_set.get_mut(&PageNumber::ONE) {
             if page1.len() >= DATABASE_HEADER_SIZE {
-                let max_written = self.write_set.keys().map(|p| p.get()).max().unwrap_or(0);
                 let new_db_size = inner.db_size.max(max_written);
                 let new_change_counter = inner.commit_seq.get().wrapping_add(1) as u32;
 
@@ -1373,8 +1378,7 @@ where
         // Ensure header page_count reflects the final db_size after all
         // checkpoint writes/truncation, even if page 1 was checkpointed early.
         Self::patch_page1_header(&mut inner, cx)?;
-        persist_freelist_to_disk(cx, &mut inner)?;
-        inner.db_file.sync(cx, SyncFlags::NORMAL)
+                inner.db_file.sync(cx, SyncFlags::NORMAL)
     }
 }
 
