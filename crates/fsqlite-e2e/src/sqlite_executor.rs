@@ -306,7 +306,9 @@ fn apply_pragmas(conn: &Connection, config: &SqliteExecConfig) -> Result<(), rus
         loop {
             match conn.execute_batch(p) {
                 Ok(()) => break,
-                Err(rusqlite::Error::SqliteFailure(err, msg)) if err.code == rusqlite::ErrorCode::DatabaseBusy => {
+                Err(rusqlite::Error::SqliteFailure(err, msg))
+                    if err.code == rusqlite::ErrorCode::DatabaseBusy =>
+                {
                     attempt += 1;
                     if attempt > config.max_busy_retries {
                         return Err(rusqlite::Error::SqliteFailure(err, msg));

@@ -142,10 +142,14 @@ fn configure_connection(conn: &Connection, config: &FsqliteExecConfig) -> E2eRes
         loop {
             match conn.execute(pragma) {
                 Ok(_) => break,
-                Err(fsqlite_error::FrankenError::Busy | fsqlite_error::FrankenError::BusyRecovery) => {
+                Err(
+                    fsqlite_error::FrankenError::Busy | fsqlite_error::FrankenError::BusyRecovery,
+                ) => {
                     attempt += 1;
                     if attempt > 100 {
-                        return Err(E2eError::Fsqlite(format!("pragma `{pragma}`: database is busy")));
+                        return Err(E2eError::Fsqlite(format!(
+                            "pragma `{pragma}`: database is busy"
+                        )));
                     }
                     std::thread::sleep(std::time::Duration::from_millis(10));
                 }

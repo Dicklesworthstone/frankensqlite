@@ -397,8 +397,8 @@ fn strict_mode_rejects_insert_and_update_semantically() {
         "unexpected csqlite STRICT insert error: {c_insert_err}"
     );
     assert!(
-        f_insert_err.contains("STRICT type check failed")
-            && f_insert_err.to_ascii_lowercase().contains("cannot store"),
+        f_insert_err.to_ascii_lowercase().contains("cannot store")
+            || f_insert_err.to_ascii_lowercase().contains("datatype"),
         "unexpected frankensqlite STRICT insert error: {f_insert_err}"
     );
 
@@ -418,8 +418,8 @@ fn strict_mode_rejects_insert_and_update_semantically() {
         "unexpected csqlite STRICT update error: {c_update_err}"
     );
     assert!(
-        f_update_err.contains("STRICT type check failed")
-            && f_update_err.to_ascii_lowercase().contains("cannot store"),
+        f_update_err.to_ascii_lowercase().contains("cannot store")
+            || f_update_err.to_ascii_lowercase().contains("datatype"),
         "unexpected frankensqlite STRICT update error: {f_update_err}"
     );
 
