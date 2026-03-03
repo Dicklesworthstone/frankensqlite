@@ -505,7 +505,7 @@ pub fn parse_columns_from_create_sql(sql: &str) -> Vec<ColumnInfo> {
                 is_ipk,
                 type_name,
                 notnull: upper.contains("NOT NULL"),
-                unique: upper.contains("UNIQUE") || (is_ipk && upper.contains("PRIMARY KEY")),
+                unique: upper.contains("UNIQUE") || upper.contains("PRIMARY KEY"),
                 default_value,
                 strict_type,
                 generated_expr: None,
