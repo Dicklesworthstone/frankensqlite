@@ -10,6 +10,7 @@ rust-version.workspace = true
 [dependencies]
 bitflags = { workspace = true }
 blake3 = { workspace = true }
+asupersync = { workspace = true }
 fsqlite-error = { workspace = true }
 smallvec = { workspace = true }
 serde = { workspace = true }

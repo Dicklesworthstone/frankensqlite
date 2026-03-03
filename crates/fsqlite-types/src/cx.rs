@@ -30,6 +30,9 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
+use asupersync::types::{CancelKind as NativeCancelKind, CancelReason as NativeCancelReason};
+use asupersync::Cx as NativeCx;
+
 use crate::eprocess::EProcessOracle;
 
 /// SQLite error code for `SQLITE_INTERRUPT`.
@@ -295,6 +298,7 @@ struct CxInner {
     children: Mutex<Vec<Weak<Self>>>,
     last_checkpoint_msg: Mutex<Option<String>>,
     eprocess_oracle: Mutex<Option<Arc<EProcessOracle>>>,
+    native_cx: Mutex<Option<NativeCx>>,
     // Deterministic clock: milliseconds since epoch for tests.
     unix_millis: AtomicU64,
 }
@@ -309,8 +313,47 @@ impl CxInner {
             children: Mutex::new(Vec::new()),
             last_checkpoint_msg: Mutex::new(None),
             eprocess_oracle: Mutex::new(None),
+            native_cx: Mutex::new(None),
             unix_millis: AtomicU64::new(0),
         }
+    }
+}
+
+#[must_use]
+fn local_reason_to_native(reason: CancelReason) -> NativeCancelReason {
+    match reason {
+        CancelReason::Timeout => NativeCancelReason::timeout(),
+        CancelReason::UserInterrupt => NativeCancelReason::user("sqlite interrupt"),
+        CancelReason::RegionClose => NativeCancelReason::parent_cancelled(),
+        CancelReason::Abort => NativeCancelReason::resource_unavailable(),
+    }
+}
+
+#[must_use]
+fn native_reason_to_local(reason: &NativeCancelReason) -> CancelReason {
+    match reason.kind {
+        NativeCancelKind::User => CancelReason::UserInterrupt,
+        NativeCancelKind::Timeout
+        | NativeCancelKind::Deadline
+        | NativeCancelKind::PollQuota
+        | NativeCancelKind::CostBudget => CancelReason::Timeout,
+        NativeCancelKind::FailFast
+        | NativeCancelKind::RaceLost
+        | NativeCancelKind::ParentCancelled
+        | NativeCancelKind::Shutdown
+        | NativeCancelKind::LinkedExit => CancelReason::RegionClose,
+        NativeCancelKind::ResourceUnavailable => CancelReason::Abort,
+    }
+}
+
+fn sync_native_cx_cancel(inner: &CxInner, reason: CancelReason) {
+    let native = inner
+        .native_cx
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    if let Some(native) = native {
+        native.set_cancel_reason(local_reason_to_native(reason));
     }
 }
 
@@ -344,6 +387,10 @@ fn propagate_cancel(inner: &CxInner, reason: CancelReason) {
             *state = CancelState::CancelRequested;
         }
     }
+
+    // Keep attached native asupersync context in sync so downstream combinators
+    // observe equivalent cancellation semantics.
+    sync_native_cx_cancel(inner, reason);
 
     // Collect children (release lock before recursing).
     let children: Vec<Arc<CxInner>> = {
@@ -620,6 +667,31 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
         *guard = None;
     }
 
+    /// Attach a native asupersync context used by [`Self::checkpoint`].
+    pub fn set_native_cx(&self, native_cx: NativeCx) {
+        if let Some(reason) = self.cancel_reason() {
+            native_cx.set_cancel_reason(local_reason_to_native(reason));
+        } else if self.is_cancel_requested() {
+            native_cx.set_cancel_requested(true);
+        }
+        let mut guard = self
+            .inner
+            .native_cx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = Some(native_cx);
+    }
+
+    /// Remove the currently attached native asupersync context.
+    pub fn clear_native_cx(&self) {
+        let mut guard = self
+            .inner
+            .native_cx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = None;
+    }
+
     #[must_use]
     fn maybe_cancel_via_eprocess(&self) -> bool {
         let oracle = self
@@ -638,6 +710,41 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
         false
     }
 
+    #[must_use]
+    fn maybe_cancel_via_native_cx(&self, masked: bool) -> bool {
+        let native = self
+            .inner
+            .native_cx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let Some(native) = native else {
+            return false;
+        };
+
+        if masked {
+            if native.is_cancel_requested() {
+                let reason = native
+                    .cancel_reason()
+                    .as_ref()
+                    .map_or(CancelReason::Timeout, native_reason_to_local);
+                self.cancel_with_reason(reason);
+                return true;
+            }
+            return false;
+        }
+
+        if native.checkpoint().is_err() {
+            let reason = native
+                .cancel_reason()
+                .as_ref()
+                .map_or(CancelReason::Timeout, native_reason_to_local);
+            self.cancel_with_reason(reason);
+            return true;
+        }
+        false
+    }
+
     // -----------------------------------------------------------------------
     // Checkpoints (§4.12.1)
     // -----------------------------------------------------------------------
@@ -648,13 +755,17 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
     /// When cancellation is observed, transitions state from `CancelRequested`
     /// to `Cancelling`.
     pub fn checkpoint(&self) -> Result<()> {
+        let masked = self.inner.mask_depth.load(Ordering::Acquire) > 0;
+
         // Fast path: not cancelled and no oracle-based shedding signal.
-        if !self.inner.cancel_requested.load(Ordering::Acquire) && !self.maybe_cancel_via_eprocess()
+        if !self.inner.cancel_requested.load(Ordering::Acquire)
+            && !self.maybe_cancel_via_eprocess()
+            && !self.maybe_cancel_via_native_cx(masked)
         {
             return Ok(());
         }
         // Masked: defer cancellation observation.
-        if self.inner.mask_depth.load(Ordering::Acquire) > 0 {
+        if masked {
             return Ok(());
         }
         // Slow path: transition CancelRequested → Cancelling.
@@ -1115,6 +1226,47 @@ mod tests {
             assert!(cx.is_cancel_requested());
             assert_eq!(cx.cancel_state(), CancelState::CancelRequested);
         }
+        let err = cx.checkpoint().unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::Cancelled);
+    }
+
+    #[test]
+    fn test_cx_checkpoint_native_cx_cancellation_maps_reason() {
+        let cx = Cx::<FullCaps>::new();
+        let native = NativeCx::for_testing();
+        cx.set_native_cx(native.clone());
+        native.set_cancel_reason(NativeCancelReason::timeout());
+
+        let err = cx.checkpoint().unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::Cancelled);
+        assert_eq!(cx.cancel_reason(), Some(CancelReason::Timeout));
+    }
+
+    #[test]
+    fn test_cx_cancel_reason_propagates_to_native_cx() {
+        let cx = Cx::<FullCaps>::new();
+        let native = NativeCx::for_testing();
+        cx.set_native_cx(native.clone());
+
+        cx.cancel_with_reason(CancelReason::RegionClose);
+        let reason = native.cancel_reason().expect("native cancel reason must be set");
+        assert_eq!(reason.kind, NativeCancelKind::ParentCancelled);
+    }
+
+    #[test]
+    fn test_cx_checkpoint_native_cx_respects_local_masking() {
+        let cx = Cx::<FullCaps>::new();
+        let native = NativeCx::for_testing();
+        cx.set_native_cx(native.clone());
+        native.set_cancel_reason(NativeCancelReason::user("cancel"));
+
+        {
+            let _mask = cx.masked();
+            assert!(cx.checkpoint().is_ok());
+            assert!(cx.is_cancel_requested());
+            assert_eq!(cx.cancel_state(), CancelState::CancelRequested);
+        }
+
         let err = cx.checkpoint().unwrap_err();
         assert_eq!(err.kind(), ErrorKind::Cancelled);
     }

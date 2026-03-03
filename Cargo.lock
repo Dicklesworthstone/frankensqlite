@@ -1048,6 +1048,7 @@ dependencies = [
 name = "fsqlite-types"
 version = "0.1.1"
 dependencies = [
+ "asupersync",
  "bitflags 2.11.0",
  "blake3",
  "fsqlite-error",
