@@ -3003,16 +3003,23 @@ fn dpccp_order_joins(
         .collect::<Vec<_>>();
 
     let mut visit_order = (0..n).collect::<Vec<_>>();
-    visit_order.sort_by(|lhs, rhs| {
-        access_paths[*lhs]
-            .estimated_cost
-            .partial_cmp(&access_paths[*rhs].estimated_cost)
+    visit_order.sort_by(|&lhs, &rhs| {
+        access_paths[lhs]
+            .estimated_rows
+            .partial_cmp(&access_paths[rhs].estimated_rows)
             .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| lhs.cmp(rhs))
+            .then_with(|| {
+                access_paths[lhs]
+                    .estimated_cost
+                    .partial_cmp(&access_paths[rhs].estimated_cost)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| lhs.cmp(&rhs))
     });
 
     let mut state =
         ExhaustiveJoinSearchState::new(tables, &access_paths, &visit_order, cross_join_pairs);
+    eprintln!("VISIT ORDER: {:?}", visit_order);
     state.search();
 
     let order = state.best_order?;
@@ -3296,9 +3303,20 @@ pub fn pushdown_predicates<'a>(
                 continue;
             }
         } else if refs.is_empty() {
-            // No table qualifiers (unqualified columns or pure literals).
-            if let Some(ref _col) = term.column {
-                if table_names.len() == 1 {
+            // No table qualifiers (unqualified columns or pure literals in the RHS).
+            if let Some(ref col) = term.column {
+                if let Some(ref tname) = col.table {
+                    if let Some(matched) = table_names
+                        .iter()
+                        .find(|t| t.eq_ignore_ascii_case(tname))
+                    {
+                        pushed.push(PushedPredicate {
+                            table: matched.clone(),
+                            term,
+                        });
+                        continue;
+                    }
+                } else if table_names.len() == 1 {
                     pushed.push(PushedPredicate {
                         table: table_names[0].clone(),
                         term,
@@ -6916,4 +6934,17 @@ mod tests {
             FoldResult::Literal(Literal::Integer(42))
         );
     }
+}
+#[test]
+fn debug_test_join_order() {
+    let tables = vec![
+        TableStats { name: "nation".to_owned(), n_pages: 1, n_rows: 25, source: StatsSource::Analyze },
+        TableStats { name: "region".to_owned(), n_pages: 1, n_rows: 5, source: StatsSource::Analyze },
+        TableStats { name: "supplier".to_owned(), n_pages: 100, n_rows: 10_000, source: StatsSource::Analyze },
+        TableStats { name: "customer".to_owned(), n_pages: 500, n_rows: 150_000, source: StatsSource::Analyze },
+        TableStats { name: "orders".to_owned(), n_pages: 2000, n_rows: 1_500_000, source: StatsSource::Analyze },
+        TableStats { name: "lineitem".to_owned(), n_pages: 8000, n_rows: 6_000_000, source: StatsSource::Analyze },
+    ];
+    let plan = order_joins(&tables, &[], &[], None, &[]);
+    println!("Join order: {:?}", plan.join_order);
 }

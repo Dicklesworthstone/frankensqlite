@@ -229,6 +229,8 @@ fn test_join_ordering_smallest_first() {
     let tables = tpch_tables();
     let plan = order_joins(&tables, &[], &[], None, &[]);
 
+    println!("PLAN JOIN ORDER: {:?}", plan.join_order);
+
     // Smallest tables (region=5, nation=25) should come first
     assert_eq!(
         plan.join_order[0], "region",
