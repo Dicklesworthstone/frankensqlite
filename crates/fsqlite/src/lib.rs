@@ -493,9 +493,17 @@ mod tests {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE t (v INTEGER);").unwrap();
         conn.execute("INSERT INTO t VALUES (1);").unwrap();
+        
+        let m1 = conn.query("SELECT * FROM sqlite_master;").unwrap();
+        eprintln!("MASTER BEFORE BEGIN: {:?}", m1);
+        
         conn.execute("BEGIN;").unwrap();
         conn.execute("INSERT INTO t VALUES (2);").unwrap();
         conn.execute("ROLLBACK;").unwrap();
+        
+        let m2 = conn.query("SELECT * FROM sqlite_master;").unwrap();
+        eprintln!("MASTER AFTER ROLLBACK: {:?}", m2);
+        
         let rows = conn.query("SELECT v FROM t;").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(row_values(&rows[0]), vec![SqliteValue::Integer(1)]);
