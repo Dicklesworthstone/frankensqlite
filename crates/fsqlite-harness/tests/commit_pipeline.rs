@@ -100,7 +100,7 @@ fn test_little_law_derivation() {
 #[test]
 fn test_two_phase_reserve_then_send() {
     let cx = test_cx();
-    let (pipeline, receiver) = CommitPipeline::with_default_capacity();
+    let (pipeline, mut receiver) = CommitPipeline::with_default_capacity();
 
     let permit = block_on(pipeline.sender().reserve(&cx)).expect("reserve should succeed");
     permit.send(CommitRequest::new(1, 0, vec![1, 2, 3]));
@@ -187,7 +187,7 @@ fn test_backpressure_blocks_at_capacity() {
 
 #[test]
 fn test_fifo_ordering_under_contention() {
-    let (pipeline, receiver) = CommitPipeline::new(16);
+    let (pipeline, mut receiver) = CommitPipeline::new(16);
     let receiver_join = thread::spawn(move || {
         let receiver_cx = test_cx();
         let mut observed_order = Vec::with_capacity(100);
@@ -294,7 +294,7 @@ fn test_conformal_batch_size_adapts_to_regime() {
 #[test]
 fn test_fifo_ordering_under_contention_disconnect_semantics() {
     let cx = test_cx();
-    let (pipeline, receiver) = CommitPipeline::new(2);
+    let (pipeline, mut receiver) = CommitPipeline::new(2);
 
     let permit = block_on(pipeline.sender().reserve(&cx)).expect("reserve should succeed");
     permit.send(CommitRequest::new(11, 0, vec![7]));

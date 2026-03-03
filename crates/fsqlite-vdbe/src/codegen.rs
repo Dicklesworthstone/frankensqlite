@@ -8,6 +8,7 @@ use std::cell::RefCell;
 
 use crate::ProgramBuilder;
 use fsqlite_ast::{
+    Span,
     AssignmentTarget, ColumnRef, ConflictAction, DeleteStatement, Distinctness, Expr, FunctionArgs,
     InsertSource, InsertStatement, LimitClause, Literal, OrderingTerm, QualifiedTableRef,
     ResultColumn, SelectCore, SelectStatement, SortDirection, Statement, TableOrSubquery,
@@ -7860,10 +7861,11 @@ mod tests {
     use super::*;
     use crate::ProgramBuilder;
     use fsqlite_ast::{
+    Span,
         Assignment, AssignmentTarget, BinaryOp as AstBinaryOp, ColumnRef, DeleteStatement,
         Distinctness, Expr, FromClause, InSet, InsertSource, InsertStatement, LimitClause, Literal,
         OrderingTerm, PlaceholderType, QualifiedName, QualifiedTableRef, ResultColumn, SelectBody,
-        SelectCore, SelectStatement, SortDirection, Span, TableOrSubquery, UpdateStatement,
+        SelectCore, SelectStatement, SortDirection, TableOrSubquery, UpdateStatement,
     };
     use fsqlite_types::opcode::{Opcode, P4};
 

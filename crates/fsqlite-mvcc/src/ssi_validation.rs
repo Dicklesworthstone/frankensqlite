@@ -198,6 +198,10 @@ pub trait ActiveTxnView {
     fn read_keys(&self) -> &[WitnessKey];
     /// Write witness keys.
     fn write_keys(&self) -> &[WitnessKey];
+    /// Check if the transaction has read a witness overlapping with `write_key`.
+    fn check_read_overlap(&self, write_key: &WitnessKey) -> bool;
+    /// Check if the transaction has written a witness overlapping with `read_key`.
+    fn check_write_overlap(&self, read_key: &WitnessKey) -> bool;
     /// Whether this transaction has incoming rw edges.
     fn has_in_rw(&self) -> bool;
     /// Whether this transaction has outgoing rw edges.
@@ -245,120 +249,6 @@ pub struct CommittedWriterInfo {
 // Edge Discovery
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy)]
-struct IndexedTxnRecord<'a> {
-    token: TxnToken,
-    begin_seq: CommitSeq,
-    commit_seq: Option<CommitSeq>,
-    source_is_active: bool,
-    source_has_in_rw: bool,
-    /// The specific witness key triggering this index entry (if available).
-    /// Used for fine-grained filtering (e.g. Cell tag matching) to avoid false positives.
-    key: Option<&'a WitnessKey>,
-}
-
-fn build_reader_index<'a>(
-    committing_txn: TxnToken,
-    active_readers: &[&'a dyn ActiveTxnView],
-    committed_readers: &[CommittedReaderInfo],
-    target_pages: &HashSet<u32>,
-) -> BTreeMap<u32, Vec<IndexedTxnRecord<'a>>> {
-    let mut index: BTreeMap<u32, Vec<IndexedTxnRecord<'a>>> = BTreeMap::new();
-
-    for reader in active_readers {
-        if reader.token() == committing_txn || !reader.is_active() {
-            continue;
-        }
-        for key in reader.read_keys() {
-            let page = witness_key_page(key);
-            if !target_pages.contains(&page) {
-                continue;
-            }
-            index.entry(page).or_default().push(IndexedTxnRecord {
-                token: reader.token(),
-                begin_seq: reader.begin_seq(),
-                commit_seq: None,
-                source_is_active: true,
-                source_has_in_rw: reader.has_in_rw(),
-                key: Some(key),
-            });
-        }
-    }
-
-    for reader in committed_readers {
-        if reader.token == committing_txn {
-            continue;
-        }
-        for page in &reader.pages {
-            let page_no = page.get();
-            if !target_pages.contains(&page_no) {
-                continue;
-            }
-            index.entry(page_no).or_default().push(IndexedTxnRecord {
-                token: reader.token,
-                begin_seq: reader.begin_seq,
-                commit_seq: Some(reader.commit_seq),
-                source_is_active: false,
-                source_has_in_rw: reader.had_in_rw,
-                key: None,
-            });
-        }
-    }
-
-    index
-}
-
-fn build_writer_index<'a>(
-    committing_txn: TxnToken,
-    active_writers: &[&'a dyn ActiveTxnView],
-    committed_writers: &[CommittedWriterInfo],
-    target_pages: &HashSet<u32>,
-) -> BTreeMap<u32, Vec<IndexedTxnRecord<'a>>> {
-    let mut index: BTreeMap<u32, Vec<IndexedTxnRecord<'a>>> = BTreeMap::new();
-
-    for writer in active_writers {
-        if writer.token() == committing_txn || !writer.is_active() {
-            continue;
-        }
-        for key in writer.write_keys() {
-            let page = witness_key_page(key);
-            if !target_pages.contains(&page) {
-                continue;
-            }
-            index.entry(page).or_default().push(IndexedTxnRecord {
-                token: writer.token(),
-                begin_seq: writer.begin_seq(),
-                commit_seq: None,
-                source_is_active: true,
-                source_has_in_rw: writer.has_out_rw(),
-                key: Some(key),
-            });
-        }
-    }
-
-    for writer in committed_writers {
-        if writer.token == committing_txn {
-            continue;
-        }
-        for page in &writer.pages {
-            let page_no = page.get();
-            if !target_pages.contains(&page_no) {
-                continue;
-            }
-            index.entry(page_no).or_default().push(IndexedTxnRecord {
-                token: writer.token,
-                begin_seq: CommitSeq::ZERO,
-                commit_seq: Some(writer.commit_seq),
-                source_is_active: false,
-                source_has_in_rw: writer.had_out_rw,
-                key: None,
-            });
-        }
-    }
-
-    index
-}
-
 /// Discover incoming rw-antidependency edges (R -rw-> T).
 ///
 /// Checks both active transactions (from `active_readers`) and committed
@@ -381,58 +271,82 @@ pub fn discover_incoming_edges(
         return edges;
     }
 
-    let target_pages: HashSet<u32> = write_keys.iter().map(witness_key_page).collect();
-    let index = build_reader_index(
-        committing_txn,
-        active_readers,
-        committed_readers,
-        &target_pages,
-    );
     let committing_begin = committing_begin_seq.get();
     let committing_end = committing_commit_seq.get();
     let mut seen_sources = HashSet::new();
-    for write_key in write_keys {
-        let page = witness_key_page(write_key);
-        let Some(candidates) = index.get(&page) else {
+
+    for candidate in active_readers {
+        if candidate.token() == committing_txn || !candidate.is_active() {
             continue;
-        };
-        for candidate in candidates {
-            // Fine-grained filtering: check exact witness overlap.
-            // This prevents false positives when transactions touch different
-            // non-overlapping parts of the same page.
-            if let Some(reader_key) = candidate.key {
-                if !crate::witness_plane::witness_keys_overlap(write_key, reader_key) {
-                    continue;
+        }
+
+        let candidate_begin = candidate.begin_seq().get();
+        let candidate_end = u64::MAX;
+        let overlaps = committing_begin < candidate_end && candidate_begin < committing_end;
+        
+        if !overlaps || seen_sources.contains(&candidate.token()) {
+            continue;
+        }
+
+        for write_key in write_keys {
+            if candidate.check_read_overlap(write_key) {
+                if seen_sources.insert(candidate.token()) {
+                    debug!(
+                        bead_id = "bd-31bo",
+                        from = ?candidate.token(),
+                        to = ?committing_txn,
+                        key = ?write_key,
+                        source = "hot_plane_index",
+                        "discovered incoming rw-antidependency edge"
+                    );
+                    edges.push(DiscoveredEdge {
+                        from: candidate.token(),
+                        to: committing_txn,
+                        overlap_key: write_key.clone(),
+                        source_is_active: true,
+                        source_has_in_rw: candidate.has_in_rw(),
+                    });
                 }
+                break;
             }
+        }
+    }
 
-            let candidate_begin = candidate.begin_seq.get();
-            let candidate_end = candidate.commit_seq.map_or(u64::MAX, CommitSeq::get);
-            let overlaps = committing_begin < candidate_end && candidate_begin < committing_end;
-            if !overlaps || !seen_sources.insert(candidate.token) {
-                continue;
+    for reader in committed_readers {
+        if reader.token == committing_txn {
+            continue;
+        }
+
+        let candidate_begin = reader.begin_seq.get();
+        let candidate_end = reader.commit_seq.get();
+        let overlaps = committing_begin < candidate_end && candidate_begin < committing_end;
+        
+        if !overlaps || seen_sources.contains(&reader.token) {
+            continue;
+        }
+
+        for write_key in write_keys {
+            let page = witness_key_page(write_key);
+            if reader.pages.contains(&PageNumber::new(page).unwrap()) {
+                if seen_sources.insert(reader.token) {
+                    debug!(
+                        bead_id = "bd-31bo",
+                        from = ?reader.token,
+                        to = ?committing_txn,
+                        key = ?write_key,
+                        source = "rcri_index",
+                        "discovered incoming rw-antidependency edge"
+                    );
+                    edges.push(DiscoveredEdge {
+                        from: reader.token,
+                        to: committing_txn,
+                        overlap_key: write_key.clone(),
+                        source_is_active: false,
+                        source_has_in_rw: reader.had_in_rw,
+                    });
+                }
+                break;
             }
-
-            let source = if candidate.source_is_active {
-                "hot_plane_index"
-            } else {
-                "rcri_index"
-            };
-            debug!(
-                bead_id = "bd-31bo",
-                from = ?candidate.token,
-                to = ?committing_txn,
-                key = ?write_key,
-                source,
-                "discovered incoming rw-antidependency edge"
-            );
-            edges.push(DiscoveredEdge {
-                from: candidate.token,
-                to: committing_txn,
-                overlap_key: write_key.clone(),
-                source_is_active: candidate.source_is_active,
-                source_has_in_rw: candidate.source_has_in_rw,
-            });
         }
     }
 
@@ -461,59 +375,82 @@ pub fn discover_outgoing_edges(
         return edges;
     }
 
-    let target_pages: HashSet<u32> = read_keys.iter().map(witness_key_page).collect();
-    let index = build_writer_index(
-        committing_txn,
-        active_writers,
-        committed_writers,
-        &target_pages,
-    );
     let committing_begin = committing_begin_seq.get();
     let committing_end = committing_commit_seq.get();
     let mut seen_targets = HashSet::new();
-    for read_key in read_keys {
-        let page = witness_key_page(read_key);
-        let Some(candidates) = index.get(&page) else {
+
+    for candidate in active_writers {
+        if candidate.token() == committing_txn || !candidate.is_active() {
             continue;
-        };
-        for candidate in candidates {
-            // Fine-grained filtering: check exact witness overlap.
-            if let Some(writer_key) = candidate.key {
-                if !crate::witness_plane::witness_keys_overlap(read_key, writer_key) {
-                    continue;
+        }
+
+        let candidate_begin = candidate.begin_seq().get();
+        let candidate_end = u64::MAX;
+        let overlaps = committing_begin < candidate_end && candidate_begin < committing_end;
+        
+        if !overlaps || seen_targets.contains(&candidate.token()) {
+            continue;
+        }
+
+        for read_key in read_keys {
+            if candidate.check_write_overlap(read_key) {
+                if seen_targets.insert(candidate.token()) {
+                    debug!(
+                        bead_id = "bd-31bo",
+                        from = ?committing_txn,
+                        to = ?candidate.token(),
+                        key = ?read_key,
+                        source = "hot_plane_index",
+                        "discovered outgoing rw-antidependency edge"
+                    );
+                    edges.push(DiscoveredEdge {
+                        from: committing_txn,
+                        to: candidate.token(),
+                        overlap_key: read_key.clone(),
+                        source_is_active: true,
+                        source_has_in_rw: candidate.has_out_rw(),
+                    });
                 }
+                break;
             }
+        }
+    }
 
-            let candidate_begin = candidate.begin_seq.get();
-            let candidate_end = candidate.commit_seq.map_or(u64::MAX, CommitSeq::get);
-            let overlaps = committing_begin < candidate_end && candidate_begin < committing_end;
-            if !overlaps || !seen_targets.insert(candidate.token) {
-                continue;
+    for writer in committed_writers {
+        if writer.token == committing_txn {
+            continue;
+        }
+
+        let candidate_begin = 0; // Committed writers overlap test uses 0 for begin_seq
+        let candidate_end = writer.commit_seq.get();
+        let overlaps = committing_begin < candidate_end && candidate_begin < committing_end;
+        
+        if !overlaps || seen_targets.contains(&writer.token) {
+            continue;
+        }
+
+        for read_key in read_keys {
+            let page = witness_key_page(read_key);
+            if writer.pages.contains(&PageNumber::new(page).unwrap()) {
+                if seen_targets.insert(writer.token) {
+                    debug!(
+                        bead_id = "bd-31bo",
+                        from = ?committing_txn,
+                        to = ?writer.token,
+                        key = ?read_key,
+                        source = "commit_log_index",
+                        "discovered outgoing rw-antidependency edge"
+                    );
+                    edges.push(DiscoveredEdge {
+                        from: committing_txn,
+                        to: writer.token,
+                        overlap_key: read_key.clone(),
+                        source_is_active: false,
+                        source_has_in_rw: writer.had_out_rw,
+                    });
+                }
+                break;
             }
-
-            let source = if candidate.source_is_active {
-                "hot_plane_index"
-            } else {
-                "commit_log_index"
-            };
-            debug!(
-                bead_id = "bd-31bo",
-                from = ?committing_txn,
-                to = ?candidate.token,
-                key = ?read_key,
-                source,
-                "discovered outgoing rw-antidependency edge"
-            );
-            edges.push(DiscoveredEdge {
-                from: committing_txn,
-                to: candidate.token,
-                overlap_key: read_key.clone(),
-                source_is_active: candidate.source_is_active,
-                // For outgoing edges, this flag carries whether the target writer
-                // had outgoing rw state (active: current has_out_rw; committed:
-                // had_out_rw at commit time). It enables committed-writer pivot checks.
-                source_has_in_rw: candidate.source_has_in_rw,
-            });
         }
     }
 
@@ -1240,6 +1177,12 @@ mod tests {
         }
         fn write_keys(&self) -> &[WitnessKey] {
             &self.writes
+        }
+        fn check_read_overlap(&self, key: &WitnessKey) -> bool {
+            self.reads.iter().any(|k| crate::witness_plane::witness_keys_overlap(k, key))
+        }
+        fn check_write_overlap(&self, key: &WitnessKey) -> bool {
+            self.writes.iter().any(|k| crate::witness_plane::witness_keys_overlap(k, key))
         }
         fn has_in_rw(&self) -> bool {
             self.has_in.get()

@@ -290,15 +290,9 @@ fn serialize_freelist_to_write_set<F: VfsFile>(
     let mut page1 = if let Some(buf) = write_set.remove(&PageNumber::ONE) {
         buf
     } else {
+        let page1_vec = inner.read_page_copy(cx, PageNumber::ONE)?;
         let mut buf = inner.cache.pool().acquire()?;
-        let bytes_read = inner.db_file.read(cx, &mut buf, 0)?;
-        if bytes_read < DATABASE_HEADER_SIZE {
-            return Err(FrankenError::DatabaseCorrupt {
-                detail: format!(
-                    "short read while updating freelist header: got {bytes_read} bytes, need at least {DATABASE_HEADER_SIZE}",
-                ),
-            });
-        }
+        buf.copy_from_slice(&page1_vec);
         buf
     };
 

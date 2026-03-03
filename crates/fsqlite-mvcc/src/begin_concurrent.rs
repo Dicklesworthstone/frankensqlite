@@ -31,6 +31,7 @@ use crate::ssi_validation::{
     ActiveTxnView, CommittedReaderInfo, CommittedWriterInfo, DiscoveredEdge, SsiAbortReason,
     discover_incoming_edges, discover_outgoing_edges,
 };
+use crate::witness_plane::witness_keys_overlap;
 
 /// Maximum number of concurrent writers that can be active simultaneously.
 ///
@@ -223,6 +224,18 @@ impl ActiveTxnView for ConcurrentHandle {
         // NOTE: We can't return a slice directly since write_witness_keys() allocates.
         // The SSI validation code will call write_set_pages() directly instead.
         &[]
+    }
+
+    fn check_read_overlap(&self, key: &WitnessKey) -> bool {
+        self.read_witness_keys()
+            .iter()
+            .any(|read_key| witness_keys_overlap(read_key, key))
+    }
+
+    fn check_write_overlap(&self, key: &WitnessKey) -> bool {
+        self.write_witness_keys()
+            .iter()
+            .any(|write_key| witness_keys_overlap(write_key, key))
     }
 
     fn has_in_rw(&self) -> bool {
@@ -575,6 +588,18 @@ impl ActiveTxnView for HandleView<'_> {
 
     fn write_keys(&self) -> &[WitnessKey] {
         &self.write_keys
+    }
+
+    fn check_read_overlap(&self, key: &WitnessKey) -> bool {
+        self.read_keys
+            .iter()
+            .any(|read_key| witness_keys_overlap(read_key, key))
+    }
+
+    fn check_write_overlap(&self, key: &WitnessKey) -> bool {
+        self.write_keys
+            .iter()
+            .any(|write_key| witness_keys_overlap(write_key, key))
     }
 
     fn has_in_rw(&self) -> bool {
