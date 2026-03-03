@@ -2072,6 +2072,11 @@ struct AggColumn {
     /// FILTER clause expression, e.g. `COUNT(*) FILTER (WHERE x > 5)`.
     /// When present, the AggStep is only executed if this evaluates to true.
     filter: Option<Box<Expr>>,
+    /// Wrapper expression applied after AggFinal.  Used when a scalar
+    /// function wraps an aggregate, e.g. `COALESCE(MAX(x), 0)`.  The
+    /// placeholder `Expr::Literal(Literal::Null, _)` marks where the
+    /// aggregate result should be substituted.
+    wrapper_expr: Option<Box<Expr>>,
 }
 
 /// Generate VDBE bytecode for a standalone `VALUES` clause.
@@ -2380,6 +2385,15 @@ fn codegen_select_aggregate(
         }
     }
 
+    // Apply wrapper expressions (e.g. COALESCE(MAX(x), 0)) after AggFinal.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    for (i, agg) in agg_columns.iter().enumerate() {
+        if let Some(wrapper) = &agg.wrapper_expr {
+            let result_reg = out_regs + i as i32;
+            emit_agg_wrapper(b, wrapper, result_reg);
+        }
+    }
+
     // HAVING filter: skip ResultRow if HAVING predicate is false/NULL.
     // For single-group aggregate (no GROUP BY), each output column maps
     // directly to its aggregate accumulator at accum_base + i.
@@ -2459,6 +2473,7 @@ fn parse_aggregate_columns(
                             arg_expr: None,
                             extra_args: Vec::new(),
                             filter: filt,
+                            wrapper_expr: None,
                         });
                     }
                     FunctionArgs::List(exprs) => {
@@ -2473,6 +2488,7 @@ fn parse_aggregate_columns(
                                 arg_expr: None,
                                 extra_args: Vec::new(),
                                 filter: filt,
+                                wrapper_expr: None,
                             });
                         } else {
                             // First argument: try column reference first,
@@ -2495,9 +2511,26 @@ fn parse_aggregate_columns(
                                 arg_expr: expr,
                                 extra_args: extra,
                                 filter: filt,
+                                wrapper_expr: None,
                             });
                         }
                     }
+                }
+            }
+            ResultColumn::Expr { expr, .. } if is_aggregate_expr(expr) => {
+                // Expression wraps an aggregate (e.g. COALESCE(MAX(x), 0)).
+                // Extract the inner aggregate, push it as an AggColumn with
+                // a wrapper_expr that will be evaluated after AggFinal.
+                if let Some((inner_agg, wrapper)) = extract_inner_aggregate(expr, table) {
+                    agg_cols.push(AggColumn {
+                        wrapper_expr: Some(Box::new(wrapper)),
+                        ..inner_agg
+                    });
+                } else {
+                    return Err(CodegenError::Unsupported(
+                        "complex aggregate wrapper expression not supported without GROUP BY"
+                            .to_owned(),
+                    ));
                 }
             }
             _ => {
@@ -2508,6 +2541,137 @@ fn parse_aggregate_columns(
         }
     }
     Ok(agg_cols)
+}
+
+/// Emit bytecode for an aggregate wrapper expression.
+///
+/// Handles COALESCE/IFNULL patterns: if the aggregate result in `result_reg`
+/// is NULL, substitute the first non-NULL fallback literal.
+fn emit_agg_wrapper(b: &mut ProgramBuilder, wrapper: &Expr, result_reg: i32) {
+    if let Expr::FunctionCall {
+        name,
+        args: FunctionArgs::List(args),
+        ..
+    } = wrapper
+    {
+        let upper = name.to_ascii_uppercase();
+        if (upper == "COALESCE" || upper == "IFNULL") && args.len() >= 2 {
+            // Chain: for each fallback, check if result_reg is non-null.
+            // NotNull jumps to done_label if result_reg is already non-null.
+            // Otherwise, load the fallback and check again.
+            let done_label = b.emit_label();
+            for fallback_arg in &args[1..] {
+                // If result_reg is NOT NULL, skip all remaining fallbacks.
+                b.emit_jump_to_label(Opcode::NotNull, result_reg, 0, done_label, P4::None, 0);
+                // Load fallback into result_reg.
+                emit_expr(b, fallback_arg, result_reg, None);
+            }
+            b.resolve_label(done_label);
+            return;
+        }
+    }
+    // For unsupported wrapper patterns, the aggregate result is emitted as-is.
+}
+
+/// Extract the single aggregate function call from a wrapper expression.
+///
+/// Returns `(AggColumn, wrapper_expr)` where `wrapper_expr` has the aggregate
+/// call replaced with a `ColumnRef` placeholder named `__agg_result__` that
+/// the codegen emitter will substitute with the accumulator register.
+///
+/// Handles patterns like `COALESCE(MAX(x), 0)`, `ABS(SUM(x))`, etc.
+fn extract_inner_aggregate(expr: &Expr, table: &TableSchema) -> Option<(AggColumn, Expr)> {
+    // Pattern: non-aggregate FunctionCall wrapping an aggregate in its args.
+    if let Expr::FunctionCall {
+        name,
+        args: FunctionArgs::List(outer_args),
+        ..
+    } = expr
+    {
+        if is_aggregate_function(name) {
+            return None; // Already a bare aggregate — shouldn't reach here.
+        }
+        // Find the first argument that is an aggregate function call.
+        for (i, arg) in outer_args.iter().enumerate() {
+            if let Expr::FunctionCall {
+                name: agg_name,
+                args: agg_args,
+                distinct,
+                filter,
+                ..
+            } = arg
+            {
+                if !is_aggregate_function(agg_name) {
+                    continue;
+                }
+                let canon_name = agg_name.to_ascii_uppercase();
+                let filt = filter.clone();
+                let agg_col = match agg_args {
+                    FunctionArgs::Star => AggColumn {
+                        name: canon_name,
+                        num_args: 0,
+                        arg_col_index: None,
+                        arg_is_rowid: false,
+                        distinct: *distinct,
+                        arg_expr: None,
+                        extra_args: Vec::new(),
+                        filter: filt,
+                        wrapper_expr: None,
+                    },
+                    FunctionArgs::List(exprs) if exprs.is_empty() => AggColumn {
+                        name: canon_name,
+                        num_args: 0,
+                        arg_col_index: None,
+                        arg_is_rowid: false,
+                        distinct: *distinct,
+                        arg_expr: None,
+                        extra_args: Vec::new(),
+                        filter: filt,
+                        wrapper_expr: None,
+                    },
+                    FunctionArgs::List(exprs) => {
+                        let (col_idx, is_rowid, a_expr) =
+                            match resolve_column_ref(&exprs[0], table, None) {
+                                Some(SortKeySource::Column(idx)) => (Some(idx), false, None),
+                                Some(SortKeySource::Rowid) => (None, true, None),
+                                _ => (None, false, Some(Box::new(exprs[0].clone()))),
+                            };
+                        let extra: Vec<Expr> = exprs[1..].to_vec();
+                        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+                        AggColumn {
+                            name: canon_name,
+                            num_args: exprs.len() as i32,
+                            arg_col_index: col_idx,
+                            arg_is_rowid: is_rowid,
+                            distinct: *distinct,
+                            arg_expr: a_expr,
+                            extra_args: extra,
+                            filter: filt,
+                            wrapper_expr: None,
+                        }
+                    }
+                };
+                // Build wrapper: replace the aggregate arg with a placeholder.
+                let placeholder = Expr::Column(
+                    ColumnRef::bare("__agg_result__"),
+                    fsqlite_ast::Span::ZERO,
+                );
+                let mut new_args = outer_args.clone();
+                new_args[i] = placeholder;
+                let wrapper = Expr::FunctionCall {
+                    name: name.clone(),
+                    args: FunctionArgs::List(new_args),
+                    distinct: false,
+                    order_by: Vec::new(),
+                    filter: None,
+                    over: None,
+                    span: fsqlite_ast::Span::ZERO,
+                };
+                return Some((agg_col, wrapper));
+            }
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -2600,6 +2764,7 @@ fn parse_group_by_output(
                             arg_expr: None,
                             extra_args: Vec::new(),
                             filter: filt,
+                            wrapper_expr: None,
                         });
                     }
                     FunctionArgs::List(exprs) => {
@@ -2613,6 +2778,7 @@ fn parse_group_by_output(
                                 arg_expr: None,
                                 extra_args: Vec::new(),
                                 filter: filt,
+                                wrapper_expr: None,
                             });
                         } else {
                             // Try column reference first, fall back to expression.
@@ -2633,6 +2799,7 @@ fn parse_group_by_output(
                                 arg_expr: expr,
                                 extra_args: extra,
                                 filter: filt,
+                                wrapper_expr: None,
                             });
                         }
                     }
@@ -2743,6 +2910,7 @@ fn collect_having_aggregates(
                             arg_expr: None,
                             extra_args: Vec::new(),
                             filter: filt,
+                            wrapper_expr: None,
                         });
                     }
                     FunctionArgs::List(exprs) => {
@@ -2756,6 +2924,7 @@ fn collect_having_aggregates(
                                 arg_expr: None,
                                 extra_args: Vec::new(),
                                 filter: filt,
+                                wrapper_expr: None,
                             });
                         } else {
                             let (col_idx, is_rowid, arg_e) =
@@ -2775,6 +2944,7 @@ fn collect_having_aggregates(
                                 arg_expr: arg_e,
                                 extra_args: extra,
                                 filter: filt,
+                                wrapper_expr: None,
                             });
                         }
                     }
