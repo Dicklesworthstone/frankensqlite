@@ -17521,6 +17521,7 @@ fn project_join_column(
 
 #[cfg(test)]
 mod tests {
+    static WAL_METRICS_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
     use super::{
         CommitSeq, Connection, InProcessPageLockTable, PagerBackend, Row, SchemaEpoch, Snapshot,
         is_sqlite_master_entry_missing, lock_unpoisoned,
@@ -25036,6 +25037,7 @@ mod tests {
 
     #[test]
     fn test_pragma_checkpoint_stats_and_advisor_surfaces() {
+        let _lock = WAL_METRICS_MUTEX.lock().unwrap();
         let conn = Connection::open(":memory:").unwrap();
         let metrics_map = |rows: &[Row]| {
             rows.iter()
@@ -25122,6 +25124,7 @@ mod tests {
 
     #[test]
     fn test_pragma_checkpoint_autocheckpoint_triggers_and_disable_semantics() {
+        let _lock = WAL_METRICS_MUTEX.lock().unwrap();
         fsqlite_wal::GLOBAL_WAL_METRICS.reset();
         let conn = Connection::open(":memory:").unwrap();
         let metrics_map = |rows: &[Row]| {
@@ -25189,6 +25192,7 @@ mod tests {
 
     #[test]
     fn test_pragma_checkpoint_autocheckpoint_bursty_default_vs_adaptive() {
+        let _lock = WAL_METRICS_MUTEX.lock().unwrap();
         let metrics_map = |rows: &[Row]| {
             rows.iter()
                 .filter_map(|row| {
