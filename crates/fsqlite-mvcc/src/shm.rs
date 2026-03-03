@@ -62,11 +62,8 @@ mod offsets {
     /// `u64` — serialized writer txn id (0 = none).
     pub const SERIALIZED_WRITER_TXN_ID: usize = 72;
 
-    /// `u32` — serialized writer PID.
-    pub const SERIALIZED_WRITER_PID: usize = 80;
-
-    /// `u32` — alignment padding (always 0).
-    pub const ALIGN1: usize = 84;
+    /// `u64` — serialized writer PID (lower 32) and generation (upper 32).
+    pub const SERIALIZED_WRITER_PID_AND_GEN: usize = 80;
 
     /// `u64` — serialized writer PID birth timestamp.
     pub const SERIALIZED_WRITER_PID_BIRTH: usize = 88;
@@ -158,7 +155,7 @@ pub struct SharedMemoryLayout {
     ecs_epoch: AtomicU64,
     gc_horizon: AtomicU64,
     serialized_writer_txn_id: AtomicU64,
-    serialized_writer_pid: AtomicU32,
+    serialized_writer_pid_and_gen: AtomicU64,
     serialized_writer_pid_birth: AtomicU64,
     serialized_writer_lease_expiry: AtomicU64,
 }
@@ -225,7 +222,7 @@ impl SharedMemoryLayout {
             ecs_epoch: AtomicU64::new(0),
             gc_horizon: AtomicU64::new(0),
             serialized_writer_txn_id: AtomicU64::new(0),
-            serialized_writer_pid: AtomicU32::new(0),
+            serialized_writer_pid_and_gen: AtomicU64::new(0),
             serialized_writer_pid_birth: AtomicU64::new(0),
             serialized_writer_lease_expiry: AtomicU64::new(0),
         }
@@ -294,7 +291,7 @@ impl SharedMemoryLayout {
         let ecs_epoch = read_u64(buf, offsets::ECS_EPOCH);
         let gc_horizon = read_u64(buf, offsets::GC_HORIZON);
         let sw_txn_id = read_u64(buf, offsets::SERIALIZED_WRITER_TXN_ID);
-        let sw_pid = read_u32(buf, offsets::SERIALIZED_WRITER_PID);
+        let sw_pid_and_gen = read_u64(buf, offsets::SERIALIZED_WRITER_PID_AND_GEN);
         let sw_pid_birth = read_u64(buf, offsets::SERIALIZED_WRITER_PID_BIRTH);
         let sw_lease = read_u64(buf, offsets::SERIALIZED_WRITER_LEASE_EXPIRY);
 
@@ -314,7 +311,7 @@ impl SharedMemoryLayout {
             ecs_epoch: AtomicU64::new(ecs_epoch),
             gc_horizon: AtomicU64::new(gc_horizon),
             serialized_writer_txn_id: AtomicU64::new(sw_txn_id),
-            serialized_writer_pid: AtomicU32::new(sw_pid),
+            serialized_writer_pid_and_gen: AtomicU64::new(sw_pid_and_gen),
             serialized_writer_pid_birth: AtomicU64::new(sw_pid_birth),
             serialized_writer_lease_expiry: AtomicU64::new(sw_lease),
         })
@@ -370,12 +367,11 @@ impl SharedMemoryLayout {
             offsets::SERIALIZED_WRITER_TXN_ID,
             self.serialized_writer_txn_id.load(Ordering::Acquire),
         );
-        write_u32(
+        write_u64(
             &mut buf,
-            offsets::SERIALIZED_WRITER_PID,
-            self.serialized_writer_pid.load(Ordering::Acquire),
+            offsets::SERIALIZED_WRITER_PID_AND_GEN,
+            self.serialized_writer_pid_and_gen.load(Ordering::Acquire),
         );
-        write_u32(&mut buf, offsets::ALIGN1, 0);
         write_u64(
             &mut buf,
             offsets::SERIALIZED_WRITER_PID_BIRTH,
@@ -548,7 +544,13 @@ impl SharedMemoryLayout {
         {
             return false;
         }
-        self.serialized_writer_pid.store(pid, Ordering::Release);
+
+        let old_packed = self.serialized_writer_pid_and_gen.load(Ordering::Acquire);
+        let old_gen = (old_packed >> 32) as u32;
+        let new_gen = old_gen.wrapping_add(1);
+        let new_packed = u64::from(pid) | (u64::from(new_gen) << 32);
+
+        self.serialized_writer_pid_and_gen.store(new_packed, Ordering::Release);
         self.serialized_writer_pid_birth
             .store(pid_birth, Ordering::Release);
         self.serialized_writer_lease_expiry
@@ -562,7 +564,7 @@ impl SharedMemoryLayout {
     /// Per spec: clear writer txn id BEFORE releasing mutex.
     pub fn release_serialized_writer(&self, writer_txn_id_raw: u64) -> bool {
         // Read our own aux fields before releasing the lock so we can carefully CAS them.
-        let my_pid = self.serialized_writer_pid.load(Ordering::Acquire);
+        let my_packed = self.serialized_writer_pid_and_gen.load(Ordering::Acquire);
         let my_birth = self.serialized_writer_pid_birth.load(Ordering::Acquire);
         let my_lease = self.serialized_writer_lease_expiry.load(Ordering::Acquire);
 
@@ -576,7 +578,10 @@ impl SharedMemoryLayout {
 
         // Clear auxiliary fields using CAS to avoid stomping on a new writer's
         // fields if they managed to acquire the lock immediately after we released it.
-        let _ = self.serialized_writer_pid.compare_exchange(my_pid, 0, Ordering::AcqRel, Ordering::Relaxed);
+        // Because `pid_and_gen` incorporates a generation counter incremented on every
+        // acquire, this CAS is guaranteed to fail if a new writer acquired the lock,
+        // even if the new writer is from the exact same process (same PID).
+        let _ = self.serialized_writer_pid_and_gen.compare_exchange(my_packed, 0, Ordering::AcqRel, Ordering::Relaxed);
         let _ = self.serialized_writer_pid_birth.compare_exchange(my_birth, 0, Ordering::AcqRel, Ordering::Relaxed);
         let _ = self.serialized_writer_lease_expiry.compare_exchange(my_lease, 0, Ordering::AcqRel, Ordering::Relaxed);
         true
@@ -625,7 +630,8 @@ impl SharedMemoryLayout {
                 return Ok(());
             }
 
-            let pid = self.serialized_writer_pid.load(Ordering::Acquire);
+            let packed_pid = self.serialized_writer_pid_and_gen.load(Ordering::Acquire);
+            let pid = packed_pid as u32;
             let pid_birth = self.serialized_writer_pid_birth.load(Ordering::Acquire);
             let lease_expiry = self.serialized_writer_lease_expiry.load(Ordering::Acquire);
 
@@ -660,7 +666,7 @@ impl SharedMemoryLayout {
             for _ in 0..10 {
                 std::hint::spin_loop();
                 if self.serialized_writer_txn_id.load(Ordering::Acquire) != writer_txn_id_raw ||
-                   self.serialized_writer_pid.load(Ordering::Acquire) != pid 
+                   self.serialized_writer_pid_and_gen.load(Ordering::Acquire) != packed_pid
                 {
                     is_torn = true;
                     break;
@@ -688,7 +694,7 @@ impl SharedMemoryLayout {
                 .is_ok()
             {
                 // Clear auxiliary fields using CAS to avoid stomping a new writer's fields.
-                let _ = self.serialized_writer_pid.compare_exchange(pid, 0, Ordering::AcqRel, Ordering::Relaxed);
+                let _ = self.serialized_writer_pid_and_gen.compare_exchange(packed_pid, 0, Ordering::AcqRel, Ordering::Relaxed);
                 let _ = self.serialized_writer_pid_birth.compare_exchange(pid_birth, 0, Ordering::AcqRel, Ordering::Relaxed);
                 let _ = self.serialized_writer_lease_expiry.compare_exchange(lease_expiry, 0, Ordering::AcqRel, Ordering::Relaxed);
 
@@ -989,6 +995,7 @@ mod tests {
             offsets::ECS_EPOCH,
             offsets::GC_HORIZON,
             offsets::SERIALIZED_WRITER_TXN_ID,
+            offsets::SERIALIZED_WRITER_PID_AND_GEN,
             offsets::SERIALIZED_WRITER_PID_BIRTH,
             offsets::SERIALIZED_WRITER_LEASE_EXPIRY,
             offsets::LOCK_TABLE_OFFSET,
@@ -1010,8 +1017,6 @@ mod tests {
             offsets::PAGE_SIZE,
             offsets::MAX_TXN_SLOTS,
             offsets::ALIGN0,
-            offsets::SERIALIZED_WRITER_PID,
-            offsets::ALIGN1,
         ];
         for &off in &u32_offsets {
             assert_eq!(off % 4, 0, "offset {off} not 4-byte aligned");
@@ -1285,7 +1290,7 @@ mod tests {
                 .load(Ordering::Relaxed),
             lease_expiry
         );
-        assert_eq!(layout.serialized_writer_pid.load(Ordering::Relaxed), 1234);
+        assert_eq!(layout.serialized_writer_pid_and_gen.load(Ordering::Relaxed) as u32, 1234);
         assert_eq!(
             layout.serialized_writer_pid_birth.load(Ordering::Relaxed),
             999
@@ -1315,7 +1320,7 @@ mod tests {
         let res = layout.check_serialized_writer_exclusion(now, |_pid, _birth| false);
         assert!(res.is_ok(), "stale indicator should be cleared");
         assert!(layout.check_serialized_writer().is_none());
-        assert_eq!(layout.serialized_writer_pid.load(Ordering::Relaxed), 0);
+        assert_eq!(layout.serialized_writer_pid_and_gen.load(Ordering::Relaxed) as u32, 0);
         assert_eq!(
             layout.serialized_writer_pid_birth.load(Ordering::Relaxed),
             0
@@ -1520,7 +1525,7 @@ mod tests {
         assert!(layout.acquire_serialized_writer(42, 1234, 999, 10_000));
 
         // Verify aux fields are set.
-        assert_eq!(layout.serialized_writer_pid.load(Ordering::Relaxed), 1234);
+        assert_eq!(layout.serialized_writer_pid_and_gen.load(Ordering::Relaxed) as u32, 1234);
         assert_eq!(
             layout.serialized_writer_pid_birth.load(Ordering::Relaxed),
             999
@@ -1532,7 +1537,7 @@ mod tests {
         // Token cleared first, then aux fields.
         assert!(layout.check_serialized_writer().is_none());
         assert_eq!(
-            layout.serialized_writer_pid.load(Ordering::Relaxed),
+            layout.serialized_writer_pid_and_gen.load(Ordering::Relaxed) as u32,
             0,
             "PID must be cleared on release"
         );

@@ -383,14 +383,23 @@ impl BocpdMonitor {
         let mut new_entries: Vec<RunEntry> = Vec::with_capacity(n + 1);
 
         // The changepoint entry (r_t = 0): sum over all r_{t-1} of
-        // P(x_t | r_{t-1}) * H(r_{t-1}) * P(r_{t-1}).
+        // P(x_t | r_t = 0) * H(r_{t-1}) * P(r_{t-1}).
+        let prior_pred = match self.config.model {
+            ConjugateModel::NormalGamma { .. } => {
+                NormalGammaStats::new().predictive_log_prob(x, &self.config.model)
+            }
+            ConjugateModel::BetaBinomial { .. } => {
+                BetaBinomialStats::new().predictive_log_prob(x, &self.config.model)
+            }
+        };
+
         let mut log_cp_terms: Vec<f64> = Vec::with_capacity(n);
-        for (i, entry) in self.entries.iter().enumerate() {
+        for entry in &self.entries {
             let h_i = self.config.hazard.evaluate(entry.run_length);
             let log_h = h_i.ln();
-            log_cp_terms.push(entry.log_prob + log_preds[i] + log_h);
+            log_cp_terms.push(entry.log_prob + log_h);
         }
-        let log_cp_prob = log_sum_exp(&log_cp_terms);
+        let log_cp_prob = log_sum_exp(&log_cp_terms) + prior_pred;
 
         // New changepoint entry (r_t = 0).
         let cp_entry = RunEntry {

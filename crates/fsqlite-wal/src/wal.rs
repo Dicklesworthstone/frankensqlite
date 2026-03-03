@@ -405,6 +405,7 @@ impl<F: VfsFile> WalFile<F> {
             salt2 = header.salts.salt2,
             "WAL file created"
         );
+        crate::metrics::GLOBAL_WAL_METRICS.set_wal_frames_current(0);
 
         Ok(Self {
             file,
@@ -547,6 +548,8 @@ impl<F: VfsFile> WalFile<F> {
             valid_frames = last_commit_frames,
             "WAL file opened"
         );
+        crate::metrics::GLOBAL_WAL_METRICS
+            .set_wal_frames_current(u64::try_from(last_commit_frames).unwrap_or(u64::MAX));
 
         Ok(Self {
             file,
@@ -573,6 +576,8 @@ impl<F: VfsFile> WalFile<F> {
             .checked_add(frames_written)
             .ok_or(FrankenError::DatabaseFull)?;
         self.running_checksum = new_running_checksum;
+        crate::metrics::GLOBAL_WAL_METRICS
+            .set_wal_frames_current(u64::try_from(self.frame_count).unwrap_or(u64::MAX));
         Ok(())
     }
 
@@ -627,6 +632,8 @@ impl<F: VfsFile> WalFile<F> {
 
         self.running_checksum = new_checksum;
         self.frame_count += 1;
+        crate::metrics::GLOBAL_WAL_METRICS
+            .set_wal_frames_current(u64::try_from(self.frame_count).unwrap_or(u64::MAX));
 
         let bytes_written = u64::try_from(frame_size).unwrap_or(u64::MAX);
         let span = tracing::span!(
@@ -779,6 +786,7 @@ impl<F: VfsFile> WalFile<F> {
         self.running_checksum = read_wal_header_checksum(&header_bytes)?;
         self.header = WalHeader::from_bytes(&header_bytes)?;
         self.frame_count = 0;
+        crate::metrics::GLOBAL_WAL_METRICS.set_wal_frames_current(0);
 
         debug!(
             checkpoint_seq = new_checkpoint_seq,

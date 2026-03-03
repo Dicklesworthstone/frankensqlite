@@ -806,37 +806,6 @@ where
                 inner.db_size = inner.db_size.max(page_no.get());
             }
 
-            // Phase 2b: Patch page_count and change_counter in the on-disk
-            // page 1 header so that external SQLite readers (which rely on
-            // the header's page_count at offset 28) see a consistent value.
-            // Without this, the header can report page_count=1 while the
-            // file actually contains dozens of pages, causing
-            // `PRAGMA integrity_check` to fail with "database disk image is
-            // malformed".  (See issue #8.)
-            {
-                let new_page_count = inner.db_size;
-                let new_change_counter = inner.commit_seq.get().wrapping_add(1) as u32;
-
-                // Read existing page 1 from disk so we only patch the
-                // relevant header fields.
-                let mut page1 = vec![0u8; ps];
-                let bytes_read = inner.db_file.read(cx, &mut page1, 0)?;
-                if bytes_read >= DATABASE_HEADER_SIZE {
-                    // Offset 24..28: change counter (big-endian u32)
-                    page1[24..28].copy_from_slice(&new_change_counter.to_be_bytes());
-                    // Offset 28..32: page count (big-endian u32)
-                    page1[28..32].copy_from_slice(&new_page_count.to_be_bytes());
-                    // Offset 92..96: version-valid-for must equal change
-                    // counter so SQLite trusts the header page_count.
-                    page1[92..96].copy_from_slice(&new_change_counter.to_be_bytes());
-                    inner.db_file.write(cx, &page1, 0)?;
-                    // Evict page 1 from cache so subsequent reads see the
-                    // patched header (page_count, change_counter,
-                    // version_valid_for) rather than stale cached values.
-                    inner.cache.evict(PageNumber::ONE);
-                }
-            }
-
             inner.db_file.sync(cx, SyncFlags::NORMAL)?;
 
             // Phase 3: Delete journal (commit point).
@@ -869,10 +838,8 @@ where
             let frame_count = sorted_pages.len();
             let max_written = sorted_pages.last().map_or(0, |p| p.get());
 
-            // Pre-compute the new db_size so we can patch page 1's header
-            // before it enters the WAL.  (See issue #8.)
+            // Pre-compute the new db_size
             let new_db_size = inner.db_size.max(max_written);
-            let new_change_counter = inner.commit_seq.get().wrapping_add(1) as u32;
 
             for (idx, page_no) in sorted_pages.iter().enumerate() {
                 let data = &write_set[page_no];
@@ -883,17 +850,7 @@ where
                     0
                 };
 
-                // Patch page 1 header with correct page_count so that WAL
-                // checkpointing produces a valid database file.
-                if *page_no == PageNumber::ONE && data.len() >= DATABASE_HEADER_SIZE {
-                    let mut patched = data.to_vec();
-                    patched[24..28].copy_from_slice(&new_change_counter.to_be_bytes());
-                    patched[28..32].copy_from_slice(&new_db_size.to_be_bytes());
-                    patched[92..96].copy_from_slice(&new_change_counter.to_be_bytes());
-                    wal.append_frame(cx, page_no.get(), &patched, db_size_if_commit)?;
-                } else {
-                    wal.append_frame(cx, page_no.get(), data, db_size_if_commit)?;
-                }
+                wal.append_frame(cx, page_no.get(), data, db_size_if_commit)?;
             }
 
             // Sync WAL to ensure durability.
@@ -1055,6 +1012,24 @@ where
             .inner
             .lock()
             .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
+
+        // ── Header Patching ──
+        // Patch page 1 header with correct page_count and change_counter in the write set.
+        // This ensures the commit functions write a consistent header without needing extra I/O.
+        if let Some(page1) = self.write_set.get_mut(&PageNumber::ONE) {
+            if page1.len() >= DATABASE_HEADER_SIZE {
+                let max_written = self.write_set.keys().map(|p| p.get()).max().unwrap_or(0);
+                let new_db_size = inner.db_size.max(max_written);
+                let new_change_counter = inner.commit_seq.get().wrapping_add(1) as u32;
+
+                // Offset 24..28: change counter (big-endian u32)
+                page1[24..28].copy_from_slice(&new_change_counter.to_be_bytes());
+                // Offset 28..32: page count (big-endian u32)
+                page1[28..32].copy_from_slice(&new_db_size.to_be_bytes());
+                // Offset 92..96: version-valid-for
+                page1[92..96].copy_from_slice(&new_change_counter.to_be_bytes());
+            }
+        }
 
         let commit_result = if self.journal_mode == JournalMode::Wal {
             Self::commit_wal(cx, &mut inner, &self.write_set, &mut self.freed_pages)

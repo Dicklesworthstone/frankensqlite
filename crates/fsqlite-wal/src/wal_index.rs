@@ -361,8 +361,9 @@ impl WalIndexHashSegment {
 
     /// Insert a page number using linear probing.
     ///
-    /// If the same page already exists in the probe chain, its slot is updated
-    /// to point at the newest entry.
+    /// Every appended frame gets a unique slot in the hash table, even if the same
+    /// page already exists. This allows readers to find the most recent version
+    /// of a page that was committed prior to their read mark.
     pub fn insert(&mut self, page_number: u32) -> Result<u16> {
         if self.page_numbers.len() >= self.capacity() {
             return Err(FrankenError::DatabaseFull);

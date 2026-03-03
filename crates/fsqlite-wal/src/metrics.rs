@@ -25,6 +25,8 @@ pub struct WalMetrics {
     pub frames_written_total: AtomicU64,
     /// Total bytes written to the WAL (frame headers + page data).
     pub bytes_written_total: AtomicU64,
+    /// Current WAL frame count gauge (tracks live `WalFile::frame_count`).
+    pub wal_frames_current: AtomicU64,
     /// Total number of checkpoint operations executed.
     pub checkpoint_count: AtomicU64,
     /// Total frames backfilled to the database during checkpoints.
@@ -42,6 +44,7 @@ impl WalMetrics {
         Self {
             frames_written_total: AtomicU64::new(0),
             bytes_written_total: AtomicU64::new(0),
+            wal_frames_current: AtomicU64::new(0),
             checkpoint_count: AtomicU64::new(0),
             checkpoint_frames_backfilled_total: AtomicU64::new(0),
             checkpoint_duration_us_total: AtomicU64::new(0),
@@ -54,6 +57,12 @@ impl WalMetrics {
         self.frames_written_total.fetch_add(1, Ordering::Relaxed);
         self.bytes_written_total
             .fetch_add(frame_bytes, Ordering::Relaxed);
+    }
+
+    /// Update the current WAL frame count gauge.
+    pub fn set_wal_frames_current(&self, frame_count: u64) {
+        self.wal_frames_current
+            .store(frame_count, Ordering::Relaxed);
     }
 
     /// Record a completed checkpoint.
@@ -76,6 +85,7 @@ impl WalMetrics {
         WalMetricsSnapshot {
             frames_written_total: self.frames_written_total.load(Ordering::Relaxed),
             bytes_written_total: self.bytes_written_total.load(Ordering::Relaxed),
+            wal_frames_current: self.wal_frames_current.load(Ordering::Relaxed),
             checkpoint_count: self.checkpoint_count.load(Ordering::Relaxed),
             checkpoint_frames_backfilled_total: self
                 .checkpoint_frames_backfilled_total
@@ -89,6 +99,7 @@ impl WalMetrics {
     pub fn reset(&self) {
         self.frames_written_total.store(0, Ordering::Relaxed);
         self.bytes_written_total.store(0, Ordering::Relaxed);
+        self.wal_frames_current.store(0, Ordering::Relaxed);
         self.checkpoint_count.store(0, Ordering::Relaxed);
         self.checkpoint_frames_backfilled_total
             .store(0, Ordering::Relaxed);
@@ -113,6 +124,7 @@ impl Default for WalMetrics {
 pub struct WalMetricsSnapshot {
     pub frames_written_total: u64,
     pub bytes_written_total: u64,
+    pub wal_frames_current: u64,
     pub checkpoint_count: u64,
     pub checkpoint_frames_backfilled_total: u64,
     pub checkpoint_duration_us_total: u64,
@@ -134,10 +146,11 @@ impl fmt::Display for WalMetricsSnapshot {
         write!(
             f,
             "wal_frames_written={} wal_bytes_written={} checkpoints={} \
-             ckpt_frames_backfilled={} ckpt_duration_us={} wal_resets={}",
+             wal_frames_current={} ckpt_frames_backfilled={} ckpt_duration_us={} wal_resets={}",
             self.frames_written_total,
             self.bytes_written_total,
             self.checkpoint_count,
+            self.wal_frames_current,
             self.checkpoint_frames_backfilled_total,
             self.checkpoint_duration_us_total,
             self.wal_resets_total,
