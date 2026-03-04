@@ -28,15 +28,15 @@ use fsqlite_error::{ErrorCode, FrankenError, Result};
 use fsqlite_func::vtab::ColumnContext;
 use fsqlite_func::{ErasedAggregateFunction, FunctionRegistry};
 use fsqlite_mvcc::{
-    ConcurrentRegistry, InProcessPageLockTable, MvccError, concurrent_read_page,
-    concurrent_write_page,
+    ConcurrentRegistry, InProcessPageLockTable, MvccError, TimeTravelSnapshot, VersionStore,
+    concurrent_read_page, concurrent_write_page,
 };
 use fsqlite_pager::TransactionHandle;
 use fsqlite_types::cx::Cx;
 use fsqlite_types::opcode::{Opcode, P4, VdbeOp};
 use fsqlite_types::record::{parse_record, serialize_record};
 use fsqlite_types::value::SqliteValue;
-use fsqlite_types::{PageData, PageNumber, StrictColumnType};
+use fsqlite_types::{CommitSeq, PageData, PageNumber, SchemaEpoch, StrictColumnType};
 
 use crate::VdbeProgram;
 
@@ -800,19 +800,107 @@ impl PageWriter for SharedTxnPageIo {
     }
 }
 
+// ── Time-Travel Page I/O ──────────────────────────────────────────────
+//
+// Wraps a `SharedTxnPageIo` and a `TimeTravelSnapshot` + `VersionStore`
+// to intercept page reads and return historical page versions when
+// available. Falls back to the underlying transaction for pages not
+// present in the version store (i.e., pages unchanged since the
+// time-travel target).
+
+/// Read-only page I/O that serves historical page versions for
+/// time-travel queries (`FOR SYSTEM_TIME AS OF ...`).
+///
+/// On `read_page`, the wrapper first resolves the page through the MVCC
+/// `VersionStore` at the snapshot's commit sequence. If a historical
+/// version is found, its `PageData` is returned directly. Otherwise the
+/// read falls through to the underlying transaction (the page has not
+/// changed since the target commit, so the current version is correct).
+///
+/// Write operations are unconditionally rejected — time-travel cursors
+/// are strictly read-only.
+#[derive(Clone)]
+struct TimeTravelPageIo {
+    /// Underlying transaction page I/O for fall-through reads.
+    inner: SharedTxnPageIo,
+    /// MVCC version store for historical page resolution.
+    version_store: Rc<RefCell<VersionStore>>,
+    /// The pinned time-travel snapshot.
+    snapshot: TimeTravelSnapshot,
+}
+
+impl std::fmt::Debug for TimeTravelPageIo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TimeTravelPageIo")
+            .field("inner", &self.inner)
+            .field("version_store", &"<Rc<RefCell<VersionStore>>>")
+            .field("target_commit_seq", &self.snapshot.target_commit_seq().get())
+            .finish()
+    }
+}
+
+impl PageReader for TimeTravelPageIo {
+    fn read_page(&self, cx: &Cx, page_no: PageNumber) -> Result<Vec<u8>> {
+        // Try to resolve the page at the historical snapshot first.
+        let vs = self.version_store.borrow();
+        if let Some(idx) = self.snapshot.resolve_page(&vs, page_no) {
+            if let Some(version) = vs.get_version(idx) {
+                tracing::trace!(
+                    page_id = page_no.get(),
+                    commit_seq = self.snapshot.target_commit_seq().get(),
+                    "time-travel: serving historical page from version store"
+                );
+                return Ok(version.data.into_vec());
+            }
+        }
+        drop(vs);
+        // Page not in the version store — it hasn't changed since the
+        // target commit, so the current transaction's page is correct.
+        tracing::trace!(
+            page_id = page_no.get(),
+            commit_seq = self.snapshot.target_commit_seq().get(),
+            "time-travel: page not in version store, falling through to txn"
+        );
+        self.inner.read_page(cx, page_no)
+    }
+}
+
+impl PageWriter for TimeTravelPageIo {
+    fn write_page(&mut self, _cx: &Cx, _page_no: PageNumber, _data: &[u8]) -> Result<()> {
+        Err(FrankenError::Internal(
+            "time-travel cursors are read-only: write_page not permitted".to_owned(),
+        ))
+    }
+
+    fn allocate_page(&mut self, _cx: &Cx) -> Result<PageNumber> {
+        Err(FrankenError::Internal(
+            "time-travel cursors are read-only: allocate_page not permitted".to_owned(),
+        ))
+    }
+
+    fn free_page(&mut self, _cx: &Cx, _page_no: PageNumber) -> Result<()> {
+        Err(FrankenError::Internal(
+            "time-travel cursors are read-only: free_page not permitted".to_owned(),
+        ))
+    }
+}
+
 // ── Cursor Backend Enum ────────────────────────────────────────────────
 //
-// Allows StorageCursor to work in two modes:
+// Allows StorageCursor to work in three modes:
 // - `Mem`: backed by MemPageStore (Phase 4 / tests)
 // - `Txn`: backed by SharedTxnPageIo (Phase 5 production path)
+// - `TimeTravel`: backed by TimeTravelPageIo (historical snapshot reads)
 
-/// Backend for a storage cursor, dispatching between in-memory and
-/// transaction-backed page I/O.
+/// Backend for a storage cursor, dispatching between in-memory,
+/// transaction-backed, and time-travel page I/O.
 enum CursorBackend {
     /// In-memory page store (used by tests and Phase 4 fallback).
     Mem(BtCursor<MemPageStore>),
     /// Real pager transaction (Phase 5 production path, bd-2a3y).
     Txn(BtCursor<SharedTxnPageIo>),
+    /// Time-travel snapshot (historical reads via MVCC version store).
+    TimeTravel(BtCursor<TimeTravelPageIo>),
 }
 
 impl std::fmt::Debug for CursorBackend {
@@ -820,6 +908,7 @@ impl std::fmt::Debug for CursorBackend {
         match self {
             Self::Mem(c) => f.debug_tuple("Mem").field(c).finish(),
             Self::Txn(c) => f.debug_tuple("Txn").field(c).finish(),
+            Self::TimeTravel(c) => f.debug_tuple("TimeTravel").field(c).finish(),
         }
     }
 }
@@ -837,6 +926,13 @@ impl CursorBackend {
         matches!(self, Self::Txn(_))
     }
 
+    /// Returns `true` if this cursor is a time-travel cursor.
+    #[must_use]
+    #[allow(dead_code)]
+    fn is_time_travel(&self) -> bool {
+        matches!(self, Self::TimeTravel(_))
+    }
+
     /// Returns a string identifying the backend kind for diagnostics.
     #[must_use]
     #[allow(dead_code)]
@@ -844,16 +940,18 @@ impl CursorBackend {
         match self {
             Self::Mem(_) => "mem",
             Self::Txn(_) => "txn",
+            Self::TimeTravel(_) => "time_travel",
         }
     }
 }
 
-/// Dispatch B-tree cursor operations across both backends.
+/// Dispatch B-tree cursor operations across all backends.
 impl CursorBackend {
     fn first(&mut self, cx: &Cx) -> Result<bool> {
         match self {
             Self::Mem(c) => c.first(cx),
             Self::Txn(c) => c.first(cx),
+            Self::TimeTravel(c) => c.first(cx),
         }
     }
 
@@ -861,6 +959,7 @@ impl CursorBackend {
         match self {
             Self::Mem(c) => c.last(cx),
             Self::Txn(c) => c.last(cx),
+            Self::TimeTravel(c) => c.last(cx),
         }
     }
 
@@ -868,6 +967,7 @@ impl CursorBackend {
         match self {
             Self::Mem(c) => c.next(cx),
             Self::Txn(c) => c.next(cx),
+            Self::TimeTravel(c) => c.next(cx),
         }
     }
 
@@ -875,6 +975,7 @@ impl CursorBackend {
         match self {
             Self::Mem(c) => c.prev(cx),
             Self::Txn(c) => c.prev(cx),
+            Self::TimeTravel(c) => c.prev(cx),
         }
     }
 
@@ -882,6 +983,7 @@ impl CursorBackend {
         match self {
             Self::Mem(c) => c.eof(),
             Self::Txn(c) => c.eof(),
+            Self::TimeTravel(c) => c.eof(),
         }
     }
 
@@ -889,6 +991,7 @@ impl CursorBackend {
         match self {
             Self::Mem(c) => c.rowid(cx),
             Self::Txn(c) => c.rowid(cx),
+            Self::TimeTravel(c) => c.rowid(cx),
         }
     }
 
@@ -896,6 +999,7 @@ impl CursorBackend {
         match self {
             Self::Mem(c) => c.payload(cx),
             Self::Txn(c) => c.payload(cx),
+            Self::TimeTravel(c) => c.payload(cx),
         }
     }
 
@@ -903,6 +1007,7 @@ impl CursorBackend {
         match self {
             Self::Mem(c) => c.table_move_to(cx, rowid),
             Self::Txn(c) => c.table_move_to(cx, rowid),
+            Self::TimeTravel(c) => c.table_move_to(cx, rowid),
         }
     }
 
@@ -910,6 +1015,9 @@ impl CursorBackend {
         match self {
             Self::Mem(c) => c.table_insert(cx, rowid, data),
             Self::Txn(c) => c.table_insert(cx, rowid, data),
+            Self::TimeTravel(_) => Err(FrankenError::Internal(
+                "time-travel cursors are read-only: table_insert not permitted".to_owned(),
+            )),
         }
     }
 
@@ -917,6 +1025,9 @@ impl CursorBackend {
         match self {
             Self::Mem(c) => c.delete(cx),
             Self::Txn(c) => c.delete(cx),
+            Self::TimeTravel(_) => Err(FrankenError::Internal(
+                "time-travel cursors are read-only: delete not permitted".to_owned(),
+            )),
         }
     }
 
@@ -925,6 +1036,7 @@ impl CursorBackend {
         match self {
             Self::Mem(c) => c.index_move_to(cx, key),
             Self::Txn(c) => c.index_move_to(cx, key),
+            Self::TimeTravel(c) => c.index_move_to(cx, key),
         }
     }
 
@@ -933,6 +1045,9 @@ impl CursorBackend {
         match self {
             Self::Mem(c) => c.index_insert(cx, key),
             Self::Txn(c) => c.index_insert(cx, key),
+            Self::TimeTravel(_) => Err(FrankenError::Internal(
+                "time-travel cursors are read-only: index_insert not permitted".to_owned(),
+            )),
         }
     }
 
@@ -947,6 +1062,9 @@ impl CursorBackend {
         match self {
             Self::Mem(c) => c.index_insert_unique(cx, key, n_unique_cols, columns_label),
             Self::Txn(c) => c.index_insert_unique(cx, key, n_unique_cols, columns_label),
+            Self::TimeTravel(_) => Err(FrankenError::Internal(
+                "time-travel cursors are read-only: index_insert_unique not permitted".to_owned(),
+            )),
         }
     }
 
@@ -958,6 +1076,7 @@ impl CursorBackend {
         match self {
             Self::Mem(c) => c.invalidate(),
             Self::Txn(c) => c.invalidate(),
+            Self::TimeTravel(c) => c.invalidate(),
         }
     }
 }
@@ -1879,6 +1998,10 @@ pub struct VdbeEngine {
     /// Keyed by cursor ID; the integration layer uses this to resolve
     /// historical page versions and enforce read-only semantics.
     time_travel_cursors: HashMap<i32, TimeTravelMarker>,
+    /// MVCC version store for time-travel page resolution.
+    /// Set by the connection layer before execution when time-travel
+    /// queries may be present.
+    version_store: Option<Rc<RefCell<VersionStore>>>,
 }
 
 /// Time-travel target marker stored on cursors opened with
@@ -2137,6 +2260,7 @@ impl VdbeEngine {
             vtab_cursors: SwissIndex::new(),
             vtab_instances: SwissIndex::new(),
             time_travel_cursors: HashMap::new(),
+            version_store: None,
         }
     }
 
@@ -2158,6 +2282,15 @@ impl VdbeEngine {
     /// Returns all time-travel cursor mappings.
     pub fn time_travel_cursors(&self) -> &HashMap<i32, TimeTravelMarker> {
         &self.time_travel_cursors
+    }
+
+    /// Set the MVCC version store for time-travel page resolution.
+    ///
+    /// Must be called by the connection layer before executing programs that
+    /// contain `SetSnapshot` opcodes so the engine can create
+    /// `TimeTravelPageIo` cursors.
+    pub fn set_version_store(&mut self, vs: Rc<RefCell<VersionStore>>) {
+        self.version_store = Some(vs);
     }
 
     /// Handles REPLACE conflict resolution natively (bd-2yqp6.x).
@@ -2553,15 +2686,13 @@ impl VdbeEngine {
                 }
 
                 Opcode::SetSnapshot => {
-                    // Attach a time-travel snapshot marker to cursor P1.
-                    // The actual snapshot creation happens in the integration
-                    // layer (fsqlite-core) which intercepts this opcode and
-                    // calls `create_time_travel_snapshot()` from fsqlite-mvcc.
+                    // Attach a time-travel snapshot to cursor P1.
                     //
-                    // At the VDBE level, we store the target so that:
-                    //   1. DML/DDL through this cursor is rejected.
-                    //   2. The integration layer can resolve pages at the
-                    //      correct historical version.
+                    // 1. Record the marker for read-only enforcement.
+                    // 2. If a VersionStore is available, replace the cursor's
+                    //    page I/O backend with `TimeTravelPageIo` so that
+                    //    subsequent reads resolve historical page versions
+                    //    from the MVCC version store.
                     let cursor_id = op.p1;
                     let target = match &op.p4 {
                         P4::TimeTravelCommitSeq(seq) => TimeTravelMarker::CommitSeq(*seq),
@@ -2572,7 +2703,91 @@ impl VdbeEngine {
                             ));
                         }
                     };
-                    self.time_travel_cursors.insert(cursor_id, target);
+                    self.time_travel_cursors.insert(cursor_id, target.clone());
+
+                    // Upgrade the cursor to a time-travel backend if we have
+                    // both a VersionStore and the cursor uses a Txn backend.
+                    if let Some(ref vs) = self.version_store {
+                        if let Some(sc) = self.storage_cursors.get(&cursor_id) {
+                            // We need the cursor's root page and table flag to
+                            // re-create the BtCursor with TimeTravelPageIo.
+                            if let CursorBackend::Txn(_) = &sc.cursor {
+                                let commit_seq = match &target {
+                                    TimeTravelMarker::CommitSeq(seq) => *seq,
+                                    TimeTravelMarker::Timestamp(_ts) => {
+                                        // Timestamp resolution requires CommitLog
+                                        // which is not yet wired. Return an error
+                                        // for now.
+                                        return Err(FrankenError::Internal(
+                                            "SetSnapshot: timestamp-based time-travel \
+                                             not yet supported (CommitLog not available)"
+                                                .to_owned(),
+                                        ));
+                                    }
+                                };
+
+                                let tt_snapshot = TimeTravelSnapshot::new_for_commit_seq(
+                                    CommitSeq::new(commit_seq),
+                                    SchemaEpoch::new(u64::from(self.schema_cookie)),
+                                );
+
+                                // Re-create cursor with TimeTravelPageIo.
+                                // Remove the old cursor to get its metadata.
+                                let old_sc = self.storage_cursors.remove(&cursor_id).unwrap();
+                                let root_page = self
+                                    .cursor_root_pages
+                                    .get(&cursor_id)
+                                    .copied()
+                                    .unwrap_or(1);
+                                let root_pgno = PageNumber::new(root_page as u32)
+                                    .unwrap_or(PageNumber::ONE);
+
+                                // Extract the SharedTxnPageIo from the old cursor.
+                                // Since we verified it's Txn above, this is safe.
+                                let inner_page_io = if let Some(ref page_io) = self.txn_page_io {
+                                    page_io.clone()
+                                } else {
+                                    return Err(FrankenError::Internal(
+                                        "SetSnapshot: no transaction page I/O available"
+                                            .to_owned(),
+                                    ));
+                                };
+
+                                let tt_page_io = TimeTravelPageIo {
+                                    inner: inner_page_io,
+                                    version_store: Rc::clone(vs),
+                                    snapshot: tt_snapshot,
+                                };
+
+                                const PAGE_SIZE: u32 = 4096;
+                                // Infer table-vs-index: if the old cursor was for
+                                // a table we opened with table_move_to semantics.
+                                // We use the same is_table flag.
+                                let is_table_btree = true; // Default: table
+                                let new_cursor = BtCursor::new(
+                                    tt_page_io,
+                                    root_pgno,
+                                    PAGE_SIZE,
+                                    is_table_btree,
+                                );
+                                self.storage_cursors.insert(
+                                    cursor_id,
+                                    StorageCursor {
+                                        cursor: CursorBackend::TimeTravel(new_cursor),
+                                        cx: old_sc.cx,
+                                        writable: false, // Time-travel is always read-only
+                                        last_alloc_rowid: 0,
+                                        cached_row: None,
+                                    },
+                                );
+                                tracing::info!(
+                                    cursor_id,
+                                    commit_seq,
+                                    "SetSnapshot: upgraded cursor to time-travel backend"
+                                );
+                            }
+                        }
+                    }
                     pc += 1;
                 }
 

@@ -421,10 +421,15 @@ pub(crate) fn balance_nonroot<W: PageWriter>(
                 // For interior pages: the divider's left-child pointer is replaced
                 // by the right-child of the current sibling.
                 let mut div = divider_cells[sib_idx].clone();
-                if let Some(rc) = page_header.right_child {
-                    if div.len() >= 4 {
-                        div[0..4].copy_from_slice(&rc.get().to_be_bytes());
-                    }
+                let rc = page_header.right_child.ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: "interior page missing right_child during balance".to_owned(),
+                })?;
+                if div.len() >= 4 {
+                    div[0..4].copy_from_slice(&rc.get().to_be_bytes());
+                } else {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: "interior divider cell too small".to_owned(),
+                    });
                 }
                 all_cells.push(GatheredCell {
                     size: u16::try_from(div.len()).unwrap_or(u16::MAX),

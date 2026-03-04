@@ -1922,8 +1922,15 @@ pub fn read_wal_fec_raptorq_repair_symbols(sidecar_path: &Path) -> Result<u8> {
         return Ok(DEFAULT_RAPTORQ_REPAIR_SYMBOLS);
     }
 
-    let bytes = fs::read(sidecar_path)?;
-    let Some(header) = WalFecPragmaHeader::from_prefix(&bytes)? else {
+    let mut file = match fs::File::open(sidecar_path) {
+        Ok(f) => f,
+        Err(_) => return Ok(DEFAULT_RAPTORQ_REPAIR_SYMBOLS),
+    };
+    let mut bytes = [0_u8; WAL_FEC_PRAGMA_HEADER_BYTES];
+    use std::io::Read;
+    let read_len = file.read(&mut bytes).unwrap_or(0);
+
+    let Some(header) = WalFecPragmaHeader::from_prefix(&bytes[..read_len])? else {
         return Ok(DEFAULT_RAPTORQ_REPAIR_SYMBOLS);
     };
 
@@ -1939,30 +1946,46 @@ pub fn read_wal_fec_raptorq_repair_symbols(sidecar_path: &Path) -> Result<u8> {
 ///
 /// Existing sidecar group data is preserved exactly after the header region.
 pub fn persist_wal_fec_raptorq_repair_symbols(sidecar_path: &Path, value: u8) -> Result<()> {
-    let existing = if sidecar_path.exists() {
-        fs::read(sidecar_path)?
-    } else {
-        Vec::new()
-    };
+    use std::io::{Read, Seek, SeekFrom, Write};
 
-    let payload_offset = match WalFecPragmaHeader::from_prefix(&existing)? {
-        Some(_) => WAL_FEC_PRAGMA_HEADER_BYTES,
-        None => 0,
-    };
-
-    let header = WalFecPragmaHeader::new(value);
-    let mut rewritten = Vec::with_capacity(
-        WAL_FEC_PRAGMA_HEADER_BYTES + existing.len().saturating_sub(payload_offset),
-    );
-    rewritten.extend_from_slice(&header.to_bytes());
-    rewritten.extend_from_slice(&existing[payload_offset..]);
-
-    if let Some(parent) = sidecar_path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)?;
+    if !sidecar_path.exists() {
+        if let Some(parent) = sidecar_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)?;
+            }
         }
+        let header = WalFecPragmaHeader::new(value);
+        fs::write(sidecar_path, header.to_bytes())?;
+        info!(
+            sidecar = %sidecar_path.display(),
+            raptorq_repair_symbols = value,
+            "persisted wal-fec repair symbol setting (new file)"
+        );
+        return Ok(());
     }
-    fs::write(sidecar_path, rewritten)?;
+
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(sidecar_path)?;
+
+    let mut header_buf = [0_u8; WAL_FEC_PRAGMA_HEADER_BYTES];
+    let read_len = file.read(&mut header_buf).unwrap_or(0);
+    let has_header = WalFecPragmaHeader::from_prefix(&header_buf[..read_len])?.is_some();
+    let header = WalFecPragmaHeader::new(value);
+
+    file.seek(SeekFrom::Start(0))?;
+    if has_header {
+        file.write_all(&header.to_bytes())?;
+    } else {
+        // Rewrite the file with the header prepended using a buffered stream to avoid OOM
+        let temp_path = sidecar_path.with_extension("wal-fec.tmp");
+        let mut temp_file = std::io::BufWriter::new(fs::File::create(&temp_path)?);
+        temp_file.write_all(&header.to_bytes())?;
+        std::io::copy(&mut file, &mut temp_file)?;
+        temp_file.flush()?;
+        fs::rename(&temp_path, sidecar_path)?;
+    }
 
     info!(
         sidecar = %sidecar_path.display(),

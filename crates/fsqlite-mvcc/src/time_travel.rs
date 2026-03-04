@@ -119,6 +119,22 @@ pub struct TimeTravelSnapshot {
 }
 
 impl TimeTravelSnapshot {
+    /// Create a time-travel snapshot pinned to a specific commit sequence.
+    ///
+    /// This is a lightweight constructor that does **not** validate against a
+    /// commit log or GC horizon. Use [`create_time_travel_snapshot`] when full
+    /// validation is required. This constructor is intended for the VDBE
+    /// integration layer where the cursor has already been opened and the
+    /// commit sequence is known.
+    #[must_use]
+    pub fn new_for_commit_seq(target_commit_seq: CommitSeq, schema_epoch: SchemaEpoch) -> Self {
+        Self {
+            snapshot: Snapshot::new(target_commit_seq, schema_epoch),
+            target_commit_seq,
+            read_only: true,
+        }
+    }
+
     /// The underlying snapshot for MVCC resolution.
     #[must_use]
     pub fn snapshot(&self) -> &Snapshot {
