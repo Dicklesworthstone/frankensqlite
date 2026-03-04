@@ -726,7 +726,6 @@ impl ArcCacheInner {
     /// and batch version coalescing (reclaims superseded cached versions).
     pub fn set_gc_horizon(&mut self, horizon: CommitSeq) {
         self.gc_horizon = horizon;
-        self.prune_ghosts_below_horizon();
         self.coalesce_all_versions();
     }
 
@@ -1333,29 +1332,6 @@ impl ArcCacheInner {
         removed
     }
 
-    fn prune_ghosts_below_horizon(&mut self) {
-        let mut stale_b1 = Vec::new();
-        for (idx, key) in self.b1.iter() {
-            if key.commit_seq.get() <= self.gc_horizon.get() {
-                stale_b1.push(idx);
-            }
-        }
-        for idx in stale_b1 {
-            let ghost = self.b1.remove(idx);
-            self.directory.remove(&ghost);
-        }
-
-        let mut stale_b2 = Vec::new();
-        for (idx, key) in self.b2.iter() {
-            if key.commit_seq.get() <= self.gc_horizon.get() {
-                stale_b2.push(idx);
-            }
-        }
-        for idx in stale_b2 {
-            let ghost = self.b2.remove(idx);
-            self.directory.remove(&ghost);
-        }
-    }
 
     fn remove_page_version(&mut self, pgno: PageNumber, seq: CommitSeq) {
         if let Some(versions) = self.page_versions.get_mut(&pgno) {
