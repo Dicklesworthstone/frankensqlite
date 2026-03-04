@@ -834,7 +834,10 @@ impl std::fmt::Debug for TimeTravelPageIo {
         f.debug_struct("TimeTravelPageIo")
             .field("inner", &self.inner)
             .field("version_store", &"<Rc<RefCell<VersionStore>>>")
-            .field("target_commit_seq", &self.snapshot.target_commit_seq().get())
+            .field(
+                "target_commit_seq",
+                &self.snapshot.target_commit_seq().get(),
+            )
             .finish()
     }
 }
@@ -2341,10 +2344,7 @@ impl VdbeEngine {
                 let mut key_values: Vec<SqliteValue> =
                     Vec::with_capacity(meta.column_indices.len() + 1);
                 for &col_idx in &meta.column_indices {
-                    let val = old_row
-                        .get(col_idx)
-                        .cloned()
-                        .unwrap_or(SqliteValue::Null);
+                    let val = old_row.get(col_idx).cloned().unwrap_or(SqliteValue::Null);
                     key_values.push(val);
                 }
                 key_values.push(SqliteValue::Integer(conflict_rowid));
@@ -2564,8 +2564,7 @@ impl VdbeEngine {
 
         // Load table-to-index cursor metadata for REPLACE conflict resolution.
         for (table_cursor, indexes) in program.table_index_meta() {
-            self.table_index_meta
-                .insert(*table_cursor, indexes.clone());
+            self.table_index_meta.insert(*table_cursor, indexes.clone());
         }
 
         let program_id = VDBE_PROGRAM_ID_SEQ.fetch_add(1, AtomicOrdering::Relaxed);
@@ -2778,13 +2777,10 @@ impl VdbeEngine {
                                 // Re-create cursor with TimeTravelPageIo.
                                 // Remove the old cursor to get its metadata.
                                 let old_sc = self.storage_cursors.remove(&cursor_id).unwrap();
-                                let root_page = self
-                                    .cursor_root_pages
-                                    .get(&cursor_id)
-                                    .copied()
-                                    .unwrap_or(1);
-                                let root_pgno = PageNumber::new(root_page as u32)
-                                    .unwrap_or(PageNumber::ONE);
+                                let root_page =
+                                    self.cursor_root_pages.get(&cursor_id).copied().unwrap_or(1);
+                                let root_pgno =
+                                    PageNumber::new(root_page as u32).unwrap_or(PageNumber::ONE);
 
                                 // Extract the SharedTxnPageIo from the old cursor.
                                 // Since we verified it's Txn above, this is safe.
@@ -2792,8 +2788,7 @@ impl VdbeEngine {
                                     page_io.clone()
                                 } else {
                                     return Err(FrankenError::Internal(
-                                        "SetSnapshot: no transaction page I/O available"
-                                            .to_owned(),
+                                        "SetSnapshot: no transaction page I/O available".to_owned(),
                                     ));
                                 };
 
@@ -2803,17 +2798,12 @@ impl VdbeEngine {
                                     snapshot: tt_snapshot,
                                 };
 
+                                // Preserve the cursor's table-vs-index type from
+                                // the original cursor so index cursors remain correct.
+                                let is_table_btree = old_sc.cursor.is_table_btree();
                                 const PAGE_SIZE: u32 = 4096;
-                                // Infer table-vs-index: if the old cursor was for
-                                // a table we opened with table_move_to semantics.
-                                // We use the same is_table flag.
-                                let is_table_btree = true; // Default: table
-                                let new_cursor = BtCursor::new(
-                                    tt_page_io,
-                                    root_pgno,
-                                    PAGE_SIZE,
-                                    is_table_btree,
-                                );
+                                let new_cursor =
+                                    BtCursor::new(tt_page_io, root_pgno, PAGE_SIZE, is_table_btree);
                                 self.storage_cursors.insert(
                                     cursor_id,
                                     StorageCursor {
@@ -12750,14 +12740,7 @@ mod tests {
         b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
         b.emit_op(Opcode::OpenRead, 0, root, 0, P4::Int(1), 0);
         // SetSnapshot with commit sequence 5 on cursor 0.
-        b.emit_op(
-            Opcode::SetSnapshot,
-            0,
-            0,
-            0,
-            P4::TimeTravelCommitSeq(5),
-            0,
-        );
+        b.emit_op(Opcode::SetSnapshot, 0, 0, 0, P4::TimeTravelCommitSeq(5), 0);
         b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
         b.resolve_label(end);
         let prog = b.finish().expect("program should build");
@@ -12772,7 +12755,10 @@ mod tests {
 
         // The marker should be recorded.
         let marker = engine.time_travel_marker(0);
-        assert!(marker.is_some(), "time-travel marker should be set on cursor 0");
+        assert!(
+            marker.is_some(),
+            "time-travel marker should be set on cursor 0"
+        );
         match marker.unwrap() {
             TimeTravelMarker::CommitSeq(seq) => assert_eq!(*seq, 5),
             _ => panic!("expected CommitSeq marker"),
@@ -12798,14 +12784,7 @@ mod tests {
         let end = b.emit_label();
         b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
         b.emit_op(Opcode::OpenRead, 0, root, 0, P4::Int(1), 0);
-        b.emit_op(
-            Opcode::SetSnapshot,
-            0,
-            0,
-            0,
-            P4::TimeTravelCommitSeq(3),
-            0,
-        );
+        b.emit_op(Opcode::SetSnapshot, 0, 0, 0, P4::TimeTravelCommitSeq(3), 0);
         b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
         b.resolve_label(end);
         let prog = b.finish().expect("program should build");

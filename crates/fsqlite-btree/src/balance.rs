@@ -421,9 +421,11 @@ pub(crate) fn balance_nonroot<W: PageWriter>(
                 // For interior pages: the divider's left-child pointer is replaced
                 // by the right-child of the current sibling.
                 let mut div = divider_cells[sib_idx].clone();
-                let rc = page_header.right_child.ok_or_else(|| FrankenError::DatabaseCorrupt {
-                    detail: "interior page missing right_child during balance".to_owned(),
-                })?;
+                let rc = page_header
+                    .right_child
+                    .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                        detail: "interior page missing right_child during balance".to_owned(),
+                    })?;
                 if div.len() >= 4 {
                     div[0..4].copy_from_slice(&rc.get().to_be_bytes());
                 } else {

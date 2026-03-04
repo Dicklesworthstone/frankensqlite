@@ -446,7 +446,10 @@ where
         let Ok(inner) = self.inner.lock() else {
             return 0;
         };
-        inner.wal_backend.as_ref().map_or(0, |wal| wal.frame_count())
+        inner
+            .wal_backend
+            .as_ref()
+            .map_or(0, |wal| wal.frame_count())
     }
 
     /// Compute the journal path from the database path.

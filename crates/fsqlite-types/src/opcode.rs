@@ -998,7 +998,7 @@ pub struct VdbeOp {
 ///
 /// Used by `native_replace_row` to clean up secondary index entries when
 /// a table row is deleted due to REPLACE conflict resolution.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexCursorMeta {
     /// Cursor ID of the index (typically table_cursor + 1, +2, ...).
     pub cursor_id: i32,

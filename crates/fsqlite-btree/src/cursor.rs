@@ -264,9 +264,7 @@ pub struct BtCursor<P> {
     root_page: PageNumber,
     /// Usable page size (page_size - reserved_bytes).
     usable_size: u32,
-    /// Whether this is a table (intkey) or index (blobkey) B-tree (retained
-    /// for future validation in mutation operations).
-    #[allow(dead_code)]
+    /// Whether this is a table (intkey) or index (blobkey) B-tree.
     is_table: bool,
     /// Page stack from root to current leaf.
     stack: Vec<StackEntry>,
@@ -286,6 +284,24 @@ impl<P> BtCursor<P> {
     pub fn invalidate(&mut self) {
         self.at_eof = true;
         self.stack.clear();
+    }
+
+    /// Whether this cursor is for a table (intkey) B-tree.
+    #[must_use]
+    pub fn is_table(&self) -> bool {
+        self.is_table
+    }
+
+    /// The root page number of the B-tree this cursor operates on.
+    #[must_use]
+    pub fn root_page(&self) -> PageNumber {
+        self.root_page
+    }
+
+    /// The usable page size for this cursor's B-tree.
+    #[must_use]
+    pub fn usable_size(&self) -> u32 {
+        self.usable_size
     }
 }
 

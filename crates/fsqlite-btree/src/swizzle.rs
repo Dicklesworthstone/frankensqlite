@@ -278,7 +278,10 @@ impl SwizzleRegistry {
     #[must_use]
     pub fn is_swizzled(&self, page_id: u64) -> bool {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        state.entries.get(&page_id).is_some_and(|entry| entry.swizzled)
+        state
+            .entries
+            .get(&page_id)
+            .is_some_and(|entry| entry.swizzled)
     }
 
     /// Return the frame address for a swizzled page, or `None`.
@@ -297,13 +300,20 @@ impl SwizzleRegistry {
     /// Number of tracked pages.
     #[must_use]
     pub fn tracked_count(&self) -> usize {
-        self.state.lock().unwrap_or_else(|e| e.into_inner()).entries.len()
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entries
+            .len()
     }
 
     /// Number of currently swizzled pages.
     #[must_use]
     pub fn swizzled_count(&self) -> usize {
-        self.state.lock().unwrap_or_else(|e| e.into_inner()).swizzled_count
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .swizzled_count
     }
 
     /// Compute and update the global swizzle ratio gauge (internal, avoids re-locking).

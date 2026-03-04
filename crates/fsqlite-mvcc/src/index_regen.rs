@@ -569,10 +569,7 @@ pub fn compute_index_key(
                 collation,
             } => {
                 let i = col_idx.get() as usize;
-                let v = row
-                    .get(i)
-                    .cloned()
-                    .unwrap_or(SqliteValue::Null);
+                let v = row.get(i).cloned().unwrap_or(SqliteValue::Null);
                 (v, *affinity, *collation)
             }
             IndexKeyPart::Expression {
@@ -1308,10 +1305,7 @@ mod tests {
         let result =
             regenerate_index_ops(&base, &updates, &indexes, RowId::new(1), &NoOpUniqueChecker);
 
-        assert!(
-            result.is_ok(),
-            "bead_id={BEAD_ID} col_oob_now_ok"
-        );
+        assert!(result.is_ok(), "bead_id={BEAD_ID} col_oob_now_ok");
     }
 
     // Test 11: NOCASE collation normalizes keys.

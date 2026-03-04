@@ -793,7 +793,7 @@ pub fn zipf_mle_from_ranked_counts(ranked_counts: &[u64]) -> Option<ZipfMleResul
         let step = if hess.abs() > 1e-12 {
             grad / hess
         } else {
-            grad.signum() * 0.05
+            -grad.signum() * 0.05
         };
         let next = (s - step).clamp(ZIPF_S_MIN, ZIPF_S_MAX);
         if (next - s).abs() < 1e-8 {

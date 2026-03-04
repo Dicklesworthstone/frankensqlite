@@ -4375,8 +4375,8 @@ impl Connection {
             let raw = self.pragma_state.borrow().wal_autocheckpoint.max(0);
             u64::try_from(raw).unwrap_or(u64::MAX)
         };
-        let wal_frames_estimate = u64::try_from(self.pager.wal_frame_count())
-            .unwrap_or(wal_metrics.wal_frames_current);
+        #[allow(clippy::cast_possible_truncation)]
+        let wal_frames_estimate = self.pager.wal_frame_count() as u64;
 
         let now = Instant::now();
         let mut state = self.checkpoint_advisor_state.borrow_mut();
@@ -34950,9 +34950,7 @@ mod pager_routing_tests {
 
         // Execute a time-travel query. With an empty VersionStore, the
         // cursor reads the current data (fall-through behavior).
-        let result = conn.query(
-            "SELECT id, name FROM users FOR SYSTEM_TIME AS OF COMMITSEQ 5;",
-        );
+        let result = conn.query("SELECT id, name FROM users FOR SYSTEM_TIME AS OF COMMITSEQ 5;");
 
         // The query should either succeed (returning current data as
         // fallback) or fail with a clear time-travel error — NOT panic.
@@ -34991,16 +34989,17 @@ mod pager_routing_tests {
         conn.execute("INSERT INTO users VALUES (1, 'Alice');")
             .unwrap();
 
-        let result = conn.query(
-            "SELECT id, name FROM users FOR SYSTEM_TIME AS OF '2024-01-01T00:00:00Z';",
-        );
+        let result =
+            conn.query("SELECT id, name FROM users FOR SYSTEM_TIME AS OF '2024-01-01T00:00:00Z';");
 
         // Should fail with a clear message about timestamp not being supported.
         match result {
             Err(e) => {
                 let msg = format!("{e}");
                 assert!(
-                    msg.contains("timestamp") || msg.contains("CommitLog") || msg.contains("time-travel"),
+                    msg.contains("timestamp")
+                        || msg.contains("CommitLog")
+                        || msg.contains("time-travel"),
                     "expected time-travel timestamp error, got: {msg}"
                 );
             }

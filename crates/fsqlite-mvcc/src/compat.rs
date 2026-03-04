@@ -154,10 +154,11 @@ impl HybridShmState {
         // by serializing the header and checksumming the first 40 bytes.
         let hdr_bytes = self.legacy_hdr.to_bytes();
         let (mut s1, mut s2) = (0_u32, 0_u32);
-        for chunk in hdr_bytes[..40].chunks(4) {
-            let word = u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-            s1 = s1.wrapping_add(word).wrapping_add(s2);
-            s2 = s2.wrapping_add(word).wrapping_add(s1);
+        for chunk in hdr_bytes[..40].chunks_exact(8) {
+            let w1 = u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            let w2 = u32::from_ne_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
+            s1 = s1.wrapping_add(w1).wrapping_add(s2);
+            s2 = s2.wrapping_add(w2).wrapping_add(s1);
         }
         self.legacy_hdr.a_cksum = [s1, s2];
 

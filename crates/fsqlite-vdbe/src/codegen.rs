@@ -8555,7 +8555,7 @@ mod tests {
         OrderingTerm, PlaceholderType, QualifiedName, QualifiedTableRef, ResultColumn, SelectBody,
         SelectCore, SelectStatement, SortDirection, Span, TableOrSubquery, UpdateStatement,
     };
-    use fsqlite_types::opcode::{IndexCursorMeta, Opcode, P4};
+    use fsqlite_types::opcode::{Opcode, P4};
 
     fn test_schema() -> Vec<TableSchema> {
         vec![TableSchema {
