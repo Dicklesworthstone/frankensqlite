@@ -10178,7 +10178,27 @@ impl Connection {
                         })
                         .collect();
                     let pb = spec.partition_by.clone();
-                    let two_pass = name.eq_ignore_ascii_case("lead");
+                    // Functions that need two passes (step all, then
+                    // value+inverse):
+                    // - LEAD: reads ahead in the partition.
+                    // - NTILE, PERCENT_RANK, CUME_DIST: need partition size.
+                    // - FIRST_VALUE, LAST_VALUE, NTH_VALUE: frame-relative.
+                    // - Aggregate window functions (SUM, COUNT, AVG, etc.)
+                    //   without ORDER BY: default frame is the entire
+                    //   partition, so we must step all rows first.
+                    let upper = name.to_ascii_uppercase();
+                    let needs_full_partition = matches!(
+                        upper.as_str(),
+                        "LEAD"
+                            | "NTILE"
+                            | "PERCENT_RANK"
+                            | "CUME_DIST"
+                            | "FIRST_VALUE"
+                            | "LAST_VALUE"
+                            | "NTH_VALUE"
+                    );
+                    let aggregate_no_order = !needs_full_partition && spec.order_by.is_empty();
+                    let two_pass = needs_full_partition || aggregate_no_order;
                     let idx = win_funcs.len();
                     win_funcs.push(func);
                     win_args.push(arg_exprs);
@@ -34442,5 +34462,333 @@ mod pager_routing_tests {
         // Cache must be invalidated: fresh parse succeeds.
         let rows = conn.query("SELECT v FROM pc5").unwrap();
         assert_eq!(rows[0].values()[0], SqliteValue::Text("new".to_owned()));
+    }
+
+    // ── Window function tests ──────────────────────────────────────
+
+    fn setup_window_test() -> Connection {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute(
+            "CREATE TABLE scores(id INTEGER PRIMARY KEY, name TEXT, subject TEXT, score INTEGER);",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO scores VALUES (1, 'Alice', 'math', 90), (2, 'Bob', 'math', 85), (3, 'Charlie', 'math', 90), (4, 'Alice', 'science', 80), (5, 'Bob', 'science', 95), (6, 'Charlie', 'science', 70);").unwrap();
+        conn
+    }
+
+    #[test]
+    fn test_window_row_number() {
+        let conn = setup_window_test();
+        let rows = conn
+            .query("SELECT name, score, ROW_NUMBER() OVER (ORDER BY score DESC) as rn FROM scores WHERE subject = 'math'")
+            .unwrap();
+        assert_eq!(rows.len(), 3, "expected 3 rows");
+        // ROW_NUMBER assigns sequential numbers ordered by score DESC.
+        // Scores: Alice 90, Charlie 90, Bob 85 → rn = 1, 2, 3
+        let rn_values: Vec<i64> = rows
+            .iter()
+            .map(|r| match &r.values()[2] {
+                SqliteValue::Integer(v) => *v,
+                other => panic!("expected Integer, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(rn_values, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_window_rank() {
+        let conn = setup_window_test();
+        let rows = conn
+            .query("SELECT name, score, RANK() OVER (ORDER BY score DESC) as rnk FROM scores WHERE subject = 'math'")
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        let rank_values: Vec<i64> = rows
+            .iter()
+            .map(|r| match &r.values()[2] {
+                SqliteValue::Integer(v) => *v,
+                other => panic!("expected Integer, got {other:?}"),
+            })
+            .collect();
+        // Tied scores 90 → rank 1, 1; then 85 → rank 3
+        assert_eq!(rank_values, vec![1, 1, 3]);
+    }
+
+    #[test]
+    fn test_window_dense_rank() {
+        let conn = setup_window_test();
+        let rows = conn
+            .query("SELECT name, score, DENSE_RANK() OVER (ORDER BY score DESC) as drnk FROM scores WHERE subject = 'math'")
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        let drank_values: Vec<i64> = rows
+            .iter()
+            .map(|r| match &r.values()[2] {
+                SqliteValue::Integer(v) => *v,
+                other => panic!("expected Integer, got {other:?}"),
+            })
+            .collect();
+        // Tied 90 → dense_rank 1, 1; 85 → dense_rank 2
+        assert_eq!(drank_values, vec![1, 1, 2]);
+    }
+
+    #[test]
+    fn test_window_sum_over_partition() {
+        let conn = setup_window_test();
+        let rows = conn
+            .query("SELECT name, subject, score, SUM(score) OVER (PARTITION BY subject) as subj_total FROM scores ORDER BY subject, name")
+            .unwrap();
+        assert_eq!(rows.len(), 6);
+        // Math total: 90 + 85 + 90 = 265
+        // Science total: 80 + 95 + 70 = 245
+        let totals: Vec<i64> = rows
+            .iter()
+            .map(|r| match &r.values()[3] {
+                SqliteValue::Integer(v) => *v,
+                other => panic!("expected Integer, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(totals, vec![265, 265, 265, 245, 245, 245]);
+    }
+
+    #[test]
+    fn test_window_lag_lead() {
+        let conn = setup_window_test();
+        let rows = conn
+            .query("SELECT name, score, LAG(score, 1) OVER (ORDER BY name) as prev_score FROM scores WHERE subject = 'math' ORDER BY name")
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        // Order by name: Alice(90), Bob(85), Charlie(90)
+        // LAG: NULL, 90, 85
+        let lag_values: Vec<&SqliteValue> = rows.iter().map(|r| &r.values()[2]).collect();
+        assert_eq!(lag_values[0], &SqliteValue::Null);
+        assert_eq!(lag_values[1], &SqliteValue::Integer(90));
+        assert_eq!(lag_values[2], &SqliteValue::Integer(85));
+    }
+
+    #[test]
+    fn test_window_ntile() {
+        let conn = setup_window_test();
+        let rows = conn
+            .query("SELECT name, score, NTILE(2) OVER (ORDER BY score DESC) as tile FROM scores WHERE subject = 'math'")
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        let tiles: Vec<i64> = rows
+            .iter()
+            .map(|r| match &r.values()[2] {
+                SqliteValue::Integer(v) => *v,
+                other => panic!("expected Integer, got {other:?}"),
+            })
+            .collect();
+        // 3 rows, 2 tiles → [1, 1, 2]
+        assert_eq!(tiles, vec![1, 1, 2]);
+    }
+
+    // ── SQL edge-case probes ───────────────────────────────────────
+
+    #[test]
+    fn test_coalesce_aggregate() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (x INTEGER);").unwrap();
+        // Empty table — MAX(x) is NULL, COALESCE should return 0.
+        let rows = conn.query("SELECT COALESCE(MAX(x), 0) FROM t;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(0));
+    }
+
+    #[test]
+    fn test_case_with_aggregate() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE items (name TEXT, qty INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO items VALUES ('A', 5), ('B', 15), ('C', 3);")
+            .unwrap();
+        let rows = conn
+            .query("SELECT CASE WHEN SUM(qty) > 10 THEN 'many' ELSE 'few' END FROM items;")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        // SUM = 23 > 10 → 'many'
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("many".to_owned()));
+    }
+
+    #[test]
+    fn test_count_distinct() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE d (v TEXT);").unwrap();
+        conn.execute("INSERT INTO d VALUES ('a'), ('b'), ('a'), ('c'), ('b');")
+            .unwrap();
+        let rows = conn.query("SELECT COUNT(DISTINCT v) FROM d;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(3));
+    }
+
+    #[test]
+    fn test_group_concat() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE g (id INTEGER, name TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO g VALUES (1, 'Alice'), (1, 'Bob'), (2, 'Charlie');")
+            .unwrap();
+        let rows = conn
+            .query("SELECT id, GROUP_CONCAT(name, ', ') FROM g GROUP BY id ORDER BY id;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+        // Group 1: Alice and Bob (order may vary).
+        let group1 = match &rows[0].values()[1] {
+            SqliteValue::Text(s) => s.clone(),
+            other => panic!("expected Text, got {other:?}"),
+        };
+        assert!(
+            group1 == "Alice, Bob" || group1 == "Bob, Alice",
+            "unexpected group_concat result: {group1}"
+        );
+        assert_eq!(rows[1].values()[0], SqliteValue::Integer(2));
+    }
+
+    #[test]
+    fn test_subquery_in_where() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, val INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO a VALUES (1, 10), (2, 20), (3, 30);")
+            .unwrap();
+        conn.execute("CREATE TABLE b (aid INTEGER, label TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO b VALUES (1, 'x'), (3, 'y');")
+            .unwrap();
+        let rows = conn
+            .query("SELECT val FROM a WHERE id IN (SELECT aid FROM b) ORDER BY val;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(10));
+        assert_eq!(rows[1].values()[0], SqliteValue::Integer(30));
+    }
+
+    #[test]
+    fn test_order_by_expression() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (x INTEGER);").unwrap();
+        conn.execute("INSERT INTO t VALUES (3), (1), (2);").unwrap();
+        let rows = conn.query("SELECT x FROM t ORDER BY x * -1;").unwrap();
+        assert_eq!(rows.len(), 3);
+        // Descending via negative multiplication.
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(3));
+        assert_eq!(rows[1].values()[0], SqliteValue::Integer(2));
+        assert_eq!(rows[2].values()[0], SqliteValue::Integer(1));
+    }
+
+    #[test]
+    fn test_nullif_and_ifnull() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn
+            .query("SELECT NULLIF(1, 1), NULLIF(1, 2), IFNULL(NULL, 'fallback'), IFNULL('value', 'fallback');")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Null);
+        assert_eq!(rows[0].values()[1], SqliteValue::Integer(1));
+        assert_eq!(
+            rows[0].values()[2],
+            SqliteValue::Text("fallback".to_owned())
+        );
+        assert_eq!(rows[0].values()[3], SqliteValue::Text("value".to_owned()));
+    }
+
+    #[test]
+    fn test_union_all() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1 (x INTEGER);").unwrap();
+        conn.execute("CREATE TABLE t2 (y INTEGER);").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1), (2);").unwrap();
+        conn.execute("INSERT INTO t2 VALUES (2), (3);").unwrap();
+        let rows = conn
+            .query("SELECT x FROM t1 UNION ALL SELECT y FROM t2 ORDER BY x;")
+            .unwrap();
+        assert_eq!(rows.len(), 4);
+        let vals: Vec<i64> = rows
+            .iter()
+            .map(|r| match &r.values()[0] {
+                SqliteValue::Integer(v) => *v,
+                other => panic!("expected Integer, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(vals, vec![1, 2, 2, 3]);
+    }
+
+    #[test]
+    fn test_union_dedup() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1 (x INTEGER);").unwrap();
+        conn.execute("CREATE TABLE t2 (y INTEGER);").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1), (2);").unwrap();
+        conn.execute("INSERT INTO t2 VALUES (2), (3);").unwrap();
+        let rows = conn
+            .query("SELECT x FROM t1 UNION SELECT y FROM t2 ORDER BY x;")
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        let vals: Vec<i64> = rows
+            .iter()
+            .map(|r| match &r.values()[0] {
+                SqliteValue::Integer(v) => *v,
+                other => panic!("expected Integer, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(vals, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_intersect() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1 (x INTEGER);").unwrap();
+        conn.execute("CREATE TABLE t2 (y INTEGER);").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1), (2), (3);")
+            .unwrap();
+        conn.execute("INSERT INTO t2 VALUES (2), (3), (4);")
+            .unwrap();
+        let rows = conn
+            .query("SELECT x FROM t1 INTERSECT SELECT y FROM t2 ORDER BY x;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        let vals: Vec<i64> = rows
+            .iter()
+            .map(|r| match &r.values()[0] {
+                SqliteValue::Integer(v) => *v,
+                other => panic!("expected Integer, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(vals, vec![2, 3]);
+    }
+
+    #[test]
+    fn test_except() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1 (x INTEGER);").unwrap();
+        conn.execute("CREATE TABLE t2 (y INTEGER);").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1), (2), (3);")
+            .unwrap();
+        conn.execute("INSERT INTO t2 VALUES (2), (4);").unwrap();
+        let rows = conn
+            .query("SELECT x FROM t1 EXCEPT SELECT y FROM t2 ORDER BY x;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        let vals: Vec<i64> = rows
+            .iter()
+            .map(|r| match &r.values()[0] {
+                SqliteValue::Integer(v) => *v,
+                other => panic!("expected Integer, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(vals, vec![1, 3]);
+    }
+
+    #[test]
+    fn test_cast_expressions() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn
+            .query("SELECT CAST('42' AS INTEGER), CAST(3.14 AS TEXT), CAST(NULL AS INTEGER);")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(42));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("3.14".to_owned()));
+        assert_eq!(rows[0].values()[2], SqliteValue::Null);
     }
 }
