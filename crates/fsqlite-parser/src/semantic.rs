@@ -577,7 +577,6 @@ impl<'a> Resolver<'a> {
                         }
                     }
                 }
-                let returning_scope = scope.clone();
                 if let Some(from) = &update.from {
                     self.resolve_from(from, scope);
                 }
@@ -588,7 +587,7 @@ impl<'a> Resolver<'a> {
                     self.resolve_expr(where_clause, scope);
                 }
                 for ret in &update.returning {
-                    self.resolve_result_column(ret, &returning_scope);
+                    self.resolve_result_column(ret, scope);
                 }
                 for term in &update.order_by {
                     self.resolve_expr(&term.expr, scope);

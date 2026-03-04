@@ -83,26 +83,37 @@ pub fn check_sheaf_consistency(
             let a = &sections[i];
             let b = &sections[j];
 
+            let mut a_le_b = true;
+            let mut b_le_a = true;
+            let mut overlap_pages = Vec::new();
+
             // Check overlapping pages.
             for (&page, &ver_a) in &a.observations {
                 if let Some(&ver_b) = b.observations.get(&page) {
-                    let consistent = if let Some(order_fn) = version_order {
-                        // Ordered: either a sees b's version or vice versa.
-                        order_fn(ver_a, ver_b) || order_fn(ver_b, ver_a)
-                    } else {
-                        // Strict equality.
-                        ver_a == ver_b
-                    };
-
-                    if !consistent {
-                        obstructions.push(SheafObstruction {
-                            page,
-                            txn_a: a.txn_id,
-                            version_a: ver_a,
-                            txn_b: b.txn_id,
-                            version_b: ver_b,
-                        });
+                    overlap_pages.push((page, ver_a, ver_b));
+                    if let Some(order_fn) = version_order {
+                        if !order_fn(ver_a, ver_b) {
+                            a_le_b = false;
+                        }
+                        if !order_fn(ver_b, ver_a) {
+                            b_le_a = false;
+                        }
+                    } else if ver_a != ver_b {
+                        a_le_b = false;
+                        b_le_a = false;
                     }
+                }
+            }
+
+            if !overlap_pages.is_empty() && !a_le_b && !b_le_a {
+                for (page, ver_a, ver_b) in overlap_pages {
+                    obstructions.push(SheafObstruction {
+                        page,
+                        txn_a: a.txn_id,
+                        version_a: ver_a,
+                        txn_b: b.txn_id,
+                        version_b: ver_b,
+                    });
                 }
             }
         }
@@ -138,20 +149,47 @@ pub fn check_sheaf_consistency_with_chains<S: std::hash::BuildHasher>(
             let a = &sections[i];
             let b = &sections[j];
 
+            let mut a_le_b = true;
+            let mut b_le_a = true;
+            let mut overlap_pages = Vec::new();
+
             for (&page, &ver_a) in &a.observations {
                 let Some(&ver_b) = b.observations.get(&page) else {
                     continue;
                 };
 
-                let consistent = if ver_a == ver_b {
-                    true
-                } else {
-                    global_version_chains
-                        .get(&page)
-                        .is_some_and(|chain| chain.contains(&ver_a) && chain.contains(&ver_b))
-                };
+                overlap_pages.push((page, ver_a, ver_b));
 
-                if !consistent {
+                if ver_a == ver_b {
+                    continue;
+                }
+
+                if let Some(chain) = global_version_chains.get(&page) {
+                    let pos_a = chain.iter().position(|&v| v == ver_a);
+                    let pos_b = chain.iter().position(|&v| v == ver_b);
+                    
+                    match (pos_a, pos_b) {
+                        (Some(pa), Some(pb)) => {
+                            if pa > pb {
+                                a_le_b = false;
+                            }
+                            if pb > pa {
+                                b_le_a = false;
+                            }
+                        }
+                        _ => {
+                            a_le_b = false;
+                            b_le_a = false;
+                        }
+                    }
+                } else {
+                    a_le_b = false;
+                    b_le_a = false;
+                }
+            }
+
+            if !overlap_pages.is_empty() && !a_le_b && !b_le_a {
+                for (page, ver_a, ver_b) in overlap_pages {
                     obstructions.push(SheafObstruction {
                         page,
                         txn_a: a.txn_id,
