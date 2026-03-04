@@ -326,26 +326,27 @@ pub fn discover_incoming_edges(
         }
 
         for write_key in write_keys {
-            let page = witness_key_page(write_key);
-            if reader.pages.contains(&PageNumber::new(page).unwrap()) {
-                if seen_sources.insert(reader.token) {
-                    debug!(
-                        bead_id = "bd-31bo",
-                        from = ?reader.token,
-                        to = ?committing_txn,
-                        key = ?write_key,
-                        source = "rcri_index",
-                        "discovered incoming rw-antidependency edge"
-                    );
-                    edges.push(DiscoveredEdge {
-                        from: reader.token,
-                        to: committing_txn,
-                        overlap_key: write_key.clone(),
-                        source_is_active: false,
-                        source_has_in_rw: reader.had_in_rw,
-                    });
+            if let Some(page) = witness_key_page(write_key) {
+                if reader.pages.contains(&PageNumber::new(page).unwrap()) {
+                    if seen_sources.insert(reader.token) {
+                        debug!(
+                            bead_id = "bd-31bo",
+                            from = ?reader.token,
+                            to = ?committing_txn,
+                            key = ?write_key,
+                            source = "rcri_index",
+                            "discovered incoming rw-antidependency edge"
+                        );
+                        edges.push(DiscoveredEdge {
+                            from: reader.token,
+                            to: committing_txn,
+                            overlap_key: write_key.clone(),
+                            source_is_active: false,
+                            source_has_in_rw: reader.had_in_rw,
+                        });
+                    }
+                    break;
                 }
-                break;
             }
         }
     }
@@ -430,26 +431,27 @@ pub fn discover_outgoing_edges(
         }
 
         for read_key in read_keys {
-            let page = witness_key_page(read_key);
-            if writer.pages.contains(&PageNumber::new(page).unwrap()) {
-                if seen_targets.insert(writer.token) {
-                    debug!(
-                        bead_id = "bd-31bo",
-                        from = ?committing_txn,
-                        to = ?writer.token,
-                        key = ?read_key,
-                        source = "commit_log_index",
-                        "discovered outgoing rw-antidependency edge"
-                    );
-                    edges.push(DiscoveredEdge {
-                        from: committing_txn,
-                        to: writer.token,
-                        overlap_key: read_key.clone(),
-                        source_is_active: false,
-                        source_has_in_rw: writer.had_out_rw,
-                    });
+            if let Some(page) = witness_key_page(read_key) {
+                if writer.pages.contains(&PageNumber::new(page).unwrap()) {
+                    if seen_targets.insert(writer.token) {
+                        debug!(
+                            bead_id = "bd-31bo",
+                            from = ?committing_txn,
+                            to = ?writer.token,
+                            key = ?read_key,
+                            source = "commit_log_index",
+                            "discovered outgoing rw-antidependency edge"
+                        );
+                        edges.push(DiscoveredEdge {
+                            from: committing_txn,
+                            to: writer.token,
+                            overlap_key: read_key.clone(),
+                            source_is_active: false,
+                            source_has_in_rw: writer.had_out_rw,
+                        });
+                    }
+                    break;
                 }
-                break;
             }
         }
     }
@@ -462,14 +464,14 @@ pub fn discover_outgoing_edges(
 // ---------------------------------------------------------------------------
 
 /// Extract the page number from a witness key.
-pub(crate) fn witness_key_page(key: &WitnessKey) -> u32 {
+pub(crate) fn witness_key_page(key: &WitnessKey) -> Option<u32> {
     match key {
-        WitnessKey::Page(p) => p.get(),
+        WitnessKey::Page(p) => Some(p.get()),
         WitnessKey::Cell { btree_root, .. } | WitnessKey::KeyRange { btree_root, .. } => {
-            btree_root.get()
+            Some(btree_root.get())
         }
-        WitnessKey::ByteRange { page, .. } => page.get(),
-        WitnessKey::Custom { .. } => 0,
+        WitnessKey::ByteRange { page, .. } => Some(page.get()),
+        WitnessKey::Custom { .. } => None,
     }
 }
 
@@ -919,7 +921,7 @@ fn build_dependency_edges(
             to: edge.to,
             key_basis: EdgeKeyBasis {
                 level: 0,
-                range_prefix: witness_key_page(&edge.overlap_key),
+                range_prefix: witness_key_page(&edge.overlap_key).unwrap_or(0),
                 refinement: Some(KeySummary::ExactKeys(vec![edge.overlap_key.clone()])),
             },
             observed_by: observer,
@@ -965,7 +967,7 @@ fn decision_outcome(decision_type: SsiDecisionType) -> &'static str {
 fn witness_keys_to_pages(keys: &[WitnessKey]) -> Vec<PageNumber> {
     let mut pages: Vec<PageNumber> = keys
         .iter()
-        .filter_map(|key| PageNumber::new(witness_key_page(key)))
+        .filter_map(|key| witness_key_page(key).and_then(PageNumber::new))
         .collect();
     pages.sort_by_key(|page| page.get());
     pages.dedup();
@@ -995,7 +997,7 @@ fn edge_conflicting_txns(txn: TxnToken, edges: &[DiscoveredEdge]) -> Vec<TxnToke
 fn edge_conflict_pages(edges: &[DiscoveredEdge]) -> Vec<PageNumber> {
     let mut pages: Vec<PageNumber> = edges
         .iter()
-        .filter_map(|edge| PageNumber::new(witness_key_page(&edge.overlap_key)))
+        .filter_map(|edge| witness_key_page(&edge.overlap_key).and_then(PageNumber::new))
         .collect();
     pages.sort_by_key(|page| page.get());
     pages.dedup();

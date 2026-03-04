@@ -136,10 +136,6 @@ impl EpochAuthKey {
 /// `master_key = BLAKE3_KEYED(DEK, "fsqlite:symbol-auth-master:v1")`
 ///
 /// The DEK must be exactly 32 bytes (XChaCha20-Poly1305 key size).
-///
-/// # Errors
-///
-/// Returns [`FrankenError::TypeMismatch`] if `dek` is not 32 bytes.
 pub fn derive_master_key_from_dek(dek: &[u8; 32]) -> [u8; 32] {
     let keyed_hasher = blake3::Hasher::new_keyed(dek);
     let mut hasher = keyed_hasher;

@@ -219,28 +219,32 @@ proptest! {
 fn test_beta_bernoulli_update() -> Result<(), String> {
     let mut bp = BetaPosterior::new(1.0, 1.0);
     bp.observe(true);
-    if (bp.alpha - 2.0).abs() > 1e-10 {
+    // alpha = 1.0 * 0.95 + 1.0 = 1.95
+    if (bp.alpha - 1.95).abs() > 1e-10 {
         return Err(format!(
-            "bead_id={BEAD_ID} case=alpha_after_success expected=2.0 got={}",
+            "bead_id={BEAD_ID} case=alpha_after_success expected=1.95 got={}",
             bp.alpha
         ));
     }
-    if (bp.beta - 1.0).abs() > 1e-10 {
+    // beta = 1.0 * 0.95 = 0.95
+    if (bp.beta - 0.95).abs() > 1e-10 {
         return Err(format!(
-            "bead_id={BEAD_ID} case=beta_unchanged expected=1.0 got={}",
+            "bead_id={BEAD_ID} case=beta_unchanged expected=0.95 got={}",
             bp.beta
         ));
     }
     bp.observe(false);
-    if (bp.alpha - 2.0).abs() > 1e-10 {
+    // alpha = 1.95 * 0.95 = 1.8525
+    if (bp.alpha - 1.8525).abs() > 1e-10 {
         return Err(format!(
-            "bead_id={BEAD_ID} case=alpha_after_failure expected=2.0 got={}",
+            "bead_id={BEAD_ID} case=alpha_after_failure expected=1.8525 got={}",
             bp.alpha
         ));
     }
-    if (bp.beta - 2.0).abs() > 1e-10 {
+    // beta = 0.95 * 0.95 + 1.0 = 1.9025
+    if (bp.beta - 1.9025).abs() > 1e-10 {
         return Err(format!(
-            "bead_id={BEAD_ID} case=beta_after_failure expected=2.0 got={}",
+            "bead_id={BEAD_ID} case=beta_after_failure expected=1.9025 got={}",
             bp.beta
         ));
     }
@@ -255,12 +259,13 @@ fn test_beta_bernoulli_update() -> Result<(), String> {
 #[test]
 fn test_beta_bernoulli_posterior_mean() -> Result<(), String> {
     let mut bp = BetaPosterior::new(1.0, 1.0);
-    // Observe: success, success, failure → alpha=3, beta=2 → mean = 3/5 = 0.6
+    // Observe: success, success, failure
+    // With 0.95 discount, mean becomes ~0.5933274946630905
     bp.observe(true);
     bp.observe(true);
     bp.observe(false);
     let p_hat = bp.mean();
-    let expected = 3.0 / 5.0;
+    let expected = 0.5933274946630905;
 
     if (p_hat - expected).abs() > 1e-10 {
         return Err(format!(

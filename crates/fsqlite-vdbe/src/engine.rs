@@ -26,7 +26,7 @@ use fsqlite_btree::{
 };
 use fsqlite_error::{ErrorCode, FrankenError, Result};
 use fsqlite_func::vtab::ColumnContext;
-use fsqlite_func::{ErasedAggregateFunction, FunctionRegistry};
+use fsqlite_func::{ErasedAggregateFunction, ErasedWindowFunction, FunctionRegistry};
 use fsqlite_mvcc::{
     ConcurrentRegistry, InProcessPageLockTable, MvccError, TimeTravelSnapshot, VersionStore,
     concurrent_read_page, concurrent_write_page,
@@ -250,6 +250,44 @@ enum SortKeyOrder {
 
 /// Default spill threshold: 100 MiB.
 const SORTER_DEFAULT_SPILL_THRESHOLD: usize = 100 * 1024 * 1024;
+
+/// Number of 64-bit words in a Bloom filter (8192 bits = 1 KiB).
+const BLOOM_FILTER_WORDS: usize = 128;
+
+/// Compute a simple hash of a `SqliteValue` for Bloom filter lookups.
+fn bloom_hash(val: &SqliteValue) -> u64 {
+    // FNV-1a-style hash — sufficient for a Bloom filter.
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let bytes: &[u8] = match val {
+        SqliteValue::Null => &[0],
+        SqliteValue::Integer(i) => {
+            // Hash inline to avoid allocation.
+            h ^= 1;
+            h = h.wrapping_mul(0x0100_0000_01b3);
+            for b in i.to_le_bytes() {
+                h ^= u64::from(b);
+                h = h.wrapping_mul(0x0100_0000_01b3);
+            }
+            return h;
+        }
+        SqliteValue::Float(f) => {
+            h ^= 2;
+            h = h.wrapping_mul(0x0100_0000_01b3);
+            for b in f.to_le_bytes() {
+                h ^= u64::from(b);
+                h = h.wrapping_mul(0x0100_0000_01b3);
+            }
+            return h;
+        }
+        SqliteValue::Text(s) => s.as_bytes(),
+        SqliteValue::Blob(b) => b.as_slice(),
+    };
+    for &b in bytes {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    h
+}
 
 /// Approximate page size for spill accounting (4 KiB).
 const SORTER_SPILL_PAGE_SIZE: usize = 4096;
@@ -2019,6 +2057,16 @@ pub struct VdbeEngine {
     /// and column indices. Used by `native_replace_row` to clean up secondary
     /// index entries during REPLACE conflict resolution.
     table_index_meta: HashMap<i32, Vec<IndexCursorMeta>>,
+    /// Window function accumulators keyed by accumulator register.
+    window_contexts: SwissIndex<i32, WindowContext>,
+    /// Register subtype tags (register index → subtype value).
+    /// Used by JSON functions to distinguish JSON text (subtype 74/'J')
+    /// from regular text. Cleared on each register write.
+    register_subtypes: HashMap<i32, u32>,
+    /// Bloom filters keyed by cursor/filter register.
+    /// Each entry is a fixed-size bit array used for early rejection
+    /// during index lookups.
+    bloom_filters: HashMap<i32, Vec<u64>>,
 }
 
 /// Time-travel target marker stored on cursors opened with
@@ -2205,6 +2253,12 @@ struct AggregateContext {
     distinct_seen: Option<std::collections::HashSet<DistinctKeyBuf>>,
 }
 
+/// Per-accumulator window function context (for `AggInverse` / `AggValue`).
+struct WindowContext {
+    func: Arc<ErasedWindowFunction>,
+    state: Box<dyn Any + Send>,
+}
+
 /// Encode aggregate arguments into a canonical byte key for DISTINCT deduplication.
 ///
 /// Each value is tagged with a type discriminant followed by its payload so that
@@ -2279,6 +2333,9 @@ impl VdbeEngine {
             time_travel_cursors: HashMap::new(),
             version_store: None,
             table_index_meta: HashMap::new(),
+            window_contexts: SwissIndex::new(),
+            register_subtypes: HashMap::new(),
+            bloom_filters: HashMap::new(),
         }
     }
 
@@ -5273,18 +5330,85 @@ impl VdbeEngine {
 
                 Opcode::AggInverse => {
                     // Inverse aggregate step for window functions.
-                    // Not yet needed; stub for forward compatibility.
+                    // Remove a row from the sliding window frame.
+                    // P4 = function name, P2 = first arg register,
+                    // P5 = arg count, P3 = accumulator register.
+                    let func_name = match &op.p4 {
+                        P4::FuncName(name) => name.as_str(),
+                        _ => {
+                            return Err(FrankenError::Internal(
+                                "AggInverse opcode missing P4::FuncName".to_owned(),
+                            ));
+                        }
+                    };
+
+                    let registry = self.func_registry.as_ref().ok_or_else(|| {
+                        FrankenError::Internal(
+                            "AggInverse opcode executed without function registry".to_owned(),
+                        )
+                    })?;
+
+                    let arg_count = i32::from(op.p5);
+                    let func = registry.find_window(func_name, arg_count).ok_or_else(|| {
+                        FrankenError::Internal(format!(
+                            "no such window function: {func_name}/{arg_count}",
+                        ))
+                    })?;
+
+                    let mut args = Vec::with_capacity(op.p5 as usize);
+                    for i in 0..op.p5 {
+                        let reg_idx = op.p2 + i32::from(i);
+                        args.push(self.get_reg(reg_idx).clone());
+                    }
+
+                    let accum_reg = op.p3;
+                    let ctx = self.window_contexts.entry_or_insert_with(accum_reg, || {
+                        let state = func.initial_state();
+                        WindowContext {
+                            func: func.clone(),
+                            state,
+                        }
+                    });
+
+                    ctx.func.inverse(&mut ctx.state, &args)?;
                     pc += 1;
                 }
 
                 Opcode::AggValue => {
                     // Extract the current intermediate value from the
-                    // aggregate accumulator in register P1.
-                    // Unlike AggFinal, this does NOT consume the accumulator.
-                    //
-                    // Currently a stub: returns the register value as-is.
-                    // Full window-function AggValue requires a `value()`
-                    // method on the aggregate trait (future work).
+                    // window accumulator in register P3, storing the
+                    // result in register P3. Unlike AggFinal, this
+                    // does NOT consume the accumulator.
+                    // P4 = function name, P1 = accumulator register,
+                    // P3 = destination register.
+                    let func_name = match &op.p4 {
+                        P4::FuncName(name) => name.as_str(),
+                        _ => {
+                            return Err(FrankenError::Internal(
+                                "AggValue opcode missing P4::FuncName".to_owned(),
+                            ));
+                        }
+                    };
+
+                    let registry = self.func_registry.as_ref().ok_or_else(|| {
+                        FrankenError::Internal(
+                            "AggValue opcode executed without function registry".to_owned(),
+                        )
+                    })?;
+
+                    let arg_count = op.p2;
+                    let func = registry.find_window(func_name, arg_count).ok_or_else(|| {
+                        FrankenError::Internal(format!(
+                            "no such window function: {func_name}/{arg_count}",
+                        ))
+                    })?;
+
+                    let accum_reg = op.p1;
+                    let result = match self.window_contexts.get(&accum_reg) {
+                        Some(ctx) => ctx.func.value(&ctx.state)?,
+                        None => func.value(&func.initial_state())?,
+                    };
+                    self.set_reg(op.p3, result);
                     pc += 1;
                 }
 
@@ -5554,37 +5678,73 @@ impl VdbeEngine {
                 }
 
                 // ── Subtype operations ───────────────────────────────
-                // Subtypes are used by JSON functions to distinguish
-                // JSON text from regular text. Currently a no-op stub
-                // since JSON extension is not yet wired to runtime.
+                // Subtypes tag registers with metadata (e.g. JSON
+                // subtype 74/'J') without changing the stored value.
                 Opcode::ClrSubtype => {
-                    // Clear subtype flag on register P1. No-op.
+                    // Clear subtype flag on register P1.
+                    self.register_subtypes.remove(&op.p1);
                     pc += 1;
                 }
 
                 Opcode::GetSubtype => {
-                    // Store subtype of P1 into P2. Currently always 0.
-                    self.set_reg(op.p2, SqliteValue::Integer(0));
+                    // Store the subtype of register P1 into register P2.
+                    // Returns 0 if no subtype is set.
+                    let st = self.register_subtypes.get(&op.p1).copied().unwrap_or(0);
+                    #[allow(clippy::cast_possible_wrap)]
+                    self.set_reg(op.p2, SqliteValue::Integer(st as i64));
                     pc += 1;
                 }
 
                 Opcode::SetSubtype => {
-                    // Set subtype of P2 from integer P1. No-op.
+                    // Set the subtype of register P2 from the integer
+                    // value in register P1.
+                    let val = self.get_reg(op.p1);
+                    #[allow(clippy::cast_sign_loss)]
+                    let st = match val {
+                        SqliteValue::Integer(i) => *i as u32,
+                        _ => 0,
+                    };
+                    if st == 0 {
+                        self.register_subtypes.remove(&op.p2);
+                    } else {
+                        self.register_subtypes.insert(op.p2, st);
+                    }
                     pc += 1;
                 }
 
                 // ── Bloom filter ─────────────────────────────────────
-                // Bloom filters are an optimization for index lookups.
-                // When absent, we conservatively fall through (no skip).
+                // Bloom filters provide early rejection during index
+                // lookups. P1 is the filter register, P3 the hash key
+                // register, P2 the jump target (for Filter).
                 Opcode::FilterAdd => {
-                    // Add entry to Bloom filter. No-op when not implemented.
+                    // Add hash of register P3 to the Bloom filter
+                    // identified by P1.
+                    let hash = bloom_hash(self.get_reg(op.p3));
+                    let filter = self
+                        .bloom_filters
+                        .entry(op.p1)
+                        .or_insert_with(|| vec![0u64; BLOOM_FILTER_WORDS]);
+                    let bit = (hash as usize) % (filter.len() * 64);
+                    filter[bit / 64] |= 1u64 << (bit % 64);
                     pc += 1;
                 }
 
                 Opcode::Filter => {
-                    // Test Bloom filter. Jump to P2 if definitely not present.
-                    // Without Bloom filter, we never skip (fall through).
-                    pc += 1;
+                    // Test Bloom filter P1 for register P3's hash.
+                    // Jump to P2 if definitely not present.
+                    if let Some(filter) = self.bloom_filters.get(&op.p1) {
+                        let hash = bloom_hash(self.get_reg(op.p3));
+                        let bit = (hash as usize) % (filter.len() * 64);
+                        let present = (filter[bit / 64] >> (bit % 64)) & 1 == 1;
+                        if !present {
+                            pc = op.p2 as usize;
+                        } else {
+                            pc += 1;
+                        }
+                    } else {
+                        // No filter exists — conservatively fall through.
+                        pc += 1;
+                    }
                 }
 
                 // ── Hints & debug ────────────────────────────────────
@@ -12812,5 +12972,194 @@ mod tests {
         );
         // The cursor should be marked read-only.
         assert!(!sc.writable, "time-travel cursor should be read-only");
+    }
+
+    // ── Subtype opcode tests ─────────────────────────────────────────
+
+    #[test]
+    fn test_subtype_set_get_clr_roundtrip() {
+        // SetSubtype P1=subtype_reg P2=target_reg,
+        // GetSubtype P1=target_reg P2=result_reg,
+        // ClrSubtype P1=target_reg.
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+
+            let r_subtype = b.alloc_reg(); // holds subtype value (74 = 'J')
+            let r_target = b.alloc_reg(); // register to tag
+            let r_out1 = b.alloc_reg(); // result before SetSubtype
+            let r_out2 = b.alloc_reg(); // result after SetSubtype
+            let r_out3 = b.alloc_reg(); // result after ClrSubtype
+
+            // Put a value into r_target.
+            b.emit_op(
+                Opcode::String8,
+                0,
+                r_target,
+                0,
+                P4::Str(r#"{"a":1}"#.to_owned()),
+                0,
+            );
+
+            // GetSubtype before any SetSubtype → 0.
+            b.emit_op(Opcode::GetSubtype, r_target, r_out1, 0, P4::None, 0);
+
+            // SetSubtype: tag r_target with subtype 74 ('J' for JSON).
+            b.emit_op(Opcode::Integer, 74, r_subtype, 0, P4::None, 0);
+            b.emit_op(Opcode::SetSubtype, r_subtype, r_target, 0, P4::None, 0);
+
+            // GetSubtype → should be 74.
+            b.emit_op(Opcode::GetSubtype, r_target, r_out2, 0, P4::None, 0);
+
+            // ClrSubtype → clear the tag.
+            b.emit_op(Opcode::ClrSubtype, r_target, 0, 0, P4::None, 0);
+            b.emit_op(Opcode::GetSubtype, r_target, r_out3, 0, P4::None, 0);
+
+            b.emit_op(Opcode::ResultRow, r_out1, 3, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0], SqliteValue::Integer(0)); // before set
+        assert_eq!(rows[0][1], SqliteValue::Integer(74)); // after set
+        assert_eq!(rows[0][2], SqliteValue::Integer(0)); // after clear
+    }
+
+    #[test]
+    fn test_subtype_set_zero_clears() {
+        // Setting subtype to 0 should effectively clear it.
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+
+            let r_st = b.alloc_reg();
+            let r_target = b.alloc_reg();
+            let r_out = b.alloc_reg();
+
+            b.emit_op(Opcode::Integer, 42, r_target, 0, P4::None, 0);
+            // Set subtype to 74.
+            b.emit_op(Opcode::Integer, 74, r_st, 0, P4::None, 0);
+            b.emit_op(Opcode::SetSubtype, r_st, r_target, 0, P4::None, 0);
+            // Set subtype to 0 → should clear.
+            b.emit_op(Opcode::Integer, 0, r_st, 0, P4::None, 0);
+            b.emit_op(Opcode::SetSubtype, r_st, r_target, 0, P4::None, 0);
+            b.emit_op(Opcode::GetSubtype, r_target, r_out, 0, P4::None, 0);
+
+            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows[0][0], SqliteValue::Integer(0));
+    }
+
+    // ── Bloom filter opcode tests ────────────────────────────────────
+
+    #[test]
+    fn test_bloom_filter_add_and_test() {
+        // FilterAdd adds a hash; Filter should NOT jump (entry present).
+        // Filter: jump to P2 if NOT found, fall through if possibly found.
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+
+            let r_filter = b.alloc_reg();
+            let r_key = b.alloc_reg();
+            let r_out = b.alloc_reg();
+
+            // Add key "hello" to filter.
+            b.emit_op(Opcode::String8, 0, r_key, 0, P4::Str("hello".to_owned()), 0);
+            b.emit_op(Opcode::FilterAdd, r_filter, 0, r_key, P4::None, 0);
+
+            // Test "hello" — should be found (falls through past Filter).
+            let not_found = b.emit_label();
+            b.emit_op(Opcode::Integer, 0, r_out, 0, P4::None, 0); // default: not found
+            b.emit_jump_to_label(Opcode::Filter, r_filter, r_key, not_found, P4::None, 0);
+            // Fell through → found. Overwrite with 1.
+            b.emit_op(Opcode::Integer, 1, r_out, 0, P4::None, 0);
+            b.resolve_label(not_found);
+
+            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows[0][0], SqliteValue::Integer(1)); // found
+    }
+
+    #[test]
+    fn test_bloom_filter_miss_jumps() {
+        // Test a key NOT in the filter → Filter should jump to P2.
+        // Filter: jump to P2 if NOT found, fall through if found.
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+
+            let r_filter = b.alloc_reg();
+            let r_key1 = b.alloc_reg();
+            let r_key2 = b.alloc_reg();
+            let r_out = b.alloc_reg();
+
+            // Add "hello" to filter.
+            b.emit_op(
+                Opcode::String8,
+                0,
+                r_key1,
+                0,
+                P4::Str("hello".to_owned()),
+                0,
+            );
+            b.emit_op(Opcode::FilterAdd, r_filter, 0, r_key1, P4::None, 0);
+
+            // Test "world" — likely NOT found → jumps to not_found.
+            b.emit_op(
+                Opcode::String8,
+                0,
+                r_key2,
+                0,
+                P4::Str("world".to_owned()),
+                0,
+            );
+            let not_found = b.emit_label();
+            b.emit_op(Opcode::Integer, 0, r_out, 0, P4::None, 0); // default: not found
+            b.emit_jump_to_label(Opcode::Filter, r_filter, r_key2, not_found, P4::None, 0);
+            // Fell through → found (false positive).
+            b.emit_op(Opcode::Integer, 1, r_out, 0, P4::None, 0);
+            b.resolve_label(not_found);
+
+            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        // Due to Bloom filter false positives, we can't assert the exact value.
+        assert!(matches!(
+            rows[0][0],
+            SqliteValue::Integer(0 | 1)
+        ));
+    }
+
+    #[test]
+    fn test_bloom_filter_no_filter_falls_through() {
+        // Filter with no FilterAdd → no filter exists → conservatively
+        // falls through (never skips).
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+
+            let r_filter = b.alloc_reg();
+            let r_key = b.alloc_reg();
+            let r_out = b.alloc_reg();
+
+            b.emit_op(Opcode::Integer, 42, r_key, 0, P4::None, 0);
+            let not_found = b.emit_label();
+            b.emit_op(Opcode::Integer, 0, r_out, 0, P4::None, 0); // default: not found
+            b.emit_jump_to_label(Opcode::Filter, r_filter, r_key, not_found, P4::None, 0);
+            // Fell through → found (or no filter). Set to 1.
+            b.emit_op(Opcode::Integer, 1, r_out, 0, P4::None, 0);
+            b.resolve_label(not_found);
+
+            b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows[0][0], SqliteValue::Integer(1)); // fell through
     }
 }

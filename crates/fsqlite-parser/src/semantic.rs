@@ -789,15 +789,20 @@ impl<'a> Resolver<'a> {
 
                 // Register the subquery alias with empty columns (we don't
                 // track subquery output columns at this stage).
-                let alias_name = alias.as_deref().unwrap_or("");
+                let alias_name = if let Some(a) = alias {
+                    a.clone()
+                } else {
+                    format!("<subquery_{}>", self.tables_resolved)
+                };
 
-                if !alias_name.is_empty() && scope.has_alias_local(alias_name) {
+                if !alias_name.starts_with("<subquery_") && scope.has_alias_local(&alias_name) {
                     self.push_error(SemanticErrorKind::DuplicateAlias {
-                        alias: alias_name.to_owned(),
+                        alias: alias_name.clone(),
                     });
                 }
 
-                scope.add_alias(alias_name, "<subquery>", None);
+                scope.add_alias(&alias_name, "<subquery>", None);
+                self.tables_resolved += 1;
             }
             TableOrSubquery::TableFunction {
                 name, args, alias, ..
@@ -1532,6 +1537,20 @@ mod tests {
         assert!(matches!(
             errors[0].kind,
             SemanticErrorKind::UnresolvedColumn { .. }
+        ));
+    }
+
+    #[test]
+    fn test_unaliased_subqueries() {
+        let schema = make_schema();
+        // Since there are two unknown subqueries, "a" should be reported as ambiguous
+        let stmt = parse_one("SELECT a FROM (SELECT 1), (SELECT 2)");
+        let mut resolver = Resolver::new(&schema);
+        let errors = resolver.resolve_statement(&stmt);
+        assert_eq!(errors.len(), 1, "Expected ambiguous column error!");
+        assert!(matches!(
+            errors[0].kind,
+            SemanticErrorKind::AmbiguousColumn { .. }
         ));
     }
 

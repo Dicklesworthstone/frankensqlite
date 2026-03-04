@@ -173,7 +173,7 @@ pub fn refine_edges(
             continue;
         }
 
-        let page = crate::ssi_validation::witness_key_page(&edge.overlap_key);
+        let page = crate::ssi_validation::witness_key_page(&edge.overlap_key).unwrap_or(0);
         if let Some((_, summary)) = refinements.iter().find(|(p, _)| *p == page) {
             let estimated_bytes = estimate_summary_bytes(summary);
             if bytes_used + estimated_bytes > budget.max_bytes {
@@ -218,7 +218,7 @@ pub fn refine_edges(
             continue;
         }
 
-        let page = crate::ssi_validation::witness_key_page(&edge.overlap_key);
+        let page = crate::ssi_validation::witness_key_page(&edge.overlap_key).unwrap_or(0);
         if let Some((_, summary)) = refinements.iter().find(|(p, _)| *p == page) {
             let estimated_bytes = estimate_summary_bytes(summary);
             if bytes_used + estimated_bytes > budget.max_bytes {

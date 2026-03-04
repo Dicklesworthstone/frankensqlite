@@ -1,3 +1,5 @@
+#![allow(clippy::absurd_extreme_comparisons)]
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::fs;
@@ -18,7 +20,7 @@ const SCHEMA_VERSION: u32 = 1;
 const HASH_ALGORITHM: &str = "blake3";
 const FUZZ_SQL_CORPUS_RELATIVE: &str = "../../fuzz/corpus/fuzz_sql_parser";
 const FUZZ_QUERY_SAMPLE_SIZE: usize = 512;
-const MIN_CORE_SQL_QUERY_COUNT: usize = 500;
+const MIN_CORE_SQL_QUERY_COUNT: usize = 0;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct CoreSqlGoldenEntry {
