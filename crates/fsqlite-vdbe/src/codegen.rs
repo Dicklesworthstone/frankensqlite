@@ -2577,12 +2577,22 @@ fn parse_aggregate_columns(
             ResultColumn::Expr { expr, .. } if is_aggregate_expr(expr) => {
                 // Expression wraps aggregate(s).  Try single-aggregate
                 // extraction first (fast path), then multi-aggregate.
-                if let Some((inner_agg, wrapper)) = extract_inner_aggregate(expr, table) {
-                    agg_cols.push(AggColumn {
-                        wrapper_expr: Some(Box::new(wrapper)),
-                        ..inner_agg
-                    });
-                } else {
+                let single_ok =
+                    if let Some((inner_agg, ref wrapper)) = extract_inner_aggregate(expr, table) {
+                        if is_aggregate_expr(wrapper) {
+                            // Wrapper still contains aggregates → need multi-agg path.
+                            false
+                        } else {
+                            agg_cols.push(AggColumn {
+                                wrapper_expr: Some(Box::new(wrapper.clone())),
+                                ..inner_agg
+                            });
+                            true
+                        }
+                    } else {
+                        false
+                    };
+                if !single_ok {
                     // Multi-aggregate: e.g. MAX(x) - MIN(x).
                     let (extracted, wrapper) = extract_all_inner_aggregates(expr, table);
                     if extracted.is_empty() {
