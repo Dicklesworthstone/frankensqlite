@@ -2567,7 +2567,6 @@ fn emit_agg_wrapper(b: &mut ProgramBuilder, wrapper: &Expr, result_reg: i32) {
                 emit_expr(b, fallback_arg, result_reg, None);
             }
             b.resolve_label(done_label);
-            return;
         }
     }
     // For unsupported wrapper patterns, the aggregate result is emitted as-is.
