@@ -994,6 +994,19 @@ pub struct VdbeOp {
     pub p5: u16,
 }
 
+/// Metadata about an index cursor for REPLACE conflict resolution.
+///
+/// Used by `native_replace_row` to clean up secondary index entries when
+/// a table row is deleted due to REPLACE conflict resolution.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IndexCursorMeta {
+    /// Cursor ID of the index (typically table_cursor + 1, +2, ...).
+    pub cursor_id: i32,
+    /// Column indices (0-based positions in the table schema) that make up
+    /// the index key. The index key is `(col[0], col[1], ..., rowid)`.
+    pub column_indices: Vec<usize>,
+}
+
 /// The P4 operand of a VDBE instruction.
 ///
 /// P4 is a polymorphic operand that can hold different types depending on
@@ -1133,6 +1146,8 @@ pub struct ProgramBuilder {
     labels: Vec<LabelState>,
     /// Register allocator.
     regs: RegisterAllocator,
+    /// Table-to-index cursor metadata for REPLACE conflict resolution.
+    table_index_meta: Vec<(i32, Vec<IndexCursorMeta>)>,
 }
 
 impl ProgramBuilder {
@@ -1143,6 +1158,7 @@ impl ProgramBuilder {
             ops: Vec::new(),
             labels: Vec::new(),
             regs: RegisterAllocator::new(),
+            table_index_meta: Vec::new(),
         }
     }
 
@@ -1286,6 +1302,22 @@ impl ProgramBuilder {
         self.regs.count()
     }
 
+    // ── Index Metadata ───────────────────────────────────────────────────
+
+    /// Register metadata about index cursors associated with a table cursor.
+    ///
+    /// This is used by the VDBE engine's REPLACE conflict resolution to clean
+    /// up secondary index entries when a conflicting row is deleted.
+    pub fn register_table_indexes(
+        &mut self,
+        table_cursor: i32,
+        indexes: Vec<IndexCursorMeta>,
+    ) {
+        if !indexes.is_empty() {
+            self.table_index_meta.push((table_cursor, indexes));
+        }
+    }
+
     // ── Finalization ────────────────────────────────────────────────────
 
     /// Validate all labels are resolved and return the finished program.
@@ -1305,6 +1337,7 @@ impl ProgramBuilder {
         Ok(VdbeProgram {
             ops: self.ops,
             register_count: self.regs.count(),
+            table_index_meta: self.table_index_meta,
         })
     }
 }
@@ -1322,6 +1355,10 @@ pub struct VdbeProgram {
     ops: Vec<VdbeOp>,
     /// Number of registers needed (high water mark from allocation).
     register_count: i32,
+    /// Metadata mapping table cursor IDs to their associated index cursors.
+    /// Used by the VDBE engine's `native_replace_row` to clean up secondary
+    /// index entries during REPLACE conflict resolution.
+    table_index_meta: Vec<(i32, Vec<IndexCursorMeta>)>,
 }
 
 impl VdbeProgram {
@@ -1347,6 +1384,12 @@ impl VdbeProgram {
     #[must_use]
     pub fn register_count(&self) -> i32 {
         self.register_count
+    }
+
+    /// Table-to-index cursor metadata for REPLACE conflict resolution.
+    #[must_use]
+    pub fn table_index_meta(&self) -> &[(i32, Vec<IndexCursorMeta>)] {
+        &self.table_index_meta
     }
 
     /// Get the instruction at the given program counter.

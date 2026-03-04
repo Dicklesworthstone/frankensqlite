@@ -33,7 +33,7 @@ use fsqlite_mvcc::{
 };
 use fsqlite_pager::TransactionHandle;
 use fsqlite_types::cx::Cx;
-use fsqlite_types::opcode::{Opcode, P4, VdbeOp};
+use fsqlite_types::opcode::{IndexCursorMeta, Opcode, P4, VdbeOp};
 use fsqlite_types::record::{parse_record, serialize_record};
 use fsqlite_types::value::SqliteValue;
 use fsqlite_types::{CommitSeq, PageData, PageNumber, SchemaEpoch, StrictColumnType};
@@ -2002,6 +2002,10 @@ pub struct VdbeEngine {
     /// Set by the connection layer before execution when time-travel
     /// queries may be present.
     version_store: Option<Rc<RefCell<VersionStore>>>,
+    /// Metadata mapping table cursor IDs to their associated index cursors
+    /// and column indices. Used by `native_replace_row` to clean up secondary
+    /// index entries during REPLACE conflict resolution.
+    table_index_meta: HashMap<i32, Vec<IndexCursorMeta>>,
 }
 
 /// Time-travel target marker stored on cursors opened with
@@ -2261,6 +2265,7 @@ impl VdbeEngine {
             vtab_instances: SwissIndex::new(),
             time_travel_cursors: HashMap::new(),
             version_store: None,
+            table_index_meta: HashMap::new(),
         }
     }
 
@@ -2314,14 +2319,37 @@ impl VdbeEngine {
             return Ok(());
         };
 
-        // TODO(multi-index-replace): Clean up secondary index entries for the
-        // deleted row. Requires StorageCursor.name and VdbeEngine.schemas fields
-        // to look up which cursors correspond to which indexes. For now, only the
-        // table row is deleted; orphaned index entries may remain. This matches
-        // the pre-existing behavior before the incomplete refactor.
-        let _old_row = fsqlite_types::record::parse_record(&payload);
+        // Parse old row to extract column values for index key construction.
+        let old_row = parse_record(&payload);
 
-        // Delete the table row
+        // Delete secondary index entries for the old row using the metadata
+        // registered by the codegen. For each index cursor, build the index
+        // key from the old row's column values and delete it.
+        if let Some(index_metas) = self.table_index_meta.get(&tbl_cursor_id).cloned() {
+            for meta in &index_metas {
+                // Build index key: (indexed_col_values..., rowid).
+                let mut key_values: Vec<SqliteValue> =
+                    Vec::with_capacity(meta.column_indices.len() + 1);
+                for &col_idx in &meta.column_indices {
+                    let val = old_row
+                        .get(col_idx)
+                        .cloned()
+                        .unwrap_or(SqliteValue::Null);
+                    key_values.push(val);
+                }
+                key_values.push(SqliteValue::Integer(conflict_rowid));
+                let key_bytes = encode_record(&key_values);
+
+                // Seek to the key in the index cursor and delete it.
+                if let Some(sc) = self.storage_cursors.get_mut(&meta.cursor_id) {
+                    if sc.writable && sc.cursor.index_move_to(&sc.cx, &key_bytes)?.is_found() {
+                        sc.cursor.delete(&sc.cx)?;
+                    }
+                }
+            }
+        }
+
+        // Delete the table row.
         if let Some(tsc) = self.storage_cursors.get_mut(&tbl_cursor_id) {
             tsc.cursor.table_move_to(&tsc.cx, conflict_rowid)?;
             tsc.cursor.delete(&tsc.cx)?;
@@ -2523,6 +2551,12 @@ impl VdbeEngine {
         }
 
         self.aggregates.clear();
+
+        // Load table-to-index cursor metadata for REPLACE conflict resolution.
+        for (table_cursor, indexes) in program.table_index_meta() {
+            self.table_index_meta
+                .insert(*table_cursor, indexes.clone());
+        }
 
         let program_id = VDBE_PROGRAM_ID_SEQ.fetch_add(1, AtomicOrdering::Relaxed);
         let start_time = Instant::now();
@@ -6997,7 +7031,7 @@ fn char_to_affinity(ch: char) -> fsqlite_types::TypeAffinity {
 mod tests {
     use super::*;
     use crate::ProgramBuilder;
-    use fsqlite_types::opcode::{Opcode, P4, VdbeOp};
+    use fsqlite_types::opcode::{IndexCursorMeta, Opcode, P4, VdbeOp};
 
     /// Build and execute a program, returning results.
     fn run_program(build: impl FnOnce(&mut ProgramBuilder)) -> Vec<Vec<SqliteValue>> {

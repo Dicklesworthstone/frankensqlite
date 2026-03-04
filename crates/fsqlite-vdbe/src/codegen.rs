@@ -15,7 +15,7 @@ use fsqlite_ast::{
 };
 use fsqlite_parser::Parser as SqlParser;
 use fsqlite_types::StrictColumnType;
-use fsqlite_types::opcode::{Opcode, P4};
+use fsqlite_types::opcode::{IndexCursorMeta, Opcode, P4};
 
 // ---------------------------------------------------------------------------
 // Thread-local extra aggregate function names for UDF support (bd-2wt.3)
@@ -4177,6 +4177,11 @@ pub fn codegen_insert(
         );
     }
 
+    // Register table-to-index cursor metadata for REPLACE conflict resolution.
+    // This allows the engine's native_replace_row to clean up secondary index
+    // entries when a conflicting row is deleted.
+    register_table_index_meta(b, table, table_cursor);
+
     // Conflict behavior: ON CONFLICT clause from upsert takes precedence.
     let (oe_flag, upsert_clause) = if !stmt.upsert.is_empty() {
         // Use the first upsert clause (multiple ON CONFLICT clauses
@@ -5266,6 +5271,9 @@ pub fn codegen_update(
         );
     }
 
+    // Register table-to-index cursor metadata for REPLACE conflict resolution.
+    register_table_index_meta(b, table, table_cursor);
+
     // Full table scan: Rewind → loop body → Next.
     let loop_start = b.current_addr();
     b.emit_jump_to_label(Opcode::Rewind, table_cursor, 0, done_label, P4::None, 0);
@@ -5536,6 +5544,9 @@ pub fn codegen_delete(
             0,
         );
     }
+
+    // Register table-to-index cursor metadata for REPLACE conflict resolution.
+    register_table_index_meta(b, table, table_cursor);
 
     // Reverse scan (Last/Prev) so that delete_at(pos) does not shift
     // indices of rows we haven't visited yet.
@@ -5858,6 +5869,31 @@ fn emit_index_deletes(b: &mut ProgramBuilder, table: &TableSchema, table_cursor:
             0,
         );
     }
+}
+
+/// Register metadata mapping a table cursor to its index cursors and their
+/// column indices. Used by the VDBE engine's REPLACE conflict resolution to
+/// clean up secondary index entries when a conflicting row is deleted.
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+fn register_table_index_meta(b: &mut ProgramBuilder, table: &TableSchema, table_cursor: i32) {
+    let metas: Vec<IndexCursorMeta> = table
+        .indexes
+        .iter()
+        .enumerate()
+        .map(|(idx_offset, index)| {
+            let cursor_id = table_cursor + 1 + idx_offset as i32;
+            let column_indices: Vec<usize> = index
+                .columns
+                .iter()
+                .filter_map(|col_name| table.column_index(col_name))
+                .collect();
+            IndexCursorMeta {
+                cursor_id,
+                column_indices,
+            }
+        })
+        .collect();
+    b.register_table_indexes(table_cursor, metas);
 }
 
 /// Count result columns (handling `SELECT *`).
@@ -8519,7 +8555,7 @@ mod tests {
         OrderingTerm, PlaceholderType, QualifiedName, QualifiedTableRef, ResultColumn, SelectBody,
         SelectCore, SelectStatement, SortDirection, Span, TableOrSubquery, UpdateStatement,
     };
-    use fsqlite_types::opcode::{Opcode, P4};
+    use fsqlite_types::opcode::{IndexCursorMeta, Opcode, P4};
 
     fn test_schema() -> Vec<TableSchema> {
         vec![TableSchema {
