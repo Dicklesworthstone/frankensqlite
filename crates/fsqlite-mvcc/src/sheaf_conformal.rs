@@ -106,14 +106,23 @@ pub fn check_sheaf_consistency(
             }
 
             if !overlap_pages.is_empty() && !a_le_b && !b_le_a {
+                // Only report pages where versions actually disagree;
+                // agreeing pages are not part of the obstruction.
                 for (page, ver_a, ver_b) in overlap_pages {
-                    obstructions.push(SheafObstruction {
-                        page,
-                        txn_a: a.txn_id,
-                        version_a: ver_a,
-                        txn_b: b.txn_id,
-                        version_b: ver_b,
-                    });
+                    let disagrees = if let Some(order_fn) = version_order {
+                        !order_fn(ver_a, ver_b) && !order_fn(ver_b, ver_a)
+                    } else {
+                        ver_a != ver_b
+                    };
+                    if disagrees {
+                        obstructions.push(SheafObstruction {
+                            page,
+                            txn_a: a.txn_id,
+                            version_a: ver_a,
+                            txn_b: b.txn_id,
+                            version_b: ver_b,
+                        });
+                    }
                 }
             }
         }
@@ -189,14 +198,18 @@ pub fn check_sheaf_consistency_with_chains<S: std::hash::BuildHasher>(
             }
 
             if !overlap_pages.is_empty() && !a_le_b && !b_le_a {
+                // Only report pages where versions actually disagree;
+                // agreeing pages are not part of the obstruction.
                 for (page, ver_a, ver_b) in overlap_pages {
-                    obstructions.push(SheafObstruction {
-                        page,
-                        txn_a: a.txn_id,
-                        version_a: ver_a,
-                        txn_b: b.txn_id,
-                        version_b: ver_b,
-                    });
+                    if ver_a != ver_b {
+                        obstructions.push(SheafObstruction {
+                            page,
+                            txn_a: a.txn_id,
+                            version_a: ver_a,
+                            txn_b: b.txn_id,
+                            version_b: ver_b,
+                        });
+                    }
                 }
             }
         }
@@ -394,10 +407,10 @@ impl OpportunityScore {
     /// Compute the score.
     #[must_use]
     pub fn score(&self) -> f64 {
-        if self.effort <= 0.0 {
-            return f64::INFINITY;
-        }
-        self.impact * self.confidence / self.effort
+        // Clamp effort to a small positive minimum so zero/negative effort
+        // doesn't produce INFINITY (which would always pass the gate).
+        let effort = self.effort.max(f64::EPSILON);
+        self.impact * self.confidence / effort
     }
 
     /// Whether the score meets the gate threshold (>= 2.0).

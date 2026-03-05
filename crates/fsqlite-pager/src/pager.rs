@@ -275,6 +275,9 @@ fn serialize_freelist_to_write_set<F: VfsFile>(
             let take = remaining.min(max_leaf_entries);
 
             let mut buf = inner.cache.pool().acquire()?;
+            // Zero the entire page to avoid leaking stale data from the
+            // pool in the unused tail of the trunk page.
+            buf.fill(0);
             buf[0..4].copy_from_slice(&next.to_be_bytes());
             buf[4..8].copy_from_slice(&(take as u32).to_be_bytes());
 

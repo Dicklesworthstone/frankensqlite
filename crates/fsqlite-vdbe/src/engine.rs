@@ -7830,26 +7830,32 @@ mod tests {
             let r_co = b.alloc_reg(); // coroutine state register
             let r_val = b.alloc_reg(); // value register
 
-            // InitCoroutine: p1=r_co, p2=consumer start, p3=producer start
-            let consumer_start = b.emit_label();
-            let producer_start = b.emit_label();
-            b.emit_jump_to_label(Opcode::InitCoroutine, r_co, 0, consumer_start, P4::None, 0);
-            // Hack: resolve producer_start at the InitCoroutine's p3 position.
-            // Actually, InitCoroutine stores p3 into r_co, then jumps to p2.
-            // So p3 should be the producer's first instruction address.
+            let init_addr = b.emit_op(Opcode::InitCoroutine, r_co, 0, 0, P4::None, 0);
 
-            // For simplicity, just test Yield directly:
-            b.resolve_label(consumer_start);
-
-            // Producer: emit 3 values
-            b.resolve_label(producer_start);
-            b.emit_op(Opcode::Integer, 10, r_val, 0, P4::None, 0);
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            let consumer_start = b.current_addr() as i32;
+            b.emit_op(Opcode::Yield, r_co, 0, 0, P4::None, 0);
             b.emit_op(Opcode::ResultRow, r_val, 1, 0, P4::None, 0);
-            b.emit_op(Opcode::Integer, 20, r_val, 0, P4::None, 0);
+            b.emit_op(Opcode::Yield, r_co, 0, 0, P4::None, 0);
             b.emit_op(Opcode::ResultRow, r_val, 1, 0, P4::None, 0);
-            b.emit_op(Opcode::Integer, 30, r_val, 0, P4::None, 0);
+            b.emit_op(Opcode::Yield, r_co, 0, 0, P4::None, 0);
             b.emit_op(Opcode::ResultRow, r_val, 1, 0, P4::None, 0);
             b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            let producer_start = b.current_addr() as i32;
+            b.emit_op(Opcode::Integer, 10, r_val, 0, P4::None, 0);
+            b.emit_op(Opcode::Yield, r_co, 0, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 20, r_val, 0, P4::None, 0);
+            b.emit_op(Opcode::Yield, r_co, 0, 0, P4::None, 0);
+            b.emit_op(Opcode::Integer, 30, r_val, 0, P4::None, 0);
+            b.emit_op(Opcode::Yield, r_co, 0, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+
+            if let Some(init_op) = b.op_at_mut(init_addr) {
+                init_op.p2 = consumer_start;
+                init_op.p3 = producer_start;
+            }
 
             b.resolve_label(end);
         });

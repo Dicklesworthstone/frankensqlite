@@ -367,9 +367,7 @@ fn emit_upsert_expr(
         }
 
         // ── Leaf: literals & placeholders — no column refs ─────────────
-        Expr::Literal(..) | Expr::Placeholder(..) => {
-            emit_expr(b, expr, reg, Some(existing_ctx));
-        }
+        // (Handled by the wildcard arm)
 
         // ── Binary operations ──────────────────────────────────────────
         Expr::BinaryOp {
@@ -10472,7 +10470,7 @@ mod tests {
             table: QualifiedName::bare("t"),
             alias: None,
             columns: vec![],
-            source: InsertSource::Values(vec![vec![placeholder(1)]]),
+            source: InsertSource::Values(vec![vec![placeholder(1), placeholder(2)]]),
             upsert: vec![],
             returning: vec![],
         };
@@ -10826,7 +10824,7 @@ mod tests {
             table: QualifiedName::bare("t"),
             alias: None,
             columns: vec![],
-            source: InsertSource::Values(vec![vec![placeholder(1)]]),
+            source: InsertSource::Values(vec![vec![placeholder(1), placeholder(2)]]),
             upsert: vec![],
             returning: vec![ResultColumn::Expr {
                 expr: Expr::Column(ColumnRef::bare("rowid"), Span::ZERO),
