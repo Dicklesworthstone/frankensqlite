@@ -9,10 +9,11 @@
 //! Cursor-based opcodes (OpenRead, Rewind, Next, Column, etc.) are stubbed
 //! and will be wired to the B-tree layer in Phase 5.
 
+use hashbrown::{HashMap, HashSet};
 use std::any::Any;
 use std::cell::RefCell;
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::VecDeque;
 
 use fsqlite_btree::swiss_index::SwissIndex;
 use std::rc::Rc;
@@ -1530,9 +1531,7 @@ impl JitRuntimeState {
             return None;
         }
         let mut evicted = None;
-        if let std::collections::hash_map::Entry::Occupied(mut occupied) =
-            self.cache.entry(plan_hash)
-        {
+        if let hashbrown::hash_map::Entry::Occupied(mut occupied) = self.cache.entry(plan_hash) {
             occupied.insert(entry);
             self.touch_lru(plan_hash);
             return None;
@@ -3299,11 +3298,13 @@ impl VdbeEngine {
                 Opcode::If => {
                     // Jump to p2 if p1 is true (non-zero, non-NULL).
                     // If p1 is NULL, jump iff p3 != 0 (SQLite semantics).
+                    // C SQLite uses sqlite3VdbeIntValue() which truncates to
+                    // integer, so 0.5 is falsy (truncates to 0).
                     let val = self.get_reg(op.p1);
                     let should_jump = if val.is_null() {
                         op.p3 != 0
                     } else {
-                        val.to_float() != 0.0
+                        val.to_integer() != 0
                     };
                     if should_jump {
                         pc = op.p2 as usize;
@@ -3315,11 +3316,12 @@ impl VdbeEngine {
                 Opcode::IfNot => {
                     // Jump to p2 if p1 is false (zero).
                     // If p1 is NULL, jump iff p3 != 0 (SQLite semantics).
+                    // C SQLite uses sqlite3VdbeIntValue() — integer truncation.
                     let val = self.get_reg(op.p1);
                     let should_jump = if val.is_null() {
                         op.p3 != 0
                     } else {
-                        val.to_float() == 0.0
+                        val.to_integer() == 0
                     };
                     if should_jump {
                         pc = op.p2 as usize;
@@ -6981,15 +6983,19 @@ fn sql_rem(dividend: &SqliteValue, divisor: &SqliteValue) -> SqliteValue {
             None => SqliteValue::Integer(0),
         };
     }
-    // C SQLite: OP_Remainder always converts to integers even for float
-    // operands, performs integer %, then returns result as Float.
-    let ia = dividend.to_integer();
-    let ib = divisor.to_integer();
-    if ib == 0 {
+    // C SQLite: OP_Remainder uses sqlite3VdbeRealValue + fmod for
+    // non-integer operands. Rust f64 `%` operator is fmod.
+    let fa = dividend.to_float();
+    let fb = divisor.to_float();
+    if fb == 0.0 {
         return SqliteValue::Null;
     }
-    let result = ia.checked_rem(ib).unwrap_or_default();
-    SqliteValue::Float(result as f64)
+    let result = fa % fb;
+    if result.is_nan() {
+        SqliteValue::Null
+    } else {
+        SqliteValue::Float(result)
+    }
 }
 
 /// SQL shift left (SQLite semantics: negative shift = shift right).

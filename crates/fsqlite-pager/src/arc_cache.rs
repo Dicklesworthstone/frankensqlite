@@ -19,7 +19,7 @@
 //! pinning.  The mutex critical section covers only metadata updates
 //! (no I/O), keeping it short.
 
-use std::collections::HashMap;
+use hashbrown::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};

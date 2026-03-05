@@ -1053,9 +1053,10 @@ impl ScalarFunction for SubstrFunc {
 
         // Match C SQLite's 2-phase substr algorithm exactly:
         // Phase 1: remember if length was negative, make it positive
+        // Use saturating_neg to avoid panic on i64::MIN.
         let neg_p2 = p2 < 0;
         if neg_p2 {
-            p2 = -p2;
+            p2 = p2.saturating_neg();
         }
 
         // Phase 2: resolve start position (1-based to 0-based)
@@ -1123,7 +1124,7 @@ impl SubstrFunc {
 
         let neg_p2 = p2 < 0;
         if neg_p2 {
-            p2 = -p2;
+            p2 = p2.saturating_neg();
         }
 
         if p1 < 0 {

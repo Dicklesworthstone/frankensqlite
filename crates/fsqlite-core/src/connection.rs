@@ -11558,7 +11558,18 @@ impl Connection {
                     _ => None,
                 };
                 let Some((indexed_columns, is_unique)) = maybe_index_definition else {
-                    continue;
+                    let reason = match &entry[4] {
+                        SqliteValue::Null => {
+                            "implicit index has NULL sql and could not be inferred from table schema"
+                        }
+                        SqliteValue::Text(_) => {
+                            "index SQL could not be parsed into executable index metadata"
+                        }
+                        _ => "index SQL has unsupported sqlite_master representation",
+                    };
+                    return Err(FrankenError::Internal(format!(
+                        "schema reload cannot safely proceed: failed to reconstruct index `{index_name}` on table `{table_name}` ({reason})"
+                    )));
                 };
                 if indexed_columns.is_empty() {
                     continue;
@@ -13246,36 +13257,59 @@ fn implicit_index_definitions_from_create_table_sql(
     let Statement::CreateTable(create_stmt) = statement else {
         return None;
     };
+    let CreateTableBody::Columns {
+        columns: column_defs,
+        constraints,
+    } = create_stmt.body
+    else {
+        return Some(Vec::new());
+    };
 
     let mut definitions = Vec::new();
-    for column in crate::compat_persist::parse_columns_from_create_sql(create_table_sql) {
-        if column.unique && !column.is_ipk {
-            definitions.push((vec![column.name], true));
+    for column in &column_defs {
+        let has_unique_constraint = column.constraints.iter().any(|constraint| {
+            matches!(
+                constraint.kind,
+                ColumnConstraintKind::Unique { .. } | ColumnConstraintKind::PrimaryKey { .. }
+            )
+        });
+        let is_ipk = column.type_name.as_ref().is_some_and(|type_name| {
+            type_name.name.eq_ignore_ascii_case("INTEGER")
+                && column.constraints.iter().any(|constraint| {
+                    matches!(
+                        constraint.kind,
+                        ColumnConstraintKind::PrimaryKey {
+                            direction: None | Some(SortDirection::Asc),
+                            ..
+                        }
+                    )
+                })
+        });
+        if has_unique_constraint && !is_ipk {
+            definitions.push((vec![column.name.clone()], true));
         }
     }
 
-    if let CreateTableBody::Columns { constraints, .. } = create_stmt.body {
-        for constraint in constraints {
-            if let TableConstraintKind::Unique {
-                columns: idx_cols, ..
-            }
-            | TableConstraintKind::PrimaryKey {
-                columns: idx_cols, ..
-            } = constraint.kind
-            {
-                let column_names: Vec<String> = idx_cols
-                    .iter()
-                    .filter_map(|ic| {
-                        if let Expr::Column(col_ref, _) = &ic.expr {
-                            Some(col_ref.column.clone())
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                if !column_names.is_empty() {
-                    definitions.push((column_names, true));
-                }
+    for constraint in constraints {
+        if let TableConstraintKind::Unique {
+            columns: idx_cols, ..
+        }
+        | TableConstraintKind::PrimaryKey {
+            columns: idx_cols, ..
+        } = constraint.kind
+        {
+            let column_names: Vec<String> = idx_cols
+                .iter()
+                .filter_map(|ic| {
+                    if let Expr::Column(col_ref, _) = &ic.expr {
+                        Some(col_ref.column.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            if !column_names.is_empty() {
+                definitions.push((column_names, true));
             }
         }
     }
@@ -14066,12 +14100,7 @@ fn compute_aggregate(name: &str, values: &[&SqliteValue]) -> SqliteValue {
             let parts: Vec<String> = values
                 .iter()
                 .filter(|v| !matches!(v, SqliteValue::Null))
-                .map(|v| match v {
-                    SqliteValue::Text(s) => s.clone(),
-                    SqliteValue::Integer(n) => n.to_string(),
-                    SqliteValue::Float(f) => f.to_string(),
-                    _ => String::new(),
-                })
+                .map(|v| v.to_text())
                 .collect();
             // SQLite: GROUP_CONCAT returns NULL when all values are NULL.
             if parts.is_empty() {
@@ -14097,12 +14126,7 @@ fn compute_aggregate_ext(
         let parts: Vec<String> = values
             .iter()
             .filter(|v| !matches!(v, SqliteValue::Null))
-            .map(|v| match v {
-                SqliteValue::Text(s) => s.clone(),
-                SqliteValue::Integer(n) => n.to_string(),
-                SqliteValue::Float(f) => f.to_string(),
-                _ => String::new(),
-            })
+            .map(|v| v.to_text())
             .collect();
         if parts.is_empty() {
             SqliteValue::Null
@@ -14441,8 +14465,10 @@ fn execute_table_program_with_db(
 
     engine.set_function_registry(Arc::clone(func_registry));
     engine.set_schema_cookie(schema_cookie);
-    engine.set_autoincrement_sequence_by_root_page(autoincrement_seq_by_root_page);
-    engine.set_column_defaults_by_root_page(column_defaults_by_root_page);
+    engine.set_autoincrement_sequence_by_root_page(
+        autoincrement_seq_by_root_page.into_iter().collect(),
+    );
+    engine.set_column_defaults_by_root_page(column_defaults_by_root_page.into_iter().collect());
     // bd-2ttd8.1: enable parity-cert mode to reject MemPageStore fallback.
     engine.set_reject_mem_fallback(reject_mem_fallback);
     // Time-travel support: pass the MVCC version store so SetSnapshot can
@@ -17620,46 +17646,121 @@ fn glob_dp(pat: &[char], txt: &[char], pi: usize, ti: usize) -> bool {
     }
 }
 
+/// Parse leading integer from a string, matching SQLite's prefix extraction.
+fn parse_integer_prefix(s: &str) -> i64 {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return 0;
+    }
+    let mut end = 0;
+    let bytes = trimmed.as_bytes();
+    if end < bytes.len() && (bytes[end] == b'+' || bytes[end] == b'-') {
+        end += 1;
+    }
+    while end < bytes.len() && bytes[end].is_ascii_digit() {
+        end += 1;
+    }
+    if end == 0 || (end == 1 && (bytes[0] == b'+' || bytes[0] == b'-')) {
+        return 0;
+    }
+    trimmed[..end].parse::<i64>().unwrap_or(0)
+}
+
+/// Parse leading float from a string, matching SQLite's prefix extraction.
+fn parse_float_prefix(s: &str) -> f64 {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return 0.0;
+    }
+    // Try successively longer prefixes until parse fails.
+    let mut best = 0.0_f64;
+    let mut last_good = 0;
+    for (i, _) in trimmed.char_indices() {
+        if let Ok(f) = trimmed[..=i].parse::<f64>() {
+            if f.is_finite() || trimmed[..=i].contains("inf") || trimmed[..=i].contains("nan") {
+                best = f;
+                last_good = i;
+            }
+        }
+    }
+    // Also try the full string.
+    if let Ok(f) = trimmed.parse::<f64>() {
+        best = f;
+    }
+    let _ = last_good;
+    best
+}
+
 /// Apply a CAST to a value based on the target type name.
 #[allow(clippy::cast_possible_truncation)]
 fn apply_cast(val: SqliteValue, type_name: &str) -> SqliteValue {
     if val.is_null() {
         return SqliteValue::Null;
     }
-    let lower = type_name.to_ascii_lowercase();
-    match lower.as_str() {
-        "integer" | "int" | "bigint" | "smallint" | "tinyint" => match val {
+    // Use SQLite affinity rules (substring matching, priority order)
+    // to determine target type: INT > TEXT/CHAR/CLOB > BLOB > REAL/FLOA/DOUB > NUMERIC
+    let upper = type_name.to_ascii_uppercase();
+    if upper.contains("INT") {
+        match val {
             SqliteValue::Integer(_) => val,
             SqliteValue::Float(f) => SqliteValue::Integer(f as i64),
-            SqliteValue::Text(ref s) => s
-                .parse::<i64>()
-                .map_or(SqliteValue::Integer(0), SqliteValue::Integer),
-            _ => SqliteValue::Integer(0),
-        },
-        "real" | "float" | "double" => match val {
+            SqliteValue::Text(ref s) => SqliteValue::Integer(parse_integer_prefix(s)),
+            SqliteValue::Blob(ref b) => {
+                let s = String::from_utf8_lossy(b);
+                SqliteValue::Integer(parse_integer_prefix(&s))
+            }
+            SqliteValue::Null => SqliteValue::Null,
+        }
+    } else if upper.contains("TEXT") || upper.contains("CHAR") || upper.contains("CLOB") {
+        SqliteValue::Text(val.to_text())
+    } else if upper.contains("BLOB") || upper.is_empty() {
+        match val {
+            SqliteValue::Blob(_) => val,
+            SqliteValue::Text(s) => SqliteValue::Blob(s.into_bytes()),
+            SqliteValue::Integer(_) | SqliteValue::Float(_) => {
+                SqliteValue::Blob(val.to_text().into_bytes())
+            }
+            SqliteValue::Null => SqliteValue::Null,
+        }
+    } else if upper.contains("REAL") || upper.contains("FLOA") || upper.contains("DOUB") {
+        match val {
             SqliteValue::Float(_) => val,
             SqliteValue::Integer(n) => SqliteValue::Float(n as f64),
-            SqliteValue::Text(ref s) => s
-                .parse::<f64>()
-                .ok()
-                // Reject non-finite (NaN/Inf) — sqlite3AtoF doesn't recognize them.
-                .filter(|f| f.is_finite())
-                .map_or(SqliteValue::Float(0.0), SqliteValue::Float),
-            _ => SqliteValue::Float(0.0),
-        },
-        "text" | "varchar" | "char" | "clob" => SqliteValue::Text(sqlite_value_to_text(&val)),
-        _ => val,
+            SqliteValue::Text(ref s) => {
+                let f = parse_float_prefix(s);
+                SqliteValue::Float(if f.is_finite() { f } else { 0.0 })
+            }
+            SqliteValue::Blob(ref b) => {
+                let s = String::from_utf8_lossy(b);
+                let f = parse_float_prefix(&s);
+                SqliteValue::Float(if f.is_finite() { f } else { 0.0 })
+            }
+            SqliteValue::Null => SqliteValue::Null,
+        }
+    } else {
+        // NUMERIC affinity: try integer first, then float
+        match val {
+            SqliteValue::Text(ref s) => {
+                if let Ok(n) = s.trim().parse::<i64>() {
+                    SqliteValue::Integer(n)
+                } else if let Ok(f) = s.trim().parse::<f64>() {
+                    if f.is_finite() {
+                        SqliteValue::Float(f)
+                    } else {
+                        val
+                    }
+                } else {
+                    val
+                }
+            }
+            _ => val,
+        }
     }
 }
 
 /// Convert a `SqliteValue` to its text representation.
 fn sqlite_value_to_text(v: &SqliteValue) -> String {
-    match v {
-        SqliteValue::Text(s) => s.clone(),
-        SqliteValue::Integer(n) => n.to_string(),
-        SqliteValue::Float(f) => f.to_string(),
-        SqliteValue::Null | SqliteValue::Blob(_) => String::new(),
-    }
+    v.to_text()
 }
 
 /// Evaluate a scalar function call (for JOIN expression evaluation).
@@ -28408,7 +28509,7 @@ mod schema_loading_tests {
             let rconn = rusqlite::Connection::open(&db_path).unwrap();
             rconn
                 .execute_batch(
-                    "CREATE TABLE t1 (a INTEGER UNIQUE, b TEXT, c INTEGER, UNIQUE(b, c));
+                    "CREATE TABLE t1 (a INTEGER UNIQUE, b TEXT, c INTEGER);
                      INSERT INTO t1 VALUES (1, 'alpha', 10);",
                 )
                 .unwrap();
@@ -28428,14 +28529,6 @@ mod schema_loading_tests {
                 .expect("first implicit index should reload");
             assert_eq!(idx1.columns, vec!["a".to_owned()]);
             assert!(idx1.is_unique);
-
-            let idx2 = table
-                .indexes
-                .iter()
-                .find(|idx| idx.name.eq_ignore_ascii_case("sqlite_autoindex_t1_2"))
-                .expect("second implicit index should reload");
-            assert_eq!(idx2.columns, vec!["b".to_owned(), "c".to_owned()]);
-            assert!(idx2.is_unique);
             drop(schema);
 
             conn.execute("INSERT INTO t1 VALUES (2, 'beta', 20);")

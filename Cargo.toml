@@ -173,7 +173,9 @@ opt-level = "z"
 lto = true
 codegen-units = 1
 panic = "abort"
-strip = true
+strip = false
+debug = true
+force-frame-pointers = true
 
 [profile.release-perf]
 inherits = "release"

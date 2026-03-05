@@ -32,7 +32,7 @@ use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::{AccessFlags, SyncFlags, VfsOpenFlags};
 #[cfg(all(feature = "linux-uring-fs", not(feature = "linux-asupersync-uring")))]
 use nix::unistd::{Whence, lseek};
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::shm::ShmRegion;
 use crate::traits::{Vfs, VfsFile};
@@ -87,7 +87,7 @@ fn enforce_conformal_breach_policy(
     disable_reason: &'static str,
 ) {
     runtime.disable(disable_reason);
-    warn!(
+    info!(
         operation,
         observed_latency_us = duration_to_micros_saturated(observed),
         conformal_upper_bound_us,
@@ -216,10 +216,20 @@ impl IoUringRuntime {
 
     fn disable(&self, reason: &'static str) {
         if !self.disabled.swap(true, Ordering::AcqRel) {
-            warn!(
-                backend = Self::backend_name(),
-                reason, "io_uring backend disabled; falling back to unix path"
-            );
+            if matches!(
+                reason,
+                IO_URING_READ_CONFORMAL_BREACH_MSG | IO_URING_WRITE_CONFORMAL_BREACH_MSG
+            ) {
+                info!(
+                    backend = Self::backend_name(),
+                    reason, "io_uring backend disabled; falling back to unix path"
+                );
+            } else {
+                warn!(
+                    backend = Self::backend_name(),
+                    reason, "io_uring backend disabled; falling back to unix path"
+                );
+            }
         }
     }
 

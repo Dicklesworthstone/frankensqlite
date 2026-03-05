@@ -8,10 +8,11 @@ use std::cell::RefCell;
 
 use crate::ProgramBuilder;
 use fsqlite_ast::{
-    AssignmentTarget, ColumnRef, ConflictAction, DeleteStatement, Distinctness, Expr, FunctionArgs,
-    InsertSource, InsertStatement, LimitClause, Literal, OrderingTerm, QualifiedTableRef,
-    ResultColumn, SelectCore, SelectStatement, SortDirection, Statement, TableOrSubquery,
-    TimeTravelClause, TimeTravelTarget, UpdateStatement, UpsertAction, UpsertClause, UpsertTarget,
+    AssignmentTarget, ColumnRef, ConflictAction, DeleteStatement, Distinctness, Expr, FromClause,
+    FunctionArgs, InsertSource, InsertStatement, LimitClause, Literal, OrderingTerm,
+    QualifiedTableRef, ResultColumn, SelectCore, SelectStatement, SortDirection, Statement,
+    TableOrSubquery, TimeTravelClause, TimeTravelTarget, UpdateStatement, UpsertAction,
+    UpsertClause, UpsertTarget,
 };
 use fsqlite_parser::Parser as SqlParser;
 use fsqlite_types::StrictColumnType;
@@ -1981,6 +1982,7 @@ fn codegen_select_ordered_scan(
             table_alias,
             schema: Some(schema),
             register_base: None,
+            secondary: None,
         };
         for key in &sort_keys {
             match key {
@@ -2506,6 +2508,7 @@ fn codegen_select_aggregate(
                 table_alias,
                 schema: Some(schema),
                 register_base: None,
+                secondary: None,
             };
             emit_expr(b, filter_expr, filter_reg, Some(&scan_ctx));
             // p3=1: treat NULL as false (skip AggStep).
@@ -2544,6 +2547,7 @@ fn codegen_select_aggregate(
                     table_alias,
                     schema: Some(schema),
                     register_base: None,
+                    secondary: None,
                 };
                 emit_expr(b, expr, arg_base, Some(&scan_ctx));
             } else {
@@ -2567,6 +2571,7 @@ fn codegen_select_aggregate(
                     table_alias,
                     schema: Some(schema),
                     register_base: None,
+                    secondary: None,
                 };
                 for (j, extra_expr) in agg.extra_args.iter().enumerate() {
                     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
@@ -2892,6 +2897,7 @@ fn emit_agg_wrapper(b: &mut ProgramBuilder, wrapper: &Expr, result_reg: i32) {
         table_alias: None,
         schema: None,
         register_base: Some(result_reg),
+        secondary: None,
     };
     let temp = b.alloc_temp();
     emit_expr(b, wrapper, temp, Some(&scan));
@@ -2954,6 +2960,7 @@ fn emit_multi_agg_wrapper(
         table_alias: None,
         schema: None,
         register_base: Some(fake_base),
+        secondary: None,
     };
     let temp = b.alloc_temp();
     emit_expr(b, wrapper, temp, Some(&scan));
@@ -3873,6 +3880,7 @@ fn codegen_select_group_by_aggregate(
             table_alias,
             schema: Some(schema),
             register_base: None,
+            secondary: None,
         };
         let mut reg = sorter_base;
         for key in &group_by_keys {
@@ -4933,6 +4941,7 @@ fn codegen_insert_values(
                     table_alias: Some("excluded"),
                     schema: None,
                     register_base: Some(val_regs),
+                    secondary: None,
                 };
                 let existing_ctx = ScanCtx {
                     cursor,
@@ -4940,6 +4949,7 @@ fn codegen_insert_values(
                     table_alias: None,
                     schema: None,
                     register_base: Some(existing_regs),
+                    secondary: None,
                 };
 
                 // Optional WHERE clause on the DO UPDATE action.
@@ -5535,10 +5545,8 @@ pub fn codegen_update(
     let end_label = b.emit_label();
     let done_label = b.emit_label();
 
-    if stmt.from.is_some() {
-        return Err(CodegenError::Unsupported(
-            "UPDATE ... FROM is not supported in VDBE codegen path".to_owned(),
-        ));
+    if let Some(from_clause) = &stmt.from {
+        return codegen_update_from(b, stmt, from_clause, schema, ctx);
     }
     if !stmt.order_by.is_empty() || stmt.limit.is_some() {
         return Err(CodegenError::Unsupported(
@@ -5675,6 +5683,7 @@ pub fn codegen_update(
         table_alias: stmt.table.alias.as_deref(),
         schema: Some(schema),
         register_base: None,
+        secondary: None,
     };
     // Reset placeholder counter to 1 for SET expressions (they appear first in SQL text).
     b.set_next_anon_placeholder(1);
@@ -5799,6 +5808,335 @@ pub fn codegen_update(
         b.emit_op(Opcode::Close, idx_cursor, 0, 0, P4::None, 0);
     }
     b.emit_op(Opcode::Close, table_cursor, 0, 0, P4::None, 0);
+    b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+
+    // End label.
+    b.resolve_label(end_label);
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// UPDATE ... FROM codegen
+// ---------------------------------------------------------------------------
+
+/// Emit a Column or Rowid opcode for a column reference against a specific cursor.
+fn emit_column_from_cursor(
+    b: &mut ProgramBuilder,
+    col_name: &str,
+    cursor: i32,
+    table: &TableSchema,
+    reg: i32,
+) {
+    if is_rowid_alias(col_name) {
+        b.emit_op(Opcode::Rowid, cursor, reg, 0, P4::None, 0);
+    } else if let Some(col_idx) = table.column_index(col_name) {
+        if table.columns[col_idx].is_ipk {
+            b.emit_op(Opcode::Rowid, cursor, reg, 0, P4::None, 0);
+        } else {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            b.emit_op(Opcode::Column, cursor, col_idx as i32, reg, P4::None, 0);
+        }
+    } else {
+        b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
+    }
+}
+
+/// Generate VDBE bytecode for `UPDATE target SET ... FROM source WHERE ...`.
+///
+/// Uses a nested-loop join: outer loop scans the FROM table, inner loop scans
+/// the target table. WHERE clause filters for the join condition.
+#[allow(clippy::too_many_lines)]
+fn codegen_update_from(
+    b: &mut ProgramBuilder,
+    stmt: &UpdateStatement,
+    from_clause: &FromClause,
+    schema: &[TableSchema],
+    ctx: &CodegenContext,
+) -> Result<(), CodegenError> {
+    // Resolve the FROM source table (only simple named tables for now).
+    let (from_table_name, from_alias) = match &from_clause.source {
+        TableOrSubquery::Table { name, alias, .. } => (name.name.as_str(), alias.as_deref()),
+        _ => {
+            return Err(CodegenError::Unsupported(
+                "UPDATE ... FROM only supports named tables (not subqueries or joins)".to_owned(),
+            ));
+        }
+    };
+    if !from_clause.joins.is_empty() {
+        return Err(CodegenError::Unsupported(
+            "UPDATE ... FROM with JOIN clauses is not yet supported".to_owned(),
+        ));
+    }
+
+    let table_name = table_name_from_qualified(&stmt.table);
+    let target = find_table(schema, table_name)?;
+    let from_table = find_table(schema, from_table_name)?;
+    let n_cols = target.columns.len();
+
+    let end_label = b.emit_label();
+    let done_label = b.emit_label();
+
+    // Init.
+    b.emit_jump_to_label(Opcode::Init, 0, 0, end_label, P4::None, 0);
+
+    // Transaction (write).
+    b.emit_op(Opcode::Transaction, 0, 1, 0, P4::None, 0);
+
+    // Resolve assignment targets to column indices.
+    let assignment_cols: Vec<usize> = stmt
+        .assignments
+        .iter()
+        .map(|assign| {
+            let col_name = match &assign.target {
+                fsqlite_ast::AssignmentTarget::Column(name) => name.as_str(),
+                fsqlite_ast::AssignmentTarget::ColumnList(_) => {
+                    return Err(CodegenError::Unsupported(
+                        "multi-column SET (a, b) = (...) assignment is not yet supported"
+                            .to_owned(),
+                    ));
+                }
+            };
+            target
+                .column_index(col_name)
+                .ok_or_else(|| CodegenError::ColumnNotFound {
+                    table: target.name.clone(),
+                    column: col_name.to_owned(),
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Cursor allocation: 0 = target (write), 1..N = indexes, N+1 = FROM (read).
+    let target_cursor = 0_i32;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let from_cursor = (1 + target.indexes.len()) as i32;
+
+    // OpenWrite for target table.
+    b.emit_op(
+        Opcode::OpenWrite,
+        target_cursor,
+        target.root_page,
+        0,
+        P4::Table(target.name.clone()),
+        0,
+    );
+
+    // OpenWrite for each index on target.
+    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+    for (idx_offset, index) in target.indexes.iter().enumerate() {
+        let idx_cursor = target_cursor + 1 + idx_offset as i32;
+        b.emit_op(
+            Opcode::OpenWrite,
+            idx_cursor,
+            index.root_page,
+            0,
+            P4::Table(index.name.clone()),
+            0,
+        );
+    }
+    register_table_index_meta(b, target, target_cursor);
+
+    // OpenRead for FROM table.
+    b.emit_op(
+        Opcode::OpenRead,
+        from_cursor,
+        from_table.root_page,
+        0,
+        P4::Table(from_table.name.clone()),
+        0,
+    );
+
+    // Outer loop: scan FROM table.
+    let outer_loop_start = b.current_addr();
+    let outer_done_label = done_label;
+    b.emit_jump_to_label(
+        Opcode::Rewind,
+        from_cursor,
+        0,
+        outer_done_label,
+        P4::None,
+        0,
+    );
+
+    // Inner loop: scan target table.
+    let inner_done_label = b.emit_label();
+    let inner_loop_start = b.current_addr();
+    b.emit_jump_to_label(
+        Opcode::Rewind,
+        target_cursor,
+        0,
+        inner_done_label,
+        P4::None,
+        0,
+    );
+
+    // Build scan context with secondary for multi-table column resolution.
+    let scan = ScanCtx {
+        cursor: target_cursor,
+        table: target,
+        table_alias: stmt.table.alias.as_deref(),
+        schema: Some(schema),
+        register_base: None,
+        secondary: Some(SecondaryScan {
+            cursor: from_cursor,
+            table: from_table,
+            table_alias: from_alias,
+        }),
+    };
+
+    // WHERE filter.
+    let skip_label = b.emit_label();
+    if let Some(where_expr) = &stmt.where_clause {
+        let cond_reg = b.alloc_temp();
+        emit_expr(b, where_expr, cond_reg, Some(&scan));
+        b.emit_jump_to_label(Opcode::IfNot, cond_reg, 1, skip_label, P4::None, 0);
+        b.free_temp(cond_reg);
+    }
+
+    // Read ALL existing columns from target into registers.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let col_regs = b.alloc_regs(n_cols as i32);
+    for i in 0..n_cols {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let target_reg = col_regs + i as i32;
+        if target.columns.get(i).is_some_and(|col| col.is_ipk) {
+            b.emit_op(Opcode::Rowid, target_cursor, target_reg, 0, P4::None, 0);
+        } else {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            b.emit_op(
+                Opcode::Column,
+                target_cursor,
+                i as i32,
+                target_reg,
+                P4::None,
+                0,
+            );
+        }
+    }
+
+    // Delete old index entries before updating.
+    emit_index_deletes(b, target, target_cursor);
+
+    // Evaluate SET assignments. Column refs can reference both target and FROM tables.
+    for (assign_idx, col_idx) in assignment_cols.iter().enumerate() {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let target_reg = col_regs + *col_idx as i32;
+        emit_expr(
+            b,
+            &stmt.assignments[assign_idx].value,
+            target_reg,
+            Some(&scan),
+        );
+    }
+
+    // Get old rowid.
+    let old_rowid_reg = b.alloc_reg();
+    b.emit_op(Opcode::Rowid, target_cursor, old_rowid_reg, 0, P4::None, 0);
+
+    // Delete old row.
+    b.emit_op(Opcode::Delete, target_cursor, 0, 0, P4::None, 0);
+
+    // Determine destination rowid.
+    let mut rowid_reg = old_rowid_reg;
+    let rowid_alias_col_idx = ctx
+        .rowid_alias_col_idx
+        .or_else(|| target.columns.iter().position(|col| col.is_ipk));
+    if let Some(ipk_idx) = rowid_alias_col_idx {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let ipk_reg = col_regs + ipk_idx as i32;
+        let auto_label = b.emit_label();
+        let rowid_done_label = b.emit_label();
+        let concurrent_flag = i32::from(ctx.concurrent_mode);
+
+        rowid_reg = b.alloc_reg();
+
+        b.emit_jump_to_label(Opcode::IsNull, ipk_reg, 0, auto_label, P4::None, 0);
+        b.emit_op(Opcode::Copy, ipk_reg, rowid_reg, 0, P4::None, 0);
+        b.emit_jump_to_label(Opcode::Goto, 0, 0, rowid_done_label, P4::None, 0);
+
+        b.resolve_label(auto_label);
+        b.emit_op(
+            Opcode::NewRowid,
+            target_cursor,
+            rowid_reg,
+            concurrent_flag,
+            P4::None,
+            0,
+        );
+        b.emit_op(Opcode::Copy, rowid_reg, ipk_reg, 0, P4::None, 0);
+        b.resolve_label(rowid_done_label);
+    }
+
+    // Recompute STORED generated columns.
+    emit_stored_generated_columns(b, target, col_regs);
+
+    // MakeRecord with ALL columns.
+    emit_strict_type_check(b, target, col_regs);
+    let aff_str = target.affinity_string();
+    let rec_reg = b.alloc_reg();
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let n_cols_i32 = n_cols as i32;
+    b.emit_op(
+        Opcode::Affinity,
+        col_regs,
+        n_cols_i32,
+        0,
+        P4::Affinity(aff_str.clone()),
+        0,
+    );
+    b.emit_op(
+        Opcode::MakeRecord,
+        col_regs,
+        n_cols_i32,
+        rec_reg,
+        P4::Affinity(aff_str),
+        0,
+    );
+
+    // Insert updated row.
+    let oe_flag = conflict_action_to_oe(stmt.or_conflict.as_ref());
+    b.emit_op(
+        Opcode::Insert,
+        target_cursor,
+        rec_reg,
+        rowid_reg,
+        P4::Table(target.name.clone()),
+        oe_flag,
+    );
+
+    // Insert new index entries.
+    emit_index_inserts(b, target, target_cursor, col_regs, rowid_reg, oe_flag);
+
+    // RETURNING clause.
+    if !stmt.returning.is_empty() {
+        emit_returning(b, target_cursor, target, &stmt.returning, rowid_reg)?;
+    }
+
+    // Skip label for WHERE-filtered rows.
+    b.resolve_label(skip_label);
+
+    // Inner Next: loop back to inner loop body.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let inner_body = (inner_loop_start + 1) as i32;
+    b.emit_op(Opcode::Next, target_cursor, inner_body, 0, P4::None, 0);
+
+    // Inner done.
+    b.resolve_label(inner_done_label);
+
+    // Outer Next: loop back to outer loop body.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let outer_body = (outer_loop_start + 1) as i32;
+    b.emit_op(Opcode::Next, from_cursor, outer_body, 0, P4::None, 0);
+
+    // Done: close cursors.
+    b.resolve_label(done_label);
+    b.emit_op(Opcode::Close, from_cursor, 0, 0, P4::None, 0);
+    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+    for idx_offset in 0..target.indexes.len() {
+        let idx_cursor = target_cursor + 1 + idx_offset as i32;
+        b.emit_op(Opcode::Close, idx_cursor, 0, 0, P4::None, 0);
+    }
+    b.emit_op(Opcode::Close, target_cursor, 0, 0, P4::None, 0);
     b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
 
     // End label.
@@ -6046,6 +6384,7 @@ fn emit_stored_generated_columns(b: &mut ProgramBuilder, table: &TableSchema, va
                     table_alias: None,
                     schema: None,
                     register_base: Some(val_regs),
+                    secondary: None,
                 };
                 emit_expr(b, &expr, dest_reg, Some(&gen_ctx));
             } else {
@@ -6317,6 +6656,7 @@ fn emit_column_reads(
                         table_alias,
                         schema: Some(schema),
                         register_base: None,
+                        secondary: None,
                     };
                     emit_expr(b, expr, reg, Some(&scan));
                 }
@@ -6608,6 +6948,7 @@ fn emit_where_filter(
                 table_alias,
                 schema: Some(schema),
                 register_base: None,
+                secondary: None,
             };
             // Check for COLLATE on either operand.
             let collation_p4 = extract_collation(left)
@@ -6718,6 +7059,7 @@ fn emit_where_filter(
                 table_alias,
                 schema: Some(schema),
                 register_base: None,
+                secondary: None,
             };
             let cond_reg = b.alloc_temp();
             emit_expr(b, where_expr, cond_reg, Some(&scan));
@@ -7134,6 +7476,15 @@ struct ScanCtx<'a> {
     /// (`register_base + col_index`) instead of reading from the B-tree cursor.
     /// Used for generated column expression evaluation during INSERT.
     register_base: Option<i32>,
+    /// Secondary table context for UPDATE ... FROM multi-table resolution.
+    secondary: Option<SecondaryScan<'a>>,
+}
+
+/// Secondary table scan context for UPDATE ... FROM.
+struct SecondaryScan<'a> {
+    cursor: i32,
+    table: &'a TableSchema,
+    table_alias: Option<&'a str>,
 }
 
 enum InProbeValue<'a> {
@@ -7395,6 +7746,7 @@ fn try_emit_complex_in_subquery(
             table_alias,
             schema: Some(schema),
             register_base: None,
+            secondary: None,
         };
 
         // Emit sort key columns.
@@ -7570,6 +7922,7 @@ fn try_emit_complex_in_subquery(
             table_alias,
             schema: Some(schema),
             register_base: None,
+            secondary: None,
         };
 
         let r_probe = b.alloc_temp();
@@ -7691,6 +8044,7 @@ fn emit_in_probe_expr(
         table_alias: probe_source.table_alias,
         schema: Some(schema),
         register_base: None,
+        secondary: None,
     };
     match probe_source.value {
         InProbeValue::Expr(expr) => emit_expr(b, expr, r_probe, Some(&probe_scan)),
@@ -8049,6 +8403,13 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
             };
             if let Some(qualifier) = &col_ref.table {
                 if !matches_table_or_alias(qualifier, sc.table, sc.table_alias) {
+                    // Check secondary table context (UPDATE ... FROM).
+                    if let Some(sec) = &sc.secondary {
+                        if matches_table_or_alias(qualifier, sec.table, sec.table_alias) {
+                            emit_column_from_cursor(b, &col_ref.column, sec.cursor, sec.table, reg);
+                            return;
+                        }
+                    }
                     b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
                     return;
                 }
@@ -8071,6 +8432,9 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
                 } else {
                     b.emit_op(Opcode::Column, sc.cursor, col_idx as i32, reg, P4::None, 0);
                 }
+            } else if let Some(sec) = &sc.secondary {
+                // Unqualified column not found in primary — try secondary.
+                emit_column_from_cursor(b, &col_ref.column, sec.cursor, sec.table, reg);
             } else {
                 // Unknown column — emit Null.
                 b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
@@ -8213,6 +8577,7 @@ fn emit_exists_subquery(
         table_alias: sub_alias,
         schema: Some(schema),
         register_base: None,
+        secondary: None,
     };
 
     // Apply WHERE filter if present.
@@ -8325,6 +8690,7 @@ fn emit_scalar_subquery(
         table_alias: sub_alias,
         schema: Some(schema),
         register_base: None,
+        secondary: None,
     };
 
     // Check if this is an aggregate query (e.g., SELECT MAX(x) FROM t).
@@ -12431,7 +12797,8 @@ mod tests {
     }
 
     #[test]
-    fn test_codegen_update_rejects_from_clause_in_vdbe_path() {
+    fn test_codegen_update_from_generates_nested_loop() {
+        // UPDATE t SET b = s.b FROM s WHERE t.a = s.b
         let stmt = UpdateStatement {
             with: None,
             or_conflict: None,
@@ -12443,10 +12810,15 @@ mod tests {
             },
             assignments: vec![Assignment {
                 target: AssignmentTarget::Column("b".to_owned()),
-                value: placeholder(1),
+                value: Expr::Column(ColumnRef::qualified("s", "b"), Span::ZERO),
             }],
             from: Some(from_table("s")),
-            where_clause: None,
+            where_clause: Some(Expr::BinaryOp {
+                left: Box::new(Expr::Column(ColumnRef::qualified("t", "a"), Span::ZERO)),
+                op: AstBinaryOp::Eq,
+                right: Box::new(Expr::Column(ColumnRef::qualified("s", "b"), Span::ZERO)),
+                span: Span::ZERO,
+            }),
             returning: vec![],
             order_by: vec![],
             limit: None,
@@ -12454,10 +12826,33 @@ mod tests {
         let schema = test_schema_with_subquery_source();
         let ctx = CodegenContext::default();
         let mut b = ProgramBuilder::new();
-        let err = codegen_update(&mut b, &stmt, &schema, &ctx).unwrap_err();
+        codegen_update(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        let opcodes = opcode_sequence(&prog);
+        // Expect two Rewind opcodes (outer FROM, inner target).
+        let rewind_count = opcodes.iter().filter(|&&o| o == Opcode::Rewind).count();
+        assert_eq!(rewind_count, 2, "expected nested loop with 2 Rewind ops");
+        // Expect two Next opcodes (inner and outer).
+        let next_count = opcodes.iter().filter(|&&o| o == Opcode::Next).count();
+        assert_eq!(next_count, 2, "expected nested loop with 2 Next ops");
+        // Expect OpenWrite for target and OpenRead for FROM.
         assert!(
-            matches!(&err, CodegenError::Unsupported(msg) if msg.contains("UPDATE ... FROM")),
-            "expected explicit unsupported error, got {err:?}"
+            opcodes.contains(&Opcode::OpenWrite),
+            "expected OpenWrite for target table"
+        );
+        assert!(
+            opcodes.contains(&Opcode::OpenRead),
+            "expected OpenRead for FROM table"
+        );
+        // Expect Delete + Insert for the update-as-delete+insert pattern.
+        assert!(
+            opcodes.contains(&Opcode::Delete),
+            "expected Delete for old row"
+        );
+        assert!(
+            opcodes.contains(&Opcode::Insert),
+            "expected Insert for updated row"
         );
     }
 

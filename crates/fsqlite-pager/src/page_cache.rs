@@ -8,9 +8,9 @@
 //! This module is the *plumbing layer* for zero-copy I/O; the full ARC
 //! eviction policy lives in a higher-level module (bd-7pu).
 
+use hashbrown::HashMap;
+use hashbrown::hash_map::Entry;
 use std::cell::Cell;
-use std::collections::HashMap;
-use std::collections::hash_map::Entry;
 
 use fsqlite_error::Result;
 use fsqlite_types::cx::Cx;

@@ -734,14 +734,13 @@ impl<F: VfsFile> WalFile<F> {
 
     /// Find the last commit frame index, or `None` if there are no commits.
     pub fn last_commit_frame(&mut self, cx: &Cx) -> Result<Option<usize>> {
-        let mut last = None;
-        for i in 0..self.frame_count {
+        for i in (0..self.frame_count).rev() {
             let header = self.read_frame_header(cx, i)?;
             if header.is_commit() {
-                last = Some(i);
+                return Ok(Some(i));
             }
         }
-        Ok(last)
+        Ok(None)
     }
 
     /// Sync the WAL file to stable storage.

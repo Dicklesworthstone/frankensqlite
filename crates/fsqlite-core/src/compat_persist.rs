@@ -857,15 +857,17 @@ fn extract_default_value(remainder: &str) -> Option<String> {
 
 /// Map a SQL type keyword to an affinity character.
 fn type_to_affinity(type_str: &str) -> char {
+    // SQLite affinity rules (section 3.1 of datatype3.html):
+    // Priority: INT > TEXT/CHAR/CLOB > BLOB/empty > REAL/FLOA/DOUB > NUMERIC
     let upper = type_str.to_uppercase();
     if upper.contains("INT") {
         'D' // INTEGER affinity
-    } else if upper.contains("REAL") || upper.contains("FLOAT") || upper.contains("DOUB") {
-        'E' // REAL affinity
-    } else if upper.contains("BLOB") || upper.is_empty() {
-        'A' // BLOB (none) affinity
     } else if upper.contains("TEXT") || upper.contains("CHAR") || upper.contains("CLOB") {
         'B' // TEXT affinity
+    } else if upper.contains("BLOB") || upper.is_empty() {
+        'A' // BLOB (none) affinity
+    } else if upper.contains("REAL") || upper.contains("FLOA") || upper.contains("DOUB") {
+        'E' // REAL affinity
     } else {
         'C' // NUMERIC affinity
     }

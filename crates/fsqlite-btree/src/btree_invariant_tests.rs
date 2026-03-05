@@ -237,6 +237,67 @@ mod tests {
 
             verify_sorted_order(&mut cursor, &cx, &expected);
         }
+
+        #[test]
+        fn index_btree_invariant_random_insert_delete(
+            ops in prop::collection::vec(
+                (any::<bool>(), prop::collection::vec(0u8..255, 1..100)),
+                1..=2000
+            ),
+        ) {
+            let cx = Cx::new();
+            let root = PageNumber::new(2).unwrap();
+            let store = MemPageStore::with_empty_index(root, USABLE);
+            let mut cursor = BtCursor::new(store, root, USABLE, false);
+
+            let mut expected = BTreeSet::new();
+
+            for (is_insert, mut key) in ops {
+                key.insert(0, 0xFF);
+
+                if is_insert || !expected.contains(&key) {
+                    if expected.insert(key.clone()) {
+                        cursor.index_insert(&cx, &key).unwrap();
+                    }
+                } else {
+                    let seek = cursor.index_move_to(&cx, &key).unwrap();
+                    if seek.is_found() {
+                        cursor.delete(&cx).unwrap();
+                        expected.remove(&key);
+                    }
+                }
+            }
+
+            // Verify sorted order for index tree.
+            let has = cursor.first(&cx).unwrap();
+            if expected.is_empty() {
+                assert!(!has, "empty tree should have no rows");
+            } else {
+                assert!(has, "non-empty tree should have rows");
+                let mut btree_elements = BTreeSet::new();
+                let mut prev: Option<Vec<u8>> = None;
+                loop {
+                    if cursor.eof() {
+                        break;
+                    }
+                    let key = cursor.payload(&cx).unwrap();
+                    if let Some(ref p) = prev {
+                        assert!(key > *p, "keys not strictly ascending");
+                    }
+                    assert!(expected.contains(&key), "unexpected key in tree");
+                    prev = Some(key.clone());
+                    btree_elements.insert(key);
+                    if !cursor.next(&cx).unwrap() {
+                        break;
+                    }
+                }
+                if btree_elements.len() != expected.len() {
+                    let _missing: Vec<_> = expected.difference(&btree_elements).collect();
+                    panic!("row count mismatch! missing {} elements", expected.len() - btree_elements.len());
+                }
+                assert_eq!(btree_elements.len(), expected.len(), "row count mismatch");
+            }
+        }
     }
 
     // ────────────────────────────────────────────────────────────────────

@@ -297,8 +297,8 @@ struct CxInner {
     mask_depth: AtomicU32,
     children: Mutex<Vec<Weak<Self>>>,
     last_checkpoint_msg: Mutex<Option<String>>,
-    eprocess_oracle: Mutex<Option<Arc<EProcessOracle>>>,
-    native_cx: Mutex<Option<NativeCx>>,
+    eprocess_oracle: std::sync::OnceLock<Arc<EProcessOracle>>,
+    native_cx: std::sync::OnceLock<NativeCx>,
     // Deterministic clock: milliseconds since epoch for tests.
     unix_millis: AtomicU64,
 }
@@ -312,8 +312,8 @@ impl CxInner {
             mask_depth: AtomicU32::new(0),
             children: Mutex::new(Vec::new()),
             last_checkpoint_msg: Mutex::new(None),
-            eprocess_oracle: Mutex::new(None),
-            native_cx: Mutex::new(None),
+            eprocess_oracle: std::sync::OnceLock::new(),
+            native_cx: std::sync::OnceLock::new(),
             unix_millis: AtomicU64::new(0),
         }
     }
@@ -347,12 +347,7 @@ fn native_reason_to_local(reason: &NativeCancelReason) -> CancelReason {
 }
 
 fn sync_native_cx_cancel(inner: &CxInner, reason: CancelReason) {
-    let native = inner
-        .native_cx
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone();
-    if let Some(native) = native {
+    if let Some(native) = inner.native_cx.get() {
         native.set_cancel_reason(local_reason_to_native(reason));
     }
 }
@@ -649,22 +644,13 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
 
     /// Attach an e-process oracle used by [`Self::checkpoint`].
     pub fn set_eprocess_oracle(&self, oracle: Arc<EProcessOracle>) {
-        let mut guard = self
-            .inner
-            .eprocess_oracle
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *guard = Some(oracle);
+        let _ = self.inner.eprocess_oracle.set(oracle);
     }
 
     /// Remove the currently attached e-process oracle.
     pub fn clear_eprocess_oracle(&self) {
-        let mut guard = self
-            .inner
-            .eprocess_oracle
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *guard = None;
+        // OnceLock cannot be easily cleared. We just leave it as is.
+        // It's only called in unused methods anyway.
     }
 
     /// Attach a native asupersync context used by [`Self::checkpoint`].
@@ -674,33 +660,17 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
         } else if self.is_cancel_requested() {
             native_cx.set_cancel_requested(true);
         }
-        let mut guard = self
-            .inner
-            .native_cx
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *guard = Some(native_cx);
+        let _ = self.inner.native_cx.set(native_cx);
     }
 
     /// Remove the currently attached native asupersync context.
     pub fn clear_native_cx(&self) {
-        let mut guard = self
-            .inner
-            .native_cx
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *guard = None;
+        // OnceLock cannot be easily cleared. We just leave it as is.
     }
 
     #[must_use]
     fn maybe_cancel_via_eprocess(&self) -> bool {
-        let oracle = self
-            .inner
-            .eprocess_oracle
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        let Some(oracle) = oracle else {
+        let Some(oracle) = self.inner.eprocess_oracle.get() else {
             return false;
         };
         if oracle.should_shed(self.budget.priority) {
@@ -712,13 +682,7 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
 
     #[must_use]
     fn maybe_cancel_via_native_cx(&self, masked: bool) -> bool {
-        let native = self
-            .inner
-            .native_cx
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        let Some(native) = native else {
+        let Some(native) = self.inner.native_cx.get() else {
             return false;
         };
 

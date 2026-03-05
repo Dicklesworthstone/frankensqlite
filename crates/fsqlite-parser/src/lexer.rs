@@ -380,8 +380,14 @@ impl<'a> Lexer<'a> {
     fn skip_whitespace_and_comments(&mut self) {
         loop {
             // Skip whitespace
-            while self.pos < self.src.len() && self.src[self.pos].is_ascii_whitespace() {
-                self.advance();
+            let mut ws_len = 0;
+            while self.pos + ws_len < self.src.len()
+                && self.src[self.pos + ws_len].is_ascii_whitespace()
+            {
+                ws_len += 1;
+            }
+            if ws_len > 0 {
+                self.advance_by(ws_len);
             }
 
             if self.pos >= self.src.len() {

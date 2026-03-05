@@ -837,6 +837,33 @@ impl<P: PageReader> BtCursor<P> {
 
     /// Seek to a key in an index B-tree. Returns the seek result.
     fn index_seek(&mut self, cx: &Cx, target_key: &[u8]) -> Result<SeekResult> {
+        let res = self.index_seek_for_insert(cx, target_key)?;
+        if !res.is_found() && self.at_eof {
+            // We fell off the right edge of the leaf.
+            // Determine if there is a successor up the tree.
+            let mut has_successor = false;
+            for parent in self.stack.iter().rev().skip(1) {
+                if parent.cell_idx < parent.header.cell_count {
+                    has_successor = true;
+                    break;
+                }
+            }
+
+            if has_successor {
+                // There is a successor. Reset eof and use advance_next to reach it.
+                self.at_eof = false;
+                let advanced = self.advance_next(cx)?;
+                if !advanced {
+                    self.at_eof = true;
+                }
+            }
+        }
+        Ok(res)
+    }
+
+    /// Internal seek used by INSERT that anchors the cursor on the leaf where
+    /// the target belongs, even if it falls off the right edge.
+    fn index_seek_for_insert(&mut self, cx: &Cx, target_key: &[u8]) -> Result<SeekResult> {
         self.stack.clear();
         let mut current_page = self.root_page;
 
@@ -867,31 +894,11 @@ impl<P: PageReader> BtCursor<P> {
                         let mut entry = entry;
                         if idx >= entry.header.cell_count {
                             // Target is strictly greater than the last key on this leaf.
-                            // To match API expectations (position at successor), we must look
-                            // up the tree for the first ancestor where we took a left branch.
-                            let mut has_successor = false;
-                            for parent in self.stack.iter().rev() {
-                                if parent.cell_idx < parent.header.cell_count {
-                                    has_successor = true;
-                                    break;
-                                }
-                            }
-
-                            if has_successor {
-                                // Pop up to the successor.
-                                while let Some(parent) = self.stack.last() {
-                                    if parent.cell_idx < parent.header.cell_count {
-                                        break;
-                                    }
-                                    self.stack.pop();
-                                }
-                                self.at_eof = false;
-                            } else {
-                                // Global EOF. Keep the leaf on the stack for INSERT.
-                                entry.cell_idx = entry.header.cell_count.saturating_sub(1);
-                                self.stack.push(entry);
-                                self.at_eof = true;
-                            }
+                            // Keep the path anchored to this right-most leaf and mark EOF,
+                            // so callers (notably INSERT) still have a valid stack context.
+                            entry.cell_idx = entry.header.cell_count.saturating_sub(1);
+                            self.stack.push(entry);
+                            self.at_eof = true;
                         } else {
                             entry.cell_idx = idx;
                             self.stack.push(entry);
@@ -1929,7 +1936,7 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
 
     fn index_insert(&mut self, cx: &Cx, key: &[u8]) -> Result<()> {
         self.with_btree_op(cx, BtreeOpType::Insert, |cursor| {
-            let seek = cursor.index_seek(cx, key)?;
+            let seek = cursor.index_seek_for_insert(cx, key)?;
             let (is_leaf, cell_idx) = {
                 let top = cursor
                     .stack

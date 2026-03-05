@@ -200,6 +200,16 @@ impl Scope {
         self.ctes.insert(name.to_ascii_lowercase());
     }
 
+    /// Check if a CTE is visible in this scope (or parent scopes).
+    #[must_use]
+    pub fn has_cte(&self, name: &str) -> bool {
+        let key = name.to_ascii_lowercase();
+        if self.ctes.contains(&key) {
+            return true;
+        }
+        self.parent.as_ref().is_some_and(|p| p.has_cte(name))
+    }
+
     /// Check if an alias is visible in this scope (or parent scopes).
     #[must_use]
     pub fn has_alias(&self, alias: &str) -> bool {
@@ -688,15 +698,19 @@ impl<'a> Resolver<'a> {
         // Resolve ORDER BY against the first core's scope augmented with SELECT aliases.
         let mut order_by_scope = first_core_scope.clone();
         if let SelectCore::Select { columns, .. } = &select.body.select {
+            let mut output_cols = HashSet::new();
             for col in columns {
                 if let ResultColumn::Expr {
                     alias: Some(alias_id),
                     ..
                 } = col
                 {
-                    // Add the output column alias so ORDER BY can reference it.
-                    order_by_scope.add_alias(alias_id, "<output>", None);
+                    output_cols.insert(alias_id.to_ascii_lowercase());
                 }
+            }
+            if !output_cols.is_empty() {
+                // Add the output columns as a pseudo-table so ORDER BY can reference them.
+                order_by_scope.add_alias("<output>", "<output>", Some(output_cols));
             }
         }
 
@@ -803,7 +817,7 @@ impl<'a> Resolver<'a> {
                 }
 
                 // Resolve table name against schema or CTEs.
-                if scope.ctes.contains(&table_name.to_ascii_lowercase()) {
+                if scope.has_cte(table_name) {
                     // CTE reference — columns are unknown at this stage.
                     scope.add_alias(alias_name, table_name, None);
                     self.tables_resolved += 1;
@@ -1179,7 +1193,7 @@ impl<'a> Resolver<'a> {
 
     fn bind_table_to_scope(&mut self, name: &str, alias: Option<&str>, scope: &mut Scope) {
         let alias_name = alias.unwrap_or(name);
-        if scope.ctes.contains(&name.to_ascii_lowercase()) {
+        if scope.has_cte(name) {
             scope.add_alias(alias_name, name, None);
             self.tables_resolved += 1;
         } else if let Some(table_def) = self.schema.find_table(name) {
@@ -1198,8 +1212,7 @@ impl<'a> Resolver<'a> {
     }
 
     fn resolve_table_name(&mut self, name: &str, scope: &Scope) {
-        if scope.ctes.contains(&name.to_ascii_lowercase()) || self.schema.find_table(name).is_some()
-        {
+        if scope.has_cte(name) || self.schema.find_table(name).is_some() {
             self.tables_resolved += 1;
         } else {
             self.push_error(SemanticErrorKind::UnresolvedTable {

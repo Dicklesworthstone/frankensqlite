@@ -1424,9 +1424,9 @@ fn ensure_frame_len(frame: &[u8], page_size: usize) -> Result<()> {
     ensure_min_len(frame, frame_size, "WAL frame")
 }
 
+#[inline]
 fn decode_u32_words(bytes: &[u8], big_endian_checksum_words: bool) -> u32 {
-    let mut raw = [0_u8; 4];
-    raw.copy_from_slice(bytes);
+    let raw = bytes[..4].try_into().unwrap();
     if big_endian_checksum_words {
         u32::from_be_bytes(raw)
     } else {
@@ -1434,10 +1434,9 @@ fn decode_u32_words(bytes: &[u8], big_endian_checksum_words: bool) -> u32 {
     }
 }
 
+#[inline]
 fn read_be_u32_at(bytes: &[u8], offset: usize) -> u32 {
-    let mut raw = [0_u8; 4];
-    raw.copy_from_slice(&bytes[offset..offset + 4]);
-    u32::from_be_bytes(raw)
+    u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap())
 }
 
 fn write_be_u32_at(bytes: &mut [u8], offset: usize, value: u32) {

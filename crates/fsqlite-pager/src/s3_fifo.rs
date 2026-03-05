@@ -802,7 +802,8 @@ fn regression_bps(baseline: u64, candidate: u64) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::{HashMap, HashSet, VecDeque};
+    use hashbrown::HashMap;
+    use std::collections::{HashSet, VecDeque};
     use std::sync::{Arc, Mutex};
 
     use proptest::collection::vec;

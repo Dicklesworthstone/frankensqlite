@@ -281,6 +281,14 @@ impl WriteCoordinator {
         self.mode
     }
 
+    /// Allocate the next commit sequence number atomically.
+    fn allocate_commit_seq(&self) -> CommitSeq {
+        CommitSeq::new(
+            self.next_commit_seq
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+        )
+    }
+
     /// Restore coordinator state from persistent storage (WAL/Marker stream).
     ///
     /// MUST be called immediately after creation/lease-acquisition to populate
@@ -601,12 +609,11 @@ impl WriteCoordinator {
         }
 
         let mut responses = Vec::with_capacity(requests.len());
-        let mut accepted_commits: Vec<(CommitSeq, BTreeSet<u32>)> = Vec::new();
-        let mut batch_page_owner: HashMap<u32, CommitSeq> = HashMap::new();
+        let mut accepted_commits: Vec<CommitSeq> = Vec::new();
         let frame_header_size = 24_u64;
         let mut total_batch_bytes = 0_u64;
 
-        // Phase 1: Validate all (under a single write lock).
+        // Phase 1: Validate all and reserve eagerly (under a single write lock).
         let mut index = self.commit_page_index.write();
         for req in requests {
             let page_numbers: Vec<u32> = req
@@ -639,44 +646,28 @@ impl WriteCoordinator {
                     conflicting_commit_seq: conflict_seq,
                 });
             } else {
-                let mut intra_batch_conflicts = Vec::new();
-                let mut intra_batch_conflict_seq = CommitSeq::new(0);
+                // Phase 2: Allocate commit_seq and WAL offset.
+                let commit_seq = self.allocate_commit_seq();
+                let page_size = Self::infer_page_size(&req.write_set);
+                let page_count = req.write_set.page_count() as u64;
+                let commit_bytes = page_count * (frame_header_size + page_size);
+                let wal_offset = self.wal_offset.fetch_add(commit_bytes, Ordering::SeqCst);
+                total_batch_bytes += commit_bytes;
+
+                // Eagerly reserve to prevent intra-batch conflicts and concurrent conflicts.
                 for &pgno in &page_set {
-                    if let Some(&owner_seq) = batch_page_owner.get(&pgno) {
-                        if let Some(page) = PageNumber::new(pgno) {
-                            intra_batch_conflicts.push(page);
-                        }
-                        if owner_seq.get() > intra_batch_conflict_seq.get() {
-                            intra_batch_conflict_seq = owner_seq;
-                        }
-                    }
+                    index.insert(pgno, commit_seq);
                 }
-
-                if intra_batch_conflicts.is_empty() {
-                    // Phase 2: Allocate commit_seq and WAL offset.
-                    let commit_seq = self.allocate_commit_seq();
-                    let page_size = Self::infer_page_size(&req.write_set);
-                    let page_count = req.write_set.page_count() as u64;
-                    let commit_bytes = page_count * (frame_header_size + page_size);
-                    let wal_offset = self.wal_offset.fetch_add(commit_bytes, Ordering::SeqCst);
-                    total_batch_bytes += commit_bytes;
-
-                    for &pgno in &page_set {
-                        batch_page_owner.insert(pgno, commit_seq);
-                    }
-                    accepted_commits.push((commit_seq, page_set));
-                    responses.push(CompatCommitResponse::Ok {
-                        wal_offset,
-                        commit_seq,
-                    });
-                } else {
-                    responses.push(CompatCommitResponse::Conflict {
-                        conflicting_pages: intra_batch_conflicts,
-                        conflicting_commit_seq: intra_batch_conflict_seq,
-                    });
-                }
+                accepted_commits.push(commit_seq);
+                responses.push(CompatCommitResponse::Ok {
+                    wal_offset,
+                    commit_seq,
+                });
             }
         }
+
+        // Drop the index lock BEFORE Phase 3 I/O!
+        drop(index);
 
         if accepted_commits.is_empty() {
             return responses;
@@ -692,14 +683,13 @@ impl WriteCoordinator {
             "compat_commit_batch: single fsync for batch"
         );
 
-        // Phase 4: Publish all and fill responses.
-        for (commit_seq, page_set) in &accepted_commits {
-            for &pgno in page_set {
-                index.insert(pgno, *commit_seq);
-            }
-            self.committed_seqs.write().push(*commit_seq);
+        // Phase 4: Publish all.
+        // Index was already updated in Phase 1 to reserve pages.
+        let mut committed_seqs = self.committed_seqs.write();
+        for commit_seq in &accepted_commits {
+            committed_seqs.push(*commit_seq);
         }
-        drop(index);
+        drop(committed_seqs);
 
         info!(
             bead_id = "bd-389e",
@@ -716,52 +706,6 @@ impl WriteCoordinator {
     /// Whether an active coordinator lease is currently held.
     fn has_active_lease(&self) -> bool {
         self.lease.read().is_some()
-    }
-
-    /// Validate first-committer-wins against the commit page index.
-    ///
-    /// Returns `None` if no conflicts; `Some((pages, seq))` on conflict.
-    fn validate_fcw_set(
-        &self,
-        write_pages: &BTreeSet<u32>,
-        begin_seq: CommitSeq,
-    ) -> Option<(Vec<PageNumber>, CommitSeq)> {
-        let index = self.commit_page_index.read();
-        let mut conflict_pages = Vec::new();
-        let mut conflict_seq = CommitSeq::new(0);
-
-        for &pgno in write_pages {
-            if let Some(&committed_seq) = index.get(&pgno) {
-                if committed_seq.get() > begin_seq.get() {
-                    if let Some(pn) = PageNumber::new(pgno) {
-                        conflict_pages.push(pn);
-                    }
-                    if committed_seq.get() > conflict_seq.get() {
-                        conflict_seq = committed_seq;
-                    }
-                }
-            }
-        }
-
-        if conflict_pages.is_empty() {
-            None
-        } else {
-            Some((conflict_pages, conflict_seq))
-        }
-    }
-
-    /// Allocate the next commit sequence number (monotonic).
-    fn allocate_commit_seq(&self) -> CommitSeq {
-        let seq = self.next_commit_seq.fetch_add(1, Ordering::SeqCst);
-        CommitSeq::new(seq)
-    }
-
-    /// Update the commit page index after a successful commit.
-    fn update_commit_index(&self, pages: &BTreeSet<u32>, commit_seq: CommitSeq) {
-        let mut index = self.commit_page_index.write();
-        for &pgno in pages {
-            index.insert(pgno, commit_seq);
-        }
     }
 
     /// Infer page size from the write set (V1: assume 4096 if no data).
