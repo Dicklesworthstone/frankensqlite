@@ -11542,25 +11542,23 @@ impl Connection {
                     SqliteValue::Integer(n) => *n,
                     _ => continue,
                 };
-                let create_sql = match &entry[4] {
-                    SqliteValue::Text(s) => s.clone(),
-                    _ => continue,
-                };
                 let root_page = i32::try_from(root_page_num).unwrap_or(0);
                 if root_page <= 0 {
                     continue;
                 }
-                let (indexed_columns, is_unique) = match parse_single_statement(&create_sql) {
-                    Ok(Statement::CreateIndex(stmt)) => {
-                        let cols = stmt
-                            .columns
-                            .iter()
-                            .filter_map(normalize_indexed_column_term)
-                            .map(|term| term.column_name)
-                            .collect::<Vec<_>>();
-                        (cols, stmt.unique)
+                let maybe_index_definition = match &entry[4] {
+                    SqliteValue::Text(create_sql) => {
+                        parse_index_columns_from_create_sql(create_sql)
                     }
-                    _ => (Vec::new(), false),
+                    SqliteValue::Null => infer_implicit_index_definition_from_master_entries(
+                        &master_entries,
+                        &table_name,
+                        &index_name,
+                    ),
+                    _ => None,
+                };
+                let Some((indexed_columns, is_unique)) = maybe_index_definition else {
+                    continue;
                 };
                 if indexed_columns.is_empty() {
                     continue;
@@ -13175,6 +13173,114 @@ struct NormalizedIndexedColumnTerm {
     column_name: String,
     collation: Option<String>,
     direction: Option<SortDirection>,
+}
+
+fn parse_index_columns_from_create_sql(create_sql: &str) -> Option<(Vec<String>, bool)> {
+    match parse_single_statement(create_sql).ok()? {
+        Statement::CreateIndex(stmt) => {
+            let columns = stmt
+                .columns
+                .iter()
+                .filter_map(normalize_indexed_column_term)
+                .map(|term| term.column_name)
+                .collect::<Vec<_>>();
+            if columns.is_empty() {
+                None
+            } else {
+                Some((columns, stmt.unique))
+            }
+        }
+        _ => None,
+    }
+}
+
+fn infer_implicit_index_definition_from_master_entries(
+    master_entries: &[Vec<SqliteValue>],
+    table_name: &str,
+    index_name: &str,
+) -> Option<(Vec<String>, bool)> {
+    let ordinal = parse_autoindex_ordinal(index_name, table_name)?;
+    let table_create_sql = master_entries.iter().find_map(|entry| {
+        if entry.len() < 5 {
+            return None;
+        }
+        let entry_type = match &entry[0] {
+            SqliteValue::Text(s) => s.as_str(),
+            _ => return None,
+        };
+        if !entry_type.eq_ignore_ascii_case("table") {
+            return None;
+        }
+        let entry_table_name = match &entry[1] {
+            SqliteValue::Text(s) => s.as_str(),
+            _ => return None,
+        };
+        if !entry_table_name.eq_ignore_ascii_case(table_name) {
+            return None;
+        }
+        match &entry[4] {
+            SqliteValue::Text(sql) => Some(sql.as_str()),
+            _ => None,
+        }
+    })?;
+    let definitions = implicit_index_definitions_from_create_table_sql(table_create_sql)?;
+    let definition_index = ordinal.checked_sub(1)?;
+    definitions.get(definition_index).cloned()
+}
+
+fn parse_autoindex_ordinal(index_name: &str, table_name: &str) -> Option<usize> {
+    let index_name_lower = index_name.to_ascii_lowercase();
+    let prefix = format!("sqlite_autoindex_{}_", table_name.to_ascii_lowercase());
+    let suffix = index_name_lower.strip_prefix(&prefix)?;
+    if suffix.is_empty() || !suffix.chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+    let ordinal = suffix.parse::<usize>().ok()?;
+    if ordinal == 0 { None } else { Some(ordinal) }
+}
+
+fn implicit_index_definitions_from_create_table_sql(
+    create_table_sql: &str,
+) -> Option<Vec<(Vec<String>, bool)>> {
+    let statement = parse_single_statement(create_table_sql).ok()?;
+    let Statement::CreateTable(create_stmt) = statement else {
+        return None;
+    };
+
+    let mut definitions = Vec::new();
+    for column in crate::compat_persist::parse_columns_from_create_sql(create_table_sql) {
+        if column.unique && !column.is_ipk {
+            definitions.push((vec![column.name], true));
+        }
+    }
+
+    if let CreateTableBody::Columns { constraints, .. } = create_stmt.body {
+        for constraint in constraints {
+            if let TableConstraintKind::Unique {
+                columns: idx_cols, ..
+            }
+            | TableConstraintKind::PrimaryKey {
+                columns: idx_cols, ..
+            } = constraint.kind
+            {
+                let column_names: Vec<String> = idx_cols
+                    .iter()
+                    .filter_map(|ic| {
+                        if let Expr::Column(col_ref, _) = &ic.expr {
+                            Some(col_ref.column.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                if !column_names.is_empty() {
+                    definitions.push((column_names, true));
+                }
+            }
+        }
+    }
+
+    Some(definitions)
 }
 
 /// Normalize an indexed-column AST node into execution/persistence metadata.
@@ -28288,6 +28394,57 @@ mod schema_loading_tests {
                     .iter()
                     .any(|idx| idx.name.eq_ignore_ascii_case("idx_t1_a")),
                 "index metadata should reload from sqlite_master"
+            );
+        }
+    }
+
+    #[test]
+    fn test_reopen_loads_autoindex_metadata_and_keeps_quick_check_clean() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("autoindex_reload.db");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        {
+            let rconn = rusqlite::Connection::open(&db_path).unwrap();
+            rconn
+                .execute_batch(
+                    "CREATE TABLE t1 (a INTEGER UNIQUE, b TEXT, c INTEGER, UNIQUE(b, c));
+                     INSERT INTO t1 VALUES (1, 'alpha', 10);",
+                )
+                .unwrap();
+        }
+
+        {
+            let conn = Connection::open(&db_str).unwrap();
+            let schema = conn.schema.borrow();
+            let table = schema
+                .iter()
+                .find(|t| t.name.eq_ignore_ascii_case("t1"))
+                .expect("table should load");
+            let idx1 = table
+                .indexes
+                .iter()
+                .find(|idx| idx.name.eq_ignore_ascii_case("sqlite_autoindex_t1_1"))
+                .expect("first implicit index should reload");
+            assert_eq!(idx1.columns, vec!["a".to_owned()]);
+            assert!(idx1.is_unique);
+
+            let idx2 = table
+                .indexes
+                .iter()
+                .find(|idx| idx.name.eq_ignore_ascii_case("sqlite_autoindex_t1_2"))
+                .expect("second implicit index should reload");
+            assert_eq!(idx2.columns, vec!["b".to_owned(), "c".to_owned()]);
+            assert!(idx2.is_unique);
+            drop(schema);
+
+            conn.execute("INSERT INTO t1 VALUES (2, 'beta', 20);")
+                .unwrap();
+            let quick_check_rows = conn.query("PRAGMA quick_check;").unwrap();
+            assert_eq!(quick_check_rows.len(), 1);
+            assert_eq!(
+                quick_check_rows[0].values()[0],
+                SqliteValue::Text("ok".to_owned())
             );
         }
     }
