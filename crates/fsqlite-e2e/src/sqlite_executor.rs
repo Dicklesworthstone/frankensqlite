@@ -624,7 +624,9 @@ fn parse_sql_value(s: &str) -> Value {
         return Value::Integer(i);
     }
     if let Ok(f) = s.parse::<f64>() {
-        return Value::Real(f);
+        if f.is_finite() {
+            return Value::Real(f);
+        }
     }
 
     Value::Text(s.to_owned())

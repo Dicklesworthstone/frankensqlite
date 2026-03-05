@@ -196,8 +196,14 @@ impl SqliteValue {
             Self::Integer(i) => *i,
             Self::Float(f) => *f as i64,
             Self::Text(s) => s.trim().parse::<i64>().unwrap_or_else(|_| {
-                // Try parsing as float first, then truncate
-                s.trim().parse::<f64>().map_or(0, |f| f as i64)
+                // Try parsing as float first, then truncate.
+                // Reject non-finite values (NaN/Inf) since SQLite's
+                // sqlite3AtoF does not recognize "nan"/"inf"/"infinity".
+                s.trim()
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|f| f.is_finite())
+                    .map_or(0, |f| f as i64)
             }),
         }
     }
@@ -215,7 +221,15 @@ impl SqliteValue {
             Self::Null | Self::Blob(_) => 0.0,
             Self::Integer(i) => *i as f64,
             Self::Float(f) => *f,
-            Self::Text(s) => s.trim().parse::<f64>().unwrap_or(0.0),
+            Self::Text(s) => {
+                // Reject non-finite values (NaN/Inf) since SQLite's
+                // sqlite3AtoF does not recognize "nan"/"inf"/"infinity".
+                s.trim()
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|f| f.is_finite())
+                    .unwrap_or(0.0)
+            }
         }
     }
 

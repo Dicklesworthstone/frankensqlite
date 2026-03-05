@@ -155,8 +155,11 @@ impl AggregateFunction for CountFunc {
 // ═══════════════════════════════════════════════════════════════════════════
 
 pub struct GroupConcatState {
-    values: Vec<String>,
-    separator: String,
+    /// Incrementally built result string.  C SQLite appends
+    /// `separator + value` at each step (separator only before 2nd+ value),
+    /// using the separator from *that row's* argument, not a single global one.
+    result: String,
+    has_value: bool,
 }
 
 pub struct GroupConcatFunc;
@@ -166,8 +169,8 @@ impl AggregateFunction for GroupConcatFunc {
 
     fn initial_state(&self) -> Self::State {
         GroupConcatState {
-            values: Vec::new(),
-            separator: ",".to_owned(),
+            result: String::new(),
+            has_value: false,
         }
     }
 
@@ -175,20 +178,24 @@ impl AggregateFunction for GroupConcatFunc {
         if args[0].is_null() {
             return Ok(());
         }
-        // Set separator from second arg on EVERY call if provided, since it's an expression
-        // that could conceptually change, though usually it's a constant.
-        if args.len() > 1 && !args[1].is_null() {
-            state.separator = args[1].to_text();
+        let sep = if args.len() > 1 && !args[1].is_null() {
+            args[1].to_text()
+        } else {
+            ",".to_owned()
+        };
+        if state.has_value {
+            state.result.push_str(&sep);
         }
-        state.values.push(args[0].to_text());
+        state.result.push_str(&args[0].to_text());
+        state.has_value = true;
         Ok(())
     }
 
     fn finalize(&self, state: Self::State) -> Result<SqliteValue> {
-        if state.values.is_empty() {
-            Ok(SqliteValue::Null)
+        if state.has_value {
+            Ok(SqliteValue::Text(state.result))
         } else {
-            Ok(SqliteValue::Text(state.values.join(&state.separator)))
+            Ok(SqliteValue::Null)
         }
     }
 
@@ -583,6 +590,7 @@ impl AggregateFunction for PercentileDiscFunc {
             return Ok(SqliteValue::Null);
         }
         let p = state.p.unwrap_or(0.5);
+        let p = if p.is_nan() { 0.5 } else { p.clamp(0.0, 1.0) };
         state
             .values
             .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -612,7 +620,7 @@ fn percentile_cont_impl(sorted: &[f64], p: f64) -> f64 {
     if n == 1 {
         return sorted[0];
     }
-    let p = p.clamp(0.0, 1.0);
+    let p = if p.is_nan() { 0.5 } else { p.clamp(0.0, 1.0) };
     let rank = p * (n - 1) as f64;
     let lower = rank.floor() as usize;
     let upper = rank.ceil() as usize;
@@ -648,8 +656,8 @@ pub fn register_aggregate_builtins(registry: &mut FunctionRegistry) {
 
         fn initial_state(&self) -> Self::State {
             GroupConcatState {
-                values: Vec::new(),
-                separator: ",".to_owned(),
+                result: String::new(),
+                has_value: false,
             }
         }
 
@@ -811,6 +819,26 @@ mod tests {
     fn test_group_concat_empty() {
         let r = run_agg(&GroupConcatFunc, &[]);
         assert_eq!(r, SqliteValue::Null);
+    }
+
+    #[test]
+    fn test_group_concat_varying_separator() {
+        // C SQLite uses the separator from each row's argument, not a single
+        // global separator. SELECT group_concat(val, sep) with varying sep
+        // produces a+b*c, not a*b*c (the old bug used the last-seen sep).
+        let rows = vec![
+            (text("a"), text("-")),
+            (text("b"), text("+")),
+            (text("c"), text("*")),
+        ];
+        let r = run_agg2(&GroupConcatFunc, &rows);
+        assert_eq!(r, SqliteValue::Text("a+b*c".to_owned()));
+    }
+
+    #[test]
+    fn test_group_concat_single_value() {
+        let r = run_agg(&GroupConcatFunc, &[text("only")]);
+        assert_eq!(r, SqliteValue::Text("only".to_owned()));
     }
 
     // ── max (aggregate) ───────────────────────────────────────────────

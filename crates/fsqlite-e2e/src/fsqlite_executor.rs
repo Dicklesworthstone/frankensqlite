@@ -606,7 +606,9 @@ fn parse_value(s: &str) -> SqliteValue {
         return SqliteValue::Integer(i);
     }
     if let Ok(f) = s.parse::<f64>() {
-        return SqliteValue::Float(f);
+        if f.is_finite() {
+            return SqliteValue::Float(f);
+        }
     }
     SqliteValue::Text(s.to_owned())
 }

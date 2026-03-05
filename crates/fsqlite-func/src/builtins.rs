@@ -96,7 +96,12 @@ fn coerce_numeric(v: &SqliteValue) -> SqliteValue {
             if let Ok(i) = t.parse::<i64>() {
                 SqliteValue::Integer(i)
             } else if let Ok(f) = t.parse::<f64>() {
-                SqliteValue::Float(f)
+                // Reject non-finite (NaN/Inf) — sqlite3AtoF doesn't recognize them.
+                if f.is_finite() {
+                    SqliteValue::Float(f)
+                } else {
+                    SqliteValue::Integer(0)
+                }
             } else {
                 SqliteValue::Integer(0)
             }
@@ -318,11 +323,14 @@ impl ScalarFunction for IifFunc {
             SqliteValue::Null => false,
             SqliteValue::Integer(i) => *i != 0,
             SqliteValue::Float(f) => *f != 0.0,
-            SqliteValue::Text(s) => s.trim().parse::<f64>().is_ok_and(|f| f != 0.0),
+            SqliteValue::Text(s) => s
+                .trim()
+                .parse::<f64>()
+                .is_ok_and(|f| f.is_finite() && f != 0.0),
             SqliteValue::Blob(b) => std::str::from_utf8(b)
                 .ok()
                 .and_then(|s| s.trim().parse::<f64>().ok())
-                .is_some_and(|f| f != 0.0),
+                .is_some_and(|f| f.is_finite() && f != 0.0),
         };
         if is_true {
             Ok(args[1].clone())
@@ -665,6 +673,16 @@ impl ScalarFunction for ReplaceFunc {
         if y.is_empty() {
             return Ok(SqliteValue::Text(x));
         }
+        
+        // Prevent OOM from massive string expansion
+        if z.len() > y.len() {
+            let occurrences = x.matches(&y).count();
+            let final_len = x.len() + occurrences * (z.len() - y.len());
+            if final_len > 1_000_000_000 {
+                return Err(FrankenError::TooBig);
+            }
+        }
+        
         Ok(SqliteValue::Text(x.replace(&y, &z)))
     }
 
@@ -744,7 +762,10 @@ impl ScalarFunction for SignFunc {
                 if let Ok(i) = t.parse::<i64>() {
                     Ok(SqliteValue::Integer(i.signum()))
                 } else if let Ok(f) = t.parse::<f64>() {
-                    if f > 0.0 {
+                    // Reject non-finite (NaN/Inf) — sqlite3AtoF doesn't recognize them.
+                    if !f.is_finite() {
+                        Ok(SqliteValue::Null)
+                    } else if f > 0.0 {
                         Ok(SqliteValue::Integer(1))
                     } else if f < 0.0 {
                         Ok(SqliteValue::Integer(-1))
@@ -822,7 +843,11 @@ impl ScalarFunction for RandomblobFunc {
         if args[0].is_null() {
             return Ok(SqliteValue::Null);
         }
-        let n = args[0].to_integer().max(0) as usize;
+        let n_i64 = args[0].to_integer().max(0);
+        if n_i64 > 1_000_000_000 {
+            return Err(FrankenError::TooBig);
+        }
+        let n = n_i64 as usize;
         let mut buf = vec![0u8; n];
         let mut i = 0;
         while i < n {
@@ -858,7 +883,11 @@ impl ScalarFunction for ZeroblobFunc {
         if args[0].is_null() {
             return Ok(SqliteValue::Blob(Vec::new()));
         }
-        let n = args[0].to_integer().max(0) as usize;
+        let n_i64 = args[0].to_integer().max(0);
+        if n_i64 > 1_000_000_000 {
+            return Err(FrankenError::TooBig);
+        }
+        let n = n_i64 as usize;
         Ok(SqliteValue::Blob(vec![0u8; n]))
     }
 
@@ -1012,52 +1041,53 @@ impl ScalarFunction for SubstrFunc {
 
         let s = args[0].to_text();
         let chars: Vec<char> = s.chars().collect();
-        let char_count = chars.len() as i64;
-        let start = args[1].to_integer();
+        let len = chars.len() as i64;
         let has_length = args.len() > 2 && !args[2].is_null();
-        let length = if has_length {
+
+        let mut p1 = args[1].to_integer();
+        let mut p2 = if has_length {
             args[2].to_integer()
         } else {
             1_000_000_000
         };
 
-        // SQLite substr semantics:
-        // start=0 quirk: with length>0, returns max(length-1,0) chars from start
-        // negative start counts from end
-        // negative length returns chars preceding start
-
-        if length < 0 {
-            // Negative length: characters BEFORE the starting position
-            let abs_len = length.unsigned_abs();
-            let end_pos = if start > 0 {
-                (start - 1).min(char_count)
-            } else if start == 0 {
-                0
-            } else {
-                (char_count + start + 1).max(0).min(char_count)
-            };
-            let start_pos = (end_pos - abs_len as i64).max(0);
-            let result: String = chars[start_pos as usize..end_pos as usize].iter().collect();
-            return Ok(SqliteValue::Text(result));
+        // Match C SQLite's 2-phase substr algorithm exactly:
+        // Phase 1: remember if length was negative, make it positive
+        let neg_p2 = p2 < 0;
+        if neg_p2 {
+            p2 = -p2;
         }
 
-        let (begin, len) = if start > 0 {
-            ((start - 1).max(0) as usize, length as usize)
-        } else if start == 0 {
-            // START=0 quirk: returns max(length-1, 0) chars from beginning
-            (0, (length - 1).max(0) as usize)
-        } else {
-            // Negative start: count from end
-            let effective = char_count + start; // e.g. -2 on "hello"(5) => 3
-            if effective < 0 {
-                let skip = effective.unsigned_abs() as usize;
-                (0, length as usize - skip.min(length as usize))
-            } else {
-                (effective as usize, length as usize)
+        // Phase 2: resolve start position (1-based to 0-based)
+        if p1 < 0 {
+            p1 += len;
+            if p1 < 0 {
+                p2 += p1;
+                p1 = 0;
             }
-        };
+        } else if p1 > 0 {
+            p1 -= 1;
+        } else if p2 > 0 {
+            p2 -= 1; // start=0 quirk
+        }
 
-        let result: String = chars.iter().skip(begin).take(len).collect();
+        // Phase 3: apply negative-length shift (move start backward)
+        if neg_p2 {
+            p1 -= p2;
+            if p1 < 0 {
+                p2 += p1;
+                p1 = 0;
+            }
+        }
+
+        if p1 + p2 > len {
+            p2 = len - p1;
+        }
+        if p2 <= 0 {
+            return Ok(SqliteValue::Text(String::new()));
+        }
+
+        let result: String = chars[p1 as usize..(p1 + p2) as usize].iter().collect();
         Ok(SqliteValue::Text(result))
     }
 
@@ -1071,52 +1101,55 @@ impl ScalarFunction for SubstrFunc {
 }
 
 impl SubstrFunc {
-    #[allow(clippy::unused_self)]
+    #[allow(clippy::unused_self, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
     fn invoke_blob(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
         let blob = match &args[0] {
             SqliteValue::Blob(b) => b,
             _ => return Ok(SqliteValue::Null),
         };
-        let blob_len = blob.len() as i64;
-        let start = args[1].to_integer();
+        let len = blob.len() as i64;
         let has_length = args.len() > 2 && !args[2].is_null();
-        let length = if has_length {
+
+        let mut p1 = args[1].to_integer();
+        let mut p2 = if has_length {
             args[2].to_integer()
         } else {
             1_000_000_000
         };
 
-        if length < 0 {
-            let abs_len = length.unsigned_abs();
-            let end_pos = if start > 0 {
-                (start - 1).min(blob_len)
-            } else if start == 0 {
-                0
-            } else {
-                (blob_len + start + 1).max(0).min(blob_len)
-            };
-            let start_pos = (end_pos - abs_len as i64).max(0);
-            return Ok(SqliteValue::Blob(
-                blob[start_pos as usize..end_pos as usize].to_vec(),
-            ));
+        let neg_p2 = p2 < 0;
+        if neg_p2 {
+            p2 = -p2;
         }
 
-        let (begin, len) = if start > 0 {
-            ((start - 1).max(0) as usize, length as usize)
-        } else if start == 0 {
-            (0, (length - 1).max(0) as usize)
-        } else {
-            let effective = blob_len + start;
-            if effective < 0 {
-                let skip = effective.unsigned_abs() as usize;
-                (0, length as usize - skip.min(length as usize))
-            } else {
-                (effective as usize, length as usize)
+        if p1 < 0 {
+            p1 += len;
+            if p1 < 0 {
+                p2 += p1;
+                p1 = 0;
             }
-        };
+        } else if p1 > 0 {
+            p1 -= 1;
+        } else if p2 > 0 {
+            p2 -= 1;
+        }
 
-        let end = (begin + len).min(blob.len());
-        Ok(SqliteValue::Blob(blob[begin..end].to_vec()))
+        if neg_p2 {
+            p1 -= p2;
+            if p1 < 0 {
+                p2 += p1;
+                p1 = 0;
+            }
+        }
+
+        if p1 + p2 > len {
+            p2 = len - p1;
+        }
+        if p2 <= 0 {
+            return Ok(SqliteValue::Blob(Vec::new()));
+        }
+
+        Ok(SqliteValue::Blob(blob[p1 as usize..(p1 + p2) as usize].to_vec()))
     }
 }
 
@@ -1915,7 +1948,10 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<String> {
         // Parse width
         let mut width = 0usize;
         while i < chars.len() && chars[i].is_ascii_digit() {
-            width = width * 10 + (chars[i] as usize - '0' as usize);
+            width = width
+                .saturating_mul(10)
+                .saturating_add(chars[i] as usize - '0' as usize)
+                .min(100_000_000); // Prevent OOM from malicious formats
             i += 1;
         }
 
@@ -1925,7 +1961,10 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<String> {
             i += 1;
             let mut prec = 0usize;
             while i < chars.len() && chars[i].is_ascii_digit() {
-                prec = prec * 10 + (chars[i] as usize - '0' as usize);
+                prec = prec
+                    .saturating_mul(10)
+                    .saturating_add(chars[i] as usize - '0' as usize)
+                    .min(100_000_000); // Prevent OOM from malicious formats
                 i += 1;
             }
             precision = Some(prec);
@@ -3019,6 +3058,59 @@ mod tests {
             ])
             .unwrap();
         assert_eq!(result, SqliteValue::Text("lo".to_owned()));
+    }
+
+    #[test]
+    fn test_substr_negative_length() {
+        let f = SubstrFunc;
+        let t = |s: &str| SqliteValue::Text(s.to_owned());
+        let i = SqliteValue::Integer;
+        // SUBSTR('hello', 3, -2) => 'he' (2 chars before position 3)
+        assert_eq!(f.invoke(&[t("hello"), i(3), i(-2)]).unwrap(), t("he"));
+        // SUBSTR('hello', 3, -5) => 'he' (clamped at start)
+        assert_eq!(f.invoke(&[t("hello"), i(3), i(-5)]).unwrap(), t("he"));
+        // SUBSTR('hello', 1, -1) => '' (nothing before position 1)
+        assert_eq!(f.invoke(&[t("hello"), i(1), i(-1)]).unwrap(), t(""));
+    }
+
+    #[test]
+    fn test_substr_negative_start_negative_length() {
+        let f = SubstrFunc;
+        let t = |s: &str| SqliteValue::Text(s.to_owned());
+        let i = SqliteValue::Integer;
+        // SUBSTR('hello', -2, -2) => 'el' (C SQLite confirmed)
+        assert_eq!(f.invoke(&[t("hello"), i(-2), i(-2)]).unwrap(), t("el"));
+    }
+
+    #[test]
+    fn test_substr_edge_cases() {
+        let f = SubstrFunc;
+        let t = |s: &str| SqliteValue::Text(s.to_owned());
+        let i = SqliteValue::Integer;
+        // Past end
+        assert_eq!(f.invoke(&[t("hello"), i(6), i(2)]).unwrap(), t(""));
+        // Way before start
+        assert_eq!(f.invoke(&[t("hello"), i(-10), i(3)]).unwrap(), t(""));
+        // Negative start covering entire string
+        assert_eq!(f.invoke(&[t("hello"), i(-5), i(6)]).unwrap(), t("hello"));
+        // start=0, length=1 => '' (quirk)
+        assert_eq!(f.invoke(&[t("hello"), i(0), i(1)]).unwrap(), t(""));
+        // start=0, negative length
+        assert_eq!(f.invoke(&[t("hello"), i(0), i(-1)]).unwrap(), t(""));
+        // Empty string
+        assert_eq!(f.invoke(&[t(""), i(1), i(1)]).unwrap(), t(""));
+    }
+
+    #[test]
+    fn test_substr_blob_negative_length() {
+        let f = SubstrFunc;
+        let i = SqliteValue::Integer;
+        let blob = SqliteValue::Blob(vec![1, 2, 3, 4, 5]);
+        // SUBSTR(X'0102030405', -2, -2) => X'0203' (matches text behavior)
+        assert_eq!(
+            f.invoke(&[blob, i(-2), i(-2)]).unwrap(),
+            SqliteValue::Blob(vec![2, 3])
+        );
     }
 
     // ── like ─────────────────────────────────────────────────────────────

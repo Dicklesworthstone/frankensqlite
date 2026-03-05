@@ -38,7 +38,8 @@ fn to_f64(v: &SqliteValue) -> Option<f64> {
         // numeric conversion.  Non-numeric text produces NULL (not 0.0).
         SqliteValue::Text(s) => {
             let trimmed = s.trim();
-            trimmed.parse::<f64>().ok()
+            // Reject non-finite (NaN/Inf) — sqlite3AtoF doesn't recognize them.
+            trimmed.parse::<f64>().ok().filter(|f| f.is_finite())
         }
         SqliteValue::Blob(_) => Some(0.0),
     }

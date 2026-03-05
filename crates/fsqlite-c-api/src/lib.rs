@@ -310,6 +310,11 @@ pub unsafe extern "C" fn sqlite3_exec(
                     let mut owned_names: Vec<CString> = Vec::with_capacity(vals.len());
 
                     for (i, v) in vals.iter().enumerate() {
+                        let col_name = format!("column{i}");
+                        let cname = CString::new(col_name).expect("col name");
+                        c_names.push(cname.as_ptr().cast_mut());
+                        owned_names.push(cname);
+
                         let text = match v {
                             SqliteValue::Null => {
                                 c_values.push(std::ptr::null_mut());
@@ -334,11 +339,6 @@ pub unsafe extern "C" fn sqlite3_exec(
                             CString::new(text).unwrap_or_else(|_| CString::new("").expect(""));
                         c_values.push(cval.as_ptr().cast_mut());
                         owned_vals.push(cval);
-
-                        let col_name = format!("column{i}");
-                        let cname = CString::new(col_name).expect("col name");
-                        c_names.push(cname.as_ptr().cast_mut());
-                        owned_names.push(cname);
                     }
 
                     let rc = cb(parg, ncols, c_values.as_mut_ptr(), c_names.as_mut_ptr());
@@ -707,7 +707,14 @@ pub unsafe extern "C" fn sqlite3_column_double(stmt: *mut Sqlite3Stmt, i_col: c_
     match current_value_ref(stmt, i_col) {
         Some(SqliteValue::Float(f)) => *f,
         Some(SqliteValue::Integer(n)) => *n as f64,
-        Some(SqliteValue::Text(s)) => s.trim().parse::<f64>().unwrap_or(0.0),
+        Some(SqliteValue::Text(s)) => {
+            // Reject non-finite (NaN/Inf) — sqlite3AtoF doesn't recognize them.
+            s.trim()
+                .parse::<f64>()
+                .ok()
+                .filter(|f| f.is_finite())
+                .unwrap_or(0.0)
+        }
         _ => 0.0,
     }
 }

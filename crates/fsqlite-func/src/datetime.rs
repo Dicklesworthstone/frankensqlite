@@ -226,8 +226,9 @@ fn parse_timestring(s: &str) -> Option<f64> {
     }
 
     // Try as a Julian Day Number (bare float).
+    // Reject non-finite values (NaN/Inf) — sqlite3AtoF doesn't recognize them.
     if let Ok(jdn) = s.parse::<f64>() {
-        if jdn >= 0.0 {
+        if jdn >= 0.0 && jdn.is_finite() {
             return Some(jdn);
         }
     }
@@ -411,7 +412,8 @@ fn parse_arithmetic_modifier(m: &str) -> Option<f64> {
     let num_str = parts.next()?;
     let unit = parts.next()?.trim();
 
-    let num = num_str.parse::<f64>().ok()?;
+    // Reject non-finite (NaN/Inf) — sqlite3AtoF doesn't recognize them.
+    let num = num_str.parse::<f64>().ok().filter(|f| f.is_finite())?;
     let delta = num * sign;
 
     match unit.trim_end_matches('s') {
