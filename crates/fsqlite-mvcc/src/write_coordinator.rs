@@ -257,8 +257,6 @@ pub struct WriteCoordinator {
     wal_offset: AtomicU64,
     /// Coordinator lease.
     lease: RwLock<Option<CoordinatorLease>>,
-    /// Commit records for publishing (compatibility mode).
-    committed_seqs: RwLock<Vec<CommitSeq>>,
 }
 
 impl WriteCoordinator {
@@ -271,7 +269,6 @@ impl WriteCoordinator {
             commit_page_index: RwLock::new(HashMap::new()),
             wal_offset: AtomicU64::new(0),
             lease: RwLock::new(None),
-            committed_seqs: RwLock::new(Vec::new()),
         }
     }
 
@@ -561,15 +558,10 @@ impl WriteCoordinator {
         // Step 5: Update commit index (publish).
         // (Already reserved eagerly in Step 1 to prevent races)
 
-        // Track committed seq.
-        self.committed_seqs.write().push(commit_seq);
-
         info!(
             bead_id = "bd-389e",
             txn = ?req.txn,
             commit_seq = commit_seq.get(),
-            wal_offset,
-            pages = page_numbers.len(),
             "compat_commit: commit approved (WAL path)"
         );
 
@@ -685,11 +677,6 @@ impl WriteCoordinator {
 
         // Phase 4: Publish all.
         // Index was already updated in Phase 1 to reserve pages.
-        let mut committed_seqs = self.committed_seqs.write();
-        for commit_seq in &accepted_commits {
-            committed_seqs.push(*commit_seq);
-        }
-        drop(committed_seqs);
 
         info!(
             bead_id = "bd-389e",

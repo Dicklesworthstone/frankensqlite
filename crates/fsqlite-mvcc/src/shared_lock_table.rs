@@ -371,7 +371,8 @@ impl SharedPageLockTable {
         debug_assert!(page_number != 0, "page_number 0 is the empty sentinel");
         debug_assert!(txn_id != 0, "txn_id 0 is the unlocked sentinel");
 
-        // Step 0: Snapshot table selection.
+        // Step 0: Snapshot table selection and ABA epoch.
+        let start_epoch = self.rebuild_epoch.load(Ordering::Acquire);
         let active_idx = self.active_table.load(Ordering::Acquire);
         let draining_idx = self.draining_table.load(Ordering::Acquire);
 
@@ -430,7 +431,13 @@ impl SharedPageLockTable {
                     Ordering::AcqRel,
                     Ordering::Acquire,
                 ) {
-                    Ok(_) => return AcquireResult::Acquired,
+                    Ok(_) => {
+                        if self.rebuild_epoch.load(Ordering::Acquire) != start_epoch {
+                            let _ = entry.owner_txn.compare_exchange(txn_id, 0, Ordering::AcqRel, Ordering::Relaxed);
+                            return self.try_acquire(page_number, txn_id);
+                        }
+                        return AcquireResult::Acquired;
+                    }
                     Err(current_owner) => {
                         if current_owner == txn_id {
                             return AcquireResult::AlreadyHeld;
@@ -476,7 +483,13 @@ impl SharedPageLockTable {
                     Ordering::AcqRel,
                     Ordering::Acquire,
                 ) {
-                    Ok(_) => AcquireResult::Acquired,
+                    Ok(_) => {
+                        if self.rebuild_epoch.load(Ordering::Acquire) != start_epoch {
+                            let _ = entry.owner_txn.compare_exchange(txn_id, 0, Ordering::AcqRel, Ordering::Relaxed);
+                            return self.try_acquire(page_number, txn_id);
+                        }
+                        AcquireResult::Acquired
+                    }
                     Err(_) => {
                         // Another process raced and acquired the lock.
                         // MUST NOT continue probing for a second copy.
@@ -865,15 +878,16 @@ impl SharedPageLockTable {
             return Err(RebuildLeaseError::NotQuiescent { remaining });
         }
 
+        // Set draining_table = NONE so no new readers check it.
+        self.draining_table.store(DRAINING_NONE, Ordering::Release);
+
+        // Increment rebuild_epoch BEFORE clear_all to invalidate any pending
+        // try_acquire operations that snapshotted the old epoch.
+        let new_epoch = self.rebuild_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+
         // Clear drained table (§5.6.3.1 step 4).
         let cleared = draining.occupied_count();
         draining.clear_all();
-
-        // Set draining_table = NONE (Release).
-        self.draining_table.store(DRAINING_NONE, Ordering::Release);
-
-        // Increment rebuild_epoch (step 5).
-        let new_epoch = self.rebuild_epoch.fetch_add(1, Ordering::AcqRel) + 1;
 
         // Release lease.
         self.rebuild_pid.store(0, Ordering::Release);

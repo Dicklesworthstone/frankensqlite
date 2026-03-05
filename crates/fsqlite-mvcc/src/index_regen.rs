@@ -257,17 +257,12 @@ fn sqlite_values_equal(a: &SqliteValue, b: &SqliteValue) -> bool {
     }
 }
 
-/// SQLite truthiness: non-zero integer or non-zero float is true.
+/// SQLite truthiness: C SQLite uses integer truncation (`sqlite3VdbeIntValue`),
+/// so 0.5 is falsy (truncates to 0), 1.5 is truthy (truncates to 1).
 fn sqlite_value_is_truthy(v: &SqliteValue) -> bool {
     match v {
-        SqliteValue::Integer(i) => *i != 0,
-        SqliteValue::Float(f) => *f != 0.0,
         SqliteValue::Null => false,
-        other => match other.clone().apply_affinity(TypeAffinity::Numeric) {
-            SqliteValue::Integer(i) => i != 0,
-            SqliteValue::Float(f) => f != 0.0,
-            _ => false,
-        },
+        v => v.to_integer() != 0,
     }
 }
 
@@ -449,7 +444,7 @@ fn eval_function(name: &str, args: &[SqliteValue]) -> Result<SqliteValue, IndexR
                     SqliteValue::Text(s) => SqliteValue::Integer(s.chars().count() as i64),
                     SqliteValue::Blob(b) => SqliteValue::Integer(b.len() as i64),
                     SqliteValue::Integer(n) => SqliteValue::Integer(n.to_string().len() as i64),
-                    SqliteValue::Float(f) => SqliteValue::Integer(f.to_string().len() as i64),
+                    v @ SqliteValue::Float(_) => SqliteValue::Integer(v.to_text().len() as i64),
                 })
             } else {
                 Ok(SqliteValue::Null)

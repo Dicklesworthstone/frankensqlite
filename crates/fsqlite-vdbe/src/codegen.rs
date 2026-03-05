@@ -7664,7 +7664,11 @@ fn try_emit_complex_in_subquery(
     // Labels for control flow.
     let no_match_label = b.emit_label();
     let matched_label = b.emit_label();
+    let null_result_label = b.emit_label();
     let done_label = b.emit_label();
+
+    // If the operand is NULL, the result is NULL per SQL semantics.
+    b.emit_jump_to_label(Opcode::IsNull, r_operand, 0, null_result_label, P4::None, 0);
 
     // Check if we have ORDER BY and/or LIMIT.
     let has_order_by = !subquery.order_by.is_empty();
@@ -7952,6 +7956,10 @@ fn try_emit_complex_in_subquery(
 
     b.resolve_label(matched_label);
     b.emit_op(Opcode::Integer, i32::from(!not), reg, 0, P4::None, 0);
+    b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+
+    b.resolve_label(null_result_label);
+    b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
 
     b.resolve_label(done_label);
     // Close cursors.

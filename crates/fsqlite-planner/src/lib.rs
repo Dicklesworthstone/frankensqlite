@@ -3367,7 +3367,9 @@ pub fn try_constant_fold(expr: &Expr) -> FoldResult {
             let inner_val = try_constant_fold(inner);
             match inner_val {
                 FoldResult::Literal(Literal::Integer(i)) => match op {
-                    fsqlite_ast::UnaryOp::Negate => FoldResult::Literal(Literal::Integer(-i)),
+                    fsqlite_ast::UnaryOp::Negate => {
+                        FoldResult::Literal(Literal::Integer(i.wrapping_neg()))
+                    }
                     fsqlite_ast::UnaryOp::Plus => FoldResult::Literal(Literal::Integer(i)),
                     fsqlite_ast::UnaryOp::BitNot => FoldResult::Literal(Literal::Integer(!i)),
                     fsqlite_ast::UnaryOp::Not => FoldResult::Literal(if i == 0 {
@@ -3410,14 +3412,14 @@ pub fn try_constant_fold(expr: &Expr) -> FoldResult {
                         if b == 0 {
                             FoldResult::Literal(Literal::Null)
                         } else {
-                            FoldResult::Literal(Literal::Integer(a / b))
+                            FoldResult::Literal(Literal::Integer(a.wrapping_div(b)))
                         }
                     }
                     fsqlite_ast::BinaryOp::Modulo => {
                         if b == 0 {
                             FoldResult::Literal(Literal::Null)
                         } else {
-                            FoldResult::Literal(Literal::Integer(a % b))
+                            FoldResult::Literal(Literal::Integer(a.wrapping_rem(b)))
                         }
                     }
                     fsqlite_ast::BinaryOp::Eq => FoldResult::Literal(if a == b {

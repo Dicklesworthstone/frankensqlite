@@ -319,18 +319,11 @@ impl ScalarFunction for IifFunc {
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
         // NOTE: Real short-circuit happens at VDBE level.
         let cond = &args[0];
+        // C SQLite uses integer truncation for truthiness (sqlite3VdbeIntValue):
+        // 0.5 is falsy (truncates to 0), 1.5 is truthy (truncates to 1).
         let is_true = match cond {
             SqliteValue::Null => false,
-            SqliteValue::Integer(i) => *i != 0,
-            SqliteValue::Float(f) => *f != 0.0,
-            SqliteValue::Text(s) => s
-                .trim()
-                .parse::<f64>()
-                .is_ok_and(|f| f.is_finite() && f != 0.0),
-            SqliteValue::Blob(b) => std::str::from_utf8(b)
-                .ok()
-                .and_then(|s| s.trim().parse::<f64>().ok())
-                .is_some_and(|f| f.is_finite() && f != 0.0),
+            v => v.to_integer() != 0,
         };
         if is_true {
             Ok(args[1].clone())

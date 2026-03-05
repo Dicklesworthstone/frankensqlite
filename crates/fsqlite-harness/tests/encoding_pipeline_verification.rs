@@ -357,7 +357,7 @@ fn test_encoding_pipeline_stages() {
     assert!(params.l > params.k);
 
     let matrix = ConstraintMatrix::build(&params, 42);
-    assert_eq!(matrix.rows, params.s + params.h + params.k);
+    assert_eq!(matrix.rows, params.s + params.h + params.k_prime);
     assert_eq!(matrix.cols, params.l);
 
     let mut rhs: Vec<Vec<u8>> = Vec::with_capacity(matrix.rows);
@@ -366,6 +366,9 @@ fn test_encoding_pipeline_stages() {
     }
     for sym in &source {
         rhs.push(sym.clone());
+    }
+    for _ in params.k..params.k_prime {
+        rhs.push(vec![0u8; 64]);
     }
     assert_eq!(rhs.len(), matrix.rows);
 

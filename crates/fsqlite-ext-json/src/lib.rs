@@ -277,15 +277,9 @@ pub fn json_quote(value: &SqliteValue) -> Result<String> {
     match value {
         SqliteValue::Null => Ok("null".to_owned()),
         SqliteValue::Integer(i) => Ok(i.to_string()),
-        SqliteValue::Float(f) => {
+        v @ SqliteValue::Float(f) => {
             if f.is_finite() {
-                // Ensure float always has a decimal point in JSON output.
-                let repr = format!("{f}");
-                if repr.contains('.') || repr.contains('e') || repr.contains('E') {
-                    Ok(repr)
-                } else {
-                    Ok(format!("{repr}.0"))
-                }
+                Ok(v.to_text())
             } else {
                 Ok("null".to_owned())
             }

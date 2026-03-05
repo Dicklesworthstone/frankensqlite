@@ -25,7 +25,8 @@
 //! # Example
 //!
 //! ```rust
-//! use fsqlite_harness::test_diagnostics::{DiagContext, diag_assert_eq};
+//! use fsqlite_harness::diag_assert_eq;
+//! use fsqlite_harness::test_diagnostics::DiagContext;
 //!
 //! let ctx = DiagContext::new("bd-mblr.6.6")
 //!     .case("seed_roundtrip")
@@ -238,7 +239,8 @@ pub fn repro_command(crate_name: &str, test_path: &str) -> String {
 /// values. Usage:
 ///
 /// ```rust
-/// use fsqlite_harness::test_diagnostics::{DiagContext, diag_assert_eq};
+/// use fsqlite_harness::diag_assert_eq;
+/// use fsqlite_harness::test_diagnostics::DiagContext;
 ///
 /// let ctx = DiagContext::new("bd-test").case("basic");
 /// diag_assert_eq!(ctx, 1 + 1, 2);

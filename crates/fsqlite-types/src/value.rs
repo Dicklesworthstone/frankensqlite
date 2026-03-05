@@ -3,6 +3,129 @@ use std::fmt;
 
 use crate::{StorageClass, StrictColumnType, StrictTypeError, TypeAffinity};
 
+/// Parse the longest numeric prefix of `s` as an integer, matching SQLite's
+/// `sqlite3Atoi64` behavior. Leading whitespace is skipped, an optional sign
+/// is consumed, then decimal digits. If the prefix includes a decimal point
+/// or exponent, the float value is truncated to i64. Returns 0 if no numeric
+/// prefix is found.
+#[allow(clippy::cast_possible_truncation)]
+fn parse_integer_prefix(s: &str) -> i64 {
+    let f = parse_float_prefix(s);
+    if f == 0.0 && !s.trim_start().starts_with('0') {
+        // Fast path: no numeric prefix at all.
+        // But first check if it starts with "0" (which is valid and returns 0).
+        return 0;
+    }
+    // Clamp to i64 range, matching SQLite behavior for overflow.
+    #[allow(clippy::manual_clamp)]
+    if f >= i64::MAX as f64 {
+        i64::MAX
+    } else if f <= i64::MIN as f64 {
+        i64::MIN
+    } else {
+        f as i64
+    }
+}
+
+/// Parse the longest numeric prefix of `s` as a float, matching SQLite's
+/// `sqlite3AtoF` behavior. Leading whitespace is skipped. Recognizes:
+/// optional sign, digits, optional decimal point + digits, optional
+/// exponent (e/E + optional sign + digits). Also handles `0x` hex prefix.
+/// Returns 0.0 if no numeric prefix is found. Does NOT recognize
+/// "nan"/"inf"/"infinity" (matching C SQLite).
+fn parse_float_prefix(s: &str) -> f64 {
+    let s = s.trim_start();
+    if s.is_empty() {
+        return 0.0;
+    }
+
+    let bytes = s.as_bytes();
+    let mut i = 0;
+
+    // Optional sign
+    if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') {
+        i += 1;
+    }
+
+    // Check for hex prefix 0x/0X
+    if i + 1 < bytes.len() && bytes[i] == b'0' && (bytes[i + 1] == b'x' || bytes[i + 1] == b'X') {
+        return parse_hex_prefix(s);
+    }
+
+    let start = i;
+
+    // Integer digits
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+
+    // Decimal point + fractional digits
+    if i < bytes.len() && bytes[i] == b'.' {
+        i += 1;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+    }
+
+    // Must have consumed at least one digit
+    if i == start {
+        return 0.0;
+    }
+
+    // Exponent
+    if i < bytes.len() && (bytes[i] == b'e' || bytes[i] == b'E') {
+        let mut j = i + 1;
+        if j < bytes.len() && (bytes[j] == b'+' || bytes[j] == b'-') {
+            j += 1;
+        }
+        // Need at least one digit after e
+        if j < bytes.len() && bytes[j].is_ascii_digit() {
+            j += 1;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                j += 1;
+            }
+            i = j;
+        }
+    }
+
+    // Parse the extracted prefix
+    s[..i].parse::<f64>().unwrap_or(0.0)
+}
+
+/// Parse a hex-prefixed string (0x...) as a float, matching SQLite behavior.
+fn parse_hex_prefix(s: &str) -> f64 {
+    let bytes = s.as_bytes();
+    let negative = !bytes.is_empty() && bytes[0] == b'-';
+    let skip = if !bytes.is_empty() && (bytes[0] == b'+' || bytes[0] == b'-') {
+        3 // sign + "0x"
+    } else {
+        2 // "0x"
+    };
+
+    let mut val: u64 = 0;
+    let mut i = skip;
+    let mut any_digit = false;
+    while i < bytes.len() {
+        let d = match bytes[i] {
+            b'0'..=b'9' => bytes[i] - b'0',
+            b'a'..=b'f' => bytes[i] - b'a' + 10,
+            b'A'..=b'F' => bytes[i] - b'A' + 10,
+            _ => break,
+        };
+        any_digit = true;
+        val = val.wrapping_mul(16).wrapping_add(u64::from(d));
+        i += 1;
+    }
+
+    if !any_digit {
+        return 0.0;
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    let f = val as f64;
+    if negative { -f } else { f }
+}
+
 /// A dynamically-typed SQLite value.
 ///
 /// Corresponds to C SQLite's `sqlite3_value` / `Mem` type. SQLite has five
@@ -192,19 +315,14 @@ impl SqliteValue {
     #[allow(clippy::cast_possible_truncation)]
     pub fn to_integer(&self) -> i64 {
         match self {
-            Self::Null | Self::Blob(_) => 0,
+            Self::Null => 0,
             Self::Integer(i) => *i,
             Self::Float(f) => *f as i64,
-            Self::Text(s) => s.trim().parse::<i64>().unwrap_or_else(|_| {
-                // Try parsing as float first, then truncate.
-                // Reject non-finite values (NaN/Inf) since SQLite's
-                // sqlite3AtoF does not recognize "nan"/"inf"/"infinity".
-                s.trim()
-                    .parse::<f64>()
-                    .ok()
-                    .filter(|f| f.is_finite())
-                    .map_or(0, |f| f as i64)
-            }),
+            Self::Text(s) => parse_integer_prefix(s),
+            Self::Blob(b) => {
+                let s = String::from_utf8_lossy(b);
+                parse_integer_prefix(&s)
+            }
         }
     }
 
@@ -218,17 +336,13 @@ impl SqliteValue {
     #[allow(clippy::cast_precision_loss)]
     pub fn to_float(&self) -> f64 {
         match self {
-            Self::Null | Self::Blob(_) => 0.0,
+            Self::Null => 0.0,
             Self::Integer(i) => *i as f64,
             Self::Float(f) => *f,
-            Self::Text(s) => {
-                // Reject non-finite values (NaN/Inf) since SQLite's
-                // sqlite3AtoF does not recognize "nan"/"inf"/"infinity".
-                s.trim()
-                    .parse::<f64>()
-                    .ok()
-                    .filter(|f| f.is_finite())
-                    .unwrap_or(0.0)
+            Self::Text(s) => parse_float_prefix(s),
+            Self::Blob(b) => {
+                let s = String::from_utf8_lossy(b);
+                parse_float_prefix(&s)
             }
         }
     }

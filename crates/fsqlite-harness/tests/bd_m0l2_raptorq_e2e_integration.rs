@@ -571,13 +571,14 @@ fn test_e2e_wal_fec_repair_single_frame() {
     let digest = compute_db_gen_digest(1, num_pages + 1, 0, 1);
     let meta = DbFecGroupMeta::new(page_size, 2, num_pages, 4, hashes, digest);
 
-    // Compute XOR parity of all source pages.
-    let mut parity = vec![0u8; page_size as usize];
-    for d in &pages {
-        for (j, b) in d.iter().enumerate() {
-            parity[j] ^= b;
-        }
-    }
+    // Compute RaptorQ repair symbols.
+    let page_slices: Vec<&[u8]> = pages.iter().map(|p| p.as_slice()).collect();
+    let encoded_repair = fsqlite_core::db_fec::compute_raptorq_repair_symbols(
+        &meta,
+        &page_slices,
+        page_size as usize,
+    )
+    .expect("encode");
 
     // Corrupt page at pgno=5 (index 3 in the group).
     let target_pgno = 5_u32;
@@ -591,7 +592,11 @@ fn test_e2e_wal_fec_repair_single_frame() {
         }
     };
 
-    let repair_symbols = vec![(num_pages, parity)];
+    let repair_symbols: Vec<(u32, Vec<u8>)> = encoded_repair
+        .into_iter()
+        .enumerate()
+        .map(|(i, sym)| (num_pages + i as u32, sym))
+        .collect();
     let (recovered, status) = attempt_page_repair(target_pgno, &meta, &read_fn, &repair_symbols)
         .expect("single frame repair");
 
@@ -625,13 +630,14 @@ fn test_e2e_wal_fec_repair_multiple_frames() {
     let digest = compute_db_gen_digest(1, num_pages + 1, 0, 1);
     let meta = DbFecGroupMeta::new(page_size, 2, num_pages, DEFAULT_R_REPAIR, hashes, digest);
 
-    // Compute XOR parity.
-    let mut parity = vec![0u8; page_size as usize];
-    for d in &pages {
-        for (j, b) in d.iter().enumerate() {
-            parity[j] ^= b;
-        }
-    }
+    // Compute RaptorQ repair symbols.
+    let page_slices: Vec<&[u8]> = pages.iter().map(|p| p.as_slice()).collect();
+    let encoded_repair = fsqlite_core::db_fec::compute_raptorq_repair_symbols(
+        &meta,
+        &page_slices,
+        page_size as usize,
+    )
+    .expect("encode");
 
     // Repair page 8 (pgno=10, index=8).
     let target_pgno = 10_u32;
@@ -645,7 +651,11 @@ fn test_e2e_wal_fec_repair_multiple_frames() {
         }
     };
 
-    let repair_symbols = vec![(num_pages, parity)];
+    let repair_symbols: Vec<(u32, Vec<u8>)> = encoded_repair
+        .into_iter()
+        .enumerate()
+        .map(|(i, sym)| (num_pages + i as u32, sym))
+        .collect();
     let (recovered, _) = attempt_page_repair(target_pgno, &meta, &read_fn, &repair_symbols)
         .expect("repair should succeed for single corruption with 4 repair symbols");
     assert_eq!(
@@ -950,12 +960,13 @@ fn test_e2e_bd_m0l2_compliance() {
     let digest = compute_db_gen_digest(1, 5, 0, 1);
     let meta = DbFecGroupMeta::new(page_size, 2, 4, 4, hashes, digest);
 
-    let mut parity = vec![0u8; page_size as usize];
-    for d in &pages {
-        for (j, byte) in d.iter().enumerate() {
-            parity[j] ^= byte;
-        }
-    }
+    let page_slices: Vec<&[u8]> = pages.iter().map(|p| p.as_slice()).collect();
+    let encoded_repair = fsqlite_core::db_fec::compute_raptorq_repair_symbols(
+        &meta,
+        &page_slices,
+        page_size as usize,
+    )
+    .expect("encode");
 
     let target = 3_u32;
     let corrupted = vec![0xFF_u8; page_size as usize];
@@ -966,8 +977,14 @@ fn test_e2e_bd_m0l2_compliance() {
             pages[(pgno - 2) as usize].clone()
         }
     };
+
+    let repair_symbols: Vec<(u32, Vec<u8>)> = encoded_repair
+        .into_iter()
+        .enumerate()
+        .map(|(i, sym)| (4 + i as u32, sym))
+        .collect();
     let (recovered, _) =
-        attempt_page_repair(target, &meta, &read_fn, &[(4, parity)]).expect("step 4: repair");
+        attempt_page_repair(target, &meta, &read_fn, &repair_symbols).expect("step 4: repair");
     assert_eq!(recovered, pages[1], "step 4: recovered page matches");
 
     // --- Step 5: Inter-object coding ---

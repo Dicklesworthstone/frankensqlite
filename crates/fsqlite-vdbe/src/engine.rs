@@ -6971,30 +6971,16 @@ fn sql_rem(dividend: &SqliteValue, divisor: &SqliteValue) -> SqliteValue {
     if dividend.is_null() || divisor.is_null() {
         return SqliteValue::Null;
     }
-    // C SQLite: if both operands are integers, use integer remainder.
-    // Otherwise, use float remainder (fmod).
-    if let (SqliteValue::Integer(a), SqliteValue::Integer(b)) = (dividend, divisor) {
-        if *b == 0 {
-            return SqliteValue::Null;
-        }
-        return match a.checked_rem(*b) {
-            Some(result) => SqliteValue::Integer(result),
-            // i64::MIN % -1 = 0 mathematically (no remainder).
-            None => SqliteValue::Integer(0),
-        };
-    }
-    // C SQLite: OP_Remainder uses sqlite3VdbeRealValue + fmod for
-    // non-integer operands. Rust f64 `%` operator is fmod.
-    let fa = dividend.to_float();
-    let fb = divisor.to_float();
-    if fb == 0.0 {
+    // C SQLite: OP_Remainder always casts operands to integers before modulo.
+    let a = dividend.to_integer();
+    let b = divisor.to_integer();
+    if b == 0 {
         return SqliteValue::Null;
     }
-    let result = fa % fb;
-    if result.is_nan() {
-        SqliteValue::Null
-    } else {
-        SqliteValue::Float(result)
+    match a.checked_rem(b) {
+        Some(result) => SqliteValue::Integer(result),
+        // i64::MIN % -1 = 0 mathematically.
+        None => SqliteValue::Integer(0),
     }
 }
 
@@ -7078,39 +7064,44 @@ fn scan_numeric_prefix(bytes: &[u8]) -> usize {
     if bytes.is_empty() {
         return 0;
     }
-    let mut end = 0;
+    let mut i = 0;
     // Optional leading sign.
-    if bytes[0] == b'+' || bytes[0] == b'-' || bytes[0].is_ascii_digit() {
-        end = 1;
-        // Integer digits.
-        while end < bytes.len() && bytes[end].is_ascii_digit() {
-            end += 1;
-        }
-        // Optional decimal part.
-        if end < bytes.len() && bytes[end] == b'.' {
-            end += 1;
-            while end < bytes.len() && bytes[end].is_ascii_digit() {
-                end += 1;
-            }
-        }
-        // Optional exponent (e.g. e+10, E-3, e5).
-        if end < bytes.len() && (bytes[end] == b'e' || bytes[end] == b'E') {
-            let exp_start = end;
-            end += 1;
-            if end < bytes.len() && (bytes[end] == b'+' || bytes[end] == b'-') {
-                end += 1;
-            }
-            if end < bytes.len() && bytes[end].is_ascii_digit() {
-                while end < bytes.len() && bytes[end].is_ascii_digit() {
-                    end += 1;
-                }
-            } else {
-                // No digits after 'e' — revert to before exponent.
-                end = exp_start;
-            }
+    if bytes[i] == b'+' || bytes[i] == b'-' {
+        i += 1;
+    }
+    let digit_start = i;
+    // Integer digits.
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    // Optional decimal part.
+    if i < bytes.len() && bytes[i] == b'.' {
+        i += 1;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
         }
     }
-    end
+    // Must have consumed at least one digit.
+    if i == digit_start {
+        return 0;
+    }
+    // Optional exponent (e.g. e+10, E-3, e5).
+    if i < bytes.len() && (bytes[i] == b'e' || bytes[i] == b'E') {
+        let exp_start = i;
+        i += 1;
+        if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') {
+            i += 1;
+        }
+        if i < bytes.len() && bytes[i].is_ascii_digit() {
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+        } else {
+            // No digits after 'e' — revert to before exponent.
+            i = exp_start;
+        }
+    }
+    i
 }
 
 /// SQL CAST operation (p2 encodes target type).

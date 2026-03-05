@@ -310,6 +310,8 @@ impl Scope {
                         ResolveResult::Resolved(
                             unknown_matches.into_iter().next().unwrap_or_default(),
                         )
+                    } else if unknown_matches.contains(&"<output>".to_owned()) {
+                        ResolveResult::Resolved("<output>".to_owned())
                     } else {
                         ResolveResult::Ambiguous(unknown_matches)
                     }
@@ -320,6 +322,8 @@ impl Scope {
                 known_matches.sort();
                 if self.using_columns.contains(&col_lower) {
                     ResolveResult::Resolved(known_matches.into_iter().next().unwrap_or_default())
+                } else if known_matches.contains(&"<output>".to_owned()) {
+                    ResolveResult::Resolved("<output>".to_owned())
                 } else {
                     ResolveResult::Ambiguous(known_matches)
                 }
@@ -1662,6 +1666,34 @@ mod tests {
         let mut resolver = Resolver::new(&schema);
         let errors = resolver.resolve_statement(&stmt);
         assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+    }
+
+    #[test]
+    fn test_order_by_select_alias_shadowing() {
+        let mut schema = Schema::new();
+        schema.add_table(TableDef {
+            name: "tbl".to_owned(),
+            columns: vec![ColumnDef {
+                name: "a".to_owned(),
+                affinity: TypeAffinity::Integer,
+                is_ipk: false,
+                not_null: false,
+            }],
+            without_rowid: false,
+            strict: false,
+        });
+
+        // "a" is both an alias and a column in the table.
+        let stmt = parse_one("SELECT 1 AS a FROM tbl ORDER BY a");
+        let mut resolver = Resolver::new(&schema);
+        let errors = resolver.resolve_statement(&stmt);
+
+        // Let's print out the errors. We want to see if it causes AmbiguousColumn.
+        // Wait, standard SQLite allows this (it prefers the SELECT alias in ORDER BY, or treats them as equivalent).
+        // If our semantic resolver returns an AmbiguousColumn error, we have a bug to fix.
+        if !errors.is_empty() {
+            panic!("Expected no errors, but got: {:?}", errors);
+        }
     }
 
     // ── Metrics tests ──

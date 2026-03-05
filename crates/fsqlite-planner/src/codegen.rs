@@ -315,7 +315,14 @@ pub fn codegen_select(
         let loop_start = b.current_addr();
         let idx_key_reg = b.alloc_reg();
         b.emit_op(Opcode::Column, idx_cursor, 0, idx_key_reg, P4::None, 0);
-        b.emit_jump_to_label(Opcode::Ne, param_reg, idx_key_reg, done_label, P4::None, 0);
+        b.emit_jump_to_label(
+            Opcode::Ne,
+            param_reg,
+            idx_key_reg,
+            done_label,
+            P4::None,
+            0x10,
+        );
 
         let rowid_reg = b.alloc_reg();
         b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
@@ -1657,7 +1664,14 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32) -> Result<(), Codege
                     let next_label = b.emit_label();
                     let when_reg = b.alloc_temp();
                     emit_expr(b, when_val, when_reg)?;
-                    b.emit_jump_to_label(Opcode::Ne, when_reg, base_reg, next_label, P4::None, 0);
+                    b.emit_jump_to_label(
+                        Opcode::Ne,
+                        when_reg,
+                        base_reg,
+                        next_label,
+                        P4::None,
+                        0x10,
+                    );
                     b.free_temp(when_reg);
                     emit_expr(b, then_val, reg)?;
                     b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);

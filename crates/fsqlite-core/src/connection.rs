@@ -7901,7 +7901,9 @@ impl Connection {
                 Ok(Some(plan))
             }
             Err((err, fcw_result)) => {
-                registry.remove(session_id);
+                if let Some(mut handle) = registry.remove(session_id) {
+                    concurrent_abort(&mut handle, &self.concurrent_lock_table, session_id);
+                }
                 *self.concurrent_session_id.borrow_mut() = None;
                 Err(Self::map_mvcc_commit_error(err, fcw_result))
             }
@@ -13404,10 +13406,12 @@ fn build_raw_scan_select(select: &SelectStatement) -> SelectStatement {
 }
 
 /// Test whether a `SqliteValue` is truthy (non-zero, non-NULL).
+/// C SQLite uses integer truncation (`sqlite3VdbeIntValue`) for truthiness,
+/// so 0.5 is falsy (truncates to 0), 1.5 is truthy (truncates to 1).
 fn is_sqlite_truthy(v: &SqliteValue) -> bool {
     match v {
         SqliteValue::Null => false,
-        v => v.to_float() != 0.0,
+        v => v.to_integer() != 0,
     }
 }
 
@@ -13811,15 +13815,15 @@ fn evaluate_having_value(
             let upper = type_name.name.to_ascii_uppercase();
             if upper.contains("INT") {
                 SqliteValue::Integer(v.to_integer())
-            } else if upper.contains("REAL") || upper.contains("FLOAT") || upper.contains("DOUB") {
-                SqliteValue::Float(v.to_float())
             } else if upper.contains("TEXT") || upper.contains("CHAR") || upper.contains("CLOB") {
                 SqliteValue::Text(v.to_text())
-            } else if upper.contains("BLOB") {
+            } else if upper.contains("BLOB") || upper.is_empty() {
                 match v {
                     SqliteValue::Blob(_) => v,
                     _ => SqliteValue::Blob(v.to_text().into_bytes()),
                 }
+            } else if upper.contains("REAL") || upper.contains("FLOA") || upper.contains("DOUB") {
+                SqliteValue::Float(v.to_float())
             } else {
                 // NUMERIC affinity: try integer, then float, else text.
                 let txt = v.to_text();
@@ -17648,47 +17652,61 @@ fn glob_dp(pat: &[char], txt: &[char], pi: usize, ti: usize) -> bool {
 
 /// Parse leading integer from a string, matching SQLite's prefix extraction.
 fn parse_integer_prefix(s: &str) -> i64 {
-    let trimmed = s.trim();
-    if trimmed.is_empty() {
-        return 0;
+    let f = parse_float_prefix(s);
+    #[allow(clippy::manual_clamp)]
+    if f >= i64::MAX as f64 {
+        i64::MAX
+    } else if f <= i64::MIN as f64 {
+        i64::MIN
+    } else {
+        f as i64
     }
-    let mut end = 0;
-    let bytes = trimmed.as_bytes();
-    if end < bytes.len() && (bytes[end] == b'+' || bytes[end] == b'-') {
-        end += 1;
-    }
-    while end < bytes.len() && bytes[end].is_ascii_digit() {
-        end += 1;
-    }
-    if end == 0 || (end == 1 && (bytes[0] == b'+' || bytes[0] == b'-')) {
-        return 0;
-    }
-    trimmed[..end].parse::<i64>().unwrap_or(0)
 }
 
-/// Parse leading float from a string, matching SQLite's prefix extraction.
+/// Parse the longest numeric prefix of `s` as a float, matching SQLite's
+/// `sqlite3AtoF` behavior. Does NOT recognize "nan"/"inf"/"infinity".
 fn parse_float_prefix(s: &str) -> f64 {
     let trimmed = s.trim();
     if trimmed.is_empty() {
         return 0.0;
     }
-    // Try successively longer prefixes until parse fails.
-    let mut best = 0.0_f64;
-    let mut last_good = 0;
-    for (i, _) in trimmed.char_indices() {
-        if let Ok(f) = trimmed[..=i].parse::<f64>() {
-            if f.is_finite() || trimmed[..=i].contains("inf") || trimmed[..=i].contains("nan") {
-                best = f;
-                last_good = i;
-            }
+    let bytes = trimmed.as_bytes();
+    let mut i = 0;
+    // Optional sign
+    if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') {
+        i += 1;
+    }
+    let start = i;
+    // Integer digits
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    // Decimal point + fractional digits
+    if i < bytes.len() && bytes[i] == b'.' {
+        i += 1;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
         }
     }
-    // Also try the full string.
-    if let Ok(f) = trimmed.parse::<f64>() {
-        best = f;
+    // Must have consumed at least one digit
+    if i == start {
+        return 0.0;
     }
-    let _ = last_good;
-    best
+    // Exponent
+    if i < bytes.len() && (bytes[i] == b'e' || bytes[i] == b'E') {
+        let mut j = i + 1;
+        if j < bytes.len() && (bytes[j] == b'+' || bytes[j] == b'-') {
+            j += 1;
+        }
+        if j < bytes.len() && bytes[j].is_ascii_digit() {
+            j += 1;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                j += 1;
+            }
+            i = j;
+        }
+    }
+    trimmed[..i].parse::<f64>().unwrap_or(0.0)
 }
 
 /// Apply a CAST to a value based on the target type name.
@@ -17801,10 +17819,10 @@ fn eval_scalar_fn(name: &str, args: &[SqliteValue]) -> SqliteValue {
                 #[allow(clippy::cast_possible_wrap)]
                 SqliteValue::Integer(n.to_string().len() as i64)
             }
-            Some(SqliteValue::Float(f)) =>
+            Some(v @ SqliteValue::Float(_)) =>
             {
                 #[allow(clippy::cast_possible_wrap)]
-                SqliteValue::Integer(f.to_string().len() as i64)
+                SqliteValue::Integer(v.to_text().len() as i64)
             }
             _ => SqliteValue::Null,
         },
@@ -17986,22 +18004,7 @@ fn eval_scalar_fn(name: &str, args: &[SqliteValue]) -> SqliteValue {
         "quote" => match args.first() {
             Some(SqliteValue::Null) => SqliteValue::Text("NULL".to_owned()),
             Some(SqliteValue::Integer(n)) => SqliteValue::Text(n.to_string()),
-            Some(SqliteValue::Float(f)) => {
-                // C SQLite always includes a decimal point for floats.
-                let s = f.to_string();
-                SqliteValue::Text(
-                    if s.contains('.')
-                        || s.contains('e')
-                        || s.contains('E')
-                        || s.contains("inf")
-                        || s.contains("nan")
-                    {
-                        s
-                    } else {
-                        format!("{s}.0")
-                    },
-                )
-            }
+            Some(v @ SqliteValue::Float(_)) => SqliteValue::Text(v.to_text()),
             Some(SqliteValue::Text(s)) => SqliteValue::Text(format!("'{}'", s.replace('\'', "''"))),
             Some(SqliteValue::Blob(b)) => {
                 use std::fmt::Write;

@@ -709,13 +709,13 @@ fn test_encoding_pipeline_stages() {
     {
         let _stage = stage_span("determine_parameters", &params, seed, 0);
         assert_eq!(params.k, k);
-        assert_eq!(params.l, params.k + params.s + params.h);
+        assert_eq!(params.l, params.k_prime + params.s + params.h);
     }
 
     let matrix = {
         let _stage = stage_span("construct_constraint_matrix", &params, seed, 0);
         let matrix = ConstraintMatrix::build(&params, seed);
-        assert_eq!(matrix.rows, params.s + params.h + params.k);
+        assert_eq!(matrix.rows, params.s + params.h + params.k_prime);
         assert_eq!(matrix.cols, params.l);
         matrix
     };
@@ -723,7 +723,7 @@ fn test_encoding_pipeline_stages() {
     let lt_start = params.s + params.h;
     {
         let _stage = stage_span("build_source_vector", &params, seed, 0);
-        assert_eq!(matrix.rows - lt_start, params.k);
+        assert_eq!(matrix.rows - lt_start, params.k_prime);
     }
 
     {

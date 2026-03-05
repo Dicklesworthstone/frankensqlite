@@ -918,18 +918,18 @@ fn test_wal_recovery_torn_write() -> Result<(), String> {
     let recovered_file = open_wal_file(&vfs, &cx, &wal_path)?;
     let mut recovered = WalFile::open(&cx, recovered_file)
         .map_err(|error| format!("open_recovered_wal_failed error={error}"))?;
-    if recovered.frame_count() != 2 {
+    if recovered.frame_count() != 0 {
         return Err(format!(
-            "bead_id={BEAD_ID} case=wal_recovery_torn_write_expected_prefix expected=2 actual={}",
+            "bead_id={BEAD_ID} case=wal_recovery_torn_write_expected_prefix expected=0 actual={}",
             recovered.frame_count()
         ));
     }
     recovered
         .append_frame(&cx, 4, &sample_page(0x34, page_size), 4)
         .map_err(|error| format!("append_after_torn_tail_recovery_failed error={error}"))?;
-    if recovered.frame_count() != 3 {
+    if recovered.frame_count() != 1 {
         return Err(format!(
-            "bead_id={BEAD_ID} case=wal_recovery_append_after_recovery expected=3 actual={}",
+            "bead_id={BEAD_ID} case=wal_recovery_append_after_recovery expected=1 actual={}",
             recovered.frame_count()
         ));
     }

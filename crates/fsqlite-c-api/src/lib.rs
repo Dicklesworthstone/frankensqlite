@@ -322,7 +322,7 @@ pub unsafe extern "C" fn sqlite3_exec(
                                 continue;
                             }
                             SqliteValue::Integer(n) => n.to_string(),
-                            SqliteValue::Float(f) => f.to_string(),
+                            v @ SqliteValue::Float(_) => v.to_text(),
                             SqliteValue::Text(s) => s.clone(),
                             SqliteValue::Blob(b) => {
                                 // Represent blob as hex for the exec callback.
@@ -740,7 +740,7 @@ pub unsafe extern "C" fn sqlite3_column_text(
     let text = match current_value_ref(stmt, i_col) {
         Some(SqliteValue::Text(s)) => s.clone(),
         Some(SqliteValue::Integer(n)) => n.to_string(),
-        Some(SqliteValue::Float(f)) => f.to_string(),
+        Some(v @ SqliteValue::Float(_)) => v.to_text(),
         Some(SqliteValue::Blob(b)) => {
             // Return blob as hex string for text accessor.
             let mut hex = String::with_capacity(b.len() * 2);

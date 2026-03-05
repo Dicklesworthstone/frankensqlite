@@ -372,6 +372,46 @@ impl ConcurrentRegistry {
             .retain(|reader| reader.commit_seq > min_active_begin);
         self.committed_writers
             .retain(|writer| writer.commit_seq > min_active_begin);
+
+        // Safety bound: prevent unbounded memory growth if a long-running
+        // transaction pins the horizon.
+        const MAX_HISTORY_ENTRIES: usize = 16384;
+        while self.committed_readers.len() + self.committed_writers.len() > MAX_HISTORY_ENTRIES {
+            // Find the oldest active transaction and mark it for abort to unpin the horizon.
+            let mut oldest_id = None;
+            let mut oldest_seq = CommitSeq::new(u64::MAX);
+            for (&id, handle) in &self.active {
+                if handle.is_active() && !handle.is_marked_for_abort() && handle.snapshot.high < oldest_seq {
+                    oldest_seq = handle.snapshot.high;
+                    oldest_id = Some(id);
+                }
+            }
+
+            if let Some(id) = oldest_id {
+                tracing::warn!(
+                    session_id = id,
+                    snapshot_high = oldest_seq.get(),
+                    "prune_committed_conflict_history: marking long-running transaction for abort due to SSI history limit"
+                );
+                if let Some(handle) = self.active.get_mut(&id) {
+                    handle.set_marked_for_abort(true);
+                }
+                
+                // Recompute horizon and prune again now that the oldest is marked for abort
+                let new_horizon = self.gc_horizon().unwrap_or(CommitSeq::new(u64::MAX));
+                self.committed_readers
+                    .retain(|reader| reader.commit_seq > new_horizon);
+                self.committed_writers
+                    .retain(|writer| writer.commit_seq > new_horizon);
+            } else {
+                // If we couldn't find an active transaction to abort (should be impossible if
+                // history is bounded by active transactions), just clear everything.
+                tracing::warn!("prune_committed_conflict_history: forced to clear SSI history");
+                self.committed_readers.clear();
+                self.committed_writers.clear();
+                break;
+            }
+        }
     }
 
     /// Compute the GC horizon: the minimum `snapshot.high` across all active
@@ -1022,13 +1062,21 @@ pub fn concurrent_commit_with_ssi(
     session_id: u64,
     assign_commit_seq: CommitSeq,
 ) -> Result<CommitSeq, (MvccError, FcwResult)> {
-    let prepared = prepare_concurrent_commit_with_ssi(
+    let prepared = match prepare_concurrent_commit_with_ssi(
         registry,
         commit_index,
         lock_table,
         session_id,
         assign_commit_seq,
-    )?;
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            if let Some(mut handle) = registry.remove(session_id) {
+                concurrent_abort(&mut handle, lock_table, session_id);
+            }
+            return Err(e);
+        }
+    };
     finalize_prepared_concurrent_commit_with_ssi(
         registry,
         commit_index,

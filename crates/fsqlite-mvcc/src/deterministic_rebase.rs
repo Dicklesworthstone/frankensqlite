@@ -306,9 +306,10 @@ fn enforce_constraints(
             })?;
         // Per SQLite: CHECK passes if result is true (non-zero) OR NULL.
         // Fails only if result is exactly false (zero).
+        // C SQLite uses integer truncation for truthiness.
         let is_false = match result {
             SqliteValue::Null => false,
-            v => v.to_float() == 0.0,
+            v => v.to_integer() == 0,
         };
         if is_false {
             return Err(RebaseError::CheckViolation {
