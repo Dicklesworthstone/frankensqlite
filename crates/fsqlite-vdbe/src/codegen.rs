@@ -1422,6 +1422,11 @@ fn codegen_select_full_scan(
         })
     });
 
+    // LIMIT 0 guard: skip entire scan if limit is zero.
+    if let Some(lim_r) = limit_reg {
+        emit_limit_zero_guard(b, lim_r, done_label);
+    }
+
     b.emit_op(
         Opcode::OpenRead,
         cursor,
@@ -1547,6 +1552,11 @@ fn codegen_select_index_ordered_scan(
             r
         })
     });
+
+    // LIMIT 0 guard: skip entire scan if limit is zero.
+    if let Some(lim_r) = limit_reg {
+        emit_limit_zero_guard(b, lim_r, done_label);
+    }
 
     if needs_table_lookup {
         b.emit_op(
@@ -1750,6 +1760,11 @@ fn codegen_select_distinct_scan(
         })
     });
 
+    // LIMIT 0 guard: skip entire output pass if limit is zero.
+    if let Some(lim_r) = limit_reg {
+        emit_limit_zero_guard(b, lim_r, done_label);
+    }
+
     // DISTINCT state (record compare against previous output row).
     let cur_rec = b.alloc_reg();
     let prev_rec = b.alloc_reg();
@@ -1876,6 +1891,18 @@ fn emit_limit_expr(b: &mut ProgramBuilder, expr: &Expr, target_reg: i32) {
             emit_expr(b, expr, target_reg, None);
         }
     }
+}
+
+/// Emit a guard that jumps to `done_label` when the LIMIT register is zero.
+///
+/// `LIMIT 0` means "return no rows". The `DecrJumpZero` instruction after
+/// `ResultRow` doesn't fire when the register is already 0 (it only
+/// decrements positive values), so we need a pre-loop guard.
+///
+/// `LIMIT -1` means "no limit" — the register is -1 (truthy), so the
+/// `IfNot` check does not fire.
+fn emit_limit_zero_guard(b: &mut ProgramBuilder, limit_reg: i32, done_label: crate::Label) {
+    b.emit_jump_to_label(Opcode::IfNot, limit_reg, 1, done_label, P4::None, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -2061,6 +2088,11 @@ fn codegen_select_ordered_scan(
             r
         })
     });
+
+    // LIMIT 0 guard: skip entire output pass if limit is zero.
+    if let Some(lim_r) = limit_reg {
+        emit_limit_zero_guard(b, lim_r, done_label);
+    }
 
     // DISTINCT state (used only when DISTINCT is requested).
     let distinct_state = if distinct == Distinctness::Distinct {
@@ -3841,6 +3873,11 @@ fn codegen_select_group_by_aggregate(
             r
         })
     });
+
+    // LIMIT 0 guard: skip entire GROUP BY scan if limit is zero.
+    if let Some(lim_r) = limit_reg {
+        emit_limit_zero_guard(b, lim_r, done_label);
+    }
 
     let num_group_keys = group_by_keys.len();
     let num_aggs = agg_columns.len();

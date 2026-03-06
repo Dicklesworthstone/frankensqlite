@@ -10616,9 +10616,15 @@ impl Connection {
             for desc in &result_descriptors {
                 match desc {
                     GroupByColumn::Plain(expr) => {
-                        let val = group_rows.first().map_or(SqliteValue::Null, |r| {
-                            eval_join_expr(expr, r, &col_map).unwrap_or(SqliteValue::Null)
-                        });
+                        let val = if expr_contains_agg(expr) {
+                            let refs: Vec<&Vec<SqliteValue>> = group_rows.iter().collect();
+                            eval_group_agg_join_expr(expr, &refs, &col_map)
+                                .unwrap_or(SqliteValue::Null)
+                        } else {
+                            group_rows.first().map_or(SqliteValue::Null, |r| {
+                                eval_join_expr(expr, r, &col_map).unwrap_or(SqliteValue::Null)
+                            })
+                        };
                         values.push(val);
                     }
                     GroupByColumn::Agg {
@@ -10706,8 +10712,97 @@ impl Connection {
         }
 
         // Step 7: ORDER BY and LIMIT.
+        //
+        // SQLite allows ORDER BY on columns/expressions not in the SELECT list
+        // (e.g., ORDER BY e.id when only e.name is selected, or ORDER BY
+        // sum(salary) when only dept is selected). We handle this by detecting
+        // unresolvable ORDER BY terms, computing their values from the group
+        // data, and temporarily appending them as extra columns.
         if !select.order_by.is_empty() {
-            sort_rows_by_order_terms(&mut result, &select.order_by, &expanded_columns)?;
+            let extra_order_terms: Vec<(usize, &Expr)> = select
+                .order_by
+                .iter()
+                .enumerate()
+                .filter(|(_, term)| resolve_order_term_idx(&term.expr, &expanded_columns).is_none())
+                .map(|(i, term)| (i, &term.expr))
+                .collect();
+
+            if extra_order_terms.is_empty() {
+                sort_rows_by_order_terms(&mut result, &select.order_by, &expanded_columns)?;
+            } else {
+                // Re-iterate groups to compute extra ORDER BY values.
+                // result and groups are in the same order (both follow the
+                // groups vec, minus HAVING-filtered entries).
+                let mut result_idx = 0;
+                for (_key, group_rows) in &groups {
+                    // Reproduce HAVING check to stay in sync.
+                    if let Some(having) = having_expr {
+                        let check_vals: Vec<SqliteValue> = result_descriptors
+                            .iter()
+                            .map(|desc| match desc {
+                                GroupByColumn::Plain(expr) => {
+                                    if expr_contains_agg(expr) {
+                                        let refs: Vec<&Vec<SqliteValue>> =
+                                            group_rows.iter().collect();
+                                        eval_group_agg_join_expr(expr, &refs, &col_map)
+                                            .unwrap_or(SqliteValue::Null)
+                                    } else {
+                                        group_rows.first().map_or(SqliteValue::Null, |r| {
+                                            eval_join_expr(expr, r, &col_map)
+                                                .unwrap_or(SqliteValue::Null)
+                                        })
+                                    }
+                                }
+                                GroupByColumn::Agg { .. } => SqliteValue::Null,
+                            })
+                            .collect();
+                        if !evaluate_having_predicate(
+                            having,
+                            &check_vals,
+                            &result_descriptors,
+                            &expanded_columns,
+                            group_rows,
+                            &col_names,
+                        ) {
+                            continue;
+                        }
+                    }
+
+                    if result_idx >= result.len() {
+                        break;
+                    }
+                    let row = &mut result[result_idx];
+                    for (_term_idx, expr) in &extra_order_terms {
+                        let val = if expr_contains_agg(expr) {
+                            let refs: Vec<&Vec<SqliteValue>> = group_rows.iter().collect();
+                            eval_group_agg_join_expr(expr, &refs, &col_map)
+                                .unwrap_or(SqliteValue::Null)
+                        } else {
+                            group_rows.first().map_or(SqliteValue::Null, |r| {
+                                eval_join_expr(expr, r, &col_map).unwrap_or(SqliteValue::Null)
+                            })
+                        };
+                        row.values.push(val);
+                    }
+                    result_idx += 1;
+                }
+
+                // Build extended columns with synthetic entries.
+                let orig_col_count = expanded_columns.len();
+                let mut ext_columns = expanded_columns.clone();
+                for (_, expr) in &extra_order_terms {
+                    ext_columns.push(ResultColumn::Expr {
+                        expr: (*expr).clone(),
+                        alias: None,
+                    });
+                }
+                sort_rows_by_order_terms(&mut result, &select.order_by, &ext_columns)?;
+
+                // Trim extra columns.
+                for row in &mut result {
+                    row.values.truncate(orig_col_count);
+                }
+            }
         }
         if let Some(ref limit_clause) = select.limit {
             apply_limit_clause(&mut result, limit_clause);
@@ -11195,10 +11290,15 @@ impl Connection {
             for desc in &result_descriptors {
                 match desc {
                     GroupByColumn::Plain(expr) => {
-                        // Evaluate the expression against the first row in the group.
-                        let val = group_rows.first().map_or(SqliteValue::Null, |r| {
-                            eval_join_expr(expr, r, &col_map).unwrap_or(SqliteValue::Null)
-                        });
+                        let val = if expr_contains_agg(expr) {
+                            let refs: Vec<&Vec<SqliteValue>> = group_rows.iter().collect();
+                            eval_group_agg_join_expr(expr, &refs, &col_map)
+                                .unwrap_or(SqliteValue::Null)
+                        } else {
+                            group_rows.first().map_or(SqliteValue::Null, |r| {
+                                eval_join_expr(expr, r, &col_map).unwrap_or(SqliteValue::Null)
+                            })
+                        };
                         values.push(val);
                     }
                     GroupByColumn::Agg {
@@ -11286,9 +11386,85 @@ impl Connection {
             result.push(Row { values });
         }
 
-        // Post-process: ORDER BY.
+        // Post-process: ORDER BY (with support for expressions not in SELECT).
         if !select.order_by.is_empty() {
-            sort_rows_by_order_terms(&mut result, &select.order_by, &expanded_columns)?;
+            let extra_order_terms: Vec<(usize, &Expr)> = select
+                .order_by
+                .iter()
+                .enumerate()
+                .filter(|(_, term)| resolve_order_term_idx(&term.expr, &expanded_columns).is_none())
+                .map(|(i, term)| (i, &term.expr))
+                .collect();
+
+            if extra_order_terms.is_empty() {
+                sort_rows_by_order_terms(&mut result, &select.order_by, &expanded_columns)?;
+            } else {
+                let mut result_idx = 0;
+                for (_key, group_rows) in &groups {
+                    if let Some(having) = having_expr {
+                        let check_vals: Vec<SqliteValue> = result_descriptors
+                            .iter()
+                            .map(|desc| match desc {
+                                GroupByColumn::Plain(expr) => {
+                                    if expr_contains_agg(expr) {
+                                        let refs: Vec<&Vec<SqliteValue>> =
+                                            group_rows.iter().collect();
+                                        eval_group_agg_join_expr(expr, &refs, &col_map)
+                                            .unwrap_or(SqliteValue::Null)
+                                    } else {
+                                        group_rows.first().map_or(SqliteValue::Null, |r| {
+                                            eval_join_expr(expr, r, &col_map)
+                                                .unwrap_or(SqliteValue::Null)
+                                        })
+                                    }
+                                }
+                                GroupByColumn::Agg { .. } => SqliteValue::Null,
+                            })
+                            .collect();
+                        if !evaluate_having_predicate(
+                            having,
+                            &check_vals,
+                            &result_descriptors,
+                            &expanded_columns,
+                            group_rows,
+                            &col_names,
+                        ) {
+                            continue;
+                        }
+                    }
+                    if result_idx >= result.len() {
+                        break;
+                    }
+                    let row = &mut result[result_idx];
+                    for (_term_idx, expr) in &extra_order_terms {
+                        let val = if expr_contains_agg(expr) {
+                            let refs: Vec<&Vec<SqliteValue>> = group_rows.iter().collect();
+                            eval_group_agg_join_expr(expr, &refs, &col_map)
+                                .unwrap_or(SqliteValue::Null)
+                        } else {
+                            group_rows.first().map_or(SqliteValue::Null, |r| {
+                                eval_join_expr(expr, r, &col_map).unwrap_or(SqliteValue::Null)
+                            })
+                        };
+                        row.values.push(val);
+                    }
+                    result_idx += 1;
+                }
+
+                let orig_col_count = expanded_columns.len();
+                let mut ext_columns = expanded_columns.clone();
+                for (_, expr) in &extra_order_terms {
+                    ext_columns.push(ResultColumn::Expr {
+                        expr: (*expr).clone(),
+                        alias: None,
+                    });
+                }
+                sort_rows_by_order_terms(&mut result, &select.order_by, &ext_columns)?;
+
+                for row in &mut result {
+                    row.values.truncate(orig_col_count);
+                }
+            }
         }
 
         // Post-process: LIMIT / OFFSET.
@@ -14323,6 +14499,164 @@ fn is_agg_fn(name: &str) -> bool {
     AGG_NAMES.iter().any(|&n| n == lower)
 }
 
+/// Check whether an expression tree contains any aggregate function calls.
+fn expr_contains_agg(expr: &Expr) -> bool {
+    match expr {
+        Expr::FunctionCall { name, args, .. } => {
+            if is_agg_fn(name) {
+                return true;
+            }
+            match args {
+                FunctionArgs::List(exprs) => exprs.iter().any(expr_contains_agg),
+                FunctionArgs::Star => false,
+            }
+        }
+        Expr::BinaryOp { left, right, .. } => expr_contains_agg(left) || expr_contains_agg(right),
+        Expr::UnaryOp { expr: inner, .. }
+        | Expr::IsNull { expr: inner, .. }
+        | Expr::Cast { expr: inner, .. }
+        | Expr::Collate { expr: inner, .. } => expr_contains_agg(inner),
+        Expr::Between {
+            expr: inner,
+            low,
+            high,
+            ..
+        } => expr_contains_agg(inner) || expr_contains_agg(low) || expr_contains_agg(high),
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            operand.as_ref().is_some_and(|e| expr_contains_agg(e))
+                || whens
+                    .iter()
+                    .any(|(w, t)| expr_contains_agg(w) || expr_contains_agg(t))
+                || else_expr.as_ref().is_some_and(|e| expr_contains_agg(e))
+        }
+        _ => false,
+    }
+}
+
+/// Evaluate an expression that may contain aggregate function calls against
+/// a group of rows. Aggregate sub-expressions are computed over the full
+/// group; the remaining scalar parts are evaluated against the first row.
+fn eval_group_agg_join_expr(
+    expr: &Expr,
+    group_rows: &[&Vec<SqliteValue>],
+    col_map: &[(String, String)],
+) -> Result<SqliteValue> {
+    match expr {
+        Expr::FunctionCall {
+            name,
+            args,
+            distinct,
+            ..
+        } if is_agg_fn(name) => {
+            let func = name.to_ascii_lowercase();
+            match args {
+                FunctionArgs::Star => {
+                    if func == "count" {
+                        #[allow(clippy::cast_possible_wrap)]
+                        return Ok(SqliteValue::Integer(group_rows.len() as i64));
+                    }
+                    Ok(SqliteValue::Null)
+                }
+                FunctionArgs::List(exprs) if exprs.is_empty() => {
+                    if func == "count" {
+                        #[allow(clippy::cast_possible_wrap)]
+                        return Ok(SqliteValue::Integer(group_rows.len() as i64));
+                    }
+                    Ok(SqliteValue::Null)
+                }
+                FunctionArgs::List(exprs) => {
+                    let mut owned_values: Vec<SqliteValue> = group_rows
+                        .iter()
+                        .filter_map(|r| eval_join_expr(&exprs[0], r, col_map).ok())
+                        .filter(|v| !v.is_null())
+                        .collect();
+                    if *distinct {
+                        let mut refs: Vec<&SqliteValue> = owned_values.iter().collect();
+                        dedup_values(&mut refs);
+                        owned_values = refs.into_iter().cloned().collect();
+                    }
+                    let separator = if func == "group_concat" || func == "string_agg" {
+                        exprs
+                            .get(1)
+                            .and_then(|e| {
+                                if let Expr::Literal(Literal::String(s), _) = e {
+                                    Some(s.as_str())
+                                } else {
+                                    None
+                                }
+                            })
+                            .or(Some(","))
+                    } else {
+                        None
+                    };
+                    let agg_refs: Vec<&SqliteValue> = owned_values.iter().collect();
+                    Ok(compute_aggregate_ext(&func, &agg_refs, separator))
+                }
+            }
+        }
+        Expr::FunctionCall { name, args, .. } => {
+            // Scalar function — evaluate args which may themselves contain aggs.
+            let arg_vals: Vec<SqliteValue> = match args {
+                FunctionArgs::List(exprs) => exprs
+                    .iter()
+                    .map(|e| eval_group_agg_join_expr(e, group_rows, col_map))
+                    .collect::<Result<Vec<_>>>()?,
+                FunctionArgs::Star => vec![],
+            };
+            Ok(eval_scalar_fn(name, &arg_vals))
+        }
+        Expr::BinaryOp {
+            left, op, right, ..
+        } => {
+            let lv = eval_group_agg_join_expr(left, group_rows, col_map)?;
+            let rv = eval_group_agg_join_expr(right, group_rows, col_map)?;
+            Ok(eval_join_binary_op(&lv, *op, &rv))
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            let base = operand
+                .as_ref()
+                .map(|e| eval_group_agg_join_expr(e, group_rows, col_map))
+                .transpose()?;
+            for (when_expr, then_expr) in whens {
+                let when_val = eval_group_agg_join_expr(when_expr, group_rows, col_map)?;
+                let matches = if let Some(ref b) = base {
+                    !b.is_null()
+                        && !when_val.is_null()
+                        && cmp_values(b, &when_val) == std::cmp::Ordering::Equal
+                } else {
+                    is_sqlite_truthy(&when_val)
+                };
+                if matches {
+                    return eval_group_agg_join_expr(then_expr, group_rows, col_map);
+                }
+            }
+            if let Some(else_e) = else_expr {
+                eval_group_agg_join_expr(else_e, group_rows, col_map)
+            } else {
+                Ok(SqliteValue::Null)
+            }
+        }
+        // No aggregate sub-expressions: delegate to per-row eval on first row.
+        other => {
+            if let Some(first) = group_rows.first() {
+                eval_join_expr(other, first, col_map)
+            } else {
+                Ok(SqliteValue::Null)
+            }
+        }
+    }
+}
+
 /// Describes one result column in a GROUP BY query.
 enum GroupByColumn {
     /// A non-aggregate expression that appears in GROUP BY; evaluated per-group.
@@ -15519,6 +15853,36 @@ fn cmp_sqlite_values(a: &SqliteValue, b: &SqliteValue) -> std::cmp::Ordering {
         (SqliteValue::Blob(a), SqliteValue::Blob(b)) => a.cmp(b),
         _ => unreachable!("unreachable given rank check above"),
     }
+}
+
+/// Try to resolve an ORDER BY expression to a column index in `columns`.
+/// Returns `None` if the expression doesn't match any column.
+fn resolve_order_term_idx(expr: &Expr, columns: &[ResultColumn]) -> Option<usize> {
+    if let Expr::Literal(Literal::Integer(n), _) = expr {
+        let pos = usize::try_from(*n).unwrap_or(0);
+        if pos >= 1 && pos <= columns.len() {
+            return Some(pos - 1);
+        }
+    }
+    if let Some(col_name) = expr_col_name(expr) {
+        let found = columns.iter().position(|c| match c {
+            ResultColumn::Expr {
+                expr: Expr::Column(r, _),
+                ..
+            } => r.column.eq_ignore_ascii_case(col_name),
+            ResultColumn::Expr {
+                alias: Some(alias), ..
+            } => alias.eq_ignore_ascii_case(col_name),
+            _ => false,
+        });
+        if found.is_some() {
+            return found;
+        }
+    }
+    columns.iter().position(|c| match c {
+        ResultColumn::Expr { expr: e, .. } => exprs_match(expr, e),
+        _ => false,
+    })
 }
 
 /// Sort result rows by ORDER BY terms (for GROUP BY post-processing).
@@ -41168,6 +41532,560 @@ mod pager_routing_tests {
                 "{} limit/agg/join conformance mismatches found",
                 mismatches.len()
             );
+        }
+    }
+
+    /// Probe type coercion, CAST, expression edge cases, and
+    /// multi-table patterns that exercise deeper code paths.
+    #[test]
+    fn test_conformance_types_and_multipath() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, price REAL, qty INTEGER);",
+            "INSERT INTO items VALUES (1, 'apple', 1.50, 10);",
+            "INSERT INTO items VALUES (2, 'banana', 0.75, 20);",
+            "INSERT INTO items VALUES (3, 'cherry', 3.00, 0);",
+            "INSERT INTO items VALUES (4, 'date', NULL, 5);",
+            "INSERT INTO items VALUES (5, 'elderberry', 12.50, NULL);",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            // CAST expressions
+            "SELECT CAST(price AS INTEGER) FROM items ORDER BY id",
+            "SELECT CAST(qty AS REAL) FROM items ORDER BY id",
+            "SELECT CAST(name AS BLOB) FROM items WHERE id = 1",
+            "SELECT CAST(123 AS TEXT)",
+            "SELECT CAST(NULL AS INTEGER), CAST(NULL AS TEXT), CAST(NULL AS REAL)",
+            // ABS edge cases
+            "SELECT abs(-1), abs(0), abs(1), abs(NULL)",
+            "SELECT abs(-9223372036854775807)",
+            // ROUND
+            "SELECT round(2.5), round(3.5), round(-2.5)",
+            "SELECT round(1.2345, 2), round(1.2345, 0)",
+            // UNICODE / CHAR
+            "SELECT unicode('A'), unicode('a'), unicode(' ')",
+            "SELECT char(65), char(97), char(32)",
+            // ZEROBLOB
+            "SELECT typeof(zeroblob(4)), length(zeroblob(4))",
+            // TOTAL (returns 0.0 for empty, unlike SUM which returns NULL)
+            "SELECT total(price) FROM items",
+            "SELECT total(price) FROM items WHERE id > 100",
+            // SUM returns NULL for empty set
+            "SELECT sum(price) FROM items WHERE id > 100",
+            // GROUP_CONCAT
+            "SELECT group_concat(name) FROM items WHERE name IS NOT NULL ORDER BY id",
+            "SELECT group_concat(name, ' | ') FROM items WHERE name IS NOT NULL ORDER BY id",
+            // SUBSTR edge cases
+            "SELECT substr('hello', 1, 3), substr('hello', -2)",
+            "SELECT substr('hello', 0, 3)",
+            // LTRIM/RTRIM/TRIM
+            "SELECT ltrim('  hello  '), rtrim('  hello  '), trim('  hello  ')",
+            "SELECT ltrim('xxxhello', 'x'), rtrim('helloyyy', 'y')",
+            // UPPER/LOWER
+            "SELECT upper('hello'), lower('HELLO')",
+            // Nested function calls
+            "SELECT length(upper(trim('  hello  ')))",
+            // BETWEEN
+            "SELECT id FROM items WHERE price BETWEEN 1.0 AND 5.0 ORDER BY id",
+            // NOT BETWEEN
+            "SELECT id FROM items WHERE price NOT BETWEEN 1.0 AND 5.0 ORDER BY id",
+            // IS / IS NOT
+            "SELECT id FROM items WHERE price IS NULL ORDER BY id",
+            "SELECT id FROM items WHERE price IS NOT NULL ORDER BY id",
+            // Ternary comparison chain via CASE
+            "SELECT id, CASE WHEN price > 10 THEN 'expensive' WHEN price > 1 THEN 'moderate' ELSE 'cheap' END AS tier FROM items WHERE price IS NOT NULL ORDER BY id",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!(
+                "{} types/multipath conformance mismatches found",
+                mismatches.len()
+            );
+        }
+    }
+
+    #[test]
+    fn test_conformance_subquery_coalesce_iif() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE t1 (id INTEGER PRIMARY KEY, a INTEGER, b TEXT);",
+            "INSERT INTO t1 VALUES (1, 10, 'x');",
+            "INSERT INTO t1 VALUES (2, 20, 'y');",
+            "INSERT INTO t1 VALUES (3, NULL, 'z');",
+            "INSERT INTO t1 VALUES (4, 30, NULL);",
+            "CREATE TABLE t2 (id INTEGER PRIMARY KEY, t1_id INTEGER, val REAL);",
+            "INSERT INTO t2 VALUES (1, 1, 100.0);",
+            "INSERT INTO t2 VALUES (2, 1, 200.0);",
+            "INSERT INTO t2 VALUES (3, 2, 50.0);",
+            "INSERT INTO t2 VALUES (4, 3, 75.0);",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            // COALESCE
+            "SELECT coalesce(a, -1) FROM t1 ORDER BY id",
+            "SELECT coalesce(NULL, NULL, 42)",
+            "SELECT coalesce(b, 'missing') FROM t1 ORDER BY id",
+            // NULLIF
+            "SELECT nullif(10, 10), nullif(10, 20), nullif(NULL, 1)",
+            "SELECT nullif(a, 10) FROM t1 ORDER BY id",
+            // IIF
+            "SELECT iif(1, 'yes', 'no'), iif(0, 'yes', 'no'), iif(NULL, 'yes', 'no')",
+            "SELECT iif(a > 15, 'big', 'small') FROM t1 WHERE a IS NOT NULL ORDER BY id",
+            // Scalar subquery in SELECT list
+            "SELECT id, (SELECT count(*) FROM t2 WHERE t2.t1_id = t1.id) AS cnt FROM t1 ORDER BY id",
+            // Scalar subquery in WHERE
+            "SELECT id FROM t1 WHERE (SELECT sum(val) FROM t2 WHERE t2.t1_id = t1.id) > 100 ORDER BY id",
+            // EXISTS subquery
+            "SELECT id FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.t1_id = t1.id) ORDER BY id",
+            "SELECT id FROM t1 WHERE NOT EXISTS (SELECT 1 FROM t2 WHERE t2.t1_id = t1.id) ORDER BY id",
+            // IN subquery
+            "SELECT id FROM t1 WHERE id IN (SELECT t1_id FROM t2) ORDER BY id",
+            "SELECT id FROM t1 WHERE id NOT IN (SELECT t1_id FROM t2 WHERE t1_id IS NOT NULL) ORDER BY id",
+            // Arithmetic on aggregates
+            "SELECT count(*) + 1, sum(a) * 2 FROM t1",
+            // Multiple aggregates
+            "SELECT min(a), max(a), avg(a) FROM t1",
+            // HAVING
+            "SELECT t1_id, sum(val) AS s FROM t2 GROUP BY t1_id HAVING sum(val) > 100 ORDER BY t1_id",
+            // ORDER BY expression
+            "SELECT id, a FROM t1 ORDER BY a IS NULL, a",
+            // LIMIT with OFFSET
+            "SELECT id FROM t1 ORDER BY id LIMIT 2 OFFSET 1",
+            // UNION
+            "SELECT a FROM t1 WHERE a > 15 UNION SELECT CAST(val AS INTEGER) FROM t2 WHERE val < 100 ORDER BY 1",
+            // EXCEPT
+            "SELECT id FROM t1 EXCEPT SELECT t1_id FROM t2 ORDER BY 1",
+            // INTERSECT
+            "SELECT id FROM t1 INTERSECT SELECT t1_id FROM t2 ORDER BY 1",
+            // UNION ALL
+            "SELECT 'from_t1' AS src, id FROM t1 WHERE id <= 2 UNION ALL SELECT 'from_t2', id FROM t2 WHERE id <= 2 ORDER BY src, id",
+            // REPLACE
+            "SELECT replace('hello world', 'world', 'there')",
+            "SELECT replace('aaa', 'a', 'bb')",
+            // INSTR
+            "SELECT instr('hello world', 'world'), instr('hello', 'xyz')",
+            // HEX / QUOTE
+            "SELECT hex('ABC'), hex(NULL)",
+            "SELECT quote(1), quote('hello'), quote(NULL), quote(1.5)",
+            // typeof
+            "SELECT typeof(1), typeof(1.0), typeof('x'), typeof(NULL), typeof(X'AB')",
+            // max/min with multiple args (scalar form)
+            "SELECT max(1, 2, 3), min(1, 2, 3)",
+            "SELECT max(NULL, 2), min(NULL, 2)",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!(
+                "{} subquery/coalesce/iif conformance mismatches found",
+                mismatches.len()
+            );
+        }
+    }
+
+    /// LEFT JOIN, DISTINCT+LIMIT, complex UPDATE/DELETE, and
+    /// expression-only SELECT edge cases.
+    #[test]
+    fn test_conformance_left_join_distinct_limit() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE dept (id INTEGER PRIMARY KEY, name TEXT);",
+            "INSERT INTO dept VALUES (1, 'eng');",
+            "INSERT INTO dept VALUES (2, 'sales');",
+            "INSERT INTO dept VALUES (3, 'hr');",
+            "CREATE TABLE emp (id INTEGER PRIMARY KEY, name TEXT, dept_id INTEGER, salary INTEGER);",
+            "INSERT INTO emp VALUES (1, 'Alice', 1, 100);",
+            "INSERT INTO emp VALUES (2, 'Bob', 1, 120);",
+            "INSERT INTO emp VALUES (3, 'Carol', 2, 90);",
+            "INSERT INTO emp VALUES (4, 'Dave', NULL, 80);",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            // LEFT JOIN basics
+            "SELECT d.name, e.name FROM dept d LEFT JOIN emp e ON d.id = e.dept_id ORDER BY d.name, e.name",
+            // LEFT JOIN with NULL dept_id
+            "SELECT e.name, d.name FROM emp e LEFT JOIN dept d ON e.dept_id = d.id ORDER BY e.name",
+            // LEFT JOIN with aggregate
+            "SELECT d.name, COUNT(e.id) AS cnt FROM dept d LEFT JOIN emp e ON d.id = e.dept_id GROUP BY d.name ORDER BY d.name",
+            // LEFT JOIN with SUM
+            "SELECT d.name, SUM(e.salary) AS total FROM dept d LEFT JOIN emp e ON d.id = e.dept_id GROUP BY d.name ORDER BY d.name",
+            // LEFT JOIN with COALESCE(SUM(...), 0) — aggregate inside scalar wrapper
+            "SELECT d.name, COALESCE(SUM(e.salary), 0) AS total FROM dept d LEFT JOIN emp e ON d.id = e.dept_id GROUP BY d.name ORDER BY d.name",
+            // DISTINCT basics
+            "SELECT DISTINCT dept_id FROM emp ORDER BY dept_id",
+            // DISTINCT with LIMIT
+            "SELECT DISTINCT dept_id FROM emp ORDER BY dept_id LIMIT 2",
+            // DISTINCT with LIMIT 0
+            "SELECT DISTINCT dept_id FROM emp ORDER BY dept_id LIMIT 0",
+            // Aggregate inside expression wrapper (single-table)
+            "SELECT COALESCE(SUM(salary), 0) FROM emp",
+            // Arithmetic on aggregates
+            "SELECT COUNT(*) * 2, SUM(salary) + 100 FROM emp",
+            // CASE wrapping aggregate
+            "SELECT CASE WHEN SUM(salary) > 200 THEN 'high' ELSE 'low' END FROM emp",
+            // Expression-only SELECT edge cases
+            "SELECT 1+2, 3*4, 10/3, 10%3",
+            "SELECT -(-5), -(3.14)",
+            "SELECT 'a' < 'b', 'b' < 'a', 'a' = 'a'",
+            "SELECT 1 AND 0, 1 OR 0, NOT 1, NOT 0",
+            "SELECT NULL AND 1, NULL OR 1, NULL AND 0, NULL OR 0",
+            // UPDATE with subquery
+            "UPDATE emp SET salary = salary + 10 WHERE dept_id = (SELECT id FROM dept WHERE name = 'eng')",
+            "SELECT name, salary FROM emp WHERE dept_id = 1 ORDER BY name",
+            // DELETE with IN
+            "DELETE FROM emp WHERE dept_id IN (SELECT id FROM dept WHERE name = 'hr')",
+            "SELECT COUNT(*) FROM emp",
+            // Nested subquery in SELECT
+            "SELECT (SELECT MAX(salary) FROM emp) - (SELECT MIN(salary) FROM emp)",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!(
+                "{} left_join/distinct/limit conformance mismatches found",
+                mismatches.len()
+            );
+        }
+    }
+
+    #[test]
+    fn test_conformance_complex_patterns() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE employees (id INTEGER PRIMARY KEY, name TEXT, dept TEXT, salary INTEGER, mgr_id INTEGER);",
+            "INSERT INTO employees VALUES (1, 'Alice', 'eng', 120, NULL);",
+            "INSERT INTO employees VALUES (2, 'Bob', 'eng', 100, 1);",
+            "INSERT INTO employees VALUES (3, 'Carol', 'sales', 90, 1);",
+            "INSERT INTO employees VALUES (4, 'Dave', 'sales', 80, 3);",
+            "INSERT INTO employees VALUES (5, 'Eve', 'hr', 95, 1);",
+            "INSERT INTO employees VALUES (6, 'Frank', 'hr', 85, 5);",
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, name TEXT, lead_id INTEGER, budget REAL);",
+            "INSERT INTO projects VALUES (1, 'Alpha', 1, 50000.0);",
+            "INSERT INTO projects VALUES (2, 'Beta', 2, 30000.0);",
+            "INSERT INTO projects VALUES (3, 'Gamma', 3, 20000.0);",
+            "INSERT INTO projects VALUES (4, 'Delta', 5, 15000.0);",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            // Self-join: employees with their managers
+            "SELECT e.name, m.name AS mgr FROM employees e LEFT JOIN employees m ON e.mgr_id = m.id ORDER BY e.id",
+            // Correlated subquery: employees earning more than their dept average
+            "SELECT name FROM employees WHERE salary > (SELECT avg(salary) FROM employees e2 WHERE e2.dept = employees.dept) ORDER BY name",
+            // GROUP BY with HAVING on count
+            "SELECT dept, count(*) AS cnt FROM employees GROUP BY dept HAVING count(*) > 1 ORDER BY dept",
+            // Nested aggregate in subquery
+            "SELECT name FROM employees WHERE dept = (SELECT dept FROM employees GROUP BY dept ORDER BY sum(salary) DESC LIMIT 1) ORDER BY name",
+            // Multi-table join with aggregate
+            "SELECT e.name, count(p.id) AS proj_count FROM employees e LEFT JOIN projects p ON p.lead_id = e.id GROUP BY e.id ORDER BY e.id",
+            // CASE inside aggregate
+            "SELECT dept, sum(CASE WHEN salary >= 100 THEN 1 ELSE 0 END) AS high_earners FROM employees GROUP BY dept ORDER BY dept",
+            // CTE with join
+            "WITH dept_totals AS (SELECT dept, sum(salary) AS total FROM employees GROUP BY dept) SELECT e.name, dt.total FROM employees e JOIN dept_totals dt ON e.dept = dt.dept WHERE e.salary > 90 ORDER BY e.name",
+            // Chained CTEs
+            "WITH high_paid AS (SELECT * FROM employees WHERE salary >= 100), leads AS (SELECT DISTINCT lead_id FROM projects) SELECT h.name FROM high_paid h WHERE h.id IN (SELECT lead_id FROM leads) ORDER BY h.name",
+            // Multiple CTEs joined
+            "WITH a AS (SELECT dept, count(*) AS cnt FROM employees GROUP BY dept), b AS (SELECT dept, sum(salary) AS total FROM employees GROUP BY dept) SELECT a.dept, a.cnt, b.total FROM a JOIN b ON a.dept = b.dept ORDER BY a.dept",
+            // Expression in ORDER BY not in SELECT list
+            "SELECT name FROM employees ORDER BY salary DESC, name ASC",
+            // ORDER BY column number
+            "SELECT name, salary FROM employees ORDER BY 2 DESC, 1 ASC",
+            // LIKE patterns
+            "SELECT name FROM employees WHERE name LIKE 'A%' ORDER BY name",
+            "SELECT name FROM employees WHERE name LIKE '%a%' ORDER BY name",
+            "SELECT name FROM employees WHERE name LIKE '_o%' ORDER BY name",
+            // GLOB pattern
+            "SELECT name FROM employees WHERE name GLOB 'A*' ORDER BY name",
+            // IN with literal list
+            "SELECT name FROM employees WHERE dept IN ('eng', 'hr') ORDER BY name",
+            // NOT IN with literal list
+            "SELECT name FROM employees WHERE dept NOT IN ('eng') ORDER BY name",
+            // Compound: UNION with ORDER BY
+            "SELECT name FROM employees WHERE dept = 'eng' UNION SELECT name FROM employees WHERE salary > 90 ORDER BY name",
+            // Compound: INTERSECT
+            "SELECT name FROM employees WHERE dept = 'eng' INTERSECT SELECT name FROM employees WHERE salary > 90 ORDER BY name",
+            // Compound: EXCEPT
+            "SELECT name FROM employees WHERE salary > 80 EXCEPT SELECT name FROM employees WHERE dept = 'eng' ORDER BY name",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+
+        // Test INSERT...SELECT
+        fconn
+            .execute("CREATE TABLE emp_backup (id INTEGER PRIMARY KEY, name TEXT, dept TEXT, salary INTEGER, mgr_id INTEGER)")
+            .unwrap();
+        rconn
+            .execute_batch("CREATE TABLE emp_backup (id INTEGER PRIMARY KEY, name TEXT, dept TEXT, salary INTEGER, mgr_id INTEGER)")
+            .unwrap();
+        let insert_sel = "INSERT INTO emp_backup SELECT * FROM employees WHERE dept = 'eng'";
+        fconn.execute(insert_sel).unwrap();
+        rconn.execute_batch(insert_sel).unwrap();
+        let verify = ["SELECT * FROM emp_backup ORDER BY id"];
+        let mut dml_mismatches = oracle_compare(&fconn, &rconn, &verify);
+
+        // UPDATE with subquery in WHERE
+        let upd =
+            "UPDATE employees SET salary = salary + 10 WHERE id IN (SELECT lead_id FROM projects)";
+        fconn.execute(upd).unwrap();
+        rconn.execute_batch(upd).unwrap();
+        let verify2 = ["SELECT id, salary FROM employees ORDER BY id"];
+        dml_mismatches.extend(oracle_compare(&fconn, &rconn, &verify2));
+
+        // DELETE with subquery
+        let del =
+            "DELETE FROM emp_backup WHERE id NOT IN (SELECT id FROM employees WHERE salary > 110)";
+        fconn.execute(del).unwrap();
+        rconn.execute_batch(del).unwrap();
+        let verify3 = ["SELECT * FROM emp_backup ORDER BY id"];
+        dml_mismatches.extend(oracle_compare(&fconn, &rconn, &verify3));
+
+        let all_mismatches: Vec<String> = mismatches.into_iter().chain(dml_mismatches).collect();
+        if !all_mismatches.is_empty() {
+            for m in &all_mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!(
+                "{} complex pattern conformance mismatches found",
+                all_mismatches.len()
+            );
+        }
+    }
+
+    /// Probe LIMIT edge cases, complex expressions, nested aggregates,
+    /// multi-level subqueries, and expression-heavy ORDER BY.
+    #[test]
+    fn test_conformance_limit_expr_nested() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE data (id INTEGER PRIMARY KEY, cat TEXT, val INTEGER, note TEXT);",
+            "INSERT INTO data VALUES (1, 'a', 10, 'first');",
+            "INSERT INTO data VALUES (2, 'b', 20, 'second');",
+            "INSERT INTO data VALUES (3, 'a', 30, 'third');",
+            "INSERT INTO data VALUES (4, 'b', 40, NULL);",
+            "INSERT INTO data VALUES (5, 'c', NULL, 'fifth');",
+            "INSERT INTO data VALUES (6, 'a', 10, 'sixth');",
+            "INSERT INTO data VALUES (7, 'c', 50, 'seventh');",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            // LIMIT 0 — should return no rows
+            "SELECT * FROM data LIMIT 0",
+            "SELECT cat, count(*) FROM data GROUP BY cat LIMIT 0",
+            "SELECT DISTINCT cat FROM data LIMIT 0",
+            "SELECT id FROM data ORDER BY id LIMIT 0",
+            // LIMIT with negative (means no limit in SQLite)
+            "SELECT id FROM data ORDER BY id LIMIT -1",
+            // LIMIT with expression
+            "SELECT id FROM data ORDER BY id LIMIT 2 + 1",
+            "SELECT id FROM data ORDER BY id LIMIT 3 OFFSET 2",
+            // ORDER BY expression
+            "SELECT id, val FROM data ORDER BY val IS NULL, val DESC",
+            "SELECT id FROM data ORDER BY abs(val - 25) LIMIT 3",
+            "SELECT id, cat FROM data ORDER BY cat, id DESC",
+            // Complex WHERE with AND/OR
+            "SELECT id FROM data WHERE (cat = 'a' AND val > 10) OR cat = 'c' ORDER BY id",
+            "SELECT id FROM data WHERE NOT (cat = 'b') AND val IS NOT NULL ORDER BY id",
+            // Nested CASE in SELECT
+            "SELECT id, CASE cat WHEN 'a' THEN val * 2 WHEN 'b' THEN val + 100 ELSE 0 END AS computed FROM data WHERE val IS NOT NULL ORDER BY id",
+            // Aggregate with CASE inside
+            "SELECT cat, SUM(CASE WHEN val > 20 THEN val ELSE 0 END) AS big_sum FROM data GROUP BY cat ORDER BY cat",
+            // COUNT with filter via CASE
+            "SELECT cat, COUNT(CASE WHEN val IS NOT NULL THEN 1 END) AS non_null_count FROM data GROUP BY cat ORDER BY cat",
+            // Correlated subquery in SELECT
+            "SELECT id, (SELECT MAX(val) FROM data d2 WHERE d2.cat = data.cat) AS cat_max FROM data ORDER BY id",
+            // Correlated EXISTS
+            "SELECT id FROM data d1 WHERE EXISTS (SELECT 1 FROM data d2 WHERE d2.cat = d1.cat AND d2.id != d1.id) ORDER BY id",
+            // NOT IN with NULLs (tricky!)
+            "SELECT id FROM data WHERE cat NOT IN ('a', 'b') ORDER BY id",
+            // IN with subquery
+            "SELECT id FROM data WHERE cat IN (SELECT cat FROM data GROUP BY cat HAVING count(*) > 1) ORDER BY id",
+            // Nested arithmetic
+            "SELECT (val * 2 + 10) / 3 FROM data WHERE val IS NOT NULL ORDER BY id",
+            // String concatenation
+            "SELECT cat || '-' || CAST(val AS TEXT) FROM data WHERE val IS NOT NULL ORDER BY id",
+            // COALESCE in ORDER BY
+            "SELECT id, val FROM data ORDER BY COALESCE(val, 999), id",
+            // Multiple aggregates without GROUP BY
+            "SELECT COUNT(*), SUM(val), AVG(val), MIN(val), MAX(val) FROM data",
+            "SELECT COUNT(*), SUM(val) FROM data WHERE val > 100",
+            // GROUP BY with HAVING and ORDER BY (tiebreak with cat for determinism)
+            "SELECT cat, SUM(val) AS s FROM data GROUP BY cat HAVING SUM(val) > 20 ORDER BY s DESC, cat",
+            // Aggregate over empty set
+            "SELECT COUNT(*), SUM(val), MIN(val), MAX(val), TOTAL(val) FROM data WHERE id > 100",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!(
+                "{} limit/expr/nested conformance mismatches found",
+                mismatches.len()
+            );
+        }
+    }
+
+    /// Probe INSERT/UPDATE/DELETE with RETURNING, complex UPDATE with
+    /// subqueries, and multi-table DML patterns.
+    #[test]
+    fn test_conformance_dml_returning_complex() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE stock (id INTEGER PRIMARY KEY, item TEXT NOT NULL, qty INTEGER DEFAULT 0, price REAL);",
+            "INSERT INTO stock VALUES (1, 'Widget', 100, 9.99);",
+            "INSERT INTO stock VALUES (2, 'Gadget', 50, 24.95);",
+            "INSERT INTO stock VALUES (3, 'Doohickey', 200, 4.50);",
+            "INSERT INTO stock VALUES (4, 'Thingamajig', 0, 99.99);",
+            "CREATE TABLE orders (id INTEGER PRIMARY KEY, stock_id INTEGER, qty INTEGER, ts TEXT DEFAULT 'now');",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let mut mismatches = Vec::new();
+
+        // -- DML sequences: run same ops on both, then compare SELECT results --
+
+        let dml_ops = [
+            // INSERT with DEFAULT
+            "INSERT INTO orders (stock_id, qty) VALUES (1, 10)",
+            "INSERT INTO orders (stock_id, qty) VALUES (2, 5)",
+            "INSERT INTO orders (stock_id, qty) VALUES (1, 3)",
+            // UPDATE with arithmetic
+            "UPDATE stock SET qty = qty - 10 WHERE id = 1",
+            // UPDATE with subquery in WHERE
+            "UPDATE stock SET qty = qty - 5 WHERE id IN (SELECT stock_id FROM orders WHERE qty >= 5)",
+            // DELETE
+            "DELETE FROM orders WHERE qty < 5",
+        ];
+        for op in &dml_ops {
+            fconn.execute(op).unwrap();
+            rconn.execute_batch(op).unwrap();
+        }
+
+        let verify = [
+            "SELECT * FROM stock ORDER BY id",
+            "SELECT * FROM orders ORDER BY id",
+            // JOIN after DML
+            "SELECT s.item, o.qty FROM stock s JOIN orders o ON s.id = o.stock_id ORDER BY s.item, o.qty",
+            // Aggregate after DML
+            "SELECT stock_id, SUM(qty) FROM orders GROUP BY stock_id ORDER BY stock_id",
+            // Computed column
+            "SELECT item, qty * price AS inventory_value FROM stock ORDER BY id",
+            // Subquery in SELECT after DML
+            "SELECT item, (SELECT COALESCE(SUM(qty), 0) FROM orders WHERE stock_id = stock.id) AS total_ordered FROM stock ORDER BY id",
+        ];
+
+        mismatches.extend(oracle_compare(&fconn, &rconn, &verify));
+
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!(
+                "{} DML/returning conformance mismatches found",
+                mismatches.len()
+            );
+        }
+    }
+
+    /// Probe recursive CTEs, VALUES clause, multi-way JOINs, self-joins,
+    /// and LEFT/CROSS JOIN semantics.
+    #[test]
+    fn test_conformance_join_cte_advanced() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE emp (id INTEGER PRIMARY KEY, name TEXT, mgr_id INTEGER, dept TEXT, salary INTEGER);",
+            "INSERT INTO emp VALUES (1, 'Alice', NULL, 'eng', 100000);",
+            "INSERT INTO emp VALUES (2, 'Bob', 1, 'eng', 90000);",
+            "INSERT INTO emp VALUES (3, 'Carol', 1, 'eng', 95000);",
+            "INSERT INTO emp VALUES (4, 'Dave', 2, 'sales', 80000);",
+            "INSERT INTO emp VALUES (5, 'Eve', NULL, 'sales', 110000);",
+            "INSERT INTO emp VALUES (6, 'Frank', 5, 'sales', 75000);",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            // Self-join: find manager name
+            "SELECT e.name, m.name AS manager FROM emp e LEFT JOIN emp m ON e.mgr_id = m.id ORDER BY e.id",
+            // COUNT with LEFT JOIN
+            "SELECT m.name, COUNT(e.id) AS reports FROM emp m LEFT JOIN emp e ON e.mgr_id = m.id GROUP BY m.id ORDER BY m.name",
+            // Recursive CTE: org hierarchy
+            "WITH RECURSIVE chain(id, name, depth) AS (SELECT id, name, 0 FROM emp WHERE mgr_id IS NULL UNION ALL SELECT e.id, e.name, c.depth + 1 FROM emp e JOIN chain c ON e.mgr_id = c.id) SELECT name, depth FROM chain ORDER BY depth, name",
+            // Recursive CTE: counting
+            "WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM cnt WHERE x < 5) SELECT x FROM cnt",
+            // Recursive CTE: fibonacci
+            "WITH RECURSIVE fib(a, b) AS (SELECT 0, 1 UNION ALL SELECT b, a + b FROM fib WHERE b < 100) SELECT a FROM fib",
+            // Multi-column GROUP BY
+            "SELECT dept, CASE WHEN salary > 90000 THEN 'senior' ELSE 'junior' END AS level, COUNT(*) FROM emp GROUP BY dept, 2 ORDER BY dept, level",
+            // CROSS JOIN (small tables)
+            "SELECT a.id, b.id FROM (SELECT 1 AS id UNION ALL SELECT 2) a CROSS JOIN (SELECT 10 AS id UNION ALL SELECT 20) b ORDER BY a.id, b.id",
+            // Subquery as table source
+            "SELECT sub.dept, sub.avg_sal FROM (SELECT dept, AVG(salary) AS avg_sal FROM emp GROUP BY dept) sub ORDER BY sub.dept",
+            // HAVING with expression
+            "SELECT dept, AVG(salary) AS avg_s FROM emp GROUP BY dept HAVING AVG(salary) > 85000 ORDER BY dept",
+            // WHERE with subquery comparison
+            "SELECT name FROM emp WHERE salary > (SELECT AVG(salary) FROM emp) ORDER BY name",
+            // Multiple CTEs
+            "WITH eng AS (SELECT * FROM emp WHERE dept = 'eng'), sales AS (SELECT * FROM emp WHERE dept = 'sales') SELECT eng.name, sales.name FROM eng CROSS JOIN sales WHERE eng.salary > sales.salary ORDER BY eng.name, sales.name",
+            // UNION of JOINed queries
+            "SELECT 'has_mgr' AS type, name FROM emp WHERE mgr_id IS NOT NULL UNION ALL SELECT 'no_mgr', name FROM emp WHERE mgr_id IS NULL ORDER BY type, name",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!("{} join/CTE conformance mismatches found", mismatches.len());
         }
     }
 }
