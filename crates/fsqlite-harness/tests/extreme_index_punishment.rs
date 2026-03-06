@@ -13,7 +13,6 @@ fn test_extreme_index_punishment() {
     setup
         .execute_batch(
             "PRAGMA journal_mode=WAL;
-         PRAGMA wal_autocheckpoint=0;
          PRAGMA busy_timeout=5000;
          CREATE TABLE items (id INTEGER PRIMARY KEY, category INTEGER, data TEXT);
          CREATE INDEX idx_category ON items(category);",
@@ -30,10 +29,7 @@ fn test_extreme_index_punishment() {
         let path = db.clone();
         handles.push(thread::spawn(move || -> Result<(), String> {
             let conn = Connection::open(&path).map_err(|e| format!("{:?}", e))?;
-            conn.execute_batch(
-                "PRAGMA wal_autocheckpoint=0;
-                 PRAGMA busy_timeout=5000;",
-            )
+            conn.execute_batch("PRAGMA busy_timeout=5000;")
                 .map_err(|e| format!("{:?}", e))?;
             bar.wait();
 

@@ -218,6 +218,20 @@ impl BtreePageHeader {
     }
 }
 
+/// Parse a B-tree page header using the canonical header offset for `page_no`
+/// and attach page-number context to corruption errors.
+pub fn parse_page_header(page: &[u8], page_no: PageNumber) -> Result<BtreePageHeader> {
+    let header_offset = header_offset_for_page(page_no);
+    BtreePageHeader::parse(page, header_offset).map_err(|error| FrankenError::DatabaseCorrupt {
+        detail: format!(
+            "failed to parse B-tree page {} at header offset {}: {}",
+            page_no.get(),
+            header_offset,
+            error
+        ),
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Cell pointer array helpers
 // ---------------------------------------------------------------------------

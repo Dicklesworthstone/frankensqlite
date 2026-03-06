@@ -6962,23 +6962,35 @@ fn opcode_register_spans(op: &VdbeOp) -> OpcodeRegisterSpans {
 
 // ── Arithmetic helpers ──────────────────────────────────────────────────────
 
+/// Mirrors C SQLite `numericType()` (vdbe.c:496): returns true if BOTH
+/// operands should be treated as integers for arithmetic purposes.
+/// Text/Blob that parse as i64 are integer-typed; Float is not.
+fn both_integer_numeric_type(a: &SqliteValue, b: &SqliteValue) -> bool {
+    a.is_integer_numeric_type() && b.is_integer_numeric_type()
+}
+
 /// SQL division with NULL propagation and division-by-zero handling.
-#[allow(clippy::cast_precision_loss)]
 #[allow(clippy::cast_precision_loss)]
 fn sql_div(dividend: &SqliteValue, divisor: &SqliteValue) -> SqliteValue {
     if dividend.is_null() || divisor.is_null() {
         return SqliteValue::Null;
     }
-    if let (SqliteValue::Integer(a), SqliteValue::Integer(b)) = (dividend, divisor) {
-        if *b == 0 {
+    // C SQLite numericType() coercion (vdbe.c:1932-1934): if both operands
+    // are integer-typed (including text that parses as integer), use int math.
+    let both_int = both_integer_numeric_type(dividend, divisor);
+    if both_int {
+        let a = dividend.to_integer();
+        let b = divisor.to_integer();
+        if b == 0 {
             SqliteValue::Null
         } else {
-            match a.checked_div(*b) {
+            match a.checked_div(b) {
                 Some(result) => SqliteValue::Integer(result),
                 // i64::MIN / -1 overflows; C SQLite promotes to float via
                 // `goto fp_math` (vdbe.c:1916), NOT wrapping.
+                #[allow(clippy::cast_precision_loss)]
                 None => {
-                    let result = *a as f64 / *b as f64;
+                    let result = a as f64 / b as f64;
                     if result.is_nan() {
                         SqliteValue::Null
                     } else {
@@ -7007,15 +7019,14 @@ fn sql_div(dividend: &SqliteValue, divisor: &SqliteValue) -> SqliteValue {
 /// C SQLite (vdbe.c:1920): when both operands are MEM_Int, result is Integer.
 /// When either is Float/Text/Blob, fp_math path casts to integer for the
 /// modulo but stores the result as Float (MEM_Real).
+/// C SQLite `numericType()` coercion: text that parses as integer is treated
+/// as integer for the both-int check (vdbe.c:1932-1934).
 #[allow(clippy::cast_precision_loss)]
 fn sql_rem(dividend: &SqliteValue, divisor: &SqliteValue) -> SqliteValue {
     if dividend.is_null() || divisor.is_null() {
         return SqliteValue::Null;
     }
-    let both_int = matches!(
-        (dividend, divisor),
-        (SqliteValue::Integer(_), SqliteValue::Integer(_))
-    );
+    let both_int = both_integer_numeric_type(dividend, divisor);
     let a = dividend.to_integer();
     let b = divisor.to_integer();
     if b == 0 {
@@ -7105,23 +7116,6 @@ fn sql_or(a: &SqliteValue, b: &SqliteValue) -> SqliteValue {
     }
 }
 
-/// Convert a float to i64 with clamping, matching C SQLite's `doubleToInt64`.
-///
-/// - Inf → i64::MAX, -Inf → i64::MIN, NaN → 0
-/// - Finite values truncate toward zero, clamped to i64 range.
-#[allow(clippy::cast_possible_truncation)]
-fn cast_float_to_i64(f: f64) -> i64 {
-    if f.is_nan() {
-        0
-    } else if f >= i64::MAX as f64 {
-        i64::MAX
-    } else if f <= i64::MIN as f64 {
-        i64::MIN
-    } else {
-        f as i64
-    }
-}
-
 /// Scan the leading numeric prefix from a byte slice.
 ///
 /// Recognises `[+-]? [0-9]* ('.' [0-9]*)? ([eE] [+-]? [0-9]+)?`.
@@ -7170,6 +7164,38 @@ fn scan_numeric_prefix(bytes: &[u8]) -> usize {
     i
 }
 
+/// Parse the text/blob prefix used by `CAST(... AS INTEGER)`.
+///
+/// SQLite only consumes an optional sign followed by decimal digits here.
+/// Decimal points and exponents terminate the parse instead of contributing to
+/// the numeric value.
+fn parse_cast_integer_prefix(s: &str) -> i64 {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return 0;
+    }
+
+    let bytes = trimmed.as_bytes();
+    let mut end = 0;
+    if matches!(bytes.first(), Some(b'+') | Some(b'-')) {
+        end = 1;
+    }
+    let digit_start = end;
+    while end < bytes.len() && bytes[end].is_ascii_digit() {
+        end += 1;
+    }
+    if end == digit_start {
+        return 0;
+    }
+
+    let prefix = &trimmed[..end];
+    match prefix.parse::<i64>() {
+        Ok(value) => value,
+        Err(_) if prefix.starts_with('-') => i64::MIN,
+        Err(_) => i64::MAX,
+    }
+}
+
 /// SQL CAST operation (p2 encodes target type).
 fn sql_cast(val: SqliteValue, target: i32) -> SqliteValue {
     if val.is_null() {
@@ -7202,37 +7228,12 @@ fn sql_cast(val: SqliteValue, target: i32) -> SqliteValue {
                 other => SqliteValue::Text(other.to_text()),
             }
         }
-        b'C' | b'c' => val.apply_affinity(fsqlite_types::TypeAffinity::Numeric),
+        b'C' | b'c' => val.cast_to_numeric(),
         b'D' | b'd' => {
-            // C SQLite: CAST('123abc' AS INTEGER) parses leading numeric prefix.
+            // C SQLite integer casts from text/blob consume only the signed
+            // integer prefix; decimal/exponent syntax is ignored.
             match &val {
-                SqliteValue::Text(s) => {
-                    let trimmed = s.trim();
-                    let bytes = trimmed.as_bytes();
-                    let end = scan_numeric_prefix(bytes);
-                    // Full-string numeric match (rejects Rust's "nan"/"inf" parsing).
-                    if end == trimmed.len() && end > 0 {
-                        if let Ok(i) = trimmed.parse::<i64>() {
-                            return SqliteValue::Integer(i);
-                        }
-                        #[allow(clippy::cast_possible_truncation)]
-                        if let Ok(f) = trimmed.parse::<f64>() {
-                            return SqliteValue::Integer(cast_float_to_i64(f));
-                        }
-                    }
-                    // Prefix match for strings with trailing non-numeric text.
-                    if end > 0 {
-                        let prefix = &trimmed[..end];
-                        if let Ok(i) = prefix.parse::<i64>() {
-                            return SqliteValue::Integer(i);
-                        }
-                        #[allow(clippy::cast_possible_truncation)]
-                        if let Ok(f) = prefix.parse::<f64>() {
-                            return SqliteValue::Integer(cast_float_to_i64(f));
-                        }
-                    }
-                    SqliteValue::Integer(0)
-                }
+                SqliteValue::Text(s) => SqliteValue::Integer(parse_cast_integer_prefix(s)),
                 _ => SqliteValue::Integer(val.to_integer()),
             }
         }
@@ -8921,6 +8922,63 @@ mod tests {
     }
 
     #[test]
+    fn test_divide_text_prefix_uses_integer_path() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r_divisor = b.alloc_reg();
+            let r_dividend = b.alloc_reg();
+            let r_result = b.alloc_reg();
+            b.emit_op(Opcode::Integer, 2, r_divisor, 0, P4::None, 0);
+            b.emit_op(
+                Opcode::String8,
+                0,
+                r_dividend,
+                0,
+                P4::Str("123abc".to_owned()),
+                0,
+            );
+            b.emit_op(Opcode::Divide, r_divisor, r_dividend, r_result, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_result, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows[0], vec![SqliteValue::Integer(61)]);
+    }
+
+    #[test]
+    fn test_remainder_blob_prefix_uses_integer_path() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r_divisor = b.alloc_reg();
+            let r_dividend = b.alloc_reg();
+            let r_result = b.alloc_reg();
+            b.emit_op(Opcode::Integer, 2, r_divisor, 0, P4::None, 0);
+            b.emit_op(
+                Opcode::Blob,
+                4,
+                r_dividend,
+                0,
+                P4::Blob(b"123a".to_vec()),
+                0,
+            );
+            b.emit_op(
+                Opcode::Remainder,
+                r_divisor,
+                r_dividend,
+                r_result,
+                P4::None,
+                0,
+            );
+            b.emit_op(Opcode::ResultRow, r_result, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows[0], vec![SqliteValue::Integer(1)]);
+    }
+
+    #[test]
     fn test_null_arithmetic_propagation() {
         // NULL + 1, NULL * 5, NULL - 3 should all be NULL.
         let rows = run_program(|b| {
@@ -9760,7 +9818,8 @@ mod tests {
 
     #[test]
     fn test_cast_text_sci_notation_to_integer() {
-        // Regression: CAST('1.5e2abc' AS INTEGER) must yield 150, not 1.
+        // SQLite integer casts ignore exponent syntax in text and consume only
+        // the signed integer prefix.
         let rows = run_program(|b| {
             let end = b.emit_label();
             b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
@@ -9771,7 +9830,22 @@ mod tests {
             b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
             b.resolve_label(end);
         });
-        assert_eq!(rows[0], vec![SqliteValue::Integer(150)]);
+        assert_eq!(rows[0], vec![SqliteValue::Integer(1)]);
+    }
+
+    #[test]
+    fn test_cast_text_huge_exponent_to_integer_ignores_exponent() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r = b.alloc_reg();
+            b.emit_op(Opcode::String8, 0, r, 0, P4::Str("1e999".to_owned()), 0);
+            b.emit_op(Opcode::Cast, r, 68, 0, P4::None, 0); // 'D' = INTEGER
+            b.emit_op(Opcode::ResultRow, r, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(rows[0], vec![SqliteValue::Integer(1)]);
     }
 
     #[test]
@@ -9804,6 +9878,34 @@ mod tests {
             b.resolve_label(end);
         });
         assert_eq!(rows[0], vec![SqliteValue::Float(2500.0)]);
+    }
+
+    #[test]
+    fn test_cast_text_prefix_to_numeric() {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r1 = b.alloc_reg();
+            let r2 = b.alloc_reg();
+            let r3 = b.alloc_reg();
+            b.emit_op(Opcode::String8, 0, r1, 0, P4::Str("123abc".to_owned()), 0);
+            b.emit_op(Opcode::String8, 0, r2, 0, P4::Str("1.5e2abc".to_owned()), 0);
+            b.emit_op(Opcode::String8, 0, r3, 0, P4::Str("abc".to_owned()), 0);
+            b.emit_op(Opcode::Cast, r1, 67, 0, P4::None, 0); // 'C' = NUMERIC
+            b.emit_op(Opcode::Cast, r2, 67, 0, P4::None, 0);
+            b.emit_op(Opcode::Cast, r3, 67, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r1, 3, 0, P4::None, 0);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        assert_eq!(
+            rows[0],
+            vec![
+                SqliteValue::Integer(123),
+                SqliteValue::Integer(150),
+                SqliteValue::Integer(0),
+            ]
+        );
     }
 
     #[test]

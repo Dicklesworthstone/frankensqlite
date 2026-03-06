@@ -13,8 +13,8 @@
 //! the cursor position and page state.
 
 use crate::cell::{
-    BtreePageHeader, BtreePageType, CellRef, header_offset_for_page, read_cell_pointers,
-    write_cell_pointers,
+    BtreePageHeader, BtreePageType, CellRef, header_offset_for_page, parse_page_header,
+    read_cell_pointers, write_cell_pointers,
 };
 use crate::cursor::PageWriter;
 use fsqlite_error::{FrankenError, Result};
@@ -92,7 +92,7 @@ pub fn balance_deeper<W: PageWriter>(
 ) -> Result<PageNumber> {
     let root_data = writer.read_page(cx, root_page_no)?;
     let root_offset = header_offset_for_page(root_page_no);
-    let root_header = BtreePageHeader::parse(&root_data, root_offset)?;
+    let root_header = parse_page_header(&root_data, root_page_no)?;
 
     // Extract cells from the root page safely to avoid offset shifting bugs.
     let cell_ptrs = read_cell_pointers(&root_data, &root_header, root_offset)?;
@@ -184,7 +184,7 @@ pub fn balance_quick<W: PageWriter>(
     // Read parent page to check for space.
     let parent_data = writer.read_page(cx, parent_page_no)?;
     let parent_offset = header_offset_for_page(parent_page_no);
-    let parent_header = BtreePageHeader::parse(&parent_data, parent_offset)?;
+    let parent_header = parse_page_header(&parent_data, parent_page_no)?;
 
     // Calculate required space for the divider cell.
     // Divider: [4-byte child ptr] [rowid varint]
@@ -255,7 +255,7 @@ pub fn balance_quick<W: PageWriter>(
     // Read the existing leaf to find the divider key (its rightmost rowid).
     let leaf_data = writer.read_page(cx, leaf_page_no)?;
     let leaf_offset = header_offset_for_page(leaf_page_no);
-    let leaf_header = BtreePageHeader::parse(&leaf_data, leaf_offset)?;
+    let leaf_header = parse_page_header(&leaf_data, leaf_page_no)?;
     let leaf_ptrs = read_cell_pointers(&leaf_data, &leaf_header, leaf_offset)?;
 
     let divider_rowid = if leaf_header.cell_count > 0 {
@@ -327,7 +327,7 @@ pub(crate) fn balance_nonroot<W: PageWriter>(
 ) -> Result<BalanceResult> {
     let parent_data = writer.read_page(cx, parent_page_no)?;
     let parent_offset = header_offset_for_page(parent_page_no);
-    let parent_header = BtreePageHeader::parse(&parent_data, parent_offset)?;
+    let parent_header = parse_page_header(&parent_data, parent_page_no)?;
     let parent_ptrs = read_cell_pointers(&parent_data, &parent_header, parent_offset)?;
 
     let total_children = parent_header.cell_count as usize + 1;
@@ -376,7 +376,7 @@ pub(crate) fn balance_nonroot<W: PageWriter>(
     for (sib_idx, &pgno) in sibling_pgnos.iter().enumerate() {
         let page_data = writer.read_page(cx, pgno)?;
         let page_offset = header_offset_for_page(pgno);
-        let page_header = BtreePageHeader::parse(&page_data, page_offset)?;
+        let page_header = parse_page_header(&page_data, pgno)?;
         let ptrs = read_cell_pointers(&page_data, &page_header, page_offset)?;
 
         sibling_types.push(page_header.page_type);
@@ -1096,7 +1096,7 @@ fn insert_cell_into_page<W: PageWriter>(
 ) -> Result<()> {
     let mut page_data = writer.read_page(cx, page_no)?;
     let offset = header_offset_for_page(page_no);
-    let mut header = BtreePageHeader::parse(&page_data, offset)?;
+    let mut header = parse_page_header(&page_data, page_no)?;
     let mut ptrs = read_cell_pointers(&page_data, &header, offset)?;
 
     let cell_len = cell_data.len();
@@ -1156,7 +1156,7 @@ pub(crate) fn apply_child_replacement<W: PageWriter>(
 ) -> Result<BalanceResult> {
     let page_data = writer.read_page(cx, parent_page_no)?;
     let offset = header_offset_for_page(parent_page_no);
-    let header = BtreePageHeader::parse(&page_data, offset)?;
+    let header = parse_page_header(&page_data, parent_page_no)?;
     let ptrs = read_cell_pointers(&page_data, &header, offset)?;
     let total_children = header.cell_count as usize + 1;
     let touches_rightmost = first_child + old_sibling_count == total_children;
@@ -1341,7 +1341,7 @@ fn balance_shallower<W: PageWriter>(
     let child_data = writer.read_page(cx, child_pgno)?;
     let root_offset = header_offset_for_page(root_page_no);
     let child_offset = header_offset_for_page(child_pgno);
-    let child_header = BtreePageHeader::parse(&child_data, child_offset)?;
+    let child_header = parse_page_header(&child_data, child_pgno)?;
 
     // Rebuild child cells using the root's header offset. This handles page-1
     // (100-byte header) safely and avoids raw offset shifting pitfalls.

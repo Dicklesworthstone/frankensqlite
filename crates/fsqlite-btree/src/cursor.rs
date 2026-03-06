@@ -512,17 +512,7 @@ impl<P: PageReader> BtCursor<P> {
     fn load_page(&mut self, cx: &Cx, page_no: PageNumber) -> Result<StackEntry> {
         let page_data = self.pager.read_page(cx, page_no)?;
         let header_offset = cell::header_offset_for_page(page_no);
-        let header =
-            BtreePageHeader::parse(&page_data, header_offset).map_err(|error| {
-                FrankenError::DatabaseCorrupt {
-                    detail: format!(
-                        "failed to parse B-tree page {} at header offset {}: {}",
-                        page_no.get(),
-                        header_offset,
-                        error
-                    ),
-                }
-            })?;
+        let header = cell::parse_page_header(&page_data, page_no)?;
         let cell_pointers = cell::read_cell_pointers(&page_data, &header, header_offset)?;
         self.note_page_visit(page_no);
 
@@ -1386,7 +1376,7 @@ impl<P: PageWriter> BtCursor<P> {
 
         let mut page_data = self.pager.read_page(cx, leaf_page_no)?;
         let header_offset = cell::header_offset_for_page(leaf_page_no);
-        let mut header = BtreePageHeader::parse(&page_data, header_offset)?;
+        let mut header = cell::parse_page_header(&page_data, leaf_page_no)?;
         let mut ptrs = cell::read_cell_pointers(&page_data, &header, header_offset)?;
 
         let content_offset = header.content_offset(self.usable_size);
@@ -1627,8 +1617,7 @@ impl<P: PageWriter> BtCursor<P> {
             // Check whether the parent now has zero cells — if so, it
             // needs to be merged with its siblings at the next level up.
             let parent_data = self.pager.read_page(cx, parent_page_no)?;
-            let parent_offset = cell::header_offset_for_page(parent_page_no);
-            let parent_header = cell::BtreePageHeader::parse(&parent_data, parent_offset)?;
+            let parent_header = cell::parse_page_header(&parent_data, parent_page_no)?;
 
             if parent_header.cell_count == 0 && parent_header.page_type.is_interior() {
                 level -= 1;
@@ -1689,7 +1678,7 @@ impl<P: PageWriter> BtCursor<P> {
         // Remove old cell from page and try to insert new cell.
         let mut page_data = self.pager.read_page(cx, page_no)?;
         let header_offset = cell::header_offset_for_page(page_no);
-        let mut header = BtreePageHeader::parse(&page_data, header_offset)?;
+        let mut header = cell::parse_page_header(&page_data, page_no)?;
         let mut ptrs = cell::read_cell_pointers(&page_data, &header, header_offset)?;
         let cell_idx_usize = usize::from(cell_idx);
         if cell_idx_usize >= ptrs.len() {
@@ -1820,7 +1809,7 @@ impl<P: PageWriter> BtCursor<P> {
         let leaf_page_no = top.page_no;
         let mut page_data = self.pager.read_page(cx, leaf_page_no)?;
         let header_offset = cell::header_offset_for_page(leaf_page_no);
-        let mut header = BtreePageHeader::parse(&page_data, header_offset)?;
+        let mut header = cell::parse_page_header(&page_data, leaf_page_no)?;
         let mut ptrs = cell::read_cell_pointers(&page_data, &header, header_offset)?;
         if delete_idx >= ptrs.len() {
             return Err(FrankenError::DatabaseCorrupt {

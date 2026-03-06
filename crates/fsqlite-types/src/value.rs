@@ -3,6 +3,55 @@ use std::fmt;
 
 use crate::{StorageClass, StrictColumnType, StrictTypeError, TypeAffinity};
 
+/// Scan the longest SQLite numeric prefix from a byte slice.
+///
+/// Recognises `[+-]? [0-9]* ('.' [0-9]*)? ([eE] [+-]? [0-9]+)?`.
+/// Returns the byte offset where the prefix ends, or 0 if no numeric prefix
+/// is present.
+fn scan_numeric_prefix(bytes: &[u8]) -> usize {
+    if bytes.is_empty() {
+        return 0;
+    }
+
+    let mut i = 0usize;
+    if bytes[i] == b'+' || bytes[i] == b'-' {
+        i += 1;
+    }
+
+    let digit_start = i;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+
+    if i < bytes.len() && bytes[i] == b'.' {
+        i += 1;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+    }
+
+    if i == digit_start {
+        return 0;
+    }
+
+    if i < bytes.len() && (bytes[i] == b'e' || bytes[i] == b'E') {
+        let exp_start = i;
+        i += 1;
+        if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') {
+            i += 1;
+        }
+        if i < bytes.len() && bytes[i].is_ascii_digit() {
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+        } else {
+            i = exp_start;
+        }
+    }
+
+    i
+}
+
 /// Parse the longest numeric prefix of `s` as an integer, matching SQLite's
 /// `sqlite3Atoi64` behavior. Leading whitespace is skipped, an optional sign
 /// is consumed, then decimal digits. If the prefix includes a decimal point
@@ -10,12 +59,13 @@ use crate::{StorageClass, StrictColumnType, StrictTypeError, TypeAffinity};
 /// prefix is found.
 #[allow(clippy::cast_possible_truncation)]
 fn parse_integer_prefix(s: &str) -> i64 {
-    let f = parse_float_prefix(s);
-    if f == 0.0 && !s.trim_start().starts_with('0') {
-        // Fast path: no numeric prefix at all.
-        // But first check if it starts with "0" (which is valid and returns 0).
+    let trimmed = s.trim_start();
+    let end = scan_numeric_prefix(trimmed.as_bytes());
+    if end == 0 {
         return 0;
     }
+
+    let f = trimmed[..end].parse::<f64>().unwrap_or(0.0);
     // Clamp to i64 range, matching SQLite behavior for overflow.
     #[allow(clippy::manual_clamp)]
     if f >= i64::MAX as f64 {
@@ -30,100 +80,51 @@ fn parse_integer_prefix(s: &str) -> i64 {
 /// Parse the longest numeric prefix of `s` as a float, matching SQLite's
 /// `sqlite3AtoF` behavior. Leading whitespace is skipped. Recognizes:
 /// optional sign, digits, optional decimal point + digits, optional
-/// exponent (e/E + optional sign + digits). Also handles `0x` hex prefix.
-/// Returns 0.0 if no numeric prefix is found. Does NOT recognize
-/// "nan"/"inf"/"infinity" (matching C SQLite).
+/// exponent (e/E + optional sign + digits). Returns 0.0 if no numeric prefix
+/// is found. Does NOT recognize "nan"/"inf"/"infinity" or text hex forms
+/// like `"0x10"` (matching C SQLite coercion rules).
 fn parse_float_prefix(s: &str) -> f64 {
-    let s = s.trim_start();
-    if s.is_empty() {
+    let trimmed = s.trim_start();
+    let end = scan_numeric_prefix(trimmed.as_bytes());
+    if end == 0 {
         return 0.0;
     }
 
-    let bytes = s.as_bytes();
-    let mut i = 0;
-
-    // Optional sign
-    if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') {
-        i += 1;
-    }
-
-    // Check for hex prefix 0x/0X
-    if i + 1 < bytes.len() && bytes[i] == b'0' && (bytes[i + 1] == b'x' || bytes[i + 1] == b'X') {
-        return parse_hex_prefix(s);
-    }
-
-    let start = i;
-
-    // Integer digits
-    while i < bytes.len() && bytes[i].is_ascii_digit() {
-        i += 1;
-    }
-
-    // Decimal point + fractional digits
-    if i < bytes.len() && bytes[i] == b'.' {
-        i += 1;
-        while i < bytes.len() && bytes[i].is_ascii_digit() {
-            i += 1;
-        }
-    }
-
-    // Must have consumed at least one digit
-    if i == start {
-        return 0.0;
-    }
-
-    // Exponent
-    if i < bytes.len() && (bytes[i] == b'e' || bytes[i] == b'E') {
-        let mut j = i + 1;
-        if j < bytes.len() && (bytes[j] == b'+' || bytes[j] == b'-') {
-            j += 1;
-        }
-        // Need at least one digit after e
-        if j < bytes.len() && bytes[j].is_ascii_digit() {
-            j += 1;
-            while j < bytes.len() && bytes[j].is_ascii_digit() {
-                j += 1;
-            }
-            i = j;
-        }
-    }
-
-    // Parse the extracted prefix
-    s[..i].parse::<f64>().unwrap_or(0.0)
+    trimmed[..end].parse::<f64>().unwrap_or(0.0)
 }
 
-/// Parse a hex-prefixed string (0x...) as a float, matching SQLite behavior.
-fn parse_hex_prefix(s: &str) -> f64 {
-    let bytes = s.as_bytes();
-    let negative = !bytes.is_empty() && bytes[0] == b'-';
-    let skip = if !bytes.is_empty() && (bytes[0] == b'+' || bytes[0] == b'-') {
-        3 // sign + "0x"
-    } else {
-        2 // "0x"
-    };
-
-    let mut val: u64 = 0;
-    let mut i = skip;
-    let mut any_digit = false;
-    while i < bytes.len() {
-        let d = match bytes[i] {
-            b'0'..=b'9' => bytes[i] - b'0',
-            b'a'..=b'f' => bytes[i] - b'a' + 10,
-            b'A'..=b'F' => bytes[i] - b'A' + 10,
-            _ => break,
-        };
-        any_digit = true;
-        val = val.wrapping_mul(16).wrapping_add(u64::from(d));
-        i += 1;
+fn cast_text_prefix_to_numeric(s: &str) -> SqliteValue {
+    let trimmed = s.trim();
+    let end = scan_numeric_prefix(trimmed.as_bytes());
+    if end == 0 {
+        return SqliteValue::Integer(0);
     }
 
-    if !any_digit {
-        return 0.0;
+    let prefix = &trimmed[..end];
+    let is_integer_syntax = !prefix
+        .as_bytes()
+        .iter()
+        .any(|byte| matches!(*byte, b'.' | b'e' | b'E'));
+
+    if is_integer_syntax && let Ok(value) = prefix.parse::<i64>() {
+        return SqliteValue::Integer(value);
     }
 
-    #[allow(clippy::cast_precision_loss)]
-    let f = val as f64;
-    if negative { -f } else { f }
+    if let Ok(value) = prefix.parse::<f64>() {
+        if value.is_finite()
+            && (-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&value)
+        {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+            let truncated = value as i64;
+            #[allow(clippy::float_cmp, clippy::cast_precision_loss)]
+            if truncated as f64 == value {
+                return SqliteValue::Integer(truncated);
+            }
+        }
+        return SqliteValue::Float(value);
+    }
+
+    SqliteValue::Integer(0)
 }
 
 /// A dynamically-typed SQLite value.
@@ -362,6 +363,22 @@ impl SqliteValue {
         }
     }
 
+    /// Convert to NUMERIC using SQLite CAST semantics rather than affinity.
+    ///
+    /// Unlike NUMERIC affinity, CAST always produces a numeric storage class for
+    /// text/blob input, using the longest leading numeric prefix or `0` when no
+    /// numeric prefix exists.
+    #[must_use]
+    pub fn cast_to_numeric(&self) -> Self {
+        match self {
+            Self::Null => Self::Null,
+            Self::Integer(i) => Self::Integer(*i),
+            Self::Float(f) => Self::Float(*f),
+            Self::Text(s) => cast_text_prefix_to_numeric(s),
+            Self::Blob(b) => cast_text_prefix_to_numeric(&String::from_utf8_lossy(b)),
+        }
+    }
+
     /// Returns the SQLite `typeof()` string for this value.
     ///
     /// Matches C sqlite3: "null", "integer", "real", "text", or "blob".
@@ -416,12 +433,37 @@ impl SqliteValue {
         }
     }
 
+    /// Mirrors C SQLite's `numericType()` (vdbe.c:496): returns true if this
+    /// value should be treated as an integer for arithmetic purposes.
+    ///
+    /// Integer values are obviously integer-typed. Text/Blob values that parse
+    /// as i64 are also integer-typed. Float and Null are not.
+    pub fn is_integer_numeric_type(&self) -> bool {
+        fn text_is_integer_numeric_type(s: &str) -> bool {
+            let trimmed = s.trim_start();
+            let end = scan_numeric_prefix(trimmed.as_bytes());
+            end > 0
+                && !trimmed[..end]
+                    .as_bytes()
+                    .iter()
+                    .any(|byte| matches!(*byte, b'.' | b'e' | b'E'))
+        }
+
+        match self {
+            Self::Integer(_) => true,
+            Self::Float(_) | Self::Null => false,
+            Self::Text(s) => text_is_integer_numeric_type(s),
+            Self::Blob(b) => text_is_integer_numeric_type(&String::from_utf8_lossy(b)),
+        }
+    }
+
     /// Add two values following SQLite's overflow semantics.
     ///
     /// - Integer + Integer: checked add; overflows promote to REAL.
     /// - Any REAL operand: float addition.
     /// - NULL propagates (NULL + x = NULL).
-    /// - Non-numeric types coerced to numeric first.
+    /// - Text/Blob coerced via `numericType()`: if both parse as integer,
+    ///   integer math is used (vdbe.c:1932-1934).
     #[must_use]
     #[allow(clippy::cast_precision_loss)]
     pub fn sql_add(&self, other: &Self) -> Self {
@@ -431,6 +473,14 @@ impl SqliteValue {
                 Some(result) => Self::Integer(result),
                 None => Self::float_result_or_null(*a as f64 + *b as f64),
             },
+            _ if self.is_integer_numeric_type() && other.is_integer_numeric_type() => {
+                let a = self.to_integer();
+                let b = other.to_integer();
+                match a.checked_add(b) {
+                    Some(result) => Self::Integer(result),
+                    None => Self::float_result_or_null(a as f64 + b as f64),
+                }
+            }
             _ => Self::float_result_or_null(self.to_float() + other.to_float()),
         }
     }
@@ -447,6 +497,14 @@ impl SqliteValue {
                 Some(result) => Self::Integer(result),
                 None => Self::float_result_or_null(*a as f64 - *b as f64),
             },
+            _ if self.is_integer_numeric_type() && other.is_integer_numeric_type() => {
+                let a = self.to_integer();
+                let b = other.to_integer();
+                match a.checked_sub(b) {
+                    Some(result) => Self::Integer(result),
+                    None => Self::float_result_or_null(a as f64 - b as f64),
+                }
+            }
             _ => Self::float_result_or_null(self.to_float() - other.to_float()),
         }
     }
@@ -463,6 +521,14 @@ impl SqliteValue {
                 Some(result) => Self::Integer(result),
                 None => Self::float_result_or_null(*a as f64 * *b as f64),
             },
+            _ if self.is_integer_numeric_type() && other.is_integer_numeric_type() => {
+                let a = self.to_integer();
+                let b = other.to_integer();
+                match a.checked_mul(b) {
+                    Some(result) => Self::Integer(result),
+                    None => Self::float_result_or_null(a as f64 * b as f64),
+                }
+            }
             _ => Self::float_result_or_null(self.to_float() * other.to_float()),
         }
     }
@@ -981,6 +1047,25 @@ mod tests {
     }
 
     #[test]
+    fn text_numeric_coercion_ignores_hex_text_prefixes() {
+        let v = SqliteValue::Text("0x10".to_owned());
+        assert_eq!(v.to_integer(), 0);
+        assert_eq!(v.to_float(), 0.0);
+
+        let v = SqliteValue::Blob(b"0x10".to_vec());
+        assert_eq!(v.to_integer(), 0);
+        assert_eq!(v.to_float(), 0.0);
+    }
+
+    #[test]
+    fn test_integer_numeric_type_uses_sqlite_prefix_rules() {
+        assert!(SqliteValue::Text("123abc".to_owned()).is_integer_numeric_type());
+        assert!(SqliteValue::Blob(b"123a".to_vec()).is_integer_numeric_type());
+        assert!(!SqliteValue::Text("1.5e2abc".to_owned()).is_integer_numeric_type());
+        assert!(!SqliteValue::Text("abc".to_owned()).is_integer_numeric_type());
+    }
+
+    #[test]
     fn test_sqlite_value_integer_real_comparison_equal() {
         let int_value = SqliteValue::Integer(3);
         let real_value = SqliteValue::Float(3.0);
@@ -1212,6 +1297,31 @@ mod tests {
         let val = SqliteValue::Text("9".into());
         let coerced = val.apply_affinity(TypeAffinity::Real);
         assert_eq!(coerced.as_float(), Some(9.0));
+    }
+
+    #[test]
+    fn test_cast_to_numeric_uses_sqlite_cast_rules() {
+        assert_eq!(
+            SqliteValue::Text("123abc".into()).cast_to_numeric(),
+            SqliteValue::Integer(123)
+        );
+        assert_eq!(
+            SqliteValue::Text("1.5e2abc".into()).cast_to_numeric(),
+            SqliteValue::Integer(150)
+        );
+        assert_eq!(
+            SqliteValue::Text("abc".into()).cast_to_numeric(),
+            SqliteValue::Integer(0)
+        );
+        assert_eq!(
+            SqliteValue::Blob(b"123a".to_vec()).cast_to_numeric(),
+            SqliteValue::Integer(123)
+        );
+
+        match SqliteValue::Text("1e999".into()).cast_to_numeric() {
+            SqliteValue::Float(value) => assert!(value.is_infinite() && value.is_sign_positive()),
+            other => panic!("expected +inf REAL from NUMERIC cast, got {other:?}"),
+        }
     }
 
     #[test]
