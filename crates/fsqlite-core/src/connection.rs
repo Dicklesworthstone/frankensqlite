@@ -40656,4 +40656,88 @@ mod pager_routing_tests {
             panic!("{} deep probe mismatches found", mismatches.len());
         }
     }
+
+    /// GROUP BY with SELECT-list alias (CASE expression aliased as `tier`).
+    #[test]
+    fn test_group_by_select_alias_case() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE scores (id INTEGER PRIMARY KEY, val INTEGER);",
+            "INSERT INTO scores VALUES (1, 90), (2, 60), (3, 85), (4, 40), (5, 70);",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            "SELECT CASE WHEN val >= 80 THEN 'pass' ELSE 'fail' END AS result, COUNT(*) FROM scores GROUP BY result ORDER BY result",
+            "SELECT CASE WHEN val >= 70 THEN 'A' WHEN val >= 50 THEN 'B' ELSE 'C' END AS grade, COUNT(*) FROM scores GROUP BY grade ORDER BY grade",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!("{} GROUP BY alias mismatches found", mismatches.len());
+        }
+    }
+
+    /// FROM-less aggregate SELECT (no FROM clause with aggregate functions).
+    #[test]
+    fn test_fromless_aggregate_select() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let queries = [
+            "SELECT COUNT(*)",
+            "SELECT COUNT(*), COUNT(NULL)",
+            "SELECT SUM(NULL), AVG(NULL), MIN(NULL), MAX(NULL)",
+            "SELECT COUNT(*), COUNT(NULL), SUM(NULL), AVG(NULL), MIN(NULL), MAX(NULL)",
+            "SELECT total(NULL)",
+            "SELECT COUNT(1), COUNT(0), COUNT('')",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!("{} FROM-less aggregate mismatches found", mismatches.len());
+        }
+    }
+
+    /// GROUP BY alias resolution in JOIN context.
+    #[test]
+    fn test_group_by_alias_with_join() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT, cat_id INTEGER);",
+            "INSERT INTO products VALUES (1, 'Apple', 1), (2, 'Banana', 1), (3, 'Carrot', 2);",
+            "CREATE TABLE categories (id INTEGER PRIMARY KEY, label TEXT);",
+            "INSERT INTO categories VALUES (1, 'Fruit'), (2, 'Vegetable');",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            "SELECT c.label, COUNT(p.id) AS cnt FROM categories c JOIN products p ON c.id = p.cat_id GROUP BY c.label ORDER BY c.label",
+            "SELECT CASE WHEN c.label = 'Fruit' THEN 'F' ELSE 'V' END AS code, COUNT(*) FROM categories c JOIN products p ON c.id = p.cat_id GROUP BY code ORDER BY code",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!("{} GROUP BY alias+JOIN mismatches found", mismatches.len());
+        }
+    }
 }
