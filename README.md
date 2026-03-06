@@ -27,7 +27,7 @@
 
 2. **RaptorQ-Pervasive Durability.** Every persistent layer is infused with RFC 6330 fountain codes via asupersync's production-grade RaptorQ implementation. WAL frames carry repair symbols for self-healing after torn writes. Snapshot transfer uses rateless coding for bandwidth-optimal replication over lossy networks. Data loss becomes a mathematical near-impossibility rather than a failure mode to mitigate.
 
-The file format stays 100% compatible with existing `.sqlite` databases in Compatibility mode. A Native mode stores everything as content-addressed, erasure-coded objects (ECS) for maximum durability and cross-process concurrency.
+The current runnable engine is already real, but still hybrid. Compatibility mode over standard SQLite files is the live runtime path today; Native mode / ECS sections below describe the longer-term design plus partial implementation work. See "Current Implementation Status" before treating every section as present-day behavior.
 
 ### Why FrankenSQLite?
 
@@ -38,11 +38,11 @@ The file format stays 100% compatible with existing `.sqlite` databases in Compa
 | Concurrent readers | Many (WAL; 5 read-mark slots by default) | Many (Compat: same 5 read-mark slots; Native: bounded by txn-slot capacity, no WAL-index cap) |
 | Memory safety | Manual (C) | Guaranteed (`#[forbid(unsafe_code)]`) |
 | Data races | Possible (careful C) | Impossible (Rust ownership) |
-| File format | SQLite 3.x | Identical (Compatibility mode) or ECS (Native mode) |
+| File format | SQLite 3.x | Compatibility mode targets SQLite 3.x parity; Native/ECS work is separate |
 | Self-healing storage | No | Yes (RaptorQ repair symbols) |
 | Page-level encryption | No (commercial SEE extension) | XChaCha20-Poly1305 (DEK/KEK envelope, Argon2id KEK derivation) |
-| SQL dialect | Full | Full (same parser coverage) |
-| Extensions | FTS3/4/5, R-tree, JSON1, etc. | All the same, compiled in |
+| SQL dialect | Full | Large and growing subset; parser coverage exceeds full execution parity today |
+| Extensions | FTS3/4/5, R-tree, JSON1, etc. | Extension crates are present; some runtime wiring is still in progress |
 | Cross-process MVCC | No | Yes (shared-memory coordination) |
 | Embedded, zero-config | Yes | Yes |
 
@@ -68,7 +68,7 @@ The entire workspace enforces `#[forbid(unsafe_code)]`. Every crate, every modul
 
 ### 4. File Format Compatibility Is Non-Negotiable
 
-Databases created by FrankenSQLite open in C SQLite and vice versa. No migration step, no conversion tool. The 100-byte header, B-tree page layout, record encoding, and WAL frame format are all identical.
+Compatibility with existing SQLite databases is a core goal of the current runtime. FrankenSQLite is built around standard `.db` plus rollback-journal/WAL files, and a major part of the harness exists to drive byte- and behavior-level parity against C SQLite. Full parity remains an active verification track rather than a claim that every edge is already finished.
 
 ### 5. Serializable Snapshot Isolation (SSI) by Default
 
@@ -94,10 +94,10 @@ Database engines live and die by cache behavior and I/O patterns. All page buffe
 
 ## Architecture
 
-FrankenSQLite is organized as a 24-crate Cargo workspace with strict layered dependencies:
+FrankenSQLite is organized as a 26-member Cargo workspace with strict layered dependencies:
 
 <div align="center">
-  <img src="frankensqlite_diagram.webp" alt="FrankenSQLite architecture diagram — 24-crate layered workspace" width="512">
+  <img src="frankensqlite_diagram.webp" alt="FrankenSQLite architecture diagram — 26-member layered workspace" width="512">
 </div>
 
 ### Crate Map
@@ -123,10 +123,15 @@ FrankenSQLite is organized as a 24-crate Cargo workspace with strict layered dep
 | | `fsqlite-ext-session` | Changeset/patchset generation and application |
 | | `fsqlite-ext-icu` | ICU collation and Unicode case folding |
 | | `fsqlite-ext-misc` | generate_series, carray, dbstat, dbpage |
-| **Integration** | `fsqlite-core` | Wires all layers: connection, prepare, schema, DDL/DML codegen |
+| **Integration** | `fsqlite-core` | Connection/runtime hub: parser dispatch, transaction control, schema management, VDBE bridge |
 | | `fsqlite` | Public API: `Connection::open()`, `execute()`, `query()`, `prepare()` |
-| | `fsqlite-cli` | Interactive REPL with dot-commands, output modes, syntax highlighting |
-| | `fsqlite-harness` | Conformance test runner comparing against C SQLite |
+| | `fsqlite-cli` | Small REPL, `-c/--command`, `.read`, and decode-proof verification |
+| | `fsqlite-observability` | Metrics, tracing, latency telemetry, conflict observability |
+| | `fsqlite-e2e` | Differential testing, workload replay, fairness/benchmark execution |
+| | `fsqlite-harness` | Verification/conformance/orchestration platform around the engine |
+| | `fsqlite-c-api` | C ABI surface for embedding/integration |
+
+There is also an experimental `crates/fsqlite-wasm/` directory in the repository, but it is not currently a workspace member.
 
 ---
 
@@ -136,8 +141,13 @@ This README describes the target end-state architecture. The runnable code today
 
 - Public entry point: `fsqlite::Connection` (`crates/fsqlite/src/lib.rs`), implemented by `fsqlite-core::Connection` (`crates/fsqlite-core/src/connection.rs`).
 - Execution backend: the default table-backed path uses pager transactions plus storage cursors into the B-tree stack, executed by `fsqlite-vdbe::VdbeEngine` (`crates/fsqlite-vdbe/src/engine.rs`).
+- Hot compile path: `fsqlite-core::Connection` currently compiles most table-backed work directly through `fsqlite-vdbe::codegen`; the separate `fsqlite-planner` crate exists and is substantial, but it is not yet the primary `Connection` hot path for all queries.
 - Runtime image/fallback: `fsqlite-vdbe::engine::MemDatabase` is still maintained as the in-memory execution image and remains in selected compatibility/fallback paths while cutover work continues.
 - Persistence: for non-`:memory:` paths, `Connection` opens pager/VFS state, applies journal-mode configuration, and reloads runtime image from pager-backed data; compatibility snapshot flows remain in the codebase for specific paths.
+- SQL fallback boundaries: CTE/view materialization, some JOIN/GROUP BY/window-function shapes, sqlite_schema virtualization, and some `INSERT ... SELECT` paths still route through connection-level compatibility execution instead of fully lowered VDBE storage programs.
+- CLI status: `fsqlite-cli` is currently a small shell and command runner, not yet a full sqlite3-style front-end with the broad dot-command/output-mode surface described later in older revisions of this README.
+- Verification surface: most serious differential, conformance, and benchmark machinery lives in `fsqlite-harness` and `fsqlite-e2e`, not at the workspace root.
+- Operating modes: the current user-facing runtime is the compatibility/pager-backed path. Native-mode/ECS sections below should be read as design plus partial implementation unless explicitly called out as live behavior.
 - Extensions: extension crates are present and feature-gated in the workspace/public API crate, but extension virtual table/function wiring is still in progress.
 - Storage stack status: `fsqlite-vfs`, `fsqlite-pager`, `fsqlite-wal`, `fsqlite-mvcc`, and `fsqlite-btree` are wired into default runtime execution. Remaining work focuses on removing residual fallback paths, closing opcode/behavior gaps, and finishing parity/certification tracks.
 
@@ -517,7 +527,7 @@ addr  opcode         p1    p2    p3    p4             p5
 
 ## The Query Planner
 
-The planner transforms an AST into an optimized logical plan, then hands it to the VDBE code generator.
+The repository contains a substantial `fsqlite-planner` crate for name resolution, WHERE analysis, access-path costing, and join ordering. In the current runnable engine, however, `fsqlite_core::Connection` usually compiles table-backed statements directly through `fsqlite_vdbe::codegen`, so this section describes the planner crate and intended end-state architecture rather than the exact hot path for every query today.
 
 ### Index Selection
 
@@ -994,53 +1004,18 @@ All aggregate functions also work as window functions when used with an `OVER` c
 
 ## The CLI Shell
 
-The `fsqlite-cli` binary provides an interactive SQL shell equivalent to the `sqlite3` command-line tool.
+The `fsqlite-cli` binary currently provides a small interactive SQL shell plus one-shot command execution. It is useful today, but it is not yet a full `sqlite3`-equivalent front-end.
 
 ### Features
 
 - Multi-line statement detection (continues until `;`)
-- SQL syntax highlighting in the prompt
-- Tab completion for table names, column names, SQL keywords, and dot-commands
-- Command history with persistent `~/.frankensqlite_history` file
-- Init file (`~/.frankensqliterc`) executed on startup
-- Batch mode: pipe SQL from stdin or a file
-- Signal handling: Ctrl-C cancels the running query, Ctrl-D exits
+- Simple row rendering with ` | ` separators
+- REPL dot commands: `.help`, `.quit`, `.exit`, `.read FILE`
+- Single-command mode: `-c` / `--command`
+- Decode-proof verification mode: `--verify-proof`
+- Ctrl-C clears the current pending statement; EOF exits the shell
 
-### Output Modes
-
-| Mode | Description |
-|------|------------|
-| `column` | Aligned columns with headers (default) |
-| `table` | ASCII table with borders |
-| `box` | Unicode box-drawing table |
-| `csv` | Comma-separated values |
-| `json` | JSON array of objects |
-| `line` | One `column = value` per line |
-| `list` | Pipe-separated values |
-| `markdown` | GitHub-flavored markdown table |
-| `tabs` | Tab-separated values |
-| `insert` | SQL INSERT statements |
-| `html` | HTML table |
-| `ascii` | ASCII art separators |
-| `quote` | SQL-escaped values |
-| `tcl` | TCL list format |
-
-### Dot-Commands (Selected)
-
-| Command | Purpose |
-|---------|---------|
-| `.open FILE` | Open a database file |
-| `.tables` | List all tables |
-| `.schema TABLE` | Show CREATE statement |
-| `.dump` | Export entire database as SQL |
-| `.import FILE TABLE` | Import CSV/TSV into a table |
-| `.mode MODE` | Set output mode |
-| `.headers on/off` | Toggle column headers |
-| `.explain on/off` | Toggle EXPLAIN formatting |
-| `.stats on/off` | Show query execution statistics |
-| `.timer on/off` | Show wall-clock query timing |
-| `.backup FILE` | Backup database to a file |
-| `.restore FILE` | Restore database from backup |
+Features such as persistent history, completion, syntax highlighting, rich output modes, and broad sqlite3-style dot-command coverage are still future work.
 
 ---
 
@@ -1297,15 +1272,15 @@ This is critical for multi-process locking compatibility: if a B-tree page were 
 
 ---
 
-## Two Operating Modes
+## Compatibility Runtime Today, Native Mode Design
 
-FrankenSQLite operates in one of two modes, selected per-connection via `PRAGMA fsqlite.mode`:
+The current user-facing runtime is the compatibility/pager-backed path over standard SQLite `.db` plus rollback-journal/WAL files. The codebase also contains substantial native-mode / ECS / time-travel machinery in crates, tests, and design docs, but `PRAGMA fsqlite.mode` is not currently a stable public `Connection` switch in the same way this README originally implied.
 
-### Compatibility Mode (Default)
+### Compatibility Runtime (Current)
 
 The database file is a standard SQLite `.db` file. WAL frames use standard SQLite WAL format. An existing C SQLite database opens without conversion, and a FrankenSQLite database opens in C SQLite without conversion. Optional sidecars (`.wal-fec`, `.idx-fec`) store RaptorQ repair symbols alongside the standard files but the core `.db` remains SQLite-compatible when checkpointed. This mode is the default and is used for conformance testing against C SQLite.
 
-### Native Mode
+### Native Mode (Design / Partial Implementation)
 
 Primary durable state is an ECS commit stream: append-only `CommitCapsule` objects encoded as RaptorQ symbols. The source-of-truth is the commit stream, not a mutable `.db` file.
 
@@ -1321,9 +1296,9 @@ Checkpointing materializes a canonical `.db` for compatibility export, but the c
 
 ---
 
-## Time Travel Queries (Native Mode)
+## Time Travel Queries (Partial Implementation / Native-Mode Design)
 
-Native mode persists an immutable commit stream (capsules + markers with monotonic timestamps). This enables **time travel queries** that evaluate reads against a historical commit sequence — querying the database as it existed at any past point in time.
+Parser, AST, opcode, and engine support for `FOR SYSTEM_TIME AS OF ...` exist in the repository today. The broader native-mode commit-stream/retention story described here remains part of the design/partial-implementation track rather than the default runtime path.
 
 **Syntax:**
 
@@ -1393,7 +1368,7 @@ The `RootManifest` is the bootstrap object: it maps the logical database name to
 
 ---
 
-## Native Mode Commit Protocol
+## Native Mode Commit Protocol (Design)
 
 The Native-mode commit protocol decouples **bulk durability** (payload bytes) from **ordering** (the marker stream). Writers persist `CommitCapsule` payloads concurrently using bulk I/O off the critical section. A single sequencer (`WriteCoordinator`) serializes only the tiny ordering step: validation, `commit_seq` allocation, and `CommitMarker` append.
 
@@ -1426,7 +1401,7 @@ The two-fsync cost (~100-200 microseconds on NVMe) is amortized by batching mult
 
 ---
 
-## ECS Compaction
+## ECS Compaction (Design)
 
 Native Mode's append-only symbol logs (`ecs/symbols/*.log`) grow indefinitely. To reclaim storage, the system runs a **mark-and-compact** process that is cancel-safe, crash-safe, cross-process safe, and non-disruptive to p99 query latency.
 
@@ -2363,7 +2338,7 @@ Every ambitious project has risks. Here they are, along with the mitigations tha
 | **R3: Append-only storage grows without bound** | Medium | Checkpoint and compaction are first-class operations; enforce budgets for MVCC history, SIREAD table, symbol caches; GC horizon = min(active txn ids) bounds version chain length |
 | **R4: Bootstrap chicken-and-egg** (need index to find symbols, need symbols to build index) | Low | Symbol records are self-describing (header + OTI); one tiny mutable root pointer per database; rebuild-from-scan always possible as fallback |
 | **R5: Multi-process MVCC coordination is complex** | High | Shared-memory coordination protocol fully specified; lease-based TxnSlot cleanup handles process crashes; validate in-process first (Phase 6), cross-process follows (Phase 7) |
-| **R6: File format compatibility vs innovation** | Medium | Compatibility Mode = standard SQLite format; Native Mode = innovation layer; conformance harness validates observable behavior |
+| **R6: File format compatibility vs innovation** | Medium | Compatibility runtime stays on standard SQLite files; Native/ECS work is an innovation layer pursued alongside parity harnesses and explicit status tracking |
 | **R7: Mergeable writes become a correctness minefield** | High | Strict merge safety ladder (Section above); proptest invariants + DPOR tests; start with deterministic rebase for small op subset, expand guided by benchmarks |
 | **R8: Distributed mode correctness is hard** | High | Leader commit clock as default; sheaf checks + TLA⁺ export for bounded model checking; implementation phased: single-node first, multi-node Phase 9 |
 
@@ -2461,7 +2436,7 @@ cargo bench --bench parser_throughput
 
 FrankenSQLite deliberately omits several components of the C SQLite ecosystem. Each exclusion has a technical rationale; none are omitted from laziness.
 
-**Amalgamation build system.** The C SQLite amalgamation (`sqlite3.c`) is a single-file build artifact produced by concatenating ~150 source files. Its purpose is simplifying C compilation. Rust's Cargo workspace with 24 crates provides superior modularity, parallel compilation, and dependency tracking. There is no analog of the amalgamation in a Rust project.
+**Amalgamation build system.** The C SQLite amalgamation (`sqlite3.c`) is a single-file build artifact produced by concatenating ~150 source files. Its purpose is simplifying C compilation. Rust's Cargo workspace with 26 members provides superior modularity, parallel compilation, and dependency tracking. There is no analog of the amalgamation in a Rust project.
 
 **TCL test harness.** C SQLite's test suite is driven by ~90,000+ lines of TCL scripts deeply intertwined with the C API. These cannot be meaningfully ported. Instead, FrankenSQLite uses native Rust `#[test]` modules, proptest for property-based testing, a conformance harness comparing SQL output against C SQLite golden files, and asupersync's lab reactor for deterministic concurrency tests.
 
@@ -2482,7 +2457,7 @@ FrankenSQLite deliberately omits several components of the C SQLite ecosystem. E
 ## Limitations
 
 - **Nightly Rust required.** Uses edition 2024 features that aren't stabilized yet.
-- **No C API.** The initial release targets Rust consumers. A C-compatible FFI wrapper is a future goal.
+- **Rust is still the primary supported surface.** A separate `fsqlite-c-api` crate now exists, but the main documented API and most verification effort are still centered on the Rust crates.
 - **No loadable extensions.** Extension support is configured at compile time via Cargo features; dynamic `dlopen`-based loading is not planned.
 - **No WASM target yet.** The VFS trait abstracts all OS operations, and a `WasmVfs` implementation is planned but not yet built. Browser/edge deployment via WebAssembly is a future goal.
 - **MVCC adds memory overhead.** Multiple page versions consume more RAM than single-version SQLite. ARC eviction and GC mitigate this but introduce background work.
@@ -2520,7 +2495,7 @@ SQLite has accumulated 24 years of behavioral nuances that applications depend o
 A: Yes. FrankenSQLite reads and writes the standard SQLite file format byte-for-byte. A database created by C SQLite opens in FrankenSQLite and vice versa.
 
 **Q: How does MVCC interact with WAL mode?**
-A: WAL frames carry transaction IDs. The WAL index maps `(page_number, txn_id)` to frame offsets. Checkpoint respects active snapshots, writing back only pages whose versions are no longer needed by any reader.
+A: In the current compatibility runtime, WAL is the durability mechanism while MVCC conflict tracking lives above the pager in shared session state (`ConcurrentRegistry`, commit index, page locks, version store). The more ambitious WAL/native-mode extensions described elsewhere in this README are design/partial-implementation work rather than the entire hot path today.
 
 **Q: What happens when two writers conflict on the same page?**
 A: If the page lock is held, the second writer gets `SQLITE_BUSY` immediately (no waiting, no deadlocks). If both reach commit on the same page, FCW detects base drift; commuting conflicts may be resolved by the safe merge ladder when enabled, otherwise the loser aborts/retries with `SQLITE_BUSY_SNAPSHOT`.
@@ -2538,7 +2513,7 @@ and comparing results. Any intentional divergence is documented and annotated
 with rationale. The canonical contract file is `sqlite_version_contract.toml`.
 
 **Q: How does MVCC garbage collection affect latency?**
-A: The GC runs on a background thread every ~1 second. It walks version chains and frees unreachable versions. The GC never holds the WAL append mutex, so it does not block writers. The only contention point is the brief `RwLock` acquisition to read the active transaction set when computing the GC horizon.
+A: In the current core runtime, GC is scheduler-driven from connection activity rather than a dedicated background thread. Old versions are pruned incrementally from the `VersionStore` when the scheduler decides it is time, based on version pressure and active-snapshot horizon.
 
 **Q: What prevents a long-running reader from causing unbounded memory growth?**
 A: A reader that holds a snapshot open for a long time pins all page versions newer than its snapshot, preventing GC from reclaiming them. This is the same tradeoff PostgreSQL makes. In practice, connection timeouts and application-level query deadlines prevent runaway memory growth.
@@ -2550,7 +2525,7 @@ A: Serializable Snapshot Isolation detects write skew -- a class of anomaly wher
 A: Three things. (1) Self-healing after torn writes: WAL frames carry repair symbols, so partial writes during a crash are recoverable without double-write journaling. (2) Bandwidth-optimal replication: fountain coding means a receiver can reconstruct data from any sufficient subset of encoding symbols, regardless of which symbols arrive. (3) Version chain compression: older page versions are stored as RaptorQ-encoded deltas rather than full copies.
 
 **Q: What is the difference between Compatibility and Native mode?**
-A: Compatibility mode stores data in a standard SQLite `.db` file readable by C SQLite. Native mode stores data as an append-only stream of content-addressed, erasure-coded objects (ECS) for maximum durability and cross-process concurrency. Both modes expose the same SQL dialect and API. Switch with `PRAGMA fsqlite.mode = compatibility | native`.
+A: Today, the stable user-facing runtime is the compatibility/pager-backed path over standard SQLite files. Native mode refers to the ECS/content-addressed durability design and partial implementation work present in the repo. It is not yet a mature public `PRAGMA fsqlite.mode` toggle on `Connection`.
 
 **Q: How does encryption work?**
 A: `PRAGMA key = 'passphrase'` derives a KEK via Argon2id and unwraps a per-database random DEK. Pages are encrypted with XChaCha20-Poly1305 using a fresh random 24-byte nonce per page write; the nonce and 16-byte tag are stored in each page's reserved bytes. `PRAGMA rekey = 'new_passphrase'` re-wraps the DEK in O(1). In Native mode, encryption happens before RaptorQ encoding (encrypt-then-code).
@@ -2584,7 +2559,7 @@ A: Yes. The `fsqlite` crate is the public API. The CLI (`fsqlite-cli`) is a sepa
 
 ```
 frankensqlite/
-├── Cargo.toml                # Workspace: 24 members, shared deps, lint config
+├── Cargo.toml                # Workspace: 26 members, shared deps, lint config
 ├── Cargo.lock                # Pinned dependency versions
 ├── rust-toolchain.toml       # Nightly channel + rustfmt + clippy
 ├── AGENTS.md                 # AI agent development guidelines
@@ -2609,8 +2584,11 @@ frankensqlite/
 │   ├── fsqlite-ext-*/        # 7 extension crates
 │   ├── fsqlite-core/         # Engine integration
 │   ├── fsqlite/              # Public API
-│   ├── fsqlite-cli/          # CLI shell
-│   └── fsqlite-harness/      # Conformance tests
+│   ├── fsqlite-cli/          # Small CLI shell + command runner
+│   ├── fsqlite-harness/      # Verification/conformance harness
+│   ├── fsqlite-e2e/          # Differential/E2E runner crate
+│   ├── fsqlite-observability/ # Metrics and tracing helpers
+│   └── fsqlite-c-api/        # C ABI adapter
 ├── legacy_sqlite_code/
 │   └── sqlite/               # C SQLite reference (git submodule)
 ├── benches/                  # Criterion benchmarks
