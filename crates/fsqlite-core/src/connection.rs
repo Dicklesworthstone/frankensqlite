@@ -3494,9 +3494,7 @@ impl Connection {
             // For REPLACE: delete rows that conflict on non-IPK UNIQUE columns.
             if *conflict == ConflictAction::Replace && !conflicting_rowids.is_empty() {
                 let table = db.get_table_mut(root_page).ok_or_else(|| {
-                    FrankenError::Internal(format!(
-                        "table not found at root page {root_page}"
-                    ))
+                    FrankenError::Internal(format!("table not found at root page {root_page}"))
                 })?;
                 for rid in &conflicting_rowids {
                     table.delete_by_rowid(*rid);
@@ -11918,6 +11916,25 @@ impl Connection {
                 SqliteValue::Text(s) => s.clone(),
                 _ => continue,
             };
+
+            // Virtual tables (FTS5, rtree, etc.) have rootpage=0 in
+            // sqlite_master and their CREATE SQL starts with
+            // "CREATE VIRTUAL TABLE".  These cannot be loaded as regular
+            // B-tree tables — skip them gracefully instead of crashing
+            // with an OpenRead on page 0.  (Issue #15)
+            let is_virtual = root_page_num == 0
+                || create_sql
+                    .trim_start()
+                    .to_ascii_uppercase()
+                    .starts_with("CREATE VIRTUAL TABLE");
+            if is_virtual {
+                tracing::warn!(
+                    table = %name,
+                    rootpage = root_page_num,
+                    "skipping virtual table from sqlite_master (module not loaded)"
+                );
+                continue;
+            }
 
             // Parse the CREATE TABLE to extract column info.
             let columns = crate::compat_persist::parse_columns_from_create_sql(&create_sql);
@@ -29539,6 +29556,72 @@ mod schema_loading_tests {
         }
     }
 
+    /// Issue #15: databases created by stock SQLite with FTS5 virtual tables
+    /// have rootpage=0 entries in sqlite_master.  Opening such a database
+    /// previously crashed with "OpenRead failed on root page 0".  The fix
+    /// skips virtual table entries during schema reload so that regular
+    /// tables are still accessible.
+    #[test]
+    fn test_reopen_skips_virtual_tables_with_rootpage_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("vtab_rootpage_zero.db");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        // Phase 1: create a database with stock SQLite (rusqlite) that
+        // contains both a regular table and an FTS5 virtual table.
+        {
+            let rconn = rusqlite::Connection::open(&db_path).unwrap();
+            rconn
+                .execute_batch(
+                    r"
+                    CREATE TABLE docs (id INTEGER PRIMARY KEY, title TEXT, body TEXT);
+                    INSERT INTO docs VALUES (1, 'hello', 'world');
+                    INSERT INTO docs VALUES (2, 'foo', 'bar');
+                    CREATE VIRTUAL TABLE docs_fts USING fts5(title, body, content=docs, content_rowid=id);
+                    ",
+                )
+                .unwrap();
+
+            // Verify the virtual table has rootpage=0 in sqlite_master.
+            let vtab_rootpage: i64 = rconn
+                .query_row(
+                    "SELECT rootpage FROM sqlite_master WHERE name = 'docs_fts'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                vtab_rootpage, 0,
+                "FTS5 virtual table should have rootpage=0 in sqlite_master"
+            );
+        }
+
+        // Phase 2: open the same database with fsqlite — this must NOT crash.
+        let conn = Connection::open(&db_str).unwrap();
+
+        // The regular table should be loaded and queryable.
+        let rows = conn.query("SELECT id, title FROM docs ORDER BY id").unwrap();
+        assert_eq!(rows.len(), 2, "regular table rows should survive reload");
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("hello".to_owned()));
+        assert_eq!(rows[1].values()[0], SqliteValue::Integer(2));
+        assert_eq!(rows[1].values()[1], SqliteValue::Text("foo".to_owned()));
+
+        // The virtual table should NOT appear in the schema (skipped).
+        let schema = conn.schema.borrow();
+        assert!(
+            !schema
+                .iter()
+                .any(|t| t.name.eq_ignore_ascii_case("docs_fts")),
+            "virtual table should be skipped during schema reload"
+        );
+        // The regular table should still be present.
+        assert!(
+            schema.iter().any(|t| t.name.eq_ignore_ascii_case("docs")),
+            "regular table should survive schema reload alongside virtual tables"
+        );
+    }
+
     #[test]
     fn test_reopen_loads_autoindex_metadata_and_keeps_quick_check_clean() {
         let dir = tempfile::tempdir().unwrap();
@@ -36750,10 +36833,7 @@ mod pager_routing_tests {
         // REPLACE should remove old row (id=1) and insert new (id=2).
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values()[0], SqliteValue::Integer(2));
-        assert_eq!(
-            rows[0].values()[1],
-            SqliteValue::Text("a@b.com".to_owned())
-        );
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("a@b.com".to_owned()));
         assert_eq!(rows[0].values()[2], SqliteValue::Text("Bob".to_owned()));
     }
 

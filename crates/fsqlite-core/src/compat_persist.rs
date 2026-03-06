@@ -261,6 +261,18 @@ pub fn load_from_sqlite(path: &Path) -> Result<LoadedState> {
             _ => continue,
         };
 
+        // Virtual tables (FTS5, rtree, etc.) have rootpage=0 in
+        // sqlite_master.  These cannot be loaded as regular B-tree tables
+        // — skip them gracefully instead of crashing.  (Issue #15)
+        let is_virtual = root_page_num == 0
+            || create_sql
+                .trim_start()
+                .to_ascii_uppercase()
+                .starts_with("CREATE VIRTUAL TABLE");
+        if is_virtual {
+            continue;
+        }
+
         // Parse the CREATE TABLE to extract column info.
         let columns = parse_columns_from_create_sql(&create_sql);
         let num_columns = columns.len();
