@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 
+use crate::attach::SchemaRegistry;
 use fsqlite_ast::{
     AlterTableAction, BinaryOp, ColumnConstraintKind, ColumnRef, CompoundOp, CreateTableBody,
     DefaultValue, Distinctness, DropObjectType, Expr, FunctionArgs, GeneratedStorage, InSet,
@@ -1247,6 +1248,17 @@ struct ParseCacheEntry {
     statement: Statement,
 }
 
+/// bd-1dp9.6.7.2.2: Cached compiled VdbeProgram for repeated ad-hoc queries.
+///
+/// Keyed by SQL text hash (same as parse cache). Invalidated when the schema
+/// cookie changes. Stores the compiled bytecode so that repeated
+/// `execute()`/`execute_with_params()` calls skip both parsing and compilation.
+#[derive(Clone)]
+struct CompiledCacheEntry {
+    sql: String,
+    program: VdbeProgram,
+}
+
 /// A database connection holding schema metadata and execution/cache state.
 ///
 /// Supports transactions (BEGIN/COMMIT/ROLLBACK) and savepoints
@@ -1411,6 +1423,15 @@ pub struct Connection {
     /// Schema cookie value at time of last cache fill.  When schema_cookie
     /// changes (DDL executed), the entire cache is invalidated.
     parse_cache_cookie: RefCell<u32>,
+    /// bd-1dp9.6.7.2.2: Schema-scoped compiled VdbeProgram cache.
+    /// Caches compiled bytecode for repeated ad-hoc statements so that
+    /// repeated `execute()`/`execute_with_params()` calls skip compilation.
+    /// Invalidated alongside parse_cache when schema_cookie changes.
+    compiled_cache: RefCell<HashMap<u64, CompiledCacheEntry>>,
+    // ── ATTACH/DETACH schema registry (§12.11, bd-7pxb) ─────────────────────
+    /// Registry of attached databases. Tracks schema names registered via
+    /// ATTACH DATABASE so that schema-qualified references resolve correctly.
+    attached_schemas: RefCell<SchemaRegistry>,
 }
 
 impl std::fmt::Debug for Connection {
@@ -1517,6 +1538,10 @@ impl Connection {
             // Parse cache (br-legjy.7.3)
             parse_cache: RefCell::new(HashMap::with_capacity(64)),
             parse_cache_cookie: RefCell::new(0),
+            // Compiled bytecode cache (bd-1dp9.6.7.2.2)
+            compiled_cache: RefCell::new(HashMap::with_capacity(64)),
+            // ATTACH/DETACH schema registry (§12.11, bd-7pxb)
+            attached_schemas: RefCell::new(SchemaRegistry::new()),
         };
         // Reset cumulative total_changes counter for this new connection.
         reset_total_changes();
@@ -2212,6 +2237,7 @@ impl Connection {
         let cached_cookie = *self.parse_cache_cookie.borrow();
         if cached_cookie != current_cookie {
             self.parse_cache.borrow_mut().clear();
+            self.compiled_cache.borrow_mut().clear();
             *self.parse_cache_cookie.borrow_mut() = current_cookie;
         }
     }
@@ -2236,6 +2262,48 @@ impl Connection {
                 statement: statement.clone(),
             },
         );
+    }
+
+    // ── bd-1dp9.6.7.2.2: Schema-scoped compiled cache ─────────────────
+
+    /// Look up a cached compiled VdbeProgram by SQL hash.
+    fn lookup_compiled_cache(&self, key: u64, sql: &str) -> Option<VdbeProgram> {
+        self.compiled_cache
+            .borrow()
+            .get(&key)
+            .and_then(|entry| (entry.sql == sql).then_some(entry.program.clone()))
+    }
+
+    /// Store a compiled VdbeProgram in the schema-scoped cache.
+    fn insert_compiled_cache(&self, key: u64, sql: &str, program: &VdbeProgram) {
+        let mut cache = self.compiled_cache.borrow_mut();
+        if cache.len() >= 128 {
+            cache.clear();
+        }
+        cache.insert(
+            key,
+            CompiledCacheEntry {
+                sql: sql.to_owned(),
+                program: program.clone(),
+            },
+        );
+    }
+
+    /// Compile a statement, using the compiled cache when possible.
+    /// The `sql_key` is the hash of the canonical SQL text; `sql` is the
+    /// canonical SQL text for collision safety.
+    fn compile_with_cache(
+        &self,
+        sql_key: u64,
+        sql: &str,
+        compile_fn: impl FnOnce(&Self) -> Result<VdbeProgram>,
+    ) -> Result<VdbeProgram> {
+        if let Some(program) = self.lookup_compiled_cache(sql_key, sql) {
+            return Ok(program);
+        }
+        let program = compile_fn(self)?;
+        self.insert_compiled_cache(sql_key, sql, &program);
+        Ok(program)
     }
 
     // ── Internal helpers ──────────────────────────────────────────────────
@@ -2590,7 +2658,8 @@ impl Connection {
                         dedup_rows(&mut rows);
                     }
                     Ok(rows)
-                } else if has_group_by(select) && (has_joins(select) || has_subquery_source(select)) {
+                } else if has_group_by(select) && (has_joins(select) || has_subquery_source(select))
+                {
                     // GROUP BY + JOIN: materialize the join as a temp table,
                     // then GROUP BY on that temp table.
                     self.log_mem_execution_fallback("select", "group_by_join_fallback")?;
@@ -2624,8 +2693,7 @@ impl Connection {
                     // window spec, compute window functions at connection level.
                     self.log_mem_execution_fallback("select", "window_function_fallback")?;
                     let rewritten = self.rewrite_in_subqueries_select(select, params)?;
-                    let mut bound =
-                        bind_placeholders_in_select_for_fallback(&rewritten, params)?;
+                    let mut bound = bind_placeholders_in_select_for_fallback(&rewritten, params)?;
                     let limit_clause = bound.limit.take();
                     let mut rows = self.execute_window_select(&bound, None)?;
                     if distinct {
@@ -2677,13 +2745,17 @@ impl Connection {
                         );
                         record_trace_span_created();
                         let _plan_guard = plan_span.enter();
-                        if distinct && limit_clause.is_some() {
-                            let mut unbounded = select.clone();
-                            unbounded.limit = None;
-                            self.compile_table_select(&unbounded)?
-                        } else {
-                            self.compile_table_select(select)?
-                        }
+                        let sql_text = statement.to_string();
+                        let sql_key = Self::sql_hash(&sql_text);
+                        self.compile_with_cache(sql_key, &sql_text, |conn| {
+                            if distinct && limit_clause.is_some() {
+                                let mut unbounded = select.clone();
+                                unbounded.limit = None;
+                                conn.compile_table_select(&unbounded)
+                            } else {
+                                conn.compile_table_select(select)
+                            }
+                        })?
                     };
 
                     let (mut rows, _) = self.execute_table_program(&program, params)?;
@@ -2751,9 +2823,8 @@ impl Connection {
                     // Detect simple VALUES clause (no compounds).
                     // We must use the VDBE path for simple VALUES to avoid infinite recursion
                     // in the fallback (which implements inserts by generating simple VALUES inserts).
-                    let is_simple_values =
-                        matches!(select_stmt.body.select, SelectCore::Values(_))
-                            && select_stmt.body.compounds.is_empty();
+                    let is_simple_values = matches!(select_stmt.body.select, SelectCore::Values(_))
+                        && select_stmt.body.compounds.is_empty();
 
                     // Use VDBE path when RETURNING is present OR it's a simple VALUES clause;
                     // fallback otherwise (e.g. complex SELECTs, compounds).
@@ -2803,7 +2874,11 @@ impl Connection {
                     );
                     record_trace_span_created();
                     let _plan_guard = plan_span.enter();
-                    self.compile_table_insert(insert)?
+                    let sql_text = statement.to_string();
+                    let sql_key = Self::sql_hash(&sql_text);
+                    self.compile_with_cache(sql_key, &sql_text, |conn| {
+                        conn.compile_table_insert(insert)
+                    })?
                 };
                 let (rows, affected) = self.execute_table_program(&program, params)?;
 
@@ -2815,7 +2890,12 @@ impl Connection {
                 // Phase 5G.3: Fire AFTER INSERT triggers.
                 if has_after_insert {
                     for new_values in &trigger_new_rows {
-                        self.fire_after_triggers(table_name, &insert_event, None, Some(new_values))?;
+                        self.fire_after_triggers(
+                            table_name,
+                            &insert_event,
+                            None,
+                            Some(new_values),
+                        )?;
                     }
                 }
 
@@ -2932,7 +3012,11 @@ impl Connection {
                     );
                     record_trace_span_created();
                     let _plan_guard = plan_span.enter();
-                    self.compile_table_update(&effective_update)?
+                    let sql_text = statement.to_string();
+                    let sql_key = Self::sql_hash(&sql_text);
+                    self.compile_with_cache(sql_key, &sql_text, |conn| {
+                        conn.compile_table_update(&effective_update)
+                    })?
                 };
                 let (rows, _) = self.execute_table_program(&program, params)?;
 
@@ -3037,14 +3121,23 @@ impl Connection {
                     );
                     record_trace_span_created();
                     let _plan_guard = plan_span.enter();
-                    self.compile_table_delete(&effective_delete)?
+                    let sql_text = statement.to_string();
+                    let sql_key = Self::sql_hash(&sql_text);
+                    self.compile_with_cache(sql_key, &sql_text, |conn| {
+                        conn.compile_table_delete(&effective_delete)
+                    })?
                 };
                 let (rows, _) = self.execute_table_program(&program, params)?;
 
                 // Phase 5G.3: Fire AFTER DELETE triggers.
                 if has_after_delete {
                     for old_values in &trigger_old_rows {
-                        self.fire_after_triggers(table_name, &delete_event, Some(old_values), None)?;
+                        self.fire_after_triggers(
+                            table_name,
+                            &delete_event,
+                            Some(old_values),
+                            None,
+                        )?;
                     }
                 }
 
@@ -3115,14 +3208,54 @@ impl Connection {
                 Ok(Vec::new())
             }
             // ANALYZE and REINDEX are no-ops for now
-            Statement::Analyze(_) | Statement::Reindex(_) => {
-                Ok(Vec::new())
-            }
+            Statement::Analyze(_) | Statement::Reindex(_) => Ok(Vec::new()),
             Statement::Explain { query_plan, stmt } => {
                 self.execute_explain(*stmt, query_plan, params)
             }
+            Statement::Attach(ref attach) => {
+                let path_rows = self.execute_statement(
+                    Statement::Select(SelectStatement {
+                        with: None,
+                        body: SelectBody {
+                            select: SelectCore::Select {
+                                distinct: Distinctness::All,
+                                columns: vec![ResultColumn::Expr {
+                                    expr: attach.expr.clone(),
+                                    alias: None,
+                                }],
+                                from: None,
+                                where_clause: None,
+                                group_by: Vec::new(),
+                                having: None,
+                                windows: Vec::new(),
+                            },
+                            compounds: Vec::new(),
+                        },
+                        order_by: Vec::new(),
+                        limit: None,
+                    }),
+                    params,
+                )?;
+                let path = path_rows
+                    .first()
+                    .and_then(|r| r.values().first())
+                    .map(|v| match v {
+                        SqliteValue::Text(s) => s.clone(),
+                        other => format!("{other}"),
+                    })
+                    .unwrap_or_default();
+                self.attached_schemas
+                    .borrow_mut()
+                    .attach(attach.schema.clone(), path)?;
+                Ok(Vec::new())
+            }
+            Statement::Detach(ref schema_name) => {
+                self.attached_schemas.borrow_mut().detach(schema_name)?;
+                Ok(Vec::new())
+            }
+            #[allow(unreachable_patterns)]
             _ => Err(FrankenError::NotImplemented(
-                "only SELECT, INSERT, UPDATE, DELETE, DDL (CREATE/DROP/ALTER TABLE, CREATE INDEX/VIEW/TRIGGER), transaction control, PRAGMA, VACUUM, ANALYZE, REINDEX, and EXPLAIN are supported".to_owned(),
+                "unsupported statement type".to_owned(),
             )),
         }
     }
@@ -3177,13 +3310,22 @@ impl Connection {
         select_stmt: &fsqlite_ast::SelectStatement,
         params: Option<&[SqliteValue]>,
     ) -> Result<usize> {
-        if insert.with.is_some() || !insert.upsert.is_empty() || !insert.returning.is_empty() {
+        if !insert.upsert.is_empty() || !insert.returning.is_empty() {
             return Err(FrankenError::NotImplemented(
-                "INSERT ... SELECT fallback does not support WITH/UPSERT/RETURNING".to_owned(),
+                "INSERT ... SELECT fallback does not support UPSERT/RETURNING".to_owned(),
             ));
         }
 
-        let source_rows = self.execute_statement(Statement::Select(select_stmt.clone()), params)?;
+        // If the INSERT has a WITH clause (CTEs), transfer it to the SELECT
+        // so execute_statement will materialize the CTEs before evaluation.
+        let effective_select = if let Some(ref with) = insert.with {
+            let mut sel = select_stmt.clone();
+            sel.with = Some(with.clone());
+            sel
+        } else {
+            select_stmt.clone()
+        };
+        let source_rows = self.execute_statement(Statement::Select(effective_select), params)?;
         if source_rows.is_empty() {
             return Ok(0);
         }
@@ -3642,11 +3784,60 @@ impl Connection {
                     conn: self,
                 })
             }
-            Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_) => {
-                // DML statements cannot be compiled to standalone VdbePrograms
-                // because their execution requires the full Connection context
-                // (triggers, constraints, autocommit).  Store the parsed AST
-                // and dispatch through Connection::execute_prepared at runtime.
+            Statement::Insert(insert) => {
+                // bd-1dp9.6.7.2.1: Pre-compile simple VALUES-based INSERTs
+                // into a real VdbeProgram so execute_prepared can reuse the
+                // cached program without re-running codegen each call.
+                // INSERT...SELECT with complex subqueries still gets a
+                // placeholder and falls back to full execute_statement.
+                let is_simple_values = matches!(
+                    &insert.source,
+                    fsqlite_ast::InsertSource::Values(_) | fsqlite_ast::InsertSource::DefaultValues
+                ) || matches!(
+                    &insert.source,
+                    fsqlite_ast::InsertSource::Select(sel)
+                    if matches!(sel.body.select, SelectCore::Values(_))
+                       && sel.body.compounds.is_empty()
+                );
+
+                if is_simple_values {
+                    let program = self.compile_table_insert(insert)?;
+                    Ok(PreparedStatement {
+                        program,
+                        func_registry: registry,
+                        expression_postprocess: None,
+                        distinct: false,
+                        db: Some(Rc::clone(&self.db)),
+                        pager: Some(self.pager.clone()),
+                        post_distinct_limit: None,
+                        schema_cookie: self.schema_cookie(),
+                        root_cx: self.root_cx.clone(),
+                        dml_statement: Some(statement.clone()),
+                        conn: self,
+                    })
+                } else {
+                    // Complex INSERT...SELECT: placeholder, full dispatch.
+                    let placeholder_program = ProgramBuilder::new().finish().map_err(|e| {
+                        FrankenError::Internal(format!("failed to build placeholder program: {e}"))
+                    })?;
+                    Ok(PreparedStatement {
+                        program: placeholder_program,
+                        func_registry: registry,
+                        expression_postprocess: None,
+                        distinct: false,
+                        db: None,
+                        pager: None,
+                        post_distinct_limit: None,
+                        schema_cookie: self.schema_cookie(),
+                        root_cx: self.root_cx.clone(),
+                        dml_statement: Some(statement.clone()),
+                        conn: self,
+                    })
+                }
+            }
+            Statement::Update(_) | Statement::Delete(_) => {
+                // UPDATE/DELETE still use full execute_statement dispatch
+                // because their execution requires complex materialization.
                 let placeholder_program = ProgramBuilder::new().finish().map_err(|e| {
                     FrankenError::Internal(format!("failed to build placeholder program: {e}"))
                 })?;
@@ -9609,6 +9800,218 @@ impl Connection {
                     None => Ok(Vec::new()),
                 }
             }
+            // PRAGMA index_list(table_name) — return indexes on a table.
+            // Output: seq, name, unique, origin, partial
+            "index_list" => {
+                let table_name = match pragma.value.as_ref() {
+                    Some(PragmaValue::Call(expr) | PragmaValue::Assign(expr)) => match expr {
+                        Expr::Column(col_ref, _) if col_ref.table.is_none() => {
+                            col_ref.column.clone()
+                        }
+                        Expr::Literal(Literal::String(s), _) => s.clone(),
+                        _ => return Ok(Vec::new()),
+                    },
+                    None => return Ok(Vec::new()),
+                };
+                let schema = self.schema.borrow();
+                let table = schema
+                    .iter()
+                    .find(|t| t.name.eq_ignore_ascii_case(&table_name));
+                match table {
+                    Some(t) => {
+                        let rows = t
+                            .indexes
+                            .iter()
+                            .enumerate()
+                            .map(|(seq, idx)| Row {
+                                values: vec![
+                                    SqliteValue::Integer(i64::try_from(seq).unwrap_or(0)),
+                                    SqliteValue::Text(idx.name.clone()),
+                                    SqliteValue::Integer(i64::from(idx.is_unique)),
+                                    SqliteValue::Text("c".to_owned()),
+                                    SqliteValue::Integer(0),
+                                ],
+                            })
+                            .collect();
+                        Ok(rows)
+                    }
+                    None => Ok(Vec::new()),
+                }
+            }
+            // PRAGMA index_info(index_name) / index_xinfo — column details.
+            // Output: seqno, cid, name
+            "index_info" | "index_xinfo" => {
+                let index_name = match pragma.value.as_ref() {
+                    Some(PragmaValue::Call(expr) | PragmaValue::Assign(expr)) => match expr {
+                        Expr::Column(col_ref, _) if col_ref.table.is_none() => {
+                            col_ref.column.clone()
+                        }
+                        Expr::Literal(Literal::String(s), _) => s.clone(),
+                        _ => return Ok(Vec::new()),
+                    },
+                    None => return Ok(Vec::new()),
+                };
+                let schema = self.schema.borrow();
+                for table in schema.iter() {
+                    for idx in &table.indexes {
+                        if idx.name.eq_ignore_ascii_case(&index_name) {
+                            let rows = idx
+                                .columns
+                                .iter()
+                                .enumerate()
+                                .map(|(seq, col_name)| {
+                                    let cid = table
+                                        .columns
+                                        .iter()
+                                        .position(|c| c.name.eq_ignore_ascii_case(col_name))
+                                        .map_or(-1, |p| i64::try_from(p).unwrap_or(-1));
+                                    Row {
+                                        values: vec![
+                                            SqliteValue::Integer(i64::try_from(seq).unwrap_or(0)),
+                                            SqliteValue::Integer(cid),
+                                            SqliteValue::Text(col_name.clone()),
+                                        ],
+                                    }
+                                })
+                                .collect();
+                            return Ok(rows);
+                        }
+                    }
+                }
+                Ok(Vec::new())
+            }
+            // PRAGMA foreign_key_list(table_name) — FK constraints.
+            // Output: id, seq, table, from, to, on_update, on_delete, match
+            "foreign_key_list" => {
+                let table_name = match pragma.value.as_ref() {
+                    Some(PragmaValue::Call(expr) | PragmaValue::Assign(expr)) => match expr {
+                        Expr::Column(col_ref, _) if col_ref.table.is_none() => {
+                            col_ref.column.clone()
+                        }
+                        Expr::Literal(Literal::String(s), _) => s.clone(),
+                        _ => return Ok(Vec::new()),
+                    },
+                    None => return Ok(Vec::new()),
+                };
+                let schema = self.schema.borrow();
+                let table = schema
+                    .iter()
+                    .find(|t| t.name.eq_ignore_ascii_case(&table_name));
+                match table {
+                    Some(t) => {
+                        let rows = t
+                            .foreign_keys
+                            .iter()
+                            .enumerate()
+                            .flat_map(|(fk_id, fk)| {
+                                fk.child_columns.iter().enumerate().map(move |(seq, &cid)| {
+                                    let from_col = t
+                                        .columns
+                                        .get(cid)
+                                        .map_or_else(|| format!("col{cid}"), |c| c.name.clone());
+                                    let to_col =
+                                        fk.parent_columns.get(seq).cloned().unwrap_or_default();
+                                    Row {
+                                        values: vec![
+                                            SqliteValue::Integer(i64::try_from(fk_id).unwrap_or(0)),
+                                            SqliteValue::Integer(i64::try_from(seq).unwrap_or(0)),
+                                            SqliteValue::Text(fk.parent_table.clone()),
+                                            SqliteValue::Text(from_col),
+                                            SqliteValue::Text(to_col),
+                                            SqliteValue::Text(
+                                                fk_action_sql(fk.on_update).to_owned(),
+                                            ),
+                                            SqliteValue::Text(
+                                                fk_action_sql(fk.on_delete).to_owned(),
+                                            ),
+                                            SqliteValue::Text("NONE".to_owned()),
+                                        ],
+                                    }
+                                })
+                            })
+                            .collect();
+                        Ok(rows)
+                    }
+                    None => Ok(Vec::new()),
+                }
+            }
+            // PRAGMA compile_options — return build-time configuration options.
+            "compile_options" => {
+                let options = [
+                    "COMPILER=rustc",
+                    "ENABLE_FTS5",
+                    "ENABLE_JSON1",
+                    "ENABLE_RTREE",
+                    "THREADSAFE=1",
+                    "FRANKENSQLITE",
+                ];
+                let rows = options
+                    .iter()
+                    .map(|opt| Row {
+                        values: vec![SqliteValue::Text((*opt).to_owned())],
+                    })
+                    .collect();
+                Ok(rows)
+            }
+            // PRAGMA database_list — return attached databases.
+            // Output: seq, name, file
+            "database_list" => {
+                let mut rows = vec![
+                    Row {
+                        values: vec![
+                            SqliteValue::Integer(0),
+                            SqliteValue::Text("main".to_owned()),
+                            SqliteValue::Text(self.path.clone()),
+                        ],
+                    },
+                    Row {
+                        values: vec![
+                            SqliteValue::Integer(1),
+                            SqliteValue::Text("temp".to_owned()),
+                            SqliteValue::Text(String::new()),
+                        ],
+                    },
+                ];
+                let registry = self.attached_schemas.borrow();
+                for (i, schema_name) in registry.all_schemas().into_iter().enumerate() {
+                    if schema_name == "main" || schema_name == "temp" {
+                        continue;
+                    }
+                    let path = registry
+                        .find(schema_name)
+                        .map_or_else(String::new, |db| db.path.clone());
+                    rows.push(Row {
+                        values: vec![
+                            SqliteValue::Integer(i64::try_from(i).unwrap_or(0)),
+                            SqliteValue::Text(schema_name.to_owned()),
+                            SqliteValue::Text(path),
+                        ],
+                    });
+                }
+                Ok(rows)
+            }
+            // PRAGMA table_list — return all tables/views.
+            // Output: schema, name, type, ncol, wr, strict
+            "table_list" => {
+                let schema = self.schema.borrow();
+                let rows = schema
+                    .iter()
+                    .map(|t| {
+                        let ncol = i64::try_from(t.columns.len()).unwrap_or(0);
+                        Row {
+                            values: vec![
+                                SqliteValue::Text("main".to_owned()),
+                                SqliteValue::Text(t.name.clone()),
+                                SqliteValue::Text("table".to_owned()),
+                                SqliteValue::Integer(ncol),
+                                SqliteValue::Integer(0),
+                                SqliteValue::Integer(i64::from(t.strict)),
+                            ],
+                        }
+                    })
+                    .collect();
+                Ok(rows)
+            }
             // Unrecognised pragmas are silently ignored (SQLite compatibility).
             _ => Ok(Vec::new()),
         }
@@ -11706,8 +12109,9 @@ impl Connection {
     fn increment_schema_cookie(&self) {
         let mut cookie = self.schema_cookie.borrow_mut();
         *cookie = cookie.wrapping_add(1);
-        // Invalidate parse cache — schema change may affect name resolution.
+        // Invalidate parse + compiled caches — schema change may affect resolution/codegen.
         self.parse_cache.borrow_mut().clear();
+        self.compiled_cache.borrow_mut().clear();
     }
 
     /// Increment the file change counter.  Must be called for every
@@ -11722,6 +12126,11 @@ impl Connection {
     /// Read the current schema cookie value.
     pub fn schema_cookie(&self) -> u32 {
         *self.schema_cookie.borrow()
+    }
+
+    /// Number of entries in the compiled bytecode cache (bd-1dp9.6.7.2.2).
+    pub fn compiled_cache_len(&self) -> usize {
+        self.compiled_cache.borrow().len()
     }
 
     /// Read the current file change counter value.
@@ -29600,7 +30009,9 @@ mod schema_loading_tests {
         let conn = Connection::open(&db_str).unwrap();
 
         // The regular table should be loaded and queryable.
-        let rows = conn.query("SELECT id, title FROM docs ORDER BY id").unwrap();
+        let rows = conn
+            .query("SELECT id, title FROM docs ORDER BY id")
+            .unwrap();
         assert_eq!(rows.len(), 2, "regular table rows should survive reload");
         assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
         assert_eq!(rows[0].values()[1], SqliteValue::Text("hello".to_owned()));
@@ -33530,6 +33941,44 @@ mod pager_routing_tests {
     }
 
     #[test]
+    fn test_select_bare_column_with_aggregate() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE ep10b (id INTEGER PRIMARY KEY, val INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO ep10b VALUES (1, 10), (2, 30), (3, 20);")
+            .unwrap();
+        let rows = conn.query("SELECT max(val), id FROM ep10b;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(30));
+        // Bare column `id` takes its value from the last row scanned.
+        assert_eq!(rows[0].values()[1], SqliteValue::Integer(3));
+    }
+
+    #[test]
+    fn test_select_where_inequality_with_affinity() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE ep10c (id INTEGER PRIMARY KEY, val INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO ep10c VALUES (1, 10), (2, 20), (3, 30), (4, 5);")
+            .unwrap();
+        // WHERE val > 10 should return rows 2 and 3.
+        let rows = conn.query("SELECT id FROM ep10c WHERE val > 10;").unwrap();
+        assert_eq!(rows.len(), 2);
+        // WHERE val <= 10 should return rows 1 and 4.
+        let rows = conn.query("SELECT id FROM ep10c WHERE val <= 10;").unwrap();
+        assert_eq!(rows.len(), 2);
+        // WHERE val != 20 should return rows 1, 3, and 4.
+        let rows = conn.query("SELECT id FROM ep10c WHERE val != 20;").unwrap();
+        assert_eq!(rows.len(), 3);
+        // WHERE val >= 20 should return rows 2 and 3.
+        let rows = conn.query("SELECT id FROM ep10c WHERE val >= 20;").unwrap();
+        assert_eq!(rows.len(), 2);
+        // WHERE val < 20 should return rows 1 and 4.
+        let rows = conn.query("SELECT id FROM ep10c WHERE val < 20;").unwrap();
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
     fn test_group_by_with_having() {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE ep11 (cat TEXT, val INTEGER);")
@@ -36237,6 +36686,208 @@ mod pager_routing_tests {
         assert_eq!(rows[0].values()[0], SqliteValue::Text("hello".to_owned()));
     }
 
+    // ── bd-1dp9.6.7.2.1: Prepared INSERT reuse tests ────────────────────
+
+    #[test]
+    fn test_prepared_insert_reuse_multiple_executions() {
+        // Verify that a single prepared INSERT can be executed multiple times
+        // with different parameters, reusing the pre-compiled VdbeProgram.
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE prep_reuse (id INTEGER PRIMARY KEY, name TEXT);")
+            .unwrap();
+
+        let stmt = conn
+            .prepare("INSERT INTO prep_reuse (id, name) VALUES (?1, ?2)")
+            .unwrap();
+
+        // The stmt should have db set (pre-compiled, not placeholder).
+        assert!(
+            stmt.db.is_some(),
+            "simple VALUES INSERT should be pre-compiled with db set"
+        );
+
+        for i in 1..=5 {
+            let affected = stmt
+                .execute_with_params(&[
+                    SqliteValue::Integer(i),
+                    SqliteValue::Text(format!("name_{i}")),
+                ])
+                .unwrap();
+            assert_eq!(affected, 1);
+        }
+
+        let rows = conn.query("SELECT COUNT(*) FROM prep_reuse").unwrap();
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(5));
+
+        let rows = conn
+            .query("SELECT name FROM prep_reuse ORDER BY id")
+            .unwrap();
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("name_1".to_owned()));
+        assert_eq!(rows[4].values()[0], SqliteValue::Text("name_5".to_owned()));
+    }
+
+    #[test]
+    fn test_prepared_insert_reuse_semantic_parity_with_execute() {
+        // Verify that prepared INSERT produces identical results to
+        // Connection::execute for the same data.
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE parity_a (id INTEGER PRIMARY KEY, v REAL, t TEXT);")
+            .unwrap();
+        conn.execute("CREATE TABLE parity_b (id INTEGER PRIMARY KEY, v REAL, t TEXT);")
+            .unwrap();
+
+        // Insert via prepared statement (reuse path).
+        let stmt = conn
+            .prepare("INSERT INTO parity_a VALUES (?1, ?2, ?3)")
+            .unwrap();
+        stmt.execute_with_params(&[
+            SqliteValue::Integer(1),
+            SqliteValue::Float(3.14),
+            SqliteValue::Text("hello".to_owned()),
+        ])
+        .unwrap();
+        stmt.execute_with_params(&[
+            SqliteValue::Integer(2),
+            SqliteValue::Null,
+            SqliteValue::Text("world".to_owned()),
+        ])
+        .unwrap();
+
+        // Insert via direct execute (full dispatch path).
+        conn.execute_with_params(
+            "INSERT INTO parity_b VALUES (?1, ?2, ?3)",
+            &[
+                SqliteValue::Integer(1),
+                SqliteValue::Float(3.14),
+                SqliteValue::Text("hello".to_owned()),
+            ],
+        )
+        .unwrap();
+        conn.execute_with_params(
+            "INSERT INTO parity_b VALUES (?1, ?2, ?3)",
+            &[
+                SqliteValue::Integer(2),
+                SqliteValue::Null,
+                SqliteValue::Text("world".to_owned()),
+            ],
+        )
+        .unwrap();
+
+        let rows_a = conn.query("SELECT * FROM parity_a ORDER BY id").unwrap();
+        let rows_b = conn.query("SELECT * FROM parity_b ORDER BY id").unwrap();
+        assert_eq!(rows_a.len(), rows_b.len());
+        for (a, b) in rows_a.iter().zip(rows_b.iter()) {
+            assert_eq!(a.values(), b.values());
+        }
+    }
+
+    #[test]
+    fn test_prepared_insert_reuse_within_explicit_transaction() {
+        // Verify prepared INSERT works correctly within BEGIN/COMMIT.
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE prep_txn (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+
+        let stmt = conn
+            .prepare("INSERT INTO prep_txn (id, val) VALUES (?1, ?2)")
+            .unwrap();
+
+        conn.execute("BEGIN;").unwrap();
+        stmt.execute_with_params(&[SqliteValue::Integer(1), SqliteValue::Text("a".to_owned())])
+            .unwrap();
+        stmt.execute_with_params(&[SqliteValue::Integer(2), SqliteValue::Text("b".to_owned())])
+            .unwrap();
+        conn.execute("COMMIT;").unwrap();
+
+        let rows = conn.query("SELECT val FROM prep_txn ORDER BY id").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("a".to_owned()));
+        assert_eq!(rows[1].values()[0], SqliteValue::Text("b".to_owned()));
+    }
+
+    #[test]
+    fn test_prepared_insert_reuse_rollback_in_explicit_transaction() {
+        // Verify that ROLLBACK correctly undoes prepared INSERT writes.
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE prep_rb (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO prep_rb VALUES (1, 'before');")
+            .unwrap();
+
+        let stmt = conn
+            .prepare("INSERT INTO prep_rb (id, val) VALUES (?1, ?2)")
+            .unwrap();
+
+        conn.execute("BEGIN;").unwrap();
+        stmt.execute_with_params(&[
+            SqliteValue::Integer(2),
+            SqliteValue::Text("should_vanish".to_owned()),
+        ])
+        .unwrap();
+        conn.execute("ROLLBACK;").unwrap();
+
+        let rows = conn.query("SELECT COUNT(*) FROM prep_rb").unwrap();
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+    }
+
+    #[test]
+    fn test_prepared_insert_reuse_or_ignore() {
+        // INSERT OR IGNORE with pre-compiled program should silently skip
+        // duplicate keys.
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE prep_ign (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+
+        let stmt = conn
+            .prepare("INSERT OR IGNORE INTO prep_ign (id, val) VALUES (?1, ?2)")
+            .unwrap();
+
+        stmt.execute_with_params(&[
+            SqliteValue::Integer(1),
+            SqliteValue::Text("first".to_owned()),
+        ])
+        .unwrap();
+
+        // Duplicate key — should be silently ignored.
+        let affected = stmt
+            .execute_with_params(&[
+                SqliteValue::Integer(1),
+                SqliteValue::Text("duplicate".to_owned()),
+            ])
+            .unwrap();
+        assert_eq!(affected, 0);
+
+        let rows = conn.query("SELECT val FROM prep_ign WHERE id = 1").unwrap();
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("first".to_owned()));
+    }
+
+    #[test]
+    fn test_prepared_insert_select_uses_fallback() {
+        // INSERT...SELECT should NOT get a pre-compiled program (db stays None)
+        // and should fall back to full execute_statement dispatch.
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE src (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        conn.execute("CREATE TABLE dst (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO src VALUES (1, 'a'), (2, 'b');")
+            .unwrap();
+
+        let stmt = conn.prepare("INSERT INTO dst SELECT * FROM src").unwrap();
+        // INSERT...SELECT is complex: should NOT be pre-compiled.
+        assert!(
+            stmt.db.is_none(),
+            "INSERT...SELECT should use placeholder (db=None)"
+        );
+
+        let affected = stmt.execute().unwrap();
+        assert_eq!(affected, 2);
+
+        let rows = conn.query("SELECT val FROM dst ORDER BY id").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("a".to_owned()));
+    }
+
     #[test]
     fn test_prepared_select_rejects_schema_change() {
         let conn = Connection::open(":memory:").unwrap();
@@ -36411,6 +37062,159 @@ mod pager_routing_tests {
         // Cache must be invalidated: fresh parse succeeds.
         let rows = conn.query("SELECT v FROM pc5").unwrap();
         assert_eq!(rows[0].values()[0], SqliteValue::Text("new".to_owned()));
+    }
+
+    // ── bd-1dp9.6.7.2.2: Compiled cache tests ────────────────────────
+
+    #[test]
+    fn test_compiled_cache_reused_on_repeated_select() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE cc_sel (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO cc_sel VALUES (1, 'a'), (2, 'b');")
+            .unwrap();
+
+        // First query compiles fresh.
+        let rows1 = conn.query("SELECT val FROM cc_sel ORDER BY id").unwrap();
+        assert_eq!(rows1.len(), 2);
+
+        // Second query should hit compiled cache (same SQL + schema).
+        let rows2 = conn.query("SELECT val FROM cc_sel ORDER BY id").unwrap();
+        assert_eq!(rows2.len(), 2);
+        assert_eq!(rows2[0].values()[0], SqliteValue::Text("a".to_owned()));
+        assert_eq!(rows2[1].values()[0], SqliteValue::Text("b".to_owned()));
+
+        // Compiled cache should have at least one entry from the queries.
+        assert!(
+            conn.compiled_cache_len() > 0,
+            "compiled cache should have entries after repeated queries"
+        );
+    }
+
+    #[test]
+    fn test_compiled_cache_reused_on_repeated_insert() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE cc_ins (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+
+        let sql = "INSERT INTO cc_ins VALUES (?1, ?2)";
+
+        // First insert compiles fresh.
+        conn.execute_with_params(
+            sql,
+            &[SqliteValue::Integer(1), SqliteValue::Text("a".to_owned())],
+        )
+        .unwrap();
+
+        // Second insert should hit compiled cache.
+        conn.execute_with_params(
+            sql,
+            &[SqliteValue::Integer(2), SqliteValue::Text("b".to_owned())],
+        )
+        .unwrap();
+
+        let rows = conn.query("SELECT val FROM cc_ins ORDER BY id").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("a".to_owned()));
+        assert_eq!(rows[1].values()[0], SqliteValue::Text("b".to_owned()));
+    }
+
+    #[test]
+    fn test_compiled_cache_reused_on_repeated_update() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE cc_upd (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO cc_upd VALUES (1, 'old'), (2, 'old');")
+            .unwrap();
+
+        let sql = "UPDATE cc_upd SET val = ?1 WHERE id = ?2";
+
+        conn.execute_with_params(
+            sql,
+            &[
+                SqliteValue::Text("new1".to_owned()),
+                SqliteValue::Integer(1),
+            ],
+        )
+        .unwrap();
+        conn.execute_with_params(
+            sql,
+            &[
+                SqliteValue::Text("new2".to_owned()),
+                SqliteValue::Integer(2),
+            ],
+        )
+        .unwrap();
+
+        let rows = conn.query("SELECT val FROM cc_upd ORDER BY id").unwrap();
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("new1".to_owned()));
+        assert_eq!(rows[1].values()[0], SqliteValue::Text("new2".to_owned()));
+    }
+
+    #[test]
+    fn test_compiled_cache_reused_on_repeated_delete() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE cc_del (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO cc_del VALUES (1, 'a'), (2, 'b'), (3, 'c');")
+            .unwrap();
+
+        let sql = "DELETE FROM cc_del WHERE id = ?1";
+
+        conn.execute_with_params(sql, &[SqliteValue::Integer(1)])
+            .unwrap();
+        conn.execute_with_params(sql, &[SqliteValue::Integer(3)])
+            .unwrap();
+
+        let rows = conn.query("SELECT id FROM cc_del ORDER BY id").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(2));
+    }
+
+    #[test]
+    fn test_compiled_cache_invalidated_by_ddl() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE cc_ddl (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO cc_ddl VALUES (1, 'a');").unwrap();
+
+        // Populate compiled cache.
+        let rows = conn.query("SELECT val FROM cc_ddl").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(
+            conn.compiled_cache_len() > 0,
+            "cache should be populated after query"
+        );
+
+        // DDL should invalidate compiled cache.
+        conn.execute("ALTER TABLE cc_ddl ADD COLUMN extra TEXT DEFAULT 'x';")
+            .unwrap();
+        assert_eq!(
+            conn.compiled_cache_len(),
+            0,
+            "DDL must clear compiled cache"
+        );
+
+        // Should recompile fresh (schema changed).
+        let rows = conn.query("SELECT val, extra FROM cc_ddl").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("a".to_owned()));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("x".to_owned()));
+    }
+
+    #[test]
+    fn test_compiled_cache_different_sql_not_confused() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE cc_diff (id INTEGER PRIMARY KEY, a TEXT, b TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO cc_diff VALUES (1, 'alpha', 'beta');")
+            .unwrap();
+
+        let rows_a = conn.query("SELECT a FROM cc_diff").unwrap();
+        let rows_b = conn.query("SELECT b FROM cc_diff").unwrap();
+
+        assert_eq!(rows_a[0].values()[0], SqliteValue::Text("alpha".to_owned()));
+        assert_eq!(rows_b[0].values()[0], SqliteValue::Text("beta".to_owned()));
     }
 
     // ── Window function tests ──────────────────────────────────────
@@ -36964,5 +37768,276 @@ mod pager_routing_tests {
                 // Also acceptable if the fallback path handles it gracefully.
             }
         }
+    }
+
+    // ── INSERT...SELECT WITH clause tests ──────────────────────────────────
+
+    #[test]
+    fn test_insert_select_with_cte() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO t WITH data(id, val) AS (VALUES (1,'a'),(2,'b')) SELECT id, val FROM data;",
+        )
+        .unwrap();
+        let rows = conn.query("SELECT id, val FROM t ORDER BY id;").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("a".to_owned()));
+        assert_eq!(rows[1].values()[1], SqliteValue::Text("b".to_owned()));
+    }
+
+    #[test]
+    fn test_insert_select_with_recursive_cte() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE nums (n INTEGER);").unwrap();
+        conn.execute(
+            "INSERT INTO nums WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM cnt WHERE x < 5) SELECT x FROM cnt;",
+        )
+        .unwrap();
+        let rows = conn.query("SELECT n FROM nums ORDER BY n;").unwrap();
+        assert_eq!(rows.len(), 5);
+        for (i, row) in rows.iter().enumerate() {
+            assert_eq!(
+                row.values()[0],
+                SqliteValue::Integer(i64::try_from(i + 1).unwrap())
+            );
+        }
+    }
+
+    // ── IN (SELECT ...) subquery tests ───────────────────────────────────
+
+    #[test]
+    fn test_in_subquery_select() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1 (id INTEGER PRIMARY KEY, name TEXT);")
+            .unwrap();
+        conn.execute("CREATE TABLE t2 (ref_id INTEGER);").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1, 'Alice');").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (2, 'Bob');").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (3, 'Carol');").unwrap();
+        conn.execute("INSERT INTO t2 VALUES (1);").unwrap();
+        conn.execute("INSERT INTO t2 VALUES (3);").unwrap();
+
+        let rows = conn
+            .query("SELECT name FROM t1 WHERE id IN (SELECT ref_id FROM t2) ORDER BY name;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("Alice".to_owned()));
+        assert_eq!(rows[1].values()[0], SqliteValue::Text("Carol".to_owned()));
+    }
+
+    #[test]
+    fn test_not_in_subquery_select() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1 (id INTEGER PRIMARY KEY, name TEXT);")
+            .unwrap();
+        conn.execute("CREATE TABLE t2 (ref_id INTEGER);").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1, 'Alice');").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (2, 'Bob');").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (3, 'Carol');").unwrap();
+        conn.execute("INSERT INTO t2 VALUES (1);").unwrap();
+        conn.execute("INSERT INTO t2 VALUES (3);").unwrap();
+
+        let rows = conn
+            .query("SELECT name FROM t1 WHERE id NOT IN (SELECT ref_id FROM t2);")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("Bob".to_owned()));
+    }
+
+    #[test]
+    fn test_in_subquery_update() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        conn.execute("CREATE TABLE t2 (ref_id INTEGER);").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1, 'old');").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (2, 'old');").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (3, 'old');").unwrap();
+        conn.execute("INSERT INTO t2 VALUES (1);").unwrap();
+        conn.execute("INSERT INTO t2 VALUES (3);").unwrap();
+
+        conn.execute("UPDATE t1 SET val = 'new' WHERE id IN (SELECT ref_id FROM t2);")
+            .unwrap();
+
+        let rows = conn.query("SELECT id, val FROM t1 ORDER BY id;").unwrap();
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("new".to_owned()));
+        assert_eq!(rows[1].values()[1], SqliteValue::Text("old".to_owned()));
+        assert_eq!(rows[2].values()[1], SqliteValue::Text("new".to_owned()));
+    }
+
+    #[test]
+    fn test_in_subquery_delete() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        conn.execute("CREATE TABLE t2 (ref_id INTEGER);").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1, 'a');").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (2, 'b');").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (3, 'c');").unwrap();
+        conn.execute("INSERT INTO t2 VALUES (2);").unwrap();
+
+        conn.execute("DELETE FROM t1 WHERE id IN (SELECT ref_id FROM t2);")
+            .unwrap();
+
+        let rows = conn.query("SELECT id FROM t1 ORDER BY id;").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+        assert_eq!(rows[1].values()[0], SqliteValue::Integer(3));
+    }
+
+    #[test]
+    fn test_in_subquery_empty() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        conn.execute("CREATE TABLE t2 (ref_id INTEGER);").unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1, 'a');").unwrap();
+
+        let rows = conn
+            .query("SELECT id FROM t1 WHERE id IN (SELECT ref_id FROM t2);")
+            .unwrap();
+        assert_eq!(rows.len(), 0);
+    }
+
+    // ── ATTACH/DETACH tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_attach_and_detach_database() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("ATTACH DATABASE ':memory:' AS aux;").unwrap();
+        conn.execute("DETACH DATABASE aux;").unwrap();
+    }
+
+    #[test]
+    fn test_attach_duplicate_fails() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("ATTACH DATABASE ':memory:' AS aux;").unwrap();
+        let result = conn.execute("ATTACH DATABASE ':memory:' AS aux;");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_detach_reserved_fails() {
+        let conn = Connection::open(":memory:").unwrap();
+        let result = conn.execute("DETACH DATABASE main;");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_attach_max_limit() {
+        let conn = Connection::open(":memory:").unwrap();
+        for i in 0..10 {
+            conn.execute(&format!("ATTACH DATABASE ':memory:' AS db{i};"))
+                .unwrap();
+        }
+        let result = conn.execute("ATTACH DATABASE ':memory:' AS overflow;");
+        assert!(result.is_err());
+    }
+
+    // ── PRAGMA introspection tests ───────────────────────────────────────
+
+    #[test]
+    fn test_pragma_index_list() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (a TEXT, b INTEGER);").unwrap();
+        conn.execute("CREATE INDEX idx_a ON t(a);").unwrap();
+        let rows = conn.query("PRAGMA index_list(t);").unwrap();
+        assert!(!rows.is_empty());
+        let names: Vec<_> = rows
+            .iter()
+            .filter_map(|r| {
+                if let SqliteValue::Text(s) = &r.values()[1] {
+                    Some(s.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert!(
+            names.iter().any(|n| n.contains("idx_a")),
+            "expected idx_a in {names:?}"
+        );
+    }
+
+    #[test]
+    fn test_pragma_index_info() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (a TEXT, b INTEGER);").unwrap();
+        conn.execute("CREATE INDEX idx_ab ON t(a, b);").unwrap();
+        let rows = conn.query("PRAGMA index_info(idx_ab);").unwrap();
+        assert_eq!(rows.len(), 2);
+        // First column should be 'a', second 'b'
+        assert_eq!(rows[0].values()[2], SqliteValue::Text("a".to_owned()));
+        assert_eq!(rows[1].values()[2], SqliteValue::Text("b".to_owned()));
+    }
+
+    #[test]
+    fn test_pragma_compile_options() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn.query("PRAGMA compile_options;").unwrap();
+        assert!(!rows.is_empty());
+        let options: Vec<_> = rows
+            .iter()
+            .filter_map(|r| {
+                if let SqliteValue::Text(s) = &r.values()[0] {
+                    Some(s.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert!(
+            options.iter().any(|o| o.contains("COMPILER")),
+            "expected COMPILER in {options:?}"
+        );
+    }
+
+    #[test]
+    fn test_pragma_database_list_with_attach() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn.query("PRAGMA database_list;").unwrap();
+        // At minimum, main and temp should be listed.
+        assert!(rows.len() >= 2);
+        let names: Vec<_> = rows
+            .iter()
+            .filter_map(|r| {
+                if let SqliteValue::Text(s) = &r.values()[1] {
+                    Some(s.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert!(names.contains(&"main".to_owned()));
+        assert!(names.contains(&"temp".to_owned()));
+    }
+
+    #[test]
+    fn test_pragma_table_list() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE foo (id INTEGER PRIMARY KEY);")
+            .unwrap();
+        conn.execute("CREATE TABLE bar (name TEXT);").unwrap();
+        let rows = conn.query("PRAGMA table_list;").unwrap();
+        let names: Vec<_> = rows
+            .iter()
+            .filter_map(|r| {
+                if let SqliteValue::Text(s) = &r.values()[1] {
+                    Some(s.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert!(
+            names.contains(&"foo".to_owned()),
+            "expected foo in {names:?}"
+        );
+        assert!(
+            names.contains(&"bar".to_owned()),
+            "expected bar in {names:?}"
+        );
     }
 }
