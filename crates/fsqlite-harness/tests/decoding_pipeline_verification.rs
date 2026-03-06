@@ -445,12 +445,13 @@ fn test_inactive_subsystem_bounded() {
 
         #[allow(clippy::cast_precision_loss)]
         let sqrt_k = (k as f64).sqrt();
+        let inactive_bound = sqrt_k.mul_add(3.0, 35.0);
         // Account for S+H pre-coding constraints which dominate for small K.
         assert!(
-            (result.stats.inactivated as f64) < sqrt_k * 3.0 + 35.0,
+            (result.stats.inactivated as f64) < inactive_bound,
             "bead_id={BEAD_ID} k={k}: inactive={} > bound={:.0}",
             result.stats.inactivated,
-            sqrt_k * 3.0 + 35.0
+            inactive_bound
         );
     }
 }

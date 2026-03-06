@@ -4791,6 +4791,7 @@ impl VdbeEngine {
 
                 Opcode::IfNullRow => {
                     // Jump to p2 if cursor p1 is not positioned on a row.
+                    // C SQLite also sets register P3 to NULL before jumping.
                     let is_null = if let Some(cursor) = self.storage_cursors.get(&op.p1) {
                         cursor.cursor.eof()
                     } else {
@@ -4799,6 +4800,9 @@ impl VdbeEngine {
                             .is_none_or(|c| c.position.is_none() && !c.is_pseudo)
                     };
                     if is_null {
+                        if op.p3 > 0 {
+                            self.set_reg(op.p3, SqliteValue::Null);
+                        }
                         pc = op.p2 as usize;
                     } else {
                         pc += 1;
@@ -6524,6 +6528,7 @@ impl VdbeEngine {
 
 /// SQLite affinity constants (from §3.2 of datatype3.html).
 /// Encoded in the lower bits of comparison opcode p5 (masked by 0x47).
+const SQLITE_AFF_TEXT: u16 = 0x42; // 'B'
 const SQLITE_AFF_NUMERIC: u16 = 0x43; // 'C'
 
 /// Apply SQLite comparison affinity coercion (§3.2 of datatype3.html).
@@ -6544,7 +6549,25 @@ fn coerce_for_comparison<'a>(
 
     let affinity = p5 & 0x47_u16; // SQLITE_AFF_MASK
 
-    // Only coerce text→numeric when the opcode carries numeric affinity.
+    // TEXT affinity (0x42): convert numeric operands to text for comparison.
+    if affinity == SQLITE_AFF_TEXT {
+        let coerce_to_text = |v: &SqliteValue| -> Option<SqliteValue> {
+            match v {
+                SqliteValue::Integer(_) | SqliteValue::Float(_) => {
+                    Some(SqliteValue::Text(v.to_text()))
+                }
+                _ => None,
+            }
+        };
+        let new_lhs = coerce_to_text(lhs);
+        let new_rhs = coerce_to_text(rhs);
+        return (
+            new_lhs.map_or_else(|| Cow::Borrowed(lhs), Cow::Owned),
+            new_rhs.map_or_else(|| Cow::Borrowed(rhs), Cow::Owned),
+        );
+    }
+
+    // Numeric affinity (>= 0x43): coerce text→numeric when one side is numeric.
     if affinity >= SQLITE_AFF_NUMERIC {
         let is_numeric =
             |v: &SqliteValue| matches!(v, SqliteValue::Integer(_) | SqliteValue::Float(_));
@@ -6941,6 +6964,7 @@ fn opcode_register_spans(op: &VdbeOp) -> OpcodeRegisterSpans {
 
 /// SQL division with NULL propagation and division-by-zero handling.
 #[allow(clippy::cast_precision_loss)]
+#[allow(clippy::cast_precision_loss)]
 fn sql_div(dividend: &SqliteValue, divisor: &SqliteValue) -> SqliteValue {
     if dividend.is_null() || divisor.is_null() {
         return SqliteValue::Null;
@@ -6951,9 +6975,16 @@ fn sql_div(dividend: &SqliteValue, divisor: &SqliteValue) -> SqliteValue {
         } else {
             match a.checked_div(*b) {
                 Some(result) => SqliteValue::Integer(result),
-                // i64::MIN / -1 overflows; C SQLite wraps via two's complement
-                // (-iA == i64::MIN), so we return Integer(i64::MIN) for parity.
-                None => SqliteValue::Integer(i64::MIN),
+                // i64::MIN / -1 overflows; C SQLite promotes to float via
+                // `goto fp_math` (vdbe.c:1916), NOT wrapping.
+                None => {
+                    let result = *a as f64 / *b as f64;
+                    if result.is_nan() {
+                        SqliteValue::Null
+                    } else {
+                        SqliteValue::Float(result)
+                    }
+                }
             }
         }
     } else {
@@ -6972,20 +7003,33 @@ fn sql_div(dividend: &SqliteValue, divisor: &SqliteValue) -> SqliteValue {
 }
 
 /// SQL remainder with NULL propagation and division-by-zero handling.
+///
+/// C SQLite (vdbe.c:1920): when both operands are MEM_Int, result is Integer.
+/// When either is Float/Text/Blob, fp_math path casts to integer for the
+/// modulo but stores the result as Float (MEM_Real).
+#[allow(clippy::cast_precision_loss)]
 fn sql_rem(dividend: &SqliteValue, divisor: &SqliteValue) -> SqliteValue {
     if dividend.is_null() || divisor.is_null() {
         return SqliteValue::Null;
     }
-    // C SQLite: OP_Remainder always casts operands to integers before modulo.
+    let both_int = matches!(
+        (dividend, divisor),
+        (SqliteValue::Integer(_), SqliteValue::Integer(_))
+    );
     let a = dividend.to_integer();
     let b = divisor.to_integer();
     if b == 0 {
         return SqliteValue::Null;
     }
-    match a.checked_rem(b) {
-        Some(result) => SqliteValue::Integer(result),
+    let result = match a.checked_rem(b) {
+        Some(r) => r,
         // i64::MIN % -1 = 0 mathematically.
-        None => SqliteValue::Integer(0),
+        None => 0,
+    };
+    if both_int {
+        SqliteValue::Integer(result)
+    } else {
+        SqliteValue::Float(result as f64)
     }
 }
 
@@ -7058,6 +7102,23 @@ fn sql_or(a: &SqliteValue, b: &SqliteValue) -> SqliteValue {
         (Some(true), _) | (_, Some(true)) => SqliteValue::Integer(1),
         (Some(false), Some(false)) => SqliteValue::Integer(0),
         _ => SqliteValue::Null,
+    }
+}
+
+/// Convert a float to i64 with clamping, matching C SQLite's `doubleToInt64`.
+///
+/// - Inf → i64::MAX, -Inf → i64::MIN, NaN → 0
+/// - Finite values truncate toward zero, clamped to i64 range.
+#[allow(clippy::cast_possible_truncation)]
+fn cast_float_to_i64(f: f64) -> i64 {
+    if f.is_nan() {
+        0
+    } else if f >= i64::MAX as f64 {
+        i64::MAX
+    } else if f <= i64::MIN as f64 {
+        i64::MIN
+    } else {
+        f as i64
     }
 }
 
@@ -7147,14 +7208,19 @@ fn sql_cast(val: SqliteValue, target: i32) -> SqliteValue {
             match &val {
                 SqliteValue::Text(s) => {
                     let trimmed = s.trim();
-                    if let Ok(i) = trimmed.parse::<i64>() {
-                        return SqliteValue::Integer(i);
-                    }
-                    // Parse leading numeric prefix (digits, optional sign, optional
-                    // decimal, optional exponent).  Matches SQLite's sqlite3Atoi64
-                    // / sqlite3AtoF prefix extraction.
                     let bytes = trimmed.as_bytes();
                     let end = scan_numeric_prefix(bytes);
+                    // Full-string numeric match (rejects Rust's "nan"/"inf" parsing).
+                    if end == trimmed.len() && end > 0 {
+                        if let Ok(i) = trimmed.parse::<i64>() {
+                            return SqliteValue::Integer(i);
+                        }
+                        #[allow(clippy::cast_possible_truncation)]
+                        if let Ok(f) = trimmed.parse::<f64>() {
+                            return SqliteValue::Integer(cast_float_to_i64(f));
+                        }
+                    }
+                    // Prefix match for strings with trailing non-numeric text.
                     if end > 0 {
                         let prefix = &trimmed[..end];
                         if let Ok(i) = prefix.parse::<i64>() {
@@ -7162,9 +7228,7 @@ fn sql_cast(val: SqliteValue, target: i32) -> SqliteValue {
                         }
                         #[allow(clippy::cast_possible_truncation)]
                         if let Ok(f) = prefix.parse::<f64>() {
-                            if f.is_finite() {
-                                return SqliteValue::Integer(f as i64);
-                            }
+                            return SqliteValue::Integer(cast_float_to_i64(f));
                         }
                     }
                     SqliteValue::Integer(0)
@@ -7174,21 +7238,21 @@ fn sql_cast(val: SqliteValue, target: i32) -> SqliteValue {
         }
         b'E' | b'e' => {
             // C SQLite: CAST('3.14abc' AS REAL) extracts leading numeric prefix.
+            // C SQLite allows Inf from "1e999" but not from literal "inf" text.
             match &val {
                 SqliteValue::Text(s) => {
                     let trimmed = s.trim();
-                    if let Ok(f) = trimmed.parse::<f64>() {
-                        // Reject non-finite (NaN/Inf) — sqlite3AtoF doesn't recognize them.
-                        if f.is_finite() {
+                    let end = scan_numeric_prefix(trimmed.as_bytes());
+                    // Full-string numeric match (rejects Rust's "nan"/"inf" parsing).
+                    if end == trimmed.len() && end > 0 {
+                        if let Ok(f) = trimmed.parse::<f64>() {
                             return SqliteValue::Float(f);
                         }
                     }
-                    let end = scan_numeric_prefix(trimmed.as_bytes());
+                    // Prefix match for strings with trailing non-numeric text.
                     if end > 0 {
                         if let Ok(f) = trimmed[..end].parse::<f64>() {
-                            if f.is_finite() {
-                                return SqliteValue::Float(f);
-                            }
+                            return SqliteValue::Float(f);
                         }
                     }
                     SqliteValue::Float(0.0)

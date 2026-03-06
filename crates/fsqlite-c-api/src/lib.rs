@@ -20,9 +20,9 @@
 use std::ffi::{CStr, CString};
 use std::fmt::Write as _;
 use std::os::raw::{c_char, c_double, c_int, c_void};
-use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::sync::LazyLock;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 
 use fsqlite::Connection;
 use fsqlite_error::{ErrorCode, FrankenError};
@@ -741,10 +741,8 @@ pub unsafe extern "C" fn sqlite3_column_int64(stmt: *mut Sqlite3Stmt, i_col: c_i
     COMPAT_COLUMN.fetch_add(1, Ordering::Relaxed);
 
     match current_value_ref(stmt, i_col) {
-        Some(SqliteValue::Integer(n)) => *n,
-        Some(SqliteValue::Float(f)) => *f as i64,
-        Some(SqliteValue::Text(s)) => s.trim().parse::<i64>().unwrap_or(0),
-        _ => 0,
+        Some(v) => v.to_integer(),
+        None => 0,
     }
 }
 
@@ -768,17 +766,8 @@ pub unsafe extern "C" fn sqlite3_column_double(stmt: *mut Sqlite3Stmt, i_col: c_
     COMPAT_COLUMN.fetch_add(1, Ordering::Relaxed);
 
     match current_value_ref(stmt, i_col) {
-        Some(SqliteValue::Float(f)) => *f,
-        Some(SqliteValue::Integer(n)) => *n as f64,
-        Some(SqliteValue::Text(s)) => {
-            // Reject non-finite (NaN/Inf) — sqlite3AtoF doesn't recognize them.
-            s.trim()
-                .parse::<f64>()
-                .ok()
-                .filter(|f| f.is_finite())
-                .unwrap_or(0.0)
-        }
-        _ => 0.0,
+        Some(v) => v.to_float(),
+        None => 0.0,
     }
 }
 
@@ -896,8 +885,8 @@ pub unsafe extern "C" fn sqlite3_column_bytes(stmt: *mut Sqlite3Stmt, i_col: c_i
     match current_value_ref(stmt, i_col) {
         Some(SqliteValue::Blob(b)) => b.len() as c_int,
         Some(SqliteValue::Text(s)) => s.len() as c_int,
-        // SQLite returns the byte length of the text representation for integers;
-        // we return 0 for all other types.
+        // C SQLite coerces to text and returns the byte length.
+        Some(v @ (SqliteValue::Integer(_) | SqliteValue::Float(_))) => v.to_text().len() as c_int,
         _ => 0,
     }
 }

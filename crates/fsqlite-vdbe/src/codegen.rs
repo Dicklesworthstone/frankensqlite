@@ -5984,9 +5984,19 @@ fn codegen_update_from(
         }),
     };
 
+    // Count anonymous placeholders in SET assignments so WHERE
+    // placeholders start after them (SQL textual order: SET before WHERE).
+    let set_placeholder_count: u32 = stmt
+        .assignments
+        .iter()
+        .map(|a| count_anon_placeholders(&a.value))
+        .sum();
+
     // WHERE filter.
     let skip_label = b.emit_label();
     if let Some(where_expr) = &stmt.where_clause {
+        // Set placeholder counter to start after SET placeholders.
+        b.set_next_anon_placeholder(set_placeholder_count + 1);
         let cond_reg = b.alloc_temp();
         emit_expr(b, where_expr, cond_reg, Some(&scan));
         b.emit_jump_to_label(Opcode::IfNot, cond_reg, 1, skip_label, P4::None, 0);
@@ -6017,7 +6027,8 @@ fn codegen_update_from(
     // Delete old index entries before updating.
     emit_index_deletes(b, target, target_cursor);
 
-    // Evaluate SET assignments. Column refs can reference both target and FROM tables.
+    // Evaluate SET assignments. Reset placeholder counter to 1 (SET first in SQL text).
+    b.set_next_anon_placeholder(1);
     for (assign_idx, col_idx) in assignment_cols.iter().enumerate() {
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
         let target_reg = col_regs + *col_idx as i32;

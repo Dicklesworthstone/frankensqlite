@@ -512,7 +512,17 @@ impl<P: PageReader> BtCursor<P> {
     fn load_page(&mut self, cx: &Cx, page_no: PageNumber) -> Result<StackEntry> {
         let page_data = self.pager.read_page(cx, page_no)?;
         let header_offset = cell::header_offset_for_page(page_no);
-        let header = BtreePageHeader::parse(&page_data, header_offset)?;
+        let header =
+            BtreePageHeader::parse(&page_data, header_offset).map_err(|error| {
+                FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "failed to parse B-tree page {} at header offset {}: {}",
+                        page_no.get(),
+                        header_offset,
+                        error
+                    ),
+                }
+            })?;
         let cell_pointers = cell::read_cell_pointers(&page_data, &header, header_offset)?;
         self.note_page_visit(page_no);
 

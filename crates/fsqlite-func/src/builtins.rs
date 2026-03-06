@@ -2060,7 +2060,8 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<String> {
                 }
             }
             'w' => {
-                // Double-quote escaping for identifiers; NULL → "(NULL)"
+                // Double-quote escaping for identifiers; NULL → "(NULL)".
+                // C SQLite %w only escapes internal double quotes (no surrounding quotes).
                 let param = params.get(param_idx);
                 param_idx += 1;
                 if matches!(param, Some(SqliteValue::Null) | None) {
@@ -2068,9 +2069,7 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<String> {
                 } else {
                     let val = param.map(SqliteValue::to_text).unwrap_or_default();
                     let escaped = val.replace('"', "\"\"");
-                    result.push('"');
                     result.push_str(&escaped);
-                    result.push('"');
                 }
             }
             'x' | 'X' => {

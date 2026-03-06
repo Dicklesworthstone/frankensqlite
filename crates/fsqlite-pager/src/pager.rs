@@ -105,6 +105,104 @@ impl<F: VfsFile> PagerInner<F> {
         Ok(slice.to_vec())
     }
 
+    /// Read a page from the latest committed database state without consulting
+    /// the local cache.
+    ///
+    /// This is used to refresh connection-local pager metadata after another
+    /// connection has committed. The local cache may still reflect an older
+    /// generation, so committed-state refresh must bypass it.
+    fn read_committed_page_copy(&mut self, cx: &Cx, page_no: PageNumber) -> Result<Vec<u8>> {
+        if self.journal_mode == JournalMode::Wal
+            && let Some(ref mut wal) = self.wal_backend
+            && let Some(wal_data) = wal.read_page(cx, page_no.get())?
+        {
+            return Ok(wal_data);
+        }
+
+        let page_size = self.page_size.as_usize();
+        let offset = u64::from(page_no.get().saturating_sub(1)) * page_size as u64;
+        let file_size = self.db_file.file_size(cx)?;
+        if offset >= file_size {
+            return Ok(vec![0_u8; page_size]);
+        }
+
+        let mut out = vec![0_u8; page_size];
+        let bytes_read = self.db_file.read(cx, &mut out, offset)?;
+        if bytes_read < page_size {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "short read fetching committed page {page}: got {bytes_read} of {page_size}",
+                    page = page_no.get()
+                ),
+            });
+        }
+        Ok(out)
+    }
+
+    /// Refresh connection-local pager metadata from the latest committed state.
+    ///
+    /// Returns `true` when WAL snapshot setup was already performed as part of
+    /// the refresh and does not need to be repeated for the new transaction.
+    fn refresh_committed_state(&mut self, cx: &Cx) -> Result<bool> {
+        let wal_snapshot_initialized = if self.journal_mode == JournalMode::Wal {
+            let wal = self.wal_backend.as_mut().ok_or_else(|| {
+                FrankenError::internal("WAL mode active but no WAL backend installed")
+            })?;
+            wal.begin_transaction(cx)?;
+            true
+        } else {
+            false
+        };
+
+        let page1 = self.read_committed_page_copy(cx, PageNumber::ONE)?;
+        if page1.len() < DATABASE_HEADER_SIZE {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "committed page 1 too small for database header: got {}, need {}",
+                    page1.len(),
+                    DATABASE_HEADER_SIZE
+                ),
+            });
+        }
+
+        let mut header_bytes = [0_u8; DATABASE_HEADER_SIZE];
+        header_bytes.copy_from_slice(&page1[..DATABASE_HEADER_SIZE]);
+        let header = DatabaseHeader::from_bytes(&header_bytes).map_err(|error| {
+            FrankenError::DatabaseCorrupt {
+                detail: format!("invalid database header during pager refresh: {error}"),
+            }
+        })?;
+
+        let db_size = if header.is_page_count_stale() {
+            let file_size = self.db_file.file_size(cx)?;
+            header
+                .page_count_from_file_size(file_size)
+                .unwrap_or(header.page_count)
+        } else {
+            header.page_count
+        }
+        .max(1);
+        let freelist = load_freelist_from_committed_state(
+            cx,
+            self,
+            db_size,
+            header.freelist_trunk,
+            header.freelist_count,
+        )?;
+
+        self.db_size = db_size;
+        self.next_page = if db_size >= 2 {
+            db_size.saturating_add(1)
+        } else {
+            2
+        };
+        self.freelist = freelist;
+        self.commit_seq = CommitSeq::new(u64::from(header.change_counter));
+        self.cache.clear();
+
+        Ok(wal_snapshot_initialized)
+    }
+
     /// Flush page data to cache and file.
     fn flush_page(&mut self, cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()> {
         if let Some(cached) = self.cache.get_mut(page_no) {
@@ -236,6 +334,87 @@ fn load_freelist_from_disk<F: VfsFile>(
     Ok(normalize_freelist(&out, db_size))
 }
 
+fn load_freelist_from_committed_state<F: VfsFile>(
+    cx: &Cx,
+    inner: &mut PagerInner<F>,
+    db_size: u32,
+    first_trunk: u32,
+    freelist_count: u32,
+) -> Result<Vec<PageNumber>> {
+    if first_trunk == 0 || freelist_count == 0 {
+        return Ok(Vec::new());
+    }
+
+    let ps = inner.page_size.as_usize();
+    let mut visited: HashSet<u32> = HashSet::new();
+    let mut out: Vec<PageNumber> = Vec::with_capacity(freelist_count as usize);
+    let mut trunk = first_trunk;
+
+    while trunk != 0 && out.len() < freelist_count as usize {
+        if trunk > db_size {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!("freelist trunk page {trunk} exceeds db_size {db_size}"),
+            });
+        }
+        if !visited.insert(trunk) {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!("freelist loop detected at trunk page {trunk}"),
+            });
+        }
+
+        let trunk_page = PageNumber::new(trunk).ok_or_else(|| FrankenError::DatabaseCorrupt {
+            detail: format!("invalid freelist trunk page number {trunk}"),
+        })?;
+        out.push(trunk_page);
+
+        let buf = inner.read_committed_page_copy(cx, trunk_page)?;
+        if buf.len() < ps {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "short read loading committed freelist trunk page {trunk}: got {} of {ps}",
+                    buf.len()
+                ),
+            });
+        }
+
+        let next_trunk = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        let leaf_count = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
+        let max_leaf_entries = (ps / 4).saturating_sub(2);
+        if leaf_count > max_leaf_entries {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "freelist trunk {trunk} leaf_count {leaf_count} exceeds max {max_leaf_entries}"
+                ),
+            });
+        }
+
+        for idx in 0..leaf_count {
+            if out.len() >= freelist_count as usize {
+                break;
+            }
+            let base = 8 + idx * 4;
+            let leaf = u32::from_be_bytes([buf[base], buf[base + 1], buf[base + 2], buf[base + 3]]);
+            if leaf == 0 {
+                continue;
+            }
+            if leaf > db_size {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!("freelist leaf page {leaf} exceeds db_size {db_size}"),
+                });
+            }
+            let leaf_page = PageNumber::new(leaf).ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: format!("invalid freelist leaf page number {leaf}"),
+            })?;
+            out.push(leaf_page);
+        }
+
+        trunk = next_trunk;
+    }
+
+    out.truncate(freelist_count as usize);
+    Ok(normalize_freelist(&out, db_size))
+}
+
 fn serialize_freelist_to_write_set<F: VfsFile>(
     cx: &Cx,
     inner: &mut PagerInner<F>,
@@ -294,20 +473,28 @@ fn serialize_freelist_to_write_set<F: VfsFile>(
         }
     }
 
-    let mut page1 = if let Some(buf) = write_set.remove(&PageNumber::ONE) {
-        buf
-    } else {
-        let page1_vec = inner.read_page_copy(cx, PageNumber::ONE)?;
-        let mut buf = inner.cache.pool().acquire()?;
-        buf.copy_from_slice(&page1_vec);
-        buf
-    };
+    let mut page1 = ensure_page_one_in_write_set(cx, inner, write_set)?;
 
     page1[32..36].copy_from_slice(&first_trunk.to_be_bytes());
     page1[36..40].copy_from_slice(&total_free.to_be_bytes());
     write_set.insert(PageNumber::ONE, page1);
 
     Ok(())
+}
+
+fn ensure_page_one_in_write_set<F: VfsFile>(
+    cx: &Cx,
+    inner: &mut PagerInner<F>,
+    write_set: &mut HashMap<PageNumber, PageBuf>,
+) -> Result<PageBuf> {
+    if let Some(buf) = write_set.remove(&PageNumber::ONE) {
+        return Ok(buf);
+    }
+
+    let page1_vec = inner.read_page_copy(cx, PageNumber::ONE)?;
+    let mut buf = inner.cache.pool().acquire()?;
+    buf.copy_from_slice(&page1_vec);
+    Ok(buf)
 }
 
 /// A concrete single-writer pager backed by a VFS file.
@@ -339,6 +526,12 @@ where
             return Err(FrankenError::Busy);
         }
 
+        let wal_snapshot_initialized = if inner.active_transactions == 0 {
+            inner.refresh_committed_state(cx)?
+        } else {
+            false
+        };
+
         let eager_writer = matches!(
             mode,
             TransactionMode::Immediate | TransactionMode::Exclusive
@@ -350,7 +543,7 @@ where
             inner.writer_active = true;
         }
 
-        if inner.journal_mode == JournalMode::Wal {
+        if inner.journal_mode == JournalMode::Wal && !wal_snapshot_initialized {
             let wal_begin_result = {
                 let wal = inner.wal_backend.as_mut().ok_or_else(|| {
                     FrankenError::internal("WAL mode active but no WAL backend installed")
@@ -438,6 +631,11 @@ impl<V: Vfs> SimplePager<V>
 where
     V::File: Send + Sync,
 {
+    /// Clone the pager's VFS handle for companion-file operations.
+    pub fn vfs_handle(&self) -> Arc<V> {
+        Arc::clone(&self.vfs)
+    }
+
     /// Capture point-in-time page-cache counters.
     pub fn cache_metrics_snapshot(&self) -> Result<PageCacheMetricsSnapshot> {
         let inner = self
@@ -606,7 +804,7 @@ where
                 freelist,
                 journal_mode: JournalMode::Delete,
                 wal_backend: None,
-                commit_seq: CommitSeq::ZERO,
+                commit_seq: CommitSeq::new(u64::from(header.change_counter)),
             })),
         })
     }
@@ -1603,6 +1801,30 @@ mod tests {
         assert!(
             matches!(err, FrankenError::DatabaseCorrupt { .. }),
             "bead_id={BEAD_ID} case=reject_page_size_mismatch"
+        );
+    }
+
+    #[test]
+    fn test_begin_refreshes_external_page_growth_before_allocation() {
+        let vfs = MemoryVfs::new();
+        let path = PathBuf::from("/pager_refresh_external_growth.db");
+        let pager1 = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT).unwrap();
+        let pager2 = SimplePager::open(vfs, &path, PageSize::DEFAULT).unwrap();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        let mut writer1 = pager1.begin(&cx, TransactionMode::Immediate).unwrap();
+        let page2 = writer1.allocate_page(&cx).unwrap();
+        assert_eq!(page2.get(), 2, "first writer should allocate page 2");
+        writer1.write_page(&cx, page2, &vec![0xAB; ps]).unwrap();
+        writer1.commit(&cx).unwrap();
+
+        let mut writer2 = pager2.begin(&cx, TransactionMode::Immediate).unwrap();
+        let page3 = writer2.allocate_page(&cx).unwrap();
+        assert_eq!(
+            page3.get(),
+            3,
+            "bead_id={BEAD_ID} case=refresh_external_growth_reissues_next_page"
         );
     }
 
