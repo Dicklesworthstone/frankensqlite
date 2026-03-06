@@ -719,14 +719,17 @@ impl ScalarFunction for RoundFunc {
         if !(-4_503_599_627_370_496.0..=4_503_599_627_370_496.0).contains(&x) {
             return Ok(SqliteValue::Float(x));
         }
-        // Round half away from zero (NOT banker's rounding).
-        // n is in [0, 30] so the i32 cast is lossless.
-        #[allow(clippy::cast_possible_truncation)]
-        let factor = 10.0_f64.powi(n as i32);
-        let rounded = if x >= 0.0 {
-            (x * factor + 0.5).floor() / factor
+        let rounded = if n == 0 {
+            // n==0: round half away from zero via integer truncation.
+            #[allow(clippy::cast_possible_truncation)]
+            let r = (x + if x < 0.0 { -0.5 } else { 0.5 }) as i64;
+            r as f64
         } else {
-            (x * factor - 0.5).ceil() / factor
+            // n>0: use string formatting (matching C SQLite's printf-based
+            // approach) to avoid intermediate float precision errors.
+            #[allow(clippy::cast_possible_truncation)]
+            let s = format!("{x:.prec$}", prec = n as usize);
+            s.parse::<f64>().unwrap_or(x)
         };
         Ok(SqliteValue::Float(rounded))
     }
