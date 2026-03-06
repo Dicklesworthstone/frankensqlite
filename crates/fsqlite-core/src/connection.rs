@@ -41045,10 +41045,7 @@ mod pager_routing_tests {
             for m in &mismatches {
                 eprintln!("{m}\n");
             }
-            panic!(
-                "{} compound/CTE mismatches found",
-                mismatches.len()
-            );
+            panic!("{} compound/CTE mismatches found", mismatches.len());
         }
     }
 
@@ -41099,6 +41096,76 @@ mod pager_routing_tests {
             }
             panic!(
                 "{} correlated/update probe mismatches found",
+                mismatches.len()
+            );
+        }
+    }
+
+    /// Probe LIMIT/OFFSET, aggregate expressions in JOINs,
+    /// GROUP BY edge cases, and HAVING with expressions.
+    #[test]
+    fn test_conformance_limit_agg_join() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE orders (id INTEGER PRIMARY KEY, cust_id INTEGER, amount REAL, status TEXT);",
+            "INSERT INTO orders VALUES (1, 1, 100.0, 'shipped');",
+            "INSERT INTO orders VALUES (2, 1, 50.0, 'pending');",
+            "INSERT INTO orders VALUES (3, 2, 200.0, 'shipped');",
+            "INSERT INTO orders VALUES (4, 2, 75.0, 'shipped');",
+            "INSERT INTO orders VALUES (5, 3, 300.0, 'pending');",
+            "INSERT INTO orders VALUES (6, 3, 25.0, 'cancelled');",
+            "CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT, region TEXT);",
+            "INSERT INTO customers VALUES (1, 'Alice', 'east');",
+            "INSERT INTO customers VALUES (2, 'Bob', 'west');",
+            "INSERT INTO customers VALUES (3, 'Carol', 'east');",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            // LIMIT with literal
+            "SELECT id FROM orders ORDER BY id LIMIT 3",
+            // LIMIT with OFFSET
+            "SELECT id FROM orders ORDER BY id LIMIT 2 OFFSET 2",
+            // LIMIT 0
+            "SELECT id FROM orders ORDER BY id LIMIT 0",
+            // OFFSET without LIMIT (SQLite treats as LIMIT -1 OFFSET n)
+            "SELECT id FROM orders ORDER BY id LIMIT -1 OFFSET 3",
+            // Aggregate with JOIN
+            "SELECT c.name, SUM(o.amount) AS total FROM customers c JOIN orders o ON c.id = o.cust_id GROUP BY c.name ORDER BY c.name",
+            // COUNT with JOIN
+            "SELECT c.name, COUNT(o.id) AS cnt FROM customers c JOIN orders o ON c.id = o.cust_id GROUP BY c.name ORDER BY c.name",
+            // AVG with JOIN
+            "SELECT c.name, AVG(o.amount) AS avg_amt FROM customers c JOIN orders o ON c.id = o.cust_id GROUP BY c.name ORDER BY c.name",
+            // HAVING with expression
+            "SELECT c.name, SUM(o.amount) AS total FROM customers c JOIN orders o ON c.id = o.cust_id GROUP BY c.name HAVING SUM(o.amount) > 150 ORDER BY c.name",
+            // Aggregate over CASE in JOIN
+            "SELECT c.region, SUM(CASE WHEN o.status = 'shipped' THEN o.amount ELSE 0 END) AS shipped_total FROM customers c JOIN orders o ON c.id = o.cust_id GROUP BY c.region ORDER BY c.region",
+            // COUNT DISTINCT in JOIN
+            "SELECT c.region, COUNT(DISTINCT o.status) AS status_count FROM customers c JOIN orders o ON c.id = o.cust_id GROUP BY c.region ORDER BY c.region",
+            // GROUP BY with multiple aggregates
+            "SELECT c.region, MIN(o.amount), MAX(o.amount), COUNT(*) FROM customers c JOIN orders o ON c.id = o.cust_id GROUP BY c.region ORDER BY c.region",
+            // Subquery in FROM with LIMIT
+            "SELECT * FROM (SELECT id, amount FROM orders ORDER BY amount DESC LIMIT 3) sub ORDER BY sub.id",
+            // GROUP BY ordinal with HAVING
+            "SELECT status, COUNT(*) AS cnt FROM orders GROUP BY 1 HAVING COUNT(*) > 1 ORDER BY 1",
+            // COALESCE in aggregate
+            "SELECT SUM(COALESCE(amount, 0)) FROM orders",
+            // Nested aggregate: max of group sums (via subquery)
+            "SELECT MAX(total) FROM (SELECT cust_id, SUM(amount) AS total FROM orders GROUP BY cust_id)",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!(
+                "{} limit/agg/join conformance mismatches found",
                 mismatches.len()
             );
         }

@@ -2953,6 +2953,52 @@ fn emit_agg_wrapper(b: &mut ProgramBuilder, wrapper: &Expr, result_reg: i32) {
 
 /// Emit bytecode for a multi-aggregate wrapper expression.
 ///
+/// Evaluate a simple aggregate wrapper expression (e.g. `COUNT(*) - 1`).
+///
+/// The wrapper uses a single placeholder column `__agg_result__` that maps
+/// to the finalized aggregate value in `accum_reg`.
+fn emit_simple_agg_wrapper(
+    b: &mut ProgramBuilder,
+    wrapper: &Expr,
+    result_reg: i32,
+    accum_reg: i32,
+) {
+    let columns = vec![ColumnInfo {
+        name: "__agg_result__".to_owned(),
+        affinity: 'A',
+        is_ipk: false,
+        type_name: Some("ANY".to_owned()),
+        notnull: false,
+        unique: false,
+        default_value: None,
+        strict_type: None,
+        generated_expr: None,
+        generated_stored: None,
+        collation: None,
+    }];
+    let fake_table = TableSchema {
+        name: String::new(),
+        root_page: 0,
+        columns,
+        indexes: vec![],
+        strict: false,
+        foreign_keys: Vec::new(),
+        check_constraints: Vec::new(),
+    };
+    let scan = ScanCtx {
+        cursor: 0,
+        table: &fake_table,
+        table_alias: None,
+        schema: None,
+        register_base: Some(accum_reg),
+        secondary: None,
+    };
+    let temp = b.alloc_temp();
+    emit_expr(b, wrapper, temp, Some(&scan));
+    b.emit_op(Opcode::Copy, temp, result_reg, 0, P4::None, 0);
+    b.free_temp(temp);
+}
+
 /// Handles patterns like `MAX(x) - MIN(x)` where the wrapper contains
 /// placeholder columns `__agg_0__`, `__agg_1__`, … that map to accumulator
 /// registers at `accum_base + multi_agg_indices[N]`.
@@ -8973,60 +9019,104 @@ fn emit_scalar_aggregate_subquery(
         b.free_temp(r_cond);
     }
 
-    // AggStep for each aggregate.
-    let agg = &agg_cols[0]; // scalar subquery uses first aggregate only
-    let total_args = agg.num_args.max(1);
-    let arg_base = b.alloc_regs(total_args);
-    if agg.num_args > 0 {
-        if agg.arg_is_rowid {
-            b.emit_op(Opcode::Rowid, sub_ctx.cursor, arg_base, 0, P4::None, 0);
-        } else if let Some(ref expr) = agg.arg_expr {
-            emit_expr_with_fallback(b, expr, arg_base, sub_ctx, Some(outer_ctx));
-        } else if let Some(col_idx) = agg.arg_col_index {
-            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-            b.emit_op(
-                Opcode::Column,
-                sub_ctx.cursor,
-                col_idx as i32,
-                arg_base,
-                P4::None,
-                0,
-            );
-        }
-        // Extra arguments (e.g. separator for group_concat).
-        for (j, extra_expr) in agg.extra_args.iter().enumerate() {
-            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-            let extra_reg = arg_base + 1 + j as i32;
-            emit_expr_with_fallback(b, extra_expr, extra_reg, sub_ctx, Some(outer_ctx));
-        }
+    // Separate real (hidden) aggregates from the output entry (which may
+    // have a wrapper_expr for complex expressions like COUNT(*) - 1).
+    let real_aggs: Vec<&AggColumn> = agg_cols.iter().filter(|a| !a.name.is_empty()).collect();
+    let output_entry = agg_cols.last();
+
+    // Allocate one accumulator per real aggregate.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let accum_base = if real_aggs.len() > 1 {
+        b.alloc_regs(real_aggs.len() as i32)
+    } else {
+        accum_reg
+    };
+
+    // Initialize all accumulators to NULL.
+    for i in 0..real_aggs.len() {
+        #[allow(clippy::cast_possible_wrap)]
+        b.emit_op(Opcode::Null, 0, accum_base + i as i32, 0, P4::None, 0);
     }
 
-    #[allow(clippy::cast_possible_truncation)]
-    let num_args = agg.num_args as u16;
-    let distinct_flag = i32::from(agg.distinct);
-    b.emit_op(
-        Opcode::AggStep,
-        distinct_flag,
-        arg_base,
-        accum_reg,
-        P4::FuncName(agg.name.clone()),
-        num_args,
-    );
+    // AggStep for each real aggregate in the loop body.
+    for (i, agg) in real_aggs.iter().enumerate() {
+        let total_args = agg.num_args.max(1);
+        let arg_base = b.alloc_regs(total_args);
+        if agg.num_args > 0 {
+            if agg.arg_is_rowid {
+                b.emit_op(Opcode::Rowid, sub_ctx.cursor, arg_base, 0, P4::None, 0);
+            } else if let Some(expr) = &agg.arg_expr {
+                emit_expr_with_fallback(b, expr, arg_base, sub_ctx, Some(outer_ctx));
+            } else if let Some(col_idx) = agg.arg_col_index {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+                b.emit_op(
+                    Opcode::Column,
+                    sub_ctx.cursor,
+                    col_idx as i32,
+                    arg_base,
+                    P4::None,
+                    0,
+                );
+            }
+            for (j, extra_expr) in agg.extra_args.iter().enumerate() {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+                let extra_reg = arg_base + 1 + j as i32;
+                emit_expr_with_fallback(b, extra_expr, extra_reg, sub_ctx, Some(outer_ctx));
+            }
+        }
+
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        {
+            let num_args = agg.num_args as u16;
+            let distinct_flag = i32::from(agg.distinct);
+            b.emit_op(
+                Opcode::AggStep,
+                distinct_flag,
+                arg_base,
+                accum_base + i as i32,
+                P4::FuncName(agg.name.clone()),
+                num_args,
+            );
+        }
+    }
 
     b.resolve_label(skip_label);
     b.emit_op(Opcode::Next, sub_ctx.cursor, loop_body, 0, P4::None, 0);
 
+    // Finalize all accumulators.
     b.resolve_label(finalize_label);
-    b.emit_op(
-        Opcode::AggFinal,
-        accum_reg,
-        agg.num_args,
-        0,
-        P4::FuncName(agg.name.clone()),
-        0,
-    );
-    // Copy result to target register.
-    b.emit_op(Opcode::Copy, accum_reg, reg, 0, P4::None, 0);
+    for (i, agg) in real_aggs.iter().enumerate() {
+        #[allow(clippy::cast_possible_wrap)]
+        b.emit_op(
+            Opcode::AggFinal,
+            accum_base + i as i32,
+            agg.num_args,
+            0,
+            P4::FuncName(agg.name.clone()),
+            0,
+        );
+    }
+
+    // Evaluate wrapper expression or copy the single result.
+    if let Some(entry) = output_entry {
+        if let Some(ref wrapper) = entry.wrapper_expr {
+            if entry.multi_agg_indices.is_empty() {
+                // Simple wrapper (e.g. COUNT(*) - 1): evaluate the wrapper
+                // expression with __agg_result__ mapped to accum_reg.
+                emit_simple_agg_wrapper(b, wrapper, reg, accum_reg);
+            } else {
+                emit_multi_agg_wrapper(b, wrapper, reg, accum_base, &entry.multi_agg_indices);
+            }
+        } else {
+            b.emit_op(Opcode::Copy, accum_base, reg, 0, P4::None, 0);
+        }
+    } else {
+        b.emit_op(Opcode::Copy, accum_base, reg, 0, P4::None, 0);
+    }
+
+    if real_aggs.len() > 1 {
+        // Free the extra accumulators (accum_reg was already allocated).
+    }
     b.free_temp(accum_reg);
 }
 
