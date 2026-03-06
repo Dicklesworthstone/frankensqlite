@@ -12636,6 +12636,12 @@ impl Drop for Connection {
 
 /// Check if a SELECT statement has no FROM clause (expression-only).
 fn is_expression_only_select(select: &SelectStatement) -> bool {
+    // Compound SELECTs (UNION/INTERSECT/EXCEPT) are never expression-only
+    // because compile_expression_select does not handle them — they must go
+    // through the VDBE codegen path.
+    if !select.body.compounds.is_empty() {
+        return false;
+    }
     match &select.body.select {
         SelectCore::Select { from, .. } => from.is_none(),
         SelectCore::Values(_) => true,
@@ -38178,5 +38184,40 @@ mod pager_routing_tests {
         assert!(names.contains(&"BINARY".to_owned()));
         assert!(names.contains(&"NOCASE".to_owned()));
         assert!(names.contains(&"RTRIM".to_owned()));
+    }
+
+    #[test]
+    fn test_compound_expression_only_select() {
+        let conn = Connection::open(":memory:").unwrap();
+        // UNION of expression-only SELECTs (no FROM clause).
+        let rows = conn
+            .query("SELECT 1 UNION SELECT 2 UNION SELECT 3;")
+            .unwrap();
+        let mut vals: Vec<i64> = rows
+            .iter()
+            .filter_map(|r| match r.values().first() {
+                Some(SqliteValue::Integer(n)) => Some(*n),
+                _ => None,
+            })
+            .collect();
+        vals.sort_unstable();
+        assert_eq!(vals, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_compound_union_all_expression_only() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn
+            .query("SELECT 'a' UNION ALL SELECT 'a' UNION ALL SELECT 'b';")
+            .unwrap();
+        let vals: Vec<&str> = rows
+            .iter()
+            .filter_map(|r| match r.values().first() {
+                Some(SqliteValue::Text(s)) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(vals.len(), 3);
+        assert_eq!(vals.iter().filter(|&&v| v == "a").count(), 2);
     }
 }
