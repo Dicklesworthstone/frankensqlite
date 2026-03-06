@@ -10624,6 +10624,11 @@ impl Connection {
                 groups.push((key, vec![row.values().to_vec()]));
             }
         }
+        // Implicit aggregation (no GROUP BY): empty input must still
+        // produce one row with default aggregate values (COUNT→0, etc.).
+        if groups.is_empty() && group_by_exprs.is_empty() {
+            groups.push((Vec::new(), Vec::new()));
+        }
 
         // Step 6: Build result rows from groups.
         let mut result = Vec::with_capacity(groups.len());
@@ -43111,6 +43116,272 @@ mod pager_routing_tests {
             }
             panic!(
                 "{} multi-join/order-expr conformance mismatches found",
+                mismatches.len()
+            );
+        }
+    }
+
+    /// Correlated scalar subqueries whose FROM clause contains JOINs.
+    /// Validates the connection-level fallback that inline-evaluates such
+    /// subqueries by substituting outer references and executing per-row.
+    #[test]
+    fn test_conformance_correlated_join_subqueries() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE departments (id INTEGER PRIMARY KEY, name TEXT);",
+            "INSERT INTO departments VALUES (1, 'Engineering');",
+            "INSERT INTO departments VALUES (2, 'Marketing');",
+            "INSERT INTO departments VALUES (3, 'Sales');",
+            "CREATE TABLE employees (id INTEGER PRIMARY KEY, name TEXT, dept_id INTEGER, salary INTEGER);",
+            "INSERT INTO employees VALUES (1, 'Alice', 1, 120000);",
+            "INSERT INTO employees VALUES (2, 'Bob', 1, 110000);",
+            "INSERT INTO employees VALUES (3, 'Carol', 2, 95000);",
+            "INSERT INTO employees VALUES (4, 'Dan', 2, 90000);",
+            "INSERT INTO employees VALUES (5, 'Eve', 3, 85000);",
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, name TEXT, lead_id INTEGER, dept_id INTEGER);",
+            "INSERT INTO projects VALUES (1, 'Alpha', 1, 1);",
+            "INSERT INTO projects VALUES (2, 'Beta', 2, 1);",
+            "INSERT INTO projects VALUES (3, 'Gamma', 3, 2);",
+            "CREATE TABLE tasks (id INTEGER PRIMARY KEY, project_id INTEGER, assignee_id INTEGER, status TEXT);",
+            "INSERT INTO tasks VALUES (1, 1, 1, 'done');",
+            "INSERT INTO tasks VALUES (2, 1, 2, 'done');",
+            "INSERT INTO tasks VALUES (3, 2, 1, 'active');",
+            "INSERT INTO tasks VALUES (4, 2, 2, 'done');",
+            "INSERT INTO tasks VALUES (5, 3, 3, 'active');",
+            "INSERT INTO tasks VALUES (6, 3, 4, 'done');",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            // Basic correlated single-table subquery (baseline)
+            "SELECT d.name, (SELECT avg(e.salary) FROM employees e WHERE e.dept_id = d.id) AS avg_sal FROM departments d ORDER BY d.name",
+            // Correlated subquery with JOIN in FROM
+            "SELECT d.name, (SELECT count(t.id) FROM projects p JOIN tasks t ON t.project_id = p.id WHERE p.dept_id = d.id) AS task_count FROM departments d ORDER BY d.name",
+            // COALESCE wrapping correlated JOIN subquery
+            "SELECT d.name, COALESCE((SELECT sum(e.salary) FROM employees e JOIN projects p ON p.lead_id = e.id WHERE p.dept_id = d.id), 0) AS lead_salary_sum FROM departments d ORDER BY d.name",
+            // Multiple correlated subqueries in same SELECT
+            "SELECT d.name, (SELECT count(*) FROM employees e WHERE e.dept_id = d.id) AS emp_count, (SELECT count(t.id) FROM projects p JOIN tasks t ON t.project_id = p.id WHERE p.dept_id = d.id) AS task_count FROM departments d ORDER BY d.name",
+            // Correlated JOIN subquery with aggregate filter
+            "SELECT d.name, (SELECT count(t.id) FROM projects p JOIN tasks t ON t.project_id = p.id WHERE p.dept_id = d.id AND t.status = 'done') AS done_tasks FROM departments d ORDER BY d.name",
+            // Correlated JOIN subquery returning NULL for unmatched
+            "SELECT d.name, (SELECT max(t.id) FROM projects p JOIN tasks t ON t.project_id = p.id WHERE p.dept_id = d.id AND t.status = 'cancelled') AS max_cancelled FROM departments d ORDER BY d.name",
+            // Three-table correlated subquery
+            "SELECT d.name, (SELECT count(DISTINCT t.assignee_id) FROM projects p JOIN tasks t ON t.project_id = p.id JOIN employees e ON e.id = t.assignee_id WHERE p.dept_id = d.id) AS unique_workers FROM departments d ORDER BY d.name",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!(
+                "{} correlated join subquery conformance mismatches found",
+                mismatches.len()
+            );
+        }
+    }
+
+    /// Probe UPDATE/DELETE with complex patterns: correlated subqueries,
+    /// computed expressions, and multi-step DML sequences.
+    #[test]
+    fn test_conformance_dml_advanced() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE inventory (id INTEGER PRIMARY KEY, item TEXT NOT NULL, qty INTEGER DEFAULT 0, price REAL, category TEXT);",
+            "INSERT INTO inventory VALUES (1, 'Widget', 100, 9.99, 'hardware');",
+            "INSERT INTO inventory VALUES (2, 'Gadget', 50, 24.95, 'electronics');",
+            "INSERT INTO inventory VALUES (3, 'Bolt', 1000, 0.10, 'hardware');",
+            "INSERT INTO inventory VALUES (4, 'Chip', 200, 5.50, 'electronics');",
+            "INSERT INTO inventory VALUES (5, 'Gear', 75, 15.00, 'hardware');",
+            "CREATE TABLE sales (id INTEGER PRIMARY KEY, inv_id INTEGER, sold INTEGER, ts TEXT);",
+            "INSERT INTO sales VALUES (1, 1, 10, '2024-01-15');",
+            "INSERT INTO sales VALUES (2, 2, 5, '2024-01-16');",
+            "INSERT INTO sales VALUES (3, 1, 20, '2024-02-01');",
+            "INSERT INTO sales VALUES (4, 3, 100, '2024-02-10');",
+            "INSERT INTO sales VALUES (5, 4, 50, '2024-02-15');",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let mut mismatches = Vec::new();
+
+        // Pre-DML queries
+        let pre = [
+            "SELECT item, qty * price AS stock_value FROM inventory ORDER BY id",
+            "SELECT i.item, SUM(s.sold) AS total_sold FROM inventory i LEFT JOIN sales s ON s.inv_id = i.id GROUP BY i.item ORDER BY i.item",
+        ];
+        mismatches.extend(oracle_compare(&fconn, &rconn, &pre));
+
+        // Complex DML
+        let dml = [
+            "UPDATE inventory SET price = round(price * 1.1, 2) WHERE category = 'hardware'",
+            "UPDATE inventory SET qty = qty - COALESCE((SELECT SUM(sold) FROM sales WHERE inv_id = inventory.id), 0)",
+            "DELETE FROM sales WHERE sold < (SELECT AVG(sold) FROM sales)",
+            "INSERT INTO sales (inv_id, sold, ts) VALUES (5, 25, '2024-03-01')",
+        ];
+        for op in &dml {
+            fconn.execute(op).unwrap();
+            rconn.execute_batch(op).unwrap();
+        }
+
+        // Post-DML verification
+        let post = [
+            "SELECT * FROM inventory ORDER BY id",
+            "SELECT * FROM sales ORDER BY id",
+            "SELECT category, SUM(qty) AS total_qty, round(AVG(price), 2) AS avg_price FROM inventory GROUP BY category ORDER BY category",
+            "SELECT i.item, s.sold FROM inventory i JOIN sales s ON s.inv_id = i.id ORDER BY i.item, s.sold",
+            "SELECT item, qty, price, round(qty * price, 2) AS total_value FROM inventory ORDER BY total_value DESC",
+        ];
+        mismatches.extend(oracle_compare(&fconn, &rconn, &post));
+
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!(
+                "{} DML advanced conformance mismatches found",
+                mismatches.len()
+            );
+        }
+    }
+
+    /// Probe expression edge cases: nested CASE, BETWEEN with expressions,
+    /// complex IN lists, LIKE/GLOB patterns, and arithmetic chains.
+    #[test]
+    fn test_conformance_expression_depth() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let queries = [
+            // Nested CASE
+            "SELECT CASE WHEN 1 THEN CASE WHEN 0 THEN 'a' ELSE 'b' END ELSE 'c' END",
+            "SELECT CASE WHEN NULL THEN 'a' WHEN 1 THEN 'b' END",
+            "SELECT CASE 3 WHEN 1 THEN 'one' WHEN 2 THEN 'two' WHEN 3 THEN 'three' END",
+            // BETWEEN with expressions
+            "SELECT 5 BETWEEN 1+2 AND 3*3",
+            "SELECT 'c' BETWEEN 'a' AND 'e'",
+            "SELECT NULL BETWEEN 1 AND 10",
+            // IN with expressions
+            "SELECT 3 IN (1, 2, 3)",
+            "SELECT 4 IN (1, 2, 3)",
+            "SELECT NULL IN (1, 2, 3)",
+            "SELECT 1 IN (1, NULL, 3)",
+            "SELECT 2 IN (1, NULL, 3)",
+            // NOT IN with NULL (three-valued logic)
+            "SELECT 2 NOT IN (1, NULL, 3)",
+            "SELECT NULL NOT IN (1, 2)",
+            // Complex arithmetic chains
+            "SELECT 2 + 3 * 4",
+            "SELECT (2 + 3) * 4",
+            "SELECT 10 - 3 - 2",
+            "SELECT 100 / 10 / 2",
+            "SELECT 17 % 5 + 2",
+            // Bitwise operations
+            "SELECT 5 & 3, 5 | 3, ~5",
+            "SELECT 0xFF & 0x0F",
+            "SELECT 1 << 4, 32 >> 2",
+            // String comparison
+            "SELECT 'abc' < 'abd'",
+            "SELECT 'abc' = 'ABC'",
+            "SELECT '' < 'a'",
+            // Concatenation edge cases
+            "SELECT 'a' || 'b' || 'c'",
+            "SELECT 1 || 2 || 3",
+            "SELECT NULL || 'hello'",
+            // LIKE edge cases
+            "SELECT 'hello' LIKE 'HELLO'",
+            "SELECT 'hello' LIKE 'h_llo'",
+            "SELECT 'hello' LIKE '%ell%'",
+            "SELECT 'hello' LIKE 'hello%'",
+            "SELECT 'hello' LIKE '%'",
+            "SELECT '' LIKE '%'",
+            "SELECT NULL LIKE '%'",
+            // GLOB (case-sensitive)
+            "SELECT 'Hello' GLOB 'Hello'",
+            "SELECT 'Hello' GLOB 'hello'",
+            "SELECT 'Hello' GLOB 'H*'",
+            "SELECT 'Hello' GLOB '?ello'",
+            // Mixed type comparisons
+            "SELECT 1 < 2.0",
+            "SELECT 1 = 1.0",
+            "SELECT '9' > '10'",
+            "SELECT 9 > 10",
+            // Ternary conditional via IIF nesting
+            "SELECT iif(1 > 2, 'a', iif(3 > 2, 'b', 'c'))",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!(
+                "{} expression depth conformance mismatches found",
+                mismatches.len()
+            );
+        }
+    }
+
+    /// Probe compound SELECT (UNION/INTERSECT/EXCEPT) with complex operands,
+    /// nested CTEs, and recursive patterns.
+    #[test]
+    fn test_conformance_compound_advanced() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE colors (id INTEGER PRIMARY KEY, name TEXT, hex TEXT);",
+            "INSERT INTO colors VALUES (1, 'red', '#FF0000');",
+            "INSERT INTO colors VALUES (2, 'green', '#00FF00');",
+            "INSERT INTO colors VALUES (3, 'blue', '#0000FF');",
+            "INSERT INTO colors VALUES (4, 'white', '#FFFFFF');",
+            "INSERT INTO colors VALUES (5, 'black', '#000000');",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            // UNION with ORDER BY and LIMIT
+            "SELECT name FROM colors WHERE id <= 3 UNION SELECT name FROM colors WHERE id >= 3 ORDER BY name",
+            // UNION ALL preserves duplicates
+            "SELECT name FROM colors WHERE id <= 3 UNION ALL SELECT name FROM colors WHERE id >= 3 ORDER BY name",
+            // INTERSECT
+            "SELECT name FROM colors WHERE id <= 3 INTERSECT SELECT name FROM colors WHERE id >= 3 ORDER BY name",
+            // EXCEPT
+            "SELECT name FROM colors WHERE id <= 4 EXCEPT SELECT name FROM colors WHERE id >= 3 ORDER BY name",
+            // Nested UNION
+            "SELECT 1 AS n UNION SELECT 2 UNION SELECT 3 ORDER BY n",
+            // Compound with aggregates
+            "SELECT 'max' AS stat, MAX(id) AS val FROM colors UNION ALL SELECT 'min', MIN(id) FROM colors UNION ALL SELECT 'count', COUNT(*) FROM colors ORDER BY stat",
+            // Compound with LIMIT
+            "SELECT name FROM colors ORDER BY name LIMIT 2 OFFSET 0",
+            "SELECT name FROM colors ORDER BY name LIMIT 10 OFFSET 3",
+            // CTE used in UNION
+            "WITH warm AS (SELECT name FROM colors WHERE name IN ('red')) SELECT name FROM warm UNION SELECT name FROM colors WHERE name = 'blue' ORDER BY name",
+            // Recursive CTE: generate_series equivalent
+            "WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 10) SELECT n FROM seq",
+            // Recursive CTE with string building
+            "WITH RECURSIVE parts(s, n) AS (SELECT 'a', 1 UNION ALL SELECT s || 'a', n + 1 FROM parts WHERE n < 5) SELECT s FROM parts ORDER BY n",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!(
+                "{} compound advanced conformance mismatches found",
                 mismatches.len()
             );
         }
