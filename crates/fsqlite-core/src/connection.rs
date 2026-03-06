@@ -651,6 +651,57 @@ impl PreparedStatement<'_> {
         self.dml_statement.is_some()
     }
 
+    fn execute_table_query(&self, op_cx: &Cx, params: Option<&[SqliteValue]>) -> Result<Vec<Row>> {
+        let Some(db) = self.db.as_ref() else {
+            return Err(FrankenError::Internal(
+                "prepared table query missing database handle".to_owned(),
+            ));
+        };
+        let Some(registry) = self.func_registry.as_ref() else {
+            return Err(FrankenError::Internal(
+                "prepared statement missing function registry".to_owned(),
+            ));
+        };
+
+        // When the parent connection already owns an active transaction, reuse
+        // that exact execution path so prepared reads observe the connection's
+        // uncommitted writes, concurrent session state, and MVCC snapshot.
+        if self.conn.active_txn.borrow().is_some() {
+            let (rows, _) = self.conn.execute_table_program(&self.program, params)?;
+            return Ok(rows);
+        }
+
+        // Standalone prepared reads still need the same execution metadata as
+        // the normal connection path: parity-cert fallback policy, synthetic
+        // defaults for short records, and the MVCC version store for
+        // historical snapshot upgrades.
+        let reject_mem = *self.conn.reject_mem_fallback.borrow();
+        let autoincrement_seq_by_root_page = self.conn.autoincrement_sequence_by_root_page();
+        let col_defaults_by_root_page = self.conn.column_defaults_by_root_page();
+        let txn = self
+            .pager
+            .as_ref()
+            .map(|p| p.begin(op_cx, TransactionMode::Deferred))
+            .transpose()?;
+        let (result, mut txn_back) = execute_table_program_with_db(
+            &self.program,
+            params,
+            registry,
+            db,
+            txn,
+            self.schema_cookie,
+            None,
+            autoincrement_seq_by_root_page,
+            col_defaults_by_root_page,
+            reject_mem,
+            Some(Rc::clone(&self.conn.version_store)),
+        );
+        if let Some(ref mut txn) = txn_back {
+            txn.commit(op_cx)?;
+        }
+        result.map(|(rows, _)| rows)
+    }
+
     /// Execute as a query and return all result rows.
     pub fn query(&self) -> Result<Vec<Row>> {
         if self.dml_statement.is_some() {
@@ -662,39 +713,8 @@ impl PreparedStatement<'_> {
         }
         let op_cx = self.root_cx.clone().with_decision_id(next_decision_id());
         self.ensure_schema_unchanged(&op_cx)?;
-        let mut rows = if let Some(db) = self.db.as_ref() {
-            let Some(registry) = self.func_registry.as_ref() else {
-                return Err(FrankenError::Internal(
-                    "prepared statement missing function registry".to_owned(),
-                ));
-            };
-            // Phase 5 (bd-35my): start a deferred transaction to read from the
-            // pager. This ensures PreparedStatement::query() can see data written
-            // by prior INSERT statements through the Connection.
-            let txn = self
-                .pager
-                .as_ref()
-                .map(|p| p.begin(&op_cx, TransactionMode::Deferred))
-                .transpose()?;
-            // PreparedStatement doesn't have concurrent context (it manages its own txns).
-            let (result, mut txn_back) = execute_table_program_with_db(
-                &self.program,
-                None,
-                registry,
-                db,
-                txn,
-                self.schema_cookie,
-                None,
-                HashMap::new(),
-                HashMap::new(),
-                false,
-                None,
-            );
-            // Commit the read transaction (no-op for deferred reads).
-            if let Some(ref mut txn) = txn_back {
-                txn.commit(&op_cx)?;
-            }
-            result?.0
+        let mut rows = if self.db.is_some() {
+            self.execute_table_query(&op_cx, None)?
         } else {
             execute_program_with_postprocess(
                 &self.program,
@@ -723,36 +743,8 @@ impl PreparedStatement<'_> {
         }
         let op_cx = self.root_cx.clone().with_decision_id(next_decision_id());
         self.ensure_schema_unchanged(&op_cx)?;
-        let mut rows = if let Some(db) = self.db.as_ref() {
-            let Some(registry) = self.func_registry.as_ref() else {
-                return Err(FrankenError::Internal(
-                    "prepared statement missing function registry".to_owned(),
-                ));
-            };
-            // Execute through a deferred pager transaction so prepared
-            // parameterized table queries do not fall back to MemPageStore.
-            let txn = self
-                .pager
-                .as_ref()
-                .map(|p| p.begin(&op_cx, TransactionMode::Deferred))
-                .transpose()?;
-            let (result, mut txn_back) = execute_table_program_with_db(
-                &self.program,
-                Some(params),
-                registry,
-                db,
-                txn,
-                self.schema_cookie,
-                None,
-                HashMap::new(),
-                HashMap::new(),
-                false,
-                None,
-            );
-            if let Some(ref mut txn) = txn_back {
-                txn.commit(&op_cx)?;
-            }
-            result?.0
+        let mut rows = if self.db.is_some() {
+            self.execute_table_query(&op_cx, Some(params))?
         } else {
             execute_program_with_postprocess(
                 &self.program,
@@ -3460,7 +3452,8 @@ impl Connection {
             let mut db = self.db.borrow_mut();
 
             // Check UNIQUE constraints on columns.
-            let mut unique_violation = None;
+            let mut unique_violation_col: Option<String> = None;
+            let mut conflicting_rowids: Vec<i64> = Vec::new();
             if let Some(table) = db.get_table(root_page) {
                 for (i, col_info) in table_schema.columns.iter().enumerate() {
                     if col_info.unique && !col_info.is_ipk {
@@ -3472,34 +3465,41 @@ impl Connection {
                                 }
                                 if let Some(existing_val) = mem_row.1.get(i) {
                                     if existing_val == new_val {
-                                        unique_violation = Some(col_info.name.clone());
+                                        if *conflict == ConflictAction::Replace {
+                                            conflicting_rowids.push(mem_row.0);
+                                        } else {
+                                            unique_violation_col = Some(col_info.name.clone());
+                                        }
                                         break;
                                     }
                                 }
                             }
                         }
                     }
-                    if unique_violation.is_some() {
+                    if unique_violation_col.is_some() {
                         break;
                     }
                 }
             }
 
-            if let Some(col_name) = unique_violation {
-                match conflict {
-                    ConflictAction::Ignore => continue,
-                    ConflictAction::Replace => {
-                        // True SQLite REPLACE deletes the conflicting row. For Phase 4 we can return an error
-                        // since this fallback is temporary, but let's at least support basic test cases.
-                        return Err(FrankenError::NotImplemented(
-                            "REPLACE on non-IPK UNIQUE constraint".to_owned(),
-                        ));
-                    }
-                    _ => {
-                        return Err(FrankenError::UniqueViolation {
-                            columns: format!("{}.{}", table_name, col_name),
-                        });
-                    }
+            if let Some(col_name) = unique_violation_col {
+                if *conflict == ConflictAction::Ignore {
+                    continue;
+                }
+                return Err(FrankenError::UniqueViolation {
+                    columns: format!("{}.{}", table_name, col_name),
+                });
+            }
+
+            // For REPLACE: delete rows that conflict on non-IPK UNIQUE columns.
+            if *conflict == ConflictAction::Replace && !conflicting_rowids.is_empty() {
+                let table = db.get_table_mut(root_page).ok_or_else(|| {
+                    FrankenError::Internal(format!(
+                        "table not found at root page {root_page}"
+                    ))
+                })?;
+                for rid in &conflicting_rowids {
+                    table.delete_by_rowid(*rid);
                 }
             }
 
@@ -19110,6 +19110,52 @@ mod tests {
         assert_eq!(
             row_values(&rows[0]),
             vec![SqliteValue::Text("two".to_owned())]
+        );
+    }
+
+    #[test]
+    fn test_prepared_statement_query_sees_same_transaction_writes() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE prep_live_txn (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+
+        let stmt = conn
+            .prepare("SELECT val FROM prep_live_txn ORDER BY id;")
+            .unwrap();
+
+        conn.execute("BEGIN;").unwrap();
+        conn.execute("INSERT INTO prep_live_txn VALUES (1, 'one');")
+            .unwrap();
+
+        let rows = stmt.query().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![SqliteValue::Text("one".to_owned())]
+        );
+
+        conn.execute("ROLLBACK;").unwrap();
+    }
+
+    #[test]
+    fn test_prepared_statement_query_uses_added_column_defaults() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE prep_defaults (id INTEGER PRIMARY KEY);")
+            .unwrap();
+        conn.execute("INSERT INTO prep_defaults(id) VALUES (1);")
+            .unwrap();
+        conn.execute("ALTER TABLE prep_defaults ADD COLUMN val TEXT DEFAULT 'fallback';")
+            .unwrap();
+
+        let stmt = conn
+            .prepare("SELECT val FROM prep_defaults WHERE id = 1;")
+            .unwrap();
+        let rows = stmt.query().unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![SqliteValue::Text("fallback".to_owned())]
         );
     }
 
@@ -36689,23 +36735,64 @@ mod pager_routing_tests {
 
     #[test]
     fn test_replace_on_unique_constraint() {
-        // Tests: INSERT OR REPLACE with UNIQUE constraint (non-IPK).
+        // INSERT OR REPLACE with UNIQUE constraint (non-IPK) deletes the
+        // conflicting row and inserts the new one.
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT UNIQUE, name TEXT);")
             .unwrap();
         conn.execute("INSERT INTO t VALUES (1, 'a@b.com', 'Alice');")
             .unwrap();
-        let result = conn.execute("INSERT OR REPLACE INTO t VALUES (2, 'a@b.com', 'Bob');");
-        if result.is_ok() {
-            let rows = conn
-                .query("SELECT id, email, name FROM t ORDER BY id;")
-                .unwrap();
-            // REPLACE should remove old row (id=1) and insert new (id=2).
-            assert_eq!(rows.len(), 1);
-            assert_eq!(rows[0].values()[0], SqliteValue::Integer(2));
-            assert_eq!(rows[0].values()[2], SqliteValue::Text("Bob".to_owned()));
-        }
-        // Document: may error with "REPLACE on non-IPK UNIQUE constraint".
+        conn.execute("INSERT OR REPLACE INTO t VALUES (2, 'a@b.com', 'Bob');")
+            .unwrap();
+        let rows = conn
+            .query("SELECT id, email, name FROM t ORDER BY id;")
+            .unwrap();
+        // REPLACE should remove old row (id=1) and insert new (id=2).
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(2));
+        assert_eq!(
+            rows[0].values()[1],
+            SqliteValue::Text("a@b.com".to_owned())
+        );
+        assert_eq!(rows[0].values()[2], SqliteValue::Text("Bob".to_owned()));
+    }
+
+    #[test]
+    fn test_replace_on_unique_multiple_columns() {
+        // REPLACE should handle multiple UNIQUE columns — each conflicting row
+        // gets deleted before insertion.
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT UNIQUE, b TEXT UNIQUE, val TEXT);",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'x', 'p', 'first');")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 'y', 'q', 'second');")
+            .unwrap();
+        // New row conflicts with row 1 on column `a` and row 2 on column `b`.
+        conn.execute("INSERT OR REPLACE INTO t VALUES (3, 'x', 'q', 'third');")
+            .unwrap();
+        let rows = conn
+            .query("SELECT id, a, b, val FROM t ORDER BY id;")
+            .unwrap();
+        // Both conflicting rows (1, 2) should be deleted; only row 3 remains.
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(3));
+        assert_eq!(rows[0].values()[3], SqliteValue::Text("third".to_owned()));
+    }
+
+    #[test]
+    fn test_replace_statement_shorthand() {
+        // REPLACE INTO is shorthand for INSERT OR REPLACE INTO.
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT UNIQUE);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'Alice');").unwrap();
+        conn.execute("REPLACE INTO t VALUES (2, 'Alice');").unwrap();
+        let rows = conn.query("SELECT id, name FROM t;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(2));
     }
 
     #[test]
