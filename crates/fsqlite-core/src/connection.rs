@@ -42460,4 +42460,214 @@ mod pager_routing_tests {
             );
         }
     }
+
+    /// Deep probe: NULL propagation through arithmetic and comparisons,
+    /// mixed-type IN lists, BETWEEN edge cases, complex CASE WHEN.
+    #[test]
+    fn test_conformance_null_and_type_edge_cases() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b REAL, c TEXT, d BLOB);",
+            "INSERT INTO t VALUES (1, 10, 1.5, 'hello', X'CAFE');",
+            "INSERT INTO t VALUES (2, NULL, 2.5, NULL, NULL);",
+            "INSERT INTO t VALUES (3, 0, 0.0, '', X'');",
+            "INSERT INTO t VALUES (4, -5, -1.5, 'world', X'BABE');",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            // NULL arithmetic propagation
+            "SELECT NULL + 1, NULL * 2, NULL - 3, NULL / 4",
+            "SELECT a + NULL, NULL + a FROM t ORDER BY id",
+            // NULL comparison returns NULL (not true/false)
+            "SELECT NULL = NULL, NULL != NULL, NULL < 1, NULL > 1",
+            "SELECT NULL = 0, NULL != 0",
+            // NULL in CASE WHEN
+            "SELECT CASE NULL WHEN NULL THEN 'match' ELSE 'no' END",
+            "SELECT CASE WHEN NULL THEN 'true' ELSE 'false' END",
+            // IN with mixed types
+            "SELECT 1 IN (1, 2, 3), 1 IN (1.0, 2, 3)",
+            "SELECT 'a' IN ('a', 'b', 'c')",
+            "SELECT NULL IN (1, 2, 3), 1 IN (1, NULL, 3)",
+            // BETWEEN edge cases
+            "SELECT 5 BETWEEN 1 AND 10, 0 BETWEEN 1 AND 10",
+            "SELECT NULL BETWEEN 1 AND 10, 5 BETWEEN NULL AND 10, 5 BETWEEN 1 AND NULL",
+            // NOT BETWEEN
+            "SELECT 5 NOT BETWEEN 1 AND 10, 0 NOT BETWEEN 1 AND 10",
+            // Boolean expressions
+            "SELECT 1 AND 1, 1 AND 0, 0 AND 0",
+            "SELECT 1 OR 0, 0 OR 0, 1 OR 1",
+            "SELECT NOT 1, NOT 0, NOT NULL",
+            // Truthiness
+            "SELECT CASE WHEN 0 THEN 'yes' ELSE 'no' END",
+            "SELECT CASE WHEN '' THEN 'yes' ELSE 'no' END",
+            "SELECT CASE WHEN 0.0 THEN 'yes' ELSE 'no' END",
+            // IFNULL / NULLIF
+            "SELECT ifnull(NULL, 'default'), ifnull('value', 'default')",
+            "SELECT nullif(1, 1), nullif(1, 2), nullif(NULL, 1)",
+            // Type affinity in comparisons
+            "SELECT '10' > 9, '10' > '9'",
+            "SELECT typeof('10' + 0), typeof(10 || '')",
+            // Concatenation with NULL
+            "SELECT 'a' || NULL, NULL || 'b', NULL || NULL",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!("{} NULL/type edge case mismatches found", mismatches.len());
+        }
+    }
+
+    /// VDBE codegen path: single-table queries with WHERE, ORDER BY, LIMIT,
+    /// and index scans that go through compile_table_select.
+    #[test]
+    fn test_conformance_vdbe_codegen_path() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER, email TEXT);",
+            "CREATE INDEX idx_users_age ON users(age);",
+            "CREATE INDEX idx_users_name ON users(name);",
+            "INSERT INTO users VALUES (1, 'Alice', 30, 'alice@example.com');",
+            "INSERT INTO users VALUES (2, 'Bob', 25, 'bob@example.com');",
+            "INSERT INTO users VALUES (3, 'Carol', 35, NULL);",
+            "INSERT INTO users VALUES (4, 'Dave', 25, 'dave@example.com');",
+            "INSERT INTO users VALUES (5, 'Eve', 40, 'eve@example.com');",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            // Basic full-table scan
+            "SELECT * FROM users ORDER BY id",
+            // Simple WHERE
+            "SELECT name FROM users WHERE age > 30 ORDER BY name",
+            // WHERE with AND
+            "SELECT name FROM users WHERE age >= 25 AND age <= 35 ORDER BY name",
+            // WHERE with OR
+            "SELECT name FROM users WHERE age = 25 OR age = 40 ORDER BY name",
+            // WHERE with NOT
+            "SELECT name FROM users WHERE NOT (age > 30) ORDER BY name",
+            // WHERE IS NULL
+            "SELECT name FROM users WHERE email IS NULL",
+            // WHERE IS NOT NULL
+            "SELECT name FROM users WHERE email IS NOT NULL ORDER BY name",
+            // ORDER BY DESC
+            "SELECT name, age FROM users ORDER BY age DESC, name ASC",
+            // LIMIT
+            "SELECT name FROM users ORDER BY id LIMIT 3",
+            // LIMIT with OFFSET
+            "SELECT name FROM users ORDER BY id LIMIT 2 OFFSET 2",
+            // LIMIT 0
+            "SELECT name FROM users ORDER BY id LIMIT 0",
+            // LIMIT 1
+            "SELECT name FROM users ORDER BY id LIMIT 1",
+            // COUNT with WHERE
+            "SELECT COUNT(*) FROM users WHERE age > 30",
+            // Multiple columns with expressions
+            "SELECT id, name, age * 2 AS double_age FROM users ORDER BY id",
+            // WHERE with LIKE
+            "SELECT name FROM users WHERE name LIKE 'A%' ORDER BY name",
+            // WHERE with IN list
+            "SELECT name FROM users WHERE age IN (25, 35) ORDER BY name",
+            // DISTINCT
+            "SELECT DISTINCT age FROM users ORDER BY age",
+            // WHERE with BETWEEN
+            "SELECT name FROM users WHERE age BETWEEN 25 AND 35 ORDER BY name",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!(
+                "{} VDBE codegen conformance mismatches found",
+                mismatches.len()
+            );
+        }
+    }
+
+    #[test]
+    fn test_conformance_multi_join_order_expr() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE authors (id INTEGER PRIMARY KEY, name TEXT);",
+            "INSERT INTO authors VALUES (1, 'Alice');",
+            "INSERT INTO authors VALUES (2, 'Bob');",
+            "INSERT INTO authors VALUES (3, 'Carol');",
+            "CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT, author_id INTEGER, year INTEGER);",
+            "INSERT INTO books VALUES (1, 'Book A', 1, 2020);",
+            "INSERT INTO books VALUES (2, 'Book B', 1, 2021);",
+            "INSERT INTO books VALUES (3, 'Book C', 2, 2019);",
+            "INSERT INTO books VALUES (4, 'Book D', 2, 2022);",
+            "INSERT INTO books VALUES (5, 'Book E', 3, 2020);",
+            "CREATE TABLE reviews (id INTEGER PRIMARY KEY, book_id INTEGER, rating INTEGER, reviewer TEXT);",
+            "INSERT INTO reviews VALUES (1, 1, 5, 'Dan');",
+            "INSERT INTO reviews VALUES (2, 1, 4, 'Eve');",
+            "INSERT INTO reviews VALUES (3, 2, 3, 'Dan');",
+            "INSERT INTO reviews VALUES (4, 3, 5, 'Eve');",
+            "INSERT INTO reviews VALUES (5, 4, 2, 'Dan');",
+            "INSERT INTO reviews VALUES (6, 5, 4, 'Dan');",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            // Three-way JOIN
+            "SELECT a.name, b.title, r.rating FROM authors a JOIN books b ON b.author_id = a.id JOIN reviews r ON r.book_id = b.id ORDER BY a.name, b.title",
+            // Three-way JOIN with aggregate
+            "SELECT a.name, count(r.id) AS review_count FROM authors a JOIN books b ON b.author_id = a.id JOIN reviews r ON r.book_id = b.id GROUP BY a.name ORDER BY a.name",
+            // Three-way JOIN with aggregate + HAVING
+            "SELECT a.name, avg(r.rating) AS avg_rating FROM authors a JOIN books b ON b.author_id = a.id JOIN reviews r ON r.book_id = b.id GROUP BY a.name HAVING avg(r.rating) >= 4.0 ORDER BY a.name",
+            // LEFT JOIN preserving unmatched
+            "SELECT b.title, r.rating FROM books b LEFT JOIN reviews r ON r.book_id = b.id ORDER BY b.title",
+            // ORDER BY expression not in SELECT (non-GROUP BY)
+            "SELECT title FROM books ORDER BY year DESC, title ASC",
+            // ORDER BY with CASE expression
+            "SELECT title, year FROM books ORDER BY CASE WHEN year >= 2021 THEN 0 ELSE 1 END, title",
+            // Multi-column DISTINCT
+            "SELECT DISTINCT author_id, year FROM books ORDER BY author_id, year",
+            // Subquery in SELECT with multi-table context
+            "SELECT a.name, (SELECT avg(r.rating) FROM books b JOIN reviews r ON r.book_id = b.id WHERE b.author_id = a.id) AS avg_rating FROM authors a ORDER BY a.name",
+            // COALESCE with subquery
+            "SELECT a.name, COALESCE((SELECT max(r.rating) FROM books b JOIN reviews r ON r.book_id = b.id WHERE b.author_id = a.id), 0) AS best FROM authors a ORDER BY a.name",
+            // Complex WHERE with AND/OR/NOT
+            "SELECT title FROM books WHERE (year > 2019 AND author_id = 1) OR (year < 2021 AND author_id = 2) ORDER BY title",
+            // NULL handling in ORDER BY
+            "SELECT b.title, r.rating FROM books b LEFT JOIN reviews r ON r.book_id = b.id ORDER BY r.rating IS NULL, r.rating DESC, b.title",
+            // GROUP BY with ORDER BY on aggregate not in SELECT
+            "SELECT a.name FROM authors a JOIN books b ON b.author_id = a.id GROUP BY a.name ORDER BY count(b.id) DESC, a.name",
+            // CASE with aggregate
+            "SELECT a.name, CASE WHEN count(b.id) > 1 THEN 'prolific' ELSE 'modest' END AS output FROM authors a JOIN books b ON b.author_id = a.id GROUP BY a.name ORDER BY a.name",
+            // Nested CASE
+            "SELECT title, CASE WHEN year >= 2022 THEN 'new' WHEN year >= 2020 THEN 'recent' ELSE 'old' END AS era FROM books ORDER BY title",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!(
+                "{} multi-join/order-expr conformance mismatches found",
+                mismatches.len()
+            );
+        }
+    }
 }
