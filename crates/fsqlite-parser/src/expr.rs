@@ -185,6 +185,22 @@ impl Parser {
             TokenKind::Minus => {
                 let inner = self.parse_expr_bp(bp::UNARY)?;
                 let span = tok.span.merge(inner.span());
+                // Constant-fold: -<float literal> → integer when the negated
+                // value is exactly representable as i64.  This handles the
+                // critical case of `-9223372036854775808` (i64::MIN) whose
+                // unsigned magnitude overflows i64::MAX during lexing, causing
+                // promotion to Float.  C SQLite folds this at parse time.
+                if let Expr::Literal(Literal::Float(f), _) = &inner {
+                    let neg = -f;
+                    // Don't fold -0.0 to integer 0; it must stay as float.
+                    if neg != 0.0 {
+                        #[allow(clippy::cast_possible_truncation)]
+                        let as_i64 = neg as i64;
+                        if (as_i64 as f64) == neg {
+                            return Ok(Expr::Literal(Literal::Integer(as_i64), span));
+                        }
+                    }
+                }
                 Ok(Expr::UnaryOp {
                     op: UnaryOp::Negate,
                     expr: Box::new(inner),

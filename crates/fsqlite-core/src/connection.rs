@@ -2741,6 +2741,23 @@ impl Connection {
                         apply_limit_clause(&mut rows, &limit);
                     }
                     Ok(rows)
+                } else if select_has_correlated_join_subquery(select) {
+                    // Correlated scalar subqueries with JOINs in their FROM
+                    // clause cannot be handled by the VDBE emit_scalar_subquery
+                    // (which only opens one table cursor). Route through the
+                    // connection-level fallback which can inline-evaluate them.
+                    self.log_mem_execution_fallback("select", "correlated_join_subquery_fallback")?;
+                    let rewritten = self.rewrite_in_subqueries_select(select, params)?;
+                    let mut bound = bind_placeholders_in_select_for_fallback(&rewritten, params)?;
+                    let limit_clause = bound.limit.take();
+                    let mut rows = self.execute_join_select(&bound, None)?;
+                    if distinct {
+                        dedup_rows(&mut rows);
+                    }
+                    if let Some(limit) = limit_clause {
+                        apply_limit_clause(&mut rows, &limit);
+                    }
+                    Ok(rows)
                 } else {
                     // Eagerly rewrite IN-subqueries that the VDBE codegen
                     // cannot handle (e.g. those with GROUP BY / HAVING).
@@ -12407,41 +12424,56 @@ impl Connection {
         }
 
         // ── 7. Project result columns ──
-        let mut result: Vec<Row> = combined
+        // Check once whether any column contains a subquery expression.
+        let has_subqueries = columns
             .iter()
-            .map(|row| {
-                let mut values = Vec::new();
-                for col in columns {
-                    match col {
-                        ResultColumn::Star => {
-                            // All columns from all tables.
-                            values.extend(row.iter().cloned());
-                        }
-                        ResultColumn::TableStar(table_name) => {
-                            // All columns from a specific table.
-                            let mut offset = 0;
-                            for src in &table_sources {
-                                let label = src.alias.as_deref().unwrap_or(&src.table_name);
-                                if label.eq_ignore_ascii_case(table_name) {
-                                    let width = src.col_names.len();
-                                    values.extend(row[offset..offset + width].iter().cloned());
-                                    break;
-                                }
-                                offset += src.col_names.len();
+            .any(|c| matches!(c, ResultColumn::Expr { expr, .. } if expr_has_any_subquery(expr)))
+            || extra_order_exprs.iter().any(expr_has_any_subquery);
+
+        let mut result: Vec<Row> = Vec::with_capacity(combined.len());
+        for row in &combined {
+            let mut values = Vec::new();
+            for col in columns {
+                match col {
+                    ResultColumn::Star => {
+                        values.extend(row.iter().cloned());
+                    }
+                    ResultColumn::TableStar(table_name) => {
+                        let mut offset = 0;
+                        for src in &table_sources {
+                            let label = src.alias.as_deref().unwrap_or(&src.table_name);
+                            if label.eq_ignore_ascii_case(table_name) {
+                                let width = src.col_names.len();
+                                values.extend(row[offset..offset + width].iter().cloned());
+                                break;
                             }
+                            offset += src.col_names.len();
                         }
-                        ResultColumn::Expr { .. } => {
+                    }
+                    ResultColumn::Expr { expr, .. } => {
+                        if has_subqueries && expr_has_any_subquery(expr) {
+                            let inlined = self.inline_subqueries_in_expr(expr, row, &col_map)?;
+                            values.push(
+                                eval_join_expr(&inlined, row, &col_map)
+                                    .unwrap_or(SqliteValue::Null),
+                            );
+                        } else {
                             values.push(project_join_column(col, row, &col_map));
                         }
                     }
                 }
-                // Append extra ORDER BY column values for sorting.
-                for expr in &extra_order_exprs {
+            }
+            for expr in &extra_order_exprs {
+                if has_subqueries && expr_has_any_subquery(expr) {
+                    let inlined = self.inline_subqueries_in_expr(expr, row, &col_map)?;
+                    values
+                        .push(eval_join_expr(&inlined, row, &col_map).unwrap_or(SqliteValue::Null));
+                } else {
                     values.push(eval_join_expr(expr, row, &col_map).unwrap_or(SqliteValue::Null));
                 }
-                Row { values }
-            })
-            .collect();
+            }
+            result.push(Row { values });
+        }
 
         // ── 8. Post-process: ORDER BY ──
         if !select.order_by.is_empty() {
@@ -12461,6 +12493,139 @@ impl Connection {
         }
 
         Ok(result)
+    }
+
+    /// Walk an expression tree and inline any `Expr::Subquery` by substituting
+    /// correlated outer references with literal values from the current row,
+    /// executing the subquery, and replacing it with a literal result.
+    ///
+    /// This allows `execute_join_select` to evaluate result columns that
+    /// contain correlated scalar subqueries (including those with JOINs in
+    /// their FROM clause, which the VDBE `emit_scalar_subquery` cannot handle).
+    fn inline_subqueries_in_expr(
+        &self,
+        expr: &Expr,
+        row: &[SqliteValue],
+        outer_col_map: &[(String, String)],
+    ) -> Result<Expr> {
+        match expr {
+            Expr::Subquery(sub, span) => {
+                let inner_tables = collect_subquery_inner_tables(sub);
+                let mut sub_clone = sub.as_ref().clone();
+                substitute_outer_refs_in_select(&mut sub_clone, row, outer_col_map, &inner_tables);
+                let rows = self.execute_statement(Statement::Select(sub_clone), None)?;
+                let val = rows
+                    .into_iter()
+                    .next()
+                    .and_then(|r| r.values.into_iter().next())
+                    .unwrap_or(SqliteValue::Null);
+                Ok(Expr::Literal(sqlite_value_to_literal(&val), *span))
+            }
+            Expr::FunctionCall {
+                name,
+                args,
+                distinct,
+                order_by,
+                filter,
+                over,
+                span,
+            } => {
+                let new_args = match args {
+                    FunctionArgs::List(exprs) => {
+                        let new_exprs: Result<Vec<_>> = exprs
+                            .iter()
+                            .map(|e| self.inline_subqueries_in_expr(e, row, outer_col_map))
+                            .collect();
+                        FunctionArgs::List(new_exprs?)
+                    }
+                    FunctionArgs::Star => FunctionArgs::Star,
+                };
+                Ok(Expr::FunctionCall {
+                    name: name.clone(),
+                    args: new_args,
+                    distinct: *distinct,
+                    order_by: order_by.clone(),
+                    filter: filter
+                        .as_ref()
+                        .map(|f| self.inline_subqueries_in_expr(f, row, outer_col_map))
+                        .transpose()?
+                        .map(Box::new),
+                    over: over.clone(),
+                    span: *span,
+                })
+            }
+            Expr::BinaryOp {
+                left,
+                op,
+                right,
+                span,
+            } => {
+                let l = self.inline_subqueries_in_expr(left, row, outer_col_map)?;
+                let r = self.inline_subqueries_in_expr(right, row, outer_col_map)?;
+                Ok(Expr::BinaryOp {
+                    left: Box::new(l),
+                    op: *op,
+                    right: Box::new(r),
+                    span: *span,
+                })
+            }
+            Expr::UnaryOp {
+                op,
+                expr: inner,
+                span,
+            } => {
+                let inlined = self.inline_subqueries_in_expr(inner, row, outer_col_map)?;
+                Ok(Expr::UnaryOp {
+                    op: *op,
+                    expr: Box::new(inlined),
+                    span: *span,
+                })
+            }
+            Expr::Case {
+                operand,
+                whens,
+                else_expr,
+                span,
+            } => {
+                let new_op = operand
+                    .as_ref()
+                    .map(|e| self.inline_subqueries_in_expr(e, row, outer_col_map))
+                    .transpose()?
+                    .map(Box::new);
+                let new_whens: Result<Vec<_>> = whens
+                    .iter()
+                    .map(|(w, t)| {
+                        let nw = self.inline_subqueries_in_expr(w, row, outer_col_map)?;
+                        let nt = self.inline_subqueries_in_expr(t, row, outer_col_map)?;
+                        Ok((nw, nt))
+                    })
+                    .collect();
+                let new_else = else_expr
+                    .as_ref()
+                    .map(|e| self.inline_subqueries_in_expr(e, row, outer_col_map))
+                    .transpose()?
+                    .map(Box::new);
+                Ok(Expr::Case {
+                    operand: new_op,
+                    whens: new_whens?,
+                    else_expr: new_else,
+                    span: *span,
+                })
+            }
+            Expr::Cast {
+                expr: inner,
+                type_name,
+                span,
+            } => {
+                let inlined = self.inline_subqueries_in_expr(inner, row, outer_col_map)?;
+                Ok(Expr::Cast {
+                    expr: Box::new(inlined),
+                    type_name: type_name.clone(),
+                    span: *span,
+                })
+            }
+            _ => Ok(expr.clone()),
+        }
     }
 
     /// Compile an INSERT through the VDBE codegen.
@@ -14326,6 +14491,282 @@ fn expr_has_external_column_ref(expr: &Expr, inner_table: Option<&str>) -> bool 
                     .is_some_and(|e| expr_has_external_column_ref(e, inner_table))
         }
         _ => false,
+    }
+}
+
+/// Collect all table names and aliases from a subquery's FROM clause
+/// (including JOINed tables).
+fn collect_subquery_inner_tables(sub: &SelectStatement) -> Vec<String> {
+    let mut tables = Vec::new();
+    if let SelectCore::Select {
+        from: Some(from), ..
+    } = &sub.body.select
+    {
+        if let TableOrSubquery::Table { name, alias, .. } = &from.source {
+            tables.push(name.name.clone());
+            if let Some(a) = alias {
+                tables.push(a.clone());
+            }
+        }
+        for join in &from.joins {
+            if let TableOrSubquery::Table { name, alias, .. } = &join.table {
+                tables.push(name.name.clone());
+                if let Some(a) = alias {
+                    tables.push(a.clone());
+                }
+            }
+        }
+    }
+    tables
+}
+
+/// Check if an expression tree contains any `Expr::Subquery`.
+fn expr_has_any_subquery(expr: &Expr) -> bool {
+    match expr {
+        Expr::Subquery(_, _) | Expr::Exists { .. } => true,
+        Expr::FunctionCall { args, .. } => match args {
+            FunctionArgs::List(exprs) => exprs.iter().any(expr_has_any_subquery),
+            FunctionArgs::Star => false,
+        },
+        Expr::BinaryOp { left, right, .. } => {
+            expr_has_any_subquery(left) || expr_has_any_subquery(right)
+        }
+        Expr::UnaryOp { expr: inner, .. }
+        | Expr::IsNull { expr: inner, .. }
+        | Expr::Cast { expr: inner, .. }
+        | Expr::Collate { expr: inner, .. } => expr_has_any_subquery(inner),
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            operand.as_ref().is_some_and(|e| expr_has_any_subquery(e))
+                || whens
+                    .iter()
+                    .any(|(w, t)| expr_has_any_subquery(w) || expr_has_any_subquery(t))
+                || else_expr.as_ref().is_some_and(|e| expr_has_any_subquery(e))
+        }
+        _ => false,
+    }
+}
+
+/// Check if an expression contains a correlated scalar subquery whose
+/// FROM clause has JOINs (multi-table subquery). These cannot be handled
+/// by the VDBE `emit_scalar_subquery` which only opens one table cursor.
+fn expr_has_correlated_join_subquery(expr: &Expr) -> bool {
+    match expr {
+        Expr::Subquery(sub, _) => {
+            if let SelectCore::Select {
+                from: Some(from), ..
+            } = &sub.body.select
+            {
+                if !from.joins.is_empty() {
+                    return true;
+                }
+            }
+            false
+        }
+        Expr::FunctionCall { args, .. } => match args {
+            FunctionArgs::List(exprs) => exprs.iter().any(expr_has_correlated_join_subquery),
+            FunctionArgs::Star => false,
+        },
+        Expr::BinaryOp { left, right, .. } => {
+            expr_has_correlated_join_subquery(left) || expr_has_correlated_join_subquery(right)
+        }
+        Expr::UnaryOp { expr: inner, .. }
+        | Expr::IsNull { expr: inner, .. }
+        | Expr::Cast { expr: inner, .. }
+        | Expr::Collate { expr: inner, .. } => expr_has_correlated_join_subquery(inner),
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            operand
+                .as_ref()
+                .is_some_and(|e| expr_has_correlated_join_subquery(e))
+                || whens.iter().any(|(w, t)| {
+                    expr_has_correlated_join_subquery(w) || expr_has_correlated_join_subquery(t)
+                })
+                || else_expr
+                    .as_ref()
+                    .is_some_and(|e| expr_has_correlated_join_subquery(e))
+        }
+        _ => false,
+    }
+}
+
+/// Check if a SELECT statement contains any correlated scalar subquery
+/// with JOINs in any of its result columns, WHERE clause, or ORDER BY.
+fn select_has_correlated_join_subquery(select: &SelectStatement) -> bool {
+    let SelectCore::Select {
+        columns,
+        where_clause,
+        ..
+    } = &select.body.select
+    else {
+        return false;
+    };
+    for col in columns {
+        if let ResultColumn::Expr { expr, .. } = col {
+            if expr_has_correlated_join_subquery(expr) {
+                return true;
+            }
+        }
+    }
+    if let Some(wh) = where_clause {
+        if expr_has_correlated_join_subquery(wh) {
+            return true;
+        }
+    }
+    for term in &select.order_by {
+        if expr_has_correlated_join_subquery(&term.expr) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Substitute external column references in an expression with literal
+/// values from the outer row. Column references whose table qualifier
+/// matches one of the `inner_tables` are left unchanged.
+fn substitute_outer_refs_in_expr(
+    expr: &Expr,
+    row: &[SqliteValue],
+    outer_col_map: &[(String, String)],
+    inner_tables: &[String],
+) -> Expr {
+    match expr {
+        Expr::Column(col_ref, _span) => {
+            if let Some(qualifier) = &col_ref.table {
+                let is_inner = inner_tables
+                    .iter()
+                    .any(|t| t.eq_ignore_ascii_case(qualifier));
+                if !is_inner {
+                    if let Ok(idx) =
+                        find_col_in_map(outer_col_map, Some(qualifier), &col_ref.column)
+                    {
+                        let val = row.get(idx).cloned().unwrap_or(SqliteValue::Null);
+                        return value_to_literal_expr(val);
+                    }
+                }
+            }
+            expr.clone()
+        }
+        Expr::BinaryOp {
+            left,
+            op,
+            right,
+            span,
+        } => Expr::BinaryOp {
+            left: Box::new(substitute_outer_refs_in_expr(
+                left,
+                row,
+                outer_col_map,
+                inner_tables,
+            )),
+            op: *op,
+            right: Box::new(substitute_outer_refs_in_expr(
+                right,
+                row,
+                outer_col_map,
+                inner_tables,
+            )),
+            span: *span,
+        },
+        Expr::FunctionCall {
+            name,
+            args,
+            distinct,
+            order_by,
+            filter,
+            over,
+            span,
+        } => {
+            let new_args = match args {
+                FunctionArgs::List(exprs) => FunctionArgs::List(
+                    exprs
+                        .iter()
+                        .map(|e| substitute_outer_refs_in_expr(e, row, outer_col_map, inner_tables))
+                        .collect(),
+                ),
+                FunctionArgs::Star => FunctionArgs::Star,
+            };
+            Expr::FunctionCall {
+                name: name.clone(),
+                args: new_args,
+                distinct: *distinct,
+                order_by: order_by.clone(),
+                filter: filter.as_ref().map(|f| {
+                    Box::new(substitute_outer_refs_in_expr(
+                        f,
+                        row,
+                        outer_col_map,
+                        inner_tables,
+                    ))
+                }),
+                over: over.clone(),
+                span: *span,
+            }
+        }
+        Expr::UnaryOp {
+            op,
+            expr: inner,
+            span,
+        } => Expr::UnaryOp {
+            op: *op,
+            expr: Box::new(substitute_outer_refs_in_expr(
+                inner,
+                row,
+                outer_col_map,
+                inner_tables,
+            )),
+            span: *span,
+        },
+        Expr::IsNull {
+            expr: inner,
+            not,
+            span,
+        } => Expr::IsNull {
+            expr: Box::new(substitute_outer_refs_in_expr(
+                inner,
+                row,
+                outer_col_map,
+                inner_tables,
+            )),
+            not: *not,
+            span: *span,
+        },
+        _ => expr.clone(),
+    }
+}
+
+/// Substitute external column references in a subquery's WHERE clause
+/// and JOIN ON conditions with literal values from the outer row.
+fn substitute_outer_refs_in_select(
+    select: &mut SelectStatement,
+    row: &[SqliteValue],
+    outer_col_map: &[(String, String)],
+    inner_tables: &[String],
+) {
+    if let SelectCore::Select {
+        where_clause, from, ..
+    } = &mut select.body.select
+    {
+        if let Some(wh) = where_clause {
+            **wh = substitute_outer_refs_in_expr(wh, row, outer_col_map, inner_tables);
+        }
+        // Also substitute in JOIN ON conditions.
+        if let Some(from) = from {
+            for join in &mut from.joins {
+                if let Some(JoinConstraint::On(ref mut on_expr)) = join.constraint {
+                    *on_expr =
+                        substitute_outer_refs_in_expr(on_expr, row, outer_col_map, inner_tables);
+                }
+            }
+        }
     }
 }
 
@@ -42635,18 +43076,22 @@ mod pager_routing_tests {
             "SELECT a.name, count(r.id) AS review_count FROM authors a JOIN books b ON b.author_id = a.id JOIN reviews r ON r.book_id = b.id GROUP BY a.name ORDER BY a.name",
             // Three-way JOIN with aggregate + HAVING
             "SELECT a.name, avg(r.rating) AS avg_rating FROM authors a JOIN books b ON b.author_id = a.id JOIN reviews r ON r.book_id = b.id GROUP BY a.name HAVING avg(r.rating) >= 4.0 ORDER BY a.name",
-            // LEFT JOIN preserving unmatched
-            "SELECT b.title, r.rating FROM books b LEFT JOIN reviews r ON r.book_id = b.id ORDER BY b.title",
+            // LEFT JOIN preserving unmatched (secondary sort for stability)
+            "SELECT b.title, r.rating FROM books b LEFT JOIN reviews r ON r.book_id = b.id ORDER BY b.title, r.rating",
             // ORDER BY expression not in SELECT (non-GROUP BY)
             "SELECT title FROM books ORDER BY year DESC, title ASC",
             // ORDER BY with CASE expression
             "SELECT title, year FROM books ORDER BY CASE WHEN year >= 2021 THEN 0 ELSE 1 END, title",
             // Multi-column DISTINCT
             "SELECT DISTINCT author_id, year FROM books ORDER BY author_id, year",
-            // Subquery in SELECT with multi-table context
+            // Single-table correlated subqueries (VDBE codegen path)
+            "SELECT a.name, (SELECT count(*) FROM books b WHERE b.author_id = a.id) AS book_count FROM authors a ORDER BY a.name",
+            // COALESCE with single-table subquery
+            "SELECT a.name, COALESCE((SELECT max(b.year) FROM books b WHERE b.author_id = a.id), 0) AS latest FROM authors a ORDER BY a.name",
+            // Correlated scalar subqueries with JOINs (connection-level fallback)
             "SELECT a.name, (SELECT avg(r.rating) FROM books b JOIN reviews r ON r.book_id = b.id WHERE b.author_id = a.id) AS avg_rating FROM authors a ORDER BY a.name",
-            // COALESCE with subquery
-            "SELECT a.name, COALESCE((SELECT max(r.rating) FROM books b JOIN reviews r ON r.book_id = b.id WHERE b.author_id = a.id), 0) AS best FROM authors a ORDER BY a.name",
+            // COALESCE wrapping a correlated JOIN subquery
+            "SELECT a.name, COALESCE((SELECT count(r.id) FROM books b JOIN reviews r ON r.book_id = b.id WHERE b.author_id = a.id), 0) AS review_count FROM authors a ORDER BY a.name",
             // Complex WHERE with AND/OR/NOT
             "SELECT title FROM books WHERE (year > 2019 AND author_id = 1) OR (year < 2021 AND author_id = 2) ORDER BY title",
             // NULL handling in ORDER BY
