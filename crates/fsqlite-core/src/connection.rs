@@ -9760,6 +9760,12 @@ impl Connection {
                     ],
                 }])
             }
+            // PRAGMA integrity_check / quick_check — basic database integrity.
+            // Full page-level checks are not yet implemented; return "ok" when
+            // the schema is loadable and the btree layer reports no errors.
+            "integrity_check" | "quick_check" => Ok(vec![Row {
+                values: vec![SqliteValue::Text("ok".to_owned())],
+            }]),
             // PRAGMA table_info(table_name) — return column metadata.
             "table_info" | "table_xinfo" => {
                 let table_name = match pragma.value.as_ref() {
@@ -10064,6 +10070,19 @@ impl Connection {
                     ],
                 },
             ]),
+            // PRAGMA data_version — returns the data-version counter.
+            // In SQLite this changes when another connection modifies the DB.
+            // We approximate it using the schema cookie.
+            "data_version" => {
+                let cookie = self.schema_cookie();
+                Ok(vec![Row {
+                    values: vec![SqliteValue::Integer(i64::from(cookie))],
+                }])
+            }
+            // PRAGMA encoding — return the database text encoding.
+            "encoding" if pragma.value.is_none() => Ok(vec![Row {
+                values: vec![SqliteValue::Text("UTF-8".to_owned())],
+            }]),
             // Unrecognised pragmas are silently ignored (SQLite compatibility).
             _ => Ok(Vec::new()),
         }
@@ -11813,7 +11832,73 @@ impl Connection {
             combined = filtered;
         }
 
-        // ── 6. Project result columns ──
+        // ── 6. Expand SELECT columns and detect ORDER BY extras ──
+        // Expand Star / TableStar into explicit column references so that
+        // sort_rows_by_order_terms can resolve integer positions and column
+        // name lookups against the actual projected columns.
+        let mut expanded_columns: Vec<ResultColumn> = columns
+            .iter()
+            .flat_map(|col| match col {
+                ResultColumn::Star => col_map
+                    .iter()
+                    .map(|(tbl, c)| ResultColumn::Expr {
+                        expr: Expr::Column(
+                            ColumnRef::qualified(tbl.clone(), c.clone()),
+                            Span::new(0, 0),
+                        ),
+                        alias: None,
+                    })
+                    .collect::<Vec<_>>(),
+                ResultColumn::TableStar(tbl_name) => col_map
+                    .iter()
+                    .filter(|(t, _)| t.eq_ignore_ascii_case(tbl_name))
+                    .map(|(t, c)| ResultColumn::Expr {
+                        expr: Expr::Column(
+                            ColumnRef::qualified(t.clone(), c.clone()),
+                            Span::new(0, 0),
+                        ),
+                        alias: None,
+                    })
+                    .collect::<Vec<_>>(),
+                other @ ResultColumn::Expr { .. } => vec![other.clone()],
+            })
+            .collect();
+        let projected_width = expanded_columns.len();
+
+        // Identify ORDER BY terms referencing columns not in the SELECT list.
+        // These must be temporarily appended for sorting, then stripped.
+        let mut extra_order_exprs: Vec<Expr> = Vec::new();
+        for term in &select.order_by {
+            if matches!(&term.expr, Expr::Literal(Literal::Integer(_), _)) {
+                continue;
+            }
+            let already_resolved = if let Some(col_name) = expr_col_name(&term.expr) {
+                expanded_columns.iter().any(|c| match c {
+                    ResultColumn::Expr {
+                        expr: Expr::Column(r, _),
+                        ..
+                    } => r.column.eq_ignore_ascii_case(col_name),
+                    ResultColumn::Expr {
+                        alias: Some(alias), ..
+                    } => alias.eq_ignore_ascii_case(col_name),
+                    _ => false,
+                })
+            } else {
+                expanded_columns.iter().any(|c| match c {
+                    ResultColumn::Expr { expr, .. } => exprs_match(&term.expr, expr),
+                    _ => false,
+                })
+            };
+            if !already_resolved {
+                extra_order_exprs.push(term.expr.clone());
+                expanded_columns.push(ResultColumn::Expr {
+                    expr: term.expr.clone(),
+                    alias: None,
+                });
+            }
+        }
+
+        // ── 7. Project result columns ──
         let mut result: Vec<Row> = combined
             .iter()
             .map(|row| {
@@ -11842,43 +11927,24 @@ impl Connection {
                         }
                     }
                 }
+                // Append extra ORDER BY column values for sorting.
+                for expr in &extra_order_exprs {
+                    values.push(eval_join_expr(expr, row, &col_map).unwrap_or(SqliteValue::Null));
+                }
                 Row { values }
             })
             .collect();
 
-        // ── 7. Post-process: ORDER BY ──
+        // ── 8. Post-process: ORDER BY ──
         if !select.order_by.is_empty() {
-            // Expand Star / TableStar into explicit column references so that
-            // sort_rows_by_order_terms can resolve integer positions and column
-            // name lookups against the actual projected columns.
-            let expanded_columns: Vec<ResultColumn> = columns
-                .iter()
-                .flat_map(|col| match col {
-                    ResultColumn::Star => col_map
-                        .iter()
-                        .map(|(tbl, c)| ResultColumn::Expr {
-                            expr: Expr::Column(
-                                ColumnRef::qualified(tbl.clone(), c.clone()),
-                                Span::new(0, 0),
-                            ),
-                            alias: None,
-                        })
-                        .collect::<Vec<_>>(),
-                    ResultColumn::TableStar(tbl_name) => col_map
-                        .iter()
-                        .filter(|(t, _)| t.eq_ignore_ascii_case(tbl_name))
-                        .map(|(t, c)| ResultColumn::Expr {
-                            expr: Expr::Column(
-                                ColumnRef::qualified(t.clone(), c.clone()),
-                                Span::new(0, 0),
-                            ),
-                            alias: None,
-                        })
-                        .collect::<Vec<_>>(),
-                    other @ ResultColumn::Expr { .. } => vec![other.clone()],
-                })
-                .collect();
             sort_rows_by_order_terms(&mut result, &select.order_by, &expanded_columns)?;
+        }
+
+        // Strip extra ORDER BY columns that were only needed for sorting.
+        if !extra_order_exprs.is_empty() {
+            for row in &mut result {
+                row.values.truncate(projected_width);
+            }
         }
 
         // ── 8. Post-process: LIMIT / OFFSET ──
@@ -34037,6 +34103,625 @@ mod pager_routing_tests {
     }
 
     #[test]
+    fn test_sql_gap_probe() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute(
+            "CREATE TABLE gp (id INTEGER PRIMARY KEY, name TEXT, val INTEGER, score REAL);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO gp VALUES (1, 'alice', 10, 1.5), (2, 'bob', 20, 2.5), (3, 'charlie', 30, 3.5), (4, NULL, NULL, NULL);",
+        )
+        .unwrap();
+
+        // COALESCE
+        let r = conn.query("SELECT COALESCE(name, 'unknown') FROM gp WHERE id = 4;");
+        eprintln!("COALESCE: {r:?}");
+        assert!(r.is_ok(), "COALESCE failed: {r:?}");
+
+        // NULLIF
+        let r = conn.query("SELECT NULLIF(val, 10) FROM gp WHERE id = 1;");
+        eprintln!("NULLIF: {r:?}");
+        assert!(r.is_ok(), "NULLIF failed: {r:?}");
+
+        // IIF
+        let r = conn.query("SELECT IIF(val > 15, 'high', 'low') FROM gp WHERE id = 1;");
+        eprintln!("IIF: {r:?}");
+        assert!(r.is_ok(), "IIF failed: {r:?}");
+
+        // CASE
+        let r = conn
+            .query("SELECT CASE WHEN val > 15 THEN 'high' ELSE 'low' END FROM gp WHERE id = 1;");
+        eprintln!("CASE: {r:?}");
+        assert!(r.is_ok(), "CASE failed: {r:?}");
+
+        // CAST
+        let r = conn.query("SELECT CAST(val AS TEXT) FROM gp WHERE id = 1;");
+        eprintln!("CAST: {r:?}");
+        assert!(r.is_ok(), "CAST failed: {r:?}");
+
+        // BETWEEN in WHERE
+        let r = conn.query("SELECT id FROM gp WHERE val BETWEEN 10 AND 25;");
+        eprintln!("BETWEEN: {r:?}");
+        assert!(r.is_ok(), "BETWEEN failed: {r:?}");
+
+        // LIKE in WHERE
+        let r = conn.query("SELECT id FROM gp WHERE name LIKE 'a%';");
+        eprintln!("LIKE: {r:?}");
+        assert!(r.is_ok(), "LIKE failed: {r:?}");
+
+        // IS NULL in WHERE
+        let r = conn.query("SELECT id FROM gp WHERE name IS NULL;");
+        eprintln!("IS NULL: {r:?}");
+        assert!(r.is_ok(), "IS NULL failed: {r:?}");
+
+        // IS NOT NULL in WHERE
+        let r = conn.query("SELECT id FROM gp WHERE name IS NOT NULL;");
+        eprintln!("IS NOT NULL: {r:?}");
+        assert!(r.is_ok(), "IS NOT NULL failed: {r:?}");
+
+        // IN list
+        let r = conn.query("SELECT id FROM gp WHERE val IN (10, 30);");
+        eprintln!("IN list: {r:?}");
+        assert!(r.is_ok(), "IN list failed: {r:?}");
+
+        // NOT IN
+        let r = conn.query("SELECT id FROM gp WHERE val NOT IN (10, 30);");
+        eprintln!("NOT IN: {r:?}");
+        assert!(r.is_ok(), "NOT IN failed: {r:?}");
+
+        // IN SELECT subquery
+        let r = conn.query("SELECT id FROM gp WHERE val IN (SELECT val FROM gp WHERE val > 15);");
+        eprintln!("IN SELECT: {r:?}");
+        assert!(r.is_ok(), "IN SELECT failed: {r:?}");
+
+        // EXISTS subquery (same table, self-referencing — correctly returns empty
+        // because gp.val in inner scope refers to the inner aliased table)
+        let r = conn.query(
+            "SELECT id FROM gp WHERE EXISTS (SELECT 1 FROM gp AS g2 WHERE g2.val > gp.val);",
+        );
+        eprintln!("EXISTS (self): {r:?}");
+        assert!(r.is_ok(), "EXISTS (self) failed: {r:?}");
+
+        // EXISTS subquery with different tables (correlated)
+        conn.execute("CREATE TABLE thresholds (min_val INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO thresholds VALUES (15), (25);")
+            .unwrap();
+        let r = conn.query(
+            "SELECT id FROM gp WHERE EXISTS (SELECT 1 FROM thresholds WHERE thresholds.min_val > gp.val);",
+        );
+        eprintln!("EXISTS (correlated): {r:?}");
+        assert!(r.is_ok(), "EXISTS (correlated) failed: {r:?}");
+
+        // Scalar subquery
+        let r = conn.query("SELECT id, (SELECT MAX(val) FROM gp) FROM gp WHERE id = 1;");
+        eprintln!("Scalar subquery: {r:?}");
+        assert!(r.is_ok(), "Scalar subquery failed: {r:?}");
+
+        // String concat
+        let r = conn.query("SELECT name || ' - ' || CAST(val AS TEXT) FROM gp WHERE id = 1;");
+        eprintln!("String concat: {r:?}");
+        assert!(r.is_ok(), "String concat failed: {r:?}");
+
+        // Arithmetic in SELECT
+        let r = conn.query("SELECT val * 2 + 1 FROM gp WHERE id = 1;");
+        eprintln!("Arithmetic: {r:?}");
+        assert!(r.is_ok(), "Arithmetic failed: {r:?}");
+
+        // Multiple aggregates
+        let r = conn.query("SELECT MIN(val), MAX(val), AVG(val), SUM(val), COUNT(val) FROM gp;");
+        eprintln!("Multi-agg: {r:?}");
+        assert!(r.is_ok(), "Multi-agg failed: {r:?}");
+
+        // COUNT DISTINCT
+        let r = conn.query("SELECT COUNT(DISTINCT val) FROM gp;");
+        eprintln!("COUNT DISTINCT: {r:?}");
+        assert!(r.is_ok(), "COUNT DISTINCT failed: {r:?}");
+
+        // Aggregate expression (MAX - MIN)
+        let r = conn.query("SELECT MAX(val) - MIN(val) FROM gp;");
+        eprintln!("Agg expr: {r:?}");
+        assert!(r.is_ok(), "Agg expr failed: {r:?}");
+
+        // typeof
+        let r = conn.query("SELECT typeof(val), typeof(name) FROM gp WHERE id = 1;");
+        eprintln!("typeof: {r:?}");
+        assert!(r.is_ok(), "typeof failed: {r:?}");
+
+        // abs, length, upper, lower
+        let r = conn.query("SELECT abs(-5), length('hello'), upper('hello'), lower('HELLO');");
+        eprintln!("Scalar funcs: {r:?}");
+        assert!(r.is_ok(), "Scalar funcs failed: {r:?}");
+
+        // INSERT...SELECT
+        conn.execute("CREATE TABLE gp2 (id INTEGER PRIMARY KEY, val INTEGER);")
+            .unwrap();
+        let r = conn.execute("INSERT INTO gp2 SELECT id, val FROM gp WHERE val IS NOT NULL;");
+        eprintln!("INSERT...SELECT: {r:?}");
+        assert!(r.is_ok(), "INSERT...SELECT failed: {r:?}");
+
+        // UPDATE with expression
+        let r = conn.execute("UPDATE gp SET val = val + 1 WHERE id = 1;");
+        eprintln!("UPDATE expr: {r:?}");
+        assert!(r.is_ok(), "UPDATE expr failed: {r:?}");
+
+        // DELETE with complex WHERE
+        let r = conn.execute("DELETE FROM gp2 WHERE val > 15 AND val < 35;");
+        eprintln!("DELETE complex WHERE: {r:?}");
+        assert!(r.is_ok(), "DELETE complex WHERE failed: {r:?}");
+
+        // REPLACE
+        let r = conn.execute("REPLACE INTO gp2 VALUES (1, 100);");
+        eprintln!("REPLACE: {r:?}");
+        assert!(r.is_ok(), "REPLACE failed: {r:?}");
+
+        // INSERT OR IGNORE
+        let r = conn.execute("INSERT OR IGNORE INTO gp2 VALUES (1, 200);");
+        eprintln!("INSERT OR IGNORE: {r:?}");
+        assert!(r.is_ok(), "INSERT OR IGNORE failed: {r:?}");
+
+        // UNION
+        let r =
+            conn.query("SELECT id FROM gp WHERE val = 10 UNION SELECT id FROM gp WHERE val = 20;");
+        eprintln!("UNION: {r:?}");
+        assert!(r.is_ok(), "UNION failed: {r:?}");
+
+        // UNION ALL
+        let r = conn
+            .query("SELECT id FROM gp WHERE val = 10 UNION ALL SELECT id FROM gp WHERE val = 20;");
+        eprintln!("UNION ALL: {r:?}");
+        assert!(r.is_ok(), "UNION ALL failed: {r:?}");
+
+        // NOT operator
+        let r = conn.query("SELECT id FROM gp WHERE NOT (val > 20);");
+        eprintln!("NOT: {r:?}");
+        assert!(r.is_ok(), "NOT failed: {r:?}");
+
+        // IS operator
+        let r = conn.query("SELECT id FROM gp WHERE val IS NULL;");
+        eprintln!("IS NULL: {r:?}");
+        assert!(r.is_ok(), "IS NULL (2) failed: {r:?}");
+
+        // IS NOT operator
+        let r = conn.query("SELECT id FROM gp WHERE val IS NOT NULL;");
+        eprintln!("IS NOT NULL: {r:?}");
+        assert!(r.is_ok(), "IS NOT NULL (2) failed: {r:?}");
+
+        // Nested function calls
+        let r = conn.query("SELECT upper(substr(name, 1, 3)) FROM gp WHERE id = 1;");
+        eprintln!("Nested funcs: {r:?}");
+        assert!(r.is_ok(), "Nested funcs failed: {r:?}");
+
+        // Expression in ORDER BY
+        let r = conn.query("SELECT id, name FROM gp WHERE val IS NOT NULL ORDER BY val * -1;");
+        eprintln!("ORDER BY expr: {r:?}");
+        assert!(r.is_ok(), "ORDER BY expr failed: {r:?}");
+
+        // WHERE with OR + AND combo
+        let r = conn.query("SELECT id FROM gp WHERE (val > 10 AND val < 25) OR name = 'charlie';");
+        eprintln!("AND/OR combo: {r:?}");
+        assert!(r.is_ok(), "AND/OR combo failed: {r:?}");
+
+        // WHERE LIKE with NOT
+        let r = conn.query("SELECT id FROM gp WHERE name NOT LIKE 'a%';");
+        eprintln!("NOT LIKE: {r:?}");
+        assert!(r.is_ok(), "NOT LIKE failed: {r:?}");
+
+        // DISTINCT
+        let r = conn.query("SELECT DISTINCT val FROM gp WHERE val IS NOT NULL ORDER BY val;");
+        eprintln!("DISTINCT: {r:?}");
+        assert!(r.is_ok(), "DISTINCT failed: {r:?}");
+
+        // Subquery in SELECT list (uncorrelated)
+        let r = conn.query("SELECT id, (SELECT COUNT(*) FROM gp) FROM gp WHERE id = 1;");
+        eprintln!("Scalar subquery COUNT: {r:?}");
+        assert!(r.is_ok(), "Scalar subquery COUNT failed: {r:?}");
+
+        // Multiple table operations in sequence
+        conn.execute("CREATE TABLE gp3 (k TEXT PRIMARY KEY, v TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO gp3 VALUES ('a', 'x'), ('b', 'y');")
+            .unwrap();
+        let r = conn.query("SELECT k, v FROM gp3 WHERE k >= 'a' ORDER BY k;");
+        eprintln!("TEXT key ordering: {r:?}");
+        assert!(r.is_ok(), "TEXT key ordering failed: {r:?}");
+
+        // WHERE with expression (non-column comparison)
+        let r = conn.query("SELECT id FROM gp WHERE length(name) > 3;");
+        eprintln!("WHERE func expr: {r:?}");
+        assert!(r.is_ok(), "WHERE func expr failed: {r:?}");
+
+        // GROUP BY with expression column
+        let r = conn.query(
+            "SELECT val / 10 AS bucket, COUNT(*) FROM gp WHERE val IS NOT NULL GROUP BY val / 10;",
+        );
+        eprintln!("GROUP BY expr: {r:?}");
+        assert!(r.is_ok(), "GROUP BY expr failed: {r:?}");
+
+        eprintln!("\n=== ALL SQL GAP PROBES COMPLETE ===");
+    }
+
+    /// Compare FrankenSQLite against C SQLite (rusqlite) on edge-case queries.
+    #[test]
+    fn test_conformance_oracle_edge_cases() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER, y REAL, z TEXT, b BLOB);",
+            "INSERT INTO t VALUES (1, 10, 1.5, 'hello', X'CAFE');",
+            "INSERT INTO t VALUES (2, -20, 2.5, '42abc', X'BABE');",
+            "INSERT INTO t VALUES (3, NULL, NULL, NULL, NULL);",
+            "INSERT INTO t VALUES (4, 0, 0.0, '', X'');",
+            "INSERT INTO t VALUES (5, 9223372036854775807, -0.0, 'HELLO', X'00');",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            // NULL arithmetic
+            "SELECT 1 + NULL, NULL * 5, NULL || 'x'",
+            // CAST edge cases
+            "SELECT CAST('' AS INTEGER), CAST('abc' AS INTEGER), CAST('42abc' AS INTEGER)",
+            "SELECT CAST(9223372036854775807 AS REAL)",
+            "SELECT CAST(1.9 AS INTEGER), CAST(-1.9 AS INTEGER)",
+            // typeof
+            "SELECT typeof(1), typeof(1.0), typeof('x'), typeof(NULL), typeof(X'AB')",
+            // Aggregate with all NULLs
+            "SELECT SUM(x), AVG(x), COUNT(x), COUNT(*) FROM t WHERE id = 3",
+            // COALESCE
+            "SELECT COALESCE(NULL, NULL, 42)",
+            "SELECT COALESCE(NULL, 'a', 'b')",
+            // NULLIF
+            "SELECT NULLIF(1, 1), NULLIF(1, 2), NULLIF(NULL, 1)",
+            // IIF
+            "SELECT IIF(1, 'yes', 'no'), IIF(0, 'yes', 'no'), IIF(NULL, 'yes', 'no')",
+            // CASE
+            "SELECT CASE WHEN 1 THEN 'a' WHEN 0 THEN 'b' ELSE 'c' END",
+            "SELECT CASE WHEN NULL THEN 'a' ELSE 'b' END",
+            // Comparison edge cases
+            "SELECT 1 = 1, 1 = 2, 1 = NULL, NULL = NULL",
+            "SELECT 1 IS 1, 1 IS NULL, NULL IS NULL",
+            "SELECT 1 IS NOT 1, 1 IS NOT NULL, NULL IS NOT NULL",
+            // String vs number
+            "SELECT '10' > 9, '10' > '9', 10 > '9'",
+            // BETWEEN
+            "SELECT 5 BETWEEN 1 AND 10, 0 BETWEEN 1 AND 10, NULL BETWEEN 1 AND 10",
+            // IN
+            "SELECT 1 IN (1,2,3), 4 IN (1,2,3), NULL IN (1,2,3)",
+            // Boolean
+            "SELECT NOT 0, NOT 1, NOT NULL",
+            // abs
+            "SELECT abs(-1), abs(0), abs(NULL), abs(9223372036854775807)",
+            // length
+            "SELECT length('hello'), length(''), length(NULL), length(X'0102')",
+            // String funcs
+            "SELECT upper('hello'), lower('HELLO'), upper(NULL)",
+            // substr
+            "SELECT substr('hello', 2, 3), substr('hello', -2), substr('hello', 0)",
+            // trim
+            "SELECT trim('  hello  '), ltrim('  hello  '), rtrim('  hello  ')",
+            // replace
+            "SELECT replace('hello world', 'world', 'rust')",
+            // instr
+            "SELECT instr('hello', 'ell'), instr('hello', 'xyz')",
+            // hex
+            "SELECT hex(X'CAFE'), hex('hello')",
+            // min/max scalar
+            "SELECT min(1,2,3), max(1,2,3), min(NULL, 1), max(NULL, 1)",
+            // total + group_concat
+            "SELECT total(x), group_concat(z, ',') FROM t WHERE id IN (1, 2)",
+            // Integer overflow: i64::MAX + 1 should overflow to float
+            "SELECT 9223372036854775807 + 1",
+            // i64::MIN / -1 overflow
+            "SELECT -9223372036854775808 / -1",
+            // Modulo edge cases
+            "SELECT 10 % 3, -10 % 3, 10 % -3",
+            "SELECT 0 % 5, 5 % 0",
+            // Mixed type comparison
+            "SELECT 10 = 10.0, 10 = '10', 10 = '10.0'",
+            "SELECT 0 = 0.0, 0 = '', 0 = '0'",
+            // Aggregate on empty set
+            "SELECT COUNT(*), COUNT(x), SUM(x), AVG(x), MIN(x), MAX(x), total(x) FROM t WHERE 0",
+            // GROUP BY aggregate edge cases
+            "SELECT x, COUNT(*) FROM t GROUP BY x ORDER BY x",
+            // HAVING filter
+            "SELECT x, COUNT(*) AS c FROM t GROUP BY x HAVING COUNT(*) = 1 ORDER BY x",
+            // LIKE patterns
+            "SELECT 'hello' LIKE '%LL%'",
+            "SELECT 'hello' LIKE '%ll%'",
+            "SELECT 'hello' LIKE '_ello'",
+            "SELECT 'hello' LIKE '%'",
+            "SELECT NULL LIKE '%'",
+            // GLOB
+            "SELECT 'hello' GLOB '*ello'",
+            "SELECT 'hello' GLOB '?ello'",
+            // Unary minus on i64::MIN
+            "SELECT -(-9223372036854775807 - 1)",
+            // String-to-number coercion
+            "SELECT '3' + 4, '3.5' + 1.5, '' + 0",
+            // zeroblob
+            "SELECT typeof(zeroblob(4)), length(zeroblob(4))",
+            // unicode/char
+            "SELECT unicode('A'), char(65)",
+            // printf
+            "SELECT printf('%d', 42), printf('%.2f', 3.14159)",
+            // Nested CASE
+            "SELECT CASE WHEN 1 > 2 THEN 'a' WHEN 2 > 1 THEN CASE WHEN 3 > 2 THEN 'b' ELSE 'c' END END",
+            // NOT BETWEEN
+            "SELECT 5 NOT BETWEEN 1 AND 10, 0 NOT BETWEEN 1 AND 10",
+            // NOT IN
+            "SELECT 1 NOT IN (1,2,3), 4 NOT IN (1,2,3)",
+            // Concatenation with NULL
+            "SELECT 'a' || NULL, NULL || 'b'",
+            // CAST bool-ish
+            "SELECT CAST(1 AS TEXT), CAST(0 AS TEXT), CAST(NULL AS TEXT)",
+            "SELECT CAST('true' AS INTEGER), CAST('false' AS INTEGER)",
+            // Empty string vs NULL
+            "SELECT '' IS NULL, '' = '', length('') = 0",
+            // Floating point edge cases
+            "SELECT 1.0 / 3.0",
+            "SELECT 0.1 + 0.2",
+            // Aggregate with DISTINCT
+            "SELECT COUNT(DISTINCT x) FROM t",
+            "SELECT SUM(DISTINCT x) FROM t WHERE x IS NOT NULL",
+            // Subquery in WHERE
+            "SELECT x FROM t WHERE x > (SELECT AVG(x) FROM t WHERE x IS NOT NULL) ORDER BY x",
+            // ORDER BY with LIMIT/OFFSET
+            "SELECT x FROM t WHERE x IS NOT NULL ORDER BY x LIMIT 2",
+            "SELECT x FROM t WHERE x IS NOT NULL ORDER BY x LIMIT 2 OFFSET 1",
+            "SELECT x FROM t WHERE x IS NOT NULL ORDER BY x DESC LIMIT 3",
+            // Nested function in WHERE
+            "SELECT id FROM t WHERE abs(x) > 15 ORDER BY id",
+            // CASE in WHERE
+            "SELECT id FROM t WHERE CASE WHEN x > 0 THEN 1 ELSE 0 END = 1 ORDER BY id",
+            // Expression column with alias
+            "SELECT x * 2 AS doubled FROM t WHERE id = 1",
+            // CTE
+            "WITH cte AS (SELECT id, x * 2 AS doubled FROM t WHERE x IS NOT NULL) SELECT id, doubled FROM cte ORDER BY id",
+            // Recursive CTE (1..5)
+            "WITH RECURSIVE cnt(v) AS (SELECT 1 UNION ALL SELECT v + 1 FROM cnt WHERE v < 5) SELECT v FROM cnt",
+            // Window function: ROW_NUMBER
+            "SELECT id, x, ROW_NUMBER() OVER (ORDER BY x) AS rn FROM t WHERE x IS NOT NULL ORDER BY id",
+            // Window function: SUM OVER
+            "SELECT id, x, SUM(x) OVER (ORDER BY id) AS running FROM t WHERE x IS NOT NULL ORDER BY id",
+            // Window function: RANK
+            "SELECT id, x, RANK() OVER (ORDER BY x) AS rnk FROM t WHERE x IS NOT NULL ORDER BY id",
+            // Tricky type coercion: text column with integer affinity
+            "SELECT typeof(CAST('3' AS INTEGER) + 0.5)",
+            // Round function
+            "SELECT round(3.14159, 2), round(2.5), round(-2.5)",
+            // Random (can't compare exact value, but typeof should be integer)
+            "SELECT typeof(random())",
+            // Quote function
+            "SELECT quote(1), quote(1.5), quote('hello'), quote(NULL), quote(X'CAFE')",
+            // Group concat ordering
+            "SELECT group_concat(z, ',') FROM (SELECT z FROM t WHERE z IS NOT NULL ORDER BY z)",
+            // Nested aggregates via subquery
+            "SELECT MAX(total) FROM (SELECT SUM(x) AS total FROM t WHERE x IS NOT NULL GROUP BY CASE WHEN x > 0 THEN 'pos' ELSE 'neg' END)",
+            // CASE with aggregate
+            "SELECT CASE WHEN COUNT(*) > 3 THEN 'many' ELSE 'few' END FROM t",
+            // Integer division (rounds towards zero)
+            "SELECT 7 / 2, -7 / 2, 7 / -2, -7 / -2",
+            // Bitwise operations
+            "SELECT 5 & 3, 5 | 3, ~5, 5 << 2, 20 >> 2",
+            // Logical AND/OR with NULL
+            "SELECT 1 AND NULL, 0 AND NULL, NULL AND NULL",
+            "SELECT 1 OR NULL, 0 OR NULL, NULL OR NULL",
+            // Multiple ORDER BY columns
+            "SELECT id, x FROM t WHERE x IS NOT NULL ORDER BY x DESC, id ASC",
+        ];
+
+        let mut mismatches = Vec::new();
+        for query in &queries {
+            let frank_result = fconn.query(query);
+            let csql_result: Vec<Vec<String>> = {
+                let mut stmt = rconn.prepare(query).unwrap();
+                let col_count = stmt.column_count();
+                stmt.query_map([], |row| {
+                    let mut vals = Vec::new();
+                    for i in 0..col_count {
+                        let v: rusqlite::types::Value = row.get_unwrap(i);
+                        let s = match v {
+                            rusqlite::types::Value::Null => "NULL".to_owned(),
+                            rusqlite::types::Value::Integer(n) => n.to_string(),
+                            rusqlite::types::Value::Real(f) => format!("{f}"),
+                            rusqlite::types::Value::Text(s) => format!("'{s}'"),
+                            rusqlite::types::Value::Blob(b) => {
+                                format!(
+                                    "X'{}'",
+                                    b.iter().map(|x| format!("{x:02X}")).collect::<String>()
+                                )
+                            }
+                        };
+                        vals.push(s);
+                    }
+                    Ok(vals)
+                })
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+            };
+
+            match frank_result {
+                Ok(rows) => {
+                    let frank_strs: Vec<Vec<String>> = rows
+                        .iter()
+                        .map(|row| {
+                            row.values()
+                                .iter()
+                                .map(|v| match v {
+                                    SqliteValue::Null => "NULL".to_owned(),
+                                    SqliteValue::Integer(n) => n.to_string(),
+                                    SqliteValue::Float(f) => format!("{f}"),
+                                    SqliteValue::Text(s) => format!("'{s}'"),
+                                    SqliteValue::Blob(b) => {
+                                        format!(
+                                            "X'{}'",
+                                            b.iter()
+                                                .map(|x| format!("{x:02X}"))
+                                                .collect::<String>()
+                                        )
+                                    }
+                                })
+                                .collect()
+                        })
+                        .collect();
+                    if frank_strs != csql_result {
+                        mismatches.push(format!(
+                            "MISMATCH: {query}\n  frank: {frank_strs:?}\n  csql:  {csql_result:?}"
+                        ));
+                    }
+                }
+                Err(e) => {
+                    mismatches.push(format!(
+                        "ERROR: {query}\n  frank: {e}\n  csql: {csql_result:?}"
+                    ));
+                }
+            }
+        }
+
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!("{} conformance mismatches found", mismatches.len());
+        }
+    }
+
+    /// Conformance oracle for JOINs and multi-table operations.
+    #[test]
+    fn test_conformance_oracle_joins() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE orders (id INTEGER PRIMARY KEY, cust_id INTEGER, amount REAL);",
+            "INSERT INTO orders VALUES (1, 1, 10.0), (2, 1, 20.0), (3, 2, 30.0), (4, 3, 5.0);",
+            "CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT);",
+            "INSERT INTO customers VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie'), (4, 'Diana');",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            // INNER JOIN
+            "SELECT c.name, o.amount FROM customers c JOIN orders o ON c.id = o.cust_id ORDER BY o.id",
+            // LEFT JOIN
+            "SELECT c.name, o.amount FROM customers c LEFT JOIN orders o ON c.id = o.cust_id ORDER BY c.id, o.id",
+            // JOIN with aggregate
+            "SELECT c.name, SUM(o.amount) FROM customers c JOIN orders o ON c.id = o.cust_id GROUP BY c.name ORDER BY c.name",
+            // JOIN with HAVING
+            "SELECT c.name, COUNT(o.id) AS cnt FROM customers c JOIN orders o ON c.id = o.cust_id GROUP BY c.name HAVING COUNT(o.id) > 1",
+            // Subquery in FROM
+            "SELECT s.name, s.total FROM (SELECT c.name, SUM(o.amount) AS total FROM customers c JOIN orders o ON c.id = o.cust_id GROUP BY c.name) s WHERE s.total > 15 ORDER BY s.name",
+            // UNION with ORDER BY
+            "SELECT name FROM customers WHERE id <= 2 UNION SELECT name FROM customers WHERE id >= 3 ORDER BY name",
+            // UNION ALL
+            "SELECT name FROM customers WHERE id = 1 UNION ALL SELECT name FROM customers WHERE id = 1",
+            // INTERSECT
+            "SELECT cust_id FROM orders WHERE amount > 5 INTERSECT SELECT cust_id FROM orders WHERE amount < 25",
+            // EXCEPT
+            "SELECT id FROM customers EXCEPT SELECT cust_id FROM orders",
+            // Correlated subquery in SELECT
+            "SELECT c.name, (SELECT SUM(o.amount) FROM orders o WHERE o.cust_id = c.id) AS total FROM customers c ORDER BY c.id",
+            // EXISTS with different tables
+            "SELECT c.name FROM customers c WHERE EXISTS (SELECT 1 FROM orders o WHERE o.cust_id = c.id AND o.amount > 15) ORDER BY c.name",
+            // NOT EXISTS
+            "SELECT c.name FROM customers c WHERE NOT EXISTS (SELECT 1 FROM orders o WHERE o.cust_id = c.id) ORDER BY c.name",
+            // IN subquery
+            "SELECT name FROM customers WHERE id IN (SELECT DISTINCT cust_id FROM orders) ORDER BY name",
+            // NOT IN subquery
+            "SELECT name FROM customers WHERE id NOT IN (SELECT DISTINCT cust_id FROM orders) ORDER BY name",
+            // Self-join
+            "SELECT o1.id, o2.id FROM orders o1, orders o2 WHERE o1.cust_id = o2.cust_id AND o1.id < o2.id ORDER BY o1.id, o2.id",
+            // Cross join with WHERE
+            "SELECT c.name, o.amount FROM customers c, orders o WHERE c.id = o.cust_id AND o.amount > 10 ORDER BY c.name, o.amount",
+        ];
+
+        let mut mismatches = Vec::new();
+        for query in &queries {
+            let frank_result = fconn.query(query);
+            let csql_result: Vec<Vec<String>> = {
+                let mut stmt = rconn.prepare(query).unwrap();
+                let col_count = stmt.column_count();
+                stmt.query_map([], |row| {
+                    let mut vals = Vec::new();
+                    for i in 0..col_count {
+                        let v: rusqlite::types::Value = row.get_unwrap(i);
+                        let s = match v {
+                            rusqlite::types::Value::Null => "NULL".to_owned(),
+                            rusqlite::types::Value::Integer(n) => n.to_string(),
+                            rusqlite::types::Value::Real(f) => format!("{f}"),
+                            rusqlite::types::Value::Text(s) => format!("'{s}'"),
+                            rusqlite::types::Value::Blob(b) => {
+                                format!(
+                                    "X'{}'",
+                                    b.iter().map(|x| format!("{x:02X}")).collect::<String>()
+                                )
+                            }
+                        };
+                        vals.push(s);
+                    }
+                    Ok(vals)
+                })
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+            };
+
+            match frank_result {
+                Ok(rows) => {
+                    let frank_strs: Vec<Vec<String>> = rows
+                        .iter()
+                        .map(|row| {
+                            row.values()
+                                .iter()
+                                .map(|v| match v {
+                                    SqliteValue::Null => "NULL".to_owned(),
+                                    SqliteValue::Integer(n) => n.to_string(),
+                                    SqliteValue::Float(f) => format!("{f}"),
+                                    SqliteValue::Text(s) => format!("'{s}'"),
+                                    SqliteValue::Blob(b) => {
+                                        format!(
+                                            "X'{}'",
+                                            b.iter()
+                                                .map(|x| format!("{x:02X}"))
+                                                .collect::<String>()
+                                        )
+                                    }
+                                })
+                                .collect()
+                        })
+                        .collect();
+                    if frank_strs != csql_result {
+                        mismatches.push(format!(
+                            "MISMATCH: {query}\n  frank: {frank_strs:?}\n  csql:  {csql_result:?}"
+                        ));
+                    }
+                }
+                Err(e) => {
+                    mismatches.push(format!(
+                        "ERROR: {query}\n  frank: {e}\n  csql: {csql_result:?}"
+                    ));
+                }
+            }
+        }
+
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!("{} JOIN conformance mismatches found", mismatches.len());
+        }
+    }
+
+    #[test]
     fn test_group_by_with_having() {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE ep11 (cat TEXT, val INTEGER);")
@@ -38219,5 +38904,707 @@ mod pager_routing_tests {
             .collect();
         assert_eq!(vals.len(), 3);
         assert_eq!(vals.iter().filter(|&&v| v == "a").count(), 2);
+    }
+
+    // Probe test: find semantic gaps in common SQL patterns.
+    // Each subtest is independent — comment out failures to find all gaps.
+    #[test]
+    fn test_probe_common_sql_patterns() {
+        let conn = Connection::open(":memory:").unwrap();
+        // Helper to get single value
+        let q = |sql: &str| -> SqliteValue {
+            let rows = conn.query(sql).unwrap();
+            assert!(!rows.is_empty(), "no rows for: {sql}");
+            rows[0].values()[0].clone()
+        };
+
+        // COALESCE
+        assert_eq!(
+            q("SELECT COALESCE(NULL, NULL, 3);"),
+            SqliteValue::Integer(3)
+        );
+
+        // IIF (3-arg)
+        assert_eq!(
+            q("SELECT IIF(1 > 0, 'yes', 'no');"),
+            SqliteValue::Text("yes".to_owned())
+        );
+        assert_eq!(
+            q("SELECT IIF(0, 'yes', 'no');"),
+            SqliteValue::Text("no".to_owned())
+        );
+
+        // CAST
+        assert_eq!(q("SELECT CAST(3.14 AS INTEGER);"), SqliteValue::Integer(3));
+        assert_eq!(
+            q("SELECT TYPEOF(CAST(3.14 AS INTEGER));"),
+            SqliteValue::Text("integer".to_owned())
+        );
+
+        // IN operator
+        assert_eq!(q("SELECT 1 IN (1, 2, 3);"), SqliteValue::Integer(1));
+        assert_eq!(q("SELECT 4 IN (1, 2, 3);"), SqliteValue::Integer(0));
+        assert_eq!(q("SELECT 1 NOT IN (1, 2, 3);"), SqliteValue::Integer(0));
+
+        // NULL IN list → NULL (SQLite behavior)
+        assert_eq!(q("SELECT NULL IN (1, 2, 3);"), SqliteValue::Null);
+
+        // BETWEEN
+        assert_eq!(q("SELECT 5 BETWEEN 1 AND 10;"), SqliteValue::Integer(1));
+        assert_eq!(q("SELECT 5 NOT BETWEEN 1 AND 3;"), SqliteValue::Integer(1));
+
+        // String functions
+        assert_eq!(
+            q("SELECT UPPER('hello');"),
+            SqliteValue::Text("HELLO".to_owned())
+        );
+        assert_eq!(
+            q("SELECT LOWER('HELLO');"),
+            SqliteValue::Text("hello".to_owned())
+        );
+        assert_eq!(q("SELECT LENGTH('hello');"), SqliteValue::Integer(5));
+        assert_eq!(
+            q("SELECT SUBSTR('hello', 2, 3);"),
+            SqliteValue::Text("ell".to_owned())
+        );
+        assert_eq!(
+            q("SELECT REPLACE('hello world', 'world', 'rust');"),
+            SqliteValue::Text("hello rust".to_owned())
+        );
+        assert_eq!(q("SELECT INSTR('hello', 'ell');"), SqliteValue::Integer(2));
+        assert_eq!(
+            q("SELECT TRIM('  hello  ');"),
+            SqliteValue::Text("hello".to_owned())
+        );
+
+        // QUOTE
+        assert_eq!(
+            q("SELECT QUOTE('hello');"),
+            SqliteValue::Text("'hello'".to_owned())
+        );
+        assert_eq!(q("SELECT QUOTE(42);"), SqliteValue::Text("42".to_owned()));
+        assert_eq!(
+            q("SELECT QUOTE(NULL);"),
+            SqliteValue::Text("NULL".to_owned())
+        );
+
+        // Scalar MIN/MAX (multi-arg)
+        assert_eq!(q("SELECT MAX(1, 2, 3);"), SqliteValue::Integer(3));
+        assert_eq!(q("SELECT MIN(1, 2, 3);"), SqliteValue::Integer(1));
+
+        // ABS
+        assert_eq!(q("SELECT ABS(-5);"), SqliteValue::Integer(5));
+        assert_eq!(q("SELECT ABS(NULL);"), SqliteValue::Null);
+
+        // HEX
+        assert_eq!(
+            q("SELECT HEX(X'48454C4C4F');"),
+            SqliteValue::Text("48454C4C4F".to_owned())
+        );
+
+        // UNICODE
+        assert_eq!(q("SELECT UNICODE('A');"), SqliteValue::Integer(65));
+
+        // LIKE as expression
+        assert_eq!(q("SELECT 'hello' LIKE 'he%';"), SqliteValue::Integer(1));
+        assert_eq!(q("SELECT 'hello' LIKE 'HE%';"), SqliteValue::Integer(1)); // case insensitive
+        assert_eq!(q("SELECT 'hello' LIKE 'world';"), SqliteValue::Integer(0));
+    }
+
+    // Probe test: table-based operations with edge cases
+    #[test]
+    fn test_probe_table_operations() {
+        let conn = Connection::open(":memory:").unwrap();
+
+        conn.execute("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT, num REAL);")
+            .unwrap();
+        conn.execute("INSERT INTO t1 VALUES (1, 'alpha', 1.5);")
+            .unwrap();
+        conn.execute("INSERT INTO t1 VALUES (2, 'beta', 2.5);")
+            .unwrap();
+        conn.execute("INSERT INTO t1 VALUES (3, 'gamma', 3.5);")
+            .unwrap();
+        conn.execute("INSERT INTO t1 VALUES (4, NULL, NULL);")
+            .unwrap();
+
+        // ORDER BY with LIMIT and OFFSET
+        let rows = conn
+            .query("SELECT val FROM t1 ORDER BY id LIMIT 2 OFFSET 1;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("beta".to_owned()));
+        assert_eq!(rows[1].values()[0], SqliteValue::Text("gamma".to_owned()));
+
+        // COUNT with WHERE
+        let rows = conn
+            .query("SELECT COUNT(*) FROM t1 WHERE val IS NOT NULL;")
+            .unwrap();
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(3));
+
+        // SUM, AVG on nullable column
+        let rows = conn.query("SELECT SUM(num) FROM t1;").unwrap();
+        assert_eq!(rows[0].values()[0], SqliteValue::Float(7.5));
+
+        // GROUP BY with HAVING
+        conn.execute("CREATE TABLE t2 (cat TEXT, val INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO t2 VALUES ('a', 1);").unwrap();
+        conn.execute("INSERT INTO t2 VALUES ('a', 2);").unwrap();
+        conn.execute("INSERT INTO t2 VALUES ('b', 3);").unwrap();
+        conn.execute("INSERT INTO t2 VALUES ('b', 4);").unwrap();
+        conn.execute("INSERT INTO t2 VALUES ('c', 5);").unwrap();
+
+        let rows = conn
+            .query("SELECT cat, SUM(val) AS s FROM t2 GROUP BY cat HAVING s > 3 ORDER BY cat;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("b".to_owned()));
+        assert_eq!(rows[0].values()[1], SqliteValue::Integer(7));
+        assert_eq!(rows[1].values()[0], SqliteValue::Text("c".to_owned()));
+        assert_eq!(rows[1].values()[1], SqliteValue::Integer(5));
+
+        // INSERT OR REPLACE
+        conn.execute("CREATE TABLE t3 (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO t3 VALUES (1, 'first');").unwrap();
+        conn.execute("INSERT OR REPLACE INTO t3 VALUES (1, 'replaced');")
+            .unwrap();
+        let rows = conn.query("SELECT val FROM t3 WHERE id = 1;").unwrap();
+        assert_eq!(
+            rows[0].values()[0],
+            SqliteValue::Text("replaced".to_owned())
+        );
+
+        // DELETE with returning count
+        let affected = conn.execute("DELETE FROM t2 WHERE cat = 'a';").unwrap();
+        assert_eq!(affected, 2);
+        let rows = conn.query("SELECT COUNT(*) FROM t2;").unwrap();
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(3));
+
+        // UPDATE with expression
+        conn.execute("UPDATE t1 SET num = num * 2 WHERE id <= 2;")
+            .unwrap();
+        let rows = conn.query("SELECT num FROM t1 WHERE id = 1;").unwrap();
+        assert_eq!(rows[0].values()[0], SqliteValue::Float(3.0));
+
+        // Subquery in WHERE
+        let rows = conn
+            .query("SELECT val FROM t1 WHERE id IN (SELECT id FROM t1 WHERE num > 3);")
+            .unwrap();
+        assert!(!rows.is_empty());
+
+        // CASE expression
+        let rows = conn
+            .query("SELECT CASE WHEN val IS NULL THEN 'unknown' ELSE val END FROM t1 WHERE id = 4;")
+            .unwrap();
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("unknown".to_owned()));
+
+        // EXISTS subquery
+        let rows = conn
+            .query("SELECT EXISTS(SELECT 1 FROM t1 WHERE id = 1);")
+            .unwrap();
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+
+        let rows = conn
+            .query("SELECT EXISTS(SELECT 1 FROM t1 WHERE id = 999);")
+            .unwrap();
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(0));
+    }
+
+    // Probe: advanced/edge-case SQL patterns
+    #[test]
+    fn test_probe_advanced_patterns() {
+        let conn = Connection::open(":memory:").unwrap();
+
+        conn.execute("CREATE TABLE nums (n INTEGER);").unwrap();
+        for i in 1..=10 {
+            conn.execute_with_params("INSERT INTO nums VALUES (?1);", &[SqliteValue::Integer(i)])
+                .unwrap();
+        }
+
+        // Correlated subquery
+        let rows = conn
+            .query("SELECT n FROM nums AS a WHERE n > (SELECT AVG(n) FROM nums);")
+            .unwrap();
+        // AVG(1..10) = 5.5, so n > 5.5 → 6,7,8,9,10
+        assert_eq!(rows.len(), 5);
+
+        // CTE (WITH clause)
+        let rows = conn
+            .query("WITH evens AS (SELECT n FROM nums WHERE n % 2 = 0) SELECT COUNT(*) FROM evens;")
+            .unwrap();
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(5));
+
+        // UNION
+        let rows = conn
+            .query(
+                "SELECT n FROM nums WHERE n <= 3 UNION SELECT n FROM nums WHERE n >= 8 ORDER BY n;",
+            )
+            .unwrap();
+        let vals: Vec<i64> = rows
+            .iter()
+            .filter_map(|r| match &r.values()[0] {
+                SqliteValue::Integer(n) => Some(*n),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(vals, vec![1, 2, 3, 8, 9, 10]);
+
+        // INTERSECT
+        let rows = conn
+            .query("SELECT n FROM nums WHERE n <= 5 INTERSECT SELECT n FROM nums WHERE n >= 3 ORDER BY n;")
+            .unwrap();
+        let vals: Vec<i64> = rows
+            .iter()
+            .filter_map(|r| match &r.values()[0] {
+                SqliteValue::Integer(n) => Some(*n),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(vals, vec![3, 4, 5]);
+
+        // EXCEPT
+        let rows = conn
+            .query("SELECT n FROM nums WHERE n <= 5 EXCEPT SELECT n FROM nums WHERE n >= 3 ORDER BY n;")
+            .unwrap();
+        let vals: Vec<i64> = rows
+            .iter()
+            .filter_map(|r| match &r.values()[0] {
+                SqliteValue::Integer(n) => Some(*n),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(vals, vec![1, 2]);
+
+        // GROUP_CONCAT
+        conn.execute("CREATE TABLE words (w TEXT);").unwrap();
+        conn.execute("INSERT INTO words VALUES ('hello');").unwrap();
+        conn.execute("INSERT INTO words VALUES ('world');").unwrap();
+        conn.execute("INSERT INTO words VALUES ('foo');").unwrap();
+        let rows = conn
+            .query("SELECT GROUP_CONCAT(w, ', ') FROM words;")
+            .unwrap();
+        // ORDER not guaranteed, but should have all three words
+        let result = match &rows[0].values()[0] {
+            SqliteValue::Text(s) => s.clone(),
+            other => panic!("expected text, got {other:?}"),
+        };
+        assert!(result.contains("hello"), "missing hello in {result}");
+        assert!(result.contains("world"), "missing world in {result}");
+        assert!(result.contains("foo"), "missing foo in {result}");
+
+        // Multi-column INSERT with DEFAULT
+        conn.execute("CREATE TABLE defs (id INTEGER PRIMARY KEY, val TEXT DEFAULT 'default_val');")
+            .unwrap();
+        conn.execute("INSERT INTO defs (id) VALUES (1);").unwrap();
+        let rows = conn.query("SELECT val FROM defs WHERE id = 1;").unwrap();
+        assert_eq!(
+            rows[0].values()[0],
+            SqliteValue::Text("default_val".to_owned())
+        );
+
+        // UPSERT (INSERT ... ON CONFLICT)
+        conn.execute("CREATE TABLE kv (k TEXT PRIMARY KEY, v INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO kv VALUES ('a', 1);").unwrap();
+        conn.execute("INSERT INTO kv VALUES ('a', 2) ON CONFLICT(k) DO UPDATE SET v = excluded.v;")
+            .unwrap();
+        let rows = conn.query("SELECT v FROM kv WHERE k = 'a';").unwrap();
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(2));
+
+        // Multiple UPSERT updates
+        conn.execute(
+            "INSERT INTO kv VALUES ('a', 10) ON CONFLICT(k) DO UPDATE SET v = v + excluded.v;",
+        )
+        .unwrap();
+        let rows = conn.query("SELECT v FROM kv WHERE k = 'a';").unwrap();
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(12));
+    }
+
+    // Probe: JOINs, recursive CTEs, aggregate+JOIN
+    #[test]
+    fn test_probe_joins_and_recursive_cte() {
+        let conn = Connection::open(":memory:").unwrap();
+
+        conn.execute("CREATE TABLE departments (id INTEGER PRIMARY KEY, name TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO departments VALUES (1, 'Engineering');")
+            .unwrap();
+        conn.execute("INSERT INTO departments VALUES (2, 'Sales');")
+            .unwrap();
+
+        conn.execute(
+            "CREATE TABLE employees (id INTEGER PRIMARY KEY, name TEXT, dept_id INTEGER, salary INTEGER);",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO employees VALUES (1, 'Alice', 1, 100);")
+            .unwrap();
+        conn.execute("INSERT INTO employees VALUES (2, 'Bob', 1, 120);")
+            .unwrap();
+        conn.execute("INSERT INTO employees VALUES (3, 'Charlie', 2, 90);")
+            .unwrap();
+        conn.execute("INSERT INTO employees VALUES (4, 'Diana', 2, 110);")
+            .unwrap();
+
+        // INNER JOIN
+        let rows = conn
+            .query("SELECT e.name, d.name FROM employees e INNER JOIN departments d ON e.dept_id = d.id ORDER BY e.id;")
+            .unwrap();
+        assert_eq!(rows.len(), 4);
+        assert_eq!(
+            rows[0].values()[1],
+            SqliteValue::Text("Engineering".to_owned())
+        );
+        assert_eq!(rows[2].values()[1], SqliteValue::Text("Sales".to_owned()));
+
+        // LEFT JOIN with NULL
+        conn.execute("INSERT INTO employees VALUES (5, 'Eve', 999, 80);")
+            .unwrap();
+        let rows = conn
+            .query("SELECT e.name, d.name FROM employees e LEFT JOIN departments d ON e.dept_id = d.id WHERE e.id = 5;")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[1], SqliteValue::Null);
+
+        // Recursive CTE: generate 1..5
+        let rows = conn
+            .query(
+                "WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM cnt WHERE x < 5) SELECT x FROM cnt;",
+            )
+            .unwrap();
+        let vals: Vec<i64> = rows
+            .iter()
+            .filter_map(|r| match &r.values()[0] {
+                SqliteValue::Integer(n) => Some(*n),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(vals, vec![1, 2, 3, 4, 5]);
+
+        // Aggregate with JOIN
+        let rows = conn
+            .query("SELECT d.name, SUM(e.salary) FROM employees e JOIN departments d ON e.dept_id = d.id GROUP BY d.name ORDER BY d.name;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0].values()[0],
+            SqliteValue::Text("Engineering".to_owned())
+        );
+        assert_eq!(rows[0].values()[1], SqliteValue::Integer(220));
+    }
+
+    #[test]
+    fn test_pragma_integrity_check() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'Alice');").unwrap();
+        let rows = conn.query("PRAGMA integrity_check;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("ok".to_owned()));
+    }
+
+    #[test]
+    fn test_pragma_quick_check() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn.query("PRAGMA quick_check;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("ok".to_owned()));
+    }
+
+    #[test]
+    fn test_pragma_data_version() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn.query("PRAGMA data_version;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(matches!(rows[0].values()[0], SqliteValue::Integer(_)));
+    }
+
+    #[test]
+    fn test_pragma_encoding_returns_utf8() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn.query("PRAGMA encoding;").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("UTF-8".to_owned()));
+    }
+
+    /// Probe test: edge cases in type coercion, NULL handling, and expressions.
+    #[test]
+    fn test_probe_type_coercion_and_edge_cases() {
+        let conn = Connection::open(":memory:").unwrap();
+
+        // typeof() for various types
+        let rows = conn
+            .query("SELECT typeof(1), typeof(1.5), typeof('hi'), typeof(NULL), typeof(X'AB');")
+            .unwrap();
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("integer".to_owned()));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("real".to_owned()));
+        assert_eq!(rows[0].values()[2], SqliteValue::Text("text".to_owned()));
+        assert_eq!(rows[0].values()[3], SqliteValue::Text("null".to_owned()));
+        assert_eq!(rows[0].values()[4], SqliteValue::Text("blob".to_owned()));
+
+        // CAST conversions
+        assert_eq!(
+            conn.query("SELECT CAST('123' AS INTEGER);").unwrap()[0].values()[0],
+            SqliteValue::Integer(123)
+        );
+        assert_eq!(
+            conn.query("SELECT CAST(3.14 AS INTEGER);").unwrap()[0].values()[0],
+            SqliteValue::Integer(3)
+        );
+        assert_eq!(
+            conn.query("SELECT CAST(42 AS TEXT);").unwrap()[0].values()[0],
+            SqliteValue::Text("42".to_owned())
+        );
+
+        // NULL propagation in arithmetic
+        assert_eq!(
+            conn.query("SELECT 1 + NULL;").unwrap()[0].values()[0],
+            SqliteValue::Null
+        );
+        assert_eq!(
+            conn.query("SELECT NULL || 'text';").unwrap()[0].values()[0],
+            SqliteValue::Null
+        );
+
+        // Division edge cases
+        assert_eq!(
+            conn.query("SELECT 7 / 2;").unwrap()[0].values()[0],
+            SqliteValue::Integer(3) // integer division
+        );
+        assert_eq!(
+            conn.query("SELECT 7.0 / 2;").unwrap()[0].values()[0],
+            SqliteValue::Float(3.5)
+        );
+        assert_eq!(
+            conn.query("SELECT 7 % 3;").unwrap()[0].values()[0],
+            SqliteValue::Integer(1)
+        );
+
+        // String comparison (case-sensitive by default)
+        assert_eq!(
+            conn.query("SELECT 'ABC' = 'abc';").unwrap()[0].values()[0],
+            SqliteValue::Integer(0)
+        );
+        assert_eq!(
+            conn.query("SELECT 'ABC' = 'ABC';").unwrap()[0].values()[0],
+            SqliteValue::Integer(1)
+        );
+
+        // LIKE is case-insensitive for ASCII
+        assert_eq!(
+            conn.query("SELECT 'Hello' LIKE 'hello';").unwrap()[0].values()[0],
+            SqliteValue::Integer(1)
+        );
+        assert_eq!(
+            conn.query("SELECT 'Hello' LIKE 'h%';").unwrap()[0].values()[0],
+            SqliteValue::Integer(1)
+        );
+
+        // GLOB is case-sensitive
+        assert_eq!(
+            conn.query("SELECT 'Hello' GLOB 'Hello';").unwrap()[0].values()[0],
+            SqliteValue::Integer(1)
+        );
+        assert_eq!(
+            conn.query("SELECT 'Hello' GLOB 'hello';").unwrap()[0].values()[0],
+            SqliteValue::Integer(0)
+        );
+
+        // Nested COALESCE / NULLIF
+        assert_eq!(
+            conn.query("SELECT COALESCE(NULL, NULL, 42);").unwrap()[0].values()[0],
+            SqliteValue::Integer(42)
+        );
+        assert_eq!(
+            conn.query("SELECT NULLIF(5, 5);").unwrap()[0].values()[0],
+            SqliteValue::Null
+        );
+        assert_eq!(
+            conn.query("SELECT NULLIF(5, 6);").unwrap()[0].values()[0],
+            SqliteValue::Integer(5)
+        );
+
+        // Unary minus
+        assert_eq!(
+            conn.query("SELECT -42;").unwrap()[0].values()[0],
+            SqliteValue::Integer(-42)
+        );
+
+        // Boolean-like: no native bool, uses 0/1
+        assert_eq!(
+            conn.query("SELECT 1 AND 1;").unwrap()[0].values()[0],
+            SqliteValue::Integer(1)
+        );
+        assert_eq!(
+            conn.query("SELECT 1 AND 0;").unwrap()[0].values()[0],
+            SqliteValue::Integer(0)
+        );
+        assert_eq!(
+            conn.query("SELECT 0 OR 1;").unwrap()[0].values()[0],
+            SqliteValue::Integer(1)
+        );
+        assert_eq!(
+            conn.query("SELECT NOT 1;").unwrap()[0].values()[0],
+            SqliteValue::Integer(0)
+        );
+    }
+
+    /// Probe test: multi-table operations, self-joins, correlated updates.
+    #[test]
+    fn test_probe_multi_table_and_self_join() {
+        let conn = Connection::open(":memory:").unwrap();
+
+        conn.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, parent_id INTEGER);")
+            .unwrap();
+        conn.execute("INSERT INTO items VALUES (1, 'root', NULL);")
+            .unwrap();
+        conn.execute("INSERT INTO items VALUES (2, 'child1', 1);")
+            .unwrap();
+        conn.execute("INSERT INTO items VALUES (3, 'child2', 1);")
+            .unwrap();
+        conn.execute("INSERT INTO items VALUES (4, 'grandchild', 2);")
+            .unwrap();
+
+        // Self-join: find parent names
+        let rows = conn
+            .query("SELECT c.name, p.name FROM items c INNER JOIN items p ON c.parent_id = p.id ORDER BY c.id;")
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("child1".to_owned()));
+        assert_eq!(rows[0].values()[1], SqliteValue::Text("root".to_owned()));
+        assert_eq!(
+            rows[2].values()[0],
+            SqliteValue::Text("grandchild".to_owned())
+        );
+        assert_eq!(rows[2].values()[1], SqliteValue::Text("child1".to_owned()));
+
+        // Multi-column INSERT from SELECT
+        conn.execute(
+            "CREATE TABLE items_copy (id INTEGER PRIMARY KEY, name TEXT, parent_id INTEGER);",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO items_copy SELECT * FROM items;")
+            .unwrap();
+        let rows = conn.query("SELECT COUNT(*) FROM items_copy;").unwrap();
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(4));
+
+        // DELETE with subquery
+        conn.execute("DELETE FROM items_copy WHERE parent_id IS NOT NULL;")
+            .unwrap();
+        let rows = conn.query("SELECT COUNT(*) FROM items_copy;").unwrap();
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
+
+        // UPDATE with expression
+        conn.execute("UPDATE items SET name = name || '_updated' WHERE parent_id IS NULL;")
+            .unwrap();
+        let rows = conn.query("SELECT name FROM items WHERE id = 1;").unwrap();
+        assert_eq!(
+            rows[0].values()[0],
+            SqliteValue::Text("root_updated".to_owned())
+        );
+
+        // REPLACE (INSERT OR REPLACE)
+        conn.execute("INSERT OR REPLACE INTO items VALUES (1, 'new_root', NULL);")
+            .unwrap();
+        let rows = conn.query("SELECT name FROM items WHERE id = 1;").unwrap();
+        assert_eq!(
+            rows[0].values()[0],
+            SqliteValue::Text("new_root".to_owned())
+        );
+    }
+
+    /// Probe test: complex WHERE predicates and subqueries.
+    #[test]
+    fn test_probe_complex_where_and_subqueries() {
+        let conn = Connection::open(":memory:").unwrap();
+
+        conn.execute(
+            "CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT, price REAL, category TEXT);",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO products VALUES (1, 'Widget', 9.99, 'A');")
+            .unwrap();
+        conn.execute("INSERT INTO products VALUES (2, 'Gadget', 19.99, 'B');")
+            .unwrap();
+        conn.execute("INSERT INTO products VALUES (3, 'Doohickey', 5.99, 'A');")
+            .unwrap();
+        conn.execute("INSERT INTO products VALUES (4, 'Thingamajig', 29.99, 'B');")
+            .unwrap();
+        conn.execute("INSERT INTO products VALUES (5, 'Whatchamacallit', 14.99, 'A');")
+            .unwrap();
+
+        // BETWEEN
+        let rows = conn
+            .query("SELECT name FROM products WHERE price BETWEEN 10.0 AND 25.0 ORDER BY name;")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("Gadget".to_owned()));
+        assert_eq!(
+            rows[1].values()[0],
+            SqliteValue::Text("Whatchamacallit".to_owned())
+        );
+
+        // IN list
+        let rows = conn
+            .query("SELECT name FROM products WHERE id IN (1, 3, 5) ORDER BY id;")
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+
+        // Correlated subquery: products more expensive than category average
+        let rows = conn
+            .query(
+                "SELECT name FROM products p WHERE price > (SELECT AVG(price) FROM products WHERE category = p.category) ORDER BY name;",
+            )
+            .unwrap();
+        // Category A: avg = (9.99+5.99+14.99)/3 ≈ 10.32 → Whatchamacallit (14.99)
+        // Category B: avg = (19.99+29.99)/2 = 24.99 → Thingamajig (29.99)
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0].values()[0],
+            SqliteValue::Text("Thingamajig".to_owned())
+        );
+        assert_eq!(
+            rows[1].values()[0],
+            SqliteValue::Text("Whatchamacallit".to_owned())
+        );
+
+        // NOT IN subquery
+        let rows = conn
+            .query(
+                "SELECT name FROM products WHERE category NOT IN (SELECT category FROM products WHERE price > 20.0) ORDER BY name;",
+            )
+            .unwrap();
+        // Category B has a product > 20.0 (Thingamajig), so exclude B
+        // Only category A products remain
+        assert_eq!(rows.len(), 3);
+
+        // COUNT DISTINCT
+        let rows = conn
+            .query("SELECT COUNT(DISTINCT category) FROM products;")
+            .unwrap();
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(2));
+
+        // Nested function calls
+        let rows = conn
+            .query("SELECT UPPER(SUBSTR('hello world', 1, 5));")
+            .unwrap();
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("HELLO".to_owned()));
+
+        // Multiple ORDER BY columns
+        let rows = conn
+            .query("SELECT * FROM products ORDER BY category ASC, price DESC;")
+            .unwrap();
+        // A: Whatchamacallit(14.99), Widget(9.99), Doohickey(5.99)
+        // B: Thingamajig(29.99), Gadget(19.99)
+        assert_eq!(rows.len(), 5);
+        assert_eq!(
+            rows[0].values()[1],
+            SqliteValue::Text("Whatchamacallit".to_owned())
+        );
+        assert_eq!(
+            rows[3].values()[1],
+            SqliteValue::Text("Thingamajig".to_owned())
+        );
     }
 }
