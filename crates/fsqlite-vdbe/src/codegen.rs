@@ -7307,6 +7307,21 @@ fn resolve_sort_key(
         if is_rowid_alias(&col_ref.column) {
             return SortKeySource::Rowid;
         }
+        // Check if the unqualified name matches a result column alias
+        // (e.g. `ORDER BY total` where `total` is `price * qty AS total`).
+        if col_ref.table.is_none() {
+            for col in columns {
+                if let ResultColumn::Expr {
+                    alias: Some(alias),
+                    expr: col_expr,
+                } = col
+                {
+                    if alias.eq_ignore_ascii_case(&col_ref.column) {
+                        return resolve_sort_key(col_expr, table, table_alias, columns);
+                    }
+                }
+            }
+        }
     }
     SortKeySource::Expression(expr.clone())
 }

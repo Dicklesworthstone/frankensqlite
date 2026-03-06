@@ -2634,6 +2634,12 @@ impl Connection {
                 if !select.body.compounds.is_empty() {
                     return self.execute_compound_select(select, params);
                 }
+                // FROM-less aggregate SELECT (e.g. SELECT COUNT(*), SUM(NULL)).
+                // Must be checked before the expression-only path because the
+                // expression-only VDBE codegen cannot handle aggregate functions.
+                if is_expression_only_select(select) && has_implicit_aggregation(select) {
+                    return self.execute_fromless_aggregate(select);
+                }
                 // Check if this is an expression-only SELECT (no FROM clause).
                 if is_expression_only_select(select) {
                     // Fallback codegen: eagerly rewrite IN subqueries.
@@ -10582,6 +10588,10 @@ impl Connection {
             })
             .collect::<Result<Vec<_>>>()?;
 
+        // Step 4c: Resolve GROUP BY alias references against SELECT-list aliases.
+        let mut group_by_exprs = group_by_exprs.clone();
+        resolve_group_by_aliases(&mut group_by_exprs, &expanded_columns, &col_map);
+
         // Step 5: Group the joined rows by evaluating GROUP BY expressions.
         let mut groups: Vec<(Vec<SqliteValue>, Vec<Vec<SqliteValue>>)> = Vec::new();
         for row in &join_rows {
@@ -10764,6 +10774,129 @@ impl Connection {
             }
             _ => {}
         }
+    }
+
+    /// Execute a FROM-less aggregate SELECT like `SELECT COUNT(*), SUM(NULL)`.
+    ///
+    /// SQLite treats FROM-less SELECTs with aggregates as aggregation over a
+    /// single implicit row. `COUNT(*)` returns 1, `COUNT(NULL)` returns 0,
+    /// `SUM(NULL)` returns NULL, etc.
+    fn execute_fromless_aggregate(&self, select: &SelectStatement) -> Result<Vec<Row>> {
+        let SelectCore::Select {
+            columns,
+            where_clause,
+            ..
+        } = &select.body.select
+        else {
+            return Err(FrankenError::Internal(
+                "execute_fromless_aggregate called on non-SELECT core".to_owned(),
+            ));
+        };
+        let empty_row: Vec<SqliteValue> = Vec::new();
+        let empty_col_map: Vec<(String, String)> = Vec::new();
+
+        // If there is a WHERE clause that evaluates to false/NULL, the
+        // implicit single row is excluded — aggregates return empty-set
+        // defaults (COUNT→0, SUM/AVG/etc.→NULL, TOTAL→0.0).
+        let row_included = if let Some(wh) = where_clause {
+            let val = eval_join_expr(wh, &empty_row, &empty_col_map).unwrap_or(SqliteValue::Null);
+            !val.is_null() && val.to_integer() != 0
+        } else {
+            true
+        };
+
+        let mut values = Vec::with_capacity(columns.len());
+
+        for col in columns {
+            match col {
+                ResultColumn::Expr {
+                    expr:
+                        Expr::FunctionCall {
+                            name,
+                            args,
+                            distinct: is_distinct,
+                            ..
+                        },
+                    ..
+                } if is_agg_fn(name) => {
+                    let func = name.to_ascii_lowercase();
+                    if !row_included {
+                        // WHERE excluded the implicit row — empty-set defaults.
+                        values.push(empty_aggregate_default(&func));
+                        continue;
+                    }
+                    match args {
+                        FunctionArgs::Star => {
+                            // COUNT(*) over single implicit row → 1
+                            if func == "count" {
+                                values.push(SqliteValue::Integer(1));
+                            } else {
+                                values.push(SqliteValue::Null);
+                            }
+                        }
+                        FunctionArgs::List(exprs) if exprs.is_empty() => {
+                            if func == "count" {
+                                values.push(SqliteValue::Integer(1));
+                            } else {
+                                values.push(SqliteValue::Null);
+                            }
+                        }
+                        FunctionArgs::List(exprs) => {
+                            // Evaluate each argument expression.
+                            let arg_vals: Vec<SqliteValue> = exprs
+                                .iter()
+                                .map(|e| {
+                                    eval_join_expr(e, &empty_row, &empty_col_map)
+                                        .unwrap_or(SqliteValue::Null)
+                                })
+                                .collect();
+                            // min/max with 2+ args are SCALAR (NULL-propagating),
+                            // not aggregate (NULL-skipping).
+                            if (func == "min" || func == "max") && arg_vals.len() >= 2 {
+                                if let Some(scalar) = self
+                                    .func_registry
+                                    .borrow()
+                                    .find_scalar(&func, arg_vals.len() as i32)
+                                {
+                                    values.push(
+                                        scalar.invoke(&arg_vals).unwrap_or(SqliteValue::Null),
+                                    );
+                                } else {
+                                    values.push(SqliteValue::Null);
+                                }
+                            } else {
+                                let mut deduped = arg_vals;
+                                if *is_distinct {
+                                    deduped.dedup();
+                                }
+                                // Filter NULLs for aggregates (except COUNT(*)
+                                // which is handled above).
+                                let filtered: Vec<&SqliteValue> = deduped
+                                    .iter()
+                                    .filter(|v| !matches!(v, SqliteValue::Null))
+                                    .collect();
+                                values.push(compute_aggregate(&func, &filtered));
+                            }
+                        }
+                    }
+                }
+                ResultColumn::Expr { expr, .. } => {
+                    if row_included {
+                        values.push(
+                            eval_join_expr(expr, &empty_row, &empty_col_map)
+                                .unwrap_or(SqliteValue::Null),
+                        );
+                    } else {
+                        values.push(SqliteValue::Null);
+                    }
+                }
+                ResultColumn::Star | ResultColumn::TableStar(_) => {
+                    // No table → Star has no meaning.
+                    values.push(SqliteValue::Null);
+                }
+            }
+        }
+        Ok(vec![Row { values }])
     }
 
     /// Execute a GROUP BY aggregate SELECT via post-execution processing:
@@ -11028,6 +11161,11 @@ impl Connection {
                 }
             }
         }
+
+        // Resolve GROUP BY alias references: if a GROUP BY term is a bare column
+        // reference that doesn't match a table column, look for a matching
+        // SELECT-list alias and replace with the underlying expression.
+        resolve_group_by_aliases(&mut group_by_exprs, &expanded_columns, &col_map);
 
         // Compile and execute a raw SELECT * scan (no aggregates, no GROUP BY).
         let raw_select = build_raw_scan_select(select);
@@ -15172,6 +15310,17 @@ fn cmp_values(a: &SqliteValue, b: &SqliteValue) -> std::cmp::Ordering {
     }
 }
 
+/// Return the empty-set default for an aggregate function.
+///
+/// SQLite: `COUNT` → 0, `TOTAL` → 0.0, everything else → NULL.
+fn empty_aggregate_default(name: &str) -> SqliteValue {
+    match name {
+        "count" => SqliteValue::Integer(0),
+        "total" => SqliteValue::Float(0.0),
+        _ => SqliteValue::Null,
+    }
+}
+
 /// Compute the aggregate value for a group of values.
 #[allow(clippy::cast_possible_wrap)]
 fn compute_aggregate(name: &str, values: &[&SqliteValue]) -> SqliteValue {
@@ -18564,6 +18713,45 @@ fn is_rowid_alias(name: &str) -> bool {
 /// Rewrite rowid alias references in an expression tree so that `rowid`,
 /// `_rowid_`, and `oid` column references become the real column name of the
 /// `INTEGER PRIMARY KEY` column (the rowid alias).
+/// Resolve GROUP BY expressions that reference SELECT-list aliases.
+///
+/// SQLite resolves a bare identifier in GROUP BY against the table columns
+/// first, and only falls back to SELECT-list aliases when no column matches.
+/// This function implements that fallback: for each GROUP BY expression that
+/// is a bare column reference not found in `col_map`, it checks for a matching
+/// alias in `columns` and replaces the expression with the aliased expression.
+fn resolve_group_by_aliases(
+    group_by_exprs: &mut [Expr],
+    columns: &[ResultColumn],
+    col_map: &[(String, String)],
+) {
+    for expr in group_by_exprs.iter_mut() {
+        if let Expr::Column(col_ref, _) = expr {
+            if col_ref.table.is_some() {
+                continue; // Qualified reference — not an alias.
+            }
+            let name = &col_ref.column;
+            // If the identifier resolves to a table column, leave it as-is.
+            if find_col_in_map(col_map, None, name).is_ok() {
+                continue;
+            }
+            // Look for a matching SELECT-list alias.
+            for col in columns {
+                if let ResultColumn::Expr {
+                    alias: Some(alias),
+                    expr: aliased_expr,
+                } = col
+                {
+                    if alias.eq_ignore_ascii_case(name) {
+                        *expr = aliased_expr.clone();
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn rewrite_rowid_aliases_in_expr(expr: &mut Expr, real_col: &str) {
     match expr {
         Expr::Column(col_ref, _) if is_rowid_alias(&col_ref.column) => {
@@ -18955,7 +19143,7 @@ fn eval_scalar_fn(name: &str, args: &[SqliteValue]) -> SqliteValue {
     // Standard SQL NULL propagation: if any argument is NULL, most scalar
     // functions return NULL.  Functions with special NULL handling are exempt.
     match lower.as_str() {
-        "coalesce" | "ifnull" | "nullif" | "typeof" | "quote" | "iif" | "max" | "min" => {}
+        "coalesce" | "ifnull" | "nullif" | "typeof" | "quote" | "iif" => {}
         _ => {
             if args.iter().any(SqliteValue::is_null) {
                 return SqliteValue::Null;
@@ -40317,6 +40505,155 @@ mod pager_routing_tests {
                 eprintln!("{m}\n");
             }
             panic!("{} advanced conformance mismatches found", mismatches.len());
+        }
+    }
+
+    #[test]
+    fn test_order_by_alias_computed_expr() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute(
+            "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, price REAL, qty INTEGER)",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO items VALUES (1, 'a', 1.50, 10)")
+            .unwrap();
+        conn.execute("INSERT INTO items VALUES (2, 'b', 3.00, 5)")
+            .unwrap();
+        conn.execute("INSERT INTO items VALUES (3, 'c', 2.00, 8)")
+            .unwrap();
+        let rows = conn
+            .query("SELECT name, price * qty AS total FROM items ORDER BY total DESC")
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        // c: 16, b: 15, a: 15
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("c".to_owned()));
+    }
+
+    #[test]
+    fn test_case_expr_with_group_by() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, cat TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'fruit'), (2, 'fruit'), (3, 'veg')")
+            .unwrap();
+        let rows = conn
+            .query(
+                "SELECT CASE cat WHEN 'fruit' THEN 'F' WHEN 'veg' THEN 'V' END AS code, count(*) FROM t GROUP BY cat ORDER BY code",
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("F".to_owned()));
+        assert_eq!(rows[0].values()[1], SqliteValue::Integer(2));
+        assert_eq!(rows[1].values()[0], SqliteValue::Text("V".to_owned()));
+        assert_eq!(rows[1].values()[1], SqliteValue::Integer(1));
+    }
+
+    #[test]
+    fn test_in_subquery_with_group_by_having() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, cat TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1,'a'),(2,'a'),(3,'a'),(4,'b'),(5,'c'),(6,'c')")
+            .unwrap();
+        let rows = conn
+            .query(
+                "SELECT cat FROM t WHERE cat IN (SELECT cat FROM t GROUP BY cat HAVING count(*) > 2) GROUP BY cat ORDER BY cat",
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("a".to_owned()));
+    }
+
+    /// Probe deeper SQL patterns against C SQLite to find execution gaps.
+    #[test]
+    fn test_conformance_deep_probe() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE emp (id INTEGER PRIMARY KEY, name TEXT, dept TEXT, salary REAL);",
+            "INSERT INTO emp VALUES (1, 'Alice', 'eng', 100.0);",
+            "INSERT INTO emp VALUES (2, 'Bob', 'eng', 120.0);",
+            "INSERT INTO emp VALUES (3, 'Carol', 'sales', 90.0);",
+            "INSERT INTO emp VALUES (4, 'Dave', 'sales', 80.0);",
+            "INSERT INTO emp VALUES (5, 'Eve', 'hr', 95.0);",
+            "CREATE TABLE dept (name TEXT PRIMARY KEY, budget REAL);",
+            "INSERT INTO dept VALUES ('eng', 500.0);",
+            "INSERT INTO dept VALUES ('sales', 300.0);",
+            "INSERT INTO dept VALUES ('hr', 200.0);",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            // GROUP BY with expression
+            "SELECT dept, SUM(salary) AS total FROM emp GROUP BY dept ORDER BY total DESC",
+            // GROUP BY with HAVING on alias
+            "SELECT dept, COUNT(*) AS cnt FROM emp GROUP BY dept HAVING cnt >= 2 ORDER BY dept",
+            // ORDER BY expression not in SELECT (single table)
+            "SELECT name FROM emp ORDER BY salary DESC",
+            // ORDER BY multiple columns including non-selected
+            "SELECT name FROM emp ORDER BY dept, salary DESC",
+            // DISTINCT with ORDER BY
+            "SELECT DISTINCT dept FROM emp ORDER BY dept",
+            // Subquery in WHERE with aggregate
+            "SELECT name FROM emp WHERE salary > (SELECT AVG(salary) FROM emp) ORDER BY name",
+            // Correlated subquery
+            "SELECT e.name, (SELECT d.budget FROM dept d WHERE d.name = e.dept) AS budget FROM emp e ORDER BY e.id",
+            // CASE in SELECT with GROUP BY
+            "SELECT CASE WHEN salary >= 100 THEN 'high' ELSE 'low' END AS tier, COUNT(*) FROM emp GROUP BY tier ORDER BY tier",
+            // Nested function calls
+            "SELECT name, length(upper(name)) FROM emp ORDER BY id",
+            // COALESCE with columns
+            "SELECT COALESCE(NULL, dept, 'none') FROM emp WHERE id = 1",
+            // INSERT with expression defaults
+            "SELECT 1 + 2 * 3, (1 + 2) * 3",
+            // Multiple aggregates
+            "SELECT dept, MIN(salary), MAX(salary), AVG(salary) FROM emp GROUP BY dept ORDER BY dept",
+            // LIMIT with OFFSET
+            "SELECT name FROM emp ORDER BY id LIMIT 2 OFFSET 2",
+            // NULL handling in aggregates
+            "SELECT COUNT(*), COUNT(NULL), SUM(NULL), AVG(NULL), MIN(NULL), MAX(NULL)",
+            // UNION with different column names
+            "SELECT name FROM emp WHERE dept = 'eng' UNION SELECT name FROM emp WHERE dept = 'hr' ORDER BY 1",
+            // Multi-column IN
+            "SELECT name FROM emp WHERE dept IN ('eng', 'hr') ORDER BY name",
+            // BETWEEN with strings
+            "SELECT name FROM emp WHERE name BETWEEN 'B' AND 'D' ORDER BY name",
+            // EXISTS subquery
+            "SELECT e.name FROM emp e WHERE EXISTS (SELECT 1 FROM dept d WHERE d.name = e.dept AND d.budget > 250) ORDER BY e.name",
+            // NOT EXISTS
+            "SELECT d.name FROM dept d WHERE NOT EXISTS (SELECT 1 FROM emp e WHERE e.dept = d.name AND e.salary > 100) ORDER BY d.name",
+            // JOIN with ORDER BY on non-selected column
+            "SELECT e.name FROM emp e JOIN dept d ON e.dept = d.name ORDER BY d.budget DESC, e.salary DESC",
+            // LEFT JOIN with NULL check
+            "SELECT d.name, e.name FROM dept d LEFT JOIN emp e ON d.name = e.dept AND e.salary > 100 ORDER BY d.name, e.name",
+            // Aggregate with CASE
+            "SELECT SUM(CASE WHEN salary >= 100 THEN salary ELSE 0 END) AS high_total FROM emp",
+            // COUNT with condition
+            "SELECT COUNT(CASE WHEN dept = 'eng' THEN 1 END) AS eng_count FROM emp",
+            // GROUP_CONCAT with ORDER BY
+            "SELECT dept, GROUP_CONCAT(name, ', ') FROM emp GROUP BY dept ORDER BY dept",
+            // Scalar subquery in SELECT
+            "SELECT name, salary - (SELECT AVG(salary) FROM emp) AS diff FROM emp ORDER BY id",
+            // CAST in expression
+            "SELECT CAST(salary AS INTEGER) FROM emp WHERE id = 1",
+            // Nested CASE
+            "SELECT CASE WHEN dept = 'eng' THEN CASE WHEN salary > 110 THEN 'senior' ELSE 'junior' END ELSE 'other' END FROM emp ORDER BY id",
+            // Self-join
+            "SELECT e1.name, e2.name FROM emp e1 JOIN emp e2 ON e1.dept = e2.dept AND e1.id < e2.id ORDER BY e1.id, e2.id",
+            // GROUP BY with JOIN
+            "SELECT d.name, COUNT(e.id), SUM(e.salary) FROM dept d LEFT JOIN emp e ON d.name = e.dept GROUP BY d.name ORDER BY d.name",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!("{} deep probe mismatches found", mismatches.len());
         }
     }
 }
