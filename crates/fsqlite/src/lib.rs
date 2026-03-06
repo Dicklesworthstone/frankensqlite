@@ -70,12 +70,12 @@ mod tests {
     }
 
     #[test]
-    fn test_public_api_query_row_returns_first_row() {
+    fn test_public_api_query_row_multiple_rows_error() {
         let conn = Connection::open(":memory:").expect("in-memory connection should open");
-        let row = conn
+        let error = conn
             .query_row("VALUES (10), (20), (30);")
-            .expect("query_row should return first row");
-        assert_eq!(row_values(&row), vec![SqliteValue::Integer(10)]);
+            .expect_err("query_row should fail when more than one row is returned");
+        assert!(matches!(error, FrankenError::QueryReturnedMultipleRows));
     }
 
     #[test]

@@ -64,6 +64,10 @@ pub enum FrankenError {
     #[error("query returned no rows")]
     QueryReturnedNoRows,
 
+    /// Query executed successfully but produced more than one row.
+    #[error("query returned more than one row")]
+    QueryReturnedMultipleRows,
+
     /// No such table.
     #[error("no such table: {name}")]
     NoSuchTable { name: String },
@@ -347,6 +351,7 @@ impl FrankenError {
             Self::SyntaxError { .. }
             | Self::ParseError { .. }
             | Self::QueryReturnedNoRows
+            | Self::QueryReturnedMultipleRows
             | Self::NoSuchTable { .. }
             | Self::NoSuchColumn { .. }
             | Self::NoSuchIndex { .. }
@@ -403,6 +408,7 @@ impl FrankenError {
                 | Self::SyntaxError { .. }
                 | Self::ParseError { .. }
                 | Self::QueryReturnedNoRows
+                | Self::QueryReturnedMultipleRows
                 | Self::NoSuchTable { .. }
                 | Self::NoSuchColumn { .. }
                 | Self::TypeMismatch { .. }
@@ -434,6 +440,9 @@ impl FrankenError {
                 "Use a filesystem that supports shared memory, or use BEGIN (serialized) instead",
             ),
             Self::QueryReturnedNoRows => Some("Use query() when zero rows are acceptable"),
+            Self::QueryReturnedMultipleRows => {
+                Some("Use query() when multiple rows are acceptable, or tighten the query")
+            }
             _ => None,
         }
     }
@@ -549,6 +558,10 @@ mod tests {
             FrankenError::QueryReturnedNoRows.error_code(),
             ErrorCode::Error
         );
+        assert_eq!(
+            FrankenError::QueryReturnedMultipleRows.error_code(),
+            ErrorCode::Error
+        );
         assert_eq!(FrankenError::Busy.error_code(), ErrorCode::Busy);
         assert_eq!(
             FrankenError::DatabaseCorrupt {
@@ -567,6 +580,7 @@ mod tests {
     fn user_recoverable() {
         assert!(FrankenError::Busy.is_user_recoverable());
         assert!(FrankenError::QueryReturnedNoRows.is_user_recoverable());
+        assert!(FrankenError::QueryReturnedMultipleRows.is_user_recoverable());
         assert!(FrankenError::syntax("x").is_user_recoverable());
         assert!(!FrankenError::internal("bug").is_user_recoverable());
         assert!(!FrankenError::DatabaseFull.is_user_recoverable());
@@ -585,6 +599,11 @@ mod tests {
     fn suggestions() {
         assert!(FrankenError::Busy.suggestion().is_some());
         assert!(FrankenError::not_implemented("CTE").suggestion().is_some());
+        assert!(
+            FrankenError::QueryReturnedMultipleRows
+                .suggestion()
+                .is_some()
+        );
         assert!(FrankenError::DatabaseFull.suggestion().is_none());
     }
 
@@ -1328,6 +1347,11 @@ mod tests {
         assert!(FrankenError::TooBig.suggestion().is_some());
         assert!(FrankenError::ConcurrentUnavailable.suggestion().is_some());
         assert!(FrankenError::QueryReturnedNoRows.suggestion().is_some());
+        assert!(
+            FrankenError::QueryReturnedMultipleRows
+                .suggestion()
+                .is_some()
+        );
 
         // No suggestion
         assert!(FrankenError::Abort.suggestion().is_none());

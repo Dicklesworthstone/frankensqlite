@@ -2,7 +2,6 @@
 mod tests {
     use crate::parser::Parser;
     use crate::semantic::*;
-    use fsqlite_ast::Statement;
     use fsqlite_types::TypeAffinity;
 
     fn make_schema() -> Schema {

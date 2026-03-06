@@ -2021,6 +2021,9 @@ pub struct VdbeEngine {
     /// Cursor ID used by the last Insert opcode (for conflict resolution in
     /// `IdxInsert`: allows the index handler to undo or replace the table row).
     last_insert_cursor_id: Option<i32>,
+    /// Provisional table insert metadata kept until later `IdxInsert`
+    /// opcodes either succeed or roll the row back under `OE_IGNORE`.
+    pending_insert_rollback: Option<PendingInsertRollback>,
     /// When true, a UNIQUE conflict with IGNORE was detected during an
     /// `IdxInsert`, so remaining `IdxInsert` opcodes for this row should be
     /// skipped.
@@ -2252,6 +2255,15 @@ struct AggregateContext {
     distinct_seen: Option<std::collections::HashSet<DistinctKeyBuf>>,
 }
 
+/// Metadata for a provisional table insert that may need to be undone if a
+/// later UNIQUE index write resolves to `OE_IGNORE`.
+#[derive(Debug, Clone, Copy)]
+struct PendingInsertRollback {
+    cursor_id: i32,
+    rowid: i64,
+    previous_last_insert_rowid: i64,
+}
+
 /// Per-accumulator window function context (for `AggInverse` / `AggValue`).
 ///
 /// TODO: Window functions are not yet emitted by codegen, so `AggInverse` /
@@ -2327,6 +2339,7 @@ impl VdbeEngine {
             changes: 0,
             last_insert_rowid: 0,
             last_insert_cursor_id: None,
+            pending_insert_rollback: None,
             conflict_skip_idx: false,
             rowsets: SwissIndex::new(),
             fk_counter: 0,
@@ -4286,6 +4299,7 @@ impl VdbeEngine {
                     let oe_flag = op.p5 & 0x0F; // Low 4 bits for OE_* mode
                     let rowid = self.get_reg(rowid_reg).to_integer();
                     let record_val = self.get_reg(record_reg).clone();
+                    let previous_last_insert_rowid = self.last_insert_rowid;
                     let pk_conflict = ExecOutcome::Error {
                         code: ErrorCode::Constraint as i32,
                         message: "PRIMARY KEY constraint failed".to_owned(),
@@ -4383,6 +4397,13 @@ impl VdbeEngine {
                     if actually_inserted {
                         self.changes += 1;
                         self.last_insert_rowid = rowid;
+                        self.pending_insert_rollback = Some(PendingInsertRollback {
+                            cursor_id,
+                            rowid,
+                            previous_last_insert_rowid,
+                        });
+                    } else {
+                        self.pending_insert_rollback = None;
                     }
                     self.last_insert_cursor_id = Some(cursor_id);
                     self.conflict_skip_idx = false;
@@ -4477,18 +4498,47 @@ impl VdbeEngine {
                                             // OE_IGNORE (4): Undo the table
                                             // insert and skip remaining indexes.
                                             4 => {
-                                                if let Some(tbl_cursor_id) =
-                                                    self.last_insert_cursor_id
+                                                let rollback = self
+                                                    .pending_insert_rollback
+                                                    .take()
+                                                    .ok_or_else(|| {
+                                                        FrankenError::internal(
+                                                            "UNIQUE IGNORE conflict without \
+                                                             pending table insert",
+                                                        )
+                                                    })?;
+                                                let tsc = self
+                                                    .storage_cursors
+                                                    .get_mut(&rollback.cursor_id)
+                                                    .ok_or_else(|| {
+                                                        FrankenError::internal(
+                                                            "table cursor missing during \
+                                                             UNIQUE IGNORE rollback",
+                                                        )
+                                                    })?;
+                                                if !tsc
+                                                    .cursor
+                                                    .table_move_to(&tsc.cx, rollback.rowid)?
+                                                    .is_found()
                                                 {
-                                                    // Delete the just-inserted
-                                                    // table row to undo the
-                                                    // Insert opcode.
-                                                    if let Some(tsc) =
-                                                        self.storage_cursors.get_mut(&tbl_cursor_id)
-                                                    {
-                                                        let _ = tsc.cursor.delete(&tsc.cx);
-                                                    }
+                                                    return Err(FrankenError::internal(
+                                                        "failed to locate provisional table row \
+                                                         during UNIQUE IGNORE rollback",
+                                                    ));
                                                 }
+                                                tsc.cursor.delete(&tsc.cx)?;
+                                                self.changes = self
+                                                    .changes
+                                                    .checked_sub(1)
+                                                    .ok_or_else(|| {
+                                                        FrankenError::internal(
+                                                            "UNIQUE IGNORE rollback underflowed \
+                                                             change counter",
+                                                        )
+                                                    })?;
+                                                self.last_insert_rowid =
+                                                    rollback.previous_last_insert_rowid;
+                                                self.last_insert_cursor_id = None;
                                                 self.conflict_skip_idx = true;
                                                 pc += 1;
                                                 continue;
@@ -7032,11 +7082,8 @@ fn sql_rem(dividend: &SqliteValue, divisor: &SqliteValue) -> SqliteValue {
     if b == 0 {
         return SqliteValue::Null;
     }
-    let result = match a.checked_rem(b) {
-        Some(r) => r,
-        // i64::MIN % -1 = 0 mathematically.
-        None => 0,
-    };
+    // i64::MIN % -1 = 0 mathematically.
+    let result = a.checked_rem(b).unwrap_or_default();
     if both_int {
         SqliteValue::Integer(result)
     } else {
@@ -7176,10 +7223,11 @@ fn parse_cast_integer_prefix(s: &str) -> i64 {
     }
 
     let bytes = trimmed.as_bytes();
-    let mut end = 0;
-    if matches!(bytes.first(), Some(b'+') | Some(b'-')) {
-        end = 1;
-    }
+    let mut end = if matches!(bytes.first(), Some(b'+' | b'-')) {
+        1
+    } else {
+        0
+    };
     let digit_start = end;
     while end < bytes.len() && bytes[end].is_ascii_digit() {
         end += 1;

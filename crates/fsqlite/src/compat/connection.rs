@@ -14,7 +14,8 @@ use super::params::ParamValue;
 pub trait ConnectionExt {
     /// Execute a query that returns exactly one row, mapping it with `f`.
     ///
-    /// Returns `FrankenError::QueryReturnedNoRows` if no rows match.
+    /// Returns `FrankenError::QueryReturnedNoRows` if no rows match and
+    /// `FrankenError::QueryReturnedMultipleRows` if more than one row matches.
     ///
     /// # Examples
     ///

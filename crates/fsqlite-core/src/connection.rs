@@ -772,12 +772,12 @@ impl PreparedStatement<'_> {
 
     /// Execute as a query and return exactly one row.
     pub fn query_row(&self) -> Result<Row> {
-        first_row_or_error(self.query()?)
+        exactly_one_row_or_error(self.query()?)
     }
 
     /// Execute as a query with parameters and return exactly one row.
     pub fn query_row_with_params(&self, params: &[SqliteValue]) -> Result<Row> {
-        first_row_or_error(self.query_with_params(params)?)
+        exactly_one_row_or_error(self.query_with_params(params)?)
     }
 
     /// Execute and return affected/output row count.
@@ -2061,12 +2061,12 @@ impl Connection {
 
     /// Prepare and execute SQL as a query, returning exactly one row.
     pub fn query_row(&self, sql: &str) -> Result<Row> {
-        first_row_or_error(self.query(sql)?)
+        exactly_one_row_or_error(self.query(sql)?)
     }
 
     /// Prepare and execute SQL as a query with bound SQL parameters, returning exactly one row.
     pub fn query_row_with_params(&self, sql: &str, params: &[SqliteValue]) -> Result<Row> {
-        first_row_or_error(self.query_with_params(sql, params)?)
+        exactly_one_row_or_error(self.query_with_params(sql, params)?)
     }
 
     /// Prepare and execute SQL, returning output/affected row count.
@@ -2140,6 +2140,11 @@ impl Connection {
         stmt: &PreparedStatement<'_>,
         params: &[SqliteValue],
     ) -> Result<usize> {
+        if !std::ptr::eq(self, stmt.conn) {
+            return Err(FrankenError::internal(
+                "prepared statement belongs to a different connection",
+            ));
+        }
         if let Some(dml) = &stmt.dml_statement {
             let op_cx = self.op_cx();
             stmt.ensure_schema_unchanged(&op_cx)?;
@@ -14290,10 +14295,7 @@ fn numeric_mod(a: &SqliteValue, b: &SqliteValue) -> SqliteValue {
     if bi == 0 {
         SqliteValue::Null
     } else {
-        let result = match ai.checked_rem(bi) {
-            Some(r) => r,
-            None => 0,
-        };
+        let result = ai.checked_rem(bi).unwrap_or_default();
         if both_int {
             SqliteValue::Integer(result)
         } else {
@@ -15077,10 +15079,13 @@ fn compare_order_values(
     ordering
 }
 
-fn first_row_or_error(rows: Vec<Row>) -> Result<Row> {
-    rows.into_iter()
-        .next()
-        .ok_or(FrankenError::QueryReturnedNoRows)
+fn exactly_one_row_or_error(rows: Vec<Row>) -> Result<Row> {
+    let mut iter = rows.into_iter();
+    let row = iter.next().ok_or(FrankenError::QueryReturnedNoRows)?;
+    if iter.next().is_some() {
+        return Err(FrankenError::QueryReturnedMultipleRows);
+    }
+    Ok(row)
 }
 
 fn validate_bound_parameters(program: &VdbeProgram, params: &[SqliteValue]) -> Result<()> {
@@ -19395,22 +19400,24 @@ mod tests {
     }
 
     #[test]
-    fn test_query_row_returns_first_row() {
+    fn test_query_row_multiple_rows_error() {
         let conn = Connection::open(":memory:").unwrap();
-        let row = conn.query_row("VALUES (1), (2), (3);").unwrap();
-        assert_eq!(row_values(&row), vec![SqliteValue::Integer(1)]);
+        let error = conn
+            .query_row("VALUES (1), (2), (3);")
+            .expect_err("query_row should fail when more than one row is returned");
+        assert!(matches!(error, FrankenError::QueryReturnedMultipleRows));
     }
 
     #[test]
-    fn test_query_row_with_params_returns_first_row() {
+    fn test_query_row_with_params_multiple_rows_error() {
         let conn = Connection::open(":memory:").unwrap();
-        let row = conn
+        let error = conn
             .query_row_with_params(
                 "VALUES (?1), (?2);",
                 &[SqliteValue::Integer(11), SqliteValue::Integer(22)],
             )
-            .unwrap();
-        assert_eq!(row_values(&row), vec![SqliteValue::Integer(11)]);
+            .expect_err("query_row_with_params should fail when more than one row is returned");
+        assert!(matches!(error, FrankenError::QueryReturnedMultipleRows));
     }
 
     #[test]
@@ -19425,9 +19432,9 @@ mod tests {
     #[test]
     fn test_prepared_statement_query_row_with_params() {
         let conn = Connection::open(":memory:").unwrap();
-        let stmt = conn.prepare("VALUES (?1), (?2);").unwrap();
+        let stmt = conn.prepare("VALUES (?1);").unwrap();
         let row = stmt
-            .query_row_with_params(&[SqliteValue::Integer(5), SqliteValue::Integer(9)])
+            .query_row_with_params(&[SqliteValue::Integer(5)])
             .unwrap();
         assert_eq!(row_values(&row), vec![SqliteValue::Integer(5)]);
     }
@@ -27585,6 +27592,36 @@ mod transaction_lifecycle_tests {
         let rows = conn.query("SELECT name FROM t WHERE id = 1").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get(0).unwrap(), &SqliteValue::Text("alice".into()));
+    }
+
+    #[test]
+    fn test_insert_or_ignore_secondary_unique_preserves_change_count_and_rowid() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT UNIQUE)")
+            .unwrap();
+
+        assert_eq!(
+            conn.execute("INSERT INTO t VALUES (1, 'alice@example.com')")
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.execute("INSERT OR IGNORE INTO t VALUES (2, 'alice@example.com')")
+                .unwrap(),
+            0
+        );
+
+        let rows = conn.query("SELECT id, email FROM t ORDER BY id").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get(0).unwrap(), &SqliteValue::Integer(1));
+        assert_eq!(
+            rows[0].get(1).unwrap(),
+            &SqliteValue::Text("alice@example.com".into())
+        );
+
+        let rowid_rows = conn.query("SELECT last_insert_rowid()").unwrap();
+        assert_eq!(rowid_rows.len(), 1);
+        assert_eq!(rowid_rows[0].get(0).unwrap(), &SqliteValue::Integer(1));
     }
 
     #[test]
@@ -35929,6 +35966,42 @@ mod pager_routing_tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
         assert_eq!(rows[1].values()[0], SqliteValue::Integer(3));
+    }
+
+    #[test]
+    fn test_execute_prepared_rejects_statement_from_different_connection() {
+        let conn1 = Connection::open(":memory:").unwrap();
+        let conn2 = Connection::open(":memory:").unwrap();
+        conn1
+            .execute("CREATE TABLE prep_cross (id INTEGER PRIMARY KEY);")
+            .unwrap();
+        conn2
+            .execute("CREATE TABLE prep_cross (id INTEGER PRIMARY KEY);")
+            .unwrap();
+
+        let stmt = conn1
+            .prepare("INSERT INTO prep_cross VALUES (?1);")
+            .unwrap();
+        let error = conn2
+            .execute_prepared_with_params(&stmt, &[SqliteValue::Integer(1)])
+            .expect_err("prepared DML should not execute through a different connection");
+        assert!(matches!(error, FrankenError::Internal(_)));
+        assert!(
+            error
+                .to_string()
+                .contains("prepared statement belongs to a different connection")
+        );
+
+        assert_eq!(
+            conn1.query("SELECT id FROM prep_cross;").unwrap().len(),
+            0,
+            "owner connection should remain unchanged on rejected cross-connection execution"
+        );
+        assert_eq!(
+            conn2.query("SELECT id FROM prep_cross;").unwrap().len(),
+            0,
+            "callee connection should remain unchanged on rejected cross-connection execution"
+        );
     }
 
     #[test]

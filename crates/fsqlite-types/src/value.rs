@@ -443,8 +443,7 @@ impl SqliteValue {
             let trimmed = s.trim_start();
             let end = scan_numeric_prefix(trimmed.as_bytes());
             end > 0
-                && !trimmed[..end]
-                    .as_bytes()
+                && !trimmed.as_bytes()[..end]
                     .iter()
                     .any(|byte| matches!(*byte, b'.' | b'e' | b'E'))
         }
