@@ -510,7 +510,14 @@ fn emit_upsert_expr(
         }
 
         // ── Scalar function calls ──────────────────────────────────────
-        Expr::FunctionCall { name, args, .. } if !is_aggregate_function(name) => {
+        // (includes multi-arg max/min which are scalar, not aggregate)
+        Expr::FunctionCall { name, args, .. }
+            if !is_aggregate_function(name) || {
+                let lower = name.to_ascii_lowercase();
+                (lower == "max" || lower == "min")
+                    && matches!(args, fsqlite_ast::FunctionArgs::List(a) if a.len() >= 2)
+            } =>
+        {
             let canon = name.to_ascii_uppercase();
             match args {
                 fsqlite_ast::FunctionArgs::Star => {
@@ -2247,9 +2254,15 @@ fn has_aggregate_columns(columns: &[ResultColumn]) -> bool {
 }
 
 /// Check whether an expression contains an aggregate function call.
+/// NOTE: `max(x,y,...)` and `min(x,y,...)` with 2+ args are scalar, not aggregate.
 fn is_aggregate_expr(expr: &Expr) -> bool {
     match expr {
-        Expr::FunctionCall { name, .. } if is_aggregate_function(name) => true,
+        Expr::FunctionCall { name, args, .. } if is_aggregate_function(name) => {
+            // SQLite: max/min with 2+ arguments are scalar functions, not aggregates.
+            let lower = name.to_ascii_lowercase();
+            !((lower == "max" || lower == "min")
+                && matches!(args, fsqlite_ast::FunctionArgs::List(a) if a.len() >= 2))
+        }
         Expr::BinaryOp { left, right, .. } => is_aggregate_expr(left) || is_aggregate_expr(right),
         Expr::UnaryOp { expr: inner, .. }
         | Expr::IsNull { expr: inner, .. }
@@ -8637,7 +8650,13 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
                 emit_in_probe_expr(b, operand, set, *not, reg, ctx);
             }
         }
-        Expr::FunctionCall { name, args, .. } if !is_aggregate_function(name) => {
+        Expr::FunctionCall { name, args, .. }
+            if !is_aggregate_function(name) || {
+                let lower = name.to_ascii_lowercase();
+                (lower == "max" || lower == "min")
+                    && matches!(args, fsqlite_ast::FunctionArgs::List(a) if a.len() >= 2)
+            } =>
+        {
             // Scalar function call: emit args, then PureFunc.
             let canon = name.to_ascii_uppercase();
             match args {
