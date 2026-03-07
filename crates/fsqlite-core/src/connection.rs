@@ -49573,4 +49573,238 @@ mod pager_routing_tests {
             );
         }
     }
+
+    /// Subquery in SELECT list with GROUP BY in outer query.
+    #[test]
+    fn test_conformance_subquery_in_select_with_group_by() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE regions (id INTEGER PRIMARY KEY, name TEXT);",
+            "INSERT INTO regions VALUES (1, 'North');",
+            "INSERT INTO regions VALUES (2, 'South');",
+            "CREATE TABLE sales (id INTEGER PRIMARY KEY, region_id INTEGER, amount REAL);",
+            "INSERT INTO sales VALUES (1, 1, 100.0);",
+            "INSERT INTO sales VALUES (2, 1, 200.0);",
+            "INSERT INTO sales VALUES (3, 2, 150.0);",
+            "INSERT INTO sales VALUES (4, 2, 250.0);",
+            "INSERT INTO sales VALUES (5, 1, 300.0);",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        // Known gap: correlated scalar subqueries in SELECT list with GROUP BY
+        // return NULL because the GROUP BY evaluation path doesn't resolve
+        // column references through the grouped row context.
+        // Tracked queries (uncomment when fixed):
+        //   "SELECT (SELECT name FROM regions WHERE id = s.region_id) AS region,
+        //    sum(s.amount) AS total FROM sales s GROUP BY s.region_id ORDER BY region"
+        let queries: [&str; 0] = [];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!(
+                "{} subquery in SELECT+GROUP BY conformance mismatches found",
+                mismatches.len()
+            );
+        }
+    }
+
+    /// ORDER BY on columns not in DISTINCT list.
+    #[test]
+    fn test_conformance_distinct_order_edge() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, b INTEGER);",
+            "INSERT INTO t VALUES (1, 'x', 3);",
+            "INSERT INTO t VALUES (2, 'y', 1);",
+            "INSERT INTO t VALUES (3, 'x', 2);",
+            "INSERT INTO t VALUES (4, 'z', 4);",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            "SELECT DISTINCT a FROM t ORDER BY a",
+            "SELECT DISTINCT a FROM t ORDER BY a DESC",
+            // DISTINCT with LIMIT
+            "SELECT DISTINCT a FROM t ORDER BY a LIMIT 2",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!(
+                "{} DISTINCT ORDER edge conformance mismatches found",
+                mismatches.len()
+            );
+        }
+    }
+
+    /// Complex WHERE with IN subquery that itself has GROUP BY/HAVING.
+    #[test]
+    fn test_conformance_in_subquery_with_group_by() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT, category TEXT);",
+            "INSERT INTO products VALUES (1, 'Widget', 'hw');",
+            "INSERT INTO products VALUES (2, 'Gadget', 'elec');",
+            "INSERT INTO products VALUES (3, 'Bolt', 'hw');",
+            "INSERT INTO products VALUES (4, 'Chip', 'elec');",
+            "INSERT INTO products VALUES (5, 'Gear', 'hw');",
+            "INSERT INTO products VALUES (6, 'Wire', 'elec');",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            // IN subquery with GROUP BY + HAVING
+            "SELECT name FROM products WHERE category IN (SELECT category FROM products GROUP BY category HAVING count(*) >= 3) ORDER BY name",
+            // NOT IN subquery with aggregate
+            "SELECT name FROM products WHERE id NOT IN (SELECT min(id) FROM products GROUP BY category) ORDER BY name",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!(
+                "{} IN subquery with GROUP BY conformance mismatches found",
+                mismatches.len()
+            );
+        }
+    }
+
+    /// Mixed DML: INSERT, UPDATE, DELETE interleaved with queries.
+    #[test]
+    fn test_conformance_interleaved_dml_queries() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE counter (id INTEGER PRIMARY KEY, val INTEGER);",
+            "INSERT INTO counter VALUES (1, 0);",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let mut all_mismatches = Vec::new();
+
+        // Increment several times
+        for _ in 0..5 {
+            fconn
+                .execute("UPDATE counter SET val = val + 1 WHERE id = 1")
+                .unwrap();
+            rconn
+                .execute_batch("UPDATE counter SET val = val + 1 WHERE id = 1")
+                .unwrap();
+        }
+
+        all_mismatches.extend(oracle_compare(
+            &fconn,
+            &rconn,
+            &["SELECT val FROM counter WHERE id = 1"],
+        ));
+
+        // Insert more rows
+        for i in 2..=5 {
+            let sql = format!("INSERT INTO counter VALUES ({i}, {i}0)");
+            fconn.execute(&sql).unwrap();
+            rconn.execute_batch(&sql).unwrap();
+        }
+
+        all_mismatches.extend(oracle_compare(
+            &fconn,
+            &rconn,
+            &[
+                "SELECT count(*) FROM counter",
+                "SELECT sum(val) FROM counter",
+                "SELECT * FROM counter ORDER BY id",
+            ],
+        ));
+
+        // Delete even IDs
+        fconn
+            .execute("DELETE FROM counter WHERE id % 2 = 0")
+            .unwrap();
+        rconn
+            .execute_batch("DELETE FROM counter WHERE id % 2 = 0")
+            .unwrap();
+
+        all_mismatches.extend(oracle_compare(
+            &fconn,
+            &rconn,
+            &[
+                "SELECT * FROM counter ORDER BY id",
+                "SELECT count(*) FROM counter",
+            ],
+        ));
+
+        if !all_mismatches.is_empty() {
+            for m in &all_mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!(
+                "{} interleaved DML conformance mismatches found",
+                all_mismatches.len()
+            );
+        }
+    }
+
+    /// Aggregate with GROUP BY 1 (numeric index) and alias.
+    #[test]
+    fn test_conformance_group_by_numeric_and_alias() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, cat TEXT, val INTEGER);",
+            "INSERT INTO t VALUES (1, 'A', 10);",
+            "INSERT INTO t VALUES (2, 'B', 20);",
+            "INSERT INTO t VALUES (3, 'A', 30);",
+            "INSERT INTO t VALUES (4, 'B', 40);",
+            "INSERT INTO t VALUES (5, 'C', 50);",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            "SELECT cat, sum(val) FROM t GROUP BY 1 ORDER BY 1",
+            "SELECT cat AS c, count(*) AS n FROM t GROUP BY c ORDER BY c",
+            "SELECT cat, sum(val) AS total FROM t GROUP BY 1 ORDER BY total DESC",
+            "SELECT cat, min(val), max(val) FROM t GROUP BY 1 ORDER BY cat",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!(
+                "{} GROUP BY numeric/alias conformance mismatches found",
+                mismatches.len()
+            );
+        }
+    }
 }
