@@ -1577,49 +1577,41 @@ impl VfsFile for UnixFile {
             });
         }
 
+        let map_size = usize::try_from(size).map_err(|_| FrankenError::LockFailed {
+            detail: format!("shm_map size too large: {size}"),
+        })?;
+
         let shm_info = self.ensure_shm_info()?;
         let mut info = shm_info.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Return cached region if it already exists and is large enough.
         if let Some(existing) = info.regions.get(&region).cloned() {
-            let requested_size = usize::try_from(size).map_err(|_| FrankenError::LockFailed {
-                detail: format!("shm_map size too large: {size}"),
-            })?;
-            if existing.len() >= requested_size {
+            if existing.len() >= map_size {
                 drop(info);
                 return Ok(existing);
             }
+            // Existing region is too small. For mmap-backed regions we must
+            // remap rather than resize, so remove the old entry and fall
+            // through to the mmap path below.
             if !extend {
                 drop(info);
                 return Err(FrankenError::LockFailed {
                     detail: format!(
-                        "shm region {region} is {} bytes, requested {requested_size} bytes without extend",
+                        "shm region {region} is {} bytes, requested {map_size} bytes without extend",
                         existing.len()
                     ),
                 });
             }
-
-            let mut updated_region = existing.clone();
-            updated_region.resize(requested_size);
-            let region_count = u64::from(region) + 1;
-            let target_len = region_count.checked_mul(u64::from(size)).ok_or_else(|| {
-                FrankenError::LockFailed {
-                    detail: "shm_map file length overflow".to_string(),
-                }
-            })?;
-            info.file.set_len(target_len).map_err(FrankenError::Io)?;
-            info.regions.insert(region, updated_region.clone());
-            drop(info);
-            return Ok(updated_region);
-        }
-        if !extend {
+            info.regions.remove(&region);
+            // The old ShmRegion (and its MmapBacking) will be munmap'd when
+            // the last Arc reference is dropped.
+        } else if !extend {
             return Err(FrankenError::CannotOpen {
                 path: self.shm_path.clone(),
             });
         }
 
-        let map_size = usize::try_from(size).map_err(|_| FrankenError::LockFailed {
-            detail: format!("shm_map size too large: {size}"),
-        })?;
-        let new_region = ShmRegion::new(map_size);
+        // Extend the SHM file if necessary.
         let region_count = u64::from(region) + 1;
         let target_len =
             region_count
@@ -1627,7 +1619,37 @@ impl VfsFile for UnixFile {
                 .ok_or_else(|| FrankenError::LockFailed {
                     detail: "shm_map file length overflow".to_string(),
                 })?;
-        info.file.set_len(target_len).map_err(FrankenError::Io)?;
+        let current_len = info.file.metadata().map_err(FrankenError::Io)?.len();
+        if target_len > current_len {
+            info.file.set_len(target_len).map_err(FrankenError::Io)?;
+        }
+
+        // Map the region via mmap(MAP_SHARED).
+        let offset = u64::from(region) * u64::from(size);
+        let fd = info.file.as_raw_fd();
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                map_size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd,
+                offset as libc::off_t,
+            )
+        };
+
+        if ptr == libc::MAP_FAILED {
+            let err = std::io::Error::last_os_error();
+            return Err(FrankenError::Io(std::io::Error::new(
+                err.kind(),
+                format!("mmap failed for shm region {region} (offset={offset}, size={map_size}): {err}"),
+            )));
+        }
+
+        // SAFETY: `ptr` is from a successful `mmap(MAP_SHARED, PROT_READ|PROT_WRITE)`
+        // call. The region is `map_size` bytes. We transfer ownership to ShmRegion
+        // which will `munmap` on drop.
+        let new_region = unsafe { ShmRegion::from_mmap(ptr as *mut u8, map_size) };
         info.regions.insert(region, new_region.clone());
         drop(info);
         Ok(new_region)
@@ -1698,7 +1720,13 @@ impl VfsFile for UnixFile {
         Ok(())
     }
 
-    fn shm_barrier(&self) {}
+    fn shm_barrier(&self) {
+        // Full memory barrier to ensure all prior SHM writes (via mmap) are
+        // visible to other processes before any subsequent reads. This matches
+        // C SQLite's xShmBarrier which calls `__sync_synchronize()` or
+        // equivalent.
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+    }
 
     fn shm_unmap(&mut self, _cx: &Cx, delete: bool) -> Result<()> {
         self.release_shm_owner_state(delete)
@@ -2600,13 +2628,13 @@ mod tests {
     }
 
     #[test]
-    fn test_unix_vfs_shm_barrier_noop() {
+    fn test_unix_vfs_shm_barrier_is_fence() {
         let cx = Cx::new();
         let vfs = UnixVfs::new();
         let (_dir, path) = make_temp_path("barrier.db");
 
         let (file, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
-        file.shm_barrier(); // should not panic
+        file.shm_barrier(); // should not panic; emits SeqCst fence
     }
 
     #[test]
@@ -2668,5 +2696,259 @@ mod tests {
         // shm_unmap with delete=false should succeed even when no SHM was mapped.
         file.shm_unmap(&cx, false).unwrap();
         file.close(&cx).unwrap();
+    }
+
+    // -- mmap-backed SHM region tests --
+
+    #[test]
+    fn test_shm_map_returns_mmap_backed_region() {
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("shm_mmap_backed.db");
+
+        let (mut file, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        file.write(&cx, b"x", 0).unwrap();
+
+        let region = file.shm_map(&cx, 0, 32768, true).unwrap();
+        assert!(region.is_mmap_backed(), "unix VFS shm_map must return mmap-backed region");
+        assert_eq!(region.len(), 32768);
+
+        // Verify the underlying SHM file was created and extended.
+        let shm_path = sqlite_shm_path(&file.path);
+        assert!(shm_path.exists(), "SHM file must exist after shm_map");
+        let shm_len = fs::metadata(&shm_path).unwrap().len();
+        assert!(shm_len >= 32768, "SHM file must be at least 32KB, got {shm_len}");
+
+        file.shm_unmap(&cx, true).unwrap();
+        file.close(&cx).unwrap();
+    }
+
+    #[test]
+    fn test_shm_mmap_region_read_write_roundtrip() {
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("shm_mmap_rw.db");
+
+        let (mut file, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        file.write(&cx, b"x", 0).unwrap();
+
+        let region = file.shm_map(&cx, 0, 32768, true).unwrap();
+        assert!(region.is_mmap_backed());
+
+        // Write through the mmap region and read back.
+        region.write_u32_le(0, 0xDEAD_BEEF);
+        region.write_u64_le(8, 0x0102_0304_0506_0708);
+        assert_eq!(region.read_u32_le(0), 0xDEAD_BEEF);
+        assert_eq!(region.read_u64_le(8), 0x0102_0304_0506_0708);
+
+        // Verify writes are visible in the SHM file on disk.
+        file.shm_barrier();
+        let shm_path = sqlite_shm_path(&file.path);
+        let shm_data = fs::read(&shm_path).unwrap();
+        assert_eq!(
+            u32::from_le_bytes([shm_data[0], shm_data[1], shm_data[2], shm_data[3]]),
+            0xDEAD_BEEF,
+            "mmap write must be visible in the SHM file"
+        );
+
+        file.shm_unmap(&cx, true).unwrap();
+        file.close(&cx).unwrap();
+    }
+
+    #[test]
+    fn test_shm_mmap_two_handles_share_data() {
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("shm_mmap_share.db");
+
+        let (mut file_a, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        let (mut file_b, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        file_a.write(&cx, b"x", 0).unwrap();
+
+        let region_a = file_a.shm_map(&cx, 0, 32768, true).unwrap();
+        let region_b = file_b.shm_map(&cx, 0, 32768, true).unwrap();
+        assert!(region_a.is_mmap_backed());
+        assert!(region_b.is_mmap_backed());
+
+        // Write through handle A, read through handle B.
+        region_a.write_u32_le(100, 42);
+        file_a.shm_barrier();
+        file_b.shm_barrier();
+
+        assert_eq!(
+            region_b.read_u32_le(100),
+            42,
+            "mmap write through one handle must be visible to another handle (same process)"
+        );
+
+        file_a.shm_unmap(&cx, false).unwrap();
+        file_b.shm_unmap(&cx, true).unwrap();
+        file_a.close(&cx).unwrap();
+        file_b.close(&cx).unwrap();
+    }
+
+    #[test]
+    fn test_shm_mmap_multiple_regions() {
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("shm_mmap_multi.db");
+
+        let (mut file, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        file.write(&cx, b"x", 0).unwrap();
+
+        let region0 = file.shm_map(&cx, 0, 32768, true).unwrap();
+        let region1 = file.shm_map(&cx, 1, 32768, true).unwrap();
+
+        // Write different data to each region.
+        region0.write_u32_le(0, 0xAAAA_AAAA);
+        region1.write_u32_le(0, 0xBBBB_BBBB);
+
+        // Verify regions are independent.
+        assert_eq!(region0.read_u32_le(0), 0xAAAA_AAAA);
+        assert_eq!(region1.read_u32_le(0), 0xBBBB_BBBB);
+
+        // Verify SHM file is at least 2 * 32KB.
+        let shm_path = sqlite_shm_path(&file.path);
+        let shm_len = fs::metadata(&shm_path).unwrap().len();
+        assert!(shm_len >= 65536, "SHM file must be at least 64KB for 2 regions, got {shm_len}");
+
+        file.shm_unmap(&cx, true).unwrap();
+        file.close(&cx).unwrap();
+    }
+
+    #[test]
+    fn test_shm_mmap_unmap_deletes_file() {
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("shm_mmap_delete.db");
+
+        let (mut file, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        file.write(&cx, b"x", 0).unwrap();
+
+        let _region = file.shm_map(&cx, 0, 32768, true).unwrap();
+        let shm_path = sqlite_shm_path(&file.path);
+        assert!(shm_path.exists());
+
+        file.shm_unmap(&cx, true).unwrap();
+        assert!(!shm_path.exists(), "SHM file must be deleted after shm_unmap(delete=true)");
+
+        file.close(&cx).unwrap();
+    }
+
+    #[test]
+    fn test_shm_mmap_cross_process_visibility() {
+        // This test verifies that mmap-backed SHM regions are visible across
+        // process boundaries. Process A writes a magic value to the SHM file,
+        // and process B reads it back.
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("shm_cross_proc.db");
+
+        let (mut file, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        file.write(&cx, b"x", 0).unwrap();
+
+        let region = file.shm_map(&cx, 0, 32768, true).unwrap();
+        assert!(region.is_mmap_backed());
+
+        // Write a distinctive pattern at offset 256 in the SHM region.
+        region.write_u32_le(256, 0xCAFE_BABE);
+        file.shm_barrier();
+
+        // Read the SHM file directly (simulating another process) and verify.
+        let shm_path = sqlite_shm_path(&file.path);
+        let shm_data = fs::read(&shm_path).unwrap();
+        assert!(shm_data.len() >= 260);
+        let val = u32::from_le_bytes([shm_data[256], shm_data[257], shm_data[258], shm_data[259]]);
+        assert_eq!(
+            val, 0xCAFE_BABE,
+            "mmap write at offset 256 must be visible when reading the SHM file directly"
+        );
+
+        file.shm_unmap(&cx, true).unwrap();
+        file.close(&cx).unwrap();
+    }
+
+    #[test]
+    fn test_shm_barrier_ensures_ordering() {
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("shm_barrier_order.db");
+
+        let (mut writer, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        let (mut reader, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        writer.write(&cx, b"x", 0).unwrap();
+
+        let w_region = writer.shm_map(&cx, 0, 32768, true).unwrap();
+        let r_region = reader.shm_map(&cx, 0, 32768, true).unwrap();
+
+        // Write a sequence of values with barriers between them.
+        w_region.write_u32_le(0, 1);
+        writer.shm_barrier();
+        w_region.write_u32_le(4, 2);
+        writer.shm_barrier();
+
+        reader.shm_barrier();
+        let v1 = r_region.read_u32_le(0);
+        let v2 = r_region.read_u32_le(4);
+        assert_eq!(v1, 1, "first write must be visible after barrier");
+        assert_eq!(v2, 2, "second write must be visible after barrier");
+
+        writer.shm_unmap(&cx, false).unwrap();
+        reader.shm_unmap(&cx, true).unwrap();
+        writer.close(&cx).unwrap();
+        reader.close(&cx).unwrap();
+    }
+
+    #[test]
+    fn test_shm_lock_coordination_with_mmap() {
+        // Verify that shm_lock + shm_barrier + mmap regions work together
+        // for the WAL write lock protocol.
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("shm_lock_mmap.db");
+
+        let (mut writer, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        let (mut reader, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        writer.write(&cx, b"x", 0).unwrap();
+
+        // Map SHM regions for both.
+        let w_region = writer.shm_map(&cx, 0, 32768, true).unwrap();
+        let r_region = reader.shm_map(&cx, 0, 32768, true).unwrap();
+
+        // Writer acquires exclusive lock on slot 0 (WAL_WRITE_LOCK).
+        writer
+            .shm_lock(&cx, WAL_WRITE_LOCK, 1, SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE)
+            .unwrap();
+
+        // Write data under the lock.
+        w_region.write_u32_le(200, 0x1234_5678);
+        writer.shm_barrier();
+
+        // Reader should fail to get exclusive lock on same slot (BUSY).
+        let err = reader.shm_lock(
+            &cx,
+            WAL_WRITE_LOCK,
+            1,
+            SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE,
+        );
+        assert!(err.is_err(), "reader must fail to acquire exclusive lock held by writer");
+
+        // But reader can still read the mmap data (SHM is MAP_SHARED).
+        reader.shm_barrier();
+        assert_eq!(
+            r_region.read_u32_le(200),
+            0x1234_5678,
+            "reader must see writer's data through mmap even without its own exclusive lock"
+        );
+
+        // Writer releases.
+        writer
+            .shm_lock(&cx, WAL_WRITE_LOCK, 1, SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE)
+            .unwrap();
+
+        writer.shm_unmap(&cx, false).unwrap();
+        reader.shm_unmap(&cx, true).unwrap();
+        writer.close(&cx).unwrap();
+        reader.close(&cx).unwrap();
     }
 }

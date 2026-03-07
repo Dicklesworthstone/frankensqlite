@@ -34,5 +34,28 @@ advisory-lock = "0.3.0"
 [dev-dependencies]
 tempfile = { workspace = true }
 
-[lints]
-workspace = true
+# Cannot inherit workspace lints because workspace forbids unsafe_code
+# and VFS requires unsafe for mmap.
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+cast_lossless = { level = "allow", priority = 1 }
+cast_possible_truncation = { level = "allow", priority = 1 }
+cast_possible_wrap = { level = "allow", priority = 1 }
+cast_precision_loss = { level = "allow", priority = 1 }
+cast_sign_loss = { level = "allow", priority = 1 }
+doc_markdown = { level = "allow", priority = 1 }
+missing_const_for_fn = { level = "allow", priority = 1 }
+missing_errors_doc = { level = "allow", priority = 1 }
+missing_panics_doc = { level = "allow", priority = 1 }
+module_name_repetitions = { level = "allow", priority = 1 }
+must_use_candidate = { level = "allow", priority = 1 }
+option_if_let_else = { level = "allow", priority = 1 }
+significant_drop_tightening = { level = "allow", priority = 1 }
+similar_names = { level = "allow", priority = 1 }
+too_many_lines = { level = "allow", priority = 1 }
+unreadable_literal = { level = "allow", priority = 1 }
+uninlined_format_args = { level = "allow", priority = 1 }

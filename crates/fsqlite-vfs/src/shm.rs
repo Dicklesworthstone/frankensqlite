@@ -12,6 +12,83 @@
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+// ---------------------------------------------------------------------------
+// Mmap-backed SHM region support (Unix only)
+// ---------------------------------------------------------------------------
+
+/// Raw mmap-backed shared memory region.
+///
+/// This is the actual backing storage for `ShmRegion` when using the Unix VFS.
+/// It maps a region of the `*-shm` file via `mmap(MAP_SHARED)`, so writes are
+/// visible to all processes that map the same file region.
+///
+/// # Safety
+///
+/// The `ptr` must point to a valid `mmap`-allocated region of `len` bytes.
+/// The region must not be unmapped while any `MmapBacking` referring to it
+/// is alive.
+#[cfg(unix)]
+struct MmapBacking {
+    ptr: *mut u8,
+    len: usize,
+}
+
+#[cfg(unix)]
+impl Drop for MmapBacking {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() && self.len > 0 {
+            // SAFETY: `ptr` and `len` were returned by a successful `mmap` call.
+            unsafe {
+                libc::munmap(self.ptr as *mut libc::c_void, self.len);
+            }
+        }
+    }
+}
+
+// SAFETY: The mmap region is backed by a `MAP_SHARED` file mapping.
+// Multiple processes/threads can safely access it via the POSIX shared memory
+// contract (coordinated by fcntl locks and memory barriers). The raw pointer
+// is only dereferenced through the `ShmRegionGuard` which holds a mutex lock.
+#[cfg(unix)]
+unsafe impl Send for MmapBacking {}
+#[cfg(unix)]
+unsafe impl Sync for MmapBacking {}
+
+/// The backing storage for a `ShmRegion`.
+enum ShmRegionBacking {
+    /// Heap-allocated storage (used by `MemoryVfs` and tests).
+    Heap(Arc<Mutex<Vec<u8>>>),
+    /// Mmap-backed storage (used by `UnixVfs` for real multi-process SHM).
+    #[cfg(unix)]
+    Mmap(Arc<MmapBacking>),
+}
+
+impl std::fmt::Debug for ShmRegionBacking {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ShmRegionBacking::Heap(v) => f
+                .debug_tuple("Heap")
+                .field(&format_args!("Vec<u8>[{}]", v.lock().unwrap_or_else(|e| e.into_inner()).len()))
+                .finish(),
+            #[cfg(unix)]
+            ShmRegionBacking::Mmap(m) => f
+                .debug_tuple("Mmap")
+                .field(&format_args!("ptr={:?}, len={}", m.ptr, m.len))
+                .finish(),
+        }
+    }
+}
+
+impl Clone for ShmRegionBacking {
+    fn clone(&self) -> Self {
+        match self {
+            ShmRegionBacking::Heap(v) => ShmRegionBacking::Heap(Arc::clone(v)),
+            #[cfg(unix)]
+            ShmRegionBacking::Mmap(m) => ShmRegionBacking::Mmap(Arc::clone(m)),
+        }
+    }
+}
+
 /// `xShmLock` flag: unlock the requested slot range.
 pub const SQLITE_SHM_UNLOCK: u32 = 0x01;
 /// `xShmLock` flag: lock the requested slot range.
@@ -69,29 +146,54 @@ pub const fn wal_lock_byte(slot: u32) -> Option<u64> {
 /// Each region is a fixed-size chunk (typically 32 KB) of the SHM file.
 /// Regions are 0-indexed and grow on demand when `VfsFile::shm_map` is
 /// called with `extend = true`.
+///
+/// # Backing types
+///
+/// - **Heap**: In-process `Vec<u8>` behind a `Mutex`. Used by `MemoryVfs` and
+///   tests. Changes are only visible within the same process.
+/// - **Mmap** (Unix only): `MAP_SHARED` mapping of the `*-shm` file. Changes
+///   are visible across processes. Coordinated by `fcntl` locks and memory
+///   barriers (`shm_barrier`).
 #[derive(Debug, Clone)]
 pub struct ShmRegion {
     len: usize,
-    data: Arc<Mutex<Vec<u8>>>,
+    backing: ShmRegionBacking,
 }
 
 impl ShmRegion {
-    /// Create a new zeroed SHM region of the given size.
+    /// Create a new zeroed SHM region of the given size (heap-backed).
     #[must_use]
     pub fn new(size: usize) -> Self {
         Self {
             len: size,
-            data: Arc::new(Mutex::new(vec![0; size])),
+            backing: ShmRegionBacking::Heap(Arc::new(Mutex::new(vec![0; size]))),
         }
     }
 
-    /// Create a region from existing data.
+    /// Create a region from existing data (heap-backed).
     #[must_use]
     pub fn from_vec(data: Vec<u8>) -> Self {
         let len = data.len();
         Self {
             len,
-            data: Arc::new(Mutex::new(data)),
+            backing: ShmRegionBacking::Heap(Arc::new(Mutex::new(data))),
+        }
+    }
+
+    /// Create a region backed by an existing `mmap(MAP_SHARED)` mapping.
+    ///
+    /// # Safety
+    ///
+    /// - `ptr` must have been returned by a successful `mmap` call with
+    ///   `MAP_SHARED` and `PROT_READ | PROT_WRITE`.
+    /// - The mapped region must be exactly `len` bytes.
+    /// - The caller must not `munmap` the region; `ShmRegion` will do it on
+    ///   drop (when all clones are dropped).
+    #[cfg(unix)]
+    pub unsafe fn from_mmap(ptr: *mut u8, len: usize) -> Self {
+        Self {
+            len,
+            backing: ShmRegionBacking::Mmap(Arc::new(MmapBacking { ptr, len })),
         }
     }
 
@@ -109,12 +211,21 @@ impl ShmRegion {
 
     /// Acquire a lock and borrow the region as a byte slice.
     ///
+    /// For heap-backed regions, this acquires the inner mutex.
+    /// For mmap-backed regions, this returns a direct view of the mapped memory.
+    ///
     /// The returned guard derefs to `&[u8]` / `&mut [u8]` and releases the lock
     /// on drop.
     #[must_use]
     pub fn lock(&self) -> ShmRegionGuard<'_> {
-        ShmRegionGuard {
-            guard: self.data.lock().unwrap_or_else(|e| e.into_inner()),
+        match &self.backing {
+            ShmRegionBacking::Heap(data) => ShmRegionGuard {
+                inner: ShmRegionGuardInner::Heap(data.lock().unwrap_or_else(|e| e.into_inner())),
+            },
+            #[cfg(unix)]
+            ShmRegionBacking::Mmap(m) => ShmRegionGuard {
+                inner: ShmRegionGuardInner::Mmap { ptr: m.ptr, len: m.len, _backing: m },
+            },
         }
     }
 
@@ -172,37 +283,95 @@ impl ShmRegion {
 
     /// Resize the shared memory region.
     ///
+    /// This is only supported for heap-backed regions. Mmap-backed regions
+    /// must be remapped by calling `shm_map` again with the new size.
+    ///
     /// Existing clones of this `ShmRegion` will still share the same underlying
     /// data, but their locally cached `len()` will not be updated. This matches
     /// the semantics of `mremap` where other handles must explicitly remap
     /// to see the new size, while still sharing the physical bytes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called on an mmap-backed region.
     pub fn resize(&mut self, new_size: usize) {
-        let mut guard = self.data.lock().unwrap_or_else(|e| e.into_inner());
-        if new_size > guard.len() {
-            guard.resize(new_size, 0);
-        } else if new_size < guard.len() {
-            guard.truncate(new_size);
+        match &self.backing {
+            ShmRegionBacking::Heap(data) => {
+                let mut guard = data.lock().unwrap_or_else(|e| e.into_inner());
+                if new_size > guard.len() {
+                    guard.resize(new_size, 0);
+                } else if new_size < guard.len() {
+                    guard.truncate(new_size);
+                }
+                self.len = new_size;
+            }
+            #[cfg(unix)]
+            ShmRegionBacking::Mmap(_) => {
+                panic!("cannot resize mmap-backed ShmRegion; remap instead");
+            }
         }
-        self.len = new_size;
+    }
+
+    /// Returns `true` if this region is backed by mmap (multi-process visible).
+    #[must_use]
+    pub fn is_mmap_backed(&self) -> bool {
+        match &self.backing {
+            ShmRegionBacking::Heap(_) => false,
+            #[cfg(unix)]
+            ShmRegionBacking::Mmap(_) => true,
+        }
     }
 }
 
 /// Locked SHM region access guard.
+///
+/// For heap-backed regions, holds the inner `MutexGuard`.
+/// For mmap-backed regions, provides direct access to the mapped memory
+/// while keeping a reference to the `MmapBacking` to prevent unmapping.
 pub struct ShmRegionGuard<'a> {
-    guard: MutexGuard<'a, Vec<u8>>,
+    inner: ShmRegionGuardInner<'a>,
+}
+
+enum ShmRegionGuardInner<'a> {
+    Heap(MutexGuard<'a, Vec<u8>>),
+    #[cfg(unix)]
+    Mmap {
+        ptr: *mut u8,
+        len: usize,
+        /// Prevent the `MmapBacking` from being dropped while we hold a
+        /// reference to the mapped memory.
+        _backing: &'a Arc<MmapBacking>,
+    },
 }
 
 impl Deref for ShmRegionGuard<'_> {
     type Target = [u8];
 
     fn deref(&self) -> &[u8] {
-        self.guard.as_slice()
+        match &self.inner {
+            ShmRegionGuardInner::Heap(guard) => guard.as_slice(),
+            #[cfg(unix)]
+            ShmRegionGuardInner::Mmap { ptr, len, .. } => {
+                // SAFETY: The MmapBacking reference guarantees the region is
+                // still mapped. `ptr` and `len` were set from a successful
+                // `mmap` call.
+                unsafe { std::slice::from_raw_parts(*ptr, *len) }
+            }
+        }
     }
 }
 
 impl DerefMut for ShmRegionGuard<'_> {
     fn deref_mut(&mut self) -> &mut [u8] {
-        self.guard.as_mut_slice()
+        match &mut self.inner {
+            ShmRegionGuardInner::Heap(guard) => guard.as_mut_slice(),
+            #[cfg(unix)]
+            ShmRegionGuardInner::Mmap { ptr, len, .. } => {
+                // SAFETY: Same invariants as Deref. The mmap was created with
+                // PROT_READ | PROT_WRITE.
+                unsafe { std::slice::from_raw_parts_mut(*ptr, *len) }
+            }
+        }
     }
 }
 
