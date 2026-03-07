@@ -4770,6 +4770,7 @@ pub fn codegen_insert(
 
             let rec_reg = b.alloc_reg();
             emit_strict_type_check(b, table, col_regs);
+            emit_check_constraints(b, table, col_regs);
             // Apply column type affinities before packing the record.
             let aff_str = table.affinity_string();
             b.emit_op(
@@ -4959,6 +4960,9 @@ fn codegen_insert_values(
         // STRICT type check BEFORE affinity (SQLite validates raw storage
         // classes, then applies affinity for the on-disk format).
         emit_strict_type_check(b, table, val_regs);
+
+        // CHECK constraint validation.
+        emit_check_constraints(b, table, val_regs);
 
         // Apply column type affinities before packing the record.
         let aff_str = table.affinity_string();
@@ -5490,6 +5494,7 @@ fn codegen_insert_select(
     // Apply column type affinities before packing the record.
     // STRICT type check before affinity.
     emit_strict_type_check(b, target_table, final_regs);
+    emit_check_constraints(b, target_table, final_regs);
 
     let aff_str = target_table.affinity_string();
     b.emit_op(
@@ -5634,6 +5639,7 @@ fn codegen_insert_select_without_from(
 
     // STRICT type check before affinity.
     emit_strict_type_check(b, target_table, val_regs);
+    emit_check_constraints(b, target_table, val_regs);
 
     // Apply column type affinities before packing the record.
     let aff_str = target_table.affinity_string();
@@ -5898,6 +5904,7 @@ pub fn codegen_update(
 
     // MakeRecord with ALL columns.
     emit_strict_type_check(b, table, col_regs);
+    emit_check_constraints(b, table, col_regs);
     // Apply column type affinities before packing the record.
     let aff_str = table.affinity_string();
     let rec_reg = b.alloc_reg();
@@ -6237,6 +6244,7 @@ fn codegen_update_from(
 
     // MakeRecord with ALL columns.
     emit_strict_type_check(b, target, col_regs);
+    emit_check_constraints(b, target, col_regs);
     let aff_str = target.affinity_string();
     let rec_reg = b.alloc_reg();
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
@@ -6560,6 +6568,56 @@ fn emit_stored_generated_columns(b: &mut ProgramBuilder, table: &TableSchema, va
             // VIRTUAL: not stored in the record; set NULL as placeholder.
             b.emit_op(Opcode::Null, 0, dest_reg, 0, P4::None, 0);
         }
+    }
+}
+
+/// Emit CHECK constraint validation for INSERT/UPDATE.
+///
+/// For each CHECK constraint on the table, parses the constraint expression,
+/// evaluates it using register-based column resolution, and emits a `Halt`
+/// with SQLITE_CONSTRAINT (19) if any constraint evaluates to false (0).
+/// NULL results are treated as passing (SQLite semantics: CHECK passes
+/// unless the expression is explicitly false).
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+fn emit_check_constraints(b: &mut ProgramBuilder, table: &TableSchema, val_regs: i32) {
+    const SQLITE_CONSTRAINT: i32 = 19;
+
+    for check_sql in &table.check_constraints {
+        let Some(expr) = parse_default_expr(check_sql) else {
+            continue;
+        };
+
+        let result_reg = b.alloc_reg();
+        let ok_label = b.emit_label();
+
+        let check_ctx = ScanCtx {
+            cursor: 0,
+            table,
+            table_alias: None,
+            schema: None,
+            register_base: Some(val_regs),
+            secondary: None,
+        };
+
+        emit_expr(b, &expr, result_reg, Some(&check_ctx));
+
+        // NULL result: CHECK passes (SQLite semantics).
+        b.emit_jump_to_label(Opcode::IsNull, result_reg, 0, ok_label, P4::None, 0);
+
+        // Non-zero (truthy): CHECK passes.
+        b.emit_jump_to_label(Opcode::If, result_reg, 0, ok_label, P4::None, 0);
+
+        // False (0): CHECK fails — halt with constraint error.
+        b.emit_op(
+            Opcode::Halt,
+            SQLITE_CONSTRAINT,
+            0,
+            0,
+            P4::Str(format!("CHECK constraint failed: {check_sql}")),
+            0,
+        );
+
+        b.resolve_label(ok_label);
     }
 }
 

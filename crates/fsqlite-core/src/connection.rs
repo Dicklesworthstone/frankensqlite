@@ -14216,10 +14216,7 @@ fn select_references_table(select: &SelectStatement, table_name: &str) -> bool {
 /// Recursively resolve column names for a subquery that uses `SELECT *`.
 /// Walks through nested subqueries and schema tables to find the actual
 /// column names that will appear in the result set.
-fn resolve_subquery_star_columns(
-    select: &SelectStatement,
-    schema: &[TableSchema],
-) -> Vec<String> {
+fn resolve_subquery_star_columns(select: &SelectStatement, schema: &[TableSchema]) -> Vec<String> {
     let basic = infer_select_column_names(select);
     if !basic.iter().any(|n| n == "*" || n.ends_with(".*")) {
         return basic;
@@ -14235,9 +14232,7 @@ fn resolve_subquery_star_columns(
             if name == "*" {
                 // Expand from all FROM sources.
                 match &from.source {
-                    TableOrSubquery::Table {
-                        name: tbl_name, ..
-                    } => {
+                    TableOrSubquery::Table { name: tbl_name, .. } => {
                         if let Some(tbl) = schema
                             .iter()
                             .find(|t| t.name.eq_ignore_ascii_case(&tbl_name.name))
@@ -16143,9 +16138,7 @@ fn compute_having_aggregate(
             if func == "count" {
                 let cnt = group_rows
                     .iter()
-                    .filter(|r| {
-                        r.get(idx).is_some_and(|v| !matches!(v, SqliteValue::Null))
-                    })
+                    .filter(|r| r.get(idx).is_some_and(|v| !matches!(v, SqliteValue::Null)))
                     .count();
                 return SqliteValue::Integer(cnt as i64);
             }
@@ -46965,10 +46958,7 @@ mod pager_routing_tests {
             for m in &mismatches {
                 eprintln!("{m}\n");
             }
-            panic!(
-                "{} view conformance mismatches found",
-                mismatches.len()
-            );
+            panic!("{} view conformance mismatches found", mismatches.len());
         }
     }
 
@@ -47075,9 +47065,7 @@ mod pager_routing_tests {
         let fconn = Connection::open(":memory:").unwrap();
         let rconn = rusqlite::Connection::open_in_memory().unwrap();
 
-        let setup = [
-            "CREATE TABLE kv (key TEXT PRIMARY KEY, val INTEGER DEFAULT 0);",
-        ];
+        let setup = ["CREATE TABLE kv (key TEXT PRIMARY KEY, val INTEGER DEFAULT 0);"];
         for s in &setup {
             fconn.execute(s).unwrap();
             rconn.execute_batch(s).unwrap();
@@ -47342,9 +47330,7 @@ mod pager_routing_tests {
         }
 
         // Delete completed tasks
-        let dml = [
-            "DELETE FROM tasks WHERE done = 1",
-        ];
+        let dml = ["DELETE FROM tasks WHERE done = 1"];
         for s in &dml {
             fconn.execute(s).unwrap();
             rconn.execute_batch(s).unwrap();
@@ -47357,9 +47343,7 @@ mod pager_routing_tests {
         ];
 
         // Now delete using subquery condition
-        let dml2 = [
-            "DELETE FROM tasks WHERE priority = (SELECT max(priority) FROM tasks)",
-        ];
+        let dml2 = ["DELETE FROM tasks WHERE priority = (SELECT max(priority) FROM tasks)"];
         for s in &dml2 {
             fconn.execute(s).unwrap();
             rconn.execute_batch(s).unwrap();
@@ -47665,9 +47649,8 @@ mod pager_routing_tests {
             rconn.execute_batch(s).unwrap();
         }
 
-        let dml = [
-            "INSERT INTO summary SELECT name, sum(amount), count(*) FROM source GROUP BY name",
-        ];
+        let dml =
+            ["INSERT INTO summary SELECT name, sum(amount), count(*) FROM source GROUP BY name"];
         for s in &dml {
             fconn.execute(s).unwrap();
             rconn.execute_batch(s).unwrap();
@@ -47710,23 +47693,17 @@ mod pager_routing_tests {
         }
 
         // Step 1: decrease stock
-        let dml1 = [
-            "UPDATE stock SET qty = qty - 5 WHERE qty >= 30",
-        ];
+        let dml1 = ["UPDATE stock SET qty = qty - 5 WHERE qty >= 30"];
         for s in &dml1 {
             fconn.execute(s).unwrap();
             rconn.execute_batch(s).unwrap();
         }
 
-        let check1 = [
-            "SELECT item, qty FROM stock ORDER BY item",
-        ];
+        let check1 = ["SELECT item, qty FROM stock ORDER BY item"];
         let mut all_mismatches = oracle_compare(&fconn, &rconn, &check1);
 
         // Step 2: delete low stock
-        let dml2 = [
-            "DELETE FROM stock WHERE qty < 20",
-        ];
+        let dml2 = ["DELETE FROM stock WHERE qty < 20"];
         for s in &dml2 {
             fconn.execute(s).unwrap();
             rconn.execute_batch(s).unwrap();
@@ -47749,9 +47726,7 @@ mod pager_routing_tests {
             rconn.execute_batch(s).unwrap();
         }
 
-        let check3 = [
-            "SELECT item, qty FROM stock ORDER BY item",
-        ];
+        let check3 = ["SELECT item, qty FROM stock ORDER BY item"];
         all_mismatches.extend(oracle_compare(&fconn, &rconn, &check3));
 
         if !all_mismatches.is_empty() {
@@ -47902,26 +47877,19 @@ mod pager_routing_tests {
             .execute_batch("CREATE TABLE t2 (id INTEGER PRIMARY KEY, val TEXT)")
             .unwrap();
 
-        fconn
-            .execute("INSERT INTO t2 SELECT * FROM t1")
-            .unwrap();
+        fconn.execute("INSERT INTO t2 SELECT * FROM t1").unwrap();
         rconn
             .execute_batch("INSERT INTO t2 SELECT * FROM t1")
             .unwrap();
 
-        let q3 = [
-            "SELECT * FROM t2 ORDER BY id",
-            "SELECT count(*) FROM t2",
-        ];
+        let q3 = ["SELECT * FROM t2 ORDER BY id", "SELECT count(*) FROM t2"];
         all_mismatches.extend(oracle_compare(&fconn, &rconn, &q3));
 
         // Drop original table
         fconn.execute("DROP TABLE t1").unwrap();
         rconn.execute_batch("DROP TABLE t1").unwrap();
 
-        let q4 = [
-            "SELECT * FROM t2 ORDER BY id",
-        ];
+        let q4 = ["SELECT * FROM t2 ORDER BY id"];
         all_mismatches.extend(oracle_compare(&fconn, &rconn, &q4));
 
         if !all_mismatches.is_empty() {
@@ -48101,9 +48069,7 @@ mod pager_routing_tests {
             rconn.execute_batch(s).unwrap();
         }
 
-        let queries = [
-            "SELECT item, price FROM prices ORDER BY item",
-        ];
+        let queries = ["SELECT item, price FROM prices ORDER BY item"];
 
         let mismatches = oracle_compare(&fconn, &rconn, &queries);
         if !mismatches.is_empty() {
@@ -48317,8 +48283,12 @@ mod pager_routing_tests {
         ];
 
         // Modify original, verify copy is unchanged
-        fconn.execute("UPDATE original SET score = 0 WHERE id = 1").unwrap();
-        rconn.execute_batch("UPDATE original SET score = 0 WHERE id = 1").unwrap();
+        fconn
+            .execute("UPDATE original SET score = 0 WHERE id = 1")
+            .unwrap();
+        rconn
+            .execute_batch("UPDATE original SET score = 0 WHERE id = 1")
+            .unwrap();
 
         let queries2 = [
             "SELECT score FROM original WHERE id = 1",
@@ -48332,10 +48302,7 @@ mod pager_routing_tests {
             for m in &all {
                 eprintln!("{m}\n");
             }
-            panic!(
-                "{} table copy conformance mismatches found",
-                all.len()
-            );
+            panic!("{} table copy conformance mismatches found", all.len());
         }
     }
 
@@ -48402,7 +48369,7 @@ mod pager_routing_tests {
             "SELECT NOT 1, NOT 0, NOT NULL",
             // Type ordering: NULL < INT < REAL < TEXT < BLOB
             "SELECT NULL < 0",
-            "SELECT 0 < 0.0",  // integer vs real
+            "SELECT 0 < 0.0", // integer vs real
             "SELECT typeof(1), typeof(1.0)",
         ];
 
@@ -48602,9 +48569,7 @@ mod pager_routing_tests {
         let fconn = Connection::open(":memory:").unwrap();
         let rconn = rusqlite::Connection::open_in_memory().unwrap();
 
-        let setup = [
-            "CREATE TABLE t (a INTEGER, b TEXT, c REAL);",
-        ];
+        let setup = ["CREATE TABLE t (a INTEGER, b TEXT, c REAL);"];
         for s in &setup {
             fconn.execute(s).unwrap();
             rconn.execute_batch(s).unwrap();
@@ -49038,9 +49003,8 @@ mod pager_routing_tests {
         }
 
         // Mark discontinued products as inactive
-        let dml = [
-            "UPDATE products SET active = 0 WHERE id IN (SELECT product_id FROM discontinued)",
-        ];
+        let dml =
+            ["UPDATE products SET active = 0 WHERE id IN (SELECT product_id FROM discontinued)"];
         for s in &dml {
             fconn.execute(s).unwrap();
             rconn.execute_batch(s).unwrap();
@@ -49052,9 +49016,7 @@ mod pager_routing_tests {
         ];
 
         // Delete discontinued products
-        let dml2 = [
-            "DELETE FROM products WHERE id IN (SELECT product_id FROM discontinued)",
-        ];
+        let dml2 = ["DELETE FROM products WHERE id IN (SELECT product_id FROM discontinued)"];
         for s in &dml2 {
             fconn.execute(s).unwrap();
             rconn.execute_batch(s).unwrap();
@@ -49252,10 +49214,7 @@ mod pager_routing_tests {
             for m in &all {
                 eprintln!("{m}\n");
             }
-            panic!(
-                "{} CTE in DML conformance mismatches found",
-                all.len()
-            );
+            panic!("{} CTE in DML conformance mismatches found", all.len());
         }
     }
 
@@ -49305,9 +49264,8 @@ mod pager_routing_tests {
         let fconn = Connection::open(":memory:").unwrap();
         let rconn = rusqlite::Connection::open_in_memory().unwrap();
 
-        let mut setup = vec![
-            "CREATE TABLE big (id INTEGER PRIMARY KEY, grp TEXT, val REAL);".to_owned(),
-        ];
+        let mut setup =
+            vec!["CREATE TABLE big (id INTEGER PRIMARY KEY, grp TEXT, val REAL);".to_owned()];
         for i in 1..=100 {
             let grp = match i % 5 {
                 0 => "A",
@@ -49856,10 +49814,7 @@ mod pager_routing_tests {
             for m in &mismatches {
                 eprintln!("{m}\n");
             }
-            panic!(
-                "{} group by edge case mismatches found",
-                mismatches.len()
-            );
+            panic!("{} group by edge case mismatches found", mismatches.len());
         }
     }
 
@@ -49906,10 +49861,7 @@ mod pager_routing_tests {
             for m in &mismatches {
                 eprintln!("{m}\n");
             }
-            panic!(
-                "{} order by non-select mismatches found",
-                mismatches.len()
-            );
+            panic!("{} order by non-select mismatches found", mismatches.len());
         }
     }
 
@@ -49954,10 +49906,7 @@ mod pager_routing_tests {
             for m in &mismatches {
                 eprintln!("{m}\n");
             }
-            panic!(
-                "{} compound select mismatches found",
-                mismatches.len()
-            );
+            panic!("{} compound select mismatches found", mismatches.len());
         }
     }
 
@@ -50032,17 +49981,35 @@ mod pager_routing_tests {
         // DML that mutates then queries
         let operations: Vec<(&str, &str)> = vec![
             // INSERT OR REPLACE overwrites existing
-            ("INSERT OR REPLACE INTO kv VALUES ('a', 10)", "SELECT key, val FROM kv ORDER BY key"),
+            (
+                "INSERT OR REPLACE INTO kv VALUES ('a', 10)",
+                "SELECT key, val FROM kv ORDER BY key",
+            ),
             // INSERT OR IGNORE skips duplicate
-            ("INSERT OR IGNORE INTO kv VALUES ('b', 20)", "SELECT key, val FROM kv ORDER BY key"),
+            (
+                "INSERT OR IGNORE INTO kv VALUES ('b', 20)",
+                "SELECT key, val FROM kv ORDER BY key",
+            ),
             // REPLACE as alias for INSERT OR REPLACE
-            ("REPLACE INTO kv VALUES ('c', 30)", "SELECT key, val FROM kv ORDER BY key"),
+            (
+                "REPLACE INTO kv VALUES ('c', 30)",
+                "SELECT key, val FROM kv ORDER BY key",
+            ),
             // UPDATE with expression
-            ("UPDATE kv SET val = val + 100 WHERE key = 'a'", "SELECT key, val FROM kv ORDER BY key"),
+            (
+                "UPDATE kv SET val = val + 100 WHERE key = 'a'",
+                "SELECT key, val FROM kv ORDER BY key",
+            ),
             // DELETE + verify
-            ("DELETE FROM kv WHERE key = 'b'", "SELECT key, val FROM kv ORDER BY key"),
+            (
+                "DELETE FROM kv WHERE key = 'b'",
+                "SELECT key, val FROM kv ORDER BY key",
+            ),
             // Re-insert after delete
-            ("INSERT INTO kv VALUES ('b', 99)", "SELECT key, val FROM kv ORDER BY key"),
+            (
+                "INSERT INTO kv VALUES ('b', 99)",
+                "SELECT key, val FROM kv ORDER BY key",
+            ),
         ];
 
         let mut mismatches = Vec::new();
@@ -50056,10 +50023,7 @@ mod pager_routing_tests {
             for m in &mismatches {
                 eprintln!("{m}\n");
             }
-            panic!(
-                "{} conflict resolution mismatches found",
-                mismatches.len()
-            );
+            panic!("{} conflict resolution mismatches found", mismatches.len());
         }
     }
 
@@ -50107,10 +50071,7 @@ mod pager_routing_tests {
             for m in &mismatches {
                 eprintln!("{m}\n");
             }
-            panic!(
-                "{} subquery position mismatches found",
-                mismatches.len()
-            );
+            panic!("{} subquery position mismatches found", mismatches.len());
         }
     }
 
@@ -50211,10 +50172,7 @@ mod pager_routing_tests {
             for m in &mismatches {
                 eprintln!("{m}\n");
             }
-            panic!(
-                "{} null semantics mismatches found",
-                mismatches.len()
-            );
+            panic!("{} null semantics mismatches found", mismatches.len());
         }
     }
 
@@ -50266,10 +50224,7 @@ mod pager_routing_tests {
             for m in &mismatches {
                 eprintln!("{m}\n");
             }
-            panic!(
-                "{} complex where mismatches found",
-                mismatches.len()
-            );
+            panic!("{} complex where mismatches found", mismatches.len());
         }
     }
 
@@ -50296,11 +50251,20 @@ mod pager_routing_tests {
 
         let operations: Vec<(&str, &str)> = vec![
             // UPDATE with arithmetic
-            ("UPDATE accounts SET balance = balance * 1.1 WHERE id = 1", "SELECT id, balance FROM accounts ORDER BY id"),
+            (
+                "UPDATE accounts SET balance = balance * 1.1 WHERE id = 1",
+                "SELECT id, balance FROM accounts ORDER BY id",
+            ),
             // UPDATE with CASE
-            ("UPDATE accounts SET balance = CASE WHEN balance > 200 THEN balance - 50 ELSE balance + 10 END", "SELECT id, balance FROM accounts ORDER BY id"),
+            (
+                "UPDATE accounts SET balance = CASE WHEN balance > 200 THEN balance - 50 ELSE balance + 10 END",
+                "SELECT id, balance FROM accounts ORDER BY id",
+            ),
             // UPDATE with subquery in WHERE
-            ("UPDATE accounts SET balance = 0 WHERE id IN (SELECT account_id FROM adjustments WHERE amount < 0)", "SELECT id, balance FROM accounts ORDER BY id"),
+            (
+                "UPDATE accounts SET balance = 0 WHERE id IN (SELECT account_id FROM adjustments WHERE amount < 0)",
+                "SELECT id, balance FROM accounts ORDER BY id",
+            ),
         ];
 
         let mut mismatches = Vec::new();
@@ -50314,10 +50278,7 @@ mod pager_routing_tests {
             for m in &mismatches {
                 eprintln!("{m}\n");
             }
-            panic!(
-                "{} update pattern mismatches found",
-                mismatches.len()
-            );
+            panic!("{} update pattern mismatches found", mismatches.len());
         }
     }
 
@@ -50342,9 +50303,15 @@ mod pager_routing_tests {
 
         let operations: Vec<(&str, &str)> = vec![
             // DELETE with complex WHERE
-            ("DELETE FROM logs WHERE msg = 'process' AND ts < 300", "SELECT id, msg FROM logs ORDER BY id"),
+            (
+                "DELETE FROM logs WHERE msg = 'process' AND ts < 300",
+                "SELECT id, msg FROM logs ORDER BY id",
+            ),
             // DELETE with subquery
-            ("DELETE FROM logs WHERE ts < (SELECT MAX(ts) FROM logs) AND msg != 'error'", "SELECT id, msg FROM logs ORDER BY id"),
+            (
+                "DELETE FROM logs WHERE ts < (SELECT MAX(ts) FROM logs) AND msg != 'error'",
+                "SELECT id, msg FROM logs ORDER BY id",
+            ),
             // DELETE all remaining
             ("DELETE FROM logs", "SELECT COUNT(*) FROM logs"),
         ];
@@ -50360,17 +50327,12 @@ mod pager_routing_tests {
             for m in &mismatches {
                 eprintln!("{m}\n");
             }
-            panic!(
-                "{} delete pattern mismatches found",
-                mismatches.len()
-            );
+            panic!("{} delete pattern mismatches found", mismatches.len());
         }
     }
 
     /// Probe CHECK constraint enforcement.
-    /// NOTE: CHECK constraints are parsed and stored but not yet enforced at INSERT/UPDATE time.
     #[test]
-    #[ignore = "CHECK constraint enforcement not yet implemented"]
     fn test_conformance_check_constraints() {
         let fconn = Connection::open(":memory:").unwrap();
         let rconn = rusqlite::Connection::open_in_memory().unwrap();
@@ -50407,7 +50369,9 @@ mod pager_routing_tests {
         );
 
         if !mismatches.is_empty() {
-            for m in &mismatches { eprintln!("{m}\n"); }
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
             panic!("{} check constraint mismatches", mismatches.len());
         }
     }
@@ -50449,7 +50413,9 @@ mod pager_routing_tests {
 
         let mismatches = oracle_compare(&fconn, &rconn, &queries);
         if !mismatches.is_empty() {
-            for m in &mismatches { eprintln!("{m}\n"); }
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
             panic!("{} null ordering mismatches", mismatches.len());
         }
     }
@@ -50474,7 +50440,9 @@ mod pager_routing_tests {
 
         let mismatches = oracle_compare(&fconn, &rconn, &queries);
         if !mismatches.is_empty() {
-            for m in &mismatches { eprintln!("{m}\n"); }
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
             panic!("{} hex/zeroblob mismatches", mismatches.len());
         }
     }
@@ -50512,7 +50480,9 @@ mod pager_routing_tests {
 
         let mismatches = oracle_compare(&fconn, &rconn, &queries);
         if !mismatches.is_empty() {
-            for m in &mismatches { eprintln!("{m}\n"); }
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
             panic!("{} subquery-in-case mismatches", mismatches.len());
         }
     }
@@ -50552,7 +50522,9 @@ mod pager_routing_tests {
 
         let mismatches = oracle_compare(&fconn, &rconn, &queries);
         if !mismatches.is_empty() {
-            for m in &mismatches { eprintln!("{m}\n"); }
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
             panic!("{} default values mismatches", mismatches.len());
         }
     }
@@ -50593,7 +50565,9 @@ mod pager_routing_tests {
 
         let mismatches = oracle_compare(&fconn, &rconn, &queries);
         if !mismatches.is_empty() {
-            for m in &mismatches { eprintln!("{m}\n"); }
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
             panic!("{} composite PK mismatches", mismatches.len());
         }
     }
@@ -50625,7 +50599,9 @@ mod pager_routing_tests {
 
         let mismatches = oracle_compare(&fconn, &rconn, &queries);
         if !mismatches.is_empty() {
-            for m in &mismatches { eprintln!("{m}\n"); }
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
             panic!("{} math function mismatches", mismatches.len());
         }
     }
@@ -50663,7 +50639,9 @@ mod pager_routing_tests {
 
         let mismatches = oracle_compare(&fconn, &rconn, &queries);
         if !mismatches.is_empty() {
-            for m in &mismatches { eprintln!("{m}\n"); }
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
             panic!("{} distinct+order mismatches", mismatches.len());
         }
     }
@@ -50694,7 +50672,9 @@ mod pager_routing_tests {
 
         let mismatches = oracle_compare(&fconn, &rconn, &queries);
         if !mismatches.is_empty() {
-            for m in &mismatches { eprintln!("{m}\n"); }
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
             panic!("{} compound type mixing mismatches", mismatches.len());
         }
     }
@@ -50733,8 +50713,242 @@ mod pager_routing_tests {
 
         let mismatches = oracle_compare(&fconn, &rconn, &queries);
         if !mismatches.is_empty() {
-            for m in &mismatches { eprintln!("{m}\n"); }
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
             panic!("{} glob mismatches", mismatches.len());
+        }
+    }
+
+    /// Complex UPDATE SET with expressions, subqueries, and CASE.
+    #[test]
+    fn test_conformance_update_complex_set() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE accounts (id INTEGER PRIMARY KEY, name TEXT, balance REAL, tier TEXT);",
+            "INSERT INTO accounts VALUES (1, 'Alice', 1000.0, 'bronze');",
+            "INSERT INTO accounts VALUES (2, 'Bob', 5000.0, 'bronze');",
+            "INSERT INTO accounts VALUES (3, 'Carol', 15000.0, 'bronze');",
+            "INSERT INTO accounts VALUES (4, 'Dave', 500.0, 'bronze');",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        // UPDATE with CASE expression
+        let u1 = "UPDATE accounts SET tier = CASE WHEN balance >= 10000 THEN 'gold' WHEN balance >= 3000 THEN 'silver' ELSE 'bronze' END";
+        fconn.execute(u1).unwrap();
+        rconn.execute_batch(u1).unwrap();
+
+        let q1 = ["SELECT name, tier FROM accounts ORDER BY name"];
+        let m1 = oracle_compare(&fconn, &rconn, &q1);
+
+        // UPDATE with arithmetic expression
+        let u2 = "UPDATE accounts SET balance = balance * 1.05 WHERE tier = 'gold'";
+        fconn.execute(u2).unwrap();
+        rconn.execute_batch(u2).unwrap();
+
+        let q2 = ["SELECT name, balance FROM accounts ORDER BY name"];
+        let m2 = oracle_compare(&fconn, &rconn, &q2);
+
+        // UPDATE with subquery in WHERE
+        let u3 = "UPDATE accounts SET balance = balance + 100 WHERE balance < (SELECT AVG(balance) FROM accounts)";
+        fconn.execute(u3).unwrap();
+        rconn.execute_batch(u3).unwrap();
+
+        let q3 = ["SELECT name, balance FROM accounts ORDER BY name"];
+        let m3 = oracle_compare(&fconn, &rconn, &q3);
+
+        let mut all = Vec::new();
+        all.extend(m1);
+        all.extend(m2);
+        all.extend(m3);
+        if !all.is_empty() {
+            for m in &all {
+                eprintln!("{m}\n");
+            }
+            panic!("{} UPDATE complex SET mismatches", all.len());
+        }
+    }
+
+    /// Multi-way JOIN with NULL columns, LEFT/INNER mix.
+    #[test]
+    fn test_conformance_multi_join_nulls() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT);",
+            "CREATE TABLE orders (id INTEGER PRIMARY KEY, cust_id INTEGER, product TEXT);",
+            "CREATE TABLE reviews (id INTEGER PRIMARY KEY, order_id INTEGER, rating INTEGER);",
+            "INSERT INTO customers VALUES (1, 'Alice');",
+            "INSERT INTO customers VALUES (2, 'Bob');",
+            "INSERT INTO customers VALUES (3, 'Carol');",
+            "INSERT INTO orders VALUES (10, 1, 'laptop');",
+            "INSERT INTO orders VALUES (11, 1, 'mouse');",
+            "INSERT INTO orders VALUES (12, 2, 'keyboard');",
+            "INSERT INTO reviews VALUES (100, 10, 5);",
+            "INSERT INTO reviews VALUES (101, 12, 3);",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            // LEFT JOIN with unmatched rows
+            "SELECT c.name, o.product FROM customers c LEFT JOIN orders o ON o.cust_id = c.id ORDER BY c.name, o.product",
+            // Double LEFT JOIN
+            "SELECT c.name, o.product, r.rating FROM customers c LEFT JOIN orders o ON o.cust_id = c.id LEFT JOIN reviews r ON r.order_id = o.id ORDER BY c.name, o.product",
+            // COUNT with LEFT JOIN (NULL rows counted differently)
+            "SELECT c.name, COUNT(o.id), COUNT(r.id) FROM customers c LEFT JOIN orders o ON o.cust_id = c.id LEFT JOIN reviews r ON r.order_id = o.id GROUP BY c.name ORDER BY c.name",
+            // COALESCE to handle NULLs from JOINs
+            "SELECT c.name, COALESCE(o.product, 'no order'), COALESCE(r.rating, 0) FROM customers c LEFT JOIN orders o ON o.cust_id = c.id LEFT JOIN reviews r ON r.order_id = o.id ORDER BY c.name, o.product",
+            // INNER JOIN excludes NULLs
+            "SELECT c.name, o.product, r.rating FROM customers c INNER JOIN orders o ON o.cust_id = c.id INNER JOIN reviews r ON r.order_id = o.id ORDER BY c.name",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!("{} multi-join NULL mismatches", mismatches.len());
+        }
+    }
+
+    /// String functions: instr, replace, hex, quote, zeroblob, unicode, char.
+    #[test]
+    fn test_conformance_string_funcs_extended() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let queries = [
+            "SELECT instr('hello world', 'world')",
+            "SELECT instr('hello world', 'xyz')",
+            "SELECT instr('abcabc', 'bc')",
+            "SELECT replace('hello world', 'world', 'rust')",
+            "SELECT replace('aaa', 'a', 'bb')",
+            "SELECT replace('hello', 'xyz', 'abc')",
+            "SELECT hex(42)",
+            "SELECT hex('hello')",
+            "SELECT hex(NULL)",
+            "SELECT quote(42), quote(3.14), quote('hello'), quote(NULL)",
+            "SELECT unicode('A'), unicode('a'), unicode(' ')",
+            "SELECT char(65), char(97), char(32)",
+            "SELECT char(72, 101, 108, 108, 111)",
+            "SELECT zeroblob(4)",
+            "SELECT typeof(zeroblob(4))",
+            "SELECT length(zeroblob(10))",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!("{} string function mismatches", mismatches.len());
+        }
+    }
+
+    /// Complex WHERE clauses: nested AND/OR, BETWEEN, IN with subquery.
+    #[test]
+    fn test_conformance_complex_where_nested() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT, category TEXT, price REAL, stock INTEGER);",
+            "INSERT INTO products VALUES (1, 'Widget A', 'widgets', 9.99, 100);",
+            "INSERT INTO products VALUES (2, 'Widget B', 'widgets', 14.99, 0);",
+            "INSERT INTO products VALUES (3, 'Gadget X', 'gadgets', 29.99, 50);",
+            "INSERT INTO products VALUES (4, 'Gadget Y', 'gadgets', 49.99, 25);",
+            "INSERT INTO products VALUES (5, 'Thing Z', 'things', 4.99, 200);",
+            "INSERT INTO products VALUES (6, 'Thing W', 'things', NULL, 10);",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            // Complex AND/OR
+            "SELECT name FROM products WHERE (category = 'widgets' AND price < 12) OR (category = 'gadgets' AND stock > 30) ORDER BY name",
+            // BETWEEN
+            "SELECT name FROM products WHERE price BETWEEN 10 AND 40 ORDER BY name",
+            // NOT BETWEEN
+            "SELECT name FROM products WHERE price NOT BETWEEN 10 AND 40 ORDER BY name",
+            // IN list
+            "SELECT name FROM products WHERE category IN ('widgets', 'things') ORDER BY name",
+            // NOT IN
+            "SELECT name FROM products WHERE category NOT IN ('widgets') AND price IS NOT NULL ORDER BY name",
+            // IN subquery
+            "SELECT name FROM products WHERE category IN (SELECT DISTINCT category FROM products WHERE stock > 50) ORDER BY name",
+            // NULL in comparisons
+            "SELECT name FROM products WHERE price > 10 ORDER BY name",
+            "SELECT name FROM products WHERE price IS NULL ORDER BY name",
+            "SELECT name FROM products WHERE price IS NOT NULL ORDER BY name",
+            // Nested subquery in WHERE
+            "SELECT name FROM products WHERE price = (SELECT MAX(price) FROM products WHERE category = products.category) ORDER BY name",
+            // Complex expression
+            "SELECT name FROM products WHERE (price * stock) > 1000 ORDER BY name",
+            "SELECT name, COALESCE(price, 0) * stock AS value FROM products ORDER BY name",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!("{} complex WHERE mismatches", mismatches.len());
+        }
+    }
+
+    /// ORDER BY edge cases: expressions, multiple columns, NULLs.
+    #[test]
+    fn test_conformance_order_by_edge_cases() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b TEXT, c REAL);",
+            "INSERT INTO t VALUES (1, 3, 'banana', 2.5);",
+            "INSERT INTO t VALUES (2, 1, 'cherry', 1.0);",
+            "INSERT INTO t VALUES (3, 3, 'apple', NULL);",
+            "INSERT INTO t VALUES (4, NULL, 'date', 3.0);",
+            "INSERT INTO t VALUES (5, 2, NULL, 2.5);",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            // ORDER BY expression
+            "SELECT id, a * 2 AS doubled FROM t WHERE a IS NOT NULL ORDER BY a * 2, id",
+            // ORDER BY multiple columns with mixed directions
+            "SELECT id, a, b FROM t WHERE a IS NOT NULL ORDER BY a DESC, b ASC",
+            // NULLs sort first in ASC (SQLite behavior)
+            "SELECT id, a FROM t ORDER BY a, id",
+            "SELECT id, a FROM t ORDER BY a DESC, id",
+            // ORDER BY column number
+            "SELECT id, a, b FROM t ORDER BY 2, 3, 1",
+            // ORDER BY alias
+            "SELECT id, a + 1 AS x FROM t WHERE a IS NOT NULL ORDER BY x, id",
+            // LIMIT with ORDER BY
+            "SELECT id FROM t ORDER BY a, id LIMIT 3",
+            "SELECT id FROM t ORDER BY a DESC, id LIMIT 2 OFFSET 1",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!("{} ORDER BY edge case mismatches", mismatches.len());
         }
     }
 }
