@@ -1333,6 +1333,223 @@ fn test_window_function_parity() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════
+// ── Extended window function parity (partitioned, aggregate, edge cases) ─
+// ═════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn test_window_function_extended_parity() {
+    let fs = open_mem();
+    let rs = open_rusqlite();
+
+    for sql in &[
+        "CREATE TABLE emp (id INTEGER PRIMARY KEY, name TEXT, dept TEXT, salary INTEGER)",
+        "INSERT INTO emp VALUES (1, 'Alice', 'eng', 120)",
+        "INSERT INTO emp VALUES (2, 'Bob', 'eng', 100)",
+        "INSERT INTO emp VALUES (3, 'Carol', 'sales', 100)",
+        "INSERT INTO emp VALUES (4, 'Dave', 'sales', 80)",
+        "INSERT INTO emp VALUES (5, 'Eve', 'hr', 110)",
+        "INSERT INTO emp VALUES (6, 'Frank', 'hr', 95)",
+    ] {
+        fs.execute(sql).unwrap();
+        rs.execute(sql, []).unwrap();
+    }
+
+    let tests = [
+        // Partitioned row_number/rank/dense_rank
+        (
+            "rank_partition",
+            "SELECT name, dept, rank() OVER (PARTITION BY dept ORDER BY salary DESC) AS rnk FROM emp ORDER BY dept, rnk, name",
+        ),
+        (
+            "dense_rank_partition",
+            "SELECT name, dept, dense_rank() OVER (PARTITION BY dept ORDER BY salary DESC) AS drnk FROM emp ORDER BY dept, drnk, name",
+        ),
+        // Aggregate window functions
+        (
+            "sum_over_global",
+            "SELECT name, sum(salary) OVER () AS total FROM emp ORDER BY salary DESC, name",
+        ),
+        (
+            "sum_over_partition",
+            "SELECT name, dept, sum(salary) OVER (PARTITION BY dept) AS dept_total FROM emp ORDER BY dept, name",
+        ),
+        (
+            "count_over_partition",
+            "SELECT name, dept, count(*) OVER (PARTITION BY dept) AS dept_count FROM emp ORDER BY dept, name",
+        ),
+        (
+            "avg_over_partition",
+            "SELECT name, dept, avg(salary) OVER (PARTITION BY dept) AS dept_avg FROM emp ORDER BY dept, name",
+        ),
+        // Running aggregate with ORDER BY
+        (
+            "sum_running",
+            "SELECT name, sum(salary) OVER (ORDER BY salary DESC) AS running_sum FROM emp ORDER BY salary DESC, name",
+        ),
+        (
+            "count_running",
+            "SELECT name, count(*) OVER (ORDER BY salary DESC) AS running_count FROM emp ORDER BY salary DESC, name",
+        ),
+        // Partitioned cume_dist/percent_rank
+        (
+            "cume_dist_partition",
+            "SELECT name, dept, cume_dist() OVER (PARTITION BY dept ORDER BY salary DESC) AS cd FROM emp ORDER BY dept, salary DESC, name",
+        ),
+        (
+            "percent_rank_partition",
+            "SELECT name, dept, percent_rank() OVER (PARTITION BY dept ORDER BY salary DESC) AS pr FROM emp ORDER BY dept, salary DESC, name",
+        ),
+        // Lag with partition
+        (
+            "lag_partition",
+            "SELECT name, dept, lag(name, 1) OVER (PARTITION BY dept ORDER BY salary DESC) AS prev_emp FROM emp ORDER BY dept, salary DESC, name",
+        ),
+        // First_value with partition
+        (
+            "first_value_partition",
+            "SELECT name, dept, first_value(name) OVER (PARTITION BY dept ORDER BY salary DESC) AS top_earner FROM emp ORDER BY dept, salary DESC, name",
+        ),
+        // Min/max as window (no ORDER BY → whole partition frame)
+        (
+            "min_over_partition",
+            "SELECT name, dept, min(salary) OVER (PARTITION BY dept) AS min_sal FROM emp ORDER BY dept, name",
+        ),
+        (
+            "max_over_partition",
+            "SELECT name, dept, max(salary) OVER (PARTITION BY dept) AS max_sal FROM emp ORDER BY dept, name",
+        ),
+    ];
+
+    let mut passed = 0;
+    let mut failed = 0;
+    let mut failures = Vec::new();
+    let mut observed_failure_names = BTreeSet::new();
+
+    for (name, sql) in tests {
+        let (ok, fs_rows, rs_rows) = compare_query_rows(&fs, &rs, sql);
+        if ok {
+            passed += 1;
+        } else {
+            failed += 1;
+            observed_failure_names.insert(name);
+            failures.push(format!(
+                "  FAIL {name}: fsqlite={fs_rows:?} rusqlite={rs_rows:?} sql={sql}"
+            ));
+        }
+    }
+
+    let expected_failure_names: BTreeSet<&str> = BTreeSet::new();
+    let total = passed + failed;
+    println!("[window_extended] {passed}/{total} passed");
+    for failure in &failures {
+        println!("{failure}");
+    }
+    assert_eq!(
+        observed_failure_names, expected_failure_names,
+        "extended window parity gaps changed unexpectedly"
+    );
+    assert_eq!(failed, expected_failure_names.len());
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+// ── Window edge cases: NULLs, single rows, empty results ────────────────
+// ═════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn test_window_function_edge_cases() {
+    let fs = open_mem();
+    let rs = open_rusqlite();
+
+    for sql in &[
+        "CREATE TABLE nums (id INTEGER PRIMARY KEY, val INTEGER, grp TEXT)",
+        "INSERT INTO nums VALUES (1, NULL, 'a')",
+        "INSERT INTO nums VALUES (2, 10, 'a')",
+        "INSERT INTO nums VALUES (3, 20, 'b')",
+        "INSERT INTO nums VALUES (4, NULL, 'b')",
+        "INSERT INTO nums VALUES (5, 10, 'a')",
+    ] {
+        fs.execute(sql).unwrap();
+        rs.execute(sql, []).unwrap();
+    }
+
+    let tests = [
+        // NULL values in aggregations
+        (
+            "sum_with_nulls",
+            "SELECT id, sum(val) OVER (ORDER BY id) AS running FROM nums ORDER BY id",
+        ),
+        (
+            "count_with_nulls",
+            "SELECT id, count(val) OVER (ORDER BY id) AS cnt FROM nums ORDER BY id",
+        ),
+        (
+            "count_star_with_nulls",
+            "SELECT id, count(*) OVER (ORDER BY id) AS cnt FROM nums ORDER BY id",
+        ),
+        // Row number with NULLs in ORDER BY
+        (
+            "row_number_null_order",
+            "SELECT id, val, row_number() OVER (ORDER BY val) AS rn FROM nums ORDER BY rn",
+        ),
+        // Single-row partition
+        (
+            "single_row_partition",
+            "SELECT id, grp, row_number() OVER (PARTITION BY grp ORDER BY id) AS rn FROM nums ORDER BY grp, rn",
+        ),
+        // Peer group with NULLs
+        (
+            "rank_null_peers",
+            "SELECT id, val, rank() OVER (ORDER BY val) AS rnk FROM nums ORDER BY rnk, id",
+        ),
+        // Dense rank with ties and NULLs
+        (
+            "dense_rank_null_peers",
+            "SELECT id, val, dense_rank() OVER (ORDER BY val) AS drnk FROM nums ORDER BY drnk, id",
+        ),
+        // SUM over partition with NULLs — no ORDER BY (whole partition)
+        (
+            "sum_partition_no_order",
+            "SELECT id, grp, sum(val) OVER (PARTITION BY grp) AS total FROM nums ORDER BY grp, id",
+        ),
+        // Aggregate over empty result — no rows should be returned
+        (
+            "window_empty_result",
+            "SELECT id, sum(val) OVER () AS total FROM nums WHERE val > 100 ORDER BY id",
+        ),
+    ];
+
+    let mut passed = 0;
+    let mut failed = 0;
+    let mut failures = Vec::new();
+    let mut observed_failure_names = BTreeSet::new();
+
+    for (name, sql) in tests {
+        let (ok, fs_rows, rs_rows) = compare_query_rows(&fs, &rs, sql);
+        if ok {
+            passed += 1;
+        } else {
+            failed += 1;
+            observed_failure_names.insert(name);
+            failures.push(format!(
+                "  FAIL {name}: fsqlite={fs_rows:?} rusqlite={rs_rows:?} sql={sql}"
+            ));
+        }
+    }
+
+    let expected_failure_names: BTreeSet<&str> = BTreeSet::new();
+    let total = passed + failed;
+    println!("[window_edge_cases] {passed}/{total} passed");
+    for failure in &failures {
+        println!("{failure}");
+    }
+    assert_eq!(
+        observed_failure_names, expected_failure_names,
+        "window edge case gaps changed unexpectedly"
+    );
+    assert_eq!(failed, expected_failure_names.len());
+}
+
+// ═════════════════════════════════════════════════════════════════════════
 // ── SQLite version/compile option functions ───────────────────────────────
 // ═════════════════════════════════════════════════════════════════════════
 
