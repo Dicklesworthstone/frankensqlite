@@ -20259,11 +20259,23 @@ fn eval_scalar_fn(name: &str, args: &[SqliteValue]) -> SqliteValue {
         }
         "round" => match args.first() {
             Some(SqliteValue::Float(f)) => {
-                let digits = args
+                #[allow(clippy::cast_possible_truncation)]
+                let n = args
                     .get(1)
-                    .map_or(0, fsqlite_types::SqliteValue::to_integer);
-                let factor = 10f64.powi(digits as i32);
-                SqliteValue::Float((f * factor).round() / factor)
+                    .map_or(0, fsqlite_types::SqliteValue::to_integer)
+                    .clamp(0, 30) as usize;
+                let rounded = if n == 0 {
+                    // n==0: round half away from zero via integer truncation
+                    // (matches C SQLite's (double)(sqlite_int64)(r+0.5)).
+                    #[allow(clippy::cast_possible_truncation)]
+                    let r = (*f + if *f < 0.0 { -0.5 } else { 0.5 }) as i64;
+                    r as f64
+                } else {
+                    // n>0: use string formatting to match C SQLite's printf-based
+                    // rounding and avoid intermediate float precision errors.
+                    format!("{f:.n$}").parse::<f64>().unwrap_or(*f)
+                };
+                SqliteValue::Float(rounded)
             }
             Some(SqliteValue::Integer(n)) => SqliteValue::Float(*n as f64),
             _ => SqliteValue::Null,
@@ -43382,6 +43394,73 @@ mod pager_routing_tests {
             }
             panic!(
                 "{} compound advanced conformance mismatches found",
+                mismatches.len()
+            );
+        }
+    }
+
+    #[test]
+    fn test_conformance_aggregate_edge_cases() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE sales (id INTEGER PRIMARY KEY, product TEXT, amount REAL, region TEXT, qty INTEGER);",
+            "INSERT INTO sales VALUES (1, 'A', 10.5, 'north', 3);",
+            "INSERT INTO sales VALUES (2, 'B', 20.0, 'south', 1);",
+            "INSERT INTO sales VALUES (3, 'A', 15.5, 'south', 2);",
+            "INSERT INTO sales VALUES (4, 'C', 5.0, 'north', 10);",
+            "INSERT INTO sales VALUES (5, 'B', 8.0, 'north', 4);",
+            "INSERT INTO sales VALUES (6, 'A', 12.0, 'south', NULL);",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            // COUNT(*) vs COUNT(column) — NULL handling
+            "SELECT product, count(*), count(qty) FROM sales GROUP BY product ORDER BY product",
+            // SUM with NULL values
+            "SELECT product, sum(qty) FROM sales GROUP BY product ORDER BY product",
+            // AVG with NULL values (should exclude NULLs)
+            "SELECT product, avg(qty) FROM sales GROUP BY product ORDER BY product",
+            // TOTAL (always returns float, 0.0 for empty)
+            "SELECT product, total(amount) FROM sales GROUP BY product ORDER BY product",
+            // GROUP_CONCAT
+            "SELECT region, group_concat(product) FROM sales GROUP BY region ORDER BY region",
+            "SELECT region, group_concat(product, '; ') FROM sales GROUP BY region ORDER BY region",
+            // GROUP_CONCAT with ORDER BY on non-SELECT column
+            "SELECT product FROM sales GROUP BY product ORDER BY sum(amount) DESC",
+            // Multiple aggregates with arithmetic
+            "SELECT product, sum(amount) * count(*) AS weighted FROM sales GROUP BY product ORDER BY product",
+            // HAVING with complex expression
+            "SELECT region, sum(amount) AS total FROM sales GROUP BY region HAVING sum(amount) > 30 ORDER BY region",
+            // Aggregate over arithmetic expression
+            "SELECT product, sum(amount * qty) AS revenue FROM sales WHERE qty IS NOT NULL GROUP BY product ORDER BY product",
+            // MIN/MAX with text
+            "SELECT min(product), max(product) FROM sales",
+            // COUNT DISTINCT
+            "SELECT count(DISTINCT product), count(DISTINCT region) FROM sales",
+            // Nested expression in GROUP BY
+            "SELECT CASE WHEN amount > 10 THEN 'high' ELSE 'low' END AS tier, count(*) FROM sales GROUP BY CASE WHEN amount > 10 THEN 'high' ELSE 'low' END ORDER BY tier",
+            // Empty group aggregate
+            "SELECT count(*), sum(amount), avg(amount), min(amount), max(amount) FROM sales WHERE id > 100",
+            // Aggregate with COALESCE
+            "SELECT product, sum(COALESCE(qty, 0)) AS total_qty FROM sales GROUP BY product ORDER BY product",
+            // GROUP BY with LIMIT
+            "SELECT product, sum(amount) AS total FROM sales GROUP BY product ORDER BY total DESC LIMIT 2",
+            // GROUP BY with OFFSET
+            "SELECT product, sum(amount) AS total FROM sales GROUP BY product ORDER BY total DESC LIMIT 2 OFFSET 1",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!(
+                "{} aggregate edge case conformance mismatches found",
                 mismatches.len()
             );
         }
