@@ -9,6 +9,7 @@ pub mod obligation;
 pub mod opcode;
 pub mod record;
 pub mod serial_type;
+pub mod sync_primitives;
 pub mod value;
 
 pub use cx::Cx;

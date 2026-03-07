@@ -21,6 +21,9 @@ smallvec = { workspace = true }
 serde = { workspace = true }
 xxhash-rust = { workspace = true }
 
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+parking_lot = { workspace = true }
+
 [dev-dependencies]
 proptest = { workspace = true }
 serde_json = { workspace = true }
