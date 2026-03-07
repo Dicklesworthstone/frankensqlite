@@ -420,7 +420,7 @@ where
         return false;
     }
 
-    let open_flags = VfsOpenFlags::READWRITE | VfsOpenFlags::WAL;
+    let open_flags = VfsOpenFlags::WAL;
     let Ok((mut file, _)) = vfs.open(cx, Some(wal_path), open_flags) else {
         return false;
     };
@@ -5799,7 +5799,6 @@ impl Connection {
     /// rowid order and expects table entries to appear before their index
     /// entries.  A delete-then-reinsert would assign a new (higher) rowid,
     /// corrupting the schema when the table already has indexes.
-    #[allow(dead_code)]
     fn update_sqlite_master_sql(&self, name: &str, new_sql: &str) -> Result<()> {
         self.with_pager_write_txn(|cx, txn| {
             let usable_size = PageSize::DEFAULT.get();
@@ -20726,15 +20725,18 @@ mod tests {
     };
     use fsqlite_ast::Statement;
     use fsqlite_error::FrankenError;
+    use fsqlite_types::LockLevel;
     use fsqlite_types::cx::Cx;
-    use fsqlite_types::flags::VfsOpenFlags;
+    use fsqlite_types::flags::{AccessFlags, SyncFlags, VfsOpenFlags};
     use fsqlite_types::opcode::{Opcode, P4};
     use fsqlite_types::value::SqliteValue;
     use fsqlite_types::{PageNumber, PageSize};
     use fsqlite_vdbe::ProgramBuilder;
     use fsqlite_vfs::MemoryVfs;
+    use fsqlite_vfs::ShmRegion;
     use fsqlite_vfs::traits::{Vfs, VfsFile};
     use std::collections::HashSet;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
     impl Connection {
@@ -28798,6 +28800,172 @@ mod tests {
         full_file.write(&cx, &[0_u8; 32], 0).unwrap();
         full_file.close(&cx).unwrap();
         assert!(wal_file_present_with_vfs(&vfs, &cx, &wal_path));
+    }
+
+    #[derive(Debug, Default, Clone, Copy)]
+    struct ReadOnlyWalProbeVfs;
+
+    #[derive(Debug)]
+    struct ReadOnlyWalProbeFile {
+        size: u64,
+    }
+
+    impl Vfs for ReadOnlyWalProbeVfs {
+        type File = ReadOnlyWalProbeFile;
+
+        fn name(&self) -> &'static str {
+            "read_only_wal_probe"
+        }
+
+        fn open(
+            &self,
+            _cx: &Cx,
+            path: Option<&Path>,
+            flags: VfsOpenFlags,
+        ) -> std::result::Result<(Self::File, VfsOpenFlags), FrankenError> {
+            let resolved = path.unwrap_or_else(|| Path::new("/probe.db-wal"));
+            if flags.contains(VfsOpenFlags::READWRITE) {
+                return Err(FrankenError::CannotOpen {
+                    path: resolved.to_path_buf(),
+                });
+            }
+            Ok((ReadOnlyWalProbeFile { size: 32 }, flags))
+        }
+
+        fn delete(
+            &self,
+            _cx: &Cx,
+            _path: &Path,
+            _sync_dir: bool,
+        ) -> std::result::Result<(), FrankenError> {
+            Err(FrankenError::internal(
+                "delete is unused in read-only WAL probe test",
+            ))
+        }
+
+        fn access(
+            &self,
+            _cx: &Cx,
+            path: &Path,
+            flags: AccessFlags,
+        ) -> std::result::Result<bool, FrankenError> {
+            let exists = path == Path::new("/probe.db-wal");
+            if flags == AccessFlags::READWRITE {
+                return Ok(false);
+            }
+            if flags == AccessFlags::READ {
+                return Ok(exists);
+            }
+            Ok(exists)
+        }
+
+        fn full_pathname(
+            &self,
+            _cx: &Cx,
+            path: &Path,
+        ) -> std::result::Result<PathBuf, FrankenError> {
+            Ok(path.to_path_buf())
+        }
+    }
+
+    impl VfsFile for ReadOnlyWalProbeFile {
+        fn close(&mut self, _cx: &Cx) -> std::result::Result<(), FrankenError> {
+            Ok(())
+        }
+
+        fn read(
+            &mut self,
+            _cx: &Cx,
+            buf: &mut [u8],
+            offset: u64,
+        ) -> std::result::Result<usize, FrankenError> {
+            buf.fill(0);
+            if offset >= self.size {
+                return Ok(0);
+            }
+            let remaining = self.size.saturating_sub(offset);
+            let bytes = usize::try_from(remaining)
+                .unwrap_or(usize::MAX)
+                .min(buf.len());
+            Ok(bytes)
+        }
+
+        fn write(
+            &mut self,
+            _cx: &Cx,
+            _buf: &[u8],
+            _offset: u64,
+        ) -> std::result::Result<(), FrankenError> {
+            Err(FrankenError::internal(
+                "write is unused in read-only WAL probe test",
+            ))
+        }
+
+        fn truncate(&mut self, _cx: &Cx, _size: u64) -> std::result::Result<(), FrankenError> {
+            Err(FrankenError::internal(
+                "truncate is unused in read-only WAL probe test",
+            ))
+        }
+
+        fn sync(&mut self, _cx: &Cx, _flags: SyncFlags) -> std::result::Result<(), FrankenError> {
+            Ok(())
+        }
+
+        fn file_size(&self, _cx: &Cx) -> std::result::Result<u64, FrankenError> {
+            Ok(self.size)
+        }
+
+        fn lock(&mut self, _cx: &Cx, _level: LockLevel) -> std::result::Result<(), FrankenError> {
+            Ok(())
+        }
+
+        fn unlock(&mut self, _cx: &Cx, _level: LockLevel) -> std::result::Result<(), FrankenError> {
+            Ok(())
+        }
+
+        fn check_reserved_lock(&self, _cx: &Cx) -> std::result::Result<bool, FrankenError> {
+            Ok(false)
+        }
+
+        fn shm_map(
+            &mut self,
+            _cx: &Cx,
+            _region: u32,
+            _size: u32,
+            _extend: bool,
+        ) -> std::result::Result<ShmRegion, FrankenError> {
+            Err(FrankenError::internal(
+                "shm_map is unused in read-only WAL probe test",
+            ))
+        }
+
+        fn shm_lock(
+            &mut self,
+            _cx: &Cx,
+            _offset: u32,
+            _n: u32,
+            _flags: u32,
+        ) -> std::result::Result<(), FrankenError> {
+            Ok(())
+        }
+
+        fn shm_barrier(&self) {}
+
+        fn shm_unmap(&mut self, _cx: &Cx, _delete: bool) -> std::result::Result<(), FrankenError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_wal_file_present_with_vfs_accepts_read_only_probe_open() {
+        let cx = Cx::new();
+        let vfs = ReadOnlyWalProbeVfs;
+        let wal_path = wal_path_for_db_path("/probe.db");
+
+        assert!(
+            wal_file_present_with_vfs(&vfs, &cx, &wal_path),
+            "WAL presence probe should not require read-write open access"
+        );
     }
 
     #[test]
