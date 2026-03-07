@@ -692,17 +692,61 @@ impl ScalarFunction for RoundFunc {
         if !(-4_503_599_627_370_496.0..=4_503_599_627_370_496.0).contains(&x) {
             return Ok(SqliteValue::Float(x));
         }
-        let rounded = if n == 0 {
-            // n==0: round half away from zero via integer truncation.
-            #[allow(clippy::cast_possible_truncation)]
-            let r = (x + if x < 0.0 { -0.5 } else { 0.5 }) as i64;
-            r as f64
-        } else {
-            // n>0: use string formatting (matching C SQLite's printf-based
-            // approach) to avoid intermediate float precision errors.
-            #[allow(clippy::cast_possible_truncation)]
-            let s = format!("{x:.prec$}", prec = n as usize);
-            s.parse::<f64>().unwrap_or(x)
+        // SQLite uses "round half away from zero" via its custom printf.
+        // Rust's format! uses "round half to even" (IEEE 754 default).
+        // They agree on all cases except exact ties (digit at n+1 is
+        // precisely 5 with no further non-zero digits). For ties, we
+        // detect and adjust to match SQLite.
+        #[allow(clippy::cast_possible_truncation)]
+        let rounded = {
+            let prec = (n as usize) + 15;
+            let full = format!("{x:.prec$}");
+            let dot = full.find('.').unwrap_or(full.len());
+            let rd_idx = dot + 1 + n as usize;
+            if rd_idx >= full.len() {
+                format!("{x:.prec$}", prec = n as usize)
+                    .parse::<f64>()
+                    .unwrap_or(x)
+            } else {
+                let rd = full.as_bytes()[rd_idx] - b'0';
+                if rd != 5 || !full[rd_idx + 1..].bytes().all(|b| b == b'0') {
+                    // Not an exact tie — format!'s default rounding is correct
+                    format!("{x:.prec$}", prec = n as usize)
+                        .parse::<f64>()
+                        .unwrap_or(x)
+                } else {
+                    // Exact tie — round half away from zero by incrementing
+                    // the truncated string's last digit.
+                    let mut trunc = full[..rd_idx].as_bytes().to_vec();
+                    // Strip trailing '.' for n==0
+                    if trunc.last() == Some(&b'.') {
+                        trunc.pop();
+                    }
+                    let start = usize::from(trunc.first() == Some(&b'-'));
+                    let mut carry = true;
+                    for b in trunc[start..].iter_mut().rev() {
+                        if *b == b'.' {
+                            continue;
+                        }
+                        if carry {
+                            if *b == b'9' {
+                                *b = b'0';
+                            } else {
+                                *b += 1;
+                                carry = false;
+                                break;
+                            }
+                        }
+                    }
+                    if carry {
+                        trunc.insert(start, b'1');
+                    }
+                    String::from_utf8(trunc)
+                        .ok()
+                        .and_then(|s| s.parse::<f64>().ok())
+                        .unwrap_or(x)
+                }
+            }
         };
         Ok(SqliteValue::Float(rounded))
     }

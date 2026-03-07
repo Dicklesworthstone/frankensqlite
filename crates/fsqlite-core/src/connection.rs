@@ -23332,9 +23332,7 @@ fn eval_scalar_fn(name: &str, args: &[SqliteValue]) -> SqliteValue {
                         format!("{f:.n$}").parse::<f64>().unwrap_or(*f)
                     } else {
                         let rd = full.as_bytes()[rd_idx] - b'0';
-                        if rd != 5
-                            || !full[rd_idx + 1..].bytes().all(|b| b == b'0')
-                        {
+                        if rd != 5 || !full[rd_idx + 1..].bytes().all(|b| b == b'0') {
                             format!("{f:.n$}").parse::<f64>().unwrap_or(*f)
                         } else {
                             let mut trunc = full[..rd_idx].as_bytes().to_vec();
@@ -23344,7 +23342,9 @@ fn eval_scalar_fn(name: &str, args: &[SqliteValue]) -> SqliteValue {
                             let start = usize::from(trunc.first() == Some(&b'-'));
                             let mut carry = true;
                             for b in trunc[start..].iter_mut().rev() {
-                                if *b == b'.' { continue; }
+                                if *b == b'.' {
+                                    continue;
+                                }
                                 if carry {
                                     if *b == b'9' {
                                         *b = b'0';
