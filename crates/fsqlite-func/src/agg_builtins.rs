@@ -29,14 +29,18 @@ use crate::{AggregateFunction, FunctionRegistry};
 
 // ─── Kahan compensated summation ──────────────────────────────────────────
 
-/// Kahan compensated summation step.  Maintains a running compensation term
-/// that captures the low-order bits lost during each addition, matching the
-/// precision behavior of C SQLite's aggregate accumulator.
+/// Kahan-Babuska-Neumaier compensated summation step.  Uses magnitude-aware
+/// error term selection to match the precision behavior of C SQLite's
+/// `kahanBabuskaNeumaierStep` (func.c:1871-1883).
 #[inline]
 fn kahan_add(sum: &mut f64, compensation: &mut f64, value: f64) {
-    let y = value - *compensation;
-    let t = *sum + y;
-    *compensation = (t - *sum) - y;
+    let s = *sum;
+    let t = s + value;
+    if s.abs() > value.abs() {
+        *compensation += (s - t) + value;
+    } else {
+        *compensation += (value - t) + s;
+    }
     *sum = t;
 }
 
@@ -75,7 +79,9 @@ impl AggregateFunction for AvgFunc {
         if state.count == 0 {
             Ok(SqliteValue::Null)
         } else {
-            Ok(SqliteValue::Float(state.sum / state.count as f64))
+            Ok(SqliteValue::Float(
+                (state.sum + state.compensation) / state.count as f64,
+            ))
         }
     }
 
@@ -365,7 +371,9 @@ impl AggregateFunction for SumFunc {
         if state.all_integer {
             Ok(SqliteValue::Integer(state.int_sum))
         } else {
-            Ok(SqliteValue::Float(state.float_sum))
+            Ok(SqliteValue::Float(
+                state.float_sum + state.float_compensation,
+            ))
         }
     }
 
@@ -408,7 +416,7 @@ impl AggregateFunction for TotalFunc {
     }
 
     fn finalize(&self, state: Self::State) -> Result<SqliteValue> {
-        Ok(SqliteValue::Float(state.sum))
+        Ok(SqliteValue::Float(state.sum + state.compensation))
     }
 
     fn num_args(&self) -> i32 {
