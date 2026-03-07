@@ -6,7 +6,7 @@
 
 use std::cell::RefCell;
 
-use crate::ProgramBuilder;
+use crate::{Label, ProgramBuilder};
 use fsqlite_ast::{
     AssignmentTarget, ColumnRef, ConflictAction, DeleteStatement, Distinctness, Expr, FromClause,
     FunctionArgs, InsertSource, InsertStatement, LimitClause, Literal, OrderingTerm,
@@ -4770,8 +4770,8 @@ pub fn codegen_insert(
 
             let rec_reg = b.alloc_reg();
             emit_strict_type_check(b, table, col_regs);
-            emit_check_constraints(b, table, col_regs);
-            emit_not_null_constraints(b, table, col_regs);
+            emit_check_constraints(b, table, col_regs, None);
+            emit_not_null_constraints(b, table, col_regs, None);
             // Apply column type affinities before packing the record.
             let aff_str = table.affinity_string();
             b.emit_op(
@@ -4963,8 +4963,13 @@ fn codegen_insert_values(
         emit_strict_type_check(b, table, val_regs);
 
         // CHECK constraint validation.
-        emit_check_constraints(b, table, val_regs);
-        emit_not_null_constraints(b, table, val_regs);
+        let ignore_skip = if oe_flag == OE_IGNORE {
+            Some(b.emit_label())
+        } else {
+            None
+        };
+        emit_check_constraints(b, table, val_regs, ignore_skip);
+        emit_not_null_constraints(b, table, val_regs, ignore_skip);
 
         // Apply column type affinities before packing the record.
         let aff_str = table.affinity_string();
@@ -5291,6 +5296,11 @@ fn codegen_insert_values(
                 emit_returning(b, cursor, table, returning, rowid_reg)?;
             }
         }
+
+        // Resolve OR IGNORE skip label after all insert logic for this row.
+        if let Some(skip) = ignore_skip {
+            b.resolve_label(skip);
+        }
     }
 
     Ok(())
@@ -5496,8 +5506,13 @@ fn codegen_insert_select(
     // Apply column type affinities before packing the record.
     // STRICT type check before affinity.
     emit_strict_type_check(b, target_table, final_regs);
-    emit_check_constraints(b, target_table, final_regs);
-    emit_not_null_constraints(b, target_table, final_regs);
+    let ignore_target = if oe_flag == OE_IGNORE {
+        Some(skip_label)
+    } else {
+        None
+    };
+    emit_check_constraints(b, target_table, final_regs, ignore_target);
+    emit_not_null_constraints(b, target_table, final_regs, ignore_target);
 
     let aff_str = target_table.affinity_string();
     b.emit_op(
@@ -5640,10 +5655,16 @@ fn codegen_insert_select_without_from(
     // Evaluate STORED generated columns before packing the record.
     emit_stored_generated_columns(b, target_table, val_regs);
 
+    let ignore_target = if oe_flag == OE_IGNORE {
+        Some(done_label)
+    } else {
+        None
+    };
+
     // STRICT type check before affinity.
     emit_strict_type_check(b, target_table, val_regs);
-    emit_check_constraints(b, target_table, val_regs);
-    emit_not_null_constraints(b, target_table, val_regs);
+    emit_check_constraints(b, target_table, val_regs, ignore_target);
+    emit_not_null_constraints(b, target_table, val_regs, ignore_target);
 
     // Apply column type affinities before packing the record.
     let aff_str = target_table.affinity_string();
@@ -5908,8 +5929,8 @@ pub fn codegen_update(
 
     // MakeRecord with ALL columns.
     emit_strict_type_check(b, table, col_regs);
-    emit_check_constraints(b, table, col_regs);
-    emit_not_null_constraints(b, table, col_regs);
+    emit_check_constraints(b, table, col_regs, None);
+    emit_not_null_constraints(b, table, col_regs, None);
     // Apply column type affinities before packing the record.
     let aff_str = table.affinity_string();
     let rec_reg = b.alloc_reg();
@@ -6249,8 +6270,8 @@ fn codegen_update_from(
 
     // MakeRecord with ALL columns.
     emit_strict_type_check(b, target, col_regs);
-    emit_check_constraints(b, target, col_regs);
-    emit_not_null_constraints(b, target, col_regs);
+    emit_check_constraints(b, target, col_regs, None);
+    emit_not_null_constraints(b, target, col_regs, None);
     let aff_str = target.affinity_string();
     let rec_reg = b.alloc_reg();
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
@@ -6584,8 +6605,16 @@ fn emit_stored_generated_columns(b: &mut ProgramBuilder, table: &TableSchema, va
 /// with SQLITE_CONSTRAINT (19) if any constraint evaluates to false (0).
 /// NULL results are treated as passing (SQLite semantics: CHECK passes
 /// unless the expression is explicitly false).
+///
+/// When `ignore_label` is `Some`, CHECK failures jump there instead of
+/// halting (used for INSERT OR IGNORE to silently skip violating rows).
 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-fn emit_check_constraints(b: &mut ProgramBuilder, table: &TableSchema, val_regs: i32) {
+fn emit_check_constraints(
+    b: &mut ProgramBuilder,
+    table: &TableSchema,
+    val_regs: i32,
+    ignore_label: Option<Label>,
+) {
     const SQLITE_CONSTRAINT: i32 = 19;
 
     for check_sql in &table.check_constraints {
@@ -6613,15 +6642,21 @@ fn emit_check_constraints(b: &mut ProgramBuilder, table: &TableSchema, val_regs:
         // Non-zero (truthy): CHECK passes.
         b.emit_jump_to_label(Opcode::If, result_reg, 0, ok_label, P4::None, 0);
 
-        // False (0): CHECK fails — halt with constraint error.
-        b.emit_op(
-            Opcode::Halt,
-            SQLITE_CONSTRAINT,
-            0,
-            0,
-            P4::Str(format!("CHECK constraint failed: {check_sql}")),
-            0,
-        );
+        // False (0): CHECK fails.
+        if let Some(skip) = ignore_label {
+            // OR IGNORE: skip this row silently.
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, skip, P4::None, 0);
+        } else {
+            // Default: halt with constraint error.
+            b.emit_op(
+                Opcode::Halt,
+                SQLITE_CONSTRAINT,
+                0,
+                0,
+                P4::Str(format!("CHECK constraint failed: {check_sql}")),
+                0,
+            );
+        }
 
         b.resolve_label(ok_label);
     }
@@ -6632,20 +6667,32 @@ fn emit_check_constraints(b: &mut ProgramBuilder, table: &TableSchema, val_regs:
 /// For each column with `not_null == true` (and not an IPK, which can't be NULL),
 /// emits `HaltIfNull` to abort with SQLITE_CONSTRAINT if the value is NULL.
 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-fn emit_not_null_constraints(b: &mut ProgramBuilder, table: &TableSchema, val_regs: i32) {
+fn emit_not_null_constraints(
+    b: &mut ProgramBuilder,
+    table: &TableSchema,
+    val_regs: i32,
+    ignore_label: Option<Label>,
+) {
     const SQLITE_CONSTRAINT: i32 = 19;
 
     for (col_idx, col) in table.columns.iter().enumerate() {
         if col.notnull && !col.is_ipk {
             let reg = val_regs + col_idx as i32;
-            b.emit_op(
-                Opcode::HaltIfNull,
-                SQLITE_CONSTRAINT,
-                0,
-                reg,
-                P4::Str(format!("NOT NULL constraint failed: {}.{}", table.name, col.name)),
-                0,
-            );
+            let ok_label = b.emit_label();
+            b.emit_jump_to_label(Opcode::NotNull, reg, 0, ok_label, P4::None, 0);
+            if let Some(skip) = ignore_label {
+                b.emit_jump_to_label(Opcode::Goto, 0, 0, skip, P4::None, 0);
+            } else {
+                b.emit_op(
+                    Opcode::Halt,
+                    SQLITE_CONSTRAINT,
+                    0,
+                    0,
+                    P4::Str(format!("NOT NULL constraint failed: {}.{}", table.name, col.name)),
+                    0,
+                );
+            }
+            b.resolve_label(ok_label);
         }
     }
 }
