@@ -60862,4 +60862,146 @@ mod pager_routing_tests {
             panic!("{} index query mismatches", mismatches.len());
         }
     }
+
+    /// Conformance oracle: text-to-number coercion edge cases in arithmetic
+    #[test]
+    fn test_conformance_text_number_coercion_arith() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let queries = [
+            // Non-numeric text → integer 0
+            "SELECT typeof('abc' + 0)",
+            "SELECT 'abc' + 0",
+            "SELECT 'abc' * 1",
+            "SELECT typeof('abc' * 1)",
+            // Numeric prefix text → integer
+            "SELECT '42abc' + 0",
+            "SELECT typeof('42abc' + 0)",
+            // Float prefix text → float
+            "SELECT '3.14abc' + 0",
+            "SELECT typeof('3.14abc' + 0)",
+            // Pure integer text → integer
+            "SELECT '100' + 0",
+            "SELECT typeof('100' + 0)",
+            // Pure float text → float
+            "SELECT '1.5' + 0",
+            "SELECT typeof('1.5' + 0)",
+            // Scientific notation
+            "SELECT '1e2' + 0",
+            "SELECT typeof('1e2' + 0)",
+            // Empty string → integer 0
+            "SELECT '' + 0",
+            "SELECT typeof('' + 0)",
+            // Leading whitespace
+            "SELECT '  42' + 0",
+            "SELECT typeof('  42' + 0)",
+            // Division with text
+            "SELECT '10' / 3",
+            "SELECT typeof('10' / 3)",
+            "SELECT '10.0' / 3",
+            "SELECT typeof('10.0' / 3)",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!("{} text-number coercion mismatches", mismatches.len());
+        }
+    }
+
+    /// Conformance oracle: UNION with different column types
+    #[test]
+    fn test_conformance_union_type_coercion() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let queries = [
+            "SELECT 1 UNION ALL SELECT 1.0 ORDER BY 1",
+            "SELECT 1 UNION ALL SELECT '1' ORDER BY 1",
+            "SELECT NULL UNION ALL SELECT 1 ORDER BY 1",
+            "SELECT typeof(x) FROM (SELECT 1 AS x UNION ALL SELECT 1.0)",
+            "SELECT typeof(x) FROM (SELECT 1 AS x UNION ALL SELECT '1')",
+            // UNION dedup with mixed types
+            "SELECT 1 UNION SELECT 1.0 ORDER BY 1",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!("{} UNION type coercion mismatches", mismatches.len());
+        }
+    }
+
+    /// Conformance oracle: nested aggregate expressions (SUM inside CASE, etc.)
+    #[test]
+    fn test_conformance_nested_aggregate_exprs() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE t1(id INTEGER PRIMARY KEY, cat TEXT, val INTEGER)",
+            "INSERT INTO t1 VALUES(1,'A',10),(2,'A',20),(3,'B',30),(4,'B',40),(5,'A',50)",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            // Aggregate in CASE
+            "SELECT cat, CASE WHEN SUM(val) > 50 THEN 'high' ELSE 'low' END FROM t1 GROUP BY cat ORDER BY cat",
+            // Multiple different aggregates
+            "SELECT cat, SUM(val) - MIN(val) AS range FROM t1 GROUP BY cat ORDER BY cat",
+            // Aggregate with arithmetic
+            "SELECT cat, SUM(val) * 100 / (SELECT SUM(val) FROM t1) AS pct FROM t1 GROUP BY cat ORDER BY cat",
+            // COUNT(*) vs COUNT(col)
+            "SELECT COUNT(*), COUNT(val), COUNT(DISTINCT cat) FROM t1",
+            // Nested function in aggregate
+            "SELECT SUM(abs(val - 30)) FROM t1",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!("{} nested aggregate mismatches", mismatches.len());
+        }
+    }
+
+    /// Conformance oracle: multi-row VALUES and INSERT
+    #[test]
+    fn test_conformance_multi_row_values() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE t1(id INTEGER PRIMARY KEY, a TEXT, b INTEGER)",
+            "INSERT INTO t1 VALUES(1,'x',10),(2,'y',20),(3,'z',30)",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            "SELECT * FROM t1 ORDER BY id",
+            "SELECT COUNT(*) FROM t1",
+            // Note: standalone VALUES in FROM clause (e.g. SELECT * FROM (VALUES ...))
+            // is not yet supported — known gap.
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!("{} multi-row VALUES mismatches", mismatches.len());
+        }
+    }
 }
