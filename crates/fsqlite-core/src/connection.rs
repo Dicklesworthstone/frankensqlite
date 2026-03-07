@@ -58167,7 +58167,7 @@ mod pager_routing_tests {
 
     /// Conformance oracle: window functions (ROW_NUMBER, RANK, DENSE_RANK, LAG, LEAD, SUM OVER)
     #[test]
-    fn test_conformance_window_functions_basic() {
+    fn test_conformance_window_functions_partitioned() {
         let fconn = Connection::open(":memory:").unwrap();
         let rconn = rusqlite::Connection::open_in_memory().unwrap();
 
@@ -58213,7 +58213,7 @@ mod pager_routing_tests {
 
     /// Conformance oracle: correlated subqueries in SELECT, WHERE, HAVING
     #[test]
-    fn test_conformance_correlated_subqueries() {
+    fn test_conformance_correlated_subqueries_deep() {
         let fconn = Connection::open(":memory:").unwrap();
         let rconn = rusqlite::Connection::open_in_memory().unwrap();
 
@@ -58451,7 +58451,7 @@ mod pager_routing_tests {
 
     /// Conformance oracle: multi-table operations with DELETE, INSERT...SELECT, REPLACE
     #[test]
-    fn test_conformance_multi_table_dml() {
+    fn test_conformance_multi_table_dml_patterns() {
         let fconn = Connection::open(":memory:").unwrap();
         let rconn = rusqlite::Connection::open_in_memory().unwrap();
 
@@ -58500,13 +58500,13 @@ mod pager_routing_tests {
             }
             panic!("{} multi-table DML mismatches (phase 2)", mismatches.len());
         }
-        Ok(())
     }
 
     /// Conformance oracle: type coercion edge cases in comparisons and arithmetic
     #[test]
-    fn test_conformance_type_coercion_deep() -> Result<(), String> {
-        let (fconn, rconn) = setup_oracle_pair();
+    fn test_conformance_type_coercion_deep() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
 
         let queries = &[
             // Text-to-number coercion
@@ -58547,6 +58547,5 @@ mod pager_routing_tests {
             }
             panic!("{} type coercion mismatches", mismatches.len());
         }
-        Ok(())
     }
 }
