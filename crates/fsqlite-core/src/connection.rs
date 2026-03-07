@@ -43198,6 +43198,129 @@ mod pager_routing_tests {
         }
     }
 
+    /// Implicit aggregation (no GROUP BY), round edge cases, and mixed
+    /// aggregate/scalar expressions in GROUP BY.
+    #[test]
+    fn test_conformance_implicit_agg_and_round() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE nums (id INTEGER PRIMARY KEY, val REAL, label TEXT);",
+            "INSERT INTO nums VALUES (1, 1.5, 'a');",
+            "INSERT INTO nums VALUES (2, 2.5, 'a');",
+            "INSERT INTO nums VALUES (3, 3.5, 'b');",
+            "INSERT INTO nums VALUES (4, 4.5, 'b');",
+            "INSERT INTO nums VALUES (5, 5.5, 'c');",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            // Implicit aggregation — no GROUP BY
+            "SELECT count(*) FROM nums",
+            "SELECT sum(val), avg(val) FROM nums",
+            "SELECT min(val), max(val) FROM nums",
+            // Implicit aggregation on empty result
+            "SELECT count(*) FROM nums WHERE val > 100",
+            "SELECT sum(val) FROM nums WHERE val > 100",
+            "SELECT avg(val) FROM nums WHERE val > 100",
+            // round edge cases
+            "SELECT round(2.5)",
+            "SELECT round(3.5)",
+            "SELECT round(2.55, 1)",
+            "SELECT round(2.45, 1)",
+            "SELECT round(-2.5)",
+            "SELECT round(-3.5)",
+            "SELECT round(0.5)",
+            "SELECT round(1.5)",
+            "SELECT round(2.225, 2)",
+            "SELECT round(2.235, 2)",
+            "SELECT round(2.245, 2)",
+            "SELECT round(2.255, 2)",
+            // Mixed aggregate + scalar in GROUP BY result
+            "SELECT label, count(*) AS cnt, round(avg(val), 1) AS avg_val FROM nums GROUP BY label ORDER BY label",
+            "SELECT label, sum(val) * 2 AS double_sum FROM nums GROUP BY label ORDER BY label",
+            "SELECT label, max(val) - min(val) AS range_val FROM nums GROUP BY label ORDER BY label",
+            // Aggregate with HAVING
+            "SELECT label, count(*) AS cnt FROM nums GROUP BY label HAVING count(*) >= 2 ORDER BY label",
+            "SELECT label, avg(val) AS avg_val FROM nums GROUP BY label HAVING avg(val) > 3.0 ORDER BY label",
+            // Implicit aggregation on joined empty result
+            "SELECT count(*) FROM nums n1 JOIN nums n2 ON n1.id = n2.id WHERE n1.val > 100",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!(
+                "{} implicit agg/round conformance mismatches found",
+                mismatches.len()
+            );
+        }
+    }
+
+    /// EXISTS subqueries, IN subqueries, WHERE-clause subqueries, and
+    /// complex expression patterns.
+    #[test]
+    fn test_conformance_subquery_expressions() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT, grp INTEGER);",
+            "INSERT INTO t1 VALUES (1, 'alpha', 1);",
+            "INSERT INTO t1 VALUES (2, 'beta', 1);",
+            "INSERT INTO t1 VALUES (3, 'gamma', 2);",
+            "INSERT INTO t1 VALUES (4, 'delta', 2);",
+            "INSERT INTO t1 VALUES (5, 'epsilon', 3);",
+            "CREATE TABLE t2 (id INTEGER PRIMARY KEY, t1_id INTEGER, score INTEGER);",
+            "INSERT INTO t2 VALUES (1, 1, 90);",
+            "INSERT INTO t2 VALUES (2, 2, 85);",
+            "INSERT INTO t2 VALUES (3, 3, 95);",
+            "INSERT INTO t2 VALUES (4, 5, 70);",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            // EXISTS subquery
+            "SELECT val FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.t1_id = t1.id) ORDER BY val",
+            // NOT EXISTS
+            "SELECT val FROM t1 WHERE NOT EXISTS (SELECT 1 FROM t2 WHERE t2.t1_id = t1.id) ORDER BY val",
+            // IN subquery
+            "SELECT val FROM t1 WHERE id IN (SELECT t1_id FROM t2) ORDER BY val",
+            // NOT IN subquery
+            "SELECT val FROM t1 WHERE id NOT IN (SELECT t1_id FROM t2) ORDER BY val",
+            // Scalar subquery in WHERE
+            "SELECT val FROM t1 WHERE (SELECT max(score) FROM t2 WHERE t2.t1_id = t1.id) > 80 ORDER BY val",
+            // Scalar subquery comparison
+            "SELECT val FROM t1 WHERE grp = (SELECT grp FROM t1 WHERE val = 'alpha') ORDER BY val",
+            // CASE with subquery
+            "SELECT val, CASE WHEN (SELECT count(*) FROM t2 WHERE t2.t1_id = t1.id) > 0 THEN 'has_score' ELSE 'no_score' END AS status FROM t1 ORDER BY val",
+            // Aggregate over expression
+            "SELECT grp, count(*) AS cnt, group_concat(val, ', ') AS vals FROM t1 GROUP BY grp ORDER BY grp",
+            // COALESCE with subquery
+            "SELECT val, COALESCE((SELECT score FROM t2 WHERE t2.t1_id = t1.id), -1) AS score FROM t1 ORDER BY val",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!(
+                "{} subquery expression conformance mismatches found",
+                mismatches.len()
+            );
+        }
+    }
+
     /// Probe UPDATE/DELETE with complex patterns: correlated subqueries,
     /// computed expressions, and multi-step DML sequences.
     #[test]
