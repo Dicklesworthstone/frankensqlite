@@ -18,7 +18,7 @@ use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use parking_lot::Mutex;
+use fsqlite_types::sync_primitives::Mutex;
 
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::PageSize;

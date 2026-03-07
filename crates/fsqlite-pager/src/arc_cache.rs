@@ -25,7 +25,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use fsqlite_types::{CommitSeq, PageNumber};
-use parking_lot::{Condvar, Mutex};
+use fsqlite_types::sync_primitives::{Condvar, Mutex};
 
 use crate::page_buf::PageBuf;
 
@@ -1458,7 +1458,7 @@ impl ArcCache {
     }
 
     /// Acquire the inner lock for direct manipulation.
-    pub fn lock(&self) -> parking_lot::MutexGuard<'_, ArcCacheInner> {
+    pub fn lock(&self) -> fsqlite_types::sync_primitives::MutexGuard<'_, ArcCacheInner> {
         self.inner.lock()
     }
 

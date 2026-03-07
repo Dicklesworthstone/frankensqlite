@@ -11,6 +11,7 @@ mod per_core_buffer;
 pub mod recovery_compaction;
 pub mod telemetry;
 pub mod wal;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod wal_fec;
 pub mod wal_index;
 
@@ -56,6 +57,7 @@ pub use telemetry::{
     WalTelemetrySnapshot, wal_telemetry_snapshot,
 };
 pub use wal::WalFile;
+#[cfg(not(target_arch = "wasm32"))]
 pub use wal_fec::{
     DEFAULT_RAPTORQ_REPAIR_SYMBOLS, MAX_RAPTORQ_REPAIR_SYMBOLS, WAL_FEC_GROUP_META_MAGIC,
     WAL_FEC_GROUP_META_VERSION, WalFecDecodeProof, WalFecGroupId, WalFecGroupMeta,

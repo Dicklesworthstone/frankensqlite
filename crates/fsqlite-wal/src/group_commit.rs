@@ -36,7 +36,7 @@
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use fsqlite_types::sync_primitives::{Duration, Instant};
 
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::cx::Cx;

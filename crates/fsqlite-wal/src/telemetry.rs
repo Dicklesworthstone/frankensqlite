@@ -205,7 +205,7 @@ impl WalTelemetryObserver for NoOpWalObserver {
 
 /// Ring-buffer observer that stores the last N events for diagnostic queries.
 pub struct WalTelemetryRingBuffer {
-    events: parking_lot::Mutex<WalRingBufferInner>,
+    events: fsqlite_types::sync_primitives::Mutex<WalRingBufferInner>,
 }
 
 struct WalRingBufferInner {
@@ -220,7 +220,7 @@ impl WalTelemetryRingBuffer {
     #[must_use]
     pub fn new(capacity: usize) -> Self {
         Self {
-            events: parking_lot::Mutex::new(WalRingBufferInner {
+            events: fsqlite_types::sync_primitives::Mutex::new(WalRingBufferInner {
                 buf: Vec::with_capacity(capacity),
                 capacity,
                 write_pos: 0,

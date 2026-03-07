@@ -86,7 +86,7 @@ pub fn execute_checkpoint<F: VfsFile>(
     state: CheckpointState,
     target: &mut impl CheckpointTarget,
 ) -> Result<CheckpointExecutionResult> {
-    let checkpoint_start = std::time::Instant::now();
+    let checkpoint_start = fsqlite_types::sync_primitives::Instant::now();
     let plan = plan_checkpoint(mode, state);
     let normalized = state.normalized();
 
