@@ -6096,6 +6096,20 @@ impl Connection {
         rootpage: i32,
         sql: &str,
     ) -> Result<()> {
+        self.insert_sqlite_master_row_with_sql(type_, name, tbl_name, rootpage, Some(sql))
+    }
+
+    /// Insert a sqlite_master row with an optional SQL column value.
+    /// Implicit autoindexes (sqlite_autoindex_*) are stored with NULL sql,
+    /// matching real SQLite's behavior.
+    fn insert_sqlite_master_row_with_sql(
+        &self,
+        type_: &str,
+        name: &str,
+        tbl_name: &str,
+        rootpage: i32,
+        sql: Option<&str>,
+    ) -> Result<()> {
         self.with_pager_write_txn(|cx, txn| {
             let usable_size = PageSize::DEFAULT.get();
             let mut cursor = fsqlite_btree::BtCursor::new(
@@ -6129,14 +6143,16 @@ impl Connection {
                 SqliteValue::Text(name.to_owned()),
                 SqliteValue::Text(tbl_name.to_owned()),
                 SqliteValue::Integer(i64::from(rootpage)),
-                SqliteValue::Text(sql.to_owned()),
+                sql.map_or(SqliteValue::Null, |s| SqliteValue::Text(s.to_owned())),
             ]);
             cursor.table_insert(cx, rowid, &record)
         })?;
         // Cache original DDL text for sqlite_master sql column queries.
-        self.original_ddl_sql
-            .borrow_mut()
-            .insert(name.to_ascii_lowercase(), sql.to_owned());
+        if let Some(sql) = sql {
+            self.original_ddl_sql
+                .borrow_mut()
+                .insert(name.to_ascii_lowercase(), sql.to_owned());
+        }
         Ok(())
     }
 
@@ -6946,11 +6962,24 @@ impl Connection {
                     foreign_keys: fk_defs,
                     check_constraints: check_defs,
                 };
+                let implicit_indexes_for_master = table_schema.indexes.clone();
                 let create_sql = create.to_string();
                 let rp = table_schema.root_page;
                 let tbl_name = table_schema.name.clone();
                 self.schema.borrow_mut().push(table_schema);
                 self.insert_sqlite_master_row("table", &tbl_name, &tbl_name, rp, &create_sql)?;
+                // Persist implicit autoindex entries (sqlite_autoindex_*) to
+                // sqlite_master with NULL sql, matching real SQLite behavior.
+                // Without these rows SQLite reports the database as malformed.
+                for index in &implicit_indexes_for_master {
+                    self.insert_sqlite_master_row_with_sql(
+                        "index",
+                        &index.name,
+                        &tbl_name,
+                        index.root_page,
+                        None,
+                    )?;
+                }
                 if is_autoincrement {
                     self.ensure_sqlite_sequence_table_exists()?;
                     let table_key = tbl_name.to_ascii_lowercase();
@@ -16525,7 +16554,7 @@ pub(crate) fn maybe_quote_ident(name: &str) -> String {
 }
 
 fn render_create_table_sql(table: &TableSchema, is_autoincrement: bool) -> String {
-    let column_defs = table
+    let mut defs: Vec<String> = table
         .columns
         .iter()
         .map(|col| {
@@ -16566,8 +16595,34 @@ fn render_create_table_sql(table: &TableSchema, is_autoincrement: bool) -> Strin
             }
             part
         })
-        .collect::<Vec<_>>()
-        .join(", ");
+        .collect();
+
+    // Append table-level UNIQUE constraints for multi-column implicit indexes
+    // so the rendered SQL round-trips correctly through sqlite_master.
+    for index in &table.indexes {
+        if !index.is_unique || index.columns.is_empty() {
+            continue;
+        }
+        // Single-column UNIQUE constraints are already rendered inline above.
+        if index.columns.len() == 1
+            && table.columns.iter().any(|column| {
+                column.unique
+                    && !column.is_ipk
+                    && column.name.eq_ignore_ascii_case(&index.columns[0])
+            })
+        {
+            continue;
+        }
+        let cols = index
+            .columns
+            .iter()
+            .map(|name| format!("\"{name}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        defs.push(format!("UNIQUE ({cols})"));
+    }
+
+    let column_defs = defs.join(", ");
     // Append table-level FOREIGN KEY constraints so they survive
     // round-tripping through sqlite_master.
     let mut fk_clauses = String::new();
@@ -25466,6 +25521,59 @@ mod tests {
             .delete_sqlite_master_row("idx_t_drop_idx_x")
             .expect_err("dropped index row should be absent from sqlite_master");
         assert!(is_sqlite_master_entry_missing(&index_missing));
+    }
+
+    /// Verify that a table with a TEXT PRIMARY KEY produces a database that
+    /// SQLite considers well-formed (PRAGMA quick_check = ok) and that the
+    /// implicit autoindex row appears in sqlite_master.
+    #[test]
+    fn test_implicit_unique_index_is_visible_to_external_sqlite() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("implicit_unique_index.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+
+        conn.execute("CREATE TABLE t (id TEXT PRIMARY KEY, payload TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES ('a', 'x');").unwrap();
+        conn.execute("INSERT INTO t VALUES ('b', 'y');").unwrap();
+        drop(conn);
+
+        let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+        let quick_check: String = sqlite
+            .query_row("PRAGMA quick_check;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(quick_check, "ok");
+
+        let autoindex_count: i64 = sqlite
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='sqlite_autoindex_t_1';",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(autoindex_count, 1);
+    }
+
+    /// Verify that a composite PRIMARY KEY also produces a well-formed database.
+    #[test]
+    fn test_composite_primary_key_autoindex_is_visible_to_external_sqlite() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("composite_pk_autoindex.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+
+        conn.execute(
+            "CREATE TABLE dep (issue_id TEXT, depends_on TEXT, PRIMARY KEY(issue_id, depends_on));",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO dep VALUES ('a', 'b');").unwrap();
+        conn.execute("INSERT INTO dep VALUES ('a', 'c');").unwrap();
+        drop(conn);
+
+        let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+        let quick_check: String = sqlite
+            .query_row("PRAGMA quick_check;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(quick_check, "ok");
     }
 
     #[test]
