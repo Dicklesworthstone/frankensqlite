@@ -444,21 +444,27 @@ fn emit_upsert_expr(
                     b.resolve_label(done_label);
                 }
 
-                // IS / IS NOT: NULLEQ semantics (NULL IS NULL = TRUE).
+                // IS / IS NOT: check for IS TRUE/FALSE/NOT TRUE/NOT FALSE.
                 BinaryOp::Is | BinaryOp::IsNot => {
-                    let true_label = b.emit_label();
-                    let done_label = b.emit_label();
-                    let cmp = if matches!(op, BinaryOp::Is) {
-                        Opcode::Eq
+                    if let Some((p3, p4)) = is_true_false_params(*op, right) {
+                        // Emit IsTrue opcode for IS TRUE/FALSE/NOT TRUE/NOT FALSE.
+                        b.emit_op(Opcode::IsTrue, left_reg, reg, p3, p4, 0);
                     } else {
-                        Opcode::Ne
-                    };
-                    b.emit_jump_to_label(cmp, right_reg, left_reg, true_label, P4::None, 0x80);
-                    b.emit_op(Opcode::Integer, 0, reg, 0, P4::None, 0);
-                    b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
-                    b.resolve_label(true_label);
-                    b.emit_op(Opcode::Integer, 1, reg, 0, P4::None, 0);
-                    b.resolve_label(done_label);
+                        // General IS / IS NOT: NULLEQ semantics.
+                        let true_label = b.emit_label();
+                        let done_label = b.emit_label();
+                        let cmp = if matches!(op, BinaryOp::Is) {
+                            Opcode::Eq
+                        } else {
+                            Opcode::Ne
+                        };
+                        b.emit_jump_to_label(cmp, right_reg, left_reg, true_label, P4::None, 0x80);
+                        b.emit_op(Opcode::Integer, 0, reg, 0, P4::None, 0);
+                        b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+                        b.resolve_label(true_label);
+                        b.emit_op(Opcode::Integer, 1, reg, 0, P4::None, 0);
+                        b.resolve_label(done_label);
+                    }
                 }
             }
         }
@@ -9516,18 +9522,22 @@ fn emit_expr_with_fallback(
                 b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
                 b.resolve_label(done_label);
             } else if matches!(op, fsqlite_ast::BinaryOp::Is | fsqlite_ast::BinaryOp::IsNot) {
-                let (cmp_opcode, flag) = match op {
-                    fsqlite_ast::BinaryOp::Is => (Opcode::Eq, 0x80_u16),
-                    _ => (Opcode::Ne, 0x80_u16),
-                };
-                let true_label = b.emit_label();
-                let done_label = b.emit_label();
-                b.emit_jump_to_label(cmp_opcode, r_right, r_left, true_label, P4::None, flag);
-                b.emit_op(Opcode::Integer, 0, reg, 0, P4::None, 0);
-                b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
-                b.resolve_label(true_label);
-                b.emit_op(Opcode::Integer, 1, reg, 0, P4::None, 0);
-                b.resolve_label(done_label);
+                if let Some((p3, p4)) = is_true_false_params(*op, right) {
+                    b.emit_op(Opcode::IsTrue, r_left, reg, p3, p4, 0);
+                } else {
+                    let (cmp_opcode, flag) = match op {
+                        fsqlite_ast::BinaryOp::Is => (Opcode::Eq, 0x80_u16),
+                        _ => (Opcode::Ne, 0x80_u16),
+                    };
+                    let true_label = b.emit_label();
+                    let done_label = b.emit_label();
+                    b.emit_jump_to_label(cmp_opcode, r_right, r_left, true_label, P4::None, flag);
+                    b.emit_op(Opcode::Integer, 0, reg, 0, P4::None, 0);
+                    b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+                    b.resolve_label(true_label);
+                    b.emit_op(Opcode::Integer, 1, reg, 0, P4::None, 0);
+                    b.resolve_label(done_label);
+                }
             } else {
                 // Arithmetic / logical / bitwise.
                 // VDBE convention: P3 = P2 op P1 (P1=rhs, P2=lhs).
@@ -9782,6 +9792,15 @@ fn emit_is_comparison(
     reg: i32,
     ctx: Option<&ScanCtx<'_>>,
 ) {
+    // IS TRUE / IS FALSE / IS NOT TRUE / IS NOT FALSE → IsTrue opcode.
+    if let Some((p3, p4)) = is_true_false_params(op, right) {
+        let r_left = b.alloc_temp();
+        emit_expr(b, left, r_left, ctx);
+        b.emit_op(Opcode::IsTrue, r_left, reg, p3, p4, 0);
+        b.free_temp(r_left);
+        return;
+    }
+
     let r_left = b.alloc_temp();
     let r_right = b.alloc_temp();
     emit_expr(b, left, r_left, ctx);
@@ -9819,6 +9838,39 @@ fn emit_is_comparison(
 
     b.free_temp(r_right);
     b.free_temp(r_left);
+}
+
+/// Check if a `BinaryOp::Is/IsNot` with `Literal::True/False` should use
+/// the `IsTrue` opcode.  Returns `(p3, p4)` for the IsTrue instruction.
+///
+/// Mapping:
+///   IS TRUE      → (p3=0, P4::None)        — truthy, NULL→0
+///   IS FALSE     → (p3=1, P4::Int(1))      — !truthy, NULL→0
+///   IS NOT TRUE  → (p3=0, P4::Int(1))      — !truthy, NULL→1
+///   IS NOT FALSE → (p3=1, P4::None)        — truthy inverted, NULL→1
+fn is_true_false_params(op: fsqlite_ast::BinaryOp, rhs: &Expr) -> Option<(i32, P4)> {
+    let is_not = matches!(op, fsqlite_ast::BinaryOp::IsNot);
+    match rhs {
+        Expr::Literal(Literal::True, _) => {
+            if is_not {
+                // IS NOT TRUE: p3=0, p4=1
+                Some((0, P4::Int(1)))
+            } else {
+                // IS TRUE: p3=0, p4=0
+                Some((0, P4::None))
+            }
+        }
+        Expr::Literal(Literal::False, _) => {
+            if is_not {
+                // IS NOT FALSE: p3=1, p4=0
+                Some((1, P4::None))
+            } else {
+                // IS FALSE: p3=1, p4=1
+                Some((1, P4::Int(1)))
+            }
+        }
+        _ => None,
+    }
 }
 
 /// Emit CASE \[operand\] WHEN ... THEN ... \[ELSE ...\] END.
