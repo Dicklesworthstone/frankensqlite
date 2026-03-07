@@ -2856,7 +2856,8 @@ fn test_conformance_select_distinct_group_by_s55f() {
         "SELECT DISTINCT val FROM t ORDER BY val",
         "SELECT DISTINCT cat, val FROM t ORDER BY cat, val",
         "SELECT cat, SUM(val) AS s FROM t GROUP BY cat HAVING SUM(val) > 20 ORDER BY cat",
-        "SELECT cat FROM t GROUP BY cat ORDER BY COUNT(*) DESC",
+        // Tiebreaker: add cat to ORDER BY for deterministic ordering
+        "SELECT cat FROM t GROUP BY cat ORDER BY COUNT(*) DESC, cat ASC",
     ];
 
     let mismatches = oracle_compare(&fconn, &rconn, &queries);

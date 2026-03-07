@@ -209,9 +209,33 @@ impl FrameStack {
         self.frames.last().map(|(f, _)| f)
     }
 
-    /// Mutable reference to the top frame.
-    pub fn top_mut(&mut self) -> Option<&mut VdbeFrame> {
-        self.frames.last_mut().map(|(f, _)| f)
+    /// Apply a mutation to the top frame while preserving the stack's memory-budget invariant.
+    ///
+    /// Returns `Ok(false)` if the stack is empty. If the mutation would exceed
+    /// the configured memory budget, the frame is left unchanged and
+    /// `Err(FrankenError::OutOfMemory)` is returned.
+    pub fn update_top(
+        &mut self,
+        update: impl FnOnce(&mut VdbeFrame),
+    ) -> Result<bool, FrankenError> {
+        let Some((top, recorded_mem)) = self.frames.last_mut() else {
+            return Ok(false);
+        };
+
+        let mut candidate = top.clone();
+        update(&mut candidate);
+
+        let new_mem = candidate.estimated_memory();
+        let base_memory = self.current_memory.saturating_sub(*recorded_mem);
+        let new_total = base_memory.saturating_add(new_mem);
+        if new_total > self.cx_memory_budget {
+            return Err(FrankenError::OutOfMemory);
+        }
+
+        *top = candidate;
+        *recorded_mem = new_mem;
+        self.current_memory = new_total;
+        Ok(true)
     }
 
     /// Unwind all frames (cleanup on error). Returns the unwound frames
@@ -224,18 +248,26 @@ impl FrameStack {
         unwound
     }
 
-    /// Unwind frames until a frame matching the given trigger name is popped,
-    /// or the stack is empty. Returns all unwound frames (innermost first).
-    pub fn unwind_to_trigger(&mut self, trigger_name: &str) -> Vec<VdbeFrame> {
-        let mut unwound = Vec::new();
-        while let Some(frame) = self.pop_frame() {
-            let is_target = frame.trigger_name == trigger_name;
-            unwound.push(frame);
-            if is_target {
-                break;
+    /// Unwind frames until the frame at `target_index` is popped.
+    ///
+    /// `target_index` is a 0-based index into the stack where 0 is the
+    /// outermost frame. Returns the unwound frames in pop order (innermost
+    /// first). Missing targets are rejected instead of silently unwinding the
+    /// full stack.
+    pub fn unwind_to_index(&mut self, target_index: usize) -> Result<Vec<VdbeFrame>, FrankenError> {
+        if target_index >= self.frames.len() {
+            return Err(FrankenError::Internal(format!(
+                "no frame at index {target_index}"
+            )));
+        }
+
+        let mut unwound = Vec::with_capacity(self.frames.len() - target_index);
+        while self.frames.len() > target_index {
+            if let Some(frame) = self.pop_frame() {
+                unwound.push(frame);
             }
         }
-        unwound
+        Ok(unwound)
     }
 }
 
@@ -422,8 +454,11 @@ mod tests {
         assert_eq!(stack.depth(), 5);
 
         // The 5th trigger (top of stack) raises RAISE(ABORT, "constraint failed").
-        stack.top_mut().unwrap().raise_result =
-            Some(RaiseResult::Abort("constraint failed".to_owned()));
+        stack
+            .update_top(|frame| {
+                frame.raise_result = Some(RaiseResult::Abort("constraint failed".to_owned()));
+            })
+            .expect("raise_result update should succeed");
 
         // Verify the raise result is accessible.
         let top = stack.top().unwrap();
@@ -545,6 +580,52 @@ mod tests {
     // ── Additional coverage ─────────────────────────────────────────────
 
     #[test]
+    fn test_update_top_rejects_budget_bypass() {
+        let base_frame = make_frame(0, 1, 0, 0, "trg_budget");
+        let budget = base_frame.estimated_memory() + 16;
+        let mut stack = FrameStack::new(SQLITE_MAX_TRIGGER_DEPTH, budget);
+        stack.push_frame(base_frame.clone()).unwrap();
+
+        let before_memory = stack.current_memory();
+        let before_frame = stack.top().unwrap().clone();
+
+        let err = stack
+            .update_top(|frame| {
+                frame.registers[0] = SqliteValue::Text("x".repeat(512));
+            })
+            .expect_err("budget-busting top mutation must fail");
+        assert!(matches!(err, FrankenError::OutOfMemory));
+        assert_eq!(stack.current_memory(), before_memory);
+        assert_eq!(
+            stack.top().unwrap().estimated_memory(),
+            before_frame.estimated_memory()
+        );
+        assert!(matches!(
+            stack.top().unwrap().registers[0],
+            SqliteValue::Null
+        ));
+    }
+
+    #[test]
+    fn test_update_top_refreshes_memory_accounting() {
+        let base_frame = make_frame(0, 1, 0, 0, "trg_budget_ok");
+        let mut stack = FrameStack::new(SQLITE_MAX_TRIGGER_DEPTH, usize::MAX);
+        stack.push_frame(base_frame).unwrap();
+
+        stack
+            .update_top(|frame| {
+                frame.trigger_name.push_str("_expanded");
+                frame.registers[0] = SqliteValue::Blob(vec![7; 128]);
+            })
+            .expect("top mutation should succeed");
+
+        let top = stack.top().unwrap();
+        assert_eq!(stack.current_memory(), top.estimated_memory());
+        assert_eq!(top.trigger_name, "trg_budget_ok_expanded");
+        assert!(matches!(&top.registers[0], SqliteValue::Blob(bytes) if bytes.len() == 128));
+    }
+
+    #[test]
     fn test_raise_result_variants() {
         let ignore = RaiseResult::Ignore;
         let rollback = RaiseResult::Rollback("oops".to_owned());
@@ -581,7 +662,7 @@ mod tests {
     }
 
     #[test]
-    fn test_unwind_to_trigger() {
+    fn test_unwind_to_index() {
         let mut stack = FrameStack::with_defaults();
         stack.set_recursive_triggers(true);
 
@@ -590,13 +671,26 @@ mod tests {
             stack.push_frame(frame).unwrap();
         }
 
-        // Unwind to "trg_2" — should pop trg_4, trg_3, trg_2.
-        let unwound = stack.unwind_to_trigger("trg_2");
+        // Unwind to index 2 — should pop trg_4, trg_3, trg_2.
+        let unwound = stack.unwind_to_index(2).unwrap();
         assert_eq!(unwound.len(), 3);
         assert_eq!(unwound[0].trigger_name, "trg_4");
         assert_eq!(unwound[1].trigger_name, "trg_3");
         assert_eq!(unwound[2].trigger_name, "trg_2");
         assert_eq!(stack.depth(), 2); // trg_0 and trg_1 remain
+    }
+
+    #[test]
+    fn test_unwind_to_index_missing_target_errors() {
+        let mut stack = FrameStack::with_defaults();
+        stack.push_frame(make_frame(0, 4, 0, 0, "trg_0")).unwrap();
+        stack.push_frame(make_frame(1, 4, 0, 1, "trg_1")).unwrap();
+
+        let err = stack
+            .unwind_to_index(2)
+            .expect_err("missing target index must not unwind the full stack");
+        assert!(err.to_string().contains("no frame at index 2"));
+        assert_eq!(stack.depth(), 2);
     }
 
     #[test]
