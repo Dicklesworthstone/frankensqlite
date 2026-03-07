@@ -10029,7 +10029,7 @@ impl Connection {
                                         'C' | 'c' => "NUMERIC",
                                         _ => "",
                                     });
-                                let notnull = i64::from(col.notnull || col.is_ipk);
+                                let notnull = i64::from(col.notnull);
                                 let dflt = col
                                     .default_value
                                     .as_ref()
@@ -51551,6 +51551,212 @@ mod pager_routing_tests {
                 "{} index covering mismatches found",
                 mismatches.len()
             );
+        }
+    }
+
+    /// DELETE with complex WHERE, RETURNING, and correlated subqueries.
+    #[test]
+    fn test_conformance_delete_complex_v2() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE log (id INTEGER PRIMARY KEY, ts INTEGER, msg TEXT, level TEXT);",
+            "INSERT INTO log VALUES (1, 100, 'start', 'info');",
+            "INSERT INTO log VALUES (2, 200, 'err1', 'error');",
+            "INSERT INTO log VALUES (3, 300, 'warn1', 'warn');",
+            "INSERT INTO log VALUES (4, 400, 'err2', 'error');",
+            "INSERT INTO log VALUES (5, 500, 'end', 'info');",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        // DELETE with IN subquery
+        let d1 = "DELETE FROM log WHERE id IN (SELECT id FROM log WHERE level = 'error')";
+        fconn.execute(d1).unwrap();
+        rconn.execute_batch(d1).unwrap();
+
+        let q1 = ["SELECT id, msg FROM log ORDER BY id"];
+        let m1 = oracle_compare(&fconn, &rconn, &q1);
+
+        // DELETE with compound WHERE
+        let d2 = "DELETE FROM log WHERE ts < 300 AND level != 'warn'";
+        fconn.execute(d2).unwrap();
+        rconn.execute_batch(d2).unwrap();
+
+        let q2 = ["SELECT id, msg FROM log ORDER BY id"];
+        let m2 = oracle_compare(&fconn, &rconn, &q2);
+
+        // Verify final count
+        let q3 = ["SELECT COUNT(*) FROM log"];
+        let m3 = oracle_compare(&fconn, &rconn, &q3);
+
+        let mut all = Vec::new();
+        all.extend(m1);
+        all.extend(m2);
+        all.extend(m3);
+        if !all.is_empty() {
+            for m in &all { eprintln!("{m}\n"); }
+            panic!("{} DELETE complex mismatches", all.len());
+        }
+    }
+
+    /// Views: CREATE VIEW, SELECT from view, view with JOINs.
+    #[test]
+    fn test_conformance_views_v2() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE emp (id INTEGER PRIMARY KEY, name TEXT, dept TEXT, salary REAL);",
+            "INSERT INTO emp VALUES (1, 'Alice', 'eng', 90000);",
+            "INSERT INTO emp VALUES (2, 'Bob', 'eng', 85000);",
+            "INSERT INTO emp VALUES (3, 'Carol', 'sales', 70000);",
+            "CREATE VIEW high_earners AS SELECT name, salary FROM emp WHERE salary > 80000;",
+            "CREATE VIEW dept_stats AS SELECT dept, COUNT(*) AS cnt, AVG(salary) AS avg_sal FROM emp GROUP BY dept;",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            "SELECT * FROM high_earners ORDER BY name",
+            "SELECT * FROM dept_stats ORDER BY dept",
+            "SELECT name FROM high_earners WHERE salary > 88000",
+            "SELECT d.dept, d.cnt FROM dept_stats d WHERE d.avg_sal > 75000 ORDER BY d.dept",
+            // View in JOIN
+            "SELECT e.name, d.avg_sal FROM emp e JOIN dept_stats d ON e.dept = d.dept ORDER BY e.name",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches { eprintln!("{m}\n"); }
+            panic!("{} view conformance mismatches", mismatches.len());
+        }
+    }
+
+    /// Multi-value INSERT, INSERT OR REPLACE, INSERT OR IGNORE.
+    #[test]
+    fn test_conformance_insert_conflict_modes() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE kv (key TEXT PRIMARY KEY, val INTEGER);",
+            "INSERT INTO kv VALUES ('a', 1);",
+            "INSERT INTO kv VALUES ('b', 2);",
+            "INSERT INTO kv VALUES ('c', 3);",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        // INSERT OR REPLACE (existing key)
+        let r1 = "INSERT OR REPLACE INTO kv VALUES ('b', 20)";
+        fconn.execute(r1).unwrap();
+        rconn.execute_batch(r1).unwrap();
+
+        // INSERT OR IGNORE (existing key)
+        let r2 = "INSERT OR IGNORE INTO kv VALUES ('a', 100)";
+        fconn.execute(r2).unwrap();
+        rconn.execute_batch(r2).unwrap();
+
+        // INSERT OR REPLACE (new key)
+        let r3 = "INSERT OR REPLACE INTO kv VALUES ('d', 4)";
+        fconn.execute(r3).unwrap();
+        rconn.execute_batch(r3).unwrap();
+
+        // INSERT OR IGNORE (new key)
+        let r4 = "INSERT OR IGNORE INTO kv VALUES ('e', 5)";
+        fconn.execute(r4).unwrap();
+        rconn.execute_batch(r4).unwrap();
+
+        let queries = [
+            "SELECT key, val FROM kv ORDER BY key",
+            "SELECT COUNT(*) FROM kv",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches { eprintln!("{m}\n"); }
+            panic!("{} INSERT conflict mode mismatches", mismatches.len());
+        }
+    }
+
+    /// Date/time function edge cases.
+    #[test]
+    fn test_conformance_datetime_edge_cases() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let queries = [
+            "SELECT date('2024-03-15')",
+            "SELECT time('14:30:00')",
+            "SELECT datetime('2024-03-15 14:30:00')",
+            "SELECT date('2024-03-15', '+1 day')",
+            "SELECT date('2024-03-15', '-1 month')",
+            "SELECT date('2024-03-15', '+1 year')",
+            "SELECT date('2024-02-29')",
+            "SELECT date('2024-02-29', '+1 year')",
+            "SELECT strftime('%Y', '2024-03-15')",
+            "SELECT strftime('%m', '2024-03-15')",
+            "SELECT strftime('%d', '2024-03-15')",
+            "SELECT strftime('%H:%M:%S', '2024-03-15 14:30:45')",
+            "SELECT julianday('2024-01-01')",
+            "SELECT date('now') IS NOT NULL",
+            "SELECT time('now') IS NOT NULL",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches { eprintln!("{m}\n"); }
+            panic!("{} datetime conformance mismatches", mismatches.len());
+        }
+    }
+
+    /// Mixed type comparisons and affinity.
+    #[test]
+    fn test_conformance_type_affinity_comparisons() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let queries = [
+            // Integer vs text
+            "SELECT 1 = '1'",
+            "SELECT 1 < '2'",
+            "SELECT 0 = ''",
+            // Float vs integer
+            "SELECT 1 = 1.0",
+            "SELECT 1 < 1.5",
+            "SELECT 2.0 > 1",
+            // NULL comparisons
+            "SELECT NULL = NULL",
+            "SELECT NULL != NULL",
+            "SELECT NULL < 1",
+            "SELECT NULL > 1",
+            "SELECT NULL IS NULL",
+            "SELECT NULL IS NOT NULL",
+            "SELECT 1 IS NULL",
+            "SELECT 1 IS NOT NULL",
+            // Text vs blob
+            "SELECT 'abc' = X'616263'",
+            "SELECT typeof('abc'), typeof(X'616263')",
+            // Numeric text
+            "SELECT '10' > '9'",
+            "SELECT '10' > 9",
+            "SELECT 10 > '9'",
+            // Boolean-like
+            "SELECT 0 = 0, 1 = 1, '' = '', 0 = ''",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches { eprintln!("{m}\n"); }
+            panic!("{} type affinity comparison mismatches", mismatches.len());
         }
     }
 }

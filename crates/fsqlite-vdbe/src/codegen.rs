@@ -4771,6 +4771,7 @@ pub fn codegen_insert(
             let rec_reg = b.alloc_reg();
             emit_strict_type_check(b, table, col_regs);
             emit_check_constraints(b, table, col_regs);
+            emit_not_null_constraints(b, table, col_regs);
             // Apply column type affinities before packing the record.
             let aff_str = table.affinity_string();
             b.emit_op(
@@ -4963,6 +4964,7 @@ fn codegen_insert_values(
 
         // CHECK constraint validation.
         emit_check_constraints(b, table, val_regs);
+        emit_not_null_constraints(b, table, val_regs);
 
         // Apply column type affinities before packing the record.
         let aff_str = table.affinity_string();
@@ -5495,6 +5497,7 @@ fn codegen_insert_select(
     // STRICT type check before affinity.
     emit_strict_type_check(b, target_table, final_regs);
     emit_check_constraints(b, target_table, final_regs);
+    emit_not_null_constraints(b, target_table, final_regs);
 
     let aff_str = target_table.affinity_string();
     b.emit_op(
@@ -5640,6 +5643,7 @@ fn codegen_insert_select_without_from(
     // STRICT type check before affinity.
     emit_strict_type_check(b, target_table, val_regs);
     emit_check_constraints(b, target_table, val_regs);
+    emit_not_null_constraints(b, target_table, val_regs);
 
     // Apply column type affinities before packing the record.
     let aff_str = target_table.affinity_string();
@@ -5905,6 +5909,7 @@ pub fn codegen_update(
     // MakeRecord with ALL columns.
     emit_strict_type_check(b, table, col_regs);
     emit_check_constraints(b, table, col_regs);
+    emit_not_null_constraints(b, table, col_regs);
     // Apply column type affinities before packing the record.
     let aff_str = table.affinity_string();
     let rec_reg = b.alloc_reg();
@@ -6245,6 +6250,7 @@ fn codegen_update_from(
     // MakeRecord with ALL columns.
     emit_strict_type_check(b, target, col_regs);
     emit_check_constraints(b, target, col_regs);
+    emit_not_null_constraints(b, target, col_regs);
     let aff_str = target.affinity_string();
     let rec_reg = b.alloc_reg();
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
@@ -6618,6 +6624,29 @@ fn emit_check_constraints(b: &mut ProgramBuilder, table: &TableSchema, val_regs:
         );
 
         b.resolve_label(ok_label);
+    }
+}
+
+/// Emit NOT NULL constraint validation for INSERT/UPDATE.
+///
+/// For each column with `not_null == true` (and not an IPK, which can't be NULL),
+/// emits `HaltIfNull` to abort with SQLITE_CONSTRAINT if the value is NULL.
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+fn emit_not_null_constraints(b: &mut ProgramBuilder, table: &TableSchema, val_regs: i32) {
+    const SQLITE_CONSTRAINT: i32 = 19;
+
+    for (col_idx, col) in table.columns.iter().enumerate() {
+        if col.notnull && !col.is_ipk {
+            let reg = val_regs + col_idx as i32;
+            b.emit_op(
+                Opcode::HaltIfNull,
+                SQLITE_CONSTRAINT,
+                0,
+                reg,
+                P4::Str(format!("NOT NULL constraint failed: {}.{}", table.name, col.name)),
+                0,
+            );
+        }
     }
 }
 
