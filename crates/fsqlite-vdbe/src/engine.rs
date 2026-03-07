@@ -7066,22 +7066,8 @@ fn compare_sorter_rows(
         return ord;
     }
 
-    // Deterministic tie-breaker: compare full rows so sort order is stable.
-    let full_len = lhs.len().max(rhs.len());
-    for idx in 0..full_len {
-        match (lhs.get(idx), rhs.get(idx)) {
-            (Some(lhs_value), Some(rhs_value)) => {
-                match lhs_value.partial_cmp(rhs_value).unwrap_or(Ordering::Equal) {
-                    Ordering::Equal => {}
-                    non_equal => return non_equal,
-                }
-            }
-            (Some(_), None) => return Ordering::Greater,
-            (None, Some(_)) => return Ordering::Less,
-            (None, None) => break,
-        }
-    }
-
+    // Rust's sort_by is stable, so equal-key rows stay in insertion order,
+    // matching C SQLite's behavior (especially for COLLATE NOCASE DISTINCT).
     Ordering::Equal
 }
 
