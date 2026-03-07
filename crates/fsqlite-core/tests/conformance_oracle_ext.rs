@@ -9294,3 +9294,156 @@ fn test_conformance_cast_aggregate_group_by() {
         panic!("{} cast aggregate group by mismatches", mismatches.len());
     }
 }
+
+#[test]
+fn test_conformance_hex_blob_operations() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+    let queries = [
+        "SELECT HEX(X'48454C4C4F')",
+        "SELECT TYPEOF(X'48454C4C4F')",
+        "SELECT LENGTH(X'48454C4C4F')",
+        "SELECT X'48454C4C4F' = X'48454C4C4F'",
+        "SELECT X'00' < X'01'",
+        "SELECT HEX(ZEROBLOB(4))",
+        "SELECT TYPEOF(ZEROBLOB(4))",
+    ];
+
+    let mismatches = oracle_compare(&fconn, &rconn, &queries);
+    if !mismatches.is_empty() {
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
+        panic!("{} hex blob mismatches", mismatches.len());
+    }
+}
+
+#[test]
+fn test_conformance_complex_where_with_or() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+    let setup = [
+        "CREATE TABLE items_cw (id INTEGER PRIMARY KEY, name TEXT, price REAL, cat TEXT, active INTEGER)",
+        "INSERT INTO items_cw VALUES (1,'A',10,'x',1),(2,'B',20,'y',0),(3,'C',30,'x',1),(4,'D',5,'y',1),(5,'E',15,'z',0)",
+    ];
+    for s in &setup {
+        fconn.execute(s).unwrap();
+        rconn.execute_batch(s).unwrap();
+    }
+
+    let queries = [
+        // Complex OR/AND combinations
+        "SELECT name FROM items_cw WHERE (cat = 'x' AND active = 1) OR (cat = 'y' AND price > 10) ORDER BY name",
+        "SELECT name FROM items_cw WHERE active = 1 AND (price < 10 OR price > 25) ORDER BY name",
+        "SELECT name FROM items_cw WHERE NOT (cat = 'z' OR active = 0) ORDER BY name",
+        // OR with subquery
+        "SELECT name FROM items_cw WHERE price > (SELECT AVG(price) FROM items_cw) OR active = 0 ORDER BY name",
+    ];
+
+    let mismatches = oracle_compare(&fconn, &rconn, &queries);
+    if !mismatches.is_empty() {
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
+        panic!("{} complex where or mismatches", mismatches.len());
+    }
+}
+
+#[test]
+fn test_conformance_empty_string_vs_null() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+    let setup = [
+        "CREATE TABLE esn (id INTEGER PRIMARY KEY, val TEXT)",
+        "INSERT INTO esn VALUES (1,''),(2,NULL),(3,'hello'),(4,''),(5,NULL)",
+    ];
+    for s in &setup {
+        fconn.execute(s).unwrap();
+        rconn.execute_batch(s).unwrap();
+    }
+
+    let queries = [
+        "SELECT id, val IS NULL FROM esn ORDER BY id",
+        "SELECT id, val = '' FROM esn ORDER BY id",
+        "SELECT id, val IS NOT NULL FROM esn ORDER BY id",
+        "SELECT id, COALESCE(val, 'default') FROM esn ORDER BY id",
+        "SELECT id, LENGTH(val) FROM esn ORDER BY id",
+        "SELECT COUNT(*), COUNT(val) FROM esn",
+        "SELECT id, TYPEOF(val) FROM esn ORDER BY id",
+        // Empty string is truthy in SQLite (unlike some databases)
+        "SELECT id, IIF(val, 'truthy', 'falsy') FROM esn ORDER BY id",
+    ];
+
+    let mismatches = oracle_compare(&fconn, &rconn, &queries);
+    if !mismatches.is_empty() {
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
+        panic!("{} empty string vs null mismatches", mismatches.len());
+    }
+}
+
+#[test]
+fn test_conformance_recursive_fibonacci() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+    let queries = [
+        // Fibonacci via recursive CTE
+        "WITH RECURSIVE fib(n, a, b) AS (\
+            SELECT 1, 0, 1 \
+            UNION ALL \
+            SELECT n+1, b, a+b FROM fib WHERE n < 10 \
+         ) SELECT n, a FROM fib ORDER BY n",
+        // Factorial via recursive CTE
+        "WITH RECURSIVE fact(n, f) AS (\
+            SELECT 1, 1 \
+            UNION ALL \
+            SELECT n+1, f*(n+1) FROM fact WHERE n < 10 \
+         ) SELECT n, f FROM fact ORDER BY n",
+        // Power of 2
+        "WITH RECURSIVE pow2(n, v) AS (\
+            SELECT 0, 1 \
+            UNION ALL \
+            SELECT n+1, v*2 FROM pow2 WHERE n < 10 \
+         ) SELECT n, v FROM pow2 ORDER BY n",
+    ];
+
+    let mismatches = oracle_compare(&fconn, &rconn, &queries);
+    if !mismatches.is_empty() {
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
+        panic!("{} recursive fibonacci mismatches", mismatches.len());
+    }
+}
+
+#[test]
+fn test_conformance_between_with_types() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+    let queries = [
+        "SELECT 5 BETWEEN 1 AND 10",
+        "SELECT 0 BETWEEN 1 AND 10",
+        "SELECT 10 BETWEEN 1 AND 10",
+        "SELECT 11 BETWEEN 1 AND 10",
+        "SELECT 5 NOT BETWEEN 1 AND 10",
+        "SELECT 'c' BETWEEN 'a' AND 'z'",
+        "SELECT 'hello' BETWEEN 'a' AND 'z'",
+        "SELECT NULL BETWEEN 1 AND 10",
+        "SELECT 5 BETWEEN NULL AND 10",
+        "SELECT 5 BETWEEN 1 AND NULL",
+    ];
+
+    let mismatches = oracle_compare(&fconn, &rconn, &queries);
+    if !mismatches.is_empty() {
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
+        panic!("{} between type mismatches", mismatches.len());
+    }
+}
