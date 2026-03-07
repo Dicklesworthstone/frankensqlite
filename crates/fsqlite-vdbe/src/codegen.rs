@@ -72,7 +72,7 @@ fn conflict_action_to_oe(action: Option<&ConflictAction>) -> u16 {
     }
 }
 
-fn json_access_func_name(arrow: &JsonArrow) -> &'static str {
+fn json_access_func_name(arrow: JsonArrow) -> &'static str {
     match arrow {
         JsonArrow::Arrow => "JSON_ARROW",
         JsonArrow::DoubleArrow => "JSON_DOUBLE_ARROW",
@@ -737,7 +737,7 @@ fn emit_upsert_expr(
                 0,
                 arg_base,
                 reg,
-                P4::FuncName(json_access_func_name(arrow).to_owned()),
+                P4::FuncName(json_access_func_name(*arrow).to_owned()),
                 2,
             );
         }
@@ -9000,7 +9000,7 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
                 0,
                 arg_base,
                 reg,
-                P4::FuncName(json_access_func_name(arrow).to_owned()),
+                P4::FuncName(json_access_func_name(*arrow).to_owned()),
                 2,
             );
         }

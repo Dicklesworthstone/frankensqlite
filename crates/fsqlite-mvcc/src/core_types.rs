@@ -158,7 +158,12 @@ impl VersionArena {
             .unwrap_or_else(|| panic!("VersionArena::take: double-free of {idx:?}"));
 
         // Increment generation on free so that any dangling VersionIdx becomes invalid.
-        slot.generation = slot.generation.wrapping_add(1);
+        // We skip u32::MAX to prevent collision with CHAIN_HEAD_EMPTY (u64::MAX) when packed.
+        let mut next_gen = slot.generation.wrapping_add(1);
+        if next_gen == u32::MAX {
+            next_gen = 0;
+        }
+        slot.generation = next_gen;
 
         self.free_list.push(idx);
         version

@@ -445,12 +445,12 @@ impl SharedPageLockTable {
                         }
                         return AcquireResult::Acquired;
                     }
-                    Err(current_owner) => {
-                        if current_owner == txn_id {
+                    Err(actual_owner) => {
+                        if actual_owner == txn_id {
                             return AcquireResult::AlreadyHeld;
                         }
                         return AcquireResult::Busy {
-                            holder: current_owner,
+                            holder: actual_owner,
                         };
                     }
                 }
@@ -1682,7 +1682,7 @@ mod tests {
             !table.is_rebuild_in_progress(),
             "quiescent drain must be finalized"
         );
-        assert_eq!(table.rebuild_epoch(), 1, "finalize should advance epoch");
+        assert_eq!(table.rebuild_epoch(), 1, "epoch must increment on rebuild");
     }
 
     // -- bd-3t3.8 test 7: crash cleanup via release_all_for_txn --
@@ -1740,7 +1740,7 @@ mod tests {
         assert_eq!(table.total_locked(), 8);
         assert_eq!(table.rebuild_epoch(), 0);
 
-        // Step 1: Acquire lease and rotate to fresh active table.
+        // Step 1: Acquire lease and rotate.
         table.acquire_rebuild_lease(42, 0, 1000).unwrap();
         table.rotate().unwrap();
 

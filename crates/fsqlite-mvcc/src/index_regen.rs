@@ -420,7 +420,7 @@ fn eval_function(name: &str, args: &[SqliteValue]) -> Result<SqliteValue, IndexR
                         Some(val) => SqliteValue::Integer(val),
                         None => SqliteValue::Float((i as f64).abs()),
                     },
-                    SqliteValue::Float(f) => SqliteValue::Float(if f < 0.0 { -f } else { f }),
+                    SqliteValue::Float(f) => SqliteValue::Float(f.abs()),
                     _ => SqliteValue::Integer(0),
                 })
             } else {

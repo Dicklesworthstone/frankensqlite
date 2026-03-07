@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use fsqlite_ast::{
     ColumnRef, Expr, FromClause, FunctionArgs, InSet, JoinClause, JoinConstraint, ResultColumn,
-    SelectCore, SelectStatement, Statement, TableOrSubquery,
+    SelectCore, SelectStatement, Statement, TableOrSubquery, WithClause,
 };
 use fsqlite_types::TypeAffinity;
 
@@ -191,8 +191,13 @@ impl Scope {
     /// Register a table alias with its columns.
     pub fn add_alias(&mut self, alias: &str, table_name: &str, columns: Option<HashSet<String>>) {
         let key = alias.to_ascii_lowercase();
-        self.aliases.insert(key.clone(), table_name.to_owned());
-        self.columns.insert(key, columns);
+        if self.aliases.contains_key(&key) {
+            self.aliases.insert(key.clone(), "<AMBIGUOUS>".to_owned());
+            self.columns.insert(key, None);
+        } else {
+            self.aliases.insert(key.clone(), table_name.to_owned());
+            self.columns.insert(key, columns);
+        }
     }
 
     /// Register a CTE name.
@@ -243,6 +248,9 @@ impl Scope {
 
         if let Some(qualifier) = table_qualifier {
             let key = qualifier.to_ascii_lowercase();
+            if self.aliases.get(&key).map(String::as_str) == Some("<AMBIGUOUS>") {
+                return ResolveResult::Ambiguous(vec![key]);
+            }
             if let Some(cols) = self.columns.get(&key) {
                 if cols.as_ref().is_none_or(|c| c.contains(&col_lower)) {
                     return ResolveResult::Resolved(key);
@@ -253,10 +261,6 @@ impl Scope {
                             return ResolveResult::Resolved(key);
                         }
                     }
-                }
-                // Check parent scope.
-                if let Some(ref parent) = self.parent {
-                    return parent.resolve_column(schema, table_qualifier, column_name);
                 }
                 return ResolveResult::ColumnNotFound;
             }
@@ -272,6 +276,9 @@ impl Scope {
         let mut unknown_matches = Vec::new();
 
         for (alias, cols) in &self.columns {
+            if self.aliases.get(alias).map(String::as_str) == Some("<AMBIGUOUS>") {
+                continue; // Do not resolve unqualified columns from ambiguous aliases
+            }
             let is_match = match cols {
                 Some(c) => {
                     c.contains(&col_lower) || {
@@ -292,40 +299,33 @@ impl Scope {
             }
         }
 
-        match known_matches.len() {
-            0 => match unknown_matches.len() {
-                0 => {
-                    // Check parent scope.
-                    if let Some(ref parent) = self.parent {
-                        return parent.resolve_column(schema, None, column_name);
-                    }
-                    ResolveResult::ColumnNotFound
+        let total_matches = known_matches.len() + unknown_matches.len();
+
+        match total_matches {
+            0 => {
+                // Check parent scope.
+                if let Some(ref parent) = self.parent {
+                    return parent.resolve_column(schema, None, column_name);
                 }
-                1 => {
+                ResolveResult::ColumnNotFound
+            }
+            1 => {
+                if known_matches.len() == 1 {
+                    ResolveResult::Resolved(known_matches.into_iter().next().unwrap_or_default())
+                } else {
                     ResolveResult::Resolved(unknown_matches.into_iter().next().unwrap_or_default())
                 }
-                _ => {
-                    unknown_matches.sort();
-                    if self.using_columns.contains(&col_lower) {
-                        ResolveResult::Resolved(
-                            unknown_matches.into_iter().next().unwrap_or_default(),
-                        )
-                    } else if unknown_matches.contains(&"<output>".to_owned()) {
-                        ResolveResult::Resolved("<output>".to_owned())
-                    } else {
-                        ResolveResult::Ambiguous(unknown_matches)
-                    }
-                }
-            },
-            1 => ResolveResult::Resolved(known_matches.into_iter().next().unwrap_or_default()),
+            }
             _ => {
-                known_matches.sort();
+                let mut all_matches = known_matches;
+                all_matches.extend(unknown_matches);
+                all_matches.sort();
                 if self.using_columns.contains(&col_lower) {
-                    ResolveResult::Resolved(known_matches.into_iter().next().unwrap_or_default())
-                } else if known_matches.contains(&"<output>".to_owned()) {
+                    ResolveResult::Resolved(all_matches.into_iter().next().unwrap_or_default())
+                } else if all_matches.contains(&"<output>".to_owned()) {
                     ResolveResult::Resolved("<output>".to_owned())
                 } else {
-                    ResolveResult::Ambiguous(known_matches)
+                    ResolveResult::Ambiguous(all_matches)
                 }
             }
         }
@@ -499,13 +499,7 @@ impl<'a> Resolver<'a> {
             Statement::Insert(insert) => {
                 // Process WITH clause CTEs if present.
                 if let Some(ref with) = insert.with {
-                    for cte in &with.ctes {
-                        scope.add_cte(&cte.name);
-                    }
-                    for cte in &with.ctes {
-                        let mut cte_scope = scope.clone();
-                        self.resolve_select(&cte.query, &mut cte_scope);
-                    }
+                    self.resolve_with_clause(with, scope);
                 }
                 match &insert.source {
                     fsqlite_ast::InsertSource::Select(select) => {
@@ -591,13 +585,7 @@ impl<'a> Resolver<'a> {
             Statement::Update(update) => {
                 // Process WITH clause CTEs if present.
                 if let Some(ref with) = update.with {
-                    for cte in &with.ctes {
-                        scope.add_cte(&cte.name);
-                    }
-                    for cte in &with.ctes {
-                        let mut cte_scope = scope.clone();
-                        self.resolve_select(&cte.query, &mut cte_scope);
-                    }
+                    self.resolve_with_clause(with, scope);
                 }
                 self.bind_table_to_scope(
                     &update.table.name.name,
@@ -641,13 +629,7 @@ impl<'a> Resolver<'a> {
             Statement::Delete(delete) => {
                 // Process WITH clause CTEs if present.
                 if let Some(ref with) = delete.with {
-                    for cte in &with.ctes {
-                        scope.add_cte(&cte.name);
-                    }
-                    for cte in &with.ctes {
-                        let mut cte_scope = scope.clone();
-                        self.resolve_select(&cte.query, &mut cte_scope);
-                    }
+                    self.resolve_with_clause(with, scope);
                 }
                 self.bind_table_to_scope(
                     &delete.table.name.name,
@@ -675,11 +657,9 @@ impl<'a> Resolver<'a> {
         }
     }
 
-    fn resolve_select(&mut self, select: &SelectStatement, scope: &mut Scope) {
-        // Register CTEs first (they are visible in the entire WITH scope),
-        // then resolve each CTE body query so that column errors inside CTEs
-        // are detected.
-        if let Some(ref with) = select.with {
+    fn resolve_with_clause(&mut self, with: &WithClause, scope: &mut Scope) {
+        if with.recursive {
+            // In WITH RECURSIVE, all CTE names are visible to all CTE bodies.
             for cte in &with.ctes {
                 scope.add_cte(&cte.name);
             }
@@ -687,6 +667,21 @@ impl<'a> Resolver<'a> {
                 let mut cte_scope = scope.clone();
                 self.resolve_select(&cte.query, &mut cte_scope);
             }
+        } else {
+            // In plain WITH, a CTE body can only see previously defined CTEs.
+            for cte in &with.ctes {
+                let mut cte_scope = scope.clone();
+                self.resolve_select(&cte.query, &mut cte_scope);
+                // Add *after* resolving the query so it can't see itself or subsequent CTEs.
+                scope.add_cte(&cte.name);
+            }
+        }
+    }
+
+    fn resolve_select(&mut self, select: &SelectStatement, scope: &mut Scope) {
+        // Register CTEs if present.
+        if let Some(ref with) = select.with {
+            self.resolve_with_clause(with, scope);
         }
 
         // Resolve the primary select core in an isolated scope.
@@ -699,8 +694,14 @@ impl<'a> Resolver<'a> {
             self.resolve_select_core(core, &mut comp_scope);
         }
 
-        // Resolve ORDER BY against the first core's scope augmented with SELECT aliases.
-        let mut order_by_scope = first_core_scope.clone();
+        // Resolve ORDER BY against the appropriate scope.
+        // In compound queries, ORDER BY can ONLY reference result columns.
+        let mut order_by_scope = if select.body.compounds.is_empty() {
+            first_core_scope.clone()
+        } else {
+            scope.clone() // Start with outer scope, not first_core_scope (so FROM aliases aren't visible)
+        };
+
         if let SelectCore::Select { columns, .. } = &select.body.select {
             let mut output_cols = HashSet::new();
             for col in columns {
@@ -710,6 +711,13 @@ impl<'a> Resolver<'a> {
                 } = col
                 {
                     output_cols.insert(alias_id.to_ascii_lowercase());
+                } else if let ResultColumn::Expr {
+                    expr: Expr::Column(col_ref, _),
+                    ..
+                } = col
+                {
+                    // Also add un-aliased column names to output_cols
+                    output_cols.insert(col_ref.column.to_ascii_lowercase());
                 }
             }
             if !output_cols.is_empty() {
@@ -757,29 +765,51 @@ impl<'a> Resolver<'a> {
                     self.resolve_expr(where_expr, scope);
                 }
 
+                // Create a scope for GROUP BY, HAVING, and WINDOW that includes output columns.
+                let mut post_select_scope = scope.clone();
+                let mut output_cols = HashSet::new();
+                for col in columns {
+                    if let ResultColumn::Expr {
+                        alias: Some(alias_id),
+                        ..
+                    } = col
+                    {
+                        output_cols.insert(alias_id.to_ascii_lowercase());
+                    } else if let ResultColumn::Expr {
+                        expr: Expr::Column(col_ref, _),
+                        ..
+                    } = col
+                    {
+                        output_cols.insert(col_ref.column.to_ascii_lowercase());
+                    }
+                }
+                if !output_cols.is_empty() {
+                    post_select_scope.add_alias("<output>", "<output>", Some(output_cols));
+                }
+
                 // Resolve GROUP BY.
                 for expr in group_by {
-                    self.resolve_expr(expr, scope);
+                    self.resolve_expr(expr, &post_select_scope);
                 }
 
                 // Resolve HAVING.
                 if let Some(having_expr) = having {
-                    self.resolve_expr(having_expr, scope);
+                    self.resolve_expr(having_expr, &post_select_scope);
                 }
 
                 // Resolve WINDOW definitions.
                 for window_def in windows {
                     for expr in &window_def.spec.partition_by {
-                        self.resolve_expr(expr, scope);
+                        self.resolve_expr(expr, &post_select_scope);
                     }
                     for term in &window_def.spec.order_by {
-                        self.resolve_expr(&term.expr, scope);
+                        self.resolve_expr(&term.expr, &post_select_scope);
                     }
                     if let Some(frame) = &window_def.spec.frame {
                         match &frame.start {
                             fsqlite_ast::FrameBound::Preceding(expr)
                             | fsqlite_ast::FrameBound::Following(expr) => {
-                                self.resolve_expr(expr, scope);
+                                self.resolve_expr(expr, &post_select_scope);
                             }
                             _ => {}
                         }
@@ -788,7 +818,7 @@ impl<'a> Resolver<'a> {
                             | fsqlite_ast::FrameBound::Following(expr),
                         ) = &frame.end
                         {
-                            self.resolve_expr(expr, scope);
+                            self.resolve_expr(expr, &post_select_scope);
                         }
                     }
                 }
@@ -844,8 +874,6 @@ impl<'a> Resolver<'a> {
                 let mut child = Scope::child(scope.clone());
                 self.resolve_select(query, &mut child);
 
-                // Register the subquery alias with empty columns (we don't
-                // track subquery output columns at this stage).
                 let alias_name = if let Some(a) = alias {
                     a.clone()
                 } else {
@@ -858,7 +886,39 @@ impl<'a> Resolver<'a> {
                     });
                 }
 
-                scope.add_alias(&alias_name, "<subquery>", None);
+                let mut output_cols = HashSet::new();
+                let mut is_complete = true;
+                if let SelectCore::Select { columns, .. } = &query.body.select {
+                    for col in columns {
+                        match col {
+                            ResultColumn::Expr {
+                                alias: Some(alias_id),
+                                ..
+                            } => {
+                                output_cols.insert(alias_id.to_ascii_lowercase());
+                            }
+                            ResultColumn::Expr {
+                                expr: Expr::Column(col_ref, _),
+                                ..
+                            } => {
+                                output_cols.insert(col_ref.column.to_ascii_lowercase());
+                            }
+                            ResultColumn::Star | ResultColumn::TableStar(_) => {
+                                is_complete = false;
+                            }
+                            _ => {}
+                        }
+                    }
+                } else {
+                    is_complete = false;
+                }
+
+                if is_complete {
+                    scope.add_alias(&alias_name, "<subquery>", Some(output_cols));
+                } else {
+                    scope.add_alias(&alias_name, "<subquery>", None);
+                }
+
                 self.tables_resolved += 1;
             }
             TableOrSubquery::TableFunction {
@@ -1628,14 +1688,14 @@ mod tests {
     #[test]
     fn test_unaliased_subqueries() {
         let schema = make_schema();
-        // Since there are two unknown subqueries, "a" should be reported as ambiguous
+        // Since there are two unknown subqueries and a is not known, "a" should be reported as unresolved
         let stmt = parse_one("SELECT a FROM (SELECT 1), (SELECT 2)");
         let mut resolver = Resolver::new(&schema);
         let errors = resolver.resolve_statement(&stmt);
-        assert_eq!(errors.len(), 1, "Expected ambiguous column error!");
+        assert_eq!(errors.len(), 1, "Expected unresolved column error!");
         assert!(matches!(
             errors[0].kind,
-            SemanticErrorKind::AmbiguousColumn { .. }
+            SemanticErrorKind::UnresolvedColumn { .. }
         ));
     }
 

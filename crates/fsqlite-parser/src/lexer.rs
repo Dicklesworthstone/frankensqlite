@@ -326,7 +326,7 @@ impl<'a> Lexer<'a> {
         let newlines = slice.iter().filter(|&&b| b == b'\n').count();
         if newlines > 0 {
             self.line += newlines as u32;
-            let last_nl = slice.iter().rposition(|&b| b == b'\n').unwrap();
+            let last_nl = slice.iter().rposition(|&b| b == b'\n').unwrap_or(0);
             self.col = (n - last_nl) as u32;
         } else {
             self.col += n as u32;
@@ -723,7 +723,17 @@ impl<'a> Lexer<'a> {
         if is_float {
             match text.parse::<f64>() {
                 Ok(v) => TokenKind::Float(v),
-                Err(_) => TokenKind::Error(format!("invalid float: {text}")),
+                Err(_) => {
+                    // Rust's f64 parser rejects `.e4` but SQLite accepts it as 0.0.
+                    let mut text_fixed = text.clone().into_owned();
+                    if text_fixed.starts_with(".e") || text_fixed.starts_with(".E") {
+                        text_fixed.insert(0, '0');
+                    }
+                    match text_fixed.parse::<f64>() {
+                        Ok(v) => TokenKind::Float(v),
+                        Err(_) => TokenKind::Error(format!("invalid float: {text}")),
+                    }
+                }
             }
         } else {
             match text.parse::<i64>() {

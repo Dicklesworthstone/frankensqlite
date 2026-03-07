@@ -1125,13 +1125,49 @@ pub enum SltKind {
 /// ----
 /// 1|2|3
 /// ```
+///
+/// The parser ignores suite-level control lines such as `skipif`, `onlyif`,
+/// `hash-threshold`, and standalone comments. `skipif` / `onlyif` are
+/// interpreted relative to the SQLite target so that SQLite-relevant records
+/// are ingested while records excluded for SQLite are dropped.
 pub fn parse_slt(content: &str) -> Vec<SltEntry> {
     let mut entries = Vec::new();
     let lines: Vec<&str> = content.lines().collect();
-    let mut i = 0;
+    let mut i = 0_usize;
+    let mut include_next_record = true;
 
     while i < lines.len() {
         let line = lines[i].trim();
+
+        if line.is_empty() || line.starts_with('#') || line.starts_with("--") {
+            i += 1;
+            continue;
+        }
+
+        if let Some(backend) = slt_backend_directive(line, "skipif") {
+            if slt_backend_matches_sqlite(backend) {
+                include_next_record = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        if let Some(backend) = slt_backend_directive(line, "onlyif") {
+            if !slt_backend_matches_sqlite(backend) {
+                include_next_record = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        if line
+            .split_whitespace()
+            .next()
+            .is_some_and(|token| token.eq_ignore_ascii_case("hash-threshold"))
+        {
+            i += 1;
+            continue;
+        }
 
         if line.starts_with("statement") {
             let result_type = line
@@ -1145,12 +1181,18 @@ pub fn parse_slt(content: &str) -> Vec<SltEntry> {
                 sql_lines.push(lines[i]);
                 i += 1;
             }
-            entries.push(SltEntry {
-                kind: SltKind::Statement,
-                sql: sql_lines.join("\n"),
-                result_type,
-                expected: Vec::new(),
-            });
+            if include_next_record {
+                let sql = sql_lines.join("\n");
+                if !sql.trim().is_empty() {
+                    entries.push(SltEntry {
+                        kind: SltKind::Statement,
+                        sql,
+                        result_type,
+                        expected: Vec::new(),
+                    });
+                }
+            }
+            include_next_record = true;
         } else if line.starts_with("query") {
             let result_type = line.strip_prefix("query").unwrap_or("").trim().to_string();
             i += 1;
@@ -1169,12 +1211,18 @@ pub fn parse_slt(content: &str) -> Vec<SltEntry> {
                 expected.push(lines[i].to_string());
                 i += 1;
             }
-            entries.push(SltEntry {
-                kind: SltKind::Query,
-                sql: sql_lines.join("\n"),
-                result_type,
-                expected,
-            });
+            if include_next_record {
+                let sql = sql_lines.join("\n");
+                if !sql.trim().is_empty() {
+                    entries.push(SltEntry {
+                        kind: SltKind::Query,
+                        sql,
+                        result_type,
+                        expected,
+                    });
+                }
+            }
+            include_next_record = true;
         } else if line.starts_with("halt") {
             entries.push(SltEntry {
                 kind: SltKind::Halt,
@@ -1189,6 +1237,34 @@ pub fn parse_slt(content: &str) -> Vec<SltEntry> {
     }
 
     entries
+}
+
+fn slt_backend_directive<'a>(line: &'a str, keyword: &str) -> Option<&'a str> {
+    let mut tokens = line.split_whitespace();
+    let directive = tokens.next()?;
+    if !directive.eq_ignore_ascii_case(keyword) {
+        return None;
+    }
+    tokens.next()
+}
+
+fn slt_backend_matches_sqlite(backend: &str) -> bool {
+    backend.eq_ignore_ascii_case("sqlite")
+        || backend.eq_ignore_ascii_case("sqlite3")
+        || backend.eq_ignore_ascii_case("frankensqlite")
+}
+
+fn slt_query_order_is_significant(result_type: &str) -> bool {
+    let mut tokens = result_type.split_whitespace();
+    let _type_string = tokens.next();
+    let Some(sort_mode) = tokens.next() else {
+        return true;
+    };
+
+    !matches!(
+        sort_mode.to_ascii_lowercase().as_str(),
+        "nosort" | "rowsort" | "valuesort"
+    )
 }
 
 /// Convert SLT entries into a `TestFixture`.
@@ -1222,8 +1298,7 @@ pub fn slt_entries_to_fixture(entries: &[SltEntry], fixture_id: &str) -> TestFix
                         .collect();
                     QueryExpectation {
                         rows,
-                        ordered: entry.result_type.contains("rowsort")
-                            || entry.result_type.contains("nosort"),
+                        ordered: slt_query_order_is_significant(&entry.result_type),
                         ..QueryExpectation::default()
                     }
                 };
@@ -1444,6 +1519,113 @@ SELECT a FROM t1 ORDER BY a
             6,
             "bead_id={TEST_BEAD_ID} expected 6 fixture ops (1 open + 5 sql)"
         );
+    }
+
+    #[test]
+    fn test_slt_parser_honors_sqlite_directives() {
+        let slt_content = "\
+# comment-only metadata
+hash-threshold 8
+
+skipif sqlite
+statement ok
+CREATE TABLE skipped_sqlite(v INTEGER)
+
+onlyif postgresql
+statement ok
+CREATE TABLE skipped_onlyif(v INTEGER)
+
+onlyif sqlite
+statement ok
+CREATE TABLE kept(v INTEGER)
+
+skipif mysql
+statement ok
+INSERT INTO kept VALUES(1)
+
+query I keep_label
+SELECT v FROM kept ORDER BY v
+----
+1
+
+halt
+statement ok
+SELECT 99
+";
+
+        let entries = parse_slt(slt_content);
+        assert_eq!(entries.len(), 4);
+        assert_eq!(entries[0].kind, SltKind::Statement);
+        assert_eq!(entries[0].sql, "CREATE TABLE kept(v INTEGER)");
+        assert_eq!(entries[1].kind, SltKind::Statement);
+        assert_eq!(entries[1].sql, "INSERT INTO kept VALUES(1)");
+        assert_eq!(entries[2].kind, SltKind::Query);
+        assert_eq!(entries[2].expected, vec!["1".to_owned()]);
+        assert_eq!(entries[3].kind, SltKind::Halt);
+    }
+
+    #[test]
+    fn test_slt_entries_to_fixture_respects_sort_modes() {
+        let slt_content = "\
+query I nosort
+SELECT 1
+----
+1
+
+query I rowsort
+SELECT 2
+----
+2
+
+query I valuesort
+SELECT 3
+----
+3
+
+query I label_only
+SELECT 4
+----
+4
+";
+
+        let entries = parse_slt(slt_content);
+        let fixture = slt_entries_to_fixture(&entries, "sort_modes");
+
+        let FixtureOp::Query {
+            expect: nosort_expect,
+            ..
+        } = &fixture.ops[1]
+        else {
+            panic!("expected first query op");
+        };
+        assert!(!nosort_expect.ordered);
+
+        let FixtureOp::Query {
+            expect: rowsort_expect,
+            ..
+        } = &fixture.ops[2]
+        else {
+            panic!("expected second query op");
+        };
+        assert!(!rowsort_expect.ordered);
+
+        let FixtureOp::Query {
+            expect: valuesort_expect,
+            ..
+        } = &fixture.ops[3]
+        else {
+            panic!("expected third query op");
+        };
+        assert!(!valuesort_expect.ordered);
+
+        let FixtureOp::Query {
+            expect: default_expect,
+            ..
+        } = &fixture.ops[4]
+        else {
+            panic!("expected fourth query op");
+        };
+        assert!(default_expect.ordered);
     }
 
     #[test]

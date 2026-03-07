@@ -3652,8 +3652,14 @@ impl Connection {
                 }
             }
 
-            // TODO: Evaluate STORED generated columns in the fallback path.
-            // The VDBE bytecode path handles this via emit_stored_generated_columns.
+            // Verify we don't silently ignore STORED generated columns in the fallback path.
+            for col_info in &table_schema.columns {
+                if col_info.generated_stored == Some(true) {
+                    return Err(FrankenError::NotImplemented(
+                        "STORED generated columns are not yet supported in the INSERT OR REPLACE fallback path".to_owned()
+                    ));
+                }
+            }
 
             let mut db = self.db.borrow_mut();
 
@@ -12423,6 +12429,12 @@ impl Connection {
                 // where rows with equal ORDER BY keys share the same value.
                 let is_peer_aware = matches!(fname.as_str(), "CUME_DIST" | "PERCENT_RANK");
 
+                // Functions that track row position via inverse() (ntile, lead)
+                // must always use the generic value+inverse loop after stepping
+                // the full partition. They must NOT be rerouted through the
+                // running-frame path which never calls inverse().
+                let uses_inverse_counter = matches!(fname.as_str(), "NTILE" | "LEAD");
+
                 if win_two_pass[wi] {
                     // Two-pass: step all rows first.
                     for &ri in partition_indices {
@@ -12434,15 +12446,23 @@ impl Connection {
                         )?;
                         func.step(&mut state, &args)?;
                     }
-                    if !has_order {
+                    if uses_inverse_counter {
+                        // Functions relying on inverse() to advance row
+                        // counter: value+inverse per row.
+                        for _ in partition_indices {
+                            window_results[wi].push(func.value(&state)?);
+                            func.inverse(&mut state, &[])?;
+                        }
+                    } else if !has_order {
                         // No ORDER BY → frame is entire partition.
                         let val = func.value(&state)?;
                         for _ in partition_indices {
                             window_results[wi].push(val.clone());
                         }
                     } else if is_peer_aware {
-                        // Peer-group evaluation for cume_dist/percent_rank.
-                        // Group consecutive rows with equal ORDER BY keys.
+                        // Direct computation for cume_dist/percent_rank using
+                        // peer-group positions — avoids step/inverse/value
+                        // protocol mismatch.
                         let psize = partition_indices.len();
                         let mut pos = 0;
                         while pos < psize {
@@ -12463,12 +12483,18 @@ impl Connection {
                                 }
                                 peer_end += 1;
                             }
-                            // For cume_dist: advance inverse to consume the entire peer group,
-                            // then compute value once for all peers.
-                            for _ in 0..(peer_end - pos) {
-                                func.inverse(&mut state, &[])?;
-                            }
-                            let val = func.value(&state)?;
+                            let val = if fname == "CUME_DIST" {
+                                // cume_dist = (last peer position) / partition_size
+                                SqliteValue::Float(peer_end as f64 / psize as f64)
+                            } else {
+                                // percent_rank = (rank - 1) / (partition_size - 1)
+                                // where rank = pos + 1 (1-based position of first peer)
+                                if psize <= 1 {
+                                    SqliteValue::Float(0.0)
+                                } else {
+                                    SqliteValue::Float(pos as f64 / (psize - 1) as f64)
+                                }
+                            };
                             for _ in pos..peer_end {
                                 window_results[wi].push(val.clone());
                             }
@@ -37910,7 +37936,10 @@ mod pager_routing_tests {
             .query("SELECT data -> '$.x' FROM jt2s WHERE id = 1;")
             .unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].values()[0], SqliteValue::Text(r#""hello""#.to_owned()));
+        assert_eq!(
+            rows[0].values()[0],
+            SqliteValue::Text(r#""hello""#.to_owned())
+        );
     }
 
     #[test]
@@ -37931,8 +37960,12 @@ mod pager_routing_tests {
     #[test]
     fn test_json_arrow_integer_shorthand_extracts_array_index() {
         let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE jt2i (id INTEGER PRIMARY KEY, data TEXT);")
+            .unwrap();
+        conn.execute(r#"INSERT INTO jt2i VALUES (1, '[10,20,30]');"#)
+            .unwrap();
         let rows = conn
-            .query("SELECT '[10,20,30]' -> 1, '[10,20,30]' ->> 1;")
+            .query("SELECT data -> 1, data ->> 1 FROM jt2i WHERE id = 1;")
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values()[0], SqliteValue::Text("20".to_owned()));
@@ -57536,7 +57569,51 @@ mod pager_routing_tests {
             for m in &mismatches {
                 eprintln!("{m}\n");
             }
-            panic!("{} GROUP BY advanced expression mismatches", mismatches.len());
+            panic!(
+                "{} GROUP BY advanced expression mismatches",
+                mismatches.len()
+            );
+        }
+    }
+
+    /// Probe NTILE, LEAD window functions via oracle.
+    #[test]
+    fn test_conformance_window_ntile_lead_oracle() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE wt (id INTEGER PRIMARY KEY, val INTEGER, grp TEXT)",
+            "INSERT INTO wt VALUES (1, 10, 'A')",
+            "INSERT INTO wt VALUES (2, 20, 'A')",
+            "INSERT INTO wt VALUES (3, 30, 'A')",
+            "INSERT INTO wt VALUES (4, 40, 'B')",
+            "INSERT INTO wt VALUES (5, 50, 'B')",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            // NTILE(2) over 3 rows: [1, 1, 2]
+            "SELECT id, val, NTILE(2) OVER (ORDER BY val) AS tile FROM wt WHERE grp='A' ORDER BY id",
+            // NTILE(3) over 5 rows: [1, 1, 2, 2, 3]
+            "SELECT id, val, NTILE(3) OVER (ORDER BY val) AS tile FROM wt ORDER BY id",
+            // NTILE with PARTITION BY
+            "SELECT id, grp, NTILE(2) OVER (PARTITION BY grp ORDER BY val) AS tile FROM wt ORDER BY id",
+            // LEAD
+            "SELECT id, val, LEAD(val) OVER (ORDER BY id) AS next_val FROM wt ORDER BY id",
+            "SELECT id, val, LEAD(val, 2) OVER (ORDER BY id) AS skip_val FROM wt ORDER BY id",
+            "SELECT id, val, LEAD(val, 1, -1) OVER (ORDER BY id) AS next_or_default FROM wt ORDER BY id",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!("{} NTILE/LEAD window function mismatches", mismatches.len());
         }
     }
 
@@ -57660,13 +57737,14 @@ mod pager_routing_tests {
         }
 
         // INSERT...SELECT
-        fconn.execute("INSERT INTO dst SELECT * FROM src WHERE num >= 20").unwrap();
-        rconn.execute_batch("INSERT INTO dst SELECT * FROM src WHERE num >= 20").unwrap();
+        fconn
+            .execute("INSERT INTO dst SELECT * FROM src WHERE num >= 20")
+            .unwrap();
+        rconn
+            .execute_batch("INSERT INTO dst SELECT * FROM src WHERE num >= 20")
+            .unwrap();
 
-        let queries = [
-            "SELECT * FROM dst ORDER BY id",
-            "SELECT COUNT(*) FROM dst",
-        ];
+        let queries = ["SELECT * FROM dst ORDER BY id", "SELECT COUNT(*) FROM dst"];
 
         let mismatches = oracle_compare(&fconn, &rconn, &queries);
         if !mismatches.is_empty() {
@@ -57677,12 +57755,14 @@ mod pager_routing_tests {
         }
 
         // INSERT with column list
-        fconn.execute("INSERT INTO dst (id, val) VALUES (99, 'extra')").unwrap();
-        rconn.execute_batch("INSERT INTO dst (id, val) VALUES (99, 'extra')").unwrap();
+        fconn
+            .execute("INSERT INTO dst (id, val) VALUES (99, 'extra')")
+            .unwrap();
+        rconn
+            .execute_batch("INSERT INTO dst (id, val) VALUES (99, 'extra')")
+            .unwrap();
 
-        let queries2 = [
-            "SELECT id, val, num FROM dst WHERE id = 99",
-        ];
+        let queries2 = ["SELECT id, val, num FROM dst WHERE id = 99"];
 
         let mismatches2 = oracle_compare(&fconn, &rconn, &queries2);
         if !mismatches2.is_empty() {
@@ -57839,20 +57919,14 @@ mod pager_routing_tests {
         let fconn = Connection::open(":memory:").unwrap();
         let rconn = rusqlite::Connection::open_in_memory().unwrap();
 
-        let setup = [
-            "CREATE TABLE txn (id INTEGER PRIMARY KEY, val TEXT)",
-        ];
+        let setup = ["CREATE TABLE txn (id INTEGER PRIMARY KEY, val TEXT)"];
         for s in &setup {
             fconn.execute(s).unwrap();
             rconn.execute_batch(s).unwrap();
         }
 
         // Insert, commit
-        let ops = [
-            "BEGIN",
-            "INSERT INTO txn VALUES (1, 'committed')",
-            "COMMIT",
-        ];
+        let ops = ["BEGIN", "INSERT INTO txn VALUES (1, 'committed')", "COMMIT"];
         for s in &ops {
             fconn.execute(s).unwrap();
             rconn.execute_batch(s).unwrap();
@@ -57884,10 +57958,7 @@ mod pager_routing_tests {
             rconn.execute_batch(s).unwrap();
         }
 
-        let queries = [
-            "SELECT * FROM txn ORDER BY id",
-            "SELECT COUNT(*) FROM txn",
-        ];
+        let queries = ["SELECT * FROM txn ORDER BY id", "SELECT COUNT(*) FROM txn"];
 
         let mismatches = oracle_compare(&fconn, &rconn, &queries);
         if !mismatches.is_empty() {
@@ -57943,6 +58014,154 @@ mod pager_routing_tests {
                 eprintln!("{m}\n");
             }
             panic!("{} index query mismatches", mismatches.len());
+        }
+    }
+
+    /// Probe numeric edge cases: overflow, float precision, division.
+    #[test]
+    fn test_conformance_numeric_edge_cases_deep() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let queries = [
+            "SELECT 9223372036854775807",
+            "SELECT -9223372036854775808",
+            "SELECT typeof(9223372036854775807)",
+            "SELECT typeof(9223372036854775808)",
+            "SELECT 9223372036854775807 + 1",
+            "SELECT 0.1 + 0.2",
+            "SELECT typeof(0.1 + 0.2)",
+            "SELECT 10 / 3",
+            "SELECT 10.0 / 3.0",
+            "SELECT typeof(10 / 3)",
+            "SELECT typeof(10.0 / 3.0)",
+            "SELECT 10 % 3",
+            "SELECT -10 % 3",
+            "SELECT -(-9223372036854775807)",
+            "SELECT 1 = 1.0",
+            "SELECT 1 < 1.5",
+            "SELECT 2.0 > 1",
+            "SELECT typeof(1e999)",
+            "SELECT 0 = -0",
+            "SELECT 0.0 = -0.0",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!("{} numeric edge case mismatches", mismatches.len());
+        }
+    }
+
+    /// Probe complex WHERE: OR/AND combos, nested predicates, subqueries.
+    #[test]
+    fn test_conformance_complex_where_predicates() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT, price REAL, category TEXT, in_stock INTEGER)",
+            "INSERT INTO products VALUES (1, 'Widget', 9.99, 'A', 1)",
+            "INSERT INTO products VALUES (2, 'Gadget', 24.99, 'B', 1)",
+            "INSERT INTO products VALUES (3, 'Thingamajig', 4.99, 'A', 0)",
+            "INSERT INTO products VALUES (4, 'Doohickey', 14.99, 'C', 1)",
+            "INSERT INTO products VALUES (5, 'Whatchamacallit', 34.99, 'B', 0)",
+            "INSERT INTO products VALUES (6, 'Gizmo', 19.99, 'A', 1)",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            "SELECT name FROM products WHERE (category = 'A' OR category = 'B') AND in_stock = 1 ORDER BY name",
+            "SELECT name FROM products WHERE (price < 10 AND in_stock = 1) OR (price > 30) ORDER BY name",
+            "SELECT name FROM products WHERE NOT (category = 'A' AND price < 5) ORDER BY name",
+            "SELECT name FROM products WHERE price BETWEEN 10 AND 25 OR category = 'C' ORDER BY name",
+            "SELECT name FROM products WHERE category IN ('A', 'C') AND price > 10 ORDER BY name",
+            "SELECT name FROM products WHERE price > (SELECT AVG(price) FROM products) ORDER BY name",
+            "SELECT p.name FROM products p WHERE EXISTS (SELECT 1 FROM products p2 WHERE p2.category = p.category AND p2.id != p.id) ORDER BY p.name",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!("{} complex WHERE mismatches", mismatches.len());
+        }
+    }
+
+    /// Probe multi-table JOIN with aggregate, DELETE, then verify state.
+    #[test]
+    fn test_conformance_join_aggregate_delete() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE authors (id INTEGER PRIMARY KEY, name TEXT)",
+            "INSERT INTO authors VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Carol')",
+            "CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT, author_id INTEGER, copies INTEGER)",
+            "INSERT INTO books VALUES (1, 'Book A', 1, 5)",
+            "INSERT INTO books VALUES (2, 'Book B', 1, 3)",
+            "INSERT INTO books VALUES (3, 'Book C', 2, 8)",
+            "INSERT INTO books VALUES (4, 'Book D', 3, 0)",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            "SELECT a.name, b.title FROM authors a JOIN books b ON a.id = b.author_id ORDER BY a.name, b.title",
+            "SELECT a.name, COUNT(b.id) AS book_count, SUM(b.copies) AS total_copies FROM authors a LEFT JOIN books b ON a.id = b.author_id GROUP BY a.name ORDER BY a.name",
+            "SELECT a.name, SUM(b.copies) AS total FROM authors a JOIN books b ON a.id = b.author_id GROUP BY a.name HAVING total > 5 ORDER BY a.name",
+        ];
+
+        fconn.execute("DELETE FROM books WHERE copies = 0").unwrap();
+        rconn
+            .execute_batch("DELETE FROM books WHERE copies = 0")
+            .unwrap();
+
+        let after_delete = [
+            "SELECT COUNT(*) FROM books",
+            "SELECT title FROM books ORDER BY title",
+        ];
+
+        let mut all: Vec<&str> = queries.to_vec();
+        all.extend(after_delete.iter());
+
+        let mismatches = oracle_compare(&fconn, &rconn, &all);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!("{} join/aggregate/delete mismatches", mismatches.len());
+        }
+    }
+
+    /// Probe CTE: recursive, multiple, with aggregation.
+    #[test]
+    fn test_conformance_cte_recursive_multi() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let queries = [
+            "WITH nums AS (SELECT 1 AS n UNION ALL SELECT 2 UNION ALL SELECT 3) SELECT * FROM nums ORDER BY n",
+            "WITH a AS (SELECT 1 AS x), b AS (SELECT 2 AS y) SELECT a.x, b.y FROM a, b",
+            "WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM cnt WHERE x < 10) SELECT x FROM cnt",
+            "WITH RECURSIVE pow2(x) AS (SELECT 1 UNION ALL SELECT x*2 FROM pow2 WHERE x < 100) SELECT x FROM pow2",
+            "WITH data AS (SELECT 1 AS grp, 10 AS val UNION ALL SELECT 1, 20 UNION ALL SELECT 2, 30) SELECT grp, SUM(val) FROM data GROUP BY grp ORDER BY grp",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!("{} CTE mismatches", mismatches.len());
         }
     }
 }

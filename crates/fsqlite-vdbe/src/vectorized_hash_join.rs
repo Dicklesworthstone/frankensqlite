@@ -288,13 +288,25 @@ fn extract_key(batch: &Batch, key_columns: &[usize], row: usize) -> Result<Vec<K
             ColumnData::Int64(v) => KeyValue::Integer(v.as_slice()[row]),
             ColumnData::Float32(v) => {
                 let f = f64::from(v.as_slice()[row]);
-                let f_norm = if f == 0.0 { 0.0 } else { f };
-                KeyValue::FloatBits(f_norm.to_bits())
+                let f_norm = if f.is_nan() {
+                    f64::NAN.to_bits()
+                } else if f == 0.0 {
+                    0.0f64.to_bits()
+                } else {
+                    f.to_bits()
+                };
+                KeyValue::FloatBits(f_norm)
             }
             ColumnData::Float64(v) => {
                 let f = v.as_slice()[row];
-                let f_norm = if f == 0.0 { 0.0 } else { f };
-                KeyValue::FloatBits(f_norm.to_bits())
+                let f_norm = if f.is_nan() {
+                    f64::NAN.to_bits()
+                } else if f == 0.0 {
+                    0.0f64.to_bits()
+                } else {
+                    f.to_bits()
+                };
+                KeyValue::FloatBits(f_norm)
             }
             ColumnData::Text { offsets, data } => {
                 let start = offsets[row] as usize;

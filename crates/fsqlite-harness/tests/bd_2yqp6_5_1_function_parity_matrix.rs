@@ -1319,8 +1319,7 @@ fn test_window_function_parity() {
         }
     }
 
-    let expected_failure_names =
-        BTreeSet::from(["first_value_running", "nth_value_two", "cume_dist_global"]);
+    let expected_failure_names: BTreeSet<&str> = BTreeSet::new();
     let total = passed + failed;
     println!("[window_parity] {passed}/{total} passed");
     for failure in &failures {

@@ -1527,15 +1527,16 @@ mod tests {
             had_out_rw: false,
             keys: vec![page_key(7).clone()],
         };
+        let committed_writers = vec![committed_w];
 
         // Hot-plane only: no edges found.
         let edges_hot_only = discover_outgoing_edges(
             txn,
             CommitSeq::new(1),
             CommitSeq::new(5),
-            &[page_key(7)],
             &[], // empty active writers
-            &[], // no committed writers
+            &[],
+            &committed_writers,
         );
         assert!(
             edges_hot_only.is_empty(),
@@ -1549,7 +1550,7 @@ mod tests {
             CommitSeq::new(5),
             &[page_key(7)],
             &[],
-            &[committed_w],
+            &committed_writers,
         );
         assert_eq!(edges_full.len(), 1, "commit index catches the edge");
     }
@@ -2631,13 +2632,27 @@ mod tests {
             &[],
             false,
         );
-        commit_result.expect("commit decision should be recorded");
+        let commit_ok = commit_result.expect("commit decision should be recorded");
 
         let abort_txn = TxnToken::new(TxnId::new(90_002).unwrap(), TxnEpoch::new(0));
-        let reader = MockActiveTxn::new(90_003, 0, 1).with_reads(vec![page_key(700)]);
-        let writer = MockActiveTxn::new(90_004, 0, 1).with_writes(vec![page_key(800)]);
-        let readers: Vec<&dyn ActiveTxnView> = vec![&reader];
-        let writers: Vec<&dyn ActiveTxnView> = vec![&writer];
+        let _reader = MockActiveTxn::new(90_003, 0, 1).with_reads(vec![page_key(700)]);
+        let _writer = MockActiveTxn::new(90_004, 0, 1).with_writes(vec![page_key(800)]);
+
+        let _readers = vec![CommittedReaderInfo {
+            token: TxnToken::new(TxnId::new(90_003).unwrap(), TxnEpoch::new(0)),
+            begin_seq: CommitSeq::new(0),
+            commit_seq: CommitSeq::new(1),
+            had_in_rw: commit_ok.ssi_state.has_in_rw,
+            keys: vec![page_key(700)],
+        }];
+
+        let _writers = vec![CommittedWriterInfo {
+            token: TxnToken::new(TxnId::new(90_004).unwrap(), TxnEpoch::new(0)),
+            commit_seq: CommitSeq::new(2),
+            had_out_rw: commit_ok.ssi_state.has_out_rw,
+            keys: vec![page_key(800)],
+        }];
+
         let abort_result = ssi_validate_and_publish(
             abort_txn,
             CommitSeq::new(1),

@@ -104,12 +104,12 @@ pub const fn serial_type_for_integer(value: i64) -> u64 {
 
 /// Compute the serial type for a text value of `len` bytes.
 pub const fn serial_type_for_text(len: u64) -> u64 {
-    len * 2 + 13
+    len.saturating_mul(2).saturating_add(13)
 }
 
 /// Compute the serial type for a blob value of `len` bytes.
 pub const fn serial_type_for_blob(len: u64) -> u64 {
-    len * 2 + 12
+    len.saturating_mul(2).saturating_add(12)
 }
 
 /// The sizes for serial types less than 128, matching C SQLite's

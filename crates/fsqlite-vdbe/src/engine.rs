@@ -2322,6 +2322,16 @@ fn distinct_key(args: &[SqliteValue]) -> DistinctKeyBuf {
                 key.extend_from_slice(&i.to_le_bytes());
             }
             SqliteValue::Float(f) => {
+                if (-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(f) {
+                    #[allow(clippy::cast_possible_truncation)]
+                    let i = *f as i64;
+                    #[allow(clippy::cast_precision_loss)]
+                    if (i as f64) == *f {
+                        key.push(1);
+                        key.extend_from_slice(&i.to_le_bytes());
+                        continue;
+                    }
+                }
                 key.push(2);
                 key.extend_from_slice(&f.to_bits().to_le_bytes());
             }

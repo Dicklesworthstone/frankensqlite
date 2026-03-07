@@ -1184,21 +1184,25 @@ impl Parser {
         let mut without_rowid = false;
         let mut strict = false;
         // Table options after the closing paren.
-        loop {
-            if self.check_kw(&TokenKind::KwWithout) {
-                self.advance();
-                // Expect "ROWID" as an identifier.
-                let id = self.parse_identifier()?;
-                if !id.eq_ignore_ascii_case("ROWID") {
-                    return Err(self.err_expected("ROWID after WITHOUT"));
+        if self.check_kw(&TokenKind::KwWithout) || self.check_kw(&TokenKind::KwStrict) {
+            loop {
+                if self.check_kw(&TokenKind::KwWithout) {
+                    self.advance();
+                    // Expect "ROWID" as an identifier.
+                    let id = self.parse_identifier()?;
+                    if !id.eq_ignore_ascii_case("ROWID") {
+                        return Err(self.err_expected("ROWID after WITHOUT"));
+                    }
+                    without_rowid = true;
+                } else if self.eat_kw(&TokenKind::KwStrict) {
+                    strict = true;
+                } else {
+                    return Err(self.err_expected("table option"));
                 }
-                without_rowid = true;
-            } else if self.eat_kw(&TokenKind::KwStrict) {
-                strict = true;
-            } else {
-                break;
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
             }
-            let _ = self.eat(&TokenKind::Comma);
         }
         Ok(Statement::CreateTable(CreateTableStatement {
             if_not_exists,

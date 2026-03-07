@@ -522,8 +522,8 @@ impl TieredStorage {
             .entry(self.write_back_segment_id)
             .or_default();
         segment.extend(missing);
-        segment.sort_by_key(|record| record.esi);
-        segment.dedup_by_key(|record| record.esi);
+        segment.sort_by_key(|record| (record.object_id, record.esi));
+        segment.dedup_by(|left, right| left.object_id == right.object_id && left.esi == right.esi);
         added
     }
 
@@ -1360,6 +1360,54 @@ mod tests {
                 .any(|entry| !entry.decode_success && entry.proof.symbols_received.len() >= 2),
             "expected proof to capture available symbol cardinality"
         );
+    }
+
+    #[test]
+    fn test_write_back_segment_keeps_missing_symbols_per_object() {
+        let object_a = object_id_from_u64(68);
+        let payload_a = b"first-payload";
+        let full_a = make_symbol_records(object_a, payload_a, 8, 0);
+        let mut local_a = full_a.clone();
+        local_a.retain(|record| record.esi == 0);
+
+        let object_b = object_id_from_u64(69);
+        let payload_b = b"second-bytes!";
+        let full_b = make_symbol_records(object_b, payload_b, 8, 0);
+        let mut local_b = full_b.clone();
+        local_b.retain(|record| record.esi == 0);
+
+        let mut storage = TieredStorage::new(DurabilityMode::local());
+        storage.insert_l2_segment(418, local_a);
+        storage.insert_l2_segment(419, local_b);
+
+        let mut remote = MockRemoteTier::default();
+        remote.set_object_symbols(object_a, full_a);
+        remote.set_object_symbols(object_b, full_b);
+        let cx = Cx::<cap::All>::new();
+
+        let first_fetch = storage
+            .fetch_object(&cx, object_a, 57, Some(&mut remote), Some(remote_cap(13)))
+            .expect("first object fetch succeeds");
+        assert!(first_fetch.remote_used);
+        assert!(first_fetch.write_back_count > 0);
+
+        let second_fetch = storage
+            .fetch_object(&cx, object_b, 58, Some(&mut remote), Some(remote_cap(13)))
+            .expect("second object fetch succeeds");
+        assert!(second_fetch.remote_used);
+        assert!(second_fetch.write_back_count > 0);
+
+        let replay_a = storage
+            .fetch_object(&cx, object_a, 59, Option::<&mut MockRemoteTier>::None, None)
+            .expect("first object should remain recoverable from local write-back");
+        assert_eq!(replay_a.bytes, payload_a);
+        assert!(!replay_a.remote_used);
+
+        let replay_b = storage
+            .fetch_object(&cx, object_b, 60, Option::<&mut MockRemoteTier>::None, None)
+            .expect("second object should remain recoverable from local write-back");
+        assert_eq!(replay_b.bytes, payload_b);
+        assert!(!replay_b.remote_used);
     }
 
     #[test]

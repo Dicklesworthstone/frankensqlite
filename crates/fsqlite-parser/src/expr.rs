@@ -1600,7 +1600,7 @@ mod tests {
         let expr = parse("a & b | c");
         match &expr {
             Expr::BinaryOp {
-                op: BinaryOp::Or,
+                op: BinaryOp::BitOr,
                 left,
                 ..
             } => assert!(
@@ -1613,7 +1613,7 @@ mod tests {
                 ),
                 "bitwise operators should be left-associative"
             ),
-            other => unreachable!("expected Or(BitAnd, c), got {other:?}"),
+            other => unreachable!("expected BitOr(BitAnd, c), got {other:?}"),
         }
     }
 
@@ -1808,7 +1808,7 @@ mod tests {
                 ),
                 "a != b >= c must parse as a != (b >= c)"
             ),
-            other => unreachable!("expected Ne(a, Ge(b,c)), got {other:?}"),
+            other => unreachable!("expected Ne(Ge(b,c)), got {other:?}"),
         }
     }
 
@@ -1910,24 +1910,24 @@ mod tests {
 
     #[test]
     fn test_pratt_level7_tighter_than_bitwise() {
-        // a & b + c → a & (b + c)
-        let expr = parse("a & b + c");
+        // a * b || c → a * (b || c)
+        let expr = parse("a * b || c");
         match &expr {
             Expr::BinaryOp {
-                op: BinaryOp::BitAnd,
+                op: BinaryOp::Multiply,
                 right,
                 ..
             } => assert!(
                 matches!(
                     right.as_ref(),
                     Expr::BinaryOp {
-                        op: BinaryOp::Add,
+                        op: BinaryOp::Concat,
                         ..
                     }
                 ),
-                "addition should bind tighter than bitwise"
+                "concat should bind tighter than multiply"
             ),
-            other => unreachable!("expected BitAnd(a, Add(b,c)), got {other:?}"),
+            other => unreachable!("expected Mul(a, Concat(b,c)), got {other:?}"),
         }
     }
 
