@@ -829,6 +829,7 @@ impl PageWriter for SharedTxnPageIo {
                             remaining
                         };
                         if !sleep_for.is_zero() {
+                            #[cfg(not(target_arch = "wasm32"))]
                             std::thread::sleep(sleep_for);
                         }
                         backoff = (backoff * 2).min(Duration::from_millis(5));

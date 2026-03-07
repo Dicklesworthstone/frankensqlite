@@ -8,7 +8,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-fsqlite-types = { workspace = true, features = ["native"] }
+fsqlite-types = { workspace = true }
 fsqlite-error = { workspace = true }
 fsqlite-pager = { workspace = true }
 tracing = { workspace = true }

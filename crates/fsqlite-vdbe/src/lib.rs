@@ -14,6 +14,7 @@ pub mod frame;
 mod repro_delete_skip;
 pub mod vectorized;
 pub mod vectorized_agg;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod vectorized_dispatch;
 pub mod vectorized_hash_join;
 pub mod vectorized_join;
