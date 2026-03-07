@@ -18766,7 +18766,9 @@ fn test_conformance_integer_overflow_edges_s195() {
 
     let mismatches = oracle_compare(&fconn, &rconn, &queries);
     if !mismatches.is_empty() {
-        for m in &mismatches { eprintln!("{m}\n"); }
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
         panic!("{} integer overflow mismatches", mismatches.len());
     }
 }
@@ -18791,7 +18793,9 @@ fn test_conformance_float_formatting_s196() {
 
     let mismatches = oracle_compare(&fconn, &rconn, &queries);
     if !mismatches.is_empty() {
-        for m in &mismatches { eprintln!("{m}\n"); }
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
         panic!("{} float formatting mismatches", mismatches.len());
     }
 }
@@ -18821,7 +18825,9 @@ fn test_conformance_is_is_not_operators_s197() {
 
     let mismatches = oracle_compare(&fconn, &rconn, &queries);
     if !mismatches.is_empty() {
-        for m in &mismatches { eprintln!("{m}\n"); }
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
         panic!("{} IS/IS NOT mismatches", mismatches.len());
     }
 }
@@ -18853,7 +18859,9 @@ fn test_conformance_between_and_in_s198() {
 
     let mismatches = oracle_compare(&fconn, &rconn, &queries);
     if !mismatches.is_empty() {
-        for m in &mismatches { eprintln!("{m}\n"); }
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
         panic!("{} BETWEEN/IN mismatches", mismatches.len());
     }
 }
@@ -18884,7 +18892,9 @@ fn test_conformance_insert_select_s199() {
 
     let mismatches = oracle_compare(&fconn, &rconn, &queries);
     if !mismatches.is_empty() {
-        for m in &mismatches { eprintln!("{m}\n"); }
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
         panic!("{} INSERT...SELECT mismatches", mismatches.len());
     }
 }
@@ -18916,7 +18926,9 @@ fn test_conformance_collate_nocase_s200() {
 
     let mismatches = oracle_compare(&fconn, &rconn, &queries);
     if !mismatches.is_empty() {
-        for m in &mismatches { eprintln!("{m}\n"); }
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
         panic!("{} COLLATE NOCASE mismatches", mismatches.len());
     }
 }
@@ -18942,7 +18954,9 @@ fn test_conformance_multiple_aggregates_same_group_s201() {
 
     let mismatches = oracle_compare(&fconn, &rconn, &queries);
     if !mismatches.is_empty() {
-        for m in &mismatches { eprintln!("{m}\n"); }
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
         panic!("{} multiple aggregate mismatches", mismatches.len());
     }
 }
@@ -18973,7 +18987,9 @@ fn test_conformance_column_alias_reuse_s202() {
 
     let mismatches = oracle_compare(&fconn, &rconn, &queries);
     if !mismatches.is_empty() {
-        for m in &mismatches { eprintln!("{m}\n"); }
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
         panic!("{} column alias mismatches", mismatches.len());
     }
 }
@@ -18997,7 +19013,9 @@ fn test_conformance_json_functions_s203() {
 
     let mismatches = oracle_compare(&fconn, &rconn, &queries);
     if !mismatches.is_empty() {
-        for m in &mismatches { eprintln!("{m}\n"); }
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
         panic!("{} JSON function mismatches", mismatches.len());
     }
 }
@@ -19027,7 +19045,9 @@ fn test_conformance_rowid_queries_s204() {
 
     let mismatches = oracle_compare(&fconn, &rconn, &queries);
     if !mismatches.is_empty() {
-        for m in &mismatches { eprintln!("{m}\n"); }
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
         panic!("{} rowid query mismatches", mismatches.len());
     }
 }
@@ -19051,9 +19071,7 @@ fn test_conformance_probe_update_complex_set_s171() {
         rconn.execute_batch(s).unwrap();
     }
 
-    for s in &[
-        "UPDATE upd_complex SET a = b + 1, b = a - 1, c = c || '!' WHERE id <= 2",
-    ] {
+    for s in &["UPDATE upd_complex SET a = b + 1, b = a - 1, c = c || '!' WHERE id <= 2"] {
         fconn.execute(s).unwrap();
         rconn.execute_batch(s).unwrap();
     }
@@ -19061,13 +19079,13 @@ fn test_conformance_probe_update_complex_set_s171() {
     let queries = ["SELECT * FROM upd_complex ORDER BY id"];
     let mismatches = oracle_compare(&fconn, &rconn, &queries);
     if !mismatches.is_empty() {
-        for m in &mismatches { eprintln!("{m}\n"); }
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
         panic!("{} update complex mismatches", mismatches.len());
     }
 
-    for s in &[
-        "UPDATE upd_complex SET a = CASE WHEN a > 30 THEN a * 2 ELSE a END",
-    ] {
+    for s in &["UPDATE upd_complex SET a = CASE WHEN a > 30 THEN a * 2 ELSE a END"] {
         fconn.execute(s).unwrap();
         rconn.execute_batch(s).unwrap();
     }
@@ -19075,7 +19093,9 @@ fn test_conformance_probe_update_complex_set_s171() {
     let queries2 = ["SELECT id, a FROM upd_complex ORDER BY id"];
     let m2 = oracle_compare(&fconn, &rconn, &queries2);
     if !m2.is_empty() {
-        for m in &m2 { eprintln!("{m}\n"); }
+        for m in &m2 {
+            eprintln!("{m}\n");
+        }
         panic!("{} update case mismatches", m2.len());
     }
 }
@@ -19111,7 +19131,9 @@ fn test_conformance_probe_multi_index_queries_s172() {
 
     let mismatches = oracle_compare(&fconn, &rconn, &queries);
     if !mismatches.is_empty() {
-        for m in &mismatches { eprintln!("{m}\n"); }
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
         panic!("{} multi-index mismatches", mismatches.len());
     }
 }
@@ -19148,7 +19170,9 @@ fn test_conformance_probe_nested_agg_subquery_s173() {
 
     let mismatches = oracle_compare(&fconn, &rconn, &queries);
     if !mismatches.is_empty() {
-        for m in &mismatches { eprintln!("{m}\n"); }
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
         panic!("{} nested agg subquery mismatches", mismatches.len());
     }
 }
@@ -19183,7 +19207,9 @@ fn test_conformance_probe_complex_join_cond_s174() {
 
     let mismatches = oracle_compare(&fconn, &rconn, &queries);
     if !mismatches.is_empty() {
-        for m in &mismatches { eprintln!("{m}\n"); }
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
         panic!("{} complex join cond mismatches", mismatches.len());
     }
 }
@@ -19217,7 +19243,9 @@ fn test_conformance_probe_group_concat_adv_s175() {
 
     let mismatches = oracle_compare(&fconn, &rconn, &queries);
     if !mismatches.is_empty() {
-        for m in &mismatches { eprintln!("{m}\n"); }
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
         panic!("{} group_concat advanced mismatches", mismatches.len());
     }
 }
@@ -19248,7 +19276,9 @@ fn test_conformance_probe_compound_order_limit_s176() {
 
     let mismatches = oracle_compare(&fconn, &rconn, &queries);
     if !mismatches.is_empty() {
-        for m in &mismatches { eprintln!("{m}\n"); }
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
         panic!("{} compound order/limit mismatches", mismatches.len());
     }
 }
@@ -19280,7 +19310,9 @@ fn test_conformance_probe_coalesce_ifnull_chain_s177() {
 
     let mismatches = oracle_compare(&fconn, &rconn, &queries);
     if !mismatches.is_empty() {
-        for m in &mismatches { eprintln!("{m}\n"); }
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
         panic!("{} coalesce/ifnull mismatches", mismatches.len());
     }
 }
@@ -19302,9 +19334,7 @@ fn test_conformance_probe_delete_complex_where_s178() {
         rconn.execute_batch(s).unwrap();
     }
 
-    for s in &[
-        "DELETE FROM del_data WHERE val > (SELECT AVG(val) FROM del_data)",
-    ] {
+    for s in &["DELETE FROM del_data WHERE val > (SELECT AVG(val) FROM del_data)"] {
         fconn.execute(s).unwrap();
         rconn.execute_batch(s).unwrap();
     }
@@ -19312,7 +19342,9 @@ fn test_conformance_probe_delete_complex_where_s178() {
     let queries = ["SELECT * FROM del_data ORDER BY id"];
     let mismatches = oracle_compare(&fconn, &rconn, &queries);
     if !mismatches.is_empty() {
-        for m in &mismatches { eprintln!("{m}\n"); }
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
         panic!("{} delete complex mismatches", mismatches.len());
     }
 
@@ -19327,7 +19359,9 @@ fn test_conformance_probe_delete_complex_where_s178() {
     let queries2 = ["SELECT * FROM del_data ORDER BY id"];
     let m2 = oracle_compare(&fconn, &rconn, &queries2);
     if !m2.is_empty() {
-        for m in &m2 { eprintln!("{m}\n"); }
+        for m in &m2 {
+            eprintln!("{m}\n");
+        }
         panic!("{} delete exists mismatches", m2.len());
     }
 }
@@ -19360,7 +19394,9 @@ fn test_conformance_probe_alter_add_column_s179() {
     ];
     let m1 = oracle_compare(&fconn, &rconn, &queries);
     if !m1.is_empty() {
-        for m in &m1 { eprintln!("{m}\n"); }
+        for m in &m1 {
+            eprintln!("{m}\n");
+        }
         panic!("{} alter table mismatches", m1.len());
     }
 
@@ -19375,7 +19411,9 @@ fn test_conformance_probe_alter_add_column_s179() {
     let queries2 = ["SELECT * FROM alt_test ORDER BY id"];
     let m2 = oracle_compare(&fconn, &rconn, &queries2);
     if !m2.is_empty() {
-        for m in &m2 { eprintln!("{m}\n"); }
+        for m in &m2 {
+            eprintln!("{m}\n");
+        }
         panic!("{} alter table insert mismatches", m2.len());
     }
 }
@@ -19408,7 +19446,9 @@ fn test_conformance_probe_expression_positions_s180() {
 
     let mismatches = oracle_compare(&fconn, &rconn, &queries);
     if !mismatches.is_empty() {
-        for m in &mismatches { eprintln!("{m}\n"); }
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
         panic!("{} expression positions mismatches", mismatches.len());
     }
 }
@@ -19434,7 +19474,9 @@ fn test_conformance_probe_insert_or_modes_s181() {
     let q1 = ["SELECT * FROM ior_data ORDER BY id"];
     let m1 = oracle_compare(&fconn, &rconn, &q1);
     if !m1.is_empty() {
-        for m in &m1 { eprintln!("{m}\n"); }
+        for m in &m1 {
+            eprintln!("{m}\n");
+        }
         panic!("{} insert or replace pk mismatches", m1.len());
     }
 
@@ -19445,7 +19487,9 @@ fn test_conformance_probe_insert_or_modes_s181() {
     let q2 = ["SELECT * FROM ior_data ORDER BY id"];
     let m2 = oracle_compare(&fconn, &rconn, &q2);
     if !m2.is_empty() {
-        for m in &m2 { eprintln!("{m}\n"); }
+        for m in &m2 {
+            eprintln!("{m}\n");
+        }
         panic!("{} insert or ignore unique mismatches", m2.len());
     }
 
@@ -19456,7 +19500,9 @@ fn test_conformance_probe_insert_or_modes_s181() {
     let q3 = ["SELECT * FROM ior_data ORDER BY id"];
     let m3 = oracle_compare(&fconn, &rconn, &q3);
     if !m3.is_empty() {
-        for m in &m3 { eprintln!("{m}\n"); }
+        for m in &m3 {
+            eprintln!("{m}\n");
+        }
         panic!("{} insert or replace unique mismatches", m3.len());
     }
 }
@@ -19475,7 +19521,9 @@ fn test_conformance_probe_recursive_cte_depth_s182() {
 
     let mismatches = oracle_compare(&fconn, &rconn, &queries);
     if !mismatches.is_empty() {
-        for m in &mismatches { eprintln!("{m}\n"); }
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
         panic!("{} recursive CTE depth mismatches", mismatches.len());
     }
 }
@@ -19507,7 +19555,9 @@ fn test_conformance_probe_derived_table_s183() {
 
     let mismatches = oracle_compare(&fconn, &rconn, &queries);
     if !mismatches.is_empty() {
-        for m in &mismatches { eprintln!("{m}\n"); }
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
         panic!("{} derived table mismatches", mismatches.len());
     }
 }
@@ -19528,7 +19578,9 @@ fn test_conformance_probe_type_coercion_cmp_s184() {
 
     let mismatches = oracle_compare(&fconn, &rconn, &queries);
     if !mismatches.is_empty() {
-        for m in &mismatches { eprintln!("{m}\n"); }
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
         panic!("{} type coercion comparison mismatches", mismatches.len());
     }
 }
@@ -19563,7 +19615,9 @@ fn test_conformance_probe_window_rank_s185() {
 
     let mismatches = oracle_compare(&fconn, &rconn, &queries);
     if !mismatches.is_empty() {
-        for m in &mismatches { eprintln!("{m}\n"); }
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
         panic!("{} window rank mismatches", mismatches.len());
     }
 }
@@ -19596,7 +19650,9 @@ fn test_conformance_probe_window_agg_frame_s186() {
 
     let mismatches = oracle_compare(&fconn, &rconn, &queries);
     if !mismatches.is_empty() {
-        for m in &mismatches { eprintln!("{m}\n"); }
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
         panic!("{} window agg frame mismatches", mismatches.len());
     }
 }
@@ -19606,9 +19662,9 @@ fn test_conformance_probe_pragma_table_info_s187() {
     let fconn = Connection::open(":memory:").unwrap();
     let rconn = rusqlite::Connection::open_in_memory().unwrap();
 
-    for s in &[
-        "CREATE TABLE pragma_t(id INTEGER PRIMARY KEY, name TEXT NOT NULL, val REAL DEFAULT 0.0)",
-    ] {
+    for s in
+        &["CREATE TABLE pragma_t(id INTEGER PRIMARY KEY, name TEXT NOT NULL, val REAL DEFAULT 0.0)"]
+    {
         fconn.execute(s).unwrap();
         rconn.execute_batch(s).unwrap();
     }
@@ -19616,7 +19672,9 @@ fn test_conformance_probe_pragma_table_info_s187() {
     let queries = ["PRAGMA table_info('pragma_t')"];
     let mismatches = oracle_compare(&fconn, &rconn, &queries);
     if !mismatches.is_empty() {
-        for m in &mismatches { eprintln!("{m}\n"); }
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
         panic!("{} pragma table_info mismatches", mismatches.len());
     }
 }
@@ -19639,7 +19697,9 @@ fn test_conformance_probe_hex_blob_s188() {
 
     let mismatches = oracle_compare(&fconn, &rconn, &queries);
     if !mismatches.is_empty() {
-        for m in &mismatches { eprintln!("{m}\n"); }
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
         panic!("{} hex/blob mismatches", mismatches.len());
     }
 }
@@ -19671,7 +19731,9 @@ fn test_conformance_probe_fk_cascade_s189() {
     ];
     let mismatches = oracle_compare(&fconn, &rconn, &queries);
     if !mismatches.is_empty() {
-        for m in &mismatches { eprintln!("{m}\n"); }
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
         panic!("{} FK cascade mismatches", mismatches.len());
     }
 }
@@ -19692,7 +19754,9 @@ fn test_conformance_probe_cast_all_types_s190() {
 
     let mismatches = oracle_compare(&fconn, &rconn, &queries);
     if !mismatches.is_empty() {
-        for m in &mismatches { eprintln!("{m}\n"); }
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
         panic!("{} cast all types mismatches", mismatches.len());
     }
 }
@@ -19729,7 +19793,9 @@ fn test_conformance_probe_trigger_audit_s191() {
     ];
     let mismatches = oracle_compare(&fconn, &rconn, &queries);
     if !mismatches.is_empty() {
-        for m in &mismatches { eprintln!("{m}\n"); }
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
         panic!("{} trigger audit mismatches", mismatches.len());
     }
 }
@@ -19757,7 +19823,9 @@ fn test_conformance_probe_string_fns_ext_s192() {
 
     let mismatches = oracle_compare(&fconn, &rconn, &queries);
     if !mismatches.is_empty() {
-        for m in &mismatches { eprintln!("{m}\n"); }
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
         panic!("{} string function ext mismatches", mismatches.len());
     }
 }
@@ -19781,7 +19849,9 @@ fn test_conformance_probe_numeric_math_s193() {
 
     let mismatches = oracle_compare(&fconn, &rconn, &queries);
     if !mismatches.is_empty() {
-        for m in &mismatches { eprintln!("{m}\n"); }
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
         panic!("{} numeric math mismatches", mismatches.len());
     }
 }
@@ -19815,7 +19885,9 @@ fn test_conformance_probe_savepoint_nested_s194() {
     let queries = ["SELECT * FROM sp_data ORDER BY id"];
     let mismatches = oracle_compare(&fconn, &rconn, &queries);
     if !mismatches.is_empty() {
-        for m in &mismatches { eprintln!("{m}\n"); }
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
         panic!("{} savepoint nesting mismatches", mismatches.len());
     }
 }
@@ -19842,7 +19914,9 @@ fn test_conformance_probe_lateral_alias_s195() {
 
     let mismatches = oracle_compare(&fconn, &rconn, &queries);
     if !mismatches.is_empty() {
-        for m in &mismatches { eprintln!("{m}\n"); }
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
         panic!("{} lateral alias mismatches", mismatches.len());
     }
 }
