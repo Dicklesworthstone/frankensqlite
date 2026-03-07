@@ -11859,8 +11859,10 @@ impl Connection {
     ) -> Result<SqliteValue> {
         match expr {
             Expr::Subquery(sub, _) => {
-                let rows =
-                    self.execute_statement(Statement::Select(sub.as_ref().clone()), params)?;
+                let inner_tables = collect_subquery_inner_tables(sub);
+                let mut sub_clone = sub.as_ref().clone();
+                substitute_outer_refs_in_select(&mut sub_clone, row, col_map, &inner_tables);
+                let rows = self.execute_statement(Statement::Select(sub_clone), params)?;
                 Ok(rows
                     .into_iter()
                     .next()
@@ -11868,8 +11870,10 @@ impl Connection {
                     .unwrap_or(SqliteValue::Null))
             }
             Expr::Exists { subquery, not, .. } => {
-                let rows =
-                    self.execute_statement(Statement::Select(subquery.as_ref().clone()), params)?;
+                let inner_tables = collect_subquery_inner_tables(subquery);
+                let mut sub_clone = subquery.as_ref().clone();
+                substitute_outer_refs_in_select(&mut sub_clone, row, col_map, &inner_tables);
+                let rows = self.execute_statement(Statement::Select(sub_clone), params)?;
                 let exists = !rows.is_empty();
                 let truth = if *not { !exists } else { exists };
                 Ok(SqliteValue::Integer(i64::from(truth)))
@@ -14317,6 +14321,19 @@ impl Connection {
                     type_name: type_name.clone(),
                     span: *span,
                 })
+            }
+            Expr::Exists {
+                subquery,
+                not,
+                span,
+            } => {
+                let inner_tables = collect_subquery_inner_tables(subquery);
+                let mut sub_clone = subquery.as_ref().clone();
+                substitute_outer_refs_in_select(&mut sub_clone, row, outer_col_map, &inner_tables);
+                let rows = self.execute_statement(Statement::Select(sub_clone), None)?;
+                let exists = !rows.is_empty();
+                let truth = if *not { !exists } else { exists };
+                Ok(Expr::Literal(Literal::Integer(i64::from(truth)), *span))
             }
             _ => Ok(expr.clone()),
         }
