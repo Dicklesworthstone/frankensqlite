@@ -16420,26 +16420,46 @@ fn eval_group_agg_join_expr(
             name,
             args,
             distinct,
+            filter,
             ..
         } if is_agg_fn(name) && !is_scalar_max_min(name, args) => {
             let func = name.to_ascii_lowercase();
+            // Apply FILTER clause: only include rows where the filter
+            // expression evaluates to true.
+            let filtered_rows: Vec<&&Vec<SqliteValue>>;
+            let effective_rows: &[&&Vec<SqliteValue>] = if let Some(filter_expr) = filter {
+                filtered_rows = group_rows
+                    .iter()
+                    .filter(|r| {
+                        eval_join_expr(filter_expr, r, col_map)
+                            .map(|v| is_sqlite_truthy(&v))
+                            .unwrap_or(false)
+                    })
+                    .collect();
+                &filtered_rows
+            } else {
+                // No filter — use all group rows. We need a compatible type
+                // so collect into a temp vec.
+                filtered_rows = group_rows.iter().collect();
+                &filtered_rows
+            };
             match args {
                 FunctionArgs::Star => {
                     if func == "count" {
                         #[allow(clippy::cast_possible_wrap)]
-                        return Ok(SqliteValue::Integer(group_rows.len() as i64));
+                        return Ok(SqliteValue::Integer(effective_rows.len() as i64));
                     }
                     Ok(SqliteValue::Null)
                 }
                 FunctionArgs::List(exprs) if exprs.is_empty() => {
                     if func == "count" {
                         #[allow(clippy::cast_possible_wrap)]
-                        return Ok(SqliteValue::Integer(group_rows.len() as i64));
+                        return Ok(SqliteValue::Integer(effective_rows.len() as i64));
                     }
                     Ok(SqliteValue::Null)
                 }
                 FunctionArgs::List(exprs) => {
-                    let mut owned_values: Vec<SqliteValue> = group_rows
+                    let mut owned_values: Vec<SqliteValue> = effective_rows
                         .iter()
                         .filter_map(|r| eval_join_expr(&exprs[0], r, col_map).ok())
                         .filter(|v| !v.is_null())
