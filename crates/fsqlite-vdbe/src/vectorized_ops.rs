@@ -500,8 +500,8 @@ fn compare_i64(lhs: i64, op: CompareOp, rhs: i64) -> bool {
 #[inline]
 fn compare_f64(lhs: f64, op: CompareOp, rhs: f64) -> bool {
     match op {
-        CompareOp::Eq => (lhs - rhs).abs() < f64::EPSILON,
-        CompareOp::Ne => (lhs - rhs).abs() >= f64::EPSILON,
+        CompareOp::Eq => lhs == rhs,
+        CompareOp::Ne => lhs != rhs,
         CompareOp::Lt => lhs < rhs,
         CompareOp::Le => lhs <= rhs,
         CompareOp::Gt => lhs > rhs,
@@ -530,8 +530,14 @@ fn hash_column_value(data: &ColumnData, row: usize) -> u64 {
         ColumnData::Int16(v) => v.as_slice().get(row).map_or(0, |&x| x as u64),
         ColumnData::Int32(v) => v.as_slice().get(row).map_or(0, |&x| x as u64),
         ColumnData::Int64(v) => v.as_slice().get(row).map_or(0, |&x| x as u64),
-        ColumnData::Float32(v) => v.as_slice().get(row).map_or(0, |&x| u64::from(x.to_bits())),
-        ColumnData::Float64(v) => v.as_slice().get(row).map_or(0, |&x| x.to_bits()),
+        ColumnData::Float32(v) => v.as_slice().get(row).map_or(0, |&x| {
+            let val = if x == 0.0 { 0.0 } else { x };
+            u64::from(val.to_bits())
+        }),
+        ColumnData::Float64(v) => v.as_slice().get(row).map_or(0, |&x| {
+            let val = if x == 0.0 { 0.0 } else { x };
+            val.to_bits()
+        }),
         ColumnData::Binary { offsets, data } | ColumnData::Text { offsets, data } => {
             let start = offsets.get(row).copied().unwrap_or(0) as usize;
             let end = offsets.get(row + 1).copied().unwrap_or(0) as usize;

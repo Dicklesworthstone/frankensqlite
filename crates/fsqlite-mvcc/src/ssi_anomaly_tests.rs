@@ -424,11 +424,11 @@ fn ssi_anomaly_committed_pivot_abort() {
     let txn2 = TxnToken::new(TxnId::new(2).unwrap(), TxnEpoch::new(0));
 
     let committed_reader = CommittedReaderInfo {
-        token: TxnToken::new(TxnId::new(1).unwrap(), TxnEpoch::new(0)),
-        begin_seq: CommitSeq::new(1),
-        commit_seq: CommitSeq::new(5),
-        had_in_rw: true, // T1 was a pivot at commit time.
-        pages: vec![test_page(50)],
+        token: txn2,
+        begin_seq: CommitSeq::new(5),
+        commit_seq: CommitSeq::new(10),
+        had_in_rw: true,
+        keys: vec![WitnessKey::Page(test_page(100))],
     };
 
     // T2 writes page 50 (which T1 read) → incoming edge from committed reader.
@@ -1026,10 +1026,9 @@ fn cas_version_arena_aba_protection() {
             v.is_some(),
             "bead_id={BEAD_ID} cas-aba: slot {i} must be accessible"
         );
-        let expected_seq = (i + 1) as u64;
         assert_eq!(
             v.unwrap().commit_seq.get(),
-            expected_seq,
+            (i + 1) as u64,
             "bead_id={BEAD_ID} cas-aba: slot {i} commit_seq"
         );
     }

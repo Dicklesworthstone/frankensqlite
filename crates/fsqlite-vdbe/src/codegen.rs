@@ -2218,7 +2218,8 @@ fn codegen_select_ordered_scan(
     }
 
     // DISTINCT: skip rows whose output columns match the previous row.
-    // Pack output into a record, compare with previous record; if equal, skip.
+    // Pack output into a record, compare with previous record using
+    // SorterCompare for collation-aware dedup; if equal, skip.
     if let Some((cur_rec, prev_rec, skip)) = distinct_state {
         // Pack current output columns into a record.
         b.emit_op(
@@ -2230,8 +2231,19 @@ fn codegen_select_ordered_scan(
             0,
         );
 
-        // Compare with previous record; if equal (Eq jumps on match), skip.
-        b.emit_jump_to_label(Opcode::Eq, prev_rec, cur_rec, skip, P4::None, 0);
+        // SorterCompare: jumps to not_dup when keys differ (not a duplicate).
+        let not_dup = b.emit_label();
+        b.emit_jump_to_label(
+            Opcode::SorterCompare,
+            sorter_cursor,
+            prev_rec,
+            not_dup,
+            P4::None,
+            0,
+        );
+        // Fall through = keys equal = duplicate, skip.
+        b.emit_jump_to_label(Opcode::Goto, 0, 0, skip, P4::None, 0);
+        b.resolve_label(not_dup);
 
         // Update previous record to current.
         b.emit_op(Opcode::Copy, cur_rec, prev_rec, 0, P4::None, 0);

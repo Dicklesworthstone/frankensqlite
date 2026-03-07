@@ -229,8 +229,8 @@ pub struct CommittedReaderInfo {
     pub commit_seq: CommitSeq,
     /// Whether the reader had incoming rw edges at commit time.
     pub had_in_rw: bool,
-    /// Pages the reader accessed (for overlap checks).
-    pub pages: Vec<PageNumber>,
+    /// Keys the reader accessed (for overlap checks).
+    pub keys: Vec<WitnessKey>,
 }
 
 /// A committed writer entry from the CommitLog (for outgoing edge discovery).
@@ -245,8 +245,8 @@ pub struct CommittedWriterInfo {
     /// Used for committed-pivot checks when a later transaction discovers an
     /// outgoing edge to this already-committed writer.
     pub had_out_rw: bool,
-    /// Pages the writer modified.
-    pub pages: Vec<PageNumber>,
+    /// Keys the writer modified.
+    pub keys: Vec<WitnessKey>,
 }
 
 // ---------------------------------------------------------------------------
@@ -330,27 +330,25 @@ pub fn discover_incoming_edges(
         }
 
         for write_key in write_keys {
-            if let Some(page) = witness_key_page(write_key) {
-                if reader.pages.contains(&page) {
-                    if seen_sources.insert(reader.token) {
-                        debug!(
-                            bead_id = "bd-31bo",
-                            from = ?reader.token,
-                            to = ?committing_txn,
-                            key = ?write_key,
-                            source = "rcri_index",
-                            "discovered incoming rw-antidependency edge"
-                        );
-                        edges.push(DiscoveredEdge {
-                            from: reader.token,
-                            to: committing_txn,
-                            overlap_key: write_key.clone(),
-                            source_is_active: false,
-                            source_has_in_rw: reader.had_in_rw,
-                        });
-                    }
-                    break;
+            if reader.keys.iter().any(|k| crate::witness_plane::witness_keys_overlap(k, write_key)) {
+                if seen_sources.insert(reader.token) {
+                    debug!(
+                        bead_id = "bd-31bo",
+                        from = ?reader.token,
+                        to = ?committing_txn,
+                        key = ?write_key,
+                        source = "rcri_index",
+                        "discovered incoming rw-antidependency edge"
+                    );
+                    edges.push(DiscoveredEdge {
+                        from: reader.token,
+                        to: committing_txn,
+                        overlap_key: write_key.clone(),
+                        source_is_active: false,
+                        source_has_in_rw: reader.had_in_rw,
+                    });
                 }
+                break;
             }
         }
     }
@@ -436,7 +434,7 @@ pub fn discover_outgoing_edges(
 
         for read_key in read_keys {
             if let Some(page) = witness_key_page(read_key) {
-                if writer.pages.contains(&page) {
+                if writer.keys.contains(&page) {
                     if seen_targets.insert(writer.token) {
                         debug!(
                             bead_id = "bd-31bo",
@@ -1470,7 +1468,7 @@ mod tests {
             token: TxnToken::new(TxnId::new(3).unwrap(), TxnEpoch::new(0)),
             commit_seq: CommitSeq::new(3),
             had_out_rw: false,
-            pages: vec![PageNumber::new(7).unwrap()],
+            keys: vec![page_key(7).clone()],
         };
 
         let edges = discover_outgoing_edges(
@@ -1496,7 +1494,7 @@ mod tests {
             begin_seq: CommitSeq::new(0),
             commit_seq: CommitSeq::new(3),
             had_in_rw: false,
-            pages: vec![PageNumber::new(5).unwrap()],
+            keys: vec![page_key(5).clone()],
         };
 
         let edges = discover_incoming_edges(
@@ -1521,7 +1519,7 @@ mod tests {
             token: TxnToken::new(TxnId::new(3).unwrap(), TxnEpoch::new(0)),
             commit_seq: CommitSeq::new(3),
             had_out_rw: false,
-            pages: vec![PageNumber::new(7).unwrap()],
+            keys: vec![page_key(7).clone()],
         };
 
         // Hot-plane only: no edges found.
@@ -1560,7 +1558,7 @@ mod tests {
             begin_seq: CommitSeq::new(0),
             commit_seq: CommitSeq::new(3),
             had_in_rw: false,
-            pages: vec![PageNumber::new(5).unwrap()],
+            keys: vec![page_key(5).clone()],
         };
 
         // Hot-plane only: no edges found.
@@ -1621,7 +1619,7 @@ mod tests {
             token: TxnToken::new(TxnId::new(3).unwrap(), TxnEpoch::new(0)),
             commit_seq: CommitSeq::new(4),
             had_out_rw: false,
-            pages: vec![PageNumber::new(7).unwrap()],
+            keys: vec![page_key(7).clone()],
         };
 
         let edges = discover_outgoing_edges(
@@ -1668,13 +1666,13 @@ mod tests {
             begin_seq: CommitSeq::new(1),
             commit_seq: CommitSeq::new(2),
             had_in_rw: t1_commit.ssi_state.has_in_rw,
-            pages: vec![PageNumber::new(100).unwrap(), PageNumber::new(200).unwrap()],
+            keys: vec![page_key(100).clone(), page_key(200).clone()],
         };
         let committed_writer_t1 = CommittedWriterInfo {
             token: t1,
             commit_seq: CommitSeq::new(2),
             had_out_rw: t1_commit.ssi_state.has_out_rw,
-            pages: vec![PageNumber::new(100).unwrap()],
+            keys: vec![page_key(100).clone()],
         };
 
         let t2_reads = [page_key(100), page_key(200)];
@@ -1727,13 +1725,13 @@ mod tests {
             begin_seq: CommitSeq::new(1),
             commit_seq: CommitSeq::new(2),
             had_in_rw: d1_commit.ssi_state.has_in_rw,
-            pages: vec![PageNumber::new(310).unwrap(), PageNumber::new(311).unwrap()],
+            keys: vec![page_key(310).clone(), page_key(311).clone()],
         };
         let committed_writer_d1 = CommittedWriterInfo {
             token: d1,
             commit_seq: CommitSeq::new(2),
             had_out_rw: d1_commit.ssi_state.has_out_rw,
-            pages: vec![PageNumber::new(310).unwrap()],
+            keys: vec![page_key(310).clone()],
         };
 
         let d2_reads = [page_key(310), page_key(311)];
@@ -1799,7 +1797,7 @@ mod tests {
             begin_seq: CommitSeq::new(0),
             commit_seq: CommitSeq::new(3),
             had_in_rw: true, // R was pivot at commit time
-            pages: vec![PageNumber::new(5).unwrap()],
+            keys: vec![page_key(5).clone()],
         };
 
         let result = ssi_validate_and_publish(
@@ -2156,14 +2154,9 @@ mod tests {
         let page_a = page_key(10);
         let page_b = page_key(20);
 
-        // T1 as active reader (reads A,B)
-        let _t1_view = MockActiveTxn::new(1, 0, 1).with_reads(vec![page_a.clone(), page_b.clone()]);
-        // T2 as active reader (reads A,B)
-        let t2_view = MockActiveTxn::new(2, 0, 1).with_reads(vec![page_a.clone(), page_b.clone()]);
-
         // T1 commits first: writes A. T2 is active reader of A → incoming edge.
         // No outgoing edge for T1 (nobody is writing to B yet).
-        let t2_readers: Vec<&dyn ActiveTxnView> = vec![&t2_view];
+        let t2_readers: Vec<&dyn ActiveTxnView> = vec![&t2_token];
         let result_t1 = ssi_validate_and_publish(
             t1_token,
             CommitSeq::new(1),
@@ -2189,13 +2182,13 @@ mod tests {
             begin_seq: CommitSeq::new(1),
             commit_seq: CommitSeq::new(2),
             had_in_rw: ok_t1.ssi_state.has_in_rw,
-            pages: vec![PageNumber::new(10).unwrap(), PageNumber::new(20).unwrap()],
+            keys: vec![page_a.clone(), page_b.clone()],
         };
         let writer_t1 = CommittedWriterInfo {
             token: t1_token,
             commit_seq: CommitSeq::new(2),
             had_out_rw: ok_t1.ssi_state.has_out_rw,
-            pages: vec![PageNumber::new(10).unwrap()],
+            keys: vec![page_a.clone()],
         };
 
         let result_t2 = ssi_validate_and_publish(
@@ -2347,13 +2340,13 @@ mod tests {
                     begin_seq,
                     commit_seq: CommitSeq::new(2),
                     had_in_rw: ok.ssi_state.has_in_rw,
-                    pages: keys_to_pages(&v1.reads),
+                    keys: v1.reads.to_vec(),
                 });
                 committed_writers.push(CommittedWriterInfo {
                     token: t1,
                     commit_seq: CommitSeq::new(2),
                     had_out_rw: ok.ssi_state.has_out_rw,
-                    pages: keys_to_pages(&v1.writes),
+                    keys: v1.writes.to_vec(),
                 });
             }
             Err(_) => aborts += 1,
@@ -2381,13 +2374,13 @@ mod tests {
                     begin_seq,
                     commit_seq: CommitSeq::new(3),
                     had_in_rw: ok.ssi_state.has_in_rw,
-                    pages: keys_to_pages(&v2.reads),
+                    keys: v2.reads.to_vec(),
                 });
                 committed_writers.push(CommittedWriterInfo {
                     token: t2,
                     commit_seq: CommitSeq::new(3),
                     had_out_rw: ok.ssi_state.has_out_rw,
-                    pages: keys_to_pages(&v2.writes),
+                    keys: v2.writes.to_vec(),
                 });
             }
             Err(_) => aborts += 1,
@@ -2521,13 +2514,13 @@ mod tests {
                         begin_seq,
                         commit_seq,
                         had_in_rw: ok.ssi_state.has_in_rw,
-                        pages: keys_to_pages(&current.reads),
+                        keys: current.reads.to_vec(),
                     });
                     committed_writers.push(CommittedWriterInfo {
                         token: current.token,
                         commit_seq,
                         had_out_rw: ok.ssi_state.has_out_rw,
-                        pages: keys_to_pages(&current.writes),
+                        keys: current.writes.to_vec(),
                     });
                 }
                 Err(_) => abort_count += 1,

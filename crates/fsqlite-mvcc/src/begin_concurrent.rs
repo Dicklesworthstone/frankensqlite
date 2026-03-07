@@ -13,7 +13,7 @@
 //!    newest committed version with `commit_seq <= snapshot.high`.
 //! 3. Writes acquire per-page locks (not a global mutex).
 //! 4. At commit time, the write set is validated against the commit index:
-//!    any page modified by another transaction since the snapshot was taken
+//!    any page modified by a concurrent transaction since the snapshot was taken
 //!    triggers `BusySnapshot`.
 //! 5. Savepoints within concurrent transactions work normally; `ROLLBACK TO`
 //!    reverts write-set state but preserves page locks and the snapshot.
@@ -545,8 +545,8 @@ pub struct PreparedConcurrentCommit {
     assigned_commit_seq: CommitSeq,
     txn_token: TxnToken,
     begin_seq: CommitSeq,
-    read_pages: Vec<PageNumber>,
-    write_pages: Vec<PageNumber>,
+    read_keys: Vec<WitnessKey>,
+    write_keys: Vec<WitnessKey>,
     has_in_rw: bool,
     has_out_rw: bool,
     incoming_edges: Vec<DiscoveredEdge>,
@@ -585,13 +585,13 @@ impl PreparedConcurrentCommit {
     }
 
     #[must_use]
-    pub fn read_pages(&self) -> &[PageNumber] {
-        &self.read_pages
+    pub fn read_keys(&self) -> &[WitnessKey] {
+        &self.read_keys
     }
 
     #[must_use]
-    pub fn write_pages(&self) -> &[PageNumber] {
-        &self.write_pages
+    pub fn write_keys(&self) -> &[WitnessKey] {
+        &self.write_keys
     }
 }
 
@@ -618,7 +618,7 @@ impl ActiveTxnView for HandleView<'_> {
     }
 
     fn begin_seq(&self) -> CommitSeq {
-        self.handle.snapshot.high
+        self.handle.begin_seq()
     }
 
     fn is_active(&self) -> bool {
@@ -768,26 +768,40 @@ pub fn prepare_concurrent_commit_with_ssi(
     }
 
     // Build view of committing txn state.
-    let (txn, begin_seq, read_keys, write_keys, marked_for_abort, mut read_pages, mut write_pages) = {
+    let (txn, begin_seq, read_keys, write_keys, marked_for_abort) = {
         let handle = registry
             .get(session_id)
             .ok_or((MvccError::InvalidState, FcwResult::Clean))?;
 
-        let mut read_pages: Vec<PageNumber> = handle.read_set().iter().copied().collect();
-        read_pages.sort_unstable();
-        let mut write_pages: Vec<PageNumber> = handle.write_set.keys().copied().collect();
-        write_pages.sort_unstable();
+        let read_keys = handle.read_witness_keys();
+        let write_keys = handle.write_witness_keys();
 
         (
-            handle.txn_token(),
-            handle.snapshot().high,
-            handle.read_witness_keys(),
-            handle.write_witness_keys(),
-            handle.is_marked_for_abort(),
-            read_pages,
-            write_pages,
+            handle.token(),
+            handle.begin_seq(),
+            read_keys,
+            write_keys,
+            handle.marked_for_abort(),
         )
     };
+
+    if marked_for_abort {
+        tracing::warn!(
+            txn = %txn_id,
+            "prepare_concurrent_commit_with_ssi: marked_for_abort"
+        );
+        lock_table.release_all(txn_id);
+        if let Some(handle) = registry.get_mut(session_id) {
+            handle.mark_aborted();
+        }
+        return Err((MvccError::BusySnapshot, FcwResult::Clean));
+    }
+
+    // Sort keys for deterministic evidence ordering.
+    let mut sorted_read_keys = read_keys.clone();
+    sorted_read_keys.sort_unstable();
+    let mut sorted_write_keys = write_keys.clone();
+    sorted_write_keys.sort_unstable();
 
     // Step 2: Discover SSI edges without publishing side effects yet.
     let views: Vec<HandleView<'_>> = registry
@@ -804,7 +818,7 @@ pub fn prepare_concurrent_commit_with_ssi(
         txn,
         begin_seq,
         assign_commit_seq,
-        &write_keys,
+        &sorted_write_keys,
         &active_views,
         &registry.committed_readers,
     );
@@ -812,7 +826,7 @@ pub fn prepare_concurrent_commit_with_ssi(
         txn,
         begin_seq,
         assign_commit_seq,
-        &read_keys,
+        &sorted_read_keys,
         &active_views,
         &registry.committed_writers,
     );
@@ -820,70 +834,19 @@ pub fn prepare_concurrent_commit_with_ssi(
     let has_in_rw = !incoming_edges.is_empty();
     let has_out_rw = !outgoing_edges.is_empty();
 
-    if marked_for_abort {
-        tracing::warn!(
-            txn = %txn_id,
-            "prepare_concurrent_commit_with_ssi: marked_for_abort"
-        );
-        lock_table.release_all(txn_id);
-        if let Some(handle) = registry.get_mut(session_id) {
-            handle.mark_aborted();
-        }
-        return Err((MvccError::BusySnapshot, FcwResult::Clean));
-    }
-
     if has_in_rw && has_out_rw {
-        tracing::warn!(
-            txn = %txn_id,
-            "prepare_concurrent_commit_with_ssi: pivot (in+out rw edges)"
-        );
-        lock_table.release_all(txn_id);
-        if let Some(handle) = registry.get_mut(session_id) {
-            handle.mark_aborted();
-        }
-        return Err((MvccError::BusySnapshot, FcwResult::Clean));
+        let reason = SsiAbortReason::Pivot;
+        tracing::warn!(?txn, ?reason, "SSI validation aborted");
+        return Err((MvccError::BusySnapshot, FcwResult::Abort { reason }));
     }
-
-    let has_committed_reader_pivot = incoming_edges
-        .iter()
-        .any(|edge| !edge.source_is_active && edge.source_has_in_rw);
-    let has_committed_writer_pivot = outgoing_edges
-        .iter()
-        .any(|edge| !edge.source_is_active && edge.source_has_in_rw);
-    if has_committed_reader_pivot || has_committed_writer_pivot {
-        tracing::warn!(
-            txn = %txn_id,
-            committed_reader_pivot = has_committed_reader_pivot,
-            committed_writer_pivot = has_committed_writer_pivot,
-            "prepare_concurrent_commit_with_ssi: committed pivot conflict"
-        );
-        lock_table.release_all(txn_id);
-        if let Some(handle) = registry.get_mut(session_id) {
-            handle.mark_aborted();
-        }
-        return Err((MvccError::BusySnapshot, FcwResult::Clean));
-    }
-
-    // Persist local SSI flags on the committing handle for observability and
-    // consistency with the commit-time state captured in history.
-    if let Some(handle) = registry.get_mut(session_id) {
-        handle.has_in_rw.set(has_in_rw);
-        handle.has_out_rw.set(has_out_rw);
-    } else {
-        return Err((MvccError::InvalidState, FcwResult::Clean));
-    }
-
-    // Keep deterministic ordering for downstream evidence and tests.
-    read_pages.sort_unstable();
-    write_pages.sort_unstable();
 
     Ok(PreparedConcurrentCommit {
         session_id,
         assigned_commit_seq: assign_commit_seq,
         txn_token: txn,
         begin_seq,
-        read_pages,
-        write_pages,
+        read_keys: sorted_read_keys,
+        write_keys: sorted_write_keys,
         has_in_rw,
         has_out_rw,
         incoming_edges,
@@ -914,28 +877,15 @@ pub fn finalize_prepared_concurrent_commit_with_ssi(
 
     // Re-scan against current active state to capture overlap edges that may
     // appear after prepare but before finalize. This keeps committed pivot
-    // flags (`had_in_rw`/`had_out_rw`) complete without blocking readers/writers
-    // through the entire pager commit.
-    let active_views: Vec<HandleView<'_>> = registry
-        .iter_active()
-        .filter(|(_, other)| other.is_active())
-        .map(|(_, other)| HandleView::new(other))
+    // decisions deterministic.
+    let active_views: Vec<HandleView> = registry
+        .active
+        .values()
+        .map(HandleView::new)
         .collect();
     let active_refs: Vec<&dyn ActiveTxnView> = active_views
         .iter()
         .map(|view| view as &dyn ActiveTxnView)
-        .collect();
-    let read_keys: Vec<WitnessKey> = prepared
-        .read_pages
-        .iter()
-        .copied()
-        .map(WitnessKey::Page)
-        .collect();
-    let write_keys: Vec<WitnessKey> = prepared
-        .write_pages
-        .iter()
-        .copied()
-        .map(WitnessKey::Page)
         .collect();
 
     let mut incoming_edges = prepared.incoming_edges.clone();
@@ -943,7 +893,7 @@ pub fn finalize_prepared_concurrent_commit_with_ssi(
         prepared.txn_token,
         prepared.begin_seq,
         committed_seq,
-        &write_keys,
+        &prepared.write_keys,
         &active_refs,
         &[],
     ) {
@@ -960,7 +910,7 @@ pub fn finalize_prepared_concurrent_commit_with_ssi(
         prepared.txn_token,
         prepared.begin_seq,
         committed_seq,
-        &read_keys,
+        &prepared.read_keys,
         &active_refs,
         &[],
     ) {
@@ -1025,8 +975,10 @@ pub fn finalize_prepared_concurrent_commit_with_ssi(
         );
     }
 
-    for &page in &prepared.write_pages {
-        commit_index.update(page, committed_seq);
+    for key in &prepared.write_keys {
+        if let Some(page) = crate::ssi_validation::witness_key_page(key) {
+            commit_index.update(page, committed_seq);
+        }
     }
     lock_table.release_all(txn_id);
     if mark_committed {
@@ -1037,21 +989,21 @@ pub fn finalize_prepared_concurrent_commit_with_ssi(
         }
     }
 
-    if !prepared.read_pages.is_empty() {
+    if !prepared.read_keys.is_empty() {
         registry.committed_readers.push(CommittedReaderInfo {
             token: prepared.txn_token,
             begin_seq: prepared.begin_seq,
             commit_seq: committed_seq,
             had_in_rw: has_in_rw,
-            pages: prepared.read_pages.clone(),
+            keys: prepared.read_keys.clone(),
         });
     }
-    if !prepared.write_pages.is_empty() {
+    if !prepared.write_keys.is_empty() {
         registry.committed_writers.push(CommittedWriterInfo {
             token: prepared.txn_token,
             commit_seq: committed_seq,
             had_out_rw: has_out_rw,
-            pages: prepared.write_pages.clone(),
+            keys: prepared.write_keys.clone(),
         });
     }
     registry.prune_committed_conflict_history();
@@ -1638,6 +1590,7 @@ mod tests {
             let h1 = registry.get_mut(s1).unwrap();
             h1.record_read(test_page(5));
             concurrent_write_page(h1, &lock_table, s1, test_page(10), test_data()).unwrap();
+            // B
         }
 
         // T2 reads and writes.
@@ -1717,7 +1670,7 @@ mod tests {
             &commit_index,
             &lock_table,
             s2,
-            CommitSeq::new(12),
+            CommitSeq::new(11),
         )
         .expect("second txn commits");
 
@@ -1745,9 +1698,9 @@ mod tests {
         // T2 reads B, writes A.
         //
         // When T1 tries to commit:
-        // - Incoming: T2 read B, T1 writes B → incoming edge from T2
+        // - Incoming: T2 read B, T1 writes B → incoming edge from T2 to T1
         // - Outgoing: T1 read A, T2 writes A → outgoing edge to T2
-        // T1 has BOTH → T1 is pivot → T1 must abort.
+        // T1 has BOTH → T1 must abort.
 
         let s1 = registry.begin_concurrent(test_snapshot(10)).unwrap();
         let s2 = registry.begin_concurrent(test_snapshot(10)).unwrap();
@@ -1786,7 +1739,7 @@ mod tests {
         let (err, _) = result1.unwrap_err();
         assert_eq!(err, MvccError::BusySnapshot);
 
-        // After T1 aborts, T2 can now commit (T1 is no longer active, so no edges).
+        // After T1 aborted, T2 can now commit (T1 is no longer active, so no edges).
         let result2 = concurrent_commit_with_ssi(
             &mut registry,
             &commit_index,
@@ -1934,7 +1887,7 @@ mod tests {
     //     has_in_rw was set in the outgoing-check AFTER the incoming-check
     //     tested it (false at that point).
     //
-    // After T1 aborts, T2 can commit because the pivot (T1) is gone.
+    // After T1 aborts, T2 can now commit because the pivot (T1) is gone.
     //
     // This test exercises the full real-component SSI path without any
     // mock objects or manual flag manipulation.
@@ -2030,10 +1983,11 @@ mod tests {
     //
     // Step 2: T2 commits. Scans T1:
     //   Incoming check: T2 writes 10, T1 reads {10,20}. Match on 10!
-    //   T1.has_out_rw = true. T1.has_in_rw already true => T1 marked_for_abort!
+    //   T1.has_out_rw = true. T1.has_in_rw is already true (from step 1) => T1 marked_for_abort!
     //   T2 has only incoming edge => T2 commits.
     //
-    // Step 3: T1 tries to commit => fails (marked_for_abort).
+    // Step 3: T1 tries to commit → fails with BusySnapshot
+    // (marked_for_abort).
     #[test]
     fn test_ssi_marked_for_abort_via_real_edge_detection() {
         use super::concurrent_commit_with_ssi;
@@ -2217,7 +2171,7 @@ mod tests {
         );
     }
 
-    // Test 24 (bd-mblr.6.7): FCW conflict detection with real CommitIndex
+    // Test 24 (bd-2kkn4.5): FCW conflict detection with real CommitIndex
     // — verifies first-committer-wins uses real commit_index state.
     //
     // T1 and T2 both start with snapshot at seq 10.
@@ -2264,7 +2218,7 @@ mod tests {
             &commit_index,
             &lock_table,
             s2,
-            CommitSeq::new(12),
+            CommitSeq::new(11),
         );
         assert!(result2.is_err(), "T2 must fail: FCW conflict on page 42");
         let (err, fcw) = result2.unwrap_err();
@@ -2354,8 +2308,8 @@ mod tests {
         let committed = registry
             .committed_writers
             .iter()
-            .find(|writer| writer.pages.contains(&test_page(77)))
-            .map(|writer| writer.token)
+            .find(|entry| entry.token.id.get() == winner_session)
+            .map(|entry| entry.token)
             .expect("winning writer should be recorded");
         assert_eq!(committed, winner_token);
     }
