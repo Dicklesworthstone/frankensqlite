@@ -43321,6 +43321,137 @@ mod pager_routing_tests {
         }
     }
 
+    /// LIMIT/OFFSET edge cases across different query paths, UNION/INTERSECT/EXCEPT,
+    /// and type coercion in comparisons.
+    #[test]
+    fn test_conformance_limit_union_coercion() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, price REAL, qty INTEGER);",
+            "INSERT INTO items VALUES (1, 'A', 10.5, 100);",
+            "INSERT INTO items VALUES (2, 'B', 20.0, 50);",
+            "INSERT INTO items VALUES (3, 'C', 15.75, 75);",
+            "INSERT INTO items VALUES (4, 'D', 5.25, 200);",
+            "INSERT INTO items VALUES (5, 'E', 30.0, 25);",
+            "INSERT INTO items VALUES (6, 'F', 12.0, 150);",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            // LIMIT only
+            "SELECT name FROM items ORDER BY id LIMIT 3",
+            // LIMIT + OFFSET
+            "SELECT name FROM items ORDER BY id LIMIT 3 OFFSET 2",
+            // LIMIT 0
+            "SELECT name FROM items ORDER BY id LIMIT 0",
+            // LIMIT larger than result set
+            "SELECT name FROM items ORDER BY id LIMIT 100",
+            // OFFSET larger than result set
+            "SELECT name FROM items ORDER BY id LIMIT 10 OFFSET 100",
+            // LIMIT on GROUP BY
+            "SELECT qty, count(*) AS cnt FROM items GROUP BY qty ORDER BY qty LIMIT 3",
+            // UNION
+            "SELECT name FROM items WHERE price > 20 UNION SELECT name FROM items WHERE qty < 50 ORDER BY name",
+            // UNION ALL
+            "SELECT name FROM items WHERE price > 15 UNION ALL SELECT name FROM items WHERE qty > 100 ORDER BY name",
+            // INTERSECT
+            "SELECT name FROM items WHERE price > 10 INTERSECT SELECT name FROM items WHERE qty >= 50 ORDER BY name",
+            // EXCEPT
+            "SELECT name FROM items WHERE price > 10 EXCEPT SELECT name FROM items WHERE qty > 100 ORDER BY name",
+            // Type coercion: integer vs text comparison
+            "SELECT name FROM items WHERE id = '3'",
+            // Type coercion: integer vs float
+            "SELECT name FROM items WHERE id = 3.0",
+            // ORDER BY expression
+            "SELECT name, price * qty AS total FROM items ORDER BY price * qty DESC LIMIT 3",
+            // Compound SELECT with LIMIT
+            "SELECT name FROM items WHERE price > 20 UNION ALL SELECT name FROM items WHERE qty < 30 ORDER BY name LIMIT 2",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!(
+                "{} limit/union/coercion conformance mismatches found",
+                mismatches.len()
+            );
+        }
+    }
+
+    /// String functions, REPLACE, INSTR, SUBSTR, and built-in functions
+    /// commonly used by ORMs and applications.
+    #[test]
+    fn test_conformance_string_and_builtin_funcs() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let queries = [
+            // String functions
+            "SELECT length('hello')",
+            "SELECT upper('hello'), lower('WORLD')",
+            "SELECT trim('  hello  ')",
+            "SELECT ltrim('  hello')",
+            "SELECT rtrim('hello  ')",
+            "SELECT replace('hello world', 'world', 'rust')",
+            "SELECT instr('hello world', 'world')",
+            "SELECT instr('hello', 'xyz')",
+            "SELECT substr('hello world', 7)",
+            "SELECT substr('hello world', 7, 5)",
+            "SELECT substr('hello', -3)",
+            // typeof
+            "SELECT typeof(42), typeof(3.14), typeof('text'), typeof(NULL), typeof(x'FF')",
+            // CAST
+            "SELECT CAST(42 AS TEXT)",
+            "SELECT CAST('42' AS INTEGER)",
+            "SELECT CAST('3.14' AS REAL)",
+            "SELECT CAST(3.14 AS INTEGER)",
+            "SELECT CAST(NULL AS INTEGER)",
+            // hex/unhex
+            "SELECT hex('hello')",
+            "SELECT hex(42)",
+            // abs
+            "SELECT abs(-42), abs(42), abs(0)",
+            "SELECT abs(-3.14)",
+            // min/max scalar
+            "SELECT min(1, 2, 3), max(1, 2, 3)",
+            "SELECT min('a', 'b', 'c'), max('a', 'b', 'c')",
+            // coalesce/ifnull/nullif
+            "SELECT coalesce(NULL, NULL, 42)",
+            "SELECT coalesce(1, 2, 3)",
+            "SELECT ifnull(NULL, 'default')",
+            "SELECT ifnull('value', 'default')",
+            "SELECT nullif(1, 1)",
+            "SELECT nullif(1, 2)",
+            // iif
+            "SELECT iif(1 > 0, 'yes', 'no')",
+            "SELECT iif(1 < 0, 'yes', 'no')",
+            "SELECT iif(NULL, 'yes', 'no')",
+            // quote
+            "SELECT quote('hello')",
+            "SELECT quote(42)",
+            "SELECT quote(NULL)",
+            "SELECT quote(3.14)",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!(
+                "{} string/builtin function conformance mismatches found",
+                mismatches.len()
+            );
+        }
+    }
+
     /// Probe UPDATE/DELETE with complex patterns: correlated subqueries,
     /// computed expressions, and multi-step DML sequences.
     #[test]
