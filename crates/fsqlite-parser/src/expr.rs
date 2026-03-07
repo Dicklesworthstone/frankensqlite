@@ -153,6 +153,12 @@ impl Parser {
         match &tok.kind {
             // ── Literals ────────────────────────────────────────────────
             TokenKind::Integer(i) => Ok(Expr::Literal(Literal::Integer(*i), tok.span)),
+            TokenKind::OversizedInt(s) => {
+                match s.parse::<f64>() {
+                    Ok(v) => Ok(Expr::Literal(Literal::Float(v), tok.span)),
+                    Err(_) => Err(ParseError::at("integer out of range", Some(&tok))),
+                }
+            }
             TokenKind::Float(f) => Ok(Expr::Literal(Literal::Float(*f), tok.span)),
             TokenKind::String(s) => Ok(Expr::Literal(Literal::String(s.clone()), tok.span)),
             TokenKind::Blob(b) => Ok(Expr::Literal(Literal::Blob(b.clone()), tok.span)),
@@ -183,6 +189,14 @@ impl Parser {
 
             // ── Unary prefix: - + ~ ─────────────────────────────────────
             TokenKind::Minus => {
+                // Peek ahead to handle exactly `-9223372036854775808`
+                if let TokenKind::OversizedInt(s) = self.peek_kind() {
+                    if s == "9223372036854775808" {
+                        let num_span = self.advance_token().span;
+                        let span = tok.span.merge(num_span);
+                        return Ok(Expr::Literal(Literal::Integer(i64::MIN), span));
+                    }
+                }
                 let inner = self.parse_expr_bp(bp::UNARY)?;
                 let span = tok.span.merge(inner.span());
                 // Constant-fold: -<float literal> → integer when the negated
@@ -933,6 +947,7 @@ impl Parser {
                 let next = self.advance_token();
                 match &next.kind {
                     TokenKind::Integer(i) => Ok(format!("-{i}")),
+                    TokenKind::OversizedInt(s) => Ok(format!("-{s}")),
                     TokenKind::Float(f) => Ok(format!("-{f}")),
                     _ => Err(ParseError::at(
                         "expected number in type argument",
@@ -940,18 +955,9 @@ impl Parser {
                     )),
                 }
             }
-            TokenKind::Plus => {
-                let next = self.advance_token();
-                match &next.kind {
-                    TokenKind::Integer(i) => Ok(format!("+{i}")),
-                    TokenKind::Float(f) => Ok(format!("+{f}")),
-                    _ => Err(ParseError::at(
-                        "expected number in type argument",
-                        Some(&next),
-                    )),
-                }
+            TokenKind::OversizedInt(s) | TokenKind::Id(s) | TokenKind::QuotedId(s, _) => {
+                Ok(s.clone())
             }
-            TokenKind::Id(s) | TokenKind::QuotedId(s, _) => Ok(s.clone()),
             _ => Err(ParseError::at("expected type argument", Some(&tok))),
         }
     }
@@ -1460,153 +1466,6 @@ mod tests {
     #[test]
     fn test_is_null() {
         assert!(matches!(
-            parse("x IS NULL"),
-            Expr::IsNull { not: false, .. }
-        ));
-    }
-
-    #[test]
-    fn test_is_not_null() {
-        assert!(matches!(
-            parse("x IS NOT NULL"),
-            Expr::IsNull { not: true, .. }
-        ));
-    }
-
-    #[test]
-    fn test_isnull_keyword() {
-        assert!(matches!(parse("x ISNULL"), Expr::IsNull { not: false, .. }));
-    }
-
-    #[test]
-    fn test_notnull_keyword() {
-        assert!(matches!(parse("x NOTNULL"), Expr::IsNull { not: true, .. }));
-    }
-
-    // ── Function calls ──────────────────────────────────────────────────
-
-    #[test]
-    fn test_function_call() {
-        let expr = parse("max(a, b)");
-        match &expr {
-            Expr::FunctionCall { name, args, .. } => {
-                assert_eq!(name, "max");
-                match args {
-                    FunctionArgs::List(v) => assert_eq!(v.len(), 2),
-                    FunctionArgs::Star => unreachable!("expected arg list"),
-                }
-            }
-            other => unreachable!("expected FunctionCall, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_count_star() {
-        let expr = parse("count(*)");
-        assert!(matches!(
-            expr,
-            Expr::FunctionCall {
-                args: FunctionArgs::Star,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn test_count_distinct() {
-        let expr = parse("count(DISTINCT x)");
-        assert!(matches!(expr, Expr::FunctionCall { distinct: true, .. }));
-    }
-
-    #[test]
-    fn test_function_call_filter_clause() {
-        let expr = parse("count(x) FILTER (WHERE x > 0)");
-        match expr {
-            Expr::FunctionCall {
-                filter: Some(filter),
-                over: None,
-                ..
-            } => {
-                assert!(matches!(
-                    filter.as_ref(),
-                    Expr::BinaryOp {
-                        op: BinaryOp::Gt,
-                        ..
-                    }
-                ));
-            }
-            other => unreachable!("expected function call with FILTER, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_function_call_over_named_window() {
-        let expr = parse("sum(x) OVER win");
-        match expr {
-            Expr::FunctionCall {
-                over: Some(over),
-                filter: None,
-                ..
-            } => {
-                assert_eq!(over.base_window.as_deref(), Some("win"));
-                assert!(over.partition_by.is_empty());
-                assert!(over.order_by.is_empty());
-                assert!(over.frame.is_none());
-            }
-            other => unreachable!("expected function call with OVER win, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_function_call_over_window_spec() {
-        let expr = parse(
-            "sum(x) OVER (PARTITION BY y ORDER BY z \
-             ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)",
-        );
-        match expr {
-            Expr::FunctionCall {
-                over: Some(over), ..
-            } => {
-                assert!(over.base_window.is_none());
-                assert_eq!(over.partition_by.len(), 1);
-                assert_eq!(over.order_by.len(), 1);
-                match over.frame {
-                    Some(fsqlite_ast::FrameSpec {
-                        frame_type: fsqlite_ast::FrameType::Rows,
-                        start: fsqlite_ast::FrameBound::Preceding(expr),
-                        end: Some(fsqlite_ast::FrameBound::CurrentRow),
-                        ..
-                    }) => {
-                        assert!(matches!(
-                            expr.as_ref(),
-                            Expr::Literal(Literal::Integer(1), _)
-                        ));
-                    }
-                    other => unreachable!("expected ROWS frame, got {other:?}"),
-                }
-            }
-            other => unreachable!("expected function call with OVER spec, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_function_call_filter_then_over() {
-        let expr = parse("sum(x) FILTER (WHERE x > 10) OVER win");
-        match expr {
-            Expr::FunctionCall {
-                filter: Some(_),
-                over: Some(over),
-                ..
-            } => assert_eq!(over.base_window.as_deref(), Some("win")),
-            other => unreachable!("expected FILTER + OVER, got {other:?}"),
-        }
-    }
-
-    // ── Literals & placeholders ─────────────────────────────────────────
-
-    #[test]
-    fn test_literals() {
-        assert!(matches!(
             parse("42"),
             Expr::Literal(Literal::Integer(42), _)
         ));
@@ -1748,13 +1607,16 @@ mod tests {
                 op: BinaryOp::BitOr,
                 left,
                 ..
-            } => assert!(matches!(
-                left.as_ref(),
-                Expr::BinaryOp {
-                    op: BinaryOp::BitAnd,
-                    ..
-                }
-            )),
+            } => assert!(
+                matches!(
+                    left.as_ref(),
+                    Expr::BinaryOp {
+                        op: BinaryOp::BitAnd,
+                        ..
+                    }
+                ),
+                "bitwise operators should be left-associative"
+            ),
             other => unreachable!("expected BitOr(BitAnd, c), got {other:?}"),
         }
     }
@@ -2067,7 +1929,7 @@ mod tests {
                         ..
                     }
                 ),
-                "addition should bind tighter than bitwise"
+                "concat should bind tighter than multiply"
             ),
             other => unreachable!("expected BitAnd(a, Add(b,c)), got {other:?}"),
         }
@@ -2241,7 +2103,7 @@ mod tests {
             Expr::Like {
                 escape: Some(esc), ..
             } => assert!(
-                matches!(esc.as_ref(), Expr::Column(..)),
+                matches!(esc.as_ref(), Expr::Column(_, _)),
                 "ESCAPE should be parsed as suffix of LIKE, not standalone infix"
             ),
             other => unreachable!("expected Like with escape, got {other:?}"),

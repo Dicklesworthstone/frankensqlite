@@ -362,6 +362,7 @@ impl TwoPhaseCoordinator {
     pub fn check_detach(&self, db_id: DatabaseId) -> Result<(), TwoPhaseError> {
         if self.state != TwoPhaseState::Idle
             && self.state != TwoPhaseState::Committed
+            && self.state != TwoPhaseState::Aborted
             && self.participants.contains_key(&db_id)
         {
             return Err(TwoPhaseError::DetachWithActiveTransaction { db_id });

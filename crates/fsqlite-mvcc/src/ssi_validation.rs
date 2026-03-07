@@ -433,27 +433,25 @@ pub fn discover_outgoing_edges(
         }
 
         for read_key in read_keys {
-            if let Some(page) = witness_key_page(read_key) {
-                if writer.keys.contains(&page) {
-                    if seen_targets.insert(writer.token) {
-                        debug!(
-                            bead_id = "bd-31bo",
-                            from = ?committing_txn,
-                            to = ?writer.token,
-                            key = ?read_key,
-                            source = "commit_log_index",
-                            "discovered outgoing rw-antidependency edge"
-                        );
-                        edges.push(DiscoveredEdge {
-                            from: committing_txn,
-                            to: writer.token,
-                            overlap_key: read_key.clone(),
-                            source_is_active: false,
-                            source_has_in_rw: writer.had_out_rw,
-                        });
-                    }
-                    break;
+            if writer.keys.contains(read_key) {
+                if seen_targets.insert(writer.token) {
+                    debug!(
+                        bead_id = "bd-31bo",
+                        from = ?committing_txn,
+                        to = ?writer.token,
+                        key = ?read_key,
+                        source = "commit_log_index",
+                        "discovered outgoing rw-antidependency edge"
+                    );
+                    edges.push(DiscoveredEdge {
+                        from: committing_txn,
+                        to: writer.token,
+                        overlap_key: read_key.clone(),
+                        source_is_active: false,
+                        source_has_in_rw: writer.had_out_rw,
+                    });
                 }
+                break;
             }
         }
     }
@@ -2156,7 +2154,8 @@ mod tests {
 
         // T1 commits first: writes A. T2 is active reader of A → incoming edge.
         // No outgoing edge for T1 (nobody is writing to B yet).
-        let t2_readers: Vec<&dyn ActiveTxnView> = vec![&t2_token];
+        let t2_mock = MockActiveTxn::new(2, 0, 1).with_reads(vec![page_a.clone()]);
+        let t2_readers: Vec<&dyn ActiveTxnView> = vec![&t2_mock];
         let result_t1 = ssi_validate_and_publish(
             t1_token,
             CommitSeq::new(1),
@@ -2637,8 +2636,8 @@ mod tests {
             CommitSeq::new(3),
             &[page_key(800)],
             &[page_key(700)],
-            &readers,
-            &writers,
+            &[],
+            &[],
             &[],
             &[],
             false,

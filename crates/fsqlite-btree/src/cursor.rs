@@ -3076,6 +3076,48 @@ mod tests {
     }
 
     #[test]
+    fn test_cursor_index_seek_duplicate_run_walks_all_matching_entries() {
+        let mut store = MemPageStore::new(USABLE);
+        store.pages.insert(2, build_leaf_index(&[]));
+
+        let cx = Cx::new();
+        let mut cursor = BtCursor::new(store, pn(2), USABLE, false);
+
+        for rowid in [1_i64, 2, 5] {
+            let key = serialize_record(&[SqliteValue::Integer(42), SqliteValue::Integer(rowid)]);
+            cursor.index_insert(&cx, &key).unwrap();
+        }
+        let other_key = serialize_record(&[SqliteValue::Integer(99), SqliteValue::Integer(9)]);
+        cursor.index_insert(&cx, &other_key).unwrap();
+
+        let probe = serialize_record(&[SqliteValue::Integer(42), SqliteValue::Integer(i64::MIN)]);
+        let seek = cursor.index_move_to(&cx, &probe).unwrap();
+        assert!(
+            !seek.is_found(),
+            "probe uses a synthetic minimum rowid and should anchor via successor positioning"
+        );
+        assert!(
+            !cursor.eof(),
+            "duplicate-run probe should land on the first matching entry"
+        );
+
+        let mut seen_rowids = Vec::new();
+        loop {
+            let payload = cursor.payload(&cx).unwrap();
+            let fields = parse_record(&payload).unwrap();
+            if fields.first() != Some(&SqliteValue::Integer(42)) {
+                break;
+            }
+            seen_rowids.push(cursor.rowid(&cx).unwrap());
+            if !cursor.next(&cx).unwrap() {
+                break;
+            }
+        }
+
+        assert_eq!(seen_rowids, vec![1, 2, 5]);
+    }
+
+    #[test]
     fn test_cursor_index_rowid_rejects_record_without_trailing_integer() {
         let mut store = MemPageStore::new(USABLE);
         store.pages.insert(2, build_leaf_index(&[]));

@@ -363,11 +363,11 @@ pub fn aggregate_batch_ordered(
 // ── Helpers ────────────────────────────────────────────────────────────────
 
 /// A single group key value for comparison.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum GroupKeyValue {
     Null,
     Integer(i64),
-    Float(f64),
+    FloatBits(u64),
     Text(String),
     Blob(Vec<u8>),
 }
@@ -392,8 +392,16 @@ fn extract_group_key(
             ColumnData::Int16(v) => GroupKeyValue::Integer(i64::from(v.as_slice()[row])),
             ColumnData::Int32(v) => GroupKeyValue::Integer(i64::from(v.as_slice()[row])),
             ColumnData::Int64(v) => GroupKeyValue::Integer(v.as_slice()[row]),
-            ColumnData::Float32(v) => GroupKeyValue::Float(f64::from(v.as_slice()[row])),
-            ColumnData::Float64(v) => GroupKeyValue::Float(v.as_slice()[row]),
+            ColumnData::Float32(v) => {
+                let f = f64::from(v.as_slice()[row]);
+                let f_norm = if f == 0.0 { 0.0 } else { f };
+                GroupKeyValue::FloatBits(f_norm.to_bits())
+            }
+            ColumnData::Float64(v) => {
+                let f = v.as_slice()[row];
+                let f_norm = if f == 0.0 { 0.0 } else { f };
+                GroupKeyValue::FloatBits(f_norm.to_bits())
+            }
             ColumnData::Text { offsets, data } => {
                 let start = offsets[row] as usize;
                 let end = offsets[row + 1] as usize;
@@ -451,7 +459,7 @@ fn build_group_key_column(
                     }
                     GroupKeyValue::Integer(v) => *v,
                     #[allow(clippy::cast_possible_truncation)]
-                    GroupKeyValue::Float(v) => *v as i64,
+                    GroupKeyValue::FloatBits(v) => f64::from_bits(*v) as i64,
                     GroupKeyValue::Text(_) | GroupKeyValue::Blob(_) => 0,
                 };
                 values.push(i);
@@ -475,7 +483,7 @@ fn build_group_key_column(
                     }
                     #[allow(clippy::cast_precision_loss)]
                     GroupKeyValue::Integer(v) => *v as f64,
-                    GroupKeyValue::Float(v) => *v,
+                    GroupKeyValue::FloatBits(v) => f64::from_bits(*v),
                     GroupKeyValue::Text(_) | GroupKeyValue::Blob(_) => 0.0,
                 };
                 values.push(f);

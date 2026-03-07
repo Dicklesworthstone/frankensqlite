@@ -27,6 +27,8 @@ pub enum TokenKind {
     // === Literals ===
     /// Integer literal: `42`, `-7`, `0xFF`.
     Integer(i64),
+    /// Integer literal that exceeded `i64::MAX` but has no decimal/exponent.
+    OversizedInt(String),
     /// Float literal: `3.14`, `1e10`, `.5`.
     Float(f64),
     /// String literal (single-quoted): `'hello'`.

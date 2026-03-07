@@ -52,6 +52,10 @@ pub enum FcwResult {
         /// The authoritative commit sequence that caused the conflict.
         conflicting_commit_seq: CommitSeq,
     },
+    /// SSI abort due to anomalous access patterns.
+    Abort {
+        reason: crate::ssi_validation::SsiAbortReason,
+    },
 }
 
 /// Lightweight handle representing one active concurrent session.
@@ -724,7 +728,7 @@ pub fn concurrent_commit(
             handle.mark_committed();
             Ok(assign_commit_seq)
         }
-        FcwResult::Conflict { .. } => {
+        FcwResult::Conflict { .. } | FcwResult::Abort { .. } => {
             // Release all page locks on conflict.
             lock_table.release_all(txn_id);
             handle.mark_aborted();
@@ -781,7 +785,7 @@ pub fn prepare_concurrent_commit_with_ssi(
             handle.begin_seq(),
             read_keys,
             write_keys,
-            handle.marked_for_abort(),
+            handle.marked_for_abort.get(),
         )
     };
 
@@ -1426,6 +1430,7 @@ mod tests {
                 assert_eq!(conflicting_commit_seq, CommitSeq::new(15));
             }
             FcwResult::Clean => panic!("expected conflict"),
+            FcwResult::Abort { .. } => panic!("expected conflict, got abort"),
         }
     }
 

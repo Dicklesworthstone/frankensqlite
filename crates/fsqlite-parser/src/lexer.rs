@@ -705,11 +705,9 @@ impl<'a> Lexer<'a> {
             match text.parse::<i64>() {
                 Ok(v) => TokenKind::Integer(v),
                 Err(_) => {
-                    // SQLite promotes oversized integers to REAL.
-                    match text.parse::<f64>() {
-                        Ok(v) => TokenKind::Float(v),
-                        Err(_) => TokenKind::Error(format!("integer out of range: {text}")),
-                    }
+                    // SQLite promotes oversized integers to REAL. We emit a special
+                    // token to allow the parser to fold `-9223372036854775808` correctly.
+                    TokenKind::OversizedInt(text.into_owned())
                 }
             }
         }

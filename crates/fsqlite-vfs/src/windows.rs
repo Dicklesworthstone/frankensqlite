@@ -766,15 +766,9 @@ impl VfsFile for WindowsFile {
                                 ),
                             });
                         }
-                        let replacement = ShmRegion::new(size_usize);
-                        {
-                            let current = occupied.get();
-                            let old_guard = current.lock();
-                            let mut new_guard = replacement.lock();
-                            let copy_len = old_guard.len().min(new_guard.len());
-                            new_guard[..copy_len].copy_from_slice(&old_guard[..copy_len]);
-                        }
-                        occupied.insert(replacement);
+                        let mut updated_region = occupied.get().clone();
+                        updated_region.resize(size_usize);
+                        occupied.insert(updated_region);
                     }
                     occupied.into_mut()
                 }
@@ -994,6 +988,31 @@ mod tests {
     #[test]
     fn test_windowsvfs_shared_memory_cross_handle() {
         test_windowsvfs_shared_memory_create_and_cross_handle();
+    }
+
+    #[test]
+    fn test_windowsvfs_shm_resize_preserves_existing_mappings() {
+        let cx = Cx::new();
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("shm_resize.db");
+        let vfs = WindowsVfs::new();
+        let (mut file, _) = vfs
+            .open(&cx, Some(&path), open_flags_create())
+            .expect("open file");
+
+        let region_small = file.shm_map(&cx, 0, 32, true).expect("initial map");
+        region_small.write_u32_le(0, 0x1122_3344);
+
+        let region_large = file.shm_map(&cx, 0, 64, true).expect("resized map");
+        region_large.write_u32_le(0, 0x5566_7788);
+        region_large.write_u32_le(32, 0xAABB_CCDD);
+
+        assert_eq!(
+            region_small.read_u32_le(0),
+            0x5566_7788,
+            "resizing must preserve shared backing for existing mappings"
+        );
+        assert_eq!(region_large.read_u32_le(32), 0xAABB_CCDD);
     }
 
     #[test]

@@ -1095,13 +1095,15 @@ pub fn codegen_select(
     } else {
         extract_rowid_bind_param(where_clause.as_deref())
     };
-    // Check for index-usable WHERE clause (only for non-aggregate queries).
-    // NOTE: Index-seek is disabled because the B-tree cursor Next() doesn't
-    // correctly advance through duplicate key entries in non-unique indexes,
-    // causing WHERE queries on non-unique indexed columns to return only
-    // the first matching row. Fall back to full table scan until the B-tree
-    // cursor is fixed. (bd-beads_rust-6ii1)
-    let index_eq: Option<(String, i32)> = None;
+    // Check for a simple indexed equality probe (only for non-aggregate queries).
+    // We probe with [bound_value, i64::MIN] so SeekGE anchors on the first
+    // duplicate entry in non-unique indexes and the loop can walk the full
+    // duplicate run via Next + IdxRowid.
+    let index_eq = if is_aggregate {
+        None
+    } else {
+        extract_column_eq_bind(where_clause.as_deref())
+    };
     let mut index_cursor_to_close = None;
 
     if let Some(param_idx) = rowid_param {
@@ -7891,7 +7893,6 @@ fn extract_rowid_bind_param(where_clause: Option<&Expr>) -> Option<i32> {
 }
 
 /// Check if a WHERE clause is `col = ?` for an indexed column.
-#[allow(dead_code)]
 fn extract_column_eq_bind(where_clause: Option<&Expr>) -> Option<(String, i32)> {
     let expr = where_clause?;
     if let Expr::BinaryOp {
@@ -11687,39 +11688,77 @@ mod tests {
         codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
         let prog = b.finish().unwrap();
 
-        // Index-seek planning is intentionally disabled for now (see
-        // codegen_select comment near `index_eq`), so this should compile to
-        // a full table scan even when an index exists on the filtered column.
+        // Indexed equality should probe the index, anchor on the first
+        // duplicate using [param, i64::MIN], and iterate the duplicate run.
         let open_reads = prog
             .ops()
             .iter()
             .filter(|op| op.opcode == Opcode::OpenRead)
             .count();
         assert_eq!(
-            open_reads, 1,
-            "index seek disabled: only table cursor should open"
+            open_reads, 2,
+            "indexed equality should open both table and index cursors"
+        );
+        assert!(
+            prog.ops().iter().any(|op| op.opcode == Opcode::OpenRead
+                && matches!(&op.p4, P4::Index(name) if name == "idx_t_b")),
+            "expected index cursor open for indexed equality probe"
         );
 
-        assert!(
-            prog.ops().iter().any(|op| op.opcode == Opcode::Rewind),
-            "expected full scan to rewind the table cursor"
+        let int64 = prog
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::Int64)
+            .expect("Int64 should load i64::MIN for duplicate-range seek lower bound");
+        assert_eq!(int64.p4, P4::Int64(i64::MIN));
+
+        let make_record = prog
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::MakeRecord)
+            .expect("MakeRecord should build the composite probe key");
+        assert_eq!(
+            make_record.p1 + 1,
+            int64.p2,
+            "MakeRecord should consume [param_reg, min_rowid_reg]"
         );
-        assert!(
-            prog.ops().iter().any(|op| op.opcode == Opcode::Next),
-            "expected full scan loop to advance with Next"
+
+        let seek_ge = prog
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::SeekGE)
+            .expect("SeekGE should be emitted for index probe");
+        assert_eq!(
+            seek_ge.p3, make_record.p3,
+            "SeekGE must read probe key from MakeRecord destination register"
         );
+
+        let is_null_count = prog
+            .ops()
+            .iter()
+            .filter(|op| op.opcode == Opcode::IsNull)
+            .count();
         assert!(
-            !prog.ops().iter().any(|op| op.opcode == Opcode::SeekGE),
-            "index seek is disabled: no SeekGE expected"
+            is_null_count >= 1,
+            "indexed equality should guard NULL probe"
         );
-        assert!(
-            !prog.ops().iter().any(|op| op.opcode == Opcode::IdxRowid),
-            "index seek is disabled: no IdxRowid expected"
+
+        let seek_rowid = prog
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::SeekRowid)
+            .expect("SeekRowid should follow IdxRowid");
+        assert_ne!(
+            seek_rowid.p2, 0,
+            "SeekRowid miss target must not jump to pc=0"
         );
-        assert!(
-            !prog.ops().iter().any(|op| op.opcode == Opcode::SeekRowid),
-            "index seek is disabled: no SeekRowid expected in this path"
-        );
+
+        let next = prog
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::Next)
+            .expect("index equality path must iterate duplicates");
+        assert_eq!(next.p1, 1, "Next should advance the index cursor");
     }
 
     #[test]

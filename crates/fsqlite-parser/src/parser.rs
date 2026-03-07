@@ -399,6 +399,14 @@ impl Parser {
                     self.advance();
                     TimeTravelTarget::CommitSequence(n as u64)
                 }
+                TokenKind::OversizedInt(s) => {
+                    if let Ok(n) = s.parse::<u64>() {
+                        self.advance();
+                        TimeTravelTarget::CommitSequence(n)
+                    } else {
+                        return Err(self.err_expected("non-negative integer after COMMITSEQ"));
+                    }
+                }
                 _ => return Err(self.err_expected("non-negative integer after COMMITSEQ")),
             }
         } else {
@@ -1289,6 +1297,10 @@ impl Parser {
             TokenKind::Integer(n) => {
                 self.advance();
                 Ok(if neg { format!("-{n}") } else { n.to_string() })
+            }
+            TokenKind::OversizedInt(s) => {
+                self.advance();
+                Ok(if neg { format!("-{s}") } else { s.clone() })
             }
             TokenKind::Float(f) => {
                 self.advance();

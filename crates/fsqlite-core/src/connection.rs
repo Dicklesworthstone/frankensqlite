@@ -5844,9 +5844,10 @@ impl Connection {
                             // tbl_name, and rootpage from the existing row,
                             // only replacing the sql column (index 4).
                             let mut updated = values.clone();
-                            if updated.len() > 4 {
-                                updated[4] = SqliteValue::Text(new_sql.to_owned());
+                            if updated.len() < 5 {
+                                updated.resize(5, SqliteValue::Null);
                             }
+                            updated[4] = SqliteValue::Text(new_sql.to_owned());
                             let record = serialize_record(&updated);
 
                             // Delete old row then re-insert at the same rowid.
@@ -8465,7 +8466,7 @@ impl Connection {
                         .map(|p| p.get().to_string())
                         .collect::<Vec<_>>()
                         .join(", "),
-                    FcwResult::Clean => String::new(),
+                    FcwResult::Clean | FcwResult::Abort { .. } => String::new(),
                 };
                 FrankenError::BusySnapshot {
                     conflicting_pages: pages,
@@ -8700,7 +8701,17 @@ impl Connection {
 
         match validate_result {
             Ok(plan) => {
-                let first_page = plan.write_pages().first().map_or(0, |page| page.get());
+                let first_page = plan
+                    .write_keys()
+                    .iter()
+                    .find_map(|k| {
+                        if let fsqlite_types::WitnessKey::Page(p) = k {
+                            Some(p.get())
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(0);
                 tracing::debug!(
                     txn_id = plan.txn_token().id.get(),
                     commit_seq = plan.assigned_commit_seq().get(),
@@ -8729,7 +8740,17 @@ impl Connection {
         plan: PreparedConcurrentCommit,
         committed_seq: CommitSeq,
     ) {
-        let first_page = plan.write_pages().first().map_or(0, |page| page.get());
+        let first_page = plan
+            .write_keys()
+            .iter()
+            .find_map(|k| {
+                if let fsqlite_types::WitnessKey::Page(p) = k {
+                    Some(p.get())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0);
         tracing::info!(
             txn_id = plan.txn_token().id.get(),
             commit_seq = committed_seq.get(),
@@ -12660,7 +12681,7 @@ impl Connection {
         &self,
         with: Option<&fsqlite_ast::WithClause>,
         params: Option<&[SqliteValue]>,
-        temp_names: &mut Vec<String>,
+        mut temp_names: &mut Vec<String>,
     ) -> Result<()> {
         let with_clause = with.ok_or_else(|| FrankenError::internal("expected CTE with clause"))?;
         let is_recursive = with_clause.recursive;
@@ -12676,7 +12697,7 @@ impl Connection {
                     .any(|(_, core)| select_core_references_table(core, cte_name));
 
             if has_self_ref {
-                self.materialize_recursive_cte(cte, params, &mut temp_names)?;
+                self.materialize_recursive_cte(cte, params, &mut *temp_names)?;
             } else {
                 let cte_rows =
                     self.execute_statement(Statement::Select(cte.query.clone()), params)?;
@@ -13959,11 +13980,8 @@ impl Connection {
                 );
                 continue;
             }
-            if root_page_num == 0 {
-                return Err(FrankenError::DatabaseCorrupt {
-                    detail: format!("table `{name}` has invalid rootpage 0 in sqlite_master"),
-                });
-            }
+            let root_page_u32 =
+                crate::compat_persist::validate_sqlite_master_root_page(&name, root_page_num)?;
 
             // Parse the CREATE TABLE to extract column info.
             let columns = crate::compat_persist::parse_columns_from_sqlite_master_sql(&create_sql);
@@ -13982,8 +14000,8 @@ impl Connection {
                 }
             }
 
-            #[allow(clippy::cast_possible_truncation)]
-            let real_root_page = root_page_num as i32;
+            let real_root_page =
+                i32::try_from(root_page_u32).expect("validated root page must fit MemDatabase");
             new_db.create_table_at(real_root_page, num_columns);
 
             // Parse FK definitions and UNIQUE column groups from the CREATE TABLE AST.
@@ -32880,6 +32898,66 @@ mod schema_loading_tests {
     }
 
     #[test]
+    fn test_reopen_rejects_negative_rootpage() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("corrupt_rootpage_negative.db");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        {
+            let rconn = rusqlite::Connection::open(&db_path).unwrap();
+            rconn
+                .execute_batch(
+                    r"
+                    CREATE TABLE docs (id INTEGER PRIMARY KEY, title TEXT);
+                    INSERT INTO docs VALUES (1, 'hello');
+                    PRAGMA writable_schema = ON;
+                    UPDATE sqlite_master SET rootpage = -9 WHERE name = 'docs';
+                    PRAGMA writable_schema = OFF;
+                    ",
+                )
+                .unwrap();
+        }
+
+        let err = Connection::open(&db_str).expect_err("negative rootpage should fail reload");
+        let message = err.to_string();
+        assert!(
+            message.contains("rootpage -9") || message.contains("invalid rootpage"),
+            "unexpected reopen error: {message}"
+        );
+    }
+
+    #[test]
+    fn test_reopen_rejects_rootpage_above_supported_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("corrupt_rootpage_large.db");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        {
+            let rconn = rusqlite::Connection::open(&db_path).unwrap();
+            rconn
+                .execute_batch(
+                    r"
+                    CREATE TABLE docs (id INTEGER PRIMARY KEY, title TEXT);
+                    INSERT INTO docs VALUES (1, 'hello');
+                    PRAGMA writable_schema = ON;
+                    UPDATE sqlite_master SET rootpage = 2147483648 WHERE name = 'docs';
+                    PRAGMA writable_schema = OFF;
+                    ",
+                )
+                .unwrap();
+        }
+
+        let err = Connection::open(&db_str).expect_err("oversized rootpage should fail reload");
+        let message = err.to_string();
+        assert!(
+            message.contains("supported range")
+                || message.contains("out-of-range")
+                || message.contains("2147483648"),
+            "unexpected reopen error: {message}"
+        );
+    }
+
+    #[test]
     fn test_reopen_loads_autoindex_metadata_and_keeps_quick_check_clean() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("autoindex_reload.db");
@@ -35045,7 +35123,9 @@ mod pager_routing_tests {
                     "conflicting seq must be session 1's commit"
                 );
             }
-            FcwResult::Clean => panic!("session 2 should detect FCW conflict"),
+            FcwResult::Clean | FcwResult::Abort { .. } => {
+                panic!("session 2 should detect FCW conflict")
+            }
         }
     }
 
@@ -35647,7 +35727,7 @@ mod pager_routing_tests {
                     "conflicting seq must be 8"
                 );
             }
-            FcwResult::Clean => panic!("expected conflict, got Clean"),
+            FcwResult::Clean | FcwResult::Abort { .. } => panic!("expected conflict, got Clean"),
         }
     }
 
@@ -56594,6 +56674,302 @@ mod pager_routing_tests {
                 eprintln!("{m}\n");
             }
             panic!("{} UPDATE with subquery mismatches", mismatches.len());
+        }
+    }
+
+    /// REPLACE INTO, CASE with NULL coercion, multi-aggregate, UPSERT edges.
+    #[test]
+    fn test_conformance_replace_and_case_null() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE kv (k TEXT PRIMARY KEY, v INTEGER);",
+            "INSERT INTO kv VALUES ('a', 1);",
+            "INSERT INTO kv VALUES ('b', 2);",
+            "INSERT INTO kv VALUES ('c', 3);",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        // REPLACE INTO overwrites existing row
+        let dml = "REPLACE INTO kv VALUES ('b', 99)";
+        fconn.execute(dml).unwrap();
+        rconn.execute_batch(dml).unwrap();
+
+        let queries = [
+            "SELECT * FROM kv ORDER BY k",
+            // CASE with NULL coercion
+            "SELECT k, CASE WHEN v IS NULL THEN 'nil' ELSE CAST(v AS TEXT) END AS label FROM kv ORDER BY k",
+            // CASE WHEN comparing against NULL (always falls through to ELSE)
+            "SELECT CASE NULL WHEN 1 THEN 'one' WHEN NULL THEN 'null' ELSE 'else' END",
+            // Multi-aggregate in one query
+            "SELECT COUNT(*), SUM(v), AVG(v), MIN(v), MAX(v), GROUP_CONCAT(k, ',') FROM kv",
+            // COALESCE with NULL
+            "SELECT COALESCE(NULL, NULL, 42)",
+            "SELECT COALESCE(NULL, 'hello', 'world')",
+            // NULLIF
+            "SELECT NULLIF(1, 1), NULLIF(1, 2), NULLIF(NULL, 1)",
+            // IIF (SQLite 3.32+)
+            "SELECT IIF(1 > 0, 'yes', 'no'), IIF(0, 'yes', 'no'), IIF(NULL, 'yes', 'no')",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!("{} REPLACE/CASE/NULL mismatches", mismatches.len());
+        }
+    }
+
+    /// EXISTS subquery, BETWEEN operator, compound set operations.
+    #[test]
+    fn test_conformance_exists_between_compound() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT);",
+            "INSERT INTO t1 VALUES (1, 'alpha');",
+            "INSERT INTO t1 VALUES (2, 'beta');",
+            "INSERT INTO t1 VALUES (3, 'gamma');",
+            "INSERT INTO t1 VALUES (4, 'delta');",
+            "CREATE TABLE t2 (id INTEGER PRIMARY KEY, ref_id INTEGER);",
+            "INSERT INTO t2 VALUES (1, 1);",
+            "INSERT INTO t2 VALUES (2, 3);",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            // EXISTS subquery
+            "SELECT val FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.ref_id = t1.id) ORDER BY val",
+            // NOT EXISTS
+            "SELECT val FROM t1 WHERE NOT EXISTS (SELECT 1 FROM t2 WHERE t2.ref_id = t1.id) ORDER BY val",
+            // BETWEEN
+            "SELECT * FROM t1 WHERE id BETWEEN 2 AND 3 ORDER BY id",
+            // NOT BETWEEN
+            "SELECT * FROM t1 WHERE id NOT BETWEEN 2 AND 3 ORDER BY id",
+            // UNION
+            "SELECT id FROM t1 WHERE id <= 2 UNION SELECT id FROM t1 WHERE id >= 3 ORDER BY id",
+            // UNION ALL (preserves duplicates)
+            "SELECT id FROM t1 WHERE id <= 3 UNION ALL SELECT id FROM t1 WHERE id >= 2 ORDER BY id",
+            // INTERSECT
+            "SELECT id FROM t1 WHERE id <= 3 INTERSECT SELECT id FROM t1 WHERE id >= 2 ORDER BY id",
+            // EXCEPT
+            "SELECT id FROM t1 WHERE id <= 3 EXCEPT SELECT id FROM t1 WHERE id >= 3 ORDER BY id",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!("{} EXISTS/BETWEEN/compound mismatches", mismatches.len());
+        }
+    }
+
+    /// UPSERT (INSERT OR ... ON CONFLICT) edge cases.
+    #[test]
+    fn test_conformance_upsert_edges() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE inventory (sku TEXT PRIMARY KEY, qty INTEGER DEFAULT 0, name TEXT);",
+            "INSERT INTO inventory VALUES ('A001', 10, 'Widget');",
+            "INSERT INTO inventory VALUES ('B002', 5, 'Gadget');",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        // ON CONFLICT DO UPDATE with excluded reference
+        let upsert = "INSERT INTO inventory (sku, qty, name) VALUES ('A001', 3, 'Widget v2') ON CONFLICT(sku) DO UPDATE SET qty = qty + excluded.qty, name = excluded.name";
+        fconn.execute(upsert).unwrap();
+        rconn.execute_batch(upsert).unwrap();
+
+        // ON CONFLICT DO NOTHING for new row
+        let upsert2 = "INSERT INTO inventory (sku, qty, name) VALUES ('C003', 7, 'Thingamajig') ON CONFLICT(sku) DO NOTHING";
+        fconn.execute(upsert2).unwrap();
+        rconn.execute_batch(upsert2).unwrap();
+
+        // ON CONFLICT DO NOTHING for existing row
+        let upsert3 = "INSERT INTO inventory (sku, qty, name) VALUES ('B002', 99, 'Ignored') ON CONFLICT(sku) DO NOTHING";
+        fconn.execute(upsert3).unwrap();
+        rconn.execute_batch(upsert3).unwrap();
+
+        let queries = [
+            "SELECT * FROM inventory ORDER BY sku",
+            "SELECT COUNT(*) FROM inventory",
+            "SELECT SUM(qty) FROM inventory",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!("{} UPSERT edge mismatches", mismatches.len());
+        }
+    }
+
+    /// INSERT...SELECT transformation, datetime functions, string function edges.
+    #[test]
+    fn test_conformance_insert_select_datetime_strings() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE src (id INTEGER PRIMARY KEY, val TEXT);",
+            "INSERT INTO src VALUES (1, 'hello');",
+            "INSERT INTO src VALUES (2, 'world');",
+            "INSERT INTO src VALUES (3, 'test');",
+            "CREATE TABLE dst (id INTEGER PRIMARY KEY, val TEXT);",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        // INSERT...SELECT
+        let ins = "INSERT INTO dst SELECT * FROM src WHERE id <= 2";
+        fconn.execute(ins).unwrap();
+        rconn.execute_batch(ins).unwrap();
+
+        let queries = [
+            "SELECT * FROM dst ORDER BY id",
+            // String function edges
+            "SELECT LENGTH(''), LENGTH(NULL), LENGTH('hello')",
+            "SELECT UPPER('hello'), LOWER('HELLO'), UPPER(NULL)",
+            "SELECT REPLACE('hello world', 'world', 'earth')",
+            "SELECT SUBSTR('hello', 2, 3), SUBSTR('hello', -2)",
+            "SELECT TRIM('  hello  '), LTRIM('  hello'), RTRIM('hello  ')",
+            "SELECT INSTR('hello world', 'world'), INSTR('hello', 'xyz')",
+            // Type checking
+            "SELECT TYPEOF(1), TYPEOF(1.5), TYPEOF('hi'), TYPEOF(NULL), TYPEOF(X'00')",
+            // CAST edges
+            "SELECT CAST('123abc' AS INTEGER), CAST('' AS INTEGER), CAST(NULL AS INTEGER)",
+            "SELECT CAST(123 AS TEXT), CAST(1.5 AS INTEGER), CAST(1.9 AS INTEGER)",
+            // HEX / ZEROBLOB
+            "SELECT HEX(X'DEADBEEF'), HEX('ABC')",
+            "SELECT LENGTH(ZEROBLOB(10)), TYPEOF(ZEROBLOB(5))",
+            // ABS edges
+            "SELECT ABS(-42), ABS(42), ABS(0), ABS(NULL)",
+            // Unicode
+            "SELECT UNICODE('A'), UNICODE('Z'), UNICODE('a')",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!(
+                "{} INSERT SELECT/datetime/string mismatches",
+                mismatches.len()
+            );
+        }
+    }
+
+    /// Nested NULL-handling functions and expression edges.
+    #[test]
+    fn test_conformance_nested_null_expressions() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let queries = [
+            // Nested COALESCE / NULLIF / IIF
+            "SELECT COALESCE(NULLIF(1, 1), NULLIF(2, 3), 99)",
+            "SELECT COALESCE(NULLIF(1, 1), NULLIF(2, 2), 99)",
+            "SELECT IIF(NULLIF(1, 1) IS NULL, 'was null', 'not null')",
+            // Arithmetic with NULL
+            "SELECT 1 + NULL, NULL * 5, NULL / 0, 10 - NULL",
+            // String concatenation with NULL
+            "SELECT 'hello' || NULL, NULL || 'world', NULL || NULL",
+            // Comparison with NULL
+            "SELECT NULL = NULL, NULL != NULL, NULL < 1, NULL > 1",
+            "SELECT NULL IS NULL, NULL IS NOT NULL, 1 IS NULL, 1 IS NOT NULL",
+            // IN with NULL
+            "SELECT 1 IN (1, 2, NULL), 3 IN (1, 2, NULL), NULL IN (1, 2, 3)",
+            // Boolean-like expressions
+            "SELECT NOT NULL, NOT 0, NOT 1, NOT ''",
+            // Nested CASE
+            "SELECT CASE WHEN 1 THEN CASE WHEN 0 THEN 'inner-t' ELSE 'inner-f' END ELSE 'outer-f' END",
+            // Expression with mixed types
+            "SELECT MAX(1, 2.5, '3'), MIN(1, 2.5, '0')",
+            "SELECT TOTAL(NULL), TOTAL(0)",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!("{} nested NULL/expression mismatches", mismatches.len());
+        }
+    }
+
+    /// GROUP BY with HAVING, multi-table JOIN aggregation.
+    #[test]
+    fn test_conformance_groupby_having_join_agg() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INTEGER, amount REAL);",
+            "INSERT INTO orders VALUES (1, 1, 100.0);",
+            "INSERT INTO orders VALUES (2, 1, 200.0);",
+            "INSERT INTO orders VALUES (3, 2, 50.0);",
+            "INSERT INTO orders VALUES (4, 2, 75.0);",
+            "INSERT INTO orders VALUES (5, 3, 300.0);",
+            "CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT);",
+            "INSERT INTO customers VALUES (1, 'Alice');",
+            "INSERT INTO customers VALUES (2, 'Bob');",
+            "INSERT INTO customers VALUES (3, 'Carol');",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            // GROUP BY with HAVING
+            "SELECT customer_id, SUM(amount) AS total FROM orders GROUP BY customer_id HAVING total >= 125 ORDER BY customer_id",
+            // JOIN + GROUP BY + HAVING
+            "SELECT c.name, COUNT(o.id) AS cnt, SUM(o.amount) AS total FROM customers c JOIN orders o ON c.id = o.customer_id GROUP BY c.name HAVING cnt > 1 ORDER BY c.name",
+            // LEFT JOIN with aggregate (customer with no orders)
+            "INSERT INTO customers VALUES (4, 'Dave')",
+        ];
+
+        // Run the INSERT in both
+        for q in &queries[..2] {
+            // just queries, run below
+            let _ = q;
+        }
+        fconn.execute(queries[2]).unwrap();
+        rconn.execute_batch(queries[2]).unwrap();
+
+        let check_queries = [
+            "SELECT customer_id, SUM(amount) AS total FROM orders GROUP BY customer_id HAVING total >= 125 ORDER BY customer_id",
+            "SELECT c.name, COUNT(o.id) AS cnt, SUM(o.amount) AS total FROM customers c JOIN orders o ON c.id = o.customer_id GROUP BY c.name HAVING cnt > 1 ORDER BY c.name",
+            "SELECT c.name, COALESCE(SUM(o.amount), 0) AS total FROM customers c LEFT JOIN orders o ON c.id = o.customer_id GROUP BY c.name ORDER BY c.name",
+            // COUNT with LEFT JOIN (NULL rows should not be counted)
+            "SELECT c.name, COUNT(o.id) FROM customers c LEFT JOIN orders o ON c.id = o.customer_id GROUP BY c.name ORDER BY c.name",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &check_queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!("{} GROUP BY/HAVING/JOIN agg mismatches", mismatches.len());
         }
     }
 }

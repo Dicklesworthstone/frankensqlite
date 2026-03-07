@@ -215,8 +215,15 @@ fn encode_value(data: &ColumnData, row: usize, buf: &mut Vec<u8>) {
         ColumnData::Text { offsets, data } | ColumnData::Binary { offsets, data } => {
             let start = offsets[row] as usize;
             let end = offsets[row + 1] as usize;
-            buf.extend_from_slice(&data[start..end]);
-            buf.push(0x00); // null terminator
+            // Escape 0x00 to properly support composite keys and blobs containing null bytes.
+            for &b in &data[start..end] {
+                if b == 0x00 {
+                    buf.extend_from_slice(&[0x00, 0x01]);
+                } else {
+                    buf.push(b);
+                }
+            }
+            buf.extend_from_slice(&[0x00, 0x00]); // terminator
         }
     }
 }

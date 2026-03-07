@@ -275,19 +275,15 @@ pub fn load_from_sqlite(path: &Path) -> Result<LoadedState> {
         if is_virtual {
             continue;
         }
-        if root_page_num == 0 {
-            return Err(FrankenError::DatabaseCorrupt {
-                detail: format!("table `{name}` has invalid rootpage 0 in sqlite_master"),
-            });
-        }
+        let root_page_u32 = validate_sqlite_master_root_page(&name, root_page_num)?;
 
         // Parse the CREATE TABLE to extract column info.
         let columns = parse_columns_from_sqlite_master_sql(&create_sql);
         let num_columns = columns.len();
 
         // Use the REAL root page from sqlite_master (5A.4: bd-1soh).
-        #[allow(clippy::cast_possible_truncation)]
-        let real_root_page = root_page_num as i32;
+        let real_root_page =
+            i32::try_from(root_page_u32).expect("validated root page must fit MemDatabase");
         db.create_table_at(real_root_page, num_columns);
 
         schema.push(TableSchema {
@@ -302,7 +298,7 @@ pub fn load_from_sqlite(path: &Path) -> Result<LoadedState> {
 
         // Read all rows from this table's B-tree.
         let file_root =
-            PageNumber::new(u32::try_from(root_page_num).unwrap_or(1)).unwrap_or(PageNumber::ONE);
+            PageNumber::new(root_page_u32).expect("validated sqlite_master root page is positive");
 
         let mut cursor = fsqlite_btree::BtCursor::new(
             TransactionPageIo::new(&mut txn),
@@ -571,6 +567,25 @@ pub fn parse_columns_from_sqlite_master_sql(sql: &str) -> Vec<ColumnInfo> {
             .unwrap_or_else(|| parse_columns_from_create_sql(sql));
     }
     parse_columns_from_create_sql(sql)
+}
+
+pub(crate) fn validate_sqlite_master_root_page(name: &str, root_page_num: i64) -> Result<u32> {
+    if root_page_num <= 0 {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!("table `{name}` has invalid rootpage {root_page_num} in sqlite_master"),
+        });
+    }
+
+    let root_page_u32 =
+        u32::try_from(root_page_num).map_err(|_| FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "table `{name}` has out-of-range rootpage {root_page_num} in sqlite_master"
+            ),
+        })?;
+    i32::try_from(root_page_u32).map_err(|_| FrankenError::DatabaseCorrupt {
+        detail: format!("table `{name}` has rootpage {root_page_num} that exceeds supported range"),
+    })?;
+    Ok(root_page_u32)
 }
 
 fn is_virtual_table_sql(sql: &str) -> bool {
@@ -1694,6 +1709,68 @@ mod tests {
         let message = err.to_string();
         assert!(
             message.contains("rootpage 0") || message.contains("root page"),
+            "unexpected load error: {message}"
+        );
+    }
+
+    #[test]
+    fn test_load_from_sqlite_rejects_negative_rootpage() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("compat_corrupt_rootpage_negative.db");
+
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                r"
+                CREATE TABLE docs (id INTEGER PRIMARY KEY, title TEXT);
+                INSERT INTO docs VALUES (1, 'hello');
+                PRAGMA writable_schema = ON;
+                UPDATE sqlite_master SET rootpage = -7 WHERE name = 'docs';
+                PRAGMA writable_schema = OFF;
+                ",
+            )
+            .unwrap();
+        }
+
+        let err = match load_from_sqlite(&db_path) {
+            Ok(_) => panic!("negative rootpage should fail load"),
+            Err(err) => err,
+        };
+        let message = err.to_string();
+        assert!(
+            message.contains("rootpage -7") || message.contains("invalid rootpage"),
+            "unexpected load error: {message}"
+        );
+    }
+
+    #[test]
+    fn test_load_from_sqlite_rejects_rootpage_above_supported_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("compat_corrupt_rootpage_large.db");
+
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                r"
+                CREATE TABLE docs (id INTEGER PRIMARY KEY, title TEXT);
+                INSERT INTO docs VALUES (1, 'hello');
+                PRAGMA writable_schema = ON;
+                UPDATE sqlite_master SET rootpage = 2147483648 WHERE name = 'docs';
+                PRAGMA writable_schema = OFF;
+                ",
+            )
+            .unwrap();
+        }
+
+        let err = match load_from_sqlite(&db_path) {
+            Ok(_) => panic!("oversized rootpage should fail load"),
+            Err(err) => err,
+        };
+        let message = err.to_string();
+        assert!(
+            message.contains("supported range")
+                || message.contains("out-of-range")
+                || message.contains("2147483648"),
             "unexpected load error: {message}"
         );
     }

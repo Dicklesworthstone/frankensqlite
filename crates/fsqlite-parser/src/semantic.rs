@@ -1227,7 +1227,16 @@ impl<'a> Resolver<'a> {
     fn resolve_function(&mut self, name: &str, args: &FunctionArgs, scope: &Scope) {
         // Resolve argument expressions.
         let actual = match args {
-            FunctionArgs::Star => 1, // `*` counts as 1 argument for arity purposes (e.g. count(*))
+            FunctionArgs::Star => {
+                if !name.eq_ignore_ascii_case("count") {
+                    self.push_error(SemanticErrorKind::FunctionArityMismatch {
+                        function: name.to_owned(),
+                        expected: FunctionArity::Range(0, 1),
+                        actual: 1,
+                    });
+                }
+                1 // `*` counts as 1 argument for arity purposes (e.g. count(*))
+            }
             FunctionArgs::List(list) => {
                 for arg in list {
                     self.resolve_expr(arg, scope);
@@ -1317,7 +1326,7 @@ fn known_function_arity(name: &str) -> Option<FunctionArity> {
         "ifnull" | "nullif" | "instr" | "glob" | "likelihood" => Some(FunctionArity::Exact(2)),
         "iif" | "replace" => Some(FunctionArity::Exact(3)),
         "count" => Some(FunctionArity::Range(0, 1)),
-        "group_concat" | "trim" | "ltrim" | "rtrim" => Some(FunctionArity::Range(1, 2)),
+        "group_concat" | "trim" | "ltrim" | "rtrim" | "round" => Some(FunctionArity::Range(1, 2)),
         "substr" | "substring" | "like" => Some(FunctionArity::Range(2, 3)),
         "coalesce" | "json_extract" | "json_remove" => Some(FunctionArity::VariadicMin(2)),
         "json_insert" | "json_replace" | "json_set" => Some(FunctionArity::VariadicMin(3)),
@@ -1656,7 +1665,7 @@ mod tests {
         assert_eq!(errors.len(), 1);
         assert!(matches!(
             errors[0].kind,
-            SemanticErrorKind::NoTablesSpecifiedForStar
+            SemanticErrorKind::FunctionArityMismatch { .. }
         ));
     }
 
@@ -1731,5 +1740,50 @@ mod tests {
             before.fsqlite_semantic_errors_total,
             after.fsqlite_semantic_errors_total,
         );
+    }
+
+    #[test]
+    fn test_resolve_function_arity() {
+        let schema = make_schema();
+        let stmt = parse_one("SELECT sum(1, 2)");
+        let mut resolver = Resolver::new(&schema);
+        let errors = resolver.resolve_statement(&stmt);
+        assert_eq!(errors.len(), 1);
+        assert!(matches!(
+            errors[0].kind,
+            SemanticErrorKind::FunctionArityMismatch { .. }
+        ));
+
+        let stmt_ok = parse_one("SELECT count(*)");
+        let mut resolver_ok = Resolver::new(&schema);
+        let errors_ok = resolver_ok.resolve_statement(&stmt_ok);
+        assert!(errors_ok.is_empty(), "count(*) should be valid");
+    }
+
+    #[test]
+    fn test_resolve_function_star_args_only_for_count() {
+        let schema = make_schema();
+        let stmt = parse_one("SELECT sum(*)");
+        let mut resolver = Resolver::new(&schema);
+        let errors = resolver.resolve_statement(&stmt);
+        assert_eq!(errors.len(), 1);
+        assert!(matches!(
+            errors[0].kind,
+            SemanticErrorKind::FunctionArityMismatch { .. }
+        ));
+
+        let stmt_ok = parse_one("SELECT count(*)");
+        let mut resolver_ok = Resolver::new(&schema);
+        let errors_ok = resolver_ok.resolve_statement(&stmt_ok);
+        assert!(errors_ok.is_empty(), "count(*) should be valid");
+    }
+
+    #[test]
+    fn test_resolve_group_by_alias() {
+        let schema = make_schema();
+        let stmt = parse_one("SELECT id FROM users GROUP BY id");
+        let mut resolver = Resolver::new(&schema);
+        let errors = resolver.resolve_statement(&stmt);
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
     }
 }

@@ -153,69 +153,42 @@ impl VirtualTableCursor for GenerateSeriesCursor {
 ///
 /// Strips leading zeros (except the one before the decimal point),
 /// ensures there's at least a "0" if the integer part is empty.
-fn decimal_normalize(s: &str) -> String {
-    let s = s.trim();
-    let (negative, s) = if let Some(stripped) = s.strip_prefix('-') {
-        (true, stripped)
-    } else {
-        (false, s)
-    };
-
-    let (int_part, frac_part) = match s.split_once('.') {
-        Some((i, f)) => (i, Some(f)),
-        None => (s, None),
-    };
-
-    // Strip leading zeros from integer part
-    let int_part = int_part.trim_start_matches('0');
-    let int_part = if int_part.is_empty() { "0" } else { int_part };
-
-    // Strip trailing zeros from fractional part
-    let result = match frac_part {
-        Some(f) => {
-            let f = f.trim_end_matches('0');
-            if f.is_empty() {
-                int_part.to_owned()
-            } else {
-                format!("{int_part}.{f}")
-            }
-        }
-        None => int_part.to_owned(),
-    };
-
-    if negative && result != "0" {
-        format!("-{result}")
-    } else {
-        result
-    }
+fn decimal_normalize(s: &str) -> Option<String> {
+    let (negative, int_digits, frac_digits) = parse_decimal(s)?;
+    Some(format_decimal(negative, &int_digits, &frac_digits))
 }
 
 /// Parse a decimal string into (negative, integer_digits, fractional_digits).
-fn parse_decimal(s: &str) -> (bool, Vec<u8>, Vec<u8>) {
+fn parse_decimal(s: &str) -> Option<(bool, Vec<u8>, Vec<u8>)> {
     let s = s.trim();
     let (negative, s) = if let Some(stripped) = s.strip_prefix('-') {
         (true, stripped)
+    } else if let Some(stripped) = s.strip_prefix('+') {
+        (false, stripped)
     } else {
         (false, s)
     };
+
+    if s.is_empty() {
+        return None;
+    }
 
     let (int_str, frac_str) = match s.split_once('.') {
         Some((i, f)) => (i, f),
         None => (s, ""),
     };
 
-    let int_digits: Vec<u8> = int_str
-        .bytes()
-        .filter(|b| b.is_ascii_digit())
-        .map(|b| b - b'0')
-        .collect();
-    let frac_digits: Vec<u8> = frac_str
-        .bytes()
-        .filter(|b| b.is_ascii_digit())
-        .map(|b| b - b'0')
-        .collect();
+    if !int_str.is_empty() && !int_str.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if !frac_str.is_empty() && !frac_str.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
 
-    (negative, int_digits, frac_digits)
+    let int_digits: Vec<u8> = int_str.bytes().map(|b| b - b'0').collect();
+    let frac_digits: Vec<u8> = frac_str.bytes().map(|b| b - b'0').collect();
+
+    Some((negative, int_digits, frac_digits))
 }
 
 /// Add two non-negative decimal digit sequences (aligned by decimal point).
@@ -378,11 +351,11 @@ fn format_decimal(negative: bool, int_digits: &[u8], frac_digits: &[u8]) -> Stri
 }
 
 /// Perform decimal addition: a + b.
-fn decimal_add_impl(a: &str, b: &str) -> String {
-    let (neg_a, int_a, frac_a) = parse_decimal(a);
-    let (neg_b, int_b, frac_b) = parse_decimal(b);
+fn decimal_add_impl(a: &str, b: &str) -> Option<String> {
+    let (neg_a, int_a, frac_a) = parse_decimal(a)?;
+    let (neg_b, int_b, frac_b) = parse_decimal(b)?;
 
-    match (neg_a, neg_b) {
+    let result = match (neg_a, neg_b) {
         (false, false) => {
             let (ir, fr) = add_unsigned(&int_a, &frac_a, &int_b, &frac_b);
             format_decimal(false, &ir, &fr)
@@ -419,24 +392,31 @@ fn decimal_add_impl(a: &str, b: &str) -> String {
                 }
             }
         }
-    }
+    };
+    Some(result)
 }
 
 /// Perform decimal subtraction: a - b.
-fn decimal_sub_impl(a: &str, b: &str) -> String {
+fn decimal_sub_impl(a: &str, b: &str) -> Option<String> {
+    let b_str = b.trim();
+    if b_str.is_empty() {
+        return None;
+    }
     // a - b = a + (-b)
-    let neg_b = if let Some(stripped) = b.strip_prefix('-') {
+    let neg_b = if let Some(stripped) = b_str.strip_prefix('-') {
         stripped.to_owned()
+    } else if let Some(stripped) = b_str.strip_prefix('+') {
+        format!("-{stripped}")
     } else {
-        format!("-{b}")
+        format!("-{b_str}")
     };
     decimal_add_impl(a, &neg_b)
 }
 
 /// Perform decimal multiplication: a * b.
-fn decimal_mul_impl(a: &str, b: &str) -> String {
-    let (neg_a, int_a, frac_a) = parse_decimal(a);
-    let (neg_b, int_b, frac_b) = parse_decimal(b);
+fn decimal_mul_impl(a: &str, b: &str) -> Option<String> {
+    let Some((neg_a, int_a, frac_a)) = parse_decimal(a) else { return None; };
+    let Some((neg_b, int_b, frac_b)) = parse_decimal(b) else { return None; };
 
     let result_negative = neg_a != neg_b;
     let frac_places = frac_a.len() + frac_b.len();
@@ -474,22 +454,22 @@ fn decimal_mul_impl(a: &str, b: &str) -> String {
     let int_digits = &product[..int_end];
     let frac_digits = &product[int_end..];
 
-    format_decimal(result_negative, int_digits, frac_digits)
+    Some(format_decimal(result_negative, int_digits, frac_digits))
 }
 
 /// Compare two decimal values, returning -1, 0, or 1.
-fn decimal_cmp_impl(a: &str, b: &str) -> i64 {
-    let (neg_a, int_a, frac_a) = parse_decimal(a);
-    let (neg_b, int_b, frac_b) = parse_decimal(b);
+fn decimal_cmp_impl(a: &str, b: &str) -> Option<i64> {
+    let Some((neg_a, int_a, frac_a)) = parse_decimal(a) else { return None; };
+    let Some((neg_b, int_b, frac_b)) = parse_decimal(b) else { return None; };
 
     let a_is_zero = int_a.iter().all(|&d| d == 0) && frac_a.iter().all(|&d| d == 0);
     let b_is_zero = int_b.iter().all(|&d| d == 0) && frac_b.iter().all(|&d| d == 0);
 
     if a_is_zero && b_is_zero {
-        return 0;
+        return Some(0);
     }
 
-    match (neg_a && !a_is_zero, neg_b && !b_is_zero) {
+    let result = match (neg_a && !a_is_zero, neg_b && !b_is_zero) {
         (true, false) => -1,
         (false, true) => 1,
         (true, true) => {
@@ -505,7 +485,8 @@ fn decimal_cmp_impl(a: &str, b: &str) -> i64 {
             Ordering::Equal => 0,
             Ordering::Greater => 1,
         },
-    }
+    };
+    Some(result)
 }
 
 // ── Decimal scalar functions ─────────────────────────────────────────
@@ -524,7 +505,7 @@ impl ScalarFunction for DecimalFunc {
             return Ok(SqliteValue::Null);
         }
         let text = args[0].to_text();
-        Ok(SqliteValue::Text(decimal_normalize(&text)))
+        Ok(SqliteValue::Text(decimal_normalize(&text).unwrap_or_else(|| text.clone())))
     }
 
     fn num_args(&self) -> i32 {
@@ -552,7 +533,10 @@ impl ScalarFunction for DecimalAddFunc {
         let a = args[0].to_text();
         let b = args[1].to_text();
         debug!(a = %a, b = %b, "decimal_add invoked");
-        Ok(SqliteValue::Text(decimal_add_impl(&a, &b)))
+        Ok(match decimal_add_impl(&a, &b) {
+            Some(result) => SqliteValue::Text(result),
+            None => SqliteValue::Null,
+        })
     }
 
     fn num_args(&self) -> i32 {
@@ -580,7 +564,10 @@ impl ScalarFunction for DecimalSubFunc {
         let a = args[0].to_text();
         let b = args[1].to_text();
         debug!(a = %a, b = %b, "decimal_sub invoked");
-        Ok(SqliteValue::Text(decimal_sub_impl(&a, &b)))
+        Ok(match decimal_sub_impl(&a, &b) {
+            Some(result) => SqliteValue::Text(result),
+            None => SqliteValue::Null,
+        })
     }
 
     fn num_args(&self) -> i32 {
@@ -608,7 +595,10 @@ impl ScalarFunction for DecimalMulFunc {
         let a = args[0].to_text();
         let b = args[1].to_text();
         debug!(a = %a, b = %b, "decimal_mul invoked");
-        Ok(SqliteValue::Text(decimal_mul_impl(&a, &b)))
+        Ok(match decimal_mul_impl(&a, &b) {
+            Some(result) => SqliteValue::Text(result),
+            None => SqliteValue::Null,
+        })
     }
 
     fn num_args(&self) -> i32 {
@@ -636,7 +626,10 @@ impl ScalarFunction for DecimalCmpFunc {
         let a = args[0].to_text();
         let b = args[1].to_text();
         debug!(a = %a, b = %b, "decimal_cmp invoked");
-        Ok(SqliteValue::Integer(decimal_cmp_impl(&a, &b)))
+        Ok(match decimal_cmp_impl(&a, &b) {
+            Some(result) => SqliteValue::Integer(result),
+            None => SqliteValue::Null,
+        })
     }
 
     fn num_args(&self) -> i32 {
@@ -1021,11 +1014,11 @@ mod tests {
 
     #[test]
     fn test_decimal_normalize() {
-        assert_eq!(decimal_normalize("1.23"), "1.23");
-        assert_eq!(decimal_normalize("001.230"), "1.23");
-        assert_eq!(decimal_normalize("0.0"), "0");
-        assert_eq!(decimal_normalize("-1.50"), "-1.5");
-        assert_eq!(decimal_normalize("42"), "42");
+        assert_eq!(decimal_normalize("1.23"), Some("1.23".to_owned()));
+        assert_eq!(decimal_normalize("001.230"), Some("1.23".to_owned()));
+        assert_eq!(decimal_normalize("0.0"), Some("0".to_owned()));
+        assert_eq!(decimal_normalize("-1.50"), Some("-1.5".to_owned()));
+        assert_eq!(decimal_normalize("42"), Some("42".to_owned()));
     }
 
     #[test]
@@ -1151,13 +1144,13 @@ mod tests {
     fn test_decimal_precision_financial() {
         // Common financial precision test: 19.99 * 100 = 1999
         let result = decimal_mul_impl("19.99", "100");
-        assert_eq!(result, "1999");
+        assert_eq!(result, Some("1999".to_owned()));
 
         // Chained operations: (10.50 + 3.75) * 2 = 28.50
         let sum = decimal_add_impl("10.50", "3.75");
-        assert_eq!(sum, "14.25");
-        let product = decimal_mul_impl(&sum, "2");
-        assert_eq!(product, "28.5");
+        assert_eq!(sum, Some("14.25".to_owned()));
+        let product = decimal_mul_impl(sum.as_ref().unwrap(), "2");
+        assert_eq!(product, Some("28.5".to_owned()));
     }
 
     // ── uuid ─────────────────────────────────────────────────────────
@@ -1359,96 +1352,96 @@ mod tests {
 
     #[test]
     fn test_decimal_normalize_zero() {
-        assert_eq!(decimal_normalize("0"), "0");
-        assert_eq!(decimal_normalize("0.0"), "0");
-        assert_eq!(decimal_normalize("000.000"), "0");
+        assert_eq!(decimal_normalize("0"), Some("0".to_owned()));
+        assert_eq!(decimal_normalize("0.0"), Some("0".to_owned()));
+        assert_eq!(decimal_normalize("000.000"), Some("0".to_owned()));
     }
 
     #[test]
     fn test_decimal_normalize_negative_zero() {
         // Negative zero should normalize to "0"
         let result = decimal_normalize("-0.0");
-        assert!(result == "0" || result == "-0");
+        assert!(result == Some("0".to_owned()) || result == Some("-0".to_owned()));
     }
 
     #[test]
     fn test_decimal_normalize_integer() {
-        assert_eq!(decimal_normalize("42"), "42");
-        assert_eq!(decimal_normalize("00042"), "42");
+        assert_eq!(decimal_normalize("42"), Some("42".to_owned()));
+        assert_eq!(decimal_normalize("00042"), Some("42".to_owned()));
     }
 
     #[test]
     fn test_decimal_normalize_trailing_zeros() {
-        assert_eq!(decimal_normalize("1.50000"), "1.5");
-        assert_eq!(decimal_normalize("3.14000"), "3.14");
+        assert_eq!(decimal_normalize("1.50000"), Some("1.5".to_owned()));
+        assert_eq!(decimal_normalize("3.14000"), Some("3.14".to_owned()));
     }
 
     // ── Decimal: arithmetic edge cases ───────────────────────────────────
 
     #[test]
     fn test_decimal_add_zeros() {
-        assert_eq!(decimal_add_impl("0", "0"), "0");
+        assert_eq!(decimal_add_impl("0", "0"), Some("0".to_owned()));
     }
 
     #[test]
     fn test_decimal_add_negative_plus_positive() {
         let result = decimal_add_impl("-5", "3");
-        assert_eq!(result, "-2");
+        assert_eq!(result, Some("-2".to_owned()));
     }
 
     #[test]
     fn test_decimal_add_positive_plus_negative() {
         let result = decimal_add_impl("3", "-5");
-        assert_eq!(result, "-2");
+        assert_eq!(result, Some("-2".to_owned()));
     }
 
     #[test]
     fn test_decimal_sub_same_number() {
-        assert_eq!(decimal_sub_impl("42.5", "42.5"), "0");
+        assert_eq!(decimal_sub_impl("42.5", "42.5"), Some("0".to_owned()));
     }
 
     #[test]
     fn test_decimal_sub_produces_negative() {
         let result = decimal_sub_impl("1", "5");
-        assert_eq!(result, "-4");
+        assert_eq!(result, Some("-4".to_owned()));
     }
 
     #[test]
     fn test_decimal_mul_by_zero() {
-        assert_eq!(decimal_mul_impl("12345.6789", "0"), "0");
+        assert_eq!(decimal_mul_impl("12345.6789", "0"), Some("0".to_owned()));
     }
 
     #[test]
     fn test_decimal_mul_by_one() {
-        assert_eq!(decimal_mul_impl("3.14", "1"), "3.14");
+        assert_eq!(decimal_mul_impl("3.14", "1"), Some("3.14".to_owned()));
     }
 
     #[test]
     fn test_decimal_mul_negative_times_negative() {
         let result = decimal_mul_impl("-3", "-4");
-        assert_eq!(result, "12");
+        assert_eq!(result, Some("12".to_owned()));
     }
 
     #[test]
     fn test_decimal_mul_small_decimals() {
         let result = decimal_mul_impl("0.001", "0.001");
-        assert_eq!(result, "0.000001");
+        assert_eq!(result, Some("0.000001".to_owned()));
     }
 
     #[test]
     fn test_decimal_cmp_equal_values() {
-        assert_eq!(decimal_cmp_impl("3.14", "3.14"), 0);
+        assert_eq!(decimal_cmp_impl("3.14", "3.14"), Some(0));
     }
 
     #[test]
     fn test_decimal_cmp_leading_zeros_equal() {
-        assert_eq!(decimal_cmp_impl("007.50", "7.5"), 0);
+        assert_eq!(decimal_cmp_impl("007.50", "7.5"), Some(0));
     }
 
     #[test]
     fn test_decimal_cmp_negative_ordering() {
-        assert_eq!(decimal_cmp_impl("-10", "-5"), -1);
-        assert_eq!(decimal_cmp_impl("-5", "-10"), 1);
+        assert_eq!(decimal_cmp_impl("-10", "-5"), Some(-1));
+        assert_eq!(decimal_cmp_impl("-5", "-10"), Some(1));
     }
 
     // ── Decimal: scalar function null handling ───────────────────────────

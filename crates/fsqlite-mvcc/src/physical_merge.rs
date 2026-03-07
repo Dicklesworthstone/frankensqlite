@@ -127,6 +127,13 @@ pub enum CellOpKind {
     Replace { new_cell_bytes: Vec<u8> },
 }
 
+/// Free-space layout operation (derived during repack).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FreeSpaceOp {
+    /// Add a free block.
+    AddFreeblock { offset: u16, size: u16 },
+}
+
 /// A semantic cell operation keyed by a stable digest, not a physical offset.
 ///
 /// `cell_key_digest` MUST be derived from the same domain-separated semantic

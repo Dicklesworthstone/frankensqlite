@@ -904,7 +904,7 @@ fn bench_ssi_outgoing_edges(c: &mut Criterion) {
                                 token: TxnToken::new(txn(u64::from(i) + 200), TxnEpoch::new(1)),
                                 commit_seq: CommitSeq::new(u64::from(i) + 5),
                                 had_out_rw: false,
-                                pages: (1..=5_u32).map(page).collect(),
+                                keys: (1..=5_u32).map(|j| WitnessKey::Page(page(j))).collect(),
                             })
                             .collect();
                         (committer, read_keys, committed_writers)

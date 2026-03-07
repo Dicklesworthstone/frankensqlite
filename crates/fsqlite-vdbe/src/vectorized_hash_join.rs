@@ -40,11 +40,11 @@ struct BuildRow {
 }
 
 /// Comparable key value extracted from a column.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum KeyValue {
     Null,
     Integer(i64),
-    Float(f64),
+    FloatBits(u64),
     Text(String),
     Blob(Vec<u8>),
 }
@@ -286,8 +286,16 @@ fn extract_key(batch: &Batch, key_columns: &[usize], row: usize) -> Result<Vec<K
             ColumnData::Int16(v) => KeyValue::Integer(i64::from(v.as_slice()[row])),
             ColumnData::Int32(v) => KeyValue::Integer(i64::from(v.as_slice()[row])),
             ColumnData::Int64(v) => KeyValue::Integer(v.as_slice()[row]),
-            ColumnData::Float32(v) => KeyValue::Float(f64::from(v.as_slice()[row])),
-            ColumnData::Float64(v) => KeyValue::Float(v.as_slice()[row]),
+            ColumnData::Float32(v) => {
+                let f = f64::from(v.as_slice()[row]);
+                let f_norm = if f == 0.0 { 0.0 } else { f };
+                KeyValue::FloatBits(f_norm.to_bits())
+            }
+            ColumnData::Float64(v) => {
+                let f = v.as_slice()[row];
+                let f_norm = if f == 0.0 { 0.0 } else { f };
+                KeyValue::FloatBits(f_norm.to_bits())
+            }
             ColumnData::Text { offsets, data } => {
                 let start = offsets[row] as usize;
                 let end = offsets[row + 1] as usize;

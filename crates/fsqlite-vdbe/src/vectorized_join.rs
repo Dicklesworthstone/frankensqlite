@@ -514,7 +514,7 @@ impl<'a> TrieCursor<'a> {
                     return Ok(true);
                 }
                 Ordering::Greater => {
-                    high = probe.saturating_add(1);
+                    high = probe;
                     break;
                 }
             }
