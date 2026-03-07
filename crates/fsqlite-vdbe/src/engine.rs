@@ -3907,52 +3907,15 @@ impl VdbeEngine {
                         continue;
                     }
 
-                    let found = if matches!(key_val, SqliteValue::Blob(_)) {
-                        // Index seek path: probe register contains serialized key
-                        // bytes (typically from MakeRecord).
-                        let key_bytes = record_blob_bytes(&key_val);
-                        if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
-                            let seek_result =
-                                cursor.cursor.index_move_to(&cursor.cx, &key_bytes)?;
-                            match op.opcode {
-                                Opcode::SeekGE => !cursor.cursor.eof(),
-                                Opcode::SeekGT => {
-                                    if seek_result.is_found() {
-                                        cursor.cursor.next(&cursor.cx)?
-                                    } else {
-                                        !cursor.cursor.eof()
-                                    }
-                                }
-                                Opcode::SeekLE => {
-                                    if seek_result.is_found() {
-                                        true
-                                    } else if cursor.cursor.eof() {
-                                        cursor.cursor.last(&cursor.cx)?
-                                    } else {
-                                        cursor.cursor.prev(&cursor.cx)?
-                                    }
-                                }
-                                Opcode::SeekLT => {
-                                    if cursor.cursor.eof() {
-                                        cursor.cursor.last(&cursor.cx)?
-                                    } else {
-                                        cursor.cursor.prev(&cursor.cx)?
-                                    }
-                                }
-                                _ => unreachable!(),
-                            }
-                        } else {
-                            false
-                        }
-                    } else {
-                        let key = key_val.to_integer();
-                        if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
-                            // Route through B-tree cursor (Phase 5 path).
-                            //
-                            // table_move_to semantics:
-                            // - Found: cursor positioned at exact key
-                            // - NotFound: cursor positioned at entry that would follow
-                            //   key in sort order (or EOF if no such entry)
+                    // Dispatch based on cursor type (table vs index), NOT on
+                    // key value type. Using the key type was incorrect: an
+                    // index cursor receiving an integer key would wrongly call
+                    // table_move_to, triggering "table leaf cell has no rowid"
+                    // on index pages. (Fixes br#138-140, #144, #145.)
+                    let found = if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
+                        if cursor.cursor.is_table_btree() {
+                            // Table seek: key is a rowid (integer).
+                            let key = key_val.to_integer();
                             let seek_result = cursor.cursor.table_move_to(&cursor.cx, key)?;
 
                             match op.opcode {
@@ -4000,79 +3963,108 @@ impl VdbeEngine {
                                 }
                                 _ => unreachable!(),
                             }
-                        } else if let Some(cursor) = self.cursors.get_mut(&cursor_id) {
-                            // MemCursor fallback (Phase 4 path).
-                            // Implement proper seeking via linear scan for correctness.
-                            if let Some(db) = self.db.as_ref() {
-                                if let Some(table) = db.get_table(cursor.root_page) {
-                                    if table.rows.is_empty() {
-                                        false
+                        } else {
+                            // Index seek: key is a packed record blob.
+                            let key_bytes = record_blob_bytes(&key_val);
+                            let seek_result =
+                                cursor.cursor.index_move_to(&cursor.cx, &key_bytes)?;
+
+                            match op.opcode {
+                                Opcode::SeekGE => {
+                                    !cursor.cursor.eof()
+                                }
+                                Opcode::SeekGT => {
+                                    if seek_result.is_found() {
+                                        cursor.cursor.next(&cursor.cx)?
                                     } else {
-                                        match op.opcode {
-                                            Opcode::SeekGE => {
-                                                // Find first row with rowid >= key.
-                                                let pos = table
-                                                    .rows
-                                                    .binary_search_by_key(&key, |r| r.rowid)
-                                                    .unwrap_or_else(|e| e);
-                                                if pos < table.rows.len() {
-                                                    cursor.position = Some(pos);
-                                                    true
-                                                } else {
-                                                    false
-                                                }
-                                            }
-                                            Opcode::SeekGT => {
-                                                // Find first row with rowid > key.
-                                                let pos = match table
-                                                    .rows
-                                                    .binary_search_by_key(&key, |r| r.rowid)
-                                                {
-                                                    Ok(idx) => idx + 1,
-                                                    Err(idx) => idx,
-                                                };
-                                                if pos < table.rows.len() {
-                                                    cursor.position = Some(pos);
-                                                    true
-                                                } else {
-                                                    false
-                                                }
-                                            }
-                                            Opcode::SeekLE => {
-                                                // Find last row with rowid <= key.
-                                                let pos = match table
-                                                    .rows
-                                                    .binary_search_by_key(&key, |r| r.rowid)
-                                                {
-                                                    Ok(idx) => Some(idx),
-                                                    Err(idx) => idx.checked_sub(1),
-                                                };
-                                                if let Some(idx) = pos {
-                                                    cursor.position = Some(idx);
-                                                    true
-                                                } else {
-                                                    false
-                                                }
-                                            }
-                                            Opcode::SeekLT => {
-                                                // Find last row with rowid < key.
-                                                let pos = table
-                                                    .rows
-                                                    .binary_search_by_key(&key, |r| r.rowid)
-                                                    .unwrap_or_else(|e| e)
-                                                    .checked_sub(1);
-                                                if let Some(idx) = pos {
-                                                    cursor.position = Some(idx);
-                                                    true
-                                                } else {
-                                                    false
-                                                }
-                                            }
-                                            _ => unreachable!(),
-                                        }
+                                        !cursor.cursor.eof()
                                     }
-                                } else {
+                                }
+                                Opcode::SeekLE => {
+                                    if seek_result.is_found() {
+                                        true
+                                    } else if cursor.cursor.eof() {
+                                        cursor.cursor.last(&cursor.cx)?
+                                    } else {
+                                        cursor.cursor.prev(&cursor.cx)?
+                                    }
+                                }
+                                Opcode::SeekLT => {
+                                    if cursor.cursor.eof() {
+                                        cursor.cursor.last(&cursor.cx)?
+                                    } else {
+                                        cursor.cursor.prev(&cursor.cx)?
+                                    }
+                                }
+                                _ => unreachable!(),
+                            }
+                        }
+                    } else if let Some(cursor) = self.cursors.get_mut(&cursor_id) {
+                        // MemCursor fallback (Phase 4 path).
+                        let key = key_val.to_integer();
+                        if let Some(db) = self.db.as_ref() {
+                            if let Some(table) = db.get_table(cursor.root_page) {
+                                if table.rows.is_empty() {
                                     false
+                                } else {
+                                    match op.opcode {
+                                        Opcode::SeekGE => {
+                                            let pos = table
+                                                .rows
+                                                .binary_search_by_key(&key, |r| r.rowid)
+                                                .unwrap_or_else(|e| e);
+                                            if pos < table.rows.len() {
+                                                cursor.position = Some(pos);
+                                                true
+                                            } else {
+                                                false
+                                            }
+                                        }
+                                        Opcode::SeekGT => {
+                                            let pos = match table
+                                                .rows
+                                                .binary_search_by_key(&key, |r| r.rowid)
+                                            {
+                                                Ok(idx) => idx + 1,
+                                                Err(idx) => idx,
+                                            };
+                                            if pos < table.rows.len() {
+                                                cursor.position = Some(pos);
+                                                true
+                                            } else {
+                                                false
+                                            }
+                                        }
+                                        Opcode::SeekLE => {
+                                            let pos = match table
+                                                .rows
+                                                .binary_search_by_key(&key, |r| r.rowid)
+                                            {
+                                                Ok(idx) => Some(idx),
+                                                Err(idx) => idx.checked_sub(1),
+                                            };
+                                            if let Some(idx) = pos {
+                                                cursor.position = Some(idx);
+                                                true
+                                            } else {
+                                                false
+                                            }
+                                        }
+                                        Opcode::SeekLT => {
+                                            let pos = table
+                                                .rows
+                                                .binary_search_by_key(&key, |r| r.rowid)
+                                                .unwrap_or_else(|e| e)
+                                                .checked_sub(1);
+                                            if let Some(idx) = pos {
+                                                cursor.position = Some(idx);
+                                                true
+                                            } else {
+                                                false
+                                            }
+                                        }
+                                        _ => unreachable!(),
+                                    }
                                 }
                             } else {
                                 false
@@ -4080,6 +4072,8 @@ impl VdbeEngine {
                         } else {
                             false
                         }
+                    } else {
+                        false
                     };
                     if found {
                         pc += 1;

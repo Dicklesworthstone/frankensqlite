@@ -890,6 +890,19 @@ impl<P: PageReader> BtCursor<P> {
 
             let entry = self.load_page(cx, current_page)?;
 
+            // Guard: detect is_table vs actual page-type mismatch early.
+            // If the cursor was opened with is_table=false but the page is
+            // actually a table page, catch this with a clear diagnostic.
+            if entry.header.page_type.is_table() {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "index_seek called on table page (type {:?}, page {}, root {}): \
+                         cursor is_table flag likely incorrect",
+                        entry.header.page_type, current_page, self.root_page
+                    ),
+                });
+            }
+
             if entry.header.page_type.is_leaf() {
                 let result = self.binary_search_index_leaf(cx, &entry, target_key)?;
                 match result {
