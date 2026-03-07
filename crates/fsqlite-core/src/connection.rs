@@ -513,6 +513,10 @@ pub struct PreparedStatement<'conn> {
     /// re-parsing.  `None` for SELECT statements (which use the compiled
     /// VdbeProgram directly).
     dml_statement: Option<Statement>,
+    /// For SELECT statements that cannot be safely precompiled because they
+    /// depend on connection-level fallback routing or parameter-sensitive
+    /// subquery rewriting, store the AST and re-dispatch at execution time.
+    deferred_query_statement: Option<Statement>,
     /// Reference to the parent Connection that prepared this statement.
     /// Used by `execute_with_params` to delegate DML execution through
     /// the Connection's full execution pipeline (triggers, constraints,
@@ -636,7 +640,7 @@ impl std::fmt::Debug for PreparedStatement<'_> {
 
 impl PreparedStatement<'_> {
     fn requires_schema_validation(&self) -> bool {
-        self.db.is_some() || self.dml_statement.is_some()
+        self.db.is_some() || self.dml_statement.is_some() || self.deferred_query_statement.is_some()
     }
 
     fn ensure_schema_unchanged(&self, cx: &Cx) -> Result<()> {
@@ -718,6 +722,9 @@ impl PreparedStatement<'_> {
         self.conn.sync_change_tracking_context();
         let op_cx = self.root_cx.clone().with_decision_id(next_decision_id());
         self.ensure_schema_unchanged(&op_cx)?;
+        if let Some(statement) = &self.deferred_query_statement {
+            return self.conn.execute_statement(statement.clone(), None);
+        }
         let mut rows = if self.db.is_some() {
             self.execute_table_query(&op_cx, None)?
         } else {
@@ -749,6 +756,9 @@ impl PreparedStatement<'_> {
         self.conn.sync_change_tracking_context();
         let op_cx = self.root_cx.clone().with_decision_id(next_decision_id());
         self.ensure_schema_unchanged(&op_cx)?;
+        if let Some(statement) = &self.deferred_query_statement {
+            return self.conn.execute_statement(statement.clone(), Some(params));
+        }
         let mut rows = if self.db.is_some() {
             self.execute_table_query(&op_cx, Some(params))?
         } else {
@@ -817,6 +827,10 @@ impl PreparedStatement<'_> {
 
     /// Return an EXPLAIN-style disassembly for the compiled program.
     pub fn explain(&self) -> String {
+        if self.deferred_query_statement.is_some() {
+            return "-- prepared SELECT is dispatched dynamically; no precompiled bytecode"
+                .to_owned();
+        }
         self.program.disassemble()
     }
 }
@@ -2079,6 +2093,17 @@ impl Connection {
             let _parse_guard = parse_span.enter();
             self.cached_parse_single(sql)?
         };
+        if self.prepared_select_requires_dispatch(&statement) {
+            let plan_span = tracing::span!(
+                target: "fsqlite.plan",
+                tracing::Level::TRACE,
+                "plan",
+                stage = "compile_prepared_statement"
+            );
+            record_trace_span_created();
+            let _plan_guard = plan_span.enter();
+            return self.compile_and_wrap(&statement);
+        }
         let statement = {
             let parse_span = tracing::span!(
                 target: "fsqlite.parse",
@@ -3978,6 +4003,25 @@ impl Connection {
     fn compile_and_wrap(&self, statement: &Statement) -> Result<PreparedStatement<'_>> {
         let registry = Some(Arc::clone(&*self.func_registry.borrow()));
         match statement {
+            Statement::Select(_) if self.prepared_select_requires_dispatch(statement) => {
+                let placeholder_program = ProgramBuilder::new().finish().map_err(|e| {
+                    FrankenError::Internal(format!("failed to build placeholder program: {e}"))
+                })?;
+                Ok(PreparedStatement {
+                    program: placeholder_program,
+                    func_registry: registry,
+                    expression_postprocess: None,
+                    distinct: false,
+                    db: None,
+                    pager: None,
+                    post_distinct_limit: None,
+                    schema_cookie: self.schema_cookie(),
+                    root_cx: self.root_cx.clone(),
+                    dml_statement: None,
+                    deferred_query_statement: Some(statement.clone()),
+                    conn: self,
+                })
+            }
             Statement::Select(select) if is_expression_only_select(select) => {
                 let program = compile_expression_select(select)?;
                 let expression_postprocess = Some(build_expression_postprocess(select));
@@ -3992,6 +4036,7 @@ impl Connection {
                     schema_cookie: self.schema_cookie(),
                     root_cx: self.root_cx.clone(),
                     dml_statement: None,
+                    deferred_query_statement: None,
                     conn: self,
                 })
             }
@@ -4016,6 +4061,7 @@ impl Connection {
                     schema_cookie: self.schema_cookie(),
                     root_cx: self.root_cx.clone(),
                     dml_statement: None,
+                    deferred_query_statement: None,
                     conn: self,
                 })
             }
@@ -4048,6 +4094,7 @@ impl Connection {
                         schema_cookie: self.schema_cookie(),
                         root_cx: self.root_cx.clone(),
                         dml_statement: Some(statement.clone()),
+                        deferred_query_statement: None,
                         conn: self,
                     })
                 } else {
@@ -4066,6 +4113,7 @@ impl Connection {
                         schema_cookie: self.schema_cookie(),
                         root_cx: self.root_cx.clone(),
                         dml_statement: Some(statement.clone()),
+                        deferred_query_statement: None,
                         conn: self,
                     })
                 }
@@ -4087,6 +4135,7 @@ impl Connection {
                     schema_cookie: self.schema_cookie(),
                     root_cx: self.root_cx.clone(),
                     dml_statement: Some(statement.clone()),
+                    deferred_query_statement: None,
                     conn: self,
                 })
             }
@@ -4094,6 +4143,29 @@ impl Connection {
                 "prepare() supports SELECT, INSERT, UPDATE, and DELETE statements only".to_owned(),
             )),
         }
+    }
+
+    fn prepared_select_requires_dispatch(&self, statement: &Statement) -> bool {
+        let Statement::Select(select) = statement else {
+            return false;
+        };
+
+        let expression_only = is_expression_only_select(select);
+        let has_grouping = has_group_by(select) || has_implicit_aggregation(select);
+        let has_join_like_source = has_joins(select) || has_subquery_source(select);
+
+        statement_contains_rewritable_subquery(statement)
+            || select.with.is_some()
+            || self.has_sqlite_schema_references(select)
+            || !select.body.compounds.is_empty()
+            || (expression_only && has_implicit_aggregation(select))
+            || (expression_only && expression_only_has_subquery(select))
+            || (has_grouping && has_join_like_source)
+            || has_group_by(select)
+            || has_window_functions(select)
+            || select_contains_match_operator(select)
+            || has_join_like_source
+            || select_has_correlated_join_subquery(select)
     }
 
     /// Count the number of rows in `table_name` matching an optional WHERE
@@ -24467,6 +24539,30 @@ mod tests {
         let rows = stmt.query_with_params(&[SqliteValue::Integer(9)]).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(row_values(&rows[0]), vec![SqliteValue::Integer(10)]);
+    }
+
+    #[test]
+    fn test_prepared_statement_expression_subquery_uses_dispatch_path() {
+        let conn = Connection::open(":memory:").unwrap();
+        let stmt = conn.prepare("SELECT (SELECT ?1) + 1;").unwrap();
+
+        let rows = stmt.query_with_params(&[SqliteValue::Integer(41)]).unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0]), vec![SqliteValue::Integer(42)]);
+    }
+
+    #[test]
+    fn test_prepared_statement_with_cte_uses_dispatch_path() {
+        let conn = Connection::open(":memory:").unwrap();
+        let stmt = conn
+            .prepare("WITH base(val) AS (SELECT 7) SELECT val + ?1 FROM base;")
+            .unwrap();
+
+        let rows = stmt.query_with_params(&[SqliteValue::Integer(5)]).unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(row_values(&rows[0]), vec![SqliteValue::Integer(12)]);
     }
 
     #[test]
