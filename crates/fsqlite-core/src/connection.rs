@@ -2669,9 +2669,7 @@ impl Connection {
                 // columns: the VDBE codegen cannot resolve table references
                 // inside subqueries (e.g. CTE temp tables).  Evaluate via the
                 // connection-level path that can call execute_statement.
-                if is_expression_only_select(select)
-                    && expression_only_has_subquery(select)
-                {
+                if is_expression_only_select(select) && expression_only_has_subquery(select) {
                     return self.execute_expression_only_with_subqueries(select, params);
                 }
                 // Check if this is an expression-only SELECT (no FROM clause).
@@ -11703,7 +11701,8 @@ impl Connection {
     ) -> Result<SqliteValue> {
         match expr {
             Expr::Subquery(sub, _) => {
-                let rows = self.execute_statement(Statement::Select(sub.as_ref().clone()), params)?;
+                let rows =
+                    self.execute_statement(Statement::Select(sub.as_ref().clone()), params)?;
                 Ok(rows
                     .into_iter()
                     .next()
@@ -11711,10 +11710,8 @@ impl Connection {
                     .unwrap_or(SqliteValue::Null))
             }
             Expr::Exists { subquery, not, .. } => {
-                let rows = self.execute_statement(
-                    Statement::Select(subquery.as_ref().clone()),
-                    params,
-                )?;
+                let rows =
+                    self.execute_statement(Statement::Select(subquery.as_ref().clone()), params)?;
                 let exists = !rows.is_empty();
                 let truth = if *not { !exists } else { exists };
                 Ok(SqliteValue::Integer(i64::from(truth)))
@@ -63087,9 +63084,7 @@ mod pager_routing_tests {
         let fconn = Connection::open(":memory:").unwrap();
         let rconn = rusqlite::Connection::open_in_memory().unwrap();
 
-        let setup = [
-            "CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT, b INTEGER)",
-        ];
+        let setup = ["CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT, b INTEGER)"];
         for s in &setup {
             fconn.execute(s).unwrap();
             rconn.execute_batch(s).unwrap();
@@ -63165,7 +63160,9 @@ mod pager_routing_tests {
         }
 
         fconn.execute("UPDATE t SET val = 30 WHERE id = 1").unwrap();
-        rconn.execute_batch("UPDATE t SET val = 30 WHERE id = 1").unwrap();
+        rconn
+            .execute_batch("UPDATE t SET val = 30 WHERE id = 1")
+            .unwrap();
 
         let queries = [
             "SELECT id, val FROM t ORDER BY id",
@@ -63239,10 +63236,14 @@ mod pager_routing_tests {
         rconn.execute_batch("DROP INDEX idx_t2_ref").unwrap();
 
         // Queries should still work without index
-        let m1 = oracle_compare(&fconn, &rconn, &[
-            "SELECT * FROM t2 WHERE ref_id = 1",
-            "SELECT COUNT(*) FROM t2",
-        ]);
+        let m1 = oracle_compare(
+            &fconn,
+            &rconn,
+            &[
+                "SELECT * FROM t2 WHERE ref_id = 1",
+                "SELECT COUNT(*) FROM t2",
+            ],
+        );
 
         // Drop table
         fconn.execute("DROP TABLE t1").unwrap();
