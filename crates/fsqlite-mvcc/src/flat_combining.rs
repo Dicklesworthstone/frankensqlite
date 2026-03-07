@@ -39,9 +39,9 @@
 //!   - `fsqlite_flat_combining_wait_ns_max`
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use fsqlite_types::sync_primitives::Instant;
 
-use parking_lot::Mutex;
+use fsqlite_types::sync_primitives::Mutex;
 use serde::Serialize;
 
 // ---------------------------------------------------------------------------

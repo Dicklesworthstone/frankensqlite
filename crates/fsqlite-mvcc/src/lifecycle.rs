@@ -20,7 +20,7 @@ use fsqlite_types::{
     TxnEpoch, TxnId, TxnToken,
 };
 use fsqlite_wal::DEFAULT_RAPTORQ_REPAIR_SYMBOLS;
-use parking_lot::Mutex;
+use fsqlite_types::sync_primitives::Mutex;
 
 use crate::cache_aligned::{logical_now_epoch_secs, logical_now_millis};
 use crate::core_types::{

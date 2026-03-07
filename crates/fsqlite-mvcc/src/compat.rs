@@ -7,7 +7,7 @@
 //! - `CoordinatorRecovery`: Crash recovery after coordinator or legacy process death.
 //! - `begin_concurrent_check`: Gate for `BEGIN CONCURRENT` under no-SHM fallback.
 
-use std::time::Instant;
+use fsqlite_types::sync_primitives::Instant;
 
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_wal::wal_index::{WAL_READ_MARK_COUNT, WalCkptInfo, WalIndexHdr};

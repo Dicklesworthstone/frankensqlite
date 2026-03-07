@@ -8,7 +8,7 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
-use std::time::Instant;
+use fsqlite_types::sync_primitives::Instant;
 
 use fsqlite_types::{CommitSeq, PageNumber, PageNumberBuildHasher, VersionPointer};
 

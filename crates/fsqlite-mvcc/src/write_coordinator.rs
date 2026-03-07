@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use fsqlite_types::{CommitSeq, IntentOp, ObjectId, PageData, PageNumber, Snapshot, TxnToken};
-use parking_lot::RwLock;
+use fsqlite_types::sync_primitives::RwLock;
 use tracing::{debug, info, warn};
 
 use crate::core_types::TransactionMode;

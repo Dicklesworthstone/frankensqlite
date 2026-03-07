@@ -74,7 +74,7 @@ const MAX_RETRIES: u32 = 1_000_000;
 pub struct SeqLock {
     seq: AtomicU64,
     value: AtomicU64,
-    write_lock: parking_lot::Mutex<()>,
+    write_lock: fsqlite_types::sync_primitives::Mutex<()>,
 }
 
 impl SeqLock {
@@ -83,7 +83,7 @@ impl SeqLock {
         Self {
             seq: AtomicU64::new(0),
             value: AtomicU64::new(initial),
-            write_lock: parking_lot::Mutex::new(()),
+            write_lock: fsqlite_types::sync_primitives::Mutex::new(()),
         }
     }
 
@@ -177,7 +177,7 @@ pub struct SeqLockPair {
     seq: AtomicU64,
     a: AtomicU64,
     b: AtomicU64,
-    write_lock: parking_lot::Mutex<()>,
+    write_lock: fsqlite_types::sync_primitives::Mutex<()>,
 }
 
 impl SeqLockPair {
@@ -187,7 +187,7 @@ impl SeqLockPair {
             seq: AtomicU64::new(0),
             a: AtomicU64::new(a),
             b: AtomicU64::new(b),
-            write_lock: parking_lot::Mutex::new(()),
+            write_lock: fsqlite_types::sync_primitives::Mutex::new(()),
         }
     }
 
@@ -273,7 +273,7 @@ pub struct SeqLockTriple {
     a: AtomicU64,
     b: AtomicU64,
     c: AtomicU64,
-    write_lock: parking_lot::Mutex<()>,
+    write_lock: fsqlite_types::sync_primitives::Mutex<()>,
 }
 
 impl SeqLockTriple {
@@ -284,7 +284,7 @@ impl SeqLockTriple {
             a: AtomicU64::new(a),
             b: AtomicU64::new(b),
             c: AtomicU64::new(c),
-            write_lock: parking_lot::Mutex::new(()),
+            write_lock: fsqlite_types::sync_primitives::Mutex::new(()),
         }
     }
 

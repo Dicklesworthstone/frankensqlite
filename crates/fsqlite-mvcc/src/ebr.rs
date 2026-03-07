@@ -14,7 +14,7 @@ use std::{
 };
 
 use crossbeam_epoch::{self as epoch, Guard};
-use parking_lot::Mutex;
+use fsqlite_types::sync_primitives::Mutex;
 use serde::Serialize;
 
 // ---------------------------------------------------------------------------

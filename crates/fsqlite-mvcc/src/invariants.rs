@@ -12,7 +12,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use parking_lot::{Mutex, RwLock};
+use fsqlite_types::sync_primitives::{Mutex, RwLock};
 
 use fsqlite_types::{
     CommitSeq, PageNumber, PageNumberBuildHasher, PageSize, PageVersion, Snapshot, TxnId,

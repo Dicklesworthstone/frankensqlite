@@ -13,7 +13,7 @@ use fsqlite_types::encoding::{
     append_u16_be, append_u32_be, append_u32_le, append_u64_be, append_u64_le, read_u16_be,
     read_u32_be, read_u32_le, read_u64_be, read_u64_le,
 };
-use parking_lot::Mutex;
+use fsqlite_types::sync_primitives::Mutex;
 
 // ---------------------------------------------------------------------------
 // Constants (§5.9.0 normative)

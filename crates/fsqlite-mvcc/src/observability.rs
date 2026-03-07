@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use fsqlite_types::sync_primitives::Instant;
 
 use fsqlite_observability::{ConflictEvent, ConflictObserver, SsiAbortCategory};
 use fsqlite_types::{CommitSeq, PageNumber, TxnId, TxnToken};

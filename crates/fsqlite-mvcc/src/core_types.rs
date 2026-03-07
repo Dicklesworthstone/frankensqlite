@@ -10,7 +10,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-use parking_lot::{Mutex, RwLock};
+use fsqlite_types::sync_primitives::{Mutex, RwLock};
 use smallvec::SmallVec;
 
 use std::sync::atomic::Ordering;

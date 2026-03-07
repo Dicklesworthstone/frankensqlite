@@ -14,7 +14,7 @@
 //!   4. Read the value(s).
 //!   5. Decrement reader counter.
 //!
-//! **Writer** (serialized via `parking_lot::Mutex`):
+//! **Writer** (serialized via `fsqlite_types::sync_primitives::Mutex`):
 //!   1. Update the *inactive* copy.
 //!   2. Swap `active`.
 //!   3. Spin-wait until reader counter on the *old* active side drains to zero.
@@ -91,7 +91,7 @@ pub struct LeftRight {
     active: AtomicU64,
     left_readers: AtomicU64,
     right_readers: AtomicU64,
-    writer_lock: parking_lot::Mutex<()>,
+    writer_lock: fsqlite_types::sync_primitives::Mutex<()>,
 }
 
 impl LeftRight {
@@ -103,7 +103,7 @@ impl LeftRight {
             active: AtomicU64::new(0),
             left_readers: AtomicU64::new(0),
             right_readers: AtomicU64::new(0),
-            writer_lock: parking_lot::Mutex::new(()),
+            writer_lock: fsqlite_types::sync_primitives::Mutex::new(()),
         }
     }
 
@@ -229,7 +229,7 @@ pub struct LeftRightPair {
     active: AtomicU64,
     left_readers: AtomicU64,
     right_readers: AtomicU64,
-    writer_lock: parking_lot::Mutex<()>,
+    writer_lock: fsqlite_types::sync_primitives::Mutex<()>,
 }
 
 impl LeftRightPair {
@@ -243,7 +243,7 @@ impl LeftRightPair {
             active: AtomicU64::new(0),
             left_readers: AtomicU64::new(0),
             right_readers: AtomicU64::new(0),
-            writer_lock: parking_lot::Mutex::new(()),
+            writer_lock: fsqlite_types::sync_primitives::Mutex::new(()),
         }
     }
 
@@ -345,7 +345,7 @@ pub struct LeftRightTriple {
     active: AtomicU64,
     left_readers: AtomicU64,
     right_readers: AtomicU64,
-    writer_lock: parking_lot::Mutex<()>,
+    writer_lock: fsqlite_types::sync_primitives::Mutex<()>,
 }
 
 impl LeftRightTriple {
@@ -361,7 +361,7 @@ impl LeftRightTriple {
             active: AtomicU64::new(0),
             left_readers: AtomicU64::new(0),
             right_readers: AtomicU64::new(0),
-            writer_lock: parking_lot::Mutex::new(()),
+            writer_lock: fsqlite_types::sync_primitives::Mutex::new(()),
         }
     }
 

@@ -10,17 +10,19 @@ rust-version.workspace = true
 [dependencies]
 blake3 = { workspace = true }
 crossbeam-epoch = { workspace = true }
-fsqlite-types = { workspace = true, features = ["native"] }
+fsqlite-types = { workspace = true }
 fsqlite-error = { workspace = true }
 fsqlite-observability = { workspace = true }
 fsqlite-pager = { workspace = true }
 fsqlite-wal = { workspace = true }
-nix = { workspace = true }
-parking_lot = { workspace = true }
 smallvec = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 tracing = { workspace = true }
 xxhash-rust = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+nix = { workspace = true }
+parking_lot = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
