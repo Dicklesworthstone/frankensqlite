@@ -679,6 +679,8 @@ pub struct SumAccumulator {
     int_sum: i64,
     /// Running float sum (if promoted to float mode).
     float_sum: f64,
+    /// KBN compensation error term.
+    float_err: f64,
     /// Whether we've seen any non-NULL value.
     has_value: bool,
     /// Whether we're in float mode (any REAL input or integer overflow).
@@ -693,12 +695,26 @@ impl Default for SumAccumulator {
     }
 }
 
+/// Kahan-Babuska-Neumaier compensated summation step (matches C SQLite func.c:1871).
+#[inline]
+fn kbn_step(sum: &mut f64, err: &mut f64, value: f64) {
+    let s = *sum;
+    let t = s + value;
+    if s.abs() > value.abs() {
+        *err += (s - t) + value;
+    } else {
+        *err += (value - t) + s;
+    }
+    *sum = t;
+}
+
 impl SumAccumulator {
     /// Create a new accumulator.
     pub const fn new() -> Self {
         Self {
             int_sum: 0,
             float_sum: 0.0,
+            float_err: 0.0,
             has_value: false,
             is_float: false,
             overflow: false,
@@ -713,7 +729,7 @@ impl SumAccumulator {
             SqliteValue::Integer(i) => {
                 self.has_value = true;
                 if self.is_float {
-                    self.float_sum += *i as f64;
+                    kbn_step(&mut self.float_sum, &mut self.float_err, *i as f64);
                 } else {
                     match self.int_sum.checked_add(*i) {
                         Some(result) => self.int_sum = result,
@@ -725,9 +741,10 @@ impl SumAccumulator {
                 self.has_value = true;
                 if !self.is_float {
                     self.float_sum = self.int_sum as f64;
+                    self.float_err = 0.0;
                     self.is_float = true;
                 }
-                self.float_sum += f;
+                kbn_step(&mut self.float_sum, &mut self.float_err, *f);
             }
             other => {
                 // TEXT/BLOB coerced to numeric.
@@ -735,9 +752,10 @@ impl SumAccumulator {
                 let n = other.to_float();
                 if !self.is_float {
                     self.float_sum = self.int_sum as f64;
+                    self.float_err = 0.0;
                     self.is_float = true;
                 }
-                self.float_sum += n;
+                kbn_step(&mut self.float_sum, &mut self.float_err, n);
             }
         }
     }
@@ -752,7 +770,7 @@ impl SumAccumulator {
             return Ok(SqliteValue::Null);
         }
         if self.is_float {
-            Ok(SqliteValue::Float(self.float_sum))
+            Ok(SqliteValue::Float(self.float_sum + self.float_err))
         } else {
             Ok(SqliteValue::Integer(self.int_sum))
         }

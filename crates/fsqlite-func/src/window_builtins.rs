@@ -712,9 +712,23 @@ impl WindowFunction for NthValueFunc {
 
 pub struct WindowSumState {
     sum: f64,
+    err: f64,
     has_value: bool,
     is_int: bool,
     int_sum: i64,
+}
+
+/// Kahan-Babuska-Neumaier compensated summation step (matches C SQLite func.c:1871).
+#[inline]
+fn kbn_step(sum: &mut f64, err: &mut f64, value: f64) {
+    let s = *sum;
+    let t = s + value;
+    if s.abs() > value.abs() {
+        *err += (s - t) + value;
+    } else {
+        *err += (value - t) + s;
+    }
+    *sum = t;
 }
 
 pub struct WindowSumFunc;
@@ -725,6 +739,7 @@ impl WindowFunction for WindowSumFunc {
     fn initial_state(&self) -> Self::State {
         WindowSumState {
             sum: 0.0,
+            err: 0.0,
             has_value: false,
             is_int: true,
             int_sum: 0,
@@ -739,17 +754,17 @@ impl WindowFunction for WindowSumFunc {
         match &args[0] {
             SqliteValue::Integer(i) => {
                 state.int_sum = state.int_sum.wrapping_add(*i);
-                state.sum += *i as f64;
+                kbn_step(&mut state.sum, &mut state.err, *i as f64);
             }
             SqliteValue::Float(f) => {
                 state.is_int = false;
-                state.sum += f;
+                kbn_step(&mut state.sum, &mut state.err, *f);
             }
             other => {
                 let f = other.to_float();
                 if f != 0.0 || other.to_text() == "0" {
                     state.is_int = false;
-                    state.sum += f;
+                    kbn_step(&mut state.sum, &mut state.err, f);
                 }
             }
         }
@@ -763,10 +778,10 @@ impl WindowFunction for WindowSumFunc {
         match &args[0] {
             SqliteValue::Integer(i) => {
                 state.int_sum = state.int_sum.wrapping_sub(*i);
-                state.sum -= *i as f64;
+                kbn_step(&mut state.sum, &mut state.err, -(*i as f64));
             }
             _ => {
-                state.sum -= args[0].to_float();
+                kbn_step(&mut state.sum, &mut state.err, -args[0].to_float());
             }
         }
         Ok(())
@@ -779,7 +794,7 @@ impl WindowFunction for WindowSumFunc {
         if state.is_int {
             Ok(SqliteValue::Integer(state.int_sum))
         } else {
-            Ok(SqliteValue::Float(state.sum))
+            Ok(SqliteValue::Float(state.sum + state.err))
         }
     }
 

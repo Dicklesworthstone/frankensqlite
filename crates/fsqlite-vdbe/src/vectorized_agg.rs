@@ -48,6 +48,19 @@ pub struct AggregateSpec {
 
 // ── Aggregate Accumulator ──────────────────────────────────────────────────
 
+/// Kahan-Babuska-Neumaier compensated summation step (matches C SQLite func.c:1871).
+#[inline]
+fn kbn_step(sum: &mut f64, err: &mut f64, value: f64) {
+    let s = *sum;
+    let t = s + value;
+    if s.abs() > value.abs() {
+        *err += (s - t) + value;
+    } else {
+        *err += (value - t) + s;
+    }
+    *sum = t;
+}
+
 /// Internal accumulator state for a single aggregate function.
 #[derive(Debug, Clone)]
 struct Accumulator {
@@ -55,6 +68,7 @@ struct Accumulator {
     count: i64,
     sum_i64: i64,
     sum_f64: f64,
+    sum_err: f64,
     min_i64: Option<i64>,
     max_i64: Option<i64>,
     min_f64: Option<f64>,
@@ -69,6 +83,7 @@ impl Accumulator {
             count: 0,
             sum_i64: 0,
             sum_f64: 0.0,
+            sum_err: 0.0,
             min_i64: None,
             max_i64: None,
             min_f64: None,
@@ -80,7 +95,7 @@ impl Accumulator {
     fn update_i64(&mut self, val: i64) {
         self.count += 1;
         self.sum_i64 = self.sum_i64.wrapping_add(val);
-        self.sum_f64 += val as f64;
+        kbn_step(&mut self.sum_f64, &mut self.sum_err, val as f64);
         self.min_i64 = Some(self.min_i64.map_or(val, |m| m.min(val)));
         self.max_i64 = Some(self.max_i64.map_or(val, |m| m.max(val)));
     }
@@ -88,7 +103,7 @@ impl Accumulator {
     fn update_f64(&mut self, val: f64) {
         self.is_float = true;
         self.count += 1;
-        self.sum_f64 += val;
+        kbn_step(&mut self.sum_f64, &mut self.sum_err, val);
         self.min_f64 = Some(self.min_f64.map_or(val, |m| m.min(val)));
         self.max_f64 = Some(self.max_f64.map_or(val, |m| m.max(val)));
     }
@@ -129,19 +144,19 @@ impl Accumulator {
                 if self.count == 0 {
                     None
                 } else {
-                    Some(self.sum_f64)
+                    Some(self.sum_f64 + self.sum_err)
                 }
             }
             AggregateOp::Avg => {
                 if self.count == 0 {
                     None
                 } else {
-                    Some(self.sum_f64 / self.count as f64)
+                    Some((self.sum_f64 + self.sum_err) / self.count as f64)
                 }
             }
             AggregateOp::Min => self.min_f64,
             AggregateOp::Max => self.max_f64,
-            AggregateOp::Total => Some(self.sum_f64),
+            AggregateOp::Total => Some(self.sum_f64 + self.sum_err),
         }
     }
 }
