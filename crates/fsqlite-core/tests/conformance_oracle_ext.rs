@@ -25244,7 +25244,6 @@ fn test_conformance_window_lag_lead_default_s364() {
 }
 
 #[test]
-#[ignore = "subquery in INSERT VALUES not evaluated"]
 fn test_conformance_subquery_in_insert_values_s365() {
     let fconn = Connection::open(":memory:").unwrap();
     let rconn = rusqlite::Connection::open_in_memory().unwrap();

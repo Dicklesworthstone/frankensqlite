@@ -14556,6 +14556,10 @@ impl Connection {
 
     /// Compile an INSERT through the VDBE codegen.
     fn compile_table_insert(&self, insert: &fsqlite_ast::InsertStatement) -> Result<VdbeProgram> {
+        // Resolve any subqueries inside VALUES expressions before VDBE codegen,
+        // because emit_expr receives None scan context for VALUES rows and
+        // cannot handle Expr::Subquery/Expr::Exists.
+        let insert = self.resolve_insert_values_subqueries(insert)?;
         let schema = self.schema.borrow();
         let mut builder = ProgramBuilder::new();
         let rowid_alias_col_idx = self
@@ -14567,8 +14571,58 @@ impl Connection {
             concurrent_mode: self.is_concurrent_transaction(),
             rowid_alias_col_idx,
         };
-        codegen_insert(&mut builder, insert, &schema, &ctx).map_err(codegen_error_to_franken)?;
+        codegen_insert(&mut builder, &insert, &schema, &ctx).map_err(codegen_error_to_franken)?;
         builder.finish()
+    }
+
+    /// If the INSERT source contains VALUES rows with subquery expressions,
+    /// eagerly evaluate them and replace with literal values so VDBE codegen
+    /// can handle them (it passes `None` scan context to `emit_expr`).
+    fn resolve_insert_values_subqueries(
+        &self,
+        insert: &fsqlite_ast::InsertStatement,
+    ) -> Result<fsqlite_ast::InsertStatement> {
+        let empty_row: &[SqliteValue] = &[];
+        let empty_col_map: &[(String, String)] = &[];
+        let resolve_rows = |rows: &[Vec<Expr>]| -> Result<Vec<Vec<Expr>>> {
+            rows.iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|expr| {
+                            if expr_has_any_subquery(expr) {
+                                self.inline_subqueries_in_expr(expr, empty_row, empty_col_map)
+                            } else {
+                                Ok(expr.clone())
+                            }
+                        })
+                        .collect()
+                })
+                .collect()
+        };
+        match &insert.source {
+            fsqlite_ast::InsertSource::Values(rows) => {
+                if rows.iter().any(|r| r.iter().any(expr_has_any_subquery)) {
+                    let mut new_insert = insert.clone();
+                    new_insert.source = fsqlite_ast::InsertSource::Values(resolve_rows(rows)?);
+                    Ok(new_insert)
+                } else {
+                    Ok(insert.clone())
+                }
+            }
+            fsqlite_ast::InsertSource::Select(sel) => {
+                if let SelectCore::Values(rows) = &sel.body.select {
+                    if rows.iter().any(|r| r.iter().any(expr_has_any_subquery)) {
+                        let mut new_insert = insert.clone();
+                        let mut new_sel = sel.as_ref().clone();
+                        new_sel.body.select = SelectCore::Values(resolve_rows(rows)?);
+                        new_insert.source = fsqlite_ast::InsertSource::Select(Box::new(new_sel));
+                        return Ok(new_insert);
+                    }
+                }
+                Ok(insert.clone())
+            }
+            _ => Ok(insert.clone()),
+        }
     }
 
     /// Compile an UPDATE through the VDBE codegen.
