@@ -723,6 +723,20 @@ impl<P: PageReader> BtCursor<P> {
 
             let entry = self.load_page(cx, current_page)?;
 
+            // Guard: detect is_table vs actual page-type mismatch early.
+            // If the cursor was opened with is_table=true but the page is
+            // actually an index page, binary_search_table_* will fail with
+            // "cell has no rowid". Catch this here with a clearer error.
+            if !entry.header.page_type.is_table() {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "table_seek called on index page (type {:?}, page {}, root {}): \
+                         cursor is_table flag likely incorrect",
+                        entry.header.page_type, current_page, self.root_page
+                    ),
+                });
+            }
+
             if entry.header.page_type.is_leaf() {
                 // Binary search on the leaf page by rowid.
                 let result = self.binary_search_table_leaf(&entry, target_rowid)?;

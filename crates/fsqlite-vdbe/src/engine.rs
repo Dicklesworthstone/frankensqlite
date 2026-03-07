@@ -3466,7 +3466,7 @@ impl VdbeEngine {
                     pc += 1;
                 }
 
-                Opcode::OpenEphemeral | Opcode::OpenAutoindex => {
+                Opcode::OpenEphemeral => {
                     // Ephemeral table: create an in-memory table on-the-fly.
                     let cursor_id = op.p1;
                     self.pending_next_after_delete.remove(&cursor_id);
@@ -3476,6 +3476,42 @@ impl VdbeEngine {
                         self.storage_cursors.remove(&cursor_id);
                         self.cursors
                             .insert(cursor_id, MemCursor::new(root_page, true));
+                    }
+                    pc += 1;
+                }
+
+                Opcode::OpenAutoindex => {
+                    // Autoindex: create an ephemeral INDEX B-tree.
+                    // Unlike OpenEphemeral (table B-tree), autoindexes use
+                    // index B-tree semantics (no rowid, key-only cells).
+                    // We create a StorageCursor backed by MemPageStore with
+                    // is_table=false so IdxInsert/IdxGE etc. work correctly.
+                    const AUTOINDEX_PAGE_SIZE: u32 = 4096;
+                    let cursor_id = op.p1;
+                    self.pending_next_after_delete.remove(&cursor_id);
+                    let root_pgno = if let Some(db) = self.db.as_mut() {
+                        let rp = db.create_table(op.p2.max(1) as usize);
+                        PageNumber::new(rp as u32)
+                    } else {
+                        None
+                    };
+                    if let Some(root_pgno) = root_pgno {
+                        let store =
+                            MemPageStore::with_empty_index(root_pgno, AUTOINDEX_PAGE_SIZE);
+                        let cx = Cx::new();
+                        let cursor =
+                            BtCursor::new(store, root_pgno, AUTOINDEX_PAGE_SIZE, false);
+                        self.cursors.remove(&cursor_id);
+                        self.storage_cursors.insert(
+                            cursor_id,
+                            StorageCursor {
+                                cursor: CursorBackend::Mem(cursor),
+                                cx,
+                                writable: true,
+                                last_alloc_rowid: 0,
+                                cached_row: None,
+                            },
+                        );
                     }
                     pc += 1;
                 }
@@ -6340,20 +6376,44 @@ impl VdbeEngine {
                     return false;
                 }
             };
+            let hdr_offset = header_offset_for_page(root_pgno);
             let parsed_header =
-                BtreePageHeader::parse(&page_data, header_offset_for_page(root_pgno)).ok();
-            // Keep the legacy non-zero first-byte gate so existing tests that
-            // use MockTransaction's synthetic pages still open cursors.
+                BtreePageHeader::parse(&page_data, hdr_offset).ok();
+            // A page is a valid B-tree if the header parses successfully.
+            // Legacy fallback: synthetic test pages with non-zero first byte
+            // but unparseable header are also accepted, but we infer
+            // is_table from the raw page-type byte rather than defaulting
+            // to true (which was incorrect for index pages).
             let is_valid_btree =
                 parsed_header.is_some() || (!page_data.is_empty() && page_data[0] != 0x00);
             let is_zero_page = page_data.iter().all(|&byte| byte == 0);
 
             if is_valid_btree {
                 // Real B-tree backed by pager: infer table-vs-index from the
-                // parsed page header when available.
-                let (is_table_btree, detected_page_type) = parsed_header
-                    .map(|header| (header.page_type.is_table(), Some(header.page_type)))
-                    .unwrap_or((true, None));
+                // parsed page header when available, falling back to the raw
+                // page-type byte for synthetic/legacy pages.
+                let (is_table_btree, detected_page_type) = if let Some(header) = parsed_header {
+                    (header.page_type.is_table(), Some(header.page_type))
+                } else {
+                    // Header parse failed but page has data. Use the raw
+                    // page-type flag byte at the header offset to infer
+                    // table vs index — do NOT blindly default to table.
+                    let type_byte = page_data.get(hdr_offset).copied().unwrap_or(0);
+                    let is_table = match type_byte {
+                        0x02 | 0x0A => false, // InteriorIndex / LeafIndex
+                        0x05 | 0x0D => true,  // InteriorTable / LeafTable
+                        _ => {
+                            tracing::warn!(
+                                cursor_id,
+                                page_id = root_page,
+                                type_byte,
+                                "open_storage_cursor: unparseable header with unknown page-type byte, defaulting to table"
+                            );
+                            true
+                        }
+                    };
+                    (is_table, None)
+                };
                 let cursor = BtCursor::new(page_io.clone(), root_pgno, PAGE_SIZE, is_table_btree);
                 self.storage_cursors.insert(
                     cursor_id,
