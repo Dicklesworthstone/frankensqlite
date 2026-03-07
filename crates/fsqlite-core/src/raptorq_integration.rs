@@ -13,7 +13,7 @@
 
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use fsqlite_types::sync_primitives::Instant;
 
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::{ObjectId, cx::Cx};

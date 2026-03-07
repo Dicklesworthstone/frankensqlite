@@ -36,8 +36,10 @@ xxhash-rust = { workspace = true }
 blake3 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-asupersync = { workspace = true }
 hashbrown.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+asupersync = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

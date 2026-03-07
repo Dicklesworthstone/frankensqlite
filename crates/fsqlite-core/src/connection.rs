@@ -2606,7 +2606,7 @@ impl Connection {
                 sql: statement_sql.clone(),
             },
         );
-        let execution_started = std::time::Instant::now();
+        let execution_started = fsqlite_types::sync_primitives::Instant::now();
         let statement = {
             let parse_span = tracing::span!(
                 target: "fsqlite.parse",
@@ -20211,7 +20211,7 @@ fn execute_table_program_with_db(
     engine.set_database(db_value);
 
     // Always take the DB and txn back, even if execution returns Err.
-    let export_started = std::time::Instant::now();
+    let export_started = fsqlite_types::sync_primitives::Instant::now();
     let exec_res = engine.execute(program);
     let export_latency_us = u64::try_from(export_started.elapsed().as_micros()).unwrap_or(u64::MAX);
     record_trace_export(1, export_latency_us);
@@ -32419,7 +32419,7 @@ mod tests {
                 let mut state = conn.checkpoint_advisor_state.borrow_mut();
                 state.last_wal_sample_frames_written_total = 0;
                 state.last_wal_sample_at = Some(
-                    std::time::Instant::now()
+                    fsqlite_types::sync_primitives::Instant::now()
                         .checked_sub(std::time::Duration::from_millis(5))
                         .expect("current instant should exceed 5ms"),
                 );
