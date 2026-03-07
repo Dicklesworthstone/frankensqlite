@@ -15308,3 +15308,221 @@ fn test_conformance_changes_function_s123() {
         panic!("{} changes() mismatches", mismatches.len());
     }
 }
+
+/// Probe: Complex WHERE with nested AND/OR, BETWEEN, LIKE, GLOB patterns.
+#[test]
+fn test_conformance_probe_where_complex_predicates() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+    for s in &[
+        "CREATE TABLE wcp(id INTEGER PRIMARY KEY, name TEXT, age INTEGER, score REAL, tag TEXT)",
+        "INSERT INTO wcp VALUES(1,'Alice',25,88.5,'A'),(2,'Bob',30,72.3,'B'),(3,'Carol',35,95.1,'A'),(4,'Dave',28,65.0,'C'),(5,'Eve',22,91.2,'B'),(6,'Frank',40,50.0,NULL)",
+    ] {
+        fconn.execute(s).unwrap();
+        rconn.execute_batch(s).unwrap();
+    }
+
+    let queries = [
+        "SELECT name FROM wcp WHERE age BETWEEN 25 AND 35 ORDER BY name",
+        "SELECT name FROM wcp WHERE age NOT BETWEEN 25 AND 35 ORDER BY name",
+        "SELECT name FROM wcp WHERE name LIKE 'A%' ORDER BY name",
+        "SELECT name FROM wcp WHERE name LIKE '%o%' ORDER BY name",
+        "SELECT name FROM wcp WHERE name LIKE '_a%' ORDER BY name",
+        "SELECT name FROM wcp WHERE name GLOB 'A*' ORDER BY name",
+        "SELECT name FROM wcp WHERE (age > 25 AND score > 80) OR tag = 'C' ORDER BY name",
+        "SELECT name FROM wcp WHERE NOT (age < 30) ORDER BY name",
+        "SELECT name FROM wcp WHERE tag IS NULL ORDER BY name",
+        "SELECT name FROM wcp WHERE tag IS NOT NULL AND score > 70 ORDER BY name",
+        "SELECT name FROM wcp WHERE CAST(score AS INTEGER) > 80 ORDER BY name",
+        "SELECT name FROM wcp WHERE age IN (25, 30, 35) ORDER BY name",
+        "SELECT name FROM wcp WHERE age NOT IN (25, 30) ORDER BY name",
+    ];
+
+    let mismatches = oracle_compare(&fconn, &rconn, &queries);
+    if !mismatches.is_empty() {
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
+        panic!("{} WHERE complex predicate mismatches", mismatches.len());
+    }
+}
+
+/// Probe: INSERT with DEFAULT VALUES, multi-row VALUES, and column-list variants.
+#[test]
+fn test_conformance_probe_insert_variants() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+    for s in &[
+        "CREATE TABLE iv_t(id INTEGER PRIMARY KEY, name TEXT DEFAULT 'unnamed', val INTEGER DEFAULT 0)",
+    ] {
+        fconn.execute(s).unwrap();
+        rconn.execute_batch(s).unwrap();
+    }
+
+    let ops = [
+        "INSERT INTO iv_t VALUES(1, 'Alice', 10)",
+        "INSERT INTO iv_t(id, name) VALUES(2, 'Bob')",
+        "INSERT INTO iv_t(id) VALUES(3)",
+        "INSERT INTO iv_t DEFAULT VALUES",
+        "INSERT INTO iv_t VALUES(5, 'Carol', 50),(6, 'Dave', 60),(7, 'Eve', 70)",
+    ];
+    for o in &ops {
+        fconn.execute(o).unwrap();
+        rconn.execute_batch(o).unwrap();
+    }
+
+    let queries = [
+        "SELECT * FROM iv_t ORDER BY id",
+        "SELECT COUNT(*) FROM iv_t",
+        "SELECT name, val FROM iv_t WHERE val = 0 ORDER BY id",
+    ];
+
+    let mismatches = oracle_compare(&fconn, &rconn, &queries);
+    if !mismatches.is_empty() {
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
+        panic!("{} INSERT variant mismatches", mismatches.len());
+    }
+}
+
+/// Probe: Numeric edge cases — integer overflow, float precision, division by zero.
+#[test]
+fn test_conformance_probe_numeric_edges() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+    let queries = [
+        "SELECT 9223372036854775807 + 0",
+        "SELECT 9223372036854775807 + 1",
+        "SELECT -9223372036854775808 + 0",
+        "SELECT -9223372036854775808 - 1",
+        "SELECT 1 / 0",
+        "SELECT 1.0 / 0.0",
+        "SELECT 0 / 0",
+        "SELECT 10 % 3, -10 % 3, 10 % -3",
+        "SELECT 1.0 / 3.0",
+        "SELECT typeof(9223372036854775807), typeof(9223372036854775808)",
+        "SELECT 2.0 = 2, 2 = 2.0",
+        "SELECT '10' > 9, '10' > '9'",
+    ];
+
+    let mismatches = oracle_compare(&fconn, &rconn, &queries);
+    if !mismatches.is_empty() {
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
+        panic!("{} numeric edge mismatches", mismatches.len());
+    }
+}
+
+/// Probe: Aggregate functions with empty sets and NULL-only sets.
+#[test]
+fn test_conformance_probe_aggregate_empty_null() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+    for s in &[
+        "CREATE TABLE aen(id INTEGER PRIMARY KEY, val INTEGER, grp TEXT)",
+        "INSERT INTO aen VALUES(1, NULL, 'A'),(2, NULL, 'A'),(3, 10, 'B'),(4, 20, 'B'),(5, NULL, 'C')",
+    ] {
+        fconn.execute(s).unwrap();
+        rconn.execute_batch(s).unwrap();
+    }
+
+    let queries = [
+        "SELECT grp, COUNT(*), COUNT(val), SUM(val), AVG(val), MIN(val), MAX(val), TOTAL(val) FROM aen GROUP BY grp ORDER BY grp",
+        "SELECT COUNT(*), COUNT(val), SUM(val), AVG(val), MIN(val), MAX(val), TOTAL(val) FROM aen WHERE 1=0",
+        "SELECT grp, GROUP_CONCAT(val, ',') FROM aen GROUP BY grp ORDER BY grp",
+        "SELECT COUNT(DISTINCT val) FROM aen",
+        "SELECT grp, COUNT(DISTINCT val) FROM aen GROUP BY grp ORDER BY grp",
+    ];
+
+    let mismatches = oracle_compare(&fconn, &rconn, &queries);
+    if !mismatches.is_empty() {
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
+        panic!("{} aggregate empty/null mismatches", mismatches.len());
+    }
+}
+
+/// Probe: AUTOINCREMENT behavior and sqlite_sequence table.
+#[test]
+fn test_conformance_probe_autoincrement() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+    for s in &[
+        "CREATE TABLE ai_t(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT)",
+        "INSERT INTO ai_t(name) VALUES('first'),('second'),('third')",
+    ] {
+        fconn.execute(s).unwrap();
+        rconn.execute_batch(s).unwrap();
+    }
+
+    let queries = [
+        "SELECT * FROM ai_t ORDER BY id",
+        "SELECT seq FROM sqlite_sequence WHERE name = 'ai_t'",
+    ];
+    let m1 = oracle_compare(&fconn, &rconn, &queries);
+    if !m1.is_empty() {
+        for m in &m1 {
+            eprintln!("{m}\n");
+        }
+        panic!("{} autoincrement initial mismatches", m1.len());
+    }
+
+    for s in &[
+        "DELETE FROM ai_t WHERE id = 3",
+        "INSERT INTO ai_t(name) VALUES('fourth')",
+    ] {
+        fconn.execute(s).unwrap();
+        rconn.execute_batch(s).unwrap();
+    }
+
+    let queries2 = [
+        "SELECT * FROM ai_t ORDER BY id",
+        "SELECT seq FROM sqlite_sequence WHERE name = 'ai_t'",
+    ];
+    let m2 = oracle_compare(&fconn, &rconn, &queries2);
+    if !m2.is_empty() {
+        for m in &m2 {
+            eprintln!("{m}\n");
+        }
+        panic!("{} autoincrement no-reuse mismatches", m2.len());
+    }
+}
+
+/// Probe: Datetime functions — date(), time(), datetime(), strftime(), julianday().
+#[test]
+fn test_conformance_probe_datetime_functions() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+    let queries = [
+        "SELECT date('2024-03-15')",
+        "SELECT time('14:30:45')",
+        "SELECT datetime('2024-03-15 14:30:45')",
+        "SELECT date('2024-03-15', '+1 day')",
+        "SELECT date('2024-03-15', '-1 month')",
+        "SELECT date('2024-03-15', '+1 year')",
+        "SELECT strftime('%Y', '2024-03-15')",
+        "SELECT strftime('%m', '2024-03-15')",
+        "SELECT strftime('%d', '2024-03-15')",
+        "SELECT strftime('%H:%M:%S', '2024-03-15 14:30:45')",
+        "SELECT julianday('2024-03-15')",
+        "SELECT date('2024-01-31', '+1 month')",
+        "SELECT datetime('2024-03-15 14:30:45', '+6 hours')",
+    ];
+
+    let mismatches = oracle_compare(&fconn, &rconn, &queries);
+    if !mismatches.is_empty() {
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
+        panic!("{} datetime function mismatches", mismatches.len());
+    }
+}
