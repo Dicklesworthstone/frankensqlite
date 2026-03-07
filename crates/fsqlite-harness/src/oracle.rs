@@ -527,8 +527,8 @@ pub fn run_sqlite3_oracle(
     let sentinel_prefix = "__FSQLITE_ORACLE_SENTINEL__";
     let mut script = String::new();
     let mut stmt_types = Vec::new(); // (idx, is_query, sql_text)
-    // Track script line numbers so stderr errors ("near line N:") can be
-    // mapped back to the correct statement index.
+                                     // Track script line numbers so stderr errors ("near line N:") can be
+                                     // mapped back to the correct statement index.
     let mut line_number = 1_usize;
     let mut sql_line_to_idx: Vec<(usize, usize)> = Vec::new();
 

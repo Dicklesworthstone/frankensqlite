@@ -292,8 +292,8 @@ mod tests {
                     }
                 }
                 if btree_elements.len() != expected.len() {
-                    let _missing: Vec<_> = expected.difference(&btree_elements).collect();
-                    panic!("row count mismatch! missing {} elements", expected.len() - btree_elements.len());
+                    let missing: Vec<_> = expected.difference(&btree_elements).collect();
+                    panic!("row count mismatch! missing {} elements: {:?}", expected.len() - btree_elements.len(), missing);
                 }
                 assert_eq!(btree_elements.len(), expected.len(), "row count mismatch");
             }

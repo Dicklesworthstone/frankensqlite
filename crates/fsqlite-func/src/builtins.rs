@@ -1047,9 +1047,9 @@ impl ScalarFunction for SubstrFunc {
 
         // Phase 2: resolve start position (1-based to 0-based)
         if p1 < 0 {
-            p1 += len;
+            p1 = p1.saturating_add(len);
             if p1 < 0 {
-                p2 += p1;
+                p2 = p2.saturating_add(p1);
                 p1 = 0;
             }
         } else if p1 > 0 {
@@ -1060,15 +1060,15 @@ impl ScalarFunction for SubstrFunc {
 
         // Phase 3: apply negative-length shift (move start backward)
         if neg_p2 {
-            p1 -= p2;
+            p1 = p1.saturating_sub(p2);
             if p1 < 0 {
-                p2 += p1;
+                p2 = p2.saturating_add(p1);
                 p1 = 0;
             }
         }
 
-        if p1 + p2 > len {
-            p2 = len - p1;
+        if p1.saturating_add(p2) > len {
+            p2 = len.saturating_sub(p1);
         }
         if p2 <= 0 {
             return Ok(SqliteValue::Text(String::new()));
@@ -1114,9 +1114,9 @@ impl SubstrFunc {
         }
 
         if p1 < 0 {
-            p1 += len;
+            p1 = p1.saturating_add(len);
             if p1 < 0 {
-                p2 += p1;
+                p2 = p2.saturating_add(p1);
                 p1 = 0;
             }
         } else if p1 > 0 {
@@ -1126,15 +1126,15 @@ impl SubstrFunc {
         }
 
         if neg_p2 {
-            p1 -= p2;
+            p1 = p1.saturating_sub(p2);
             if p1 < 0 {
-                p2 += p1;
+                p2 = p2.saturating_add(p1);
                 p1 = 0;
             }
         }
 
-        if p1 + p2 > len {
-            p2 = len - p1;
+        if p1.saturating_add(p2) > len {
+            p2 = len.saturating_sub(p1);
         }
         if p2 <= 0 {
             return Ok(SqliteValue::Blob(Vec::new()));

@@ -17,13 +17,13 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fmt::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::mismatch_minimizer::{MinimizerConfig, ReproducibilityTest, minimize_workload};
-use crate::oracle::{SltKind, parse_slt};
+use crate::mismatch_minimizer::{minimize_workload, MinimizerConfig, ReproducibilityTest};
+use crate::oracle::{parse_slt, SltKind};
 
 /// Bead identifier for log correlation.
 const BEAD_ID: &str = "bd-1dp9.2.1";
@@ -1129,32 +1129,13 @@ pub fn ingest_slt_files_with_report(
     builder: &mut CorpusBuilder,
 ) -> Result<SltIngestReport, String> {
     let mut report = SltIngestReport::default();
-    let entries = std::fs::read_dir(dir)
-        .map_err(|error| format!("failed to read slt dir {}: {error}", dir.display()))?;
-
-    let mut files: Vec<_> = entries
-        .filter_map(std::result::Result::ok)
-        .filter(|entry| {
-            entry
-                .path()
-                .extension()
-                .and_then(std::ffi::OsStr::to_str)
-                .map(|ext| {
-                    ext.eq_ignore_ascii_case("slt")
-                        || ext.eq_ignore_ascii_case("sqllogictest")
-                        || ext.eq_ignore_ascii_case("test")
-                })
-                .unwrap_or(false)
-        })
-        .collect();
-    files.sort_by_key(std::fs::DirEntry::path);
+    let files = collect_slt_suite_files(dir)?;
     report.slt_files_seen = files.len();
 
-    for entry in files {
-        let path = entry.path();
+    for path in files {
         let file_name = path
-            .file_name()
-            .unwrap_or_default()
+            .strip_prefix(dir)
+            .unwrap_or(path.as_path())
             .to_string_lossy()
             .to_string();
         let content = std::fs::read_to_string(&path)
@@ -1222,6 +1203,51 @@ fn normalize_slt_sql(sql: &str) -> String {
         .join("\n")
         .trim()
         .to_owned()
+}
+
+fn collect_slt_suite_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut files = Vec::new();
+    collect_slt_suite_files_recursive(dir, &mut files)?;
+    files.sort();
+    Ok(files)
+}
+
+fn collect_slt_suite_files_recursive(dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), String> {
+    let entries = std::fs::read_dir(dir)
+        .map_err(|error| format!("failed to read slt dir {}: {error}", dir.display()))?;
+    let mut children = Vec::new();
+    for entry_result in entries {
+        let entry = entry_result
+            .map_err(|error| format!("failed to read slt dir entry {}: {error}", dir.display()))?;
+        children.push(entry);
+    }
+    children.sort_by_key(std::fs::DirEntry::path);
+
+    for entry in children {
+        let file_type = entry
+            .file_type()
+            .map_err(|error| format!("failed to inspect {}: {error}", entry.path().display()))?;
+        let path = entry.path();
+        if file_type.is_dir() {
+            collect_slt_suite_files_recursive(&path, files)?;
+            continue;
+        }
+        if file_type.is_file() && is_supported_slt_file(&path) {
+            files.push(path);
+        }
+    }
+
+    Ok(())
+}
+
+fn is_supported_slt_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|ext| {
+            ext.eq_ignore_ascii_case("slt")
+                || ext.eq_ignore_ascii_case("sqllogictest")
+                || ext.eq_ignore_ascii_case("test")
+        })
 }
 
 // ─── Built-in Seed Corpus ────────────────────────────────────────────────

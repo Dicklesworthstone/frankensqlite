@@ -13,12 +13,15 @@ use std::fs;
 use std::path::Path;
 
 use fsqlite_harness::corpus_ingest::{
-    CORPUS_SEED_BASE, CorpusBuilder, CorpusSource, Family, UserReproIntakeRequest, classify_family,
-    derive_entry_seed, generate_seed_corpus, ingest_conformance_fixtures_with_report,
-    ingest_slt_files_with_report, intake_user_repro_fixture, render_user_repro_fixture_json,
-    write_user_repro_fixture,
+    classify_family, derive_entry_seed, generate_seed_corpus,
+    ingest_conformance_fixtures_with_report, ingest_slt_files_with_report,
+    intake_user_repro_fixture, render_user_repro_fixture_json, write_user_repro_fixture,
+    CorpusBuilder, CorpusSource, Family, UserReproIntakeRequest, CORPUS_SEED_BASE,
 };
 use fsqlite_harness::differential_v2::{StatementDivergence, StmtOutcome};
+use fsqlite_harness::fixture_root_contract::{
+    load_fixture_root_contract, DEFAULT_FIXTURE_ROOT_MANIFEST_PATH,
+};
 use fsqlite_harness::mismatch_minimizer::MinimizerConfig;
 use proptest::prelude::*;
 use tempfile::tempdir;
@@ -241,11 +244,9 @@ fn builder_link_features_attaches_ids() {
 
     let manifest = builder.build();
     assert_eq!(manifest.entries[0].taxonomy_features.len(), 2);
-    assert!(
-        manifest.entries[0]
-            .taxonomy_features
-            .contains(&"F-FUN.5".to_owned())
-    );
+    assert!(manifest.entries[0]
+        .taxonomy_features
+        .contains(&"F-FUN.5".to_owned()));
 }
 
 // ─── Coverage Report Tests ───────────────────────────────────────────────
@@ -265,30 +266,22 @@ fn coverage_reports_missing_families() {
     let manifest = builder.build();
 
     assert!(manifest.coverage.missing_families.len() >= 7);
-    assert!(
-        manifest
-            .coverage
-            .missing_families
-            .contains(&"TXN".to_owned())
-    );
-    assert!(
-        manifest
-            .coverage
-            .missing_families
-            .contains(&"FUN".to_owned())
-    );
-    assert!(
-        manifest
-            .coverage
-            .missing_families
-            .contains(&"VDB".to_owned())
-    );
-    assert!(
-        !manifest
-            .coverage
-            .missing_families
-            .contains(&"SQL".to_owned())
-    );
+    assert!(manifest
+        .coverage
+        .missing_families
+        .contains(&"TXN".to_owned()));
+    assert!(manifest
+        .coverage
+        .missing_families
+        .contains(&"FUN".to_owned()));
+    assert!(manifest
+        .coverage
+        .missing_families
+        .contains(&"VDB".to_owned()));
+    assert!(!manifest
+        .coverage
+        .missing_families
+        .contains(&"SQL".to_owned()));
 }
 
 #[test]
@@ -487,11 +480,9 @@ fn ingest_conformance_fixtures_reports_skipped_underspecified_files() {
     assert_eq!(report.sql_statements_ingested, 1);
     assert_eq!(report.skipped_files.len(), 1);
     assert_eq!(report.skipped_files[0].file, "empty.json");
-    assert!(
-        report.skipped_files[0]
-            .reason
-            .contains("no ops[].sql statements")
-    );
+    assert!(report.skipped_files[0]
+        .reason
+        .contains("no ops[].sql statements"));
 
     let manifest = builder.build();
     assert_eq!(manifest.entries.len(), 1);
@@ -566,11 +557,9 @@ CREATE TABLE t2(v INTEGER)
     assert_eq!(report.sql_statements_ingested, 1);
     assert_eq!(report.skipped_files.len(), 1);
     assert_eq!(report.skipped_files[0].file, "empty.test");
-    assert!(
-        report.skipped_files[0]
-            .reason
-            .contains("no SLT entries parsed")
-    );
+    assert!(report.skipped_files[0]
+        .reason
+        .contains("no SLT entries parsed"));
 }
 
 #[test]
@@ -612,6 +601,93 @@ CREATE TABLE a(v INTEGER)
         assert_eq!(left_entry.statements, right_entry.statements);
         assert_eq!(left_entry.content_hash(), right_entry.content_hash());
     }
+}
+
+#[test]
+fn ingest_slt_files_discovers_nested_suite_files() {
+    let temp = tempdir().expect("create tempdir");
+    let dir = temp.path();
+    let nested = dir.join("core").join("smoke");
+    fs::create_dir_all(&nested).expect("create nested suite");
+
+    fs::write(
+        nested.join("a.slt"),
+        "\
+statement ok
+CREATE TABLE nested_a(v INTEGER)
+",
+    )
+    .expect("write nested a.slt");
+    fs::write(
+        dir.join("top_level.sqllogictest"),
+        "\
+statement ok
+CREATE TABLE top_level(v INTEGER)
+",
+    )
+    .expect("write top_level.sqllogictest");
+
+    let mut builder = CorpusBuilder::new(CORPUS_SEED_BASE);
+    let report = ingest_slt_files_with_report(dir, &mut builder).expect("ingest nested slt");
+
+    assert_eq!(report.slt_files_seen, 2);
+    assert_eq!(report.slt_entries_ingested, 2);
+    assert_eq!(report.sql_statements_ingested, 2);
+    assert!(report.skipped_files.is_empty());
+
+    let manifest = builder.build();
+    assert_eq!(manifest.entries.len(), 2);
+    assert!(manifest.entries.iter().any(|entry| {
+        matches!(
+            &entry.source,
+            CorpusSource::Slt { file } if file == "core/smoke/a.slt"
+        )
+    }));
+    assert!(manifest.entries.iter().any(|entry| {
+        matches!(
+            &entry.source,
+            CorpusSource::Slt { file } if file == "top_level.sqllogictest"
+        )
+    }));
+}
+
+#[test]
+fn canonical_slt_corpus_root_satisfies_manifest_contract() {
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let contract = load_fixture_root_contract(
+        &workspace_root,
+        Path::new(DEFAULT_FIXTURE_ROOT_MANIFEST_PATH),
+    )
+    .expect("load fixture-root contract");
+
+    assert!(
+        contract.slt_dir.exists(),
+        "canonical slt_dir is missing: {}",
+        contract.slt_dir.display()
+    );
+
+    let mut builder = CorpusBuilder::new(CORPUS_SEED_BASE);
+    let report = ingest_slt_files_with_report(&contract.slt_dir, &mut builder)
+        .expect("ingest canonical slt");
+
+    assert!(
+        report.slt_files_seen >= contract.min_slt_files,
+        "slt_files_seen={} < min_slt_files={}",
+        report.slt_files_seen,
+        contract.min_slt_files
+    );
+    assert!(
+        report.slt_entries_ingested >= contract.min_slt_entries,
+        "slt_entries_ingested={} < min_slt_entries={}",
+        report.slt_entries_ingested,
+        contract.min_slt_entries
+    );
+    assert!(
+        report.sql_statements_ingested >= contract.min_slt_sql_statements,
+        "slt_sql_statements_ingested={} < min_slt_sql_statements={}",
+        report.sql_statements_ingested,
+        contract.min_slt_sql_statements
+    );
 }
 
 // ─── User Repro Intake Tests (bd-2yqp6.3.5) ─────────────────────────────

@@ -193,6 +193,47 @@ mod tests {
         assert!(!explain.is_empty());
     }
 
+    #[test]
+    fn prepared_indexed_equality_explain_uses_duplicate_run_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("indexed-equality.db");
+        let db = db_path.to_string_lossy().to_string();
+
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, b INTEGER NOT NULL);")
+                .unwrap();
+            conn.execute("CREATE INDEX idx_t_b ON t(b);").unwrap();
+            conn.execute("INSERT INTO t (id, b) VALUES (1, 42), (2, 42), (5, 42), (9, 99);")
+                .unwrap();
+        }
+
+        let conn = Connection::open(&db).unwrap();
+        let stmt = conn.prepare("SELECT id FROM t WHERE b = ?1;").unwrap();
+
+        let explain = stmt.explain();
+        assert!(explain.contains("idx_t_b"));
+        assert!(explain.contains("SeekGE"));
+        assert!(explain.contains("IdxRowid"));
+        assert!(explain.contains("SeekRowid"));
+        assert!(
+            explain.contains("-9223372036854775808"),
+            "expected synthetic low-rowid probe in explain output: {explain}"
+        );
+
+        let rows = stmt.query_with_params(&[SqliteValue::Integer(42)]).unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.get(0).cloned().unwrap())
+                .collect::<Vec<_>>(),
+            vec![
+                SqliteValue::Integer(1),
+                SqliteValue::Integer(2),
+                SqliteValue::Integer(5),
+            ]
+        );
+    }
+
     // ── Connection::query_row_with_params ────────────────────────────────
 
     #[test]
