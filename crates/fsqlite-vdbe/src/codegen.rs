@@ -1157,7 +1157,9 @@ pub fn codegen_select(
             let full_scan_fallback = b.emit_label();
             let duplicate_run_done = b.emit_label();
 
-            let param_reg = b.alloc_reg();
+            // Allocate param_reg and min_rowid_reg as contiguous pair for MakeRecord.
+            let param_reg = b.alloc_regs(2);
+            let min_rowid_reg = param_reg + 1;
             b.emit_op(Opcode::Variable, *param_idx, param_reg, 0, P4::None, 0);
 
             // SQL semantics: `WHERE col = NULL` is UNKNOWN (filters out all rows).
@@ -1169,7 +1171,6 @@ pub fn codegen_select(
 
             // Build probe key: [bound_value, i64::MIN] so SeekGE lands on the
             // first duplicate for the bound value.
-            let min_rowid_reg = b.alloc_reg();
             b.emit_op(Opcode::Int64, 0, min_rowid_reg, 0, P4::Int64(i64::MIN), 0);
             let probe_record_reg = b.alloc_reg();
             b.emit_op(
@@ -11805,16 +11806,20 @@ mod tests {
         codegen_delete(&mut b, &stmt, &schema, &ctx).unwrap();
         let prog = b.finish().unwrap();
 
-        // Verify scan-based delete with reverse iteration (Last/Prev).
+        // Verify two-pass delete: collect matching rowids, then delete.
         assert!(has_opcodes(
             &prog,
             &[
                 Opcode::Init,
                 Opcode::Transaction,
                 Opcode::OpenWrite,
-                Opcode::Last,   // start from end
-                Opcode::Delete, // delete matching row
-                Opcode::Prev,   // iterate backwards
+                Opcode::Rewind,     // pass 1: scan
+                Opcode::Rowid,      // collect rowid
+                Opcode::RowSetAdd,  // into rowset
+                Opcode::Next,       // continue scan
+                Opcode::RowSetRead, // pass 2: iterate collected rowids
+                Opcode::SeekRowid,  // seek to rowid
+                Opcode::Delete,     // delete row
                 Opcode::Close,
                 Opcode::Halt,
             ]
@@ -13906,14 +13911,18 @@ mod tests {
         codegen_delete(&mut b, &stmt, &schema, &ctx).unwrap();
         let prog = b.finish().unwrap();
 
-        // The qualified alias "u.a" should resolve correctly.
+        // The qualified alias "u.a" should resolve correctly (two-pass delete).
         assert!(has_opcodes(
             &prog,
             &[
-                Opcode::Last,
+                Opcode::Rewind,
                 Opcode::Column, // read u.a for WHERE comparison
                 Opcode::Variable,
-                Opcode::Ne, // filter non-matching rows
+                Opcode::Ne,    // filter non-matching rows
+                Opcode::Rowid, // collect matching rowid
+                Opcode::RowSetAdd,
+                Opcode::RowSetRead, // pass 2: delete collected rows
+                Opcode::SeekRowid,
                 Opcode::Delete,
             ]
         ));
@@ -14440,14 +14449,18 @@ mod tests {
         codegen_delete(&mut b, &stmt, &schema, &ctx).unwrap();
         let prog = b.finish().unwrap();
 
-        // Bare rowid in DELETE WHERE Eq should emit Rowid + Ne filter.
+        // Bare rowid in DELETE WHERE Eq should emit Rowid + Ne filter (two-pass).
         assert!(has_opcodes(
             &prog,
             &[
-                Opcode::Last,
+                Opcode::Rewind,
                 Opcode::Rowid, // WHERE rowid comparison
                 Opcode::Variable,
-                Opcode::Ne, // filter non-matching rows
+                Opcode::Ne,    // filter non-matching rows
+                Opcode::Rowid, // collect matching rowid
+                Opcode::RowSetAdd,
+                Opcode::RowSetRead, // pass 2: delete collected rows
+                Opcode::SeekRowid,
                 Opcode::Delete,
             ]
         ));

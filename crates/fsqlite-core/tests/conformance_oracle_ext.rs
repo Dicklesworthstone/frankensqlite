@@ -28527,8 +28527,13 @@ fn test_conformance_correlated_subquery_in_order_by_s521() {
     ];
     let mismatches = oracle_compare(&fconn, &rconn, &queries);
     if !mismatches.is_empty() {
-        for m in &mismatches { eprintln!("{m}\n"); }
-        panic!("{} correlated subquery in ORDER BY mismatches", mismatches.len());
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
+        panic!(
+            "{} correlated subquery in ORDER BY mismatches",
+            mismatches.len()
+        );
     }
 }
 
@@ -28550,7 +28555,9 @@ fn test_conformance_multiple_aggregates_single_query_s522() {
     ];
     let mismatches = oracle_compare(&fconn, &rconn, &queries);
     if !mismatches.is_empty() {
-        for m in &mismatches { eprintln!("{m}\n"); }
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
         panic!("{} multiple aggregates mismatches", mismatches.len());
     }
 }
@@ -28574,8 +28581,13 @@ fn test_conformance_subquery_in_where_comparison_s523() {
     ];
     let mismatches = oracle_compare(&fconn, &rconn, &queries);
     if !mismatches.is_empty() {
-        for m in &mismatches { eprintln!("{m}\n"); }
-        panic!("{} subquery in WHERE comparison mismatches", mismatches.len());
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
+        panic!(
+            "{} subquery in WHERE comparison mismatches",
+            mismatches.len()
+        );
     }
 }
 
@@ -28599,7 +28611,9 @@ fn test_conformance_cross_join_s524() {
     ];
     let mismatches = oracle_compare(&fconn, &rconn, &queries);
     if !mismatches.is_empty() {
-        for m in &mismatches { eprintln!("{m}\n"); }
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
         panic!("{} CROSS JOIN mismatches", mismatches.len());
     }
 }
@@ -28622,7 +28636,9 @@ fn test_conformance_string_functions_detailed_s525() {
     ];
     let mismatches = oracle_compare(&fconn, &rconn, &queries);
     if !mismatches.is_empty() {
-        for m in &mismatches { eprintln!("{m}\n"); }
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
         panic!("{} string function detailed mismatches", mismatches.len());
     }
 }
@@ -28645,7 +28661,9 @@ fn test_conformance_arithmetic_edge_cases_s526() {
     ];
     let mismatches = oracle_compare(&fconn, &rconn, &queries);
     if !mismatches.is_empty() {
-        for m in &mismatches { eprintln!("{m}\n"); }
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
         panic!("{} arithmetic edge case mismatches", mismatches.len());
     }
 }
@@ -28669,13 +28687,16 @@ fn test_conformance_correlated_update_with_case_and_like_s527() {
         fconn.execute(s).unwrap();
         rconn.execute_batch(s).unwrap();
     }
-    let queries = [
-        "SELECT * FROM employees ORDER BY id",
-    ];
+    let queries = ["SELECT * FROM employees ORDER BY id"];
     let mismatches = oracle_compare(&fconn, &rconn, &queries);
     if !mismatches.is_empty() {
-        for m in &mismatches { eprintln!("{m}\n"); }
-        panic!("{} correlated UPDATE CASE+LIKE mismatches", mismatches.len());
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
+        panic!(
+            "{} correlated UPDATE CASE+LIKE mismatches",
+            mismatches.len()
+        );
     }
 }
 
@@ -28683,9 +28704,7 @@ fn test_conformance_correlated_update_with_case_and_like_s527() {
 fn test_conformance_empty_table_aggregates_s528() {
     let fconn = Connection::open(":memory:").unwrap();
     let rconn = rusqlite::Connection::open_in_memory().unwrap();
-    for s in &[
-        "CREATE TABLE empty(id INTEGER PRIMARY KEY, val INTEGER)",
-    ] {
+    for s in &["CREATE TABLE empty(id INTEGER PRIMARY KEY, val INTEGER)"] {
         fconn.execute(s).unwrap();
         rconn.execute_batch(s).unwrap();
     }
@@ -28702,7 +28721,9 @@ fn test_conformance_empty_table_aggregates_s528() {
     ];
     let mismatches = oracle_compare(&fconn, &rconn, &queries);
     if !mismatches.is_empty() {
-        for m in &mismatches { eprintln!("{m}\n"); }
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
         panic!("{} empty table aggregate mismatches", mismatches.len());
     }
 }
