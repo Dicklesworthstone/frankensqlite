@@ -11727,7 +11727,7 @@ impl Connection {
             for (wi, func) in win_funcs.iter().enumerate() {
                 let mut state = func.initial_state();
                 if win_two_pass[wi] {
-                    // Two-pass (lead): step all rows, then value+inverse.
+                    // Two-pass: step all rows first.
                     for &ri in partition_indices {
                         let args = build_window_args(
                             &win_args[wi],
@@ -11737,9 +11737,19 @@ impl Connection {
                         )?;
                         func.step(&mut state, &args)?;
                     }
-                    for _ in partition_indices {
-                        window_results[wi].push(func.value(&state)?);
-                        func.inverse(&mut state, &[])?;
+                    if win_order_by[wi].is_empty() {
+                        // No ORDER BY in OVER → frame is entire partition.
+                        // Every row gets the same aggregate value.
+                        let val = func.value(&state)?;
+                        for _ in partition_indices {
+                            window_results[wi].push(val.clone());
+                        }
+                    } else {
+                        // Has ORDER BY (e.g. LEAD/NTILE): value+inverse per row.
+                        for _ in partition_indices {
+                            window_results[wi].push(func.value(&state)?);
+                            func.inverse(&mut state, &[])?;
+                        }
                     }
                 } else {
                     // Single-pass: step then value per row.
@@ -43514,7 +43524,7 @@ mod pager_routing_tests {
 
         let queries = [
             // Aliased column in ORDER BY
-            "SELECT u.name AS user_name, count(o.id) AS order_count FROM users u JOIN orders o ON o.user_id = u.id GROUP BY u.name ORDER BY order_count DESC",
+            "SELECT u.name AS user_name, count(o.id) AS order_count FROM users u JOIN orders o ON o.user_id = u.id GROUP BY u.name ORDER BY order_count DESC, u.name",
             // Sum with HAVING
             "SELECT u.name, sum(o.amount) AS total FROM users u JOIN orders o ON o.user_id = u.id GROUP BY u.name HAVING sum(o.amount) > 100 ORDER BY u.name",
             // LEFT JOIN with aggregate (NULL handling)
@@ -43536,6 +43546,241 @@ mod pager_routing_tests {
             }
             panic!(
                 "{} ORM pattern conformance mismatches found",
+                mismatches.len()
+            );
+        }
+    }
+
+    /// INSERT...SELECT, UPDATE with subqueries, DELETE with subqueries,
+    /// and multi-statement DML conformance.
+    #[test]
+    fn test_conformance_dml_subqueries() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE src (id INTEGER PRIMARY KEY, val TEXT, score INTEGER);",
+            "INSERT INTO src VALUES (1, 'alpha', 10);",
+            "INSERT INTO src VALUES (2, 'beta', 20);",
+            "INSERT INTO src VALUES (3, 'gamma', 30);",
+            "CREATE TABLE dst (id INTEGER PRIMARY KEY, val TEXT, score INTEGER);",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        // INSERT...SELECT
+        let dml = [
+            "INSERT INTO dst SELECT * FROM src WHERE score >= 20",
+        ];
+        for s in &dml {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            // Verify INSERT...SELECT result
+            "SELECT * FROM dst ORDER BY id",
+            // Scalar subquery in WHERE
+            "SELECT val FROM src WHERE score > (SELECT min(score) FROM src) ORDER BY val",
+            // IN subquery
+            "SELECT val FROM src WHERE id IN (SELECT id FROM dst) ORDER BY val",
+            // NOT IN subquery
+            "SELECT val FROM src WHERE id NOT IN (SELECT id FROM dst) ORDER BY val",
+            // EXISTS subquery
+            "SELECT val FROM src WHERE EXISTS (SELECT 1 FROM dst WHERE dst.id = src.id) ORDER BY val",
+            // NOT EXISTS subquery
+            "SELECT val FROM src WHERE NOT EXISTS (SELECT 1 FROM dst WHERE dst.id = src.id) ORDER BY val",
+            // Scalar subquery in SELECT list
+            "SELECT val, (SELECT count(*) FROM dst WHERE dst.score <= src.score) AS rank_approx FROM src ORDER BY val",
+            // Correlated subquery with aggregate in WHERE
+            "SELECT val FROM src WHERE score = (SELECT max(score) FROM src s2 WHERE s2.id <= src.id) ORDER BY val",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!(
+                "{} DML subquery conformance mismatches found",
+                mismatches.len()
+            );
+        }
+    }
+
+    /// Nested subqueries, multi-level correlated, and complex WHERE expressions.
+    #[test]
+    fn test_conformance_nested_subqueries_and_complex_where() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE departments (id INTEGER PRIMARY KEY, name TEXT);",
+            "INSERT INTO departments VALUES (1, 'Engineering');",
+            "INSERT INTO departments VALUES (2, 'Marketing');",
+            "INSERT INTO departments VALUES (3, 'Sales');",
+            "CREATE TABLE employees (id INTEGER PRIMARY KEY, name TEXT, dept_id INTEGER, salary REAL);",
+            "INSERT INTO employees VALUES (1, 'Alice', 1, 95000);",
+            "INSERT INTO employees VALUES (2, 'Bob', 1, 85000);",
+            "INSERT INTO employees VALUES (3, 'Carol', 2, 75000);",
+            "INSERT INTO employees VALUES (4, 'Dave', 2, 65000);",
+            "INSERT INTO employees VALUES (5, 'Eve', 3, 55000);",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            // Subquery returning max salary per dept, filter employees above dept avg
+            "SELECT e.name FROM employees e WHERE e.salary > (SELECT avg(e2.salary) FROM employees e2 WHERE e2.dept_id = e.dept_id) ORDER BY e.name",
+            // Department names with more than 1 employee
+            "SELECT d.name FROM departments d WHERE (SELECT count(*) FROM employees e WHERE e.dept_id = d.id) > 1 ORDER BY d.name",
+            // Nested subquery: departments where max salary > overall avg
+            "SELECT d.name FROM departments d WHERE (SELECT max(e.salary) FROM employees e WHERE e.dept_id = d.id) > (SELECT avg(salary) FROM employees) ORDER BY d.name",
+            // Complex WHERE with AND/OR and subqueries
+            "SELECT e.name FROM employees e WHERE (e.salary > 70000 OR e.dept_id = 3) AND e.dept_id IN (SELECT id FROM departments WHERE name != 'Marketing') ORDER BY e.name",
+            // BETWEEN with subquery bounds
+            "SELECT e.name FROM employees e WHERE e.salary BETWEEN (SELECT min(salary) FROM employees) + 10000 AND (SELECT max(salary) FROM employees) - 10000 ORDER BY e.name",
+            // Aggregate with HAVING referencing correlated subquery
+            "SELECT d.name, count(*) as cnt FROM departments d JOIN employees e ON e.dept_id = d.id GROUP BY d.name HAVING count(*) = (SELECT max(c) FROM (SELECT count(*) as c FROM employees GROUP BY dept_id)) ORDER BY d.name",
+            // CASE with subquery
+            "SELECT e.name, CASE WHEN e.salary > (SELECT avg(salary) FROM employees) THEN 'above' ELSE 'below' END AS salary_rank FROM employees e ORDER BY e.name",
+            // Derived table with JOIN
+            "SELECT d.name, sub.avg_sal FROM departments d JOIN (SELECT dept_id, avg(salary) AS avg_sal FROM employees GROUP BY dept_id) sub ON sub.dept_id = d.id ORDER BY d.name",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!(
+                "{} nested subquery conformance mismatches found",
+                mismatches.len()
+            );
+        }
+    }
+
+    /// NULL handling edge cases: IS NULL, IS NOT NULL, COALESCE chains,
+    /// NULL in aggregates, NULL in DISTINCT, NULL comparisons.
+    #[test]
+    fn test_conformance_null_handling() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, b INTEGER, c REAL);",
+            "INSERT INTO t VALUES (1, 'x', 10, 1.5);",
+            "INSERT INTO t VALUES (2, NULL, 20, NULL);",
+            "INSERT INTO t VALUES (3, 'y', NULL, 3.5);",
+            "INSERT INTO t VALUES (4, NULL, NULL, NULL);",
+            "INSERT INTO t VALUES (5, 'x', 10, 1.5);",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            // IS NULL / IS NOT NULL
+            "SELECT id FROM t WHERE a IS NULL ORDER BY id",
+            "SELECT id FROM t WHERE b IS NOT NULL ORDER BY id",
+            // COALESCE chains
+            "SELECT id, COALESCE(a, 'none') FROM t ORDER BY id",
+            "SELECT id, COALESCE(a, CAST(b AS TEXT), 'empty') FROM t ORDER BY id",
+            // NULL in aggregates
+            "SELECT count(*), count(a), count(b), count(c) FROM t",
+            "SELECT sum(b), avg(b), min(b), max(b) FROM t",
+            "SELECT group_concat(a, ',') FROM t",
+            // DISTINCT with NULLs
+            "SELECT DISTINCT a FROM t ORDER BY a",
+            "SELECT DISTINCT b FROM t ORDER BY b",
+            // NULL comparison behavior
+            "SELECT id FROM t WHERE a = NULL ORDER BY id",
+            "SELECT id FROM t WHERE a != NULL ORDER BY id",
+            "SELECT id FROM t WHERE NOT (a IS NULL) ORDER BY id",
+            // NULL in CASE
+            "SELECT id, CASE WHEN a IS NULL THEN 'null' WHEN a = 'x' THEN 'ex' ELSE 'other' END FROM t ORDER BY id",
+            // NULL in IN list
+            "SELECT id FROM t WHERE a IN ('x', NULL) ORDER BY id",
+            "SELECT id FROM t WHERE a NOT IN ('x', NULL) ORDER BY id",
+            // NULL arithmetic
+            "SELECT id, b + 1, b * 2, b - c FROM t ORDER BY id",
+            // IFNULL and NULLIF
+            "SELECT id, ifnull(a, 'default'), nullif(a, 'x') FROM t ORDER BY id",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!(
+                "{} NULL handling conformance mismatches found",
+                mismatches.len()
+            );
+        }
+    }
+
+    /// Type coercion edge cases: mixed-type comparisons, affinity rules,
+    /// CAST behavior, and numeric string handling.
+    #[test]
+    fn test_conformance_type_coercion_edge_cases() {
+        let fconn = Connection::open(":memory:").unwrap();
+        let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let setup = [
+            "CREATE TABLE mixed (id INTEGER PRIMARY KEY, val);",
+            "INSERT INTO mixed VALUES (1, 42);",
+            "INSERT INTO mixed VALUES (2, '42');",
+            "INSERT INTO mixed VALUES (3, 42.0);",
+            "INSERT INTO mixed VALUES (4, '42.0');",
+            "INSERT INTO mixed VALUES (5, 'abc');",
+            "INSERT INTO mixed VALUES (6, NULL);",
+            "INSERT INTO mixed VALUES (7, x'CAFE');",
+            "INSERT INTO mixed VALUES (8, 0);",
+            "INSERT INTO mixed VALUES (9, '');",
+            "INSERT INTO mixed VALUES (10, 0.0);",
+        ];
+        for s in &setup {
+            fconn.execute(s).unwrap();
+            rconn.execute_batch(s).unwrap();
+        }
+
+        let queries = [
+            // typeof on each
+            "SELECT id, typeof(val) FROM mixed ORDER BY id",
+            // Equality comparisons across types
+            "SELECT id FROM mixed WHERE val = 42 ORDER BY id",
+            "SELECT id FROM mixed WHERE val = '42' ORDER BY id",
+            "SELECT id FROM mixed WHERE val = 42.0 ORDER BY id",
+            // Ordering across types (SQLite sort order: NULL < INT/REAL < TEXT < BLOB)
+            "SELECT id, val FROM mixed ORDER BY val, id",
+            // CAST behavior (exclude BLOB row 7: CAST(x'CAFE' AS TEXT) produces non-UTF-8 that rusqlite cannot retrieve)
+            "SELECT id, CAST(val AS INTEGER) FROM mixed WHERE id != 7 ORDER BY id",
+            "SELECT id, CAST(val AS REAL) FROM mixed WHERE id != 7 ORDER BY id",
+            "SELECT id, CAST(val AS TEXT) FROM mixed WHERE id != 7 ORDER BY id",
+            // Arithmetic with text that looks numeric
+            "SELECT val + 0 FROM mixed WHERE typeof(val) = 'text' ORDER BY id",
+            // Comparison with zero
+            "SELECT id FROM mixed WHERE val = 0 ORDER BY id",
+            "SELECT id FROM mixed WHERE val > 0 ORDER BY id",
+            // Boolean-like comparisons
+            "SELECT id FROM mixed WHERE val ORDER BY id",
+            // total() vs sum() with NULLs
+            "SELECT sum(val), total(val) FROM mixed",
+        ];
+
+        let mismatches = oracle_compare(&fconn, &rconn, &queries);
+        if !mismatches.is_empty() {
+            for m in &mismatches {
+                eprintln!("{m}\n");
+            }
+            panic!(
+                "{} type coercion conformance mismatches found",
                 mismatches.len()
             );
         }
