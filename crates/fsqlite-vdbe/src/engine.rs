@@ -2519,7 +2519,9 @@ impl VdbeEngine {
         };
 
         // Parse old row to extract column values for index key construction.
-        let old_row = parse_record(&payload).unwrap_or_default();
+        let old_row = parse_record(&payload).ok_or_else(|| {
+            FrankenError::internal("delete_secondary_index_entries: malformed table record")
+        })?;
 
         // Delete secondary index entries for the old row using the metadata
         // registered by the codegen. For each index cursor, build the index
@@ -4098,14 +4100,18 @@ impl VdbeEngine {
                                     }
                                     if !cursor.cursor.eof() {
                                         let target_vals =
-                                            parse_record(&key_bytes).unwrap_or_default();
+                                            parse_record(&key_bytes).ok_or_else(|| {
+                                                FrankenError::internal("SeekGT: malformed seek key record")
+                                            })?;
                                         loop {
                                             if cursor.cursor.eof() {
                                                 break;
                                             }
                                             let payload = cursor.cursor.payload(&cursor.cx)?;
                                             let cur_vals =
-                                                parse_record(&payload).unwrap_or_default();
+                                                parse_record(&payload).ok_or_else(|| {
+                                                    FrankenError::internal("SeekGT: malformed cursor record")
+                                                })?;
                                             let cmp = compare_sorter_keys(
                                                 &cur_vals,
                                                 &target_vals,
@@ -4124,14 +4130,18 @@ impl VdbeEngine {
                                 Opcode::SeekLE => {
                                     if !cursor.cursor.eof() {
                                         let target_vals =
-                                            parse_record(&key_bytes).unwrap_or_default();
+                                            parse_record(&key_bytes).ok_or_else(|| {
+                                                FrankenError::internal("SeekLE: malformed seek key record")
+                                            })?;
                                         loop {
                                             if cursor.cursor.eof() {
                                                 break;
                                             }
                                             let payload = cursor.cursor.payload(&cursor.cx)?;
                                             let cur_vals =
-                                                parse_record(&payload).unwrap_or_default();
+                                                parse_record(&payload).ok_or_else(|| {
+                                                    FrankenError::internal("SeekLE: malformed cursor record")
+                                                })?;
                                             let cmp = compare_sorter_keys(
                                                 &cur_vals,
                                                 &target_vals,
@@ -5354,7 +5364,7 @@ impl VdbeEngine {
                 Opcode::IdxLE | Opcode::IdxGT | Opcode::IdxLT | Opcode::IdxGE => {
                     let cursor_id = op.p1;
                     let probe_val = self.get_reg(op.p3).clone();
-                    let probe_fields = decode_record(&probe_val).unwrap_or_default();
+                    let probe_fields = decode_record(&probe_val)?;
 
                     // Extract current cursor key as parsed fields.
                     let cursor_fields = if let Some(sc) = self.storage_cursors.get(&cursor_id) {
@@ -5369,7 +5379,9 @@ impl VdbeEngine {
                             continue;
                         }
                         let payload = sc.cursor.payload(&sc.cx)?;
-                        parse_record(&payload).unwrap_or_default()
+                        parse_record(&payload).ok_or_else(|| {
+                            FrankenError::internal("IdxCmp: malformed index record at cursor position")
+                        })?
                     } else if let Some(cursor) = self.cursors.get(&cursor_id) {
                         if let Some(pos) = cursor.position
                             && let Some(db) = self.db.as_ref()
@@ -7015,7 +7027,9 @@ fn find_conflicting_rowid_in_index(
     sc.cursor.index_move_to(&sc.cx, key_bytes)?;
 
     // The new key we're trying to insert — parse its prefix for comparison.
-    let new_fields = parse_record(key_bytes).unwrap_or_default();
+    let new_fields = parse_record(key_bytes).ok_or_else(|| {
+        FrankenError::internal("find_conflicting_rowid: malformed new index key")
+    })?;
 
     // Check the entry at current position and previous entry for a prefix match.
     for attempt in 0..2 {
@@ -7029,7 +7043,9 @@ fn find_conflicting_rowid_in_index(
         }
 
         let entry_bytes = sc.cursor.payload(&sc.cx)?;
-        let entry_fields = parse_record(&entry_bytes).unwrap_or_default();
+        let entry_fields = parse_record(&entry_bytes).ok_or_else(|| {
+            FrankenError::internal("find_conflicting_rowid: malformed index entry record")
+        })?;
 
         // Check if the indexed columns (excluding the trailing rowid) match
         // and none of them are NULL.
