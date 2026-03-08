@@ -119,9 +119,11 @@ fn bench_vectorized_scan_throughput(c: &mut Criterion) {
             &fixture,
             |b, fixture| {
                 b.iter(|| {
+                    let cx = Cx::new();
                     let cursor =
                         BtCursor::new(fixture.io.clone(), fixture.root_page, PAGE_SIZE, true);
                     let mut scan = VectorizedTableScan::try_new(
+                        &cx,
                         cursor,
                         fixture.specs.clone(),
                         DEFAULT_BATCH_ROW_CAPACITY,

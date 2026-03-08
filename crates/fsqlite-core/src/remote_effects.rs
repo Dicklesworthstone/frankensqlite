@@ -9,17 +9,47 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
+#[cfg(not(feature = "native"))]
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::thread;
+use std::time::Duration;
+#[cfg(not(feature = "native"))]
+use std::time::Instant;
+#[cfg(feature = "native")]
+use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(feature = "native")]
+use asupersync::combinator::bulkhead::{
+    Bulkhead as AdmissionBulkhead, BulkheadError as AdmissionBulkheadError,
+    BulkheadMetrics as AdmissionBulkheadMetrics, BulkheadPermit as AdmissionPermit, BulkheadPolicy,
+};
+#[cfg(feature = "native")]
+use asupersync::types::Time as AdmissionTime;
 use blake3::Hasher;
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::cx::{Cx, cap};
 use fsqlite_types::{IdempotencyKey, ObjectId, RemoteCap, Saga};
 use tracing::{debug, info, warn};
 
-use crate::{Bulkhead, BulkheadConfig, OverflowPolicy, available_parallelism_or_one};
+#[cfg(not(feature = "native"))]
+use crate::Bulkhead as AdmissionBulkhead;
+#[cfg(feature = "native")]
+use crate::available_parallelism_or_one;
+#[cfg(not(feature = "native"))]
+use crate::{
+    BulkheadConfig, BulkheadPermit as AdmissionPermit, OverflowPolicy, available_parallelism_or_one,
+};
 
 const BEAD_ID: &str = "bd-numl";
 const MAX_BALANCED_REMOTE_IN_FLIGHT: usize = 8;
+const REMOTE_EFFECTS_EXECUTOR_NAME: &str = "fsqlite.remote_effects";
+#[allow(dead_code)]
+pub(crate) const TIERED_STORAGE_EXECUTOR_NAME: &str = "fsqlite.tiered_storage";
+#[allow(dead_code)]
+const DEFAULT_TIERED_STORAGE_QUEUE_DEPTH: usize = 1;
+#[allow(dead_code)]
+const DEFAULT_TIERED_STORAGE_QUEUE_TIMEOUT: Duration = Duration::from_millis(250);
+const ADMISSION_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 /// Domain separator for deterministic remote idempotency keys.
 pub const REMOTE_IDEMPOTENCY_DOMAIN: &str = "fsqlite:remote:v1";
@@ -302,10 +332,40 @@ pub const fn conservative_remote_max_in_flight(parallelism: usize) -> usize {
     }
 }
 
+/// Snapshotted admission state for remote work.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AdmissionSnapshot {
+    pub active_permits: usize,
+    pub queue_depth: usize,
+    pub total_rejected: u64,
+    pub total_cancelled: u64,
+}
+
+#[cfg(feature = "native")]
+#[must_use]
+fn admission_now() -> AdmissionTime {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let millis = u64::try_from(millis).unwrap_or(u64::MAX);
+    AdmissionTime::from_millis(millis)
+}
+
 /// Executor for remote operations guarded by a global bulkhead.
 #[derive(Debug)]
 pub struct Executor {
-    bulkhead: Bulkhead,
+    name: &'static str,
+    max_in_flight: usize,
+    max_queue: usize,
+    queue_timeout: Duration,
+    bulkhead: AdmissionBulkhead,
+    #[cfg(not(feature = "native"))]
+    queued_waiters: AtomicUsize,
+    #[cfg(not(feature = "native"))]
+    total_rejected: AtomicU64,
+    #[cfg(not(feature = "native"))]
+    total_cancelled: AtomicU64,
 }
 
 impl Executor {
@@ -331,32 +391,550 @@ impl Executor {
     ///
     /// Returns `FrankenError::OutOfRange` if `max_in_flight == 0`.
     pub fn with_max_in_flight(max_in_flight: usize) -> Result<Self> {
-        let config =
-            BulkheadConfig::new(max_in_flight, 0, OverflowPolicy::DropBusy).ok_or_else(|| {
-                FrankenError::OutOfRange {
-                    what: "remote_max_in_flight".to_owned(),
-                    value: max_in_flight.to_string(),
-                }
-            })?;
-        Ok(Self {
-            bulkhead: Bulkhead::new(config),
-        })
+        Self::with_limits(
+            REMOTE_EFFECTS_EXECUTOR_NAME,
+            max_in_flight,
+            0,
+            Duration::ZERO,
+        )
     }
 
     #[must_use]
     pub fn balanced_default() -> Self {
         let p = available_parallelism_or_one();
         let max_in_flight = conservative_remote_max_in_flight(p);
-        let config = BulkheadConfig::new(max_in_flight, 0, OverflowPolicy::DropBusy)
-            .expect("remote balanced max_in_flight is always >= 1");
-        Self {
-            bulkhead: Bulkhead::new(config),
+        Self::with_max_in_flight(max_in_flight)
+            .expect("remote balanced max_in_flight is always >= 1")
+    }
+
+    /// Low-risk first production rollout slice for `bd-28z4i.6`: keep the
+    /// existing conservative concurrency cap, but allow one bounded waiter so
+    /// `&Cx` cancellation can unwind tiered-storage remote admission cleanly.
+    #[must_use]
+    #[allow(dead_code)]
+    pub(crate) fn balanced_tiered_storage_default() -> Self {
+        let p = available_parallelism_or_one();
+        let max_in_flight = conservative_remote_max_in_flight(p);
+        Self::with_limits(
+            TIERED_STORAGE_EXECUTOR_NAME,
+            max_in_flight,
+            DEFAULT_TIERED_STORAGE_QUEUE_DEPTH,
+            DEFAULT_TIERED_STORAGE_QUEUE_TIMEOUT,
+        )
+        .expect("tiered storage balanced max_in_flight is always >= 1")
+    }
+
+    /// Create a named executor with explicit queue bounds.
+    ///
+    /// # Errors
+    ///
+    /// Returns `FrankenError::OutOfRange` when any configured limit does not
+    /// fit the underlying admission controller.
+    pub(crate) fn with_limits(
+        name: &'static str,
+        max_in_flight: usize,
+        max_queue: usize,
+        queue_timeout: Duration,
+    ) -> Result<Self> {
+        let max_in_flight_u32 =
+            u32::try_from(max_in_flight).map_err(|_| FrankenError::OutOfRange {
+                what: format!("{name}.max_in_flight"),
+                value: max_in_flight.to_string(),
+            })?;
+        if max_in_flight_u32 == 0 {
+            return Err(FrankenError::OutOfRange {
+                what: format!("{name}.max_in_flight"),
+                value: max_in_flight.to_string(),
+            });
         }
+        #[cfg(feature = "native")]
+        let bulkhead = {
+            let max_queue_u32 = u32::try_from(max_queue).map_err(|_| FrankenError::OutOfRange {
+                what: format!("{name}.max_queue"),
+                value: max_queue.to_string(),
+            })?;
+            AdmissionBulkhead::new(BulkheadPolicy {
+                name: name.to_owned(),
+                max_concurrent: max_in_flight_u32,
+                max_queue: max_queue_u32,
+                queue_timeout,
+                weighted: false,
+                on_full: None,
+            })
+        };
+        #[cfg(not(feature = "native"))]
+        let bulkhead = {
+            let config = BulkheadConfig::new(max_in_flight, 0, OverflowPolicy::DropBusy)
+                .ok_or_else(|| FrankenError::OutOfRange {
+                    what: format!("{name}.max_in_flight"),
+                    value: max_in_flight.to_string(),
+                })?;
+            AdmissionBulkhead::new(config)
+        };
+
+        Ok(Self {
+            name,
+            max_in_flight,
+            max_queue,
+            queue_timeout,
+            bulkhead,
+            #[cfg(not(feature = "native"))]
+            queued_waiters: AtomicUsize::new(0),
+            #[cfg(not(feature = "native"))]
+            total_rejected: AtomicU64::new(0),
+            #[cfg(not(feature = "native"))]
+            total_cancelled: AtomicU64::new(0),
+        })
     }
 
     #[must_use]
-    pub fn bulkhead(&self) -> &Bulkhead {
-        &self.bulkhead
+    pub const fn name(&self) -> &'static str {
+        self.name
+    }
+
+    #[must_use]
+    pub const fn max_in_flight(&self) -> usize {
+        self.max_in_flight
+    }
+
+    #[must_use]
+    pub const fn max_queue(&self) -> usize {
+        self.max_queue
+    }
+
+    #[must_use]
+    pub fn snapshot(&self) -> AdmissionSnapshot {
+        #[cfg(feature = "native")]
+        {
+            let metrics: AdmissionBulkheadMetrics = self.bulkhead.metrics();
+            AdmissionSnapshot {
+                #[allow(clippy::cast_possible_truncation)]
+                active_permits: metrics.active_permits as usize,
+                #[allow(clippy::cast_possible_truncation)]
+                queue_depth: metrics.queue_depth as usize,
+                total_rejected: metrics.total_rejected,
+                total_cancelled: metrics.total_cancelled,
+            }
+        }
+        #[cfg(not(feature = "native"))]
+        {
+            AdmissionSnapshot {
+                active_permits: self.bulkhead.in_flight(),
+                queue_depth: self.queued_waiters.load(Ordering::Acquire),
+                total_rejected: self.total_rejected.load(Ordering::Acquire),
+                total_cancelled: self.total_cancelled.load(Ordering::Acquire),
+            }
+        }
+    }
+
+    #[cfg(not(feature = "native"))]
+    fn reserve_fallback_waiter(&self) -> bool {
+        loop {
+            let current = self.queued_waiters.load(Ordering::Acquire);
+            if current >= self.max_queue {
+                return false;
+            }
+            let next = current + 1;
+            if self
+                .queued_waiters
+                .compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return true;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn try_acquire_for_testing(&self) -> Option<AdmissionPermit<'_>> {
+        #[cfg(feature = "native")]
+        {
+            self.bulkhead.try_acquire(1)
+        }
+        #[cfg(not(feature = "native"))]
+        {
+            self.bulkhead.try_acquire().ok()
+        }
+    }
+
+    pub(crate) fn run<Caps, T, F>(
+        &self,
+        cx: &Cx<Caps>,
+        effect_name: &str,
+        saga: Option<Saga>,
+        idempotency_key: Option<IdempotencyKey>,
+        ecs_epoch: u64,
+        operation: F,
+    ) -> Result<T>
+    where
+        Caps: cap::SubsetOf<cap::All>,
+        F: FnOnce() -> Result<T>,
+    {
+        let _permit = self.acquire(cx, effect_name, saga, idempotency_key, ecs_epoch)?;
+        cx.checkpoint().map_err(|_| {
+            let snapshot = self.snapshot();
+            warn!(
+                bead_id = BEAD_ID,
+                executor = self.name,
+                effect_name,
+                saga_id = format_saga(saga),
+                idempotency_key = format_key(idempotency_key),
+                ecs_epoch,
+                admission = "cancelled_post_acquire",
+                active_permits = snapshot.active_permits,
+                queue_depth = snapshot.queue_depth,
+                total_cancelled = snapshot.total_cancelled,
+                "remote operation cancelled after admission and before dispatch"
+            );
+            FrankenError::Busy
+        })?;
+        match operation() {
+            Ok(out) => {
+                let snapshot = self.snapshot();
+                info!(
+                    bead_id = BEAD_ID,
+                    executor = self.name,
+                    effect_name,
+                    saga_id = format_saga(saga),
+                    idempotency_key = format_key(idempotency_key),
+                    ecs_epoch,
+                    active_permits = snapshot.active_permits,
+                    queue_depth = snapshot.queue_depth,
+                    "remote operation completed under admission control"
+                );
+                Ok(out)
+            }
+            Err(err) => {
+                let snapshot = self.snapshot();
+                warn!(
+                    bead_id = BEAD_ID,
+                    executor = self.name,
+                    effect_name,
+                    saga_id = format_saga(saga),
+                    idempotency_key = format_key(idempotency_key),
+                    ecs_epoch,
+                    active_permits = snapshot.active_permits,
+                    queue_depth = snapshot.queue_depth,
+                    error = %err,
+                    "remote operation failed under admission control"
+                );
+                Err(err)
+            }
+        }
+    }
+
+    fn acquire<Caps>(
+        &self,
+        cx: &Cx<Caps>,
+        effect_name: &str,
+        saga: Option<Saga>,
+        idempotency_key: Option<IdempotencyKey>,
+        ecs_epoch: u64,
+    ) -> Result<AdmissionPermit<'_>>
+    where
+        Caps: cap::SubsetOf<cap::All>,
+    {
+        cx.checkpoint().map_err(|_| FrankenError::Busy)?;
+
+        #[cfg(feature = "native")]
+        {
+            if let Some(permit) = self.bulkhead.try_acquire(1) {
+                let snapshot = self.snapshot();
+                debug!(
+                    bead_id = BEAD_ID,
+                    executor = self.name,
+                    effect_name,
+                    saga_id = format_saga(saga),
+                    idempotency_key = format_key(idempotency_key),
+                    ecs_epoch,
+                    admission = "immediate",
+                    active_permits = snapshot.active_permits,
+                    queue_depth = snapshot.queue_depth,
+                    max_in_flight = self.max_in_flight,
+                    max_queue = self.max_queue,
+                    "remote admission granted immediately"
+                );
+                return Ok(permit);
+            }
+
+            let snapshot = self.snapshot();
+            if self.max_queue == 0 {
+                warn!(
+                    bead_id = BEAD_ID,
+                    executor = self.name,
+                    effect_name,
+                    saga_id = format_saga(saga),
+                    idempotency_key = format_key(idempotency_key),
+                    ecs_epoch,
+                    admission = "rejected",
+                    active_permits = snapshot.active_permits,
+                    queue_depth = snapshot.queue_depth,
+                    total_rejected = snapshot.total_rejected,
+                    "remote admission saturated"
+                );
+                return Err(FrankenError::Busy);
+            }
+
+            let queued_at = admission_now();
+            let entry_id = match self.bulkhead.enqueue(1, queued_at) {
+                Ok(entry_id) => entry_id,
+                Err(AdmissionBulkheadError::Full | AdmissionBulkheadError::QueueFull) => {
+                    let snapshot = self.snapshot();
+                    warn!(
+                        bead_id = BEAD_ID,
+                        executor = self.name,
+                        effect_name,
+                        saga_id = format_saga(saga),
+                        idempotency_key = format_key(idempotency_key),
+                        ecs_epoch,
+                        admission = "rejected",
+                        active_permits = snapshot.active_permits,
+                        queue_depth = snapshot.queue_depth,
+                        total_rejected = snapshot.total_rejected,
+                        "remote admission queue full"
+                    );
+                    return Err(FrankenError::Busy);
+                }
+                Err(
+                    AdmissionBulkheadError::QueueTimeout { .. } | AdmissionBulkheadError::Cancelled,
+                ) => {
+                    return Err(FrankenError::Busy);
+                }
+                Err(AdmissionBulkheadError::Inner(())) => unreachable!(),
+            };
+
+            let snapshot = self.snapshot();
+            debug!(
+                bead_id = BEAD_ID,
+                executor = self.name,
+                effect_name,
+                saga_id = format_saga(saga),
+                idempotency_key = format_key(idempotency_key),
+                ecs_epoch,
+                admission = "queued",
+                entry_id,
+                queue_depth = snapshot.queue_depth,
+                queue_timeout_ms = self.queue_timeout.as_millis(),
+                "remote admission queued"
+            );
+
+            loop {
+                if cx.checkpoint().is_err() {
+                    self.bulkhead.cancel_entry(entry_id, admission_now());
+                    let snapshot = self.snapshot();
+                    warn!(
+                        bead_id = BEAD_ID,
+                        executor = self.name,
+                        effect_name,
+                        saga_id = format_saga(saga),
+                        idempotency_key = format_key(idempotency_key),
+                        ecs_epoch,
+                        admission = "cancelled",
+                        entry_id,
+                        queue_depth = snapshot.queue_depth,
+                        total_cancelled = snapshot.total_cancelled,
+                        "remote admission cancelled while waiting"
+                    );
+                    return Err(FrankenError::Busy);
+                }
+
+                let now = admission_now();
+                match self.bulkhead.check_entry(entry_id, now) {
+                    Ok(Some(permit)) => {
+                        let waited_ms = now.as_millis().saturating_sub(queued_at.as_millis());
+                        let snapshot = self.snapshot();
+                        debug!(
+                            bead_id = BEAD_ID,
+                            executor = self.name,
+                            effect_name,
+                            saga_id = format_saga(saga),
+                            idempotency_key = format_key(idempotency_key),
+                            ecs_epoch,
+                            admission = "dequeued",
+                            entry_id,
+                            waited_ms,
+                            active_permits = snapshot.active_permits,
+                            queue_depth = snapshot.queue_depth,
+                            "remote admission granted from queue"
+                        );
+                        return Ok(permit);
+                    }
+                    Ok(None) => thread::sleep(ADMISSION_POLL_INTERVAL),
+                    Err(AdmissionBulkheadError::QueueTimeout { waited }) => {
+                        let snapshot = self.snapshot();
+                        warn!(
+                            bead_id = BEAD_ID,
+                            executor = self.name,
+                            effect_name,
+                            saga_id = format_saga(saga),
+                            idempotency_key = format_key(idempotency_key),
+                            ecs_epoch,
+                            admission = "timed_out",
+                            entry_id,
+                            waited_ms = waited.as_millis(),
+                            queue_depth = snapshot.queue_depth,
+                            total_rejected = snapshot.total_rejected,
+                            "remote admission queue timeout"
+                        );
+                        return Err(FrankenError::Busy);
+                    }
+                    Err(
+                        AdmissionBulkheadError::Cancelled
+                        | AdmissionBulkheadError::Full
+                        | AdmissionBulkheadError::QueueFull,
+                    ) => {
+                        return Err(FrankenError::Busy);
+                    }
+                    Err(AdmissionBulkheadError::Inner(())) => unreachable!(),
+                }
+            }
+        }
+
+        #[cfg(not(feature = "native"))]
+        {
+            if let Ok(permit) = self.bulkhead.try_acquire() {
+                let snapshot = self.snapshot();
+                debug!(
+                    bead_id = BEAD_ID,
+                    executor = self.name,
+                    effect_name,
+                    saga_id = format_saga(saga),
+                    idempotency_key = format_key(idempotency_key),
+                    ecs_epoch,
+                    admission = "immediate",
+                    active_permits = snapshot.active_permits,
+                    queue_depth = snapshot.queue_depth,
+                    max_in_flight = self.max_in_flight,
+                    max_queue = self.max_queue,
+                    "remote admission granted via local fallback bulkhead"
+                );
+                return Ok(permit);
+            }
+
+            if self.max_queue == 0 {
+                self.total_rejected.fetch_add(1, Ordering::AcqRel);
+                let snapshot = self.snapshot();
+                warn!(
+                    bead_id = BEAD_ID,
+                    executor = self.name,
+                    effect_name,
+                    saga_id = format_saga(saga),
+                    idempotency_key = format_key(idempotency_key),
+                    ecs_epoch,
+                    admission = "rejected",
+                    active_permits = snapshot.active_permits,
+                    queue_depth = snapshot.queue_depth,
+                    total_rejected = snapshot.total_rejected,
+                    "remote admission saturated"
+                );
+                return Err(FrankenError::Busy);
+            }
+
+            if !self.reserve_fallback_waiter() {
+                self.total_rejected.fetch_add(1, Ordering::AcqRel);
+                let snapshot = self.snapshot();
+                warn!(
+                    bead_id = BEAD_ID,
+                    executor = self.name,
+                    effect_name,
+                    saga_id = format_saga(saga),
+                    idempotency_key = format_key(idempotency_key),
+                    ecs_epoch,
+                    admission = "rejected",
+                    active_permits = snapshot.active_permits,
+                    queue_depth = snapshot.queue_depth,
+                    total_rejected = snapshot.total_rejected,
+                    "remote admission queue full"
+                );
+                return Err(FrankenError::Busy);
+            }
+
+            let queued_at = Instant::now();
+            let queued = FallbackQueueReservation::new(&self.queued_waiters);
+            let snapshot = self.snapshot();
+            debug!(
+                bead_id = BEAD_ID,
+                executor = self.name,
+                effect_name,
+                saga_id = format_saga(saga),
+                idempotency_key = format_key(idempotency_key),
+                ecs_epoch,
+                admission = "queued",
+                queue_depth = snapshot.queue_depth,
+                queue_timeout_ms = self.queue_timeout.as_millis(),
+                "remote admission queued via local fallback bulkhead"
+            );
+
+            loop {
+                if cx.checkpoint().is_err() {
+                    self.total_cancelled.fetch_add(1, Ordering::AcqRel);
+                    queued.release();
+                    let snapshot = self.snapshot();
+                    warn!(
+                        bead_id = BEAD_ID,
+                        executor = self.name,
+                        effect_name,
+                        saga_id = format_saga(saga),
+                        idempotency_key = format_key(idempotency_key),
+                        ecs_epoch,
+                        admission = "cancelled",
+                        queue_depth = snapshot.queue_depth,
+                        total_cancelled = snapshot.total_cancelled,
+                        "remote admission cancelled while waiting"
+                    );
+                    return Err(FrankenError::Busy);
+                }
+
+                match self.bulkhead.try_acquire() {
+                    Ok(permit) => {
+                        let waited_ms =
+                            u64::try_from(queued_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+                        queued.release();
+                        let snapshot = self.snapshot();
+                        debug!(
+                            bead_id = BEAD_ID,
+                            executor = self.name,
+                            effect_name,
+                            saga_id = format_saga(saga),
+                            idempotency_key = format_key(idempotency_key),
+                            ecs_epoch,
+                            admission = "dequeued",
+                            waited_ms,
+                            active_permits = snapshot.active_permits,
+                            queue_depth = snapshot.queue_depth,
+                            "remote admission granted from local fallback queue"
+                        );
+                        return Ok(permit);
+                    }
+                    Err(FrankenError::Busy) => {
+                        if queued_at.elapsed() >= self.queue_timeout {
+                            self.total_rejected.fetch_add(1, Ordering::AcqRel);
+                            let waited_ms =
+                                u64::try_from(queued_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+                            queued.release();
+                            let snapshot = self.snapshot();
+                            warn!(
+                                bead_id = BEAD_ID,
+                                executor = self.name,
+                                effect_name,
+                                saga_id = format_saga(saga),
+                                idempotency_key = format_key(idempotency_key),
+                                ecs_epoch,
+                                admission = "timed_out",
+                                waited_ms,
+                                queue_depth = snapshot.queue_depth,
+                                total_rejected = snapshot.total_rejected,
+                                "remote admission queue timeout"
+                            );
+                            return Err(FrankenError::Busy);
+                        }
+                        thread::sleep(ADMISSION_POLL_INTERVAL);
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+        }
     }
 
     /// Execute a named remote computation through the global remote bulkhead.
@@ -383,8 +961,6 @@ impl Executor {
     {
         let _cap = require_remote_cap(cx, remote_cap)?;
         registry.validate(&computation.name)?;
-        let _permit = self.bulkhead.try_acquire()?;
-
         debug!(
             bead_id = BEAD_ID,
             trace_id = trace.trace_id,
@@ -397,8 +973,14 @@ impl Executor {
             schedule_fingerprint = ?trace.schedule_fingerprint,
             "dispatching named remote computation"
         );
-
-        let out = operation()?;
+        let out = self.run(
+            cx,
+            computation.name.as_str(),
+            trace.saga_id,
+            trace.idempotency_key,
+            trace.ecs_epoch,
+            operation,
+        )?;
 
         info!(
             bead_id = BEAD_ID,
@@ -917,12 +1499,48 @@ fn hex16(bytes: &[u8; 16]) -> String {
     out
 }
 
+#[cfg(not(feature = "native"))]
+#[derive(Debug)]
+struct FallbackQueueReservation<'a> {
+    queued_waiters: &'a AtomicUsize,
+    released: bool,
+}
+
+#[cfg(not(feature = "native"))]
+impl FallbackQueueReservation<'_> {
+    fn new(queued_waiters: &AtomicUsize) -> FallbackQueueReservation<'_> {
+        FallbackQueueReservation {
+            queued_waiters,
+            released: false,
+        }
+    }
+
+    fn release(mut self) {
+        if !self.released {
+            self.queued_waiters.fetch_sub(1, Ordering::AcqRel);
+            self.released = true;
+        }
+    }
+}
+
+#[cfg(not(feature = "native"))]
+impl Drop for FallbackQueueReservation<'_> {
+    fn drop(&mut self) {
+        if !self.released {
+            self.queued_waiters.fetch_sub(1, Ordering::AcqRel);
+            self.released = true;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
     use std::time::Duration;
+    #[cfg(not(feature = "native"))]
+    use std::time::Instant;
 
     use super::*;
 
@@ -932,6 +1550,18 @@ mod tests {
 
     fn segment_id(seed: u8) -> ObjectId {
         ObjectId::from_bytes([seed; 16])
+    }
+
+    #[cfg(not(feature = "native"))]
+    fn wait_for(condition: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_millis(250);
+        while Instant::now() < deadline {
+            if condition() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(condition(), "timed out waiting for condition");
     }
 
     #[test]
@@ -1137,7 +1767,62 @@ mod tests {
     fn test_remote_bulkhead_zero_means_auto() {
         let expected = conservative_remote_max_in_flight(available_parallelism_or_one());
         let executor = Executor::from_pragma_remote_max_in_flight(0).unwrap();
-        assert_eq!(executor.bulkhead().config().max_concurrent, expected);
+        assert_eq!(executor.max_in_flight(), expected);
+    }
+
+    #[cfg(not(feature = "native"))]
+    #[test]
+    fn test_remote_bulkhead_fallback_queue_waits_for_capacity() {
+        let executor = Arc::new(
+            Executor::with_limits("fallback.test", 1, 1, Duration::from_millis(100)).unwrap(),
+        );
+        let held = executor.try_acquire_for_testing().unwrap();
+
+        let exec = Arc::clone(&executor);
+        let waiter = thread::spawn(move || {
+            let cx = Cx::<cap::All>::new();
+            let permit = exec.acquire(&cx, "segment_stat", None, None, 0).unwrap();
+            drop(permit);
+        });
+
+        wait_for(|| executor.snapshot().queue_depth == 1);
+        assert_eq!(executor.snapshot().active_permits, 1);
+
+        drop(held);
+        waiter.join().unwrap();
+
+        let snapshot = executor.snapshot();
+        assert_eq!(snapshot.queue_depth, 0);
+        assert_eq!(snapshot.total_rejected, 0);
+        assert_eq!(snapshot.total_cancelled, 0);
+    }
+
+    #[cfg(not(feature = "native"))]
+    #[test]
+    fn test_remote_bulkhead_fallback_cancellation_releases_queue_slot() {
+        let executor = Arc::new(
+            Executor::with_limits("fallback.test", 1, 1, Duration::from_millis(100)).unwrap(),
+        );
+        let held = executor.try_acquire_for_testing().unwrap();
+        let cx = Cx::<cap::All>::new();
+        let waiter_cx = cx.clone();
+
+        let exec = Arc::clone(&executor);
+        let waiter = thread::spawn(move || {
+            let err = exec
+                .acquire(&waiter_cx, "segment_stat", None, None, 0)
+                .unwrap_err();
+            assert!(matches!(err, FrankenError::Busy));
+        });
+
+        wait_for(|| executor.snapshot().queue_depth == 1);
+        cx.cancel();
+        waiter.join().unwrap();
+        drop(held);
+
+        let snapshot = executor.snapshot();
+        assert_eq!(snapshot.queue_depth, 0);
+        assert_eq!(snapshot.total_cancelled, 1);
     }
 
     #[test]

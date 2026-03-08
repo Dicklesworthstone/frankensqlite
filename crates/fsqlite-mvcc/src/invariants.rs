@@ -772,6 +772,12 @@ impl VersionStore {
         self.page_size
     }
 
+    /// Count the number of pages currently tracked by the version store.
+    #[must_use]
+    pub fn page_count(&self) -> usize {
+        self.chain_heads.page_count()
+    }
+
     /// Run one incremental GC pass: prune version chains for pages in the todo queue.
     ///
     /// This method acquires write locks on the arena and chain heads, then delegates

@@ -796,6 +796,13 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
         let _ = self.inner.native_cx.set(native_cx);
     }
 
+    /// Return the attached native asupersync context, if one exists.
+    #[cfg(feature = "native")]
+    #[must_use]
+    pub fn attached_native_cx(&self) -> Option<NativeCx> {
+        self.inner.native_cx.get().cloned()
+    }
+
     /// Remove the currently attached native asupersync context.
     #[cfg(feature = "native")]
     pub fn clear_native_cx(&self) {

@@ -9,6 +9,7 @@
 use std::collections::VecDeque;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use asupersync::error::ErrorKind as AsErrorKind;
 use asupersync::raptorq::{RaptorQReceiverBuilder, RaptorQSenderBuilder};
@@ -17,10 +18,12 @@ use asupersync::security::authenticated::AuthenticatedSymbol;
 use asupersync::transport::error::{SinkError, StreamError};
 use asupersync::transport::sink::SymbolSink;
 use asupersync::transport::stream::SymbolStream;
+use asupersync::types::Time as AsTime;
 use asupersync::types::{ObjectId as AsObjectId, ObjectParams, Symbol, SymbolId, SymbolKind};
-use asupersync::{Cx as AsCx, RaptorQConfig};
+use asupersync::{Budget as AsBudget, Cx as AsCx, RaptorQConfig};
 
 use fsqlite_error::{FrankenError, Result};
+use fsqlite_types::cx::Cx;
 
 use crate::raptorq_integration::{
     CodecDecodeResult, CodecEncodeResult, DecodeFailureReason, SymbolCodec,
@@ -203,6 +206,59 @@ impl Default for AsupersyncCodec {
     }
 }
 
+fn native_budget_from_local(cx: &Cx) -> AsBudget {
+    let budget = cx.budget();
+    let mut native_budget = AsBudget::new()
+        .with_poll_quota(budget.poll_quota)
+        .with_priority(budget.priority);
+    if let Some(cost_quota) = budget.cost_quota {
+        native_budget = native_budget.with_cost_quota(cost_quota);
+    }
+    if let Some(deadline) = budget.deadline {
+        native_budget = native_budget.with_deadline(local_deadline_to_native_time(deadline));
+    }
+    native_budget
+}
+
+fn wall_clock_now_since_epoch() -> Duration {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+}
+
+fn local_deadline_to_native_time(deadline: Duration) -> AsTime {
+    let absolute_deadline = wall_clock_now_since_epoch()
+        .checked_add(deadline)
+        .unwrap_or(Duration::MAX);
+    let nanos = u64::try_from(absolute_deadline.as_nanos()).unwrap_or(u64::MAX);
+    AsTime::from_nanos(nanos)
+}
+
+fn is_native_abort(kind: AsErrorKind) -> bool {
+    matches!(
+        kind,
+        AsErrorKind::Cancelled
+            | AsErrorKind::CancelTimeout
+            | AsErrorKind::DeadlineExceeded
+            | AsErrorKind::PollQuotaExhausted
+            | AsErrorKind::CostQuotaExhausted
+    )
+}
+
+fn derive_native_request_cx(cx: &Cx) -> (Cx, AsCx) {
+    let codec_cx = cx.create_child();
+    if let Some(reason) = cx.cancel_reason() {
+        codec_cx.cancel_with_reason(reason);
+    } else if cx.is_cancel_requested() {
+        codec_cx.cancel();
+    }
+    let native_cx = cx
+        .attached_native_cx()
+        .unwrap_or_else(|| AsCx::for_request_with_budget(native_budget_from_local(&codec_cx)));
+    codec_cx.set_native_cx(native_cx.clone());
+    (codec_cx, native_cx)
+}
+
 #[allow(
     clippy::cast_possible_truncation,
     clippy::cast_lossless,
@@ -212,6 +268,7 @@ impl Default for AsupersyncCodec {
 impl SymbolCodec for AsupersyncCodec {
     fn encode(
         &self,
+        cx: &Cx,
         source_data: &[u8],
         symbol_size: u32,
         repair_overhead: f64,
@@ -221,7 +278,8 @@ impl SymbolCodec for AsupersyncCodec {
         config.encoding.max_block_size = self.max_block_size;
         config.encoding.repair_overhead = repair_overhead;
 
-        let cx = AsCx::for_testing();
+        let (codec_cx, native_cx) = derive_native_request_cx(cx);
+        codec_cx.checkpoint().map_err(|_| FrankenError::Abort)?;
         let object_id = AsObjectId::new_for_test(PRODUCTION_OBJECT_ID);
         let mut sender = RaptorQSenderBuilder::new()
             .config(config)
@@ -230,8 +288,14 @@ impl SymbolCodec for AsupersyncCodec {
             .map_err(|e| FrankenError::Internal(format!("{BEAD_ID}: sender build: {e}")))?;
 
         let outcome = sender
-            .send_object(&cx, object_id, source_data)
-            .map_err(|e| FrankenError::Internal(format!("{BEAD_ID}: send_object: {e}")))?;
+            .send_object(&native_cx, object_id, source_data)
+            .map_err(|e| {
+                if is_native_abort(e.kind()) {
+                    FrankenError::Abort
+                } else {
+                    FrankenError::Internal(format!("{BEAD_ID}: send_object: {e}"))
+                }
+            })?;
 
         let symbols = std::mem::take(&mut sender.transport_mut().symbols);
         let k = outcome.source_symbols as u32;
@@ -256,6 +320,7 @@ impl SymbolCodec for AsupersyncCodec {
 
     fn decode(
         &self,
+        cx: &Cx,
         symbols: &[(u32, Vec<u8>)],
         k_source: u32,
         symbol_size: u32,
@@ -317,20 +382,22 @@ impl SymbolCodec for AsupersyncCodec {
             ));
         }
 
-        let cx = AsCx::for_testing();
+        let (codec_cx, native_cx) = derive_native_request_cx(cx);
+        codec_cx.checkpoint().map_err(|_| FrankenError::Abort)?;
         let mut receiver = RaptorQReceiverBuilder::new()
             .config(config)
             .source(VecTransportStream::new(rebuilt))
             .build()
             .map_err(|e| FrankenError::Internal(format!("{BEAD_ID}: receiver build: {e}")))?;
 
-        match receiver.receive_object(&cx, &params) {
+        match receiver.receive_object(&native_cx, &params) {
             Ok(outcome) => Ok(CodecDecodeResult::Success {
                 data: outcome.data,
                 symbols_used: outcome.symbols_received as u32,
                 peeled_count: 0,
                 inactivated_count: 0,
             }),
+            Err(err) if is_native_abort(err.kind()) => Err(FrankenError::Abort),
             Err(err) => {
                 let reason = match err.kind() {
                     AsErrorKind::InsufficientSymbols => DecodeFailureReason::InsufficientSymbols,
@@ -353,6 +420,12 @@ impl SymbolCodec for AsupersyncCodec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use asupersync::types::CancelReason as AsCancelReason;
+    use fsqlite_types::cx::{CancelReason, Cx};
+
+    fn test_cx() -> Cx {
+        Cx::new()
+    }
 
     #[test]
     fn test_pack_unpack_source_symbol() {
@@ -397,11 +470,14 @@ mod tests {
     #[test]
     fn test_codec_encode_decode_roundtrip() {
         let codec = AsupersyncCodec::default();
+        let cx = test_cx();
         let data = vec![0xAB_u8; 4096];
         let symbol_size = 512_u32;
         let repair_overhead = 1.25;
 
-        let encoded = codec.encode(&data, symbol_size, repair_overhead).unwrap();
+        let encoded = codec
+            .encode(&cx, &data, symbol_size, repair_overhead)
+            .unwrap();
         assert!(encoded.k_source > 0);
         assert!(!encoded.source_symbols.is_empty());
         assert!(!encoded.repair_symbols.is_empty());
@@ -411,7 +487,7 @@ mod tests {
         all_symbols.extend(encoded.repair_symbols.clone());
 
         let decoded = codec
-            .decode(&all_symbols, encoded.k_source, symbol_size)
+            .decode(&cx, &all_symbols, encoded.k_source, symbol_size)
             .unwrap();
         match decoded {
             CodecDecodeResult::Success {
@@ -428,14 +504,15 @@ mod tests {
     #[test]
     fn test_codec_decode_source_only() {
         let codec = AsupersyncCodec::default();
+        let cx = test_cx();
         let data = vec![0xCD_u8; 2048];
         let symbol_size = 512_u32;
 
-        let encoded = codec.encode(&data, symbol_size, 1.25).unwrap();
+        let encoded = codec.encode(&cx, &data, symbol_size, 1.25).unwrap();
 
         // Decode with source symbols only (no repair needed).
         let decoded = codec
-            .decode(&encoded.source_symbols, encoded.k_source, symbol_size)
+            .decode(&cx, &encoded.source_symbols, encoded.k_source, symbol_size)
             .unwrap();
         match decoded {
             CodecDecodeResult::Success {
@@ -452,10 +529,11 @@ mod tests {
     #[test]
     fn test_codec_decode_with_erasures() {
         let codec = AsupersyncCodec::default();
+        let cx = test_cx();
         let data = vec![0xEF_u8; 4096];
         let symbol_size = 512_u32;
 
-        let encoded = codec.encode(&data, symbol_size, 1.5).unwrap();
+        let encoded = codec.encode(&cx, &data, symbol_size, 1.5).unwrap();
         let k = encoded.k_source as usize;
 
         // Drop first source symbol, replace with repair symbols.
@@ -465,7 +543,7 @@ mod tests {
         assert!(symbols.len() >= k, "need at least K symbols");
 
         let decoded = codec
-            .decode(&symbols, encoded.k_source, symbol_size)
+            .decode(&cx, &symbols, encoded.k_source, symbol_size)
             .unwrap();
         match decoded {
             CodecDecodeResult::Success {
@@ -482,7 +560,8 @@ mod tests {
     #[test]
     fn test_codec_decode_empty() {
         let codec = AsupersyncCodec::default();
-        let result = codec.decode(&[], 4, 512).unwrap();
+        let cx = test_cx();
+        let result = codec.decode(&cx, &[], 4, 512).unwrap();
         assert!(matches!(
             result,
             CodecDecodeResult::Failure {
@@ -501,13 +580,14 @@ mod tests {
     #[test]
     fn test_codec_custom_max_block_size() {
         let codec = AsupersyncCodec::new(128 * 1024);
+        let cx = test_cx();
         assert_eq!(codec.max_block_size, 128 * 1024);
 
         // Should still encode/decode correctly.
         let data = vec![0x42_u8; 2048];
-        let encoded = codec.encode(&data, 512, 1.25).unwrap();
+        let encoded = codec.encode(&cx, &data, 512, 1.25).unwrap();
         let decoded = codec
-            .decode(&encoded.source_symbols, encoded.k_source, 512)
+            .decode(&cx, &encoded.source_symbols, encoded.k_source, 512)
             .unwrap();
         assert!(matches!(decoded, CodecDecodeResult::Success { .. }));
     }
@@ -522,13 +602,14 @@ mod tests {
     #[test]
     fn test_codec_large_data_4096_page() {
         let codec = AsupersyncCodec::default();
+        let cx = test_cx();
         // 4 pages of 4096 bytes each.
         let data = vec![0x77_u8; 4 * 4096];
-        let encoded = codec.encode(&data, 4096, 1.25).unwrap();
+        let encoded = codec.encode(&cx, &data, 4096, 1.25).unwrap();
         assert!(encoded.k_source >= 4);
 
         let decoded = codec
-            .decode(&encoded.source_symbols, encoded.k_source, 4096)
+            .decode(&cx, &encoded.source_symbols, encoded.k_source, 4096)
             .unwrap();
         match decoded {
             CodecDecodeResult::Success {
@@ -545,10 +626,11 @@ mod tests {
     #[test]
     fn test_codec_repair_symbol_count_scales_with_overhead() {
         let codec = AsupersyncCodec::default();
+        let cx = test_cx();
         let data = vec![0x55_u8; 8192];
 
-        let low = codec.encode(&data, 512, 1.1).unwrap();
-        let high = codec.encode(&data, 512, 2.0).unwrap();
+        let low = codec.encode(&cx, &data, 512, 1.1).unwrap();
+        let high = codec.encode(&cx, &data, 512, 2.0).unwrap();
 
         // Higher overhead should produce more repair symbols.
         assert!(
@@ -567,5 +649,83 @@ mod tests {
         assert_eq!(kind, SymbolKind::Repair);
         assert_eq!(sbn, 127);
         assert_eq!(esi, 0x3F_FFFF);
+    }
+
+    #[test]
+    fn test_codec_encode_respects_cancelled_cx() {
+        let codec = AsupersyncCodec::default();
+        let cx = test_cx();
+        cx.cancel_with_reason(CancelReason::Abort);
+
+        let err = codec.encode(&cx, &[0xAB; 512], 512, 1.25).unwrap_err();
+        assert!(matches!(err, FrankenError::Abort));
+    }
+
+    #[test]
+    fn test_codec_decode_respects_cancelled_cx() {
+        let codec = AsupersyncCodec::default();
+        let setup_cx = test_cx();
+        let encoded = codec.encode(&setup_cx, &[0xBC; 512], 512, 1.25).unwrap();
+
+        let cx = test_cx();
+        cx.cancel_with_reason(CancelReason::Abort);
+
+        let err = codec
+            .decode(&cx, &encoded.source_symbols, encoded.k_source, 512)
+            .unwrap_err();
+        assert!(matches!(err, FrankenError::Abort));
+    }
+
+    #[test]
+    fn test_local_deadline_converts_to_future_native_time() {
+        let before = wall_clock_now_since_epoch();
+        let cx = Cx::with_budget(
+            fsqlite_types::cx::Budget::INFINITE.with_deadline(Duration::from_millis(50)),
+        );
+
+        let native_budget = native_budget_from_local(&cx);
+        let native_deadline = Duration::from_nanos(
+            native_budget
+                .deadline
+                .expect("native budget should carry a deadline")
+                .as_nanos(),
+        );
+        let lower_bound = before
+            .checked_add(Duration::from_millis(25))
+            .unwrap_or(Duration::MAX);
+
+        assert!(
+            native_deadline >= lower_bound,
+            "native deadline should be an absolute future instant, got {native_deadline:?}"
+        );
+    }
+
+    #[test]
+    fn test_codec_encode_respects_attached_native_cancellation() {
+        let codec = AsupersyncCodec::default();
+        let cx = test_cx();
+        let native = AsCx::for_testing();
+        cx.set_native_cx(native.clone());
+        native.set_cancel_reason(AsCancelReason::timeout());
+
+        let err = codec.encode(&cx, &[0xAB; 512], 512, 1.25).unwrap_err();
+        assert!(matches!(err, FrankenError::Abort));
+    }
+
+    #[test]
+    fn test_codec_decode_respects_attached_native_cancellation() {
+        let codec = AsupersyncCodec::default();
+        let setup_cx = test_cx();
+        let encoded = codec.encode(&setup_cx, &[0xBC; 512], 512, 1.25).unwrap();
+
+        let cx = test_cx();
+        let native = AsCx::for_testing();
+        cx.set_native_cx(native.clone());
+        native.set_cancel_reason(AsCancelReason::timeout());
+
+        let err = codec
+            .decode(&cx, &encoded.source_symbols, encoded.k_source, 512)
+            .unwrap_err();
+        assert!(matches!(err, FrankenError::Abort));
     }
 }

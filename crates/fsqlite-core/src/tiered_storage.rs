@@ -12,7 +12,8 @@
 //! - segment eviction is cancel-safe and precondition-checked
 //! - fetch path prefers systematic symbols then falls back to decode
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::cx::{Cx, cap};
@@ -24,6 +25,7 @@ use tracing::{debug, info, warn};
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::decode_proofs::{EcsDecodeProof, RejectedSymbol, SymbolDigest, SymbolRejectionReason};
+use crate::remote_effects::Executor as RemoteAdmissionExecutor;
 
 const BEAD_ID: &str = "bd-1hi.29";
 const FETCH_SYMBOLS_COMPUTATION: &str = "fsqlite:tiered:fetch_symbols:v1";
@@ -129,13 +131,7 @@ impl CommitRequest {
     /// Build a deterministic commit request from segment + symbol records.
     #[must_use]
     pub fn new(segment_id: u64, records: Vec<SymbolRecord>, ecs_epoch: u64) -> Self {
-        let mut request_bytes = Vec::with_capacity(24);
-        request_bytes.extend_from_slice(&segment_id.to_le_bytes());
-        request_bytes.extend_from_slice(
-            &u64::try_from(records.len())
-                .unwrap_or(u64::MAX)
-                .to_le_bytes(),
-        );
+        let request_bytes = segment_request_bytes(segment_id, &records);
         let idempotency_key = IdempotencyKey::derive(ecs_epoch, &request_bytes);
         let saga = Saga::new(idempotency_key);
         Self {
@@ -196,6 +192,7 @@ pub struct EvictionOutcome {
 #[derive(Debug)]
 pub struct TieredStorage {
     durability_mode: DurabilityMode,
+    remote_executor: Arc<RemoteAdmissionExecutor>,
     write_back_segment_id: u64,
     l2_segments: BTreeMap<u64, Vec<SymbolRecord>>,
     decode_audit_seq: u64,
@@ -209,16 +206,27 @@ impl Default for TieredStorage {
 }
 
 impl TieredStorage {
-    /// Create a tiered-storage controller.
-    #[must_use]
-    pub fn new(durability_mode: DurabilityMode) -> Self {
+    fn new_with_remote_executor(
+        durability_mode: DurabilityMode,
+        remote_executor: RemoteAdmissionExecutor,
+    ) -> Self {
         Self {
             durability_mode,
+            remote_executor: Arc::new(remote_executor),
             write_back_segment_id: DEFAULT_WRITE_BACK_SEGMENT_ID,
             l2_segments: BTreeMap::new(),
             decode_audit_seq: 0,
             decode_audit: Vec::new(),
         }
+    }
+
+    /// Create a tiered-storage controller.
+    #[must_use]
+    pub fn new(durability_mode: DurabilityMode) -> Self {
+        Self::new_with_remote_executor(
+            durability_mode,
+            RemoteAdmissionExecutor::balanced_tiered_storage_default(),
+        )
     }
 
     /// Current durability mode.
@@ -267,7 +275,7 @@ impl TieredStorage {
         for segment in self.l2_segments.values() {
             for record in segment {
                 if record.object_id == object_id {
-                    by_esi.entry(record.esi).or_insert_with(|| record.clone());
+                    merge_symbol_record_by_esi(&mut by_esi, record.clone());
                 }
             }
         }
@@ -306,7 +314,6 @@ impl TieredStorage {
 
         let cap = remote_cap.ok_or(FrankenError::AuthDenied)?;
         let remote_store = remote.ok_or(FrankenError::AuthDenied)?;
-        cx.checkpoint().map_err(|_| FrankenError::Busy)?;
 
         let upload_request = UploadSegmentRequest {
             segment_id: request.segment_id,
@@ -317,7 +324,14 @@ impl TieredStorage {
             remote_cap: cap,
             computation: UPLOAD_SEGMENT_COMPUTATION,
         };
-        let receipt = remote_store.upload_segment(&upload_request)?;
+        let receipt = self.remote_executor.run(
+            cx,
+            upload_request.computation,
+            Some(upload_request.saga),
+            Some(upload_request.idempotency_key),
+            upload_request.ecs_epoch,
+            || remote_store.upload_segment(&upload_request),
+        )?;
         if !self.durability_mode.quorum_satisfied(receipt.acked_stores) {
             warn!(
                 bead_id = BEAD_ID,
@@ -376,7 +390,6 @@ impl TieredStorage {
 
         let cap = remote_cap.ok_or(FrankenError::AuthDenied)?;
         let remote_store = remote.ok_or(FrankenError::AuthDenied)?;
-        cx.checkpoint().map_err(|_| FrankenError::Busy)?;
 
         let preferred_esis = preferred_source_esis(local_records.first().map(|record| record.oti));
         let idempotency_key = derive_fetch_key(object_id, &preferred_esis, ecs_epoch);
@@ -389,12 +402,20 @@ impl TieredStorage {
             remote_cap: cap,
             computation: FETCH_SYMBOLS_COMPUTATION,
         };
-        let fetched = remote_store.fetch_symbols(&fetch_request)?;
+        let fetched = self.remote_executor.run(
+            cx,
+            fetch_request.computation,
+            None,
+            Some(fetch_request.idempotency_key),
+            fetch_request.ecs_epoch,
+            || remote_store.fetch_symbols(&fetch_request),
+        )?;
         if fetched.is_empty() {
             return Err(FrankenError::Internal(format!(
                 "remote tier returned no symbols for object {object_id}"
             )));
         }
+        cx.checkpoint().map_err(|_| FrankenError::Busy)?;
 
         let merged = merge_symbol_sets(&local_records, &fetched);
         let recovered = match recover_object_hybrid(&merged) {
@@ -410,7 +431,7 @@ impl TieredStorage {
         if let Some(proof) = recovered.decode_proof.clone() {
             self.record_decode_proof(proof);
         }
-        let write_back_count = self.write_back_missing(&local_records, &fetched);
+        let write_back_count = self.write_back_repairs(&local_records, &fetched);
 
         Ok(FetchOutcome {
             bytes: recovered.bytes,
@@ -446,7 +467,7 @@ impl TieredStorage {
                 FrankenError::Internal(format!("unknown L2 segment {segment_id}"))
             })?;
 
-        let key = derive_evict_key(segment_id, ecs_epoch);
+        let key = derive_evict_key(segment_id, &records, ecs_epoch);
         let upload_request = UploadSegmentRequest {
             segment_id,
             records,
@@ -456,7 +477,14 @@ impl TieredStorage {
             remote_cap: cap,
             computation: UPLOAD_SEGMENT_COMPUTATION,
         };
-        let receipt = remote.upload_segment(&upload_request)?;
+        let receipt = self.remote_executor.run(
+            cx,
+            upload_request.computation,
+            Some(upload_request.saga),
+            Some(upload_request.idempotency_key),
+            upload_request.ecs_epoch,
+            || remote.upload_segment(&upload_request),
+        )?;
         debug!(
             bead_id = BEAD_ID,
             segment_id,
@@ -502,28 +530,34 @@ impl TieredStorage {
         })
     }
 
-    fn write_back_missing(&mut self, local: &[SymbolRecord], fetched: &[SymbolRecord]) -> usize {
-        let known_esi: BTreeSet<u32> = local.iter().map(|record| record.esi).collect();
-        let mut missing_by_esi = BTreeMap::<u32, SymbolRecord>::new();
+    fn write_back_repairs(&mut self, local: &[SymbolRecord], fetched: &[SymbolRecord]) -> usize {
+        let local_by_esi: BTreeMap<u32, &SymbolRecord> =
+            local.iter().map(|record| (record.esi, record)).collect();
+        let mut repairs_by_esi = BTreeMap::<u32, SymbolRecord>::new();
         for record in fetched {
-            if !known_esi.contains(&record.esi) {
-                missing_by_esi
-                    .entry(record.esi)
-                    .or_insert_with(|| record.clone());
+            let needs_repair = match local_by_esi.get(&record.esi) {
+                None => true,
+                Some(existing) => !existing.verify_integrity() && record.verify_integrity(),
+            };
+            if needs_repair {
+                merge_symbol_record_by_esi(&mut repairs_by_esi, record.clone());
             }
         }
-        let missing: Vec<SymbolRecord> = missing_by_esi.into_values().collect();
-        if missing.is_empty() {
+        let repairs: Vec<SymbolRecord> = repairs_by_esi.into_values().collect();
+        if repairs.is_empty() {
             return 0;
         }
-        let added = missing.len();
+        let added = repairs.len();
         let segment = self
             .l2_segments
             .entry(self.write_back_segment_id)
             .or_default();
-        segment.extend(missing);
-        segment.sort_by_key(|record| (record.object_id, record.esi));
-        segment.dedup_by(|left, right| left.object_id == right.object_id && left.esi == right.esi);
+        segment.extend(repairs);
+        let mut deduped = BTreeMap::<(ObjectId, u32), SymbolRecord>::new();
+        for record in segment.drain(..) {
+            merge_symbol_record_by_key(&mut deduped, (record.object_id, record.esi), record);
+        }
+        *segment = deduped.into_values().collect();
         added
     }
 
@@ -565,17 +599,66 @@ fn derive_fetch_key(object_id: ObjectId, preferred_esis: &[u32], ecs_epoch: u64)
     IdempotencyKey::derive(ecs_epoch, &bytes)
 }
 
-fn derive_evict_key(segment_id: u64, ecs_epoch: u64) -> IdempotencyKey {
-    IdempotencyKey::derive(ecs_epoch, &segment_id.to_le_bytes())
+fn segment_request_bytes(segment_id: u64, records: &[SymbolRecord]) -> Vec<u8> {
+    let payload_bytes = records.iter().fold(0_usize, |acc, record| {
+        acc.saturating_add(record.to_bytes().len())
+    });
+    let mut bytes = Vec::with_capacity(16 + payload_bytes + records.len().saturating_mul(8));
+    bytes.extend_from_slice(&segment_id.to_le_bytes());
+    bytes.extend_from_slice(
+        &u64::try_from(records.len())
+            .unwrap_or(u64::MAX)
+            .to_le_bytes(),
+    );
+    for record in records {
+        let record_bytes = record.to_bytes();
+        bytes.extend_from_slice(
+            &u64::try_from(record_bytes.len())
+                .unwrap_or(u64::MAX)
+                .to_le_bytes(),
+        );
+        bytes.extend_from_slice(&record_bytes);
+    }
+    bytes
+}
+
+fn derive_evict_key(segment_id: u64, records: &[SymbolRecord], ecs_epoch: u64) -> IdempotencyKey {
+    let request_bytes = segment_request_bytes(segment_id, records);
+    IdempotencyKey::derive(ecs_epoch, &request_bytes)
+}
+
+fn prefer_symbol_record(existing: &SymbolRecord, candidate: &SymbolRecord) -> bool {
+    !existing.verify_integrity() && candidate.verify_integrity()
+}
+
+fn merge_symbol_record_by_esi(by_esi: &mut BTreeMap<u32, SymbolRecord>, record: SymbolRecord) {
+    merge_symbol_record_by_key(by_esi, record.esi, record);
+}
+
+fn merge_symbol_record_by_key<K: Ord>(
+    map: &mut BTreeMap<K, SymbolRecord>,
+    key: K,
+    record: SymbolRecord,
+) {
+    match map.entry(key) {
+        std::collections::btree_map::Entry::Vacant(entry) => {
+            entry.insert(record);
+        }
+        std::collections::btree_map::Entry::Occupied(mut entry) => {
+            if prefer_symbol_record(entry.get(), &record) {
+                entry.insert(record);
+            }
+        }
+    }
 }
 
 fn merge_symbol_sets(local: &[SymbolRecord], fetched: &[SymbolRecord]) -> Vec<SymbolRecord> {
     let mut by_esi = BTreeMap::<u32, SymbolRecord>::new();
     for record in local {
-        by_esi.entry(record.esi).or_insert_with(|| record.clone());
+        merge_symbol_record_by_esi(&mut by_esi, record.clone());
     }
     for record in fetched {
-        by_esi.entry(record.esi).or_insert_with(|| record.clone());
+        merge_symbol_record_by_esi(&mut by_esi, record.clone());
     }
     by_esi.into_values().collect()
 }
@@ -892,6 +975,7 @@ fn rejection_reason_code(reason: SymbolRejectionReason) -> u8 {
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeSet, HashMap};
+    use std::time::Duration;
 
     use fsqlite_types::cx::{Cx, cap};
     use fsqlite_types::{ObjectId, Oti, SymbolRecordFlags};
@@ -910,6 +994,7 @@ mod tests {
         fetch_calls: usize,
         configured_acks: u32,
         cancel_after_upload: Option<Cx<cap::All>>,
+        cancel_after_fetch: Option<Cx<cap::All>>,
         last_fetch_preferred: Vec<u32>,
     }
 
@@ -952,6 +1037,9 @@ mod tests {
             let mut ordered = records.clone();
             ordered.sort_by_key(|record| (!preferred.contains(&record.esi), record.esi));
             ordered.truncate(request.max_symbols);
+            if let Some(cx) = self.cancel_after_fetch.take() {
+                cx.cancel();
+            }
             Ok(ordered)
         }
 
@@ -1144,6 +1232,35 @@ mod tests {
     }
 
     #[test]
+    fn test_l3_upload_idempotency_key_changes_with_segment_contents() {
+        let object_id = object_id_from_u64(22);
+        let payload_a = b"idempotent-upload-a";
+        let payload_b = b"idempotent-upload-b";
+        let records_a = make_symbol_records(object_id, payload_a, 8, 1);
+        let records_b = make_symbol_records(object_id, payload_b, 8, 1);
+
+        let request_a = CommitRequest::new(10, records_a, 11);
+        let request_b = CommitRequest::new(10, records_b, 11);
+
+        assert_ne!(request_a.idempotency_key, request_b.idempotency_key);
+        assert_ne!(request_a.saga, request_b.saga);
+    }
+
+    #[test]
+    fn test_evict_idempotency_key_changes_with_segment_contents() {
+        let object_id = object_id_from_u64(23);
+        let payload_a = b"evict-segment-a";
+        let payload_b = b"evict-segment-b";
+        let records_a = make_symbol_records(object_id, payload_a, 8, 1);
+        let records_b = make_symbol_records(object_id, payload_b, 8, 1);
+
+        let key_a = derive_evict_key(40, &records_a, 12);
+        let key_b = derive_evict_key(40, &records_b, 12);
+
+        assert_ne!(key_a, key_b);
+    }
+
+    #[test]
     fn test_eviction_cancel_safety() {
         let object_id = object_id_from_u64(3);
         let payload = b"eviction-cancel-safety";
@@ -1308,6 +1425,85 @@ mod tests {
         assert!(
             audit.iter().any(|entry| !entry.decode_success),
             "expected local failure proof before remote fallback success"
+        );
+    }
+
+    #[test]
+    fn test_fetch_repairs_corrupt_local_symbol_and_persists_healed_copy() {
+        let object_id = object_id_from_u64(72);
+        let payload = b"repair-corrupt-local-symbol";
+        let full = make_symbol_records(object_id, payload, 8, 2);
+
+        let mut local = full.clone();
+        let corrupt = local
+            .iter_mut()
+            .find(|record| record.esi == 1)
+            .expect("seeded symbol set must contain ESI 1");
+        if let Some(first) = corrupt.symbol_data.first_mut() {
+            *first ^= 0x5A;
+        }
+        assert!(
+            !corrupt.verify_integrity(),
+            "test fixture must actually corrupt the local symbol"
+        );
+
+        let mut storage = TieredStorage::new(DurabilityMode::local());
+        storage.insert_l2_segment(420, local);
+
+        let mut remote = MockRemoteTier::default();
+        remote.set_object_symbols(object_id, full.clone());
+        let cx = Cx::<cap::All>::new();
+
+        let repaired = storage
+            .fetch_object(&cx, object_id, 57, Some(&mut remote), Some(remote_cap(13)))
+            .expect("remote repair should recover the object");
+        assert_eq!(repaired.bytes, payload);
+        assert!(repaired.remote_used);
+        assert_eq!(repaired.write_back_count, 1);
+
+        let local_replay = storage
+            .fetch_object(
+                &cx,
+                object_id,
+                58,
+                Option::<&mut MockRemoteTier>::None,
+                None,
+            )
+            .expect("healed symbol should make later local-only reads succeed");
+        assert_eq!(local_replay.bytes, payload);
+        assert!(!local_replay.remote_used);
+        assert!(
+            storage
+                .l2_records_for_object(object_id)
+                .iter()
+                .all(SymbolRecord::verify_integrity),
+            "local self-healing must prefer the repaired symbol over the stale corrupt copy"
+        );
+    }
+
+    #[test]
+    fn test_fetch_cancelled_after_remote_read_does_not_write_back_repairs() {
+        let object_id = object_id_from_u64(73);
+        let payload = b"cancel-after-remote-fetch";
+        let full = make_symbol_records(object_id, payload, 8, 1);
+        let mut local = full.clone();
+        local.retain(|record| record.esi == 0);
+
+        let mut storage = TieredStorage::new(DurabilityMode::local());
+        storage.insert_l2_segment(421, local);
+
+        let cx = Cx::<cap::All>::new();
+        let mut remote = MockRemoteTier::default();
+        remote.set_object_symbols(object_id, full);
+        remote.cancel_after_fetch = Some(cx.clone());
+
+        let result =
+            storage.fetch_object(&cx, object_id, 59, Some(&mut remote), Some(remote_cap(14)));
+        assert!(matches!(result, Err(FrankenError::Busy)));
+        assert_eq!(remote.fetch_calls(), 1);
+        assert!(
+            !storage.l2_segment_exists(storage.write_back_segment_id()),
+            "cancelled fetch must not append repaired symbols into the write-back segment"
         );
     }
 
@@ -1614,6 +1810,47 @@ mod tests {
             .expect("quorum commit succeeds after sufficient ACKs");
         assert!(ok.remote_io);
         assert!(storage.l2_segment_exists(61));
+    }
+
+    #[test]
+    fn test_tiered_storage_remote_admission_cancelled_while_waiting() {
+        let object_id = object_id_from_u64(9);
+        let payload = b"tiered-admission-cancel";
+        let records = make_symbol_records(object_id, payload, 8, 1);
+        let mut storage = TieredStorage::new_with_remote_executor(
+            DurabilityMode::quorum(1, 2).expect("valid quorum"),
+            RemoteAdmissionExecutor::with_limits(
+                crate::remote_effects::TIERED_STORAGE_EXECUTOR_NAME,
+                1,
+                1,
+                Duration::from_secs(1),
+            )
+            .expect("executor config valid"),
+        );
+        let held_executor = Arc::clone(&storage.remote_executor);
+        let _held_permit = held_executor
+            .try_acquire_for_testing()
+            .expect("first permit must saturate admission");
+
+        let cx = Cx::<cap::All>::new();
+        let canceller = {
+            let cancel_cx = cx.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(20));
+                cancel_cx.cancel();
+            })
+        };
+
+        let mut remote = MockRemoteTier::default();
+        remote.set_acked_stores(2);
+        let request = CommitRequest::new(70, records, 71);
+        let result = storage.commit_segment(&cx, request, Some(&mut remote), Some(remote_cap(12)));
+
+        canceller.join().expect("canceller thread joins");
+
+        assert!(matches!(result, Err(FrankenError::Busy)));
+        assert_eq!(remote.upload_calls(), 0);
+        assert!(storage.l2_segment_exists(70));
     }
 
     #[test]

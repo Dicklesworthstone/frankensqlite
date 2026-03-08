@@ -529,32 +529,51 @@ where
             return Err(FrankenError::Busy);
         }
 
-        // Acquire a SHARED lock on the database file for cross-process
-        // reader/writer exclusion (all transactions need at least SHARED).
-        inner.db_file.lock(cx, LockLevel::Shared)?;
+        let active_transactions_before_begin = inner.active_transactions;
 
-        let wal_snapshot_initialized = if inner.active_transactions == 0 {
+        // Acquire a SHARED lock on the database file for cross-process
+        // reader/writer exclusion. The file handle lock is shared across all
+        // local transactions, so only the first active transaction should
+        // acquire it.
+        if active_transactions_before_begin == 0 {
+            inner.db_file.lock(cx, LockLevel::Shared)?;
+        }
+
+        let wal_snapshot_initialized = if active_transactions_before_begin == 0 {
             if inner.rollback_journal_recovery_pending {
                 let journal_path = Self::journal_path(&self.db_path);
                 let page_size = inner.page_size;
-                if !Self::recover_rollback_journal_if_present(
+                match Self::recover_rollback_journal_if_present(
                     cx,
                     &*self.vfs,
                     &mut inner.db_file,
                     &journal_path,
                     page_size,
-                )? {
-                    inner.db_file.unlock(cx, LockLevel::None)?;
-                    return Err(FrankenError::internal(
-                        "rollback journal missing while local recovery was pending",
-                    ));
+                ) {
+                    Ok(false) => {
+                        inner.db_file.unlock(cx, LockLevel::None)?;
+                        return Err(FrankenError::internal(
+                            "rollback journal missing while local recovery was pending",
+                        ));
+                    }
+                    Ok(true) => {}
+                    Err(err) => {
+                        let _ = inner.db_file.unlock(cx, LockLevel::None);
+                        return Err(err);
+                    }
                 }
                 // Failed rollback-journal commits can leave uncommitted bytes in
                 // the cache even after the on-disk pre-images are restored.
                 inner.cache.clear();
                 inner.rollback_journal_recovery_pending = false;
             }
-            inner.refresh_committed_state(cx)?
+            match inner.refresh_committed_state(cx) {
+                Ok(v) => v,
+                Err(err) => {
+                    let _ = inner.db_file.unlock(cx, LockLevel::None);
+                    return Err(err);
+                }
+            }
         } else {
             false
         };
@@ -564,7 +583,9 @@ where
             TransactionMode::Immediate | TransactionMode::Exclusive
         );
         if eager_writer && inner.writer_active {
-            inner.db_file.unlock(cx, LockLevel::None)?;
+            if active_transactions_before_begin == 0 {
+                inner.db_file.unlock(cx, LockLevel::None)?;
+            }
             return Err(FrankenError::Busy);
         }
 
@@ -573,7 +594,11 @@ where
         // prevents multiple processes from writing simultaneously.
         if eager_writer {
             if let Err(err) = inner.db_file.lock(cx, LockLevel::Reserved) {
-                inner.db_file.unlock(cx, LockLevel::None)?;
+                let preserve_level = retained_lock_level_after_txn_exit(
+                    active_transactions_before_begin,
+                    inner.writer_active,
+                );
+                inner.db_file.unlock(cx, preserve_level)?;
                 return Err(err);
             }
             inner.writer_active = true;
@@ -583,14 +608,31 @@ where
             let wal_begin_result = {
                 let wal = inner.wal_backend.as_mut().ok_or_else(|| {
                     FrankenError::internal("WAL mode active but no WAL backend installed")
-                })?;
-                wal.begin_transaction(cx)
+                });
+                match wal {
+                    Ok(w) => w.begin_transaction(cx),
+                    Err(err) => {
+                        if eager_writer {
+                            inner.writer_active = false;
+                        }
+                        let preserve_level = retained_lock_level_after_txn_exit(
+                            active_transactions_before_begin,
+                            inner.writer_active,
+                        );
+                        let _ = inner.db_file.unlock(cx, preserve_level);
+                        return Err(err);
+                    }
+                }
             };
             if let Err(err) = wal_begin_result {
                 if eager_writer {
                     inner.writer_active = false;
                 }
-                inner.db_file.unlock(cx, LockLevel::None)?;
+                let preserve_level = retained_lock_level_after_txn_exit(
+                    active_transactions_before_begin,
+                    inner.writer_active,
+                );
+                inner.db_file.unlock(cx, preserve_level)?;
                 return Err(err);
             }
         }
@@ -1260,6 +1302,19 @@ where
     }
 }
 
+const fn retained_lock_level_after_txn_exit(
+    remaining_active_transactions: u32,
+    writer_active: bool,
+) -> LockLevel {
+    if remaining_active_transactions == 0 {
+        LockLevel::None
+    } else if writer_active {
+        LockLevel::Reserved
+    } else {
+        LockLevel::Shared
+    }
+}
+
 impl<V> TransactionHandle for SimpleTransaction<V>
 where
     V: Vfs + Send,
@@ -1358,8 +1413,11 @@ where
                 .lock()
                 .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
             inner.active_transactions = inner.active_transactions.saturating_sub(1);
-            // Release the SHARED file lock for read-only transactions.
-            let _ = inner.db_file.unlock(cx, LockLevel::None);
+            let preserve_level = retained_lock_level_after_txn_exit(
+                inner.active_transactions,
+                inner.writer_active,
+            );
+            let _ = inner.db_file.unlock(cx, preserve_level);
             drop(inner);
             self.committed = true;
             self.finished = true;
@@ -1424,8 +1482,11 @@ where
                 inner.cache.insert_buffer(page_no, buf);
             }
 
-            // Release the file lock now that the commit is complete.
-            let _ = inner.db_file.unlock(cx, LockLevel::None);
+            let preserve_level = retained_lock_level_after_txn_exit(
+                inner.active_transactions,
+                inner.writer_active,
+            );
+            let _ = inner.db_file.unlock(cx, preserve_level);
 
             drop(inner);
             self.committed = true;
@@ -1506,8 +1567,9 @@ where
             }
         }
         inner.active_transactions = inner.active_transactions.saturating_sub(1);
-        // Release the file lock on rollback.
-        let _ = inner.db_file.unlock(cx, LockLevel::None);
+        let preserve_level =
+            retained_lock_level_after_txn_exit(inner.active_transactions, inner.writer_active);
+        let _ = inner.db_file.unlock(cx, preserve_level);
         drop(inner);
         if self.is_writer {
             // Delete any partial journal file.
@@ -1643,6 +1705,12 @@ impl<V: Vfs> Drop for SimpleTransaction<V> {
                 }
             }
             inner.active_transactions = inner.active_transactions.saturating_sub(1);
+            let preserve_level =
+                retained_lock_level_after_txn_exit(inner.active_transactions, inner.writer_active);
+            // Best-effort downgrade/release. Drop has no caller-owned context,
+            // so cleanup uses a detached Cx only for this final unlock.
+            let cx = Cx::new();
+            let _ = inner.db_file.unlock(&cx, preserve_level);
         }
         // We cannot easily delete the journal file here because Drop doesn't
         // take a Context or return a Result. It's best effort cleanup.
@@ -1966,6 +2034,150 @@ mod tests {
         fn full_pathname(&self, cx: &Cx, path: &std::path::Path) -> Result<PathBuf> {
             self.inner.full_pathname(cx, path)
         }
+    }
+
+    #[derive(Clone)]
+    struct ObservedLockVfs {
+        inner: MemoryVfs,
+        observed_lock_level: Arc<Mutex<LockLevel>>,
+    }
+
+    impl ObservedLockVfs {
+        fn new() -> Self {
+            Self {
+                inner: MemoryVfs::new(),
+                observed_lock_level: Arc::new(Mutex::new(LockLevel::None)),
+            }
+        }
+
+        fn observed_lock_level(&self) -> Arc<Mutex<LockLevel>> {
+            Arc::clone(&self.observed_lock_level)
+        }
+    }
+
+    struct ObservedLockFile {
+        inner: MemoryFile,
+        observed_lock_level: Arc<Mutex<LockLevel>>,
+    }
+
+    impl Vfs for ObservedLockVfs {
+        type File = ObservedLockFile;
+
+        fn name(&self) -> &'static str {
+            self.inner.name()
+        }
+
+        fn open(
+            &self,
+            cx: &Cx,
+            path: Option<&std::path::Path>,
+            flags: VfsOpenFlags,
+        ) -> Result<(Self::File, VfsOpenFlags)> {
+            let (inner, actual_flags) = self.inner.open(cx, path, flags)?;
+            Ok((
+                ObservedLockFile {
+                    inner,
+                    observed_lock_level: self.observed_lock_level(),
+                },
+                actual_flags,
+            ))
+        }
+
+        fn delete(&self, cx: &Cx, path: &std::path::Path, sync_dir: bool) -> Result<()> {
+            self.inner.delete(cx, path, sync_dir)
+        }
+
+        fn access(&self, cx: &Cx, path: &std::path::Path, flags: AccessFlags) -> Result<bool> {
+            self.inner.access(cx, path, flags)
+        }
+
+        fn full_pathname(&self, cx: &Cx, path: &std::path::Path) -> Result<PathBuf> {
+            self.inner.full_pathname(cx, path)
+        }
+    }
+
+    impl VfsFile for ObservedLockFile {
+        fn close(&mut self, cx: &Cx) -> Result<()> {
+            let result = self.inner.close(cx);
+            if result.is_ok() {
+                *self.observed_lock_level.lock().unwrap() = LockLevel::None;
+            }
+            result
+        }
+
+        fn read(&mut self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
+            self.inner.read(cx, buf, offset)
+        }
+
+        fn write(&mut self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
+            self.inner.write(cx, buf, offset)
+        }
+
+        fn truncate(&mut self, cx: &Cx, size: u64) -> Result<()> {
+            self.inner.truncate(cx, size)
+        }
+
+        fn sync(&mut self, cx: &Cx, flags: SyncFlags) -> Result<()> {
+            self.inner.sync(cx, flags)
+        }
+
+        fn file_size(&self, cx: &Cx) -> Result<u64> {
+            self.inner.file_size(cx)
+        }
+
+        fn lock(&mut self, cx: &Cx, level: LockLevel) -> Result<()> {
+            self.inner.lock(cx, level)?;
+            *self.observed_lock_level.lock().unwrap() = level;
+            Ok(())
+        }
+
+        fn unlock(&mut self, cx: &Cx, level: LockLevel) -> Result<()> {
+            self.inner.unlock(cx, level)?;
+            *self.observed_lock_level.lock().unwrap() = level;
+            Ok(())
+        }
+
+        fn check_reserved_lock(&self, cx: &Cx) -> Result<bool> {
+            self.inner.check_reserved_lock(cx)
+        }
+
+        fn sector_size(&self) -> u32 {
+            self.inner.sector_size()
+        }
+
+        fn device_characteristics(&self) -> u32 {
+            self.inner.device_characteristics()
+        }
+
+        fn shm_map(
+            &mut self,
+            cx: &Cx,
+            region: u32,
+            size: u32,
+            extend: bool,
+        ) -> Result<fsqlite_vfs::ShmRegion> {
+            self.inner.shm_map(cx, region, size, extend)
+        }
+
+        fn shm_lock(&mut self, cx: &Cx, offset: u32, n: u32, flags: u32) -> Result<()> {
+            self.inner.shm_lock(cx, offset, n, flags)
+        }
+
+        fn shm_barrier(&self) {
+            self.inner.shm_barrier();
+        }
+
+        fn shm_unmap(&mut self, cx: &Cx, delete: bool) -> Result<()> {
+            self.inner.shm_unmap(cx, delete)
+        }
+    }
+
+    fn observed_lock_pager() -> (SimplePager<ObservedLockVfs>, Arc<Mutex<LockLevel>>) {
+        let vfs = ObservedLockVfs::new();
+        let observed_lock_level = vfs.observed_lock_level();
+        let path = PathBuf::from("/observed-lock.db");
+        let pager = SimplePager::open(vfs, &path, PageSize::DEFAULT).unwrap();
+        (pager, observed_lock_level)
     }
 
     #[derive(Debug)]
@@ -2497,6 +2709,60 @@ mod tests {
         assert!(
             txn2.is_ok(),
             "bead_id={BEAD_ID} case=drop_releases_writer_lock"
+        );
+    }
+
+    #[test]
+    fn test_reader_exit_preserves_shared_lock_for_other_reader() {
+        let (pager, observed_lock_level) = observed_lock_pager();
+        let cx = Cx::new();
+
+        let mut reader1 = pager.begin(&cx, TransactionMode::ReadOnly).unwrap();
+        let reader2 = pager.begin(&cx, TransactionMode::ReadOnly).unwrap();
+
+        assert_eq!(*observed_lock_level.lock().unwrap(), LockLevel::Shared);
+
+        reader1.commit(&cx).unwrap();
+
+        assert_eq!(
+            *observed_lock_level.lock().unwrap(),
+            LockLevel::Shared,
+            "bead_id={BEAD_ID} case=reader_commit_keeps_shared_for_other_reader"
+        );
+
+        drop(reader2);
+
+        assert_eq!(
+            *observed_lock_level.lock().unwrap(),
+            LockLevel::None,
+            "bead_id={BEAD_ID} case=last_reader_releases_shared"
+        );
+    }
+
+    #[test]
+    fn test_reader_exit_preserves_reserved_lock_for_active_writer() {
+        let (pager, observed_lock_level) = observed_lock_pager();
+        let cx = Cx::new();
+
+        let mut writer = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let reader = pager.begin(&cx, TransactionMode::ReadOnly).unwrap();
+
+        assert_eq!(*observed_lock_level.lock().unwrap(), LockLevel::Reserved);
+
+        drop(reader);
+
+        assert_eq!(
+            *observed_lock_level.lock().unwrap(),
+            LockLevel::Reserved,
+            "bead_id={BEAD_ID} case=reader_drop_keeps_reserved_for_writer"
+        );
+
+        writer.commit(&cx).unwrap();
+
+        assert_eq!(
+            *observed_lock_level.lock().unwrap(),
+            LockLevel::None,
+            "bead_id={BEAD_ID} case=writer_commit_releases_last_lock"
         );
     }
 

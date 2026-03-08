@@ -1,9 +1,12 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, TryLockError};
-use std::thread;
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
+use asupersync::runtime::{Runtime, RuntimeBuilder, spawn_blocking};
+#[cfg(test)]
+use asupersync::time::{sleep, wall_now};
 use fsqlite_types::{CommitSeq, PageNumber, TxnEpoch, TxnId, TxnToken};
 
 const DEFAULT_BUFFER_CAPACITY_BYTES: usize = 4 * 1024 * 1024;
@@ -681,6 +684,14 @@ fn make_record(core_id: usize, seq: u64, payload_len: usize) -> WalRecord {
     }
 }
 
+#[cfg(test)]
+fn test_runtime() -> Runtime {
+    RuntimeBuilder::current_thread()
+        .blocking_threads(8, 8)
+        .build()
+        .expect("runtime build")
+}
+
 #[test]
 fn bd_ncivz_1_state_machine_double_buffering() {
     let config = BufferConfig {
@@ -830,30 +841,41 @@ fn bd_ncivz_1_overflow_allocate_triggers_deterministic_fallback() {
 fn bd_ncivz_1_per_core_pool_concurrent_writers_no_contention() {
     let pool = Arc::new(PerCoreWalBufferPool::new(8, BufferConfig::default()));
     let records_per_core = 400_u64;
+    let runtime = test_runtime();
+    let handle = runtime.handle();
 
-    let mut handles = Vec::new();
-    for core_id in 0..8_usize {
-        let pool_ref = Arc::clone(&pool);
-        handles.push(thread::spawn(move || {
-            for seq in 0..records_per_core {
-                let record = make_record(core_id, seq, 64);
-                let outcome = pool_ref
-                    .append_to_core(core_id, record)
-                    .expect("core index should exist");
-                assert!(
-                    matches!(
-                        outcome,
-                        AppendOutcome::Appended | AppendOutcome::QueuedOverflow
-                    ),
-                    "append outcome should not block"
-                );
-            }
-        }));
-    }
+    runtime.block_on(async {
+        let mut writer_tasks = Vec::new();
+        for core_id in 0..8_usize {
+            let pool_ref = Arc::clone(&pool);
+            writer_tasks.push(
+                handle
+                    .try_spawn(async move {
+                        spawn_blocking(move || {
+                            for seq in 0..records_per_core {
+                                let record = make_record(core_id, seq, 64);
+                                let outcome = pool_ref
+                                    .append_to_core(core_id, record)
+                                    .expect("core index should exist");
+                                assert!(
+                                    matches!(
+                                        outcome,
+                                        AppendOutcome::Appended | AppendOutcome::QueuedOverflow
+                                    ),
+                                    "append outcome should not block"
+                                );
+                            }
+                        })
+                        .await;
+                    })
+                    .expect("writer task should spawn"),
+            );
+        }
 
-    for handle in handles {
-        handle.join().expect("writer thread should complete");
-    }
+        for writer_task in writer_tasks {
+            writer_task.await;
+        }
+    });
 
     assert_eq!(pool.contention_events_total(), 0);
 }
@@ -883,24 +905,32 @@ fn bd_ncivz_2_epoch_fence_waits_for_active_core_observation() {
     coordinator
         .observe_epoch(1)
         .expect("core 1 should be valid");
+    let runtime = test_runtime();
+    let handle = runtime.handle();
 
-    let coordinator_ref = Arc::clone(&coordinator);
-    let observer = thread::spawn(move || {
-        thread::sleep(Duration::from_millis(8));
-        coordinator_ref
-            .observe_epoch(0)
-            .expect("core 0 observation should succeed");
-        coordinator_ref
-            .observe_epoch(1)
-            .expect("core 1 observation should succeed");
-    });
+    let next_epoch = runtime.block_on(async {
+        let observer_ref = Arc::clone(&coordinator);
+        let observer = handle
+            .try_spawn(async move {
+                sleep(wall_now(), Duration::from_millis(8)).await;
+                observer_ref
+                    .observe_epoch(0)
+                    .expect("core 0 observation should succeed");
+                observer_ref
+                    .observe_epoch(1)
+                    .expect("core 1 observation should succeed");
+            })
+            .expect("observer task should spawn");
 
-    let next_epoch = coordinator
-        .advance_epoch_and_wait(&[0, 1], Duration::from_millis(200))
+        let fence_ref = Arc::clone(&coordinator);
+        let next_epoch = spawn_blocking(move || {
+            fence_ref.advance_epoch_and_wait(&[0, 1], Duration::from_millis(200))
+        })
+        .await
         .expect("fence should complete after observations");
-    observer
-        .join()
-        .expect("observer thread should complete successfully");
+        observer.await;
+        next_epoch
+    });
 
     assert_eq!(next_epoch, 1);
     assert_eq!(coordinator.current_epoch(), 1);
@@ -939,37 +969,44 @@ fn bd_ncivz_2_group_commit_flushes_epoch_across_cores() {
             .expect("append on core 1 should succeed"),
         AppendOutcome::Appended
     );
+    let runtime = test_runtime();
+    let handle = runtime.handle();
 
-    let coordinator_ref = Arc::clone(&coordinator);
-    let observer = thread::spawn(move || {
-        thread::sleep(Duration::from_millis(6));
-        coordinator_ref
-            .observe_epoch(0)
-            .expect("core 0 observation should succeed");
-        coordinator_ref
-            .observe_epoch(1)
-            .expect("core 1 observation should succeed");
-    });
+    runtime.block_on(async {
+        let observer_ref = Arc::clone(&coordinator);
+        let observer = handle
+            .try_spawn(async move {
+                sleep(wall_now(), Duration::from_millis(6)).await;
+                observer_ref
+                    .observe_epoch(0)
+                    .expect("core 0 observation should succeed");
+                observer_ref
+                    .observe_epoch(1)
+                    .expect("core 1 observation should succeed");
+            })
+            .expect("observer task should spawn");
 
-    coordinator
-        .advance_epoch_and_wait(&[0, 1], Duration::from_millis(200))
+        let advance_ref = Arc::clone(&coordinator);
+        spawn_blocking(move || {
+            advance_ref.advance_epoch_and_wait(&[0, 1], Duration::from_millis(200))
+        })
+        .await
         .expect("epoch advance should succeed");
-    observer
-        .join()
-        .expect("observer thread should complete successfully");
+        observer.await;
 
-    let batch = coordinator
-        .flush_epoch(0)
-        .expect("epoch 0 flush should succeed");
-    assert_eq!(batch.epoch, 0);
-    assert_eq!(batch.records_per_core, vec![2, 1]);
-    assert_eq!(batch.total_records(), 3);
-    assert!(batch.records.iter().all(|record| record.epoch == 0));
+        let batch = coordinator
+            .flush_epoch(0)
+            .expect("epoch 0 flush should succeed");
+        assert_eq!(batch.epoch, 0);
+        assert_eq!(batch.records_per_core, vec![2, 1]);
+        assert_eq!(batch.total_records(), 3);
+        assert!(batch.records.iter().all(|record| record.epoch == 0));
 
-    assert_eq!(coordinator.durable_epoch(), Some(0));
-    coordinator
-        .wait_until_epoch_durable(0, Duration::from_millis(25))
-        .expect("durability wait should pass");
+        assert_eq!(coordinator.durable_epoch(), Some(0));
+        coordinator
+            .wait_until_epoch_durable(0, Duration::from_millis(25))
+            .expect("durability wait should pass");
+    });
 }
 
 #[test]
@@ -985,39 +1022,40 @@ fn bd_ncivz_2_writers_block_until_epoch_is_durable() {
     coordinator
         .append_to_core(0, 1, 64)
         .expect("append should succeed");
+    let runtime = test_runtime();
+    let handle = runtime.handle();
 
-    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
-    let waiter_ref = Arc::clone(&coordinator);
-    let waiter = thread::spawn(move || {
-        waiter_ref
-            .wait_until_epoch_durable(0, Duration::from_millis(600))
-            .expect("epoch should become durable");
-        done_tx
-            .send(())
-            .expect("wait completion signal should send");
+    runtime.block_on(async {
+        let waiter_ref = Arc::clone(&coordinator);
+        let waiter = handle
+            .try_spawn(async move {
+                spawn_blocking(move || {
+                    waiter_ref.wait_until_epoch_durable(0, Duration::from_millis(600))
+                })
+                .await
+            })
+            .expect("waiter task should spawn");
+
+        sleep(wall_now(), Duration::from_millis(30)).await;
+        assert!(
+            !waiter.is_finished(),
+            "writer should still be waiting before flush"
+        );
+
+        let advance_ref = Arc::clone(&coordinator);
+        spawn_blocking(move || advance_ref.advance_epoch_and_wait(&[], Duration::from_millis(25)))
+            .await
+            .expect("advancing with no active fence set should succeed");
+        assert_eq!(
+            coordinator
+                .flush_epoch(0)
+                .expect("flush should succeed")
+                .total_records(),
+            1
+        );
+
+        waiter.await.expect("epoch should become durable");
     });
-
-    thread::sleep(Duration::from_millis(30));
-    assert!(
-        done_rx.try_recv().is_err(),
-        "writer should still be waiting before flush"
-    );
-
-    coordinator
-        .advance_epoch_and_wait(&[], Duration::from_millis(25))
-        .expect("advancing with no active fence set should succeed");
-    assert_eq!(
-        coordinator
-            .flush_epoch(0)
-            .expect("flush should succeed")
-            .total_records(),
-        1
-    );
-
-    done_rx
-        .recv_timeout(Duration::from_millis(200))
-        .expect("waiter should unblock after flush");
-    waiter.join().expect("wait thread should join");
 }
 
 #[test]

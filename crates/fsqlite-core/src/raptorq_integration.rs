@@ -335,6 +335,7 @@ pub trait SymbolCodec: Send + Sync {
     /// Encode source data into source + repair symbols.
     fn encode(
         &self,
+        cx: &Cx,
         source_data: &[u8],
         symbol_size: u32,
         repair_overhead: f64,
@@ -343,6 +344,7 @@ pub trait SymbolCodec: Send + Sync {
     /// Decode from received symbols.
     fn decode(
         &self,
+        cx: &Cx,
         symbols: &[(u32, Vec<u8>)],
         k_source: u32,
         symbol_size: u32,
@@ -500,7 +502,7 @@ impl<C: SymbolCodec> RaptorQPageEncoder<C> {
 
         let result = self
             .codec
-            .encode(page_data, symbol_size, self.config.repair_overhead)?;
+            .encode(cx, page_data, symbol_size, self.config.repair_overhead)?;
 
         // Write source symbols with checkpoints.
         let interval = self.config.checkpoint_interval as usize;
@@ -632,7 +634,7 @@ impl<C: SymbolCodec> RaptorQPageDecoder<C> {
         // Delegate to codec.
         let codec_result = self
             .codec
-            .decode(&symbols, k_source, self.config.symbol_size)?;
+            .decode(cx, &symbols, k_source, self.config.symbol_size)?;
         let all_esis = canonical_esis(&symbols);
         let proof_object_id =
             derive_decode_proof_object_id(k_source, self.config.symbol_size, &all_esis);
@@ -1023,6 +1025,7 @@ mod tests {
     impl SymbolCodec for AsupersyncCodec {
         fn encode(
             &self,
+            _cx: &Cx,
             source_data: &[u8],
             symbol_size: u32,
             repair_overhead: f64,
@@ -1067,6 +1070,7 @@ mod tests {
 
         fn decode(
             &self,
+            _cx: &Cx,
             symbols: &[(u32, Vec<u8>)],
             k_source: u32,
             symbol_size: u32,

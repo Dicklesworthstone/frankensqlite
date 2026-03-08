@@ -67,6 +67,8 @@ pub fn is_sqlite_format(path: &Path) -> bool {
 /// Persist `schema` + `db` to a real SQLite-format database file at `path`.
 ///
 /// Overwrites any existing file. The resulting file is readable by `sqlite3`.
+/// The caller supplies the capability context so pager and B-tree work stay
+/// attached to the active runtime lineage.
 ///
 /// # Errors
 ///
@@ -74,6 +76,7 @@ pub fn is_sqlite_format(path: &Path) -> bool {
 /// insertion (e.g. duplicate rowid in sqlite_master).
 #[allow(clippy::too_many_lines)]
 pub fn persist_to_sqlite(
+    cx: &Cx,
     path: &Path,
     schema: &[TableSchema],
     db: &MemDatabase,
@@ -87,10 +90,9 @@ pub fn persist_to_sqlite(
         host_fs::create_empty_file(path)?;
     }
 
-    let cx = Cx::new();
     let vfs = PlatformVfs::new();
-    let pager = SimplePager::open(vfs, path, DEFAULT_PAGE_SIZE)?;
-    let mut txn = pager.begin(&cx, TransactionMode::Immediate)?;
+    let pager = SimplePager::open_with_cx(cx, vfs, path, DEFAULT_PAGE_SIZE)?;
+    let mut txn = pager.begin(cx, TransactionMode::Immediate)?;
 
     let ps = DEFAULT_PAGE_SIZE.as_usize();
     let usable_size =
@@ -106,10 +108,10 @@ pub fn persist_to_sqlite(
         };
 
         // Allocate a fresh root page for this table in the on-disk file.
-        let root_page = txn.allocate_page(&cx)?;
+        let root_page = txn.allocate_page(cx)?;
 
         // Initialize the root page as an empty leaf table B-tree.
-        init_leaf_table_page(&cx, &mut txn, root_page, ps)?;
+        init_leaf_table_page(cx, &mut txn, root_page, ps)?;
 
         // Insert all rows.
         {
@@ -121,7 +123,7 @@ pub fn persist_to_sqlite(
             );
             for (rowid, values) in mem_table.iter_rows() {
                 let payload = serialize_record(values);
-                cursor.table_insert(&cx, rowid, &payload)?;
+                cursor.table_insert(cx, rowid, &payload)?;
             }
         }
 
@@ -151,18 +153,18 @@ pub fn persist_to_sqlite(
             ]);
             #[allow(clippy::cast_possible_wrap)]
             let rid = (rowid as i64) + 1;
-            cursor.table_insert(&cx, rid, &record)?;
+            cursor.table_insert(cx, rid, &record)?;
         }
     }
 
     // Fix up the database header on page 1: update page_count,
     // change_counter, and schema_cookie so sqlite3 validates the file.
     {
-        let mut hdr_page = txn.get_page(&cx, PageNumber::ONE)?.into_vec();
+        let mut hdr_page = txn.get_page(cx, PageNumber::ONE)?.into_vec();
 
         // Compute actual page count by finding the highest page number that was allocated.
         // In a fresh database with no freelist, allocating one more page gives us (max_page + 1).
-        let next_page = txn.allocate_page(&cx)?.get();
+        let next_page = txn.allocate_page(cx)?.get();
         let max_page = next_page.saturating_sub(1).max(1);
 
         // page_count at offset 28 (4 bytes, big-endian)
@@ -181,10 +183,10 @@ pub fn persist_to_sqlite(
         // version-valid-for at offset 92 (must match change_counter)
         hdr_page[92..96].copy_from_slice(&effective_counter.to_be_bytes());
 
-        txn.write_page(&cx, PageNumber::ONE, &hdr_page)?;
+        txn.write_page(cx, PageNumber::ONE, &hdr_page)?;
     }
 
-    txn.commit(&cx)?;
+    txn.commit(cx)?;
     Ok(())
 }
 
@@ -192,17 +194,18 @@ pub fn persist_to_sqlite(
 ///
 /// Reads sqlite_master from page 1, then reads each table's B-tree to
 /// populate the in-memory store.
+/// The caller supplies the capability context so pager reads inherit the
+/// active trace and budget lineage.
 ///
 /// # Errors
 ///
 /// Returns an error if the file is not a valid SQLite database, or on
 /// I/O / B-tree navigation failures.
 #[allow(clippy::too_many_lines, clippy::similar_names)]
-pub fn load_from_sqlite(path: &Path) -> Result<LoadedState> {
-    let cx = Cx::new();
+pub fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
     let vfs = PlatformVfs::new();
-    let pager = SimplePager::open(vfs, path, DEFAULT_PAGE_SIZE)?;
-    let mut txn = pager.begin(&cx, TransactionMode::ReadOnly)?;
+    let pager = SimplePager::open_with_cx(cx, vfs, path, DEFAULT_PAGE_SIZE)?;
+    let mut txn = pager.begin(cx, TransactionMode::ReadOnly)?;
 
     let ps = DEFAULT_PAGE_SIZE.as_usize();
     let usable_size =
@@ -219,10 +222,10 @@ pub fn load_from_sqlite(path: &Path) -> Result<LoadedState> {
             true,
         );
 
-        if cursor.first(&cx)? {
+        if cursor.first(cx)? {
             loop {
-                let rowid = cursor.rowid(&cx)?;
-                let payload = cursor.payload(&cx)?;
+                let rowid = cursor.rowid(cx)?;
+                let payload = cursor.payload(cx)?;
                 let values =
                     parse_record(&payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
                         detail: format!(
@@ -230,7 +233,7 @@ pub fn load_from_sqlite(path: &Path) -> Result<LoadedState> {
                         ),
                     })?;
                 entries.push(values);
-                if !cursor.next(&cx)? {
+                if !cursor.next(cx)? {
                     break;
                 }
             }
@@ -314,10 +317,10 @@ pub fn load_from_sqlite(path: &Path) -> Result<LoadedState> {
         );
 
         if let Some(mem_table) = db.tables.get_mut(&real_root_page) {
-            if cursor.first(&cx)? {
+            if cursor.first(cx)? {
                 loop {
-                    let rowid = cursor.rowid(&cx)?;
-                    let payload = cursor.payload(&cx)?;
+                    let rowid = cursor.rowid(cx)?;
+                    let payload = cursor.payload(cx)?;
                     let values = parse_record(&payload).ok_or_else(|| {
                         FrankenError::DatabaseCorrupt {
                             detail: format!(
@@ -326,7 +329,7 @@ pub fn load_from_sqlite(path: &Path) -> Result<LoadedState> {
                         }
                     })?;
                     mem_table.insert_row(rowid, values);
-                    if !cursor.next(&cx)? {
+                    if !cursor.next(cx)? {
                         break;
                     }
                 }
@@ -336,7 +339,7 @@ pub fn load_from_sqlite(path: &Path) -> Result<LoadedState> {
 
     // Read schema_cookie and change_counter from the database header (page 1).
     let (schema_cookie, change_counter) = {
-        let header_buf = txn.get_page(&cx, PageNumber::ONE)?;
+        let header_buf = txn.get_page(cx, PageNumber::ONE)?;
         let hdr = header_buf.as_ref();
         let cookie = if hdr.len() >= 44 {
             u32::from_be_bytes([hdr[40], hdr[41], hdr[42], hdr[43]])
@@ -1051,6 +1054,22 @@ fn type_to_affinity(type_str: &str) -> char {
 mod tests {
     use super::*;
 
+    fn persist_test_db(
+        path: &Path,
+        schema: &[TableSchema],
+        db: &MemDatabase,
+        schema_cookie: u32,
+        change_counter: u32,
+    ) -> Result<()> {
+        let cx = Cx::new();
+        persist_to_sqlite(&cx, path, schema, db, schema_cookie, change_counter)
+    }
+
+    fn load_test_db(path: &Path) -> Result<LoadedState> {
+        let cx = Cx::new();
+        load_from_sqlite(&cx, path)
+    }
+
     fn make_test_schema_and_db() -> (Vec<TableSchema>, MemDatabase) {
         let mut db = MemDatabase::new();
         let root = db.create_table(2);
@@ -1116,12 +1135,12 @@ mod tests {
         let db_path = dir.path().join("test.db");
 
         let (schema, db) = make_test_schema_and_db();
-        persist_to_sqlite(&db_path, &schema, &db, 0, 0).unwrap();
+        persist_test_db(&db_path, &schema, &db, 0, 0).unwrap();
 
         assert!(db_path.exists(), "db file should exist");
         assert!(is_sqlite_format(&db_path), "should have SQLite magic");
 
-        let loaded = load_from_sqlite(&db_path).unwrap();
+        let loaded = load_test_db(&db_path).unwrap();
         assert_eq!(loaded.schema.len(), 1);
         assert_eq!(loaded.schema[0].name, "test_table");
         assert_eq!(loaded.schema[0].columns.len(), 2);
@@ -1144,11 +1163,11 @@ mod tests {
 
         let schema: Vec<TableSchema> = Vec::new();
         let db = MemDatabase::new();
-        persist_to_sqlite(&db_path, &schema, &db, 0, 0).unwrap();
+        persist_test_db(&db_path, &schema, &db, 0, 0).unwrap();
 
         assert!(is_sqlite_format(&db_path));
 
-        let loaded = load_from_sqlite(&db_path).unwrap();
+        let loaded = load_test_db(&db_path).unwrap();
         assert!(loaded.schema.is_empty());
     }
 
@@ -1158,7 +1177,7 @@ mod tests {
         let db_path = dir.path().join("readable.db");
 
         let (schema, db) = make_test_schema_and_db();
-        persist_to_sqlite(&db_path, &schema, &db, 0, 0).unwrap();
+        persist_test_db(&db_path, &schema, &db, 0, 0).unwrap();
 
         // Verify with rusqlite (C SQLite) that the file is valid.
         let conn = rusqlite::Connection::open(&db_path).unwrap();
@@ -1193,7 +1212,7 @@ mod tests {
         }
 
         // Load with our compat loader.
-        let loaded = load_from_sqlite(&db_path).unwrap();
+        let loaded = load_test_db(&db_path).unwrap();
         assert_eq!(loaded.schema.len(), 1);
         assert_eq!(loaded.schema[0].name, "items");
 
@@ -1284,8 +1303,8 @@ mod tests {
             },
         ];
 
-        persist_to_sqlite(&db_path, &schema, &db, 0, 0).unwrap();
-        let loaded = load_from_sqlite(&db_path).unwrap();
+        persist_test_db(&db_path, &schema, &db, 0, 0).unwrap();
+        let loaded = load_test_db(&db_path).unwrap();
 
         assert_eq!(loaded.schema.len(), 2);
         assert_eq!(loaded.schema[0].name, "alpha");
@@ -1640,12 +1659,12 @@ mod tests {
 
         // Write once.
         let (schema, db) = make_test_schema_and_db();
-        persist_to_sqlite(&db_path, &schema, &db, 0, 0).unwrap();
+        persist_test_db(&db_path, &schema, &db, 0, 0).unwrap();
 
         // Overwrite with empty.
-        persist_to_sqlite(&db_path, &[], &MemDatabase::new(), 0, 0).unwrap();
+        persist_test_db(&db_path, &[], &MemDatabase::new(), 0, 0).unwrap();
 
-        let loaded = load_from_sqlite(&db_path).unwrap();
+        let loaded = load_test_db(&db_path).unwrap();
         assert!(loaded.schema.is_empty());
     }
 
@@ -1668,7 +1687,7 @@ mod tests {
             conn.close().unwrap();
         }
 
-        let loaded = load_from_sqlite(&db_path).unwrap();
+        let loaded = load_test_db(&db_path).unwrap();
         let table = loaded
             .schema
             .iter()
@@ -1713,7 +1732,7 @@ mod tests {
             .unwrap();
         }
 
-        let err = match load_from_sqlite(&db_path) {
+        let err = match load_test_db(&db_path) {
             Ok(_) => panic!("corrupt rootpage should fail load"),
             Err(err) => err,
         };
@@ -1743,7 +1762,7 @@ mod tests {
             .unwrap();
         }
 
-        let err = match load_from_sqlite(&db_path) {
+        let err = match load_test_db(&db_path) {
             Ok(_) => panic!("negative rootpage should fail load"),
             Err(err) => err,
         };
@@ -1773,7 +1792,7 @@ mod tests {
             .unwrap();
         }
 
-        let err = match load_from_sqlite(&db_path) {
+        let err = match load_test_db(&db_path) {
             Ok(_) => panic!("oversized rootpage should fail load"),
             Err(err) => err,
         };
@@ -1807,7 +1826,7 @@ mod tests {
             .unwrap();
         }
 
-        let err = load_from_sqlite(&db_path).expect_err("invalid sqlite_master text should fail");
+        let err = load_test_db(&db_path).expect_err("invalid sqlite_master text should fail");
         let message = err.to_string();
         assert!(
             message.contains("sqlite_master row")
@@ -1833,7 +1852,7 @@ mod tests {
             .unwrap();
         }
 
-        let err = load_from_sqlite(&db_path).expect_err("invalid table text should fail");
+        let err = load_test_db(&db_path).expect_err("invalid table text should fail");
         let message = err.to_string();
         assert!(
             message.contains("table `docs`")

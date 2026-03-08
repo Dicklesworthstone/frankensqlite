@@ -835,35 +835,59 @@ impl UnixFile {
                     let Some(lock_byte) = wal_lock_byte(slot) else {
                         continue;
                     };
-                    slot_state.exclusive_owner = None;
-                    if slot_state.shared_holders.is_empty() {
-                        if let Err(err) = posix_unlock(&*shm_file, lock_byte, 1) {
-                            if first_error.is_none() {
-                                first_error = Some(err);
+                    let os_ok = if slot_state.shared_holders.is_empty() {
+                        match posix_unlock(&*shm_file, lock_byte, 1) {
+                            Ok(()) => true,
+                            Err(err) => {
+                                if first_error.is_none() {
+                                    first_error = Some(err);
+                                }
+                                false
                             }
                         }
-                    } else if let Err(err) = posix_lock(&*shm_file, libc::F_RDLCK, lock_byte, 1) {
-                        if first_error.is_none() {
-                            first_error = Some(err);
+                    } else {
+                        match posix_lock(&*shm_file, libc::F_RDLCK, lock_byte, 1) {
+                            Ok(true) => true,
+                            Ok(false) => {
+                                if first_error.is_none() {
+                                    first_error = Some(FrankenError::Busy);
+                                }
+                                false
+                            }
+                            Err(err) => {
+                                if first_error.is_none() {
+                                    first_error = Some(err);
+                                }
+                                false
+                            }
                         }
+                    };
+                    if os_ok {
+                        slot_state.exclusive_owner = None;
                     }
                 }
 
-                if slot_state
-                    .shared_holders
-                    .remove(&self.shm_owner_id)
-                    .is_some()
-                {
+                if slot_state.shared_holders.contains_key(&self.shm_owner_id) {
                     let Some(lock_byte) = wal_lock_byte(slot) else {
                         continue;
                     };
-                    if slot_state.exclusive_owner.is_none() && slot_state.shared_holders.is_empty()
-                    {
-                        if let Err(err) = posix_unlock(&*shm_file, lock_byte, 1) {
-                            if first_error.is_none() {
-                                first_error = Some(err);
+                    let releasing_last_shared_holder = slot_state.exclusive_owner.is_none()
+                        && slot_state.shared_holders.len() == 1;
+                    let os_ok = if releasing_last_shared_holder {
+                        match posix_unlock(&*shm_file, lock_byte, 1) {
+                            Ok(()) => true,
+                            Err(err) => {
+                                if first_error.is_none() {
+                                    first_error = Some(err);
+                                }
+                                false
                             }
                         }
+                    } else {
+                        true
+                    };
+                    if os_ok {
+                        slot_state.shared_holders.remove(&self.shm_owner_id);
                     }
                 }
             }
@@ -1616,17 +1640,55 @@ impl VfsFile for UnixFile {
             return Ok(());
         }
 
+        let prior_level = self.lock_level;
         let mut info = self
             .inode_info
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let rollback = |info: &mut InodeInfo, lock_level: &mut LockLevel| -> Result<()> {
+            if *lock_level >= LockLevel::Pending && prior_level < LockLevel::Pending {
+                info.n_pending = info.n_pending.saturating_sub(1);
+                if info.n_pending == 0 {
+                    posix_unlock(&*info.file, PENDING_BYTE, 1)?;
+                }
+            }
+
+            if *lock_level >= LockLevel::Reserved && prior_level < LockLevel::Reserved {
+                info.n_reserved = info.n_reserved.saturating_sub(1);
+                if info.n_reserved == 0 {
+                    posix_unlock(&*info.file, RESERVED_BYTE, 1)?;
+                }
+            }
+
+            if *lock_level >= LockLevel::Shared && prior_level < LockLevel::Shared {
+                info.n_shared = info.n_shared.saturating_sub(1);
+                if info.n_shared == 0 && info.n_exclusive == 0 {
+                    posix_unlock(&*info.file, SHARED_FIRST, SHARED_SIZE)?;
+                }
+            }
+
+            *lock_level = prior_level;
+            Ok(())
+        };
 
         // None -> Shared: acquire F_RDLCK on the shared byte range.
         if self.lock_level < LockLevel::Shared && level >= LockLevel::Shared {
             if info.n_shared == 0 {
-                // First shared holder in this process -- acquire the OS lock.
-                if !posix_lock(&*info.file, libc::F_RDLCK, SHARED_FIRST, SHARED_SIZE)? {
+                // Readers must pass through the PENDING byte so a waiting
+                // writer can block new SHARED acquisitions while upgrading.
+                if !posix_lock(&*info.file, libc::F_RDLCK, PENDING_BYTE, 1)? {
                     return Err(FrankenError::Busy);
+                }
+                let shared_locked =
+                    posix_lock(&*info.file, libc::F_RDLCK, SHARED_FIRST, SHARED_SIZE)?;
+                let pending_unlock = posix_unlock(&*info.file, PENDING_BYTE, 1);
+                if !shared_locked {
+                    pending_unlock?;
+                    return Err(FrankenError::Busy);
+                }
+                if let Err(err) = pending_unlock {
+                    posix_unlock(&*info.file, SHARED_FIRST, SHARED_SIZE)?;
+                    return Err(err);
                 }
             }
             info.n_shared += 1;
@@ -1637,9 +1699,11 @@ impl VfsFile for UnixFile {
         if self.lock_level < LockLevel::Reserved && level >= LockLevel::Reserved {
             if info.n_reserved > 0 {
                 // Another handle in this process already holds RESERVED.
+                rollback(&mut info, &mut self.lock_level)?;
                 return Err(FrankenError::Busy);
             }
             if !posix_lock(&*info.file, libc::F_WRLCK, RESERVED_BYTE, 1)? {
+                rollback(&mut info, &mut self.lock_level)?;
                 return Err(FrankenError::Busy);
             }
             info.n_reserved += 1;
@@ -1650,6 +1714,7 @@ impl VfsFile for UnixFile {
         // This blocks new shared-lock acquisitions from other processes.
         if self.lock_level < LockLevel::Pending && level >= LockLevel::Pending {
             if info.n_pending == 0 && !posix_lock(&*info.file, libc::F_WRLCK, PENDING_BYTE, 1)? {
+                rollback(&mut info, &mut self.lock_level)?;
                 return Err(FrankenError::Busy);
             }
             info.n_pending += 1;
@@ -1661,6 +1726,7 @@ impl VfsFile for UnixFile {
         // all other processes have released their shared locks.
         if self.lock_level < LockLevel::Exclusive && level >= LockLevel::Exclusive {
             if !posix_lock(&*info.file, libc::F_WRLCK, SHARED_FIRST, SHARED_SIZE)? {
+                rollback(&mut info, &mut self.lock_level)?;
                 return Err(FrankenError::Busy);
             }
             info.n_exclusive += 1;
@@ -1917,6 +1983,8 @@ impl Drop for UnixFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{BufRead, BufReader, Write as _};
+    use std::process::{Child, Stdio};
     use std::process::{Command, Output};
 
     fn debug_dump_sqlite_wal_files(coordinator: &mut UnixFile) {
@@ -1992,6 +2060,85 @@ mod tests {
             .arg(sql)
             .output()
             .expect("sqlite3 command should execute")
+    }
+
+    fn setup_sqlite_delete_journal_db(path: &Path) {
+        let setup = sqlite3_exec(
+            path,
+            "PRAGMA journal_mode=DELETE; \
+             DROP TABLE IF EXISTS t; \
+             CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT); \
+             INSERT INTO t(v) VALUES('alpha');",
+        );
+        assert!(
+            setup.status.success(),
+            "sqlite3 setup failed: {}",
+            String::from_utf8_lossy(&setup.stderr)
+        );
+    }
+
+    #[allow(clippy::zombie_processes)]
+    fn spawn_sqlite3_reader_transaction(db_path: &Path) -> Child {
+        let mut child = Command::new("sqlite3")
+            .arg(db_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("sqlite3 reader process should start");
+
+        let stdin = child
+            .stdin
+            .as_mut()
+            .expect("sqlite3 reader should expose stdin");
+        stdin
+            .write_all(b"PRAGMA busy_timeout=0;\nBEGIN;\nSELECT COUNT(*) FROM t;\n")
+            .expect("sqlite3 reader setup should write");
+        stdin.flush().expect("sqlite3 reader setup should flush");
+
+        let stdout = child
+            .stdout
+            .take()
+            .expect("sqlite3 reader should expose stdout");
+        let mut stdout = BufReader::new(stdout);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let read = stdout
+                .read_line(&mut line)
+                .expect("sqlite3 reader output should be readable");
+            assert!(
+                read > 0,
+                "sqlite3 reader exited before acquiring shared lock: {}",
+                child.wait_with_output().map_or_else(
+                    |_| "wait_with_output failed".to_string(),
+                    |output| String::from_utf8_lossy(&output.stderr).into_owned(),
+                )
+            );
+            if line.trim() == "1" {
+                child.stdout = Some(stdout.into_inner());
+                return child;
+            }
+        }
+    }
+
+    fn finish_sqlite3_transaction(mut child: Child) {
+        let stdin = child
+            .stdin
+            .as_mut()
+            .expect("sqlite3 reader should keep stdin open");
+        stdin
+            .write_all(b"COMMIT;\n.quit\n")
+            .expect("sqlite3 reader teardown should write");
+        stdin.flush().expect("sqlite3 reader teardown should flush");
+        let output = child
+            .wait_with_output()
+            .expect("sqlite3 reader should exit cleanly");
+        assert!(
+            output.status.success(),
+            "sqlite3 reader teardown failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     fn setup_sqlite_wal_db(path: &Path) {
@@ -2194,6 +2341,45 @@ mod tests {
         file.lock(&cx, LockLevel::Shared).unwrap();
         assert_eq!(file.lock_level, LockLevel::Shared);
 
+        file.unlock(&cx, LockLevel::None).unwrap();
+        file.close(&cx).unwrap();
+    }
+
+    #[test]
+    fn test_failed_exclusive_upgrade_releases_pending_lock() {
+        if !sqlite3_available() {
+            return;
+        }
+
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("exclusive_upgrade_busy.db");
+        setup_sqlite_delete_journal_db(&path);
+
+        let (mut file, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        file.lock(&cx, LockLevel::Shared).unwrap();
+        file.lock(&cx, LockLevel::Reserved).unwrap();
+
+        let reader = spawn_sqlite3_reader_transaction(&path);
+        let err = file.lock(&cx, LockLevel::Exclusive).unwrap_err();
+        assert!(
+            matches!(err, FrankenError::Busy),
+            "exclusive upgrade should fail while a legacy reader holds SHARED"
+        );
+        assert_eq!(
+            file.lock_level,
+            LockLevel::Reserved,
+            "failed upgrade should roll back to the prior lock level"
+        );
+
+        let another_reader = sqlite3_exec(&path, "PRAGMA busy_timeout=0; SELECT COUNT(*) FROM t;");
+        assert!(
+            another_reader.status.success(),
+            "failed exclusive upgrade must not strand the PENDING byte; stderr={}",
+            String::from_utf8_lossy(&another_reader.stderr)
+        );
+
+        finish_sqlite3_transaction(reader);
         file.unlock(&cx, LockLevel::None).unwrap();
         file.close(&cx).unwrap();
     }

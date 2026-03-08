@@ -17,6 +17,8 @@ use fsqlite_types::{Cx, PageNumber};
 
 use crate::vectorized::{Batch, BatchFormatError, Column, ColumnData, ColumnSpec, SelectionVector};
 
+const MAX_BATCH_CAPACITY: usize = u16::MAX as usize;
+
 /// Row predicate for scan-time filter pushdown.
 pub type RowPredicate = Arc<dyn Fn(i64, &[SqliteValue]) -> bool + Send + Sync + 'static>;
 
@@ -64,9 +66,10 @@ impl fmt::Display for VectorizedScanError {
                     "invalid morsel range: start page {start} > end page {end}"
                 )
             }
-            Self::InvalidBatchCapacity(capacity) => {
-                write!(f, "batch capacity must be positive, got {capacity}")
-            }
+            Self::InvalidBatchCapacity(capacity) => write!(
+                f,
+                "batch capacity must be in 1..={MAX_BATCH_CAPACITY}, got {capacity}"
+            ),
             Self::RecordDecode { rowid, payload_len } => write!(
                 f,
                 "failed to decode record payload for rowid {rowid} (payload_len={payload_len})"
@@ -195,18 +198,20 @@ where
     ///
     /// # Errors
     ///
-    /// Returns an error when `batch_capacity` is zero.
+    /// Returns an error when `batch_capacity` is zero or exceeds the
+    /// selection-vector index range.
     pub fn try_new(
+        cx: &Cx,
         cursor: BtCursor<P>,
         specs: Vec<ColumnSpec>,
         batch_capacity: usize,
     ) -> ScanResult<Self> {
-        if batch_capacity == 0 {
+        if batch_capacity == 0 || batch_capacity > MAX_BATCH_CAPACITY {
             return Err(VectorizedScanError::InvalidBatchCapacity(batch_capacity));
         }
         Ok(Self {
             cursor,
-            cx: Cx::new(),
+            cx: cx.create_child(),
             specs,
             batch_capacity,
             predicate: None,
@@ -275,8 +280,13 @@ where
                     continue;
                 }
                 if current_page > morsel.end_page {
-                    self.finished = true;
-                    break;
+                    // Leaf page numbers are not guaranteed to be monotonic in
+                    // table scan order, so keep scanning instead of stopping.
+                    if !self.cursor.next(&self.cx)? {
+                        self.finished = true;
+                        break;
+                    }
+                    continue;
                 }
             }
 
@@ -614,7 +624,10 @@ mod tests {
                     continue;
                 }
                 if current_page > m.end_page {
-                    break;
+                    if !cursor.next(&cx).expect("next should succeed") {
+                        break;
+                    }
+                    continue;
                 }
             }
 
@@ -640,9 +653,10 @@ mod tests {
     #[test]
     fn scan_output_matches_row_at_a_time_output() {
         let (io, root_page) = build_fixture(2_000);
+        let cx = Cx::new();
         let scan_cursor = BtCursor::new(io.clone(), root_page, PAGE_SIZE, true);
         let mut scan =
-            VectorizedTableScan::try_new(scan_cursor, specs(), DEFAULT_BATCH_ROW_CAPACITY)
+            VectorizedTableScan::try_new(&cx, scan_cursor, specs(), DEFAULT_BATCH_ROW_CAPACITY)
                 .expect("scan should initialize");
 
         let mut actual_rows = Vec::new();
@@ -671,9 +685,10 @@ mod tests {
     #[test]
     fn filter_pushdown_updates_selection_vector() {
         let (io, root_page) = build_fixture(1_500);
+        let cx = Cx::new();
         let predicate: RowPredicate = Arc::new(|rowid, _row| rowid % 3 == 0);
         let scan_cursor = BtCursor::new(io.clone(), root_page, PAGE_SIZE, true);
-        let mut scan = VectorizedTableScan::try_new(scan_cursor, specs(), 256)
+        let mut scan = VectorizedTableScan::try_new(&cx, scan_cursor, specs(), 256)
             .expect("scan should initialize")
             .with_predicate(predicate.clone());
 
@@ -703,6 +718,7 @@ mod tests {
     #[test]
     fn scan_respects_page_morsel_boundaries() {
         let (io, root_page) = build_fixture(3_000);
+        let cx = Cx::new();
         let (_all_rows, all_pages) =
             collect_rows_row_at_a_time(io.clone(), root_page, None, |_rowid, _row| true);
         assert!(
@@ -712,7 +728,7 @@ mod tests {
 
         let morsel = PageMorsel::new(all_pages[1], all_pages[2]).expect("morsel should be valid");
         let scan_cursor = BtCursor::new(io.clone(), root_page, PAGE_SIZE, true);
-        let mut scan = VectorizedTableScan::try_new(scan_cursor, specs(), 192)
+        let mut scan = VectorizedTableScan::try_new(&cx, scan_cursor, specs(), 192)
             .expect("scan should initialize")
             .with_morsel(morsel);
 
@@ -748,6 +764,7 @@ mod tests {
     #[test]
     fn prefetch_hints_are_emitted_during_scan() {
         let (io, root_page) = build_fixture(2_500);
+        let cx = Cx::new();
         let (all_rows, pages) =
             collect_rows_row_at_a_time(io.clone(), root_page, None, |_rowid, _row| true);
         assert!(
@@ -758,7 +775,7 @@ mod tests {
 
         let morsel = PageMorsel::new(pages[0], pages[1]).expect("morsel should be valid");
         let scan_cursor = BtCursor::new(io.clone(), root_page, PAGE_SIZE, true);
-        let mut scan = VectorizedTableScan::try_new(scan_cursor, specs(), 128)
+        let mut scan = VectorizedTableScan::try_new(&cx, scan_cursor, specs(), 128)
             .expect("scan should initialize")
             .with_morsel(morsel);
 
@@ -776,6 +793,23 @@ mod tests {
             !hinted_pages.is_empty(),
             "bead_id={BEAD_ID} expected page-reader prefetch hints"
         );
+    }
+
+    #[test]
+    fn scan_rejects_batch_capacity_beyond_selection_vector_limit() {
+        let (io, root_page) = build_fixture(1);
+        let cx = Cx::new();
+        let scan_cursor = BtCursor::new(io, root_page, PAGE_SIZE, true);
+        let capacity = MAX_BATCH_CAPACITY.saturating_add(1);
+
+        let err = match VectorizedTableScan::try_new(&cx, scan_cursor, specs(), capacity) {
+            Ok(_) => panic!("oversized batch capacity should be rejected up front"),
+            Err(err) => err,
+        };
+        assert!(matches!(
+            err,
+            VectorizedScanError::InvalidBatchCapacity(value) if value == capacity
+        ));
     }
 
     #[test]

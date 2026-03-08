@@ -1,8 +1,9 @@
 use std::path::Path;
-use std::thread;
 use std::time::{Duration, Instant};
 
-use fsqlite_types::{ObjectId, Oti};
+use asupersync::runtime::RuntimeBuilder;
+use asupersync::time::{sleep, wall_now};
+use fsqlite_types::{ObjectId, Oti, cx::Cx};
 use fsqlite_wal::{
     WalFecGroupMeta, WalFecGroupMetaInit, WalFecRepairPipeline, WalFecRepairPipelineConfig,
     WalFecRepairWorkItem, build_source_page_hashes, find_wal_fec_group,
@@ -11,6 +12,17 @@ use fsqlite_wal::{
 use tempfile::tempdir;
 
 const PAGE_SIZE: u32 = 4096;
+
+fn test_runtime() -> asupersync::runtime::Runtime {
+    RuntimeBuilder::current_thread()
+        .blocking_threads(1, 1)
+        .build()
+        .expect("runtime should build")
+}
+
+fn test_cx() -> Cx {
+    Cx::default()
+}
 
 fn sample_payload(seed: u8) -> Vec<u8> {
     let page_len = usize::try_from(PAGE_SIZE).expect("PAGE_SIZE should fit in usize");
@@ -97,22 +109,34 @@ fn sample_work_item(
 fn test_bd_1hi_10_unit_compliance_gate() {
     let temp_dir = tempdir().expect("tempdir should be created");
     let sidecar_path = temp_dir.path().join("unit.wal-fec");
-    let mut pipeline = WalFecRepairPipeline::start(WalFecRepairPipelineConfig {
-        queue_capacity: 8,
-        per_symbol_delay: Duration::from_millis(2),
-    })
-    .expect("pipeline should start");
+    let runtime = test_runtime();
+    let handle = runtime.handle();
 
-    let work_item = sample_work_item(&sidecar_path, 1, 4, 2, 8, b"bd-1hi.10-unit", 512);
-    pipeline.enqueue(work_item).expect("enqueue should succeed");
+    runtime.block_on(async {
+        let cx = test_cx();
+        let mut pipeline = WalFecRepairPipeline::start(
+            &handle,
+            WalFecRepairPipelineConfig {
+                queue_capacity: 8,
+                per_symbol_delay: Duration::from_millis(2),
+            },
+        )
+        .expect("pipeline should start");
 
-    assert!(
-        pipeline.flush(Duration::from_secs(3)),
-        "pipeline should drain within timeout"
-    );
-    let stats = pipeline.shutdown().expect("shutdown should succeed");
-    assert_eq!(stats.completed_jobs, 1);
-    assert_eq!(stats.failed_jobs, 0);
+        let work_item = sample_work_item(&sidecar_path, 1, 4, 2, 8, b"bd-1hi.10-unit", 512);
+        pipeline.enqueue(work_item).expect("enqueue should succeed");
+
+        assert!(
+            pipeline.flush(&cx, Duration::from_secs(3)).await,
+            "pipeline should drain within timeout"
+        );
+        let stats = pipeline
+            .shutdown(&cx)
+            .await
+            .expect("shutdown should succeed");
+        assert_eq!(stats.completed_jobs, 1);
+        assert_eq!(stats.failed_jobs, 0);
+    });
 }
 
 #[test]
@@ -156,177 +180,237 @@ fn prop_bd_1hi_10_structure_compliance() {
 fn test_repair_generation_pipelined() {
     let temp_dir = tempdir().expect("tempdir should be created");
     let sidecar_path = temp_dir.path().join("pipeline.wal-fec");
-    let mut pipeline = WalFecRepairPipeline::start(WalFecRepairPipelineConfig {
-        queue_capacity: 16,
-        per_symbol_delay: Duration::from_millis(20),
-    })
-    .expect("pipeline should start");
+    let runtime = test_runtime();
+    let handle = runtime.handle();
 
-    for index in 0_u32..3 {
-        let tag = format!("pipeline-{index}");
-        let item = sample_work_item(
-            &sidecar_path,
-            (index * 4) + 1,
-            4,
-            3,
-            u8::try_from(index + 7).expect("small index should fit u8"),
-            tag.as_bytes(),
-            2048 + index,
+    runtime.block_on(async {
+        let cx = test_cx();
+        let mut pipeline = WalFecRepairPipeline::start(
+            &handle,
+            WalFecRepairPipelineConfig {
+                queue_capacity: 16,
+                per_symbol_delay: Duration::from_millis(20),
+            },
+        )
+        .expect("pipeline should start");
+
+        for index in 0_u32..3 {
+            let tag = format!("pipeline-{index}");
+            let item = sample_work_item(
+                &sidecar_path,
+                (index * 4) + 1,
+                4,
+                3,
+                u8::try_from(index + 7).expect("small index should fit u8"),
+                tag.as_bytes(),
+                2048 + index,
+            );
+            pipeline.enqueue(item).expect("enqueue should succeed");
+        }
+
+        sleep(wall_now(), Duration::from_millis(25)).await;
+        let mid_stats = pipeline.stats();
+        assert!(
+            mid_stats.pending_jobs >= 1,
+            "at least one queued/in-flight job should remain while worker is generating symbols"
         );
-        pipeline.enqueue(item).expect("enqueue should succeed");
-    }
+        assert!(
+            mid_stats.max_pending_jobs >= 2,
+            "pipeline should observe buffered jobs while processing"
+        );
 
-    thread::sleep(Duration::from_millis(25));
-    let mid_stats = pipeline.stats();
-    assert!(
-        mid_stats.pending_jobs >= 1,
-        "at least one queued/in-flight job should remain while worker is generating symbols"
-    );
-    assert!(
-        mid_stats.max_pending_jobs >= 2,
-        "pipeline should observe buffered jobs while processing"
-    );
-
-    assert!(
-        pipeline.flush(Duration::from_secs(10)),
-        "pipeline should eventually catch up"
-    );
-    let final_stats = pipeline.shutdown().expect("shutdown should succeed");
-    assert_eq!(final_stats.completed_jobs, 3);
-    let scan = scan_wal_fec(&sidecar_path).expect("sidecar scan should succeed");
-    assert_eq!(scan.groups.len(), 3);
-    assert!(!scan.truncated_tail);
+        assert!(
+            pipeline.flush(&cx, Duration::from_secs(10)).await,
+            "pipeline should eventually catch up"
+        );
+        let final_stats = pipeline
+            .shutdown(&cx)
+            .await
+            .expect("shutdown should succeed");
+        assert_eq!(final_stats.completed_jobs, 3);
+        let scan = scan_wal_fec(&sidecar_path).expect("sidecar scan should succeed");
+        assert_eq!(scan.groups.len(), 3);
+        assert!(!scan.truncated_tail);
+    });
 }
 
 #[test]
 fn test_repair_generation_off_commit_path() {
     let temp_dir = tempdir().expect("tempdir should be created");
     let sidecar_path = temp_dir.path().join("off-path.wal-fec");
-    let mut pipeline = WalFecRepairPipeline::start(WalFecRepairPipelineConfig {
-        queue_capacity: 8,
-        per_symbol_delay: Duration::from_millis(80),
-    })
-    .expect("pipeline should start");
-    let item = sample_work_item(&sidecar_path, 1, 4, 4, 21, b"off-path", 4096);
+    let runtime = test_runtime();
+    let handle = runtime.handle();
 
-    let enqueue_started = Instant::now();
-    pipeline.enqueue(item).expect("enqueue should not block");
-    let enqueue_elapsed = enqueue_started.elapsed();
-    assert!(
-        enqueue_elapsed < Duration::from_millis(75),
-        "enqueue should stay off commit path; elapsed={enqueue_elapsed:?}"
-    );
-    assert_eq!(pipeline.stats().pending_jobs, 1);
+    runtime.block_on(async {
+        let cx = test_cx();
+        let mut pipeline = WalFecRepairPipeline::start(
+            &handle,
+            WalFecRepairPipelineConfig {
+                queue_capacity: 8,
+                per_symbol_delay: Duration::from_millis(80),
+            },
+        )
+        .expect("pipeline should start");
+        let item = sample_work_item(&sidecar_path, 1, 4, 4, 21, b"off-path", 4096);
 
-    assert!(
-        pipeline.flush(Duration::from_secs(10)),
-        "pipeline should drain after asynchronous generation"
-    );
-    let stats = pipeline.shutdown().expect("shutdown should succeed");
-    assert_eq!(stats.completed_jobs, 1);
+        let enqueue_started = Instant::now();
+        pipeline.enqueue(item).expect("enqueue should not block");
+        let enqueue_elapsed = enqueue_started.elapsed();
+        assert!(
+            enqueue_elapsed < Duration::from_millis(75),
+            "enqueue should stay off commit path; elapsed={enqueue_elapsed:?}"
+        );
+        assert_eq!(pipeline.stats().pending_jobs, 1);
+
+        assert!(
+            pipeline.flush(&cx, Duration::from_secs(10)).await,
+            "pipeline should drain after asynchronous generation"
+        );
+        let stats = pipeline
+            .shutdown(&cx)
+            .await
+            .expect("shutdown should succeed");
+        assert_eq!(stats.completed_jobs, 1);
+    });
 }
 
 #[test]
 fn test_repair_generation_catches_up() {
     let temp_dir = tempdir().expect("tempdir should be created");
     let sidecar_path = temp_dir.path().join("catch-up.wal-fec");
-    let mut pipeline = WalFecRepairPipeline::start(WalFecRepairPipelineConfig {
-        queue_capacity: 32,
-        per_symbol_delay: Duration::from_millis(5),
-    })
-    .expect("pipeline should start");
+    let runtime = test_runtime();
+    let handle = runtime.handle();
 
-    for index in 0_u32..8 {
-        let tag = format!("catchup-{index}");
-        let item = sample_work_item(
-            &sidecar_path,
-            (index * 3) + 1,
-            3,
-            2,
-            u8::try_from(index + 11).expect("small index should fit u8"),
-            tag.as_bytes(),
-            500 + index,
+    runtime.block_on(async {
+        let cx = test_cx();
+        let mut pipeline = WalFecRepairPipeline::start(
+            &handle,
+            WalFecRepairPipelineConfig {
+                queue_capacity: 32,
+                per_symbol_delay: Duration::from_millis(5),
+            },
+        )
+        .expect("pipeline should start");
+
+        for index in 0_u32..8 {
+            let tag = format!("catchup-{index}");
+            let item = sample_work_item(
+                &sidecar_path,
+                (index * 3) + 1,
+                3,
+                2,
+                u8::try_from(index + 11).expect("small index should fit u8"),
+                tag.as_bytes(),
+                500 + index,
+            );
+            pipeline.enqueue(item).expect("enqueue should succeed");
+        }
+
+        assert!(
+            pipeline.flush(&cx, Duration::from_secs(20)).await,
+            "pipeline should catch up after burst"
         );
-        pipeline.enqueue(item).expect("enqueue should succeed");
-    }
+        let stats = pipeline
+            .shutdown(&cx)
+            .await
+            .expect("shutdown should succeed");
+        assert_eq!(stats.completed_jobs, 8);
+        assert_eq!(stats.failed_jobs, 0);
+        assert!(
+            stats.max_pending_jobs >= 2,
+            "catch-up requires queueing beyond immediate execution"
+        );
 
-    assert!(
-        pipeline.flush(Duration::from_secs(20)),
-        "pipeline should catch up after burst"
-    );
-    let stats = pipeline.shutdown().expect("shutdown should succeed");
-    assert_eq!(stats.completed_jobs, 8);
-    assert_eq!(stats.failed_jobs, 0);
-    assert!(
-        stats.max_pending_jobs >= 2,
-        "catch-up requires queueing beyond immediate execution"
-    );
-
-    let scan = scan_wal_fec(&sidecar_path).expect("sidecar scan should succeed");
-    assert_eq!(scan.groups.len(), 8);
+        let scan = scan_wal_fec(&sidecar_path).expect("sidecar scan should succeed");
+        assert_eq!(scan.groups.len(), 8);
+    });
 }
 
 #[test]
 fn test_repair_generation_backpressure_queue_full() {
     let temp_dir = tempdir().expect("tempdir should be created");
     let sidecar_path = temp_dir.path().join("queue-full.wal-fec");
-    let mut pipeline = WalFecRepairPipeline::start(WalFecRepairPipelineConfig {
-        queue_capacity: 1,
-        per_symbol_delay: Duration::from_millis(120),
-    })
-    .expect("pipeline should start");
+    let runtime = test_runtime();
+    let handle = runtime.handle();
 
-    let item_a = sample_work_item(&sidecar_path, 1, 4, 3, 31, b"queue-a", 900);
-    let item_b = sample_work_item(&sidecar_path, 5, 4, 3, 33, b"queue-b", 904);
-    let item_c = sample_work_item(&sidecar_path, 9, 4, 3, 35, b"queue-c", 908);
+    runtime.block_on(async {
+        let cx = test_cx();
+        let mut pipeline = WalFecRepairPipeline::start(
+            &handle,
+            WalFecRepairPipelineConfig {
+                queue_capacity: 1,
+                per_symbol_delay: Duration::from_millis(120),
+            },
+        )
+        .expect("pipeline should start");
 
-    pipeline.enqueue(item_a).expect("enqueue A should succeed");
-    let second = pipeline.enqueue(item_b);
-    let third = pipeline.enqueue(item_c);
-    let queue_full_error = second
-        .err()
-        .or_else(|| third.err())
-        .expect("at least one enqueue must fail from queue-full backpressure");
-    assert!(
-        queue_full_error.to_string().contains("queue full"),
-        "expected queue-full backpressure error, got {queue_full_error}"
-    );
+        let item_a = sample_work_item(&sidecar_path, 1, 4, 3, 31, b"queue-a", 900);
+        let item_b = sample_work_item(&sidecar_path, 5, 4, 3, 33, b"queue-b", 904);
+        let item_c = sample_work_item(&sidecar_path, 9, 4, 3, 35, b"queue-c", 908);
 
-    pipeline.cancel();
-    let _ = pipeline.shutdown().expect("shutdown should succeed");
+        pipeline.enqueue(item_a).expect("enqueue A should succeed");
+        let second = pipeline.enqueue(item_b);
+        let third = pipeline.enqueue(item_c);
+        let queue_full_error = second
+            .err()
+            .or_else(|| third.err())
+            .expect("at least one enqueue must fail from queue-full backpressure");
+        assert!(
+            queue_full_error.to_string().contains("queue full"),
+            "expected queue-full backpressure error, got {queue_full_error}"
+        );
+
+        pipeline.cancel();
+        let _ = pipeline
+            .shutdown(&cx)
+            .await
+            .expect("shutdown should succeed");
+    });
 }
 
 #[test]
 fn test_repair_generation_shutdown_drains_pending_jobs() {
     let temp_dir = tempdir().expect("tempdir should be created");
     let sidecar_path = temp_dir.path().join("shutdown-drain.wal-fec");
-    let mut pipeline = WalFecRepairPipeline::start(WalFecRepairPipelineConfig {
-        queue_capacity: 16,
-        per_symbol_delay: Duration::from_millis(10),
-    })
-    .expect("pipeline should start");
+    let runtime = test_runtime();
+    let handle = runtime.handle();
 
-    for index in 0_u32..4 {
-        let tag = format!("drain-{index}");
-        let item = sample_work_item(
-            &sidecar_path,
-            (index * 4) + 1,
-            4,
-            2,
-            u8::try_from(index + 41).expect("small index should fit u8"),
-            tag.as_bytes(),
-            1_200 + index,
-        );
-        pipeline.enqueue(item).expect("enqueue should succeed");
-    }
+    runtime.block_on(async {
+        let cx = test_cx();
+        let mut pipeline = WalFecRepairPipeline::start(
+            &handle,
+            WalFecRepairPipelineConfig {
+                queue_capacity: 16,
+                per_symbol_delay: Duration::from_millis(10),
+            },
+        )
+        .expect("pipeline should start");
 
-    let stats = pipeline.shutdown().expect("shutdown should drain queue");
-    assert_eq!(stats.completed_jobs, 4);
-    assert_eq!(stats.failed_jobs, 0);
-    assert_eq!(stats.canceled_jobs, 0);
+        for index in 0_u32..4 {
+            let tag = format!("drain-{index}");
+            let item = sample_work_item(
+                &sidecar_path,
+                (index * 4) + 1,
+                4,
+                2,
+                u8::try_from(index + 41).expect("small index should fit u8"),
+                tag.as_bytes(),
+                1_200 + index,
+            );
+            pipeline.enqueue(item).expect("enqueue should succeed");
+        }
 
-    let scan = scan_wal_fec(&sidecar_path).expect("sidecar scan should succeed");
-    assert_eq!(scan.groups.len(), 4);
+        let stats = pipeline
+            .shutdown(&cx)
+            .await
+            .expect("shutdown should drain queue");
+        assert_eq!(stats.completed_jobs, 4);
+        assert_eq!(stats.failed_jobs, 0);
+        assert_eq!(stats.canceled_jobs, 0);
+
+        let scan = scan_wal_fec(&sidecar_path).expect("sidecar scan should succeed");
+        assert_eq!(scan.groups.len(), 4);
+    });
 }
 
 #[test]
@@ -334,12 +418,6 @@ fn test_repair_generation_shutdown_drains_pending_jobs() {
 fn test_repair_generation_commit_path_overhead_under_one_percent() {
     let temp_dir = tempdir().expect("tempdir should be created");
     let sidecar_path = temp_dir.path().join("throughput-window.wal-fec");
-    let mut pipeline = WalFecRepairPipeline::start(WalFecRepairPipelineConfig {
-        queue_capacity: 256,
-        per_symbol_delay: Duration::from_millis(12),
-    })
-    .expect("pipeline should start");
-
     let commits = 80_u32;
     let simulated_commit_cost = Duration::from_millis(4);
     let mut queued_work = Vec::with_capacity(usize::try_from(commits).expect("small count"));
@@ -356,100 +434,143 @@ fn test_repair_generation_commit_path_overhead_under_one_percent() {
         ));
     }
 
-    let baseline_start = Instant::now();
-    for _ in 0..commits {
-        thread::sleep(simulated_commit_cost);
-    }
-    let baseline_elapsed = baseline_start.elapsed();
+    let runtime = test_runtime();
+    let handle = runtime.handle();
 
-    let async_start = Instant::now();
-    for item in queued_work {
-        thread::sleep(simulated_commit_cost);
-        pipeline
-            .enqueue(item)
-            .expect("enqueue should remain non-blocking under bounded queue");
-    }
-    let async_elapsed = async_start.elapsed();
+    runtime.block_on(async {
+        let baseline_start = Instant::now();
+        for _ in 0..commits {
+            sleep(wall_now(), simulated_commit_cost).await;
+        }
+        let baseline_elapsed = baseline_start.elapsed();
 
-    assert!(
-        pipeline.flush(Duration::from_secs(40)),
-        "pipeline should catch up after throughput run"
-    );
-    let stats = pipeline.shutdown().expect("shutdown should succeed");
-    assert_eq!(stats.failed_jobs, 0);
+        let cx = test_cx();
+        let mut pipeline = WalFecRepairPipeline::start(
+            &handle,
+            WalFecRepairPipelineConfig {
+                queue_capacity: 256,
+                per_symbol_delay: Duration::from_millis(12),
+            },
+        )
+        .expect("pipeline should start");
 
-    let baseline_secs = baseline_elapsed.as_secs_f64().max(f64::EPSILON);
-    let async_secs = async_elapsed.as_secs_f64();
-    let overhead_ratio = ((async_secs - baseline_secs) / baseline_secs).max(0.0);
-    assert!(
-        overhead_ratio <= 0.01,
-        "critical-path overhead should remain <=1%; baseline={baseline_elapsed:?} async={async_elapsed:?} overhead={:.2}%",
-        overhead_ratio * 100.0
-    );
+        let async_start = Instant::now();
+        for item in queued_work {
+            sleep(wall_now(), simulated_commit_cost).await;
+            pipeline
+                .enqueue(item)
+                .expect("enqueue should remain non-blocking under bounded queue");
+        }
+        let async_elapsed = async_start.elapsed();
+
+        assert!(
+            pipeline.flush(&cx, Duration::from_secs(40)).await,
+            "pipeline should catch up after throughput run"
+        );
+        let stats = pipeline.shutdown(&cx).await.expect("shutdown should succeed");
+        assert_eq!(stats.failed_jobs, 0);
+
+        let baseline_secs = baseline_elapsed.as_secs_f64().max(f64::EPSILON);
+        let async_secs = async_elapsed.as_secs_f64();
+        let overhead_ratio = ((async_secs - baseline_secs) / baseline_secs).max(0.0);
+        assert!(
+            overhead_ratio <= 0.01,
+            "critical-path overhead should remain <=1%; baseline={baseline_elapsed:?} async={async_elapsed:?} overhead={:.2}%",
+            overhead_ratio * 100.0
+        );
+    });
 }
 
 #[test]
 fn test_repair_generation_cancel_safe() {
     let temp_dir = tempdir().expect("tempdir should be created");
     let sidecar_path = temp_dir.path().join("cancel.wal-fec");
-    let mut pipeline = WalFecRepairPipeline::start(WalFecRepairPipelineConfig {
-        queue_capacity: 4,
-        per_symbol_delay: Duration::from_millis(100),
-    })
-    .expect("pipeline should start");
+    let runtime = test_runtime();
+    let handle = runtime.handle();
 
-    let item = sample_work_item(&sidecar_path, 1, 4, 4, 17, b"cancel-safe", 777);
-    pipeline.enqueue(item).expect("enqueue should succeed");
-    thread::sleep(Duration::from_millis(35));
+    runtime.block_on(async {
+        let cx = test_cx();
+        let mut pipeline = WalFecRepairPipeline::start(
+            &handle,
+            WalFecRepairPipelineConfig {
+                queue_capacity: 4,
+                per_symbol_delay: Duration::from_millis(100),
+            },
+        )
+        .expect("pipeline should start");
 
-    pipeline.cancel();
-    let stats = pipeline.shutdown().expect("shutdown should succeed");
-    assert!(
-        stats.canceled_jobs >= 1,
-        "in-flight job should be canceled without partial append"
-    );
+        let item = sample_work_item(&sidecar_path, 1, 4, 4, 17, b"cancel-safe", 777);
+        pipeline.enqueue(item).expect("enqueue should succeed");
+        sleep(wall_now(), Duration::from_millis(35)).await;
 
-    let scan = scan_wal_fec(&sidecar_path).expect("scan should succeed");
-    assert!(
-        scan.groups.is_empty(),
-        "cancel-safe behavior must avoid partially written groups"
-    );
+        pipeline.cancel();
+        assert!(
+            pipeline.flush(&cx, Duration::from_secs(2)).await,
+            "pipeline should settle once the canceled work item drains"
+        );
+        let stats = pipeline
+            .shutdown(&cx)
+            .await
+            .expect("shutdown should succeed");
+        assert!(
+            stats.canceled_jobs >= 1,
+            "in-flight job should be canceled without partial append"
+        );
+
+        let scan = scan_wal_fec(&sidecar_path).expect("scan should succeed");
+        assert!(
+            scan.groups.is_empty(),
+            "cancel-safe behavior must avoid partially written groups"
+        );
+    });
 }
 
 #[test]
 fn test_e2e_bd_1hi_10_compliance() {
     let temp_dir = tempdir().expect("tempdir should be created");
     let sidecar_path = temp_dir.path().join("e2e.wal-fec");
-    let mut pipeline = WalFecRepairPipeline::start(WalFecRepairPipelineConfig {
-        queue_capacity: 8,
-        per_symbol_delay: Duration::from_millis(2),
-    })
-    .expect("pipeline should start");
+    let runtime = test_runtime();
+    let handle = runtime.handle();
 
-    let item_a = sample_work_item(&sidecar_path, 1, 3, 2, 1, b"e2e-a", 100);
-    let item_b = sample_work_item(&sidecar_path, 4, 3, 2, 9, b"e2e-b", 103);
-    let item_c = sample_work_item(&sidecar_path, 7, 3, 2, 21, b"e2e-c", 106);
-    let target_group_id = item_b.meta.group_id();
+    runtime.block_on(async {
+        let cx = test_cx();
+        let mut pipeline = WalFecRepairPipeline::start(
+            &handle,
+            WalFecRepairPipelineConfig {
+                queue_capacity: 8,
+                per_symbol_delay: Duration::from_millis(2),
+            },
+        )
+        .expect("pipeline should start");
 
-    pipeline.enqueue(item_a).expect("enqueue A");
-    pipeline.enqueue(item_b).expect("enqueue B");
-    pipeline.enqueue(item_c).expect("enqueue C");
-    assert!(
-        pipeline.flush(Duration::from_secs(10)),
-        "pipeline should fully drain in e2e run"
-    );
-    let stats = pipeline.shutdown().expect("shutdown should succeed");
-    assert_eq!(stats.completed_jobs, 3);
+        let item_a = sample_work_item(&sidecar_path, 1, 3, 2, 1, b"e2e-a", 100);
+        let item_b = sample_work_item(&sidecar_path, 4, 3, 2, 9, b"e2e-b", 103);
+        let item_c = sample_work_item(&sidecar_path, 7, 3, 2, 21, b"e2e-c", 106);
+        let target_group_id = item_b.meta.group_id();
 
-    let scan = scan_wal_fec(&sidecar_path).expect("scan should succeed");
-    assert_eq!(scan.groups.len(), 3);
-    assert!(!scan.truncated_tail);
-    let found = find_wal_fec_group(&sidecar_path, target_group_id)
-        .expect("lookup should succeed")
-        .expect("target group should exist");
-    assert_eq!(found.meta.group_id(), target_group_id);
-    assert_eq!(
-        found.repair_symbols.len(),
-        usize::try_from(found.meta.r_repair).expect("small r should fit usize")
-    );
+        pipeline.enqueue(item_a).expect("enqueue A");
+        pipeline.enqueue(item_b).expect("enqueue B");
+        pipeline.enqueue(item_c).expect("enqueue C");
+        assert!(
+            pipeline.flush(&cx, Duration::from_secs(10)).await,
+            "pipeline should fully drain in e2e run"
+        );
+        let stats = pipeline
+            .shutdown(&cx)
+            .await
+            .expect("shutdown should succeed");
+        assert_eq!(stats.completed_jobs, 3);
+
+        let scan = scan_wal_fec(&sidecar_path).expect("scan should succeed");
+        assert_eq!(scan.groups.len(), 3);
+        assert!(!scan.truncated_tail);
+        let found = find_wal_fec_group(&sidecar_path, target_group_id)
+            .expect("lookup should succeed")
+            .expect("target group should exist");
+        assert_eq!(found.meta.group_id(), target_group_id);
+        assert_eq!(
+            found.repair_symbols.len(),
+            usize::try_from(found.meta.r_repair).expect("small r should fit usize")
+        );
+    });
 }

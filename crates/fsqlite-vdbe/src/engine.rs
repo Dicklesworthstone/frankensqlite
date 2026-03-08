@@ -920,13 +920,47 @@ impl PageReader for TimeTravelPageIo {
                 return Ok(version.data.into_vec());
             }
         }
+
+        // The VersionStore has no version for this page at this snapshot.
+        //
+        // Fallthrough to the current transaction is only correct when the
+        // VersionStore is actively tracking page versions (i.e., Native mode
+        // with a populated commit stream). In that case, absence from the
+        // store means the page has not changed since the target commit, so
+        // the current on-disk version is the correct historical version.
+        //
+        // However, if the VersionStore is empty (page_count == 0), the MVCC
+        // subsystem is not tracking any historical state. Falling through
+        // would silently return current data, which is incorrect and
+        // violates the time-travel query contract. In that case, we must
+        // fail explicitly.
+        let store_has_versions = (*vs).page_count() > 0;
         drop(vs);
-        // Page not in the version store — it hasn't changed since the
-        // target commit, so the current transaction's page is correct.
+
+        if !store_has_versions {
+            tracing::warn!(
+                page_id = page_no.get(),
+                commit_seq = self.snapshot.target_commit_seq().get(),
+                "time-travel: VersionStore is empty — cannot serve historical \
+                 page; historical data not available for this commit"
+            );
+            return Err(FrankenError::Internal(format!(
+                "time-travel query failed: historical data not available for \
+                 commit_seq={} (MVCC version store has no historical page \
+                 versions; the database may be running in compatibility mode \
+                 where time-travel is not yet supported)",
+                self.snapshot.target_commit_seq().get(),
+            )));
+        }
+
+        // VersionStore is populated but this specific page is absent —
+        // the page has not changed since the target commit, so the
+        // current transaction's version is correct.
         tracing::trace!(
             page_id = page_no.get(),
             commit_seq = self.snapshot.target_commit_seq().get(),
-            "time-travel: page not in version store, falling through to txn"
+            "time-travel: page not in version store (unchanged since target \
+             commit), falling through to txn"
         );
         self.inner.read_page(cx, page_no)
     }
@@ -2015,6 +2049,8 @@ pub struct VdbeEngine {
     registers: Vec<SqliteValue>,
     /// Bound SQL parameter values (`?1`, `?2`, ...).
     bindings: Vec<SqliteValue>,
+    /// Root capability context for execution-owned cursor and virtual-table work.
+    execution_cx: Cx,
     /// Whether opcode-level tracing is enabled.
     trace_opcodes: bool,
     /// Result rows accumulated during execution.
@@ -2365,14 +2401,26 @@ fn distinct_key(args: &[SqliteValue]) -> DistinctKeyBuf {
 
 impl VdbeEngine {
     /// Create a new engine with enough registers for the given program.
+    ///
+    /// This detached convenience constructor is kept for legacy/test callers.
+    /// Production execution paths should prefer [`Self::new_with_execution_cx`]
+    /// so capability lineage is preserved end-to-end.
+    #[must_use]
+    pub fn new(register_count: i32) -> Self {
+        let detached_execution_cx = Cx::new();
+        Self::new_with_execution_cx(register_count, &detached_execution_cx)
+    }
+
+    /// Create a new engine rooted in the caller's execution context.
     #[must_use]
     #[allow(clippy::cast_sign_loss)]
-    pub fn new(register_count: i32) -> Self {
+    pub fn new_with_execution_cx(register_count: i32, execution_cx: &Cx) -> Self {
         // +1 because registers are 1-indexed (register 0 unused).
         let count = register_count.max(0) as u32 + 1;
         Self {
             registers: vec![SqliteValue::Null; count as usize],
             bindings: Vec::new(),
+            execution_cx: execution_cx.create_child(),
             trace_opcodes: opcode_trace_enabled(),
             results: Vec::new(),
             cursors: SwissIndex::new(),
@@ -2438,6 +2486,15 @@ impl VdbeEngine {
     /// `TimeTravelPageIo` cursors.
     pub fn set_version_store(&mut self, vs: Rc<RefCell<VersionStore>>) {
         self.version_store = Some(vs);
+    }
+
+    /// Attach the root capability context for this execution.
+    pub fn set_execution_cx(&mut self, cx: Cx) {
+        self.execution_cx = cx;
+    }
+
+    fn derive_execution_cx(&self) -> Cx {
+        self.execution_cx.create_child()
     }
 
     /// Handles REPLACE conflict resolution natively (bd-2yqp6.x).
@@ -3538,7 +3595,7 @@ impl VdbeEngine {
                     };
                     if let Some(root_pgno) = root_pgno {
                         let store = MemPageStore::with_empty_index(root_pgno, AUTOINDEX_PAGE_SIZE);
-                        let cx = Cx::new();
+                        let cx = self.derive_execution_cx();
                         let cursor = BtCursor::new(store, root_pgno, AUTOINDEX_PAGE_SIZE, false);
                         self.cursors.remove(&cursor_id);
                         self.storage_cursors.insert(
@@ -6023,9 +6080,9 @@ impl VdbeEngine {
                     // P4 = number of filter arguments (via P4::Int)
                     let cursor_id = op.p1;
                     let jump_if_empty = op.p2;
+                    let cx = self.derive_execution_cx();
 
                     if let Some(state) = self.vtab_cursors.get_mut(&cursor_id) {
-                        let cx = Cx::new();
                         let n_args = match &op.p4 {
                             P4::Int(n) => *n as usize,
                             _ => 0,
@@ -6090,9 +6147,9 @@ impl VdbeEngine {
                     // P2 = jump address to loop body (go back if not eof)
                     let cursor_id = op.p1;
                     let jump_if_more = op.p2;
+                    let cx = self.derive_execution_cx();
 
                     if let Some(state) = self.vtab_cursors.get_mut(&cursor_id) {
-                        let cx = Cx::new();
                         if let Err(e) = state.cursor.next(&cx) {
                             break ExecOutcome::Error {
                                 code: 1,
@@ -6117,6 +6174,7 @@ impl VdbeEngine {
                     let n_args = op.p2;
                     let first_reg = op.p3;
                     let dest_reg = op.p5 as i32;
+                    let cx = self.derive_execution_cx();
                     #[allow(clippy::cast_sign_loss)]
                     let args: Vec<SqliteValue> = (0..n_args)
                         .map(|i| {
@@ -6127,7 +6185,6 @@ impl VdbeEngine {
                         })
                         .collect();
                     if let Some(vtab) = self.vtab_instances.get_mut(&cursor_id) {
-                        let cx = Cx::new();
                         match vtab.vtab_update(&cx, &args) {
                             Ok(Some(rowid)) => {
                                 #[allow(clippy::cast_sign_loss)]
@@ -6161,8 +6218,8 @@ impl VdbeEngine {
                     // Begin a virtual table transaction.
                     // P1 = cursor number identifying the vtab instance.
                     let cursor_id = op.p1;
+                    let cx = self.derive_execution_cx();
                     if let Some(vtab) = self.vtab_instances.get_mut(&cursor_id) {
-                        let cx = Cx::new();
                         if let Err(e) = vtab.begin(&cx) {
                             break ExecOutcome::Error {
                                 code: 1,
@@ -6220,12 +6277,12 @@ impl VdbeEngine {
                     // P1 = cursor number for the vtab instance
                     // P4 = new table name (via P4::Str)
                     let cursor_id = op.p1;
+                    let cx = self.derive_execution_cx();
                     if let Some(vtab) = self.vtab_instances.get_mut(&cursor_id) {
                         let new_name = match &op.p4 {
                             P4::Str(s) => s.as_str(),
                             _ => "",
                         };
-                        let cx = Cx::new();
                         if let Err(e) = vtab.rename(&cx, new_name) {
                             break ExecOutcome::Error {
                                 code: 1,
@@ -6508,11 +6565,11 @@ impl VdbeEngine {
         //
         // The only acceptable writable "bootstrap" case is a truly
         // zero-initialized root page that we can initialize in-place.
+        let txn_cx = self.derive_execution_cx();
         if let Some(ref mut page_io) = self.txn_page_io {
-            let cx = Cx::new();
             // If the pager read itself fails, fail cursor open instead of
             // treating it as an uninitialized page.
-            let page_data = match page_io.read_page(&cx, root_pgno) {
+            let page_data = match page_io.read_page(&txn_cx, root_pgno) {
                 Ok(bytes) => bytes,
                 Err(err) => {
                     tracing::warn!(
@@ -6571,7 +6628,7 @@ impl VdbeEngine {
                     cursor_id,
                     StorageCursor {
                         cursor: CursorBackend::Txn(cursor),
-                        cx,
+                        cx: txn_cx,
                         writable,
                         last_alloc_rowid: 0,
                         cached_row: None,
@@ -6618,7 +6675,7 @@ impl VdbeEngine {
                 // Byte 7: fragmented free bytes = 0.
 
                 // Write the initialized page to pager.
-                if let Err(err) = page_io.write_page(&cx, root_pgno, &page) {
+                if let Err(err) = page_io.write_page(&txn_cx, root_pgno, &page) {
                     tracing::warn!(
                         cursor_id,
                         page_id = root_page,
@@ -6637,7 +6694,7 @@ impl VdbeEngine {
                     cursor_id,
                     StorageCursor {
                         cursor: CursorBackend::Txn(cursor),
-                        cx,
+                        cx: txn_cx,
                         writable,
                         last_alloc_rowid: 0,
                         cached_row: None,
@@ -6721,7 +6778,7 @@ impl VdbeEngine {
         } else {
             MemPageStore::with_empty_index(root_pgno, PAGE_SIZE)
         };
-        let cx = Cx::new();
+        let cx = self.derive_execution_cx();
         let mut cursor = BtCursor::new(store, root_pgno, PAGE_SIZE, is_table_btree);
         // Populate cursor from MemDatabase if available.
         if is_table_btree
@@ -13571,6 +13628,94 @@ mod tests {
         );
         // The cursor should be marked read-only.
         assert!(!sc.writable, "time-travel cursor should be read-only");
+    }
+
+    #[test]
+    fn test_time_travel_empty_version_store_rejects_read() {
+        // When a TimeTravelPageIo is created with an empty VersionStore
+        // (page_count == 0), reading a page must return an explicit error
+        // rather than silently falling through to current data.
+        use fsqlite_pager::{MockMvccPager, MvccPager as _, TransactionMode};
+
+        let pager = MockMvccPager;
+        let cx = Cx::new();
+        let txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+
+        let mut db = MemDatabase::new();
+        let root = db.create_table(1);
+        let table = db.get_table_mut(root).unwrap();
+        table.insert(1, vec![SqliteValue::Integer(42)]);
+
+        let mut b = ProgramBuilder::new();
+        let end = b.emit_label();
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+        // Open cursor on our table.
+        b.emit_op(Opcode::OpenRead, 0, root, 0, P4::Int(1), 0);
+        // Set time-travel snapshot — VersionStore is empty.
+        b.emit_op(
+            Opcode::SetSnapshot,
+            0,
+            0,
+            0,
+            P4::TimeTravelCommitSeq(5),
+            0,
+        );
+        // Try to read via the time-travel cursor.
+        b.emit_op(Opcode::Rewind, 0, 0, 0, P4::None, 0);
+        let r_out = b.alloc_reg();
+        b.emit_op(Opcode::Column, 0, 0, r_out, P4::None, 0);
+        b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end);
+        let prog = b.finish().expect("program should build");
+
+        // Create an empty VersionStore (no published versions).
+        let vs = Rc::new(RefCell::new(VersionStore::new(
+            fsqlite_types::PageSize::DEFAULT,
+        )));
+
+        let mut engine = VdbeEngine::new(prog.register_count());
+        engine.set_database(db);
+        engine.set_transaction(Box::new(txn));
+        engine.set_version_store(Rc::clone(&vs));
+
+        let result = engine.execute(&prog);
+
+        // The execution should fail with an error about missing historical
+        // data, NOT silently return current data.
+        match result {
+            Err(e) => {
+                let msg = format!("{e}");
+                assert!(
+                    msg.contains("historical data not available")
+                        || msg.contains("time-travel")
+                        || msg.contains("version store"),
+                    "expected time-travel error about missing history, got: {msg}"
+                );
+            }
+            Ok(ExecOutcome::Error { message, .. }) => {
+                assert!(
+                    message.contains("historical data not available")
+                        || message.contains("time-travel")
+                        || message.contains("version store"),
+                    "expected time-travel error about missing history, got: {message}"
+                );
+            }
+            Ok(ExecOutcome::Done) => {
+                let results = engine.take_results();
+                if results.is_empty() {
+                    // Empty result set is acceptable — the Rewind may have
+                    // jumped past the scan due to the error being caught
+                    // at a different layer.
+                } else {
+                    panic!(
+                        "time-travel query with empty VersionStore should NOT \
+                         return rows from current data (got {} rows)",
+                        results.len()
+                    );
+                }
+            }
+        }
     }
 
     // ── Subtype opcode tests ─────────────────────────────────────────

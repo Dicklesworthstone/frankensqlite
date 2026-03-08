@@ -14,12 +14,17 @@ use std::mem::size_of;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, mpsc};
-use std::thread::{self, JoinHandle};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use asupersync::channel::mpsc;
+use asupersync::cx::Cx as NativeCx;
+use asupersync::runtime::{
+    JoinHandle as AsyncJoinHandle, RuntimeHandle, spawn_blocking, yield_now,
+};
 use fsqlite_error::{FrankenError, Result};
-use fsqlite_types::{ObjectId, Oti, PageSize, SymbolRecord, SymbolRecordFlags};
+use fsqlite_types::{ObjectId, Oti, PageSize, SymbolRecord, SymbolRecordFlags, cx::Cx};
 use tracing::{debug, error, info, warn};
 use xxhash_rust::xxh3::xxh3_64;
 
@@ -1401,7 +1406,6 @@ pub struct WalFrameCandidate {
 }
 
 const DEFAULT_REPAIR_PIPELINE_QUEUE_CAPACITY: usize = 64;
-const REPAIR_PIPELINE_FLUSH_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 /// Pipeline configuration for asynchronous WAL-FEC repair generation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1467,83 +1471,63 @@ enum WalFecWorkOutcome {
     Canceled,
 }
 
+#[derive(Debug, Clone)]
+struct WalFecRepairWorkerState {
+    cancel_flag: Arc<AtomicBool>,
+    pending_jobs: Arc<AtomicUsize>,
+    completed_jobs: Arc<AtomicUsize>,
+    failed_jobs: Arc<AtomicUsize>,
+    canceled_jobs: Arc<AtomicUsize>,
+    worker_failure: Arc<Mutex<Option<String>>>,
+}
+
 /// Background worker that computes and appends WAL-FEC repair symbols.
 pub struct WalFecRepairPipeline {
-    sender: Option<mpsc::SyncSender<WalFecPipelineMessage>>,
+    sender: Option<mpsc::Sender<WalFecPipelineMessage>>,
     cancel_flag: Arc<AtomicBool>,
     pending_jobs: Arc<AtomicUsize>,
     completed_jobs: Arc<AtomicUsize>,
     failed_jobs: Arc<AtomicUsize>,
     canceled_jobs: Arc<AtomicUsize>,
     max_pending_jobs: Arc<AtomicUsize>,
-    worker: Option<JoinHandle<()>>,
+    worker_failure: Arc<Mutex<Option<String>>>,
+    worker: Option<AsyncJoinHandle<()>>,
 }
 
 impl WalFecRepairPipeline {
-    /// Start the pipeline worker.
-    pub fn start(config: WalFecRepairPipelineConfig) -> Result<Self> {
+    /// Start the pipeline worker on an existing asupersync runtime.
+    pub fn start(runtime: &RuntimeHandle, config: WalFecRepairPipelineConfig) -> Result<Self> {
         if config.queue_capacity == 0 {
             return Err(FrankenError::WalCorrupt {
                 detail: "wal-fec repair pipeline queue_capacity must be >= 1".to_owned(),
             });
         }
 
-        let (tx, rx) = mpsc::sync_channel(config.queue_capacity);
+        let (tx, rx) = mpsc::channel(config.queue_capacity);
         let cancel_flag = Arc::new(AtomicBool::new(false));
         let pending_jobs = Arc::new(AtomicUsize::new(0));
         let completed_jobs = Arc::new(AtomicUsize::new(0));
         let failed_jobs = Arc::new(AtomicUsize::new(0));
         let canceled_jobs = Arc::new(AtomicUsize::new(0));
         let max_pending_jobs = Arc::new(AtomicUsize::new(0));
+        let worker_failure = Arc::new(Mutex::new(None));
+        let worker_state = WalFecRepairWorkerState {
+            cancel_flag: Arc::clone(&cancel_flag),
+            pending_jobs: Arc::clone(&pending_jobs),
+            completed_jobs: Arc::clone(&completed_jobs),
+            failed_jobs: Arc::clone(&failed_jobs),
+            canceled_jobs: Arc::clone(&canceled_jobs),
+            worker_failure: Arc::clone(&worker_failure),
+        };
 
-        let worker_cancel = Arc::clone(&cancel_flag);
-        let worker_pending = Arc::clone(&pending_jobs);
-        let worker_completed = Arc::clone(&completed_jobs);
-        let worker_failed = Arc::clone(&failed_jobs);
-        let worker_canceled = Arc::clone(&canceled_jobs);
-        let worker_handle = thread::Builder::new()
-            .name("wal-fec-repair-pipeline".to_owned())
-            .spawn(move || {
-                while let Ok(message) = rx.recv() {
-                    match message {
-                        WalFecPipelineMessage::Work(work_item) => {
-                            let group_id = work_item.meta.group_id();
-                            let outcome = process_repair_work_item(
-                                &work_item,
-                                worker_cancel.as_ref(),
-                                config.per_symbol_delay,
-                            );
-                            worker_pending.fetch_sub(1, Ordering::SeqCst);
-                            match outcome {
-                                Ok(WalFecWorkOutcome::Completed) => {
-                                    worker_completed.fetch_add(1, Ordering::SeqCst);
-                                    info!(
-                                        group_id = %group_id,
-                                        "wal-fec repair work item completed"
-                                    );
-                                }
-                                Ok(WalFecWorkOutcome::Canceled) => {
-                                    worker_canceled.fetch_add(1, Ordering::SeqCst);
-                                    warn!(
-                                        group_id = %group_id,
-                                        "wal-fec repair work item canceled before append"
-                                    );
-                                }
-                                Err(err) => {
-                                    worker_failed.fetch_add(1, Ordering::SeqCst);
-                                    error!(
-                                        group_id = %group_id,
-                                        error = %err,
-                                        "wal-fec repair work item failed"
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-            })
+        let worker_handle = runtime
+            .try_spawn(run_repair_pipeline_worker(
+                rx,
+                worker_state,
+                config.per_symbol_delay,
+            ))
             .map_err(|err| FrankenError::WalCorrupt {
-                detail: format!("failed to spawn wal-fec repair worker thread: {err}"),
+                detail: format!("failed to spawn wal-fec repair worker task: {err}"),
             })?;
 
         Ok(Self {
@@ -1554,6 +1538,7 @@ impl WalFecRepairPipeline {
             failed_jobs,
             canceled_jobs,
             max_pending_jobs,
+            worker_failure,
             worker: Some(worker_handle),
         })
     }
@@ -1577,13 +1562,13 @@ impl WalFecRepairPipeline {
 
         match sender.try_send(WalFecPipelineMessage::Work(work_item)) {
             Ok(()) => Ok(()),
-            Err(mpsc::TrySendError::Full(_)) => {
+            Err(mpsc::SendError::Full(_)) => {
                 self.pending_jobs.fetch_sub(1, Ordering::SeqCst);
                 Err(FrankenError::WalCorrupt {
                     detail: "wal-fec repair pipeline queue full".to_owned(),
                 })
             }
-            Err(mpsc::TrySendError::Disconnected(_)) => {
+            Err(mpsc::SendError::Disconnected(_) | mpsc::SendError::Cancelled(_)) => {
                 self.pending_jobs.fetch_sub(1, Ordering::SeqCst);
                 Err(FrankenError::WalCorrupt {
                     detail: "wal-fec repair pipeline worker is disconnected".to_owned(),
@@ -1599,18 +1584,22 @@ impl WalFecRepairPipeline {
 
     /// Wait until queue drains or timeout expires.
     #[must_use]
-    pub fn flush(&self, timeout: Duration) -> bool {
-        let mut remaining = timeout;
+    pub async fn flush(&self, cx: &Cx, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
         loop {
+            if lock_unpoisoned(&self.worker_failure).is_some() {
+                return false;
+            }
             if self.pending_jobs.load(Ordering::SeqCst) == 0 {
                 return true;
             }
-            if remaining.is_zero() {
+            if Instant::now() >= deadline {
                 return false;
             }
-            let sleep_for = remaining.min(REPAIR_PIPELINE_FLUSH_POLL_INTERVAL);
-            thread::sleep(sleep_for);
-            remaining = remaining.saturating_sub(sleep_for);
+            if cx.checkpoint().is_err() {
+                return false;
+            }
+            yield_now().await;
         }
     }
 
@@ -1626,16 +1615,19 @@ impl WalFecRepairPipeline {
         }
     }
 
-    /// Stop the worker and join thread.
+    /// Stop the worker and await task completion.
     ///
     /// This is a graceful shutdown: queued work is drained before the worker
     /// exits. To force immediate cancellation, call [`Self::cancel`] first.
-    pub fn shutdown(&mut self) -> Result<WalFecRepairPipelineStats> {
+    pub async fn shutdown(&mut self, cx: &Cx) -> Result<WalFecRepairPipelineStats> {
+        let _mask = cx.masked();
         self.sender.take();
         if let Some(worker) = self.worker.take() {
-            worker.join().map_err(|_| FrankenError::WalCorrupt {
-                detail: "wal-fec repair worker thread panicked".to_owned(),
-            })?;
+            worker.await;
+        }
+        let worker_failure_detail = lock_unpoisoned(&self.worker_failure).clone();
+        if let Some(detail) = worker_failure_detail {
+            return Err(FrankenError::WalCorrupt { detail });
         }
         Ok(self.stats())
     }
@@ -1644,8 +1636,152 @@ impl WalFecRepairPipeline {
 impl Drop for WalFecRepairPipeline {
     fn drop(&mut self) {
         if self.worker.is_some() {
-            let _ = self.shutdown();
+            self.cancel();
+            self.sender.take();
+            warn!(
+                pending_jobs = self.pending_jobs.load(Ordering::SeqCst),
+                "dropping wal-fec repair pipeline without awaiting shutdown"
+            );
         }
+    }
+}
+
+async fn run_repair_pipeline_worker(
+    mut receiver: mpsc::Receiver<WalFecPipelineMessage>,
+    state: WalFecRepairWorkerState,
+    per_symbol_delay: Duration,
+) {
+    let Some(native_worker_cx) = NativeCx::current() else {
+        record_worker_failure(
+            &state.worker_failure,
+            "wal-fec repair worker task missing native runtime Cx".to_owned(),
+        );
+        drain_abandoned_work(
+            &receiver,
+            state.pending_jobs.as_ref(),
+            state.canceled_jobs.as_ref(),
+        );
+        return;
+    };
+    let worker_cx = Cx::new();
+    worker_cx.set_native_cx(native_worker_cx.clone());
+
+    loop {
+        let message = match receiver.recv(&native_worker_cx).await {
+            Ok(message) => message,
+            Err(mpsc::RecvError::Empty) => {
+                yield_now().await;
+                continue;
+            }
+            Err(mpsc::RecvError::Disconnected) => break,
+            Err(mpsc::RecvError::Cancelled) => {
+                record_worker_failure(
+                    &state.worker_failure,
+                    "wal-fec repair worker task cancelled before the queue drained".to_owned(),
+                );
+                drain_abandoned_work(
+                    &receiver,
+                    state.pending_jobs.as_ref(),
+                    state.canceled_jobs.as_ref(),
+                );
+                break;
+            }
+        };
+
+        match message {
+            WalFecPipelineMessage::Work(work_item) => {
+                let group_id = work_item.meta.group_id();
+                let cancel_flag_for_work = Arc::clone(&state.cancel_flag);
+                let outcome = spawn_blocking(move || {
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        process_repair_work_item(
+                            &work_item,
+                            cancel_flag_for_work.as_ref(),
+                            per_symbol_delay,
+                        )
+                    }))
+                })
+                .await;
+
+                state.pending_jobs.fetch_sub(1, Ordering::SeqCst);
+                match outcome {
+                    Ok(Ok(WalFecWorkOutcome::Completed)) => {
+                        state.completed_jobs.fetch_add(1, Ordering::SeqCst);
+                        info!(
+                            group_id = %group_id,
+                            "wal-fec repair work item completed"
+                        );
+                    }
+                    Ok(Ok(WalFecWorkOutcome::Canceled)) => {
+                        state.canceled_jobs.fetch_add(1, Ordering::SeqCst);
+                        warn!(
+                            group_id = %group_id,
+                            "wal-fec repair work item canceled before append"
+                        );
+                    }
+                    Ok(Err(err)) => {
+                        state.failed_jobs.fetch_add(1, Ordering::SeqCst);
+                        error!(
+                            group_id = %group_id,
+                            error = %err,
+                            "wal-fec repair work item failed"
+                        );
+                    }
+                    Err(_) => {
+                        state.failed_jobs.fetch_add(1, Ordering::SeqCst);
+                        let detail = format!(
+                            "wal-fec repair worker task panicked while processing group {group_id}"
+                        );
+                        record_worker_failure(&state.worker_failure, detail.clone());
+                        error!(group_id = %group_id, "{detail}");
+                        drain_abandoned_work(
+                            &receiver,
+                            state.pending_jobs.as_ref(),
+                            state.canceled_jobs.as_ref(),
+                        );
+                        break;
+                    }
+                }
+
+                if worker_cx.checkpoint().is_err() {
+                    record_worker_failure(
+                        &state.worker_failure,
+                        "wal-fec repair worker task cancelled after processing work".to_owned(),
+                    );
+                    drain_abandoned_work(
+                        &receiver,
+                        state.pending_jobs.as_ref(),
+                        state.canceled_jobs.as_ref(),
+                    );
+                    break;
+                }
+                yield_now().await;
+            }
+        }
+    }
+}
+
+fn record_worker_failure(worker_failure: &Mutex<Option<String>>, detail: String) {
+    let mut slot = lock_unpoisoned(worker_failure);
+    if slot.is_none() {
+        *slot = Some(detail);
+    }
+}
+
+fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn drain_abandoned_work(
+    receiver: &mpsc::Receiver<WalFecPipelineMessage>,
+    pending_jobs: &AtomicUsize,
+    canceled_jobs: &AtomicUsize,
+) {
+    while let Ok(WalFecPipelineMessage::Work(_)) = receiver.try_recv() {
+        pending_jobs.fetch_sub(1, Ordering::SeqCst);
+        canceled_jobs.fetch_add(1, Ordering::SeqCst);
     }
 }
 
