@@ -589,10 +589,8 @@ where
             if let Err(err) = wal_begin_result {
                 if eager_writer {
                     inner.writer_active = false;
-                    inner.db_file.unlock(cx, LockLevel::None)?;
-                } else {
-                    inner.db_file.unlock(cx, LockLevel::None)?;
                 }
+                inner.db_file.unlock(cx, LockLevel::None)?;
                 return Err(err);
             }
         }
@@ -3722,14 +3720,8 @@ mod tests {
             let mut page1 = vec![0u8; inner.page_size.as_usize()];
             let n = inner.db_file.read(&cx, &mut page1, 0).unwrap();
             assert!(n >= DATABASE_HEADER_SIZE);
-            assert_eq!(
-                page1[18], 1,
-                "bead_id={BEAD_ID} case=default_write_version"
-            );
-            assert_eq!(
-                page1[19], 1,
-                "bead_id={BEAD_ID} case=default_read_version"
-            );
+            assert_eq!(page1[18], 1, "bead_id={BEAD_ID} case=default_write_version");
+            assert_eq!(page1[19], 1, "bead_id={BEAD_ID} case=default_read_version");
         }
 
         // Switch to WAL mode: bytes 18-19 should become 2.
@@ -3742,14 +3734,8 @@ mod tests {
             let mut page1 = vec![0u8; inner.page_size.as_usize()];
             let n = inner.db_file.read(&cx, &mut page1, 0).unwrap();
             assert!(n >= DATABASE_HEADER_SIZE);
-            assert_eq!(
-                page1[18], 2,
-                "bead_id={BEAD_ID} case=wal_write_version"
-            );
-            assert_eq!(
-                page1[19], 2,
-                "bead_id={BEAD_ID} case=wal_read_version"
-            );
+            assert_eq!(page1[18], 2, "bead_id={BEAD_ID} case=wal_write_version");
+            assert_eq!(page1[19], 2, "bead_id={BEAD_ID} case=wal_read_version");
         }
 
         // Switch back to DELETE mode: bytes 18-19 should revert to 1.
@@ -3760,14 +3746,8 @@ mod tests {
             let mut page1 = vec![0u8; inner.page_size.as_usize()];
             let n = inner.db_file.read(&cx, &mut page1, 0).unwrap();
             assert!(n >= DATABASE_HEADER_SIZE);
-            assert_eq!(
-                page1[18], 1,
-                "bead_id={BEAD_ID} case=delete_write_version"
-            );
-            assert_eq!(
-                page1[19], 1,
-                "bead_id={BEAD_ID} case=delete_read_version"
-            );
+            assert_eq!(page1[18], 1, "bead_id={BEAD_ID} case=delete_write_version");
+            assert_eq!(page1[19], 1, "bead_id={BEAD_ID} case=delete_read_version");
         }
     }
 

@@ -62,16 +62,12 @@ macro_rules! lock_debug {
 // ---------------------------------------------------------------------------
 
 /// Byte offset of the pending lock byte.
-#[allow(dead_code)]
 const PENDING_BYTE: u64 = 0x4000_0000;
 /// Byte offset of the reserved lock byte.
-#[allow(dead_code)]
 const RESERVED_BYTE: u64 = PENDING_BYTE + 1;
 /// Byte offset of the first shared lock byte.
-#[allow(dead_code)]
 const SHARED_FIRST: u64 = PENDING_BYTE + 2;
 /// Number of bytes in the shared lock range.
-#[allow(dead_code)]
 const SHARED_SIZE: u64 = 510;
 
 // ---------------------------------------------------------------------------
@@ -319,6 +315,11 @@ struct InodeKey {
 }
 
 /// Per-inode lock state shared across all file handles in this process.
+///
+/// Because POSIX fcntl locks are per-process (not per-fd), we must coalesce
+/// lock operations through a single canonical fd and track how many handles
+/// want each lock level. The OS-level lock is only released when the last
+/// handle drops its claim.
 #[derive(Debug)]
 struct InodeInfo {
     /// Canonical file descriptor for this inode.
@@ -329,11 +330,27 @@ struct InodeInfo {
     file: Arc<File>,
     /// Total number of open file handles referencing this inode.
     n_ref: u32,
+    /// Number of handles holding a SHARED or higher lock.
+    n_shared: u32,
+    /// Number of handles holding a RESERVED lock (at most 1 from the OS
+    /// perspective, but tracked for reference-counting).
+    n_reserved: u32,
+    /// Number of handles holding a PENDING lock.
+    n_pending: u32,
+    /// Number of handles holding an EXCLUSIVE lock.
+    n_exclusive: u32,
 }
 
 impl InodeInfo {
     fn new(file: Arc<File>) -> Self {
-        Self { file, n_ref: 0 }
+        Self {
+            file,
+            n_ref: 0,
+            n_shared: 0,
+            n_reserved: 0,
+            n_pending: 0,
+            n_exclusive: 0,
+        }
     }
 }
 
@@ -1595,16 +1612,109 @@ impl VfsFile for UnixFile {
     }
 
     fn lock(&mut self, _cx: &Cx, level: LockLevel) -> Result<()> {
-        if self.lock_level < level {
-            self.lock_level = level;
+        if level <= self.lock_level {
+            return Ok(());
         }
+
+        let mut info = self
+            .inode_info
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // None -> Shared: acquire F_RDLCK on the shared byte range.
+        if self.lock_level < LockLevel::Shared && level >= LockLevel::Shared {
+            if info.n_shared == 0 {
+                // First shared holder in this process -- acquire the OS lock.
+                if !posix_lock(&*info.file, libc::F_RDLCK, SHARED_FIRST, SHARED_SIZE)? {
+                    return Err(FrankenError::Busy);
+                }
+            }
+            info.n_shared += 1;
+            self.lock_level = LockLevel::Shared;
+        }
+
+        // Shared -> Reserved: acquire F_WRLCK on the reserved byte.
+        if self.lock_level < LockLevel::Reserved && level >= LockLevel::Reserved {
+            if info.n_reserved > 0 {
+                // Another handle in this process already holds RESERVED.
+                return Err(FrankenError::Busy);
+            }
+            if !posix_lock(&*info.file, libc::F_WRLCK, RESERVED_BYTE, 1)? {
+                return Err(FrankenError::Busy);
+            }
+            info.n_reserved += 1;
+            self.lock_level = LockLevel::Reserved;
+        }
+
+        // Reserved -> Pending: acquire F_WRLCK on the pending byte.
+        // This blocks new shared-lock acquisitions from other processes.
+        if self.lock_level < LockLevel::Pending && level >= LockLevel::Pending {
+            if info.n_pending == 0 && !posix_lock(&*info.file, libc::F_WRLCK, PENDING_BYTE, 1)? {
+                return Err(FrankenError::Busy);
+            }
+            info.n_pending += 1;
+            self.lock_level = LockLevel::Pending;
+        }
+
+        // Pending -> Exclusive: acquire F_WRLCK on the entire shared range,
+        // replacing the existing shared read lock. This will only succeed when
+        // all other processes have released their shared locks.
+        if self.lock_level < LockLevel::Exclusive && level >= LockLevel::Exclusive {
+            if !posix_lock(&*info.file, libc::F_WRLCK, SHARED_FIRST, SHARED_SIZE)? {
+                return Err(FrankenError::Busy);
+            }
+            info.n_exclusive += 1;
+            self.lock_level = LockLevel::Exclusive;
+        }
+
         Ok(())
     }
 
     fn unlock(&mut self, _cx: &Cx, level: LockLevel) -> Result<()> {
-        if self.lock_level > level {
-            self.lock_level = level;
+        if level >= self.lock_level {
+            return Ok(());
         }
+
+        let mut info = self
+            .inode_info
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // Exclusive -> (Shared or lower): downgrade exclusive on shared range.
+        if self.lock_level >= LockLevel::Exclusive && level < LockLevel::Exclusive {
+            info.n_exclusive = info.n_exclusive.saturating_sub(1);
+            if info.n_exclusive == 0 && info.n_shared > 0 {
+                // Other handles still hold shared -- downgrade the OS lock back
+                // to a read lock on the shared range.
+                let _ = posix_lock(&*info.file, libc::F_RDLCK, SHARED_FIRST, SHARED_SIZE)?;
+            }
+        }
+
+        // Pending -> (Reserved or lower): release pending byte.
+        if self.lock_level >= LockLevel::Pending && level < LockLevel::Pending {
+            info.n_pending = info.n_pending.saturating_sub(1);
+            if info.n_pending == 0 {
+                posix_unlock(&*info.file, PENDING_BYTE, 1)?;
+            }
+        }
+
+        // Reserved -> (Shared or lower): release reserved byte.
+        if self.lock_level >= LockLevel::Reserved && level < LockLevel::Reserved {
+            info.n_reserved = info.n_reserved.saturating_sub(1);
+            if info.n_reserved == 0 {
+                posix_unlock(&*info.file, RESERVED_BYTE, 1)?;
+            }
+        }
+
+        // Shared -> None: release shared range.
+        if self.lock_level >= LockLevel::Shared && level < LockLevel::Shared {
+            info.n_shared = info.n_shared.saturating_sub(1);
+            if info.n_shared == 0 && info.n_exclusive == 0 {
+                posix_unlock(&*info.file, SHARED_FIRST, SHARED_SIZE)?;
+            }
+        }
+
+        self.lock_level = level;
         Ok(())
     }
 
