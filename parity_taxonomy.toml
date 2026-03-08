@@ -338,9 +338,15 @@ id = "F-SQL.35"
 family = "SQL"
 title = "Time travel queries (FOR SYSTEM_TIME AS OF) — Native mode extension"
 weight = 3
-status = "fail"
+status = "partial"
 observability = ["test_time_travel"]
-notes = "FrankenSQLite-specific extension, requires Native mode commit stream"
+notes = """Parser, AST, opcode (SetSnapshot), VDBE cursor upgrade, and MVCC \
+VersionStore resolution are fully wired. TimeTravelPageIo correctly serves \
+historical pages when the VersionStore is populated. Empty VersionStore now \
+returns an explicit error instead of silently falling through to current data. \
+Timestamp-based resolution returns explicit 'CommitLog not available' error. \
+Full end-to-end requires Native mode commit stream to populate the VersionStore \
+with historical page versions during normal operation."""
 
 # ============================================================================
 # FAMILY: TXN — Transaction and Storage Behavior (weight pool: 150)
