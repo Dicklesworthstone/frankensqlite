@@ -1,0 +1,21 @@
+# Canonical SQLLogicTest smoke suite for corpus ingestion.
+hash-threshold 8
+
+onlyif sqlite
+statement ok
+CREATE TABLE corpus_smoke(id INTEGER PRIMARY KEY, name TEXT)
+
+skipif mysql
+statement ok
+INSERT INTO corpus_smoke VALUES(1, 'alpha')
+
+query IT rowsort
+SELECT id, name FROM corpus_smoke
+----
+1|alpha
+
+skipif sqlite
+statement ok
+SELECT 'not ingested on sqlite'
+
+halt
