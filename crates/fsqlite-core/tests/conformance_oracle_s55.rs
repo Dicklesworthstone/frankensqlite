@@ -1251,7 +1251,9 @@ fn test_conformance_empty_table_aggregates_s55() {
     let fconn = Connection::open(":memory:").unwrap();
     let rconn = rusqlite::Connection::open_in_memory().unwrap();
 
-    for s in &["CREATE TABLE eta(id INTEGER PRIMARY KEY, val INTEGER, name TEXT)"] {
+    {
+        let s = &"CREATE TABLE eta(id INTEGER PRIMARY KEY, val INTEGER, name TEXT)";
+
         fconn.execute(s).unwrap();
         rconn.execute_batch(s).unwrap();
     }

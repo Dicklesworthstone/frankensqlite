@@ -4852,8 +4852,12 @@ impl Connection {
                                             columns[0]
                                         ))
                                     })?;
+                            let value_expr = match &assignment.value {
+                                Expr::RowValue(values, _) if values.len() == 1 => &values[0],
+                                other => other,
+                            };
                             new_values[target_index] =
-                                eval_join_expr(&assignment.value, &old_values, &col_map)?;
+                                eval_join_expr(value_expr, &old_values, &col_map)?;
                             continue;
                         }
 

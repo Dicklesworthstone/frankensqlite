@@ -4037,15 +4037,44 @@ impl VdbeEngine {
                                 Opcode::SeekGE => !cursor.cursor.eof(),
                                 Opcode::SeekGT => {
                                     if seek_result.is_found() {
-                                        cursor.cursor.next(&cursor.cx)?
-                                    } else {
-                                        !cursor.cursor.eof()
+                                        cursor.cursor.next(&cursor.cx)?;
                                     }
+                                    if !cursor.cursor.eof() {
+                                        let target_vals = parse_record(&key_bytes).unwrap_or_default();
+                                        loop {
+                                            if cursor.cursor.eof() {
+                                                break;
+                                            }
+                                            let payload = cursor.cursor.payload(&cursor.cx)?;
+                                            let cur_vals = parse_record(&payload).unwrap_or_default();
+                                            let cmp = compare_sorter_keys(&cur_vals, &target_vals, target_vals.len(), &[]);
+                                            if cmp == std::cmp::Ordering::Equal {
+                                                cursor.cursor.next(&cursor.cx)?;
+                                            } else {
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    !cursor.cursor.eof()
                                 }
                                 Opcode::SeekLE => {
-                                    if seek_result.is_found() {
-                                        true
-                                    } else if cursor.cursor.eof() {
+                                    if !cursor.cursor.eof() {
+                                        let target_vals = parse_record(&key_bytes).unwrap_or_default();
+                                        loop {
+                                            if cursor.cursor.eof() {
+                                                break;
+                                            }
+                                            let payload = cursor.cursor.payload(&cursor.cx)?;
+                                            let cur_vals = parse_record(&payload).unwrap_or_default();
+                                            let cmp = compare_sorter_keys(&cur_vals, &target_vals, target_vals.len(), &[]);
+                                            if cmp == std::cmp::Ordering::Equal {
+                                                cursor.cursor.next(&cursor.cx)?;
+                                            } else {
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    if cursor.cursor.eof() {
                                         cursor.cursor.last(&cursor.cx)?
                                     } else {
                                         cursor.cursor.prev(&cursor.cx)?
@@ -5261,7 +5290,7 @@ impl VdbeEngine {
                             continue;
                         }
                         let payload = sc.cursor.payload(&sc.cx)?;
-                        decode_record(&SqliteValue::Blob(payload)).unwrap_or_default()
+                        parse_record(&payload).unwrap_or_default()
                     } else if let Some(cursor) = self.cursors.get(&cursor_id) {
                         if let Some(pos) = cursor.position
                             && let Some(db) = self.db.as_ref()
@@ -6347,7 +6376,8 @@ impl VdbeEngine {
             let decoded = if let Some(vals) = values {
                 vals
             } else {
-                let new_values = decode_record(&SqliteValue::Blob(payload.clone()))?;
+                let new_values = parse_record(&payload)
+                    .ok_or_else(|| FrankenError::internal("malformed SQLite record blob"))?;
                 cursor.cached_row = Some((payload, new_values));
                 &cursor.cached_row.as_ref().unwrap().1
             };

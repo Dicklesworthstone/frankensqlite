@@ -554,7 +554,7 @@ impl VfsFile for MemoryFile {
 
             // Grow the region in place to match WAL-index expectations
             // when a caller remaps with a larger size.
-            let mut updated_region = existing.clone();
+            let mut updated_region = existing;
             updated_region.resize(requested_size);
             info.regions.insert(region, updated_region.clone());
             drop(info);

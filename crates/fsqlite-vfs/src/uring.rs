@@ -626,29 +626,23 @@ impl VfsFile for IoUringFile {
         checkpoint_or_abort(cx)?;
         if self.runtime.is_available() {
             let start = Instant::now();
-            match self.read_via_uring(cx, buf, offset) {
-                Ok(bytes) => {
-                    let elapsed = start.elapsed();
-                    if record_io_uring_read_latency(elapsed) {
-                        let snapshot = io_uring_latency_snapshot();
-                        enforce_conformal_breach_policy(
-                            &self.runtime,
-                            "read",
-                            elapsed,
-                            snapshot.read_conformal_upper_bound_us,
-                            IO_URING_READ_CONFORMAL_BREACH_MSG,
-                        );
-                    }
-                    return Ok(bytes);
+            if let Ok(bytes) = self.read_via_uring(cx, buf, offset) {
+                let elapsed = start.elapsed();
+                if record_io_uring_read_latency(elapsed) {
+                    let snapshot = io_uring_latency_snapshot();
+                    enforce_conformal_breach_policy(
+                        &self.runtime,
+                        "read",
+                        elapsed,
+                        snapshot.read_conformal_upper_bound_us,
+                        IO_URING_READ_CONFORMAL_BREACH_MSG,
+                    );
                 }
-                Err(_) => {
-                    self.runtime.disable(IO_URING_READ_ERROR_FALLBACK_MSG);
-                    record_io_uring_unix_fallback();
-                }
+                return Ok(bytes);
             }
-        } else {
-            record_io_uring_unix_fallback();
+            self.runtime.disable(IO_URING_READ_ERROR_FALLBACK_MSG);
         }
+        record_io_uring_unix_fallback();
         self.inner.read(cx, buf, offset)
     }
 
@@ -656,29 +650,23 @@ impl VfsFile for IoUringFile {
         checkpoint_or_abort(cx)?;
         if self.runtime.is_available() {
             let start = Instant::now();
-            match self.write_via_uring(cx, buf, offset) {
-                Ok(()) => {
-                    let elapsed = start.elapsed();
-                    if record_io_uring_write_latency(elapsed) {
-                        let snapshot = io_uring_latency_snapshot();
-                        enforce_conformal_breach_policy(
-                            &self.runtime,
-                            "write",
-                            elapsed,
-                            snapshot.write_conformal_upper_bound_us,
-                            IO_URING_WRITE_CONFORMAL_BREACH_MSG,
-                        );
-                    }
-                    return Ok(());
+            if matches!(self.write_via_uring(cx, buf, offset), Ok(())) {
+                let elapsed = start.elapsed();
+                if record_io_uring_write_latency(elapsed) {
+                    let snapshot = io_uring_latency_snapshot();
+                    enforce_conformal_breach_policy(
+                        &self.runtime,
+                        "write",
+                        elapsed,
+                        snapshot.write_conformal_upper_bound_us,
+                        IO_URING_WRITE_CONFORMAL_BREACH_MSG,
+                    );
                 }
-                Err(_) => {
-                    self.runtime.disable(IO_URING_WRITE_ERROR_FALLBACK_MSG);
-                    record_io_uring_unix_fallback();
-                }
+                return Ok(());
             }
-        } else {
-            record_io_uring_unix_fallback();
+            self.runtime.disable(IO_URING_WRITE_ERROR_FALLBACK_MSG);
         }
+        record_io_uring_unix_fallback();
         self.inner.write(cx, buf, offset)
     }
 
