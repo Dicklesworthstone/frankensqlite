@@ -29,8 +29,9 @@ use fsqlite_error::{ErrorCode, FrankenError, Result};
 use fsqlite_func::vtab::ColumnContext;
 use fsqlite_func::{ErasedAggregateFunction, ErasedWindowFunction, FunctionRegistry};
 use fsqlite_mvcc::{
-    ConcurrentRegistry, InProcessPageLockTable, MvccError, TimeTravelSnapshot, VersionStore,
-    concurrent_read_page, concurrent_write_page,
+    CommitLog, ConcurrentRegistry, InProcessPageLockTable, MvccError, TimeTravelSnapshot,
+    TimeTravelTarget, VersionStore, concurrent_read_page, concurrent_write_page,
+    create_time_travel_snapshot,
 };
 use fsqlite_pager::TransactionHandle;
 use fsqlite_types::cx::Cx;
@@ -888,7 +889,7 @@ struct TimeTravelPageIo {
     /// Underlying transaction page I/O for fall-through reads.
     inner: SharedTxnPageIo,
     /// MVCC version store for historical page resolution.
-    version_store: Rc<RefCell<VersionStore>>,
+    version_store: Arc<VersionStore>,
     /// The pinned time-travel snapshot.
     snapshot: TimeTravelSnapshot,
 }
@@ -897,7 +898,7 @@ impl std::fmt::Debug for TimeTravelPageIo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TimeTravelPageIo")
             .field("inner", &self.inner)
-            .field("version_store", &"<Rc<RefCell<VersionStore>>>")
+            .field("version_store", &"<Arc<VersionStore>>")
             .field(
                 "target_commit_seq",
                 &self.snapshot.target_commit_seq().get(),
@@ -909,8 +910,8 @@ impl std::fmt::Debug for TimeTravelPageIo {
 impl PageReader for TimeTravelPageIo {
     fn read_page(&self, cx: &Cx, page_no: PageNumber) -> Result<Vec<u8>> {
         // Try to resolve the page at the historical snapshot first.
-        let vs = self.version_store.borrow();
-        if let Some(idx) = self.snapshot.resolve_page(&vs, page_no) {
+        let vs = &self.version_store;
+        if let Some(idx) = self.snapshot.resolve_page(vs, page_no) {
             if let Some(version) = vs.get_version(idx) {
                 tracing::trace!(
                     page_id = page_no.get(),
@@ -934,8 +935,7 @@ impl PageReader for TimeTravelPageIo {
         // would silently return current data, which is incorrect and
         // violates the time-travel query contract. In that case, we must
         // fail explicitly.
-        let store_has_versions = (*vs).page_count() > 0;
-        drop(vs);
+        let store_has_versions = vs.page_count() > 0;
 
         if !store_has_versions {
             tracing::warn!(
@@ -2132,7 +2132,11 @@ pub struct VdbeEngine {
     /// MVCC version store for time-travel page resolution.
     /// Set by the connection layer before execution when time-travel
     /// queries may be present.
-    version_store: Option<Rc<RefCell<VersionStore>>>,
+    version_store: Option<Arc<VersionStore>>,
+    /// Commit log for time-travel timestamp resolution and commit validation.
+    time_travel_commit_log: Option<Arc<Mutex<CommitLog>>>,
+    /// GC horizon for time-travel snapshot validation.
+    time_travel_gc_horizon: Option<CommitSeq>,
     /// Metadata mapping table cursor IDs to their associated index cursors
     /// and column indices. Used by `native_replace_row` to clean up secondary
     /// index entries during REPLACE conflict resolution.
@@ -2452,6 +2456,8 @@ impl VdbeEngine {
             vtab_instances: SwissIndex::new(),
             time_travel_cursors: HashMap::new(),
             version_store: None,
+            time_travel_commit_log: None,
+            time_travel_gc_horizon: None,
             table_index_meta: HashMap::new(),
             window_contexts: SwissIndex::new(),
             register_subtypes: HashMap::new(),
@@ -2484,8 +2490,18 @@ impl VdbeEngine {
     /// Must be called by the connection layer before executing programs that
     /// contain `SetSnapshot` opcodes so the engine can create
     /// `TimeTravelPageIo` cursors.
-    pub fn set_version_store(&mut self, vs: Rc<RefCell<VersionStore>>) {
+    pub fn set_version_store(&mut self, vs: Arc<VersionStore>) {
         self.version_store = Some(vs);
+    }
+
+    /// Set the commit log used for time-travel resolution and validation.
+    pub fn set_time_travel_commit_log(&mut self, log: Arc<Mutex<CommitLog>>) {
+        self.time_travel_commit_log = Some(log);
+    }
+
+    /// Set the GC horizon for time-travel snapshot validation.
+    pub fn set_time_travel_gc_horizon(&mut self, horizon: CommitSeq) {
+        self.time_travel_gc_horizon = Some(horizon);
     }
 
     /// Attach the root capability context for this execution.
@@ -2936,80 +2952,108 @@ impl VdbeEngine {
                     };
                     self.time_travel_cursors.insert(cursor_id, target.clone());
 
-                    // Upgrade the cursor to a time-travel backend if we have
-                    // both a VersionStore and the cursor uses a Txn backend.
-                    if let Some(ref vs) = self.version_store {
-                        if let Some(sc) = self.storage_cursors.get(&cursor_id) {
-                            // We need the cursor's root page and table flag to
-                            // re-create the BtCursor with TimeTravelPageIo.
-                            if let CursorBackend::Txn(_) = &sc.cursor {
-                                let commit_seq = match &target {
-                                    TimeTravelMarker::CommitSeq(seq) => *seq,
-                                    TimeTravelMarker::Timestamp(_ts) => {
-                                        // Timestamp resolution requires CommitLog
-                                        // which is not yet wired. Return an error
-                                        // for now.
-                                        return Err(FrankenError::Internal(
-                                            "SetSnapshot: timestamp-based time-travel \
-                                             not yet supported (CommitLog not available)"
-                                                .to_owned(),
-                                        ));
-                                    }
-                                };
+                    let version_store = self.version_store.as_ref().ok_or_else(|| {
+                        FrankenError::Internal(
+                            "SetSnapshot: VersionStore not available for time-travel".to_owned(),
+                        )
+                    })?;
+                    let commit_log = self.time_travel_commit_log.as_ref().ok_or_else(|| {
+                        FrankenError::Internal(
+                            "SetSnapshot: CommitLog not available for time-travel".to_owned(),
+                        )
+                    })?;
+                    let gc_horizon = self.time_travel_gc_horizon.ok_or_else(|| {
+                        FrankenError::Internal(
+                            "SetSnapshot: GC horizon not available for time-travel".to_owned(),
+                        )
+                    })?;
 
-                                let tt_snapshot = TimeTravelSnapshot::new_for_commit_seq(
-                                    CommitSeq::new(commit_seq),
-                                    SchemaEpoch::new(u64::from(self.schema_cookie)),
-                                );
-
-                                // Re-create cursor with TimeTravelPageIo.
-                                // Remove the old cursor to get its metadata.
-                                let old_sc = self.storage_cursors.remove(&cursor_id).unwrap();
-                                let root_page =
-                                    self.cursor_root_pages.get(&cursor_id).copied().unwrap_or(1);
-                                let root_pgno =
-                                    PageNumber::new(root_page as u32).unwrap_or(PageNumber::ONE);
-
-                                // Extract the SharedTxnPageIo from the old cursor.
-                                // Since we verified it's Txn above, this is safe.
-                                let inner_page_io = if let Some(ref page_io) = self.txn_page_io {
-                                    page_io.clone()
-                                } else {
-                                    return Err(FrankenError::Internal(
-                                        "SetSnapshot: no transaction page I/O available".to_owned(),
-                                    ));
-                                };
-
-                                let tt_page_io = TimeTravelPageIo {
-                                    inner: inner_page_io,
-                                    version_store: Rc::clone(vs),
-                                    snapshot: tt_snapshot,
-                                };
-
-                                // Preserve the cursor's table-vs-index type from
-                                // the original cursor so index cursors remain correct.
-                                let is_table_btree = old_sc.cursor.is_table_btree();
-                                const PAGE_SIZE: u32 = 4096;
-                                let new_cursor =
-                                    BtCursor::new(tt_page_io, root_pgno, PAGE_SIZE, is_table_btree);
-                                self.storage_cursors.insert(
-                                    cursor_id,
-                                    StorageCursor {
-                                        cursor: CursorBackend::TimeTravel(new_cursor),
-                                        cx: old_sc.cx,
-                                        writable: false, // Time-travel is always read-only
-                                        last_alloc_rowid: 0,
-                                        cached_row: None,
-                                    },
-                                );
-                                tracing::info!(
-                                    cursor_id,
-                                    commit_seq,
-                                    "SetSnapshot: upgraded cursor to time-travel backend"
-                                );
-                            }
-                        }
+                    let has_txn_cursor = self
+                        .storage_cursors
+                        .get(&cursor_id)
+                        .is_some_and(|sc| matches!(&sc.cursor, CursorBackend::Txn(_)));
+                    if !has_txn_cursor {
+                        return Err(FrankenError::Internal(format!(
+                            "SetSnapshot: cursor {cursor_id} is not a transactional cursor"
+                        )));
                     }
+
+                    let time_travel_target = match &target {
+                        TimeTravelMarker::CommitSeq(seq) => {
+                            TimeTravelTarget::CommitSequence(CommitSeq::new(*seq))
+                        }
+                        TimeTravelMarker::Timestamp(ts) => {
+                            // Timestamp-based time-travel requires parsing
+                            // an ISO-8601 / SQLite datetime string to unix
+                            // nanoseconds. The datetime parser integration
+                            // is not yet available; return an explicit error.
+                            return Err(FrankenError::Internal(format!(
+                                "SetSnapshot: timestamp-based time-travel \
+                                 not yet supported (datetime parser not \
+                                 wired); timestamp='{ts}'"
+                            )));
+                        }
+                    };
+
+                    let schema_epoch = SchemaEpoch::new(u64::from(self.schema_cookie));
+                    let commit_log = commit_log
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let tt_snapshot = create_time_travel_snapshot(
+                        time_travel_target,
+                        &commit_log,
+                        gc_horizon,
+                        schema_epoch,
+                    )
+                    .map_err(|err| {
+                        FrankenError::Internal(format!("time-travel snapshot error: {err}"))
+                    })?;
+
+                    // Re-create cursor with TimeTravelPageIo.
+                    // Remove the old cursor to get its metadata.
+                    let old_sc = self.storage_cursors.remove(&cursor_id).unwrap();
+                    let root_page = self.cursor_root_pages.get(&cursor_id).copied().unwrap_or(1);
+                    let root_pgno =
+                        PageNumber::new(root_page as u32).unwrap_or(PageNumber::ONE);
+
+                    // Extract the SharedTxnPageIo from the old cursor.
+                    // Since we verified it's Txn above, this is safe.
+                    let inner_page_io = if let Some(ref page_io) = self.txn_page_io {
+                        page_io.clone()
+                    } else {
+                        return Err(FrankenError::Internal(
+                            "SetSnapshot: no transaction page I/O available".to_owned(),
+                        ));
+                    };
+
+                    let commit_seq = tt_snapshot.target_commit_seq().get();
+                    let tt_page_io = TimeTravelPageIo {
+                        inner: inner_page_io,
+                        version_store: Arc::clone(version_store),
+                        snapshot: tt_snapshot,
+                    };
+
+                    // Preserve the cursor's table-vs-index type from
+                    // the original cursor so index cursors remain correct.
+                    let is_table_btree = old_sc.cursor.is_table_btree();
+                    const PAGE_SIZE: u32 = 4096;
+                    let new_cursor =
+                        BtCursor::new(tt_page_io, root_pgno, PAGE_SIZE, is_table_btree);
+                    self.storage_cursors.insert(
+                        cursor_id,
+                        StorageCursor {
+                            cursor: CursorBackend::TimeTravel(new_cursor),
+                            cx: old_sc.cx,
+                            writable: false, // Time-travel is always read-only
+                            last_alloc_rowid: 0,
+                            cached_row: None,
+                        },
+                    );
+                    tracing::info!(
+                        cursor_id,
+                        commit_seq,
+                        "SetSnapshot: upgraded cursor to time-travel backend"
+                    );
                     pc += 1;
                 }
 
@@ -4517,28 +4561,25 @@ impl VdbeEngine {
                             let exists = sc.cursor.table_move_to(&sc.cx, rowid)?.is_found();
 
                             if exists {
-                                match oe_flag {
-                                    4 => {
-                                        // OE_IGNORE: Skip insert for conflicting row
-                                    }
-                                    5 | 8 => {
-                                        // OE_REPLACE (5) or OPFLAG_ISUPDATE (8): Delete old, insert new (UPSERT/UPDATE)
-                                        self.native_replace_row(cursor_id, rowid)?;
-                                        let sc2 = self
-                                            .storage_cursors
-                                            .get_mut(&cursor_id)
-                                            .ok_or_else(|| {
-                                                FrankenError::internal(
-                                                    "cursor disappeared during REPLACE",
-                                                )
-                                            })?;
-                                        sc2.cursor.table_insert(&sc2.cx, rowid, &blob)?;
-                                        actually_inserted = true;
-                                    }
-                                    _ => {
-                                        // Default (ABORT/FAIL/ROLLBACK): constraint error.
-                                        break pk_conflict;
-                                    }
+                                let is_update = (op.p5 & 0x04) != 0;
+                                if is_update || oe_flag == 5 {
+                                    // OE_REPLACE (5) or OPFLAG_ISUPDATE: Delete old, insert new (UPSERT/UPDATE)
+                                    self.native_replace_row(cursor_id, rowid)?;
+                                    let sc2 = self
+                                        .storage_cursors
+                                        .get_mut(&cursor_id)
+                                        .ok_or_else(|| {
+                                            FrankenError::internal(
+                                                "cursor disappeared during REPLACE",
+                                            )
+                                        })?;
+                                    sc2.cursor.table_insert(&sc2.cx, rowid, &blob)?;
+                                    actually_inserted = true;
+                                } else if oe_flag == 4 {
+                                    // OE_IGNORE: Skip insert for conflicting row
+                                } else {
+                                    // Default (ABORT/FAIL/ROLLBACK): constraint error.
+                                    break pk_conflict;
                                 }
                             } else {
                                 // No conflict — insert normally
@@ -13621,14 +13662,31 @@ mod tests {
         b.resolve_label(end);
         let prog = b.finish().expect("program should build");
 
-        let vs = Rc::new(RefCell::new(VersionStore::new(
+        let vs = Arc::new(VersionStore::new(
             fsqlite_types::PageSize::DEFAULT,
-        )));
+        ));
+
+        // Build a CommitLog with entries so SetSnapshot validation passes.
+        let commit_log = {
+            use fsqlite_types::TxnId;
+            let mut log = CommitLog::new(CommitSeq::new(1));
+            for seq in 1..=5 {
+                log.append(fsqlite_mvcc::core_types::CommitRecord {
+                    txn_id: TxnId::new(seq).unwrap(),
+                    commit_seq: CommitSeq::new(seq),
+                    pages: smallvec::smallvec![PageNumber::new(1).unwrap()],
+                    timestamp_unix_ns: 1_700_000_000_000_000_000 + seq * 1_000_000_000,
+                });
+            }
+            Arc::new(Mutex::new(log))
+        };
 
         let mut engine = VdbeEngine::new(prog.register_count());
         engine.set_database(db);
         engine.set_transaction(Box::new(txn));
-        engine.set_version_store(Rc::clone(&vs));
+        engine.set_version_store(Arc::clone(&vs));
+        engine.set_time_travel_commit_log(Arc::clone(&commit_log));
+        engine.set_time_travel_gc_horizon(CommitSeq::new(1));
 
         let outcome = engine.execute(&prog).expect("execution should succeed");
         assert_eq!(outcome, ExecOutcome::Done);
@@ -13647,90 +13705,111 @@ mod tests {
     }
 
     #[test]
-    fn test_time_travel_empty_version_store_rejects_read() {
-        // When a TimeTravelPageIo is created with an empty VersionStore
-        // (page_count == 0), reading a page must return an explicit error
-        // rather than silently falling through to current data.
+    fn test_time_travel_page_io_empty_version_store_rejects_read() {
+        // Unit test for TimeTravelPageIo: when the VersionStore is empty
+        // (page_count == 0), read_page must return an explicit error rather
+        // than silently falling through to current data.
+        //
+        // This tests the TimeTravelPageIo directly without going through
+        // the full SetSnapshot opcode path, which has additional
+        // requirements (CommitLog, GC horizon).
         use fsqlite_pager::{MockMvccPager, MvccPager as _, TransactionMode};
 
         let pager = MockMvccPager;
         let cx = Cx::new();
         let txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let inner_io = SharedTxnPageIo::new(Box::new(txn));
 
-        let mut db = MemDatabase::new();
-        let root = db.create_table(1);
-        let table = db.get_table_mut(root).unwrap();
-        table.insert(1, vec![SqliteValue::Integer(42)]);
-
-        let mut b = ProgramBuilder::new();
-        let end = b.emit_label();
-        b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
-        // Open cursor on our table.
-        b.emit_op(Opcode::OpenRead, 0, root, 0, P4::Int(1), 0);
-        // Set time-travel snapshot — VersionStore is empty.
-        b.emit_op(
-            Opcode::SetSnapshot,
-            0,
-            0,
-            0,
-            P4::TimeTravelCommitSeq(5),
-            0,
-        );
-        // Try to read via the time-travel cursor.
-        b.emit_op(Opcode::Rewind, 0, 0, 0, P4::None, 0);
-        let r_out = b.alloc_reg();
-        b.emit_op(Opcode::Column, 0, 0, r_out, P4::None, 0);
-        b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
-        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
-        b.resolve_label(end);
-        let prog = b.finish().expect("program should build");
-
-        // Create an empty VersionStore (no published versions).
-        let vs = Rc::new(RefCell::new(VersionStore::new(
+        let empty_vs = Arc::new(VersionStore::new(
             fsqlite_types::PageSize::DEFAULT,
-        )));
+        ));
 
-        let mut engine = VdbeEngine::new(prog.register_count());
-        engine.set_database(db);
-        engine.set_transaction(Box::new(txn));
-        engine.set_version_store(Rc::clone(&vs));
+        let tt_snapshot = TimeTravelSnapshot::new_for_commit_seq(
+            CommitSeq::new(5),
+            SchemaEpoch::new(1),
+        );
 
-        let result = engine.execute(&prog);
+        let tt_page_io = TimeTravelPageIo {
+            inner: inner_io,
+            version_store: empty_vs,
+            snapshot: tt_snapshot,
+        };
 
-        // The execution should fail with an error about missing historical
-        // data, NOT silently return current data.
-        match result {
-            Err(e) => {
-                let msg = format!("{e}");
-                assert!(
-                    msg.contains("historical data not available")
-                        || msg.contains("time-travel")
-                        || msg.contains("version store"),
-                    "expected time-travel error about missing history, got: {msg}"
-                );
-            }
-            Ok(ExecOutcome::Error { message, .. }) => {
-                assert!(
-                    message.contains("historical data not available")
-                        || message.contains("time-travel")
-                        || message.contains("version store"),
-                    "expected time-travel error about missing history, got: {message}"
-                );
-            }
-            Ok(ExecOutcome::Done) => {
-                let results = engine.take_results();
-                if results.is_empty() {
-                    // Empty result set is acceptable — the Rewind may have
-                    // jumped past the scan due to the error being caught
-                    // at a different layer.
-                } else {
-                    panic!(
-                        "time-travel query with empty VersionStore should NOT \
-                         return rows from current data (got {} rows)",
-                        results.len()
-                    );
-                }
-            }
+        // Attempt to read page 1. The VersionStore is empty, so this
+        // should fail with an explicit error.
+        let result = tt_page_io.read_page(&cx, PageNumber::new(1).unwrap());
+
+        assert!(
+            result.is_err(),
+            "reading from TimeTravelPageIo with empty VersionStore \
+             should return an error, not silently fall through"
+        );
+
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("historical data not available")
+                || err_msg.contains("time-travel")
+                || err_msg.contains("version store"),
+            "expected error about missing historical data, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_time_travel_page_io_populated_store_falls_through_for_unchanged_page() {
+        // When the VersionStore IS populated (has at least one page
+        // version), but a specific page was never versioned, the
+        // read_page should fall through to the underlying transaction
+        // (the page hasn't changed since the target commit).
+        use fsqlite_pager::{MockMvccPager, MvccPager as _, TransactionMode};
+        use fsqlite_types::{PageVersion, TxnEpoch, TxnId, TxnToken, VersionPointer};
+
+        let pager = MockMvccPager;
+        let cx = Cx::new();
+        let txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let inner_io = SharedTxnPageIo::new(Box::new(txn));
+
+        let vs = Arc::new(VersionStore::new(fsqlite_types::PageSize::DEFAULT));
+
+        // Publish a version for page 1 at commit_seq=3 so the store is
+        // not empty.
+        let version = PageVersion {
+            pgno: PageNumber::new(1).unwrap(),
+            commit_seq: CommitSeq::new(3),
+            created_by: TxnToken::new(TxnId::new(3).unwrap(), TxnEpoch::new(1)),
+            data: PageData::from_vec(vec![0xAA; 4096]),
+            prev: None,
+        };
+        vs.publish(version);
+
+        // Snapshot at commit 5 -- page 1 is versioned, page 2 is not.
+        let tt_snapshot = TimeTravelSnapshot::new_for_commit_seq(
+            CommitSeq::new(5),
+            SchemaEpoch::new(1),
+        );
+
+        let tt_page_io = TimeTravelPageIo {
+            inner: inner_io,
+            version_store: vs,
+            snapshot: tt_snapshot,
+        };
+
+        // Reading page 2 (not versioned) should fall through to the
+        // underlying transaction, not error. The MockMvccPager's
+        // transaction will likely return an error because it has no real
+        // pages, but the important thing is it does NOT return the
+        // "historical data not available" error -- it falls through.
+        let result = tt_page_io.read_page(&cx, PageNumber::new(2).unwrap());
+
+        // The result may be Ok (if the mock provides data) or Err (if
+        // the mock doesn't), but it should NOT be the "historical data
+        // not available" error.
+        if let Err(e) = &result {
+            let msg = format!("{e}");
+            assert!(
+                !msg.contains("historical data not available"),
+                "populated VersionStore should fall through for unknown pages, \
+                 not return 'historical data not available'"
+            );
         }
     }
 

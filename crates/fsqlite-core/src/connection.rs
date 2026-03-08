@@ -1167,6 +1167,23 @@ enum FkDeleteAction {
     },
 }
 
+/// Describes the action to take when a FK-referenced parent row is updated.
+#[allow(dead_code)]
+enum FkUpdateAction {
+    Allow,
+    Cascade {
+        child_table: String,
+        child_columns: Vec<String>,
+        old_parent_values: Vec<SqliteValue>,
+        new_parent_values: Vec<SqliteValue>,
+    },
+    SetNull {
+        child_table: String,
+        child_columns: Vec<String>,
+        old_parent_values: Vec<SqliteValue>,
+    },
+}
+
 fn trigger_statement_raise_directive(
     statement: &Statement,
 ) -> Result<Option<TriggerRaiseDirective>> {
@@ -1509,6 +1526,11 @@ pub struct Connection {
     /// File change counter (offset 24 in the database header).  Incremented
     /// on every transaction that modifies the database (DML or DDL).
     change_counter: RefCell<u32>,
+    /// Depth counter for FK cascade operations.  When > 0, FK enforcement
+    /// is suppressed to prevent recursive checking during CASCADE/SET NULL
+    /// actions (matches C SQLite behavior where FK actions do not re-trigger
+    /// FK checking).
+    fk_cascade_depth: Cell<usize>,
     // ── MVCC conflict observability (bd-t6sv2.1) ──────────────────────────
     /// Observer for MVCC conflict analytics.  Records metrics (contention,
     /// FCW drift, SSI aborts) and a ring-buffer of recent conflict events.
@@ -1686,6 +1708,7 @@ impl Connection {
             next_master_rowid: RefCell::new(1),
             schema_cookie: RefCell::new(0),
             change_counter: RefCell::new(0),
+            fk_cascade_depth: Cell::new(0),
             // MVCC conflict observability (bd-t6sv2.1)
             conflict_observer: Rc::new(MetricsObserver::new(1024)),
             trace_registration: RefCell::new(None),
@@ -3359,9 +3382,11 @@ impl Connection {
                     for (old_values, new_values) in &rows_to_check {
                         // Parent-side: if this table is referenced by children,
                         // check that changing FK-referenced values doesn't orphan them.
-                        let fk_actions = self.check_fk_on_delete(table_name, old_values)?;
+                        // Use ON UPDATE actions (not ON DELETE) for UPDATE statements.
+                        let fk_actions =
+                            self.check_fk_on_update(table_name, old_values, new_values)?;
                         for action in &fk_actions {
-                            self.execute_fk_delete_action(action)?;
+                            self.execute_fk_update_action(action)?;
                         }
                         // Child-side: validate new FK values against parent tables.
                         self.check_fk_parent_exists(table_name, new_values)?;
@@ -6173,7 +6198,13 @@ impl Connection {
                     }
                     Ok(())
                 }
-                Err(e) => Err(e),
+                Err(e) => {
+                    // Commit failed (e.g. I/O error or BUSY in standard mode).
+                    // We must rollback to ensure cleanup and propagate the error.
+                    self.txn_metrics_note_rollback();
+                    let _ = txn.rollback(&cx);
+                    Err(e)
+                }
             }
         } else {
             if *self.concurrent_txn.borrow() {
@@ -6189,29 +6220,15 @@ impl Connection {
             txn.rollback(&cx)
         };
 
-        if let Err(err) = txn_result {
-            if ok {
-                self.txn_metrics_note_rollback();
-            }
-            let _ = txn.rollback(&cx);
-            if *self.concurrent_txn.borrow() {
-                if let Some(session_id) = self.concurrent_session_id.borrow_mut().take() {
-                    let mut registry = lock_unpoisoned(&self.concurrent_registry);
-                    if let Some(handle) = registry.get_mut(session_id) {
-                        concurrent_abort(handle, &self.concurrent_lock_table, session_id);
-                    }
-                    registry.remove(session_id);
-                }
-            }
-            *self.concurrent_txn.borrow_mut() = false;
-            *self.concurrent_session_id.borrow_mut() = None;
-            self.txn_metrics_mark_finished();
-            return Err(err);
-        }
-
+        // Ensure connection-level transaction state is cleared regardless of outcome.
         *self.concurrent_txn.borrow_mut() = false;
         *self.concurrent_session_id.borrow_mut() = None;
         self.txn_metrics_mark_finished();
+
+        if let Err(err) = txn_result {
+            return Err(err);
+        }
+
         self.maybe_run_adaptive_autocheckpoint();
         Ok(())
     }
@@ -8157,7 +8174,7 @@ impl Connection {
 
     /// Returns `true` when `PRAGMA foreign_keys` is currently ON.
     fn fk_enforcement_enabled(&self) -> bool {
-        self.pragma_state.borrow().foreign_keys
+        self.pragma_state.borrow().foreign_keys && self.fk_cascade_depth.get() == 0
     }
 
     /// Enforce parent-existence checks for rows inserted by an INSERT statement.
@@ -8386,7 +8403,10 @@ impl Connection {
                     child_table,
                     where_parts.join(" AND ")
                 );
-                self.execute_with_params(&sql, parent_values)?;
+                self.fk_cascade_depth.set(self.fk_cascade_depth.get() + 1);
+                let result = self.execute_with_params(&sql, parent_values);
+                self.fk_cascade_depth.set(self.fk_cascade_depth.get() - 1);
+                result?;
                 Ok(())
             }
             FkDeleteAction::SetNull {
@@ -8409,12 +8429,202 @@ impl Connection {
                     set_parts.join(", "),
                     where_parts.join(" AND ")
                 );
-                self.execute_with_params(&sql, parent_values)?;
+                self.fk_cascade_depth.set(self.fk_cascade_depth.get() + 1);
+                let result = self.execute_with_params(&sql, parent_values);
+                self.fk_cascade_depth.set(self.fk_cascade_depth.get() - 1);
+                result?;
                 Ok(())
             }
         }
     }
 
+    /// Verify that no child table references a row being updated in `table_name`.
+    ///
+    /// `old_values` are the column values before the update.
+    /// `new_values` are the column values after the update.
+    fn check_fk_on_update(
+        &self,
+        table_name: &str,
+        old_values: &[SqliteValue],
+        new_values: &[SqliteValue],
+    ) -> Result<Vec<FkUpdateAction>> {
+        let schema = self.schema.borrow();
+        let mut actions: Vec<(String, fsqlite_ast::FkDef, Vec<String>)> = Vec::new();
+        for table in schema.iter() {
+            for fk in &table.foreign_keys {
+                if fk.parent_table.eq_ignore_ascii_case(table_name) {
+                    let child_col_names: Vec<String> = fk
+                        .child_columns
+                        .iter()
+                        .filter_map(|&idx| table.columns.get(idx).map(|c| c.name.clone()))
+                        .collect();
+                    actions.push((table.name.clone(), fk.clone(), child_col_names));
+                }
+            }
+        }
+        let parent = schema
+            .iter()
+            .find(|t| t.name.eq_ignore_ascii_case(table_name));
+        let parent_cols: Vec<String> = parent.map_or_else(Vec::new, |p| {
+            p.columns.iter().map(|c| c.name.clone()).collect()
+        });
+        drop(schema);
+
+        if actions.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let mut result_actions = Vec::new();
+
+        for (child_table, fk, child_col_names) in &actions {
+            let parent_key_cols: &[String] = if fk.parent_columns.is_empty() {
+                &parent_cols
+            } else {
+                &fk.parent_columns
+            };
+
+            let parent_schema = self.schema.borrow();
+            let parent_table = parent_schema
+                .iter()
+                .find(|t| t.name.eq_ignore_ascii_case(table_name));
+            
+            let old_parent_vals: Vec<SqliteValue> = parent_key_cols
+                .iter()
+                .filter_map(|col_name| {
+                    parent_table.and_then(|t| {
+                        t.columns
+                            .iter()
+                            .position(|c| c.name.eq_ignore_ascii_case(col_name))
+                            .and_then(|idx| old_values.get(idx).cloned())
+                    })
+                })
+                .collect();
+                
+            let new_parent_vals: Vec<SqliteValue> = parent_key_cols
+                .iter()
+                .filter_map(|col_name| {
+                    parent_table.and_then(|t| {
+                        t.columns
+                            .iter()
+                            .position(|c| c.name.eq_ignore_ascii_case(col_name))
+                            .and_then(|idx| new_values.get(idx).cloned())
+                    })
+                })
+                .collect();
+            drop(parent_schema);
+
+            if old_parent_vals.iter().any(|v| matches!(v, SqliteValue::Null)) {
+                continue;
+            }
+            if old_parent_vals.len() != child_col_names.len() || new_parent_vals.len() != child_col_names.len() {
+                continue;
+            }
+
+            if old_parent_vals == new_parent_vals {
+                continue;
+            }
+
+            let where_parts: Vec<String> = child_col_names
+                .iter()
+                .enumerate()
+                .map(|(i, col)| format!("\"{}\" = ?{}", col, i + 1))
+                .collect();
+            let sql = format!(
+                "SELECT 1 FROM \"{}\" WHERE {} LIMIT 1",
+                child_table,
+                where_parts.join(" AND ")
+            );
+            let rows = self.query_with_params(&sql, &old_parent_vals)?;
+            if !rows.is_empty() {
+                match fk.on_update {
+                    fsqlite_ast::FkActionType::Cascade => {
+                        result_actions.push(FkUpdateAction::Cascade {
+                            child_table: child_table.clone(),
+                            child_columns: child_col_names.clone(),
+                            old_parent_values: old_parent_vals,
+                            new_parent_values: new_parent_vals,
+                        });
+                    }
+                    fsqlite_ast::FkActionType::SetNull => {
+                        result_actions.push(FkUpdateAction::SetNull {
+                            child_table: child_table.clone(),
+                            child_columns: child_col_names.clone(),
+                            old_parent_values: old_parent_vals,
+                        });
+                    }
+                    fsqlite_ast::FkActionType::NoAction | fsqlite_ast::FkActionType::Restrict | fsqlite_ast::FkActionType::SetDefault => {
+                        return Err(FrankenError::ForeignKeyViolation);
+                    }
+                }
+            }
+        }
+        Ok(result_actions)
+    }
+
+    /// Execute FK cascade/set-null actions for an UPDATE operation.
+    fn execute_fk_update_action(&self, action: &FkUpdateAction) -> Result<()> {
+        match action {
+            FkUpdateAction::Allow => Ok(()),
+            FkUpdateAction::Cascade {
+                child_table,
+                child_columns,
+                old_parent_values,
+                new_parent_values,
+            } => {
+                let set_parts: Vec<String> = child_columns
+                    .iter()
+                    .enumerate()
+                    .map(|(i, col)| format!("\"{}\" = ?{}", col, i + 1))
+                    .collect();
+                let where_parts: Vec<String> = child_columns
+                    .iter()
+                    .enumerate()
+                    .map(|(i, col)| format!("\"{}\" = ?{}", col, i + 1 + child_columns.len()))
+                    .collect();
+                let sql = format!(
+                    "UPDATE \"{}\" SET {} WHERE {}",
+                    child_table,
+                    set_parts.join(", "),
+                    where_parts.join(" AND ")
+                );
+                let mut params = new_parent_values.clone();
+                params.extend_from_slice(old_parent_values);
+                self.fk_cascade_depth.set(self.fk_cascade_depth.get() + 1);
+                let result = self.execute_with_params(&sql, &params);
+                self.fk_cascade_depth.set(self.fk_cascade_depth.get() - 1);
+                result?;
+                Ok(())
+            }
+            FkUpdateAction::SetNull {
+                child_table,
+                child_columns,
+                old_parent_values,
+            } => {
+                let set_parts: Vec<String> = child_columns
+                    .iter()
+                    .map(|col| format!("\"{}\" = NULL", col))
+                    .collect();
+                let where_parts: Vec<String> = child_columns
+                    .iter()
+                    .enumerate()
+                    .map(|(i, col)| format!("\"{}\" = ?{}", col, i + 1))
+                    .collect();
+                let sql = format!(
+                    "UPDATE \"{}\" SET {} WHERE {}",
+                    child_table,
+                    set_parts.join(", "),
+                    where_parts.join(" AND ")
+                );
+                self.fk_cascade_depth.set(self.fk_cascade_depth.get() + 1);
+                let result = self.execute_with_params(&sql, old_parent_values);
+                self.fk_cascade_depth.set(self.fk_cascade_depth.get() - 1);
+                result?;
+                Ok(())
+            }
+        }
+    }
+
+    /// Verify that changing FK-referenced parent values doesn't orphan children.
     fn has_matching_triggers(
         &self,
         table_name: &str,
@@ -9481,7 +9691,7 @@ impl Connection {
 
         // Attempt pager commit without consuming the handle (retriable on BUSY).
         // We use a scope to limit the mutable borrow of active_txn.
-        {
+        let commit_result = {
             let _commit_guard = lock_unpoisoned(&self.commit_write_mutex);
             let concurrent_commit_plan = if *self.concurrent_txn.borrow() {
                 self.plan_concurrent_commit()?
@@ -9489,14 +9699,23 @@ impl Connection {
                 None
             };
             let mut txn_guard = self.active_txn.borrow_mut();
-            if let Some(txn) = txn_guard.as_mut() {
-                txn.commit(&cx)?;
-            }
+            let commit_res = if let Some(txn) = txn_guard.as_mut() {
+                txn.commit(&cx)
+            } else {
+                Ok(())
+            };
 
-            let committed_seq = self.advance_commit_clock();
-            if let Some(plan) = concurrent_commit_plan {
-                self.finalize_concurrent_commit(plan, committed_seq);
+            if let Ok(()) = commit_res {
+                let committed_seq = self.advance_commit_clock();
+                if let Some(plan) = concurrent_commit_plan {
+                    self.finalize_concurrent_commit(plan, committed_seq);
+                }
             }
+            commit_res
+        };
+
+        if let Err(e) = commit_result {
+            return Err(e);
         }
 
         // Commit succeeded; now consume and drop the handle.
@@ -9572,6 +9791,9 @@ impl Connection {
             }
             self.txn_metrics_note_rollback();
             self.restore_snapshot(&snap);
+
+            // MVCC GC (bd-3bql / 5E.5): After savepoint rollback, trigger GC if scheduler permits.
+            self.maybe_gc_tick();
         } else {
             // Full ROLLBACK: restore to transaction start.
             // 5D.2 (bd-1ene): Use pager rollback and reload from committed state.
@@ -9598,14 +9820,16 @@ impl Connection {
             // Roll back the pager transaction: discard all dirty pages and
             // release writer locks. After this, the pager reflects the
             // pre-transaction committed state.
-            if let Some(mut txn) = self.active_txn.borrow_mut().take() {
-                txn.rollback(&cx)?;
-            }
+            let rollback_result = if let Some(mut txn) = self.active_txn.borrow_mut().take() {
+                txn.rollback(&cx)
+            } else {
+                Ok(())
+            };
 
             // Reload MemDatabase from pager's committed state.
             // This replaces the snapshot-restore approach with reading the
             // authoritative state from the pager.
-            self.reload_memdb_from_pager(&cx)?;
+            let reload_result = self.reload_memdb_from_pager(&cx);
 
             // Clear transaction state.
             *self.txn_snapshot.borrow_mut() = None;
@@ -9621,6 +9845,9 @@ impl Connection {
             // MVCC GC (bd-3bql / 5E.5): After full rollback, trigger GC if scheduler permits.
             // Rollback discards the write set and releases page locks, good time for cleanup.
             self.maybe_gc_tick();
+
+            rollback_result?;
+            reload_result?;
         }
         Ok(())
     }
