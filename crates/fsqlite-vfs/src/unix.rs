@@ -35,8 +35,9 @@ use tracing::debug;
 use tracing::{error, warn};
 
 use crate::shm::{
-    SQLITE_SHM_EXCLUSIVE, SQLITE_SHM_LOCK, SQLITE_SHM_SHARED, SQLITE_SHM_UNLOCK, ShmRegion,
-    WAL_NREADER_USIZE, WAL_TOTAL_LOCKS, WAL_WRITE_LOCK, wal_lock_byte, wal_read_lock_slot,
+    SHM_READ_MARK_OFFSET, SHM_SEGMENT_SIZE, SQLITE_SHM_EXCLUSIVE, SQLITE_SHM_LOCK,
+    SQLITE_SHM_SHARED, SQLITE_SHM_UNLOCK, ShmRegion, WAL_NREADER_USIZE, WAL_TOTAL_LOCKS,
+    WAL_WRITE_LOCK, wal_lock_byte, wal_read_lock_slot,
 };
 use crate::traits::{Vfs, VfsFile};
 
@@ -177,7 +178,7 @@ fn build_empty_sqlite_wal_shm_header(
     write_ne_u32(&mut hdr, 4, 0); // unused
     write_ne_u32(&mut hdr, 8, 0); // iChange
     hdr[12] = 1; // isInit
-    hdr[13] = if cfg!(target_endian = "big") { 1 } else { 0 }; // bigEndCksum
+    hdr[13] = u8::from(cfg!(target_endian = "big")); // bigEndCksum
     hdr[14..16].copy_from_slice(&sz_page_u16.to_ne_bytes());
     write_ne_u32(&mut hdr, 16, 0); // mxFrame (empty WAL)
     write_ne_u32(&mut hdr, 20, n_page);
@@ -354,13 +355,19 @@ impl InodeTable {
 
     /// Get the inode info for the given key if present.
     fn get(&self, key: InodeKey) -> Option<Arc<Mutex<InodeInfo>>> {
-        let map = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        let map = self
+            .map
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         map.get(&key).cloned()
     }
 
     /// Get or create the inode info for the given key.
     fn get_or_create(&self, key: InodeKey, file: Arc<File>) -> Arc<Mutex<InodeInfo>> {
-        let mut map = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = self
+            .map
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         Arc::clone(
             map.entry(key)
                 .or_insert_with(|| Arc::new(Mutex::new(InodeInfo::new(file)))),
@@ -369,9 +376,14 @@ impl InodeTable {
 
     /// Remove the inode entry if its refcount reaches zero.
     fn maybe_remove(&self, key: InodeKey) {
-        let mut map = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = self
+            .map
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(info) = map.get(&key) {
-            let guard = info.lock().unwrap_or_else(|e| e.into_inner());
+            let guard = info
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if guard.n_ref == 0 {
                 drop(guard);
                 map.remove(&key);
@@ -402,7 +414,6 @@ struct ShmInfo {
     regions: HashMap<u32, ShmRegion>,
     slots: Vec<ShmSlotState>,
     owner_refs: HashMap<u64, u32>,
-    read_marks: [u32; WAL_NREADER_USIZE],
 }
 
 impl ShmInfo {
@@ -419,12 +430,26 @@ impl ShmInfo {
                 .take(slot_count)
                 .collect(),
             owner_refs: HashMap::new(),
-            read_marks: [0; WAL_NREADER_USIZE],
         }
     }
 
+    /// Read `aReadMark[0..5]` from SHM segment 0 (native byte order).
+    ///
+    /// Returns zeros if segment 0 has not been mapped yet (pre-initialization
+    /// state). Once mapped, reads directly from the mmap'd `*-shm` file,
+    /// making values visible across all processes sharing the SHM.
     fn read_marks(&self) -> [u32; WAL_NREADER_USIZE] {
-        self.read_marks
+        let Some(region_0) = self.regions.get(&0) else {
+            return [0; WAL_NREADER_USIZE];
+        };
+        if region_0.len() < SHM_READ_MARK_OFFSET + WAL_NREADER_USIZE * 4 {
+            return [0; WAL_NREADER_USIZE];
+        }
+        let mut marks = [0u32; WAL_NREADER_USIZE];
+        for (i, mark) in marks.iter_mut().enumerate() {
+            *mark = region_0.read_u32_ne(SHM_READ_MARK_OFFSET + i * 4);
+        }
+        marks
     }
 }
 
@@ -444,7 +469,10 @@ impl ShmTable {
         // fd to an already-locked `*-shm` file, we can drop all locks held by this
         // process on that file. To avoid that, only ever open `*-shm` while holding
         // this mutex and only when we're definitely creating the canonical entry.
-        let mut map = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = self
+            .map
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(existing) = map.get(&path) {
             return Ok(Arc::clone(existing));
         }
@@ -464,9 +492,14 @@ impl ShmTable {
     }
 
     fn remove_if_orphaned(&self, path: &Path) {
-        let mut map = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = self
+            .map
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(entry) = map.get(path) {
-            let info = entry.lock().unwrap_or_else(|e| e.into_inner());
+            let info = entry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if info.owner_refs.is_empty() {
                 drop(info);
                 map.remove(path);
@@ -549,7 +582,9 @@ impl Vfs for UnixVfs {
             if let Some(inode_key) = inode_key_from_path(&resolved)? {
                 if let Some(inode_info) = global_inode_table().get(inode_key) {
                     let file = {
-                        let mut info = inode_info.lock().unwrap_or_else(|e| e.into_inner());
+                        let mut info = inode_info
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
                         info.n_ref += 1;
                         Arc::clone(&info.file)
                     };
@@ -601,7 +636,9 @@ impl Vfs for UnixVfs {
         let inode_key = inode_key_from_file(opened.as_ref())?;
         let inode_info = global_inode_table().get_or_create(inode_key, Arc::clone(&opened));
         let file = {
-            let mut info = inode_info.lock().unwrap_or_else(|e| e.into_inner());
+            let mut info = inode_info
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             info.n_ref += 1;
             Arc::clone(&info.file)
         };
@@ -748,7 +785,9 @@ impl UnixFile {
 
         let info = global_shm_table().get_or_create(self.shm_path.clone())?;
         {
-            let mut guard = info.lock().unwrap_or_else(|e| e.into_inner());
+            let mut guard = info
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             *guard.owner_refs.entry(self.shm_owner_id).or_insert(0) += 1;
         }
         self.shm_info = Some(Arc::clone(&info));
@@ -764,7 +803,9 @@ impl UnixFile {
         };
 
         {
-            let mut info = info_arc.lock().unwrap_or_else(|e| e.into_inner());
+            let mut info = info_arc
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let mut first_error: Option<FrankenError> = None;
             let shm_file = Arc::clone(&info.file);
 
@@ -1251,25 +1292,24 @@ impl UnixFile {
             });
         };
 
-        let shm_info = self.ensure_shm_info()?;
-        let needs_update = {
-            let info = shm_info.lock().unwrap_or_else(|e| e.into_inner());
-            let slot_idx = usize::try_from(reader_slot).expect("reader slot fits usize");
-            info.read_marks[slot_idx] != snapshot_mark
-        };
+        // Ensure SHM segment 0 is mapped so we can read/write aReadMark
+        // directly through the mmap'd `*-shm` file, making changes visible
+        // to all processes (including legacy C SQLite readers/writers).
+        let region_0 = self.shm_map(cx, 0, SHM_SEGMENT_SIZE, true)?;
 
-        if !needs_update {
+        let slot_idx = usize::try_from(reader_slot).expect("reader slot fits usize");
+        let shm_offset = SHM_READ_MARK_OFFSET + slot_idx * 4;
+        let current_mark = region_0.read_u32_ne(shm_offset);
+
+        if current_mark == snapshot_mark {
             self.shm_lock(cx, slot, 1, SQLITE_SHM_LOCK | SQLITE_SHM_SHARED)?;
             return Ok(false);
         }
 
         // Legacy protocol: EXCLUSIVE only for aReadMark mutation, then downgrade to SHARED.
         self.shm_lock(cx, slot, 1, SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE)?;
-        {
-            let mut info = shm_info.lock().unwrap_or_else(|e| e.into_inner());
-            let slot_idx = usize::try_from(reader_slot).expect("reader slot fits usize");
-            info.read_marks[slot_idx] = snapshot_mark;
-        }
+        region_0.write_u32_ne(shm_offset, snapshot_mark);
+        self.shm_barrier();
         self.shm_lock(cx, slot, 1, SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE)?;
         self.shm_lock(cx, slot, 1, SQLITE_SHM_LOCK | SQLITE_SHM_SHARED)?;
         Ok(true)
@@ -1350,14 +1390,18 @@ impl UnixFile {
     fn compat_shm_hold_dms_shared(&mut self, cx: &Cx) -> Result<()> {
         checkpoint_or_abort(cx)?;
         let shm_info = self.ensure_shm_info()?;
-        let mut info = shm_info.lock().unwrap_or_else(|e| e.into_inner());
+        let mut info = shm_info
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.acquire_shm_dms_shared(&mut info)
     }
 
     fn compat_shm_release_dms_shared(&mut self, cx: &Cx) -> Result<()> {
         checkpoint_or_abort(cx)?;
         let shm_info = self.ensure_shm_info()?;
-        let mut info = shm_info.lock().unwrap_or_else(|e| e.into_inner());
+        let mut info = shm_info
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.release_shm_dms_shared(&mut info)
     }
 
@@ -1369,7 +1413,9 @@ impl UnixFile {
         // grab WAL_WRITE_LOCK just to initialize `*-shm`.
         let shm_info = self.ensure_shm_info()?;
         let shm_file = {
-            let info = shm_info.lock().unwrap_or_else(|e| e.into_inner());
+            let info = shm_info
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             Arc::clone(&info.file)
         };
 
@@ -1446,9 +1492,11 @@ impl UnixFile {
 
     #[must_use]
     pub fn compat_read_marks(&self) -> Option<[u32; WAL_NREADER_USIZE]> {
-        self.shm_info
-            .as_ref()
-            .map(|info| info.lock().unwrap_or_else(|e| e.into_inner()).read_marks())
+        self.shm_info.as_ref().map(|info| {
+            info.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .read_marks()
+        })
     }
 }
 
@@ -1466,7 +1514,10 @@ impl VfsFile for UnixFile {
 
         // Decrement refcount.
         {
-            let mut info = self.inode_info.lock().unwrap_or_else(|e| e.into_inner());
+            let mut info = self
+                .inode_info
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             info.n_ref = info.n_ref.saturating_sub(1);
         }
         global_inode_table().maybe_remove(self.inode_key);
@@ -1582,7 +1633,9 @@ impl VfsFile for UnixFile {
         })?;
 
         let shm_info = self.ensure_shm_info()?;
-        let mut info = shm_info.lock().unwrap_or_else(|e| e.into_inner());
+        let mut info = shm_info
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         // Return cached region if it already exists and is large enough.
         if let Some(existing) = info.regions.get(&region).cloned() {
@@ -1642,14 +1695,16 @@ impl VfsFile for UnixFile {
             let err = std::io::Error::last_os_error();
             return Err(FrankenError::Io(std::io::Error::new(
                 err.kind(),
-                format!("mmap failed for shm region {region} (offset={offset}, size={map_size}): {err}"),
+                format!(
+                    "mmap failed for shm region {region} (offset={offset}, size={map_size}): {err}"
+                ),
             )));
         }
 
         // SAFETY: `ptr` is from a successful `mmap(MAP_SHARED, PROT_READ|PROT_WRITE)`
         // call. The region is `map_size` bytes. We transfer ownership to ShmRegion
         // which will `munmap` on drop.
-        let new_region = unsafe { ShmRegion::from_mmap(ptr as *mut u8, map_size) };
+        let new_region = unsafe { ShmRegion::from_mmap(ptr.cast::<u8>(), map_size) };
         info.regions.insert(region, new_region.clone());
         drop(info);
         Ok(new_region)
@@ -1683,7 +1738,9 @@ impl VfsFile for UnixFile {
         }
 
         let shm_info = self.ensure_shm_info()?;
-        let mut info = shm_info.lock().unwrap_or_else(|e| e.into_inner());
+        let mut info = shm_info
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         if lock_requested {
             let mut acquired = Vec::new();
@@ -1776,7 +1833,9 @@ mod tests {
 
         if let Ok(shm_info) = coordinator.ensure_shm_info() {
             let shm_file = {
-                let info = shm_info.lock().unwrap_or_else(|e| e.into_inner());
+                let info = shm_info
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 Arc::clone(&info.file)
             };
             let mut header = [0_u8; SQLITE_WAL_SHM_HEADER_BYTES];
@@ -2379,7 +2438,7 @@ mod tests {
     fn test_wal_checksum_8_bytes() {
         let data = [1u8, 0, 0, 0, 2, 0, 0, 0];
         let (s1, s2) = sqlite_wal_checksum_native_8byte_chunks(&data).unwrap();
-        // w1 = 1, w2 = 2 (native-endian on little-endian)
+        // w1 = 1, w2 = 2 (native byte order on little-endian)
         // s1 = 0 + 1 + 0 = 1
         // s2 = 0 + 2 + 1 = 3
         assert_eq!(s1, 1);
@@ -2710,14 +2769,20 @@ mod tests {
         file.write(&cx, b"x", 0).unwrap();
 
         let region = file.shm_map(&cx, 0, 32768, true).unwrap();
-        assert!(region.is_mmap_backed(), "unix VFS shm_map must return mmap-backed region");
+        assert!(
+            region.is_mmap_backed(),
+            "unix VFS shm_map must return mmap-backed region"
+        );
         assert_eq!(region.len(), 32768);
 
         // Verify the underlying SHM file was created and extended.
         let shm_path = sqlite_shm_path(&file.path);
         assert!(shm_path.exists(), "SHM file must exist after shm_map");
         let shm_len = fs::metadata(&shm_path).unwrap().len();
-        assert!(shm_len >= 32768, "SHM file must be at least 32KB, got {shm_len}");
+        assert!(
+            shm_len >= 32768,
+            "SHM file must be at least 32KB, got {shm_len}"
+        );
 
         file.shm_unmap(&cx, true).unwrap();
         file.close(&cx).unwrap();
@@ -2770,15 +2835,15 @@ mod tests {
         assert!(region_a.is_mmap_backed());
         assert!(region_b.is_mmap_backed());
 
-        // Write through handle A, read through handle B.
-        region_a.write_u32_le(100, 42);
+        // Write a distinctive pattern at offset 256 in the SHM region.
+        region_a.write_u32_le(256, 0xCAFE_BABE);
         file_a.shm_barrier();
         file_b.shm_barrier();
 
         assert_eq!(
-            region_b.read_u32_le(100),
-            42,
-            "mmap write through one handle must be visible to another handle (same process)"
+            region_b.read_u32_le(256),
+            0xCAFE_BABE,
+            "mmap write at offset 256 must be visible to another handle (same process)"
         );
 
         file_a.shm_unmap(&cx, false).unwrap();
@@ -2810,7 +2875,10 @@ mod tests {
         // Verify SHM file is at least 2 * 32KB.
         let shm_path = sqlite_shm_path(&file.path);
         let shm_len = fs::metadata(&shm_path).unwrap().len();
-        assert!(shm_len >= 65536, "SHM file must be at least 64KB for 2 regions, got {shm_len}");
+        assert!(
+            shm_len >= 65536,
+            "SHM file must be at least 64KB for 2 regions, got {shm_len}"
+        );
 
         file.shm_unmap(&cx, true).unwrap();
         file.close(&cx).unwrap();
@@ -2830,7 +2898,10 @@ mod tests {
         assert!(shm_path.exists());
 
         file.shm_unmap(&cx, true).unwrap();
-        assert!(!shm_path.exists(), "SHM file must be deleted after shm_unmap(delete=true)");
+        assert!(
+            !shm_path.exists(),
+            "SHM file must be deleted after shm_unmap(delete=true)"
+        );
 
         file.close(&cx).unwrap();
     }
@@ -2917,7 +2988,12 @@ mod tests {
 
         // Writer acquires exclusive lock on slot 0 (WAL_WRITE_LOCK).
         writer
-            .shm_lock(&cx, WAL_WRITE_LOCK, 1, SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE)
+            .shm_lock(
+                &cx,
+                WAL_WRITE_LOCK,
+                1,
+                SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE,
+            )
             .unwrap();
 
         // Write data under the lock.
@@ -2931,7 +3007,10 @@ mod tests {
             1,
             SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE,
         );
-        assert!(err.is_err(), "reader must fail to acquire exclusive lock held by writer");
+        assert!(
+            err.is_err(),
+            "reader must fail to acquire exclusive lock held by writer"
+        );
 
         // But reader can still read the mmap data (SHM is MAP_SHARED).
         reader.shm_barrier();
@@ -2943,7 +3022,12 @@ mod tests {
 
         // Writer releases.
         writer
-            .shm_lock(&cx, WAL_WRITE_LOCK, 1, SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE)
+            .shm_lock(
+                &cx,
+                WAL_WRITE_LOCK,
+                1,
+                SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE,
+            )
             .unwrap();
 
         writer.shm_unmap(&cx, false).unwrap();

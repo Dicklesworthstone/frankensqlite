@@ -39,7 +39,7 @@ impl Drop for MmapBacking {
         if !self.ptr.is_null() && self.len > 0 {
             // SAFETY: `ptr` and `len` were returned by a successful `mmap` call.
             unsafe {
-                libc::munmap(self.ptr as *mut libc::c_void, self.len);
+                libc::munmap(self.ptr.cast::<libc::c_void>(), self.len);
             }
         }
     }
@@ -66,12 +66,17 @@ enum ShmRegionBacking {
 impl std::fmt::Debug for ShmRegionBacking {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ShmRegionBacking::Heap(v) => f
+            Self::Heap(v) => f
                 .debug_tuple("Heap")
-                .field(&format_args!("Vec<u8>[{}]", v.lock().unwrap_or_else(|e| e.into_inner()).len()))
+                .field(&format_args!(
+                    "Vec<u8>[{}]",
+                    v.lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .len()
+                ))
                 .finish(),
             #[cfg(unix)]
-            ShmRegionBacking::Mmap(m) => f
+            Self::Mmap(m) => f
                 .debug_tuple("Mmap")
                 .field(&format_args!("ptr={:?}, len={}", m.ptr, m.len))
                 .finish(),
@@ -82,9 +87,9 @@ impl std::fmt::Debug for ShmRegionBacking {
 impl Clone for ShmRegionBacking {
     fn clone(&self) -> Self {
         match self {
-            ShmRegionBacking::Heap(v) => ShmRegionBacking::Heap(Arc::clone(v)),
+            Self::Heap(v) => Self::Heap(Arc::clone(v)),
             #[cfg(unix)]
-            ShmRegionBacking::Mmap(m) => ShmRegionBacking::Mmap(Arc::clone(m)),
+            Self::Mmap(m) => Self::Mmap(Arc::clone(m)),
         }
     }
 }
@@ -112,6 +117,21 @@ pub const WAL_NREADER: u32 = 5;
 pub const WAL_NREADER_USIZE: usize = 5;
 /// Total number of legacy SQLite WAL lock slots.
 pub const WAL_TOTAL_LOCKS: u32 = WAL_READ_LOCK_BASE + WAL_NREADER;
+
+/// Standard SHM segment size in bytes (32 KiB, matching C SQLite).
+pub const SHM_SEGMENT_SIZE: u32 = 32 * 1024;
+
+/// Absolute byte offset of `aReadMark[0]` in SHM segment 0.
+///
+/// The SHM header layout is:
+/// - `[0..48)`:   `WalIndexHdr` copy 1
+/// - `[48..96)`:  `WalIndexHdr` copy 2
+/// - `[96..100)`: `nBackfill` (u32)
+/// - `[100..120)`: `aReadMark[0..5]` (5 × u32, native byte order)
+/// - `[120..128)`: `aLock[0..8]` (lock slot bytes)
+/// - `[128..132)`: `nBackfillAttempted` (u32)
+/// - `[132..136)`: reserved
+pub const SHM_READ_MARK_OFFSET: usize = 100;
 
 /// Legacy SQLite POSIX SHM lock-byte base offset in the `*-shm` file.
 const SQLITE_SHM_LOCK_BASE: u64 = 120;
@@ -220,11 +240,18 @@ impl ShmRegion {
     pub fn lock(&self) -> ShmRegionGuard<'_> {
         match &self.backing {
             ShmRegionBacking::Heap(data) => ShmRegionGuard {
-                inner: ShmRegionGuardInner::Heap(data.lock().unwrap_or_else(|e| e.into_inner())),
+                inner: ShmRegionGuardInner::Heap(
+                    data.lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner),
+                ),
             },
             #[cfg(unix)]
             ShmRegionBacking::Mmap(m) => ShmRegionGuard {
-                inner: ShmRegionGuardInner::Mmap { ptr: m.ptr, len: m.len, _backing: m },
+                inner: ShmRegionGuardInner::Mmap {
+                    ptr: m.ptr,
+                    len: m.len,
+                    _backing: m,
+                },
             },
         }
     }
@@ -253,6 +280,38 @@ impl ShmRegion {
     pub fn write_u32_le(&self, offset: usize, val: u32) {
         let mut guard = self.lock();
         guard[offset..offset + 4].copy_from_slice(&val.to_le_bytes());
+    }
+
+    /// Read a native-endian `u32` at the given byte offset.
+    ///
+    /// SHM WAL-index fields use native byte order (the SHM file is not
+    /// portable across architectures — it is reconstructed from the WAL
+    /// on startup).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `offset + 4 > self.len()`.
+    #[must_use]
+    pub fn read_u32_ne(&self, offset: usize) -> u32 {
+        let bytes: [u8; 4] = {
+            let guard = self.lock();
+            guard[offset..offset + 4]
+                .try_into()
+                .expect("slice is exactly 4 bytes")
+        };
+        u32::from_ne_bytes(bytes)
+    }
+
+    /// Write a native-endian `u32` at the given byte offset.
+    ///
+    /// SHM WAL-index fields use native byte order.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `offset + 4 > self.len()`.
+    pub fn write_u32_ne(&self, offset: usize, val: u32) {
+        let mut guard = self.lock();
+        guard[offset..offset + 4].copy_from_slice(&val.to_ne_bytes());
     }
 
     /// Read a little-endian `u64` at the given byte offset.
@@ -297,7 +356,9 @@ impl ShmRegion {
     pub fn resize(&mut self, new_size: usize) {
         match &self.backing {
             ShmRegionBacking::Heap(data) => {
-                let mut guard = data.lock().unwrap_or_else(|e| e.into_inner());
+                let mut guard = data
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if new_size > guard.len() {
                     guard.resize(new_size, 0);
                 } else if new_size < guard.len() {
@@ -576,5 +637,34 @@ mod tests {
         region.write_u64_le(8, 0xCAFE_BABE_DEAD_BEEF);
         assert_eq!(region.read_u32_le(0), 42);
         assert_eq!(region.read_u64_le(8), 0xCAFE_BABE_DEAD_BEEF);
+    }
+
+    #[test]
+    fn test_shm_region_read_write_u32_ne() {
+        let region = ShmRegion::new(64);
+        region.write_u32_ne(0, 0xDEAD_BEEF);
+        region.write_u32_ne(4, 42);
+        assert_eq!(region.read_u32_ne(0), 0xDEAD_BEEF);
+        assert_eq!(region.read_u32_ne(4), 42);
+    }
+
+    #[test]
+    fn test_shm_region_native_endian_consistency() {
+        let region = ShmRegion::new(16);
+        let value = 0x1234_5678_u32;
+        region.write_u32_ne(0, value);
+        // Native endian read should round-trip.
+        assert_eq!(region.read_u32_ne(0), value);
+        // On little-endian platforms, ne == le.
+        if cfg!(target_endian = "little") {
+            assert_eq!(region.read_u32_le(0), value);
+        }
+    }
+
+    #[test]
+    fn test_shm_read_mark_offset_constant() {
+        // aReadMark starts at absolute SHM offset 100 (after 2×48B headers + 4B nBackfill).
+        assert_eq!(SHM_READ_MARK_OFFSET, 100);
+        assert_eq!(SHM_SEGMENT_SIZE, 32 * 1024);
     }
 }
