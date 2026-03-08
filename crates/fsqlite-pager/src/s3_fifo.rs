@@ -667,7 +667,8 @@ impl S3Fifo {
     }
 
     fn remove_ghost(&mut self, page_id: PageNumber) {
-        self.ghost.retain(|candidate| *candidate != page_id);
+        // PERF: Avoid O(N) `retain` scan on the ghost queue. Dead entries will be
+        // lazily ignored by `trim_ghosts` since they will no longer have `EntryState::Ghost`.
         if matches!(self.index.get(&page_id), Some(EntryState::Ghost)) {
             self.index.remove(&page_id);
         }
@@ -1669,7 +1670,7 @@ mod tests {
         }
     }
 
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(Debug, Clone)]
     struct BenchmarkRow {
         workload: WorkloadKind,
         capacity_percent: usize,

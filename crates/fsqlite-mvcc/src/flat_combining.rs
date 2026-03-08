@@ -38,8 +38,8 @@
 //!   - `fsqlite_flat_combining_wait_ns_total`
 //!   - `fsqlite_flat_combining_wait_ns_max`
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use fsqlite_types::sync_primitives::Instant;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use fsqlite_types::sync_primitives::Mutex;
 use serde::Serialize;

@@ -34,9 +34,9 @@
 //! - `max_group_delay`: Maximum time to wait for additional writers before
 //!   flushing (default: 1ms). Bounded to ensure tail latency.
 
+use fsqlite_types::sync_primitives::{Duration, Instant};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
-use fsqlite_types::sync_primitives::{Duration, Instant};
 
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::cx::Cx;

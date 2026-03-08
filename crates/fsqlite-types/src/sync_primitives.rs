@@ -25,8 +25,8 @@ pub use parking_lot::{
 mod wasm_sync {
     use std::ops::{Deref, DerefMut};
     use std::sync::{
-        Mutex as StdMutex, MutexGuard as StdMutexGuard, Once as StdOnce,
-        PoisonError, RwLock as StdRwLock, RwLockReadGuard as StdRwReadGuard,
+        Mutex as StdMutex, MutexGuard as StdMutexGuard, Once as StdOnce, PoisonError,
+        RwLock as StdRwLock, RwLockReadGuard as StdRwReadGuard,
         RwLockWriteGuard as StdRwWriteGuard,
     };
 
@@ -50,10 +50,7 @@ mod wasm_sync {
         }
 
         pub fn try_lock(&self) -> Option<MutexGuard<'_, T>> {
-            self.0
-                .try_lock()
-                .ok()
-                .map(MutexGuard)
+            self.0.try_lock().ok().map(MutexGuard)
         }
 
         pub fn is_locked(&self) -> bool {
@@ -231,9 +228,7 @@ mod wasm_sync {
 }
 
 #[cfg(target_arch = "wasm32")]
-pub use wasm_sync::{
-    Condvar, Mutex, MutexGuard, Once, RwLock, RwLockReadGuard, RwLockWriteGuard,
-};
+pub use wasm_sync::{Condvar, Mutex, MutexGuard, Once, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 // ---------------------------------------------------------------------------
 // Time polyfill — Instant / Duration

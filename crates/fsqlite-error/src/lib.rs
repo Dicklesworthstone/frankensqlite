@@ -253,6 +253,10 @@ pub enum FrankenError {
     #[error("{0}")]
     FunctionError(String),
 
+    /// A background runtime worker failed and poisoned the shared database state.
+    #[error("background worker failed: {0}")]
+    BackgroundWorkerFailed(String),
+
     /// Attempt to write a read-only database or virtual table.
     #[error("attempt to write a readonly database")]
     ReadOnly,
@@ -368,6 +372,7 @@ impl FrankenError {
             | Self::TooManyArguments { .. }
             | Self::NotImplemented(_)
             | Self::FunctionError(_)
+            | Self::BackgroundWorkerFailed(_)
             | Self::ConcurrentUnavailable => ErrorCode::Error,
             Self::UniqueViolation { .. }
             | Self::NotNullViolation { .. }
@@ -439,6 +444,9 @@ impl FrankenError {
             Self::ConcurrentUnavailable => Some(
                 "Use a filesystem that supports shared memory, or use BEGIN (serialized) instead",
             ),
+            Self::BackgroundWorkerFailed(_) => {
+                Some("Close and reopen the database; inspect the logged worker failure details")
+            }
             Self::QueryReturnedNoRows => Some("Use query() when zero rows are acceptable"),
             Self::QueryReturnedMultipleRows => {
                 Some("Use query() when multiple rows are acceptable, or tighten the query")
@@ -1405,6 +1413,16 @@ mod tests {
         let err = FrankenError::function_error("division by zero");
         assert!(matches!(err, FrankenError::FunctionError(ref msg) if msg == "division by zero"));
         assert_eq!(err.error_code(), ErrorCode::Error);
+    }
+
+    #[test]
+    fn background_worker_failed_is_non_transient_generic_error() {
+        let err = FrankenError::BackgroundWorkerFailed("gc worker panic".to_owned());
+        assert_eq!(err.to_string(), "background worker failed: gc worker panic");
+        assert_eq!(err.error_code(), ErrorCode::Error);
+        assert!(!err.is_transient());
+        assert!(!err.is_user_recoverable());
+        assert!(err.suggestion().is_some());
     }
 
     #[test]

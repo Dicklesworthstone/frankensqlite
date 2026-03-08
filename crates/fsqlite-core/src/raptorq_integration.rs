@@ -11,9 +11,9 @@
 //! `checkpoint_interval` symbols (§4.12.1).  If the context is cancelled
 //! the operation returns `FrankenError::Abort`.
 
+use fsqlite_types::sync_primitives::Instant;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
-use fsqlite_types::sync_primitives::Instant;
 
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::{ObjectId, cx::Cx};

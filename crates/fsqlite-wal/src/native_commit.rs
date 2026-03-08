@@ -20,8 +20,8 @@
 //! - FSYNC_1 prevents "committed marker, lost data" (worst case).
 //! - FSYNC_2 prevents "client thinks committed, marker not persisted."
 
-use std::collections::VecDeque;
 use fsqlite_types::sync_primitives::Instant;
+use std::collections::VecDeque;
 
 use fsqlite_types::{
     CommitMarker, CommitProof, CommitSeq, ObjectId, OperatingMode, PageNumber, TxnToken,

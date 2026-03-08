@@ -1178,7 +1178,7 @@ mod tests {
     fn test_uuid_v4_version() {
         let uuid = generate_uuid_v4();
         // Version nibble is the first character of the third group
-        let version_char = uuid.chars().nth(14).unwrap();
+        let version_char = uuid.as_bytes()[14] as char;
         assert_eq!(version_char, '4', "UUID v4 must have version nibble = 4");
     }
 
@@ -1186,7 +1186,7 @@ mod tests {
     fn test_uuid_v4_variant() {
         let uuid = generate_uuid_v4();
         // Variant bits are the first character of the fourth group
-        let variant_char = uuid.chars().nth(19).unwrap();
+        let variant_char = uuid.as_bytes()[19] as char;
         let variant_nibble = u8::from_str_radix(&variant_char.to_string(), 16).unwrap();
         assert!(
             (0x8..=0xB).contains(&variant_nibble),

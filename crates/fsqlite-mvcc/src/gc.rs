@@ -6,9 +6,9 @@
 //! - [`gc_tick`]: Incremental pruning driver with work budgets.
 //! - [`prune_page_chain`]: Single-page chain severing and free-list return.
 
+use fsqlite_types::sync_primitives::Instant;
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
-use fsqlite_types::sync_primitives::Instant;
 
 use fsqlite_types::{CommitSeq, PageNumber, PageNumberBuildHasher, VersionPointer};
 

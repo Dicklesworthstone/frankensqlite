@@ -4040,14 +4040,21 @@ impl VdbeEngine {
                                         cursor.cursor.next(&cursor.cx)?;
                                     }
                                     if !cursor.cursor.eof() {
-                                        let target_vals = parse_record(&key_bytes).unwrap_or_default();
+                                        let target_vals =
+                                            parse_record(&key_bytes).unwrap_or_default();
                                         loop {
                                             if cursor.cursor.eof() {
                                                 break;
                                             }
                                             let payload = cursor.cursor.payload(&cursor.cx)?;
-                                            let cur_vals = parse_record(&payload).unwrap_or_default();
-                                            let cmp = compare_sorter_keys(&cur_vals, &target_vals, target_vals.len(), &[]);
+                                            let cur_vals =
+                                                parse_record(&payload).unwrap_or_default();
+                                            let cmp = compare_sorter_keys(
+                                                &cur_vals,
+                                                &target_vals,
+                                                target_vals.len(),
+                                                &[],
+                                            );
                                             if cmp == std::cmp::Ordering::Equal {
                                                 cursor.cursor.next(&cursor.cx)?;
                                             } else {
@@ -4059,14 +4066,21 @@ impl VdbeEngine {
                                 }
                                 Opcode::SeekLE => {
                                     if !cursor.cursor.eof() {
-                                        let target_vals = parse_record(&key_bytes).unwrap_or_default();
+                                        let target_vals =
+                                            parse_record(&key_bytes).unwrap_or_default();
                                         loop {
                                             if cursor.cursor.eof() {
                                                 break;
                                             }
                                             let payload = cursor.cursor.payload(&cursor.cx)?;
-                                            let cur_vals = parse_record(&payload).unwrap_or_default();
-                                            let cmp = compare_sorter_keys(&cur_vals, &target_vals, target_vals.len(), &[]);
+                                            let cur_vals =
+                                                parse_record(&payload).unwrap_or_default();
+                                            let cmp = compare_sorter_keys(
+                                                &cur_vals,
+                                                &target_vals,
+                                                target_vals.len(),
+                                                &[],
+                                            );
                                             if cmp == std::cmp::Ordering::Equal {
                                                 cursor.cursor.next(&cursor.cx)?;
                                             } else {
@@ -4525,9 +4539,17 @@ impl VdbeEngine {
                         });
                     } else {
                         self.pending_insert_rollback = None;
+                        // When OE_IGNORE skips the insert (unique or rowid
+                        // conflict handled internally), tell subsequent
+                        // IdxInsert opcodes to skip this row's index entries.
+                        if oe_flag == 4 {
+                            self.conflict_skip_idx = true;
+                        }
                     }
                     self.last_insert_cursor_id = Some(cursor_id);
-                    self.conflict_skip_idx = false;
+                    if actually_inserted {
+                        self.conflict_skip_idx = false;
+                    }
                     self.pending_idx_entries.clear();
 
                     // br-22iss: Clear pending_next_after_delete since Insert repositions

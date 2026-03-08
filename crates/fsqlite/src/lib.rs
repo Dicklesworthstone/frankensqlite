@@ -3,7 +3,10 @@
 //! This crate will grow a stable, ergonomic API surface over time. In early
 //! phases it also re-exports selected internal crates for integration tests.
 
-pub use fsqlite_core::connection::{Connection, PreparedStatement, Row, TraceEvent, TraceMask};
+pub use fsqlite_core::connection::{
+    Connection, ConnectionEnv, IoPollStrategy, PreparedStatement, Row, RuntimeConfig,
+    RuntimeContext, TraceEvent, TraceMask, init_global_runtime,
+};
 pub use fsqlite_error::FrankenError;
 pub use fsqlite_vfs;
 
@@ -19,9 +22,13 @@ pub mod migrate;
     clippy::branches_sharing_code
 )]
 mod tests {
-    use super::Connection;
+    use super::{
+        Connection, ConnectionEnv, IoPollStrategy, RuntimeConfig, RuntimeContext,
+        init_global_runtime,
+    };
     use fsqlite_error::FrankenError;
     use fsqlite_types::value::SqliteValue;
+    use std::sync::Arc;
 
     fn row_values(row: &super::Row) -> Vec<SqliteValue> {
         row.values().to_vec()
@@ -102,6 +109,24 @@ mod tests {
     fn open_empty_path_fails() {
         let err = Connection::open("").expect_err("empty path should fail");
         assert!(matches!(err, FrankenError::CannotOpen { .. }));
+    }
+
+    #[test]
+    fn runtime_api_is_reexported() {
+        let runtime = init_global_runtime(RuntimeConfig {
+            worker_threads: 2,
+            io_poll_strategy: IoPollStrategy::Blocking,
+        });
+        assert_eq!(runtime.config().worker_threads, 2);
+        assert_eq!(runtime.config().io_poll_strategy, IoPollStrategy::Blocking);
+
+        let explicit_runtime = Arc::new(RuntimeContext::new(RuntimeConfig {
+            worker_threads: 1,
+            io_poll_strategy: IoPollStrategy::Auto,
+        }));
+        let env = ConnectionEnv::new(Arc::clone(&explicit_runtime));
+        let conn = Connection::open_with_env(":memory:", env).expect("connection should open");
+        assert_eq!(conn.path(), ":memory:");
     }
 
     // ── Row accessors ────────────────────────────────────────────────────

@@ -49,10 +49,20 @@ fn single_conn_upsert_updates_existing_row() {
     let rows = c
         .query("SELECT COUNT(*) FROM agents WHERE slug='test'")
         .unwrap();
-    assert_eq!(col(&rows, 0, 0), "1", "single-conn: should have exactly 1 row");
+    assert_eq!(
+        col(&rows, 0, 0),
+        "1",
+        "single-conn: should have exactly 1 row"
+    );
 
-    let rows = c.query("SELECT name FROM agents WHERE slug='test'").unwrap();
-    assert_eq!(col(&rows, 0, 0), "Updated", "single-conn: name should be updated");
+    let rows = c
+        .query("SELECT name FROM agents WHERE slug='test'")
+        .unwrap();
+    assert_eq!(
+        col(&rows, 0, 0),
+        "Updated",
+        "single-conn: name should be updated"
+    );
 }
 
 /// Cross-connection: Connection B's upsert must see Connection A's committed row.
@@ -104,7 +114,9 @@ fn cross_conn_upsert_detects_conflict() {
             "cross-conn: should still have exactly 1 row, not a duplicate"
         );
 
-        let rows = c.query("SELECT name FROM agents WHERE slug='test'").unwrap();
+        let rows = c
+            .query("SELECT name FROM agents WHERE slug='test'")
+            .unwrap();
         assert_eq!(
             col(&rows, 0, 0),
             "ConnB",
@@ -117,14 +129,16 @@ fn cross_conn_upsert_detects_conflict() {
 #[test]
 fn cross_conn_do_nothing_skips_duplicate() {
     let dir = tempdir().unwrap();
-    let path = dir.path().join("cross_nothing.db").to_string_lossy().to_string();
+    let path = dir
+        .path()
+        .join("cross_nothing.db")
+        .to_string_lossy()
+        .to_string();
 
     {
         let c = open(&path);
-        c.execute(
-            "CREATE TABLE kv (k TEXT PRIMARY KEY, v INTEGER)",
-        )
-        .unwrap();
+        c.execute("CREATE TABLE kv (k TEXT PRIMARY KEY, v INTEGER)")
+            .unwrap();
         c.execute("INSERT INTO kv VALUES ('key1', 100)").unwrap();
     }
 
@@ -137,7 +151,11 @@ fn cross_conn_do_nothing_skips_duplicate() {
         assert_eq!(col(&rows, 0, 0), "1", "DO NOTHING: should still have 1 row");
 
         let rows = c.query("SELECT v FROM kv WHERE k='key1'").unwrap();
-        assert_eq!(col(&rows, 0, 0), "100", "DO NOTHING: original value preserved");
+        assert_eq!(
+            col(&rows, 0, 0),
+            "100",
+            "DO NOTHING: original value preserved"
+        );
     }
 }
 
@@ -149,10 +167,8 @@ fn cross_conn_three_connections_same_key() {
 
     {
         let c = open(&path);
-        c.execute(
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, slug TEXT UNIQUE, val INTEGER)",
-        )
-        .unwrap();
+        c.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, slug TEXT UNIQUE, val INTEGER)")
+            .unwrap();
     }
 
     for i in 1..=3 {

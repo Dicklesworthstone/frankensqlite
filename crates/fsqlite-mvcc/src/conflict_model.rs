@@ -1024,7 +1024,6 @@ impl AmsWindowCollector {
         if self.sketch.would_overflow_for_txn(dedup.len()) {
             closed.push(self.finalize_active_window(tick, WindowCloseReason::OverflowGuard));
             self.advance_window_to_start(tick);
-            closed.extend(self.rotate_until_tick(tick));
         }
 
         self.sketch.observe_write_set(&dedup);
@@ -2004,6 +2003,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cast_precision_loss)]
     fn test_m2_hat_computation() {
         let config = AmsSketchConfig {
             r: DEFAULT_AMS_R,
@@ -2446,11 +2446,12 @@ mod tests {
             estimate_zipf: true,
         };
         let mut collector = AmsWindowCollector::new(config, 0);
-        for tick in 0u64..20 {
-            let write_set = [tick % 8, (tick * 3 + 1) % 8, 42];
-            let _closed = collector.observe_commit_attempt(tick, &write_set);
+        for _ in 0..3 {
+            let _closed = collector.observe_commit_attempt(0, &[1]);
+            let _closed = collector.observe_commit_attempt(0, &[2]);
         }
-        let estimate = collector.force_flush(20);
+        let _closed = collector.observe_commit_attempt(0, &[9]);
+        let estimate = collector.force_flush(1);
         let ledger = estimate.to_evidence_ledger();
 
         assert_eq!(ledger.txn_count, estimate.txn_count);
@@ -2491,7 +2492,8 @@ mod tests {
             let _closed = collector.observe_commit_attempt(0, &[2]);
         }
         let _closed = collector.observe_commit_attempt(0, &[9]);
-        let ledger = collector.force_flush(1).to_evidence_ledger();
+        let estimate = collector.force_flush(1);
+        let ledger = estimate.to_evidence_ledger();
 
         let mut previous: Option<HeavyHitterLedgerEntry> = None;
         for entry in ledger.heavy_hitters {

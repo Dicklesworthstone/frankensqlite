@@ -10,8 +10,8 @@
 
 use std::collections::HashMap;
 
-use fsqlite_types::{RowId, RowIdMode, SchemaEpoch, TableId};
 use fsqlite_types::sync_primitives::Mutex;
+use fsqlite_types::{RowId, RowIdMode, SchemaEpoch, TableId};
 use tracing::{debug, error, info, warn};
 
 use crate::coordinator_ipc::{RowidReservePayload, RowidReserveResponse};

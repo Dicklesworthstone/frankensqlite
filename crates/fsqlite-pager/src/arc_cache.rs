@@ -24,8 +24,8 @@ use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use fsqlite_types::{CommitSeq, PageNumber};
 use fsqlite_types::sync_primitives::{Condvar, Mutex};
+use fsqlite_types::{CommitSeq, PageNumber};
 
 use crate::page_buf::PageBuf;
 

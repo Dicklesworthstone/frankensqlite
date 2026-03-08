@@ -42,14 +42,14 @@ use fsqlite_pager::{CheckpointMode, JournalMode, PageCacheMetricsSnapshot, Simpl
 use fsqlite_parser::Parser;
 use fsqlite_parser::lexer::Lexer;
 use fsqlite_types::DATABASE_HEADER_SIZE;
-use fsqlite_types::cx::Cx;
+use fsqlite_types::cx::{CancelReason, Cx};
 use fsqlite_types::flags::{AccessFlags, VfsOpenFlags};
 use fsqlite_types::limits::MAX_VARIABLE_NUMBER;
 use fsqlite_types::opcode::{Opcode, P4};
 use fsqlite_types::record::{parse_record, serialize_record};
 use fsqlite_types::value::SqliteValue;
 use fsqlite_types::{
-    BTreePageHeader, DatabaseHeader, EProcessConfig, EProcessOracle, PageNumber, PageSize,
+    BTreePageHeader, DatabaseHeader, EProcessConfig, EProcessOracle, PageNumber, PageSize, Region,
     StrictColumnType, TextEncoding,
 };
 use fsqlite_vdbe::codegen::{
@@ -93,6 +93,7 @@ use fsqlite_observability::{
 };
 use fsqlite_types::{CommitSeq, SchemaEpoch, Snapshot, TxnToken};
 
+use crate::region::{RegionKind, RegionTree};
 use crate::wal_adapter::WalBackendAdapter;
 
 const EPROCESS_DEFAULT_CONFIG: EProcessConfig = EProcessConfig {
@@ -109,6 +110,114 @@ const EPROCESS_PRIORITY_THRESHOLD: u8 = 1;
 /// level consumes significantly more stack space than C. A practical limit of
 /// 100 prevents stack overflow while still allowing deep trigger chains.
 const MAX_TRIGGER_DEPTH: usize = 100;
+
+/// I/O polling strategy for the shared runtime context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IoPollStrategy {
+    /// Let FrankenSQLite choose the platform default.
+    Auto,
+    /// Use a conservative blocking strategy.
+    Blocking,
+}
+
+/// Configuration for the process-global runtime context.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeConfig {
+    /// Preferred worker-thread count for background services.
+    pub worker_threads: usize,
+    /// I/O polling strategy to prefer for background services.
+    pub io_poll_strategy: IoPollStrategy,
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        Self {
+            worker_threads: crate::available_parallelism_or_one(),
+            io_poll_strategy: IoPollStrategy::Auto,
+        }
+    }
+}
+
+/// Process-global runtime handle shared by all database regions.
+#[derive(Debug)]
+pub struct RuntimeContext {
+    config: RuntimeConfig,
+    root_cx: Cx,
+}
+
+impl RuntimeContext {
+    /// Create a runtime context with the provided configuration.
+    #[must_use]
+    pub fn new(config: RuntimeConfig) -> Self {
+        Self {
+            config,
+            root_cx: Cx::new().with_trace_context(next_trace_id(), 0, 0),
+        }
+    }
+
+    /// Access the runtime configuration.
+    #[must_use]
+    pub const fn config(&self) -> &RuntimeConfig {
+        &self.config
+    }
+
+    /// Return the active process-global runtime context.
+    #[must_use]
+    pub fn global() -> Arc<Self> {
+        global_runtime_context()
+    }
+}
+
+impl Default for RuntimeContext {
+    fn default() -> Self {
+        Self::new(RuntimeConfig::default())
+    }
+}
+
+static GLOBAL_RUNTIME_CONTEXT: OnceLock<Mutex<Option<Arc<RuntimeContext>>>> = OnceLock::new();
+
+fn global_runtime_context() -> Arc<RuntimeContext> {
+    let slot = GLOBAL_RUNTIME_CONTEXT.get_or_init(|| Mutex::new(None));
+    let mut guard = lock_unpoisoned(slot);
+    Arc::clone(guard.get_or_insert_with(|| Arc::new(RuntimeContext::default())))
+}
+
+/// Install or replace the process-global runtime context used by `Connection::open`.
+#[must_use]
+pub fn init_global_runtime(config: RuntimeConfig) -> Arc<RuntimeContext> {
+    let runtime = Arc::new(RuntimeContext::new(config));
+    let slot = GLOBAL_RUNTIME_CONTEXT.get_or_init(|| Mutex::new(None));
+    *lock_unpoisoned(slot) = Some(Arc::clone(&runtime));
+    runtime
+}
+
+/// Connection-scoped environment for selecting the runtime context.
+#[derive(Debug, Clone)]
+pub struct ConnectionEnv {
+    runtime: Arc<RuntimeContext>,
+}
+
+impl ConnectionEnv {
+    /// Create a connection environment from an explicit runtime context.
+    #[must_use]
+    pub fn new(runtime: Arc<RuntimeContext>) -> Self {
+        Self { runtime }
+    }
+
+    /// Access the runtime context that will back newly opened connections.
+    #[must_use]
+    pub fn runtime(&self) -> &Arc<RuntimeContext> {
+        &self.runtime
+    }
+}
+
+impl Default for ConnectionEnv {
+    fn default() -> Self {
+        Self {
+            runtime: RuntimeContext::global(),
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Storage backend abstraction
@@ -723,6 +832,7 @@ impl PreparedStatement<'_> {
                     .to_owned(),
             ));
         }
+        self.conn.background_status()?;
         self.conn.sync_change_tracking_context();
         let op_cx = self.root_cx.clone().with_decision_id(next_decision_id());
         self.ensure_schema_unchanged(&op_cx)?;
@@ -757,6 +867,7 @@ impl PreparedStatement<'_> {
                     .to_owned(),
             ));
         }
+        self.conn.background_status()?;
         self.conn.sync_change_tracking_context();
         let op_cx = self.root_cx.clone().with_decision_id(next_decision_id());
         self.ensure_schema_unchanged(&op_cx)?;
@@ -1406,6 +1517,8 @@ pub struct Connection {
     /// Keeps the per-database shared MVCC bundle alive while this connection
     /// is open, so same-path connections reuse the same state entry.
     _shared_mvcc_state: Arc<SharedMvccState>,
+    /// Region owned by this connection under the shared per-database root.
+    runtime_region: Region,
     /// Session ID for the current concurrent transaction (if any).
     /// Set by execute_begin() when mode is Concurrent.
     concurrent_session_id: RefCell<Option<u64>>,
@@ -1497,6 +1610,14 @@ impl Connection {
     /// table-backed DML (CREATE TABLE, INSERT, SELECT FROM, UPDATE, DELETE)
     /// are supported.
     pub fn open(path: impl Into<String>) -> Result<Self> {
+        Self::open_with_env(path, ConnectionEnv::default())
+    }
+
+    /// Open a connection with an explicit runtime environment.
+    ///
+    /// The supplied [`ConnectionEnv`] selects the process-global or custom
+    /// runtime context whose per-database region this connection joins.
+    pub fn open_with_env(path: impl Into<String>, env: ConnectionEnv) -> Result<Self> {
         let path = path.into();
         if path.is_empty() {
             return Err(FrankenError::CannotOpen {
@@ -1507,14 +1628,14 @@ impl Connection {
         // Phase 5 (bd-3iw8): initialize the pager backend as the primary
         // storage layer. The pager handles all persistence via WAL.
         let pager = PagerBackend::open(&path)?;
-        let shared_mvcc_state = shared_mvcc_state_for_path(&path);
+        let shared_mvcc_state = shared_mvcc_state_for_path(&path, Arc::clone(env.runtime()))?;
         let initial_visible_commit_seq = CommitSeq::new(
             shared_mvcc_state
                 .next_commit_seq
                 .load(AtomicOrdering::Acquire)
                 .saturating_sub(1),
         );
-        let root_cx = Cx::new().with_trace_context(next_trace_id(), 0, 0);
+        let (runtime_region, root_cx) = shared_mvcc_state.register_connection()?;
         let eprocess_oracle = Arc::new(EProcessOracle::new(
             EPROCESS_DEFAULT_CONFIG,
             EPROCESS_PRIORITY_THRESHOLD,
@@ -1559,6 +1680,7 @@ impl Connection {
             // MVCC concurrent-writer state (bd-14zc / 5E.1, bd-kivg / 5E.2)
             concurrent_registry: Arc::clone(&shared_mvcc_state.registry),
             _shared_mvcc_state: Arc::clone(&shared_mvcc_state),
+            runtime_region,
             concurrent_session_id: RefCell::new(None),
             concurrent_lock_table: Arc::clone(&shared_mvcc_state.lock_table),
             concurrent_commit_index: Arc::clone(&shared_mvcc_state.commit_index),
@@ -1606,6 +1728,11 @@ impl Connection {
     /// Returns the configured database path.
     pub fn path(&self) -> &str {
         &self.path
+    }
+
+    /// Return the background-runtime health for this connection's database.
+    pub fn background_status(&self) -> Result<()> {
+        self._shared_mvcc_state.background_status()
     }
 
     fn sync_change_tracking_context(&self) {
@@ -1985,6 +2112,15 @@ impl Connection {
             }
         }
 
+        if best_effort {
+            let _ = self
+                ._shared_mvcc_state
+                .release_connection(self.runtime_region, true);
+        } else {
+            self._shared_mvcc_state
+                .release_connection(self.runtime_region, false)?;
+        }
+
         *self.closed.get_mut() = true;
         emit_compat_trace_event(trace_registration.as_ref(), TraceEvent::Close);
         Ok(())
@@ -2088,6 +2224,7 @@ impl Connection {
 
     /// Prepare SQL into a statement.
     pub fn prepare(&self, sql: &str) -> Result<PreparedStatement<'_>> {
+        self.background_status()?;
         let statement = {
             let parse_span = tracing::span!(
                 target: "fsqlite.parse",
@@ -2139,6 +2276,7 @@ impl Connection {
     /// **last** statement are returned. Intermediate statement results are
     /// discarded. This matches common SQL driver semantics (last statement wins).
     pub fn query(&self, sql: &str) -> Result<Vec<Row>> {
+        self.background_status()?;
         let statements = {
             let parse_span = tracing::span!(
                 target: "fsqlite.parse",
@@ -2160,6 +2298,7 @@ impl Connection {
 
     /// Prepare and execute SQL as a query with bound SQL parameters.
     pub fn query_with_params(&self, sql: &str, params: &[SqliteValue]) -> Result<Vec<Row>> {
+        self.background_status()?;
         let statement = {
             let parse_span = tracing::span!(
                 target: "fsqlite.parse",
@@ -2191,6 +2330,7 @@ impl Connection {
     /// rows.  For SELECT and other statement types it returns the number of
     /// result rows.
     pub fn execute(&self, sql: &str) -> Result<usize> {
+        self.background_status()?;
         let statements = {
             let parse_span = tracing::span!(
                 target: "fsqlite.parse",
@@ -2221,6 +2361,7 @@ impl Connection {
 
     /// Prepare and execute SQL with bound SQL parameters.
     pub fn execute_with_params(&self, sql: &str, params: &[SqliteValue]) -> Result<usize> {
+        self.background_status()?;
         let statement = {
             let parse_span = tracing::span!(
                 target: "fsqlite.parse",
@@ -2256,6 +2397,7 @@ impl Connection {
         stmt: &PreparedStatement<'_>,
         params: &[SqliteValue],
     ) -> Result<usize> {
+        self.background_status()?;
         if !std::ptr::eq(self, stmt.conn) {
             return Err(FrankenError::internal(
                 "prepared statement belongs to a different connection",
@@ -3453,9 +3595,9 @@ impl Connection {
     /// Pre-process statement-level subquery expressions before compilation.
     ///
     /// EXISTS and scalar subqueries are eagerly evaluated everywhere.
-    /// `IN (SELECT ...)` / `IN table` are left intact for statements that
-    /// go through VDBE codegen (UPDATE, DELETE, simple SELECT) so the
-    /// runtime probe mechanism handles them.  Fallback paths (GROUP BY,
+    /// Simple `IN (SELECT ...)` are left intact for VDBE probe, but IN
+    /// subqueries with GROUP BY/HAVING/windows/compounds/WITH are eagerly
+    /// evaluated since VDBE codegen emits NULL for those.  Fallback paths (GROUP BY,
     /// JOIN, expression-only SELECT) apply the IN rewrite separately.
     fn rewrite_subquery_statement(
         &self,
@@ -3492,7 +3634,8 @@ impl Connection {
             }
             Statement::Update(ref update) if update.with.is_some() => Ok(statement),
             Statement::Update(mut update) => {
-                // Only rewrite EXISTS / scalar subqueries; leave IN for VDBE probe.
+                // Rewrite EXISTS / scalar subqueries, plus IN subqueries that
+                // VDBE can't probe (GROUP BY, HAVING, windows, compounds, WITH).
                 for assignment in &mut update.assignments {
                     rewrite_in_expr(&mut assignment.value, self, false, params)?;
                 }
@@ -3503,7 +3646,8 @@ impl Connection {
             }
             Statement::Delete(ref delete) if delete.with.is_some() => Ok(statement),
             Statement::Delete(mut delete) => {
-                // Only rewrite EXISTS / scalar subqueries; leave IN for VDBE probe.
+                // Rewrite EXISTS / scalar subqueries, plus IN subqueries that
+                // VDBE can't probe (GROUP BY, HAVING, windows, compounds, WITH).
                 if let Some(where_expr) = delete.where_clause.as_mut() {
                     rewrite_in_expr(where_expr, self, false, params)?;
                 }
@@ -4825,12 +4969,29 @@ impl Connection {
             .map(|name| (table_label.clone(), name))
             .collect::<Vec<_>>();
 
+        // Bind placeholders in assignment values so eval_join_expr can
+        // evaluate them.  Without this, numbered placeholders (`?1`, `?2`, ...)
+        // would reach the catch-all arm and fail with "unsupported expression
+        // type: Placeholder".  This is particularly triggered when
+        // PRAGMA foreign_keys=ON causes collect_update_trigger_rows to be
+        // called for FK constraint checking.
+        let bound_assignments = if let Some(p) = params {
+            let mut cloned = update.assignments.clone();
+            let mut bind_state = BindParamState::default();
+            for a in &mut cloned {
+                bind_placeholders_in_expr(&mut a.value, &mut bind_state, p)?;
+            }
+            cloned
+        } else {
+            update.assignments.clone()
+        };
+
         let mut trigger_rows = Vec::with_capacity(matched_rows.len());
         for row in matched_rows {
             let old_values = row.values().to_vec();
             let mut new_values = old_values.clone();
 
-            for assignment in &update.assignments {
+            for assignment in &bound_assignments {
                 match &assignment.target {
                     fsqlite_ast::AssignmentTarget::Column(column_name) => {
                         let target_index =
@@ -15792,6 +15953,14 @@ impl Connection {
 
 impl Drop for Connection {
     fn drop(&mut self) {
+        if !*self.closed.get_mut() {
+            tracing::warn!(
+                target: "fsqlite::runtime",
+                event = "drop_close",
+                db_path = %self.path,
+                msg = "Connection dropped without explicit close()"
+            );
+        }
         let _ = self.close_internal(true);
     }
 }
@@ -17087,6 +17256,25 @@ fn select_core_contains_rewritable_subquery(core: &SelectCore) -> bool {
     }
 }
 
+/// Check if an IN subquery uses features that VDBE codegen cannot handle
+/// in IN-probe expressions (GROUP BY, HAVING, windows, compounds, WITH).
+/// These need eager evaluation or VDBE will emit NULL.
+fn in_subquery_needs_eager_eval(sub: &SelectStatement) -> bool {
+    // VDBE rejects compounds and WITH in resolve_in_probe_source
+    if sub.with.is_some() || !sub.body.compounds.is_empty() {
+        return true;
+    }
+    // VDBE rejects GROUP BY / HAVING / windows in both probe paths
+    matches!(
+        &sub.body.select,
+        SelectCore::Select {
+            group_by, having, windows, ..
+        } if !group_by.is_empty()
+            || having.is_some()
+            || !windows.is_empty()
+    )
+}
+
 /// Recursively detect expression forms that the non-IN rewrite pass mutates.
 fn expr_contains_rewritable_subquery(expr: &Expr) -> bool {
     match expr {
@@ -17108,7 +17296,11 @@ fn expr_contains_rewritable_subquery(expr: &Expr) -> bool {
             expr_contains_rewritable_subquery(expr)
                 || match set {
                     InSet::List(exprs) => exprs.iter().any(expr_contains_rewritable_subquery),
-                    InSet::Subquery(_) | InSet::Table(_) => false,
+                    // IN subqueries with GROUP BY / HAVING / windows / compounds
+                    // / WITH need eager evaluation because VDBE codegen emits
+                    // NULL for those.
+                    InSet::Subquery(sub) => in_subquery_needs_eager_eval(sub),
+                    InSet::Table(_) => false,
                 }
         }
         Expr::Case {
@@ -17149,24 +17341,190 @@ fn expr_contains_rewritable_subquery(expr: &Expr) -> bool {
     }
 }
 
-#[derive(Debug)]
+struct SharedRuntimeState {
+    path_key: String,
+    regions: RegionTree,
+    db_root_region: Region,
+    open_connections: usize,
+    poisoned: Option<String>,
+}
+
 struct SharedMvccState {
     registry: Arc<Mutex<ConcurrentRegistry>>,
     lock_table: Arc<InProcessPageLockTable>,
     commit_index: Arc<CommitIndex>,
     next_commit_seq: Arc<AtomicU64>,
     commit_write_mutex: Arc<Mutex<()>>,
+    _runtime: Arc<RuntimeContext>,
+    runtime_state: Mutex<SharedRuntimeState>,
 }
 
 impl SharedMvccState {
-    fn new() -> Self {
-        Self {
+    fn new(path_key: &str, runtime: Arc<RuntimeContext>) -> Result<Self> {
+        let mut regions = RegionTree::new();
+        let db_root_cx = runtime
+            .root_cx
+            .create_child()
+            .with_trace_context(next_trace_id(), 0, 0);
+        let db_root_region = regions.create_root(RegionKind::DbRoot, db_root_cx)?;
+
+        tracing::info!(
+            target: "fsqlite::runtime",
+            event = "region_created",
+            db_path = %path_key,
+            region_id = db_root_region.get(),
+            region_kind = "db_root"
+        );
+
+        Ok(Self {
             registry: Arc::new(Mutex::new(ConcurrentRegistry::new())),
             lock_table: Arc::new(InProcessPageLockTable::new()),
             commit_index: Arc::new(CommitIndex::new()),
             next_commit_seq: Arc::new(AtomicU64::new(1)),
             commit_write_mutex: Arc::new(Mutex::new(())),
+            _runtime: runtime,
+            runtime_state: Mutex::new(SharedRuntimeState {
+                path_key: path_key.to_owned(),
+                regions,
+                db_root_region,
+                open_connections: 0,
+                poisoned: None,
+            }),
+        })
+    }
+
+    fn background_status(&self) -> Result<()> {
+        let state = lock_unpoisoned(&self.runtime_state);
+        match &state.poisoned {
+            Some(details) => Err(FrankenError::BackgroundWorkerFailed(details.clone())),
+            None => Ok(()),
         }
+    }
+
+    fn register_connection(&self) -> Result<(Region, Cx)> {
+        let mut state = lock_unpoisoned(&self.runtime_state);
+        if let Some(details) = &state.poisoned {
+            return Err(FrankenError::BackgroundWorkerFailed(details.clone()));
+        }
+
+        let db_root_cx = state
+            .regions
+            .cx(state.db_root_region)
+            .ok_or_else(|| FrankenError::internal("database root region missing Cx"))?;
+        let db_root_region = state.db_root_region;
+        let connection_cx = db_root_cx
+            .create_child()
+            .with_trace_context(next_trace_id(), 0, 0);
+        let connection_region = state.regions.create_child(
+            db_root_region,
+            RegionKind::PerConnection,
+            connection_cx.clone(),
+        )?;
+        state.open_connections = state.open_connections.saturating_add(1);
+
+        tracing::info!(
+            target: "fsqlite::runtime",
+            event = "region_created",
+            db_path = %state.path_key,
+            region_id = connection_region.get(),
+            region_kind = "per_connection"
+        );
+
+        Ok((connection_region, connection_cx))
+    }
+
+    fn release_connection(&self, connection_region: Region, best_effort: bool) -> Result<()> {
+        let mut state = lock_unpoisoned(&self.runtime_state);
+
+        let connection_close_started = Instant::now();
+        tracing::info!(
+            target: "fsqlite::runtime",
+            event = "region_closing",
+            db_path = %state.path_key,
+            region_id = connection_region.get(),
+            active_tasks = state.regions.active_tasks(connection_region)
+        );
+        if let Err(err) = state.regions.close_and_drain(connection_region) {
+            tracing::warn!(
+                target: "fsqlite::runtime",
+                event = "region_close_failed",
+                db_path = %state.path_key,
+                region_id = connection_region.get(),
+                error = %err
+            );
+            if !best_effort {
+                return Err(err);
+            }
+        }
+        state.open_connections = state.open_connections.saturating_sub(1);
+        tracing::info!(
+            target: "fsqlite::runtime",
+            event = "region_closed",
+            db_path = %state.path_key,
+            region_id = connection_region.get(),
+            elapsed_ms = u64::try_from(connection_close_started.elapsed().as_millis())
+                .unwrap_or(u64::MAX)
+        );
+
+        if state.open_connections == 0 {
+            let db_root_region = state.db_root_region;
+            let root_close_started = Instant::now();
+            tracing::info!(
+                target: "fsqlite::runtime",
+                event = "region_closing",
+                db_path = %state.path_key,
+                region_id = db_root_region.get(),
+                active_tasks = state.regions.active_tasks(db_root_region)
+            );
+            if let Err(err) = state.regions.close_and_drain(db_root_region) {
+                tracing::warn!(
+                    target: "fsqlite::runtime",
+                    event = "region_close_failed",
+                    db_path = %state.path_key,
+                    region_id = db_root_region.get(),
+                    error = %err
+                );
+                if !best_effort {
+                    return Err(err);
+                }
+            }
+            tracing::info!(
+                target: "fsqlite::runtime",
+                event = "region_closed",
+                db_path = %state.path_key,
+                region_id = db_root_region.get(),
+                elapsed_ms = u64::try_from(root_close_started.elapsed().as_millis())
+                    .unwrap_or(u64::MAX)
+            );
+
+            if state.path_key != ":memory:" {
+                if let Some(state_map) = SHARED_MVCC_STATE_BY_PATH.get() {
+                    lock_unpoisoned(state_map).remove(&state.path_key);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn poison(&self, details: impl Into<String>) {
+        let details = details.into();
+        let mut state = lock_unpoisoned(&self.runtime_state);
+        if state.poisoned.is_some() {
+            return;
+        }
+
+        state.poisoned = Some(details.clone());
+        if let Some(db_root_cx) = state.regions.cx(state.db_root_region) {
+            db_root_cx.cancel_with_reason(CancelReason::Abort);
+        }
+        tracing::error!(
+            target: "fsqlite::runtime",
+            event = "poisoned",
+            db_path = %state.path_key,
+            cause = %details
+        );
     }
 }
 
@@ -17189,9 +17547,12 @@ fn mvcc_state_key(path: &str) -> String {
         .into_owned()
 }
 
-fn shared_mvcc_state_for_path(path: &str) -> Arc<SharedMvccState> {
+fn shared_mvcc_state_for_path(
+    path: &str,
+    runtime: Arc<RuntimeContext>,
+) -> Result<Arc<SharedMvccState>> {
     if path == ":memory:" {
-        return Arc::new(SharedMvccState::new());
+        return Ok(Arc::new(SharedMvccState::new(path, runtime)?));
     }
 
     let key = mvcc_state_key(path);
@@ -17199,12 +17560,12 @@ fn shared_mvcc_state_for_path(path: &str) -> Arc<SharedMvccState> {
     let mut map = lock_unpoisoned(state_map);
 
     if let Some(existing) = map.get(&key).and_then(Weak::upgrade) {
-        return existing;
+        return Ok(existing);
     }
 
-    let state = Arc::new(SharedMvccState::new());
+    let state = Arc::new(SharedMvccState::new(&key, runtime)?);
     map.insert(key, Arc::downgrade(&state));
-    state
+    Ok(state)
 }
 
 /// Recursively walk an expression tree and eagerly evaluate subquery
@@ -17748,10 +18109,11 @@ fn substitute_outer_refs_in_select(
 }
 
 ///
-/// When `rewrite_in_subqueries` is true, also eagerly evaluate
-/// `IN (SELECT ...)` and `IN table` into literal lists.  When false,
-/// leave those forms intact so the VDBE codegen can handle them via
-/// runtime probe scans.
+/// When `rewrite_in_subqueries` is true, eagerly evaluate ALL
+/// `IN (SELECT ...)` into literal lists.  When false, only eagerly
+/// evaluate IN subqueries that VDBE codegen cannot handle (those with
+/// GROUP BY, HAVING, windows, compounds, or WITH clauses) — simple
+/// ones are left intact for VDBE runtime probe scans.
 #[allow(clippy::too_many_lines)]
 fn rewrite_in_expr(
     expr: &mut Expr,
@@ -17764,8 +18126,13 @@ fn rewrite_in_expr(
             set, expr: inner, ..
         } => {
             rewrite_in_expr(inner, conn, rewrite_in_subqueries, params)?;
-            if rewrite_in_subqueries {
-                if let InSet::Subquery(sub) = set {
+            if let InSet::Subquery(sub) = set {
+                // Eagerly evaluate the subquery when requested, OR when the
+                // subquery uses GROUP BY / HAVING / windows / compounds / WITH
+                // which VDBE codegen cannot handle in IN-probe expressions
+                // (it would emit NULL).
+                let needs_eager = rewrite_in_subqueries || in_subquery_needs_eager_eval(sub);
+                if needs_eager {
                     let rows = conn.execute_statement(Statement::Select(*sub.clone()), params)?;
                     let literals: Vec<Expr> = rows
                         .into_iter()
@@ -24312,8 +24679,9 @@ fn project_join_column(
 #[cfg(test)]
 mod tests {
     use super::{
-        CommitSeq, Connection, InProcessPageLockTable, PagerBackend, Row, SchemaEpoch, SimplePager,
-        Snapshot, is_sqlite_master_entry_missing, lock_unpoisoned,
+        CommitSeq, Connection, ConnectionEnv, InProcessPageLockTable, IoPollStrategy, PagerBackend,
+        Row, RuntimeConfig, RuntimeContext, SchemaEpoch, SimplePager, Snapshot,
+        init_global_runtime, is_sqlite_master_entry_missing, lock_unpoisoned,
         statement_contains_rewritable_subquery, wal_file_present_with_vfs, wal_path_for_db_path,
     };
     use fsqlite_ast::Statement;
@@ -24336,6 +24704,93 @@ mod tests {
         pub(crate) fn open_in_memory() -> std::result::Result<Self, FrankenError> {
             Self::open(":memory:")
         }
+    }
+
+    #[test]
+    fn test_runtime_context_global_singleton() {
+        let runtime = init_global_runtime(RuntimeConfig {
+            worker_threads: 2,
+            io_poll_strategy: IoPollStrategy::Blocking,
+        });
+        let env = ConnectionEnv::default();
+
+        assert!(Arc::ptr_eq(env.runtime(), &runtime));
+        assert_eq!(env.runtime().config().worker_threads, 2);
+        assert_eq!(
+            env.runtime().config().io_poll_strategy,
+            IoPollStrategy::Blocking
+        );
+    }
+
+    #[test]
+    fn test_open_with_env_uses_supplied_runtime() {
+        let runtime = Arc::new(RuntimeContext::new(RuntimeConfig {
+            worker_threads: 1,
+            io_poll_strategy: IoPollStrategy::Auto,
+        }));
+        let conn = Connection::open_with_env(":memory:", ConnectionEnv::new(Arc::clone(&runtime)))
+            .expect("connection should open");
+
+        assert!(Arc::ptr_eq(&conn._shared_mvcc_state._runtime, &runtime));
+    }
+
+    #[test]
+    fn test_multiple_connections_same_database_share_runtime_region() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("shared-runtime.db");
+        let db_path = db_path.to_string_lossy().into_owned();
+
+        let conn1 = Connection::open(&db_path).unwrap();
+        let conn2 = Connection::open(&db_path).unwrap();
+
+        assert!(Arc::ptr_eq(
+            &conn1._shared_mvcc_state,
+            &conn2._shared_mvcc_state
+        ));
+        assert_ne!(conn1.runtime_region, conn2.runtime_region);
+
+        let root_region = {
+            let state = lock_unpoisoned(&conn1._shared_mvcc_state.runtime_state);
+            assert_eq!(state.open_connections, 2);
+            state.db_root_region
+        };
+
+        drop(conn1);
+
+        let state = lock_unpoisoned(&conn2._shared_mvcc_state.runtime_state);
+        assert_eq!(state.open_connections, 1);
+        assert_eq!(state.db_root_region, root_region);
+    }
+
+    #[test]
+    fn test_poisoning_cascades_to_all_connections_and_prepared_statements() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("poisoned-runtime.db");
+        let db_path = db_path.to_string_lossy().into_owned();
+
+        let conn1 = Connection::open(&db_path).unwrap();
+        let conn2 = Connection::open(&db_path).unwrap();
+        let stmt = conn2.prepare("SELECT 1;").unwrap();
+
+        conn1
+            ._shared_mvcc_state
+            .poison("simulated background worker failure");
+
+        assert!(matches!(
+            conn1.background_status(),
+            Err(FrankenError::BackgroundWorkerFailed(ref msg))
+                if msg.contains("simulated background worker failure")
+        ));
+        assert!(matches!(
+            stmt.query(),
+            Err(FrankenError::BackgroundWorkerFailed(ref msg))
+                if msg.contains("simulated background worker failure")
+        ));
+        assert!(matches!(
+            Connection::open(&db_path),
+            Err(FrankenError::BackgroundWorkerFailed(ref msg))
+                if msg.contains("simulated background worker failure")
+        ));
     }
 
     fn row_values(row: &Row) -> Vec<SqliteValue> {

@@ -200,23 +200,24 @@ impl PerCoreWalBuffer {
         }
     }
 
-    fn force_serialized_drain(&mut self) -> usize {
-        let drained = self
-            .active
-            .records
-            .len()
-            .saturating_add(self.flush_lane.records.len())
-            .saturating_add(self.overflow.len());
+    fn force_serialized_drain(&mut self) -> Vec<WalRecord> {
+        let mut drained = Vec::with_capacity(
+            self.active
+                .records
+                .len()
+                .saturating_add(self.flush_lane.records.len())
+                .saturating_add(self.overflow.len()),
+        );
+        drained.append(&mut self.active.records);
+        drained.append(&mut self.flush_lane.records);
+        drained.extend(self.overflow.drain(..));
 
-        self.active.records.clear();
         self.active.bytes_used = 0;
         self.active.state = BufferState::Writable;
 
-        self.flush_lane.records.clear();
         self.flush_lane.bytes_used = 0;
         self.flush_lane.state = BufferState::Writable;
 
-        self.overflow.clear();
         self.overflow_bytes = 0;
         self.fallback_latched = false;
         drained
@@ -815,7 +816,7 @@ fn bd_ncivz_1_overflow_allocate_triggers_deterministic_fallback() {
     assert_eq!(buffer.overflow_len(), 2);
 
     let drained = buffer.force_serialized_drain();
-    assert_eq!(drained, 3);
+    assert_eq!(drained.len(), 3);
     assert_eq!(buffer.active_len(), 0);
     assert_eq!(buffer.flush_len(), 0);
     assert_eq!(buffer.overflow_len(), 0);

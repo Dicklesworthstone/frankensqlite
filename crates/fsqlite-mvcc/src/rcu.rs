@@ -46,8 +46,8 @@
 //!   - `fsqlite_rcu_grace_period_duration_ns_max`
 //!   - `fsqlite_rcu_reclaimed_total`
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use fsqlite_types::sync_primitives::Instant;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use fsqlite_types::sync_primitives::Mutex;
 use serde::Serialize;

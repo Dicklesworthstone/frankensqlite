@@ -36,8 +36,7 @@ mod tests {
 
     #[test]
     fn parse_create_table() {
-        let (stmts, errors) =
-            parse_sql("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)");
+        let (stmts, errors) = parse_sql("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)");
         assert!(errors.is_empty(), "unexpected errors: {errors:?}");
         assert_eq!(stmts.len(), 1);
     }

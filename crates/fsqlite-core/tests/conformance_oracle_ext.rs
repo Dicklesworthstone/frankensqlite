@@ -5762,9 +5762,8 @@ fn test_conformance_insert_default_conflict() {
     let fconn = Connection::open(":memory:").unwrap();
     let rconn = rusqlite::Connection::open(":memory:").unwrap();
 
-    for setup in &[
-        "CREATE TABLE dfl(id INTEGER PRIMARY KEY, name TEXT NOT NULL DEFAULT 'unknown', score INTEGER DEFAULT 0, created TEXT DEFAULT 'now')",
-    ] {
+    {
+        let setup = "CREATE TABLE dfl(id INTEGER PRIMARY KEY, name TEXT NOT NULL DEFAULT 'unknown', score INTEGER DEFAULT 0, created TEXT DEFAULT 'now')";
         fconn.execute(setup).unwrap();
         rconn.execute_batch(setup).unwrap();
     }
@@ -12635,9 +12634,8 @@ fn test_conformance_update_delete_subquery_edges_s54() {
         rconn.execute_batch(s).unwrap();
     }
 
-    for s in &[
-        "UPDATE ud_items SET price = (SELECT AVG(price) FROM ud_items WHERE category = ud_items.category) WHERE id = 1",
-    ] {
+    {
+        let s = "UPDATE ud_items SET price = (SELECT AVG(price) FROM ud_items WHERE category = ud_items.category) WHERE id = 1";
         fconn.execute(s).unwrap();
         rconn.execute_batch(s).unwrap();
     }
@@ -12942,9 +12940,8 @@ fn test_conformance_multi_table_update_delete_s66() {
     }
 
     // Apply discount update
-    for s in &[
-        "UPDATE mtud_products SET price = ROUND(price * (1 - (SELECT discount FROM mtud_categories WHERE id = mtud_products.category_id)), 2)",
-    ] {
+    {
+        let s = "UPDATE mtud_products SET price = ROUND(price * (1 - (SELECT discount FROM mtud_categories WHERE id = mtud_products.category_id)), 2)";
         fconn.execute(s).unwrap();
         rconn.execute_batch(s).unwrap();
     }
@@ -14437,9 +14434,8 @@ fn test_conformance_delete_patterns_s97() {
     }
 
     // DELETE with complex WHERE
-    for s in &[
-        "DELETE FROM dp WHERE category = 'A' AND val = (SELECT MAX(val) FROM dp WHERE category = 'A')",
-    ] {
+    {
+        let s = "DELETE FROM dp WHERE category = 'A' AND val = (SELECT MAX(val) FROM dp WHERE category = 'A')";
         fconn.execute(s).unwrap();
         rconn.execute_batch(s).unwrap();
     }
@@ -15007,9 +15003,8 @@ fn test_conformance_complex_update_set_s113() {
     }
 
     // UPDATE with CASE in SET
-    for s in &[
-        "UPDATE cus SET grade = CASE WHEN score >= 90 THEN 'A' WHEN score >= 80 THEN 'B' WHEN score >= 70 THEN 'C' ELSE 'F' END",
-    ] {
+    {
+        let s = "UPDATE cus SET grade = CASE WHEN score >= 90 THEN 'A' WHEN score >= 80 THEN 'B' WHEN score >= 70 THEN 'C' ELSE 'F' END";
         fconn.execute(s).unwrap();
         rconn.execute_batch(s).unwrap();
     }
@@ -15394,9 +15389,8 @@ fn test_conformance_probe_insert_variants() {
     let fconn = Connection::open(":memory:").unwrap();
     let rconn = rusqlite::Connection::open_in_memory().unwrap();
 
-    for s in &[
-        "CREATE TABLE iv_t(id INTEGER PRIMARY KEY, name TEXT DEFAULT 'unnamed', val INTEGER DEFAULT 0)",
-    ] {
+    {
+        let s = "CREATE TABLE iv_t(id INTEGER PRIMARY KEY, name TEXT DEFAULT 'unnamed', val INTEGER DEFAULT 0)";
         fconn.execute(s).unwrap();
         rconn.execute_batch(s).unwrap();
     }
@@ -16517,9 +16511,8 @@ fn test_conformance_cte_insert_s142() {
     }
 
     // INSERT with CTE
-    for s in &[
-        "WITH selected AS (SELECT id, val FROM ci_src WHERE id <= 2) INSERT INTO ci_dst SELECT * FROM selected",
-    ] {
+    {
+        let s = "WITH selected AS (SELECT id, val FROM ci_src WHERE id <= 2) INSERT INTO ci_dst SELECT * FROM selected";
         fconn.execute(s).unwrap();
         rconn.execute_batch(s).unwrap();
     }
@@ -16624,7 +16617,8 @@ fn test_conformance_update_where_complex_s145() {
 
     // Complex WHERE with AND/OR
     {
-        let s = &"UPDATE uwc SET score = score + 5 WHERE category = 'A' AND active = 1 AND score < 90";
+        let s =
+            &"UPDATE uwc SET score = score + 5 WHERE category = 'A' AND active = 1 AND score < 90";
 
         fconn.execute(s).unwrap();
         rconn.execute_batch(s).unwrap();
@@ -17311,9 +17305,8 @@ fn test_conformance_cte_with_update_delete_s150() {
     }
 
     // UPDATE with CTE
-    for s in &[
-        "WITH high AS (SELECT id FROM cwud WHERE val > 25) UPDATE cwud SET tag = 'high' WHERE id IN (SELECT id FROM high)",
-    ] {
+    {
+        let s = "WITH high AS (SELECT id FROM cwud WHERE val > 25) UPDATE cwud SET tag = 'high' WHERE id IN (SELECT id FROM high)";
         fconn.execute(s).unwrap();
         rconn.execute_batch(s).unwrap();
     }
@@ -17328,9 +17321,8 @@ fn test_conformance_cte_with_update_delete_s150() {
     }
 
     // DELETE with CTE
-    for s in &[
-        "WITH low AS (SELECT id FROM cwud WHERE val < 20) DELETE FROM cwud WHERE id IN (SELECT id FROM low)",
-    ] {
+    {
+        let s = "WITH low AS (SELECT id FROM cwud WHERE val < 20) DELETE FROM cwud WHERE id IN (SELECT id FROM low)";
         fconn.execute(s).unwrap();
         rconn.execute_batch(s).unwrap();
     }
@@ -17653,9 +17645,8 @@ fn test_conformance_insert_default_values_s160() {
     let fconn = Connection::open(":memory:").unwrap();
     let rconn = rusqlite::Connection::open_in_memory().unwrap();
 
-    for s in &[
-        "CREATE TABLE dv(id INTEGER PRIMARY KEY, name TEXT DEFAULT 'unknown', val INTEGER DEFAULT 42, ts TEXT DEFAULT 'now')",
-    ] {
+    {
+        let s = "CREATE TABLE dv(id INTEGER PRIMARY KEY, name TEXT DEFAULT 'unknown', val INTEGER DEFAULT 42, ts TEXT DEFAULT 'now')";
         fconn.execute(s).unwrap();
         rconn.execute_batch(s).unwrap();
     }
@@ -20994,7 +20985,6 @@ fn test_conformance_order_by_null_handling_s237() {
 }
 
 #[test]
-#[ignore = "INSERT OR IGNORE with UNIQUE constraint on non-PK column errors: pending_insert_rollback not set"]
 fn test_conformance_insert_or_ignore_s238() {
     let fconn = Connection::open(":memory:").unwrap();
     let rconn = rusqlite::Connection::open_in_memory().unwrap();
@@ -21167,7 +21157,6 @@ fn test_conformance_window_sum_over_partition_s242() {
 }
 
 #[test]
-#[ignore = "CHECK constraints parsed but not enforced yet"]
 fn test_conformance_check_constraint_enforcement_s243() {
     let fconn = Connection::open(":memory:").unwrap();
     let rconn = rusqlite::Connection::open_in_memory().unwrap();
@@ -25759,9 +25748,8 @@ fn test_conformance_correlated_update_between_s413() {
         fconn.execute(s).unwrap();
         rconn.execute_batch(s).unwrap();
     }
-    for s in &[
-        "UPDATE students SET grade = (SELECT g.grade FROM grade_ranges g WHERE students.score BETWEEN g.min_score AND g.max_score)",
-    ] {
+    {
+        let s = "UPDATE students SET grade = (SELECT g.grade FROM grade_ranges g WHERE students.score BETWEEN g.min_score AND g.max_score)";
         fconn.execute(s).unwrap();
         rconn.execute_batch(s).unwrap();
     }
@@ -25793,9 +25781,8 @@ fn test_conformance_correlated_subquery_like_s414() {
         rconn.execute_batch(s).unwrap();
     }
     // Now test UPDATE with LIKE
-    for s in &[
-        "UPDATE products SET category = (SELECT c.label FROM categories c WHERE products.name LIKE c.pattern LIMIT 1)",
-    ] {
+    {
+        let s = "UPDATE products SET category = (SELECT c.label FROM categories c WHERE products.name LIKE c.pattern LIMIT 1)";
         fconn.execute(s).unwrap();
         rconn.execute_batch(s).unwrap();
     }
@@ -25848,9 +25835,8 @@ fn test_conformance_update_with_case_s416() {
         fconn.execute(s).unwrap();
         rconn.execute_batch(s).unwrap();
     }
-    for s in &[
-        "UPDATE accounts SET tier = CASE WHEN balance >= 1000.0 THEN 'gold' WHEN balance >= 200.0 THEN 'silver' ELSE 'bronze' END",
-    ] {
+    {
+        let s = "UPDATE accounts SET tier = CASE WHEN balance >= 1000.0 THEN 'gold' WHEN balance >= 200.0 THEN 'silver' ELSE 'bronze' END";
         fconn.execute(s).unwrap();
         rconn.execute_batch(s).unwrap();
     }
@@ -26385,9 +26371,8 @@ fn test_conformance_correlated_update_and_s435() {
         fconn.execute(s).unwrap();
         rconn.execute_batch(s).unwrap();
     }
-    for s in &[
-        "UPDATE orders SET status = (SELECT t.level FROM thresholds t WHERE orders.amount >= t.min_amount AND orders.amount <= t.max_amount)",
-    ] {
+    {
+        let s = "UPDATE orders SET status = (SELECT t.level FROM thresholds t WHERE orders.amount >= t.min_amount AND orders.amount <= t.max_amount)";
         fconn.execute(s).unwrap();
         rconn.execute_batch(s).unwrap();
     }
@@ -26415,9 +26400,8 @@ fn test_conformance_correlated_update_in_list_s436() {
         fconn.execute(s).unwrap();
         rconn.execute_batch(s).unwrap();
     }
-    for s in &[
-        "UPDATE products SET discount = (SELECT p.promo FROM promos p WHERE p.category = products.category)",
-    ] {
+    {
+        let s = "UPDATE products SET discount = (SELECT p.promo FROM promos p WHERE p.category = products.category)";
         fconn.execute(s).unwrap();
         rconn.execute_batch(s).unwrap();
     }
@@ -27802,9 +27786,8 @@ fn test_conformance_correlated_between_update_s491() {
         fconn.execute(s).unwrap();
         rconn.execute_batch(s).unwrap();
     }
-    for s in &[
-        "UPDATE scores SET grade = (SELECT b.grade FROM bands b WHERE scores.val BETWEEN b.lo AND b.hi LIMIT 1)",
-    ] {
+    {
+        let s = "UPDATE scores SET grade = (SELECT b.grade FROM bands b WHERE scores.val BETWEEN b.lo AND b.hi LIMIT 1)";
         fconn.execute(s).unwrap();
         rconn.execute_batch(s).unwrap();
     }
@@ -28113,9 +28096,8 @@ fn test_conformance_delete_with_correlated_exists_s503() {
         fconn.execute(s).unwrap();
         rconn.execute_batch(s).unwrap();
     }
-    for s in &[
-        "DELETE FROM log_entries WHERE EXISTS (SELECT 1 FROM banned_users b WHERE b.user_id = log_entries.user_id)",
-    ] {
+    {
+        let s = "DELETE FROM log_entries WHERE EXISTS (SELECT 1 FROM banned_users b WHERE b.user_id = log_entries.user_id)";
         fconn.execute(s).unwrap();
         rconn.execute_batch(s).unwrap();
     }
@@ -28769,9 +28751,8 @@ fn test_conformance_correlated_update_with_case_and_like_s527() {
         fconn.execute(s).unwrap();
         rconn.execute_batch(s).unwrap();
     }
-    for s in &[
-        "UPDATE employees SET level = (SELECT dc.level_override FROM dept_config dc WHERE dc.dept = employees.dept AND employees.name LIKE dc.pattern LIMIT 1)",
-    ] {
+    {
+        let s = "UPDATE employees SET level = (SELECT dc.level_override FROM dept_config dc WHERE dc.dept = employees.dept AND employees.name LIKE dc.pattern LIMIT 1)";
         fconn.execute(s).unwrap();
         rconn.execute_batch(s).unwrap();
     }
@@ -28910,7 +28891,8 @@ fn test_conformance_insert_returning_s532() {
     let fconn = Connection::open(":memory:").unwrap();
     let rconn = rusqlite::Connection::open_in_memory().unwrap();
     {
-        let s = &"CREATE TABLE logs(id INTEGER PRIMARY KEY, msg TEXT, created_at TEXT DEFAULT 'now')";
+        let s =
+            &"CREATE TABLE logs(id INTEGER PRIMARY KEY, msg TEXT, created_at TEXT DEFAULT 'now')";
 
         fconn.execute(s).unwrap();
         rconn.execute_batch(s).unwrap();
@@ -29757,7 +29739,6 @@ fn test_conformance_probe_case_when_aggregate_s510() {
 }
 
 #[test]
-#[ignore = "INSERT OR IGNORE with UNIQUE on non-PK: pending_insert_rollback not set"]
 fn test_conformance_probe_insert_or_ignore_replace_s511() {
     let fconn = Connection::open(":memory:").unwrap();
     let rconn = rusqlite::Connection::open_in_memory().unwrap();
@@ -29880,7 +29861,8 @@ fn test_conformance_probe_multi_table_delete_s515() {
         rconn.execute_batch(s).unwrap();
     }
     {
-        let s = &"DELETE FROM orders WHERE customer_id IN (SELECT id FROM customers WHERE active = 0)";
+        let s =
+            &"DELETE FROM orders WHERE customer_id IN (SELECT id FROM customers WHERE active = 0)";
 
         fconn.execute(s).unwrap();
         rconn.execute_batch(s).unwrap();
@@ -30006,7 +29988,6 @@ fn test_conformance_probe_window_ntile_lag_lead_s519() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "reason"] // window functions with JOIN: column resolution not wired
 fn test_conformance_window_with_join_s521() {
     let fconn = Connection::open(":memory:").unwrap();
     let rconn = rusqlite::Connection::open_in_memory().unwrap();
