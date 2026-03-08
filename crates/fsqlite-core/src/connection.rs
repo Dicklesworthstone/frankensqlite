@@ -40,6 +40,7 @@ use fsqlite_func::{
 use fsqlite_pager::traits::{MvccPager, TransactionHandle, TransactionMode};
 use fsqlite_pager::{CheckpointMode, JournalMode, PageCacheMetricsSnapshot, SimplePager};
 use fsqlite_parser::Parser;
+use fsqlite_parser::lexer::Lexer;
 use fsqlite_types::DATABASE_HEADER_SIZE;
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::{AccessFlags, VfsOpenFlags};
@@ -10948,6 +10949,7 @@ impl Connection {
                     .find(|t| t.name.eq_ignore_ascii_case(&table_name));
                 match table {
                     Some(t) => {
+                        let pk_positions = self.compute_pk_positions(t);
                         let rows = t
                             .columns
                             .iter()
@@ -10966,7 +10968,7 @@ impl Connection {
                                     .default_value
                                     .as_ref()
                                     .map_or(SqliteValue::Null, |s| SqliteValue::Text(s.clone()));
-                                let pk = i64::from(col.is_ipk);
+                                let pk = pk_positions.get(i).copied().unwrap_or(0);
                                 Row {
                                     values: vec![
                                         SqliteValue::Integer(i64::try_from(i).unwrap_or(0)),
@@ -11250,6 +11252,76 @@ impl Connection {
             // Unrecognised pragmas are silently ignored (SQLite compatibility).
             _ => Ok(Vec::new()),
         }
+    }
+
+    /// Compute the `pk` column for PRAGMA table_info.
+    ///
+    /// Returns a `Vec<i64>` parallel to `table.columns` where each element is:
+    /// - 0 if the column is not part of the PRIMARY KEY
+    /// - 1 for a single-column PRIMARY KEY (IPK or column constraint)
+    /// - 1-indexed position for composite `PRIMARY KEY(x, y, ...)`
+    #[allow(clippy::unused_self)]
+    fn compute_pk_positions(&self, table: &TableSchema) -> Vec<i64> {
+        let n = table.columns.len();
+        let mut positions = vec![0i64; n];
+
+        // Case 1: IPK column (INTEGER PRIMARY KEY)
+        if let Some(idx) = table.columns.iter().position(|c| c.is_ipk) {
+            positions[idx] = 1;
+            return positions;
+        }
+
+        // Case 2: Parse original DDL to find PRIMARY KEY constraint
+        let ddl_map = self.original_ddl_sql.borrow();
+        let ddl = ddl_map.get(&table.name.to_ascii_lowercase());
+        if let Some(sql) = ddl {
+            let tokens = Lexer::tokenize(sql);
+            let (stmts, _errors) = Parser::new(tokens).parse_all();
+            for stmt in &stmts {
+                if let Statement::CreateTable(create) = stmt {
+                    if let CreateTableBody::Columns {
+                        constraints,
+                        columns,
+                        ..
+                    } = &create.body
+                    {
+                        // Table-level PRIMARY KEY constraint
+                        for tc in constraints {
+                            if let TableConstraintKind::PrimaryKey {
+                                columns: pk_cols, ..
+                            } = &tc.kind
+                            {
+                                for (pk_pos, pk_col) in pk_cols.iter().enumerate() {
+                                    if let Expr::Column(col_ref, _) = &pk_col.expr {
+                                        if let Some(col_idx) = table.columns.iter().position(|c| {
+                                            c.name.eq_ignore_ascii_case(&col_ref.column)
+                                        }) {
+                                            #[allow(clippy::cast_possible_wrap)]
+                                            {
+                                                positions[col_idx] = (pk_pos as i64) + 1;
+                                            }
+                                        }
+                                    }
+                                }
+                                return positions;
+                            }
+                        }
+                        // Column-level PRIMARY KEY (non-IPK, e.g. TEXT PRIMARY KEY)
+                        for (i, col) in columns.iter().enumerate() {
+                            let has_pk = col
+                                .constraints
+                                .iter()
+                                .any(|c| matches!(c.kind, ColumnConstraintKind::PrimaryKey { .. }));
+                            if has_pk && i < n {
+                                positions[i] = 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        positions
     }
 
     fn pragma_database_header(&self) -> Result<Option<DatabaseHeader>> {
@@ -16620,7 +16692,7 @@ fn render_create_table_sql(table: &TableSchema, is_autoincrement: bool) -> Strin
         let cols = index
             .columns
             .iter()
-            .map(|name| format!("\"{name}\""))
+            .map(|name| maybe_quote_ident(name))
             .collect::<Vec<_>>()
             .join(", ");
         defs.push(format!("UNIQUE ({cols})"));
@@ -25556,6 +25628,16 @@ mod tests {
             )
             .unwrap();
         assert_eq!(autoindex_count, 1);
+
+        // Ensure exactly 1 index total for table t (no duplicates).
+        let total_index_count: i64 = sqlite
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE tbl_name='t' AND type='index';",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(total_index_count, 1);
     }
 
     /// Verify that a composite PRIMARY KEY also produces a well-formed database.
