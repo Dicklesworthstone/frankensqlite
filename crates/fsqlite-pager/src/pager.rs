@@ -13,7 +13,7 @@ use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::{AccessFlags, SyncFlags, VfsOpenFlags};
 use fsqlite_types::{
     BTreePageHeader, CommitSeq, DATABASE_HEADER_SIZE, DatabaseHeader,
-    FRANKENSQLITE_SQLITE_VERSION_NUMBER, PageData, PageNumber, PageSize,
+    FRANKENSQLITE_SQLITE_VERSION_NUMBER, LockLevel, PageData, PageNumber, PageSize,
 };
 use fsqlite_vfs::{Vfs, VfsFile};
 
@@ -529,6 +529,10 @@ where
             return Err(FrankenError::Busy);
         }
 
+        // Acquire a SHARED lock on the database file for cross-process
+        // reader/writer exclusion (all transactions need at least SHARED).
+        inner.db_file.lock(cx, LockLevel::Shared)?;
+
         let wal_snapshot_initialized = if inner.active_transactions == 0 {
             if inner.rollback_journal_recovery_pending {
                 let journal_path = Self::journal_path(&self.db_path);
@@ -540,6 +544,7 @@ where
                     &journal_path,
                     page_size,
                 )? {
+                    inner.db_file.unlock(cx, LockLevel::None)?;
                     return Err(FrankenError::internal(
                         "rollback journal missing while local recovery was pending",
                     ));
@@ -559,9 +564,18 @@ where
             TransactionMode::Immediate | TransactionMode::Exclusive
         );
         if eager_writer && inner.writer_active {
+            inner.db_file.unlock(cx, LockLevel::None)?;
             return Err(FrankenError::Busy);
         }
+
+        // For write transactions, escalate to RESERVED to signal write intent
+        // to other processes. This is a non-blocking advisory lock that
+        // prevents multiple processes from writing simultaneously.
         if eager_writer {
+            if let Err(err) = inner.db_file.lock(cx, LockLevel::Reserved) {
+                inner.db_file.unlock(cx, LockLevel::None)?;
+                return Err(err);
+            }
             inner.writer_active = true;
         }
 
@@ -575,6 +589,9 @@ where
             if let Err(err) = wal_begin_result {
                 if eager_writer {
                     inner.writer_active = false;
+                    inner.db_file.unlock(cx, LockLevel::None)?;
+                } else {
+                    inner.db_file.unlock(cx, LockLevel::None)?;
                 }
                 return Err(err);
             }
@@ -612,7 +629,7 @@ where
             .unwrap_or_default()
     }
 
-    fn set_journal_mode(&self, _cx: &Cx, mode: JournalMode) -> Result<JournalMode> {
+    fn set_journal_mode(&self, cx: &Cx, mode: JournalMode) -> Result<JournalMode> {
         let mut inner = self
             .inner
             .lock()
@@ -628,6 +645,23 @@ where
 
         if mode == JournalMode::Wal && inner.wal_backend.is_none() {
             return Err(FrankenError::Unsupported);
+        }
+
+        // Update the file format version in the database header (bytes 18-19).
+        // WAL mode uses version 2; all rollback journal modes use version 1.
+        // Without this, standard SQLite tools cannot detect WAL mode from the
+        // on-disk header and will fail to look for the WAL file.
+        let version_byte: u8 = if mode == JournalMode::Wal { 2 } else { 1 };
+        if inner.db_size > 0 {
+            let page_size = inner.page_size.as_usize();
+            let mut page1 = vec![0u8; page_size];
+            let bytes_read = inner.db_file.read(cx, &mut page1, 0)?;
+            if bytes_read >= DATABASE_HEADER_SIZE {
+                page1[18] = version_byte;
+                page1[19] = version_byte;
+                inner.db_file.write(cx, &page1, 0)?;
+                inner.cache.evict(PageNumber::ONE);
+            }
         }
 
         inner.journal_mode = mode;
@@ -711,28 +745,28 @@ where
         Ok(true)
     }
 
-    /// Open (or create) a database and return a pager.
+    /// Open (or create) a database and return a pager using a caller-owned
+    /// capability context.
     ///
     /// If a hot journal is detected (leftover from a crash), it is replayed
     /// to restore the database to a consistent state before returning.
     #[allow(clippy::too_many_lines)]
-    pub fn open(vfs: V, path: &Path, page_size: PageSize) -> Result<Self> {
-        let cx = Cx::new();
+    pub fn open_with_cx(cx: &Cx, vfs: V, path: &Path, page_size: PageSize) -> Result<Self> {
         let vfs = Arc::new(vfs);
         let flags = VfsOpenFlags::CREATE | VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB;
-        let (mut db_file, _actual_flags) = vfs.open(&cx, Some(path), flags)?;
+        let (mut db_file, _actual_flags) = vfs.open(cx, Some(path), flags)?;
 
         let journal_path = Self::journal_path(path);
         // Hot journal recovery: if a journal file exists, replay it.
         let _ = Self::recover_rollback_journal_if_present(
-            &cx,
+            cx,
             &*vfs,
             &mut db_file,
             &journal_path,
             page_size,
         )?;
 
-        let mut file_size = db_file.file_size(&cx)?;
+        let mut file_size = db_file.file_size(cx)?;
         let header = if file_size == 0 {
             // SQLite databases are never truly empty: page 1 contains the
             // 100-byte database header followed by the sqlite_master root page.
@@ -758,9 +792,9 @@ where
             let usable = page_size.usable(header.reserved_per_page);
             BTreePageHeader::write_empty_leaf_table(&mut page1, DATABASE_HEADER_SIZE, usable);
 
-            db_file.write(&cx, &page1, 0)?;
-            db_file.sync(&cx, SyncFlags::NORMAL)?;
-            file_size = db_file.file_size(&cx)?;
+            db_file.write(cx, &page1, 0)?;
+            db_file.sync(cx, SyncFlags::NORMAL)?;
+            file_size = db_file.file_size(cx)?;
             header
         } else {
             if file_size < DATABASE_HEADER_SIZE as u64 {
@@ -772,7 +806,7 @@ where
             }
 
             let mut header_bytes = [0u8; DATABASE_HEADER_SIZE];
-            let header_read = db_file.read(&cx, &mut header_bytes, 0)?;
+            let header_read = db_file.read(cx, &mut header_bytes, 0)?;
             if header_read < DATABASE_HEADER_SIZE {
                 return Err(FrankenError::DatabaseCorrupt {
                     detail: format!(
@@ -819,7 +853,7 @@ where
             2
         };
         let freelist = load_freelist_from_disk(
-            &cx,
+            cx,
             &mut db_file,
             page_size,
             db_size,
@@ -848,6 +882,17 @@ where
                 commit_seq: CommitSeq::new(u64::from(header.change_counter)),
             })),
         })
+    }
+
+    /// Open (or create) a database and return a pager.
+    ///
+    /// This convenience helper preserves the historical detached-context
+    /// behavior for tests and legacy callers. Production paths should prefer
+    /// [`Self::open_with_cx`] so trace/budget lineage is preserved.
+    #[allow(clippy::too_many_lines)]
+    pub fn open(vfs: V, path: &Path, page_size: PageSize) -> Result<Self> {
+        let cx = Cx::new();
+        Self::open_with_cx(&cx, vfs, path, page_size)
     }
 
     /// Replay a hot journal by writing original pages back to the database.
@@ -1030,6 +1075,11 @@ where
         original_db_size: u32,
     ) -> Result<()> {
         if !write_set.is_empty() {
+            // Escalate to EXCLUSIVE before writing to the database file.
+            // This prevents concurrent processes from reading partially
+            // written pages during the commit.
+            inner.db_file.lock(cx, LockLevel::Exclusive)?;
+
             // Phase 1: Write rollback journal with pre-images.
             let nonce = 0x4652_414E; // "FRAN" — deterministic nonce.
             let page_size = inner.page_size;
@@ -1122,6 +1172,11 @@ where
         write_set: &HashMap<PageNumber, PageBuf>,
     ) -> Result<()> {
         if !write_set.is_empty() {
+            // Escalate to EXCLUSIVE before writing WAL frames.
+            // This prevents concurrent processes from appending to the WAL
+            // simultaneously, which would cause corruption.
+            inner.db_file.lock(cx, LockLevel::Exclusive)?;
+
             let wal = inner.wal_backend.as_mut().ok_or_else(|| {
                 FrankenError::internal("WAL mode active but no WAL backend installed")
             })?;
@@ -1162,7 +1217,7 @@ where
         Ok(())
     }
 
-    fn ensure_writer(&mut self) -> Result<()> {
+    fn ensure_writer(&mut self, cx: &Cx) -> Result<()> {
         if self.is_writer {
             return Ok(());
         }
@@ -1193,6 +1248,8 @@ where
                 if inner.writer_active {
                     return Err(FrankenError::Busy);
                 }
+                // Escalate to RESERVED lock for cross-process writer exclusion.
+                inner.db_file.lock(cx, LockLevel::Reserved)?;
                 inner.writer_active = true;
                 drop(inner);
                 self.is_writer = true;
@@ -1224,8 +1281,8 @@ where
         Ok(PageData::from_vec(data))
     }
 
-    fn write_page(&mut self, _cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()> {
-        self.ensure_writer()?;
+    fn write_page(&mut self, cx: &Cx, page_no: PageNumber, data: &[u8]) -> Result<()> {
+        self.ensure_writer(cx)?;
 
         // If we are writing to a page that was previously freed in this transaction,
         // we must "un-free" it.
@@ -1244,8 +1301,8 @@ where
         Ok(())
     }
 
-    fn allocate_page(&mut self, _cx: &Cx) -> Result<PageNumber> {
-        self.ensure_writer()?;
+    fn allocate_page(&mut self, cx: &Cx) -> Result<PageNumber> {
+        self.ensure_writer(cx)?;
 
         // First, try to reuse a page freed by this transaction.
         if let Some(page) = self.freed_pages.pop() {
@@ -1277,8 +1334,8 @@ where
         Ok(page)
     }
 
-    fn free_page(&mut self, _cx: &Cx, page_no: PageNumber) -> Result<()> {
-        self.ensure_writer()?;
+    fn free_page(&mut self, cx: &Cx, page_no: PageNumber) -> Result<()> {
+        self.ensure_writer(cx)?;
         if page_no == PageNumber::ONE {
             return Err(FrankenError::OutOfRange {
                 what: "free page number".to_owned(),
@@ -1303,6 +1360,8 @@ where
                 .lock()
                 .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
             inner.active_transactions = inner.active_transactions.saturating_sub(1);
+            // Release the SHARED file lock for read-only transactions.
+            let _ = inner.db_file.unlock(cx, LockLevel::None);
             drop(inner);
             self.committed = true;
             self.finished = true;
@@ -1366,6 +1425,9 @@ where
             for (page_no, buf) in self.write_set.drain() {
                 inner.cache.insert_buffer(page_no, buf);
             }
+
+            // Release the file lock now that the commit is complete.
+            let _ = inner.db_file.unlock(cx, LockLevel::None);
 
             drop(inner);
             self.committed = true;
@@ -1446,6 +1508,8 @@ where
             }
         }
         inner.active_transactions = inner.active_transactions.saturating_sub(1);
+        // Release the file lock on rollback.
+        let _ = inner.db_file.unlock(cx, LockLevel::None);
         drop(inner);
         if self.is_writer {
             // Delete any partial journal file.
@@ -3645,6 +3709,66 @@ mod tests {
             JournalMode::Wal,
             "bead_id={BEAD_ID} case=wal_mode_persisted"
         );
+    }
+
+    #[test]
+    fn test_set_journal_mode_updates_header_version_bytes() {
+        let (pager, _) = test_pager();
+        let cx = Cx::new();
+
+        // Verify default state: bytes 18-19 should be 1 (rollback journal).
+        {
+            let mut inner = pager.inner.lock().unwrap();
+            let mut page1 = vec![0u8; inner.page_size.as_usize()];
+            let n = inner.db_file.read(&cx, &mut page1, 0).unwrap();
+            assert!(n >= DATABASE_HEADER_SIZE);
+            assert_eq!(
+                page1[18], 1,
+                "bead_id={BEAD_ID} case=default_write_version"
+            );
+            assert_eq!(
+                page1[19], 1,
+                "bead_id={BEAD_ID} case=default_read_version"
+            );
+        }
+
+        // Switch to WAL mode: bytes 18-19 should become 2.
+        let (backend, _frames, _) = MockWalBackend::new();
+        pager.set_wal_backend(Box::new(backend)).unwrap();
+        pager.set_journal_mode(&cx, JournalMode::Wal).unwrap();
+
+        {
+            let mut inner = pager.inner.lock().unwrap();
+            let mut page1 = vec![0u8; inner.page_size.as_usize()];
+            let n = inner.db_file.read(&cx, &mut page1, 0).unwrap();
+            assert!(n >= DATABASE_HEADER_SIZE);
+            assert_eq!(
+                page1[18], 2,
+                "bead_id={BEAD_ID} case=wal_write_version"
+            );
+            assert_eq!(
+                page1[19], 2,
+                "bead_id={BEAD_ID} case=wal_read_version"
+            );
+        }
+
+        // Switch back to DELETE mode: bytes 18-19 should revert to 1.
+        pager.set_journal_mode(&cx, JournalMode::Delete).unwrap();
+
+        {
+            let mut inner = pager.inner.lock().unwrap();
+            let mut page1 = vec![0u8; inner.page_size.as_usize()];
+            let n = inner.db_file.read(&cx, &mut page1, 0).unwrap();
+            assert!(n >= DATABASE_HEADER_SIZE);
+            assert_eq!(
+                page1[18], 1,
+                "bead_id={BEAD_ID} case=delete_write_version"
+            );
+            assert_eq!(
+                page1[19], 1,
+                "bead_id={BEAD_ID} case=delete_read_version"
+            );
+        }
     }
 
     #[test]
