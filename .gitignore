@@ -146,6 +146,10 @@ crates/*/target/
 # Alternative target directories
 target-local/
 target-fresh/
+target-obs/
+target-wasm/
+**/target-obs/
+**/target-wasm/
 
 # Agent-generated Python scripts (one-off analysis/fix tools)
 /find_*.py
