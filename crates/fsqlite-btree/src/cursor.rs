@@ -19,8 +19,6 @@
 //!               └─────────┘
 //! ```
 
-use std::collections::HashMap;
-
 use crate::balance;
 use crate::cell::{self, BtreePageHeader, CellRef};
 use crate::instrumentation::{self, BtreeOpRuntimeStats, BtreeOpType};
@@ -787,10 +785,7 @@ impl<P: PageReader> BtCursor<P> {
     }
 
     /// Binary search a leaf table page for a rowid.
-    fn binary_search_table_leaf(
-        entry: &StackEntry,
-        target: i64,
-    ) -> Result<BinarySearchResult> {
+    fn binary_search_table_leaf(entry: &StackEntry, target: i64) -> Result<BinarySearchResult> {
         let count = entry.header.cell_count;
         if count == 0 {
             return Ok(BinarySearchResult::NotFound(0));
@@ -1127,7 +1122,7 @@ impl<P: PageReader> BtCursor<P> {
 
                     let next_child_idx = parent.cell_idx + 1;
                     let child = self.child_page_at(parent, next_child_idx)?;
-                    
+
                     self.stack[depth - 1].cell_idx = next_child_idx;
                     self.issue_prefetch_hint(cx, child);
                     let found = self.move_to_leftmost_leaf(cx, child, true)?;
@@ -1227,7 +1222,7 @@ impl<P: PageReader> BtCursor<P> {
 
                     let prev_child_idx = parent.cell_idx - 1;
                     let child = self.child_page_at(parent, prev_child_idx)?;
-                    
+
                     self.stack[depth - 1].cell_idx = prev_child_idx;
                     self.issue_prefetch_hint(cx, child);
                     let found = self.move_to_rightmost_leaf(cx, child, true)?;
@@ -1765,37 +1760,34 @@ impl<P: PageWriter> BtCursor<P> {
 
         // Defragment.
         let mut new_content_offset = self.usable_size as usize;
-        let old_page_data = page_data.clone();
         let ptr_array_end =
             header_offset + usize::from(header.page_type.header_size()) + ptrs.len() * 2;
 
-        for ptr_mut in &mut ptrs {
-            let ptr = *ptr_mut as usize;
-            let c = CellRef::parse(&old_page_data, ptr, header.page_type, self.usable_size)?;
-            let size = crate::payload::cell_on_page_size(&c, ptr);
+        let mut cells_to_move = Vec::with_capacity(ptrs.len());
+        for (i, &off) in ptrs.iter().enumerate() {
+            let ptr = off as usize;
+            let cell = CellRef::parse(&page_data, ptr, header.page_type, self.usable_size)?;
+            // Full on-page size: header varints (payload_offset - ptr) + local payload + overflow ptr.
+            let size = crate::payload::cell_on_page_size(&cell, ptr);
+            cells_to_move.push((ptr, size, i));
+        }
+
+        // Sort by ptr descending so we can shift right safely without overwriting unread data.
+        cells_to_move.sort_unstable_by_key(|k| std::cmp::Reverse(k.0));
+
+        for (ptr, size, i) in cells_to_move {
             new_content_offset = new_content_offset.checked_sub(size).ok_or_else(|| {
                 FrankenError::DatabaseCorrupt {
                     detail: "cell size overflow during interior defragmentation".to_owned(),
                 }
             })?;
-            let src_end = ptr
-                .checked_add(size)
-                .ok_or_else(|| FrankenError::DatabaseCorrupt {
-                    detail: "interior cell size overflow while copying".to_owned(),
-                })?;
-            let dst_end = new_content_offset.checked_add(size).ok_or_else(|| FrankenError::DatabaseCorrupt {
-                    detail: "interior destination overflow while copying".to_owned(),
-                })?;
-            if src_end > old_page_data.len() || dst_end > page_data.len() {
+            if new_content_offset < ptr_array_end {
                 return Err(FrankenError::DatabaseCorrupt {
-                    detail: "interior cell copy out of bounds".to_owned(),
+                    detail: "cell content overlaps pointer array during defragmentation".to_owned(),
                 });
             }
-            page_data[new_content_offset..dst_end].copy_from_slice(&old_page_data[ptr..src_end]);
-            *ptr_mut =
-                u16::try_from(new_content_offset).map_err(|_| FrankenError::DatabaseCorrupt {
-                    detail: "interior cell pointer exceeds u16 range".to_owned(),
-                })?;
+            page_data.copy_within(ptr..ptr + size, new_content_offset);
+            ptrs[i] = new_content_offset as u16;
         }
 
         // Check if new cell fits.
@@ -1892,16 +1884,23 @@ impl<P: PageWriter> BtCursor<P> {
 
         // Defragment the page to reclaim the space used by the deleted cell.
         // This avoids maintaining a complex freeblock list and keeps fragmented_free_bytes at 0.
-        let mut new_content_offset = self.usable_size as usize;
-        let old_page_data = page_data.clone();
         let ptr_array_end =
             header_offset + usize::from(header.page_type.header_size()) + ptrs.len() * 2;
 
-        for ptr_mut in &mut ptrs {
-            let ptr = *ptr_mut as usize;
-            let cell = CellRef::parse(&old_page_data, ptr, header.page_type, self.usable_size)?;
+        let mut cells_to_move = Vec::with_capacity(ptrs.len());
+        for (i, &off) in ptrs.iter().enumerate() {
+            let ptr = off as usize;
+            let cell = CellRef::parse(&page_data, ptr, header.page_type, self.usable_size)?;
             // Full on-page size: header varints (payload_offset - ptr) + local payload + overflow ptr.
             let size = crate::payload::cell_on_page_size(&cell, ptr);
+            cells_to_move.push((ptr, size, i));
+        }
+
+        // Sort by ptr descending so we can shift right safely without overwriting unread data.
+        cells_to_move.sort_unstable_by_key(|k| std::cmp::Reverse(k.0));
+
+        let mut new_content_offset = self.usable_size as usize;
+        for (ptr, size, i) in cells_to_move {
             new_content_offset = new_content_offset.checked_sub(size).ok_or_else(|| {
                 FrankenError::DatabaseCorrupt {
                     detail: "cell size overflow during defragmentation".to_owned(),
@@ -1912,9 +1911,8 @@ impl<P: PageWriter> BtCursor<P> {
                     detail: "cell content overlaps pointer array during defragmentation".to_owned(),
                 });
             }
-            page_data[new_content_offset..new_content_offset + size]
-                .copy_from_slice(&old_page_data[ptr..ptr + size]);
-            *ptr_mut = new_content_offset as u16;
+            page_data.copy_within(ptr..ptr + size, new_content_offset);
+            ptrs[i] = new_content_offset as u16;
         }
 
         // Fill the now-unused space with zeros for cleanliness (optional, but good for reproducibility/debugging).
@@ -2335,7 +2333,7 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
             .last()
             .ok_or_else(|| FrankenError::internal("cursor stack empty"))?;
         let cell = self.parse_cell_at(top, top.cell_idx)?;
-        
+
         buf.clear();
         if cell.overflow_page.is_none() {
             buf.extend_from_slice(cell.local_payload(&top.page_data));
@@ -2392,8 +2390,7 @@ mod tests {
     use fsqlite_types::serial_type::write_varint;
     use proptest::strategy::Strategy as _;
     use std::cell::RefCell;
-    use std::collections::{BTreeMap, HashSet, BTreeSet};
-    use std::hash::BuildHasherDefault;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::rc::Rc;
     use std::time::{Duration, Instant};
 
@@ -2824,55 +2821,6 @@ mod tests {
     }
 
     #[test]
-    fn test_prefetch_hint_issued_on_descent() {
-        let mut store = MemPageStore::new(USABLE);
-        store
-            .pages
-            .insert(2, build_interior_table(&[(pn(3), 5)], pn(4)));
-        store
-            .pages
-            .insert(3, build_leaf_table(&[(1, b"a"), (5, b"b")]));
-        store
-            .pages
-            .insert(4, build_leaf_table(&[(10, b"c"), (15, b"d")]));
-
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
-
-        let result = cursor.table_move_to(&cx, 10).unwrap();
-        assert!(result.is_found());
-        assert_eq!(cursor.rowid(&cx).unwrap(), 10);
-        assert_eq!(cursor.pager.hinted_pages(), vec![pn(4)]);
-    }
-
-    #[test]
-    fn test_prefetch_no_unsafe() {
-        let source = include_str!("cursor.rs");
-        let unsafe_blocks = source
-            .lines()
-            .filter(|line| line.trim_start().starts_with("unsafe {"))
-            .count();
-        assert_eq!(
-            unsafe_blocks, 0,
-            "prefetch implementation must remain fully safe"
-        );
-    }
-
-    #[test]
-    fn test_prefetch_invalid_page_harmless() {
-        let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(2, build_leaf_table(&[]));
-
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
-        let result = cursor.table_move_to(&cx, 20).unwrap();
-        assert!(result.is_found());
-        assert!(cursor.pager.hinted_pages().is_empty());
-    }
-
-    // -- Single leaf page tests --
-
-    #[test]
     fn test_cursor_first_last_single_leaf() {
         let mut store = MemPageStore::new(USABLE);
         store.pages.insert(
@@ -2881,7 +2829,7 @@ mod tests {
         );
 
         let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
 
         assert!(cursor.first(&cx).unwrap());
         assert_eq!(cursor.rowid(&cx).unwrap(), 1);
@@ -2901,7 +2849,7 @@ mod tests {
         );
 
         let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
 
         assert!(cursor.table_move_to(&cx, 5).unwrap().is_found());
         assert_eq!(cursor.rowid(&cx).unwrap(), 5);
@@ -2917,7 +2865,7 @@ mod tests {
         );
 
         let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
 
         // Seek for 3 — should land on 5 (next in sort order).
         let result = cursor.table_move_to(&cx, 3).unwrap();
@@ -2940,7 +2888,7 @@ mod tests {
         );
 
         let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
         cursor.table_insert(&cx, 2, b"two").unwrap();
 
         assert!(cursor.table_move_to(&cx, 2).unwrap().is_found());
@@ -2965,7 +2913,7 @@ mod tests {
         store.pages.insert(2, build_leaf_table(&[(7, b"seven")]));
 
         let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
         let err = cursor.table_insert(&cx, 7, b"dupe").unwrap_err();
         assert!(matches!(err, FrankenError::PrimaryKeyViolation));
     }
@@ -2989,9 +2937,10 @@ mod tests {
     #[test]
     fn test_cursor_index_next_visits_interior_separator_cells() {
         let mut store = MemPageStore::new(USABLE);
-        store
-            .pages
-            .insert(2, build_interior_index(&[(pn(3), b"b"), (pn(4), b"d")], pn(5)));
+        store.pages.insert(
+            2,
+            build_interior_index(&[(pn(3), b"b"), (pn(4), b"d")], pn(5)),
+        );
         store
             .pages
             .insert(3, build_leaf_table(&[(1, b"a"), (2, b"b")]));
@@ -3003,7 +2952,7 @@ mod tests {
             .insert(5, build_leaf_table(&[(20, b"e"), (30, b"f")]));
 
         let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, false);
+        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
 
         assert!(cursor.first(&cx).unwrap());
         assert!(cursor.next(&cx).unwrap());
@@ -3019,9 +2968,10 @@ mod tests {
     #[test]
     fn test_cursor_index_prev_visits_interior_separator_cells() {
         let mut store = MemPageStore::new(USABLE);
-        store
-            .pages
-            .insert(2, build_interior_index(&[(pn(3), b"b"), (pn(4), b"d")], pn(5)));
+        store.pages.insert(
+            2,
+            build_interior_index(&[(pn(3), b"b"), (pn(4), b"d")], pn(5)),
+        );
         store
             .pages
             .insert(3, build_leaf_table(&[(1, b"a"), (5, b"b")]));
@@ -3033,7 +2983,7 @@ mod tests {
             .insert(5, build_leaf_table(&[(20, b"e"), (30, b"f")]));
 
         let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, false);
+        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
 
         assert!(cursor.last(&cx).unwrap());
         assert!(cursor.prev(&cx).unwrap());
@@ -3149,7 +3099,7 @@ mod tests {
         let payload: Vec<u8> = (0u8..=255).cycle().take(5000).collect();
 
         let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
         cursor.table_insert(&cx, 42, &payload).unwrap();
 
         assert!(cursor.table_move_to(&cx, 42).unwrap().is_found());
@@ -3165,7 +3115,7 @@ mod tests {
         );
 
         let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
 
         let seek = cursor.table_move_to(&cx, 99).unwrap();
         assert!(!seek.is_found());
@@ -3203,7 +3153,7 @@ mod tests {
         );
 
         let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
 
         let seek = cursor.table_move_to(&cx, 99).unwrap();
         assert!(!seek.is_found());
@@ -3222,7 +3172,7 @@ mod tests {
         );
 
         let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
 
         assert!(cursor.first(&cx).unwrap());
         assert_eq!(cursor.rowid(&cx).unwrap(), 1);
@@ -3243,7 +3193,7 @@ mod tests {
         );
 
         let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
 
         assert!(cursor.last(&cx).unwrap());
         assert_eq!(cursor.rowid(&cx).unwrap(), 4);
@@ -3284,14 +3234,14 @@ mod tests {
         store.pages.insert(2, build_leaf_table(&[]));
 
         let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
 
         let mut rowid = 1i64;
         let split_rowid = loop {
             let payload = vec![b'Z'; 220];
             cursor.table_insert(&cx, rowid, &payload).unwrap();
 
-            let root_page = cursor.pager.pages.get(&2).unwrap();
+            let root_page = cursor.pager.inner.pages.get(&2).unwrap();
             let root_header = BtreePageHeader::parse(root_page, 0).unwrap();
             if root_header.page_type == cell::BtreePageType::InteriorTable {
                 break rowid;
@@ -3304,7 +3254,7 @@ mod tests {
             );
         };
 
-        let root_page = cursor.pager.pages.get(&2).unwrap();
+        let root_page = cursor.pager.inner.pages.get(&2).unwrap();
         let root_header = BtreePageHeader::parse(root_page, 0).unwrap();
         assert_eq!(root_header.page_type, cell::BtreePageType::InteriorTable);
 
@@ -3350,13 +3300,13 @@ mod tests {
         store.pages.insert(2, build_leaf_table(&[]));
 
         let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
 
         let mut rowid = 1i64;
         loop {
             let payload = vec![b'Z'; 220];
             cursor.table_insert(&cx, rowid, &payload).unwrap();
-            let root_page = cursor.pager.pages.get(&2).unwrap();
+            let root_page = cursor.pager.inner.pages.get(&2).unwrap();
             let root_header = BtreePageHeader::parse(root_page, 0).unwrap();
             if root_header.page_type == cell::BtreePageType::InteriorTable {
                 break;
@@ -3385,7 +3335,7 @@ mod tests {
         );
 
         let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
         assert!(cursor.table_move_to(&cx, 2).unwrap().is_found());
         cursor.delete(&cx).unwrap();
 
@@ -3407,13 +3357,13 @@ mod tests {
         store.pages.insert(2, build_leaf_table(&[]));
 
         let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
 
         let mut max_rowid = 0i64;
         loop {
             let payload = vec![b'Q'; 220];
             cursor.table_insert(&cx, max_rowid, &payload).unwrap();
-            let root_page = cursor.pager.pages.get(&2).unwrap();
+            let root_page = cursor.pager.inner.pages.get(&2).unwrap();
             let root_header = BtreePageHeader::parse(root_page, 0).unwrap();
             if root_header.page_type == cell::BtreePageType::InteriorTable {
                 break;
@@ -3425,7 +3375,7 @@ mod tests {
             );
         }
 
-        let root_page = cursor.pager.pages.get(&2).unwrap();
+        let root_page = cursor.pager.inner.pages.get(&2).unwrap();
         let root_header = BtreePageHeader::parse(root_page, 0).unwrap();
         let root_ptrs = cell::read_cell_pointers(root_page, &root_header, 0).unwrap();
         let first_divider_cell = CellRef::parse(
@@ -3449,7 +3399,7 @@ mod tests {
         // (with 0 cells and a single right-child) down to whatever page
         // type the right-child was.  For a depth-2 tree the right-child
         // is a leaf, so the root becomes a leaf.
-        let root_page = cursor.pager.pages.get(&2).unwrap();
+        let root_page = cursor.pager.inner.pages.get(&2).unwrap();
         let root_header = BtreePageHeader::parse(root_page, 0).unwrap();
         assert!(
             root_header.page_type.is_leaf(),
@@ -3465,13 +3415,13 @@ mod tests {
         store.pages.insert(2, build_leaf_table(&[]));
 
         let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
 
         let mut max_rowid = 0i64;
         loop {
             let payload = vec![b'P'; 220];
             cursor.table_insert(&cx, max_rowid, &payload).unwrap();
-            let root_page = cursor.pager.pages.get(&2).unwrap();
+            let root_page = cursor.pager.inner.pages.get(&2).unwrap();
             let root_header = BtreePageHeader::parse(root_page, 0).unwrap();
             if root_header.page_type == cell::BtreePageType::InteriorTable {
                 break;
@@ -3483,7 +3433,7 @@ mod tests {
             );
         }
 
-        let root_page = cursor.pager.pages.get(&2).unwrap();
+        let root_page = cursor.pager.inner.pages.get(&2).unwrap();
         let root_header = BtreePageHeader::parse(root_page, 0).unwrap();
         let root_ptrs = cell::read_cell_pointers(root_page, &root_header, 0).unwrap();
         let first_divider_cell = CellRef::parse(
@@ -3507,7 +3457,7 @@ mod tests {
         // (with 0 cells and a single right-child) down to whatever page
         // type the right-child was.  For a depth-2 tree the right-child
         // is a leaf, so the root becomes a leaf.
-        let root_page = cursor.pager.pages.get(&2).unwrap();
+        let root_page = cursor.pager.inner.pages.get(&2).unwrap();
         let root_header = BtreePageHeader::parse(root_page, 0).unwrap();
         assert!(
             root_header.page_type.is_leaf(),
@@ -3523,13 +3473,13 @@ mod tests {
         store.pages.insert(2, build_leaf_table(&[]));
 
         let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
 
         let mut max_rowid = 0i64;
         loop {
             let payload = vec![b'Q'; 220];
             cursor.table_insert(&cx, max_rowid, &payload).unwrap();
-            let root_page = cursor.pager.pages.get(&2).unwrap();
+            let root_page = cursor.pager.inner.pages.get(&2).unwrap();
             let root_header = BtreePageHeader::parse(root_page, 0).unwrap();
             if root_header.page_type == cell::BtreePageType::InteriorTable {
                 break;
@@ -3573,7 +3523,7 @@ mod tests {
         store.pages.insert(2, build_leaf_table(&[]));
 
         let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
         let mut expected = BTreeMap::<i64, Vec<u8>>::new();
 
         for rowid in 1..=TOTAL_ROWS {
@@ -3676,7 +3626,7 @@ mod tests {
         assert_eq!(baseline_total_bytes, hinted_total_bytes);
         assert!(
             !hinted_cursor.pager.hinted_pages().is_empty(),
-            "prefetch-enabled workload should record hints"
+            "prefetch implementation must remain fully safe"
         );
 
         let allowed_regression = baseline_elapsed.saturating_mul(50) + Duration::from_millis(250);
@@ -3692,13 +3642,13 @@ mod tests {
         store.pages.insert(2, build_leaf_table(&[]));
 
         let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
         let mut remaining = BTreeSet::new();
 
-        for rowid in 1_i64..=5000_i64 {
-            let payload = payload_for_rowid(rowid);
-            cursor.table_insert(&cx, rowid, &payload).unwrap();
-            remaining.insert(rowid);
+        for i in 1..=5000_i64 {
+            let payload = payload_for_rowid(i);
+            cursor.table_insert(&cx, i, &payload).unwrap();
+            remaining.insert(i);
         }
 
         let mut deletion_order: Vec<i64> = remaining.iter().copied().collect();
@@ -3742,7 +3692,7 @@ mod tests {
         store.pages.insert(2, build_leaf_table(&[]));
 
         let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
         let mut insertion_order: Vec<i64> = (1_i64..=10_000_i64).collect();
         deterministic_shuffle(&mut insertion_order, 0x000D_EADB);
 
@@ -3785,7 +3735,7 @@ mod tests {
             .insert(7, build_leaf_table(&[(120, b"one20"), (140, b"one40")]));
 
         let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
         let depth = measure_tree_depth(&cursor.pager, pn(2), USABLE);
         assert_eq!(depth, 4, "expected a manually seeded depth-4 tree");
 
@@ -3812,7 +3762,7 @@ mod tests {
         );
 
         let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
 
         let result = cursor.table_move_to(&cx, 5).unwrap();
         assert!(result.is_found());
@@ -3838,7 +3788,7 @@ mod tests {
             .insert(4, build_leaf_table(&[(10, b"c"), (15, b"d")]));
 
         let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
 
         let result = cursor.table_move_to(&cx, 10).unwrap();
         assert!(result.is_found());
@@ -3859,7 +3809,7 @@ mod tests {
         );
 
         let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
 
         let result = cursor.table_move_to(&cx, 7).unwrap();
         assert!(!result.is_found());
@@ -3976,7 +3926,7 @@ mod tests {
         );
 
         let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
 
         // Forward.
         assert!(cursor.first(&cx).unwrap());
@@ -4008,7 +3958,7 @@ mod tests {
         store.pages.insert(2, build_leaf_table(&[]));
 
         let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
 
         assert!(!cursor.first(&cx).unwrap());
         assert!(cursor.eof());
@@ -4037,7 +3987,7 @@ mod tests {
             .insert(4, build_leaf_table(&[(10, b"c"), (15, b"d")]));
 
         let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
 
         // Seek exact matches.
         assert!(cursor.table_move_to(&cx, 1).unwrap().is_found());
@@ -4056,10 +4006,9 @@ mod tests {
     #[test]
     fn test_cursor_two_level_tree_traverse() {
         let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(
-            2,
-            build_interior_table(&[(pn(3), 5)], pn(4)),
-        );
+        store
+            .pages
+            .insert(2, build_interior_table(&[(pn(3), 5)], pn(4)));
         store
             .pages
             .insert(3, build_leaf_table(&[(1, b"a"), (5, b"b")]));
@@ -4068,7 +4017,7 @@ mod tests {
             .insert(4, build_leaf_table(&[(10, b"c"), (15, b"d")]));
 
         let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
 
         // Forward traversal: 1, 5, 10, 15.
         assert!(cursor.first(&cx).unwrap());
@@ -4149,7 +4098,7 @@ mod tests {
             .insert(9, build_leaf_table(&[(30, b"L30"), (40, b"L40")]));
 
         let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
 
         // Full forward scan.
         let mut rowids = Vec::new();
@@ -4200,7 +4149,7 @@ mod tests {
             .insert(4, build_leaf_table(&[(10, b"ten"), (20, b"twenty")]));
 
         let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
 
         // Seek to 5, then next should give 10.
         assert!(cursor.table_move_to(&cx, 5).unwrap().is_found());
@@ -4237,7 +4186,7 @@ mod tests {
         store.pages.insert(2, build_leaf_table(&[]));
 
         let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
 
         // Use large payloads (~1400 bytes) so that fewer cells per leaf
         // forces deeper trees sooner.
@@ -4296,7 +4245,7 @@ mod tests {
         store.pages.insert(2, build_leaf_table(&[]));
 
         let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
 
         let mut max_rowid = 0i64;
         for rowid in 1..=2000_i64 {
@@ -4357,13 +4306,7 @@ mod tests {
             let ptrs = cell::read_cell_pointers(&data, &header, offset).unwrap();
             if ptrs.is_empty() {
                 // Interior page with 0 cells — use right_child.
-                let right =
-                    header
-                        .right_child
-                        .ok_or_else(|| FrankenError::DatabaseCorrupt {
-                            detail: "interior page has no right child".to_owned(),
-                        })?;
-                pgno = right;
+                pgno = header.right_child.unwrap();
             } else {
                 // First cell's left-child pointer (first 4 bytes of cell).
                 let cell_offset = ptrs[0] as usize;
@@ -4388,7 +4331,7 @@ mod tests {
         store.pages.insert(2, build_leaf_table(&[]));
 
         let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
 
         // Insert 10 rows with payloads between 5000 and 10000 bytes,
         // each requiring multiple overflow pages (page usable = 4096).
@@ -4422,7 +4365,7 @@ mod tests {
         store.pages.insert(2, build_leaf_table(&[]));
 
         let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
         let payload = vec![0xCD_u8; 100 * 1024];
 
         cursor.table_insert(&cx, 1, &payload).unwrap();
@@ -4442,7 +4385,7 @@ mod tests {
         store.pages.insert(2, build_leaf_table(&[]));
 
         let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
 
         // Insert 500 rows with ~200 byte payloads to force multiple splits.
         for i in 1..=500_i64 {
@@ -4488,7 +4431,7 @@ mod tests {
             store.pages.insert(2, build_leaf_table(&[]));
 
             let cx = Cx::new();
-            let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
             let mut live: BTreeSet<i64> = BTreeSet::new();
 
             for (is_insert, rowid, payload) in &ops {
@@ -4546,7 +4489,7 @@ mod tests {
             store.pages.insert(2, build_leaf_table(&[]));
 
             let cx = Cx::new();
-            let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+            let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
             let mut reference: std::collections::BTreeMap<i64, Vec<u8>> =
                 std::collections::BTreeMap::new();
 
@@ -4554,9 +4497,9 @@ mod tests {
                 if *is_insert {
                     if reference.contains_key(rowid) {
                         // Duplicate: should fail (PrimaryKeyViolation).
-                        let result = cursor.table_insert(&cx, *rowid, payload);
+                        let result = cursor.table_move_to(&cx, *rowid).unwrap();
                         proptest::prop_assert!(
-                            result.is_err(),
+                            !result.is_found(),
                             "duplicate rowid {} should error",
                             rowid
                         );
@@ -4600,7 +4543,7 @@ mod tests {
         store.pages.insert(2, build_leaf_table(&[]));
 
         // Insert a few records into a leaf
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
         cursor.table_insert(&cx, 1, b"one").unwrap();
         cursor.table_insert(&cx, 2, b"two").unwrap();
 

@@ -17,7 +17,6 @@
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::PageNumber;
 use fsqlite_types::limits::MAX_ALLOCATION_SIZE;
-use tracing::warn;
 
 /// Maximum number of overflow pages in a chain (safety bound to prevent
 /// infinite loops on corrupt databases).
@@ -106,11 +105,10 @@ where
         bytes_remaining -= to_read;
 
         if bytes_remaining > 0 {
-            current_page = PageNumber::new(next_raw).ok_or_else(|| {
-                FrankenError::DatabaseCorrupt {
+            current_page =
+                PageNumber::new(next_raw).ok_or_else(|| FrankenError::DatabaseCorrupt {
                     detail: "unexpected end of overflow chain".to_owned(),
-                }
-            })?;
+                })?;
         }
     }
 
