@@ -10,8 +10,8 @@
 
 use std::collections::HashMap;
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
     Arc,
+    atomic::{AtomicU64, Ordering},
 };
 use std::time::Duration;
 
@@ -26,7 +26,7 @@ use crate::cache_aligned::{logical_now_epoch_secs, logical_now_millis};
 use crate::core_types::{
     CommitIndex, InProcessPageLockTable, Transaction, TransactionMode, TransactionState,
 };
-use crate::ebr::{VersionGuardRegistry, VersionGuardTicket, GLOBAL_EBR_METRICS};
+use crate::ebr::{GLOBAL_EBR_METRICS, VersionGuardRegistry, VersionGuardTicket};
 use crate::invariants::{SerializedWriteMutex, TxnManager, VersionStore};
 use crate::observability::{
     mvcc_snapshot_established, mvcc_snapshot_released, record_snapshot_read_versions_traversed,
@@ -322,7 +322,8 @@ pub struct Savepoint {
     pub name: String,
     /// Snapshot of the write set at the time the savepoint was created.
     /// Maps page -> data so we can restore on ROLLBACK TO.
-    pub write_set_snapshot: HashMap<PageNumber, PageData>,
+    /// Uses `Arc` for cheap O(1) creation.
+    pub write_set_snapshot: Arc<HashMap<PageNumber, PageData>>,
     /// Number of pages in write_set when savepoint was created.
     pub write_set_len: usize,
 }
@@ -932,7 +933,7 @@ impl TransactionManager {
         );
 
         // Restore write_set_data to the savepoint state.
-        txn.write_set_data.clone_from(&savepoint.write_set_snapshot);
+        txn.write_set_data = savepoint.write_set_snapshot.clone();
 
         // Truncate the write_set page list to savepoint length.
         txn.write_set.truncate(savepoint.write_set_len);
@@ -1039,7 +1040,7 @@ impl TransactionManager {
         if !txn.write_set.contains(&pgno) {
             txn.write_set.push(pgno);
         }
-        txn.write_set_data.insert(pgno, data);
+        Arc::make_mut(&mut txn.write_set_data).insert(pgno, data);
         Ok(())
     }
 
@@ -1079,7 +1080,7 @@ impl TransactionManager {
         if !txn.write_set.contains(&pgno) {
             txn.write_set.push(pgno);
         }
-        txn.write_set_data.insert(pgno, data);
+        Arc::make_mut(&mut txn.write_set_data).insert(pgno, data);
         Ok(())
     }
 
@@ -1291,7 +1292,7 @@ impl TransactionManager {
         // Compose if disjoint.
         match compose_disjoint_gf256_patches(base_data.as_bytes(), &delta_ours, &delta_theirs) {
             Some(merged) => {
-                txn.write_set_data.insert(pgno, PageData::from_vec(merged));
+                Arc::make_mut(&mut txn.write_set_data).insert(pgno, PageData::from_vec(merged));
                 txn.record_page_read(pgno, latest_seq);
                 if let Some(entry) = txn.write_set_versions.get_mut(&pgno) {
                     entry.old_version = Some(latest_seq);
@@ -1533,9 +1534,9 @@ mod tests {
     use crate::ebr::GLOBAL_EBR_METRICS;
     use std::hint::black_box;
     use std::io;
-    use std::sync::mpsc;
     use std::sync::Arc;
     use std::sync::Mutex;
+    use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
     use fsqlite_types::TxnId;
@@ -1845,12 +1846,16 @@ mod tests {
 
         assert_eq!(reader.read_version_for_page(p1), Some(committed));
         assert_eq!(reader.read_version_for_page(p2), Some(committed));
-        assert!(reader
-            .read_keys
-            .contains(&fsqlite_types::WitnessKey::Page(p1)));
-        assert!(reader
-            .read_keys
-            .contains(&fsqlite_types::WitnessKey::Page(p2)));
+        assert!(
+            reader
+                .read_keys
+                .contains(&fsqlite_types::WitnessKey::Page(p1))
+        );
+        assert!(
+            reader
+                .read_keys
+                .contains(&fsqlite_types::WitnessKey::Page(p2))
+        );
     }
 
     #[test]
@@ -3861,9 +3866,10 @@ mod tests {
         }
         m.commit(&mut writer).unwrap();
         for page in [901_u32, 902, 903] {
-            assert!(m
-                .read_page(&mut old_reader, PageNumber::new(page).unwrap())
-                .is_none());
+            assert!(
+                m.read_page(&mut old_reader, PageNumber::new(page).unwrap())
+                    .is_none()
+            );
         }
 
         let mut stale = m.begin(BeginKind::Concurrent).unwrap();
