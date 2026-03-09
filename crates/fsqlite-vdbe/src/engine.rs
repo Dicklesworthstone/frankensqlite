@@ -3038,7 +3038,10 @@ impl VdbeEngine {
                     // Re-create cursor with TimeTravelPageIo.
                     // Remove the old cursor to get its metadata.
                     let old_sc = self.storage_cursors.remove(&cursor_id).ok_or_else(|| {
-                        FrankenError::Internal(format!("SetSnapshot: cursor {} not found", cursor_id))
+                        FrankenError::Internal(format!(
+                            "SetSnapshot: cursor {} not found",
+                            cursor_id
+                        ))
                     })?;
                     let root_page = self.cursor_root_pages.get(&cursor_id).copied().unwrap_or(1);
                     let root_pgno = PageNumber::new(root_page as u32).unwrap_or(PageNumber::ONE);

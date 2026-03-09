@@ -984,7 +984,9 @@ impl Transaction {
             snapshot,
             snapshot_established: true,
             write_set: SmallVec::new(),
-            write_set_data: Arc::new(HashMap::with_hasher(fsqlite_types::PageNumberBuildHasher::default())),
+            write_set_data: Arc::new(HashMap::with_hasher(
+                fsqlite_types::PageNumberBuildHasher::default(),
+            )),
             intent_log: Vec::new(),
             page_locks: HashSet::new(),
             state: TransactionState::Active,
