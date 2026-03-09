@@ -8,11 +8,12 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-fsqlite-types = { workspace = true }
+fsqlite-types = { path = "../fsqlite-types", version = "0.1" }
 fsqlite-error = { workspace = true }
 fsqlite-pager = { workspace = true }
 tracing = { workspace = true }
 hashbrown = { workspace = true }
+foldhash = "0.2.0"
 
 [dev-dependencies]
 proptest = { workspace = true }
