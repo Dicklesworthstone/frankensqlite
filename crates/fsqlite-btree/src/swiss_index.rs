@@ -6,6 +6,7 @@
 //! Uses SSE2/AVX2 control byte probing for cache-line parallel lookup (via hashbrown).
 
 use crate::instrumentation::{record_swiss_probe, set_swiss_load_factor};
+use foldhash::fast::FixedState;
 use hashbrown::HashMap;
 use std::borrow::Borrow;
 use std::hash::Hash;
@@ -18,7 +19,7 @@ use tracing::{Level, span};
 /// `fsqlite_swiss_table_load_factor` metrics on operations.
 #[derive(Debug, Clone, Default)]
 pub struct SwissIndex<K, V> {
-    inner: HashMap<K, V>,
+    inner: HashMap<K, V, FixedState>,
 }
 
 impl<K, V> SwissIndex<K, V>
@@ -28,14 +29,14 @@ where
     /// Creates an empty `SwissIndex`.
     pub fn new() -> Self {
         Self {
-            inner: HashMap::new(),
+            inner: HashMap::with_hasher(FixedState::default()),
         }
     }
 
     /// Creates an empty `SwissIndex` with the specified capacity.
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
-            inner: HashMap::with_capacity(capacity),
+            inner: HashMap::with_capacity_and_hasher(capacity, FixedState::default()),
         }
     }
 
@@ -171,6 +172,11 @@ where
         } else {
             (self.inner.len() as u64 * 1000) / capacity as u64
         }
+    }
+
+    #[inline(always)]
+    pub fn capacity(&self) -> usize {
+        self.inner.capacity()
     }
 }
 
