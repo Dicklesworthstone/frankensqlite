@@ -11958,7 +11958,7 @@ impl Connection {
             .flat_map(|col| match col {
                 ResultColumn::Star => col_map
                     .iter()
-                    .map(|(tbl, c)| ResultColumn::Expr {
+                    .map(|(tbl, c, _)| ResultColumn::Expr {
                         expr: Expr::Column(
                             ColumnRef::qualified(tbl.clone(), c.clone()),
                             Span::new(0, 0),
