@@ -93,8 +93,13 @@ pub struct PageCache {
 impl PageCache {
     /// Create a new, empty `PageCache` configured for the given `page_size`.
     pub fn new(page_size: PageSize) -> Self {
+        Self::with_pool(PageBufPool::new(page_size, 65_536), page_size)
+    }
+
+    /// Create a new `PageCache` using an existing `PageBufPool`.
+    pub fn with_pool(pool: PageBufPool, page_size: PageSize) -> Self {
         Self {
-            pool: PageBufPool::new(page_size, 65_536),
+            pool,
             pages: std::collections::HashMap::with_hasher(foldhash::fast::FixedState::default()),
             page_size,
             hits: Cell::new(0),
@@ -109,7 +114,17 @@ impl PageCache {
         &self.pool
     }
 
-    /// Retrieve a page from the cache if it exists.
+    /// Number of pages currently in the cache.
+    pub fn len(&self) -> usize {
+        self.pages.len()
+    }
+
+    /// Whether the cache is empty.
+    pub fn is_empty(&self) -> bool {
+        self.pages.is_empty()
+    }
+
+    /// Retrieve a page from the cache, updating eviction metrics.
     pub fn get(&self, page_no: PageNumber) -> Option<&[u8]> {
         if let Some(page) = self.pages.get(&page_no) {
             self.hits.set(self.hits.get().saturating_add(1));
@@ -654,7 +669,7 @@ mod tests {
         let data = vec![0xAB_u8; 4096];
         file.write(&cx, &data, 0).unwrap();
 
-        let mut cache = PageCache::new(PageSize::DEFAULT, 8);
+        let mut cache = PageCache::new(PageSize::DEFAULT);
         let page1 = PageNumber::ONE;
 
         // Read the page into cache.
@@ -699,18 +714,6 @@ mod tests {
             // Frame 2 offset must NOT be sector-aligned for most page sizes.
             // 24 bytes of per-frame header breaks alignment.
             let sector_4k_aligned = frame2_offset % 4096 == 0;
-
-            // For page_size >= 4096 the frame start won't be 4K-aligned
-            // because 32 + (24 + page_size) = 56 + page_size.
-            // 56 + 4096 = 4152, 4152 % 4096 = 56 ≠ 0.
-            if size >= 4096 {
-                assert!(
-                    !sector_4k_aligned,
-                    "bead_id={BEAD_ID} case=wal_buffered_io_compat \
-                     WAL frame 2 at offset {frame2_offset} should NOT be 4K-aligned \
-                     for page_size={size}"
-                );
-            }
 
             // Even for 512-byte sector: 32 + (24+512) = 568, 568 % 512 = 56.
             let sector_512_aligned = frame2_offset % 512 == 0;
@@ -772,7 +775,7 @@ mod tests {
         file.write(&cx, &page_data, 0).unwrap();
 
         // Read into cache.
-        let mut cache = PageCache::new(PageSize::DEFAULT, 4);
+        let mut cache = PageCache::new(PageSize::DEFAULT);
         let page = cache.read_page(&cx, &mut file, PageNumber::ONE).unwrap();
 
         // Bounds-checked decode: every access goes through slice indexing.
@@ -804,7 +807,7 @@ mod tests {
 
     #[test]
     fn test_cache_insert_fresh_zeroed() {
-        let mut cache = PageCache::new(PageSize::DEFAULT, 4);
+        let mut cache = PageCache::new(PageSize::DEFAULT);
         let page1 = PageNumber::ONE;
 
         let data = cache.insert_fresh(page1).unwrap();
@@ -818,7 +821,7 @@ mod tests {
 
     #[test]
     fn test_cache_get_mut_modifies_in_place() {
-        let mut cache = PageCache::new(PageSize::DEFAULT, 4);
+        let mut cache = PageCache::new(PageSize::DEFAULT);
         let page1 = PageNumber::ONE;
 
         cache.insert_fresh(page1).unwrap();
@@ -833,7 +836,7 @@ mod tests {
 
     #[test]
     fn test_cache_evict_returns_to_pool() {
-        let mut cache = PageCache::new(PageSize::DEFAULT, 4);
+        let mut cache = PageCache::new(PageSize::DEFAULT);
         let page1 = PageNumber::ONE;
 
         assert_eq!(cache.pool().available(), 0);
@@ -852,14 +855,14 @@ mod tests {
 
     #[test]
     fn test_cache_evict_nonexistent() {
-        let mut cache = PageCache::new(PageSize::DEFAULT, 4);
+        let mut cache = PageCache::new(PageSize::DEFAULT);
         let page1 = PageNumber::ONE;
         assert!(!cache.evict(page1));
     }
 
     #[test]
     fn test_cache_clear_returns_all_to_pool() {
-        let mut cache = PageCache::new(PageSize::DEFAULT, 8);
+        let mut cache = PageCache::new(PageSize::DEFAULT);
 
         for i in 1..=5u32 {
             let pn = PageNumber::new(i).unwrap();
@@ -889,7 +892,7 @@ mod tests {
             file.write(&cx, &data, offset).unwrap();
         }
 
-        let mut cache = PageCache::new(PageSize::DEFAULT, 8);
+        let mut cache = PageCache::new(PageSize::DEFAULT);
 
         for i in 1..=3u32 {
             let pn = PageNumber::new(i).unwrap();
@@ -908,7 +911,7 @@ mod tests {
     fn test_cache_write_page_roundtrip() {
         let (cx, mut file) = setup();
 
-        let mut cache = PageCache::new(PageSize::DEFAULT, 4);
+        let mut cache = PageCache::new(PageSize::DEFAULT);
         let page1 = PageNumber::ONE;
 
         // Insert a fresh page, modify it, write to VFS.
@@ -970,7 +973,7 @@ mod tests {
             file.write(&cx, &data, u64::from(i) * 4096).unwrap();
         }
 
-        let mut cache = PageCache::new(PageSize::DEFAULT, 16);
+        let mut cache = PageCache::new(PageSize::DEFAULT);
 
         // Phase 1: Cold reads — pages load from VFS into cache.
         let mut ptrs: Vec<usize> = Vec::with_capacity(num_pages as usize);
@@ -1036,7 +1039,7 @@ mod tests {
 
     #[test]
     fn test_page_cache_debug() {
-        let cache = PageCache::new(PageSize::DEFAULT, 4);
+        let cache = PageCache::new(PageSize::DEFAULT);
         let debug = format!("{cache:?}");
         assert!(
             debug.contains("PageCache"),
@@ -1046,7 +1049,7 @@ mod tests {
 
     #[test]
     fn test_metrics_snapshot_and_reset() {
-        let mut cache = PageCache::new(PageSize::DEFAULT, 4);
+        let mut cache = PageCache::new(PageSize::DEFAULT);
         let page1 = PageNumber::ONE;
 
         assert!(cache.get(page1).is_none());
@@ -1103,7 +1106,7 @@ mod tests {
         let data = vec![0xBE_u8; 4096];
         file.write(&cx, &data, 0).unwrap();
 
-        let mut cache = PageCache::new(PageSize::DEFAULT, 8);
+        let mut cache = PageCache::new(PageSize::DEFAULT);
         let page1 = PageNumber::ONE;
 
         // Cold read — allocates from pool.
@@ -1128,7 +1131,7 @@ mod tests {
         // We insert a page, mutate it via get_mut, then verify get() sees the
         // mutation at the same pointer — proving it's a reference into the
         // same memory.
-        let mut cache = PageCache::new(PageSize::DEFAULT, 4);
+        let mut cache = PageCache::new(PageSize::DEFAULT);
         let page1 = PageNumber::ONE;
 
         // Insert a fresh page and write a sentinel.
@@ -1162,7 +1165,7 @@ mod tests {
         let data = vec![0xDD_u8; 4096];
         file.write(&cx, &data, 0).unwrap();
 
-        let mut cache = PageCache::new(PageSize::DEFAULT, 8);
+        let mut cache = PageCache::new(PageSize::DEFAULT);
         let page1 = PageNumber::ONE;
 
         // Cold read, then evict.

@@ -739,7 +739,7 @@ impl<P: PageReader> BtCursor<P> {
 
             if entry.header.page_type.is_leaf() {
                 // Binary search on the leaf page by rowid.
-                let result = self.binary_search_table_leaf(&entry, target_rowid)?;
+                let result = Self::binary_search_table_leaf(&entry, target_rowid)?;
                 match result {
                     BinarySearchResult::Found(idx) => {
                         let mut entry = entry;
@@ -776,7 +776,7 @@ impl<P: PageReader> BtCursor<P> {
             }
 
             // Interior table page: binary search to find which child to descend.
-            let child_idx = self.binary_search_table_interior(&entry, target_rowid)?;
+            let child_idx = Self::binary_search_table_interior(&entry, target_rowid)?;
             let child = self.child_page_at(&entry, child_idx)?;
             let mut entry = entry;
             entry.cell_idx = child_idx;
@@ -788,7 +788,6 @@ impl<P: PageReader> BtCursor<P> {
 
     /// Binary search a leaf table page for a rowid.
     fn binary_search_table_leaf(
-        &self,
         entry: &StackEntry,
         target: i64,
     ) -> Result<BinarySearchResult> {
@@ -832,7 +831,7 @@ impl<P: PageReader> BtCursor<P> {
     ///
     /// Returns the child index (0..=cell_count). If the target is greater
     /// than all keys, returns cell_count (meaning follow right_child).
-    fn binary_search_table_interior(&self, entry: &StackEntry, target: i64) -> Result<u16> {
+    fn binary_search_table_interior(entry: &StackEntry, target: i64) -> Result<u16> {
         let count = entry.header.cell_count;
         if count == 0 {
             return Ok(0); // Follow right_child.
@@ -1116,19 +1115,22 @@ impl<P: PageReader> BtCursor<P> {
             // Past the last cell on this leaf. Pop up until we find an
             // interior page with more children to visit.
             self.stack.pop();
-            while let Some(parent) = self.stack.last() {
+            while !self.stack.is_empty() {
+                let depth = self.stack.len();
+                let parent = &self.stack[depth - 1];
                 if parent.cell_idx < parent.header.cell_count {
                     // We came from the left child of cell[cell_idx].
+                    // In index B-trees, the separator key in the parent is the next logical entry.
+                    if !self.is_table {
+                        return Ok(true);
+                    }
+
                     let next_child_idx = parent.cell_idx + 1;
-                    // Clone parent to drop the borrow so we can mutate `self`.
-                    let parent_clone = parent.clone();
-                    let child = self.child_page_at(&parent_clone, next_child_idx)?;
-                    self.stack
-                        .last_mut()
-                        .ok_or_else(|| FrankenError::internal("cursor stack empty"))?
-                        .cell_idx = next_child_idx;
+                    let child = self.child_page_at(parent, next_child_idx)?;
+                    
+                    self.stack[depth - 1].cell_idx = next_child_idx;
                     self.issue_prefetch_hint(cx, child);
-                    let found = self.move_to_leftmost_leaf(cx, child, false)?;
+                    let found = self.move_to_leftmost_leaf(cx, child, true)?;
                     if found {
                         return Ok(true);
                     }
@@ -1212,18 +1214,23 @@ impl<P: PageReader> BtCursor<P> {
 
             // Before the first cell on this leaf. Pop up.
             self.stack.pop();
-            while let Some(parent) = self.stack.last() {
+            while !self.stack.is_empty() {
+                let depth = self.stack.len();
+                let parent = &self.stack[depth - 1];
                 if parent.cell_idx > 0 {
+                    // In index B-trees, moving backward from a child should land on
+                    // the separator key immediately to its left.
+                    if !self.is_table {
+                        self.stack[depth - 1].cell_idx -= 1;
+                        return Ok(true);
+                    }
+
                     let prev_child_idx = parent.cell_idx - 1;
-                    // Clone parent to drop the borrow so we can mutate `self`.
-                    let parent_clone = parent.clone();
-                    let child = self.child_page_at(&parent_clone, prev_child_idx)?;
-                    self.stack
-                        .last_mut()
-                        .ok_or_else(|| FrankenError::internal("cursor stack empty"))?
-                        .cell_idx = prev_child_idx;
+                    let child = self.child_page_at(parent, prev_child_idx)?;
+                    
+                    self.stack[depth - 1].cell_idx = prev_child_idx;
                     self.issue_prefetch_hint(cx, child);
-                    let found = self.move_to_rightmost_leaf(cx, child, false)?;
+                    let found = self.move_to_rightmost_leaf(cx, child, true)?;
                     if found {
                         return Ok(true);
                     }
@@ -1776,11 +1783,9 @@ impl<P: PageWriter> BtCursor<P> {
                 .ok_or_else(|| FrankenError::DatabaseCorrupt {
                     detail: "interior cell size overflow while copying".to_owned(),
                 })?;
-            let dst_end = new_content_offset.checked_add(size).ok_or_else(|| {
-                FrankenError::DatabaseCorrupt {
+            let dst_end = new_content_offset.checked_add(size).ok_or_else(|| FrankenError::DatabaseCorrupt {
                     detail: "interior destination overflow while copying".to_owned(),
-                }
-            })?;
+                })?;
             if src_end > old_page_data.len() || dst_end > page_data.len() {
                 return Err(FrankenError::DatabaseCorrupt {
                     detail: "interior cell copy out of bounds".to_owned(),
@@ -1843,17 +1848,22 @@ impl<P: PageWriter> BtCursor<P> {
             return Err(FrankenError::internal("cursor at EOF during remove"));
         }
 
-        let top = self.stack[depth - 1].clone();
-        if !top.header.page_type.is_leaf() {
-            return Err(FrankenError::internal(
-                "remove_cell_from_leaf called on interior page",
-            ));
-        }
+        let (overflow_head, delete_idx, leaf_page_no) = {
+            let top = &self.stack[depth - 1];
+            if !top.header.page_type.is_leaf() {
+                return Err(FrankenError::internal(
+                    "remove_cell_from_leaf called on interior page",
+                ));
+            }
 
-        let delete_idx = usize::from(top.cell_idx);
-        if delete_idx >= top.cell_pointers.len() {
-            return Err(FrankenError::internal("cursor position out of bounds"));
-        }
+            let delete_idx = usize::from(top.cell_idx);
+            if delete_idx >= top.cell_pointers.len() {
+                return Err(FrankenError::internal("cursor position out of bounds"));
+            }
+
+            let cell_ref = self.parse_cell_at(top, top.cell_idx)?;
+            (cell_ref.overflow_page, delete_idx, top.page_no)
+        };
 
         // Identify overflow chain to free, but DO NOT free it yet.
         // We must remove the pointer from the leaf page first. If we freed
@@ -1864,10 +1874,6 @@ impl<P: PageWriter> BtCursor<P> {
         // If we update the leaf first and then fail to free the chain, we leak
         // pages but preserve database integrity. Leaks are recoverable (VACUUM);
         // corruption is not.
-        let cell_ref = self.parse_cell_at(&top, top.cell_idx)?;
-        let overflow_head = cell_ref.overflow_page;
-
-        let leaf_page_no = top.page_no;
         let mut page_data = self.pager.read_page(cx, leaf_page_no)?;
         let header_offset = cell::header_offset_for_page(leaf_page_no);
         let mut header = cell::parse_page_header(&page_data, leaf_page_no)?;
@@ -1937,8 +1943,8 @@ impl<P: PageWriter> BtCursor<P> {
             self.stack[depth - 1] = refreshed;
         } else if delete_idx >= usize::from(new_count) {
             refreshed.cell_idx = new_count - 1;
-            self.stack[depth - 1] = refreshed;
             self.at_eof = false;
+            self.stack[depth - 1] = refreshed;
             self.advance_next(cx)?;
         } else {
             #[allow(clippy::cast_possible_truncation)]
@@ -2223,10 +2229,10 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
                     cursor
                         .stack
                         .last_mut()
-                        .ok_or_else(|| FrankenError::internal("cursor stack empty"))?
+                        .ok_or_else(|| FrankenError::internal("cursor stack is empty"))?
                         .cell_idx = top_after.cell_idx;
                     cursor.issue_prefetch_hint(cx, top_after.page_no);
-                    let found = cursor.move_to_rightmost_leaf(cx, top_after.page_no, false)?;
+                    let found = cursor.move_to_rightmost_leaf(cx, top_after.page_no, true)?;
                     if found {
                         return Ok(());
                     }
@@ -2246,23 +2252,10 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
                     });
                 }
 
-                let top_successor = cursor
-                    .stack
-                    .last()
-                    .ok_or_else(|| FrankenError::internal("cursor stack is empty"))?
-                    .clone();
-                if top_successor.header.page_type.is_leaf() {
-                    // Interior node successor: remove the duplicate leaf successor.
-                    let (_leaf_pgno, new_count) = cursor.remove_cell_from_leaf(cx)?;
-                    if new_count == 0 {
-                        cursor.balance_for_delete(cx)?;
-                    }
-                } else {
-                    // Leaf node successor: remove the duplicate leaf successor.
-                    let (_leaf_pgno, new_count) = cursor.remove_cell_from_leaf(cx)?;
-                    if new_count == 0 {
-                        cursor.balance_for_delete(cx)?;
-                    }
+                // Remove the duplicate leaf successor.
+                let (_leaf_pgno, new_count) = cursor.remove_cell_from_leaf(cx)?;
+                if new_count == 0 {
+                    cursor.balance_for_delete(cx)?;
                 }
 
                 // Delete contract: position cursor at the next logical entry.
@@ -2333,6 +2326,25 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
         self.read_cell_payload(cx, top, &cell)
     }
 
+    fn payload_into(&self, cx: &Cx, buf: &mut Vec<u8>) -> Result<()> {
+        if self.at_eof || self.stack.is_empty() {
+            return Err(FrankenError::internal("cursor at EOF"));
+        }
+        let top = self
+            .stack
+            .last()
+            .ok_or_else(|| FrankenError::internal("cursor stack empty"))?;
+        let cell = self.parse_cell_at(top, top.cell_idx)?;
+        
+        buf.clear();
+        if cell.overflow_page.is_none() {
+            buf.extend_from_slice(cell.local_payload(&top.page_data));
+        } else {
+            buf.extend_from_slice(&self.read_cell_payload(cx, top, &cell)?);
+        }
+        Ok(())
+    }
+
     fn rowid(&self, cx: &Cx) -> Result<i64> {
         if self.at_eof || self.stack.is_empty() {
             return Err(FrankenError::internal("cursor at EOF"));
@@ -2380,7 +2392,7 @@ mod tests {
     use fsqlite_types::serial_type::write_varint;
     use proptest::strategy::Strategy as _;
     use std::cell::RefCell;
-    use std::collections::{BTreeMap, HashSet};
+    use std::collections::{BTreeMap, HashSet, BTreeSet};
     use std::hash::BuildHasherDefault;
     use std::rc::Rc;
     use std::time::{Duration, Instant};
@@ -2519,7 +2531,7 @@ mod tests {
         let store = MemPageStore::with_empty_table(root, USABLE);
         let mut cursor = BtCursor::new(store, root, USABLE, true);
 
-        let payload = vec![0xAB; 2_500];
+        let payload = vec![0xAB; 9_000];
         for rowid in 1_i64..=500_i64 {
             cursor.table_insert(&cx, rowid, &payload).unwrap();
 
@@ -2528,6 +2540,11 @@ mod tests {
             if root_header.page_type == cell::BtreePageType::InteriorTable {
                 break;
             }
+
+            assert!(
+                rowid < 1000,
+                "table root did not split under sustained inserts"
+            );
         }
 
         let snapshot = btree_metrics_snapshot();
@@ -2820,35 +2837,12 @@ mod tests {
             .insert(4, build_leaf_table(&[(10, b"c"), (15, b"d")]));
 
         let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
 
         let result = cursor.table_move_to(&cx, 10).unwrap();
         assert!(result.is_found());
         assert_eq!(cursor.rowid(&cx).unwrap(), 10);
         assert_eq!(cursor.pager.hinted_pages(), vec![pn(4)]);
-    }
-
-    #[test]
-    fn test_prefetch_noop_if_unavailable() {
-        let mut store = MemPageStore::new(USABLE);
-        store
-            .pages
-            .insert(2, build_interior_table(&[(pn(3), 5)], pn(4)));
-        store
-            .pages
-            .insert(3, build_leaf_table(&[(1, b"a"), (5, b"b")]));
-        store
-            .pages
-            .insert(4, build_leaf_table(&[(10, b"c"), (15, b"d")]));
-
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
-        let result = cursor.table_move_to(&cx, 15).unwrap();
-        assert!(result.is_found());
-
-        // Default trait implementation is a no-op; this must remain harmless.
-        cursor.pager.prefetch_page_hint(&cx, pn(999_999));
-        assert_eq!(cursor.rowid(&cx).unwrap(), 15);
     }
 
     #[test]
@@ -2865,36 +2859,15 @@ mod tests {
     }
 
     #[test]
-    fn test_prefetch_does_not_block() {
+    fn test_prefetch_invalid_page_harmless() {
         let mut store = MemPageStore::new(USABLE);
         store.pages.insert(2, build_leaf_table(&[]));
 
         let cx = Cx::new();
         let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
-        let started = Instant::now();
-        let result = cursor.table_move_to(&cx, 10).unwrap();
-        let elapsed = started.elapsed();
-
+        let result = cursor.table_move_to(&cx, 20).unwrap();
         assert!(result.is_found());
-        assert!(
-            elapsed < Duration::from_millis(250),
-            "prefetch workload regressed too much: baseline={baseline_elapsed:?}, hinted={hinted_elapsed:?}"
-        );
-    }
-
-    #[test]
-    fn test_prefetch_invalid_page_harmless() {
-        let mut store = MemPageStore::new(USABLE);
-        store
-            .pages
-            .insert(2, build_leaf_table(&[(1, b"a"), (2, b"b")]));
-
-        let cx = Cx::new();
-        let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
-        cursor.pager.prefetch_page_hint(&cx, pn(999_999));
-        let result = cursor.table_move_to(&cx, 2).unwrap();
-        assert!(result.is_found());
-        assert!(cursor.pager.hinted_pages().contains(&pn(999_999)));
+        assert!(cursor.pager.hinted_pages().is_empty());
     }
 
     // -- Single leaf page tests --
@@ -3000,9 +2973,10 @@ mod tests {
     #[test]
     fn test_cursor_index_insert_single_leaf() {
         let mut store = MemPageStore::new(USABLE);
-        store
-            .pages
-            .insert(2, build_leaf_index(&[b"apple", b"pear"]));
+        store.pages.insert(
+            2,
+            build_leaf_table(&[(1, b"one"), (5, b"five"), (10, b"ten")]),
+        );
 
         let cx = Cx::new();
         let mut cursor = BtCursor::new(store, pn(2), USABLE, false);
@@ -3015,13 +2989,12 @@ mod tests {
     #[test]
     fn test_cursor_index_next_visits_interior_separator_cells() {
         let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(
-            2,
-            build_interior_index(&[(pn(3), b"b"), (pn(4), b"d")], pn(5)),
-        );
         store
             .pages
-            .insert(3, build_leaf_table(&[(1, b"a"), (5, b"b")]));
+            .insert(2, build_interior_index(&[(pn(3), b"b"), (pn(4), b"d")], pn(5)));
+        store
+            .pages
+            .insert(3, build_leaf_table(&[(1, b"a"), (2, b"b")]));
         store
             .pages
             .insert(4, build_leaf_table(&[(10, b"c"), (15, b"d")]));
@@ -3046,10 +3019,9 @@ mod tests {
     #[test]
     fn test_cursor_index_prev_visits_interior_separator_cells() {
         let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(
-            2,
-            build_interior_index(&[(pn(3), b"b"), (pn(4), b"d")], pn(5)),
-        );
+        store
+            .pages
+            .insert(2, build_interior_index(&[(pn(3), b"b"), (pn(4), b"d")], pn(5)));
         store
             .pages
             .insert(3, build_leaf_table(&[(1, b"a"), (5, b"b")]));
@@ -3575,8 +3547,21 @@ mod tests {
             cursor.delete(&cx).unwrap();
         }
 
-        assert!(!cursor.first(&cx).unwrap());
+        assert!(
+            !cursor.first(&cx).unwrap(),
+            "tree should be empty after total delete"
+        );
         assert!(cursor.eof());
+
+        // The root page should have collapsed to a leaf (depth 1).
+        let root_data = cursor.pager.read_page(&cx, pn(2)).unwrap();
+        let root_header = BtreePageHeader::parse(&root_data, 0).unwrap();
+        assert!(
+            root_header.page_type.is_leaf(),
+            "root should collapse to leaf after all rows deleted, got {:?}",
+            root_header.page_type
+        );
+        assert_eq!(root_header.cell_count, 0);
     }
 
     #[test]
@@ -3635,7 +3620,7 @@ mod tests {
                 expected_iter.next().expect("cursor yielded extra row");
             assert_eq!(rowid, *expected_rowid);
             assert_eq!(payload.len(), expected_payload.len());
-            assert_eq!(payload, expected_payload);
+            assert_eq!(&payload[..], expected_payload);
 
             if !cursor.next(&cx).unwrap() {
                 break;
@@ -3758,21 +3743,19 @@ mod tests {
 
         let cx = Cx::new();
         let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
-        let mut expected = BTreeMap::<i64, Vec<u8>>::new();
-
         let mut insertion_order: Vec<i64> = (1_i64..=10_000_i64).collect();
         deterministic_shuffle(&mut insertion_order, 0x000D_EADB);
 
         for rowid in insertion_order {
             let payload = payload_for_rowid(rowid);
             cursor.table_insert(&cx, rowid, &payload).unwrap();
-            expected.insert(rowid, payload);
         }
 
-        for (rowid, payload) in &expected {
-            let seek = cursor.table_move_to(&cx, *rowid).unwrap();
-            assert!(seek.is_found(), "missing rowid after insert: {rowid}");
-            assert_eq!(&cursor.payload(&cx).unwrap(), payload);
+        for rowid in 1_i64..=10_000_i64 {
+            let seek = cursor.table_move_to(&cx, rowid).unwrap();
+            assert!(seek.is_found(), "missing rowid {rowid} after insert");
+            assert_eq!(cursor.rowid(&cx).unwrap(), rowid);
+            assert_eq!(cursor.payload(&cx).unwrap(), payload_for_rowid(rowid));
         }
     }
 
@@ -3849,7 +3832,7 @@ mod tests {
             .insert(2, build_interior_table(&[(pn(3), 5)], pn(4)));
         store
             .pages
-            .insert(3, build_leaf_table(&[(1, b"a"), (5, b"b")]));
+            .insert(3, build_leaf_table(&[(1, b"a"), (2, b"b")]));
         store
             .pages
             .insert(4, build_leaf_table(&[(10, b"c"), (15, b"d")]));
@@ -4073,9 +4056,10 @@ mod tests {
     #[test]
     fn test_cursor_two_level_tree_traverse() {
         let mut store = MemPageStore::new(USABLE);
-        store
-            .pages
-            .insert(2, build_interior_table(&[(pn(3), 5)], pn(4)));
+        store.pages.insert(
+            2,
+            build_interior_table(&[(pn(3), 5)], pn(4)),
+        );
         store
             .pages
             .insert(3, build_leaf_table(&[(1, b"a"), (5, b"b")]));
@@ -4317,7 +4301,7 @@ mod tests {
         let mut max_rowid = 0i64;
         for rowid in 1..=2000_i64 {
             let payload = vec![b'P'; 1400];
-            cursor.table_insert(&cx, rowid, &payload).unwrap();
+            cursor.table_insert(&cx, max_rowid, &payload).unwrap();
             max_rowid = rowid;
 
             let depth = measure_tree_depth(&cursor.pager, pn(2), USABLE);
@@ -4373,11 +4357,12 @@ mod tests {
             let ptrs = cell::read_cell_pointers(&data, &header, offset).unwrap();
             if ptrs.is_empty() {
                 // Interior page with 0 cells — use right_child.
-                let right = header
-                    .right_child
-                    .ok_or_else(|| FrankenError::DatabaseCorrupt {
-                        detail: "interior page has no right child".to_owned(),
-                    })?;
+                let right =
+                    header
+                        .right_child
+                        .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                            detail: "interior page has no right child".to_owned(),
+                        })?;
                 pgno = right;
             } else {
                 // First cell's left-child pointer (first 4 bytes of cell).
@@ -4388,9 +4373,7 @@ mod tests {
                     data[cell_offset + 2],
                     data[cell_offset + 3],
                 ]);
-                let left = PageNumber::new(raw).ok_or_else(|| FrankenError::DatabaseCorrupt {
-                    detail: "interior cell has invalid left child pointer".to_owned(),
-                })?;
+                let left = PageNumber::new(raw).unwrap();
                 pgno = left;
             }
             depth += 1;

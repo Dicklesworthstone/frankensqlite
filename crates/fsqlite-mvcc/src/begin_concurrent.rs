@@ -231,15 +231,27 @@ impl ActiveTxnView for ConcurrentHandle {
     }
 
     fn check_read_overlap(&self, key: &WitnessKey) -> bool {
-        self.read_witness_keys()
-            .iter()
-            .any(|read_key| witness_keys_overlap(read_key, key))
+        // We know read_set contains ONLY Page(p) witnesses.
+        // Therefore, we can bypass the O(N) allocation of read_witness_keys()
+        // and check overlap directly using hash set lookups.
+        match key {
+            WitnessKey::Page(p)
+            | WitnessKey::Cell { btree_root: p, .. }
+            | WitnessKey::ByteRange { page: p, .. }
+            | WitnessKey::KeyRange { btree_root: p, .. } => self.read_set.contains(p),
+            WitnessKey::Custom { .. } => !self.read_set.is_empty(), // Conservative fallback
+        }
     }
 
     fn check_write_overlap(&self, key: &WitnessKey) -> bool {
-        self.write_witness_keys()
-            .iter()
-            .any(|write_key| witness_keys_overlap(write_key, key))
+        // We know write_set contains ONLY Page(p) witnesses.
+        match key {
+            WitnessKey::Page(p)
+            | WitnessKey::Cell { btree_root: p, .. }
+            | WitnessKey::ByteRange { page: p, .. }
+            | WitnessKey::KeyRange { btree_root: p, .. } => self.write_set.contains_key(p),
+            WitnessKey::Custom { .. } => !self.write_set.is_empty(), // Conservative fallback
+        }
     }
 
     fn has_in_rw(&self) -> bool {
@@ -644,15 +656,23 @@ impl ActiveTxnView for HandleView<'_> {
     }
 
     fn check_read_overlap(&self, key: &WitnessKey) -> bool {
-        self.read_keys
-            .iter()
-            .any(|read_key| witness_keys_overlap(read_key, key))
+        match key {
+            WitnessKey::Page(p)
+            | WitnessKey::Cell { btree_root: p, .. }
+            | WitnessKey::ByteRange { page: p, .. }
+            | WitnessKey::KeyRange { btree_root: p, .. } => self.handle.read_set.contains(p),
+            WitnessKey::Custom { .. } => !self.handle.read_set.is_empty(), // Conservative fallback
+        }
     }
 
     fn check_write_overlap(&self, key: &WitnessKey) -> bool {
-        self.write_keys
-            .iter()
-            .any(|write_key| witness_keys_overlap(write_key, key))
+        match key {
+            WitnessKey::Page(p)
+            | WitnessKey::Cell { btree_root: p, .. }
+            | WitnessKey::ByteRange { page: p, .. }
+            | WitnessKey::KeyRange { btree_root: p, .. } => self.handle.write_set.contains_key(p),
+            WitnessKey::Custom { .. } => !self.handle.write_set.is_empty(), // Conservative fallback
+        }
     }
 
     fn has_in_rw(&self) -> bool {

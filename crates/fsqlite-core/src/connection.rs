@@ -2882,8 +2882,12 @@ impl Connection {
         };
         let trace_id = next_trace_id();
         let decision_id = next_decision_id();
-        let statement_sql = statement.to_string();
         let trace_registration = self.trace_registration.borrow().clone();
+        let statement_sql = if trace_registration.is_some() || precompiled.is_none() {
+            statement.to_string()
+        } else {
+            String::new()
+        };
         let statement_span = tracing::span!(
             target: "fsqlite.statement",
             tracing::Level::DEBUG,
@@ -2894,12 +2898,14 @@ impl Connection {
         );
         record_trace_span_created();
         let _statement_guard = statement_span.enter();
-        emit_compat_trace_event(
-            trace_registration.as_ref(),
-            TraceEvent::Statement {
-                sql: statement_sql.clone(),
-            },
-        );
+        if trace_registration.is_some() {
+            emit_compat_trace_event(
+                trace_registration.as_ref(),
+                TraceEvent::Statement {
+                    sql: statement_sql.clone(),
+                },
+            );
+        }
         let execution_started = fsqlite_types::sync_primitives::Instant::now();
         let statement = {
             let parse_span = tracing::span!(

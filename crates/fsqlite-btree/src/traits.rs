@@ -150,6 +150,10 @@ pub trait BtreeCursorOps: sealed::Sealed {
     /// B-trees, this is the key bytes.
     fn payload(&self, cx: &Cx) -> Result<Vec<u8>>;
 
+    /// Read the payload at the current cursor position into the provided buffer,
+    /// clearing it first. This avoids allocations when repeatedly reading payloads.
+    fn payload_into(&self, cx: &Cx, buf: &mut Vec<u8>) -> Result<()>;
+
     /// Read the rowid at the current cursor position.
     ///
     /// For table B-trees this is the integer key. For index B-trees this is
@@ -349,6 +353,15 @@ impl BtreeCursorOps for MockBtreeCursor {
             return Err(fsqlite_error::FrankenError::internal("cursor at EOF"));
         }
         Ok(self.entries[self.pos].1.clone())
+    }
+
+    fn payload_into(&self, _cx: &Cx, buf: &mut Vec<u8>) -> Result<()> {
+        if self.at_eof {
+            return Err(fsqlite_error::FrankenError::internal("cursor at EOF"));
+        }
+        buf.clear();
+        buf.extend_from_slice(&self.entries[self.pos].1);
+        Ok(())
     }
 
     fn rowid(&self, _cx: &Cx) -> Result<i64> {

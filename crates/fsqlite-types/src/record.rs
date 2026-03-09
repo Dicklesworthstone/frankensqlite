@@ -70,6 +70,51 @@ pub fn parse_record_into(data: &[u8], values: &mut Vec<SqliteValue>) -> Option<(
     Some(())
 }
 
+/// Parse a single column from a serialized record, avoiding allocating for other columns.
+///
+/// Returns `None` if the record is malformed or if `col_idx` is out of bounds.
+#[allow(clippy::cast_possible_truncation)]
+pub fn parse_record_column(data: &[u8], col_idx: usize) -> Option<SqliteValue> {
+    if data.is_empty() {
+        return None;
+    }
+
+    // Read the header size.
+    let (header_size_u64, hdr_varint_len) = read_varint(data)?;
+    let header_size = usize::try_from(header_size_u64).unwrap_or(usize::MAX);
+
+    if header_size > data.len() || header_size < hdr_varint_len {
+        return None;
+    }
+
+    let mut offset = hdr_varint_len;
+    let mut body_offset = header_size;
+    let mut current_idx = 0;
+
+    while offset < header_size {
+        let (serial_type, consumed) = read_varint(&data[offset..header_size])?;
+        offset += consumed;
+
+        let value_len_u64 = serial_type_len(serial_type)?;
+        let value_len = usize::try_from(value_len_u64).unwrap_or(usize::MAX);
+        let end = body_offset.checked_add(value_len)?;
+
+        if end > data.len() {
+            return None;
+        }
+
+        if current_idx == col_idx {
+            let value_bytes = &data[body_offset..end];
+            return decode_value(serial_type, value_bytes);
+        }
+
+        body_offset = end;
+        current_idx += 1;
+    }
+
+    None
+}
+
 /// Serialize a list of `SqliteValue` into the SQLite record format.
 pub fn serialize_record(values: &[SqliteValue]) -> Vec<u8> {
     serialize_record_iter(values.iter())
@@ -81,7 +126,7 @@ pub fn serialize_record_refs(values: &[&SqliteValue]) -> Vec<u8> {
 }
 
 /// Core serialization logic using a zero-allocation, multi-pass iterator.
-fn serialize_record_iter<'a, I>(values: I) -> Vec<u8>
+pub fn serialize_record_iter<'a, I>(values: I) -> Vec<u8>
 where
     I: Iterator<Item = &'a SqliteValue> + Clone,
 {

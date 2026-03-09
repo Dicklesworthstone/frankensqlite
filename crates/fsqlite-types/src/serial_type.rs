@@ -136,13 +136,19 @@ pub const SMALL_TYPE_SIZES: [u8; 128] = {
 ///
 /// SQLite varints are 1-9 bytes. The high bit of each byte indicates whether
 /// more bytes follow (except the 9th byte which uses all 8 bits).
+#[inline]
 pub fn read_varint(buf: &[u8]) -> Option<(u64, usize)> {
     if buf.is_empty() {
         return None;
     }
 
-    let mut value: u64 = 0;
-    for (i, &byte) in buf.iter().enumerate().take(8) {
+    let first = buf[0];
+    if first < 0x80 {
+        return Some((u64::from(first), 1));
+    }
+
+    let mut value: u64 = u64::from(first & 0x7F);
+    for (i, &byte) in buf.iter().enumerate().skip(1).take(7) {
         if byte & 0x80 == 0 {
             value = (value << 7) | u64::from(byte);
             return Some((value, i + 1));
@@ -153,10 +159,10 @@ pub fn read_varint(buf: &[u8]) -> Option<(u64, usize)> {
     // 9th byte (if present) uses all 8 bits
     if buf.len() > 8 {
         value = (value << 8) | u64::from(buf[8]);
-        Some((value, 9))
-    } else {
-        None
+        return Some((value, 9));
     }
+
+    None
 }
 
 /// Compute the number of bytes needed to encode a value as a varint.

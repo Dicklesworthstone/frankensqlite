@@ -1284,9 +1284,9 @@ mod tests {
         assert!(matches!(variants[4], P4::Str(_)));
         assert!(matches!(variants[5], P4::Blob(_)));
         assert!(matches!(variants[6], P4::Collation(_)));
-        assert!(matches!(variants[7], P4::FuncName(_)));
-        assert!(matches!(variants[8], P4::Table(_)));
-        assert!(matches!(variants[9], P4::Affinity(_)));
+        assert!(matches!(variants[7], P4::FuncName(ref s) if s == "count"));
+        assert!(matches!(variants[8], P4::Table(ref s) if s == "users"));
+        assert!(matches!(variants[9], P4::Affinity(ref s) if s == "ddd"));
     }
 
     // ── test_label_emit_and_resolve ─────────────────────────────────────
@@ -1829,7 +1829,7 @@ mod tests {
     #[test]
     fn test_pragma_raptorq_repair_symbols_default_query() {
         let mut mgr = TransactionManager::new(PageSize::DEFAULT);
-        let query = parse_pragma("PRAGMA raptorq_repair_symbols").expect("parse pragma");
+        let query = parse_pragma("PRAGMA raptorq_repair_symbols").expect("parse query");
         assert_eq!(
             pragma::apply(&mut mgr, &query).expect("query pragma"),
             pragma::PragmaOutput::Int(i64::from(DEFAULT_RAPTORQ_REPAIR_SYMBOLS))

@@ -174,7 +174,7 @@ where
         }
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn capacity(&self) -> usize {
         self.inner.capacity()
     }

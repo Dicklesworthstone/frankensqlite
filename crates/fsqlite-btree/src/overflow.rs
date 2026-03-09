@@ -42,6 +42,31 @@ pub fn read_overflow_chain<F>(
 where
     F: FnMut(PageNumber) -> Result<Vec<u8>>,
 {
+    let mut payload = Vec::new();
+    read_overflow_chain_into(
+        local_data,
+        first_overflow,
+        total_payload_size,
+        usable_size,
+        read_page,
+        &mut payload,
+    )?;
+    Ok(payload)
+}
+
+/// Read a complete payload into an existing buffer.
+pub fn read_overflow_chain_into<F>(
+    local_data: &[u8],
+    first_overflow: PageNumber,
+    total_payload_size: u32,
+    usable_size: u32,
+    read_page: &mut F,
+    out: &mut Vec<u8>,
+) -> Result<()>
+where
+    F: FnMut(PageNumber) -> Result<Vec<u8>>,
+{
+    out.clear();
     if total_payload_size > MAX_ALLOCATION_SIZE {
         return Err(FrankenError::TooBig);
     }
@@ -53,86 +78,53 @@ where
             ),
         });
     }
-    let total = total_payload_size as usize;
-    let mut payload = Vec::with_capacity(total);
-    payload.extend_from_slice(local_data);
 
+    #[allow(clippy::cast_possible_truncation)]
+    let total_size = total_payload_size as usize;
+
+    out.reserve(total_size);
+    out.extend_from_slice(local_data);
+
+    let mut current_page = first_overflow;
+    let mut bytes_remaining = total_size.saturating_sub(local_data.len());
     let bytes_per_overflow = (usable_size - 4) as usize;
-    let mut next_pgno = Some(first_overflow);
-    let mut previous_pgno: Option<PageNumber> = None;
-    let mut pages_read = 0usize;
 
-    while payload.len() < total {
-        let Some(pgno) = next_pgno else {
-            warn!(
-                expected_bytes = total,
-                got_bytes = payload.len(),
-                last_page = previous_pgno.map(PageNumber::get),
-                "overflow chain corruption detected: chain ended prematurely"
-            );
-            return Err(FrankenError::DatabaseCorrupt {
-                detail: format!(
-                    "overflow chain ended prematurely: got {} of {} bytes",
-                    payload.len(),
-                    total
-                ),
-            });
-        };
-
-        pages_read += 1;
-        if pages_read > MAX_OVERFLOW_CHAIN {
-            warn!(
-                page = pgno.get(),
-                max_pages = MAX_OVERFLOW_CHAIN,
-                "overflow chain corruption detected: chain length exceeds safety bound"
-            );
-            return Err(FrankenError::DatabaseCorrupt {
-                detail: format!(
-                    "overflow chain exceeds {} pages (possible cycle)",
-                    MAX_OVERFLOW_CHAIN
-                ),
-            });
-        }
-
-        let page_data = match read_page(pgno) {
-            Ok(page_data) => page_data,
-            Err(error) => {
-                warn!(
-                    page = pgno.get(),
-                    error = %error,
-                    "overflow chain corruption detected: failed to read overflow page"
-                );
-                return Err(error);
-            }
-        };
+    while bytes_remaining > 0 {
+        let page_data = read_page(current_page)?;
         if page_data.len() < 4 {
-            warn!(
-                page = pgno.get(),
-                page_len = page_data.len(),
-                "overflow chain corruption detected: page too small"
-            );
             return Err(FrankenError::DatabaseCorrupt {
-                detail: format!(
-                    "overflow page {} is too small: {} bytes",
-                    pgno,
-                    page_data.len()
-                ),
+                detail: "overflow page too small".to_owned(),
             });
         }
 
-        // First 4 bytes: next overflow page number (0 = end of chain).
         let next_raw = u32::from_be_bytes([page_data[0], page_data[1], page_data[2], page_data[3]]);
-        next_pgno = PageNumber::new(next_raw);
-        previous_pgno = Some(pgno);
 
-        // Remaining bytes: overflow payload data.
-        let remaining_needed = total - payload.len();
         let available = page_data.len().saturating_sub(4).min(bytes_per_overflow);
-        let to_copy = remaining_needed.min(available);
-        payload.extend_from_slice(&page_data[4..4 + to_copy]);
+        let to_read = bytes_remaining.min(available);
+
+        out.extend_from_slice(&page_data[4..4 + to_read]);
+        bytes_remaining -= to_read;
+
+        if bytes_remaining > 0 {
+            current_page = PageNumber::new(next_raw).ok_or_else(|| {
+                FrankenError::DatabaseCorrupt {
+                    detail: "unexpected end of overflow chain".to_owned(),
+                }
+            })?;
+        }
     }
 
-    Ok(payload)
+    if out.len() != total_size {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "read overflow chain size mismatch: expected {}, got {}",
+                total_size,
+                out.len()
+            ),
+        });
+    }
+
+    Ok(())
 }
 
 /// Write a payload to an overflow chain, allocating pages as needed.

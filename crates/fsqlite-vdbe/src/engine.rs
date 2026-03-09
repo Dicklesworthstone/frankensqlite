@@ -1133,6 +1133,14 @@ impl CursorBackend {
         }
     }
 
+    fn payload_into(&self, cx: &Cx, buf: &mut Vec<u8>) -> Result<()> {
+        match self {
+            Self::Mem(c) => c.payload_into(cx, buf),
+            Self::Txn(c) => c.payload_into(cx, buf),
+            Self::TimeTravel(c) => c.payload_into(cx, buf),
+        }
+    }
+
     fn table_move_to(&mut self, cx: &Cx, rowid: i64) -> Result<SeekResult> {
         match self {
             Self::Mem(c) => c.table_move_to(cx, rowid),
@@ -1226,8 +1234,8 @@ struct StorageCursor {
     /// Ensures consecutive allocations return unique values even when
     /// no Insert has been issued between them.
     last_alloc_rowid: i64,
-    /// Cache for the decoded row payload to optimize OP_Column.
-    cached_row: Option<(Vec<u8>, Vec<SqliteValue>)>,
+    /// Pre-allocated buffer to read payloads into without allocating.
+    payload_buf: Vec<u8>,
 }
 
 /// Lightweight version token for `MemDatabase` undo/rollback (bd-g6eo).
@@ -3076,7 +3084,7 @@ impl VdbeEngine {
                             cx: old_sc.cx,
                             writable: false, // Time-travel is always read-only
                             last_alloc_rowid: 0,
-                            cached_row: None,
+                            payload_buf: Vec::new(),
                         },
                     );
                     tracing::info!(
@@ -3342,17 +3350,18 @@ impl VdbeEngine {
 
                 Opcode::Cast => {
                     // Cast register p1 to type indicated by p2.
-                    let val = self.get_reg(op.p1).clone();
+                    let val = self.take_reg(op.p1);
                     let casted = sql_cast(val, op.p2);
                     self.set_reg(op.p1, casted);
                     pc += 1;
                 }
 
                 Opcode::MustBeInt => {
-                    let val = self.get_reg(op.p1).clone();
+                    let val = self.take_reg(op.p1);
                     let coerced = val.apply_affinity(fsqlite_types::TypeAffinity::Integer);
-                    if coerced.as_integer().is_some() {
-                        self.set_reg(op.p1, coerced);
+                    let is_int = coerced.as_integer().is_some();
+                    self.set_reg(op.p1, coerced);
+                    if is_int {
                         pc += 1;
                     } else {
                         if op.p2 > 0 {
@@ -3688,7 +3697,7 @@ impl VdbeEngine {
                                 cx,
                                 writable: true,
                                 last_alloc_rowid: 0,
-                                cached_row: None,
+                                payload_buf: Vec::new(),
                             },
                         );
                     }
@@ -4105,7 +4114,7 @@ impl VdbeEngine {
                     let cursor_id = op.p1;
                     // Seek repositions the cursor, so clear any pending delete state.
                     self.pending_next_after_delete.remove(&cursor_id);
-                    let key_val = self.get_reg(op.p3).clone();
+                    let key_val = self.get_reg(op.p3);
                     if key_val.is_null() {
                         pc = op.p2 as usize;
                         continue;
@@ -4173,6 +4182,9 @@ impl VdbeEngine {
                             let seek_result =
                                 cursor.cursor.index_move_to(&cursor.cx, &key_bytes)?;
 
+                            let mut target_vals_buf = Vec::new();
+                            let mut cur_vals_buf = Vec::new();
+
                             match op.opcode {
                                 Opcode::SeekGE => !cursor.cursor.eof(),
                                 Opcode::SeekGT => {
@@ -4180,27 +4192,25 @@ impl VdbeEngine {
                                         cursor.cursor.next(&cursor.cx)?;
                                     }
                                     if !cursor.cursor.eof() {
-                                        let target_vals =
-                                            parse_record(&key_bytes).ok_or_else(|| {
-                                                FrankenError::internal(
-                                                    "SeekGT: malformed seek key record",
-                                                )
-                                            })?;
+                                        fsqlite_types::record::parse_record_into(&key_bytes, &mut target_vals_buf).ok_or_else(|| {
+                                            FrankenError::internal(
+                                                "SeekGT: malformed seek key record",
+                                            )
+                                        })?;
                                         loop {
                                             if cursor.cursor.eof() {
                                                 break;
                                             }
                                             let payload = cursor.cursor.payload(&cursor.cx)?;
-                                            let cur_vals =
-                                                parse_record(&payload).ok_or_else(|| {
-                                                    FrankenError::internal(
-                                                        "SeekGT: malformed cursor record",
-                                                    )
-                                                })?;
+                                            fsqlite_types::record::parse_record_into(&payload, &mut cur_vals_buf).ok_or_else(|| {
+                                                FrankenError::internal(
+                                                    "SeekGT: malformed cursor record",
+                                                )
+                                            })?;
                                             let cmp = compare_sorter_keys(
-                                                &cur_vals,
-                                                &target_vals,
-                                                target_vals.len(),
+                                                &cur_vals_buf,
+                                                &target_vals_buf,
+                                                target_vals_buf.len(),
                                                 &[],
                                             );
                                             if cmp == std::cmp::Ordering::Equal {
@@ -4214,27 +4224,25 @@ impl VdbeEngine {
                                 }
                                 Opcode::SeekLE => {
                                     if !cursor.cursor.eof() {
-                                        let target_vals =
-                                            parse_record(&key_bytes).ok_or_else(|| {
-                                                FrankenError::internal(
-                                                    "SeekLE: malformed seek key record",
-                                                )
-                                            })?;
+                                        fsqlite_types::record::parse_record_into(&key_bytes, &mut target_vals_buf).ok_or_else(|| {
+                                            FrankenError::internal(
+                                                "SeekLE: malformed seek key record",
+                                            )
+                                        })?;
                                         loop {
                                             if cursor.cursor.eof() {
                                                 break;
                                             }
                                             let payload = cursor.cursor.payload(&cursor.cx)?;
-                                            let cur_vals =
-                                                parse_record(&payload).ok_or_else(|| {
-                                                    FrankenError::internal(
-                                                        "SeekLE: malformed cursor record",
-                                                    )
-                                                })?;
+                                            fsqlite_types::record::parse_record_into(&payload, &mut cur_vals_buf).ok_or_else(|| {
+                                                FrankenError::internal(
+                                                    "SeekLE: malformed cursor record",
+                                                )
+                                            })?;
                                             let cmp = compare_sorter_keys(
-                                                &cur_vals,
-                                                &target_vals,
-                                                target_vals.len(),
+                                                &cur_vals_buf,
+                                                &target_vals_buf,
+                                                target_vals_buf.len(),
                                                 &[],
                                             );
                                             if cmp == std::cmp::Ordering::Equal {
@@ -4768,7 +4776,7 @@ impl VdbeEngine {
                     #[allow(clippy::cast_possible_truncation)]
                     let oe_flag = ((op.p5 >> 1) & 0x0F) as u8;
                     let n_idx_cols = op.p3 as usize;
-                    let key_val = self.get_reg(key_reg).clone();
+                    let key_val = self.get_reg(key_reg);
 
                     // If a previous IdxInsert for the same row triggered IGNORE,
                     // skip all remaining index inserts for this row.
@@ -4779,18 +4787,18 @@ impl VdbeEngine {
 
                     if let Some(sc) = self.storage_cursors.get_mut(&cursor_id) {
                         if sc.writable {
-                            let key_bytes = record_blob_bytes(&key_val);
+                            let key_bytes = record_blob_bytes(key_val);
 
                             if is_unique && n_idx_cols > 0 {
                                 let columns_label = match &op.p4 {
-                                    P4::Table(s) => s.clone(),
-                                    _ => String::new(),
+                                    P4::Table(s) => s.as_str(),
+                                    _ => "",
                                 };
                                 match sc.cursor.index_insert_unique(
                                     &sc.cx,
-                                    &key_bytes,
+                                    key_bytes,
                                     n_idx_cols,
-                                    &columns_label,
+                                    columns_label,
                                 ) {
                                     Ok(()) => {
                                         self.pending_idx_entries
@@ -4903,7 +4911,7 @@ impl VdbeEngine {
                                             // (ABORT/FAIL/ROLLBACK).
                                             _ => {
                                                 return Err(FrankenError::UniqueViolation {
-                                                    columns: columns_label,
+                                                    columns: columns_label.to_owned(),
                                                 });
                                             }
                                         }
@@ -4924,10 +4932,10 @@ impl VdbeEngine {
 
                 Opcode::SorterInsert => {
                     let cursor_id = op.p1;
-                    let record = self.get_reg(op.p2).clone();
+                    let record = self.get_reg(op.p2);
                     if let Some(sorter) = self.sorters.get_mut(&cursor_id) {
-                        let decoded = decode_record(&record)?;
-                        let blob = record_blob_bytes(&record).to_vec();
+                        let decoded = decode_record(record)?;
+                        let blob = record_blob_bytes(record).to_vec();
                         sorter.insert_row(decoded, blob)?;
                     }
                     pc += 1;
@@ -5036,9 +5044,29 @@ impl VdbeEngine {
                 Opcode::MakeRecord => {
                     // Build a record from registers p1..p1+p2-1 into register p3.
                     let target = op.p3;
-                    let values =
-                        self.collect_reg_range_refs(op.p1, usize::try_from(op.p2).unwrap_or(0));
-                    let blob = encode_record_refs(&values);
+                    let n_cols = usize::try_from(op.p2).unwrap_or(0);
+                    let blob = if let P4::Affinity(aff) = &op.p4 {
+                        // Skip columns marked with 'X' (IPK columns).
+                        let this = &*self;
+                        let iter = aff.chars().enumerate().filter_map(move |(i, ch)| {
+                            if ch == 'X' {
+                                None
+                            } else {
+                                #[allow(clippy::cast_possible_wrap)]
+                                let reg = op.p1 + i as i32;
+                                Some(this.get_reg(reg))
+                            }
+                        });
+                        fsqlite_types::record::serialize_record_iter(iter)
+                    } else {
+                        let this = &*self;
+                        let iter = (0..n_cols).map(move |i| {
+                            #[allow(clippy::cast_possible_wrap)]
+                            let reg = op.p1 + i as i32;
+                            this.get_reg(reg)
+                        });
+                        fsqlite_types::record::serialize_record_iter(iter)
+                    };
                     self.set_reg(target, SqliteValue::Blob(blob));
                     pc += 1;
                 }
@@ -5051,7 +5079,7 @@ impl VdbeEngine {
                         for (i, ch) in aff.chars().enumerate() {
                             #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
                             let reg = start + i as i32;
-                            let val = self.get_reg(reg).clone();
+                            let val = self.take_reg(reg);
                             let affinity = char_to_affinity(ch);
                             self.set_reg(reg, val.apply_affinity(affinity));
                         }
@@ -5454,8 +5482,8 @@ impl VdbeEngine {
                 // (0 means use all columns from the probe).
                 Opcode::IdxLE | Opcode::IdxGT | Opcode::IdxLT | Opcode::IdxGE => {
                     let cursor_id = op.p1;
-                    let probe_val = self.get_reg(op.p3).clone();
-                    let probe_fields = decode_record(&probe_val)?;
+                    let probe_val = self.get_reg(op.p3);
+                    let probe_fields = decode_record(probe_val)?;
 
                     // Extract current cursor key as parsed fields.
                     let cursor_fields = if let Some(sc) = self.storage_cursors.get(&cursor_id) {
@@ -6556,29 +6584,26 @@ impl VdbeEngine {
             if cursor.cursor.eof() {
                 return Ok(SqliteValue::Null);
             }
-            let payload = cursor.cursor.payload(&cursor.cx)?;
+            cursor.cursor.payload_into(&cursor.cx, &mut cursor.payload_buf)?;
 
-            let values = if let Some((cached_payload, cached_values)) = &cursor.cached_row {
-                if cached_payload == &payload {
-                    Some(cached_values)
+            let ipk_col_idx = None;
+            let payload_idx = if let Some(ipk) = ipk_col_idx {
+                if col_idx == ipk {
+                    return self.cursor_rowid(cursor_id);
+                }
+                if col_idx > ipk {
+                    col_idx - 1
                 } else {
-                    None
+                    col_idx
                 }
             } else {
-                None
+                col_idx
             };
 
-            let decoded = if let Some(vals) = values {
-                vals
-            } else {
-                let new_values = parse_record(&payload)
-                    .ok_or_else(|| FrankenError::internal("malformed SQLite record blob"))?;
-                cursor.cached_row = Some((payload, new_values));
-                &cursor.cached_row.as_ref().unwrap().1
-            };
-
-            if col_idx < decoded.len() {
-                return Ok(decoded[col_idx].clone());
+            if let Some(val) =
+                fsqlite_types::record::parse_record_column(&cursor.payload_buf, payload_idx)
+            {
+                return Ok(val);
             }
             // Column beyond record width — check ALTER TABLE ADD COLUMN defaults.
             if let Some(&root_page) = self.cursor_root_pages.get(&cursor_id) {
@@ -6784,7 +6809,7 @@ impl VdbeEngine {
                         cx: txn_cx,
                         writable,
                         last_alloc_rowid: 0,
-                        cached_row: None,
+                        payload_buf: Vec::new(),
                     },
                 );
                 tracing::debug!(
@@ -6855,7 +6880,7 @@ impl VdbeEngine {
                         cx: txn_cx,
                         writable,
                         last_alloc_rowid: 0,
-                        cached_row: None,
+                        payload_buf: Vec::new(),
                     },
                 );
                 tracing::debug!(
@@ -6957,7 +6982,7 @@ impl VdbeEngine {
                 cx,
                 writable,
                 last_alloc_rowid: 0,
-                cached_row: None,
+                payload_buf: Vec::new(),
             },
         );
         tracing::debug!(
@@ -7172,8 +7197,11 @@ fn find_conflicting_rowid_in_index(
     // Re-seek to the position where the conflicting entry should be.
     sc.cursor.index_move_to(&sc.cx, key_bytes)?;
 
+    let mut new_fields_buf = Vec::new();
+    let mut entry_fields_buf = Vec::new();
+
     // The new key we're trying to insert — parse its prefix for comparison.
-    let new_fields = parse_record(key_bytes)
+    fsqlite_types::record::parse_record_into(key_bytes, &mut new_fields_buf)
         .ok_or_else(|| FrankenError::internal("find_conflicting_rowid: malformed new index key"))?;
 
     // Check the entry at current position and previous entry for a prefix match.
@@ -7188,7 +7216,7 @@ fn find_conflicting_rowid_in_index(
         }
 
         let entry_bytes = sc.cursor.payload(&sc.cx)?;
-        let entry_fields = parse_record(&entry_bytes).ok_or_else(|| {
+        fsqlite_types::record::parse_record_into(&entry_bytes, &mut entry_fields_buf).ok_or_else(|| {
             FrankenError::internal("find_conflicting_rowid: malformed index entry record")
         })?;
 
@@ -7197,8 +7225,8 @@ fn find_conflicting_rowid_in_index(
         let mut prefix_match = true;
         let mut has_null = false;
         for i in 0..n_idx_cols {
-            let new_val = new_fields.get(i);
-            let entry_val = entry_fields.get(i);
+            let new_val = new_fields_buf.get(i);
+            let entry_val = entry_fields_buf.get(i);
             if matches!(new_val, Some(SqliteValue::Null) | None)
                 || matches!(entry_val, Some(SqliteValue::Null) | None)
             {
@@ -7213,7 +7241,7 @@ fn find_conflicting_rowid_in_index(
 
         if prefix_match && !has_null {
             // Extract the rowid (last field in the index entry).
-            let old_rowid = if let Some(SqliteValue::Integer(rid)) = entry_fields.last() {
+            let old_rowid = if let Some(SqliteValue::Integer(rid)) = entry_fields_buf.last() {
                 *rid
             } else {
                 // Fallback: try cursor rowid.

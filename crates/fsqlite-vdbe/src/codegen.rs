@@ -202,9 +202,13 @@ pub struct TableSchema {
 
 impl TableSchema {
     /// Build an affinity string for `MakeRecord` (one char per column).
+    /// IPK columns are marked with 'X' to signal omission from the record payload.
     #[must_use]
     pub fn affinity_string(&self) -> String {
-        self.columns.iter().map(|c| c.affinity).collect()
+        self.columns
+            .iter()
+            .map(|c| if c.is_ipk { 'X' } else { c.affinity })
+            .collect()
     }
 
     /// Find a column's 0-based index by name (case-insensitive).
