@@ -27,8 +27,6 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use fsqlite_types::sync_primitives::{Condvar, Mutex};
 use fsqlite_types::{CommitSeq, PageNumber};
 
-use crate::page_buf::PageBuf;
-
 // ═══════════════════════════════════════════════════════════════════════
 // CacheMetricsSnapshot
 // ═══════════════════════════════════════════════════════════════════════
@@ -135,7 +133,7 @@ impl CacheKey {
 /// A page with `ref_count > 0` is "pinned" and **must not** be evicted.
 pub struct CachedPage {
     pub key: CacheKey,
-    pub data: PageBuf,
+    pub data: fsqlite_types::PageData,
     /// Lock-free pin counter.  Reads use `Acquire`; writes use `Release`.
     pub ref_count: AtomicU32,
     /// XXH3 hash of `data` at insertion time (integrity check).
@@ -149,7 +147,12 @@ pub struct CachedPage {
 impl CachedPage {
     /// Create a new cached page.
     #[must_use]
-    pub fn new(key: CacheKey, data: PageBuf, xxh3: u64, wal_frame: Option<u32>) -> Self {
+    pub fn new(
+        key: CacheKey,
+        data: fsqlite_types::PageData,
+        xxh3: u64,
+        wal_frame: Option<u32>,
+    ) -> Self {
         let byte_size = data.len();
         Self {
             key,
@@ -1632,7 +1635,7 @@ mod tests {
         } else {
             PageSize::new(65536).unwrap()
         };
-        let mut cp = CachedPage::new(k, PageBuf::new(ps), 0, None);
+        let mut cp = CachedPage::new(k, fsqlite_types::PageData::zeroed(ps), 0, None);
         cp.byte_size = size;
         cp
     }

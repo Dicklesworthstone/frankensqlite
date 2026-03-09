@@ -8,8 +8,6 @@
 //! This module is the *plumbing layer* for zero-copy I/O; the full ARC
 //! eviction policy lives in a higher-level module (bd-7pu).
 
-use hashbrown::HashMap;
-use hashbrown::hash_map::Entry;
 use std::cell::Cell;
 
 use fsqlite_error::Result;
@@ -84,87 +82,25 @@ impl PageCacheMetricsSnapshot {
 /// low-level storage layer that proves the zero-copy invariant.
 pub struct PageCache {
     pool: PageBufPool,
-    pages: HashMap<PageNumber, PageBuf>,
+    pages: std::collections::HashMap<PageNumber, PageBuf, foldhash::fast::FixedState>,
     page_size: PageSize,
     hits: Cell<u64>,
     misses: Cell<u64>,
-    admits: Cell<u64>,
-    evictions: Cell<u64>,
 }
 
 impl PageCache {
-    /// Create a new page cache.
-    ///
-    /// `pool_capacity` is the maximum number of outstanding page buffers the
-    /// underlying pool will allow (idle + in-use).
-    #[must_use]
-    pub fn new(page_size: PageSize, pool_capacity: usize) -> Self {
+    /// Create a new, empty `PageCache` configured for the given `page_size`.
+    pub fn new(page_size: PageSize) -> Self {
         Self {
-            pool: PageBufPool::new(page_size, pool_capacity),
-            pages: HashMap::new(),
+            pool: PageBufPool::new(page_size),
+            pages: std::collections::HashMap::with_hasher(foldhash::fast::FixedState::default()),
             page_size,
             hits: Cell::new(0),
             misses: Cell::new(0),
-            admits: Cell::new(0),
-            evictions: Cell::new(0),
         }
     }
 
-    /// Create a page cache backed by an existing pool.
-    #[must_use]
-    pub fn with_pool(pool: PageBufPool, page_size: PageSize) -> Self {
-        debug_assert_eq!(
-            pool.page_size(),
-            page_size.as_usize(),
-            "pool page_size must match cache page_size"
-        );
-        Self {
-            pool,
-            pages: HashMap::new(),
-            page_size,
-            hits: Cell::new(0),
-            misses: Cell::new(0),
-            admits: Cell::new(0),
-            evictions: Cell::new(0),
-        }
-    }
-
-    /// The page size this cache serves.
-    #[inline]
-    #[must_use]
-    pub fn page_size(&self) -> PageSize {
-        self.page_size
-    }
-
-    /// Number of pages currently cached.
-    #[inline]
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.pages.len()
-    }
-
-    /// Returns `true` if the cache contains no pages.
-    #[inline]
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.pages.is_empty()
-    }
-
-    /// A reference to the underlying buffer pool.
-    #[inline]
-    #[must_use]
-    pub fn pool(&self) -> &PageBufPool {
-        &self.pool
-    }
-
-    // --- Lookup ---
-
-    /// Get a reference to a cached page.
-    ///
-    /// Returns `None` if the page is not in the cache.  The returned
-    /// reference points directly into the pool-allocated buffer — no copy.
-    #[inline]
-    #[must_use]
+    /// Retrieve a page from the cache if it exists.
     pub fn get(&self, page_no: PageNumber) -> Option<&[u8]> {
         if let Some(page) = self.pages.get(&page_no) {
             self.hits.set(self.hits.get().saturating_add(1));
@@ -265,11 +201,11 @@ impl PageCache {
         buf.as_mut_slice().fill(0);
 
         let (out, admitted_new) = match self.pages.entry(page_no) {
-            Entry::Occupied(mut entry) => {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
                 entry.insert(buf);
                 (entry.into_mut().as_mut_slice(), false)
             }
-            Entry::Vacant(entry) => (entry.insert(buf).as_mut_slice(), true),
+            std::collections::hash_map::Entry::Vacant(entry) => (entry.insert(buf).as_mut_slice(), true),
         };
         if admitted_new {
             self.admits.set(self.admits.get().saturating_add(1));
@@ -280,11 +216,11 @@ impl PageCache {
     /// Directly insert an existing `PageBuf` into the cache.
     pub fn insert_buffer(&mut self, page_no: PageNumber, buf: PageBuf) {
         let admitted_new = match self.pages.entry(page_no) {
-            Entry::Occupied(mut entry) => {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
                 entry.insert(buf);
                 false
             }
-            Entry::Vacant(entry) => {
+            std::collections::hash_map::Entry::Vacant(entry) => {
                 entry.insert(buf);
                 true
             }

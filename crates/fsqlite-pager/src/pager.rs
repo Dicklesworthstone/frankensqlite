@@ -1557,8 +1557,17 @@ where
 
                 inner.writer_active = false;
             } else if self.is_writer && self.mode == TransactionMode::Concurrent {
+                // For concurrent transactions, only return pages to the freelist
+                // if they are within the current committed db_size. Pages beyond
+                // db_size were allocated from EOF and should be "dropped" by
+                // just not being reused, as they were never part of a committed
+                // state and cannot be safely referenced in a trunk page if
+                // db_size is not also extended.
+                let current_db_size = inner.db_size;
                 for page in self.allocated_from_eof.drain(..) {
-                    inner.freelist.push(page);
+                    if page.get() <= current_db_size {
+                        inner.freelist.push(page);
+                    }
                 }
             }
         }
@@ -2202,7 +2211,10 @@ mod tests {
         }
 
         fn arm_after_db_writes(&self, successful_db_writes_before_failure: usize) {
-            let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             state.armed = true;
             state.remaining_successful_db_writes = successful_db_writes_before_failure;
         }
@@ -2230,7 +2242,10 @@ mod tests {
         ) -> Result<(Self::File, VfsOpenFlags)> {
             let (inner, actual_flags) = self.inner.open(cx, path, flags)?;
             let is_target_db = {
-                let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 path == Some(state.target_path.as_path()) && flags.contains(VfsOpenFlags::MAIN_DB)
             };
             Ok((
@@ -2267,7 +2282,10 @@ mod tests {
 
         fn write(&mut self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
             if self.is_target_db {
-                let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if state.armed {
                     if state.remaining_successful_db_writes == 0 {
                         state.armed = false;
