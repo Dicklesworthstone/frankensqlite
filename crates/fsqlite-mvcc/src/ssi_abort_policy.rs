@@ -249,6 +249,224 @@ impl AbortDecisionEnvelope {
     }
 }
 
+/// User-facing scaling knob for DRO uncertainty radius.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DroRiskTolerance {
+    Low,
+    High,
+}
+
+impl DroRiskTolerance {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::High => "high",
+        }
+    }
+
+    #[must_use]
+    pub const fn radius_multiplier(self) -> f64 {
+        match self {
+            Self::Low => 1.0,
+            Self::High => 1.75,
+        }
+    }
+}
+
+impl fmt::Display for DroRiskTolerance {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for DroRiskTolerance {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let normalized = value.trim().to_ascii_lowercase();
+        match normalized.as_str() {
+            "low" => Ok(Self::Low),
+            "high" => Ok(Self::High),
+            _ => Err("unrecognized DRO risk tolerance"),
+        }
+    }
+}
+
+/// Wasserstein-style uncertainty certificate derived from recent SSI windows.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(clippy::struct_field_names)]
+pub struct DroRadiusCertificate {
+    pub abort_rate_variance: f64,
+    pub edge_rate_variance: f64,
+    pub base_radius: f64,
+    pub scaled_radius: f64,
+    pub tolerance: DroRiskTolerance,
+}
+
+impl DroRadiusCertificate {
+    #[must_use]
+    pub const fn effective_radius(self) -> f64 {
+        self.scaled_radius
+    }
+}
+
+/// Hot-path DRO evaluation result for one T3 decision.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(clippy::struct_field_names)]
+pub struct DroHotPathDecision {
+    pub active_readers: usize,
+    pub active_writers: usize,
+    pub cvar_penalty: f64,
+    pub threshold: f64,
+    pub radius: f64,
+    pub tolerance: DroRiskTolerance,
+    pub decision: AbortDecision,
+}
+
+impl DroHotPathDecision {
+    #[must_use]
+    pub const fn should_abort(self) -> bool {
+        matches!(self.decision, AbortDecision::Abort)
+    }
+}
+
+/// Dense O(1) lookup table for T3 near-miss DRO penalties.
+#[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::struct_field_names)]
+pub struct DroLossMatrix {
+    max_active_readers: usize,
+    max_active_writers: usize,
+    threshold: f64,
+    radius: DroRadiusCertificate,
+    penalties: Vec<f64>,
+}
+
+impl DroLossMatrix {
+    #[must_use]
+    pub fn from_radius_certificate(
+        max_active_readers: usize,
+        max_active_writers: usize,
+        threshold: f64,
+        radius: DroRadiusCertificate,
+    ) -> Self {
+        let rows = max_active_readers.saturating_add(1);
+        let cols = max_active_writers.saturating_add(1);
+        let mut penalties = vec![0.0; rows.saturating_mul(cols)];
+
+        for readers in 0..rows {
+            for writers in 0..cols {
+                let idx = readers * cols + writers;
+                penalties[idx] = dro_cvar_penalty(readers, writers, radius);
+            }
+        }
+
+        Self {
+            max_active_readers,
+            max_active_writers,
+            threshold: threshold.max(0.0),
+            radius,
+            penalties,
+        }
+    }
+
+    #[must_use]
+    pub const fn threshold(&self) -> f64 {
+        self.threshold
+    }
+
+    #[must_use]
+    pub const fn radius(&self) -> DroRadiusCertificate {
+        self.radius
+    }
+
+    #[must_use]
+    pub fn penalty(&self, active_readers: usize, active_writers: usize) -> f64 {
+        let readers = active_readers.min(self.max_active_readers);
+        let writers = active_writers.min(self.max_active_writers);
+        let cols = self.max_active_writers.saturating_add(1);
+        self.penalties[(readers * cols) + writers]
+    }
+
+    #[must_use]
+    pub fn evaluate(&self, active_readers: usize, active_writers: usize) -> DroHotPathDecision {
+        let readers = active_readers.min(self.max_active_readers);
+        let writers = active_writers.min(self.max_active_writers);
+        let cvar_penalty = self.penalty(readers, writers);
+        let decision = if cvar_penalty > self.threshold {
+            AbortDecision::Abort
+        } else {
+            AbortDecision::Commit
+        };
+
+        DroHotPathDecision {
+            active_readers: readers,
+            active_writers: writers,
+            cvar_penalty,
+            threshold: self.threshold,
+            radius: self.radius.effective_radius(),
+            tolerance: self.radius.tolerance,
+            decision,
+        }
+    }
+}
+
+/// Build a deterministic Wasserstein-style radius certificate from recent
+/// abort-rate and conflict-edge windows.
+#[must_use]
+pub fn dro_wasserstein_radius(
+    abort_rates: &[f64],
+    edge_rates: &[f64],
+    tolerance: DroRiskTolerance,
+) -> Option<DroRadiusCertificate> {
+    let abort_rate_variance = sample_variance(abort_rates)?;
+    let edge_rate_variance = sample_variance(edge_rates)?;
+    let base_radius = (abort_rate_variance + edge_rate_variance).sqrt();
+    let scaled_radius = base_radius * tolerance.radius_multiplier();
+
+    Some(DroRadiusCertificate {
+        abort_rate_variance,
+        edge_rate_variance,
+        base_radius,
+        scaled_radius,
+        tolerance,
+    })
+}
+
+#[must_use]
+fn sample_variance(values: &[f64]) -> Option<f64> {
+    if values.len() < 2 {
+        return None;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let mean = values.iter().sum::<f64>() / values.len() as f64;
+    #[allow(clippy::cast_precision_loss)]
+    let variance = values
+        .iter()
+        .map(|value| {
+            let delta = value - mean;
+            delta * delta
+        })
+        .sum::<f64>()
+        / (values.len() - 1) as f64;
+    Some(variance)
+}
+
+#[must_use]
+fn dro_cvar_penalty(
+    active_readers: usize,
+    active_writers: usize,
+    radius: DroRadiusCertificate,
+) -> f64 {
+    #[allow(clippy::cast_precision_loss)]
+    let occupancy = active_readers as f64 + active_writers as f64;
+    #[allow(clippy::cast_precision_loss)]
+    let skew = (active_readers.max(active_writers) as f64 + 1.0)
+        / (active_readers.min(active_writers) as f64 + 1.0);
+    let tail_mass = (occupancy / 8.0).min(4.0);
+    radius.effective_radius() * tail_mass * skew.ln_1p()
+}
+
 // ---------------------------------------------------------------------------
 // SSI Evidence Ledger (galaxy-brain decision cards)
 // ---------------------------------------------------------------------------
@@ -1302,5 +1520,99 @@ mod tests {
         });
         assert_eq!(by_time.len(), 1);
         assert_eq!(by_time[0].txn.id.get(), 11);
+    }
+
+    #[test]
+    fn test_dro_risk_tolerance_parse_and_display() {
+        assert_eq!("low".parse::<DroRiskTolerance>(), Ok(DroRiskTolerance::Low));
+        assert_eq!(
+            "HIGH".parse::<DroRiskTolerance>(),
+            Ok(DroRiskTolerance::High)
+        );
+        assert_eq!(DroRiskTolerance::Low.to_string(), "low");
+        assert_eq!(DroRiskTolerance::High.to_string(), "high");
+    }
+
+    #[test]
+    fn test_dro_wasserstein_radius_expands_with_variance() {
+        let calm = dro_wasserstein_radius(
+            &[0.02, 0.03, 0.02, 0.03],
+            &[0.01, 0.02, 0.01, 0.02],
+            DroRiskTolerance::Low,
+        )
+        .expect("certificate");
+        let volatile = dro_wasserstein_radius(
+            &[0.02, 0.14, 0.01, 0.18],
+            &[0.01, 0.16, 0.02, 0.20],
+            DroRiskTolerance::Low,
+        )
+        .expect("certificate");
+        assert!(volatile.base_radius > calm.base_radius);
+        assert!(volatile.scaled_radius > calm.scaled_radius);
+    }
+
+    #[test]
+    fn test_dro_wasserstein_radius_respects_tolerance_scale() {
+        let low = dro_wasserstein_radius(
+            &[0.04, 0.08, 0.12, 0.16],
+            &[0.03, 0.07, 0.11, 0.15],
+            DroRiskTolerance::Low,
+        )
+        .expect("certificate");
+        let high = dro_wasserstein_radius(
+            &[0.04, 0.08, 0.12, 0.16],
+            &[0.03, 0.07, 0.11, 0.15],
+            DroRiskTolerance::High,
+        )
+        .expect("certificate");
+        assert_eq!(low.base_radius, high.base_radius);
+        assert!(high.scaled_radius > low.scaled_radius);
+    }
+
+    #[test]
+    fn test_dro_loss_matrix_zero_penalty_without_contention() {
+        let cert = dro_wasserstein_radius(
+            &[0.05, 0.05, 0.05, 0.05],
+            &[0.03, 0.03, 0.03, 0.03],
+            DroRiskTolerance::Low,
+        )
+        .expect("certificate");
+        let matrix = DroLossMatrix::from_radius_certificate(8, 8, 0.5, cert);
+        let decision = matrix.evaluate(0, 0);
+        assert_eq!(decision.active_readers, 0);
+        assert_eq!(decision.active_writers, 0);
+        assert_eq!(decision.cvar_penalty, 0.0);
+        assert!(!decision.should_abort());
+    }
+
+    #[test]
+    fn test_dro_loss_matrix_penalty_grows_with_contention() {
+        let cert = dro_wasserstein_radius(
+            &[0.03, 0.08, 0.13, 0.21],
+            &[0.02, 0.07, 0.11, 0.19],
+            DroRiskTolerance::High,
+        )
+        .expect("certificate");
+        let matrix = DroLossMatrix::from_radius_certificate(8, 8, 0.5, cert);
+        let light = matrix.evaluate(1, 1);
+        let heavy = matrix.evaluate(6, 6);
+        assert!(heavy.cvar_penalty > light.cvar_penalty);
+    }
+
+    #[test]
+    fn test_dro_loss_matrix_threshold_boundary() {
+        let cert = dro_wasserstein_radius(
+            &[0.05, 0.09, 0.15, 0.23],
+            &[0.04, 0.08, 0.14, 0.22],
+            DroRiskTolerance::High,
+        )
+        .expect("certificate");
+        let matrix = DroLossMatrix::from_radius_certificate(8, 8, 0.2, cert);
+        let decision = matrix.evaluate(7, 7);
+        assert!(decision.cvar_penalty >= 0.0);
+        assert_eq!(
+            decision.should_abort(),
+            decision.cvar_penalty > decision.threshold
+        );
     }
 }

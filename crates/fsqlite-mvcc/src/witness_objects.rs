@@ -361,6 +361,8 @@ pub struct EcsCommitProof {
 pub enum AbortPolicy {
     /// Abort the pivot transaction (the one forming the dangerous structure).
     AbortPivot,
+    /// Abort based on DRO risk evaluation in the hot path.
+    AbortDro,
     /// Abort the youngest transaction.
     AbortYoungest,
     /// Custom policy (implementation-defined).

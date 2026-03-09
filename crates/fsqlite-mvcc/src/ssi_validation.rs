@@ -19,7 +19,8 @@ use tracing::{debug, info, warn};
 
 use crate::observability;
 use crate::ssi_abort_policy::{
-    SsiDecisionCard, SsiDecisionCardDraft, SsiDecisionQuery, SsiDecisionType, SsiEvidenceLedger,
+    DroHotPathDecision, DroLossMatrix, DroRiskTolerance, SsiDecisionCard, SsiDecisionCardDraft,
+    SsiDecisionQuery, SsiDecisionType, SsiEvidenceLedger, dro_wasserstein_radius,
 };
 
 use crate::witness_objects::{
@@ -109,6 +110,41 @@ pub fn ssi_evidence_metrics_snapshot() -> EvidenceRecordMetricsSnapshot {
 pub fn reset_ssi_evidence_metrics() {
     FSQLITE_EVIDENCE_RECORDS_TOTAL_COMMIT.store(0, Ordering::Relaxed);
     FSQLITE_EVIDENCE_RECORDS_TOTAL_ABORT.store(0, Ordering::Relaxed);
+}
+
+fn default_t3_dro_matrix() -> &'static DroLossMatrix {
+    static MATRIX: OnceLock<DroLossMatrix> = OnceLock::new();
+    MATRIX.get_or_init(|| {
+        let certificate = dro_wasserstein_radius(
+            &[0.03, 0.05, 0.08, 0.13],
+            &[0.04, 0.06, 0.09, 0.15],
+            DroRiskTolerance::Low,
+        )
+        .expect("default DRO certificate must be constructible");
+        DroLossMatrix::from_radius_certificate(32, 32, 0.45, certificate)
+    })
+}
+
+pub(crate) fn evaluate_t3_dro(
+    txn: TxnToken,
+    active_readers: usize,
+    active_writers: usize,
+) -> DroHotPathDecision {
+    let decision = default_t3_dro_matrix().evaluate(active_readers, active_writers);
+    info!(
+        target: "fsqlite::ssi::dro",
+        event = "t3_decision",
+        txn_id = txn.id.get(),
+        active_readers = decision.active_readers,
+        active_writers = decision.active_writers,
+        cvar_penalty = decision.cvar_penalty,
+        threshold = decision.threshold,
+        radius = decision.radius,
+        tolerance = %decision.tolerance,
+        decision = if decision.should_abort() { "abort" } else { "allow" },
+        "dro t3 decision evaluated"
+    );
+    decision
 }
 
 // ---------------------------------------------------------------------------
@@ -725,6 +761,16 @@ pub fn ssi_validate_and_publish(
     }
 
     // Step 6: T3 rule (near-miss check).
+    let dro_t3_decision = if in_edges.is_empty() && out_edges.is_empty() {
+        None
+    } else {
+        Some(evaluate_t3_dro(
+            txn,
+            active_readers.len().saturating_add(committed_readers.len()),
+            active_writers.len().saturating_add(committed_writers.len()),
+        ))
+    };
+
     for edge in &in_edges {
         if edge.source_is_active {
             // R is active: set R.has_out_rw = true (R now has outgoing edge to T).
@@ -736,6 +782,10 @@ pub fn ssi_validate_and_publish(
                         debug!(
                             bead_id = "bd-31bo",
                             pivot = ?edge.from,
+                            dro_penalty = dro_t3_decision
+                                .map_or(0.0, |decision| decision.cvar_penalty),
+                            dro_threshold = dro_t3_decision
+                                .map_or(0.0, |decision| decision.threshold),
                             "T3 rule: active reader is pivot, marking for abort"
                         );
                         reader.set_marked_for_abort(true);
@@ -747,6 +797,18 @@ pub fn ssi_validate_and_publish(
             // R is committed: if R.has_in_rw at commit time,
             // T MUST abort (committed pivot cannot be undone).
             if edge.source_has_in_rw {
+                let dro_rationale = dro_t3_decision.map_or_else(
+                    || "committed_pivot_abort".to_owned(),
+                    |decision| {
+                        format!(
+                            "committed_pivot_abort dro_penalty={:.6} dro_threshold={:.6} active_readers={} active_writers={}",
+                            decision.cvar_penalty,
+                            decision.threshold,
+                            decision.active_readers,
+                            decision.active_writers
+                        )
+                    },
+                );
                 let discovered_edges: Vec<DiscoveredEdge> = in_edges
                     .iter()
                     .cloned()
@@ -760,7 +822,7 @@ pub fn ssi_validate_and_publish(
                     read_keys,
                     write_keys,
                     &discovered_edges,
-                    "committed_pivot_abort",
+                    dro_rationale.as_str(),
                 );
                 span.record("conflict_detected", true);
                 span.record("decision_reason", "committed_pivot_abort");
@@ -768,6 +830,10 @@ pub fn ssi_validate_and_publish(
                     bead_id = "bd-31bo",
                     txn = ?txn,
                     committed_pivot = ?edge.from,
+                    dro_penalty = dro_t3_decision
+                        .map_or(0.0, |decision| decision.cvar_penalty),
+                    dro_threshold = dro_t3_decision
+                        .map_or(0.0, |decision| decision.threshold),
                     "T3 rule: committed reader was pivot, T must abort"
                 );
                 observability::record_ssi_abort(
@@ -800,6 +866,10 @@ pub fn ssi_validate_and_publish(
                         debug!(
                             bead_id = "bd-31bo",
                             pivot = ?edge.to,
+                            dro_penalty = dro_t3_decision
+                                .map_or(0.0, |decision| decision.cvar_penalty),
+                            dro_threshold = dro_t3_decision
+                                .map_or(0.0, |decision| decision.threshold),
                             "T3 rule: active writer is pivot, marking for abort"
                         );
                         writer.set_marked_for_abort(true);
@@ -811,6 +881,18 @@ pub fn ssi_validate_and_publish(
             // W is committed and had outgoing rw at commit time.
             // Symmetric committed-pivot check: T -> W with W already a pivot
             // implies T must abort.
+            let dro_rationale = dro_t3_decision.map_or_else(
+                || "committed_writer_pivot_abort".to_owned(),
+                |decision| {
+                    format!(
+                        "committed_writer_pivot_abort dro_penalty={:.6} dro_threshold={:.6} active_readers={} active_writers={}",
+                        decision.cvar_penalty,
+                        decision.threshold,
+                        decision.active_readers,
+                        decision.active_writers
+                    )
+                },
+            );
             let discovered_edges: Vec<DiscoveredEdge> = in_edges
                 .iter()
                 .cloned()
@@ -824,7 +906,7 @@ pub fn ssi_validate_and_publish(
                 read_keys,
                 write_keys,
                 &discovered_edges,
-                "committed_writer_pivot_abort",
+                dro_rationale.as_str(),
             );
             span.record("conflict_detected", true);
             span.record("decision_reason", "committed_writer_pivot_abort");
@@ -832,6 +914,8 @@ pub fn ssi_validate_and_publish(
                 bead_id = "bd-31bo",
                 txn = ?txn,
                 committed_pivot = ?edge.to,
+                dro_penalty = dro_t3_decision.map_or(0.0, |decision| decision.cvar_penalty),
+                dro_threshold = dro_t3_decision.map_or(0.0, |decision| decision.threshold),
                 "T3 rule: committed writer was pivot, T must abort"
             );
             observability::record_ssi_abort(
@@ -1811,6 +1895,14 @@ mod tests {
         );
         let err = result.expect_err("committed pivot → T must abort");
         assert_eq!(err.reason, SsiAbortReason::CommittedPivot);
+
+        let dro = super::default_t3_dro_matrix().evaluate(1, 0);
+        assert_eq!(dro.active_readers, 1);
+        assert_eq!(dro.active_writers, 0);
+        assert!(
+            dro.cvar_penalty >= 0.0,
+            "DRO seam should always produce a non-negative penalty"
+        );
     }
 
     // -- §5.7.3 test 15: T3 rule — active no in_rw → no mark --

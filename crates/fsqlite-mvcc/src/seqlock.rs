@@ -106,7 +106,11 @@ impl SeqLock {
                 continue;
             }
 
-            let snapshot = self.value.load(Ordering::Acquire);
+            // Ensure the payload load happens AFTER the first sequence check.
+            std::sync::atomic::fence(Ordering::Acquire);
+            let snapshot = self.value.load(Ordering::Relaxed);
+            // Ensure the payload load happens BEFORE the second sequence check.
+            std::sync::atomic::fence(Ordering::Acquire);
 
             let seq2 = self.seq.load(Ordering::Acquire);
             if seq1 == seq2 {
@@ -208,8 +212,10 @@ impl SeqLockPair {
                 continue;
             }
 
-            let va = self.a.load(Ordering::Acquire);
-            let vb = self.b.load(Ordering::Acquire);
+            std::sync::atomic::fence(Ordering::Acquire);
+            let va = self.a.load(Ordering::Relaxed);
+            let vb = self.b.load(Ordering::Relaxed);
+            std::sync::atomic::fence(Ordering::Acquire);
 
             let seq2 = self.seq.load(Ordering::Acquire);
             if seq1 == seq2 {
@@ -305,9 +311,11 @@ impl SeqLockTriple {
                 continue;
             }
 
-            let va = self.a.load(Ordering::Acquire);
-            let vb = self.b.load(Ordering::Acquire);
-            let vc = self.c.load(Ordering::Acquire);
+            std::sync::atomic::fence(Ordering::Acquire);
+            let va = self.a.load(Ordering::Relaxed);
+            let vb = self.b.load(Ordering::Relaxed);
+            let vc = self.c.load(Ordering::Relaxed);
+            std::sync::atomic::fence(Ordering::Acquire);
 
             let seq2 = self.seq.load(Ordering::Acquire);
             if seq1 == seq2 {

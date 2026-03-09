@@ -29,7 +29,7 @@ use crate::core_types::{CommitIndex, InProcessPageLockTable, TransactionMode, Tr
 use crate::lifecycle::MvccError;
 use crate::ssi_validation::{
     ActiveTxnView, CommittedReaderInfo, CommittedWriterInfo, DiscoveredEdge, SsiAbortReason,
-    discover_incoming_edges, discover_outgoing_edges,
+    discover_incoming_edges, discover_outgoing_edges, evaluate_t3_dro,
 };
 use crate::witness_plane::witness_keys_overlap;
 
@@ -555,6 +555,7 @@ pub struct PreparedConcurrentCommit {
     has_out_rw: bool,
     incoming_edges: Vec<DiscoveredEdge>,
     outgoing_edges: Vec<DiscoveredEdge>,
+    dro_t3_decision: Option<crate::ssi_abort_policy::DroHotPathDecision>,
 }
 
 impl PreparedConcurrentCommit {
@@ -596,6 +597,11 @@ impl PreparedConcurrentCommit {
     #[must_use]
     pub fn write_keys(&self) -> &[WitnessKey] {
         &self.write_keys
+    }
+
+    #[must_use]
+    pub const fn dro_t3_decision(&self) -> Option<crate::ssi_abort_policy::DroHotPathDecision> {
+        self.dro_t3_decision
     }
 }
 
@@ -668,6 +674,33 @@ impl ActiveTxnView for HandleView<'_> {
     fn set_marked_for_abort(&self, val: bool) {
         self.handle.marked_for_abort.set(val);
     }
+}
+
+fn evaluate_prepare_t3_dro(
+    txn: TxnToken,
+    incoming_edges: &[DiscoveredEdge],
+    outgoing_edges: &[DiscoveredEdge],
+    active_txn_count: usize,
+    committed_reader_count: usize,
+    committed_writer_count: usize,
+) -> Option<crate::ssi_abort_policy::DroHotPathDecision> {
+    if incoming_edges.is_empty() && outgoing_edges.is_empty() {
+        return None;
+    }
+
+    let active_other_txns = active_txn_count.saturating_sub(1);
+    let active_reader_population = active_other_txns
+        .max(incoming_edges.len())
+        .saturating_add(committed_reader_count);
+    let active_writer_population = active_other_txns
+        .max(outgoing_edges.len())
+        .saturating_add(committed_writer_count);
+
+    Some(evaluate_t3_dro(
+        txn,
+        active_reader_population,
+        active_writer_population,
+    ))
 }
 
 /// Commit a concurrent transaction.
@@ -837,10 +870,24 @@ pub fn prepare_concurrent_commit_with_ssi(
 
     let has_in_rw = !incoming_edges.is_empty();
     let has_out_rw = !outgoing_edges.is_empty();
+    let dro_t3_decision = evaluate_prepare_t3_dro(
+        txn,
+        &incoming_edges,
+        &outgoing_edges,
+        registry.active.len(),
+        registry.committed_readers.len(),
+        registry.committed_writers.len(),
+    );
 
     if has_in_rw && has_out_rw {
         let reason = SsiAbortReason::Pivot;
-        tracing::warn!(?txn, ?reason, "SSI validation aborted");
+        tracing::warn!(
+            ?txn,
+            ?reason,
+            dro_penalty = dro_t3_decision.map_or(0.0, |decision| decision.cvar_penalty),
+            dro_threshold = dro_t3_decision.map_or(0.0, |decision| decision.threshold),
+            "SSI validation aborted"
+        );
         return Err((MvccError::BusySnapshot, FcwResult::Abort { reason }));
     }
 
@@ -855,6 +902,7 @@ pub fn prepare_concurrent_commit_with_ssi(
         has_out_rw,
         incoming_edges,
         outgoing_edges,
+        dro_t3_decision,
     })
 }
 
@@ -921,6 +969,14 @@ pub fn finalize_prepared_concurrent_commit_with_ssi(
 
     let has_in_rw = !incoming_edges.is_empty();
     let has_out_rw = !outgoing_edges.is_empty();
+    let dro_t3_decision = evaluate_prepare_t3_dro(
+        prepared.txn_token,
+        &incoming_edges,
+        &outgoing_edges,
+        registry.active.len(),
+        registry.committed_readers.len(),
+        registry.committed_writers.len(),
+    );
 
     // T3 propagation for active readers on incoming edges.
     for edge in &incoming_edges {
@@ -934,6 +990,12 @@ pub fn finalize_prepared_concurrent_commit_with_ssi(
         {
             reader.set_has_out_rw(true);
             if reader.has_in_rw() {
+                tracing::debug!(
+                    pivot = ?edge.from,
+                    dro_penalty = dro_t3_decision.map_or(0.0, |decision| decision.cvar_penalty),
+                    dro_threshold = dro_t3_decision.map_or(0.0, |decision| decision.threshold),
+                    "prepare/finalize T3 rule: active reader is pivot, marking for abort"
+                );
                 reader.set_marked_for_abort(true);
             }
         }
@@ -951,6 +1013,12 @@ pub fn finalize_prepared_concurrent_commit_with_ssi(
         {
             writer.set_has_in_rw(true);
             if writer.has_out_rw() {
+                tracing::debug!(
+                    pivot = ?edge.to,
+                    dro_penalty = dro_t3_decision.map_or(0.0, |decision| decision.cvar_penalty),
+                    dro_threshold = dro_t3_decision.map_or(0.0, |decision| decision.threshold),
+                    "prepare/finalize T3 rule: active writer is pivot, marking for abort"
+                );
                 writer.set_marked_for_abort(true);
             }
         }
@@ -1518,6 +1586,70 @@ mod tests {
         let h2 = registry.get_mut(s2).expect("handle 2");
         concurrent_write_page(h2, &lock_table, s2, test_page(5), test_data())
             .expect("page lock should be released during finalize");
+    }
+
+    #[test]
+    fn test_prepare_materializes_dro_decision_for_edgeful_commit() {
+        let lock_table = InProcessPageLockTable::new();
+        let commit_index = CommitIndex::new();
+        let mut registry = ConcurrentRegistry::new();
+
+        let s1 = registry.begin_concurrent(test_snapshot(10)).unwrap();
+        let s2 = registry.begin_concurrent(test_snapshot(10)).unwrap();
+
+        {
+            let h1 = registry.get_mut(s1).unwrap();
+            h1.record_read(test_page(20));
+            concurrent_write_page(h1, &lock_table, s1, test_page(10), test_data()).unwrap();
+        }
+        {
+            let h2 = registry.get_mut(s2).unwrap();
+            h2.record_read(test_page(30));
+            concurrent_write_page(h2, &lock_table, s2, test_page(20), test_data()).unwrap();
+        }
+
+        let prepared = prepare_concurrent_commit_with_ssi(
+            &mut registry,
+            &commit_index,
+            &lock_table,
+            s1,
+            CommitSeq::new(11),
+        )
+        .expect("prepare should succeed");
+
+        let decision = prepared
+            .dro_t3_decision()
+            .expect("edgeful prepare should materialize a DRO decision");
+        assert_eq!(decision.active_readers, 1);
+        assert_eq!(decision.active_writers, 1);
+        assert!(decision.threshold >= 0.0);
+    }
+
+    #[test]
+    fn test_prepare_skips_dro_decision_for_edge_free_commit() {
+        let lock_table = InProcessPageLockTable::new();
+        let commit_index = CommitIndex::new();
+        let mut registry = ConcurrentRegistry::new();
+
+        let s1 = registry.begin_concurrent(test_snapshot(10)).unwrap();
+        {
+            let h1 = registry.get_mut(s1).unwrap();
+            concurrent_write_page(h1, &lock_table, s1, test_page(5), test_data()).unwrap();
+        }
+
+        let prepared = prepare_concurrent_commit_with_ssi(
+            &mut registry,
+            &commit_index,
+            &lock_table,
+            s1,
+            CommitSeq::new(11),
+        )
+        .expect("prepare should succeed");
+
+        assert!(
+            prepared.dro_t3_decision().is_none(),
+            "edge-free prepare should not emit a DRO decision"
+        );
     }
 
     // -----------------------------------------------------------------------
