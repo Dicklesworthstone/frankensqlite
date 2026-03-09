@@ -1044,7 +1044,6 @@ pub fn codegen_select(
     schema: &[TableSchema],
     _ctx: &CodegenContext,
 ) -> Result<(), CodegenError> {
-    println!("DEBUG: codegen_select entered");
     let (columns, from, where_clause, group_by, having, distinct) = match &stmt.body.select {
         SelectCore::Select {
             columns,
@@ -1055,8 +1054,6 @@ pub fn codegen_select(
             distinct,
             ..
         } => {
-            println!("DEBUG: AST columns: {:?}", columns);
-            println!("DEBUG: AST group_by: {:?}", group_by);
             (columns, from, where_clause, group_by, having, *distinct)
         },
         SelectCore::Values(rows) => {
@@ -1109,7 +1106,6 @@ pub fn codegen_select(
     // Aggregates like count(*) require a full scan + AggStep/AggFinal path;
     // the rowid-seek and index-seek paths don't support aggregate functions.
     let is_aggregate = has_aggregate_columns(columns);
-    println!("DEBUG: has_aggregate_columns = {}, group_by.is_empty() = {}", is_aggregate, group_by.is_empty());
 
     // Check for rowid-equality WHERE clause (only for non-aggregate queries).
     let rowid_target = if is_aggregate {
@@ -1307,7 +1303,6 @@ pub fn codegen_select(
             );
         }
     } else if has_aggregate_columns(columns) && !group_by.is_empty() {
-        eprintln!("DEBUG: Hitting codegen_select_group_by_aggregate! columns: {:?}", columns.len());
         // --- Aggregate query WITH GROUP BY ---
         return codegen_select_group_by_aggregate(
             b,
@@ -4166,7 +4161,6 @@ fn codegen_select_group_by_aggregate(
             register_base: None,
             secondary: None,
         };
-        eprintln!("DEBUG: group_by_keys length = {}, keys = {:?}", group_by_keys.len(), group_by_keys);
         let mut reg = sorter_base;
         for key in &group_by_keys {
             match key {
@@ -4175,7 +4169,6 @@ fn codegen_select_group_by_aggregate(
                     b.emit_op(Opcode::Column, cursor, *col_idx as i32, reg, P4::None, 0);
                 }
                 GroupByKey::Expression(expr) => {
-                    eprintln!("DEBUG: evaluate GroupByKey::Expression: {:?}", expr);
                     emit_expr(b, expr, reg, Some(&scan_ctx));
                 }
             }

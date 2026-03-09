@@ -217,6 +217,13 @@ impl MemCursor {
     }
 }
 
+/// A single row in the sorter, caching both the decoded values and the original blob.
+#[derive(Debug, Clone)]
+struct SorterRow {
+    values: Vec<SqliteValue>,
+    blob: Vec<u8>,
+}
+
 /// Cursor state for sorter opcodes (`SorterOpen`, `SorterInsert`, ...).
 ///
 /// Supports external merge sort: when in-memory rows exceed `spill_threshold`
@@ -231,8 +238,8 @@ struct SorterCursor {
     sort_key_orders: Vec<SortKeyOrder>,
     /// Per-key collation sequence (e.g. "NOCASE"). `None` means BINARY.
     collations: Vec<Option<String>>,
-    /// Inserted records decoded from `MakeRecord` blobs.
-    rows: Vec<Vec<SqliteValue>>,
+    /// Inserted records.
+    rows: Vec<SorterRow>,
     /// Current position after `SorterSort`/`SorterNext`.
     position: Option<usize>,
     /// Estimated bytes consumed by `rows` (approximate).
@@ -344,11 +351,11 @@ impl SorterCursor {
         }
     }
 
-    /// Estimate the memory footprint of a decoded row.
-    fn estimate_row_size(row: &[SqliteValue]) -> usize {
-        // Base overhead per Vec element + per-value overhead
-        let mut size = std::mem::size_of::<Vec<SqliteValue>>() + row.len() * 24;
-        for val in row {
+    /// Estimate the memory footprint of a sorter row.
+    fn estimate_row_size(values: &[SqliteValue], blob: &[u8]) -> usize {
+        // Base overhead per Vec element + per-value overhead + blob size
+        let mut size = std::mem::size_of::<SorterRow>() + values.len() * 24 + blob.len();
+        for val in values {
             match val {
                 SqliteValue::Text(s) => size += s.len(),
                 SqliteValue::Blob(b) => size += b.len(),
@@ -359,9 +366,9 @@ impl SorterCursor {
     }
 
     /// Insert a row and spill to disk if memory exceeds the threshold.
-    fn insert_row(&mut self, row: Vec<SqliteValue>) -> Result<()> {
-        self.memory_used += Self::estimate_row_size(&row);
-        self.rows.push(row);
+    fn insert_row(&mut self, values: Vec<SqliteValue>, blob: Vec<u8>) -> Result<()> {
+        self.memory_used += Self::estimate_row_size(&values, &blob);
+        self.rows.push(SorterRow { values, blob });
 
         if self.memory_used >= self.spill_threshold {
             self.spill_to_disk()?;
@@ -382,7 +389,7 @@ impl SorterCursor {
         let orders = self.sort_key_orders.clone();
         let colls = self.collations.clone();
         self.rows
-            .sort_by(|lhs, rhs| compare_sorter_rows(lhs, rhs, key_columns, &orders, &colls));
+            .sort_by(|lhs, rhs| compare_sorter_rows(&lhs.values, &rhs.values, key_columns, &orders, &colls));
 
         // Write to temp file.  We use `keep()` to detach the auto-delete
         // guard so the file persists until we explicitly remove it in
@@ -397,7 +404,7 @@ impl SorterCursor {
         let record_count = self.rows.len() as u64;
         let mut bytes_written: u64 = 0;
         for row in &self.rows {
-            let blob = serialize_record(row);
+            let blob = serialize_record(&row.values);
             #[allow(clippy::cast_possible_truncation)]
             let len_bytes = (blob.len() as u32).to_le_bytes();
             writer
@@ -448,7 +455,7 @@ impl SorterCursor {
             let orders = self.sort_key_orders.clone();
             let colls = self.collations.clone();
             self.rows
-                .sort_by(|lhs, rhs| compare_sorter_rows(lhs, rhs, key_columns, &orders, &colls));
+                .sort_by(|lhs, rhs| compare_sorter_rows(&lhs.values, &rhs.values, key_columns, &orders, &colls));
             self.rows_sorted_total += self.rows.len() as u64;
             return Ok(());
         }
@@ -458,7 +465,7 @@ impl SorterCursor {
         let orders = self.sort_key_orders.clone();
         let colls = self.collations.clone();
         self.rows
-            .sort_by(|lhs, rhs| compare_sorter_rows(lhs, rhs, key_columns, &orders, &colls));
+            .sort_by(|lhs, rhs| compare_sorter_rows(&lhs.values, &rhs.values, key_columns, &orders, &colls));
 
         // Collect all runs: disk runs first, then in-memory remainder.
         let mut run_iters: Vec<RunIterator> = Vec::with_capacity(self.spill_runs.len() + 1);
@@ -472,7 +479,7 @@ impl SorterCursor {
         }
 
         // K-way merge using a simple tournament approach.
-        let mut merged: Vec<Vec<SqliteValue>> = Vec::new();
+        let mut merged: Vec<SorterRow> = Vec::new();
 
         // Advance all iterators to their first element.
         for iter in &mut run_iters {
@@ -570,7 +577,7 @@ impl RunIterator {
         })
     }
 
-    fn from_memory(rows: Vec<Vec<SqliteValue>>) -> Self {
+    fn from_memory(rows: Vec<SorterRow>) -> Self {
         Self::Memory {
             rows: rows.into_iter(),
             current: None,
@@ -2049,7 +2056,7 @@ pub enum ExecOutcome {
 #[allow(clippy::struct_excessive_bools)]
 pub struct VdbeEngine {
     /// Register file (1-indexed; index 0 is unused/sentinel).
-    registers: Vec<SqliteValue>,
+    registers: smallvec::SmallVec<[SqliteValue; 32]>,
     /// Bound SQL parameter values (`?1`, `?2`, ...).
     bindings: Vec<SqliteValue>,
     /// Root capability context for execution-owned cursor and virtual-table work.
@@ -2059,7 +2066,7 @@ pub struct VdbeEngine {
     /// Whether opcode-level tracing is enabled.
     trace_opcodes: bool,
     /// Result rows accumulated during execution.
-    results: Vec<Vec<SqliteValue>>,
+    results: Vec<smallvec::SmallVec<[SqliteValue; 8]>>,
     /// Open cursors (keyed by cursor number, i.e. p1 of OpenRead/OpenWrite).
     cursors: SwissIndex<i32, MemCursor>,
     /// Open sorter cursors keyed by cursor number.
@@ -2431,7 +2438,7 @@ impl VdbeEngine {
         // +1 because registers are 1-indexed (register 0 unused).
         let count = register_count.max(0) as u32 + 1;
         Self {
-            registers: vec![SqliteValue::Null; count as usize],
+            registers: smallvec::smallvec![SqliteValue::Null; count as usize],
             bindings: Vec::new(),
             execution_cx: execution_cx.create_child(),
             page_size,
@@ -2558,7 +2565,7 @@ impl VdbeEngine {
                 let mut key_values: Vec<SqliteValue> =
                     Vec::with_capacity(meta.column_indices.len() + 1);
                 for &col_idx in &meta.column_indices {
-                    let val = old_row.get(col_idx).cloned().unwrap_or(SqliteValue::Null);
+                    let val = old_row.values.get(col_idx).cloned().unwrap_or(SqliteValue::Null);
                     key_values.push(val);
                 }
                 key_values.push(SqliteValue::Integer(conflict_rowid));
@@ -3045,7 +3052,7 @@ impl VdbeEngine {
                     // Preserve the cursor's table-vs-index type from
                     // the original cursor so index cursors remain correct.
                     let is_table_btree = old_sc.cursor.is_table_btree();
-                    let page_size_u32 = self.page_size.as_u32();
+                    let page_size_u32 = self.page_size.get();
                     let new_cursor =
                         BtCursor::new(tt_page_io, root_pgno, page_size_u32, is_table_btree);
                     self.storage_cursors.insert(
@@ -3462,15 +3469,13 @@ impl VdbeEngine {
 
                 // ── Conditional Jumps ───────────────────────────────────
                 Opcode::If => {
-                    // Jump to p2 if p1 is true (non-zero, non-NULL).
+                    // Jump to p2 if p1 is true.
                     // If p1 is NULL, jump iff p3 != 0 (SQLite semantics).
-                    // C SQLite uses sqlite3VdbeRealValue() != 0.0 (NOT integer
-                    // truncation), so 0.1 and 0.5 are truthy.
                     let val = self.get_reg(op.p1);
                     let should_jump = if val.is_null() {
                         op.p3 != 0
                     } else {
-                        vdbe_real_is_truthy(val)
+                        val.as_bool().unwrap_or(false)
                     };
                     if should_jump {
                         pc = op.p2 as usize;
@@ -3482,12 +3487,11 @@ impl VdbeEngine {
                 Opcode::IfNot => {
                     // Jump to p2 if p1 is false (zero).
                     // If p1 is NULL, jump iff p3 != 0 (SQLite semantics).
-                    // C SQLite uses sqlite3VdbeRealValue() != 0.0.
                     let val = self.get_reg(op.p1);
                     let should_jump = if val.is_null() {
                         op.p3 != 0
                     } else {
-                        !vdbe_real_is_truthy(val)
+                        !val.as_bool().unwrap_or(false)
                     };
                     if should_jump {
                         pc = op.p2 as usize;
@@ -3639,7 +3643,7 @@ impl VdbeEngine {
                     // index B-tree semantics (no rowid, key-only cells).
                     // We create a StorageCursor backed by MemPageStore with
                     // is_table=false so IdxInsert/IdxGE etc. work correctly.
-                    const AUTOINDEX_PAGE_SIZE: u32 = 4096;
+                    let autoindex_page_size = self.page_size.get();
                     let cursor_id = op.p1;
                     self.pending_next_after_delete.remove(&cursor_id);
                     let root_pgno = if let Some(db) = self.db.as_mut() {
@@ -3649,9 +3653,9 @@ impl VdbeEngine {
                         None
                     };
                     if let Some(root_pgno) = root_pgno {
-                        let store = MemPageStore::with_empty_index(root_pgno, AUTOINDEX_PAGE_SIZE);
+                        let store = MemPageStore::with_empty_index(root_pgno, autoindex_page_size);
                         let cx = self.derive_execution_cx();
-                        let cursor = BtCursor::new(store, root_pgno, AUTOINDEX_PAGE_SIZE, false);
+                        let cursor = BtCursor::new(store, root_pgno, autoindex_page_size, false);
                         self.cursors.remove(&cursor_id);
                         self.storage_cursors.insert(
                             cursor_id,
@@ -4766,7 +4770,7 @@ impl VdbeEngine {
                                 ) {
                                     Ok(()) => {
                                         self.pending_idx_entries
-                                            .push((cursor_id, key_bytes.clone()));
+                                            .push((cursor_id, key_bytes.to_vec()));
                                     }
                                     Err(FrankenError::UniqueViolation { .. }) => {
                                         match oe_flag {
@@ -4885,7 +4889,7 @@ impl VdbeEngine {
                             } else {
                                 sc.cursor.index_insert(&sc.cx, &key_bytes)?;
                                 self.pending_idx_entries
-                                    .push((cursor_id, key_bytes.clone()));
+                                    .push((cursor_id, key_bytes.to_vec()));
                             }
                         }
                     }
@@ -4981,7 +4985,7 @@ impl VdbeEngine {
                     let value = if let Some(sorter) = self.sorters.get(&cursor_id) {
                         if let Some(pos) = sorter.position {
                             if let Some(row) = sorter.rows.get(pos) {
-                                SqliteValue::Blob(encode_record(row))
+                                SqliteValue::Blob(encode_record(&row.values))
                             } else {
                                 SqliteValue::Null
                             }
@@ -5612,11 +5616,11 @@ impl VdbeEngine {
                             ))
                         })?;
 
-                    let mut args = Vec::with_capacity(op.p5 as usize);
-                    for i in 0..op.p5 {
-                        let reg_idx = op.p2 + i32::from(i);
-                        args.push(self.get_reg(reg_idx).clone());
-                    }
+                    let start_idx = usize::try_from(op.p2).unwrap_or(0);
+                    let count = usize::from(op.p5);
+                    let end_idx = start_idx.saturating_add(count);
+                    let limit = self.registers.len();
+                    let args = &self.registers[start_idx..end_idx.min(limit)];
 
                     let accum_reg = op.p3;
                     let is_distinct = op.p1 != 0;
@@ -5728,11 +5732,11 @@ impl VdbeEngine {
                         ))
                     })?;
 
-                    let mut args = Vec::with_capacity(op.p5 as usize);
-                    for i in 0..op.p5 {
-                        let reg_idx = op.p2 + i32::from(i);
-                        args.push(self.get_reg(reg_idx).clone());
-                    }
+                    let start_idx = usize::try_from(op.p2).unwrap_or(0);
+                    let count = usize::from(op.p5);
+                    let end_idx = start_idx.saturating_add(count);
+                    let limit = self.registers.len();
+                    let args = &self.registers[start_idx..end_idx.min(limit)];
 
                     let accum_reg = op.p3;
                     let ctx = self.window_contexts.entry_or_insert_with(accum_reg, || {
@@ -5820,10 +5824,6 @@ impl VdbeEngine {
 
                     let args = self.collect_reg_range(first_arg_reg, arg_count);
                     let result = func.invoke(&args)?;
-                    // DEBUG TRACE
-                    if func_name.eq_ignore_ascii_case("strftime") {
-                        println!("DEBUG: strftime called with {:?} -> {:?}", args, result);
-                    }
 
                     if self.trace_opcodes {
                         let result_type = match &result {
@@ -6435,22 +6435,23 @@ impl VdbeEngine {
     }
 
     /// Get the collected result rows.
-    pub fn results(&self) -> &[Vec<SqliteValue>] {
+    pub fn results(&self) -> &[smallvec::SmallVec<[SqliteValue; 8]>] {
         &self.results
     }
 
     /// Take the result rows, consuming them.
-    pub fn take_results(&mut self) -> Vec<Vec<SqliteValue>> {
+    pub fn take_results(&mut self) -> Vec<smallvec::SmallVec<[SqliteValue; 8]>> {
         std::mem::take(&mut self.results)
     }
 
     // ── Helpers ─────────────────────────────────────────────────────────
 
     fn get_reg(&self, r: i32) -> &SqliteValue {
-        usize::try_from(r)
-            .ok()
-            .and_then(|idx| self.registers.get(idx))
-            .unwrap_or(&SqliteValue::Null)
+        if r >= 0 && (r as usize) < self.registers.len() {
+            &self.registers[r as usize]
+        } else {
+            &SqliteValue::Null
+        }
     }
 
     fn reg_with_offset(start: i32, offset: usize) -> Option<i32> {
@@ -6459,31 +6460,32 @@ impl VdbeEngine {
             .and_then(|delta| start.checked_add(delta))
     }
 
-    fn collect_reg_range(&self, start: i32, count: usize) -> Vec<SqliteValue> {
-        (0..count)
-            .map(|offset| {
-                Self::reg_with_offset(start, offset)
-                    .map_or(SqliteValue::Null, |reg| self.get_reg(reg).clone())
-            })
-            .collect()
+    fn collect_reg_range(&self, start: i32, count: usize) -> smallvec::SmallVec<[SqliteValue; 8]> {
+        let mut row = smallvec::SmallVec::with_capacity(count);
+        for offset in 0..count {
+            let val = Self::reg_with_offset(start, offset)
+                .map_or_else(|| SqliteValue::Null, |reg| self.get_reg(reg).clone());
+            row.push(val);
+        }
+        row
     }
 
     fn collect_reg_range_refs(&self, start: i32, count: usize) -> Vec<&SqliteValue> {
-        (0..count)
-            .map(|offset| {
-                Self::reg_with_offset(start, offset)
-                    .map_or(&SqliteValue::Null, |reg| self.get_reg(reg))
-            })
-            .collect()
+        let mut row = Vec::with_capacity(count);
+        for offset in 0..count {
+            let val = Self::reg_with_offset(start, offset)
+                .map_or(&SqliteValue::Null, |reg| self.get_reg(reg));
+            row.push(val);
+        }
+        row
     }
 
     fn take_reg(&mut self, r: i32) -> SqliteValue {
-        usize::try_from(r)
-            .ok()
-            .and_then(|idx| self.registers.get_mut(idx))
-            .map_or(SqliteValue::Null, |slot| {
-                std::mem::replace(slot, SqliteValue::Null)
-            })
+        if r >= 0 && (r as usize) < self.registers.len() {
+            std::mem::replace(&mut self.registers[r as usize], SqliteValue::Null)
+        } else {
+            SqliteValue::Null
+        }
     }
 
     #[allow(clippy::cast_sign_loss)]
@@ -6590,7 +6592,7 @@ impl VdbeEngine {
         if let Some(sorter) = self.sorters.get(&cursor_id) {
             if let Some(pos) = sorter.position {
                 if let Some(row) = sorter.rows.get(pos) {
-                    return Ok(row.get(col_idx).cloned().unwrap_or(SqliteValue::Null));
+                    return Ok(row.values.get(col_idx).cloned().unwrap_or(SqliteValue::Null));
                 }
             }
         }
@@ -6620,7 +6622,7 @@ impl VdbeEngine {
 
     #[allow(clippy::cast_sign_loss)]
     fn open_storage_cursor(&mut self, cursor_id: i32, root_page: i32, writable: bool) -> bool {
-        let page_size_u32 = self.page_size.as_u32();
+        let page_size_u32 = self.page_size.get();
         // bd-1xrs: storage_cursors_enabled check removed.
         // StorageCursor is now the ONLY cursor path.
         let mode = if self.reject_mem_fallback {
@@ -6711,7 +6713,7 @@ impl VdbeEngine {
                     };
                     (is_table, None)
                 };
-                let cursor = BtCursor::new(page_io.clone(), root_pgno, PAGE_SIZE, is_table_btree);
+                let cursor = BtCursor::new(page_io.clone(), root_pgno, self.page_size.get(), is_table_btree);
                 self.storage_cursors.insert(
                     cursor_id,
                     StorageCursor {
@@ -6752,13 +6754,13 @@ impl VdbeEngine {
                     BtreePageType::LeafIndex
                 };
                 // Initialize empty leaf page for the inferred B-tree kind.
-                let mut page = vec![0u8; PAGE_SIZE as usize];
+                let mut page = vec![0u8; self.page_size.get() as usize];
                 page[0] = init_page_type as u8;
                 // Bytes 1-2: first freeblock offset = 0 (none).
                 // Bytes 3-4: cell count = 0.
                 // Bytes 5-6: content area offset = page_size (no cells yet).
                 #[allow(clippy::cast_possible_truncation)]
-                let content_offset = PAGE_SIZE as u16; // PAGE_SIZE=4096 fits in u16
+                let content_offset = self.page_size.get() as u16; // self.page_size.get()=4096 fits in u16
                 page[5..7].copy_from_slice(&content_offset.to_be_bytes());
                 // Byte 7: fragmented free bytes = 0.
 
@@ -6777,7 +6779,7 @@ impl VdbeEngine {
                     );
                     return false;
                 }
-                let cursor = BtCursor::new(page_io.clone(), root_pgno, PAGE_SIZE, is_table_btree);
+                let cursor = BtCursor::new(page_io.clone(), root_pgno, self.page_size.get(), is_table_btree);
                 self.storage_cursors.insert(
                     cursor_id,
                     StorageCursor {
@@ -6862,12 +6864,12 @@ impl VdbeEngine {
             .as_ref()
             .is_none_or(|db| db.get_table(root_page).is_some());
         let store = if is_table_btree {
-            MemPageStore::with_empty_table(root_pgno, PAGE_SIZE)
+            MemPageStore::with_empty_table(root_pgno, self.page_size.get())
         } else {
-            MemPageStore::with_empty_index(root_pgno, PAGE_SIZE)
+            MemPageStore::with_empty_index(root_pgno, self.page_size.get())
         };
         let cx = self.derive_execution_cx();
-        let mut cursor = BtCursor::new(store, root_pgno, PAGE_SIZE, is_table_btree);
+        let mut cursor = BtCursor::new(store, root_pgno, self.page_size.get(), is_table_btree);
         // Populate cursor from MemDatabase if available.
         if is_table_btree
             && let Some(table) = self.db.as_ref().and_then(|db| db.get_table(root_page))
@@ -6938,12 +6940,6 @@ impl VdbeEngine {
 const SQLITE_AFF_TEXT: u16 = 0x42; // 'B'
 const SQLITE_AFF_NUMERIC: u16 = 0x43; // 'C'
 
-/// Apply SQLite comparison affinity coercion (§3.2 of datatype3.html).
-///
-/// Coercion only applies when the comparison opcode's p5 carries a
-/// numeric-class affinity (>= NUMERIC / 0x43).  When p5 is 0 or carries
-/// BLOB affinity (0x41), no coercion is performed — values compare using
-/// their native storage classes (NULL < numeric < text < blob).
 /// C SQLite OP_If/OP_IfNot truthiness: uses `sqlite3VdbeRealValue() != 0.0`,
 /// which means 0.1, 0.5, -0.1 etc. are all truthy (unlike integer truncation).
 fn vdbe_real_is_truthy(val: &SqliteValue) -> bool {
@@ -6961,6 +6957,12 @@ fn vdbe_real_is_truthy(val: &SqliteValue) -> bool {
     }
 }
 
+/// Apply SQLite comparison affinity coercion (§3.2 of datatype3.html).
+///
+/// Coercion only applies when the comparison opcode's p5 carries a
+/// numeric-class affinity (>= NUMERIC / 0x43).  When p5 is 0 or carries
+/// BLOB affinity (0x41), no coercion is performed — values compare using
+/// their native storage classes (NULL < numeric < text < blob).
 fn coerce_for_comparison<'a>(
     lhs: &'a SqliteValue,
     rhs: &'a SqliteValue,

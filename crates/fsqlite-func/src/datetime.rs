@@ -854,7 +854,6 @@ pub struct StrftimeFunc;
 impl ScalarFunction for StrftimeFunc {
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
         if args.len() < 2 || args[0].is_null() || args[1].is_null() {
-            dbg!("strftime early return null", args);
             return Ok(SqliteValue::Null);
         }
         let fmt = args[0].to_text();
@@ -862,7 +861,6 @@ impl ScalarFunction for StrftimeFunc {
         match parse_args(rest) {
             Some((jdn, _)) => Ok(SqliteValue::Text(format_strftime(&fmt, jdn))),
             None => {
-                dbg!("strftime parse_args returned None", args);
                 Ok(SqliteValue::Null)
             }
         }
