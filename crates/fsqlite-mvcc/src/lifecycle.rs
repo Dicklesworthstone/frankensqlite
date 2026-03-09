@@ -323,7 +323,8 @@ pub struct Savepoint {
     /// Snapshot of the write set at the time the savepoint was created.
     /// Maps page -> data so we can restore on ROLLBACK TO.
     /// Uses `Arc` for cheap O(1) creation.
-    pub write_set_snapshot: Arc<HashMap<PageNumber, PageData, fsqlite_types::PageNumberBuildHasher>>,
+    pub write_set_snapshot:
+        Arc<HashMap<PageNumber, PageData, fsqlite_types::PageNumberBuildHasher>>,
     /// Number of pages in write_set when savepoint was created.
     pub write_set_len: usize,
 }

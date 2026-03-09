@@ -796,15 +796,16 @@ impl ScalarFunction for SignFunc {
                 }
             }
             SqliteValue::Text(s) => {
-                // In SQLite, sign() returns NULL if the string cannot be parsed as numeric at all.
-                // It does not coerce non-numeric strings to 0.0 like abs() does.
-                if s.trim().is_empty() {
+                // C SQLite sign() uses sqlite3AtoF — returns NULL for non-numeric text.
+                let trimmed = s.trim();
+                if trimmed.is_empty() {
                     return Ok(SqliteValue::Null);
                 }
 
-                // Let's see if it's entirely non-numeric. We can check if it starts with a digit, +, -, or .
-                let first = s.trim().chars().next().unwrap_or(' ');
-                if !first.is_ascii_digit() && first != '+' && first != '-' && first != '.' {
+                // Try parsing as a number. If the string isn't a valid numeric
+                // representation, return NULL (matching C SQLite behavior).
+                let is_numeric = trimmed.parse::<f64>().is_ok() || trimmed.parse::<i64>().is_ok();
+                if !is_numeric {
                     return Ok(SqliteValue::Null);
                 }
 

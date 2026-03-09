@@ -15451,3 +15451,214 @@ fn test_conformance_last_insert_rowid_changes_s69dv() {
         panic!("{} last_insert_rowid mismatches", mismatches.len());
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════
+// Session 70 conformance oracle tests — float modulo, sign(), window
+// AVG/SUM, IN list NULL in GROUP BY.
+// ═══════════════════════════════════════════════════════════════════
+
+#[test]
+fn test_conformance_float_modulo_s70a() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+    for s in &[
+        "CREATE TABLE modtest(a REAL, b REAL, c INTEGER, d INTEGER)",
+        "INSERT INTO modtest VALUES(2.5, 1.5, 7, 3)",
+        "INSERT INTO modtest VALUES(10.7, 3.2, 10, 3)",
+        "INSERT INTO modtest VALUES(5.0, 2.0, 5, 2)",
+        "INSERT INTO modtest VALUES(-7.5, 2.5, -7, 2)",
+        "INSERT INTO modtest VALUES(1.0, 0.3, 1, 0)",
+    ] {
+        fconn.execute(s).unwrap();
+        rconn.execute_batch(s).unwrap();
+    }
+
+    let queries: &[&str] = &[
+        // Float % Float: should use fmod semantics
+        "SELECT a % b FROM modtest",
+        "SELECT 2.5 % 1.5",
+        "SELECT 10.7 % 3.2",
+        "SELECT 5.0 % 2.0",
+        "SELECT -7.5 % 2.5",
+        "SELECT 1.0 % 0.3",
+        // Float % Integer: should use fmod
+        "SELECT a % d FROM modtest WHERE c = 7",
+        "SELECT 10.7 % 3",
+        "SELECT 2.5 % 2",
+        // Integer % Float: should use fmod
+        "SELECT c % b FROM modtest WHERE c = 7",
+        "SELECT 7 % 2.5",
+        // Integer % Integer: should use integer rem
+        "SELECT c % d FROM modtest",
+        "SELECT 7 % 3",
+        "SELECT 10 % 3",
+        "SELECT -7 % 2",
+        // Division by zero
+        "SELECT c % 0 FROM modtest WHERE c = 5",
+        "SELECT a % 0.0 FROM modtest WHERE c = 5",
+        // Mixed expression
+        "SELECT (a + 1.0) % b FROM modtest WHERE c = 7",
+    ];
+
+    let mismatches = oracle_compare(&fconn, &rconn, queries);
+    if !mismatches.is_empty() {
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
+        panic!("{} float_modulo mismatches", mismatches.len());
+    }
+}
+
+#[test]
+fn test_conformance_sign_text_s70b() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+    let queries: &[&str] = &[
+        // Numeric text: should return sign
+        "SELECT sign('42')",
+        "SELECT sign('-3.14')",
+        "SELECT sign('0')",
+        "SELECT sign('0.0')",
+        "SELECT sign('+5')",
+        "SELECT sign('.5')",
+        "SELECT sign('-.5')",
+        // Non-numeric text: should return NULL
+        "SELECT sign('abc')",
+        "SELECT sign('.abc')",
+        "SELECT sign('+xyz')",
+        "SELECT sign('-hello')",
+        "SELECT sign('')",
+        "SELECT sign(' ')",
+        // Integer and float values
+        "SELECT sign(42)",
+        "SELECT sign(-3)",
+        "SELECT sign(0)",
+        "SELECT sign(3.14)",
+        "SELECT sign(-0.5)",
+        "SELECT sign(0.0)",
+        // NULL
+        "SELECT sign(NULL)",
+    ];
+
+    let mismatches = oracle_compare(&fconn, &rconn, queries);
+    if !mismatches.is_empty() {
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
+        panic!("{} sign_text mismatches", mismatches.len());
+    }
+}
+
+#[test]
+fn test_conformance_window_avg_precision_s70c() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+    for s in &[
+        "CREATE TABLE wavg(id INTEGER PRIMARY KEY, val REAL)",
+        "INSERT INTO wavg VALUES(1, 1e15)",
+        "INSERT INTO wavg VALUES(2, 1.0)",
+        "INSERT INTO wavg VALUES(3, -1e15)",
+        "INSERT INTO wavg VALUES(4, 2.0)",
+        "INSERT INTO wavg VALUES(5, 3.0)",
+        "INSERT INTO wavg VALUES(6, 1e15)",
+        "INSERT INTO wavg VALUES(7, -1e15)",
+        "INSERT INTO wavg VALUES(8, 0.5)",
+    ] {
+        fconn.execute(s).unwrap();
+        rconn.execute_batch(s).unwrap();
+    }
+
+    let queries: &[&str] = &[
+        // Running AVG over values with varying magnitudes
+        "SELECT id, AVG(val) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM wavg",
+        // Sliding window AVG
+        "SELECT id, AVG(val) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) FROM wavg",
+        // Partition AVG
+        "SELECT id, AVG(val) OVER () FROM wavg",
+        // Regular aggregate AVG for comparison
+        "SELECT AVG(val) FROM wavg",
+    ];
+
+    let mismatches = oracle_compare(&fconn, &rconn, queries);
+    if !mismatches.is_empty() {
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
+        panic!("{} window_avg_precision mismatches", mismatches.len());
+    }
+}
+
+#[test]
+fn test_conformance_in_null_group_by_s70d() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+    for s in &[
+        "CREATE TABLE ing(grp TEXT, val INTEGER)",
+        "INSERT INTO ing VALUES('A', 1)",
+        "INSERT INTO ing VALUES('A', 2)",
+        "INSERT INTO ing VALUES('A', NULL)",
+        "INSERT INTO ing VALUES('B', 3)",
+        "INSERT INTO ing VALUES('B', NULL)",
+    ] {
+        fconn.execute(s).unwrap();
+        rconn.execute_batch(s).unwrap();
+    }
+
+    let queries: &[&str] = &[
+        // IN with NULL in list inside GROUP BY aggregate expression
+        "SELECT grp, SUM(CASE WHEN val IN (1, NULL, 3) THEN 1 ELSE 0 END) FROM ing GROUP BY grp",
+        // NOT IN with NULL
+        "SELECT grp, SUM(CASE WHEN val NOT IN (1, NULL) THEN 1 ELSE 0 END) FROM ing GROUP BY grp",
+        // Three-valued IN with NULL propagation in HAVING
+        "SELECT grp, COUNT(*) FROM ing GROUP BY grp HAVING MAX(val) IN (2, NULL)",
+    ];
+
+    let mismatches = oracle_compare(&fconn, &rconn, queries);
+    if !mismatches.is_empty() {
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
+        panic!("{} in_null_group_by mismatches", mismatches.len());
+    }
+}
+
+#[test]
+fn test_conformance_window_sum_int_s70e() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+    for s in &[
+        "CREATE TABLE wsum(id INTEGER PRIMARY KEY, val INTEGER, cat TEXT)",
+        "INSERT INTO wsum VALUES(1, 100, 'X')",
+        "INSERT INTO wsum VALUES(2, 200, 'X')",
+        "INSERT INTO wsum VALUES(3, 300, 'X')",
+        "INSERT INTO wsum VALUES(4, 150, 'Y')",
+        "INSERT INTO wsum VALUES(5, 250, 'Y')",
+    ] {
+        fconn.execute(s).unwrap();
+        rconn.execute_batch(s).unwrap();
+    }
+
+    let queries: &[&str] = &[
+        // Running SUM
+        "SELECT id, SUM(val) OVER (ORDER BY id) FROM wsum",
+        // Partition SUM
+        "SELECT id, SUM(val) OVER (PARTITION BY cat ORDER BY id) FROM wsum",
+        // Sliding window SUM
+        "SELECT id, SUM(val) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM wsum",
+        // total() window
+        "SELECT id, total(val) OVER (ORDER BY id) FROM wsum",
+    ];
+
+    let mismatches = oracle_compare(&fconn, &rconn, queries);
+    if !mismatches.is_empty() {
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
+        panic!("{} window_sum_int mismatches", mismatches.len());
+    }
+}

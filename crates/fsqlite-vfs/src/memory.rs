@@ -457,9 +457,12 @@ impl VfsFile for MemoryFile {
         let mut storage = self.storage.lock().map_err(|_| lock_err())?;
 
         let offset = u64_to_usize(offset, "write offset")?;
-        let end = offset
-            .checked_add(buf.len())
-            .ok_or_else(|| FrankenError::Io(std::io::Error::new(std::io::ErrorKind::Other, "write offset + length overflow")))?;
+        let end = offset.checked_add(buf.len()).ok_or_else(|| {
+            FrankenError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "write offset + length overflow",
+            ))
+        })?;
 
         if offset == storage.data.len() {
             // Fast path: appending exactly at the end. Skips zero-initialization.

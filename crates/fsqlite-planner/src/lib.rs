@@ -3019,7 +3019,6 @@ fn dpccp_order_joins(
 
     let mut state =
         ExhaustiveJoinSearchState::new(tables, &access_paths, &visit_order, cross_join_pairs);
-    eprintln!("VISIT ORDER: {:?}", visit_order);
     state.search();
 
     let order = state.best_order?;

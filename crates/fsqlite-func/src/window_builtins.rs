@@ -31,7 +31,7 @@
 
 use std::collections::VecDeque;
 
-use fsqlite_error::Result;
+use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::SqliteValue;
 
 use crate::{FunctionRegistry, WindowFunction};
@@ -716,6 +716,7 @@ pub struct WindowSumState {
     has_value: bool,
     is_int: bool,
     int_sum: i64,
+    overflowed: bool,
 }
 
 /// Kahan-Babuska-Neumaier compensated summation step (matches C SQLite func.c:1871).
@@ -743,6 +744,7 @@ impl WindowFunction for WindowSumFunc {
             has_value: false,
             is_int: true,
             int_sum: 0,
+            overflowed: false,
         }
     }
 
@@ -753,7 +755,12 @@ impl WindowFunction for WindowSumFunc {
         state.has_value = true;
         match &args[0] {
             SqliteValue::Integer(i) => {
-                state.int_sum = state.int_sum.wrapping_add(*i);
+                if state.is_int && !state.overflowed {
+                    match state.int_sum.checked_add(*i) {
+                        Some(s) => state.int_sum = s,
+                        None => state.overflowed = true,
+                    }
+                }
                 kbn_step(&mut state.sum, &mut state.err, *i as f64);
             }
             SqliteValue::Float(f) => {
@@ -777,7 +784,12 @@ impl WindowFunction for WindowSumFunc {
         }
         match &args[0] {
             SqliteValue::Integer(i) => {
-                state.int_sum = state.int_sum.wrapping_sub(*i);
+                if state.is_int && !state.overflowed {
+                    match state.int_sum.checked_sub(*i) {
+                        Some(s) => state.int_sum = s,
+                        None => state.overflowed = true,
+                    }
+                }
                 kbn_step(&mut state.sum, &mut state.err, -(*i as f64));
             }
             _ => {
@@ -790,6 +802,9 @@ impl WindowFunction for WindowSumFunc {
     fn value(&self, state: &Self::State) -> Result<SqliteValue> {
         if !state.has_value {
             return Ok(SqliteValue::Null);
+        }
+        if state.overflowed {
+            return Err(FrankenError::IntegerOverflow);
         }
         if state.is_int {
             Ok(SqliteValue::Integer(state.int_sum))
@@ -1001,6 +1016,7 @@ impl WindowFunction for WindowMaxFunc {
 
 pub struct WindowAvgState {
     sum: f64,
+    err: f64,
     count: i64,
 }
 
@@ -1010,14 +1026,18 @@ impl WindowFunction for WindowAvgFunc {
     type State = WindowAvgState;
 
     fn initial_state(&self) -> Self::State {
-        WindowAvgState { sum: 0.0, count: 0 }
+        WindowAvgState {
+            sum: 0.0,
+            err: 0.0,
+            count: 0,
+        }
     }
 
     fn step(&self, state: &mut Self::State, args: &[SqliteValue]) -> Result<()> {
         if args.is_empty() || args[0].is_null() {
             return Ok(());
         }
-        state.sum += args[0].to_float();
+        kbn_step(&mut state.sum, &mut state.err, args[0].to_float());
         state.count += 1;
         Ok(())
     }
@@ -1026,7 +1046,7 @@ impl WindowFunction for WindowAvgFunc {
         if args.is_empty() || args[0].is_null() {
             return Ok(());
         }
-        state.sum -= args[0].to_float();
+        kbn_step(&mut state.sum, &mut state.err, -args[0].to_float());
         state.count -= 1;
         Ok(())
     }
@@ -1035,7 +1055,10 @@ impl WindowFunction for WindowAvgFunc {
         if state.count == 0 {
             Ok(SqliteValue::Null)
         } else {
-            Ok(SqliteValue::Float(state.sum / state.count as f64))
+            #[allow(clippy::cast_precision_loss)]
+            Ok(SqliteValue::Float(
+                (state.sum + state.err) / state.count as f64,
+            ))
         }
     }
 

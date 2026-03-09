@@ -214,7 +214,9 @@ impl PageCache {
                 entry.insert(buf);
                 (entry.into_mut().as_mut_slice(), false)
             }
-            std::collections::hash_map::Entry::Vacant(entry) => (entry.insert(buf).as_mut_slice(), true),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                (entry.insert(buf).as_mut_slice(), true)
+            }
         };
         if admitted_new {
             self.admits.set(self.admits.get().saturating_add(1));

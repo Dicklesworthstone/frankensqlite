@@ -2220,7 +2220,8 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
                     .clone();
                 if !top_after.header.page_type.is_leaf() {
                     // Index B-trees: stop at the separator cell.
-                    cursor.stack
+                    cursor
+                        .stack
                         .last_mut()
                         .ok_or_else(|| FrankenError::internal("cursor stack empty"))?
                         .cell_idx = top_after.cell_idx;
@@ -2830,7 +2831,9 @@ mod tests {
     #[test]
     fn test_prefetch_noop_if_unavailable() {
         let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(2, build_interior_table(&[(pn(3), 5)], pn(4)));
+        store
+            .pages
+            .insert(2, build_interior_table(&[(pn(3), 5)], pn(4)));
         store
             .pages
             .insert(3, build_leaf_table(&[(1, b"a"), (5, b"b")]));
@@ -2882,7 +2885,9 @@ mod tests {
     #[test]
     fn test_prefetch_invalid_page_harmless() {
         let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(2, build_leaf_table(&[(1, b"a"), (2, b"b")]));
+        store
+            .pages
+            .insert(2, build_leaf_table(&[(1, b"a"), (2, b"b")]));
 
         let cx = Cx::new();
         let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
@@ -2995,7 +3000,9 @@ mod tests {
     #[test]
     fn test_cursor_index_insert_single_leaf() {
         let mut store = MemPageStore::new(USABLE);
-        store.pages.insert(2, build_leaf_index(&[b"apple", b"pear"]));
+        store
+            .pages
+            .insert(2, build_leaf_index(&[b"apple", b"pear"]));
 
         let cx = Cx::new();
         let mut cursor = BtCursor::new(store, pn(2), USABLE, false);
@@ -3008,9 +3015,10 @@ mod tests {
     #[test]
     fn test_cursor_index_next_visits_interior_separator_cells() {
         let mut store = MemPageStore::new(USABLE);
-        store
-            .pages
-            .insert(2, build_interior_index(&[(pn(3), b"b"), (pn(4), b"d")], pn(5)));
+        store.pages.insert(
+            2,
+            build_interior_index(&[(pn(3), b"b"), (pn(4), b"d")], pn(5)),
+        );
         store
             .pages
             .insert(3, build_leaf_table(&[(1, b"a"), (5, b"b")]));
@@ -3038,9 +3046,10 @@ mod tests {
     #[test]
     fn test_cursor_index_prev_visits_interior_separator_cells() {
         let mut store = MemPageStore::new(USABLE);
-        store
-            .pages
-            .insert(2, build_interior_index(&[(pn(3), b"b"), (pn(4), b"d")], pn(5)));
+        store.pages.insert(
+            2,
+            build_interior_index(&[(pn(3), b"b"), (pn(4), b"d")], pn(5)),
+        );
         store
             .pages
             .insert(3, build_leaf_table(&[(1, b"a"), (5, b"b")]));
@@ -4364,12 +4373,11 @@ mod tests {
             let ptrs = cell::read_cell_pointers(&data, &header, offset).unwrap();
             if ptrs.is_empty() {
                 // Interior page with 0 cells — use right_child.
-                let right =
-                    header
-                        .right_child
-                        .ok_or_else(|| FrankenError::DatabaseCorrupt {
-                            detail: "interior page has no right child".to_owned(),
-                        })?;
+                let right = header
+                    .right_child
+                    .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                        detail: "interior page has no right child".to_owned(),
+                    })?;
                 pgno = right;
             } else {
                 // First cell's left-child pointer (first 4 bytes of cell).
@@ -4380,10 +4388,9 @@ mod tests {
                     data[cell_offset + 2],
                     data[cell_offset + 3],
                 ]);
-                let left =
-                    PageNumber::new(raw).ok_or_else(|| FrankenError::DatabaseCorrupt {
-                        detail: "interior cell has invalid left child pointer".to_owned(),
-                    })?;
+                let left = PageNumber::new(raw).ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: "interior cell has invalid left child pointer".to_owned(),
+                })?;
                 pgno = left;
             }
             depth += 1;

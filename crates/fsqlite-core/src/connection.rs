@@ -2509,7 +2509,7 @@ impl Connection {
 
     /// Compute a 64-bit hash of an SQL string for parse cache lookup.
     fn sql_hash(sql: &str) -> u64 {
-        use std::hash::{Hash, Hasher, BuildHasher};
+        use std::hash::{BuildHasher, Hash, Hasher};
         let mut hasher = foldhash::fast::FixedState::default().build_hasher();
         sql.hash(&mut hasher);
         hasher.finish()
@@ -2801,7 +2801,6 @@ impl Connection {
         params: Option<&[SqliteValue]>,
         precompiled: Option<&VdbeProgram>,
     ) -> Result<Vec<Row>> {
-
         self.sync_change_tracking_context();
         let statement_kind = match &statement {
             Statement::Select(_) => "select",
@@ -2956,7 +2955,6 @@ impl Connection {
         params: Option<&[SqliteValue]>,
         precompiled: Option<&VdbeProgram>,
     ) -> Result<Vec<Row>> {
-
         match statement {
             Statement::CreateTable(create) => {
                 self.execute_create_table(create)?;
@@ -20068,23 +20066,34 @@ fn numeric_div(a: &SqliteValue, b: &SqliteValue) -> SqliteValue {
 
 /// SQL remainder with NULL propagation and division-by-zero → NULL.
 ///
-/// C SQLite: both-integer → Integer result; otherwise fp_math → Float result.
+/// C SQLite: both-integer → Integer result; otherwise fp_math (fmod) → Float result.
 #[allow(clippy::cast_precision_loss)]
 fn numeric_mod(a: &SqliteValue, b: &SqliteValue) -> SqliteValue {
     if a.is_null() || b.is_null() {
         return SqliteValue::Null;
     }
     let both_int = matches!((a, b), (SqliteValue::Integer(_), SqliteValue::Integer(_)));
-    let ai = a.to_integer();
-    let bi = b.to_integer();
-    if bi == 0 {
-        SqliteValue::Null
-    } else {
-        let result = ai.checked_rem(bi).unwrap_or_default();
-        if both_int {
-            SqliteValue::Integer(result)
+    if both_int {
+        let ai = a.to_integer();
+        let bi = b.to_integer();
+        if bi == 0 {
+            SqliteValue::Null
         } else {
-            SqliteValue::Float(result as f64)
+            SqliteValue::Integer(ai.checked_rem(bi).unwrap_or(0))
+        }
+    } else {
+        // C SQLite uses fmod() for non-integer operands.
+        let af = a.to_float();
+        let bf = b.to_float();
+        if bf == 0.0 {
+            SqliteValue::Null
+        } else {
+            let result = af % bf;
+            if result.is_nan() {
+                SqliteValue::Null
+            } else {
+                SqliteValue::Float(result)
+            }
         }
     }
 }
