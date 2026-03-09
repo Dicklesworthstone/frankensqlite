@@ -1413,10 +1413,8 @@ where
                 .lock()
                 .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
             inner.active_transactions = inner.active_transactions.saturating_sub(1);
-            let preserve_level = retained_lock_level_after_txn_exit(
-                inner.active_transactions,
-                inner.writer_active,
-            );
+            let preserve_level =
+                retained_lock_level_after_txn_exit(inner.active_transactions, inner.writer_active);
             let _ = inner.db_file.unlock(cx, preserve_level);
             drop(inner);
             self.committed = true;
@@ -1482,10 +1480,8 @@ where
                 inner.cache.insert_buffer(page_no, buf);
             }
 
-            let preserve_level = retained_lock_level_after_txn_exit(
-                inner.active_transactions,
-                inner.writer_active,
-            );
+            let preserve_level =
+                retained_lock_level_after_txn_exit(inner.active_transactions, inner.writer_active);
             let _ = inner.db_file.unlock(cx, preserve_level);
 
             drop(inner);

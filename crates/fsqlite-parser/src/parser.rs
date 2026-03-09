@@ -132,7 +132,7 @@ impl Parser {
         self.depth = self.depth.saturating_sub(1);
     }
 
-    fn with_recursion_guard<T>(
+    pub(crate) fn with_recursion_guard<T>(
         &mut self,
         f: impl FnOnce(&mut Self) -> Result<T, ParseError>,
     ) -> Result<T, ParseError> {

@@ -11,7 +11,7 @@ mod tests2 {
         let root = PageNumber::new(2).unwrap();
         let store = MemPageStore::with_empty_index(root, 4096);
         let mut cursor = BtCursor::new(store, root, 4096, false);
-        
+
         // Let's print out what happens
         if let Err(e) = cursor.index_insert(&cx, b"M") {
             println!("ERR: {:?}", e);

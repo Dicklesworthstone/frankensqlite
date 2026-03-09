@@ -115,7 +115,8 @@ pub fn execute_checkpoint<F: VfsFile>(
 
     let mut frames_backfilled: u32 = 0;
     let mut last_db_size: Option<u32> = None;
-    let mut latest_frames: std::collections::HashMap<PageNumber, usize> = std::collections::HashMap::new();
+    let mut latest_frames: std::collections::HashMap<PageNumber, usize> =
+        std::collections::HashMap::new();
 
     // Pass 1: Find the latest frame index for each page in the checkpoint range.
     for frame_idx in start..end {

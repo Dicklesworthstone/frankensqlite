@@ -372,6 +372,7 @@ impl InodeTable {
         }
     }
 
+    #[allow(clippy::unused_self, clippy::items_after_statements)]
     fn shard_idx(&self, key: InodeKey) -> usize {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         std::hash::Hash::hash(&key, &mut h);

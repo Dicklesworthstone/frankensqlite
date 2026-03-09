@@ -1620,8 +1620,10 @@ impl WalFecRepairPipeline {
     /// This is a graceful shutdown: queued work is drained before the worker
     /// exits. To force immediate cancellation, call [`Self::cancel`] first.
     pub async fn shutdown(&mut self, cx: &Cx) -> Result<WalFecRepairPipelineStats> {
-        let _mask = cx.masked();
-        self.sender.take();
+        {
+            let _mask = cx.masked();
+            self.sender.take();
+        }
         if let Some(worker) = self.worker.take() {
             worker.await;
         }
@@ -1657,7 +1659,7 @@ async fn run_repair_pipeline_worker(
             "wal-fec repair worker task missing native runtime Cx".to_owned(),
         );
         drain_abandoned_work(
-            &mut receiver,
+            &receiver,
             state.pending_jobs.as_ref(),
             state.canceled_jobs.as_ref(),
         );
@@ -1680,7 +1682,7 @@ async fn run_repair_pipeline_worker(
                     "wal-fec repair worker task cancelled before the queue drained".to_owned(),
                 );
                 drain_abandoned_work(
-                    &mut receiver,
+                    &receiver,
                     state.pending_jobs.as_ref(),
                     state.canceled_jobs.as_ref(),
                 );
@@ -1735,7 +1737,7 @@ async fn run_repair_pipeline_worker(
                         record_worker_failure(&state.worker_failure, detail.clone());
                         error!(group_id = %group_id, "{detail}");
                         drain_abandoned_work(
-                            &mut receiver,
+                            &receiver,
                             state.pending_jobs.as_ref(),
                             state.canceled_jobs.as_ref(),
                         );
@@ -1749,7 +1751,7 @@ async fn run_repair_pipeline_worker(
                         "wal-fec repair worker task cancelled after processing work".to_owned(),
                     );
                     drain_abandoned_work(
-                        &mut receiver,
+                        &receiver,
                         state.pending_jobs.as_ref(),
                         state.canceled_jobs.as_ref(),
                     );
@@ -1775,7 +1777,7 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 fn drain_abandoned_work(
-    receiver: &mut mpsc::Receiver<WalFecPipelineMessage>,
+    receiver: &mpsc::Receiver<WalFecPipelineMessage>,
     pending_jobs: &AtomicUsize,
     canceled_jobs: &AtomicUsize,
 ) {
