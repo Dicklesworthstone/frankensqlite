@@ -5044,7 +5044,7 @@ impl Connection {
         let col_map = column_names
             .iter()
             .cloned()
-            .map(|name| (table_label.clone(), name))
+            .map(|name| (table_label.clone(), name, false))
             .collect::<Vec<_>>();
 
         // Bind placeholders in assignment values so eval_join_expr can
@@ -20278,7 +20278,7 @@ fn should_coerce_for_comparison(
             let col_name = &col_ref.column;
             let table_prefix = col_ref.table.as_deref();
             // Look up the table name from col_map.
-            if let Some((table_name, _)) = col_map.iter().find(|(tbl, col, _)| {
+            if let Some((table_name, _, _)) = col_map.iter().find(|(tbl, col, _)| {
                 col.eq_ignore_ascii_case(col_name)
                     && table_prefix.is_none_or(|p| tbl.eq_ignore_ascii_case(p))
             }) {
