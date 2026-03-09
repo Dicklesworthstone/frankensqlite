@@ -1128,7 +1128,7 @@ fn trigger_when_matches(when_clause: Option<&Expr>, frame: Option<&TriggerFrame>
         bind_trigger_columns_in_expr(&mut bound_expr, active_frame);
     }
     let row: [SqliteValue; 0] = [];
-    let col_map: [(String, String); 0] = [];
+    let col_map: [(String, String, bool); 0] = [];
     match eval_join_expr(&bound_expr, &row, &col_map) {
         Ok(value) => Ok(is_sqlite_truthy(&value)),
         Err(FrankenError::NotImplemented(_)) => Ok(true),
@@ -1230,7 +1230,7 @@ fn trigger_statement_raise_directive(
 
     if let Some(predicate) = where_clause {
         let row: [SqliteValue; 0] = [];
-        let col_map: [(String, String); 0] = [];
+        let col_map: [(String, String, bool); 0] = [];
         let predicate_val = eval_join_expr(predicate, &row, &col_map)?;
         if !is_sqlite_truthy(&predicate_val) {
             return Ok(None);
@@ -11968,8 +11968,8 @@ impl Connection {
                     .collect::<Vec<_>>(),
                 ResultColumn::TableStar(tbl) => col_map
                     .iter()
-                    .filter(|(t, _)| t.eq_ignore_ascii_case(tbl))
-                    .map(|(t, c)| ResultColumn::Expr {
+                    .filter(|(t, _, _)| t.eq_ignore_ascii_case(tbl))
+                    .map(|(t, c, _)| ResultColumn::Expr {
                         expr: Expr::Column(
                             ColumnRef::qualified(t.clone(), c.clone()),
                             Span::new(0, 0),
@@ -12025,7 +12025,7 @@ impl Connection {
                                     Expr::Column(cr, _) => cr.table.as_deref(),
                                     _ => None,
                                 };
-                                Some(find_col_in_map(&col_map, table_prefix, col_name)?)
+                                Some(find_col_in_map(&col_map, table_prefix, col_name, None)?)
                             } else {
                                 arg_expr = Some(Box::new(exprs[0].clone()));
                                 None
@@ -12040,7 +12040,7 @@ impl Connection {
                                     Expr::Column(cr, _) => cr.table.as_deref(),
                                     _ => None,
                                 };
-                                Some(find_col_in_map(&col_map, table_prefix, col_name)?)
+                                Some(find_col_in_map(&col_map, table_prefix, col_name, None)?)
                             } else {
                                 arg_expr = Some(Box::new(exprs[0].clone()));
                                 None
@@ -12462,7 +12462,7 @@ impl Connection {
     fn col_map_for_source(
         source: &TableOrSubquery,
         schema: &[TableSchema],
-        col_map: &mut Vec<(String, String)>,
+        col_map: &mut Vec<(String, String, bool)>,
     ) {
         match source {
             TableOrSubquery::Table { name, alias, .. } => {
@@ -12488,7 +12488,7 @@ impl Connection {
                             let resolved = resolve_subquery_star_columns(query, schema);
                             for name in resolved {
                                 if name != "*" && !name.ends_with(".*") {
-                                    col_map.push((label.to_owned(), name));
+                                    col_map.push((label.to_owned(), name, false));
                                 }
                             }
                         } else {
@@ -12508,7 +12508,7 @@ impl Connection {
                                         unreachable!()
                                     }
                                 };
-                                col_map.push((label.to_owned(), col_name));
+                                col_map.push((label.to_owned(), col_name, false));
                             }
                         }
                     }
@@ -12541,7 +12541,7 @@ impl Connection {
             ));
         };
         let empty_row: Vec<SqliteValue> = Vec::new();
-        let empty_col_map: Vec<(String, String)> = Vec::new();
+        let empty_col_map: Vec<(String, String, bool)> = Vec::new();
 
         // If there is a WHERE clause that evaluates to false/NULL, the
         // implicit single row is excluded -- aggregates return empty-set
@@ -12663,7 +12663,7 @@ impl Connection {
             ));
         };
         let empty_row: Vec<SqliteValue> = Vec::new();
-        let empty_col_map: Vec<(String, String)> = Vec::new();
+        let empty_col_map: Vec<(String, String, bool)> = Vec::new();
         let mut values = Vec::with_capacity(columns.len());
         for col in columns {
             match col {
@@ -12687,7 +12687,7 @@ impl Connection {
         &self,
         expr: &Expr,
         row: &[SqliteValue],
-        col_map: &[(String, String)],
+        col_map: &[(String, String, bool)],
         params: Option<&[SqliteValue]>,
     ) -> Result<SqliteValue> {
         match expr {
@@ -12928,10 +12928,10 @@ impl Connection {
         // Use the alias as the table label when present so that alias-qualified
         // column references (e.g. `t.dept` when FROM table AS t) resolve correctly.
         let effective_label = table_alias.as_deref().unwrap_or(&table_name);
-        let col_map: Vec<(String, String)> = table_schema
+        let col_map: Vec<(String, String, bool)> = table_schema
             .columns
             .iter()
-            .map(|c| (effective_label.to_owned(), c.name.clone()))
+            .map(|c| (effective_label.to_owned(), c.name.clone(), false))
             .collect();
 
         // Resolve the INTEGER PRIMARY KEY column name so that rowid/_rowid_/oid
@@ -13497,8 +13497,8 @@ impl Connection {
                         .collect::<Vec<_>>(),
                     ResultColumn::TableStar(tbl) => cmap
                         .iter()
-                        .filter(|(t, _)| t.eq_ignore_ascii_case(tbl))
-                        .map(|(t, c)| ResultColumn::Expr {
+                        .filter(|(t, _, _)| t.eq_ignore_ascii_case(tbl))
+                        .map(|(t, c, _)| ResultColumn::Expr {
                             expr: Expr::Column(
                                 ColumnRef::qualified(t.clone(), c.clone()),
                                 Span::new(0, 0),
@@ -13538,7 +13538,7 @@ impl Connection {
             let cmap: Vec<(String, String)> = table_schema
                 .columns
                 .iter()
-                .map(|c| (effective_label.to_owned(), c.name.clone()))
+                .map(|c| (effective_label.to_owned(), c.name.clone(), false))
                 .collect();
             let expanded: Vec<ResultColumn> = columns
                 .iter()
@@ -14836,7 +14836,7 @@ impl Connection {
 
         // ── 2. Build the combined column map ──
         // col_map entries: (table_label, col_name, combined_index)
-        let mut col_map: Vec<(String, String)> = Vec::new();
+        let mut col_map: Vec<(String, String, bool)> = Vec::new();
         for src in &table_sources {
             let label = src.alias.as_deref().unwrap_or(&src.table_name);
             for col_name in &src.col_names {
@@ -14997,8 +14997,8 @@ impl Connection {
                     .collect::<Vec<_>>(),
                 ResultColumn::TableStar(tbl_name) => col_map
                     .iter()
-                    .filter(|(t, _)| t.eq_ignore_ascii_case(tbl_name))
-                    .map(|(t, c)| ResultColumn::Expr {
+                    .filter(|(t, _, _)| t.eq_ignore_ascii_case(tbl_name))
+                    .map(|(t, c, _)| ResultColumn::Expr {
                         expr: Expr::Column(
                             ColumnRef::qualified(t.clone(), c.clone()),
                             Span::new(0, 0),
@@ -15153,7 +15153,7 @@ impl Connection {
         &self,
         expr: &Expr,
         row: &[SqliteValue],
-        outer_col_map: &[(String, String)],
+        outer_col_map: &[(String, String, bool)],
     ) -> Result<Expr> {
         match expr {
             Expr::Subquery(sub, span) => {
@@ -15296,7 +15296,7 @@ impl Connection {
         &self,
         expr: &Expr,
         row: &[SqliteValue],
-        col_map: &[(String, String)],
+        col_map: &[(String, String, bool)],
     ) -> Result<Expr> {
         match expr {
             Expr::Exists {
@@ -15458,7 +15458,7 @@ impl Connection {
         insert: &fsqlite_ast::InsertStatement,
     ) -> Result<fsqlite_ast::InsertStatement> {
         let empty_row: &[SqliteValue] = &[];
-        let empty_col_map: &[(String, String)] = &[];
+        let empty_col_map: &[(String, String, bool)] = &[];
         let resolve_rows = |rows: &[Vec<Expr>]| -> Result<Vec<Vec<Expr>>> {
             rows.iter()
                 .map(|row| {
@@ -18135,7 +18135,7 @@ fn select_has_correlated_join_subquery(select: &SelectStatement) -> bool {
 fn substitute_outer_refs_in_expr(
     expr: &Expr,
     row: &[SqliteValue],
-    outer_col_map: &[(String, String)],
+    outer_col_map: &[(String, String, bool)],
     inner_tables: &[String],
 ) -> Expr {
     match expr {
@@ -18146,7 +18146,7 @@ fn substitute_outer_refs_in_expr(
                     .any(|t| t.eq_ignore_ascii_case(qualifier));
                 if !is_inner {
                     if let Ok(idx) =
-                        find_col_in_map(outer_col_map, Some(qualifier), &col_ref.column)
+                        find_col_in_map(outer_col_map, Some(qualifier), &col_ref.column, None)
                     {
                         let val = row.get(idx).cloned().unwrap_or(SqliteValue::Null);
                         return value_to_literal_expr(val);
@@ -18396,7 +18396,7 @@ fn substitute_outer_refs_in_expr(
 fn substitute_outer_refs_in_select(
     select: &mut SelectStatement,
     row: &[SqliteValue],
-    outer_col_map: &[(String, String)],
+    outer_col_map: &[(String, String, bool)],
     inner_tables: &[String],
 ) {
     if let SelectCore::Select {
@@ -18637,7 +18637,7 @@ fn expr_contains_agg(expr: &Expr) -> bool {
 fn eval_group_agg_join_expr(
     expr: &Expr,
     group_rows: &[&Vec<SqliteValue>],
-    col_map: &[(String, String)],
+    col_map: &[(String, String, bool)],
 ) -> Result<SqliteValue> {
     match expr {
         Expr::FunctionCall {
@@ -19203,7 +19203,7 @@ fn build_peer_groups(
     partition_indices: &[usize],
     order_by: &[(Expr, bool)],
     row_values: &[Vec<SqliteValue>],
-    col_map: &[(String, String)],
+    col_map: &[(String, String, bool)],
 ) -> Vec<Vec<usize>> {
     if partition_indices.is_empty() {
         return Vec::new();
@@ -19264,7 +19264,7 @@ fn range_value_frame_bounds(
     partition_indices: &[usize],
     order_by: &[(Expr, bool)],
     row_values: &[Vec<SqliteValue>],
-    col_map: &[(String, String)],
+    col_map: &[(String, String, bool)],
     frame: &FrameSpec,
 ) -> (usize, usize) {
     // Extract current row's ORDER BY value as f64 for arithmetic comparison.
@@ -19340,7 +19340,7 @@ fn build_window_args(
     func_args: &[Expr],
     order_by: &[(Expr, bool)],
     row: &[SqliteValue],
-    col_map: &[(String, String)],
+    col_map: &[(String, String, bool)],
 ) -> Result<Vec<SqliteValue>> {
     if func_args.is_empty() {
         order_by
@@ -19410,7 +19410,7 @@ fn evaluate_having_predicate(
     descriptors: &[GroupByColumn],
     columns: &[ResultColumn],
     group_rows: &[Vec<SqliteValue>],
-    col_map: &[(String, String)],
+    col_map: &[(String, String, bool)],
 ) -> bool {
     is_sqlite_truthy(&evaluate_having_value(
         expr,
@@ -19457,7 +19457,7 @@ fn evaluate_having_value(
     descriptors: &[GroupByColumn],
     columns: &[ResultColumn],
     group_rows: &[Vec<SqliteValue>],
-    col_map: &[(String, String)],
+    col_map: &[(String, String, bool)],
 ) -> SqliteValue {
     match expr {
         // Aggregate function -- first try matching a result column, then compute directly.
@@ -19543,7 +19543,7 @@ fn evaluate_having_value(
             }
             // Fall back to resolving from raw group data via col_map.
             let table_prefix = col_ref.table.as_deref();
-            if let Ok(idx) = find_col_in_map(col_map, table_prefix, col_name) {
+            if let Ok(idx) = find_col_in_map(col_map, table_prefix, col_name, None) {
                 return group_rows
                     .first()
                     .and_then(|r| r.get(idx))
@@ -19908,7 +19908,7 @@ fn evaluate_having_value(
 
 /// Evaluate a non-aggregate expression (CASE, arithmetic, etc.) against a raw
 /// group row using the column map.  Returns Null on errors or unresolvable refs.
-fn eval_having_expr(expr: &Expr, row: &[SqliteValue], col_map: &[(String, String)]) -> SqliteValue {
+fn eval_having_expr(expr: &Expr, row: &[SqliteValue], col_map: &[(String, String, bool)]) -> SqliteValue {
     eval_join_expr(expr, row, col_map).unwrap_or(SqliteValue::Null)
 }
 
@@ -19918,7 +19918,7 @@ fn compute_having_aggregate(
     func: &str,
     args: &FunctionArgs,
     group_rows: &[Vec<SqliteValue>],
-    col_map: &[(String, String)],
+    col_map: &[(String, String, bool)],
 ) -> SqliteValue {
     // Determine whether the argument is a simple column ref or a complex
     // expression that needs per-row evaluation.
@@ -19937,7 +19937,7 @@ fn compute_having_aggregate(
                     Expr::Column(cr, _) => cr.table.as_deref(),
                     _ => None,
                 };
-                if let Ok(idx) = find_col_in_map(col_map, table_prefix, col_name) {
+                if let Ok(idx) = find_col_in_map(col_map, table_prefix, col_name, None) {
                     ArgSource::ColIdx(idx)
                 } else {
                     return SqliteValue::Null;
@@ -20266,19 +20266,19 @@ fn cmp_values_no_affinity(a: &SqliteValue, b: &SqliteValue) -> std::cmp::Orderin
 fn should_coerce_for_comparison(
     left: &Expr,
     right: &Expr,
-    col_map: &[(String, String)],
+    col_map: &[(String, String, bool)],
     schemas: &[TableSchema],
 ) -> bool {
     fn expr_has_numeric_affinity(
         expr: &Expr,
-        col_map: &[(String, String)],
+        col_map: &[(String, String, bool)],
         schemas: &[TableSchema],
     ) -> bool {
         if let Expr::Column(col_ref, _) = expr {
             let col_name = &col_ref.column;
             let table_prefix = col_ref.table.as_deref();
             // Look up the table name from col_map.
-            if let Some((table_name, _)) = col_map.iter().find(|(tbl, col)| {
+            if let Some((table_name, _)) = col_map.iter().find(|(tbl, col, _)| {
                 col.eq_ignore_ascii_case(col_name)
                     && table_prefix.is_none_or(|p| tbl.eq_ignore_ascii_case(p))
             }) {
@@ -23668,7 +23668,7 @@ fn execute_single_join(
     left_width: usize,
     kind: JoinKind,
     constraint: Option<&JoinConstraint>,
-    col_map: &[(String, String)],
+    col_map: &[(String, String, bool)],
 ) -> Result<Vec<Vec<SqliteValue>>> {
     let mut result = Vec::new();
     let combined_width = left_width + right_width;
@@ -23738,7 +23738,7 @@ fn execute_single_join(
 fn eval_using_constraint(
     cols: &[String],
     combined_row: &[SqliteValue],
-    col_map: &[(String, String)],
+    col_map: &[(String, String, bool)],
     left_width: usize,
 ) -> bool {
     for col_name in cols {
@@ -23746,13 +23746,13 @@ fn eval_using_constraint(
         let left_val = col_map[..left_width]
             .iter()
             .enumerate()
-            .find(|(_, (_, name))| name.eq_ignore_ascii_case(col_name))
+            .find(|(_, (_, name, _))| name.eq_ignore_ascii_case(col_name))
             .and_then(|(i, _)| combined_row.get(i));
         // Find the column in the right side.
         let right_val = col_map[left_width..]
             .iter()
             .enumerate()
-            .find(|(_, (_, name))| name.eq_ignore_ascii_case(col_name))
+            .find(|(_, (_, name, _))| name.eq_ignore_ascii_case(col_name))
             .and_then(|(i, _)| combined_row.get(left_width + i));
 
         match (left_val, right_val) {
@@ -23776,7 +23776,7 @@ fn eval_using_constraint(
 fn eval_join_predicate(
     expr: &Expr,
     row: &[SqliteValue],
-    col_map: &[(String, String)],
+    col_map: &[(String, String, bool)],
 ) -> Result<bool> {
     let val = eval_join_expr(expr, row, col_map)?;
     Ok(is_sqlite_truthy(&val))
@@ -23787,13 +23787,13 @@ fn eval_join_predicate(
 fn eval_join_expr(
     expr: &Expr,
     row: &[SqliteValue],
-    col_map: &[(String, String)],
+    col_map: &[(String, String, bool)],
 ) -> Result<SqliteValue> {
     match expr {
         Expr::Column(col_ref, _) => {
             let col_name = &col_ref.column;
             let table_prefix = col_ref.table.as_deref();
-            if let Ok(idx) = find_col_in_map(col_map, table_prefix, col_name) {
+            if let Ok(idx) = find_col_in_map(col_map, table_prefix, col_name, None) {
                 return Ok(row.get(idx).cloned().unwrap_or(SqliteValue::Null));
             }
 
@@ -23802,12 +23802,12 @@ fn eval_join_expr(
             if table_prefix.is_none()
                 && col_map
                     .iter()
-                    .any(|(table, _)| table.eq_ignore_ascii_case(col_name))
+                    .any(|(table, _, _)| table.eq_ignore_ascii_case(col_name))
             {
                 let text = col_map
                     .iter()
                     .enumerate()
-                    .filter(|(_, (table, _))| table.eq_ignore_ascii_case(col_name))
+                    .filter(|(_, (table, _, _))| table.eq_ignore_ascii_case(col_name))
                     .filter_map(|(idx, _)| row.get(idx))
                     .filter(|value| !matches!(value, SqliteValue::Null))
                     .map(sqlite_value_to_text)
@@ -24056,24 +24056,39 @@ fn eval_join_expr(
 
 /// Find a column's index in the combined column map.
 fn find_col_in_map(
-    col_map: &[(String, String)],
+    col_map: &[(String, String, bool)],
     table_prefix: Option<&str>,
     col_name: &str,
+    using_skip_indices: Option<&HashSet<usize>>,
 ) -> Result<usize> {
     if let Some(prefix) = table_prefix {
         // Qualified: match table label + column name.
         col_map
             .iter()
-            .position(|(tbl, col)| {
+            .position(|(tbl, col, _)| {
                 tbl.eq_ignore_ascii_case(prefix) && col.eq_ignore_ascii_case(col_name)
             })
             .ok_or_else(|| FrankenError::Internal(format!("column not found: {prefix}.{col_name}")))
     } else {
-        // Unqualified: first match wins (left-to-right).
-        col_map
-            .iter()
-            .position(|(_, col)| col.eq_ignore_ascii_case(col_name))
-            .ok_or_else(|| FrankenError::Internal(format!("column not found: {col_name}")))
+        // Unqualified: find all matches, ignoring skipped USING columns.
+        let mut first = None;
+        let mut ambiguous = false;
+        for (i, (_, col, _)) in col_map.iter().enumerate() {
+            if using_skip_indices.is_some_and(|s| s.contains(&i)) {
+                continue;
+            }
+            if col.eq_ignore_ascii_case(col_name) {
+                if first.is_none() {
+                    first = Some(i);
+                } else {
+                    ambiguous = true;
+                }
+            }
+        }
+        if ambiguous {
+            return Err(FrankenError::AmbiguousColumn { name: col_name.to_owned() });
+        }
+        first.ok_or_else(|| FrankenError::Internal(format!("column not found: {col_name}")))
     }
 }
 
@@ -24102,7 +24117,7 @@ fn is_rowid_alias(name: &str) -> bool {
 fn resolve_group_by_aliases(
     group_by_exprs: &mut [Expr],
     columns: &[ResultColumn],
-    col_map: &[(String, String)],
+    col_map: &[(String, String, bool)],
 ) {
     for expr in group_by_exprs.iter_mut() {
         // Numeric index: GROUP BY 1 → group by the first result column.
@@ -24121,7 +24136,7 @@ fn resolve_group_by_aliases(
             }
             let name = &col_ref.column;
             // If the identifier resolves to a table column, leave it as-is.
-            if find_col_in_map(col_map, None, name).is_ok() {
+            if find_col_in_map(col_map, None, name, None).is_ok() {
                 continue;
             }
             // Look for a matching SELECT-list alias.
@@ -24648,6 +24663,62 @@ fn eval_scalar_fn(name: &str, args: &[SqliteValue]) -> SqliteValue {
             };
             SqliteValue::Text(type_name.to_owned())
         }
+        "strftime" => {
+            use fsqlite_func::ScalarFunction;
+            if let Ok(v) = fsqlite_func::datetime::StrftimeFunc.invoke(args) {
+                v
+            } else {
+                SqliteValue::Null
+            }
+        }
+        "date" => {
+            use fsqlite_func::ScalarFunction;
+            if let Ok(v) = fsqlite_func::datetime::DateFunc.invoke(args) {
+                v
+            } else {
+                SqliteValue::Null
+            }
+        }
+        "time" => {
+            use fsqlite_func::ScalarFunction;
+            if let Ok(v) = fsqlite_func::datetime::TimeFunc.invoke(args) {
+                v
+            } else {
+                SqliteValue::Null
+            }
+        }
+        "datetime" => {
+            use fsqlite_func::ScalarFunction;
+            if let Ok(v) = fsqlite_func::datetime::DateTimeFunc.invoke(args) {
+                v
+            } else {
+                SqliteValue::Null
+            }
+        }
+        "julianday" => {
+            use fsqlite_func::ScalarFunction;
+            if let Ok(v) = fsqlite_func::datetime::JuliandayFunc.invoke(args) {
+                v
+            } else {
+                SqliteValue::Null
+            }
+        }
+        "unixepoch" => {
+            use fsqlite_func::ScalarFunction;
+            if let Ok(v) = fsqlite_func::datetime::UnixepochFunc.invoke(args) {
+                v
+            } else {
+                SqliteValue::Null
+            }
+        }
+        "timediff" => {
+            use fsqlite_func::ScalarFunction;
+            if let Ok(v) = fsqlite_func::datetime::TimediffFunc.invoke(args) {
+                v
+            } else {
+                SqliteValue::Null
+            }
+        }
         "iif" => {
             if args.len() >= 3 {
                 if is_sqlite_truthy(&args[0]) {
@@ -24971,7 +25042,7 @@ fn eval_scalar_fn(name: &str, args: &[SqliteValue]) -> SqliteValue {
 fn project_join_column(
     col: &ResultColumn,
     row: &[SqliteValue],
-    col_map: &[(String, String)],
+    col_map: &[(String, String, bool)],
 ) -> SqliteValue {
     match col {
         ResultColumn::Expr { expr, .. } => {
