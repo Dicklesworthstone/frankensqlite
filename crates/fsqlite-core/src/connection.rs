@@ -846,7 +846,7 @@ impl PreparedStatement<'_> {
         let op_cx = self.conn.op_cx()?;
         self.ensure_schema_unchanged(&op_cx)?;
         if let Some(statement) = &self.deferred_query_statement {
-            return self.conn.execute_statement(statement.clone(), None);
+            return self.conn.execute_statement(statement, None);
         }
         let mut rows = if self.db.is_some() {
             self.execute_table_query(&op_cx, None)?
@@ -882,7 +882,7 @@ impl PreparedStatement<'_> {
         let op_cx = self.conn.op_cx()?;
         self.ensure_schema_unchanged(&op_cx)?;
         if let Some(statement) = &self.deferred_query_statement {
-            return self.conn.execute_statement(statement.clone(), Some(params));
+            return self.conn.execute_statement(statement, Some(params));
         }
         let mut rows = if self.db.is_some() {
             self.execute_table_query(&op_cx, Some(params))?
@@ -2364,7 +2364,7 @@ impl Connection {
         };
         let mut rows = Vec::new();
         for statement in statements {
-            rows = self.execute_statement(&statement, None)?;
+            rows = self.execute_statement(statement.as_ref(), None)?;
         }
         Ok(rows)
     }
@@ -2419,10 +2419,10 @@ impl Connection {
         let mut last_count = 0;
         for statement in statements {
             let is_dml = matches!(
-                &statement,
+                statement.as_ref(),
                 Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
             );
-            let rows = self.execute_statement(&statement, None)?;
+            let rows = self.execute_statement(statement.as_ref(), None)?;
             last_count = if is_dml {
                 *self.last_changes.borrow()
             } else {
@@ -2542,7 +2542,7 @@ impl Connection {
         if stmts.len() == 1 {
             self.insert_parse_cache(key, sql, stmts[0].clone());
         }
-        Ok(stmts)
+        Ok(stmts.into_iter().map(std::sync::Arc::new).collect())
     }
 
     fn refresh_parse_cache_if_needed(&self) {
@@ -3503,19 +3503,6 @@ impl Connection {
                     }
                 }
 
-                let affected = if has_before_delete || has_after_delete {
-                    trigger_old_rows.len()
-                } else if let Some(materialized_rows) = limited_row_count_hint {
-                    materialized_rows
-                } else {
-                    self.count_matching_rows(
-                        &effective_delete.table,
-                        effective_delete.where_clause.as_ref(),
-                        &effective_delete.order_by,
-                        effective_delete.limit.as_ref(),
-                        params,
-                    )?
-                };
                 let program = {
                     let plan_span = tracing::span!(
                         target: "fsqlite.plan",
@@ -3531,7 +3518,7 @@ impl Connection {
                         conn.compile_table_delete(&effective_delete)
                     })?
                 };
-                let (rows, _, _) = self.execute_table_program(&program, params)?;
+                let (rows, affected, _) = self.execute_table_program(&program, params)?;
 
                 // Phase 5G.3: Fire AFTER DELETE triggers.
                 if has_after_delete {
@@ -3612,7 +3599,7 @@ impl Connection {
             // ANALYZE and REINDEX are no-ops for now
             Statement::Analyze(_) | Statement::Reindex(_) => Ok(Vec::new()),
             Statement::Explain { query_plan, stmt } => {
-                self.execute_explain(*stmt, query_plan, params)
+                self.execute_explain(*stmt, *query_plan, params)
             }
             Statement::Attach(ref attach) => {
                 let path_rows = self.execute_statement(
@@ -3677,7 +3664,7 @@ impl Connection {
         // Fast path: if the statement has no EXISTS/scalar-subquery expressions
         // in rewrite-covered locations, skip the clone/traversal rewrite pass.
         if !statement_contains_rewritable_subquery(statement) {
-            return Ok(std::borrow::Cow::Borrowed(statement));
+            return Ok(statement);
         }
         match statement {
             Statement::Select(ref select) if select.with.is_some() => {
@@ -3685,7 +3672,7 @@ impl Connection {
                 // been materialized yet.  Subqueries may reference CTE names,
                 // so skip eager rewriting here — it will happen after CTE
                 // materialization inside execute_with_ctes.
-                Ok(std::borrow::Cow::Borrowed(statement))
+                Ok(statement)
             }
             Statement::Select(ref select)
                 if is_expression_only_select(select) && expression_only_has_subquery(select) =>
@@ -3696,13 +3683,13 @@ impl Connection {
                 // subquery via execute_statement would create nested autocommit
                 // transactions that can trigger reload_memdb_from_pager,
                 // destroying CTE temp tables between subquery evaluations.
-                Ok(std::borrow::Cow::Borrowed(statement))
+                Ok(statement)
             }
             Statement::Select(select) => {
                 let rewritten = self.rewrite_subqueries(&select, params)?;
                 Ok(std::borrow::Cow::Owned(Statement::Select(rewritten)))
             }
-            Statement::Update(ref update) if update.with.is_some() => Ok(std::borrow::Cow::Borrowed(statement)),
+            Statement::Update(ref update) if update.with.is_some() => Ok(statement),
             Statement::Update(update) => {
                 let mut update = update.clone();
                 // Rewrite EXISTS / scalar subqueries, plus IN subqueries that
@@ -3715,7 +3702,7 @@ impl Connection {
                 }
                 Ok(std::borrow::Cow::Owned(Statement::Update(update)))
             }
-            Statement::Delete(ref delete) if delete.with.is_some() => Ok(std::borrow::Cow::Borrowed(statement)),
+            Statement::Delete(ref delete) if delete.with.is_some() => Ok(statement),
             Statement::Delete(delete) => {
                 let mut delete = delete.clone();
                 // Rewrite EXISTS / scalar subqueries, plus IN subqueries that
@@ -3725,7 +3712,7 @@ impl Connection {
                 }
                 Ok(std::borrow::Cow::Owned(Statement::Delete(delete)))
             }
-            other => Ok(other),
+            other => Ok(std::borrow::Cow::Borrowed(other)),
         }
     }
 
@@ -12431,7 +12418,7 @@ impl Connection {
     }
 
     /// Build a col_map with original table labels for a SELECT with JOINs.
-    fn build_join_col_map(&self, select: &SelectStatement) -> Vec<(String, String)> {
+    fn build_join_col_map(&self, select: &SelectStatement) -> Vec<(String, String, bool)> {
         let mut col_map = Vec::new();
         let schema = self.schema.borrow();
         if let SelectCore::Select {
@@ -12460,7 +12447,7 @@ impl Connection {
                     .find(|t| t.name.eq_ignore_ascii_case(&name.name))
                 {
                     for c in &ts.columns {
-                        col_map.push((label.to_owned(), c.name.clone()));
+                        col_map.push((label.to_owned(), c.name.clone(), false));
                     }
                 }
             }
@@ -12503,7 +12490,7 @@ impl Connection {
                     SelectCore::Values(rows) => {
                         let width = rows.first().map_or(0, Vec::len);
                         for i in 0..width {
-                            col_map.push((label.to_owned(), format!("column{}", i + 1)));
+                            col_map.push((label.to_owned(), format!("column{}", i + 1), false));
                         }
                     }
                 }
@@ -13629,14 +13616,14 @@ impl Connection {
                         },
                     ..
                 } => {
-                    let spec = resolve_window_spec(raw_spec);
+                    let spec = resolve_window_spec(&raw_spec);
                     let arg_exprs = match args {
                         FunctionArgs::List(exprs) => exprs.clone(),
                         FunctionArgs::Star => vec![],
                     };
                     #[allow(clippy::cast_possible_wrap)]
                     let num_args = arg_exprs.len() as i32;
-                    let func = registry.find_window(name, num_args).ok_or_else(|| {
+                    let func = registry.find_window(&name, num_args).ok_or_else(|| {
                         FrankenError::Internal(format!(
                             "no such window function: {name}/{num_args}"
                         ))
@@ -13676,13 +13663,13 @@ impl Connection {
                     win_filters.push(filter.as_deref().cloned());
                     col_kinds.push(ColKind::Window(idx));
                 }
-                ResultColumn::Expr { expr, .. } if expr_has_window_function(expr) => {
+                ResultColumn::Expr { expr, .. } if expr_has_window_function(&expr) => {
                     // The expression contains a nested window function
                     // (e.g., ROUND(AVG(val) OVER (...), 2)).  Extract the
                     // inner window call, register it, and wrap the outer
                     // expression with a placeholder.
                     let (inner_name, inner_args, raw_inner_spec, inner_filter) =
-                        extract_inner_window_function(expr).ok_or_else(|| {
+                        extract_inner_window_function(&expr).ok_or_else(|| {
                             FrankenError::Internal(
                                 "expr_has_window_function=true but cannot extract".to_owned(),
                             )
@@ -13734,7 +13721,7 @@ impl Connection {
                     win_frame_specs.push(inner_spec.frame.clone());
                     win_filters.push(inner_filter);
                     // Replace the inner window call with a placeholder in the outer expr.
-                    let outer_with_placeholder = replace_window_with_placeholder(expr);
+                    let outer_with_placeholder = replace_window_with_placeholder(&expr);
                     col_kinds.push(ColKind::WrappedWindow(idx, outer_with_placeholder));
                 }
                 ResultColumn::Expr { expr, .. } => {
@@ -14797,7 +14784,7 @@ impl Connection {
             if pre.is_some() {
                 if let TableOrSubquery::Subquery { query, .. } = all_sources[i] {
                     let rows =
-                        self.execute_statement(Statement::Select(query.as_ref().clone()), None)?;
+                        self.execute_statement(&Statement::Select(query.as_ref().clone()), None)?;
                     let row_data: Vec<Vec<SqliteValue>> =
                         rows.iter().map(|r| r.values().to_vec()).collect();
                     // If col_names contains "*" (unresolved star), resolve it
@@ -14828,7 +14815,7 @@ impl Connection {
         for src in &table_sources {
             let label = src.alias.as_deref().unwrap_or(&src.table_name);
             for col_name in &src.col_names {
-                col_map.push((label.to_owned(), col_name.clone()));
+                col_map.push((label.to_owned(), col_name.clone(), false));
             }
         }
 
@@ -43944,10 +43931,10 @@ mod pager_routing_tests {
         *conn.parse_cache_cookie.borrow_mut() = cookie;
         conn.parse_cache.borrow_mut().put(
             key,
-            ParseCacheEntry {
+            std::sync::Arc::new(ParseCacheEntry {
                 sql: cached_sql.to_owned(),
                 statement: Arc::new(statement),
-            },
+            }),
         );
 
         // If execute() reparses first, this call fails with a parse error.
@@ -44560,10 +44547,10 @@ mod pager_routing_tests {
         *conn.parse_cache_cookie.borrow_mut() = cookie;
         conn.parse_cache.borrow_mut().put(
             key,
-            ParseCacheEntry {
+            std::sync::Arc::new(ParseCacheEntry {
                 sql: "SELECT 1".to_owned(),
                 statement: Arc::new(parse_single_statement("SELECT 1").unwrap()),
-            },
+            }),
         );
 
         // A hash-key match with different SQL text must not return wrong AST.
