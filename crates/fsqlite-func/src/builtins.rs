@@ -804,18 +804,26 @@ impl ScalarFunction for SignFunc {
 
                 // Try parsing as a number. If the string isn't a valid numeric
                 // representation, return NULL (matching C SQLite behavior).
-                let is_numeric = trimmed.parse::<f64>().is_ok() || trimmed.parse::<i64>().is_ok();
-                if !is_numeric {
-                    return Ok(SqliteValue::Null);
-                }
-
-                let f = args[0].to_float();
-                if f > 0.0 {
-                    Ok(SqliteValue::Integer(1))
-                } else if f < 0.0 {
-                    Ok(SqliteValue::Integer(-1))
+                // Also reject NaN/Infinity — Rust's f64 parse accepts "NaN",
+                // "inf", "Infinity", "-inf", etc., but C SQLite does not.
+                if let Ok(f) = trimmed.parse::<f64>() {
+                    if f.is_nan() || f.is_infinite() {
+                        return Ok(SqliteValue::Null);
+                    }
+                    // Use the already-parsed value (avoids a redundant double-parse).
+                    if f > 0.0 {
+                        Ok(SqliteValue::Integer(1))
+                    } else if f < 0.0 {
+                        Ok(SqliteValue::Integer(-1))
+                    } else {
+                        Ok(SqliteValue::Integer(0))
+                    }
+                } else if trimmed.parse::<i64>().is_ok() {
+                    // Handles integers that f64 can't represent exactly but i64 can.
+                    let i: i64 = trimmed.parse().unwrap();
+                    Ok(SqliteValue::Integer(i.signum()))
                 } else {
-                    Ok(SqliteValue::Integer(0))
+                    Ok(SqliteValue::Null)
                 }
             }
             other => {
@@ -2928,6 +2936,19 @@ mod tests {
             invoke1(&SignFunc, SqliteValue::Text("  -3.14  ".to_owned())).unwrap(),
             SqliteValue::Integer(-1)
         );
+    }
+
+    #[test]
+    fn test_sign_nan_inf_text_returns_null() {
+        // C SQLite doesn't recognise "NaN", "inf", "Infinity" etc. as numeric —
+        // sign() must return NULL for these, matching the C oracle.
+        for s in &["NaN", "nan", "inf", "-inf", "Infinity", "-Infinity", "INF"] {
+            assert_eq!(
+                invoke1(&SignFunc, SqliteValue::Text((*s).to_owned())).unwrap(),
+                SqliteValue::Null,
+                "sign('{s}') should be NULL"
+            );
+        }
     }
 
     // ── scalar max/min ───────────────────────────────────────────────────

@@ -15662,3 +15662,28 @@ fn test_conformance_window_sum_int_s70e() {
         panic!("{} window_sum_int mismatches", mismatches.len());
     }
 }
+
+#[test]
+fn test_conformance_sign_nan_inf_s70f() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+    let queries: &[&str] = &[
+        // NaN and Infinity strings — C SQLite returns NULL for all of these.
+        "SELECT sign('NaN')",
+        "SELECT sign('nan')",
+        "SELECT sign('inf')",
+        "SELECT sign('-inf')",
+        "SELECT sign('Infinity')",
+        "SELECT sign('-Infinity')",
+        "SELECT sign('INF')",
+    ];
+
+    let mismatches = oracle_compare(&fconn, &rconn, queries);
+    if !mismatches.is_empty() {
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
+        panic!("{} sign_nan_inf mismatches", mismatches.len());
+    }
+}
