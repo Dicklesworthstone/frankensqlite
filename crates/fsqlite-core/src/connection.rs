@@ -3401,19 +3401,6 @@ impl Connection {
                     }
                 }
 
-                let affected = if has_before_update || has_after_update {
-                    trigger_rows.len()
-                } else if let Some(materialized_rows) = limited_row_count_hint {
-                    materialized_rows
-                } else {
-                    self.count_matching_rows(
-                        &effective_update.table,
-                        effective_update.where_clause.as_ref(),
-                        &effective_update.order_by,
-                        effective_update.limit.as_ref(),
-                        params,
-                    )?
-                };
                 let program = {
                     let plan_span = tracing::span!(
                         target: "fsqlite.plan",
@@ -3429,7 +3416,7 @@ impl Connection {
                         conn.compile_table_update(&effective_update)
                     })?
                 };
-                let (rows, _, _) = self.execute_table_program(&program, params)?;
+                let (rows, affected, _) = self.execute_table_program(&program, params)?;
 
                 // Phase 5G.3: Fire AFTER UPDATE triggers.
                 if has_after_update {

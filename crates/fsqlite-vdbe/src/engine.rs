@@ -16,6 +16,7 @@ use std::cmp::Ordering;
 use std::collections::VecDeque;
 
 use fsqlite_btree::swiss_index::SwissIndex;
+use fsqlite_types::PageSize;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
@@ -2416,19 +2417,24 @@ impl VdbeEngine {
     #[must_use]
     pub fn new(register_count: i32) -> Self {
         let detached_execution_cx = Cx::new();
-        Self::new_with_execution_cx(register_count, &detached_execution_cx)
+        Self::new_with_execution_cx(register_count, &detached_execution_cx, PageSize::DEFAULT)
     }
 
     /// Create a new engine rooted in the caller's execution context.
     #[must_use]
     #[allow(clippy::cast_sign_loss)]
-    pub fn new_with_execution_cx(register_count: i32, execution_cx: &Cx) -> Self {
+    pub fn new_with_execution_cx(
+        register_count: i32,
+        execution_cx: &Cx,
+        page_size: PageSize,
+    ) -> Self {
         // +1 because registers are 1-indexed (register 0 unused).
         let count = register_count.max(0) as u32 + 1;
         Self {
             registers: vec![SqliteValue::Null; count as usize],
             bindings: Vec::new(),
             execution_cx: execution_cx.create_child(),
+            page_size,
             trace_opcodes: opcode_trace_enabled(),
             results: Vec::with_capacity(64),
             cursors: SwissIndex::new(),
@@ -3039,9 +3045,9 @@ impl VdbeEngine {
                     // Preserve the cursor's table-vs-index type from
                     // the original cursor so index cursors remain correct.
                     let is_table_btree = old_sc.cursor.is_table_btree();
-                    const PAGE_SIZE: u32 = 4096;
+                    let page_size_u32 = self.page_size.as_u32();
                     let new_cursor =
-                        BtCursor::new(tt_page_io, root_pgno, PAGE_SIZE, is_table_btree);
+                        BtCursor::new(tt_page_io, root_pgno, page_size_u32, is_table_btree);
                     self.storage_cursors.insert(
                         cursor_id,
                         StorageCursor {
@@ -6614,7 +6620,7 @@ impl VdbeEngine {
 
     #[allow(clippy::cast_sign_loss)]
     fn open_storage_cursor(&mut self, cursor_id: i32, root_page: i32, writable: bool) -> bool {
-        const PAGE_SIZE: u32 = 4096;
+        let page_size_u32 = self.page_size.as_u32();
         // bd-1xrs: storage_cursors_enabled check removed.
         // StorageCursor is now the ONLY cursor path.
         let mode = if self.reject_mem_fallback {
@@ -7167,10 +7173,10 @@ fn encode_record_refs(values: &[&SqliteValue]) -> Vec<u8> {
 }
 
 /// Extract the raw bytes from a record blob value (output of `MakeRecord`).
-fn record_blob_bytes(val: &SqliteValue) -> Vec<u8> {
+fn record_blob_bytes(val: &SqliteValue) -> &[u8] {
     match val {
-        SqliteValue::Blob(bytes) => bytes.clone(),
-        _ => Vec::new(),
+        SqliteValue::Blob(bytes) => bytes.as_slice(),
+        _ => &[],
     }
 }
 

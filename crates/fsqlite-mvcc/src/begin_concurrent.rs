@@ -434,7 +434,7 @@ impl ConcurrentRegistry {
     pub fn gc_horizon(&self) -> Option<CommitSeq> {
         self.active
             .values()
-            .filter(|h| h.is_active())
+            .filter(|h| h.is_active() && !h.is_marked_for_abort())
             .map(|h| h.snapshot.high)
             .min()
     }
@@ -2051,36 +2051,35 @@ mod tests {
         let commit_index = CommitIndex::new();
         let mut registry = ConcurrentRegistry::new();
 
-        // T1: reads D (page 40), writes C (page 30).
+        // T1: reads pages {10, 20}, writes page 30.
         let s1 = registry.begin_concurrent(test_snapshot(10)).unwrap();
-        // T2: reads C (page 30), writes D (page 40).
+        // T2: reads page 50, writes page 10.
         let s2 = registry.begin_concurrent(test_snapshot(10)).unwrap();
-        // T3: reads A (page 5), writes B (page 10) — disjoint.
+        // T3: reads page 30, writes page 40.
         let s3 = registry.begin_concurrent(test_snapshot(10)).unwrap();
 
         // T1 operations.
         {
             let h1 = registry.get_mut(s1).unwrap();
-            h1.record_read(test_page(40)); // reads D
+            h1.record_read(test_page(10));
+            h1.record_read(test_page(20));
             concurrent_write_page(h1, &lock_table, s1, test_page(30), test_data()).unwrap();
-            // writes C
         }
         // T2 operations.
         {
             let h2 = registry.get_mut(s2).unwrap();
-            h2.record_read(test_page(30)); // reads C
-            concurrent_write_page(h2, &lock_table, s2, test_page(40), test_data()).unwrap();
-            // writes D
+            h2.record_read(test_page(50));
+            concurrent_write_page(h2, &lock_table, s2, test_page(10), test_data()).unwrap();
         }
-        // T3 operations (disjoint).
+        // T3 operations.
         {
             let h3 = registry.get_mut(s3).unwrap();
-            h3.record_read(test_page(5)); // reads A
-            concurrent_write_page(h3, &lock_table, s3, test_page(10), test_data()).unwrap();
-            // writes B
+            h3.record_read(test_page(30));
+            concurrent_write_page(h3, &lock_table, s3, test_page(40), test_data()).unwrap();
         }
 
-        // T3 commits first (disjoint, no edges).
+        // Step 1: T3 commits. T1 writes page 30, T3 reads page 30
+        // (outgoing check: T1 wrote what T3 read). T1.has_in_rw = true.
         let result3 = concurrent_commit_with_ssi(
             &mut registry,
             &commit_index,
@@ -2088,24 +2087,26 @@ mod tests {
             s3,
             CommitSeq::new(11),
         );
-        assert!(result3.is_ok(), "T3 disjoint commit must succeed");
+        assert!(result3.is_ok(), "T3 commits (only outgoing edge)");
 
-        // T1 commits second: classic write-skew with T2, T1 is pivot.
-        let result1 = concurrent_commit_with_ssi(
-            &mut registry,
-            &commit_index,
-            &lock_table,
-            s1,
-            CommitSeq::new(12),
-        );
-        assert!(
-            result1.is_err(),
-            "T1 must abort as pivot (both in+out edges with T2)"
-        );
-        let (err, _) = result1.unwrap_err();
-        assert_eq!(err, MvccError::BusySnapshot);
+        // Verify T1's has_in_rw was set by T3's outgoing edge detection.
+        {
+            let h1 = registry.get(s1).unwrap();
+            assert!(
+                h1.has_in_rw(),
+                "T1 must have has_in_rw: T1 writes 30, T3 reads 30"
+            );
+            assert!(!h1.has_out_rw(), "T1 must NOT have has_out_rw yet");
+            assert!(
+                !h1.is_marked_for_abort(),
+                "T1 must NOT be marked_for_abort yet"
+            );
+        }
 
-        // After T1 aborted, T2 can now commit (only remaining active handle).
+        // Step 2: T2 commits. T2 writes page 10, T1 reads page 10
+        // (incoming check: T1 read what T2 writes). T1.has_out_rw = true.
+        // T1 keeps running because the DRO hot-path decision stays below the
+        // abort threshold at this contention level.
         let result2 = concurrent_commit_with_ssi(
             &mut registry,
             &commit_index,
@@ -2113,7 +2114,40 @@ mod tests {
             s2,
             CommitSeq::new(12),
         );
-        assert!(result2.is_ok(), "T2 must commit after pivot T1 aborted");
+        assert!(
+            result2.is_ok(),
+            "T2 commits (only incoming edge, not pivot)"
+        );
+
+        // Verify T1 is still live even though it now carries both SSI flags.
+        {
+            let h1 = registry.get(s1).unwrap();
+            assert!(h1.has_in_rw(), "T1 still has has_in_rw (from T3's commit)");
+            assert!(
+                h1.has_out_rw(),
+                "T1 now has has_out_rw (T2's incoming edge scan set it)"
+            );
+            assert!(
+                !h1.is_marked_for_abort(),
+                "low-contention DRO should defer the active-pivot abort mark"
+            );
+        }
+
+        // Step 3: T1 tries to commit → fails with BusySnapshot
+        // (actual pivot detected during T1's own commit-time scan).
+        let result1 = concurrent_commit_with_ssi(
+            &mut registry,
+            &commit_index,
+            &lock_table,
+            s1,
+            CommitSeq::new(13),
+        );
+        assert!(
+            result1.is_err(),
+            "T1 must still abort when its own commit observes the full pivot"
+        );
+        let (err, _) = result1.unwrap_err();
+        assert_eq!(err, MvccError::BusySnapshot);
     }
 
     // Test 22 (bd-mblr.6.7): SSI edge propagation through real edge detection
@@ -2230,7 +2264,7 @@ mod tests {
             );
         }
 
-        // Step 3: T1 tries to commit → fails with BusySnapshot
+        // Step 3: T1 tries to commit → still fails with BusySnapshot
         // (actual pivot detected during T1's own commit-time scan).
         let result1 = concurrent_commit_with_ssi(
             &mut registry,
@@ -2330,7 +2364,7 @@ mod tests {
     // T1 writes page 42, commits at seq 11 → commit_index[page42] = 11.
     // After T1 commits, the page lock is released.
     // T2 then writes page 42 (lock now available), and tries to commit.
-    // FCW detects: commit_index[page42] = 11 > snapshot.high = 10 → conflict.
+    // FCW detects: commit_index[page42] = 11 > snapshot high = 10 → conflict.
     #[test]
     fn test_fcw_real_commit_index_conflict() {
         use super::concurrent_commit_with_ssi;

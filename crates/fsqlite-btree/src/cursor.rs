@@ -1231,7 +1231,12 @@ impl<P: PageReader> BtCursor<P> {
             self.child_page_at(top, cell_idx)?
         };
         self.issue_prefetch_hint(cx, child);
-        self.move_to_rightmost_leaf(cx, child, true)
+        let found = self.move_to_rightmost_leaf(cx, child, false)?;
+        if found {
+            Ok(true)
+        } else {
+            self.advance_prev(cx)
+        }
     }
 }
 

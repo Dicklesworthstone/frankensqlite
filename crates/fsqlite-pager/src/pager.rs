@@ -2202,7 +2202,7 @@ mod tests {
         }
 
         fn arm_after_db_writes(&self, successful_db_writes_before_failure: usize) {
-            let mut state = self.state.lock().expect("DbWriteFailState lock poisoned");
+            let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             state.armed = true;
             state.remaining_successful_db_writes = successful_db_writes_before_failure;
         }
@@ -2230,7 +2230,7 @@ mod tests {
         ) -> Result<(Self::File, VfsOpenFlags)> {
             let (inner, actual_flags) = self.inner.open(cx, path, flags)?;
             let is_target_db = {
-                let state = self.state.lock().expect("DbWriteFailState lock poisoned");
+                let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 path == Some(state.target_path.as_path()) && flags.contains(VfsOpenFlags::MAIN_DB)
             };
             Ok((
@@ -2267,7 +2267,7 @@ mod tests {
 
         fn write(&mut self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
             if self.is_target_db {
-                let mut state = self.state.lock().expect("DbWriteFailState lock poisoned");
+                let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 if state.armed {
                     if state.remaining_successful_db_writes == 0 {
                         state.armed = false;
