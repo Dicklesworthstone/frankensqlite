@@ -977,6 +977,7 @@ pub fn finalize_prepared_concurrent_commit_with_ssi(
         registry.committed_readers.len(),
         registry.committed_writers.len(),
     );
+    let should_abort_active_pivot = dro_t3_decision.is_none_or(|decision| decision.should_abort());
 
     // T3 propagation for active readers on incoming edges.
     for edge in &incoming_edges {
@@ -990,13 +991,22 @@ pub fn finalize_prepared_concurrent_commit_with_ssi(
         {
             reader.set_has_out_rw(true);
             if reader.has_in_rw() {
-                tracing::debug!(
-                    pivot = ?edge.from,
-                    dro_penalty = dro_t3_decision.map_or(0.0, |decision| decision.cvar_penalty),
-                    dro_threshold = dro_t3_decision.map_or(0.0, |decision| decision.threshold),
-                    "prepare/finalize T3 rule: active reader is pivot, marking for abort"
-                );
-                reader.set_marked_for_abort(true);
+                if should_abort_active_pivot {
+                    tracing::debug!(
+                        pivot = ?edge.from,
+                        dro_penalty = dro_t3_decision.map_or(0.0, |decision| decision.cvar_penalty),
+                        dro_threshold = dro_t3_decision.map_or(0.0, |decision| decision.threshold),
+                        "prepare/finalize T3 rule: active reader is pivot, marking for abort"
+                    );
+                    reader.set_marked_for_abort(true);
+                } else {
+                    tracing::debug!(
+                        pivot = ?edge.from,
+                        dro_penalty = dro_t3_decision.map_or(0.0, |decision| decision.cvar_penalty),
+                        dro_threshold = dro_t3_decision.map_or(0.0, |decision| decision.threshold),
+                        "prepare/finalize T3 rule: active reader is pivot, DRO allows it to continue"
+                    );
+                }
             }
         }
     }
@@ -1013,13 +1023,22 @@ pub fn finalize_prepared_concurrent_commit_with_ssi(
         {
             writer.set_has_in_rw(true);
             if writer.has_out_rw() {
-                tracing::debug!(
-                    pivot = ?edge.to,
-                    dro_penalty = dro_t3_decision.map_or(0.0, |decision| decision.cvar_penalty),
-                    dro_threshold = dro_t3_decision.map_or(0.0, |decision| decision.threshold),
-                    "prepare/finalize T3 rule: active writer is pivot, marking for abort"
-                );
-                writer.set_marked_for_abort(true);
+                if should_abort_active_pivot {
+                    tracing::debug!(
+                        pivot = ?edge.to,
+                        dro_penalty = dro_t3_decision.map_or(0.0, |decision| decision.cvar_penalty),
+                        dro_threshold = dro_t3_decision.map_or(0.0, |decision| decision.threshold),
+                        "prepare/finalize T3 rule: active writer is pivot, marking for abort"
+                    );
+                    writer.set_marked_for_abort(true);
+                } else {
+                    tracing::debug!(
+                        pivot = ?edge.to,
+                        dro_penalty = dro_t3_decision.map_or(0.0, |decision| decision.cvar_penalty),
+                        dro_threshold = dro_t3_decision.map_or(0.0, |decision| decision.threshold),
+                        "prepare/finalize T3 rule: active writer is pivot, DRO allows it to continue"
+                    );
+                }
             }
         }
     }
@@ -2097,9 +2116,8 @@ mod tests {
         assert!(result2.is_ok(), "T2 must commit after pivot T1 aborted");
     }
 
-    // Test 22 (bd-mblr.6.7): SSI marked-for-abort propagation through
-    // real edge detection — three transactions where sequential commits
-    // progressively set SSI flags on T1 until T1 is marked_for_abort.
+    // Test 22 (bd-mblr.6.7): SSI edge propagation through real edge detection
+    // with the DRO gate left open under low contention.
     //
     // The marked_for_abort path fires when the INCOMING edge check finds
     // that the other handle already has has_in_rw set. The incoming check
@@ -2116,13 +2134,14 @@ mod tests {
     //
     // Step 2: T2 commits. Scans T1:
     //   Incoming check: T2 writes 10, T1 reads {10,20}. Match on 10!
-    //   T1.has_out_rw = true. T1.has_in_rw is already true (from step 1) => T1 marked_for_abort!
+    //   T1.has_out_rw = true. T1 has both flags now, but the default
+    //   low-contention DRO matrix keeps the active pivot running.
     //   T2 has only incoming edge => T2 commits.
     //
-    // Step 3: T1 tries to commit → fails with BusySnapshot
-    // (marked_for_abort).
+    // Step 3: T1 tries to commit → still fails with BusySnapshot because its
+    // own commit-time scan observes both incoming and outgoing edges.
     #[test]
-    fn test_ssi_marked_for_abort_via_real_edge_detection() {
+    fn test_ssi_low_contention_dro_defers_marked_for_abort() {
         use super::concurrent_commit_with_ssi;
 
         let lock_table = InProcessPageLockTable::new();
@@ -2183,7 +2202,8 @@ mod tests {
 
         // Step 2: T2 commits. T2 writes page 10, T1 reads page 10
         // (incoming check: T1 read what T2 writes). T1.has_out_rw = true.
-        // T1.has_in_rw is already true (from step 1) => T1 marked_for_abort!
+        // T1 keeps running because the DRO hot-path decision stays below the
+        // abort threshold at this contention level.
         let result2 = concurrent_commit_with_ssi(
             &mut registry,
             &commit_index,
@@ -2196,7 +2216,7 @@ mod tests {
             "T2 commits (only incoming edge, not pivot)"
         );
 
-        // Verify T1 is now marked_for_abort.
+        // Verify T1 is still live even though it now carries both SSI flags.
         {
             let h1 = registry.get(s1).unwrap();
             assert!(h1.has_in_rw(), "T1 still has has_in_rw (from T3's commit)");
@@ -2205,14 +2225,13 @@ mod tests {
                 "T1 now has has_out_rw (T2's incoming edge scan set it)"
             );
             assert!(
-                h1.is_marked_for_abort(),
-                "T1 must be marked_for_abort: T2 found incoming edge from T1, \
-                 and T1 already had has_in_rw from T3's commit"
+                !h1.is_marked_for_abort(),
+                "low-contention DRO should defer the active-pivot abort mark"
             );
         }
 
         // Step 3: T1 tries to commit → fails with BusySnapshot
-        // (marked_for_abort).
+        // (actual pivot detected during T1's own commit-time scan).
         let result1 = concurrent_commit_with_ssi(
             &mut registry,
             &commit_index,
@@ -2222,7 +2241,7 @@ mod tests {
         );
         assert!(
             result1.is_err(),
-            "T1 must abort: marked_for_abort by T2's commit scan"
+            "T1 must still abort when its own commit observes the full pivot"
         );
         let (err, _) = result1.unwrap_err();
         assert_eq!(err, MvccError::BusySnapshot);

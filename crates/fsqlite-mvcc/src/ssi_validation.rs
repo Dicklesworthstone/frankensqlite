@@ -770,6 +770,7 @@ pub fn ssi_validate_and_publish(
             active_writers.len().saturating_add(committed_writers.len()),
         ))
     };
+    let should_abort_active_pivot = dro_t3_decision.is_none_or(DroHotPathDecision::should_abort);
 
     for edge in &in_edges {
         if edge.source_is_active {
@@ -779,16 +780,28 @@ pub fn ssi_validate_and_publish(
                 if reader.token() == edge.from {
                     reader.set_has_out_rw(true);
                     if reader.has_in_rw() {
-                        debug!(
-                            bead_id = "bd-31bo",
-                            pivot = ?edge.from,
-                            dro_penalty = dro_t3_decision
-                                .map_or(0.0, |decision| decision.cvar_penalty),
-                            dro_threshold = dro_t3_decision
-                                .map_or(0.0, |decision| decision.threshold),
-                            "T3 rule: active reader is pivot, marking for abort"
-                        );
-                        reader.set_marked_for_abort(true);
+                        if should_abort_active_pivot {
+                            debug!(
+                                bead_id = "bd-31bo",
+                                pivot = ?edge.from,
+                                dro_penalty = dro_t3_decision
+                                    .map_or(0.0, |decision| decision.cvar_penalty),
+                                dro_threshold = dro_t3_decision
+                                    .map_or(0.0, |decision| decision.threshold),
+                                "T3 rule: active reader is pivot, marking for abort"
+                            );
+                            reader.set_marked_for_abort(true);
+                        } else {
+                            debug!(
+                                bead_id = "bd-31bo",
+                                pivot = ?edge.from,
+                                dro_penalty = dro_t3_decision
+                                    .map_or(0.0, |decision| decision.cvar_penalty),
+                                dro_threshold = dro_t3_decision
+                                    .map_or(0.0, |decision| decision.threshold),
+                                "T3 rule: active reader is pivot, DRO allows it to continue"
+                            );
+                        }
                     }
                     break;
                 }
@@ -863,16 +876,28 @@ pub fn ssi_validate_and_publish(
                 if writer.token() == edge.to {
                     writer.set_has_in_rw(true);
                     if writer.has_out_rw() {
-                        debug!(
-                            bead_id = "bd-31bo",
-                            pivot = ?edge.to,
-                            dro_penalty = dro_t3_decision
-                                .map_or(0.0, |decision| decision.cvar_penalty),
-                            dro_threshold = dro_t3_decision
-                                .map_or(0.0, |decision| decision.threshold),
-                            "T3 rule: active writer is pivot, marking for abort"
-                        );
-                        writer.set_marked_for_abort(true);
+                        if should_abort_active_pivot {
+                            debug!(
+                                bead_id = "bd-31bo",
+                                pivot = ?edge.to,
+                                dro_penalty = dro_t3_decision
+                                    .map_or(0.0, |decision| decision.cvar_penalty),
+                                dro_threshold = dro_t3_decision
+                                    .map_or(0.0, |decision| decision.threshold),
+                                "T3 rule: active writer is pivot, marking for abort"
+                            );
+                            writer.set_marked_for_abort(true);
+                        } else {
+                            debug!(
+                                bead_id = "bd-31bo",
+                                pivot = ?edge.to,
+                                dro_penalty = dro_t3_decision
+                                    .map_or(0.0, |decision| decision.cvar_penalty),
+                                dro_threshold = dro_t3_decision
+                                    .map_or(0.0, |decision| decision.threshold),
+                                "T3 rule: active writer is pivot, DRO allows it to continue"
+                            );
+                        }
                     }
                     break;
                 }
@@ -1838,9 +1863,9 @@ mod tests {
     // -- §5.7.3 test 13: T3 rule — active pivot marked --
 
     #[test]
-    fn test_t3_rule_active_pivot_marked() {
+    fn test_t3_rule_active_pivot_low_contention_not_marked() {
         // T commits. R is active, R.has_in_rw = true, and T wrote a key R read.
-        // R should be marked_for_abort.
+        // Under the default low-contention DRO matrix, R should keep running.
         let t = TxnToken::new(TxnId::new(1).unwrap(), TxnEpoch::new(0));
         let r = MockActiveTxn::new(2, 0, 1)
             .with_reads(vec![page_key(5)])
@@ -1861,9 +1886,59 @@ mod tests {
         );
         // T should commit (only has incoming, not outgoing).
         result.expect("T has only incoming edge, should commit");
-        // R should be marked for abort (T3 rule).
+        let dro = super::default_t3_dro_matrix().evaluate(1, 0);
+        assert!(
+            !dro.should_abort(),
+            "low-contention DRO seam should allow the active pivot to continue"
+        );
         assert!(r.has_out.get(), "R.has_out_rw should be set to true");
-        assert!(r.marked.get(), "R should be marked for abort (T3 rule)");
+        assert!(
+            !r.marked.get(),
+            "R should remain unmarked when the DRO penalty stays below threshold"
+        );
+    }
+
+    #[test]
+    fn test_t3_rule_active_pivot_marked_under_high_skew() {
+        let t = TxnToken::new(TxnId::new(1).unwrap(), TxnEpoch::new(0));
+        let readers: Vec<MockActiveTxn> = (0_u64..20_u64)
+            .map(|idx| {
+                let reader = MockActiveTxn::new(2 + idx, 0, 1).with_reads(vec![page_key(5)]);
+                if idx == 0 {
+                    reader.with_has_in_rw(true)
+                } else {
+                    reader
+                }
+            })
+            .collect();
+        let reader_refs: Vec<&dyn ActiveTxnView> = readers
+            .iter()
+            .map(|reader| reader as &dyn ActiveTxnView)
+            .collect();
+
+        let result = ssi_validate_and_publish(
+            t,
+            CommitSeq::new(1),
+            CommitSeq::new(5),
+            &[],
+            &[page_key(5)],
+            &reader_refs,
+            &[],
+            &[],
+            &[],
+            false,
+        );
+        result.expect("incoming-only commit should still succeed");
+
+        let dro = super::default_t3_dro_matrix().evaluate(readers.len(), 0);
+        assert!(
+            dro.should_abort(),
+            "skewed reader population should exceed the default DRO threshold"
+        );
+        assert!(
+            readers[0].marked.get(),
+            "the active pivot should be marked once the DRO penalty exceeds threshold"
+        );
     }
 
     // -- §5.7.3 test 14: T3 rule — committed pivot forces abort --
