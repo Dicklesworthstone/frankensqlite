@@ -65,7 +65,7 @@ impl<'a> Transaction<'a> {
     }
 
     /// Execute a SQL statement with `ParamValue` parameters.
-    pub fn execute_params(&self, sql: &str, params: &[ParamValue]) -> Result<usize, FrankenError> {
+    pub fn execute_compat(&self, sql: &str, params: &[ParamValue]) -> Result<usize, FrankenError> {
         let values: Vec<SqliteValue> = params.iter().map(|p| p.0.clone()).collect();
         self.conn.execute_with_params(sql, &values)
     }

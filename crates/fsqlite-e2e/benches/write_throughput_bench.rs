@@ -104,9 +104,14 @@ fn bench_write_autocommit(c: &mut Criterion) {
                 for i in 0..ROW_COUNT {
                     #[allow(clippy::cast_possible_truncation)]
                     let val = f64::from(i as i32) * 0.137;
-                    conn.execute(&format!(
-                        "INSERT INTO bench VALUES ({i}, 'data_{i}', {val})"
-                    ))
+                    conn.execute_params(
+                        "INSERT INTO bench VALUES (?, ?, ?)",
+                        &[
+                            fsqlite_types::value::SqliteValue::Integer(i),
+                            fsqlite_types::value::SqliteValue::Text(format!("data_{i}")),
+                            fsqlite_types::value::SqliteValue::Float(val),
+                        ],
+                    )
                     .unwrap();
                 }
                 // Verify row count.
@@ -171,9 +176,14 @@ fn bench_write_batched(c: &mut Criterion) {
                     for i in start..start + BATCH_SIZE {
                         #[allow(clippy::cast_possible_truncation)]
                         let val = f64::from(i as i32) * 0.137;
-                        conn.execute(&format!(
-                            "INSERT INTO bench VALUES ({i}, 'data_{i}', {val})"
-                        ))
+                        conn.execute_params(
+                            "INSERT INTO bench VALUES (?, ?, ?)",
+                            &[
+                                fsqlite_types::value::SqliteValue::Integer(i),
+                                fsqlite_types::value::SqliteValue::Text(format!("data_{i}")),
+                                fsqlite_types::value::SqliteValue::Float(val),
+                            ],
+                        )
                         .unwrap();
                     }
                     conn.execute("COMMIT").unwrap();
@@ -234,9 +244,14 @@ fn bench_write_single_txn(c: &mut Criterion) {
                 for i in 0..ROW_COUNT {
                     #[allow(clippy::cast_possible_truncation)]
                     let val = f64::from(i as i32) * 0.137;
-                    conn.execute(&format!(
-                        "INSERT INTO bench VALUES ({i}, 'data_{i}', {val})"
-                    ))
+                    conn.execute_params(
+                        "INSERT INTO bench VALUES (?, ?, ?)",
+                        &[
+                            fsqlite_types::value::SqliteValue::Integer(i),
+                            fsqlite_types::value::SqliteValue::Text(format!("data_{i}")),
+                            fsqlite_types::value::SqliteValue::Float(val),
+                        ],
+                    )
                     .unwrap();
                 }
                 conn.execute("COMMIT").unwrap();

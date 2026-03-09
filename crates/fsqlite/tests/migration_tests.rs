@@ -53,7 +53,7 @@ fn fresh_database_applies_all_migrations() {
     assert_eq!(result.current, 3);
 
     // Verify schema was applied
-    conn.execute_params(
+    conn.execute_compat(
         "INSERT INTO conversations (id, agent, created_at, model) VALUES (?1, ?2, ?3, ?4)",
         params!["s-001", "claude", 1700000000_i64, "opus"],
     )
@@ -350,18 +350,18 @@ fn cass_like_migration_sequence() {
     assert_eq!(result.current, 3);
 
     // Insert realistic data
-    conn.execute_params(
+    conn.execute_compat(
         "INSERT INTO conversations (id, agent, created_at, title, tags) VALUES (?1, ?2, ?3, ?4, ?5)",
         params!["s-001", "claude_code", 1700000000_i64, "Debug auth", "rust,auth"],
     ).unwrap();
 
-    conn.execute_params(
+    conn.execute_compat(
         "INSERT INTO messages (conversation_id, role, content, timestamp) VALUES (?1, ?2, ?3, ?4)",
         params!["s-001", "user", "Why is auth broken?", 1700000000_i64],
     )
     .unwrap();
 
-    conn.execute_params(
+    conn.execute_compat(
         "INSERT INTO bookmarks (conversation_id, message_index, note, created_at) VALUES (?1, ?2, ?3, ?4)",
         params!["s-001", 0_i64, "Key insight", 1700000001_i64],
     ).unwrap();

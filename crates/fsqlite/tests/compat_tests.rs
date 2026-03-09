@@ -257,7 +257,7 @@ fn execute_params_inserts_rows() {
         .unwrap();
 
     let changed = conn
-        .execute_params("INSERT INTO t VALUES (?1, ?2)", params![1_i64, "hello"])
+        .execute_compat("INSERT INTO t VALUES (?1, ?2)", params![1_i64, "hello"])
         .unwrap();
     assert_eq!(changed, 1);
 
@@ -425,7 +425,7 @@ fn transaction_execute_params_compat() {
         .unwrap();
 
     let tx = conn.transaction().unwrap();
-    tx.execute_params(
+    tx.execute_compat(
         "INSERT INTO t VALUES (?1, ?2)",
         params![1_i64, "via_params"],
     )
@@ -586,13 +586,13 @@ fn full_compat_round_trip() {
     .unwrap();
 
     // Insert via execute_params
-    conn.execute_params(
+    conn.execute_compat(
         "INSERT INTO users (id, name, email, active) VALUES (?1, ?2, ?3, ?4)",
         params![1_i64, "Alice", "alice@example.com", true],
     )
     .unwrap();
 
-    conn.execute_params(
+    conn.execute_compat(
         "INSERT INTO users (id, name, email, active) VALUES (?1, ?2, ?3, ?4)",
         params![2_i64, "Bob", None::<String>, false],
     )
@@ -642,7 +642,7 @@ fn full_compat_round_trip() {
     // Transaction: insert + rollback
     {
         let tx = conn.transaction().unwrap();
-        tx.execute_params(
+        tx.execute_compat(
             "INSERT INTO users (id, name) VALUES (?1, ?2)",
             params![3_i64, "Charlie"],
         )
@@ -658,7 +658,7 @@ fn full_compat_round_trip() {
     // Transaction: insert + commit
     {
         let tx = conn.transaction().unwrap();
-        tx.execute_params(
+        tx.execute_compat(
             "INSERT INTO users (id, name) VALUES (?1, ?2)",
             params![3_i64, "Charlie"],
         )

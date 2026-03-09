@@ -254,7 +254,7 @@ fn parse_iso8601(s: &str) -> Option<f64> {
         let m = s[5..7].parse::<i64>().ok()?;
         let d = s[8..10].parse::<i64>().ok()?;
 
-        if m < 1 || m > 12 || d < 1 || d > days_in_month(y, m) {
+        if m < 1 || m > 12 || d < 1 || d > 31 {
             return None;
         }
 
@@ -854,13 +854,17 @@ pub struct StrftimeFunc;
 impl ScalarFunction for StrftimeFunc {
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
         if args.len() < 2 || args[0].is_null() || args[1].is_null() {
+            dbg!("strftime early return null", args);
             return Ok(SqliteValue::Null);
         }
         let fmt = args[0].to_text();
         let rest = &args[1..];
         match parse_args(rest) {
             Some((jdn, _)) => Ok(SqliteValue::Text(format_strftime(&fmt, jdn))),
-            None => Ok(SqliteValue::Null),
+            None => {
+                dbg!("strftime parse_args returned None", args);
+                Ok(SqliteValue::Null)
+            }
         }
     }
 

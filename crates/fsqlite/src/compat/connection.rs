@@ -60,7 +60,7 @@ pub trait ConnectionExt {
         F: FnMut(&Row) -> Result<T, FrankenError>;
 
     /// Execute a SQL statement with `ParamValue` parameters, returning affected row count.
-    fn execute_params(&self, sql: &str, params: &[ParamValue]) -> Result<usize, FrankenError>;
+    fn execute_compat(&self, sql: &str, params: &[ParamValue]) -> Result<usize, FrankenError>;
 }
 
 impl ConnectionExt for Connection {
@@ -87,7 +87,7 @@ impl ConnectionExt for Connection {
         rows.iter().map(f).collect()
     }
 
-    fn execute_params(&self, sql: &str, params: &[ParamValue]) -> Result<usize, FrankenError> {
+    fn execute_compat(&self, sql: &str, params: &[ParamValue]) -> Result<usize, FrankenError> {
         let values: Vec<SqliteValue> = params.iter().map(|p| p.0.clone()).collect();
         self.execute_with_params(sql, &values)
     }
@@ -139,7 +139,7 @@ mod tests {
             .unwrap();
         let p = [ParamValue::from(1_i64), ParamValue::from("alice")];
         let affected = conn
-            .execute_params("INSERT INTO t VALUES (?1, ?2)", &p)
+            .execute_compat("INSERT INTO t VALUES (?1, ?2)", &p)
             .unwrap();
         assert_eq!(affected, 1);
     }
