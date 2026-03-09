@@ -7974,14 +7974,14 @@ fn resolve_result_column_indices(
     Ok(indices)
 }
 
-/// Check if a WHERE clause is a simple `rowid = ?` bind parameter.
-///
-/// Returns the 1-based bind parameter index if so.
-
 fn is_simple_constant(expr: &Expr) -> bool {
     matches!(expr, Expr::Placeholder(..) | Expr::Literal(..))
 }
 
+/// Check if a WHERE clause is a simple `rowid = ?` bind parameter.
+///
+/// Returns the 1-based bind parameter index if so.
+#[allow(dead_code)]
 fn extract_rowid_bind_param(
     where_clause: Option<&Expr>,
     table: Option<&TableSchema>,
@@ -8078,6 +8078,7 @@ fn is_rowid_ref(col_ref: &ColumnRef, table: Option<&TableSchema>) -> bool {
 }
 
 /// Extract a bind parameter index from a `?` or `?NNN` placeholder.
+#[allow(dead_code)]
 fn bind_param_index(expr: &Expr) -> Option<i32> {
     if let Expr::Placeholder(pt, _) = expr {
         match pt {

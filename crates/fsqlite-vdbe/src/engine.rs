@@ -769,8 +769,10 @@ impl PageWriter for SharedTxnPageIo {
             let deadline = Duration::from_millis(ctx.busy_timeout_ms);
             let mut backoff = Duration::from_micros(50);
 
+            let page_data_base = PageData::from_vec(data.to_vec());
+
             loop {
-                let page_data = PageData::from_vec(data.to_vec());
+                let page_data = page_data_base.clone();
                 let (write_result, txn_id, snapshot_high) = {
                     let mut guard = ctx
                         .registry
