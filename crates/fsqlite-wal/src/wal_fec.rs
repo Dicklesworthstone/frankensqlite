@@ -1657,7 +1657,7 @@ async fn run_repair_pipeline_worker(
             "wal-fec repair worker task missing native runtime Cx".to_owned(),
         );
         drain_abandoned_work(
-            &receiver,
+            &mut receiver,
             state.pending_jobs.as_ref(),
             state.canceled_jobs.as_ref(),
         );
@@ -1680,7 +1680,7 @@ async fn run_repair_pipeline_worker(
                     "wal-fec repair worker task cancelled before the queue drained".to_owned(),
                 );
                 drain_abandoned_work(
-                    &receiver,
+                    &mut receiver,
                     state.pending_jobs.as_ref(),
                     state.canceled_jobs.as_ref(),
                 );
@@ -1735,7 +1735,7 @@ async fn run_repair_pipeline_worker(
                         record_worker_failure(&state.worker_failure, detail.clone());
                         error!(group_id = %group_id, "{detail}");
                         drain_abandoned_work(
-                            &receiver,
+                            &mut receiver,
                             state.pending_jobs.as_ref(),
                             state.canceled_jobs.as_ref(),
                         );
@@ -1749,7 +1749,7 @@ async fn run_repair_pipeline_worker(
                         "wal-fec repair worker task cancelled after processing work".to_owned(),
                     );
                     drain_abandoned_work(
-                        &receiver,
+                        &mut receiver,
                         state.pending_jobs.as_ref(),
                         state.canceled_jobs.as_ref(),
                     );
@@ -1775,7 +1775,7 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 fn drain_abandoned_work(
-    receiver: &mpsc::Receiver<WalFecPipelineMessage>,
+    receiver: &mut mpsc::Receiver<WalFecPipelineMessage>,
     pending_jobs: &AtomicUsize,
     canceled_jobs: &AtomicUsize,
 ) {

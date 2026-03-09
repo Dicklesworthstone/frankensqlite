@@ -354,26 +354,34 @@ impl InodeInfo {
     }
 }
 
+const INODE_TABLE_SHARDS: usize = 16;
+
 /// Global per-process table mapping (dev, ino) to shared lock state.
 ///
-/// This prevents the "POSIX close drops all locks" problem: we only issue
+/// This prevents the \"POSIX close drops all locks\" problem: we only issue
 /// OS-level lock/unlock calls through one canonical fd per inode, and track
 /// how many handles want each lock level.
 struct InodeTable {
-    map: Mutex<HashMap<InodeKey, Arc<Mutex<InodeInfo>>>>,
+    shards: [Mutex<HashMap<InodeKey, Arc<Mutex<InodeInfo>>>>; INODE_TABLE_SHARDS],
 }
 
 impl InodeTable {
     fn new() -> Self {
         Self {
-            map: Mutex::new(HashMap::new()),
+            shards: std::array::from_fn(|_| Mutex::new(HashMap::new())),
         }
+    }
+
+    fn shard_idx(&self, key: InodeKey) -> usize {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(&key, &mut h);
+        use std::hash::Hasher;
+        (h.finish() as usize) & (INODE_TABLE_SHARDS - 1)
     }
 
     /// Get the inode info for the given key if present.
     fn get(&self, key: InodeKey) -> Option<Arc<Mutex<InodeInfo>>> {
-        let map = self
-            .map
+        let map = self.shards[self.shard_idx(key)]
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         map.get(&key).cloned()
@@ -381,8 +389,7 @@ impl InodeTable {
 
     /// Get or create the inode info for the given key.
     fn get_or_create(&self, key: InodeKey, file: Arc<File>) -> Arc<Mutex<InodeInfo>> {
-        let mut map = self
-            .map
+        let mut map = self.shards[self.shard_idx(key)]
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         Arc::clone(
@@ -393,8 +400,7 @@ impl InodeTable {
 
     /// Remove the inode entry if its refcount reaches zero.
     fn maybe_remove(&self, key: InodeKey) {
-        let mut map = self
-            .map
+        let mut map = self.shards[self.shard_idx(key)]
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(info) = map.get(&key) {
