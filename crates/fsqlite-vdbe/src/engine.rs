@@ -717,19 +717,29 @@ impl PageReader for SharedTxnPageIo {
         if let Some(ctx) = &self.concurrent {
             // Read-own-writes visibility: if this txn already wrote the page,
             // return that version first and still record the read for SSI.
-            let mut guard = ctx
-                .registry
+            //
+            // OPTIMIZATION: We only lock the session-local ConcurrentHandle,
+            // avoiding the global registry lock for every page read.
+            let handle_arc = {
+                let guard = ctx
+                    .registry
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                guard.get(ctx.session_id).ok_or_else(|| {
+                    FrankenError::Internal(format!(
+                        "MVCC session {} not found in registry during read",
+                        ctx.session_id
+                    ))
+                })?
+            };
+
+            let mut handle = handle_arc
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let handle = guard.get_mut(ctx.session_id).ok_or_else(|| {
-                FrankenError::Internal(format!(
-                    "MVCC session {} not found in registry during read",
-                    ctx.session_id
-                ))
-            })?;
+
             let txn_id = handle.txn_token().id.get();
             let snapshot_high = handle.snapshot().high.get();
-            let write_set_page = concurrent_read_page(handle, page_no).cloned();
+            let write_set_page = concurrent_read_page(&handle, page_no).cloned();
             handle.record_read(page_no);
 
             if let Some(page) = write_set_page {
@@ -754,6 +764,7 @@ impl PageReader for SharedTxnPageIo {
                 conflict_reason = "none",
                 "mvcc visibility decision"
             );
+            drop(handle);
         }
 
         let page = self.txn.borrow().get_page(cx, page_no)?.into_vec();
@@ -13602,7 +13613,15 @@ mod tests {
     #[test]
     fn test_set_snapshot_stores_time_travel_marker() {
         // Verify that SetSnapshot stores a TimeTravelMarker on the engine
-        // even without a VersionStore (marker-only behavior).
+        // AND upgrades the cursor when VersionStore, CommitLog, and GC
+        // horizon are all provided (marker-only without infrastructure is
+        // no longer supported after the empty-VersionStore hardening).
+        use fsqlite_pager::{MockMvccPager, MvccPager as _, TransactionMode};
+
+        let pager = MockMvccPager;
+        let cx = Cx::new();
+        let txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+
         let mut db = MemDatabase::new();
         let root = db.create_table(1);
         let table = db.get_table_mut(root).unwrap();
@@ -13618,10 +13637,31 @@ mod tests {
         b.resolve_label(end);
         let prog = b.finish().expect("program should build");
 
+        let vs = Arc::new(VersionStore::new(
+            fsqlite_types::PageSize::DEFAULT,
+        ));
+
+        // Build a CommitLog with entries so SetSnapshot validation passes.
+        let commit_log = {
+            use fsqlite_types::TxnId;
+            let mut log = CommitLog::new(CommitSeq::new(1));
+            for seq in 1..=5 {
+                log.append(fsqlite_mvcc::core_types::CommitRecord {
+                    txn_id: TxnId::new(seq).unwrap(),
+                    commit_seq: CommitSeq::new(seq),
+                    pages: smallvec::smallvec![PageNumber::new(1).unwrap()],
+                    timestamp_unix_ns: 1_700_000_000_000_000_000 + seq * 1_000_000_000,
+                });
+            }
+            Arc::new(Mutex::new(log))
+        };
+
         let mut engine = VdbeEngine::new(prog.register_count());
         engine.set_database(db);
-        engine.set_reject_mem_fallback(false);
-        engine.enable_storage_read_cursors(true);
+        engine.set_transaction(Box::new(txn));
+        engine.set_version_store(Arc::clone(&vs));
+        engine.set_time_travel_commit_log(Arc::clone(&commit_log));
+        engine.set_time_travel_gc_horizon(CommitSeq::new(1));
 
         let outcome = engine.execute(&prog).expect("execution should succeed");
         assert_eq!(outcome, ExecOutcome::Done);
