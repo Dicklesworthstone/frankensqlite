@@ -5045,9 +5045,9 @@ impl VdbeEngine {
                     // Build a record from registers p1..p1+p2-1 into register p3.
                     let target = op.p3;
                     let n_cols = usize::try_from(op.p2).unwrap_or(0);
+                    let this = &*self;
                     let blob = if let P4::Affinity(aff) = &op.p4 {
                         // Skip columns marked with 'X' (IPK columns).
-                        let this = &*self;
                         let iter = aff.chars().enumerate().filter_map(move |(i, ch)| {
                             if ch == 'X' {
                                 None
@@ -5059,7 +5059,6 @@ impl VdbeEngine {
                         });
                         fsqlite_types::record::serialize_record_iter(iter)
                     } else {
-                        let this = &*self;
                         let iter = (0..n_cols).map(move |i| {
                             #[allow(clippy::cast_possible_wrap)]
                             let reg = op.p1 + i as i32;
