@@ -787,7 +787,9 @@ impl ScalarFunction for SignFunc {
         match &args[0] {
             SqliteValue::Integer(i) => Ok(SqliteValue::Integer(i.signum())),
             SqliteValue::Float(f) => {
-                if *f > 0.0 {
+                if f.is_nan() {
+                    Ok(SqliteValue::Null)
+                } else if *f > 0.0 {
                     Ok(SqliteValue::Integer(1))
                 } else if *f < 0.0 {
                     Ok(SqliteValue::Integer(-1))
@@ -802,14 +804,22 @@ impl ScalarFunction for SignFunc {
                     return Ok(SqliteValue::Null);
                 }
 
+                // Reject literal NaN/inf/infinity keywords (case-insensitive,
+                // with optional leading sign). Rust's f64::parse accepts these
+                // but C SQLite's sqlite3AtoF does not. Note: numeric overflow
+                // strings like "1e999" that parse to infinity ARE valid — C
+                // SQLite recognises those as numeric and sign() returns 1/-1.
+                let stripped = trimmed.strip_prefix(['+', '-']).unwrap_or(trimmed);
+                if stripped.eq_ignore_ascii_case("nan")
+                    || stripped.eq_ignore_ascii_case("inf")
+                    || stripped.eq_ignore_ascii_case("infinity")
+                {
+                    return Ok(SqliteValue::Null);
+                }
+
                 // Try parsing as a number. If the string isn't a valid numeric
                 // representation, return NULL (matching C SQLite behavior).
-                // Also reject NaN/Infinity — Rust's f64 parse accepts "NaN",
-                // "inf", "Infinity", "-inf", etc., but C SQLite does not.
                 if let Ok(f) = trimmed.parse::<f64>() {
-                    if f.is_nan() || f.is_infinite() {
-                        return Ok(SqliteValue::Null);
-                    }
                     // Use the already-parsed value (avoids a redundant double-parse).
                     if f > 0.0 {
                         Ok(SqliteValue::Integer(1))
@@ -2942,13 +2952,41 @@ mod tests {
     fn test_sign_nan_inf_text_returns_null() {
         // C SQLite doesn't recognise "NaN", "inf", "Infinity" etc. as numeric —
         // sign() must return NULL for these, matching the C oracle.
-        for s in &["NaN", "nan", "inf", "-inf", "Infinity", "-Infinity", "INF"] {
+        for s in &["NaN", "nan", "inf", "-inf", "Infinity", "-Infinity", "INF", "+nan", "+inf"] {
             assert_eq!(
                 invoke1(&SignFunc, SqliteValue::Text((*s).to_owned())).unwrap(),
                 SqliteValue::Null,
                 "sign('{s}') should be NULL"
             );
         }
+    }
+
+    #[test]
+    fn test_sign_numeric_overflow_to_infinity() {
+        // "1e999" overflows to +inf in both Rust and C. C SQLite's sqlite3AtoF
+        // accepts it as numeric, so sign() must return 1 (not NULL).
+        assert_eq!(
+            invoke1(&SignFunc, SqliteValue::Text("1e999".to_owned())).unwrap(),
+            SqliteValue::Integer(1)
+        );
+        assert_eq!(
+            invoke1(&SignFunc, SqliteValue::Text("-1e999".to_owned())).unwrap(),
+            SqliteValue::Integer(-1)
+        );
+        // Underflow to zero
+        assert_eq!(
+            invoke1(&SignFunc, SqliteValue::Text("1e-999".to_owned())).unwrap(),
+            SqliteValue::Integer(0)
+        );
+    }
+
+    #[test]
+    fn test_sign_float_nan_returns_null() {
+        // C SQLite: sign(0.0/0.0) = NULL. Float NaN must not return 0.
+        assert_eq!(
+            invoke1(&SignFunc, SqliteValue::Float(f64::NAN)).unwrap(),
+            SqliteValue::Null
+        );
     }
 
     // ── scalar max/min ───────────────────────────────────────────────────
