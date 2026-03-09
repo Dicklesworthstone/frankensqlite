@@ -717,29 +717,19 @@ impl PageReader for SharedTxnPageIo {
         if let Some(ctx) = &self.concurrent {
             // Read-own-writes visibility: if this txn already wrote the page,
             // return that version first and still record the read for SSI.
-            //
-            // OPTIMIZATION: We only lock the session-local ConcurrentHandle,
-            // avoiding the global registry lock for every page read.
-            let handle_arc = {
-                let guard = ctx
-                    .registry
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                guard.get(ctx.session_id).ok_or_else(|| {
-                    FrankenError::Internal(format!(
-                        "MVCC session {} not found in registry during read",
-                        ctx.session_id
-                    ))
-                })?
-            };
-
-            let mut handle = handle_arc
+            let mut guard = ctx
+                .registry
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-
+            let handle = guard.get_mut(ctx.session_id).ok_or_else(|| {
+                FrankenError::Internal(format!(
+                    "MVCC session {} not found in registry during read",
+                    ctx.session_id
+                ))
+            })?;
             let txn_id = handle.txn_token().id.get();
             let snapshot_high = handle.snapshot().high.get();
-            let write_set_page = concurrent_read_page(&handle, page_no).cloned();
+            let write_set_page = concurrent_read_page(handle, page_no).cloned();
             handle.record_read(page_no);
 
             if let Some(page) = write_set_page {
@@ -764,7 +754,6 @@ impl PageReader for SharedTxnPageIo {
                 conflict_reason = "none",
                 "mvcc visibility decision"
             );
-            drop(handle);
         }
 
         let page = self.txn.borrow().get_page(cx, page_no)?.into_vec();
@@ -13801,7 +13790,7 @@ mod tests {
         // read_page should fall through to the underlying transaction
         // (the page hasn't changed since the target commit).
         use fsqlite_pager::{MockMvccPager, MvccPager as _, TransactionMode};
-        use fsqlite_types::{PageVersion, TxnEpoch, TxnId, TxnToken, VersionPointer};
+        use fsqlite_types::{PageVersion, TxnEpoch, TxnId, TxnToken};
 
         let pager = MockMvccPager;
         let cx = Cx::new();
