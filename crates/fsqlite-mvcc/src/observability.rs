@@ -9,8 +9,8 @@
 //! never acquire page locks or block writers.
 
 use fsqlite_types::sync_primitives::Instant;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use fsqlite_observability::{ConflictEvent, ConflictObserver, SsiAbortCategory};
 use fsqlite_types::{CommitSeq, PageNumber, TxnId, TxnToken};

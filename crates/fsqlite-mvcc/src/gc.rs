@@ -470,8 +470,8 @@ pub fn gc_tick_with_registry(
 mod tests {
     use super::*;
     use crate::core_types::VersionArena;
-    use crate::ebr::{VersionGuardRegistry, GLOBAL_EBR_METRICS};
-    use crate::invariants::{idx_to_version_pointer, ChainHeadTable};
+    use crate::ebr::{GLOBAL_EBR_METRICS, VersionGuardRegistry};
+    use crate::invariants::{ChainHeadTable, idx_to_version_pointer};
     use fsqlite_types::{
         CommitSeq, PageData, PageNumber, PageSize, PageVersion, TxnEpoch, TxnId, TxnToken,
     };

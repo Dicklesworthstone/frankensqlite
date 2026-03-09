@@ -14,7 +14,7 @@ wasm = ["fsqlite-types/wasm", "fsqlite-vfs/wasm"]
 linux-asupersync-uring = ["native", "fsqlite-vfs/linux-asupersync-uring"]
 
 [dependencies]
-fsqlite-types = { version = "0.1.1", path = "../fsqlite-types", default-features = false }
+fsqlite-types = { path = "../fsqlite-types", version = "0.1" }
 fsqlite-error = { workspace = true }
 fsqlite-vfs = { version = "0.1.2", path = "../fsqlite-vfs", default-features = false }
 fsqlite-pager = { workspace = true }
@@ -36,8 +36,13 @@ xxhash-rust = { workspace = true }
 blake3 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-hashbrown.workspace = true
-lru.workspace = true
+hashbrown = { workspace = true }
+lru = { workspace = true }
+smallvec = { workspace = true }
+tracing-subscriber = "0.3.22"
+regex = "1.11"
+lazy_static = "1.5"
+foldhash = "0.1"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 asupersync = { workspace = true }

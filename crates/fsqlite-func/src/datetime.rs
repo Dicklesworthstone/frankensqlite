@@ -860,9 +860,7 @@ impl ScalarFunction for StrftimeFunc {
         let rest = &args[1..];
         match parse_args(rest) {
             Some((jdn, _)) => Ok(SqliteValue::Text(format_strftime(&fmt, jdn))),
-            None => {
-                Ok(SqliteValue::Null)
-            }
+            None => Ok(SqliteValue::Null),
         }
     }
 

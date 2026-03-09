@@ -187,6 +187,8 @@ struct MemCursor {
     position: Option<usize>,
     /// Pseudo-table data (for OpenPseudo: a single row set by RowData/MakeRecord).
     pseudo_row: Option<Vec<SqliteValue>>,
+    /// Cached pseudo-row values parsed from `pseudo_reg`.
+    cached_pseudo_row: Option<(SqliteValue, Vec<SqliteValue>)>,
     /// Register containing the pseudo-row data blob.
     pseudo_reg: Option<i32>,
     /// Whether this is a pseudo cursor (OpenPseudo).
@@ -200,6 +202,7 @@ impl MemCursor {
             writable,
             position: None,
             pseudo_row: None,
+            cached_pseudo_row: None,
             pseudo_reg: None,
             is_pseudo: false,
         }
@@ -211,6 +214,7 @@ impl MemCursor {
             writable: false,
             position: None,
             pseudo_row: None,
+            cached_pseudo_row: None,
             pseudo_reg: Some(reg),
             is_pseudo: true,
         }
@@ -388,8 +392,9 @@ impl SorterCursor {
         let key_columns = self.key_columns;
         let orders = self.sort_key_orders.clone();
         let colls = self.collations.clone();
-        self.rows
-            .sort_by(|lhs, rhs| compare_sorter_rows(&lhs.values, &rhs.values, key_columns, &orders, &colls));
+        self.rows.sort_by(|lhs, rhs| {
+            compare_sorter_rows(&lhs.values, &rhs.values, key_columns, &orders, &colls)
+        });
 
         // Write to temp file.  We use `keep()` to detach the auto-delete
         // guard so the file persists until we explicitly remove it in
@@ -454,8 +459,9 @@ impl SorterCursor {
             let key_columns = self.key_columns;
             let orders = self.sort_key_orders.clone();
             let colls = self.collations.clone();
-            self.rows
-                .sort_by(|lhs, rhs| compare_sorter_rows(&lhs.values, &rhs.values, key_columns, &orders, &colls));
+            self.rows.sort_by(|lhs, rhs| {
+                compare_sorter_rows(&lhs.values, &rhs.values, key_columns, &orders, &colls)
+            });
             self.rows_sorted_total += self.rows.len() as u64;
             return Ok(());
         }
@@ -464,8 +470,9 @@ impl SorterCursor {
         let key_columns = self.key_columns;
         let orders = self.sort_key_orders.clone();
         let colls = self.collations.clone();
-        self.rows
-            .sort_by(|lhs, rhs| compare_sorter_rows(&lhs.values, &rhs.values, key_columns, &orders, &colls));
+        self.rows.sort_by(|lhs, rhs| {
+            compare_sorter_rows(&lhs.values, &rhs.values, key_columns, &orders, &colls)
+        });
 
         // Collect all runs: disk runs first, then in-memory remainder.
         let mut run_iters: Vec<RunIterator> = Vec::with_capacity(self.spill_runs.len() + 1);
@@ -490,11 +497,11 @@ impl SorterCursor {
             // Find the run with the smallest current element.
             let mut best_idx: Option<usize> = None;
             for (i, iter) in run_iters.iter().enumerate() {
-                let Some(row) = iter.current() else {
+                let Some(row) = iter.current_values() else {
                     continue;
                 };
                 if let Some(bi) = best_idx {
-                    if let Some(best_row) = run_iters[bi].current() {
+                    if let Some(best_row) = run_iters[bi].current_values() {
                         if compare_sorter_rows(row, best_row, key_columns, &orders, &colls)
                             == Ordering::Less
                         {
@@ -558,12 +565,12 @@ enum RunIterator {
     /// Records read from a temporary file.
     File {
         reader: std::io::BufReader<std::fs::File>,
-        current: Option<Vec<SqliteValue>>,
+        current: Option<SorterRow>,
     },
     /// Records from an in-memory Vec (used for the final unsorted batch).
     Memory {
-        rows: std::vec::IntoIter<Vec<SqliteValue>>,
-        current: Option<Vec<SqliteValue>>,
+        rows: std::vec::IntoIter<SorterRow>,
+        current: Option<SorterRow>,
     },
 }
 
@@ -584,13 +591,15 @@ impl RunIterator {
         }
     }
 
-    fn current(&self) -> Option<&Vec<SqliteValue>> {
+    fn current_values(&self) -> Option<&Vec<SqliteValue>> {
         match self {
-            Self::File { current, .. } | Self::Memory { current, .. } => current.as_ref(),
+            Self::File { current, .. } | Self::Memory { current, .. } => {
+                current.as_ref().map(|r| &r.values)
+            }
         }
     }
 
-    fn take_current(&mut self) -> Option<Vec<SqliteValue>> {
+    fn take_current(&mut self) -> Option<SorterRow> {
         match self {
             Self::File { current, .. } | Self::Memory { current, .. } => current.take(),
         }
@@ -608,10 +617,10 @@ impl RunIterator {
                         reader
                             .read_exact(&mut buf)
                             .map_err(|e| FrankenError::internal(format!("sorter run read: {e}")))?;
-                        let row = parse_record(&buf).ok_or_else(|| {
+                        let values = parse_record(&buf).ok_or_else(|| {
                             FrankenError::internal("sorter run: malformed record")
                         })?;
-                        *current = Some(row);
+                        *current = Some(SorterRow { values, blob: buf });
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                         *current = None;
@@ -2565,7 +2574,7 @@ impl VdbeEngine {
                 let mut key_values: Vec<SqliteValue> =
                     Vec::with_capacity(meta.column_indices.len() + 1);
                 for &col_idx in &meta.column_indices {
-                    let val = old_row.values.get(col_idx).cloned().unwrap_or(SqliteValue::Null);
+                    let val = old_row.get(col_idx).cloned().unwrap_or(SqliteValue::Null);
                     key_values.push(val);
                 }
                 key_values.push(SqliteValue::Integer(conflict_rowid));
@@ -3028,7 +3037,9 @@ impl VdbeEngine {
 
                     // Re-create cursor with TimeTravelPageIo.
                     // Remove the old cursor to get its metadata.
-                    let old_sc = self.storage_cursors.remove(&cursor_id).unwrap();
+                    let old_sc = self.storage_cursors.remove(&cursor_id).ok_or_else(|| {
+                        FrankenError::Internal(format!("SetSnapshot: cursor {} not found", cursor_id))
+                    })?;
                     let root_page = self.cursor_root_pages.get(&cursor_id).copied().unwrap_or(1);
                     let root_pgno = PageNumber::new(root_page as u32).unwrap_or(PageNumber::ONE);
 
@@ -3475,7 +3486,7 @@ impl VdbeEngine {
                     let should_jump = if val.is_null() {
                         op.p3 != 0
                     } else {
-                        val.as_bool().unwrap_or(false)
+                        vdbe_real_is_truthy(val)
                     };
                     if should_jump {
                         pc = op.p2 as usize;
@@ -3491,7 +3502,7 @@ impl VdbeEngine {
                     let should_jump = if val.is_null() {
                         op.p3 != 0
                     } else {
-                        !val.as_bool().unwrap_or(false)
+                        !vdbe_real_is_truthy(val)
                     };
                     if should_jump {
                         pc = op.p2 as usize;
@@ -3595,6 +3606,11 @@ impl VdbeEngine {
                 Opcode::OpenRead => {
                     // bd-1xrs: StorageCursor is now the ONLY cursor path.
                     // No MemCursor fallback - open_storage_cursor must succeed.
+                    if op.p3 > 1 {
+                        return Err(FrankenError::NotImplemented(
+                            "attached databases (p3 > 1) not yet supported in VDBE".to_owned(),
+                        ));
+                    }
                     let cursor_id = op.p1;
                     let root_page = op.p2;
                     self.pending_next_after_delete.remove(&cursor_id);
@@ -3610,6 +3626,11 @@ impl VdbeEngine {
                 Opcode::OpenWrite => {
                     // bd-1xrs: StorageCursor is now the ONLY cursor path.
                     // No MemCursor fallback - open_storage_cursor must succeed.
+                    if op.p3 > 1 {
+                        return Err(FrankenError::NotImplemented(
+                            "attached databases (p3 > 1) not yet supported in VDBE".to_owned(),
+                        ));
+                    }
                     let cursor_id = op.p1;
                     let root_page = op.p2;
                     self.pending_next_after_delete.remove(&cursor_id);
@@ -4903,7 +4924,8 @@ impl VdbeEngine {
                     let record = self.get_reg(op.p2).clone();
                     if let Some(sorter) = self.sorters.get_mut(&cursor_id) {
                         let decoded = decode_record(&record)?;
-                        sorter.insert_row(decoded)?;
+                        let blob = record_blob_bytes(&record).to_vec();
+                        sorter.insert_row(decoded, blob)?;
                     }
                     pc += 1;
                 }
@@ -4957,7 +4979,7 @@ impl VdbeEngine {
                             if let Some(current) = sorter.rows.get(pos) {
                                 let probe = decode_record(self.get_reg(op.p3))?;
                                 !sorter_keys_equal(
-                                    current,
+                                    &current.values,
                                     &probe,
                                     sorter.key_columns,
                                     &sorter.collations,
@@ -4985,7 +5007,7 @@ impl VdbeEngine {
                     let value = if let Some(sorter) = self.sorters.get(&cursor_id) {
                         if let Some(pos) = sorter.position {
                             if let Some(row) = sorter.rows.get(pos) {
-                                SqliteValue::Blob(encode_record(&row.values))
+                                SqliteValue::Blob(row.blob.clone())
                             } else {
                                 SqliteValue::Null
                             }
@@ -5011,7 +5033,8 @@ impl VdbeEngine {
                 Opcode::MakeRecord => {
                     // Build a record from registers p1..p1+p2-1 into register p3.
                     let target = op.p3;
-                    let values = self.collect_reg_range_refs(op.p1, usize::try_from(op.p2).unwrap_or(0));
+                    let values =
+                        self.collect_reg_range_refs(op.p1, usize::try_from(op.p2).unwrap_or(0));
                     let blob = encode_record_refs(&values);
                     self.set_reg(target, SqliteValue::Blob(blob));
                     pc += 1;
@@ -6565,12 +6588,40 @@ impl VdbeEngine {
             return Ok(SqliteValue::Null);
         }
 
+        // Extract pseudo cursor info without holding a mutable borrow
+        // on self.cursors, to avoid conflict with self.get_reg().
         if let Some(cursor) = self.cursors.get(&cursor_id) {
             if cursor.is_pseudo {
+                if let Some(row) = &cursor.pseudo_row {
+                    return Ok(row.get(col_idx).cloned().unwrap_or(SqliteValue::Null));
+                }
                 if let Some(reg) = cursor.pseudo_reg {
-                    let blob = self.get_reg(reg);
-                    if let Ok(values) = decode_record(blob) {
-                        return Ok(values.get(col_idx).cloned().unwrap_or(SqliteValue::Null));
+                    let blob = self.get_reg(reg).clone();
+
+                    let use_cache = if let Some(cursor) = self.cursors.get(&cursor_id) {
+                        if let Some((cached_blob, _)) = &cursor.cached_pseudo_row {
+                            cached_blob == &blob
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+
+                    if !use_cache {
+                        if let Ok(values) = decode_record(&blob) {
+                            if let Some(cursor) = self.cursors.get_mut(&cursor_id) {
+                                cursor.cached_pseudo_row = Some((blob, values));
+                            }
+                        } else if let Some(cursor) = self.cursors.get_mut(&cursor_id) {
+                            cursor.cached_pseudo_row = None;
+                        }
+                    }
+
+                    if let Some(cursor) = self.cursors.get(&cursor_id) {
+                        if let Some((_, values)) = &cursor.cached_pseudo_row {
+                            return Ok(values.get(col_idx).cloned().unwrap_or(SqliteValue::Null));
+                        }
                     }
                 }
                 return Ok(SqliteValue::Null);
@@ -6592,7 +6643,11 @@ impl VdbeEngine {
         if let Some(sorter) = self.sorters.get(&cursor_id) {
             if let Some(pos) = sorter.position {
                 if let Some(row) = sorter.rows.get(pos) {
-                    return Ok(row.values.get(col_idx).cloned().unwrap_or(SqliteValue::Null));
+                    return Ok(row
+                        .values
+                        .get(col_idx)
+                        .cloned()
+                        .unwrap_or(SqliteValue::Null));
                 }
             }
         }
@@ -6713,7 +6768,12 @@ impl VdbeEngine {
                     };
                     (is_table, None)
                 };
-                let cursor = BtCursor::new(page_io.clone(), root_pgno, self.page_size.get(), is_table_btree);
+                let cursor = BtCursor::new(
+                    page_io.clone(),
+                    root_pgno,
+                    self.page_size.get(),
+                    is_table_btree,
+                );
                 self.storage_cursors.insert(
                     cursor_id,
                     StorageCursor {
@@ -6779,7 +6839,12 @@ impl VdbeEngine {
                     );
                     return false;
                 }
-                let cursor = BtCursor::new(page_io.clone(), root_pgno, self.page_size.get(), is_table_btree);
+                let cursor = BtCursor::new(
+                    page_io.clone(),
+                    root_pgno,
+                    self.page_size.get(),
+                    is_table_btree,
+                );
                 self.storage_cursors.insert(
                     cursor_id,
                     StorageCursor {
@@ -7756,7 +7821,11 @@ mod tests {
         let mut engine = VdbeEngine::new(prog.register_count());
         let outcome = engine.execute(&prog).expect("execution should succeed");
         assert_eq!(outcome, ExecOutcome::Done);
-        engine.take_results()
+        engine
+            .take_results()
+            .into_iter()
+            .map(|v| v.into_vec())
+            .collect()
     }
 
     /// Build and execute a program with bound SQL parameters.
@@ -7771,7 +7840,11 @@ mod tests {
         engine.set_bindings(bindings);
         let outcome = engine.execute(&prog).expect("execution should succeed");
         assert_eq!(outcome, ExecOutcome::Done);
-        engine.take_results()
+        engine
+            .take_results()
+            .into_iter()
+            .map(|v| v.into_vec())
+            .collect()
     }
 
     /// Build and execute a program with the builtin function registry attached.
@@ -7787,7 +7860,11 @@ mod tests {
         engine.set_function_registry(Arc::new(registry));
         let outcome = engine.execute(&prog).expect("execution should succeed");
         assert_eq!(outcome, ExecOutcome::Done);
-        engine.take_results()
+        engine
+            .take_results()
+            .into_iter()
+            .map(|v| v.into_vec())
+            .collect()
     }
 
     #[test]
@@ -8474,7 +8551,10 @@ mod tests {
         let outcome = engine.execute(&prog).unwrap();
         assert_eq!(outcome, ExecOutcome::Done);
         assert_eq!(engine.results().len(), 1);
-        assert_eq!(engine.results()[0], vec![SqliteValue::Integer(200)]);
+        assert_eq!(
+            engine.results()[0].to_vec(),
+            vec![SqliteValue::Integer(200)]
+        );
     }
 
     #[test]
@@ -11014,7 +11094,11 @@ mod tests {
         engine.set_reject_mem_fallback(false);
         let outcome = engine.execute(&prog).expect("execution should succeed");
         assert_eq!(outcome, ExecOutcome::Done);
-        engine.take_results()
+        engine
+            .take_results()
+            .into_iter()
+            .map(|v| v.into_vec())
+            .collect()
     }
 
     #[test]
@@ -11108,7 +11192,11 @@ mod tests {
         engine.set_reject_mem_fallback(false);
         let outcome = engine.execute(&prog).expect("execution should succeed");
         assert_eq!(outcome, ExecOutcome::Done);
-        let results = engine.take_results();
+        let results: Vec<_> = engine
+            .take_results()
+            .into_iter()
+            .map(|v| v.into_vec())
+            .collect();
         let db = engine.take_database().expect("database should exist");
         (results, db)
     }
@@ -12396,7 +12484,7 @@ mod tests {
         // Insert several rows — each should trigger a spill.
         for value in [50i64, 30, 10, 40, 20] {
             sorter
-                .insert_row(vec![SqliteValue::Integer(value)])
+                .insert_row(vec![SqliteValue::Integer(value)], vec![])
                 .expect("insert should succeed");
         }
 
@@ -12418,7 +12506,11 @@ mod tests {
         assert!(sorter.spill_runs.is_empty(), "runs should be drained");
 
         // Verify sorted order.
-        let values: Vec<i64> = sorter.rows.iter().map(|r| r[0].to_integer()).collect();
+        let values: Vec<i64> = sorter
+            .rows
+            .iter()
+            .map(|r| r.values[0].to_integer())
+            .collect();
         assert_eq!(values, vec![10, 20, 30, 40, 50]);
 
         // All 5 rows should have been counted (spill batches + in-memory remainder).
@@ -12439,7 +12531,7 @@ mod tests {
 
         for value in [3i64, 1, 2] {
             sorter
-                .insert_row(vec![SqliteValue::Integer(value)])
+                .insert_row(vec![SqliteValue::Integer(value)], vec![])
                 .expect("insert should succeed");
         }
         assert!(!sorter.spill_runs.is_empty());
@@ -12461,13 +12553,17 @@ mod tests {
 
         for value in [10i64, 50, 30, 20, 40] {
             sorter
-                .insert_row(vec![SqliteValue::Integer(value)])
+                .insert_row(vec![SqliteValue::Integer(value)], vec![])
                 .expect("insert should succeed");
         }
 
         sorter.sort().expect("sort should succeed");
 
-        let values: Vec<i64> = sorter.rows.iter().map(|r| r[0].to_integer()).collect();
+        let values: Vec<i64> = sorter
+            .rows
+            .iter()
+            .map(|r| r.values[0].to_integer())
+            .collect();
         assert_eq!(values, vec![50, 40, 30, 20, 10]);
     }
 
@@ -12480,10 +12576,10 @@ mod tests {
         // Insert rows: (group, value)
         for (group, value) in [(1i64, 30i64), (2, 10), (1, 20), (2, 40), (1, 10)] {
             sorter
-                .insert_row(vec![
-                    SqliteValue::Integer(group),
-                    SqliteValue::Integer(value),
-                ])
+                .insert_row(
+                    vec![SqliteValue::Integer(group), SqliteValue::Integer(value)],
+                    vec![],
+                )
                 .expect("insert should succeed");
         }
 
@@ -12492,7 +12588,7 @@ mod tests {
         let values: Vec<(i64, i64)> = sorter
             .rows
             .iter()
-            .map(|r| (r[0].to_integer(), r[1].to_integer()))
+            .map(|r| (r.values[0].to_integer(), r.values[1].to_integer()))
             .collect();
         // Group 1 first (ASC), within group value DESC: 30, 20, 10.
         // Group 2 second, within group value DESC: 40, 10.
@@ -12506,13 +12602,13 @@ mod tests {
         assert_eq!(sorter.memory_used, 0);
 
         sorter
-            .insert_row(vec![SqliteValue::Integer(42)])
+            .insert_row(vec![SqliteValue::Integer(42)], vec![])
             .expect("insert should succeed");
         let after_one = sorter.memory_used;
         assert!(after_one > 0, "memory should increase after insert");
 
         sorter
-            .insert_row(vec![SqliteValue::Text("hello world".into())])
+            .insert_row(vec![SqliteValue::Text("hello world".into())], vec![])
             .expect("insert should succeed");
         let after_two = sorter.memory_used;
         assert!(
@@ -12537,14 +12633,18 @@ mod tests {
 
         for value in [5i64, 3, 1, 4, 2] {
             sorter
-                .insert_row(vec![SqliteValue::Integer(value)])
+                .insert_row(vec![SqliteValue::Integer(value)], vec![])
                 .expect("insert should succeed");
         }
 
         assert!(sorter.spill_runs.is_empty(), "no spill expected");
         sorter.sort().expect("sort should succeed");
 
-        let values: Vec<i64> = sorter.rows.iter().map(|r| r[0].to_integer()).collect();
+        let values: Vec<i64> = sorter
+            .rows
+            .iter()
+            .map(|r| r.values[0].to_integer())
+            .collect();
         assert_eq!(values, vec![1, 2, 3, 4, 5]);
         assert_eq!(sorter.rows_sorted_total, 5);
     }
@@ -12660,7 +12760,11 @@ mod tests {
         let outcome = engine.execute(&prog).expect("execution should succeed");
         assert_eq!(outcome, ExecOutcome::Done);
 
-        let results = engine.take_results();
+        let results: Vec<_> = engine
+            .take_results()
+            .into_iter()
+            .map(|v| v.into_vec())
+            .collect();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0], vec![SqliteValue::Integer(100)]);
     }
@@ -12704,7 +12808,11 @@ mod tests {
         let outcome = engine.execute(&prog).expect("execution should succeed");
         assert_eq!(outcome, ExecOutcome::Done);
 
-        let results = engine.take_results();
+        let results: Vec<_> = engine
+            .take_results()
+            .into_iter()
+            .map(|v| v.into_vec())
+            .collect();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0], vec![SqliteValue::Integer(42)]);
     }
@@ -13406,7 +13514,14 @@ mod tests {
         let mut engine = VdbeEngine::new(prog.register_count());
         engine.register_vtab_cursor(cursor_id, Box::new(cursor));
         let outcome = engine.execute(&prog).expect("execution should succeed");
-        (engine.take_results(), outcome)
+        (
+            engine
+                .take_results()
+                .into_iter()
+                .map(|v| v.into_vec())
+                .collect(),
+            outcome,
+        )
     }
 
     #[test]

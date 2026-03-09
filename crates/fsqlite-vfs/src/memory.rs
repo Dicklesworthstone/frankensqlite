@@ -459,10 +459,13 @@ impl VfsFile for MemoryFile {
         let offset = u64_to_usize(offset, "write offset")?;
         let end = offset
             .checked_add(buf.len())
-            .ok_or_else(|| FrankenError::OutOfRange {
-                what: "write end offset".to_string(),
-                value: format!("offset={offset}, len={}", buf.len()),
-            })?;
+            .ok_or_else(|| FrankenError::Io(std::io::Error::new(std::io::ErrorKind::Other, "write offset + length overflow")))?;
+
+        if offset == storage.data.len() {
+            // Fast path: appending exactly at the end. Skips zero-initialization.
+            storage.data.extend_from_slice(buf);
+            return Ok(());
+        }
 
         if end > storage.data.len() {
             storage.data.resize(end, 0);

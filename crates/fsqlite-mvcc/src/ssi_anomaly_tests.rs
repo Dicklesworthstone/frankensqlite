@@ -7,8 +7,8 @@
 //! 4. Rebase correctness (concurrent conflicting transactions)
 //! 5. CAS version install correctness
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use fsqlite_types::{
@@ -17,14 +17,14 @@ use fsqlite_types::{
 };
 
 use crate::begin_concurrent::{
-    concurrent_abort, concurrent_commit_with_ssi, concurrent_write_page, ConcurrentRegistry,
+    ConcurrentRegistry, concurrent_abort, concurrent_commit_with_ssi, concurrent_write_page,
 };
 use crate::core_types::{CommitIndex, InProcessPageLockTable, VersionArena};
-use crate::ebr::{StaleReaderConfig, VersionGuard, VersionGuardRegistry, GLOBAL_EBR_METRICS};
+use crate::ebr::{GLOBAL_EBR_METRICS, StaleReaderConfig, VersionGuard, VersionGuardRegistry};
 use crate::gc::{GcScheduler, GcTodo};
 use crate::lifecycle::MvccError;
 use crate::ssi_validation::{
-    ssi_validate_and_publish, ActiveTxnView, CommittedReaderInfo, SsiAbortReason,
+    ActiveTxnView, CommittedReaderInfo, SsiAbortReason, ssi_validate_and_publish,
 };
 
 const BEAD_ID: &str = "bd-688.6";

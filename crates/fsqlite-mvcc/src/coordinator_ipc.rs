@@ -8,12 +8,12 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
+use fsqlite_types::ObjectId;
 use fsqlite_types::encoding::{
     append_u16_be, append_u32_be, append_u32_le, append_u64_be, append_u64_le, read_u16_be,
     read_u32_be, read_u32_le, read_u64_be, read_u64_le,
 };
 use fsqlite_types::sync_primitives::Mutex;
-use fsqlite_types::ObjectId;
 
 // ---------------------------------------------------------------------------
 // Constants (§5.9.0 normative)
@@ -761,7 +761,7 @@ impl SubmitWalPayload {
         buf.push(u8::from(self.has_out_rw));
         buf.push(self.wal_fec_r);
         buf.extend_from_slice(&[0u8; 5]); // pad1 to 8-byte alignment (§5.9.0.1)
-                                          // spill_pages
+        // spill_pages
         let sp_count =
             u32::try_from(self.spill_pages.len()).expect("spill_pages length must fit u32");
         append_u32_le(&mut buf, sp_count);
@@ -796,7 +796,7 @@ impl SubmitWalPayload {
         pos += 1;
         let wal_fec_r = *src.get(pos)?;
         pos += 6; // fec_r(1) + pad1(5)
-                  // spill_pages
+        // spill_pages
         let sp_count = read_u32_le(src.get(pos..pos + 4)?)? as usize;
         pos += 4;
         // Lower bound: we must have enough bytes for `sp_count` entries plus the four
@@ -1386,7 +1386,7 @@ pub fn send_with_fd(
     data: &[u8],
     fd: std::os::unix::io::RawFd,
 ) -> std::io::Result<usize> {
-    use nix::sys::socket::{sendmsg, ControlMessage, MsgFlags};
+    use nix::sys::socket::{ControlMessage, MsgFlags, sendmsg};
     use std::io::IoSlice;
     use std::io::Write as _;
     use std::os::unix::io::AsRawFd;
@@ -1429,7 +1429,7 @@ pub fn recv_with_fd(
     buf: &mut [u8],
 ) -> std::io::Result<(usize, Option<ReceivedFd>)> {
     use nix::cmsg_space;
-    use nix::sys::socket::{recvmsg, MsgFlags};
+    use nix::sys::socket::{MsgFlags, recvmsg};
     use std::io::IoSliceMut;
     use std::os::unix::io::AsRawFd;
 
@@ -2040,8 +2040,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn test_scm_rights_fd_passing() {
-        use std::io::pipe;
         use std::io::Write;
+        use std::io::pipe;
         use std::os::fd::AsRawFd;
         use std::os::unix::net::UnixStream;
 
