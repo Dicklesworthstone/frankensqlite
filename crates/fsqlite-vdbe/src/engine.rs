@@ -2426,7 +2426,7 @@ impl VdbeEngine {
             bindings: Vec::new(),
             execution_cx: execution_cx.create_child(),
             trace_opcodes: opcode_trace_enabled(),
-            results: Vec::new(),
+            results: Vec::with_capacity(64),
             cursors: SwissIndex::new(),
             sorters: SwissIndex::new(),
             storage_cursors: SwissIndex::new(),
@@ -2717,7 +2717,7 @@ impl VdbeEngine {
     ///
     /// Values are 1-indexed at execution time (`?1` maps to `bindings[0]`).
     pub fn set_bindings(&mut self, bindings: Vec<SqliteValue>) {
-        self.bindings = bindings.into();
+        self.bindings = bindings;
     }
 
     /// Set the schema cookie that `ReadCookie` will return and
@@ -3013,8 +3013,7 @@ impl VdbeEngine {
                     // Remove the old cursor to get its metadata.
                     let old_sc = self.storage_cursors.remove(&cursor_id).unwrap();
                     let root_page = self.cursor_root_pages.get(&cursor_id).copied().unwrap_or(1);
-                    let root_pgno =
-                        PageNumber::new(root_page as u32).unwrap_or(PageNumber::ONE);
+                    let root_pgno = PageNumber::new(root_page as u32).unwrap_or(PageNumber::ONE);
 
                     // Extract the SharedTxnPageIo from the old cursor.
                     // Since we verified it's Txn above, this is safe.
@@ -4145,7 +4144,9 @@ impl VdbeEngine {
                                     if !cursor.cursor.eof() {
                                         let target_vals =
                                             parse_record(&key_bytes).ok_or_else(|| {
-                                                FrankenError::internal("SeekGT: malformed seek key record")
+                                                FrankenError::internal(
+                                                    "SeekGT: malformed seek key record",
+                                                )
                                             })?;
                                         loop {
                                             if cursor.cursor.eof() {
@@ -4154,7 +4155,9 @@ impl VdbeEngine {
                                             let payload = cursor.cursor.payload(&cursor.cx)?;
                                             let cur_vals =
                                                 parse_record(&payload).ok_or_else(|| {
-                                                    FrankenError::internal("SeekGT: malformed cursor record")
+                                                    FrankenError::internal(
+                                                        "SeekGT: malformed cursor record",
+                                                    )
                                                 })?;
                                             let cmp = compare_sorter_keys(
                                                 &cur_vals,
@@ -4175,7 +4178,9 @@ impl VdbeEngine {
                                     if !cursor.cursor.eof() {
                                         let target_vals =
                                             parse_record(&key_bytes).ok_or_else(|| {
-                                                FrankenError::internal("SeekLE: malformed seek key record")
+                                                FrankenError::internal(
+                                                    "SeekLE: malformed seek key record",
+                                                )
                                             })?;
                                         loop {
                                             if cursor.cursor.eof() {
@@ -4184,7 +4189,9 @@ impl VdbeEngine {
                                             let payload = cursor.cursor.payload(&cursor.cx)?;
                                             let cur_vals =
                                                 parse_record(&payload).ok_or_else(|| {
-                                                    FrankenError::internal("SeekLE: malformed cursor record")
+                                                    FrankenError::internal(
+                                                        "SeekLE: malformed cursor record",
+                                                    )
                                                 })?;
                                             let cmp = compare_sorter_keys(
                                                 &cur_vals,
@@ -4561,18 +4568,21 @@ impl VdbeEngine {
                             let exists = sc.cursor.table_move_to(&sc.cx, rowid)?.is_found();
 
                             if exists {
-                                let is_update = (op.p5 & 0x04) != 0;
-                                if is_update || oe_flag == 5 {
-                                    // OE_REPLACE (5) or OPFLAG_ISUPDATE: Delete old, insert new (UPSERT/UPDATE)
+                                // Match on OE_* mode value — p5 is NOT a
+                                // bitfield, so do NOT use bit-flag checks
+                                // like `(op.p5 & 0x04)`.  OE_IGNORE == 4
+                                // would collide with a hypothetical
+                                // OPFLAG_ISUPDATE bit at 0x04.
+                                if oe_flag == 5 {
+                                    // OE_REPLACE: Delete old, insert new
                                     self.native_replace_row(cursor_id, rowid)?;
-                                    let sc2 = self
-                                        .storage_cursors
-                                        .get_mut(&cursor_id)
-                                        .ok_or_else(|| {
+                                    let sc2 = self.storage_cursors.get_mut(&cursor_id).ok_or_else(
+                                        || {
                                             FrankenError::internal(
                                                 "cursor disappeared during REPLACE",
                                             )
-                                        })?;
+                                        },
+                                    )?;
                                     sc2.cursor.table_insert(&sc2.cx, rowid, &blob)?;
                                     actually_inserted = true;
                                 } else if oe_flag == 4 {
@@ -4612,9 +4622,9 @@ impl VdbeEngine {
                                     4 => {
                                         // OE_IGNORE: Skip insert for conflicting row
                                     }
-                                    5 | 8 => {
-                                        // OE_REPLACE / OPFLAG_ISUPDATE: Delete conflicting
-                                        // row(s), then insert new.
+                                    5 => {
+                                        // OE_REPLACE: Delete conflicting row(s),
+                                        // then insert new.
                                         if let Some(conflict_rid) = unique_conflict_rowid {
                                             db.get_table_mut(root)
                                                 .map(|t| t.delete_by_rowid(conflict_rid));
@@ -5421,7 +5431,9 @@ impl VdbeEngine {
                         }
                         let payload = sc.cursor.payload(&sc.cx)?;
                         parse_record(&payload).ok_or_else(|| {
-                            FrankenError::internal("IdxCmp: malformed index record at cursor position")
+                            FrankenError::internal(
+                                "IdxCmp: malformed index record at cursor position",
+                            )
                         })?
                     } else if let Some(cursor) = self.cursors.get(&cursor_id) {
                         if let Some(pos) = cursor.position
@@ -5798,6 +5810,10 @@ impl VdbeEngine {
 
                     let args = self.collect_reg_range(first_arg_reg, arg_count);
                     let result = func.invoke(&args)?;
+                    // DEBUG TRACE
+                    if func_name.eq_ignore_ascii_case("strftime") {
+                        println!("DEBUG: strftime called with {:?} -> {:?}", args, result);
+                    }
 
                     if self.trace_opcodes {
                         let result_type = match &result {
@@ -7068,9 +7084,8 @@ fn find_conflicting_rowid_in_index(
     sc.cursor.index_move_to(&sc.cx, key_bytes)?;
 
     // The new key we're trying to insert — parse its prefix for comparison.
-    let new_fields = parse_record(key_bytes).ok_or_else(|| {
-        FrankenError::internal("find_conflicting_rowid: malformed new index key")
-    })?;
+    let new_fields = parse_record(key_bytes)
+        .ok_or_else(|| FrankenError::internal("find_conflicting_rowid: malformed new index key"))?;
 
     // Check the entry at current position and previous entry for a prefix match.
     for attempt in 0..2 {
@@ -13626,9 +13641,7 @@ mod tests {
         b.resolve_label(end);
         let prog = b.finish().expect("program should build");
 
-        let vs = Arc::new(VersionStore::new(
-            fsqlite_types::PageSize::DEFAULT,
-        ));
+        let vs = Arc::new(VersionStore::new(fsqlite_types::PageSize::DEFAULT));
 
         // Build a CommitLog with entries so SetSnapshot validation passes.
         let commit_log = {
@@ -13691,9 +13704,7 @@ mod tests {
         b.resolve_label(end);
         let prog = b.finish().expect("program should build");
 
-        let vs = Arc::new(VersionStore::new(
-            fsqlite_types::PageSize::DEFAULT,
-        ));
+        let vs = Arc::new(VersionStore::new(fsqlite_types::PageSize::DEFAULT));
 
         // Build a CommitLog with entries so SetSnapshot validation passes.
         let commit_log = {
@@ -13749,14 +13760,10 @@ mod tests {
         let txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
         let inner_io = SharedTxnPageIo::new(Box::new(txn));
 
-        let empty_vs = Arc::new(VersionStore::new(
-            fsqlite_types::PageSize::DEFAULT,
-        ));
+        let empty_vs = Arc::new(VersionStore::new(fsqlite_types::PageSize::DEFAULT));
 
-        let tt_snapshot = TimeTravelSnapshot::new_for_commit_seq(
-            CommitSeq::new(5),
-            SchemaEpoch::new(1),
-        );
+        let tt_snapshot =
+            TimeTravelSnapshot::new_for_commit_seq(CommitSeq::new(5), SchemaEpoch::new(1));
 
         let tt_page_io = TimeTravelPageIo {
             inner: inner_io,
@@ -13811,10 +13818,8 @@ mod tests {
         vs.publish(version);
 
         // Snapshot at commit 5 -- page 1 is versioned, page 2 is not.
-        let tt_snapshot = TimeTravelSnapshot::new_for_commit_seq(
-            CommitSeq::new(5),
-            SchemaEpoch::new(1),
-        );
+        let tt_snapshot =
+            TimeTravelSnapshot::new_for_commit_seq(CommitSeq::new(5), SchemaEpoch::new(1));
 
         let tt_page_io = TimeTravelPageIo {
             inner: inner_io,

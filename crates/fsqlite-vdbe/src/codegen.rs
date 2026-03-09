@@ -1044,6 +1044,7 @@ pub fn codegen_select(
     schema: &[TableSchema],
     _ctx: &CodegenContext,
 ) -> Result<(), CodegenError> {
+    println!("DEBUG: codegen_select entered");
     let (columns, from, where_clause, group_by, having, distinct) = match &stmt.body.select {
         SelectCore::Select {
             columns,
@@ -1053,7 +1054,11 @@ pub fn codegen_select(
             having,
             distinct,
             ..
-        } => (columns, from, where_clause, group_by, having, *distinct),
+        } => {
+            println!("DEBUG: AST columns: {:?}", columns);
+            println!("DEBUG: AST group_by: {:?}", group_by);
+            (columns, from, where_clause, group_by, having, *distinct)
+        },
         SelectCore::Values(rows) => {
             return codegen_values_select(b, rows);
         }
@@ -1104,12 +1109,13 @@ pub fn codegen_select(
     // Aggregates like count(*) require a full scan + AggStep/AggFinal path;
     // the rowid-seek and index-seek paths don't support aggregate functions.
     let is_aggregate = has_aggregate_columns(columns);
+    println!("DEBUG: has_aggregate_columns = {}, group_by.is_empty() = {}", is_aggregate, group_by.is_empty());
 
     // Check for rowid-equality WHERE clause (only for non-aggregate queries).
-    let rowid_param = if is_aggregate {
+    let rowid_target = if is_aggregate {
         None
     } else {
-        extract_rowid_bind_param(where_clause.as_deref(), Some(table))
+        extract_rowid_target_expr(where_clause.as_deref(), Some(table))
     };
     // Check for a simple indexed equality probe (only for non-aggregate queries).
     // We probe with [bound_value, i64::MIN] so SeekGE anchors on the first
@@ -1118,14 +1124,14 @@ pub fn codegen_select(
     let index_eq = if is_aggregate {
         None
     } else {
-        extract_column_eq_bind(where_clause.as_deref())
+        extract_column_eq_target(where_clause.as_deref(), table)
     };
     let mut index_cursor_to_close = None;
 
-    if let Some(param_idx) = rowid_param {
+    if let Some(target_expr) = rowid_target {
         // --- Rowid-seek SELECT ---
         let rowid_reg = b.alloc_reg();
-        b.emit_op(Opcode::Variable, param_idx, rowid_reg, 0, P4::None, 0);
+        emit_expr(b, target_expr, rowid_reg, None);
         b.emit_op(
             Opcode::OpenRead,
             cursor,
@@ -1149,9 +1155,9 @@ pub fn codegen_select(
 
         // ResultRow.
         b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
-    } else if let Some((col_name, param_idx)) = &index_eq {
+    } else if let Some((col_name, target_expr)) = index_eq {
         // --- Index-seek SELECT ---
-        if let Some(idx_schema) = table.index_for_column(col_name) {
+        if let Some(idx_schema) = table.index_for_column(&col_name) {
             let idx_cursor = 1_i32;
             index_cursor_to_close = Some(idx_cursor);
             let full_scan_fallback = b.emit_label();
@@ -1160,7 +1166,7 @@ pub fn codegen_select(
             // Allocate param_reg and min_rowid_reg as contiguous pair for MakeRecord.
             let param_reg = b.alloc_regs(2);
             let min_rowid_reg = param_reg + 1;
-            b.emit_op(Opcode::Variable, *param_idx, param_reg, 0, P4::None, 0);
+            emit_expr(b, target_expr, param_reg, None);
 
             // SQL semantics: `WHERE col = NULL` is UNKNOWN (filters out all rows).
             // If the bound parameter is NULL, skip the index scan entirely.
@@ -1301,6 +1307,7 @@ pub fn codegen_select(
             );
         }
     } else if has_aggregate_columns(columns) && !group_by.is_empty() {
+        eprintln!("DEBUG: Hitting codegen_select_group_by_aggregate! columns: {:?}", columns.len());
         // --- Aggregate query WITH GROUP BY ---
         return codegen_select_group_by_aggregate(
             b,
@@ -3652,6 +3659,7 @@ fn rewrite_aggregates_recursive(
 
 /// A GROUP BY key that is either a simple column reference or an arbitrary
 /// expression (e.g. `length(name)`, `substr(city, 1, 1)`).
+#[derive(Debug)]
 enum GroupByKey {
     /// Direct table column — read via `Opcode::Column`.
     Column(usize),
@@ -4158,6 +4166,7 @@ fn codegen_select_group_by_aggregate(
             register_base: None,
             secondary: None,
         };
+        eprintln!("DEBUG: group_by_keys length = {}, keys = {:?}", group_by_keys.len(), group_by_keys);
         let mut reg = sorter_base;
         for key in &group_by_keys {
             match key {
@@ -4166,6 +4175,7 @@ fn codegen_select_group_by_aggregate(
                     b.emit_op(Opcode::Column, cursor, *col_idx as i32, reg, P4::None, 0);
                 }
                 GroupByKey::Expression(expr) => {
+                    eprintln!("DEBUG: evaluate GroupByKey::Expression: {:?}", expr);
                     emit_expr(b, expr, reg, Some(&scan_ctx));
                 }
             }
@@ -7967,7 +7977,23 @@ fn resolve_result_column_indices(
 /// Check if a WHERE clause is a simple `rowid = ?` bind parameter.
 ///
 /// Returns the 1-based bind parameter index if so.
-fn extract_rowid_bind_param(where_clause: Option<&Expr>, table: Option<&TableSchema>) -> Option<i32> {
+
+fn is_simple_constant(expr: &Expr) -> bool {
+    matches!(expr, Expr::Placeholder(..) | Expr::Literal(..))
+}
+
+fn extract_rowid_bind_param(
+    where_clause: Option<&Expr>,
+    table: Option<&TableSchema>,
+) -> Option<i32> {
+    let expr = extract_rowid_target_expr(where_clause, table)?;
+    bind_param_index(expr)
+}
+
+fn extract_rowid_target_expr<'a>(
+    where_clause: Option<&'a Expr>,
+    table: Option<&TableSchema>,
+) -> Option<&'a Expr> {
     let expr = where_clause?;
     if let Expr::BinaryOp {
         left,
@@ -7976,19 +8002,18 @@ fn extract_rowid_bind_param(where_clause: Option<&Expr>, table: Option<&TableSch
         ..
     } = expr
     {
-        // Check left = rowid column, right = bind param.
-        if is_rowid_expr(left, table) {
-            return bind_param_index(right);
+        if is_rowid_expr(left, table) && is_simple_constant(right) {
+            return Some(right);
         }
-        if is_rowid_expr(right, table) {
-            return bind_param_index(left);
+        if is_rowid_expr(right, table) && is_simple_constant(left) {
+            return Some(left);
         }
     }
     None
 }
 
 /// Check if a WHERE clause is `col = ?` for an indexed column.
-fn extract_column_eq_bind(where_clause: Option<&Expr>) -> Option<(String, i32)> {
+fn extract_column_eq_target<'a>(where_clause: Option<&'a Expr>, table: &TableSchema) -> Option<(String, &'a Expr)> {
     let expr = where_clause?;
     if let Expr::BinaryOp {
         left,
@@ -7997,11 +8022,15 @@ fn extract_column_eq_bind(where_clause: Option<&Expr>) -> Option<(String, i32)> 
         ..
     } = expr
     {
-        if let (Some(col_name), Some(param_idx)) = (column_name(left), bind_param_index(right)) {
-            return Some((col_name, param_idx));
+        if let Some(col_name) = column_name(left, table) {
+            if is_simple_constant(right) {
+                return Some((col_name, right));
+            }
         }
-        if let (Some(col_name), Some(param_idx)) = (column_name(right), bind_param_index(left)) {
-            return Some((col_name, param_idx));
+        if let Some(col_name) = column_name(right, table) {
+            if is_simple_constant(left) {
+                return Some((col_name, left));
+            }
         }
     }
     None
@@ -8009,9 +8038,9 @@ fn extract_column_eq_bind(where_clause: Option<&Expr>) -> Option<(String, i32)> 
 
 /// Extract a column name from an expression if it's a simple column reference.
 #[allow(dead_code)]
-fn column_name(expr: &Expr) -> Option<String> {
+fn column_name(expr: &Expr, table: &TableSchema) -> Option<String> {
     if let Expr::Column(col_ref, _) = expr {
-        if !is_rowid_ref(col_ref) {
+        if !is_rowid_ref(col_ref, Some(table)) {
             return Some(col_ref.column.clone());
         }
     }
@@ -8021,7 +8050,7 @@ fn column_name(expr: &Expr) -> Option<String> {
 /// Check if an expression is a rowid reference.
 fn is_rowid_expr(expr: &Expr, table: Option<&TableSchema>) -> bool {
     if let Expr::Column(col_ref, _) = expr {
-        if is_rowid_ref(col_ref) {
+        if is_rowid_ref(col_ref, table) {
             return true;
         }
         if let Some(t) = table {
@@ -8035,9 +8064,17 @@ fn is_rowid_expr(expr: &Expr, table: Option<&TableSchema>) -> bool {
     false
 }
 
-fn is_rowid_ref(col_ref: &ColumnRef) -> bool {
+fn is_rowid_ref(col_ref: &ColumnRef, table: Option<&TableSchema>) -> bool {
     let name = col_ref.column.to_ascii_lowercase();
-    name == "rowid" || name == "_rowid_" || name == "oid"
+    if name == "rowid" || name == "_rowid_" || name == "oid" {
+        return true;
+    }
+    if let Some(t) = table {
+        if let Some(col_idx) = t.column_index(&col_ref.column) {
+            return t.columns[col_idx].is_ipk;
+        }
+    }
+    false
 }
 
 /// Extract a bind parameter index from a `?` or `?NNN` placeholder.
