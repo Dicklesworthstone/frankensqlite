@@ -1048,6 +1048,7 @@ pub enum P4 {
 // (Layer 5). This is enforced by the workspace layering tests (bd-1wwc).
 
 use fsqlite_error::{FrankenError, Result};
+use smallvec::SmallVec;
 
 /// An opaque handle representing a forward-reference label.
 ///
@@ -1141,7 +1142,7 @@ impl Default for RegisterAllocator {
 #[derive(Debug)]
 pub struct ProgramBuilder {
     /// The instruction sequence.
-    ops: Vec<VdbeOp>,
+    ops: SmallVec<[VdbeOp; 64]>,
     /// Label states (indexed by `Label.0`).
     labels: Vec<LabelState>,
     /// Register allocator.
@@ -1153,7 +1154,7 @@ impl ProgramBuilder {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            ops: Vec::new(),
+            ops: SmallVec::new(),
             labels: Vec::new(),
             regs: RegisterAllocator::new(),
         }
@@ -1332,7 +1333,7 @@ impl Default for ProgramBuilder {
 #[derive(Debug, Clone, PartialEq)]
 pub struct VdbeProgram {
     /// The instruction sequence.
-    ops: Vec<VdbeOp>,
+    ops: SmallVec<[VdbeOp; 64]>,
     /// Number of registers needed (high water mark from allocation).
     register_count: i32,
 }

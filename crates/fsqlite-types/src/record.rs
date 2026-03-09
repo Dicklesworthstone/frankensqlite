@@ -31,21 +31,17 @@ pub fn parse_record(data: &[u8]) -> Option<Vec<SqliteValue>> {
         return None;
     }
 
-    // Parse serial types from the header.
-    let mut serial_types = Vec::new();
+    // Parse serial types and values in a single pass to avoid allocating
+    // a temporary vector for serial types.
     let mut offset = hdr_varint_len;
+    let mut body_offset = header_size;
+    let mut values = Vec::new();
+
     while offset < header_size {
         let (serial_type, consumed) = read_varint(&data[offset..header_size])?;
-        serial_types.push(serial_type);
         offset += consumed;
-    }
 
-    // Parse values from the body.
-    let mut body_offset = header_size;
-    let mut values = Vec::with_capacity(serial_types.len());
-
-    for &st in &serial_types {
-        let value_len_u64 = serial_type_len(st)?;
+        let value_len_u64 = serial_type_len(serial_type)?;
         let value_len = usize::try_from(value_len_u64).unwrap_or(usize::MAX);
 
         let end = body_offset.checked_add(value_len)?;
@@ -55,7 +51,7 @@ pub fn parse_record(data: &[u8]) -> Option<Vec<SqliteValue>> {
         }
 
         let value_bytes = &data[body_offset..end];
-        let value = decode_value(st, value_bytes)?;
+        let value = decode_value(serial_type, value_bytes)?;
         values.push(value);
         body_offset = end;
     }
@@ -181,19 +177,31 @@ fn decode_value(serial_type: u64, bytes: &[u8]) -> Option<SqliteValue> {
 /// Decode a big-endian signed integer of 1-8 bytes.
 #[allow(clippy::cast_possible_wrap)]
 fn decode_big_endian_signed(bytes: &[u8]) -> i64 {
-    if bytes.is_empty() {
-        return 0;
+    match bytes.len() {
+        0 => 0,
+        1 => bytes[0] as i8 as i64,
+        2 => i16::from_be_bytes(bytes.try_into().unwrap()) as i64,
+        3 => {
+            let mut buf = [if bytes[0] & 0x80 != 0 { 0xFF } else { 0 }; 4];
+            buf[1..4].copy_from_slice(bytes);
+            i32::from_be_bytes(buf) as i64
+        }
+        4 => i32::from_be_bytes(bytes.try_into().unwrap()) as i64,
+        6 => {
+            let mut buf = [if bytes[0] & 0x80 != 0 { 0xFF } else { 0 }; 8];
+            buf[2..8].copy_from_slice(bytes);
+            i64::from_be_bytes(buf)
+        }
+        8 => i64::from_be_bytes(bytes.try_into().unwrap()),
+        _ => {
+            let negative = bytes.first().is_some_and(|&b| b & 0x80 != 0);
+            let mut value: u64 = if negative { u64::MAX } else { 0 };
+            for &b in bytes {
+                value = (value << 8) | u64::from(b);
+            }
+            value as i64
+        }
     }
-
-    // Sign-extend: if the high bit is set, fill with 0xFF.
-    let negative = bytes[0] & 0x80 != 0;
-    let mut value: u64 = if negative { u64::MAX } else { 0 };
-
-    for &b in bytes {
-        value = (value << 8) | u64::from(b);
-    }
-
-    value as i64
 }
 
 /// Encode a `SqliteValue` into its serial type byte representation.
