@@ -838,6 +838,22 @@ fn parse_decoded_snapshot_block(
     let entry_size = 4_usize + 8 + header.page_size as usize;
     let data_bytes = &changeset_bytes[CHANGESET_HEADER_SIZE..];
 
+    let required_data_len = (header.n_pages as usize)
+        .checked_mul(entry_size)
+        .ok_or_else(|| FrankenError::DatabaseCorrupt {
+            detail: "n_pages causes size overflow".to_owned(),
+        })?;
+
+    if data_bytes.len() < required_data_len {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "changeset truncated: expected {} data bytes, got {}",
+                required_data_len,
+                data_bytes.len()
+            ),
+        });
+    }
+
     let mut pages = Vec::with_capacity(header.n_pages as usize);
     for i in 0..header.n_pages as usize {
         let offset = i * entry_size;

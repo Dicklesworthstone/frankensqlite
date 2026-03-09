@@ -7,9 +7,11 @@
 //! VDBE execution image and compatibility fallback for selected paths while
 //! cutover work continues.
 
+use lru::LruCache;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::str::FromStr;
@@ -822,7 +824,7 @@ impl PreparedStatement<'_> {
             autoincrement_seq_by_root_page,
             col_defaults_by_root_page,
             reject_mem,
-            Some(Rc::clone(&self.conn.version_store)),
+            Some(Arc::clone(&self.conn.version_store)),
         );
         if let Some(ref mut txn) = txn_back {
             txn.commit(op_cx)?;
@@ -1421,7 +1423,7 @@ struct ActiveConflictEvidence {
 #[derive(Debug, Clone)]
 struct ParseCacheEntry {
     sql: String,
-    statement: Statement,
+    statement: Arc<Statement>,
 }
 
 /// bd-1dp9.6.7.2.2: Cached compiled VdbeProgram for repeated ad-hoc queries.
@@ -1432,7 +1434,7 @@ struct ParseCacheEntry {
 #[derive(Clone)]
 struct CompiledCacheEntry {
     sql: String,
-    program: VdbeProgram,
+    program: Arc<VdbeProgram>,
 }
 
 /// A database connection holding schema metadata and execution/cache state.
@@ -1581,7 +1583,7 @@ pub struct Connection {
     // ── MVCC garbage collection (bd-3bql / 5E.5) ─────────────────────────────
     /// Version store for MVCC page versioning.  Stores committed page versions
     /// in an arena with version chains for snapshot resolution.
-    version_store: Rc<RefCell<VersionStore>>,
+    version_store: Arc<VersionStore>,
     /// GC scheduler that derives tick frequency from version chain pressure.
     gc_scheduler: RefCell<GcScheduler>,
     /// Per-process touched-page queue for incremental GC pruning.
@@ -1611,7 +1613,7 @@ pub struct Connection {
     /// LRU-bounded cache of parsed SQL ASTs keyed by SQL text hash.
     /// Avoids re-parsing the same SQL string on repeated query/execute calls.
     /// Invalidated on DDL operations (schema cookie increment).
-    parse_cache: RefCell<HashMap<u64, ParseCacheEntry>>,
+    parse_cache: RefCell<LruCache<u64, Arc<ParseCacheEntry>>>,
     /// Schema cookie value at time of last cache fill.  When schema_cookie
     /// changes (DDL executed), the entire cache is invalidated.
     parse_cache_cookie: RefCell<u32>,
@@ -1619,7 +1621,7 @@ pub struct Connection {
     /// Caches compiled bytecode for repeated ad-hoc statements so that
     /// repeated `execute()`/`execute_with_params()` calls skip compilation.
     /// Invalidated alongside parse_cache when schema_cookie changes.
-    compiled_cache: RefCell<HashMap<u64, CompiledCacheEntry>>,
+    compiled_cache: RefCell<LruCache<u64, Arc<CompiledCacheEntry>>>,
     // ── ATTACH/DETACH schema registry (§12.11, bd-7pxb) ─────────────────────
     /// Registry of attached databases. Tracks schema names registered via
     /// ATTACH DATABASE so that schema-qualified references resolve correctly.
@@ -1730,7 +1732,7 @@ impl Connection {
             root_cx,
             eprocess_oracle,
             // MVCC garbage collection (bd-3bql / 5E.5)
-            version_store: Rc::new(RefCell::new(VersionStore::new(PageSize::DEFAULT))),
+            version_store: Arc::new(VersionStore::new(PageSize::DEFAULT)),
             gc_scheduler: RefCell::new(GcScheduler::new()),
             gc_todo: RefCell::new(GcTodo::new()),
             gc_clock_millis: RefCell::new(0),
@@ -1746,10 +1748,10 @@ impl Connection {
             vtab_modules: RefCell::new(HashMap::new()),
             vtab_instances: RefCell::new(HashMap::new()),
             // Parse cache (br-legjy.7.3)
-            parse_cache: RefCell::new(HashMap::with_capacity(64)),
+            parse_cache: RefCell::new(LruCache::new(NonZeroUsize::new(256).unwrap())),
             parse_cache_cookie: RefCell::new(0),
             // Compiled bytecode cache (bd-1dp9.6.7.2.2)
-            compiled_cache: RefCell::new(HashMap::with_capacity(64)),
+            compiled_cache: RefCell::new(LruCache::new(NonZeroUsize::new(128).unwrap())),
             // ATTACH/DETACH schema registry (§12.11, bd-7pxb)
             attached_schemas: RefCell::new(SchemaRegistry::new()),
         };
@@ -2517,10 +2519,10 @@ impl Connection {
         let key = Self::sql_hash(sql);
         self.refresh_parse_cache_if_needed();
         if let Some(cached) = self.lookup_parse_cache(key, sql) {
-            return Ok(cached);
+            return Ok((*cached.statement).clone());
         }
         let stmt = parse_single_statement(sql)?;
-        self.insert_parse_cache(key, sql, &stmt);
+        self.insert_parse_cache(key, sql, stmt.clone());
         Ok(stmt)
     }
 
@@ -2533,13 +2535,13 @@ impl Connection {
         let key = Self::sql_hash(sql);
         self.refresh_parse_cache_if_needed();
         if let Some(cached) = self.lookup_parse_cache(key, sql) {
-            return Ok(vec![cached]);
+            return Ok(vec![(*cached.statement).clone()]);
         }
 
         // For single-statement SQL, use the cache.
         let stmts = parse_statements(sql)?;
         if stmts.len() == 1 {
-            self.insert_parse_cache(key, sql, &stmts[0]);
+            self.insert_parse_cache(key, sql, stmts[0].clone());
         }
         Ok(stmts)
     }
@@ -2554,60 +2556,67 @@ impl Connection {
         }
     }
 
-    fn lookup_parse_cache(&self, key: u64, sql: &str) -> Option<Statement> {
-        self.parse_cache
-            .borrow()
-            .get(&key)
-            .and_then(|entry| (entry.sql == sql).then_some(entry.statement.clone()))
+    fn lookup_parse_cache(&self, key: u64, sql: &str) -> Option<Arc<ParseCacheEntry>> {
+        let mut cache = self.parse_cache.borrow_mut();
+        let entry = cache.get(&key)?;
+        if entry.sql == sql {
+            Some(Arc::clone(entry))
+        } else {
+            None
+        }
     }
 
-    fn insert_parse_cache(&self, key: u64, sql: &str, statement: &Statement) {
-        // Bound cache size to avoid unbounded growth.
+    fn insert_parse_cache(
+        &self,
+        key: u64,
+        sql: &str,
+        statement: Statement,
+    ) -> Arc<ParseCacheEntry> {
         let mut cache = self.parse_cache.borrow_mut();
-        if cache.len() >= 256 {
-            cache.clear();
-        }
-        cache.insert(
-            key,
-            ParseCacheEntry {
-                sql: sql.to_owned(),
-                statement: statement.clone(),
-            },
-        );
+        let entry = Arc::new(ParseCacheEntry {
+            sql: sql.to_owned(),
+            statement: Arc::new(statement),
+        });
+        cache.put(key, Arc::clone(&entry));
+        entry
     }
 
     // ── bd-1dp9.6.7.2.2: Schema-scoped compiled cache ─────────────────
 
     /// Look up a cached compiled VdbeProgram by SQL hash.
-    fn lookup_compiled_cache(&self, key: u64, sql: &str) -> Option<VdbeProgram> {
-        self.compiled_cache
-            .borrow()
-            .get(&key)
-            .and_then(|entry| (entry.sql == sql).then_some(entry.program.clone()))
+    fn lookup_compiled_cache(&self, key: u64, sql: &str) -> Option<Arc<CompiledCacheEntry>> {
+        let mut cache = self.compiled_cache.borrow_mut();
+        let entry = cache.get(&key)?;
+        if entry.sql == sql {
+            Some(Arc::clone(entry))
+        } else {
+            None
+        }
     }
 
     /// Remove a cached compiled program by SQL text, if present.
     fn invalidate_compiled_cache(&self, sql: &str) {
         let key = Self::sql_hash(sql);
         let mut cache = self.compiled_cache.borrow_mut();
-        if cache.get(&key).is_some_and(|e| e.sql == sql) {
-            cache.remove(&key);
+        if cache.peek(&key).is_some_and(|e| e.sql == sql) {
+            cache.pop(&key);
         }
     }
 
     /// Store a compiled VdbeProgram in the schema-scoped cache.
-    fn insert_compiled_cache(&self, key: u64, sql: &str, program: &VdbeProgram) {
+    fn insert_compiled_cache(
+        &self,
+        key: u64,
+        sql: &str,
+        program: VdbeProgram,
+    ) -> Arc<CompiledCacheEntry> {
         let mut cache = self.compiled_cache.borrow_mut();
-        if cache.len() >= 128 {
-            cache.clear();
-        }
-        cache.insert(
-            key,
-            CompiledCacheEntry {
-                sql: sql.to_owned(),
-                program: program.clone(),
-            },
-        );
+        let entry = Arc::new(CompiledCacheEntry {
+            sql: sql.to_owned(),
+            program: Arc::new(program),
+        });
+        cache.put(key, Arc::clone(&entry));
+        entry
     }
 
     /// Compile a statement, using the compiled cache when possible.
@@ -2618,13 +2627,13 @@ impl Connection {
         sql_key: u64,
         sql: &str,
         compile_fn: impl FnOnce(&Self) -> Result<VdbeProgram>,
-    ) -> Result<VdbeProgram> {
-        if let Some(program) = self.lookup_compiled_cache(sql_key, sql) {
-            return Ok(program);
+    ) -> Result<Arc<VdbeProgram>> {
+        if let Some(cached) = self.lookup_compiled_cache(sql_key, sql) {
+            return Ok(Arc::clone(&cached.program));
         }
         let program = compile_fn(self)?;
-        self.insert_compiled_cache(sql_key, sql, &program);
-        Ok(program)
+        let entry = self.insert_compiled_cache(sql_key, sql, program);
+        Ok(Arc::clone(&entry.program))
     }
 
     // ── Internal helpers ──────────────────────────────────────────────────
@@ -6225,9 +6234,7 @@ impl Connection {
         *self.concurrent_session_id.borrow_mut() = None;
         self.txn_metrics_mark_finished();
 
-        if let Err(err) = txn_result {
-            return Err(err);
-        }
+        txn_result?;
 
         self.maybe_run_adaptive_autocheckpoint();
         Ok(())
@@ -8449,7 +8456,7 @@ impl Connection {
         new_values: &[SqliteValue],
     ) -> Result<Vec<FkUpdateAction>> {
         let schema = self.schema.borrow();
-        let mut actions: Vec<(String, fsqlite_ast::FkDef, Vec<String>)> = Vec::new();
+        let mut actions: Vec<(String, fsqlite_vdbe::codegen::FkDef, Vec<String>)> = Vec::new();
         for table in schema.iter() {
             for fk in &table.foreign_keys {
                 if fk.parent_table.eq_ignore_ascii_case(table_name) {
@@ -8487,7 +8494,7 @@ impl Connection {
             let parent_table = parent_schema
                 .iter()
                 .find(|t| t.name.eq_ignore_ascii_case(table_name));
-            
+
             let old_parent_vals: Vec<SqliteValue> = parent_key_cols
                 .iter()
                 .filter_map(|col_name| {
@@ -8499,7 +8506,7 @@ impl Connection {
                     })
                 })
                 .collect();
-                
+
             let new_parent_vals: Vec<SqliteValue> = parent_key_cols
                 .iter()
                 .filter_map(|col_name| {
@@ -8513,10 +8520,15 @@ impl Connection {
                 .collect();
             drop(parent_schema);
 
-            if old_parent_vals.iter().any(|v| matches!(v, SqliteValue::Null)) {
+            if old_parent_vals
+                .iter()
+                .any(|v| matches!(v, SqliteValue::Null))
+            {
                 continue;
             }
-            if old_parent_vals.len() != child_col_names.len() || new_parent_vals.len() != child_col_names.len() {
+            if old_parent_vals.len() != child_col_names.len()
+                || new_parent_vals.len() != child_col_names.len()
+            {
                 continue;
             }
 
@@ -8537,7 +8549,7 @@ impl Connection {
             let rows = self.query_with_params(&sql, &old_parent_vals)?;
             if !rows.is_empty() {
                 match fk.on_update {
-                    fsqlite_ast::FkActionType::Cascade => {
+                    fsqlite_vdbe::codegen::FkActionType::Cascade => {
                         result_actions.push(FkUpdateAction::Cascade {
                             child_table: child_table.clone(),
                             child_columns: child_col_names.clone(),
@@ -8545,14 +8557,16 @@ impl Connection {
                             new_parent_values: new_parent_vals,
                         });
                     }
-                    fsqlite_ast::FkActionType::SetNull => {
+                    fsqlite_vdbe::codegen::FkActionType::SetNull => {
                         result_actions.push(FkUpdateAction::SetNull {
                             child_table: child_table.clone(),
                             child_columns: child_col_names.clone(),
                             old_parent_values: old_parent_vals,
                         });
                     }
-                    fsqlite_ast::FkActionType::NoAction | fsqlite_ast::FkActionType::Restrict | fsqlite_ast::FkActionType::SetDefault => {
+                    fsqlite_vdbe::codegen::FkActionType::NoAction
+                    | fsqlite_vdbe::codegen::FkActionType::Restrict
+                    | fsqlite_vdbe::codegen::FkActionType::SetDefault => {
                         return Err(FrankenError::ForeignKeyViolation);
                     }
                 }
@@ -9705,7 +9719,7 @@ impl Connection {
                 Ok(())
             };
 
-            if let Ok(()) = commit_res {
+            if matches!(commit_res, Ok(())) {
                 let committed_seq = self.advance_commit_clock();
                 if let Some(plan) = concurrent_commit_plan {
                     self.finalize_concurrent_commit(plan, committed_seq);
@@ -9714,9 +9728,7 @@ impl Connection {
             commit_res
         };
 
-        if let Err(e) = commit_result {
-            return Err(e);
-        }
+        commit_result?;
 
         // Commit succeeded; now consume and drop the handle.
         *self.active_txn.borrow_mut() = None;
@@ -9935,7 +9947,7 @@ impl Connection {
         // Run GC via the VersionStore's gc_tick method which handles
         // internal locking of arena and chain_heads.
         let mut gc_todo = self.gc_todo.borrow_mut();
-        let result = self.version_store.borrow().gc_tick(&mut gc_todo, horizon);
+        let result = self.version_store.gc_tick(&mut gc_todo, horizon);
 
         if result.pages_pruned > 0 {
             tracing::info!(
@@ -15692,7 +15704,7 @@ impl Connection {
             autoincrement_seq_by_root_page,
             col_defaults_by_root_page,
             reject_mem,
-            Some(Rc::clone(&self.version_store)),
+            Some(Arc::clone(&self.version_store)),
         );
         // Always restore the transaction handle, even on error.
         if let Some(txn) = txn_back {
@@ -20898,7 +20910,7 @@ fn execute_table_program_with_db(
     autoincrement_seq_by_root_page: HashMap<i32, i64>,
     column_defaults_by_root_page: HashMap<i32, Vec<Option<SqliteValue>>>,
     reject_mem_fallback: bool,
-    version_store: Option<Rc<RefCell<VersionStore>>>,
+    version_store: Option<Arc<VersionStore>>,
 ) -> TableProgramExecOutcome {
     let execution_span = tracing::span!(
         target: "fsqlite.execution",
@@ -43871,11 +43883,11 @@ mod pager_routing_tests {
         let statement = parse_single_statement("SELECT 1;").unwrap();
         let cookie = *conn.schema_cookie.borrow();
         *conn.parse_cache_cookie.borrow_mut() = cookie;
-        conn.parse_cache.borrow_mut().insert(
+        conn.parse_cache.borrow_mut().put(
             key,
             ParseCacheEntry {
                 sql: cached_sql.to_owned(),
-                statement,
+                statement: Arc::new(statement),
             },
         );
 
@@ -44487,11 +44499,11 @@ mod pager_routing_tests {
         let key = Connection::sql_hash(target_sql);
         let cookie = *conn.schema_cookie.borrow();
         *conn.parse_cache_cookie.borrow_mut() = cookie;
-        conn.parse_cache.borrow_mut().insert(
+        conn.parse_cache.borrow_mut().put(
             key,
             ParseCacheEntry {
                 sql: "SELECT 1".to_owned(),
-                statement: parse_single_statement("SELECT 1").unwrap(),
+                statement: Arc::new(parse_single_statement("SELECT 1").unwrap()),
             },
         );
 
@@ -44499,7 +44511,7 @@ mod pager_routing_tests {
         let rows = conn.query(target_sql).unwrap();
         assert_eq!(rows[0].values()[0], SqliteValue::Text("alpha".to_owned()));
 
-        let cache = conn.parse_cache.borrow();
+        let mut cache = conn.parse_cache.borrow_mut();
         let entry = cache
             .get(&key)
             .expect("cache entry should be refreshed for target SQL");
