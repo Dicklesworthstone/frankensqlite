@@ -2330,7 +2330,7 @@ impl Connection {
             );
             record_trace_span_created();
             let _parse_guard = parse_span.enter();
-            self.rewrite_subquery_statement(statement, None)?
+            self.rewrite_subquery_statement(&statement, None)?
         };
         let plan_span = tracing::span!(
             target: "fsqlite.plan",
@@ -2364,7 +2364,7 @@ impl Connection {
         };
         let mut rows = Vec::new();
         for statement in statements {
-            rows = self.execute_statement(statement, None)?;
+            rows = self.execute_statement(&statement, None)?;
         }
         Ok(rows)
     }
@@ -2422,7 +2422,7 @@ impl Connection {
                 &statement,
                 Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
             );
-            let rows = self.execute_statement(statement, None)?;
+            let rows = self.execute_statement(&statement, None)?;
             last_count = if is_dml {
                 *self.last_changes.borrow()
             } else {
@@ -2451,7 +2451,7 @@ impl Connection {
             &statement,
             Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
         );
-        let rows = self.execute_statement(statement, Some(params))?;
+        let rows = self.execute_statement(&statement, Some(params))?;
         Ok(if is_dml {
             *self.last_changes.borrow()
         } else {
@@ -2484,7 +2484,7 @@ impl Connection {
             } else {
                 Some(params)
             };
-            let rows = self.execute_statement(dml.clone(), p)?;
+            let rows = self.execute_statement(dml, p)?;
             let is_dml = matches!(
                 dml,
                 Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
@@ -2515,27 +2515,26 @@ impl Connection {
 
     /// Return a cached parsed single statement, or parse fresh and cache it.
     /// The cache is invalidated whenever the schema cookie changes (DDL).
-    fn cached_parse_single(&self, sql: &str) -> Result<Statement> {
+    fn cached_parse_single(&self, sql: &str) -> Result<std::sync::Arc<Statement>> {
         let key = Self::sql_hash(sql);
         self.refresh_parse_cache_if_needed();
         if let Some(cached) = self.lookup_parse_cache(key, sql) {
-            return Ok((*cached.statement).clone());
+            return Ok(std::sync::Arc::clone(&cached.statement));
         }
         let stmt = parse_single_statement(sql)?;
-        self.insert_parse_cache(key, sql, stmt.clone());
-        Ok(stmt)
+        Ok(std::sync::Arc::clone(&self.insert_parse_cache(key, sql, stmt).statement))
     }
 
     /// Return cached parsed multi-statement list, or parse fresh.
     /// Multi-statement SQL is less common and cache hit rate is lower,
     /// so we only cache single-statement SQL in this path.
-    fn cached_parse_multi(&self, sql: &str) -> Result<Vec<Statement>> {
+    fn cached_parse_multi(&self, sql: &str) -> Result<Vec<std::sync::Arc<Statement>>> {
         // Hot path optimization for repeated single-statement execute() calls.
         // Use the same collision-safe SQL equality check as cached_parse_single.
         let key = Self::sql_hash(sql);
         self.refresh_parse_cache_if_needed();
         if let Some(cached) = self.lookup_parse_cache(key, sql) {
-            return Ok(vec![(*cached.statement).clone()]);
+            return Ok(vec![std::sync::Arc::clone(&cached.statement)]);
         }
 
         // For single-statement SQL, use the cache.
@@ -2784,7 +2783,7 @@ impl Connection {
     #[allow(clippy::too_many_lines)]
     fn execute_statement(
         &self,
-        statement: Statement,
+        statement: &Statement,
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Row>> {
         self.sync_change_tracking_context();
@@ -2848,7 +2847,7 @@ impl Connection {
         // explicit BEGIN.  Writes use Immediate mode; reads use Deferred.
         // Transaction-control statements manage their own transactions.
         let is_write = matches!(
-            &statement,
+            statement.as_ref(),
             Statement::Insert(_)
                 | Statement::Update(_)
                 | Statement::Delete(_)
@@ -2861,7 +2860,7 @@ impl Connection {
                 | Statement::CreateIndex(_)
         );
         let is_txn_control = matches!(
-            &statement,
+            statement.as_ref(),
             Statement::Begin(_)
                 | Statement::Commit
                 | Statement::Rollback(_)
@@ -2881,7 +2880,7 @@ impl Connection {
         if !is_txn_control {
             if is_write {
                 self.txn_metrics_note_write();
-            } else if matches!(&statement, Statement::Select(_)) {
+            } else if matches!(statement.as_ref(), Statement::Select(_)) {
                 self.txn_metrics_note_read();
             }
         }
@@ -2889,15 +2888,15 @@ impl Connection {
             && self.active_txn.borrow().is_some()
             && self.internal_statement_savepoint_depth.get() == 0
             && matches!(
-                &statement,
+                statement.as_ref(),
                 Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
             );
         let result = if use_statement_savepoint {
             self.with_internal_statement_savepoint(statement_kind, || {
-                self.execute_statement_dispatch(statement, params)
+                self.execute_statement_dispatch(statement.as_ref(), params)
             })
         } else {
-            self.execute_statement_dispatch(statement, params)
+            self.execute_statement_dispatch(statement.as_ref(), params)
         };
         let ok = result.is_ok();
         self.resolve_autocommit_txn(was_auto, ok)?;
@@ -2927,12 +2926,12 @@ impl Connection {
     #[allow(clippy::too_many_lines)]
     fn execute_statement_dispatch(
         &self,
-        statement: Statement,
+        statement: &Statement,
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Row>> {
         match statement {
             Statement::CreateTable(create) => {
-                self.execute_create_table(&create)?;
+                self.execute_create_table(create)?;
                 // 5D.4: Persistence now handled by pager WAL, not compat_persist.
                 Ok(Vec::new())
             }
@@ -3683,15 +3682,15 @@ impl Connection {
     /// subqueries with GROUP BY/HAVING/windows/compounds/WITH are eagerly
     /// evaluated since VDBE codegen emits NULL for those.  Fallback paths (GROUP BY,
     /// JOIN, expression-only SELECT) apply the IN rewrite separately.
-    fn rewrite_subquery_statement(
+    fn rewrite_subquery_statement<'a>(
         &self,
-        statement: Statement,
+        statement: &'a Statement,
         params: Option<&[SqliteValue]>,
-    ) -> Result<Statement> {
+    ) -> Result<std::borrow::Cow<'a, Statement>> {
         // Fast path: if the statement has no EXISTS/scalar-subquery expressions
         // in rewrite-covered locations, skip the clone/traversal rewrite pass.
-        if !statement_contains_rewritable_subquery(&statement) {
-            return Ok(statement);
+        if !statement_contains_rewritable_subquery(statement) {
+            return Ok(std::borrow::Cow::Borrowed(statement));
         }
         match statement {
             Statement::Select(ref select) if select.with.is_some() => {
@@ -3699,7 +3698,7 @@ impl Connection {
                 // been materialized yet.  Subqueries may reference CTE names,
                 // so skip eager rewriting here — it will happen after CTE
                 // materialization inside execute_with_ctes.
-                Ok(statement)
+                Ok(std::borrow::Cow::Borrowed(statement))
             }
             Statement::Select(ref select)
                 if is_expression_only_select(select) && expression_only_has_subquery(select) =>
@@ -3710,14 +3709,15 @@ impl Connection {
                 // subquery via execute_statement would create nested autocommit
                 // transactions that can trigger reload_memdb_from_pager,
                 // destroying CTE temp tables between subquery evaluations.
-                Ok(statement)
+                Ok(std::borrow::Cow::Borrowed(statement))
             }
             Statement::Select(select) => {
                 let rewritten = self.rewrite_subqueries(&select, params)?;
-                Ok(Statement::Select(rewritten))
+                Ok(std::borrow::Cow::Owned(Statement::Select(rewritten)))
             }
-            Statement::Update(ref update) if update.with.is_some() => Ok(statement),
-            Statement::Update(mut update) => {
+            Statement::Update(ref update) if update.with.is_some() => Ok(std::borrow::Cow::Borrowed(statement)),
+            Statement::Update(update) => {
+                let mut update = update.clone();
                 // Rewrite EXISTS / scalar subqueries, plus IN subqueries that
                 // VDBE can't probe (GROUP BY, HAVING, windows, compounds, WITH).
                 for assignment in &mut update.assignments {
@@ -3726,16 +3726,17 @@ impl Connection {
                 if let Some(where_expr) = update.where_clause.as_mut() {
                     rewrite_in_expr(where_expr, self, false, params)?;
                 }
-                Ok(Statement::Update(update))
+                Ok(std::borrow::Cow::Owned(Statement::Update(update)))
             }
-            Statement::Delete(ref delete) if delete.with.is_some() => Ok(statement),
-            Statement::Delete(mut delete) => {
+            Statement::Delete(ref delete) if delete.with.is_some() => Ok(std::borrow::Cow::Borrowed(statement)),
+            Statement::Delete(delete) => {
+                let mut delete = delete.clone();
                 // Rewrite EXISTS / scalar subqueries, plus IN subqueries that
                 // VDBE can't probe (GROUP BY, HAVING, windows, compounds, WITH).
                 if let Some(where_expr) = delete.where_clause.as_mut() {
                     rewrite_in_expr(where_expr, self, false, params)?;
                 }
-                Ok(Statement::Delete(delete))
+                Ok(std::borrow::Cow::Owned(Statement::Delete(delete)))
             }
             other => Ok(other),
         }
@@ -3763,7 +3764,7 @@ impl Connection {
         } else {
             select_stmt.clone()
         };
-        let source_rows = self.execute_statement(Statement::Select(effective_select), params)?;
+        let source_rows = self.execute_statement(&Statement::Select(effective_select), params)?;
         if source_rows.is_empty() {
             return Ok(0);
         }
@@ -4891,7 +4892,7 @@ impl Connection {
                 .collect(),
             fsqlite_ast::InsertSource::Select(select) => {
                 let source_rows =
-                    self.execute_statement(Statement::Select(*select.clone()), params)?;
+                    self.execute_statement(&Statement::Select(*select.clone()), params)?;
                 source_rows
                     .iter()
                     .enumerate()
@@ -4995,7 +4996,7 @@ impl Connection {
 
         let sql = format!("SELECT {trimmed}");
         let statement = parse_single_statement(&sql)?;
-        let rows = self.execute_statement(statement, None).map_err(|error| {
+        let rows = self.execute_statement(&statement, None).map_err(|error| {
             FrankenError::Internal(format!(
                 "failed to evaluate DEFAULT expression `{trimmed}`: {error}"
             ))
@@ -7236,7 +7237,7 @@ impl Connection {
                     ));
                 }
                 // Execute the SELECT to get result rows.
-                let rows = self.execute_statement(Statement::Select(*select_stmt.clone()), None)?;
+                let rows = self.execute_statement(&Statement::Select(*select_stmt.clone()), None)?;
                 // Infer column names from the SELECT columns.
                 let inferred_cols = infer_select_column_names(select_stmt);
                 let col_names = if inferred_cols.is_empty() {
@@ -8700,7 +8701,7 @@ impl Connection {
                     .to_owned(),
             });
         }
-        self.execute_statement(statement, None)?;
+        self.execute_statement(&statement, None)?;
         Ok(TriggerStatementOutcome::Continue)
     }
 
@@ -8902,7 +8903,7 @@ impl Connection {
                         ))
                     })?;
                 let view_rows =
-                    self.execute_statement(Statement::Select(view.query.clone()), params)?;
+                    self.execute_statement(&Statement::Select(view.query.clone()), params)?;
                 let inferred = infer_select_column_names(&view.query);
                 let col_names = if inferred.is_empty() {
                     inferred
@@ -8972,7 +8973,7 @@ impl Connection {
                 }
             }
 
-            let result = self.execute_statement(Statement::Select(select.clone()), params);
+            let result = self.execute_statement(&Statement::Select(select.clone()), params);
 
             // Clean up materialized temp tables.
             for name in &materialized {
@@ -9042,7 +9043,7 @@ impl Connection {
         let result = (|| -> Result<Vec<Row>> {
             let referenced = self.collect_sqlite_schema_references(select);
             if referenced.is_empty() {
-                return self.execute_statement(Statement::Select(select.clone()), params);
+                return self.execute_statement(&Statement::Select(select.clone()), params);
             }
 
             let virtual_rows = self.build_sqlite_master_rows();
@@ -9072,7 +9073,7 @@ impl Connection {
                 materialized.push((table_name, root_page));
             }
 
-            let result = self.execute_statement(Statement::Select(select.clone()), params);
+            let result = self.execute_statement(&Statement::Select(select.clone()), params);
 
             for (name, root_page) in &materialized {
                 let mut schema = self.schema.borrow_mut();
@@ -12695,7 +12696,7 @@ impl Connection {
                 let inner_tables = collect_subquery_inner_tables(sub);
                 let mut sub_clone = sub.as_ref().clone();
                 substitute_outer_refs_in_select(&mut sub_clone, row, col_map, &inner_tables);
-                let rows = self.execute_statement(Statement::Select(sub_clone), params)?;
+                let rows = self.execute_statement(&Statement::Select(sub_clone), params)?;
                 Ok(rows
                     .into_iter()
                     .next()
@@ -12706,7 +12707,7 @@ impl Connection {
                 let inner_tables = collect_subquery_inner_tables(subquery);
                 let mut sub_clone = subquery.as_ref().clone();
                 substitute_outer_refs_in_select(&mut sub_clone, row, col_map, &inner_tables);
-                let rows = self.execute_statement(Statement::Select(sub_clone), params)?;
+                let rows = self.execute_statement(&Statement::Select(sub_clone), params)?;
                 let exists = !rows.is_empty();
                 let truth = if *not { !exists } else { exists };
                 Ok(SqliteValue::Integer(i64::from(truth)))
@@ -13535,7 +13536,7 @@ impl Connection {
                 .find(|t| t.name.eq_ignore_ascii_case(&table_name))
                 .ok_or_else(|| FrankenError::Internal(format!("table not found: {table_name}")))?;
             let effective_label = table_alias.as_deref().unwrap_or(&table_name);
-            let cmap: Vec<(String, String)> = table_schema
+            let cmap: Vec<(String, String, bool)> = table_schema
                 .columns
                 .iter()
                 .map(|c| (effective_label.to_owned(), c.name.clone(), false))
@@ -14289,7 +14290,7 @@ impl Connection {
             order_by: vec![],
             limit: None,
         };
-        let mut result = self.execute_statement(Statement::Select(first_arm), params)?;
+        let mut result = self.execute_statement(&Statement::Select(first_arm), params)?;
 
         // Process each compound arm.
         for (op, core) in &select.body.compounds {
@@ -14302,7 +14303,7 @@ impl Connection {
                 order_by: vec![],
                 limit: None,
             };
-            let arm_rows = self.execute_statement(Statement::Select(arm_select), params)?;
+            let arm_rows = self.execute_statement(&Statement::Select(arm_select), params)?;
 
             match op {
                 CompoundOp::UnionAll => {
@@ -14359,7 +14360,7 @@ impl Connection {
             self.compiled_cache.borrow_mut().clear();
             let mut stripped = select.clone();
             stripped.with = None;
-            self.execute_statement(Statement::Select(stripped), params)
+            self.execute_statement(&Statement::Select(stripped), params)
         })();
         self.cleanup_cte_tables(&temp_names);
         self.set_reject_mem_fallback(prev_reject);
@@ -14381,7 +14382,7 @@ impl Connection {
             self.compiled_cache.borrow_mut().clear();
             let mut stripped = delete.clone();
             stripped.with = None;
-            self.execute_statement(Statement::Delete(stripped), params)
+            self.execute_statement(&Statement::Delete(stripped), params)
         })();
         self.cleanup_cte_tables(&temp_names);
         self.set_reject_mem_fallback(prev_reject);
@@ -14403,7 +14404,7 @@ impl Connection {
             self.compiled_cache.borrow_mut().clear();
             let mut stripped = update.clone();
             stripped.with = None;
-            self.execute_statement(Statement::Update(stripped), params)
+            self.execute_statement(&Statement::Update(stripped), params)
         })();
         self.cleanup_cte_tables(&temp_names);
         self.set_reject_mem_fallback(prev_reject);
@@ -14436,7 +14437,7 @@ impl Connection {
                 self.materialize_recursive_cte(cte, params, &mut *temp_names)?;
             } else {
                 let cte_rows =
-                    self.execute_statement(Statement::Select(cte.query.clone()), params)?;
+                    self.execute_statement(&Statement::Select(cte.query.clone()), params)?;
                 let col_names: Vec<String> = if cte.columns.is_empty() {
                     let inferred = infer_select_column_names(&cte.query);
                     if inferred.is_empty() {
@@ -14567,7 +14568,7 @@ impl Connection {
             order_by: vec![],
             limit: None,
         };
-        let base_rows = self.execute_statement(Statement::Select(base_select), params)?;
+        let base_rows = self.execute_statement(&Statement::Select(base_select), params)?;
         let mut all_rows: Vec<Vec<SqliteValue>> =
             base_rows.iter().map(|r| r.values().to_vec()).collect();
         let mut recursive_arms: Vec<(&CompoundOp, &SelectCore)> = Vec::new();
@@ -14590,7 +14591,7 @@ impl Connection {
                 order_by: vec![],
                 limit: None,
             };
-            let arm_rows = self.execute_statement(Statement::Select(arm_select), params)?;
+            let arm_rows = self.execute_statement(&Statement::Select(arm_select), params)?;
             match op {
                 CompoundOp::UnionAll => {
                     all_rows.extend(arm_rows.iter().map(|row| row.values().to_vec()));
@@ -14640,7 +14641,7 @@ impl Connection {
                     order_by: vec![],
                     limit: None,
                 };
-                let arm_rows = self.execute_statement(Statement::Select(arm_select), params)?;
+                let arm_rows = self.execute_statement(&Statement::Select(arm_select), params)?;
                 for row in &arm_rows {
                     let vals = row.values().to_vec();
                     match op {
@@ -14987,7 +14988,7 @@ impl Connection {
                     .iter()
                     .enumerate()
                     .filter(|(idx, _)| !using_skip_indices.contains(idx))
-                    .map(|(_, (tbl, c))| ResultColumn::Expr {
+                    .map(|(_, (tbl, c, _))| ResultColumn::Expr {
                         expr: Expr::Column(
                             ColumnRef::qualified(tbl.clone(), c.clone()),
                             Span::new(0, 0),
@@ -15160,7 +15161,7 @@ impl Connection {
                 let inner_tables = collect_subquery_inner_tables(sub);
                 let mut sub_clone = sub.as_ref().clone();
                 substitute_outer_refs_in_select(&mut sub_clone, row, outer_col_map, &inner_tables);
-                let rows = self.execute_statement(Statement::Select(sub_clone), None)?;
+                let rows = self.execute_statement(&Statement::Select(sub_clone), None)?;
                 let val = rows
                     .into_iter()
                     .next()
@@ -15279,7 +15280,7 @@ impl Connection {
                 let inner_tables = collect_subquery_inner_tables(subquery);
                 let mut sub_clone = subquery.as_ref().clone();
                 substitute_outer_refs_in_select(&mut sub_clone, row, outer_col_map, &inner_tables);
-                let rows = self.execute_statement(Statement::Select(sub_clone), None)?;
+                let rows = self.execute_statement(&Statement::Select(sub_clone), None)?;
                 let exists = !rows.is_empty();
                 let truth = if *not { !exists } else { exists };
                 Ok(Expr::Literal(Literal::Integer(i64::from(truth)), *span))
@@ -15307,7 +15308,7 @@ impl Connection {
                 let inner_tables = collect_subquery_inner_tables(subquery);
                 let mut sub_clone = subquery.as_ref().clone();
                 substitute_outer_refs_in_select(&mut sub_clone, row, col_map, &inner_tables);
-                let rows = self.execute_statement(Statement::Select(sub_clone), None)?;
+                let rows = self.execute_statement(&Statement::Select(sub_clone), None)?;
                 let exists = !rows.is_empty();
                 let truth = if *not { !exists } else { exists };
                 Ok(Expr::Literal(Literal::Integer(i64::from(truth)), *span))
@@ -15316,7 +15317,7 @@ impl Connection {
                 let inner_tables = collect_subquery_inner_tables(sub);
                 let mut sub_clone = sub.as_ref().clone();
                 substitute_outer_refs_in_select(&mut sub_clone, row, col_map, &inner_tables);
-                let rows = self.execute_statement(Statement::Select(sub_clone), None)?;
+                let rows = self.execute_statement(&Statement::Select(sub_clone), None)?;
                 let val = rows
                     .into_iter()
                     .next()
@@ -15401,7 +15402,7 @@ impl Connection {
                             col_map,
                             &inner_tables,
                         );
-                        let rows = self.execute_statement(Statement::Select(sub_clone), None)?;
+                        let rows = self.execute_statement(&Statement::Select(sub_clone), None)?;
                         let literals: Vec<Expr> = rows
                             .into_iter()
                             .filter_map(|r| r.values.into_iter().next())
@@ -18443,7 +18444,7 @@ fn rewrite_in_expr(
                 // (it would emit NULL).
                 let needs_eager = rewrite_in_subqueries || in_subquery_needs_eager_eval(sub);
                 if needs_eager {
-                    let rows = conn.execute_statement(Statement::Select(*sub.clone()), params)?;
+                    let rows = conn.execute_statement(&Statement::Select(*sub.clone()), params)?;
                     let literals: Vec<Expr> = rows
                         .into_iter()
                         .filter_map(|row| row.values.into_iter().next())
@@ -18469,7 +18470,7 @@ fn rewrite_in_expr(
             if is_correlated_subquery(subquery) {
                 return Ok(());
             }
-            let rows = conn.execute_statement(Statement::Select(*subquery.clone()), params)?;
+            let rows = conn.execute_statement(&Statement::Select(*subquery.clone()), params)?;
             let exists = !rows.is_empty();
             let result = if *not { !exists } else { exists };
             *expr = Expr::Literal(Literal::Integer(i64::from(result)), *span);
@@ -18481,7 +18482,7 @@ fn rewrite_in_expr(
             if is_correlated_subquery(sub) {
                 return Ok(());
             }
-            let rows = conn.execute_statement(Statement::Select(*sub.clone()), params)?;
+            let rows = conn.execute_statement(&Statement::Select(*sub.clone()), params)?;
             let val = rows
                 .into_iter()
                 .next()
