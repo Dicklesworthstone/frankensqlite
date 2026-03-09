@@ -86,18 +86,27 @@ pub struct PageCache {
     page_size: PageSize,
     hits: Cell<u64>,
     misses: Cell<u64>,
+    admits: Cell<u64>,
+    evictions: Cell<u64>,
 }
 
 impl PageCache {
     /// Create a new, empty `PageCache` configured for the given `page_size`.
     pub fn new(page_size: PageSize) -> Self {
         Self {
-            pool: PageBufPool::new(page_size),
+            pool: PageBufPool::new(page_size, 65_536),
             pages: std::collections::HashMap::with_hasher(foldhash::fast::FixedState::default()),
             page_size,
             hits: Cell::new(0),
             misses: Cell::new(0),
+            admits: Cell::new(0),
+            evictions: Cell::new(0),
         }
+    }
+
+    /// Access the underlying page pool.
+    pub fn pool(&self) -> &PageBufPool {
+        &self.pool
     }
 
     /// Retrieve a page from the cache if it exists.
