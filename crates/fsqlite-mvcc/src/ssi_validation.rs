@@ -19,8 +19,9 @@ use tracing::{debug, info, warn};
 
 use crate::observability;
 use crate::ssi_abort_policy::{
-    DroHotPathDecision, DroLossMatrix, DroRiskTolerance, SsiDecisionCard, SsiDecisionCardDraft,
-    SsiDecisionQuery, SsiDecisionType, SsiEvidenceLedger, dro_wasserstein_radius,
+    DroHotPathDecision, DroLossMatrix, DroRiskTolerance, DroVolatilityTracker,
+    DroVolatilityTrackerConfig, SsiDecisionCard, SsiDecisionCardDraft, SsiDecisionQuery,
+    SsiDecisionType, SsiEvidenceLedger,
 };
 
 use crate::witness_objects::{
@@ -115,12 +116,18 @@ pub fn reset_ssi_evidence_metrics() {
 fn default_t3_dro_matrix() -> &'static DroLossMatrix {
     static MATRIX: OnceLock<DroLossMatrix> = OnceLock::new();
     MATRIX.get_or_init(|| {
-        let certificate = dro_wasserstein_radius(
-            &[0.03, 0.05, 0.08, 0.13],
-            &[0.04, 0.06, 0.09, 0.15],
-            DroRiskTolerance::Low,
-        )
-        .expect("default DRO certificate must be constructible");
+        let mut tracker = DroVolatilityTracker::new(DroVolatilityTrackerConfig {
+            window_size: 4,
+            min_samples: 4,
+        });
+        for (abort_rate, edge_rate) in [(0.03, 0.04), (0.05, 0.06), (0.08, 0.09), (0.13, 0.15)] {
+            tracker
+                .observe_window(abort_rate, edge_rate)
+                .expect("default DRO tracker windows must be valid");
+        }
+        let certificate = tracker
+            .radius_certificate(DroRiskTolerance::Low)
+            .expect("default DRO certificate must be constructible");
         DroLossMatrix::from_radius_certificate(32, 32, 0.45, certificate)
     })
 }

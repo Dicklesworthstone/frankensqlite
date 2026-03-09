@@ -433,6 +433,211 @@ pub fn dro_wasserstein_radius(
     })
 }
 
+/// One observed workload window for DRO volatility tracking.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(clippy::derive_partial_eq_without_eq)] // f64 does not impl Eq
+pub struct DroWindowObservation {
+    pub abort_rate: f64,
+    pub edge_rate: f64,
+}
+
+/// Which observed rate failed DRO volatility validation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DroObservedRateKind {
+    Abort,
+    Edge,
+}
+
+impl DroObservedRateKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Abort => "abort_rate",
+            Self::Edge => "edge_rate",
+        }
+    }
+}
+
+impl fmt::Display for DroObservedRateKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Validation error when recording workload windows for DRO volatility tracking.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(clippy::derive_partial_eq_without_eq)] // f64 does not impl Eq
+#[allow(clippy::module_name_repetitions)]
+pub enum DroVolatilityTrackerError {
+    NonFiniteRate {
+        kind: DroObservedRateKind,
+        value: f64,
+    },
+    OutOfRangeRate {
+        kind: DroObservedRateKind,
+        value: f64,
+    },
+}
+
+impl fmt::Display for DroVolatilityTrackerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Self::NonFiniteRate { kind, value } => {
+                write!(f, "{kind} must be finite, got {value}")
+            }
+            Self::OutOfRangeRate { kind, value } => {
+                write!(f, "{kind} must be within [0.0, 1.0], got {value}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for DroVolatilityTrackerError {}
+
+/// Configuration for the empirical DRO volatility tracker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DroVolatilityTrackerConfig {
+    /// Maximum number of workload windows retained in the sliding window.
+    pub window_size: usize,
+    /// Minimum number of retained samples required before emitting a certificate.
+    pub min_samples: usize,
+}
+
+impl Default for DroVolatilityTrackerConfig {
+    fn default() -> Self {
+        Self {
+            window_size: 32,
+            min_samples: 4,
+        }
+    }
+}
+
+impl DroVolatilityTrackerConfig {
+    #[must_use]
+    fn normalized(self) -> Self {
+        let window_size = self.window_size.max(2);
+        let min_samples = self.min_samples.clamp(2, window_size);
+        Self {
+            window_size,
+            min_samples,
+        }
+    }
+}
+
+/// Sliding-window tracker for recent abort/edge-rate volatility.
+#[derive(Debug, Clone)]
+pub struct DroVolatilityTracker {
+    config: DroVolatilityTrackerConfig,
+    windows: VecDeque<DroWindowObservation>,
+}
+
+impl DroVolatilityTracker {
+    #[must_use]
+    pub fn new(config: DroVolatilityTrackerConfig) -> Self {
+        let config = config.normalized();
+        Self {
+            windows: VecDeque::with_capacity(config.window_size),
+            config,
+        }
+    }
+
+    /// Record one completed workload window.
+    pub fn observe_window(
+        &mut self,
+        abort_rate: f64,
+        edge_rate: f64,
+    ) -> std::result::Result<(), DroVolatilityTrackerError> {
+        validate_observed_rate(DroObservedRateKind::Abort, abort_rate)?;
+        validate_observed_rate(DroObservedRateKind::Edge, edge_rate)?;
+        if self.windows.len() == self.config.window_size {
+            let _ = self.windows.pop_front();
+        }
+        self.windows.push_back(DroWindowObservation {
+            abort_rate,
+            edge_rate,
+        });
+        Ok(())
+    }
+
+    #[must_use]
+    pub const fn window_size(&self) -> usize {
+        self.config.window_size
+    }
+
+    #[must_use]
+    pub const fn min_samples(&self) -> usize {
+        self.config.min_samples
+    }
+
+    #[must_use]
+    pub fn sample_count(&self) -> usize {
+        self.windows.len()
+    }
+
+    #[must_use]
+    pub fn is_ready(&self) -> bool {
+        self.sample_count() >= self.config.min_samples
+    }
+
+    #[must_use]
+    pub fn abort_rate_variance(&self) -> Option<f64> {
+        if !self.is_ready() {
+            return None;
+        }
+        let abort_rates = self
+            .windows
+            .iter()
+            .map(|window| window.abort_rate)
+            .collect::<Vec<_>>();
+        sample_variance(&abort_rates)
+    }
+
+    #[must_use]
+    pub fn edge_rate_variance(&self) -> Option<f64> {
+        if !self.is_ready() {
+            return None;
+        }
+        let edge_rates = self
+            .windows
+            .iter()
+            .map(|window| window.edge_rate)
+            .collect::<Vec<_>>();
+        sample_variance(&edge_rates)
+    }
+
+    /// Build the current Wasserstein-style certificate from the sliding window.
+    #[must_use]
+    pub fn radius_certificate(&self, tolerance: DroRiskTolerance) -> Option<DroRadiusCertificate> {
+        if !self.is_ready() {
+            return None;
+        }
+        let abort_rates = self
+            .windows
+            .iter()
+            .map(|window| window.abort_rate)
+            .collect::<Vec<_>>();
+        let edge_rates = self
+            .windows
+            .iter()
+            .map(|window| window.edge_rate)
+            .collect::<Vec<_>>();
+        dro_wasserstein_radius(&abort_rates, &edge_rates, tolerance)
+    }
+}
+
+fn validate_observed_rate(
+    kind: DroObservedRateKind,
+    value: f64,
+) -> std::result::Result<(), DroVolatilityTrackerError> {
+    if !value.is_finite() {
+        return Err(DroVolatilityTrackerError::NonFiniteRate { kind, value });
+    }
+    if !(0.0..=1.0).contains(&value) {
+        return Err(DroVolatilityTrackerError::OutOfRangeRate { kind, value });
+    }
+    Ok(())
+}
+
 #[must_use]
 fn sample_variance(values: &[f64]) -> Option<f64> {
     if values.len() < 2 {
@@ -1613,6 +1818,137 @@ mod tests {
         assert_eq!(
             decision.should_abort(),
             decision.cvar_penalty > decision.threshold
+        );
+    }
+
+    #[test]
+    fn test_dro_volatility_tracker_requires_min_samples() {
+        let mut tracker = DroVolatilityTracker::new(DroVolatilityTrackerConfig {
+            window_size: 6,
+            min_samples: 4,
+        });
+        tracker.observe_window(0.02, 0.01).expect("valid rates");
+        tracker.observe_window(0.03, 0.02).expect("valid rates");
+        tracker.observe_window(0.04, 0.03).expect("valid rates");
+        assert!(!tracker.is_ready(), "bead_id=bd-1scmu tracker not ready");
+        assert_eq!(tracker.abort_rate_variance(), None);
+        assert_eq!(tracker.edge_rate_variance(), None);
+        assert_eq!(tracker.radius_certificate(DroRiskTolerance::Low), None);
+    }
+
+    #[test]
+    fn test_dro_volatility_tracker_bounded_window_uses_latest_samples() {
+        let mut tracker = DroVolatilityTracker::new(DroVolatilityTrackerConfig {
+            window_size: 4,
+            min_samples: 4,
+        });
+        for &(abort_rate, edge_rate) in &[
+            (0.01, 0.02),
+            (0.02, 0.03),
+            (0.03, 0.04),
+            (0.04, 0.05),
+            (0.15, 0.20),
+            (0.18, 0.22),
+        ] {
+            tracker
+                .observe_window(abort_rate, edge_rate)
+                .expect("valid rates");
+        }
+        assert_eq!(tracker.sample_count(), 4, "bead_id=bd-1scmu bounded window");
+
+        let expected = dro_wasserstein_radius(
+            &[0.03, 0.04, 0.15, 0.18],
+            &[0.04, 0.05, 0.20, 0.22],
+            DroRiskTolerance::Low,
+        )
+        .expect("certificate");
+        let actual = tracker
+            .radius_certificate(DroRiskTolerance::Low)
+            .expect("tracker certificate");
+        assert_eq!(
+            actual.abort_rate_variance, expected.abort_rate_variance,
+            "bead_id=bd-1scmu abort variance tracks latest window"
+        );
+        assert_eq!(
+            actual.edge_rate_variance, expected.edge_rate_variance,
+            "bead_id=bd-1scmu edge variance tracks latest window"
+        );
+        assert_eq!(
+            actual.scaled_radius, expected.scaled_radius,
+            "bead_id=bd-1scmu radius tracks latest window"
+        );
+    }
+
+    #[test]
+    fn test_dro_volatility_tracker_radius_expands_under_regime_shift() {
+        let mut tracker = DroVolatilityTracker::new(DroVolatilityTrackerConfig {
+            window_size: 8,
+            min_samples: 4,
+        });
+        for &(abort_rate, edge_rate) in &[
+            (0.02, 0.01),
+            (0.03, 0.02),
+            (0.02, 0.01),
+            (0.03, 0.02),
+        ] {
+            tracker
+                .observe_window(abort_rate, edge_rate)
+                .expect("valid calm rates");
+        }
+        let calm = tracker
+            .radius_certificate(DroRiskTolerance::Low)
+            .expect("calm certificate");
+
+        for &(abort_rate, edge_rate) in &[
+            (0.20, 0.18),
+            (0.01, 0.02),
+            (0.25, 0.21),
+            (0.02, 0.03),
+        ] {
+            tracker
+                .observe_window(abort_rate, edge_rate)
+                .expect("valid volatile rates");
+        }
+        let volatile = tracker
+            .radius_certificate(DroRiskTolerance::Low)
+            .expect("volatile certificate");
+        assert!(
+            volatile.base_radius > calm.base_radius,
+            "bead_id=bd-1scmu regime shift must increase base radius"
+        );
+        assert!(
+            volatile.scaled_radius > calm.scaled_radius,
+            "bead_id=bd-1scmu regime shift must increase scaled radius"
+        );
+    }
+
+    #[test]
+    fn test_dro_volatility_tracker_rejects_invalid_rates() {
+        let mut tracker = DroVolatilityTracker::new(DroVolatilityTrackerConfig::default());
+        assert!(
+            matches!(
+                tracker.observe_window(f64::NAN, 0.2),
+                Err(DroVolatilityTrackerError::NonFiniteRate {
+                    kind: DroObservedRateKind::Abort,
+                    value,
+                }) if value.is_nan()
+            ),
+            "bead_id=bd-1scmu NaN abort rate must be rejected"
+        );
+        assert!(
+            matches!(
+                tracker.observe_window(0.2, 1.5),
+                Err(DroVolatilityTrackerError::OutOfRangeRate {
+                    kind: DroObservedRateKind::Edge,
+                    value: 1.5,
+                })
+            ),
+            "bead_id=bd-1scmu edge rate above 1.0 must be rejected"
+        );
+        assert_eq!(
+            tracker.sample_count(),
+            0,
+            "bead_id=bd-1scmu invalid samples must not be recorded"
         );
     }
 }

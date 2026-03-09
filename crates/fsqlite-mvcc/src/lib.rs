@@ -198,10 +198,11 @@ pub use sketch_telemetry::{
 };
 pub use ssi_abort_policy::{
     AbortDecision, AbortDecisionEnvelope, ConformalCalibrator, ConformalConfig, CycleStatus,
-    DroHotPathDecision, DroLossMatrix, DroRadiusCertificate, DroRiskTolerance, LossMatrix,
-    SsiDecisionCard, SsiDecisionCardDraft, SsiDecisionQuery, SsiDecisionType, SsiEvidenceLedger,
-    SsiFpMonitor, SsiFpMonitorConfig, SsiReadSetSummary, TxnCost, Victim, VictimDecision,
-    dro_wasserstein_radius, select_victim,
+    DroHotPathDecision, DroLossMatrix, DroObservedRateKind, DroRadiusCertificate, DroRiskTolerance,
+    DroVolatilityTracker, DroVolatilityTrackerConfig, DroVolatilityTrackerError,
+    DroWindowObservation, LossMatrix, SsiDecisionCard, SsiDecisionCardDraft, SsiDecisionQuery,
+    SsiDecisionType, SsiEvidenceLedger, SsiFpMonitor, SsiFpMonitorConfig, SsiReadSetSummary,
+    TxnCost, Victim, VictimDecision, dro_wasserstein_radius, select_victim,
 };
 pub use ssi_validation::{
     ActiveTxnView, CommittedReaderInfo, CommittedWriterInfo, DiscoveredEdge,
