@@ -14,10 +14,10 @@
 //! 6. UNIQUE enforcement against committed base snapshot
 //! 7. Overflow page chain management (delegated to B-tree layer)
 
+use fsqlite_types::TypeAffinity;
 use fsqlite_types::glossary::{ColumnIdx, IndexId, IntentOpKind, RebaseExpr, RowId, TableId};
 use fsqlite_types::record::{parse_record, serialize_record};
 use fsqlite_types::value::SqliteValue;
-use fsqlite_types::TypeAffinity;
 
 /// Bead identifier for tracing.
 const BEAD_ID: &str = "bd-zj56";
@@ -346,11 +346,7 @@ fn eval_binary_op(op: RebaseBinaryOp, left: SqliteValue, right: SqliteValue) -> 
         RebaseBinaryOp::ShiftLeft => integer_bitop(&left, &right, |a, b| {
             let shift = b.unsigned_abs() as u32;
             if shift >= 64 {
-                if b < 0 && a < 0 {
-                    -1
-                } else {
-                    0
-                }
+                if b < 0 && a < 0 { -1 } else { 0 }
             } else if b < 0 {
                 a >> shift
             } else {
@@ -361,11 +357,7 @@ fn eval_binary_op(op: RebaseBinaryOp, left: SqliteValue, right: SqliteValue) -> 
         RebaseBinaryOp::ShiftRight => integer_bitop(&left, &right, |a, b| {
             let shift = b.unsigned_abs() as u32;
             if shift >= 64 {
-                if b >= 0 && a < 0 {
-                    -1
-                } else {
-                    0
-                }
+                if b >= 0 && a < 0 { -1 } else { 0 }
             } else if b < 0 {
                 a << shift
             } else {

@@ -1182,7 +1182,8 @@ pub(crate) fn apply_child_replacement<W: PageWriter>(
 
     // Insert new divider cells at the correct position.
     let insert_pos = first_child;
-    let mut final_cells: Vec<GatheredCell> = Vec::with_capacity(kept_cells.len() + new_dividers.len());
+    let mut final_cells: Vec<GatheredCell> =
+        Vec::with_capacity(kept_cells.len() + new_dividers.len());
 
     for cell in &kept_cells[..insert_pos] {
         final_cells.push(cell.clone());

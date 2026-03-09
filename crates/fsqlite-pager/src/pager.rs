@@ -908,7 +908,7 @@ where
                 db_file,
                 // Generous cache size (65536 pages = 256MB) to support large
                 // in-memory transactions (like 1M inserts) without OutOfMemory.
-                cache: PageCache::new(page_size, 65_536),
+                cache: PageCache::new(page_size),
                 page_size,
                 db_size,
                 next_page,

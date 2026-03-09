@@ -10,7 +10,7 @@
 use fsqlite_types::sync_primitives::Instant;
 
 use fsqlite_error::{FrankenError, Result};
-use fsqlite_wal::wal_index::{WalCkptInfo, WalIndexHdr, WAL_READ_MARK_COUNT};
+use fsqlite_wal::wal_index::{WAL_READ_MARK_COUNT, WalCkptInfo, WalIndexHdr};
 
 // ---------------------------------------------------------------------------
 // CompatMode — operating posture
@@ -323,7 +323,7 @@ impl RecoveryPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fsqlite_wal::wal_index::{WalCkptInfo, WalIndexHdr, WAL_INDEX_VERSION};
+    use fsqlite_wal::wal_index::{WAL_INDEX_VERSION, WalCkptInfo, WalIndexHdr};
 
     const BEAD_3INZ: &str = "bd-3inz";
 

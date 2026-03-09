@@ -19,6 +19,15 @@ use crate::value::SqliteValue;
 /// Returns `None` if the record is malformed.
 #[allow(clippy::cast_possible_truncation)]
 pub fn parse_record(data: &[u8]) -> Option<Vec<SqliteValue>> {
+    let mut values = Vec::new();
+    parse_record_into(data, &mut values)?;
+    Some(values)
+}
+
+/// Parse a serialized record into an existing `Vec<SqliteValue>`, clearing it first.
+#[allow(clippy::cast_possible_truncation)]
+pub fn parse_record_into(data: &[u8], values: &mut Vec<SqliteValue>) -> Option<()> {
+    values.clear();
     if data.is_empty() {
         return None;
     }
@@ -31,11 +40,9 @@ pub fn parse_record(data: &[u8]) -> Option<Vec<SqliteValue>> {
         return None;
     }
 
-    // Parse serial types and values in a single pass to avoid allocating
-    // a temporary vector for serial types.
+    // Parse serial types and values in a single pass.
     let mut offset = hdr_varint_len;
     let mut body_offset = header_size;
-    let mut values = Vec::new();
 
     while offset < header_size {
         let (serial_type, consumed) = read_varint(&data[offset..header_size])?;
@@ -60,73 +67,38 @@ pub fn parse_record(data: &[u8]) -> Option<Vec<SqliteValue>> {
         return None;
     }
 
-    Some(values)
+    Some(())
 }
 
-/// Serialize a list of `SqliteValue`s into the SQLite record format.
-///
-/// Returns the complete record bytes (header + body).
+/// Serialize a list of `SqliteValue` into the SQLite record format.
 pub fn serialize_record(values: &[SqliteValue]) -> Vec<u8> {
-    // First pass: compute serial types and header size.
-    let serial_types: Vec<u64> = values.iter().map(serial_type_for_value).collect();
-
-    let mut header_content_size: usize = 0;
-    for &st in &serial_types {
-        header_content_size += varint_len(st);
-    }
-
-    // The header size includes the varint encoding of the header size itself.
-    // This is a bit circular: the header size varint is part of the header.
-    let header_size = compute_header_size(header_content_size);
-    let header_size_varint_len = varint_len(header_size as u64);
-
-    // Second pass: compute body size.
-    #[allow(clippy::cast_possible_truncation)]
-    let body_size: usize = serial_types
-        .iter()
-        .map(|&st| serial_type_len(st).unwrap_or(0) as usize)
-        .sum();
-
-    let total_size = header_size + body_size;
-    let mut buf = vec![0u8; total_size];
-
-    // Write header.
-    let mut offset = write_varint(&mut buf, header_size as u64);
-    debug_assert_eq!(offset, header_size_varint_len);
-
-    for &st in &serial_types {
-        offset += write_varint(&mut buf[offset..], st);
-    }
-    debug_assert_eq!(offset, header_size);
-
-    // Write body.
-    #[allow(clippy::cast_possible_truncation)]
-    for (value, &st) in values.iter().zip(serial_types.iter()) {
-        let value_len = serial_type_len(st).unwrap_or(0) as usize;
-        encode_value(value, st, &mut buf[offset..offset + value_len]);
-        offset += value_len;
-    }
-
-    buf
+    serialize_record_iter(values.iter())
 }
 
 /// Serialize a list of `SqliteValue` references into the SQLite record format.
 pub fn serialize_record_refs(values: &[&SqliteValue]) -> Vec<u8> {
-    let serial_types: Vec<u64> = values.iter().map(|&v| serial_type_for_value(v)).collect();
+    serialize_record_iter(values.iter().copied())
+}
 
+/// Core serialization logic using a zero-allocation, multi-pass iterator.
+fn serialize_record_iter<'a, I>(values: I) -> Vec<u8>
+where
+    I: Iterator<Item = &'a SqliteValue> + Clone,
+{
     let mut header_content_size: usize = 0;
-    for &st in &serial_types {
+    let mut body_size: usize = 0;
+
+    for v in values.clone() {
+        let st = serial_type_for_value(v);
         header_content_size += varint_len(st);
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            body_size += serial_type_len(st).unwrap_or(0) as usize;
+        }
     }
 
     let header_size = compute_header_size(header_content_size);
     let header_size_varint_len = varint_len(header_size as u64);
-
-    #[allow(clippy::cast_possible_truncation)]
-    let body_size: usize = serial_types
-        .iter()
-        .map(|&st| serial_type_len(st).unwrap_or(0) as usize)
-        .sum();
 
     let total_size = header_size + body_size;
     let mut buf = vec![0u8; total_size];
@@ -134,15 +106,17 @@ pub fn serialize_record_refs(values: &[&SqliteValue]) -> Vec<u8> {
     let mut offset = write_varint(&mut buf, header_size as u64);
     debug_assert_eq!(offset, header_size_varint_len);
 
-    for &st in &serial_types {
+    for v in values.clone() {
+        let st = serial_type_for_value(v);
         offset += write_varint(&mut buf[offset..], st);
     }
     debug_assert_eq!(offset, header_size);
 
     #[allow(clippy::cast_possible_truncation)]
-    for (&value, &st) in values.iter().zip(serial_types.iter()) {
+    for v in values {
+        let st = serial_type_for_value(v);
         let value_len = serial_type_len(st).unwrap_or(0) as usize;
-        encode_value(value, st, &mut buf[offset..offset + value_len]);
+        encode_value(v, st, &mut buf[offset..offset + value_len]);
         offset += value_len;
     }
 

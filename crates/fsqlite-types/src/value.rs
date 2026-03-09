@@ -135,11 +135,11 @@ fn cast_text_prefix_to_numeric(s: &str) -> SqliteValue {
 /// fundamental storage classes: NULL, INTEGER, REAL, TEXT, and BLOB.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum SqliteValue {
-    /// SQL NULL.
+    /// A NULL value.
     Null,
-    /// A 64-bit signed integer.
+    /// A signed 64-bit integer.
     Integer(i64),
-    /// A 64-bit IEEE 754 floating-point number.
+    /// A 64-bit IEEE floating point number.
     Float(f64),
     /// A UTF-8 text string.
     Text(String),
@@ -295,7 +295,7 @@ impl SqliteValue {
     /// Try to extract a text reference.
     pub fn as_text(&self) -> Option<&str> {
         match self {
-            Self::Text(s) => Some(s),
+            Self::Text(s) => Some(s.as_str()),
             _ => None,
         }
     }
@@ -303,7 +303,7 @@ impl SqliteValue {
     /// Try to extract a blob reference.
     pub fn as_blob(&self) -> Option<&[u8]> {
         match self {
-            Self::Blob(b) => Some(b),
+            Self::Blob(b) => Some(b.as_slice()),
             _ => None,
         }
     }
@@ -942,7 +942,7 @@ fn try_coerce_text_to_numeric(s: &str) -> Option<SqliteValue> {
 /// Matches C SQLite's `sqlite3IntFloatCompare` algorithm. The naive
 /// `(i as f64).partial_cmp(&r)` loses precision for |i| > 2^53.
 #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
-fn int_float_cmp(i: i64, r: f64) -> Ordering {
+pub fn int_float_cmp(i: i64, r: f64) -> Ordering {
     if r.is_nan() {
         // SQLite treats NaN as NULL, and all integers are greater than NULL.
         return Ordering::Greater;

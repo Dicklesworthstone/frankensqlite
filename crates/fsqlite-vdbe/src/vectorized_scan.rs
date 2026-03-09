@@ -5,7 +5,6 @@
 //! values, supports page-range morsels, and applies early filter pushdown via
 //! selection vectors.
 
-use std::collections::BTreeSet;
 use std::fmt;
 use std::sync::Arc;
 
@@ -260,7 +259,7 @@ where
 
         let mut rows = Vec::with_capacity(self.batch_capacity);
         let mut selection_indices = Vec::with_capacity(self.batch_capacity);
-        let mut page_set = BTreeSet::new();
+        let mut last_page_seen = None;
         let mut pages_touched = Vec::new();
         let mut prefetch_hints_issued = 0usize;
 
@@ -290,15 +289,16 @@ where
                 }
             }
 
-            if page_set.insert(current_page) {
+            if last_page_seen != Some(current_page) {
                 pages_touched.push(current_page);
-                if let Some(prefetch_page) = self.next_prefetch_page(current_page)
-                    && self.last_prefetched_page != Some(prefetch_page)
-                {
-                    self.cursor.prefetch_page_hint(&self.cx, prefetch_page);
-                    self.last_prefetched_page = Some(prefetch_page);
-                    prefetch_hints_issued = prefetch_hints_issued.saturating_add(1);
+                if let Some(prefetch_page) = self.next_prefetch_page(current_page) {
+                    if self.last_prefetched_page != Some(prefetch_page) {
+                        self.cursor.prefetch_page_hint(&self.cx, prefetch_page);
+                        self.last_prefetched_page = Some(prefetch_page);
+                        prefetch_hints_issued = prefetch_hints_issued.saturating_add(1);
+                    }
                 }
+                last_page_seen = Some(current_page);
             }
 
             let rowid = self.cursor.rowid(&self.cx)?;

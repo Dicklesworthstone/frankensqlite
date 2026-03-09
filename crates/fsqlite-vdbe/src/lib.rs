@@ -197,7 +197,7 @@ impl Default for RegisterAllocator {
 #[derive(Debug)]
 pub struct ProgramBuilder {
     /// The instruction sequence.
-    ops: Vec<VdbeOp>,
+    ops: smallvec::SmallVec<[VdbeOp; 64]>,
     /// Label states (indexed by `Label.0`).
     labels: Vec<LabelState>,
     /// Register allocator.
@@ -212,7 +212,7 @@ impl ProgramBuilder {
     /// Create a new empty program builder.
     pub fn new() -> Self {
         Self {
-            ops: Vec::new(),
+            ops: smallvec::SmallVec::new(),
             labels: Vec::new(),
             regs: RegisterAllocator::new(),
             next_anon_placeholder: 1,
@@ -436,7 +436,7 @@ impl Default for ProgramBuilder {
 #[derive(Debug, Clone, PartialEq)]
 pub struct VdbeProgram {
     /// The instruction sequence.
-    ops: Vec<VdbeOp>,
+    ops: smallvec::SmallVec<[VdbeOp; 64]>,
     /// Number of registers needed (high water mark from allocation).
     register_count: i32,
     /// Precomputed bind parameter requirement for `Opcode::Variable` opcodes.

@@ -273,6 +273,12 @@ impl SymbolCodec for AsupersyncCodec {
         symbol_size: u32,
         repair_overhead: f64,
     ) -> Result<CodecEncodeResult> {
+        if symbol_size == 0 {
+            return Err(FrankenError::OutOfRange {
+                what: "symbol_size (must be > 0)".to_owned(),
+                value: "0".to_owned(),
+            });
+        }
         let mut config = RaptorQConfig::default();
         config.encoding.symbol_size = symbol_size as u16;
         config.encoding.max_block_size = self.max_block_size;
@@ -330,6 +336,13 @@ impl SymbolCodec for AsupersyncCodec {
                 reason: DecodeFailureReason::InsufficientSymbols,
                 symbols_received: 0,
                 k_required: k_source,
+            });
+        }
+
+        if symbol_size == 0 {
+            return Err(FrankenError::OutOfRange {
+                what: "symbol_size (must be > 0)".to_owned(),
+                value: "0".to_owned(),
             });
         }
 

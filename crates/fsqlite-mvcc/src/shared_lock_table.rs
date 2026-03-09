@@ -1782,8 +1782,8 @@ mod tests {
 
     #[test]
     fn test_e2e_shared_page_lock_table_cross_thread_contention() {
-        use std::sync::atomic::AtomicBool;
         use std::sync::Barrier;
+        use std::sync::atomic::AtomicBool;
 
         let table = Arc::new(SharedPageLockTable::new(256));
         let barrier = Arc::new(Barrier::new(2));

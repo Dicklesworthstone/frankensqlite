@@ -1053,9 +1053,7 @@ pub fn codegen_select(
             having,
             distinct,
             ..
-        } => {
-            (columns, from, where_clause, group_by, having, *distinct)
-        },
+        } => (columns, from, where_clause, group_by, having, *distinct),
         SelectCore::Values(rows) => {
             return codegen_values_select(b, rows);
         }
@@ -5921,38 +5919,50 @@ pub fn codegen_update(
     // Register table-to-index cursor metadata for REPLACE conflict resolution.
     register_table_index_meta(b, table, table_cursor);
 
-    // Full table scan: Rewind → loop body → Next.
-    let loop_start = b.current_addr();
-    b.emit_jump_to_label(Opcode::Rewind, table_cursor, 0, done_label, P4::None, 0);
+    let rowid_target = extract_rowid_target_expr(stmt.where_clause.as_ref(), Some(table));
+    let skip_label = b.emit_label();
+    let mut loop_start = 0;
 
-    // Count anonymous placeholders in SET assignments.
-    // Parameters are numbered in SQL textual order (SET first, then WHERE), but
-    // bytecode emits WHERE before SET. We must set the placeholder counter
-    // so WHERE placeholders get indices *after* the SET placeholders.
     let set_placeholder_count: u32 = stmt
         .assignments
         .iter()
         .map(|a| count_anon_placeholders(&a.value))
         .sum();
-    let where_placeholder_count = stmt
+
+    let where_placeholder_count: u32 = stmt
         .where_clause
         .as_ref()
-        .map_or(0, count_anon_placeholders);
+        .map_or(0, |w| count_anon_placeholders(w));
 
-    // Evaluate WHERE condition (if any) and skip non-matching rows.
-    let skip_label = b.emit_label();
-    if let Some(where_expr) = &stmt.where_clause {
-        // Set placeholder counter to start after SET placeholders.
+    if let Some(target_expr) = rowid_target {
+        let rowid_reg = b.alloc_reg();
         b.set_next_anon_placeholder(set_placeholder_count + 1);
-        emit_where_filter(
-            b,
-            where_expr,
+        emit_expr(b, target_expr, rowid_reg, None);
+        b.emit_jump_to_label(
+            Opcode::SeekRowid,
             table_cursor,
-            table,
-            stmt.table.alias.as_deref(),
-            schema,
-            skip_label,
+            rowid_reg,
+            done_label,
+            P4::None,
+            0,
         );
+    } else {
+        // Full table scan: Rewind → loop body → Next.
+        loop_start = b.current_addr();
+        b.emit_jump_to_label(Opcode::Rewind, table_cursor, 0, done_label, P4::None, 0);
+
+        if let Some(where_expr) = &stmt.where_clause {
+            b.set_next_anon_placeholder(set_placeholder_count + 1);
+            emit_where_filter(
+                b,
+                where_expr,
+                table_cursor,
+                table,
+                stmt.table.alias.as_deref(),
+                schema,
+                skip_label,
+            );
+        }
     }
 
     // Read ALL existing columns into registers.
@@ -6100,17 +6110,19 @@ pub fn codegen_update(
         // RETURNING appears after WHERE in SQL textual order; restore the
         // post-WHERE placeholder index so RETURNING placeholders don't collide
         // with SET placeholder numbering.
-        b.set_next_anon_placeholder(set_placeholder_count + where_placeholder_count + 1);
+        b.set_next_anon_placeholder(set_placeholder_count + 1);
         emit_returning(b, table_cursor, table, &stmt.returning, rowid_reg)?;
     }
 
     // Skip label for WHERE-filtered rows.
     b.resolve_label(skip_label);
 
-    // Next: jump back to loop body.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    let loop_body = (loop_start + 1) as i32;
-    b.emit_op(Opcode::Next, table_cursor, loop_body, 0, P4::None, 0);
+    // Next: jump back to loop body, unless we did a point-lookup seek.
+    if loop_start != 0 {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let loop_body = (loop_start + 1) as i32;
+        b.emit_op(Opcode::Next, table_cursor, loop_body, 0, P4::None, 0);
+    }
 
     // Done: Close index cursors, then table cursor.
     b.resolve_label(done_label);
@@ -6545,37 +6557,52 @@ pub fn codegen_delete(
 
     // --- Pass 1: collect matching rowids ---
     let collect_done_label = b.emit_label();
-    let collect_start = b.current_addr();
-    b.emit_jump_to_label(
-        Opcode::Rewind,
-        table_cursor,
-        0,
-        collect_done_label,
-        P4::None,
-        0,
-    );
+    let rowid_target = extract_rowid_target_expr(stmt.where_clause.as_ref(), Some(table));
 
-    let collect_skip_label = b.emit_label();
-    if let Some(where_expr) = &stmt.where_clause {
-        emit_where_filter(
-            b,
-            where_expr,
+    if let Some(target_expr) = rowid_target {
+        emit_expr(b, target_expr, rowid_reg, None);
+        b.emit_jump_to_label(
+            Opcode::SeekRowid,
             table_cursor,
-            table,
-            stmt.table.alias.as_deref(),
-            schema,
-            collect_skip_label,
+            rowid_reg,
+            collect_done_label,
+            P4::None,
+            0,
         );
+        b.emit_op(Opcode::RowSetAdd, rowset_reg, rowid_reg, 0, P4::None, 0);
+    } else {
+        let collect_start = b.current_addr();
+        b.emit_jump_to_label(
+            Opcode::Rewind,
+            table_cursor,
+            0,
+            collect_done_label,
+            P4::None,
+            0,
+        );
+
+        let collect_skip_label = b.emit_label();
+        if let Some(where_expr) = &stmt.where_clause {
+            emit_where_filter(
+                b,
+                where_expr,
+                table_cursor,
+                table,
+                stmt.table.alias.as_deref(),
+                schema,
+                collect_skip_label,
+            );
+        }
+
+        // Get rowid of matching row and add to rowset.
+        b.emit_op(Opcode::Rowid, table_cursor, rowid_reg, 0, P4::None, 0);
+        b.emit_op(Opcode::RowSetAdd, rowset_reg, rowid_reg, 0, P4::None, 0);
+
+        b.resolve_label(collect_skip_label);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let collect_body = (collect_start + 1) as i32;
+        b.emit_op(Opcode::Next, table_cursor, collect_body, 0, P4::None, 0);
     }
-
-    // Get rowid of matching row and add to rowset.
-    b.emit_op(Opcode::Rowid, table_cursor, rowid_reg, 0, P4::None, 0);
-    b.emit_op(Opcode::RowSetAdd, rowset_reg, rowid_reg, 0, P4::None, 0);
-
-    b.resolve_label(collect_skip_label);
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    let collect_body = (collect_start + 1) as i32;
-    b.emit_op(Opcode::Next, table_cursor, collect_body, 0, P4::None, 0);
 
     b.resolve_label(collect_done_label);
 
@@ -8006,7 +8033,10 @@ fn extract_rowid_target_expr<'a>(
 }
 
 /// Check if a WHERE clause is `col = ?` for an indexed column.
-fn extract_column_eq_target<'a>(where_clause: Option<&'a Expr>, table: &TableSchema) -> Option<(String, &'a Expr)> {
+fn extract_column_eq_target<'a>(
+    where_clause: Option<&'a Expr>,
+    table: &TableSchema,
+) -> Option<(String, &'a Expr)> {
     let expr = where_clause?;
     if let Expr::BinaryOp {
         left,

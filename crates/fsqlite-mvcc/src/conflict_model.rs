@@ -515,11 +515,7 @@ impl AmsSketch {
 #[must_use]
 pub fn ams_sign(seed: u64, pgno: u64) -> i8 {
     let h = mix64(seed ^ pgno);
-    if (h & 1) == 0 {
-        1
-    } else {
-        -1
-    }
+    if (h & 1) == 0 { 1 } else { -1 }
 }
 
 /// De-duplicate and canonicalize a write set using ascending `pgno` ordering.

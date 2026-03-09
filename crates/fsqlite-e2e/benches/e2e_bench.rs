@@ -41,7 +41,7 @@ fn bench_sequential_inserts(c: &mut Criterion) {
             },
             |conn| {
                 for i in 0..100 {
-                    conn.execute_params(
+                    conn.execute_with_params(
                         "INSERT INTO t VALUES (?, 'val');",
                         &[fsqlite_types::value::SqliteValue::Integer(i)],
                     )

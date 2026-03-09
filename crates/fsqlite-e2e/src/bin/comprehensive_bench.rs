@@ -1389,11 +1389,15 @@ fn bench_read_after_write(report: &mut BenchReport, row_counts: &[usize]) {
                     .unwrap();
             })
         };
-        let fs = measure(&format!("fs_pk_{count}"), 1, || {
-            let _rows = fs_conn
-                .query(&format!("SELECT * FROM bench WHERE id = {target_id}"))
+        let fs = {
+            let stmt = fs_conn
+                .prepare("SELECT * FROM bench WHERE id = ?1")
                 .unwrap();
-        });
+            let target_val = fsqlite_types::value::SqliteValue::Integer(target_id);
+            measure(&format!("fs_pk_{count}"), 1, || {
+                let _rows = stmt.query_with_params(&[target_val.clone()]).unwrap();
+            })
+        };
         eprintln!(
             "C={} F={}",
             format_duration(cs.median()),

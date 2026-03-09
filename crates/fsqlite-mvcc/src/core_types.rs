@@ -7,17 +7,18 @@
 //! Foundation types (TxnId, CommitSeq, Snapshot, etc.) live in
 //! [`fsqlite_types::glossary`]; this module builds the runtime machinery on top.
 
+use fsqlite_types::sync_primitives::{Mutex, RwLock};
+use serde_json::json;
+use smallvec::SmallVec;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
-use smallvec::SmallVec;
-use fsqlite_types::sync_primitives::{Mutex, RwLock};
 
 use crate::cache_aligned::{
-    decode_payload, decode_tag, encode_cleaning, is_sentinel, logical_now_millis, CacheAligned,
-    SharedTxnSlot, CLAIMING_TIMEOUT_NO_PID_SECS, CLAIMING_TIMEOUT_SECS, TAG_CLAIMING,
+    CLAIMING_TIMEOUT_NO_PID_SECS, CLAIMING_TIMEOUT_SECS, CacheAligned, SharedTxnSlot, TAG_CLAIMING,
+    decode_payload, decode_tag, encode_cleaning, is_sentinel, logical_now_millis,
 };
 use crate::ebr::VersionGuardTicket;
 use fsqlite_observability::GLOBAL_TXN_SLOT_METRICS;
@@ -930,7 +931,7 @@ pub struct Transaction {
     pub write_set: SmallVec<[PageNumber; 8]>,
     /// Maps each page in the write set to its current data.
     /// Uses `Arc` to allow cheap O(1) cloning for savepoints.
-    pub write_set_data: Arc<HashMap<PageNumber, PageData>>,
+    pub write_set_data: Arc<HashMap<PageNumber, PageData, fsqlite_types::PageNumberBuildHasher>>,
     pub intent_log: IntentLog,
     pub page_locks: HashSet<PageNumber>,
     pub state: TransactionState,
@@ -983,7 +984,7 @@ impl Transaction {
             snapshot,
             snapshot_established: true,
             write_set: SmallVec::new(),
-            write_set_data: Arc::new(HashMap::new()),
+            write_set_data: Arc::new(HashMap::with_hasher(fsqlite_types::PageNumberBuildHasher::default())),
             intent_log: Vec::new(),
             page_locks: HashSet::new(),
             state: TransactionState::Active,
@@ -3255,8 +3256,8 @@ mod tests {
     const BEAD_22N13: &str = "bd-22n.13";
 
     use crate::cache_aligned::{
-        encode_claiming, encode_cleaning, CLAIMING_TIMEOUT_NO_PID_SECS, CLAIMING_TIMEOUT_SECS,
-        TAG_CLAIMING, TAG_CLEANING,
+        CLAIMING_TIMEOUT_NO_PID_SECS, CLAIMING_TIMEOUT_SECS, TAG_CLAIMING, TAG_CLEANING,
+        encode_claiming, encode_cleaning,
     };
 
     /// Helper: create a slot with a real (non-sentinel) TxnId and begin_seq.
@@ -4288,7 +4289,7 @@ mod tests {
 
     #[test]
     fn test_txn_slot_cross_process_visibility_shared_slot() {
-        use std::sync::{mpsc, Arc, Mutex};
+        use std::sync::{Arc, Mutex, mpsc};
         use std::time::Instant;
 
         let scenario_started = Instant::now();
@@ -4332,7 +4333,7 @@ mod tests {
         heartbeat_slot.pid.store(8_001, Ordering::Release);
         heartbeat_slot.pid_birth.store(9_001, Ordering::Release);
         let heartbeat_cleanup =
-            try_cleanup_orphaned_slot(&heartbeat_slot, heartbeat_probe_now, |_, _| false);
+            try_cleanup_orphaned_slot(&heartbeat_slot, heartbeat_probe_now, |_, _| false, |_| {});
         let crash_detected_within_two_heartbeats = heartbeat_probe_now.saturating_sub(claim_time)
             <= heartbeat_period_secs.saturating_mul(2);
         assert!(
@@ -4459,7 +4460,7 @@ mod tests {
             TXN_SLOT_E2E_SEED,
             TXN_SLOT_E2E_SCENARIO_ID,
             TXN_SLOT_E2E_SEED,
-            visibility_slot,
+            "target/txn_slot_e2e_artifact.json",
         );
         let checks = vec![
             json!({
@@ -4528,10 +4529,10 @@ mod tests {
         });
         let artifact_bytes = serde_json::to_vec_pretty(&artifact)
             .expect("bead_id={BEAD_2G5_1} artifact serialization should succeed");
-        std::fs::write(&visibility_slot, artifact_bytes)
+        std::fs::write("target/txn_slot_e2e_artifact.json", artifact_bytes)
             .expect("bead_id={BEAD_2G5_1} artifact write should succeed");
         assert!(
-            visibility_slot.exists(),
+            std::path::Path::new("target/txn_slot_e2e_artifact.json").exists(),
             "bead_id={BEAD_2G5_1} e2e artifact path should exist",
         );
         assert!(
@@ -4570,9 +4571,7 @@ mod tests {
         );
 
         // txn_b tries same page — contention event emitted.
-        assert!(table
-            .try_acquire(page, txn_b)
-            .is_err());
+        assert!(table.try_acquire(page, txn_b).is_err());
         assert_eq!(
             obs.metrics()
                 .page_contentions
@@ -4643,17 +4642,23 @@ mod tests {
             .unwrap();
 
         // txn_b contends on page 10.
-        assert!(table
-            .try_acquire(PageNumber::new(10).unwrap(), txn_b)
-            .is_err());
+        assert!(
+            table
+                .try_acquire(PageNumber::new(10).unwrap(), txn_b)
+                .is_err()
+        );
         // txn_c contends on page 10.
-        assert!(table
-            .try_acquire(PageNumber::new(10).unwrap(), txn_c)
-            .is_err());
+        assert!(
+            table
+                .try_acquire(PageNumber::new(10).unwrap(), txn_c)
+                .is_err()
+        );
         // txn_b contends on page 20.
-        assert!(table
-            .try_acquire(PageNumber::new(20).unwrap(), txn_b)
-            .is_err());
+        assert!(
+            table
+                .try_acquire(PageNumber::new(20).unwrap(), txn_b)
+                .is_err()
+        );
 
         assert_eq!(
             obs.metrics()

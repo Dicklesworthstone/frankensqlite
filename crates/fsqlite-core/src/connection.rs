@@ -2509,7 +2509,8 @@ impl Connection {
 
     /// Compute a 64-bit hash of an SQL string for parse cache lookup.
     fn sql_hash(sql: &str) -> u64 {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        use std::hash::{Hash, Hasher, BuildHasher};
+        let mut hasher = foldhash::fast::FixedState::default().build_hasher();
         sql.hash(&mut hasher);
         hasher.finish()
     }
@@ -12860,14 +12861,25 @@ impl Connection {
                     .iter()
                     .map(|le| self.eval_expr_with_subqueries(le, row, col_map, params))
                     .collect::<Result<Vec<_>>>()?;
-                let found = list_vals
-                    .iter()
-                    .any(|lv| !lv.is_null() && cmp_values(&val, lv) == std::cmp::Ordering::Equal);
-                Ok(SqliteValue::Integer(i64::from(if *not {
-                    !found
+                let mut found = false;
+                let mut saw_null = false;
+                for lv in &list_vals {
+                    if lv.is_null() {
+                        saw_null = true;
+                        continue;
+                    }
+                    if cmp_values(&val, lv) == std::cmp::Ordering::Equal {
+                        found = true;
+                        break;
+                    }
+                }
+                if found {
+                    Ok(SqliteValue::Integer(i64::from(!*not)))
+                } else if saw_null {
+                    Ok(SqliteValue::Null)
                 } else {
-                    found
-                })))
+                    Ok(SqliteValue::Integer(i64::from(*not)))
+                }
             }
             Expr::Cast {
                 expr: e, type_name, ..
