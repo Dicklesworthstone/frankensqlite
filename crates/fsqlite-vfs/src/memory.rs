@@ -458,10 +458,7 @@ impl VfsFile for MemoryFile {
 
         let offset = u64_to_usize(offset, "write offset")?;
         let end = offset.checked_add(buf.len()).ok_or_else(|| {
-            FrankenError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "write offset + length overflow",
-            ))
+            FrankenError::Io(std::io::Error::other("write offset + length overflow"))
         })?;
 
         if offset == storage.data.len() {
