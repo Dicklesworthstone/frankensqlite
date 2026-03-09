@@ -713,7 +713,7 @@ mod tests {
 
             // Frame 2 offset must NOT be sector-aligned for most page sizes.
             // 24 bytes of per-frame header breaks alignment.
-            let sector_4k_aligned = frame2_offset % 4096 == 0;
+            let _sector_4k_aligned = frame2_offset % 4096 == 0;
 
             // Even for 512-byte sector: 32 + (24+512) = 568, 568 % 512 = 56.
             let sector_512_aligned = frame2_offset % 512 == 0;

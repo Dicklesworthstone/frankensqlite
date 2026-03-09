@@ -8,12 +8,10 @@
 //! [`fsqlite_types::glossary`]; this module builds the runtime machinery on top.
 
 use fsqlite_types::sync_primitives::{Mutex, RwLock};
-use serde_json::json;
 use smallvec::SmallVec;
 use std::collections::{HashMap, HashSet};
-use std::fmt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use crate::cache_aligned::{
@@ -1884,6 +1882,7 @@ mod tests {
     use super::*;
     use fsqlite_types::{PageData, PageSize, SchemaEpoch, VersionPointer};
     use proptest::prelude::*;
+    use serde_json::json;
 
     fn make_page_version(pgno: u32, commit: u64) -> PageVersion {
         let pgno = PageNumber::new(pgno).unwrap();
@@ -3435,7 +3434,7 @@ mod tests {
         let txn_id_raw = 99_u64;
         let claim_time = 1_000_u64;
         let long_ago = claim_time + CLAIMING_TIMEOUT_SECS - 1;
-        let now = long_ago + CLAIMING_TIMEOUT_SECS + 1;
+        let _now = long_ago + CLAIMING_TIMEOUT_SECS + 1;
 
         let slot = make_claiming_slot(txn_id_raw, long_ago);
         // Ensure pid/pid_birth are 0 (not published).

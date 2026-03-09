@@ -31,7 +31,6 @@ use crate::ssi_validation::{
     ActiveTxnView, CommittedReaderInfo, CommittedWriterInfo, DiscoveredEdge, SsiAbortReason,
     discover_incoming_edges, discover_outgoing_edges, evaluate_t3_dro,
 };
-use crate::witness_plane::witness_keys_overlap;
 
 /// Maximum number of concurrent writers that can be active simultaneously.
 ///
