@@ -9,8 +9,8 @@
 //! - [`SerializedWriteMutex`]: Global write mutex for Serialized mode (INV-7).
 
 use std::collections::{BTreeSet, HashMap};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use fsqlite_types::sync_primitives::{Mutex, RwLock};
 
@@ -22,7 +22,7 @@ use fsqlite_types::{
 use crate::cache_aligned::CacheAligned;
 use crate::core_types::{Transaction, VersionArena, VersionIdx};
 use crate::ebr::VersionGuardRegistry;
-use crate::gc::{GcTickResult, GcTodo, gc_tick_with_registry, prune_page_chain_with_registry};
+use crate::gc::{gc_tick_with_registry, prune_page_chain_with_registry, GcTickResult, GcTodo};
 use crate::observability::record_cas_attempt;
 
 // ---------------------------------------------------------------------------
@@ -1154,8 +1154,8 @@ mod tests {
 
     #[test]
     fn test_bd6883_first_attempt_ratio_64_threads_moderate_contention() {
-        use std::sync::Arc;
         use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
         use std::thread;
 
         const THREADS: u32 = 64;
@@ -1233,8 +1233,8 @@ mod tests {
 
     #[test]
     fn loom_chain_head_publication_linearizable() {
-        use loom::sync::Arc;
         use loom::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+        use loom::sync::Arc;
         use loom::thread;
 
         loom::model(|| {
@@ -1247,21 +1247,19 @@ mod tests {
 
             let spawn_installer =
                 |next_head: u64, head: Arc<AtomicU64>, completions: Arc<AtomicUsize>| {
-                    thread::spawn(move || {
-                        loop {
-                            let current = head.load(Ordering::Acquire);
-                            if head
-                                .compare_exchange(
-                                    current,
-                                    next_head,
-                                    Ordering::AcqRel,
-                                    Ordering::Acquire,
-                                )
-                                .is_ok()
-                            {
-                                completions.fetch_add(1, Ordering::Release);
-                                break;
-                            }
+                    thread::spawn(move || loop {
+                        let current = head.load(Ordering::Acquire);
+                        if head
+                            .compare_exchange(
+                                current,
+                                next_head,
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            )
+                            .is_ok()
+                        {
+                            completions.fetch_add(1, Ordering::Release);
+                            break;
                         }
                     })
                 };

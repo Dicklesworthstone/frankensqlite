@@ -545,9 +545,9 @@ mod tests {
     use fsqlite_types::CommitSeq;
 
     use super::{
-        COMMIT_MARKER_MAGIC, GlobalCommitMarker, MAIN_DB_ID, MAX_TOTAL_DATABASES, PrepareResult,
-        RecoveryAction, SQLITE_MAX_ATTACHED, TEMP_DB_ID, TwoPhaseCoordinator, TwoPhaseError,
-        TwoPhaseState,
+        GlobalCommitMarker, PrepareResult, RecoveryAction, TwoPhaseCoordinator, TwoPhaseError,
+        TwoPhaseState, COMMIT_MARKER_MAGIC, MAIN_DB_ID, MAX_TOTAL_DATABASES, SQLITE_MAX_ATTACHED,
+        TEMP_DB_ID,
     };
 
     // -----------------------------------------------------------------------

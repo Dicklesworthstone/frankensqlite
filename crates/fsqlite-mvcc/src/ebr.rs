@@ -7,8 +7,8 @@
 use std::{
     collections::HashMap,
     sync::{
-        Arc,
         atomic::{AtomicU64, Ordering},
+        Arc,
     },
     time::{Duration, Instant},
 };
@@ -566,8 +566,8 @@ impl Drop for VersionGuardTicket {
 mod tests {
     use std::{
         sync::{
-            Arc,
             atomic::{AtomicUsize, Ordering},
+            Arc,
         },
         thread,
         time::{Duration, Instant},
@@ -577,8 +577,8 @@ mod tests {
     use proptest::{prelude::*, test_runner::Config as ProptestConfig};
 
     use super::{
-        EbrMetrics, GLOBAL_EBR_METRICS, StaleReaderConfig, VersionGuard, VersionGuardRegistry,
-        VersionGuardTicket,
+        EbrMetrics, StaleReaderConfig, VersionGuard, VersionGuardRegistry, VersionGuardTicket,
+        GLOBAL_EBR_METRICS,
     };
 
     #[test]

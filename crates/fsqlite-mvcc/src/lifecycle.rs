@@ -10,8 +10,8 @@
 
 use std::collections::HashMap;
 use std::sync::{
-    Arc,
     atomic::{AtomicU64, Ordering},
+    Arc,
 };
 use std::time::Duration;
 
@@ -26,7 +26,7 @@ use crate::cache_aligned::{logical_now_epoch_secs, logical_now_millis};
 use crate::core_types::{
     CommitIndex, InProcessPageLockTable, Transaction, TransactionMode, TransactionState,
 };
-use crate::ebr::{GLOBAL_EBR_METRICS, VersionGuardRegistry, VersionGuardTicket};
+use crate::ebr::{VersionGuardRegistry, VersionGuardTicket, GLOBAL_EBR_METRICS};
 use crate::invariants::{SerializedWriteMutex, TxnManager, VersionStore};
 use crate::observability::{
     mvcc_snapshot_established, mvcc_snapshot_released, record_snapshot_read_versions_traversed,
@@ -1533,9 +1533,9 @@ mod tests {
     use crate::ebr::GLOBAL_EBR_METRICS;
     use std::hint::black_box;
     use std::io;
+    use std::sync::mpsc;
     use std::sync::Arc;
     use std::sync::Mutex;
-    use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
     use fsqlite_types::TxnId;
@@ -1845,16 +1845,12 @@ mod tests {
 
         assert_eq!(reader.read_version_for_page(p1), Some(committed));
         assert_eq!(reader.read_version_for_page(p2), Some(committed));
-        assert!(
-            reader
-                .read_keys
-                .contains(&fsqlite_types::WitnessKey::Page(p1))
-        );
-        assert!(
-            reader
-                .read_keys
-                .contains(&fsqlite_types::WitnessKey::Page(p2))
-        );
+        assert!(reader
+            .read_keys
+            .contains(&fsqlite_types::WitnessKey::Page(p1)));
+        assert!(reader
+            .read_keys
+            .contains(&fsqlite_types::WitnessKey::Page(p2)));
     }
 
     #[test]
@@ -3865,10 +3861,9 @@ mod tests {
         }
         m.commit(&mut writer).unwrap();
         for page in [901_u32, 902, 903] {
-            assert!(
-                m.read_page(&mut old_reader, PageNumber::new(page).unwrap())
-                    .is_none()
-            );
+            assert!(m
+                .read_page(&mut old_reader, PageNumber::new(page).unwrap())
+                .is_none());
         }
 
         let mut stale = m.begin(BeginKind::Concurrent).unwrap();

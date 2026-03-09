@@ -13,7 +13,7 @@
 //! - **Bounded backoff**: epoch_lock acquisition respects budget and falls back
 //!   to overflow when budget is exhausted.
 
-use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 use fsqlite_types::RangeKey;
 use tracing::{debug, info, warn};
@@ -703,7 +703,7 @@ pub fn bitset_to_slot_ids(bitset: &[u64]) -> Vec<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::witness_hierarchy::{WitnessHierarchyConfigV1, derive_range_keys};
+    use crate::witness_hierarchy::{derive_range_keys, WitnessHierarchyConfigV1};
     use fsqlite_types::{PageNumber, WitnessKey};
 
     fn page(n: u32) -> PageNumber {

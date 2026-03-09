@@ -17,7 +17,7 @@ use fsqlite_types::{
 };
 
 use crate::deterministic_rebase::{
-    BaseRowReader, RebaseError, RebaseSchemaLookup, check_rebase_eligibility, deterministic_rebase,
+    check_rebase_eligibility, deterministic_rebase, BaseRowReader, RebaseError, RebaseSchemaLookup,
 };
 use crate::lifecycle::WriteMergePolicy;
 
@@ -1276,16 +1276,12 @@ mod tests {
         assert!(result.is_ok(), "opaque pages should allow raw XOR");
 
         // Validate via StructuredPagePatch method too
-        assert!(
-            patch_with_xor
-                .validate_no_raw_xor_for_structured(MergePageKind::BtreeLeafTable)
-                .is_err()
-        );
-        assert!(
-            patch_with_xor
-                .validate_no_raw_xor_for_structured(MergePageKind::Opaque)
-                .is_ok()
-        );
+        assert!(patch_with_xor
+            .validate_no_raw_xor_for_structured(MergePageKind::BtreeLeafTable)
+            .is_err());
+        assert!(patch_with_xor
+            .validate_no_raw_xor_for_structured(MergePageKind::Opaque)
+            .is_ok());
     }
 
     // -----------------------------------------------------------------------

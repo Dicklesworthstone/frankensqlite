@@ -589,7 +589,7 @@ mod tests {
             let h = reg_r.register().unwrap();
             h.quiescent();
             ready_r.wait(); // signal main thread
-            // Simulate being in a read critical section.
+                            // Simulate being in a read critical section.
             while !do_q_r.load(Ordering::Acquire) {
                 std::hint::spin_loop();
             }

@@ -20,10 +20,10 @@ use tracing::{debug, info, warn};
 
 use fsqlite_types::{CommitSeq, PageNumber, SchemaEpoch, Snapshot};
 
-use crate::VersionIdx;
 use crate::core_types::CommitLog;
 use crate::invariants::VersionStore;
 use crate::witness_publication::CommitMarkerStore;
+use crate::VersionIdx;
 
 // ---------------------------------------------------------------------------
 // Error types

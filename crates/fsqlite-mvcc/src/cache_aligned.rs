@@ -13,7 +13,7 @@
 //! We assume 64-byte cache lines (standard on x86-64 and AArch64). This is
 //! encoded in [`CACHE_LINE_BYTES`].
 
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 use fsqlite_observability::GLOBAL_TXN_SLOT_METRICS;
 
@@ -2002,11 +2002,10 @@ mod tests {
         let entry_ref = rcri.entry_at(0).unwrap();
         let unlikely_page = 999_999;
         if !entry_ref.bloom_may_contain(unlikely_page) {
-            assert!(
-                rcri.query_incoming_edges(unlikely_page, 200)
-                    .next()
-                    .is_none()
-            );
+            assert!(rcri
+                .query_incoming_edges(unlikely_page, 200)
+                .next()
+                .is_none());
         }
     }
 

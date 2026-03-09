@@ -11,18 +11,18 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use fsqlite_types::TypeAffinity;
 use fsqlite_types::glossary::{
     ColumnIdx, IndexId, IntentOp, IntentOpKind, RebaseExpr, RowId, Snapshot, StructuralEffects,
     TableId,
 };
 use fsqlite_types::record::{parse_record, serialize_record};
 use fsqlite_types::value::SqliteValue;
+use fsqlite_types::TypeAffinity;
 use tracing::{debug, warn};
 
 use crate::index_regen::{
-    IndexDef, IndexRegenError, IndexRegenOps, UniqueChecker, apply_column_updates,
-    eval_rebase_expr, regenerate_index_ops,
+    apply_column_updates, eval_rebase_expr, regenerate_index_ops, IndexDef, IndexRegenError,
+    IndexRegenOps, UniqueChecker,
 };
 
 /// Bead identifier for tracing.
@@ -630,7 +630,7 @@ mod tests {
     };
     use fsqlite_types::record::serialize_record;
 
-    use crate::index_regen::{Collation, IndexKeyPart, NoOpUniqueChecker, compute_index_key};
+    use crate::index_regen::{compute_index_key, Collation, IndexKeyPart, NoOpUniqueChecker};
 
     // ── Test helpers ─────────────────────────────────────────────────────
 

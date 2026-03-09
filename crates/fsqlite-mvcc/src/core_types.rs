@@ -16,8 +16,8 @@ use smallvec::SmallVec;
 use std::sync::atomic::Ordering;
 
 use crate::cache_aligned::{
-    CLAIMING_TIMEOUT_NO_PID_SECS, CLAIMING_TIMEOUT_SECS, CacheAligned, SharedTxnSlot, TAG_CLAIMING,
-    decode_payload, decode_tag, encode_cleaning, is_sentinel, logical_now_millis,
+    decode_payload, decode_tag, encode_cleaning, is_sentinel, logical_now_millis, CacheAligned,
+    SharedTxnSlot, CLAIMING_TIMEOUT_NO_PID_SECS, CLAIMING_TIMEOUT_SECS, TAG_CLAIMING,
 };
 use crate::ebr::VersionGuardTicket;
 use fsqlite_observability::GLOBAL_TXN_SLOT_METRICS;
@@ -3323,8 +3323,8 @@ mod tests {
     const BEAD_22N13: &str = "bd-22n.13";
 
     use crate::cache_aligned::{
-        CLAIMING_TIMEOUT_NO_PID_SECS, CLAIMING_TIMEOUT_SECS, TAG_CLEANING, encode_claiming,
-        encode_cleaning,
+        encode_claiming, encode_cleaning, CLAIMING_TIMEOUT_NO_PID_SECS, CLAIMING_TIMEOUT_SECS,
+        TAG_CLEANING,
     };
 
     /// Helper: create a slot with a real (non-sentinel) TxnId and begin_seq.
@@ -4371,7 +4371,7 @@ mod tests {
 
     #[test]
     fn test_txn_slot_cross_process_visibility_shared_slot() {
-        use std::sync::{Arc, mpsc};
+        use std::sync::{mpsc, Arc};
 
         let slot = Arc::new(SharedTxnSlot::new());
         let writer_slot = Arc::clone(&slot);
@@ -4455,7 +4455,7 @@ mod tests {
     fn txn_slot_crash_recovery_e2e_replay_emits_artifact() {
         use serde_json::json;
         use std::path::PathBuf;
-        use std::sync::{Arc, Mutex, mpsc};
+        use std::sync::{mpsc, Arc, Mutex};
         use std::time::Instant;
 
         let run_id = std::env::var("RUN_ID")
@@ -4842,23 +4842,17 @@ mod tests {
             .unwrap();
 
         // txn_b contends on page 10.
-        assert!(
-            table
-                .try_acquire(PageNumber::new(10).unwrap(), txn_b)
-                .is_err()
-        );
+        assert!(table
+            .try_acquire(PageNumber::new(10).unwrap(), txn_b)
+            .is_err());
         // txn_c contends on page 10.
-        assert!(
-            table
-                .try_acquire(PageNumber::new(10).unwrap(), txn_c)
-                .is_err()
-        );
+        assert!(table
+            .try_acquire(PageNumber::new(10).unwrap(), txn_c)
+            .is_err());
         // txn_b contends on page 20.
-        assert!(
-            table
-                .try_acquire(PageNumber::new(20).unwrap(), txn_b)
-                .is_err()
-        );
+        assert!(table
+            .try_acquire(PageNumber::new(20).unwrap(), txn_b)
+            .is_err());
 
         assert_eq!(
             obs.metrics()

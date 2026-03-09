@@ -28,8 +28,8 @@ use fsqlite_types::{
 use crate::core_types::{CommitIndex, InProcessPageLockTable, TransactionMode, TransactionState};
 use crate::lifecycle::MvccError;
 use crate::ssi_validation::{
-    ActiveTxnView, CommittedReaderInfo, CommittedWriterInfo, DiscoveredEdge, SsiAbortReason,
-    discover_incoming_edges, discover_outgoing_edges, evaluate_t3_dro,
+    discover_incoming_edges, discover_outgoing_edges, evaluate_t3_dro, ActiveTxnView,
+    CommittedReaderInfo, CommittedWriterInfo, DiscoveredEdge, SsiAbortReason,
 };
 use crate::witness_plane::witness_keys_overlap;
 
@@ -1190,10 +1190,10 @@ mod tests {
     use crate::lifecycle::MvccError;
 
     use super::{
-        ConcurrentRegistry, FcwResult, MAX_CONCURRENT_WRITERS, concurrent_abort, concurrent_commit,
-        concurrent_read_page, concurrent_rollback_to_savepoint, concurrent_savepoint,
-        concurrent_write_page, finalize_prepared_concurrent_commit_with_ssi,
-        prepare_concurrent_commit_with_ssi, validate_first_committer_wins,
+        concurrent_abort, concurrent_commit, concurrent_read_page,
+        concurrent_rollback_to_savepoint, concurrent_savepoint, concurrent_write_page,
+        finalize_prepared_concurrent_commit_with_ssi, prepare_concurrent_commit_with_ssi,
+        validate_first_committer_wins, ConcurrentRegistry, FcwResult, MAX_CONCURRENT_WRITERS,
     };
 
     fn test_snapshot(high: u64) -> Snapshot {

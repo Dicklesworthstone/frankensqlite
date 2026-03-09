@@ -16,7 +16,7 @@ use std::collections::BTreeSet;
 use fsqlite_types::{CommitSeq, ObjectId, RangeKey, TxnToken, WitnessKey};
 use tracing::debug;
 
-use crate::hot_witness_index::{HotWitnessIndex, bitset_to_slot_ids};
+use crate::hot_witness_index::{bitset_to_slot_ids, HotWitnessIndex};
 
 // ---------------------------------------------------------------------------
 // §5.7.1 KeySummary (6 variants)

@@ -187,7 +187,11 @@ impl FlatCombiner {
             for b in s.bytes() {
                 h = h.wrapping_mul(31).wrapping_add(u64::from(b));
             }
-            if h == 0 { 1 } else { h }
+            if h == 0 {
+                1
+            } else {
+                h
+            }
         };
 
         for i in 0..MAX_FC_THREADS {
