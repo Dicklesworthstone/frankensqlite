@@ -1109,7 +1109,7 @@ pub fn codegen_select(
     let rowid_param = if is_aggregate {
         None
     } else {
-        extract_rowid_bind_param(where_clause.as_deref())
+        extract_rowid_bind_param(where_clause.as_deref(), Some(table))
     };
     // Check for a simple indexed equality probe (only for non-aggregate queries).
     // We probe with [bound_value, i64::MIN] so SeekGE anchors on the first
@@ -7967,7 +7967,7 @@ fn resolve_result_column_indices(
 /// Check if a WHERE clause is a simple `rowid = ?` bind parameter.
 ///
 /// Returns the 1-based bind parameter index if so.
-fn extract_rowid_bind_param(where_clause: Option<&Expr>) -> Option<i32> {
+fn extract_rowid_bind_param(where_clause: Option<&Expr>, table: Option<&TableSchema>) -> Option<i32> {
     let expr = where_clause?;
     if let Expr::BinaryOp {
         left,
@@ -7977,10 +7977,10 @@ fn extract_rowid_bind_param(where_clause: Option<&Expr>) -> Option<i32> {
     } = expr
     {
         // Check left = rowid column, right = bind param.
-        if is_rowid_expr(left) {
+        if is_rowid_expr(left, table) {
             return bind_param_index(right);
         }
-        if is_rowid_expr(right) {
+        if is_rowid_expr(right, table) {
             return bind_param_index(left);
         }
     }
@@ -8019,12 +8019,20 @@ fn column_name(expr: &Expr) -> Option<String> {
 }
 
 /// Check if an expression is a rowid reference.
-fn is_rowid_expr(expr: &Expr) -> bool {
+fn is_rowid_expr(expr: &Expr, table: Option<&TableSchema>) -> bool {
     if let Expr::Column(col_ref, _) = expr {
-        is_rowid_ref(col_ref)
-    } else {
-        false
+        if is_rowid_ref(col_ref) {
+            return true;
+        }
+        if let Some(t) = table {
+            for col in &t.columns {
+                if col.is_ipk && col.name.eq_ignore_ascii_case(&col_ref.column) {
+                    return true;
+                }
+            }
+        }
     }
+    false
 }
 
 fn is_rowid_ref(col_ref: &ColumnRef) -> bool {

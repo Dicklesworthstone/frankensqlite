@@ -2717,7 +2717,7 @@ impl VdbeEngine {
     ///
     /// Values are 1-indexed at execution time (`?1` maps to `bindings[0]`).
     pub fn set_bindings(&mut self, bindings: Vec<SqliteValue>) {
-        self.bindings = bindings;
+        self.bindings = bindings.into();
     }
 
     /// Set the schema cookie that `ReadCookie` will return and
