@@ -2952,7 +2952,17 @@ mod tests {
     fn test_sign_nan_inf_text_returns_null() {
         // C SQLite doesn't recognise "NaN", "inf", "Infinity" etc. as numeric —
         // sign() must return NULL for these, matching the C oracle.
-        for s in &["NaN", "nan", "inf", "-inf", "Infinity", "-Infinity", "INF", "+nan", "+inf"] {
+        for s in &[
+            "NaN",
+            "nan",
+            "inf",
+            "-inf",
+            "Infinity",
+            "-Infinity",
+            "INF",
+            "+nan",
+            "+inf",
+        ] {
             assert_eq!(
                 invoke1(&SignFunc, SqliteValue::Text((*s).to_owned())).unwrap(),
                 SqliteValue::Null,
