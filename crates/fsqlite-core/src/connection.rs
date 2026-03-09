@@ -11,7 +11,7 @@ use lru::LruCache;
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
-use std::hash::{Hash, Hasher};
+use std::hash::Hash;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -2566,10 +2566,8 @@ impl Connection {
 
     /// Compute a 64-bit hash of an SQL string for parse cache lookup.
     fn sql_hash(sql: &str) -> u64 {
-        use std::hash::{BuildHasher, Hash, Hasher};
-        let mut hasher = foldhash::fast::FixedState::default().build_hasher();
-        sql.hash(&mut hasher);
-        hasher.finish()
+        use std::hash::BuildHasher;
+        foldhash::fast::FixedState::default().hash_one(sql)
     }
 
     /// Return a cached parsed single statement, or parse fresh and cache it.
@@ -2842,7 +2840,6 @@ impl Connection {
     /// Execute a parsed statement, handling both DDL (CREATE TABLE) and
     /// DML (SELECT/INSERT/UPDATE/DELETE).
     #[allow(clippy::too_many_lines)]
-
     fn execute_statement(
         &self,
         statement: &Statement,
@@ -3002,7 +2999,7 @@ impl Connection {
     /// Inner dispatch for `execute_statement` — separated so that
     /// autocommit wrapping can bracket the entire execution.
     #[allow(clippy::too_many_lines)]
-
+    #[allow(dead_code)]
     fn execute_statement_dispatch(
         &self,
         statement: &Statement,
@@ -3421,7 +3418,7 @@ impl Connection {
                     self.log_mem_execution_fallback("update", "with_clause_materialization")?;
                     return self.execute_update_with_ctes(update, params);
                 }
-                let (effective_update, limited_row_count_hint) =
+                let (effective_update, _limited_row_count_hint) =
                     self.materialize_update_limit_scope(update, params)?;
                 let table_name = &effective_update.table.name.name;
                 // Collect columns being updated for UPDATE OF trigger matching.
@@ -3543,7 +3540,7 @@ impl Connection {
                     self.log_mem_execution_fallback("delete", "with_clause_materialization")?;
                     return self.execute_delete_with_ctes(delete, params);
                 }
-                let (effective_delete, limited_row_count_hint) =
+                let (effective_delete, _limited_row_count_hint) =
                     self.materialize_delete_limit_scope(delete, params)?;
                 let table_name = &effective_delete.table.name.name;
                 let delete_event = fsqlite_ast::TriggerEvent::Delete;
@@ -3639,7 +3636,7 @@ impl Connection {
                 }
             }
             Statement::Begin(begin) => {
-                self.execute_begin(begin)?;
+                self.execute_begin(*begin)?;
                 Ok(Vec::new())
             }
             Statement::Commit => {
@@ -3784,7 +3781,7 @@ impl Connection {
                 Ok(Cow::Borrowed(statement))
             }
             Statement::Select(select) => {
-                let rewritten = self.rewrite_subqueries(&select, params)?;
+                let rewritten = self.rewrite_subqueries(select, params)?;
                 Ok(Cow::Owned(Statement::Select(rewritten)))
             }
             Statement::Update(update) if update.with.is_some() => Ok(Cow::Borrowed(statement)),
@@ -4679,6 +4676,7 @@ impl Connection {
 
     /// Count rows matching UPDATE/DELETE scope using the existing SELECT
     /// helper so affected-row accounting is decoupled from VDBE opcode shape.
+    #[allow(dead_code)]
     fn count_matching_rows(
         &self,
         table_ref: &fsqlite_ast::QualifiedTableRef,
@@ -9308,7 +9306,7 @@ impl Connection {
     }
 
     /// Handle BEGIN [DEFERRED|IMMEDIATE|EXCLUSIVE|CONCURRENT].
-    fn execute_begin(&self, begin: &fsqlite_ast::BeginStatement) -> Result<()> {
+    fn execute_begin(&self, begin: fsqlite_ast::BeginStatement) -> Result<()> {
         if *self.in_transaction.borrow() {
             return Err(FrankenError::Internal(
                 "cannot start a transaction within a transaction".to_owned(),
@@ -13818,14 +13816,14 @@ impl Connection {
                         },
                     ..
                 } => {
-                    let spec = resolve_window_spec(&raw_spec);
+                    let spec = resolve_window_spec(raw_spec);
                     let arg_exprs = match args {
                         FunctionArgs::List(exprs) => exprs.clone(),
                         FunctionArgs::Star => vec![],
                     };
                     #[allow(clippy::cast_possible_wrap)]
                     let num_args = arg_exprs.len() as i32;
-                    let func = registry.find_window(&name, num_args).ok_or_else(|| {
+                    let func = registry.find_window(name, num_args).ok_or_else(|| {
                         FrankenError::Internal(format!(
                             "no such window function: {name}/{num_args}"
                         ))
@@ -13865,13 +13863,13 @@ impl Connection {
                     win_filters.push(filter.as_deref().cloned());
                     col_kinds.push(ColKind::Window(idx));
                 }
-                ResultColumn::Expr { expr, .. } if expr_has_window_function(&expr) => {
+                ResultColumn::Expr { expr, .. } if expr_has_window_function(expr) => {
                     // The expression contains a nested window function
                     // (e.g., ROUND(AVG(val) OVER (...), 2)).  Extract the
                     // inner window call, register it, and wrap the outer
                     // expression with a placeholder.
                     let (inner_name, inner_args, raw_inner_spec, inner_filter) =
-                        extract_inner_window_function(&expr).ok_or_else(|| {
+                        extract_inner_window_function(expr).ok_or_else(|| {
                             FrankenError::Internal(
                                 "expr_has_window_function=true but cannot extract".to_owned(),
                             )
@@ -13923,7 +13921,7 @@ impl Connection {
                     win_frame_specs.push(inner_spec.frame.clone());
                     win_filters.push(inner_filter);
                     // Replace the inner window call with a placeholder in the outer expr.
-                    let outer_with_placeholder = replace_window_with_placeholder(&expr);
+                    let outer_with_placeholder = replace_window_with_placeholder(expr);
                     col_kinds.push(ColKind::WrappedWindow(idx, outer_with_placeholder));
                 }
                 ResultColumn::Expr { expr, .. } => {
@@ -15785,10 +15783,10 @@ impl Connection {
         let _ = params; // reserved for future use
 
         if query_plan {
-            return Ok(self.execute_explain_query_plan(&stmt));
+            return Ok(self.execute_explain_query_plan(stmt));
         }
 
-        let program = self.try_compile_statement(&stmt)?;
+        let program = self.try_compile_statement(stmt)?;
 
         let rows = program
             .ops()
@@ -25272,17 +25270,21 @@ fn extract_temporal_clause(select: &SelectStatement) -> Option<TimeTravelTarget>
         SelectCore::Values(_) => return None,
     };
     // Check the primary source table.
-    if let TableOrSubquery::Table { time_travel, .. } = &from.source {
-        if let Some(tt) = time_travel {
-            return Some(tt.target.clone());
-        }
+    if let TableOrSubquery::Table {
+        time_travel: Some(tt),
+        ..
+    } = &from.source
+    {
+        return Some(tt.target.clone());
     }
     // Check JOIN tables.
     for join in &from.joins {
-        if let TableOrSubquery::Table { time_travel, .. } = &join.table {
-            if let Some(tt) = time_travel {
-                return Some(tt.target.clone());
-            }
+        if let TableOrSubquery::Table {
+            time_travel: Some(tt),
+            ..
+        } = &join.table
+        {
+            return Some(tt.target.clone());
         }
     }
     None
@@ -25292,6 +25294,7 @@ fn extract_temporal_clause(select: &SelectStatement) -> Option<TimeTravelTarget>
 ///
 /// This produces a clean SELECT that can be executed against a historical
 /// MemDatabase snapshot without the VDBE seeing time-travel directives.
+#[allow(clippy::collapsible_match)]
 fn strip_temporal_clauses(select: &mut SelectStatement) {
     if let SelectCore::Select { ref mut from, .. } = select.body.select {
         if let Some(from) = from {
@@ -25329,7 +25332,7 @@ fn parse_timestamp_to_ns(ts: &str) -> Result<u64> {
 
     // Try ISO-8601 / SQLite datetime.
     let ts = ts.trim_end_matches('Z');
-    let parts: Vec<&str> = ts.splitn(2, |c| c == 'T' || c == ' ').collect();
+    let parts: Vec<&str> = ts.splitn(2, ['T', ' ']).collect();
     if parts.len() != 2 {
         return Err(FrankenError::Internal(format!(
             "time-travel: cannot parse timestamp '{ts}' — expected ISO-8601 or Unix seconds"
@@ -45764,7 +45767,11 @@ mod pager_routing_tests {
             .values()
             .iter()
             .any(|v| *v == SqliteValue::Text("Alice".into()));
-        assert!(alice_present, "seq 2 should contain Alice, got: {:?}", hist_2[0].values());
+        assert!(
+            alice_present,
+            "seq 2 should contain Alice, got: {:?}",
+            hist_2[0].values()
+        );
 
         // Historical: after seq 3 (Alice + Bob).
         let hist_3 = conn
@@ -45779,8 +45786,7 @@ mod pager_routing_tests {
         assert_eq!(hist_4.len(), 3, "seq 4 should have 3 rows");
 
         // Non-existent commit_seq returns an error.
-        let err = conn
-            .query("SELECT * FROM users FOR SYSTEM_TIME AS OF COMMITSEQ 999;");
+        let err = conn.query("SELECT * FROM users FOR SYSTEM_TIME AS OF COMMITSEQ 999;");
         assert!(err.is_err(), "non-existent commit_seq should error");
         let msg = format!("{}", err.unwrap_err());
         assert!(
@@ -45798,8 +45804,10 @@ mod pager_routing_tests {
             .unwrap();
 
         conn.execute("BEGIN;").unwrap();
-        conn.execute("INSERT INTO items VALUES (1, 'one');").unwrap();
-        conn.execute("INSERT INTO items VALUES (2, 'two');").unwrap();
+        conn.execute("INSERT INTO items VALUES (1, 'one');")
+            .unwrap();
+        conn.execute("INSERT INTO items VALUES (2, 'two');")
+            .unwrap();
         conn.execute("COMMIT;").unwrap();
         // seq 2: table has (1,'one'), (2,'two')
 
@@ -45816,7 +45824,11 @@ mod pager_routing_tests {
         let hist = conn
             .query("SELECT * FROM items FOR SYSTEM_TIME AS OF COMMITSEQ 2;")
             .unwrap();
-        assert_eq!(hist.len(), 2, "deleted row should be visible in historical snapshot");
+        assert_eq!(
+            hist.len(),
+            2,
+            "deleted row should be visible in historical snapshot"
+        );
     }
 
     #[test]
@@ -45840,7 +45852,10 @@ mod pager_routing_tests {
 
         // Current state: new_value
         let current = conn.query("SELECT v FROM kv WHERE k = 'key1';").unwrap();
-        assert_eq!(current[0].values()[0], SqliteValue::Text("new_value".into()));
+        assert_eq!(
+            current[0].values()[0],
+            SqliteValue::Text("new_value".into())
+        );
 
         // Historical seq 2: old_value
         let hist = conn
@@ -45872,7 +45887,11 @@ mod pager_routing_tests {
 
         // Live state should still have both rows.
         let live = conn.query("SELECT * FROM t;").unwrap();
-        assert_eq!(live.len(), 2, "live state must not be corrupted by time-travel query");
+        assert_eq!(
+            live.len(),
+            2,
+            "live state must not be corrupted by time-travel query"
+        );
     }
 
     #[test]
