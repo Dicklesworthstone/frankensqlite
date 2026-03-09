@@ -115,10 +115,11 @@ pub fn execute_checkpoint<F: VfsFile>(
 
     let mut frames_backfilled: u32 = 0;
     let mut last_db_size: Option<u32> = None;
-    let mut frame_buf = vec![0u8; wal.frame_size()];
+    let mut latest_frames: std::collections::HashMap<PageNumber, usize> = std::collections::HashMap::new();
 
+    // Pass 1: Find the latest frame index for each page in the checkpoint range.
     for frame_idx in start..end {
-        let header = wal.read_frame_into(cx, frame_idx, &mut frame_buf)?;
+        let header = wal.read_frame_header(cx, frame_idx)?;
 
         let page_no =
             PageNumber::new(header.page_number).ok_or_else(|| FrankenError::OutOfRange {
@@ -126,19 +127,28 @@ pub fn execute_checkpoint<F: VfsFile>(
                 value: header.page_number.to_string(),
             })?;
 
-        let page_data = &frame_buf[WAL_FRAME_HEADER_SIZE..];
-        target.write_page(cx, page_no, page_data)?;
+        latest_frames.insert(page_no, frame_idx);
         frames_backfilled += 1;
 
         if header.is_commit() && header.db_size > 0 {
             last_db_size = Some(header.db_size);
         }
+    }
+
+    // Pass 2: Write deduplicated pages in sorted order to minimize disk seeks.
+    let mut sorted_pages: Vec<(PageNumber, usize)> = latest_frames.into_iter().collect();
+    sorted_pages.sort_unstable_by_key(|(p, _)| p.get());
+
+    let mut frame_buf = vec![0u8; wal.frame_size()];
+    for (page_no, frame_idx) in sorted_pages {
+        wal.read_frame_into(cx, frame_idx, &mut frame_buf)?;
+        let page_data = &frame_buf[WAL_FRAME_HEADER_SIZE..];
+        target.write_page(cx, page_no, page_data)?;
 
         debug!(
             frame_idx,
-            page_number = header.page_number,
-            is_commit = header.is_commit(),
-            "checkpoint: frame backfilled"
+            page_number = page_no.get(),
+            "checkpoint: page backfilled"
         );
     }
 

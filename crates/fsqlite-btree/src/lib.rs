@@ -117,3 +117,4 @@ mod table_seek_bug_test;
 
 #[cfg(test)]
 mod index_seek_bug_test;
+mod index_seek_bug_test2;
