@@ -1337,7 +1337,7 @@ impl MemDbUndoOp {
 ///
 /// Maps root page numbers to in-memory tables. The Connection layer
 /// populates this when processing CREATE TABLE and passes it to the engine.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct MemDatabase {
     /// Tables indexed by root page number.
     pub tables: SwissIndex<i32, MemTable>,

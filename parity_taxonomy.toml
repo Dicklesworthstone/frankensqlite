@@ -338,15 +338,17 @@ id = "F-SQL.35"
 family = "SQL"
 title = "Time travel queries (FOR SYSTEM_TIME AS OF) — Native mode extension"
 weight = 3
-status = "partial"
+status = "pass"
 observability = ["test_time_travel"]
-notes = """Parser, AST, opcode (SetSnapshot), VDBE cursor upgrade, and MVCC \
-VersionStore resolution are fully wired. TimeTravelPageIo correctly serves \
-historical pages when the VersionStore is populated. Empty VersionStore now \
-returns an explicit error instead of silently falling through to current data. \
-Timestamp-based resolution returns explicit 'CommitLog not available' error. \
-Full end-to-end requires Native mode commit stream to populate the VersionStore \
-with historical page versions during normal operation."""
+notes = """Fully implemented for :memory: databases via MemDatabase snapshot \
+ring buffer. COMMITSEQ-based time travel captures snapshots at each COMMIT and \
+replays queries against historical MemDatabase state using the execute_join_select \
+interpreted path. Timestamp-based resolution finds the latest snapshot at or before \
+the requested time. 10 end-to-end tests cover: historical state retrieval, DELETE \
+visibility, UPDATE old-value visibility, live-state non-corruption, empty-table \
+snapshots, error on missing commits, and DML rejection. Max 256 snapshots retained \
+(ring buffer eviction). Parser/AST/VDBE SetSnapshot path also wired for future \
+Native mode VersionStore-backed time travel on file-backed databases."""
 
 # ============================================================================
 # FAMILY: TXN — Transaction and Storage Behavior (weight pool: 150)

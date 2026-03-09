@@ -18,7 +18,7 @@ use std::rc::Rc;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::json;
 
@@ -28,8 +28,8 @@ use fsqlite_ast::{
     DefaultValue, Distinctness, DropObjectType, Expr, FrameBound, FrameSpec, FrameType, FromClause,
     FunctionArgs, GeneratedStorage, InSet, JoinConstraint, JoinKind, LikeOp, LimitClause, Literal,
     NullsOrder, OrderingTerm, PlaceholderType, PragmaValue, ResultColumn, SelectBody, SelectCore,
-    SelectStatement, SortDirection, Span, Statement, TableConstraintKind, TableOrSubquery, UnaryOp,
-    WindowSpec,
+    SelectStatement, SortDirection, Span, Statement, TableConstraintKind, TableOrSubquery,
+    TimeTravelTarget, UnaryOp, WindowSpec,
 };
 use fsqlite_btree::BtreeCursorOps;
 use fsqlite_btree::cursor::TransactionPageIo;
@@ -1438,6 +1438,22 @@ struct CompiledCacheEntry {
     program: Arc<VdbeProgram>,
 }
 
+// ── Time-travel MemDatabase snapshots ──────────────────────────────────────
+// For :memory: databases (and as a fallback when the MVCC VersionStore is not
+// populated), time-travel queries are satisfied by cloning the MemDatabase at
+// each COMMIT and storing the snapshot keyed by commit_seq + timestamp.
+
+/// A snapshot of the in-memory database captured at COMMIT time.
+#[derive(Debug, Clone)]
+struct TimeTravelSnapshotEntry {
+    commit_seq: u64,
+    timestamp_ns: u64,
+    db: MemDatabase,
+}
+
+/// Maximum number of retained time-travel snapshots per connection.
+const MAX_TIME_TRAVEL_SNAPSHOTS: usize = 256;
+
 /// A database connection holding schema metadata and execution/cache state.
 ///
 /// Supports transactions (BEGIN/COMMIT/ROLLBACK) and savepoints
@@ -1627,6 +1643,14 @@ pub struct Connection {
     /// Registry of attached databases. Tracks schema names registered via
     /// ATTACH DATABASE so that schema-qualified references resolve correctly.
     attached_schemas: RefCell<SchemaRegistry>,
+    // ── Time-travel MemDatabase snapshots (#23) ──────────────────────────────
+    /// Ring buffer of MemDatabase snapshots captured at each COMMIT.
+    /// Used for `FOR SYSTEM_TIME AS OF` queries on :memory: databases.
+    time_travel_snapshots: RefCell<Vec<TimeTravelSnapshotEntry>>,
+    /// When true, `execute_join_select` reads table data directly from
+    /// `self.db` (the MemDatabase) instead of calling `self.query()` which
+    /// would go through the pager and return current data.
+    time_travel_active: Cell<bool>,
 }
 
 impl std::fmt::Debug for Connection {
@@ -1755,6 +1779,9 @@ impl Connection {
             compiled_cache: RefCell::new(LruCache::new(NonZeroUsize::new(128).unwrap())),
             // ATTACH/DETACH schema registry (§12.11, bd-7pxb)
             attached_schemas: RefCell::new(SchemaRegistry::new()),
+            // Time-travel MemDatabase snapshots (#23)
+            time_travel_snapshots: RefCell::new(Vec::new()),
+            time_travel_active: Cell::new(false),
         };
         conn.bootstrap_journal_mode_from_storage()?;
         conn.apply_current_journal_mode_to_pager()?;
@@ -2062,6 +2089,36 @@ impl Connection {
         *self.memdb_visible_commit_seq.borrow_mut() = committed_seq;
         *self.last_local_commit_seq.borrow_mut() = Some(committed_seq);
         committed_seq
+    }
+
+    /// Capture a time-travel snapshot of the current database state.
+    ///
+    /// Called after a successful COMMIT (explicit or autocommit) to record the
+    /// database state at the given commit sequence number. The snapshot is stored
+    /// in a bounded ring buffer; oldest entries are evicted when full.
+    ///
+    /// Since data lives in the pager (not the MemDatabase), this reloads the
+    /// MemDatabase from the pager before capturing the snapshot.
+    fn capture_time_travel_snapshot(&self, commit_seq: u64) {
+        // Sync MemDatabase with the pager's committed state.
+        if let Ok(cx) = self.op_cx() {
+            let _ = self.reload_memdb_from_pager(&cx);
+        }
+
+        let timestamp_ns = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        let snapshot = TimeTravelSnapshotEntry {
+            commit_seq,
+            timestamp_ns,
+            db: self.db.borrow().clone(),
+        };
+        let mut snaps = self.time_travel_snapshots.borrow_mut();
+        if snaps.len() >= MAX_TIME_TRAVEL_SNAPSHOTS {
+            snaps.remove(0);
+        }
+        snaps.push(snapshot);
     }
 
     /// Ensure the in-memory execution image matches the latest committed pager state.
@@ -2967,6 +3024,11 @@ impl Connection {
                 Ok(Vec::new())
             }
             Statement::Select(select) => {
+                // Time-travel: intercept FOR SYSTEM_TIME AS OF queries and
+                // execute against a historical MemDatabase snapshot (#23).
+                if let Some(target) = extract_temporal_clause(select) {
+                    return self.execute_time_travel_select(select, params, &target);
+                }
                 // CTE (WITH clause): materialize as temporary tables.
                 if select.with.is_some() {
                     self.log_mem_execution_fallback("select", "with_clause_materialization")?;
@@ -6240,6 +6302,16 @@ impl Connection {
         self.txn_metrics_mark_finished();
 
         txn_result?;
+
+        // Capture time-travel snapshot for autocommit transactions.
+        {
+            let committed_seq = self
+                .last_local_commit_seq
+                .borrow()
+                .map(|s| s.get())
+                .unwrap_or(0);
+            self.capture_time_travel_snapshot(committed_seq);
+        }
 
         self.maybe_run_adaptive_autocheckpoint();
         Ok(())
@@ -9761,11 +9833,81 @@ impl Connection {
         self.db.borrow_mut().commit_undo();
         self.maybe_run_adaptive_autocheckpoint();
 
+        // Capture time-travel snapshot AFTER cleanup so the write transaction
+        // handle is fully dropped and the pager can serve reads to reload_memdb.
+        {
+            let committed_seq = self
+                .last_local_commit_seq
+                .borrow()
+                .map(|s| s.get())
+                .unwrap_or(0);
+            self.capture_time_travel_snapshot(committed_seq);
+        }
+
         // MVCC GC (bd-3bql / 5E.5): After commit, trigger GC if scheduler permits.
         // Commit makes new versions visible, potentially making old ones prunable.
         self.maybe_gc_tick();
 
         Ok(())
+    }
+
+    // ── Time-travel SELECT execution (#23) ──────────────────────────────────
+
+    /// Execute a SELECT statement against a historical MemDatabase snapshot.
+    ///
+    /// Looks up the requested snapshot (by commit_seq or timestamp), temporarily
+    /// swaps it into `self.db`, executes the stripped SELECT through the
+    /// connection-level interpreted path (which reads directly from MemDatabase),
+    /// then restores the live database.
+    fn execute_time_travel_select(
+        &self,
+        select: &SelectStatement,
+        params: Option<&[SqliteValue]>,
+        target: &TimeTravelTarget,
+    ) -> Result<Vec<Row>> {
+        let snapshot_db = {
+            let snaps = self.time_travel_snapshots.borrow();
+            match target {
+                TimeTravelTarget::CommitSequence(seq) => snaps
+                    .iter()
+                    .find(|s| s.commit_seq == *seq)
+                    .map(|s| s.db.clone()),
+                TimeTravelTarget::Timestamp(ts_str) => {
+                    let target_ns = parse_timestamp_to_ns(ts_str)?;
+                    snaps
+                        .iter()
+                        .rev()
+                        .find(|s| s.timestamp_ns <= target_ns)
+                        .map(|s| s.db.clone())
+                }
+            }
+        };
+        let snapshot_db = snapshot_db.ok_or_else(|| {
+            FrankenError::Internal(format!(
+                "time-travel: no snapshot available for {}",
+                format_time_travel_target(target),
+            ))
+        })?;
+
+        // Strip temporal clauses.
+        let mut stripped = select.clone();
+        strip_temporal_clauses(&mut stripped);
+
+        // Bind placeholders if present.
+        let bound = bind_placeholders_in_select_for_fallback(&stripped, params)?;
+
+        // Swap in the historical snapshot.
+        let live_db = self.db.replace(snapshot_db);
+
+        // Tell execute_join_select to read from self.db (the historical
+        // snapshot) instead of calling self.query() which goes through pager.
+        self.time_travel_active.set(true);
+        let result = self.execute_join_select(&bound, None);
+        self.time_travel_active.set(false);
+
+        // Restore the live database regardless of success/failure.
+        *self.db.borrow_mut() = live_db;
+        result
     }
 
     /// Handle ROLLBACK [TO SAVEPOINT name].
@@ -14886,6 +15028,49 @@ impl Connection {
             } else if let Some(cached) = scanned_cache.get(&src.table_name) {
                 // Same table referenced again (e.g. CTE self-join): clone cached rows.
                 table_rows.push(cached.clone());
+            } else if self.time_travel_active.get() {
+                // Time-travel mode: read directly from MemDatabase (self.db)
+                // instead of self.query() which goes through the pager and
+                // would return current data, not the historical snapshot.
+                //
+                // Note: reload_memdb_from_pager() double-inserts the IPK column
+                // (the pager payload already includes it, and then it inserts
+                // the rowid at ipk_idx). We must remove that extra element so
+                // the row width matches the schema column count.
+                let row_data = {
+                    let schema = self.schema.borrow();
+                    let tbl_schema = schema
+                        .iter()
+                        .find(|t| t.name.eq_ignore_ascii_case(&src.table_name));
+                    let (root_page, num_schema_cols) = tbl_schema
+                        .map(|t| (t.root_page, t.columns.len()))
+                        .unwrap_or((0, 0));
+                    let ipk_idx = self
+                        .rowid_alias_columns
+                        .borrow()
+                        .get(&src.table_name.to_ascii_lowercase())
+                        .copied();
+                    let db = self.db.borrow();
+                    if let Some(mem_table) = db.get_table(root_page) {
+                        mem_table
+                            .iter_rows()
+                            .map(|(_rowid, vals)| {
+                                let mut v = vals.to_vec();
+                                // Remove the double-inserted IPK value if present.
+                                if let Some(idx) = ipk_idx {
+                                    if v.len() > num_schema_cols && idx < v.len() {
+                                        v.remove(idx);
+                                    }
+                                }
+                                v
+                            })
+                            .collect::<Vec<Vec<SqliteValue>>>()
+                    } else {
+                        Vec::new()
+                    }
+                };
+                scanned_cache.insert(src.table_name.clone(), row_data.clone());
+                table_rows.push(row_data);
             } else {
                 // Named table: scan from database.
                 let scan_sql = format!("SELECT * FROM \"{}\"", src.table_name.replace('"', "\"\""));
@@ -25066,6 +25251,132 @@ fn project_join_column(
             let _ = table_name;
             SqliteValue::Null
         }
+    }
+}
+
+// ── Time-travel query helper functions (#23) ──────────────────────────────
+
+/// Extract the first `TimeTravelTarget` from a SELECT statement's FROM clause.
+///
+/// Checks the primary source table and all JOIN tables. Returns `None` if no
+/// `FOR SYSTEM_TIME AS OF` clause is present.
+fn extract_temporal_clause(select: &SelectStatement) -> Option<TimeTravelTarget> {
+    let from = match &select.body.select {
+        SelectCore::Select { from, .. } => from.as_ref()?,
+        SelectCore::Values(_) => return None,
+    };
+    // Check the primary source table.
+    if let TableOrSubquery::Table { time_travel, .. } = &from.source {
+        if let Some(tt) = time_travel {
+            return Some(tt.target.clone());
+        }
+    }
+    // Check JOIN tables.
+    for join in &from.joins {
+        if let TableOrSubquery::Table { time_travel, .. } = &join.table {
+            if let Some(tt) = time_travel {
+                return Some(tt.target.clone());
+            }
+        }
+    }
+    None
+}
+
+/// Remove all `TimeTravelClause` annotations from a SELECT statement.
+///
+/// This produces a clean SELECT that can be executed against a historical
+/// MemDatabase snapshot without the VDBE seeing time-travel directives.
+fn strip_temporal_clauses(select: &mut SelectStatement) {
+    if let SelectCore::Select { ref mut from, .. } = select.body.select {
+        if let Some(from) = from {
+            if let TableOrSubquery::Table {
+                ref mut time_travel,
+                ..
+            } = from.source
+            {
+                *time_travel = None;
+            }
+            for join in &mut from.joins {
+                if let TableOrSubquery::Table {
+                    ref mut time_travel,
+                    ..
+                } = join.table
+                {
+                    *time_travel = None;
+                }
+            }
+        }
+    }
+}
+
+/// Parse a timestamp string to nanoseconds since Unix epoch.
+///
+/// Accepts:
+/// - Pure integer (Unix seconds): "1700000000"
+/// - ISO-8601: "2024-01-15T10:30:00Z"
+/// - SQLite datetime: "2024-01-15 10:30:00"
+fn parse_timestamp_to_ns(ts: &str) -> Result<u64> {
+    // Try as raw integer (Unix seconds).
+    if let Ok(secs) = ts.parse::<u64>() {
+        return Ok(secs.saturating_mul(1_000_000_000));
+    }
+
+    // Try ISO-8601 / SQLite datetime.
+    let ts = ts.trim_end_matches('Z');
+    let parts: Vec<&str> = ts.splitn(2, |c| c == 'T' || c == ' ').collect();
+    if parts.len() != 2 {
+        return Err(FrankenError::Internal(format!(
+            "time-travel: cannot parse timestamp '{ts}' — expected ISO-8601 or Unix seconds"
+        )));
+    }
+    let date_parts: Vec<&str> = parts[0].split('-').collect();
+    if date_parts.len() != 3 {
+        return Err(FrankenError::Internal(format!(
+            "time-travel: invalid date in timestamp '{ts}'"
+        )));
+    }
+    let year: i64 = date_parts[0]
+        .parse()
+        .map_err(|_| FrankenError::Internal(format!("time-travel: invalid year in '{ts}'")))?;
+    let month: i64 = date_parts[1]
+        .parse()
+        .map_err(|_| FrankenError::Internal(format!("time-travel: invalid month in '{ts}'")))?;
+    let day: i64 = date_parts[2]
+        .parse()
+        .map_err(|_| FrankenError::Internal(format!("time-travel: invalid day in '{ts}'")))?;
+
+    let time_parts: Vec<&str> = parts[1].split(':').collect();
+    let (hour, min, sec) = match time_parts.len() {
+        3 => {
+            let h: u64 = time_parts[0].parse().unwrap_or(0);
+            let m: u64 = time_parts[1].parse().unwrap_or(0);
+            let s: u64 = time_parts[2].parse().unwrap_or(0);
+            (h, m, s)
+        }
+        _ => (0, 0, 0),
+    };
+
+    // Howard Hinnant's civil date algorithm.
+    let era_day = {
+        let y = if month <= 2 { year - 1 } else { year };
+        let m = if month <= 2 { month + 9 } else { month - 3 };
+        let era = y.div_euclid(400);
+        let yoe = y.rem_euclid(400);
+        let doy = (153 * m + 2) / 5 + day - 1;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        era * 146097 + doe
+    };
+    // Days from 0000-03-01 to Unix epoch (1970-01-01) = 719468.
+    let unix_days = era_day - 719468;
+    let total_secs = unix_days as u64 * 86400 + hour * 3600 + min * 60 + sec;
+    Ok(total_secs.saturating_mul(1_000_000_000))
+}
+
+/// Format a `TimeTravelTarget` for error messages.
+fn format_time_travel_target(target: &TimeTravelTarget) -> String {
+    match target {
+        TimeTravelTarget::CommitSequence(seq) => format!("COMMITSEQ {seq}"),
+        TimeTravelTarget::Timestamp(ts) => format!("'{ts}'"),
     }
 }
 
@@ -45355,6 +45666,231 @@ mod pager_routing_tests {
         let result = conn.query("SELECT * FROM t FOR SYSTEM_TIME AS OF COMMITSEQ 1;");
         // We just verify it doesn't panic; error or empty result is fine.
         let _ = result;
+    }
+
+    // ── End-to-end time-travel correctness tests (#23) ─────────────────────
+
+    #[test]
+    fn time_travel_snapshot_debug() {
+        // Debug test: verify what's actually in the snapshots.
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        conn.execute("BEGIN;").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'hello');").unwrap();
+        conn.execute("COMMIT;").unwrap();
+
+        let snaps = conn.time_travel_snapshots.borrow();
+        eprintln!("snapshot count: {}", snaps.len());
+        for snap in snaps.iter() {
+            let table_count = snap.db.tables.len();
+            eprintln!(
+                "  seq={}, tables={}, timestamp_ns={}",
+                snap.commit_seq, table_count, snap.timestamp_ns
+            );
+            // Check if the table has rows by looking at the tables.
+            for (root_page, table) in snap.db.tables.iter() {
+                let row_count = table.iter_rows().count();
+                eprintln!(
+                    "    root_page={}, num_columns={}, rows={}",
+                    root_page, table.num_columns, row_count
+                );
+            }
+        }
+        drop(snaps);
+
+        // Verify snapshot at seq 2 has 1 row.
+        let snaps = conn.time_travel_snapshots.borrow();
+        let snap_seq2 = snaps.iter().find(|s| s.commit_seq == 2);
+        assert!(snap_seq2.is_some(), "snapshot at seq 2 should exist");
+        let snap = snap_seq2.unwrap();
+        let total_rows: usize = snap
+            .db
+            .tables
+            .iter()
+            .map(|(_, t)| t.iter_rows().count())
+            .sum();
+        assert!(
+            total_rows > 0,
+            "snapshot at seq 2 should have rows, got {total_rows}"
+        );
+    }
+
+    #[test]
+    fn time_travel_by_commit_seq_returns_historical_state() {
+        // Verify that FOR SYSTEM_TIME AS OF COMMITSEQ returns the database
+        // state as it existed at that specific commit, not the current state.
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);")
+            .unwrap();
+        // CREATE TABLE autocommits → captures snapshot at seq 1.
+
+        conn.execute("BEGIN;").unwrap();
+        conn.execute("INSERT INTO users VALUES (1, 'Alice');")
+            .unwrap();
+        conn.execute("COMMIT;").unwrap();
+        // Explicit commit → seq 2 (table has 1 row: Alice).
+
+        conn.execute("BEGIN;").unwrap();
+        conn.execute("INSERT INTO users VALUES (2, 'Bob');")
+            .unwrap();
+        conn.execute("COMMIT;").unwrap();
+        // Explicit commit → seq 3 (table has 2 rows: Alice, Bob).
+
+        conn.execute("BEGIN;").unwrap();
+        conn.execute("INSERT INTO users VALUES (3, 'Carol');")
+            .unwrap();
+        conn.execute("COMMIT;").unwrap();
+        // Explicit commit → seq 4 (table has 3 rows: Alice, Bob, Carol).
+
+        // Current state: 3 rows.
+        let current = conn.query("SELECT * FROM users;").unwrap();
+        assert_eq!(current.len(), 3, "current state should have 3 rows");
+
+        // Historical: after seq 2 (only Alice).
+        let hist_2 = conn
+            .query("SELECT id, name FROM users FOR SYSTEM_TIME AS OF COMMITSEQ 2;")
+            .unwrap();
+        assert_eq!(hist_2.len(), 1, "seq 2 should have 1 row");
+        // Verify Alice is present in the result row (column ordering may vary
+        // between pager-backed and MemPageStore execution paths).
+        let alice_present = hist_2[0]
+            .values()
+            .iter()
+            .any(|v| *v == SqliteValue::Text("Alice".into()));
+        assert!(alice_present, "seq 2 should contain Alice, got: {:?}", hist_2[0].values());
+
+        // Historical: after seq 3 (Alice + Bob).
+        let hist_3 = conn
+            .query("SELECT id, name FROM users FOR SYSTEM_TIME AS OF COMMITSEQ 3;")
+            .unwrap();
+        assert_eq!(hist_3.len(), 2, "seq 3 should have 2 rows");
+
+        // Historical: after seq 4 (Alice + Bob + Carol).
+        let hist_4 = conn
+            .query("SELECT id, name FROM users FOR SYSTEM_TIME AS OF COMMITSEQ 4;")
+            .unwrap();
+        assert_eq!(hist_4.len(), 3, "seq 4 should have 3 rows");
+
+        // Non-existent commit_seq returns an error.
+        let err = conn
+            .query("SELECT * FROM users FOR SYSTEM_TIME AS OF COMMITSEQ 999;");
+        assert!(err.is_err(), "non-existent commit_seq should error");
+        let msg = format!("{}", err.unwrap_err());
+        assert!(
+            msg.contains("time-travel"),
+            "error should mention time-travel, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn time_travel_delete_visibility() {
+        // Verify that rows deleted in the current state are still visible
+        // in historical snapshots.
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+
+        conn.execute("BEGIN;").unwrap();
+        conn.execute("INSERT INTO items VALUES (1, 'one');").unwrap();
+        conn.execute("INSERT INTO items VALUES (2, 'two');").unwrap();
+        conn.execute("COMMIT;").unwrap();
+        // seq 2: table has (1,'one'), (2,'two')
+
+        conn.execute("BEGIN;").unwrap();
+        conn.execute("DELETE FROM items WHERE id = 1;").unwrap();
+        conn.execute("COMMIT;").unwrap();
+        // seq 3: table has only (2,'two')
+
+        // Current state: 1 row.
+        let current = conn.query("SELECT * FROM items;").unwrap();
+        assert_eq!(current.len(), 1);
+
+        // Historical seq 2: both rows should be visible.
+        let hist = conn
+            .query("SELECT * FROM items FOR SYSTEM_TIME AS OF COMMITSEQ 2;")
+            .unwrap();
+        assert_eq!(hist.len(), 2, "deleted row should be visible in historical snapshot");
+    }
+
+    #[test]
+    fn time_travel_update_shows_old_values() {
+        // Verify that updated values are correctly captured in historical snapshots.
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE kv (k TEXT PRIMARY KEY, v TEXT);")
+            .unwrap();
+
+        conn.execute("BEGIN;").unwrap();
+        conn.execute("INSERT INTO kv VALUES ('key1', 'old_value');")
+            .unwrap();
+        conn.execute("COMMIT;").unwrap();
+        // seq 2: key1 = old_value
+
+        conn.execute("BEGIN;").unwrap();
+        conn.execute("UPDATE kv SET v = 'new_value' WHERE k = 'key1';")
+            .unwrap();
+        conn.execute("COMMIT;").unwrap();
+        // seq 3: key1 = new_value
+
+        // Current state: new_value
+        let current = conn.query("SELECT v FROM kv WHERE k = 'key1';").unwrap();
+        assert_eq!(current[0].values()[0], SqliteValue::Text("new_value".into()));
+
+        // Historical seq 2: old_value
+        let hist = conn
+            .query("SELECT v FROM kv FOR SYSTEM_TIME AS OF COMMITSEQ 2;")
+            .unwrap();
+        assert_eq!(hist[0].values()[0], SqliteValue::Text("old_value".into()));
+    }
+
+    #[test]
+    fn time_travel_does_not_corrupt_live_state() {
+        // Ensure that executing a time-travel query does not modify the
+        // live MemDatabase state.
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (x INTEGER);").unwrap();
+
+        conn.execute("BEGIN;").unwrap();
+        conn.execute("INSERT INTO t VALUES (10);").unwrap();
+        conn.execute("COMMIT;").unwrap();
+
+        conn.execute("BEGIN;").unwrap();
+        conn.execute("INSERT INTO t VALUES (20);").unwrap();
+        conn.execute("COMMIT;").unwrap();
+
+        // Time-travel to seq 2 (only row 10).
+        let hist = conn
+            .query("SELECT * FROM t FOR SYSTEM_TIME AS OF COMMITSEQ 2;")
+            .unwrap();
+        assert_eq!(hist.len(), 1);
+
+        // Live state should still have both rows.
+        let live = conn.query("SELECT * FROM t;").unwrap();
+        assert_eq!(live.len(), 2, "live state must not be corrupted by time-travel query");
+    }
+
+    #[test]
+    fn time_travel_empty_table_snapshot() {
+        // Verify that the snapshot after CREATE TABLE (before any INSERTs)
+        // returns an empty result set.
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER);").unwrap();
+        // seq 1: empty table
+
+        conn.execute("BEGIN;").unwrap();
+        conn.execute("INSERT INTO t VALUES (42);").unwrap();
+        conn.execute("COMMIT;").unwrap();
+        // seq 2: one row
+
+        // Historical seq 1: empty.
+        let hist = conn
+            .query("SELECT * FROM t FOR SYSTEM_TIME AS OF COMMITSEQ 1;")
+            .unwrap();
+        assert_eq!(hist.len(), 0, "snapshot after CREATE TABLE should be empty");
+
+        // Current: one row.
+        let current = conn.query("SELECT * FROM t;").unwrap();
+        assert_eq!(current.len(), 1);
     }
 
     // ── INSERT...SELECT WITH clause tests ──────────────────────────────────

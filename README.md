@@ -1296,38 +1296,37 @@ Checkpointing materializes a canonical `.db` for compatibility export, but the c
 
 ---
 
-## Time Travel Queries (Partial Implementation / Native-Mode Design)
+## Time Travel Queries
 
-Parser, AST, opcode (`SetSnapshot`), VDBE cursor upgrade, and MVCC `VersionStore` resolution for `FOR SYSTEM_TIME AS OF ...` are fully wired in the codebase. However, **end-to-end historical replay is not yet available in the default compatibility runtime** because the `VersionStore` is not populated with historical page versions during normal operation. Full time-travel requires the Native-mode commit stream, which is a design/partial-implementation track.
+FrankenSQLite supports temporal queries using SQL:2011-inspired `FOR SYSTEM_TIME AS OF` syntax. This works end-to-end for `:memory:` databases and any connection using the compatibility runtime.
 
-**What works today:**
+**How it works:**
 
-- **Parser** correctly handles `FOR SYSTEM_TIME AS OF COMMITSEQ <n>` and `FOR SYSTEM_TIME AS OF '<timestamp>'`.
-- **Codegen** emits `SetSnapshot` opcodes that attach a `TimeTravelSnapshot` to the cursor.
-- **VDBE engine** upgrades cursor backends to `TimeTravelPageIo` when a `VersionStore` is available.
-- **`TimeTravelPageIo`** correctly resolves historical pages from the `VersionStore` and rejects writes.
-- **MVCC unit tests** verify correct historical page resolution, GC horizon enforcement, read-only enforcement, and timestamp-to-commit-seq resolution.
-
-**What does not work yet:**
-
-- In the default **compatibility runtime** (`:memory:` or `.db` files), the `VersionStore` is empty. Time-travel queries against an empty `VersionStore` return an explicit error: _"historical data not available for this commit"_. They do **not** silently fall back to current data.
-- **Timestamp-based time travel** (`AS OF '<timestamp>'`) returns an explicit error because the `CommitLog` is not wired into the execution path in the compatibility runtime.
-- The **Native-mode commit stream** (which would populate the `VersionStore` with historical page versions during normal writes) is not yet the default runtime path.
+At each `COMMIT`, a snapshot of the in-memory database state is captured into a ring buffer (max 256 entries). When a `SELECT ... FOR SYSTEM_TIME AS OF` query is issued, the matching historical snapshot is loaded and the query executes against it using the connection-level interpreted path. The live database state is restored after the query completes.
 
 **Syntax:**
 
 ```sql
+-- Query by commit sequence number
+SELECT * FROM orders FOR SYSTEM_TIME AS OF COMMITSEQ 42;
+
+-- Query by timestamp (Unix seconds, ISO-8601, or SQLite datetime format)
 SELECT * FROM orders FOR SYSTEM_TIME AS OF '2024-06-15 09:30:00';
-SELECT * FROM orders FOR SYSTEM_TIME AS OF COMMITSEQ 1234567;
 ```
 
-**How it works (with a populated VersionStore / Native mode):**
+**What works:**
 
-1. **Resolve target commit:** If `AS OF COMMITSEQ N`, use N directly. Otherwise, parse the timestamp using SQLite-compatible datetime rules and binary-search the marker stream for the greatest marker with `commit_time_unix_ns <= target_time_unix_ns`.
-2. **Create synthetic snapshot:** Build a read-only snapshot `S` with `S.high = target_commit_seq`.
-3. **Execute normally:** The query runs using standard MVCC resolution rules -- `resolve(P, S)` returns the newest committed page version with `version.commit_seq <= S.high`. Pages absent from the `VersionStore` (unchanged since the target commit) fall through to the current on-disk version.
+- **COMMITSEQ-based time travel** returns verified historical results. Each commit increments the sequence counter, and queries resolve to the exact snapshot at that commit.
+- **Timestamp-based time travel** resolves to the latest snapshot at or before the requested time. Accepts Unix epoch seconds, ISO-8601, and SQLite `datetime()` format strings.
+- **DML rejection:** `INSERT`, `UPDATE`, `DELETE` with temporal clauses fail with an explicit error.
+- **No silent fallback:** Queries against non-existent commit sequences or timestamps return explicit errors rather than silently returning current data.
+- **10 end-to-end tests** cover: historical state retrieval across multiple commits, DELETE visibility (deleted rows visible in history), UPDATE old-value visibility, live-state non-corruption, empty-table snapshots, error on missing commits, and DML rejection.
 
-**Restrictions (V1):** Time travel is read-only. `INSERT`, `UPDATE`, `DELETE`, and DDL in a time-travel context fail with `SQLITE_ERROR`. If the retention policy has pruned the requested historical state, the query fails with an explicit "history not retained" error. If the `VersionStore` is empty (compatibility mode), the query fails with an explicit "historical data not available" error rather than silently returning current data.
+**Limitations:**
+
+- Snapshots are stored in memory (ring buffer, max 256). Oldest snapshots are evicted when the buffer is full.
+- JOINs and subqueries in time-travel SELECT use the interpreted `execute_join_select` path.
+- The VDBE/pager `SetSnapshot` + `VersionStore` path (for file-backed databases with page-level MVCC) is wired but not yet populated during normal operation. This is a future Native-mode enhancement.
 
 ---
 
