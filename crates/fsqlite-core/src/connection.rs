@@ -8,6 +8,7 @@
 //! cutover work continues.
 
 use lru::LruCache;
+use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
@@ -2384,7 +2385,7 @@ impl Connection {
             let _parse_guard = parse_span.enter();
             self.cached_parse_single(sql)?
         };
-        self.execute_statement(statement, Some(params))
+        self.execute_statement(statement.as_ref(), Some(params))
     }
 
     /// Prepare and execute SQL as a query, returning exactly one row.
@@ -2448,10 +2449,10 @@ impl Connection {
             self.cached_parse_single(sql)?
         };
         let is_dml = matches!(
-            &statement,
+            statement.as_ref(),
             Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
         );
-        let rows = self.execute_statement(&statement, Some(params))?;
+        let rows = self.execute_statement(statement.as_ref(), Some(params))?;
         Ok(if is_dml {
             *self.last_changes.borrow()
         } else {
@@ -2484,7 +2485,7 @@ impl Connection {
             } else {
                 Some(params)
             };
-            let rows = self.execute_statement(dml, p)?;
+            let rows = self.execute_statement_impl(dml, p, Some(&stmt.program))?;
             let is_dml = matches!(
                 dml,
                 Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
@@ -2522,7 +2523,9 @@ impl Connection {
             return Ok(std::sync::Arc::clone(&cached.statement));
         }
         let stmt = parse_single_statement(sql)?;
-        Ok(std::sync::Arc::clone(&self.insert_parse_cache(key, sql, stmt).statement))
+        Ok(std::sync::Arc::clone(
+            &self.insert_parse_cache(key, sql, stmt).statement,
+        ))
     }
 
     /// Return cached parsed multi-statement list, or parse fresh.
@@ -2781,11 +2784,23 @@ impl Connection {
     /// Execute a parsed statement, handling both DDL (CREATE TABLE) and
     /// DML (SELECT/INSERT/UPDATE/DELETE).
     #[allow(clippy::too_many_lines)]
+
     fn execute_statement(
         &self,
         statement: &Statement,
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Row>> {
+        self.execute_statement_impl(statement, params, None)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn execute_statement_impl(
+        &self,
+        statement: &Statement,
+        params: Option<&[SqliteValue]>,
+        precompiled: Option<&VdbeProgram>,
+    ) -> Result<Vec<Row>> {
+
         self.sync_change_tracking_context();
         let statement_kind = match &statement {
             Statement::Select(_) => "select",
@@ -2893,10 +2908,10 @@ impl Connection {
             );
         let result = if use_statement_savepoint {
             self.with_internal_statement_savepoint(statement_kind, || {
-                self.execute_statement_dispatch(statement.as_ref(), params)
+                self.execute_statement_dispatch_impl(statement.as_ref(), params, precompiled)
             })
         } else {
-            self.execute_statement_dispatch(statement.as_ref(), params)
+            self.execute_statement_dispatch_impl(statement.as_ref(), params, precompiled)
         };
         let ok = result.is_ok();
         self.resolve_autocommit_txn(was_auto, ok)?;
@@ -2924,23 +2939,35 @@ impl Connection {
     /// Inner dispatch for `execute_statement` — separated so that
     /// autocommit wrapping can bracket the entire execution.
     #[allow(clippy::too_many_lines)]
+
     fn execute_statement_dispatch(
         &self,
         statement: &Statement,
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Row>> {
+        self.execute_statement_dispatch_impl(statement, params, None)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn execute_statement_dispatch_impl(
+        &self,
+        statement: &Statement,
+        params: Option<&[SqliteValue]>,
+        precompiled: Option<&VdbeProgram>,
+    ) -> Result<Vec<Row>> {
+
         match statement {
             Statement::CreateTable(create) => {
                 self.execute_create_table(create)?;
                 // 5D.4: Persistence now handled by pager WAL, not compat_persist.
                 Ok(Vec::new())
             }
-            Statement::CreateVirtualTable(ref create_virtual) => {
+            Statement::CreateVirtualTable(create_virtual) => {
                 self.execute_create_virtual_table(create_virtual)?;
                 // 5D.4: Persistence now handled by pager WAL, not compat_persist.
                 Ok(Vec::new())
             }
-            Statement::Select(ref select) => {
+            Statement::Select(select) => {
                 // CTE (WITH clause): materialize as temporary tables.
                 if select.with.is_some() {
                     self.log_mem_execution_fallback("select", "with_clause_materialization")?;
@@ -3138,7 +3165,7 @@ impl Connection {
                     Ok(rows)
                 }
             }
-            Statement::Insert(ref insert) => {
+            Statement::Insert(insert) => {
                 // FTS5 maintenance command compatibility:
                 //   INSERT INTO <table>(<table>) VALUES('optimize')
                 // is treated as a no-op in this compatibility path.
@@ -3251,7 +3278,10 @@ impl Connection {
                 // from the pager, we can re-enable it for performance.
                 // For now, fall through to VDBE execution.
 
-                let program = {
+                let arc_prog;
+                let program: &VdbeProgram = if let Some(p) = precompiled {
+                    p
+                } else {
                     let plan_span = tracing::span!(
                         target: "fsqlite.plan",
                         tracing::Level::TRACE,
@@ -3262,11 +3292,12 @@ impl Connection {
                     let _plan_guard = plan_span.enter();
                     let sql_text = statement.to_string();
                     let sql_key = Self::sql_hash(&sql_text);
-                    self.compile_with_cache(sql_key, &sql_text, |conn| {
+                    arc_prog = self.compile_with_cache(sql_key, &sql_text, |conn| {
                         conn.compile_table_insert(insert)
-                    })?
+                    })?;
+                    &arc_prog
                 };
-                let (rows, affected, _) = self.execute_table_program(&program, params)?;
+                let (rows, affected, _) = self.execute_table_program(program, params)?;
 
                 // bd-thqgm: FK constraint checking on INSERT.
                 if self.fk_enforcement_enabled() {
@@ -3316,7 +3347,7 @@ impl Connection {
                     Ok(rows)
                 }
             }
-            Statement::Update(ref update) => {
+            Statement::Update(update) => {
                 // CTE (WITH clause): materialize CTEs as temporary tables,
                 // then execute the UPDATE with the WITH clause stripped.
                 if update.with.is_some() {
@@ -3438,7 +3469,7 @@ impl Connection {
                     Ok(rows)
                 }
             }
-            Statement::Delete(ref delete) => {
+            Statement::Delete(delete) => {
                 // CTE (WITH clause): materialize CTEs as temporary tables,
                 // then execute the DELETE with the WITH clause stripped.
                 if delete.with.is_some() {
@@ -3548,46 +3579,46 @@ impl Connection {
                 self.execute_commit()?;
                 Ok(Vec::new())
             }
-            Statement::Rollback(ref rb) => {
+            Statement::Rollback(rb) => {
                 self.execute_rollback(rb)?;
                 // 5D.4: Persistence now handled by pager WAL, not compat_persist.
                 Ok(Vec::new())
             }
-            Statement::Savepoint(ref name) => {
+            Statement::Savepoint(name) => {
                 self.execute_savepoint(name)?;
                 Ok(Vec::new())
             }
-            Statement::Release(ref name) => {
+            Statement::Release(name) => {
                 self.execute_release(name)?;
                 Ok(Vec::new())
             }
-            Statement::Pragma(ref pragma) => self.execute_pragma(pragma),
-            Statement::Drop(ref drop_stmt) => {
+            Statement::Pragma(pragma) => self.execute_pragma(pragma),
+            Statement::Drop(drop_stmt) => {
                 self.execute_drop(drop_stmt)?;
                 // 5D.4: Persistence now handled by pager WAL, not compat_persist.
                 Ok(Vec::new())
             }
-            Statement::AlterTable(ref alter) => {
+            Statement::AlterTable(alter) => {
                 self.execute_alter_table(alter)?;
                 // 5D.4: Persistence now handled by pager WAL, not compat_persist.
                 Ok(Vec::new())
             }
-            Statement::CreateIndex(ref create_idx) => {
+            Statement::CreateIndex(create_idx) => {
                 self.execute_create_index(create_idx)?;
                 // 5D.4: Persistence now handled by pager WAL, not compat_persist.
                 Ok(Vec::new())
             }
-            Statement::CreateView(ref create_view) => {
+            Statement::CreateView(create_view) => {
                 self.execute_create_view(create_view)?;
                 Ok(Vec::new())
             }
-            Statement::CreateTrigger(ref create_trigger) => {
+            Statement::CreateTrigger(create_trigger) => {
                 self.execute_create_trigger(create_trigger)?;
                 Ok(Vec::new())
             }
             // VACUUM INTO copies the database to a new file.
             // Plain VACUUM is a no-op for now (defragmentation not implemented).
-            Statement::Vacuum(ref vacuum_stmt) => {
+            Statement::Vacuum(vacuum_stmt) => {
                 if vacuum_stmt.into.is_some() {
                     // VACUUM INTO requires VFS-based file copy to avoid ambient
                     // filesystem authority.  Not yet implemented.
@@ -3599,11 +3630,11 @@ impl Connection {
             // ANALYZE and REINDEX are no-ops for now
             Statement::Analyze(_) | Statement::Reindex(_) => Ok(Vec::new()),
             Statement::Explain { query_plan, stmt } => {
-                self.execute_explain(*stmt, *query_plan, params)
+                self.execute_explain(stmt, *query_plan, params)
             }
-            Statement::Attach(ref attach) => {
+            Statement::Attach(attach) => {
                 let path_rows = self.execute_statement(
-                    Statement::Select(SelectStatement {
+                    &Statement::Select(SelectStatement {
                         with: None,
                         body: SelectBody {
                             select: SelectCore::Select {
@@ -3638,7 +3669,7 @@ impl Connection {
                     .attach(attach.schema.clone(), path)?;
                 Ok(Vec::new())
             }
-            Statement::Detach(ref schema_name) => {
+            Statement::Detach(schema_name) => {
                 self.attached_schemas.borrow_mut().detach(schema_name)?;
                 Ok(Vec::new())
             }
@@ -3660,21 +3691,21 @@ impl Connection {
         &self,
         statement: &'a Statement,
         params: Option<&[SqliteValue]>,
-    ) -> Result<std::borrow::Cow<'a, Statement>> {
+    ) -> Result<Cow<'a, Statement>> {
         // Fast path: if the statement has no EXISTS/scalar-subquery expressions
         // in rewrite-covered locations, skip the clone/traversal rewrite pass.
         if !statement_contains_rewritable_subquery(statement) {
-            return Ok(statement);
+            return Ok(Cow::Borrowed(statement));
         }
         match statement {
-            Statement::Select(ref select) if select.with.is_some() => {
+            Statement::Select(select) if select.with.is_some() => {
                 // When the SELECT has a WITH clause, the CTE tables have not
                 // been materialized yet.  Subqueries may reference CTE names,
                 // so skip eager rewriting here — it will happen after CTE
                 // materialization inside execute_with_ctes.
-                Ok(statement)
+                Ok(Cow::Borrowed(statement))
             }
-            Statement::Select(ref select)
+            Statement::Select(select)
                 if is_expression_only_select(select) && expression_only_has_subquery(select) =>
             {
                 // Expression-only SELECTs with scalar subqueries in result
@@ -3683,13 +3714,13 @@ impl Connection {
                 // subquery via execute_statement would create nested autocommit
                 // transactions that can trigger reload_memdb_from_pager,
                 // destroying CTE temp tables between subquery evaluations.
-                Ok(statement)
+                Ok(Cow::Borrowed(statement))
             }
             Statement::Select(select) => {
                 let rewritten = self.rewrite_subqueries(&select, params)?;
-                Ok(std::borrow::Cow::Owned(Statement::Select(rewritten)))
+                Ok(Cow::Owned(Statement::Select(rewritten)))
             }
-            Statement::Update(ref update) if update.with.is_some() => Ok(statement),
+            Statement::Update(update) if update.with.is_some() => Ok(Cow::Borrowed(statement)),
             Statement::Update(update) => {
                 let mut update = update.clone();
                 // Rewrite EXISTS / scalar subqueries, plus IN subqueries that
@@ -3700,9 +3731,9 @@ impl Connection {
                 if let Some(where_expr) = update.where_clause.as_mut() {
                     rewrite_in_expr(where_expr, self, false, params)?;
                 }
-                Ok(std::borrow::Cow::Owned(Statement::Update(update)))
+                Ok(Cow::Owned(Statement::Update(update)))
             }
-            Statement::Delete(ref delete) if delete.with.is_some() => Ok(statement),
+            Statement::Delete(delete) if delete.with.is_some() => Ok(Cow::Borrowed(statement)),
             Statement::Delete(delete) => {
                 let mut delete = delete.clone();
                 // Rewrite EXISTS / scalar subqueries, plus IN subqueries that
@@ -3710,9 +3741,9 @@ impl Connection {
                 if let Some(where_expr) = delete.where_clause.as_mut() {
                     rewrite_in_expr(where_expr, self, false, params)?;
                 }
-                Ok(std::borrow::Cow::Owned(Statement::Delete(delete)))
+                Ok(Cow::Owned(Statement::Delete(delete)))
             }
-            other => Ok(std::borrow::Cow::Borrowed(other)),
+            other => Ok(Cow::Borrowed(other)),
         }
     }
 
@@ -7211,7 +7242,8 @@ impl Connection {
                     ));
                 }
                 // Execute the SELECT to get result rows.
-                let rows = self.execute_statement(&Statement::Select(*select_stmt.clone()), None)?;
+                let rows =
+                    self.execute_statement(&Statement::Select(*select_stmt.clone()), None)?;
                 // Infer column names from the SELECT columns.
                 let inferred_cols = infer_select_column_names(select_stmt);
                 let col_names = if inferred_cols.is_empty() {
@@ -8280,12 +8312,16 @@ impl Connection {
                 }
             }
         }
-        // Determine parent column values to match.
+        // Determine parent IPK column(s) for implicit FK references.
         let parent = schema
             .iter()
             .find(|t| t.name.eq_ignore_ascii_case(table_name));
-        let parent_cols: Vec<String> = parent.map_or_else(Vec::new, |p| {
-            p.columns.iter().map(|c| c.name.clone()).collect()
+        let parent_ipk_cols: Vec<String> = parent.map_or_else(Vec::new, |p| {
+            p.columns
+                .iter()
+                .find(|c| c.is_ipk)
+                .map(|c| vec![c.name.clone()])
+                .unwrap_or_default()
         });
         drop(schema);
 
@@ -8297,8 +8333,10 @@ impl Connection {
 
         for (child_table, fk, child_col_names) in &actions {
             // Determine which parent column values to match.
+            // When fk.parent_columns is empty, the FK implicitly references
+            // the parent's rowid/IPK — NOT all columns.
             let parent_key_cols: &[String] = if fk.parent_columns.is_empty() {
-                &parent_cols
+                &parent_ipk_cols
             } else {
                 &fk.parent_columns
             };
@@ -8447,8 +8485,12 @@ impl Connection {
         let parent = schema
             .iter()
             .find(|t| t.name.eq_ignore_ascii_case(table_name));
-        let parent_cols: Vec<String> = parent.map_or_else(Vec::new, |p| {
-            p.columns.iter().map(|c| c.name.clone()).collect()
+        let parent_ipk_cols: Vec<String> = parent.map_or_else(Vec::new, |p| {
+            p.columns
+                .iter()
+                .find(|c| c.is_ipk)
+                .map(|c| vec![c.name.clone()])
+                .unwrap_or_default()
         });
         drop(schema);
 
@@ -8459,8 +8501,10 @@ impl Connection {
         let mut result_actions = Vec::new();
 
         for (child_table, fk, child_col_names) in &actions {
+            // When fk.parent_columns is empty, the FK implicitly references
+            // the parent's rowid/IPK — NOT all columns.
             let parent_key_cols: &[String] = if fk.parent_columns.is_empty() {
-                &parent_cols
+                &parent_ipk_cols
             } else {
                 &fk.parent_columns
             };
@@ -9187,7 +9231,7 @@ impl Connection {
     }
 
     /// Handle BEGIN [DEFERRED|IMMEDIATE|EXCLUSIVE|CONCURRENT].
-    fn execute_begin(&self, begin: fsqlite_ast::BeginStatement) -> Result<()> {
+    fn execute_begin(&self, begin: &fsqlite_ast::BeginStatement) -> Result<()> {
         if *self.in_transaction.borrow() {
             return Err(FrankenError::Internal(
                 "cannot start a transaction within a transaction".to_owned(),
@@ -13462,7 +13506,7 @@ impl Connection {
                 .flat_map(|col| match col {
                     ResultColumn::Star => cmap
                         .iter()
-                        .map(|(tbl, c)| ResultColumn::Expr {
+                        .map(|(tbl, c, _)| ResultColumn::Expr {
                             expr: Expr::Column(
                                 ColumnRef::qualified(tbl.clone(), c.clone()),
                                 Span::new(0, 0),
@@ -15533,7 +15577,7 @@ impl Connection {
     ///   id | parent | notused | detail
     fn execute_explain(
         &self,
-        stmt: Statement,
+        stmt: &Statement,
         query_plan: bool,
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Row>> {
@@ -16002,8 +16046,7 @@ impl Connection {
 
             // Parse FK definitions and UNIQUE column groups from the CREATE TABLE AST.
             let mut fk_defs = Vec::new();
-            if let Ok(Statement::CreateTable(ref create_stmt)) = parse_single_statement(&create_sql)
-            {
+            if let Ok(Statement::CreateTable(create_stmt)) = parse_single_statement(&create_sql) {
                 if let CreateTableBody::Columns {
                     columns: ref col_defs,
                     ref constraints,
@@ -19883,7 +19926,11 @@ fn evaluate_having_value(
 
 /// Evaluate a non-aggregate expression (CASE, arithmetic, etc.) against a raw
 /// group row using the column map.  Returns Null on errors or unresolvable refs.
-fn eval_having_expr(expr: &Expr, row: &[SqliteValue], col_map: &[(String, String, bool)]) -> SqliteValue {
+fn eval_having_expr(
+    expr: &Expr,
+    row: &[SqliteValue],
+    col_map: &[(String, String, bool)],
+) -> SqliteValue {
     eval_join_expr(expr, row, col_map).unwrap_or(SqliteValue::Null)
 }
 
@@ -20050,23 +20097,7 @@ fn cmp_values(a: &SqliteValue, b: &SqliteValue) -> std::cmp::Ordering {
 
     /// Precision-preserving integer-float comparison (avoids lossy `as f64`).
     fn int_float_cmp(i: i64, r: f64) -> Ordering {
-        if r.is_nan() {
-            return Ordering::Greater;
-        }
-        if r < -9_223_372_036_854_775_808.0 {
-            return Ordering::Greater;
-        }
-        if r >= 9_223_372_036_854_775_808.0 {
-            return Ordering::Less;
-        }
-        let y = r as i64;
-        match i.cmp(&y) {
-            Ordering::Equal => {
-                let s = i as f64;
-                s.partial_cmp(&r).unwrap_or(Ordering::Equal)
-            }
-            other => other,
-        }
+        fsqlite_types::value::int_float_cmp(i, r)
     }
 
     /// Try to coerce a text string to a numeric `SqliteValue`.
@@ -20194,23 +20225,7 @@ fn cmp_values_no_affinity(a: &SqliteValue, b: &SqliteValue) -> std::cmp::Orderin
     }
 
     fn int_float_cmp(i: i64, r: f64) -> Ordering {
-        if r.is_nan() {
-            return Ordering::Greater;
-        }
-        if r < -9_223_372_036_854_775_808.0 {
-            return Ordering::Greater;
-        }
-        if r >= 9_223_372_036_854_775_808.0 {
-            return Ordering::Less;
-        }
-        let y = r as i64;
-        match i.cmp(&y) {
-            Ordering::Equal => {
-                let s = i as f64;
-                s.partial_cmp(&r).unwrap_or(Ordering::Equal)
-            }
-            other => other,
-        }
+        fsqlite_types::value::int_float_cmp(i, r)
     }
 
     let rank_a = type_rank(a);
@@ -20491,23 +20506,7 @@ fn cmp_sqlite_values(a: &SqliteValue, b: &SqliteValue) -> std::cmp::Ordering {
 
     /// Precision-preserving integer-float comparison.
     fn int_float_cmp(i: i64, r: f64) -> Ordering {
-        if r.is_nan() {
-            return Ordering::Greater;
-        }
-        if r < -9_223_372_036_854_775_808.0 {
-            return Ordering::Greater;
-        }
-        if r >= 9_223_372_036_854_775_808.0 {
-            return Ordering::Less;
-        }
-        let y = r as i64;
-        match i.cmp(&y) {
-            Ordering::Equal => {
-                let s = i as f64;
-                s.partial_cmp(&r).unwrap_or(Ordering::Equal)
-            }
-            other => other,
-        }
+        fsqlite_types::value::int_float_cmp(i, r)
     }
 
     // Same type class — compare within class.
@@ -20825,7 +20824,11 @@ fn execute_program(
     func_registry: Option<&Arc<FunctionRegistry>>,
     execution_cx: &Cx,
 ) -> Result<Vec<Row>> {
-    let mut engine = VdbeEngine::new_with_execution_cx(program.register_count(), execution_cx);
+    let mut engine = VdbeEngine::new_with_execution_cx(
+        program.register_count(),
+        execution_cx,
+        fsqlite_types::PageSize::new(4096).unwrap(),
+    );
     if let Some(params) = params {
         validate_bound_parameters(program, params)?;
         engine.set_bindings(params.to_vec());
@@ -20838,7 +20841,9 @@ fn execute_program(
         ExecOutcome::Done => Ok(engine
             .take_results()
             .into_iter()
-            .map(|values| Row { values })
+            .map(|values| Row {
+                values: values.into_vec(),
+            })
             .collect()),
         ExecOutcome::Error { code, message } => Err(FrankenError::Internal(format!(
             "VDBE halted with code {code}: {message}",
@@ -20895,7 +20900,11 @@ fn execute_table_program_with_db(
     );
     record_trace_span_created();
     let _execution_guard = execution_span.enter();
-    let mut engine = VdbeEngine::new_with_execution_cx(program.register_count(), execution_cx);
+    let mut engine = VdbeEngine::new_with_execution_cx(
+        program.register_count(),
+        execution_cx,
+        fsqlite_types::PageSize::new(4096).unwrap(),
+    );
     if let Some(params) = params {
         if let Err(e) = validate_bound_parameters(program, params) {
             return (Err(e), txn);
@@ -20965,7 +20974,9 @@ fn execute_table_program_with_db(
             engine
                 .take_results()
                 .into_iter()
-                .map(|values| Row { values })
+                .map(|values| Row {
+                    values: values.into_vec(),
+                })
                 .collect(),
             changes,
             engine_rowid,
@@ -24061,7 +24072,9 @@ fn find_col_in_map(
             }
         }
         if ambiguous {
-            return Err(FrankenError::AmbiguousColumn { name: col_name.to_owned() });
+            return Err(FrankenError::AmbiguousColumn {
+                name: col_name.to_owned(),
+            });
         }
         first.ok_or_else(|| FrankenError::Internal(format!("column not found: {col_name}")))
     }
@@ -70836,6 +70849,382 @@ mod pager_routing_tests {
         assert_eq!(
             rows[0].values()[1],
             SqliteValue::Text("extra_val".to_owned())
+        );
+    }
+
+    /// Regression test for issue #24: UPDATE on parent table with FK enforcement
+    /// must NOT cascade-delete child rows when the FK-referenced column (PK) is
+    /// unchanged.  Only non-PK columns are modified.
+    #[test]
+    fn test_update_parent_non_pk_column_preserves_children() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("PRAGMA foreign_keys = ON;").unwrap();
+
+        // TEXT PRIMARY KEY (not IPK) to test non-integer FK references.
+        conn.execute("CREATE TABLE parent (id TEXT PRIMARY KEY, name TEXT);")
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE child (
+                id INTEGER PRIMARY KEY,
+                parent_id TEXT NOT NULL REFERENCES parent(id) ON DELETE CASCADE,
+                val TEXT
+            );",
+        )
+        .unwrap();
+
+        conn.execute("INSERT INTO parent (id, name) VALUES ('p1', 'original');")
+            .unwrap();
+        conn.execute("INSERT INTO child (id, parent_id, val) VALUES (1, 'p1', 'c1');")
+            .unwrap();
+        conn.execute("INSERT INTO child (id, parent_id, val) VALUES (2, 'p1', 'c2');")
+            .unwrap();
+
+        // Verify 2 children exist.
+        let rows = conn
+            .query("SELECT COUNT(*) FROM child WHERE parent_id = 'p1';")
+            .unwrap();
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(2));
+
+        // UPDATE parent name (NOT the PK) using numbered placeholders.
+        conn.execute_with_params(
+            "UPDATE parent SET name = ?1 WHERE id = ?2",
+            &[
+                SqliteValue::Text("updated".to_owned()),
+                SqliteValue::Text("p1".to_owned()),
+            ],
+        )
+        .expect("UPDATE non-PK column should succeed");
+
+        // Children MUST still exist — PK was not changed.
+        let rows = conn
+            .query("SELECT COUNT(*) FROM child WHERE parent_id = 'p1';")
+            .unwrap();
+        assert_eq!(
+            rows[0].values()[0],
+            SqliteValue::Integer(2),
+            "child rows were incorrectly deleted by UPDATE of non-PK parent column"
+        );
+
+        // Verify parent name was actually updated.
+        let rows = conn
+            .query("SELECT name FROM parent WHERE id = 'p1';")
+            .unwrap();
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("updated".to_owned()));
+    }
+
+    /// Regression test for issue #24 with INTEGER PRIMARY KEY parent table.
+    /// Same scenario but using INTEGER PK (IPK) instead of TEXT PK.
+    #[test]
+    fn test_update_parent_non_pk_column_preserves_children_ipk() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("PRAGMA foreign_keys = ON;").unwrap();
+
+        conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY, name TEXT);")
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE child (
+                id INTEGER PRIMARY KEY,
+                parent_id INTEGER NOT NULL REFERENCES parent(id) ON DELETE CASCADE,
+                val TEXT
+            );",
+        )
+        .unwrap();
+
+        conn.execute("INSERT INTO parent VALUES (1, 'original');")
+            .unwrap();
+        conn.execute("INSERT INTO child VALUES (1, 1, 'c1');")
+            .unwrap();
+        conn.execute("INSERT INTO child VALUES (2, 1, 'c2');")
+            .unwrap();
+
+        // UPDATE parent name only.
+        conn.execute("UPDATE parent SET name = 'updated' WHERE id = 1;")
+            .unwrap();
+
+        // Children must survive.
+        let rows = conn
+            .query("SELECT COUNT(*) FROM child WHERE parent_id = 1;")
+            .unwrap();
+        assert_eq!(
+            rows[0].values()[0],
+            SqliteValue::Integer(2),
+            "child rows were incorrectly deleted by UPDATE of non-PK parent column (IPK)"
+        );
+    }
+
+    /// Regression test: UPDATE that DOES change the FK-referenced PK column
+    /// should trigger ON UPDATE actions (NO ACTION = error when children exist).
+    #[test]
+    fn test_update_parent_pk_column_with_children_errors() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("PRAGMA foreign_keys = ON;").unwrap();
+
+        conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY, name TEXT);")
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE child (
+                id INTEGER PRIMARY KEY,
+                parent_id INTEGER REFERENCES parent(id),
+                val TEXT
+            );",
+        )
+        .unwrap();
+
+        conn.execute("INSERT INTO parent VALUES (1, 'original');")
+            .unwrap();
+        conn.execute("INSERT INTO child VALUES (1, 1, 'c1');")
+            .unwrap();
+
+        // Changing the PK with default ON UPDATE NO ACTION should error.
+        let result = conn.execute("UPDATE parent SET id = 99 WHERE id = 1;");
+        assert!(
+            result.is_err(),
+            "UPDATE that changes FK-referenced PK should fail with ON UPDATE NO ACTION"
+        );
+    }
+
+    /// Regression test: UPDATE with ON UPDATE CASCADE correctly cascades
+    /// when the FK-referenced column actually changes.
+    #[test]
+    fn test_update_parent_pk_column_cascades_correctly() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("PRAGMA foreign_keys = ON;").unwrap();
+
+        conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY, name TEXT);")
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE child (
+                id INTEGER PRIMARY KEY,
+                parent_id INTEGER REFERENCES parent(id) ON UPDATE CASCADE,
+                val TEXT
+            );",
+        )
+        .unwrap();
+
+        conn.execute("INSERT INTO parent VALUES (1, 'original');")
+            .unwrap();
+        conn.execute("INSERT INTO child VALUES (1, 1, 'c1');")
+            .unwrap();
+        conn.execute("INSERT INTO child VALUES (2, 1, 'c2');")
+            .unwrap();
+
+        // Changing the PK with ON UPDATE CASCADE should update children.
+        conn.execute("UPDATE parent SET id = 99 WHERE id = 1;")
+            .unwrap();
+
+        // Children should now reference the new PK.
+        let rows = conn
+            .query("SELECT COUNT(*) FROM child WHERE parent_id = 99;")
+            .unwrap();
+        assert_eq!(
+            rows[0].values()[0],
+            SqliteValue::Integer(2),
+            "child rows should be cascaded to new parent PK"
+        );
+
+        // Old PK should have no children.
+        let rows = conn
+            .query("SELECT COUNT(*) FROM child WHERE parent_id = 1;")
+            .unwrap();
+        assert_eq!(rows[0].values()[0], SqliteValue::Integer(0));
+    }
+
+    /// Regression test: Composite foreign key with UPDATE on non-FK column
+    /// should not cascade.
+    #[test]
+    fn test_composite_fk_update_non_fk_column_preserves_children() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("PRAGMA foreign_keys = ON;").unwrap();
+
+        conn.execute("CREATE TABLE parent (a INTEGER, b INTEGER, name TEXT, PRIMARY KEY (a, b));")
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE child (
+                id INTEGER PRIMARY KEY,
+                pa INTEGER,
+                pb INTEGER,
+                val TEXT,
+                FOREIGN KEY (pa, pb) REFERENCES parent(a, b) ON DELETE CASCADE
+            );",
+        )
+        .unwrap();
+
+        conn.execute("INSERT INTO parent VALUES (1, 2, 'original');")
+            .unwrap();
+        conn.execute("INSERT INTO child VALUES (1, 1, 2, 'c1');")
+            .unwrap();
+
+        // UPDATE non-FK column.
+        conn.execute("UPDATE parent SET name = 'updated' WHERE a = 1 AND b = 2;")
+            .unwrap();
+
+        // Child must survive.
+        let rows = conn.query("SELECT COUNT(*) FROM child;").unwrap();
+        assert_eq!(
+            rows[0].values()[0],
+            SqliteValue::Integer(1),
+            "child row deleted by UPDATE of non-FK column in composite-key parent"
+        );
+    }
+
+    /// Regression test: Self-referencing FK with UPDATE on non-FK column
+    /// should not cascade.
+    #[test]
+    fn test_self_referencing_fk_update_non_fk_column() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("PRAGMA foreign_keys = ON;").unwrap();
+
+        conn.execute(
+            "CREATE TABLE tree (
+                id INTEGER PRIMARY KEY,
+                parent_id INTEGER REFERENCES tree(id) ON DELETE CASCADE,
+                name TEXT
+            );",
+        )
+        .unwrap();
+
+        conn.execute("INSERT INTO tree VALUES (1, NULL, 'root');")
+            .unwrap();
+        conn.execute("INSERT INTO tree VALUES (2, 1, 'child1');")
+            .unwrap();
+        conn.execute("INSERT INTO tree VALUES (3, 1, 'child2');")
+            .unwrap();
+        conn.execute("INSERT INTO tree VALUES (4, 2, 'grandchild');")
+            .unwrap();
+
+        // UPDATE non-FK column on root.
+        conn.execute("UPDATE tree SET name = 'ROOT' WHERE id = 1;")
+            .unwrap();
+
+        // All rows must survive.
+        let rows = conn.query("SELECT COUNT(*) FROM tree;").unwrap();
+        assert_eq!(
+            rows[0].values()[0],
+            SqliteValue::Integer(4),
+            "self-referencing FK: rows deleted by UPDATE of non-FK column"
+        );
+    }
+
+    /// Regression test: ON DELETE SET NULL should not fire during UPDATE
+    /// when the FK-referenced column is unchanged.
+    #[test]
+    fn test_fk_set_null_not_triggered_by_non_pk_update() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("PRAGMA foreign_keys = ON;").unwrap();
+
+        conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY, name TEXT);")
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE child (
+                id INTEGER PRIMARY KEY,
+                parent_id INTEGER REFERENCES parent(id) ON DELETE SET NULL,
+                val TEXT
+            );",
+        )
+        .unwrap();
+
+        conn.execute("INSERT INTO parent VALUES (1, 'original');")
+            .unwrap();
+        conn.execute("INSERT INTO child VALUES (1, 1, 'c1');")
+            .unwrap();
+
+        // UPDATE non-PK column.
+        conn.execute("UPDATE parent SET name = 'updated' WHERE id = 1;")
+            .unwrap();
+
+        // Child FK column should NOT be set to NULL.
+        let rows = conn
+            .query("SELECT parent_id FROM child WHERE id = 1;")
+            .unwrap();
+        assert_eq!(
+            rows[0].values()[0],
+            SqliteValue::Integer(1),
+            "ON DELETE SET NULL incorrectly fired during non-PK UPDATE"
+        );
+    }
+
+    /// Regression test: NULL values in FK columns should be handled correctly
+    /// during UPDATE (SQL standard: partially-NULL FK is always satisfied).
+    #[test]
+    fn test_update_with_null_in_fk_column() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("PRAGMA foreign_keys = ON;").unwrap();
+
+        conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY, name TEXT);")
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE child (
+                id INTEGER PRIMARY KEY,
+                parent_id INTEGER REFERENCES parent(id) ON DELETE CASCADE,
+                val TEXT
+            );",
+        )
+        .unwrap();
+
+        conn.execute("INSERT INTO parent VALUES (1, 'p1');")
+            .unwrap();
+        // Insert child with NULL FK (orphan — allowed by SQL standard).
+        conn.execute("INSERT INTO child VALUES (1, NULL, 'orphan');")
+            .unwrap();
+        conn.execute("INSERT INTO child VALUES (2, 1, 'attached');")
+            .unwrap();
+
+        // UPDATE parent non-PK column.
+        conn.execute("UPDATE parent SET name = 'updated' WHERE id = 1;")
+            .unwrap();
+
+        // Both children must survive.
+        let rows = conn.query("SELECT COUNT(*) FROM child;").unwrap();
+        assert_eq!(
+            rows[0].values()[0],
+            SqliteValue::Integer(2),
+            "children deleted during non-PK UPDATE with NULL FK values present"
+        );
+    }
+
+    /// Regression test: Multiple child tables referencing the same parent
+    /// should all be preserved when the parent's non-PK column is updated.
+    #[test]
+    fn test_multiple_child_tables_preserved_on_non_pk_update() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("PRAGMA foreign_keys = ON;").unwrap();
+
+        conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY, name TEXT);")
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE child_a (
+                id INTEGER PRIMARY KEY,
+                parent_id INTEGER REFERENCES parent(id) ON DELETE CASCADE
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE child_b (
+                id INTEGER PRIMARY KEY,
+                parent_id INTEGER REFERENCES parent(id) ON DELETE SET NULL
+            );",
+        )
+        .unwrap();
+
+        conn.execute("INSERT INTO parent VALUES (1, 'p1');")
+            .unwrap();
+        conn.execute("INSERT INTO child_a VALUES (1, 1);").unwrap();
+        conn.execute("INSERT INTO child_b VALUES (1, 1);").unwrap();
+
+        // UPDATE non-PK column.
+        conn.execute("UPDATE parent SET name = 'updated' WHERE id = 1;")
+            .unwrap();
+
+        // Both child tables must be unaffected.
+        let rows_a = conn.query("SELECT COUNT(*) FROM child_a;").unwrap();
+        assert_eq!(rows_a[0].values()[0], SqliteValue::Integer(1));
+        let rows_b = conn
+            .query("SELECT parent_id FROM child_b WHERE id = 1;")
+            .unwrap();
+        assert_eq!(
+            rows_b[0].values()[0],
+            SqliteValue::Integer(1),
+            "child_b FK column was incorrectly set to NULL during non-PK UPDATE"
         );
     }
 }
