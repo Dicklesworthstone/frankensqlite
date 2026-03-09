@@ -13,6 +13,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fsqlite_types::{CommitSeq, PageNumber, TxnToken};
+use tracing::{debug, warn};
 
 // ---------------------------------------------------------------------------
 // Loss matrix (§5.7.3 Bayesian Decision Framework)
@@ -547,6 +548,7 @@ impl DroVolatilityTracker {
         abort_rate: f64,
         edge_rate: f64,
     ) -> std::result::Result<(), DroVolatilityTrackerError> {
+        let previous_certificate = self.radius_certificate(DroRiskTolerance::Low);
         validate_observed_rate(DroObservedRateKind::Abort, abort_rate)?;
         validate_observed_rate(DroObservedRateKind::Edge, edge_rate)?;
         if self.windows.len() == self.config.window_size {
@@ -556,6 +558,36 @@ impl DroVolatilityTracker {
             abort_rate,
             edge_rate,
         });
+        if let Some(current_certificate) = self.radius_certificate(DroRiskTolerance::Low) {
+            let previous_radius =
+                previous_certificate.map_or(0.0, |certificate| certificate.base_radius);
+            let trigger = if previous_certificate.is_some() {
+                "observe_window"
+            } else {
+                "min_samples_reached"
+            };
+            debug!(
+                target: "fsqlite::ssi::dro",
+                event = "wasserstein_update",
+                old_radius = previous_radius,
+                new_radius = current_certificate.base_radius,
+                abort_rate,
+                edge_rate,
+                window_samples = self.windows.len(),
+                trigger,
+            );
+            if let Some(previous_certificate) = previous_certificate {
+                if current_certificate.base_radius > previous_certificate.base_radius {
+                    warn!(
+                        target: "fsqlite::ssi::dro",
+                        event = "regime_shift",
+                        old_radius = previous_certificate.base_radius,
+                        new_radius = current_certificate.base_radius,
+                        volatility = current_certificate.base_radius,
+                    );
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1885,12 +1917,7 @@ mod tests {
             window_size: 8,
             min_samples: 4,
         });
-        for &(abort_rate, edge_rate) in &[
-            (0.02, 0.01),
-            (0.03, 0.02),
-            (0.02, 0.01),
-            (0.03, 0.02),
-        ] {
+        for &(abort_rate, edge_rate) in &[(0.02, 0.01), (0.03, 0.02), (0.02, 0.01), (0.03, 0.02)] {
             tracker
                 .observe_window(abort_rate, edge_rate)
                 .expect("valid calm rates");
@@ -1899,12 +1926,7 @@ mod tests {
             .radius_certificate(DroRiskTolerance::Low)
             .expect("calm certificate");
 
-        for &(abort_rate, edge_rate) in &[
-            (0.20, 0.18),
-            (0.01, 0.02),
-            (0.25, 0.21),
-            (0.02, 0.03),
-        ] {
+        for &(abort_rate, edge_rate) in &[(0.20, 0.18), (0.01, 0.02), (0.25, 0.21), (0.02, 0.03)] {
             tracker
                 .observe_window(abort_rate, edge_rate)
                 .expect("valid volatile rates");
