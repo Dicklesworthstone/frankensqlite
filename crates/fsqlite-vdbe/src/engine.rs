@@ -4114,7 +4114,7 @@ impl VdbeEngine {
                     let cursor_id = op.p1;
                     // Seek repositions the cursor, so clear any pending delete state.
                     self.pending_next_after_delete.remove(&cursor_id);
-                    let key_val = self.get_reg(op.p3);
+                    let key_val = self.get_reg(op.p3).clone();
                     if key_val.is_null() {
                         pc = op.p2 as usize;
                         continue;
@@ -4125,225 +4125,242 @@ impl VdbeEngine {
                     // index cursor receiving an integer key would wrongly call
                     // table_move_to, triggering "table leaf cell has no rowid"
                     // on index pages. (Fixes br#138-140, #144, #145.)
-                    let found = if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
-                        if cursor.cursor.is_table_btree() {
-                            // Table seek: key is a rowid (integer).
-                            let key = key_val.to_integer();
-                            let seek_result = cursor.cursor.table_move_to(&cursor.cx, key)?;
+                    let found =
+                        if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
+                            if cursor.cursor.is_table_btree() {
+                                // Table seek: key is a rowid (integer).
+                                let key = key_val.to_integer();
+                                let seek_result = cursor.cursor.table_move_to(&cursor.cx, key)?;
 
-                            match op.opcode {
-                                Opcode::SeekGE => {
-                                    // Need first row >= key.
-                                    // table_move_to already positions at key (Found) or
-                                    // at next larger (NotFound). Check for EOF.
-                                    !cursor.cursor.eof()
-                                }
-                                Opcode::SeekGT => {
-                                    // Need first row > key.
-                                    // If Found (at exact key), advance past it.
-                                    // If NotFound, already past key.
-                                    if seek_result.is_found() {
-                                        cursor.cursor.next(&cursor.cx)?
-                                    } else {
+                                match op.opcode {
+                                    Opcode::SeekGE => {
+                                        // Need first row >= key.
+                                        // table_move_to already positions at key (Found) or
+                                        // at next larger (NotFound). Check for EOF.
                                         !cursor.cursor.eof()
                                     }
-                                }
-                                Opcode::SeekLE => {
-                                    // Need last row <= key.
-                                    // If Found, we're at the exact key - done.
-                                    // If NotFound, cursor is at entry > key, so prev().
-                                    if seek_result.is_found() {
-                                        true
-                                    } else if cursor.cursor.eof() {
-                                        // All entries < key, position at last.
-                                        cursor.cursor.last(&cursor.cx)?
-                                    } else {
-                                        // Cursor at entry > key, move to previous.
-                                        cursor.cursor.prev(&cursor.cx)?
-                                    }
-                                }
-                                Opcode::SeekLT => {
-                                    // Need last row < key.
-                                    // Cursor is either at key (Found) or past key (NotFound).
-                                    // Either way, we need to go to the previous entry.
-                                    if cursor.cursor.eof() {
-                                        // All entries < key, position at last.
-                                        cursor.cursor.last(&cursor.cx)?
-                                    } else {
-                                        // Go to previous entry (which will be < key).
-                                        cursor.cursor.prev(&cursor.cx)?
-                                    }
-                                }
-                                _ => unreachable!(),
-                            }
-                        } else {
-                            // Index seek: key is a packed record blob.
-                            let key_bytes = record_blob_bytes(&key_val);
-                            let seek_result =
-                                cursor.cursor.index_move_to(&cursor.cx, &key_bytes)?;
-
-                            let mut target_vals_buf = Vec::new();
-                            let mut cur_vals_buf = Vec::new();
-
-                            match op.opcode {
-                                Opcode::SeekGE => !cursor.cursor.eof(),
-                                Opcode::SeekGT => {
-                                    if seek_result.is_found() {
-                                        cursor.cursor.next(&cursor.cx)?;
-                                    }
-                                    if !cursor.cursor.eof() {
-                                        fsqlite_types::record::parse_record_into(&key_bytes, &mut target_vals_buf).ok_or_else(|| {
-                                            FrankenError::internal(
-                                                "SeekGT: malformed seek key record",
-                                            )
-                                        })?;
-                                        loop {
-                                            if cursor.cursor.eof() {
-                                                break;
-                                            }
-                                            let payload = cursor.cursor.payload(&cursor.cx)?;
-                                            fsqlite_types::record::parse_record_into(&payload, &mut cur_vals_buf).ok_or_else(|| {
-                                                FrankenError::internal(
-                                                    "SeekGT: malformed cursor record",
-                                                )
-                                            })?;
-                                            let cmp = compare_sorter_keys(
-                                                &cur_vals_buf,
-                                                &target_vals_buf,
-                                                target_vals_buf.len(),
-                                                &[],
-                                            );
-                                            if cmp == std::cmp::Ordering::Equal {
-                                                cursor.cursor.next(&cursor.cx)?;
-                                            } else {
-                                                break;
-                                            }
+                                    Opcode::SeekGT => {
+                                        // Need first row > key.
+                                        // If Found (at exact key), advance past it.
+                                        // If NotFound, already past key.
+                                        if seek_result.is_found() {
+                                            cursor.cursor.next(&cursor.cx)?
+                                        } else {
+                                            !cursor.cursor.eof()
                                         }
                                     }
-                                    !cursor.cursor.eof()
-                                }
-                                Opcode::SeekLE => {
-                                    if !cursor.cursor.eof() {
-                                        fsqlite_types::record::parse_record_into(&key_bytes, &mut target_vals_buf).ok_or_else(|| {
-                                            FrankenError::internal(
-                                                "SeekLE: malformed seek key record",
-                                            )
-                                        })?;
-                                        loop {
-                                            if cursor.cursor.eof() {
-                                                break;
-                                            }
-                                            let payload = cursor.cursor.payload(&cursor.cx)?;
-                                            fsqlite_types::record::parse_record_into(&payload, &mut cur_vals_buf).ok_or_else(|| {
-                                                FrankenError::internal(
-                                                    "SeekLE: malformed cursor record",
-                                                )
-                                            })?;
-                                            let cmp = compare_sorter_keys(
-                                                &cur_vals_buf,
-                                                &target_vals_buf,
-                                                target_vals_buf.len(),
-                                                &[],
-                                            );
-                                            if cmp == std::cmp::Ordering::Equal {
-                                                cursor.cursor.next(&cursor.cx)?;
-                                            } else {
-                                                break;
-                                            }
+                                    Opcode::SeekLE => {
+                                        // Need last row <= key.
+                                        // If Found, we're at the exact key - done.
+                                        // If NotFound, cursor is at entry > key, so prev().
+                                        if seek_result.is_found() {
+                                            true
+                                        } else if cursor.cursor.eof() {
+                                            // All entries < key, position at last.
+                                            cursor.cursor.last(&cursor.cx)?
+                                        } else {
+                                            // Cursor at entry > key, move to previous.
+                                            cursor.cursor.prev(&cursor.cx)?
                                         }
                                     }
-                                    if cursor.cursor.eof() {
-                                        cursor.cursor.last(&cursor.cx)?
-                                    } else {
-                                        cursor.cursor.prev(&cursor.cx)?
+                                    Opcode::SeekLT => {
+                                        // Need last row < key.
+                                        // Cursor is either at key (Found) or past key (NotFound).
+                                        // Either way, we need to go to the previous entry.
+                                        if cursor.cursor.eof() {
+                                            // All entries < key, position at last.
+                                            cursor.cursor.last(&cursor.cx)?
+                                        } else {
+                                            // Go to previous entry (which will be < key).
+                                            cursor.cursor.prev(&cursor.cx)?
+                                        }
                                     }
+                                    _ => unreachable!(),
                                 }
-                                Opcode::SeekLT => {
-                                    if cursor.cursor.eof() {
-                                        cursor.cursor.last(&cursor.cx)?
-                                    } else {
-                                        cursor.cursor.prev(&cursor.cx)?
+                            } else {
+                                // Index seek: key is a packed record blob.
+                                let key_bytes = record_blob_bytes(&key_val);
+                                let seek_result =
+                                    cursor.cursor.index_move_to(&cursor.cx, key_bytes)?;
+
+                                let mut target_vals_buf = Vec::new();
+                                let mut cur_vals_buf = Vec::new();
+
+                                match op.opcode {
+                                    Opcode::SeekGE => !cursor.cursor.eof(),
+                                    Opcode::SeekGT => {
+                                        if seek_result.is_found() {
+                                            cursor.cursor.next(&cursor.cx)?;
+                                        }
+                                        if !cursor.cursor.eof() {
+                                            fsqlite_types::record::parse_record_into(
+                                                key_bytes,
+                                                &mut target_vals_buf,
+                                            )
+                                            .ok_or_else(|| {
+                                                FrankenError::internal(
+                                                    "SeekGT: malformed seek key record",
+                                                )
+                                            })?;
+                                            loop {
+                                                if cursor.cursor.eof() {
+                                                    break;
+                                                }
+                                                let payload = cursor.cursor.payload(&cursor.cx)?;
+                                                fsqlite_types::record::parse_record_into(
+                                                    &payload,
+                                                    &mut cur_vals_buf,
+                                                )
+                                                .ok_or_else(|| {
+                                                    FrankenError::internal(
+                                                        "SeekGT: malformed cursor record",
+                                                    )
+                                                })?;
+                                                let cmp = compare_sorter_keys(
+                                                    &cur_vals_buf,
+                                                    &target_vals_buf,
+                                                    target_vals_buf.len(),
+                                                    &[],
+                                                );
+                                                if cmp == std::cmp::Ordering::Equal {
+                                                    cursor.cursor.next(&cursor.cx)?;
+                                                } else {
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        !cursor.cursor.eof()
                                     }
+                                    Opcode::SeekLE => {
+                                        if !cursor.cursor.eof() {
+                                            fsqlite_types::record::parse_record_into(
+                                                key_bytes,
+                                                &mut target_vals_buf,
+                                            )
+                                            .ok_or_else(|| {
+                                                FrankenError::internal(
+                                                    "SeekLE: malformed seek key record",
+                                                )
+                                            })?;
+                                            loop {
+                                                if cursor.cursor.eof() {
+                                                    break;
+                                                }
+                                                let payload = cursor.cursor.payload(&cursor.cx)?;
+                                                fsqlite_types::record::parse_record_into(
+                                                    &payload,
+                                                    &mut cur_vals_buf,
+                                                )
+                                                .ok_or_else(|| {
+                                                    FrankenError::internal(
+                                                        "SeekLE: malformed cursor record",
+                                                    )
+                                                })?;
+                                                let cmp = compare_sorter_keys(
+                                                    &cur_vals_buf,
+                                                    &target_vals_buf,
+                                                    target_vals_buf.len(),
+                                                    &[],
+                                                );
+                                                if cmp == std::cmp::Ordering::Equal {
+                                                    cursor.cursor.next(&cursor.cx)?;
+                                                } else {
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        if cursor.cursor.eof() {
+                                            cursor.cursor.last(&cursor.cx)?
+                                        } else {
+                                            cursor.cursor.prev(&cursor.cx)?
+                                        }
+                                    }
+                                    Opcode::SeekLT => {
+                                        if cursor.cursor.eof() {
+                                            cursor.cursor.last(&cursor.cx)?
+                                        } else {
+                                            cursor.cursor.prev(&cursor.cx)?
+                                        }
+                                    }
+                                    _ => unreachable!(),
                                 }
-                                _ => unreachable!(),
                             }
-                        }
-                    } else if let Some(cursor) = self.cursors.get_mut(&cursor_id) {
-                        // MemCursor fallback (Phase 4 path).
-                        let key = key_val.to_integer();
-                        if let Some(db) = self.db.as_ref() {
-                            if let Some(table) = db.get_table(cursor.root_page) {
-                                if table.rows.is_empty() {
-                                    false
+                        } else if let Some(cursor) = self.cursors.get_mut(&cursor_id) {
+                            // MemCursor fallback (Phase 4 path).
+                            let key = key_val.to_integer();
+                            if let Some(db) = self.db.as_ref() {
+                                if let Some(table) = db.get_table(cursor.root_page) {
+                                    if table.rows.is_empty() {
+                                        false
+                                    } else {
+                                        match op.opcode {
+                                            Opcode::SeekGE => {
+                                                let pos = table
+                                                    .rows
+                                                    .binary_search_by_key(&key, |r| r.rowid)
+                                                    .unwrap_or_else(|e| e);
+                                                if pos < table.rows.len() {
+                                                    cursor.position = Some(pos);
+                                                    true
+                                                } else {
+                                                    false
+                                                }
+                                            }
+                                            Opcode::SeekGT => {
+                                                let pos = match table
+                                                    .rows
+                                                    .binary_search_by_key(&key, |r| r.rowid)
+                                                {
+                                                    Ok(idx) => idx + 1,
+                                                    Err(idx) => idx,
+                                                };
+                                                if pos < table.rows.len() {
+                                                    cursor.position = Some(pos);
+                                                    true
+                                                } else {
+                                                    false
+                                                }
+                                            }
+                                            Opcode::SeekLE => {
+                                                let pos = match table
+                                                    .rows
+                                                    .binary_search_by_key(&key, |r| r.rowid)
+                                                {
+                                                    Ok(idx) => Some(idx),
+                                                    Err(idx) => idx.checked_sub(1),
+                                                };
+                                                if let Some(idx) = pos {
+                                                    cursor.position = Some(idx);
+                                                    true
+                                                } else {
+                                                    false
+                                                }
+                                            }
+                                            Opcode::SeekLT => {
+                                                let pos = table
+                                                    .rows
+                                                    .binary_search_by_key(&key, |r| r.rowid)
+                                                    .unwrap_or_else(|e| e)
+                                                    .checked_sub(1);
+                                                if let Some(idx) = pos {
+                                                    cursor.position = Some(idx);
+                                                    true
+                                                } else {
+                                                    false
+                                                }
+                                            }
+                                            _ => unreachable!(),
+                                        }
+                                    }
                                 } else {
-                                    match op.opcode {
-                                        Opcode::SeekGE => {
-                                            let pos = table
-                                                .rows
-                                                .binary_search_by_key(&key, |r| r.rowid)
-                                                .unwrap_or_else(|e| e);
-                                            if pos < table.rows.len() {
-                                                cursor.position = Some(pos);
-                                                true
-                                            } else {
-                                                false
-                                            }
-                                        }
-                                        Opcode::SeekGT => {
-                                            let pos = match table
-                                                .rows
-                                                .binary_search_by_key(&key, |r| r.rowid)
-                                            {
-                                                Ok(idx) => idx + 1,
-                                                Err(idx) => idx,
-                                            };
-                                            if pos < table.rows.len() {
-                                                cursor.position = Some(pos);
-                                                true
-                                            } else {
-                                                false
-                                            }
-                                        }
-                                        Opcode::SeekLE => {
-                                            let pos = match table
-                                                .rows
-                                                .binary_search_by_key(&key, |r| r.rowid)
-                                            {
-                                                Ok(idx) => Some(idx),
-                                                Err(idx) => idx.checked_sub(1),
-                                            };
-                                            if let Some(idx) = pos {
-                                                cursor.position = Some(idx);
-                                                true
-                                            } else {
-                                                false
-                                            }
-                                        }
-                                        Opcode::SeekLT => {
-                                            let pos = table
-                                                .rows
-                                                .binary_search_by_key(&key, |r| r.rowid)
-                                                .unwrap_or_else(|e| e)
-                                                .checked_sub(1);
-                                            if let Some(idx) = pos {
-                                                cursor.position = Some(idx);
-                                                true
-                                            } else {
-                                                false
-                                            }
-                                        }
-                                        _ => unreachable!(),
-                                    }
+                                    false
                                 }
                             } else {
                                 false
                             }
                         } else {
                             false
-                        }
-                    } else {
-                        false
-                    };
+                        };
                     if found {
                         pc += 1;
                     } else {
@@ -4378,7 +4395,7 @@ impl VdbeEngine {
                         if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
                             cursor
                                 .cursor
-                                .index_move_to(&cursor.cx, &key_bytes)?
+                                .index_move_to(&cursor.cx, key_bytes)?
                                 .is_found()
                         } else {
                             false
@@ -4429,7 +4446,7 @@ impl VdbeEngine {
                         if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
                             cursor
                                 .cursor
-                                .index_move_to(&cursor.cx, &key_bytes)?
+                                .index_move_to(&cursor.cx, key_bytes)?
                                 .is_found()
                         } else {
                             false
@@ -4629,7 +4646,7 @@ impl VdbeEngine {
                                             )
                                         },
                                     )?;
-                                    sc2.cursor.table_insert(&sc2.cx, rowid, &blob)?;
+                                    sc2.cursor.table_insert(&sc2.cx, rowid, blob)?;
                                     actually_inserted = true;
                                 } else if oe_flag == 4 {
                                     // OE_IGNORE: Skip insert for conflicting row
@@ -4639,7 +4656,7 @@ impl VdbeEngine {
                                 }
                             } else {
                                 // No conflict — insert normally
-                                sc.cursor.table_insert(&sc.cx, rowid, &blob)?;
+                                sc.cursor.table_insert(&sc.cx, rowid, blob)?;
                                 actually_inserted = true;
                             }
                         }
@@ -4776,7 +4793,7 @@ impl VdbeEngine {
                     #[allow(clippy::cast_possible_truncation)]
                     let oe_flag = ((op.p5 >> 1) & 0x0F) as u8;
                     let n_idx_cols = op.p3 as usize;
-                    let key_val = self.get_reg(key_reg);
+                    let key_val = self.get_reg(key_reg).clone();
 
                     // If a previous IdxInsert for the same row triggered IGNORE,
                     // skip all remaining index inserts for this row.
@@ -4787,7 +4804,7 @@ impl VdbeEngine {
 
                     if let Some(sc) = self.storage_cursors.get_mut(&cursor_id) {
                         if sc.writable {
-                            let key_bytes = record_blob_bytes(key_val);
+                            let key_bytes = record_blob_bytes(&key_val);
 
                             if is_unique && n_idx_cols > 0 {
                                 let columns_label = match &op.p4 {
@@ -4882,7 +4899,7 @@ impl VdbeEngine {
                                                 // conflicting row from the index.
                                                 let conflict_rowid =
                                                     find_conflicting_rowid_in_index(
-                                                        sc, &key_bytes, n_idx_cols,
+                                                        sc, key_bytes, n_idx_cols,
                                                     )?;
 
                                                 if let Some(old_rowid) = conflict_rowid {
@@ -4905,7 +4922,7 @@ impl VdbeEngine {
                                                     .ok_or_else(|| {
                                                         FrankenError::internal("cursor must exist")
                                                     })?;
-                                                sc2.cursor.index_insert(&sc2.cx, &key_bytes)?;
+                                                sc2.cursor.index_insert(&sc2.cx, key_bytes)?;
                                             }
                                             // Default: propagate the error
                                             // (ABORT/FAIL/ROLLBACK).
@@ -4919,7 +4936,7 @@ impl VdbeEngine {
                                     Err(e) => return Err(e),
                                 }
                             } else {
-                                sc.cursor.index_insert(&sc.cx, &key_bytes)?;
+                                sc.cursor.index_insert(&sc.cx, key_bytes)?;
                                 self.pending_idx_entries
                                     .push((cursor_id, key_bytes.to_vec()));
                             }
@@ -4932,10 +4949,10 @@ impl VdbeEngine {
 
                 Opcode::SorterInsert => {
                     let cursor_id = op.p1;
-                    let record = self.get_reg(op.p2);
+                    let record = self.get_reg(op.p2).clone();
                     if let Some(sorter) = self.sorters.get_mut(&cursor_id) {
-                        let decoded = decode_record(record)?;
-                        let blob = record_blob_bytes(record).to_vec();
+                        let decoded = decode_record(&record)?;
+                        let blob = record_blob_bytes(&record).to_vec();
                         sorter.insert_row(decoded, blob)?;
                     }
                     pc += 1;
@@ -5703,14 +5720,14 @@ impl VdbeEngine {
                         if args.iter().any(|a| matches!(a, SqliteValue::Null)) {
                             false
                         } else {
-                            seen.insert(distinct_key(&args))
+                            seen.insert(distinct_key(args))
                         }
                     } else {
                         true
                     };
 
                     if should_step {
-                        ctx.func.step(&mut ctx.state, &args)?;
+                        ctx.func.step(&mut ctx.state, args)?;
                     }
                     pc += 1;
                 }
@@ -5800,7 +5817,7 @@ impl VdbeEngine {
                         }
                     });
 
-                    ctx.func.inverse(&mut ctx.state, &args)?;
+                    ctx.func.inverse(&mut ctx.state, args)?;
                     pc += 1;
                 }
 
@@ -6523,6 +6540,7 @@ impl VdbeEngine {
         row
     }
 
+    #[allow(dead_code)]
     fn collect_reg_range_refs(&self, start: i32, count: usize) -> Vec<&SqliteValue> {
         let mut row = Vec::with_capacity(count);
         for offset in 0..count {
@@ -6583,18 +6601,16 @@ impl VdbeEngine {
             if cursor.cursor.eof() {
                 return Ok(SqliteValue::Null);
             }
-            cursor.cursor.payload_into(&cursor.cx, &mut cursor.payload_buf)?;
+            cursor
+                .cursor
+                .payload_into(&cursor.cx, &mut cursor.payload_buf)?;
 
             let ipk_col_idx = None;
             let payload_idx = if let Some(ipk) = ipk_col_idx {
                 if col_idx == ipk {
                     return self.cursor_rowid(cursor_id);
                 }
-                if col_idx > ipk {
-                    col_idx - 1
-                } else {
-                    col_idx
-                }
+                if col_idx > ipk { col_idx - 1 } else { col_idx }
             } else {
                 col_idx
             };
@@ -6704,7 +6720,7 @@ impl VdbeEngine {
 
     #[allow(clippy::cast_sign_loss)]
     fn open_storage_cursor(&mut self, cursor_id: i32, root_page: i32, writable: bool) -> bool {
-        let page_size_u32 = self.page_size.get();
+        let _page_size_u32 = self.page_size.get();
         // bd-1xrs: storage_cursors_enabled check removed.
         // StorageCursor is now the ONLY cursor path.
         let mode = if self.reject_mem_fallback {
@@ -7215,9 +7231,9 @@ fn find_conflicting_rowid_in_index(
         }
 
         let entry_bytes = sc.cursor.payload(&sc.cx)?;
-        fsqlite_types::record::parse_record_into(&entry_bytes, &mut entry_fields_buf).ok_or_else(|| {
-            FrankenError::internal("find_conflicting_rowid: malformed index entry record")
-        })?;
+        fsqlite_types::record::parse_record_into(&entry_bytes, &mut entry_fields_buf).ok_or_else(
+            || FrankenError::internal("find_conflicting_rowid: malformed index entry record"),
+        )?;
 
         // Check if the indexed columns (excluding the trailing rowid) match
         // and none of them are NULL.
@@ -7265,6 +7281,7 @@ fn encode_record(values: &[SqliteValue]) -> Vec<u8> {
     serialize_record(values)
 }
 
+#[allow(dead_code)]
 fn encode_record_refs(values: &[&SqliteValue]) -> Vec<u8> {
     fsqlite_types::record::serialize_record_refs(values)
 }

@@ -5933,10 +5933,10 @@ pub fn codegen_update(
         .map(|a| count_anon_placeholders(&a.value))
         .sum();
 
-    let where_placeholder_count: u32 = stmt
+    let _where_placeholder_count: u32 = stmt
         .where_clause
         .as_ref()
-        .map_or(0, |w| count_anon_placeholders(w));
+        .map_or(0, count_anon_placeholders);
 
     if let Some(target_expr) = rowid_target {
         let rowid_reg = b.alloc_reg();
