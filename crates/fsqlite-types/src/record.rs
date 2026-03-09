@@ -110,6 +110,45 @@ pub fn serialize_record(values: &[SqliteValue]) -> Vec<u8> {
     buf
 }
 
+/// Serialize a list of `SqliteValue` references into the SQLite record format.
+pub fn serialize_record_refs(values: &[&SqliteValue]) -> Vec<u8> {
+    let serial_types: Vec<u64> = values.iter().map(|&v| serial_type_for_value(v)).collect();
+
+    let mut header_content_size: usize = 0;
+    for &st in &serial_types {
+        header_content_size += varint_len(st);
+    }
+
+    let header_size = compute_header_size(header_content_size);
+    let header_size_varint_len = varint_len(header_size as u64);
+
+    #[allow(clippy::cast_possible_truncation)]
+    let body_size: usize = serial_types
+        .iter()
+        .map(|&st| serial_type_len(st).unwrap_or(0) as usize)
+        .sum();
+
+    let total_size = header_size + body_size;
+    let mut buf = vec![0u8; total_size];
+
+    let mut offset = write_varint(&mut buf, header_size as u64);
+    debug_assert_eq!(offset, header_size_varint_len);
+
+    for &st in &serial_types {
+        offset += write_varint(&mut buf[offset..], st);
+    }
+    debug_assert_eq!(offset, header_size);
+
+    #[allow(clippy::cast_possible_truncation)]
+    for (&value, &st) in values.iter().zip(serial_types.iter()) {
+        let value_len = serial_type_len(st).unwrap_or(0) as usize;
+        encode_value(value, st, &mut buf[offset..offset + value_len]);
+        offset += value_len;
+    }
+
+    buf
+}
+
 /// Compute the total header size (including the header-size varint itself).
 #[allow(clippy::cast_possible_truncation)]
 fn compute_header_size(content_size: usize) -> usize {

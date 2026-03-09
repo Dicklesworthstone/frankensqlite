@@ -2053,6 +2053,8 @@ pub struct VdbeEngine {
     bindings: Vec<SqliteValue>,
     /// Root capability context for execution-owned cursor and virtual-table work.
     execution_cx: Cx,
+    /// Page size for this database (bd-zjisk.2).
+    page_size: PageSize,
     /// Whether opcode-level tracing is enabled.
     trace_opcodes: bool,
     /// Result rows accumulated during execution.
@@ -4999,8 +5001,8 @@ impl VdbeEngine {
                 Opcode::MakeRecord => {
                     // Build a record from registers p1..p1+p2-1 into register p3.
                     let target = op.p3;
-                    let values = self.collect_reg_range(op.p1, usize::try_from(op.p2).unwrap_or(0));
-                    let blob = encode_record(&values);
+                    let values = self.collect_reg_range_refs(op.p1, usize::try_from(op.p2).unwrap_or(0));
+                    let blob = encode_record_refs(&values);
                     self.set_reg(target, SqliteValue::Blob(blob));
                     pc += 1;
                 }
@@ -6460,6 +6462,15 @@ impl VdbeEngine {
             .collect()
     }
 
+    fn collect_reg_range_refs(&self, start: i32, count: usize) -> Vec<&SqliteValue> {
+        (0..count)
+            .map(|offset| {
+                Self::reg_with_offset(start, offset)
+                    .map_or(&SqliteValue::Null, |reg| self.get_reg(reg))
+            })
+            .collect()
+    }
+
     fn take_reg(&mut self, r: i32) -> SqliteValue {
         usize::try_from(r)
             .ok()
@@ -7149,6 +7160,10 @@ fn find_conflicting_rowid_in_index(
 
 fn encode_record(values: &[SqliteValue]) -> Vec<u8> {
     serialize_record(values)
+}
+
+fn encode_record_refs(values: &[&SqliteValue]) -> Vec<u8> {
+    fsqlite_types::record::serialize_record_refs(values)
 }
 
 /// Extract the raw bytes from a record blob value (output of `MakeRecord`).

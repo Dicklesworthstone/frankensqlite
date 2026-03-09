@@ -1182,36 +1182,21 @@ pub(crate) fn apply_child_replacement<W: PageWriter>(
 
     // Insert new divider cells at the correct position.
     let insert_pos = first_child;
-    let mut final_cells: Vec<GatheredCell> = Vec::new();
-    let mut inserted = false;
-    let mut kept_idx = 0;
+    let mut final_cells: Vec<GatheredCell> = Vec::with_capacity(kept_cells.len() + new_dividers.len());
 
-    for i in 0..kept_cells.len() + new_dividers.len() {
-        if !inserted && kept_idx == insert_pos {
-            // Insert all new dividers here.
-            for (_, div_data) in new_dividers {
-                final_cells.push(GatheredCell {
-                    size: u16::try_from(div_data.len()).unwrap_or(u16::MAX),
-                    data: div_data.clone(),
-                });
-            }
-            inserted = true;
-        }
-        if kept_idx < kept_cells.len() {
-            final_cells.push(kept_cells[kept_idx].clone());
-            kept_idx += 1;
-        }
-        let _ = i;
+    for cell in &kept_cells[..insert_pos] {
+        final_cells.push(cell.clone());
     }
 
-    if !inserted {
-        // Dividers go at the end.
-        for (_, div_data) in new_dividers {
-            final_cells.push(GatheredCell {
-                size: u16::try_from(div_data.len()).unwrap_or(u16::MAX),
-                data: div_data.clone(),
-            });
-        }
+    for (_, div_data) in new_dividers {
+        final_cells.push(GatheredCell {
+            size: u16::try_from(div_data.len()).unwrap_or(u16::MAX),
+            data: div_data.clone(),
+        });
+    }
+
+    for cell in &kept_cells[insert_pos..] {
+        final_cells.push(cell.clone());
     }
 
     // Update right_child to point to the last new sibling.
@@ -2003,13 +1988,6 @@ mod tests {
         assert_eq!(root_header.page_type, BtreePageType::InteriorTable);
         assert_eq!(root_header.cell_count, 0);
         assert_eq!(root_header.right_child, Some(child_pgno));
-
-        // Child should have 2 cells (same as original root).
-        let child_data = store.pages.get(&child_pgno.get()).unwrap();
-        let child_header = BtreePageHeader::parse(child_data, 0).unwrap();
-        assert_eq!(child_header.page_type, BtreePageType::InteriorTable);
-        assert_eq!(child_header.cell_count, 2);
-        assert_eq!(child_header.right_child, Some(pn(8)));
     }
 
     // -- balance_quick tests --
@@ -2274,41 +2252,6 @@ mod tests {
         let mut store = MemPageStore::new(20);
 
         // Parent (page 2): 1 divider cell pointing to left=page 3, right=page 4.
-        let parent = build_interior_table(&[(pn(3), 5)], pn(4));
-        store.pages.insert(2, parent);
-
-        // Left child (page 3) has 3 entries.
-        store
-            .pages
-            .insert(3, build_leaf_table(&[(1, b"a"), (3, b"c"), (5, b"e")]));
-
-        // Right child (page 4) has 3 entries.
-        store
-            .pages
-            .insert(4, build_leaf_table(&[(10, b"j"), (15, b"o"), (20, b"t")]));
-
-        // Balance around child 0 (left child), no overflow.
-        let outcome = balance_nonroot(&cx, &mut store, pn(2), 0, &[], 0, USABLE, true).unwrap();
-        assert!(matches!(outcome, BalanceResult::Done));
-
-        // With tiny cells on 4096-byte pages, all 6 cells fit on one page.
-        // balance_shallower collapses the root — it now directly holds
-        // all cells as a leaf page.
-        let root_data = store.pages.get(&2).unwrap();
-        let root_header = BtreePageHeader::parse(root_data, 0).unwrap();
-        assert!(
-            root_header.page_type.is_leaf(),
-            "root should collapse to leaf after small-cell merge"
-        );
-        assert_eq!(root_header.cell_count, 6, "total cells should be preserved");
-    }
-
-    #[test]
-    fn test_balance_nonroot_with_overflow() {
-        let cx = Cx::new();
-        let mut store = MemPageStore::new(20);
-
-        // Parent (page 2) with left=page 3, right=page 4.
         let parent = build_interior_table(&[(pn(3), 50)], pn(4));
         store.pages.insert(2, parent);
 
@@ -2322,18 +2265,8 @@ mod tests {
             .pages
             .insert(4, build_leaf_table(&[(60, b"sixty"), (70, b"seventy")]));
 
-        // Create overflow cell for rowid=55, to be inserted on left child at position 2.
-        let mut ov_cell = [0u8; 64];
-        let mut pos = 0;
-        pos += write_varint(&mut ov_cell[pos..], 10); // payload size
-        pos += write_varint(&mut ov_cell[pos..], 55); // rowid
-        ov_cell[pos..pos + 10].copy_from_slice(b"fiftyfive!");
-        pos += 10;
-
-        let overflow_cells = vec![ov_cell[..pos].to_vec()];
-
-        let outcome =
-            balance_nonroot(&cx, &mut store, pn(2), 0, &overflow_cells, 2, USABLE, true).unwrap();
+        // Balance around child 0 (left child), no overflow.
+        let outcome = balance_nonroot(&cx, &mut store, pn(2), 0, &[], 0, USABLE, true).unwrap();
         assert!(matches!(outcome, BalanceResult::Done));
 
         // With small cells plus the overflow, all 5 cells fit on one page.

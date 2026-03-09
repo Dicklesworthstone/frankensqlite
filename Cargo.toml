@@ -138,7 +138,7 @@ fsqlite-c-api = { version = "0.1.1", path = "crates/fsqlite-c-api" }
 fsqlite-wasm = { version = "0.1.0", path = "crates/fsqlite-wasm" }
 
 # External dependencies
-ftui = { version = "0.2.1" }
+ftui = { path = "/data/projects/frankentui/crates/ftui" }
 thiserror = "2.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["preserve_order"] }

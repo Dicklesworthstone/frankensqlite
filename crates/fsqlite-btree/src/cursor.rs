@@ -1101,7 +1101,11 @@ impl<P: PageReader> BtCursor<P> {
                             .ok_or_else(|| FrankenError::internal("cursor stack empty"))?
                             .cell_idx = next_child_idx;
                         self.issue_prefetch_hint(cx, child);
-                        return self.move_to_leftmost_leaf(cx, child, true);
+                        let found = self.move_to_leftmost_leaf(cx, child, false)?;
+                        if found {
+                            return Ok(true);
+                        }
+                        return self.advance_next(cx);
                     }
                     // Index B-trees: the separator cell is the next record.
                     self.at_eof = false;
@@ -1129,7 +1133,12 @@ impl<P: PageReader> BtCursor<P> {
             .ok_or_else(|| FrankenError::internal("cursor stack empty"))?
             .cell_idx = next_child_idx;
         self.issue_prefetch_hint(cx, child);
-        self.move_to_leftmost_leaf(cx, child, true)
+        let found = self.move_to_leftmost_leaf(cx, child, false)?;
+        if found {
+            Ok(true)
+        } else {
+            self.advance_next(cx)
+        }
     }
 
     /// Move to the previous entry. Returns false if at the beginning.
@@ -1192,7 +1201,11 @@ impl<P: PageReader> BtCursor<P> {
                             .ok_or_else(|| FrankenError::internal("cursor stack empty"))?
                             .cell_idx = prev_child_idx;
                         self.issue_prefetch_hint(cx, child);
-                        return self.move_to_rightmost_leaf(cx, child, true);
+                        let found = self.move_to_rightmost_leaf(cx, child, false)?;
+                        if found {
+                            return Ok(true);
+                        }
+                        return self.advance_prev(cx);
                     }
                     // Index B-trees: stop at the separator cell.
                     self.stack
