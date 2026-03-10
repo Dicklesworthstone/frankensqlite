@@ -7621,6 +7621,38 @@ fn test_conformance_vacuum_reindex() {
 }
 
 #[test]
+fn test_conformance_analyze_sqlite_stat1() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+    let setup = [
+        "CREATE TABLE no_idx (id INTEGER PRIMARY KEY, val TEXT)",
+        "INSERT INTO no_idx VALUES (1,'a'),(2,'b')",
+        "CREATE TABLE with_idx (a INTEGER, b INTEGER)",
+        "INSERT INTO with_idx VALUES (1,10),(1,11),(2,20),(2,21),(3,30),(3,31)",
+        "CREATE INDEX idx_with_idx_ab ON with_idx(a,b)",
+    ];
+    for s in &setup {
+        fconn.execute(s).unwrap();
+        rconn.execute_batch(s).unwrap();
+    }
+
+    fconn.execute("ANALYZE").unwrap();
+    rconn.execute_batch("ANALYZE").unwrap();
+
+    let queries = [
+        "SELECT tbl, COALESCE(idx, '<null>'), stat FROM sqlite_stat1 ORDER BY tbl, COALESCE(idx, '')",
+    ];
+    let mismatches = oracle_compare(&fconn, &rconn, &queries);
+    if !mismatches.is_empty() {
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
+        panic!("{} analyze/sqlite_stat1 mismatches", mismatches.len());
+    }
+}
+
+#[test]
 fn test_conformance_complex_where_predicates() {
     let fconn = Connection::open(":memory:").unwrap();
     let rconn = rusqlite::Connection::open_in_memory().unwrap();
