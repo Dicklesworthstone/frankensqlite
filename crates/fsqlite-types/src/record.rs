@@ -307,6 +307,35 @@ pub fn parse_record_column(data: &[u8], col_idx: usize) -> Option<SqliteValue> {
     None
 }
 
+/// Count the number of serialized columns in a SQLite record without decoding
+/// the values themselves.
+///
+/// Returns `None` if the record is malformed.
+#[allow(clippy::cast_possible_truncation)]
+pub fn record_column_count(data: &[u8]) -> Option<usize> {
+    if data.is_empty() {
+        return None;
+    }
+
+    let (header_size_u64, hdr_varint_len) = read_varint(data)?;
+    let header_size = usize::try_from(header_size_u64).unwrap_or(usize::MAX);
+
+    if header_size > data.len() || header_size < hdr_varint_len {
+        return None;
+    }
+
+    let mut offset = hdr_varint_len;
+    let mut count = 0_usize;
+
+    while offset < header_size {
+        let (_, consumed) = read_varint(&data[offset..header_size])?;
+        offset += consumed;
+        count += 1;
+    }
+
+    Some(count)
+}
+
 /// Serialize a list of `SqliteValue` into the SQLite record format.
 pub fn serialize_record(values: &[SqliteValue]) -> Vec<u8> {
     serialize_record_iter(values.iter())
@@ -882,6 +911,18 @@ mod tests {
     fn malformed_record_rejects_trailing_body_bytes() {
         let data = [0x02, 0x01, 0x2A, 0x63];
         assert!(parse_record(&data).is_none());
+    }
+
+    #[test]
+    fn record_column_count_matches_encoded_values() {
+        let values = vec![
+            SqliteValue::Null,
+            SqliteValue::Integer(42),
+            SqliteValue::Text("hello".to_owned()),
+            SqliteValue::Blob(vec![1, 2, 3]),
+        ];
+        let data = serialize_record(&values);
+        assert_eq!(record_column_count(&data), Some(values.len()));
     }
 
     #[test]

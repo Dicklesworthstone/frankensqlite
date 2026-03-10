@@ -1000,6 +1000,7 @@ impl PreparedStatement<'_> {
         let reject_mem = *self.conn.reject_mem_fallback.borrow();
         let autoincrement_seq_by_root_page = self.conn.autoincrement_sequence_by_root_page();
         let rowid_alias_col_by_root_page = self.conn.rowid_alias_column_by_root_page();
+        let table_column_count_by_root_page = self.conn.table_column_count_by_root_page();
         let col_defaults_by_root_page = self.conn.column_defaults_by_root_page();
         let txn = self
             .pager
@@ -1020,6 +1021,7 @@ impl PreparedStatement<'_> {
             None,
             autoincrement_seq_by_root_page,
             rowid_alias_col_by_root_page,
+            table_column_count_by_root_page,
             col_defaults_by_root_page,
             reject_mem,
             Some(Arc::clone(&self.conn.version_store)),
@@ -7628,6 +7630,14 @@ impl Connection {
         out
     }
 
+    fn table_column_count_by_root_page(&self) -> HashMap<i32, usize> {
+        let schema = self.schema.borrow();
+        schema
+            .iter()
+            .map(|table| (table.root_page, table.columns.len()))
+            .collect()
+    }
+
     /// Build evaluated column default values keyed by root page.
     /// Used by the VDBE engine to apply ALTER TABLE ADD COLUMN defaults
     /// when a row's record has fewer columns than the current schema.
@@ -11286,8 +11296,16 @@ impl Connection {
         rowid_alias_col_idx: Option<usize>,
         defaults: Option<&[Option<SqliteValue>]>,
     ) -> Result<Vec<SqliteValue>> {
-        let payload_includes_rowid_alias =
-            rowid_alias_col_idx.is_some_and(|_| payload_values.len() == table.columns.len());
+        let payload_includes_rowid_alias = rowid_alias_col_idx.is_some_and(|ipk_idx| {
+            if payload_values.len() >= table.columns.len() {
+                return true;
+            }
+            match payload_values.get(ipk_idx) {
+                Some(SqliteValue::Null) => true,
+                Some(SqliteValue::Integer(encoded_rowid)) => *encoded_rowid == rowid,
+                _ => false,
+            }
+        });
         let mut values = Vec::with_capacity(table.columns.len());
         let mut payload_idx = 0_usize;
 
@@ -17427,6 +17445,7 @@ impl Connection {
         let reject_mem = *self.reject_mem_fallback.borrow();
         let autoincrement_seq_by_root_page = self.autoincrement_sequence_by_root_page();
         let rowid_alias_col_by_root_page = self.rowid_alias_column_by_root_page();
+        let table_column_count_by_root_page = self.table_column_count_by_root_page();
         let col_defaults_by_root_page = self.column_defaults_by_root_page();
 
         // Lend the active transaction to the VDBE engine so that storage
@@ -17461,6 +17480,7 @@ impl Connection {
             concurrent_ctx,
             autoincrement_seq_by_root_page,
             rowid_alias_col_by_root_page,
+            table_column_count_by_root_page,
             col_defaults_by_root_page,
             reject_mem,
             Some(Arc::clone(&self.version_store)),
@@ -23161,6 +23181,7 @@ fn execute_table_program_with_db(
     concurrent_ctx: Option<ConcurrentExecContext>,
     autoincrement_seq_by_root_page: HashMap<i32, i64>,
     rowid_alias_col_by_root_page: HashMap<i32, usize>,
+    table_column_count_by_root_page: HashMap<i32, usize>,
     column_defaults_by_root_page: HashMap<i32, Vec<Option<SqliteValue>>>,
     reject_mem_fallback: bool,
     version_store: Option<Arc<VersionStore>>,
@@ -23191,6 +23212,8 @@ fn execute_table_program_with_db(
         autoincrement_seq_by_root_page.into_iter().collect(),
     );
     engine.set_rowid_alias_column_by_root_page(rowid_alias_col_by_root_page.into_iter().collect());
+    engine
+        .set_table_column_count_by_root_page(table_column_count_by_root_page.into_iter().collect());
     engine.set_column_defaults_by_root_page(column_defaults_by_root_page.into_iter().collect());
     // bd-2ttd8.1: enable parity-cert mode to reject MemPageStore fallback.
     engine.set_reject_mem_fallback(reject_mem_fallback);
@@ -35556,9 +35579,37 @@ mod tests {
             retries += handle.join().expect("worker should not panic");
         }
 
+        let read_single_column_row_via_pager = |conn: &Connection| -> Option<Vec<SqliteValue>> {
+            let cx = Cx::new();
+            let mut txn = conn
+                .pager
+                .begin(&cx, fsqlite_pager::TransactionMode::ReadOnly)
+                .unwrap();
+            let mut cursor = fsqlite_btree::BtCursor::new(
+                fsqlite_btree::TransactionPageIo::new(txn.as_mut()),
+                fsqlite_types::PageNumber::new(
+                    u32::try_from(table_root_page).expect("root page should fit in u32"),
+                )
+                .expect("root page should be valid"),
+                u32::try_from(fsqlite_types::PageSize::DEFAULT.as_usize())
+                    .expect("page size should fit in u32"),
+                true,
+            );
+            let seek = cursor.table_move_to(&cx, 1).unwrap();
+            if !seek.is_found() {
+                return None;
+            }
+            let payload = cursor.payload(&cx).unwrap();
+            Some(
+                fsqlite_types::record::parse_record(&payload)
+                    .expect("pager-backed row payload should decode as a SQLite record"),
+            )
+        };
+
         let verifier = Connection::open(&db).unwrap();
         let row = verifier.query_row("SELECT v FROM t WHERE id = 1;").unwrap();
         let final_cell = row.get(0).cloned().unwrap_or(SqliteValue::Null);
+        let pager_values_before_close = read_single_column_row_via_pager(&verifier);
         let wal_path = wal_path_for_db_path(&db);
         let wal_len_before_close = std::fs::metadata(&wal_path).ok().map(|meta| meta.len());
         let (
@@ -35589,6 +35640,9 @@ mod tests {
             (journal_mode, integrity_check, typeof_v, quote_v, value)
         };
         drop(verifier);
+        let reopened = Connection::open(&db).unwrap();
+        let pager_values_after_close = read_single_column_row_via_pager(&reopened);
+        drop(reopened);
         let wal_len_after_close = std::fs::metadata(&wal_path).ok().map(|meta| meta.len());
         let (
             sqlite_journal_mode_after_close,
@@ -35618,24 +35672,188 @@ mod tests {
             (journal_mode, integrity_check, typeof_v, quote_v, value)
         };
         let expected = i64::try_from(WORKERS * TXNS_PER_WORKER).unwrap();
+        assert_eq!(
+            pager_values_before_close,
+            Some(vec![SqliteValue::Integer(expected)]),
+            "bd-rjc pager-backed mismatch before close: final_cell={final_cell:?} expected={expected} retries={retries} pager_before={pager_values_before_close:?} pager_after={pager_values_after_close:?} wal_len_before_close={wal_len_before_close:?} wal_len_after_close={wal_len_after_close:?} sqlite_before=(journal_mode={sqlite_journal_mode_before_close:?}, integrity={sqlite_integrity_before_close:?}, typeof={sqlite_typeof_before_close:?}, quote={sqlite_quote_before_close:?}, value={sqlite_value_before_close:?}) sqlite_after=(journal_mode={sqlite_journal_mode_after_close:?}, integrity={sqlite_integrity_after_close:?}, typeof={sqlite_typeof_after_close:?}, quote={sqlite_quote_after_close:?}, value={sqlite_value_after_close:?})"
+        );
+        assert_eq!(
+            pager_values_after_close,
+            Some(vec![SqliteValue::Integer(expected)]),
+            "bd-rjc pager-backed mismatch after close: final_cell={final_cell:?} expected={expected} retries={retries} pager_before={pager_values_before_close:?} pager_after={pager_values_after_close:?} wal_len_before_close={wal_len_before_close:?} wal_len_after_close={wal_len_after_close:?} sqlite_before=(journal_mode={sqlite_journal_mode_before_close:?}, integrity={sqlite_integrity_before_close:?}, typeof={sqlite_typeof_before_close:?}, quote={sqlite_quote_before_close:?}, value={sqlite_value_before_close:?}) sqlite_after=(journal_mode={sqlite_journal_mode_after_close:?}, integrity={sqlite_integrity_after_close:?}, typeof={sqlite_typeof_after_close:?}, quote={sqlite_quote_after_close:?}, value={sqlite_value_after_close:?})"
+        );
         assert!(
             matches!(final_cell, SqliteValue::Integer(_)),
-            "bd-rjc verifier returned non-integer: final_cell={final_cell:?} expected={expected} retries={retries} wal_len_before_close={wal_len_before_close:?} wal_len_after_close={wal_len_after_close:?} sqlite_before=(journal_mode={sqlite_journal_mode_before_close:?}, integrity={sqlite_integrity_before_close:?}, typeof={sqlite_typeof_before_close:?}, quote={sqlite_quote_before_close:?}, value={sqlite_value_before_close:?}) sqlite_after=(journal_mode={sqlite_journal_mode_after_close:?}, integrity={sqlite_integrity_after_close:?}, typeof={sqlite_typeof_after_close:?}, quote={sqlite_quote_after_close:?}, value={sqlite_value_after_close:?})"
+            "bd-rjc verifier returned non-integer: final_cell={final_cell:?} expected={expected} retries={retries} pager_before={pager_values_before_close:?} pager_after={pager_values_after_close:?} wal_len_before_close={wal_len_before_close:?} wal_len_after_close={wal_len_after_close:?} sqlite_before=(journal_mode={sqlite_journal_mode_before_close:?}, integrity={sqlite_integrity_before_close:?}, typeof={sqlite_typeof_before_close:?}, quote={sqlite_quote_before_close:?}, value={sqlite_value_before_close:?}) sqlite_after=(journal_mode={sqlite_journal_mode_after_close:?}, integrity={sqlite_integrity_after_close:?}, typeof={sqlite_typeof_after_close:?}, quote={sqlite_quote_after_close:?}, value={sqlite_value_after_close:?})"
         );
         assert_eq!(
             sqlite_value_before_close,
             rusqlite::types::Value::Integer(expected),
-            "bd-rjc oracle mismatch before close: final_cell={final_cell:?} expected={expected} retries={retries} wal_len_before_close={wal_len_before_close:?} wal_len_after_close={wal_len_after_close:?} sqlite_before=(journal_mode={sqlite_journal_mode_before_close:?}, integrity={sqlite_integrity_before_close:?}, typeof={sqlite_typeof_before_close:?}, quote={sqlite_quote_before_close:?}, value={sqlite_value_before_close:?}) sqlite_after=(journal_mode={sqlite_journal_mode_after_close:?}, integrity={sqlite_integrity_after_close:?}, typeof={sqlite_typeof_after_close:?}, quote={sqlite_quote_after_close:?}, value={sqlite_value_after_close:?})"
+            "bd-rjc oracle mismatch before close: final_cell={final_cell:?} expected={expected} retries={retries} pager_before={pager_values_before_close:?} pager_after={pager_values_after_close:?} wal_len_before_close={wal_len_before_close:?} wal_len_after_close={wal_len_after_close:?} sqlite_before=(journal_mode={sqlite_journal_mode_before_close:?}, integrity={sqlite_integrity_before_close:?}, typeof={sqlite_typeof_before_close:?}, quote={sqlite_quote_before_close:?}, value={sqlite_value_before_close:?}) sqlite_after=(journal_mode={sqlite_journal_mode_after_close:?}, integrity={sqlite_integrity_after_close:?}, typeof={sqlite_typeof_after_close:?}, quote={sqlite_quote_after_close:?}, value={sqlite_value_after_close:?})"
         );
         assert_eq!(
             sqlite_value_after_close,
             rusqlite::types::Value::Integer(expected),
-            "bd-rjc oracle mismatch after close: final_cell={final_cell:?} expected={expected} retries={retries} wal_len_before_close={wal_len_before_close:?} wal_len_after_close={wal_len_after_close:?} sqlite_before=(journal_mode={sqlite_journal_mode_before_close:?}, integrity={sqlite_integrity_before_close:?}, typeof={sqlite_typeof_before_close:?}, quote={sqlite_quote_before_close:?}, value={sqlite_value_before_close:?}) sqlite_after=(journal_mode={sqlite_journal_mode_after_close:?}, integrity={sqlite_integrity_after_close:?}, typeof={sqlite_typeof_after_close:?}, quote={sqlite_quote_after_close:?}, value={sqlite_value_after_close:?})"
+            "bd-rjc oracle mismatch after close: final_cell={final_cell:?} expected={expected} retries={retries} pager_before={pager_values_before_close:?} pager_after={pager_values_after_close:?} wal_len_before_close={wal_len_before_close:?} wal_len_after_close={wal_len_after_close:?} sqlite_before=(journal_mode={sqlite_journal_mode_before_close:?}, integrity={sqlite_integrity_before_close:?}, typeof={sqlite_typeof_before_close:?}, quote={sqlite_quote_before_close:?}, value={sqlite_value_before_close:?}) sqlite_after=(journal_mode={sqlite_journal_mode_after_close:?}, integrity={sqlite_integrity_after_close:?}, typeof={sqlite_typeof_after_close:?}, quote={sqlite_quote_after_close:?}, value={sqlite_value_after_close:?})"
         );
         assert_eq!(
             final_cell,
             SqliteValue::Integer(expected),
-            "bd-rjc single-account probe mismatch: final_cell={final_cell:?} expected={expected} retries={retries} wal_len_before_close={wal_len_before_close:?} wal_len_after_close={wal_len_after_close:?} sqlite_before=(journal_mode={sqlite_journal_mode_before_close:?}, integrity={sqlite_integrity_before_close:?}, typeof={sqlite_typeof_before_close:?}, quote={sqlite_quote_before_close:?}, value={sqlite_value_before_close:?}) sqlite_after=(journal_mode={sqlite_journal_mode_after_close:?}, integrity={sqlite_integrity_after_close:?}, typeof={sqlite_typeof_after_close:?}, quote={sqlite_quote_after_close:?}, value={sqlite_value_after_close:?})"
+            "bd-rjc single-account probe mismatch: final_cell={final_cell:?} expected={expected} retries={retries} pager_before={pager_values_before_close:?} pager_after={pager_values_after_close:?} wal_len_before_close={wal_len_before_close:?} wal_len_after_close={wal_len_after_close:?} sqlite_before=(journal_mode={sqlite_journal_mode_before_close:?}, integrity={sqlite_integrity_before_close:?}, typeof={sqlite_typeof_before_close:?}, quote={sqlite_quote_before_close:?}, value={sqlite_value_before_close:?}) sqlite_after=(journal_mode={sqlite_journal_mode_after_close:?}, integrity={sqlite_integrity_after_close:?}, typeof={sqlite_typeof_after_close:?}, quote={sqlite_quote_after_close:?}, value={sqlite_value_after_close:?})"
+        );
+    }
+
+    #[test]
+    fn test_sequential_single_account_increment_oracle_probe_bd_rjc() {
+        const TXNS: usize = 640;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("bd_rjc_sequential_single_account_probe.db");
+        let db = db_path.to_string_lossy().to_string();
+        let table_root_page = {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute("PRAGMA busy_timeout=5000;").unwrap();
+            conn.execute("PRAGMA fsqlite.concurrent_mode=ON;").unwrap();
+            conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL);")
+                .unwrap();
+            let root_page = conn
+                .schema
+                .borrow()
+                .iter()
+                .find(|table| table.name.eq_ignore_ascii_case("t"))
+                .map(|table| table.root_page)
+                .expect("table t should exist after CREATE TABLE");
+            conn.execute("INSERT INTO t (id, v) VALUES (1, 0);")
+                .unwrap();
+            root_page
+        };
+
+        let conn = Connection::open(&db).unwrap();
+        conn.execute("PRAGMA busy_timeout=5000;").unwrap();
+        conn.execute("PRAGMA fsqlite.concurrent_mode=ON;").unwrap();
+        for _ in 0..TXNS {
+            let changes = conn.execute("UPDATE t SET v = v + 1 WHERE id = 1;").unwrap();
+            assert_eq!(changes, 1, "expected one-row sequential update");
+        }
+        drop(conn);
+
+        let read_single_column_row_via_pager = |conn: &Connection| -> Option<Vec<SqliteValue>> {
+            let cx = Cx::new();
+            let mut txn = conn
+                .pager
+                .begin(&cx, fsqlite_pager::TransactionMode::ReadOnly)
+                .unwrap();
+            let mut cursor = fsqlite_btree::BtCursor::new(
+                fsqlite_btree::TransactionPageIo::new(txn.as_mut()),
+                fsqlite_types::PageNumber::new(
+                    u32::try_from(table_root_page).expect("root page should fit in u32"),
+                )
+                .expect("root page should be valid"),
+                u32::try_from(fsqlite_types::PageSize::DEFAULT.as_usize())
+                    .expect("page size should fit in u32"),
+                true,
+            );
+            let seek = cursor.table_move_to(&cx, 1).unwrap();
+            if !seek.is_found() {
+                return None;
+            }
+            let payload = cursor.payload(&cx).unwrap();
+            Some(
+                fsqlite_types::record::parse_record(&payload)
+                    .expect("pager-backed row payload should decode as a SQLite record"),
+            )
+        };
+
+        let verifier = Connection::open(&db).unwrap();
+        let row = verifier.query_row("SELECT v FROM t WHERE id = 1;").unwrap();
+        let final_cell = row.get(0).cloned().unwrap_or(SqliteValue::Null);
+        let pager_values_before_close = read_single_column_row_via_pager(&verifier);
+        let wal_path = wal_path_for_db_path(&db);
+        let wal_len_before_close = std::fs::metadata(&wal_path).ok().map(|meta| meta.len());
+        let (
+            sqlite_journal_mode_before_close,
+            sqlite_integrity_before_close,
+            sqlite_typeof_before_close,
+            sqlite_quote_before_close,
+            sqlite_value_before_close,
+        ) = {
+            let sqlite = rusqlite::Connection::open(&db).unwrap();
+            let journal_mode: String = sqlite
+                .query_row("PRAGMA journal_mode;", [], |row| row.get(0))
+                .unwrap();
+            let integrity_check: String = sqlite
+                .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+                .unwrap();
+            let typeof_v: String = sqlite
+                .query_row("SELECT typeof(v) FROM t WHERE id = 1;", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            let quote_v: String = sqlite
+                .query_row("SELECT quote(v) FROM t WHERE id = 1;", [], |row| row.get(0))
+                .unwrap();
+            let value: rusqlite::types::Value = sqlite
+                .query_row("SELECT v FROM t WHERE id = 1;", [], |row| row.get(0))
+                .unwrap();
+            (journal_mode, integrity_check, typeof_v, quote_v, value)
+        };
+        drop(verifier);
+        let reopened = Connection::open(&db).unwrap();
+        let pager_values_after_close = read_single_column_row_via_pager(&reopened);
+        drop(reopened);
+        let wal_len_after_close = std::fs::metadata(&wal_path).ok().map(|meta| meta.len());
+        let (
+            sqlite_journal_mode_after_close,
+            sqlite_integrity_after_close,
+            sqlite_typeof_after_close,
+            sqlite_quote_after_close,
+            sqlite_value_after_close,
+        ) = {
+            let sqlite = rusqlite::Connection::open(&db).unwrap();
+            let journal_mode: String = sqlite
+                .query_row("PRAGMA journal_mode;", [], |row| row.get(0))
+                .unwrap();
+            let integrity_check: String = sqlite
+                .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+                .unwrap();
+            let typeof_v: String = sqlite
+                .query_row("SELECT typeof(v) FROM t WHERE id = 1;", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            let quote_v: String = sqlite
+                .query_row("SELECT quote(v) FROM t WHERE id = 1;", [], |row| row.get(0))
+                .unwrap();
+            let value: rusqlite::types::Value = sqlite
+                .query_row("SELECT v FROM t WHERE id = 1;", [], |row| row.get(0))
+                .unwrap();
+            (journal_mode, integrity_check, typeof_v, quote_v, value)
+        };
+        let expected = i64::try_from(TXNS).unwrap();
+        assert_eq!(
+            pager_values_before_close,
+            Some(vec![SqliteValue::Integer(expected)]),
+            "bd-rjc sequential pager-backed mismatch before close: final_cell={final_cell:?} expected={expected} pager_before={pager_values_before_close:?} pager_after={pager_values_after_close:?} wal_len_before_close={wal_len_before_close:?} wal_len_after_close={wal_len_after_close:?} sqlite_before=(journal_mode={sqlite_journal_mode_before_close:?}, integrity={sqlite_integrity_before_close:?}, typeof={sqlite_typeof_before_close:?}, quote={sqlite_quote_before_close:?}, value={sqlite_value_before_close:?}) sqlite_after=(journal_mode={sqlite_journal_mode_after_close:?}, integrity={sqlite_integrity_after_close:?}, typeof={sqlite_typeof_after_close:?}, quote={sqlite_quote_after_close:?}, value={sqlite_value_after_close:?})"
+        );
+        assert_eq!(
+            pager_values_after_close,
+            Some(vec![SqliteValue::Integer(expected)]),
+            "bd-rjc sequential pager-backed mismatch after close: final_cell={final_cell:?} expected={expected} pager_before={pager_values_before_close:?} pager_after={pager_values_after_close:?} wal_len_before_close={wal_len_before_close:?} wal_len_after_close={wal_len_after_close:?} sqlite_before=(journal_mode={sqlite_journal_mode_before_close:?}, integrity={sqlite_integrity_before_close:?}, typeof={sqlite_typeof_before_close:?}, quote={sqlite_quote_before_close:?}, value={sqlite_value_before_close:?}) sqlite_after=(journal_mode={sqlite_journal_mode_after_close:?}, integrity={sqlite_integrity_after_close:?}, typeof={sqlite_typeof_after_close:?}, quote={sqlite_quote_after_close:?}, value={sqlite_value_after_close:?})"
+        );
+        assert_eq!(
+            sqlite_value_before_close,
+            rusqlite::types::Value::Integer(expected),
+            "bd-rjc sequential oracle mismatch before close: final_cell={final_cell:?} expected={expected} pager_before={pager_values_before_close:?} pager_after={pager_values_after_close:?} wal_len_before_close={wal_len_before_close:?} wal_len_after_close={wal_len_after_close:?} sqlite_before=(journal_mode={sqlite_journal_mode_before_close:?}, integrity={sqlite_integrity_before_close:?}, typeof={sqlite_typeof_before_close:?}, quote={sqlite_quote_before_close:?}, value={sqlite_value_before_close:?}) sqlite_after=(journal_mode={sqlite_journal_mode_after_close:?}, integrity={sqlite_integrity_after_close:?}, typeof={sqlite_typeof_after_close:?}, quote={sqlite_quote_after_close:?}, value={sqlite_value_after_close:?})"
+        );
+        assert_eq!(
+            sqlite_value_after_close,
+            rusqlite::types::Value::Integer(expected),
+            "bd-rjc sequential oracle mismatch after close: final_cell={final_cell:?} expected={expected} pager_before={pager_values_before_close:?} pager_after={pager_values_after_close:?} wal_len_before_close={wal_len_before_close:?} wal_len_after_close={wal_len_after_close:?} sqlite_before=(journal_mode={sqlite_journal_mode_before_close:?}, integrity={sqlite_integrity_before_close:?}, typeof={sqlite_typeof_before_close:?}, quote={sqlite_quote_before_close:?}, value={sqlite_value_before_close:?}) sqlite_after=(journal_mode={sqlite_journal_mode_after_close:?}, integrity={sqlite_integrity_after_close:?}, typeof={sqlite_typeof_after_close:?}, quote={sqlite_quote_after_close:?}, value={sqlite_value_after_close:?})"
+        );
+        assert_eq!(
+            final_cell,
+            SqliteValue::Integer(expected),
+            "bd-rjc sequential single-account probe mismatch: final_cell={final_cell:?} expected={expected} pager_before={pager_values_before_close:?} pager_after={pager_values_after_close:?} wal_len_before_close={wal_len_before_close:?} wal_len_after_close={wal_len_after_close:?} sqlite_before=(journal_mode={sqlite_journal_mode_before_close:?}, integrity={sqlite_integrity_before_close:?}, typeof={sqlite_typeof_before_close:?}, quote={sqlite_quote_before_close:?}, value={sqlite_value_before_close:?}) sqlite_after=(journal_mode={sqlite_journal_mode_after_close:?}, integrity={sqlite_integrity_after_close:?}, typeof={sqlite_typeof_after_close:?}, quote={sqlite_quote_after_close:?}, value={sqlite_value_after_close:?})"
         );
     }
 
@@ -40467,6 +40685,80 @@ mod schema_loading_tests {
     }
 
     #[test]
+    fn test_reopened_autoincrement_table_where_order_by_returns_correct_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("comments_ordered_reopen.db");
+        let db_str = db_path.to_str().unwrap();
+
+        {
+            let conn = Connection::open(db_str).unwrap();
+            conn.execute(
+                "CREATE TABLE comments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    issue_id TEXT NOT NULL,
+                    author TEXT NOT NULL,
+                    text TEXT NOT NULL,
+                    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );",
+            )
+            .unwrap();
+            conn.execute("CREATE INDEX idx_comments_issue ON comments (issue_id);")
+                .unwrap();
+            conn.execute("CREATE INDEX idx_comments_created_at ON comments (created_at);")
+                .unwrap();
+            conn.execute(
+                "INSERT INTO comments (issue_id, author, text, created_at) VALUES
+                    ('bd-1', 'Ada', 'first', '2026-03-10T17:23:42+00:00'),
+                    ('bd-2', 'Bea', 'other', '2026-03-10T17:23:43+00:00'),
+                    ('bd-1', 'Cy', 'second', '2026-03-10T17:23:44+00:00');",
+            )
+            .unwrap();
+        }
+
+        let conn = Connection::open(db_str).unwrap();
+        let rows = conn
+            .query_with_params(
+                "SELECT id, issue_id, author, text, created_at
+                 FROM comments
+                 WHERE issue_id = ?
+                 ORDER BY created_at ASC",
+                &[SqliteValue::from("bd-1")],
+            )
+            .unwrap();
+
+        assert_eq!(rows.len(), 2);
+
+        assert_eq!(
+            rows[0].get(0).and_then(SqliteValue::as_integer),
+            Some(1),
+            "first row should expose the rowid/IPK as id",
+        );
+        assert_eq!(
+            rows[0].get(1).and_then(SqliteValue::as_text),
+            Some("bd-1"),
+            "issue_id should remain a text column after reopen and ORDER BY planning",
+        );
+        assert_eq!(rows[0].get(2).and_then(SqliteValue::as_text), Some("Ada"));
+        assert_eq!(rows[0].get(3).and_then(SqliteValue::as_text), Some("first"));
+        assert_eq!(
+            rows[0].get(4).and_then(SqliteValue::as_text),
+            Some("2026-03-10T17:23:42+00:00"),
+        );
+
+        assert_eq!(rows[1].get(0).and_then(SqliteValue::as_integer), Some(3),);
+        assert_eq!(rows[1].get(1).and_then(SqliteValue::as_text), Some("bd-1"));
+        assert_eq!(rows[1].get(2).and_then(SqliteValue::as_text), Some("Cy"));
+        assert_eq!(
+            rows[1].get(3).and_then(SqliteValue::as_text),
+            Some("second")
+        );
+        assert_eq!(
+            rows[1].get(4).and_then(SqliteValue::as_text),
+            Some("2026-03-10T17:23:44+00:00"),
+        );
+    }
+
+    #[test]
     fn test_update_preserves_rowid_alias_after_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("ipk_update_reopen.db");
@@ -41940,6 +42232,21 @@ mod schema_loading_tests {
 mod pager_routing_tests {
     use super::*;
 
+    fn init_publication_test_tracing() {
+        static TRACING_INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        TRACING_INIT.get_or_init(|| {
+            if tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::TRACE)
+                .with_test_writer()
+                .try_init()
+                .is_err()
+            {
+                // Another test already installed a global subscriber.
+            }
+        });
+    }
+
     // bd-zjisk.1: Parity-cert mode defaults to ON.
     #[test]
     fn test_reject_mem_fallback_default_on() {
@@ -42421,6 +42728,7 @@ mod pager_routing_tests {
 
     #[test]
     fn test_memdb_visible_commit_seq_drives_stale_detection() {
+        init_publication_test_tracing();
         // After a commit from one connection, a second connection should see the
         // updated data when it starts a new read — proving the stale-detection
         // mechanism driven by memdb_visible_commit_seq works correctly.
@@ -42939,6 +43247,7 @@ mod pager_routing_tests {
 
     #[test]
     fn test_visibility_interleavings_fixed_seed_matrix() {
+        init_publication_test_tracing();
         // Fixed-seed property-style stress over interleaved two-connection
         // operations. Verifies:
         // 1) global commit sequence never regresses

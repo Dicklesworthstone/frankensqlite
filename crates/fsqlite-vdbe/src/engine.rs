@@ -2584,8 +2584,11 @@ pub struct VdbeEngine {
     /// Populated from `sqlite_sequence` by the Connection before execution.
     autoincrement_seq_by_root_page: HashMap<i32, i64>,
     /// INTEGER PRIMARY KEY alias column positions keyed by root page number.
-    /// Used to decode storage-cursor payload columns that omit the rowid alias.
+    /// Used to decode storage-cursor payload columns for rowid tables.
     rowid_alias_col_by_root_page: HashMap<i32, usize>,
+    /// Declared table column counts keyed by root page number.
+    /// Used to distinguish canonical SQLite payloads from legacy short records.
+    table_column_count_by_root_page: HashMap<i32, usize>,
     /// Per-cursor monotonic sequence counters for `Opcode::Sequence`.
     sequence_counters: HashMap<i32, i64>,
     /// Column default values by root page number (for ALTER TABLE ADD COLUMN).
@@ -2928,6 +2931,7 @@ impl VdbeEngine {
             fk_counter: 0,
             autoincrement_seq_by_root_page: HashMap::new(),
             rowid_alias_col_by_root_page: HashMap::new(),
+            table_column_count_by_root_page: HashMap::new(),
             sequence_counters: HashMap::new(),
             column_defaults_by_root_page: HashMap::new(),
             cursor_root_pages: HashMap::new(),
@@ -3220,6 +3224,11 @@ impl VdbeEngine {
     /// Provide INTEGER PRIMARY KEY alias column positions keyed by root page.
     pub fn set_rowid_alias_column_by_root_page(&mut self, map: HashMap<i32, usize>) {
         self.rowid_alias_col_by_root_page = map;
+    }
+
+    /// Provide declared table column counts keyed by root page.
+    pub fn set_table_column_count_by_root_page(&mut self, map: HashMap<i32, usize>) {
+        self.table_column_count_by_root_page = map;
     }
 
     /// Set column default values by root page, used for ALTER TABLE ADD COLUMN.
@@ -7188,16 +7197,33 @@ impl VdbeEngine {
                 .cursor
                 .payload_into(&cursor.cx, &mut cursor.payload_buf)?;
 
-            let ipk_col_idx = self
-                .cursor_root_pages
-                .get(&cursor_id)
-                .and_then(|root_page| self.rowid_alias_col_by_root_page.get(root_page))
+            let root_page = self.cursor_root_pages.get(&cursor_id).copied();
+            let rowid = cursor.cursor.rowid(&cursor.cx)?;
+            let ipk_col_idx = root_page
+                .and_then(|root_page| self.rowid_alias_col_by_root_page.get(&root_page))
                 .copied();
+            let payload_includes_rowid_alias =
+                root_page
+                    .zip(ipk_col_idx)
+                    .is_some_and(|(root_page, ipk_col_idx)| {
+                        payload_includes_rowid_alias(
+                            &cursor.payload_buf,
+                            rowid,
+                            ipk_col_idx,
+                            self.table_column_count_by_root_page
+                                .get(&root_page)
+                                .copied(),
+                        )
+                    });
             let payload_idx = if let Some(ipk) = ipk_col_idx {
                 if col_idx == ipk {
-                    return self.cursor_rowid(cursor_id);
+                    return Ok(SqliteValue::Integer(rowid));
                 }
-                if col_idx > ipk { col_idx - 1 } else { col_idx }
+                if col_idx > ipk && !payload_includes_rowid_alias {
+                    col_idx - 1
+                } else {
+                    col_idx
+                }
             } else {
                 col_idx
             };
@@ -7908,6 +7934,29 @@ fn find_conflicting_rowid_in_index(
 
 fn encode_record(values: &[SqliteValue]) -> Vec<u8> {
     serialize_record(values)
+}
+
+fn payload_includes_rowid_alias(
+    payload: &[u8],
+    rowid: i64,
+    ipk_col_idx: usize,
+    table_column_count: Option<usize>,
+) -> bool {
+    let payload_column_count = fsqlite_types::record::record_column_count(payload);
+    if let (Some(payload_cols), Some(table_cols)) = (payload_column_count, table_column_count)
+        && payload_cols >= table_cols
+    {
+        return true;
+    }
+    if payload_column_count.is_some_and(|payload_cols| payload_cols <= ipk_col_idx) {
+        return false;
+    }
+
+    match fsqlite_types::record::parse_record_column(payload, ipk_col_idx) {
+        Some(SqliteValue::Null) => true,
+        Some(SqliteValue::Integer(encoded_rowid)) => encoded_rowid == rowid,
+        _ => false,
+    }
 }
 
 #[allow(dead_code)]

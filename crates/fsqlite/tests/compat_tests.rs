@@ -10,6 +10,7 @@ use fsqlite::compat::*;
 use fsqlite::params;
 use fsqlite_error::FrankenError;
 use fsqlite_types::value::SqliteValue;
+use rusqlite::Connection as RusqliteConnection;
 
 // ===========================================================================
 // 1. PARAMS MACRO
@@ -1005,5 +1006,77 @@ mod rusqlite_parity {
             .collect();
 
         assert_parity("COALESCE", r, f);
+    }
+
+    #[test]
+    fn parity_sqlite_created_integer_primary_key_rows_do_not_shift_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("projects.db");
+
+        {
+            let conn = RusqliteConnection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "
+                CREATE TABLE projects(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    slug TEXT NOT NULL UNIQUE,
+                    human_key TEXT NOT NULL,
+                    created_at INTEGER NOT NULL
+                );
+                CREATE INDEX idx_projects_human_key ON projects(human_key);
+                CREATE INDEX idx_projects_created_id_desc ON projects(created_at DESC, id DESC);
+                ",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO projects(slug, human_key, created_at) VALUES (?1, ?2, ?3)",
+                rusqlite::params!["slug-001", "/path/001", 1_773_076_744_605_941_i64],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO projects(slug, human_key, created_at) VALUES (?1, ?2, ?3)",
+                rusqlite::params!["slug-002", "/path/002", 1_773_076_744_605_942_i64],
+            )
+            .unwrap();
+        }
+
+        let conn = Connection::open(db_path.to_str().unwrap()).unwrap();
+        let rows = conn
+            .query("SELECT id, slug, human_key, created_at FROM projects ORDER BY id")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0].values(),
+            vec![
+                SqliteValue::Integer(1),
+                SqliteValue::Text("slug-001".to_owned()),
+                SqliteValue::Text("/path/001".to_owned()),
+                SqliteValue::Integer(1_773_076_744_605_941),
+            ]
+        );
+        assert_eq!(
+            rows[1].values(),
+            vec![
+                SqliteValue::Integer(2),
+                SqliteValue::Text("slug-002".to_owned()),
+                SqliteValue::Text("/path/002".to_owned()),
+                SqliteValue::Integer(1_773_076_744_605_942),
+            ]
+        );
+
+        let row = conn
+            .query_row(
+                "SELECT id, slug, human_key, created_at FROM projects WHERE slug = 'slug-002'",
+            )
+            .unwrap();
+        assert_eq!(
+            row.values(),
+            vec![
+                SqliteValue::Integer(2),
+                SqliteValue::Text("slug-002".to_owned()),
+                SqliteValue::Text("/path/002".to_owned()),
+                SqliteValue::Integer(1_773_076_744_605_942),
+            ]
+        );
     }
 }
