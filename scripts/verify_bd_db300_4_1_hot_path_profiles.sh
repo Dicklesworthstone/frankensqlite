@@ -13,12 +13,14 @@
 #   artifacts/perf/bd-db300.4.1/inline/
 #     events.jsonl
 #     run_records.jsonl
+#     opcode_profile_packs.json
+#     subsystem_profile_packs.json
 #     scenario_profiles.json
 #     actionable_ranking.json
 #     benchmark_context.json
 #     report.json
 #     summary.md
-#     runs/<scenario>__<fixture>/{profile.json,actionable_ranking.json,summary.md,manifest.json}
+#     runs/<scenario>__<fixture>/{profile.json,opcode_profile.json,subsystem_profile.json,actionable_ranking.json,summary.md,manifest.json}
 
 set -euo pipefail
 
@@ -33,6 +35,8 @@ RUNS_DIR="${OUTPUT_DIR}/runs"
 SYNC_GOLDEN_DIR="${SYNC_GOLDEN_DIR:-${OUTPUT_DIR}/golden}"
 LOG_FILE="${OUTPUT_DIR}/events.jsonl"
 RUN_RECORDS_JSONL="${OUTPUT_DIR}/run_records.jsonl"
+OPCODE_PROFILE_PACKS_JSON="${OUTPUT_DIR}/opcode_profile_packs.json"
+SUBSYSTEM_PROFILE_PACKS_JSON="${OUTPUT_DIR}/subsystem_profile_packs.json"
 SCENARIO_PROFILES_JSON="${OUTPUT_DIR}/scenario_profiles.json"
 ACTIONABLE_RANKING_JSON="${OUTPUT_DIR}/actionable_ranking.json"
 BENCHMARK_CONTEXT_JSON="${OUTPUT_DIR}/benchmark_context.json"
@@ -46,6 +50,8 @@ CARGO_PROFILE="${CARGO_PROFILE:-release}"
 RCH_TARGET_DIR="${RCH_TARGET_DIR:-/tmp/rch_target_bd_db300_4_1}"
 HOT_PATH_PROFILE_SCHEMA="fsqlite-e2e.hot_path_profile.v1"
 HOT_PATH_PROFILE_MANIFEST_SCHEMA="fsqlite-e2e.hot_path_profile_manifest.v1"
+HOT_PATH_OPCODE_PROFILE_SCHEMA="fsqlite-e2e.hot_path_opcode_profile.v1"
+HOT_PATH_SUBSYSTEM_PROFILE_SCHEMA="fsqlite-e2e.hot_path_subsystem_profile.v1"
 HOT_PATH_ACTIONABLE_RANKING_SCHEMA="fsqlite-e2e.hot_path_actionable_ranking.v1"
 HOT_PATH_INLINE_BUNDLE_SCHEMA="fsqlite-e2e.hot_path_inline_bundle.v1"
 HOT_PATH_INLINE_BUNDLE_PREFIX="HOT_PATH_INLINE_BUNDLE_JSON="
@@ -102,6 +108,8 @@ preseed_output_bundle() {
 
     mkdir -p "${scenario_dir}"
     : > "${scenario_dir}/profile.json"
+    : > "${scenario_dir}/opcode_profile.json"
+    : > "${scenario_dir}/subsystem_profile.json"
     : > "${scenario_dir}/actionable_ranking.json"
     : > "${scenario_dir}/summary.md"
     : > "${scenario_dir}/manifest.json"
@@ -122,6 +130,8 @@ materialize_output_bundle_from_log() {
         || fail "run" "invalid inline hot-path bundle in ${stderr_log}"
 
     printf '%s\n' "${bundle_line}" | jq '.profile' > "${scenario_dir}/profile.json"
+    printf '%s\n' "${bundle_line}" | jq '.opcode_profile' > "${scenario_dir}/opcode_profile.json"
+    printf '%s\n' "${bundle_line}" | jq '.subsystem_profile' > "${scenario_dir}/subsystem_profile.json"
     printf '%s\n' "${bundle_line}" | jq '.actionable_ranking' > "${scenario_dir}/actionable_ranking.json"
     printf '%s\n' "${bundle_line}" | jq -r '.summary_markdown' > "${scenario_dir}/summary.md"
     printf '%s\n' "${bundle_line}" | jq '.manifest' > "${scenario_dir}/manifest.json"
@@ -209,6 +219,8 @@ capture_run_record() {
         --argjson seed "${SEED}" \
         --argjson scale "${SCALE}" \
         --slurpfile profile "${scenario_dir}/profile.json" \
+        --slurpfile opcode_profile "${scenario_dir}/opcode_profile.json" \
+        --slurpfile subsystem_profile "${scenario_dir}/subsystem_profile.json" \
         --slurpfile actionable_ranking "${scenario_dir}/actionable_ranking.json" \
         --slurpfile manifest "${scenario_dir}/manifest.json" \
         '
@@ -228,6 +240,8 @@ capture_run_record() {
             stdout_log: $stdout_log,
             stderr_log: $stderr_log,
             profile: $profile[0],
+            opcode_profile_pack: $opcode_profile[0],
+            subsystem_profile_pack: $subsystem_profile[0],
             actionable_ranking: $actionable_ranking[0],
             manifest: $manifest[0]
         }
@@ -269,6 +283,8 @@ run_hot_profile() {
 
     materialize_output_bundle_from_log "${scenario_dir}" "${stderr_log}"
     require_json_schema "${scenario_dir}/profile.json" "${HOT_PATH_PROFILE_SCHEMA}"
+    require_json_schema "${scenario_dir}/opcode_profile.json" "${HOT_PATH_OPCODE_PROFILE_SCHEMA}"
+    require_json_schema "${scenario_dir}/subsystem_profile.json" "${HOT_PATH_SUBSYSTEM_PROFILE_SCHEMA}"
     require_json_schema "${scenario_dir}/actionable_ranking.json" "${HOT_PATH_ACTIONABLE_RANKING_SCHEMA}"
     require_nonempty_file "${scenario_dir}/summary.md"
     require_json_schema "${scenario_dir}/manifest.json" "${HOT_PATH_PROFILE_MANIFEST_SCHEMA}"
@@ -296,6 +312,56 @@ build_scenario_profiles() {
             runs: .
         }
         ' "${RUN_RECORDS_JSONL}" > "${SCENARIO_PROFILES_JSON}"
+}
+
+build_opcode_profile_packs() {
+    jq -s \
+        --arg bead_id "${BEAD_ID}" \
+        --arg run_id "${RUN_ID}" \
+        --arg generated_at "${GENERATED_AT}" \
+        '
+        {
+            schema_version: "fsqlite-e2e.hot_path_campaign_opcode_packs.v1",
+            bead_id: $bead_id,
+            run_id: $run_id,
+            generated_at: $generated_at,
+            runs: [
+                .[] | {
+                    scenario_id,
+                    fixture_id,
+                    mode_id,
+                    engine_label,
+                    output_dir,
+                    opcode_profile: .opcode_profile_pack
+                }
+            ]
+        }
+        ' "${RUN_RECORDS_JSONL}" > "${OPCODE_PROFILE_PACKS_JSON}"
+}
+
+build_subsystem_profile_packs() {
+    jq -s \
+        --arg bead_id "${BEAD_ID}" \
+        --arg run_id "${RUN_ID}" \
+        --arg generated_at "${GENERATED_AT}" \
+        '
+        {
+            schema_version: "fsqlite-e2e.hot_path_campaign_subsystem_packs.v1",
+            bead_id: $bead_id,
+            run_id: $run_id,
+            generated_at: $generated_at,
+            runs: [
+                .[] | {
+                    scenario_id,
+                    fixture_id,
+                    mode_id,
+                    engine_label,
+                    output_dir,
+                    subsystem_profile: .subsystem_profile_pack
+                }
+            ]
+        }
+        ' "${RUN_RECORDS_JSONL}" > "${SUBSYSTEM_PROFILE_PACKS_JSON}"
 }
 
 build_benchmark_context() {
@@ -526,6 +592,8 @@ ${opcode_summary}
 
 - structured_log: \`${LOG_FILE}\`
 - run_records: \`${RUN_RECORDS_JSONL}\`
+- opcode_profile_packs: \`${OPCODE_PROFILE_PACKS_JSON}\`
+- subsystem_profile_packs: \`${SUBSYSTEM_PROFILE_PACKS_JSON}\`
 - scenario_profiles: \`${SCENARIO_PROFILES_JSON}\`
 - actionable_ranking: \`${ACTIONABLE_RANKING_JSON}\`
 - benchmark_context: \`${BENCHMARK_CONTEXT_JSON}\`
@@ -545,6 +613,8 @@ build_report_json() {
         --arg replay_command "bash scripts/verify_bd_db300_4_1_hot_path_profiles.sh" \
         --arg structured_log "${LOG_FILE}" \
         --arg run_records "${RUN_RECORDS_JSONL}" \
+        --arg opcode_profile_packs "${OPCODE_PROFILE_PACKS_JSON}" \
+        --arg subsystem_profile_packs "${SUBSYSTEM_PROFILE_PACKS_JSON}" \
         --arg scenario_profiles "${SCENARIO_PROFILES_JSON}" \
         --arg actionable_ranking "${ACTIONABLE_RANKING_JSON}" \
         --arg benchmark_context "${BENCHMARK_CONTEXT_JSON}" \
@@ -575,6 +645,8 @@ build_report_json() {
             artifacts: {
                 structured_log: $structured_log,
                 run_records: $run_records,
+                opcode_profile_packs: $opcode_profile_packs,
+                subsystem_profile_packs: $subsystem_profile_packs,
                 scenario_profiles: $scenario_profiles,
                 actionable_ranking: $actionable_ranking,
                 benchmark_context: $benchmark_context,
@@ -613,6 +685,8 @@ for mode_id in "${MODE_IDS_ARRAY[@]}"; do
 done
 
 build_scenario_profiles
+build_opcode_profile_packs
+build_subsystem_profile_packs
 build_benchmark_context
 build_actionable_ranking
 build_summary_md

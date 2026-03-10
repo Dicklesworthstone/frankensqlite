@@ -108,7 +108,7 @@ assert_publication_trace_contract \
 run_phase \
   "file_backed_strict_visibility_matrix" \
   "${ARTIFACT_DIR}/file_backed_strict_visibility_matrix.log" \
-  rch exec -- cargo test -p fsqlite-core test_visibility_interleavings_fixed_seed_matrix -- --exact --nocapture
+  rch exec -- cargo test -p fsqlite-core connection::pager_routing_tests::test_visibility_interleavings_fixed_seed_matrix -- --exact --nocapture
 assert_publication_trace_contract \
   "file_backed_strict_visibility_matrix" \
   "${ARTIFACT_DIR}/file_backed_strict_visibility_matrix.log" \
@@ -117,7 +117,7 @@ assert_publication_trace_contract \
 run_phase \
   "file_backed_stale_refresh" \
   "${ARTIFACT_DIR}/file_backed_stale_refresh.log" \
-  rch exec -- cargo test -p fsqlite-core test_memdb_visible_commit_seq_drives_stale_detection -- --exact --nocapture
+  rch exec -- cargo test -p fsqlite-core connection::pager_routing_tests::test_memdb_visible_commit_seq_drives_stale_detection -- --exact --nocapture
 assert_publication_trace_contract \
   "file_backed_stale_refresh" \
   "${ARTIFACT_DIR}/file_backed_stale_refresh.log" \
