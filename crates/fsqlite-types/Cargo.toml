@@ -19,6 +19,7 @@ asupersync = { workspace = true, optional = true }
 fsqlite-error = { workspace = true }
 smallvec = { workspace = true }
 serde = { workspace = true }
+tracing = { workspace = true }
 xxhash-rust = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]

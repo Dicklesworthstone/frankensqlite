@@ -32,9 +32,11 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 #[cfg(feature = "native")]
-use asupersync::Cx as NativeCx;
+use asupersync::types::Time as NativeTime;
 #[cfg(feature = "native")]
 use asupersync::types::{CancelKind as NativeCancelKind, CancelReason as NativeCancelReason};
+#[cfg(feature = "native")]
+use asupersync::{Budget as NativeBudget, Cx as NativeCx};
 
 #[cfg(not(feature = "native"))]
 mod native_cx_shim {
@@ -160,7 +162,7 @@ mod native_cx_shim {
 #[cfg(not(feature = "native"))]
 use native_cx_shim::{NativeCancelKind, NativeCancelReason, NativeCx};
 
-use crate::eprocess::EProcessOracle;
+use crate::eprocess::{EProcessDecision, EProcessOracle, EProcessSnapshot};
 
 /// SQLite error code for `SQLITE_INTERRUPT`.
 pub const SQLITE_INTERRUPT: i32 = 9;
@@ -434,9 +436,12 @@ struct CxInner {
     mask_depth: AtomicU32,
     children: Mutex<Vec<Weak<Self>>>,
     last_checkpoint_msg: Mutex<Option<String>>,
+    last_eprocess_decision: Mutex<Option<EProcessDecision>>,
     eprocess_oracle: std::sync::OnceLock<Arc<EProcessOracle>>,
     #[cfg(feature = "native")]
-    native_cx: std::sync::OnceLock<NativeCx>,
+    attached_native_cx: Mutex<Option<NativeCx>>,
+    #[cfg(feature = "native")]
+    fallback_native_cx: std::sync::OnceLock<NativeCx>,
     // Deterministic clock: milliseconds since epoch for tests.
     unix_millis: AtomicU64,
 }
@@ -450,9 +455,12 @@ impl CxInner {
             mask_depth: AtomicU32::new(0),
             children: Mutex::new(Vec::new()),
             last_checkpoint_msg: Mutex::new(None),
+            last_eprocess_decision: Mutex::new(None),
             eprocess_oracle: std::sync::OnceLock::new(),
             #[cfg(feature = "native")]
-            native_cx: std::sync::OnceLock::new(),
+            attached_native_cx: Mutex::new(None),
+            #[cfg(feature = "native")]
+            fallback_native_cx: std::sync::OnceLock::new(),
             unix_millis: AtomicU64::new(0),
         }
     }
@@ -489,9 +497,51 @@ fn native_reason_to_local(reason: &NativeCancelReason) -> CancelReason {
 
 #[cfg(feature = "native")]
 fn sync_native_cx_cancel(inner: &CxInner, reason: CancelReason) {
-    if let Some(native) = inner.native_cx.get() {
+    if let Some(native) = inner
+        .attached_native_cx
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .cloned()
+    {
         native.set_cancel_reason(local_reason_to_native(reason));
     }
+    if let Some(native) = inner.fallback_native_cx.get() {
+        native.set_cancel_reason(local_reason_to_native(reason));
+    }
+}
+
+#[cfg(feature = "native")]
+#[must_use]
+fn native_budget_from_local(budget: Budget) -> NativeBudget {
+    let mut native_budget = NativeBudget::new()
+        .with_poll_quota(budget.poll_quota)
+        .with_priority(budget.priority);
+    if let Some(cost_quota) = budget.cost_quota {
+        native_budget = native_budget.with_cost_quota(cost_quota);
+    }
+    if let Some(deadline) = budget.deadline {
+        native_budget = native_budget.with_deadline(local_deadline_to_native_time(deadline));
+    }
+    native_budget
+}
+
+#[cfg(feature = "native")]
+#[must_use]
+fn wall_clock_now_since_epoch() -> Duration {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+}
+
+#[cfg(feature = "native")]
+#[must_use]
+fn local_deadline_to_native_time(deadline: Duration) -> NativeTime {
+    let absolute_deadline = wall_clock_now_since_epoch()
+        .checked_add(deadline)
+        .unwrap_or(Duration::MAX);
+    let nanos = u64::try_from(absolute_deadline.as_nanos()).unwrap_or(u64::MAX);
+    NativeTime::from_nanos(nanos)
 }
 
 /// Propagate cancellation to a `CxInner` node and all its descendants.
@@ -587,6 +637,35 @@ impl Cx<FullCaps> {
 }
 
 impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
+    #[cfg(feature = "native")]
+    #[must_use]
+    fn effective_native_cx(&self) -> NativeCx {
+        if let Some(native) = self
+            .inner
+            .attached_native_cx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .cloned()
+        {
+            return native;
+        }
+
+        self.inner
+            .fallback_native_cx
+            .get_or_init(|| {
+                let native =
+                    NativeCx::for_request_with_budget(native_budget_from_local(self.budget));
+                if let Some(reason) = self.cancel_reason() {
+                    native.set_cancel_reason(local_reason_to_native(reason));
+                } else if self.is_cancel_requested() {
+                    native.set_cancel_requested(true);
+                }
+                native
+            })
+            .clone()
+    }
+
     #[must_use]
     pub fn with_budget(budget: Budget) -> Self {
         Self {
@@ -804,20 +883,32 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
         } else if self.is_cancel_requested() {
             native_cx.set_cancel_requested(true);
         }
-        let _ = self.inner.native_cx.set(native_cx);
+        *self
+            .inner
+            .attached_native_cx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(native_cx);
     }
 
     /// Return the attached native asupersync context, if one exists.
     #[cfg(feature = "native")]
     #[must_use]
     pub fn attached_native_cx(&self) -> Option<NativeCx> {
-        self.inner.native_cx.get().cloned()
+        self.inner
+            .attached_native_cx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// Remove the currently attached native asupersync context.
     #[cfg(feature = "native")]
     pub fn clear_native_cx(&self) {
-        // OnceLock cannot be easily cleared. We just leave it as is.
+        *self
+            .inner
+            .attached_native_cx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 
     #[must_use]
@@ -825,7 +916,34 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
         let Some(oracle) = self.inner.eprocess_oracle.get() else {
             return false;
         };
-        if oracle.should_shed(self.budget.priority) {
+        let decision = oracle.decision(self.budget.priority);
+        self.record_eprocess_decision(decision.clone());
+        tracing::debug!(
+            target: "fsqlite::cx",
+            event = "eprocess_checkpoint",
+            trace_id = self.trace_id,
+            decision_id = self.decision_id,
+            policy_id = self.policy_id,
+            priority = decision.priority,
+            evalue = decision.snapshot.evalue,
+            threshold = decision.snapshot.rejection_threshold,
+            observations = decision.snapshot.observations,
+            priority_threshold = decision.snapshot.priority_threshold,
+            should_shed = decision.should_shed,
+            signal = ?decision.snapshot.last_signal
+        );
+        if decision.should_shed {
+            tracing::info!(
+                target: "fsqlite::cx",
+                event = "eprocess_shedding_triggered",
+                trace_id = self.trace_id,
+                decision_id = self.decision_id,
+                policy_id = self.policy_id,
+                priority = decision.priority,
+                evalue = decision.snapshot.evalue,
+                threshold = decision.snapshot.rejection_threshold,
+                signal = ?decision.snapshot.last_signal
+            );
             self.cancel_with_reason(CancelReason::Abort);
             return true;
         }
@@ -835,9 +953,7 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
     #[cfg(feature = "native")]
     #[must_use]
     fn maybe_cancel_via_native_cx(&self, masked: bool) -> bool {
-        let Some(native) = self.inner.native_cx.get() else {
-            return false;
-        };
+        let native = self.effective_native_cx();
 
         if masked {
             if native.is_cancel_requested() {
@@ -926,6 +1042,31 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
             .clone()
     }
 
+    /// Most recent e-process decision recorded during [`Self::checkpoint`].
+    #[must_use]
+    pub fn last_eprocess_decision(&self) -> Option<EProcessDecision> {
+        self.inner
+            .last_eprocess_decision
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Snapshot portion of the most recent e-process decision.
+    #[must_use]
+    pub fn last_eprocess_snapshot(&self) -> Option<EProcessSnapshot> {
+        self.last_eprocess_decision()
+            .map(|decision| decision.snapshot)
+    }
+
+    fn record_eprocess_decision(&self, decision: EProcessDecision) {
+        *self
+            .inner
+            .last_eprocess_decision
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(decision);
+    }
+
     // -----------------------------------------------------------------------
     // Masked critical sections (§4.12.2)
     // -----------------------------------------------------------------------
@@ -1000,6 +1141,9 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
         child.trace_id = self.trace_id;
         child.decision_id = self.decision_id;
         child.policy_id = self.policy_id;
+        if let Some(oracle) = self.inner.eprocess_oracle.get().cloned() {
+            child.set_eprocess_oracle(oracle);
+        }
         {
             let mut children = self
                 .inner
@@ -1007,6 +1151,11 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             children.push(Arc::downgrade(&child.inner));
+        }
+        if let Some(reason) = self.cancel_reason() {
+            child.cancel_with_reason(reason);
+        } else if self.is_cancel_requested() {
+            child.cancel();
         }
         child
     }
@@ -1090,7 +1239,7 @@ impl CommitCtx {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::eprocess::EProcessConfig;
+    use crate::eprocess::{EProcessConfig, EProcessSignal};
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Weak};
 
@@ -1300,12 +1449,18 @@ mod tests {
             },
             1,
         ));
-        oracle.observe_sample(true);
-        oracle.observe_sample(true);
+        let signal = EProcessSignal::new(1.0, 1.0, 1.0);
+        oracle.observe_signal(signal);
+        oracle.observe_signal(signal);
         cx.set_eprocess_oracle(oracle);
         let err = cx.checkpoint().unwrap_err();
         assert_eq!(err.kind(), ErrorKind::Cancelled);
         assert_eq!(cx.cancel_reason(), Some(CancelReason::Abort));
+        let decision = cx
+            .last_eprocess_decision()
+            .expect("checkpoint should record an e-process decision");
+        assert!(decision.should_shed);
+        assert_eq!(decision.snapshot.last_signal, Some(signal));
     }
 
     #[test]
@@ -1320,11 +1475,18 @@ mod tests {
             },
             1,
         ));
-        oracle.observe_sample(true);
-        oracle.observe_sample(true);
+        let signal = EProcessSignal::new(1.0, 1.0, 1.0);
+        oracle.observe_signal(signal);
+        oracle.observe_signal(signal);
         cx.set_eprocess_oracle(oracle);
         assert!(cx.checkpoint().is_ok());
         assert!(!cx.is_cancel_requested());
+        let decision = cx
+            .last_eprocess_decision()
+            .expect("checkpoint should still record non-shedding decisions");
+        assert!(!decision.should_shed);
+        assert_eq!(decision.priority, 1);
+        assert_eq!(decision.snapshot.last_signal, Some(signal));
     }
 
     #[test]
@@ -1339,16 +1501,66 @@ mod tests {
             },
             1,
         ));
-        oracle.observe_sample(true);
-        oracle.observe_sample(true);
+        let signal = EProcessSignal::new(1.0, 1.0, 1.0);
+        oracle.observe_signal(signal);
+        oracle.observe_signal(signal);
         cx.set_eprocess_oracle(oracle);
         {
             let _mask = cx.masked();
             assert!(cx.checkpoint().is_ok());
             assert!(cx.is_cancel_requested());
             assert_eq!(cx.cancel_state(), CancelState::CancelRequested);
+            assert_eq!(
+                cx.last_eprocess_snapshot()
+                    .expect("checkpoint should record the masked decision")
+                    .last_signal,
+                Some(signal)
+            );
         }
         let err = cx.checkpoint().unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::Cancelled);
+    }
+
+    #[test]
+    fn test_create_child_inherits_eprocess_oracle() {
+        let parent = Cx::<FullCaps>::with_budget(Budget::INFINITE.with_priority(3));
+        let oracle = Arc::new(EProcessOracle::new(
+            EProcessConfig {
+                p0: 0.1,
+                lambda: 5.0,
+                alpha: 0.05,
+                max_evalue: 1e12,
+            },
+            1,
+        ));
+        let signal = EProcessSignal::new(1.0, 1.0, 1.0);
+        oracle.observe_signal(signal);
+        oracle.observe_signal(signal);
+        parent.set_eprocess_oracle(oracle);
+
+        let child = parent.create_child();
+        let err = child.checkpoint().unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::Cancelled);
+        assert_eq!(child.cancel_reason(), Some(CancelReason::Abort));
+        assert_eq!(
+            child
+                .last_eprocess_snapshot()
+                .expect("child checkpoint should record inherited oracle decision")
+                .last_signal,
+            Some(signal)
+        );
+    }
+
+    #[test]
+    fn test_create_child_inherits_preexisting_parent_cancellation() {
+        let parent = Cx::<FullCaps>::new();
+        parent.cancel_with_reason(CancelReason::RegionClose);
+
+        let child = parent.create_child();
+        assert_eq!(child.cancel_reason(), Some(CancelReason::RegionClose));
+        assert_eq!(child.cancel_state(), CancelState::CancelRequested);
+
+        let err = child.checkpoint().unwrap_err();
         assert_eq!(err.kind(), ErrorKind::Cancelled);
     }
 
@@ -1396,6 +1608,46 @@ mod tests {
 
         let err = cx.checkpoint().unwrap_err();
         assert_eq!(err.kind(), ErrorKind::Cancelled);
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn test_cx_effective_native_cx_uses_fallback_without_marking_explicit_attachment() {
+        let cx = Cx::<FullCaps>::with_budget(Budget::INFINITE.with_priority(7));
+
+        assert!(cx.attached_native_cx().is_none());
+        let native = cx.effective_native_cx();
+        assert!(cx.attached_native_cx().is_none());
+        assert!(native.checkpoint().is_ok());
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn test_cx_set_native_cx_replaces_fallback_context() {
+        let cx = Cx::<FullCaps>::new();
+        let _ = cx.effective_native_cx();
+
+        let replacement = NativeCx::for_testing();
+        cx.set_native_cx(replacement.clone());
+        replacement.set_cancel_reason(NativeCancelReason::timeout());
+
+        let err = cx.checkpoint().unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::Cancelled);
+        assert_eq!(cx.cancel_reason(), Some(CancelReason::Timeout));
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn test_create_child_copies_preexisting_cancellation_into_fallback_native_cx() {
+        let parent = Cx::<FullCaps>::new();
+        parent.cancel_with_reason(CancelReason::RegionClose);
+
+        let child = parent.create_child();
+        let reason = child
+            .effective_native_cx()
+            .cancel_reason()
+            .expect("fallback native cx should mirror inherited cancellation");
+        assert_eq!(reason.kind, NativeCancelKind::ParentCancelled);
     }
 
     #[test]

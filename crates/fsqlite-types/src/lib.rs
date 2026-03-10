@@ -19,7 +19,10 @@ pub use ecs::{
     layout_systematic_run, reconstruct_systematic_happy_path, recover_object_with_fallback,
     source_symbol_count, validate_systematic_run,
 };
-pub use eprocess::{EProcessConfig, EProcessOracle, EProcessSnapshot};
+pub use eprocess::{
+    EProcessConfig, EProcessDecision, EProcessOracle, EProcessSignal, EProcessSnapshot,
+    EProcessTelemetryBridge,
+};
 pub use glossary::{
     ArcCache, BtreeRef, Budget, COMMIT_MARKER_RECORD_V1_SIZE, ColumnIdx, CommitCapsule,
     CommitMarker, CommitProof, CommitSeq, DecodeProof, DependencyEdge, EpochId, IdempotencyKey,
