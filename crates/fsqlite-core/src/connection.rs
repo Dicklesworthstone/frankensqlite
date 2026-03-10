@@ -16535,7 +16535,7 @@ impl Connection {
         }
 
         let primary_width = table_sources[0].col_names.len();
-        let primary_where_pushdown = where_clause.and_then(|expr| {
+        let primary_where_pushdown = where_clause.as_deref().and_then(|expr| {
             expr_references_only_col_map(expr, &col_map[..primary_width]).then_some(expr)
         });
 
@@ -26392,7 +26392,6 @@ fn expr_references_only_col_map(expr: &Expr, col_map: &[(String, String, bool)])
             .iter()
             .all(|value| expr_references_only_col_map(value, col_map)),
         Expr::Exists { .. } | Expr::Subquery(..) => false,
-        _ => false,
     }
 }
 

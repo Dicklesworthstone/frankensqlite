@@ -1255,7 +1255,7 @@ impl NormalizedColumnComparison {
         };
 
         match self.op {
-            AstBinaryOp::Eq => literal_satisfies_predicate_literal(&ordering, predicate.op),
+            AstBinaryOp::Eq => literal_satisfies_predicate_literal(ordering, predicate.op),
             AstBinaryOp::Gt => {
                 matches!(predicate.op, AstBinaryOp::Gt | AstBinaryOp::Ge)
                     && matches!(
@@ -1292,7 +1292,7 @@ impl NormalizedColumnComparison {
 }
 
 fn literal_satisfies_predicate_literal(
-    ordering: &std::cmp::Ordering,
+    ordering: std::cmp::Ordering,
     predicate_op: AstBinaryOp,
 ) -> bool {
     match predicate_op {

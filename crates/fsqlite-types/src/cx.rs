@@ -497,13 +497,13 @@ fn native_reason_to_local(reason: &NativeCancelReason) -> CancelReason {
 
 #[cfg(feature = "native")]
 fn sync_native_cx_cancel(inner: &CxInner, reason: CancelReason) {
-    if let Some(native) = inner
+    let attached_native = inner
         .attached_native_cx
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .as_ref()
-        .cloned()
-    {
+        .cloned();
+    if let Some(native) = attached_native {
         native.set_cancel_reason(local_reason_to_native(reason));
     }
     if let Some(native) = inner.fallback_native_cx.get() {
@@ -640,14 +640,14 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
     #[cfg(feature = "native")]
     #[must_use]
     fn effective_native_cx(&self) -> NativeCx {
-        if let Some(native) = self
+        let attached_native = self
             .inner
             .attached_native_cx
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
-            .cloned()
-        {
+            .cloned();
+        if let Some(native) = attached_native {
             return native;
         }
 
