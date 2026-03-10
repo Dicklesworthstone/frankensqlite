@@ -4599,6 +4599,14 @@ mod tests {
         ("page1_plus_7_new_pages", 8),
         ("page1_plus_31_new_pages", 32),
     ];
+    const TRACK_C_METADATA_BENCH_BEAD_ID: &str = "bd-db300.3.3.3";
+    const TRACK_C_METADATA_BENCH_WARMUP_ITERS: usize = 5;
+    const TRACK_C_METADATA_BENCH_MEASURE_ITERS: usize = 25;
+    const TRACK_C_METADATA_BENCH_CASES: [(&str, usize); 3] = [
+        ("interior_only_1_dirty_page", 1),
+        ("interior_only_7_dirty_pages", 7),
+        ("interior_only_31_dirty_pages", 31),
+    ];
 
     /// In-memory WAL backend for testing WAL-mode commit and page lookup.
     struct MockWalBackend {
@@ -4650,6 +4658,21 @@ mod tests {
             match self {
                 Self::SingleFrame => "single_frame",
                 Self::Batched => "batch_append",
+            }
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum TrackCMetadataMode {
+        ForcedPageOneBaseline,
+        SemanticCleanupCandidate,
+    }
+
+    impl TrackCMetadataMode {
+        const fn as_str(self) -> &'static str {
+            match self {
+                Self::ForcedPageOneBaseline => "forced_page_one_baseline",
+                Self::SemanticCleanupCandidate => "semantic_cleanup_candidate",
             }
         }
     }
@@ -4806,6 +4829,126 @@ mod tests {
         }
 
         samples
+    }
+
+    fn track_c_metadata_seed_existing_pages(
+        pager: &SimplePager<MemoryVfs>,
+        cx: &Cx,
+        interior_dirty_pages: usize,
+    ) {
+        assert!(interior_dirty_pages > 0);
+        let mut txn = pager.begin(cx, TransactionMode::Immediate).unwrap();
+        let page_bytes = PageSize::DEFAULT.as_usize();
+        for page_idx in 0..interior_dirty_pages {
+            let page_no = txn.allocate_page(cx).unwrap();
+            let fill = u8::try_from((page_idx % 251) + 1).unwrap();
+            txn.write_page(cx, page_no, &vec![fill; page_bytes])
+                .unwrap();
+        }
+        txn.commit(cx).unwrap();
+    }
+
+    fn track_c_metadata_apply_workload(
+        txn: &mut SimpleTransaction<MemoryVfs>,
+        cx: &Cx,
+        interior_dirty_pages: usize,
+        mode: TrackCMetadataMode,
+    ) {
+        let page_bytes = PageSize::DEFAULT.as_usize();
+        for page_idx in 0..interior_dirty_pages {
+            let page_no = PageNumber::new(u32::try_from(page_idx + 2).unwrap()).unwrap();
+            let fill = u8::try_from(((page_idx + 17) % 251) + 1).unwrap();
+            txn.write_page(cx, page_no, &vec![fill; page_bytes])
+                .unwrap();
+        }
+        if matches!(mode, TrackCMetadataMode::ForcedPageOneBaseline) {
+            let page_one = txn.get_page(cx, PageNumber::ONE).unwrap().into_vec();
+            txn.write_page(cx, PageNumber::ONE, &page_one).unwrap();
+        }
+    }
+
+    fn track_c_metadata_prepared_commit(
+        mode: TrackCMetadataMode,
+        interior_dirty_pages: usize,
+    ) -> (Cx, SimpleTransaction<MemoryVfs>) {
+        assert!(interior_dirty_pages > 0);
+
+        let cx = Cx::new();
+        let vfs = MemoryVfs::new();
+        let db_path = PathBuf::from(format!(
+            "/track_c_metadata_cleanup_{}_{}.db",
+            mode.as_str(),
+            interior_dirty_pages
+        ));
+        let wal_path = PathBuf::from(format!(
+            "/track_c_metadata_cleanup_{}_{}.db-wal",
+            mode.as_str(),
+            interior_dirty_pages
+        ));
+        let pager = SimplePager::open(vfs.clone(), &db_path, PageSize::DEFAULT).unwrap();
+        track_c_metadata_seed_existing_pages(&pager, &cx, interior_dirty_pages);
+        let backend =
+            TrackCBenchmarkWalBackend::new(&vfs, &cx, &wal_path, TrackCBatchMode::Batched);
+        pager.set_wal_backend(Box::new(backend)).unwrap();
+        pager.set_journal_mode(&cx, JournalMode::Wal).unwrap();
+
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        track_c_metadata_apply_workload(&mut txn, &cx, interior_dirty_pages, mode);
+        (cx, txn)
+    }
+
+    fn track_c_metadata_measure_commit_ns(
+        mode: TrackCMetadataMode,
+        interior_dirty_pages: usize,
+    ) -> Vec<u64> {
+        let total_iters =
+            TRACK_C_METADATA_BENCH_WARMUP_ITERS + TRACK_C_METADATA_BENCH_MEASURE_ITERS;
+        let mut samples = Vec::with_capacity(TRACK_C_METADATA_BENCH_MEASURE_ITERS);
+
+        for iter_idx in 0..total_iters {
+            let (cx, mut txn) = track_c_metadata_prepared_commit(mode, interior_dirty_pages);
+            let started = Instant::now();
+            txn.commit(&cx).unwrap();
+            if iter_idx >= TRACK_C_METADATA_BENCH_WARMUP_ITERS {
+                let elapsed_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                samples.push(elapsed_ns);
+            }
+        }
+
+        samples
+    }
+
+    fn track_c_metadata_capture_frame_pages(
+        mode: TrackCMetadataMode,
+        interior_dirty_pages: usize,
+    ) -> Vec<u32> {
+        assert!(interior_dirty_pages > 0);
+
+        let cx = Cx::new();
+        let vfs = MemoryVfs::new();
+        let db_path = PathBuf::from(format!(
+            "/track_c_metadata_capture_{}_{}.db",
+            mode.as_str(),
+            interior_dirty_pages
+        ));
+        let pager = SimplePager::open(vfs, &db_path, PageSize::DEFAULT).unwrap();
+        track_c_metadata_seed_existing_pages(&pager, &cx, interior_dirty_pages);
+
+        let (backend, frames, _begin_calls, _batch_calls) = MockWalBackend::new();
+        pager.set_wal_backend(Box::new(backend)).unwrap();
+        pager.set_journal_mode(&cx, JournalMode::Wal).unwrap();
+        frames.lock().unwrap().clear();
+
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        track_c_metadata_apply_workload(&mut txn, &cx, interior_dirty_pages, mode);
+        txn.commit(&cx).unwrap();
+
+        frames
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(page_number, _, _)| *page_number)
+            .collect()
     }
 
     fn track_c_percentile_ns(sorted_samples: &[u64], percentile: usize) -> u64 {
@@ -5431,6 +5574,94 @@ mod tests {
         println!("BEGIN_BD_DB300_3_1_4_REPORT");
         println!("{}", serde_json::to_string_pretty(&report).unwrap());
         println!("END_BD_DB300_3_1_4_REPORT");
+    }
+
+    #[test]
+    #[ignore = "benchmark evidence only"]
+    fn wal_metadata_cleanup_benchmark_report() {
+        let cases: Vec<_> = TRACK_C_METADATA_BENCH_CASES
+            .iter()
+            .map(|(scenario_id, interior_dirty_pages)| {
+                let baseline_samples = track_c_metadata_measure_commit_ns(
+                    TrackCMetadataMode::ForcedPageOneBaseline,
+                    *interior_dirty_pages,
+                );
+                let candidate_samples = track_c_metadata_measure_commit_ns(
+                    TrackCMetadataMode::SemanticCleanupCandidate,
+                    *interior_dirty_pages,
+                );
+                let baseline_summary = track_c_sample_summary(&baseline_samples);
+                let candidate_summary = track_c_sample_summary(&candidate_samples);
+                let baseline_median = baseline_summary["median_ns"].as_u64().unwrap_or(0);
+                let candidate_median = candidate_summary["median_ns"].as_u64().unwrap_or(0);
+                let baseline_mean = baseline_summary["mean_ns"].as_f64().unwrap_or(0.0);
+                let candidate_mean = candidate_summary["mean_ns"].as_f64().unwrap_or(0.0);
+                let baseline_frame_pages = track_c_metadata_capture_frame_pages(
+                    TrackCMetadataMode::ForcedPageOneBaseline,
+                    *interior_dirty_pages,
+                );
+                let candidate_frame_pages = track_c_metadata_capture_frame_pages(
+                    TrackCMetadataMode::SemanticCleanupCandidate,
+                    *interior_dirty_pages,
+                );
+                let baseline_page_one_frames = baseline_frame_pages
+                    .iter()
+                    .filter(|page_number| **page_number == PageNumber::ONE.get())
+                    .count();
+                let candidate_page_one_frames = candidate_frame_pages
+                    .iter()
+                    .filter(|page_number| **page_number == PageNumber::ONE.get())
+                    .count();
+
+                json!({
+                    "scenario_id": scenario_id,
+                    "interior_dirty_pages": interior_dirty_pages,
+                    "forced_page_one_baseline": baseline_summary,
+                    "semantic_cleanup_candidate": candidate_summary,
+                    "baseline_frame_pages": baseline_frame_pages,
+                    "candidate_frame_pages": candidate_frame_pages,
+                    "baseline_total_frames_per_commit": baseline_frame_pages.len(),
+                    "candidate_total_frames_per_commit": candidate_frame_pages.len(),
+                    "baseline_page_one_frames_per_commit": baseline_page_one_frames,
+                    "candidate_page_one_frames_per_commit": candidate_page_one_frames,
+                    "frame_count_reduction_per_commit": baseline_frame_pages.len().saturating_sub(candidate_frame_pages.len()),
+                    "page_one_exposure_reduction_per_commit": baseline_page_one_frames.saturating_sub(candidate_page_one_frames),
+                    "speedup_vs_baseline_median": if candidate_median == 0 {
+                        0.0
+                    } else {
+                        (baseline_median as f64) / (candidate_median as f64)
+                    },
+                    "speedup_vs_baseline_mean": if candidate_mean == 0.0 {
+                        0.0
+                    } else {
+                        baseline_mean / candidate_mean
+                    },
+                    "faster_variant_by_median": if candidate_median <= baseline_median {
+                        "semantic_cleanup_candidate"
+                    } else {
+                        "forced_page_one_baseline"
+                    },
+                })
+            })
+            .collect();
+
+        let report = json!({
+            "schema_version": "fsqlite.track_c.metadata_cleanup_benchmark.v1",
+            "bead_id": TRACK_C_METADATA_BENCH_BEAD_ID,
+            "parent_bead_id": "bd-db300.3.3",
+            "measured_operation": "wal_commit_interior_only_workload",
+            "warmup_iterations": TRACK_C_METADATA_BENCH_WARMUP_ITERS,
+            "measurement_iterations": TRACK_C_METADATA_BENCH_MEASURE_ITERS,
+            "vfs": "memory",
+            "sync_mode": "normal_noop_memory_vfs",
+            "baseline_variant": "forced_page_one_rewrite_every_commit",
+            "candidate_variant": "semantic_trigger_page_one_cleanup",
+            "cases": cases,
+        });
+
+        println!("BEGIN_BD_DB300_3_3_3_REPORT");
+        println!("{}", serde_json::to_string_pretty(&report).unwrap());
+        println!("END_BD_DB300_3_3_3_REPORT");
     }
 
     #[test]
