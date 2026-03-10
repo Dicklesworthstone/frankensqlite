@@ -146,15 +146,16 @@ impl<F: VfsFile> PagerInner<F> {
     /// Returns `true` when WAL snapshot setup was already performed as part of
     /// the refresh and does not need to be repeated for the new transaction.
     fn refresh_committed_state(&mut self, cx: &Cx) -> Result<bool> {
-        let wal_snapshot_initialized = if self.journal_mode == JournalMode::Wal {
+        let wal_post_page1_commits = if self.journal_mode == JournalMode::Wal {
             let wal = self.wal_backend.as_mut().ok_or_else(|| {
                 FrankenError::internal("WAL mode active but no WAL backend installed")
             })?;
             wal.begin_transaction(cx)?;
-            true
+            wal.committed_txns_since_page(cx, PageNumber::ONE.get())?
         } else {
-            false
+            0
         };
+        let wal_snapshot_initialized = self.journal_mode == JournalMode::Wal;
 
         let page1 = self.read_committed_page_copy(cx, PageNumber::ONE)?;
         if page1.len() < DATABASE_HEADER_SIZE {
@@ -200,9 +201,12 @@ impl<F: VfsFile> PagerInner<F> {
         };
         self.freelist = freelist;
 
-        let new_commit_seq = CommitSeq::new(u64::from(header.change_counter));
-        // Only clear the cache if the database was modified by another connection.
-        // If the change_counter matches our last known commit_seq, our cache is still valid.
+        let new_commit_seq =
+            CommitSeq::new(u64::from(header.change_counter).saturating_add(wal_post_page1_commits));
+        // Only clear the cache if the database was modified by another
+        // connection. In WAL mode this uses the latest visible page-1
+        // change-counter plus any committed transactions that occurred after
+        // the most recent committed page-1 frame.
         if new_commit_seq != self.commit_seq {
             self.cache.clear();
         }
@@ -977,6 +981,10 @@ where
             .lock()
             .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
 
+        if inner.journal_mode == mode {
+            return Ok(mode);
+        }
+
         if inner.checkpoint_active {
             return Err(FrankenError::Busy);
         }
@@ -1510,6 +1518,21 @@ impl<V: Vfs> SimpleTransaction<V> {
     pub fn is_writer(&self) -> bool {
         self.is_writer
     }
+
+    #[must_use]
+    fn freelist_metadata_dirty(&self) -> bool {
+        !self.freed_pages.is_empty() || !self.allocated_from_freelist.is_empty()
+    }
+
+    #[must_use]
+    fn wal_commit_requires_page_one(&self, current_db_size: u32, freelist_dirty: bool) -> bool {
+        self.write_set.contains_key(&PageNumber::ONE)
+            || freelist_dirty
+            || self
+                .write_pages_sorted
+                .last()
+                .is_some_and(|page| page.get() > current_db_size)
+    }
 }
 
 impl<V> SimpleTransaction<V>
@@ -1631,8 +1654,7 @@ where
         write_set: &HashMap<PageNumber, PageBuf>,
         write_pages_sorted: &[PageNumber],
     ) -> Result<()> {
-        if let Some(batch) =
-            collect_wal_commit_batch(inner.db_size, write_set, write_pages_sorted)?
+        if let Some(batch) = collect_wal_commit_batch(inner.db_size, write_set, write_pages_sorted)?
         {
             // Escalate to EXCLUSIVE before writing WAL frames.
             // This prevents concurrent processes from appending to the WAL
@@ -1929,35 +1951,49 @@ where
             .lock()
             .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
 
+        let freelist_dirty = self.freelist_metadata_dirty();
         for page_no in self.freed_pages.drain(..) {
             inner.freelist.push(page_no);
         }
-        serialize_freelist_to_write_set(
-            cx,
-            &mut inner,
-            &mut self.write_set,
-            &mut self.write_pages_sorted,
-        )?;
+        if freelist_dirty {
+            serialize_freelist_to_write_set(
+                cx,
+                &mut inner,
+                &mut self.write_set,
+                &mut self.write_pages_sorted,
+            )?;
+        }
 
-        // ── Header Patching ──
-        // Patch page 1 header with correct page_count and change_counter in the write set.
-        // This ensures the commit functions write a consistent header without needing extra I/O.
+        // In rollback-journal mode page 1 is still the durable commit beacon.
+        // In WAL mode we only carry page 1 when its contents actually change:
+        // page 1 itself is dirty, freelist metadata changed, or the database
+        // grew and page_count must advance.
         let max_written = self.write_pages_sorted.last().map_or(0, |page| page.get());
-        if let Some(page1) = self.write_set.get_mut(&PageNumber::ONE) {
+        let must_write_page1 = if self.journal_mode == JournalMode::Wal {
+            self.wal_commit_requires_page_one(inner.db_size, freelist_dirty)
+        } else {
+            true
+        };
+        if must_write_page1 {
+            let mut page1 = ensure_page_one_in_write_set(cx, &mut inner, &mut self.write_set)?;
             if page1.len() >= DATABASE_HEADER_SIZE {
-                let new_db_size = inner.db_size.max(max_written).max(
-                    page1[28..32]
-                        .iter()
-                        .fold(0, |acc, &x| (acc << 8) | (x as u32)),
-                );
+                let mut page_count_bytes = [0_u8; 4];
+                page_count_bytes.copy_from_slice(&page1[28..32]);
+                let existing_page_count = u32::from_be_bytes(page_count_bytes);
                 let new_change_counter = inner.commit_seq.get().wrapping_add(1) as u32;
 
                 // Offset 24..28: change counter (big-endian u32)
                 page1[24..28].copy_from_slice(&new_change_counter.to_be_bytes());
-                // Offset 28..32: page count (big-endian u32)
-                page1[28..32].copy_from_slice(&new_db_size.to_be_bytes());
+                if self.journal_mode != JournalMode::Wal || max_written > inner.db_size {
+                    let new_db_size = inner.db_size.max(max_written).max(existing_page_count);
+                    // Offset 28..32: page count (big-endian u32)
+                    page1[28..32].copy_from_slice(&new_db_size.to_be_bytes());
+                }
                 // Offset 92..96: version-valid-for
                 page1[92..96].copy_from_slice(&new_change_counter.to_be_bytes());
+            }
+            if self.write_set.insert(PageNumber::ONE, page1).is_none() {
+                insert_page_sorted(&mut self.write_pages_sorted, PageNumber::ONE);
             }
         }
 
@@ -4492,6 +4528,20 @@ mod tests {
                 batch_calls,
             )
         }
+
+        fn with_shared_frames(frames: SharedFrames) -> (Self, SharedCounter, SharedCounter) {
+            let begin_calls: SharedCounter = StdArc::new(StdMutex::new(0));
+            let batch_calls: SharedCounter = StdArc::new(StdMutex::new(0));
+            (
+                Self {
+                    frames,
+                    begin_calls: StdArc::clone(&begin_calls),
+                    batch_calls: StdArc::clone(&batch_calls),
+                },
+                begin_calls,
+                batch_calls,
+            )
+        }
     }
 
     #[derive(Clone, Copy)]
@@ -4743,6 +4793,37 @@ mod tests {
             Ok(result)
         }
 
+        fn committed_txns_since_page(
+            &mut self,
+            _cx: &Cx,
+            page_number: u32,
+        ) -> fsqlite_error::Result<u64> {
+            let frames = self.frames.lock().unwrap();
+            let last_page_frame = frames.iter().rposition(|(pn, _, _)| *pn == page_number);
+            let Some(last_page_frame) = last_page_frame else {
+                return Ok(frames
+                    .iter()
+                    .filter(|(_, _, db_size_if_commit)| *db_size_if_commit > 0)
+                    .count() as u64);
+            };
+
+            let mut page_commit_seen = false;
+            let mut committed_txns_after_page = 0_u64;
+            for (frame_index, (_, _, db_size_if_commit)) in frames.iter().enumerate() {
+                if *db_size_if_commit == 0 {
+                    continue;
+                }
+                if !page_commit_seen && frame_index >= last_page_frame {
+                    page_commit_seen = true;
+                    continue;
+                }
+                if page_commit_seen {
+                    committed_txns_after_page = committed_txns_after_page.saturating_add(1);
+                }
+            }
+            Ok(committed_txns_after_page)
+        }
+
         fn sync(&mut self, _cx: &Cx) -> fsqlite_error::Result<()> {
             Ok(())
         }
@@ -4790,6 +4871,25 @@ mod tests {
         pager.set_wal_backend(Box::new(backend)).unwrap();
         pager.set_journal_mode(&cx, JournalMode::Wal).unwrap();
         (pager, frames, begin_calls, batch_calls)
+    }
+
+    fn wal_pager_pair_with_shared_backend()
+    -> (SimplePager<MemoryVfs>, SimplePager<MemoryVfs>, SharedFrames) {
+        let vfs = MemoryVfs::new();
+        let path = PathBuf::from("/wal_shared_refresh.db");
+        let pager1 = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT).unwrap();
+        let pager2 = SimplePager::open(vfs, &path, PageSize::DEFAULT).unwrap();
+        let cx = Cx::new();
+
+        let frames: SharedFrames = StdArc::new(StdMutex::new(Vec::new()));
+        let (backend1, _, _) = MockWalBackend::with_shared_frames(StdArc::clone(&frames));
+        let (backend2, _, _) = MockWalBackend::with_shared_frames(StdArc::clone(&frames));
+        pager1.set_wal_backend(Box::new(backend1)).unwrap();
+        pager2.set_wal_backend(Box::new(backend2)).unwrap();
+        pager1.set_journal_mode(&cx, JournalMode::Wal).unwrap();
+        pager2.set_journal_mode(&cx, JournalMode::Wal).unwrap();
+
+        (pager1, pager2, frames)
     }
 
     #[test]
@@ -4887,6 +4987,17 @@ mod tests {
             result.is_err(),
             "bead_id={BEAD_ID} case=mode_switch_blocked_during_write"
         );
+    }
+
+    #[test]
+    fn test_set_journal_mode_same_mode_succeeds_during_reader() {
+        let (pager, _frames) = wal_pager();
+        let cx = Cx::new();
+        let _reader = pager.begin(&cx, TransactionMode::ReadOnly).unwrap();
+
+        let mode = pager.set_journal_mode(&cx, JournalMode::Wal).unwrap();
+
+        assert_eq!(mode, JournalMode::Wal);
     }
 
     #[test]
@@ -5141,7 +5252,8 @@ mod tests {
 
     #[test]
     fn test_collect_wal_commit_batch_returns_none_for_empty_write_set() {
-        let batch = collect_wal_commit_batch(4, &HashMap::new(), &[]).unwrap();
+        let write_set = HashMap::new();
+        let batch = collect_wal_commit_batch(4, &write_set, &[]).unwrap();
         assert!(
             batch.is_none(),
             "bead_id={BEAD_ID} case=wal_batch_helper_empty_batch"
@@ -5151,7 +5263,13 @@ mod tests {
     #[test]
     fn test_collect_wal_commit_batch_errors_when_sorted_page_missing_from_write_set() {
         let missing_page = PageNumber::new(4).unwrap();
-        let err = collect_wal_commit_batch(1, &HashMap::new(), &[missing_page]).unwrap_err();
+        let write_set = HashMap::new();
+        let err = match collect_wal_commit_batch(1, &write_set, &[missing_page]) {
+            Ok(_) => panic!(
+                "bead_id={BEAD_ID} case=wal_batch_helper_missing_page expected helper to fail"
+            ),
+            Err(err) => err,
+        };
         let message = err.to_string();
         assert!(
             message.contains("missing page 4"),
@@ -5356,6 +5474,84 @@ mod tests {
             data.as_ref()[0],
             0x22,
             "bead_id={BEAD_ID} case=wal_latest_version"
+        );
+    }
+
+    #[test]
+    fn test_wal_interior_update_skips_page1_when_metadata_unchanged() {
+        let (pager, frames) = wal_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        let page_two = {
+            let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+            let page_two = txn.allocate_page(&cx).unwrap();
+            txn.write_page(&cx, page_two, &vec![0x11; ps]).unwrap();
+            txn.commit(&cx).unwrap();
+            page_two
+        };
+
+        let frames_before = frames.lock().unwrap().len();
+
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        txn.write_page(&cx, page_two, &vec![0x22; ps]).unwrap();
+        txn.commit(&cx).unwrap();
+
+        let frames = frames.lock().unwrap();
+        let appended = &frames[frames_before..];
+        assert_eq!(
+            appended.len(),
+            1,
+            "bead_id={BEAD_ID} case=wal_headerless_interior_commit_frame_count"
+        );
+        assert_eq!(
+            appended[0].0,
+            page_two.get(),
+            "bead_id={BEAD_ID} case=wal_headerless_interior_commit_page"
+        );
+        assert_eq!(
+            appended[0].2,
+            page_two.get(),
+            "bead_id={BEAD_ID} case=wal_headerless_interior_commit_commit_marker_uses_existing_db_size"
+        );
+    }
+
+    #[test]
+    fn test_wal_external_refresh_tracks_headerless_interior_commit() {
+        let (pager1, pager2, _frames) = wal_pager_pair_with_shared_backend();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        let page_two = {
+            let mut txn = pager1.begin(&cx, TransactionMode::Immediate).unwrap();
+            let page_two = txn.allocate_page(&cx).unwrap();
+            txn.write_page(&cx, page_two, &vec![0x11; ps]).unwrap();
+            txn.commit(&cx).unwrap();
+            page_two
+        };
+
+        let seq_before = pager1.published_snapshot().visible_commit_seq;
+
+        let mut txn = pager1.begin(&cx, TransactionMode::Immediate).unwrap();
+        txn.write_page(&cx, page_two, &vec![0x22; ps]).unwrap();
+        txn.commit(&cx).unwrap();
+
+        let latest_seq = pager1.published_snapshot().visible_commit_seq;
+        assert!(
+            latest_seq > seq_before,
+            "bead_id={BEAD_ID} case=wal_headerless_interior_commit_advances_local_seq"
+        );
+
+        let reader = pager2.begin(&cx, TransactionMode::ReadOnly).unwrap();
+        let refreshed = pager2.published_snapshot();
+        assert_eq!(
+            refreshed.visible_commit_seq, latest_seq,
+            "bead_id={BEAD_ID} case=wal_headerless_interior_commit_refreshes_visible_seq"
+        );
+        assert_eq!(
+            reader.get_page(&cx, page_two).unwrap().as_ref()[0],
+            0x22,
+            "bead_id={BEAD_ID} case=wal_headerless_interior_commit_refreshes_latest_page"
         );
     }
 

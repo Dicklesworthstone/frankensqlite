@@ -145,6 +145,16 @@ pub trait WalBackend: Send {
     /// page has no WAL entry (caller should fall through to disk).
     fn read_page(&mut self, cx: &Cx, page_number: u32) -> Result<Option<Vec<u8>>>;
 
+    /// Count committed transactions that occur after the latest committed
+    /// frame for `page_number` in the current visible WAL snapshot.
+    ///
+    /// This lets the pager derive an exact visible commit sequence even when a
+    /// WAL commit does not need to rewrite page 1. Implementations may return
+    /// 0 when they cannot provide a more precise answer.
+    fn committed_txns_since_page(&mut self, _cx: &Cx, _page_number: u32) -> Result<u64> {
+        Ok(0)
+    }
+
     /// Sync the WAL file to stable storage.
     fn sync(&mut self, cx: &Cx) -> Result<()>;
 

@@ -442,6 +442,56 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
         Ok(Some(data))
     }
 
+    fn committed_txns_since_page(&mut self, cx: &Cx, page_number: u32) -> Result<u64> {
+        let last_commit_frame = if self.read_snapshot_pinned {
+            let Some(pinned) = self.read_snapshot_last_commit else {
+                return Ok(0);
+            };
+            pinned
+        } else {
+            let Some(current) = self.wal.last_commit_frame(cx)? else {
+                return Ok(0);
+            };
+            current
+        };
+
+        let mut last_page_frame = None;
+        for frame_index in 0..=last_commit_frame {
+            let header = self.wal.read_frame_header(cx, frame_index)?;
+            if header.page_number == page_number {
+                last_page_frame = Some(frame_index);
+            }
+        }
+
+        let Some(last_page_frame) = last_page_frame else {
+            let mut total_commits = 0_u64;
+            for frame_index in 0..=last_commit_frame {
+                if self.wal.read_frame_header(cx, frame_index)?.is_commit() {
+                    total_commits = total_commits.saturating_add(1);
+                }
+            }
+            return Ok(total_commits);
+        };
+
+        let mut page_commit_seen = false;
+        let mut committed_txns_after_page = 0_u64;
+        for frame_index in 0..=last_commit_frame {
+            let header = self.wal.read_frame_header(cx, frame_index)?;
+            if !header.is_commit() {
+                continue;
+            }
+            if !page_commit_seen && frame_index >= last_page_frame {
+                page_commit_seen = true;
+                continue;
+            }
+            if page_commit_seen {
+                committed_txns_after_page = committed_txns_after_page.saturating_add(1);
+            }
+        }
+
+        Ok(committed_txns_after_page)
+    }
+
     fn sync(&mut self, cx: &Cx) -> Result<()> {
         let result = self.wal.sync(cx, SyncFlags::NORMAL);
         self.refresh_before_append = true;
