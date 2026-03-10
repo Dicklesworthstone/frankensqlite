@@ -11,7 +11,7 @@ use std::sync::atomic::{
     AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering as AtomicOrdering,
 };
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::cx::Cx;
@@ -524,6 +524,27 @@ fn remove_page_sorted(pages: &mut Vec<PageNumber>, page_no: PageNumber) {
 }
 
 const SNAPSHOT_PUBLICATION_MODE: &str = "seqlock_published_pages";
+const PUBLISHED_SNAPSHOT_SPIN_LIMIT: u32 = 64;
+const PUBLISHED_SNAPSHOT_SLEEP_AFTER: u32 = 512;
+const PUBLISHED_SNAPSHOT_SLEEP: Duration = Duration::from_micros(50);
+const PUBLISHED_READ_FAST_RETRY_LIMIT: usize = 64;
+
+#[inline]
+fn publication_retry_pause(retry: u32) {
+    if retry < PUBLISHED_SNAPSHOT_SPIN_LIMIT {
+        spin_loop();
+        return;
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        if retry < PUBLISHED_SNAPSHOT_SLEEP_AFTER {
+            std::thread::yield_now();
+        } else {
+            std::thread::sleep(PUBLISHED_SNAPSHOT_SLEEP);
+        }
+    }
+}
 
 /// Point-in-time view of the pager metadata publication plane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -589,11 +610,13 @@ impl PublishedPagerState {
     }
 
     fn snapshot(&self) -> PagerPublishedSnapshot {
+        let mut retry = 0_u32;
         loop {
             let snapshot_gen = self.sequence.load(AtomicOrdering::Acquire);
             if snapshot_gen % 2 == 1 {
                 self.record_retry();
-                spin_loop();
+                publication_retry_pause(retry);
+                retry = retry.saturating_add(1);
                 continue;
             }
 
@@ -618,7 +641,8 @@ impl PublishedPagerState {
             }
 
             self.record_retry();
-            spin_loop();
+            publication_retry_pause(retry);
+            retry = retry.saturating_add(1);
         }
     }
 
@@ -1682,6 +1706,7 @@ where
         }
 
         let read_start = Instant::now();
+        let mut published_retry_count = 0_usize;
         loop {
             let snapshot = self.published.snapshot();
             if page_no.get() > snapshot.db_size {
@@ -1704,6 +1729,11 @@ where
                     return Ok(PageData::from_vec(vec![0_u8; self.pool.page_size()]));
                 }
                 self.published.record_retry();
+                if published_retry_count >= PUBLISHED_READ_FAST_RETRY_LIMIT {
+                    break;
+                }
+                publication_retry_pause(u32::try_from(published_retry_count).unwrap_or(u32::MAX));
+                published_retry_count = published_retry_count.saturating_add(1);
                 continue;
             }
 
@@ -1728,6 +1758,11 @@ where
                     return Ok(page);
                 }
                 self.published.record_retry();
+                if published_retry_count >= PUBLISHED_READ_FAST_RETRY_LIMIT {
+                    break;
+                }
+                publication_retry_pause(u32::try_from(published_retry_count).unwrap_or(u32::MAX));
+                published_retry_count = published_retry_count.saturating_add(1);
                 continue;
             }
 
@@ -1850,6 +1885,23 @@ where
             self.finished = true;
             return Ok(());
         }
+        if !self.has_pending_writes() {
+            let mut inner = self
+                .inner
+                .lock()
+                .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
+            inner.active_transactions = inner.active_transactions.saturating_sub(1);
+            if self.mode != TransactionMode::Concurrent {
+                inner.writer_active = false;
+            }
+            let preserve_level =
+                retained_lock_level_after_txn_exit(inner.active_transactions, inner.writer_active);
+            let _ = inner.db_file.unlock(cx, preserve_level);
+            drop(inner);
+            self.committed = true;
+            self.finished = true;
+            return Ok(());
+        }
 
         let mut inner = self
             .inner
@@ -1944,6 +1996,14 @@ where
             drop(inner);
         }
         commit_result
+    }
+
+    fn is_writer(&self) -> bool {
+        self.is_writer
+    }
+
+    fn has_pending_writes(&self) -> bool {
+        !self.write_set.is_empty() || !self.freed_pages.is_empty()
     }
 
     fn rollback(&mut self, cx: &Cx) -> Result<()> {

@@ -113,6 +113,67 @@ const EPROCESS_DEFAULT_CONFIG: EProcessConfig = EProcessConfig {
 };
 const EPROCESS_PRIORITY_THRESHOLD: u8 = 1;
 
+// Keep the BEGIN retry schedule aligned with the VDBE page-write handoff path:
+// bounded on-CPU spins with infrequent scheduler yields, never sleep-based
+// exponential backoff.
+const BEGIN_BUSY_HANDOFF_BASE_SPINS: u32 = 64;
+const BEGIN_BUSY_HANDOFF_MAX_SPINS: u32 = 2_048;
+const BEGIN_BUSY_HANDOFF_YIELD_EVERY: u32 = 8;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BeginBusyRetryWait {
+    attempt: u32,
+    spin_loops: u32,
+    yielded: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct BeginBusyRetryHandoff {
+    next_attempt: u32,
+}
+
+impl BeginBusyRetryHandoff {
+    fn next_wait(&mut self, started: Instant, deadline: Duration) -> Option<BeginBusyRetryWait> {
+        if deadline.is_zero() || started.elapsed() >= deadline {
+            return None;
+        }
+
+        let attempt = self.next_attempt.saturating_add(1);
+        self.next_attempt = attempt;
+        Some(BeginBusyRetryWait {
+            attempt,
+            spin_loops: begin_busy_retry_spin_loops(attempt),
+            yielded: begin_busy_retry_should_yield(attempt),
+        })
+    }
+}
+
+const fn begin_busy_retry_spin_loops(attempt: u32) -> u32 {
+    let growth = attempt.saturating_sub(1);
+    let shift = if growth > 5 { 5 } else { growth };
+    let spins = BEGIN_BUSY_HANDOFF_BASE_SPINS << shift;
+    if spins > BEGIN_BUSY_HANDOFF_MAX_SPINS {
+        BEGIN_BUSY_HANDOFF_MAX_SPINS
+    } else {
+        spins
+    }
+}
+
+const fn begin_busy_retry_should_yield(attempt: u32) -> bool {
+    attempt >= BEGIN_BUSY_HANDOFF_YIELD_EVERY && attempt % BEGIN_BUSY_HANDOFF_YIELD_EVERY == 0
+}
+
+fn perform_begin_busy_retry_handoff(wait: BeginBusyRetryWait) {
+    for _ in 0..wait.spin_loops {
+        std::hint::spin_loop();
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    if wait.yielded {
+        std::thread::yield_now();
+    }
+}
+
 /// Maximum trigger recursion depth (F-PGM.11).
 ///
 /// SQLite defines `SQLITE_MAX_TRIGGER_DEPTH = 1000`, but each Rust recursion
@@ -943,7 +1004,10 @@ impl PreparedStatement<'_> {
         let txn = self
             .pager
             .as_ref()
-            .map(|p| p.begin(op_cx, TransactionMode::Deferred))
+            .map(|p| {
+                self.conn
+                    .begin_pager_txn_with_busy_timeout(p, op_cx, TransactionMode::Deferred)
+            })
             .transpose()?;
         let (result, mut txn_back) = execute_table_program_with_db(
             &self.program,
@@ -2323,9 +2387,34 @@ impl Connection {
         let publication = self.bind_pager_publication(cx, "memdb_staleness_check")?;
         if publication.snapshot.visible_commit_seq > *self.memdb_visible_commit_seq.borrow() {
             self.reload_memdb_from_pager(cx)?;
-            *self.memdb_visible_commit_seq.borrow_mut() = publication.snapshot.visible_commit_seq;
         }
         Ok(())
+    }
+
+    fn begin_pager_txn_with_busy_timeout(
+        &self,
+        pager: &PagerBackend,
+        cx: &Cx,
+        mode: TransactionMode,
+    ) -> Result<Box<dyn TransactionHandle>> {
+        let busy_timeout_ms = self.pragma_state.borrow().busy_timeout_ms.max(0) as u64;
+        let deadline = Duration::from_millis(busy_timeout_ms);
+        let started = Instant::now();
+        let mut handoff = BeginBusyRetryHandoff::default();
+
+        loop {
+            match pager.begin(cx, mode) {
+                Ok(txn) => return Ok(txn),
+                Err(FrankenError::Busy) => {
+                    let Some(wait) = handoff.next_wait(started, deadline) else {
+                        return Err(FrankenError::Busy);
+                    };
+                    perform_begin_busy_retry_handoff(wait);
+                    self.refresh_memdb_if_stale(cx)?;
+                }
+                Err(err) => return Err(err),
+            }
+        }
     }
 
     fn refresh_prepared_schema_state(&self, cx: &Cx) -> Result<()> {
@@ -6466,7 +6555,7 @@ impl Connection {
         } else {
             None
         };
-        let mut txn = self.pager.begin(&cx, mode)?;
+        let mut txn = self.begin_pager_txn_with_busy_timeout(&self.pager, &cx, mode)?;
         let concurrent_session = if let Some(snapshot) = concurrent_snapshot {
             let begin_result =
                 lock_unpoisoned(&self.concurrent_registry).begin_concurrent(snapshot);
@@ -6514,9 +6603,10 @@ impl Connection {
         // next_commit_seq between plan (which reads it) and finalize (which
         // bumps it).  Without this, assigned_commit_seq != committed_seq,
         // corrupting the MVCC commit index.
-        let txn_result = if ok {
+        let (txn_result, committed_write) = if ok {
             let _commit_guard = lock_unpoisoned(&self.commit_write_mutex);
-            let concurrent_plan = if *self.concurrent_txn.borrow() {
+            let txn_has_pending_writes = TransactionHandle::has_pending_writes(&*txn);
+            let concurrent_plan = if *self.concurrent_txn.borrow() && txn_has_pending_writes {
                 match self.plan_concurrent_commit() {
                     Ok(plan) => plan,
                     Err(e) => {
@@ -6543,18 +6633,28 @@ impl Connection {
             };
             match txn.commit(&cx) {
                 Ok(()) => {
-                    let committed_seq = self.advance_commit_clock();
-                    if let Some(plan) = concurrent_plan {
-                        self.finalize_concurrent_commit(plan, committed_seq);
+                    if txn_has_pending_writes {
+                        let committed_seq = self.advance_commit_clock();
+                        if let Some(plan) = concurrent_plan {
+                            self.finalize_concurrent_commit(plan, committed_seq);
+                        }
+                    } else if *self.concurrent_txn.borrow() {
+                        let _ =
+                            self.concurrent_session_id
+                                .borrow_mut()
+                                .take()
+                                .and_then(|session_id| {
+                                    lock_unpoisoned(&self.concurrent_registry).remove(session_id)
+                                });
                     }
-                    Ok(())
+                    (Ok(()), txn_has_pending_writes)
                 }
                 Err(e) => {
                     // Commit failed (e.g. I/O error or BUSY in standard mode).
                     // We must rollback to ensure cleanup and propagate the error.
                     self.txn_metrics_note_rollback();
                     let _ = txn.rollback(&cx);
-                    Err(e)
+                    (Err(e), false)
                 }
             }
         } else {
@@ -6568,7 +6668,7 @@ impl Connection {
                 }
             }
             self.txn_metrics_note_rollback();
-            txn.rollback(&cx)
+            (txn.rollback(&cx), false)
         };
 
         // Ensure connection-level transaction state is cleared regardless of outcome.
@@ -6578,17 +6678,15 @@ impl Connection {
 
         txn_result?;
 
-        // Capture time-travel snapshot for autocommit transactions.
-        {
+        if committed_write {
             let committed_seq = self
                 .last_local_commit_seq
                 .borrow()
                 .map(|s| s.get())
                 .unwrap_or(0);
             self.capture_time_travel_snapshot(committed_seq);
+            self.maybe_run_adaptive_autocheckpoint();
         }
-
-        self.maybe_run_adaptive_autocheckpoint();
         Ok(())
     }
 
@@ -6634,7 +6732,11 @@ impl Connection {
         let auto = self.active_txn.borrow().is_none();
         let mut auto_commit_succeeded = false;
         if auto {
-            let txn = self.pager.begin(&cx, TransactionMode::Immediate)?;
+            let txn = self.begin_pager_txn_with_busy_timeout(
+                &self.pager,
+                &cx,
+                TransactionMode::Immediate,
+            )?;
             *self.active_txn.borrow_mut() = Some(txn);
         }
         let result = {
@@ -8212,18 +8314,19 @@ impl Connection {
         // Phase 1: Validate schema (with borrow)
         {
             let schema = self.schema.borrow();
-            let table = schema
+            schema
                 .iter()
                 .find(|t| t.name.eq_ignore_ascii_case(table_name))
                 .ok_or_else(|| FrankenError::NoSuchTable {
                     name: table_name.clone(),
                 })?;
-            // Check for duplicate index name.
-            if table
-                .indexes
-                .iter()
-                .any(|idx| idx.name.eq_ignore_ascii_case(&index_name))
-            {
+            let index_name_exists = schema.iter().any(|candidate| {
+                candidate
+                    .indexes
+                    .iter()
+                    .any(|idx| idx.name.eq_ignore_ascii_case(&index_name))
+            });
+            if index_name_exists {
                 if stmt.if_not_exists {
                     return Ok(());
                 }
@@ -9632,32 +9735,7 @@ impl Connection {
         } else {
             None
         };
-        // Respect busy_timeout: retry pager.begin() with exponential backoff
-        // when an IMMEDIATE/EXCLUSIVE transaction gets SQLITE_BUSY because
-        // another writer is active.  Without this, BEGIN IMMEDIATE returns
-        // Busy immediately even though the caller configured a timeout.
-        // (issue #109: dead busy_timeout parameter)
-        let busy_timeout_ms = self.pragma_state.borrow().busy_timeout_ms.max(0) as u64;
-        let mut txn = {
-            let deadline = Duration::from_millis(busy_timeout_ms);
-            let started = Instant::now();
-            let mut backoff = Duration::from_micros(500);
-            loop {
-                match self.pager.begin(&cx, pager_mode) {
-                    Ok(t) => break t,
-                    Err(FrankenError::Busy)
-                        if busy_timeout_ms > 0 && started.elapsed() < deadline =>
-                    {
-                        std::thread::sleep(backoff);
-                        backoff = backoff.saturating_mul(2).min(Duration::from_millis(50));
-                        // Refresh memdb before retrying -- another writer may
-                        // have committed while we waited.
-                        self.refresh_memdb_if_stale(&cx)?;
-                    }
-                    Err(e) => return Err(e),
-                }
-            }
-        };
+        let mut txn = self.begin_pager_txn_with_busy_timeout(&self.pager, &cx, pager_mode)?;
         // MVCC concurrent-writer session (bd-14zc / 5E.1):
         // When mode is Concurrent, register with ConcurrentRegistry for
         // page-level MVCC locking and first-committer-wins validation.
@@ -10077,14 +10155,18 @@ impl Connection {
 
         // Attempt pager commit without consuming the handle (retriable on BUSY).
         // We use a scope to limit the mutable borrow of active_txn.
-        let commit_result = {
+        let (commit_result, committed_write) = {
             let _commit_guard = lock_unpoisoned(&self.commit_write_mutex);
-            let concurrent_commit_plan = if *self.concurrent_txn.borrow() {
+            let mut txn_guard = self.active_txn.borrow_mut();
+            let txn_has_pending_writes = txn_guard
+                .as_ref()
+                .is_some_and(|txn| TransactionHandle::has_pending_writes(&**txn));
+            let concurrent_commit_plan = if *self.concurrent_txn.borrow() && txn_has_pending_writes
+            {
                 self.plan_concurrent_commit()?
             } else {
                 None
             };
-            let mut txn_guard = self.active_txn.borrow_mut();
             let commit_res = if let Some(txn) = txn_guard.as_mut() {
                 txn.commit(&cx)
             } else {
@@ -10092,12 +10174,22 @@ impl Connection {
             };
 
             if matches!(commit_res, Ok(())) {
-                let committed_seq = self.advance_commit_clock();
-                if let Some(plan) = concurrent_commit_plan {
-                    self.finalize_concurrent_commit(plan, committed_seq);
+                if txn_has_pending_writes {
+                    let committed_seq = self.advance_commit_clock();
+                    if let Some(plan) = concurrent_commit_plan {
+                        self.finalize_concurrent_commit(plan, committed_seq);
+                    }
+                } else if *self.concurrent_txn.borrow() {
+                    let _ = self
+                        .concurrent_session_id
+                        .borrow_mut()
+                        .take()
+                        .and_then(|session_id| {
+                            lock_unpoisoned(&self.concurrent_registry).remove(session_id)
+                        });
                 }
             }
-            commit_res
+            (commit_res, txn_has_pending_writes)
         };
 
         commit_result?;
@@ -10113,22 +10205,22 @@ impl Connection {
         *self.implicit_txn.borrow_mut() = false;
         *self.concurrent_txn.borrow_mut() = false;
         self.db.borrow_mut().commit_undo();
-        self.maybe_run_adaptive_autocheckpoint();
+        if committed_write {
+            self.maybe_run_adaptive_autocheckpoint();
 
-        // Capture time-travel snapshot AFTER cleanup so the write transaction
-        // handle is fully dropped and the pager can serve reads to reload_memdb.
-        {
+            // Capture time-travel snapshot AFTER cleanup so the write transaction
+            // handle is fully dropped and the pager can serve reads to reload_memdb.
             let committed_seq = self
                 .last_local_commit_seq
                 .borrow()
                 .map(|s| s.get())
                 .unwrap_or(0);
             self.capture_time_travel_snapshot(committed_seq);
-        }
 
-        // MVCC GC (bd-3bql / 5E.5): After commit, trigger GC if scheduler permits.
-        // Commit makes new versions visible, potentially making old ones prunable.
-        self.maybe_gc_tick();
+            // MVCC GC (bd-3bql / 5E.5): After commit, trigger GC if scheduler permits.
+            // Commit makes new versions visible, potentially making old ones prunable.
+            self.maybe_gc_tick();
+        }
 
         Ok(())
     }
@@ -10426,13 +10518,12 @@ impl Connection {
             // Bind the implicit transaction snapshot to the pager's published
             // visibility plane before opening the pager txn.
             let concurrent_snapshot = if is_concurrent {
-                let publication =
-                    self.bind_pager_publication(&cx, "savepoint_implicit_begin")?;
+                let publication = self.bind_pager_publication(&cx, "savepoint_implicit_begin")?;
                 Some(self.concurrent_snapshot_from_publication(publication))
             } else {
                 None
             };
-            let mut txn = self.pager.begin(&cx, pager_mode)?;
+            let mut txn = self.begin_pager_txn_with_busy_timeout(&self.pager, &cx, pager_mode)?;
             let concurrent_session = if let Some(snapshot) = concurrent_snapshot {
                 let session_id = lock_unpoisoned(&self.concurrent_registry)
                     .begin_concurrent(snapshot)
@@ -10537,7 +10628,8 @@ impl Connection {
         }
         drop(active_txn);
 
-        let mut txn = self.pager.begin(&cx, TransactionMode::ReadOnly)?;
+        let mut txn =
+            self.begin_pager_txn_with_busy_timeout(&self.pager, &cx, TransactionMode::ReadOnly)?;
         let result = f(&cx, txn.as_mut());
         let _ = txn.rollback(&cx);
         result
@@ -10562,6 +10654,7 @@ impl Connection {
             }
 
             let header = parse_database_header_checked(page1_bytes)?;
+            let total_pages = self.pager.refresh_published_snapshot(cx)?.db_size;
             let master_rows = Self::read_sqlite_master_rows_in_txn(
                 cx,
                 txn,
@@ -10576,6 +10669,10 @@ impl Connection {
                 header.reserved_per_page,
                 &master_rows,
                 quick,
+                total_pages,
+                header.freelist_trunk,
+                header.freelist_count,
+                header.largest_root_page != 0,
             )?;
             Ok(())
         })
@@ -10683,6 +10780,412 @@ impl Connection {
         Ok(())
     }
 
+    fn inflate_table_row_values_for_integrity(
+        table: &TableSchema,
+        rowid: i64,
+        payload_values: &[SqliteValue],
+        rowid_alias_col_idx: Option<usize>,
+        defaults: Option<&[Option<SqliteValue>]>,
+    ) -> Result<Vec<SqliteValue>> {
+        let payload_includes_rowid_alias =
+            rowid_alias_col_idx.is_some_and(|_| payload_values.len() == table.columns.len());
+        let mut values = Vec::with_capacity(table.columns.len());
+        let mut payload_idx = 0_usize;
+
+        for col_idx in 0..table.columns.len() {
+            if rowid_alias_col_idx == Some(col_idx) && !payload_includes_rowid_alias {
+                values.push(SqliteValue::Integer(rowid));
+                continue;
+            }
+
+            let value = if let Some(value) = payload_values.get(payload_idx) {
+                payload_idx += 1;
+                value.clone()
+            } else if let Some(Some(default)) = defaults.and_then(|entries| entries.get(col_idx)) {
+                default.clone()
+            } else {
+                SqliteValue::Null
+            };
+
+            if rowid_alias_col_idx == Some(col_idx)
+                && let Some(encoded_rowid) = value.as_integer()
+                && encoded_rowid != rowid
+            {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "table `{}` rowid {rowid} stores inconsistent INTEGER PRIMARY KEY alias value {encoded_rowid}",
+                        table.name
+                    ),
+                });
+            }
+
+            values.push(value);
+        }
+
+        Ok(values)
+    }
+
+    fn build_expected_index_key_for_integrity(
+        table_name: &str,
+        index_name: &str,
+        rowid: i64,
+        row_values: &[SqliteValue],
+        column_positions: &[usize],
+    ) -> Result<Vec<u8>> {
+        let mut key_values = Vec::with_capacity(column_positions.len() + 1);
+        for &column_idx in column_positions {
+            let Some(value) = row_values.get(column_idx) else {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "index `{index_name}` on table `{table_name}` references missing column position {column_idx}",
+                    ),
+                });
+            };
+            key_values.push(value.clone());
+        }
+        key_values.push(SqliteValue::Integer(rowid));
+        Ok(serialize_record(&key_values))
+    }
+
+    fn record_integrity_page_owner(
+        owners: &mut HashMap<PageNumber, String>,
+        page_no: PageNumber,
+        total_pages: u32,
+        owner: String,
+    ) -> Result<()> {
+        if page_no.get() > total_pages {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "page {} referenced by {owner} lies past the end of the database (page_count={total_pages})",
+                    page_no.get()
+                ),
+            });
+        }
+
+        if let Some(existing) = owners.insert(page_no, owner.clone()) {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "page {} is referenced multiple times ({existing}; {owner})",
+                    page_no.get()
+                ),
+            });
+        }
+
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn walk_integrity_overflow_chain(
+        cx: &Cx,
+        txn: &mut dyn TransactionHandle,
+        page_size: PageSize,
+        reserved_per_page: u8,
+        total_pages: u32,
+        first_overflow: PageNumber,
+        payload_size: u32,
+        local_size: u32,
+        owner: &str,
+        owners: &mut HashMap<PageNumber, String>,
+    ) -> Result<()> {
+        let usable_size = page_size.usable(reserved_per_page);
+        if usable_size <= 4 {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!("invalid usable page size {usable_size} for overflow chain"),
+            });
+        }
+        if payload_size <= local_size {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!("{owner} stores an unexpected overflow pointer"),
+            });
+        }
+
+        let bytes_per_overflow = usize::try_from(usable_size - 4).unwrap_or(0);
+        let mut remaining =
+            usize::try_from(payload_size.saturating_sub(local_size)).unwrap_or(usize::MAX);
+        let mut current = Some(first_overflow);
+        let mut overflow_idx = 0_usize;
+
+        while remaining > 0 {
+            if overflow_idx >= fsqlite_btree::overflow::MAX_OVERFLOW_CHAIN {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!("{owner} overflow chain exceeds safety bound"),
+                });
+            }
+
+            let Some(page_no) = current else {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!("{owner} overflow chain ended before the payload was fully covered"),
+                });
+            };
+
+            Self::record_integrity_page_owner(
+                owners,
+                page_no,
+                total_pages,
+                format!("{owner} overflow[{overflow_idx}]"),
+            )?;
+
+            let page = txn.get_page(cx, page_no)?;
+            let page_bytes = page.as_ref();
+            if page_bytes.len() < 4 {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!("overflow page {} is too small", page_no.get()),
+                });
+            }
+
+            let next_raw =
+                u32::from_be_bytes([page_bytes[0], page_bytes[1], page_bytes[2], page_bytes[3]]);
+            let available = page_bytes.len().saturating_sub(4).min(bytes_per_overflow);
+            if available == 0 {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!("overflow page {} stores no payload bytes", page_no.get()),
+                });
+            }
+
+            remaining = remaining.saturating_sub(remaining.min(available));
+            current = PageNumber::new(next_raw);
+
+            if remaining == 0 && current.is_some() {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!("{owner} overflow chain has trailing pages beyond the declared payload size"),
+                });
+            }
+            if remaining > 0 && current.is_none() {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!("{owner} overflow chain ended before the payload was fully covered"),
+                });
+            }
+
+            overflow_idx = overflow_idx.saturating_add(1);
+        }
+
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn walk_integrity_btree_pages(
+        cx: &Cx,
+        txn: &mut dyn TransactionHandle,
+        page_size: PageSize,
+        reserved_per_page: u8,
+        total_pages: u32,
+        page_no: PageNumber,
+        owner: &str,
+        owners: &mut HashMap<PageNumber, String>,
+    ) -> Result<()> {
+        Self::record_integrity_page_owner(owners, page_no, total_pages, owner.to_owned())?;
+
+        let page = txn.get_page(cx, page_no)?;
+        let page_bytes = page.as_ref();
+        let header = BTreePageHeader::parse(
+            page_bytes,
+            page_size,
+            reserved_per_page,
+            page_no == PageNumber::ONE,
+        )
+        .map_err(|err| FrankenError::DatabaseCorrupt {
+            detail: format!("{owner}: page {} header invalid: {err}", page_no.get()),
+        })?;
+        let cell_pointers = header
+            .parse_cell_pointers(page_bytes, page_size, reserved_per_page)
+            .map_err(|err| FrankenError::DatabaseCorrupt {
+                detail: format!("{owner}: page {} cell pointers invalid: {err}", page_no.get()),
+            })?;
+        header
+            .parse_freeblocks(page_bytes, page_size, reserved_per_page)
+            .map_err(|err| FrankenError::DatabaseCorrupt {
+                detail: format!("{owner}: page {} freeblocks invalid: {err}", page_no.get()),
+            })?;
+
+        let usable_size = page_size.usable(reserved_per_page);
+        let page_type =
+            fsqlite_btree::BtreePageType::from_flag(page_bytes[header.header_offset]).ok_or_else(
+                || FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "{owner}: page {} has invalid B-tree page type flag {:#04x}",
+                        page_no.get(),
+                        page_bytes[header.header_offset]
+                    ),
+                },
+            )?;
+
+        for (cell_idx, cell_pointer) in cell_pointers.iter().enumerate() {
+            let cell = fsqlite_btree::CellRef::parse(
+                page_bytes,
+                usize::from(*cell_pointer),
+                page_type,
+                usable_size,
+            )
+            .map_err(|err| FrankenError::DatabaseCorrupt {
+                detail: format!("{owner}: page {} cell {cell_idx} invalid: {err}", page_no.get()),
+            })?;
+
+            if let Some(left_child) = cell.left_child {
+                Self::walk_integrity_btree_pages(
+                    cx,
+                    txn,
+                    page_size,
+                    reserved_per_page,
+                    total_pages,
+                    left_child,
+                    &format!("{owner} -> child[{cell_idx}]"),
+                    owners,
+                )?;
+            }
+
+            if let Some(first_overflow) = cell.overflow_page {
+                Self::walk_integrity_overflow_chain(
+                    cx,
+                    txn,
+                    page_size,
+                    reserved_per_page,
+                    total_pages,
+                    first_overflow,
+                    cell.payload_size,
+                    cell.local_size,
+                    &format!("{owner} -> cell[{cell_idx}]"),
+                    owners,
+                )?;
+            }
+        }
+
+        if let Some(right_child) = header.right_most_child {
+            Self::walk_integrity_btree_pages(
+                cx,
+                txn,
+                page_size,
+                reserved_per_page,
+                total_pages,
+                right_child,
+                &format!("{owner} -> right_child"),
+                owners,
+            )?;
+        }
+
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn validate_page_ownership_in_txn(
+        &self,
+        cx: &Cx,
+        txn: &mut dyn TransactionHandle,
+        page_size: PageSize,
+        reserved_per_page: u8,
+        total_pages: u32,
+        freelist_trunk: u32,
+        freelist_count: u32,
+        auto_vacuum_enabled: bool,
+        schema: &[TableSchema],
+    ) -> Result<()> {
+        if total_pages == 0 {
+            return Ok(());
+        }
+
+        let mut owners = HashMap::new();
+        Self::walk_integrity_btree_pages(
+            cx,
+            txn,
+            page_size,
+            reserved_per_page,
+            total_pages,
+            PageNumber::ONE,
+            "sqlite_master root",
+            &mut owners,
+        )?;
+
+        let mut counted_freelist_pages = 0_u32;
+        let mut next_trunk = PageNumber::new(freelist_trunk);
+        let mut trunk_index = 0_usize;
+        while let Some(trunk_page) = next_trunk {
+            Self::record_integrity_page_owner(
+                &mut owners,
+                trunk_page,
+                total_pages,
+                format!("freelist trunk[{trunk_index}]"),
+            )?;
+
+            let page = txn.get_page(cx, trunk_page)?;
+            let trunk =
+                fsqlite_btree::freelist::FreelistTrunk::parse(page.as_ref()).map_err(|err| {
+                    FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "freelist trunk page {} is malformed: {err}",
+                            trunk_page.get()
+                        ),
+                    }
+                })?;
+            counted_freelist_pages = counted_freelist_pages.saturating_add(1);
+
+            for (leaf_idx, leaf_page) in trunk.leaf_pages.iter().copied().enumerate() {
+                Self::record_integrity_page_owner(
+                    &mut owners,
+                    leaf_page,
+                    total_pages,
+                    format!("freelist trunk[{trunk_index}] leaf[{leaf_idx}]"),
+                )?;
+                counted_freelist_pages = counted_freelist_pages.saturating_add(1);
+            }
+
+            next_trunk = trunk.next_trunk;
+            trunk_index = trunk_index.saturating_add(1);
+        }
+
+        if counted_freelist_pages != freelist_count {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "freelist header claims {freelist_count} pages but the freelist walk found {counted_freelist_pages}",
+                ),
+            });
+        }
+
+        for table in schema {
+            let table_root = page_number_from_schema_root(table.root_page, &table.name, "table")?;
+            if table_root != PageNumber::ONE {
+                Self::walk_integrity_btree_pages(
+                    cx,
+                    txn,
+                    page_size,
+                    reserved_per_page,
+                    total_pages,
+                    table_root,
+                    &format!("table `{}` root", table.name),
+                    &mut owners,
+                )?;
+            }
+
+            for index in &table.indexes {
+                let index_root =
+                    page_number_from_schema_root(index.root_page, &index.name, "index")?;
+                Self::walk_integrity_btree_pages(
+                    cx,
+                    txn,
+                    page_size,
+                    reserved_per_page,
+                    total_pages,
+                    index_root,
+                    &format!("index `{}` root", index.name),
+                    &mut owners,
+                )?;
+            }
+        }
+
+        if !auto_vacuum_enabled {
+            for raw_page_no in 1..=total_pages {
+                let Some(page_no) = PageNumber::new(raw_page_no) else {
+                    continue;
+                };
+                if !owners.contains_key(&page_no) {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: format!("page {} is never used", page_no.get()),
+                    });
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     fn validate_schema_btrees_in_txn(
         &self,
         cx: &Cx,
@@ -10691,8 +11194,29 @@ impl Connection {
         reserved_per_page: u8,
         master_rows: &[Vec<SqliteValue>],
         quick: bool,
+        total_pages: u32,
+        freelist_trunk: u32,
+        freelist_count: u32,
+        auto_vacuum_enabled: bool,
     ) -> Result<()> {
         let schema = self.schema.borrow().clone();
+        let rowid_alias_col_by_root_page = (!quick).then(|| self.rowid_alias_column_by_root_page());
+        let column_defaults_by_root_page = (!quick).then(|| self.column_defaults_by_root_page());
+
+        if !quick {
+            self.validate_page_ownership_in_txn(
+                cx,
+                txn,
+                page_size,
+                reserved_per_page,
+                total_pages,
+                freelist_trunk,
+                freelist_count,
+                auto_vacuum_enabled,
+                &schema,
+            )?;
+        }
+
         let mut without_rowid_tables = HashSet::new();
         for row in master_rows {
             let (entry_type, name, _, _) = sqlite_master_signature(row)?;
@@ -10786,6 +11310,43 @@ impl Connection {
                     }
                 }
             } else {
+                let index_specs = if quick {
+                    Vec::new()
+                } else {
+                    table
+                        .indexes
+                        .iter()
+                        .map(|index| {
+                            let positions = index
+                                .columns
+                                .iter()
+                                .map(|column_name| {
+                                    table.column_index(column_name).ok_or_else(|| {
+                                        FrankenError::DatabaseCorrupt {
+                                            detail: format!(
+                                                "index `{}` references unknown column `{}` on table `{}`",
+                                                index.name, column_name, table.name
+                                            ),
+                                        }
+                                    })
+                                })
+                                .collect::<Result<Vec<_>>>()?;
+                            Ok((index, positions))
+                        })
+                        .collect::<Result<Vec<_>>>()?
+                };
+                let mut expected_index_keys = index_specs
+                    .iter()
+                    .map(|_| HashMap::<i64, Vec<u8>>::new())
+                    .collect::<Vec<_>>();
+                let rowid_alias_col_idx = rowid_alias_col_by_root_page
+                    .as_ref()
+                    .and_then(|map| map.get(&table.root_page))
+                    .copied();
+                let column_defaults = column_defaults_by_root_page
+                    .as_ref()
+                    .and_then(|map| map.get(&table.root_page))
+                    .map(Vec::as_slice);
                 let mut cursor = fsqlite_btree::BtCursor::new(
                     TransactionPageIo::new(txn),
                     root_page,
@@ -10814,11 +11375,133 @@ impl Connection {
                                 ),
                             });
                         }
+                        if !quick {
+                            let row_values = Self::inflate_table_row_values_for_integrity(
+                                table,
+                                rowid,
+                                &values,
+                                rowid_alias_col_idx,
+                                column_defaults,
+                            )?;
+                            for ((index, positions), expected_keys) in
+                                index_specs.iter().zip(expected_index_keys.iter_mut())
+                            {
+                                let key = Self::build_expected_index_key_for_integrity(
+                                    &table.name,
+                                    &index.name,
+                                    rowid,
+                                    &row_values,
+                                    positions,
+                                )?;
+                                expected_keys.insert(rowid, key);
+                            }
+                        }
                         if !cursor.next(cx)? {
                             break;
                         }
                     }
                 }
+                for ((index, _positions), expected_keys) in
+                    index_specs.iter().zip(expected_index_keys.iter())
+                {
+                    let index_root =
+                        page_number_from_schema_root(index.root_page, &index.name, "index")?;
+                    let page = txn.get_page(cx, index_root)?;
+                    let header =
+                        BTreePageHeader::parse(page.as_ref(), page_size, reserved_per_page, false)
+                            .map_err(|err| FrankenError::DatabaseCorrupt {
+                                detail: format!(
+                                    "index `{}` root page {} invalid: {err}",
+                                    index.name, index.root_page
+                                ),
+                            })?;
+                    if header.page_type.is_table() {
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "index `{}` root page {} is not an index b-tree page",
+                                index.name, index.root_page
+                            ),
+                        });
+                    }
+                    header
+                        .parse_cell_pointers(page.as_ref(), page_size, reserved_per_page)
+                        .map_err(|err| FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "index `{}` root page {} cell pointers invalid: {err}",
+                                index.name, index.root_page
+                            ),
+                        })?;
+                    header
+                        .parse_freeblocks(page.as_ref(), page_size, reserved_per_page)
+                        .map_err(|err| FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "index `{}` root page {} freeblocks invalid: {err}",
+                                index.name, index.root_page
+                            ),
+                        })?;
+
+                    let mut actual_rowids = HashSet::new();
+                    let mut cursor = fsqlite_btree::BtCursor::new(
+                        TransactionPageIo::new(txn),
+                        index_root,
+                        page_size.get(),
+                        false,
+                    );
+                    if cursor.first(cx)? {
+                        loop {
+                            let payload = cursor.payload(cx)?;
+                            parse_record(&payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
+                                detail: format!(
+                                    "index `{}` contains an invalid key record payload",
+                                    index.name
+                                ),
+                            })?;
+                            let rowid = cursor.rowid(cx)?;
+                            let Some(expected_payload) = expected_keys.get(&rowid) else {
+                                return Err(FrankenError::DatabaseCorrupt {
+                                    detail: format!(
+                                        "index `{}` contains stale rowid {rowid} with no matching table row",
+                                        index.name
+                                    ),
+                                });
+                            };
+                            if expected_payload.as_slice() != payload.as_slice() {
+                                return Err(FrankenError::DatabaseCorrupt {
+                                    detail: format!(
+                                        "index `{}` entry for rowid {rowid} does not match the table row payload",
+                                        index.name
+                                    ),
+                                });
+                            }
+                            if !actual_rowids.insert(rowid) {
+                                return Err(FrankenError::DatabaseCorrupt {
+                                    detail: format!(
+                                        "index `{}` contains duplicate entries for rowid {rowid}",
+                                        index.name
+                                    ),
+                                });
+                            }
+                            if !cursor.next(cx)? {
+                                break;
+                            }
+                        }
+                    }
+
+                    if let Some(missing_rowid) = expected_keys
+                        .keys()
+                        .find(|rowid| !actual_rowids.contains(rowid))
+                        .copied()
+                    {
+                        return Err(FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "table `{}` rowid {missing_rowid} is missing from index `{}`",
+                                table.name, index.name
+                            ),
+                        });
+                    }
+                }
+
+                continue;
             }
 
             for index in &table.indexes {
@@ -12221,7 +12904,8 @@ impl Connection {
             return Ok(parse_database_header(page1.as_ref()));
         }
 
-        let mut txn = self.pager.begin(&cx, TransactionMode::ReadOnly)?;
+        let mut txn =
+            self.begin_pager_txn_with_busy_timeout(&self.pager, &cx, TransactionMode::ReadOnly)?;
         let header = {
             let page1 = txn.get_page(&cx, PageNumber::ONE)?;
             parse_database_header(page1.as_ref())
@@ -27534,6 +28218,44 @@ mod tests {
     }
 
     #[test]
+    fn test_create_index_rejects_duplicate_name_on_other_table() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE issues (status TEXT);").unwrap();
+        conn.execute("CREATE INDEX idx_issues_status ON issues (status);")
+            .unwrap();
+        conn.execute("CREATE TABLE issues_rebuild_tmp (status TEXT);")
+            .unwrap();
+
+        let err = conn.execute("CREATE INDEX idx_issues_status ON issues_rebuild_tmp (status);");
+        assert!(
+            err.is_err(),
+            "duplicate index names must be rejected globally"
+        );
+    }
+
+    #[test]
+    fn test_create_index_if_not_exists_noops_when_name_exists_on_other_table() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE issues (status TEXT);").unwrap();
+        conn.execute("CREATE INDEX idx_issues_status ON issues (status);")
+            .unwrap();
+        conn.execute("CREATE TABLE issues_rebuild_tmp (status TEXT);")
+            .unwrap();
+
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_issues_status ON issues_rebuild_tmp (status);",
+        )
+        .unwrap();
+
+        let rows = conn
+            .query(
+                "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_issues_status';",
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
     fn test_create_index_bad_column() {
         let conn = Connection::open(":memory:").unwrap();
         conn.execute("CREATE TABLE t (a INTEGER);").unwrap();
@@ -38282,6 +39004,199 @@ mod schema_loading_tests {
         assert_eq!(*rows[0].get(0).unwrap(), SqliteValue::Integer(10000));
     }
 
+    #[test]
+    fn test_begin_busy_retry_spin_loops_grow_then_cap() {
+        assert_eq!(
+            begin_busy_retry_spin_loops(1),
+            BEGIN_BUSY_HANDOFF_BASE_SPINS
+        );
+        assert_eq!(
+            begin_busy_retry_spin_loops(2),
+            BEGIN_BUSY_HANDOFF_BASE_SPINS * 2
+        );
+        assert_eq!(
+            begin_busy_retry_spin_loops(3),
+            BEGIN_BUSY_HANDOFF_BASE_SPINS * 4
+        );
+        assert_eq!(begin_busy_retry_spin_loops(6), BEGIN_BUSY_HANDOFF_MAX_SPINS);
+        assert_eq!(
+            begin_busy_retry_spin_loops(32),
+            BEGIN_BUSY_HANDOFF_MAX_SPINS
+        );
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct BeginBusyRetryScheduleSummary {
+        attempts: u32,
+        total_spin_loops: u64,
+        max_spin_loops: u32,
+        yield_count: u32,
+        p50_spin_loops: u32,
+        p95_spin_loops: u32,
+        p99_spin_loops: u32,
+    }
+
+    fn summarize_begin_busy_retry_schedule(attempts: u32) -> BeginBusyRetryScheduleSummary {
+        assert!(
+            attempts > 0,
+            "begin busy-retry validation needs at least one attempt"
+        );
+
+        let waits = (1..=attempts)
+            .map(|attempt| BeginBusyRetryWait {
+                attempt,
+                spin_loops: begin_busy_retry_spin_loops(attempt),
+                yielded: begin_busy_retry_should_yield(attempt),
+            })
+            .collect::<Vec<_>>();
+
+        let total_spin_loops = waits.iter().map(|wait| u64::from(wait.spin_loops)).sum();
+        let max_spin_loops = waits
+            .iter()
+            .map(|wait| wait.spin_loops)
+            .max()
+            .unwrap_or_default();
+        let yield_count = u32::try_from(waits.iter().filter(|wait| wait.yielded).count())
+            .expect("begin busy-retry validation should fit within u32 attempt counts");
+
+        let mut spin_samples = waits.iter().map(|wait| wait.spin_loops).collect::<Vec<_>>();
+        spin_samples.sort_unstable();
+
+        BeginBusyRetryScheduleSummary {
+            attempts,
+            total_spin_loops,
+            max_spin_loops,
+            yield_count,
+            p50_spin_loops: percentile_begin_spin_loops(&spin_samples, 50),
+            p95_spin_loops: percentile_begin_spin_loops(&spin_samples, 95),
+            p99_spin_loops: percentile_begin_spin_loops(&spin_samples, 99),
+        }
+    }
+
+    fn percentile_begin_spin_loops(sorted_spin_loops: &[u32], percentile: u8) -> u32 {
+        assert!(
+            (1..=100).contains(&percentile),
+            "percentile must be in 1..=100"
+        );
+        assert!(
+            !sorted_spin_loops.is_empty(),
+            "percentile validation needs at least one sample"
+        );
+
+        let rank = usize::from(percentile)
+            .saturating_mul(sorted_spin_loops.len())
+            .div_ceil(100);
+        let index = rank
+            .saturating_sub(1)
+            .min(sorted_spin_loops.len().saturating_sub(1));
+        sorted_spin_loops[index]
+    }
+
+    #[test]
+    fn test_begin_busy_retry_yield_cadence_is_bounded() {
+        for attempt in 1..BEGIN_BUSY_HANDOFF_YIELD_EVERY {
+            assert!(
+                !begin_busy_retry_should_yield(attempt),
+                "attempt {attempt} should stay on-CPU"
+            );
+        }
+
+        assert!(begin_busy_retry_should_yield(
+            BEGIN_BUSY_HANDOFF_YIELD_EVERY
+        ));
+        assert!(!begin_busy_retry_should_yield(
+            BEGIN_BUSY_HANDOFF_YIELD_EVERY + 1
+        ));
+        assert!(begin_busy_retry_should_yield(
+            BEGIN_BUSY_HANDOFF_YIELD_EVERY * 2
+        ));
+    }
+
+    #[test]
+    fn test_begin_busy_retry_handoff_respects_deadline() {
+        let mut handoff = BeginBusyRetryHandoff::default();
+        let expired_started = Instant::now()
+            .checked_sub(Duration::from_millis(5))
+            .expect("expired instant should be constructible");
+        assert!(
+            handoff
+                .next_wait(expired_started, Duration::from_millis(1))
+                .is_none(),
+            "expired deadline must stop retrying"
+        );
+
+        let fresh_wait = handoff
+            .next_wait(Instant::now(), Duration::from_millis(1))
+            .expect("fresh deadline should allow a bounded handoff wait");
+        assert_eq!(fresh_wait.attempt, 1);
+        assert_eq!(fresh_wait.spin_loops, BEGIN_BUSY_HANDOFF_BASE_SPINS);
+        assert!(!fresh_wait.yielded, "first retry should not yield");
+    }
+
+    #[test]
+    fn test_begin_busy_retry_schedule_summary_captures_tail_latency_budget() {
+        let summary = summarize_begin_busy_retry_schedule(8);
+
+        assert_eq!(summary.attempts, 8);
+        assert_eq!(summary.total_spin_loops, 8_128);
+        assert_eq!(summary.max_spin_loops, BEGIN_BUSY_HANDOFF_MAX_SPINS);
+        assert_eq!(summary.p50_spin_loops, 512);
+        assert_eq!(summary.p95_spin_loops, BEGIN_BUSY_HANDOFF_MAX_SPINS);
+        assert_eq!(summary.p99_spin_loops, BEGIN_BUSY_HANDOFF_MAX_SPINS);
+    }
+
+    #[test]
+    fn test_begin_busy_retry_schedule_summary_bounds_wake_amplification() {
+        let summary = summarize_begin_busy_retry_schedule(21);
+
+        assert_eq!(
+            summary.yield_count,
+            21 / BEGIN_BUSY_HANDOFF_YIELD_EVERY,
+            "wake amplification must stay at one scheduler yield per bounded retry window"
+        );
+        assert_eq!(summary.max_spin_loops, BEGIN_BUSY_HANDOFF_MAX_SPINS);
+        assert_eq!(summary.p95_spin_loops, BEGIN_BUSY_HANDOFF_MAX_SPINS);
+        assert_eq!(summary.p99_spin_loops, BEGIN_BUSY_HANDOFF_MAX_SPINS);
+    }
+
+    #[test]
+    fn test_begin_immediate_busy_timeout_preserves_losing_connection_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("begin_busy_timeout_handoff.db");
+        let db_path_str = db_path.to_str().unwrap();
+
+        let holder = Connection::open(db_path_str).unwrap();
+        holder
+            .execute("CREATE TABLE t (id INTEGER PRIMARY KEY);")
+            .unwrap();
+        holder.execute("BEGIN IMMEDIATE;").unwrap();
+
+        let waiter = Connection::open(db_path_str).unwrap();
+        waiter.execute("PRAGMA busy_timeout=1;").unwrap();
+
+        let err = waiter
+            .execute("BEGIN IMMEDIATE;")
+            .expect_err("contending BEGIN IMMEDIATE should time out with SQLITE_BUSY");
+        assert!(
+            matches!(err, FrankenError::Busy),
+            "expected SQLITE_BUSY from begin handoff timeout, got {err}"
+        );
+        assert!(
+            !waiter.in_transaction(),
+            "timed-out waiter must not enter an in-transaction state"
+        );
+        assert!(
+            waiter.active_txn.borrow().is_none(),
+            "timed-out waiter must not retain an active pager transaction"
+        );
+        assert!(
+            !waiter.has_concurrent_session(),
+            "timed-out waiter must not leak a concurrent session"
+        );
+
+        holder.execute("COMMIT;").unwrap();
+    }
+
     /// br-22iss: Test UPDATE with numbered placeholders
     #[test]
     fn test_update_with_four_numbered_placeholders() {
@@ -40122,6 +41037,96 @@ mod pager_routing_tests {
     }
 
     #[test]
+    fn test_read_only_queries_do_not_poison_following_concurrent_begin_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("readonly_commit_seq_regression.db");
+        let db_path_str = db_path.to_str().unwrap();
+        let conn_a = Connection::open(db_path_str).unwrap();
+        conn_a
+            .execute("CREATE TABLE ro_clock_test (id INTEGER PRIMARY KEY, v INTEGER);")
+            .unwrap();
+        let conn_b = Connection::open(db_path_str).unwrap();
+        conn_a.set_reject_mem_fallback(true);
+        conn_a.set_strict_mem_fallback_rejection(true);
+        conn_b.set_reject_mem_fallback(true);
+        conn_b.set_strict_mem_fallback_rejection(true);
+
+        let seq_before_reads = conn_a.current_global_commit_seq();
+        let rows = conn_b
+            .query("SELECT id FROM ro_clock_test ORDER BY id;")
+            .unwrap();
+        assert!(rows.is_empty(), "fresh table should start empty");
+        let rows = conn_b
+            .query("SELECT id FROM ro_clock_test ORDER BY id;")
+            .unwrap();
+        assert!(rows.is_empty(), "repeated read should stay empty");
+        assert_eq!(
+            conn_a.current_global_commit_seq(),
+            seq_before_reads,
+            "read-only queries must not advance the shared commit clock"
+        );
+
+        conn_a.execute("BEGIN;").unwrap();
+        conn_a
+            .execute("INSERT INTO ro_clock_test (id, v) VALUES (1, 1);")
+            .unwrap();
+        conn_a.execute("COMMIT;").unwrap();
+
+        let latest_visible = conn_a.pager.published_snapshot().visible_commit_seq;
+        conn_b.execute("BEGIN;").unwrap();
+        assert_eq!(
+            conn_b.current_concurrent_snapshot_seq(),
+            Some(latest_visible.get()),
+            "plain BEGIN after prior reads must bind to the latest published snapshot"
+        );
+        conn_b
+            .execute("INSERT INTO ro_clock_test (id, v) VALUES (2, 2);")
+            .unwrap();
+        conn_b.execute("COMMIT;").unwrap();
+
+        let rows = conn_a
+            .query("SELECT id FROM ro_clock_test ORDER BY id;")
+            .unwrap();
+        let observed_ids = rows
+            .iter()
+            .map(|row| match row.values()[0] {
+                SqliteValue::Integer(v) => v,
+                _ => panic!("expected integer id column"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(observed_ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn test_rolled_back_savepoint_write_does_not_advance_commit_clock() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE savepoint_clock_test (id INTEGER PRIMARY KEY);")
+            .unwrap();
+
+        let seq_before = conn.current_global_commit_seq();
+        conn.execute("BEGIN;").unwrap();
+        conn.execute("SAVEPOINT s;").unwrap();
+        conn.execute("INSERT INTO savepoint_clock_test (id) VALUES (1);")
+            .unwrap();
+        conn.execute("ROLLBACK TO s;").unwrap();
+        conn.execute("RELEASE s;").unwrap();
+        conn.execute("COMMIT;").unwrap();
+
+        assert_eq!(
+            conn.current_global_commit_seq(),
+            seq_before,
+            "rolling back all savepoint writes must leave the commit clock unchanged"
+        );
+        let rows = conn
+            .query("SELECT id FROM savepoint_clock_test ORDER BY id;")
+            .unwrap();
+        assert!(
+            rows.is_empty(),
+            "rolled-back savepoint write must stay invisible"
+        );
+    }
+
+    #[test]
     fn test_visibility_interleavings_fixed_seed_matrix() {
         // Fixed-seed property-style stress over interleaved two-connection
         // operations. Verifies:
@@ -40165,23 +41170,53 @@ mod pager_routing_tests {
                 match op_code {
                     0 => {
                         // Commit path.
-                        conn.execute("BEGIN;").unwrap();
+                        conn.execute("BEGIN;").unwrap_or_else(|err| {
+                            panic!(
+                                "seed={seed} step={_step} conn={} op=begin_commit err={err:?}",
+                                if use_a { "a" } else { "b" }
+                            )
+                        });
                         conn.execute(&format!(
                             "INSERT INTO interleave_vis (id, v) VALUES ({next_row_id}, {next_row_id});"
                         ))
-                        .unwrap();
-                        conn.execute("COMMIT;").unwrap();
+                        .unwrap_or_else(|err| {
+                            panic!(
+                                "seed={seed} step={_step} conn={} op=insert_commit row_id={next_row_id} err={err:?}",
+                                if use_a { "a" } else { "b" }
+                            )
+                        });
+                        conn.execute("COMMIT;").unwrap_or_else(|err| {
+                            panic!(
+                                "seed={seed} step={_step} conn={} op=commit row_id={next_row_id} err={err:?}",
+                                if use_a { "a" } else { "b" }
+                            )
+                        });
                         committed_ids.insert(next_row_id);
                         next_row_id += 1;
                     }
                     1 => {
                         // Rollback path.
-                        conn.execute("BEGIN;").unwrap();
+                        conn.execute("BEGIN;").unwrap_or_else(|err| {
+                            panic!(
+                                "seed={seed} step={_step} conn={} op=begin_rollback err={err:?}",
+                                if use_a { "a" } else { "b" }
+                            )
+                        });
                         conn.execute(&format!(
                             "INSERT INTO interleave_vis (id, v) VALUES ({next_row_id}, {next_row_id});"
                         ))
-                        .unwrap();
-                        conn.execute("ROLLBACK;").unwrap();
+                        .unwrap_or_else(|err| {
+                            panic!(
+                                "seed={seed} step={_step} conn={} op=insert_rollback row_id={next_row_id} err={err:?}",
+                                if use_a { "a" } else { "b" }
+                            )
+                        });
+                        conn.execute("ROLLBACK;").unwrap_or_else(|err| {
+                            panic!(
+                                "seed={seed} step={_step} conn={} op=rollback row_id={next_row_id} err={err:?}",
+                                if use_a { "a" } else { "b" }
+                            )
+                        });
                         next_row_id += 1;
                     }
                     _ => {
@@ -47398,6 +48433,87 @@ mod pager_routing_tests {
             message.contains("invalid B-tree page type")
                 || message.contains("root page")
                 || message.contains("corrupt"),
+            "unexpected integrity_check diagnostic: {message}"
+        );
+    }
+
+    #[test]
+    fn test_pragma_integrity_check_reports_corrupt_secondary_index_entry() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);")
+            .unwrap();
+        conn.execute("CREATE INDEX idx_t_name ON t(name);").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'Alice');").unwrap();
+
+        let index_root = conn
+            .schema
+            .borrow()
+            .iter()
+            .find(|table| table.name.eq_ignore_ascii_case("t"))
+            .and_then(|table| {
+                table
+                    .indexes
+                    .iter()
+                    .find(|index| index.name.eq_ignore_ascii_case("idx_t_name"))
+                    .map(|index| index.root_page)
+            })
+            .expect("test index root page");
+
+        let cx = Cx::new();
+        let mut txn = conn.pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let page_no = PageNumber::new(u32::try_from(index_root).unwrap()).unwrap();
+        let mut page = txn.get_page(&cx, page_no).unwrap().into_vec();
+        let header_offset = fsqlite_btree::header_offset_for_page(page_no);
+        let header = fsqlite_btree::BtreePageHeader::parse(&page, header_offset).unwrap();
+        let cell_pointers = fsqlite_btree::read_cell_pointers(&page, &header, header_offset).unwrap();
+        let cell = fsqlite_btree::CellRef::parse(
+            &page,
+            usize::from(cell_pointers[0]),
+            header.page_type,
+            u32::try_from(page.len()).unwrap(),
+        )
+        .unwrap();
+        let local_payload_end = cell.payload_offset + usize::try_from(cell.local_size).unwrap();
+        page[local_payload_end - 1] ^= 0x01;
+        txn.write_page(&cx, page_no, &page).unwrap();
+        txn.commit(&cx).unwrap();
+
+        let rows = conn.query("PRAGMA integrity_check;").unwrap();
+        assert_eq!(rows.len(), 1);
+        let SqliteValue::Text(message) = &rows[0].values()[0] else {
+            panic!("integrity_check should return a text diagnostic row");
+        };
+        assert_ne!(message, "ok");
+        assert!(
+            message.contains("idx_t_name")
+                || message.contains("stale rowid")
+                || message.contains("does not match"),
+            "unexpected integrity_check diagnostic: {message}"
+        );
+    }
+
+    #[test]
+    fn test_pragma_integrity_check_reports_freelist_count_mismatch() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'Alice');").unwrap();
+
+        let cx = Cx::new();
+        let mut txn = conn.pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let mut page1 = txn.get_page(&cx, PageNumber::ONE).unwrap().into_vec();
+        page1[36..40].copy_from_slice(&1_u32.to_be_bytes());
+        txn.write_page(&cx, PageNumber::ONE, &page1).unwrap();
+        txn.commit(&cx).unwrap();
+
+        let rows = conn.query("PRAGMA integrity_check;").unwrap();
+        assert_eq!(rows.len(), 1);
+        let SqliteValue::Text(message) = &rows[0].values()[0] else {
+            panic!("integrity_check should return a text diagnostic row");
+        };
+        assert_ne!(message, "ok");
+        assert!(
+            message.contains("freelist header claims"),
             "unexpected integrity_check diagnostic: {message}"
         );
     }

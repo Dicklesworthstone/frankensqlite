@@ -1496,16 +1496,16 @@ fn cmd_run(argv: &[String]) -> i32 {
             pretty,
             output_jsonl.as_deref(),
         ),
-        "fsqlite" => run_fsqlite_engine(
+        "fsqlite" => run_fsqlite_engine(FsqliteRunArgs {
             db_name,
             workload_name,
-            &concurrency,
+            concurrency: &concurrency,
             repeat,
-            fsqlite_mvcc,
+            mvcc: fsqlite_mvcc,
             run_mode,
             pretty,
-            output_jsonl.as_deref(),
-        ),
+            output_jsonl: output_jsonl.as_deref(),
+        }),
         other => {
             eprintln!("error: unknown engine `{other}` (expected sqlite3 or fsqlite)");
             2
@@ -1725,16 +1725,29 @@ fn run_sqlite3_engine(
 
 /// Execute a workload against FrankenSQLite and print JSON results.
 #[allow(clippy::too_many_lines)]
-fn run_fsqlite_engine(
-    db_name: &str,
-    workload_name: &str,
-    concurrency: &[u16],
+struct FsqliteRunArgs<'a> {
+    db_name: &'a str,
+    workload_name: &'a str,
+    concurrency: &'a [u16],
     repeat: usize,
     mvcc: bool,
     run_mode: RunModeOptions,
     pretty: bool,
-    output_jsonl: Option<&Path>,
-) -> i32 {
+    output_jsonl: Option<&'a Path>,
+}
+
+#[allow(clippy::too_many_lines)]
+fn run_fsqlite_engine(args: FsqliteRunArgs<'_>) -> i32 {
+    let FsqliteRunArgs {
+        db_name,
+        workload_name,
+        concurrency,
+        repeat,
+        mvcc,
+        run_mode,
+        pretty,
+        output_jsonl,
+    } = args;
     let golden_path = match resolve_golden_db(db_name) {
         Ok(p) => p,
         Err(e) => {

@@ -7671,7 +7671,7 @@ fn resolved_primary_collation<'a>(
 ) -> Option<&'a str> {
     match resolved {
         Some(SortKeySource::Column(idx)) => table.columns.get(*idx)?.collation.as_deref(),
-        Some(SortKeySource::Rowid) | Some(SortKeySource::Expression(_)) | None => None,
+        Some(SortKeySource::Rowid | SortKeySource::Expression(_)) | None => None,
     }
 }
 

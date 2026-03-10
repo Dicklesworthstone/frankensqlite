@@ -330,8 +330,7 @@ impl PerfResult {
     }
 }
 
-#[must_use]
-fn hot_path_value_profile(
+struct HotPathValueMetrics {
     total_values: u64,
     nulls: u64,
     integers: u64,
@@ -340,16 +339,19 @@ fn hot_path_value_profile(
     blobs: u64,
     text_bytes_total: u64,
     blob_bytes_total: u64,
-) -> HotPathValueTypeProfile {
+}
+
+#[must_use]
+fn hot_path_value_profile(metrics: HotPathValueMetrics) -> HotPathValueTypeProfile {
     HotPathValueTypeProfile {
-        total_values,
-        nulls,
-        integers,
-        reals,
-        texts,
-        blobs,
-        text_bytes_total,
-        blob_bytes_total,
+        total_values: metrics.total_values,
+        nulls: metrics.nulls,
+        integers: metrics.integers,
+        reals: metrics.reals,
+        texts: metrics.texts,
+        blobs: metrics.blobs,
+        text_bytes_total: metrics.text_bytes_total,
+        blob_bytes_total: metrics.blob_bytes_total,
     }
 }
 
@@ -379,26 +381,26 @@ fn build_hot_path_profile_report(
     engine_report: EngineRunReport,
     snapshot: HotPathProfileSnapshot,
 ) -> HotPathProfileReport {
-    let decoded_types = hot_path_value_profile(
-        snapshot.record_decode.decoded_values.total_values(),
-        snapshot.record_decode.decoded_values.null_count,
-        snapshot.record_decode.decoded_values.integer_count,
-        snapshot.record_decode.decoded_values.float_count,
-        snapshot.record_decode.decoded_values.text_count,
-        snapshot.record_decode.decoded_values.blob_count,
-        snapshot.record_decode.decoded_values.text_bytes,
-        snapshot.record_decode.decoded_values.blob_bytes,
-    );
-    let materialized_types = hot_path_value_profile(
-        snapshot.vdbe.result_value_types.total_values,
-        snapshot.vdbe.result_value_types.nulls,
-        snapshot.vdbe.result_value_types.integers,
-        snapshot.vdbe.result_value_types.reals,
-        snapshot.vdbe.result_value_types.texts,
-        snapshot.vdbe.result_value_types.blobs,
-        snapshot.vdbe.result_value_types.text_bytes_total,
-        snapshot.vdbe.result_value_types.blob_bytes_total,
-    );
+    let decoded_types = hot_path_value_profile(HotPathValueMetrics {
+        total_values: snapshot.record_decode.decoded_values.total_values(),
+        nulls: snapshot.record_decode.decoded_values.null_count,
+        integers: snapshot.record_decode.decoded_values.integer_count,
+        reals: snapshot.record_decode.decoded_values.float_count,
+        texts: snapshot.record_decode.decoded_values.text_count,
+        blobs: snapshot.record_decode.decoded_values.blob_count,
+        text_bytes_total: snapshot.record_decode.decoded_values.text_bytes,
+        blob_bytes_total: snapshot.record_decode.decoded_values.blob_bytes,
+    });
+    let materialized_types = hot_path_value_profile(HotPathValueMetrics {
+        total_values: snapshot.vdbe.result_value_types.total_values,
+        nulls: snapshot.vdbe.result_value_types.nulls,
+        integers: snapshot.vdbe.result_value_types.integers,
+        reals: snapshot.vdbe.result_value_types.reals,
+        texts: snapshot.vdbe.result_value_types.texts,
+        blobs: snapshot.vdbe.result_value_types.blobs,
+        text_bytes_total: snapshot.vdbe.result_value_types.text_bytes_total,
+        blob_bytes_total: snapshot.vdbe.result_value_types.blob_bytes_total,
+    });
 
     let opcode_profile = snapshot
         .vdbe
@@ -611,7 +613,7 @@ pub fn render_hot_path_profile_markdown(report: &HotPathProfileReport) -> String
             .engine_report
             .correctness
             .integrity_check_ok
-            .map_or("skipped".to_owned(), |ok| ok.to_string())
+            .map_or_else(|| "skipped".to_owned(), |ok| ok.to_string())
     );
     if let Some(error) = &report.engine_report.error {
         let _ = writeln!(out, "- Error: `{error}`");

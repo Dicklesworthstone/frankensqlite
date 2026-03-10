@@ -538,6 +538,7 @@ impl CheckpointTarget for CheckpointTargetAdapterRef<'_> {
 #[cfg(test)]
 mod tests {
     use fsqlite_pager::MockCheckpointPageWriter;
+    use fsqlite_pager::traits::WalFrameRef;
     use fsqlite_types::flags::VfsOpenFlags;
     use fsqlite_vfs::MemoryVfs;
     use fsqlite_vfs::traits::Vfs;
@@ -715,6 +716,73 @@ mod tests {
             2,
             "shared WAL should contain both commit frames"
         );
+    }
+
+    #[test]
+    fn test_adapter_batch_append_checksum_chain_matches_single_append() {
+        let cx = test_cx();
+        let vfs_single = MemoryVfs::new();
+        let vfs_batch = MemoryVfs::new();
+
+        let mut adapter_single = make_adapter(&vfs_single, &cx);
+        let mut adapter_batch = make_adapter(&vfs_batch, &cx);
+
+        let pages: Vec<Vec<u8>> = (0..4u8).map(sample_page).collect();
+        let commit_sizes = [0_u32, 0, 0, 4];
+
+        for (index, page) in pages.iter().enumerate() {
+            adapter_single
+                .append_frame(
+                    &cx,
+                    u32::try_from(index + 1).expect("page number fits u32"),
+                    page,
+                    commit_sizes[index],
+                )
+                .expect("single append");
+        }
+
+        let batch_frames: Vec<_> = pages
+            .iter()
+            .enumerate()
+            .map(|(index, page)| WalFrameRef {
+                page_number: u32::try_from(index + 1).expect("page number fits u32"),
+                page_data: page,
+                db_size_if_commit: commit_sizes[index],
+            })
+            .collect();
+        adapter_batch
+            .append_frames(&cx, &batch_frames)
+            .expect("batch append");
+
+        assert_eq!(
+            adapter_single.frame_count(),
+            adapter_batch.frame_count(),
+            "batch adapter append must preserve frame count"
+        );
+        assert_eq!(
+            adapter_single.wal.running_checksum(),
+            adapter_batch.wal.running_checksum(),
+            "batch adapter append must preserve checksum chain"
+        );
+
+        for frame_index in 0..pages.len() {
+            let (single_header, single_data) = adapter_single
+                .wal
+                .read_frame(&cx, frame_index)
+                .expect("read single frame");
+            let (batch_header, batch_data) = adapter_batch
+                .wal
+                .read_frame(&cx, frame_index)
+                .expect("read batch frame");
+            assert_eq!(
+                single_header, batch_header,
+                "frame header {frame_index} must match"
+            );
+            assert_eq!(
+                single_data, batch_data,
+                "frame payload {frame_index} must match"
+            );
+        }
     }
 
     #[test]

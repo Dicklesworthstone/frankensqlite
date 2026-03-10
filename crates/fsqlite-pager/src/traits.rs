@@ -318,6 +318,19 @@ pub trait TransactionHandle: sealed::Sealed + Send {
     /// (via `FrankenError::Busy`) on serialization failure.
     fn commit(&mut self, cx: &Cx) -> Result<()>;
 
+    /// Whether this transaction has been upgraded to a writer.
+    ///
+    /// Read-only and deferred transactions that never dirtied a page must
+    /// return `false` so upper layers do not synthesize commit sequences for
+    /// no-op commits.
+    fn is_writer(&self) -> bool;
+
+    /// Whether this transaction still has net page changes to publish.
+    ///
+    /// This can become `false` again after `ROLLBACK TO` discards all pending
+    /// writes, even if the transaction had previously upgraded to writer mode.
+    fn has_pending_writes(&self) -> bool;
+
     /// Roll back this transaction, discarding the write-set.
     ///
     /// Rollback is infallible in the MVCC model (we simply discard the
@@ -449,6 +462,14 @@ impl TransactionHandle for MockTransaction {
     fn commit(&mut self, _cx: &Cx) -> Result<()> {
         self.committed = true;
         Ok(())
+    }
+
+    fn is_writer(&self) -> bool {
+        false
+    }
+
+    fn has_pending_writes(&self) -> bool {
+        false
     }
 
     fn rollback(&mut self, _cx: &Cx) -> Result<()> {

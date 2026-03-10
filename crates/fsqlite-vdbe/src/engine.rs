@@ -2220,38 +2220,39 @@ fn estimated_value_heap_bytes(value: &SqliteValue) -> u64 {
     }
 }
 
-fn record_value_type_metrics(
-    value: &SqliteValue,
-    total_counter: &AtomicU64,
-    null_counter: &AtomicU64,
-    integer_counter: &AtomicU64,
-    real_counter: &AtomicU64,
-    text_counter: &AtomicU64,
-    blob_counter: &AtomicU64,
-    text_bytes_counter: &AtomicU64,
-    blob_bytes_counter: &AtomicU64,
-) {
-    total_counter.fetch_add(1, AtomicOrdering::Relaxed);
+struct ValueTypeMetricCounters<'a> {
+    total: &'a AtomicU64,
+    nulls: &'a AtomicU64,
+    integers: &'a AtomicU64,
+    reals: &'a AtomicU64,
+    texts: &'a AtomicU64,
+    blobs: &'a AtomicU64,
+    text_bytes: &'a AtomicU64,
+    blob_bytes: &'a AtomicU64,
+}
+
+fn record_value_type_metrics(value: &SqliteValue, counters: &ValueTypeMetricCounters<'_>) {
+    counters.total.fetch_add(1, AtomicOrdering::Relaxed);
     match value {
         SqliteValue::Null => {
-            null_counter.fetch_add(1, AtomicOrdering::Relaxed);
+            counters.nulls.fetch_add(1, AtomicOrdering::Relaxed);
         }
         SqliteValue::Integer(_) => {
-            integer_counter.fetch_add(1, AtomicOrdering::Relaxed);
+            counters.integers.fetch_add(1, AtomicOrdering::Relaxed);
         }
         SqliteValue::Float(_) => {
-            real_counter.fetch_add(1, AtomicOrdering::Relaxed);
+            counters.reals.fetch_add(1, AtomicOrdering::Relaxed);
         }
         SqliteValue::Text(text) => {
-            text_counter.fetch_add(1, AtomicOrdering::Relaxed);
-            text_bytes_counter.fetch_add(
+            counters.texts.fetch_add(1, AtomicOrdering::Relaxed);
+            counters.text_bytes.fetch_add(
                 u64::try_from(text.len()).unwrap_or(u64::MAX),
                 AtomicOrdering::Relaxed,
             );
         }
         SqliteValue::Blob(blob) => {
-            blob_counter.fetch_add(1, AtomicOrdering::Relaxed);
-            blob_bytes_counter.fetch_add(
+            counters.blobs.fetch_add(1, AtomicOrdering::Relaxed);
+            counters.blob_bytes.fetch_add(
                 u64::try_from(blob.len()).unwrap_or(u64::MAX),
                 AtomicOrdering::Relaxed,
             );
@@ -2262,17 +2263,17 @@ fn record_value_type_metrics(
 fn record_decoded_value_metrics(value: &SqliteValue) {
     FSQLITE_VDBE_DECODED_VALUE_HEAP_BYTES_TOTAL
         .fetch_add(estimated_value_heap_bytes(value), AtomicOrdering::Relaxed);
-    record_value_type_metrics(
-        value,
-        &FSQLITE_VDBE_DECODED_VALUES_TOTAL,
-        &FSQLITE_VDBE_DECODED_NULLS_TOTAL,
-        &FSQLITE_VDBE_DECODED_INTEGERS_TOTAL,
-        &FSQLITE_VDBE_DECODED_REALS_TOTAL,
-        &FSQLITE_VDBE_DECODED_TEXTS_TOTAL,
-        &FSQLITE_VDBE_DECODED_BLOBS_TOTAL,
-        &FSQLITE_VDBE_DECODED_TEXT_BYTES_TOTAL,
-        &FSQLITE_VDBE_DECODED_BLOB_BYTES_TOTAL,
-    );
+    let counters = ValueTypeMetricCounters {
+        total: &FSQLITE_VDBE_DECODED_VALUES_TOTAL,
+        nulls: &FSQLITE_VDBE_DECODED_NULLS_TOTAL,
+        integers: &FSQLITE_VDBE_DECODED_INTEGERS_TOTAL,
+        reals: &FSQLITE_VDBE_DECODED_REALS_TOTAL,
+        texts: &FSQLITE_VDBE_DECODED_TEXTS_TOTAL,
+        blobs: &FSQLITE_VDBE_DECODED_BLOBS_TOTAL,
+        text_bytes: &FSQLITE_VDBE_DECODED_TEXT_BYTES_TOTAL,
+        blob_bytes: &FSQLITE_VDBE_DECODED_BLOB_BYTES_TOTAL,
+    };
+    record_value_type_metrics(value, &counters);
 }
 
 fn record_result_row_metrics(row: &[SqliteValue]) {
@@ -2281,18 +2282,18 @@ fn record_result_row_metrics(row: &[SqliteValue]) {
         acc.saturating_add(estimated_value_heap_bytes(value))
     });
     FSQLITE_VDBE_RESULT_VALUE_HEAP_BYTES_TOTAL.fetch_add(row_heap_bytes, AtomicOrdering::Relaxed);
+    let counters = ValueTypeMetricCounters {
+        total: &FSQLITE_VDBE_RESULT_VALUES_TOTAL,
+        nulls: &FSQLITE_VDBE_RESULT_NULLS_TOTAL,
+        integers: &FSQLITE_VDBE_RESULT_INTEGERS_TOTAL,
+        reals: &FSQLITE_VDBE_RESULT_REALS_TOTAL,
+        texts: &FSQLITE_VDBE_RESULT_TEXTS_TOTAL,
+        blobs: &FSQLITE_VDBE_RESULT_BLOBS_TOTAL,
+        text_bytes: &FSQLITE_VDBE_RESULT_TEXT_BYTES_TOTAL,
+        blob_bytes: &FSQLITE_VDBE_RESULT_BLOB_BYTES_TOTAL,
+    };
     for value in row {
-        record_value_type_metrics(
-            value,
-            &FSQLITE_VDBE_RESULT_VALUES_TOTAL,
-            &FSQLITE_VDBE_RESULT_NULLS_TOTAL,
-            &FSQLITE_VDBE_RESULT_INTEGERS_TOTAL,
-            &FSQLITE_VDBE_RESULT_REALS_TOTAL,
-            &FSQLITE_VDBE_RESULT_TEXTS_TOTAL,
-            &FSQLITE_VDBE_RESULT_BLOBS_TOTAL,
-            &FSQLITE_VDBE_RESULT_TEXT_BYTES_TOTAL,
-            &FSQLITE_VDBE_RESULT_BLOB_BYTES_TOTAL,
-        );
+        record_value_type_metrics(value, &counters);
     }
 }
 
@@ -14762,6 +14763,73 @@ mod tests {
         assert_eq!(busy_retry_spin_loops(32), WRITE_BUSY_HANDOFF_MAX_SPINS);
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct BusyRetryScheduleSummary {
+        attempts: u32,
+        total_spin_loops: u64,
+        max_spin_loops: u32,
+        yield_count: u32,
+        p50_spin_loops: u32,
+        p95_spin_loops: u32,
+        p99_spin_loops: u32,
+    }
+
+    fn summarize_busy_retry_schedule(attempts: u32) -> BusyRetryScheduleSummary {
+        assert!(
+            attempts > 0,
+            "busy-retry validation needs at least one attempt"
+        );
+
+        let waits = (1..=attempts)
+            .map(|attempt| BusyRetryWait {
+                attempt,
+                spin_loops: busy_retry_spin_loops(attempt),
+                yielded: busy_retry_should_yield(attempt),
+            })
+            .collect::<Vec<_>>();
+
+        let total_spin_loops = waits.iter().map(|wait| u64::from(wait.spin_loops)).sum();
+        let max_spin_loops = waits
+            .iter()
+            .map(|wait| wait.spin_loops)
+            .max()
+            .unwrap_or_default();
+        let yield_count = u32::try_from(waits.iter().filter(|wait| wait.yielded).count())
+            .expect("busy-retry validation should fit within u32 attempt counts");
+
+        let mut spin_samples = waits.iter().map(|wait| wait.spin_loops).collect::<Vec<_>>();
+        spin_samples.sort_unstable();
+
+        BusyRetryScheduleSummary {
+            attempts,
+            total_spin_loops,
+            max_spin_loops,
+            yield_count,
+            p50_spin_loops: percentile_spin_loops(&spin_samples, 50),
+            p95_spin_loops: percentile_spin_loops(&spin_samples, 95),
+            p99_spin_loops: percentile_spin_loops(&spin_samples, 99),
+        }
+    }
+
+    fn percentile_spin_loops(sorted_spin_loops: &[u32], percentile: u8) -> u32 {
+        assert!(
+            (1..=100).contains(&percentile),
+            "percentile must be in 1..=100"
+        );
+        assert!(
+            !sorted_spin_loops.is_empty(),
+            "percentile validation needs at least one sample"
+        );
+
+        let rank = usize::from(percentile)
+            .saturating_mul(sorted_spin_loops.len())
+            .div_ceil(100);
+        let index = rank
+            .saturating_sub(1)
+            .min(sorted_spin_loops.len().saturating_sub(1));
+        sorted_spin_loops[index]
+    }
+
     #[test]
     fn test_busy_retry_yield_cadence_is_bounded() {
         for attempt in 1..WRITE_BUSY_HANDOFF_YIELD_EVERY {
@@ -14795,6 +14863,32 @@ mod tests {
         assert_eq!(fresh_wait.attempt, 1);
         assert_eq!(fresh_wait.spin_loops, WRITE_BUSY_HANDOFF_BASE_SPINS);
         assert!(!fresh_wait.yielded, "first retry should not yield");
+    }
+
+    #[test]
+    fn test_busy_retry_schedule_summary_captures_tail_latency_budget() {
+        let summary = summarize_busy_retry_schedule(8);
+
+        assert_eq!(summary.attempts, 8);
+        assert_eq!(summary.total_spin_loops, 8_128);
+        assert_eq!(summary.max_spin_loops, WRITE_BUSY_HANDOFF_MAX_SPINS);
+        assert_eq!(summary.p50_spin_loops, 512);
+        assert_eq!(summary.p95_spin_loops, WRITE_BUSY_HANDOFF_MAX_SPINS);
+        assert_eq!(summary.p99_spin_loops, WRITE_BUSY_HANDOFF_MAX_SPINS);
+    }
+
+    #[test]
+    fn test_busy_retry_schedule_summary_bounds_wake_amplification() {
+        let summary = summarize_busy_retry_schedule(21);
+
+        assert_eq!(
+            summary.yield_count,
+            21 / WRITE_BUSY_HANDOFF_YIELD_EVERY,
+            "wake amplification must stay at one scheduler yield per bounded retry window"
+        );
+        assert_eq!(summary.max_spin_loops, WRITE_BUSY_HANDOFF_MAX_SPINS);
+        assert_eq!(summary.p95_spin_loops, WRITE_BUSY_HANDOFF_MAX_SPINS);
+        assert_eq!(summary.p99_spin_loops, WRITE_BUSY_HANDOFF_MAX_SPINS);
     }
 
     #[test]

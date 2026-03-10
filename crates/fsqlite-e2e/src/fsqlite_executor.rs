@@ -18,12 +18,12 @@ use fsqlite::{Connection, FrankenError};
 use fsqlite_btree::instrumentation::{
     BtreeMetricsSnapshot, btree_metrics_snapshot, reset_btree_metrics,
 };
-use fsqlite_parser::{
-    ParseMetricsSnapshot, SemanticMetricsSnapshot, TokenizeMetricsSnapshot,
-    parse_metrics_snapshot, reset_parse_metrics, reset_semantic_metrics,
-    reset_tokenize_metrics, semantic_metrics_snapshot, tokenize_metrics_snapshot,
-};
 use fsqlite_parser::parser::{parse_metrics_enabled, set_parse_metrics_enabled};
+use fsqlite_parser::{
+    ParseMetricsSnapshot, SemanticMetricsSnapshot, TokenizeMetricsSnapshot, parse_metrics_snapshot,
+    reset_parse_metrics, reset_semantic_metrics, reset_tokenize_metrics, semantic_metrics_snapshot,
+    tokenize_metrics_snapshot,
+};
 use fsqlite_types::value::SqliteValue;
 use fsqlite_vdbe::engine::{
     ValueTypeMetricsSnapshot, VdbeMetricsSnapshot, reset_vdbe_metrics, set_vdbe_metrics_enabled,
@@ -138,18 +138,18 @@ impl HotPathMetricsCapture {
         if !self.enabled {
             return None;
         }
-        Some(build_hot_path_profile(
-            &tokenize_metrics_snapshot(),
-            &parse_metrics_snapshot(),
-            &semantic_metrics_snapshot(),
-            &vdbe_metrics_snapshot(),
-            &btree_metrics_snapshot(),
-            &GLOBAL_VFS_METRICS.snapshot(),
-            &self.vfs_before,
-            &wal_telemetry_snapshot(),
-            &self.wal_before,
+        Some(build_hot_path_profile(HotPathProfileInputs {
+            tokenize: &tokenize_metrics_snapshot(),
+            parser: &parse_metrics_snapshot(),
+            semantic: semantic_metrics_snapshot(),
+            vdbe: &vdbe_metrics_snapshot(),
+            btree: &btree_metrics_snapshot(),
+            vfs_after: GLOBAL_VFS_METRICS.snapshot(),
+            vfs_before: self.vfs_before,
+            wal_after: &wal_telemetry_snapshot(),
+            wal_before: &self.wal_before,
             oplog,
-        ))
+        }))
     }
 }
 
@@ -302,18 +302,32 @@ fn wal_delta(after: &WalTelemetrySnapshot, before: &WalTelemetrySnapshot) -> Wal
     }
 }
 
-fn build_hot_path_profile(
-    tokenize: &TokenizeMetricsSnapshot,
-    parser: &ParseMetricsSnapshot,
-    semantic: &SemanticMetricsSnapshot,
-    vdbe: &VdbeMetricsSnapshot,
-    btree: &BtreeMetricsSnapshot,
-    vfs_after: &VfsMetricsSnapshot,
-    vfs_before: &VfsMetricsSnapshot,
-    wal_after: &WalTelemetrySnapshot,
-    wal_before: &WalTelemetrySnapshot,
-    oplog: &OpLog,
-) -> FsqliteHotPathProfile {
+struct HotPathProfileInputs<'a> {
+    tokenize: &'a TokenizeMetricsSnapshot,
+    parser: &'a ParseMetricsSnapshot,
+    semantic: SemanticMetricsSnapshot,
+    vdbe: &'a VdbeMetricsSnapshot,
+    btree: &'a BtreeMetricsSnapshot,
+    vfs_after: VfsMetricsSnapshot,
+    vfs_before: VfsMetricsSnapshot,
+    wal_after: &'a WalTelemetrySnapshot,
+    wal_before: &'a WalTelemetrySnapshot,
+    oplog: &'a OpLog,
+}
+
+fn build_hot_path_profile(inputs: HotPathProfileInputs<'_>) -> FsqliteHotPathProfile {
+    let HotPathProfileInputs {
+        tokenize,
+        parser,
+        semantic,
+        vdbe,
+        btree,
+        vfs_after,
+        vfs_before,
+        wal_after,
+        wal_before,
+        oplog,
+    } = inputs;
     let top_actual_opcodes = top_opcode_counts(
         vdbe.opcode_execution_totals
             .iter()
@@ -400,7 +414,7 @@ fn build_hot_path_profile(
             ),
         },
     ];
-    let vfs_profile = vfs_delta(vfs_after, vfs_before);
+    let vfs_profile = vfs_delta(&vfs_after, &vfs_before);
     if vfs_profile.read_ops > 0 || vfs_profile.write_ops > 0 {
         ranked_hotspots.push(HotPathEvidence {
             label: "vfs_io".to_owned(),
@@ -508,7 +522,7 @@ pub fn run_oplog_fsqlite(
     oplog: &OpLog,
     config: &FsqliteExecConfig,
 ) -> E2eResult<EngineRunReport> {
-    let metrics_capture = HotPathMetricsCapture::new(config.collect_hot_path_profile);
+    let mut metrics_capture = HotPathMetricsCapture::new(config.collect_hot_path_profile);
     let worker_count = oplog.header.concurrency.worker_count;
     if worker_count == 0 {
         return Err(E2eError::Io(std::io::Error::new(
@@ -528,7 +542,7 @@ pub fn run_oplog_fsqlite(
             setup_len,
             &per_worker,
             config,
-            &metrics_capture,
+            &mut metrics_capture,
         )?
     } else {
         let conn = open_connection(db_path)?;
@@ -545,7 +559,7 @@ pub fn run_oplog_fsqlite(
         )
     };
     let wall = started.elapsed();
-    let hot_path_profile = metrics_capture.snapshot();
+    let hot_path_profile = metrics_capture.snapshot(oplog);
 
     let integrity_check_ok = if config.run_integrity_check && db_path != Path::new(":memory:") {
         // Best-effort verification: validate the resulting DB file with
@@ -556,18 +570,18 @@ pub fn run_oplog_fsqlite(
         None
     };
 
-    Ok(build_report(
+    Ok(build_report(EngineRunReportArgs {
         wall,
         ops_ok,
         ops_err,
         retries,
         aborts,
         first_error,
-        config.concurrent_mode,
+        concurrent_mode: config.concurrent_mode,
         integrity_check_ok,
-        run_parallel_workers,
+        parallel_workers: run_parallel_workers,
         hot_path_profile,
-    ))
+    }))
 }
 
 fn open_connection(db_path: &Path) -> E2eResult<Connection> {
@@ -642,7 +656,7 @@ fn replay_parallel(
     setup_len: usize,
     per_worker: &[Vec<&OpRecord>],
     config: &FsqliteExecConfig,
-    metrics_capture: &HotPathMetricsCapture,
+    metrics_capture: &mut HotPathMetricsCapture,
 ) -> E2eResult<(u64, u64, u64, u64, Option<String>)> {
     let worker_count = u16::try_from(per_worker.len()).map_err(|_| {
         E2eError::Io(std::io::Error::new(
@@ -796,7 +810,7 @@ fn run_worker_parallel(
 
 /// Assemble an [`EngineRunReport`] from execution statistics.
 #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
-fn build_report(
+struct EngineRunReportArgs {
     wall: std::time::Duration,
     ops_ok: u64,
     ops_err: u64,
@@ -807,7 +821,22 @@ fn build_report(
     integrity_check_ok: Option<bool>,
     parallel_workers: bool,
     hot_path_profile: Option<FsqliteHotPathProfile>,
-) -> EngineRunReport {
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+fn build_report(args: EngineRunReportArgs) -> EngineRunReport {
+    let EngineRunReportArgs {
+        wall,
+        ops_ok,
+        ops_err,
+        retries,
+        aborts,
+        first_error,
+        concurrent_mode,
+        integrity_check_ok,
+        parallel_workers,
+        hot_path_profile,
+    } = args;
     let wall_ms = wall.as_millis() as u64;
     let ops_total = ops_ok + ops_err;
     let ops_per_sec = if wall.as_secs_f64() > 0.0 {
