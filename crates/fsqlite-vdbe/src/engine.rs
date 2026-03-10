@@ -39,7 +39,7 @@ use fsqlite_types::cx::Cx;
 use fsqlite_types::opcode::{IndexCursorMeta, Opcode, P4, VdbeOp};
 use fsqlite_types::record::{parse_record, serialize_record};
 use fsqlite_types::value::SqliteValue;
-use fsqlite_types::{CommitSeq, PageData, PageNumber, SchemaEpoch, StrictColumnType};
+use fsqlite_types::{CommitSeq, PageData, PageNumber, SchemaEpoch, StrictColumnType, WitnessKey};
 
 use crate::VdbeProgram;
 
@@ -90,9 +90,10 @@ impl MemTable {
         self.unique_column_groups.push(cols);
     }
 
-    /// Find a row that conflicts with `new_values` on any UNIQUE constraint.
-    /// Returns the rowid of the first conflicting row, or `None`.
-    pub fn find_unique_conflict(&self, new_values: &[SqliteValue]) -> Option<i64> {
+    /// Find rows that conflict with `new_values` on any UNIQUE constraint.
+    /// Returns the rowids of all conflicting rows.
+    pub fn find_unique_conflicts(&self, new_values: &[SqliteValue]) -> Vec<i64> {
+        let mut conflicts = Vec::new();
         for group in &self.unique_column_groups {
             for row in &self.rows {
                 let all_match = group.iter().all(|&col_idx| {
@@ -107,11 +108,13 @@ impl MemTable {
                     }
                 });
                 if all_match {
-                    return Some(row.rowid);
+                    if !conflicts.contains(&row.rowid) {
+                        conflicts.push(row.rowid);
+                    }
                 }
             }
         }
-        None
+        conflicts
     }
 
     /// Allocate a new unique rowid.
@@ -907,6 +910,20 @@ impl PageWriter for SharedTxnPageIo {
     fn free_page(&mut self, cx: &Cx, page_no: PageNumber) -> Result<()> {
         self.txn.borrow_mut().free_page(cx, page_no)
     }
+
+    fn record_write_witness(&mut self, cx: &Cx, key: WitnessKey) {
+        if let Some(ref ctx) = self.concurrent {
+            let mut guard = ctx
+                .registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(handle) = guard.get_mut(ctx.session_id) {
+                handle.record_write_witness(key);
+                return;
+            }
+        }
+        self.txn.borrow_mut().record_write_witness(cx, key);
+    }
 }
 
 // ── Time-Travel Page I/O ──────────────────────────────────────────────
@@ -1028,6 +1045,8 @@ impl PageWriter for TimeTravelPageIo {
             "time-travel cursors are read-only: free_page not permitted".to_owned(),
         ))
     }
+
+    fn record_write_witness(&mut self, _cx: &Cx, _key: WitnessKey) {}
 }
 
 // ── Cursor Backend Enum ────────────────────────────────────────────────
@@ -4220,9 +4239,6 @@ impl VdbeEngine {
                                 let seek_result =
                                     cursor.cursor.index_move_to(&cursor.cx, key_bytes)?;
 
-                                let mut target_vals_buf = Vec::new();
-                                let mut cur_vals_buf = Vec::new();
-
                                 match op.opcode {
                                     Opcode::SeekGE => !cursor.cursor.eof(),
                                     Opcode::SeekGT => {
@@ -4230,9 +4246,10 @@ impl VdbeEngine {
                                             cursor.cursor.next(&cursor.cx)?;
                                         }
                                         if !cursor.cursor.eof() {
+                                            cursor.target_vals_buf.clear();
                                             fsqlite_types::record::parse_record_into(
                                                 key_bytes,
-                                                &mut target_vals_buf,
+                                                &mut cursor.target_vals_buf,
                                             )
                                             .ok_or_else(|| {
                                                 FrankenError::internal(
@@ -4244,9 +4261,10 @@ impl VdbeEngine {
                                                     break;
                                                 }
                                                 let payload = cursor.cursor.payload(&cursor.cx)?;
+                                                cursor.cur_vals_buf.clear();
                                                 fsqlite_types::record::parse_record_into(
                                                     &payload,
-                                                    &mut cur_vals_buf,
+                                                    &mut cursor.cur_vals_buf,
                                                 )
                                                 .ok_or_else(|| {
                                                     FrankenError::internal(
@@ -4254,9 +4272,9 @@ impl VdbeEngine {
                                                     )
                                                 })?;
                                                 let cmp = compare_sorter_keys(
-                                                    &cur_vals_buf,
-                                                    &target_vals_buf,
-                                                    target_vals_buf.len(),
+                                                    &cursor.cur_vals_buf,
+                                                    &cursor.target_vals_buf,
+                                                    cursor.target_vals_buf.len(),
                                                     &[],
                                                 );
                                                 if cmp == std::cmp::Ordering::Equal {
@@ -4270,9 +4288,10 @@ impl VdbeEngine {
                                     }
                                     Opcode::SeekLE => {
                                         if !cursor.cursor.eof() {
+                                            cursor.target_vals_buf.clear();
                                             fsqlite_types::record::parse_record_into(
                                                 key_bytes,
-                                                &mut target_vals_buf,
+                                                &mut cursor.target_vals_buf,
                                             )
                                             .ok_or_else(|| {
                                                 FrankenError::internal(
@@ -4284,9 +4303,10 @@ impl VdbeEngine {
                                                     break;
                                                 }
                                                 let payload = cursor.cursor.payload(&cursor.cx)?;
+                                                cursor.cur_vals_buf.clear();
                                                 fsqlite_types::record::parse_record_into(
                                                     &payload,
-                                                    &mut cur_vals_buf,
+                                                    &mut cursor.cur_vals_buf,
                                                 )
                                                 .ok_or_else(|| {
                                                     FrankenError::internal(
@@ -4294,9 +4314,9 @@ impl VdbeEngine {
                                                     )
                                                 })?;
                                                 let cmp = compare_sorter_keys(
-                                                    &cur_vals_buf,
-                                                    &target_vals_buf,
-                                                    target_vals_buf.len(),
+                                                    &cursor.cur_vals_buf,
+                                                    &cursor.target_vals_buf,
+                                                    cursor.target_vals_buf.len(),
                                                     &[],
                                                 );
                                                 if cmp == std::cmp::Ordering::Equal {
@@ -4708,14 +4728,15 @@ impl VdbeEngine {
                                 .is_some();
 
                             // Check UNIQUE column constraint conflicts (non-IPK).
-                            let unique_conflict_rowid = if !rowid_conflict {
-                                db.get_table(root)
-                                    .and_then(|t| t.find_unique_conflict(&values))
-                            } else {
-                                None
-                            };
+                            // We check even if rowid_conflict is true, because
+                            // the new values might conflict with a DIFFERENT
+                            // row on a UNIQUE column.
+                            let unique_conflicts = db
+                                .get_table(root)
+                                .map(|t| t.find_unique_conflicts(&values))
+                                .unwrap_or_default();
 
-                            let has_conflict = rowid_conflict || unique_conflict_rowid.is_some();
+                            let has_conflict = rowid_conflict || !unique_conflicts.is_empty();
 
                             if has_conflict {
                                 match oe_flag {
@@ -4725,9 +4746,14 @@ impl VdbeEngine {
                                     5 => {
                                         // OE_REPLACE: Delete conflicting row(s),
                                         // then insert new.
-                                        if let Some(conflict_rid) = unique_conflict_rowid {
-                                            db.get_table_mut(root)
-                                                .map(|t| t.delete_by_rowid(conflict_rid));
+                                        if let Some(table) = db.get_table_mut(root) {
+                                            for conflict_rid in unique_conflicts {
+                                                // Delete conflicting rows that are not the new rowid
+                                                // (which will be replaced by upsert_row).
+                                                if conflict_rid != rowid {
+                                                    table.delete_by_rowid(conflict_rid);
+                                                }
+                                            }
                                         }
                                         db.upsert_row(root, rowid, values);
                                         actually_inserted = true;
@@ -5008,12 +5034,8 @@ impl VdbeEngine {
 
                     // Collect key bytes BEFORE borrowing cursor (borrow checker).
                     let key_bytes: Option<Vec<u8>> = if key_count > 0 {
-                        let mut key_values: Vec<SqliteValue> =
-                            Vec::with_capacity(key_count as usize);
-                        for i in 0..key_count {
-                            key_values.push(self.get_reg(key_start_reg + i).clone());
-                        }
-                        Some(encode_record(&key_values))
+                        let iter = (0..key_count).map(|i| self.get_reg(key_start_reg + i));
+                        Some(fsqlite_types::record::serialize_record_iter(iter))
                     } else {
                         None
                     };
@@ -5416,12 +5438,14 @@ impl VdbeEngine {
                     // P4 (Int) = default type code if column is beyond row width.
                     // P5 bitmask: 0x01=INTEGER, 0x02=FLOAT, 0x04=TEXT, 0x08=BLOB, 0x10=NULL
                     // Jump to P2 if the value's type matches a bit in P5.
+                    let val_ref;
                     let val = if op.p1 < 0 {
-                        self.get_reg(op.p3).clone()
+                        self.get_reg(op.p3)
                     } else {
-                        self.cursor_column(op.p1, op.p3 as usize)?
+                        val_ref = self.cursor_column(op.p1, op.p3 as usize)?;
+                        &val_ref
                     };
-                    let type_bit: u16 = match &val {
+                    let type_bit: u16 = match val {
                         SqliteValue::Integer(_) => 0x01,
                         SqliteValue::Float(_) => 0x02,
                         SqliteValue::Text(_) => 0x04,
@@ -5535,11 +5559,10 @@ impl VdbeEngine {
                 // (0 means use all columns from the probe).
                 Opcode::IdxLE | Opcode::IdxGT | Opcode::IdxLT | Opcode::IdxGE => {
                     let cursor_id = op.p1;
-                    let probe_val = self.get_reg(op.p3);
-                    let probe_fields = decode_record(probe_val)?;
+                    let probe_val = self.get_reg(op.p3).clone();
 
                     // Extract current cursor key as parsed fields.
-                    let cursor_fields = if let Some(sc) = self.storage_cursors.get(&cursor_id) {
+                    if let Some(sc) = self.storage_cursors.get_mut(&cursor_id) {
                         if sc.cursor.eof() {
                             // EOF: IdxGT/IdxGE jump (past end), IdxLT/IdxLE fall through.
                             let jump = matches!(op.opcode, Opcode::IdxGT | Opcode::IdxGE);
@@ -5550,19 +5573,73 @@ impl VdbeEngine {
                             }
                             continue;
                         }
-                        let payload = sc.cursor.payload(&sc.cx)?;
-                        parse_record(&payload).ok_or_else(|| {
-                            FrankenError::internal(
+
+                        sc.target_vals_buf.clear();
+                        if let SqliteValue::Blob(bytes) = &probe_val {
+                            fsqlite_types::record::parse_record_into(bytes, &mut sc.target_vals_buf);
+                        }
+
+                        sc.payload_buf.clear();
+                        sc.cursor.payload_into(&sc.cx, &mut sc.payload_buf)?;
+                        sc.cur_vals_buf.clear();
+                        if fsqlite_types::record::parse_record_into(&sc.payload_buf, &mut sc.cur_vals_buf).is_none() {
+                            return Err(FrankenError::internal(
                                 "IdxCmp: malformed index record at cursor position",
-                            )
-                        })?
+                            ));
+                        }
+
+                        let n_compare = if op.p5 > 0 {
+                            op.p5 as usize
+                        } else {
+                            sc.target_vals_buf.len()
+                        };
+
+                        let cmp = compare_sorter_keys(
+                            &sc.cur_vals_buf,
+                            &sc.target_vals_buf,
+                            n_compare,
+                            &[], // TODO: Collations?
+                        );
+
+                        let condition_met = match op.opcode {
+                            Opcode::IdxLE => cmp != Ordering::Greater,
+                            Opcode::IdxGT => cmp == Ordering::Greater,
+                            Opcode::IdxLT => cmp == Ordering::Less,
+                            Opcode::IdxGE => cmp != Ordering::Less,
+                            _ => unreachable!(),
+                        };
+
+                        if condition_met {
+                            pc = op.p2 as usize;
+                        } else {
+                            pc += 1;
+                        }
                     } else if let Some(cursor) = self.cursors.get(&cursor_id) {
+                        // MemCursor fallback (Phase 4).
+                        let probe_fields = decode_record(&probe_val)?;
                         if let Some(pos) = cursor.position
                             && let Some(db) = self.db.as_ref()
                             && let Some(table) = db.get_table(cursor.root_page)
                             && let Some(row) = table.rows.get(pos)
                         {
-                            row.values.clone()
+                            let n_compare = if op.p5 > 0 {
+                                op.p5 as usize
+                            } else {
+                                probe_fields.len()
+                            };
+                            let cmp = compare_sorter_keys(&row.values, &probe_fields, n_compare, &[]);
+                            let condition_met = match op.opcode {
+                                Opcode::IdxLE => cmp != Ordering::Greater,
+                                Opcode::IdxGT => cmp == Ordering::Greater,
+                                Opcode::IdxLT => cmp == Ordering::Less,
+                                Opcode::IdxGE => cmp != Ordering::Less,
+                                _ => unreachable!(),
+                            };
+                            if condition_met {
+                                pc = op.p2 as usize;
+                            } else {
+                                pc += 1;
+                            }
                         } else {
                             // No position or no table: treat as past-end.
                             let jump = matches!(op.opcode, Opcode::IdxGT | Opcode::IdxGE);
@@ -5571,33 +5648,7 @@ impl VdbeEngine {
                             } else {
                                 pc += 1;
                             }
-                            continue;
                         }
-                    } else {
-                        pc += 1;
-                        continue;
-                    };
-
-                    // Compare column-by-column up to P5 columns (0 = all
-                    // probe columns).
-                    let n_compare = if op.p5 > 0 {
-                        op.p5 as usize
-                    } else {
-                        probe_fields.len()
-                    };
-
-                    let cmp = compare_sorter_keys(&cursor_fields, &probe_fields, n_compare, &[]);
-
-                    let condition_met = match op.opcode {
-                        Opcode::IdxLE => cmp != Ordering::Greater,
-                        Opcode::IdxGT => cmp == Ordering::Greater,
-                        Opcode::IdxLT => cmp == Ordering::Less,
-                        Opcode::IdxGE => cmp != Ordering::Less,
-                        _ => unreachable!(),
-                    };
-
-                    if condition_met {
-                        pc = op.p2 as usize;
                     } else {
                         pc += 1;
                     }
@@ -7258,11 +7309,11 @@ fn find_conflicting_rowid_in_index(
     // Re-seek to the position where the conflicting entry should be.
     sc.cursor.index_move_to(&sc.cx, key_bytes)?;
 
-    let mut new_fields_buf = Vec::new();
-    let mut entry_fields_buf = Vec::new();
+    sc.target_vals_buf.clear();
+    sc.cur_vals_buf.clear();
 
     // The new key we're trying to insert — parse its prefix for comparison.
-    fsqlite_types::record::parse_record_into(key_bytes, &mut new_fields_buf)
+    fsqlite_types::record::parse_record_into(key_bytes, &mut sc.target_vals_buf)
         .ok_or_else(|| FrankenError::internal("find_conflicting_rowid: malformed new index key"))?;
 
     // Check the entry at current position and previous entry for a prefix match.
@@ -7276,8 +7327,10 @@ fn find_conflicting_rowid_in_index(
             break;
         }
 
-        let entry_bytes = sc.cursor.payload(&sc.cx)?;
-        fsqlite_types::record::parse_record_into(&entry_bytes, &mut entry_fields_buf).ok_or_else(
+        sc.payload_buf.clear();
+        sc.cursor.payload_into(&sc.cx, &mut sc.payload_buf)?;
+        sc.cur_vals_buf.clear();
+        fsqlite_types::record::parse_record_into(&sc.payload_buf, &mut sc.cur_vals_buf).ok_or_else(
             || FrankenError::internal("find_conflicting_rowid: malformed index entry record"),
         )?;
 
@@ -7286,8 +7339,8 @@ fn find_conflicting_rowid_in_index(
         let mut prefix_match = true;
         let mut has_null = false;
         for i in 0..n_idx_cols {
-            let new_val = new_fields_buf.get(i);
-            let entry_val = entry_fields_buf.get(i);
+            let new_val = sc.target_vals_buf.get(i);
+            let entry_val = sc.cur_vals_buf.get(i);
             if matches!(new_val, Some(SqliteValue::Null) | None)
                 || matches!(entry_val, Some(SqliteValue::Null) | None)
             {
@@ -7302,12 +7355,14 @@ fn find_conflicting_rowid_in_index(
 
         if prefix_match && !has_null {
             // Extract the rowid (last field in the index entry).
-            let old_rowid = if let Some(SqliteValue::Integer(my_rid)) = entry_fields_buf.last() {
-                *my_rid
-            } else {
-                // Fallback: try cursor rowid.
-                sc.cursor.rowid(&sc.cx).unwrap_or(0)
-            };
+            let old_rowid = sc
+                .cur_vals_buf
+                .last()
+                .and_then(|value| match value {
+                    SqliteValue::Integer(rid) => Some(*rid),
+                    _ => None,
+                })
+                .unwrap_or_else(|| sc.cursor.rowid(&sc.cx).unwrap_or(0));
 
             // Delete the conflicting index entry.
             sc.cursor.delete(&sc.cx)?;

@@ -29,7 +29,7 @@ use crate::core_types::{CommitIndex, InProcessPageLockTable, TransactionMode, Tr
 use crate::lifecycle::MvccError;
 use crate::ssi_validation::{
     ActiveTxnView, CommittedReaderInfo, CommittedWriterInfo, DiscoveredEdge, SsiAbortReason,
-    discover_incoming_edges, discover_outgoing_edges, evaluate_t3_dro,
+    discover_incoming_edges, discover_outgoing_edges, evaluate_t3_dro, witness_key_page,
 };
 
 /// Maximum number of concurrent writers that can be active simultaneously.
@@ -137,6 +137,12 @@ impl ConcurrentHandle {
         self.write_set.len()
     }
 
+    /// Access the raw write set (for `is_dirty` checks).
+    #[must_use]
+    pub fn write_set(&self) -> &HashMap<PageNumber, PageData> {
+        &self.write_set
+    }
+
     /// Returns the set of page locks held.
     #[must_use]
     pub fn held_locks(&self) -> &HashSet<PageNumber> {
@@ -147,6 +153,12 @@ impl ConcurrentHandle {
     #[must_use]
     pub const fn is_active(&self) -> bool {
         matches!(self.state, TransactionState::Active)
+    }
+
+    /// Return the transaction token used by SSI and commit tracking.
+    #[must_use]
+    pub const fn txn_token(&self) -> TxnToken {
+        self.txn_token
     }
 
     /// Mark the transaction as committed.
@@ -168,7 +180,7 @@ impl ConcurrentHandle {
 
     /// Record a granular read witness for fine-grained SSI.
     pub fn record_read_witness(&mut self, key: WitnessKey) {
-        if let Some(p) = key.page_number() {
+        if let Some(p) = witness_key_page(&key) {
             self.read_set.insert(p);
             self.read_index.entry(p).or_default().push(key);
         } else {
@@ -178,7 +190,7 @@ impl ConcurrentHandle {
 
     /// Record a granular write witness for fine-grained SSI.
     pub fn record_write_witness(&mut self, key: WitnessKey) {
-        if let Some(p) = key.page_number() {
+        if let Some(p) = witness_key_page(&key) {
             self.page_locks.insert(p);
             self.write_index.entry(p).or_default().push(key);
         } else {
@@ -196,12 +208,6 @@ impl ConcurrentHandle {
     #[must_use]
     pub fn read_set_len(&self) -> usize {
         self.read_set.len()
-    }
-
-    /// Returns the transaction token.
-    #[must_use]
-    pub const fn txn_token(&self) -> TxnToken {
-        self.txn_token
     }
 
     /// Returns witness keys for all read pages (for SSI validation).
@@ -254,18 +260,16 @@ impl ActiveTxnView for ConcurrentHandle {
     }
 
     fn read_keys(&self) -> &[WitnessKey] {
-        // NOTE: We can't return a slice directly since read_witnesses HashSet isn't a slice.
-        // Callers should use read_witness_keys() if they need the full list.
+        // NOTE: We can't return a slice directly since indices are non-contiguous.
         &[]
     }
 
     fn write_keys(&self) -> &[WitnessKey] {
-        // NOTE: We can't return a slice directly since write_witnesses HashSet isn't a slice.
         &[]
     }
 
     fn check_read_overlap(&self, key: &WitnessKey) -> bool {
-        // First check global witnesses which overlap with everything.
+        // First check global witnesses.
         if self
             .global_read_witnesses
             .iter()
@@ -275,7 +279,7 @@ impl ActiveTxnView for ConcurrentHandle {
         }
 
         // Level 0: Fast reject if the page isn't in our read set at all.
-        let page = match key.page_number() {
+        let page = match witness_key_page(key) {
             Some(p) => p,
             None => return !self.read_set.is_empty() || !self.global_read_witnesses.is_empty(),
         };
@@ -304,7 +308,7 @@ impl ActiveTxnView for ConcurrentHandle {
             return true;
         }
 
-        let page = match key.page_number() {
+        let page = match witness_key_page(key) {
             Some(p) => p,
             None => return !self.write_set.is_empty() || !self.global_write_witnesses.is_empty(),
         };
@@ -1080,7 +1084,7 @@ pub fn finalize_prepared_concurrent_commit_with_ssi(
         if let Some(reader) = registry
             .active
             .values_mut()
-            .find(|reader| reader.is_active() && reader.txn_token() == edge.from)
+            .find(|reader| reader.is_active() && reader.token() == edge.from)
         {
             reader.set_has_out_rw(true);
             if reader.has_in_rw() {
@@ -1112,7 +1116,7 @@ pub fn finalize_prepared_concurrent_commit_with_ssi(
         if let Some(writer) = registry
             .active
             .values_mut()
-            .find(|writer| writer.is_active() && writer.txn_token() == edge.to)
+            .find(|writer| writer.is_active() && writer.token() == edge.to)
         {
             writer.set_has_in_rw(true);
             if writer.has_out_rw() {
@@ -2591,7 +2595,7 @@ mod tests {
         assert_eq!(committed, winner_token);
     }
 
-    // Test 26: committed-writer pivot forces abort in prepare path.
+    // Test 26: committed writer pivot forces abort in prepare path.
     //
     // Scenario:
     // - T1 reads B, writes A.
