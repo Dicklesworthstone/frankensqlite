@@ -47,6 +47,8 @@ RCH_TARGET_DIR="${RCH_TARGET_DIR:-/tmp/rch_target_bd_db300_4_1}"
 HOT_PATH_PROFILE_SCHEMA="fsqlite-e2e.hot_path_profile.v1"
 HOT_PATH_PROFILE_MANIFEST_SCHEMA="fsqlite-e2e.hot_path_profile_manifest.v1"
 HOT_PATH_ACTIONABLE_RANKING_SCHEMA="fsqlite-e2e.hot_path_actionable_ranking.v1"
+HOT_PATH_INLINE_BUNDLE_SCHEMA="fsqlite-e2e.hot_path_inline_bundle.v1"
+HOT_PATH_INLINE_BUNDLE_PREFIX="HOT_PATH_INLINE_BUNDLE_JSON="
 
 mkdir -p "${RUNS_DIR}"
 : > "${LOG_FILE}"
@@ -103,6 +105,26 @@ preseed_output_bundle() {
     : > "${scenario_dir}/actionable_ranking.json"
     : > "${scenario_dir}/summary.md"
     : > "${scenario_dir}/manifest.json"
+}
+
+materialize_output_bundle_from_log() {
+    local scenario_dir="$1"
+    local stderr_log="$2"
+    local bundle_line
+
+    bundle_line="$(sed -n "s/^${HOT_PATH_INLINE_BUNDLE_PREFIX}//p" "${stderr_log}" | tail -n 1)"
+    [[ -n "${bundle_line}" ]] || return 0
+
+    printf '%s\n' "${bundle_line}" \
+        | jq -e --arg schema "${HOT_PATH_INLINE_BUNDLE_SCHEMA}" '
+            type == "object" and .schema_version == $schema
+        ' > /dev/null \
+        || fail "run" "invalid inline hot-path bundle in ${stderr_log}"
+
+    printf '%s\n' "${bundle_line}" | jq '.profile' > "${scenario_dir}/profile.json"
+    printf '%s\n' "${bundle_line}" | jq '.actionable_ranking' > "${scenario_dir}/actionable_ranking.json"
+    printf '%s\n' "${bundle_line}" | jq -r '.summary_markdown' > "${scenario_dir}/summary.md"
+    printf '%s\n' "${bundle_line}" | jq '.manifest' > "${scenario_dir}/manifest.json"
 }
 
 copy_fixture_seed() {
@@ -238,12 +260,14 @@ run_hot_profile() {
         --seed "${SEED}" \
         --scale "${SCALE}" \
         --output-dir "${scenario_dir}" \
+        --emit-inline-bundle \
         "${cli_flag}" \
         > "${stdout_log}" \
         2> "${stderr_log}"; then
         fail "run" "hot-profile failed for fixture=${fixture_id} mode=${mode_id}; see ${stderr_log}"
     fi
 
+    materialize_output_bundle_from_log "${scenario_dir}" "${stderr_log}"
     require_json_schema "${scenario_dir}/profile.json" "${HOT_PATH_PROFILE_SCHEMA}"
     require_json_schema "${scenario_dir}/actionable_ranking.json" "${HOT_PATH_ACTIONABLE_RANKING_SCHEMA}"
     require_nonempty_file "${scenario_dir}/summary.md"
