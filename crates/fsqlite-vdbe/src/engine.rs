@@ -27,6 +27,7 @@ use fsqlite_btree::{
     SeekResult, header_offset_for_page,
 };
 use fsqlite_error::{ErrorCode, FrankenError, Result};
+use fsqlite_func::collation::CollationRegistry;
 use fsqlite_func::vtab::ColumnContext;
 use fsqlite_func::{ErasedAggregateFunction, ErasedWindowFunction, FunctionRegistry};
 use fsqlite_mvcc::{
@@ -243,6 +244,8 @@ struct SorterCursor {
     sort_key_orders: Vec<SortKeyOrder>,
     /// Per-key collation sequence (e.g. "NOCASE"). `None` means BINARY.
     collations: Vec<Option<String>>,
+    /// Shared collation registry consulted during comparison.
+    collation_registry: Arc<Mutex<CollationRegistry>>,
     /// Inserted records.
     rows: Vec<SorterRow>,
     /// Current position after `SorterSort`/`SorterNext`.
@@ -334,8 +337,22 @@ struct SpillRun {
 impl SorterCursor {
     fn new(
         key_columns: usize,
+        sort_key_orders: Vec<SortKeyOrder>,
+        collations: Vec<Option<String>>,
+    ) -> Self {
+        Self::with_collation_registry(
+            key_columns,
+            sort_key_orders,
+            collations,
+            Arc::new(Mutex::new(CollationRegistry::new())),
+        )
+    }
+
+    fn with_collation_registry(
+        key_columns: usize,
         mut sort_key_orders: Vec<SortKeyOrder>,
         collations: Vec<Option<String>>,
+        collation_registry: Arc<Mutex<CollationRegistry>>,
     ) -> Self {
         let key_columns = key_columns.max(1);
         if sort_key_orders.len() < key_columns {
@@ -346,6 +363,7 @@ impl SorterCursor {
             key_columns,
             sort_key_orders,
             collations,
+            collation_registry,
             rows: Vec::new(),
             position: None,
             memory_used: 0,
@@ -393,8 +411,16 @@ impl SorterCursor {
         let key_columns = self.key_columns;
         let orders = self.sort_key_orders.clone();
         let colls = self.collations.clone();
+        let registry = Arc::clone(&self.collation_registry);
         self.rows.sort_by(|lhs, rhs| {
-            compare_sorter_rows(&lhs.values, &rhs.values, key_columns, &orders, &colls)
+            compare_sorter_rows(
+                &lhs.values,
+                &rhs.values,
+                key_columns,
+                &orders,
+                &colls,
+                registry.as_ref(),
+            )
         });
 
         // Write to temp file.  We use `keep()` to detach the auto-delete
@@ -460,8 +486,16 @@ impl SorterCursor {
             let key_columns = self.key_columns;
             let orders = self.sort_key_orders.clone();
             let colls = self.collations.clone();
+            let registry = Arc::clone(&self.collation_registry);
             self.rows.sort_by(|lhs, rhs| {
-                compare_sorter_rows(&lhs.values, &rhs.values, key_columns, &orders, &colls)
+                compare_sorter_rows(
+                    &lhs.values,
+                    &rhs.values,
+                    key_columns,
+                    &orders,
+                    &colls,
+                    registry.as_ref(),
+                )
             });
             self.rows_sorted_total += self.rows.len() as u64;
             return Ok(());
@@ -471,8 +505,16 @@ impl SorterCursor {
         let key_columns = self.key_columns;
         let orders = self.sort_key_orders.clone();
         let colls = self.collations.clone();
+        let registry = Arc::clone(&self.collation_registry);
         self.rows.sort_by(|lhs, rhs| {
-            compare_sorter_rows(&lhs.values, &rhs.values, key_columns, &orders, &colls)
+            compare_sorter_rows(
+                &lhs.values,
+                &rhs.values,
+                key_columns,
+                &orders,
+                &colls,
+                registry.as_ref(),
+            )
         });
 
         // Collect all runs: disk runs first, then in-memory remainder.
@@ -503,8 +545,14 @@ impl SorterCursor {
                 };
                 if let Some(bi) = best_idx {
                     if let Some(best_row) = run_iters[bi].current_values() {
-                        if compare_sorter_rows(row, best_row, key_columns, &orders, &colls)
-                            == Ordering::Less
+                        if compare_sorter_rows(
+                            row,
+                            best_row,
+                            key_columns,
+                            &orders,
+                            &colls,
+                            self.collation_registry.as_ref(),
+                        ) == Ordering::Less
                         {
                             best_idx = Some(i);
                         }
@@ -2549,6 +2597,8 @@ pub struct VdbeEngine {
     db: Option<MemDatabase>,
     /// Scalar/aggregate/window function registry for Function/PureFunc opcodes.
     func_registry: Option<Arc<FunctionRegistry>>,
+    /// Collation registry for compare, sort, DISTINCT, and grouping semantics.
+    collation_registry: Arc<Mutex<CollationRegistry>>,
     /// Aggregate accumulators keyed by accumulator register.
     aggregates: SwissIndex<i32, AggregateContext>,
     /// Schema cookie value provided by the Connection (bd-3mmj).
@@ -2918,6 +2968,7 @@ impl VdbeEngine {
             reject_mem_fallback: true,
             db: None,
             func_registry: None,
+            collation_registry: Arc::new(Mutex::new(CollationRegistry::new())),
             aggregates: SwissIndex::new(),
             schema_cookie: 0,
             last_compare_result: None,
@@ -3194,6 +3245,11 @@ impl VdbeEngine {
     /// Attach a function registry for `Function`/`PureFunc` opcode dispatch.
     pub fn set_function_registry(&mut self, registry: Arc<FunctionRegistry>) {
         self.func_registry = Some(registry);
+    }
+
+    /// Attach a shared collation registry for compare and sorting opcodes.
+    pub fn set_collation_registry(&mut self, registry: Arc<Mutex<CollationRegistry>>) {
+        self.collation_registry = registry;
     }
 
     /// Replace the current set of bound SQL parameters.
@@ -3943,7 +3999,12 @@ impl VdbeEngine {
                         // coercion only happens when p5 carries numeric affinity.
                         let (cmp_lhs, cmp_rhs) = coerce_for_comparison(lhs, rhs, op.p5);
                         let cmp = if let P4::Collation(ref coll_name) = op.p4 {
-                            collate_compare(&cmp_lhs, &cmp_rhs, coll_name)
+                            collate_compare(
+                                &cmp_lhs,
+                                &cmp_rhs,
+                                coll_name,
+                                self.collation_registry.as_ref(),
+                            )
                         } else {
                             cmp_lhs.partial_cmp(&cmp_rhs)
                         };
@@ -4280,7 +4341,12 @@ impl VdbeEngine {
                     };
                     self.sorters.insert(
                         cursor_id,
-                        SorterCursor::new(key_columns, sort_key_orders, collations),
+                        SorterCursor::with_collation_registry(
+                            key_columns,
+                            sort_key_orders,
+                            collations,
+                            Arc::clone(&self.collation_registry),
+                        ),
                     );
                     // A cursor id cannot be both table and sorter cursor.
                     self.cursors.remove(&cursor_id);
@@ -4742,6 +4808,7 @@ impl VdbeEngine {
                                                     &cursor.target_vals_buf,
                                                     cursor.target_vals_buf.len(),
                                                     &[],
+                                                    self.collation_registry.as_ref(),
                                                 );
                                                 if cmp == std::cmp::Ordering::Equal {
                                                     cursor.cursor.next(&cursor.cx)?;
@@ -4784,6 +4851,7 @@ impl VdbeEngine {
                                                     &cursor.target_vals_buf,
                                                     cursor.target_vals_buf.len(),
                                                     &[],
+                                                    self.collation_registry.as_ref(),
                                                 );
                                                 if cmp == std::cmp::Ordering::Equal {
                                                     cursor.cursor.next(&cursor.cx)?;
@@ -5536,6 +5604,7 @@ impl VdbeEngine {
                                     &probe,
                                     sorter.key_columns,
                                     &sorter.collations,
+                                    sorter.collation_registry.as_ref(),
                                 )
                             } else {
                                 true
@@ -5589,14 +5658,19 @@ impl VdbeEngine {
                     let n_cols = usize::try_from(op.p2).unwrap_or(0);
                     let this = &*self;
                     let blob = if let P4::Affinity(aff) = &op.p4 {
-                        // Skip columns marked with 'X' (IPK columns).
-                        let iter = aff.chars().enumerate().filter_map(move |(i, ch)| {
+                        // SQLite stores INTEGER PRIMARY KEY aliases as a NULL
+                        // placeholder in the record payload and materializes
+                        // the real key from the rowid. Omitting the column
+                        // entirely shifts later fields and produces
+                        // SQLite-incompatible on-disk records.
+                        let null_placeholder = SqliteValue::Null;
+                        let iter = aff.chars().enumerate().map(|(i, ch)| {
                             if ch == 'X' {
-                                None
+                                &null_placeholder
                             } else {
                                 #[allow(clippy::cast_possible_wrap)]
                                 let reg = op.p1 + i as i32;
-                                Some(this.get_reg(reg))
+                                this.get_reg(reg)
                             }
                         });
                         fsqlite_types::record::serialize_record_iter(iter)
@@ -5796,7 +5870,12 @@ impl VdbeEngine {
                         // values.  When partial_cmp returns None (NULL vs
                         // non-NULL or NaN), apply NULL-first ordering.
                         let ord = if let Some(coll_name) = coll_name {
-                            collate_compare(val_a, val_b, coll_name)
+                            collate_compare(
+                                val_a,
+                                val_b,
+                                coll_name,
+                                self.collation_registry.as_ref(),
+                            )
                         } else {
                             val_a.partial_cmp(val_b)
                         };
@@ -6087,6 +6166,7 @@ impl VdbeEngine {
                             &sc.target_vals_buf,
                             n_compare,
                             &[], // TODO: Collations?
+                            self.collation_registry.as_ref(),
                         );
 
                         let condition_met = match op.opcode {
@@ -6115,8 +6195,13 @@ impl VdbeEngine {
                             } else {
                                 probe_fields.len()
                             };
-                            let cmp =
-                                compare_sorter_keys(&row.values, &probe_fields, n_compare, &[]);
+                            let cmp = compare_sorter_keys(
+                                &row.values,
+                                &probe_fields,
+                                n_compare,
+                                &[],
+                                self.collation_registry.as_ref(),
+                            );
                             let condition_met = match op.opcode {
                                 Opcode::IdxLE => cmp != Ordering::Greater,
                                 Opcode::IdxGT => cmp == Ordering::Greater,
@@ -7802,28 +7887,37 @@ fn collate_compare(
     lhs: &SqliteValue,
     rhs: &SqliteValue,
     coll_name: &str,
+    collation_registry: &Mutex<CollationRegistry>,
 ) -> Option<std::cmp::Ordering> {
     match (lhs, rhs) {
-        (SqliteValue::Text(l), SqliteValue::Text(r)) => {
-            let upper = coll_name.to_ascii_uppercase();
-            Some(match upper.as_str() {
-                "NOCASE" => {
-                    let li = l.as_bytes().iter().map(u8::to_ascii_uppercase);
-                    let ri = r.as_bytes().iter().map(u8::to_ascii_uppercase);
-                    li.cmp(ri)
-                }
-                "RTRIM" => {
-                    let lb = l.as_bytes();
-                    let rb = r.as_bytes();
-                    let lt = &lb[..lb.iter().rposition(|&b| b != b' ').map_or(0, |p| p + 1)];
-                    let rt = &rb[..rb.iter().rposition(|&b| b != b' ').map_or(0, |p| p + 1)];
-                    lt.cmp(rt)
-                }
-                _ => l.as_bytes().cmp(r.as_bytes()),
-            })
-        }
+        (SqliteValue::Text(l), SqliteValue::Text(r)) => Some(compare_text_with_collation(
+            l.as_bytes(),
+            r.as_bytes(),
+            coll_name,
+            collation_registry,
+        )),
         _ => lhs.partial_cmp(rhs),
     }
+}
+
+fn compare_text_with_collation(
+    left: &[u8],
+    right: &[u8],
+    coll_name: &str,
+    collation_registry: &Mutex<CollationRegistry>,
+) -> Ordering {
+    let compare_with = |registry: &CollationRegistry| {
+        registry
+            .find(coll_name)
+            .map(|collation| collation.compare(left, right))
+    };
+
+    match collation_registry.lock() {
+        Ok(registry) => compare_with(&registry),
+        Err(_) => None,
+    }
+    .or_else(|| compare_with(&CollationRegistry::new()))
+    .unwrap_or_else(|| left.cmp(right))
 }
 
 fn parse_compare_collations(p4: &P4) -> Option<Vec<String>> {
@@ -7993,8 +8087,9 @@ fn sorter_keys_equal(
     rhs: &[SqliteValue],
     key_columns: usize,
     collations: &[Option<String>],
+    collation_registry: &Mutex<CollationRegistry>,
 ) -> bool {
-    compare_sorter_keys(lhs, rhs, key_columns, collations) == Ordering::Equal
+    compare_sorter_keys(lhs, rhs, key_columns, collations, collation_registry) == Ordering::Equal
 }
 
 fn compare_sorter_keys(
@@ -8002,6 +8097,7 @@ fn compare_sorter_keys(
     rhs: &[SqliteValue],
     key_columns: usize,
     collations: &[Option<String>],
+    collation_registry: &Mutex<CollationRegistry>,
 ) -> Ordering {
     let key_count = key_columns.max(1);
     for idx in 0..key_count {
@@ -8017,7 +8113,7 @@ fn compare_sorter_keys(
         };
 
         let coll = collations.get(idx).and_then(|c| c.as_deref());
-        match cmp_values_collated(lhs_value, rhs_value, coll) {
+        match cmp_values_collated(lhs_value, rhs_value, coll, collation_registry) {
             Ordering::Equal => {}
             non_equal => return non_equal,
         }
@@ -8026,13 +8122,17 @@ fn compare_sorter_keys(
 }
 
 /// Compare two `SqliteValue`s with an optional collation sequence.
-/// When `collation` is `Some("NOCASE")`, text values are compared
-/// case-insensitively.
-fn cmp_values_collated(lhs: &SqliteValue, rhs: &SqliteValue, collation: Option<&str>) -> Ordering {
+///
+/// Text values consult the shared collation registry so dynamically loaded
+/// collations participate in ORDER BY, DISTINCT, and index probes.
+fn cmp_values_collated(
+    lhs: &SqliteValue,
+    rhs: &SqliteValue,
+    collation: Option<&str>,
+    collation_registry: &Mutex<CollationRegistry>,
+) -> Ordering {
     if let (Some(coll), SqliteValue::Text(lt), SqliteValue::Text(rt)) = (collation, lhs, rhs) {
-        if coll.eq_ignore_ascii_case("NOCASE") {
-            return lt.to_ascii_lowercase().cmp(&rt.to_ascii_lowercase());
-        }
+        return compare_text_with_collation(lt.as_bytes(), rt.as_bytes(), coll, collation_registry);
     }
     lhs.partial_cmp(rhs).unwrap_or(Ordering::Equal)
 }
@@ -8043,6 +8143,7 @@ fn compare_sorter_rows(
     key_columns: usize,
     sort_key_orders: &[SortKeyOrder],
     collations: &[Option<String>],
+    collation_registry: &Mutex<CollationRegistry>,
 ) -> Ordering {
     let key_count = key_columns.max(1);
     for idx in 0..key_count {
@@ -8090,7 +8191,7 @@ fn compare_sorter_rows(
         }
 
         let coll = collations.get(idx).and_then(|c| c.as_deref());
-        let mut ord = cmp_values_collated(lhs_value, rhs_value, coll);
+        let mut ord = cmp_values_collated(lhs_value, rhs_value, coll, collation_registry);
         if ord == Ordering::Equal {
             continue;
         }

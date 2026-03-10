@@ -169,6 +169,31 @@ impl CollationRegistry {
     pub fn contains(&self, name: &str) -> bool {
         self.collations.contains_key(&name.to_ascii_uppercase())
     }
+
+    /// Return registered collation names in stable display order.
+    ///
+    /// Built-ins always appear first (`BINARY`, `NOCASE`, `RTRIM`) so pragma
+    /// output is deterministic; custom collations follow in case-insensitive
+    /// sorted order.
+    #[must_use]
+    pub fn names(&self) -> Vec<String> {
+        let mut names = vec![
+            "BINARY".to_owned(),
+            "NOCASE".to_owned(),
+            "RTRIM".to_owned(),
+        ];
+        let mut custom: Vec<String> = self
+            .collations
+            .keys()
+            .filter(|name| {
+                !matches!(name.as_str(), "BINARY" | "NOCASE" | "RTRIM")
+            })
+            .cloned()
+            .collect();
+        custom.sort_unstable_by_key(|name| name.to_ascii_uppercase());
+        names.extend(custom);
+        names
+    }
 }
 
 // ── Collation selection ─────────────────────────────────────────────────

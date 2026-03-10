@@ -35,6 +35,7 @@ use fsqlite_btree::BtreeCursorOps;
 use fsqlite_btree::cursor::TransactionPageIo;
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_func::builtins::{ChangeTrackingState, set_change_tracking_state};
+use fsqlite_func::collation::CollationRegistry;
 use fsqlite_func::vtab::{ErasedVtabInstance, VtabModuleFactory};
 use fsqlite_func::{
     ErasedWindowFunction, FunctionRegistry, get_last_changes, get_last_insert_rowid,
@@ -748,7 +749,9 @@ where
 
 /// Build a [`FunctionRegistry`] populated with all built-in scalar,
 /// aggregate, datetime, and math functions.
-fn default_function_registry() -> Arc<FunctionRegistry> {
+fn default_function_registry(
+    collation_registry: &Arc<Mutex<CollationRegistry>>,
+) -> Arc<FunctionRegistry> {
     let mut registry = FunctionRegistry::new();
     fsqlite_func::register_builtins(&mut registry);
     fsqlite_func::register_datetime_builtins(&mut registry);
@@ -757,6 +760,8 @@ fn default_function_registry() -> Arc<FunctionRegistry> {
     fsqlite_func::register_window_builtins(&mut registry);
     fsqlite_ext_json::register_json_scalars(&mut registry);
     fsqlite_ext_fts5::register_fts5_scalars(&mut registry);
+    fsqlite_ext_icu::register_icu_scalars(&mut registry);
+    fsqlite_ext_icu::register_icu_load_collation(&mut registry, Arc::clone(collation_registry));
     Arc::new(registry)
 }
 
@@ -1014,6 +1019,7 @@ impl PreparedStatement<'_> {
             &self.program,
             params,
             registry,
+            &self.conn.collation_registry,
             op_cx,
             db,
             txn,
@@ -1055,6 +1061,7 @@ impl PreparedStatement<'_> {
                 &self.program,
                 None,
                 self.func_registry.as_ref(),
+                Some(&self.conn.collation_registry),
                 &op_cx,
                 self.expression_postprocess.as_ref(),
             )?
@@ -1093,6 +1100,7 @@ impl PreparedStatement<'_> {
                 &self.program,
                 Some(params),
                 self.func_registry.as_ref(),
+                Some(&self.conn.collation_registry),
                 &op_cx,
                 self.expression_postprocess.as_ref(),
             )?
@@ -1719,6 +1727,8 @@ pub struct Connection {
     /// Scalar/aggregate/window function registry shared with the VDBE engine.
     /// Wrapped in `RefCell` to allow UDF registration after connection creation.
     func_registry: RefCell<Arc<FunctionRegistry>>,
+    /// Shared collation registry consulted by fallback paths and the VDBE.
+    collation_registry: Arc<Mutex<CollationRegistry>>,
     /// Whether an explicit transaction is active (BEGIN without matching COMMIT/ROLLBACK).
     in_transaction: RefCell<bool>,
     /// Snapshot taken at BEGIN time, restored on ROLLBACK.
@@ -1941,6 +1951,7 @@ impl Connection {
         root_cx.set_eprocess_oracle(Arc::clone(&eprocess_oracle));
 
         let eager_memdb_rows = path == ":memory:";
+        let collation_registry = Arc::new(Mutex::new(CollationRegistry::new()));
         let conn = Self {
             path,
             db: Rc::new(RefCell::new(MemDatabase::new())),
@@ -1950,7 +1961,8 @@ impl Connection {
             views: RefCell::new(Vec::new()),
             triggers: RefCell::new(Vec::new()),
             trigger_frame_stack: RefCell::new(Vec::new()),
-            func_registry: RefCell::new(default_function_registry()),
+            func_registry: RefCell::new(default_function_registry(&collation_registry)),
+            collation_registry,
             in_transaction: RefCell::new(false),
             txn_snapshot: RefCell::new(None),
             savepoints: RefCell::new(Vec::new()),
@@ -3472,6 +3484,7 @@ impl Connection {
                         &program,
                         params,
                         Some(&registry),
+                        Some(&self.collation_registry),
                         &op_cx,
                         Some(&build_expression_postprocess(&rewritten)),
                     )?;
@@ -13317,26 +13330,20 @@ impl Connection {
             }
             // PRAGMA collation_list — return available collation sequences.
             // Output: seq, name
-            "collation_list" => Ok(vec![
-                Row {
+            "collation_list" => Ok(self
+                .collation_registry
+                .lock()
+                .map(|registry| registry.names())
+                .unwrap_or_else(|_| CollationRegistry::new().names())
+                .into_iter()
+                .enumerate()
+                .map(|(idx, name)| Row {
                     values: vec![
-                        SqliteValue::Integer(0),
-                        SqliteValue::Text("BINARY".to_owned()),
+                        SqliteValue::Integer(i64::try_from(idx).unwrap_or(0)),
+                        SqliteValue::Text(name),
                     ],
-                },
-                Row {
-                    values: vec![
-                        SqliteValue::Integer(1),
-                        SqliteValue::Text("NOCASE".to_owned()),
-                    ],
-                },
-                Row {
-                    values: vec![
-                        SqliteValue::Integer(2),
-                        SqliteValue::Text("RTRIM".to_owned()),
-                    ],
-                },
-            ]),
+                })
+                .collect()),
             // PRAGMA data_version — returns the data-version counter.
             // In SQLite this changes when another connection modifies the DB.
             // We approximate it using the schema cookie.
@@ -17473,6 +17480,7 @@ impl Connection {
             program,
             params,
             &func_reg,
+            &self.collation_registry,
             &op_cx,
             &self.db,
             txn,
@@ -22815,19 +22823,41 @@ fn cmp_sqlite_values(a: &SqliteValue, b: &SqliteValue) -> std::cmp::Ordering {
 }
 
 /// Compare two `SqliteValue`s with an optional collation sequence.
-/// When `collation` is `Some("NOCASE")`, text values are compared
-/// case-insensitively.
+/// Text values consult the shared collation registry so dynamically loaded
+/// collations participate in fallback ORDER BY / GROUP BY / DISTINCT logic.
+fn compare_text_bytes_collated(
+    left: &[u8],
+    right: &[u8],
+    collation: &str,
+    collation_registry: &Mutex<CollationRegistry>,
+) -> std::cmp::Ordering {
+    let compare_with = |registry: &CollationRegistry| {
+        registry
+            .find(collation)
+            .map(|collation| collation.compare(left, right))
+    };
+
+    match collation_registry.lock() {
+        Ok(registry) => compare_with(&registry),
+        Err(_) => None,
+    }
+    .or_else(|| compare_with(&CollationRegistry::new()))
+    .unwrap_or_else(|| left.cmp(right))
+}
+
 fn cmp_sqlite_values_collated(
     a: &SqliteValue,
     b: &SqliteValue,
     collation: Option<&str>,
+    collation_registry: &Mutex<CollationRegistry>,
 ) -> std::cmp::Ordering {
     if let (Some(coll), SqliteValue::Text(at), SqliteValue::Text(bt)) = (collation, a, b) {
-        if coll.eq_ignore_ascii_case("NOCASE") {
-            let a_iter = at.bytes().map(|c| c.to_ascii_lowercase());
-            let b_iter = bt.bytes().map(|c| c.to_ascii_lowercase());
-            return a_iter.cmp(b_iter);
-        }
+        return compare_text_bytes_collated(
+            at.as_bytes(),
+            bt.as_bytes(),
+            coll,
+            collation_registry,
+        );
     }
     cmp_sqlite_values(a, b)
 }
@@ -22837,13 +22867,15 @@ fn group_keys_equal_collated(
     a: &[SqliteValue],
     b: &[SqliteValue],
     collations: &[Option<String>],
+    collation_registry: &Mutex<CollationRegistry>,
 ) -> bool {
     if a.len() != b.len() {
         return false;
     }
     a.iter().zip(b.iter()).enumerate().all(|(i, (av, bv))| {
         let coll = collations.get(i).and_then(|c| c.as_deref());
-        cmp_sqlite_values_collated(av, bv, coll) == std::cmp::Ordering::Equal
+        cmp_sqlite_values_collated(av, bv, coll, collation_registry)
+            == std::cmp::Ordering::Equal
     })
 }
 
@@ -23114,6 +23146,7 @@ fn execute_program(
     program: &VdbeProgram,
     params: Option<&[SqliteValue]>,
     func_registry: Option<&Arc<FunctionRegistry>>,
+    collation_registry: Option<&Arc<Mutex<CollationRegistry>>>,
     execution_cx: &Cx,
 ) -> Result<Vec<Row>> {
     let mut engine = VdbeEngine::new_with_execution_cx(
@@ -23127,6 +23160,9 @@ fn execute_program(
     }
     if let Some(registry) = func_registry {
         engine.set_function_registry(Arc::clone(registry));
+    }
+    if let Some(registry) = collation_registry {
+        engine.set_collation_registry(Arc::clone(registry));
     }
 
     match engine.execute(program)? {
@@ -23147,10 +23183,17 @@ fn execute_program_with_postprocess(
     program: &VdbeProgram,
     params: Option<&[SqliteValue]>,
     func_registry: Option<&Arc<FunctionRegistry>>,
+    collation_registry: Option<&Arc<Mutex<CollationRegistry>>>,
     execution_cx: &Cx,
     expression_postprocess: Option<&ExpressionPostprocess>,
 ) -> Result<Vec<Row>> {
-    let mut rows = execute_program(program, params, func_registry, execution_cx)?;
+    let mut rows = execute_program(
+        program,
+        params,
+        func_registry,
+        collation_registry,
+        execution_cx,
+    )?;
     if let Some(postprocess) = expression_postprocess {
         apply_expression_postprocess(&mut rows, postprocess)?;
     }
@@ -23174,6 +23217,7 @@ fn execute_table_program_with_db(
     program: &VdbeProgram,
     params: Option<&[SqliteValue]>,
     func_registry: &Arc<FunctionRegistry>,
+    collation_registry: &Arc<Mutex<CollationRegistry>>,
     execution_cx: &Cx,
     db: &Rc<RefCell<MemDatabase>>,
     txn: Option<Box<dyn TransactionHandle>>,
@@ -23207,6 +23251,7 @@ fn execute_table_program_with_db(
     }
 
     engine.set_function_registry(Arc::clone(func_registry));
+    engine.set_collation_registry(Arc::clone(collation_registry));
     engine.set_schema_cookie(schema_cookie);
     engine.set_autoincrement_sequence_by_root_page(
         autoincrement_seq_by_root_page.into_iter().collect(),
@@ -35598,11 +35643,15 @@ mod tests {
                                 .expect("staged row payload should decode as a SQLite record");
                                 assert_eq!(
                                     staged_values.len(),
-                                    1,
+                                    2,
                                     "UPDATE staged unexpected payload width before COMMIT: values={staged_values:?}"
                                 );
                                 assert!(
-                                    matches!(staged_values[0], SqliteValue::Integer(_)),
+                                    matches!(staged_values[0], SqliteValue::Null),
+                                    "UPDATE staged unexpected IPK placeholder before COMMIT: values={staged_values:?}"
+                                );
+                                assert!(
+                                    matches!(staged_values[1], SqliteValue::Integer(_)),
                                     "UPDATE staged non-integer payload before COMMIT: values={staged_values:?}"
                                 );
                             }
@@ -35762,12 +35811,12 @@ mod tests {
         let expected = i64::try_from(WORKERS * TXNS_PER_WORKER).unwrap();
         assert_eq!(
             pager_values_before_close,
-            Some(vec![SqliteValue::Integer(expected)]),
+            Some(vec![SqliteValue::Null, SqliteValue::Integer(expected)]),
             "bd-rjc pager-backed mismatch before close: final_cell={final_cell:?} expected={expected} retries={retries} pager_before={pager_values_before_close:?} pager_after={pager_values_after_close:?} wal_len_before_close={wal_len_before_close:?} wal_len_after_close={wal_len_after_close:?} sqlite_before=(journal_mode={sqlite_journal_mode_before_close:?}, integrity={sqlite_integrity_before_close:?}, typeof={sqlite_typeof_before_close:?}, quote={sqlite_quote_before_close:?}, value={sqlite_value_before_close:?}) sqlite_after=(journal_mode={sqlite_journal_mode_after_close:?}, integrity={sqlite_integrity_after_close:?}, typeof={sqlite_typeof_after_close:?}, quote={sqlite_quote_after_close:?}, value={sqlite_value_after_close:?})"
         );
         assert_eq!(
             pager_values_after_close,
-            Some(vec![SqliteValue::Integer(expected)]),
+            Some(vec![SqliteValue::Null, SqliteValue::Integer(expected)]),
             "bd-rjc pager-backed mismatch after close: final_cell={final_cell:?} expected={expected} retries={retries} pager_before={pager_values_before_close:?} pager_after={pager_values_after_close:?} wal_len_before_close={wal_len_before_close:?} wal_len_after_close={wal_len_after_close:?} sqlite_before=(journal_mode={sqlite_journal_mode_before_close:?}, integrity={sqlite_integrity_before_close:?}, typeof={sqlite_typeof_before_close:?}, quote={sqlite_quote_before_close:?}, value={sqlite_value_before_close:?}) sqlite_after=(journal_mode={sqlite_journal_mode_after_close:?}, integrity={sqlite_integrity_after_close:?}, typeof={sqlite_typeof_after_close:?}, quote={sqlite_quote_after_close:?}, value={sqlite_value_after_close:?})"
         );
         assert!(
@@ -35819,6 +35868,10 @@ mod tests {
         let conn = Connection::open(&db).unwrap();
         conn.execute("PRAGMA busy_timeout=5000;").unwrap();
         conn.execute("PRAGMA fsqlite.concurrent_mode=ON;").unwrap();
+        let table_root_pgno = fsqlite_types::PageNumber::new(
+            u32::try_from(table_root_page).expect("root page should fit in u32"),
+        )
+        .expect("root page should be valid");
         let read_single_column_row_via_pager = |conn: &Connection| -> Option<Vec<SqliteValue>> {
             let cx = Cx::new();
             let mut txn = conn
@@ -35827,10 +35880,7 @@ mod tests {
                 .unwrap();
             let mut cursor = fsqlite_btree::BtCursor::new(
                 fsqlite_btree::TransactionPageIo::new(txn.as_mut()),
-                fsqlite_types::PageNumber::new(
-                    u32::try_from(table_root_page).expect("root page should fit in u32"),
-                )
-                .expect("root page should be valid"),
+                table_root_pgno,
                 u32::try_from(fsqlite_types::PageSize::DEFAULT.as_usize())
                     .expect("page size should fit in u32"),
                 true,
@@ -35845,6 +35895,99 @@ mod tests {
                     .expect("pager-backed row payload should decode as a SQLite record"),
             )
         };
+        let hex_prefix = |bytes: &[u8], limit: usize| -> String {
+            bytes
+                .iter()
+                .take(limit)
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<Vec<_>>()
+                .join("")
+        };
+        let describe_root_page_layout = |conn: &Connection| -> String {
+            let cx = Cx::new();
+            let mut txn = conn
+                .pager
+                .begin(&cx, fsqlite_pager::TransactionMode::ReadOnly)
+                .unwrap();
+            let page_data = txn.get_page(&cx, table_root_pgno).unwrap();
+            let page = page_data.as_bytes();
+            let header_offset = fsqlite_btree::header_offset_for_page(table_root_pgno);
+            let header = match fsqlite_btree::BtreePageHeader::parse(page, header_offset) {
+                Ok(header) => header,
+                Err(err) => {
+                    return format!("header_err={err} page_prefix={}", hex_prefix(page, 96));
+                }
+            };
+            let cell_pointers =
+                match fsqlite_btree::read_cell_pointers(page, &header, header_offset) {
+                    Ok(pointers) => pointers,
+                    Err(err) => {
+                        return format!(
+                            "header={header:?} ptr_err={err} page_prefix={}",
+                            hex_prefix(page, 96)
+                        );
+                    }
+                };
+            let usable_size =
+                u32::try_from(page.len()).expect("page length should fit into u32 for tests");
+            let content_offset = header.content_offset(usable_size);
+            let content_prefix = if content_offset < page.len() {
+                hex_prefix(&page[content_offset..], 96)
+            } else {
+                "content_offset_at_end".to_owned()
+            };
+            let cells = cell_pointers
+                .iter()
+                .enumerate()
+                .map(|(idx, &ptr)| {
+                    let cell_offset = usize::from(ptr);
+                    let raw_cell_prefix = if cell_offset < page.len() {
+                        hex_prefix(&page[cell_offset..], 64)
+                    } else {
+                        "ptr_out_of_bounds".to_owned()
+                    };
+                    match fsqlite_btree::CellRef::parse(
+                        page,
+                        cell_offset,
+                        header.page_type,
+                        usable_size,
+                    ) {
+                        Ok(cell) => {
+                            let on_page_size = fsqlite_btree::payload::cell_on_page_size(
+                                &cell,
+                                cell_offset,
+                            );
+                            let cell_end = cell_offset.saturating_add(on_page_size).min(page.len());
+                            let cell_hex = hex_prefix(&page[cell_offset..cell_end], 96);
+                            let payload = cell.local_payload(page);
+                            let payload_values = fsqlite_types::record::parse_record(payload);
+                            format!(
+                                "idx={idx} ptr={ptr} rowid={:?} payload_size={} local_size={} payload_offset={} overflow={:?} payload_values={payload_values:?} raw_cell_prefix={} cell_hex={}",
+                                cell.rowid,
+                                cell.payload_size,
+                                cell.local_size,
+                                cell.payload_offset,
+                                cell.overflow_page,
+                                raw_cell_prefix,
+                                cell_hex
+                            )
+                        }
+                        Err(err) => {
+                            format!(
+                                "idx={idx} ptr={ptr} parse_err={err} raw_cell_prefix={raw_cell_prefix}"
+                            )
+                        }
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" | ");
+            format!(
+                "header={header:?} cell_pointers={cell_pointers:?} page_prefix={} content_prefix={} cells=[{}]",
+                hex_prefix(page, 96),
+                content_prefix,
+                cells
+            )
+        };
         for step in 0..TXNS {
             let query_before_step = conn
                 .query_row("SELECT v FROM t WHERE id = 1;")
@@ -35854,6 +35997,46 @@ mod tests {
             match conn.execute("UPDATE t SET v = v + 1 WHERE id = 1;") {
                 Ok(changes) => {
                     assert_eq!(changes, 1, "expected one-row sequential update");
+                    if step == 0 {
+                        let query_after_first_step = conn
+                            .query_row("SELECT v FROM t WHERE id = 1;")
+                            .ok()
+                            .and_then(|row| row.get(0).cloned());
+                        let pager_after_first_step = read_single_column_row_via_pager(&conn);
+                        let sqlite_after_first_step = {
+                            let sqlite = rusqlite::Connection::open(&db).unwrap();
+                            let typeof_v: String = sqlite
+                                .query_row("SELECT typeof(v) FROM t WHERE id = 1;", [], |row| {
+                                    row.get(0)
+                                })
+                                .unwrap();
+                            let quote_v: String = sqlite
+                                .query_row("SELECT quote(v) FROM t WHERE id = 1;", [], |row| {
+                                    row.get(0)
+                                })
+                                .unwrap();
+                            let value: rusqlite::types::Value = sqlite
+                                .query_row("SELECT v FROM t WHERE id = 1;", [], |row| row.get(0))
+                                .unwrap();
+                            (typeof_v, quote_v, value)
+                        };
+                        let root_page_layout_after_first_step = describe_root_page_layout(&conn);
+                        assert_eq!(
+                            query_after_first_step,
+                            Some(SqliteValue::Integer(1)),
+                            "bd-rjc first sequential update corrupted SQL view: pager_after_first_step={pager_after_first_step:?} sqlite_after_first_step={sqlite_after_first_step:?} root_page_layout_after_first_step={root_page_layout_after_first_step}"
+                        );
+                        assert_eq!(
+                            pager_after_first_step,
+                            Some(vec![SqliteValue::Integer(1)]),
+                            "bd-rjc first sequential update corrupted pager view: query_after_first_step={query_after_first_step:?} sqlite_after_first_step={sqlite_after_first_step:?} root_page_layout_after_first_step={root_page_layout_after_first_step}"
+                        );
+                        assert_eq!(
+                            sqlite_after_first_step.2,
+                            rusqlite::types::Value::Integer(1),
+                            "bd-rjc first sequential update corrupted SQLite view: query_after_first_step={query_after_first_step:?} pager_after_first_step={pager_after_first_step:?} sqlite_after_first_step={sqlite_after_first_step:?} root_page_layout_after_first_step={root_page_layout_after_first_step}"
+                        );
+                    }
                 }
                 Err(err) => {
                     let sqlite_before_step = {
@@ -35871,8 +36054,9 @@ mod tests {
                             .unwrap();
                         (typeof_v, quote_v, value)
                     };
+                    let root_page_layout_before_step = describe_root_page_layout(&conn);
                     panic!(
-                        "bd-rjc sequential update failed: step={step} query_before_step={query_before_step:?} pager_before_step={pager_before_step:?} sqlite_before_step={sqlite_before_step:?} err={err}"
+                        "bd-rjc sequential update failed: step={step} query_before_step={query_before_step:?} pager_before_step={pager_before_step:?} sqlite_before_step={sqlite_before_step:?} root_page_layout_before_step={root_page_layout_before_step} err={err}"
                     );
                 }
             }
@@ -35947,12 +36131,12 @@ mod tests {
         let expected = i64::try_from(TXNS).unwrap();
         assert_eq!(
             pager_values_before_close,
-            Some(vec![SqliteValue::Integer(expected)]),
+            Some(vec![SqliteValue::Null, SqliteValue::Integer(expected)]),
             "bd-rjc sequential pager-backed mismatch before close: final_cell={final_cell:?} expected={expected} pager_before={pager_values_before_close:?} pager_after={pager_values_after_close:?} wal_len_before_close={wal_len_before_close:?} wal_len_after_close={wal_len_after_close:?} sqlite_before=(journal_mode={sqlite_journal_mode_before_close:?}, integrity={sqlite_integrity_before_close:?}, typeof={sqlite_typeof_before_close:?}, quote={sqlite_quote_before_close:?}, value={sqlite_value_before_close:?}) sqlite_after=(journal_mode={sqlite_journal_mode_after_close:?}, integrity={sqlite_integrity_after_close:?}, typeof={sqlite_typeof_after_close:?}, quote={sqlite_quote_after_close:?}, value={sqlite_value_after_close:?})"
         );
         assert_eq!(
             pager_values_after_close,
-            Some(vec![SqliteValue::Integer(expected)]),
+            Some(vec![SqliteValue::Null, SqliteValue::Integer(expected)]),
             "bd-rjc sequential pager-backed mismatch after close: final_cell={final_cell:?} expected={expected} pager_before={pager_values_before_close:?} pager_after={pager_values_after_close:?} wal_len_before_close={wal_len_before_close:?} wal_len_after_close={wal_len_after_close:?} sqlite_before=(journal_mode={sqlite_journal_mode_before_close:?}, integrity={sqlite_integrity_before_close:?}, typeof={sqlite_typeof_before_close:?}, quote={sqlite_quote_before_close:?}, value={sqlite_value_before_close:?}) sqlite_after=(journal_mode={sqlite_journal_mode_after_close:?}, integrity={sqlite_integrity_after_close:?}, typeof={sqlite_typeof_after_close:?}, quote={sqlite_quote_after_close:?}, value={sqlite_value_after_close:?})"
         );
         assert_eq!(

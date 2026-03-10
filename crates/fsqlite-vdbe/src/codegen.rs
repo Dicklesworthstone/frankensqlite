@@ -202,7 +202,8 @@ pub struct TableSchema {
 
 impl TableSchema {
     /// Build an affinity string for `MakeRecord` (one char per column).
-    /// IPK columns are marked with 'X' to signal omission from the record payload.
+    /// IPK columns are marked with 'X' so `MakeRecord` writes a NULL placeholder
+    /// while the real key continues to come from the rowid.
     #[must_use]
     pub fn affinity_string(&self) -> String {
         self.columns
