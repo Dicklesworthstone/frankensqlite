@@ -7,7 +7,7 @@ LOG_SCHEMA_VERSION="1.0.0"
 SEED="1095400001"
 WORKSPACE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RUN_ID="bd-1dp9.5.4-$(date -u +%Y%m%dT%H%M%SZ)-$$"
-TARGET_DIR="${CARGO_TARGET_DIR:-target_bd_1dp9_5_4}"
+TARGET_DIR="${CARGO_TARGET_DIR:-/var/tmp/target_bd_1dp9_5_4}"
 REPORT_DIR="${WORKSPACE_ROOT}/test-results/bd_1dp9_5_4"
 LOG_DIR="${REPORT_DIR}/logs/${RUN_ID}"
 REPORT_JSONL="${REPORT_DIR}/${RUN_ID}.jsonl"
@@ -124,7 +124,7 @@ run_phase() {
     local status="pass"
     local exit_code=0
     set +e
-    CARGO_TARGET_DIR="${TARGET_DIR}" "$@" >"${log_file}" 2>&1
+    rch exec -- env CARGO_TARGET_DIR="${TARGET_DIR}" "$@" >"${log_file}" 2>&1
     exit_code=$?
     set -e
     if [[ "${exit_code}" -ne 0 ]]; then
@@ -183,6 +183,12 @@ run_phase() {
 }
 
 failures=0
+
+run_phase \
+    "EXT-5" \
+    "direct_extension_storage_roundtrip" \
+    cargo test -p fsqlite-harness --test ext_real_storage_test -- --nocapture \
+    || failures=$((failures + 1))
 
 run_phase \
     "EXT-1" \

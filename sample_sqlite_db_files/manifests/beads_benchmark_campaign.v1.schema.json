@@ -1,74 +1,40 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://frankensqlite.local/schemas/sample_sqlite_db_files/beads_benchmark_campaign.v1.schema.json",
-  "title": "FrankenSQLite Canonical Beads Benchmark Campaign (v1)",
+  "title": "FrankenSQLite Beads Benchmark Campaign (v1)",
   "type": "object",
   "additionalProperties": false,
   "required": [
     "schema_version",
-    "bead_id",
     "campaign_id",
-    "description",
-    "fixture_root",
-    "build_profile",
-    "beads_data_source",
-    "seed_policy",
-    "retry_policy",
-    "hardware_classes",
-    "placement_profiles",
+    "title",
+    "working_benchmark_root_relpath",
+    "beads_data_relpath",
     "fixtures",
-    "workloads",
-    "modes",
-    "scenarios",
-    "artifact_naming"
+    "placement_profiles",
+    "hardware_classes",
+    "retry_policies",
+    "build_profiles",
+    "seed_policies",
+    "matrix_rows",
+    "artifact_contract"
   ],
   "properties": {
     "schema_version": {
       "type": "string",
-      "const": "fsqlite-e2e.canonical_beads_benchmark_campaign.v1"
-    },
-    "bead_id": {
-      "type": "string",
-      "minLength": 1
+      "const": "fsqlite-e2e.beads_benchmark_campaign.v1"
     },
     "campaign_id": {
-      "type": "string",
-      "minLength": 1
+      "$ref": "#/$defs/id"
     },
-    "description": {
-      "type": "string",
-      "minLength": 1
+    "title": {
+      "$ref": "#/$defs/non_empty_string"
     },
-    "fixture_root": {
-      "type": "string",
-      "minLength": 1
+    "working_benchmark_root_relpath": {
+      "$ref": "#/$defs/non_empty_string"
     },
-    "build_profile": {
-      "type": "string",
-      "minLength": 1
-    },
-    "beads_data_source": {
-      "$ref": "#/$defs/beads_data_source"
-    },
-    "seed_policy": {
-      "$ref": "#/$defs/seed_policy"
-    },
-    "retry_policy": {
-      "$ref": "#/$defs/retry_policy"
-    },
-    "hardware_classes": {
-      "type": "array",
-      "minItems": 1,
-      "items": {
-        "$ref": "#/$defs/hardware_class"
-      }
-    },
-    "placement_profiles": {
-      "type": "array",
-      "minItems": 2,
-      "items": {
-        "$ref": "#/$defs/placement_profile"
-      }
+    "beads_data_relpath": {
+      "$ref": "#/$defs/non_empty_string"
     },
     "fixtures": {
       "type": "array",
@@ -77,117 +43,149 @@
         "$ref": "#/$defs/fixture"
       }
     },
-    "workloads": {
+    "placement_profiles": {
       "type": "array",
       "minItems": 1,
       "items": {
-        "$ref": "#/$defs/workload"
+        "$ref": "#/$defs/placement_profile"
       }
     },
-    "modes": {
-      "type": "array",
-      "minItems": 3,
-      "items": {
-        "$ref": "#/$defs/mode"
-      }
-    },
-    "scenarios": {
+    "hardware_classes": {
       "type": "array",
       "minItems": 1,
       "items": {
-        "$ref": "#/$defs/scenario"
+        "$ref": "#/$defs/hardware_class"
       }
     },
-    "artifact_naming": {
-      "$ref": "#/$defs/artifact_naming"
+    "retry_policies": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/retry_policy"
+      }
+    },
+    "build_profiles": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/build_profile"
+      }
+    },
+    "seed_policies": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/seed_policy"
+      }
+    },
+    "matrix_rows": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/matrix_row"
+      }
+    },
+    "artifact_contract": {
+      "$ref": "#/$defs/artifact_contract"
     }
   },
   "$defs": {
+    "non_empty_string": {
+      "type": "string",
+      "minLength": 1
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9_\\-\\.]*$"
+    },
     "sha256": {
       "type": "string",
       "pattern": "^[0-9a-f]{64}$"
     },
-    "id": {
+    "benchmark_mode": {
       "type": "string",
-      "pattern": "^[a-z0-9][a-z0-9_\\-]{1,127}$"
+      "enum": [
+        "sqlite_reference",
+        "fsqlite_mvcc",
+        "fsqlite_single_writer"
+      ]
     },
-    "beads_data_source": {
+    "fixture": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["path", "hash_algorithm"],
+      "required": [
+        "fixture_id",
+        "source_path",
+        "source_sha256",
+        "source_size_bytes",
+        "working_copy_relpath",
+        "working_copy_sha256",
+        "working_copy_size_bytes",
+        "page_size",
+        "journal_mode",
+        "capture_rule"
+      ],
       "properties": {
-        "path": {
-          "type": "string",
-          "minLength": 1
+        "fixture_id": {
+          "$ref": "#/$defs/id"
         },
-        "hash_algorithm": {
-          "type": "string",
-          "const": "sha256"
+        "source_path": {
+          "$ref": "#/$defs/non_empty_string"
+        },
+        "source_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "source_size_bytes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "working_copy_relpath": {
+          "$ref": "#/$defs/non_empty_string"
+        },
+        "working_copy_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "working_copy_size_bytes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "page_size": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "journal_mode": {
+          "$ref": "#/$defs/non_empty_string"
+        },
+        "capture_rule": {
+          "$ref": "#/$defs/non_empty_string"
         }
       }
     },
-    "seed_policy": {
+    "placement_profile": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["id", "root_seed", "worker_seed_derivation", "notes"],
+      "required": [
+        "id",
+        "kind",
+        "description",
+        "command_hint",
+        "availability"
+      ],
       "properties": {
         "id": {
           "$ref": "#/$defs/id"
         },
-        "root_seed": {
-          "type": "integer",
-          "minimum": 1
+        "kind": {
+          "$ref": "#/$defs/non_empty_string"
         },
-        "worker_seed_derivation": {
-          "type": "string",
-          "minLength": 1
+        "description": {
+          "$ref": "#/$defs/non_empty_string"
         },
-        "notes": {
-          "type": "string",
-          "minLength": 1
-        }
-      }
-    },
-    "retry_mode": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["max_busy_retries", "backoff_base_ms", "backoff_cap_ms"],
-      "properties": {
-        "max_busy_retries": {
-          "type": "integer",
-          "minimum": 1
+        "command_hint": {
+          "$ref": "#/$defs/non_empty_string"
         },
-        "backoff_base_ms": {
-          "type": "integer",
-          "minimum": 1
-        },
-        "backoff_cap_ms": {
-          "type": "integer",
-          "minimum": 1
-        },
-        "busy_timeout_ms": {
-          "type": ["integer", "null"],
-          "minimum": 0
-        }
-      }
-    },
-    "retry_policy": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["id", "sqlite", "fsqlite", "notes"],
-      "properties": {
-        "id": {
-          "$ref": "#/$defs/id"
-        },
-        "sqlite": {
-          "$ref": "#/$defs/retry_mode"
-        },
-        "fsqlite": {
-          "$ref": "#/$defs/retry_mode"
-        },
-        "notes": {
-          "type": "string",
-          "minLength": 1
+        "availability": {
+          "$ref": "#/$defs/non_empty_string"
         }
       }
     },
@@ -196,228 +194,227 @@
       "additionalProperties": false,
       "required": [
         "id",
-        "cpu_model",
-        "logical_cpus",
-        "physical_cores",
-        "sockets",
-        "numa_nodes",
-        "llc_domains",
-        "smt_enabled",
+        "arch",
+        "min_logical_cores",
+        "min_numa_nodes",
+        "description"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "arch": {
+          "$ref": "#/$defs/non_empty_string"
+        },
+        "min_logical_cores": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "min_numa_nodes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1
+        },
+        "description": {
+          "$ref": "#/$defs/non_empty_string"
+        }
+      }
+    },
+    "retry_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "max_busy_retries",
+        "busy_backoff_ms",
+        "busy_backoff_max_ms",
         "notes"
       ],
       "properties": {
         "id": {
           "$ref": "#/$defs/id"
         },
-        "cpu_model": {
-          "type": "string",
-          "minLength": 1
-        },
-        "logical_cpus": {
+        "max_busy_retries": {
           "type": "integer",
           "minimum": 1
         },
-        "physical_cores": {
+        "busy_backoff_ms": {
           "type": "integer",
           "minimum": 1
         },
-        "sockets": {
+        "busy_backoff_max_ms": {
           "type": "integer",
           "minimum": 1
-        },
-        "numa_nodes": {
-          "type": "integer",
-          "minimum": 1
-        },
-        "llc_domains": {
-          "type": "integer",
-          "minimum": 1
-        },
-        "smt_enabled": {
-          "type": "boolean"
         },
         "notes": {
-          "type": "string",
-          "minLength": 1
+          "$ref": "#/$defs/non_empty_string"
         }
       }
     },
-    "placement_profile": {
+    "build_profile": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["id", "kind", "hardware_class_ids", "notes"],
+      "required": [
+        "id",
+        "cargo_profile",
+        "cargo_args",
+        "notes"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "cargo_profile": {
+          "$ref": "#/$defs/non_empty_string"
+        },
+        "cargo_args": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/non_empty_string"
+          }
+        },
+        "notes": {
+          "$ref": "#/$defs/non_empty_string"
+        }
+      }
+    },
+    "seed_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "kind",
+        "base_seed",
+        "notes"
+      ],
       "properties": {
         "id": {
           "$ref": "#/$defs/id"
         },
         "kind": {
-          "type": "string",
-          "enum": ["baseline", "recommended", "adversarial"]
+          "$ref": "#/$defs/non_empty_string"
         },
-        "hardware_class_ids": {
+        "base_seed": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "notes": {
+          "$ref": "#/$defs/non_empty_string"
+        }
+      }
+    },
+    "placement_variant": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "placement_profile_id",
+        "hardware_class_id",
+        "required"
+      ],
+      "properties": {
+        "placement_profile_id": {
+          "$ref": "#/$defs/id"
+        },
+        "hardware_class_id": {
+          "$ref": "#/$defs/id"
+        },
+        "required": {
+          "type": "boolean"
+        }
+      }
+    },
+    "matrix_row": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "row_id",
+        "fixtures",
+        "workload",
+        "concurrency",
+        "modes",
+        "placement_variants",
+        "retry_policy_id",
+        "build_profile_id",
+        "seed_policy_id"
+      ],
+      "properties": {
+        "row_id": {
+          "$ref": "#/$defs/id"
+        },
+        "fixtures": {
           "type": "array",
           "minItems": 1,
           "items": {
             "$ref": "#/$defs/id"
           }
         },
-        "taskset_cpu_list_by_concurrency": {
-          "type": "object",
-          "default": {},
-          "additionalProperties": {
-            "type": "string",
-            "pattern": "^[0-9,\\-]+$"
-          }
-        },
-        "notes": {
-          "type": "string",
-          "minLength": 1
-        }
-      }
-    },
-    "fixture": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "id",
-        "source_path",
-        "snapshot_path",
-        "sha256",
-        "size_bytes",
-        "digest_source",
-        "notes"
-      ],
-      "properties": {
-        "id": {
-          "$ref": "#/$defs/id"
-        },
-        "source_path": {
-          "type": "string",
-          "minLength": 1
-        },
-        "snapshot_path": {
-          "type": "string",
-          "minLength": 1
-        },
-        "sha256": {
-          "$ref": "#/$defs/sha256"
-        },
-        "size_bytes": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "digest_source": {
-          "type": "string",
-          "minLength": 1
-        },
-        "notes": {
-          "type": "string",
-          "minLength": 1
-        }
-      }
-    },
-    "workload": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["id", "description", "scale", "notes"],
-      "properties": {
-        "id": {
-          "$ref": "#/$defs/id"
-        },
-        "description": {
-          "type": "string",
-          "minLength": 1
-        },
-        "scale": {
-          "type": "integer",
-          "minimum": 1
-        },
-        "notes": {
-          "type": "string",
-          "minLength": 1
-        }
-      }
-    },
-    "mode": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["id", "benchmark_engine_label", "engine", "concurrent_mode", "notes"],
-      "properties": {
-        "id": {
-          "$ref": "#/$defs/id"
-        },
-        "benchmark_engine_label": {
-          "type": "string",
-          "minLength": 1
-        },
-        "engine": {
-          "type": "string",
-          "enum": ["sqlite3", "fsqlite"]
-        },
-        "concurrent_mode": {
-          "type": ["boolean", "null"]
-        },
-        "notes": {
-          "type": "string",
-          "minLength": 1
-        }
-      }
-    },
-    "scenario": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["fixture_id", "workload_id", "concurrency", "mode_ids", "placement_profile_ids"],
-      "properties": {
-        "fixture_id": {
-          "$ref": "#/$defs/id"
-        },
-        "workload_id": {
+        "workload": {
           "$ref": "#/$defs/id"
         },
         "concurrency": {
           "type": "integer",
           "minimum": 1
         },
-        "mode_ids": {
-          "type": "array",
-          "minItems": 3,
-          "items": {
-            "$ref": "#/$defs/id"
-          }
-        },
-        "placement_profile_ids": {
-          "type": "array",
-          "minItems": 2,
-          "items": {
-            "$ref": "#/$defs/id"
-          }
-        }
-      }
-    },
-    "artifact_naming": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["output_root", "directory_template", "file_stem_template", "required_context"],
-      "properties": {
-        "output_root": {
-          "type": "string",
-          "minLength": 1
-        },
-        "directory_template": {
-          "type": "string",
-          "minLength": 1
-        },
-        "file_stem_template": {
-          "type": "string",
-          "minLength": 1
-        },
-        "required_context": {
+        "modes": {
           "type": "array",
           "minItems": 1,
           "items": {
-            "type": "string",
-            "minLength": 1
+            "$ref": "#/$defs/benchmark_mode"
           }
+        },
+        "placement_variants": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/placement_variant"
+          }
+        },
+        "retry_policy_id": {
+          "$ref": "#/$defs/id"
+        },
+        "build_profile_id": {
+          "$ref": "#/$defs/id"
+        },
+        "seed_policy_id": {
+          "$ref": "#/$defs/id"
+        }
+      }
+    },
+    "artifact_contract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "artifact_root_relpath",
+        "bundle_dir_template",
+        "result_jsonl_name",
+        "summary_md_name",
+        "manifest_name",
+        "logs_dir_name",
+        "profiles_dir_name"
+      ],
+      "properties": {
+        "artifact_root_relpath": {
+          "$ref": "#/$defs/non_empty_string"
+        },
+        "bundle_dir_template": {
+          "$ref": "#/$defs/non_empty_string"
+        },
+        "result_jsonl_name": {
+          "$ref": "#/$defs/non_empty_string"
+        },
+        "summary_md_name": {
+          "$ref": "#/$defs/non_empty_string"
+        },
+        "manifest_name": {
+          "$ref": "#/$defs/non_empty_string"
+        },
+        "logs_dir_name": {
+          "$ref": "#/$defs/non_empty_string"
+        },
+        "profiles_dir_name": {
+          "$ref": "#/$defs/non_empty_string"
         }
       }
     }

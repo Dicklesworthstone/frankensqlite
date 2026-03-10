@@ -246,15 +246,15 @@ or artifact names.
 
 ```bash
 # Run all presets against all golden copies (full matrix)
-cargo run -p fsqlite-e2e --bin realdb-e2e --release -- bench
+rch exec -- cargo run -p fsqlite-e2e --bin realdb-e2e --release -- bench
 
 # Run specific database and preset
-cargo run -p fsqlite-e2e --bin realdb-e2e --release -- bench \
+rch exec -- cargo run -p fsqlite-e2e --bin realdb-e2e --release -- bench \
   --db asupersync \
   --preset commutative_inserts_disjoint_keys
 
 # Control iterations
-cargo run -p fsqlite-e2e --bin realdb-e2e --release -- bench \
+rch exec -- cargo run -p fsqlite-e2e --bin realdb-e2e --release -- bench \
   --warmup 3 \
   --repeat 10 \
   --output results/bench_report.json
@@ -272,22 +272,22 @@ sample_sqlite_db_files/manifests/beads_benchmark_campaign.v1.schema.json
 That manifest freezes the real-fixture campaign dimensions instead of relying on
 ad hoc shell history:
 
-- Fixtures: `frankensqlite_beads`, `frankentui_beads`, `frankensearch_beads`
+- Fixtures: `frankensqlite`, `frankentui`, `frankensearch`
 - Workloads: `commutative_inserts_disjoint_keys`, `hot_page_contention`, `mixed_read_write`
-- Modes: `sqlite3_wal`, `fsqlite_mvcc`, `fsqlite_single_writer`
-- Build profile: `release-perf`
+- Modes: `sqlite_reference`, `fsqlite_mvcc`, `fsqlite_single_writer`
+- Build profile: manifest ID `release_perf` using Cargo profile `release-perf`
 - Seed policy: fixed root seed `42`
 - Retry policy: harness-instrumented busy retries (`10_000`, `1ms` base, `250ms` cap)
-- Placement profiles: unpinned baseline, pinned LLC-spread, adversarial SMT-packed
-- Hardware class: `amd_tr_pro_5995wx_64c128t_smt_on_l3x8_numa1`
+- Placement profiles: `baseline_unpinned`, `recommended_pinned`, `adversarial_cross_node`
+- Hardware classes: `linux_x86_64_any`, `linux_x86_64_many_core_numa`
 
 Artifact names for canonical runs must include the source revision and the
 `.beads/issues.jsonl` hash so results stay mechanically diffable over time. The
 tracked templates are:
 
 ```text
-directory: {date}_{commit_sha8}_{beads_hash12}_{hardware_class_id}_{placement_profile_id}
-file stem: {mode_id}__{fixture_id}__{workload_id}__c{concurrency}__{build_profile}
+bundle dir: {row_id}__{fixture_id}__{mode}__{placement_profile_id}__rev_{source_revision}__beads_{beads_hash}
+files: results.jsonl, summary.md, manifest.json, logs/, profiles/
 ```
 
 For CPU-heavy canonical runs, offload through `rch` and use the manifest as the

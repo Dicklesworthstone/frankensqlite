@@ -13,8 +13,7 @@ use serde::{Deserialize, Serialize};
 /// Bead identifier for the leapfrog exit-criteria gate.
 pub const BEAD_ID: &str = "bd-db300.7.3";
 /// Stable schema identifier for the exit-criteria contract.
-pub const LEAPFROG_EXIT_CRITERIA_SCHEMA_V1: &str =
-    "fsqlite-harness.leapfrog_exit_criteria.v1";
+pub const LEAPFROG_EXIT_CRITERIA_SCHEMA_V1: &str = "fsqlite-harness.leapfrog_exit_criteria.v1";
 /// Workspace-relative path to the canonical exit-criteria contract.
 pub const LEAPFROG_EXIT_CRITERIA_PATH: &str = "leapfrog_exit_criteria.toml";
 const CANONICAL_CAMPAIGN_MANIFEST_PATH: &str =
@@ -191,9 +190,12 @@ impl LeapfrogExitCriteria {
             "campaign.required_placement_profiles",
             &self.campaign.required_placement_profiles,
         )?;
-        let required_mode_ids = unique_set("campaign.required_modes", &self.campaign.required_modes)?;
-        let required_cell_suffixes =
-            unique_set("campaign.required_cell_suffixes", &self.campaign.required_cell_suffixes)?;
+        let required_mode_ids =
+            unique_set("campaign.required_modes", &self.campaign.required_modes)?;
+        let required_cell_suffixes = unique_set(
+            "campaign.required_cell_suffixes",
+            &self.campaign.required_cell_suffixes,
+        )?;
         require_eq(
             "campaign.manifest_path",
             &self.campaign.manifest_path,
@@ -203,9 +205,7 @@ impl LeapfrogExitCriteria {
             || !required_cell_suffixes.contains("c4")
             || !required_cell_suffixes.contains("c8")
         {
-            return Err(
-                "campaign.required_cell_suffixes must include c1, c4, and c8".to_owned(),
-            );
+            return Err("campaign.required_cell_suffixes must include c1, c4, and c8".to_owned());
         }
 
         for profile_id in [
@@ -260,12 +260,7 @@ impl LeapfrogExitCriteria {
                     gate.cell
                 ));
             }
-            require_pct(
-                "cell_gates.max_retry_rate",
-                gate.max_retry_rate,
-                0.0,
-                1.0,
-            )?;
+            require_pct("cell_gates.max_retry_rate", gate.max_retry_rate, 0.0, 1.0)?;
             require_pct(
                 "cell_gates.min_cpu_utilization_pct",
                 gate.min_cpu_utilization_pct,
@@ -304,9 +299,14 @@ impl LeapfrogExitCriteria {
             ));
         }
 
-        let unit_tests = unique_set("verification_plan.unit_tests", &self.verification_plan.unit_tests)?;
-        let e2e_scenarios =
-            unique_set("verification_plan.e2e_scenarios", &self.verification_plan.e2e_scenarios)?;
+        let unit_tests = unique_set(
+            "verification_plan.unit_tests",
+            &self.verification_plan.unit_tests,
+        )?;
+        let e2e_scenarios = unique_set(
+            "verification_plan.e2e_scenarios",
+            &self.verification_plan.e2e_scenarios,
+        )?;
         let logging_artifacts = unique_set(
             "verification_plan.logging_artifacts",
             &self.verification_plan.logging_artifacts,
@@ -316,7 +316,9 @@ impl LeapfrogExitCriteria {
             &self.verification_plan.required_log_fields,
         )?;
         if unit_tests.is_empty() || e2e_scenarios.is_empty() || logging_artifacts.is_empty() {
-            return Err("verification_plan must list unit tests, scenarios, and artifacts".to_owned());
+            return Err(
+                "verification_plan must list unit tests, scenarios, and artifacts".to_owned(),
+            );
         }
         for required_field in REQUIRED_LOG_FIELDS {
             if !log_fields.contains(required_field) {
@@ -360,9 +362,7 @@ impl LeapfrogExitCriteria {
                 .iter()
                 .find(|suffix| scenario_id.ends_with(suffix.as_str()))
                 .ok_or_else(|| {
-                    format!(
-                        "campaign row `{scenario_id}` does not end with a required cell suffix"
-                    )
+                    format!("campaign row `{scenario_id}` does not end with a required cell suffix")
                 })?;
             covered_suffixes.insert(matched_suffix.clone());
         }

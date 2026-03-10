@@ -331,6 +331,51 @@ pub struct AcceptanceTestRef {
     pub oracle_differential: bool,
 }
 
+/// Determinism contract for an executable extension suite.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DeterminismContract {
+    /// The suite uses a fixed numeric seed for reproducibility.
+    FixedSeed(u64),
+    /// The suite is deterministic because it uses fixed fixtures only.
+    DeterministicFixture,
+}
+
+/// Executable suite metadata linking the matrix to replayable verification.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExtensionExecutionSuite {
+    /// Stable suite identifier.
+    pub suite_id: String,
+    /// Extension module validated by this suite.
+    pub module: ExtensionModule,
+    /// One-command replay instruction.
+    pub replay_command: String,
+    /// Artifact paths emitted or collected by the suite.
+    pub artifact_paths: Vec<String>,
+    /// Stable scenario IDs exercised by the suite.
+    pub scenario_ids: Vec<String>,
+    /// Determinism contracts for this suite.
+    pub determinism: Vec<DeterminismContract>,
+    /// Acceptance tests providing the executable backing for this suite.
+    pub acceptance_tests: Vec<AcceptanceTestRef>,
+    /// Matrix entry IDs covered by this suite.
+    pub matrix_entry_ids: Vec<String>,
+    /// Ledger / taxonomy IDs covered by this suite.
+    pub taxonomy_feature_ids: Vec<FeatureId>,
+    /// Feature flags exercised in enabled mode by this suite.
+    pub enabled_flags: Vec<String>,
+    /// Feature flags intentionally checked in disabled mode by this suite.
+    pub disabled_flags: Vec<String>,
+}
+
+/// The canonical executable plan for extension parity verification.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExtensionExecutionPlan {
+    /// Schema version.
+    pub schema_version: u32,
+    /// Deterministic executable suites by module.
+    pub suites: Vec<ExtensionExecutionSuite>,
+}
+
 // ---------------------------------------------------------------------------
 // Contract entry
 // ---------------------------------------------------------------------------
@@ -1173,6 +1218,146 @@ impl ExtensionParityMatrix {
             &["ext", "misc", "uuid"],
         );
 
+        let acceptance =
+            |module_path: &str, test_name: &str, oracle_differential: bool| AcceptanceTestRef {
+                module_path: module_path.to_owned(),
+                test_name: Some(test_name.to_owned()),
+                oracle_differential,
+            };
+        let attach_tests = |entries: &mut BTreeMap<String, ContractEntry>,
+                            module: ExtensionModule,
+                            tests: &[AcceptanceTestRef]| {
+            for entry in entries.values_mut().filter(|entry| entry.module == module) {
+                entry.acceptance_tests.extend(tests.iter().cloned());
+            }
+        };
+
+        attach_tests(
+            &mut entries,
+            ExtensionModule::Json,
+            &[
+                acceptance(
+                    "crates/fsqlite-harness/tests/ext_real_storage_test.rs",
+                    "json_text_storage_round_trip",
+                    false,
+                ),
+                acceptance(
+                    "crates/fsqlite-harness/tests/bd_1dp9_5_2_json_fts_wave.rs",
+                    "test_json1_differential_wave_parity",
+                    true,
+                ),
+                acceptance(
+                    "crates/fsqlite-e2e/tests/extension_json_fts_parity.rs",
+                    "json1_contract_rows_match_csqlite",
+                    true,
+                ),
+            ],
+        );
+        attach_tests(
+            &mut entries,
+            ExtensionModule::Fts3,
+            &[acceptance(
+                "crates/fsqlite-harness/tests/ext_real_storage_test.rs",
+                "fts3_query_parsing_on_stored_content",
+                false,
+            )],
+        );
+        attach_tests(
+            &mut entries,
+            ExtensionModule::Fts5,
+            &[
+                acceptance(
+                    "crates/fsqlite-harness/tests/ext_real_storage_test.rs",
+                    "fts5_tokenizer_on_stored_text",
+                    false,
+                ),
+                acceptance(
+                    "crates/fsqlite-e2e/tests/extension_json_fts_parity.rs",
+                    "fts5_source_id_available_in_frankensqlite",
+                    false,
+                ),
+            ],
+        );
+        attach_tests(
+            &mut entries,
+            ExtensionModule::Rtree,
+            &[
+                acceptance(
+                    "crates/fsqlite-harness/tests/ext_real_storage_test.rs",
+                    "rtree_bounding_box_round_trip",
+                    false,
+                ),
+                acceptance(
+                    "crates/fsqlite-harness/tests/bd_1dp9_5_3_rtree_session_icu_misc_wave.rs",
+                    "test_rtree_spatial_differential_wave_with_artifact",
+                    true,
+                ),
+                acceptance(
+                    "crates/fsqlite-e2e/tests/extension_rtree_session_icu_misc_parity.rs",
+                    "rtree_spatial_scenario_rows_match_csqlite",
+                    true,
+                ),
+            ],
+        );
+        attach_tests(
+            &mut entries,
+            ExtensionModule::Session,
+            &[
+                acceptance(
+                    "crates/fsqlite-harness/tests/ext_real_storage_test.rs",
+                    "session_changeset_encode_store_decode",
+                    false,
+                ),
+                acceptance(
+                    "crates/fsqlite-harness/tests/bd_1dp9_5_3_rtree_session_icu_misc_wave.rs",
+                    "test_session_changeset_differential_wave_with_artifact",
+                    true,
+                ),
+                acceptance(
+                    "crates/fsqlite-e2e/tests/extension_rtree_session_icu_misc_parity.rs",
+                    "session_changeset_blob_roundtrip_rows_match_csqlite",
+                    true,
+                ),
+            ],
+        );
+        attach_tests(
+            &mut entries,
+            ExtensionModule::Icu,
+            &[
+                acceptance(
+                    "crates/fsqlite-harness/tests/ext_real_storage_test.rs",
+                    "icu_case_mapping_round_trip",
+                    false,
+                ),
+                acceptance(
+                    "crates/fsqlite-harness/tests/bd_1dp9_5_3_rtree_session_icu_misc_wave.rs",
+                    "test_unit_icu_collation_and_case_invariants",
+                    false,
+                ),
+            ],
+        );
+        attach_tests(
+            &mut entries,
+            ExtensionModule::Misc,
+            &[
+                acceptance(
+                    "crates/fsqlite-harness/tests/ext_real_storage_test.rs",
+                    "misc_decimal_precision_round_trip",
+                    false,
+                ),
+                acceptance(
+                    "crates/fsqlite-harness/tests/ext_real_storage_test.rs",
+                    "misc_uuid_blob_text_conversion_round_trip",
+                    false,
+                ),
+                acceptance(
+                    "crates/fsqlite-harness/tests/bd_1dp9_5_3_rtree_session_icu_misc_wave.rs",
+                    "test_unit_misc_decimal_and_uuid_conversion_invariants",
+                    false,
+                ),
+            ],
+        );
+
         Self {
             schema_version: MATRIX_SCHEMA_VERSION,
             target_sqlite_version: "3.52.0".to_owned(),
@@ -1226,6 +1411,26 @@ impl ExtensionParityMatrix {
                     "Entry {} has omission rationale but status is {:?}",
                     entry.id, entry.status
                 ));
+            }
+            if !needs_omission && entry.acceptance_tests.is_empty() {
+                diagnostics.push(format!(
+                    "Entry {} is {:?} but has no acceptance tests",
+                    entry.id, entry.status
+                ));
+            }
+            for acceptance in &entry.acceptance_tests {
+                if acceptance.module_path.is_empty() {
+                    diagnostics.push(format!(
+                        "Entry {} has acceptance test with empty module_path",
+                        entry.id
+                    ));
+                }
+                if acceptance.test_name.as_deref().is_some_and(str::is_empty) {
+                    diagnostics.push(format!(
+                        "Entry {} has acceptance test with empty test_name",
+                        entry.id
+                    ));
+                }
             }
         }
 
@@ -1287,6 +1492,323 @@ impl ExtensionParityMatrix {
             .values()
             .filter(|e| e.tags.iter().any(|t| tag_set.contains(t.as_str())))
             .collect()
+    }
+
+    /// Build the canonical executable suite plan for this matrix.
+    #[must_use]
+    pub fn execution_plan(&self) -> ExtensionExecutionPlan {
+        ExtensionExecutionPlan::from_matrix(self)
+    }
+}
+
+impl ExtensionExecutionPlan {
+    /// Build the canonical execution plan from the canonical matrix.
+    #[must_use]
+    pub fn canonical() -> Self {
+        let matrix = ExtensionParityMatrix::canonical();
+        Self::from_matrix(&matrix)
+    }
+
+    /// Build an executable suite plan from a specific matrix snapshot.
+    #[must_use]
+    pub fn from_matrix(matrix: &ExtensionParityMatrix) -> Self {
+        let module_entry_ids = |module| {
+            matrix
+                .entries_for_module(module)
+                .into_iter()
+                .map(|entry| entry.id.clone())
+                .collect::<Vec<_>>()
+        };
+        let module_feature_ids = |module| {
+            matrix
+                .entries_for_module(module)
+                .into_iter()
+                .filter_map(|entry| entry.taxonomy_feature_id.clone())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
+        };
+        let module_acceptance_tests = |module| {
+            matrix
+                .entries_for_module(module)
+                .first()
+                .map_or_else(Vec::new, |entry| entry.acceptance_tests.clone())
+        };
+        let module_flags = |module| {
+            matrix
+                .entries_for_module(module)
+                .into_iter()
+                .flat_map(|entry| entry.required_flags.iter().cloned())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
+        };
+
+        Self {
+            schema_version: MATRIX_SCHEMA_VERSION,
+            suites: vec![
+                ExtensionExecutionSuite {
+                    suite_id: "EXT-SUITE-JSON".to_owned(),
+                    module: ExtensionModule::Json,
+                    replay_command: "bash e2e/json_fts_wave_report.sh --json".to_owned(),
+                    artifact_paths: vec![
+                        "test-results/bd_1dp9_5_2/".to_owned(),
+                        "target/bd_1dp9_5_2_runtime/".to_owned(),
+                    ],
+                    scenario_ids: vec!["EXT-1".to_owned(), "EXT-2".to_owned(), "EXT-4".to_owned()],
+                    determinism: vec![
+                        DeterminismContract::FixedSeed(1_095_200_001),
+                        DeterminismContract::DeterministicFixture,
+                    ],
+                    acceptance_tests: module_acceptance_tests(ExtensionModule::Json),
+                    matrix_entry_ids: module_entry_ids(ExtensionModule::Json),
+                    taxonomy_feature_ids: module_feature_ids(ExtensionModule::Json),
+                    enabled_flags: module_flags(ExtensionModule::Json),
+                    disabled_flags: Vec::new(),
+                },
+                ExtensionExecutionSuite {
+                    suite_id: "EXT-SUITE-FTS3".to_owned(),
+                    module: ExtensionModule::Fts3,
+                    replay_command: "bash e2e/fts3_compat_report.sh --json".to_owned(),
+                    artifact_paths: vec![
+                        "test-results/bd_2xl9_fts3_compat_report.jsonl".to_owned(),
+                        "test-results/bd_2xl9_fts3_compat_events.jsonl".to_owned(),
+                    ],
+                    scenario_ids: vec!["EXT-1".to_owned()],
+                    determinism: vec![DeterminismContract::FixedSeed(2_026_022_006)],
+                    acceptance_tests: module_acceptance_tests(ExtensionModule::Fts3),
+                    matrix_entry_ids: module_entry_ids(ExtensionModule::Fts3),
+                    taxonomy_feature_ids: module_feature_ids(ExtensionModule::Fts3),
+                    enabled_flags: module_flags(ExtensionModule::Fts3),
+                    disabled_flags: Vec::new(),
+                },
+                ExtensionExecutionSuite {
+                    suite_id: "EXT-SUITE-FTS5".to_owned(),
+                    module: ExtensionModule::Fts5,
+                    replay_command: "bash e2e/json_fts_wave_report.sh --json".to_owned(),
+                    artifact_paths: vec![
+                        "test-results/bd_1dp9_5_2/".to_owned(),
+                        "target/bd_1dp9_5_2_runtime/".to_owned(),
+                    ],
+                    scenario_ids: vec!["EXT-1".to_owned(), "EXT-2".to_owned(), "EXT-4".to_owned()],
+                    determinism: vec![
+                        DeterminismContract::FixedSeed(1_095_200_001),
+                        DeterminismContract::DeterministicFixture,
+                    ],
+                    acceptance_tests: module_acceptance_tests(ExtensionModule::Fts5),
+                    matrix_entry_ids: module_entry_ids(ExtensionModule::Fts5),
+                    taxonomy_feature_ids: module_feature_ids(ExtensionModule::Fts5),
+                    enabled_flags: module_flags(ExtensionModule::Fts5),
+                    disabled_flags: Vec::new(),
+                },
+                ExtensionExecutionSuite {
+                    suite_id: "EXT-SUITE-RTREE".to_owned(),
+                    module: ExtensionModule::Rtree,
+                    replay_command: "bash e2e/extension_integrated_wave_report.sh --json"
+                        .to_owned(),
+                    artifact_paths: vec![
+                        "test-results/bd_1dp9_5_4/".to_owned(),
+                        "target/bd_1dp9_5_3_runtime/".to_owned(),
+                        "target/bd_1dp9_5_3_e2e_runtime/".to_owned(),
+                    ],
+                    scenario_ids: vec![
+                        "EXT-1".to_owned(),
+                        "EXT-2".to_owned(),
+                        "EXT-3".to_owned(),
+                        "EXT-4".to_owned(),
+                        "EXT-5".to_owned(),
+                    ],
+                    determinism: vec![
+                        DeterminismContract::FixedSeed(1_095_400_001),
+                        DeterminismContract::DeterministicFixture,
+                    ],
+                    acceptance_tests: module_acceptance_tests(ExtensionModule::Rtree),
+                    matrix_entry_ids: module_entry_ids(ExtensionModule::Rtree),
+                    taxonomy_feature_ids: module_feature_ids(ExtensionModule::Rtree),
+                    enabled_flags: module_flags(ExtensionModule::Rtree),
+                    disabled_flags: vec!["ext-geopoly".to_owned()],
+                },
+                ExtensionExecutionSuite {
+                    suite_id: "EXT-SUITE-SESSION".to_owned(),
+                    module: ExtensionModule::Session,
+                    replay_command: "bash e2e/extension_integrated_wave_report.sh --json"
+                        .to_owned(),
+                    artifact_paths: vec![
+                        "test-results/bd_1dp9_5_4/".to_owned(),
+                        "target/bd_1dp9_5_3_runtime/".to_owned(),
+                        "target/bd_1dp9_5_3_e2e_runtime/".to_owned(),
+                    ],
+                    scenario_ids: vec![
+                        "EXT-1".to_owned(),
+                        "EXT-2".to_owned(),
+                        "EXT-3".to_owned(),
+                        "EXT-4".to_owned(),
+                        "EXT-5".to_owned(),
+                    ],
+                    determinism: vec![
+                        DeterminismContract::FixedSeed(1_095_400_002),
+                        DeterminismContract::DeterministicFixture,
+                    ],
+                    acceptance_tests: module_acceptance_tests(ExtensionModule::Session),
+                    matrix_entry_ids: module_entry_ids(ExtensionModule::Session),
+                    taxonomy_feature_ids: module_feature_ids(ExtensionModule::Session),
+                    enabled_flags: module_flags(ExtensionModule::Session),
+                    disabled_flags: Vec::new(),
+                },
+                ExtensionExecutionSuite {
+                    suite_id: "EXT-SUITE-ICU".to_owned(),
+                    module: ExtensionModule::Icu,
+                    replay_command: "bash e2e/extension_integrated_wave_report.sh --json"
+                        .to_owned(),
+                    artifact_paths: vec![
+                        "test-results/bd_1dp9_5_4/".to_owned(),
+                        "target/bd_1dp9_5_3_runtime/".to_owned(),
+                    ],
+                    scenario_ids: vec!["EXT-3".to_owned(), "EXT-5".to_owned()],
+                    determinism: vec![DeterminismContract::DeterministicFixture],
+                    acceptance_tests: module_acceptance_tests(ExtensionModule::Icu),
+                    matrix_entry_ids: module_entry_ids(ExtensionModule::Icu),
+                    taxonomy_feature_ids: module_feature_ids(ExtensionModule::Icu),
+                    enabled_flags: module_flags(ExtensionModule::Icu),
+                    disabled_flags: Vec::new(),
+                },
+                ExtensionExecutionSuite {
+                    suite_id: "EXT-SUITE-MISC".to_owned(),
+                    module: ExtensionModule::Misc,
+                    replay_command: "bash e2e/extension_integrated_wave_report.sh --json"
+                        .to_owned(),
+                    artifact_paths: vec![
+                        "test-results/bd_1dp9_5_4/".to_owned(),
+                        "target/bd_1dp9_5_3_runtime/".to_owned(),
+                    ],
+                    scenario_ids: vec!["EXT-3".to_owned(), "EXT-5".to_owned()],
+                    determinism: vec![DeterminismContract::DeterministicFixture],
+                    acceptance_tests: module_acceptance_tests(ExtensionModule::Misc),
+                    matrix_entry_ids: module_entry_ids(ExtensionModule::Misc),
+                    taxonomy_feature_ids: module_feature_ids(ExtensionModule::Misc),
+                    enabled_flags: module_flags(ExtensionModule::Misc),
+                    disabled_flags: Vec::new(),
+                },
+            ],
+        }
+    }
+
+    /// Validate suite/ledger consistency against the matrix.
+    #[must_use]
+    pub fn validate(&self, matrix: &ExtensionParityMatrix) -> Vec<String> {
+        let mut diagnostics = Vec::new();
+        let mut seen_suite_ids = BTreeSet::new();
+        let mut seen_modules = BTreeSet::new();
+        let known_flags: BTreeSet<&str> = matrix
+            .feature_flags
+            .flags
+            .keys()
+            .map(String::as_str)
+            .collect();
+
+        for suite in &self.suites {
+            if !seen_suite_ids.insert(suite.suite_id.as_str()) {
+                diagnostics.push(format!("Duplicate suite_id {}", suite.suite_id));
+            }
+            seen_modules.insert(suite.module);
+
+            if suite.replay_command.is_empty() {
+                diagnostics.push(format!("Suite {} has empty replay_command", suite.suite_id));
+            }
+            if suite.artifact_paths.is_empty() {
+                diagnostics.push(format!("Suite {} has no artifact paths", suite.suite_id));
+            }
+            if suite.scenario_ids.is_empty() {
+                diagnostics.push(format!("Suite {} has no scenario IDs", suite.suite_id));
+            }
+            if suite.determinism.is_empty() {
+                diagnostics.push(format!(
+                    "Suite {} has no determinism contract",
+                    suite.suite_id
+                ));
+            }
+            if suite.acceptance_tests.is_empty() {
+                diagnostics.push(format!("Suite {} has no acceptance tests", suite.suite_id));
+            }
+            if suite.matrix_entry_ids.is_empty() {
+                diagnostics.push(format!("Suite {} has no matrix entry IDs", suite.suite_id));
+            }
+            if suite.taxonomy_feature_ids.is_empty() {
+                diagnostics.push(format!(
+                    "Suite {} has no taxonomy feature IDs",
+                    suite.suite_id
+                ));
+            }
+
+            let module_entry_ids: BTreeSet<String> = matrix
+                .entries_for_module(suite.module)
+                .into_iter()
+                .map(|entry| entry.id.clone())
+                .collect();
+            for entry_id in &suite.matrix_entry_ids {
+                if !module_entry_ids.contains(entry_id) {
+                    diagnostics.push(format!(
+                        "Suite {} references entry {} outside module {:?}",
+                        suite.suite_id, entry_id, suite.module
+                    ));
+                }
+            }
+
+            let module_feature_ids: BTreeSet<FeatureId> = matrix
+                .entries_for_module(suite.module)
+                .into_iter()
+                .filter_map(|entry| entry.taxonomy_feature_id.clone())
+                .collect();
+            for feature_id in &suite.taxonomy_feature_ids {
+                if !module_feature_ids.contains(feature_id) {
+                    diagnostics.push(format!(
+                        "Suite {} references feature {} outside module {:?}",
+                        suite.suite_id, feature_id, suite.module
+                    ));
+                }
+            }
+
+            for flag in suite
+                .enabled_flags
+                .iter()
+                .chain(suite.disabled_flags.iter())
+            {
+                if !known_flags.contains(flag.as_str()) {
+                    diagnostics.push(format!(
+                        "Suite {} references unknown flag {}",
+                        suite.suite_id, flag
+                    ));
+                }
+            }
+        }
+
+        for module in ExtensionModule::ALL {
+            if !seen_modules.contains(&module) {
+                diagnostics.push(format!("Missing execution suite for module {module:?}"));
+            }
+        }
+
+        let disabled_by_default: BTreeSet<String> = matrix
+            .feature_flags
+            .flags
+            .values()
+            .filter(|flag| !flag.enabled_by_default)
+            .map(|flag| flag.name.clone())
+            .collect();
+        let covered_disabled_flags: BTreeSet<String> = self
+            .suites
+            .iter()
+            .flat_map(|suite| suite.disabled_flags.iter().cloned())
+            .collect();
+        for flag in disabled_by_default {
+            if !covered_disabled_flags.contains(&flag) {
+                diagnostics.push(format!(
+                    "No execution suite asserts disabled-mode coverage for {flag}"
+                ));
+            }
+        }
+
+        diagnostics
     }
 }
 

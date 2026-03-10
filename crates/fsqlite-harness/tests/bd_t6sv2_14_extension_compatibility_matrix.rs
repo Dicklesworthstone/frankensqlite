@@ -13,8 +13,8 @@
 //! - Conformance summary
 
 use fsqlite_harness::extension_parity_matrix::{
-    ExtensionModule, ExtensionParityMatrix, FeatureFlagTable, MATRIX_SCHEMA_VERSION, SurfaceKind,
-    compute_extension_coverage,
+    ExtensionExecutionPlan, ExtensionModule, ExtensionParityMatrix, FeatureFlagTable,
+    MATRIX_SCHEMA_VERSION, SurfaceKind, compute_extension_coverage,
 };
 use fsqlite_harness::parity_taxonomy::ParityStatus;
 
@@ -138,6 +138,102 @@ fn canonical_matrix_construction_and_validation() {
         assert!(!entry.id.is_empty());
         assert!(!entry.name.is_empty());
         assert!(!entry.expected_behavior.is_empty());
+    }
+}
+
+#[test]
+fn canonical_execution_plan_construction_and_validation() {
+    let matrix = ExtensionParityMatrix::canonical();
+    let plan = matrix.execution_plan();
+
+    assert_eq!(plan.schema_version, MATRIX_SCHEMA_VERSION);
+    let diagnostics = plan.validate(&matrix);
+    assert!(
+        diagnostics.is_empty(),
+        "canonical execution plan should validate: {diagnostics:?}"
+    );
+}
+
+#[test]
+fn canonical_execution_plan_covers_all_modules() {
+    let plan = ExtensionExecutionPlan::canonical();
+    assert_eq!(plan.suites.len(), ExtensionModule::ALL.len());
+
+    for module in ExtensionModule::ALL {
+        let suites: Vec<_> = plan
+            .suites
+            .iter()
+            .filter(|suite| suite.module == module)
+            .collect();
+        assert_eq!(
+            suites.len(),
+            1,
+            "expected exactly one canonical suite for {module:?}, got {}",
+            suites.len()
+        );
+        let suite = suites[0];
+        assert!(
+            !suite.replay_command.is_empty(),
+            "suite for {module:?} must have replay command"
+        );
+        assert!(
+            !suite.artifact_paths.is_empty(),
+            "suite for {module:?} must declare artifact paths"
+        );
+        assert!(
+            !suite.acceptance_tests.is_empty(),
+            "suite for {module:?} must declare acceptance tests"
+        );
+    }
+}
+
+#[test]
+fn execution_plan_traces_to_matrix_entries_and_feature_ids() {
+    let matrix = ExtensionParityMatrix::canonical();
+    let plan = matrix.execution_plan();
+
+    for suite in &plan.suites {
+        let module_entries = matrix.entries_for_module(suite.module);
+        let module_entry_ids = module_entries
+            .iter()
+            .map(|entry| entry.id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        let module_feature_ids = module_entries
+            .iter()
+            .filter_map(|entry| entry.taxonomy_feature_id.as_ref())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        for entry_id in &suite.matrix_entry_ids {
+            assert!(
+                module_entry_ids.contains(entry_id.as_str()),
+                "suite {} references out-of-module entry {}",
+                suite.suite_id,
+                entry_id
+            );
+        }
+        for feature_id in &suite.taxonomy_feature_ids {
+            assert!(
+                module_feature_ids.contains(feature_id),
+                "suite {} references out-of-module feature {}",
+                suite.suite_id,
+                feature_id
+            );
+        }
+    }
+}
+
+#[test]
+fn executable_entries_have_acceptance_tests() {
+    let matrix = ExtensionParityMatrix::canonical();
+    for entry in matrix.entries.values() {
+        if matches!(entry.status, ParityStatus::Missing | ParityStatus::Excluded) {
+            continue;
+        }
+        assert!(
+            !entry.acceptance_tests.is_empty(),
+            "executable extension entry {} must have acceptance tests",
+            entry.id
+        );
     }
 }
 

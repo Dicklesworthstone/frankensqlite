@@ -6,6 +6,8 @@
 # mixed_read_write hot-path profile across the pinned Beads fixture copies in
 # both MVCC and forced single-writer modes, then aggregates the per-run
 # `profile.json` + `actionable_ranking.json` bundles into a bead-level ledger.
+# Default profile is `release` for worker survivability; override with
+# `CARGO_PROFILE=release-perf` when the worker fleet has headroom for it.
 #
 # Outputs:
 #   artifacts/perf/bd-db300.4.1/inline/
@@ -24,10 +26,11 @@ WORKSPACE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BEAD_ID="bd-db300.4.1"
 RUN_ID="${BEAD_ID}-$(date -u +%Y%m%dT%H%M%SZ)-$$"
 GENERATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-GOLDEN_DIR_DEFAULT="${WORKSPACE_ROOT}/sample_sqlite_db_files/working/beads_bench_20260310/golden"
-GOLDEN_DIR="${GOLDEN_DIR:-${GOLDEN_DIR_DEFAULT}}"
+SOURCE_GOLDEN_DIR_DEFAULT="${WORKSPACE_ROOT}/sample_sqlite_db_files/working/beads_bench_20260310/golden"
+SOURCE_GOLDEN_DIR="${GOLDEN_DIR:-${SOURCE_GOLDEN_DIR_DEFAULT}}"
 OUTPUT_DIR="${OUTPUT_DIR:-${WORKSPACE_ROOT}/artifacts/perf/${BEAD_ID}/inline}"
 RUNS_DIR="${OUTPUT_DIR}/runs"
+SYNC_GOLDEN_DIR="${SYNC_GOLDEN_DIR:-${OUTPUT_DIR}/golden}"
 LOG_FILE="${OUTPUT_DIR}/events.jsonl"
 RUN_RECORDS_JSONL="${OUTPUT_DIR}/run_records.jsonl"
 SCENARIO_PROFILES_JSON="${OUTPUT_DIR}/scenario_profiles.json"
@@ -39,8 +42,11 @@ WORKLOAD_ID="mixed_read_write"
 CONCURRENCY="${CONCURRENCY:-4}"
 SEED="${SEED:-42}"
 SCALE="${SCALE:-50}"
-CARGO_PROFILE="${CARGO_PROFILE:-release-perf}"
+CARGO_PROFILE="${CARGO_PROFILE:-release}"
 RCH_TARGET_DIR="${RCH_TARGET_DIR:-/tmp/rch_target_bd_db300_4_1}"
+HOT_PATH_PROFILE_SCHEMA="fsqlite-e2e.hot_path_profile.v1"
+HOT_PATH_PROFILE_MANIFEST_SCHEMA="fsqlite-e2e.hot_path_profile_manifest.v1"
+HOT_PATH_ACTIONABLE_RANKING_SCHEMA="fsqlite-e2e.hot_path_actionable_ranking.v1"
 
 mkdir -p "${RUNS_DIR}"
 : > "${LOG_FILE}"
@@ -73,6 +79,47 @@ require_file() {
     [[ -f "${path}" ]] || fail "inputs" "missing required file: ${path}"
 }
 
+require_nonempty_file() {
+    local path="$1"
+    [[ -s "${path}" ]] || fail "inputs" "missing or empty required file: ${path}"
+}
+
+require_json_schema() {
+    local path="$1"
+    local schema="$2"
+
+    require_nonempty_file "${path}"
+    jq -e --arg schema "${schema}" '
+        type == "object" and .schema_version == $schema
+    ' "${path}" > /dev/null \
+        || fail "inputs" "invalid schema in ${path}; expected ${schema}"
+}
+
+preseed_output_bundle() {
+    local scenario_dir="$1"
+
+    mkdir -p "${scenario_dir}"
+    : > "${scenario_dir}/profile.json"
+    : > "${scenario_dir}/actionable_ranking.json"
+    : > "${scenario_dir}/summary.md"
+    : > "${scenario_dir}/manifest.json"
+}
+
+copy_fixture_seed() {
+    local fixture_id="$1"
+    local source_db="${SOURCE_GOLDEN_DIR}/${fixture_id}.db"
+    local dest_db="${SYNC_GOLDEN_DIR}/${fixture_id}.db"
+
+    require_file "${source_db}"
+    mkdir -p "${SYNC_GOLDEN_DIR}"
+    cp "${source_db}" "${dest_db}"
+    for suffix in -wal -shm -journal; do
+        if [[ -f "${source_db}${suffix}" ]]; then
+            cp "${source_db}${suffix}" "${dest_db}${suffix}"
+        fi
+    done
+}
+
 mode_cli_flag() {
     local mode_id="$1"
     case "${mode_id}" in
@@ -102,7 +149,7 @@ discover_fixture_ids() {
         return
     fi
 
-    find "${GOLDEN_DIR}" -maxdepth 1 -type f -name '*.db' -printf '%f\n' \
+    find "${SOURCE_GOLDEN_DIR}" -maxdepth 1 -type f -name '*.db' -printf '%f\n' \
         | sed 's/\.db$//' \
         | sort
 }
@@ -133,7 +180,8 @@ capture_run_record() {
         --arg stdout_log "${stdout_log}" \
         --arg stderr_log "${stderr_log}" \
         --arg engine_label "$(mode_engine_label "${mode_id}")" \
-        --arg golden_dir "${GOLDEN_DIR}" \
+        --arg source_golden_dir "${SOURCE_GOLDEN_DIR}" \
+        --arg sync_golden_dir "${SYNC_GOLDEN_DIR}" \
         --arg cargo_profile "${CARGO_PROFILE}" \
         --argjson concurrency "${CONCURRENCY}" \
         --argjson seed "${SEED}" \
@@ -152,7 +200,8 @@ capture_run_record() {
             seed: $seed,
             scale: $scale,
             cargo_profile: $cargo_profile,
-            golden_dir: $golden_dir,
+            source_golden_dir: $source_golden_dir,
+            sync_golden_dir: $sync_golden_dir,
             output_dir: $output_dir,
             stdout_log: $stdout_log,
             stderr_log: $stderr_log,
@@ -175,6 +224,7 @@ run_hot_profile() {
     cli_flag="$(mode_cli_flag "${mode_id}")"
 
     mkdir -p "${scenario_dir}"
+    preseed_output_bundle "${scenario_dir}"
     log_event "INFO" "run" "starting ${scenario_id} fixture=${fixture_id} mode=${mode_id}"
 
     if ! rch exec -- env CARGO_TARGET_DIR="${RCH_TARGET_DIR}" cargo run \
@@ -182,7 +232,7 @@ run_hot_profile() {
         --profile "${CARGO_PROFILE}" \
         --bin realdb-e2e \
         -- hot-profile \
-        --golden-dir "${GOLDEN_DIR}" \
+        --golden-dir "${SYNC_GOLDEN_DIR}" \
         --db "${fixture_id}" \
         --concurrency "${CONCURRENCY}" \
         --seed "${SEED}" \
@@ -194,10 +244,10 @@ run_hot_profile() {
         fail "run" "hot-profile failed for fixture=${fixture_id} mode=${mode_id}; see ${stderr_log}"
     fi
 
-    require_file "${scenario_dir}/profile.json"
-    require_file "${scenario_dir}/actionable_ranking.json"
-    require_file "${scenario_dir}/summary.md"
-    require_file "${scenario_dir}/manifest.json"
+    require_json_schema "${scenario_dir}/profile.json" "${HOT_PATH_PROFILE_SCHEMA}"
+    require_json_schema "${scenario_dir}/actionable_ranking.json" "${HOT_PATH_ACTIONABLE_RANKING_SCHEMA}"
+    require_nonempty_file "${scenario_dir}/summary.md"
+    require_json_schema "${scenario_dir}/manifest.json" "${HOT_PATH_PROFILE_MANIFEST_SCHEMA}"
     capture_run_record "${scenario_id}" "${fixture_id}" "${mode_id}" "${scenario_dir}" "${stdout_log}" "${stderr_log}"
     log_event "INFO" "run" "completed ${scenario_id} fixture=${fixture_id} mode=${mode_id}"
 }
@@ -207,7 +257,8 @@ build_scenario_profiles() {
         --arg bead_id "${BEAD_ID}" \
         --arg run_id "${RUN_ID}" \
         --arg generated_at "${GENERATED_AT}" \
-        --arg golden_dir "${GOLDEN_DIR}" \
+        --arg source_golden_dir "${SOURCE_GOLDEN_DIR}" \
+        --arg sync_golden_dir "${SYNC_GOLDEN_DIR}" \
         --arg workload "${WORKLOAD_ID}" \
         '
         {
@@ -215,7 +266,8 @@ build_scenario_profiles() {
             bead_id: $bead_id,
             run_id: $run_id,
             generated_at: $generated_at,
-            golden_dir: $golden_dir,
+            source_golden_dir: $source_golden_dir,
+            sync_golden_dir: $sync_golden_dir,
             workload: $workload,
             runs: .
         }
@@ -227,7 +279,8 @@ build_benchmark_context() {
         --arg bead_id "${BEAD_ID}" \
         --arg run_id "${RUN_ID}" \
         --arg generated_at "${GENERATED_AT}" \
-        --arg golden_dir "${GOLDEN_DIR}" \
+        --arg source_golden_dir "${SOURCE_GOLDEN_DIR}" \
+        --arg sync_golden_dir "${SYNC_GOLDEN_DIR}" \
         --arg workload "${WORKLOAD_ID}" \
         '
         {
@@ -235,7 +288,8 @@ build_benchmark_context() {
             bead_id: $bead_id,
             run_id: $run_id,
             generated_at: $generated_at,
-            golden_dir: $golden_dir,
+            source_golden_dir: $source_golden_dir,
+            sync_golden_dir: $sync_golden_dir,
             workload: $workload,
             runs: [
                 .[] | {
@@ -421,7 +475,8 @@ build_summary_md() {
 
 - run_id: \`${RUN_ID}\`
 - generated_at: \`${GENERATED_AT}\`
-- golden_dir: \`${GOLDEN_DIR}\`
+- source_golden_dir: \`${SOURCE_GOLDEN_DIR}\`
+- sync_golden_dir: \`${SYNC_GOLDEN_DIR}\`
 - replay_command: \`bash scripts/verify_bd_db300_4_1_hot_path_profiles.sh\`
 - cargo_profile: \`${CARGO_PROFILE}\`
 - workload: \`${WORKLOAD_ID}\`
@@ -460,7 +515,8 @@ build_report_json() {
         --arg bead_id "${BEAD_ID}" \
         --arg run_id "${RUN_ID}" \
         --arg generated_at "${GENERATED_AT}" \
-        --arg golden_dir "${GOLDEN_DIR}" \
+        --arg source_golden_dir "${SOURCE_GOLDEN_DIR}" \
+        --arg sync_golden_dir "${SYNC_GOLDEN_DIR}" \
         --arg output_dir "${OUTPUT_DIR}" \
         --arg replay_command "bash scripts/verify_bd_db300_4_1_hot_path_profiles.sh" \
         --arg structured_log "${LOG_FILE}" \
@@ -482,7 +538,8 @@ build_report_json() {
             run_id: $run_id,
             generated_at: $generated_at,
             workload: $workload,
-            golden_dir: $golden_dir,
+            source_golden_dir: $source_golden_dir,
+            sync_golden_dir: $sync_golden_dir,
             output_dir: $output_dir,
             cargo_profile: $cargo_profile,
             concurrency: $concurrency,
@@ -509,16 +566,21 @@ build_report_json() {
 }
 
 log_event "INFO" "start" "starting inline D1 hot-path campaign"
-require_dir "${GOLDEN_DIR}"
+require_dir "${SOURCE_GOLDEN_DIR}"
 
 mapfile -t FIXTURE_IDS_ARRAY < <(discover_fixture_ids)
 mapfile -t MODE_IDS_ARRAY < <(discover_mode_ids)
 
-(( ${#FIXTURE_IDS_ARRAY[@]} > 0 )) || fail "inputs" "no fixture ids discovered under ${GOLDEN_DIR}"
+(( ${#FIXTURE_IDS_ARRAY[@]} > 0 )) || fail "inputs" "no fixture ids discovered under ${SOURCE_GOLDEN_DIR}"
 (( ${#MODE_IDS_ARRAY[@]} > 0 )) || fail "inputs" "no mode ids configured"
 
 expected_runs=$(( ${#FIXTURE_IDS_ARRAY[@]} * ${#MODE_IDS_ARRAY[@]} ))
 log_event "INFO" "plan" "fixtures=${#FIXTURE_IDS_ARRAY[@]} modes=${#MODE_IDS_ARRAY[@]} expected_runs=${expected_runs}"
+
+for fixture_id in "${FIXTURE_IDS_ARRAY[@]}"; do
+    copy_fixture_seed "${fixture_id}"
+done
+log_event "INFO" "inputs" "prepared synced fixture seed directory at ${SYNC_GOLDEN_DIR}"
 
 for mode_id in "${MODE_IDS_ARRAY[@]}"; do
     for fixture_id in "${FIXTURE_IDS_ARRAY[@]}"; do
@@ -539,7 +601,8 @@ jq -e '.runs | length == '"${expected_runs}" "${BENCHMARK_CONTEXT_JSON}" >/dev/n
 
 log_event "INFO" "complete" "inline D1 hot-path campaign completed"
 echo "RUN_ID:              ${RUN_ID}"
-echo "Golden dir:          ${GOLDEN_DIR}"
+echo "Source golden dir:   ${SOURCE_GOLDEN_DIR}"
+echo "Synced golden dir:   ${SYNC_GOLDEN_DIR}"
 echo "Run records:         ${RUN_RECORDS_JSONL}"
 echo "Scenario profiles:   ${SCENARIO_PROFILES_JSON}"
 echo "Actionable ranking:  ${ACTIONABLE_RANKING_JSON}"

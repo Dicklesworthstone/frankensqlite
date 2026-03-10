@@ -1,12 +1,13 @@
 //! Extension integration tests on real file-backed storage (bd-mblr.2.4).
 //!
-//! Exercises JSON, FTS3/FTS5, R-tree, session, and misc extension crate APIs
+//! Exercises JSON, FTS3/FTS5, R-tree, session, ICU, and misc extension crate APIs
 //! using data stored in file-backed databases. Each test creates a temp directory,
 //! opens a file-backed connection, writes data, closes, reopens, and verifies
 //! integrity after the round-trip.
 
 use fsqlite::Connection;
 use fsqlite_ext_fts5::{Fts5Tokenizer, Unicode61Tokenizer};
+use fsqlite_ext_icu::{IcuLowerFunc, IcuUpperFunc};
 use fsqlite_ext_json as json_ext;
 use fsqlite_ext_rtree as rtree_ext;
 use fsqlite_ext_session as session_ext;
@@ -488,7 +489,75 @@ fn session_patchset_round_trip() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// §4  Misc Extension — Decimal and UUID with Real Storage
+// §4  ICU Extension — Locale-Aware Case Mapping on Real Storage
+// ═══════════════════════════════════════════════════════════════════════
+
+#[test]
+fn icu_case_mapping_round_trip() {
+    let (_dir, path) = temp_db();
+
+    let upper = IcuUpperFunc
+        .invoke(&[
+            SqliteValue::Text("straße".to_owned()),
+            SqliteValue::Text("de_DE".to_owned()),
+        ])
+        .expect("icu_upper");
+    let lower = IcuLowerFunc
+        .invoke(&[
+            SqliteValue::Text("Iİ".to_owned()),
+            SqliteValue::Text("tr_TR".to_owned()),
+        ])
+        .expect("icu_lower");
+
+    let upper_text = match upper {
+        SqliteValue::Text(text) => text,
+        other => panic!("expected Text from icu_upper, got {other:?}"),
+    };
+    let lower_text = match lower {
+        SqliteValue::Text(text) => text,
+        other => panic!("expected Text from icu_lower, got {other:?}"),
+    };
+
+    {
+        let conn = Connection::open(&path).expect("open");
+        conn.execute(
+            "CREATE TABLE icu_case_map (id INTEGER PRIMARY KEY, locale TEXT, transformed TEXT)",
+        )
+        .expect("create");
+        conn.execute(&format!(
+            "INSERT INTO icu_case_map VALUES (1, 'de_DE', '{}')",
+            upper_text.replace('\'', "''")
+        ))
+        .expect("insert upper");
+        conn.execute(&format!(
+            "INSERT INTO icu_case_map VALUES (2, 'tr_TR', '{}')",
+            lower_text.replace('\'', "''")
+        ))
+        .expect("insert lower");
+    }
+
+    {
+        let conn = Connection::open(&path).expect("reopen");
+        assert_eq!(
+            query_col_text(
+                &conn,
+                "SELECT transformed FROM icu_case_map WHERE locale = 'de_DE'"
+            ),
+            "STRASSE"
+        );
+        assert_eq!(
+            query_col_text(
+                &conn,
+                "SELECT transformed FROM icu_case_map WHERE locale = 'tr_TR'"
+            ),
+            "ıi"
+        );
+    }
+
+    eprintln!("[{BEAD_ID}][test=icu_case_mapping_round_trip] PASS");
+}
+// ═══════════════════════════════════════════════════════════════════════
+// §5  Misc Extension — Decimal and UUID with Real Storage
 // ═══════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -606,7 +675,7 @@ fn misc_uuid_blob_text_conversion_round_trip() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// §5  FTS5 Extension — Tokenizer APIs with Stored Text
+// §6  FTS5 Extension — Tokenizer APIs with Stored Text
 // ═══════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -688,7 +757,7 @@ fn fts3_query_parsing_on_stored_content() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// §6  Cross-Extension Integration — Multiple Extensions on Same DB
+// §7  Cross-Extension Integration — Multiple Extensions on Same DB
 // ═══════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -787,7 +856,7 @@ fn multi_extension_data_on_single_db() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// §7  Multiple Reopen Cycles
+// §8  Multiple Reopen Cycles
 // ═══════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -844,7 +913,7 @@ fn multiple_reopen_cycles_preserve_extension_data() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// §8  Large Data Integrity
+// §9  Large Data Integrity
 // ═══════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -885,7 +954,7 @@ fn large_json_document_storage_integrity() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// §9  JSONB Binary Encoding Round-Trip
+// §10  JSONB Binary Encoding Round-Trip
 // ═══════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -925,7 +994,7 @@ fn jsonb_blob_storage_round_trip() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// §10  Session Concat and Multi-Table Changeset
+// §11  Session Concat and Multi-Table Changeset
 // ═══════════════════════════════════════════════════════════════════════
 
 #[test]

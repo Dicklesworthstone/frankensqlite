@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use fsqlite_core::wal_adapter::WalBackendAdapter;
-use fsqlite_pager::{JournalMode, MvccPager, SimplePager, TransactionMode};
+use fsqlite_pager::{JournalMode, MvccPager, SimplePager, TransactionHandle, TransactionMode};
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::VfsOpenFlags;
 use fsqlite_types::{PageNumber, PageSize};
@@ -529,6 +529,12 @@ fn test_e2e_bd_db300_3_1_batch_wal_append_verification() -> Result<(), String> {
     };
 
     write_report(&report_path, &report)?;
+    let report_json = serde_json::to_string_pretty(&report)
+        .map_err(|error| format!("bead_id={BEAD_ID} case=serialize_report_stdout error={error}"))?;
+
+    println!("BEGIN_BD_DB300_3_1_REPORT");
+    println!("{report_json}");
+    println!("END_BD_DB300_3_1_REPORT");
 
     eprintln!(
         "INFO bead_id={BEAD_ID} phase=artifact_written run_id={} trace_id={} scenario_id={} artifact_path={}",

@@ -88,9 +88,13 @@ fn test_bd_db300_7_3_required_campaign_surface_exists() -> Result<(), String> {
         ));
     }
 
-    let expected_profiles = ["baseline_unpinned", "recommended_pinned", "adversarial_cross_node"]
-        .into_iter()
-        .collect::<BTreeSet<_>>();
+    let expected_profiles = [
+        "baseline_unpinned",
+        "recommended_pinned",
+        "adversarial_cross_node",
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
     let actual_profiles = criteria
         .campaign
         .required_placement_profiles
@@ -124,7 +128,9 @@ fn test_bd_db300_7_3_cell_targets_are_monotone() -> Result<(), String> {
         && c4.recommended_min_throughput_ratio_vs_sqlite
             < c8.recommended_min_throughput_ratio_vs_sqlite)
     {
-        return Err("recommended throughput targets must strictly increase c1 < c4 < c8".to_owned());
+        return Err(
+            "recommended throughput targets must strictly increase c1 < c4 < c8".to_owned(),
+        );
     }
 
     if !(c1.baseline_catastrophic_floor_ratio_vs_sqlite
@@ -140,7 +146,9 @@ fn test_bd_db300_7_3_cell_targets_are_monotone() -> Result<(), String> {
         && c4.adversarial_catastrophic_floor_ratio_vs_sqlite
             > c8.adversarial_catastrophic_floor_ratio_vs_sqlite)
     {
-        return Err("adversarial catastrophic floors must get looser as concurrency rises".to_owned());
+        return Err(
+            "adversarial catastrophic floors must get looser as concurrency rises".to_owned(),
+        );
     }
 
     if !(c1.max_retry_rate < c4.max_retry_rate && c4.max_retry_rate < c8.max_retry_rate) {
@@ -187,9 +195,7 @@ fn test_bd_db300_7_3_verification_plan_is_actionable() -> Result<(), String> {
         .collect::<BTreeSet<_>>();
     for required_field in REQUIRED_LOG_FIELDS {
         if !log_fields.contains(required_field) {
-            return Err(format!(
-                "required log field missing field={required_field}"
-            ));
+            return Err(format!("required log field missing field={required_field}"));
         }
     }
 

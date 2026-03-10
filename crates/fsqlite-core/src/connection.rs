@@ -1006,7 +1006,7 @@ impl PreparedStatement<'_> {
             .as_ref()
             .map(|p| {
                 self.conn
-                    .begin_pager_txn_with_busy_timeout(p, op_cx, TransactionMode::Deferred)
+                    .begin_pager_txn_with_busy_timeout(p, op_cx, TransactionMode::ReadOnly)
             })
             .transpose()?;
         let (result, mut txn_back) = execute_table_program_with_db(
@@ -3300,7 +3300,7 @@ impl Connection {
         } else if is_write {
             self.ensure_autocommit_txn()?
         } else {
-            self.ensure_autocommit_txn_mode(TransactionMode::Deferred)?
+            self.ensure_autocommit_txn_mode(TransactionMode::ReadOnly)?
         };
         if !is_txn_control {
             if is_write {
@@ -34072,22 +34072,30 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("bd_rjc_single_account_probe.db");
         let db = db_path.to_string_lossy().to_string();
-
-        {
+        let table_root_page = {
             let conn = Connection::open(&db).unwrap();
             conn.execute("PRAGMA busy_timeout=5000;").unwrap();
             conn.execute("PRAGMA fsqlite.concurrent_mode=ON;").unwrap();
             conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL);")
                 .unwrap();
+            let root_page = conn
+                .schema
+                .borrow()
+                .iter()
+                .find(|table| table.name.eq_ignore_ascii_case("t"))
+                .map(|table| table.root_page)
+                .expect("table t should exist after CREATE TABLE");
             conn.execute("INSERT INTO t (id, v) VALUES (1, 0);")
                 .unwrap();
-        }
+            root_page
+        };
 
         let start_barrier = Arc::new(std::sync::Barrier::new(WORKERS));
         let mut handles = Vec::with_capacity(WORKERS);
         for _worker_id in 0..WORKERS {
             let db = db.clone();
             let barrier = Arc::clone(&start_barrier);
+            let table_root_page = table_root_page;
             handles.push(std::thread::spawn(move || -> u64 {
                 let conn = Connection::open(&db).unwrap();
                 conn.execute("PRAGMA busy_timeout=5000;").unwrap();
@@ -34114,6 +34122,24 @@ mod tests {
                                 assert!(
                                     concurrent_write_set_len > 0,
                                     "UPDATE reported success but concurrent write set is empty"
+                                );
+                                let root_page_tracked = {
+                                    let registry = lock_unpoisoned(&conn.concurrent_registry);
+                                    registry
+                                        .get(session_id)
+                                        .expect("concurrent session handle missing after UPDATE")
+                                        .write_set_pages()
+                                        .contains(
+                                            &fsqlite_types::PageNumber::new(
+                                                u32::try_from(table_root_page)
+                                                    .expect("root page should fit in u32"),
+                                            )
+                                            .expect("root page should be valid"),
+                                        )
+                                };
+                                assert!(
+                                    root_page_tracked,
+                                    "UPDATE reported success but concurrent write set omitted table root page {table_root_page}"
                                 );
                                 let pager_has_pending_writes = conn
                                     .active_txn
@@ -34155,23 +34181,80 @@ mod tests {
 
         let verifier = Connection::open(&db).unwrap();
         let row = verifier.query_row("SELECT v FROM t WHERE id = 1;").unwrap();
-        let final_value = match row.get(0) {
-            Some(SqliteValue::Integer(value)) => *value,
-            Some(other) => panic!("expected integer final value, got {other:?}"),
-            None => panic!("missing final value column"),
+        let final_cell = row.get(0).cloned().unwrap_or(SqliteValue::Null);
+        let wal_path = wal_path_for_db_path(&db);
+        let wal_len_before_close = std::fs::metadata(&wal_path).ok().map(|meta| meta.len());
+        let (
+            sqlite_journal_mode_before_close,
+            sqlite_integrity_before_close,
+            sqlite_typeof_before_close,
+            sqlite_quote_before_close,
+            sqlite_value_before_close,
+        ) = {
+            let sqlite = rusqlite::Connection::open(&db).unwrap();
+            let journal_mode = sqlite
+                .query_row("PRAGMA journal_mode;", [], |row| row.get(0))
+                .unwrap();
+            let integrity_check = sqlite
+                .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+                .unwrap();
+            let typeof_v = sqlite
+                .query_row("SELECT typeof(v) FROM t WHERE id = 1;", [], |row| row.get(0))
+                .unwrap();
+            let quote_v = sqlite
+                .query_row("SELECT quote(v) FROM t WHERE id = 1;", [], |row| row.get(0))
+                .unwrap();
+            let value = sqlite
+                .query_row("SELECT v FROM t WHERE id = 1;", [], |row| row.get(0))
+                .unwrap();
+            (journal_mode, integrity_check, typeof_v, quote_v, value)
         };
-        let sqlite_value: i64 = rusqlite::Connection::open(&db)
-            .unwrap()
-            .query_row("SELECT v FROM t WHERE id = 1;", [], |row| row.get(0))
-            .unwrap();
+        drop(verifier);
+        let wal_len_after_close = std::fs::metadata(&wal_path).ok().map(|meta| meta.len());
+        let (
+            sqlite_journal_mode_after_close,
+            sqlite_integrity_after_close,
+            sqlite_typeof_after_close,
+            sqlite_quote_after_close,
+            sqlite_value_after_close,
+        ) = {
+            let sqlite = rusqlite::Connection::open(&db).unwrap();
+            let journal_mode = sqlite
+                .query_row("PRAGMA journal_mode;", [], |row| row.get(0))
+                .unwrap();
+            let integrity_check = sqlite
+                .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+                .unwrap();
+            let typeof_v = sqlite
+                .query_row("SELECT typeof(v) FROM t WHERE id = 1;", [], |row| row.get(0))
+                .unwrap();
+            let quote_v = sqlite
+                .query_row("SELECT quote(v) FROM t WHERE id = 1;", [], |row| row.get(0))
+                .unwrap();
+            let value = sqlite
+                .query_row("SELECT v FROM t WHERE id = 1;", [], |row| row.get(0))
+                .unwrap();
+            (journal_mode, integrity_check, typeof_v, quote_v, value)
+        };
         let expected = i64::try_from(WORKERS * TXNS_PER_WORKER).unwrap();
-        assert_eq!(
-            final_value, sqlite_value,
-            "bd-rjc verifier mismatch: final_value={final_value} sqlite_value={sqlite_value} expected={expected} retries={retries}"
+        assert!(
+            matches!(final_cell, SqliteValue::Integer(_)),
+            "bd-rjc verifier returned non-integer: final_cell={final_cell:?} expected={expected} retries={retries} wal_len_before_close={wal_len_before_close:?} wal_len_after_close={wal_len_after_close:?} sqlite_before=(journal_mode={sqlite_journal_mode_before_close:?}, integrity={sqlite_integrity_before_close:?}, typeof={sqlite_typeof_before_close:?}, quote={sqlite_quote_before_close:?}, value={sqlite_value_before_close:?}) sqlite_after=(journal_mode={sqlite_journal_mode_after_close:?}, integrity={sqlite_integrity_after_close:?}, typeof={sqlite_typeof_after_close:?}, quote={sqlite_quote_after_close:?}, value={sqlite_value_after_close:?})"
         );
         assert_eq!(
-            sqlite_value, expected,
-            "bd-rjc single-account probe mismatch: sqlite_value={sqlite_value} final_value={final_value} expected={expected} retries={retries}"
+            sqlite_value_before_close,
+            rusqlite::types::Value::Integer(expected),
+            "bd-rjc oracle mismatch before close: final_cell={final_cell:?} expected={expected} retries={retries} wal_len_before_close={wal_len_before_close:?} wal_len_after_close={wal_len_after_close:?} sqlite_before=(journal_mode={sqlite_journal_mode_before_close:?}, integrity={sqlite_integrity_before_close:?}, typeof={sqlite_typeof_before_close:?}, quote={sqlite_quote_before_close:?}, value={sqlite_value_before_close:?}) sqlite_after=(journal_mode={sqlite_journal_mode_after_close:?}, integrity={sqlite_integrity_after_close:?}, typeof={sqlite_typeof_after_close:?}, quote={sqlite_quote_after_close:?}, value={sqlite_value_after_close:?})"
+        );
+        assert_eq!(
+            sqlite_value_after_close,
+            rusqlite::types::Value::Integer(expected),
+            "bd-rjc oracle mismatch after close: final_cell={final_cell:?} expected={expected} retries={retries} wal_len_before_close={wal_len_before_close:?} wal_len_after_close={wal_len_after_close:?} sqlite_before=(journal_mode={sqlite_journal_mode_before_close:?}, integrity={sqlite_integrity_before_close:?}, typeof={sqlite_typeof_before_close:?}, quote={sqlite_quote_before_close:?}, value={sqlite_value_before_close:?}) sqlite_after=(journal_mode={sqlite_journal_mode_after_close:?}, integrity={sqlite_integrity_after_close:?}, typeof={sqlite_typeof_after_close:?}, quote={sqlite_quote_after_close:?}, value={sqlite_value_after_close:?})"
+        );
+        assert_eq!(
+            final_cell,
+            SqliteValue::Integer(expected),
+            "bd-rjc single-account probe mismatch: final_cell={final_cell:?} expected={expected} retries={retries} wal_len_before_close={wal_len_before_close:?} wal_len_after_close={wal_len_after_close:?} sqlite_before=(journal_mode={sqlite_journal_mode_before_close:?}, integrity={sqlite_integrity_before_close:?}, typeof={sqlite_typeof_before_close:?}, quote={sqlite_quote_before_close:?}, value={sqlite_value_before_close:?}) sqlite_after=(journal_mode={sqlite_journal_mode_after_close:?}, integrity={sqlite_integrity_after_close:?}, typeof={sqlite_typeof_after_close:?}, quote={sqlite_quote_after_close:?}, value={sqlite_value_after_close:?})"
         );
     }
 
@@ -37917,7 +38000,7 @@ mod autocommit_txn_tests {
     fn test_autocommit_read_mode_does_not_open_concurrent_session() {
         let conn = Connection::open(":memory:").unwrap();
         let started = conn
-            .ensure_autocommit_txn_mode(TransactionMode::Deferred)
+            .ensure_autocommit_txn_mode(TransactionMode::ReadOnly)
             .unwrap();
         assert!(started);
         assert!(!conn.is_concurrent_transaction());

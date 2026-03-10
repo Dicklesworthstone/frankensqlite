@@ -1149,6 +1149,8 @@ pub fn find_duplicate_db_ids(manifest: &Manifest) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jsonschema::validator_for;
+    use serde_json::Value;
     use std::fs;
 
     fn sample_manifest() -> Manifest {
@@ -1725,7 +1727,89 @@ mod tests {
         if let Ok(campaign) = load_beads_benchmark_campaign(workspace_root) {
             validate_beads_benchmark_campaign(&campaign, workspace_root).unwrap();
             assert_eq!(campaign.campaign_id, "bd-db300.1.2");
-            assert!(!campaign.matrix_rows.is_empty());
+            assert_eq!(campaign.matrix_rows.len(), 9);
+
+            let mut fixture_ids: Vec<_> = campaign
+                .fixtures
+                .iter()
+                .map(|fixture| fixture.fixture_id.as_str())
+                .collect();
+            fixture_ids.sort_unstable();
+            assert_eq!(
+                fixture_ids,
+                vec!["frankensearch", "frankensqlite", "frankentui"]
+            );
+
+            let cells = expand_beads_benchmark_campaign(&campaign);
+            assert_eq!(cells.len(), 216);
         }
+    }
+
+    #[test]
+    fn test_beads_benchmark_campaign_manifest_matches_json_schema() {
+        let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .unwrap();
+        let schema_path = workspace_root
+            .join("sample_sqlite_db_files/manifests/beads_benchmark_campaign.v1.schema.json");
+        let manifest_path = workspace_root.join(BEADS_BENCHMARK_CAMPAIGN_PATH_RELATIVE);
+        if !schema_path.is_file() || !manifest_path.is_file() {
+            return;
+        }
+
+        let schema: Value = serde_json::from_str(
+            &fs::read_to_string(&schema_path).expect("schema json should be readable"),
+        )
+        .expect("schema should parse");
+        let manifest: Value = serde_json::from_str(
+            &fs::read_to_string(&manifest_path).expect("manifest json should be readable"),
+        )
+        .expect("manifest should parse");
+
+        let validator = validator_for(&schema).expect("schema should compile");
+        let errors: Vec<String> = validator
+            .iter_errors(&manifest)
+            .map(|error| error.to_string())
+            .collect();
+        assert!(errors.is_empty(), "schema errors: {errors:#?}");
+    }
+
+    #[test]
+    fn test_real_beads_benchmark_campaign_bundle_path_contract() {
+        let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .unwrap();
+        let Ok(campaign) = load_beads_benchmark_campaign(workspace_root) else {
+            return;
+        };
+        let cell = expand_beads_benchmark_campaign(&campaign)
+            .into_iter()
+            .find(|cell| {
+                cell.row_id == "mixed_read_write_c8"
+                    && cell.fixture_id == "frankensqlite"
+                    && cell.mode == BenchmarkMode::FsqliteMvcc
+                    && cell.placement_profile_id == "recommended_pinned"
+                    && cell.hardware_class_id == "linux_x86_64_many_core_numa"
+            })
+            .expect("expected canonical bundle cell");
+
+        let bundle_path = benchmark_bundle_path(
+            workspace_root,
+            &campaign,
+            &cell,
+            "0123456789abcdef",
+            "abcdef0123456789fedcba9876543210",
+        );
+        let relative = bundle_path
+            .strip_prefix(workspace_root)
+            .expect("bundle path should stay in workspace");
+        assert_eq!(
+            relative,
+            Path::new(
+                "artifacts/perf/bd-db300.1.2/mixed_read_write_c8__frankensqlite__fsqlite_mvcc__recommended_pinned__rev_0123456789ab__beads_abcdef012345"
+            )
+        );
     }
 }

@@ -115,6 +115,20 @@ run_step \
         cargo test -p fsqlite-harness --test bd_db300_3_1_batch_wal_append -- --nocapture
 
 if [[ ! -f "${TEST_REPORT_JSON}" ]]; then
+    awk '
+        /BEGIN_BD_DB300_3_1_REPORT/ {capture=1; next}
+        /END_BD_DB300_3_1_REPORT/ {capture=0}
+        capture {print}
+    ' "${TEST_LOG}" > "${TEST_REPORT_JSON}"
+
+    if [[ -s "${TEST_REPORT_JSON}" ]]; then
+        emit_event "artifact_check" "info" "running" "reconstructed missing test report from ${TEST_LOG}"
+    else
+        rm -f "${TEST_REPORT_JSON}"
+    fi
+fi
+
+if [[ ! -f "${TEST_REPORT_JSON}" ]]; then
     emit_event "artifact_check" "fail" "fail" "missing expected test report ${TEST_REPORT_JSON}"
     echo "ERROR: missing expected test report ${TEST_REPORT_JSON}" >&2
     exit 1
