@@ -236,7 +236,7 @@ struct SorterRow {
 /// bytes, the current batch is sorted and flushed to a temporary file as a
 /// "run".  At `SorterSort` time, all runs (plus any remaining in-memory rows)
 /// are merged via k-way merge.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct SorterCursor {
     /// Number of leading columns used as sort key.
     key_columns: usize,

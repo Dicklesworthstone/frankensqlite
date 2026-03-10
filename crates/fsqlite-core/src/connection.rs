@@ -13816,7 +13816,8 @@ impl Connection {
         keyed_rows.sort_by(|(k1, _), (k2, _)| {
             for (i, (av, bv)) in k1.iter().zip(k2.iter()).enumerate() {
                 let coll = group_collations.get(i).and_then(|c| c.as_deref());
-                let ord = cmp_sqlite_values_collated(av, bv, coll);
+                let ord =
+                    cmp_sqlite_values_collated(av, bv, coll, self.collation_registry.as_ref());
                 if ord != std::cmp::Ordering::Equal {
                     return ord;
                 }
@@ -13827,7 +13828,12 @@ impl Connection {
         let mut groups: Vec<(Vec<SqliteValue>, Vec<Vec<SqliteValue>>)> = Vec::new();
         for (key, row_values) in keyed_rows {
             if let Some(last_group) = groups.last_mut() {
-                if group_keys_equal_collated(&last_group.0, &key, &group_collations) {
+                if group_keys_equal_collated(
+                    &last_group.0,
+                    &key,
+                    &group_collations,
+                    self.collation_registry.as_ref(),
+                ) {
                     last_group.1.push(row_values);
                     continue;
                 }
@@ -14861,7 +14867,8 @@ impl Connection {
         keyed_rows.sort_by(|(k1, _), (k2, _)| {
             for (i, (av, bv)) in k1.iter().zip(k2.iter()).enumerate() {
                 let coll = group_collations.get(i).and_then(|c| c.as_deref());
-                let ord = cmp_sqlite_values_collated(av, bv, coll);
+                let ord =
+                    cmp_sqlite_values_collated(av, bv, coll, self.collation_registry.as_ref());
                 if ord != std::cmp::Ordering::Equal {
                     return ord;
                 }
@@ -14872,7 +14879,12 @@ impl Connection {
         let mut groups: Vec<(Vec<SqliteValue>, Vec<Vec<SqliteValue>>)> = Vec::new();
         for (key, row_values) in keyed_rows {
             if let Some(last_group) = groups.last_mut() {
-                if group_keys_equal_collated(&last_group.0, &key, &group_collations) {
+                if group_keys_equal_collated(
+                    &last_group.0,
+                    &key,
+                    &group_collations,
+                    self.collation_registry.as_ref(),
+                ) {
                     last_group.1.push(row_values);
                     continue;
                 }
@@ -23015,7 +23027,7 @@ fn sort_rows_by_order_terms(
                 return ord;
             }
             let coll = col_collations.get(idx).and_then(|c| c.as_deref());
-            let ord = cmp_sqlite_values_collated(av, bv, coll);
+            let ord = cmp_sqlite_values_collated(av, bv, coll, self.collation_registry.as_ref());
             let ord = if desc { ord.reverse() } else { ord };
             if ord != std::cmp::Ordering::Equal {
                 return ord;
@@ -50384,6 +50396,103 @@ mod pager_routing_tests {
         assert!(names.contains(&"BINARY".to_owned()));
         assert!(names.contains(&"NOCASE".to_owned()));
         assert!(names.contains(&"RTRIM".to_owned()));
+    }
+
+    #[test]
+    fn test_icu_scalar_functions_available() {
+        let conn = Connection::open(":memory:").unwrap();
+        let rows = conn
+            .query("SELECT icu_upper('straße', 'de_DE'), icu_lower('I', 'tr_TR');")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].values(),
+            &[
+                SqliteValue::Text("STRASSE".to_owned()),
+                SqliteValue::Text("ı".to_owned()),
+            ],
+        );
+    }
+
+    #[test]
+    fn test_icu_load_collation_updates_pragma_and_vdbe_ordering() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.query("SELECT icu_load_collation('de_DE', 'german');")
+            .unwrap();
+
+        let names: Vec<String> = conn
+            .query("PRAGMA collation_list;")
+            .unwrap()
+            .into_iter()
+            .filter_map(|row| match &row.values()[1] {
+                SqliteValue::Text(name) => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(names.contains(&"GERMAN".to_owned()));
+
+        conn.execute("CREATE TABLE words (word TEXT);").unwrap();
+        conn.execute("INSERT INTO words VALUES ('ad');").unwrap();
+        conn.execute("INSERT INTO words VALUES ('ä');").unwrap();
+        conn.execute("INSERT INTO words VALUES ('af');").unwrap();
+
+        let ordered = conn
+            .query("SELECT word FROM words ORDER BY word COLLATE german;")
+            .unwrap();
+        assert_eq!(
+            ordered
+                .iter()
+                .map(|row| row.values()[0].clone())
+                .collect::<Vec<_>>(),
+            vec![
+                SqliteValue::Text("ad".to_owned()),
+                SqliteValue::Text("ä".to_owned()),
+                SqliteValue::Text("af".to_owned()),
+            ],
+        );
+
+        let filtered = conn
+            .query("SELECT word FROM words WHERE word < 'af' COLLATE german ORDER BY word COLLATE german;")
+            .unwrap();
+        assert_eq!(
+            filtered
+                .iter()
+                .map(|row| row.values()[0].clone())
+                .collect::<Vec<_>>(),
+            vec![
+                SqliteValue::Text("ad".to_owned()),
+                SqliteValue::Text("ä".to_owned()),
+            ],
+        );
+    }
+
+    #[test]
+    fn test_icu_collation_reaches_fallback_join_sorting() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.query("SELECT icu_load_collation('de_DE', 'german');")
+            .unwrap();
+        conn.execute("CREATE TABLE words (word TEXT);").unwrap();
+        conn.execute("INSERT INTO words VALUES ('af');").unwrap();
+        conn.execute("INSERT INTO words VALUES ('ä');").unwrap();
+        conn.execute("INSERT INTO words VALUES ('ad');").unwrap();
+
+        let rows = conn
+            .query(
+                "SELECT a.word \
+                 FROM words AS a JOIN words AS b ON a.rowid = b.rowid \
+                 ORDER BY a.word COLLATE german;",
+            )
+            .unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.values()[0].clone())
+                .collect::<Vec<_>>(),
+            vec![
+                SqliteValue::Text("ad".to_owned()),
+                SqliteValue::Text("ä".to_owned()),
+                SqliteValue::Text("af".to_owned()),
+            ],
+        );
     }
 
     #[test]
