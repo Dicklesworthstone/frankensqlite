@@ -577,6 +577,58 @@ const PUBLISHED_SNAPSHOT_SPIN_LIMIT: u32 = 64;
 const PUBLISHED_SNAPSHOT_SLEEP_AFTER: u32 = 512;
 const PUBLISHED_SNAPSHOT_SLEEP: Duration = Duration::from_micros(50);
 const PUBLISHED_READ_FAST_RETRY_LIMIT: usize = 64;
+const PUBLISHED_COUNTER_STRIPE_COUNT: usize = 64;
+
+static NEXT_PUBLISHED_COUNTER_STRIPE: AtomicUsize = AtomicUsize::new(0);
+
+std::thread_local! {
+    static PUBLISHED_COUNTER_STRIPE_INDEX: usize =
+        NEXT_PUBLISHED_COUNTER_STRIPE.fetch_add(1, AtomicOrdering::Relaxed)
+            % PUBLISHED_COUNTER_STRIPE_COUNT;
+}
+
+#[derive(Debug)]
+#[repr(align(64))]
+struct CacheAlignedAtomicU64(AtomicU64);
+
+impl CacheAlignedAtomicU64 {
+    const fn new(value: u64) -> Self {
+        Self(AtomicU64::new(value))
+    }
+
+    fn fetch_add(&self, value: u64, ordering: AtomicOrdering) {
+        self.0.fetch_add(value, ordering);
+    }
+
+    fn load(&self, ordering: AtomicOrdering) -> u64 {
+        self.0.load(ordering)
+    }
+}
+
+#[derive(Debug)]
+struct StripedCounter64 {
+    stripes: [CacheAlignedAtomicU64; PUBLISHED_COUNTER_STRIPE_COUNT],
+}
+
+impl StripedCounter64 {
+    fn new() -> Self {
+        Self {
+            stripes: std::array::from_fn(|_| CacheAlignedAtomicU64::new(0)),
+        }
+    }
+
+    fn increment(&self) {
+        PUBLISHED_COUNTER_STRIPE_INDEX.with(|stripe| {
+            self.stripes[*stripe].fetch_add(1, AtomicOrdering::Relaxed);
+        });
+    }
+
+    fn load(&self) -> u64 {
+        self.stripes.iter().fold(0_u64, |sum, stripe| {
+            sum.saturating_add(stripe.load(AtomicOrdering::Acquire))
+        })
+    }
+}
 
 #[inline]
 fn publication_retry_pause(retry: u32) {
@@ -632,8 +684,8 @@ struct PublishedPagerState {
     freelist_count: AtomicUsize,
     checkpoint_active: AtomicBool,
     page_set_size: AtomicUsize,
-    read_retry_count: AtomicU64,
-    published_page_hits: AtomicU64,
+    read_retry_count: StripedCounter64,
+    published_page_hits: StripedCounter64,
     pages: RwLock<HashMap<PageNumber, PageData, foldhash::fast::FixedState>>,
 }
 
@@ -652,8 +704,8 @@ impl PublishedPagerState {
             freelist_count: AtomicUsize::new(freelist_count),
             checkpoint_active: AtomicBool::new(false),
             page_set_size: AtomicUsize::new(0),
-            read_retry_count: AtomicU64::new(0),
-            published_page_hits: AtomicU64::new(0),
+            read_retry_count: StripedCounter64::new(),
+            published_page_hits: StripedCounter64::new(),
             pages: RwLock::new(HashMap::with_hasher(foldhash::fast::FixedState::default())),
         }
     }
@@ -752,20 +804,19 @@ impl PublishedPagerState {
     }
 
     fn note_published_hit(&self) {
-        self.published_page_hits
-            .fetch_add(1, AtomicOrdering::Relaxed);
+        self.published_page_hits.increment();
     }
 
     fn record_retry(&self) {
-        self.read_retry_count.fetch_add(1, AtomicOrdering::Relaxed);
+        self.read_retry_count.increment();
     }
 
     fn read_retry_count(&self) -> u64 {
-        self.read_retry_count.load(AtomicOrdering::Acquire)
+        self.read_retry_count.load()
     }
 
     fn published_page_hits(&self) -> u64 {
-        self.published_page_hits.load(AtomicOrdering::Acquire)
+        self.published_page_hits.load()
     }
 }
 
@@ -7136,5 +7187,121 @@ mod tests {
             snapshot.checkpoint_active,
             "bead_id={BEAD_ID} case=publication_retry_checkpoint_flag"
         );
+    }
+
+    fn run_parallel_counter_benchmark<F>(
+        thread_count: usize,
+        increments_per_thread: usize,
+        increment: F,
+    ) -> u64
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        let start_barrier = Arc::new(std::sync::Barrier::new(thread_count + 1));
+        let increment = Arc::new(increment);
+        let handles: Vec<_> = (0..thread_count)
+            .map(|_| {
+                let start_barrier = Arc::clone(&start_barrier);
+                let increment = Arc::clone(&increment);
+                std::thread::spawn(move || {
+                    start_barrier.wait();
+                    for _ in 0..increments_per_thread {
+                        increment();
+                    }
+                })
+            })
+            .collect();
+
+        start_barrier.wait();
+        let started = Instant::now();
+        for handle in handles {
+            handle.join().expect("counter worker should finish");
+        }
+        u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
+    }
+
+    #[test]
+    fn test_published_counter_striping_tracks_parallel_increments() {
+        let counter = Arc::new(StripedCounter64::new());
+        let thread_count = 8;
+        let increments_per_thread = 5_000;
+        let expected_total =
+            u64::try_from(thread_count * increments_per_thread).unwrap_or(u64::MAX);
+
+        let counter_for_bench = Arc::clone(&counter);
+        let elapsed_ns =
+            run_parallel_counter_benchmark(thread_count, increments_per_thread, move || {
+                counter_for_bench.increment();
+            });
+
+        assert!(
+            elapsed_ns > 0,
+            "bead_id={BEAD_ID} case=publication_counter_parallel_elapsed"
+        );
+        assert_eq!(
+            counter.load(),
+            expected_total,
+            "bead_id={BEAD_ID} case=publication_counter_parallel_total"
+        );
+    }
+
+    #[test]
+    #[ignore = "manual perf evidence for bd-db300.2.3.2"]
+    fn bench_bd_db300_2_3_2_publication_counter_striping() {
+        #[derive(Debug)]
+        struct BaselineCounter(AtomicU64);
+
+        impl BaselineCounter {
+            fn increment(&self) {
+                self.0.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+
+            fn load(&self) -> u64 {
+                self.0.load(AtomicOrdering::Acquire)
+            }
+        }
+
+        let thread_count = std::thread::available_parallelism()
+            .map_or(4, |parallelism| parallelism.get().clamp(2, 16));
+        let increments_per_thread = 200_000;
+        let expected_total =
+            u64::try_from(thread_count * increments_per_thread).unwrap_or(u64::MAX);
+
+        let baseline = Arc::new(BaselineCounter(AtomicU64::new(0)));
+        let baseline_counter = Arc::clone(&baseline);
+        let baseline_ns =
+            run_parallel_counter_benchmark(thread_count, increments_per_thread, move || {
+                baseline_counter.increment();
+            });
+        assert_eq!(
+            baseline.load(),
+            expected_total,
+            "bead_id={BEAD_ID} case=publication_counter_baseline_total"
+        );
+
+        let striped = Arc::new(StripedCounter64::new());
+        let striped_counter = Arc::clone(&striped);
+        let striped_ns =
+            run_parallel_counter_benchmark(thread_count, increments_per_thread, move || {
+                striped_counter.increment();
+            });
+        assert_eq!(
+            striped.load(),
+            expected_total,
+            "bead_id={BEAD_ID} case=publication_counter_striped_total"
+        );
+
+        let speedup_milli = if striped_ns == 0 {
+            0_u64
+        } else {
+            u64::try_from((u128::from(baseline_ns)).saturating_mul(1_000) / u128::from(striped_ns))
+                .unwrap_or(u64::MAX)
+        };
+
+        println!("BEGIN_BD_DB300_2_3_2_REPORT");
+        println!(
+            "{{\"threads\":{thread_count},\"increments_per_thread\":{increments_per_thread},\"baseline_ns\":{baseline_ns},\"striped_ns\":{striped_ns},\"speedup_milli\":{speedup_milli}}}"
+        );
+        println!("END_BD_DB300_2_3_2_REPORT");
     }
 }
