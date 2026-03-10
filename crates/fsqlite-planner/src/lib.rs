@@ -1205,19 +1205,209 @@ fn best_access_path_internal(
 
 /// Check if the WHERE terms collectively imply a partial index predicate.
 ///
-/// Conservative structural check: the predicate (or each conjunct of it)
-/// must appear as the expression of one of the WHERE terms.
+/// This is intentionally stronger than plain structural equality for common
+/// partial-index predicates. It accepts exact conjunct matches, commuted
+/// equality/range comparisons, stronger range bounds on the same column, and
+/// non-NULL comparisons implying `IS NOT NULL`.
 fn where_terms_imply_predicate(terms: &[WhereTerm<'_>], predicate: &Expr) -> bool {
-    // Decompose the predicate into conjuncts.
     let pred_conjuncts = decompose_where(predicate);
-
-    // Each conjunct of the predicate must be matched by some WHERE term.
-    pred_conjuncts.iter().all(|pc| {
-        terms.iter().any(|t| {
-            // Structural equality of the AST nodes.
-            *t.expr == **pc
-        })
+    pred_conjuncts.iter().all(|predicate_conjunct| {
+        terms
+            .iter()
+            .any(|term| expr_implies_partial_predicate(term.expr, predicate_conjunct))
     })
+}
+
+fn expr_implies_partial_predicate(query_expr: &Expr, predicate: &Expr) -> bool {
+    if query_expr == predicate {
+        return true;
+    }
+
+    if let Some(predicate_column) = normalize_is_not_null_predicate(predicate) {
+        return expr_guarantees_non_null(query_expr, &predicate_column);
+    }
+
+    match (
+        normalize_column_literal_comparison(query_expr),
+        normalize_column_literal_comparison(predicate),
+    ) {
+        (Some(query_cmp), Some(predicate_cmp)) => query_cmp.implies(&predicate_cmp),
+        _ => false,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct NormalizedColumnComparison {
+    column: WhereColumn,
+    op: AstBinaryOp,
+    literal: Literal,
+}
+
+impl NormalizedColumnComparison {
+    fn implies(&self, predicate: &Self) -> bool {
+        if !where_columns_compatible(&self.column, &predicate.column) {
+            return false;
+        }
+
+        let Some(ordering) = compare_partial_index_literals(&self.literal, &predicate.literal)
+        else {
+            return false;
+        };
+
+        match self.op {
+            AstBinaryOp::Eq => literal_satisfies_predicate_literal(&ordering, predicate.op),
+            AstBinaryOp::Gt => {
+                matches!(predicate.op, AstBinaryOp::Gt | AstBinaryOp::Ge)
+                    && matches!(
+                        ordering,
+                        std::cmp::Ordering::Greater | std::cmp::Ordering::Equal
+                    )
+            }
+            AstBinaryOp::Ge => match predicate.op {
+                AstBinaryOp::Gt => matches!(ordering, std::cmp::Ordering::Greater),
+                AstBinaryOp::Ge => matches!(
+                    ordering,
+                    std::cmp::Ordering::Greater | std::cmp::Ordering::Equal
+                ),
+                _ => false,
+            },
+            AstBinaryOp::Lt => {
+                matches!(predicate.op, AstBinaryOp::Lt | AstBinaryOp::Le)
+                    && matches!(
+                        ordering,
+                        std::cmp::Ordering::Less | std::cmp::Ordering::Equal
+                    )
+            }
+            AstBinaryOp::Le => match predicate.op {
+                AstBinaryOp::Lt => matches!(ordering, std::cmp::Ordering::Less),
+                AstBinaryOp::Le => matches!(
+                    ordering,
+                    std::cmp::Ordering::Less | std::cmp::Ordering::Equal
+                ),
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+}
+
+fn literal_satisfies_predicate_literal(
+    ordering: &std::cmp::Ordering,
+    predicate_op: AstBinaryOp,
+) -> bool {
+    match predicate_op {
+        AstBinaryOp::Eq => matches!(ordering, std::cmp::Ordering::Equal),
+        AstBinaryOp::Gt => matches!(ordering, std::cmp::Ordering::Greater),
+        AstBinaryOp::Ge => matches!(
+            ordering,
+            std::cmp::Ordering::Greater | std::cmp::Ordering::Equal
+        ),
+        AstBinaryOp::Lt => matches!(ordering, std::cmp::Ordering::Less),
+        AstBinaryOp::Le => matches!(
+            ordering,
+            std::cmp::Ordering::Less | std::cmp::Ordering::Equal
+        ),
+        _ => false,
+    }
+}
+
+fn expr_guarantees_non_null(expr: &Expr, predicate_column: &WhereColumn) -> bool {
+    if let Some(query_cmp) = normalize_column_literal_comparison(expr) {
+        return where_columns_compatible(&query_cmp.column, predicate_column)
+            && !matches!(query_cmp.literal, Literal::Null);
+    }
+
+    match expr {
+        Expr::Between { expr: inner, .. } => extract_where_column(inner)
+            .is_some_and(|column| where_columns_compatible(&column, predicate_column)),
+        Expr::IsNull {
+            expr: inner,
+            not: true,
+            ..
+        } => extract_where_column(inner)
+            .is_some_and(|column| where_columns_compatible(&column, predicate_column)),
+        _ => false,
+    }
+}
+
+fn normalize_is_not_null_predicate(expr: &Expr) -> Option<WhereColumn> {
+    let Expr::IsNull {
+        expr: inner,
+        not: true,
+        ..
+    } = expr
+    else {
+        return None;
+    };
+    extract_where_column(inner)
+}
+
+fn normalize_column_literal_comparison(expr: &Expr) -> Option<NormalizedColumnComparison> {
+    let Expr::BinaryOp {
+        left,
+        op: AstBinaryOp::Eq | AstBinaryOp::Lt | AstBinaryOp::Le | AstBinaryOp::Gt | AstBinaryOp::Ge,
+        right,
+        ..
+    } = expr
+    else {
+        return None;
+    };
+
+    if let (Some(column), Expr::Literal(literal, _)) = (extract_where_column(left), right.as_ref())
+    {
+        return Some(NormalizedColumnComparison {
+            column,
+            op: match expr {
+                Expr::BinaryOp { op, .. } => *op,
+                _ => unreachable!(),
+            },
+            literal: literal.clone(),
+        });
+    }
+
+    if let (Expr::Literal(literal, _), Some(column)) = (left.as_ref(), extract_where_column(right))
+    {
+        return Some(NormalizedColumnComparison {
+            column,
+            op: reverse_comparison_op(match expr {
+                Expr::BinaryOp { op, .. } => *op,
+                _ => unreachable!(),
+            })?,
+            literal: literal.clone(),
+        });
+    }
+
+    None
+}
+
+fn reverse_comparison_op(op: AstBinaryOp) -> Option<AstBinaryOp> {
+    match op {
+        AstBinaryOp::Eq => Some(AstBinaryOp::Eq),
+        AstBinaryOp::Lt => Some(AstBinaryOp::Gt),
+        AstBinaryOp::Le => Some(AstBinaryOp::Ge),
+        AstBinaryOp::Gt => Some(AstBinaryOp::Lt),
+        AstBinaryOp::Ge => Some(AstBinaryOp::Le),
+        _ => None,
+    }
+}
+
+fn compare_partial_index_literals(left: &Literal, right: &Literal) -> Option<std::cmp::Ordering> {
+    match (left, right) {
+        (Literal::Integer(lhs), Literal::Integer(rhs)) => Some(lhs.cmp(rhs)),
+        (Literal::Float(lhs), Literal::Float(rhs)) => lhs.partial_cmp(rhs),
+        (Literal::Integer(lhs), Literal::Float(rhs)) => (*lhs as f64).partial_cmp(rhs),
+        (Literal::Float(lhs), Literal::Integer(rhs)) => lhs.partial_cmp(&(*rhs as f64)),
+        (Literal::String(lhs), Literal::String(rhs)) => Some(lhs.cmp(rhs)),
+        _ => None,
+    }
+}
+
+fn where_columns_compatible(left: &WhereColumn, right: &WhereColumn) -> bool {
+    left.column.eq_ignore_ascii_case(&right.column)
+        && match (&left.table, &right.table) {
+            (Some(lhs), Some(rhs)) => lhs.eq_ignore_ascii_case(rhs),
+            _ => true,
+        }
 }
 
 // ---------------------------------------------------------------------------
@@ -5726,6 +5916,92 @@ mod tests {
         let ap_implied = best_access_path(&table, &[partial_idx], &[eq_term_value("a", 1)], None);
         assert!(matches!(
             ap_implied.kind,
+            AccessPathKind::IndexScanEquality | AccessPathKind::CoveringIndexScan { .. }
+        ));
+    }
+
+    #[test]
+    fn test_best_access_path_partial_index_accepts_commuted_equality() {
+        let table = table_stats("t1", 100, 1000);
+        let mut partial_idx = index_info("idx_partial_a", "t1", &["a"], false, 20);
+        partial_idx.partial_where = Some(Expr::BinaryOp {
+            left: Box::new(Expr::Column(ColumnRef::bare("a"), Span::ZERO)),
+            op: AstBinaryOp::Eq,
+            right: Box::new(Expr::Literal(Literal::Integer(1), Span::ZERO)),
+            span: Span::ZERO,
+        });
+
+        let expr: &'static Expr = Box::leak(Box::new(Expr::BinaryOp {
+            left: Box::new(Expr::Literal(Literal::Integer(1), Span::ZERO)),
+            op: AstBinaryOp::Eq,
+            right: Box::new(Expr::Column(ColumnRef::bare("a"), Span::ZERO)),
+            span: Span::ZERO,
+        }));
+        let ap = best_access_path(&table, &[partial_idx], &[classify_where_term(expr)], None);
+        assert!(matches!(
+            ap.kind,
+            AccessPathKind::IndexScanEquality | AccessPathKind::CoveringIndexScan { .. }
+        ));
+    }
+
+    #[test]
+    fn test_best_access_path_partial_index_accepts_stronger_lower_bound() {
+        let table = table_stats("t1", 100, 1000);
+        let mut partial_idx = index_info("idx_partial_a", "t1", &["a"], false, 20);
+        partial_idx.partial_where = Some(Expr::BinaryOp {
+            left: Box::new(Expr::Column(ColumnRef::bare("a"), Span::ZERO)),
+            op: AstBinaryOp::Gt,
+            right: Box::new(Expr::Literal(Literal::Integer(0), Span::ZERO)),
+            span: Span::ZERO,
+        });
+
+        let expr: &'static Expr = Box::leak(Box::new(Expr::BinaryOp {
+            left: Box::new(Expr::Column(ColumnRef::bare("a"), Span::ZERO)),
+            op: AstBinaryOp::Gt,
+            right: Box::new(Expr::Literal(Literal::Integer(10), Span::ZERO)),
+            span: Span::ZERO,
+        }));
+        let ap = best_access_path(&table, &[partial_idx], &[classify_where_term(expr)], None);
+        assert!(matches!(
+            ap.kind,
+            AccessPathKind::IndexScanRange { .. } | AccessPathKind::CoveringIndexScan { .. }
+        ));
+    }
+
+    #[test]
+    fn test_best_access_path_partial_index_rejects_weaker_lower_bound() {
+        let table = table_stats("t1", 100, 1000);
+        let mut partial_idx = index_info("idx_partial_a", "t1", &["a"], false, 20);
+        partial_idx.partial_where = Some(Expr::BinaryOp {
+            left: Box::new(Expr::Column(ColumnRef::bare("a"), Span::ZERO)),
+            op: AstBinaryOp::Gt,
+            right: Box::new(Expr::Literal(Literal::Integer(10), Span::ZERO)),
+            span: Span::ZERO,
+        });
+
+        let expr: &'static Expr = Box::leak(Box::new(Expr::BinaryOp {
+            left: Box::new(Expr::Column(ColumnRef::bare("a"), Span::ZERO)),
+            op: AstBinaryOp::Gt,
+            right: Box::new(Expr::Literal(Literal::Integer(0), Span::ZERO)),
+            span: Span::ZERO,
+        }));
+        let ap = best_access_path(&table, &[partial_idx], &[classify_where_term(expr)], None);
+        assert!(matches!(ap.kind, AccessPathKind::FullTableScan));
+    }
+
+    #[test]
+    fn test_best_access_path_partial_index_accepts_is_not_null_from_equality() {
+        let table = table_stats("t1", 100, 1000);
+        let mut partial_idx = index_info("idx_partial_a", "t1", &["a"], false, 20);
+        partial_idx.partial_where = Some(Expr::IsNull {
+            expr: Box::new(Expr::Column(ColumnRef::bare("a"), Span::ZERO)),
+            not: true,
+            span: Span::ZERO,
+        });
+
+        let ap = best_access_path(&table, &[partial_idx], &[eq_term_value("a", 7)], None);
+        assert!(matches!(
+            ap.kind,
             AccessPathKind::IndexScanEquality | AccessPathKind::CoveringIndexScan { .. }
         ));
     }
