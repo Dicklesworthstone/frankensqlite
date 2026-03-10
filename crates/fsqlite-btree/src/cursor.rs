@@ -68,6 +68,8 @@ pub trait PageWriter: PageReader {
     fn allocate_page(&mut self, cx: &Cx) -> Result<PageNumber>;
     /// Free a page.
     fn free_page(&mut self, cx: &Cx, page_no: PageNumber) -> Result<()>;
+    /// Record a granular write witness for fine-grained SSI.
+    fn record_write_witness(&mut self, cx: &Cx, key: WitnessKey);
 }
 
 // ---------------------------------------------------------------------------
@@ -119,6 +121,10 @@ impl<T: TransactionHandle + ?Sized> PageWriter for TransactionPageIo<'_, T> {
 
     fn free_page(&mut self, cx: &Cx, page_no: PageNumber) -> Result<()> {
         self.txn.free_page(cx, page_no)
+    }
+
+    fn record_write_witness(&mut self, cx: &Cx, key: WitnessKey) {
+        self.txn.record_write_witness(cx, key);
     }
 }
 
@@ -229,6 +235,8 @@ impl PageWriter for MemPageStore {
         self.pages.remove(&page_no.get());
         Ok(())
     }
+
+    fn record_write_witness(&mut self, _cx: &Cx, _key: WitnessKey) {}
 }
 
 // ---------------------------------------------------------------------------

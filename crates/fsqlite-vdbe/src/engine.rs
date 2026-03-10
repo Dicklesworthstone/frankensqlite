@@ -4671,7 +4671,7 @@ impl VdbeEngine {
                     let rowid_reg = op.p3;
                     let oe_flag = op.p5 & 0x0F; // Low 4 bits for OE_* mode
                     let rowid = self.get_reg(rowid_reg).to_integer();
-                    let record_val = self.get_reg(record_reg);
+                    let record_val = self.get_reg(record_reg).clone();
                     let previous_last_insert_rowid = self.last_insert_rowid;
                     let pk_conflict = ExecOutcome::Error {
                         code: ErrorCode::Constraint as i32,

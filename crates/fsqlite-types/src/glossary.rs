@@ -785,6 +785,21 @@ impl WitnessKey {
         (cell, page)
     }
 
+    /// Return the page-like bucket associated with this witness.
+    ///
+    /// Page and byte-range witnesses map to their physical page. Cell and
+    /// key-range witnesses are bucketed by their B-tree root page so higher
+    /// layers can retain O(1) page/root-level witness indexes. Custom
+    /// witnesses are intentionally left unbucketed.
+    #[must_use]
+    pub const fn page_number(&self) -> Option<PageNumber> {
+        match self {
+            Self::Page(page) | Self::ByteRange { page, .. } => Some(*page),
+            Self::Cell { btree_root, .. } | Self::KeyRange { btree_root, .. } => Some(*btree_root),
+            Self::Custom { .. } => None,
+        }
+    }
+
     /// Returns `true` if this is a coarse page-level witness.
     #[must_use]
     pub fn is_page(&self) -> bool {
@@ -797,23 +812,6 @@ impl WitnessKey {
         matches!(self, Self::Cell { .. })
     }
 
-    /// Return the primary page number associated with this witness key.
-    ///
-    /// - `Page(p)` → `Some(p)`
-    /// - `Cell { leaf_page, .. }` → `Some(leaf_page)`
-    /// - `ByteRange { page, .. }` → `Some(page)`
-    /// - `KeyRange { btree_root, .. }` → `Some(btree_root)`
-    /// - `Custom { .. }` → `None`
-    #[must_use]
-    pub fn page_number(&self) -> Option<PageNumber> {
-        match self {
-            Self::Page(p) => Some(*p),
-            Self::Cell { leaf_page, .. } => Some(*leaf_page),
-            Self::ByteRange { page, .. } => Some(*page),
-            Self::KeyRange { btree_root, .. } => Some(*btree_root),
-            Self::Custom { .. } => None,
-        }
-    }
 }
 
 /// Witness hierarchy range key (prefix-based bucketing).

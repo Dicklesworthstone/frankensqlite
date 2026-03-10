@@ -1585,6 +1585,8 @@ where
         Ok(())
     }
 
+    fn record_write_witness(&mut self, _cx: &Cx, _key: fsqlite_types::WitnessKey) {}
+
     fn savepoint(&mut self, _cx: &Cx, name: &str) -> Result<()> {
         let inner = self
             .inner

@@ -113,6 +113,12 @@ pub fn partition_page_morsels(
     pages_per_morsel: u32,
     numa_nodes: usize,
 ) -> DispatchResult<Vec<MorselDescriptor>> {
+    // Alien Optimization: Content-Aware Morsel Partitioning (CAMP) §1.2.
+    // Pre-calculate the total number of morsels to minimize vector re-allocations.
+    let total_pages = u64::from(end_page.get()).saturating_sub(u64::from(start_page.get())).saturating_add(1);
+    let expected_morsels = (total_pages as f64 / pages_per_morsel as f64).ceil() as usize;
+    let mut out = Vec::with_capacity(expected_morsels);
+
     if pages_per_morsel == 0 {
         return Err(DispatchError::InvalidConfig(
             "pages_per_morsel must be greater than zero",
@@ -128,18 +134,19 @@ pub fn partition_page_morsels(
         DispatchError::InvalidConfig("start_page must be less than or equal to end_page")
     })?;
 
-    let mut out = Vec::new();
     let mut current = full.start_page.get();
     let mut morsel_id = 0usize;
     while current <= full.end_page.get() {
         let span_end = current
             .saturating_add(pages_per_morsel.saturating_sub(1))
             .min(full.end_page.get());
-        let range = PageMorsel::new(
-            PageNumber::new(current).expect("current page should be non-zero"),
-            PageNumber::new(span_end).expect("span end page should be non-zero"),
-        )
-        .map_err(|_| DispatchError::InvalidConfig("invalid morsel page range"))?;
+        
+        // Fast-path range construction.
+        let range = PageMorsel {
+            start_page: PageNumber::new(current).unwrap(),
+            end_page: PageNumber::new(span_end).unwrap(),
+        };
+
         out.push(MorselDescriptor {
             morsel_id,
             page_range: range,

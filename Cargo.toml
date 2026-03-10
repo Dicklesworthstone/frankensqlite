@@ -22,6 +22,7 @@ members = [
     "crates/fsqlite-ext-icu",
     "crates/fsqlite-ext-misc",
     "crates/fsqlite-core",
+    "crates/fsqlite-e2e",
     "crates/fsqlite",
     "crates/fsqlite-cli",
     "crates/fsqlite-harness",
@@ -178,7 +179,6 @@ codegen-units = 1
 panic = "abort"
 strip = false
 debug = true
-force-frame-pointers = true
 
 [profile.release-perf]
 inherits = "release"

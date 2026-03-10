@@ -298,6 +298,12 @@ pub trait TransactionHandle: sealed::Sealed + Send {
     /// consistency with the trait surface.
     fn rollback(&mut self, cx: &Cx) -> Result<()>;
 
+    /// Record a granular write witness for fine-grained SSI bookkeeping.
+    ///
+    /// Simple pager-backed transactions may ignore this, but concurrent MVCC
+    /// implementations can override it to feed witness-plane validation.
+    fn record_write_witness(&mut self, _cx: &Cx, _key: fsqlite_types::WitnessKey) {}
+
     /// Create a named savepoint, snapshotting the current write-set.
     ///
     /// Corresponds to SQL `SAVEPOINT name`. The snapshot captures the
@@ -421,6 +427,8 @@ impl TransactionHandle for MockTransaction {
     fn rollback(&mut self, _cx: &Cx) -> Result<()> {
         Ok(())
     }
+
+    fn record_write_witness(&mut self, _cx: &Cx, _key: fsqlite_types::WitnessKey) {}
 
     fn savepoint(&mut self, _cx: &Cx, name: &str) -> Result<()> {
         self.savepoint_names.push(name.to_owned());

@@ -2542,7 +2542,7 @@ impl Connection {
             } else {
                 Some(params)
             };
-            let rows = self.execute_statement_impl(dml.as_ref(), p, Some(&*stmt.program))?;
+            let rows = self.execute_statement_impl(dml.as_ref(), p, Some(&stmt.program))?;
             let is_dml = matches!(
                 dml.as_ref(),
                 Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
@@ -3193,18 +3193,21 @@ impl Connection {
                     }
                     Ok(rows)
                 } else {
-                    // Eagerly rewrite IN-subqueries that the VDBE codegen
-                    // cannot handle (e.g. those with GROUP BY / HAVING).
-                    let rewritten = self.rewrite_in_subqueries_select(select, params)?;
-                    let limit_clause = rewritten.limit.clone();
-                    let compiled_select = if distinct && limit_clause.is_some() {
-                        let mut unbounded = rewritten.clone();
-                        unbounded.limit = None;
-                        unbounded
+                    let limit_clause = select.limit.clone();
+                    let arc_prog;
+                    let program: &VdbeProgram = if let Some(p) = precompiled {
+                        p
                     } else {
-                        rewritten.clone()
-                    };
-                    let program = {
+                        // Eagerly rewrite IN-subqueries that the VDBE codegen
+                        // cannot handle (e.g. those with GROUP BY / HAVING).
+                        let rewritten = self.rewrite_in_subqueries_select(select, params)?;
+                        let compiled_select = if distinct && limit_clause.is_some() {
+                            let mut unbounded = rewritten.clone();
+                            unbounded.limit = None;
+                            unbounded
+                        } else {
+                            rewritten.clone()
+                        };
                         let plan_span = tracing::span!(
                             target: "fsqlite.plan",
                             tracing::Level::TRACE,
@@ -3218,12 +3221,13 @@ impl Connection {
                         // parameter-sensitive literal lists before codegen.
                         let sql_text = Statement::Select(compiled_select.clone()).to_string();
                         let sql_key = Self::sql_hash(&sql_text);
-                        self.compile_with_cache(sql_key, &sql_text, |conn| {
+                        arc_prog = self.compile_with_cache(sql_key, &sql_text, |conn| {
                             conn.compile_table_select(&compiled_select)
-                        })?
+                        })?;
+                        &arc_prog
                     };
 
-                    let (mut rows, _, _) = self.execute_table_program(&program, params)?;
+                    let (mut rows, _, _) = self.execute_table_program(program, params)?;
                     if distinct {
                         dedup_rows(&mut rows);
                         if let Some(limit_clause) = limit_clause.as_ref() {
@@ -3500,7 +3504,10 @@ impl Connection {
                     }
                 }
 
-                let program = {
+                let arc_prog;
+                let program: &VdbeProgram = if let Some(p) = precompiled {
+                    p
+                } else {
                     let plan_span = tracing::span!(
                         target: "fsqlite.plan",
                         tracing::Level::TRACE,
@@ -3511,11 +3518,12 @@ impl Connection {
                     let _plan_guard = plan_span.enter();
                     let sql_text = statement.to_string();
                     let sql_key = Self::sql_hash(&sql_text);
-                    self.compile_with_cache(sql_key, &sql_text, |conn| {
+                    arc_prog = self.compile_with_cache(sql_key, &sql_text, |conn| {
                         conn.compile_table_update(&effective_update)
-                    })?
+                    })?;
+                    &arc_prog
                 };
-                let (rows, affected, _) = self.execute_table_program(&program, params)?;
+                let (rows, affected, _) = self.execute_table_program(program, params)?;
 
                 // Phase 5G.3: Fire AFTER UPDATE triggers.
                 if has_after_update {
@@ -3602,7 +3610,10 @@ impl Connection {
                     }
                 }
 
-                let program = {
+                let arc_prog;
+                let program: &VdbeProgram = if let Some(p) = precompiled {
+                    p
+                } else {
                     let plan_span = tracing::span!(
                         target: "fsqlite.plan",
                         tracing::Level::TRACE,
@@ -3613,11 +3624,12 @@ impl Connection {
                     let _plan_guard = plan_span.enter();
                     let sql_text = statement.to_string();
                     let sql_key = Self::sql_hash(&sql_text);
-                    self.compile_with_cache(sql_key, &sql_text, |conn| {
+                    arc_prog = self.compile_with_cache(sql_key, &sql_text, |conn| {
                         conn.compile_table_delete(&effective_delete)
-                    })?
+                    })?;
+                    &arc_prog
                 };
-                let (rows, affected, _) = self.execute_table_program(&program, params)?;
+                let (rows, affected, _) = self.execute_table_program(program, params)?;
 
                 // Phase 5G.3: Fire AFTER DELETE triggers.
                 if has_after_delete {
@@ -4338,7 +4350,7 @@ impl Connection {
                 let program = compile_expression_select(select)?;
                 let expression_postprocess = Some(build_expression_postprocess(select));
                 Ok(PreparedStatement {
-                    program: Arc::new(program),
+                    program,
                     func_registry: registry,
                     expression_postprocess,
                     distinct: is_distinct_select(select),
@@ -4363,7 +4375,7 @@ impl Connection {
                     self.compile_table_select(select)?
                 };
                 Ok(PreparedStatement {
-                    program: Arc::new(program),
+                    program,
                     func_registry: registry,
                     expression_postprocess: None,
                     distinct,
@@ -4445,7 +4457,7 @@ impl Connection {
                     pager: None,
                     post_distinct_limit: None,
                     schema_cookie: self.schema_cookie(),
-                    dml_statement: Some(statement.clone()),
+                    dml_statement: Some(Arc::new(statement.clone())),
                     deferred_query_statement: None,
                     deferred_query_column_count: None,
                     conn: self,
