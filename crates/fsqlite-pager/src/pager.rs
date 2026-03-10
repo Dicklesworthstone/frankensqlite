@@ -4592,6 +4592,7 @@ mod tests {
     type SharedFrames = StdArc<StdMutex<Vec<WalFrame>>>;
     type SharedCounter = StdArc<StdMutex<usize>>;
     const TRACK_C_BATCH_BENCH_BEAD_ID: &str = "bd-db300.3.1.4";
+    const TRACK_C_PUBLISH_WINDOW_INVENTORY_BEAD_ID: &str = "bd-db300.3.2.1";
     const TRACK_C_BATCH_BENCH_WARMUP_ITERS: usize = 5;
     const TRACK_C_BATCH_BENCH_MEASURE_ITERS: usize = 25;
     const TRACK_C_BATCH_BENCH_CASES: [(&str, usize); 3] = [
@@ -5574,6 +5575,161 @@ mod tests {
         println!("BEGIN_BD_DB300_3_1_4_REPORT");
         println!("{}", serde_json::to_string_pretty(&report).unwrap());
         println!("END_BD_DB300_3_1_4_REPORT");
+    }
+
+    #[test]
+    #[ignore = "inventory evidence only"]
+    fn wal_publish_window_inventory_report() {
+        let outside_window = vec![
+            json!({
+                "component": "collect_wal_commit_batch",
+                "location": "crates/fsqlite-pager/src/pager.rs::commit_wal",
+                "classification": "already_outside_publish_window",
+                "move_candidate": "not_applicable",
+                "rationale": "frame ordering, commit-marker boundary, and new_db_size derivation happen before EXCLUSIVE lock acquisition",
+            }),
+        ];
+
+        let inside_window = vec![
+            json!({
+                "component": "lock_exclusive",
+                "location": "crates/fsqlite-pager/src/pager.rs::commit_wal",
+                "classification": "serialized_boundary",
+                "move_candidate": "no",
+                "rationale": "cross-process WAL append exclusion is the start of the current publish window",
+            }),
+            json!({
+                "component": "wal_refresh_before_append",
+                "location": "crates/fsqlite-core/src/wal_adapter.rs::append_frames",
+                "classification": "state_refresh_read_only",
+                "move_candidate": "conditional",
+                "rationale": "refresh chooses append offset/checksum seed but is still read/refresh work rather than durable publication",
+            }),
+            json!({
+                "component": "wal_adapter_frame_ref_copy",
+                "location": "crates/fsqlite-core/src/wal_adapter.rs::append_frames",
+                "classification": "pure_copy",
+                "move_candidate": "yes",
+                "rationale": "borrowed WalFrameRef values are copied into owned WalAppendFrameRef structs before the real WAL write",
+            }),
+            json!({
+                "component": "wal_batch_buffer_allocation",
+                "location": "crates/fsqlite-wal/src/wal.rs::append_frames",
+                "classification": "allocation",
+                "move_candidate": "yes",
+                "rationale": "contiguous frame buffer allocation is preparatory memory work, not durable state transition",
+            }),
+            json!({
+                "component": "wal_header_and_payload_copy",
+                "location": "crates/fsqlite-wal/src/wal.rs::append_frames",
+                "classification": "pure_copy",
+                "move_candidate": "yes",
+                "rationale": "header field writes, salt stamping, and page payload copies assemble bytes for the later single write",
+            }),
+            json!({
+                "component": "wal_checksum_preparation",
+                "location": "crates/fsqlite-wal/src/wal.rs::append_frames",
+                "classification": "pure_compute",
+                "move_candidate": "yes",
+                "rationale": "rolling checksum calculation over the prepared batch is deterministic compute over in-memory bytes",
+            }),
+            json!({
+                "component": "wal_file_write",
+                "location": "crates/fsqlite-wal/src/wal.rs::append_frames",
+                "classification": "durable_state_transition",
+                "move_candidate": "no",
+                "rationale": "single contiguous file write is the core serialized append that must observe the authoritative WAL end",
+            }),
+            json!({
+                "component": "wal_state_advance_after_write",
+                "location": "crates/fsqlite-wal/src/wal.rs::append_frames",
+                "classification": "durable_state_transition",
+                "move_candidate": "no",
+                "rationale": "frame_count/running_checksum advancement must match the durable append that just occurred",
+            }),
+            json!({
+                "component": "fec_hook_on_frame",
+                "location": "crates/fsqlite-core/src/wal_adapter.rs::append_frames",
+                "classification": "post_append_compute",
+                "move_candidate": "yes",
+                "rationale": "FEC hook work is explicitly non-fatal and currently runs after append while the publish window is still open",
+            }),
+            json!({
+                "component": "wal_sync",
+                "location": "crates/fsqlite-pager/src/pager.rs::commit_wal",
+                "classification": "durability_barrier",
+                "move_candidate": "no",
+                "rationale": "sync is the durability barrier for the commit and therefore part of the required serialized state transition",
+            }),
+            json!({
+                "component": "inner_db_size_update",
+                "location": "crates/fsqlite-pager/src/pager.rs::commit_wal",
+                "classification": "pager_state_publish",
+                "move_candidate": "no",
+                "rationale": "pager-visible db_size must only advance after the WAL append and sync succeed",
+            }),
+        ];
+
+        let definitely_movable = inside_window
+            .iter()
+            .filter(|entry| entry["move_candidate"] == "yes")
+            .count();
+        let conditionally_movable = inside_window
+            .iter()
+            .filter(|entry| entry["move_candidate"] == "conditional")
+            .count();
+        let required_serialized = inside_window
+            .iter()
+            .filter(|entry| entry["move_candidate"] == "no")
+            .count();
+
+        let report = json!({
+            "schema_version": "fsqlite.track_c.publish_window_inventory.v1",
+            "bead_id": TRACK_C_PUBLISH_WINDOW_INVENTORY_BEAD_ID,
+            "parent_bead_id": "bd-db300.3.2",
+            "measured_operation": "pager_commit_wal_path",
+            "measurement_anchor_bead_id": TRACK_C_BATCH_BENCH_BEAD_ID,
+            "measurement_anchor_report": "fsqlite.track_c.batch_commit_benchmark.v1",
+            "current_window": {
+                "entry_function": "crates/fsqlite-pager/src/pager.rs::commit_wal",
+                "window_begins_at": "inner.db_file.lock(cx, LockLevel::Exclusive)?",
+                "window_ends_after": "inner.db_size = batch.new_db_size",
+            },
+            "outside_window": outside_window,
+            "inside_window": inside_window,
+            "summary": {
+                "outside_window_steps": outside_window.len(),
+                "inside_window_steps": inside_window.len(),
+                "definitely_movable_inside_window_steps": definitely_movable,
+                "conditionally_movable_inside_window_steps": conditionally_movable,
+                "required_serialized_inside_window_steps": required_serialized,
+            },
+        });
+
+        println!("BEGIN_BD_DB300_3_2_1_REPORT");
+        println!("{}", serde_json::to_string_pretty(&report).unwrap());
+        println!("END_BD_DB300_3_2_1_REPORT");
+
+        assert_eq!(
+            report["measured_operation"],
+            "pager_commit_wal_path",
+            "bead_id={TRACK_C_PUBLISH_WINDOW_INVENTORY_BEAD_ID} case=measured_operation_anchor"
+        );
+        assert_eq!(
+            report["summary"]["definitely_movable_inside_window_steps"],
+            5,
+            "bead_id={TRACK_C_PUBLISH_WINDOW_INVENTORY_BEAD_ID} case=movable_step_count"
+        );
+        assert_eq!(
+            report["summary"]["conditionally_movable_inside_window_steps"],
+            1,
+            "bead_id={TRACK_C_PUBLISH_WINDOW_INVENTORY_BEAD_ID} case=conditional_step_count"
+        );
+        assert_eq!(
+            report["summary"]["required_serialized_inside_window_steps"],
+            5,
+            "bead_id={TRACK_C_PUBLISH_WINDOW_INVENTORY_BEAD_ID} case=required_step_count"
+        );
     }
 
     #[test]
