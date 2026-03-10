@@ -34192,19 +34192,19 @@ mod tests {
             sqlite_value_before_close,
         ) = {
             let sqlite = rusqlite::Connection::open(&db).unwrap();
-            let journal_mode = sqlite
+            let journal_mode: String = sqlite
                 .query_row("PRAGMA journal_mode;", [], |row| row.get(0))
                 .unwrap();
-            let integrity_check = sqlite
+            let integrity_check: String = sqlite
                 .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
                 .unwrap();
-            let typeof_v = sqlite
+            let typeof_v: String = sqlite
                 .query_row("SELECT typeof(v) FROM t WHERE id = 1;", [], |row| row.get(0))
                 .unwrap();
-            let quote_v = sqlite
+            let quote_v: String = sqlite
                 .query_row("SELECT quote(v) FROM t WHERE id = 1;", [], |row| row.get(0))
                 .unwrap();
-            let value = sqlite
+            let value: rusqlite::types::Value = sqlite
                 .query_row("SELECT v FROM t WHERE id = 1;", [], |row| row.get(0))
                 .unwrap();
             (journal_mode, integrity_check, typeof_v, quote_v, value)
@@ -34219,19 +34219,19 @@ mod tests {
             sqlite_value_after_close,
         ) = {
             let sqlite = rusqlite::Connection::open(&db).unwrap();
-            let journal_mode = sqlite
+            let journal_mode: String = sqlite
                 .query_row("PRAGMA journal_mode;", [], |row| row.get(0))
                 .unwrap();
-            let integrity_check = sqlite
+            let integrity_check: String = sqlite
                 .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
                 .unwrap();
-            let typeof_v = sqlite
+            let typeof_v: String = sqlite
                 .query_row("SELECT typeof(v) FROM t WHERE id = 1;", [], |row| row.get(0))
                 .unwrap();
-            let quote_v = sqlite
+            let quote_v: String = sqlite
                 .query_row("SELECT quote(v) FROM t WHERE id = 1;", [], |row| row.get(0))
                 .unwrap();
-            let value = sqlite
+            let value: rusqlite::types::Value = sqlite
                 .query_row("SELECT v FROM t WHERE id = 1;", [], |row| row.get(0))
                 .unwrap();
             (journal_mode, integrity_check, typeof_v, quote_v, value)

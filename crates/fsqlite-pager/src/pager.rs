@@ -1631,7 +1631,9 @@ where
         write_set: &HashMap<PageNumber, PageBuf>,
         write_pages_sorted: &[PageNumber],
     ) -> Result<()> {
-        if let Some(batch) = collect_wal_commit_batch(inner.db_size, write_set, write_pages_sorted)? {
+        if let Some(batch) =
+            collect_wal_commit_batch(inner.db_size, write_set, write_pages_sorted)?
+        {
             // Escalate to EXCLUSIVE before writing WAL frames.
             // This prevents concurrent processes from appending to the WAL
             // simultaneously, which would cause corruption.
@@ -5099,8 +5101,7 @@ mod tests {
             "bead_id={BEAD_ID} case=wal_batch_helper_sorted_first"
         );
         assert_eq!(
-            batch.frames[0].db_size_if_commit,
-            0,
+            batch.frames[0].db_size_if_commit, 0,
             "bead_id={BEAD_ID} case=wal_batch_helper_non_commit_prefix"
         );
         assert_eq!(
@@ -5129,13 +5130,11 @@ mod tests {
             .expect("single dirty page should yield a WAL batch");
 
         assert_eq!(
-            batch.new_db_size,
-            9,
+            batch.new_db_size, 9,
             "bead_id={BEAD_ID} case=wal_batch_helper_preserve_db_size"
         );
         assert_eq!(
-            batch.frames[0].db_size_if_commit,
-            9,
+            batch.frames[0].db_size_if_commit, 9,
             "bead_id={BEAD_ID} case=wal_batch_helper_commit_marker_uses_existing_db_size"
         );
     }
