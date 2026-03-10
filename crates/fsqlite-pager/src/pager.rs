@@ -1732,6 +1732,13 @@ where
     ) -> Result<()> {
         if let Some(batch) = collect_wal_commit_batch(inner.db_size, write_set, write_pages_sorted)?
         {
+            let prepared_batch = {
+                let wal = inner.wal_backend.as_mut().ok_or_else(|| {
+                    FrankenError::internal("WAL mode active but no WAL backend installed")
+                })?;
+                wal.prepare_append_frames(&batch.frames)?
+            };
+
             // Escalate to EXCLUSIVE before writing WAL frames.
             // This prevents concurrent processes from appending to the WAL
             // simultaneously, which would cause corruption.
@@ -1740,7 +1747,11 @@ where
             let wal = inner.wal_backend.as_mut().ok_or_else(|| {
                 FrankenError::internal("WAL mode active but no WAL backend installed")
             })?;
-            wal.append_frames(cx, &batch.frames)?;
+            if let Some(prepared_batch) = prepared_batch.as_ref() {
+                wal.append_prepared_frames(cx, prepared_batch)?;
+            } else {
+                wal.append_frames(cx, &batch.frames)?;
+            }
 
             // Sync WAL to ensure durability.
             let wal = inner
@@ -5580,15 +5591,13 @@ mod tests {
     #[test]
     #[ignore = "inventory evidence only"]
     fn wal_publish_window_inventory_report() {
-        let outside_window = vec![
-            json!({
-                "component": "collect_wal_commit_batch",
-                "location": "crates/fsqlite-pager/src/pager.rs::commit_wal",
-                "classification": "already_outside_publish_window",
-                "move_candidate": "not_applicable",
-                "rationale": "frame ordering, commit-marker boundary, and new_db_size derivation happen before EXCLUSIVE lock acquisition",
-            }),
-        ];
+        let outside_window = vec![json!({
+            "component": "collect_wal_commit_batch",
+            "location": "crates/fsqlite-pager/src/pager.rs::commit_wal",
+            "classification": "already_outside_publish_window",
+            "move_candidate": "not_applicable",
+            "rationale": "frame ordering, commit-marker boundary, and new_db_size derivation happen before EXCLUSIVE lock acquisition",
+        })];
 
         let inside_window = vec![
             json!({
@@ -5711,23 +5720,19 @@ mod tests {
         println!("END_BD_DB300_3_2_1_REPORT");
 
         assert_eq!(
-            report["measured_operation"],
-            "pager_commit_wal_path",
+            report["measured_operation"], "pager_commit_wal_path",
             "bead_id={TRACK_C_PUBLISH_WINDOW_INVENTORY_BEAD_ID} case=measured_operation_anchor"
         );
         assert_eq!(
-            report["summary"]["definitely_movable_inside_window_steps"],
-            5,
+            report["summary"]["definitely_movable_inside_window_steps"], 5,
             "bead_id={TRACK_C_PUBLISH_WINDOW_INVENTORY_BEAD_ID} case=movable_step_count"
         );
         assert_eq!(
-            report["summary"]["conditionally_movable_inside_window_steps"],
-            1,
+            report["summary"]["conditionally_movable_inside_window_steps"], 1,
             "bead_id={TRACK_C_PUBLISH_WINDOW_INVENTORY_BEAD_ID} case=conditional_step_count"
         );
         assert_eq!(
-            report["summary"]["required_serialized_inside_window_steps"],
-            5,
+            report["summary"]["required_serialized_inside_window_steps"], 5,
             "bead_id={TRACK_C_PUBLISH_WINDOW_INVENTORY_BEAD_ID} case=required_step_count"
         );
     }

@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 
 use fsqlite_error::{FrankenError, Result};
-use fsqlite_pager::traits::WalFrameRef;
+use fsqlite_pager::traits::{PreparedWalFrameBatch, PreparedWalFrameMeta, WalFrameRef};
 use fsqlite_pager::{CheckpointMode, CheckpointPageWriter, CheckpointResult, WalBackend};
 use fsqlite_types::PageNumber;
 use fsqlite_types::cx::Cx;
@@ -351,6 +351,90 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
                     cx,
                     frame.page_number,
                     frame.page_data,
+                    frame.db_size_if_commit,
+                ) {
+                    Ok(Some(result)) => {
+                        debug!(
+                            pages = result.page_numbers.len(),
+                            k_source = result.k_source,
+                            symbols = result.symbols.len(),
+                            "FEC commit group encoded"
+                        );
+                        self.fec_pending.push(result);
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            "FEC encoding failed; commit proceeds without repair symbols"
+                        );
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn prepare_append_frames(
+        &mut self,
+        frames: &[WalFrameRef<'_>],
+    ) -> Result<Option<PreparedWalFrameBatch>> {
+        if frames.is_empty() {
+            return Ok(None);
+        }
+
+        let wal_frames: Vec<_> = frames
+            .iter()
+            .map(|frame| WalAppendFrameRef {
+                page_number: frame.page_number,
+                page_data: frame.page_data,
+                db_size_if_commit: frame.db_size_if_commit,
+            })
+            .collect();
+        let frame_bytes = self.wal.prepare_frame_bytes(&wal_frames)?;
+        let frame_metas = frames
+            .iter()
+            .map(|frame| PreparedWalFrameMeta {
+                page_number: frame.page_number,
+                db_size_if_commit: frame.db_size_if_commit,
+            })
+            .collect();
+
+        Ok(Some(PreparedWalFrameBatch {
+            frame_size: self.wal.frame_size(),
+            page_data_offset: fsqlite_wal::checksum::WAL_FRAME_HEADER_SIZE,
+            frame_metas,
+            frame_bytes,
+        }))
+    }
+
+    fn append_prepared_frames(
+        &mut self,
+        cx: &Cx,
+        prepared: &PreparedWalFrameBatch,
+    ) -> Result<()> {
+        if prepared.frame_count() == 0 {
+            return Ok(());
+        }
+
+        if self.refresh_before_append {
+            // Keep this handle synchronized with external WAL growth/reset
+            // before choosing append offset and checksum seed.
+            self.wal.refresh(cx)?;
+        }
+
+        let mut frame_bytes = prepared.frame_bytes.clone();
+        self.wal
+            .append_prepared_frame_bytes(cx, &mut frame_bytes, prepared.frame_count())?;
+        self.refresh_before_append = false;
+
+        if let Some(hook) = &mut self.fec_hook {
+            for (index, frame) in prepared.frame_metas.iter().enumerate() {
+                match hook.on_frame(
+                    cx,
+                    frame.page_number,
+                    prepared.page_data(index),
                     frame.db_size_if_commit,
                 ) {
                     Ok(Some(result)) => {

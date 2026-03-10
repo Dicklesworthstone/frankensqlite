@@ -62,6 +62,12 @@ pub struct WalFile<F: VfsFile> {
     running_checksum: SqliteWalChecksum,
     /// Number of valid frames currently in the WAL.
     frame_count: usize,
+    /// Reusable contiguous assembly scratch for append paths.
+    ///
+    /// Ownership is per-`WalFile` handle. Append methods already require
+    /// `&mut self`, so reuse is serialized per handle and safe under
+    /// concurrent writers that use distinct WAL handles.
+    frame_scratch: Vec<u8>,
 }
 
 impl<F: VfsFile> WalFile<F> {
@@ -425,6 +431,7 @@ impl<F: VfsFile> WalFile<F> {
             header,
             running_checksum,
             frame_count: 0,
+            frame_scratch: Vec::new(),
         })
     }
 
@@ -569,6 +576,7 @@ impl<F: VfsFile> WalFile<F> {
             header,
             running_checksum: last_commit_checksum,
             frame_count: last_commit_frames,
+            frame_scratch: Vec::new(),
         })
     }
 
@@ -679,22 +687,15 @@ impl<F: VfsFile> WalFile<F> {
         Ok(())
     }
 
-    /// Append a batch of frames to the WAL using a single contiguous write.
+    /// Serialize a frame batch into contiguous WAL bytes without writing the
+    /// rolling checksum chain.
     ///
-    /// This preserves the checksum chain while avoiding per-frame write
-    /// syscalls on hot commit paths. Durability is still controlled by
-    /// [`Self::sync`] or a higher-level caller.
-    pub fn append_frames(&mut self, cx: &Cx, frames: &[WalAppendFrameRef<'_>]) -> Result<()> {
+    /// This lets higher layers move header/payload copy work out of a
+    /// serialized append window while preserving the requirement that checksum
+    /// chaining still uses the live on-disk seed at append time.
+    pub fn prepare_frame_bytes(&self, frames: &[WalAppendFrameRef<'_>]) -> Result<Vec<u8>> {
         if frames.is_empty() {
-            return Ok(());
-        }
-
-        let new_count = self
-            .frame_count
-            .checked_add(frames.len())
-            .ok_or(FrankenError::DatabaseFull)?;
-        if new_count > usize::try_from(u32::MAX).unwrap_or(usize::MAX) {
-            return Err(FrankenError::DatabaseFull);
+            return Ok(Vec::new());
         }
 
         let frame_size = self.frame_size();
@@ -703,7 +704,6 @@ impl<F: VfsFile> WalFile<F> {
             .checked_mul(frame_size)
             .ok_or(FrankenError::DatabaseFull)?;
         let mut frame_buf = vec![0u8; total_bytes];
-        let mut running_checksum = self.running_checksum;
 
         for (idx, frame) in frames.iter().enumerate() {
             if frame.page_data.len() != self.page_size {
@@ -725,7 +725,50 @@ impl<F: VfsFile> WalFile<F> {
             frame_slice[4..8].copy_from_slice(&frame.db_size_if_commit.to_be_bytes());
             write_wal_frame_salts(&mut frame_slice[..WAL_FRAME_HEADER_SIZE], self.header.salts)?;
             frame_slice[WAL_FRAME_HEADER_SIZE..].copy_from_slice(frame.page_data);
+        }
 
+        Ok(frame_buf)
+    }
+
+    /// Finalize checksums for a previously prepared frame buffer and append it.
+    ///
+    /// `prepared_frame_bytes` must contain `frame_count` frame records in WAL
+    /// frame layout with page number, db_size, salts, and payload already
+    /// serialized. The checksum bytes are overwritten in-place using the live
+    /// rolling checksum seed from this WAL handle.
+    pub fn append_prepared_frame_bytes(
+        &mut self,
+        cx: &Cx,
+        prepared_frame_bytes: &mut [u8],
+        frame_count: usize,
+    ) -> Result<()> {
+        if frame_count == 0 {
+            return Ok(());
+        }
+
+        let new_count = self
+            .frame_count
+            .checked_add(frame_count)
+            .ok_or(FrankenError::DatabaseFull)?;
+        if new_count > usize::try_from(u32::MAX).unwrap_or(usize::MAX) {
+            return Err(FrankenError::DatabaseFull);
+        }
+
+        let frame_size = self.frame_size();
+        let expected_bytes = frame_count
+            .checked_mul(frame_size)
+            .ok_or(FrankenError::DatabaseFull)?;
+        if prepared_frame_bytes.len() != expected_bytes {
+            return Err(FrankenError::WalCorrupt {
+                detail: format!(
+                    "prepared batch byte length mismatch: expected {expected_bytes}, got {}",
+                    prepared_frame_bytes.len()
+                ),
+            });
+        }
+
+        let mut running_checksum = self.running_checksum;
+        for frame_slice in prepared_frame_bytes.chunks_exact_mut(frame_size) {
             running_checksum = write_wal_frame_checksum(
                 frame_slice,
                 self.page_size,
@@ -736,31 +779,45 @@ impl<F: VfsFile> WalFile<F> {
 
         let start_frame_index = self.frame_count;
         let offset = self.frame_offset(start_frame_index);
-        self.file.write(cx, &frame_buf, offset)?;
-        self.advance_state_after_write(frames.len(), running_checksum)?;
+        self.file.write(cx, prepared_frame_bytes, offset)?;
+        self.advance_state_after_write(frame_count, running_checksum)?;
 
         let bytes_per_frame = u64::try_from(frame_size).unwrap_or(u64::MAX);
-        let bytes_written = u64::try_from(total_bytes).unwrap_or(u64::MAX);
+        let bytes_written = u64::try_from(expected_bytes).unwrap_or(u64::MAX);
         let span = tracing::span!(
             tracing::Level::DEBUG,
             "wal_batch_write",
             start_frame_index = start_frame_index,
-            frames_written = frames.len(),
+            frames_written = frame_count,
             bytes_written = bytes_written,
         );
         let _guard = span.enter();
 
         debug!(
             end_frame_count = self.frame_count,
-            frames_written = frames.len(),
+            frames_written = frame_count,
             "WAL frames appended in batch"
         );
 
-        for _ in 0..frames.len() {
+        for _ in 0..frame_count {
             crate::metrics::GLOBAL_WAL_METRICS.record_frame_write(bytes_per_frame);
         }
 
         Ok(())
+    }
+
+    /// Append a batch of frames to the WAL using a single contiguous write.
+    ///
+    /// This preserves the checksum chain while avoiding per-frame write
+    /// syscalls on hot commit paths. Durability is still controlled by
+    /// [`Self::sync`] or a higher-level caller.
+    pub fn append_frames(&mut self, cx: &Cx, frames: &[WalAppendFrameRef<'_>]) -> Result<()> {
+        if frames.is_empty() {
+            return Ok(());
+        }
+
+        let mut frame_buf = self.prepare_frame_bytes(frames)?;
+        self.append_prepared_frame_bytes(cx, &mut frame_buf, frames.len())
     }
 
     /// Read a frame by 0-based index, returning header and page data.

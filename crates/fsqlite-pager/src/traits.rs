@@ -139,6 +139,32 @@ pub trait WalBackend: Send {
         Ok(())
     }
 
+    /// Prepare a batch of frames for a later append.
+    ///
+    /// Implementations may use this to move pure serialization and copy work
+    /// ahead of the serialized append window. Returning `None` keeps the
+    /// existing `append_frames` path.
+    fn prepare_append_frames(
+        &mut self,
+        _frames: &[WalFrameRef<'_>],
+    ) -> Result<Option<PreparedWalFrameBatch>> {
+        Ok(None)
+    }
+
+    /// Append a previously prepared frame batch.
+    ///
+    /// The default path rebuilds borrowed frame refs and delegates back to
+    /// [`Self::append_frames`]. Backends that can preserve more pre-serialized
+    /// state should override this.
+    fn append_prepared_frames(
+        &mut self,
+        cx: &Cx,
+        prepared: &PreparedWalFrameBatch,
+    ) -> Result<()> {
+        let frame_refs = prepared.frame_refs();
+        self.append_frames(cx, &frame_refs)
+    }
+
     /// Look up the latest version of a page in the WAL.
     ///
     /// Scans backwards from the most recent frame. Returns `None` if the
@@ -196,6 +222,64 @@ pub struct WalFrameRef<'a> {
     pub page_data: &'a [u8],
     /// Database size in pages for commit frames, or 0 for non-commit frames.
     pub db_size_if_commit: u32,
+}
+
+/// Metadata describing one frame within a prepared WAL batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreparedWalFrameMeta {
+    /// Database page number this frame writes.
+    pub page_number: u32,
+    /// Database size in pages for commit frames, or 0 for non-commit frames.
+    pub db_size_if_commit: u32,
+}
+
+/// Owned WAL batch representation that can be prepared before append.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedWalFrameBatch {
+    /// Byte width of each serialized frame record.
+    pub frame_size: usize,
+    /// Offset of the page payload inside each serialized frame record.
+    pub page_data_offset: usize,
+    /// Per-frame metadata in order.
+    pub frame_metas: Vec<PreparedWalFrameMeta>,
+    /// Serialized frame bytes in order.
+    pub frame_bytes: Vec<u8>,
+}
+
+impl PreparedWalFrameBatch {
+    /// Number of frames carried by this batch.
+    #[must_use]
+    pub fn frame_count(&self) -> usize {
+        self.frame_metas.len()
+    }
+
+    /// Borrow this batch as pager-facing frame refs.
+    #[must_use]
+    pub fn frame_refs(&self) -> Vec<WalFrameRef<'_>> {
+        self.frame_metas
+            .iter()
+            .enumerate()
+            .map(|(index, meta)| {
+                let frame_start = index * self.frame_size;
+                let page_start = frame_start + self.page_data_offset;
+                let page_end = frame_start + self.frame_size;
+                WalFrameRef {
+                    page_number: meta.page_number,
+                    page_data: &self.frame_bytes[page_start..page_end],
+                    db_size_if_commit: meta.db_size_if_commit,
+                }
+            })
+            .collect()
+    }
+
+    /// Borrow the page payload for a prepared frame.
+    #[must_use]
+    pub fn page_data(&self, index: usize) -> &[u8] {
+        let frame_start = index * self.frame_size;
+        let page_start = frame_start + self.page_data_offset;
+        let page_end = frame_start + self.frame_size;
+        &self.frame_bytes[page_start..page_end]
+    }
 }
 
 // ---------------------------------------------------------------------------
