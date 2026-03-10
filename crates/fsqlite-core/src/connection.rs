@@ -17751,34 +17751,44 @@ impl Connection {
 
             // Stock SQLite virtual tables (FTS5, rtree, etc.) have
             // rootpage=0 in sqlite_master and CREATE SQL beginning with
-            // "CREATE VIRTUAL TABLE".  Those cannot be loaded as regular
-            // B-tree tables, so skip them gracefully.  Do NOT skip entries
+            // "CREATE VIRTUAL TABLE". Those cannot be loaded as regular
+            // B-tree tables, so skip them gracefully. Do NOT skip entries
             // merely because the SQL text starts with CREATE VIRTUAL TABLE:
             // FrankenSQLite currently materializes its own virtual tables as
             // ordinary row tables with a real root page and preserves the
             // original SQL text for introspection.
-            let is_virtual = root_page_num == 0 && is_virtual_table_sql(&create_sql);
-            if is_virtual {
+            let is_virtual = is_virtual_table_sql(&create_sql);
+            if is_virtual && root_page_num == 0 {
                 tracing::warn!(
                     table = %name,
                     rootpage = root_page_num,
-                    "skipping virtual table from sqlite_master (module not loaded)"
+                    "skipping virtual table with rootpage=0 from sqlite_master"
                 );
                 continue;
             }
             let root_page_u32 =
                 crate::compat_persist::validate_sqlite_master_root_page(&name, root_page_num)?;
 
-            // Parse the CREATE TABLE to extract column info.
+            // Parse the CREATE SQL to extract column info. The sqlite_master
+            // helper understands both ordinary CREATE TABLE definitions and
+            // CREATE VIRTUAL TABLE layouts.
             let columns = crate::compat_persist::parse_columns_from_sqlite_master_sql(&create_sql);
             let num_columns = columns.len();
-            let is_autoincrement = crate::compat_persist::is_autoincrement_table_sql(&create_sql);
+            let is_autoincrement = if is_virtual {
+                false
+            } else {
+                crate::compat_persist::is_autoincrement_table_sql(&create_sql)
+            };
 
             // Track rowid alias columns (INTEGER PRIMARY KEY).
             // When a column is INTEGER PRIMARY KEY, its value is NOT stored in the
             // record payload - it IS the rowid. We need to insert the rowid at this
             // position when loading data.
-            let ipk_col_idx = columns.iter().position(|c| c.is_ipk);
+            let ipk_col_idx = if is_virtual {
+                None
+            } else {
+                columns.iter().position(|c| c.is_ipk)
+            };
             if let Some(idx) = ipk_col_idx {
                 new_alias_map.insert(name.to_ascii_lowercase(), idx);
                 if is_autoincrement {
@@ -17792,76 +17802,82 @@ impl Connection {
 
             // Parse FK definitions and UNIQUE column groups from the CREATE TABLE AST.
             let mut fk_defs = Vec::new();
-            if let Ok(Statement::CreateTable(create_stmt)) = parse_single_statement(&create_sql) {
-                if let CreateTableBody::Columns {
-                    columns: ref col_defs,
-                    ref constraints,
-                } = create_stmt.body
+            if !is_virtual {
+                if let Ok(Statement::CreateTable(create_stmt)) = parse_single_statement(&create_sql)
                 {
-                    // Column-level FK constraints.
-                    for (i, col) in col_defs.iter().enumerate() {
-                        for c in &col.constraints {
-                            if let ColumnConstraintKind::ForeignKey(ref fk_clause) = c.kind {
-                                fk_defs.push(fk_clause_to_def(&[i], fk_clause));
+                    if let CreateTableBody::Columns {
+                        columns: ref col_defs,
+                        ref constraints,
+                    } = create_stmt.body
+                    {
+                        // Column-level FK constraints.
+                        for (i, col) in col_defs.iter().enumerate() {
+                            for c in &col.constraints {
+                                if let ColumnConstraintKind::ForeignKey(ref fk_clause) = c.kind {
+                                    fk_defs.push(fk_clause_to_def(&[i], fk_clause));
+                                }
                             }
                         }
-                    }
-                    // Table-level FK constraints.
-                    for tc in constraints {
-                        if let TableConstraintKind::ForeignKey {
-                            columns: ref fk_cols,
-                            ref clause,
-                        } = tc.kind
-                        {
-                            let child_indices: Vec<usize> = fk_cols
-                                .iter()
-                                .filter_map(|fk_name| {
-                                    columns
-                                        .iter()
-                                        .position(|c| c.name.eq_ignore_ascii_case(fk_name))
-                                })
-                                .collect();
-                            if !child_indices.is_empty() {
-                                fk_defs.push(fk_clause_to_def(&child_indices, clause));
-                            }
-                        }
-                    }
-
-                    // UNIQUE column groups for in-memory constraint enforcement.
-                    if let Some(mem_table) = new_db.get_table_mut(real_root_page) {
-                        // Column-level UNIQUE/non-IPK PRIMARY KEY.
-                        for (i, col_info) in columns.iter().enumerate() {
-                            if col_info.unique && !col_info.is_ipk {
-                                mem_table.add_unique_column_group(vec![i]);
-                            }
-                        }
-                        // Table-level UNIQUE/PRIMARY KEY constraints.
+                        // Table-level FK constraints.
                         for tc in constraints {
-                            if let TableConstraintKind::Unique {
-                                columns: ref idx_cols,
-                                ..
-                            }
-                            | TableConstraintKind::PrimaryKey {
-                                columns: ref idx_cols,
-                                ..
+                            if let TableConstraintKind::ForeignKey {
+                                columns: ref fk_cols,
+                                ref clause,
                             } = tc.kind
                             {
-                                let col_indices: Vec<usize> = idx_cols
+                                let child_indices: Vec<usize> = fk_cols
                                     .iter()
-                                    .filter_map(|ic| {
-                                        if let fsqlite_ast::Expr::Column(ref col_ref, _) = ic.expr {
-                                            columns.iter().position(|c| {
-                                                c.name.eq_ignore_ascii_case(&col_ref.column)
-                                            })
-                                        } else {
-                                            None
-                                        }
+                                    .filter_map(|fk_name| {
+                                        columns
+                                            .iter()
+                                            .position(|c| c.name.eq_ignore_ascii_case(fk_name))
                                     })
                                     .collect();
-                                if !col_indices.is_empty() {
-                                    let all_ipk = col_indices.iter().all(|&i| columns[i].is_ipk);
-                                    if !all_ipk {
-                                        mem_table.add_unique_column_group(col_indices);
+                                if !child_indices.is_empty() {
+                                    fk_defs.push(fk_clause_to_def(&child_indices, clause));
+                                }
+                            }
+                        }
+
+                        // UNIQUE column groups for in-memory constraint enforcement.
+                        if let Some(mem_table) = new_db.get_table_mut(real_root_page) {
+                            // Column-level UNIQUE/non-IPK PRIMARY KEY.
+                            for (i, col_info) in columns.iter().enumerate() {
+                                if col_info.unique && !col_info.is_ipk {
+                                    mem_table.add_unique_column_group(vec![i]);
+                                }
+                            }
+                            // Table-level UNIQUE/PRIMARY KEY constraints.
+                            for tc in constraints {
+                                if let TableConstraintKind::Unique {
+                                    columns: ref idx_cols,
+                                    ..
+                                }
+                                | TableConstraintKind::PrimaryKey {
+                                    columns: ref idx_cols,
+                                    ..
+                                } = tc.kind
+                                {
+                                    let col_indices: Vec<usize> = idx_cols
+                                        .iter()
+                                        .filter_map(|ic| {
+                                            if let fsqlite_ast::Expr::Column(ref col_ref, _) =
+                                                ic.expr
+                                            {
+                                                columns.iter().position(|c| {
+                                                    c.name.eq_ignore_ascii_case(&col_ref.column)
+                                                })
+                                            } else {
+                                                None
+                                            }
+                                        })
+                                        .collect();
+                                    if !col_indices.is_empty() {
+                                        let all_ipk =
+                                            col_indices.iter().all(|&i| columns[i].is_ipk);
+                                        if !all_ipk {
+                                            mem_table.add_unique_column_group(col_indices);
+                                        }
                                     }
                                 }
                             }
@@ -17870,14 +17886,22 @@ impl Connection {
                 }
             }
 
-            let check_defs = crate::compat_persist::extract_check_constraints_from_sql(&create_sql);
+            let check_defs = if is_virtual {
+                Vec::new()
+            } else {
+                crate::compat_persist::extract_check_constraints_from_sql(&create_sql)
+            };
 
             new_schema.push(TableSchema {
                 name: name.clone(),
                 root_page: real_root_page,
                 columns,
                 indexes: Vec::new(),
-                strict: crate::compat_persist::is_strict_table_sql(&create_sql),
+                strict: if is_virtual {
+                    false
+                } else {
+                    crate::compat_persist::is_strict_table_sql(&create_sql)
+                },
                 foreign_keys: fk_defs,
                 check_constraints: check_defs,
             });
@@ -40296,6 +40320,54 @@ mod schema_loading_tests {
                 || message.contains("payload"),
             "unexpected reopen error: {message}"
         );
+    }
+
+    #[test]
+    fn test_reopen_loads_virtual_tables_with_positive_rootpage() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("vtab_positive_rootpage.db");
+        let db_str = db_path.to_string_lossy().to_string();
+
+        {
+            let conn = Connection::open(&db_str).unwrap();
+            conn.execute("CREATE VIRTUAL TABLE docs USING fts5(subject, body)")
+                .unwrap();
+            conn.execute(
+                "INSERT INTO docs(rowid, subject, body) VALUES (1, 'Hello', 'Rust world')",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO docs(rowid, subject, body) VALUES (2, 'Other', 'Nothing here')",
+            )
+            .unwrap();
+
+            let rootpage = conn
+                .query_row("SELECT rootpage FROM sqlite_master WHERE name = 'docs'")
+                .unwrap();
+            match rootpage.values()[0] {
+                SqliteValue::Integer(value) => {
+                    assert!(
+                        value > 0,
+                        "fsqlite-native virtual tables should persist with a positive rootpage"
+                    );
+                }
+                ref other => panic!("unexpected rootpage value: {other:?}"),
+            }
+        }
+
+        let reopened = Connection::open(&db_str).unwrap();
+        let schema = reopened.schema.borrow();
+        assert!(
+            schema.iter().any(|t| t.name.eq_ignore_ascii_case("docs")),
+            "positive-rootpage virtual table should reload into schema"
+        );
+        drop(schema);
+
+        let rows = reopened
+            .query("SELECT subject FROM docs WHERE docs MATCH 'hello'")
+            .unwrap();
+        assert_eq!(rows.len(), 1, "reopened FTS table should remain queryable");
+        assert_eq!(rows[0].values()[0], SqliteValue::Text("Hello".to_owned()));
     }
 
     #[test]
