@@ -38,6 +38,17 @@ fn log_replay_decision(
     );
 }
 
+/// Borrowed frame descriptor used for consolidated WAL writes.
+#[derive(Debug, Clone, Copy)]
+pub struct WalAppendFrameRef<'a> {
+    /// Database page number this frame writes.
+    pub page_number: u32,
+    /// Page contents for the frame. Must be exactly `page_size` bytes.
+    pub page_data: &'a [u8],
+    /// Database size in pages for commit frames, or 0 for non-commit frames.
+    pub db_size_if_commit: u32,
+}
+
 /// A WAL file backed by a VFS file handle.
 ///
 /// Manages the write-ahead log: creation, sequential frame append with
@@ -664,6 +675,90 @@ impl<F: VfsFile> WalFile<F> {
         );
 
         crate::metrics::GLOBAL_WAL_METRICS.record_frame_write(bytes_written);
+
+        Ok(())
+    }
+
+    /// Append a batch of frames to the WAL using a single contiguous write.
+    ///
+    /// This preserves the checksum chain while avoiding per-frame write
+    /// syscalls on hot commit paths. Durability is still controlled by
+    /// [`Self::sync`] or a higher-level caller.
+    pub fn append_frames(&mut self, cx: &Cx, frames: &[WalAppendFrameRef<'_>]) -> Result<()> {
+        if frames.is_empty() {
+            return Ok(());
+        }
+
+        let new_count = self
+            .frame_count
+            .checked_add(frames.len())
+            .ok_or(FrankenError::DatabaseFull)?;
+        if new_count > usize::try_from(u32::MAX).unwrap_or(usize::MAX) {
+            return Err(FrankenError::DatabaseFull);
+        }
+
+        let frame_size = self.frame_size();
+        let total_bytes = frames
+            .len()
+            .checked_mul(frame_size)
+            .ok_or(FrankenError::DatabaseFull)?;
+        let mut frame_buf = vec![0u8; total_bytes];
+        let mut running_checksum = self.running_checksum;
+
+        for (idx, frame) in frames.iter().enumerate() {
+            if frame.page_data.len() != self.page_size {
+                return Err(FrankenError::WalCorrupt {
+                    detail: format!(
+                        "page data size mismatch in batch frame {idx}: expected {}, got {}",
+                        self.page_size,
+                        frame.page_data.len()
+                    ),
+                });
+            }
+
+            let buf_offset = idx
+                .checked_mul(frame_size)
+                .ok_or(FrankenError::DatabaseFull)?;
+            let frame_slice = &mut frame_buf[buf_offset..buf_offset + frame_size];
+
+            frame_slice[..4].copy_from_slice(&frame.page_number.to_be_bytes());
+            frame_slice[4..8].copy_from_slice(&frame.db_size_if_commit.to_be_bytes());
+            write_wal_frame_salts(&mut frame_slice[..WAL_FRAME_HEADER_SIZE], self.header.salts)?;
+            frame_slice[WAL_FRAME_HEADER_SIZE..].copy_from_slice(frame.page_data);
+
+            running_checksum = write_wal_frame_checksum(
+                frame_slice,
+                self.page_size,
+                running_checksum,
+                self.big_endian_checksum,
+            )?;
+        }
+
+        let start_frame_index = self.frame_count;
+        let offset = self.frame_offset(start_frame_index);
+        self.file.write(cx, &frame_buf, offset)?;
+        self.advance_state_after_write(frames.len(), running_checksum)?;
+
+        let bytes_per_frame = u64::try_from(frame_size).unwrap_or(u64::MAX);
+        let bytes_written = u64::try_from(total_bytes).unwrap_or(u64::MAX);
+        let span = tracing::span!(
+            tracing::Level::DEBUG,
+            "wal_batch_write",
+            start_frame_index = start_frame_index,
+            frames_written = frames.len(),
+            bytes_written = bytes_written,
+        );
+        let _guard = span.enter();
+
+        debug!(
+            end_frame_count = self.frame_count,
+            frames_written = frames.len(),
+            "WAL frames appended in batch"
+        );
+
+        for _ in 0..frames.len() {
+            crate::metrics::GLOBAL_WAL_METRICS.record_frame_write(bytes_per_frame);
+        }
 
         Ok(())
     }
@@ -1885,6 +1980,56 @@ mod tests {
 
         wal_s.close(&cx).expect("close single");
         wal_g.close(&cx).expect("close group");
+    }
+
+    #[test]
+    fn test_batch_append_checksum_chain_matches_single_append() {
+        let cx = test_cx();
+        let vfs_single = MemoryVfs::new();
+        let vfs_batch = MemoryVfs::new();
+
+        let pages: Vec<Vec<u8>> = (0..6u8).map(sample_page).collect();
+        let page_nums: Vec<u32> = (1..=6u32).collect();
+        let commit_sizes: Vec<u32> = vec![0, 0, 3, 0, 0, 6];
+
+        let file_single = open_wal_file(&vfs_single, &cx);
+        let mut wal_single =
+            WalFile::create(&cx, file_single, PAGE_SIZE, 0, test_salts()).expect("create single");
+        for i in 0..6 {
+            wal_single
+                .append_frame(&cx, page_nums[i], &pages[i], commit_sizes[i])
+                .expect("append single");
+        }
+
+        let file_batch = open_wal_file(&vfs_batch, &cx);
+        let mut wal_batch =
+            WalFile::create(&cx, file_batch, PAGE_SIZE, 0, test_salts()).expect("create batch");
+        let frames: Vec<_> = (0..6)
+            .map(|i| WalAppendFrameRef {
+                page_number: page_nums[i],
+                page_data: &pages[i],
+                db_size_if_commit: commit_sizes[i],
+            })
+            .collect();
+        wal_batch.append_frames(&cx, &frames).expect("append batch");
+
+        assert_eq!(
+            wal_single.frame_count(),
+            wal_batch.frame_count(),
+            "batch append must preserve frame count"
+        );
+        assert_eq!(
+            wal_single.running_checksum(),
+            wal_batch.running_checksum(),
+            "batch append must preserve checksum chain"
+        );
+
+        for i in 0..6 {
+            let (single_header, single_data) = wal_single.read_frame(&cx, i).expect("read single");
+            let (batch_header, batch_data) = wal_batch.read_frame(&cx, i).expect("read batch");
+            assert_eq!(single_header, batch_header, "frame header {i} must match");
+            assert_eq!(single_data, batch_data, "frame payload {i} must match");
+        }
     }
 
     #[test]

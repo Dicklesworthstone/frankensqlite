@@ -8,6 +8,7 @@
 //! - `corpus verify` — Verify golden copies against `sample_sqlite_db_files/checksums.sha256`.
 //! - `run` — Execute an OpLog workload against a chosen engine.
 //! - `bench` — Run a Criterion-style benchmark matrix.
+//! - `hot-profile` — Capture a structured mixed-read-write hot-path profile.
 //! - `corrupt` — Inject corruption into a working copy for recovery testing.
 //! - `compare` — Tiered comparison of two database files (bd-2als.3.2).
 
@@ -35,10 +36,89 @@ use fsqlite_e2e::fsqlite_executor::{FsqliteExecConfig, run_oplog_fsqlite};
 use fsqlite_e2e::golden::{format_mismatch_diagnostic, verify_databases};
 use fsqlite_e2e::methodology::EnvironmentMeta;
 use fsqlite_e2e::oplog::{self, OpLog};
+use fsqlite_e2e::perf_runner::{
+    FsqliteHotPathProfileConfig, profile_fsqlite_mixed_read_write_hot_path,
+    write_hot_path_profile_artifacts,
+};
 use fsqlite_e2e::report::{EngineInfo, RunRecordV1, RunRecordV1Args};
 use fsqlite_e2e::report_render::render_benchmark_summaries_markdown;
 use fsqlite_e2e::run_workspace::{WorkspaceConfig, create_workspace_with_label};
 use fsqlite_e2e::sqlite_executor::{SqliteExecConfig, run_oplog_sqlite};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RunModeOptions {
+    run_integrity_check: bool,
+    capture_environment_metadata: bool,
+    hot_path_profile: bool,
+}
+
+impl Default for RunModeOptions {
+    fn default() -> Self {
+        Self {
+            run_integrity_check: true,
+            capture_environment_metadata: true,
+            hot_path_profile: false,
+        }
+    }
+}
+
+impl RunModeOptions {
+    #[must_use]
+    const fn from_flags(
+        profile_only: bool,
+        skip_integrity_check: bool,
+        skip_environment_metadata: bool,
+    ) -> Self {
+        Self {
+            run_integrity_check: !(profile_only || skip_integrity_check),
+            capture_environment_metadata: !(profile_only || skip_environment_metadata),
+            hot_path_profile: profile_only,
+        }
+    }
+
+    fn environment(self, cargo_profile: &str) -> EnvironmentMeta {
+        if self.capture_environment_metadata {
+            EnvironmentMeta::capture(cargo_profile)
+        } else {
+            EnvironmentMeta::suppressed(cargo_profile)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn serialize_run_output(
+    recorded_unix_ms: u64,
+    environment: &EnvironmentMeta,
+    engine: EngineInfo,
+    fixture_id: &str,
+    golden_path: &Path,
+    golden_sha256: Option<String>,
+    workload: &str,
+    concurrency: u16,
+    ops_count: usize,
+    report: fsqlite_e2e::report::EngineRunReport,
+    pretty: bool,
+) -> Result<String, serde_json::Error> {
+    let ops_count = u64::try_from(ops_count).unwrap_or(u64::MAX);
+    let record = RunRecordV1::new(RunRecordV1Args {
+        recorded_unix_ms,
+        environment: environment.clone(),
+        engine,
+        fixture_id: fixture_id.to_owned(),
+        golden_path: Some(golden_path.display().to_string()),
+        golden_sha256,
+        workload: workload.to_owned(),
+        concurrency,
+        ops_count,
+        report,
+    });
+
+    if pretty {
+        record.to_pretty_json()
+    } else {
+        record.to_jsonl_line()
+    }
+}
 
 fn main() {
     let exit_code = run_cli(std::env::args_os());
@@ -68,6 +148,7 @@ where
         "corpus" => cmd_corpus(&tail[1..]),
         "run" => cmd_run(&tail[1..]),
         "bench" => cmd_bench(&tail[1..]),
+        "hot-profile" => cmd_hot_profile(&tail[1..]),
         "corrupt" => cmd_corrupt(&tail[1..]),
         "compare" => cmd_compare(&tail[1..]),
         other => {
@@ -94,6 +175,7 @@ SUBCOMMANDS:
     corpus verify           Verify golden copies against checksums.sha256
     run                     Execute an OpLog workload against an engine
     bench                   Run the benchmark matrix (Criterion)
+    hot-profile             Capture mixed_read_write hot-path evidence
     corrupt                 Inject corruption into a working copy
     compare                 Tiered comparison of two database files
 
@@ -108,6 +190,7 @@ EXAMPLES:
     realdb-e2e run --engine sqlite3 --db beads-proj-a --workload commutative_inserts --concurrency 4
     realdb-e2e run --engine fsqlite --db beads-proj-a --workload hot_page_contention --concurrency 8
     realdb-e2e bench --db beads-proj-a --preset all
+    realdb-e2e hot-profile --db beads-proj-a --concurrency 4
     realdb-e2e corrupt --db beads-proj-a --strategy page --page 1 --seed 42
 ";
     let _ = io::stdout().write_all(text.as_bytes());
@@ -1288,6 +1371,9 @@ fn cmd_run(argv: &[String]) -> i32 {
     let mut concurrency: Vec<u16> = vec![1];
     let mut repeat: usize = 1;
     let mut fsqlite_mvcc: bool = true;
+    let mut profile_only = false;
+    let mut skip_integrity_check = false;
+    let mut skip_environment_metadata = false;
     let mut pretty: bool = false;
     let mut output_jsonl: Option<PathBuf> = None;
 
@@ -1354,6 +1440,15 @@ fn cmd_run(argv: &[String]) -> i32 {
             "--no-mvcc" => {
                 fsqlite_mvcc = false;
             }
+            "--profile-only" => {
+                profile_only = true;
+            }
+            "--skip-integrity-check" => {
+                skip_integrity_check = true;
+            }
+            "--skip-environment-metadata" => {
+                skip_environment_metadata = true;
+            }
             "--pretty" => {
                 pretty = true;
             }
@@ -1385,6 +1480,11 @@ fn cmd_run(argv: &[String]) -> i32 {
         eprintln!("error: --workload is required (preset name)");
         return 2;
     };
+    let run_mode = RunModeOptions::from_flags(
+        profile_only,
+        skip_integrity_check,
+        skip_environment_metadata,
+    );
 
     match engine_str {
         "sqlite3" => run_sqlite3_engine(
@@ -1392,6 +1492,7 @@ fn cmd_run(argv: &[String]) -> i32 {
             workload_name,
             &concurrency,
             repeat,
+            run_mode,
             pretty,
             output_jsonl.as_deref(),
         ),
@@ -1401,6 +1502,7 @@ fn cmd_run(argv: &[String]) -> i32 {
             &concurrency,
             repeat,
             fsqlite_mvcc,
+            run_mode,
             pretty,
             output_jsonl.as_deref(),
         ),
@@ -1479,6 +1581,7 @@ fn run_sqlite3_engine(
     workload_name: &str,
     concurrency: &[u16],
     repeat: usize,
+    run_mode: RunModeOptions,
     pretty: bool,
     output_jsonl: Option<&Path>,
 ) -> i32 {
@@ -1509,8 +1612,12 @@ fn run_sqlite3_engine(
         return 1;
     }
 
-    let config = SqliteExecConfig::default();
+    let config = SqliteExecConfig {
+        run_integrity_check: run_mode.run_integrity_check,
+        ..SqliteExecConfig::default()
+    };
     let sqlite_version = rusqlite::version().to_owned();
+    let environment = run_mode.environment(cargo_profile_name());
 
     let golden_sha256 = match sha256_file(&golden_path) {
         Ok(h) => Some(h),
@@ -1574,30 +1681,23 @@ fn run_sqlite3_engine(
                 .duration_since(UNIX_EPOCH)
                 .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
 
-            let record = RunRecordV1::new(RunRecordV1Args {
+            let text = match serialize_run_output(
                 recorded_unix_ms,
-                environment: EnvironmentMeta::capture("release"),
-                engine: EngineInfo {
+                &environment,
+                EngineInfo {
                     name: "sqlite3".to_owned(),
                     sqlite_version: Some(sqlite_version.clone()),
                     fsqlite_git: None,
                 },
-                fixture_id: db_name.to_owned(),
-                golden_path: Some(golden_path.display().to_string()),
-                golden_sha256: golden_sha256.clone(),
-                workload: workload_name.to_owned(),
-                concurrency: c,
-                ops_count: u64::try_from(oplog.records.len()).unwrap_or(u64::MAX),
+                db_name,
+                &golden_path,
+                golden_sha256.clone(),
+                workload_name,
+                c,
+                oplog.records.len(),
                 report,
-            });
-
-            let json = if pretty {
-                record.to_pretty_json()
-            } else {
-                record.to_jsonl_line()
-            };
-
-            let text = match json {
+                pretty,
+            ) {
                 Ok(t) => t,
                 Err(e) => {
                     eprintln!("error: failed to serialize report: {e}");
@@ -1631,6 +1731,7 @@ fn run_fsqlite_engine(
     concurrency: &[u16],
     repeat: usize,
     mvcc: bool,
+    run_mode: RunModeOptions,
     pretty: bool,
     output_jsonl: Option<&Path>,
 ) -> i32 {
@@ -1652,8 +1753,11 @@ fn run_fsqlite_engine(
 
     let config = FsqliteExecConfig {
         concurrent_mode: mvcc,
+        run_integrity_check: run_mode.run_integrity_check,
+        collect_hot_path_profile: run_mode.hot_path_profile,
         ..FsqliteExecConfig::default()
     };
+    let environment = run_mode.environment(cargo_profile_name());
 
     let mut results: Vec<RunAgg> = Vec::new();
     let mut any_error = false;
@@ -1709,30 +1813,23 @@ fn run_fsqlite_engine(
                 .duration_since(UNIX_EPOCH)
                 .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
 
-            let record = RunRecordV1::new(RunRecordV1Args {
+            let text = match serialize_run_output(
                 recorded_unix_ms,
-                environment: EnvironmentMeta::capture("release"),
-                engine: EngineInfo {
+                &environment,
+                EngineInfo {
                     name: "fsqlite".to_owned(),
                     sqlite_version: None,
                     fsqlite_git: None,
                 },
-                fixture_id: db_name.to_owned(),
-                golden_path: Some(golden_path.display().to_string()),
-                golden_sha256: golden_sha256.clone(),
-                workload: workload_name.to_owned(),
-                concurrency: c,
-                ops_count: u64::try_from(oplog.records.len()).unwrap_or(u64::MAX),
+                db_name,
+                &golden_path,
+                golden_sha256.clone(),
+                workload_name,
+                c,
+                oplog.records.len(),
                 report,
-            });
-
-            let json = if pretty {
-                record.to_pretty_json()
-            } else {
-                record.to_jsonl_line()
-            };
-
-            let text = match json {
+                pretty,
+            ) {
                 Ok(t) => t,
                 Err(e) => {
                     eprintln!("error: failed to serialize report: {e}");
@@ -1887,6 +1984,11 @@ OPTIONS:
     --repeat <N>            Repetitions per concurrency (default: 1)
     --mvcc                  For fsqlite: force MVCC concurrent_mode on (default)
     --no-mvcc               For fsqlite: disable MVCC concurrent_mode
+    --profile-only          Skip integrity_check, suppress environment probing,
+                            and capture hot-path metrics for fsqlite runs
+    --skip-integrity-check  Disable post-run PRAGMA integrity_check explicitly
+    --skip-environment-metadata
+                            Keep RunRecordV1 output but mark environment as suppressed
     --output-jsonl <PATH>   Append a single JSONL record to PATH
     --pretty                Pretty-print JSON to stdout (default: JSONL)
     -h, --help              Show this help message
@@ -2273,6 +2375,221 @@ OPTIONS:
     --output-jsonl <PATH>   Append compact JSONL BenchmarkSummary records to PATH
     --output-md <PATH>      Write a Markdown report to PATH (rendered from summaries)
     --pretty                Pretty-print JSON to stdout (default: JSONL)
+    -h, --help              Show this help message
+";
+    let _ = io::stdout().write_all(text.as_bytes());
+}
+
+fn cmd_hot_profile(argv: &[String]) -> i32 {
+    if argv.iter().any(|arg| arg == "-h" || arg == "--help") {
+        print_hot_profile_help();
+        return 0;
+    }
+
+    let mut golden_dir = PathBuf::from(DEFAULT_GOLDEN_DIR);
+    let mut working_base = PathBuf::from(DEFAULT_WORKING_DIR);
+    let mut db: Option<String> = None;
+    let mut concurrency: u16 = 4;
+    let mut seed: u64 = 42;
+    let mut scale: u32 = 50;
+    let mut output_dir: Option<PathBuf> = None;
+    let mut mvcc = true;
+    let mut run_integrity_check = false;
+    let mut pretty = false;
+
+    let mut i = 0;
+    while i < argv.len() {
+        match argv[i].as_str() {
+            "--golden-dir" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("error: --golden-dir requires a directory path");
+                    return 2;
+                }
+                golden_dir = PathBuf::from(&argv[i]);
+            }
+            "--working-base" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("error: --working-base requires a directory path");
+                    return 2;
+                }
+                working_base = PathBuf::from(&argv[i]);
+            }
+            "--db" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("error: --db requires a fixture id");
+                    return 2;
+                }
+                db = Some(argv[i].clone());
+            }
+            "--concurrency" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("error: --concurrency requires an integer");
+                    return 2;
+                }
+                let Ok(value) = argv[i].parse::<u16>() else {
+                    eprintln!("error: invalid integer for --concurrency: `{}`", argv[i]);
+                    return 2;
+                };
+                concurrency = value;
+            }
+            "--seed" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("error: --seed requires an integer");
+                    return 2;
+                }
+                let Ok(value) = argv[i].parse::<u64>() else {
+                    eprintln!("error: invalid integer for --seed: `{}`", argv[i]);
+                    return 2;
+                };
+                seed = value;
+            }
+            "--scale" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("error: --scale requires an integer");
+                    return 2;
+                }
+                let Ok(value) = argv[i].parse::<u32>() else {
+                    eprintln!("error: invalid integer for --scale: `{}`", argv[i]);
+                    return 2;
+                };
+                scale = value;
+            }
+            "--output-dir" => {
+                i += 1;
+                if i >= argv.len() {
+                    eprintln!("error: --output-dir requires a directory path");
+                    return 2;
+                }
+                output_dir = Some(PathBuf::from(&argv[i]));
+            }
+            "--mvcc" => mvcc = true,
+            "--no-mvcc" => mvcc = false,
+            "--integrity-check" => run_integrity_check = true,
+            "--pretty" => pretty = true,
+            other => {
+                eprintln!("error: unknown option `{other}`");
+                return 2;
+            }
+        }
+        i += 1;
+    }
+
+    let Some(db) = db else {
+        eprintln!("error: --db is required");
+        return 2;
+    };
+    if concurrency == 0 {
+        eprintln!("error: --concurrency must be >= 1");
+        return 2;
+    }
+
+    let workspace_config = WorkspaceConfig {
+        golden_dir: golden_dir.clone(),
+        working_base,
+    };
+    let label = format!("hot_profile_{db}_c{concurrency}_s{seed}");
+    let workspace = match create_workspace_with_label(&workspace_config, &[db.as_str()], &label) {
+        Ok(workspace) => workspace,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return 1;
+        }
+    };
+    let Some(profile_db) = workspace.databases.first() else {
+        eprintln!("error: fixture workspace did not contain `{db}`");
+        return 1;
+    };
+
+    let output_dir = output_dir.unwrap_or_else(|| {
+        PathBuf::from("artifacts")
+            .join("bd-db300.4.1")
+            .join(format!("{db}_c{concurrency}_s{seed}"))
+    });
+    let replay_command = format!(
+        "cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db {db} --concurrency {concurrency} --seed {seed} --scale {scale} --output-dir {}{}{}",
+        output_dir.display(),
+        if mvcc { " --mvcc" } else { " --no-mvcc" },
+        if run_integrity_check {
+            " --integrity-check"
+        } else {
+            ""
+        }
+    );
+    let config = FsqliteHotPathProfileConfig {
+        seed,
+        scale,
+        concurrency,
+        exec_config: FsqliteExecConfig {
+            concurrent_mode: mvcc,
+            run_integrity_check,
+            ..FsqliteExecConfig::default()
+        },
+        replay_command,
+    };
+
+    let report = match profile_fsqlite_mixed_read_write_hot_path(&profile_db.db_path, &db, &config)
+    {
+        Ok(report) => report,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return 1;
+        }
+    };
+    let manifest = match write_hot_path_profile_artifacts(&report, &output_dir) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            eprintln!("error: failed to write hot-path artifacts: {error}");
+            return 1;
+        }
+    };
+
+    if pretty {
+        match serde_json::to_string_pretty(&report) {
+            Ok(json) => println!("{json}"),
+            Err(error) => {
+                eprintln!("error: failed to serialize hot-path report: {error}");
+                return 1;
+            }
+        }
+    } else {
+        match serde_json::to_string(&manifest) {
+            Ok(json) => println!("{json}"),
+            Err(error) => {
+                eprintln!("error: failed to serialize hot-path manifest: {error}");
+                return 1;
+            }
+        }
+    }
+
+    eprintln!("Wrote hot-path artifacts: {}", output_dir.display());
+    0
+}
+
+fn print_hot_profile_help() {
+    let text = "\
+realdb-e2e hot-profile — Capture mixed_read_write hot-path evidence
+
+USAGE:
+    realdb-e2e hot-profile [OPTIONS]
+
+OPTIONS:
+    --golden-dir <DIR>      Golden directory (default: sample_sqlite_db_files/golden)
+    --working-base <DIR>    Working-copy directory (default: sample_sqlite_db_files/working)
+    --db <DB_ID>            Database fixture id (required)
+    --concurrency <N>       Worker count for mixed_read_write (default: 4)
+    --seed <N>              Deterministic workload seed (default: 42)
+    --scale <N>             Workload scale passed to preset_mixed_read_write (default: 50)
+    --output-dir <DIR>      Artifact output directory
+    --mvcc                  Force concurrent mode on (default)
+    --no-mvcc               Disable concurrent mode for forced serialized comparison
+    --integrity-check       Run post-run integrity check (default: off for lower profiling noise)
+    --pretty                Print the full report JSON instead of the manifest JSON
     -h, --help              Show this help message
 ";
     let _ = io::stdout().write_all(text.as_bytes());
@@ -3330,6 +3647,7 @@ fn cmd_compare(argv: &[String]) -> i32 {
 mod tests {
     use super::*;
     use fsqlite_e2e::report::{CorrectnessReport, EngineRunReport};
+    use serde_json::Value;
 
     fn run_with(args: &[&str]) -> i32 {
         let os_args: Vec<OsString> = args.iter().map(OsString::from).collect();
@@ -3355,6 +3673,7 @@ mod tests {
             },
             latency_ms: None,
             error: None,
+            hot_path_profile: None,
         }
     }
 
@@ -3369,6 +3688,81 @@ mod tests {
         report.correctness.integrity_check_ok = Some(true);
         report.error = Some("boom".to_owned());
         assert!(report_has_failure(&report));
+    }
+
+    #[test]
+    fn run_mode_options_preserve_defaults_without_flags() {
+        let options = RunModeOptions::from_flags(false, false, false);
+        assert!(options.run_integrity_check);
+        assert!(options.capture_environment_metadata);
+    }
+
+    #[test]
+    fn run_mode_options_profile_only_disables_integrity_and_metadata() {
+        let options = RunModeOptions::from_flags(true, false, false);
+        assert!(!options.run_integrity_check);
+        assert!(!options.capture_environment_metadata);
+    }
+
+    #[test]
+    fn serialize_run_output_profile_only_suppresses_environment_metadata() {
+        let environment = RunModeOptions::from_flags(true, false, false).environment("release");
+        let text = serialize_run_output(
+            123,
+            &environment,
+            EngineInfo {
+                name: "sqlite3".to_owned(),
+                sqlite_version: Some("3.46.0".to_owned()),
+                fsqlite_git: None,
+            },
+            "fixture-a",
+            Path::new("/tmp/fixture-a.db"),
+            Some("abc".to_owned()),
+            "mixed_read_write",
+            4,
+            17,
+            sample_engine_report(),
+            false,
+        )
+        .expect("profile-only serialization should succeed");
+        let value: Value = serde_json::from_str(&text).expect("profile record must parse");
+        assert_eq!(
+            value["schema_version"],
+            fsqlite_e2e::report::RUN_RECORD_SCHEMA_V1
+        );
+        assert_eq!(value["environment"]["capture_mode"], "suppressed");
+        assert_eq!(value["environment"]["os"], "suppressed");
+    }
+
+    #[test]
+    fn serialize_run_output_default_keeps_environment_metadata() {
+        let environment = RunModeOptions::default().environment("release");
+        let text = serialize_run_output(
+            123,
+            &environment,
+            EngineInfo {
+                name: "sqlite3".to_owned(),
+                sqlite_version: Some("3.46.0".to_owned()),
+                fsqlite_git: None,
+            },
+            "fixture-a",
+            Path::new("/tmp/fixture-a.db"),
+            Some("abc".to_owned()),
+            "mixed_read_write",
+            4,
+            17,
+            sample_engine_report(),
+            false,
+        )
+        .expect("default serialization should succeed");
+        let value: Value = serde_json::from_str(&text).expect("run record must parse");
+        assert_eq!(
+            value["schema_version"],
+            fsqlite_e2e::report::RUN_RECORD_SCHEMA_V1
+        );
+        assert!(value.get("environment").is_some());
+        assert!(value.get("methodology").is_some());
+        assert_eq!(value["environment"]["capture_mode"], "captured");
     }
 
     #[test]
@@ -3475,6 +3869,91 @@ mod tests {
             OsString::from("--no-mvcc"),
         ];
         assert_eq!(run_cli(os_args), 0);
+    }
+
+    #[test]
+    fn test_run_profile_only_outputs_suppressed_environment_record() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db_path = tmp.path().to_str().unwrap().to_owned();
+        rusqlite::Connection::open(&db_path)
+            .unwrap()
+            .execute_batch("CREATE TABLE seed (id INTEGER PRIMARY KEY);")
+            .unwrap();
+        let output = tempfile::NamedTempFile::new().unwrap();
+
+        let os_args = vec![
+            OsString::from("realdb-e2e"),
+            OsString::from("run"),
+            OsString::from("--engine"),
+            OsString::from("sqlite3"),
+            OsString::from("--db"),
+            OsString::from(db_path),
+            OsString::from("--workload"),
+            OsString::from("commutative_inserts_disjoint_keys"),
+            OsString::from("--profile-only"),
+            OsString::from("--output-jsonl"),
+            OsString::from(output.path()),
+        ];
+        assert_eq!(run_cli(os_args), 0);
+
+        let text = fs::read_to_string(output.path()).expect("profile output should exist");
+        let first_line = text
+            .lines()
+            .next()
+            .expect("profile output should be non-empty");
+        let value: Value = serde_json::from_str(first_line).expect("profile line must be JSON");
+        assert_eq!(
+            value["schema_version"],
+            fsqlite_e2e::report::RUN_RECORD_SCHEMA_V1
+        );
+        assert_eq!(value["environment"]["capture_mode"], "suppressed");
+        assert_eq!(
+            value["report"]["correctness"]["integrity_check_ok"],
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn test_run_granular_skip_flags_work_without_profile_only() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db_path = tmp.path().to_str().unwrap().to_owned();
+        rusqlite::Connection::open(&db_path)
+            .unwrap()
+            .execute_batch("CREATE TABLE seed (id INTEGER PRIMARY KEY);")
+            .unwrap();
+        let output = tempfile::NamedTempFile::new().unwrap();
+
+        let os_args = vec![
+            OsString::from("realdb-e2e"),
+            OsString::from("run"),
+            OsString::from("--engine"),
+            OsString::from("sqlite3"),
+            OsString::from("--db"),
+            OsString::from(db_path),
+            OsString::from("--workload"),
+            OsString::from("commutative_inserts_disjoint_keys"),
+            OsString::from("--skip-integrity-check"),
+            OsString::from("--skip-environment-metadata"),
+            OsString::from("--output-jsonl"),
+            OsString::from(output.path()),
+        ];
+        assert_eq!(run_cli(os_args), 0);
+
+        let text = fs::read_to_string(output.path()).expect("profile output should exist");
+        let first_line = text
+            .lines()
+            .next()
+            .expect("profile output should be non-empty");
+        let value: Value = serde_json::from_str(first_line).expect("profile line must be JSON");
+        assert_eq!(
+            value["schema_version"],
+            fsqlite_e2e::report::RUN_RECORD_SCHEMA_V1
+        );
+        assert_eq!(value["environment"]["capture_mode"], "suppressed");
+        assert_eq!(
+            value["report"]["correctness"]["integrity_check_ok"],
+            Value::Null
+        );
     }
 
     #[test]

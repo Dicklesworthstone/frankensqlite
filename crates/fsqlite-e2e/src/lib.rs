@@ -208,9 +208,14 @@ impl HarnessSettings {
     /// Build an [`fsqlite_executor::FsqliteExecConfig`] from these settings.
     #[must_use]
     pub fn to_fsqlite_exec_config(&self) -> fsqlite_executor::FsqliteExecConfig {
+        let defaults = fsqlite_executor::FsqliteExecConfig::default();
         fsqlite_executor::FsqliteExecConfig {
             pragmas: self.to_fsqlite_pragmas(),
             concurrent_mode: self.concurrent_mode,
+            max_busy_retries: defaults.max_busy_retries,
+            busy_backoff: defaults.busy_backoff,
+            busy_backoff_max: defaults.busy_backoff_max,
+            collect_hot_path_profile: defaults.collect_hot_path_profile,
             run_integrity_check: self.run_integrity_check,
         }
     }

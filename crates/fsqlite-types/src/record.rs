@@ -7,11 +7,150 @@
 //!
 //! See: <https://www.sqlite.org/fileformat.html#record_format>
 
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
+use std::time::Instant;
+
 use crate::serial_type::{
     SerialTypeClass, classify_serial_type, read_varint, serial_type_for_blob,
     serial_type_for_integer, serial_type_for_text, serial_type_len, varint_len, write_varint,
 };
 use crate::value::SqliteValue;
+
+static FSQLITE_RECORD_PROFILE_ENABLED: AtomicBool = AtomicBool::new(false);
+static FSQLITE_RECORD_PARSE_CALLS: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_RECORD_PARSE_INTO_CALLS: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_RECORD_PARSE_COLUMN_CALLS: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_RECORD_BYTES_SCANNED: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_RECORD_VEC_CAPACITY_SLOTS: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_RECORD_DECODE_TIME_NS: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_RECORD_VALUE_NULLS: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_RECORD_VALUE_INTEGERS: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_RECORD_VALUE_FLOATS: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_RECORD_VALUE_TEXTS: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_RECORD_VALUE_BLOBS: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_RECORD_TEXT_BYTES: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_RECORD_BLOB_BYTES: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ValueTypeProfileSnapshot {
+    pub null_count: u64,
+    pub integer_count: u64,
+    pub float_count: u64,
+    pub text_count: u64,
+    pub blob_count: u64,
+    pub text_bytes: u64,
+    pub blob_bytes: u64,
+}
+
+impl ValueTypeProfileSnapshot {
+    #[must_use]
+    pub fn total_values(self) -> u64 {
+        self.null_count
+            .saturating_add(self.integer_count)
+            .saturating_add(self.float_count)
+            .saturating_add(self.text_count)
+            .saturating_add(self.blob_count)
+    }
+
+    pub fn saturating_add_assign(&mut self, other: Self) {
+        self.null_count = self.null_count.saturating_add(other.null_count);
+        self.integer_count = self.integer_count.saturating_add(other.integer_count);
+        self.float_count = self.float_count.saturating_add(other.float_count);
+        self.text_count = self.text_count.saturating_add(other.text_count);
+        self.blob_count = self.blob_count.saturating_add(other.blob_count);
+        self.text_bytes = self.text_bytes.saturating_add(other.text_bytes);
+        self.blob_bytes = self.blob_bytes.saturating_add(other.blob_bytes);
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RecordHotPathProfileSnapshot {
+    pub parse_record_calls: u64,
+    pub parse_record_into_calls: u64,
+    pub parse_record_column_calls: u64,
+    pub record_bytes_scanned: u64,
+    pub record_vec_capacity_slots: u64,
+    pub decode_time_ns: u64,
+    pub decoded_values: ValueTypeProfileSnapshot,
+}
+
+pub fn set_record_profile_enabled(enabled: bool) {
+    FSQLITE_RECORD_PROFILE_ENABLED.store(enabled, AtomicOrdering::Relaxed);
+}
+
+#[must_use]
+pub fn record_profile_enabled() -> bool {
+    FSQLITE_RECORD_PROFILE_ENABLED.load(AtomicOrdering::Relaxed)
+}
+
+pub fn reset_record_profile() {
+    FSQLITE_RECORD_PARSE_CALLS.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_RECORD_PARSE_INTO_CALLS.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_RECORD_PARSE_COLUMN_CALLS.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_RECORD_BYTES_SCANNED.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_RECORD_VEC_CAPACITY_SLOTS.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_RECORD_DECODE_TIME_NS.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_RECORD_VALUE_NULLS.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_RECORD_VALUE_INTEGERS.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_RECORD_VALUE_FLOATS.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_RECORD_VALUE_TEXTS.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_RECORD_VALUE_BLOBS.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_RECORD_TEXT_BYTES.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_RECORD_BLOB_BYTES.store(0, AtomicOrdering::Relaxed);
+}
+
+#[must_use]
+pub fn record_profile_snapshot() -> RecordHotPathProfileSnapshot {
+    RecordHotPathProfileSnapshot {
+        parse_record_calls: FSQLITE_RECORD_PARSE_CALLS.load(AtomicOrdering::Relaxed),
+        parse_record_into_calls: FSQLITE_RECORD_PARSE_INTO_CALLS.load(AtomicOrdering::Relaxed),
+        parse_record_column_calls: FSQLITE_RECORD_PARSE_COLUMN_CALLS.load(AtomicOrdering::Relaxed),
+        record_bytes_scanned: FSQLITE_RECORD_BYTES_SCANNED.load(AtomicOrdering::Relaxed),
+        record_vec_capacity_slots: FSQLITE_RECORD_VEC_CAPACITY_SLOTS.load(AtomicOrdering::Relaxed),
+        decode_time_ns: FSQLITE_RECORD_DECODE_TIME_NS.load(AtomicOrdering::Relaxed),
+        decoded_values: ValueTypeProfileSnapshot {
+            null_count: FSQLITE_RECORD_VALUE_NULLS.load(AtomicOrdering::Relaxed),
+            integer_count: FSQLITE_RECORD_VALUE_INTEGERS.load(AtomicOrdering::Relaxed),
+            float_count: FSQLITE_RECORD_VALUE_FLOATS.load(AtomicOrdering::Relaxed),
+            text_count: FSQLITE_RECORD_VALUE_TEXTS.load(AtomicOrdering::Relaxed),
+            blob_count: FSQLITE_RECORD_VALUE_BLOBS.load(AtomicOrdering::Relaxed),
+            text_bytes: FSQLITE_RECORD_TEXT_BYTES.load(AtomicOrdering::Relaxed),
+            blob_bytes: FSQLITE_RECORD_BLOB_BYTES.load(AtomicOrdering::Relaxed),
+        },
+    }
+}
+
+fn note_decoded_value(value: &SqliteValue) {
+    if !record_profile_enabled() {
+        return;
+    }
+
+    match value {
+        SqliteValue::Null => {
+            FSQLITE_RECORD_VALUE_NULLS.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        SqliteValue::Integer(_) => {
+            FSQLITE_RECORD_VALUE_INTEGERS.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        SqliteValue::Float(_) => {
+            FSQLITE_RECORD_VALUE_FLOATS.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        SqliteValue::Text(text) => {
+            FSQLITE_RECORD_VALUE_TEXTS.fetch_add(1, AtomicOrdering::Relaxed);
+            FSQLITE_RECORD_TEXT_BYTES.fetch_add(
+                u64::try_from(text.len()).unwrap_or(u64::MAX),
+                AtomicOrdering::Relaxed,
+            );
+        }
+        SqliteValue::Blob(blob) => {
+            FSQLITE_RECORD_VALUE_BLOBS.fetch_add(1, AtomicOrdering::Relaxed);
+            FSQLITE_RECORD_BLOB_BYTES.fetch_add(
+                u64::try_from(blob.len()).unwrap_or(u64::MAX),
+                AtomicOrdering::Relaxed,
+            );
+        }
+    }
+}
 
 /// Parse a serialized record into a list of `SqliteValue`s.
 ///
@@ -22,15 +161,33 @@ pub fn parse_record(data: &[u8]) -> Option<Vec<SqliteValue>> {
     // A typical record has ~4-8 columns. We can estimate capacity from data len / 8 as a heuristic,
     // clamped between 4 and 64, to avoid reallocation for the majority of rows.
     let cap = (data.len() / 8).clamp(4, 64);
+    if record_profile_enabled() {
+        FSQLITE_RECORD_PARSE_CALLS.fetch_add(1, AtomicOrdering::Relaxed);
+        FSQLITE_RECORD_VEC_CAPACITY_SLOTS.fetch_add(
+            u64::try_from(cap).unwrap_or(u64::MAX),
+            AtomicOrdering::Relaxed,
+        );
+    }
     let mut values = Vec::with_capacity(cap);
     parse_record_into(data, &mut values)?;
     Some(values)
 }
 
-/// Parse a serialized record into an existing `Vec<SqliteValue>`, clearing it first.
+/// Parse a serialized record into an existing `Vec<SqliteValue>`.
+///
+/// Existing slots are reused when possible so repeated row decodes can keep
+/// text/blob backing storage alive across iterations.
 #[allow(clippy::cast_possible_truncation)]
 pub fn parse_record_into(data: &[u8], values: &mut Vec<SqliteValue>) -> Option<()> {
-    values.clear();
+    let profile_enabled = record_profile_enabled();
+    let start = profile_enabled.then(Instant::now);
+    if profile_enabled {
+        FSQLITE_RECORD_PARSE_INTO_CALLS.fetch_add(1, AtomicOrdering::Relaxed);
+        FSQLITE_RECORD_BYTES_SCANNED.fetch_add(
+            u64::try_from(data.len()).unwrap_or(u64::MAX),
+            AtomicOrdering::Relaxed,
+        );
+    }
     if data.is_empty() {
         return None;
     }
@@ -46,6 +203,7 @@ pub fn parse_record_into(data: &[u8], values: &mut Vec<SqliteValue>) -> Option<(
     // Parse serial types and values in a single pass.
     let mut offset = hdr_varint_len;
     let mut body_offset = header_size;
+    let mut decoded_count = 0usize;
 
     while offset < header_size {
         let (serial_type, consumed) = read_varint(&data[offset..header_size])?;
@@ -61,15 +219,30 @@ pub fn parse_record_into(data: &[u8], values: &mut Vec<SqliteValue>) -> Option<(
         }
 
         let value_bytes = &data[body_offset..end];
-        let value = decode_value(serial_type, value_bytes)?;
-        values.push(value);
+        // Reuse caller-owned scratch slots so repeated row decodes keep
+        // existing text/blob backing storage alive across iterations.
+        if let Some(slot) = values.get_mut(decoded_count) {
+            decode_value_into(serial_type, value_bytes, slot)?;
+        } else {
+            let value = decode_value(serial_type, value_bytes)?;
+            values.push(value);
+        }
         body_offset = end;
+        decoded_count += 1;
     }
 
     if body_offset != data.len() {
         return None;
     }
 
+    values.truncate(decoded_count);
+
+    if let Some(start) = start {
+        FSQLITE_RECORD_DECODE_TIME_NS.fetch_add(
+            u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            AtomicOrdering::Relaxed,
+        );
+    }
     Some(())
 }
 
@@ -78,6 +251,15 @@ pub fn parse_record_into(data: &[u8], values: &mut Vec<SqliteValue>) -> Option<(
 /// Returns `None` if the record is malformed or if `col_idx` is out of bounds.
 #[allow(clippy::cast_possible_truncation)]
 pub fn parse_record_column(data: &[u8], col_idx: usize) -> Option<SqliteValue> {
+    let profile_enabled = record_profile_enabled();
+    let start = profile_enabled.then(Instant::now);
+    if profile_enabled {
+        FSQLITE_RECORD_PARSE_COLUMN_CALLS.fetch_add(1, AtomicOrdering::Relaxed);
+        FSQLITE_RECORD_BYTES_SCANNED.fetch_add(
+            u64::try_from(data.len()).unwrap_or(u64::MAX),
+            AtomicOrdering::Relaxed,
+        );
+    }
     if data.is_empty() {
         return None;
     }
@@ -108,7 +290,14 @@ pub fn parse_record_column(data: &[u8], col_idx: usize) -> Option<SqliteValue> {
 
         if current_idx == col_idx {
             let value_bytes = &data[body_offset..end];
-            return decode_value(serial_type, value_bytes);
+            let value = decode_value(serial_type, value_bytes);
+            if let Some(start) = start {
+                FSQLITE_RECORD_DECODE_TIME_NS.fetch_add(
+                    u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                    AtomicOrdering::Relaxed,
+                );
+            }
+            return value;
         }
 
         body_offset = end;
@@ -207,7 +396,7 @@ fn serial_type_for_value(value: &SqliteValue) -> u64 {
 /// Decode a value from its serial type and raw bytes.
 #[allow(clippy::cast_possible_truncation)]
 fn decode_value(serial_type: u64, bytes: &[u8]) -> Option<SqliteValue> {
-    match classify_serial_type(serial_type) {
+    let value = match classify_serial_type(serial_type) {
         SerialTypeClass::Null => Some(SqliteValue::Null),
         SerialTypeClass::Zero => Some(SqliteValue::Integer(0)),
         SerialTypeClass::One => Some(SqliteValue::Integer(1)),
@@ -232,7 +421,66 @@ fn decode_value(serial_type: u64, bytes: &[u8]) -> Option<SqliteValue> {
             .map(|text| SqliteValue::Text(text.to_owned())),
         SerialTypeClass::Blob => Some(SqliteValue::Blob(bytes.to_vec())),
         SerialTypeClass::Reserved => None,
+    };
+
+    if let Some(value) = value.as_ref() {
+        note_decoded_value(value);
     }
+    value
+}
+
+fn decode_value_into(serial_type: u64, bytes: &[u8], slot: &mut SqliteValue) -> Option<()> {
+    match classify_serial_type(serial_type) {
+        SerialTypeClass::Null => {
+            *slot = SqliteValue::Null;
+        }
+        SerialTypeClass::Zero => {
+            *slot = SqliteValue::Integer(0);
+        }
+        SerialTypeClass::One => {
+            *slot = SqliteValue::Integer(1);
+        }
+        SerialTypeClass::Integer => {
+            *slot = SqliteValue::Integer(decode_big_endian_signed(bytes));
+        }
+        SerialTypeClass::Float => {
+            if bytes.len() != 8 {
+                return None;
+            }
+            let bits = u64::from_be_bytes(bytes.try_into().ok()?);
+            let value = f64::from_bits(bits);
+            *slot = if value.is_nan() {
+                SqliteValue::Null
+            } else {
+                SqliteValue::Float(value)
+            };
+        }
+        SerialTypeClass::Text => {
+            let text = std::str::from_utf8(bytes).ok()?;
+            match slot {
+                SqliteValue::Text(existing) => {
+                    existing.clear();
+                    existing.push_str(text);
+                }
+                _ => {
+                    *slot = SqliteValue::Text(text.to_owned());
+                }
+            }
+        }
+        SerialTypeClass::Blob => match slot {
+            SqliteValue::Blob(existing) => {
+                existing.clear();
+                existing.extend_from_slice(bytes);
+            }
+            _ => {
+                *slot = SqliteValue::Blob(bytes.to_vec());
+            }
+        },
+        SerialTypeClass::Reserved => return None,
+    }
+
+    note_decoded_value(slot);
+    Some(())
 }
 
 /// Decode a big-endian signed integer of 1-8 bytes.
@@ -332,6 +580,52 @@ mod tests {
         let parsed = parse_record(&data).unwrap();
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].as_integer(), Some(1));
+    }
+
+    #[test]
+    fn parse_record_into_reuses_text_buffer_for_same_slot() {
+        let first = serialize_record(&[SqliteValue::Text("hello reusable buffer".to_owned())]);
+        let second = serialize_record(&[SqliteValue::Text("shorter".to_owned())]);
+        let mut values = Vec::new();
+
+        parse_record_into(&first, &mut values).expect("first decode");
+        let (first_ptr, first_cap) = match &values[0] {
+            SqliteValue::Text(text) => (text.as_ptr(), text.capacity()),
+            other => panic!("expected text slot, got {other:?}"),
+        };
+
+        parse_record_into(&second, &mut values).expect("second decode");
+        match &values[0] {
+            SqliteValue::Text(text) => {
+                assert_eq!(text, "shorter");
+                assert_eq!(text.capacity(), first_cap);
+                assert_eq!(text.as_ptr(), first_ptr);
+            }
+            other => panic!("expected text slot, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_record_into_reuses_blob_buffer_for_same_slot() {
+        let first = serialize_record(&[SqliteValue::Blob(vec![1, 2, 3, 4, 5, 6, 7, 8])]);
+        let second = serialize_record(&[SqliteValue::Blob(vec![9, 10, 11])]);
+        let mut values = Vec::new();
+
+        parse_record_into(&first, &mut values).expect("first decode");
+        let (first_ptr, first_cap) = match &values[0] {
+            SqliteValue::Blob(blob) => (blob.as_ptr(), blob.capacity()),
+            other => panic!("expected blob slot, got {other:?}"),
+        };
+
+        parse_record_into(&second, &mut values).expect("second decode");
+        match &values[0] {
+            SqliteValue::Blob(blob) => {
+                assert_eq!(blob.as_slice(), &[9, 10, 11]);
+                assert_eq!(blob.capacity(), first_cap);
+                assert_eq!(blob.as_ptr(), first_ptr);
+            }
+            other => panic!("expected blob slot, got {other:?}"),
+        }
     }
 
     #[test]

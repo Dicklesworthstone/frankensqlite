@@ -15,7 +15,7 @@ pub use lexer::{
 };
 pub use parser::{
     ParseError, ParseMetricsSnapshot, Parser, parse_first_statement_with_tail,
-    parse_metrics_snapshot, reset_parse_metrics,
+    parse_metrics_enabled, parse_metrics_snapshot, reset_parse_metrics, set_parse_metrics_enabled,
 };
 pub use semantic::{
     ColumnDef as SemanticColumnDef, FunctionArity, ResolveResult, Resolver, Schema, Scope,

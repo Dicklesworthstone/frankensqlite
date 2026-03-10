@@ -14,9 +14,16 @@
 //! into a [`PerfResult`] and can be serialized to JSONL for downstream
 //! analysis and reporting.
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+
+use fsqlite_core::connection::{
+    HotPathProfileSnapshot, ParserHotPathProfileSnapshot, hot_path_profile_enabled,
+    hot_path_profile_snapshot, reset_hot_path_profile, set_hot_path_profile_enabled,
+};
 
 use crate::HarnessSettings;
 use crate::benchmark::{BenchmarkConfig, BenchmarkMeta, BenchmarkSummary, run_benchmark};
@@ -136,6 +143,170 @@ pub struct PerfResult {
 
 /// Schema version for the perf result JSONL format.
 pub const PERF_RESULT_SCHEMA_V1: &str = "fsqlite-e2e.perf_result.v1";
+/// Schema version for mixed-read-write hot-path profile reports.
+pub const HOT_PATH_PROFILE_SCHEMA_V1: &str = "fsqlite-e2e.hot_path_profile.v1";
+/// Schema version for hot-path artifact manifests.
+pub const HOT_PATH_PROFILE_MANIFEST_SCHEMA_V1: &str = "fsqlite-e2e.hot_path_profile_manifest.v1";
+/// Bead identifier for the hot-path profiling work.
+pub const HOT_PATH_PROFILE_BEAD_ID: &str = "bd-db300.4.1";
+/// Canonical scenario identifier for the mixed read/write hot path.
+pub const HOT_PATH_PROFILE_SCENARIO_ID: &str = "bd-db300.4.1.mixed_read_write";
+
+/// Configuration for a focused FrankenSQLite mixed-read-write hot-path profile.
+#[derive(Debug, Clone)]
+pub struct FsqliteHotPathProfileConfig {
+    pub seed: u64,
+    pub scale: u32,
+    pub concurrency: u16,
+    pub exec_config: crate::fsqlite_executor::FsqliteExecConfig,
+    pub replay_command: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HotPathValueTypeProfile {
+    pub total_values: u64,
+    pub nulls: u64,
+    pub integers: u64,
+    pub reals: u64,
+    pub texts: u64,
+    pub blobs: u64,
+    pub text_bytes_total: u64,
+    pub blob_bytes_total: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HotPathParserProfile {
+    pub parse_single_calls: u64,
+    pub parse_multi_calls: u64,
+    pub parse_cache_hits: u64,
+    pub parse_cache_misses: u64,
+    pub parsed_sql_bytes: u64,
+    pub parse_time_ns: u64,
+    pub rewrite_calls: u64,
+    pub rewrite_time_ns: u64,
+    pub compiled_cache_hits: u64,
+    pub compiled_cache_misses: u64,
+    pub compile_time_ns: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HotPathRecordDecodeProfile {
+    pub parse_record_calls: u64,
+    pub parse_record_into_calls: u64,
+    pub parse_record_column_calls: u64,
+    pub record_bytes_scanned: u64,
+    pub record_vec_capacity_slots: u64,
+    pub decode_time_ns: u64,
+    pub decoded_values: HotPathValueTypeProfile,
+    pub vdbe_record_decode_calls_total: u64,
+    pub vdbe_column_reads_total: u64,
+    pub vdbe_decoded_value_heap_bytes_total: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HotPathRowMaterializationProfile {
+    pub result_rows_total: u64,
+    pub result_values_total: u64,
+    pub result_value_heap_bytes_total: u64,
+    pub result_row_materialization_time_ns_total: u64,
+    pub make_record_calls_total: u64,
+    pub make_record_blob_bytes_total: u64,
+    pub value_types: HotPathValueTypeProfile,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HotPathOpcodeProfileEntry {
+    pub opcode: String,
+    pub total: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HotPathTypeProfile {
+    pub decoded: HotPathValueTypeProfile,
+    pub materialized: HotPathValueTypeProfile,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HotPathRankingEntry {
+    pub subsystem: String,
+    pub metric_kind: String,
+    pub metric_value: u64,
+    pub rationale: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HotPathAllocatorPressure {
+    pub parser_sql_bytes: u64,
+    pub decoded_value_heap_bytes_total: u64,
+    pub result_value_heap_bytes_total: u64,
+    pub record_vec_capacity_slots: u64,
+    pub ranked_sources: Vec<HotPathRankingEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HotPathProfileReport {
+    pub schema_version: String,
+    pub bead_id: String,
+    pub scenario_id: String,
+    pub run_id: String,
+    pub trace_id: String,
+    pub fixture_id: String,
+    pub workload: String,
+    pub seed: u64,
+    pub scale: u32,
+    pub concurrency: u16,
+    pub replay_command: String,
+    pub engine_report: EngineRunReport,
+    pub parser: HotPathParserProfile,
+    pub record_decode: HotPathRecordDecodeProfile,
+    pub row_materialization: HotPathRowMaterializationProfile,
+    pub opcode_profile: Vec<HotPathOpcodeProfileEntry>,
+    pub type_profile: HotPathTypeProfile,
+    pub subsystem_ranking: Vec<HotPathRankingEntry>,
+    pub allocator_pressure: HotPathAllocatorPressure,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HotPathArtifactFile {
+    pub path: String,
+    pub bytes: u64,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HotPathArtifactManifest {
+    pub schema_version: String,
+    pub bead_id: String,
+    pub run_id: String,
+    pub trace_id: String,
+    pub scenario_id: String,
+    pub fixture_id: String,
+    pub workload: String,
+    pub seed: u64,
+    pub scale: u32,
+    pub concurrency: u16,
+    pub replay_command: String,
+    pub files: Vec<HotPathArtifactFile>,
+}
+
+struct HotPathProfileScope {
+    was_enabled: bool,
+}
+
+impl HotPathProfileScope {
+    fn enable() -> Self {
+        let was_enabled = hot_path_profile_enabled();
+        set_hot_path_profile_enabled(true);
+        reset_hot_path_profile();
+        Self { was_enabled }
+    }
+}
+
+impl Drop for HotPathProfileScope {
+    fn drop(&mut self) {
+        set_hot_path_profile_enabled(self.was_enabled);
+    }
+}
 
 impl PerfResult {
     /// Returns true if all cells completed successfully.
@@ -157,6 +328,378 @@ impl PerfResult {
         }
         Ok(out)
     }
+}
+
+#[must_use]
+fn hot_path_value_profile(
+    total_values: u64,
+    nulls: u64,
+    integers: u64,
+    reals: u64,
+    texts: u64,
+    blobs: u64,
+    text_bytes_total: u64,
+    blob_bytes_total: u64,
+) -> HotPathValueTypeProfile {
+    HotPathValueTypeProfile {
+        total_values,
+        nulls,
+        integers,
+        reals,
+        texts,
+        blobs,
+        text_bytes_total,
+        blob_bytes_total,
+    }
+}
+
+#[must_use]
+fn parser_profile(snapshot: ParserHotPathProfileSnapshot) -> HotPathParserProfile {
+    HotPathParserProfile {
+        parse_single_calls: snapshot.parse_single_calls,
+        parse_multi_calls: snapshot.parse_multi_calls,
+        parse_cache_hits: snapshot.parse_cache_hits,
+        parse_cache_misses: snapshot.parse_cache_misses,
+        parsed_sql_bytes: snapshot.parsed_sql_bytes,
+        parse_time_ns: snapshot.parse_time_ns,
+        rewrite_calls: snapshot.rewrite_calls,
+        rewrite_time_ns: snapshot.rewrite_time_ns,
+        compiled_cache_hits: snapshot.compiled_cache_hits,
+        compiled_cache_misses: snapshot.compiled_cache_misses,
+        compile_time_ns: snapshot.compile_time_ns,
+    }
+}
+
+#[must_use]
+fn build_hot_path_profile_report(
+    fixture_id: &str,
+    config: &FsqliteHotPathProfileConfig,
+    run_id: String,
+    trace_id: String,
+    engine_report: EngineRunReport,
+    snapshot: HotPathProfileSnapshot,
+) -> HotPathProfileReport {
+    let decoded_types = hot_path_value_profile(
+        snapshot.record_decode.decoded_values.total_values(),
+        snapshot.record_decode.decoded_values.null_count,
+        snapshot.record_decode.decoded_values.integer_count,
+        snapshot.record_decode.decoded_values.float_count,
+        snapshot.record_decode.decoded_values.text_count,
+        snapshot.record_decode.decoded_values.blob_count,
+        snapshot.record_decode.decoded_values.text_bytes,
+        snapshot.record_decode.decoded_values.blob_bytes,
+    );
+    let materialized_types = hot_path_value_profile(
+        snapshot.vdbe.result_value_types.total_values,
+        snapshot.vdbe.result_value_types.nulls,
+        snapshot.vdbe.result_value_types.integers,
+        snapshot.vdbe.result_value_types.reals,
+        snapshot.vdbe.result_value_types.texts,
+        snapshot.vdbe.result_value_types.blobs,
+        snapshot.vdbe.result_value_types.text_bytes_total,
+        snapshot.vdbe.result_value_types.blob_bytes_total,
+    );
+
+    let opcode_profile = snapshot
+        .vdbe
+        .opcode_execution_totals
+        .iter()
+        .map(|entry| HotPathOpcodeProfileEntry {
+            opcode: entry.opcode.clone(),
+            total: entry.total,
+        })
+        .collect();
+
+    let parser = parser_profile(snapshot.parser);
+    let parser_sql_bytes = parser.parsed_sql_bytes;
+    let record_decode = HotPathRecordDecodeProfile {
+        parse_record_calls: snapshot.record_decode.parse_record_calls,
+        parse_record_into_calls: snapshot.record_decode.parse_record_into_calls,
+        parse_record_column_calls: snapshot.record_decode.parse_record_column_calls,
+        record_bytes_scanned: snapshot.record_decode.record_bytes_scanned,
+        record_vec_capacity_slots: snapshot.record_decode.record_vec_capacity_slots,
+        decode_time_ns: snapshot.record_decode.decode_time_ns,
+        decoded_values: decoded_types.clone(),
+        vdbe_record_decode_calls_total: snapshot.vdbe.record_decode_calls_total,
+        vdbe_column_reads_total: snapshot.vdbe.column_reads_total,
+        vdbe_decoded_value_heap_bytes_total: snapshot.vdbe.decoded_value_heap_bytes_total,
+    };
+    let row_materialization = HotPathRowMaterializationProfile {
+        result_rows_total: snapshot.vdbe.result_rows_total,
+        result_values_total: snapshot.vdbe.result_values_total,
+        result_value_heap_bytes_total: snapshot.vdbe.result_value_heap_bytes_total,
+        result_row_materialization_time_ns_total: snapshot
+            .vdbe
+            .result_row_materialization_time_ns_total,
+        make_record_calls_total: snapshot.vdbe.make_record_calls_total,
+        make_record_blob_bytes_total: snapshot.vdbe.make_record_blob_bytes_total,
+        value_types: materialized_types.clone(),
+    };
+
+    let parser_time_ns = parser
+        .parse_time_ns
+        .saturating_add(parser.rewrite_time_ns)
+        .saturating_add(parser.compile_time_ns);
+    let mut subsystem_ranking = vec![
+        HotPathRankingEntry {
+            subsystem: "parser_ast_churn".to_owned(),
+            metric_kind: "time_ns".to_owned(),
+            metric_value: parser_time_ns,
+            rationale: "parse + rewrite + compile time on the connection path".to_owned(),
+        },
+        HotPathRankingEntry {
+            subsystem: "record_decode".to_owned(),
+            metric_kind: "time_ns".to_owned(),
+            metric_value: record_decode.decode_time_ns,
+            rationale: "time spent decoding SQLite record payloads".to_owned(),
+        },
+        HotPathRankingEntry {
+            subsystem: "row_materialization".to_owned(),
+            metric_kind: "time_ns".to_owned(),
+            metric_value: row_materialization.result_row_materialization_time_ns_total,
+            rationale: "time spent cloning registers into emitted result rows".to_owned(),
+        },
+    ];
+    subsystem_ranking.sort_by(|lhs, rhs| {
+        rhs.metric_value
+            .cmp(&lhs.metric_value)
+            .then_with(|| lhs.subsystem.cmp(&rhs.subsystem))
+    });
+
+    let mut allocator_ranking = vec![
+        HotPathRankingEntry {
+            subsystem: "result_row_values".to_owned(),
+            metric_kind: "heap_bytes".to_owned(),
+            metric_value: row_materialization.result_value_heap_bytes_total,
+            rationale: "estimated heap carried by emitted result values".to_owned(),
+        },
+        HotPathRankingEntry {
+            subsystem: "record_decode_values".to_owned(),
+            metric_kind: "heap_bytes".to_owned(),
+            metric_value: record_decode.vdbe_decoded_value_heap_bytes_total,
+            rationale: "estimated heap carried by decoded record/column values".to_owned(),
+        },
+        HotPathRankingEntry {
+            subsystem: "parser_sql_bytes".to_owned(),
+            metric_kind: "bytes".to_owned(),
+            metric_value: parser.parsed_sql_bytes,
+            rationale: "SQL text volume parsed on cache-miss paths".to_owned(),
+        },
+    ];
+    allocator_ranking.sort_by(|lhs, rhs| {
+        rhs.metric_value
+            .cmp(&lhs.metric_value)
+            .then_with(|| lhs.subsystem.cmp(&rhs.subsystem))
+    });
+
+    HotPathProfileReport {
+        schema_version: HOT_PATH_PROFILE_SCHEMA_V1.to_owned(),
+        bead_id: HOT_PATH_PROFILE_BEAD_ID.to_owned(),
+        scenario_id: HOT_PATH_PROFILE_SCENARIO_ID.to_owned(),
+        run_id,
+        trace_id,
+        fixture_id: fixture_id.to_owned(),
+        workload: "mixed_read_write".to_owned(),
+        seed: config.seed,
+        scale: config.scale,
+        concurrency: config.concurrency,
+        replay_command: config.replay_command.clone(),
+        engine_report,
+        parser,
+        record_decode,
+        row_materialization,
+        opcode_profile,
+        type_profile: HotPathTypeProfile {
+            decoded: decoded_types,
+            materialized: materialized_types,
+        },
+        subsystem_ranking,
+        allocator_pressure: HotPathAllocatorPressure {
+            parser_sql_bytes,
+            decoded_value_heap_bytes_total: snapshot.vdbe.decoded_value_heap_bytes_total,
+            result_value_heap_bytes_total: snapshot.vdbe.result_value_heap_bytes_total,
+            record_vec_capacity_slots: snapshot.record_decode.record_vec_capacity_slots,
+            ranked_sources: allocator_ranking,
+        },
+    }
+}
+
+fn unix_timestamp_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+pub fn profile_fsqlite_mixed_read_write_hot_path(
+    db_path: &Path,
+    fixture_id: &str,
+    config: &FsqliteHotPathProfileConfig,
+) -> crate::E2eResult<HotPathProfileReport> {
+    if config.concurrency == 0 {
+        return Err(crate::E2eError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "hot-path profile concurrency must be >= 1",
+        )));
+    }
+
+    let now_ms = unix_timestamp_millis();
+    let run_id = format!(
+        "{HOT_PATH_PROFILE_BEAD_ID}-{fixture_id}-c{}-s{}-{now_ms}",
+        config.concurrency, config.seed
+    );
+    let trace_id = format!(
+        "{HOT_PATH_PROFILE_SCENARIO_ID}:{fixture_id}:c{}",
+        config.concurrency
+    );
+    let oplog = generate_oplog(
+        "mixed_read_write",
+        fixture_id,
+        config.seed,
+        config.concurrency,
+        config.scale,
+    )
+    .ok_or_else(|| {
+        crate::E2eError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "mixed_read_write preset unavailable",
+        ))
+    })?;
+
+    let _scope = HotPathProfileScope::enable();
+    let engine_report = run_oplog_fsqlite(db_path, &oplog, &config.exec_config)?;
+    let snapshot = hot_path_profile_snapshot();
+    Ok(build_hot_path_profile_report(
+        fixture_id,
+        config,
+        run_id,
+        trace_id,
+        engine_report,
+        snapshot,
+    ))
+}
+
+#[must_use]
+pub fn render_hot_path_profile_markdown(report: &HotPathProfileReport) -> String {
+    let mut out = String::with_capacity(4096);
+    let _ = writeln!(out, "# Mixed Read/Write Hot-Path Profile\n");
+    let _ = writeln!(out, "- Bead: `{}`", report.bead_id);
+    let _ = writeln!(out, "- Run ID: `{}`", report.run_id);
+    let _ = writeln!(out, "- Trace ID: `{}`", report.trace_id);
+    let _ = writeln!(out, "- Scenario: `{}`", report.scenario_id);
+    let _ = writeln!(out, "- Fixture: `{}`", report.fixture_id);
+    let _ = writeln!(out, "- Workload: `{}`", report.workload);
+    let _ = writeln!(out, "- Seed: `{}`", report.seed);
+    let _ = writeln!(out, "- Concurrency: `{}`", report.concurrency);
+    let _ = writeln!(out, "- Scale: `{}`", report.scale);
+    let _ = writeln!(out);
+
+    let _ = writeln!(out, "## Engine Summary\n");
+    let _ = writeln!(
+        out,
+        "- Wall time (ms): {}",
+        report.engine_report.wall_time_ms
+    );
+    let _ = writeln!(out, "- Ops total: {}", report.engine_report.ops_total);
+    let _ = writeln!(out, "- Ops/sec: {:.2}", report.engine_report.ops_per_sec);
+    let _ = writeln!(out, "- Retries: {}", report.engine_report.retries);
+    let _ = writeln!(out, "- Aborts: {}", report.engine_report.aborts);
+    let _ = writeln!(
+        out,
+        "- Integrity check: {}",
+        report
+            .engine_report
+            .correctness
+            .integrity_check_ok
+            .map_or("skipped".to_owned(), |ok| ok.to_string())
+    );
+    if let Some(error) = &report.engine_report.error {
+        let _ = writeln!(out, "- Error: `{error}`");
+    }
+    let _ = writeln!(out);
+
+    let _ = writeln!(out, "## Ranked Hotspots\n");
+    for entry in &report.subsystem_ranking {
+        let _ = writeln!(
+            out,
+            "- {}: {}={} ({})",
+            entry.subsystem, entry.metric_kind, entry.metric_value, entry.rationale
+        );
+    }
+    let _ = writeln!(out);
+
+    let _ = writeln!(out, "## Allocator Pressure\n");
+    for entry in &report.allocator_pressure.ranked_sources {
+        let _ = writeln!(
+            out,
+            "- {}: {}={} ({})",
+            entry.subsystem, entry.metric_kind, entry.metric_value, entry.rationale
+        );
+    }
+    let _ = writeln!(out);
+
+    let _ = writeln!(out, "## Top Opcodes\n");
+    for entry in report.opcode_profile.iter().take(12) {
+        let _ = writeln!(out, "- {}: {}", entry.opcode, entry.total);
+    }
+    let _ = writeln!(out);
+
+    let _ = writeln!(out, "## Replay\n");
+    let _ = writeln!(out, "```sh\n{}\n```", report.replay_command);
+    out
+}
+
+pub fn write_hot_path_profile_artifacts(
+    report: &HotPathProfileReport,
+    output_dir: &Path,
+) -> std::io::Result<HotPathArtifactManifest> {
+    std::fs::create_dir_all(output_dir)?;
+
+    let report_json = serde_json::to_string_pretty(report)
+        .map_err(|error| std::io::Error::other(format!("profile JSON: {error}")))?;
+    let summary_md = render_hot_path_profile_markdown(report);
+
+    let report_path = output_dir.join("profile.json");
+    let summary_path = output_dir.join("summary.md");
+    std::fs::write(&report_path, report_json.as_bytes())?;
+    std::fs::write(&summary_path, summary_md.as_bytes())?;
+
+    let manifest = HotPathArtifactManifest {
+        schema_version: HOT_PATH_PROFILE_MANIFEST_SCHEMA_V1.to_owned(),
+        bead_id: report.bead_id.clone(),
+        run_id: report.run_id.clone(),
+        trace_id: report.trace_id.clone(),
+        scenario_id: report.scenario_id.clone(),
+        fixture_id: report.fixture_id.clone(),
+        workload: report.workload.clone(),
+        seed: report.seed,
+        scale: report.scale,
+        concurrency: report.concurrency,
+        replay_command: report.replay_command.clone(),
+        files: vec![
+            HotPathArtifactFile {
+                path: "profile.json".to_owned(),
+                bytes: u64::try_from(report_json.len()).unwrap_or(u64::MAX),
+                description: "structured hot-path profile report".to_owned(),
+            },
+            HotPathArtifactFile {
+                path: "summary.md".to_owned(),
+                bytes: u64::try_from(summary_md.len()).unwrap_or(u64::MAX),
+                description: "human-readable hotspot ranking summary".to_owned(),
+            },
+        ],
+    };
+    let manifest_json = serde_json::to_string_pretty(&manifest)
+        .map_err(|error| std::io::Error::other(format!("artifact manifest: {error}")))?;
+    std::fs::write(output_dir.join("manifest.json"), manifest_json.as_bytes())?;
+
+    let mut files = manifest.files.clone();
+    files.push(HotPathArtifactFile {
+        path: "manifest.json".to_owned(),
+        bytes: u64::try_from(manifest_json.len()).unwrap_or(u64::MAX),
+        description: "artifact manifest with replay metadata".to_owned(),
+    });
+    Ok(HotPathArtifactManifest { files, ..manifest })
 }
 
 // ── Matrix expansion ───────────────────────────────────────────────────
@@ -397,6 +940,7 @@ pub fn write_results_jsonl(result: &PerfResult, path: &Path) -> std::io::Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::Connection as SqliteConnection;
 
     #[test]
     fn test_engine_display() {
@@ -530,5 +1074,45 @@ mod tests {
         let jsonl = result.to_jsonl().unwrap();
         assert!(jsonl.contains("\"error\":\"boom\""));
         assert!(jsonl.contains("\"engine\":\"fsqlite\""));
+    }
+
+    #[test]
+    fn hot_path_profile_smoke_writes_artifacts() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let db_path = tempdir.path().join("profile.db");
+        SqliteConnection::open(&db_path).unwrap();
+
+        let config = FsqliteHotPathProfileConfig {
+            seed: 7,
+            scale: 6,
+            concurrency: 1,
+            exec_config: crate::fsqlite_executor::FsqliteExecConfig {
+                concurrent_mode: true,
+                run_integrity_check: false,
+                ..crate::fsqlite_executor::FsqliteExecConfig::default()
+            },
+            replay_command: "cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db smoke"
+                .to_owned(),
+        };
+
+        let report = profile_fsqlite_mixed_read_write_hot_path(&db_path, "smoke", &config).unwrap();
+
+        assert_eq!(report.schema_version, HOT_PATH_PROFILE_SCHEMA_V1);
+        assert_eq!(report.fixture_id, "smoke");
+        assert_eq!(report.workload, "mixed_read_write");
+        assert!(!report.opcode_profile.is_empty());
+        assert!(
+            report.record_decode.parse_record_column_calls > 0
+                || report.record_decode.parse_record_into_calls > 0
+        );
+
+        let artifact_dir = tempdir.path().join("artifacts");
+        let manifest = write_hot_path_profile_artifacts(&report, &artifact_dir).unwrap();
+
+        assert_eq!(manifest.schema_version, HOT_PATH_PROFILE_MANIFEST_SCHEMA_V1);
+        assert!(artifact_dir.join("profile.json").exists());
+        assert!(artifact_dir.join("summary.md").exists());
+        assert!(artifact_dir.join("manifest.json").exists());
+        assert_eq!(manifest.files.len(), 3);
     }
 }

@@ -234,6 +234,7 @@ fn run_fsqlite_sequential(oplog: &OpLog) -> EngineRunReport {
         },
         latency_ms: None,
         error,
+        hot_path_profile: None,
     }
 }
 

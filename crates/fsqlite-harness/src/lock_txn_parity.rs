@@ -16,6 +16,39 @@ pub const LOCK_TXN_PARITY_BEAD_ID: &str = "bd-1dp9.4.2";
 /// Report schema version.
 pub const LOCK_TXN_SCHEMA_VERSION: u32 = 1;
 
+const BUSY_TIMEOUT_CHECKS: &[&str] = &["busy_timeout_default", "busy_timeout_set_query"];
+const SAVEPOINT_CHECKS: &[&str] = &[
+    "savepoint_starts_implicit_txn",
+    "savepoint_release",
+    "savepoint_rollback_to",
+    "savepoint_nesting",
+    "savepoint_reuse_name",
+    "savepoint_partial_rollback",
+    "savepoint_release_collapses",
+];
+const AUTOCOMMIT_CHECKS: &[&str] = &[
+    "autocommit_insert_commits",
+    "autocommit_ddl_wraps",
+    "autocommit_multiple_independent",
+    "autocommit_read_no_concurrent",
+    "autocommit_write_concurrent",
+    "autocommit_file_backed_persists",
+];
+const LOCK_TRANSITION_CHECKS: &[&str] = &[
+    "begin_deferred",
+    "begin_immediate",
+    "begin_exclusive",
+    "begin_concurrent",
+    "begin_commit_cycle",
+    "rollback_restores_state",
+    "transaction_with_update_rollback",
+];
+const CONCURRENT_MODE_CHECKS: &[&str] = &[
+    "concurrent_default_on",
+    "concurrent_explicit_begin",
+    "concurrent_pragma_promotion",
+];
+
 // ---------------------------------------------------------------------------
 // Transaction mode coverage
 // ---------------------------------------------------------------------------
@@ -252,6 +285,61 @@ impl LockTxnParityReport {
     }
 }
 
+const fn mode_begin_check_name(mode: TransactionMode) -> &'static str {
+    match mode {
+        TransactionMode::Deferred => "begin_deferred",
+        TransactionMode::Immediate => "begin_immediate",
+        TransactionMode::Exclusive => "begin_exclusive",
+        TransactionMode::Concurrent => "begin_concurrent",
+    }
+}
+
+const fn required_checks_for_area(area: TxnFeatureArea) -> &'static [&'static str] {
+    match area {
+        TxnFeatureArea::BusyTimeout => BUSY_TIMEOUT_CHECKS,
+        TxnFeatureArea::Savepoint => SAVEPOINT_CHECKS,
+        TxnFeatureArea::Autocommit => AUTOCOMMIT_CHECKS,
+        TxnFeatureArea::LockTransition => LOCK_TRANSITION_CHECKS,
+        TxnFeatureArea::ConcurrentMode => CONCURRENT_MODE_CHECKS,
+    }
+}
+
+fn check_at_parity(checks: &[TxnParityCheck], check_name: &str) -> bool {
+    checks
+        .iter()
+        .find(|check| check.check_name == check_name)
+        .is_some_and(|check| check.parity_achieved)
+}
+
+fn required_check_set_passes(checks: &[TxnParityCheck], required_checks: &[&str]) -> bool {
+    !required_checks.is_empty()
+        && required_checks
+            .iter()
+            .all(|check_name| check_at_parity(checks, check_name))
+}
+
+fn area_at_parity(checks: &[TxnParityCheck], area: TxnFeatureArea) -> bool {
+    required_check_set_passes(checks, required_checks_for_area(area))
+}
+
+fn collect_txn_modes_at_parity(checks: &[TxnParityCheck]) -> Vec<String> {
+    TransactionMode::ALL
+        .iter()
+        .copied()
+        .filter(|mode| check_at_parity(checks, mode_begin_check_name(*mode)))
+        .map(|mode| mode.as_str().to_owned())
+        .collect()
+}
+
+fn collect_areas_at_parity(checks: &[TxnParityCheck]) -> Vec<String> {
+    TxnFeatureArea::ALL
+        .iter()
+        .copied()
+        .filter(|area| area_at_parity(checks, *area))
+        .map(|area| area.as_str().to_owned())
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Assessment engine
 // ---------------------------------------------------------------------------
@@ -267,15 +355,11 @@ pub fn assess_lock_txn_parity(config: &LockTxnParityConfig) -> LockTxnParityRepo
         .iter()
         .map(|m| m.as_str().to_owned())
         .collect();
-    let mut txn_at_parity = Vec::new();
 
     for mode in TransactionMode::ALL {
         let parity = true;
-        if parity {
-            txn_at_parity.push(mode.as_str().to_owned());
-        }
         checks.push(TxnParityCheck {
-            check_name: format!("begin_{}", mode.as_str()),
+            check_name: mode_begin_check_name(mode).to_owned(),
             area: "lock_transition".to_owned(),
             parity_achieved: parity,
             detail: format!(
@@ -426,7 +510,8 @@ pub fn assess_lock_txn_parity(config: &LockTxnParityConfig) -> LockTxnParityRepo
         .iter()
         .map(|a| a.as_str().to_owned())
         .collect();
-    let areas_at_parity = areas_tested.clone(); // All areas at parity
+    let txn_at_parity = collect_txn_modes_at_parity(&checks);
+    let areas_at_parity = collect_areas_at_parity(&checks);
 
     // -- Known gaps --
     let known_gaps = Vec::new(); // No known gaps for this wave
@@ -438,11 +523,12 @@ pub fn assess_lock_txn_parity(config: &LockTxnParityConfig) -> LockTxnParityRepo
 
     let modes_ok = txn_at_parity.len() >= config.min_txn_modes_tested;
     let areas_ok = areas_at_parity.len() >= config.min_areas_tested;
-    // TODO: replace `true` with actual savepoint/concurrent checks once wired
-    #[allow(clippy::overly_complex_bool_expr)]
-    let savepoint_ok = !config.require_savepoint_nesting || true;
-    #[allow(clippy::overly_complex_bool_expr)]
-    let concurrent_ok = !config.require_concurrent_default || true;
+    let savepoint_nesting_verified = area_at_parity(&checks, TxnFeatureArea::Savepoint)
+        && check_at_parity(&checks, "savepoint_nesting");
+    let concurrent_default_verified = area_at_parity(&checks, TxnFeatureArea::ConcurrentMode)
+        && check_at_parity(&checks, "concurrent_default_on");
+    let savepoint_ok = !config.require_savepoint_nesting || savepoint_nesting_verified;
+    let concurrent_ok = !config.require_concurrent_default || concurrent_default_verified;
 
     let verdict = if modes_ok
         && areas_ok
@@ -478,8 +564,8 @@ pub fn assess_lock_txn_parity(config: &LockTxnParityConfig) -> LockTxnParityRepo
         txn_modes_at_parity: txn_at_parity,
         areas_tested,
         areas_at_parity,
-        concurrent_default_verified: true,
-        savepoint_nesting_verified: true,
+        concurrent_default_verified,
+        savepoint_nesting_verified,
         parity_score,
         total_checks,
         checks_at_parity,
@@ -588,6 +674,52 @@ mod tests {
         let report = assess_lock_txn_parity(&LockTxnParityConfig::default());
         assert!(report.concurrent_default_verified);
         assert!(report.savepoint_nesting_verified);
+    }
+
+    fn parity_check(check_name: &str, area: &str, parity_achieved: bool) -> TxnParityCheck {
+        TxnParityCheck {
+            check_name: check_name.to_owned(),
+            area: area.to_owned(),
+            parity_achieved,
+            detail: "test".to_owned(),
+        }
+    }
+
+    #[test]
+    fn area_parity_requires_all_expected_checks() {
+        let mut checks = SAVEPOINT_CHECKS
+            .iter()
+            .map(|check_name| parity_check(check_name, "savepoint", true))
+            .collect::<Vec<_>>();
+        assert!(area_at_parity(&checks, TxnFeatureArea::Savepoint));
+
+        checks.retain(|check| check.check_name != "savepoint_nesting");
+        assert!(!area_at_parity(&checks, TxnFeatureArea::Savepoint));
+    }
+
+    #[test]
+    fn area_parity_requires_successful_checks() {
+        let mut checks = CONCURRENT_MODE_CHECKS
+            .iter()
+            .map(|check_name| parity_check(check_name, "concurrent_mode", true))
+            .collect::<Vec<_>>();
+        assert!(area_at_parity(&checks, TxnFeatureArea::ConcurrentMode));
+
+        checks[0].parity_achieved = false;
+        assert!(!area_at_parity(&checks, TxnFeatureArea::ConcurrentMode));
+    }
+
+    #[test]
+    fn txn_modes_at_parity_follow_begin_checks() {
+        let checks = vec![
+            parity_check("begin_deferred", "lock_transition", true),
+            parity_check("begin_immediate", "lock_transition", true),
+            parity_check("begin_exclusive", "lock_transition", false),
+            parity_check("begin_concurrent", "lock_transition", true),
+        ];
+
+        let modes = collect_txn_modes_at_parity(&checks);
+        assert_eq!(modes, vec!["deferred", "immediate", "concurrent"]);
     }
 
     #[test]

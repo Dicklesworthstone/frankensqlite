@@ -152,6 +152,34 @@ Each JSONL line contains a `RunRecordV1` with:
 - `correctness.raw_sha256`, `correctness.canonical_sha256`
 - `methodology` and `environment` metadata
 
+For profiler-focused runs, use:
+
+```bash
+cargo run -p fsqlite-e2e --bin realdb-e2e -- run \
+  --engine fsqlite \
+  --db asupersync \
+  --workload hot_page_contention \
+  --concurrency 4 \
+  --profile-only
+```
+
+or the granular flags:
+
+```bash
+cargo run -p fsqlite-e2e --bin realdb-e2e -- run \
+  --engine fsqlite \
+  --db asupersync \
+  --workload hot_page_contention \
+  --concurrency 4 \
+  --skip-integrity-check \
+  --skip-environment-metadata
+```
+
+These modes keep the JSONL schema stable. The record still uses
+`RunRecordV1`, but `environment.capture_mode` becomes `suppressed` and the
+post-run `integrity_check_ok` field is omitted. Default runs remain full
+correctness runs with captured environment metadata.
+
 ### Interpreting Results
 
 **SHA-256 match (all three tiers agree):**

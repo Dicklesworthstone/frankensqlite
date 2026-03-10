@@ -18,8 +18,8 @@ use std::collections::VecDeque;
 use fsqlite_btree::swiss_index::SwissIndex;
 use fsqlite_types::PageSize;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use fsqlite_btree::{
@@ -730,6 +730,64 @@ impl SharedTxnPageIo {
     }
 }
 
+const WRITE_BUSY_HANDOFF_BASE_SPINS: u32 = 64;
+const WRITE_BUSY_HANDOFF_MAX_SPINS: u32 = 2_048;
+const WRITE_BUSY_HANDOFF_YIELD_EVERY: u32 = 8;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BusyRetryWait {
+    attempt: u32,
+    spin_loops: u32,
+    yielded: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct BusyRetryHandoff {
+    next_attempt: u32,
+}
+
+impl BusyRetryHandoff {
+    fn next_wait(&mut self, started: Instant, deadline: Duration) -> Option<BusyRetryWait> {
+        if deadline.is_zero() || started.elapsed() >= deadline {
+            return None;
+        }
+
+        let attempt = self.next_attempt.saturating_add(1);
+        self.next_attempt = attempt;
+        Some(BusyRetryWait {
+            attempt,
+            spin_loops: busy_retry_spin_loops(attempt),
+            yielded: busy_retry_should_yield(attempt),
+        })
+    }
+}
+
+const fn busy_retry_spin_loops(attempt: u32) -> u32 {
+    let growth = attempt.saturating_sub(1);
+    let shift = if growth > 5 { 5 } else { growth };
+    let spins = WRITE_BUSY_HANDOFF_BASE_SPINS << shift;
+    if spins > WRITE_BUSY_HANDOFF_MAX_SPINS {
+        WRITE_BUSY_HANDOFF_MAX_SPINS
+    } else {
+        spins
+    }
+}
+
+const fn busy_retry_should_yield(attempt: u32) -> bool {
+    attempt >= WRITE_BUSY_HANDOFF_YIELD_EVERY && attempt % WRITE_BUSY_HANDOFF_YIELD_EVERY == 0
+}
+
+fn perform_busy_retry_handoff(wait: BusyRetryWait) {
+    for _ in 0..wait.spin_loops {
+        std::hint::spin_loop();
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    if wait.yielded {
+        std::thread::yield_now();
+    }
+}
+
 impl PageReader for SharedTxnPageIo {
     fn read_page(&self, cx: &Cx, page_no: PageNumber) -> Result<Vec<u8>> {
         if let Some(ctx) = &self.concurrent {
@@ -810,7 +868,7 @@ impl PageWriter for SharedTxnPageIo {
         if let Some(ref ctx) = self.concurrent {
             let started = Instant::now();
             let deadline = Duration::from_millis(ctx.busy_timeout_ms);
-            let mut backoff = Duration::from_micros(50);
+            let mut handoff = BusyRetryHandoff::default();
 
             let page_data_base = PageData::from_vec(data.to_vec());
 
@@ -853,6 +911,20 @@ impl PageWriter for SharedTxnPageIo {
                         break;
                     }
                     Err(MvccError::Busy) => {
+                        let Some(wait) = handoff.next_wait(started, deadline) else {
+                            tracing::warn!(
+                                txn_id,
+                                commit_seq = snapshot_high,
+                                snapshot_high,
+                                page_id = page_no.get(),
+                                visibility_decision = "write_busy_timeout",
+                                conflict_reason = "page_lock_busy",
+                                retry_policy = "bounded_handoff",
+                                "mvcc write conflict exceeded busy timeout"
+                            );
+                            return Err(FrankenError::Busy);
+                        };
+
                         tracing::warn!(
                             txn_id,
                             commit_seq = snapshot_high,
@@ -860,25 +932,13 @@ impl PageWriter for SharedTxnPageIo {
                             page_id = page_no.get(),
                             visibility_decision = "write_retry",
                             conflict_reason = "page_lock_busy",
+                            retry_policy = "bounded_handoff",
+                            retry_attempt = wait.attempt,
+                            retry_spin_loops = wait.spin_loops,
+                            retry_yielded = wait.yielded,
                             "mvcc write conflict detected"
                         );
-                        if deadline.is_zero() || started.elapsed() >= deadline {
-                            return Err(FrankenError::Busy);
-                        }
-
-                        let remaining = deadline
-                            .checked_sub(started.elapsed())
-                            .unwrap_or(Duration::ZERO);
-                        let sleep_for = if backoff < remaining {
-                            backoff
-                        } else {
-                            remaining
-                        };
-                        if !sleep_for.is_zero() {
-                            #[cfg(not(target_arch = "wasm32"))]
-                            std::thread::sleep(sleep_for);
-                        }
-                        backoff = (backoff * 2).min(Duration::from_millis(5));
+                        perform_busy_retry_handoff(wait);
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -1624,6 +1684,70 @@ static FSQLITE_VDBE_OPCODES_EXECUTED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_VDBE_STATEMENTS_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// Cumulative statement duration in microseconds (for histogram approximation).
 static FSQLITE_VDBE_STATEMENT_DURATION_US_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Dynamic execution counts for each opcode, indexed by raw opcode byte.
+static FSQLITE_VDBE_OPCODE_EXECUTION_TOTALS: LazyLock<Box<[AtomicU64]>> = LazyLock::new(|| {
+    (0..=Opcode::COUNT)
+        .map(|_| AtomicU64::new(0))
+        .collect::<Vec<_>>()
+        .into_boxed_slice()
+});
+/// Total number of type-coercion attempts in Cast/Affinity opcodes.
+static FSQLITE_VDBE_TYPE_COERCIONS_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Total number of coercions that changed a value's storage class.
+static FSQLITE_VDBE_TYPE_COERCION_CHANGES_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Total number of storage cursor column reads.
+static FSQLITE_VDBE_COLUMN_READS_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Total number of record decode calls that materialized a full row vector.
+static FSQLITE_VDBE_RECORD_DECODE_CALLS_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Total number of values materialized while decoding records/columns.
+static FSQLITE_VDBE_DECODED_VALUES_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Estimated heap bytes materialized while decoding records/columns.
+static FSQLITE_VDBE_DECODED_VALUE_HEAP_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Total number of result rows emitted by the interpreter.
+static FSQLITE_VDBE_RESULT_ROWS_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Total number of result values materialized for emitted rows.
+static FSQLITE_VDBE_RESULT_VALUES_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Estimated heap bytes materialized for emitted result rows.
+static FSQLITE_VDBE_RESULT_VALUE_HEAP_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Cumulative nanoseconds spent materializing emitted result rows.
+static FSQLITE_VDBE_RESULT_ROW_MATERIALIZATION_TIME_NS_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Total number of MakeRecord calls.
+static FSQLITE_VDBE_MAKE_RECORD_CALLS_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Total bytes produced by MakeRecord blobs.
+static FSQLITE_VDBE_MAKE_RECORD_BLOB_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Decoded NULL values.
+static FSQLITE_VDBE_DECODED_NULLS_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Decoded INTEGER values.
+static FSQLITE_VDBE_DECODED_INTEGERS_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Decoded REAL values.
+static FSQLITE_VDBE_DECODED_REALS_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Decoded TEXT values.
+static FSQLITE_VDBE_DECODED_TEXTS_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Decoded BLOB values.
+static FSQLITE_VDBE_DECODED_BLOBS_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Heap bytes for decoded TEXT values.
+static FSQLITE_VDBE_DECODED_TEXT_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Heap bytes for decoded BLOB values.
+static FSQLITE_VDBE_DECODED_BLOB_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Result-row NULL values.
+static FSQLITE_VDBE_RESULT_NULLS_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Result-row INTEGER values.
+static FSQLITE_VDBE_RESULT_INTEGERS_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Result-row REAL values.
+static FSQLITE_VDBE_RESULT_REALS_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Result-row TEXT values.
+static FSQLITE_VDBE_RESULT_TEXTS_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Result-row BLOB values.
+static FSQLITE_VDBE_RESULT_BLOBS_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Heap bytes for result-row TEXT values.
+static FSQLITE_VDBE_RESULT_TEXT_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Heap bytes for result-row BLOB values.
+static FSQLITE_VDBE_RESULT_BLOB_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Whether VDBE execution metrics should be collected on the hot path.
+///
+/// These counters are used only for diagnostics/tests today, so leave them
+/// disabled by default to keep shared-state bookkeeping off ordinary execute().
+static FSQLITE_VDBE_METRICS_ENABLED: AtomicBool = AtomicBool::new(false);
 /// Monotonic program ID counter for tracing correlation.
 static VDBE_PROGRAM_ID_SEQ: AtomicU64 = AtomicU64::new(1);
 
@@ -1641,8 +1765,13 @@ static FSQLITE_JIT_CACHE_HITS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_JIT_CACHE_MISSES_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 /// Global JIT enable flag.
+///
+/// The current scaffold only tracks hot-query metadata and always falls back to
+/// the interpreter, so leaving it on by default adds synchronization and hashing
+/// overhead on every statement with no execution-speed upside. Keep it opt-in
+/// until a real compiled fast path exists.
 static FSQLITE_JIT_ENABLED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(true);
+    std::sync::atomic::AtomicBool::new(false);
 /// Hot-query threshold (`N` executions before JIT trigger).
 static FSQLITE_JIT_HOT_THRESHOLD: AtomicU64 = AtomicU64::new(8);
 /// Maximum cached JIT plan stubs.
@@ -1874,8 +2003,38 @@ static FSQLITE_SORT_ROWS_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// Total pages spilled to disk by sorters.
 static FSQLITE_SORT_SPILL_PAGES_TOTAL: AtomicU64 = AtomicU64::new(0);
 
+/// Point-in-time breakdown of materialized value storage classes.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ValueTypeMetricsSnapshot {
+    /// Total values observed in this lane.
+    pub total_values: u64,
+    /// NULL values observed.
+    pub nulls: u64,
+    /// INTEGER values observed.
+    pub integers: u64,
+    /// REAL values observed.
+    pub reals: u64,
+    /// TEXT values observed.
+    pub texts: u64,
+    /// BLOB values observed.
+    pub blobs: u64,
+    /// Heap bytes carried by TEXT values.
+    pub text_bytes_total: u64,
+    /// Heap bytes carried by BLOB values.
+    pub blob_bytes_total: u64,
+}
+
+/// Point-in-time dynamic opcode execution total.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpcodeExecutionCount {
+    /// Stable opcode name.
+    pub opcode: String,
+    /// Total dynamic executions observed.
+    pub total: u64,
+}
+
 /// Snapshot of VDBE execution metrics.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VdbeMetricsSnapshot {
     /// Total opcodes executed across all statements.
     pub opcodes_executed_total: u64,
@@ -1887,11 +2046,75 @@ pub struct VdbeMetricsSnapshot {
     pub sort_rows_total: u64,
     /// Total pages spilled to disk by sorters.
     pub sort_spill_pages_total: u64,
+    /// Dynamic opcode execution counts observed while metrics were enabled.
+    pub opcode_execution_totals: Vec<OpcodeExecutionCount>,
+    /// Total type-coercion attempts.
+    pub type_coercions_total: u64,
+    /// Total type-coercion attempts that changed storage class.
+    pub type_coercion_changes_total: u64,
+    /// Total storage cursor column reads.
+    pub column_reads_total: u64,
+    /// Total full-record decode calls.
+    pub record_decode_calls_total: u64,
+    /// Total values materialized from record/column decode.
+    pub decoded_values_total: u64,
+    /// Estimated heap bytes materialized from record/column decode.
+    pub decoded_value_heap_bytes_total: u64,
+    /// Total emitted result rows.
+    pub result_rows_total: u64,
+    /// Total values materialized in emitted result rows.
+    pub result_values_total: u64,
+    /// Estimated heap bytes materialized in emitted result rows.
+    pub result_value_heap_bytes_total: u64,
+    /// Cumulative nanoseconds spent materializing emitted result rows.
+    pub result_row_materialization_time_ns_total: u64,
+    /// Total MakeRecord calls.
+    pub make_record_calls_total: u64,
+    /// Total bytes produced by MakeRecord blobs.
+    pub make_record_blob_bytes_total: u64,
+    /// Storage-class breakdown of decoded values.
+    pub decoded_value_types: ValueTypeMetricsSnapshot,
+    /// Storage-class breakdown of emitted result values.
+    pub result_value_types: ValueTypeMetricsSnapshot,
+}
+
+/// Enable/disable VDBE execution metrics collection.
+pub fn set_vdbe_metrics_enabled(enabled: bool) {
+    FSQLITE_VDBE_METRICS_ENABLED.store(enabled, AtomicOrdering::Relaxed);
+}
+
+/// Current VDBE metrics collection flag.
+#[must_use]
+pub fn vdbe_metrics_enabled() -> bool {
+    FSQLITE_VDBE_METRICS_ENABLED.load(AtomicOrdering::Relaxed)
 }
 
 /// Read a point-in-time snapshot of VDBE execution metrics.
 #[must_use]
 pub fn vdbe_metrics_snapshot() -> VdbeMetricsSnapshot {
+    let mut opcode_execution_totals: Vec<OpcodeExecutionCount> =
+        FSQLITE_VDBE_OPCODE_EXECUTION_TOTALS
+            .iter()
+            .enumerate()
+            .skip(1)
+            .filter_map(|(idx, counter)| {
+                let total = counter.load(AtomicOrdering::Relaxed);
+                if total == 0 {
+                    return None;
+                }
+                let raw = u8::try_from(idx).ok()?;
+                let opcode = Opcode::from_byte(raw)?;
+                Some(OpcodeExecutionCount {
+                    opcode: opcode.name().to_owned(),
+                    total,
+                })
+            })
+            .collect();
+    opcode_execution_totals.sort_by(|lhs, rhs| {
+        rhs.total
+            .cmp(&lhs.total)
+            .then_with(|| lhs.opcode.cmp(&rhs.opcode))
+    });
     VdbeMetricsSnapshot {
         opcodes_executed_total: FSQLITE_VDBE_OPCODES_EXECUTED_TOTAL.load(AtomicOrdering::Relaxed),
         statements_total: FSQLITE_VDBE_STATEMENTS_TOTAL.load(AtomicOrdering::Relaxed),
@@ -1899,6 +2122,45 @@ pub fn vdbe_metrics_snapshot() -> VdbeMetricsSnapshot {
             .load(AtomicOrdering::Relaxed),
         sort_rows_total: FSQLITE_SORT_ROWS_TOTAL.load(AtomicOrdering::Relaxed),
         sort_spill_pages_total: FSQLITE_SORT_SPILL_PAGES_TOTAL.load(AtomicOrdering::Relaxed),
+        opcode_execution_totals,
+        type_coercions_total: FSQLITE_VDBE_TYPE_COERCIONS_TOTAL.load(AtomicOrdering::Relaxed),
+        type_coercion_changes_total: FSQLITE_VDBE_TYPE_COERCION_CHANGES_TOTAL
+            .load(AtomicOrdering::Relaxed),
+        column_reads_total: FSQLITE_VDBE_COLUMN_READS_TOTAL.load(AtomicOrdering::Relaxed),
+        record_decode_calls_total: FSQLITE_VDBE_RECORD_DECODE_CALLS_TOTAL
+            .load(AtomicOrdering::Relaxed),
+        decoded_values_total: FSQLITE_VDBE_DECODED_VALUES_TOTAL.load(AtomicOrdering::Relaxed),
+        decoded_value_heap_bytes_total: FSQLITE_VDBE_DECODED_VALUE_HEAP_BYTES_TOTAL
+            .load(AtomicOrdering::Relaxed),
+        result_rows_total: FSQLITE_VDBE_RESULT_ROWS_TOTAL.load(AtomicOrdering::Relaxed),
+        result_values_total: FSQLITE_VDBE_RESULT_VALUES_TOTAL.load(AtomicOrdering::Relaxed),
+        result_value_heap_bytes_total: FSQLITE_VDBE_RESULT_VALUE_HEAP_BYTES_TOTAL
+            .load(AtomicOrdering::Relaxed),
+        result_row_materialization_time_ns_total:
+            FSQLITE_VDBE_RESULT_ROW_MATERIALIZATION_TIME_NS_TOTAL.load(AtomicOrdering::Relaxed),
+        make_record_calls_total: FSQLITE_VDBE_MAKE_RECORD_CALLS_TOTAL.load(AtomicOrdering::Relaxed),
+        make_record_blob_bytes_total: FSQLITE_VDBE_MAKE_RECORD_BLOB_BYTES_TOTAL
+            .load(AtomicOrdering::Relaxed),
+        decoded_value_types: ValueTypeMetricsSnapshot {
+            total_values: FSQLITE_VDBE_DECODED_VALUES_TOTAL.load(AtomicOrdering::Relaxed),
+            nulls: FSQLITE_VDBE_DECODED_NULLS_TOTAL.load(AtomicOrdering::Relaxed),
+            integers: FSQLITE_VDBE_DECODED_INTEGERS_TOTAL.load(AtomicOrdering::Relaxed),
+            reals: FSQLITE_VDBE_DECODED_REALS_TOTAL.load(AtomicOrdering::Relaxed),
+            texts: FSQLITE_VDBE_DECODED_TEXTS_TOTAL.load(AtomicOrdering::Relaxed),
+            blobs: FSQLITE_VDBE_DECODED_BLOBS_TOTAL.load(AtomicOrdering::Relaxed),
+            text_bytes_total: FSQLITE_VDBE_DECODED_TEXT_BYTES_TOTAL.load(AtomicOrdering::Relaxed),
+            blob_bytes_total: FSQLITE_VDBE_DECODED_BLOB_BYTES_TOTAL.load(AtomicOrdering::Relaxed),
+        },
+        result_value_types: ValueTypeMetricsSnapshot {
+            total_values: FSQLITE_VDBE_RESULT_VALUES_TOTAL.load(AtomicOrdering::Relaxed),
+            nulls: FSQLITE_VDBE_RESULT_NULLS_TOTAL.load(AtomicOrdering::Relaxed),
+            integers: FSQLITE_VDBE_RESULT_INTEGERS_TOTAL.load(AtomicOrdering::Relaxed),
+            reals: FSQLITE_VDBE_RESULT_REALS_TOTAL.load(AtomicOrdering::Relaxed),
+            texts: FSQLITE_VDBE_RESULT_TEXTS_TOTAL.load(AtomicOrdering::Relaxed),
+            blobs: FSQLITE_VDBE_RESULT_BLOBS_TOTAL.load(AtomicOrdering::Relaxed),
+            text_bytes_total: FSQLITE_VDBE_RESULT_TEXT_BYTES_TOTAL.load(AtomicOrdering::Relaxed),
+            blob_bytes_total: FSQLITE_VDBE_RESULT_BLOB_BYTES_TOTAL.load(AtomicOrdering::Relaxed),
+        },
     }
 }
 
@@ -1907,9 +2169,138 @@ pub fn reset_vdbe_metrics() {
     FSQLITE_VDBE_OPCODES_EXECUTED_TOTAL.store(0, AtomicOrdering::Relaxed);
     FSQLITE_VDBE_STATEMENTS_TOTAL.store(0, AtomicOrdering::Relaxed);
     FSQLITE_VDBE_STATEMENT_DURATION_US_TOTAL.store(0, AtomicOrdering::Relaxed);
+    for counter in FSQLITE_VDBE_OPCODE_EXECUTION_TOTALS.iter() {
+        counter.store(0, AtomicOrdering::Relaxed);
+    }
+    FSQLITE_VDBE_TYPE_COERCIONS_TOTAL.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_VDBE_TYPE_COERCION_CHANGES_TOTAL.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_VDBE_COLUMN_READS_TOTAL.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_VDBE_RECORD_DECODE_CALLS_TOTAL.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_VDBE_DECODED_VALUES_TOTAL.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_VDBE_DECODED_VALUE_HEAP_BYTES_TOTAL.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_VDBE_RESULT_ROWS_TOTAL.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_VDBE_RESULT_VALUES_TOTAL.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_VDBE_RESULT_VALUE_HEAP_BYTES_TOTAL.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_VDBE_RESULT_ROW_MATERIALIZATION_TIME_NS_TOTAL.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_VDBE_MAKE_RECORD_CALLS_TOTAL.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_VDBE_MAKE_RECORD_BLOB_BYTES_TOTAL.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_VDBE_DECODED_NULLS_TOTAL.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_VDBE_DECODED_INTEGERS_TOTAL.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_VDBE_DECODED_REALS_TOTAL.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_VDBE_DECODED_TEXTS_TOTAL.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_VDBE_DECODED_BLOBS_TOTAL.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_VDBE_DECODED_TEXT_BYTES_TOTAL.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_VDBE_DECODED_BLOB_BYTES_TOTAL.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_VDBE_RESULT_NULLS_TOTAL.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_VDBE_RESULT_INTEGERS_TOTAL.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_VDBE_RESULT_REALS_TOTAL.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_VDBE_RESULT_TEXTS_TOTAL.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_VDBE_RESULT_BLOBS_TOTAL.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_VDBE_RESULT_TEXT_BYTES_TOTAL.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_VDBE_RESULT_BLOB_BYTES_TOTAL.store(0, AtomicOrdering::Relaxed);
     FSQLITE_SORT_ROWS_TOTAL.store(0, AtomicOrdering::Relaxed);
     FSQLITE_SORT_SPILL_PAGES_TOTAL.store(0, AtomicOrdering::Relaxed);
     reset_vdbe_jit_metrics();
+}
+
+fn estimated_value_heap_bytes(value: &SqliteValue) -> u64 {
+    match value {
+        SqliteValue::Null => 0,
+        SqliteValue::Integer(_) | SqliteValue::Float(_) => {
+            u64::try_from(std::mem::size_of::<SqliteValue>()).unwrap_or(u64::MAX)
+        }
+        SqliteValue::Text(text) => {
+            u64::try_from(std::mem::size_of::<SqliteValue>().saturating_add(text.len()))
+                .unwrap_or(u64::MAX)
+        }
+        SqliteValue::Blob(blob) => {
+            u64::try_from(std::mem::size_of::<SqliteValue>().saturating_add(blob.len()))
+                .unwrap_or(u64::MAX)
+        }
+    }
+}
+
+fn record_value_type_metrics(
+    value: &SqliteValue,
+    total_counter: &AtomicU64,
+    null_counter: &AtomicU64,
+    integer_counter: &AtomicU64,
+    real_counter: &AtomicU64,
+    text_counter: &AtomicU64,
+    blob_counter: &AtomicU64,
+    text_bytes_counter: &AtomicU64,
+    blob_bytes_counter: &AtomicU64,
+) {
+    total_counter.fetch_add(1, AtomicOrdering::Relaxed);
+    match value {
+        SqliteValue::Null => {
+            null_counter.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        SqliteValue::Integer(_) => {
+            integer_counter.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        SqliteValue::Float(_) => {
+            real_counter.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        SqliteValue::Text(text) => {
+            text_counter.fetch_add(1, AtomicOrdering::Relaxed);
+            text_bytes_counter.fetch_add(
+                u64::try_from(text.len()).unwrap_or(u64::MAX),
+                AtomicOrdering::Relaxed,
+            );
+        }
+        SqliteValue::Blob(blob) => {
+            blob_counter.fetch_add(1, AtomicOrdering::Relaxed);
+            blob_bytes_counter.fetch_add(
+                u64::try_from(blob.len()).unwrap_or(u64::MAX),
+                AtomicOrdering::Relaxed,
+            );
+        }
+    }
+}
+
+fn record_decoded_value_metrics(value: &SqliteValue) {
+    FSQLITE_VDBE_DECODED_VALUE_HEAP_BYTES_TOTAL
+        .fetch_add(estimated_value_heap_bytes(value), AtomicOrdering::Relaxed);
+    record_value_type_metrics(
+        value,
+        &FSQLITE_VDBE_DECODED_VALUES_TOTAL,
+        &FSQLITE_VDBE_DECODED_NULLS_TOTAL,
+        &FSQLITE_VDBE_DECODED_INTEGERS_TOTAL,
+        &FSQLITE_VDBE_DECODED_REALS_TOTAL,
+        &FSQLITE_VDBE_DECODED_TEXTS_TOTAL,
+        &FSQLITE_VDBE_DECODED_BLOBS_TOTAL,
+        &FSQLITE_VDBE_DECODED_TEXT_BYTES_TOTAL,
+        &FSQLITE_VDBE_DECODED_BLOB_BYTES_TOTAL,
+    );
+}
+
+fn record_result_row_metrics(row: &[SqliteValue]) {
+    FSQLITE_VDBE_RESULT_ROWS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
+    let row_heap_bytes = row.iter().fold(0_u64, |acc, value| {
+        acc.saturating_add(estimated_value_heap_bytes(value))
+    });
+    FSQLITE_VDBE_RESULT_VALUE_HEAP_BYTES_TOTAL.fetch_add(row_heap_bytes, AtomicOrdering::Relaxed);
+    for value in row {
+        record_value_type_metrics(
+            value,
+            &FSQLITE_VDBE_RESULT_VALUES_TOTAL,
+            &FSQLITE_VDBE_RESULT_NULLS_TOTAL,
+            &FSQLITE_VDBE_RESULT_INTEGERS_TOTAL,
+            &FSQLITE_VDBE_RESULT_REALS_TOTAL,
+            &FSQLITE_VDBE_RESULT_TEXTS_TOTAL,
+            &FSQLITE_VDBE_RESULT_BLOBS_TOTAL,
+            &FSQLITE_VDBE_RESULT_TEXT_BYTES_TOTAL,
+            &FSQLITE_VDBE_RESULT_BLOB_BYTES_TOTAL,
+        );
+    }
+}
+
+fn record_type_coercion(before: &SqliteValue, after: &SqliteValue) {
+    FSQLITE_VDBE_TYPE_COERCIONS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
+    if before.storage_class() != after.storage_class() {
+        FSQLITE_VDBE_TYPE_COERCION_CHANGES_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2191,6 +2582,9 @@ pub struct VdbeEngine {
     /// AUTOINCREMENT high-water marks keyed by root page number (bd-31j76).
     /// Populated from `sqlite_sequence` by the Connection before execution.
     autoincrement_seq_by_root_page: HashMap<i32, i64>,
+    /// INTEGER PRIMARY KEY alias column positions keyed by root page number.
+    /// Used to decode storage-cursor payload columns that omit the rowid alias.
+    rowid_alias_col_by_root_page: HashMap<i32, usize>,
     /// Per-cursor monotonic sequence counters for `Opcode::Sequence`.
     sequence_counters: HashMap<i32, i64>,
     /// Column default values by root page number (for ALTER TABLE ADD COLUMN).
@@ -2532,6 +2926,7 @@ impl VdbeEngine {
             rowsets: SwissIndex::new(),
             fk_counter: 0,
             autoincrement_seq_by_root_page: HashMap::new(),
+            rowid_alias_col_by_root_page: HashMap::new(),
             sequence_counters: HashMap::new(),
             column_defaults_by_root_page: HashMap::new(),
             cursor_root_pages: HashMap::new(),
@@ -2821,6 +3216,11 @@ impl VdbeEngine {
         self.autoincrement_seq_by_root_page = map;
     }
 
+    /// Provide INTEGER PRIMARY KEY alias column positions keyed by root page.
+    pub fn set_rowid_alias_column_by_root_page(&mut self, map: HashMap<i32, usize>) {
+        self.rowid_alias_col_by_root_page = map;
+    }
+
     /// Set column default values by root page, used for ALTER TABLE ADD COLUMN.
     /// Each entry maps a root page to a list of per-column defaults (None = no default).
     pub fn set_column_defaults_by_root_page(
@@ -2854,18 +3254,40 @@ impl VdbeEngine {
             self.table_index_meta.insert(*table_cursor, indexes.clone());
         }
 
-        let program_id = VDBE_PROGRAM_ID_SEQ.fetch_add(1, AtomicOrdering::Relaxed);
+        let statement_debug_enabled =
+            tracing::enabled!(target: "fsqlite_vdbe::statement", tracing::Level::DEBUG);
+        let jit_debug_enabled =
+            tracing::enabled!(target: "fsqlite_vdbe::jit", tracing::Level::DEBUG);
+        let jit_info_enabled = tracing::enabled!(target: "fsqlite_vdbe::jit", tracing::Level::INFO);
+        let jit_warn_enabled = tracing::enabled!(target: "fsqlite_vdbe::jit", tracing::Level::WARN);
+        let exec_info_enabled = tracing::enabled!(target: "fsqlite_vdbe", tracing::Level::INFO);
+        let slow_query_info_enabled =
+            tracing::enabled!(target: "fsqlite_vdbe::slow_query", tracing::Level::INFO);
+        let collect_vdbe_metrics = vdbe_metrics_enabled();
+        let program_id = if statement_debug_enabled
+            || jit_debug_enabled
+            || jit_info_enabled
+            || jit_warn_enabled
+            || exec_info_enabled
+            || slow_query_info_enabled
+        {
+            VDBE_PROGRAM_ID_SEQ.fetch_add(1, AtomicOrdering::Relaxed)
+        } else {
+            0
+        };
         let start_time = Instant::now();
         let mut opcode_count: u64 = 0;
+        let mut local_opcode_execution_totals = [0_u64; Opcode::COUNT + 1];
         let result_rows_before = self.results.len();
 
-        // DEBUG-level per-statement log (bd-1rw.1).
-        tracing::debug!(
-            target: "fsqlite_vdbe::statement",
-            program_id,
-            num_ops = ops.len(),
-            "vdbe statement begin",
-        );
+        if statement_debug_enabled {
+            tracing::debug!(
+                target: "fsqlite_vdbe::statement",
+                program_id,
+                num_ops = ops.len(),
+                "vdbe statement begin",
+            );
+        }
 
         match maybe_trigger_jit(program) {
             JitDecision::Disabled => {}
@@ -2873,34 +3295,40 @@ impl VdbeEngine {
                 plan_hash,
                 execution_count,
             } => {
-                tracing::debug!(
-                    target: "fsqlite_vdbe::jit",
-                    program_id,
-                    plan_hash = format_args!("{plan_hash:016x}"),
-                    execution_count,
-                    hot_threshold = vdbe_jit_hot_threshold(),
-                    "jit warmup (interpreter tier)"
-                );
+                if jit_debug_enabled {
+                    tracing::debug!(
+                        target: "fsqlite_vdbe::jit",
+                        program_id,
+                        plan_hash = format_args!("{plan_hash:016x}"),
+                        execution_count,
+                        hot_threshold = vdbe_jit_hot_threshold(),
+                        "jit warmup (interpreter tier)"
+                    );
+                }
             }
             JitDecision::CacheHit {
                 plan_hash,
                 code_size_bytes,
             } => {
-                tracing::info!(
-                    target: "fsqlite_vdbe::jit",
-                    program_id,
-                    plan_hash = format_args!("{plan_hash:016x}"),
-                    code_size_bytes,
-                    "jit trigger cache hit (interpreter fallback path)"
-                );
+                if jit_info_enabled {
+                    tracing::info!(
+                        target: "fsqlite_vdbe::jit",
+                        program_id,
+                        plan_hash = format_args!("{plan_hash:016x}"),
+                        code_size_bytes,
+                        "jit trigger cache hit (interpreter fallback path)"
+                    );
+                }
             }
             JitDecision::UnsupportedCached { plan_hash } => {
-                tracing::debug!(
-                    target: "fsqlite_vdbe::jit",
-                    program_id,
-                    plan_hash = format_args!("{plan_hash:016x}"),
-                    "jit unsupported-plan cache hit (skipping recompilation)"
-                );
+                if jit_debug_enabled {
+                    tracing::debug!(
+                        target: "fsqlite_vdbe::jit",
+                        program_id,
+                        plan_hash = format_args!("{plan_hash:016x}"),
+                        "jit unsupported-plan cache hit (skipping recompilation)"
+                    );
+                }
             }
             JitDecision::Compiled {
                 plan_hash,
@@ -2917,15 +3345,17 @@ impl VdbeEngine {
                     code_size_bytes,
                 );
                 let _compile_guard = span.enter();
-                tracing::info!(
-                    target: "fsqlite_vdbe::jit",
-                    program_id,
-                    plan_hash = %plan_hash_hex,
-                    compile_time_us,
-                    code_size_bytes,
-                    evicted_plan_hash = evicted_plan_hash.map(|value| format!("{value:016x}")),
-                    "jit trigger compile completed (interpreter fallback path)"
-                );
+                if jit_info_enabled {
+                    tracing::info!(
+                        target: "fsqlite_vdbe::jit",
+                        program_id,
+                        plan_hash = %plan_hash_hex,
+                        compile_time_us,
+                        code_size_bytes,
+                        evicted_plan_hash = evicted_plan_hash.map(|value| format!("{value:016x}")),
+                        "jit trigger compile completed (interpreter fallback path)"
+                    );
+                }
             }
             JitDecision::CompileFailed {
                 plan_hash,
@@ -2941,14 +3371,16 @@ impl VdbeEngine {
                     code_size_bytes = 0_u64,
                 );
                 let _compile_guard = span.enter();
-                tracing::warn!(
-                    target: "fsqlite_vdbe::jit",
-                    program_id,
-                    plan_hash = %plan_hash_hex,
-                    compile_time_us,
-                    reason,
-                    "jit compilation failed; falling back to interpreter"
-                );
+                if jit_warn_enabled {
+                    tracing::warn!(
+                        target: "fsqlite_vdbe::jit",
+                        program_id,
+                        plan_hash = %plan_hash_hex,
+                        compile_time_us,
+                        reason,
+                        "jit compilation failed; falling back to interpreter"
+                    );
+                }
             }
         }
 
@@ -2974,6 +3406,10 @@ impl VdbeEngine {
 
             let op = &ops[pc];
             opcode_count += 1;
+            if collect_vdbe_metrics {
+                local_opcode_execution_totals[usize::from(op.opcode as u8)] =
+                    local_opcode_execution_totals[usize::from(op.opcode as u8)].saturating_add(1);
+            }
             if self.trace_opcodes {
                 self.trace_opcode(pc, op);
             }
@@ -3261,7 +3697,18 @@ impl VdbeEngine {
                 // ── Result Row ──────────────────────────────────────────
                 Opcode::ResultRow => {
                     // Output p2 registers starting at p1.
+                    let materialize_start = collect_vdbe_metrics.then(Instant::now);
                     let row = self.collect_reg_range(op.p1, usize::try_from(op.p2).unwrap_or(0));
+                    if collect_vdbe_metrics {
+                        if let Some(materialize_start) = materialize_start {
+                            FSQLITE_VDBE_RESULT_ROW_MATERIALIZATION_TIME_NS_TOTAL.fetch_add(
+                                u64::try_from(materialize_start.elapsed().as_nanos())
+                                    .unwrap_or(u64::MAX),
+                                AtomicOrdering::Relaxed,
+                            );
+                        }
+                        record_result_row_metrics(&row);
+                    }
                     self.results.push(row);
                     pc += 1;
                 }
@@ -3403,7 +3850,10 @@ impl VdbeEngine {
                 Opcode::Cast => {
                     // Cast register p1 to type indicated by p2.
                     let val = self.take_reg(op.p1);
-                    let casted = sql_cast(val, op.p2);
+                    let casted = sql_cast(val.clone(), op.p2);
+                    if collect_vdbe_metrics {
+                        record_type_coercion(&val, &casted);
+                    }
                     self.set_reg(op.p1, casted);
                     pc += 1;
                 }
@@ -3430,8 +3880,13 @@ impl VdbeEngine {
                 #[allow(clippy::cast_precision_loss)]
                 Opcode::RealAffinity => {
                     if let SqliteValue::Integer(i) = self.get_reg(op.p1) {
+                        let before = SqliteValue::Integer(*i);
                         let f = *i as f64;
-                        self.set_reg(op.p1, SqliteValue::Float(f));
+                        let after = SqliteValue::Float(f);
+                        if collect_vdbe_metrics {
+                            record_type_coercion(&before, &after);
+                        }
+                        self.set_reg(op.p1, after);
                     }
                     pc += 1;
                 }
@@ -3848,9 +4303,11 @@ impl VdbeEngine {
                             let rows = sorter.rows_sorted_total;
                             let spill_pages = sorter.spill_pages_total;
                             let merge_runs = sorter.spill_runs.len() as u64;
-                            FSQLITE_SORT_ROWS_TOTAL.fetch_add(rows, AtomicOrdering::Relaxed);
-                            FSQLITE_SORT_SPILL_PAGES_TOTAL
-                                .fetch_add(spill_pages, AtomicOrdering::Relaxed);
+                            if vdbe_metrics_enabled() {
+                                FSQLITE_SORT_ROWS_TOTAL.fetch_add(rows, AtomicOrdering::Relaxed);
+                                FSQLITE_SORT_SPILL_PAGES_TOTAL
+                                    .fetch_add(spill_pages, AtomicOrdering::Relaxed);
+                            }
                             sorter.rows_sorted_total = 0;
                             sorter.spill_pages_total = 0;
                             // Tracing span for sort observability.
@@ -5141,6 +5598,13 @@ impl VdbeEngine {
                         });
                         fsqlite_types::record::serialize_record_iter(iter)
                     };
+                    if collect_vdbe_metrics {
+                        FSQLITE_VDBE_MAKE_RECORD_CALLS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
+                        FSQLITE_VDBE_MAKE_RECORD_BLOB_BYTES_TOTAL.fetch_add(
+                            u64::try_from(blob.len()).unwrap_or(u64::MAX),
+                            AtomicOrdering::Relaxed,
+                        );
+                    }
                     self.set_reg(target, SqliteValue::Blob(blob));
                     pc += 1;
                 }
@@ -5155,7 +5619,14 @@ impl VdbeEngine {
                             let reg = start + i as i32;
                             let val = self.take_reg(reg);
                             let affinity = char_to_affinity(ch);
-                            self.set_reg(reg, val.apply_affinity(affinity));
+                            if collect_vdbe_metrics {
+                                let before = val.clone();
+                                let coerced = val.apply_affinity(affinity);
+                                record_type_coercion(&before, &coerced);
+                                self.set_reg(reg, coerced);
+                            } else {
+                                self.set_reg(reg, val.apply_affinity(affinity));
+                            }
                         }
                     }
                     pc += 1;
@@ -6554,47 +7025,61 @@ impl VdbeEngine {
         let elapsed_us = elapsed.as_micros();
         let result_rows = self.results.len() - result_rows_before;
 
-        // Update global counters.
-        FSQLITE_VDBE_OPCODES_EXECUTED_TOTAL.fetch_add(opcode_count, AtomicOrdering::Relaxed);
-        FSQLITE_VDBE_STATEMENTS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
-        #[allow(clippy::cast_possible_truncation)]
-        FSQLITE_VDBE_STATEMENT_DURATION_US_TOTAL
-            .fetch_add(elapsed_us as u64, AtomicOrdering::Relaxed);
-
-        // vdbe_exec span with fields: opcode_count, program_id, result_rows (bd-1rw.1).
-        let span = tracing::info_span!(
-            target: "fsqlite_vdbe",
-            "vdbe_exec",
-            opcode_count,
-            program_id,
-            result_rows,
-            elapsed_us = elapsed_us as u64,
-        );
-        let _guard = span.enter();
-
-        // DEBUG-level per-statement completion log.
-        tracing::debug!(
-            target: "fsqlite_vdbe::statement",
-            program_id,
-            opcode_count,
-            result_rows,
-            elapsed_us = elapsed_us as u64,
-            outcome = ?outcome,
-            "vdbe statement done",
-        );
-
-        // INFO-level slow query log (>100ms).
-        if elapsed.as_millis() >= SLOW_QUERY_THRESHOLD_MS {
+        if collect_vdbe_metrics {
+            FSQLITE_VDBE_OPCODES_EXECUTED_TOTAL.fetch_add(opcode_count, AtomicOrdering::Relaxed);
+            FSQLITE_VDBE_STATEMENTS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
             #[allow(clippy::cast_possible_truncation)]
-            let millis = elapsed.as_millis() as u64;
-            tracing::info!(
-                target: "fsqlite_vdbe::slow_query",
-                program_id,
+            FSQLITE_VDBE_STATEMENT_DURATION_US_TOTAL
+                .fetch_add(elapsed_us as u64, AtomicOrdering::Relaxed);
+            for (idx, total) in local_opcode_execution_totals.iter().enumerate().skip(1) {
+                if *total == 0 {
+                    continue;
+                }
+                FSQLITE_VDBE_OPCODE_EXECUTION_TOTALS[idx]
+                    .fetch_add(*total, AtomicOrdering::Relaxed);
+            }
+        }
+
+        let log_statement_done = || {
+            if statement_debug_enabled {
+                tracing::debug!(
+                    target: "fsqlite_vdbe::statement",
+                    program_id,
+                    opcode_count,
+                    result_rows,
+                    elapsed_us = elapsed_us as u64,
+                    outcome = ?outcome,
+                    "vdbe statement done",
+                );
+            }
+
+            if slow_query_info_enabled && elapsed.as_millis() >= SLOW_QUERY_THRESHOLD_MS {
+                #[allow(clippy::cast_possible_truncation)]
+                let millis = elapsed.as_millis() as u64;
+                tracing::info!(
+                    target: "fsqlite_vdbe::slow_query",
+                    program_id,
+                    opcode_count,
+                    result_rows,
+                    elapsed_ms = millis,
+                    "slow vdbe statement",
+                );
+            }
+        };
+
+        if exec_info_enabled {
+            let span = tracing::info_span!(
+                target: "fsqlite_vdbe",
+                "vdbe_exec",
                 opcode_count,
+                program_id,
                 result_rows,
-                elapsed_ms = millis,
-                "slow vdbe statement",
+                elapsed_us = elapsed_us as u64,
             );
+            let _guard = span.enter();
+            log_statement_done();
+        } else {
+            log_statement_done();
         }
 
         Ok(outcome)
@@ -6693,6 +7178,7 @@ impl VdbeEngine {
 
     /// Read a column value from the cursor's current row.
     fn cursor_column(&mut self, cursor_id: i32, col_idx: usize) -> Result<SqliteValue> {
+        let collect_vdbe_metrics = vdbe_metrics_enabled();
         if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
             if cursor.cursor.eof() {
                 return Ok(SqliteValue::Null);
@@ -6701,7 +7187,11 @@ impl VdbeEngine {
                 .cursor
                 .payload_into(&cursor.cx, &mut cursor.payload_buf)?;
 
-            let ipk_col_idx = None;
+            let ipk_col_idx = self
+                .cursor_root_pages
+                .get(&cursor_id)
+                .and_then(|root_page| self.rowid_alias_col_by_root_page.get(root_page))
+                .copied();
             let payload_idx = if let Some(ipk) = ipk_col_idx {
                 if col_idx == ipk {
                     return self.cursor_rowid(cursor_id);
@@ -6714,15 +7204,27 @@ impl VdbeEngine {
             if let Some(val) =
                 fsqlite_types::record::parse_record_column(&cursor.payload_buf, payload_idx)
             {
+                if collect_vdbe_metrics {
+                    FSQLITE_VDBE_COLUMN_READS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
+                    record_decoded_value_metrics(&val);
+                }
                 return Ok(val);
             }
             // Column beyond record width — check ALTER TABLE ADD COLUMN defaults.
             if let Some(&root_page) = self.cursor_root_pages.get(&cursor_id) {
                 if let Some(defaults) = self.column_defaults_by_root_page.get(&root_page) {
                     if let Some(Some(default_val)) = defaults.get(col_idx) {
+                        if collect_vdbe_metrics {
+                            FSQLITE_VDBE_COLUMN_READS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
+                            record_decoded_value_metrics(default_val);
+                        }
                         return Ok(default_val.clone());
                     }
                 }
+            }
+            if collect_vdbe_metrics {
+                FSQLITE_VDBE_COLUMN_READS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
+                record_decoded_value_metrics(&SqliteValue::Null);
             }
             return Ok(SqliteValue::Null);
         }
@@ -6732,7 +7234,11 @@ impl VdbeEngine {
         if let Some(cursor) = self.cursors.get(&cursor_id) {
             if cursor.is_pseudo {
                 if let Some(row) = &cursor.pseudo_row {
-                    return Ok(row.get(col_idx).cloned().unwrap_or(SqliteValue::Null));
+                    let value = row.get(col_idx).cloned().unwrap_or(SqliteValue::Null);
+                    if collect_vdbe_metrics {
+                        record_decoded_value_metrics(&value);
+                    }
+                    return Ok(value);
                 }
                 if let Some(reg) = cursor.pseudo_reg {
                     let blob = self.get_reg(reg).clone();
@@ -6759,7 +7265,11 @@ impl VdbeEngine {
 
                     if let Some(cursor) = self.cursors.get(&cursor_id) {
                         if let Some((_, values)) = &cursor.cached_pseudo_row {
-                            return Ok(values.get(col_idx).cloned().unwrap_or(SqliteValue::Null));
+                            let value = values.get(col_idx).cloned().unwrap_or(SqliteValue::Null);
+                            if collect_vdbe_metrics {
+                                record_decoded_value_metrics(&value);
+                            }
+                            return Ok(value);
                         }
                     }
                 }
@@ -6770,11 +7280,15 @@ impl VdbeEngine {
                 && let Some(table) = db.get_table(cursor.root_page)
                 && let Some(row) = table.rows.get(pos)
             {
-                return Ok(row
+                let value = row
                     .values
                     .get(col_idx)
                     .cloned()
-                    .unwrap_or(SqliteValue::Null));
+                    .unwrap_or(SqliteValue::Null);
+                if collect_vdbe_metrics {
+                    record_decoded_value_metrics(&value);
+                }
+                return Ok(value);
             }
         }
 
@@ -6782,11 +7296,15 @@ impl VdbeEngine {
         if let Some(sorter) = self.sorters.get(&cursor_id) {
             if let Some(pos) = sorter.position {
                 if let Some(row) = sorter.rows.get(pos) {
-                    return Ok(row
+                    let value = row
                         .values
                         .get(col_idx)
                         .cloned()
-                        .unwrap_or(SqliteValue::Null));
+                        .unwrap_or(SqliteValue::Null);
+                    if collect_vdbe_metrics {
+                        record_decoded_value_metrics(&value);
+                    }
+                    return Ok(value);
                 }
             }
         }
@@ -7409,7 +7927,15 @@ fn decode_record(val: &SqliteValue) -> Result<Vec<SqliteValue>> {
         return Ok(Vec::new());
     };
 
-    parse_record(bytes).ok_or_else(|| FrankenError::internal("malformed SQLite record blob"))
+    let values = parse_record(bytes)
+        .ok_or_else(|| FrankenError::internal("malformed SQLite record blob"))?;
+    if vdbe_metrics_enabled() {
+        FSQLITE_VDBE_RECORD_DECODE_CALLS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
+        for value in &values {
+            record_decoded_value_metrics(value);
+        }
+    }
+    Ok(values)
 }
 
 fn sorter_keys_equal(
@@ -12488,17 +13014,14 @@ mod tests {
 
     // ── External Sort Tests (bd-1rw.4) ──────────────────────────────────
 
-    /// Mutex to serialize tests that mutate global JIT settings (enabled,
-    /// threshold, capacity). Without this, parallel tests overwrite each
-    /// other's globals, causing false negatives in delta-based assertions.
-    static JIT_SETTINGS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// Mutex to serialize tests that mutate global VDBE observability settings.
+    ///
+    /// JIT and metrics configuration are both process-global, so tests that
+    /// toggle them must not run concurrently.
+    static VDBE_OBSERVABILITY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    #[test]
-    fn test_sort_metrics_emitted_on_sorter_sort() {
-        // Verify that sort row metrics are updated when a sorter sorts rows.
-        // Delta-based: snapshot before/after to avoid racing with parallel tests.
-        let before = vdbe_metrics_snapshot();
-        let rows = run_program(|b| {
+    fn run_sorter_metric_program() -> Vec<Vec<SqliteValue>> {
+        run_program(|b| {
             let end = b.emit_label();
             let loop_start = b.emit_label();
             let empty = b.emit_label();
@@ -12524,7 +13047,20 @@ mod tests {
             b.resolve_label(empty);
             b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
             b.resolve_label(end);
-        });
+        })
+    }
+
+    #[test]
+    fn test_sort_metrics_emitted_on_sorter_sort() {
+        let _guard = VDBE_OBSERVABILITY_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev_metrics_enabled = vdbe_metrics_enabled();
+        set_vdbe_metrics_enabled(true);
+        // Verify that sort row metrics are updated when a sorter sorts rows.
+        // Delta-based: snapshot before/after to avoid racing with parallel tests.
+        let before = vdbe_metrics_snapshot();
+        let rows = run_sorter_metric_program();
 
         assert_eq!(rows.len(), 5);
         let after = vdbe_metrics_snapshot();
@@ -12536,11 +13072,82 @@ mod tests {
         );
         // No spill expected for 5 tiny rows.
         assert_eq!(delta_spill, 0, "no spill expected for small dataset");
+        set_vdbe_metrics_enabled(prev_metrics_enabled);
+    }
+
+    #[test]
+    fn test_vdbe_metrics_can_be_disabled_off_hot_path() {
+        let _guard = VDBE_OBSERVABILITY_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev_metrics_enabled = vdbe_metrics_enabled();
+        reset_vdbe_metrics();
+        set_vdbe_metrics_enabled(false);
+
+        let before = vdbe_metrics_snapshot();
+        let rows = run_sorter_metric_program();
+        let after = vdbe_metrics_snapshot();
+
+        assert_eq!(rows.len(), 5);
+        assert_eq!(after.opcodes_executed_total, before.opcodes_executed_total);
+        assert_eq!(after.statements_total, before.statements_total);
+        assert_eq!(
+            after.statement_duration_us_total,
+            before.statement_duration_us_total
+        );
+        assert_eq!(after.sort_rows_total, before.sort_rows_total);
+        assert_eq!(after.sort_spill_pages_total, before.sort_spill_pages_total);
+
+        set_vdbe_metrics_enabled(prev_metrics_enabled);
+    }
+
+    #[test]
+    #[ignore = "manual perf evidence for bd-db300.2.2"]
+    fn bench_vdbe_metrics_toggle_execute_hot_path() {
+        let _guard = VDBE_OBSERVABILITY_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev_metrics_enabled = vdbe_metrics_enabled();
+        let iterations = 20_000;
+
+        let mut b = ProgramBuilder::new();
+        let end = b.emit_label();
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+        b.emit_op(Opcode::Integer, 42, 1, 0, P4::None, 0);
+        b.emit_op(Opcode::ResultRow, 1, 1, 0, P4::None, 0);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end);
+        let prog = b.finish().expect("program should build");
+
+        let run = |metrics_enabled| {
+            set_vdbe_metrics_enabled(metrics_enabled);
+            reset_vdbe_metrics();
+            let mut engine = VdbeEngine::new(prog.register_count());
+            let start = Instant::now();
+            for _ in 0..iterations {
+                let outcome = engine.execute(&prog).expect("execution should succeed");
+                assert_eq!(outcome, ExecOutcome::Done);
+                engine.results.clear();
+            }
+            start.elapsed()
+        };
+
+        let metrics_disabled = run(false);
+        let metrics_enabled = run(true);
+        eprintln!(
+            "bd-db300.2.2 execute hot-path benchmark: iterations={iterations}, metrics_disabled_us={}, metrics_enabled_us={}",
+            metrics_disabled.as_micros(),
+            metrics_enabled.as_micros()
+        );
+
+        set_vdbe_metrics_enabled(prev_metrics_enabled);
     }
 
     #[test]
     fn test_jit_scaffold_metrics_compile_and_cache_hit() {
-        let _guard = JIT_SETTINGS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = VDBE_OBSERVABILITY_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let prev_enabled = vdbe_jit_enabled();
         let prev_threshold = vdbe_jit_hot_threshold();
         let prev_capacity = vdbe_jit_cache_capacity();
@@ -12586,7 +13193,9 @@ mod tests {
 
     #[test]
     fn test_jit_scaffold_compile_failure_falls_back_to_interpreter() {
-        let _guard = JIT_SETTINGS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = VDBE_OBSERVABILITY_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let prev_enabled = vdbe_jit_enabled();
         let prev_threshold = vdbe_jit_hot_threshold();
         let prev_capacity = vdbe_jit_cache_capacity();
@@ -14142,6 +14751,137 @@ mod tests {
                  not return 'historical data not available'"
             );
         }
+    }
+
+    #[test]
+    fn test_busy_retry_spin_loops_grow_then_cap() {
+        assert_eq!(busy_retry_spin_loops(1), WRITE_BUSY_HANDOFF_BASE_SPINS);
+        assert_eq!(busy_retry_spin_loops(2), WRITE_BUSY_HANDOFF_BASE_SPINS * 2);
+        assert_eq!(busy_retry_spin_loops(3), WRITE_BUSY_HANDOFF_BASE_SPINS * 4);
+        assert_eq!(busy_retry_spin_loops(6), WRITE_BUSY_HANDOFF_MAX_SPINS);
+        assert_eq!(busy_retry_spin_loops(32), WRITE_BUSY_HANDOFF_MAX_SPINS);
+    }
+
+    #[test]
+    fn test_busy_retry_yield_cadence_is_bounded() {
+        for attempt in 1..WRITE_BUSY_HANDOFF_YIELD_EVERY {
+            assert!(
+                !busy_retry_should_yield(attempt),
+                "attempt {attempt} should stay on-CPU"
+            );
+        }
+
+        assert!(busy_retry_should_yield(WRITE_BUSY_HANDOFF_YIELD_EVERY));
+        assert!(!busy_retry_should_yield(WRITE_BUSY_HANDOFF_YIELD_EVERY + 1));
+        assert!(busy_retry_should_yield(WRITE_BUSY_HANDOFF_YIELD_EVERY * 2));
+    }
+
+    #[test]
+    fn test_busy_retry_handoff_respects_deadline() {
+        let mut handoff = BusyRetryHandoff::default();
+        let expired_started = Instant::now()
+            .checked_sub(Duration::from_millis(5))
+            .expect("expired instant should be constructible");
+        assert!(
+            handoff
+                .next_wait(expired_started, Duration::from_millis(1))
+                .is_none(),
+            "expired deadline must stop retrying"
+        );
+
+        let fresh_wait = handoff
+            .next_wait(Instant::now(), Duration::from_millis(1))
+            .expect("fresh deadline should allow a bounded handoff wait");
+        assert_eq!(fresh_wait.attempt, 1);
+        assert_eq!(fresh_wait.spin_loops, WRITE_BUSY_HANDOFF_BASE_SPINS);
+        assert!(!fresh_wait.yielded, "first retry should not yield");
+    }
+
+    #[test]
+    fn test_shared_txn_page_io_busy_timeout_preserves_losing_writer_state() {
+        use fsqlite_pager::{MockMvccPager, MvccPager as _, TransactionMode};
+        use fsqlite_types::Snapshot;
+
+        let pager = MockMvccPager;
+        let cx = Cx::new();
+        let txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+
+        let registry = Arc::new(Mutex::new(ConcurrentRegistry::new()));
+        let lock_table = Arc::new(InProcessPageLockTable::new());
+        let snapshot = Snapshot::new(CommitSeq::new(7), SchemaEpoch::new(1));
+        let contested_page = PageNumber::ONE;
+        let page_bytes = vec![0xAB; PageSize::DEFAULT.as_usize()];
+
+        let (holder_session, writer_session) = {
+            let mut guard = registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let holder_session = guard
+                .begin_concurrent(snapshot)
+                .expect("holder session should register");
+            let writer_session = guard
+                .begin_concurrent(snapshot)
+                .expect("writer session should register");
+
+            let holder = guard
+                .get_mut(holder_session)
+                .expect("holder session must be present");
+            concurrent_write_page(
+                holder,
+                &lock_table,
+                holder_session,
+                contested_page,
+                PageData::from_vec(page_bytes.clone()),
+            )
+            .expect("holder should acquire the contested page lock");
+            (holder_session, writer_session)
+        };
+
+        let mut page_io = SharedTxnPageIo::with_concurrent(
+            Box::new(txn),
+            writer_session,
+            Arc::clone(&registry),
+            Arc::clone(&lock_table),
+            1,
+        );
+
+        let err = page_io
+            .write_page(&cx, contested_page, &page_bytes)
+            .expect_err("losing writer should time out with SQLITE_BUSY");
+        assert!(
+            matches!(err, FrankenError::Busy),
+            "expected SQLITE_BUSY on timed-out handoff, got {err}"
+        );
+
+        let guard = registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let holder = guard
+            .get(holder_session)
+            .expect("holder session should remain registered");
+        assert!(
+            holder.write_set().contains_key(&contested_page),
+            "winning writer must retain the contested page in its write set"
+        );
+
+        let writer = guard
+            .get(writer_session)
+            .expect("losing writer session should remain registered");
+        assert!(
+            writer.write_set().is_empty(),
+            "timed-out writer must not leak page data into its write set"
+        );
+        assert!(
+            writer.held_locks().is_empty(),
+            "timed-out writer must not retain the contested page lock"
+        );
+        drop(guard);
+
+        assert_eq!(
+            lock_table.total_lock_count(),
+            1,
+            "contested page lock must remain owned only by the winning writer"
+        );
     }
 
     // ── Subtype opcode tests ─────────────────────────────────────────

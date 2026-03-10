@@ -103,8 +103,22 @@ impl MethodologyMeta {
 ///
 /// This goes beyond [`crate::report::HostInfo`] with benchmark-specific
 /// fields like the Rust toolchain version and disk type.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum EnvironmentCaptureMode {
+    #[default]
+    Captured,
+    Suppressed,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnvironmentMeta {
+    /// Whether the environment was fully probed or intentionally suppressed.
+    ///
+    /// Profile-only runs keep the record shape stable while avoiding host
+    /// probing so profilers mostly observe engine work.
+    #[serde(default)]
+    pub capture_mode: EnvironmentCaptureMode,
     /// OS name and version (e.g. "Linux 6.17.0-12-generic").
     pub os: String,
     /// CPU architecture (e.g. "x86_64", "aarch64").
@@ -129,12 +143,28 @@ impl EnvironmentMeta {
     #[must_use]
     pub fn capture(cargo_profile: &str) -> Self {
         Self {
+            capture_mode: EnvironmentCaptureMode::Captured,
             os: detect_os(),
             arch: std::env::consts::ARCH.to_owned(),
             cpu_count: std::thread::available_parallelism().map_or(1, std::num::NonZero::get),
             cpu_model: detect_cpu_model(),
             ram_bytes: detect_ram_bytes(),
             rustc_version: detect_rustc_version(),
+            cargo_profile: cargo_profile.to_owned(),
+        }
+    }
+
+    /// Construct an explicit "suppressed" environment without probing the host.
+    #[must_use]
+    pub fn suppressed(cargo_profile: &str) -> Self {
+        Self {
+            capture_mode: EnvironmentCaptureMode::Suppressed,
+            os: "suppressed".to_owned(),
+            arch: "suppressed".to_owned(),
+            cpu_count: 0,
+            cpu_model: None,
+            ram_bytes: None,
+            rustc_version: "suppressed".to_owned(),
             cargo_profile: cargo_profile.to_owned(),
         }
     }
@@ -239,6 +269,7 @@ mod tests {
     #[test]
     fn environment_meta_capture_produces_sane_values() {
         let env = EnvironmentMeta::capture("release");
+        assert_eq!(env.capture_mode, EnvironmentCaptureMode::Captured);
         assert!(!env.os.is_empty());
         assert!(!env.arch.is_empty());
         assert!(env.cpu_count >= 1);
@@ -251,9 +282,42 @@ mod tests {
         let env = EnvironmentMeta::capture("release-perf");
         let json = serde_json::to_string(&env).unwrap();
         let parsed: EnvironmentMeta = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.capture_mode, EnvironmentCaptureMode::Captured);
         assert_eq!(parsed.arch, env.arch);
         assert_eq!(parsed.cpu_count, env.cpu_count);
         assert_eq!(parsed.cargo_profile, "release-perf");
+    }
+
+    #[test]
+    fn environment_meta_suppressed_roundtrip_marks_mode_and_placeholders() {
+        let env = EnvironmentMeta::suppressed("release");
+        let json = serde_json::to_string(&env).unwrap();
+        let parsed: EnvironmentMeta = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.capture_mode, EnvironmentCaptureMode::Suppressed);
+        assert_eq!(parsed.os, "suppressed");
+        assert_eq!(parsed.arch, "suppressed");
+        assert_eq!(parsed.cpu_count, 0);
+        assert_eq!(parsed.rustc_version, "suppressed");
+        assert_eq!(parsed.cargo_profile, "release");
+    }
+
+    #[test]
+    fn environment_meta_legacy_json_defaults_to_captured_mode() {
+        let parsed: EnvironmentMeta = serde_json::from_str(
+            r#"{
+                "os": "Linux",
+                "arch": "x86_64",
+                "cpu_count": 8,
+                "cpu_model": null,
+                "ram_bytes": null,
+                "rustc_version": "rustc 1.91.0-nightly",
+                "cargo_profile": "release"
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.capture_mode, EnvironmentCaptureMode::Captured);
+        assert_eq!(parsed.arch, "x86_64");
+        assert_eq!(parsed.cpu_count, 8);
     }
 
     #[test]

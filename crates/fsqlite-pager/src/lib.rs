@@ -19,7 +19,9 @@ pub use journal::{
 };
 pub use page_buf::{PageBuf, PageBufPool};
 pub use page_cache::{PageCache, PageCacheMetricsSnapshot};
-pub use pager::{SimplePager, SimplePagerCheckpointWriter, SimpleTransaction};
+pub use pager::{
+    PagerPublishedSnapshot, SimplePager, SimplePagerCheckpointWriter, SimpleTransaction,
+};
 pub use s3_fifo::{
     QueueKind, QueueLocation, RolloutDecision, RolloutMetrics, RolloutPolicy, S3Fifo, S3FifoConfig,
     S3FifoEvent, S3FifoRolloutGate,

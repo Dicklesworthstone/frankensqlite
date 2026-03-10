@@ -4,7 +4,7 @@
 
 use std::error::Error;
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use fsqlite_ast::{
     AlterTableAction, AlterTableStatement, Assignment, AssignmentTarget, AttachStatement,
@@ -32,12 +32,26 @@ use crate::token::{Token, TokenKind};
 
 /// Monotonic counter of successfully parsed statements.
 static FSQLITE_PARSE_STATEMENTS_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Monotonic counter of tokens consumed by successful parse_all() calls.
+static FSQLITE_PARSE_TOKENS_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Monotonic counter of parse errors encountered by parse_all().
+static FSQLITE_PARSE_ERRORS_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Whether parse metrics should be collected on the hot path.
+///
+/// These counters are currently used only for diagnostics/tests, so leave
+/// them disabled by default to avoid shared-state bookkeeping on ordinary
+/// parse calls.
+static FSQLITE_PARSE_METRICS_ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// Point-in-time parse metrics snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ParseMetricsSnapshot {
     /// Total statements successfully parsed.
     pub fsqlite_parse_statements_total: u64,
+    /// Total tokens observed by successful parse_all() calls.
+    pub fsqlite_parse_tokens_total: u64,
+    /// Total parse errors observed by parse_all() calls.
+    pub fsqlite_parse_errors_total: u64,
 }
 
 /// Take a point-in-time snapshot of parse metrics.
@@ -45,12 +59,27 @@ pub struct ParseMetricsSnapshot {
 pub fn parse_metrics_snapshot() -> ParseMetricsSnapshot {
     ParseMetricsSnapshot {
         fsqlite_parse_statements_total: FSQLITE_PARSE_STATEMENTS_TOTAL.load(Ordering::Relaxed),
+        fsqlite_parse_tokens_total: FSQLITE_PARSE_TOKENS_TOTAL.load(Ordering::Relaxed),
+        fsqlite_parse_errors_total: FSQLITE_PARSE_ERRORS_TOTAL.load(Ordering::Relaxed),
     }
+}
+
+/// Enable or disable parse metrics collection on the hot path.
+pub fn set_parse_metrics_enabled(enabled: bool) {
+    FSQLITE_PARSE_METRICS_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+/// Return whether parse metrics collection is enabled.
+#[must_use]
+pub fn parse_metrics_enabled() -> bool {
+    FSQLITE_PARSE_METRICS_ENABLED.load(Ordering::Relaxed)
 }
 
 /// Reset parse metrics (used by tests/diagnostics).
 pub fn reset_parse_metrics() {
     FSQLITE_PARSE_STATEMENTS_TOTAL.store(0, Ordering::Relaxed);
+    FSQLITE_PARSE_TOKENS_TOTAL.store(0, Ordering::Relaxed);
+    FSQLITE_PARSE_ERRORS_TOTAL.store(0, Ordering::Relaxed);
 }
 
 // ---------------------------------------------------------------------------
@@ -148,13 +177,21 @@ impl Parser {
     }
 
     pub fn parse_all(&mut self) -> (Vec<Statement>, Vec<ParseError>) {
-        let span = tracing::debug_span!(
-            target: "fsqlite.parse",
-            "parse",
-            ast_node_count = tracing::field::Empty,
-            parse_errors = tracing::field::Empty,
-        );
-        let _guard = span.enter();
+        let parse_debug_enabled = tracing::enabled!(target: "fsqlite.parse", tracing::Level::DEBUG);
+        let collect_parse_metrics = parse_metrics_enabled();
+        if collect_parse_metrics {
+            let token_count = u64::try_from(self.tokens.len()).unwrap_or(u64::MAX);
+            FSQLITE_PARSE_TOKENS_TOTAL.fetch_add(token_count, Ordering::Relaxed);
+        }
+        let span = parse_debug_enabled.then(|| {
+            tracing::debug_span!(
+                target: "fsqlite.parse",
+                "parse",
+                ast_node_count = tracing::field::Empty,
+                parse_errors = tracing::field::Empty,
+            )
+        });
+        let _guard = span.as_ref().map(|span| span.enter());
 
         let mut stmts = Vec::new();
         while !self.at_eof() {
@@ -164,11 +201,16 @@ impl Parser {
             }
             match self.parse_statement() {
                 Ok(s) => {
-                    FSQLITE_PARSE_STATEMENTS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                    if collect_parse_metrics {
+                        FSQLITE_PARSE_STATEMENTS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                    }
                     stmts.push(s);
                     let _ = self.eat(&TokenKind::Semicolon);
                 }
                 Err(e) => {
+                    if collect_parse_metrics {
+                        FSQLITE_PARSE_ERRORS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                    }
                     tracing::warn!(
                         target: "fsqlite.parse",
                         error = %e,
@@ -181,8 +223,10 @@ impl Parser {
         }
 
         let errors = std::mem::take(&mut self.errors);
-        span.record("ast_node_count", stmts.len() as u64);
-        span.record("parse_errors", errors.len() as u64);
+        if let Some(span) = span.as_ref() {
+            span.record("ast_node_count", stmts.len() as u64);
+            span.record("parse_errors", errors.len() as u64);
+        }
 
         (stmts, errors)
     }
@@ -2193,6 +2237,8 @@ pub(crate) fn kw_to_str(k: &TokenKind) -> String {
 mod tests {
     use super::*;
 
+    static PARSE_OBSERVABILITY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn parse_ok(sql: &str) -> Vec<Statement> {
         let mut p = Parser::from_sql(sql);
         let (stmts, errs) = p.parse_all();
@@ -2204,6 +2250,48 @@ mod tests {
         let stmts = parse_ok(sql);
         assert_eq!(stmts.len(), 1, "expected 1 statement, got {}", stmts.len());
         stmts.into_iter().next().unwrap()
+    }
+
+    #[test]
+    fn test_parse_metrics_emitted_when_enabled() {
+        let _guard = PARSE_OBSERVABILITY_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let prev_metrics_enabled = parse_metrics_enabled();
+        reset_parse_metrics();
+        set_parse_metrics_enabled(true);
+
+        let mut parser = Parser::from_sql("SELECT 1; SELECT 2;");
+        let (stmts, errs) = parser.parse_all();
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+        assert_eq!(stmts.len(), 2);
+
+        let snapshot = parse_metrics_snapshot();
+        assert_eq!(snapshot.fsqlite_parse_statements_total, 2);
+
+        set_parse_metrics_enabled(prev_metrics_enabled);
+        reset_parse_metrics();
+    }
+
+    #[test]
+    fn test_parse_metrics_can_be_disabled_off_hot_path() {
+        let _guard = PARSE_OBSERVABILITY_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let prev_metrics_enabled = parse_metrics_enabled();
+        reset_parse_metrics();
+        set_parse_metrics_enabled(false);
+
+        let mut parser = Parser::from_sql("SELECT 1; SELECT 2;");
+        let (stmts, errs) = parser.parse_all();
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+        assert_eq!(stmts.len(), 2);
+
+        let snapshot = parse_metrics_snapshot();
+        assert_eq!(snapshot.fsqlite_parse_statements_total, 0);
+
+        set_parse_metrics_enabled(prev_metrics_enabled);
+        reset_parse_metrics();
     }
 
     #[test]

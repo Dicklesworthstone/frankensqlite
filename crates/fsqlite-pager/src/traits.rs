@@ -123,6 +123,22 @@ pub trait WalBackend: Send {
         db_size_if_commit: u32,
     ) -> Result<()>;
 
+    /// Append a batch of frames to the WAL.
+    ///
+    /// The default path preserves existing behavior by delegating to
+    /// [`Self::append_frame`] one frame at a time.
+    fn append_frames(&mut self, cx: &Cx, frames: &[WalFrameRef<'_>]) -> Result<()> {
+        for frame in frames {
+            self.append_frame(
+                cx,
+                frame.page_number,
+                frame.page_data,
+                frame.db_size_if_commit,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Look up the latest version of a page in the WAL.
     ///
     /// Scans backwards from the most recent frame. Returns `None` if the
@@ -159,6 +175,17 @@ pub trait WalBackend: Send {
         backfilled_frames: u32,
         oldest_reader_frame: Option<u32>,
     ) -> Result<CheckpointResult>;
+}
+
+/// Borrowed frame descriptor used for WAL batch appends.
+#[derive(Debug, Clone, Copy)]
+pub struct WalFrameRef<'a> {
+    /// Database page number this frame writes.
+    pub page_number: u32,
+    /// Page data for the frame. Must be exactly `page_size` bytes.
+    pub page_data: &'a [u8],
+    /// Database size in pages for commit frames, or 0 for non-commit frames.
+    pub db_size_if_commit: u32,
 }
 
 // ---------------------------------------------------------------------------

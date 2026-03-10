@@ -11,12 +11,14 @@
 use std::collections::HashMap;
 
 use fsqlite_error::{FrankenError, Result};
+use fsqlite_pager::traits::WalFrameRef;
 use fsqlite_pager::{CheckpointMode, CheckpointPageWriter, CheckpointResult, WalBackend};
 use fsqlite_types::PageNumber;
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::SyncFlags;
 use fsqlite_vfs::VfsFile;
 use fsqlite_wal::checksum::WalSalts;
+use fsqlite_wal::wal::WalAppendFrameRef;
 use fsqlite_wal::{
     CheckpointMode as WalCheckpointMode, CheckpointState, CheckpointTarget, WalFile,
     execute_checkpoint,
@@ -314,6 +316,59 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
                 Err(e) => {
                     // FEC encoding failure is non-fatal -- log and continue.
                     warn!(error = %e, "FEC encoding failed; commit proceeds without repair symbols");
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn append_frames(&mut self, cx: &Cx, frames: &[WalFrameRef<'_>]) -> Result<()> {
+        if frames.is_empty() {
+            return Ok(());
+        }
+
+        if self.refresh_before_append {
+            // Keep this handle synchronized with external WAL growth/reset
+            // before choosing append offset and checksum seed.
+            self.wal.refresh(cx)?;
+        }
+
+        let mut wal_frames = Vec::with_capacity(frames.len());
+        for frame in frames {
+            wal_frames.push(WalAppendFrameRef {
+                page_number: frame.page_number,
+                page_data: frame.page_data,
+                db_size_if_commit: frame.db_size_if_commit,
+            });
+        }
+        self.wal.append_frames(cx, &wal_frames)?;
+        self.refresh_before_append = false;
+
+        if let Some(hook) = &mut self.fec_hook {
+            for frame in frames {
+                match hook.on_frame(
+                    cx,
+                    frame.page_number,
+                    frame.page_data,
+                    frame.db_size_if_commit,
+                ) {
+                    Ok(Some(result)) => {
+                        debug!(
+                            pages = result.page_numbers.len(),
+                            k_source = result.k_source,
+                            symbols = result.symbols.len(),
+                            "FEC commit group encoded"
+                        );
+                        self.fec_pending.push(result);
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            "FEC encoding failed; commit proceeds without repair symbols"
+                        );
+                    }
                 }
             }
         }

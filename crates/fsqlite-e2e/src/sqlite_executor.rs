@@ -208,6 +208,7 @@ pub fn run_oplog_sqlite(
         },
         latency_ms: None,
         error,
+        hot_path_profile: None,
     })
 }
 

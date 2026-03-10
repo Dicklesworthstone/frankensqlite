@@ -801,6 +801,7 @@ mod tests {
             },
             latency_ms: None,
             error: None,
+            hot_path_profile: None,
         }
     }
 

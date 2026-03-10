@@ -243,7 +243,18 @@ report.retries             SQLITE_BUSY retries
 report.aborts              Transaction aborts
 report.correctness.*       Correctness tier results (see below)
 report.error               null if clean, error string otherwise
+environment.capture_mode   "captured" by default, "suppressed" for profiler-only runs
 ```
+
+For lower-overhead profiler runs, `realdb-e2e run` supports:
+
+- `--profile-only` to disable post-run `PRAGMA integrity_check` and suppress
+  host probing in the emitted `environment` block.
+- `--skip-integrity-check` and `--skip-environment-metadata` when those knobs
+  should be controlled independently.
+
+Default runs are unchanged: they still emit a full `RunRecordV1` with captured
+environment metadata and integrity-check results.
 
 ### Correctness Tiers
 

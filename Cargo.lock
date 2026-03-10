@@ -832,12 +832,15 @@ version = "0.1.0"
 dependencies = [
  "criterion",
  "fsqlite",
+ "fsqlite-btree",
  "fsqlite-core",
  "fsqlite-error",
  "fsqlite-ext-session",
  "fsqlite-harness",
  "fsqlite-mvcc",
+ "fsqlite-parser",
  "fsqlite-types",
+ "fsqlite-vdbe",
  "fsqlite-vfs",
  "fsqlite-wal",
  "ftui",
@@ -1030,6 +1033,7 @@ dependencies = [
  "proptest",
  "smallvec",
  "tempfile",
+ "tracing",
  "xxhash-rust",
 ]
 

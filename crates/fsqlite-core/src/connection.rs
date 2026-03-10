@@ -16,7 +16,7 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -41,7 +41,9 @@ use fsqlite_func::{
     get_total_changes,
 };
 use fsqlite_pager::traits::{MvccPager, TransactionHandle, TransactionMode};
-use fsqlite_pager::{CheckpointMode, JournalMode, PageCacheMetricsSnapshot, SimplePager};
+use fsqlite_pager::{
+    CheckpointMode, JournalMode, PageCacheMetricsSnapshot, PagerPublishedSnapshot, SimplePager,
+};
 use fsqlite_parser::Parser;
 use fsqlite_parser::lexer::Lexer;
 use fsqlite_types::DATABASE_HEADER_SIZE;
@@ -49,7 +51,10 @@ use fsqlite_types::cx::{CancelReason, Cx};
 use fsqlite_types::flags::{AccessFlags, VfsOpenFlags};
 use fsqlite_types::limits::MAX_VARIABLE_NUMBER;
 use fsqlite_types::opcode::{Opcode, P4};
-use fsqlite_types::record::{parse_record, serialize_record};
+use fsqlite_types::record::{
+    RecordHotPathProfileSnapshot, parse_record, record_profile_snapshot, reset_record_profile,
+    serialize_record, set_record_profile_enabled,
+};
 use fsqlite_types::value::SqliteValue;
 use fsqlite_types::{
     BTreePageHeader, DatabaseHeader, EProcessConfig, EProcessOracle, PageNumber, PageSize, Region,
@@ -60,9 +65,10 @@ use fsqlite_vdbe::codegen::{
     codegen_delete, codegen_insert, codegen_select, codegen_update,
 };
 use fsqlite_vdbe::engine::{
-    ExecOutcome, MemDatabase, MemDbVersionToken, VdbeEngine, reset_vdbe_jit_metrics,
-    set_vdbe_jit_cache_capacity, set_vdbe_jit_enabled, set_vdbe_jit_hot_threshold,
-    vdbe_jit_cache_capacity, vdbe_jit_enabled, vdbe_jit_hot_threshold, vdbe_jit_metrics_snapshot,
+    ExecOutcome, MemDatabase, MemDbVersionToken, VdbeEngine, VdbeMetricsSnapshot,
+    reset_vdbe_jit_metrics, reset_vdbe_metrics, set_vdbe_jit_cache_capacity, set_vdbe_jit_enabled,
+    set_vdbe_jit_hot_threshold, set_vdbe_metrics_enabled, vdbe_jit_cache_capacity,
+    vdbe_jit_enabled, vdbe_jit_hot_threshold, vdbe_jit_metrics_snapshot, vdbe_metrics_snapshot,
 };
 use fsqlite_vdbe::{ProgramBuilder, VdbeProgram};
 #[cfg(target_os = "linux")]
@@ -113,6 +119,89 @@ const EPROCESS_PRIORITY_THRESHOLD: u8 = 1;
 /// level consumes significantly more stack space than C. A practical limit of
 /// 100 prevents stack overflow while still allowing deep trigger chains.
 const MAX_TRIGGER_DEPTH: usize = 100;
+
+static FSQLITE_HOT_PATH_PROFILE_ENABLED: AtomicBool = AtomicBool::new(false);
+static FSQLITE_PARSE_SINGLE_CALLS: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_PARSE_MULTI_CALLS: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_PARSE_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_PARSE_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_PARSED_SQL_BYTES: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_PARSE_TIME_NS: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_REWRITE_CALLS: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_REWRITE_TIME_NS: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_COMPILED_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_COMPILED_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
+static FSQLITE_COMPILE_TIME_NS: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ParserHotPathProfileSnapshot {
+    pub parse_single_calls: u64,
+    pub parse_multi_calls: u64,
+    pub parse_cache_hits: u64,
+    pub parse_cache_misses: u64,
+    pub parsed_sql_bytes: u64,
+    pub parse_time_ns: u64,
+    pub rewrite_calls: u64,
+    pub rewrite_time_ns: u64,
+    pub compiled_cache_hits: u64,
+    pub compiled_cache_misses: u64,
+    pub compile_time_ns: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HotPathProfileSnapshot {
+    pub parser: ParserHotPathProfileSnapshot,
+    pub record_decode: RecordHotPathProfileSnapshot,
+    pub vdbe: VdbeMetricsSnapshot,
+}
+
+#[must_use]
+pub fn hot_path_profile_enabled() -> bool {
+    FSQLITE_HOT_PATH_PROFILE_ENABLED.load(AtomicOrdering::Relaxed)
+}
+
+pub fn set_hot_path_profile_enabled(enabled: bool) {
+    FSQLITE_HOT_PATH_PROFILE_ENABLED.store(enabled, AtomicOrdering::Relaxed);
+    set_record_profile_enabled(enabled);
+    set_vdbe_metrics_enabled(enabled);
+}
+
+pub fn reset_hot_path_profile() {
+    FSQLITE_PARSE_SINGLE_CALLS.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_PARSE_MULTI_CALLS.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_PARSE_CACHE_HITS.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_PARSE_CACHE_MISSES.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_PARSED_SQL_BYTES.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_PARSE_TIME_NS.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_REWRITE_CALLS.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_REWRITE_TIME_NS.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_COMPILED_CACHE_HITS.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_COMPILED_CACHE_MISSES.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_COMPILE_TIME_NS.store(0, AtomicOrdering::Relaxed);
+    reset_record_profile();
+    reset_vdbe_metrics();
+}
+
+#[must_use]
+pub fn hot_path_profile_snapshot() -> HotPathProfileSnapshot {
+    HotPathProfileSnapshot {
+        parser: ParserHotPathProfileSnapshot {
+            parse_single_calls: FSQLITE_PARSE_SINGLE_CALLS.load(AtomicOrdering::Relaxed),
+            parse_multi_calls: FSQLITE_PARSE_MULTI_CALLS.load(AtomicOrdering::Relaxed),
+            parse_cache_hits: FSQLITE_PARSE_CACHE_HITS.load(AtomicOrdering::Relaxed),
+            parse_cache_misses: FSQLITE_PARSE_CACHE_MISSES.load(AtomicOrdering::Relaxed),
+            parsed_sql_bytes: FSQLITE_PARSED_SQL_BYTES.load(AtomicOrdering::Relaxed),
+            parse_time_ns: FSQLITE_PARSE_TIME_NS.load(AtomicOrdering::Relaxed),
+            rewrite_calls: FSQLITE_REWRITE_CALLS.load(AtomicOrdering::Relaxed),
+            rewrite_time_ns: FSQLITE_REWRITE_TIME_NS.load(AtomicOrdering::Relaxed),
+            compiled_cache_hits: FSQLITE_COMPILED_CACHE_HITS.load(AtomicOrdering::Relaxed),
+            compiled_cache_misses: FSQLITE_COMPILED_CACHE_MISSES.load(AtomicOrdering::Relaxed),
+            compile_time_ns: FSQLITE_COMPILE_TIME_NS.load(AtomicOrdering::Relaxed),
+        },
+        record_decode: record_profile_snapshot(),
+        vdbe: vdbe_metrics_snapshot(),
+    }
+}
 
 /// I/O polling strategy for the shared runtime context.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -301,6 +390,48 @@ impl PagerBackend {
             Self::Unix(p) => p.wal_frame_count(),
             #[cfg(target_os = "windows")]
             Self::Windows(p) => p.wal_frame_count(),
+        }
+    }
+
+    /// Published pager metadata snapshot for lock-light visibility checks.
+    #[must_use]
+    pub fn published_snapshot(&self) -> PagerPublishedSnapshot {
+        match self {
+            Self::Memory(p) => p.published_snapshot(),
+            #[cfg(target_os = "linux")]
+            Self::IoUring(p) => p.published_snapshot(),
+            #[cfg(unix)]
+            Self::Unix(p) => p.published_snapshot(),
+            #[cfg(target_os = "windows")]
+            Self::Windows(p) => p.published_snapshot(),
+        }
+    }
+
+    /// Refresh the pager publication plane from the latest committed state and
+    /// return the resulting snapshot.
+    pub fn refresh_published_snapshot(&self, cx: &Cx) -> Result<PagerPublishedSnapshot> {
+        match self {
+            Self::Memory(p) => p.refresh_published_snapshot(cx),
+            #[cfg(target_os = "linux")]
+            Self::IoUring(p) => p.refresh_published_snapshot(cx),
+            #[cfg(unix)]
+            Self::Unix(p) => p.refresh_published_snapshot(cx),
+            #[cfg(target_os = "windows")]
+            Self::Windows(p) => p.refresh_published_snapshot(cx),
+        }
+    }
+
+    /// Number of retries readers have taken while binding a stable published snapshot.
+    #[must_use]
+    pub fn published_read_retry_count(&self) -> u64 {
+        match self {
+            Self::Memory(p) => p.published_read_retry_count(),
+            #[cfg(target_os = "linux")]
+            Self::IoUring(p) => p.published_read_retry_count(),
+            #[cfg(unix)]
+            Self::Unix(p) => p.published_read_retry_count(),
+            #[cfg(target_os = "windows")]
+            Self::Windows(p) => p.published_read_retry_count(),
         }
     }
 
@@ -807,6 +938,7 @@ impl PreparedStatement<'_> {
         // historical snapshot upgrades.
         let reject_mem = *self.conn.reject_mem_fallback.borrow();
         let autoincrement_seq_by_root_page = self.conn.autoincrement_sequence_by_root_page();
+        let rowid_alias_col_by_root_page = self.conn.rowid_alias_column_by_root_page();
         let col_defaults_by_root_page = self.conn.column_defaults_by_root_page();
         let txn = self
             .pager
@@ -823,6 +955,7 @@ impl PreparedStatement<'_> {
             self.schema_cookie,
             None,
             autoincrement_seq_by_root_page,
+            rowid_alias_col_by_root_page,
             col_defaults_by_root_page,
             reject_mem,
             Some(Arc::clone(&self.conn.version_store)),
@@ -1456,6 +1589,15 @@ struct TimeTravelSnapshotEntry {
 /// Maximum number of retained time-travel snapshots per connection.
 const MAX_TIME_TRAVEL_SNAPSHOTS: usize = 256;
 
+const PAGER_PUBLICATION_MODE: &str = "seqlock_published_pages";
+
+/// Connection-bound view of the pager publication plane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BoundPagerPublication {
+    snapshot: PagerPublishedSnapshot,
+    read_retry_count: u64,
+}
+
 /// A database connection holding schema metadata and execution/cache state.
 ///
 /// Supports transactions (BEGIN/COMMIT/ROLLBACK) and savepoints
@@ -1584,6 +1726,9 @@ pub struct Connection {
     /// Highest commit sequence reflected in this connection's in-memory
     /// `MemDatabase` image. Used to reload from pager before BEGIN when stale.
     memdb_visible_commit_seq: RefCell<CommitSeq>,
+    /// Whether the connection-local `MemDatabase` currently contains full row
+    /// payloads for file-backed tables, not just schema-shaped placeholders.
+    memdb_rows_loaded: Cell<bool>,
     /// Last commit sequence assigned to a successful local COMMIT executed
     /// through this connection.
     last_local_commit_seq: RefCell<Option<CommitSeq>>,
@@ -1694,12 +1839,7 @@ impl Connection {
                 .with_trace_context(next_trace_id(), 0, 0);
         let pager = PagerBackend::open(&path, &bootstrap_cx)?;
         let shared_mvcc_state = shared_mvcc_state_for_path(&path, Arc::clone(env.runtime()))?;
-        let initial_visible_commit_seq = CommitSeq::new(
-            shared_mvcc_state
-                .next_commit_seq
-                .load(AtomicOrdering::Acquire)
-                .saturating_sub(1),
-        );
+        let initial_visible_commit_seq = pager.published_snapshot().visible_commit_seq;
         let (runtime_region, root_cx) = shared_mvcc_state.register_connection()?;
         let eprocess_oracle = Arc::new(EProcessOracle::new(
             EPROCESS_DEFAULT_CONFIG,
@@ -1707,6 +1847,7 @@ impl Connection {
         ));
         root_cx.set_eprocess_oracle(Arc::clone(&eprocess_oracle));
 
+        let eager_memdb_rows = path == ":memory:";
         let conn = Self {
             path,
             db: Rc::new(RefCell::new(MemDatabase::new())),
@@ -1752,6 +1893,7 @@ impl Connection {
             concurrent_commit_index: Arc::clone(&shared_mvcc_state.commit_index),
             next_commit_seq: Arc::clone(&shared_mvcc_state.next_commit_seq),
             memdb_visible_commit_seq: RefCell::new(initial_visible_commit_seq),
+            memdb_rows_loaded: Cell::new(eager_memdb_rows),
             last_local_commit_seq: RefCell::new(None),
             commit_write_mutex: Arc::clone(&shared_mvcc_state.commit_write_mutex),
             closed: RefCell::new(false),
@@ -2075,6 +2217,7 @@ impl Connection {
         self.eprocess_oracle.observe_sample(anomaly_score >= 0.5);
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     #[inline]
     fn current_global_commit_seq(&self) -> CommitSeq {
         CommitSeq::new(
@@ -2093,15 +2236,28 @@ impl Connection {
         committed_seq
     }
 
+    #[inline]
+    fn should_eagerly_hydrate_memdb_rows(&self) -> bool {
+        self.path == ":memory:" || !*self.reject_mem_fallback.borrow()
+    }
+
     /// Capture a time-travel snapshot of the current database state.
     ///
     /// Called after a successful COMMIT (explicit or autocommit) to record the
     /// database state at the given commit sequence number. The snapshot is stored
     /// in a bounded ring buffer; oldest entries are evicted when full.
     ///
+    /// These snapshots are only retained for `:memory:` connections. File-backed
+    /// databases should source historical reads from MVCC/WAL state rather than
+    /// cloning the compatibility `MemDatabase` on every commit.
+    ///
     /// Since data lives in the pager (not the MemDatabase), this reloads the
     /// MemDatabase from the pager before capturing the snapshot.
     fn capture_time_travel_snapshot(&self, commit_seq: u64) {
+        if self.path != ":memory:" {
+            return;
+        }
+
         // Sync MemDatabase with the pager's committed state.
         if let Ok(cx) = self.op_cx() {
             let _ = self.reload_memdb_from_pager(&cx);
@@ -2123,16 +2279,51 @@ impl Connection {
         snaps.push(snapshot);
     }
 
+    fn bind_pager_publication(
+        &self,
+        cx: &Cx,
+        scenario_id: &'static str,
+    ) -> Result<BoundPagerPublication> {
+        let started = Instant::now();
+        let publication = BoundPagerPublication {
+            snapshot: self.pager.refresh_published_snapshot(cx)?,
+            read_retry_count: self.pager.published_read_retry_count(),
+        };
+        tracing::trace!(
+            target: "fsqlite.snapshot_publication",
+            trace_id = cx.trace_id(),
+            run_id = "connection-publication",
+            scenario_id,
+            snapshot_gen = publication.snapshot.snapshot_gen,
+            visible_commit_seq = publication.snapshot.visible_commit_seq.get(),
+            publication_mode = PAGER_PUBLICATION_MODE,
+            read_retry_count = publication.read_retry_count,
+            page_set_size = publication.snapshot.page_set_size,
+            checkpoint_active = publication.snapshot.checkpoint_active,
+            freelist_count = publication.snapshot.freelist_count,
+            elapsed_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            "bound connection to pager snapshot"
+        );
+        Ok(publication)
+    }
+
+    fn concurrent_snapshot_from_publication(&self, publication: BoundPagerPublication) -> Snapshot {
+        Snapshot::new(
+            publication.snapshot.visible_commit_seq,
+            SchemaEpoch::new((*self.schema_cookie.borrow()).into()),
+        )
+    }
+
     /// Ensure the in-memory execution image matches the latest committed pager state.
     ///
     /// Connections keep a local `MemDatabase` cache for VDBE execution. When other
     /// connections commit, this cache can become stale; before starting a new SQL
     /// transaction we must reload from pager to preserve snapshot correctness.
     fn refresh_memdb_if_stale(&self, cx: &Cx) -> Result<()> {
-        let latest_commit_seq = self.current_global_commit_seq();
-        if latest_commit_seq > *self.memdb_visible_commit_seq.borrow() {
+        let publication = self.bind_pager_publication(cx, "memdb_staleness_check")?;
+        if publication.snapshot.visible_commit_seq > *self.memdb_visible_commit_seq.borrow() {
             self.reload_memdb_from_pager(cx)?;
-            *self.memdb_visible_commit_seq.borrow_mut() = latest_commit_seq;
+            *self.memdb_visible_commit_seq.borrow_mut() = publication.snapshot.visible_commit_seq;
         }
         Ok(())
     }
@@ -2390,7 +2581,19 @@ impl Connection {
             );
             record_trace_span_created();
             let _parse_guard = parse_span.enter();
-            self.rewrite_subquery_statement(&statement, None)?
+            let profile_enabled = hot_path_profile_enabled();
+            if profile_enabled {
+                FSQLITE_REWRITE_CALLS.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            let start = profile_enabled.then(Instant::now);
+            let statement = self.rewrite_subquery_statement(&statement, None)?;
+            if let Some(start) = start {
+                FSQLITE_REWRITE_TIME_NS.fetch_add(
+                    u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                    AtomicOrdering::Relaxed,
+                );
+            }
+            statement
         };
         let plan_span = tracing::span!(
             target: "fsqlite.plan",
@@ -2575,12 +2778,33 @@ impl Connection {
     /// Return a cached parsed single statement, or parse fresh and cache it.
     /// The cache is invalidated whenever the schema cookie changes (DDL).
     fn cached_parse_single(&self, sql: &str) -> Result<std::sync::Arc<Statement>> {
+        let profile_enabled = hot_path_profile_enabled();
+        if profile_enabled {
+            FSQLITE_PARSE_SINGLE_CALLS.fetch_add(1, AtomicOrdering::Relaxed);
+        }
         let key = Self::sql_hash(sql);
         self.refresh_parse_cache_if_needed();
         if let Some(cached) = self.lookup_parse_cache(key, sql) {
+            if profile_enabled {
+                FSQLITE_PARSE_CACHE_HITS.fetch_add(1, AtomicOrdering::Relaxed);
+            }
             return Ok(std::sync::Arc::clone(&cached.statement));
         }
+        if profile_enabled {
+            FSQLITE_PARSE_CACHE_MISSES.fetch_add(1, AtomicOrdering::Relaxed);
+            FSQLITE_PARSED_SQL_BYTES.fetch_add(
+                u64::try_from(sql.len()).unwrap_or(u64::MAX),
+                AtomicOrdering::Relaxed,
+            );
+        }
+        let start = profile_enabled.then(Instant::now);
         let stmt = parse_single_statement(sql)?;
+        if let Some(start) = start {
+            FSQLITE_PARSE_TIME_NS.fetch_add(
+                u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                AtomicOrdering::Relaxed,
+            );
+        }
         Ok(std::sync::Arc::clone(
             &self.insert_parse_cache(key, sql, stmt).statement,
         ))
@@ -2590,16 +2814,37 @@ impl Connection {
     /// Multi-statement SQL is less common and cache hit rate is lower,
     /// so we only cache single-statement SQL in this path.
     fn cached_parse_multi(&self, sql: &str) -> Result<Vec<std::sync::Arc<Statement>>> {
+        let profile_enabled = hot_path_profile_enabled();
+        if profile_enabled {
+            FSQLITE_PARSE_MULTI_CALLS.fetch_add(1, AtomicOrdering::Relaxed);
+        }
         // Hot path optimization for repeated single-statement execute() calls.
         // Use the same collision-safe SQL equality check as cached_parse_single.
         let key = Self::sql_hash(sql);
         self.refresh_parse_cache_if_needed();
         if let Some(cached) = self.lookup_parse_cache(key, sql) {
+            if profile_enabled {
+                FSQLITE_PARSE_CACHE_HITS.fetch_add(1, AtomicOrdering::Relaxed);
+            }
             return Ok(vec![std::sync::Arc::clone(&cached.statement)]);
         }
 
         // For single-statement SQL, use the cache.
+        if profile_enabled {
+            FSQLITE_PARSE_CACHE_MISSES.fetch_add(1, AtomicOrdering::Relaxed);
+            FSQLITE_PARSED_SQL_BYTES.fetch_add(
+                u64::try_from(sql.len()).unwrap_or(u64::MAX),
+                AtomicOrdering::Relaxed,
+            );
+        }
+        let start = profile_enabled.then(Instant::now);
         let stmts = parse_statements(sql)?;
+        if let Some(start) = start {
+            FSQLITE_PARSE_TIME_NS.fetch_add(
+                u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                AtomicOrdering::Relaxed,
+            );
+        }
         if stmts.len() == 1 {
             self.insert_parse_cache(key, sql, stmts[0].clone());
         }
@@ -2688,10 +2933,24 @@ impl Connection {
         sql: &str,
         compile_fn: impl FnOnce(&Self) -> Result<VdbeProgram>,
     ) -> Result<Arc<VdbeProgram>> {
+        let profile_enabled = hot_path_profile_enabled();
         if let Some(cached) = self.lookup_compiled_cache(sql_key, sql) {
+            if profile_enabled {
+                FSQLITE_COMPILED_CACHE_HITS.fetch_add(1, AtomicOrdering::Relaxed);
+            }
             return Ok(Arc::clone(&cached.program));
         }
+        if profile_enabled {
+            FSQLITE_COMPILED_CACHE_MISSES.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        let start = profile_enabled.then(Instant::now);
         let program = compile_fn(self)?;
+        if let Some(start) = start {
+            FSQLITE_COMPILE_TIME_NS.fetch_add(
+                u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                AtomicOrdering::Relaxed,
+            );
+        }
         let entry = self.insert_compiled_cache(sql_key, sql, program);
         Ok(Arc::clone(&entry.program))
     }
@@ -6197,19 +6456,13 @@ impl Connection {
         let cx = self.op_cx()?;
         self.refresh_memdb_if_stale(&cx)?;
         let is_concurrent = mode == TransactionMode::Concurrent;
-        // Capture MVCC snapshot sequence BEFORE opening pager txn.
-        // This is intentionally conservative: if a writer commits between this
-        // load and `pager.begin`, FCW may over-abort, but it cannot false-clean.
+        // Bind the MVCC snapshot to the pager's published visibility plane
+        // before opening the pager txn. This is still conservative: if a
+        // writer commits between the bind and `pager.begin`, FCW may
+        // over-abort, but it cannot false-clean.
         let concurrent_snapshot = if is_concurrent {
-            let snapshot_seq = CommitSeq::new(
-                self.next_commit_seq
-                    .load(AtomicOrdering::Acquire)
-                    .saturating_sub(1),
-            );
-            Some(Snapshot::new(
-                snapshot_seq,
-                SchemaEpoch::new((*self.schema_cookie.borrow()).into()),
-            ))
+            let publication = self.bind_pager_publication(&cx, "autocommit_begin")?;
+            Some(self.concurrent_snapshot_from_publication(publication))
         } else {
             None
         };
@@ -6953,6 +7206,19 @@ impl Connection {
             if autoincrement_tables.contains(&key) {
                 let seq = sqlite_sequence_cache.get(&key).copied().unwrap_or(0);
                 out.insert(table.root_page, seq);
+            }
+        }
+        out
+    }
+
+    fn rowid_alias_column_by_root_page(&self) -> HashMap<i32, usize> {
+        let schema = self.schema.borrow();
+        let rowid_alias_columns = self.rowid_alias_columns.borrow();
+        let mut out = HashMap::new();
+        for table in schema.iter() {
+            let key = table.name.to_ascii_lowercase();
+            if let Some(&alias_idx) = rowid_alias_columns.get(&key) {
+                out.insert(table.root_page, alias_idx);
             }
         }
         out
@@ -9356,19 +9622,13 @@ impl Connection {
 
         let cx = self.op_cx()?;
         self.refresh_memdb_if_stale(&cx)?;
-        // Capture MVCC snapshot sequence BEFORE opening pager txn.
-        // If a writer commits during begin, this can only make the snapshot
-        // older than the pager view (safe over-abort), never newer (unsafe).
+        // Bind the MVCC snapshot to the pager's published visibility plane
+        // before opening the pager txn. If a writer commits during begin, this
+        // can only make the snapshot older than the pager view (safe
+        // over-abort), never newer (unsafe).
         let concurrent_snapshot = if is_concurrent {
-            let snapshot_seq = CommitSeq::new(
-                self.next_commit_seq
-                    .load(AtomicOrdering::Acquire)
-                    .saturating_sub(1),
-            );
-            Some(Snapshot::new(
-                snapshot_seq,
-                SchemaEpoch::new((*self.schema_cookie.borrow()).into()),
-            ))
+            let publication = self.bind_pager_publication(&cx, "explicit_begin")?;
+            Some(self.concurrent_snapshot_from_publication(publication))
         } else {
             None
         };
@@ -10163,18 +10423,12 @@ impl Connection {
             } else {
                 TransactionMode::Deferred
             };
-            // Capture MVCC snapshot sequence BEFORE opening pager txn.
-            // This avoids assigning a snapshot newer than the actual read view.
+            // Bind the implicit transaction snapshot to the pager's published
+            // visibility plane before opening the pager txn.
             let concurrent_snapshot = if is_concurrent {
-                let snapshot_seq = CommitSeq::new(
-                    self.next_commit_seq
-                        .load(AtomicOrdering::Acquire)
-                        .saturating_sub(1),
-                );
-                Some(Snapshot::new(
-                    snapshot_seq,
-                    SchemaEpoch::new((*self.schema_cookie.borrow()).into()),
-                ))
+                let publication =
+                    self.bind_pager_publication(&cx, "savepoint_implicit_begin")?;
+                Some(self.concurrent_snapshot_from_publication(publication))
             } else {
                 None
             };
@@ -10800,7 +11054,13 @@ impl Connection {
             "fsqlite.parity_cert" | "parity_cert" => {
                 if let Some(ref val) = pragma.value {
                     let enabled = parse_pragma_bool(val)?;
-                    *self.reject_mem_fallback.borrow_mut() = enabled;
+                    {
+                        *self.reject_mem_fallback.borrow_mut() = enabled;
+                    }
+                    if !enabled && self.path != ":memory:" && !self.memdb_rows_loaded.get() {
+                        let cx = self.op_cx()?;
+                        self.reload_memdb_from_pager_with_mode(&cx, true)?;
+                    }
                     Ok(vec![Row {
                         values: vec![SqliteValue::Integer(i64::from(enabled))],
                     }])
@@ -15943,6 +16203,7 @@ impl Connection {
         let func_reg = self.func_registry.borrow().clone();
         let reject_mem = *self.reject_mem_fallback.borrow();
         let autoincrement_seq_by_root_page = self.autoincrement_sequence_by_root_page();
+        let rowid_alias_col_by_root_page = self.rowid_alias_column_by_root_page();
         let col_defaults_by_root_page = self.column_defaults_by_root_page();
 
         // Lend the active transaction to the VDBE engine so that storage
@@ -15976,6 +16237,7 @@ impl Connection {
             cookie,
             concurrent_ctx,
             autoincrement_seq_by_root_page,
+            rowid_alias_col_by_root_page,
             col_defaults_by_root_page,
             reject_mem,
             Some(Arc::clone(&self.version_store)),
@@ -16077,8 +16339,12 @@ impl Connection {
     /// # Errors
     ///
     /// Returns an error if the pager cannot be read or if B-tree traversal fails.
-    #[allow(clippy::too_many_lines)]
     fn reload_memdb_from_pager(&self, cx: &Cx) -> Result<()> {
+        self.reload_memdb_from_pager_with_mode(cx, self.should_eagerly_hydrate_memdb_rows())
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn reload_memdb_from_pager_with_mode(&self, cx: &Cx, hydrate_rows: bool) -> Result<()> {
         // Open a read transaction to see the committed state.
         let mut txn = self.pager.begin(cx, TransactionMode::ReadOnly)?;
 
@@ -16103,7 +16369,9 @@ impl Connection {
             *self.next_master_rowid.borrow_mut() = 1;
             *self.schema_cookie.borrow_mut() = 0;
             *self.change_counter.borrow_mut() = 0;
-            *self.memdb_visible_commit_seq.borrow_mut() = self.current_global_commit_seq();
+            *self.memdb_visible_commit_seq.borrow_mut() =
+                self.pager.published_snapshot().visible_commit_seq;
+            self.memdb_rows_loaded.set(hydrate_rows);
             return Ok(());
         }
 
@@ -16391,18 +16659,24 @@ impl Connection {
                 check_constraints: check_defs,
             });
 
-            // Read all rows from this table's B-tree.
-            let file_root = PageNumber::new(u32::try_from(root_page_num).unwrap_or(1))
-                .unwrap_or(PageNumber::ONE);
+            // For file-backed databases in parity-cert mode, execution routes
+            // through pager-backed cursors and does not need every table row
+            // duplicated into the compatibility MemDatabase. Preserve only the
+            // schema-shaped placeholders unless Mem fallback is explicitly
+            // enabled. `sqlite_sequence` is still scanned so AUTOINCREMENT state
+            // survives reopen/reload without fully hydrating user tables.
+            let should_scan_rows = hydrate_rows || name.eq_ignore_ascii_case("sqlite_sequence");
+            if should_scan_rows {
+                let file_root = PageNumber::new(u32::try_from(root_page_num).unwrap_or(1))
+                    .unwrap_or(PageNumber::ONE);
 
-            let mut cursor = fsqlite_btree::BtCursor::new(
-                TransactionPageIo::new(txn.as_mut()),
-                file_root,
-                usable_size,
-                true, // user tables remain table b-trees even during read-only reloads
-            );
+                let mut cursor = fsqlite_btree::BtCursor::new(
+                    TransactionPageIo::new(txn.as_mut()),
+                    file_root,
+                    usable_size,
+                    true, // user tables remain table b-trees even during read-only reloads
+                );
 
-            if let Some(mem_table) = new_db.tables.get_mut(&real_root_page) {
                 if cursor.first(cx)? {
                     loop {
                         let rowid = cursor.rowid(cx)?;
@@ -16414,12 +16688,6 @@ impl Connection {
                                 ),
                             }
                         })?;
-                        // If this table has an INTEGER PRIMARY KEY column, insert
-                        // the rowid at that position since it's not stored in the
-                        // record payload.
-                        if let Some(ipk_idx) = ipk_col_idx {
-                            values.insert(ipk_idx, SqliteValue::Integer(rowid));
-                        }
                         if name.eq_ignore_ascii_case("sqlite_sequence")
                             && values.len() >= 2
                             && let (SqliteValue::Text(tbl_name), SqliteValue::Integer(seq)) =
@@ -16427,7 +16695,17 @@ impl Connection {
                         {
                             new_sqlite_sequence_cache.insert(tbl_name.to_ascii_lowercase(), *seq);
                         }
-                        mem_table.insert_row(rowid, values);
+                        if hydrate_rows {
+                            // If this table has an INTEGER PRIMARY KEY column, insert
+                            // the rowid at that position since it's not stored in the
+                            // record payload.
+                            if let Some(ipk_idx) = ipk_col_idx {
+                                values.insert(ipk_idx, SqliteValue::Integer(rowid));
+                            }
+                            if let Some(mem_table) = new_db.tables.get_mut(&real_root_page) {
+                                mem_table.insert_row(rowid, values);
+                            }
+                        }
                         if !cursor.next(cx)? {
                             break;
                         }
@@ -16506,7 +16784,9 @@ impl Connection {
         }
         *self.schema_cookie.borrow_mut() = schema_cookie;
         *self.change_counter.borrow_mut() = change_counter;
-        *self.memdb_visible_commit_seq.borrow_mut() = self.current_global_commit_seq();
+        *self.memdb_visible_commit_seq.borrow_mut() =
+            self.pager.published_snapshot().visible_commit_seq;
+        self.memdb_rows_loaded.set(hydrate_rows);
 
         Ok(())
     }
@@ -21156,6 +21436,7 @@ fn execute_table_program_with_db(
     schema_cookie: u32,
     concurrent_ctx: Option<ConcurrentExecContext>,
     autoincrement_seq_by_root_page: HashMap<i32, i64>,
+    rowid_alias_col_by_root_page: HashMap<i32, usize>,
     column_defaults_by_root_page: HashMap<i32, Vec<Option<SqliteValue>>>,
     reject_mem_fallback: bool,
     version_store: Option<Arc<VersionStore>>,
@@ -21185,6 +21466,7 @@ fn execute_table_program_with_db(
     engine.set_autoincrement_sequence_by_root_page(
         autoincrement_seq_by_root_page.into_iter().collect(),
     );
+    engine.set_rowid_alias_column_by_root_page(rowid_alias_col_by_root_page.into_iter().collect());
     engine.set_column_defaults_by_root_page(column_defaults_by_root_page.into_iter().collect());
     // bd-2ttd8.1: enable parity-cert mode to reject MemPageStore fallback.
     engine.set_reject_mem_fallback(reject_mem_fallback);
@@ -31283,6 +31565,40 @@ mod tests {
     }
 
     #[test]
+    fn test_savepoint_implicit_begin_uses_pager_publication_visibility() {
+        let conn = Connection::open(":memory:").unwrap();
+        let published = conn.pager.published_snapshot();
+        conn.next_commit_seq
+            .store(53, std::sync::atomic::Ordering::Release);
+
+        conn.execute("SAVEPOINT sp1;").unwrap();
+        let session_id = conn
+            .concurrent_session_id
+            .borrow()
+            .expect("SAVEPOINT should create a concurrent session");
+        let snapshot_high = {
+            let registry = lock_unpoisoned(&conn.concurrent_registry);
+            registry
+                .get(session_id)
+                .expect("concurrent handle should exist")
+                .snapshot()
+                .high
+        };
+
+        assert_eq!(
+            snapshot_high, published.visible_commit_seq,
+            "implicit SAVEPOINT begin should bind to the pager publication plane"
+        );
+        assert_ne!(
+            snapshot_high,
+            CommitSeq::new(52),
+            "implicit SAVEPOINT begin must not derive its MVCC snapshot from next_commit_seq - 1"
+        );
+
+        conn.execute("ROLLBACK;").unwrap();
+    }
+
+    #[test]
     fn test_begin_concurrent_setup_failure_does_not_leak_transaction_state() {
         let conn = Connection::open(":memory:").unwrap();
         let snapshot = Snapshot::new(CommitSeq::ZERO, SchemaEpoch::new(0));
@@ -32053,6 +32369,82 @@ mod tests {
         assert!(conn.is_concurrent_transaction());
         conn.execute("COMMIT;").unwrap();
         assert!(!conn.is_concurrent_transaction());
+    }
+
+    #[test]
+    fn test_begin_uses_pager_publication_visibility_for_concurrent_snapshot() {
+        let conn = Connection::open(":memory:").unwrap();
+        let published = conn.pager.published_snapshot();
+        conn.next_commit_seq
+            .store(41, std::sync::atomic::Ordering::Release);
+
+        conn.execute("BEGIN;").unwrap();
+        let session_id = conn
+            .concurrent_session_id
+            .borrow()
+            .expect("BEGIN should create a concurrent session");
+        let snapshot_high = {
+            let registry = lock_unpoisoned(&conn.concurrent_registry);
+            registry
+                .get(session_id)
+                .expect("concurrent handle should exist")
+                .snapshot()
+                .high
+        };
+
+        assert_eq!(
+            snapshot_high, published.visible_commit_seq,
+            "BEGIN should bind to the pager publication plane, not the raw commit clock"
+        );
+        assert_ne!(
+            snapshot_high,
+            CommitSeq::new(40),
+            "BEGIN must not derive its MVCC snapshot from next_commit_seq - 1"
+        );
+
+        conn.execute("ROLLBACK;").unwrap();
+    }
+
+    #[test]
+    fn test_file_backed_begin_refreshes_publication_before_binding_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("begin_publication_refresh.db");
+        let path_str = path.to_str().unwrap();
+
+        let conn_a = Connection::open(path_str).unwrap();
+        conn_a
+            .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER);")
+            .unwrap();
+        let conn_b = Connection::open(path_str).unwrap();
+
+        conn_a.set_reject_mem_fallback(true);
+        conn_a.set_strict_mem_fallback_rejection(true);
+        conn_b.set_reject_mem_fallback(true);
+        conn_b.set_strict_mem_fallback_rejection(true);
+
+        conn_a.execute("INSERT INTO t VALUES (1, 1);").unwrap();
+        let latest_commit_seq = conn_a.pager.published_snapshot().visible_commit_seq;
+
+        conn_b.execute("BEGIN;").unwrap();
+        let session_id = conn_b
+            .concurrent_session_id
+            .borrow()
+            .expect("BEGIN should create a concurrent session");
+        let snapshot_high = {
+            let registry = lock_unpoisoned(&conn_b.concurrent_registry);
+            registry
+                .get(session_id)
+                .expect("concurrent handle should exist")
+                .snapshot()
+                .high
+        };
+
+        assert_eq!(
+            snapshot_high, latest_commit_seq,
+            "file-backed BEGIN must refresh the pager publication plane before binding its MVCC snapshot"
+        );
+
+        conn_b.execute("ROLLBACK;").unwrap();
     }
 
     #[test]
@@ -39736,6 +40128,7 @@ mod pager_routing_tests {
         // 1) global commit sequence never regresses
         // 2) committed rows remain visible
         // 3) rolled-back rows never become visible
+        // 4) file-backed reads/writes remain on the strict no-fallback path
         fn lcg_next(state: u64) -> u64 {
             state.wrapping_mul(6364136223846793005).wrapping_add(1)
         }
@@ -39746,11 +40139,17 @@ mod pager_routing_tests {
             let db_path = dir.path().join(format!("bd_1r0ha_1_seed_{seed}.db"));
             let db_path_str = db_path.to_str().unwrap();
             let conn_a = Connection::open(db_path_str).unwrap();
-            let conn_b = Connection::open(db_path_str).unwrap();
-
             conn_a
                 .execute("CREATE TABLE interleave_vis (id INTEGER PRIMARY KEY, v INTEGER);")
                 .unwrap();
+            // This matrix is about cross-connection visibility publication on an
+            // already-established schema. Keep schema creation out of the
+            // interleaving so failures reflect snapshot refresh, not DDL replay.
+            let conn_b = Connection::open(db_path_str).unwrap();
+            conn_a.set_reject_mem_fallback(true);
+            conn_a.set_strict_mem_fallback_rejection(true);
+            conn_b.set_reject_mem_fallback(true);
+            conn_b.set_strict_mem_fallback_rejection(true);
 
             let mut state = seed;
             let mut next_row_id = 1_i64;
@@ -45828,6 +46227,157 @@ mod pager_routing_tests {
         assert!(
             total_rows > 0,
             "snapshot at seq 2 should have rows, got {total_rows}"
+        );
+    }
+
+    #[test]
+    fn file_backed_connections_do_not_capture_memdb_time_travel_snapshots() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file_backed_time_travel.db");
+        let conn = Connection::open(path.to_str().unwrap()).unwrap();
+
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'hello');").unwrap();
+
+        let snaps = conn.time_travel_snapshots.borrow();
+        assert!(
+            snaps.is_empty(),
+            "file-backed connections should not retain MemDatabase time-travel snapshots"
+        );
+    }
+
+    #[test]
+    fn file_backed_connections_reopen_with_schema_only_memdb_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("schema_only_memdb_reload.db");
+        let path_str = path.to_str().unwrap();
+
+        {
+            let conn = Connection::open(path_str).unwrap();
+            conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);")
+                .unwrap();
+            conn.execute("INSERT INTO t VALUES (1, 'hello');").unwrap();
+            conn.execute("INSERT INTO t VALUES (2, 'world');").unwrap();
+        }
+
+        let conn = Connection::open(path_str).unwrap();
+        assert!(
+            !conn.memdb_rows_loaded.get(),
+            "file-backed parity-cert connections should not eagerly hydrate table rows"
+        );
+
+        let root_page = conn
+            .schema
+            .borrow()
+            .iter()
+            .find(|table| table.name.eq_ignore_ascii_case("t"))
+            .map(|table| table.root_page)
+            .expect("table t should exist in schema");
+        let memdb_row_count = conn
+            .db
+            .borrow()
+            .get_table(root_page)
+            .expect("table t should exist in MemDatabase")
+            .iter_rows()
+            .count();
+        assert_eq!(
+            memdb_row_count, 0,
+            "schema-only file-backed reload should avoid copying user rows into MemDatabase"
+        );
+
+        let rows = conn.query("SELECT val FROM t ORDER BY id;").unwrap();
+        assert_eq!(
+            rows.len(),
+            2,
+            "pager-backed reads should still see both rows"
+        );
+        assert_eq!(rows[0].values(), &[SqliteValue::Text("hello".to_owned())]);
+        assert_eq!(rows[1].values(), &[SqliteValue::Text("world".to_owned())]);
+    }
+
+    #[test]
+    fn disabling_parity_cert_hydrates_file_backed_memdb_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("parity_cert_memdb_hydrate.db");
+        let path_str = path.to_str().unwrap();
+
+        {
+            let conn = Connection::open(path_str).unwrap();
+            conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);")
+                .unwrap();
+            conn.execute("INSERT INTO t VALUES (1, 'hello');").unwrap();
+            conn.execute("INSERT INTO t VALUES (2, 'world');").unwrap();
+        }
+
+        let conn = Connection::open(path_str).unwrap();
+        assert!(!conn.memdb_rows_loaded.get());
+
+        conn.execute("PRAGMA fsqlite.parity_cert = OFF;").unwrap();
+
+        assert!(
+            conn.memdb_rows_loaded.get(),
+            "disabling parity-cert should restore eager MemDatabase hydration"
+        );
+
+        let root_page = conn
+            .schema
+            .borrow()
+            .iter()
+            .find(|table| table.name.eq_ignore_ascii_case("t"))
+            .map(|table| table.root_page)
+            .expect("table t should exist in schema");
+        let memdb_row_count = conn
+            .db
+            .borrow()
+            .get_table(root_page)
+            .expect("table t should exist in MemDatabase")
+            .iter_rows()
+            .count();
+        assert_eq!(
+            memdb_row_count, 2,
+            "PRAGMA parity_cert = OFF should reload file-backed rows into MemDatabase"
+        );
+    }
+
+    #[test]
+    fn schema_only_reload_preserves_autoincrement_sequence_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("schema_only_autoincrement.db");
+        let path_str = path.to_str().unwrap();
+
+        {
+            let conn = Connection::open(path_str).unwrap();
+            conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, val TEXT);")
+                .unwrap();
+            conn.execute("INSERT INTO t (val) VALUES ('first');")
+                .unwrap();
+            conn.execute("INSERT INTO t (val) VALUES ('second');")
+                .unwrap();
+            conn.execute("DELETE FROM t WHERE id = 2;").unwrap();
+        }
+
+        let conn = Connection::open(path_str).unwrap();
+        assert!(
+            !conn.memdb_rows_loaded.get(),
+            "reopen should keep file-backed MemDatabase in schema-only mode"
+        );
+
+        conn.execute("INSERT INTO t (val) VALUES ('third');")
+            .unwrap();
+
+        let rows = conn.query("SELECT id FROM t ORDER BY id;").unwrap();
+        let ids: Vec<i64> = rows
+            .iter()
+            .map(|row| match row.values()[0] {
+                SqliteValue::Integer(id) => id,
+                ref other => panic!("expected integer id, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            ids,
+            vec![1, 3],
+            "AUTOINCREMENT should continue from sqlite_sequence even when MemDatabase rows stay unloaded"
         );
     }
 

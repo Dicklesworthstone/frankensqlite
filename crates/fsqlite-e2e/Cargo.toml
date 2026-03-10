@@ -17,9 +17,12 @@ default = []
 
 [dependencies]
 fsqlite = { path = "../fsqlite", version = "0.1.1", default-features = false, features = ["json", "fts5", "rtree"] }
+fsqlite-btree = { workspace = true }
 fsqlite-core = { path = "../fsqlite-core", version = "0.1.1", default-features = false }
 fsqlite-error = { workspace = true }
 fsqlite-harness = { workspace = true }
+fsqlite-parser = { workspace = true }
+fsqlite-vdbe = { workspace = true }
 fsqlite-vfs = { path = "../fsqlite-vfs", version = "0.1.2", default-features = false }
 fsqlite-types = { workspace = true }
 fsqlite-wal = { workspace = true }

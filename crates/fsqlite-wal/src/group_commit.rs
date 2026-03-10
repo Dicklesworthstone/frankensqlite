@@ -44,9 +44,7 @@ use fsqlite_types::flags::SyncFlags;
 use fsqlite_vfs::VfsFile;
 use tracing::{debug, info, trace};
 
-use crate::checksum::{WAL_FRAME_HEADER_SIZE, write_wal_frame_checksum, write_wal_frame_salts};
-use crate::metrics::GLOBAL_WAL_METRICS;
-use crate::wal::WalFile;
+use crate::wal::{WalAppendFrameRef, WalFile};
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -566,25 +564,25 @@ pub fn write_consolidated_frames<F: VfsFile>(
     wal: &mut WalFile<F>,
     batches: &[TransactionFrameBatch],
 ) -> Result<usize> {
-    let page_size = wal.page_size();
     let frame_size = wal.frame_size();
-    let salts = wal.header().salts;
-    let big_endian = wal.big_endian_checksum();
-
-    // Count total frames across all batches.
     let total_frames: usize = batches.iter().map(TransactionFrameBatch::frame_count).sum();
     if total_frames == 0 {
         return Ok(0);
     }
 
-    // Pre-allocate a single contiguous buffer for all frames.
     let total_bytes = total_frames
         .checked_mul(frame_size)
         .ok_or_else(|| FrankenError::Internal("frame batch size overflow".to_owned()))?;
-
-    let mut consolidated_buf = vec![0u8; total_bytes];
-    let mut running_checksum = wal.running_checksum();
-    let mut frame_offset_in_buf = 0;
+    let mut frame_refs = Vec::with_capacity(total_frames);
+    for batch in batches {
+        for frame in &batch.frames {
+            frame_refs.push(WalAppendFrameRef {
+                page_number: frame.page_number,
+                page_data: &frame.page_data,
+                db_size_if_commit: frame.db_size_if_commit,
+            });
+        }
+    }
 
     let span = tracing::info_span!(
         target: "fsqlite_wal::group_commit",
@@ -595,69 +593,19 @@ pub fn write_consolidated_frames<F: VfsFile>(
     );
     let _guard = span.enter();
 
-    for batch in batches {
-        for frame_sub in &batch.frames {
-            if frame_sub.page_data.len() != page_size {
-                return Err(FrankenError::WalCorrupt {
-                    detail: format!(
-                        "page data size mismatch in consolidated write: \
-                         expected {page_size}, got {}",
-                        frame_sub.page_data.len()
-                    ),
-                });
-            }
-
-            let frame_slice =
-                &mut consolidated_buf[frame_offset_in_buf..frame_offset_in_buf + frame_size];
-
-            // Write page number and db_size into header.
-            frame_slice[..4].copy_from_slice(&frame_sub.page_number.to_be_bytes());
-            frame_slice[4..8].copy_from_slice(&frame_sub.db_size_if_commit.to_be_bytes());
-
-            // Write salts.
-            write_wal_frame_salts(&mut frame_slice[..WAL_FRAME_HEADER_SIZE], salts)?;
-
-            // Copy page data.
-            frame_slice[WAL_FRAME_HEADER_SIZE..].copy_from_slice(&frame_sub.page_data);
-
-            // Compute and write checksum (maintains chain).
-            running_checksum =
-                write_wal_frame_checksum(frame_slice, page_size, running_checksum, big_endian)?;
-
-            frame_offset_in_buf += frame_size;
-        }
-    }
-
-    // Single write for all frames.
-    let base_frame_count = wal.frame_count();
-    let file_offset = wal.frame_offset(base_frame_count);
-
-    wal.file_mut().write(cx, &consolidated_buf, file_offset)?;
-
-    // Update WAL state: advance frame count and running checksum.
-    // We use a helper that directly sets internal state since we've already
-    // computed the checksums ourselves.
-    //
+    wal.append_frames(cx, &frame_refs)?;
     wal.file_mut().sync(cx, SyncFlags::FULL)?;
-
-    let frames_written = total_frames;
-    wal.advance_state_after_write(frames_written, running_checksum)?;
-
-    // Record metrics.
     let bytes_written = u64::try_from(total_bytes).unwrap_or(u64::MAX);
-    for _ in 0..frames_written {
-        GLOBAL_WAL_METRICS.record_frame_write(u64::try_from(frame_size).unwrap_or(u64::MAX));
-    }
 
     info!(
         target: "fsqlite_wal::group_commit",
-        frames_written,
+        frames_written = total_frames,
         bytes_written,
         batches = batches.len(),
         "consolidated write + fsync complete"
     );
 
-    Ok(frames_written)
+    Ok(total_frames)
 }
 
 // ---------------------------------------------------------------------------

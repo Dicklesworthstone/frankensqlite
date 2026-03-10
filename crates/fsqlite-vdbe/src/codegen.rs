@@ -7441,6 +7441,24 @@ fn emit_where_filter(
     schema: &[TableSchema],
     skip_label: crate::Label,
 ) {
+    let scan = ScanCtx {
+        cursor,
+        table,
+        table_alias,
+        schema: Some(schema),
+        register_base: None,
+        secondary: None,
+    };
+    emit_where_filter_with_ctx(b, where_expr, &scan, skip_label);
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+fn emit_where_filter_with_ctx(
+    b: &mut ProgramBuilder,
+    where_expr: &Expr,
+    scan: &ScanCtx<'_>,
+    skip_label: crate::Label,
+) {
     match where_expr {
         Expr::BinaryOp {
             left,
@@ -7448,31 +7466,12 @@ fn emit_where_filter(
             right,
             ..
         } => {
-            // Try col = expr or expr = col (with alias-aware qualifier validation).
-            let scan = ScanCtx {
-                cursor,
-                table,
-                table_alias,
-                schema: Some(schema),
-                register_base: None,
-                secondary: None,
-            };
-            // Explicit COLLATE on either operand takes priority, then
-            // column-level collation from the schema (e.g. TEXT COLLATE NOCASE).
-            let collation_p4 = extract_collation(left)
-                .or_else(|| extract_collation(right))
-                .or_else(|| column_collation(left, table, table_alias))
-                .or_else(|| column_collation(right, table, table_alias))
-                .map_or(P4::None, |coll| P4::Collation(coll.to_owned()));
-
-            if let Some(resolved) = resolve_column_ref(left, table, table_alias) {
+            let comparison = ResolvedComparisonInfo::new(left, right, scan);
+            if let Some(resolved) = comparison.left_resolved.as_ref() {
                 let col_reg = b.alloc_temp();
                 let val_reg = b.alloc_temp();
-                // Use comparison_affinity_p5 to consider BOTH operands' affinities.
-                // This is critical for col_text = col_int where we need NUMERIC coercion.
-                let cmp_p5 = 0x80 | comparison_affinity_p5(left, right, Some(&scan));
-                emit_resolved_column(b, &resolved, cursor, col_reg, &scan);
-                emit_expr(b, right, val_reg, Some(&scan));
+                emit_resolved_column(b, resolved, scan.cursor, col_reg, scan);
+                emit_expr(b, right, val_reg, Some(scan));
                 // SQL semantics: `col = NULL` is UNKNOWN (false in WHERE). If the
                 // value expression evaluates to NULL, skip the row unconditionally.
                 b.emit_jump_to_label(Opcode::IsNull, val_reg, 0, skip_label, P4::None, 0);
@@ -7482,17 +7481,16 @@ fn emit_where_filter(
                     val_reg,
                     col_reg,
                     skip_label,
-                    collation_p4,
-                    cmp_p5,
+                    comparison.collation_p4.clone(),
+                    comparison.cmp_p5,
                 );
                 b.free_temp(val_reg);
                 b.free_temp(col_reg);
-            } else if let Some(resolved) = resolve_column_ref(right, table, table_alias) {
+            } else if let Some(resolved) = comparison.right_resolved.as_ref() {
                 let col_reg = b.alloc_temp();
                 let val_reg = b.alloc_temp();
-                let cmp_p5 = 0x80 | comparison_affinity_p5(left, right, Some(&scan));
-                emit_resolved_column(b, &resolved, cursor, col_reg, &scan);
-                emit_expr(b, left, val_reg, Some(&scan));
+                emit_resolved_column(b, resolved, scan.cursor, col_reg, scan);
+                emit_expr(b, left, val_reg, Some(scan));
                 // SQL semantics: `NULL = col` is UNKNOWN (false in WHERE).
                 b.emit_jump_to_label(Opcode::IsNull, val_reg, 0, skip_label, P4::None, 0);
                 b.emit_jump_to_label(
@@ -7500,8 +7498,8 @@ fn emit_where_filter(
                     val_reg,
                     col_reg,
                     skip_label,
-                    collation_p4,
-                    cmp_p5,
+                    comparison.collation_p4.clone(),
+                    comparison.cmp_p5,
                 );
                 b.free_temp(val_reg);
                 b.free_temp(col_reg);
@@ -7509,7 +7507,7 @@ fn emit_where_filter(
                 // Neither side is a column ref (e.g. WHERE 1 = 0, WHERE length(name) = 5).
                 // Fall through to generic boolean evaluation.
                 let cond_reg = b.alloc_temp();
-                emit_expr(b, where_expr, cond_reg, Some(&scan));
+                emit_expr(b, where_expr, cond_reg, Some(scan));
                 b.emit_jump_to_label(Opcode::IfNot, cond_reg, 1, skip_label, P4::None, 0);
                 b.free_temp(cond_reg);
             }
@@ -7528,19 +7526,7 @@ fn emit_where_filter(
             right,
             ..
         } => {
-            let scan = ScanCtx {
-                cursor,
-                table,
-                table_alias,
-                schema: Some(schema),
-                register_base: None,
-                secondary: None,
-            };
-            let collation_p4 = extract_collation(left)
-                .or_else(|| extract_collation(right))
-                .or_else(|| column_collation(left, table, table_alias))
-                .or_else(|| column_collation(right, table, table_alias))
-                .map_or(P4::None, |coll| P4::Collation(coll.to_owned()));
+            let comparison = ResolvedComparisonInfo::new(left, right, scan);
 
             // Determine the skip opcode — the inverse of the comparison.
             // If `col > val` is the condition, skip when `col <= val`, i.e. Le.
@@ -7553,13 +7539,11 @@ fn emit_where_filter(
                 _ => unreachable!(),
             };
 
-            if let Some(resolved) = resolve_column_ref(left, table, table_alias) {
+            if let Some(resolved) = comparison.left_resolved.as_ref() {
                 let col_reg = b.alloc_temp();
                 let val_reg = b.alloc_temp();
-                // Use comparison_affinity_p5 to consider both operands' affinities.
-                let cmp_p5 = 0x80 | comparison_affinity_p5(left, right, Some(&scan));
-                emit_resolved_column(b, &resolved, cursor, col_reg, &scan);
-                emit_expr(b, right, val_reg, Some(&scan));
+                emit_resolved_column(b, resolved, scan.cursor, col_reg, scan);
+                emit_expr(b, right, val_reg, Some(scan));
                 b.emit_jump_to_label(Opcode::IsNull, val_reg, 0, skip_label, P4::None, 0);
                 b.emit_jump_to_label(Opcode::IsNull, col_reg, 0, skip_label, P4::None, 0);
                 b.emit_jump_to_label(
@@ -7567,12 +7551,12 @@ fn emit_where_filter(
                     val_reg,
                     col_reg,
                     skip_label,
-                    collation_p4,
-                    cmp_p5,
+                    comparison.collation_p4.clone(),
+                    comparison.cmp_p5,
                 );
                 b.free_temp(val_reg);
                 b.free_temp(col_reg);
-            } else if let Some(resolved) = resolve_column_ref(right, table, table_alias) {
+            } else if let Some(resolved) = comparison.right_resolved.as_ref() {
                 // col is on the right: `val op col` → swap operand order.
                 // `val < col` skip when `val >= col`, i.e. Ge(val, col).
                 // The skip opcode is the inverse of `val op col`.
@@ -7586,9 +7570,8 @@ fn emit_where_filter(
                 };
                 let col_reg = b.alloc_temp();
                 let val_reg = b.alloc_temp();
-                let cmp_p5 = 0x80 | comparison_affinity_p5(left, right, Some(&scan));
-                emit_resolved_column(b, &resolved, cursor, col_reg, &scan);
-                emit_expr(b, left, val_reg, Some(&scan));
+                emit_resolved_column(b, resolved, scan.cursor, col_reg, scan);
+                emit_expr(b, left, val_reg, Some(scan));
                 b.emit_jump_to_label(Opcode::IsNull, val_reg, 0, skip_label, P4::None, 0);
                 b.emit_jump_to_label(Opcode::IsNull, col_reg, 0, skip_label, P4::None, 0);
                 // VDBE comparison: opcode P1=rhs P2=lhs. For `val < col` skip
@@ -7598,14 +7581,14 @@ fn emit_where_filter(
                     col_reg,
                     val_reg,
                     skip_label,
-                    collation_p4,
-                    cmp_p5,
+                    comparison.collation_p4.clone(),
+                    comparison.cmp_p5,
                 );
                 b.free_temp(val_reg);
                 b.free_temp(col_reg);
             } else {
                 let cond_reg = b.alloc_temp();
-                emit_expr(b, where_expr, cond_reg, Some(&scan));
+                emit_expr(b, where_expr, cond_reg, Some(scan));
                 b.emit_jump_to_label(Opcode::IfNot, cond_reg, 1, skip_label, P4::None, 0);
                 b.free_temp(cond_reg);
             }
@@ -7617,8 +7600,8 @@ fn emit_where_filter(
             ..
         } => {
             // AND: both conditions must pass.
-            emit_where_filter(b, left, cursor, table, table_alias, schema, skip_label);
-            emit_where_filter(b, right, cursor, table, table_alias, schema, skip_label);
+            emit_where_filter_with_ctx(b, left, scan, skip_label);
+            emit_where_filter_with_ctx(b, right, scan, skip_label);
         }
         Expr::BinaryOp {
             left,
@@ -7631,30 +7614,100 @@ fn emit_where_filter(
             // If left fails → try right; if right also fails → skip row.
             let left_skip = b.emit_label();
             let pass_label = b.emit_label();
-            emit_where_filter(b, left, cursor, table, table_alias, schema, left_skip);
+            emit_where_filter_with_ctx(b, left, scan, left_skip);
             // Left passed — jump past right-side evaluation.
             b.emit_jump_to_label(Opcode::Goto, 0, 0, pass_label, P4::None, 0);
             b.resolve_label(left_skip);
             // Left failed — try right.
-            emit_where_filter(b, right, cursor, table, table_alias, schema, skip_label);
+            emit_where_filter_with_ctx(b, right, scan, skip_label);
             b.resolve_label(pass_label);
         }
         _ => {
             // Generic WHERE: evaluate expression with cursor context and test truthiness.
-            let scan = ScanCtx {
-                cursor,
-                table,
-                table_alias,
-                schema: Some(schema),
-                register_base: None,
-                secondary: None,
-            };
             let cond_reg = b.alloc_temp();
-            emit_expr(b, where_expr, cond_reg, Some(&scan));
+            emit_expr(b, where_expr, cond_reg, Some(scan));
             b.emit_jump_to_label(Opcode::IfNot, cond_reg, 1, skip_label, P4::None, 0);
             b.free_temp(cond_reg);
         }
     }
+}
+
+struct ResolvedComparisonInfo {
+    left_resolved: Option<SortKeySource>,
+    right_resolved: Option<SortKeySource>,
+    collation_p4: P4,
+    cmp_p5: u16,
+}
+
+impl ResolvedComparisonInfo {
+    fn new(left: &Expr, right: &Expr, scan: &ScanCtx<'_>) -> Self {
+        let left_resolved = resolve_column_ref(left, scan.table, scan.table_alias);
+        let right_resolved = resolve_column_ref(right, scan.table, scan.table_alias);
+        let collation_p4 = extract_collation(left)
+            .or_else(|| extract_collation(right))
+            .or_else(|| resolved_primary_collation(left_resolved.as_ref(), scan.table))
+            .or_else(|| resolved_primary_collation(right_resolved.as_ref(), scan.table))
+            .map_or(P4::None, |coll| P4::Collation(coll.to_owned()));
+        let cmp_p5 = 0x80
+            | comparison_affinity_p5_resolved(
+                left,
+                left_resolved.as_ref(),
+                right,
+                right_resolved.as_ref(),
+                scan,
+            );
+        Self {
+            left_resolved,
+            right_resolved,
+            collation_p4,
+            cmp_p5,
+        }
+    }
+}
+
+fn resolved_primary_collation<'a>(
+    resolved: Option<&SortKeySource>,
+    table: &'a TableSchema,
+) -> Option<&'a str> {
+    match resolved {
+        Some(SortKeySource::Column(idx)) => table.columns.get(*idx)?.collation.as_deref(),
+        Some(SortKeySource::Rowid) | Some(SortKeySource::Expression(_)) | None => None,
+    }
+}
+
+fn resolved_expr_affinity(expr: &Expr, resolved: Option<&SortKeySource>, scan: &ScanCtx<'_>) -> u8 {
+    match resolved {
+        Some(SortKeySource::Column(idx)) => scan.table.columns[*idx]
+            .type_name
+            .as_deref()
+            .map_or(b'A', column_type_to_affinity),
+        Some(SortKeySource::Rowid) => b'D',
+        Some(SortKeySource::Expression(_)) | None => expr_affinity(expr, Some(scan)),
+    }
+}
+
+fn comparison_affinity_p5_resolved(
+    left: &Expr,
+    left_resolved: Option<&SortKeySource>,
+    right: &Expr,
+    right_resolved: Option<&SortKeySource>,
+    scan: &ScanCtx<'_>,
+) -> u16 {
+    let l_aff = resolved_expr_affinity(left, left_resolved, scan);
+    let r_aff = resolved_expr_affinity(right, right_resolved, scan);
+
+    let is_numeric = |a: u8| matches!(a, b'C' | b'D' | b'E');
+
+    if is_numeric(l_aff) && matches!(r_aff, b'A' | b'B') {
+        return u16::from(b'C');
+    }
+    if is_numeric(r_aff) && matches!(l_aff, b'A' | b'B') {
+        return u16::from(b'C');
+    }
+    if (l_aff == b'B' && r_aff == b'A') || (l_aff == b'A' && r_aff == b'B') {
+        return u16::from(b'B');
+    }
+    0
 }
 
 /// Check whether a column name is a rowid alias (`rowid`, `_rowid_`, or `oid`).
@@ -10468,6 +10521,33 @@ mod tests {
                 columns: vec!["b".to_owned()],
                 is_unique: false,
             }],
+            strict: false,
+            foreign_keys: Vec::new(),
+            check_constraints: Vec::new(),
+        }]
+    }
+
+    fn test_schema_with_nocase_text_column() -> Vec<TableSchema> {
+        vec![TableSchema {
+            name: "t".to_owned(),
+            root_page: 2,
+            columns: vec![
+                ColumnInfo::basic("a", 'd', false),
+                ColumnInfo {
+                    name: "name".to_owned(),
+                    affinity: 'B',
+                    is_ipk: false,
+                    type_name: Some("TEXT".to_owned()),
+                    notnull: false,
+                    unique: false,
+                    default_value: None,
+                    strict_type: None,
+                    generated_expr: None,
+                    generated_stored: None,
+                    collation: Some("NOCASE".to_owned()),
+                },
+            ],
+            indexes: vec![],
             strict: false,
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
@@ -13955,6 +14035,47 @@ mod tests {
                 Opcode::Ne, // filter non-matching rows
             ]
         ));
+    }
+
+    #[test]
+    fn test_codegen_update_where_uses_resolved_collation_and_affinity() {
+        let stmt = UpdateStatement {
+            with: None,
+            or_conflict: None,
+            table: QualifiedTableRef {
+                name: QualifiedName::bare("t"),
+                alias: None,
+                index_hint: None,
+                time_travel: None,
+            },
+            assignments: vec![Assignment {
+                target: AssignmentTarget::Column("a".to_owned()),
+                value: placeholder(1),
+            }],
+            from: None,
+            where_clause: Some(Expr::BinaryOp {
+                left: Box::new(Expr::Column(ColumnRef::bare("name"), Span::ZERO)),
+                op: AstBinaryOp::Eq,
+                right: Box::new(placeholder(2)),
+                span: Span::ZERO,
+            }),
+            returning: vec![],
+            order_by: vec![],
+            limit: None,
+        };
+        let schema = test_schema_with_nocase_text_column();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_update(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+
+        let filter_cmp = prog
+            .ops()
+            .iter()
+            .find(|op| op.opcode == Opcode::Ne)
+            .expect("scan-based WHERE should emit Ne");
+        assert_eq!(filter_cmp.p4, P4::Collation("NOCASE".to_owned()));
+        assert_eq!(filter_cmp.p5, 0x80 | u16::from(b'B'));
     }
 
     #[test]
