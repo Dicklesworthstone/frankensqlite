@@ -11,7 +11,7 @@ use fsqlite_types::sync_primitives::{Mutex, RwLock};
 use smallvec::SmallVec;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::cache_aligned::{
@@ -1265,8 +1265,114 @@ impl Default for CommitLog {
 // CommitIndex
 // ---------------------------------------------------------------------------
 
+type CommitMap = HashMap<PageNumber, CommitSeq, PageNumberBuildHasher>;
+
+/// Left-right publication shard for commit-sequence metadata.
+///
+/// Readers pin the currently active side and read without contending with the
+/// writer's map mutation. Writers serialize locally, update the inactive copy,
+/// swap publication, wait for old-side readers to drain, then bring the old
+/// side up to date.
+///
+/// Proof obligations attached to the current `CommitIndex` prototype:
+/// - `CI-LR-1 monotone-publication`: once a newer commit sequence becomes
+///   visible for a page, subsequent reads must never regress to an older one.
+/// - `CI-LR-2 publish-before-drain`: after the active side flips, new readers
+///   must observe the new value while old-side readers still retain the
+///   previous committed copy.
+/// - `CI-LR-3 post-update-convergence`: once `update()` returns, both copies
+///   must contain the same commit sequence for the updated page.
+///
+/// This prototype duplicates the map rather than reclaiming heap nodes, so the
+/// reclamation obligation is narrowed to a grace-period-before-overwrite check
+/// (`CI-LR-2`) instead of pointer-lifetime safety. If a future design swaps to
+/// pointer-based RCU/QSBR publication, that stronger reclamation proof becomes
+/// a separate required obligation.
+struct LeftRightCommitIndexShard {
+    left: RwLock<CommitMap>,
+    right: RwLock<CommitMap>,
+    active: AtomicU64,
+    left_readers: AtomicU64,
+    right_readers: AtomicU64,
+    writer_lock: Mutex<()>,
+}
+
+impl LeftRightCommitIndexShard {
+    fn new() -> Self {
+        Self {
+            left: RwLock::new(HashMap::with_hasher(PageNumberBuildHasher::default())),
+            right: RwLock::new(HashMap::with_hasher(PageNumberBuildHasher::default())),
+            active: AtomicU64::new(0),
+            left_readers: AtomicU64::new(0),
+            right_readers: AtomicU64::new(0),
+            writer_lock: Mutex::new(()),
+        }
+    }
+
+    /// Read the latest published commit sequence for a page.
+    ///
+    /// Visibility contract:
+    /// - a reader may observe the previous committed value if a swap races with
+    ///   side selection;
+    /// - once `update()` returns, both copies contain the new value so all
+    ///   future reads observe the new commit sequence.
+    fn latest(&self, page: PageNumber) -> Option<CommitSeq> {
+        loop {
+            let side = self.active.load(Ordering::Acquire);
+            let (readers, data) = if side == 0 {
+                (&self.left_readers, &self.left)
+            } else {
+                (&self.right_readers, &self.right)
+            };
+            readers.fetch_add(1, Ordering::AcqRel);
+            if self.active.load(Ordering::Acquire) == side {
+                let value = data.read().get(&page).copied();
+                readers.fetch_sub(1, Ordering::Release);
+                return value;
+            }
+            readers.fetch_sub(1, Ordering::Release);
+        }
+    }
+
+    fn update(&self, page: PageNumber, seq: CommitSeq) {
+        let _guard = self.writer_lock.lock();
+        let active = self.active.load(Ordering::Acquire);
+
+        if active == 0 {
+            self.right.write().insert(page, seq);
+        } else {
+            self.left.write().insert(page, seq);
+        }
+
+        self.active.store(1 - active, Ordering::Release);
+
+        let old_readers = if active == 0 {
+            &self.left_readers
+        } else {
+            &self.right_readers
+        };
+        while old_readers.load(Ordering::Acquire) > 0 {
+            std::hint::spin_loop();
+        }
+
+        if active == 0 {
+            self.left.write().insert(page, seq);
+        } else {
+            self.right.write().insert(page, seq);
+        }
+    }
+
+    fn len(&self) -> usize {
+        if self.active.load(Ordering::Acquire) == 0 {
+            self.left.read().len()
+        } else {
+            self.right.read().len()
+        }
+    }
+}
+
 /// A single cache-line-aligned commit index shard.
-type CommitShard = CacheAligned<RwLock<HashMap<PageNumber, CommitSeq, PageNumberBuildHasher>>>;
+type CommitShard = CacheAligned<LeftRightCommitIndexShard>;
 
 /// Index mapping each page to its latest committed `CommitSeq`.
 ///
@@ -1281,9 +1387,7 @@ impl CommitIndex {
     pub fn new() -> Self {
         Self {
             shards: Box::new(std::array::from_fn(|_| {
-                CacheAligned::new(RwLock::new(HashMap::with_hasher(
-                    PageNumberBuildHasher::default(),
-                )))
+                CacheAligned::new(LeftRightCommitIndexShard::new())
             })),
         }
     }
@@ -1291,16 +1395,14 @@ impl CommitIndex {
     /// Record that `page` was last committed at `seq`.
     pub fn update(&self, page: PageNumber, seq: CommitSeq) {
         let shard = &self.shards[self.shard_index(page)];
-        let mut map = shard.write();
-        map.insert(page, seq);
+        shard.update(page, seq);
     }
 
     /// Get the latest `CommitSeq` for `page`.
     #[must_use]
     pub fn latest(&self, page: PageNumber) -> Option<CommitSeq> {
         let shard = &self.shards[self.shard_index(page)];
-        let map = shard.read();
-        map.get(&page).copied()
+        shard.latest(page)
     }
 
     #[allow(clippy::unused_self)]
@@ -1317,7 +1419,7 @@ impl Default for CommitIndex {
 
 impl std::fmt::Debug for CommitIndex {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let total: usize = self.shards.iter().map(|s| s.read().len()).sum();
+        let total: usize = self.shards.iter().map(|s| s.len()).sum();
         f.debug_struct("CommitIndex")
             .field("page_count", &total)
             .finish()
@@ -2429,6 +2531,128 @@ mod tests {
 
         index.update(page, CommitSeq::new(10));
         assert_eq!(index.latest(page), Some(CommitSeq::new(10)));
+    }
+
+    #[test]
+    fn test_commit_index_latest_monotone_under_concurrent_updates() {
+        use std::sync::Barrier;
+        use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+        use std::thread;
+
+        const FINAL_SEQ: u64 = 256;
+
+        let index = std::sync::Arc::new(CommitIndex::new());
+        let page = PageNumber::new(42).unwrap();
+        index.update(page, CommitSeq::new(1));
+
+        let start = std::sync::Arc::new(Barrier::new(5));
+        let done = std::sync::Arc::new(AtomicBool::new(false));
+
+        let writer_index = std::sync::Arc::clone(&index);
+        let writer_start = std::sync::Arc::clone(&start);
+        let writer_done = std::sync::Arc::clone(&done);
+        let writer = thread::spawn(move || {
+            writer_start.wait();
+            for seq in 2..=FINAL_SEQ {
+                writer_index.update(page, CommitSeq::new(seq));
+            }
+            writer_done.store(true, AtomicOrdering::Release);
+        });
+
+        let mut readers = Vec::new();
+        for _ in 0..4 {
+            let reader_index = std::sync::Arc::clone(&index);
+            let reader_start = std::sync::Arc::clone(&start);
+            let reader_done = std::sync::Arc::clone(&done);
+            readers.push(thread::spawn(move || {
+                reader_start.wait();
+                let mut last_seen = 0_u64;
+                loop {
+                    if let Some(seq) = reader_index.latest(page) {
+                        let current = seq.get();
+                        assert!(
+                            current >= last_seen,
+                            "commit index publication must be monotone: current={current} last_seen={last_seen}"
+                        );
+                        last_seen = current;
+                        if reader_done.load(AtomicOrdering::Acquire) && current == FINAL_SEQ {
+                            return last_seen;
+                        }
+                    }
+                    thread::yield_now();
+                }
+            }));
+        }
+
+        writer.join().unwrap();
+        for reader in readers {
+            assert_eq!(reader.join().unwrap(), FINAL_SEQ);
+        }
+        assert_eq!(index.latest(page), Some(CommitSeq::new(FINAL_SEQ)));
+    }
+
+    #[test]
+    fn test_commit_index_left_right_publish_drains_old_readers_before_mirror() {
+        use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+        use std::thread;
+
+        let shard = std::sync::Arc::new(LeftRightCommitIndexShard::new());
+        let page = PageNumber::new(7).unwrap();
+        let initial = CommitSeq::new(11);
+        let published = CommitSeq::new(12);
+
+        shard.update(page, initial);
+        assert_eq!(shard.active.load(Ordering::Acquire), 1);
+        assert_eq!(shard.latest(page), Some(initial));
+
+        // Emulate a reader pinned on the currently active side so the writer
+        // must stop after publication and before mirroring the old copy.
+        shard.right_readers.fetch_add(1, Ordering::AcqRel);
+
+        let writer_done = std::sync::Arc::new(AtomicBool::new(false));
+        let writer_shard = std::sync::Arc::clone(&shard);
+        let writer_done_flag = std::sync::Arc::clone(&writer_done);
+        let writer = thread::spawn(move || {
+            writer_shard.update(page, published);
+            writer_done_flag.store(true, AtomicOrdering::Release);
+        });
+
+        let mut spins = 0_u32;
+        while shard.active.load(Ordering::Acquire) != 0 {
+            std::hint::spin_loop();
+            spins = spins.saturating_add(1);
+            assert!(
+                spins < 1_000_000,
+                "writer did not publish the new active side while old readers were pinned"
+            );
+        }
+
+        assert_eq!(
+            shard.latest(page),
+            Some(published),
+            "new readers must observe the new sequence immediately after publication"
+        );
+        assert_eq!(
+            shard.left.read().get(&page).copied(),
+            Some(published),
+            "inactive side must receive the new value before publication"
+        );
+        assert_eq!(
+            shard.right.read().get(&page).copied(),
+            Some(initial),
+            "old side must retain the prior value until old readers drain"
+        );
+        assert!(
+            !writer_done.load(AtomicOrdering::Acquire),
+            "writer must wait for old-side readers before mirroring the old copy"
+        );
+
+        shard.right_readers.fetch_sub(1, Ordering::AcqRel);
+        writer.join().unwrap();
+
+        assert!(writer_done.load(AtomicOrdering::Acquire));
+        assert_eq!(shard.left.read().get(&page).copied(), Some(published));
+        assert_eq!(shard.right.read().get(&page).copied(), Some(published));
     }
 
     // -- All types Debug+Clone --
