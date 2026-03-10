@@ -5,7 +5,7 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 use fsqlite_btree::{BtCursor, BtreeCursorOps, MemPageStore, PageReader, PageWriter};
 use fsqlite_types::record::serialize_record;
 use fsqlite_types::value::SqliteValue;
-use fsqlite_types::{Cx, PageNumber};
+use fsqlite_types::{Cx, PageNumber, WitnessKey};
 use fsqlite_vdbe::vectorized::{ColumnSpec, ColumnVectorType, DEFAULT_BATCH_ROW_CAPACITY};
 use fsqlite_vdbe::vectorized_scan::VectorizedTableScan;
 
@@ -49,6 +49,8 @@ impl PageWriter for SharedMemPageIo {
     fn free_page(&mut self, cx: &Cx, page_no: PageNumber) -> fsqlite_error::Result<()> {
         self.store.borrow_mut().free_page(cx, page_no)
     }
+
+    fn record_write_witness(&mut self, _cx: &Cx, _key: WitnessKey) {}
 }
 
 #[derive(Clone, Debug)]

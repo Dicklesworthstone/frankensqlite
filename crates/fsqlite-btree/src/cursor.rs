@@ -2474,6 +2474,8 @@ mod tests {
         fn free_page(&mut self, cx: &Cx, page_no: PageNumber) -> Result<()> {
             self.inner.free_page(cx, page_no)
         }
+
+        fn record_write_witness(&mut self, _cx: &Cx, _key: WitnessKey) {}
     }
 
     #[derive(Debug)]
@@ -2515,6 +2517,8 @@ mod tests {
         fn free_page(&mut self, cx: &Cx, page_no: PageNumber) -> Result<()> {
             self.inner.borrow_mut().free_page(cx, page_no)
         }
+
+        fn record_write_witness(&mut self, _cx: &Cx, _key: WitnessKey) {}
     }
 
     const USABLE: u32 = 4096;
@@ -2972,9 +2976,10 @@ mod tests {
     #[test]
     fn test_cursor_index_next_visits_interior_separator_cells() {
         let mut store = MemPageStore::new(USABLE);
-        store
-            .pages
-            .insert(2, build_interior_index(&[(pn(3), b"b"), (pn(4), b"d")], pn(5)));
+        store.pages.insert(
+            2,
+            build_interior_index(&[(pn(3), b"b"), (pn(4), b"d")], pn(5)),
+        );
         store
             .pages
             .insert(3, build_leaf_table(&[(1, b"a"), (2, b"b")]));
@@ -3007,9 +3012,10 @@ mod tests {
     #[test]
     fn test_cursor_index_prev_visits_interior_separator_cells() {
         let mut store = MemPageStore::new(USABLE);
-        store
-            .pages
-            .insert(2, build_interior_index(&[(pn(3), b"b"), (pn(4), b"d")], pn(5)));
+        store.pages.insert(
+            2,
+            build_interior_index(&[(pn(3), b"b"), (pn(4), b"d")], pn(5)),
+        );
         store
             .pages
             .insert(3, build_leaf_table(&[(1, b"a"), (5, b"b")]));
@@ -3805,10 +3811,7 @@ mod tests {
         let result = cursor.table_move_to(&cx, 5).unwrap();
         assert!(result.is_found());
         assert_eq!(cursor.witness_keys().len(), 1);
-        assert!(matches!(
-            cursor.witness_keys()[0],
-            WitnessKey::Cell { .. }
-        ));
+        assert!(matches!(cursor.witness_keys()[0], WitnessKey::Cell { .. }));
     }
 
     #[test]
@@ -3851,10 +3854,7 @@ mod tests {
         let result = cursor.table_move_to(&cx, 7).unwrap();
         assert!(!result.is_found());
         assert_eq!(cursor.witness_keys().len(), 1);
-        assert!(matches!(
-            cursor.witness_keys()[0],
-            WitnessKey::Cell { .. }
-        ));
+        assert!(matches!(cursor.witness_keys()[0], WitnessKey::Cell { .. }));
     }
 
     #[test]

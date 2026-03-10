@@ -203,18 +203,10 @@ pub fn witness_keys_overlap(a: &WitnessKey, b: &WitnessKey) -> bool {
         // or if it matches the specific leaf page where the cell was read/written.
         (
             WitnessKey::Page(p),
-            WitnessKey::Cell {
-                btree_root,
-                ..
-            }
-            | WitnessKey::KeyRange { btree_root, .. },
+            WitnessKey::Cell { btree_root, .. } | WitnessKey::KeyRange { btree_root, .. },
         )
         | (
-            WitnessKey::Cell {
-                btree_root,
-                ..
-            }
-            | WitnessKey::KeyRange { btree_root, .. },
+            WitnessKey::Cell { btree_root, .. } | WitnessKey::KeyRange { btree_root, .. },
             WitnessKey::Page(p),
         ) => {
             p == btree_root
@@ -244,11 +236,7 @@ pub fn witness_keys_overlap(a: &WitnessKey, b: &WitnessKey) -> bool {
                 start: sb,
                 len: lb,
             },
-        ) => {
-            pa == pb
-                && *sa < sb.saturating_add(*lb)
-                && *sb < sa.saturating_add(*la)
-        },
+        ) => pa == pb && *sa < sb.saturating_add(*lb) && *sb < sa.saturating_add(*la),
         // Conservative fallback: anything involving KeyRange/Custom overlaps.
         _ => true,
     }

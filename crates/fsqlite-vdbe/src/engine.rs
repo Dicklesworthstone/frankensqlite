@@ -107,10 +107,8 @@ impl MemTable {
                         (Some(a), Some(b)) => a == b,
                     }
                 });
-                if all_match {
-                    if !conflicts.contains(&row.rowid) {
-                        conflicts.push(row.rowid);
-                    }
+                if all_match && !conflicts.contains(&row.rowid) {
+                    conflicts.push(row.rowid);
                 }
             }
         }
@@ -1285,6 +1283,7 @@ struct StorageCursor {
     /// Scratch buffer for parsing current index keys.
     cur_vals_buf: Vec<SqliteValue>,
     /// Cache the cursor's physical position to avoid redundant payload reads.
+    #[allow(dead_code)]
     last_position_stamp: Option<(u32, u16)>,
 }
 
@@ -5576,13 +5575,21 @@ impl VdbeEngine {
 
                         sc.target_vals_buf.clear();
                         if let SqliteValue::Blob(bytes) = &probe_val {
-                            fsqlite_types::record::parse_record_into(bytes, &mut sc.target_vals_buf);
+                            fsqlite_types::record::parse_record_into(
+                                bytes,
+                                &mut sc.target_vals_buf,
+                            );
                         }
 
                         sc.payload_buf.clear();
                         sc.cursor.payload_into(&sc.cx, &mut sc.payload_buf)?;
                         sc.cur_vals_buf.clear();
-                        if fsqlite_types::record::parse_record_into(&sc.payload_buf, &mut sc.cur_vals_buf).is_none() {
+                        if fsqlite_types::record::parse_record_into(
+                            &sc.payload_buf,
+                            &mut sc.cur_vals_buf,
+                        )
+                        .is_none()
+                        {
                             return Err(FrankenError::internal(
                                 "IdxCmp: malformed index record at cursor position",
                             ));
@@ -5627,7 +5634,8 @@ impl VdbeEngine {
                             } else {
                                 probe_fields.len()
                             };
-                            let cmp = compare_sorter_keys(&row.values, &probe_fields, n_compare, &[]);
+                            let cmp =
+                                compare_sorter_keys(&row.values, &probe_fields, n_compare, &[]);
                             let condition_met = match op.opcode {
                                 Opcode::IdxLE => cmp != Ordering::Greater,
                                 Opcode::IdxGT => cmp == Ordering::Greater,
@@ -7330,9 +7338,10 @@ fn find_conflicting_rowid_in_index(
         sc.payload_buf.clear();
         sc.cursor.payload_into(&sc.cx, &mut sc.payload_buf)?;
         sc.cur_vals_buf.clear();
-        fsqlite_types::record::parse_record_into(&sc.payload_buf, &mut sc.cur_vals_buf).ok_or_else(
-            || FrankenError::internal("find_conflicting_rowid: malformed index entry record"),
-        )?;
+        fsqlite_types::record::parse_record_into(&sc.payload_buf, &mut sc.cur_vals_buf)
+            .ok_or_else(|| {
+                FrankenError::internal("find_conflicting_rowid: malformed index entry record")
+            })?;
 
         // Check if the indexed columns (excluding the trailing rowid) match
         // and none of them are NULL.

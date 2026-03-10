@@ -115,7 +115,9 @@ pub fn partition_page_morsels(
 ) -> DispatchResult<Vec<MorselDescriptor>> {
     // Alien Optimization: Content-Aware Morsel Partitioning (CAMP) §1.2.
     // Pre-calculate the total number of morsels to minimize vector re-allocations.
-    let total_pages = u64::from(end_page.get()).saturating_sub(u64::from(start_page.get())).saturating_add(1);
+    let total_pages = u64::from(end_page.get())
+        .saturating_sub(u64::from(start_page.get()))
+        .saturating_add(1);
     let expected_morsels = (total_pages as f64 / pages_per_morsel as f64).ceil() as usize;
     let mut out = Vec::with_capacity(expected_morsels);
 
@@ -140,7 +142,7 @@ pub fn partition_page_morsels(
         let span_end = current
             .saturating_add(pages_per_morsel.saturating_sub(1))
             .min(full.end_page.get());
-        
+
         // Fast-path range construction.
         let range = PageMorsel {
             start_page: PageNumber::new(current).unwrap(),

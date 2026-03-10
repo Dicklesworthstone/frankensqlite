@@ -174,7 +174,10 @@ impl ConcurrentHandle {
     /// Record a page read (for SSI rw-antidependency detection).
     pub fn record_read(&mut self, page: PageNumber) {
         if self.read_set.insert(page) {
-            self.read_index.entry(page).or_default().push(WitnessKey::Page(page));
+            self.read_index
+                .entry(page)
+                .or_default()
+                .push(WitnessKey::Page(page));
         }
     }
 

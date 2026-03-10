@@ -1790,6 +1790,7 @@ fn split_overflowing_nonroot_interior_page<W: PageWriter>(
 #[allow(clippy::cast_possible_truncation, clippy::similar_names)]
 mod tests {
     use super::*;
+    use fsqlite_types::WitnessKey;
     use fsqlite_types::serial_type::write_varint;
     use std::collections::HashMap;
 
@@ -1833,6 +1834,8 @@ mod tests {
         fn free_page(&mut self, _cx: &Cx, _page_no: PageNumber) -> Result<()> {
             Ok(())
         }
+
+        fn record_write_witness(&mut self, _cx: &Cx, _key: WitnessKey) {}
     }
 
     fn pn(n: u32) -> PageNumber {

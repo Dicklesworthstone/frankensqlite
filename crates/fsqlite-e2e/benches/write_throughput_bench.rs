@@ -104,7 +104,7 @@ fn bench_write_autocommit(c: &mut Criterion) {
                 for i in 0..ROW_COUNT {
                     #[allow(clippy::cast_possible_truncation)]
                     let val = f64::from(i as i32) * 0.137;
-                    conn.execute_params(
+                    conn.execute_with_params(
                         "INSERT INTO bench VALUES (?, ?, ?)",
                         &[
                             fsqlite_types::value::SqliteValue::Integer(i),
@@ -176,7 +176,7 @@ fn bench_write_batched(c: &mut Criterion) {
                     for i in start..start + BATCH_SIZE {
                         #[allow(clippy::cast_possible_truncation)]
                         let val = f64::from(i as i32) * 0.137;
-                        conn.execute_params(
+                        conn.execute_with_params(
                             "INSERT INTO bench VALUES (?, ?, ?)",
                             &[
                                 fsqlite_types::value::SqliteValue::Integer(i),
@@ -244,7 +244,7 @@ fn bench_write_single_txn(c: &mut Criterion) {
                 for i in 0..ROW_COUNT {
                     #[allow(clippy::cast_possible_truncation)]
                     let val = f64::from(i as i32) * 0.137;
-                    conn.execute_params(
+                    conn.execute_with_params(
                         "INSERT INTO bench VALUES (?, ?, ?)",
                         &[
                             fsqlite_types::value::SqliteValue::Integer(i),

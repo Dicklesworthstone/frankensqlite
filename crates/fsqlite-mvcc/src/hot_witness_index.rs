@@ -1039,7 +1039,8 @@ mod tests {
                 thread::spawn(move || {
                     for i in 0..ops_per_thread {
                         let slot_id = t * ops_per_thread + i;
-                        let key = WitnessKey::for_cell_read(page(t + 1), page(t + 1), &i.to_le_bytes());
+                        let key =
+                            WitnessKey::for_cell_read(page(t + 1), page(t + 1), &i.to_le_bytes());
                         let rks = derive_range_keys(&key, &config);
                         if i % 2 == 0 {
                             idx.register_read(slot_id, epoch, &rks);

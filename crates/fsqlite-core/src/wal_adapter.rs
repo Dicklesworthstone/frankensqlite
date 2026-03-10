@@ -388,7 +388,7 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
     }
 
     fn sync(&mut self, cx: &Cx) -> Result<()> {
-        let result = self.wal.sync(cx, fsqlite_types::flags::SyncFlags::NORMAL);
+        let result = self.wal.sync(cx, SyncFlags::NORMAL);
         self.refresh_before_append = true;
         result
     }

@@ -490,6 +490,7 @@ mod tests {
     use std::rc::Rc;
 
     use fsqlite_btree::{MemPageStore, PageReader};
+    use fsqlite_types::WitnessKey;
     use fsqlite_types::record::serialize_record;
 
     use super::*;
@@ -547,6 +548,8 @@ mod tests {
         fn free_page(&mut self, cx: &Cx, page_no: PageNumber) -> fsqlite_error::Result<()> {
             self.store.borrow_mut().free_page(cx, page_no)
         }
+
+        fn record_write_witness(&mut self, _cx: &Cx, _key: WitnessKey) {}
     }
 
     fn specs() -> Vec<ColumnSpec> {

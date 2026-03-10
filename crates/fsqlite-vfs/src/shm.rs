@@ -256,7 +256,10 @@ impl ShmRegion {
                 inner: ShmRegionGuardInner::Mmap {
                     ptr: m.ptr,
                     len: m.len,
-                    _guard: m.mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+                    _guard: m
+                        .mutex
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner),
                     _backing: m,
                 },
             },

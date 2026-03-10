@@ -20,7 +20,9 @@ pub fn witness_key_canonical_bytes(key: &WitnessKey) -> Vec<u8> {
             buf.extend_from_slice(&pgno.get().to_le_bytes());
             buf
         }
-        WitnessKey::Cell { btree_root, tag, .. } => {
+        WitnessKey::Cell {
+            btree_root, tag, ..
+        } => {
             let mut buf = Vec::with_capacity(13);
             buf.push(0x02);
             buf.extend_from_slice(&btree_root.get().to_le_bytes());

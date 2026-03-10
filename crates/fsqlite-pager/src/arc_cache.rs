@@ -843,6 +843,7 @@ impl ArcCacheInner {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)]
     fn t1_mru_key(&self) -> Option<CacheKey> {
         self.t1.back().map(|page| page.key)
     }
@@ -1472,7 +1473,10 @@ impl ArcCache {
 
         let mut shards = Vec::with_capacity(Self::SHARD_COUNT);
         for _ in 0..Self::SHARD_COUNT {
-            shards.push(Mutex::new(ArcCacheInner::new(shard_capacity, shard_max_bytes)));
+            shards.push(Mutex::new(ArcCacheInner::new(
+                shard_capacity,
+                shard_max_bytes,
+            )));
         }
 
         Self {
@@ -1631,9 +1635,11 @@ impl ArcCache {
 impl std::fmt::Debug for ArcCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ArcCache")
+            .field("shards_len", &self.shards.len())
+            .field("shard_mask", &self.shard_mask)
             .field("inner", &*self.lock())
             .field("inflight_len", &self.inflight.lock().len())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -1662,7 +1668,7 @@ mod tests {
     }
 
     /// Helper: create a `CachedPage` with the given key and a 4096-byte page.
-    fn page(k: CacheKey, size: usize) -> Arc<CachedPage> {
+    fn page(k: CacheKey, size: usize) -> CachedPage {
         let ps = if size <= 512 {
             PageSize::new(512).unwrap()
         } else if size <= 1024 {
@@ -1682,7 +1688,7 @@ mod tests {
         };
         let mut cp = CachedPage::new(k, fsqlite_types::PageData::zeroed(ps), 0, None);
         cp.byte_size = size;
-        Arc::new(cp)
+        cp
     }
 
     // ── 1. test_cache_key_mvcc_awareness ──────────────────────────────
@@ -3055,7 +3061,7 @@ mod tests {
     }
 
     #[test]
-    fn test_e2e_arc_scan_then_hotset() {
+    fn test_arc_scan_then_hotset_acceptance() {
         test_scan_resistance();
     }
 

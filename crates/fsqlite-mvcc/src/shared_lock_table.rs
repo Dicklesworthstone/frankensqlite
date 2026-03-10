@@ -496,12 +496,10 @@ impl SharedPageLockTable {
 
         // Slot claimed. Now CAS owner_txn from 0 → txn_id.
         // MUST NOT use store() here (§5.6.3).
-        match entry.owner_txn.compare_exchange(
-            0,
-            txn_id,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
+        match entry
+            .owner_txn
+            .compare_exchange(0, txn_id, Ordering::AcqRel, Ordering::Acquire)
+        {
             Ok(_) => {
                 if self.rebuild_epoch.load(Ordering::Acquire) != start_epoch {
                     let _ = entry.owner_txn.compare_exchange(
@@ -1643,16 +1641,23 @@ mod tests {
 
         // Beyond 70%: new key acquisition triggers a best-effort rebuild.
         // It should succeed, but we can verify it rotated the table.
-        let old_active = table.active_table.load(std::sync::atomic::Ordering::Relaxed);
+        let old_active = table
+            .active_table
+            .load(std::sync::atomic::Ordering::Relaxed);
         let result = table.try_acquire(200, 200);
-        let new_active = table.active_table.load(std::sync::atomic::Ordering::Relaxed);
+        let new_active = table
+            .active_table
+            .load(std::sync::atomic::Ordering::Relaxed);
 
         assert_eq!(
             result,
             AcquireResult::Acquired,
             "new key beyond 70% load factor triggers rebuild and succeeds"
         );
-        assert_ne!(old_active, new_active, "table must have rotated due to load factor");
+        assert_ne!(
+            old_active, new_active,
+            "table must have rotated due to load factor"
+        );
 
         // Existing keys can still be re-acquired (no new slot needed).
         assert!(table.release(1, 1));

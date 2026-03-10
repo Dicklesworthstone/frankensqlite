@@ -811,7 +811,6 @@ impl WitnessKey {
     pub fn is_cell(&self) -> bool {
         matches!(self, Self::Cell { .. })
     }
-
 }
 
 /// Witness hierarchy range key (prefix-based bucketing).

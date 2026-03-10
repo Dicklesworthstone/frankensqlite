@@ -883,7 +883,9 @@ impl PreparedStatement<'_> {
         let op_cx = self.conn.op_cx()?;
         self.ensure_schema_unchanged(&op_cx)?;
         if let Some(statement) = &self.deferred_query_statement {
-            return self.conn.execute_statement(statement.as_ref(), Some(params));
+            return self
+                .conn
+                .execute_statement(statement.as_ref(), Some(params));
         }
         let mut rows = if self.db.is_some() {
             self.execute_table_query(&op_cx, Some(params))?
@@ -3873,7 +3875,6 @@ impl Connection {
 
         let source_column_count = source_target_indices.len();
         for (row_idx, row) in source_rows.iter().enumerate() {
-
             if row.values().len() != source_column_count {
                 return Err(FrankenError::Internal(format!(
                     "INSERT ... SELECT column count mismatch: source row {row_idx} has {} values, SELECT produced {source_column_count}",
@@ -12094,7 +12095,7 @@ impl Connection {
     #[allow(clippy::too_many_lines)]
     fn execute_group_by_join_select(
         &self,
-        cx: &Cx,
+        _cx: &Cx,
         select: &SelectStatement,
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Row>> {
@@ -14069,7 +14070,7 @@ impl Connection {
             // them to raw row indices afterwards.
             let mut func_vals: Vec<SqliteValue> = Vec::with_capacity(total_rows);
             let mut func_row_order: Vec<usize> = Vec::with_capacity(total_rows);
-                for partition_indices in &partitions {
+            for partition_indices in &partitions {
                 func_row_order.extend_from_slice(partition_indices);
                 let mut state = func.initial_state();
                 let fname = &win_func_names[wi];
@@ -14522,7 +14523,6 @@ impl Connection {
 
         // Process each compound arm.
         for (op, core) in &select.body.compounds {
-
             let arm_select = SelectStatement {
                 with: None,
                 body: SelectBody {
@@ -14545,9 +14545,7 @@ impl Connection {
                 CompoundOp::Intersect => {
                     // Keep only distinct rows present in both result and arm_rows.
                     // O(N*M) loop: add checkpoints.
-                    result.retain(|row| {
-                        arm_rows.iter().any(|ar| ar.values() == row.values())
-                    });
+                    result.retain(|row| arm_rows.iter().any(|ar| ar.values() == row.values()));
                     dedup_rows(&mut result);
                 }
                 CompoundOp::Except => {
@@ -23942,18 +23940,25 @@ fn execute_single_join(
     // Pre-resolve USING constraint column indices to avoid linear searches per row
     let using_indices = if let Some(JoinConstraint::Using(cols)) = constraint {
         let mut indices = Vec::with_capacity(cols.len());
+        let mut complete = true;
         for col_name in cols {
-            let l_idx = col_map[..left_width]
+            let Some(l_idx) = col_map[..left_width]
                 .iter()
                 .position(|(_, name, _)| name.eq_ignore_ascii_case(col_name))
-                .unwrap_or(0); // If not found, eval_using_constraint will handle it or we could error here
-            let r_idx = col_map[left_width..]
+            else {
+                complete = false;
+                break;
+            };
+            let Some(r_idx) = col_map[left_width..]
                 .iter()
                 .position(|(_, name, _)| name.eq_ignore_ascii_case(col_name))
-                .unwrap_or(0);
+            else {
+                complete = false;
+                break;
+            };
             indices.push((l_idx, left_width + r_idx));
         }
-        Some(indices)
+        complete.then_some(indices)
     } else {
         None
     };
@@ -23971,32 +23976,10 @@ fn execute_single_join(
             let passes = match constraint {
                 None => true,
                 Some(JoinConstraint::On(expr)) => eval_join_predicate(expr, &scratch, col_map)?,
-                Some(JoinConstraint::Using(_)) => {
-                    let mut using_passes = true;
-                    if let Some(ref indices) = using_indices {
-                        for &(l_idx, r_idx) in indices {
-                            let left_val = scratch.get(l_idx);
-                            let right_val = scratch.get(r_idx);
-                            match (left_val, right_val) {
-                                (Some(l), Some(r)) => {
-                                    if matches!(l, SqliteValue::Null) || matches!(r, SqliteValue::Null) {
-                                        using_passes = false;
-                                        break;
-                                    }
-                                    if cmp_sqlite_values(l, r) != std::cmp::Ordering::Equal {
-                                        using_passes = false;
-                                        break;
-                                    }
-                                }
-                                _ => {
-                                    using_passes = false;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    using_passes
-                }
+                Some(JoinConstraint::Using(cols)) => using_indices.as_deref().map_or_else(
+                    || eval_using_constraint(cols, &scratch, col_map, left_width),
+                    |indices| eval_using_constraint_indices(indices, &scratch),
+                ),
             };
 
             if passes {
@@ -24059,6 +24042,25 @@ fn eval_using_constraint(
             (Some(l), Some(r)) => {
                 // SQL join semantics: USING expands to equality checks,
                 // and `NULL = NULL` is not true.
+                if matches!(l, SqliteValue::Null) || matches!(r, SqliteValue::Null) {
+                    return false;
+                }
+                if cmp_sqlite_values(l, r) != std::cmp::Ordering::Equal {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
+fn eval_using_constraint_indices(indices: &[(usize, usize)], combined_row: &[SqliteValue]) -> bool {
+    for &(left_idx, right_idx) in indices {
+        let left_val = combined_row.get(left_idx);
+        let right_val = combined_row.get(right_idx);
+        match (left_val, right_val) {
+            (Some(l), Some(r)) => {
                 if matches!(l, SqliteValue::Null) || matches!(r, SqliteValue::Null) {
                     return false;
                 }
