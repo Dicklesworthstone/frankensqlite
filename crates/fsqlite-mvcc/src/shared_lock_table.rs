@@ -1431,9 +1431,17 @@ mod tests {
         // Use very small capacity to trigger load factor limit.
         let table = SharedPageLockTable::new(16);
 
-        // Manually hold the rebuild lease so try_acquire cannot rotate tables.
+        // Hold a live rebuild lease so try_acquire cannot rotate tables.
         let process_id = std::process::id();
-        assert!(table.acquire_rebuild_lease(process_id, 0, 0).is_ok());
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_secs());
+        let pid_birth = current_process_birth_token(now_secs);
+        assert!(
+            table
+                .acquire_rebuild_lease(process_id, pid_birth, now_secs)
+                .is_ok()
+        );
 
         // Fill to > 70% capacity. Load factor check is pre-insert, so with
         // capacity=16, 0.70*16=11.2. We need 12 entries in the table before
