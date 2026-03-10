@@ -16534,6 +16534,11 @@ impl Connection {
             }
         }
 
+        let primary_width = table_sources[0].col_names.len();
+        let primary_where_pushdown = where_clause.and_then(|expr| {
+            expr_references_only_col_map(expr, &col_map[..primary_width]).then_some(expr)
+        });
+
         // ── 3. Load each table's raw rows ──
         // Cache scanned rows by table name so that a CTE (or any table)
         // referenced multiple times with different aliases reuses the same
@@ -16543,10 +16548,20 @@ impl Connection {
         for (i, src) in table_sources.iter().enumerate() {
             if let Some(rows) = preloaded[i].take() {
                 // Subquery: use preloaded rows.
-                table_rows.push(rows);
+                table_rows.push(maybe_filter_primary_join_rows(
+                    rows,
+                    i,
+                    primary_where_pushdown,
+                    &col_map[..primary_width],
+                )?);
             } else if let Some(cached) = scanned_cache.get(&src.table_name) {
                 // Same table referenced again (e.g. CTE self-join): clone cached rows.
-                table_rows.push(cached.clone());
+                table_rows.push(maybe_filter_primary_join_rows(
+                    cached.clone(),
+                    i,
+                    primary_where_pushdown,
+                    &col_map[..primary_width],
+                )?);
             } else if self.time_travel_active.get() {
                 // Time-travel mode: read directly from MemDatabase (self.db)
                 // instead of self.query() which goes through the pager and
@@ -16589,7 +16604,12 @@ impl Connection {
                     }
                 };
                 scanned_cache.insert(src.table_name.clone(), row_data.clone());
-                table_rows.push(row_data);
+                table_rows.push(maybe_filter_primary_join_rows(
+                    row_data,
+                    i,
+                    primary_where_pushdown,
+                    &col_map[..primary_width],
+                )?);
             } else {
                 // Named table: scan from database.
                 let scan_sql = format!("SELECT * FROM \"{}\"", src.table_name.replace('"', "\"\""));
@@ -16601,13 +16621,17 @@ impl Connection {
                 let row_data: Vec<Vec<SqliteValue>> =
                     rows.iter().map(|r| r.values().to_vec()).collect();
                 scanned_cache.insert(src.table_name.clone(), row_data.clone());
-                table_rows.push(row_data);
+                table_rows.push(maybe_filter_primary_join_rows(
+                    row_data,
+                    i,
+                    primary_where_pushdown,
+                    &col_map[..primary_width],
+                )?);
             }
         }
 
         // ── 4. Perform joins ──
         // Start with primary table rows as "left" side.
-        let primary_width = table_sources[0].col_names.len();
         let mut combined: Vec<Vec<SqliteValue>> = table_rows[0]
             .iter()
             .map(|row| row[..primary_width].to_vec())
@@ -19464,8 +19488,12 @@ fn flatten_expr_option(
     outer_alias: Option<&str>,
     projection_map: &FlattenProjectionMap,
 ) -> Option<Option<Box<Expr>>> {
-    expr.map(|inner| flatten_expr_tree(inner, outer_alias, projection_map).map(Box::new))
-        .transpose()
+    match expr {
+        Some(inner) => flatten_expr_tree(inner, outer_alias, projection_map)
+            .map(Box::new)
+            .map(Some),
+        None => Some(None),
+    }
 }
 
 fn flatten_order_by_terms(
@@ -19574,10 +19602,7 @@ fn flatten_expr_tree(
         } => Some(Expr::Like {
             expr: Box::new(flatten_expr_tree(inner, outer_alias, projection_map)?),
             pattern: Box::new(flatten_expr_tree(pattern, outer_alias, projection_map)?),
-            escape: escape
-                .as_ref()
-                .map(|inner| flatten_expr_tree(inner, outer_alias, projection_map).map(Box::new))
-                .transpose()?,
+            escape: flatten_expr_option(escape.as_deref(), outer_alias, projection_map)?,
             op: *op,
             not: *not,
             span: *span,
@@ -19588,10 +19613,7 @@ fn flatten_expr_tree(
             else_expr,
             span,
         } => Some(Expr::Case {
-            operand: operand
-                .as_ref()
-                .map(|inner| flatten_expr_tree(inner, outer_alias, projection_map).map(Box::new))
-                .transpose()?,
+            operand: flatten_expr_option(operand.as_deref(), outer_alias, projection_map)?,
             whens: whens
                 .iter()
                 .map(|(when_expr, then_expr)| {
@@ -19601,10 +19623,7 @@ fn flatten_expr_tree(
                     ))
                 })
                 .collect::<Option<Vec<_>>>()?,
-            else_expr: else_expr
-                .as_ref()
-                .map(|inner| flatten_expr_tree(inner, outer_alias, projection_map).map(Box::new))
-                .transpose()?,
+            else_expr: flatten_expr_option(else_expr.as_deref(), outer_alias, projection_map)?,
             span: *span,
         }),
         Expr::Cast {
@@ -19648,12 +19667,7 @@ fn flatten_expr_tree(
                 args: rewritten_args,
                 distinct: *distinct,
                 order_by: flatten_order_by_terms(order_by, outer_alias, projection_map)?,
-                filter: filter
-                    .as_ref()
-                    .map(|inner| {
-                        flatten_expr_tree(inner, outer_alias, projection_map).map(Box::new)
-                    })
-                    .transpose()?,
+                filter: flatten_expr_option(filter.as_deref(), outer_alias, projection_map)?,
                 over: over.clone(),
                 span: *span,
             })
@@ -26266,6 +26280,120 @@ fn execute_single_join(
     }
 
     Ok(result)
+}
+
+fn maybe_filter_primary_join_rows(
+    row_data: Vec<Vec<SqliteValue>>,
+    table_index: usize,
+    primary_where_pushdown: Option<&Expr>,
+    primary_col_map: &[(String, String, bool)],
+) -> Result<Vec<Vec<SqliteValue>>> {
+    if table_index != 0 {
+        return Ok(row_data);
+    }
+    let Some(expr) = primary_where_pushdown else {
+        return Ok(row_data);
+    };
+
+    let mut filtered = Vec::with_capacity(row_data.len());
+    for row in row_data {
+        if eval_join_predicate(expr, &row, primary_col_map)? {
+            filtered.push(row);
+        }
+    }
+    Ok(filtered)
+}
+
+fn expr_references_only_col_map(expr: &Expr, col_map: &[(String, String, bool)]) -> bool {
+    match expr {
+        Expr::Literal(_, _) | Expr::Placeholder(_, _) | Expr::Raise { .. } => true,
+        Expr::Column(col_ref, _) => {
+            find_col_in_map(col_map, col_ref.table.as_deref(), &col_ref.column, None).is_ok()
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            expr_references_only_col_map(left, col_map)
+                && expr_references_only_col_map(right, col_map)
+        }
+        Expr::UnaryOp { expr: inner, .. }
+        | Expr::Cast { expr: inner, .. }
+        | Expr::Collate { expr: inner, .. }
+        | Expr::IsNull { expr: inner, .. } => expr_references_only_col_map(inner, col_map),
+        Expr::Between {
+            expr: inner,
+            low,
+            high,
+            ..
+        } => {
+            expr_references_only_col_map(inner, col_map)
+                && expr_references_only_col_map(low, col_map)
+                && expr_references_only_col_map(high, col_map)
+        }
+        Expr::In {
+            expr: inner, set, ..
+        } => {
+            expr_references_only_col_map(inner, col_map)
+                && match set {
+                    InSet::List(values) => values
+                        .iter()
+                        .all(|value| expr_references_only_col_map(value, col_map)),
+                    InSet::Subquery(_) | InSet::Table(_) => false,
+                }
+        }
+        Expr::Like {
+            expr: inner,
+            pattern,
+            escape,
+            ..
+        } => {
+            expr_references_only_col_map(inner, col_map)
+                && expr_references_only_col_map(pattern, col_map)
+                && escape
+                    .as_ref()
+                    .is_none_or(|expr| expr_references_only_col_map(expr, col_map))
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            operand
+                .as_ref()
+                .is_none_or(|expr| expr_references_only_col_map(expr, col_map))
+                && whens.iter().all(|(when_expr, then_expr)| {
+                    expr_references_only_col_map(when_expr, col_map)
+                        && expr_references_only_col_map(then_expr, col_map)
+                })
+                && else_expr
+                    .as_ref()
+                    .is_none_or(|expr| expr_references_only_col_map(expr, col_map))
+        }
+        Expr::FunctionCall {
+            args, filter, over, ..
+        } => {
+            over.is_none()
+                && filter
+                    .as_ref()
+                    .is_none_or(|expr| expr_references_only_col_map(expr, col_map))
+                && match args {
+                    FunctionArgs::List(arguments) => arguments
+                        .iter()
+                        .all(|argument| expr_references_only_col_map(argument, col_map)),
+                    FunctionArgs::Star => true,
+                }
+        }
+        Expr::JsonAccess {
+            expr: inner, path, ..
+        } => {
+            expr_references_only_col_map(inner, col_map)
+                && expr_references_only_col_map(path, col_map)
+        }
+        Expr::RowValue(values, _) => values
+            .iter()
+            .all(|value| expr_references_only_col_map(value, col_map)),
+        Expr::Exists { .. } | Expr::Subquery(..) => false,
+        _ => false,
+    }
 }
 
 /// Evaluate a USING constraint: check that named columns match in both sides.
