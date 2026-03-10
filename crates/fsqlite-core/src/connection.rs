@@ -35460,6 +35460,59 @@ mod tests {
                 let conn = Connection::open(&db).unwrap();
                 conn.execute("PRAGMA busy_timeout=5000;").unwrap();
                 conn.execute("PRAGMA fsqlite.concurrent_mode=ON;").unwrap();
+                let describe_row_via_txn =
+                    |txn: &mut dyn fsqlite_pager::TransactionHandle| -> String {
+                        let cx = Cx::new();
+                        let mut cursor = fsqlite_btree::BtCursor::new(
+                            fsqlite_btree::TransactionPageIo::new(txn),
+                            fsqlite_types::PageNumber::new(
+                                u32::try_from(table_root_page)
+                                    .expect("root page should fit in u32"),
+                            )
+                            .expect("root page should be valid"),
+                            u32::try_from(fsqlite_types::PageSize::DEFAULT.as_usize())
+                                .expect("page size should fit in u32"),
+                            true,
+                        );
+                        let seek = match cursor.table_move_to(&cx, 1) {
+                            Ok(seek) => seek,
+                            Err(err) => return format!("move_to_err:{err}"),
+                        };
+                        if !seek.is_found() {
+                            return "row_missing".to_owned();
+                        }
+                        let payload = match cursor.payload(&cx) {
+                            Ok(payload) => payload,
+                            Err(err) => return format!("payload_err:{err}"),
+                        };
+                        match fsqlite_types::record::parse_record(&payload) {
+                            Some(values) => format!("{values:?}"),
+                            None => format!("decode_err:payload_len={}", payload.len()),
+                        }
+                    };
+                let describe_active_txn_row = |conn: &Connection| -> String {
+                    let mut active_txn = conn.active_txn.borrow_mut();
+                    let Some(txn) = active_txn.as_mut() else {
+                        return "no_active_txn".to_owned();
+                    };
+                    describe_row_via_txn(txn.as_mut())
+                };
+                let describe_fresh_conn_state = |db: &str| -> String {
+                    let fresh = Connection::open(db).unwrap();
+                    let sql_row = fresh
+                        .query_row("SELECT v FROM t WHERE id = 1;")
+                        .ok()
+                        .and_then(|row| row.get(0).cloned());
+                    let pager_row = {
+                        let cx = Cx::new();
+                        let mut txn = fresh
+                            .pager
+                            .begin(&cx, fsqlite_pager::TransactionMode::ReadOnly)
+                            .unwrap();
+                        describe_row_via_txn(txn.as_mut())
+                    };
+                    format!("sql={sql_row:?} pager={pager_row}")
+                };
                 barrier.wait();
                 let mut retries = 0_u64;
                 for _ in 0..TXNS_PER_WORKER {
@@ -35558,7 +35611,42 @@ mod tests {
                                 let _ = conn.execute("ROLLBACK;");
                                 continue;
                             }
-                            Err(err) => panic!("non-transient update failure: {err}"),
+                            Err(err) => {
+                                let active_txn_row = describe_active_txn_row(&conn);
+                                let _ = conn.execute("ROLLBACK;");
+                                let fresh_conn_state = describe_fresh_conn_state(&db);
+                                let wal_len = std::fs::metadata(wal_path_for_db_path(&db))
+                                    .ok()
+                                    .map(|meta| meta.len());
+                                let sqlite_state = {
+                                    let sqlite = rusqlite::Connection::open(&db).unwrap();
+                                    let typeof_v: String = sqlite
+                                        .query_row(
+                                            "SELECT typeof(v) FROM t WHERE id = 1;",
+                                            [],
+                                            |row| row.get(0),
+                                        )
+                                        .unwrap();
+                                    let quote_v: String = sqlite
+                                        .query_row(
+                                            "SELECT quote(v) FROM t WHERE id = 1;",
+                                            [],
+                                            |row| row.get(0),
+                                        )
+                                        .unwrap();
+                                    let value: rusqlite::types::Value = sqlite
+                                        .query_row("SELECT v FROM t WHERE id = 1;", [], |row| {
+                                            row.get(0)
+                                        })
+                                        .unwrap();
+                                    format!(
+                                        "typeof={typeof_v:?} quote={quote_v:?} value={value:?}"
+                                    )
+                                };
+                                panic!(
+                                    "non-transient update failure: {err}; active_txn_row={active_txn_row}; fresh_conn={fresh_conn_state}; sqlite={sqlite_state}; retries={retries}; wal_len={wal_len:?}"
+                                )
+                            }
                         }
                         match conn.execute("COMMIT;") {
                             Ok(_) => break,
@@ -35731,12 +35819,6 @@ mod tests {
         let conn = Connection::open(&db).unwrap();
         conn.execute("PRAGMA busy_timeout=5000;").unwrap();
         conn.execute("PRAGMA fsqlite.concurrent_mode=ON;").unwrap();
-        for _ in 0..TXNS {
-            let changes = conn.execute("UPDATE t SET v = v + 1 WHERE id = 1;").unwrap();
-            assert_eq!(changes, 1, "expected one-row sequential update");
-        }
-        drop(conn);
-
         let read_single_column_row_via_pager = |conn: &Connection| -> Option<Vec<SqliteValue>> {
             let cx = Cx::new();
             let mut txn = conn
@@ -35763,6 +35845,39 @@ mod tests {
                     .expect("pager-backed row payload should decode as a SQLite record"),
             )
         };
+        for step in 0..TXNS {
+            let query_before_step = conn
+                .query_row("SELECT v FROM t WHERE id = 1;")
+                .ok()
+                .and_then(|row| row.get(0).cloned());
+            let pager_before_step = read_single_column_row_via_pager(&conn);
+            match conn.execute("UPDATE t SET v = v + 1 WHERE id = 1;") {
+                Ok(changes) => {
+                    assert_eq!(changes, 1, "expected one-row sequential update");
+                }
+                Err(err) => {
+                    let sqlite_before_step = {
+                        let sqlite = rusqlite::Connection::open(&db).unwrap();
+                        let typeof_v: String = sqlite
+                            .query_row("SELECT typeof(v) FROM t WHERE id = 1;", [], |row| {
+                                row.get(0)
+                            })
+                            .unwrap();
+                        let quote_v: String = sqlite
+                            .query_row("SELECT quote(v) FROM t WHERE id = 1;", [], |row| row.get(0))
+                            .unwrap();
+                        let value: rusqlite::types::Value = sqlite
+                            .query_row("SELECT v FROM t WHERE id = 1;", [], |row| row.get(0))
+                            .unwrap();
+                        (typeof_v, quote_v, value)
+                    };
+                    panic!(
+                        "bd-rjc sequential update failed: step={step} query_before_step={query_before_step:?} pager_before_step={pager_before_step:?} sqlite_before_step={sqlite_before_step:?} err={err}"
+                    );
+                }
+            }
+        }
+        drop(conn);
 
         let verifier = Connection::open(&db).unwrap();
         let row = verifier.query_row("SELECT v FROM t WHERE id = 1;").unwrap();
