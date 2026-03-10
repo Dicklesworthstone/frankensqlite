@@ -21,17 +21,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use fsqlite_core::connection::{
-    hot_path_profile_enabled, hot_path_profile_snapshot, reset_hot_path_profile,
-    set_hot_path_profile_enabled, HotPathProfileSnapshot, ParserHotPathProfileSnapshot,
+    HotPathProfileSnapshot, ParserHotPathProfileSnapshot, hot_path_profile_enabled,
+    hot_path_profile_snapshot, reset_hot_path_profile, set_hot_path_profile_enabled,
 };
 
-use crate::benchmark::{run_benchmark, BenchmarkConfig, BenchmarkMeta, BenchmarkSummary};
+use crate::HarnessSettings;
+use crate::benchmark::{BenchmarkConfig, BenchmarkMeta, BenchmarkSummary, run_benchmark};
 use crate::fsqlite_executor::run_oplog_fsqlite;
 use crate::oplog::{self, OpLog};
 use crate::report::EngineRunReport;
-use crate::run_workspace::{create_workspace_with_label, WorkspaceConfig};
+use crate::run_workspace::{WorkspaceConfig, create_workspace_with_label};
 use crate::sqlite_executor::run_oplog_sqlite;
-use crate::HarnessSettings;
 
 // ── Configuration ──────────────────────────────────────────────────────
 
@@ -147,6 +147,10 @@ pub const PERF_RESULT_SCHEMA_V1: &str = "fsqlite-e2e.perf_result.v1";
 pub const HOT_PATH_PROFILE_SCHEMA_V1: &str = "fsqlite-e2e.hot_path_profile.v1";
 /// Schema version for hot-path artifact manifests.
 pub const HOT_PATH_PROFILE_MANIFEST_SCHEMA_V1: &str = "fsqlite-e2e.hot_path_profile_manifest.v1";
+/// Schema version for raw opcode profile packs.
+pub const HOT_PATH_OPCODE_PROFILE_SCHEMA_V1: &str = "fsqlite-e2e.hot_path_opcode_profile.v1";
+/// Schema version for raw subsystem profile packs.
+pub const HOT_PATH_SUBSYSTEM_PROFILE_SCHEMA_V1: &str = "fsqlite-e2e.hot_path_subsystem_profile.v1";
 /// Schema version for structured D1 actionable hotspot ranking artifacts.
 pub const HOT_PATH_PROFILE_ACTIONABLE_RANKING_SCHEMA_V1: &str =
     "fsqlite-e2e.hot_path_actionable_ranking.v1";
@@ -224,9 +228,45 @@ pub struct HotPathOpcodeProfileEntry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HotPathOpcodeProfilePack {
+    pub schema_version: String,
+    pub bead_id: String,
+    pub run_id: String,
+    pub trace_id: String,
+    pub scenario_id: String,
+    pub fixture_id: String,
+    pub workload: String,
+    pub seed: u64,
+    pub scale: u32,
+    pub concurrency: u16,
+    pub replay_command: String,
+    pub opcodes: Vec<HotPathOpcodeProfileEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HotPathTypeProfile {
     pub decoded: HotPathValueTypeProfile,
     pub materialized: HotPathValueTypeProfile,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HotPathSubsystemProfilePack {
+    pub schema_version: String,
+    pub bead_id: String,
+    pub run_id: String,
+    pub trace_id: String,
+    pub scenario_id: String,
+    pub fixture_id: String,
+    pub workload: String,
+    pub seed: u64,
+    pub scale: u32,
+    pub concurrency: u16,
+    pub replay_command: String,
+    pub subsystem_ranking: Vec<HotPathRankingEntry>,
+    pub allocator_ranking: Vec<HotPathRankingEntry>,
+    pub parser: HotPathParserProfile,
+    pub record_decode: HotPathRecordDecodeProfile,
+    pub row_materialization: HotPathRowMaterializationProfile,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -696,6 +736,14 @@ pub fn render_hot_path_profile_markdown(report: &HotPathProfileReport) -> String
     let _ = writeln!(out, "- `profile.json` — raw scenario profile");
     let _ = writeln!(
         out,
+        "- `opcode_profile.json` — raw opcode totals for this canonical hot-cell run"
+    );
+    let _ = writeln!(
+        out,
+        "- `subsystem_profile.json` — raw execution-subsystem timing and heap profile for this run"
+    );
+    let _ = writeln!(
+        out,
         "- `actionable_ranking.json` — hotspot-to-bead ledger for D2-D4 handoff"
     );
     let _ = writeln!(
@@ -770,6 +818,55 @@ fn actionable_entry(
 }
 
 #[must_use]
+pub fn build_hot_path_opcode_profile(report: &HotPathProfileReport) -> HotPathOpcodeProfilePack {
+    let mut opcodes = report.opcode_profile.clone();
+    opcodes.sort_by(|lhs, rhs| {
+        rhs.total
+            .cmp(&lhs.total)
+            .then_with(|| lhs.opcode.cmp(&rhs.opcode))
+    });
+
+    HotPathOpcodeProfilePack {
+        schema_version: HOT_PATH_OPCODE_PROFILE_SCHEMA_V1.to_owned(),
+        bead_id: report.bead_id.clone(),
+        run_id: report.run_id.clone(),
+        trace_id: report.trace_id.clone(),
+        scenario_id: report.scenario_id.clone(),
+        fixture_id: report.fixture_id.clone(),
+        workload: report.workload.clone(),
+        seed: report.seed,
+        scale: report.scale,
+        concurrency: report.concurrency,
+        replay_command: report.replay_command.clone(),
+        opcodes,
+    }
+}
+
+#[must_use]
+pub fn build_hot_path_subsystem_profile(
+    report: &HotPathProfileReport,
+) -> HotPathSubsystemProfilePack {
+    HotPathSubsystemProfilePack {
+        schema_version: HOT_PATH_SUBSYSTEM_PROFILE_SCHEMA_V1.to_owned(),
+        bead_id: report.bead_id.clone(),
+        run_id: report.run_id.clone(),
+        trace_id: report.trace_id.clone(),
+        scenario_id: report.scenario_id.clone(),
+        fixture_id: report.fixture_id.clone(),
+        workload: report.workload.clone(),
+        seed: report.seed,
+        scale: report.scale,
+        concurrency: report.concurrency,
+        replay_command: report.replay_command.clone(),
+        subsystem_ranking: report.subsystem_ranking.clone(),
+        allocator_ranking: report.allocator_pressure.ranked_sources.clone(),
+        parser: report.parser.clone(),
+        record_decode: report.record_decode.clone(),
+        row_materialization: report.row_materialization.clone(),
+    }
+}
+
+#[must_use]
 pub fn build_hot_path_actionable_ranking(
     report: &HotPathProfileReport,
 ) -> HotPathActionableRanking {
@@ -819,15 +916,25 @@ pub fn write_hot_path_profile_artifacts(
 
     let report_json = serde_json::to_string_pretty(report)
         .map_err(|error| std::io::Error::other(format!("profile JSON: {error}")))?;
+    let opcode_profile = build_hot_path_opcode_profile(report);
+    let opcode_profile_json = serde_json::to_string_pretty(&opcode_profile)
+        .map_err(|error| std::io::Error::other(format!("opcode profile JSON: {error}")))?;
+    let subsystem_profile = build_hot_path_subsystem_profile(report);
+    let subsystem_profile_json = serde_json::to_string_pretty(&subsystem_profile)
+        .map_err(|error| std::io::Error::other(format!("subsystem profile JSON: {error}")))?;
     let actionable_ranking = build_hot_path_actionable_ranking(report);
     let actionable_ranking_json = serde_json::to_string_pretty(&actionable_ranking)
         .map_err(|error| std::io::Error::other(format!("actionable ranking JSON: {error}")))?;
     let summary_md = render_hot_path_profile_markdown(report);
 
     let report_path = output_dir.join("profile.json");
+    let opcode_profile_path = output_dir.join("opcode_profile.json");
+    let subsystem_profile_path = output_dir.join("subsystem_profile.json");
     let actionable_ranking_path = output_dir.join("actionable_ranking.json");
     let summary_path = output_dir.join("summary.md");
     std::fs::write(&report_path, report_json.as_bytes())?;
+    std::fs::write(&opcode_profile_path, opcode_profile_json.as_bytes())?;
+    std::fs::write(&subsystem_profile_path, subsystem_profile_json.as_bytes())?;
     std::fs::write(&actionable_ranking_path, actionable_ranking_json.as_bytes())?;
     std::fs::write(&summary_path, summary_md.as_bytes())?;
 
@@ -848,6 +955,17 @@ pub fn write_hot_path_profile_artifacts(
                 path: "profile.json".to_owned(),
                 bytes: u64::try_from(report_json.len()).unwrap_or(u64::MAX),
                 description: "structured hot-path profile report".to_owned(),
+            },
+            HotPathArtifactFile {
+                path: "opcode_profile.json".to_owned(),
+                bytes: u64::try_from(opcode_profile_json.len()).unwrap_or(u64::MAX),
+                description: "raw opcode totals for the canonical hot-cell run".to_owned(),
+            },
+            HotPathArtifactFile {
+                path: "subsystem_profile.json".to_owned(),
+                bytes: u64::try_from(subsystem_profile_json.len()).unwrap_or(u64::MAX),
+                description: "raw execution-subsystem timing and heap profile for the run"
+                    .to_owned(),
             },
             HotPathArtifactFile {
                 path: "summary.md".to_owned(),
@@ -1142,12 +1260,16 @@ mod tests {
         assert_eq!(cells.len(), 8);
 
         // Verify all combinations are present.
-        assert!(cells
-            .iter()
-            .any(|c| c.engine == Engine::Sqlite3 && c.fixture_id == "fix1" && c.concurrency == 1));
-        assert!(cells
-            .iter()
-            .any(|c| c.engine == Engine::Fsqlite && c.fixture_id == "fix2" && c.concurrency == 4));
+        assert!(
+            cells.iter().any(|c| c.engine == Engine::Sqlite3
+                && c.fixture_id == "fix1"
+                && c.concurrency == 1)
+        );
+        assert!(
+            cells.iter().any(|c| c.engine == Engine::Fsqlite
+                && c.fixture_id == "fix2"
+                && c.concurrency == 4)
+        );
     }
 
     #[test]
@@ -1276,6 +1398,14 @@ mod tests {
 
         let artifact_dir = tempdir.path().join("artifacts");
         let manifest = write_hot_path_profile_artifacts(&report, &artifact_dir).unwrap();
+        let opcode_profile: HotPathOpcodeProfilePack = serde_json::from_slice(
+            &std::fs::read(artifact_dir.join("opcode_profile.json")).unwrap(),
+        )
+        .unwrap();
+        let subsystem_profile: HotPathSubsystemProfilePack = serde_json::from_slice(
+            &std::fs::read(artifact_dir.join("subsystem_profile.json")).unwrap(),
+        )
+        .unwrap();
         let actionable_ranking: HotPathActionableRanking = serde_json::from_slice(
             &std::fs::read(artifact_dir.join("actionable_ranking.json")).unwrap(),
         )
@@ -1283,21 +1413,35 @@ mod tests {
 
         assert_eq!(manifest.schema_version, HOT_PATH_PROFILE_MANIFEST_SCHEMA_V1);
         assert!(artifact_dir.join("profile.json").exists());
+        assert!(artifact_dir.join("opcode_profile.json").exists());
+        assert!(artifact_dir.join("subsystem_profile.json").exists());
         assert!(artifact_dir.join("summary.md").exists());
         assert!(artifact_dir.join("actionable_ranking.json").exists());
         assert!(artifact_dir.join("manifest.json").exists());
-        assert_eq!(manifest.files.len(), 4);
+        assert_eq!(manifest.files.len(), 6);
+        assert_eq!(
+            opcode_profile.schema_version,
+            HOT_PATH_OPCODE_PROFILE_SCHEMA_V1
+        );
+        assert_eq!(
+            subsystem_profile.schema_version,
+            HOT_PATH_SUBSYSTEM_PROFILE_SCHEMA_V1
+        );
         assert_eq!(
             actionable_ranking.schema_version,
             HOT_PATH_PROFILE_ACTIONABLE_RANKING_SCHEMA_V1
         );
+        assert!(!opcode_profile.opcodes.is_empty());
+        assert!(!subsystem_profile.subsystem_ranking.is_empty());
         assert!(!actionable_ranking.named_hotspots.is_empty());
-        assert!(actionable_ranking
-            .named_hotspots
-            .iter()
-            .flat_map(|entry| entry.mapped_beads.iter())
-            .any(|bead| bead == "bd-db300.4.2"
-                || bead == "bd-db300.4.3"
-                || bead == "bd-db300.4.4"));
+        assert!(
+            actionable_ranking
+                .named_hotspots
+                .iter()
+                .flat_map(|entry| entry.mapped_beads.iter())
+                .any(|bead| bead == "bd-db300.4.2"
+                    || bead == "bd-db300.4.3"
+                    || bead == "bd-db300.4.4")
+        );
     }
 }
