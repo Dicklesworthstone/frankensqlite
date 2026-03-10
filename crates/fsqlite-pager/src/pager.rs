@@ -2563,7 +2563,7 @@ mod tests {
     use super::*;
     use crate::traits::{MvccPager, TransactionHandle, TransactionMode};
     use fsqlite_types::PageSize;
-    use fsqlite_types::flags::{AccessFlags, VfsOpenFlags};
+    use fsqlite_types::flags::{AccessFlags, SyncFlags, VfsOpenFlags};
     use fsqlite_types::{BTreePageHeader, DatabaseHeader};
     use fsqlite_vfs::{MemoryFile, MemoryVfs, Vfs, VfsFile};
     use std::path::PathBuf;
@@ -4429,12 +4429,24 @@ mod tests {
 
     // ── WAL mode integration tests ──────────────────────────────────────
 
+    use fsqlite_wal::wal::WalAppendFrameRef;
+    use fsqlite_wal::{WalFile, WalSalts};
+    use serde_json::json;
     use std::sync::{Arc as StdArc, Mutex as StdMutex};
+    use std::time::Instant;
 
     /// (page_number, page_data, db_size_if_commit)
     type WalFrame = (u32, Vec<u8>, u32);
     type SharedFrames = StdArc<StdMutex<Vec<WalFrame>>>;
     type SharedCounter = StdArc<StdMutex<usize>>;
+    const TRACK_C_BATCH_BENCH_BEAD_ID: &str = "bd-db300.3.1.4";
+    const TRACK_C_BATCH_BENCH_WARMUP_ITERS: usize = 5;
+    const TRACK_C_BATCH_BENCH_MEASURE_ITERS: usize = 25;
+    const TRACK_C_BATCH_BENCH_CASES: [(&str, usize); 3] = [
+        ("page1_plus_1_new_page", 2),
+        ("page1_plus_7_new_pages", 8),
+        ("page1_plus_31_new_pages", 32),
+    ];
 
     /// In-memory WAL backend for testing WAL-mode commit and page lookup.
     struct MockWalBackend {
@@ -4459,6 +4471,198 @@ mod tests {
                 batch_calls,
             )
         }
+    }
+
+    #[derive(Clone, Copy)]
+    enum TrackCBatchMode {
+        SingleFrame,
+        Batched,
+    }
+
+    impl TrackCBatchMode {
+        const fn as_str(self) -> &'static str {
+            match self {
+                Self::SingleFrame => "single_frame",
+                Self::Batched => "batch_append",
+            }
+        }
+    }
+
+    struct TrackCBenchmarkWalBackend {
+        wal: WalFile<MemoryFile>,
+        mode: TrackCBatchMode,
+    }
+
+    impl TrackCBenchmarkWalBackend {
+        fn new(vfs: &MemoryVfs, cx: &Cx, path: &std::path::Path, mode: TrackCBatchMode) -> Self {
+            let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::WAL;
+            let (file, _) = vfs.open(cx, Some(path), flags).unwrap();
+            let wal = WalFile::create(
+                cx,
+                file,
+                PageSize::DEFAULT.get(),
+                0,
+                WalSalts {
+                    salt1: 0xDB30_0314,
+                    salt2: 0xC1C1_C1C1,
+                },
+            )
+            .unwrap();
+            Self { wal, mode }
+        }
+    }
+
+    impl crate::traits::WalBackend for TrackCBenchmarkWalBackend {
+        fn append_frame(
+            &mut self,
+            cx: &Cx,
+            page_number: u32,
+            page_data: &[u8],
+            db_size_if_commit: u32,
+        ) -> fsqlite_error::Result<()> {
+            self.wal
+                .append_frame(cx, page_number, page_data, db_size_if_commit)
+        }
+
+        fn append_frames(
+            &mut self,
+            cx: &Cx,
+            frames: &[crate::traits::WalFrameRef<'_>],
+        ) -> fsqlite_error::Result<()> {
+            match self.mode {
+                TrackCBatchMode::SingleFrame => {
+                    for frame in frames {
+                        self.wal.append_frame(
+                            cx,
+                            frame.page_number,
+                            frame.page_data,
+                            frame.db_size_if_commit,
+                        )?;
+                    }
+                    Ok(())
+                }
+                TrackCBatchMode::Batched => {
+                    let wal_frames: Vec<_> = frames
+                        .iter()
+                        .map(|frame| WalAppendFrameRef {
+                            page_number: frame.page_number,
+                            page_data: frame.page_data,
+                            db_size_if_commit: frame.db_size_if_commit,
+                        })
+                        .collect();
+                    self.wal.append_frames(cx, &wal_frames)
+                }
+            }
+        }
+
+        fn read_page(
+            &mut self,
+            _cx: &Cx,
+            _page_number: u32,
+        ) -> fsqlite_error::Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+
+        fn sync(&mut self, cx: &Cx) -> fsqlite_error::Result<()> {
+            self.wal.sync(cx, SyncFlags::NORMAL)
+        }
+
+        fn frame_count(&self) -> usize {
+            self.wal.frame_count()
+        }
+
+        fn checkpoint(
+            &mut self,
+            _cx: &Cx,
+            _mode: crate::traits::CheckpointMode,
+            _writer: &mut dyn crate::traits::CheckpointPageWriter,
+            _backfilled_frames: u32,
+            _oldest_reader_frame: Option<u32>,
+        ) -> fsqlite_error::Result<crate::traits::CheckpointResult> {
+            let total_frames = u32::try_from(self.wal.frame_count()).unwrap_or(u32::MAX);
+            Ok(crate::traits::CheckpointResult {
+                total_frames,
+                frames_backfilled: 0,
+                completed: false,
+                wal_was_reset: false,
+            })
+        }
+    }
+
+    fn track_c_prepared_commit(
+        mode: TrackCBatchMode,
+        dirty_pages: usize,
+    ) -> (Cx, SimpleTransaction<MemoryVfs>) {
+        assert!(dirty_pages >= 2);
+
+        let cx = Cx::new();
+        let vfs = MemoryVfs::new();
+        let db_path = PathBuf::from(format!(
+            "/track_c_batch_commit_{}_{}.db",
+            mode.as_str(),
+            dirty_pages
+        ));
+        let wal_path = PathBuf::from(format!(
+            "/track_c_batch_commit_{}_{}.db-wal",
+            mode.as_str(),
+            dirty_pages
+        ));
+        let pager = SimplePager::open(vfs.clone(), &db_path, PageSize::DEFAULT).unwrap();
+        let backend = TrackCBenchmarkWalBackend::new(&vfs, &cx, &wal_path, mode);
+        pager.set_wal_backend(Box::new(backend)).unwrap();
+        pager.set_journal_mode(&cx, JournalMode::Wal).unwrap();
+
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let page_bytes = PageSize::DEFAULT.as_usize();
+        txn.write_page(&cx, PageNumber::ONE, &vec![0xA1; page_bytes])
+            .unwrap();
+        for page_idx in 1..dirty_pages {
+            let page_no = txn.allocate_page(&cx).unwrap();
+            let fill = u8::try_from((page_idx % 251) + 1).unwrap();
+            txn.write_page(&cx, page_no, &vec![fill; page_bytes])
+                .unwrap();
+        }
+        (cx, txn)
+    }
+
+    fn track_c_measure_commit_ns(mode: TrackCBatchMode, dirty_pages: usize) -> Vec<u64> {
+        let total_iters = TRACK_C_BATCH_BENCH_WARMUP_ITERS + TRACK_C_BATCH_BENCH_MEASURE_ITERS;
+        let mut samples = Vec::with_capacity(TRACK_C_BATCH_BENCH_MEASURE_ITERS);
+
+        for iter_idx in 0..total_iters {
+            let (cx, mut txn) = track_c_prepared_commit(mode, dirty_pages);
+            let started = Instant::now();
+            txn.commit(&cx).unwrap();
+            if iter_idx >= TRACK_C_BATCH_BENCH_WARMUP_ITERS {
+                let elapsed_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                samples.push(elapsed_ns);
+            }
+        }
+
+        samples
+    }
+
+    fn track_c_percentile_ns(sorted_samples: &[u64], percentile: usize) -> u64 {
+        let last_idx = sorted_samples.len().saturating_sub(1);
+        let rank = last_idx.saturating_mul(percentile).div_ceil(100);
+        sorted_samples[rank]
+    }
+
+    fn track_c_sample_summary(samples: &[u64]) -> serde_json::Value {
+        let mut sorted = samples.to_vec();
+        sorted.sort_unstable();
+        let total_ns: u128 = sorted.iter().map(|value| u128::from(*value)).sum();
+        let mean_ns = (total_ns as f64) / (sorted.len() as f64);
+
+        json!({
+            "sample_count": sorted.len(),
+            "min_ns": sorted.first().copied().unwrap_or(0),
+            "median_ns": track_c_percentile_ns(&sorted, 50),
+            "p95_ns": track_c_percentile_ns(&sorted, 95),
+            "max_ns": sorted.last().copied().unwrap_or(0),
+            "mean_ns": mean_ns,
+            "raw_samples_ns": sorted,
+        })
     }
 
     impl crate::traits::WalBackend for MockWalBackend {
@@ -4840,6 +5044,67 @@ mod tests {
             new_page.get(),
             "bead_id={BEAD_ID} case=wal_batch_append_commit_marker_last"
         );
+    }
+
+    #[test]
+    #[ignore = "benchmark evidence only"]
+    fn wal_commit_batch_benchmark_report() {
+        let cases: Vec<_> = TRACK_C_BATCH_BENCH_CASES
+            .iter()
+            .map(|(scenario_id, dirty_pages)| {
+                let single_samples =
+                    track_c_measure_commit_ns(TrackCBatchMode::SingleFrame, *dirty_pages);
+                let batch_samples =
+                    track_c_measure_commit_ns(TrackCBatchMode::Batched, *dirty_pages);
+
+                let single_summary = track_c_sample_summary(&single_samples);
+                let batch_summary = track_c_sample_summary(&batch_samples);
+                let single_median = single_summary["median_ns"].as_u64().unwrap_or(0);
+                let batch_median = batch_summary["median_ns"].as_u64().unwrap_or(0);
+                let single_mean = single_summary["mean_ns"].as_f64().unwrap_or(0.0);
+                let batch_mean = batch_summary["mean_ns"].as_f64().unwrap_or(0.0);
+
+                json!({
+                    "scenario_id": scenario_id,
+                    "dirty_pages": dirty_pages,
+                    "single_frame": single_summary,
+                    "batch_append": batch_summary,
+                    "speedup_vs_single_median": if batch_median == 0 {
+                        0.0
+                    } else {
+                        (single_median as f64) / (batch_median as f64)
+                    },
+                    "speedup_vs_single_mean": if batch_mean == 0.0 {
+                        0.0
+                    } else {
+                        single_mean / batch_mean
+                    },
+                    "faster_variant_by_median": if batch_median <= single_median {
+                        "batch_append"
+                    } else {
+                        "single_frame"
+                    },
+                })
+            })
+            .collect();
+
+        let report = json!({
+            "schema_version": "fsqlite.track_c.batch_commit_benchmark.v1",
+            "bead_id": TRACK_C_BATCH_BENCH_BEAD_ID,
+            "parent_bead_id": "bd-db300.3.1",
+            "measured_operation": "pager_commit_wal_path",
+            "warmup_iterations": TRACK_C_BATCH_BENCH_WARMUP_ITERS,
+            "measurement_iterations": TRACK_C_BATCH_BENCH_MEASURE_ITERS,
+            "vfs": "memory",
+            "sync_mode": "normal_noop_memory_vfs",
+            "baseline_variant": "single_frame_append_loop",
+            "candidate_variant": "transaction_wide_batch_append",
+            "cases": cases,
+        });
+
+        println!("BEGIN_BD_DB300_3_1_4_REPORT");
+        println!("{}", serde_json::to_string_pretty(&report).unwrap());
+        println!("END_BD_DB300_3_1_4_REPORT");
     }
 
     #[test]

@@ -8,6 +8,7 @@
 
 pub mod baseline;
 pub mod batch_runner;
+pub mod beads_benchmark_campaign;
 pub mod bench_summary;
 pub mod benchmark;
 pub mod canonicalize;

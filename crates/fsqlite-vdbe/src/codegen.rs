@@ -1160,6 +1160,7 @@ pub fn codegen_select(
             index_cursor_to_close = Some(idx_cursor);
             let full_scan_fallback = b.emit_label();
             let duplicate_run_done = b.emit_label();
+            let where_placeholder_base = b.current_anon_placeholder();
 
             // Allocate param_reg and min_rowid_reg as contiguous pair for MakeRecord.
             let param_reg = b.alloc_regs(2);
@@ -1270,6 +1271,9 @@ pub fn codegen_select(
             b.emit_jump_to_label(Opcode::Rewind, cursor, 0, done_label, P4::None, 0);
             let skip_label = b.emit_label();
             if let Some(where_expr) = where_clause.as_deref() {
+                // Reuse the original bind slots when the planner falls back
+                // from the indexed probe to the original WHERE filter.
+                b.set_next_anon_placeholder(where_placeholder_base);
                 emit_where_filter(
                     b,
                     where_expr,

@@ -1,0 +1,119 @@
+# Leapfrog Exit Criteria Contract v1
+#
+# Bead: bd-db300.7.3
+# This file is both the decision record and the executable contract for
+# claiming meaningful progress toward leapfrogging SQLite on the canonical
+# Beads benchmark matrix. The claim is intentionally fail-able: the
+# recommended pinned profile must show a repeatable concurrency win, and the
+# baseline/adversarial placements must still avoid catastrophic regression.
+
+[meta]
+schema_version = "fsqlite-harness.leapfrog_exit_criteria.v1"
+policy_id = "leapfrog-exit-criteria.v1"
+bead_id = "bd-db300.7.3"
+track_id = "bd-db300.7"
+generated_at = "2026-03-10"
+owner = "SilverGrove"
+decision_summary = "A leapfrog claim requires a repeatable recommended-profile win against SQLite plus bounded non-catastrophic behavior on baseline and adversarial placements."
+rationale = "The gate must fail when throughput gains are produced by retry storms, tail-latency collapse, weak CPU occupancy, or topology-sensitive fragility."
+
+[campaign]
+manifest_path = "sample_sqlite_db_files/manifests/beads_benchmark_campaign.v1.json"
+required_modes = ["sqlite_reference", "fsqlite_mvcc", "fsqlite_single_writer"]
+required_placement_profiles = ["baseline_unpinned", "recommended_pinned", "adversarial_cross_node"]
+required_cell_suffixes = ["c1", "c4", "c8"]
+
+[scorecard]
+recommended_profile_id = "recommended_pinned"
+baseline_profile_id = "baseline_unpinned"
+adversarial_profile_id = "adversarial_cross_node"
+claim_language = "Only say FrankenSQLite 'leapfrogs SQLite' when every c1/c4/c8 gate passes on recommended_pinned and the baseline_unpinned/adversarial_cross_node catastrophic floors still hold."
+claim_forbidden_when_any_fail = true
+
+[[cell_gates]]
+cell = "c1"
+goal = "Contain single-worker overhead while keeping retries, tails, and responsiveness disciplined."
+recommended_min_throughput_ratio_vs_sqlite = 1.05
+baseline_catastrophic_floor_ratio_vs_sqlite = 0.95
+adversarial_catastrophic_floor_ratio_vs_sqlite = 0.90
+max_retry_rate = 0.01
+min_cpu_utilization_pct = 45.0
+max_p50_latency_ratio_vs_sqlite = 1.10
+max_p95_latency_ratio_vs_sqlite = 1.20
+max_p99_latency_ratio_vs_sqlite = 1.30
+max_responsiveness_regression_ratio_vs_sqlite = 1.15
+max_topology_reassignments_per_run = 2
+
+[[cell_gates]]
+cell = "c4"
+goal = "Show a clear many-core win on the recommended pinned profile without turning baseline or adversarial placements into pathological retry or tail regimes."
+recommended_min_throughput_ratio_vs_sqlite = 1.25
+baseline_catastrophic_floor_ratio_vs_sqlite = 0.90
+adversarial_catastrophic_floor_ratio_vs_sqlite = 0.80
+max_retry_rate = 0.03
+min_cpu_utilization_pct = 60.0
+max_p50_latency_ratio_vs_sqlite = 1.15
+max_p95_latency_ratio_vs_sqlite = 1.30
+max_p99_latency_ratio_vs_sqlite = 1.45
+max_responsiveness_regression_ratio_vs_sqlite = 1.20
+max_topology_reassignments_per_run = 6
+
+[[cell_gates]]
+cell = "c8"
+goal = "Earn the headline claim by sustaining an obvious concurrency win on recommended_pinned while proving the worst placement still avoids catastrophic collapse."
+recommended_min_throughput_ratio_vs_sqlite = 1.50
+baseline_catastrophic_floor_ratio_vs_sqlite = 0.85
+adversarial_catastrophic_floor_ratio_vs_sqlite = 0.75
+max_retry_rate = 0.05
+min_cpu_utilization_pct = 70.0
+max_p50_latency_ratio_vs_sqlite = 1.20
+max_p95_latency_ratio_vs_sqlite = 1.40
+max_p99_latency_ratio_vs_sqlite = 1.60
+max_responsiveness_regression_ratio_vs_sqlite = 1.30
+max_topology_reassignments_per_run = 10
+
+[verification_plan]
+unit_tests = [
+  "test_bd_db300_7_3_contract_schema_and_links",
+  "test_bd_db300_7_3_required_campaign_surface_exists",
+  "test_bd_db300_7_3_cell_targets_are_monotone",
+  "test_bd_db300_7_3_verification_plan_is_actionable",
+]
+e2e_scenarios = [
+  "commutative_inserts_disjoint_keys_c1",
+  "commutative_inserts_disjoint_keys_c4",
+  "commutative_inserts_disjoint_keys_c8",
+  "hot_page_contention_c1",
+  "hot_page_contention_c4",
+  "hot_page_contention_c8",
+  "mixed_read_write_c1",
+  "mixed_read_write_c4",
+  "mixed_read_write_c8",
+]
+logging_artifacts = [
+  "artifacts/{bead_id}/{run_id}/events.jsonl",
+  "artifacts/{bead_id}/{run_id}/manifest.json",
+  "artifacts/{bead_id}/{run_id}/summary.md",
+  "artifacts/{bead_id}/{run_id}/cell_metrics.jsonl",
+  "artifacts/{bead_id}/{run_id}/retry_report.json",
+  "artifacts/{bead_id}/{run_id}/topology.json",
+]
+required_log_fields = [
+  "throughput_ratio_vs_sqlite",
+  "retry_rate",
+  "cpu_utilization_pct",
+  "p50_latency_ratio_vs_sqlite",
+  "p95_latency_ratio_vs_sqlite",
+  "p99_latency_ratio_vs_sqlite",
+  "responsiveness_regression_ratio_vs_sqlite",
+  "topology_reassignments",
+]
+
+[references]
+contract_module = "crates/fsqlite-harness/src/leapfrog_exit_criteria.rs"
+verification_test = "crates/fsqlite-harness/tests/bd_db300_7_3_leapfrog_exit_criteria.rs"
+campaign_matrix_module = "crates/fsqlite-e2e/src/fixture_select.rs"
+score_engine_module = "crates/fsqlite-harness/src/score_engine.rs"
+confidence_gates_module = "crates/fsqlite-harness/src/confidence_gates.rs"
+release_certificate_module = "crates/fsqlite-harness/src/release_certificate.rs"
+verifier_script = "scripts/verify_bd_db300_7_3_leapfrog_exit_criteria.sh"

@@ -40,6 +40,7 @@ pub mod fslab;
 pub mod impact_graph;
 pub mod isomorphism_proof;
 pub mod lane_selector;
+pub mod leapfrog_exit_criteria;
 pub mod lock_txn_parity;
 pub mod log;
 pub mod log_schema_validator;

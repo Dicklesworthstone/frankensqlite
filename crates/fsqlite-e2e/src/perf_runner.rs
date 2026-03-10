@@ -21,17 +21,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use fsqlite_core::connection::{
-    HotPathProfileSnapshot, ParserHotPathProfileSnapshot, hot_path_profile_enabled,
-    hot_path_profile_snapshot, reset_hot_path_profile, set_hot_path_profile_enabled,
+    hot_path_profile_enabled, hot_path_profile_snapshot, reset_hot_path_profile,
+    set_hot_path_profile_enabled, HotPathProfileSnapshot, ParserHotPathProfileSnapshot,
 };
 
-use crate::HarnessSettings;
-use crate::benchmark::{BenchmarkConfig, BenchmarkMeta, BenchmarkSummary, run_benchmark};
+use crate::benchmark::{run_benchmark, BenchmarkConfig, BenchmarkMeta, BenchmarkSummary};
 use crate::fsqlite_executor::run_oplog_fsqlite;
 use crate::oplog::{self, OpLog};
 use crate::report::EngineRunReport;
-use crate::run_workspace::{WorkspaceConfig, create_workspace_with_label};
+use crate::run_workspace::{create_workspace_with_label, WorkspaceConfig};
 use crate::sqlite_executor::run_oplog_sqlite;
+use crate::HarnessSettings;
 
 // ── Configuration ──────────────────────────────────────────────────────
 
@@ -147,6 +147,9 @@ pub const PERF_RESULT_SCHEMA_V1: &str = "fsqlite-e2e.perf_result.v1";
 pub const HOT_PATH_PROFILE_SCHEMA_V1: &str = "fsqlite-e2e.hot_path_profile.v1";
 /// Schema version for hot-path artifact manifests.
 pub const HOT_PATH_PROFILE_MANIFEST_SCHEMA_V1: &str = "fsqlite-e2e.hot_path_profile_manifest.v1";
+/// Schema version for structured D1 actionable hotspot ranking artifacts.
+pub const HOT_PATH_PROFILE_ACTIONABLE_RANKING_SCHEMA_V1: &str =
+    "fsqlite-e2e.hot_path_actionable_ranking.v1";
 /// Bead identifier for the hot-path profiling work.
 pub const HOT_PATH_PROFILE_BEAD_ID: &str = "bd-db300.4.1";
 /// Canonical scenario identifier for the mixed read/write hot path.
@@ -235,6 +238,17 @@ pub struct HotPathRankingEntry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HotPathActionableRankingEntry {
+    pub rank: u32,
+    pub subsystem: String,
+    pub metric_kind: String,
+    pub metric_value: u64,
+    pub rationale: String,
+    pub implication: String,
+    pub mapped_beads: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HotPathAllocatorPressure {
     pub parser_sql_bytes: u64,
     pub decoded_value_heap_bytes_total: u64,
@@ -264,6 +278,24 @@ pub struct HotPathProfileReport {
     pub type_profile: HotPathTypeProfile,
     pub subsystem_ranking: Vec<HotPathRankingEntry>,
     pub allocator_pressure: HotPathAllocatorPressure,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HotPathActionableRanking {
+    pub schema_version: String,
+    pub bead_id: String,
+    pub run_id: String,
+    pub trace_id: String,
+    pub scenario_id: String,
+    pub fixture_id: String,
+    pub workload: String,
+    pub seed: u64,
+    pub scale: u32,
+    pub concurrency: u16,
+    pub replay_command: String,
+    pub named_hotspots: Vec<HotPathActionableRankingEntry>,
+    pub allocator_pressure: Vec<HotPathActionableRankingEntry>,
+    pub top_opcodes: Vec<HotPathOpcodeProfileEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -583,6 +615,7 @@ pub fn profile_fsqlite_mixed_read_write_hot_path(
 
 #[must_use]
 pub fn render_hot_path_profile_markdown(report: &HotPathProfileReport) -> String {
+    let actionable_ranking = build_hot_path_actionable_ranking(report);
     let mut out = String::with_capacity(4096);
     let _ = writeln!(out, "# Mixed Read/Write Hot-Path Profile\n");
     let _ = writeln!(out, "- Bead: `{}`", report.bead_id);
@@ -621,21 +654,31 @@ pub fn render_hot_path_profile_markdown(report: &HotPathProfileReport) -> String
     let _ = writeln!(out);
 
     let _ = writeln!(out, "## Ranked Hotspots\n");
-    for entry in &report.subsystem_ranking {
+    for entry in &actionable_ranking.named_hotspots {
         let _ = writeln!(
             out,
-            "- {}: {}={} ({})",
-            entry.subsystem, entry.metric_kind, entry.metric_value, entry.rationale
+            "- rank {} {}: {}={} -> {} [{}]",
+            entry.rank,
+            entry.subsystem,
+            entry.metric_kind,
+            entry.metric_value,
+            entry.implication,
+            entry.mapped_beads.join(", ")
         );
     }
     let _ = writeln!(out);
 
     let _ = writeln!(out, "## Allocator Pressure\n");
-    for entry in &report.allocator_pressure.ranked_sources {
+    for entry in &actionable_ranking.allocator_pressure {
         let _ = writeln!(
             out,
-            "- {}: {}={} ({})",
-            entry.subsystem, entry.metric_kind, entry.metric_value, entry.rationale
+            "- rank {} {}: {}={} -> {} [{}]",
+            entry.rank,
+            entry.subsystem,
+            entry.metric_kind,
+            entry.metric_value,
+            entry.implication,
+            entry.mapped_beads.join(", ")
         );
     }
     let _ = writeln!(out);
@@ -648,7 +691,124 @@ pub fn render_hot_path_profile_markdown(report: &HotPathProfileReport) -> String
 
     let _ = writeln!(out, "## Replay\n");
     let _ = writeln!(out, "```sh\n{}\n```", report.replay_command);
+    let _ = writeln!(out);
+    let _ = writeln!(out, "## Structured Artifacts\n");
+    let _ = writeln!(out, "- `profile.json` — raw scenario profile");
+    let _ = writeln!(
+        out,
+        "- `actionable_ranking.json` — hotspot-to-bead ledger for D2-D4 handoff"
+    );
+    let _ = writeln!(
+        out,
+        "- `manifest.json` — replay metadata + artifact inventory"
+    );
     out
+}
+
+fn hotspot_implication(subsystem: &str) -> (&'static str, &'static [&'static str]) {
+    match subsystem {
+        "parser_ast_churn" => (
+            "D2 target: parser, AST, and compile churn should be reduced through prepared-artifact reuse.",
+            &["bd-db300.4.2", "bd-db300.4.2.1"],
+        ),
+        "record_decode" => (
+            "D3/D4 target: row decode work is expensive enough to justify scratch-space reuse and copy reduction.",
+            &[
+                "bd-db300.4.3",
+                "bd-db300.4.3.1",
+                "bd-db300.4.4",
+                "bd-db300.4.4.1",
+            ],
+        ),
+        "row_materialization" => (
+            "D2/D3 target: result-row materialization is paying avoidable clone/allocation cost in the mixed hot path.",
+            &["bd-db300.4.2", "bd-db300.4.3"],
+        ),
+        _ => (
+            "Secondary follow-up bucket after the named Track D hotspots.",
+            &[],
+        ),
+    }
+}
+
+fn allocator_implication(subsystem: &str) -> (&'static str, &'static [&'static str]) {
+    match subsystem {
+        "result_row_values" => (
+            "D3 target: emitted result rows are carrying most of the transient heap pressure.",
+            &["bd-db300.4.3", "bd-db300.4.3.2"],
+        ),
+        "record_decode_values" => (
+            "D3/D4 target: decoded record values create enough heap churn to justify scratch buffers and copy reduction.",
+            &["bd-db300.4.3", "bd-db300.4.4"],
+        ),
+        "parser_sql_bytes" => (
+            "D2 target: parse-volume churn is visible and should be reduced with reuse rather than repeated prepare work.",
+            &["bd-db300.4.2", "bd-db300.4.2.1"],
+        ),
+        _ => (
+            "Secondary allocator-pressure source after the named Track D hotspots.",
+            &[],
+        ),
+    }
+}
+
+fn actionable_entry(
+    rank: usize,
+    entry: &HotPathRankingEntry,
+    implication: &'static str,
+    mapped_beads: &'static [&'static str],
+) -> HotPathActionableRankingEntry {
+    HotPathActionableRankingEntry {
+        rank: u32::try_from(rank + 1).unwrap_or(u32::MAX),
+        subsystem: entry.subsystem.clone(),
+        metric_kind: entry.metric_kind.clone(),
+        metric_value: entry.metric_value,
+        rationale: entry.rationale.clone(),
+        implication: implication.to_owned(),
+        mapped_beads: mapped_beads.iter().map(|bead| (*bead).to_owned()).collect(),
+    }
+}
+
+#[must_use]
+pub fn build_hot_path_actionable_ranking(
+    report: &HotPathProfileReport,
+) -> HotPathActionableRanking {
+    let named_hotspots = report
+        .subsystem_ranking
+        .iter()
+        .enumerate()
+        .map(|(rank, entry)| {
+            let (implication, mapped_beads) = hotspot_implication(&entry.subsystem);
+            actionable_entry(rank, entry, implication, mapped_beads)
+        })
+        .collect();
+    let allocator_pressure = report
+        .allocator_pressure
+        .ranked_sources
+        .iter()
+        .enumerate()
+        .map(|(rank, entry)| {
+            let (implication, mapped_beads) = allocator_implication(&entry.subsystem);
+            actionable_entry(rank, entry, implication, mapped_beads)
+        })
+        .collect();
+
+    HotPathActionableRanking {
+        schema_version: HOT_PATH_PROFILE_ACTIONABLE_RANKING_SCHEMA_V1.to_owned(),
+        bead_id: report.bead_id.clone(),
+        run_id: report.run_id.clone(),
+        trace_id: report.trace_id.clone(),
+        scenario_id: report.scenario_id.clone(),
+        fixture_id: report.fixture_id.clone(),
+        workload: report.workload.clone(),
+        seed: report.seed,
+        scale: report.scale,
+        concurrency: report.concurrency,
+        replay_command: report.replay_command.clone(),
+        named_hotspots,
+        allocator_pressure,
+        top_opcodes: report.opcode_profile.iter().take(12).cloned().collect(),
+    }
 }
 
 pub fn write_hot_path_profile_artifacts(
@@ -659,11 +819,16 @@ pub fn write_hot_path_profile_artifacts(
 
     let report_json = serde_json::to_string_pretty(report)
         .map_err(|error| std::io::Error::other(format!("profile JSON: {error}")))?;
+    let actionable_ranking = build_hot_path_actionable_ranking(report);
+    let actionable_ranking_json = serde_json::to_string_pretty(&actionable_ranking)
+        .map_err(|error| std::io::Error::other(format!("actionable ranking JSON: {error}")))?;
     let summary_md = render_hot_path_profile_markdown(report);
 
     let report_path = output_dir.join("profile.json");
+    let actionable_ranking_path = output_dir.join("actionable_ranking.json");
     let summary_path = output_dir.join("summary.md");
     std::fs::write(&report_path, report_json.as_bytes())?;
+    std::fs::write(&actionable_ranking_path, actionable_ranking_json.as_bytes())?;
     std::fs::write(&summary_path, summary_md.as_bytes())?;
 
     let manifest = HotPathArtifactManifest {
@@ -688,6 +853,11 @@ pub fn write_hot_path_profile_artifacts(
                 path: "summary.md".to_owned(),
                 bytes: u64::try_from(summary_md.len()).unwrap_or(u64::MAX),
                 description: "human-readable hotspot ranking summary".to_owned(),
+            },
+            HotPathArtifactFile {
+                path: "actionable_ranking.json".to_owned(),
+                bytes: u64::try_from(actionable_ranking_json.len()).unwrap_or(u64::MAX),
+                description: "structured hotspot-to-bead ledger for D2-D4 handoff".to_owned(),
             },
         ],
     };
@@ -972,16 +1142,12 @@ mod tests {
         assert_eq!(cells.len(), 8);
 
         // Verify all combinations are present.
-        assert!(
-            cells.iter().any(|c| c.engine == Engine::Sqlite3
-                && c.fixture_id == "fix1"
-                && c.concurrency == 1)
-        );
-        assert!(
-            cells.iter().any(|c| c.engine == Engine::Fsqlite
-                && c.fixture_id == "fix2"
-                && c.concurrency == 4)
-        );
+        assert!(cells
+            .iter()
+            .any(|c| c.engine == Engine::Sqlite3 && c.fixture_id == "fix1" && c.concurrency == 1));
+        assert!(cells
+            .iter()
+            .any(|c| c.engine == Engine::Fsqlite && c.fixture_id == "fix2" && c.concurrency == 4));
     }
 
     #[test]
@@ -1110,11 +1276,28 @@ mod tests {
 
         let artifact_dir = tempdir.path().join("artifacts");
         let manifest = write_hot_path_profile_artifacts(&report, &artifact_dir).unwrap();
+        let actionable_ranking: HotPathActionableRanking = serde_json::from_slice(
+            &std::fs::read(artifact_dir.join("actionable_ranking.json")).unwrap(),
+        )
+        .unwrap();
 
         assert_eq!(manifest.schema_version, HOT_PATH_PROFILE_MANIFEST_SCHEMA_V1);
         assert!(artifact_dir.join("profile.json").exists());
         assert!(artifact_dir.join("summary.md").exists());
+        assert!(artifact_dir.join("actionable_ranking.json").exists());
         assert!(artifact_dir.join("manifest.json").exists());
-        assert_eq!(manifest.files.len(), 3);
+        assert_eq!(manifest.files.len(), 4);
+        assert_eq!(
+            actionable_ranking.schema_version,
+            HOT_PATH_PROFILE_ACTIONABLE_RANKING_SCHEMA_V1
+        );
+        assert!(!actionable_ranking.named_hotspots.is_empty());
+        assert!(actionable_ranking
+            .named_hotspots
+            .iter()
+            .flat_map(|entry| entry.mapped_beads.iter())
+            .any(|bead| bead == "bd-db300.4.2"
+                || bead == "bd-db300.4.3"
+                || bead == "bd-db300.4.4"));
     }
 }

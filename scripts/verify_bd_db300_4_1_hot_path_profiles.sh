@@ -1,20 +1,22 @@
 #!/usr/bin/env bash
-# verify_bd_db300_4_1_hot_path_profiles.sh — archived hot-path profile synthesis
+# verify_bd_db300_4_1_hot_path_profiles.sh — inline hot-path profile campaign
 #
-# Rebuilds a structured Track D / D1 report from the existing Beads benchmark
-# workspace under sample_sqlite_db_files/working/beads_bench_20260310.
+# Captures current Track D / D1 evidence from the inline `realdb-e2e hot-profile`
+# path instead of scraping archived `perf.data` files. The script runs the
+# mixed_read_write hot-path profile across the pinned Beads fixture copies in
+# both MVCC and forced single-writer modes, then aggregates the per-run
+# `profile.json` + `actionable_ranking.json` bundles into a bead-level ledger.
 #
 # Outputs:
-#   artifacts/perf/bd-db300.4.1/
+#   artifacts/perf/bd-db300.4.1/inline/
 #     events.jsonl
+#     run_records.jsonl
 #     scenario_profiles.json
 #     actionable_ranking.json
 #     benchmark_context.json
 #     report.json
 #     summary.md
-#     raw/*.perf.report.txt
-#     raw/*.top_symbols.tsv
-#     raw/*.scenario.json
+#     runs/<scenario>__<fixture>/{profile.json,actionable_ranking.json,summary.md,manifest.json}
 
 set -euo pipefail
 
@@ -22,19 +24,27 @@ WORKSPACE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BEAD_ID="bd-db300.4.1"
 RUN_ID="${BEAD_ID}-$(date -u +%Y%m%dT%H%M%SZ)-$$"
 GENERATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-BENCH_ROOT_DEFAULT="${WORKSPACE_ROOT}/sample_sqlite_db_files/working/beads_bench_20260310"
-BENCH_ROOT="${BENCH_ROOT:-${BENCH_ROOT_DEFAULT}}"
-OUTPUT_DIR="${OUTPUT_DIR:-${WORKSPACE_ROOT}/artifacts/perf/${BEAD_ID}}"
-RAW_DIR="${OUTPUT_DIR}/raw"
+GOLDEN_DIR_DEFAULT="${WORKSPACE_ROOT}/sample_sqlite_db_files/working/beads_bench_20260310/golden"
+GOLDEN_DIR="${GOLDEN_DIR:-${GOLDEN_DIR_DEFAULT}}"
+OUTPUT_DIR="${OUTPUT_DIR:-${WORKSPACE_ROOT}/artifacts/perf/${BEAD_ID}/inline}"
+RUNS_DIR="${OUTPUT_DIR}/runs"
 LOG_FILE="${OUTPUT_DIR}/events.jsonl"
+RUN_RECORDS_JSONL="${OUTPUT_DIR}/run_records.jsonl"
 SCENARIO_PROFILES_JSON="${OUTPUT_DIR}/scenario_profiles.json"
 ACTIONABLE_RANKING_JSON="${OUTPUT_DIR}/actionable_ranking.json"
 BENCHMARK_CONTEXT_JSON="${OUTPUT_DIR}/benchmark_context.json"
 REPORT_JSON="${OUTPUT_DIR}/report.json"
 SUMMARY_MD="${OUTPUT_DIR}/summary.md"
+WORKLOAD_ID="mixed_read_write"
+CONCURRENCY="${CONCURRENCY:-4}"
+SEED="${SEED:-42}"
+SCALE="${SCALE:-50}"
+CARGO_PROFILE="${CARGO_PROFILE:-release-perf}"
+RCH_TARGET_DIR="${RCH_TARGET_DIR:-/tmp/rch_target_bd_db300_4_1}"
 
-mkdir -p "${RAW_DIR}"
+mkdir -p "${RUNS_DIR}"
 : > "${LOG_FILE}"
+: > "${RUN_RECORDS_JSONL}"
 
 log_event() {
     local level="$1"
@@ -45,332 +55,398 @@ log_event() {
         >> "${LOG_FILE}"
 }
 
+fail() {
+    local stage="$1"
+    local message="$2"
+    log_event "ERROR" "${stage}" "${message}"
+    echo "ERROR: ${message}" >&2
+    exit 1
+}
+
+require_dir() {
+    local path="$1"
+    [[ -d "${path}" ]] || fail "inputs" "missing required directory: ${path}"
+}
+
 require_file() {
     local path="$1"
-    if [[ ! -f "${path}" ]]; then
-        log_event "ERROR" "inputs" "missing required input: ${path}"
-        echo "ERROR: missing required input: ${path}" >&2
-        exit 1
+    [[ -f "${path}" ]] || fail "inputs" "missing required file: ${path}"
+}
+
+mode_cli_flag() {
+    local mode_id="$1"
+    case "${mode_id}" in
+        mvcc) printf '%s\n' "--mvcc" ;;
+        single_writer) printf '%s\n' "--no-mvcc" ;;
+        *) fail "inputs" "unsupported mode id: ${mode_id}" ;;
+    esac
+}
+
+mode_engine_label() {
+    local mode_id="$1"
+    case "${mode_id}" in
+        mvcc) printf '%s\n' "fsqlite_mvcc" ;;
+        single_writer) printf '%s\n' "fsqlite_single_writer" ;;
+        *) fail "inputs" "unsupported mode id: ${mode_id}" ;;
+    esac
+}
+
+scenario_id_for_mode() {
+    local mode_id="$1"
+    printf '%s_c%s_%s\n' "${mode_id}" "${CONCURRENCY}" "${WORKLOAD_ID}"
+}
+
+discover_fixture_ids() {
+    if [[ -n "${FIXTURE_IDS:-}" ]]; then
+        tr ',' '\n' <<< "${FIXTURE_IDS}" | sed '/^$/d'
+        return
     fi
+
+    find "${GOLDEN_DIR}" -maxdepth 1 -type f -name '*.db' -printf '%f\n' \
+        | sed 's/\.db$//' \
+        | sort
 }
 
-json_string() {
-    jq -Rn --arg value "$1" '$value'
+discover_mode_ids() {
+    if [[ -n "${MODE_IDS:-}" ]]; then
+        tr ',' '\n' <<< "${MODE_IDS}" | sed '/^$/d'
+        return
+    fi
+
+    printf '%s\n' mvcc single_writer
 }
 
-top_symbols_from_perf() {
-    local perf_data="$1"
-    local report_txt="$2"
-    local tsv_out="$3"
+capture_run_record() {
+    local scenario_id="$1"
+    local fixture_id="$2"
+    local mode_id="$3"
+    local scenario_dir="$4"
+    local stdout_log="$5"
+    local stderr_log="$6"
 
-    perf report --stdio --no-children -F overhead,symbol,dso -t '|' \
-        -i "${perf_data}" --percent-limit 0.1 > "${report_txt}"
-
-    awk -F'|' '
-        /^[[:space:]]*[0-9]+\.[0-9]+%[[:space:]]*\|/ {
-            pct = $1;
-            sym = $2;
-            dso = $3;
-            gsub(/^[[:space:]]+|[[:space:]]+$/, "", pct);
-            gsub(/^[[:space:]]+|[[:space:]]+$/, "", sym);
-            gsub(/^[[:space:]]+|[[:space:]]+$/, "", dso);
-            sub(/%$/, "", pct);
-            print pct "\t" sym "\t" dso;
+    jq -n \
+        --arg scenario_id "${scenario_id}" \
+        --arg fixture_id "${fixture_id}" \
+        --arg mode_id "${mode_id}" \
+        --arg workload "${WORKLOAD_ID}" \
+        --arg output_dir "${scenario_dir}" \
+        --arg stdout_log "${stdout_log}" \
+        --arg stderr_log "${stderr_log}" \
+        --arg engine_label "$(mode_engine_label "${mode_id}")" \
+        --arg golden_dir "${GOLDEN_DIR}" \
+        --arg cargo_profile "${CARGO_PROFILE}" \
+        --argjson concurrency "${CONCURRENCY}" \
+        --argjson seed "${SEED}" \
+        --argjson scale "${SCALE}" \
+        --slurpfile profile "${scenario_dir}/profile.json" \
+        --slurpfile actionable_ranking "${scenario_dir}/actionable_ranking.json" \
+        --slurpfile manifest "${scenario_dir}/manifest.json" \
+        '
+        {
+            scenario_id: $scenario_id,
+            fixture_id: $fixture_id,
+            mode_id: $mode_id,
+            engine_label: $engine_label,
+            workload: $workload,
+            concurrency: $concurrency,
+            seed: $seed,
+            scale: $scale,
+            cargo_profile: $cargo_profile,
+            golden_dir: $golden_dir,
+            output_dir: $output_dir,
+            stdout_log: $stdout_log,
+            stderr_log: $stderr_log,
+            profile: $profile[0],
+            actionable_ranking: $actionable_ranking[0],
+            manifest: $manifest[0]
         }
-    ' "${report_txt}" > "${tsv_out}"
+        ' >> "${RUN_RECORDS_JSONL}"
+}
+
+run_hot_profile() {
+    local fixture_id="$1"
+    local mode_id="$2"
+    local scenario_id
+    scenario_id="$(scenario_id_for_mode "${mode_id}")"
+    local scenario_dir="${RUNS_DIR}/${scenario_id}__${fixture_id}"
+    local stdout_log="${scenario_dir}/stdout.log"
+    local stderr_log="${scenario_dir}/stderr.log"
+    local cli_flag
+    cli_flag="$(mode_cli_flag "${mode_id}")"
+
+    mkdir -p "${scenario_dir}"
+    log_event "INFO" "run" "starting ${scenario_id} fixture=${fixture_id} mode=${mode_id}"
+
+    if ! rch exec -- env CARGO_TARGET_DIR="${RCH_TARGET_DIR}" cargo run \
+        -p fsqlite-e2e \
+        --profile "${CARGO_PROFILE}" \
+        --bin realdb-e2e \
+        -- hot-profile \
+        --golden-dir "${GOLDEN_DIR}" \
+        --db "${fixture_id}" \
+        --concurrency "${CONCURRENCY}" \
+        --seed "${SEED}" \
+        --scale "${SCALE}" \
+        --output-dir "${scenario_dir}" \
+        "${cli_flag}" \
+        > "${stdout_log}" \
+        2> "${stderr_log}"; then
+        fail "run" "hot-profile failed for fixture=${fixture_id} mode=${mode_id}; see ${stderr_log}"
+    fi
+
+    require_file "${scenario_dir}/profile.json"
+    require_file "${scenario_dir}/actionable_ranking.json"
+    require_file "${scenario_dir}/summary.md"
+    require_file "${scenario_dir}/manifest.json"
+    capture_run_record "${scenario_id}" "${fixture_id}" "${mode_id}" "${scenario_dir}" "${stdout_log}" "${stderr_log}"
+    log_event "INFO" "run" "completed ${scenario_id} fixture=${fixture_id} mode=${mode_id}"
+}
+
+build_scenario_profiles() {
+    jq -s \
+        --arg bead_id "${BEAD_ID}" \
+        --arg run_id "${RUN_ID}" \
+        --arg generated_at "${GENERATED_AT}" \
+        --arg golden_dir "${GOLDEN_DIR}" \
+        --arg workload "${WORKLOAD_ID}" \
+        '
+        {
+            schema_version: "fsqlite-e2e.hot_path_campaign_scenarios.v1",
+            bead_id: $bead_id,
+            run_id: $run_id,
+            generated_at: $generated_at,
+            golden_dir: $golden_dir,
+            workload: $workload,
+            runs: .
+        }
+        ' "${RUN_RECORDS_JSONL}" > "${SCENARIO_PROFILES_JSON}"
 }
 
 build_benchmark_context() {
-    jq -n \
-        --arg bead_id "${BEAD_ID}" \
-        --arg run_id "${RUN_ID}" \
-        --arg generated_at "${GENERATED_AT}" \
-        '
-        {
-            schema_version: "fsqlite.perf.hot-path-benchmark-context.v1",
-            bead_id: $bead_id,
-            run_id: $run_id,
-            generated_at: $generated_at,
-            scenarios: []
-        }
-        ' > "${BENCHMARK_CONTEXT_JSON}"
-}
-
-append_benchmark_context() {
-    local scenario_id="$1"
-    local mode="$2"
-    local engine="$3"
-    local workload="$4"
-    local concurrency="$5"
-    local bench_jsonl="$6"
-    local bench_sha256="$7"
-
-    local tmp_json
-    tmp_json="$(mktemp)"
     jq -s \
-        --arg scenario_id "${scenario_id}" \
-        --arg mode "${mode}" \
-        --arg engine "${engine}" \
-        --arg workload "${workload}" \
-        --arg concurrency "${concurrency}" \
-        --arg bench_jsonl "${bench_jsonl}" \
-        --arg bench_sha256 "${bench_sha256}" \
+        --arg bead_id "${BEAD_ID}" \
+        --arg run_id "${RUN_ID}" \
+        --arg generated_at "${GENERATED_AT}" \
+        --arg golden_dir "${GOLDEN_DIR}" \
+        --arg workload "${WORKLOAD_ID}" \
         '
-        [
-            .[]
-            | select(.engine == $engine and .workload == $workload and (.concurrency | tostring) == $concurrency)
-        ] as $rows
-        | {
-            scenario_id: $scenario_id,
-            mode: $mode,
-            engine: $engine,
+        {
+            schema_version: "fsqlite-e2e.hot_path_campaign_context.v1",
+            bead_id: $bead_id,
+            run_id: $run_id,
+            generated_at: $generated_at,
+            golden_dir: $golden_dir,
             workload: $workload,
-            concurrency: ($concurrency | tonumber),
-            benchmark_jsonl_path: $bench_jsonl,
-            benchmark_jsonl_sha256: $bench_sha256,
-            fixture_count: ($rows | length),
-            fixture_medians: (
-                $rows
-                | map({
+            runs: [
+                .[] | {
+                    scenario_id,
                     fixture_id,
-                    median_ms: .latency.median_ms,
-                    p95_ms: .latency.p95_ms,
-                    median_ops_per_sec: .throughput.median_ops_per_sec,
-                    measurement_count
-                })
-            ),
-            avg_median_ms: (
-                if ($rows | length) > 0
-                then (($rows | map(.latency.median_ms) | add) / ($rows | length))
-                else null
-                end
-            ),
-            avg_median_ops_per_sec: (
-                if ($rows | length) > 0
-                then (($rows | map(.throughput.median_ops_per_sec) | add) / ($rows | length))
-                else null
-                end
-            )
+                    mode_id,
+                    engine_label,
+                    concurrency,
+                    seed,
+                    scale,
+                    ops_per_sec: .profile.engine_report.ops_per_sec,
+                    wall_time_ms: .profile.engine_report.wall_time_ms,
+                    retries: .profile.engine_report.retries,
+                    aborts: .profile.engine_report.aborts,
+                    error: (.profile.engine_report.error // null),
+                    output_dir
+                }
+            ]
         }
-        ' "${bench_jsonl}" > "${tmp_json}"
-
-    jq \
-        --slurpfile scenario "${tmp_json}" \
-        '.scenarios += $scenario' \
-        "${BENCHMARK_CONTEXT_JSON}" > "${BENCHMARK_CONTEXT_JSON}.tmp"
-    mv "${BENCHMARK_CONTEXT_JSON}.tmp" "${BENCHMARK_CONTEXT_JSON}"
-    rm -f "${tmp_json}"
+        ' "${RUN_RECORDS_JSONL}" > "${BENCHMARK_CONTEXT_JSON}"
 }
 
-build_scenario_json() {
-    local scenario_id="$1"
-    local mode="$2"
-    local label="$3"
-    local analysis_scope="$4"
-    local engine="$5"
-    local workload="$6"
-    local concurrency="$7"
-    local perf_data="$8"
-    local perf_sha256="$9"
-    local bench_jsonl="${10}"
-    local bench_sha256="${11}"
-    local tsv_path="${12}"
-    local scenario_json="${13}"
-
-    jq -Rn \
-        --arg scenario_id "${scenario_id}" \
-        --arg mode "${mode}" \
-        --arg label "${label}" \
-        --arg analysis_scope "${analysis_scope}" \
-        --arg engine "${engine}" \
-        --arg workload "${workload}" \
-        --arg concurrency "${concurrency}" \
-        --arg perf_data "${perf_data}" \
-        --arg perf_sha256 "${perf_sha256}" \
-        --arg bench_jsonl "${bench_jsonl}" \
-        --arg bench_sha256 "${bench_sha256}" \
-        '
-        def classify($marker; $symbol; $dso):
-            if ($marker == "kernel") or ($dso == "[unknown]") then "kernel_unresolved"
-            elif ($symbol | test("_int_malloc|__libc_malloc2|_int_free_chunk|_int_free_merge_chunk|malloc_consolidate|cfree@GLIBC|unlink_chunk")) then "allocator_pressure"
-            elif ($symbol | test("__memmove|memcpy")) then "copy_movement"
-            elif ($symbol | test("fsqlite_types::record::parse_record|fsqlite_types::record::decode_value|core::str::converts::from_utf8")) then "record_decode"
-            elif ($symbol | test("HashMap<i32, fsqlite_vdbe::engine::MemTable|drop_in_place::<fsqlite_vdbe::engine::MemTable>")) then "row_materialization"
-            elif ($symbol | test("fsqlite_parser::|parse_columns_from_create_sql|lexer::|Parser::|planner|codegen")) then "parser_ast_churn"
-            elif ($symbol | test("PagerInner<|read_page_copy|IoUringFile")) then "pager_io"
-            else "other_user_space"
-            end;
-        def opcode_responsibility($category):
-            if $category == "allocator_pressure" then "cross-cutting allocator churn under Column/MakeRecord/materialization paths"
-            elif $category == "copy_movement" then "MakeRecord and row-copy heavy movement around record/cell assembly"
-            elif $category == "record_decode" then "Column and ResultRow decode path (parse_record, decode_value, UTF-8 conversion)"
-            elif $category == "row_materialization" then "Insert/Update/Delete materialization and MemTable clone/drop churn"
-            elif $category == "parser_ast_churn" then "prepare/DDL parse path, not the steady-state opcode hot loop"
-            elif $category == "pager_io" then "OpenRead / page fetch assistance to Column"
-            elif $category == "kernel_unresolved" then "kernel samples hidden by restricted kallsyms"
-            else "uncategorized user-space work"
-            end;
-        [
-            inputs
-            | select(length > 0)
-            | split("\t")
-            | {
-                overhead_pct: (.[0] | tonumber),
-                raw_symbol: .[1],
-                dso: .[2]
-            }
-            | .marker = (
-                if (.raw_symbol | test("^\\[k\\]")) then "kernel"
-                elif (.raw_symbol | test("^\\[\\.\\]")) then "user"
-                else "unknown"
-                end
-            )
-            | .symbol = (.raw_symbol | sub("^\\[[^]]+\\]\\s*"; ""))
-            | .category = classify(.marker; .symbol; .dso)
-            | .opcode_responsibility = opcode_responsibility(.category)
-        ] as $symbols
-        | {
-            schema_version: "fsqlite.perf.hot-path-scenario.v1",
-            scenario_id: $scenario_id,
-            mode: $mode,
-            label: $label,
-            analysis_scope: $analysis_scope,
-            engine: $engine,
-            workload: $workload,
-            concurrency: ($concurrency | tonumber),
-            source_perf_data: $perf_data,
-            source_perf_sha256: $perf_sha256,
-            source_benchmark_jsonl: $bench_jsonl,
-            source_benchmark_sha256: $bench_sha256,
-            reported_entries: ($symbols | length),
-            reported_user_space_overhead_pct: (
-                $symbols
-                | map(select(.category != "kernel_unresolved") | .overhead_pct)
-                | add // 0
-            ),
-            top_symbols: ($symbols | .[:20]),
-            category_totals: (
-                $symbols
-                | sort_by(.category)
-                | group_by(.category)
-                | map({
-                    scenario_id: $scenario_id,
-                    mode: $mode,
-                    category: .[0].category,
-                    opcode_responsibility: .[0].opcode_responsibility,
-                    overhead_pct: (map(.overhead_pct) | add)
-                })
-                | sort_by(-.overhead_pct)
-            )
-        }
-        ' < "${tsv_path}" > "${scenario_json}"
-}
-
-aggregate_actionable_ranking() {
-    jq \
+build_actionable_ranking() {
+    jq -s \
         --arg bead_id "${BEAD_ID}" \
         --arg run_id "${RUN_ID}" \
         --arg generated_at "${GENERATED_AT}" \
         '
+        def named_entries:
+            [ .[] as $run
+              | $run.actionable_ranking.named_hotspots[]
+              | . + {
+                    fixture_id: $run.fixture_id,
+                    mode_id: $run.mode_id,
+                    scenario_id: $run.scenario_id
+                }
+            ];
+        def allocator_entries:
+            [ .[] as $run
+              | $run.actionable_ranking.allocator_pressure[]
+              | . + {
+                    fixture_id: $run.fixture_id,
+                    mode_id: $run.mode_id,
+                    scenario_id: $run.scenario_id
+                }
+            ];
+        def opcode_entries:
+            [ .[] as $run
+              | $run.profile.opcode_profile[]
+              | . + {
+                    fixture_id: $run.fixture_id,
+                    mode_id: $run.mode_id,
+                    scenario_id: $run.scenario_id
+                }
+            ];
         {
-            schema_version: "fsqlite.perf.hot-path-ranking.v1",
+            schema_version: "fsqlite-e2e.hot_path_campaign_ranking.v1",
             bead_id: $bead_id,
             run_id: $run_id,
             generated_at: $generated_at,
-            mixed_hot_path_categories: (
-                .scenarios
-                | map(select(.analysis_scope == "mixed_hot_path"))
-                | map(.category_totals[])
-                | sort_by(.category)
-                | group_by(.category)
+            scenario_count: length,
+            named_hotspots: (
+                named_entries
+                | sort_by(.subsystem)
+                | group_by(.subsystem)
                 | map({
-                    category: .[0].category,
-                    opcode_responsibility: .[0].opcode_responsibility,
-                    avg_overhead_pct: (map(.overhead_pct) | add / length),
-                    max_overhead_pct: (map(.overhead_pct) | max),
-                    scenario_breakdown: map({
-                        scenario_id,
-                        mode,
-                        overhead_pct
-                    }) | sort_by(-.overhead_pct),
-                    implication: (
-                        if .[0].category == "allocator_pressure" then
-                            "Primary D3 target: allocator churn dominates both modes, so reuse/scratch-space work should land before parser-focused reuse."
-                        elif .[0].category == "copy_movement" then
-                            "Primary D4 target: memmove-heavy record/cell movement is the second-largest named user-space cost."
-                        elif .[0].category == "record_decode" then
-                            "D3/D4 target: Column/ResultRow decode and UTF-8 conversion are large enough to justify focused row decode work."
-                        elif .[0].category == "row_materialization" then
-                            "D2/D3 target: MemTable clone/drop churn is measurable and should be removed from ordinary runtime paths."
-                        elif .[0].category == "parser_ast_churn" then
-                            "D2 remains relevant, but parser/AST work is secondary on the mixed hot path compared with allocator/copy/decode pressure."
-                        elif .[0].category == "kernel_unresolved" then
-                            "Do not rank hidden kernel frames; kallsyms are restricted in these archived captures."
-                        else
-                            "Secondary follow-up bucket after the named D2-D4 targets."
-                        end
-                    ),
-                    mapped_beads: (
-                        if .[0].category == "allocator_pressure" then ["bd-db300.4.3", "bd-db300.4.2"]
-                        elif .[0].category == "copy_movement" then ["bd-db300.4.4"]
-                        elif .[0].category == "record_decode" then ["bd-db300.4.3", "bd-db300.4.4"]
-                        elif .[0].category == "row_materialization" then ["bd-db300.4.2", "bd-db300.4.3"]
-                        elif .[0].category == "parser_ast_churn" then ["bd-db300.4.2"]
-                        else []
-                        end
+                    subsystem: .[0].subsystem,
+                    metric_kind: .[0].metric_kind,
+                    avg_metric_value: ((map(.metric_value) | add) / length),
+                    max_metric_value: (map(.metric_value) | max),
+                    run_breakdown: (
+                        map({
+                            fixture_id,
+                            mode_id,
+                            scenario_id,
+                            rank,
+                            metric_value,
+                            rationale,
+                            implication,
+                            mapped_beads
+                        })
+                        | sort_by(.metric_value)
+                        | reverse
                     )
                 })
-                | sort_by(-.avg_overhead_pct)
+                | sort_by(.avg_metric_value)
+                | reverse
                 | to_entries
                 | map(.value + { rank: (.key + 1) })
+            ),
+            allocator_pressure: (
+                allocator_entries
+                | sort_by(.subsystem)
+                | group_by(.subsystem)
+                | map({
+                    subsystem: .[0].subsystem,
+                    metric_kind: .[0].metric_kind,
+                    avg_metric_value: ((map(.metric_value) | add) / length),
+                    max_metric_value: (map(.metric_value) | max),
+                    run_breakdown: (
+                        map({
+                            fixture_id,
+                            mode_id,
+                            scenario_id,
+                            rank,
+                            metric_value,
+                            rationale,
+                            implication,
+                            mapped_beads
+                        })
+                        | sort_by(.metric_value)
+                        | reverse
+                    )
+                })
+                | sort_by(.avg_metric_value)
+                | reverse
+                | to_entries
+                | map(.value + { rank: (.key + 1) })
+            ),
+            top_opcodes: (
+                opcode_entries
+                | sort_by(.opcode)
+                | group_by(.opcode)
+                | map({
+                    opcode: .[0].opcode,
+                    total: (map(.total) | add),
+                    run_breakdown: (
+                        map({
+                            fixture_id,
+                            mode_id,
+                            scenario_id,
+                            total
+                        })
+                        | sort_by(.total)
+                        | reverse
+                    )
+                })
+                | sort_by(.total)
+                | reverse
+                | .[:12]
             )
         }
-        | .actionable_named_categories = (
-            .mixed_hot_path_categories
-            | map(select(.category != "kernel_unresolved" and .category != "other_user_space"))
-            | to_entries
-            | map(.value + { actionable_rank: (.key + 1) })
-        )
-        ' "${SCENARIO_PROFILES_JSON}" > "${ACTIONABLE_RANKING_JSON}"
+        ' "${RUN_RECORDS_JSONL}" > "${ACTIONABLE_RANKING_JSON}"
 }
 
 build_summary_md() {
-    local top_categories
-    top_categories="$(jq -r '
-        .actionable_named_categories[:5]
-        | map("- rank \(.actionable_rank): `\(.category)` avg=\(((.avg_overhead_pct * 100 | round) / 100) | tostring)% max=\(((.max_overhead_pct * 100 | round) / 100) | tostring)% -> \(.implication)")
-        | .[]
-    ' "${ACTIONABLE_RANKING_JSON}")"
-
-    local bench_summary
-    bench_summary="$(jq -r '
-        .scenarios
+    local run_summary
+    run_summary="$(jq -r '
+        .runs
         | map(
-            "- `\(.scenario_id)`: fixtures=\(.fixture_count), avg_median_ms=\((((.avg_median_ms // 0) * 10 | round) / 10) | tostring), avg_median_ops_per_sec=\((((.avg_median_ops_per_sec // 0) * 10 | round) / 10) | tostring)"
+            "- `\(.scenario_id)` / `\(.fixture_id)` / `\(.mode_id)`: ops_per_sec=\(.ops_per_sec), wall_time_ms=\(.wall_time_ms), retries=\(.retries), aborts=\(.aborts)"
           )
         | .[]
     ' "${BENCHMARK_CONTEXT_JSON}")"
 
+    local hotspot_summary
+    hotspot_summary="$(jq -r '
+        .named_hotspots[:5]
+        | map(
+            "- rank \(.rank): `\(.subsystem)` avg=\(.avg_metric_value) \(.metric_kind) max=\(.max_metric_value) -> \(.run_breakdown[0].implication)"
+          )
+        | .[]
+    ' "${ACTIONABLE_RANKING_JSON}")"
+
+    local allocator_summary
+    allocator_summary="$(jq -r '
+        .allocator_pressure[:3]
+        | map(
+            "- rank \(.rank): `\(.subsystem)` avg=\(.avg_metric_value) \(.metric_kind) max=\(.max_metric_value) -> \(.run_breakdown[0].implication)"
+          )
+        | .[]
+    ' "${ACTIONABLE_RANKING_JSON}")"
+
+    local opcode_summary
+    opcode_summary="$(jq -r '
+        .top_opcodes[:8]
+        | map("- `\(.opcode)`: total=\(.total)")
+        | .[]
+    ' "${ACTIONABLE_RANKING_JSON}")"
+
     cat > "${SUMMARY_MD}" <<EOF
-# ${BEAD_ID} Hot-Path Profile Summary
+# ${BEAD_ID} Inline Hot-Path Campaign Summary
 
 - run_id: \`${RUN_ID}\`
 - generated_at: \`${GENERATED_AT}\`
-- benchmark_root: \`${BENCH_ROOT}\`
+- golden_dir: \`${GOLDEN_DIR}\`
 - replay_command: \`bash scripts/verify_bd_db300_4_1_hot_path_profiles.sh\`
-- limitation: archived perf captures have restricted kallsyms, so unresolved kernel frames are excluded from the actionable ranking
+- cargo_profile: \`${CARGO_PROFILE}\`
+- workload: \`${WORKLOAD_ID}\`
+- concurrency: \`${CONCURRENCY}\`
 
-## Benchmark Context
+## Run Context
 
-${bench_summary}
+${run_summary}
 
-## Actionable Ranking
+## Ranked Hotspots
 
-${top_categories}
+${hotspot_summary}
+
+## Allocator Pressure
+
+${allocator_summary}
+
+## Top Opcodes
+
+${opcode_summary}
 
 ## Artifacts
 
 - structured_log: \`${LOG_FILE}\`
+- run_records: \`${RUN_RECORDS_JSONL}\`
 - scenario_profiles: \`${SCENARIO_PROFILES_JSON}\`
 - actionable_ranking: \`${ACTIONABLE_RANKING_JSON}\`
 - benchmark_context: \`${BENCHMARK_CONTEXT_JSON}\`
@@ -378,103 +454,93 @@ ${top_categories}
 EOF
 }
 
-log_event "INFO" "start" "starting archived D1 hot-path synthesis"
+build_report_json() {
+    jq -n \
+        --arg schema_version "fsqlite-e2e.hot_path_campaign_report.v1" \
+        --arg bead_id "${BEAD_ID}" \
+        --arg run_id "${RUN_ID}" \
+        --arg generated_at "${GENERATED_AT}" \
+        --arg golden_dir "${GOLDEN_DIR}" \
+        --arg output_dir "${OUTPUT_DIR}" \
+        --arg replay_command "bash scripts/verify_bd_db300_4_1_hot_path_profiles.sh" \
+        --arg structured_log "${LOG_FILE}" \
+        --arg run_records "${RUN_RECORDS_JSONL}" \
+        --arg scenario_profiles "${SCENARIO_PROFILES_JSON}" \
+        --arg actionable_ranking "${ACTIONABLE_RANKING_JSON}" \
+        --arg benchmark_context "${BENCHMARK_CONTEXT_JSON}" \
+        --arg summary_md "${SUMMARY_MD}" \
+        --arg report_json "${REPORT_JSON}" \
+        --arg workload "${WORKLOAD_ID}" \
+        --arg cargo_profile "${CARGO_PROFILE}" \
+        --argjson concurrency "${CONCURRENCY}" \
+        --argjson seed "${SEED}" \
+        --argjson scale "${SCALE}" \
+        '
+        {
+            schema_version: $schema_version,
+            bead_id: $bead_id,
+            run_id: $run_id,
+            generated_at: $generated_at,
+            workload: $workload,
+            golden_dir: $golden_dir,
+            output_dir: $output_dir,
+            cargo_profile: $cargo_profile,
+            concurrency: $concurrency,
+            seed: $seed,
+            scale: $scale,
+            replay: {
+                command: $replay_command
+            },
+            artifacts: {
+                structured_log: $structured_log,
+                run_records: $run_records,
+                scenario_profiles: $scenario_profiles,
+                actionable_ranking: $actionable_ranking,
+                benchmark_context: $benchmark_context,
+                summary_md: $summary_md,
+                report_json: $report_json
+            },
+            limitations: [
+                "This workflow captures mixed_read_write inline hot-path evidence only.",
+                "Results depend on the pinned Beads working-copy fixtures under the benchmark workspace golden directory."
+            ]
+        }
+        ' > "${REPORT_JSON}"
+}
 
-declare -a SCENARIO_ROWS=(
-    "mvcc_c4_mixed|mvcc|mixed_hot_path|fsqlite_mvcc|mixed_read_write|4|${BENCH_ROOT}/profiles/fsqlite_mvcc_c4_mixed.perf.data|${BENCH_ROOT}/results/after_sort_opt_mvcc_c4_mixed_all3.jsonl|real Beads fixtures / MVCC / c4"
-    "single_c4_mixed|single_writer|mixed_hot_path|fsqlite|mixed_read_write|4|${BENCH_ROOT}/profiles/fsqlite_single_c4_mixed.perf.data|${BENCH_ROOT}/results/retry_executor_c4_single.jsonl|real Beads fixtures / single-writer / c4"
-    "mvcc_c1_disjoint|mvcc|contrast|fsqlite_mvcc|commutative_inserts_disjoint_keys|1|${BENCH_ROOT}/profiles/fsqlite_mvcc_c1_disjoint.perf.data|${BENCH_ROOT}/results/current_c1_disjoint_mvcc_vs_sqlite.jsonl|contrast baseline / MVCC / c1"
-)
+log_event "INFO" "start" "starting inline D1 hot-path campaign"
+require_dir "${GOLDEN_DIR}"
 
-build_benchmark_context
+mapfile -t FIXTURE_IDS_ARRAY < <(discover_fixture_ids)
+mapfile -t MODE_IDS_ARRAY < <(discover_mode_ids)
 
-scenario_json_paths=()
+(( ${#FIXTURE_IDS_ARRAY[@]} > 0 )) || fail "inputs" "no fixture ids discovered under ${GOLDEN_DIR}"
+(( ${#MODE_IDS_ARRAY[@]} > 0 )) || fail "inputs" "no mode ids configured"
 
-for row in "${SCENARIO_ROWS[@]}"; do
-    IFS='|' read -r scenario_id mode analysis_scope engine workload concurrency perf_data bench_jsonl label <<< "${row}"
-    require_file "${perf_data}"
-    require_file "${bench_jsonl}"
+expected_runs=$(( ${#FIXTURE_IDS_ARRAY[@]} * ${#MODE_IDS_ARRAY[@]} ))
+log_event "INFO" "plan" "fixtures=${#FIXTURE_IDS_ARRAY[@]} modes=${#MODE_IDS_ARRAY[@]} expected_runs=${expected_runs}"
 
-    perf_sha256="$(sha256sum "${perf_data}" | awk '{print $1}')"
-    bench_sha256="$(sha256sum "${bench_jsonl}" | awk '{print $1}')"
-    report_txt="${RAW_DIR}/${scenario_id}.perf.report.txt"
-    top_symbols_tsv="${RAW_DIR}/${scenario_id}.top_symbols.tsv"
-    scenario_json="${RAW_DIR}/${scenario_id}.scenario.json"
-
-    log_event "INFO" "perf-report" "rendering ${scenario_id} from ${perf_data}"
-    top_symbols_from_perf "${perf_data}" "${report_txt}" "${top_symbols_tsv}"
-    build_scenario_json \
-        "${scenario_id}" "${mode}" "${label}" "${analysis_scope}" "${engine}" \
-        "${workload}" "${concurrency}" "${perf_data}" "${perf_sha256}" \
-        "${bench_jsonl}" "${bench_sha256}" "${top_symbols_tsv}" "${scenario_json}"
-    append_benchmark_context \
-        "${scenario_id}" "${mode}" "${engine}" "${workload}" "${concurrency}" \
-        "${bench_jsonl}" "${bench_sha256}"
-    scenario_json_paths+=("${scenario_json}")
+for mode_id in "${MODE_IDS_ARRAY[@]}"; do
+    for fixture_id in "${FIXTURE_IDS_ARRAY[@]}"; do
+        run_hot_profile "${fixture_id}" "${mode_id}"
+    done
 done
 
-jq -s \
-    --arg bead_id "${BEAD_ID}" \
-    --arg run_id "${RUN_ID}" \
-    --arg generated_at "${GENERATED_AT}" \
-    '
-    {
-        schema_version: "fsqlite.perf.hot-path-scenarios.v1",
-        bead_id: $bead_id,
-        run_id: $run_id,
-        generated_at: $generated_at,
-        scenarios: .
-    }
-    ' "${scenario_json_paths[@]}" > "${SCENARIO_PROFILES_JSON}"
-
-aggregate_actionable_ranking
+build_scenario_profiles
+build_benchmark_context
+build_actionable_ranking
 build_summary_md
+build_report_json
 
-jq -n \
-    --arg schema_version "fsqlite.perf.hot-path-report.v1" \
-    --arg bead_id "${BEAD_ID}" \
-    --arg run_id "${RUN_ID}" \
-    --arg generated_at "${GENERATED_AT}" \
-    --arg benchmark_root "${BENCH_ROOT}" \
-    --arg replay_command "bash scripts/verify_bd_db300_4_1_hot_path_profiles.sh" \
-    --arg structured_log "${LOG_FILE}" \
-    --arg scenario_profiles "${SCENARIO_PROFILES_JSON}" \
-    --arg actionable_ranking "${ACTIONABLE_RANKING_JSON}" \
-    --arg benchmark_context "${BENCHMARK_CONTEXT_JSON}" \
-    --arg summary_md "${SUMMARY_MD}" \
-    --arg report_json "${REPORT_JSON}" \
-    '
-    {
-        schema_version: $schema_version,
-        bead_id: $bead_id,
-        run_id: $run_id,
-        generated_at: $generated_at,
-        benchmark_root: $benchmark_root,
-        replay: {
-            command: $replay_command
-        },
-        artifacts: {
-            structured_log: $structured_log,
-            scenario_profiles: $scenario_profiles,
-            actionable_ranking: $actionable_ranking,
-            benchmark_context: $benchmark_context,
-            summary_md: $summary_md,
-            report_json: $report_json
-        },
-        limitations: [
-            "perf.data inputs are archived captures rather than newly recorded runs",
-            "kernel frames are partially unresolved because kallsyms are restricted on the source machine"
-        ]
-    }
-    ' > "${REPORT_JSON}"
+jq -e '.runs | length >= 1' "${SCENARIO_PROFILES_JSON}" >/dev/null
+jq -e '.named_hotspots | length >= 1' "${ACTIONABLE_RANKING_JSON}" >/dev/null
+jq -e '.allocator_pressure | length >= 1' "${ACTIONABLE_RANKING_JSON}" >/dev/null
+jq -e '.runs | length == '"${expected_runs}" "${BENCHMARK_CONTEXT_JSON}" >/dev/null
 
-jq -e '.scenarios | length >= 3' "${SCENARIO_PROFILES_JSON}" >/dev/null
-jq -e '.mixed_hot_path_categories | length >= 4' "${ACTIONABLE_RANKING_JSON}" >/dev/null
-jq -e '.scenarios | all(.fixture_count >= 1)' "${BENCHMARK_CONTEXT_JSON}" >/dev/null
-
-log_event "INFO" "complete" "archived D1 hot-path synthesis completed"
+log_event "INFO" "complete" "inline D1 hot-path campaign completed"
 echo "RUN_ID:              ${RUN_ID}"
-echo "Benchmark root:      ${BENCH_ROOT}"
+echo "Golden dir:          ${GOLDEN_DIR}"
+echo "Run records:         ${RUN_RECORDS_JSONL}"
 echo "Scenario profiles:   ${SCENARIO_PROFILES_JSON}"
 echo "Actionable ranking:  ${ACTIONABLE_RANKING_JSON}"
 echo "Benchmark context:   ${BENCHMARK_CONTEXT_JSON}"

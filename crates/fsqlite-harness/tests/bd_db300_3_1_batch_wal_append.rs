@@ -13,16 +13,16 @@ use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use fsqlite_core::wal_adapter::WalBackendAdapter;
-use fsqlite_pager::{JournalMode, SimplePager, TransactionMode};
+use fsqlite_pager::{JournalMode, MvccPager, SimplePager, TransactionMode};
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::VfsOpenFlags;
 use fsqlite_types::{PageNumber, PageSize};
 use fsqlite_vfs::metrics::MetricsSnapshot;
 use fsqlite_vfs::traits::Vfs;
 use fsqlite_vfs::{GLOBAL_VFS_METRICS, MemoryVfs, TracingFile};
+use fsqlite_wal::WalFile;
 use fsqlite_wal::checksum::WalSalts;
 use fsqlite_wal::wal::WalAppendFrameRef;
-use fsqlite_wal::WalFile;
 use serde::Serialize;
 
 const BEAD_ID: &str = "bd-db300.3.1";
@@ -112,15 +112,18 @@ fn verification_context() -> Result<VerificationContext, String> {
     });
     let trace_id =
         std::env::var("BD_DB300_3_1_TRACE_ID").unwrap_or_else(|_| format!("trace-{run_id}"));
-    let scenario_id = std::env::var("BD_DB300_3_1_SCENARIO_ID")
-        .unwrap_or_else(|_| "WAL-BATCH-MATRIX".to_owned());
+    let scenario_id =
+        std::env::var("BD_DB300_3_1_SCENARIO_ID").unwrap_or_else(|_| "WAL-BATCH-MATRIX".to_owned());
     let seed = std::env::var("BD_DB300_3_1_SEED")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(default_seed);
     let artifact_dir = match std::env::var("BD_DB300_3_1_ARTIFACT_DIR") {
         Ok(path) => PathBuf::from(path),
-        Err(_) => workspace_root()?.join("target").join("bd_db300_3_1").join(&run_id),
+        Err(_) => workspace_root()?
+            .join("target")
+            .join("bd_db300_3_1")
+            .join(&run_id),
     };
 
     fs::create_dir_all(&artifact_dir).map_err(|error| {
@@ -312,9 +315,11 @@ fn pager_scenario(dirty_pages: usize) -> Result<PagerScenarioReport, String> {
     let wal_file = tracing_wal_file(&vfs, &cx, &wal_path, true)?;
     let wal = WalFile::create(&cx, wal_file, PAGE_SIZE_U32, 0, wal_salts())
         .map_err(|error| format!("bead_id={BEAD_ID} case=pager_wal_create error={error}"))?;
-    pager.set_wal_backend(Box::new(WalBackendAdapter::new(wal)))
+    pager
+        .set_wal_backend(Box::new(WalBackendAdapter::new(wal)))
         .map_err(|error| format!("bead_id={BEAD_ID} case=set_wal_backend error={error}"))?;
-    pager.set_journal_mode(&cx, JournalMode::Wal)
+    pager
+        .set_journal_mode(&cx, JournalMode::Wal)
         .map_err(|error| format!("bead_id={BEAD_ID} case=set_journal_mode error={error}"))?;
 
     let page_size = PageSize::DEFAULT.as_usize();
@@ -414,9 +419,7 @@ fn test_e2e_bd_db300_3_1_batch_wal_append_verification() -> Result<(), String> {
             eprintln!(
                 "WARN bead_id={BEAD_ID} phase=low_level scenario_id={} \
                  batch_elapsed_ns={} single_elapsed_ns={} note=batch_slower_in_memory_run",
-                scenario.scenario_id,
-                scenario.batch_elapsed_ns,
-                scenario.single_elapsed_ns
+                scenario.scenario_id, scenario.batch_elapsed_ns, scenario.single_elapsed_ns
             );
         }
         assert!(

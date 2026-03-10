@@ -1,0 +1,351 @@
+{
+  "schema_version": "fsqlite-e2e.beads_benchmark_campaign.v1",
+  "campaign_id": "bd-db300.1.2",
+  "title": "Canonical Beads benchmark matrix for many-core Track A work",
+  "working_benchmark_root_relpath": "sample_sqlite_db_files/working/beads_bench_20260310",
+  "beads_data_relpath": ".beads/issues.jsonl",
+  "fixtures": [
+    {
+      "fixture_id": "frankensqlite",
+      "source_path": "/data/projects/frankensqlite/.beads/beads.db",
+      "source_sha256": "054194ca48d1334769f6c0277eaa2d51adb6fdbd481c1a67ae3d254f486210bc",
+      "source_size_bytes": 11649024,
+      "working_copy_relpath": "sample_sqlite_db_files/working/beads_bench_20260310/golden/frankensqlite_beads.db",
+      "working_copy_sha256": "c0ff9da1fcd3c1fa06cc9d16e60d0d49bc817a3142ddd8472495612adc6a86c7",
+      "working_copy_size_bytes": 10862592,
+      "page_size": 4096,
+      "journal_mode": "wal",
+      "capture_rule": "Run benchmarks from the pinned working copy under beads_bench_20260310; only refresh it via an explicit re-capture that records both source and working-copy digests."
+    },
+    {
+      "fixture_id": "frankentui",
+      "source_path": "/data/projects/frankentui/.beads/beads.db",
+      "source_sha256": "51e77b138e13044d5eef477f6847a69541c3c57519a476020a2c1ef3307fd593",
+      "source_size_bytes": 18612224,
+      "working_copy_relpath": "sample_sqlite_db_files/working/beads_bench_20260310/golden/frankentui_beads.db",
+      "working_copy_sha256": "04de3b4fcfed577b65d5aab62d570b9d91164ec3928f8efd1733eefee024b1bb",
+      "working_copy_size_bytes": 18612224,
+      "page_size": 4096,
+      "journal_mode": "wal",
+      "capture_rule": "Run benchmarks from the pinned working copy under beads_bench_20260310; only refresh it via an explicit re-capture that records both source and working-copy digests."
+    },
+    {
+      "fixture_id": "frankensearch",
+      "source_path": "/data/projects/frankensearch/.beads/beads.db",
+      "source_sha256": "3804264af40b7ef58cab0379027c360d4ac92c5ecb2035c8153c643c68a67a4d",
+      "source_size_bytes": 7868416,
+      "working_copy_relpath": "sample_sqlite_db_files/working/beads_bench_20260310/golden/frankensearch_beads.db",
+      "working_copy_sha256": "6ffafcc67d1c73c5d3124eeddd3650031a4eb6d5807b3271b4ad50731f761266",
+      "working_copy_size_bytes": 7868416,
+      "page_size": 4096,
+      "journal_mode": "wal",
+      "capture_rule": "Run benchmarks from the pinned working copy under beads_bench_20260310; only refresh it via an explicit re-capture that records both source and working-copy digests."
+    }
+  ],
+  "placement_profiles": [
+    {
+      "id": "baseline_unpinned",
+      "kind": "baseline",
+      "description": "Scheduler-default placement with no taskset/numactl overrides. This is the honest portable baseline for claims that should survive a generic host.",
+      "command_hint": "Run directly without affinity or memory-placement overrides.",
+      "availability": "universal"
+    },
+    {
+      "id": "recommended_pinned",
+      "kind": "recommended_pinned",
+      "description": "Pin workers to dedicated non-SMT cores inside one NUMA node or LLC when topology permits. This is the recommended profile for transferable many-core claims.",
+      "command_hint": "Use taskset/numactl to pin workers to sibling-free cores in one locality domain and keep memory local.",
+      "availability": "topology_aware"
+    },
+    {
+      "id": "adversarial_cross_node",
+      "kind": "adversarial_topology",
+      "description": "Deliberately spread workers across NUMA nodes or CCD boundaries to surface remote ownership, wake, and cache-line movement penalties.",
+      "command_hint": "Use taskset/numactl to place workers across nodes or CCDs instead of one locality domain.",
+      "availability": "topology_aware"
+    }
+  ],
+  "hardware_classes": [
+    {
+      "id": "linux_x86_64_any",
+      "arch": "x86_64",
+      "min_logical_cores": 4,
+      "min_numa_nodes": null,
+      "description": "Generic Linux x86_64 host suitable for baseline scheduler-default comparisons."
+    },
+    {
+      "id": "linux_x86_64_many_core_numa",
+      "arch": "x86_64",
+      "min_logical_cores": 16,
+      "min_numa_nodes": 2,
+      "description": "Many-core Linux x86_64 host with NUMA or CCD boundaries suitable for pinned and adversarial topology evidence."
+    }
+  ],
+  "retry_policies": [
+    {
+      "id": "instrumented_busy_retry_v1",
+      "max_busy_retries": 10000,
+      "busy_backoff_ms": 1,
+      "busy_backoff_max_ms": 250,
+      "notes": "Matches the current SqliteExecConfig::default() and FsqliteExecConfig::default() retry/backoff contract used by benchmark runs."
+    }
+  ],
+  "build_profiles": [
+    {
+      "id": "release_perf",
+      "cargo_profile": "release-perf",
+      "cargo_args": [
+        "--profile",
+        "release-perf"
+      ],
+      "notes": "Canonical build profile for many-core performance evidence in Track A."
+    }
+  ],
+  "seed_policies": [
+    {
+      "id": "fixed_seed_42",
+      "kind": "fixed",
+      "base_seed": 42,
+      "notes": "Keep workload generation deterministic across engines, placements, fixtures, and reruns."
+    }
+  ],
+  "matrix_rows": [
+    {
+      "row_id": "commutative_inserts_disjoint_keys_c1",
+      "fixtures": ["frankensqlite", "frankentui", "frankensearch"],
+      "workload": "commutative_inserts_disjoint_keys",
+      "concurrency": 1,
+      "modes": ["sqlite_reference", "fsqlite_mvcc", "fsqlite_single_writer"],
+      "placement_variants": [
+        {
+          "placement_profile_id": "baseline_unpinned",
+          "hardware_class_id": "linux_x86_64_any",
+          "required": true
+        },
+        {
+          "placement_profile_id": "recommended_pinned",
+          "hardware_class_id": "linux_x86_64_many_core_numa",
+          "required": true
+        }
+      ],
+      "retry_policy_id": "instrumented_busy_retry_v1",
+      "build_profile_id": "release_perf",
+      "seed_policy_id": "fixed_seed_42"
+    },
+    {
+      "row_id": "commutative_inserts_disjoint_keys_c4",
+      "fixtures": ["frankensqlite", "frankentui", "frankensearch"],
+      "workload": "commutative_inserts_disjoint_keys",
+      "concurrency": 4,
+      "modes": ["sqlite_reference", "fsqlite_mvcc", "fsqlite_single_writer"],
+      "placement_variants": [
+        {
+          "placement_profile_id": "baseline_unpinned",
+          "hardware_class_id": "linux_x86_64_any",
+          "required": true
+        },
+        {
+          "placement_profile_id": "recommended_pinned",
+          "hardware_class_id": "linux_x86_64_many_core_numa",
+          "required": true
+        },
+        {
+          "placement_profile_id": "adversarial_cross_node",
+          "hardware_class_id": "linux_x86_64_many_core_numa",
+          "required": true
+        }
+      ],
+      "retry_policy_id": "instrumented_busy_retry_v1",
+      "build_profile_id": "release_perf",
+      "seed_policy_id": "fixed_seed_42"
+    },
+    {
+      "row_id": "commutative_inserts_disjoint_keys_c8",
+      "fixtures": ["frankensqlite", "frankentui", "frankensearch"],
+      "workload": "commutative_inserts_disjoint_keys",
+      "concurrency": 8,
+      "modes": ["sqlite_reference", "fsqlite_mvcc", "fsqlite_single_writer"],
+      "placement_variants": [
+        {
+          "placement_profile_id": "baseline_unpinned",
+          "hardware_class_id": "linux_x86_64_any",
+          "required": true
+        },
+        {
+          "placement_profile_id": "recommended_pinned",
+          "hardware_class_id": "linux_x86_64_many_core_numa",
+          "required": true
+        },
+        {
+          "placement_profile_id": "adversarial_cross_node",
+          "hardware_class_id": "linux_x86_64_many_core_numa",
+          "required": true
+        }
+      ],
+      "retry_policy_id": "instrumented_busy_retry_v1",
+      "build_profile_id": "release_perf",
+      "seed_policy_id": "fixed_seed_42"
+    },
+    {
+      "row_id": "hot_page_contention_c1",
+      "fixtures": ["frankensqlite", "frankentui", "frankensearch"],
+      "workload": "hot_page_contention",
+      "concurrency": 1,
+      "modes": ["sqlite_reference", "fsqlite_mvcc", "fsqlite_single_writer"],
+      "placement_variants": [
+        {
+          "placement_profile_id": "baseline_unpinned",
+          "hardware_class_id": "linux_x86_64_any",
+          "required": true
+        },
+        {
+          "placement_profile_id": "recommended_pinned",
+          "hardware_class_id": "linux_x86_64_many_core_numa",
+          "required": true
+        }
+      ],
+      "retry_policy_id": "instrumented_busy_retry_v1",
+      "build_profile_id": "release_perf",
+      "seed_policy_id": "fixed_seed_42"
+    },
+    {
+      "row_id": "hot_page_contention_c4",
+      "fixtures": ["frankensqlite", "frankentui", "frankensearch"],
+      "workload": "hot_page_contention",
+      "concurrency": 4,
+      "modes": ["sqlite_reference", "fsqlite_mvcc", "fsqlite_single_writer"],
+      "placement_variants": [
+        {
+          "placement_profile_id": "baseline_unpinned",
+          "hardware_class_id": "linux_x86_64_any",
+          "required": true
+        },
+        {
+          "placement_profile_id": "recommended_pinned",
+          "hardware_class_id": "linux_x86_64_many_core_numa",
+          "required": true
+        },
+        {
+          "placement_profile_id": "adversarial_cross_node",
+          "hardware_class_id": "linux_x86_64_many_core_numa",
+          "required": true
+        }
+      ],
+      "retry_policy_id": "instrumented_busy_retry_v1",
+      "build_profile_id": "release_perf",
+      "seed_policy_id": "fixed_seed_42"
+    },
+    {
+      "row_id": "hot_page_contention_c8",
+      "fixtures": ["frankensqlite", "frankentui", "frankensearch"],
+      "workload": "hot_page_contention",
+      "concurrency": 8,
+      "modes": ["sqlite_reference", "fsqlite_mvcc", "fsqlite_single_writer"],
+      "placement_variants": [
+        {
+          "placement_profile_id": "baseline_unpinned",
+          "hardware_class_id": "linux_x86_64_any",
+          "required": true
+        },
+        {
+          "placement_profile_id": "recommended_pinned",
+          "hardware_class_id": "linux_x86_64_many_core_numa",
+          "required": true
+        },
+        {
+          "placement_profile_id": "adversarial_cross_node",
+          "hardware_class_id": "linux_x86_64_many_core_numa",
+          "required": true
+        }
+      ],
+      "retry_policy_id": "instrumented_busy_retry_v1",
+      "build_profile_id": "release_perf",
+      "seed_policy_id": "fixed_seed_42"
+    },
+    {
+      "row_id": "mixed_read_write_c1",
+      "fixtures": ["frankensqlite", "frankentui", "frankensearch"],
+      "workload": "mixed_read_write",
+      "concurrency": 1,
+      "modes": ["sqlite_reference", "fsqlite_mvcc", "fsqlite_single_writer"],
+      "placement_variants": [
+        {
+          "placement_profile_id": "baseline_unpinned",
+          "hardware_class_id": "linux_x86_64_any",
+          "required": true
+        },
+        {
+          "placement_profile_id": "recommended_pinned",
+          "hardware_class_id": "linux_x86_64_many_core_numa",
+          "required": true
+        }
+      ],
+      "retry_policy_id": "instrumented_busy_retry_v1",
+      "build_profile_id": "release_perf",
+      "seed_policy_id": "fixed_seed_42"
+    },
+    {
+      "row_id": "mixed_read_write_c4",
+      "fixtures": ["frankensqlite", "frankentui", "frankensearch"],
+      "workload": "mixed_read_write",
+      "concurrency": 4,
+      "modes": ["sqlite_reference", "fsqlite_mvcc", "fsqlite_single_writer"],
+      "placement_variants": [
+        {
+          "placement_profile_id": "baseline_unpinned",
+          "hardware_class_id": "linux_x86_64_any",
+          "required": true
+        },
+        {
+          "placement_profile_id": "recommended_pinned",
+          "hardware_class_id": "linux_x86_64_many_core_numa",
+          "required": true
+        },
+        {
+          "placement_profile_id": "adversarial_cross_node",
+          "hardware_class_id": "linux_x86_64_many_core_numa",
+          "required": true
+        }
+      ],
+      "retry_policy_id": "instrumented_busy_retry_v1",
+      "build_profile_id": "release_perf",
+      "seed_policy_id": "fixed_seed_42"
+    },
+    {
+      "row_id": "mixed_read_write_c8",
+      "fixtures": ["frankensqlite", "frankentui", "frankensearch"],
+      "workload": "mixed_read_write",
+      "concurrency": 8,
+      "modes": ["sqlite_reference", "fsqlite_mvcc", "fsqlite_single_writer"],
+      "placement_variants": [
+        {
+          "placement_profile_id": "baseline_unpinned",
+          "hardware_class_id": "linux_x86_64_any",
+          "required": true
+        },
+        {
+          "placement_profile_id": "recommended_pinned",
+          "hardware_class_id": "linux_x86_64_many_core_numa",
+          "required": true
+        },
+        {
+          "placement_profile_id": "adversarial_cross_node",
+          "hardware_class_id": "linux_x86_64_many_core_numa",
+          "required": true
+        }
+      ],
+      "retry_policy_id": "instrumented_busy_retry_v1",
+      "build_profile_id": "release_perf",
+      "seed_policy_id": "fixed_seed_42"
+    }
+  ],
+  "artifact_contract": {
+    "artifact_root_relpath": "artifacts/perf/bd-db300.1.2",
+    "bundle_dir_template": "{row_id}__{fixture_id}__{mode}__{placement_profile_id}__rev_{source_revision}__beads_{beads_hash}",
+    "result_jsonl_name": "results.jsonl",
+    "summary_md_name": "summary.md",
+    "manifest_name": "manifest.json",
+    "logs_dir_name": "logs",
+    "profiles_dir_name": "profiles"
+  }
+}

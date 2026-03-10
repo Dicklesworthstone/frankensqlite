@@ -233,6 +233,17 @@ reproduction.
 
 ### Run the Benchmark Matrix
 
+Track A's canonical many-core Beads campaign is pinned in
+`sample_sqlite_db_files/manifests/beads_benchmark_campaign.v1.json`. That
+manifest freezes the fixture source paths and digests, the pinned working-copy
+fixtures under `sample_sqlite_db_files/working/beads_bench_20260310/golden/`,
+the three benchmark modes (`sqlite_reference`, `fsqlite_mvcc`,
+`fsqlite_single_writer`), the fixed seed policy, the retry/backoff contract,
+the required placement profiles, the hardware-class identifiers, and the stable
+artifact bundle naming template. Future scorecard and verification work should
+treat that file as the source of truth instead of inventing ad hoc matrix rows
+or artifact names.
+
 ```bash
 # Run all presets against all golden copies (full matrix)
 cargo run -p fsqlite-e2e --bin realdb-e2e --release -- bench
@@ -247,6 +258,43 @@ cargo run -p fsqlite-e2e --bin realdb-e2e --release -- bench \
   --warmup 3 \
   --repeat 10 \
   --output results/bench_report.json
+```
+
+### Canonical Beads Campaign
+
+The canonical matrix for `bd-db300.1.2` is tracked in:
+
+```text
+sample_sqlite_db_files/manifests/beads_benchmark_campaign.v1.json
+sample_sqlite_db_files/manifests/beads_benchmark_campaign.v1.schema.json
+```
+
+That manifest freezes the real-fixture campaign dimensions instead of relying on
+ad hoc shell history:
+
+- Fixtures: `frankensqlite_beads`, `frankentui_beads`, `frankensearch_beads`
+- Workloads: `commutative_inserts_disjoint_keys`, `hot_page_contention`, `mixed_read_write`
+- Modes: `sqlite3_wal`, `fsqlite_mvcc`, `fsqlite_single_writer`
+- Build profile: `release-perf`
+- Seed policy: fixed root seed `42`
+- Retry policy: harness-instrumented busy retries (`10_000`, `1ms` base, `250ms` cap)
+- Placement profiles: unpinned baseline, pinned LLC-spread, adversarial SMT-packed
+- Hardware class: `amd_tr_pro_5995wx_64c128t_smt_on_l3x8_numa1`
+
+Artifact names for canonical runs must include the source revision and the
+`.beads/issues.jsonl` hash so results stay mechanically diffable over time. The
+tracked templates are:
+
+```text
+directory: {date}_{commit_sha8}_{beads_hash12}_{hardware_class_id}_{placement_profile_id}
+file stem: {mode_id}__{fixture_id}__{workload_id}__c{concurrency}__{build_profile}
+```
+
+For CPU-heavy canonical runs, offload through `rch` and use the manifest as the
+source of truth for dimensions and naming:
+
+```bash
+rch exec -- cargo run -p fsqlite-e2e --profile release-perf --bin realdb-e2e -- bench
 ```
 
 ### Run Library Benchmarks (Unit Tests)

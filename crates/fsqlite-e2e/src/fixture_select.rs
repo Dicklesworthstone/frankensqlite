@@ -12,10 +12,14 @@
 //! - **Size range filtering**: `--min-size 1MB`, `--max-size 100MB`.
 //! - **Feature filtering**: `--requires-wal`, `--header-ok`.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+use crate::oplog::preset_catalog;
 
 // ── Manifest types ───────────────────────────────────────────────────
 
@@ -26,6 +30,10 @@ pub struct ManifestEntry {
     pub golden_filename: String,
     pub sha256_golden: String,
     pub size_bytes: u64,
+    #[serde(default)]
+    pub source_path: Option<String>,
+    #[serde(default)]
+    pub provenance: Option<String>,
     #[serde(default)]
     pub tags: Vec<String>,
     #[serde(default)]
@@ -50,6 +58,545 @@ pub struct ManifestSqliteMeta {
 pub struct Manifest {
     pub manifest_version: u32,
     pub entries: Vec<ManifestEntry>,
+}
+
+/// Stable schema identifier for the canonical Beads benchmark campaign.
+pub const BEADS_BENCHMARK_CAMPAIGN_SCHEMA_V1: &str = "fsqlite-e2e.beads_benchmark_campaign.v1";
+
+/// Canonical Track A benchmark campaign manifest path.
+pub const BEADS_BENCHMARK_CAMPAIGN_PATH_RELATIVE: &str =
+    "sample_sqlite_db_files/manifests/beads_benchmark_campaign.v1.json";
+
+/// Which execution mode a canonical benchmark cell uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BenchmarkMode {
+    SqliteReference,
+    FsqliteMvcc,
+    FsqliteSingleWriter,
+}
+
+impl BenchmarkMode {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SqliteReference => "sqlite_reference",
+            Self::FsqliteMvcc => "fsqlite_mvcc",
+            Self::FsqliteSingleWriter => "fsqlite_single_writer",
+        }
+    }
+}
+
+/// One pinned Beads fixture used by the many-core benchmark campaign.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BeadsBenchmarkFixture {
+    pub fixture_id: String,
+    pub source_path: String,
+    pub source_sha256: String,
+    pub source_size_bytes: u64,
+    pub working_copy_relpath: String,
+    pub working_copy_sha256: String,
+    pub working_copy_size_bytes: u64,
+    pub page_size: u32,
+    pub journal_mode: String,
+    pub capture_rule: String,
+}
+
+/// Placement vocabulary for the canonical matrix.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlacementProfile {
+    pub id: String,
+    pub kind: String,
+    pub description: String,
+    pub command_hint: String,
+    pub availability: String,
+}
+
+/// Hardware taxonomy attached to canonical matrix rows.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HardwareClass {
+    pub id: String,
+    pub arch: String,
+    pub min_logical_cores: u32,
+    pub min_numa_nodes: Option<u32>,
+    pub description: String,
+}
+
+/// Busy-retry policy pinned for benchmark comparisons.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetryPolicy {
+    pub id: String,
+    pub max_busy_retries: u32,
+    pub busy_backoff_ms: u64,
+    pub busy_backoff_max_ms: u64,
+    pub notes: String,
+}
+
+/// Cargo build profile pinned for benchmark runs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BuildProfile {
+    pub id: String,
+    pub cargo_profile: String,
+    pub cargo_args: Vec<String>,
+    pub notes: String,
+}
+
+/// Deterministic seed policy pinned for benchmark runs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SeedPolicy {
+    pub id: String,
+    pub kind: String,
+    pub base_seed: u64,
+    pub notes: String,
+}
+
+/// One placement/hardware variant required for a benchmark row.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlacementVariant {
+    pub placement_profile_id: String,
+    pub hardware_class_id: String,
+    pub required: bool,
+}
+
+/// One workload/concurrency row in the canonical benchmark matrix.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BeadsBenchmarkMatrixRow {
+    pub row_id: String,
+    pub fixtures: Vec<String>,
+    pub workload: String,
+    pub concurrency: u16,
+    pub modes: Vec<BenchmarkMode>,
+    pub placement_variants: Vec<PlacementVariant>,
+    pub retry_policy_id: String,
+    pub build_profile_id: String,
+    pub seed_policy_id: String,
+}
+
+/// Stable artifact naming contract for one expanded benchmark cell.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BenchmarkArtifactContract {
+    pub artifact_root_relpath: String,
+    pub bundle_dir_template: String,
+    pub result_jsonl_name: String,
+    pub summary_md_name: String,
+    pub manifest_name: String,
+    pub logs_dir_name: String,
+    pub profiles_dir_name: String,
+}
+
+/// Checked-in Track A campaign manifest describing the canonical benchmark matrix.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BeadsBenchmarkCampaign {
+    pub schema_version: String,
+    pub campaign_id: String,
+    pub title: String,
+    pub working_benchmark_root_relpath: String,
+    pub beads_data_relpath: String,
+    pub fixtures: Vec<BeadsBenchmarkFixture>,
+    pub placement_profiles: Vec<PlacementProfile>,
+    pub hardware_classes: Vec<HardwareClass>,
+    pub retry_policies: Vec<RetryPolicy>,
+    pub build_profiles: Vec<BuildProfile>,
+    pub seed_policies: Vec<SeedPolicy>,
+    pub matrix_rows: Vec<BeadsBenchmarkMatrixRow>,
+    pub artifact_contract: BenchmarkArtifactContract,
+}
+
+/// One fully expanded benchmark cell (fixture × mode × placement).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExpandedBenchmarkCell {
+    pub row_id: String,
+    pub fixture_id: String,
+    pub workload: String,
+    pub concurrency: u16,
+    pub mode: BenchmarkMode,
+    pub placement_profile_id: String,
+    pub hardware_class_id: String,
+    pub retry_policy_id: String,
+    pub build_profile_id: String,
+    pub seed_policy_id: String,
+}
+
+/// Load the canonical Beads benchmark campaign manifest from the workspace root.
+///
+/// # Errors
+///
+/// Returns an error if the manifest cannot be read or parsed.
+pub fn load_beads_benchmark_campaign(
+    workspace_root: &Path,
+) -> Result<BeadsBenchmarkCampaign, String> {
+    let path = workspace_root.join(BEADS_BENCHMARK_CAMPAIGN_PATH_RELATIVE);
+    load_beads_benchmark_campaign_from(&path)
+}
+
+/// Load the canonical Beads benchmark campaign manifest from an explicit path.
+///
+/// # Errors
+///
+/// Returns an error if the manifest cannot be read or parsed.
+pub fn load_beads_benchmark_campaign_from(path: &Path) -> Result<BeadsBenchmarkCampaign, String> {
+    let content = std::fs::read_to_string(path).map_err(|e| {
+        format!(
+            "cannot read Beads benchmark campaign manifest at {}: {e}",
+            path.display()
+        )
+    })?;
+    serde_json::from_str::<BeadsBenchmarkCampaign>(&content).map_err(|e| {
+        format!(
+            "cannot parse Beads benchmark campaign manifest at {}: {e}",
+            path.display()
+        )
+    })
+}
+
+/// Expand the campaign into fully concrete benchmark cells.
+#[must_use]
+pub fn expand_beads_benchmark_campaign(
+    campaign: &BeadsBenchmarkCampaign,
+) -> Vec<ExpandedBenchmarkCell> {
+    let mut cells = Vec::new();
+    for row in &campaign.matrix_rows {
+        for fixture_id in &row.fixtures {
+            for &mode in &row.modes {
+                for placement in &row.placement_variants {
+                    cells.push(ExpandedBenchmarkCell {
+                        row_id: row.row_id.clone(),
+                        fixture_id: fixture_id.clone(),
+                        workload: row.workload.clone(),
+                        concurrency: row.concurrency,
+                        mode,
+                        placement_profile_id: placement.placement_profile_id.clone(),
+                        hardware_class_id: placement.hardware_class_id.clone(),
+                        retry_policy_id: row.retry_policy_id.clone(),
+                        build_profile_id: row.build_profile_id.clone(),
+                        seed_policy_id: row.seed_policy_id.clone(),
+                    });
+                }
+            }
+        }
+    }
+    cells
+}
+
+/// Render the stable artifact bundle directory name for one expanded cell.
+#[must_use]
+pub fn render_benchmark_bundle_dir(
+    contract: &BenchmarkArtifactContract,
+    cell: &ExpandedBenchmarkCell,
+    source_revision: &str,
+    beads_hash: &str,
+) -> String {
+    contract
+        .bundle_dir_template
+        .replace("{row_id}", &cell.row_id)
+        .replace("{fixture_id}", &cell.fixture_id)
+        .replace("{mode}", cell.mode.as_str())
+        .replace("{placement_profile_id}", &cell.placement_profile_id)
+        .replace("{source_revision}", &short_hash(source_revision))
+        .replace("{beads_hash}", &short_hash(beads_hash))
+}
+
+/// Materialize the artifact bundle path for one expanded cell.
+#[must_use]
+pub fn benchmark_bundle_path(
+    workspace_root: &Path,
+    campaign: &BeadsBenchmarkCampaign,
+    cell: &ExpandedBenchmarkCell,
+    source_revision: &str,
+    beads_hash: &str,
+) -> PathBuf {
+    workspace_root
+        .join(&campaign.artifact_contract.artifact_root_relpath)
+        .join(render_benchmark_bundle_dir(
+            &campaign.artifact_contract,
+            cell,
+            source_revision,
+            beads_hash,
+        ))
+}
+
+/// Validate the canonical benchmark campaign manifest for internal consistency.
+///
+/// This validates checked-in benchmark working copies, symbolic references, and
+/// the row/placement/mode contract without requiring the external source paths
+/// to exist on every machine.
+///
+/// # Errors
+///
+/// Returns a newline-delimited list of validation failures.
+pub fn validate_beads_benchmark_campaign(
+    campaign: &BeadsBenchmarkCampaign,
+    workspace_root: &Path,
+) -> Result<(), String> {
+    let mut errors = Vec::new();
+    if campaign.schema_version != BEADS_BENCHMARK_CAMPAIGN_SCHEMA_V1 {
+        errors.push(format!(
+            "unexpected schema_version {:?} (expected {:?})",
+            campaign.schema_version, BEADS_BENCHMARK_CAMPAIGN_SCHEMA_V1
+        ));
+    }
+
+    let workload_names: BTreeSet<String> =
+        preset_catalog().into_iter().map(|meta| meta.name).collect();
+    let fixture_ids = unique_ids(
+        campaign
+            .fixtures
+            .iter()
+            .map(|fixture| fixture.fixture_id.as_str()),
+        "fixture_id",
+        &mut errors,
+    );
+    let placement_ids = unique_ids(
+        campaign
+            .placement_profiles
+            .iter()
+            .map(|profile| profile.id.as_str()),
+        "placement_profile_id",
+        &mut errors,
+    );
+    let hardware_ids = unique_ids(
+        campaign
+            .hardware_classes
+            .iter()
+            .map(|hardware| hardware.id.as_str()),
+        "hardware_class_id",
+        &mut errors,
+    );
+    let retry_ids = unique_ids(
+        campaign
+            .retry_policies
+            .iter()
+            .map(|policy| policy.id.as_str()),
+        "retry_policy_id",
+        &mut errors,
+    );
+    let build_ids = unique_ids(
+        campaign
+            .build_profiles
+            .iter()
+            .map(|profile| profile.id.as_str()),
+        "build_profile_id",
+        &mut errors,
+    );
+    let seed_ids = unique_ids(
+        campaign
+            .seed_policies
+            .iter()
+            .map(|policy| policy.id.as_str()),
+        "seed_policy_id",
+        &mut errors,
+    );
+
+    for fixture in &campaign.fixtures {
+        if !Path::new(&fixture.source_path).is_absolute() {
+            errors.push(format!(
+                "fixture {} source_path must be absolute: {}",
+                fixture.fixture_id, fixture.source_path
+            ));
+        }
+        let working_copy = workspace_root.join(&fixture.working_copy_relpath);
+        if !working_copy.is_file() {
+            errors.push(format!(
+                "fixture {} working copy missing: {}",
+                fixture.fixture_id,
+                working_copy.display()
+            ));
+            continue;
+        }
+        match std::fs::metadata(&working_copy) {
+            Ok(metadata) if metadata.len() != fixture.working_copy_size_bytes => {
+                errors.push(format!(
+                    "fixture {} working copy size mismatch: manifest={} actual={} ({})",
+                    fixture.fixture_id,
+                    fixture.working_copy_size_bytes,
+                    metadata.len(),
+                    working_copy.display()
+                ))
+            }
+            Ok(_) => {}
+            Err(e) => errors.push(format!(
+                "fixture {} cannot stat working copy {}: {e}",
+                fixture.fixture_id,
+                working_copy.display()
+            )),
+        }
+        match sha256_hex_file(&working_copy) {
+            Ok(actual) if actual != fixture.working_copy_sha256 => errors.push(format!(
+                "fixture {} working copy sha256 mismatch: manifest={} actual={}",
+                fixture.fixture_id, fixture.working_copy_sha256, actual
+            )),
+            Ok(_) => {}
+            Err(e) => errors.push(format!(
+                "fixture {} cannot hash working copy {}: {e}",
+                fixture.fixture_id,
+                working_copy.display()
+            )),
+        }
+    }
+
+    let row_ids = unique_ids(
+        campaign.matrix_rows.iter().map(|row| row.row_id.as_str()),
+        "row_id",
+        &mut errors,
+    );
+    if row_ids.is_empty() {
+        errors.push("campaign must define at least one matrix row".to_owned());
+    }
+
+    for row in &campaign.matrix_rows {
+        if row.concurrency == 0 {
+            errors.push(format!("row {} must use concurrency >= 1", row.row_id));
+        }
+        if !workload_names.contains(&row.workload) {
+            errors.push(format!(
+                "row {} references unknown workload {:?}",
+                row.row_id, row.workload
+            ));
+        }
+        if row.fixtures.is_empty() {
+            errors.push(format!(
+                "row {} must reference at least one fixture",
+                row.row_id
+            ));
+        }
+        for fixture_id in &row.fixtures {
+            if !fixture_ids.contains_key(fixture_id.as_str()) {
+                errors.push(format!(
+                    "row {} references unknown fixture {:?}",
+                    row.row_id, fixture_id
+                ));
+            }
+        }
+
+        let contains_mode = |needle: BenchmarkMode| row.modes.contains(&needle);
+        if !contains_mode(BenchmarkMode::SqliteReference)
+            || !contains_mode(BenchmarkMode::FsqliteMvcc)
+            || !contains_mode(BenchmarkMode::FsqliteSingleWriter)
+        {
+            errors.push(format!(
+                "row {} must include sqlite_reference, fsqlite_mvcc, and fsqlite_single_writer modes",
+                row.row_id
+            ));
+        }
+
+        let has_baseline = row
+            .placement_variants
+            .iter()
+            .any(|variant| variant.placement_profile_id == "baseline_unpinned");
+        let has_recommended = row
+            .placement_variants
+            .iter()
+            .any(|variant| variant.placement_profile_id == "recommended_pinned");
+        let has_adversarial = row
+            .placement_variants
+            .iter()
+            .any(|variant| variant.placement_profile_id == "adversarial_cross_node");
+
+        if !has_baseline {
+            errors.push(format!(
+                "row {} must include the baseline_unpinned placement profile",
+                row.row_id
+            ));
+        }
+        if !has_recommended {
+            errors.push(format!(
+                "row {} must include the recommended_pinned placement profile",
+                row.row_id
+            ));
+        }
+        if row.concurrency > 1 && !has_adversarial {
+            errors.push(format!(
+                "row {} must include adversarial_cross_node for concurrency > 1",
+                row.row_id
+            ));
+        }
+
+        for variant in &row.placement_variants {
+            if !placement_ids.contains_key(variant.placement_profile_id.as_str()) {
+                errors.push(format!(
+                    "row {} references unknown placement profile {:?}",
+                    row.row_id, variant.placement_profile_id
+                ));
+            }
+            if !hardware_ids.contains_key(variant.hardware_class_id.as_str()) {
+                errors.push(format!(
+                    "row {} references unknown hardware class {:?}",
+                    row.row_id, variant.hardware_class_id
+                ));
+            }
+        }
+        if !retry_ids.contains_key(row.retry_policy_id.as_str()) {
+            errors.push(format!(
+                "row {} references unknown retry policy {:?}",
+                row.row_id, row.retry_policy_id
+            ));
+        }
+        if !build_ids.contains_key(row.build_profile_id.as_str()) {
+            errors.push(format!(
+                "row {} references unknown build profile {:?}",
+                row.row_id, row.build_profile_id
+            ));
+        }
+        if !seed_ids.contains_key(row.seed_policy_id.as_str()) {
+            errors.push(format!(
+                "row {} references unknown seed policy {:?}",
+                row.row_id, row.seed_policy_id
+            ));
+        }
+    }
+
+    for placeholder in [
+        "{row_id}",
+        "{fixture_id}",
+        "{mode}",
+        "{placement_profile_id}",
+        "{source_revision}",
+        "{beads_hash}",
+    ] {
+        if !campaign
+            .artifact_contract
+            .bundle_dir_template
+            .contains(placeholder)
+        {
+            errors.push(format!(
+                "artifact bundle_dir_template must contain placeholder {placeholder}"
+            ));
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("\n"))
+    }
+}
+
+fn unique_ids<'a>(
+    ids: impl Iterator<Item = &'a str>,
+    label: &str,
+    errors: &mut Vec<String>,
+) -> BTreeMap<&'a str, ()> {
+    let mut map = BTreeMap::new();
+    for id in ids {
+        if id.trim().is_empty() {
+            errors.push(format!("{label} must not be empty"));
+            continue;
+        }
+        if map.insert(id, ()).is_some() {
+            errors.push(format!("duplicate {label}: {id}"));
+        }
+    }
+    map
+}
+
+fn sha256_hex_file(path: &Path) -> Result<String, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let digest = Sha256::digest(bytes);
+    Ok(format!("{digest:x}"))
+}
+
+fn short_hash(value: &str) -> String {
+    value.chars().take(12).collect()
 }
 
 // ── Filter criteria ──────────────────────────────────────────────────
@@ -602,6 +1149,7 @@ pub fn find_duplicate_db_ids(manifest: &Manifest) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn sample_manifest() -> Manifest {
         Manifest {
@@ -612,6 +1160,8 @@ mod tests {
                     golden_filename: "beads_rust_beads.db".to_owned(),
                     sha256_golden: "aaa".to_owned(),
                     size_bytes: 4_120_576,
+                    source_path: None,
+                    provenance: None,
                     tags: vec!["beads".to_owned(), "medium".to_owned(), "wal".to_owned()],
                     sqlite_meta: Some(ManifestSqliteMeta {
                         page_size: Some(4096),
@@ -625,6 +1175,8 @@ mod tests {
                     golden_filename: "beads_viewer.db".to_owned(),
                     sha256_golden: "bbb".to_owned(),
                     size_bytes: 6_565_888,
+                    source_path: None,
+                    provenance: None,
                     tags: vec!["beads".to_owned(), "large".to_owned(), "wal".to_owned()],
                     sqlite_meta: Some(ManifestSqliteMeta {
                         page_size: Some(4096),
@@ -638,6 +1190,8 @@ mod tests {
                     golden_filename: "frankensqlite.db".to_owned(),
                     sha256_golden: "ccc".to_owned(),
                     size_bytes: 500_000,
+                    source_path: None,
+                    provenance: None,
                     tags: vec!["medium".to_owned()],
                     sqlite_meta: Some(ManifestSqliteMeta {
                         page_size: Some(4096),
@@ -651,10 +1205,143 @@ mod tests {
                     golden_filename: "tiny_test.db".to_owned(),
                     sha256_golden: "ddd".to_owned(),
                     size_bytes: 10_000,
+                    source_path: None,
+                    provenance: None,
                     tags: vec!["small".to_owned(), "test".to_owned()],
                     sqlite_meta: None,
                 },
             ],
+        }
+    }
+
+    fn sample_campaign(root: &Path) -> BeadsBenchmarkCampaign {
+        let working_copy_relpath =
+            "sample_sqlite_db_files/working/beads_bench_20260310/golden/frankensqlite_beads.db";
+        let working_copy = root.join(working_copy_relpath);
+        let bytes = b"fixture-bytes";
+        fs::create_dir_all(working_copy.parent().unwrap()).unwrap();
+        fs::write(&working_copy, bytes).unwrap();
+        let digest = sha256_hex_file(&working_copy).unwrap();
+
+        BeadsBenchmarkCampaign {
+            schema_version: BEADS_BENCHMARK_CAMPAIGN_SCHEMA_V1.to_owned(),
+            campaign_id: "bd-db300.1.2".to_owned(),
+            title: "sample".to_owned(),
+            working_benchmark_root_relpath: "sample_sqlite_db_files/working/beads_bench_20260310"
+                .to_owned(),
+            beads_data_relpath: ".beads/issues.jsonl".to_owned(),
+            fixtures: vec![BeadsBenchmarkFixture {
+                fixture_id: "frankensqlite".to_owned(),
+                source_path: "/data/projects/frankensqlite/.beads/beads.db".to_owned(),
+                source_sha256: "a".repeat(64),
+                source_size_bytes: bytes.len() as u64,
+                working_copy_relpath: working_copy_relpath.to_owned(),
+                working_copy_sha256: digest,
+                working_copy_size_bytes: bytes.len() as u64,
+                page_size: 4096,
+                journal_mode: "wal".to_owned(),
+                capture_rule: "copy pinned working copy".to_owned(),
+            }],
+            placement_profiles: vec![
+                PlacementProfile {
+                    id: "baseline_unpinned".to_owned(),
+                    kind: "baseline".to_owned(),
+                    description: "scheduler default".to_owned(),
+                    command_hint: "run directly".to_owned(),
+                    availability: "universal".to_owned(),
+                },
+                PlacementProfile {
+                    id: "recommended_pinned".to_owned(),
+                    kind: "recommended_pinned".to_owned(),
+                    description: "pin to sibling-free cores".to_owned(),
+                    command_hint: "taskset pin".to_owned(),
+                    availability: "topology_aware".to_owned(),
+                },
+                PlacementProfile {
+                    id: "adversarial_cross_node".to_owned(),
+                    kind: "adversarial_topology".to_owned(),
+                    description: "spread across nodes".to_owned(),
+                    command_hint: "numactl --cpunodebind".to_owned(),
+                    availability: "topology_aware".to_owned(),
+                },
+            ],
+            hardware_classes: vec![
+                HardwareClass {
+                    id: "linux_x86_64_any".to_owned(),
+                    arch: "x86_64".to_owned(),
+                    min_logical_cores: 4,
+                    min_numa_nodes: None,
+                    description: "generic".to_owned(),
+                },
+                HardwareClass {
+                    id: "linux_x86_64_many_core_numa".to_owned(),
+                    arch: "x86_64".to_owned(),
+                    min_logical_cores: 16,
+                    min_numa_nodes: Some(2),
+                    description: "many-core".to_owned(),
+                },
+            ],
+            retry_policies: vec![RetryPolicy {
+                id: "instrumented_busy_retry_v1".to_owned(),
+                max_busy_retries: 10_000,
+                busy_backoff_ms: 1,
+                busy_backoff_max_ms: 250,
+                notes: "default".to_owned(),
+            }],
+            build_profiles: vec![BuildProfile {
+                id: "release_perf".to_owned(),
+                cargo_profile: "release-perf".to_owned(),
+                cargo_args: vec!["--profile".to_owned(), "release-perf".to_owned()],
+                notes: "perf".to_owned(),
+            }],
+            seed_policies: vec![SeedPolicy {
+                id: "fixed_seed_42".to_owned(),
+                kind: "fixed".to_owned(),
+                base_seed: 42,
+                notes: "stable".to_owned(),
+            }],
+            matrix_rows: vec![BeadsBenchmarkMatrixRow {
+                row_id: "mixed_read_write_c4".to_owned(),
+                fixtures: vec!["frankensqlite".to_owned()],
+                workload: "mixed_read_write".to_owned(),
+                concurrency: 4,
+                modes: vec![
+                    BenchmarkMode::SqliteReference,
+                    BenchmarkMode::FsqliteMvcc,
+                    BenchmarkMode::FsqliteSingleWriter,
+                ],
+                placement_variants: vec![
+                    PlacementVariant {
+                        placement_profile_id: "baseline_unpinned".to_owned(),
+                        hardware_class_id: "linux_x86_64_any".to_owned(),
+                        required: true,
+                    },
+                    PlacementVariant {
+                        placement_profile_id: "recommended_pinned".to_owned(),
+                        hardware_class_id: "linux_x86_64_many_core_numa".to_owned(),
+                        required: true,
+                    },
+                    PlacementVariant {
+                        placement_profile_id: "adversarial_cross_node".to_owned(),
+                        hardware_class_id: "linux_x86_64_many_core_numa".to_owned(),
+                        required: true,
+                    },
+                ],
+                retry_policy_id: "instrumented_busy_retry_v1".to_owned(),
+                build_profile_id: "release_perf".to_owned(),
+                seed_policy_id: "fixed_seed_42".to_owned(),
+            }],
+            artifact_contract: BenchmarkArtifactContract {
+                artifact_root_relpath: "artifacts/perf/bd-db300.1.2".to_owned(),
+                bundle_dir_template:
+                    "{row_id}__{fixture_id}__{mode}__{placement_profile_id}__rev_{source_revision}__beads_{beads_hash}"
+                        .to_owned(),
+                result_jsonl_name: "results.jsonl".to_owned(),
+                summary_md_name: "summary.md".to_owned(),
+                manifest_name: "manifest.json".to_owned(),
+                logs_dir_name: "logs".to_owned(),
+                profiles_dir_name: "profiles".to_owned(),
+            },
         }
     }
 
@@ -753,11 +1440,9 @@ mod tests {
         };
         let results = select_all(&m, &filter);
         assert_eq!(results.len(), 2);
-        assert!(
-            results
-                .iter()
-                .all(|e| !e.tags.contains(&"beads".to_owned()))
-        );
+        assert!(results
+            .iter()
+            .all(|e| !e.tags.contains(&"beads".to_owned())));
     }
 
     #[test]
@@ -865,6 +1550,8 @@ mod tests {
             golden_filename: "test_db.db".to_owned(),
             sha256_golden: "abc".to_owned(),
             size_bytes: 100,
+            source_path: None,
+            provenance: None,
             tags: vec![],
             sqlite_meta: None,
         };
@@ -949,6 +1636,8 @@ mod tests {
             golden_filename: "duplicate.db".to_owned(),
             sha256_golden: "eee".to_owned(),
             size_bytes: 100,
+            source_path: None,
+            provenance: None,
             tags: vec![],
             sqlite_meta: None,
         });
@@ -989,6 +1678,54 @@ mod tests {
                     "sync should populate tags from metadata"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn test_expand_beads_benchmark_campaign() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let campaign = sample_campaign(tempdir.path());
+        let cells = expand_beads_benchmark_campaign(&campaign);
+        assert_eq!(cells.len(), 9);
+        assert_eq!(cells[0].row_id, "mixed_read_write_c4");
+        assert_eq!(cells[0].fixture_id, "frankensqlite");
+    }
+
+    #[test]
+    fn test_render_benchmark_bundle_dir_shortens_hashes() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let campaign = sample_campaign(tempdir.path());
+        let cell = expand_beads_benchmark_campaign(&campaign)
+            .into_iter()
+            .next()
+            .unwrap();
+        let rendered = render_benchmark_bundle_dir(
+            &campaign.artifact_contract,
+            &cell,
+            "0123456789abcdef",
+            "fedcba9876543210",
+        );
+        assert!(rendered.contains("__rev_0123456789ab"));
+        assert!(rendered.contains("__beads_fedcba987654"));
+    }
+
+    #[test]
+    fn test_validate_beads_benchmark_campaign_sample() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let campaign = sample_campaign(tempdir.path());
+        validate_beads_benchmark_campaign(&campaign, tempdir.path()).unwrap();
+    }
+
+    #[test]
+    fn test_load_beads_benchmark_campaign_real() {
+        let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .unwrap();
+        if let Ok(campaign) = load_beads_benchmark_campaign(workspace_root) {
+            validate_beads_benchmark_campaign(&campaign, workspace_root).unwrap();
+            assert_eq!(campaign.campaign_id, "bd-db300.1.2");
+            assert!(!campaign.matrix_rows.is_empty());
         }
     }
 }

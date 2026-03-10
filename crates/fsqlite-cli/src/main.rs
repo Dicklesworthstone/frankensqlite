@@ -1,4 +1,5 @@
 use std::ffi::OsString;
+use std::fmt::Write as _;
 use std::io::{self, BufRead, ErrorKind, IsTerminal, Write};
 use std::path::Path;
 
@@ -49,6 +50,7 @@ struct ShellOptions {
 }
 
 impl ShellOptions {
+    #[cfg(test)]
     const fn interactive() -> Self {
         Self {
             show_prompts: true,
@@ -102,6 +104,7 @@ fn main() {
     }
 }
 
+#[cfg(test)]
 fn run<I, R, W, E>(args: I, input: &mut R, out: &mut W, err: &mut E) -> i32
 where
     I: IntoIterator<Item = OsString>,
@@ -399,7 +402,7 @@ where
     }
 }
 
-fn run_command<R, W, E>(
+fn run_command<W, E>(
     connection: &mut Connection,
     current_db_path: &mut String,
     command: &str,
@@ -407,7 +410,6 @@ fn run_command<R, W, E>(
     err: &mut E,
 ) -> i32
 where
-    R: BufRead,
     W: Write,
     E: Write,
 {
@@ -426,8 +428,8 @@ where
         err,
         ShellOptions::batch(),
     ) {
-        Ok(_) => 0,
-        Err(()) => 1,
+        Some(_) => 0,
+        None => 1,
     }
 }
 
@@ -444,16 +446,9 @@ where
     W: Write,
     E: Write,
 {
-    match run_shell(
-        connection,
-        current_db_path,
-        input,
-        out,
-        err,
-        shell_options,
-    ) {
-        Ok(_) => 0,
-        Err(()) => 1,
+    match run_shell(connection, current_db_path, input, out, err, shell_options) {
+        Some(_) => 0,
+        None => 1,
     }
 }
 
@@ -464,7 +459,7 @@ fn run_shell<R, W, E>(
     out: &mut W,
     err: &mut E,
     shell_options: ShellOptions,
-) -> Result<ShellFlow, ()>
+) -> Option<ShellFlow>
 where
     R: BufRead,
     W: Write,
@@ -475,9 +470,13 @@ where
 
     loop {
         if shell_options.show_prompts {
-            let prompt = render_prompt(current_db_path, pending_sql.trim().is_empty(), shell_options);
+            let prompt = render_prompt(
+                current_db_path,
+                pending_sql.trim().is_empty(),
+                shell_options,
+            );
             if write!(out, "{prompt}").and_then(|()| out.flush()).is_err() {
-                return Err(());
+                return None;
             }
         }
 
@@ -492,7 +491,7 @@ where
             }
             Err(error) => {
                 let _ = writeln!(err, "error: {error}");
-                return Err(());
+                return None;
             }
         };
 
@@ -500,7 +499,7 @@ where
             if !pending_sql.trim().is_empty() {
                 let _ = execute_sql(connection, pending_sql.trim(), out, err);
             }
-            return Ok(ShellFlow::Continue);
+            return Some(ShellFlow::Continue);
         }
 
         let line = line_buffer.trim_end_matches(['\n', '\r']);
@@ -508,12 +507,12 @@ where
 
         if pending_sql.trim().is_empty() {
             if matches!(trimmed, ".exit" | ".quit") {
-                return Ok(ShellFlow::Exit);
+                return Some(ShellFlow::Exit);
             }
 
             if trimmed == ".help" {
                 if write_repl_help(out).is_err() {
-                    return Err(());
+                    return None;
                 }
                 continue;
             }
@@ -528,7 +527,7 @@ where
             ) {
                 DotCommandResult::NotHandled => {}
                 DotCommandResult::Continue => continue,
-                DotCommandResult::Exit => return Ok(ShellFlow::Exit),
+                DotCommandResult::Exit => return Some(ShellFlow::Exit),
             }
 
             if trimmed.is_empty() {
@@ -548,20 +547,41 @@ where
     }
 }
 
-fn render_prompt(current_db_path: &str, primary_prompt: bool, shell_options: ShellOptions) -> String {
-    let label = prompt_db_label(current_db_path);
+fn render_prompt(
+    current_db_path: &str,
+    primary_prompt: bool,
+    shell_options: ShellOptions,
+) -> String {
+    let is_default_db = current_db_path == DEFAULT_DB_PATH;
+    let label = (!is_default_db).then(|| prompt_db_label(current_db_path));
     if primary_prompt {
         if shell_options.colorize_prompts {
-            format!(
-                "{ANSI_BOLD_CYAN}fsqlite{ANSI_RESET}[{ANSI_YELLOW}{label}{ANSI_RESET}]> "
-            )
+            match label {
+                Some(label) => {
+                    format!(
+                        "{ANSI_BOLD_CYAN}fsqlite{ANSI_RESET}[{ANSI_YELLOW}{label}{ANSI_RESET}]> "
+                    )
+                }
+                None => format!("{ANSI_BOLD_CYAN}fsqlite{ANSI_RESET}> "),
+            }
         } else {
-            format!("{PROMPT_PRIMARY}[{label}] ")
+            match label {
+                Some(label) => format!("fsqlite[{label}]> "),
+                None => String::from(PROMPT_PRIMARY),
+            }
         }
     } else if shell_options.colorize_prompts {
-        format!("{ANSI_DIM}...{ANSI_RESET}[{ANSI_YELLOW}{label}{ANSI_RESET}]> ")
+        match label {
+            Some(label) => {
+                format!("{ANSI_DIM}...{ANSI_RESET}[{ANSI_YELLOW}{label}{ANSI_RESET}]> ")
+            }
+            None => format!("{ANSI_DIM}...{ANSI_RESET}> "),
+        }
     } else {
-        format!("{PROMPT_CONTINUATION}[{label}] ")
+        match label {
+            Some(label) => format!("...[{label}]> "),
+            None => String::from(PROMPT_CONTINUATION),
+        }
     }
 }
 
@@ -681,9 +701,8 @@ where
                         colorize_prompts: shell_options.colorize_prompts,
                     },
                 ) {
-                    Ok(ShellFlow::Continue) => {}
-                    Ok(ShellFlow::Exit) => return DotCommandResult::Exit,
-                    Err(()) => {}
+                    Some(ShellFlow::Continue) | None => {}
+                    Some(ShellFlow::Exit) => return DotCommandResult::Exit,
                 }
             }
             Err(error) => {
@@ -712,14 +731,16 @@ where
     }
 
     if let Some(arg) = dot_command_arg(trimmed, ".schema") {
-        if let Err(error) = write_schema(connection, parse_optional_quoted_arg(arg).as_deref(), out) {
+        let filter = parse_optional_quoted_arg(arg);
+        if let Err(error) = write_schema(connection, filter.as_deref(), out) {
             let _ = writeln!(err, "error: {error}");
         }
         return DotCommandResult::Continue;
     }
 
     if let Some(arg) = dot_command_arg(trimmed, ".dump") {
-        if let Err(error) = write_dump(connection, parse_optional_quoted_arg(arg).as_deref(), out) {
+        let filter = parse_optional_quoted_arg(arg);
+        if let Err(error) = write_dump(connection, filter.as_deref(), out) {
             let _ = writeln!(err, "error: {error}");
         }
         return DotCommandResult::Continue;
@@ -744,8 +765,9 @@ fn parse_optional_quoted_arg(raw: &str) -> Option<String> {
         return None;
     }
 
-    if (trimmed.starts_with('"') && trimmed.ends_with('"'))
-        || (trimmed.starts_with('\'') && trimmed.ends_with('\''))
+    if trimmed.len() >= 2
+        && ((trimmed.starts_with('"') && trimmed.ends_with('"'))
+            || (trimmed.starts_with('\'') && trimmed.ends_with('\'')))
     {
         return Some(trimmed[1..trimmed.len() - 1].to_owned());
     }
@@ -786,8 +808,9 @@ where
         END, name";
 
     let rows = match filter {
-        Some(filter) => connection
-            .query_with_params(filtered_sql, &[SqliteValue::Text(filter.to_owned())]),
+        Some(filter) => {
+            connection.query_with_params(filtered_sql, &[SqliteValue::Text(filter.to_owned())])
+        }
         None => connection.query(sql),
     }
     .map_err(|error| error.to_string())?;
@@ -886,10 +909,8 @@ where
     }
 
     let object_rows = match filter {
-        Some(filter) => connection.query_with_params(
-            filtered_object_sql,
-            &[SqliteValue::Text(filter.to_owned())],
-        ),
+        Some(filter) => connection
+            .query_with_params(filtered_object_sql, &[SqliteValue::Text(filter.to_owned())]),
         None => connection.query(object_sql),
     }
     .map_err(|error| error.to_string())?;
@@ -930,7 +951,7 @@ fn sql_literal(value: &SqliteValue) -> String {
         SqliteValue::Blob(bytes) => {
             let mut rendered = String::from("X'");
             for byte in bytes {
-                rendered.push_str(&format!("{byte:02X}"));
+                let _ = write!(rendered, "{byte:02X}");
             }
             rendered.push('\'');
             rendered
@@ -1108,6 +1129,7 @@ mod tests {
     use std::ffi::OsString;
     use std::fs;
     use std::io::{self, BufRead, Cursor, Read};
+    use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use fsqlite_core::decode_proofs::{
@@ -1116,11 +1138,26 @@ mod tests {
     use fsqlite_types::ObjectId;
     use serde_json::json;
 
-    use super::{format_row, parse_args, run, statement_complete};
+    use super::{
+        ShellOptions, format_row, parse_args, run, run_with_shell_options, statement_complete,
+    };
 
     fn parse_from(args: &[&str]) -> Result<super::CliOptions, String> {
         let os_args: Vec<OsString> = args.iter().map(OsString::from).collect();
         parse_args(os_args)
+    }
+
+    fn unique_temp_path(prefix: &str, extension: &str) -> PathBuf {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after UNIX_EPOCH");
+        let file_name = format!(
+            "{prefix}_{}_{}.{}",
+            std::process::id(),
+            now.as_nanos(),
+            extension
+        );
+        std::env::temp_dir().join(file_name)
     }
 
     #[derive(Debug)]
@@ -1308,6 +1345,26 @@ mod tests {
     }
 
     #[test]
+    fn test_batch_mode_suppresses_prompts() {
+        let mut input = Cursor::new(b"SELECT 7;\n".to_vec());
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let args = vec![OsString::from("fsqlite")];
+
+        let exit_code =
+            run_with_shell_options(args, &mut input, &mut out, &mut err, ShellOptions::batch());
+        assert_eq!(exit_code, 0);
+        assert!(err.is_empty(), "unexpected stderr: {:?}", err);
+
+        let stdout = String::from_utf8(out).expect("output should be utf-8");
+        assert!(stdout.contains('7'), "expected query result in output");
+        assert!(
+            !stdout.contains("fsqlite> ") && !stdout.contains("   ...> "),
+            "batch mode should not render prompts, got: {stdout}",
+        );
+    }
+
+    #[test]
     fn test_repl_read_line_interrupted_keeps_shell_running() {
         let mut input = InterruptOnceBufRead::new(b".quit\n".to_vec());
         let mut out = Vec::new();
@@ -1366,6 +1423,106 @@ mod tests {
         assert!(
             stderr.contains(".read requires a file path"),
             "expected .read path error in stderr",
+        );
+    }
+
+    #[test]
+    fn test_repl_open_command_switches_database() {
+        let path = unique_temp_path("fsqlite_cli_open", "db");
+        let input_script = format!(
+            "CREATE TABLE before_open(id INTEGER);\n.open {}\nSELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = 'before_open';\n.quit\n",
+            path.display()
+        );
+        let mut input = Cursor::new(input_script.into_bytes());
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let args = vec![OsString::from("fsqlite")];
+
+        let exit_code = run(args, &mut input, &mut out, &mut err);
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(exit_code, 0);
+        assert!(err.is_empty(), "unexpected stderr: {:?}", err);
+
+        let stdout = String::from_utf8(out).expect("output should be utf-8");
+        assert!(
+            stdout.contains('0'),
+            "expected .open to switch to a fresh database, got: {stdout}",
+        );
+    }
+
+    #[test]
+    fn test_command_mode_dot_schema_supports_filtering() {
+        let path = unique_temp_path("fsqlite_cli_schema", "db");
+        let path_text = path.to_string_lossy().into_owned();
+        let conn = fsqlite::Connection::open(path_text.clone()).expect("connection should open");
+        conn.query("CREATE TABLE widgets(id INTEGER PRIMARY KEY, name TEXT);")
+            .expect("create widgets table");
+        conn.query("CREATE TABLE gadgets(id INTEGER PRIMARY KEY, name TEXT);")
+            .expect("create gadgets table");
+        drop(conn);
+
+        let mut input = Cursor::new(Vec::<u8>::new());
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let args = vec![
+            OsString::from("fsqlite"),
+            OsString::from(path_text),
+            OsString::from("-c"),
+            OsString::from(".schema widgets"),
+        ];
+
+        let exit_code = run(args, &mut input, &mut out, &mut err);
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(exit_code, 0);
+        assert!(err.is_empty(), "unexpected stderr: {:?}", err);
+
+        let stdout = String::from_utf8(out).expect("output should be utf-8");
+        assert!(
+            stdout.contains("CREATE TABLE widgets"),
+            "expected widgets schema in output, got: {stdout}",
+        );
+        assert!(
+            !stdout.contains("CREATE TABLE gadgets"),
+            "unexpected gadgets schema in filtered output: {stdout}",
+        );
+    }
+
+    #[test]
+    fn test_repl_dump_command_emits_schema_and_escaped_values() {
+        let mut input = Cursor::new(
+            b"CREATE TABLE notes(id INTEGER PRIMARY KEY, name TEXT, payload BLOB, note TEXT);\n\
+INSERT INTO notes VALUES(1, 'O''Malley', x'0102', NULL);\n\
+.dump\n\
+.quit\n"
+                .to_vec(),
+        );
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let args = vec![OsString::from("fsqlite")];
+
+        let exit_code = run(args, &mut input, &mut out, &mut err);
+
+        assert_eq!(exit_code, 0);
+        assert!(err.is_empty(), "unexpected stderr: {:?}", err);
+
+        let stdout = String::from_utf8(out).expect("output should be utf-8");
+        assert!(
+            stdout.contains("BEGIN TRANSACTION;"),
+            "expected transaction header in dump, got: {stdout}",
+        );
+        assert!(
+            stdout.contains("CREATE TABLE notes"),
+            "expected table DDL in dump, got: {stdout}",
+        );
+        assert!(
+            stdout.contains("INSERT INTO \"notes\" VALUES(1, 'O''Malley', X'0102', NULL);"),
+            "expected escaped INSERT in dump, got: {stdout}",
+        );
+        assert!(
+            stdout.contains("COMMIT;"),
+            "expected transaction trailer in dump, got: {stdout}",
         );
     }
 

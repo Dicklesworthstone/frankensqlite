@@ -10914,7 +10914,9 @@ impl Connection {
 
             let Some(page_no) = current else {
                 return Err(FrankenError::DatabaseCorrupt {
-                    detail: format!("{owner} overflow chain ended before the payload was fully covered"),
+                    detail: format!(
+                        "{owner} overflow chain ended before the payload was fully covered"
+                    ),
                 });
             };
 
@@ -10947,12 +10949,16 @@ impl Connection {
 
             if remaining == 0 && current.is_some() {
                 return Err(FrankenError::DatabaseCorrupt {
-                    detail: format!("{owner} overflow chain has trailing pages beyond the declared payload size"),
+                    detail: format!(
+                        "{owner} overflow chain has trailing pages beyond the declared payload size"
+                    ),
                 });
             }
             if remaining > 0 && current.is_none() {
                 return Err(FrankenError::DatabaseCorrupt {
-                    detail: format!("{owner} overflow chain ended before the payload was fully covered"),
+                    detail: format!(
+                        "{owner} overflow chain ended before the payload was fully covered"
+                    ),
                 });
             }
 
@@ -10989,7 +10995,10 @@ impl Connection {
         let cell_pointers = header
             .parse_cell_pointers(page_bytes, page_size, reserved_per_page)
             .map_err(|err| FrankenError::DatabaseCorrupt {
-                detail: format!("{owner}: page {} cell pointers invalid: {err}", page_no.get()),
+                detail: format!(
+                    "{owner}: page {} cell pointers invalid: {err}",
+                    page_no.get()
+                ),
             })?;
         header
             .parse_freeblocks(page_bytes, page_size, reserved_per_page)
@@ -10998,16 +11007,14 @@ impl Connection {
             })?;
 
         let usable_size = page_size.usable(reserved_per_page);
-        let page_type =
-            fsqlite_btree::BtreePageType::from_flag(page_bytes[header.header_offset]).ok_or_else(
-                || FrankenError::DatabaseCorrupt {
-                    detail: format!(
-                        "{owner}: page {} has invalid B-tree page type flag {:#04x}",
-                        page_no.get(),
-                        page_bytes[header.header_offset]
-                    ),
-                },
-            )?;
+        let page_type = fsqlite_btree::BtreePageType::from_flag(page_bytes[header.header_offset])
+            .ok_or_else(|| FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "{owner}: page {} has invalid B-tree page type flag {:#04x}",
+                page_no.get(),
+                page_bytes[header.header_offset]
+            ),
+        })?;
 
         for (cell_idx, cell_pointer) in cell_pointers.iter().enumerate() {
             let cell = fsqlite_btree::CellRef::parse(
@@ -11017,7 +11024,10 @@ impl Connection {
                 usable_size,
             )
             .map_err(|err| FrankenError::DatabaseCorrupt {
-                detail: format!("{owner}: page {} cell {cell_idx} invalid: {err}", page_no.get()),
+                detail: format!(
+                    "{owner}: page {} cell {cell_idx} invalid: {err}",
+                    page_no.get()
+                ),
             })?;
 
             if let Some(left_child) = cell.left_child {
@@ -11450,11 +11460,13 @@ impl Connection {
                     if cursor.first(cx)? {
                         loop {
                             let payload = cursor.payload(cx)?;
-                            parse_record(&payload).ok_or_else(|| FrankenError::DatabaseCorrupt {
-                                detail: format!(
-                                    "index `{}` contains an invalid key record payload",
-                                    index.name
-                                ),
+                            parse_record(&payload).ok_or_else(|| {
+                                FrankenError::DatabaseCorrupt {
+                                    detail: format!(
+                                        "index `{}` contains an invalid key record payload",
+                                        index.name
+                                    ),
+                                }
                             })?;
                             let rowid = cursor.rowid(cx)?;
                             let Some(expected_payload) = expected_keys.get(&rowid) else {
@@ -13023,12 +13035,14 @@ impl Connection {
             concurrent_mode: self.is_concurrent_transaction(),
             rowid_alias_col_idx: None,
         };
+        let canonical_select = canonicalize_select_placeholders(select)?;
         // Expose custom aggregate UDF names to the codegen so it emits
         // AggStep/AggFinal instead of PureFunc for registered aggregates.
         let extra_agg = self.extra_aggregate_names();
         fsqlite_vdbe::codegen::set_extra_aggregate_names(extra_agg);
         let result =
-            codegen_select(&mut builder, select, &schema, &ctx).map_err(codegen_error_to_franken);
+            codegen_select(&mut builder, &canonical_select, &schema, &ctx)
+                .map_err(codegen_error_to_franken);
         fsqlite_vdbe::codegen::clear_extra_aggregate_names();
         result?;
         builder.finish()
@@ -23930,6 +23944,263 @@ fn placeholder_to_index(
     }
 }
 
+fn canonicalize_select_placeholders(select: &SelectStatement) -> Result<SelectStatement> {
+    let mut normalized = select.clone();
+    let mut bind_state = BindParamState::default();
+    canonicalize_select_placeholders_in_statement(&mut normalized, &mut bind_state)?;
+    Ok(normalized)
+}
+
+fn canonicalize_select_placeholders_in_statement(
+    select: &mut SelectStatement,
+    bind_state: &mut BindParamState,
+) -> Result<()> {
+    if let Some(with_clause) = &mut select.with {
+        for cte in &mut with_clause.ctes {
+            canonicalize_select_placeholders_in_statement(&mut cte.query, bind_state)?;
+        }
+    }
+
+    canonicalize_select_placeholders_in_core(&mut select.body.select, bind_state)?;
+    for (_, core) in &mut select.body.compounds {
+        canonicalize_select_placeholders_in_core(core, bind_state)?;
+    }
+
+    for ordering in &mut select.order_by {
+        canonicalize_expr_placeholders(&mut ordering.expr, bind_state)?;
+    }
+    if let Some(limit_clause) = &mut select.limit {
+        canonicalize_expr_placeholders(&mut limit_clause.limit, bind_state)?;
+        if let Some(offset) = &mut limit_clause.offset {
+            canonicalize_expr_placeholders(offset, bind_state)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn canonicalize_select_placeholders_in_core(
+    core: &mut SelectCore,
+    bind_state: &mut BindParamState,
+) -> Result<()> {
+    match core {
+        SelectCore::Select {
+            columns,
+            from,
+            where_clause,
+            group_by,
+            having,
+            windows,
+            ..
+        } => {
+            for column in columns {
+                if let ResultColumn::Expr { expr, .. } = column {
+                    canonicalize_expr_placeholders(expr, bind_state)?;
+                }
+            }
+            if let Some(from_clause) = from {
+                canonicalize_placeholders_in_from_clause(from_clause, bind_state)?;
+            }
+            if let Some(predicate) = where_clause {
+                canonicalize_expr_placeholders(predicate, bind_state)?;
+            }
+            for expr in group_by {
+                canonicalize_expr_placeholders(expr, bind_state)?;
+            }
+            if let Some(predicate) = having {
+                canonicalize_expr_placeholders(predicate, bind_state)?;
+            }
+            for window in windows {
+                canonicalize_placeholders_in_window_spec(&mut window.spec, bind_state)?;
+            }
+        }
+        SelectCore::Values(rows) => {
+            for row in rows {
+                for expr in row {
+                    canonicalize_expr_placeholders(expr, bind_state)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn canonicalize_placeholders_in_from_clause(
+    from: &mut fsqlite_ast::FromClause,
+    bind_state: &mut BindParamState,
+) -> Result<()> {
+    canonicalize_placeholders_in_table_or_subquery(&mut from.source, bind_state)?;
+    for join in &mut from.joins {
+        canonicalize_placeholders_in_table_or_subquery(&mut join.table, bind_state)?;
+        if let Some(JoinConstraint::On(expr)) = &mut join.constraint {
+            canonicalize_expr_placeholders(expr, bind_state)?;
+        }
+    }
+    Ok(())
+}
+
+fn canonicalize_placeholders_in_table_or_subquery(
+    source: &mut TableOrSubquery,
+    bind_state: &mut BindParamState,
+) -> Result<()> {
+    match source {
+        TableOrSubquery::Table { .. } => {}
+        TableOrSubquery::Subquery { query, .. } => {
+            canonicalize_select_placeholders_in_statement(query, bind_state)?;
+        }
+        TableOrSubquery::TableFunction { args, .. } => {
+            for arg in args {
+                canonicalize_expr_placeholders(arg, bind_state)?;
+            }
+        }
+        TableOrSubquery::ParenJoin(from_clause) => {
+            canonicalize_placeholders_in_from_clause(from_clause, bind_state)?;
+        }
+    }
+    Ok(())
+}
+
+fn canonicalize_placeholders_in_window_spec(
+    spec: &mut fsqlite_ast::WindowSpec,
+    bind_state: &mut BindParamState,
+) -> Result<()> {
+    for expr in &mut spec.partition_by {
+        canonicalize_expr_placeholders(expr, bind_state)?;
+    }
+    for ordering in &mut spec.order_by {
+        canonicalize_expr_placeholders(&mut ordering.expr, bind_state)?;
+    }
+    if let Some(frame) = &mut spec.frame {
+        canonicalize_placeholders_in_frame_bound(&mut frame.start, bind_state)?;
+        if let Some(end) = &mut frame.end {
+            canonicalize_placeholders_in_frame_bound(end, bind_state)?;
+        }
+    }
+    Ok(())
+}
+
+fn canonicalize_placeholders_in_frame_bound(
+    bound: &mut fsqlite_ast::FrameBound,
+    bind_state: &mut BindParamState,
+) -> Result<()> {
+    match bound {
+        fsqlite_ast::FrameBound::Preceding(expr) | fsqlite_ast::FrameBound::Following(expr) => {
+            canonicalize_expr_placeholders(expr, bind_state)?;
+        }
+        fsqlite_ast::FrameBound::UnboundedPreceding
+        | fsqlite_ast::FrameBound::CurrentRow
+        | fsqlite_ast::FrameBound::UnboundedFollowing => {}
+    }
+    Ok(())
+}
+
+fn canonicalize_expr_placeholders(expr: &mut Expr, bind_state: &mut BindParamState) -> Result<()> {
+    match expr {
+        Expr::BinaryOp { left, right, .. } => {
+            canonicalize_expr_placeholders(left, bind_state)?;
+            canonicalize_expr_placeholders(right, bind_state)?;
+        }
+        Expr::UnaryOp { expr: inner, .. }
+        | Expr::IsNull { expr: inner, .. }
+        | Expr::Cast { expr: inner, .. }
+        | Expr::Collate { expr: inner, .. } => {
+            canonicalize_expr_placeholders(inner, bind_state)?;
+        }
+        Expr::Between {
+            expr: inner,
+            low,
+            high,
+            ..
+        } => {
+            canonicalize_expr_placeholders(inner, bind_state)?;
+            canonicalize_expr_placeholders(low, bind_state)?;
+            canonicalize_expr_placeholders(high, bind_state)?;
+        }
+        Expr::In {
+            expr: inner, set, ..
+        } => {
+            canonicalize_expr_placeholders(inner, bind_state)?;
+            match set {
+                fsqlite_ast::InSet::List(values) => {
+                    for value in values {
+                        canonicalize_expr_placeholders(value, bind_state)?;
+                    }
+                }
+                fsqlite_ast::InSet::Subquery(query) => {
+                    canonicalize_select_placeholders_in_statement(query, bind_state)?;
+                }
+                fsqlite_ast::InSet::Table(_) => {}
+            }
+        }
+        Expr::Like {
+            expr: inner,
+            pattern,
+            escape,
+            ..
+        } => {
+            canonicalize_expr_placeholders(inner, bind_state)?;
+            canonicalize_expr_placeholders(pattern, bind_state)?;
+            if let Some(escape_expr) = escape {
+                canonicalize_expr_placeholders(escape_expr, bind_state)?;
+            }
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            if let Some(base) = operand {
+                canonicalize_expr_placeholders(base, bind_state)?;
+            }
+            for (when_expr, then_expr) in whens {
+                canonicalize_expr_placeholders(when_expr, bind_state)?;
+                canonicalize_expr_placeholders(then_expr, bind_state)?;
+            }
+            if let Some(else_branch) = else_expr {
+                canonicalize_expr_placeholders(else_branch, bind_state)?;
+            }
+        }
+        Expr::Subquery(subquery, _) | Expr::Exists { subquery, .. } => {
+            canonicalize_select_placeholders_in_statement(subquery, bind_state)?;
+        }
+        Expr::FunctionCall {
+            args, filter, over, ..
+        } => {
+            if let FunctionArgs::List(list) = args {
+                for arg in list {
+                    canonicalize_expr_placeholders(arg, bind_state)?;
+                }
+            }
+            if let Some(filter_expr) = filter {
+                canonicalize_expr_placeholders(filter_expr, bind_state)?;
+            }
+            if let Some(window_spec) = over {
+                canonicalize_placeholders_in_window_spec(window_spec, bind_state)?;
+            }
+        }
+        Expr::JsonAccess { expr: inner, path, .. } => {
+            canonicalize_expr_placeholders(inner, bind_state)?;
+            canonicalize_expr_placeholders(path, bind_state)?;
+        }
+        Expr::RowValue(values, _) => {
+            for value in values {
+                canonicalize_expr_placeholders(value, bind_state)?;
+            }
+        }
+        Expr::Placeholder(placeholder, span) => {
+            let index = placeholder_to_index(placeholder, bind_state)?;
+            let numbered = u32::try_from(index).map_err(|_| FrankenError::OutOfRange {
+                what: "placeholder index".to_owned(),
+                value: index.to_string(),
+            })?;
+            *expr = Expr::Placeholder(PlaceholderType::Numbered(numbered), *span);
+        }
+        Expr::Literal(_, _) | Expr::Column(_, _) | Expr::Raise { .. } => {}
+    }
+    Ok(())
+}
+
 /// Bind SELECT placeholders to literal values for fallback evaluators.
 ///
 /// Fallback JOIN/GROUP BY paths interpret expressions directly instead of
@@ -27336,6 +27607,48 @@ mod tests {
         assert_eq!(
             row_values(&rows[0]),
             vec![SqliteValue::Text("two".to_owned())]
+        );
+    }
+
+    #[test]
+    fn test_table_select_anonymous_placeholder_on_indexed_column_uses_single_binding() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.set_reject_mem_fallback(true);
+        conn.execute("CREATE TABLE issues (id TEXT PRIMARY KEY, title TEXT NOT NULL);")
+            .unwrap();
+        conn.execute("INSERT INTO issues VALUES ('bd-1', 'first'), ('bd-2', 'second');")
+            .unwrap();
+
+        let row = conn
+            .query_row_with_params(
+                "SELECT title FROM issues WHERE id = ?",
+                &[SqliteValue::Text("bd-2".to_owned())],
+            )
+            .unwrap();
+
+        assert_eq!(row_values(&row), vec![SqliteValue::Text("second".to_owned())]);
+    }
+
+    #[test]
+    fn test_prepared_table_select_anonymous_placeholder_on_indexed_column_uses_single_binding() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.set_reject_mem_fallback(true);
+        conn.execute("CREATE TABLE issues (id TEXT PRIMARY KEY, title TEXT NOT NULL);")
+            .unwrap();
+        conn.execute("INSERT INTO issues VALUES ('bd-1', 'first'), ('bd-2', 'second');")
+            .unwrap();
+
+        let stmt = conn
+            .prepare("SELECT title FROM issues WHERE id = ?")
+            .unwrap();
+        let rows = stmt
+            .query_with_params(&[SqliteValue::Text("bd-1".to_owned())])
+            .unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![SqliteValue::Text("first".to_owned())]
         );
     }
 
@@ -33787,6 +34100,32 @@ mod tests {
                         match conn.execute("UPDATE t SET v = v + 1 WHERE id = 1;") {
                             Ok(changes) => {
                                 assert_eq!(changes, 1, "expected one-row update");
+                                let session_id = conn
+                                    .concurrent_session_id
+                                    .borrow()
+                                    .expect("concurrent session should stay active after UPDATE");
+                                let concurrent_write_set_len = {
+                                    let registry = lock_unpoisoned(&conn.concurrent_registry);
+                                    registry
+                                        .get(session_id)
+                                        .expect("concurrent session handle missing after UPDATE")
+                                        .write_set_len()
+                                };
+                                assert!(
+                                    concurrent_write_set_len > 0,
+                                    "UPDATE reported success but concurrent write set is empty"
+                                );
+                                let pager_has_pending_writes = conn
+                                    .active_txn
+                                    .borrow()
+                                    .as_ref()
+                                    .is_some_and(|txn| {
+                                        fsqlite_pager::TransactionHandle::has_pending_writes(&**txn)
+                                    });
+                                assert!(
+                                    pager_has_pending_writes,
+                                    "UPDATE reported success but pager transaction has no pending writes"
+                                );
                             }
                             Err(err) if err.is_transient() => {
                                 retries += 1;
@@ -33821,10 +34160,18 @@ mod tests {
             Some(other) => panic!("expected integer final value, got {other:?}"),
             None => panic!("missing final value column"),
         };
+        let sqlite_value: i64 = rusqlite::Connection::open(&db)
+            .unwrap()
+            .query_row("SELECT v FROM t WHERE id = 1;", [], |row| row.get(0))
+            .unwrap();
         let expected = i64::try_from(WORKERS * TXNS_PER_WORKER).unwrap();
         assert_eq!(
-            final_value, expected,
-            "bd-rjc single-account probe mismatch: final_value={final_value} expected={expected} retries={retries}"
+            final_value, sqlite_value,
+            "bd-rjc verifier mismatch: final_value={final_value} sqlite_value={sqlite_value} expected={expected} retries={retries}"
+        );
+        assert_eq!(
+            sqlite_value, expected,
+            "bd-rjc single-account probe mismatch: sqlite_value={sqlite_value} final_value={final_value} expected={expected} retries={retries}"
         );
     }
 
@@ -48465,7 +48812,8 @@ mod pager_routing_tests {
         let mut page = txn.get_page(&cx, page_no).unwrap().into_vec();
         let header_offset = fsqlite_btree::header_offset_for_page(page_no);
         let header = fsqlite_btree::BtreePageHeader::parse(&page, header_offset).unwrap();
-        let cell_pointers = fsqlite_btree::read_cell_pointers(&page, &header, header_offset).unwrap();
+        let cell_pointers =
+            fsqlite_btree::read_cell_pointers(&page, &header, header_offset).unwrap();
         let cell = fsqlite_btree::CellRef::parse(
             &page,
             usize::from(cell_pointers[0]),
@@ -48499,14 +48847,20 @@ mod pager_routing_tests {
             .unwrap();
         conn.execute("INSERT INTO t VALUES (1, 'Alice');").unwrap();
 
+        conn.execute("BEGIN IMMEDIATE;").unwrap();
         let cx = Cx::new();
-        let mut txn = conn.pager.begin(&cx, TransactionMode::Immediate).unwrap();
-        let mut page1 = txn.get_page(&cx, PageNumber::ONE).unwrap().into_vec();
-        page1[36..40].copy_from_slice(&1_u32.to_be_bytes());
-        txn.write_page(&cx, PageNumber::ONE, &page1).unwrap();
-        txn.commit(&cx).unwrap();
+        {
+            let mut active_txn = conn.active_txn.borrow_mut();
+            let txn = active_txn
+                .as_deref_mut()
+                .expect("explicit BEGIN should create an active pager transaction");
+            let mut page1 = txn.get_page(&cx, PageNumber::ONE).unwrap().into_vec();
+            page1[36..40].copy_from_slice(&1_u32.to_be_bytes());
+            txn.write_page(&cx, PageNumber::ONE, &page1).unwrap();
+        }
 
         let rows = conn.query("PRAGMA integrity_check;").unwrap();
+        conn.execute("ROLLBACK;").unwrap();
         assert_eq!(rows.len(), 1);
         let SqliteValue::Text(message) = &rows[0].values()[0] else {
             panic!("integrity_check should return a text diagnostic row");

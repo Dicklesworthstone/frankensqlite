@@ -27,6 +27,8 @@ asupersync.workspace = true
 proptest = { workspace = true }
 tempfile = { workspace = true }
 blake3 = { workspace = true }
+fsqlite-wal = { workspace = true }
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

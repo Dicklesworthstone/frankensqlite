@@ -1,0 +1,425 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frankensqlite.local/schemas/sample_sqlite_db_files/beads_benchmark_campaign.v1.schema.json",
+  "title": "FrankenSQLite Canonical Beads Benchmark Campaign (v1)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "bead_id",
+    "campaign_id",
+    "description",
+    "fixture_root",
+    "build_profile",
+    "beads_data_source",
+    "seed_policy",
+    "retry_policy",
+    "hardware_classes",
+    "placement_profiles",
+    "fixtures",
+    "workloads",
+    "modes",
+    "scenarios",
+    "artifact_naming"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "fsqlite-e2e.canonical_beads_benchmark_campaign.v1"
+    },
+    "bead_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "campaign_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "description": {
+      "type": "string",
+      "minLength": 1
+    },
+    "fixture_root": {
+      "type": "string",
+      "minLength": 1
+    },
+    "build_profile": {
+      "type": "string",
+      "minLength": 1
+    },
+    "beads_data_source": {
+      "$ref": "#/$defs/beads_data_source"
+    },
+    "seed_policy": {
+      "$ref": "#/$defs/seed_policy"
+    },
+    "retry_policy": {
+      "$ref": "#/$defs/retry_policy"
+    },
+    "hardware_classes": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/hardware_class"
+      }
+    },
+    "placement_profiles": {
+      "type": "array",
+      "minItems": 2,
+      "items": {
+        "$ref": "#/$defs/placement_profile"
+      }
+    },
+    "fixtures": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/fixture"
+      }
+    },
+    "workloads": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/workload"
+      }
+    },
+    "modes": {
+      "type": "array",
+      "minItems": 3,
+      "items": {
+        "$ref": "#/$defs/mode"
+      }
+    },
+    "scenarios": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/scenario"
+      }
+    },
+    "artifact_naming": {
+      "$ref": "#/$defs/artifact_naming"
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9_\\-]{1,127}$"
+    },
+    "beads_data_source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "hash_algorithm"],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "hash_algorithm": {
+          "type": "string",
+          "const": "sha256"
+        }
+      }
+    },
+    "seed_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "root_seed", "worker_seed_derivation", "notes"],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "root_seed": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "worker_seed_derivation": {
+          "type": "string",
+          "minLength": 1
+        },
+        "notes": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "retry_mode": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_busy_retries", "backoff_base_ms", "backoff_cap_ms"],
+      "properties": {
+        "max_busy_retries": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "backoff_base_ms": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "backoff_cap_ms": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "busy_timeout_ms": {
+          "type": ["integer", "null"],
+          "minimum": 0
+        }
+      }
+    },
+    "retry_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "sqlite", "fsqlite", "notes"],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "sqlite": {
+          "$ref": "#/$defs/retry_mode"
+        },
+        "fsqlite": {
+          "$ref": "#/$defs/retry_mode"
+        },
+        "notes": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "hardware_class": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "cpu_model",
+        "logical_cpus",
+        "physical_cores",
+        "sockets",
+        "numa_nodes",
+        "llc_domains",
+        "smt_enabled",
+        "notes"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "cpu_model": {
+          "type": "string",
+          "minLength": 1
+        },
+        "logical_cpus": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "physical_cores": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "sockets": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "numa_nodes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "llc_domains": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "smt_enabled": {
+          "type": "boolean"
+        },
+        "notes": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "placement_profile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "kind", "hardware_class_ids", "notes"],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "kind": {
+          "type": "string",
+          "enum": ["baseline", "recommended", "adversarial"]
+        },
+        "hardware_class_ids": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/id"
+          }
+        },
+        "taskset_cpu_list_by_concurrency": {
+          "type": "object",
+          "default": {},
+          "additionalProperties": {
+            "type": "string",
+            "pattern": "^[0-9,\\-]+$"
+          }
+        },
+        "notes": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "fixture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "source_path",
+        "snapshot_path",
+        "sha256",
+        "size_bytes",
+        "digest_source",
+        "notes"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "source_path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "snapshot_path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "size_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "digest_source": {
+          "type": "string",
+          "minLength": 1
+        },
+        "notes": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "workload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "description", "scale", "notes"],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1
+        },
+        "scale": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "notes": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "mode": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "benchmark_engine_label", "engine", "concurrent_mode", "notes"],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "benchmark_engine_label": {
+          "type": "string",
+          "minLength": 1
+        },
+        "engine": {
+          "type": "string",
+          "enum": ["sqlite3", "fsqlite"]
+        },
+        "concurrent_mode": {
+          "type": ["boolean", "null"]
+        },
+        "notes": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "scenario": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fixture_id", "workload_id", "concurrency", "mode_ids", "placement_profile_ids"],
+      "properties": {
+        "fixture_id": {
+          "$ref": "#/$defs/id"
+        },
+        "workload_id": {
+          "$ref": "#/$defs/id"
+        },
+        "concurrency": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "mode_ids": {
+          "type": "array",
+          "minItems": 3,
+          "items": {
+            "$ref": "#/$defs/id"
+          }
+        },
+        "placement_profile_ids": {
+          "type": "array",
+          "minItems": 2,
+          "items": {
+            "$ref": "#/$defs/id"
+          }
+        }
+      }
+    },
+    "artifact_naming": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["output_root", "directory_template", "file_stem_template", "required_context"],
+      "properties": {
+        "output_root": {
+          "type": "string",
+          "minLength": 1
+        },
+        "directory_template": {
+          "type": "string",
+          "minLength": 1
+        },
+        "file_stem_template": {
+          "type": "string",
+          "minLength": 1
+        },
+        "required_context": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    }
+  }
+}
