@@ -495,9 +495,9 @@ enum InflightRole {
 /// Core ARC state.  Not thread-safe — wrap in [`ArcCache`] for concurrent use.
 pub struct ArcCacheInner {
     /// Recently accessed pages (recency-favoured).
-    t1: IntrusiveList<CachedPage>,
+    t1: IntrusiveList<Arc<CachedPage>>,
     /// Frequently accessed pages (frequency-favoured).
-    t2: IntrusiveList<CachedPage>,
+    t2: IntrusiveList<Arc<CachedPage>>,
     /// Ghost entries evicted from T1 (keys only).
     b1: IntrusiveList<CacheKey>,
     /// Ghost entries evicted from T2 (keys only).
@@ -842,15 +842,20 @@ impl ArcCacheInner {
         self.t1.front().map(|page| page.key)
     }
 
+    #[cfg(test)]
+    fn t1_mru_key(&self) -> Option<CacheKey> {
+        self.t1.back().map(|page| page.key)
+    }
+
     /// Get a reference to a cached page by key.
     ///
     /// Does **not** modify list ordering.  Call [`Self::request`] first to
     /// trigger ARC promotion/refresh logic.
     #[must_use]
-    pub fn get(&self, key: &CacheKey) -> Option<&CachedPage> {
+    pub fn get(&self, key: &CacheKey) -> Option<Arc<CachedPage>> {
         match self.directory.get(key)? {
-            Location::T1(idx) => self.t1.get(*idx),
-            Location::T2(idx) => self.t2.get(*idx),
+            Location::T1(idx) => self.t1.get(*idx).cloned(),
+            Location::T2(idx) => self.t2.get(*idx).cloned(),
             Location::B1(_) | Location::B2(_) => None,
         }
     }
@@ -1007,10 +1012,6 @@ impl ArcCacheInner {
             .or_default()
             .push(key.commit_seq);
 
-        // Phase 2.5 was removed: opportunistic version coalescing here caused O(N)
-        // latency spikes on the hot path. Superseded versions are reclaimed
-        // asynchronously by the GC thread or lazily by `evict_one_preferred`.
-
         // Phase 3: enforce byte limit (dual trigger).
         while self.max_bytes > 0 && self.total_bytes > self.max_bytes && self.len() > 1 {
             if !self.evict_one_preferred() {
@@ -1144,7 +1145,7 @@ impl ArcCacheInner {
     }
 
     /// Find the first unpinned node from the head (LRU end).
-    fn find_unpinned_victim(list: &IntrusiveList<CachedPage>) -> Option<SlabIdx> {
+    fn find_unpinned_victim(list: &IntrusiveList<Arc<CachedPage>>) -> Option<SlabIdx> {
         for (idx, page) in list.iter() {
             if !page.is_pinned() {
                 return Some(idx);
@@ -1156,7 +1157,7 @@ impl ArcCacheInner {
     /// Find a superseded, unpinned victim: a page whose `PageNumber` has
     /// more than one version cached, AND whose `commit_seq` is below the
     /// GC horizon.
-    fn find_superseded_victim(&self, list: &IntrusiveList<CachedPage>) -> Option<SlabIdx> {
+    fn find_superseded_victim(&self, list: &IntrusiveList<Arc<CachedPage>>) -> Option<SlabIdx> {
         for (idx, page) in list.iter().take(64) {
             if page.is_pinned() {
                 continue;
@@ -1179,7 +1180,7 @@ impl ArcCacheInner {
 
     fn enforce_limits(&mut self) {
         while self.len() > self.capacity
-            || (self.max_bytes > 0 && self.total_bytes > self.max_bytes)
+            || (self.max_bytes > 0 && self.total_bytes > self.max_bytes && self.len() > 1)
         {
             if !self.evict_one_preferred() {
                 self.capacity_overflow_events = self.capacity_overflow_events.saturating_add(1);
@@ -1266,9 +1267,9 @@ impl ArcCacheInner {
                 for (_, key, idx, is_t1) in versions.into_iter().skip(1) {
                     // Skip pinned pages.
                     let is_pinned = if is_t1 {
-                        self.t1.get(idx).is_some_and(CachedPage::is_pinned)
+                        self.t1.get(idx).is_some_and(|p| p.is_pinned())
                     } else {
-                        self.t2.get(idx).is_some_and(CachedPage::is_pinned)
+                        self.t2.get(idx).is_some_and(|p| p.is_pinned())
                     };
 
                     if is_pinned {
@@ -1446,23 +1447,59 @@ impl std::fmt::Debug for ArcCacheInner {
 
 /// Thread-safe ARC cache wrapping [`ArcCacheInner`] in a [`Mutex`].
 pub struct ArcCache {
-    inner: Mutex<ArcCacheInner>,
+    /// Sharded partitions to reduce lock contention (Alien Artifact §6.1).
+    /// Each shard is an independent ARC cache instance.
+    shards: Box<[Mutex<ArcCacheInner>]>,
+    /// Mask for fast shard indexing.
+    shard_mask: usize,
+    /// Singleflight miss path: suppress duplicate concurrent loads.
     inflight: Mutex<HashMap<CacheKey, Arc<InflightLoad>>>,
 }
 
 impl ArcCache {
+    /// Number of shards to use for the cache.
+    const SHARD_COUNT: usize = 16;
+
     /// Create a new thread-safe ARC cache.
     #[must_use]
     pub fn new(capacity: usize, max_bytes: usize) -> Self {
+        let shard_capacity = capacity / Self::SHARD_COUNT;
+        let shard_max_bytes = max_bytes / Self::SHARD_COUNT;
+
+        let mut shards = Vec::with_capacity(Self::SHARD_COUNT);
+        for _ in 0..Self::SHARD_COUNT {
+            shards.push(Mutex::new(ArcCacheInner::new(shard_capacity, shard_max_bytes)));
+        }
+
         Self {
-            inner: Mutex::new(ArcCacheInner::new(capacity, max_bytes)),
+            shards: shards.into_boxed_slice(),
+            shard_mask: Self::SHARD_COUNT - 1,
             inflight: Mutex::new(HashMap::new()),
         }
     }
 
+    /// Select the shard for a given key.
+    #[inline]
+    fn select_shard(&self, key: &CacheKey) -> &Mutex<ArcCacheInner> {
+        let mut hasher = foldhash::fast::FixedState::default().build_hasher();
+        use std::hash::Hasher;
+use std::hash::BuildHasher;
+        std::hash::Hash::hash(key, &mut hasher);
+        let hash = hasher.finish() as usize;
+        &self.shards[hash & self.shard_mask]
+    }
+
     /// Acquire the inner lock for direct manipulation.
     pub fn lock(&self) -> fsqlite_types::sync_primitives::MutexGuard<'_, ArcCacheInner> {
-        self.inner.lock()
+        self.shards[0].lock()
+    }
+
+    /// Optimized sharded get.
+    #[must_use]
+    pub fn get(&self, key: &CacheKey) -> Option<Arc<CachedPage>> {
+        let shard = self.select_shard(key);
+        let inner = shard.lock();
+        inner.get(key)
     }
 
     /// Singleflight miss path: suppress duplicate concurrent loads for `key`.
@@ -1814,7 +1851,7 @@ mod tests {
         let l = cache.request(&k4);
         cache.admit(k4, page(k4, 4096), l);
 
-        assert!(cache.in_b2(&k1), "setup requires k1 in B2");
+        assert!(cache.in_b2(&k1), "setup requires B2 ghost");
 
         // Set |T1| == p so B2 ghost hit uses the tie-breaker.
         let t1_before = cache.t1_lru_key().expect("T1 must be non-empty"); // k3
@@ -1855,7 +1892,7 @@ mod tests {
             "fallback should evict from T2 when preferred T1 victim is pinned"
         );
         assert!(cache.get(&incoming).is_some());
-        cache.get(&pinned).expect("pinned page exists").unpin();
+        let _ = cache.unpin(&pinned);
     }
 
     #[test]
@@ -1866,14 +1903,14 @@ mod tests {
 
         let l = cache.request(&pinned);
         cache.admit(pinned, page(pinned, 4096), l);
-        cache.get(&pinned).expect("page exists").pin();
+        cache.get(&pinned).expect("pinned page exists").pin();
 
         let l = cache.request(&incoming);
         cache.admit(incoming, page(incoming, 4096), l);
 
         assert_eq!(cache.capacity_overflow_events(), 1);
         assert_eq!(cache.len(), 2, "safety valve allows temporary growth");
-        cache.get(&pinned).expect("page exists").unpin();
+        let _ = cache.unpin(&pinned);
     }
 
     #[test]
@@ -2665,7 +2702,7 @@ mod tests {
             cache.admit(k, page(k, 4096), lookup);
         }
 
-        cache.get(&old).expect("old version should exist").pin();
+        cache.get(&old).expect("old version must exist").pin();
         cache.set_gc_horizon(CommitSeq::new(2));
 
         assert!(
@@ -3264,6 +3301,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cast_possible_truncation)]
     fn test_arc_zipf_hit_rate() {
         // Zipfian s=1.0 workload over 10K pages, cache=2000.
         // Expected ARC hit rate > 0.80.
@@ -3298,7 +3336,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::cast_possible_truncation)]
     fn test_arc_mvcc_hit_rate() {
         // MVCC 8 writers: 800 hot pages, each writer produces new versions.
         // Cache=2000. Expected hit rate > 0.65.
@@ -3318,6 +3355,7 @@ mod tests {
             if !matches!(l, CacheLookup::Hit) {
                 cache.admit(k, page(k, 4096), l);
             }
+            let _ = cache.request(&k);
         }
 
         // Simulate 8 writers, each round producing new versions.

@@ -1777,7 +1777,7 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 fn drain_abandoned_work(
-    receiver: &mpsc::Receiver<WalFecPipelineMessage>,
+    receiver: &mut mpsc::Receiver<WalFecPipelineMessage>,
     pending_jobs: &AtomicUsize,
     canceled_jobs: &AtomicUsize,
 ) {

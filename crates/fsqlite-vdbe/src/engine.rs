@@ -776,6 +776,31 @@ impl PageReader for SharedTxnPageIo {
         let page = self.txn.borrow().get_page(cx, page_no)?.into_vec();
         Ok(page)
     }
+
+    fn record_read_witness(&self, _cx: &Cx, key: WitnessKey) {
+        if let Some(ctx) = &self.concurrent {
+            let mut guard = ctx
+                .registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(handle) = guard.get_mut(ctx.session_id) {
+                handle.record_read_witness(key);
+            }
+        }
+    }
+
+    fn is_dirty(&self, page_no: PageNumber) -> bool {
+        if let Some(ctx) = &self.concurrent {
+            let guard = ctx
+                .registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(handle) = guard.get(ctx.session_id) {
+                return handle.write_set().contains_key(&page_no);
+            }
+        }
+        false
+    }
 }
 
 impl PageWriter for SharedTxnPageIo {
@@ -1236,6 +1261,12 @@ struct StorageCursor {
     last_alloc_rowid: i64,
     /// Pre-allocated buffer to read payloads into without allocating.
     payload_buf: Vec<u8>,
+    /// Scratch buffer for parsing target index keys.
+    target_vals_buf: Vec<SqliteValue>,
+    /// Scratch buffer for parsing current index keys.
+    cur_vals_buf: Vec<SqliteValue>,
+    /// Cache the cursor's physical position to avoid redundant payload reads.
+    last_position_stamp: Option<(u32, u16)>,
 }
 
 /// Lightweight version token for `MemDatabase` undo/rollback (bd-g6eo).
@@ -3085,6 +3116,9 @@ impl VdbeEngine {
                             writable: false, // Time-travel is always read-only
                             last_alloc_rowid: 0,
                             payload_buf: Vec::new(),
+                            target_vals_buf: Vec::new(),
+                            cur_vals_buf: Vec::new(),
+                            last_position_stamp: None,
                         },
                     );
                     tracing::info!(
@@ -3698,6 +3732,9 @@ impl VdbeEngine {
                                 writable: true,
                                 last_alloc_rowid: 0,
                                 payload_buf: Vec::new(),
+                                target_vals_buf: Vec::new(),
+                                cur_vals_buf: Vec::new(),
+                                last_position_stamp: None,
                             },
                         );
                     }
@@ -4614,7 +4651,7 @@ impl VdbeEngine {
                     let rowid_reg = op.p3;
                     let oe_flag = op.p5 & 0x0F; // Low 4 bits for OE_* mode
                     let rowid = self.get_reg(rowid_reg).to_integer();
-                    let record_val = self.get_reg(record_reg).clone();
+                    let record_val = self.get_reg(record_reg);
                     let previous_last_insert_rowid = self.last_insert_rowid;
                     let pk_conflict = ExecOutcome::Error {
                         code: ErrorCode::Constraint as i32,
@@ -6825,6 +6862,9 @@ impl VdbeEngine {
                         writable,
                         last_alloc_rowid: 0,
                         payload_buf: Vec::new(),
+                        target_vals_buf: Vec::new(),
+                        cur_vals_buf: Vec::new(),
+                        last_position_stamp: None,
                     },
                 );
                 tracing::debug!(
@@ -6896,6 +6936,9 @@ impl VdbeEngine {
                         writable,
                         last_alloc_rowid: 0,
                         payload_buf: Vec::new(),
+                        target_vals_buf: Vec::new(),
+                        cur_vals_buf: Vec::new(),
+                        last_position_stamp: None,
                     },
                 );
                 tracing::debug!(
@@ -6998,6 +7041,9 @@ impl VdbeEngine {
                 writable,
                 last_alloc_rowid: 0,
                 payload_buf: Vec::new(),
+                target_vals_buf: Vec::new(),
+                cur_vals_buf: Vec::new(),
+                last_position_stamp: None,
             },
         );
         tracing::debug!(
@@ -7256,8 +7302,8 @@ fn find_conflicting_rowid_in_index(
 
         if prefix_match && !has_null {
             // Extract the rowid (last field in the index entry).
-            let old_rowid = if let Some(SqliteValue::Integer(rid)) = entry_fields_buf.last() {
-                *rid
+            let old_rowid = if let Some(SqliteValue::Integer(my_rid)) = entry_fields_buf.last() {
+                *my_rid
             } else {
                 // Fallback: try cursor rowid.
                 sc.cursor.rowid(&sc.cx).unwrap_or(0)

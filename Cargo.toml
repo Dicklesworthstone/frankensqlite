@@ -25,7 +25,7 @@ members = [
     "crates/fsqlite",
     "crates/fsqlite-cli",
     "crates/fsqlite-harness",
-    #"crates/fsqlite-e2e",
+    "crates/fsqlite-e2e",
     "crates/fsqlite-observability",
     "crates/fsqlite-c-api",
     "crates/fsqlite-wasm",

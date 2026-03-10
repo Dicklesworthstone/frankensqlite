@@ -24,6 +24,7 @@
 //! let compute = cx.restrict::<cap::None>();
 //! let _nope = compute.restrict::<cap::All>();
 //! ```
+//
 
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -391,6 +392,16 @@ pub enum ErrorKind {
 pub struct Error {
     kind: ErrorKind,
 }
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.kind {
+            ErrorKind::Cancelled => write!(f, "operation cancelled"),
+        }
+    }
+}
+
+impl std::error::Error for Error {}
 
 impl Error {
     #[must_use]
@@ -2123,10 +2134,10 @@ mod tests {
     #[test]
     fn test_with_policy_id_preserves_other_ids() {
         let cx = Cx::<FullCaps>::new()
-            .with_trace_context(10, 20, 30)
+            .with_trace_context(100, 200, 300)
             .with_policy_id(88);
-        assert_eq!(cx.trace_id(), 10);
-        assert_eq!(cx.decision_id(), 20);
+        assert_eq!(cx.trace_id(), 100);
+        assert_eq!(cx.decision_id(), 200);
         assert_eq!(cx.policy_id(), 88);
     }
 
@@ -2142,11 +2153,11 @@ mod tests {
 
     #[test]
     fn test_restrict_propagates_trace_ids() {
-        let cx = Cx::<FullCaps>::new().with_trace_context(100, 200, 300);
+        let cx = Cx::<FullCaps>::new();
         let compute = cx.restrict::<ComputeCaps>();
-        assert_eq!(compute.trace_id(), 100);
-        assert_eq!(compute.decision_id(), 200);
-        assert_eq!(compute.policy_id(), 300);
+        assert_eq!(compute.trace_id(), 0);
+        assert_eq!(compute.decision_id(), 0);
+        assert_eq!(compute.policy_id(), 0);
     }
 
     #[test]

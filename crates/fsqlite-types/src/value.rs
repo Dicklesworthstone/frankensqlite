@@ -54,21 +54,22 @@ fn scan_numeric_prefix(bytes: &[u8]) -> usize {
     i
 }
 
-/// Parse the longest numeric prefix of `s` as an integer, matching SQLite's
-/// `sqlite3Atoi64` behavior. Leading whitespace is skipped, an optional sign
-/// is consumed, then decimal digits. If the prefix includes a decimal point
-/// or exponent, the float value is truncated to i64. Returns 0 if no numeric
-/// prefix is found.
+/// Parse the longest numeric prefix of `b` as an integer.
 #[allow(clippy::cast_possible_truncation)]
-fn parse_integer_prefix(s: &str) -> i64 {
-    let trimmed = s.trim_start();
-    let end = scan_numeric_prefix(trimmed.as_bytes());
+fn parse_integer_prefix_bytes(b: &[u8]) -> i64 {
+    let mut start = 0;
+    while start < b.len() && b[start].is_ascii_whitespace() {
+        start += 1;
+    }
+    let trimmed = &b[start..];
+    let end = scan_numeric_prefix(trimmed);
     if end == 0 {
         return 0;
     }
-
-    let f = trimmed[..end].parse::<f64>().unwrap_or(0.0);
-    // Clamp to i64 range, matching SQLite behavior for overflow.
+    // SAFETY: scan_numeric_prefix only advances over ASCII bytes (digits, +, -, ., e, E),
+    // so the slice is always valid UTF-8.
+    let s = std::str::from_utf8(&trimmed[..end]).unwrap_or("");
+    let f = s.parse::<f64>().unwrap_or(0.0);
     #[allow(clippy::manual_clamp)]
     if f >= i64::MAX as f64 {
         i64::MAX
@@ -79,20 +80,32 @@ fn parse_integer_prefix(s: &str) -> i64 {
     }
 }
 
-/// Parse the longest numeric prefix of `s` as a float, matching SQLite's
-/// `sqlite3AtoF` behavior. Leading whitespace is skipped. Recognizes:
-/// optional sign, digits, optional decimal point + digits, optional
-/// exponent (e/E + optional sign + digits). Returns 0.0 if no numeric prefix
-/// is found. Does NOT recognize "nan"/"inf"/"infinity" or text hex forms
-/// like `"0x10"` (matching C SQLite coercion rules).
-fn parse_float_prefix(s: &str) -> f64 {
-    let trimmed = s.trim_start();
-    let end = scan_numeric_prefix(trimmed.as_bytes());
+/// Parse the longest numeric prefix of `s` as an integer.
+#[allow(clippy::cast_possible_truncation)]
+fn parse_integer_prefix(s: &str) -> i64 {
+    parse_integer_prefix_bytes(s.as_bytes())
+}
+
+/// Parse the longest numeric prefix of `b` as a float.
+fn parse_float_prefix_bytes(b: &[u8]) -> f64 {
+    let mut start = 0;
+    while start < b.len() && b[start].is_ascii_whitespace() {
+        start += 1;
+    }
+    let trimmed = &b[start..];
+    let end = scan_numeric_prefix(trimmed);
     if end == 0 {
         return 0.0;
     }
+    // SAFETY: scan_numeric_prefix only advances over ASCII bytes (digits, +, -, ., e, E),
+    // so the slice is always valid UTF-8.
+    let s = std::str::from_utf8(&trimmed[..end]).unwrap_or("");
+    s.parse::<f64>().unwrap_or(0.0)
+}
 
-    trimmed[..end].parse::<f64>().unwrap_or(0.0)
+/// Parse the longest numeric prefix of `s` as a float.
+fn parse_float_prefix(s: &str) -> f64 {
+    parse_float_prefix_bytes(s.as_bytes())
 }
 
 fn cast_text_prefix_to_numeric(s: &str) -> SqliteValue {
@@ -322,10 +335,7 @@ impl SqliteValue {
             Self::Integer(i) => *i,
             Self::Float(f) => *f as i64,
             Self::Text(s) => parse_integer_prefix(s),
-            Self::Blob(b) => {
-                let s = String::from_utf8_lossy(b);
-                parse_integer_prefix(&s)
-            }
+            Self::Blob(b) => parse_integer_prefix_bytes(b),
         }
     }
 
@@ -343,10 +353,7 @@ impl SqliteValue {
             Self::Integer(i) => *i as f64,
             Self::Float(f) => *f,
             Self::Text(s) => parse_float_prefix(s),
-            Self::Blob(b) => {
-                let s = String::from_utf8_lossy(b);
-                parse_float_prefix(&s)
-            }
+            Self::Blob(b) => parse_float_prefix_bytes(b),
         }
     }
 

@@ -428,7 +428,7 @@ fn ssi_anomaly_committed_pivot_abort() {
         begin_seq: CommitSeq::new(5),
         commit_seq: CommitSeq::new(10),
         had_in_rw: true,
-        keys: vec![WitnessKey::Page(test_page(100))],
+        keys: vec![WitnessKey::Page(test_page(50))],
     };
 
     // T2 writes page 50 (which T1 read) → incoming edge from committed reader.

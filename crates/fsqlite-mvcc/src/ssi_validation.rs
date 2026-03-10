@@ -1180,37 +1180,20 @@ fn record_evidence_decision(
     );
     let _guard = span.enter();
 
-    let mut draft = SsiDecisionCardDraft::new(
-        decision_type,
-        txn,
-        begin_seq,
-        conflicting_txns.clone(),
-        conflict_pages.clone(),
-        read_pages.clone(),
-        write_pages.clone(),
-        rationale,
-    )
-    .with_decision_id(decision_id);
-    if let Some(seq) = commit_seq {
-        draft = draft.with_commit_seq(seq);
-    }
-    ssi_evidence_ledger().record_async(draft);
-
-    if matches!(decision_type, SsiDecisionType::CommitAllowed) {
-        FSQLITE_EVIDENCE_RECORDS_TOTAL_COMMIT.fetch_add(1, Ordering::Relaxed);
-    } else {
-        FSQLITE_EVIDENCE_RECORDS_TOTAL_ABORT.fetch_add(1, Ordering::Relaxed);
-    }
+    let r_len = read_pages.len();
+    let w_len = write_pages.len();
+    let cx_len = conflicting_txns.len();
+    let cp_len = conflict_pages.len();
 
     info!(
         decision_id,
         outcome,
         decision_type = %decision_type,
         txn_id = txn.id.get(),
-        read_pages = read_pages.len(),
-        write_pages = write_pages.len(),
-        conflicting_txns = conflicting_txns.len(),
-        conflict_pages = conflict_pages.len(),
+        read_pages = r_len,
+        write_pages = w_len,
+        conflicting_txns = cx_len,
+        conflict_pages = cp_len,
         "ssi decision evidence recorded"
     );
     debug!(
@@ -1224,6 +1207,28 @@ fn record_evidence_decision(
         rationale,
         "ssi decision evidence details"
     );
+
+    let mut draft = SsiDecisionCardDraft::new(
+        decision_type,
+        txn,
+        begin_seq,
+        conflicting_txns,
+        conflict_pages,
+        read_pages,
+        write_pages,
+        rationale,
+    )
+    .with_decision_id(decision_id);
+    if let Some(seq) = commit_seq {
+        draft = draft.with_commit_seq(seq);
+    }
+    ssi_evidence_ledger().record_async(draft);
+
+    if matches!(decision_type, SsiDecisionType::CommitAllowed) {
+        FSQLITE_EVIDENCE_RECORDS_TOTAL_COMMIT.fetch_add(1, Ordering::Relaxed);
+    } else {
+        FSQLITE_EVIDENCE_RECORDS_TOTAL_ABORT.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 // ---------------------------------------------------------------------------

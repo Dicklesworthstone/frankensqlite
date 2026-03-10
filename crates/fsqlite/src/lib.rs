@@ -561,14 +561,14 @@ mod tests {
         conn.execute("INSERT INTO t VALUES (1);").unwrap();
 
         let m1 = conn.query("SELECT * FROM sqlite_master;").unwrap();
-        eprintln!("MASTER BEFORE BEGIN: {:?}", m1);
+        eprintln!("MAIN BEFORE BEGIN: {:?}", m1);
 
         conn.execute("BEGIN;").unwrap();
         conn.execute("INSERT INTO t VALUES (2);").unwrap();
         conn.execute("ROLLBACK;").unwrap();
 
         let m2 = conn.query("SELECT * FROM sqlite_master;").unwrap();
-        eprintln!("MASTER AFTER ROLLBACK: {:?}", m2);
+        eprintln!("MAIN AFTER ROLLBACK: {:?}", m2);
 
         let rows = conn.query("SELECT v FROM t;").unwrap();
         assert_eq!(rows.len(), 1);

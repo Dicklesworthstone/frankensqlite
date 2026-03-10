@@ -723,7 +723,7 @@ mod tests {
     #[test]
     fn test_hot_index_insert_read_key() {
         let idx = HotWitnessIndex::new(16, 256);
-        let key = WitnessKey::for_cell_read(page(2), b"user_id=42");
+        let key = WitnessKey::for_cell_read(page(2), page(2), b"user_id=42");
         let rks = range_keys_for(&key);
         let epoch = idx.current_epoch();
 
@@ -742,7 +742,7 @@ mod tests {
     #[test]
     fn test_hot_index_insert_write_key() {
         let idx = HotWitnessIndex::new(16, 256);
-        let key = WitnessKey::for_cell_read(page(2), b"user_id=42");
+        let key = WitnessKey::for_cell_read(page(2), page(2), b"user_id=42");
         let rks = range_keys_for(&key);
         let epoch = idx.current_epoch();
 
@@ -761,7 +761,7 @@ mod tests {
     #[test]
     fn test_hot_index_detects_rw_conflict() {
         let idx = HotWitnessIndex::new(16, 256);
-        let key = WitnessKey::for_cell_read(page(3), b"account=100");
+        let key = WitnessKey::for_cell_read(page(3), page(3), b"account=100");
         let rks = range_keys_for(&key);
         let epoch = idx.current_epoch();
 
@@ -800,7 +800,7 @@ mod tests {
         // Register 10 distinct keys from different transactions.
         let mut keys_and_slots: Vec<(WitnessKey, u32)> = Vec::new();
         for i in 0..10_u32 {
-            let key = WitnessKey::for_cell_read(page(i + 1), &i.to_le_bytes());
+            let key = WitnessKey::for_cell_read(page(i + 1), page(i + 1), &i.to_le_bytes());
             let rks = range_keys_for(&key);
             idx.register_read(i, epoch, &rks);
             idx.register_write(i + 10, epoch, &rks);
@@ -832,7 +832,7 @@ mod tests {
         let epoch1 = idx.current_epoch();
 
         // Register at epoch 1.
-        let key = WitnessKey::for_cell_read(page(5), b"key1");
+        let key = WitnessKey::for_cell_read(page(5), page(5), b"key1");
         let rks = range_keys_for(&key);
         idx.register_read(0, epoch1, &rks);
 
@@ -878,7 +878,7 @@ mod tests {
         // Fill the table with distinct keys.
         let mut all_keys = Vec::new();
         for i in 0..10_u32 {
-            let key = WitnessKey::for_cell_read(page(100 + i), &i.to_le_bytes());
+            let key = WitnessKey::for_cell_read(page(100 + i), page(100 + i), &i.to_le_bytes());
             let rks = range_keys_for(&key);
             idx.register_read(i, epoch, &rks);
             all_keys.push((key, i));
@@ -900,7 +900,7 @@ mod tests {
     #[test]
     fn test_epoch_lock_bounded_backoff() {
         let idx = HotWitnessIndex::new(4, 64);
-        let key = WitnessKey::for_cell_read(page(1), b"test");
+        let key = WitnessKey::for_cell_read(page(1), page(1), b"test");
         let rks = range_keys_for(&key);
 
         // Register at epoch 1 to create the bucket.
@@ -941,7 +941,7 @@ mod tests {
     fn test_witness_published_as_ecs_object() {
         let mut store = ColdWitnessStore::new();
         let txn = fsqlite_types::TxnId::new(42).unwrap();
-        let key = WitnessKey::for_cell_read(page(2), b"pk=1");
+        let key = WitnessKey::for_cell_read(page(2), page(2), b"pk=1");
 
         store.publish_read_witness(fsqlite_types::ReadWitness {
             txn,
@@ -963,7 +963,7 @@ mod tests {
         // and deserializing into a fresh store.
         let mut store = ColdWitnessStore::new();
         let txn = fsqlite_types::TxnId::new(99).unwrap();
-        let key = WitnessKey::for_cell_read(page(7), b"crash_test");
+        let key = WitnessKey::for_cell_read(page(7), page(7), b"crash_test");
 
         store.publish_read_witness(fsqlite_types::ReadWitness {
             txn,
@@ -1039,7 +1039,7 @@ mod tests {
                 thread::spawn(move || {
                     for i in 0..ops_per_thread {
                         let slot_id = t * ops_per_thread + i;
-                        let key = WitnessKey::for_cell_read(page(t + 1), &i.to_le_bytes());
+                        let key = WitnessKey::for_cell_read(page(t + 1), page(t + 1), &i.to_le_bytes());
                         let rks = derive_range_keys(&key, &config);
                         if i % 2 == 0 {
                             idx.register_read(slot_id, epoch, &rks);
@@ -1059,7 +1059,7 @@ mod tests {
         for t in 0..num_threads {
             for i in 0..ops_per_thread {
                 let slot_id = t * ops_per_thread + i;
-                let key = WitnessKey::for_cell_read(page(t + 1), &i.to_le_bytes());
+                let key = WitnessKey::for_cell_read(page(t + 1), page(t + 1), &i.to_le_bytes());
                 let rks = derive_range_keys(&key, &config);
                 if i % 2 == 0 {
                     let readers = bitset_to_slot_ids(&idx.candidate_readers(&rks));
@@ -1083,7 +1083,7 @@ mod tests {
     #[test]
     fn test_range_key_hierarchy_levels() {
         let config = default_config();
-        let key = WitnessKey::for_cell_read(page(2), b"example_key");
+        let key = WitnessKey::for_cell_read(page(2), page(2), b"example_key");
         let rks = derive_range_keys(&key, &config);
 
         assert_eq!(rks.len(), 3, "must derive 3 range keys (L0, L1, L2)");
@@ -1123,7 +1123,7 @@ mod tests {
         assert_eq!(rks, rks2, "range key derivation must be deterministic");
 
         // Different key produces different range keys (at some level).
-        let key2 = WitnessKey::for_cell_read(page(2), b"other_key");
+        let key2 = WitnessKey::for_cell_read(page(2), page(2), b"other_key");
         let rks3 = derive_range_keys(&key2, &config);
         assert_ne!(
             rks, rks3,

@@ -827,7 +827,7 @@ mod tests {
     }
 
     fn key(n: u32) -> WitnessKey {
-        WitnessKey::for_cell_read(page(n), &n.to_le_bytes())
+        WitnessKey::for_cell_read(page(n), page(n), &n.to_le_bytes())
     }
 
     fn make_proof(commit_seq: u64, edges: Vec<DependencyEdge>) -> CommitProof {
@@ -1292,7 +1292,7 @@ mod tests {
         let epoch = idx.current_epoch();
 
         // "Process A" registers a read witness.
-        let key_a = WitnessKey::for_cell_read(page(5), b"shared_key");
+        let key_a = WitnessKey::for_cell_read(page(5), page(5), b"shared_key");
         let rks = crate::witness_hierarchy::derive_range_keys(&key_a, &config);
         idx.register_read(0, epoch, &rks);
 
@@ -1312,7 +1312,7 @@ mod tests {
         let config = crate::witness_hierarchy::WitnessHierarchyConfigV1::default();
         let epoch = idx.current_epoch();
 
-        let shared_key = WitnessKey::for_cell_read(page(10), b"account=100");
+        let shared_key = WitnessKey::for_cell_read(page(10), page(10), b"account=100");
         let rks = crate::witness_hierarchy::derive_range_keys(&shared_key, &config);
 
         // "Process A" reads.

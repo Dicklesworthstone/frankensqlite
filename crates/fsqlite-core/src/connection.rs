@@ -631,11 +631,11 @@ pub struct PreparedStatement<'conn> {
     /// here so that `Connection::execute_prepared` can re-dispatch without
     /// re-parsing.  `None` for SELECT statements (which use the compiled
     /// VdbeProgram directly).
-    dml_statement: Option<Statement>,
+    dml_statement: Option<Arc<Statement>>,
     /// For SELECT statements that cannot be safely precompiled because they
     /// depend on connection-level fallback routing or parameter-sensitive
     /// subquery rewriting, store the AST and re-dispatch at execution time.
-    deferred_query_statement: Option<Statement>,
+    deferred_query_statement: Option<Arc<Statement>>,
     /// Cached column count for deferred SELECT statements whose placeholder
     /// program does not contain a `ResultRow` opcode.
     deferred_query_column_count: Option<usize>,
@@ -847,7 +847,7 @@ impl PreparedStatement<'_> {
         let op_cx = self.conn.op_cx()?;
         self.ensure_schema_unchanged(&op_cx)?;
         if let Some(statement) = &self.deferred_query_statement {
-            return self.conn.execute_statement(statement, None);
+            return self.conn.execute_statement(statement.as_ref(), None);
         }
         let mut rows = if self.db.is_some() {
             self.execute_table_query(&op_cx, None)?
@@ -883,7 +883,7 @@ impl PreparedStatement<'_> {
         let op_cx = self.conn.op_cx()?;
         self.ensure_schema_unchanged(&op_cx)?;
         if let Some(statement) = &self.deferred_query_statement {
-            return self.conn.execute_statement(statement, Some(params));
+            return self.conn.execute_statement(statement.as_ref(), Some(params));
         }
         let mut rows = if self.db.is_some() {
             self.execute_table_query(&op_cx, Some(params))?
@@ -2542,9 +2542,9 @@ impl Connection {
             } else {
                 Some(params)
             };
-            let rows = self.execute_statement_impl(dml, p, Some(&stmt.program))?;
+            let rows = self.execute_statement_impl(dml.as_ref(), p, Some(&*stmt.program))?;
             let is_dml = matches!(
-                dml,
+                dml.as_ref(),
                 Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
             );
             Ok(if is_dml {
@@ -2968,10 +2968,12 @@ impl Connection {
             );
         let result = if use_statement_savepoint {
             self.with_internal_statement_savepoint(statement_kind, || {
-                self.execute_statement_dispatch_impl(statement.as_ref(), params, precompiled)
+                let cx = &Cx::new();
+                self.execute_statement_dispatch_impl(cx, statement.as_ref(), params, precompiled)
             })
         } else {
-            self.execute_statement_dispatch_impl(statement.as_ref(), params, precompiled)
+            let cx = &Cx::new();
+            self.execute_statement_dispatch_impl(cx, statement.as_ref(), params, precompiled)
         };
         let ok = result.is_ok();
         self.resolve_autocommit_txn(was_auto, ok)?;
@@ -3005,12 +3007,14 @@ impl Connection {
         statement: &Statement,
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Row>> {
-        self.execute_statement_dispatch_impl(statement, params, None)
+        let cx = &Cx::new();
+        self.execute_statement_dispatch_impl(cx, statement, params, None)
     }
 
     #[allow(clippy::too_many_lines)]
     fn execute_statement_dispatch_impl(
         &self,
+        cx: &Cx,
         statement: &Statement,
         params: Option<&[SqliteValue]>,
         precompiled: Option<&VdbeProgram>,
@@ -3103,7 +3107,7 @@ impl Connection {
                     let rewritten = self.rewrite_in_subqueries_select(select, params)?;
                     let mut bound = bind_placeholders_in_select_for_fallback(&rewritten, params)?;
                     let limit_clause = bound.limit.take();
-                    let mut rows = self.execute_group_by_join_select(&bound, None)?;
+                    let mut rows = self.execute_group_by_join_select(cx, &bound, None)?;
                     if distinct {
                         dedup_rows(&mut rows);
                     }
@@ -3857,6 +3861,7 @@ impl Connection {
 
         let source_column_count = source_target_indices.len();
         for (row_idx, row) in source_rows.iter().enumerate() {
+
             if row.values().len() != source_column_count {
                 return Err(FrankenError::Internal(format!(
                     "INSERT ... SELECT column count mismatch: source row {row_idx} has {} values, SELECT produced {source_column_count}",
@@ -4322,7 +4327,7 @@ impl Connection {
                     post_distinct_limit: None,
                     schema_cookie: self.schema_cookie(),
                     dml_statement: None,
-                    deferred_query_statement: Some(statement.clone()),
+                    deferred_query_statement: Some(Arc::new(statement.clone())),
                     deferred_query_column_count: Some(
                         self.prepared_statement_column_count(statement),
                     ),
@@ -4333,7 +4338,7 @@ impl Connection {
                 let program = compile_expression_select(select)?;
                 let expression_postprocess = Some(build_expression_postprocess(select));
                 Ok(PreparedStatement {
-                    program,
+                    program: Arc::new(program),
                     func_registry: registry,
                     expression_postprocess,
                     distinct: is_distinct_select(select),
@@ -4358,7 +4363,7 @@ impl Connection {
                     self.compile_table_select(select)?
                 };
                 Ok(PreparedStatement {
-                    program,
+                    program: Arc::new(program),
                     func_registry: registry,
                     expression_postprocess: None,
                     distinct,
@@ -4399,7 +4404,7 @@ impl Connection {
                         pager: Some(self.pager.clone()),
                         post_distinct_limit: None,
                         schema_cookie: self.schema_cookie(),
-                        dml_statement: Some(statement.clone()),
+                        dml_statement: Some(Arc::new(statement.clone())),
                         deferred_query_statement: None,
                         deferred_query_column_count: None,
                         conn: self,
@@ -4418,7 +4423,7 @@ impl Connection {
                         pager: None,
                         post_distinct_limit: None,
                         schema_cookie: self.schema_cookie(),
-                        dml_statement: Some(statement.clone()),
+                        dml_statement: Some(Arc::new(statement.clone())),
                         deferred_query_statement: None,
                         deferred_query_column_count: None,
                         conn: self,
@@ -12077,6 +12082,7 @@ impl Connection {
     #[allow(clippy::too_many_lines)]
     fn execute_group_by_join_select(
         &self,
+        cx: &Cx,
         select: &SelectStatement,
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Row>> {
@@ -12299,22 +12305,40 @@ impl Connection {
         };
 
         // Step 5: Group the joined rows by evaluating GROUP BY expressions.
-        let mut groups: Vec<(Vec<SqliteValue>, Vec<Vec<SqliteValue>>)> = Vec::new();
-        for row in &join_rows {
-            let key: Vec<SqliteValue> = group_by_exprs
-                .iter()
-                .map(|expr| {
-                    eval_join_expr(expr, row.values(), &col_map).unwrap_or(SqliteValue::Null)
-                })
-                .collect();
-            if let Some(group) = groups
-                .iter_mut()
-                .find(|(k, _)| group_keys_equal_collated(k, &key, &group_collations))
-            {
-                group.1.push(row.values().to_vec());
-            } else {
-                groups.push((key, vec![row.values().to_vec()]));
+        // Optimization: Sort rows by group key to avoid O(N*M) linear scans.
+        let mut keyed_rows: Vec<(Vec<SqliteValue>, Vec<SqliteValue>)> = join_rows
+            .into_iter()
+            .map(|row| {
+                let key: Vec<SqliteValue> = group_by_exprs
+                    .iter()
+                    .map(|expr| {
+                        eval_join_expr(expr, row.values(), &col_map).unwrap_or(SqliteValue::Null)
+                    })
+                    .collect();
+                (key, row.values)
+            })
+            .collect();
+
+        keyed_rows.sort_by(|(k1, _), (k2, _)| {
+            for (i, (av, bv)) in k1.iter().zip(k2.iter()).enumerate() {
+                let coll = group_collations.get(i).and_then(|c| c.as_deref());
+                let ord = cmp_sqlite_values_collated(av, bv, coll);
+                if ord != std::cmp::Ordering::Equal {
+                    return ord;
+                }
             }
+            std::cmp::Ordering::Equal
+        });
+
+        let mut groups: Vec<(Vec<SqliteValue>, Vec<Vec<SqliteValue>>)> = Vec::new();
+        for (key, row_values) in keyed_rows {
+            if let Some(last_group) = groups.last_mut() {
+                if group_keys_equal_collated(&last_group.0, &key, &group_collations) {
+                    last_group.1.push(row_values);
+                    continue;
+                }
+            }
+            groups.push((key, vec![row_values]));
         }
         // Implicit aggregation (no GROUP BY): empty input must still
         // produce one row with default aggregate values (COUNT→0, etc.).
@@ -13326,22 +13350,40 @@ impl Connection {
             .collect();
 
         // Group rows by evaluating GROUP BY expressions for each row.
-        let mut groups: Vec<(Vec<SqliteValue>, Vec<Vec<SqliteValue>>)> = Vec::new();
-        for row in &raw_rows {
-            let key: Vec<SqliteValue> = group_by_exprs
-                .iter()
-                .map(|expr| {
-                    eval_join_expr(expr, row.values(), &col_map).unwrap_or(SqliteValue::Null)
-                })
-                .collect();
-            if let Some(group) = groups
-                .iter_mut()
-                .find(|(k, _)| group_keys_equal_collated(k, &key, &group_collations))
-            {
-                group.1.push(row.values().to_vec());
-            } else {
-                groups.push((key, vec![row.values().to_vec()]));
+        // Optimization: Sort rows by group key to avoid O(N*M) linear scans.
+        let mut keyed_rows: Vec<(Vec<SqliteValue>, Vec<SqliteValue>)> = raw_rows
+            .into_iter()
+            .map(|row| {
+                let key: Vec<SqliteValue> = group_by_exprs
+                    .iter()
+                    .map(|expr| {
+                        eval_join_expr(expr, row.values(), &col_map).unwrap_or(SqliteValue::Null)
+                    })
+                    .collect();
+                (key, row.values)
+            })
+            .collect();
+
+        keyed_rows.sort_by(|(k1, _), (k2, _)| {
+            for (i, (av, bv)) in k1.iter().zip(k2.iter()).enumerate() {
+                let coll = group_collations.get(i).and_then(|c| c.as_deref());
+                let ord = cmp_sqlite_values_collated(av, bv, coll);
+                if ord != std::cmp::Ordering::Equal {
+                    return ord;
+                }
             }
+            std::cmp::Ordering::Equal
+        });
+
+        let mut groups: Vec<(Vec<SqliteValue>, Vec<Vec<SqliteValue>>)> = Vec::new();
+        for (key, row_values) in keyed_rows {
+            if let Some(last_group) = groups.last_mut() {
+                if group_keys_equal_collated(&last_group.0, &key, &group_collations) {
+                    last_group.1.push(row_values);
+                    continue;
+                }
+            }
+            groups.push((key, vec![row_values]));
         }
 
         // Build result rows from groups.
@@ -14015,7 +14057,7 @@ impl Connection {
             // them to raw row indices afterwards.
             let mut func_vals: Vec<SqliteValue> = Vec::with_capacity(total_rows);
             let mut func_row_order: Vec<usize> = Vec::with_capacity(total_rows);
-            for partition_indices in &partitions {
+                for partition_indices in &partitions {
                 func_row_order.extend_from_slice(partition_indices);
                 let mut state = func.initial_state();
                 let fname = &win_func_names[wi];
@@ -14468,6 +14510,7 @@ impl Connection {
 
         // Process each compound arm.
         for (op, core) in &select.body.compounds {
+
             let arm_select = SelectStatement {
                 with: None,
                 body: SelectBody {
@@ -14489,7 +14532,10 @@ impl Connection {
                 }
                 CompoundOp::Intersect => {
                     // Keep only distinct rows present in both result and arm_rows.
-                    result.retain(|row| arm_rows.iter().any(|ar| ar.values() == row.values()));
+                    // O(N*M) loop: add checkpoints.
+                    result.retain(|row| {
+                        arm_rows.iter().any(|ar| ar.values() == row.values())
+                    });
                     dedup_rows(&mut result);
                 }
                 CompoundOp::Except => {
@@ -20744,7 +20790,9 @@ fn cmp_sqlite_values_collated(
 ) -> std::cmp::Ordering {
     if let (Some(coll), SqliteValue::Text(at), SqliteValue::Text(bt)) = (collation, a, b) {
         if coll.eq_ignore_ascii_case("NOCASE") {
-            return at.to_ascii_lowercase().cmp(&bt.to_ascii_lowercase());
+            let a_iter = at.bytes().map(|c| c.to_ascii_lowercase());
+            let b_iter = bt.bytes().map(|c| c.to_ascii_lowercase());
+            return a_iter.cmp(b_iter);
         }
     }
     cmp_sqlite_values(a, b)
@@ -23877,21 +23925,65 @@ fn execute_single_join(
         Vec::new()
     };
 
+    let mut scratch = Vec::with_capacity(combined_width);
+
+    // Pre-resolve USING constraint column indices to avoid linear searches per row
+    let using_indices = if let Some(JoinConstraint::Using(cols)) = constraint {
+        let mut indices = Vec::with_capacity(cols.len());
+        for col_name in cols {
+            let l_idx = col_map[..left_width]
+                .iter()
+                .position(|(_, name, _)| name.eq_ignore_ascii_case(col_name))
+                .unwrap_or(0); // If not found, eval_using_constraint will handle it or we could error here
+            let r_idx = col_map[left_width..]
+                .iter()
+                .position(|(_, name, _)| name.eq_ignore_ascii_case(col_name))
+                .unwrap_or(0);
+            indices.push((l_idx, left_width + r_idx));
+        }
+        Some(indices)
+    } else {
+        None
+    };
+
     for left_row in left {
         let mut matched = false;
 
         for (ri, right_row) in right.iter().enumerate() {
-            // Build combined row.
-            let mut combined = Vec::with_capacity(combined_width);
-            combined.extend_from_slice(left_row);
-            combined.extend(right_row[..right_width].iter().cloned());
+            // Build combined row in scratch buffer to avoid allocation if it fails constraint.
+            scratch.clear();
+            scratch.extend_from_slice(left_row);
+            scratch.extend_from_slice(&right_row[..right_width]);
 
             // Evaluate join constraint.
             let passes = match constraint {
                 None => true,
-                Some(JoinConstraint::On(expr)) => eval_join_predicate(expr, &combined, col_map)?,
-                Some(JoinConstraint::Using(cols)) => {
-                    eval_using_constraint(cols, &combined, col_map, left_width)
+                Some(JoinConstraint::On(expr)) => eval_join_predicate(expr, &scratch, col_map)?,
+                Some(JoinConstraint::Using(_)) => {
+                    let mut using_passes = true;
+                    if let Some(ref indices) = using_indices {
+                        for &(l_idx, r_idx) in indices {
+                            let left_val = scratch.get(l_idx);
+                            let right_val = scratch.get(r_idx);
+                            match (left_val, right_val) {
+                                (Some(l), Some(r)) => {
+                                    if matches!(l, SqliteValue::Null) || matches!(r, SqliteValue::Null) {
+                                        using_passes = false;
+                                        break;
+                                    }
+                                    if cmp_sqlite_values(l, r) != std::cmp::Ordering::Equal {
+                                        using_passes = false;
+                                        break;
+                                    }
+                                }
+                                _ => {
+                                    using_passes = false;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    using_passes
                 }
             };
 
@@ -23900,7 +23992,7 @@ fn execute_single_join(
                 if track_right {
                     right_matched[ri] = true;
                 }
-                result.push(combined);
+                result.push(scratch.clone());
             }
         }
 
@@ -23921,7 +24013,7 @@ fn execute_single_join(
             if !right_matched[ri] {
                 let mut combined = Vec::with_capacity(combined_width);
                 combined.extend(std::iter::repeat_n(SqliteValue::Null, left_width));
-                combined.extend(right_row[..right_width].iter().cloned());
+                combined.extend_from_slice(&right_row[..right_width]);
                 result.push(combined);
             }
         }

@@ -1349,8 +1349,11 @@ impl TransactionManager {
             txn.snapshot_established = false;
         }
 
-        // Release page locks.
-        self.lock_table.release_all(txn.txn_id);
+        // Release page locks (§5.6.3.1).
+        // Optimization: Use the transaction's own lock list for O(Locks) release
+        // instead of O(TotalLockedPages) scan-based release_all().
+        self.lock_table
+            .release_set(txn.page_locks.drain(), txn.txn_id);
         txn.clear_page_access_tracking();
 
         // Release serialized write mutex if held.

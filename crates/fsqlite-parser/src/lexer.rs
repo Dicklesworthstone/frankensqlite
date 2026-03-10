@@ -165,7 +165,7 @@ impl<'a> Lexer<'a> {
         let started = Instant::now();
 
         let mut lexer = Self::new(source);
-        let mut tokens = Vec::new();
+        let mut tokens = Vec::with_capacity(input_bytes / 4 + 1);
         loop {
             let tok = lexer.next_token();
             let is_eof = tok.kind == TokenKind::Eof;

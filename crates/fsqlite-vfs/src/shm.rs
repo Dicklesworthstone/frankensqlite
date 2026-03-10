@@ -31,6 +31,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 struct MmapBacking {
     ptr: *mut u8,
     len: usize,
+    mutex: Mutex<()>,
 }
 
 #[cfg(unix)]
@@ -213,7 +214,11 @@ impl ShmRegion {
     pub unsafe fn from_mmap(ptr: *mut u8, len: usize) -> Self {
         Self {
             len,
-            backing: ShmRegionBacking::Mmap(Arc::new(MmapBacking { ptr, len })),
+            backing: ShmRegionBacking::Mmap(Arc::new(MmapBacking {
+                ptr,
+                len,
+                mutex: Mutex::new(()),
+            })),
         }
     }
 
@@ -232,7 +237,8 @@ impl ShmRegion {
     /// Acquire a lock and borrow the region as a byte slice.
     ///
     /// For heap-backed regions, this acquires the inner mutex.
-    /// For mmap-backed regions, this returns a direct view of the mapped memory.
+    /// For mmap-backed regions, this acquires an in-process mutex to coordinate
+    /// concurrent access from multiple threads in the same process.
     ///
     /// The returned guard derefs to `&[u8]` / `&mut [u8]` and releases the lock
     /// on drop.
@@ -250,6 +256,7 @@ impl ShmRegion {
                 inner: ShmRegionGuardInner::Mmap {
                     ptr: m.ptr,
                     len: m.len,
+                    _guard: m.mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
                     _backing: m,
                 },
             },
@@ -399,6 +406,8 @@ enum ShmRegionGuardInner<'a> {
     Mmap {
         ptr: *mut u8,
         len: usize,
+        /// The in-process lock protecting this region.
+        _guard: MutexGuard<'a, ()>,
         /// Prevent the `MmapBacking` from being dropped while we hold a
         /// reference to the mapped memory.
         _backing: &'a Arc<MmapBacking>,

@@ -131,8 +131,8 @@ impl VersionArena {
         self.chunks[chunk_idx].push(ArenaSlot::new(version));
         self.high_water += 1;
 
-        let chunk_u32 = u32::try_from(chunk_idx).expect("VersionArena chunk index overflow u32");
-        let offset_u32 = u32::try_from(offset).expect("VersionArena offset overflow u32");
+        let chunk_u32 = u32::try_from(chunk_idx).unwrap_or(u32::MAX);
+        let offset_u32 = u32::try_from(offset).unwrap_or(u32::MAX);
         VersionIdx::new(chunk_u32, offset_u32, 0)
     }
 
@@ -473,6 +473,23 @@ impl InProcessPageLockTable {
             for shard in draining.shards.iter() {
                 let mut map = shard.lock();
                 map.retain(|_, &mut v| v != txn);
+            }
+        }
+    }
+
+    /// Release a specific set of page locks held by `txn`.
+    pub fn release_set(&self, pages: impl IntoIterator<Item = PageNumber>, txn: TxnId) {
+        let draining_guard = self.draining.lock();
+        for page in pages {
+            let shard_idx = Self::shard_index_static(page);
+            let mut map = self.shards[shard_idx].lock();
+            if map.get(&page) == Some(&txn) {
+                map.remove(&page);
+            } else if let Some(ref draining) = *draining_guard {
+                let mut drain_map = draining.shards[shard_idx].lock();
+                if drain_map.get(&page) == Some(&txn) {
+                    drain_map.remove(&page);
+                }
             }
         }
     }
@@ -4530,6 +4547,7 @@ mod tests {
         });
         let artifact_bytes = serde_json::to_vec_pretty(&artifact)
             .expect("bead_id={BEAD_2G5_1} artifact serialization should succeed");
+        let _ = std::fs::create_dir_all("target");
         std::fs::write("target/txn_slot_e2e_artifact.json", artifact_bytes)
             .expect("bead_id={BEAD_2G5_1} artifact write should succeed");
         assert!(

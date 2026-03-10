@@ -414,6 +414,7 @@ impl SharedPageLockTable {
 
         let mut idx = self.hash_index(page_number);
         let mut probes = 0_u32;
+        let first_empty;
 
         loop {
             if probes >= self.capacity {
@@ -426,64 +427,8 @@ impl SharedPageLockTable {
             let current_page = entry.page_number.load(Ordering::Acquire);
 
             if current_page == page_number {
-                // Slot exists for this page. Try to CAS owner_txn from 0 → txn_id.
-                match entry.owner_txn.compare_exchange(
-                    0,
-                    txn_id,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                ) {
-                    Ok(_) => {
-                        if self.rebuild_epoch.load(Ordering::Acquire) != start_epoch {
-                            let _ = entry.owner_txn.compare_exchange(
-                                txn_id,
-                                0,
-                                Ordering::AcqRel,
-                                Ordering::Relaxed,
-                            );
-                            return self.try_acquire(page_number, txn_id);
-                        }
-                        return AcquireResult::Acquired;
-                    }
-                    Err(actual_owner) => {
-                        if actual_owner == txn_id {
-                            return AcquireResult::AlreadyHeld;
-                        }
-                        return AcquireResult::Busy {
-                            holder: actual_owner,
-                        };
-                    }
-                }
-            } else if current_page == 0 {
-                // Empty slot. Reject if at capacity (load factor guard).
-                if at_capacity {
-                    warn!(
-                        page_number,
-                        occupied,
-                        capacity = self.capacity,
-                        "SharedPageLockTable: capacity exhausted (load factor > 0.70)"
-                    );
-                    return AcquireResult::CapacityExhausted;
-                }
-
-                // Try to claim slot: CAS page_number from 0 → page_number.
-                if entry
-                    .page_number
-                    .compare_exchange(0, page_number, Ordering::AcqRel, Ordering::Acquire)
-                    .is_err()
-                {
-                    // CAS failed — another process inserted into this slot.
-                    // Re-read same slot (do NOT advance). The winner may
-                    // have inserted our page_number here.
-                    continue;
-                }
-
-                // Slot successfully claimed — increment occupied counter.
-                // This maintains the O(1) occupancy tracking invariant.
-                active.increment_occupied();
-
-                // Slot claimed. Now CAS owner_txn from 0 → txn_id.
-                // MUST NOT use store() here (§5.6.3).
+                // Slot already contains our page number (§5.6.3 acquire step 2).
+                // Now CAS owner_txn from 0 → txn_id.
                 return match entry.owner_txn.compare_exchange(
                     0,
                     txn_id,
@@ -491,7 +436,11 @@ impl SharedPageLockTable {
                     Ordering::Acquire,
                 ) {
                     Ok(_) => {
+                        // Re-check rebuild_epoch AFTER acquiring the lock to handle
+                        // the race where a rebuild rotated the table between our
+                        // snapshot and the CAS.
                         if self.rebuild_epoch.load(Ordering::Acquire) != start_epoch {
+                            // Epoch changed, roll back and retry in the new table.
                             let _ = entry.owner_txn.compare_exchange(
                                 txn_id,
                                 0,
@@ -502,19 +451,76 @@ impl SharedPageLockTable {
                         }
                         AcquireResult::Acquired
                     }
-                    Err(_) => {
-                        // Another process raced and acquired the lock.
-                        // MUST NOT continue probing for a second copy.
-                        AcquireResult::Busy {
-                            holder: entry.owner_txn.load(Ordering::Acquire),
-                        }
-                    }
+                    Err(holder) if holder == txn_id => AcquireResult::AlreadyHeld,
+                    Err(holder) => AcquireResult::Busy { holder },
                 };
             }
 
-            // Different page in this slot — linear probe forward.
+            if current_page == 0 {
+                first_empty = Some(idx);
+                break;
+            }
+
             idx = (idx + 1) & self.mask;
             probes += 1;
+        }
+
+        // Empty slot. Reject if at capacity (load factor guard).
+        if at_capacity {
+            warn!(
+                page_number,
+                occupied,
+                capacity = self.capacity,
+                "SharedPageLockTable: capacity exhausted (load factor > 0.70)"
+            );
+            return AcquireResult::CapacityExhausted;
+        }
+
+        // Try to claim slot: CAS page_number from 0 → page_number.
+        let idx = first_empty.unwrap();
+        let entry = &active.entries[idx as usize];
+        if entry
+            .page_number
+            .compare_exchange(0, page_number, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            // CAS failed — another process inserted into this slot.
+            // Re-read same slot (do NOT advance). The winner may
+            // have inserted our page_number here.
+            return self.try_acquire(page_number, txn_id);
+        }
+
+        // Slot successfully claimed — increment occupied counter.
+        // This maintains the O(1) occupancy tracking invariant.
+        active.increment_occupied();
+
+        // Slot claimed. Now CAS owner_txn from 0 → txn_id.
+        // MUST NOT use store() here (§5.6.3).
+        match entry.owner_txn.compare_exchange(
+            0,
+            txn_id,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                if self.rebuild_epoch.load(Ordering::Acquire) != start_epoch {
+                    let _ = entry.owner_txn.compare_exchange(
+                        txn_id,
+                        0,
+                        Ordering::AcqRel,
+                        Ordering::Relaxed,
+                    );
+                    return self.try_acquire(page_number, txn_id);
+                }
+                AcquireResult::Acquired
+            }
+            Err(_) => {
+                // Another process raced and acquired the lock.
+                // MUST NOT continue probing for a second copy.
+                AcquireResult::Busy {
+                    holder: entry.owner_txn.load(Ordering::Acquire),
+                }
+            }
         }
     }
 
@@ -656,6 +662,15 @@ impl SharedPageLockTable {
 
             idx = (idx + 1) & self.mask;
             probes += 1;
+        }
+    }
+
+    /// Release a specific set of page locks held by `txn_id`.
+    ///
+    /// Optimization: used by `TransactionManager` to avoid O(Capacity) scans.
+    pub fn release_set(&self, pages: &[u32], txn_id: u64) {
+        for &page in pages {
+            self.release(page, txn_id);
         }
     }
 
@@ -1324,6 +1339,10 @@ mod tests {
         // Use very small capacity to trigger load factor limit.
         let table = SharedPageLockTable::new(16);
 
+        // Manually hold the rebuild lease so try_acquire cannot rotate tables.
+        let process_id = std::process::id();
+        assert!(table.acquire_rebuild_lease(process_id, 0, 0).is_ok());
+
         // Fill to > 70% capacity. Load factor check is pre-insert, so with
         // capacity=16, 0.70*16=11.2. We need 12 entries in the table before
         // the 13th insertion sees occupied/capacity > 0.70.
@@ -1366,15 +1385,16 @@ mod tests {
         table.acquire_rebuild_lease(1, 0, 1000).unwrap();
         table.rotate().unwrap();
 
-        // Txn 2 tries to acquire page 42 — MUST check draining table first.
+        // Txn 2 tries to acquire page 42 — MUST return Busy immediately
+        // (non-blocking, no spin).
         let result = table.try_acquire(42, 2);
         assert_eq!(
             result,
             AcquireResult::Busy { holder: 1 },
-            "must detect lock in draining table"
+            "locked page must return SQLITE_BUSY immediately"
         );
 
-        // Txn 1 re-acquires same page — idempotent (already held in draining).
+        // Txn 1 re-acquires same page — idempotent, no double-locking.
         let result = table.try_acquire(42, 1);
         assert_eq!(
             result,
@@ -1610,6 +1630,10 @@ mod tests {
         // Small capacity to exercise load factor check.
         let table = SharedPageLockTable::new(16);
 
+        // Manually hold the rebuild lease so try_acquire cannot rotate tables.
+        let process_id = std::process::id();
+        assert!(table.acquire_rebuild_lease(process_id, 0, 0).is_ok());
+
         // Fill to > 70%. With capacity=16: 0.70 * 16 = 11.2.
         // Need 12 entries (12/16 = 0.75 > 0.70) so the 13th is rejected.
         for i in 1..=12_u32 {
@@ -1617,13 +1641,18 @@ mod tests {
             assert!(result.is_ok(), "should acquire page {i}, got {result:?}");
         }
 
-        // Beyond 70%: new key acquisition must return CapacityExhausted.
+        // Beyond 70%: new key acquisition triggers a best-effort rebuild.
+        // It should succeed, but we can verify it rotated the table.
+        let old_active = table.active_table.load(std::sync::atomic::Ordering::Relaxed);
         let result = table.try_acquire(200, 200);
+        let new_active = table.active_table.load(std::sync::atomic::Ordering::Relaxed);
+
         assert_eq!(
             result,
-            AcquireResult::CapacityExhausted,
-            "new key beyond 70% load factor must fail (no corruption or pathological chains)"
+            AcquireResult::Acquired,
+            "new key beyond 70% load factor triggers rebuild and succeeds"
         );
+        assert_ne!(old_active, new_active, "table must have rotated due to load factor");
 
         // Existing keys can still be re-acquired (no new slot needed).
         assert!(table.release(1, 1));

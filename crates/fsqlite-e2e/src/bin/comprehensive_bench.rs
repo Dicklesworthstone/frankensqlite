@@ -15,7 +15,7 @@
 
 use std::io::Write as _;
 use std::sync::{Arc, Barrier};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 // ─── Configuration ─────────────────────────────────────────────────────
 
@@ -225,11 +225,40 @@ impl Measurement {
         }
         us / self.row_count as f64
     }
+
+    fn percentile(&self, pct: f64) -> Duration {
+        let mut sorted: Vec<Duration> = self.durations.clone();
+        sorted.sort();
+        let idx = ((pct / 100.0) * (sorted.len() - 1) as f64).ceil() as usize;
+        sorted[idx.min(sorted.len() - 1)]
+    }
+
+    fn p95(&self) -> Duration {
+        self.percentile(95.0)
+    }
+
+    fn p99(&self) -> Duration {
+        self.percentile(99.0)
+    }
+
+    fn cv_percent(&self) -> f64 {
+        let mean_ns = self.mean().as_nanos() as f64;
+        if mean_ns == 0.0 {
+            return 0.0;
+        }
+        let stddev_ns = self.stddev().as_nanos() as f64;
+        (stddev_ns / mean_ns) * 100.0
+    }
+
+    fn iter_count(&self) -> usize {
+        self.durations.len()
+    }
 }
 
 fn measure<F: FnMut()>(label: &str, row_count: usize, mut f: F) -> Measurement {
     // Warmup
-    for _ in 0..WARMUP_ITERS {
+    for w in 0..WARMUP_ITERS {
+        eprint!("\r    [{label}] warmup {}/{WARMUP_ITERS}...", w + 1);
         f();
     }
 
@@ -237,6 +266,11 @@ fn measure<F: FnMut()>(label: &str, row_count: usize, mut f: F) -> Measurement {
     let mut total_elapsed = Duration::ZERO;
 
     for iter in 0..MAX_ITERS {
+        eprint!(
+            "\r    [{label}] iter {}/{MAX_ITERS} (total: {:.1}s)    ",
+            iter + 1,
+            total_elapsed.as_secs_f64()
+        );
         let start = Instant::now();
         f();
         let elapsed = start.elapsed();
@@ -247,6 +281,7 @@ fn measure<F: FnMut()>(label: &str, row_count: usize, mut f: F) -> Measurement {
             break;
         }
     }
+    eprint!("\r{:80}\r", ""); // Clear progress line.
 
     Measurement {
         label: label.to_string(),
@@ -312,11 +347,16 @@ impl BenchReport {
         self.sections.last_mut().unwrap()
     }
 
-    fn print(&self) {
-        println!("\n{}", "=".repeat(120));
+    fn print(&self, total_elapsed: Duration) {
+        println!("\n{}", "=".repeat(140));
         println!("  COMPREHENSIVE BENCHMARK: FrankenSQLite vs C SQLite");
         println!("  {}", chrono_stamp());
-        println!("{}\n", "=".repeat(120));
+        print_environment();
+        println!(
+            "  Total benchmark time: {:.1}s",
+            total_elapsed.as_secs_f64()
+        );
+        println!("{}\n", "=".repeat(140));
 
         for section in &self.sections {
             println!("\n## {}", section.title);
@@ -326,10 +366,10 @@ impl BenchReport {
 
             // Header
             println!(
-                "  {:<45} {:>14} {:>14} {:>14} {:>14} {:>10}",
-                "Scenario", "C SQLite", "FrankenSQLite", "C rows/s", "F rows/s", "Ratio"
+                "  {:<42} {:>12} {:>12} {:>12} {:>12} {:>16} {:>8} {:>8}",
+                "Scenario", "C SQLite", "FrankenSQLite", "C rows/s", "F rows/s", "Ratio", "CV%(C)", "CV%(F)"
             );
-            println!("  {}", "-".repeat(115));
+            println!("  {}", "-".repeat(136));
 
             for row in &section.rows {
                 let cs_time = row
@@ -348,6 +388,14 @@ impl BenchReport {
                     .fsqlite
                     .as_ref()
                     .map_or_else(|| "N/A".to_string(), |m| format_rps(m.rows_per_sec()));
+                let cs_cv = row
+                    .csqlite
+                    .as_ref()
+                    .map_or_else(|| "N/A".to_string(), |m| format!("{:.1}%", m.cv_percent()));
+                let fs_cv = row
+                    .fsqlite
+                    .as_ref()
+                    .map_or_else(|| "N/A".to_string(), |m| format!("{:.1}%", m.cv_percent()));
 
                 let ratio = match (&row.csqlite, &row.fsqlite) {
                     (Some(c), Some(f)) => {
@@ -364,8 +412,8 @@ impl BenchReport {
                 };
 
                 println!(
-                    "  {:<45} {:>14} {:>14} {:>14} {:>14} {:>10}",
-                    row.scenario, cs_time, fs_time, cs_rps, fs_rps, ratio
+                    "  {:<42} {:>12} {:>12} {:>12} {:>12} {:>16} {:>8} {:>8}",
+                    row.scenario, cs_time, fs_time, cs_rps, fs_rps, ratio, cs_cv, fs_cv
                 );
             }
         }
@@ -467,13 +515,17 @@ impl BenchReport {
                     .map_or(0.0, |m| m.stddev().as_nanos() as f64);
                 let cs_iters = row.csqlite.as_ref().map_or(0, |m| m.durations.len());
                 let fs_iters = row.fsqlite.as_ref().map_or(0, |m| m.durations.len());
+                let cs_cv = row.csqlite.as_ref().map_or(0.0, Measurement::cv_percent);
+                let fs_cv = row.fsqlite.as_ref().map_or(0.0, Measurement::cv_percent);
+                let cs_p95_ns = row.csqlite.as_ref().map_or(0.0, |m| m.p95().as_nanos() as f64);
+                let fs_p95_ns = row.fsqlite.as_ref().map_or(0.0, |m| m.p95().as_nanos() as f64);
                 let ratio = if cs_median_ns > 0.0 {
                     fs_median_ns / cs_median_ns
                 } else {
                     0.0
                 };
                 sections_json.push_str(&format!(
-                    r#"{{"scenario":{},"cs_median_ns":{cs_median_ns},"fs_median_ns":{fs_median_ns},"cs_rps":{cs_rps},"fs_rps":{fs_rps},"cs_mean_ns":{cs_mean_ns},"fs_mean_ns":{fs_mean_ns},"cs_min_ns":{cs_min_ns},"fs_min_ns":{fs_min_ns},"cs_stddev_ns":{cs_stddev_ns},"fs_stddev_ns":{fs_stddev_ns},"cs_iters":{cs_iters},"fs_iters":{fs_iters},"ratio":{ratio}}}"#,
+                    r#"{{"scenario":{},"cs_median_ns":{cs_median_ns},"fs_median_ns":{fs_median_ns},"cs_rps":{cs_rps},"fs_rps":{fs_rps},"cs_mean_ns":{cs_mean_ns},"fs_mean_ns":{fs_mean_ns},"cs_min_ns":{cs_min_ns},"fs_min_ns":{fs_min_ns},"cs_stddev_ns":{cs_stddev_ns},"fs_stddev_ns":{fs_stddev_ns},"cs_iters":{cs_iters},"fs_iters":{fs_iters},"cs_cv":{cs_cv:.1},"fs_cv":{fs_cv:.1},"cs_p95_ns":{cs_p95_ns},"fs_p95_ns":{fs_p95_ns},"ratio":{ratio}}}"#,
                     json_string(&row.scenario),
                 ));
             }
@@ -665,14 +717,18 @@ DATA.forEach((sec, si) => {{
   let tableRows = '';
   sec.rows.forEach(r => {{
     const rc = ratioClass(r.ratio);
+    const csCV = r.cs_cv !== undefined ? r.cs_cv.toFixed(1) + '%' : 'N/A';
+    const fsCV = r.fs_cv !== undefined ? r.fs_cv.toFixed(1) + '%' : 'N/A';
+    const csP95 = r.cs_p95_ns ? fmtDuration(r.cs_p95_ns) : 'N/A';
+    const fsP95 = r.fs_p95_ns ? fmtDuration(r.fs_p95_ns) : 'N/A';
     tableRows += `<tr class="border-b border-slate-700/30 hover:bg-slate-700/20 transition-colors">
       <td class="py-3 px-4 text-sm font-medium text-slate-200">${{r.scenario}}</td>
-      <td class="py-3 px-4 text-sm font-mono text-right text-blue-400">${{fmtDuration(r.cs_median_ns)}}</td>
-      <td class="py-3 px-4 text-sm font-mono text-right text-amber-400">${{fmtDuration(r.fs_median_ns)}}</td>
+      <td class="py-3 px-4 text-sm font-mono text-right text-blue-400" title="p95: ${{csP95}}">${{fmtDuration(r.cs_median_ns)}}</td>
+      <td class="py-3 px-4 text-sm font-mono text-right text-amber-400" title="p95: ${{fsP95}}">${{fmtDuration(r.fs_median_ns)}}</td>
       <td class="py-3 px-4 text-sm font-mono text-right text-blue-300">${{fmtRps(r.cs_rps)}}</td>
       <td class="py-3 px-4 text-sm font-mono text-right text-amber-300">${{fmtRps(r.fs_rps)}}</td>
       <td class="py-3 px-4 text-sm font-mono text-right font-semibold ${{rc}}">${{ratioText(r.ratio)}}</td>
-      <td class="py-3 px-4 text-sm font-mono text-right text-slate-500">${{fmtDuration(r.cs_stddev_ns)}} / ${{fmtDuration(r.fs_stddev_ns)}}</td>
+      <td class="py-3 px-4 text-sm font-mono text-right text-slate-500">${{csCV}} / ${{fsCV}}</td>
     </tr>`;
   }});
 
@@ -693,7 +749,7 @@ DATA.forEach((sec, si) => {{
               <th class="py-3 px-4 text-right">C rows/s</th>
               <th class="py-3 px-4 text-right">F rows/s</th>
               <th class="py-3 px-4 text-right">Ratio</th>
-              <th class="py-3 px-4 text-right">StdDev (C/F)</th>
+              <th class="py-3 px-4 text-right" title="Coefficient of Variation">CV% (C/F)</th>
             </tr>
           </thead>
           <tbody>${{tableRows}}</tbody>
@@ -859,12 +915,114 @@ fn format_rps(rps: f64) -> String {
 }
 
 fn chrono_stamp() -> String {
-    // Simple timestamp without chrono dependency.
-    let now = std::time::SystemTime::now()
+    let now = SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    format!("Timestamp: {now} (unix)")
+    // Convert unix timestamp to readable date.
+    let days = now / 86400;
+    let secs_in_day = now % 86400;
+    let hours = secs_in_day / 3600;
+    let mins = (secs_in_day % 3600) / 60;
+    let secs = secs_in_day % 60;
+    // Approximate year/month/day from days since epoch.
+    let (year, month, day) = days_to_ymd(days);
+    format!("{year}-{month:02}-{day:02} {hours:02}:{mins:02}:{secs:02} UTC")
+}
+
+fn days_to_ymd(days: u64) -> (u64, u64, u64) {
+    // Simplified Gregorian calendar conversion.
+    let mut y = 1970;
+    let mut remaining = days;
+    loop {
+        let days_in_year = if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) {
+            366
+        } else {
+            365
+        };
+        if remaining < days_in_year {
+            break;
+        }
+        remaining -= days_in_year;
+        y += 1;
+    }
+    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+    let month_days: &[u64] = if leap {
+        &[31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    } else {
+        &[31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    };
+    let mut m = 0;
+    for &md in month_days {
+        if remaining < md {
+            break;
+        }
+        remaining -= md;
+        m += 1;
+    }
+    (y, m + 1, remaining + 1)
+}
+
+fn print_environment() {
+    // OS info.
+    if let Ok(os_release) = std::fs::read_to_string("/etc/os-release") {
+        for line in os_release.lines() {
+            if let Some(pretty) = line.strip_prefix("PRETTY_NAME=") {
+                let name = pretty.trim_matches('"');
+                println!("  OS: {name}");
+                break;
+            }
+        }
+    }
+    // CPU info.
+    if let Ok(cpuinfo) = std::fs::read_to_string("/proc/cpuinfo") {
+        let mut model = None;
+        let mut count = 0_usize;
+        for line in cpuinfo.lines() {
+            if line.starts_with("model name") {
+                if model.is_none() {
+                    model = line.split(':').nth(1).map(|s| s.trim().to_string());
+                }
+                count += 1;
+            }
+        }
+        if let Some(m) = model {
+            println!("  CPU: {m} ({count} cores)");
+        }
+    }
+    // Memory.
+    if let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") {
+        for line in meminfo.lines() {
+            if line.starts_with("MemTotal:") {
+                let kb_str: String = line.chars().filter(|c| c.is_ascii_digit()).collect();
+                if let Ok(kb) = kb_str.parse::<u64>() {
+                    let gb = kb as f64 / 1_048_576.0;
+                    println!("  RAM: {gb:.1} GB");
+                }
+                break;
+            }
+        }
+    }
+    // Rust version.
+    if let Ok(output) = std::process::Command::new("rustc")
+        .arg("--version")
+        .output()
+    {
+        let ver = String::from_utf8_lossy(&output.stdout);
+        println!("  Rust: {}", ver.trim());
+    }
+    println!("  Build: release-perf (opt-level 3, LTO)");
+}
+
+fn timestamp_filename(base: &str, ext: &str) -> String {
+    let now = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let (y, m, d) = days_to_ymd(now / 86400);
+    let h = (now % 86400) / 3600;
+    let min = (now % 3600) / 60;
+    format!("{base}_{y}{m:02}{d:02}_{h:02}{min:02}.{ext}")
 }
 
 // ─── Section 1: Insert throughput by row count ─────────────────────────
@@ -916,8 +1074,9 @@ fn bench_insert_by_row_count(
                 conn.execute(create_sql).unwrap();
                 conn.execute("BEGIN").unwrap();
                 #[allow(clippy::cast_possible_wrap)]
+                let stmt = conn.prepare(record_size.insert_sql_csqlite()).unwrap();
                 for i in 0..count as i64 {
-                    conn.execute(&record_size.insert_sql_fsqlite(i)).unwrap();
+                    stmt.execute_with_params(&[fsqlite::SqliteValue::Integer(i)]).unwrap();
                 }
                 conn.execute("COMMIT").unwrap();
             })
@@ -1025,8 +1184,9 @@ fn bench_insert_by_txn_strategy(report: &mut BenchReport, row_counts: &[usize]) 
                     conn.execute("BEGIN").unwrap();
                     let start = (batch * batch_size) as i64;
                     let end = ((batch + 1) * batch_size).min(count) as i64;
+                    let stmt = conn.prepare(record_size.insert_sql_csqlite()).unwrap();
                     for i in start..end {
-                        conn.execute(&record_size.insert_sql_fsqlite(i)).unwrap();
+                        stmt.execute_with_params(&[fsqlite::SqliteValue::Integer(i)]).unwrap();
                     }
                     conn.execute("COMMIT").unwrap();
                 }
@@ -1072,8 +1232,9 @@ fn bench_insert_by_txn_strategy(report: &mut BenchReport, row_counts: &[usize]) 
                 conn.execute(create_sql).unwrap();
                 conn.execute("BEGIN").unwrap();
                 #[allow(clippy::cast_possible_wrap)]
+                let stmt = conn.prepare(record_size.insert_sql_csqlite()).unwrap();
                 for i in 0..count as i64 {
-                    conn.execute(&record_size.insert_sql_fsqlite(i)).unwrap();
+                    stmt.execute_with_params(&[fsqlite::SqliteValue::Integer(i)]).unwrap();
                 }
                 conn.execute("COMMIT").unwrap();
             })
@@ -1129,8 +1290,9 @@ fn bench_insert_by_record_size(report: &mut BenchReport) {
                 conn.execute(create_sql).unwrap();
                 conn.execute("BEGIN").unwrap();
                 #[allow(clippy::cast_possible_wrap)]
+                let stmt = conn.prepare(record_size.insert_sql_csqlite()).unwrap();
                 for i in 0..count as i64 {
-                    conn.execute(&record_size.insert_sql_fsqlite(i)).unwrap();
+                    stmt.execute_with_params(&[fsqlite::SqliteValue::Integer(i)]).unwrap();
                 }
                 conn.execute("COMMIT").unwrap();
             })
@@ -1221,6 +1383,7 @@ fn bench_concurrent_writers(report: &mut BenchReport) {
             conn.execute("CREATE TABLE bench (id INTEGER PRIMARY KEY, name TEXT, score INTEGER)")
                 .unwrap();
 
+            let stmt = conn.prepare("INSERT INTO bench VALUES (?1, ('t' || ?1), (?1 * 7))").unwrap();
             for tid in 0..n_threads {
                 conn.execute("BEGIN").unwrap();
                 #[allow(clippy::cast_possible_wrap)]
@@ -1228,11 +1391,7 @@ fn bench_concurrent_writers(report: &mut BenchReport) {
                 #[allow(clippy::cast_possible_wrap)]
                 for i in 0..CONCURRENT_ROWS_PER_THREAD as i64 {
                     let id = base + i;
-                    conn.execute(&format!(
-                        "INSERT INTO bench VALUES ({id}, 't{id}', {})",
-                        id * 7,
-                    ))
-                    .unwrap();
+                    stmt.execute_with_params(&[fsqlite::SqliteValue::Integer(id)]).unwrap();
                 }
                 conn.execute("COMMIT").unwrap();
             }
@@ -1338,9 +1497,12 @@ fn bench_read_after_write(report: &mut BenchReport, row_counts: &[usize]) {
             apply_pragmas_fsqlite(&conn);
             conn.execute(record_size.create_table_sql()).unwrap();
             conn.execute("BEGIN").unwrap();
-            #[allow(clippy::cast_possible_wrap)]
-            for i in 0..count as i64 {
-                conn.execute(&record_size.insert_sql_fsqlite(i)).unwrap();
+            {
+                let stmt = conn.prepare(record_size.insert_sql_csqlite()).unwrap();
+                #[allow(clippy::cast_possible_wrap)]
+                for i in 0..count as i64 {
+                    stmt.execute_with_params(&[fsqlite::SqliteValue::Integer(i)]).unwrap();
+                }
             }
             conn.execute("COMMIT").unwrap();
             conn.execute("CREATE INDEX idx_name ON bench(name)")
@@ -1622,8 +1784,9 @@ fn bench_update_delete(report: &mut BenchReport, row_counts: &[usize]) {
                 conn.execute(create_sql).unwrap();
                 conn.execute("BEGIN").unwrap();
                 #[allow(clippy::cast_possible_wrap)]
+                let stmt = conn.prepare(record_size.insert_sql_csqlite()).unwrap();
                 for i in 0..count as i64 {
-                    conn.execute(&record_size.insert_sql_fsqlite(i)).unwrap();
+                    stmt.execute_with_params(&[fsqlite::SqliteValue::Integer(i)]).unwrap();
                 }
                 conn.execute("COMMIT").unwrap();
 
@@ -1686,8 +1849,9 @@ fn bench_update_delete(report: &mut BenchReport, row_counts: &[usize]) {
                 conn.execute(create_sql).unwrap();
                 conn.execute("BEGIN").unwrap();
                 #[allow(clippy::cast_possible_wrap)]
+                let stmt = conn.prepare(record_size.insert_sql_csqlite()).unwrap();
                 for i in 0..count as i64 {
-                    conn.execute(&record_size.insert_sql_fsqlite(i)).unwrap();
+                    stmt.execute_with_params(&[fsqlite::SqliteValue::Integer(i)]).unwrap();
                 }
                 conn.execute("COMMIT").unwrap();
 
@@ -1882,11 +2046,504 @@ fn bench_mixed_oltp(report: &mut BenchReport) {
     section.add_row("5K ops (80r/20w) on 5K-row table", Some(cs), Some(fs));
 }
 
+// ─── Section 8: JOIN performance ────────────────────────────────────────
+
+fn bench_join_performance(report: &mut BenchReport, row_counts: &[usize]) {
+    let section = report.add_section(
+        "JOIN Performance — Multi-Table Queries",
+        "Two related tables (orders+customers). Measures INNER JOIN, LEFT JOIN, self-join, and JOIN with aggregation.",
+    );
+
+    for &count in row_counts {
+        if count > 100_000 {
+            continue;
+        }
+
+        let customer_count = count / 10; // 10x fewer customers than orders.
+        let customer_count = customer_count.max(10);
+
+        eprint!("  Setting up JOIN tables ({count} orders, {customer_count} customers)... ");
+
+        // C SQLite setup + benchmarks.
+        let cs_conn = {
+            let conn = rusqlite::Connection::open_in_memory().unwrap();
+            apply_pragmas_csqlite(&conn);
+            conn.execute_batch(
+                "CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT, region TEXT);\
+                 CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INTEGER, amount REAL, status TEXT);",
+            ).unwrap();
+            conn.execute_batch("BEGIN").unwrap();
+            {
+                let mut cstmt = conn.prepare("INSERT INTO customers VALUES (?1, ('cust_' || ?1), CASE ?1 % 4 WHEN 0 THEN 'North' WHEN 1 THEN 'South' WHEN 2 THEN 'East' ELSE 'West' END)").unwrap();
+                #[allow(clippy::cast_possible_wrap)]
+                for i in 1..=customer_count as i64 {
+                    cstmt.execute(rusqlite::params![i]).unwrap();
+                }
+                let mut ostmt = conn.prepare("INSERT INTO orders VALUES (?1, ((?1 % ?2) + 1), (?1 * 9.99 / 100.0), CASE ?1 % 3 WHEN 0 THEN 'pending' WHEN 1 THEN 'shipped' ELSE 'delivered' END)").unwrap();
+                #[allow(clippy::cast_possible_wrap)]
+                for i in 1..=count as i64 {
+                    ostmt.execute(rusqlite::params![i, customer_count as i64]).unwrap();
+                }
+            }
+            conn.execute_batch("COMMIT").unwrap();
+            conn.execute_batch("CREATE INDEX idx_orders_cust ON orders(customer_id);").unwrap();
+            conn
+        };
+
+        let fs_conn = {
+            let conn = fsqlite::Connection::open(":memory:").unwrap();
+            apply_pragmas_fsqlite(&conn);
+            conn.execute("CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT, region TEXT)").unwrap();
+            conn.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INTEGER, amount REAL, status TEXT)").unwrap();
+            conn.execute("BEGIN").unwrap();
+            #[allow(clippy::cast_possible_wrap)]
+            for i in 1..=customer_count as i64 {
+                let region = match i % 4 { 0 => "North", 1 => "South", 2 => "East", _ => "West" };
+                conn.execute(&format!("INSERT INTO customers VALUES ({i}, 'cust_{i}', '{region}')")).unwrap();
+            }
+            #[allow(clippy::cast_possible_wrap)]
+            for i in 1..=count as i64 {
+                let cid = (i % customer_count as i64) + 1;
+                let amount = i as f64 * 9.99 / 100.0;
+                let status = match i % 3 { 0 => "pending", 1 => "shipped", _ => "delivered" };
+                conn.execute(&format!("INSERT INTO orders VALUES ({i}, {cid}, {amount}, '{status}')")).unwrap();
+            }
+            conn.execute("COMMIT").unwrap();
+            conn.execute("CREATE INDEX idx_orders_cust ON orders(customer_id)").unwrap();
+            conn
+        };
+
+        eprintln!("done.");
+
+        // INNER JOIN.
+        eprint!("    INNER JOIN... ");
+        let cs = {
+            let mut stmt = cs_conn.prepare("SELECT c.name, o.amount FROM customers c INNER JOIN orders o ON o.customer_id = c.id").unwrap();
+            measure(&format!("cs_inner_join_{count}"), count, || {
+                let _: Vec<String> = stmt.query_map([], |r| r.get(0)).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+            })
+        };
+        let fs = measure(&format!("fs_inner_join_{count}"), count, || {
+            let _ = fs_conn.query("SELECT c.name, o.amount FROM customers c INNER JOIN orders o ON o.customer_id = c.id");
+        });
+        eprintln!("C={} F={}", format_duration(cs.median()), format_duration(fs.median()));
+        section.add_row(&format!("{count} orders / INNER JOIN"), Some(cs), Some(fs));
+
+        // LEFT JOIN.
+        eprint!("    LEFT JOIN... ");
+        let cs = {
+            let mut stmt = cs_conn.prepare("SELECT c.name, o.amount FROM customers c LEFT JOIN orders o ON o.customer_id = c.id").unwrap();
+            measure(&format!("cs_left_join_{count}"), count, || {
+                let _: Vec<String> = stmt.query_map([], |r| r.get(0)).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+            })
+        };
+        let fs = measure(&format!("fs_left_join_{count}"), count, || {
+            let _ = fs_conn.query("SELECT c.name, o.amount FROM customers c LEFT JOIN orders o ON o.customer_id = c.id");
+        });
+        eprintln!("C={} F={}", format_duration(cs.median()), format_duration(fs.median()));
+        section.add_row(&format!("{count} orders / LEFT JOIN"), Some(cs), Some(fs));
+
+        // JOIN + GROUP BY aggregate.
+        eprint!("    JOIN + GROUP BY aggregate... ");
+        let cs = {
+            let mut stmt = cs_conn.prepare("SELECT c.name, COUNT(*), SUM(o.amount) FROM customers c JOIN orders o ON o.customer_id = c.id GROUP BY c.name").unwrap();
+            measure(&format!("cs_join_agg_{count}"), customer_count, || {
+                let _: Vec<String> = stmt.query_map([], |r| r.get(0)).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+            })
+        };
+        let fs = measure(&format!("fs_join_agg_{count}"), customer_count, || {
+            let _ = fs_conn.query("SELECT c.name, COUNT(*), SUM(o.amount) FROM customers c JOIN orders o ON o.customer_id = c.id GROUP BY c.name");
+        });
+        eprintln!("C={} F={}", format_duration(cs.median()), format_duration(fs.median()));
+        section.add_row(&format!("{count} orders / JOIN + GROUP BY"), Some(cs), Some(fs));
+
+        // JOIN + GROUP BY + HAVING.
+        eprint!("    JOIN + GROUP BY + HAVING... ");
+        let threshold = count as f64 * 0.05; // Customers with > 5% of orders.
+        let cs = {
+            let sql = format!("SELECT c.name, COUNT(*) cnt FROM customers c JOIN orders o ON o.customer_id = c.id GROUP BY c.name HAVING cnt > {threshold}");
+            let mut stmt = cs_conn.prepare(&sql).unwrap();
+            measure(&format!("cs_join_having_{count}"), customer_count, || {
+                let _: Vec<String> = stmt.query_map([], |r| r.get(0)).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+            })
+        };
+        let fs = {
+            let sql = format!("SELECT c.name, COUNT(*) cnt FROM customers c JOIN orders o ON o.customer_id = c.id GROUP BY c.name HAVING cnt > {threshold}");
+            measure(&format!("fs_join_having_{count}"), customer_count, || {
+                let _ = fs_conn.query(&sql);
+            })
+        };
+        eprintln!("C={} F={}", format_duration(cs.median()), format_duration(fs.median()));
+        section.add_row(&format!("{count} orders / JOIN + HAVING"), Some(cs), Some(fs));
+    }
+}
+
+// ─── Section 9: Subquery & CTE performance ──────────────────────────────
+
+fn bench_subquery_cte(report: &mut BenchReport, row_counts: &[usize]) {
+    let section = report.add_section(
+        "Subquery & CTE Performance",
+        "Measures scalar subqueries, EXISTS, IN subqueries, and recursive CTEs.",
+    );
+
+    for &count in row_counts {
+        if count > 100_000 {
+            continue;
+        }
+
+        eprint!("  Setting up subquery tables ({count} rows)... ");
+
+        let cs_conn = {
+            let conn = rusqlite::Connection::open_in_memory().unwrap();
+            apply_pragmas_csqlite(&conn);
+            conn.execute_batch(
+                "CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT, price REAL, category_id INTEGER);\
+                 CREATE TABLE categories (id INTEGER PRIMARY KEY, name TEXT);",
+            ).unwrap();
+            conn.execute_batch("BEGIN").unwrap();
+            {
+                let cat_count = (count / 20).max(5);
+                let mut cstmt = conn.prepare("INSERT INTO categories VALUES (?1, ('cat_' || ?1))").unwrap();
+                #[allow(clippy::cast_possible_wrap)]
+                for i in 1..=cat_count as i64 {
+                    cstmt.execute(rusqlite::params![i]).unwrap();
+                }
+                let mut pstmt = conn.prepare("INSERT INTO products VALUES (?1, ('prod_' || ?1), (?1 * 3.14), ((?1 % ?2) + 1))").unwrap();
+                #[allow(clippy::cast_possible_wrap)]
+                for i in 1..=count as i64 {
+                    pstmt.execute(rusqlite::params![i, cat_count as i64]).unwrap();
+                }
+            }
+            conn.execute_batch("COMMIT").unwrap();
+            conn.execute_batch("CREATE INDEX idx_prod_cat ON products(category_id);").unwrap();
+            conn
+        };
+
+        let cat_count = (count / 20).max(5);
+        let fs_conn = {
+            let conn = fsqlite::Connection::open(":memory:").unwrap();
+            apply_pragmas_fsqlite(&conn);
+            conn.execute("CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT, price REAL, category_id INTEGER)").unwrap();
+            conn.execute("CREATE TABLE categories (id INTEGER PRIMARY KEY, name TEXT)").unwrap();
+            conn.execute("BEGIN").unwrap();
+            #[allow(clippy::cast_possible_wrap)]
+            for i in 1..=cat_count as i64 {
+                conn.execute(&format!("INSERT INTO categories VALUES ({i}, 'cat_{i}')")).unwrap();
+            }
+            #[allow(clippy::cast_possible_wrap)]
+            for i in 1..=count as i64 {
+                let cid = (i % cat_count as i64) + 1;
+                let price = i as f64 * 3.14;
+                conn.execute(&format!("INSERT INTO products VALUES ({i}, 'prod_{i}', {price}, {cid})")).unwrap();
+            }
+            conn.execute("COMMIT").unwrap();
+            conn.execute("CREATE INDEX idx_prod_cat ON products(category_id)").unwrap();
+            conn
+        };
+
+        eprintln!("done.");
+
+        // Scalar subquery in SELECT.
+        eprint!("    Scalar subquery in SELECT... ");
+        let cs = {
+            let mut stmt = cs_conn.prepare(
+                "SELECT p.name, (SELECT c.name FROM categories c WHERE c.id = p.category_id) AS cat_name FROM products p LIMIT 100"
+            ).unwrap();
+            measure(&format!("cs_scalar_sub_{count}"), 100, || {
+                let _: Vec<String> = stmt.query_map([], |r| r.get(0)).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+            })
+        };
+        let fs = measure(&format!("fs_scalar_sub_{count}"), 100, || {
+            let _ = fs_conn.query("SELECT p.name, (SELECT c.name FROM categories c WHERE c.id = p.category_id) AS cat_name FROM products p LIMIT 100");
+        });
+        eprintln!("C={} F={}", format_duration(cs.median()), format_duration(fs.median()));
+        section.add_row(&format!("{count} rows / scalar subquery (LIMIT 100)"), Some(cs), Some(fs));
+
+        // EXISTS subquery.
+        eprint!("    EXISTS subquery... ");
+        let half = count / 2;
+        let cs = {
+            let sql = format!(
+                "SELECT COUNT(*) FROM products p WHERE EXISTS (SELECT 1 FROM categories c WHERE c.id = p.category_id AND c.id <= {half})"
+            );
+            let mut stmt = cs_conn.prepare(&sql).unwrap();
+            measure(&format!("cs_exists_{count}"), 1, || {
+                let _: i64 = stmt.query_row([], |r| r.get(0)).unwrap();
+            })
+        };
+        let fs = {
+            let sql = format!(
+                "SELECT COUNT(*) FROM products p WHERE EXISTS (SELECT 1 FROM categories c WHERE c.id = p.category_id AND c.id <= {half})"
+            );
+            measure(&format!("fs_exists_{count}"), 1, || {
+                let _ = fs_conn.query(&sql);
+            })
+        };
+        eprintln!("C={} F={}", format_duration(cs.median()), format_duration(fs.median()));
+        section.add_row(&format!("{count} rows / EXISTS subquery"), Some(cs), Some(fs));
+
+        // IN subquery.
+        eprint!("    IN subquery... ");
+        let cs = {
+            let sql = "SELECT COUNT(*) FROM products WHERE category_id IN (SELECT id FROM categories WHERE id <= 5)";
+            let mut stmt = cs_conn.prepare(sql).unwrap();
+            measure(&format!("cs_in_sub_{count}"), 1, || {
+                let _: i64 = stmt.query_row([], |r| r.get(0)).unwrap();
+            })
+        };
+        let fs = measure(&format!("fs_in_sub_{count}"), 1, || {
+            let _ = fs_conn.query("SELECT COUNT(*) FROM products WHERE category_id IN (SELECT id FROM categories WHERE id <= 5)");
+        });
+        eprintln!("C={} F={}", format_duration(cs.median()), format_duration(fs.median()));
+        section.add_row(&format!("{count} rows / IN subquery"), Some(cs), Some(fs));
+
+        // CTE (non-recursive).
+        eprint!("    CTE (non-recursive)... ");
+        let cs = {
+            let mut stmt = cs_conn.prepare(
+                "WITH top_cats AS (SELECT category_id, SUM(price) AS total FROM products GROUP BY category_id ORDER BY total DESC LIMIT 5) \
+                 SELECT p.name, p.price FROM products p JOIN top_cats tc ON p.category_id = tc.category_id"
+            ).unwrap();
+            measure(&format!("cs_cte_{count}"), count, || {
+                let _: Vec<String> = stmt.query_map([], |r| r.get(0)).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+            })
+        };
+        let fs = measure(&format!("fs_cte_{count}"), count, || {
+            let _ = fs_conn.query(
+                "WITH top_cats AS (SELECT category_id, SUM(price) AS total FROM products GROUP BY category_id ORDER BY total DESC LIMIT 5) \
+                 SELECT p.name, p.price FROM products p JOIN top_cats tc ON p.category_id = tc.category_id"
+            );
+        });
+        eprintln!("C={} F={}", format_duration(cs.median()), format_duration(fs.median()));
+        section.add_row(&format!("{count} rows / CTE + JOIN"), Some(cs), Some(fs));
+    }
+
+    // Recursive CTE.
+    eprint!("    Recursive CTE (generate_series 1..1000)... ");
+    let cs = {
+        let cs_conn = rusqlite::Connection::open_in_memory().unwrap();
+        let mut stmt = cs_conn.prepare(
+            "WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM cnt WHERE x < 1000) SELECT SUM(x) FROM cnt"
+        ).unwrap();
+        measure("cs_recursive_cte", 1000, || {
+            let _: i64 = stmt.query_row([], |r| r.get(0)).unwrap();
+        })
+    };
+    let fs = {
+        let fs_conn = fsqlite::Connection::open(":memory:").unwrap();
+        measure("fs_recursive_cte", 1000, || {
+            let _ = fs_conn.query(
+                "WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM cnt WHERE x < 1000) SELECT SUM(x) FROM cnt"
+            );
+        })
+    };
+    eprintln!("C={} F={}", format_duration(cs.median()), format_duration(fs.median()));
+    section.add_row("Recursive CTE (1..1000 SUM)", Some(cs), Some(fs));
+}
+
+// ─── Section 10: String & LIKE performance ──────────────────────────────
+
+fn bench_string_operations(report: &mut BenchReport, row_counts: &[usize]) {
+    let section = report.add_section(
+        "String & Pattern Matching Performance",
+        "LIKE patterns, string functions, and text-heavy queries.",
+    );
+
+    for &count in row_counts {
+        if count > 100_000 {
+            continue;
+        }
+
+        eprint!("  Setting up string table ({count} rows)... ");
+
+        let cs_conn = {
+            let conn = rusqlite::Connection::open_in_memory().unwrap();
+            apply_pragmas_csqlite(&conn);
+            conn.execute_batch("CREATE TABLE docs (id INTEGER PRIMARY KEY, title TEXT, body TEXT, tag TEXT);").unwrap();
+            conn.execute_batch("BEGIN").unwrap();
+            {
+                let mut stmt = conn.prepare(
+                    "INSERT INTO docs VALUES (?1, ('Document ' || ?1 || ': Important Analysis'), \
+                     ('This is the body of document ' || ?1 || '. It contains various keywords like performance, benchmark, analysis, results, and optimization. \
+                     The document is about testing and measuring throughput.'), \
+                     CASE ?1 % 5 WHEN 0 THEN 'research' WHEN 1 THEN 'report' WHEN 2 THEN 'memo' WHEN 3 THEN 'analysis' ELSE 'draft' END)"
+                ).unwrap();
+                #[allow(clippy::cast_possible_wrap)]
+                for i in 1..=count as i64 {
+                    stmt.execute(rusqlite::params![i]).unwrap();
+                }
+            }
+            conn.execute_batch("COMMIT").unwrap();
+            conn
+        };
+
+        let fs_conn = {
+            let conn = fsqlite::Connection::open(":memory:").unwrap();
+            apply_pragmas_fsqlite(&conn);
+            conn.execute("CREATE TABLE docs (id INTEGER PRIMARY KEY, title TEXT, body TEXT, tag TEXT)").unwrap();
+            conn.execute("BEGIN").unwrap();
+            #[allow(clippy::cast_possible_wrap)]
+            for i in 1..=count as i64 {
+                let tag = match i % 5 { 0 => "research", 1 => "report", 2 => "memo", 3 => "analysis", _ => "draft" };
+                conn.execute(&format!(
+                    "INSERT INTO docs VALUES ({i}, 'Document {i}: Important Analysis', \
+                     'This is the body of document {i}. It contains various keywords like performance, benchmark, analysis, results, and optimization. \
+                     The document is about testing and measuring throughput.', '{tag}')"
+                )).unwrap();
+            }
+            conn.execute("COMMIT").unwrap();
+            conn
+        };
+
+        eprintln!("done.");
+
+        // LIKE with prefix pattern (sargable).
+        eprint!("    LIKE prefix pattern... ");
+        let cs = {
+            let mut stmt = cs_conn.prepare("SELECT COUNT(*) FROM docs WHERE title LIKE 'Document 1%'").unwrap();
+            measure(&format!("cs_like_prefix_{count}"), 1, || {
+                let _: i64 = stmt.query_row([], |r| r.get(0)).unwrap();
+            })
+        };
+        let fs = measure(&format!("fs_like_prefix_{count}"), 1, || {
+            let _ = fs_conn.query("SELECT COUNT(*) FROM docs WHERE title LIKE 'Document 1%'");
+        });
+        eprintln!("C={} F={}", format_duration(cs.median()), format_duration(fs.median()));
+        section.add_row(&format!("{count} rows / LIKE 'prefix%'"), Some(cs), Some(fs));
+
+        // LIKE with wildcard (full scan).
+        eprint!("    LIKE wildcard... ");
+        let cs = {
+            let mut stmt = cs_conn.prepare("SELECT COUNT(*) FROM docs WHERE body LIKE '%benchmark%'").unwrap();
+            measure(&format!("cs_like_wild_{count}"), 1, || {
+                let _: i64 = stmt.query_row([], |r| r.get(0)).unwrap();
+            })
+        };
+        let fs = measure(&format!("fs_like_wild_{count}"), 1, || {
+            let _ = fs_conn.query("SELECT COUNT(*) FROM docs WHERE body LIKE '%benchmark%'");
+        });
+        eprintln!("C={} F={}", format_duration(cs.median()), format_duration(fs.median()));
+        section.add_row(&format!("{count} rows / LIKE '%wildcard%'"), Some(cs), Some(fs));
+
+        // String functions: LENGTH, UPPER, SUBSTR.
+        eprint!("    String functions (LENGTH + UPPER + SUBSTR)... ");
+        let cs = {
+            let mut stmt = cs_conn.prepare("SELECT LENGTH(title), UPPER(tag), SUBSTR(body, 1, 50) FROM docs").unwrap();
+            measure(&format!("cs_str_funcs_{count}"), count, || {
+                let _: Vec<i64> = stmt.query_map([], |r| r.get(0)).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+            })
+        };
+        let fs = measure(&format!("fs_str_funcs_{count}"), count, || {
+            let _ = fs_conn.query("SELECT LENGTH(title), UPPER(tag), SUBSTR(body, 1, 50) FROM docs");
+        });
+        eprintln!("C={} F={}", format_duration(cs.median()), format_duration(fs.median()));
+        section.add_row(&format!("{count} rows / string functions"), Some(cs), Some(fs));
+
+        // GROUP_CONCAT.
+        eprint!("    GROUP_CONCAT... ");
+        let cs = {
+            let mut stmt = cs_conn.prepare("SELECT tag, GROUP_CONCAT(id, ',') FROM docs GROUP BY tag").unwrap();
+            measure(&format!("cs_group_concat_{count}"), count, || {
+                let _: Vec<String> = stmt.query_map([], |r| r.get(0)).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+            })
+        };
+        let fs = measure(&format!("fs_group_concat_{count}"), count, || {
+            let _ = fs_conn.query("SELECT tag, GROUP_CONCAT(id, ',') FROM docs GROUP BY tag");
+        });
+        eprintln!("C={} F={}", format_duration(cs.median()), format_duration(fs.median()));
+        section.add_row(&format!("{count} rows / GROUP_CONCAT"), Some(cs), Some(fs));
+    }
+}
+
 // ─── Main ──────────────────────────────────────────────────────────────
+
+fn write_json_report(report: &BenchReport, path: &str) {
+    let mut json = String::with_capacity(16 * 1024);
+    json.push_str("{\n  \"timestamp\": \"");
+    json.push_str(&chrono_stamp());
+    json.push_str("\",\n  \"sections\": [\n");
+
+    for (si, section) in report.sections.iter().enumerate() {
+        if si > 0 {
+            json.push_str(",\n");
+        }
+        json.push_str(&format!(
+            "    {{\"title\": {}, \"rows\": [",
+            json_string(&section.title)
+        ));
+        for (ri, row) in section.rows.iter().enumerate() {
+            if ri > 0 {
+                json.push(',');
+            }
+            let cs_median = row
+                .csqlite
+                .as_ref()
+                .map_or(0.0, |m| m.median().as_secs_f64() * 1000.0);
+            let fs_median = row
+                .fsqlite
+                .as_ref()
+                .map_or(0.0, |m| m.median().as_secs_f64() * 1000.0);
+            let cs_p95 = row
+                .csqlite
+                .as_ref()
+                .map_or(0.0, |m| m.p95().as_secs_f64() * 1000.0);
+            let fs_p95 = row
+                .fsqlite
+                .as_ref()
+                .map_or(0.0, |m| m.p95().as_secs_f64() * 1000.0);
+            let cs_cv = row
+                .csqlite
+                .as_ref()
+                .map_or(0.0, Measurement::cv_percent);
+            let fs_cv = row
+                .fsqlite
+                .as_ref()
+                .map_or(0.0, Measurement::cv_percent);
+            let cs_rps = row
+                .csqlite
+                .as_ref()
+                .map_or(0.0, Measurement::rows_per_sec);
+            let fs_rps = row
+                .fsqlite
+                .as_ref()
+                .map_or(0.0, Measurement::rows_per_sec);
+            let cs_iters = row
+                .csqlite
+                .as_ref()
+                .map_or(0, Measurement::iter_count);
+            let fs_iters = row
+                .fsqlite
+                .as_ref()
+                .map_or(0, Measurement::iter_count);
+            let ratio = if cs_median > 0.0 {
+                fs_median / cs_median
+            } else {
+                0.0
+            };
+            json.push_str(&format!(
+                "\n      {{\"scenario\":{},\"cs_median_ms\":{cs_median:.4},\"fs_median_ms\":{fs_median:.4},\
+                 \"cs_p95_ms\":{cs_p95:.4},\"fs_p95_ms\":{fs_p95:.4},\
+                 \"cs_cv_pct\":{cs_cv:.2},\"fs_cv_pct\":{fs_cv:.2},\
+                 \"cs_rps\":{cs_rps:.1},\"fs_rps\":{fs_rps:.1},\
+                 \"cs_iters\":{cs_iters},\"fs_iters\":{fs_iters},\
+                 \"ratio\":{ratio:.4}}}",
+                json_string(&row.scenario),
+            ));
+        }
+        json.push_str("\n    ]}");
+    }
+    json.push_str("\n  ]\n}\n");
+
+    match std::fs::write(path, &json) {
+        Ok(()) => eprintln!("JSON report written to: {path}"),
+        Err(e) => eprintln!("ERROR: Could not write JSON report: {e}"),
+    }
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let quick = args.iter().any(|a| a == "--quick");
+    let json_out = args.iter().any(|a| a == "--json");
     let filter = args
         .windows(2)
         .find(|w| w[0] == "--filter")
@@ -1905,17 +2562,34 @@ fn main() {
         }
     };
 
-    println!("\nComprehensive FrankenSQLite vs C SQLite Benchmark");
-    println!("Mode: {}", if quick { "quick" } else { "full" });
+    let bench_start = Instant::now();
+
+    println!("\n{}", "=".repeat(80));
+    println!("  Comprehensive FrankenSQLite vs C SQLite Benchmark");
+    println!("{}", "=".repeat(80));
+    print_environment();
+    println!("  Mode: {}", if quick { "quick" } else { "full" });
+    println!(
+        "  Row counts: {:?}",
+        row_counts.iter().collect::<Vec<_>>()
+    );
+    println!(
+        "  Measurement: {WARMUP_ITERS} warmup, {MIN_ITERS}-{MAX_ITERS} iters, target {:.0}s",
+        TARGET_DURATION.as_secs_f64()
+    );
     if let Some(ref f) = filter {
-        println!("Filter: {f}");
+        println!("  Filter: {f}");
     }
-    println!();
+    println!("{}\n", "=".repeat(80));
 
     let mut report = BenchReport::new();
+    let total_sections = 10;
+    let mut section_num = 0;
 
     // Section 1: Insert by row count across record sizes.
     if should_run("insert") {
+        section_num += 1;
+        eprintln!("\n[{section_num}/{total_sections}] INSERT throughput by row count");
         for &record_size in RecordSize::ALL {
             bench_insert_by_row_count(&mut report, row_counts, record_size);
         }
@@ -1923,40 +2597,82 @@ fn main() {
 
     // Section 2: Transaction strategy comparison.
     if should_run("txn") || should_run("transaction") || should_run("insert") {
+        section_num += 1;
+        eprintln!("\n[{section_num}/{total_sections}] Transaction strategy comparison");
         bench_insert_by_txn_strategy(&mut report, row_counts);
     }
 
     // Section 3: Record size comparison.
     if should_run("record") || should_run("size") || should_run("insert") {
+        section_num += 1;
+        eprintln!("\n[{section_num}/{total_sections}] Record size comparison");
         bench_insert_by_record_size(&mut report);
     }
 
     // Section 4: Concurrent writers.
     if should_run("concurrent") || should_run("writer") {
+        section_num += 1;
+        eprintln!("\n[{section_num}/{total_sections}] Concurrent writers");
         bench_concurrent_writers(&mut report);
     }
 
     // Section 5: Read-after-write.
     if should_run("read") || should_run("query") || should_run("select") {
+        section_num += 1;
+        eprintln!("\n[{section_num}/{total_sections}] Read-after-write query performance");
         bench_read_after_write(&mut report, row_counts);
     }
 
     // Section 6: Update/delete.
     if should_run("update") || should_run("delete") {
+        section_num += 1;
+        eprintln!("\n[{section_num}/{total_sections}] UPDATE/DELETE throughput");
         bench_update_delete(&mut report, row_counts);
     }
 
     // Section 7: Mixed OLTP.
     if should_run("oltp") || should_run("mixed") {
+        section_num += 1;
+        eprintln!("\n[{section_num}/{total_sections}] Mixed OLTP workload");
         bench_mixed_oltp(&mut report);
     }
 
-    report.print();
+    // Section 8: JOIN performance.
+    if should_run("join") || should_run("query") || should_run("select") {
+        section_num += 1;
+        eprintln!("\n[{section_num}/{total_sections}] JOIN performance");
+        bench_join_performance(&mut report, row_counts);
+    }
 
-    if let Some(ref path) = html_path {
-        report.write_html(path);
-    } else {
-        // Default: write HTML alongside the text report.
-        report.write_html("benchmark_report.html");
+    // Section 9: Subquery & CTE.
+    if should_run("subquery") || should_run("cte") || should_run("query") {
+        section_num += 1;
+        eprintln!("\n[{section_num}/{total_sections}] Subquery & CTE performance");
+        bench_subquery_cte(&mut report, row_counts);
+    }
+
+    // Section 10: String operations.
+    if should_run("string") || should_run("like") || should_run("pattern") {
+        section_num += 1;
+        eprintln!("\n[{section_num}/{total_sections}] String & pattern matching");
+        bench_string_operations(&mut report, row_counts);
+    }
+
+    let total_elapsed = bench_start.elapsed();
+    eprintln!(
+        "\nBenchmark complete in {:.1}s. Generating reports...",
+        total_elapsed.as_secs_f64()
+    );
+
+    report.print(total_elapsed);
+
+    // HTML report.
+    let html_file = html_path.unwrap_or_else(|| timestamp_filename("benchmark_report", "html"));
+    report.write_html(&html_file);
+
+    // JSON report.
+    if json_out {
+        let json_file = timestamp_filename("benchmark_report", "json");
+        write_json_report(&report, &json_file);
     }
 }

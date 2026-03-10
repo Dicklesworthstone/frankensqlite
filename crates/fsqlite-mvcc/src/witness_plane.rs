@@ -63,7 +63,9 @@ impl WitnessSet {
 
     /// Register a point read witness (Cell granularity).
     pub fn register_point_read(&mut self, btree_root: PageNumber, canonical_key_bytes: &[u8]) {
-        let key = WitnessKey::for_cell_read(btree_root, canonical_key_bytes);
+        // The caller doesn't have the leaf page easily accessible, so we pass
+        // the root twice as a fallback/coarse granularity for now.
+        let key = WitnessKey::for_cell_read(btree_root, btree_root, canonical_key_bytes);
         debug!(
             btree_root = btree_root.get(),
             witness_kind = "cell",
@@ -151,10 +153,12 @@ pub fn witness_keys_overlap(a: &WitnessKey, b: &WitnessKey) -> bool {
             WitnessKey::Cell {
                 btree_root: ra,
                 tag: ta,
+                ..
             },
             WitnessKey::Cell {
                 btree_root: rb,
                 tag: tb,
+                ..
             },
         ) => ra == rb && ta == tb,
         (
@@ -195,16 +199,40 @@ pub fn witness_keys_overlap(a: &WitnessKey, b: &WitnessKey) -> bool {
                 ..
             },
         ) => range_root == page,
-        // Page overlaps with Cell if the page could contain that cell's btree.
-        // Conservative: always overlap when page matches btree_root.
+        // Page overlaps with Cell if the page is the B-tree root (conservative)
+        // or if it matches the specific leaf page where the cell was read/written.
         (
             WitnessKey::Page(p),
-            WitnessKey::Cell { btree_root, .. } | WitnessKey::KeyRange { btree_root, .. },
+            WitnessKey::Cell {
+                btree_root,
+                ..
+            }
+            | WitnessKey::KeyRange { btree_root, .. },
         )
         | (
-            WitnessKey::Cell { btree_root, .. } | WitnessKey::KeyRange { btree_root, .. },
+            WitnessKey::Cell {
+                btree_root,
+                ..
+            }
+            | WitnessKey::KeyRange { btree_root, .. },
             WitnessKey::Page(p),
-        ) => p == btree_root,
+        ) => {
+            p == btree_root
+                || matches!(
+                    a,
+                    WitnessKey::Cell {
+                        leaf_page: lp,
+                        ..
+                    } if *lp == *p
+                )
+                || matches!(
+                    b,
+                    WitnessKey::Cell {
+                        leaf_page: lp,
+                        ..
+                    } if *lp == *p
+                )
+        }
         (
             WitnessKey::ByteRange {
                 page: pa,
@@ -216,7 +244,11 @@ pub fn witness_keys_overlap(a: &WitnessKey, b: &WitnessKey) -> bool {
                 start: sb,
                 len: lb,
             },
-        ) => pa == pb && *sa < sb + lb && *sb < sa + la,
+        ) => {
+            pa == pb
+                && *sa < sb.saturating_add(*lb)
+                && *sb < sa.saturating_add(*la)
+        },
         // Conservative fallback: anything involving KeyRange/Custom overlaps.
         _ => true,
     }
@@ -255,15 +287,17 @@ mod tests {
         let btree_root = page(2);
         let key_bytes = b"user_id=42";
 
-        let witness = WitnessKey::for_cell_read(btree_root, key_bytes);
+        let witness = WitnessKey::for_cell_read(btree_root, btree_root, key_bytes);
 
         assert!(witness.is_cell());
         if let WitnessKey::Cell {
             btree_root: root,
+            leaf_page: lp,
             tag,
         } = &witness
         {
             assert_eq!(*root, btree_root);
+            assert_eq!(*lp, btree_root);
             assert_ne!(*tag, 0, "tag must be non-zero for valid key bytes");
         }
     }
@@ -300,7 +334,7 @@ mod tests {
 
         // The cell witness from a write should match the cell witness from a read
         // of the same key (for rw-antidependency detection).
-        let read_witness = WitnessKey::for_cell_read(btree_root, key_bytes);
+        let read_witness = WitnessKey::for_cell_read(btree_root, leaf_pgno, key_bytes);
         assert_eq!(
             cell, read_witness,
             "write cell must match read cell for same key"
@@ -448,14 +482,14 @@ mod tests {
         writer_ws.register_point_write(btree_root, key_bytes, page(10));
 
         // Reader reads same key → overlap detected.
-        let read_key = WitnessKey::for_cell_read(btree_root, key_bytes);
+        let read_key = WitnessKey::for_cell_read(btree_root, btree_root, key_bytes);
         assert!(
             writer_ws.overlaps_write(&read_key),
             "must detect overlap between reader and writer on same cell"
         );
 
         // Reader reads different key → no overlap.
-        let other_key = WitnessKey::for_cell_read(btree_root, b"pk=2");
+        let other_key = WitnessKey::for_cell_read(btree_root, btree_root, b"pk=2");
         assert!(
             !writer_ws.overlaps_write(&other_key),
             "must not detect overlap for different key"

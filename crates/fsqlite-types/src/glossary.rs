@@ -706,7 +706,11 @@ pub enum WitnessKey {
     /// Semantic witness: specific B-tree cell identified by domain-separated hash.
     ///
     /// `tag` is `low32(xxh3_64("fsqlite:witness:cell:v1" || le_u32(btree_root) || key_bytes))`.
-    Cell { btree_root: PageNumber, tag: u64 },
+    Cell {
+        btree_root: PageNumber,
+        leaf_page: PageNumber,
+        tag: u64,
+    },
     /// Semantic witness: structured byte range on a page.
     ByteRange {
         page: PageNumber,
@@ -742,9 +746,14 @@ impl WitnessKey {
 
     /// Create a cell witness for a point read/uniqueness check.
     #[must_use]
-    pub fn for_cell_read(btree_root: PageNumber, canonical_key_bytes: &[u8]) -> Self {
+    pub fn for_cell_read(
+        btree_root: PageNumber,
+        leaf_page: PageNumber,
+        canonical_key_bytes: &[u8],
+    ) -> Self {
         Self::Cell {
             btree_root,
+            leaf_page,
             tag: Self::cell_tag(btree_root, canonical_key_bytes),
         }
     }
@@ -759,8 +768,8 @@ impl WitnessKey {
 
     /// Create a cell + page witness pair for a point write.
     ///
-    /// Writes register both `Cell(btree_root, cell_tag)` AND `Page(leaf_pgno)`
-    /// as write witnesses (§5.6.4.3).
+    /// Writes register both `Cell(btree_root, leaf_page, cell_tag)` AND
+    /// `Page(leaf_pgno)` as write witnesses (§5.6.4.3).
     #[must_use]
     pub fn for_point_write(
         btree_root: PageNumber,
@@ -769,6 +778,7 @@ impl WitnessKey {
     ) -> (Self, Self) {
         let cell = Self::Cell {
             btree_root,
+            leaf_page: leaf_pgno,
             tag: Self::cell_tag(btree_root, canonical_key_bytes),
         };
         let page = Self::Page(leaf_pgno);
@@ -785,6 +795,24 @@ impl WitnessKey {
     #[must_use]
     pub fn is_cell(&self) -> bool {
         matches!(self, Self::Cell { .. })
+    }
+
+    /// Return the primary page number associated with this witness key.
+    ///
+    /// - `Page(p)` → `Some(p)`
+    /// - `Cell { leaf_page, .. }` → `Some(leaf_page)`
+    /// - `ByteRange { page, .. }` → `Some(page)`
+    /// - `KeyRange { btree_root, .. }` → `Some(btree_root)`
+    /// - `Custom { .. }` → `None`
+    #[must_use]
+    pub fn page_number(&self) -> Option<PageNumber> {
+        match self {
+            Self::Page(p) => Some(*p),
+            Self::Cell { leaf_page, .. } => Some(*leaf_page),
+            Self::ByteRange { page, .. } => Some(*page),
+            Self::KeyRange { btree_root, .. } => Some(*btree_root),
+            Self::Custom { .. } => None,
+        }
     }
 }
 
@@ -1417,10 +1445,10 @@ mod tests {
     #[test]
     fn test_witness_key_variants_exhaustive() {
         let pn = PageNumber::new(1).unwrap();
-
         let a = WitnessKey::Page(pn);
         let b = WitnessKey::Cell {
             btree_root: pn,
+            leaf_page: pn,
             tag: 7,
         };
         let c = WitnessKey::ByteRange {

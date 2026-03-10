@@ -73,6 +73,15 @@ pub struct ConcurrentHandle {
     state: TransactionState,
     /// Pages read by this transaction (for SSI rw-antidependency detection).
     read_set: HashSet<PageNumber>,
+    /// Granular read witnesses bucketed by page for O(1) page-level lookup.
+    /// Uses SmallVec to avoid allocations for the common case of 1-4 witnesses per page.
+    read_index: HashMap<PageNumber, smallvec::SmallVec<[WitnessKey; 4]>>,
+    /// Witnesses that are not bound to a specific page (global or custom).
+    global_read_witnesses: Vec<WitnessKey>,
+    /// Granular write witnesses bucketed by page.
+    write_index: HashMap<PageNumber, smallvec::SmallVec<[WitnessKey; 4]>>,
+    /// Global write witnesses.
+    global_write_witnesses: Vec<WitnessKey>,
     /// Transaction token for SSI tracking.
     txn_token: TxnToken,
     /// Whether this transaction has an incoming rw-antidependency edge (SSI).
@@ -93,6 +102,10 @@ impl ConcurrentHandle {
             page_locks: HashSet::new(),
             state: TransactionState::Active,
             read_set: HashSet::new(),
+            read_index: HashMap::new(),
+            global_read_witnesses: Vec::new(),
+            write_index: HashMap::new(),
+            global_write_witnesses: Vec::new(),
             txn_token,
             has_in_rw: Cell::new(false),
             has_out_rw: Cell::new(false),
@@ -148,7 +161,29 @@ impl ConcurrentHandle {
 
     /// Record a page read (for SSI rw-antidependency detection).
     pub fn record_read(&mut self, page: PageNumber) {
-        self.read_set.insert(page);
+        if self.read_set.insert(page) {
+            self.read_index.entry(page).or_default().push(WitnessKey::Page(page));
+        }
+    }
+
+    /// Record a granular read witness for fine-grained SSI.
+    pub fn record_read_witness(&mut self, key: WitnessKey) {
+        if let Some(p) = key.page_number() {
+            self.read_set.insert(p);
+            self.read_index.entry(p).or_default().push(key);
+        } else {
+            self.global_read_witnesses.push(key);
+        }
+    }
+
+    /// Record a granular write witness for fine-grained SSI.
+    pub fn record_write_witness(&mut self, key: WitnessKey) {
+        if let Some(p) = key.page_number() {
+            self.page_locks.insert(p);
+            self.write_index.entry(p).or_default().push(key);
+        } else {
+            self.global_write_witnesses.push(key);
+        }
     }
 
     /// Returns the set of pages that were read.
@@ -172,16 +207,17 @@ impl ConcurrentHandle {
     /// Returns witness keys for all read pages (for SSI validation).
     #[must_use]
     pub fn read_witness_keys(&self) -> Vec<WitnessKey> {
-        self.read_set.iter().map(|&p| WitnessKey::Page(p)).collect()
+        let mut keys: Vec<_> = self.read_index.values().flatten().cloned().collect();
+        keys.extend(self.global_read_witnesses.iter().cloned());
+        keys
     }
 
     /// Returns witness keys for all written pages (for SSI validation).
     #[must_use]
     pub fn write_witness_keys(&self) -> Vec<WitnessKey> {
-        self.write_set
-            .keys()
-            .map(|&p| WitnessKey::Page(p))
-            .collect()
+        let mut keys: Vec<_> = self.write_index.values().flatten().cloned().collect();
+        keys.extend(self.global_write_witnesses.iter().cloned());
+        keys
     }
 
     /// Whether this handle has incoming rw-antidependency (SSI).
@@ -218,39 +254,72 @@ impl ActiveTxnView for ConcurrentHandle {
     }
 
     fn read_keys(&self) -> &[WitnessKey] {
-        // NOTE: We can't return a slice directly since read_witness_keys() allocates.
-        // The SSI validation code will call read_set() directly instead.
+        // NOTE: We can't return a slice directly since read_witnesses HashSet isn't a slice.
+        // Callers should use read_witness_keys() if they need the full list.
         &[]
     }
 
     fn write_keys(&self) -> &[WitnessKey] {
-        // NOTE: We can't return a slice directly since write_witness_keys() allocates.
-        // The SSI validation code will call write_set_pages() directly instead.
+        // NOTE: We can't return a slice directly since write_witnesses HashSet isn't a slice.
         &[]
     }
 
     fn check_read_overlap(&self, key: &WitnessKey) -> bool {
-        // We know read_set contains ONLY Page(p) witnesses.
-        // Therefore, we can bypass the O(N) allocation of read_witness_keys()
-        // and check overlap directly using hash set lookups.
-        match key {
-            WitnessKey::Page(p)
-            | WitnessKey::Cell { btree_root: p, .. }
-            | WitnessKey::ByteRange { page: p, .. }
-            | WitnessKey::KeyRange { btree_root: p, .. } => self.read_set.contains(p),
-            WitnessKey::Custom { .. } => !self.read_set.is_empty(), // Conservative fallback
+        // First check global witnesses which overlap with everything.
+        if self
+            .global_read_witnesses
+            .iter()
+            .any(|w| crate::witness_plane::witness_keys_overlap(w, key))
+        {
+            return true;
         }
+
+        // Level 0: Fast reject if the page isn't in our read set at all.
+        let page = match key.page_number() {
+            Some(p) => p,
+            None => return !self.read_set.is_empty() || !self.global_read_witnesses.is_empty(),
+        };
+
+        if !self.read_set.contains(&page) {
+            return false;
+        }
+
+        // Level 1: Refined check against witnesses for THIS page only.
+        if let Some(witnesses) = self.read_index.get(&page) {
+            return witnesses
+                .iter()
+                .any(|w| crate::witness_plane::witness_keys_overlap(w, key));
+        }
+
+        // Fallback: If no granular index but page is in read_set, assume overlap.
+        true
     }
 
     fn check_write_overlap(&self, key: &WitnessKey) -> bool {
-        // We know write_set contains ONLY Page(p) witnesses.
-        match key {
-            WitnessKey::Page(p)
-            | WitnessKey::Cell { btree_root: p, .. }
-            | WitnessKey::ByteRange { page: p, .. }
-            | WitnessKey::KeyRange { btree_root: p, .. } => self.write_set.contains_key(p),
-            WitnessKey::Custom { .. } => !self.write_set.is_empty(), // Conservative fallback
+        if self
+            .global_write_witnesses
+            .iter()
+            .any(|w| crate::witness_plane::witness_keys_overlap(w, key))
+        {
+            return true;
         }
+
+        let page = match key.page_number() {
+            Some(p) => p,
+            None => return !self.write_set.is_empty() || !self.global_write_witnesses.is_empty(),
+        };
+
+        if !self.write_set.contains_key(&page) {
+            return false;
+        }
+
+        if let Some(witnesses) = self.write_index.get(&page) {
+            return witnesses
+                .iter()
+                .any(|w| crate::witness_plane::witness_keys_overlap(w, key));
+        }
+
+        true
     }
 
     fn has_in_rw(&self) -> bool {
@@ -478,6 +547,7 @@ pub fn concurrent_write_page(
         handle.page_locks.remove(&page);
         return Err(MvccError::Busy);
     }
+    handle.record_write_witness(fsqlite_types::WitnessKey::Page(page));
     handle.write_set.insert(page, data);
     Ok(())
 }
@@ -562,6 +632,7 @@ pub struct PreparedConcurrentCommit {
     begin_seq: CommitSeq,
     read_keys: Vec<WitnessKey>,
     write_keys: Vec<WitnessKey>,
+    write_set_pages: Vec<PageNumber>,
     has_in_rw: bool,
     has_out_rw: bool,
     incoming_edges: Vec<DiscoveredEdge>,
@@ -635,7 +706,7 @@ impl<'a> HandleView<'a> {
 
 impl ActiveTxnView for HandleView<'_> {
     fn token(&self) -> TxnToken {
-        self.handle.txn_token
+        self.handle.token()
     }
 
     fn begin_seq(&self) -> CommitSeq {
@@ -824,19 +895,21 @@ pub fn prepare_concurrent_commit_with_ssi(
     }
 
     // Build view of committing txn state.
-    let (txn, begin_seq, read_keys, write_keys, marked_for_abort) = {
+    let (txn, begin_seq, read_keys, write_keys, write_set_pages, marked_for_abort) = {
         let handle = registry
             .get(session_id)
             .ok_or((MvccError::InvalidState, FcwResult::Clean))?;
 
         let read_keys = handle.read_witness_keys();
         let write_keys = handle.write_witness_keys();
+        let write_set_pages = handle.write_set.keys().copied().collect::<Vec<_>>();
 
         (
             handle.token(),
             handle.begin_seq(),
             read_keys,
             write_keys,
+            write_set_pages,
             handle.marked_for_abort.get(),
         )
     };
@@ -917,6 +990,7 @@ pub fn prepare_concurrent_commit_with_ssi(
         begin_seq,
         read_keys: sorted_read_keys,
         write_keys: sorted_write_keys,
+        write_set_pages,
         has_in_rw,
         has_out_rw,
         incoming_edges,
@@ -1081,10 +1155,8 @@ pub fn finalize_prepared_concurrent_commit_with_ssi(
         );
     }
 
-    for key in &prepared.write_keys {
-        if let Some(page) = crate::ssi_validation::witness_key_page(key) {
-            commit_index.update(page, committed_seq);
-        }
+    for &page in &prepared.write_set_pages {
+        commit_index.update(page, committed_seq);
     }
     lock_table.release_all(txn_id);
     if mark_committed {
@@ -1865,8 +1937,8 @@ mod tests {
         let mut registry = ConcurrentRegistry::new();
 
         // Classic write skew setup:
-        // T1 reads A, writes B.
-        // T2 reads B, writes A.
+        // T1: reads A, writes B.
+        // T2: reads B, writes A.
         //
         // When T1 tries to commit:
         // - Incoming: T2 read B, T1 writes B → incoming edge from T2 to T1
@@ -2191,8 +2263,8 @@ mod tests {
     //   low-contention DRO matrix keeps the active pivot running.
     //   T2 has only incoming edge => T2 commits.
     //
-    // Step 3: T1 tries to commit → still fails with BusySnapshot because its
-    // own commit-time scan observes both incoming and outgoing edges.
+    // Step 3: T1 tries to commit → still fails with BusySnapshot
+    // (actual pivot detected during T1's own commit-time scan).
     #[test]
     fn test_ssi_low_contention_dro_defers_marked_for_abort() {
         use super::concurrent_commit_with_ssi;
@@ -2526,7 +2598,7 @@ mod tests {
     // - T2 reads C, writes B (active while T1 commits), so T1 has outgoing rw.
     // - T3 reads A, writes D from an old snapshot.
     //
-    // T1 commits with had_out_rw=true in committed writer history.
+    // T1 commits and should carry had_out_rw=true in committed writer history.
     // T3 then discovers outgoing edge T3 -> T1. Because T1 was already a
     // committed writer pivot source, T3 must abort.
     #[test]

@@ -19,7 +19,10 @@ use crate::value::SqliteValue;
 /// Returns `None` if the record is malformed.
 #[allow(clippy::cast_possible_truncation)]
 pub fn parse_record(data: &[u8]) -> Option<Vec<SqliteValue>> {
-    let mut values = Vec::new();
+    // A typical record has ~4-8 columns. We can estimate capacity from data len / 8 as a heuristic,
+    // clamped between 4 and 64, to avoid reallocation for the majority of rows.
+    let cap = (data.len() / 8).clamp(4, 64);
+    let mut values = Vec::with_capacity(cap);
     parse_record_into(data, &mut values)?;
     Some(values)
 }
