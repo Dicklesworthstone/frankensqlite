@@ -68,14 +68,22 @@
   "hardware_classes": [
     {
       "id": "linux_x86_64_any",
-      "arch": "x86_64",
+      "id_fields": {
+        "os_family": "linux",
+        "cpu_arch": "x86_64",
+        "topology_class": "any"
+      },
       "min_logical_cores": 4,
       "min_numa_nodes": null,
       "description": "Generic Linux x86_64 host suitable for baseline scheduler-default comparisons."
     },
     {
       "id": "linux_x86_64_many_core_numa",
-      "arch": "x86_64",
+      "id_fields": {
+        "os_family": "linux",
+        "cpu_arch": "x86_64",
+        "topology_class": "many_core_numa"
+      },
       "min_logical_cores": 16,
       "min_numa_nodes": 2,
       "description": "Many-core Linux x86_64 host with NUMA or CCD boundaries suitable for pinned and adversarial topology evidence."

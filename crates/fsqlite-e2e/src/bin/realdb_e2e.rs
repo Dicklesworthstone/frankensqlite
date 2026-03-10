@@ -24,26 +24,30 @@ use sha2::{Digest, Sha256};
 use rusqlite::{Connection, DatabaseName, OpenFlags};
 use serde::Serialize;
 
-use fsqlite_types::{DATABASE_HEADER_SIZE, DatabaseHeader};
+use fsqlite_types::{DatabaseHeader, DATABASE_HEADER_SIZE};
 
-use fsqlite_e2e::benchmark::{BenchmarkConfig, BenchmarkMeta, BenchmarkSummary, run_benchmark};
-use fsqlite_e2e::corruption::{CorruptionStrategy, inject_corruption};
+use fsqlite_e2e::benchmark::{run_benchmark, BenchmarkConfig, BenchmarkMeta, BenchmarkSummary};
+use fsqlite_e2e::corruption::{inject_corruption, CorruptionStrategy};
 use fsqlite_e2e::fixture_metadata::{
-    ColumnProfileV1, FIXTURE_METADATA_SCHEMA_VERSION_V1, FixtureFeaturesV1, FixtureMetadataV1,
-    FixtureSafetyV1, RiskLevel, SqliteMetaV1, TableProfileV1, normalize_tags, size_bucket_tag,
+    normalize_tags, size_bucket_tag, ColumnProfileV1, FixtureFeaturesV1, FixtureMetadataV1,
+    FixtureSafetyV1, RiskLevel, SqliteMetaV1, TableProfileV1, FIXTURE_METADATA_SCHEMA_VERSION_V1,
 };
-use fsqlite_e2e::fsqlite_executor::{FsqliteExecConfig, run_oplog_fsqlite};
+use fsqlite_e2e::fsqlite_executor::{run_oplog_fsqlite, FsqliteExecConfig};
 use fsqlite_e2e::golden::{format_mismatch_diagnostic, verify_databases};
 use fsqlite_e2e::methodology::EnvironmentMeta;
 use fsqlite_e2e::oplog::{self, OpLog};
 use fsqlite_e2e::perf_runner::{
-    FsqliteHotPathProfileConfig, profile_fsqlite_mixed_read_write_hot_path,
-    write_hot_path_profile_artifacts,
+    build_hot_path_actionable_ranking, profile_fsqlite_mixed_read_write_hot_path,
+    render_hot_path_profile_markdown, write_hot_path_profile_artifacts,
+    FsqliteHotPathProfileConfig, HotPathArtifactManifest, HotPathProfileReport,
 };
 use fsqlite_e2e::report::{EngineInfo, RunRecordV1, RunRecordV1Args};
 use fsqlite_e2e::report_render::render_benchmark_summaries_markdown;
-use fsqlite_e2e::run_workspace::{WorkspaceConfig, create_workspace_with_label};
-use fsqlite_e2e::sqlite_executor::{SqliteExecConfig, run_oplog_sqlite};
+use fsqlite_e2e::run_workspace::{create_workspace_with_label, WorkspaceConfig};
+use fsqlite_e2e::sqlite_executor::{run_oplog_sqlite, SqliteExecConfig};
+
+const HOT_PATH_INLINE_BUNDLE_SCHEMA_V1: &str = "fsqlite-e2e.hot_path_inline_bundle.v1";
+const HOT_PATH_INLINE_BUNDLE_PREFIX: &str = "HOT_PATH_INLINE_BUNDLE_JSON=";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RunModeOptions {
@@ -2409,6 +2413,7 @@ fn cmd_hot_profile(argv: &[String]) -> i32 {
     let mut mvcc = true;
     let mut run_integrity_check = false;
     let mut pretty = false;
+    let mut emit_inline_bundle = false;
 
     let mut i = 0;
     while i < argv.len() {
@@ -2485,6 +2490,7 @@ fn cmd_hot_profile(argv: &[String]) -> i32 {
             "--no-mvcc" => mvcc = false,
             "--integrity-check" => run_integrity_check = true,
             "--pretty" => pretty = true,
+            "--emit-inline-bundle" => emit_inline_bundle = true,
             other => {
                 eprintln!("error: unknown option `{other}`");
                 return 2;
@@ -2562,6 +2568,16 @@ fn cmd_hot_profile(argv: &[String]) -> i32 {
         }
     };
 
+    if emit_inline_bundle {
+        match serialize_hot_path_inline_bundle(&report, &manifest) {
+            Ok(json) => eprintln!("{HOT_PATH_INLINE_BUNDLE_PREFIX}{json}"),
+            Err(error) => {
+                eprintln!("error: failed to serialize hot-path inline bundle: {error}");
+                return 1;
+            }
+        }
+    }
+
     if pretty {
         match serde_json::to_string_pretty(&report) {
             Ok(json) => println!("{json}"),
@@ -2602,10 +2618,26 @@ OPTIONS:
     --mvcc                  Force concurrent mode on (default)
     --no-mvcc               Disable concurrent mode for forced serialized comparison
     --integrity-check       Run post-run integrity check (default: off for lower profiling noise)
+    --emit-inline-bundle    Print a tagged single-line artifact bundle for remote wrappers
     --pretty                Print the full report JSON instead of the manifest JSON
     -h, --help              Show this help message
 ";
     let _ = io::stdout().write_all(text.as_bytes());
+}
+
+fn serialize_hot_path_inline_bundle(
+    report: &HotPathProfileReport,
+    manifest: &HotPathArtifactManifest,
+) -> Result<String, serde_json::Error> {
+    let actionable_ranking = build_hot_path_actionable_ranking(report);
+    let summary_markdown = render_hot_path_profile_markdown(report);
+    serde_json::to_string(&serde_json::json!({
+        "schema_version": HOT_PATH_INLINE_BUNDLE_SCHEMA_V1,
+        "profile": report,
+        "actionable_ranking": actionable_ranking,
+        "summary_markdown": summary_markdown,
+        "manifest": manifest,
+    }))
 }
 
 // ── corrupt ─────────────────────────────────────────────────────────────
@@ -3659,6 +3691,13 @@ fn cmd_compare(argv: &[String]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fsqlite_e2e::perf_runner::{
+        HotPathAllocatorPressure, HotPathArtifactFile, HotPathArtifactManifest,
+        HotPathOpcodeProfileEntry, HotPathParserProfile, HotPathProfileReport, HotPathRankingEntry,
+        HotPathRecordDecodeProfile, HotPathRowMaterializationProfile, HotPathTypeProfile,
+        HotPathValueTypeProfile, HOT_PATH_PROFILE_ACTIONABLE_RANKING_SCHEMA_V1,
+        HOT_PATH_PROFILE_MANIFEST_SCHEMA_V1, HOT_PATH_PROFILE_SCHEMA_V1,
+    };
     use fsqlite_e2e::report::{CorrectnessReport, EngineRunReport};
     use serde_json::Value;
 
@@ -3687,6 +3726,135 @@ mod tests {
             latency_ms: None,
             error: None,
             hot_path_profile: None,
+        }
+    }
+
+    fn sample_value_type_profile() -> HotPathValueTypeProfile {
+        HotPathValueTypeProfile {
+            total_values: 1,
+            nulls: 0,
+            integers: 1,
+            reals: 0,
+            texts: 0,
+            blobs: 0,
+            text_bytes_total: 0,
+            blob_bytes_total: 0,
+        }
+    }
+
+    fn sample_hot_path_report() -> HotPathProfileReport {
+        let decoded_values = sample_value_type_profile();
+        HotPathProfileReport {
+            schema_version: HOT_PATH_PROFILE_SCHEMA_V1.to_owned(),
+            bead_id: "bd-db300.4.1".to_owned(),
+            scenario_id: "bd-db300.4.1.mixed_read_write".to_owned(),
+            run_id: "run-1".to_owned(),
+            trace_id: "trace-1".to_owned(),
+            fixture_id: "fixture-a".to_owned(),
+            workload: "mixed_read_write".to_owned(),
+            seed: 42,
+            scale: 50,
+            concurrency: 4,
+            replay_command: "cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile".to_owned(),
+            engine_report: sample_engine_report(),
+            parser: HotPathParserProfile {
+                parse_single_calls: 1,
+                parse_multi_calls: 0,
+                parse_cache_hits: 0,
+                parse_cache_misses: 1,
+                parsed_sql_bytes: 32,
+                parse_time_ns: 10,
+                rewrite_calls: 0,
+                rewrite_time_ns: 0,
+                compiled_cache_hits: 0,
+                compiled_cache_misses: 1,
+                compile_time_ns: 10,
+            },
+            record_decode: HotPathRecordDecodeProfile {
+                parse_record_calls: 1,
+                parse_record_into_calls: 0,
+                parse_record_column_calls: 1,
+                record_bytes_scanned: 64,
+                record_vec_capacity_slots: 4,
+                decode_time_ns: 12,
+                decoded_values: decoded_values.clone(),
+                vdbe_record_decode_calls_total: 1,
+                vdbe_column_reads_total: 1,
+                vdbe_decoded_value_heap_bytes_total: 16,
+            },
+            row_materialization: HotPathRowMaterializationProfile {
+                result_rows_total: 1,
+                result_values_total: 1,
+                result_value_heap_bytes_total: 8,
+                result_row_materialization_time_ns_total: 14,
+                make_record_calls_total: 0,
+                make_record_blob_bytes_total: 0,
+                value_types: decoded_values.clone(),
+            },
+            opcode_profile: vec![HotPathOpcodeProfileEntry {
+                opcode: "Column".to_owned(),
+                total: 3,
+            }],
+            type_profile: HotPathTypeProfile {
+                decoded: decoded_values.clone(),
+                materialized: decoded_values,
+            },
+            subsystem_ranking: vec![HotPathRankingEntry {
+                subsystem: "record_decode".to_owned(),
+                metric_kind: "time_ns".to_owned(),
+                metric_value: 12,
+                rationale: "test hotspot".to_owned(),
+            }],
+            allocator_pressure: HotPathAllocatorPressure {
+                parser_sql_bytes: 32,
+                decoded_value_heap_bytes_total: 16,
+                result_value_heap_bytes_total: 8,
+                record_vec_capacity_slots: 4,
+                ranked_sources: vec![HotPathRankingEntry {
+                    subsystem: "record_decode_values".to_owned(),
+                    metric_kind: "bytes".to_owned(),
+                    metric_value: 16,
+                    rationale: "test allocator pressure".to_owned(),
+                }],
+            },
+        }
+    }
+
+    fn sample_hot_path_manifest() -> HotPathArtifactManifest {
+        HotPathArtifactManifest {
+            schema_version: HOT_PATH_PROFILE_MANIFEST_SCHEMA_V1.to_owned(),
+            bead_id: "bd-db300.4.1".to_owned(),
+            run_id: "run-1".to_owned(),
+            trace_id: "trace-1".to_owned(),
+            scenario_id: "bd-db300.4.1.mixed_read_write".to_owned(),
+            fixture_id: "fixture-a".to_owned(),
+            workload: "mixed_read_write".to_owned(),
+            seed: 42,
+            scale: 50,
+            concurrency: 4,
+            replay_command: "cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile".to_owned(),
+            files: vec![
+                HotPathArtifactFile {
+                    path: "profile.json".to_owned(),
+                    bytes: 1,
+                    description: "report".to_owned(),
+                },
+                HotPathArtifactFile {
+                    path: "summary.md".to_owned(),
+                    bytes: 1,
+                    description: "summary".to_owned(),
+                },
+                HotPathArtifactFile {
+                    path: "actionable_ranking.json".to_owned(),
+                    bytes: 1,
+                    description: "ranking".to_owned(),
+                },
+                HotPathArtifactFile {
+                    path: "manifest.json".to_owned(),
+                    bytes: 1,
+                    description: "manifest".to_owned(),
+                },
+            ],
         }
     }
 
@@ -3787,6 +3955,32 @@ mod tests {
     #[test]
     fn test_no_args_shows_help() {
         assert_eq!(run_with(&["realdb-e2e"]), 0);
+    }
+
+    #[test]
+    fn serialize_hot_path_inline_bundle_includes_expected_sections() {
+        let report = sample_hot_path_report();
+        let manifest = sample_hot_path_manifest();
+        let text = serialize_hot_path_inline_bundle(&report, &manifest)
+            .expect("inline bundle serialization should succeed");
+        let value: Value = serde_json::from_str(&text).expect("bundle JSON must parse");
+        assert_eq!(value["schema_version"], HOT_PATH_INLINE_BUNDLE_SCHEMA_V1);
+        assert_eq!(
+            value["profile"]["schema_version"],
+            HOT_PATH_PROFILE_SCHEMA_V1
+        );
+        assert_eq!(
+            value["actionable_ranking"]["schema_version"],
+            HOT_PATH_PROFILE_ACTIONABLE_RANKING_SCHEMA_V1
+        );
+        assert_eq!(
+            value["manifest"]["schema_version"],
+            HOT_PATH_PROFILE_MANIFEST_SCHEMA_V1
+        );
+        assert_eq!(value["manifest"]["fixture_id"], "fixture-a");
+        assert!(value["summary_markdown"]
+            .as_str()
+            .is_some_and(|summary| summary.contains("## Ranked Hotspots")));
     }
 
     #[test]

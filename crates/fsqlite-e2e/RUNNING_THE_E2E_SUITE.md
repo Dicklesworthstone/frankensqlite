@@ -279,7 +279,9 @@ ad hoc shell history:
 - Seed policy: fixed root seed `42`
 - Retry policy: harness-instrumented busy retries (`10_000`, `1ms` base, `250ms` cap)
 - Placement profiles: `baseline_unpinned`, `recommended_pinned`, `adversarial_cross_node`
+  with taxonomy kinds `baseline`, `recommended_pinned`, `adversarial_topology`
 - Hardware classes: `linux_x86_64_any`, `linux_x86_64_many_core_numa`
+  with identifier fields `os_family`, `cpu_arch`, `topology_class`
 
 Artifact names for canonical runs must include the source revision and the
 `.beads/issues.jsonl` hash so results stay mechanically diffable over time. The

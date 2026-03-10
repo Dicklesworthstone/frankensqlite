@@ -110,6 +110,60 @@
         "fsqlite_single_writer"
       ]
     },
+    "placement_profile_kind": {
+      "type": "string",
+      "enum": [
+        "baseline",
+        "recommended_pinned",
+        "adversarial_topology"
+      ]
+    },
+    "placement_profile_availability": {
+      "type": "string",
+      "enum": [
+        "universal",
+        "topology_aware"
+      ]
+    },
+    "hardware_os_family": {
+      "type": "string",
+      "enum": [
+        "linux"
+      ]
+    },
+    "hardware_cpu_architecture": {
+      "type": "string",
+      "enum": [
+        "x86_64"
+      ]
+    },
+    "hardware_topology_class": {
+      "type": "string",
+      "enum": [
+        "any",
+        "many_core_numa"
+      ]
+    },
+    "hardware_class_id_fields": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "os_family",
+        "cpu_arch",
+        "topology_class"
+      ],
+      "properties": {
+        "os_family": {
+          "$ref": "#/$defs/hardware_os_family"
+        },
+        "cpu_arch": {
+          "$ref": "#/$defs/hardware_cpu_architecture"
+        },
+        "topology_class": {
+          "$ref": "#/$defs/hardware_topology_class"
+        }
+      }
+    },
     "fixture": {
       "type": "object",
       "additionalProperties": false,
@@ -176,7 +230,7 @@
           "$ref": "#/$defs/id"
         },
         "kind": {
-          "$ref": "#/$defs/non_empty_string"
+          "$ref": "#/$defs/placement_profile_kind"
         },
         "description": {
           "$ref": "#/$defs/non_empty_string"
@@ -185,7 +239,7 @@
           "$ref": "#/$defs/non_empty_string"
         },
         "availability": {
-          "$ref": "#/$defs/non_empty_string"
+          "$ref": "#/$defs/placement_profile_availability"
         }
       }
     },
@@ -194,7 +248,7 @@
       "additionalProperties": false,
       "required": [
         "id",
-        "arch",
+        "id_fields",
         "min_logical_cores",
         "min_numa_nodes",
         "description"
@@ -203,8 +257,8 @@
         "id": {
           "$ref": "#/$defs/id"
         },
-        "arch": {
-          "$ref": "#/$defs/non_empty_string"
+        "id_fields": {
+          "$ref": "#/$defs/hardware_class_id_fields"
         },
         "min_logical_cores": {
           "type": "integer",

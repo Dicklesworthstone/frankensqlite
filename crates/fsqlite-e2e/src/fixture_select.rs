@@ -67,6 +67,29 @@ pub const BEADS_BENCHMARK_CAMPAIGN_SCHEMA_V1: &str = "fsqlite-e2e.beads_benchmar
 pub const BEADS_BENCHMARK_CAMPAIGN_PATH_RELATIVE: &str =
     "sample_sqlite_db_files/manifests/beads_benchmark_campaign.v1.json";
 
+/// Stable baseline placement profile id for portable scheduler-default runs.
+pub const PLACEMENT_PROFILE_BASELINE_UNPINNED: &str = "baseline_unpinned";
+/// Stable recommended placement profile id for topology-aware pinned runs.
+pub const PLACEMENT_PROFILE_RECOMMENDED_PINNED: &str = "recommended_pinned";
+/// Stable adversarial placement profile id for cross-node stress runs.
+pub const PLACEMENT_PROFILE_ADVERSARIAL_CROSS_NODE: &str = "adversarial_cross_node";
+/// Canonical placement-profile ids required across Track A/G reports.
+pub const REQUIRED_PLACEMENT_PROFILE_IDS: [&str; 3] = [
+    PLACEMENT_PROFILE_BASELINE_UNPINNED,
+    PLACEMENT_PROFILE_RECOMMENDED_PINNED,
+    PLACEMENT_PROFILE_ADVERSARIAL_CROSS_NODE,
+];
+
+/// Stable hardware-class id for portable x86_64 Linux baseline hosts.
+pub const HARDWARE_CLASS_LINUX_X86_64_ANY: &str = "linux_x86_64_any";
+/// Stable hardware-class id for many-core NUMA-aware x86_64 Linux hosts.
+pub const HARDWARE_CLASS_LINUX_X86_64_MANY_CORE_NUMA: &str = "linux_x86_64_many_core_numa";
+/// Canonical hardware-class ids required across Track A/G reports.
+pub const REQUIRED_HARDWARE_CLASS_IDS: [&str; 2] = [
+    HARDWARE_CLASS_LINUX_X86_64_ANY,
+    HARDWARE_CLASS_LINUX_X86_64_MANY_CORE_NUMA,
+];
+
 /// Which execution mode a canonical benchmark cell uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -102,21 +125,108 @@ pub struct BeadsBenchmarkFixture {
     pub capture_rule: String,
 }
 
+/// Placement taxonomy family used across the canonical many-core reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlacementProfileKind {
+    Baseline,
+    RecommendedPinned,
+    AdversarialTopology,
+}
+
+/// Whether the placement profile is portable or requires topology awareness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlacementAvailability {
+    Universal,
+    TopologyAware,
+}
+
 /// Placement vocabulary for the canonical matrix.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlacementProfile {
     pub id: String,
-    pub kind: String,
+    pub kind: PlacementProfileKind,
     pub description: String,
     pub command_hint: String,
-    pub availability: String,
+    pub availability: PlacementAvailability,
+}
+
+/// Operating-system family encoded in a hardware-class identifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HardwareOsFamily {
+    Linux,
+}
+
+impl HardwareOsFamily {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Linux => "linux",
+        }
+    }
+}
+
+/// CPU architecture encoded in a hardware-class identifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HardwareCpuArchitecture {
+    X86_64,
+}
+
+impl HardwareCpuArchitecture {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::X86_64 => "x86_64",
+        }
+    }
+}
+
+/// Host-topology tier encoded in a hardware-class identifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HardwareTopologyClass {
+    Any,
+    ManyCoreNuma,
+}
+
+impl HardwareTopologyClass {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Any => "any",
+            Self::ManyCoreNuma => "many_core_numa",
+        }
+    }
+}
+
+/// Explicit identifier components so reports do not need to parse free-form ids.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HardwareClassIdFields {
+    pub os_family: HardwareOsFamily,
+    pub cpu_arch: HardwareCpuArchitecture,
+    pub topology_class: HardwareTopologyClass,
+}
+
+impl HardwareClassIdFields {
+    #[must_use]
+    pub fn canonical_id(&self) -> String {
+        format!(
+            "{}_{}_{}",
+            self.os_family.as_str(),
+            self.cpu_arch.as_str(),
+            self.topology_class.as_str()
+        )
+    }
 }
 
 /// Hardware taxonomy attached to canonical matrix rows.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HardwareClass {
     pub id: String,
-    pub arch: String,
+    pub id_fields: HardwareClassIdFields,
     pub min_logical_cores: u32,
     pub min_numa_nodes: Option<u32>,
     pub description: String,
@@ -386,12 +496,148 @@ pub fn validate_beads_benchmark_campaign(
         "seed_policy_id",
         &mut errors,
     );
+    let mut source_paths = BTreeSet::new();
+    let mut working_copy_paths = BTreeSet::new();
+
+    for profile in &campaign.placement_profiles {
+        match profile.id.as_str() {
+            PLACEMENT_PROFILE_BASELINE_UNPINNED => {
+                if profile.kind != PlacementProfileKind::Baseline {
+                    errors.push(format!(
+                        "placement profile {} must use kind baseline",
+                        profile.id
+                    ));
+                }
+                if profile.availability != PlacementAvailability::Universal {
+                    errors.push(format!(
+                        "placement profile {} must use universal availability",
+                        profile.id
+                    ));
+                }
+            }
+            PLACEMENT_PROFILE_RECOMMENDED_PINNED => {
+                if profile.kind != PlacementProfileKind::RecommendedPinned {
+                    errors.push(format!(
+                        "placement profile {} must use kind recommended_pinned",
+                        profile.id
+                    ));
+                }
+                if profile.availability != PlacementAvailability::TopologyAware {
+                    errors.push(format!(
+                        "placement profile {} must use topology_aware availability",
+                        profile.id
+                    ));
+                }
+            }
+            PLACEMENT_PROFILE_ADVERSARIAL_CROSS_NODE => {
+                if profile.kind != PlacementProfileKind::AdversarialTopology {
+                    errors.push(format!(
+                        "placement profile {} must use kind adversarial_topology",
+                        profile.id
+                    ));
+                }
+                if profile.availability != PlacementAvailability::TopologyAware {
+                    errors.push(format!(
+                        "placement profile {} must use topology_aware availability",
+                        profile.id
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+    for required_profile_id in REQUIRED_PLACEMENT_PROFILE_IDS {
+        if !placement_ids.contains_key(required_profile_id) {
+            errors.push(format!(
+                "campaign must define required placement profile {:?}",
+                required_profile_id
+            ));
+        }
+    }
+
+    for hardware in &campaign.hardware_classes {
+        let canonical_id = hardware.id_fields.canonical_id();
+        if hardware.id != canonical_id {
+            errors.push(format!(
+                "hardware class {} must match identifier fields {}",
+                hardware.id, canonical_id
+            ));
+        }
+
+        let expected_fields = match hardware.id.as_str() {
+            HARDWARE_CLASS_LINUX_X86_64_ANY => Some(HardwareClassIdFields {
+                os_family: HardwareOsFamily::Linux,
+                cpu_arch: HardwareCpuArchitecture::X86_64,
+                topology_class: HardwareTopologyClass::Any,
+            }),
+            HARDWARE_CLASS_LINUX_X86_64_MANY_CORE_NUMA => Some(HardwareClassIdFields {
+                os_family: HardwareOsFamily::Linux,
+                cpu_arch: HardwareCpuArchitecture::X86_64,
+                topology_class: HardwareTopologyClass::ManyCoreNuma,
+            }),
+            _ => None,
+        };
+        if let Some(expected_fields) = expected_fields
+            && hardware.id_fields != expected_fields
+        {
+            errors.push(format!(
+                "hardware class {} must use canonical identifier fields {:?}",
+                hardware.id, expected_fields
+            ));
+        }
+    }
+    for required_hardware_id in REQUIRED_HARDWARE_CLASS_IDS {
+        if !hardware_ids.contains_key(required_hardware_id) {
+            errors.push(format!(
+                "campaign must define required hardware class {:?}",
+                required_hardware_id
+            ));
+        }
+    }
 
     for fixture in &campaign.fixtures {
+        if fixture.capture_rule.trim().is_empty() {
+            errors.push(format!(
+                "fixture {} capture_rule must not be empty",
+                fixture.fixture_id
+            ));
+        }
         if !Path::new(&fixture.source_path).is_absolute() {
             errors.push(format!(
                 "fixture {} source_path must be absolute: {}",
                 fixture.fixture_id, fixture.source_path
+            ));
+        }
+        if !is_sha256_hex_64(&fixture.source_sha256) {
+            errors.push(format!(
+                "fixture {} source_sha256 must be 64 lowercase hex chars",
+                fixture.fixture_id
+            ));
+        }
+        if !is_sha256_hex_64(&fixture.working_copy_sha256) {
+            errors.push(format!(
+                "fixture {} working_copy_sha256 must be 64 lowercase hex chars",
+                fixture.fixture_id
+            ));
+        }
+        if !source_paths.insert(fixture.source_path.as_str()) {
+            errors.push(format!(
+                "fixture source_path must be unique: {}",
+                fixture.source_path
+            ));
+        }
+        if !working_copy_paths.insert(fixture.working_copy_relpath.as_str()) {
+            errors.push(format!(
+                "fixture working_copy_relpath must be unique: {}",
+                fixture.working_copy_relpath
+            ));
+        }
+        if !Path::new(&fixture.working_copy_relpath)
+            .starts_with(Path::new(&campaign.working_benchmark_root_relpath))
+        {
+            errors.push(format!(
+                "fixture {} working copy must stay under campaign root: {}",
+                fixture.fixture_id, fixture.working_copy_relpath
             ));
         }
         let working_copy = workspace_root.join(&fixture.working_copy_relpath);
@@ -482,32 +728,31 @@ pub fn validate_beads_benchmark_campaign(
         let has_baseline = row
             .placement_variants
             .iter()
-            .any(|variant| variant.placement_profile_id == "baseline_unpinned");
+            .any(|variant| variant.placement_profile_id == PLACEMENT_PROFILE_BASELINE_UNPINNED);
         let has_recommended = row
             .placement_variants
             .iter()
-            .any(|variant| variant.placement_profile_id == "recommended_pinned");
-        let has_adversarial = row
-            .placement_variants
-            .iter()
-            .any(|variant| variant.placement_profile_id == "adversarial_cross_node");
+            .any(|variant| variant.placement_profile_id == PLACEMENT_PROFILE_RECOMMENDED_PINNED);
+        let has_adversarial = row.placement_variants.iter().any(|variant| {
+            variant.placement_profile_id == PLACEMENT_PROFILE_ADVERSARIAL_CROSS_NODE
+        });
 
         if !has_baseline {
             errors.push(format!(
-                "row {} must include the baseline_unpinned placement profile",
-                row.row_id
+                "row {} must include the {} placement profile",
+                row.row_id, PLACEMENT_PROFILE_BASELINE_UNPINNED
             ));
         }
         if !has_recommended {
             errors.push(format!(
-                "row {} must include the recommended_pinned placement profile",
-                row.row_id
+                "row {} must include the {} placement profile",
+                row.row_id, PLACEMENT_PROFILE_RECOMMENDED_PINNED
             ));
         }
         if row.concurrency > 1 && !has_adversarial {
             errors.push(format!(
-                "row {} must include adversarial_cross_node for concurrency > 1",
-                row.row_id
+                "row {} must include {} for concurrency > 1",
+                row.row_id, PLACEMENT_PROFILE_ADVERSARIAL_CROSS_NODE
             ));
         }
 
@@ -593,6 +838,13 @@ fn sha256_hex_file(path: &Path) -> Result<String, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let digest = Sha256::digest(bytes);
     Ok(format!("{digest:x}"))
+}
+
+fn is_sha256_hex_64(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
 }
 
 fn short_hash(value: &str) -> String {
@@ -1246,38 +1498,46 @@ mod tests {
             }],
             placement_profiles: vec![
                 PlacementProfile {
-                    id: "baseline_unpinned".to_owned(),
-                    kind: "baseline".to_owned(),
+                    id: PLACEMENT_PROFILE_BASELINE_UNPINNED.to_owned(),
+                    kind: PlacementProfileKind::Baseline,
                     description: "scheduler default".to_owned(),
                     command_hint: "run directly".to_owned(),
-                    availability: "universal".to_owned(),
+                    availability: PlacementAvailability::Universal,
                 },
                 PlacementProfile {
-                    id: "recommended_pinned".to_owned(),
-                    kind: "recommended_pinned".to_owned(),
+                    id: PLACEMENT_PROFILE_RECOMMENDED_PINNED.to_owned(),
+                    kind: PlacementProfileKind::RecommendedPinned,
                     description: "pin to sibling-free cores".to_owned(),
                     command_hint: "taskset pin".to_owned(),
-                    availability: "topology_aware".to_owned(),
+                    availability: PlacementAvailability::TopologyAware,
                 },
                 PlacementProfile {
-                    id: "adversarial_cross_node".to_owned(),
-                    kind: "adversarial_topology".to_owned(),
+                    id: PLACEMENT_PROFILE_ADVERSARIAL_CROSS_NODE.to_owned(),
+                    kind: PlacementProfileKind::AdversarialTopology,
                     description: "spread across nodes".to_owned(),
                     command_hint: "numactl --cpunodebind".to_owned(),
-                    availability: "topology_aware".to_owned(),
+                    availability: PlacementAvailability::TopologyAware,
                 },
             ],
             hardware_classes: vec![
                 HardwareClass {
-                    id: "linux_x86_64_any".to_owned(),
-                    arch: "x86_64".to_owned(),
+                    id: HARDWARE_CLASS_LINUX_X86_64_ANY.to_owned(),
+                    id_fields: HardwareClassIdFields {
+                        os_family: HardwareOsFamily::Linux,
+                        cpu_arch: HardwareCpuArchitecture::X86_64,
+                        topology_class: HardwareTopologyClass::Any,
+                    },
                     min_logical_cores: 4,
                     min_numa_nodes: None,
                     description: "generic".to_owned(),
                 },
                 HardwareClass {
-                    id: "linux_x86_64_many_core_numa".to_owned(),
-                    arch: "x86_64".to_owned(),
+                    id: HARDWARE_CLASS_LINUX_X86_64_MANY_CORE_NUMA.to_owned(),
+                    id_fields: HardwareClassIdFields {
+                        os_family: HardwareOsFamily::Linux,
+                        cpu_arch: HardwareCpuArchitecture::X86_64,
+                        topology_class: HardwareTopologyClass::ManyCoreNuma,
+                    },
                     min_logical_cores: 16,
                     min_numa_nodes: Some(2),
                     description: "many-core".to_owned(),
@@ -1314,18 +1574,18 @@ mod tests {
                 ],
                 placement_variants: vec![
                     PlacementVariant {
-                        placement_profile_id: "baseline_unpinned".to_owned(),
-                        hardware_class_id: "linux_x86_64_any".to_owned(),
+                        placement_profile_id: PLACEMENT_PROFILE_BASELINE_UNPINNED.to_owned(),
+                        hardware_class_id: HARDWARE_CLASS_LINUX_X86_64_ANY.to_owned(),
                         required: true,
                     },
                     PlacementVariant {
-                        placement_profile_id: "recommended_pinned".to_owned(),
-                        hardware_class_id: "linux_x86_64_many_core_numa".to_owned(),
+                        placement_profile_id: PLACEMENT_PROFILE_RECOMMENDED_PINNED.to_owned(),
+                        hardware_class_id: HARDWARE_CLASS_LINUX_X86_64_MANY_CORE_NUMA.to_owned(),
                         required: true,
                     },
                     PlacementVariant {
-                        placement_profile_id: "adversarial_cross_node".to_owned(),
-                        hardware_class_id: "linux_x86_64_many_core_numa".to_owned(),
+                        placement_profile_id: PLACEMENT_PROFILE_ADVERSARIAL_CROSS_NODE.to_owned(),
+                        hardware_class_id: HARDWARE_CLASS_LINUX_X86_64_MANY_CORE_NUMA.to_owned(),
                         required: true,
                     },
                 ],
@@ -1442,9 +1702,11 @@ mod tests {
         };
         let results = select_all(&m, &filter);
         assert_eq!(results.len(), 2);
-        assert!(results
-            .iter()
-            .all(|e| !e.tags.contains(&"beads".to_owned())));
+        assert!(
+            results
+                .iter()
+                .all(|e| !e.tags.contains(&"beads".to_owned()))
+        );
     }
 
     #[test]
@@ -1719,6 +1981,60 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_beads_benchmark_campaign_rejects_bad_fixture_provenance() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let mut campaign = sample_campaign(tempdir.path());
+        campaign.fixtures[0].source_sha256 = "not-a-digest".to_owned();
+        campaign.fixtures[0].working_copy_relpath = "outside/beads.db".to_owned();
+        campaign.fixtures[0].capture_rule.clear();
+
+        let error =
+            validate_beads_benchmark_campaign(&campaign, tempdir.path()).expect_err("must fail");
+        assert!(error.contains("source_sha256"));
+        assert!(error.contains("working copy must stay under campaign root"));
+        assert!(error.contains("capture_rule must not be empty"));
+    }
+
+    #[test]
+    fn test_beads_benchmark_campaign_taxonomy_is_explicit() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let campaign = sample_campaign(tempdir.path());
+
+        let baseline = campaign
+            .placement_profiles
+            .iter()
+            .find(|profile| profile.id == PLACEMENT_PROFILE_BASELINE_UNPINNED)
+            .unwrap();
+        assert_eq!(baseline.kind, PlacementProfileKind::Baseline);
+        assert_eq!(baseline.availability, PlacementAvailability::Universal);
+
+        let recommended = campaign
+            .placement_profiles
+            .iter()
+            .find(|profile| profile.id == PLACEMENT_PROFILE_RECOMMENDED_PINNED)
+            .unwrap();
+        assert_eq!(recommended.kind, PlacementProfileKind::RecommendedPinned);
+        assert_eq!(
+            recommended.availability,
+            PlacementAvailability::TopologyAware
+        );
+
+        let many_core = campaign
+            .hardware_classes
+            .iter()
+            .find(|hardware| hardware.id == HARDWARE_CLASS_LINUX_X86_64_MANY_CORE_NUMA)
+            .unwrap();
+        assert_eq!(
+            many_core.id_fields.canonical_id(),
+            HARDWARE_CLASS_LINUX_X86_64_MANY_CORE_NUMA
+        );
+        assert_eq!(
+            many_core.id_fields.topology_class,
+            HardwareTopologyClass::ManyCoreNuma
+        );
+    }
+
+    #[test]
     fn test_load_beads_benchmark_campaign_real() {
         let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
@@ -1790,8 +2106,8 @@ mod tests {
                 cell.row_id == "mixed_read_write_c8"
                     && cell.fixture_id == "frankensqlite"
                     && cell.mode == BenchmarkMode::FsqliteMvcc
-                    && cell.placement_profile_id == "recommended_pinned"
-                    && cell.hardware_class_id == "linux_x86_64_many_core_numa"
+                    && cell.placement_profile_id == PLACEMENT_PROFILE_RECOMMENDED_PINNED
+                    && cell.hardware_class_id == HARDWARE_CLASS_LINUX_X86_64_MANY_CORE_NUMA
             })
             .expect("expected canonical bundle cell");
 
