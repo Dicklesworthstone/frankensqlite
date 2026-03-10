@@ -33,6 +33,7 @@ const DRAINING_NONE: u32 = 0xFFFF_FFFF;
 /// Default rebuild lease duration in seconds.
 const DEFAULT_LEASE_SECS: u64 = 5;
 const PID_BIRTH_PROCFS_TAG: u64 = 1_u64 << 63;
+const OCCUPANCY_STRIPE_COUNT: usize = 16;
 
 #[cfg(unix)]
 fn read_proc_start_time_ticks(pid: u32) -> Option<u64> {
@@ -118,6 +119,69 @@ impl PageLockEntry {
     }
 }
 
+#[repr(align(64))]
+struct CacheAlignedAtomicU32(AtomicU32);
+
+impl CacheAlignedAtomicU32 {
+    const fn new(value: u32) -> Self {
+        Self(AtomicU32::new(value))
+    }
+
+    fn load(&self, ordering: Ordering) -> u32 {
+        self.0.load(ordering)
+    }
+
+    fn fetch_add(&self, value: u32, ordering: Ordering) {
+        self.0.fetch_add(value, ordering);
+    }
+
+    fn store(&self, value: u32, ordering: Ordering) {
+        self.0.store(value, ordering);
+    }
+}
+
+/// Sharded occupancy counter for the lock-table metadata path.
+///
+/// New key insertion is the only mutating operation on occupancy during steady
+/// state, so we keep the exact slot count while spreading increments across
+/// separate cache lines to reduce coherence traffic from concurrent writers.
+struct StripedOccupancyCounter {
+    stripes: [CacheAlignedAtomicU32; OCCUPANCY_STRIPE_COUNT],
+}
+
+impl StripedOccupancyCounter {
+    fn new() -> Self {
+        Self {
+            stripes: std::array::from_fn(|_| CacheAlignedAtomicU32::new(0)),
+        }
+    }
+
+    #[inline]
+    fn load(&self) -> u32 {
+        self.stripes.iter().fold(0_u32, |sum, stripe| {
+            sum.saturating_add(stripe.load(Ordering::Relaxed))
+        })
+    }
+
+    #[inline]
+    fn increment(&self, page_number: u32) {
+        let stripe = Self::stripe_index(page_number);
+        self.stripes[stripe].fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn clear(&self) {
+        for stripe in &self.stripes {
+            stripe.store(0, Ordering::Release);
+        }
+    }
+
+    #[inline]
+    fn stripe_index(page_number: u32) -> usize {
+        let mixed = page_number.wrapping_mul(2_654_435_769);
+        mixed as usize & (OCCUPANCY_STRIPE_COUNT - 1)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // LockTableInstance
 // ---------------------------------------------------------------------------
@@ -125,16 +189,16 @@ impl PageLockEntry {
 /// One of the two physical hash tables in the `SharedPageLockTable`.
 struct LockTableInstance {
     entries: Vec<PageLockEntry>,
-    /// Atomic occupancy counter - tracks slots where `page_number != 0`.
+    /// Striped occupancy counter - tracks slots where `page_number != 0`.
     ///
-    /// Maintained atomically on insert to avoid O(capacity) full-table scans
-    /// on every lock acquisition. This is a critical hot-path optimization:
-    /// reduces load-factor check from O(1M) to O(1).
+    /// Maintained on successful insert to avoid O(capacity) full-table scans on
+    /// every lock acquisition. The counter is exact under the key-stable
+    /// invariant because slots are never deleted during steady state; only
+    /// rebuild-time `clear_all()` resets it.
     ///
-    /// Invariant: `occupied_count_atomic ∈ [actual - ε, actual + ε]` where
-    /// ε is bounded by concurrent in-flight operations (typically < 100).
-    /// For the 70% load factor check, this slack is negligible.
-    occupied_count_atomic: AtomicU32,
+    /// The stripes are separated onto independent cache lines so concurrent
+    /// writers creating different keys do not all bounce one shared atomic.
+    occupied_count: StripedOccupancyCounter,
 }
 
 impl LockTableInstance {
@@ -142,7 +206,7 @@ impl LockTableInstance {
         let entries: Vec<PageLockEntry> = (0..capacity).map(|_| PageLockEntry::new()).collect();
         Self {
             entries,
-            occupied_count_atomic: AtomicU32::new(0),
+            occupied_count: StripedOccupancyCounter::new(),
         }
     }
 
@@ -153,13 +217,13 @@ impl LockTableInstance {
     /// performed on every lock acquisition.
     #[inline]
     fn occupied_count(&self) -> u32 {
-        self.occupied_count_atomic.load(Ordering::Relaxed)
+        self.occupied_count.load()
     }
 
     /// Increment occupied count when a new slot is claimed.
     #[inline]
-    fn increment_occupied(&self) {
-        self.occupied_count_atomic.fetch_add(1, Ordering::Relaxed);
+    fn increment_occupied(&self, page_number: u32) {
+        self.occupied_count.increment(page_number);
     }
 
     /// Full-table scan for occupied count (expensive, use sparingly).
@@ -203,7 +267,7 @@ impl LockTableInstance {
             entry.owner_txn.store(0, Ordering::Release);
         }
         // Reset the occupancy counter to match cleared state.
-        self.occupied_count_atomic.store(0, Ordering::Release);
+        self.occupied_count.clear();
     }
 
     /// Release all locks held by a specific txn (crash cleanup, §5.6.3).
@@ -492,7 +556,7 @@ impl SharedPageLockTable {
 
         // Slot successfully claimed — increment occupied counter.
         // This maintains the O(1) occupancy tracking invariant.
-        active.increment_occupied();
+        active.increment_occupied(page_number);
 
         // Slot claimed. Now CAS owner_txn from 0 → txn_id.
         // MUST NOT use store() here (§5.6.3).
@@ -1328,6 +1392,36 @@ mod tests {
 
         // Table 0 (the cleared one) is now empty and available for next rotation.
         assert_eq!(table.tables[0].occupied_count(), 0);
+    }
+
+    #[test]
+    fn test_striped_occupied_counter_matches_full_scan_across_rebuild() {
+        let table = SharedPageLockTable::new(TEST_CAP);
+
+        for page in 1..=20_u32 {
+            assert!(table.try_acquire(page, u64::from(page)).is_ok());
+        }
+
+        let active = table.active_table.load(Ordering::Relaxed);
+        let active_table = &table.tables[active as usize];
+        assert_eq!(
+            active_table.occupied_count(),
+            active_table.occupied_count_full_scan(),
+            "striped occupied counter must match exact active-table slot count"
+        );
+
+        table.acquire_rebuild_lease(1, 0, 1000).unwrap();
+        table.rotate().unwrap();
+
+        for page in 1..=20_u32 {
+            assert!(table.release(page, u64::from(page)));
+        }
+
+        assert!(table.drain_progress().unwrap().quiescent);
+        let cleared = table.finalize_rebuild(1).unwrap();
+        assert_eq!(cleared, 20);
+        assert_eq!(table.tables[0].occupied_count(), 0);
+        assert_eq!(table.tables[0].occupied_count_full_scan(), 0);
     }
 
     // -- bd-11x0 test 7: Resource exhaustion returns Busy --

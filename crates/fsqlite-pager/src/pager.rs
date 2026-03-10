@@ -523,6 +523,51 @@ fn remove_page_sorted(pages: &mut Vec<PageNumber>, page_no: PageNumber) {
     }
 }
 
+struct WalCommitBatch<'a> {
+    new_db_size: u32,
+    frames: Vec<traits::WalFrameRef<'a>>,
+}
+
+fn collect_wal_commit_batch<'a>(
+    current_db_size: u32,
+    write_set: &'a HashMap<PageNumber, PageBuf>,
+    write_pages_sorted: &[PageNumber],
+) -> Result<Option<WalCommitBatch<'a>>> {
+    if write_pages_sorted.is_empty() {
+        return Ok(None);
+    }
+
+    let max_written = write_pages_sorted.last().map_or(0, |page| page.get());
+    let new_db_size = current_db_size.max(max_written);
+    let frame_count = write_pages_sorted.len();
+    let mut frames = Vec::with_capacity(frame_count);
+
+    for (idx, page_no) in write_pages_sorted.iter().enumerate() {
+        let page_data = write_set.get(page_no).ok_or_else(|| {
+            FrankenError::internal(format!(
+                "WAL commit batch missing page {} from write_set",
+                page_no.get()
+            ))
+        })?;
+        let db_size_if_commit = if idx + 1 == frame_count {
+            new_db_size
+        } else {
+            0
+        };
+
+        frames.push(traits::WalFrameRef {
+            page_number: page_no.get(),
+            page_data,
+            db_size_if_commit,
+        });
+    }
+
+    Ok(Some(WalCommitBatch {
+        new_db_size,
+        frames,
+    }))
+}
+
 const SNAPSHOT_PUBLICATION_MODE: &str = "seqlock_published_pages";
 const PUBLISHED_SNAPSHOT_SPIN_LIMIT: u32 = 64;
 const PUBLISHED_SNAPSHOT_SLEEP_AFTER: u32 = 512;
@@ -1586,7 +1631,7 @@ where
         write_set: &HashMap<PageNumber, PageBuf>,
         write_pages_sorted: &[PageNumber],
     ) -> Result<()> {
-        if !write_set.is_empty() {
+        if let Some(batch) = collect_wal_commit_batch(inner.db_size, write_set, write_pages_sorted)? {
             // Escalate to EXCLUSIVE before writing WAL frames.
             // This prevents concurrent processes from appending to the WAL
             // simultaneously, which would cause corruption.
@@ -1595,33 +1640,7 @@ where
             let wal = inner.wal_backend.as_mut().ok_or_else(|| {
                 FrankenError::internal("WAL mode active but no WAL backend installed")
             })?;
-
-            // Deterministic frame ordering is required, but re-sorting the
-            // dirty page ids every commit showed up as a measurable hot path.
-            let frame_count = write_pages_sorted.len();
-            let max_written = write_pages_sorted.last().map_or(0, |p| p.get());
-
-            // Pre-compute the new db_size
-            let new_db_size = inner.db_size.max(max_written);
-
-            let mut wal_frames = Vec::with_capacity(frame_count);
-            for (idx, page_no) in write_pages_sorted.iter().enumerate() {
-                let data = &write_set[page_no];
-                // The last frame in the commit gets db_size > 0 as commit marker.
-                let db_size_if_commit = if idx + 1 == frame_count {
-                    new_db_size
-                } else {
-                    0
-                };
-
-                wal_frames.push(traits::WalFrameRef {
-                    page_number: page_no.get(),
-                    page_data: data,
-                    db_size_if_commit,
-                });
-            }
-
-            wal.append_frames(cx, &wal_frames)?;
+            wal.append_frames(cx, &batch.frames)?;
 
             // Sync WAL to ensure durability.
             let wal = inner
@@ -1631,7 +1650,7 @@ where
             wal.sync(cx)?;
 
             // Update db_size for any new pages.
-            inner.db_size = new_db_size;
+            inner.db_size = batch.new_db_size;
         }
 
         Ok(())
@@ -5043,6 +5062,101 @@ mod tests {
             frames[1].2,
             new_page.get(),
             "bead_id={BEAD_ID} case=wal_batch_append_commit_marker_last"
+        );
+    }
+
+    #[test]
+    fn test_collect_wal_commit_batch_keeps_sorted_order_and_single_commit_boundary() {
+        let page_three = PageNumber::new(3).unwrap();
+        let mut write_set = HashMap::new();
+
+        let mut page1 = PageBuf::new(PageSize::DEFAULT);
+        page1.fill(0x11);
+        write_set.insert(PageNumber::ONE, page1);
+
+        let mut page3 = PageBuf::new(PageSize::DEFAULT);
+        page3.fill(0x33);
+        write_set.insert(page_three, page3);
+
+        let write_pages_sorted = vec![PageNumber::ONE, page_three];
+        let batch = collect_wal_commit_batch(2, &write_set, &write_pages_sorted)
+            .unwrap()
+            .expect("non-empty write set should yield a WAL batch");
+
+        assert_eq!(
+            batch.new_db_size,
+            page_three.get(),
+            "bead_id={BEAD_ID} case=wal_batch_helper_new_db_size"
+        );
+        assert_eq!(
+            batch.frames.len(),
+            2,
+            "bead_id={BEAD_ID} case=wal_batch_helper_frame_count"
+        );
+        assert_eq!(
+            batch.frames[0].page_number,
+            PageNumber::ONE.get(),
+            "bead_id={BEAD_ID} case=wal_batch_helper_sorted_first"
+        );
+        assert_eq!(
+            batch.frames[0].db_size_if_commit,
+            0,
+            "bead_id={BEAD_ID} case=wal_batch_helper_non_commit_prefix"
+        );
+        assert_eq!(
+            batch.frames[1].page_number,
+            page_three.get(),
+            "bead_id={BEAD_ID} case=wal_batch_helper_sorted_last"
+        );
+        assert_eq!(
+            batch.frames[1].db_size_if_commit,
+            page_three.get(),
+            "bead_id={BEAD_ID} case=wal_batch_helper_commit_boundary_last"
+        );
+    }
+
+    #[test]
+    fn test_collect_wal_commit_batch_preserves_existing_db_size_for_interior_updates() {
+        let page_two = PageNumber::new(2).unwrap();
+        let mut write_set = HashMap::new();
+
+        let mut page2 = PageBuf::new(PageSize::DEFAULT);
+        page2.fill(0x22);
+        write_set.insert(page_two, page2);
+
+        let batch = collect_wal_commit_batch(9, &write_set, &[page_two])
+            .unwrap()
+            .expect("single dirty page should yield a WAL batch");
+
+        assert_eq!(
+            batch.new_db_size,
+            9,
+            "bead_id={BEAD_ID} case=wal_batch_helper_preserve_db_size"
+        );
+        assert_eq!(
+            batch.frames[0].db_size_if_commit,
+            9,
+            "bead_id={BEAD_ID} case=wal_batch_helper_commit_marker_uses_existing_db_size"
+        );
+    }
+
+    #[test]
+    fn test_collect_wal_commit_batch_returns_none_for_empty_write_set() {
+        let batch = collect_wal_commit_batch(4, &HashMap::new(), &[]).unwrap();
+        assert!(
+            batch.is_none(),
+            "bead_id={BEAD_ID} case=wal_batch_helper_empty_batch"
+        );
+    }
+
+    #[test]
+    fn test_collect_wal_commit_batch_errors_when_sorted_page_missing_from_write_set() {
+        let missing_page = PageNumber::new(4).unwrap();
+        let err = collect_wal_commit_batch(1, &HashMap::new(), &[missing_page]).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("missing page 4"),
+            "bead_id={BEAD_ID} case=wal_batch_helper_missing_page error={message}"
         );
     }
 
