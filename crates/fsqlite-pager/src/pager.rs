@@ -1563,6 +1563,26 @@ pub struct SimpleTransaction<V: Vfs> {
 
 impl<V: Vfs> traits::sealed::Sealed for SimpleTransaction<V> {}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WalPageOneWritePlan {
+    max_written: u32,
+    page_one_dirty: bool,
+    freelist_metadata_dirty: bool,
+    db_growth: bool,
+}
+
+impl WalPageOneWritePlan {
+    #[must_use]
+    fn requires_page_one_rewrite(self) -> bool {
+        self.page_one_dirty || self.freelist_metadata_dirty || self.db_growth
+    }
+
+    #[must_use]
+    fn requires_page_count_advance(self) -> bool {
+        self.db_growth
+    }
+}
+
 impl<V: Vfs> SimpleTransaction<V> {
     /// Whether this transaction has been upgraded to a writer.
     #[must_use]
@@ -1576,13 +1596,18 @@ impl<V: Vfs> SimpleTransaction<V> {
     }
 
     #[must_use]
-    fn wal_commit_requires_page_one(&self, current_db_size: u32, freelist_dirty: bool) -> bool {
-        self.write_set.contains_key(&PageNumber::ONE)
-            || freelist_dirty
-            || self
-                .write_pages_sorted
-                .last()
-                .is_some_and(|page| page.get() > current_db_size)
+    fn classify_wal_page_one_write(
+        &self,
+        current_db_size: u32,
+        freelist_dirty: bool,
+    ) -> WalPageOneWritePlan {
+        let max_written = self.write_pages_sorted.last().map_or(0, |page| page.get());
+        WalPageOneWritePlan {
+            max_written,
+            page_one_dirty: self.write_set.contains_key(&PageNumber::ONE),
+            freelist_metadata_dirty: freelist_dirty,
+            db_growth: max_written > current_db_size,
+        }
     }
 }
 
@@ -2016,12 +2041,11 @@ where
         }
 
         // In rollback-journal mode page 1 is still the durable commit beacon.
-        // In WAL mode we only carry page 1 when its contents actually change:
-        // page 1 itself is dirty, freelist metadata changed, or the database
-        // grew and page_count must advance.
-        let max_written = self.write_pages_sorted.last().map_or(0, |page| page.get());
+        // In WAL mode classify page-1 work by semantic trigger so later beads
+        // can remove or defer each class independently.
+        let wal_page1_plan = self.classify_wal_page_one_write(inner.db_size, freelist_dirty);
         let must_write_page1 = if self.journal_mode == JournalMode::Wal {
-            self.wal_commit_requires_page_one(inner.db_size, freelist_dirty)
+            wal_page1_plan.requires_page_one_rewrite()
         } else {
             true
         };
@@ -2035,8 +2059,13 @@ where
 
                 // Offset 24..28: change counter (big-endian u32)
                 page1[24..28].copy_from_slice(&new_change_counter.to_be_bytes());
-                if self.journal_mode != JournalMode::Wal || max_written > inner.db_size {
-                    let new_db_size = inner.db_size.max(max_written).max(existing_page_count);
+                if self.journal_mode != JournalMode::Wal
+                    || wal_page1_plan.requires_page_count_advance()
+                {
+                    let new_db_size = inner
+                        .db_size
+                        .max(wal_page1_plan.max_written)
+                        .max(existing_page_count);
                     // Offset 28..32: page count (big-endian u32)
                     page1[28..32].copy_from_slice(&new_db_size.to_be_bytes());
                 }
@@ -2675,9 +2704,24 @@ mod tests {
     use fsqlite_types::{BTreePageHeader, DatabaseHeader};
     use fsqlite_vfs::{MemoryFile, MemoryVfs, Vfs, VfsFile};
     use std::path::PathBuf;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, OnceLock};
 
     const BEAD_ID: &str = "bd-bca.1";
+
+    fn init_publication_test_tracing() {
+        static TRACING_INIT: OnceLock<()> = OnceLock::new();
+        TRACING_INIT.get_or_init(|| {
+            if tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::TRACE)
+                .with_test_writer()
+                .try_init()
+                .is_err()
+            {
+                // Another test already installed a global subscriber.
+            }
+        });
+    }
 
     fn test_pager() -> (SimplePager<MemoryVfs>, PathBuf) {
         let vfs = MemoryVfs::new();
@@ -5568,6 +5612,155 @@ mod tests {
     }
 
     #[test]
+    fn test_wal_page_one_write_plan_for_interior_update_has_no_trigger() {
+        let (pager, _frames) = wal_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        let page_two = {
+            let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+            let page_two = txn.allocate_page(&cx).unwrap();
+            txn.write_page(&cx, page_two, &vec![0x11; ps]).unwrap();
+            txn.commit(&cx).unwrap();
+            page_two
+        };
+
+        let current_db_size = pager.published_snapshot().db_size;
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        txn.write_page(&cx, page_two, &vec![0x22; ps]).unwrap();
+
+        let plan = txn.classify_wal_page_one_write(current_db_size, txn.freelist_metadata_dirty());
+        assert_eq!(
+            plan,
+            WalPageOneWritePlan {
+                max_written: page_two.get(),
+                page_one_dirty: false,
+                freelist_metadata_dirty: false,
+                db_growth: false,
+            },
+            "bead_id={BEAD_ID} case=wal_page1_plan_interior_update"
+        );
+        assert!(
+            !plan.requires_page_one_rewrite(),
+            "bead_id={BEAD_ID} case=wal_page1_plan_interior_update_no_rewrite"
+        );
+        assert!(
+            !plan.requires_page_count_advance(),
+            "bead_id={BEAD_ID} case=wal_page1_plan_interior_update_no_growth"
+        );
+    }
+
+    #[test]
+    fn test_wal_page_one_write_plan_marks_page_one_dirty_trigger() {
+        let (pager, _frames) = wal_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        {
+            let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+            let page_two = txn.allocate_page(&cx).unwrap();
+            txn.write_page(&cx, page_two, &vec![0x11; ps]).unwrap();
+            txn.commit(&cx).unwrap();
+        }
+
+        let current_db_size = pager.published_snapshot().db_size;
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        txn.write_page(&cx, PageNumber::ONE, &vec![0x77; ps])
+            .unwrap();
+
+        let plan = txn.classify_wal_page_one_write(current_db_size, txn.freelist_metadata_dirty());
+        assert_eq!(
+            plan,
+            WalPageOneWritePlan {
+                max_written: PageNumber::ONE.get(),
+                page_one_dirty: true,
+                freelist_metadata_dirty: false,
+                db_growth: false,
+            },
+            "bead_id={BEAD_ID} case=wal_page1_plan_page1_dirty"
+        );
+        assert!(
+            plan.requires_page_one_rewrite(),
+            "bead_id={BEAD_ID} case=wal_page1_plan_page1_dirty_requires_rewrite"
+        );
+        assert!(
+            !plan.requires_page_count_advance(),
+            "bead_id={BEAD_ID} case=wal_page1_plan_page1_dirty_no_growth"
+        );
+    }
+
+    #[test]
+    fn test_wal_page_one_write_plan_marks_freelist_trigger() {
+        let (pager, _frames) = wal_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        let page_two = {
+            let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+            let page_two = txn.allocate_page(&cx).unwrap();
+            txn.write_page(&cx, page_two, &vec![0x11; ps]).unwrap();
+            txn.commit(&cx).unwrap();
+            page_two
+        };
+
+        let current_db_size = pager.published_snapshot().db_size;
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        txn.free_page(&cx, page_two).unwrap();
+
+        let plan = txn.classify_wal_page_one_write(current_db_size, txn.freelist_metadata_dirty());
+        assert_eq!(
+            plan,
+            WalPageOneWritePlan {
+                max_written: 0,
+                page_one_dirty: false,
+                freelist_metadata_dirty: true,
+                db_growth: false,
+            },
+            "bead_id={BEAD_ID} case=wal_page1_plan_freelist_dirty"
+        );
+        assert!(
+            plan.requires_page_one_rewrite(),
+            "bead_id={BEAD_ID} case=wal_page1_plan_freelist_dirty_requires_rewrite"
+        );
+        assert!(
+            !plan.requires_page_count_advance(),
+            "bead_id={BEAD_ID} case=wal_page1_plan_freelist_dirty_no_growth"
+        );
+    }
+
+    #[test]
+    fn test_wal_page_one_write_plan_marks_database_growth_trigger() {
+        let (pager, _frames) = wal_pager();
+        let cx = Cx::new();
+        let ps = PageSize::DEFAULT.as_usize();
+
+        let current_db_size = pager.published_snapshot().db_size;
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+        let page_two = txn.allocate_page(&cx).unwrap();
+        txn.write_page(&cx, page_two, &vec![0x11; ps]).unwrap();
+
+        let plan = txn.classify_wal_page_one_write(current_db_size, txn.freelist_metadata_dirty());
+        assert_eq!(
+            plan,
+            WalPageOneWritePlan {
+                max_written: page_two.get(),
+                page_one_dirty: false,
+                freelist_metadata_dirty: false,
+                db_growth: true,
+            },
+            "bead_id={BEAD_ID} case=wal_page1_plan_db_growth"
+        );
+        assert!(
+            plan.requires_page_one_rewrite(),
+            "bead_id={BEAD_ID} case=wal_page1_plan_db_growth_requires_rewrite"
+        );
+        assert!(
+            plan.requires_page_count_advance(),
+            "bead_id={BEAD_ID} case=wal_page1_plan_db_growth_advances_count"
+        );
+    }
+
+    #[test]
     fn test_wal_external_refresh_tracks_headerless_interior_commit() {
         let (pager1, pager2, _frames) = wal_pager_pair_with_shared_backend();
         let cx = Cx::new();
@@ -7009,6 +7202,7 @@ mod tests {
 
     #[test]
     fn test_published_snapshot_monotonic_after_commit() {
+        init_publication_test_tracing();
         let (pager, _) = test_pager();
         let cx = Cx::new();
         let ps = PageSize::DEFAULT.as_usize();
@@ -7045,6 +7239,7 @@ mod tests {
 
     #[test]
     fn test_published_read_hit_does_not_touch_cache_metrics() {
+        init_publication_test_tracing();
         let (pager, _) = test_pager();
         let cx = Cx::new();
         let ps = PageSize::DEFAULT.as_usize();
@@ -7078,6 +7273,7 @@ mod tests {
 
     #[test]
     fn test_external_refresh_clears_stale_published_pages() {
+        init_publication_test_tracing();
         let vfs = MemoryVfs::new();
         let path = PathBuf::from("/published_refresh.db");
         let cx = Cx::new();
@@ -7132,6 +7328,7 @@ mod tests {
 
     #[test]
     fn test_published_snapshot_retries_during_inflight_publication() {
+        init_publication_test_tracing();
         let published = Arc::new(PublishedPagerState::new(
             1,
             CommitSeq::new(1),
