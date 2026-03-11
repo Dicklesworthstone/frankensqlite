@@ -589,6 +589,24 @@ pub mod pragma {
     /// set consistently across both `sqlite3` and FrankenSQLite runs.  Values
     /// are stored here for future backend wiring (Phase 5+) and are immediately
     /// queryable via `PRAGMA <name>`.
+    #[derive(Debug, Clone, Copy)]
+    pub enum DifferentialViewsSetting {
+        Off,
+        On,
+    }
+
+    impl DifferentialViewsSetting {
+        #[must_use]
+        pub const fn is_enabled(&self) -> bool {
+            matches!(self, Self::On)
+        }
+
+        #[must_use]
+        pub const fn from_enabled(enabled: bool) -> Self {
+            if enabled { Self::On } else { Self::Off }
+        }
+    }
+
     #[derive(Debug, Clone)]
     pub struct ConnectionPragmaState {
         /// Journal mode (`delete`, `truncate`, `persist`, `memory`, `wal`, `off`).
@@ -619,6 +637,8 @@ pub mod pragma {
         pub recursive_triggers: bool,
         /// Connection-level SSI toggle (`PRAGMA fsqlite.serializable`).
         pub serializable: bool,
+        /// Differential-view streaming toggle (`PRAGMA fsqlite_differential_views`).
+        pub differential_views: DifferentialViewsSetting,
         /// WAL-FEC repair symbol budget (`PRAGMA raptorq_repair_symbols`).
         pub raptorq_repair_symbols: u8,
     }
@@ -640,6 +660,7 @@ pub mod pragma {
                 foreign_keys: false,
                 recursive_triggers: false,
                 serializable: true,
+                differential_views: DifferentialViewsSetting::Off,
                 raptorq_repair_symbols: DEFAULT_RAPTORQ_REPAIR_SYMBOLS,
             }
         }
@@ -685,6 +706,9 @@ pub mod pragma {
         let name = &stmt.name.name;
         if is_fsqlite_serializable(&stmt.name) {
             return apply_serializable_connection(state, stmt);
+        }
+        if is_fsqlite_differential_views(&stmt.name) {
+            return apply_differential_views_connection(state, stmt);
         }
         if is_raptorq_repair_symbols(&stmt.name) {
             return apply_raptorq_repair_symbols_connection(state, stmt);
@@ -764,6 +788,20 @@ pub mod pragma {
                     state.raptorq_repair_symbols = value as u8;
                 }
                 Ok(PragmaOutput::Int(i64::from(state.raptorq_repair_symbols)))
+            }
+        }
+    }
+
+    fn apply_differential_views_connection(
+        state: &mut ConnectionPragmaState,
+        stmt: &PragmaStatement,
+    ) -> Result<PragmaOutput> {
+        match &stmt.value {
+            None => Ok(PragmaOutput::Bool(state.differential_views.is_enabled())),
+            Some(PragmaValue::Assign(expr) | PragmaValue::Call(expr)) => {
+                let enabled = parse_bool(expr)?;
+                state.differential_views = DifferentialViewsSetting::from_enabled(enabled);
+                Ok(PragmaOutput::Bool(enabled))
             }
         }
     }
@@ -1076,6 +1114,16 @@ pub mod pragma {
             .as_deref()
             .is_some_and(|s| s.eq_ignore_ascii_case("fsqlite"))
             && name.name.eq_ignore_ascii_case("serializable")
+    }
+
+    fn is_fsqlite_differential_views(name: &QualifiedName) -> bool {
+        match name.schema.as_deref() {
+            Some(schema) => {
+                schema.eq_ignore_ascii_case("fsqlite")
+                    && name.name.eq_ignore_ascii_case("differential_views")
+            }
+            None => name.name.eq_ignore_ascii_case("fsqlite_differential_views"),
+        }
     }
 
     fn is_raptorq_repair_symbols(name: &QualifiedName) -> bool {
@@ -1730,6 +1778,44 @@ mod tests {
         let stmt = parse_pragma("PRAGMA fsqlite.serializable").expect("parse pragma");
         let out = pragma::apply(&mut mgr, &stmt).unwrap();
         assert_eq!(out, pragma::PragmaOutput::Bool(true));
+    }
+
+    #[test]
+    fn test_connection_pragma_differential_views_default_query_returns_false() {
+        let mut state = pragma::ConnectionPragmaState::default();
+
+        let stmt = parse_pragma("PRAGMA fsqlite_differential_views").expect("parse pragma");
+        let out = pragma::apply_connection_pragma(&mut state, &stmt).expect("query pragma");
+        assert_eq!(out, pragma::PragmaOutput::Bool(false));
+    }
+
+    #[test]
+    fn test_connection_pragma_differential_views_set_and_query_across_aliases() {
+        let mut state = pragma::ConnectionPragmaState::default();
+
+        let set_on = parse_pragma("PRAGMA fsqlite.differential_views = ON").expect("parse pragma");
+        assert_eq!(
+            pragma::apply_connection_pragma(&mut state, &set_on).expect("set pragma"),
+            pragma::PragmaOutput::Bool(true)
+        );
+        assert!(state.differential_views.is_enabled());
+
+        let query = parse_pragma("PRAGMA fsqlite_differential_views").expect("parse pragma");
+        assert_eq!(
+            pragma::apply_connection_pragma(&mut state, &query).expect("query pragma"),
+            pragma::PragmaOutput::Bool(true)
+        );
+    }
+
+    #[test]
+    fn test_connection_pragma_differential_views_rejects_non_boolean_values() {
+        let mut state = pragma::ConnectionPragmaState::default();
+
+        let stmt = parse_pragma("PRAGMA fsqlite_differential_views = 2").expect("parse pragma");
+        assert!(matches!(
+            pragma::apply_connection_pragma(&mut state, &stmt),
+            Err(FrankenError::TypeMismatch { .. })
+        ));
     }
 
     #[test]

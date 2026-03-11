@@ -62,6 +62,9 @@ pub struct Manifest {
 
 /// Stable schema identifier for the canonical Beads benchmark campaign.
 pub const BEADS_BENCHMARK_CAMPAIGN_SCHEMA_V1: &str = "fsqlite-e2e.beads_benchmark_campaign.v1";
+/// Stable schema identifier for per-cell benchmark artifact manifests.
+pub const BEADS_BENCHMARK_ARTIFACT_MANIFEST_SCHEMA_V1: &str =
+    "fsqlite-e2e.beads_benchmark_artifact_manifest.v1";
 
 /// Canonical Track A benchmark campaign manifest path.
 pub const BEADS_BENCHMARK_CAMPAIGN_PATH_RELATIVE: &str =
@@ -294,11 +297,93 @@ pub struct BeadsBenchmarkMatrixRow {
 pub struct BenchmarkArtifactContract {
     pub artifact_root_relpath: String,
     pub bundle_dir_template: String,
+    pub manifest_schema_version: String,
     pub result_jsonl_name: String,
     pub summary_md_name: String,
     pub manifest_name: String,
     pub logs_dir_name: String,
     pub profiles_dir_name: String,
+}
+
+/// Stable filenames/directories expected in every per-cell artifact bundle.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BenchmarkArtifactNames {
+    pub result_jsonl: String,
+    pub summary_md: String,
+    pub manifest_json: String,
+    pub logs_dir: String,
+    pub profiles_dir: String,
+}
+
+/// One exact command that produced or validated an artifact bundle.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BenchmarkArtifactCommand {
+    pub tool: String,
+    pub command_line: String,
+}
+
+/// One tool/version pair captured for artifact provenance.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BenchmarkArtifactToolVersion {
+    pub tool: String,
+    pub version: String,
+}
+
+/// Placement-specific provenance that explains how a matrix row was run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BenchmarkArtifactPlacementPolicy {
+    pub placement_profile_id: String,
+    pub hardware_class_id: String,
+    pub availability: PlacementAvailability,
+    pub command_hint: String,
+    pub required: bool,
+}
+
+/// Reusable provenance envelope for benchmark artifact bundles.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BenchmarkArtifactProvenanceEnvelope {
+    pub source_revision: String,
+    pub beads_data_hash: String,
+    pub kernel_release: String,
+    pub placement_policy: BenchmarkArtifactPlacementPolicy,
+    pub commands: Vec<BenchmarkArtifactCommand>,
+    pub tool_versions: Vec<BenchmarkArtifactToolVersion>,
+    #[serde(default)]
+    pub fallback_notes: Vec<String>,
+}
+
+/// Checked-in or generated manifest describing one expanded benchmark cell.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BenchmarkArtifactManifest {
+    pub schema_version: String,
+    pub campaign_id: String,
+    pub campaign_manifest_path: String,
+    pub row_id: String,
+    pub fixture_id: String,
+    pub workload: String,
+    pub concurrency: u16,
+    pub mode: BenchmarkMode,
+    pub placement_profile_id: String,
+    pub hardware_class_id: String,
+    pub retry_policy_id: String,
+    pub build_profile_id: String,
+    pub seed_policy_id: String,
+    pub artifact_bundle_dir: String,
+    pub artifact_bundle_relpath: String,
+    pub artifact_names: BenchmarkArtifactNames,
+    pub provenance: BenchmarkArtifactProvenanceEnvelope,
+}
+
+/// Dynamic provenance inputs captured while producing a benchmark artifact bundle.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BenchmarkArtifactProvenanceCapture {
+    pub source_revision: String,
+    pub beads_data_hash: String,
+    pub kernel_release: String,
+    pub commands: Vec<BenchmarkArtifactCommand>,
+    pub tool_versions: Vec<BenchmarkArtifactToolVersion>,
+    #[serde(default)]
+    pub fallback_notes: Vec<String>,
 }
 
 /// Checked-in Track A campaign manifest describing the canonical benchmark matrix.
@@ -436,6 +521,144 @@ pub fn benchmark_bundle_path(
             source_revision,
             beads_hash,
         ))
+}
+
+/// Stable filenames/directories inside a benchmark artifact bundle.
+#[must_use]
+pub fn benchmark_artifact_names(contract: &BenchmarkArtifactContract) -> BenchmarkArtifactNames {
+    BenchmarkArtifactNames {
+        result_jsonl: contract.result_jsonl_name.clone(),
+        summary_md: contract.summary_md_name.clone(),
+        manifest_json: contract.manifest_name.clone(),
+        logs_dir: contract.logs_dir_name.clone(),
+        profiles_dir: contract.profiles_dir_name.clone(),
+    }
+}
+
+/// Materialize the manifest path for one expanded cell.
+#[must_use]
+pub fn benchmark_manifest_path(
+    workspace_root: &Path,
+    campaign: &BeadsBenchmarkCampaign,
+    cell: &ExpandedBenchmarkCell,
+    source_revision: &str,
+    beads_hash: &str,
+) -> PathBuf {
+    benchmark_bundle_path(workspace_root, campaign, cell, source_revision, beads_hash)
+        .join(&campaign.artifact_contract.manifest_name)
+}
+
+/// Build the reusable artifact manifest/provenance envelope for one cell.
+///
+/// # Errors
+///
+/// Returns an error if the cell cannot be mapped back to the campaign contract
+/// or if required provenance fields are empty.
+pub fn build_benchmark_artifact_manifest(
+    workspace_root: &Path,
+    campaign: &BeadsBenchmarkCampaign,
+    cell: &ExpandedBenchmarkCell,
+    capture: BenchmarkArtifactProvenanceCapture,
+) -> Result<BenchmarkArtifactManifest, String> {
+    if capture.source_revision.trim().is_empty() {
+        return Err("source_revision must not be empty".to_owned());
+    }
+    if !is_sha256_hex_64(&capture.beads_data_hash) {
+        return Err("beads_data_hash must be a 64-character lowercase hex digest".to_owned());
+    }
+    if capture.kernel_release.trim().is_empty() {
+        return Err("kernel_release must not be empty".to_owned());
+    }
+    if capture.commands.is_empty() {
+        return Err("artifact manifest must capture at least one command".to_owned());
+    }
+    if capture.tool_versions.is_empty() {
+        return Err("artifact manifest must capture at least one tool version".to_owned());
+    }
+
+    let row = campaign
+        .matrix_rows
+        .iter()
+        .find(|row| row.row_id == cell.row_id)
+        .ok_or_else(|| format!("unknown matrix row {}", cell.row_id))?;
+    let variant = row
+        .placement_variants
+        .iter()
+        .find(|variant| {
+            variant.placement_profile_id == cell.placement_profile_id
+                && variant.hardware_class_id == cell.hardware_class_id
+        })
+        .ok_or_else(|| {
+            format!(
+                "row {} does not define placement {} / hardware {}",
+                cell.row_id, cell.placement_profile_id, cell.hardware_class_id
+            )
+        })?;
+    let placement_profile = campaign
+        .placement_profiles
+        .iter()
+        .find(|profile| profile.id == cell.placement_profile_id)
+        .ok_or_else(|| format!("unknown placement profile {}", cell.placement_profile_id))?;
+
+    let bundle_path = benchmark_bundle_path(
+        workspace_root,
+        campaign,
+        cell,
+        &capture.source_revision,
+        &capture.beads_data_hash,
+    );
+    let artifact_bundle_dir = bundle_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            format!(
+                "cannot derive artifact bundle dir from {}",
+                bundle_path.display()
+            )
+        })?
+        .to_owned();
+    let artifact_bundle_relpath =
+        path_to_manifest_string(bundle_path.strip_prefix(workspace_root).map_err(|_| {
+            format!(
+                "artifact bundle path {} must stay under workspace {}",
+                bundle_path.display(),
+                workspace_root.display()
+            )
+        })?);
+
+    Ok(BenchmarkArtifactManifest {
+        schema_version: campaign.artifact_contract.manifest_schema_version.clone(),
+        campaign_id: campaign.campaign_id.clone(),
+        campaign_manifest_path: BEADS_BENCHMARK_CAMPAIGN_PATH_RELATIVE.to_owned(),
+        row_id: cell.row_id.clone(),
+        fixture_id: cell.fixture_id.clone(),
+        workload: cell.workload.clone(),
+        concurrency: cell.concurrency,
+        mode: cell.mode,
+        placement_profile_id: cell.placement_profile_id.clone(),
+        hardware_class_id: cell.hardware_class_id.clone(),
+        retry_policy_id: cell.retry_policy_id.clone(),
+        build_profile_id: cell.build_profile_id.clone(),
+        seed_policy_id: cell.seed_policy_id.clone(),
+        artifact_bundle_dir,
+        artifact_bundle_relpath,
+        artifact_names: benchmark_artifact_names(&campaign.artifact_contract),
+        provenance: BenchmarkArtifactProvenanceEnvelope {
+            source_revision: capture.source_revision,
+            beads_data_hash: capture.beads_data_hash,
+            kernel_release: capture.kernel_release,
+            placement_policy: BenchmarkArtifactPlacementPolicy {
+                placement_profile_id: cell.placement_profile_id.clone(),
+                hardware_class_id: cell.hardware_class_id.clone(),
+                availability: placement_profile.availability,
+                command_hint: placement_profile.command_hint.clone(),
+                required: variant.required,
+            },
+            commands: capture.commands,
+            tool_versions: capture.tool_versions,
+            fallback_notes: capture.fallback_notes,
+        },
+    })
 }
 
 /// Validate the canonical benchmark campaign manifest for internal consistency.
@@ -821,6 +1044,15 @@ pub fn validate_beads_benchmark_campaign(
             ));
         }
     }
+    if campaign.artifact_contract.manifest_schema_version
+        != BEADS_BENCHMARK_ARTIFACT_MANIFEST_SCHEMA_V1
+    {
+        errors.push(format!(
+            "artifact manifest_schema_version {:?} must equal {:?}",
+            campaign.artifact_contract.manifest_schema_version,
+            BEADS_BENCHMARK_ARTIFACT_MANIFEST_SCHEMA_V1
+        ));
+    }
 
     if errors.is_empty() {
         Ok(())
@@ -862,6 +1094,10 @@ fn is_sha256_hex_64(value: &str) -> bool {
 
 fn short_hash(value: &str) -> String {
     value.chars().take(12).collect()
+}
+
+fn path_to_manifest_string(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
 }
 
 // ── Filter criteria ──────────────────────────────────────────────────
@@ -1611,6 +1847,7 @@ mod tests {
                 bundle_dir_template:
                     "{row_id}__{fixture_id}__{mode}__{placement_profile_id}__rev_{source_revision}__beads_{beads_hash}"
                         .to_owned(),
+                manifest_schema_version: BEADS_BENCHMARK_ARTIFACT_MANIFEST_SCHEMA_V1.to_owned(),
                 result_jsonl_name: "results.jsonl".to_owned(),
                 summary_md_name: "summary.md".to_owned(),
                 manifest_name: "manifest.json".to_owned(),
@@ -1994,6 +2231,69 @@ mod tests {
     }
 
     #[test]
+    fn test_build_benchmark_artifact_manifest_ties_cell_to_bundle_and_provenance() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let campaign = sample_campaign(tempdir.path());
+        let cell = expand_beads_benchmark_campaign(&campaign)
+            .into_iter()
+            .next()
+            .expect("sample campaign should produce one cell");
+        let manifest = build_benchmark_artifact_manifest(
+            tempdir.path(),
+            &campaign,
+            &cell,
+            BenchmarkArtifactProvenanceCapture {
+                source_revision: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+                beads_data_hash: "a".repeat(64),
+                kernel_release: "Linux 6.13.5-test".to_owned(),
+                commands: vec![BenchmarkArtifactCommand {
+                    tool: "rch".to_owned(),
+                    command_line: "rch exec -- cargo test -p fsqlite-e2e".to_owned(),
+                }],
+                tool_versions: vec![
+                    BenchmarkArtifactToolVersion {
+                        tool: "cargo".to_owned(),
+                        version: "cargo 1.91.0-nightly".to_owned(),
+                    },
+                    BenchmarkArtifactToolVersion {
+                        tool: "perf".to_owned(),
+                        version: "perf version 6.13".to_owned(),
+                    },
+                ],
+                fallback_notes: vec!["perf c2c unavailable on this host".to_owned()],
+            },
+        )
+        .expect("artifact manifest should build");
+
+        assert_eq!(
+            manifest.schema_version,
+            BEADS_BENCHMARK_ARTIFACT_MANIFEST_SCHEMA_V1
+        );
+        assert_eq!(manifest.campaign_id, campaign.campaign_id);
+        assert_eq!(manifest.row_id, "mixed_read_write_c4");
+        assert_eq!(manifest.fixture_id, "frankensqlite");
+        assert_eq!(manifest.mode, BenchmarkMode::SqliteReference);
+        assert_eq!(manifest.artifact_names.manifest_json, "manifest.json");
+        assert!(
+            manifest
+                .artifact_bundle_relpath
+                .starts_with("artifacts/perf/bd-db300.1.2/")
+        );
+        assert!(
+            manifest
+                .artifact_bundle_dir
+                .contains("__rev_0123456789ab__beads_aaaaaaaaaaaa")
+        );
+        assert_eq!(
+            manifest.provenance.placement_policy.placement_profile_id,
+            PLACEMENT_PROFILE_BASELINE_UNPINNED
+        );
+        assert_eq!(manifest.provenance.commands.len(), 1);
+        assert_eq!(manifest.provenance.tool_versions.len(), 2);
+        assert_eq!(manifest.provenance.fallback_notes.len(), 1);
+    }
+
+    #[test]
     fn test_validate_beads_benchmark_campaign_rejects_bad_fixture_provenance() {
         let tempdir = tempfile::tempdir().unwrap();
         let mut campaign = sample_campaign(tempdir.path());
@@ -2095,6 +2395,62 @@ mod tests {
             &fs::read_to_string(&manifest_path).expect("manifest json should be readable"),
         )
         .expect("manifest should parse");
+
+        let validator = validator_for(&schema).expect("schema should compile");
+        let errors: Vec<String> = validator
+            .iter_errors(&manifest)
+            .map(|error| error.to_string())
+            .collect();
+        assert!(errors.is_empty(), "schema errors: {errors:#?}");
+    }
+
+    #[test]
+    fn test_benchmark_artifact_manifest_matches_json_schema() {
+        let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .unwrap();
+        let schema_path = workspace_root.join(
+            "sample_sqlite_db_files/manifests/beads_benchmark_artifact_manifest.v1.schema.json",
+        );
+        if !schema_path.is_file() {
+            return;
+        }
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let campaign = sample_campaign(tempdir.path());
+        let cell = expand_beads_benchmark_campaign(&campaign)
+            .into_iter()
+            .next()
+            .expect("sample campaign should produce one cell");
+        let manifest = build_benchmark_artifact_manifest(
+            tempdir.path(),
+            &campaign,
+            &cell,
+            BenchmarkArtifactProvenanceCapture {
+                source_revision: "fedcba9876543210fedcba9876543210fedcba98".to_owned(),
+                beads_data_hash: "b".repeat(64),
+                kernel_release: "Linux 6.13.5-test".to_owned(),
+                commands: vec![BenchmarkArtifactCommand {
+                    tool: "rch".to_owned(),
+                    command_line: "rch exec -- cargo run -p fsqlite-e2e --bin realdb-e2e"
+                        .to_owned(),
+                }],
+                tool_versions: vec![BenchmarkArtifactToolVersion {
+                    tool: "rustc".to_owned(),
+                    version: "rustc 1.91.0-nightly".to_owned(),
+                }],
+                fallback_notes: vec!["perf c2c unavailable".to_owned()],
+            },
+        )
+        .expect("artifact manifest should build");
+
+        let schema: Value = serde_json::from_str(
+            &fs::read_to_string(&schema_path).expect("schema json should be readable"),
+        )
+        .expect("schema should parse");
+        let manifest: Value =
+            serde_json::to_value(manifest).expect("artifact manifest should serialize");
 
         let validator = validator_for(&schema).expect("schema should compile");
         let errors: Vec<String> = validator

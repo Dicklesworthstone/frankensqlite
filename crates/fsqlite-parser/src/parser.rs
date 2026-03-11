@@ -1058,6 +1058,9 @@ impl Parser {
                     where_clause: wh,
                 }
             };
+            if target.is_none() && matches!(action, UpsertAction::Update { .. }) {
+                return Err(self.err_msg("ON CONFLICT DO UPDATE requires a conflict target"));
+            }
             clauses.push(UpsertClause { target, action });
         }
         Ok(clauses)

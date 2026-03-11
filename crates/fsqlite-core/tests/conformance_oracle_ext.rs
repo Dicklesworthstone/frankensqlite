@@ -6890,12 +6890,17 @@ fn test_conformance_multi_unique_ignore() {
             "INSERT OR IGNORE INTO users_mu VALUES(4, 'carol@test.com', 'alice', 'dup username')",
         )
         .unwrap();
-    // Known bug: INSERT OR IGNORE with non-PK UNIQUE rejects valid 3rd insert
-    // fconn.execute("INSERT OR IGNORE INTO users_mu VALUES(5, 'carol@test.com', 'carol', 'ok')").unwrap();
-    // rconn.execute_batch("INSERT OR IGNORE INTO users_mu VALUES(5, 'carol@test.com', 'carol', 'ok')").unwrap();
+    fconn
+        .execute("INSERT OR IGNORE INTO users_mu VALUES(5, 'carol@test.com', 'carol', 'ok')")
+        .unwrap();
+    rconn
+        .execute_batch("INSERT OR IGNORE INTO users_mu VALUES(5, 'carol@test.com', 'carol', 'ok')")
+        .unwrap();
 
     let queries = [
         // Test that dup-email and dup-username inserts were properly ignored
+        // and the later valid row still lands.
+        "SELECT * FROM users_mu ORDER BY id",
         "SELECT COUNT(*) FROM users_mu",
     ];
 
@@ -22899,6 +22904,31 @@ fn test_conformance_window_with_nulls_s306() {
             eprintln!("{m}\n");
         }
         panic!("{} window with NULLs mismatches", mismatches.len());
+    }
+}
+
+#[test]
+fn test_conformance_window_group_concat_s306a() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+    for s in &[
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, dept TEXT, name TEXT)",
+        "INSERT INTO t VALUES(1,'A','ann'),(2,'A',NULL),(3,'A','ada'),(4,'B','bob'),(5,'B','bea')",
+    ] {
+        fconn.execute(s).unwrap();
+        rconn.execute_batch(s).unwrap();
+    }
+    let queries = [
+        "SELECT id, dept, name, GROUP_CONCAT(name) OVER (PARTITION BY dept ORDER BY id) AS running_names FROM t ORDER BY id",
+        "SELECT id, dept, name, GROUP_CONCAT(name, '|') OVER (PARTITION BY dept ORDER BY id) AS running_names FROM t ORDER BY id",
+        "SELECT id, dept, name, GROUP_CONCAT(name, '|') OVER (PARTITION BY dept) AS dept_names FROM t ORDER BY id",
+    ];
+    let mismatches = oracle_compare(&fconn, &rconn, &queries);
+    if !mismatches.is_empty() {
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
+        panic!("{} window group_concat mismatches", mismatches.len());
     }
 }
 

@@ -101,35 +101,49 @@ fn shell_escape(raw: &str) -> String {
     format!("'{escaped}'")
 }
 
-fn format_hot_profile_replay_command(
-    db: &str,
-    golden_dir: &Path,
-    working_base: &Path,
+struct HotProfileReplayCommand<'a> {
+    db: &'a str,
+    golden_dir: &'a Path,
+    working_base: &'a Path,
     concurrency: u16,
     seed: u64,
     scale: u32,
-    output_dir: &Path,
+    output_dir: &'a Path,
     mvcc: bool,
     run_integrity_check: bool,
-) -> String {
+}
+
+fn format_hot_profile_replay_command(command: &HotProfileReplayCommand<'_>) -> String {
     let mut rendered =
         String::from("rch exec -- cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile");
     for (flag, value) in [
-        ("--db", db.to_owned()),
+        ("--db", command.db.to_owned()),
         (
             "--golden-dir",
-            golden_dir.as_os_str().to_string_lossy().into_owned(),
+            command
+                .golden_dir
+                .as_os_str()
+                .to_string_lossy()
+                .into_owned(),
         ),
         (
             "--working-base",
-            working_base.as_os_str().to_string_lossy().into_owned(),
+            command
+                .working_base
+                .as_os_str()
+                .to_string_lossy()
+                .into_owned(),
         ),
-        ("--concurrency", concurrency.to_string()),
-        ("--seed", seed.to_string()),
-        ("--scale", scale.to_string()),
+        ("--concurrency", command.concurrency.to_string()),
+        ("--seed", command.seed.to_string()),
+        ("--scale", command.scale.to_string()),
         (
             "--output-dir",
-            output_dir.as_os_str().to_string_lossy().into_owned(),
+            command
+                .output_dir
+                .as_os_str()
+                .to_string_lossy()
+                .into_owned(),
         ),
     ] {
         rendered.push(' ');
@@ -138,8 +152,8 @@ fn format_hot_profile_replay_command(
         rendered.push_str(&shell_escape(&value));
     }
     rendered.push(' ');
-    rendered.push_str(if mvcc { "--mvcc" } else { "--no-mvcc" });
-    if run_integrity_check {
+    rendered.push_str(if command.mvcc { "--mvcc" } else { "--no-mvcc" });
+    if command.run_integrity_check {
         rendered.push_str(" --integrity-check");
     }
     rendered
@@ -2586,17 +2600,17 @@ fn cmd_hot_profile(argv: &[String]) -> i32 {
             .join("bd-db300.4.1")
             .join(format!("{db}_c{concurrency}_s{seed}"))
     });
-    let replay_command = format_hot_profile_replay_command(
-        &db,
-        &golden_dir,
-        &working_base,
+    let replay_command = format_hot_profile_replay_command(&HotProfileReplayCommand {
+        db: &db,
+        golden_dir: &golden_dir,
+        working_base: &working_base,
         concurrency,
         seed,
         scale,
-        &output_dir,
+        output_dir: &output_dir,
         mvcc,
         run_integrity_check,
-    );
+    });
     let config = FsqliteHotPathProfileConfig {
         seed,
         scale,
@@ -3969,6 +3983,26 @@ mod tests {
         let options = RunModeOptions::from_flags(true, false, false);
         assert!(!options.run_integrity_check);
         assert!(!options.capture_environment_metadata);
+    }
+
+    #[test]
+    fn format_hot_profile_replay_command_renders_expected_flags() {
+        let rendered = format_hot_profile_replay_command(&HotProfileReplayCommand {
+            db: "fixture-a",
+            golden_dir: Path::new("/tmp/golden dir"),
+            working_base: Path::new("/tmp/working"),
+            concurrency: 4,
+            seed: 42,
+            scale: 50,
+            output_dir: Path::new("/tmp/output dir"),
+            mvcc: false,
+            run_integrity_check: true,
+        });
+
+        assert_eq!(
+            rendered,
+            "rch exec -- cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db fixture-a --golden-dir '/tmp/golden dir' --working-base /tmp/working --concurrency 4 --seed 42 --scale 50 --output-dir '/tmp/output dir' --no-mvcc --integrity-check"
+        );
     }
 
     #[test]

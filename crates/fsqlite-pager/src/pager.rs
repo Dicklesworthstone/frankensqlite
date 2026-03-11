@@ -9104,8 +9104,8 @@ mod tests {
 
         pager.copy_database_to(&cx, &target_path).unwrap();
 
-        let source_bytes = read_all_vfs_bytes(vfs.as_ref(), &cx, &source_path);
-        let target_bytes = read_all_vfs_bytes(vfs.as_ref(), &cx, &target_path);
+        let source_bytes = read_all_vfs_bytes(&vfs, &cx, &source_path);
+        let target_bytes = read_all_vfs_bytes(&vfs, &cx, &target_path);
         assert_eq!(
             target_bytes, source_bytes,
             "bead_id={BEAD_ID} case=copy_database_to_byte_identical_copy"
@@ -9152,10 +9152,9 @@ mod tests {
 
         let _reader = pager.begin(&cx, TransactionMode::ReadOnly).unwrap();
         let err = pager.copy_database_to(&cx, &target_path).unwrap_err();
-        assert_eq!(
-            err,
-            FrankenError::Busy,
-            "bead_id={BEAD_ID} case=copy_database_to_rejects_active_transactions"
+        assert!(
+            matches!(err, FrankenError::Busy),
+            "bead_id={BEAD_ID} case=copy_database_to_rejects_active_transactions err={err:?}"
         );
     }
 

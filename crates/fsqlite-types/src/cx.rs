@@ -1736,36 +1736,44 @@ mod tests {
         Ok(())
     }
 
-    fn scan_file_outside_cfg_test_modules(src: &str, patterns: &[&str]) -> Vec<(usize, String)> {
+    fn scan_file_outside_cfg_test_items(src: &str, patterns: &[&str]) -> Vec<(usize, String)> {
         let mut hits = Vec::new();
 
         let mut brace_depth: i32 = 0;
         let mut pending_cfg_test = false;
+        let mut pending_attr_paren_depth: i32 = 0;
         let mut skip_until_depth: Option<i32> = None;
 
         for (idx, line) in src.lines().enumerate() {
             let trimmed = line.trim_start();
+            let paren_delta = i32::try_from(line.matches('(').count()).unwrap_or(i32::MAX)
+                - i32::try_from(line.matches(')').count()).unwrap_or(i32::MAX);
 
             if skip_until_depth.is_none() {
-                // Handle `#[cfg(test)] mod tests {` on a single line.
-                if trimmed.starts_with("#[cfg(test)]") && trimmed.contains("mod ") {
+                // Handle single-line `#[cfg(test)]` items that open a block immediately.
+                if trimmed.starts_with("#[cfg(test)]") && trimmed.contains('{') {
                     pending_cfg_test = false;
+                    pending_attr_paren_depth = 0;
+                    skip_until_depth = Some(brace_depth);
+                } else if trimmed.contains("fn test_") && trimmed.contains('{') {
                     skip_until_depth = Some(brace_depth);
                 } else if trimmed.starts_with("#[cfg(test)]") {
                     pending_cfg_test = true;
+                    pending_attr_paren_depth = 0;
                 } else if pending_cfg_test {
-                    // Allow additional attributes/blank lines before `mod ... {`.
-                    if trimmed.is_empty() || trimmed.starts_with("//") || trimmed.starts_with("#[")
-                    {
+                    // Allow additional attributes/blank lines before the gated item.
+                    if trimmed.starts_with("#[") || pending_attr_paren_depth > 0 {
+                        pending_attr_paren_depth =
+                            pending_attr_paren_depth.saturating_add(paren_delta);
+                    } else if trimmed.is_empty() || trimmed.starts_with("//") {
                         // keep pending
-                    } else if trimmed.starts_with("mod ")
-                        || trimmed.starts_with("pub mod ")
-                        || trimmed.starts_with("pub(crate) mod ")
-                    {
+                    } else if trimmed.contains('{') {
                         pending_cfg_test = false;
+                        pending_attr_paren_depth = 0;
                         skip_until_depth = Some(brace_depth);
                     } else {
                         pending_cfg_test = false;
+                        pending_attr_paren_depth = 0;
                     }
                 } else {
                     for &pat in patterns {
@@ -1792,9 +1800,116 @@ mod tests {
     }
 
     #[test]
+    fn test_scan_file_outside_cfg_test_items_skips_cfg_test_functions_and_modules() {
+        let src = r"
+fn production_path() {
+    let _ = Cx::new();
+}
+
+#[cfg(test)]
+fn test_only_helper() {
+    let _ = Cx::new();
+}
+
+#[cfg(test)]
+mod tests {
+    fn nested_test_helper() {
+        let _ = Cx::default();
+    }
+}
+";
+
+        let hits = scan_file_outside_cfg_test_items(src, &["Cx::new(", "Cx::default("]);
+        assert_eq!(hits, vec![(3, "Cx::new(".to_string())]);
+    }
+
+    #[test]
+    fn test_no_direct_cx_constructors_in_runtime_production_code() {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let repo_root = manifest_dir
+            .parent()
+            .and_then(Path::parent)
+            .expect("fsqlite-types manifest dir must be crates/<name>");
+        let crates_dir = repo_root.join("crates");
+        let runtime_crates = [
+            "fsqlite-core",
+            "fsqlite-vdbe",
+            "fsqlite-btree",
+            "fsqlite-pager",
+            "fsqlite-wal",
+            "fsqlite-mvcc",
+        ];
+        let forbidden = ["Cx::new(", "Cx::default("];
+
+        let mut violations: Vec<String> = Vec::new();
+        let mut crate_dirs: Vec<PathBuf> = Vec::new();
+        for entry in std::fs::read_dir(&crates_dir).expect("read crates/ dir") {
+            let entry = entry.expect("read crates/ entry");
+            let path = entry.path();
+            if path.is_dir() {
+                crate_dirs.push(path);
+            }
+        }
+
+        for crate_dir in crate_dirs {
+            let crate_name = crate_dir
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("<unknown>");
+            if !runtime_crates.contains(&crate_name) {
+                continue;
+            }
+
+            let src_dir = crate_dir.join("src");
+            if !src_dir.is_dir() {
+                continue;
+            }
+
+            let mut files = Vec::new();
+            collect_rs_files(&src_dir, &mut files).expect("collect rs files");
+
+            for file in files {
+                if file
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.contains("test"))
+                {
+                    continue;
+                }
+
+                let src = std::fs::read_to_string(&file).expect("read file");
+                let rel_path = file.strip_prefix(repo_root).unwrap_or(&file);
+
+                for (line, pat) in scan_file_outside_cfg_test_items(&src, &forbidden) {
+                    let line_text = src.lines().nth(line - 1).unwrap_or("").trim();
+                    let allowed_detached_root_constructor = rel_path
+                        == Path::new("crates/fsqlite-core/src/connection.rs")
+                        && pat == "Cx::new("
+                        && line_text.contains("Cx::new().with_trace_context(");
+
+                    if allowed_detached_root_constructor {
+                        continue;
+                    }
+
+                    violations.push(format!(
+                        "{crate_name}:{path}:{line} uses forbidden `{pat}` outside cfg(test) code: {line_text}",
+                        path = rel_path.display()
+                    ));
+                }
+            }
+        }
+
+        assert!(
+            violations.is_empty(),
+            "direct `Cx::new()` / `Cx::default()` production-path violations:\n{}",
+            violations.join("\n")
+        );
+    }
+
+    #[test]
     fn test_ambient_authority_audit_gate() {
         // Scan `crates/*/src/**/*.rs` for ambient-authority usage, excluding
-        // `#[cfg(test)] mod ...` blocks.
+        // `#[cfg(test)]`-gated items.
         let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let repo_root = manifest_dir
             .parent()
@@ -1868,7 +1983,7 @@ mod tests {
 
             for file in files {
                 let src = std::fs::read_to_string(&file).expect("read file");
-                for (line, pat) in scan_file_outside_cfg_test_modules(&src, &always_forbidden) {
+                for (line, pat) in scan_file_outside_cfg_test_items(&src, &always_forbidden) {
                     violations.push(format!(
                         "{crate_name}:{path}:{line} uses forbidden `{pat}`",
                         path = file.display()
@@ -1876,8 +1991,7 @@ mod tests {
                 }
 
                 if crate_name != "fsqlite-vfs" {
-                    for (line, pat) in scan_file_outside_cfg_test_modules(&src, &non_vfs_forbidden)
-                    {
+                    for (line, pat) in scan_file_outside_cfg_test_items(&src, &non_vfs_forbidden) {
                         violations.push(format!(
                             "{crate_name}:{path}:{line} uses forbidden `{pat}` (non-vfs crate)",
                             path = file.display()

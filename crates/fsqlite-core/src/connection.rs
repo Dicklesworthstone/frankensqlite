@@ -710,6 +710,18 @@ impl PagerBackend {
         }
     }
 
+    fn copy_database_to(&self, cx: &Cx, target_path: &Path) -> Result<()> {
+        match self {
+            Self::Memory(p) => p.copy_database_to(cx, target_path),
+            #[cfg(target_os = "linux")]
+            Self::IoUring(p) => p.copy_database_to(cx, target_path),
+            #[cfg(unix)]
+            Self::Unix(p) => p.copy_database_to(cx, target_path),
+            #[cfg(target_os = "windows")]
+            Self::Windows(p) => p.copy_database_to(cx, target_path),
+        }
+    }
+
     /// Snapshot current page-cache counters from the active pager backend.
     fn cache_metrics_snapshot(&self) -> Result<PageCacheMetricsSnapshot> {
         match self {
@@ -3591,6 +3603,10 @@ impl Connection {
                 | Statement::Rollback(_)
                 | Statement::Savepoint(_)
                 | Statement::Release(_)
+                // VACUUM INTO needs the pager quiescent, so it cannot run
+                // inside the implicit autocommit read transaction used for
+                // ordinary statement dispatch.
+                | Statement::Vacuum(_)
                 // PRAGMA handlers that need pager access (for example
                 // `PRAGMA wal_checkpoint`) manage their own pager operations.
                 | Statement::Pragma(_)
@@ -4366,15 +4382,8 @@ impl Connection {
                 self.execute_create_trigger(create_trigger)?;
                 Ok(Vec::new())
             }
-            // VACUUM INTO copies the database to a new file.
-            // Plain VACUUM is a no-op for now (defragmentation not implemented).
             Statement::Vacuum(vacuum_stmt) => {
-                if vacuum_stmt.into.is_some() {
-                    // VACUUM INTO requires VFS-based file copy to avoid ambient
-                    // filesystem authority.  Not yet implemented.
-                    return Err(FrankenError::not_implemented("VACUUM INTO"));
-                }
-                // Plain VACUUM is a no-op (defragmentation not implemented).
+                self.execute_vacuum(vacuum_stmt, params)?;
                 Ok(Vec::new())
             }
             Statement::Analyze(target) => {
@@ -9094,6 +9103,51 @@ impl Connection {
             &columns_label,
         )?;
         self.execute_table_program(&program, None).map(|_| ())
+    }
+
+    fn execute_vacuum(
+        &self,
+        vacuum_stmt: &fsqlite_ast::VacuumStatement,
+        params: Option<&[SqliteValue]>,
+    ) -> Result<()> {
+        if let Some(schema) = vacuum_stmt.schema.as_deref()
+            && !schema.eq_ignore_ascii_case("main")
+        {
+            return Err(FrankenError::not_implemented("VACUUM on attached schemas"));
+        }
+
+        let Some(into_expr) = vacuum_stmt.into.as_ref() else {
+            // Plain VACUUM remains a no-op until page-rewrite defragmentation
+            // is implemented.
+            return Ok(());
+        };
+
+        let mut bound_expr = into_expr.clone();
+        if let Some(bound_params) = params {
+            let mut bind_state = BindParamState::default();
+            bind_placeholders_in_expr(&mut bound_expr, &mut bind_state, bound_params)?;
+        }
+
+        let empty_row: Vec<SqliteValue> = Vec::new();
+        let empty_col_map: Vec<(String, String, bool)> = Vec::new();
+        let target_value =
+            self.eval_expr_with_subqueries(&bound_expr, &empty_row, &empty_col_map, None)?;
+        let target_path = match target_value {
+            SqliteValue::Text(path) if !path.is_empty() => PathBuf::from(path),
+            SqliteValue::Text(_) | SqliteValue::Null => {
+                return Err(FrankenError::CannotOpen {
+                    path: PathBuf::new(),
+                });
+            }
+            other => PathBuf::from(format!("{other}")),
+        };
+
+        if target_path.as_os_str().is_empty() {
+            return Err(FrankenError::CannotOpen { path: target_path });
+        }
+
+        let cx = self.op_cx()?;
+        self.pager.copy_database_to(&cx, &target_path)
     }
 
     fn execute_analyze(&self, target: Option<&QualifiedName>) -> Result<()> {
@@ -31400,6 +31454,73 @@ mod tests {
         // Data should be unaffected.
         let rows = conn.query("SELECT * FROM t;").unwrap();
         assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn test_vacuum_into_copies_main_database_to_new_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("vacuum-source.db");
+        let target_path = dir.path().join("vacuum-copy.db");
+        let source_path_str = source_path.to_string_lossy().into_owned();
+        let target_path_str = target_path.to_string_lossy().into_owned();
+
+        let conn = Connection::open(&source_path_str).unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'alpha'), (2, 'beta');")
+            .unwrap();
+        let expected = conn.query("SELECT id, name FROM t ORDER BY id;").unwrap();
+
+        conn.execute_with_params(
+            "VACUUM main INTO ?1;",
+            &[SqliteValue::Text(target_path_str.clone())],
+        )
+        .unwrap();
+
+        assert!(target_path.exists());
+
+        let copied = Connection::open(&target_path_str).unwrap();
+        let actual = copied.query("SELECT id, name FROM t ORDER BY id;").unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_vacuum_into_rejects_existing_target_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("vacuum-existing-source.db");
+        let target_path = dir.path().join("vacuum-existing-target.db");
+        let source_path_str = source_path.to_string_lossy().into_owned();
+        let target_path_str = target_path.to_string_lossy().into_owned();
+
+        let conn = Connection::open(&source_path_str).unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER);").unwrap();
+        conn.execute("INSERT INTO t VALUES (1);").unwrap();
+        std::fs::write(&target_path, b"occupied").unwrap();
+
+        let err = conn
+            .execute_with_params(
+                "VACUUM INTO ?1;",
+                &[SqliteValue::Text(target_path_str.clone())],
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, FrankenError::CannotOpen { ref path } if path == &target_path),
+            "expected CannotOpen for existing target, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_vacuum_into_rejects_non_main_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("vacuum-schema-source.db");
+        let source_path_str = source_path.to_string_lossy().into_owned();
+
+        let conn = Connection::open(&source_path_str).unwrap();
+        let err = conn.execute("VACUUM aux INTO 'ignored.db';").unwrap_err();
+        assert!(
+            matches!(err, FrankenError::NotImplemented(ref feature) if feature == "VACUUM on attached schemas"),
+            "expected attached-schema VACUUM rejection, got {err:?}"
+        );
     }
 
     #[test]

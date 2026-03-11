@@ -229,8 +229,7 @@ impl<F: VfsFile> WalBackendAdapter<F> {
 
         let frame_delta_count = match (previous.last_commit_frame, last_commit_frame) {
             (Some(prev), Some(curr)) if curr >= prev => curr.saturating_sub(prev),
-            (Some(_), Some(curr)) => curr.saturating_add(1),
-            (None, Some(curr)) => curr.saturating_add(1),
+            (Some(_) | None, Some(curr)) => curr.saturating_add(1),
             (Some(prev), None) => prev.saturating_add(1),
             (None, None) => 0,
         };

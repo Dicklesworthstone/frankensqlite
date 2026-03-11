@@ -1,7 +1,8 @@
 //! Built-in window functions (S13.5, bd-14i6).
 //!
 //! Implements: row_number, rank, dense_rank, percent_rank, cume_dist,
-//! ntile, lag, lead, first_value, last_value, nth_value.
+//! ntile, lag, lead, first_value, last_value, nth_value, plus
+//! aggregate-as-window variants including group_concat and string_agg.
 //!
 //! These functions implement the [`WindowFunction`] trait.  The VDBE is
 //! responsible for partitioning, ordering, and frame management; these
@@ -1075,6 +1076,113 @@ impl WindowFunction for WindowAvgFunc {
     }
 }
 
+pub struct WindowGroupConcatState {
+    result: String,
+    has_value: bool,
+}
+
+fn window_group_concat_step(state: &mut WindowGroupConcatState, args: &[SqliteValue]) {
+    if args.is_empty() || args[0].is_null() {
+        return;
+    }
+    let sep = if args.len() > 1 && !args[1].is_null() {
+        args[1].to_text()
+    } else {
+        ",".to_owned()
+    };
+    if state.has_value {
+        state.result.push_str(&sep);
+    }
+    state.result.push_str(&args[0].to_text());
+    state.has_value = true;
+}
+
+fn window_group_concat_value(state: &WindowGroupConcatState) -> SqliteValue {
+    if state.has_value {
+        SqliteValue::Text(state.result.clone())
+    } else {
+        SqliteValue::Null
+    }
+}
+
+pub struct WindowGroupConcatFunc;
+
+impl WindowFunction for WindowGroupConcatFunc {
+    type State = WindowGroupConcatState;
+
+    fn initial_state(&self) -> Self::State {
+        WindowGroupConcatState {
+            result: String::new(),
+            has_value: false,
+        }
+    }
+
+    fn step(&self, state: &mut Self::State, args: &[SqliteValue]) -> Result<()> {
+        window_group_concat_step(state, args);
+        Ok(())
+    }
+
+    fn inverse(&self, _state: &mut Self::State, _args: &[SqliteValue]) -> Result<()> {
+        // Sliding ROWS/RANGE/GROUPS frames are recomputed by the connection-level
+        // window executor; the remaining paths never evict rows from the left edge.
+        Ok(())
+    }
+
+    fn value(&self, state: &Self::State) -> Result<SqliteValue> {
+        Ok(window_group_concat_value(state))
+    }
+
+    fn finalize(&self, state: Self::State) -> Result<SqliteValue> {
+        Ok(window_group_concat_value(&state))
+    }
+
+    fn num_args(&self) -> i32 {
+        -1
+    }
+
+    fn name(&self) -> &str {
+        "group_concat"
+    }
+}
+
+pub struct WindowStringAggFunc;
+
+impl WindowFunction for WindowStringAggFunc {
+    type State = WindowGroupConcatState;
+
+    fn initial_state(&self) -> Self::State {
+        WindowGroupConcatState {
+            result: String::new(),
+            has_value: false,
+        }
+    }
+
+    fn step(&self, state: &mut Self::State, args: &[SqliteValue]) -> Result<()> {
+        window_group_concat_step(state, args);
+        Ok(())
+    }
+
+    fn inverse(&self, _state: &mut Self::State, _args: &[SqliteValue]) -> Result<()> {
+        Ok(())
+    }
+
+    fn value(&self, state: &Self::State) -> Result<SqliteValue> {
+        Ok(window_group_concat_value(state))
+    }
+
+    fn finalize(&self, state: Self::State) -> Result<SqliteValue> {
+        Ok(window_group_concat_value(&state))
+    }
+
+    fn num_args(&self) -> i32 {
+        2
+    }
+
+    fn name(&self) -> &str {
+        "string_agg"
+    }
+}
+
 /// Compare two SQLite values using type-aware ordering.
 pub fn cmp_values(a: &SqliteValue, b: &SqliteValue) -> std::cmp::Ordering {
     match (a, b) {
@@ -1114,6 +1222,8 @@ pub fn register_window_builtins(registry: &mut FunctionRegistry) {
     registry.register_window(WindowMinFunc);
     registry.register_window(WindowMaxFunc);
     registry.register_window(WindowAvgFunc);
+    registry.register_window(WindowGroupConcatFunc);
+    registry.register_window(WindowStringAggFunc);
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────
@@ -1526,6 +1636,60 @@ mod tests {
         assert_eq!(func.value(&state).unwrap(), null());
     }
 
+    // ── group_concat / string_agg ────────────────────────────────────
+
+    #[test]
+    fn test_window_group_concat_running_default_separator() {
+        let results = run_window_partition(
+            &WindowGroupConcatFunc,
+            &[vec![text("a")], vec![text("b")], vec![text("c")]],
+        );
+        assert_eq!(results, vec![text("a"), text("a,b"), text("a,b,c")]);
+    }
+
+    #[test]
+    fn test_window_group_concat_running_custom_separator() {
+        let results = run_window_partition(
+            &WindowGroupConcatFunc,
+            &[
+                vec![text("a"), text(" | ")],
+                vec![text("b"), text(" | ")],
+                vec![text("c"), text(" | ")],
+            ],
+        );
+        assert_eq!(results, vec![text("a"), text("a | b"), text("a | b | c")]);
+    }
+
+    #[test]
+    fn test_window_group_concat_skips_null_and_uses_current_row_separator() {
+        let results = run_window_partition(
+            &WindowGroupConcatFunc,
+            &[
+                vec![text("a"), text("-")],
+                vec![null(), text("?")],
+                vec![text("b"), text("+")],
+                vec![text("c"), text("*")],
+            ],
+        );
+        assert_eq!(
+            results,
+            vec![text("a"), text("a"), text("a+b"), text("a+b*c")]
+        );
+    }
+
+    #[test]
+    fn test_window_string_agg_alias_through_registry() {
+        let mut reg = FunctionRegistry::new();
+        register_window_builtins(&mut reg);
+
+        let sa = reg.find_window("string_agg", 2).unwrap();
+        let mut state = sa.initial_state();
+        sa.step(&mut state, &[text("a"), text(";")]).unwrap();
+        assert_eq!(sa.value(&state).unwrap(), text("a"));
+        sa.step(&mut state, &[text("b"), text(";")]).unwrap();
+        assert_eq!(sa.value(&state).unwrap(), text("a;b"));
+    }
+
     // ── Registration ─────────────────────────────────────────────────
 
     #[test]
@@ -1566,6 +1730,18 @@ mod tests {
         assert!(
             reg.find_window("nth_value", 2).is_some(),
             "nth_value(2) not registered"
+        );
+        assert!(
+            reg.find_window("group_concat", 1).is_some(),
+            "group_concat(1) not registered"
+        );
+        assert!(
+            reg.find_window("group_concat", 2).is_some(),
+            "group_concat(2) not registered"
+        );
+        assert!(
+            reg.find_window("string_agg", 2).is_some(),
+            "string_agg(2) not registered"
         );
     }
 
