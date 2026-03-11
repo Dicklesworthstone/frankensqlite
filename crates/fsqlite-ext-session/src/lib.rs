@@ -358,8 +358,9 @@ impl ChangesetRow {
     /// Encode this row change into patchset binary format.
     ///
     /// For INSERT and DELETE this is identical to changeset encoding.
-    /// For UPDATE the old values are omitted — only PK columns (from old
-    /// values) plus new values are written.
+    /// For UPDATE the patchset stores a single record whose PK slots contain
+    /// the original key values and whose non-PK slots contain changed new
+    /// values or [`ChangesetValue::Undefined`] for unchanged columns.
     pub fn encode_patchset(&self, out: &mut Vec<u8>, pk_flags: &[bool]) {
         out.push(self.op.as_byte());
         out.push(0x00);
@@ -377,14 +378,15 @@ impl ChangesetRow {
                 }
             }
             ChangeOp::Update => {
-                // Patchset UPDATE: emit PK old values only, then new values.
-                for (i, v) in self.old_values.iter().enumerate() {
-                    if pk_flags.get(i).copied().unwrap_or(false) {
-                        v.encode(out);
+                for (index, new_value) in self.new_values.iter().enumerate() {
+                    if pk_flags.get(index).copied().unwrap_or(false) {
+                        self.old_values
+                            .get(index)
+                            .unwrap_or(&ChangesetValue::Undefined)
+                            .encode(out);
+                    } else {
+                        new_value.encode(out);
                     }
-                }
-                for v in &self.new_values {
-                    v.encode(out);
                 }
             }
         }
@@ -484,21 +486,18 @@ impl ChangesetRow {
                 (old_values, Vec::new())
             }
             ChangeOp::Update => {
-                let pk_count = pk_flags.iter().filter(|&&is_pk| is_pk).count();
-                if pk_count == 0 {
-                    return None;
-                }
-                let pk_old_values = decode_n(data, &mut offset, pk_count)?;
+                let record = decode_n(data, &mut offset, col_count)?;
                 let mut old_values = Vec::with_capacity(col_count);
-                let mut pk_iter = pk_old_values.into_iter();
-                for is_pk in pk_flags {
-                    if *is_pk {
-                        old_values.push(pk_iter.next()?);
+                let mut new_values = Vec::with_capacity(col_count);
+                for (index, value) in record.into_iter().enumerate() {
+                    if pk_flags.get(index).copied().unwrap_or(false) {
+                        old_values.push(value);
+                        new_values.push(ChangesetValue::Undefined);
                     } else {
                         old_values.push(ChangesetValue::Undefined);
+                        new_values.push(value);
                     }
                 }
-                let new_values = decode_n(data, &mut offset, col_count)?;
                 (old_values, new_values)
             }
         };
@@ -692,8 +691,47 @@ struct TrackedTable {
     pk_flags: Vec<bool>,
 }
 
+fn assert_tracked_change_width(change: &TrackedChange, tracked: &TrackedTable) {
+    match change.op {
+        ChangeOp::Insert => assert_eq!(
+            change.new_values.len(),
+            tracked.column_count,
+            "insert values length must match attached table column_count"
+        ),
+        ChangeOp::Delete => assert_eq!(
+            change.old_values.len(),
+            tracked.column_count,
+            "delete values length must match attached table column_count"
+        ),
+        ChangeOp::Update => {
+            assert_eq!(
+                change.old_values.len(),
+                tracked.column_count,
+                "update old_values length must match attached table column_count"
+            );
+            assert_eq!(
+                change.new_values.len(),
+                tracked.column_count,
+                "update new_values length must match attached table column_count"
+            );
+        }
+    }
+}
+
 fn has_primary_key(pk_flags: &[bool]) -> bool {
     pk_flags.iter().any(|is_pk| *is_pk)
+}
+
+fn primary_key_values_are_trackable(values: &[ChangesetValue], pk_flags: &[bool]) -> bool {
+    pk_flags
+        .iter()
+        .enumerate()
+        .filter(|(_, is_pk)| **is_pk)
+        .all(|(index, _)| {
+            values.get(index).is_some_and(|value| {
+                !matches!(value, ChangesetValue::Null | ChangesetValue::Undefined)
+            })
+        })
 }
 
 fn materialize_sparse_update(
@@ -732,7 +770,10 @@ fn canonical_old_values(
         .collect()
 }
 
-fn canonical_new_values(old_row: &[ChangesetValue], new_row: &[ChangesetValue]) -> Vec<ChangesetValue> {
+fn canonical_new_values(
+    old_row: &[ChangesetValue],
+    new_row: &[ChangesetValue],
+) -> Vec<ChangesetValue> {
     old_row
         .iter()
         .zip(new_row.iter())
@@ -746,112 +787,140 @@ fn canonical_new_values(old_row: &[ChangesetValue], new_row: &[ChangesetValue]) 
         .collect()
 }
 
-fn primary_key_identity(values: &[ChangesetValue], pk_flags: &[bool]) -> String {
-    use std::fmt::Write as _;
+fn primary_key_matches(
+    left: &[ChangesetValue],
+    right: &[ChangesetValue],
+    pk_flags: &[bool],
+) -> bool {
+    pk_flags
+        .iter()
+        .enumerate()
+        .filter(|&(_, &is_pk)| is_pk)
+        .all(|(index, _)| {
+            left.get(index)
+                .zip(right.get(index))
+                .is_some_and(|(lhs, rhs)| lhs == rhs)
+        })
+}
 
-    let mut key = String::new();
-    for (index, value) in values.iter().enumerate() {
-        if !pk_flags.get(index).copied().unwrap_or(false) {
-            continue;
-        }
-        let _ = write!(key, "{index}:");
-        match value {
-            ChangesetValue::Undefined => key.push_str("u;"),
-            ChangesetValue::Null => key.push_str("n;"),
-            ChangesetValue::Integer(value) => {
-                let _ = write!(key, "i{value};");
-            }
-            ChangesetValue::Real(value) => {
-                let _ = write!(key, "r{:016X};", value.to_bits());
-            }
-            ChangesetValue::Text(value) => {
-                let _ = write!(key, "t{}:{value};", value.len());
-            }
-            ChangesetValue::Blob(value) => {
-                let _ = write!(key, "b{}:", value.len());
-                for byte in value {
-                    let _ = write!(key, "{byte:02X}");
-                }
-                key.push(';');
-            }
-        }
-    }
-    key
+fn primary_key_changed(
+    old_row: &[ChangesetValue],
+    new_row: &[ChangesetValue],
+    pk_flags: &[bool],
+) -> bool {
+    !primary_key_matches(old_row, new_row, pk_flags)
 }
 
 #[derive(Debug, Clone)]
-enum PendingRowChange {
-    Insert { new_row: Vec<ChangesetValue> },
-    Delete { old_row: Vec<ChangesetValue> },
-    Update {
-        old_row: Vec<ChangesetValue>,
-        new_row: Vec<ChangesetValue>,
-    },
+struct PendingRowChange {
+    before: Option<Vec<ChangesetValue>>,
+    after: Option<Vec<ChangesetValue>>,
 }
 
 impl PendingRowChange {
     fn from_tracked(change: &TrackedChange, column_count: usize) -> Self {
         match change.op {
-            ChangeOp::Insert => Self::Insert {
-                new_row: change.new_values.clone(),
+            ChangeOp::Insert => Self {
+                before: None,
+                after: Some(change.new_values.clone()),
             },
-            ChangeOp::Delete => Self::Delete {
-                old_row: change.old_values.clone(),
+            ChangeOp::Delete => Self {
+                before: Some(change.old_values.clone()),
+                after: None,
             },
             ChangeOp::Update => {
                 debug_assert_eq!(change.old_values.len(), column_count);
                 debug_assert_eq!(change.new_values.len(), column_count);
-                Self::Update {
-                    old_row: change.old_values.clone(),
-                    new_row: materialize_sparse_update(&change.old_values, &change.new_values),
+                Self {
+                    before: Some(change.old_values.clone()),
+                    after: Some(materialize_sparse_update(
+                        &change.old_values,
+                        &change.new_values,
+                    )),
                 }
             }
         }
     }
 
-    fn merge(self, change: &TrackedChange, _pk_flags: &[bool]) -> Option<Self> {
-        match (self, change.op) {
-            (Self::Insert { mut new_row }, ChangeOp::Update) => {
-                new_row = materialize_sparse_update(&new_row, &change.new_values);
-                Some(Self::Insert { new_row })
-            }
-            (Self::Insert { .. }, ChangeOp::Delete) => None,
-            (Self::Update { old_row, new_row }, ChangeOp::Update) => Some(Self::Update {
-                old_row,
-                new_row: materialize_sparse_update(&new_row, &change.new_values),
-            }),
-            (Self::Update { old_row, .. }, ChangeOp::Delete) => Some(Self::Delete { old_row }),
-            (Self::Delete { old_row }, ChangeOp::Insert) => {
-                if old_row == change.new_values {
-                    None
-                } else {
-                    Some(Self::Update {
-                        old_row,
-                        new_row: change.new_values.clone(),
+    fn matches_change(&self, change: &TrackedChange, pk_flags: &[bool]) -> bool {
+        match change.op {
+            ChangeOp::Insert => {
+                self.before.as_ref().zip(self.after.as_ref()).is_none()
+                    && self.before.as_ref().is_some_and(|before| {
+                        primary_key_matches(before, &change.new_values, pk_flags)
                     })
-                }
             }
-            (state, _) => Some(state),
+            ChangeOp::Delete | ChangeOp::Update => self
+                .after
+                .as_ref()
+                .is_some_and(|after| primary_key_matches(after, &change.old_values, pk_flags)),
         }
     }
 
-    fn into_changeset_row(self, pk_flags: &[bool]) -> ChangesetRow {
-        match self {
-            Self::Insert { new_row } => ChangesetRow {
+    fn merge(&mut self, change: &TrackedChange, column_count: usize) {
+        match change.op {
+            ChangeOp::Insert => {
+                self.after = Some(change.new_values.clone());
+            }
+            ChangeOp::Delete => {
+                self.after = None;
+            }
+            ChangeOp::Update => {
+                debug_assert_eq!(change.old_values.len(), column_count);
+                debug_assert_eq!(change.new_values.len(), column_count);
+                if let Some(current_row) = self.after.as_ref() {
+                    self.after = Some(materialize_sparse_update(current_row, &change.new_values));
+                }
+            }
+        }
+    }
+
+    fn is_no_op(&self) -> bool {
+        matches!((&self.before, &self.after), (None, None))
+            || self
+                .before
+                .as_ref()
+                .zip(self.after.as_ref())
+                .is_some_and(|(before, after)| before == after)
+    }
+
+    fn into_changeset_rows(self, pk_flags: &[bool]) -> Vec<ChangesetRow> {
+        match (self.before, self.after) {
+            (None, None) => Vec::new(),
+            (None, Some(new_row)) => vec![ChangesetRow {
                 op: ChangeOp::Insert,
                 old_values: Vec::new(),
                 new_values: new_row,
-            },
-            Self::Delete { old_row } => ChangesetRow {
+            }],
+            (Some(old_row), None) => vec![ChangesetRow {
                 op: ChangeOp::Delete,
                 old_values: old_row,
                 new_values: Vec::new(),
-            },
-            Self::Update { old_row, new_row } => ChangesetRow {
-                op: ChangeOp::Update,
-                old_values: canonical_old_values(&old_row, &new_row, pk_flags),
-                new_values: canonical_new_values(&old_row, &new_row),
-            },
+            }],
+            (Some(old_row), Some(new_row)) => {
+                if old_row == new_row {
+                    Vec::new()
+                } else if primary_key_changed(&old_row, &new_row, pk_flags) {
+                    vec![
+                        ChangesetRow {
+                            op: ChangeOp::Delete,
+                            old_values: old_row,
+                            new_values: Vec::new(),
+                        },
+                        ChangesetRow {
+                            op: ChangeOp::Insert,
+                            old_values: Vec::new(),
+                            new_values: new_row,
+                        },
+                    ]
+                } else {
+                    vec![ChangesetRow {
+                        op: ChangeOp::Update,
+                        old_values: canonical_old_values(&old_row, &new_row, pk_flags),
+                        new_values: canonical_new_values(&old_row, &new_row),
+                    }]
+                }
+            }
         }
     }
 }
@@ -869,6 +938,46 @@ pub struct Session {
 }
 
 impl Session {
+    fn tracked_table(&self, table: &str) -> Option<&TrackedTable> {
+        self.tables.iter().find(|tracked| tracked.name == table)
+    }
+
+    fn validate_attached_row_width(&self, table: &str, values: &[ChangesetValue], kind: &str) {
+        if let Some(tracked) = self.tracked_table(table) {
+            assert_eq!(
+                values.len(),
+                tracked.column_count,
+                "attached table row width mismatch for {kind}: table `{table}` expects {} columns but got {}",
+                tracked.column_count,
+                values.len()
+            );
+        }
+    }
+
+    fn validate_attached_update_width(
+        &self,
+        table: &str,
+        old_values: &[ChangesetValue],
+        new_values: &[ChangesetValue],
+    ) {
+        if let Some(tracked) = self.tracked_table(table) {
+            assert_eq!(
+                old_values.len(),
+                tracked.column_count,
+                "attached table row width mismatch for update old values: table `{table}` expects {} columns but got {}",
+                tracked.column_count,
+                old_values.len()
+            );
+            assert_eq!(
+                new_values.len(),
+                tracked.column_count,
+                "attached table row width mismatch for update new values: table `{table}` expects {} columns but got {}",
+                tracked.column_count,
+                new_values.len()
+            );
+        }
+    }
+
     /// Create a new, empty session.
     #[must_use]
     pub fn new() -> Self {
@@ -900,6 +1009,7 @@ impl Session {
 
     /// Record an INSERT operation.
     pub fn record_insert(&mut self, table: &str, new_values: Vec<ChangesetValue>) {
+        self.validate_attached_row_width(table, &new_values, "insert");
         self.changes.push(TrackedChange {
             table_name: table.to_owned(),
             op: ChangeOp::Insert,
@@ -910,6 +1020,7 @@ impl Session {
 
     /// Record a DELETE operation.
     pub fn record_delete(&mut self, table: &str, old_values: Vec<ChangesetValue>) {
+        self.validate_attached_row_width(table, &old_values, "delete");
         self.changes.push(TrackedChange {
             table_name: table.to_owned(),
             op: ChangeOp::Delete,
@@ -928,6 +1039,7 @@ impl Session {
         old_values: Vec<ChangesetValue>,
         new_values: Vec<ChangesetValue>,
     ) {
+        self.validate_attached_update_width(table, &old_values, &new_values);
         self.changes.push(TrackedChange {
             table_name: table.to_owned(),
             op: ChangeOp::Update,
@@ -958,33 +1070,36 @@ impl Session {
                 continue;
             }
 
-            let mut pending = Vec::<(String, PendingRowChange)>::new();
-            for change in self.changes.iter().filter(|change| change.table_name == tracked.name) {
-                let key = primary_key_identity(
-                    match change.op {
-                        ChangeOp::Insert => &change.new_values,
-                        ChangeOp::Delete | ChangeOp::Update => &change.old_values,
-                    },
-                    &tracked.pk_flags,
-                );
-
-                if let Some(index) = pending.iter().position(|(existing_key, _)| existing_key == &key)
+            let mut pending = Vec::<PendingRowChange>::new();
+            for change in self
+                .changes
+                .iter()
+                .filter(|change| change.table_name == tracked.name)
+            {
+                assert_tracked_change_width(change, tracked);
+                let key_source = match change.op {
+                    ChangeOp::Insert => &change.new_values,
+                    ChangeOp::Delete | ChangeOp::Update => &change.old_values,
+                };
+                if !primary_key_values_are_trackable(key_source, &tracked.pk_flags) {
+                    continue;
+                }
+                if let Some(index) = pending
+                    .iter()
+                    .position(|existing| existing.matches_change(change, &tracked.pk_flags))
                 {
-                    let (existing_key, existing_change) = pending.remove(index);
-                    if let Some(merged) = existing_change.merge(change, &tracked.pk_flags) {
-                        pending.insert(index, (existing_key, merged));
+                    pending[index].merge(change, tracked.column_count);
+                    if pending[index].is_no_op() {
+                        pending.remove(index);
                     }
                 } else {
-                    pending.push((
-                        key,
-                        PendingRowChange::from_tracked(change, tracked.column_count),
-                    ));
+                    pending.push(PendingRowChange::from_tracked(change, tracked.column_count));
                 }
             }
 
             let rows = pending
                 .into_iter()
-                .map(|(_, change)| change.into_changeset_row(&tracked.pk_flags))
+                .flat_map(|change| change.into_changeset_rows(&tracked.pk_flags))
                 .collect::<Vec<_>>();
             if !rows.is_empty() {
                 tables.push(TableChangeset {
@@ -1044,6 +1159,7 @@ impl SimpleTarget {
     where
         F: FnMut(ConflictType, &ChangesetRow) -> ConflictAction,
     {
+        let original_tables = self.tables.clone();
         let mut applied = 0usize;
         let mut skipped = 0usize;
 
@@ -1064,7 +1180,10 @@ impl SimpleTarget {
                 match result {
                     Ok(true) => applied += 1,
                     Ok(false) => skipped += 1,
-                    Err(n) => return ApplyOutcome::Aborted { applied: n },
+                    Err(n) => {
+                        self.tables = original_tables;
+                        return ApplyOutcome::Aborted { applied: n };
+                    }
                 }
             }
         }
@@ -1112,16 +1231,21 @@ impl SimpleTarget {
     where
         F: FnMut(ConflictType, &ChangesetRow) -> ConflictAction,
     {
-        let pk_target: Vec<SqliteValue> = change.old_values.iter().map(ChangesetValue::to_sqlite).collect();
+        let pk_target: Vec<SqliteValue> = change
+            .old_values
+            .iter()
+            .map(ChangesetValue::to_sqlite)
+            .collect();
         if let Some(idx) = Self::find_row_by_pk(rows, pk_flags, &pk_target) {
-            let old_match = change
-                .old_values
-                .iter()
-                .zip(rows[idx].iter())
-                .all(|(cv, sv)| match cv {
-                    ChangesetValue::Undefined => true,
-                    _ => cv.to_sqlite() == *sv,
-                });
+            let old_match =
+                change
+                    .old_values
+                    .iter()
+                    .zip(rows[idx].iter())
+                    .all(|(cv, sv)| match cv {
+                        ChangesetValue::Undefined => true,
+                        _ => cv.to_sqlite() == *sv,
+                    });
             if !old_match {
                 match handler(ConflictType::Data, change) {
                     ConflictAction::OmitChange => return Ok(false),
@@ -1136,14 +1260,14 @@ impl SimpleTarget {
             Ok(true)
         } else {
             match handler(ConflictType::NotFound, change) {
-                ConflictAction::OmitChange | ConflictAction::Replace => Ok(false),
-                ConflictAction::Abort => Err(applied),
+                ConflictAction::OmitChange => Ok(false),
+                ConflictAction::Replace | ConflictAction::Abort => Err(applied),
             }
         }
     }
 
     fn apply_update<F>(
-        rows: &mut [Vec<SqliteValue>],
+        rows: &mut Vec<Vec<SqliteValue>>,
         pk_flags: &[bool],
         change: &ChangesetRow,
         handler: &mut F,
@@ -1174,19 +1298,54 @@ impl SimpleTarget {
                     ConflictAction::Abort => return Err(applied),
                 }
             }
-            let row = &mut rows[idx];
+            let original_row = rows[idx].clone();
+            let mut updated_row = original_row.clone();
             for (i, nv) in change.new_values.iter().enumerate() {
-                if *nv != ChangesetValue::Undefined {
-                    if let Some(cell) = row.get_mut(i) {
-                        *cell = nv.to_sqlite();
-                    }
+                if *nv != ChangesetValue::Undefined
+                    && let Some(cell) = updated_row.get_mut(i)
+                {
+                    *cell = nv.to_sqlite();
                 }
             }
+
+            let pk_changed = pk_flags
+                .iter()
+                .enumerate()
+                .filter(|&(_, &is_pk)| is_pk)
+                .any(|(i, _)| original_row.get(i) != updated_row.get(i));
+            if pk_changed
+                && let Some(conflict_idx) =
+                    rows.iter().enumerate().find_map(|(candidate_idx, row)| {
+                        (candidate_idx != idx
+                            && pk_flags
+                                .iter()
+                                .enumerate()
+                                .filter(|&(_, &is_pk)| is_pk)
+                                .all(|(i, _)| {
+                                    row.get(i)
+                                        .zip(updated_row.get(i))
+                                        .is_some_and(|(a, b)| a == b)
+                                }))
+                        .then_some(candidate_idx)
+                    })
+            {
+                match handler(ConflictType::Conflict, change) {
+                    ConflictAction::OmitChange => return Ok(false),
+                    ConflictAction::Replace => {
+                        rows.remove(conflict_idx);
+                        let target_idx = if conflict_idx < idx { idx - 1 } else { idx };
+                        rows[target_idx] = updated_row;
+                        return Ok(true);
+                    }
+                    ConflictAction::Abort => return Err(applied),
+                }
+            }
+            rows[idx] = updated_row;
             Ok(true)
         } else {
             match handler(ConflictType::NotFound, change) {
-                ConflictAction::OmitChange | ConflictAction::Replace => Ok(false),
-                ConflictAction::Abort => Err(applied),
+                ConflictAction::OmitChange => Ok(false),
+                ConflictAction::Replace | ConflictAction::Abort => Err(applied),
             }
         }
     }
@@ -1588,6 +1747,254 @@ mod tests {
     }
 
     #[test]
+    fn test_session_changeset_tracks_follow_on_changes_after_pk_update() {
+        let mut session = Session::new();
+        session.attach_table("accounts", 3, vec![true, false, false]);
+        session.record_insert(
+            "accounts",
+            vec![
+                ChangesetValue::Integer(1),
+                ChangesetValue::Text("alice".to_owned()),
+                ChangesetValue::Integer(100),
+            ],
+        );
+        session.record_update(
+            "accounts",
+            vec![
+                ChangesetValue::Integer(1),
+                ChangesetValue::Text("alice".to_owned()),
+                ChangesetValue::Integer(100),
+            ],
+            vec![
+                ChangesetValue::Integer(2),
+                ChangesetValue::Undefined,
+                ChangesetValue::Undefined,
+            ],
+        );
+        session.record_update(
+            "accounts",
+            vec![
+                ChangesetValue::Integer(2),
+                ChangesetValue::Text("alice".to_owned()),
+                ChangesetValue::Integer(100),
+            ],
+            vec![
+                ChangesetValue::Undefined,
+                ChangesetValue::Text("ally".to_owned()),
+                ChangesetValue::Undefined,
+            ],
+        );
+
+        let changeset = session.changeset();
+        assert_eq!(changeset.tables.len(), 1);
+        assert_eq!(changeset.tables[0].rows.len(), 1);
+        assert_eq!(changeset.tables[0].rows[0].op, ChangeOp::Insert);
+        assert_eq!(
+            changeset.tables[0].rows[0].new_values,
+            vec![
+                ChangesetValue::Integer(2),
+                ChangesetValue::Text("ally".to_owned()),
+                ChangesetValue::Integer(100),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_session_changeset_existing_row_pk_update_emits_delete_then_insert() {
+        let mut session = Session::new();
+        session.attach_table("accounts", 3, vec![true, false, false]);
+        session.record_update(
+            "accounts",
+            vec![
+                ChangesetValue::Integer(1),
+                ChangesetValue::Text("alice".to_owned()),
+                ChangesetValue::Integer(100),
+            ],
+            vec![
+                ChangesetValue::Integer(2),
+                ChangesetValue::Text("ally".to_owned()),
+                ChangesetValue::Undefined,
+            ],
+        );
+
+        let changeset = session.changeset();
+        assert_eq!(changeset.tables.len(), 1);
+        assert_eq!(changeset.tables[0].rows.len(), 2);
+        assert_eq!(changeset.tables[0].rows[0].op, ChangeOp::Delete);
+        assert_eq!(
+            changeset.tables[0].rows[0].old_values,
+            vec![
+                ChangesetValue::Integer(1),
+                ChangesetValue::Text("alice".to_owned()),
+                ChangesetValue::Integer(100),
+            ]
+        );
+        assert_eq!(changeset.tables[0].rows[1].op, ChangeOp::Insert);
+        assert_eq!(
+            changeset.tables[0].rows[1].new_values,
+            vec![
+                ChangesetValue::Integer(2),
+                ChangesetValue::Text("ally".to_owned()),
+                ChangesetValue::Integer(100),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_session_changeset_existing_row_pk_update_then_delete_emits_delete_only() {
+        let mut session = Session::new();
+        session.attach_table("accounts", 3, vec![true, false, false]);
+        session.record_update(
+            "accounts",
+            vec![
+                ChangesetValue::Integer(1),
+                ChangesetValue::Text("alice".to_owned()),
+                ChangesetValue::Integer(100),
+            ],
+            vec![
+                ChangesetValue::Integer(2),
+                ChangesetValue::Text("ally".to_owned()),
+                ChangesetValue::Undefined,
+            ],
+        );
+        session.record_delete(
+            "accounts",
+            vec![
+                ChangesetValue::Integer(2),
+                ChangesetValue::Text("ally".to_owned()),
+                ChangesetValue::Integer(100),
+            ],
+        );
+
+        let changeset = session.changeset();
+        assert_eq!(changeset.tables.len(), 1);
+        assert_eq!(changeset.tables[0].rows.len(), 1);
+        assert_eq!(changeset.tables[0].rows[0].op, ChangeOp::Delete);
+        assert_eq!(
+            changeset.tables[0].rows[0].old_values,
+            vec![
+                ChangesetValue::Integer(1),
+                ChangesetValue::Text("alice".to_owned()),
+                ChangesetValue::Integer(100),
+            ]
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "attached table row width mismatch for update new values")]
+    fn test_session_record_update_rejects_attached_table_width_mismatch() {
+        let mut session = Session::new();
+        session.attach_table("accounts", 3, vec![true, false, false]);
+        session.record_update(
+            "accounts",
+            vec![
+                ChangesetValue::Integer(1),
+                ChangesetValue::Text("alice".to_owned()),
+                ChangesetValue::Integer(100),
+            ],
+            vec![
+                ChangesetValue::Undefined,
+                ChangesetValue::Text("ally".to_owned()),
+            ],
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "attached table row width mismatch for insert")]
+    fn test_session_record_insert_rejects_attached_table_width_mismatch() {
+        let mut session = Session::new();
+        session.attach_table("accounts", 3, vec![true, false, false]);
+        session.record_insert(
+            "accounts",
+            vec![
+                ChangesetValue::Integer(1),
+                ChangesetValue::Text("alice".to_owned()),
+            ],
+        );
+    }
+
+    #[test]
+    fn test_session_pk_update_emits_delete_and_insert() {
+        let mut session = Session::new();
+        session.attach_table("accounts", 2, vec![true, false]);
+        session.record_update(
+            "accounts",
+            vec![
+                ChangesetValue::Integer(1),
+                ChangesetValue::Text("alice".to_owned()),
+            ],
+            vec![
+                ChangesetValue::Integer(2),
+                ChangesetValue::Text("alicia".to_owned()),
+            ],
+        );
+
+        let changeset = session.changeset();
+        assert_eq!(changeset.tables.len(), 1);
+        assert_eq!(changeset.tables[0].rows.len(), 2);
+        assert_eq!(changeset.tables[0].rows[0].op, ChangeOp::Delete);
+        assert_eq!(
+            changeset.tables[0].rows[0].old_values,
+            vec![
+                ChangesetValue::Integer(1),
+                ChangesetValue::Text("alice".to_owned()),
+            ]
+        );
+        assert_eq!(changeset.tables[0].rows[1].op, ChangeOp::Insert);
+        assert_eq!(
+            changeset.tables[0].rows[1].new_values,
+            vec![
+                ChangesetValue::Integer(2),
+                ChangesetValue::Text("alicia".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_session_pk_evolution_coalesces_to_net_effect() {
+        let mut session = Session::new();
+        session.attach_table("accounts", 2, vec![true, false]);
+        session.record_insert(
+            "accounts",
+            vec![
+                ChangesetValue::Integer(1),
+                ChangesetValue::Text("alice".to_owned()),
+            ],
+        );
+        session.record_update(
+            "accounts",
+            vec![
+                ChangesetValue::Integer(1),
+                ChangesetValue::Text("alice".to_owned()),
+            ],
+            vec![
+                ChangesetValue::Integer(2),
+                ChangesetValue::Text("alicia".to_owned()),
+            ],
+        );
+        session.record_delete(
+            "accounts",
+            vec![
+                ChangesetValue::Integer(2),
+                ChangesetValue::Text("alicia".to_owned()),
+            ],
+        );
+
+        let changeset = session.changeset();
+        assert!(changeset.tables.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "insert values length must match attached table column_count")]
+    fn test_session_changeset_rejects_malformed_insert_attached_after_recording() {
+        let mut session = Session::new();
+        session.record_insert("accounts", vec![ChangesetValue::Integer(1)]);
+        session.attach_table("accounts", 2, vec![true, false]);
+
+        let _ = session.changeset();
+    }
+
+    #[test]
     fn test_changeset_roundtrip() {
         let mut session = Session::new();
         session.attach_table("users", 3, vec![true, false, false]);
@@ -1753,6 +2160,33 @@ mod tests {
             patchset_bytes.len(),
             changeset_bytes.len(),
         );
+    }
+
+    #[test]
+    fn test_patchset_update_uses_single_record_layout() {
+        let pk_flags = vec![true, false, false];
+        let row = ChangesetRow {
+            op: ChangeOp::Update,
+            old_values: vec![
+                ChangesetValue::Integer(1),
+                ChangesetValue::Text("old_name".to_owned()),
+                ChangesetValue::Integer(100),
+            ],
+            new_values: vec![
+                ChangesetValue::Undefined,
+                ChangesetValue::Text("new_name".to_owned()),
+                ChangesetValue::Undefined,
+            ],
+        };
+
+        let mut patchset = Vec::new();
+        row.encode_patchset(&mut patchset, &pk_flags);
+
+        let mut expected = vec![OP_UPDATE, 0x00];
+        ChangesetValue::Integer(1).encode(&mut expected);
+        ChangesetValue::Text("new_name".to_owned()).encode(&mut expected);
+        ChangesetValue::Undefined.encode(&mut expected);
+        assert_eq!(patchset, expected);
     }
 
     #[test]
@@ -2742,6 +3176,40 @@ mod tests {
     }
 
     #[test]
+    fn test_session_rows_with_null_primary_key_are_ignored() {
+        let mut session = Session::new();
+        session.attach_table("accounts", 2, vec![true, false]);
+        session.record_insert(
+            "accounts",
+            vec![
+                ChangesetValue::Null,
+                ChangesetValue::Text("alice".to_owned()),
+            ],
+        );
+        session.record_update(
+            "accounts",
+            vec![
+                ChangesetValue::Null,
+                ChangesetValue::Text("alice".to_owned()),
+            ],
+            vec![
+                ChangesetValue::Undefined,
+                ChangesetValue::Text("alice_2".to_owned()),
+            ],
+        );
+        session.record_delete(
+            "accounts",
+            vec![
+                ChangesetValue::Null,
+                ChangesetValue::Text("alice_2".to_owned()),
+            ],
+        );
+
+        let changeset = session.changeset();
+        assert!(changeset.tables.is_empty());
+    }
+
+    #[test]
     fn test_session_empty_changeset() {
         let session = Session::new();
         let cs = session.changeset();
@@ -2887,6 +3355,118 @@ mod tests {
     }
 
     #[test]
+    fn test_apply_update_pk_conflict_omit() {
+        let mut target = SimpleTarget::default();
+        target.tables.insert(
+            "t".to_owned(),
+            vec![
+                vec![
+                    SqliteValue::Integer(1),
+                    SqliteValue::Text("alice".to_owned()),
+                ],
+                vec![SqliteValue::Integer(2), SqliteValue::Text("bob".to_owned())],
+            ],
+        );
+
+        let cs = Changeset {
+            tables: vec![TableChangeset {
+                info: TableInfo {
+                    name: "t".to_owned(),
+                    column_count: 2,
+                    pk_flags: vec![true, false],
+                },
+                rows: vec![ChangesetRow {
+                    op: ChangeOp::Update,
+                    old_values: vec![
+                        ChangesetValue::Integer(1),
+                        ChangesetValue::Text("alice".to_owned()),
+                    ],
+                    new_values: vec![
+                        ChangesetValue::Integer(2),
+                        ChangesetValue::Text("ally".to_owned()),
+                    ],
+                }],
+            }],
+        };
+
+        let mut conflict_seen = None;
+        let outcome = target.apply(&cs, |conflict, _| {
+            conflict_seen = Some(conflict);
+            ConflictAction::OmitChange
+        });
+        assert_eq!(conflict_seen, Some(ConflictType::Conflict));
+        assert_eq!(
+            outcome,
+            ApplyOutcome::Success {
+                applied: 0,
+                skipped: 1,
+            }
+        );
+        assert_eq!(
+            target.tables["t"],
+            vec![
+                vec![
+                    SqliteValue::Integer(1),
+                    SqliteValue::Text("alice".to_owned()),
+                ],
+                vec![SqliteValue::Integer(2), SqliteValue::Text("bob".to_owned()),],
+            ]
+        );
+    }
+
+    #[test]
+    fn test_apply_update_pk_conflict_replace_overwrites_conflicting_row() {
+        let mut target = SimpleTarget::default();
+        target.tables.insert(
+            "t".to_owned(),
+            vec![
+                vec![
+                    SqliteValue::Integer(1),
+                    SqliteValue::Text("alice".to_owned()),
+                ],
+                vec![SqliteValue::Integer(2), SqliteValue::Text("bob".to_owned())],
+            ],
+        );
+
+        let cs = Changeset {
+            tables: vec![TableChangeset {
+                info: TableInfo {
+                    name: "t".to_owned(),
+                    column_count: 2,
+                    pk_flags: vec![true, false],
+                },
+                rows: vec![ChangesetRow {
+                    op: ChangeOp::Update,
+                    old_values: vec![
+                        ChangesetValue::Integer(1),
+                        ChangesetValue::Text("alice".to_owned()),
+                    ],
+                    new_values: vec![
+                        ChangesetValue::Integer(2),
+                        ChangesetValue::Text("ally".to_owned()),
+                    ],
+                }],
+            }],
+        };
+
+        let outcome = target.apply(&cs, |_, _| ConflictAction::Replace);
+        assert_eq!(
+            outcome,
+            ApplyOutcome::Success {
+                applied: 1,
+                skipped: 0,
+            }
+        );
+        assert_eq!(
+            target.tables["t"],
+            vec![vec![
+                SqliteValue::Integer(2),
+                SqliteValue::Text("ally".to_owned()),
+            ]]
+        );
+    }
+
+    #[test]
     fn test_apply_delete_data_conflict_replace_removes() {
         let mut target = SimpleTarget::default();
         target.tables.insert(
@@ -2945,6 +3525,79 @@ mod tests {
         };
         let outcome = target.apply(&cs, |_, _| ConflictAction::Abort);
         assert_eq!(outcome, ApplyOutcome::Aborted { applied: 0 });
+    }
+
+    #[test]
+    fn test_apply_delete_not_found_replace_aborts() {
+        let mut target = SimpleTarget::default();
+        let cs = Changeset {
+            tables: vec![TableChangeset {
+                info: TableInfo {
+                    name: "t".to_owned(),
+                    column_count: 1,
+                    pk_flags: vec![true],
+                },
+                rows: vec![ChangesetRow {
+                    op: ChangeOp::Delete,
+                    old_values: vec![ChangesetValue::Integer(1)],
+                    new_values: Vec::new(),
+                }],
+            }],
+        };
+        let outcome = target.apply(&cs, |_, _| ConflictAction::Replace);
+        assert_eq!(outcome, ApplyOutcome::Aborted { applied: 0 });
+        assert!(target.tables["t"].is_empty());
+    }
+
+    #[test]
+    fn test_apply_update_not_found_replace_aborts() {
+        let mut target = SimpleTarget::default();
+        let cs = Changeset {
+            tables: vec![TableChangeset {
+                info: TableInfo {
+                    name: "t".to_owned(),
+                    column_count: 1,
+                    pk_flags: vec![true],
+                },
+                rows: vec![ChangesetRow {
+                    op: ChangeOp::Update,
+                    old_values: vec![ChangesetValue::Integer(1)],
+                    new_values: vec![ChangesetValue::Integer(2)],
+                }],
+            }],
+        };
+        let outcome = target.apply(&cs, |_, _| ConflictAction::Replace);
+        assert_eq!(outcome, ApplyOutcome::Aborted { applied: 0 });
+        assert!(target.tables["t"].is_empty());
+    }
+
+    #[test]
+    fn test_apply_abort_rolls_back_prior_successes() {
+        let mut target = SimpleTarget::default();
+        let cs = Changeset {
+            tables: vec![TableChangeset {
+                info: TableInfo {
+                    name: "t".to_owned(),
+                    column_count: 1,
+                    pk_flags: vec![true],
+                },
+                rows: vec![
+                    ChangesetRow {
+                        op: ChangeOp::Insert,
+                        old_values: Vec::new(),
+                        new_values: vec![ChangesetValue::Integer(1)],
+                    },
+                    ChangesetRow {
+                        op: ChangeOp::Delete,
+                        old_values: vec![ChangesetValue::Integer(2)],
+                        new_values: Vec::new(),
+                    },
+                ],
+            }],
+        };
+        let outcome = target.apply(&cs, |_, _| ConflictAction::Abort);
+        assert_eq!(outcome, ApplyOutcome::Aborted { applied: 1 });
+        assert!(target.tables["t"].is_empty());
     }
 
     #[test]

@@ -87,12 +87,20 @@ where
     let mut current_page = first_overflow;
     let mut bytes_remaining = total_size.saturating_sub(local_data.len());
     let bytes_per_overflow = (usable_size - 4) as usize;
+    let mut chain_length = 0;
 
     while bytes_remaining > 0 {
-        let page_data = read_page(current_page)?;
-        if page_data.len() < 4 {
+        chain_length += 1;
+        if chain_length > MAX_OVERFLOW_CHAIN {
             return Err(FrankenError::DatabaseCorrupt {
-                detail: "overflow page too small".to_owned(),
+                detail: format!("overflow chain exceeds maximum length of {}", MAX_OVERFLOW_CHAIN),
+            });
+        }
+
+        let page_data = read_page(current_page)?;
+        if page_data.len() <= 4 {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: "overflow page too small or empty".to_owned(),
             });
         }
 
@@ -162,6 +170,9 @@ where
 
     // Calculate number of overflow pages needed.
     let num_pages = overflow_data.len().div_ceil(bytes_per_page);
+    if num_pages > MAX_OVERFLOW_CHAIN {
+        return Err(FrankenError::TooBig);
+    }
 
     // Allocate all pages first so we know the chain.
     let mut pages = Vec::with_capacity(num_pages);

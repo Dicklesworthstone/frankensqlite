@@ -25,16 +25,16 @@ use serde_json::json;
 use crate::attach::SchemaRegistry;
 use fsqlite_ast::{
     AlterTableAction, BinaryOp, ColumnConstraintKind, ColumnRef, CompoundOp, CreateTableBody,
-    DefaultValue, Distinctness, DropObjectType, Expr, FrameBound, FrameSpec, FrameType, FromClause,
-    FunctionArgs, GeneratedStorage, InSet, JoinConstraint, JoinKind, LikeOp, LimitClause, Literal,
-    NullsOrder, OrderingTerm, PlaceholderType, PragmaValue, QualifiedName, ResultColumn,
-    SelectBody, SelectCore, SelectStatement, SortDirection, Span, Statement, TableConstraintKind,
-    TableOrSubquery, TimeTravelTarget, UnaryOp, WindowSpec,
+    DefaultValue, Distinctness, DropObjectType, Expr, FrameBound, FrameExclude, FrameSpec,
+    FrameType, FromClause, FunctionArgs, GeneratedStorage, InSet, JoinConstraint, JoinKind, LikeOp,
+    LimitClause, Literal, NullsOrder, OrderingTerm, PlaceholderType, PragmaValue, QualifiedName,
+    ResultColumn, SelectBody, SelectCore, SelectStatement, SortDirection, Span, Statement,
+    TableConstraintKind, TableOrSubquery, TimeTravelTarget, UnaryOp, WindowSpec,
 };
 use fsqlite_btree::BtreeCursorOps;
 use fsqlite_btree::cursor::TransactionPageIo;
 use fsqlite_error::{FrankenError, Result};
-use fsqlite_ext_fts5::Fts5Table;
+use fsqlite_ext_fts5::{Fts5Expr, Fts5Table, build_expr, parse_fts5_query};
 use fsqlite_ext_json::{JSON_TABLE_COLUMN_NAMES, JsonEachVtab, JsonTreeVtab};
 use fsqlite_ext_misc::GenerateSeriesTable;
 use fsqlite_func::builtins::{ChangeTrackingState, set_change_tracking_state};
@@ -2417,6 +2417,36 @@ impl Connection {
         Ok(())
     }
 
+    fn log_native_join_dispatch(&self, select: &SelectStatement, rows_out: usize, elapsed_ns: u64) {
+        let mode = self.backend_mode_label();
+        let join_shape = join_shape_label(select);
+        let join_order = join_order_label(select);
+        let derived_source_count = count_derived_sources(select);
+        tracing::debug!(
+            target: "fsqlite.storage_wiring",
+            backend_kind = self.pager_backend_label(),
+            backend_identity = %self.backend_identity(),
+            mode,
+            fallback_policy = mode,
+            statement_kind = "select",
+            decision_reason = "join_or_subquery_native_dispatch",
+            join_shape = %join_shape,
+            join_order = %join_order,
+            derived_source_count,
+            temp_materialization_mode = "connection_join_interpreter",
+            rows_out,
+            elapsed_ns,
+            "execute_statement_dispatch: completed pager-backed join/derived dispatch"
+        );
+    }
+
+    #[must_use]
+    fn can_execute_join_select_on_real_backend(&self, select: &SelectStatement) -> bool {
+        self.pager.is_file_backed()
+            && !self.time_travel_active.get()
+            && select_is_real_backend_join_candidate(select)
+    }
+
     /// Returns the kind of pager backend in use (e.g. "memory", "iouring", or "unix").
     #[must_use]
     pub fn pager_backend_kind(&self) -> &'static str {
@@ -3304,6 +3334,7 @@ impl Connection {
     }
 
     /// Remove a cached compiled program by SQL text, if present.
+    #[allow(dead_code)]
     fn invalidate_compiled_cache(&self, sql: &str) {
         let key = Self::sql_hash(sql);
         let mut cache = self.compiled_cache.borrow_mut();
@@ -3878,10 +3909,32 @@ impl Connection {
                         apply_limit_clause(&mut rows, &limit);
                     }
                     Ok(rows)
-                } else if has_joins(select) || has_fallback_from_source(select) {
+                } else if has_joins(select) || has_subquery_source(select) {
                     // Fallback path: eagerly rewrite IN subqueries.
-                    // Also handles non-table FROM sources (derived tables,
-                    // table-valued functions) even without explicit JOINs.
+                    // Also handles derived tables even without explicit JOINs.
+                    let rewritten = self.rewrite_in_subqueries_select(select, params)?;
+                    let native_join_dispatch =
+                        self.can_execute_join_select_on_real_backend(&rewritten);
+                    if !native_join_dispatch {
+                        self.log_mem_execution_fallback("select", "join_or_subquery_fallback")?;
+                    }
+                    let mut bound = bind_placeholders_in_select_for_fallback(&rewritten, params)?;
+                    let limit_clause = bound.limit.take();
+                    let started = std::time::Instant::now();
+                    let mut rows = self.execute_join_select(&bound, None)?;
+                    if native_join_dispatch {
+                        let elapsed_ns =
+                            u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                        self.log_native_join_dispatch(&bound, rows.len(), elapsed_ns);
+                    }
+                    if distinct {
+                        dedup_rows(&mut rows);
+                    }
+                    if let Some(limit) = limit_clause {
+                        apply_limit_clause(&mut rows, &limit);
+                    }
+                    Ok(rows)
+                } else if has_table_function_source(select) {
                     self.log_mem_execution_fallback("select", "join_or_subquery_fallback")?;
                     let rewritten = self.rewrite_in_subqueries_select(select, params)?;
                     let mut bound = bind_placeholders_in_select_for_fallback(&rewritten, params)?;
@@ -9166,7 +9219,6 @@ impl Connection {
             .iter()
             .filter_map(|column| table.column_index(column))
             .collect();
-        let n_idx_cols = idx_col_positions.len();
         let columns_label = format!("{}.{}", table.name, index.key_label());
         let where_expr = index
             .where_clause
@@ -9182,7 +9234,6 @@ impl Connection {
             index.root_page,
             &idx_col_positions,
             index.is_unique,
-            n_idx_cols,
             &columns_label,
             where_expr.as_ref(),
         )?;
@@ -9425,11 +9476,11 @@ impl Connection {
         index_root: i32,
         idx_col_positions: &[usize],
         is_unique: bool,
-        n_idx_cols: usize,
         columns_label: &str,
         where_expr: Option<&fsqlite_ast::Expr>,
     ) -> Result<VdbeProgram> {
         let mut b = ProgramBuilder::new();
+        let n_idx_cols = idx_col_positions.len();
         let halt_label = b.emit_label();
         let loop_label = b.emit_label();
         let next_label = b.emit_label();
@@ -16169,6 +16220,55 @@ impl Connection {
                     }
                 };
 
+                let frame_sensitive = !matches!(
+                    fname.as_str(),
+                    "ROW_NUMBER"
+                        | "RANK"
+                        | "DENSE_RANK"
+                        | "PERCENT_RANK"
+                        | "CUME_DIST"
+                        | "NTILE"
+                        | "LAG"
+                        | "LEAD"
+                );
+                if frame_sensitive && let Some(frame_spec) = frame.as_ref() {
+                    let peer_groups = build_peer_groups(
+                        partition_indices,
+                        &win_order_by[wi],
+                        &row_values,
+                        &col_map,
+                    );
+                    for (pos, &ri) in partition_indices.iter().enumerate() {
+                        let frame_rows = window_frame_rows_for_current(
+                            pos,
+                            partition_indices,
+                            &win_order_by[wi],
+                            &row_values,
+                            &col_map,
+                            frame_spec,
+                            &peer_groups,
+                        );
+                        let peer_rows = peer_rows_for_current_row(&peer_groups, ri);
+                        let included_rows =
+                            apply_frame_exclusion(frame_rows, ri, &peer_rows, frame_spec.exclude);
+                        let mut excluded_state = func.initial_state();
+                        for slot_ri in included_rows {
+                            if !row_passes_filter(slot_ri) {
+                                continue;
+                            }
+                            let args = build_window_args(
+                                &win_args[wi],
+                                &win_order_by[wi],
+                                &row_values[slot_ri],
+                                &col_map,
+                            )?;
+                            func.step(&mut excluded_state, &args)?;
+                        }
+                        func_vals.push(func.value(&excluded_state)?);
+                    }
+                    continue;
+                }
+
                 // ROWS sliding frame: recompute aggregate per row over the
                 // explicit numeric frame bounds.
                 let sliding = is_rows_sliding_frame(frame.as_ref());
@@ -17065,6 +17165,9 @@ impl Connection {
                                 JoinTableSource {
                                     table_name: name.name.clone(),
                                     alias: alias.clone(),
+                                    hidden_rowid_projection: join_hidden_rowid_projection(
+                                        &col_names,
+                                    ),
                                     col_names,
                                 },
                                 None,
@@ -17078,6 +17181,7 @@ impl Connection {
                                     table_name: label,
                                     alias: alias.clone(),
                                     col_names,
+                                    hidden_rowid_projection: None,
                                 },
                                 // Rows will be loaded after dropping schema borrow.
                                 Some(Vec::new()),
@@ -17098,6 +17202,7 @@ impl Connection {
                                     table_name: name.clone(),
                                     alias: alias.clone(),
                                     col_names,
+                                    hidden_rowid_projection: None,
                                 },
                                 Some(Vec::new()),
                             ))
@@ -17131,7 +17236,7 @@ impl Connection {
                 match all_sources[i] {
                     TableOrSubquery::Subquery { query, .. } => {
                         let rows = self
-                            .execute_statement(&Statement::Select(query.as_ref().clone()), None)?;
+                            .execute_statement(&Statement::Select(query.as_ref().clone()), params)?;
                         let row_data: Vec<Vec<SqliteValue>> =
                             rows.iter().map(|r| r.values().to_vec()).collect();
                         // If col_names contains "*" (unresolved star), resolve it
@@ -17170,9 +17275,12 @@ impl Connection {
             for col_name in &src.col_names {
                 col_map.push((label.to_owned(), col_name.clone(), false));
             }
+            if src.hidden_rowid_projection.is_some() {
+                col_map.push((label.to_owned(), "rowid".to_owned(), true));
+            }
         }
 
-        let primary_width = table_sources[0].col_names.len();
+        let primary_width = table_sources[0].scan_width();
         let primary_where_pushdown = where_clause.as_deref().and_then(|expr| {
             expr_references_only_col_map(expr, &col_map[..primary_width]).then_some(expr)
         });
@@ -17221,7 +17329,13 @@ impl Connection {
                     if let Some(mem_table) = db.get_table(root_page) {
                         mem_table
                             .iter_rows()
-                            .map(|(_rowid, vals)| vals.to_vec())
+                            .map(|(rowid, vals)| {
+                                let mut row = vals.to_vec();
+                                if src.hidden_rowid_projection.is_some() {
+                                    row.push(SqliteValue::Integer(rowid));
+                                }
+                                row
+                            })
                             .collect::<Vec<Vec<SqliteValue>>>()
                     } else {
                         Vec::new()
@@ -17235,15 +17349,15 @@ impl Connection {
                     &col_map[..primary_width],
                 )?);
             } else {
-                // Named table: scan from database.
-                let scan_sql = format!("SELECT * FROM \"{}\"", src.table_name.replace('"', "\"\""));
-                // Invalidate the compile cache for this scan SQL so that CTE
-                // temp tables whose root page changes between materializations
-                // don't get a stale compiled program from a previous CTE.
+                // Named table: scan through the normal query path so file-backed
+                // parity-cert connections read from pager-backed state instead
+                // of the schema-only MemDatabase mirror.  When the join layer
+                // needs the hidden rowid, append it explicitly to the scan.
+                let scan_sql = build_join_scan_sql(src);
                 self.invalidate_compiled_cache(&scan_sql);
                 let rows = self.query(&scan_sql)?;
                 let row_data: Vec<Vec<SqliteValue>> =
-                    rows.iter().map(|r| r.values().to_vec()).collect();
+                    rows.iter().map(|row| row.values().to_vec()).collect();
                 scanned_cache.insert(src.table_name.clone(), row_data.clone());
                 table_rows.push(maybe_filter_primary_join_rows(
                     row_data,
@@ -17263,10 +17377,10 @@ impl Connection {
 
         for (join_idx, join) in from.joins.iter().enumerate() {
             let right_rows = &table_rows[join_idx + 1];
-            let right_width = table_sources[join_idx + 1].col_names.len();
+            let right_width = table_sources[join_idx + 1].scan_width();
             let current_width: usize = table_sources[..=join_idx]
                 .iter()
-                .map(|s| s.col_names.len())
+                .map(JoinTableSource::scan_width)
                 .sum();
 
             // NATURAL JOIN: auto-derive USING constraint from shared column
@@ -17320,7 +17434,7 @@ impl Connection {
         // table's duplicate columns are excluded from SELECT *.
         let mut using_skip_indices: HashSet<usize> = HashSet::new();
         {
-            let mut offset = table_sources[0].col_names.len();
+            let mut offset = table_sources[0].scan_width();
             for (join_idx, join) in from.joins.iter().enumerate() {
                 let using_cols: Option<&[String]> = if join.join_type.natural {
                     // For NATURAL JOIN, shared columns were computed above.
@@ -17355,7 +17469,7 @@ impl Connection {
                         }
                     }
                 }
-                offset += table_sources[join_idx + 1].col_names.len();
+                offset += table_sources[join_idx + 1].scan_width();
             }
         }
 
@@ -17369,7 +17483,7 @@ impl Connection {
                 ResultColumn::Star => col_map
                     .iter()
                     .enumerate()
-                    .filter(|(idx, _)| !using_skip_indices.contains(idx))
+                    .filter(|(idx, (_, _, hidden))| !hidden && !using_skip_indices.contains(idx))
                     .map(|(_, (tbl, c, _))| ResultColumn::Expr {
                         expr: Expr::Column(
                             ColumnRef::qualified(tbl.clone(), c.clone()),
@@ -17380,7 +17494,7 @@ impl Connection {
                     .collect::<Vec<_>>(),
                 ResultColumn::TableStar(tbl_name) => col_map
                     .iter()
-                    .filter(|(t, _, _)| t.eq_ignore_ascii_case(tbl_name))
+                    .filter(|(t, _, hidden)| t.eq_ignore_ascii_case(tbl_name) && !hidden)
                     .map(|(t, c, _)| ResultColumn::Expr {
                         expr: Expr::Column(
                             ColumnRef::qualified(t.clone(), c.clone()),
@@ -17457,7 +17571,9 @@ impl Connection {
                 match col {
                     ResultColumn::Star => {
                         for (i, v) in row.iter().enumerate() {
-                            if !using_skip_indices.contains(&i) {
+                            if !using_skip_indices.contains(&i)
+                                && !col_map.get(i).is_some_and(|(_, _, hidden)| *hidden)
+                            {
                                 values.push(v.clone());
                             }
                         }
@@ -17467,11 +17583,11 @@ impl Connection {
                         for src in &table_sources {
                             let label = src.alias.as_deref().unwrap_or(&src.table_name);
                             if label.eq_ignore_ascii_case(table_name) {
-                                let width = src.col_names.len();
-                                values.extend(row[offset..offset + width].iter().cloned());
+                                let visible_width = src.col_names.len();
+                                values.extend(row[offset..offset + visible_width].iter().cloned());
                                 break;
                             }
-                            offset += src.col_names.len();
+                            offset += src.scan_width();
                         }
                     }
                     ResultColumn::Expr { expr, .. } => {
@@ -19203,6 +19319,133 @@ fn has_table_function_source(select: &SelectStatement) -> bool {
 
 fn has_fallback_from_source(select: &SelectStatement) -> bool {
     has_subquery_source(select) || has_table_function_source(select)
+}
+
+fn select_is_real_backend_join_candidate(select: &SelectStatement) -> bool {
+    if select.with.is_some() || !select.body.compounds.is_empty() {
+        return false;
+    }
+    if has_group_by(select)
+        || has_implicit_aggregation(select)
+        || has_window_functions(select)
+        || select_contains_match_operator(select)
+        || select_has_correlated_join_subquery(select)
+    {
+        return false;
+    }
+
+    match &select.body.select {
+        SelectCore::Values(_) => true,
+        SelectCore::Select {
+            from,
+            having,
+            windows,
+            ..
+        } => {
+            if having.is_some() || !windows.is_empty() {
+                return false;
+            }
+            from.as_ref().is_none_or(|from_clause| {
+                table_or_subquery_is_real_backend_join_candidate(&from_clause.source)
+                    && from_clause
+                        .joins
+                        .iter()
+                        .all(|join| table_or_subquery_is_real_backend_join_candidate(&join.table))
+            })
+        }
+    }
+}
+
+fn table_or_subquery_is_real_backend_join_candidate(source: &TableOrSubquery) -> bool {
+    match source {
+        TableOrSubquery::Table { .. } => true,
+        TableOrSubquery::Subquery { query, .. } => select_is_real_backend_join_candidate(query),
+        TableOrSubquery::TableFunction { .. } | TableOrSubquery::ParenJoin(_) => false,
+    }
+}
+
+fn count_derived_sources(select: &SelectStatement) -> usize {
+    fn count_source(source: &TableOrSubquery) -> usize {
+        match source {
+            TableOrSubquery::Subquery { query, .. } => 1 + count_derived_sources(query),
+            TableOrSubquery::ParenJoin(from_clause) => {
+                count_source(&from_clause.source)
+                    + from_clause
+                        .joins
+                        .iter()
+                        .map(|join| count_source(&join.table))
+                        .sum::<usize>()
+            }
+            TableOrSubquery::Table { .. } | TableOrSubquery::TableFunction { .. } => 0,
+        }
+    }
+
+    match &select.body.select {
+        SelectCore::Values(_) => 0,
+        SelectCore::Select { from, .. } => from.as_ref().map_or(0, |from_clause| {
+            count_source(&from_clause.source)
+                + from_clause
+                    .joins
+                    .iter()
+                    .map(|join| count_source(&join.table))
+                    .sum::<usize>()
+        }),
+    }
+}
+
+fn join_shape_label(select: &SelectStatement) -> String {
+    match &select.body.select {
+        SelectCore::Values(_) => "values".to_owned(),
+        SelectCore::Select { from, .. } => match from {
+            None => "fromless".to_owned(),
+            Some(from_clause) if from_clause.joins.is_empty() => {
+                if has_subquery_source(select) {
+                    "derived_only".to_owned()
+                } else {
+                    "single_source".to_owned()
+                }
+            }
+            Some(from_clause) => from_clause
+                .joins
+                .iter()
+                .map(|join| join.join_type.kind.to_string())
+                .collect::<Vec<_>>()
+                .join("->"),
+        },
+    }
+}
+
+fn join_order_label(select: &SelectStatement) -> String {
+    fn source_label(source: &TableOrSubquery) -> String {
+        match source {
+            TableOrSubquery::Table { name, alias, .. } => {
+                alias.clone().unwrap_or_else(|| name.name.clone())
+            }
+            TableOrSubquery::Subquery { alias, .. } => {
+                alias.clone().unwrap_or_else(|| "subquery".to_owned())
+            }
+            TableOrSubquery::TableFunction { name, alias, .. } => {
+                alias.clone().unwrap_or_else(|| name.clone())
+            }
+            TableOrSubquery::ParenJoin(_) => "paren_join".to_owned(),
+        }
+    }
+
+    match &select.body.select {
+        SelectCore::Values(_) => "values".to_owned(),
+        SelectCore::Select { from, .. } => match from {
+            None => "fromless".to_owned(),
+            Some(from_clause) => std::iter::once(source_label(&from_clause.source))
+                .chain(
+                    from_clause
+                        .joins
+                        .iter()
+                        .map(|join| source_label(&join.table)),
+                )
+                .collect::<Vec<_>>()
+                .join("->"),
+        },
+    }
 }
 
 fn table_function_column_names(name: &str) -> Option<&'static [&'static str]> {
@@ -22261,6 +22504,88 @@ fn build_peer_groups(
     groups
 }
 
+fn peer_rows_for_current_row(peer_groups: &[Vec<usize>], current_ri: usize) -> Vec<usize> {
+    peer_groups
+        .iter()
+        .find(|group| group.contains(&current_ri))
+        .cloned()
+        .unwrap_or_else(|| vec![current_ri])
+}
+
+fn window_frame_rows_for_current(
+    pos: usize,
+    partition_indices: &[usize],
+    order_by: &[(Expr, bool)],
+    row_values: &[Vec<SqliteValue>],
+    col_map: &[(String, String, bool)],
+    frame: &FrameSpec,
+    peer_groups: &[Vec<usize>],
+) -> Vec<usize> {
+    match frame.frame_type {
+        FrameType::Rows => {
+            let (frame_start, frame_end) = rows_frame_bounds(pos, partition_indices.len(), frame);
+            partition_indices[frame_start..frame_end].to_vec()
+        }
+        FrameType::Groups => {
+            let current_ri = partition_indices[pos];
+            let group_pos = peer_groups
+                .iter()
+                .position(|group| group.contains(&current_ri))
+                .unwrap_or(0);
+            let (group_start, group_end) = groups_frame_bounds(group_pos, peer_groups.len(), frame);
+            peer_groups[group_start..group_end]
+                .iter()
+                .flatten()
+                .copied()
+                .collect()
+        }
+        FrameType::Range => {
+            if order_by.is_empty() {
+                partition_indices.to_vec()
+            } else {
+                let (frame_start, frame_end) = range_value_frame_bounds(
+                    pos,
+                    partition_indices,
+                    order_by,
+                    row_values,
+                    col_map,
+                    frame,
+                );
+                partition_indices[frame_start..frame_end].to_vec()
+            }
+        }
+    }
+}
+
+fn apply_frame_exclusion(
+    frame_rows: Vec<usize>,
+    current_ri: usize,
+    peer_rows: &[usize],
+    exclude: Option<FrameExclude>,
+) -> Vec<usize> {
+    match exclude.unwrap_or(FrameExclude::NoOthers) {
+        FrameExclude::NoOthers => frame_rows,
+        FrameExclude::CurrentRow => frame_rows
+            .into_iter()
+            .filter(|&ri| ri != current_ri)
+            .collect(),
+        FrameExclude::Group => {
+            let peer_set: HashSet<usize> = peer_rows.iter().copied().collect();
+            frame_rows
+                .into_iter()
+                .filter(|ri| !peer_set.contains(ri))
+                .collect()
+        }
+        FrameExclude::Ties => {
+            let peer_set: HashSet<usize> = peer_rows.iter().copied().collect();
+            frame_rows
+                .into_iter()
+                .filter(|&ri| ri == current_ri || !peer_set.contains(&ri))
+                .collect()
+        }
+    }
+}
+
 /// Compute GROUPS frame bounds (start group index, end group index exclusive).
 fn groups_frame_bounds(group_pos: usize, num_groups: usize, frame: &FrameSpec) -> (usize, usize) {
     let start = match &frame.start {
@@ -22909,7 +23234,10 @@ fn evaluate_having_value(
             let matched = match op {
                 LikeOp::Like => simple_like_match(&p, &s),
                 LikeOp::Glob => simple_glob_match(&p, &s),
-                LikeOp::Match => simple_match_query(&p, &s),
+                LikeOp::Match => {
+                    let match_row = group_rows.first().map_or(&[][..], Vec::as_slice);
+                    match_query_with_table_columns(inner, &p, &s, match_row, col_map)
+                }
                 // REGEXP requires a user-defined function; this fallback
                 // eval path cannot call it, so return NULL (parity: SQLite
                 // errors if no regexp() function is registered).
@@ -26979,6 +27307,40 @@ struct JoinTableSource {
     table_name: String,
     alias: Option<String>,
     col_names: Vec<String>,
+    hidden_rowid_projection: Option<String>,
+}
+
+impl JoinTableSource {
+    fn scan_width(&self) -> usize {
+        self.col_names.len() + usize::from(self.hidden_rowid_projection.is_some())
+    }
+}
+
+fn join_hidden_rowid_projection(columns: &[String]) -> Option<String> {
+    let shadowed: HashSet<String> = columns
+        .iter()
+        .map(|column| column.to_ascii_lowercase())
+        .collect();
+    ["rowid", "_rowid_", "oid"]
+        .into_iter()
+        .find(|candidate| !shadowed.contains(*candidate))
+        .map(str::to_owned)
+}
+
+fn build_join_scan_sql(source: &JoinTableSource) -> String {
+    let mut projections = source
+        .col_names
+        .iter()
+        .map(|column| quote_identifier(column))
+        .collect::<Vec<_>>();
+    if let Some(hidden_rowid_projection) = &source.hidden_rowid_projection {
+        projections.push(hidden_rowid_projection.clone());
+    }
+    format!(
+        "SELECT {} FROM {}",
+        projections.join(", "),
+        quote_identifier(&source.table_name)
+    )
 }
 
 /// Perform a single join step: combine left-side rows with right-side rows.
@@ -27285,12 +27647,14 @@ fn eval_join_expr(
             if table_prefix.is_none()
                 && col_map
                     .iter()
-                    .any(|(table, _, _)| table.eq_ignore_ascii_case(col_name))
+                    .any(|(table, _, hidden)| table.eq_ignore_ascii_case(col_name) && !hidden)
             {
                 let text = col_map
                     .iter()
                     .enumerate()
-                    .filter(|(_, (table, _, _))| table.eq_ignore_ascii_case(col_name))
+                    .filter(|(_, (table, _, hidden))| {
+                        table.eq_ignore_ascii_case(col_name) && !hidden
+                    })
                     .filter_map(|(idx, _)| row.get(idx))
                     .filter(|value| !matches!(value, SqliteValue::Null))
                     .map(sqlite_value_to_text)
@@ -27476,7 +27840,7 @@ fn eval_join_expr(
             let matched = match op {
                 LikeOp::Like => simple_like_match(&p, &s),
                 LikeOp::Glob => simple_glob_match(&p, &s),
-                LikeOp::Match => simple_match_query(&p, &s),
+                LikeOp::Match => match_query_with_table_columns(inner, &p, &s, row, col_map),
                 LikeOp::Regexp => {
                     return Err(FrankenError::Internal(
                         "no such function: regexp".to_owned(),
@@ -27546,12 +27910,21 @@ fn find_col_in_map(
 ) -> Result<usize> {
     if let Some(prefix) = table_prefix {
         // Qualified: match table label + column name.
-        col_map
-            .iter()
-            .position(|(tbl, col, _)| {
-                tbl.eq_ignore_ascii_case(prefix) && col.eq_ignore_ascii_case(col_name)
+        if let Some(idx) = col_map.iter().position(|(tbl, col, _)| {
+            tbl.eq_ignore_ascii_case(prefix) && col.eq_ignore_ascii_case(col_name)
+        }) {
+            return Ok(idx);
+        }
+        if is_rowid_alias(col_name)
+            && let Some(idx) = col_map.iter().position(|(tbl, col, hidden)| {
+                tbl.eq_ignore_ascii_case(prefix) && *hidden && col.eq_ignore_ascii_case("rowid")
             })
-            .ok_or_else(|| FrankenError::Internal(format!("column not found: {prefix}.{col_name}")))
+        {
+            return Ok(idx);
+        }
+        Err(FrankenError::Internal(format!(
+            "column not found: {prefix}.{col_name}"
+        )))
     } else {
         // Unqualified: find all matches, ignoring skipped USING columns.
         let mut first = None;
@@ -27573,7 +27946,36 @@ fn find_col_in_map(
                 name: col_name.to_owned(),
             });
         }
-        first.ok_or_else(|| FrankenError::Internal(format!("column not found: {col_name}")))
+        if let Some(idx) = first {
+            return Ok(idx);
+        }
+        if is_rowid_alias(col_name) {
+            let mut hidden_match = None;
+            let mut hidden_ambiguous = false;
+            for (i, (_, col, hidden)) in col_map.iter().enumerate() {
+                if using_skip_indices.is_some_and(|s| s.contains(&i)) {
+                    continue;
+                }
+                if *hidden && col.eq_ignore_ascii_case("rowid") {
+                    if hidden_match.is_none() {
+                        hidden_match = Some(i);
+                    } else {
+                        hidden_ambiguous = true;
+                    }
+                }
+            }
+            if hidden_ambiguous {
+                return Err(FrankenError::AmbiguousColumn {
+                    name: col_name.to_owned(),
+                });
+            }
+            if let Some(idx) = hidden_match {
+                return Ok(idx);
+            }
+        }
+        Err(FrankenError::Internal(format!(
+            "column not found: {col_name}"
+        )))
     }
 }
 
@@ -27838,27 +28240,6 @@ fn like_dp(pat: &[char], txt: &[char], pi: usize, ti: usize) -> bool {
 ///
 /// Supports single-term search, quoted phrases, `AND`/`OR`, and `prefix*`.
 fn simple_match_query(query: &str, document: &str) -> bool {
-    fn matches_term(term: &str, text_lower: &str) -> bool {
-        let mut normalized = term
-            .trim()
-            .trim_matches('"')
-            .trim_matches('\'')
-            .to_ascii_lowercase();
-        if normalized.is_empty() {
-            return false;
-        }
-        if normalized.ends_with('*') {
-            normalized.pop();
-            if normalized.is_empty() {
-                return true;
-            }
-            return text_lower
-                .split_whitespace()
-                .any(|word| word.starts_with(&normalized));
-        }
-        text_lower.contains(&normalized)
-    }
-
     fn eval_clause(clause: &str, text_lower: &str) -> bool {
         let trimmed = clause.trim();
         if trimmed.contains(" OR ") {
@@ -27871,11 +28252,155 @@ fn simple_match_query(query: &str, document: &str) -> bool {
                 .split(" AND ")
                 .all(|part| eval_clause(part, text_lower));
         }
-        matches_term(trimmed, text_lower)
+        simple_match_term(trimmed, text_lower)
     }
 
     let text_lower = document.to_ascii_lowercase();
     eval_clause(query, &text_lower)
+}
+
+fn match_query_with_table_columns(
+    operand_expr: &Expr,
+    query: &str,
+    document: &str,
+    row: &[SqliteValue],
+    col_map: &[(String, String, bool)],
+) -> bool {
+    if let Expr::Column(col_ref, _) = operand_expr
+        && col_ref.table.is_none()
+        && col_map
+            .iter()
+            .any(|(table, _, _)| table.eq_ignore_ascii_case(&col_ref.column))
+    {
+        let columns = collect_match_columns(&col_ref.column, row, col_map);
+        return simple_match_query_with_columns(query, document, &columns);
+    }
+
+    simple_match_query(query, document)
+}
+
+fn collect_match_columns(
+    table_name: &str,
+    row: &[SqliteValue],
+    col_map: &[(String, String, bool)],
+) -> Vec<(String, String)> {
+    col_map
+        .iter()
+        .enumerate()
+        .filter(|(_, (table, _, hidden))| table.eq_ignore_ascii_case(table_name) && !hidden)
+        .filter_map(|(idx, (_, column, _))| {
+            let value = row.get(idx)?;
+            if matches!(value, SqliteValue::Null) {
+                return None;
+            }
+            Some((column.clone(), sqlite_value_to_text(value)))
+        })
+        .collect()
+}
+
+fn simple_match_query_with_columns(
+    query: &str,
+    document: &str,
+    columns: &[(String, String)],
+) -> bool {
+    let Ok(tokens) = parse_fts5_query(query) else {
+        return simple_match_query(query, document);
+    };
+    let Ok(expr) = build_expr(&tokens) else {
+        return simple_match_query(query, document);
+    };
+    simple_match_fts5_expr(&expr, document, columns)
+}
+
+fn simple_match_fts5_expr(expr: &Fts5Expr, document: &str, columns: &[(String, String)]) -> bool {
+    match expr {
+        Fts5Expr::Term(term) => simple_match_term(term, &document.to_lowercase()),
+        Fts5Expr::Prefix(prefix) => simple_match_prefix(prefix, &document.to_lowercase()),
+        Fts5Expr::Phrase(words) => simple_match_phrase(words, &document.to_lowercase()),
+        Fts5Expr::And(left, right) => {
+            simple_match_fts5_expr(left, document, columns)
+                && simple_match_fts5_expr(right, document, columns)
+        }
+        Fts5Expr::Or(left, right) => {
+            simple_match_fts5_expr(left, document, columns)
+                || simple_match_fts5_expr(right, document, columns)
+        }
+        Fts5Expr::Not(left, right) => {
+            simple_match_fts5_expr(left, document, columns)
+                && !simple_match_fts5_expr(right, document, columns)
+        }
+        Fts5Expr::Near(terms, _) => terms
+            .iter()
+            .all(|term| simple_match_term(term, &document.to_lowercase())),
+        Fts5Expr::ColumnFilter(column_name, inner) => {
+            let filtered_columns: Vec<(String, String)> = columns
+                .iter()
+                .filter(|(column, _)| column.eq_ignore_ascii_case(column_name))
+                .cloned()
+                .collect();
+            if filtered_columns.is_empty() {
+                return false;
+            }
+            let filtered_document = filtered_columns
+                .iter()
+                .map(|(_, text)| text.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+            simple_match_fts5_expr(inner, &filtered_document, &filtered_columns)
+        }
+        Fts5Expr::InitialToken(inner) => match inner.as_ref() {
+            Fts5Expr::Term(term) => document
+                .split_whitespace()
+                .next()
+                .is_some_and(|word| word.to_lowercase().contains(&term.to_lowercase())),
+            Fts5Expr::Prefix(prefix) => document
+                .split_whitespace()
+                .next()
+                .is_some_and(|word| word.to_lowercase().starts_with(&prefix.to_lowercase())),
+            Fts5Expr::Phrase(words) => document
+                .to_lowercase()
+                .starts_with(&words.join(" ").to_lowercase()),
+            _ => simple_match_fts5_expr(inner, document, columns),
+        },
+    }
+}
+
+fn simple_match_term(term: &str, text_lower: &str) -> bool {
+    let mut normalized = term
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+        .to_lowercase();
+    if normalized.is_empty() {
+        return false;
+    }
+    if normalized.ends_with('*') {
+        normalized.pop();
+        if normalized.is_empty() {
+            return true;
+        }
+        return text_lower
+            .split_whitespace()
+            .any(|word| word.starts_with(&normalized));
+    }
+    text_lower.contains(&normalized)
+}
+
+fn simple_match_prefix(prefix: &str, text_lower: &str) -> bool {
+    let normalized = prefix.trim().to_lowercase();
+    if normalized.is_empty() {
+        return false;
+    }
+    text_lower
+        .split_whitespace()
+        .any(|word| word.starts_with(&normalized))
+}
+
+fn simple_match_phrase(words: &[String], text_lower: &str) -> bool {
+    if words.is_empty() {
+        return false;
+    }
+    text_lower.contains(&words.join(" ").to_lowercase())
 }
 
 /// Simple GLOB pattern match (`*` = any sequence, `?` = any char, case-sensitive).
@@ -29264,6 +29789,26 @@ mod tests {
             .query("SELECT rowid FROM docs WHERE docs MATCH 'hello'")
             .unwrap();
         assert_eq!(rows.len(), 1, "MATCH should find one matching row");
+
+        let subject_rows = conn
+            .query("SELECT rowid FROM docs WHERE docs MATCH 'subject:hello'")
+            .unwrap();
+        assert_eq!(
+            subject_rows.len(),
+            1,
+            "column-filter MATCH should find one row"
+        );
+        assert_eq!(subject_rows[0].get(0), Some(&SqliteValue::Integer(1)));
+
+        let body_rows = conn
+            .query("SELECT rowid FROM docs WHERE docs MATCH 'body:rust'")
+            .unwrap();
+        assert_eq!(
+            body_rows.len(),
+            1,
+            "body column filter should isolate the body text"
+        );
+        assert_eq!(body_rows[0].get(0), Some(&SqliteValue::Integer(1)));
 
         conn.execute("INSERT INTO docs(docs) VALUES('optimize')")
             .unwrap();
@@ -34429,6 +34974,66 @@ mod tests {
                 SqliteValue::Integer(3),
                 SqliteValue::Integer(3),
                 SqliteValue::Integer(3),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_join_projection_rowid_aliases_with_shadowed_rowid_column() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE shadowed (rowid TEXT, payload TEXT);")
+            .unwrap();
+        conn.execute("CREATE TABLE aux (id INTEGER);").unwrap();
+        conn.execute("INSERT INTO shadowed(rowid, payload) VALUES ('visible', 'x');")
+            .unwrap();
+        conn.execute("INSERT INTO aux VALUES (1);").unwrap();
+
+        let rows = conn
+            .query(
+                "SELECT s.rowid, s._rowid_, s.oid, s.payload \
+                 FROM shadowed AS s JOIN aux AS a ON 1 = 1 \
+                 ORDER BY s._rowid_;",
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![
+                SqliteValue::Text("visible".to_owned()),
+                SqliteValue::Integer(1),
+                SqliteValue::Integer(1),
+                SqliteValue::Text("x".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_join_projection_rowid_aliases_fall_back_to_oid_when_needed() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE shadowed (rowid TEXT, _rowid_ TEXT, payload TEXT);")
+            .unwrap();
+        conn.execute("CREATE TABLE aux (id INTEGER);").unwrap();
+        conn.execute(
+            "INSERT INTO shadowed(rowid, _rowid_, payload) VALUES ('visible-rowid', 'visible-hidden', 'x');",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO aux VALUES (1);").unwrap();
+
+        let rows = conn
+            .query(
+                "SELECT s.rowid, s._rowid_, s.oid, s.payload \
+                 FROM shadowed AS s JOIN aux AS a ON 1 = 1 \
+                 ORDER BY s.oid;",
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            row_values(&rows[0]),
+            vec![
+                SqliteValue::Text("visible-rowid".to_owned()),
+                SqliteValue::Text("visible-hidden".to_owned()),
+                SqliteValue::Integer(1),
+                SqliteValue::Text("x".to_owned()),
             ]
         );
     }
@@ -45854,6 +46459,165 @@ mod pager_routing_tests {
         conn.execute("PRAGMA fsqlite.parity_cert = OFF;").unwrap();
         let rows = conn.query(sql).unwrap();
         assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn test_zjisk1_strict_mode_allows_file_backed_named_table_join_dispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("strict_join_native.db");
+        let conn = Connection::open(path.to_str().unwrap()).unwrap();
+        conn.execute("CREATE TABLE items (id INTEGER, name TEXT);")
+            .unwrap();
+        conn.execute("CREATE TABLE tags (item_id INTEGER, tag TEXT);")
+            .unwrap();
+        conn.execute("INSERT INTO items VALUES (1, 'alpha'), (2, 'beta');")
+            .unwrap();
+        conn.execute("INSERT INTO tags VALUES (1, 'fruit'), (2, 'tool');")
+            .unwrap();
+        conn.execute("PRAGMA fsqlite.parity_cert_strict = ON;")
+            .unwrap();
+
+        let rows = conn
+            .query(
+                "SELECT items.name, tags.tag \
+                 FROM items JOIN tags ON items.id = tags.item_id \
+                 ORDER BY items.id;",
+            )
+            .unwrap();
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0].values(),
+            vec![
+                SqliteValue::Text("alpha".to_owned()),
+                SqliteValue::Text("fruit".to_owned()),
+            ]
+            .as_slice()
+        );
+        assert_eq!(
+            rows[1].values(),
+            vec![
+                SqliteValue::Text("beta".to_owned()),
+                SqliteValue::Text("tool".to_owned()),
+            ]
+            .as_slice()
+        );
+    }
+
+    #[test]
+    fn test_zjisk1_strict_mode_allows_file_backed_simple_derived_join_dispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("strict_derived_native.db");
+        let conn = Connection::open(path.to_str().unwrap()).unwrap();
+        conn.execute("CREATE TABLE people (id INTEGER, name TEXT, age INTEGER);")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO people VALUES (1, 'alice', 30), (2, 'bob', 16), (3, 'cara', 22);",
+        )
+        .unwrap();
+        conn.execute("PRAGMA fsqlite.parity_cert_strict = ON;")
+            .unwrap();
+
+        let rows = conn
+            .query(
+                "SELECT p.name, adults.age \
+                 FROM people AS p \
+                 JOIN (SELECT id, age FROM people WHERE age >= 18) AS adults \
+                   ON adults.id = p.id \
+                 ORDER BY p.id;",
+            )
+            .unwrap();
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0].values(),
+            vec![
+                SqliteValue::Text("alice".to_owned()),
+                SqliteValue::Integer(30),
+            ]
+            .as_slice()
+        );
+        assert_eq!(
+            rows[1].values(),
+            vec![
+                SqliteValue::Text("cara".to_owned()),
+                SqliteValue::Integer(22),
+            ]
+            .as_slice()
+        );
+    }
+
+    #[test]
+    fn test_zjisk1_strict_mode_binds_params_inside_file_backed_derived_join() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("strict_derived_params.db");
+        let conn = Connection::open(path.to_str().unwrap()).unwrap();
+        conn.execute("CREATE TABLE people (id INTEGER, name TEXT, age INTEGER);")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO people VALUES (1, 'alice', 30), (2, 'bob', 16), (3, 'cara', 22);",
+        )
+        .unwrap();
+        conn.execute("PRAGMA fsqlite.parity_cert_strict = ON;")
+            .unwrap();
+
+        let rows = conn
+            .query_with_params(
+                "SELECT p.name, adults.age \
+                 FROM people AS p \
+                 JOIN (SELECT id, age FROM people WHERE age >= ?) AS adults \
+                   ON adults.id = p.id \
+                 ORDER BY p.id;",
+                &[SqliteValue::Integer(21)],
+            )
+            .unwrap();
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0].values(),
+            vec![
+                SqliteValue::Text("alice".to_owned()),
+                SqliteValue::Integer(30),
+            ]
+            .as_slice()
+        );
+        assert_eq!(
+            rows[1].values(),
+            vec![
+                SqliteValue::Text("cara".to_owned()),
+                SqliteValue::Integer(22),
+            ]
+            .as_slice()
+        );
+    }
+
+    #[test]
+    fn test_zjisk1_strict_mode_still_rejects_file_backed_aggregate_derived_dispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("strict_derived_aggregate.db");
+        let conn = Connection::open(path.to_str().unwrap()).unwrap();
+        conn.execute("CREATE TABLE orders (customer TEXT, amount INTEGER);")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO orders VALUES ('alice', 10), ('alice', 20), ('bob', 5), ('cara', 9);",
+        )
+        .unwrap();
+        conn.execute("PRAGMA fsqlite.parity_cert_strict = ON;")
+            .unwrap();
+
+        let err = conn
+            .query(
+                "SELECT * \
+                 FROM (SELECT customer, COUNT(*) AS cnt FROM orders GROUP BY customer) sub \
+                 WHERE cnt > 1 \
+                 ORDER BY customer;",
+            )
+            .expect_err("aggregate derived table should still require fallback");
+        assert!(
+            err.to_string()
+                .contains("in-memory fallback disabled in strict parity-cert mode"),
+            "unexpected strict fallback error: {err}"
+        );
     }
 
     #[test]
@@ -71525,6 +72289,47 @@ mod pager_routing_tests {
             }
             panic!("{} window value function mismatches", mismatches.len());
         }
+    }
+
+    #[test]
+    fn test_window_exclude_frame_preserved_through_fallback_rewrite() {
+        let conn = Connection::open(":memory:").unwrap();
+        let sql = "SELECT SUM(val) OVER (PARTITION BY grp ORDER BY val ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE CURRENT ROW) AS excl_current FROM wex";
+
+        let statement = super::parse_single_statement(sql).unwrap();
+        let Statement::Select(select) = statement else {
+            panic!("expected SELECT statement");
+        };
+
+        let rewritten = conn.rewrite_in_subqueries_select(&select, None).unwrap();
+        let bound = super::bind_placeholders_in_select_for_fallback(&rewritten, None).unwrap();
+        let fsqlite_ast::SelectCore::Select { columns, .. } = &bound.body.select else {
+            panic!("expected SELECT core");
+        };
+        let fsqlite_ast::ResultColumn::Expr { expr, .. } = &columns[0] else {
+            panic!("expected expression column");
+        };
+        let fsqlite_ast::Expr::FunctionCall {
+            over: Some(window_spec),
+            ..
+        } = expr
+        else {
+            panic!("expected window function column");
+        };
+        let frame = window_spec
+            .frame
+            .as_ref()
+            .expect("window frame should exist");
+
+        assert!(matches!(
+            frame.start,
+            fsqlite_ast::FrameBound::UnboundedPreceding
+        ));
+        assert!(matches!(
+            frame.end,
+            Some(fsqlite_ast::FrameBound::UnboundedFollowing)
+        ));
+        assert_eq!(frame.exclude, Some(fsqlite_ast::FrameExclude::CurrentRow));
     }
 
     /// Conformance oracle: PARTITION BY with window functions.

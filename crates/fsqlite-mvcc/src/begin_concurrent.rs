@@ -454,7 +454,7 @@ impl ConcurrentRegistry {
 
     /// Prune committed SSI history that cannot overlap any active transaction.
     fn prune_committed_conflict_history(&mut self) {
-        let Some(min_active_begin) = self.gc_horizon() else {
+        let Some(min_active_begin) = self.history_retention_horizon() else {
             self.committed_readers.clear();
             self.committed_writers.clear();
             return;
@@ -491,8 +491,11 @@ impl ConcurrentRegistry {
                     handle.set_marked_for_abort(true);
                 }
 
-                // Recompute horizon and prune again now that the oldest is marked for abort
-                let new_horizon = self.gc_horizon().unwrap_or(CommitSeq::new(u64::MAX));
+                // Recompute the retained-history horizon and prune again now
+                // that the oldest transaction is doomed to abort.
+                let new_horizon = self
+                    .history_retention_horizon()
+                    .unwrap_or(CommitSeq::new(u64::MAX));
                 self.committed_readers
                     .retain(|reader| reader.commit_seq > new_horizon);
                 self.committed_writers
@@ -519,6 +522,22 @@ impl ConcurrentRegistry {
     /// except the latest).
     #[must_use]
     pub fn gc_horizon(&self) -> Option<CommitSeq> {
+        self.active
+            .values()
+            .filter(|h| h.is_active())
+            .map(|h| h.snapshot.high)
+            .min()
+    }
+
+    /// Compute the retention horizon for committed SSI history.
+    ///
+    /// Unlike page-version GC, committed conflict history only needs to be
+    /// retained for active transactions that may still commit. Transactions
+    /// already marked for abort still pin MVCC visibility, but they are
+    /// excluded here so history can be bounded once they are guaranteed to
+    /// fail at commit time.
+    #[must_use]
+    fn history_retention_horizon(&self) -> Option<CommitSeq> {
         self.active
             .values()
             .filter(|h| h.is_active() && !h.is_marked_for_abort())
@@ -1282,7 +1301,9 @@ pub const fn is_concurrent_mode(mode: TransactionMode) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use fsqlite_types::{CommitSeq, PageData, PageNumber, PageSize, SchemaEpoch, Snapshot};
+    use fsqlite_types::{
+        CommitSeq, PageData, PageNumber, PageSize, SchemaEpoch, Snapshot, WitnessKey,
+    };
 
     use crate::core_types::{CommitIndex, InProcessPageLockTable};
     use crate::lifecycle::MvccError;
@@ -1651,6 +1672,46 @@ mod tests {
         let removed = registry.remove(s1);
         assert!(removed.is_some());
         assert_eq!(registry.active_count(), 0);
+    }
+
+    #[test]
+    fn test_marked_for_abort_txn_still_pins_gc_but_not_history_retention() {
+        let mut registry = ConcurrentRegistry::new();
+        let doomed = registry
+            .begin_concurrent(test_snapshot(10))
+            .expect("doomed session");
+        let survivor = registry
+            .begin_concurrent(test_snapshot(20))
+            .expect("survivor session");
+
+        registry
+            .get_mut(doomed)
+            .expect("doomed handle")
+            .set_marked_for_abort(true);
+        registry.committed_readers.push(crate::ssi_validation::CommittedReaderInfo {
+            token: registry.get(survivor).expect("survivor handle").txn_token(),
+            begin_seq: CommitSeq::new(20),
+            commit_seq: CommitSeq::new(15),
+            had_in_rw: false,
+            keys: vec![WitnessKey::Page(test_page(7))],
+        });
+
+        assert_eq!(
+            registry.gc_horizon(),
+            Some(CommitSeq::new(10)),
+            "marked-for-abort transactions remain active until they actually abort"
+        );
+        assert_eq!(
+            registry.history_retention_horizon(),
+            Some(CommitSeq::new(20)),
+            "committed SSI history may ignore transactions already doomed to abort"
+        );
+
+        registry.prune_committed_conflict_history();
+        assert!(
+            registry.committed_readers.is_empty(),
+            "history older than the surviving retention horizon should be pruned"
+        );
     }
 
     #[test]

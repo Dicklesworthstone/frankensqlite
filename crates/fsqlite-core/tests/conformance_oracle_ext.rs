@@ -20604,6 +20604,35 @@ fn test_conformance_window_range_offset_partition_s221() {
 }
 
 #[test]
+fn test_conformance_window_exclude_semantics_s221b() {
+    let fconn = Connection::open(":memory:").unwrap();
+    let rconn = rusqlite::Connection::open_in_memory().unwrap();
+
+    for s in &[
+        "CREATE TABLE wex221b(id INTEGER PRIMARY KEY, grp TEXT, val INTEGER)",
+        "INSERT INTO wex221b VALUES(1,'A',10),(2,'A',10),(3,'A',20),(4,'A',30),(5,'B',10),(6,'B',10),(7,'B',20)",
+    ] {
+        fconn.execute(s).unwrap();
+        rconn.execute_batch(s).unwrap();
+    }
+
+    let queries = [
+        "SELECT id, grp, val, SUM(val) OVER (PARTITION BY grp ORDER BY val ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE CURRENT ROW) AS excl_current FROM wex221b ORDER BY id",
+        "SELECT id, grp, val, SUM(val) OVER (PARTITION BY grp ORDER BY val RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW EXCLUDE TIES) AS excl_ties FROM wex221b ORDER BY id",
+        "SELECT id, grp, val, SUM(val) OVER (PARTITION BY grp ORDER BY val GROUPS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW EXCLUDE GROUP) AS excl_group FROM wex221b ORDER BY id",
+        "SELECT id, grp, val, FIRST_VALUE(val) OVER (PARTITION BY grp ORDER BY val ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING EXCLUDE CURRENT ROW) AS first_after_current FROM wex221b ORDER BY id",
+    ];
+
+    let mismatches = oracle_compare(&fconn, &rconn, &queries);
+    if !mismatches.is_empty() {
+        for m in &mismatches {
+            eprintln!("{m}\n");
+        }
+        panic!("{} window EXCLUDE mismatches", mismatches.len());
+    }
+}
+
+#[test]
 fn test_conformance_cte_multiple_references_s222() {
     let fconn = Connection::open(":memory:").unwrap();
     let rconn = rusqlite::Connection::open_in_memory().unwrap();

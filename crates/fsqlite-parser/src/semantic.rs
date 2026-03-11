@@ -102,13 +102,18 @@ impl TableDef {
         if self.without_rowid {
             return false;
         }
-        let lower = name.to_ascii_lowercase();
-        matches!(lower.as_str(), "rowid" | "_rowid_" | "oid")
-            || self
-                .columns
-                .iter()
-                .any(|c| c.is_ipk && c.name.eq_ignore_ascii_case(name))
+        if let Some(column) = self.find_column(name) {
+            return column.is_ipk;
+        }
+        is_hidden_rowid_alias_name(name)
     }
+}
+
+fn is_hidden_rowid_alias_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "rowid" | "_rowid_" | "oid"
+    )
 }
 
 /// The database schema: a collection of table definitions.
@@ -1582,6 +1587,42 @@ mod tests {
         assert!(users.is_rowid_alias("oid"));
         assert!(users.is_rowid_alias("id")); // IPK
         assert!(!users.is_rowid_alias("name"));
+    }
+
+    #[test]
+    fn test_table_rowid_alias_respects_shadowing() {
+        let mut schema = Schema::new();
+        schema.add_table(TableDef {
+            name: "shadowed".to_owned(),
+            columns: vec![
+                ColumnDef {
+                    name: "rowid".to_owned(),
+                    affinity: TypeAffinity::Text,
+                    is_ipk: false,
+                    not_null: false,
+                },
+                ColumnDef {
+                    name: "_rowid_".to_owned(),
+                    affinity: TypeAffinity::Text,
+                    is_ipk: false,
+                    not_null: false,
+                },
+                ColumnDef {
+                    name: "id".to_owned(),
+                    affinity: TypeAffinity::Integer,
+                    is_ipk: true,
+                    not_null: false,
+                },
+            ],
+            without_rowid: false,
+            strict: false,
+        });
+
+        let shadowed = schema.find_table("shadowed").unwrap();
+        assert!(!shadowed.is_rowid_alias("rowid"));
+        assert!(!shadowed.is_rowid_alias("_rowid_"));
+        assert!(shadowed.is_rowid_alias("oid"));
+        assert!(shadowed.is_rowid_alias("id"));
     }
 
     // ── Scope tests ──

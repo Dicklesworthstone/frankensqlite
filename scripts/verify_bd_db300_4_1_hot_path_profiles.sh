@@ -445,6 +445,15 @@ build_actionable_ranking() {
                     scenario_id: $run.scenario_id
                 }
             ];
+        def cost_component_entries:
+            [ .[] as $run
+              | $run.actionable_ranking.cost_components[]
+              | . + {
+                    fixture_id: $run.fixture_id,
+                    mode_id: $run.mode_id,
+                    scenario_id: $run.scenario_id
+                }
+            ];
         def opcode_entries:
             [ .[] as $run
               | $run.profile.opcode_profile[]
@@ -518,6 +527,44 @@ build_actionable_ranking() {
                 | to_entries
                 | map(.value + { rank: (.key + 1) })
             ),
+            cost_components: (
+                cost_component_entries
+                | sort_by(.component)
+                | group_by(.component)
+                | map({
+                    component: .[0].component,
+                    avg_time_ns: ((map(.time_ns) | add) / length),
+                    max_time_ns: (map(.time_ns) | max),
+                    avg_time_share_basis_points: ((map(.time_share_basis_points) | add) / length),
+                    avg_allocator_pressure_bytes: ((map(.allocator_pressure_bytes) | add) / length),
+                    max_allocator_pressure_bytes: (map(.allocator_pressure_bytes) | max),
+                    avg_allocator_share_basis_points: ((map(.allocator_share_basis_points) | add) / length),
+                    max_allocator_share_basis_points: (map(.allocator_share_basis_points) | max),
+                    max_activity_count: (map(.activity_count) | max),
+                    run_breakdown: (
+                        map({
+                            fixture_id,
+                            mode_id,
+                            scenario_id,
+                            rank,
+                            time_ns,
+                            time_share_basis_points,
+                            allocator_pressure_bytes,
+                            allocator_share_basis_points,
+                            activity_count,
+                            rationale,
+                            implication,
+                            mapped_beads
+                        })
+                        | sort_by([.time_ns, .allocator_pressure_bytes])
+                        | reverse
+                    )
+                })
+                | sort_by([.avg_time_ns, .avg_allocator_pressure_bytes])
+                | reverse
+                | to_entries
+                | map(.value + { rank: (.key + 1) })
+            ),
             top_opcodes: (
                 opcode_entries
                 | sort_by(.opcode)
@@ -583,6 +630,15 @@ build_summary_md() {
         | .[]
     ' "${ACTIONABLE_RANKING_JSON}")"
 
+    local cost_component_summary
+    cost_component_summary="$(jq -r '
+        .cost_components[:3]
+        | map(
+            "- rank \(.rank): `\(.component)` avg_time_ns=\(.avg_time_ns) avg_time_share_bps=\(.avg_time_share_basis_points) avg_allocator_pressure_bytes=\(.avg_allocator_pressure_bytes) avg_allocator_share_bps=\(.avg_allocator_share_basis_points) max_activity_count=\(.max_activity_count) -> \(.run_breakdown[0].implication)"
+          )
+        | .[]
+    ' "${ACTIONABLE_RANKING_JSON}")"
+
     local opcode_summary
     opcode_summary="$(jq -r '
         .top_opcodes[:8]
@@ -610,6 +666,10 @@ ${run_summary}
 ## Ranked Hotspots
 
 ${hotspot_summary}
+
+## Quantified Cost Components
+
+${cost_component_summary}
 
 ## Allocator Pressure
 
@@ -740,6 +800,7 @@ build_report_json
 
 jq -e '.runs | length >= 1' "${SCENARIO_PROFILES_JSON}" >/dev/null
 jq -e '.named_hotspots | length >= 1' "${ACTIONABLE_RANKING_JSON}" >/dev/null
+jq -e '.cost_components | length >= 1' "${ACTIONABLE_RANKING_JSON}" >/dev/null
 jq -e '.allocator_pressure | length >= 1' "${ACTIONABLE_RANKING_JSON}" >/dev/null
 jq -e '.runs | length == '"${expected_runs}" "${BENCHMARK_CONTEXT_JSON}" >/dev/null
 

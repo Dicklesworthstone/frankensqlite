@@ -303,6 +303,10 @@ impl TableSchema {
                 .collect(),
         )
     }
+
+    fn resolves_to_hidden_rowid(&self, name: &str) -> bool {
+        self.column_index(name).is_none() && is_hidden_rowid_alias_name(name)
+    }
 }
 
 fn strict_type_code(strict_type: Option<StrictColumnType>) -> char {
@@ -4818,7 +4822,7 @@ pub fn codegen_insert(
                     let mut explicit_rowid = None;
                     for (val_pos, col_name) in stmt.columns.iter().enumerate() {
                         if let Some(expr) = row.get(val_pos) {
-                            if is_rowid_alias(col_name) {
+                            if table.resolves_to_hidden_rowid(col_name) {
                                 explicit_rowid = Some(expr.clone());
                             } else {
                                 let tbl_pos = table.column_index(col_name).ok_or_else(|| {
@@ -4857,7 +4861,7 @@ pub fn codegen_insert(
             } else {
                 let mut mapping = vec![None; table.columns.len()];
                 for (select_pos, col_name) in stmt.columns.iter().enumerate() {
-                    if is_rowid_alias(col_name) {
+                    if table.resolves_to_hidden_rowid(col_name) {
                         // rowid aliases handled separately via IPK logic.
                         continue;
                     }
@@ -6223,15 +6227,15 @@ fn emit_column_from_cursor(
     table: &TableSchema,
     reg: i32,
 ) {
-    if is_rowid_alias(col_name) {
-        b.emit_op(Opcode::Rowid, cursor, reg, 0, P4::None, 0);
-    } else if let Some(col_idx) = table.column_index(col_name) {
+    if let Some(col_idx) = table.column_index(col_name) {
         if table.columns[col_idx].is_ipk {
             b.emit_op(Opcode::Rowid, cursor, reg, 0, P4::None, 0);
         } else {
             #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
             b.emit_op(Opcode::Column, cursor, col_idx as i32, reg, P4::None, 0);
         }
+    } else if table.resolves_to_hidden_rowid(col_name) {
+        b.emit_op(Opcode::Rowid, cursor, reg, 0, P4::None, 0);
     } else {
         b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
     }
@@ -7254,20 +7258,19 @@ fn emit_column_reads(
                             return Err(CodegenError::TableNotFound(qualifier.clone()));
                         }
                     }
-                    if is_rowid_alias(&col_ref.column) {
-                        b.emit_op(Opcode::Rowid, cursor, reg, 0, P4::None, 0);
-                    } else {
-                        let col_idx = table.column_index(&col_ref.column).ok_or_else(|| {
-                            CodegenError::ColumnNotFound {
-                                table: table.name.clone(),
-                                column: col_ref.column.clone(),
-                            }
-                        })?;
+                    if let Some(col_idx) = table.column_index(&col_ref.column) {
                         if table.columns[col_idx].is_ipk {
                             b.emit_op(Opcode::Rowid, cursor, reg, 0, P4::None, 0);
                         } else {
                             b.emit_op(Opcode::Column, cursor, col_idx as i32, reg, P4::None, 0);
                         }
+                    } else if table.resolves_to_hidden_rowid(&col_ref.column) {
+                        b.emit_op(Opcode::Rowid, cursor, reg, 0, P4::None, 0);
+                    } else {
+                        return Err(CodegenError::ColumnNotFound {
+                            table: table.name.clone(),
+                            column: col_ref.column.clone(),
+                        });
                     }
                 } else {
                     // Evaluate non-column expressions (literals, arithmetic, CASE, CAST, etc.)
@@ -7825,8 +7828,8 @@ fn comparison_affinity_p5_resolved(
     0
 }
 
-/// Check whether a column name is a rowid alias (`rowid`, `_rowid_`, or `oid`).
-fn is_rowid_alias(name: &str) -> bool {
+/// Check whether a column name is a hidden rowid alias (`rowid`, `_rowid_`, or `oid`).
+fn is_hidden_rowid_alias_name(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     lower == "rowid" || lower == "_rowid_" || lower == "oid"
 }
@@ -7918,7 +7921,7 @@ fn resolve_sort_key(
         if let Some(idx) = table.column_index(&col_ref.column) {
             return SortKeySource::Column(idx);
         }
-        if is_rowid_alias(&col_ref.column) {
+        if table.resolves_to_hidden_rowid(&col_ref.column) {
             return SortKeySource::Rowid;
         }
         // Check if the unqualified name matches a result column alias
@@ -7970,7 +7973,7 @@ fn resolve_column_ref(
             }
             return Some(SortKeySource::Column(idx));
         }
-        if is_rowid_alias(&col_ref.column) {
+        if table.resolves_to_hidden_rowid(&col_ref.column) {
             return Some(SortKeySource::Rowid);
         }
     }
@@ -8090,7 +8093,7 @@ fn resolve_order_by_index_plan(
         {
             return None;
         }
-        if is_rowid_alias(&col_ref.column) {
+        if table.resolves_to_hidden_rowid(&col_ref.column) {
             return None;
         }
         order_columns.push(col_ref.column.clone());
@@ -8260,16 +8263,13 @@ fn is_rowid_expr(expr: &Expr, table: Option<&TableSchema>) -> bool {
 }
 
 fn is_rowid_ref(col_ref: &ColumnRef, table: Option<&TableSchema>) -> bool {
-    let name = col_ref.column.to_ascii_lowercase();
-    if name == "rowid" || name == "_rowid_" || name == "oid" {
-        return true;
-    }
     if let Some(t) = table {
         if let Some(col_idx) = t.column_index(&col_ref.column) {
             return t.columns[col_idx].is_ipk;
         }
+        return t.resolves_to_hidden_rowid(&col_ref.column);
     }
-    false
+    is_hidden_rowid_alias_name(&col_ref.column)
 }
 
 /// Extract a bind parameter index from a `?` or `?NNN` placeholder.
@@ -9289,8 +9289,6 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
                 } else {
                     b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
                 }
-            } else if is_rowid_alias(&col_ref.column) {
-                b.emit_op(Opcode::Rowid, sc.cursor, reg, 0, P4::None, 0);
             } else if let Some(col_idx) = sc.table.column_index(&col_ref.column) {
                 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
                 if sc.table.columns[col_idx].is_ipk {
@@ -9298,6 +9296,8 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
                 } else {
                     b.emit_op(Opcode::Column, sc.cursor, col_idx as i32, reg, P4::None, 0);
                 }
+            } else if sc.table.resolves_to_hidden_rowid(&col_ref.column) {
+                b.emit_op(Opcode::Rowid, sc.cursor, reg, 0, P4::None, 0);
             } else if let Some(sec) = &sc.secondary {
                 // Unqualified column not found in primary — try secondary.
                 emit_column_from_cursor(b, &col_ref.column, sec.cursor, sec.table, reg);
@@ -10911,6 +10911,21 @@ mod tests {
         }]
     }
 
+    fn schema_with_visible_rowid_column() -> Vec<TableSchema> {
+        vec![TableSchema {
+            name: "t".to_owned(),
+            root_page: 2,
+            columns: vec![
+                ColumnInfo::basic("rowid", 'C', false),
+                ColumnInfo::basic("b", 'C', false),
+            ],
+            indexes: vec![],
+            strict: false,
+            foreign_keys: Vec::new(),
+            check_constraints: Vec::new(),
+        }]
+    }
+
     // === Test 1: SELECT by rowid ===
     #[test]
     fn test_codegen_select_by_rowid() {
@@ -10961,6 +10976,46 @@ mod tests {
         assert!(
             !ops.contains(&Opcode::Column),
             "single IPK projection should not read record columns"
+        );
+    }
+
+    #[test]
+    fn test_codegen_select_shadowed_rowid_column_uses_column_opcode() {
+        let stmt = simple_select(&["rowid"], "t", None);
+        let schema = schema_with_visible_rowid_column();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+        let ops = opcode_sequence(&prog);
+
+        assert!(
+            ops.contains(&Opcode::Column),
+            "shadowed rowid column should read from the record payload"
+        );
+        assert!(
+            !ops.contains(&Opcode::Rowid),
+            "shadowed rowid column must not be compiled as hidden rowid access"
+        );
+    }
+
+    #[test]
+    fn test_codegen_select_hidden_rowid_alias_when_rowid_is_shadowed() {
+        let stmt = simple_select(&["_rowid_"], "t", None);
+        let schema = schema_with_visible_rowid_column();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+        let ops = opcode_sequence(&prog);
+
+        assert!(
+            ops.contains(&Opcode::Rowid),
+            "unshadowed hidden alias should still use OP_Rowid"
+        );
+        assert!(
+            !ops.contains(&Opcode::Column),
+            "hidden rowid alias should not read the visible shadowing column"
         );
     }
 
@@ -14961,6 +15016,35 @@ mod tests {
         assert!(
             !ops.contains(&Opcode::IsNull),
             "non-IPK INSERT should NOT emit IsNull routing"
+        );
+    }
+
+    #[test]
+    fn test_codegen_insert_visible_rowid_column_does_not_use_explicit_rowid_path() {
+        let stmt = InsertStatement {
+            with: None,
+            or_conflict: None,
+            table: QualifiedName::bare("t"),
+            alias: None,
+            columns: vec!["rowid".to_owned(), "b".to_owned()],
+            source: InsertSource::Values(vec![vec![placeholder(1), placeholder(2)]]),
+            upsert: vec![],
+            returning: vec![],
+        };
+        let schema = schema_with_visible_rowid_column();
+        let ctx = CodegenContext::default();
+        let mut b = ProgramBuilder::new();
+        codegen_insert(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+        let ops = opcode_sequence(&prog);
+
+        assert!(
+            ops.contains(&Opcode::NewRowid),
+            "shadowed rowid column should still auto-generate the hidden rowid"
+        );
+        assert!(
+            !ops.contains(&Opcode::IsNull),
+            "visible rowid column must not be routed through the explicit hidden-rowid path"
         );
     }
 

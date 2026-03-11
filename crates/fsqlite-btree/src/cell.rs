@@ -303,9 +303,9 @@ pub fn write_cell_pointers(
 #[must_use]
 pub const fn max_local_payload(usable_size: u32, page_type: BtreePageType) -> u32 {
     if page_type.is_table() && page_type.is_leaf() {
-        usable_size - 35
+        usable_size.saturating_sub(35)
     } else {
-        (usable_size - 12) * 64 / 255 - 23
+        (usable_size.saturating_sub(12) * 64 / 255).saturating_sub(23)
     }
 }
 
@@ -316,7 +316,7 @@ pub const fn max_local_payload(usable_size: u32, page_type: BtreePageType) -> u3
 /// This is the same for all page types.
 #[must_use]
 pub const fn min_local_payload(usable_size: u32) -> u32 {
-    (usable_size - 12) * 32 / 255 - 23
+    (usable_size.saturating_sub(12) * 32 / 255).saturating_sub(23)
 }
 
 /// Compute the actual local payload size for a cell.

@@ -21,6 +21,12 @@ FILE_BACKED_LOG="${ARTIFACT_DIR}/file_backed_visibility.log"
 CHECKPOINT_LOG="${ARTIFACT_DIR}/checkpoint_gate.log"
 BENCHMARK_LOG="${ARTIFACT_DIR}/publish_window_benchmark.log"
 BENCHMARK_JSON="${ARTIFACT_DIR}/publish_window_benchmark.json"
+SOURCE_SNAPSHOT_JSON="${ARTIFACT_DIR}/source_snapshot.json"
+WATCHED_SOURCE_PATHS=(
+  "${WORKSPACE_ROOT}/crates/fsqlite-pager/src/pager.rs"
+  "${WORKSPACE_ROOT}/crates/fsqlite-core/src/connection.rs"
+  "${WORKSPACE_ROOT}/scripts/verify_t6_7_pager_deserialization.sh"
+)
 
 mkdir -p "${ARTIFACT_DIR}"
 : > "${EVENTS_JSONL}"
@@ -28,6 +34,76 @@ mkdir -p "${ARTIFACT_DIR}"
 export NO_COLOR="${NO_COLOR:-1}"
 export RUST_TEST_THREADS="${RUST_TEST_THREADS:-1}"
 export RUST_LOG="${RUST_LOG:-fsqlite.snapshot_publication=trace}"
+
+capture_source_snapshot() {
+  local output="$1"
+  local entries=()
+  local path rel_path sha256 mtime_epoch mtime_iso
+  for path in "${WATCHED_SOURCE_PATHS[@]}"; do
+    if [[ ! -f "${path}" ]]; then
+      echo "[GATE FAIL] watched source path missing: ${path}" >&2
+      return 1
+    fi
+
+    rel_path="${path#${WORKSPACE_ROOT}/}"
+    sha256="$(sha256sum "${path}" | awk '{print $1}')"
+    mtime_epoch="$(stat -c '%Y' "${path}")"
+    mtime_iso="$(date -u -d "@${mtime_epoch}" +%Y-%m-%dT%H:%M:%SZ)"
+    entries+=("$(
+      jq -cn \
+        --arg path "${rel_path}" \
+        --arg sha256 "${sha256}" \
+        --arg mtime_iso "${mtime_iso}" \
+        --argjson mtime_epoch "${mtime_epoch}" \
+        '{
+          path: $path,
+          sha256: $sha256,
+          mtime_epoch: $mtime_epoch,
+          mtime_iso: $mtime_iso
+        }'
+    )")
+  done
+
+  printf '%s\n' "${entries[@]}" | jq -s '.' > "${output}"
+}
+
+write_source_drift_report() {
+  local before_snapshot="$1"
+  local after_snapshot="$2"
+  local phase="$3"
+  local output="$4"
+
+  jq -n \
+    --arg phase "${phase}" \
+    --slurpfile before "${before_snapshot}" \
+    --slurpfile after "${after_snapshot}" \
+    '
+    def as_map($rows):
+      reduce $rows[] as $row ({}; .[$row.path] = $row);
+
+    ($before[0] // []) as $before_rows
+    | ($after[0] // []) as $after_rows
+    | (as_map($before_rows)) as $before_map
+    | (as_map($after_rows)) as $after_map
+    | {
+        phase: $phase,
+        changed_files: (
+          ($before_rows + $after_rows)
+          | map(.path)
+          | unique
+          | map(
+              . as $path
+              | {
+                  path: $path,
+                  before: ($before_map[$path] // null),
+                  after: ($after_map[$path] // null)
+                }
+              | select(.before != .after)
+            )
+        )
+      }
+    ' > "${output}"
+}
 
 assert_log_contains() {
   local logfile="$1"
@@ -88,6 +164,17 @@ run_phase() {
   local logfile="$2"
   shift 2
 
+  local phase_snapshot_before="${ARTIFACT_DIR}/${phase}_source_snapshot_before.json"
+  local phase_snapshot_after="${ARTIFACT_DIR}/${phase}_source_snapshot_after.json"
+  local drift_report="${ARTIFACT_DIR}/${phase}_source_drift.json"
+  capture_source_snapshot "${phase_snapshot_before}"
+  if ! cmp -s "${SOURCE_SNAPSHOT_JSON}" "${phase_snapshot_before}"; then
+    write_source_drift_report "${SOURCE_SNAPSHOT_JSON}" "${phase_snapshot_before}" "${phase}" "${drift_report}"
+    emit_event "${phase}" "fail" "fail" 0 "watched source changed before phase start: ${drift_report}"
+    echo "[GATE FAIL] ${phase}: watched source changed before phase start; see ${drift_report}" >&2
+    return 1
+  fi
+
   emit_event "${phase}" "start" "running" 0 "running: $*"
   local started
   started="$(date +%s%3N)"
@@ -99,6 +186,13 @@ run_phase() {
     local finished elapsed
     finished="$(date +%s%3N)"
     elapsed="$((finished - started))"
+    capture_source_snapshot "${phase_snapshot_after}"
+    if ! cmp -s "${phase_snapshot_before}" "${phase_snapshot_after}"; then
+      write_source_drift_report "${phase_snapshot_before}" "${phase_snapshot_after}" "${phase}" "${drift_report}"
+      emit_event "${phase}" "fail" "fail" "${elapsed}" "watched source changed while phase was running: ${drift_report}"
+      echo "[GATE FAIL] ${phase}: watched source changed while phase was running; see ${drift_report}" >&2
+      return 1
+    fi
     if ! grep -Eq '^running [1-9][0-9]* tests?$' "${logfile}"; then
       emit_event "${phase}" "fail" "fail" "${elapsed}" "command completed without executing tests: $*"
       echo "[GATE FAIL] ${phase}: no tests executed" >&2
@@ -109,6 +203,12 @@ run_phase() {
     local finished elapsed
     finished="$(date +%s%3N)"
     elapsed="$((finished - started))"
+    if capture_source_snapshot "${phase_snapshot_after}" && ! cmp -s "${phase_snapshot_before}" "${phase_snapshot_after}"; then
+      write_source_drift_report "${phase_snapshot_before}" "${phase_snapshot_after}" "${phase}" "${drift_report}"
+      emit_event "${phase}" "fail" "fail" "${elapsed}" "watched source changed while phase was running: ${drift_report}"
+      echo "[GATE FAIL] ${phase}: watched source changed while phase was running; see ${drift_report}" >&2
+      return 1
+    fi
     emit_event "${phase}" "fail" "fail" "${elapsed}" "failed: $*"
     return 1
   fi
@@ -134,6 +234,8 @@ echo "seed=${SEED}"
 echo "artifacts=${ARTIFACT_DIR}"
 
 emit_event "bootstrap" "start" "running" 0 "verification started"
+capture_source_snapshot "${SOURCE_SNAPSHOT_JSON}"
+emit_event "bootstrap" "pass" "pass" 0 "captured watched source snapshot: ${SOURCE_SNAPSHOT_JSON}"
 
 run_phase \
   "published_read_path" \
@@ -156,12 +258,12 @@ assert_publication_trace_contract \
 run_phase \
   "checkpoint_gate" \
   "${CHECKPOINT_LOG}" \
-  rch exec -- env CARGO_TARGET_DIR="/tmp/${RUN_ID_SAFE}_pager_checkpoint" cargo test -p fsqlite-pager test_checkpoint_busy_with_active_writer -- --exact --nocapture
+  rch exec -- env CARGO_TARGET_DIR="/tmp/${RUN_ID_SAFE}_pager_checkpoint" cargo test -p fsqlite-pager pager::tests::test_checkpoint_busy_with_active_writer -- --exact --nocapture
 
 run_phase \
   "publish_window_benchmark" \
   "${BENCHMARK_LOG}" \
-  rch exec -- env CARGO_TERM_COLOR=never CARGO_TARGET_DIR="/tmp/${RUN_ID_SAFE}_pager_publish_window" cargo test -p fsqlite-pager wal_publish_window_shrink_benchmark_report -- --ignored --nocapture --test-threads=1
+  rch exec -- env CARGO_TERM_COLOR=never CARGO_TARGET_DIR="/tmp/${RUN_ID_SAFE}_pager_publish_window" cargo test -p fsqlite-pager pager::tests::wal_publish_window_shrink_benchmark_report -- --ignored --exact --nocapture --test-threads=1
 extract_benchmark_report
 
 jq -e '
@@ -233,7 +335,9 @@ jq -n \
   --arg checkpoint_log "${CHECKPOINT_LOG}" \
   --arg benchmark_log "${BENCHMARK_LOG}" \
   --arg benchmark_json "${BENCHMARK_JSON}" \
+  --arg source_snapshot_json "${SOURCE_SNAPSHOT_JSON}" \
   --slurpfile benchmark "${BENCHMARK_JSON}" \
+  --slurpfile source_snapshot "${SOURCE_SNAPSHOT_JSON}" \
   '
   {
     bead_id: $bead_id,
@@ -251,8 +355,10 @@ jq -n \
       file_backed_log: $file_backed_log,
       checkpoint_log: $checkpoint_log,
       benchmark_log: $benchmark_log,
-      benchmark_json: $benchmark_json
+      benchmark_json: $benchmark_json,
+      source_snapshot_json: $source_snapshot_json
     },
+    watched_source_snapshot: $source_snapshot[0],
     acceptance: {
       published_read_trace_contract: true,
       file_backed_visibility_trace_contract: true,
@@ -276,11 +382,13 @@ jq -n \
   echo "- publish-window benchmark log: \`${BENCHMARK_LOG}\`"
   echo "- publish-window benchmark JSON: \`${BENCHMARK_JSON}\`"
   echo "- report_json: \`${REPORT_JSON}\`"
+  echo "- watched source snapshot JSON: \`${SOURCE_SNAPSHOT_JSON}\`"
   echo
   echo "This gate combines three evidence layers:"
   echo "- published-read and snapshot-publication traces from `fsqlite-pager`"
   echo "- file-backed strict-visibility routing traces from `fsqlite-core`"
   echo "- explicit hold/wait metrics harvested from the existing deterministic publish-window benchmark"
+  echo "- a watched-source snapshot that invalidates the run if `pager.rs`, `connection.rs`, or this gate changes mid-flight"
   echo
   echo "| Scenario | Candidate Hold Median (ns) | Candidate Wait Median (ns) | Serialized Reason | Backend Identity |"
   echo "| --- | ---: | ---: | --- | --- |"
@@ -291,6 +399,12 @@ jq -n \
   echo
   echo "Checkpoint gate evidence:"
   echo "- `test_checkpoint_busy_with_active_writer` passed and the gate emitted a structured event with `serialized_reason=checkpoint_active_busy`"
+  echo
+  echo "Watched source snapshot:"
+  jq -r '
+    .watched_source_snapshot[]
+    | "- `\(.path)` sha256=`\(.sha256)` mtime=`\(.mtime_iso)`"
+  ' "${REPORT_JSON}"
 } > "${SUMMARY_MD}"
 
 emit_event "finalize" "pass" "pass" 0 "report written to ${REPORT_JSON}"

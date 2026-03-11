@@ -291,6 +291,20 @@ pub struct HotPathActionableRankingEntry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HotPathCostComponentEntry {
+    pub rank: u32,
+    pub component: String,
+    pub time_ns: u64,
+    pub time_share_basis_points: u32,
+    pub allocator_pressure_bytes: u64,
+    pub allocator_share_basis_points: u32,
+    pub activity_count: u64,
+    pub rationale: String,
+    pub implication: String,
+    pub mapped_beads: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HotPathAllocatorPressure {
     pub parser_sql_bytes: u64,
     pub decoded_value_heap_bytes_total: u64,
@@ -340,6 +354,7 @@ pub struct HotPathActionableRanking {
     pub concurrency: u16,
     pub replay_command: String,
     pub named_hotspots: Vec<HotPathActionableRankingEntry>,
+    pub cost_components: Vec<HotPathCostComponentEntry>,
     pub allocator_pressure: Vec<HotPathActionableRankingEntry>,
     pub top_opcodes: Vec<HotPathOpcodeProfileEntry>,
 }
@@ -742,6 +757,24 @@ pub fn render_hot_path_profile_markdown(report: &HotPathProfileReport) -> String
     }
     let _ = writeln!(out);
 
+    let _ = writeln!(out, "## Quantified Cost Components\n");
+    for entry in &actionable_ranking.cost_components {
+        let _ = writeln!(
+            out,
+            "- rank {} {}: time_ns={}, time_share_bps={}, allocator_pressure_bytes={}, allocator_share_bps={}, activity_count={} -> {} [{}]",
+            entry.rank,
+            entry.component,
+            entry.time_ns,
+            entry.time_share_basis_points,
+            entry.allocator_pressure_bytes,
+            entry.allocator_share_basis_points,
+            entry.activity_count,
+            entry.implication,
+            entry.mapped_beads.join(", ")
+        );
+    }
+    let _ = writeln!(out);
+
     let _ = writeln!(out, "## Allocator Pressure\n");
     for entry in &actionable_ranking.allocator_pressure {
         let _ = writeln!(
@@ -834,6 +867,37 @@ fn allocator_implication(subsystem: &str) -> (&'static str, &'static [&'static s
     }
 }
 
+fn cost_component_implication(component: &str) -> (&'static str, &'static [&'static str]) {
+    match component {
+        "parser_ast_churn" => (
+            "D2 target: parser and compile reuse still dominate this component enough to justify prepared-artifact work next.",
+            &["bd-db300.4.2", "bd-db300.4.2.1"],
+        ),
+        "record_decode" => (
+            "D3/D4 target: decode cost is large enough to justify scratch buffers and copy-reduction work.",
+            &["bd-db300.4.3", "bd-db300.4.4"],
+        ),
+        "row_materialization" => (
+            "D3 target: emitted-row cloning and transient value ownership remain a first-class hot-path cost.",
+            &["bd-db300.4.3", "bd-db300.4.3.1"],
+        ),
+        _ => (
+            "Secondary cost component after the named Track D follow-on buckets.",
+            &[],
+        ),
+    }
+}
+
+fn ratio_basis_points(value: u64, total: u64) -> u32 {
+    if total == 0 {
+        return 0;
+    }
+    let numerator = u128::from(value).saturating_mul(10_000);
+    let denominator = u128::from(total);
+    let rounded = numerator.saturating_add(denominator / 2) / denominator;
+    u32::try_from(rounded).unwrap_or(u32::MAX)
+}
+
 fn actionable_entry(
     rank: usize,
     entry: &HotPathRankingEntry,
@@ -849,6 +913,113 @@ fn actionable_entry(
         implication: implication.to_owned(),
         mapped_beads: mapped_beads.iter().map(|bead| (*bead).to_owned()).collect(),
     }
+}
+
+fn build_hot_path_cost_components(report: &HotPathProfileReport) -> Vec<HotPathCostComponentEntry> {
+    let parser_time_ns = report
+        .parser
+        .parse_time_ns
+        .saturating_add(report.parser.rewrite_time_ns)
+        .saturating_add(report.parser.compile_time_ns);
+    let parser_activity_count = report
+        .parser
+        .parse_single_calls
+        .saturating_add(report.parser.parse_multi_calls);
+    let record_decode_activity_count = report
+        .record_decode
+        .parse_record_calls
+        .saturating_add(report.record_decode.parse_record_into_calls)
+        .saturating_add(report.record_decode.parse_record_column_calls);
+    let total_time_ns = parser_time_ns
+        .saturating_add(report.record_decode.decode_time_ns)
+        .saturating_add(
+            report
+                .row_materialization
+                .result_row_materialization_time_ns_total,
+        );
+    let total_allocator_pressure_bytes = report
+        .allocator_pressure
+        .parser_sql_bytes
+        .saturating_add(report.allocator_pressure.decoded_value_heap_bytes_total)
+        .saturating_add(report.allocator_pressure.result_value_heap_bytes_total);
+
+    let mut entries = vec![
+        HotPathCostComponentEntry {
+            rank: 0,
+            component: "parser_ast_churn".to_owned(),
+            time_ns: parser_time_ns,
+            time_share_basis_points: ratio_basis_points(parser_time_ns, total_time_ns),
+            allocator_pressure_bytes: report.allocator_pressure.parser_sql_bytes,
+            allocator_share_basis_points: ratio_basis_points(
+                report.allocator_pressure.parser_sql_bytes,
+                total_allocator_pressure_bytes,
+            ),
+            activity_count: parser_activity_count,
+            rationale:
+                "parse, rewrite, and compile time plus parsed SQL bytes on the connection path"
+                    .to_owned(),
+            implication: String::new(),
+            mapped_beads: Vec::new(),
+        },
+        HotPathCostComponentEntry {
+            rank: 0,
+            component: "record_decode".to_owned(),
+            time_ns: report.record_decode.decode_time_ns,
+            time_share_basis_points: ratio_basis_points(
+                report.record_decode.decode_time_ns,
+                total_time_ns,
+            ),
+            allocator_pressure_bytes: report.record_decode.vdbe_decoded_value_heap_bytes_total,
+            allocator_share_basis_points: ratio_basis_points(
+                report.record_decode.vdbe_decoded_value_heap_bytes_total,
+                total_allocator_pressure_bytes,
+            ),
+            activity_count: record_decode_activity_count,
+            rationale: "record/column decode time paired with decoded-value heap pressure"
+                .to_owned(),
+            implication: String::new(),
+            mapped_beads: Vec::new(),
+        },
+        HotPathCostComponentEntry {
+            rank: 0,
+            component: "row_materialization".to_owned(),
+            time_ns: report
+                .row_materialization
+                .result_row_materialization_time_ns_total,
+            time_share_basis_points: ratio_basis_points(
+                report
+                    .row_materialization
+                    .result_row_materialization_time_ns_total,
+                total_time_ns,
+            ),
+            allocator_pressure_bytes: report.row_materialization.result_value_heap_bytes_total,
+            allocator_share_basis_points: ratio_basis_points(
+                report.row_materialization.result_value_heap_bytes_total,
+                total_allocator_pressure_bytes,
+            ),
+            activity_count: report.row_materialization.result_rows_total,
+            rationale: "result-row cloning time paired with emitted-value allocator pressure"
+                .to_owned(),
+            implication: String::new(),
+            mapped_beads: Vec::new(),
+        },
+    ];
+    entries.sort_by(|lhs, rhs| {
+        rhs.time_ns
+            .cmp(&lhs.time_ns)
+            .then_with(|| {
+                rhs.allocator_pressure_bytes
+                    .cmp(&lhs.allocator_pressure_bytes)
+            })
+            .then_with(|| lhs.component.cmp(&rhs.component))
+    });
+    for (rank, entry) in entries.iter_mut().enumerate() {
+        entry.rank = u32::try_from(rank + 1).unwrap_or(u32::MAX);
+        let (implication, mapped_beads) = cost_component_implication(&entry.component);
+        entry.implication = implication.to_owned();
+        entry.mapped_beads = mapped_beads.iter().map(|bead| (*bead).to_owned()).collect();
+    }
+    entries
 }
 
 #[must_use]
@@ -923,6 +1094,12 @@ pub fn build_hot_path_actionable_ranking(
             actionable_entry(rank, entry, implication, mapped_beads)
         })
         .collect();
+    let cost_components = build_hot_path_cost_components(report);
+    let top_opcodes = build_hot_path_opcode_profile(report)
+        .opcodes
+        .into_iter()
+        .take(12)
+        .collect();
 
     HotPathActionableRanking {
         schema_version: HOT_PATH_PROFILE_ACTIONABLE_RANKING_SCHEMA_V1.to_owned(),
@@ -937,8 +1114,9 @@ pub fn build_hot_path_actionable_ranking(
         concurrency: report.concurrency,
         replay_command: report.replay_command.clone(),
         named_hotspots,
+        cost_components,
         allocator_pressure,
-        top_opcodes: report.opcode_profile.iter().take(12).cloned().collect(),
+        top_opcodes,
     }
 }
 
@@ -1494,6 +1672,21 @@ mod tests {
         assert!(!opcode_profile.opcodes.is_empty());
         assert!(!subsystem_profile.subsystem_ranking.is_empty());
         assert!(!actionable_ranking.named_hotspots.is_empty());
+        assert!(!actionable_ranking.cost_components.is_empty());
+        assert_eq!(
+            actionable_ranking.top_opcodes,
+            opcode_profile
+                .opcodes
+                .iter()
+                .take(actionable_ranking.top_opcodes.len())
+                .cloned()
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            std::fs::read_to_string(artifact_dir.join("summary.md"))
+                .unwrap()
+                .contains("## Quantified Cost Components")
+        );
         assert!(
             actionable_ranking
                 .named_hotspots
@@ -1503,5 +1696,14 @@ mod tests {
                     || bead == "bd-db300.4.3"
                     || bead == "bd-db300.4.4")
         );
+        assert_eq!(actionable_ranking.cost_components.len(), 3);
+        let component_names = actionable_ranking
+            .cost_components
+            .iter()
+            .map(|entry| entry.component.as_str())
+            .collect::<Vec<_>>();
+        assert!(component_names.contains(&"parser_ast_churn"));
+        assert!(component_names.contains(&"record_decode"));
+        assert!(component_names.contains(&"row_materialization"));
     }
 }
