@@ -68,8 +68,7 @@ enum EditMode {
 /// Returns a canonical minified JSON string or a `FunctionError` if invalid.
 pub fn json(input: &str) -> Result<String> {
     let value = parse_json_text(input)?;
-    serde_json::to_string(&value)
-        .map_err(|error| FrankenError::function_error(format!("json serialize failed: {error}")))
+    encode_json_text("json serialize failed", &value)
 }
 
 /// Validate JSON text under flags compatible with SQLite `json_valid`.
@@ -127,73 +126,70 @@ pub fn jsonb(input: &str) -> Result<Vec<u8>> {
 /// Convert JSONB bytes back into minified JSON text.
 pub fn json_from_jsonb(input: &[u8]) -> Result<String> {
     let value = decode_jsonb_root(input)?;
-    serde_json::to_string(&value).map_err(|error| {
-        FrankenError::function_error(format!("json_from_jsonb encode failed: {error}"))
-    })
+    encode_json_text("json_from_jsonb encode failed", &value)
 }
 
-/// Return JSON type name at the root or an optional path.
-///
-/// Returns `None` when the path does not resolve.
-pub fn json_type(input: &str, path: Option<&str>) -> Result<Option<&'static str>> {
-    let root = parse_json_text(input)?;
+fn encode_json_text(context: &str, value: &Value) -> Result<String> {
+    serde_json::to_string(value)
+        .map_err(|error| FrankenError::function_error(format!("{context}: {error}")))
+}
+
+fn parse_json_input_blob(input: &[u8]) -> Result<Value> {
+    match decode_jsonb_root(input) {
+        Ok(value) => Ok(value),
+        Err(jsonb_error) => match std::str::from_utf8(input) {
+            Ok(text) => parse_json_text(text),
+            Err(_) => Err(jsonb_error),
+        },
+    }
+}
+
+fn json_type_value(root: &Value, path: Option<&str>) -> Result<Option<&'static str>> {
     let target = match path {
-        Some(path_expr) => resolve_path(&root, path_expr)?,
-        None => Some(&root),
+        Some(path_expr) => resolve_path(root, path_expr)?,
+        None => Some(root),
     };
     Ok(target.map(json_type_name))
 }
 
-/// Extract JSON value(s) by path, following SQLite single vs multi-path behavior.
-///
-/// - One path: return SQL-native value (text unwrapped, number typed, JSON null -> SQL NULL)
-/// - Multiple paths: return JSON array text of extracted values (missing paths become `null`)
-pub fn json_extract(input: &str, paths: &[&str]) -> Result<SqliteValue> {
+fn json_extract_value(root: &Value, paths: &[&str]) -> Result<SqliteValue> {
     if paths.is_empty() {
         return Err(FrankenError::function_error(
             "json_extract requires at least one path",
         ));
     }
 
-    let root = parse_json_text(input)?;
-
     if paths.len() == 1 {
-        let selected = resolve_path(&root, paths[0])?;
+        let selected = resolve_path(root, paths[0])?;
         return Ok(selected.map_or(SqliteValue::Null, json_to_sqlite_scalar));
     }
 
     let mut out = Vec::with_capacity(paths.len());
     for path_expr in paths {
-        let selected = resolve_path(&root, path_expr)?;
+        let selected = resolve_path(root, path_expr)?;
         out.push(selected.cloned().unwrap_or(Value::Null));
     }
 
-    let encoded = serde_json::to_string(&Value::Array(out)).map_err(|error| {
-        FrankenError::function_error(format!("json_extract array encode failed: {error}"))
-    })?;
+    let encoded = encode_json_text("json_extract array encode failed", &Value::Array(out))?;
     Ok(SqliteValue::Text(encoded))
 }
 
-/// JSONB variant of `json_extract`.
-///
-/// The extracted JSON subtree is always returned as JSONB bytes.
-pub fn jsonb_extract(input: &str, paths: &[&str]) -> Result<Vec<u8>> {
+fn jsonb_extract_value(root: &Value, paths: &[&str]) -> Result<Vec<u8>> {
     if paths.is_empty() {
         return Err(FrankenError::function_error(
             "jsonb_extract requires at least one path",
         ));
     }
 
-    let root = parse_json_text(input)?;
     let output = if paths.len() == 1 {
-        resolve_path(&root, paths[0])?
+        resolve_path(root, paths[0])?
             .cloned()
             .unwrap_or(Value::Null)
     } else {
         let mut values = Vec::with_capacity(paths.len());
         for path_expr in paths {
             values.push(
-                resolve_path(&root, path_expr)?
+                resolve_path(root, path_expr)?
                     .cloned()
                     .unwrap_or(Value::Null),
             );
@@ -204,19 +200,101 @@ pub fn jsonb_extract(input: &str, paths: &[&str]) -> Result<Vec<u8>> {
     encode_jsonb_root(&output)
 }
 
+fn json_arrow_value(root: &Value, path: &str) -> Result<SqliteValue> {
+    let selected = resolve_path(root, path)?;
+    let Some(value) = selected else {
+        return Ok(SqliteValue::Null);
+    };
+    let encoded = encode_json_text("json_arrow encode failed", value)?;
+    Ok(SqliteValue::Text(encoded))
+}
+
+fn json_array_length_value(root: &Value, path: Option<&str>) -> Result<Option<usize>> {
+    let target = match path {
+        Some(path_expr) => resolve_path(root, path_expr)?,
+        None => Some(root),
+    };
+    Ok(target.and_then(Value::as_array).map(Vec::len))
+}
+
+fn json_error_position_blob(input: &[u8]) -> usize {
+    if decode_jsonb_root(input).is_ok() {
+        return 0;
+    }
+    match std::str::from_utf8(input) {
+        Ok(text) => json_error_position(text),
+        Err(_) => 1,
+    }
+}
+
+fn json_pretty_value(root: &Value, indent: Option<&str>) -> Result<String> {
+    let indent_unit = match indent {
+        Some(indent) => indent.to_owned(),
+        None => " ".repeat(JSON_PRETTY_DEFAULT_INDENT_WIDTH),
+    };
+    let mut out = String::new();
+    write_pretty_value(root, &indent_unit, 0, &mut out)?;
+    Ok(out)
+}
+
+fn edit_json_paths_value(
+    root: &Value,
+    pairs: &[(&str, SqliteValue)],
+    mode: EditMode,
+) -> Result<Value> {
+    let mut edited = root.clone();
+    for (path, value) in pairs {
+        let segments = parse_path(path)?;
+        let replacement = sqlite_to_json(value)?;
+        apply_edit(&mut edited, &segments, replacement, mode);
+    }
+    Ok(edited)
+}
+
+fn json_remove_value(root: &Value, paths: &[&str]) -> Result<Value> {
+    let mut edited = root.clone();
+    for path in paths {
+        let segments = parse_path(path)?;
+        remove_at_path(&mut edited, &segments);
+    }
+    Ok(edited)
+}
+
+fn json_patch_value(root: &Value, patch: &Value) -> Value {
+    merge_patch(root.clone(), patch.clone())
+}
+
+/// Return JSON type name at the root or an optional path.
+///
+/// Returns `None` when the path does not resolve.
+pub fn json_type(input: &str, path: Option<&str>) -> Result<Option<&'static str>> {
+    let root = parse_json_text(input)?;
+    json_type_value(&root, path)
+}
+
+/// Extract JSON value(s) by path, following SQLite single vs multi-path behavior.
+///
+/// - One path: return SQL-native value (text unwrapped, number typed, JSON null -> SQL NULL)
+/// - Multiple paths: return JSON array text of extracted values (missing paths become `null`)
+pub fn json_extract(input: &str, paths: &[&str]) -> Result<SqliteValue> {
+    let root = parse_json_text(input)?;
+    json_extract_value(&root, paths)
+}
+
+/// JSONB variant of `json_extract`.
+///
+/// The extracted JSON subtree is always returned as JSONB bytes.
+pub fn jsonb_extract(input: &str, paths: &[&str]) -> Result<Vec<u8>> {
+    let root = parse_json_text(input)?;
+    jsonb_extract_value(&root, paths)
+}
+
 /// Extract with `->` semantics: always returns JSON text for the selected node.
 ///
 /// Missing paths yield SQL NULL.
 pub fn json_arrow(input: &str, path: &str) -> Result<SqliteValue> {
     let root = parse_json_text(input)?;
-    let selected = resolve_path(&root, path)?;
-    let Some(value) = selected else {
-        return Ok(SqliteValue::Null);
-    };
-    let encoded = serde_json::to_string(value).map_err(|error| {
-        FrankenError::function_error(format!("json_arrow encode failed: {error}"))
-    })?;
-    Ok(SqliteValue::Text(encoded))
+    json_arrow_value(&root, path)
 }
 
 /// Extract with `->>` semantics: returns SQL-native value.
@@ -227,11 +305,7 @@ pub fn json_double_arrow(input: &str, path: &str) -> Result<SqliteValue> {
 /// Return the array length at root or path, or `None` when target is not an array.
 pub fn json_array_length(input: &str, path: Option<&str>) -> Result<Option<usize>> {
     let root = parse_json_text(input)?;
-    let target = match path {
-        Some(path_expr) => resolve_path(&root, path_expr)?,
-        None => Some(&root),
-    };
-    Ok(target.and_then(Value::as_array).map(Vec::len))
+    json_array_length_value(&root, path)
 }
 
 /// Return 0 for valid JSON, otherwise a 1-based position for first parse error.
@@ -269,13 +343,7 @@ pub fn json_error_position(input: &str) -> usize {
 /// Pretty-print JSON with default 4-space indentation or custom indent token.
 pub fn json_pretty(input: &str, indent: Option<&str>) -> Result<String> {
     let root = parse_json_text(input)?;
-    let indent_unit = match indent {
-        Some(indent) => indent.to_owned(),
-        None => " ".repeat(JSON_PRETTY_DEFAULT_INDENT_WIDTH),
-    };
-    let mut out = String::new();
-    write_pretty_value(&root, &indent_unit, 0, &mut out)?;
-    Ok(out)
+    json_pretty_value(&root, indent)
 }
 
 /// Quote a SQL value as JSON.
@@ -390,68 +458,74 @@ pub fn jsonb_group_object(entries: &[(SqliteValue, SqliteValue)]) -> Result<Vec<
 
 /// Set JSON values at path(s), creating object keys when missing.
 pub fn json_set(input: &str, pairs: &[(&str, SqliteValue)]) -> Result<String> {
-    edit_json_paths(input, pairs, EditMode::Set)
+    let root = parse_json_text(input)?;
+    let edited = edit_json_paths_value(&root, pairs, EditMode::Set)?;
+    encode_json_text("json edit encode failed", &edited)
 }
 
 /// JSONB variant of `json_set`.
 pub fn jsonb_set(input: &str, pairs: &[(&str, SqliteValue)]) -> Result<Vec<u8>> {
-    let json_text = json_set(input, pairs)?;
-    jsonb(&json_text)
+    let root = parse_json_text(input)?;
+    let edited = edit_json_paths_value(&root, pairs, EditMode::Set)?;
+    encode_jsonb_root(&edited)
 }
 
 /// Insert JSON values at path(s) only when path does not already exist.
 pub fn json_insert(input: &str, pairs: &[(&str, SqliteValue)]) -> Result<String> {
-    edit_json_paths(input, pairs, EditMode::Insert)
+    let root = parse_json_text(input)?;
+    let edited = edit_json_paths_value(&root, pairs, EditMode::Insert)?;
+    encode_json_text("json edit encode failed", &edited)
 }
 
 /// JSONB variant of `json_insert`.
 pub fn jsonb_insert(input: &str, pairs: &[(&str, SqliteValue)]) -> Result<Vec<u8>> {
-    let json_text = json_insert(input, pairs)?;
-    jsonb(&json_text)
+    let root = parse_json_text(input)?;
+    let edited = edit_json_paths_value(&root, pairs, EditMode::Insert)?;
+    encode_jsonb_root(&edited)
 }
 
 /// Replace JSON values at path(s) only when path already exists.
 pub fn json_replace(input: &str, pairs: &[(&str, SqliteValue)]) -> Result<String> {
-    edit_json_paths(input, pairs, EditMode::Replace)
+    let root = parse_json_text(input)?;
+    let edited = edit_json_paths_value(&root, pairs, EditMode::Replace)?;
+    encode_json_text("json edit encode failed", &edited)
 }
 
 /// JSONB variant of `json_replace`.
 pub fn jsonb_replace(input: &str, pairs: &[(&str, SqliteValue)]) -> Result<Vec<u8>> {
-    let json_text = json_replace(input, pairs)?;
-    jsonb(&json_text)
+    let root = parse_json_text(input)?;
+    let edited = edit_json_paths_value(&root, pairs, EditMode::Replace)?;
+    encode_jsonb_root(&edited)
 }
 
 /// Remove JSON values at path(s). Array removals compact the array.
 pub fn json_remove(input: &str, paths: &[&str]) -> Result<String> {
-    let mut root = parse_json_text(input)?;
-    for path in paths {
-        let segments = parse_path(path)?;
-        remove_at_path(&mut root, &segments);
-    }
-    serde_json::to_string(&root).map_err(|error| {
-        FrankenError::function_error(format!("json_remove encode failed: {error}"))
-    })
+    let root = parse_json_text(input)?;
+    let edited = json_remove_value(&root, paths)?;
+    encode_json_text("json_remove encode failed", &edited)
 }
 
 /// JSONB variant of `json_remove`.
 pub fn jsonb_remove(input: &str, paths: &[&str]) -> Result<Vec<u8>> {
-    let json_text = json_remove(input, paths)?;
-    jsonb(&json_text)
+    let root = parse_json_text(input)?;
+    let edited = json_remove_value(&root, paths)?;
+    encode_jsonb_root(&edited)
 }
 
 /// Apply RFC 7396 JSON Merge Patch.
 pub fn json_patch(input: &str, patch: &str) -> Result<String> {
     let root = parse_json_text(input)?;
     let patch_value = parse_json_text(patch)?;
-    let merged = merge_patch(root, patch_value);
-    serde_json::to_string(&merged)
-        .map_err(|error| FrankenError::function_error(format!("json_patch encode failed: {error}")))
+    let merged = json_patch_value(&root, &patch_value);
+    encode_json_text("json_patch encode failed", &merged)
 }
 
 /// JSONB variant of `json_patch`.
 pub fn jsonb_patch(input: &str, patch: &str) -> Result<Vec<u8>> {
-    let json_text = json_patch(input, patch)?;
-    jsonb(&json_text)
+    let root = parse_json_text(input)?;
+    let patch_value = parse_json_text(patch)?;
+    let merged = json_patch_value(&root, &patch_value);
+    encode_jsonb_root(&merged)
 }
 
 /// Row shape produced by `json_each` and `json_tree`.
@@ -478,10 +552,14 @@ pub struct JsonTableRow {
 /// Table-valued `json_each`: iterate immediate children at root or `path`.
 pub fn json_each(input: &str, path: Option<&str>) -> Result<Vec<JsonTableRow>> {
     let root = parse_json_text(input)?;
+    json_each_value(&root, path)
+}
+
+fn json_each_value(root: &Value, path: Option<&str>) -> Result<Vec<JsonTableRow>> {
     let base_path = path.unwrap_or("$");
     let target = match path {
-        Some(path_expr) => resolve_path(&root, path_expr)?,
-        None => Some(&root),
+        Some(path_expr) => resolve_path(root, path_expr)?,
+        None => Some(root),
     };
     let Some(target) = target else {
         return Ok(Vec::new());
@@ -546,10 +624,14 @@ pub fn json_each(input: &str, path: Option<&str>) -> Result<Vec<JsonTableRow>> {
 /// Table-valued `json_tree`: recursively iterate subtree at root or `path`.
 pub fn json_tree(input: &str, path: Option<&str>) -> Result<Vec<JsonTableRow>> {
     let root = parse_json_text(input)?;
+    json_tree_value(&root, path)
+}
+
+fn json_tree_value(root: &Value, path: Option<&str>) -> Result<Vec<JsonTableRow>> {
     let base_path = path.unwrap_or("$");
     let target = match path {
-        Some(path_expr) => resolve_path(&root, path_expr)?,
-        None => Some(&root),
+        Some(path_expr) => resolve_path(root, path_expr)?,
+        None => Some(root),
     };
     let Some(target) = target else {
         return Ok(Vec::new());
@@ -606,7 +688,7 @@ impl VirtualTableCursor for JsonEachCursor {
         args: &[SqliteValue],
     ) -> Result<()> {
         let (input, path) = parse_json_table_filter_args(args)?;
-        self.rows = json_each(input, path)?;
+        self.rows = json_each_value(&input, path)?;
         self.pos = 0;
         Ok(())
     }
@@ -673,7 +755,7 @@ impl VirtualTableCursor for JsonTreeCursor {
         args: &[SqliteValue],
     ) -> Result<()> {
         let (input, path) = parse_json_table_filter_args(args)?;
-        self.rows = json_tree(input, path)?;
+        self.rows = json_tree_value(&input, path)?;
         self.pos = 0;
         Ok(())
     }
@@ -1245,16 +1327,20 @@ fn append_tree_rows(
     Ok(())
 }
 
-fn parse_json_table_filter_args(args: &[SqliteValue]) -> Result<(&str, Option<&str>)> {
+fn parse_json_table_filter_args(args: &[SqliteValue]) -> Result<(Value, Option<&str>)> {
     let Some(input_arg) = args.first() else {
         return Err(FrankenError::function_error(
             "json table-valued functions require JSON input argument",
         ));
     };
-    let SqliteValue::Text(input_text) = input_arg else {
-        return Err(FrankenError::function_error(
-            "json table-valued input must be TEXT JSON",
-        ));
+    let input_value = match input_arg {
+        SqliteValue::Text(input_text) => parse_json_text(input_text)?,
+        SqliteValue::Blob(input_blob) => parse_json_input_blob(input_blob)?,
+        _ => {
+            return Err(FrankenError::function_error(
+                "json table-valued input must be TEXT or BLOB JSON",
+            ));
+        }
     };
 
     let path = match args.get(1) {
@@ -1267,7 +1353,7 @@ fn parse_json_table_filter_args(args: &[SqliteValue]) -> Result<(&str, Option<&s
         }
     };
 
-    Ok((input_text.as_str(), path))
+    Ok((input_value, path))
 }
 
 fn write_json_table_column(row: &JsonTableRow, ctx: &mut ColumnContext, col: i32) -> Result<()> {
@@ -1411,18 +1497,6 @@ fn write_pretty_value(value: &Value, indent: &str, depth: usize, out: &mut Strin
             Ok(())
         }
     }
-}
-
-fn edit_json_paths(input: &str, pairs: &[(&str, SqliteValue)], mode: EditMode) -> Result<String> {
-    let mut root = parse_json_text(input)?;
-    for (path, value) in pairs {
-        let segments = parse_path(path)?;
-        let replacement = sqlite_to_json(value)?;
-        apply_edit(&mut root, &segments, replacement, mode);
-    }
-
-    serde_json::to_string(&root)
-        .map_err(|error| FrankenError::function_error(format!("json edit encode failed: {error}")))
 }
 
 fn apply_edit(root: &mut Value, segments: &[PathSegment], new_value: Value, mode: EditMode) {
@@ -1723,6 +1797,22 @@ fn text_arg<'a>(name: &str, args: &'a [SqliteValue], index: usize) -> Result<&'a
     }
 }
 
+fn json_arg_value(name: &str, args: &[SqliteValue], index: usize) -> Result<Value> {
+    match args.get(index) {
+        Some(SqliteValue::Text(text)) => parse_json_text(text),
+        Some(SqliteValue::Blob(bytes)) => parse_json_input_blob(bytes),
+        Some(other) => Err(FrankenError::function_error(format!(
+            "{name} argument {} must be TEXT or BLOB, got {}",
+            index + 1,
+            other.typeof_str()
+        ))),
+        None => Err(FrankenError::function_error(format!(
+            "{name} missing argument {}",
+            index + 1
+        ))),
+    }
+}
+
 fn optional_flags_arg(name: &str, args: &[SqliteValue], index: usize) -> Result<Option<u8>> {
     let Some(value) = args.get(index) else {
         return Ok(None);
@@ -1794,12 +1884,12 @@ fn invoke_json_arrow(name: &str, args: &[SqliteValue], double_arrow: bool) -> Re
         return Ok(SqliteValue::Null);
     }
 
-    let input = text_arg(name, args, 0)?;
+    let input = json_arg_value(name, args, 0)?;
     let path = normalize_arrow_path_arg(name, &args[1], 1)?;
     if double_arrow {
-        json_double_arrow(input, path.as_ref())
+        json_extract_value(&input, &[path.as_ref()])
     } else {
-        json_arrow(input, path.as_ref())
+        json_arrow_value(&input, path.as_ref())
     }
 }
 
@@ -1829,8 +1919,11 @@ impl ScalarFunction for JsonFunc {
         if matches!(args[0], SqliteValue::Null) {
             return Ok(SqliteValue::Null);
         }
-        let input = text_arg(self.name(), args, 0)?;
-        Ok(SqliteValue::Text(json(input)?))
+        let input = json_arg_value(self.name(), args, 0)?;
+        Ok(SqliteValue::Text(encode_json_text(
+            "json serialize failed",
+            &input,
+        )?))
     }
 
     fn num_args(&self) -> i32 {
@@ -1839,6 +1932,29 @@ impl ScalarFunction for JsonFunc {
 
     fn name(&self) -> &'static str {
         "json"
+    }
+}
+
+pub struct JsonbFunc;
+
+impl ScalarFunction for JsonbFunc {
+    fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
+        if args.len() != 1 {
+            return Err(invalid_arity(self.name(), "exactly 1 argument", args.len()));
+        }
+        if matches!(args[0], SqliteValue::Null) {
+            return Ok(SqliteValue::Null);
+        }
+        let input = json_arg_value(self.name(), args, 0)?;
+        Ok(SqliteValue::Blob(encode_jsonb_root(&input)?))
+    }
+
+    fn num_args(&self) -> i32 {
+        1
+    }
+
+    fn name(&self) -> &'static str {
+        "jsonb"
     }
 }
 
@@ -1878,7 +1994,7 @@ impl ScalarFunction for JsonTypeFunc {
         if matches!(args[0], SqliteValue::Null) {
             return Ok(SqliteValue::Null);
         }
-        let input = text_arg(self.name(), args, 0)?;
+        let input = json_arg_value(self.name(), args, 0)?;
         let path = if args.len() == 2 {
             if matches!(args[1], SqliteValue::Null) {
                 return Ok(SqliteValue::Null);
@@ -1887,7 +2003,7 @@ impl ScalarFunction for JsonTypeFunc {
         } else {
             None
         };
-        Ok(match json_type(input, path)? {
+        Ok(match json_type_value(&input, path)? {
             Some(kind) => SqliteValue::Text(kind.to_owned()),
             None => SqliteValue::Null,
         })
@@ -1923,9 +2039,9 @@ impl ScalarFunction for JsonExtractFunc {
         if args[1..].iter().any(|a| matches!(a, SqliteValue::Null)) {
             return Ok(SqliteValue::Null);
         }
-        let input = text_arg(self.name(), args, 0)?;
+        let input = json_arg_value(self.name(), args, 0)?;
         let paths = collect_path_args(self.name(), args, 1)?;
-        json_extract(input, &paths)
+        json_extract_value(&input, &paths)
     }
 
     fn num_args(&self) -> i32 {
@@ -1934,6 +2050,40 @@ impl ScalarFunction for JsonExtractFunc {
 
     fn name(&self) -> &'static str {
         "json_extract"
+    }
+}
+
+pub struct JsonbExtractFunc;
+
+impl ScalarFunction for JsonbExtractFunc {
+    fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
+        if args.is_empty() {
+            return Err(invalid_arity(
+                self.name(),
+                "at least 1 argument (json, path...)",
+                args.len(),
+            ));
+        }
+        if args.len() == 1 {
+            return Ok(SqliteValue::Null);
+        }
+        if matches!(args[0], SqliteValue::Null) {
+            return Ok(SqliteValue::Null);
+        }
+        if args[1..].iter().any(|a| matches!(a, SqliteValue::Null)) {
+            return Ok(SqliteValue::Null);
+        }
+        let input = json_arg_value(self.name(), args, 0)?;
+        let paths = collect_path_args(self.name(), args, 1)?;
+        Ok(SqliteValue::Blob(jsonb_extract_value(&input, &paths)?))
+    }
+
+    fn num_args(&self) -> i32 {
+        -1
+    }
+
+    fn name(&self) -> &'static str {
+        "jsonb_extract"
     }
 }
 
@@ -1985,6 +2135,22 @@ impl ScalarFunction for JsonArrayFunc {
     }
 }
 
+pub struct JsonbArrayFunc;
+
+impl ScalarFunction for JsonbArrayFunc {
+    fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
+        Ok(SqliteValue::Blob(jsonb_array(args)?))
+    }
+
+    fn num_args(&self) -> i32 {
+        -1
+    }
+
+    fn name(&self) -> &'static str {
+        "jsonb_array"
+    }
+}
+
 pub struct JsonObjectFunc;
 
 impl ScalarFunction for JsonObjectFunc {
@@ -1998,6 +2164,22 @@ impl ScalarFunction for JsonObjectFunc {
 
     fn name(&self) -> &'static str {
         "json_object"
+    }
+}
+
+pub struct JsonbObjectFunc;
+
+impl ScalarFunction for JsonbObjectFunc {
+    fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
+        Ok(SqliteValue::Blob(jsonb_object(args)?))
+    }
+
+    fn num_args(&self) -> i32 {
+        -1
+    }
+
+    fn name(&self) -> &'static str {
+        "jsonb_object"
     }
 }
 
@@ -2042,13 +2224,17 @@ impl ScalarFunction for JsonSetFunc {
         {
             return Ok(SqliteValue::Null);
         }
-        let input = text_arg(self.name(), args, 0)?;
+        let input = json_arg_value(self.name(), args, 0)?;
         let pairs_owned = collect_path_value_pairs(self.name(), args, 1)?;
         let pairs = pairs_owned
             .iter()
             .map(|(path, value)| (path.as_str(), value.clone()))
             .collect::<Vec<_>>();
-        Ok(SqliteValue::Text(json_set(input, &pairs)?))
+        let edited = edit_json_paths_value(&input, &pairs, EditMode::Set)?;
+        Ok(SqliteValue::Text(encode_json_text(
+            "json edit encode failed",
+            &edited,
+        )?))
     }
 
     fn num_args(&self) -> i32 {
@@ -2057,6 +2243,46 @@ impl ScalarFunction for JsonSetFunc {
 
     fn name(&self) -> &'static str {
         "json_set"
+    }
+}
+
+pub struct JsonbSetFunc;
+
+impl ScalarFunction for JsonbSetFunc {
+    fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
+        if args.len() < 3 || args.len() % 2 == 0 {
+            return Err(invalid_arity(
+                self.name(),
+                "an odd argument count >= 3 (json, path, value, ...)",
+                args.len(),
+            ));
+        }
+        if matches!(args[0], SqliteValue::Null) {
+            return Ok(SqliteValue::Null);
+        }
+        if args[1..]
+            .iter()
+            .step_by(2)
+            .any(|a| matches!(a, SqliteValue::Null))
+        {
+            return Ok(SqliteValue::Null);
+        }
+        let input = json_arg_value(self.name(), args, 0)?;
+        let pairs_owned = collect_path_value_pairs(self.name(), args, 1)?;
+        let pairs = pairs_owned
+            .iter()
+            .map(|(path, value)| (path.as_str(), value.clone()))
+            .collect::<Vec<_>>();
+        let edited = edit_json_paths_value(&input, &pairs, EditMode::Set)?;
+        Ok(SqliteValue::Blob(encode_jsonb_root(&edited)?))
+    }
+
+    fn num_args(&self) -> i32 {
+        -1
+    }
+
+    fn name(&self) -> &'static str {
+        "jsonb_set"
     }
 }
 
@@ -2082,13 +2308,17 @@ impl ScalarFunction for JsonInsertFunc {
         {
             return Ok(SqliteValue::Null);
         }
-        let input = text_arg(self.name(), args, 0)?;
+        let input = json_arg_value(self.name(), args, 0)?;
         let pairs_owned = collect_path_value_pairs(self.name(), args, 1)?;
         let pairs = pairs_owned
             .iter()
             .map(|(path, value)| (path.as_str(), value.clone()))
             .collect::<Vec<_>>();
-        Ok(SqliteValue::Text(json_insert(input, &pairs)?))
+        let edited = edit_json_paths_value(&input, &pairs, EditMode::Insert)?;
+        Ok(SqliteValue::Text(encode_json_text(
+            "json edit encode failed",
+            &edited,
+        )?))
     }
 
     fn num_args(&self) -> i32 {
@@ -2097,6 +2327,46 @@ impl ScalarFunction for JsonInsertFunc {
 
     fn name(&self) -> &'static str {
         "json_insert"
+    }
+}
+
+pub struct JsonbInsertFunc;
+
+impl ScalarFunction for JsonbInsertFunc {
+    fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
+        if args.len() < 3 || args.len() % 2 == 0 {
+            return Err(invalid_arity(
+                self.name(),
+                "an odd argument count >= 3 (json, path, value, ...)",
+                args.len(),
+            ));
+        }
+        if matches!(args[0], SqliteValue::Null) {
+            return Ok(SqliteValue::Null);
+        }
+        if args[1..]
+            .iter()
+            .step_by(2)
+            .any(|a| matches!(a, SqliteValue::Null))
+        {
+            return Ok(SqliteValue::Null);
+        }
+        let input = json_arg_value(self.name(), args, 0)?;
+        let pairs_owned = collect_path_value_pairs(self.name(), args, 1)?;
+        let pairs = pairs_owned
+            .iter()
+            .map(|(path, value)| (path.as_str(), value.clone()))
+            .collect::<Vec<_>>();
+        let edited = edit_json_paths_value(&input, &pairs, EditMode::Insert)?;
+        Ok(SqliteValue::Blob(encode_jsonb_root(&edited)?))
+    }
+
+    fn num_args(&self) -> i32 {
+        -1
+    }
+
+    fn name(&self) -> &'static str {
+        "jsonb_insert"
     }
 }
 
@@ -2122,13 +2392,17 @@ impl ScalarFunction for JsonReplaceFunc {
         {
             return Ok(SqliteValue::Null);
         }
-        let input = text_arg(self.name(), args, 0)?;
+        let input = json_arg_value(self.name(), args, 0)?;
         let pairs_owned = collect_path_value_pairs(self.name(), args, 1)?;
         let pairs = pairs_owned
             .iter()
             .map(|(path, value)| (path.as_str(), value.clone()))
             .collect::<Vec<_>>();
-        Ok(SqliteValue::Text(json_replace(input, &pairs)?))
+        let edited = edit_json_paths_value(&input, &pairs, EditMode::Replace)?;
+        Ok(SqliteValue::Text(encode_json_text(
+            "json edit encode failed",
+            &edited,
+        )?))
     }
 
     fn num_args(&self) -> i32 {
@@ -2137,6 +2411,46 @@ impl ScalarFunction for JsonReplaceFunc {
 
     fn name(&self) -> &'static str {
         "json_replace"
+    }
+}
+
+pub struct JsonbReplaceFunc;
+
+impl ScalarFunction for JsonbReplaceFunc {
+    fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
+        if args.len() < 3 || args.len() % 2 == 0 {
+            return Err(invalid_arity(
+                self.name(),
+                "an odd argument count >= 3 (json, path, value, ...)",
+                args.len(),
+            ));
+        }
+        if matches!(args[0], SqliteValue::Null) {
+            return Ok(SqliteValue::Null);
+        }
+        if args[1..]
+            .iter()
+            .step_by(2)
+            .any(|a| matches!(a, SqliteValue::Null))
+        {
+            return Ok(SqliteValue::Null);
+        }
+        let input = json_arg_value(self.name(), args, 0)?;
+        let pairs_owned = collect_path_value_pairs(self.name(), args, 1)?;
+        let pairs = pairs_owned
+            .iter()
+            .map(|(path, value)| (path.as_str(), value.clone()))
+            .collect::<Vec<_>>();
+        let edited = edit_json_paths_value(&input, &pairs, EditMode::Replace)?;
+        Ok(SqliteValue::Blob(encode_jsonb_root(&edited)?))
+    }
+
+    fn num_args(&self) -> i32 {
+        -1
+    }
+
+    fn name(&self) -> &'static str {
+        "jsonb_replace"
     }
 }
 
@@ -2154,17 +2468,24 @@ impl ScalarFunction for JsonRemoveFunc {
         if matches!(args[0], SqliteValue::Null) {
             return Ok(SqliteValue::Null);
         }
-        let input = text_arg(self.name(), args, 0)?;
+        let input = json_arg_value(self.name(), args, 0)?;
         if args.len() == 1 {
             // With just the JSON argument, validate and return minified.
-            return Ok(SqliteValue::Text(json(input)?));
+            return Ok(SqliteValue::Text(encode_json_text(
+                "json serialize failed",
+                &input,
+            )?));
         }
         // SQLite returns NULL when any path argument is NULL.
         if args[1..].iter().any(|a| matches!(a, SqliteValue::Null)) {
             return Ok(SqliteValue::Null);
         }
         let paths = collect_path_args(self.name(), args, 1)?;
-        Ok(SqliteValue::Text(json_remove(input, &paths)?))
+        let edited = json_remove_value(&input, &paths)?;
+        Ok(SqliteValue::Text(encode_json_text(
+            "json_remove encode failed",
+            &edited,
+        )?))
     }
 
     fn num_args(&self) -> i32 {
@@ -2173,6 +2494,41 @@ impl ScalarFunction for JsonRemoveFunc {
 
     fn name(&self) -> &'static str {
         "json_remove"
+    }
+}
+
+pub struct JsonbRemoveFunc;
+
+impl ScalarFunction for JsonbRemoveFunc {
+    fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
+        if args.is_empty() {
+            return Err(invalid_arity(
+                self.name(),
+                "at least 1 argument (json [, path...])",
+                args.len(),
+            ));
+        }
+        if matches!(args[0], SqliteValue::Null) {
+            return Ok(SqliteValue::Null);
+        }
+        let input = json_arg_value(self.name(), args, 0)?;
+        if args.len() == 1 {
+            return Ok(SqliteValue::Blob(encode_jsonb_root(&input)?));
+        }
+        if args[1..].iter().any(|a| matches!(a, SqliteValue::Null)) {
+            return Ok(SqliteValue::Null);
+        }
+        let paths = collect_path_args(self.name(), args, 1)?;
+        let edited = json_remove_value(&input, &paths)?;
+        Ok(SqliteValue::Blob(encode_jsonb_root(&edited)?))
+    }
+
+    fn num_args(&self) -> i32 {
+        -1
+    }
+
+    fn name(&self) -> &'static str {
+        "jsonb_remove"
     }
 }
 
@@ -2190,9 +2546,13 @@ impl ScalarFunction for JsonPatchFunc {
         if matches!(args[0], SqliteValue::Null) || matches!(args[1], SqliteValue::Null) {
             return Ok(SqliteValue::Null);
         }
-        let input = text_arg(self.name(), args, 0)?;
-        let patch = text_arg(self.name(), args, 1)?;
-        Ok(SqliteValue::Text(json_patch(input, patch)?))
+        let input = json_arg_value(self.name(), args, 0)?;
+        let patch = json_arg_value(self.name(), args, 1)?;
+        let merged = json_patch_value(&input, &patch);
+        Ok(SqliteValue::Text(encode_json_text(
+            "json_patch encode failed",
+            &merged,
+        )?))
     }
 
     fn num_args(&self) -> i32 {
@@ -2201,6 +2561,35 @@ impl ScalarFunction for JsonPatchFunc {
 
     fn name(&self) -> &'static str {
         "json_patch"
+    }
+}
+
+pub struct JsonbPatchFunc;
+
+impl ScalarFunction for JsonbPatchFunc {
+    fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
+        if args.len() != 2 {
+            return Err(invalid_arity(
+                self.name(),
+                "exactly 2 arguments",
+                args.len(),
+            ));
+        }
+        if matches!(args[0], SqliteValue::Null) || matches!(args[1], SqliteValue::Null) {
+            return Ok(SqliteValue::Null);
+        }
+        let input = json_arg_value(self.name(), args, 0)?;
+        let patch = json_arg_value(self.name(), args, 1)?;
+        let merged = json_patch_value(&input, &patch);
+        Ok(SqliteValue::Blob(encode_jsonb_root(&merged)?))
+    }
+
+    fn num_args(&self) -> i32 {
+        2
+    }
+
+    fn name(&self) -> &'static str {
+        "jsonb_patch"
     }
 }
 
@@ -2214,7 +2603,7 @@ impl ScalarFunction for JsonArrayLengthFunc {
         if matches!(args[0], SqliteValue::Null) {
             return Ok(SqliteValue::Null);
         }
-        let input = text_arg(self.name(), args, 0)?;
+        let input = json_arg_value(self.name(), args, 0)?;
         let path = if args.len() == 2 {
             if matches!(args[1], SqliteValue::Null) {
                 return Ok(SqliteValue::Null);
@@ -2223,7 +2612,7 @@ impl ScalarFunction for JsonArrayLengthFunc {
         } else {
             None
         };
-        Ok(match json_array_length(input, path)? {
+        Ok(match json_array_length_value(&input, path)? {
             Some(len) => SqliteValue::Integer(usize_to_i64(self.name(), len)?),
             None => SqliteValue::Null,
         })
@@ -2248,11 +2637,18 @@ impl ScalarFunction for JsonErrorPositionFunc {
         if matches!(args[0], SqliteValue::Null) {
             return Ok(SqliteValue::Null);
         }
-        let input = text_arg(self.name(), args, 0)?;
-        Ok(SqliteValue::Integer(usize_to_i64(
-            self.name(),
-            json_error_position(input),
-        )?))
+        let position = match &args[0] {
+            SqliteValue::Text(text) => json_error_position(text),
+            SqliteValue::Blob(bytes) => json_error_position_blob(bytes),
+            other => {
+                return Err(FrankenError::function_error(format!(
+                    "{} argument 1 must be TEXT or BLOB, got {}",
+                    self.name(),
+                    other.typeof_str()
+                )));
+            }
+        };
+        Ok(SqliteValue::Integer(usize_to_i64(self.name(), position)?))
     }
 
     fn num_args(&self) -> i32 {
@@ -2274,7 +2670,7 @@ impl ScalarFunction for JsonPrettyFunc {
         if matches!(args[0], SqliteValue::Null) {
             return Ok(SqliteValue::Null);
         }
-        let input = text_arg(self.name(), args, 0)?;
+        let input = json_arg_value(self.name(), args, 0)?;
         let indent = if args.len() == 2 {
             if matches!(args[1], SqliteValue::Null) {
                 None
@@ -2284,7 +2680,7 @@ impl ScalarFunction for JsonPrettyFunc {
         } else {
             None
         };
-        Ok(SqliteValue::Text(json_pretty(input, indent)?))
+        Ok(SqliteValue::Text(json_pretty_value(&input, indent)?))
     }
 
     fn num_args(&self) -> i32 {
@@ -2299,19 +2695,28 @@ impl ScalarFunction for JsonPrettyFunc {
 /// Register JSON1 scalar functions into a `FunctionRegistry`.
 pub fn register_json_scalars(registry: &mut FunctionRegistry) {
     registry.register_scalar(JsonFunc);
+    registry.register_scalar(JsonbFunc);
     registry.register_scalar(JsonValidFunc);
     registry.register_scalar(JsonTypeFunc);
     registry.register_scalar(JsonExtractFunc);
+    registry.register_scalar(JsonbExtractFunc);
     registry.register_scalar(JsonArrowFunc);
     registry.register_scalar(JsonDoubleArrowFunc);
     registry.register_scalar(JsonArrayFunc);
+    registry.register_scalar(JsonbArrayFunc);
     registry.register_scalar(JsonObjectFunc);
+    registry.register_scalar(JsonbObjectFunc);
     registry.register_scalar(JsonQuoteFunc);
     registry.register_scalar(JsonSetFunc);
+    registry.register_scalar(JsonbSetFunc);
     registry.register_scalar(JsonInsertFunc);
+    registry.register_scalar(JsonbInsertFunc);
     registry.register_scalar(JsonReplaceFunc);
+    registry.register_scalar(JsonbReplaceFunc);
     registry.register_scalar(JsonRemoveFunc);
+    registry.register_scalar(JsonbRemoveFunc);
     registry.register_scalar(JsonPatchFunc);
+    registry.register_scalar(JsonbPatchFunc);
     registry.register_scalar(JsonArrayLengthFunc);
     registry.register_scalar(JsonErrorPositionFunc);
     registry.register_scalar(JsonPrettyFunc);
@@ -2329,17 +2734,24 @@ mod tests {
 
         for name in [
             "json",
+            "jsonb",
             "json_valid",
             "json_type",
             "json_extract",
+            "jsonb_extract",
             "json_arrow",
             "json_double_arrow",
             "json_set",
+            "jsonb_set",
             "json_remove",
+            "jsonb_remove",
             "json_array",
+            "jsonb_array",
             "json_object",
+            "jsonb_object",
             "json_quote",
             "json_patch",
+            "jsonb_patch",
         ] {
             assert!(
                 registry.contains_scalar(name),
@@ -2411,6 +2823,92 @@ mod tests {
             ])
             .unwrap();
         assert_eq!(out, SqliteValue::Text(r#"{"a":1,"b":2}"#.to_owned()));
+    }
+
+    #[test]
+    fn test_registered_jsonb_scalar_executes() {
+        let mut registry = FunctionRegistry::new();
+        register_json_scalars(&mut registry);
+        let func = registry
+            .find_scalar("jsonb", 1)
+            .expect("jsonb should be registered");
+        let out = func
+            .invoke(&[SqliteValue::Text(r#"{"a":[1,2]}"#.to_owned())])
+            .expect("jsonb should encode to JSONB");
+        let SqliteValue::Blob(blob) = out else {
+            panic!("jsonb should return BLOB");
+        };
+        assert_eq!(json_from_jsonb(&blob).unwrap(), r#"{"a":[1,2]}"#);
+    }
+
+    #[test]
+    fn test_registered_json_extract_accepts_jsonb_blob_input() {
+        let mut registry = FunctionRegistry::new();
+        register_json_scalars(&mut registry);
+        let func = registry
+            .find_scalar("json_extract", 2)
+            .expect("json_extract should be registered");
+        let input = jsonb(r#"{"a":{"b":7}}"#).unwrap();
+        let out = func
+            .invoke(&[
+                SqliteValue::Blob(input),
+                SqliteValue::Text("$.a.b".to_owned()),
+            ])
+            .expect("json_extract should accept JSONB blob input");
+        assert_eq!(out, SqliteValue::Integer(7));
+    }
+
+    #[test]
+    fn test_registered_jsonb_set_accepts_jsonb_blob_input() {
+        let mut registry = FunctionRegistry::new();
+        register_json_scalars(&mut registry);
+        let func = registry
+            .find_scalar("jsonb_set", 3)
+            .expect("jsonb_set should be registered");
+        let input = jsonb(r#"{"a":1}"#).unwrap();
+        let out = func
+            .invoke(&[
+                SqliteValue::Blob(input),
+                SqliteValue::Text("$.b".to_owned()),
+                SqliteValue::Integer(2),
+            ])
+            .expect("jsonb_set should accept JSONB blob input");
+        let SqliteValue::Blob(blob) = out else {
+            panic!("jsonb_set should return BLOB");
+        };
+        assert_eq!(json_from_jsonb(&blob).unwrap(), r#"{"a":1,"b":2}"#);
+    }
+
+    #[test]
+    fn test_registered_json_pretty_accepts_jsonb_blob_input() {
+        let mut registry = FunctionRegistry::new();
+        register_json_scalars(&mut registry);
+        let func = registry
+            .find_scalar("json_pretty", 1)
+            .expect("json_pretty should be registered");
+        let input = jsonb(r#"{"a":[1,2]}"#).unwrap();
+        let out = func
+            .invoke(&[SqliteValue::Blob(input)])
+            .expect("json_pretty should accept JSONB blob input");
+        let SqliteValue::Text(pretty) = out else {
+            panic!("json_pretty should return TEXT");
+        };
+        assert!(pretty.contains('\n'));
+        assert!(pretty.contains("\"a\""));
+    }
+
+    #[test]
+    fn test_registered_json_error_position_accepts_jsonb_blob_input() {
+        let mut registry = FunctionRegistry::new();
+        register_json_scalars(&mut registry);
+        let func = registry
+            .find_scalar("json_error_position", 1)
+            .expect("json_error_position should be registered");
+        let input = jsonb(r#"{"a":1}"#).unwrap();
+        let out = func
+            .invoke(&[SqliteValue::Blob(input)])
+            .expect("json_error_position should accept JSONB blob input");
+        assert_eq!(out, SqliteValue::Integer(0));
     }
 
     #[test]
@@ -2946,6 +3444,70 @@ mod tests {
                 ],
             )
             .unwrap();
+
+        let mut fullkeys = Vec::new();
+        while !cursor.eof() {
+            let mut ctx = ColumnContext::new();
+            cursor.column(&mut ctx, 6).unwrap();
+            let fullkey = ctx.take_value().unwrap();
+            if let SqliteValue::Text(text) = fullkey {
+                fullkeys.push(text);
+            }
+            cursor.next(&cx).unwrap();
+        }
+
+        assert_eq!(fullkeys, vec!["$.a".to_owned(), "$.a.b".to_owned()]);
+    }
+
+    #[test]
+    fn test_json_each_vtab_cursor_accepts_jsonb_blob_input() {
+        let cx = Cx::new();
+        let vtab = JsonEachVtab::connect(&cx, &[]).unwrap();
+        let mut cursor = vtab.open().unwrap();
+        let input = jsonb(r#"{"a":[10,20]}"#).unwrap();
+        cursor
+            .filter(
+                &cx,
+                0,
+                None,
+                &[
+                    SqliteValue::Blob(input),
+                    SqliteValue::Text("$.a".to_owned()),
+                ],
+            )
+            .expect("json_each cursor should accept JSONB blob input");
+
+        let mut values = Vec::new();
+        while !cursor.eof() {
+            let mut ctx = ColumnContext::new();
+            cursor.column(&mut ctx, 1).unwrap();
+            values.push(ctx.take_value().unwrap());
+            cursor.next(&cx).unwrap();
+        }
+
+        assert_eq!(
+            values,
+            vec![SqliteValue::Integer(10), SqliteValue::Integer(20)]
+        );
+    }
+
+    #[test]
+    fn test_json_tree_vtab_cursor_accepts_jsonb_blob_input() {
+        let cx = Cx::new();
+        let vtab = JsonTreeVtab::connect(&cx, &[]).unwrap();
+        let mut cursor = vtab.open().unwrap();
+        let input = jsonb(r#"{"a":{"b":1}}"#).unwrap();
+        cursor
+            .filter(
+                &cx,
+                0,
+                None,
+                &[
+                    SqliteValue::Blob(input),
+                    SqliteValue::Text("$.a".to_owned()),
+                ],
+            )
+            .expect("json_tree cursor should accept JSONB blob input");
 
         let mut fullkeys = Vec::new();
         while !cursor.eof() {
