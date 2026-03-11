@@ -563,6 +563,10 @@ struct TrackedTable {
     pk_flags: Vec<bool>,
 }
 
+fn has_primary_key(pk_flags: &[bool]) -> bool {
+    pk_flags.iter().any(|is_pk| *is_pk)
+}
+
 /// A session that records database changes for later extraction as a
 /// changeset or patchset.
 ///
@@ -588,6 +592,10 @@ impl Session {
     /// Attach a table for change tracking.
     ///
     /// `pk_flags` indicates which columns are part of the primary key.
+    ///
+    /// SQLite session changesets only track tables with an explicit primary
+    /// key. Attached tables with no key columns are ignored when generating
+    /// changesets or patchsets.
     pub fn attach_table(&mut self, name: &str, column_count: usize, pk_flags: Vec<bool>) {
         assert_eq!(
             pk_flags.len(),
@@ -672,35 +680,21 @@ impl Session {
         // Emit tables in the order they were attached (deterministic).
         for tracked in &self.tables {
             if let Some(rows) = table_map.remove(&tracked.name) {
-                tables.push(TableChangeset {
-                    info: TableInfo {
-                        name: tracked.name.clone(),
-                        column_count: tracked.column_count,
-                        pk_flags: tracked.pk_flags.clone(),
-                    },
-                    rows,
-                });
+                if has_primary_key(&tracked.pk_flags) {
+                    tables.push(TableChangeset {
+                        info: TableInfo {
+                            name: tracked.name.clone(),
+                            column_count: tracked.column_count,
+                            pk_flags: tracked.pk_flags.clone(),
+                        },
+                        rows,
+                    });
+                }
             }
         }
-        // Any changes to tables not explicitly attached are appended with
-        // inferred metadata (all columns non-PK, count from first row).
-        for (name, rows) in table_map {
-            let col_count = rows.first().map_or(0, |r| {
-                if r.new_values.is_empty() {
-                    r.old_values.len()
-                } else {
-                    r.new_values.len()
-                }
-            });
-            tables.push(TableChangeset {
-                info: TableInfo {
-                    name,
-                    column_count: col_count,
-                    pk_flags: vec![false; col_count],
-                },
-                rows,
-            });
-        }
+        // Changes for unattached tables, or attached tables without an
+        // explicit primary key, are intentionally dropped to match SQLite
+        // session semantics.
         Changeset { tables }
     }
 }
@@ -893,6 +887,9 @@ impl SimpleTarget {
         pk_flags: &[bool],
         target: &[SqliteValue],
     ) -> Option<usize> {
+        if !has_primary_key(pk_flags) {
+            return rows.iter().position(|row| row == target);
+        }
         rows.iter().position(|row| {
             pk_flags
                 .iter()
@@ -2218,19 +2215,30 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Session: unattached table
+    // Session: explicit PK requirement
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_session_unattached_table_inferred() {
+    fn test_session_unattached_table_ignored() {
         let mut session = Session::new();
-        // Record changes without attaching the table first
         session.record_insert("auto", vec![ChangesetValue::Integer(1)]);
         let cs = session.changeset();
-        assert_eq!(cs.tables.len(), 1);
-        assert_eq!(cs.tables[0].info.name, "auto");
-        assert_eq!(cs.tables[0].info.column_count, 1);
-        assert_eq!(cs.tables[0].info.pk_flags, vec![false]); // all non-PK
+        assert!(cs.tables.is_empty());
+    }
+
+    #[test]
+    fn test_session_attached_table_without_pk_is_ignored() {
+        let mut session = Session::new();
+        session.attach_table("auto", 2, vec![false, false]);
+        session.record_insert(
+            "auto",
+            vec![
+                ChangesetValue::Integer(1),
+                ChangesetValue::Text("a".to_owned()),
+            ],
+        );
+        let cs = session.changeset();
+        assert!(cs.tables.is_empty());
     }
 
     #[test]
@@ -2478,6 +2486,63 @@ mod tests {
             }
         );
         assert_eq!(target.tables["t"].len(), 2);
+    }
+
+    #[test]
+    fn test_apply_insert_without_pk_uses_full_row_identity() {
+        let mut target = SimpleTarget::default();
+        let cs = Changeset {
+            tables: vec![TableChangeset {
+                info: TableInfo {
+                    name: "t".to_owned(),
+                    column_count: 2,
+                    pk_flags: vec![false, false],
+                },
+                rows: vec![
+                    ChangesetRow {
+                        op: ChangeOp::Insert,
+                        old_values: Vec::new(),
+                        new_values: vec![
+                            ChangesetValue::Integer(1),
+                            ChangesetValue::Text("a".to_owned()),
+                        ],
+                    },
+                    ChangesetRow {
+                        op: ChangeOp::Insert,
+                        old_values: Vec::new(),
+                        new_values: vec![
+                            ChangesetValue::Integer(2),
+                            ChangesetValue::Text("b".to_owned()),
+                        ],
+                    },
+                    ChangesetRow {
+                        op: ChangeOp::Insert,
+                        old_values: Vec::new(),
+                        new_values: vec![
+                            ChangesetValue::Integer(1),
+                            ChangesetValue::Text("a".to_owned()),
+                        ],
+                    },
+                ],
+            }],
+        };
+
+        let outcome = target.apply(&cs, |_, _| ConflictAction::OmitChange);
+        assert_eq!(
+            outcome,
+            ApplyOutcome::Success {
+                applied: 2,
+                skipped: 1
+            }
+        );
+        assert_eq!(target.tables["t"].len(), 2);
+        assert_eq!(
+            target.tables["t"],
+            vec![
+                vec![SqliteValue::Integer(1), SqliteValue::Text("a".to_owned())],
+                vec![SqliteValue::Integer(2), SqliteValue::Text("b".to_owned())],
+            ]
+        );
     }
 
     #[test]
