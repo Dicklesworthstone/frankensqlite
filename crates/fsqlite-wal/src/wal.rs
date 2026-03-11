@@ -50,6 +50,31 @@ pub struct WalAppendFrameRef<'a> {
     pub db_size_if_commit: u32,
 }
 
+/// Identity for one WAL generation.
+///
+/// A generation changes whenever the WAL header is reset for a new checkpoint
+/// epoch. Salts usually change too, but correctness must not rely on that:
+/// reset/ABA detection must still work if a caller reuses the same salt pair
+/// with a new checkpoint sequence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalGenerationIdentity {
+    /// Checkpoint sequence stored in the WAL header.
+    pub checkpoint_seq: u32,
+    /// Salt pair copied into WAL frames for this generation.
+    pub salts: WalSalts,
+}
+
+impl WalGenerationIdentity {
+    /// Build a generation identity from a parsed WAL header.
+    #[must_use]
+    pub const fn from_header(header: &WalHeader) -> Self {
+        Self {
+            checkpoint_seq: header.checkpoint_seq,
+            salts: header.salts,
+        }
+    }
+}
+
 /// A WAL file backed by a VFS file handle.
 ///
 /// Manages the write-ahead log: creation, sequential frame append with
@@ -130,6 +155,7 @@ impl<F: VfsFile> WalFile<F> {
         if disk_header.magic != self.header.magic
             || disk_header.format_version != self.header.format_version
             || disk_header.page_size != self.header.page_size
+            || disk_header.checkpoint_seq != self.header.checkpoint_seq
             || disk_header.salts != self.header.salts
         {
             log_replay_decision(
@@ -368,6 +394,12 @@ impl<F: VfsFile> WalFile<F> {
     #[must_use]
     pub fn header(&self) -> &WalHeader {
         &self.header
+    }
+
+    /// The current WAL generation identity (`checkpoint_seq` + salts).
+    #[must_use]
+    pub fn generation_identity(&self) -> WalGenerationIdentity {
+        WalGenerationIdentity::from_header(&self.header)
     }
 
     /// Database page size in bytes.
@@ -2306,6 +2338,65 @@ mod tests {
             new_salts,
             "salts should be new generation"
         );
+
+        reader.close(&cx).expect("close reader");
+    }
+
+    #[test]
+    fn test_refresh_after_reset_with_same_salts_detects_new_generation() {
+        // Generation identity must include checkpoint_seq, not just salts.
+        // Otherwise a reset that reuses the same salts becomes an ABA hazard.
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let file = open_wal_file(&vfs, &cx);
+        let salts = test_salts();
+        let mut wal = WalFile::create(&cx, file, PAGE_SIZE, 0, salts).expect("create");
+
+        wal.append_frame(&cx, 1, &sample_page(1), 1)
+            .expect("append");
+        wal.close(&cx).expect("close");
+
+        let file_r = open_wal_file(&vfs, &cx);
+        let mut reader = WalFile::open(&cx, file_r).expect("open reader");
+        let before = reader.generation_identity();
+        assert_eq!(before.checkpoint_seq, 0);
+        assert_eq!(before.salts, salts);
+        assert_eq!(reader.frame_count(), 1);
+
+        let file_cp = open_wal_file(&vfs, &cx);
+        let mut cp = WalFile::open(&cx, file_cp).expect("open cp");
+        cp.reset(&cx, 1, salts, false)
+            .expect("reset with same salts");
+        cp.append_frame(&cx, 2, &sample_page(0xAA), 2)
+            .expect("append after reset");
+        cp.close(&cx).expect("close cp");
+
+        reader.refresh(&cx).expect("refresh");
+        let after = reader.generation_identity();
+        assert_eq!(
+            after.checkpoint_seq, 1,
+            "refresh must observe new checkpoint_seq"
+        );
+        assert_eq!(
+            after.salts, salts,
+            "same-salt reset is intentional in this test"
+        );
+        assert_ne!(
+            before, after,
+            "generation identity must change even when salts are reused"
+        );
+        assert_eq!(
+            reader.frame_count(),
+            1,
+            "reader must rebuild to new generation"
+        );
+
+        let (header, data) = reader.read_frame(&cx, 0).expect("read rebuilt frame");
+        assert_eq!(
+            header.page_number, 2,
+            "reader must see new-generation frame"
+        );
+        assert_eq!(data, sample_page(0xAA));
 
         reader.close(&cx).expect("close reader");
     }

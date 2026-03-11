@@ -56,7 +56,7 @@ pub use telemetry::{
     NoOpWalObserver, WalTelemetryEvent, WalTelemetryObserver, WalTelemetryRingBuffer,
     WalTelemetrySnapshot, wal_telemetry_snapshot,
 };
-pub use wal::WalFile;
+pub use wal::{WalFile, WalGenerationIdentity};
 #[cfg(not(target_arch = "wasm32"))]
 pub use wal_fec::{
     DEFAULT_RAPTORQ_REPAIR_SYMBOLS, MAX_RAPTORQ_REPAIR_SYMBOLS, WAL_FEC_GROUP_META_MAGIC,

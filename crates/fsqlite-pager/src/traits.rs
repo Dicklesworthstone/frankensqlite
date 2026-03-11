@@ -165,10 +165,12 @@ pub trait WalBackend: Send {
         self.append_frames(cx, &frame_refs)
     }
 
-    /// Look up the latest version of a page in the WAL.
+    /// Look up the latest version of a page in the current visible WAL snapshot.
     ///
-    /// Scans backwards from the most recent frame. Returns `None` if the
-    /// page has no WAL entry (caller should fall through to disk).
+    /// Implementations should prefer an authoritative per-generation lookup
+    /// structure for the steady-state path. Any slower fallback path should be
+    /// explicit and reserved for exceptional cases such as a deliberately
+    /// partial index or recovery-oriented handling.
     fn read_page(&mut self, cx: &Cx, page_number: u32) -> Result<Option<Vec<u8>>>;
 
     /// Count committed transactions that occur after the latest committed

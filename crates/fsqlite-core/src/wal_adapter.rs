@@ -19,11 +19,11 @@ use fsqlite_types::PageNumber;
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::SyncFlags;
 use fsqlite_vfs::VfsFile;
-use fsqlite_wal::checksum::{WAL_FRAME_HEADER_SIZE, WalChecksumTransform, WalSalts};
+use fsqlite_wal::checksum::{WAL_FRAME_HEADER_SIZE, WalChecksumTransform};
 use fsqlite_wal::wal::WalAppendFrameRef;
 use fsqlite_wal::{
     CheckpointMode as WalCheckpointMode, CheckpointState, CheckpointTarget, WalFile,
-    execute_checkpoint,
+    WalGenerationIdentity, execute_checkpoint,
 };
 use tracing::{debug, warn};
 
@@ -41,6 +41,41 @@ use crate::wal_fec_adapter::{FecCommitHook, FecCommitResult};
 /// Maximum number of entries in the page index before we stop growing it.
 /// This caps memory usage at roughly 64K * (4 + 8) = ~768 KB.
 const PAGE_INDEX_MAX_ENTRIES: usize = 65_536;
+
+/// How a visible page lookup was resolved for the current WAL generation.
+///
+/// The steady-state contract is that `Authoritative*` outcomes come from a
+/// complete per-generation index. `PartialIndexFallback*` outcomes are an
+/// explicit slow-path exception used only when the capped in-memory index is
+/// known to be incomplete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WalPageLookupResolution {
+    AuthoritativeHit { frame_index: usize },
+    AuthoritativeMiss,
+    PartialIndexFallbackHit { frame_index: usize },
+    PartialIndexFallbackMiss,
+}
+
+impl WalPageLookupResolution {
+    #[must_use]
+    const fn frame_index(self) -> Option<usize> {
+        match self {
+            Self::AuthoritativeHit { frame_index }
+            | Self::PartialIndexFallbackHit { frame_index } => Some(frame_index),
+            Self::AuthoritativeMiss | Self::PartialIndexFallbackMiss => None,
+        }
+    }
+
+    #[must_use]
+    const fn lookup_mode(self) -> &'static str {
+        match self {
+            Self::AuthoritativeHit { .. } | Self::AuthoritativeMiss => "authoritative_index",
+            Self::PartialIndexFallbackHit { .. } | Self::PartialIndexFallbackMiss => {
+                "partial_index_fallback"
+            }
+        }
+    }
+}
 
 pub struct WalBackendAdapter<F: VfsFile> {
     wal: WalFile<F>,
@@ -62,8 +97,11 @@ pub struct WalBackendAdapter<F: VfsFile> {
     /// Last committed frame index the page index has been built up to (inclusive).
     /// `None` means the index has never been built.
     index_built_to: Option<usize>,
-    /// WAL generation salts at the time the index was built, used to detect resets.
-    index_salts: Option<WalSalts>,
+    /// WAL generation identity at the time the index was built.
+    ///
+    /// This must include both `checkpoint_seq` and salts so same-salt resets do
+    /// not create an ABA hazard for the cached page index.
+    index_generation: Option<WalGenerationIdentity>,
     /// `true` when the page index hit the capacity cap and some pages were not
     /// indexed.  When this is set, a miss in the HashMap cannot be trusted ---
     /// the page may exist in the WAL but simply wasn't indexed.  In that case,
@@ -88,7 +126,7 @@ impl<F: VfsFile> WalBackendAdapter<F> {
             fec_pending: Vec::new(),
             page_index: HashMap::new(),
             index_built_to: None,
-            index_salts: None,
+            index_generation: None,
             index_is_partial: false,
             page_index_cap: PAGE_INDEX_MAX_ENTRIES,
         }
@@ -106,7 +144,7 @@ impl<F: VfsFile> WalBackendAdapter<F> {
             fec_pending: Vec::new(),
             page_index: HashMap::new(),
             index_built_to: None,
-            index_salts: None,
+            index_generation: None,
             index_is_partial: false,
             page_index_cap: PAGE_INDEX_MAX_ENTRIES,
         }
@@ -136,7 +174,7 @@ impl<F: VfsFile> WalBackendAdapter<F> {
     fn invalidate_page_index(&mut self) {
         self.page_index.clear();
         self.index_built_to = None;
-        self.index_salts = None;
+        self.index_generation = None;
         self.index_is_partial = false;
     }
 
@@ -145,11 +183,11 @@ impl<F: VfsFile> WalBackendAdapter<F> {
     /// Performs incremental extension when possible, or a full rebuild when WAL
     /// salts change or the commit horizon shrinks (e.g., after checkpoint reset).
     fn ensure_page_index(&mut self, cx: &Cx, last_commit_frame: usize) -> Result<()> {
-        let current_salts = self.wal.header().salts;
+        let current_generation = self.wal.generation_identity();
 
         // Detect WAL generation change (salts differ -> full rebuild).
-        let needs_full_rebuild = match self.index_salts {
-            Some(saved) => saved != current_salts,
+        let needs_full_rebuild = match self.index_generation {
+            Some(saved) => saved != current_generation,
             None => true,
         };
 
@@ -157,7 +195,7 @@ impl<F: VfsFile> WalBackendAdapter<F> {
             self.page_index.clear();
             self.index_built_to = None;
             self.index_is_partial = false;
-            self.index_salts = Some(current_salts);
+            self.index_generation = Some(current_generation);
             self.build_index_range(cx, 0, last_commit_frame)?;
             self.index_built_to = Some(last_commit_frame);
             return Ok(());
@@ -188,6 +226,30 @@ impl<F: VfsFile> WalBackendAdapter<F> {
                 self.index_built_to = Some(last_commit_frame);
                 Ok(())
             }
+        }
+    }
+
+    /// Resolve the most recent visible frame for `page_number`.
+    ///
+    /// The normal contract is `Authoritative*`: the in-memory page index fully
+    /// covers the visible WAL generation, so a miss means the page is absent.
+    /// `PartialIndexFallback*` is a bounded slow-path used only when the capped
+    /// index is known to be incomplete.
+    fn resolve_visible_frame(
+        &mut self,
+        cx: &Cx,
+        page_number: u32,
+        last_commit_frame: usize,
+    ) -> Result<WalPageLookupResolution> {
+        match self.page_index.get(&page_number) {
+            Some(&frame_index) => Ok(WalPageLookupResolution::AuthoritativeHit { frame_index }),
+            None if !self.index_is_partial => Ok(WalPageLookupResolution::AuthoritativeMiss),
+            None => match self.scan_backwards_for_page(cx, page_number, last_commit_frame)? {
+                Some(frame_index) => {
+                    Ok(WalPageLookupResolution::PartialIndexFallbackHit { frame_index })
+                }
+                None => Ok(WalPageLookupResolution::PartialIndexFallbackMiss),
+            },
         }
     }
 
@@ -515,28 +577,18 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
 
         // Build or extend the O(1) page index covering all committed frames.
         self.ensure_page_index(cx, last_commit_frame)?;
-
-        // O(1) lookup: page_number -> most recent frame index.
-        let frame_index = match self.page_index.get(&page_number) {
-            Some(&idx) => idx,
-            None if !self.index_is_partial => {
-                // The index covers every page in the WAL -- a miss here means
-                // the page genuinely isn't in the WAL.
-                return Ok(None);
-            }
-            None => {
-                // The index is partial (capacity cap was hit).  A HashMap miss
-                // might be a false negative -- fall back to a backwards linear
-                // scan of committed frames to be safe.
-                debug!(
-                    page_number,
-                    "WAL adapter: index miss with partial index, falling back to linear scan"
-                );
-                match self.scan_backwards_for_page(cx, page_number, last_commit_frame)? {
-                    Some(idx) => idx,
-                    None => return Ok(None),
-                }
-            }
+        let generation = self.wal.generation_identity();
+        let resolution = self.resolve_visible_frame(cx, page_number, last_commit_frame)?;
+        let Some(frame_index) = resolution.frame_index() else {
+            debug!(
+                page_number,
+                wal_checkpoint_seq = generation.checkpoint_seq,
+                wal_salt1 = generation.salts.salt1,
+                wal_salt2 = generation.salts.salt2,
+                lookup_mode = resolution.lookup_mode(),
+                "WAL adapter: page absent from current generation"
+            );
+            return Ok(None);
         };
 
         // Read the frame data at the resolved position.
@@ -558,7 +610,12 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
         let data = frame_buf[fsqlite_wal::checksum::WAL_FRAME_HEADER_SIZE..].to_vec();
         debug!(
             page_number,
-            frame_index, "WAL adapter: page found in WAL via index"
+            frame_index,
+            wal_checkpoint_seq = generation.checkpoint_seq,
+            wal_salt1 = generation.salts.salt1,
+            wal_salt2 = generation.salts.salt2,
+            lookup_mode = resolution.lookup_mode(),
+            "WAL adapter: resolved page from current WAL generation"
         );
         Ok(Some(data))
     }
@@ -1270,6 +1327,42 @@ mod tests {
     }
 
     #[test]
+    fn test_page_index_invalidated_on_same_salt_generation_change() {
+        // Generation identity must include checkpoint_seq. Reusing salts across
+        // reset must still invalidate the cached page index and avoid ABA bugs.
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let mut adapter = make_adapter(&vfs, &cx);
+
+        let reused_salts = adapter.inner().header().salts;
+        let old_data = sample_page(0x11);
+        adapter
+            .append_frame(&cx, 1, &old_data, 1)
+            .expect("append commit");
+        assert_eq!(adapter.read_page(&cx, 1).expect("read old"), Some(old_data));
+
+        adapter
+            .inner_mut()
+            .reset(&cx, 1, reused_salts, false)
+            .expect("reset with same salts");
+        let new_data = sample_page(0x22);
+        adapter
+            .append_frame(&cx, 2, &new_data, 2)
+            .expect("append new generation commit");
+
+        assert_eq!(
+            adapter.read_page(&cx, 1).expect("old page should be gone"),
+            None,
+            "cached index entries from the previous generation must be invalidated"
+        );
+        assert_eq!(
+            adapter.read_page(&cx, 2).expect("read new page"),
+            Some(new_data),
+            "adapter must resolve pages from the new generation even when salts are reused"
+        );
+    }
+
+    #[test]
     fn test_page_index_incremental_extend() {
         // Verify that the index extends incrementally when new frames are committed.
         let cx = test_cx();
@@ -1414,6 +1507,49 @@ mod tests {
             adapter.read_page(&cx, 2).expect("read p2"),
             Some(new_p2),
             "backwards scan must return the most recent frame for the page"
+        );
+    }
+
+    #[test]
+    fn test_lookup_contract_distinguishes_authoritative_and_fallback_paths() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let mut adapter = make_adapter(&vfs, &cx);
+        adapter.set_page_index_cap(1);
+
+        let p1 = sample_page(0x01);
+        let p2 = sample_page(0x02);
+        adapter.append_frame(&cx, 1, &p1, 0).expect("append p1");
+        adapter
+            .append_frame(&cx, 2, &p2, 2)
+            .expect("append p2 commit");
+
+        let last_commit = adapter
+            .inner_mut()
+            .last_commit_frame(&cx)
+            .expect("last commit")
+            .expect("commit exists");
+        adapter
+            .ensure_page_index(&cx, last_commit)
+            .expect("build index");
+
+        assert_eq!(
+            adapter
+                .resolve_visible_frame(&cx, 1, last_commit)
+                .expect("resolve indexed page"),
+            WalPageLookupResolution::AuthoritativeHit { frame_index: 0 }
+        );
+        assert_eq!(
+            adapter
+                .resolve_visible_frame(&cx, 2, last_commit)
+                .expect("resolve fallback page"),
+            WalPageLookupResolution::PartialIndexFallbackHit { frame_index: 1 }
+        );
+        assert_eq!(
+            adapter
+                .resolve_visible_frame(&cx, 99, last_commit)
+                .expect("resolve missing page"),
+            WalPageLookupResolution::PartialIndexFallbackMiss
         );
     }
 
