@@ -21,17 +21,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use fsqlite_core::connection::{
-    hot_path_profile_enabled, hot_path_profile_snapshot, reset_hot_path_profile,
-    set_hot_path_profile_enabled, HotPathProfileSnapshot, ParserHotPathProfileSnapshot,
+    HotPathProfileSnapshot, ParserHotPathProfileSnapshot, hot_path_profile_enabled,
+    hot_path_profile_snapshot, reset_hot_path_profile, set_hot_path_profile_enabled,
 };
 
-use crate::benchmark::{run_benchmark, BenchmarkConfig, BenchmarkMeta, BenchmarkSummary};
+use crate::HarnessSettings;
+use crate::benchmark::{BenchmarkConfig, BenchmarkMeta, BenchmarkSummary, run_benchmark};
 use crate::fsqlite_executor::run_oplog_fsqlite;
 use crate::oplog::{self, OpLog};
 use crate::report::EngineRunReport;
-use crate::run_workspace::{create_workspace_with_label, WorkspaceConfig};
+use crate::run_workspace::{WorkspaceConfig, create_workspace_with_label};
 use crate::sqlite_executor::run_oplog_sqlite;
-use crate::HarnessSettings;
 
 // ── Configuration ──────────────────────────────────────────────────────
 
@@ -1298,12 +1298,16 @@ mod tests {
         assert_eq!(cells.len(), 8);
 
         // Verify all combinations are present.
-        assert!(cells
-            .iter()
-            .any(|c| c.engine == Engine::Sqlite3 && c.fixture_id == "fix1" && c.concurrency == 1));
-        assert!(cells
-            .iter()
-            .any(|c| c.engine == Engine::Fsqlite && c.fixture_id == "fix2" && c.concurrency == 4));
+        assert!(
+            cells.iter().any(|c| c.engine == Engine::Sqlite3
+                && c.fixture_id == "fix1"
+                && c.concurrency == 1)
+        );
+        assert!(
+            cells.iter().any(|c| c.engine == Engine::Fsqlite
+                && c.fixture_id == "fix2"
+                && c.concurrency == 4)
+        );
     }
 
     #[test]
@@ -1490,12 +1494,14 @@ mod tests {
         assert!(!opcode_profile.opcodes.is_empty());
         assert!(!subsystem_profile.subsystem_ranking.is_empty());
         assert!(!actionable_ranking.named_hotspots.is_empty());
-        assert!(actionable_ranking
-            .named_hotspots
-            .iter()
-            .flat_map(|entry| entry.mapped_beads.iter())
-            .any(|bead| bead == "bd-db300.4.2"
-                || bead == "bd-db300.4.3"
-                || bead == "bd-db300.4.4"));
+        assert!(
+            actionable_ranking
+                .named_hotspots
+                .iter()
+                .flat_map(|entry| entry.mapped_beads.iter())
+                .any(|bead| bead == "bd-db300.4.2"
+                    || bead == "bd-db300.4.3"
+                    || bead == "bd-db300.4.4")
+        );
     }
 }

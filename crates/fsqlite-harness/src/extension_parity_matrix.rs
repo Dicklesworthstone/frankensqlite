@@ -1453,11 +1453,23 @@ impl ExtensionParityMatrix {
         );
         tag_named_entries(
             &mut entries,
-            &["decimal_sum()", "dbstat virtual table", "dbpage virtual table"],
+            &[
+                "decimal_sum()",
+                "dbstat virtual table",
+                "dbpage virtual table",
+            ],
             "connection-runtime-unwired",
         );
-        tag_module(&mut entries, ExtensionModule::Fts3, "connection-runtime-unwired");
-        tag_module(&mut entries, ExtensionModule::Rtree, "connection-runtime-unwired");
+        tag_module(
+            &mut entries,
+            ExtensionModule::Fts3,
+            "connection-runtime-unwired",
+        );
+        tag_module(
+            &mut entries,
+            ExtensionModule::Rtree,
+            "connection-runtime-unwired",
+        );
         tag_module(&mut entries, ExtensionModule::Session, "library-api-only");
 
         Self {

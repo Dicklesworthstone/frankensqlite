@@ -775,7 +775,10 @@ const GENERATE_SERIES_TABLE_COLUMN_NAMES: [&str; 4] = ["value", "start", "stop",
 
 fn default_vtab_module_registry() -> HashMap<String, Box<dyn VtabModuleFactory>> {
     let mut modules: HashMap<String, Box<dyn VtabModuleFactory>> = HashMap::new();
-    modules.insert("FTS5".to_owned(), Box::new(module_factory_from::<Fts5Table>()));
+    modules.insert(
+        "FTS5".to_owned(),
+        Box::new(module_factory_from::<Fts5Table>()),
+    );
     modules.insert(
         "JSON_EACH".to_owned(),
         Box::new(module_factory_from::<JsonEachVtab>()),
@@ -21573,7 +21576,9 @@ impl ReconstructedIndexDefinition {
     }
 }
 
-fn parse_index_definition_from_create_sql(create_sql: &str) -> Option<ReconstructedIndexDefinition> {
+fn parse_index_definition_from_create_sql(
+    create_sql: &str,
+) -> Option<ReconstructedIndexDefinition> {
     match parse_single_statement(create_sql).ok()? {
         Statement::CreateIndex(stmt) => index_definition_from_create_index_statement(&stmt),
         _ => None,
@@ -35460,20 +35465,29 @@ mod tests {
         let conn_b = Connection::open(path_str).unwrap();
         conn_b.execute("BEGIN;").unwrap();
         assert_eq!(
-            conn_b.query_row("SELECT v FROM t WHERE id = 1;").unwrap().values()[0],
+            conn_b
+                .query_row("SELECT v FROM t WHERE id = 1;")
+                .unwrap()
+                .values()[0],
             SqliteValue::Integer(0),
             "reader should observe the pre-commit value at transaction start"
         );
 
         conn_a.execute("UPDATE t SET v = 1 WHERE id = 1;").unwrap();
         assert_eq!(
-            conn_a.query_row("SELECT v FROM t WHERE id = 1;").unwrap().values()[0],
+            conn_a
+                .query_row("SELECT v FROM t WHERE id = 1;")
+                .unwrap()
+                .values()[0],
             SqliteValue::Integer(1),
             "writer should publish the new committed value"
         );
 
         assert_eq!(
-            conn_b.query_row("SELECT v FROM t WHERE id = 1;").unwrap().values()[0],
+            conn_b
+                .query_row("SELECT v FROM t WHERE id = 1;")
+                .unwrap()
+                .values()[0],
             SqliteValue::Integer(0),
             "concurrent transaction must keep its begin-time snapshot even after another connection commits"
         );
@@ -41494,7 +41508,8 @@ mod schema_loading_tests {
             assert_eq!(index.key_expressions.len(), 1);
             assert_eq!(index.key_expressions[0].to_ascii_lowercase(), "lower(name)");
             assert_eq!(
-                index.where_clause
+                index
+                    .where_clause
                     .as_deref()
                     .map(str::to_ascii_lowercase)
                     .as_deref(),
@@ -41503,15 +41518,15 @@ mod schema_loading_tests {
         }
 
         let sql_rows = conn
-            .query(
-                "SELECT sql FROM sqlite_master WHERE type='index' AND name='uq_agents_name_ci';",
-            )
+            .query("SELECT sql FROM sqlite_master WHERE type='index' AND name='uq_agents_name_ci';")
             .unwrap();
         assert_eq!(sql_rows.len(), 1);
         let sql_text = sql_rows[0].values()[0].to_text();
         assert!(
             sql_text.to_ascii_lowercase().contains("lower(name)")
-                && sql_text.to_ascii_lowercase().contains("where is_active = 1"),
+                && sql_text
+                    .to_ascii_lowercase()
+                    .contains("where is_active = 1"),
             "sqlite_master SQL should round-trip the expression and predicate: {sql_text}"
         );
 
@@ -44890,7 +44905,10 @@ mod pager_routing_tests {
 
         let loser_err = match conn2.execute("UPDATE t SET v = v + 1 WHERE id = 1;") {
             Ok(changes) => {
-                assert_eq!(changes, 1, "second writer should affect one row when UPDATE wins");
+                assert_eq!(
+                    changes, 1,
+                    "second writer should affect one row when UPDATE wins"
+                );
                 assert_eq!(
                     read_active_row(&conn2),
                     vec![SqliteValue::Null, SqliteValue::Integer(1)],

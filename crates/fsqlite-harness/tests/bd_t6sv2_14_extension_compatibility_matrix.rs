@@ -12,12 +12,12 @@
 //! - Concurrent writer invariant area integration
 //! - Conformance summary
 
+use fsqlite::{Connection, FrankenError, SqliteValue};
 use fsqlite_harness::extension_parity_matrix::{
     ExtensionExecutionPlan, ExtensionModule, ExtensionParityMatrix, FeatureFlagTable,
     MATRIX_SCHEMA_VERSION, SurfaceKind, compute_extension_coverage,
 };
 use fsqlite_harness::parity_taxonomy::ParityStatus;
-use fsqlite::{Connection, FrankenError, SqliteValue};
 
 // ── 1. Extension module catalog ──────────────────────────────────────────────
 
@@ -467,7 +467,9 @@ fn connection_runtime_state_tags_document_extension_reachability() {
         "FTS5 virtual table should be tagged as connection-runtime-wired"
     );
     assert!(
-        wired.iter().any(|entry| entry.name == "icu_load_collation()"),
+        wired
+            .iter()
+            .any(|entry| entry.name == "icu_load_collation()"),
         "icu_load_collation() should be tagged as connection-runtime-wired"
     );
     assert!(
@@ -477,11 +479,15 @@ fn connection_runtime_state_tags_document_extension_reachability() {
 
     let unwired = matrix.entries_by_tags(&["connection-runtime-unwired"]);
     assert!(
-        unwired.iter().any(|entry| entry.name == "FTS3 virtual table"),
+        unwired
+            .iter()
+            .any(|entry| entry.name == "FTS3 virtual table"),
         "FTS3 virtual table should be tagged as connection-runtime-unwired"
     );
     assert!(
-        unwired.iter().any(|entry| entry.name == "rtree virtual table"),
+        unwired
+            .iter()
+            .any(|entry| entry.name == "rtree virtual table"),
         "rtree virtual table should be tagged as connection-runtime-unwired"
     );
     assert!(
@@ -512,17 +518,11 @@ fn connection_runtime_wired_extension_surfaces_dispatch_through_connection_path(
     assert_eq!(json_rows.len(), 2);
     assert_eq!(
         json_rows[0].values(),
-        &[
-            SqliteValue::Text("a".to_owned()),
-            SqliteValue::Integer(10),
-        ]
+        &[SqliteValue::Text("a".to_owned()), SqliteValue::Integer(10),]
     );
     assert_eq!(
         json_rows[1].values(),
-        &[
-            SqliteValue::Text("b".to_owned()),
-            SqliteValue::Integer(20),
-        ]
+        &[SqliteValue::Text("b".to_owned()), SqliteValue::Integer(20),]
     );
 
     let series_rows = conn
@@ -547,7 +547,10 @@ fn connection_runtime_wired_extension_surfaces_dispatch_through_connection_path(
         .query("SELECT icu_upper('straße', 'de_DE'), uuid();")
         .expect("ICU and misc scalar functions should be reachable");
     assert_eq!(icu_rows.len(), 1);
-    assert_eq!(icu_rows[0].values()[0], SqliteValue::Text("STRASSE".to_owned()));
+    assert_eq!(
+        icu_rows[0].values()[0],
+        SqliteValue::Text("STRASSE".to_owned())
+    );
     match &icu_rows[0].values()[1] {
         SqliteValue::Text(uuid) => assert_eq!(uuid.len(), 36, "uuid() should return RFC4122 text"),
         other => panic!("uuid() should return text, got {other:?}"),

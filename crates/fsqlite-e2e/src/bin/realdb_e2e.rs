@@ -24,28 +24,28 @@ use sha2::{Digest, Sha256};
 use rusqlite::{Connection, DatabaseName, OpenFlags};
 use serde::Serialize;
 
-use fsqlite_types::{DatabaseHeader, DATABASE_HEADER_SIZE};
+use fsqlite_types::{DATABASE_HEADER_SIZE, DatabaseHeader};
 
-use fsqlite_e2e::benchmark::{run_benchmark, BenchmarkConfig, BenchmarkMeta, BenchmarkSummary};
-use fsqlite_e2e::corruption::{inject_corruption, CorruptionStrategy};
+use fsqlite_e2e::benchmark::{BenchmarkConfig, BenchmarkMeta, BenchmarkSummary, run_benchmark};
+use fsqlite_e2e::corruption::{CorruptionStrategy, inject_corruption};
 use fsqlite_e2e::fixture_metadata::{
-    normalize_tags, size_bucket_tag, ColumnProfileV1, FixtureFeaturesV1, FixtureMetadataV1,
-    FixtureSafetyV1, RiskLevel, SqliteMetaV1, TableProfileV1, FIXTURE_METADATA_SCHEMA_VERSION_V1,
+    ColumnProfileV1, FIXTURE_METADATA_SCHEMA_VERSION_V1, FixtureFeaturesV1, FixtureMetadataV1,
+    FixtureSafetyV1, RiskLevel, SqliteMetaV1, TableProfileV1, normalize_tags, size_bucket_tag,
 };
-use fsqlite_e2e::fsqlite_executor::{run_oplog_fsqlite, FsqliteExecConfig};
+use fsqlite_e2e::fsqlite_executor::{FsqliteExecConfig, run_oplog_fsqlite};
 use fsqlite_e2e::golden::{format_mismatch_diagnostic, verify_databases};
 use fsqlite_e2e::methodology::EnvironmentMeta;
 use fsqlite_e2e::oplog::{self, OpLog};
 use fsqlite_e2e::perf_runner::{
+    FsqliteHotPathProfileConfig, HotPathArtifactManifest, HotPathProfileReport,
     build_hot_path_actionable_ranking, build_hot_path_opcode_profile,
     build_hot_path_subsystem_profile, profile_fsqlite_mixed_read_write_hot_path,
     render_hot_path_profile_markdown, write_hot_path_profile_artifacts,
-    FsqliteHotPathProfileConfig, HotPathArtifactManifest, HotPathProfileReport,
 };
 use fsqlite_e2e::report::{EngineInfo, RunRecordV1, RunRecordV1Args};
 use fsqlite_e2e::report_render::render_benchmark_summaries_markdown;
-use fsqlite_e2e::run_workspace::{create_workspace_with_label, WorkspaceConfig};
-use fsqlite_e2e::sqlite_executor::{run_oplog_sqlite, SqliteExecConfig};
+use fsqlite_e2e::run_workspace::{WorkspaceConfig, create_workspace_with_label};
+use fsqlite_e2e::sqlite_executor::{SqliteExecConfig, run_oplog_sqlite};
 
 const HOT_PATH_INLINE_BUNDLE_SCHEMA_V1: &str = "fsqlite-e2e.hot_path_inline_bundle.v1";
 const HOT_PATH_INLINE_BUNDLE_PREFIX: &str = "HOT_PATH_INLINE_BUNDLE_JSON=";
@@ -3755,12 +3755,12 @@ fn cmd_compare(argv: &[String]) -> i32 {
 mod tests {
     use super::*;
     use fsqlite_e2e::perf_runner::{
-        HotPathAllocatorPressure, HotPathArtifactFile, HotPathArtifactManifest,
-        HotPathOpcodeProfileEntry, HotPathParserProfile, HotPathProfileReport, HotPathRankingEntry,
-        HotPathRecordDecodeProfile, HotPathRowMaterializationProfile, HotPathTypeProfile,
-        HotPathValueTypeProfile, HOT_PATH_OPCODE_PROFILE_SCHEMA_V1,
-        HOT_PATH_PROFILE_ACTIONABLE_RANKING_SCHEMA_V1, HOT_PATH_PROFILE_MANIFEST_SCHEMA_V1,
-        HOT_PATH_PROFILE_SCHEMA_V1, HOT_PATH_SUBSYSTEM_PROFILE_SCHEMA_V1,
+        HOT_PATH_OPCODE_PROFILE_SCHEMA_V1, HOT_PATH_PROFILE_ACTIONABLE_RANKING_SCHEMA_V1,
+        HOT_PATH_PROFILE_MANIFEST_SCHEMA_V1, HOT_PATH_PROFILE_SCHEMA_V1,
+        HOT_PATH_SUBSYSTEM_PROFILE_SCHEMA_V1, HotPathAllocatorPressure, HotPathArtifactFile,
+        HotPathArtifactManifest, HotPathOpcodeProfileEntry, HotPathParserProfile,
+        HotPathProfileReport, HotPathRankingEntry, HotPathRecordDecodeProfile,
+        HotPathRowMaterializationProfile, HotPathTypeProfile, HotPathValueTypeProfile,
     };
     use fsqlite_e2e::report::{CorrectnessReport, EngineRunReport};
     use serde_json::Value;
@@ -4083,9 +4083,11 @@ mod tests {
             value["subsystem_profile"]["subsystem_ranking"][0]["subsystem"],
             "record_decode"
         );
-        assert!(value["summary_markdown"]
-            .as_str()
-            .is_some_and(|summary| summary.contains("## Ranked Hotspots")));
+        assert!(
+            value["summary_markdown"]
+                .as_str()
+                .is_some_and(|summary| summary.contains("## Ranked Hotspots"))
+        );
     }
 
     #[test]

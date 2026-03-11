@@ -285,8 +285,8 @@ impl TableSchema {
             idx.supports_direct_column_lookup()
                 && idx
                     .columns
-                .first()
-                .is_some_and(|c| c.eq_ignore_ascii_case(col_name))
+                    .first()
+                    .is_some_and(|c| c.eq_ignore_ascii_case(col_name))
         })
     }
 
