@@ -1059,6 +1059,7 @@ where
         let journal_mode = inner.journal_mode;
         let pool = inner.cache.pool().clone();
         let published_visible_commit_seq = self.published.snapshot().visible_commit_seq;
+        let cleanup_cx = cleanup_child_cx(cx);
         drop(inner);
 
         Ok(SimpleTransaction {
@@ -1080,6 +1081,7 @@ where
             savepoint_stack: Vec::new(),
             journal_mode,
             pool,
+            cleanup_cx,
         })
     }
 
@@ -1162,9 +1164,93 @@ impl<V: Vfs> SimplePager<V>
 where
     V::File: Send + Sync,
 {
+    const EXPORT_COPY_CHUNK_SIZE: usize = 64 * 1024;
+
+    /// Return the database path used by this pager.
+    #[must_use]
+    pub fn db_path(&self) -> &Path {
+        &self.db_path
+    }
+
     /// Clone the pager's VFS handle for companion-file operations.
     pub fn vfs_handle(&self) -> Arc<V> {
         Arc::clone(&self.vfs)
+    }
+
+    /// Copy the pager's main database file to `target_path` via the active VFS.
+    ///
+    /// This is the pager-side export primitive used by higher-level features
+    /// like `VACUUM INTO` and backup/canonicalization flows. The copy is only
+    /// allowed when the pager is quiescent. In WAL mode we first checkpoint and
+    /// truncate the WAL so the destination contains a self-contained main DB.
+    pub fn copy_database_to(&self, cx: &Cx, target_path: &Path) -> Result<()> {
+        let source_path = self.db_path.clone();
+        let source_full = self.vfs.full_pathname(cx, &source_path)?;
+        let target_full = self.vfs.full_pathname(cx, target_path)?;
+        if source_full == target_full {
+            return Err(FrankenError::CannotOpen { path: target_full });
+        }
+        if self.vfs.access(cx, &target_full, AccessFlags::EXISTS)? {
+            return Err(FrankenError::CannotOpen { path: target_full });
+        }
+
+        let journal_mode = {
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?;
+            if inner.active_transactions > 0 || inner.checkpoint_active {
+                return Err(FrankenError::Busy);
+            }
+            inner.journal_mode
+        };
+
+        if journal_mode == JournalMode::Wal {
+            self.checkpoint(cx, traits::CheckpointMode::Truncate)?;
+        }
+
+        let source_flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::READWRITE;
+        let target_flags = VfsOpenFlags::MAIN_DB
+            | VfsOpenFlags::CREATE
+            | VfsOpenFlags::EXCLUSIVE
+            | VfsOpenFlags::READWRITE;
+        let (mut source_file, _) = self.vfs.open(cx, Some(&source_full), source_flags)?;
+        let (mut target_file, _) = self.vfs.open(cx, Some(&target_full), target_flags)?;
+
+        let copy_result = (|| -> Result<()> {
+            let file_size = source_file.file_size(cx)?;
+            let mut copied = 0_u64;
+            let mut buffer = vec![0_u8; Self::EXPORT_COPY_CHUNK_SIZE];
+            while copied < file_size {
+                let remaining = file_size - copied;
+                let chunk_len = usize::try_from(remaining.min(buffer.len() as u64))
+                    .map_err(|_| FrankenError::internal("copy chunk length overflow"))?;
+                let bytes_read = source_file.read(cx, &mut buffer[..chunk_len], copied)?;
+                if bytes_read == 0 {
+                    return Err(FrankenError::internal(
+                        "unexpected EOF while copying database image",
+                    ));
+                }
+                target_file.write(cx, &buffer[..bytes_read], copied)?;
+                copied = copied
+                    .checked_add(
+                        u64::try_from(bytes_read)
+                            .map_err(|_| FrankenError::internal("copy size overflow"))?,
+                    )
+                    .ok_or_else(|| FrankenError::internal("copy offset overflow"))?;
+            }
+            target_file.truncate(cx, file_size)?;
+            target_file.sync(cx, SyncFlags::FULL)?;
+            Ok(())
+        })();
+
+        let source_close = source_file.close(cx);
+        let target_close = target_file.close(cx);
+
+        copy_result?;
+        source_close?;
+        target_close?;
+        Ok(())
     }
 
     /// Capture point-in-time page-cache counters.
@@ -1459,11 +1545,8 @@ where
         })
     }
 
-    /// Open (or create) a database and return a pager.
-    ///
-    /// This convenience helper preserves the historical detached-context
-    /// behavior for tests and legacy callers. Production paths should prefer
-    /// [`Self::open_with_cx`] so trace/budget lineage is preserved.
+    /// Open (or create) a database and return a pager using a detached test context.
+    #[cfg(test)]
     #[allow(clippy::too_many_lines)]
     pub fn open(vfs: V, path: &Path, page_size: PageSize) -> Result<Self> {
         let cx = Cx::new();
@@ -1656,6 +1739,8 @@ pub struct SimpleTransaction<V: Vfs> {
     journal_mode: JournalMode,
     /// Buffer pool for allocating write-set pages.
     pool: PageBufPool,
+    /// Caller-rooted cleanup context used for drop-time finalization.
+    cleanup_cx: Cx,
 }
 
 impl<V: Vfs> traits::sealed::Sealed for SimpleTransaction<V> {}
@@ -1706,6 +1791,10 @@ impl<V: Vfs> SimpleTransaction<V> {
             db_growth: max_written > current_db_size,
         }
     }
+}
+
+fn cleanup_child_cx(cx: &Cx) -> Cx {
+    cx.create_child()
 }
 
 impl<V> SimpleTransaction<V>
@@ -2406,11 +2495,14 @@ where
                 inner.next_page = entry.next_page_snapshot;
                 inner.freelist.clone_from(&entry.freelist_snapshot);
             } else {
+                let current_db_size = inner.db_size;
                 for page in self
                     .allocated_from_eof
                     .drain(entry.allocated_from_eof_snapshot.len()..)
                 {
-                    inner.freelist.push(page);
+                    if page.get() <= current_db_size {
+                        inner.freelist.push(page);
+                    }
                 }
                 for page in self
                     .allocated_from_freelist
@@ -2458,17 +2550,26 @@ impl<V: Vfs> Drop for SimpleTransaction<V> {
 
                 inner.writer_active = false;
             } else if self.is_writer && self.mode == TransactionMode::Concurrent {
+                // For concurrent transactions, only return pages to the freelist
+                // if they are within the current committed db_size. Pages beyond
+                // db_size were allocated from EOF and should be "dropped" by
+                // just not being reused, as they were never part of a committed
+                // state and cannot be safely referenced in a trunk page if
+                // db_size is not also extended.
+                let current_db_size = inner.db_size;
                 for page in self.allocated_from_eof.drain(..) {
-                    inner.freelist.push(page);
+                    if page.get() <= current_db_size {
+                        inner.freelist.push(page);
+                    }
                 }
             }
             inner.active_transactions = inner.active_transactions.saturating_sub(1);
             let preserve_level =
                 retained_lock_level_after_txn_exit(inner.active_transactions, inner.writer_active);
-            // Best-effort downgrade/release. Drop has no caller-owned context,
-            // so cleanup uses a detached Cx only for this final unlock.
-            let cx = Cx::new();
-            let _ = inner.db_file.unlock(&cx, preserve_level);
+            // Final unlock should preserve caller lineage without letting
+            // inherited cancellation strand the file lock during drop cleanup.
+            let _mask = self.cleanup_cx.masked();
+            let _ = inner.db_file.unlock(&self.cleanup_cx, preserve_level);
         }
         // We cannot easily delete the journal file here because Drop doesn't
         // take a Context or return a Result. It's best effort cleanup.
@@ -2703,6 +2804,7 @@ where
         cx: &Cx,
         mode: traits::CheckpointMode,
     ) -> Result<traits::CheckpointResult> {
+        let cleanup_cx = cleanup_child_cx(cx);
         // Take the WAL backend out of the pager while marking checkpoint active.
         // `begin()` and deferred writer upgrades are blocked while this flag is
         // set so commits cannot observe "WAL mode but no backend".
@@ -2752,6 +2854,7 @@ where
             inner: &'a std::sync::Mutex<PagerInner<F>>,
             published: &'a PublishedPagerState,
             wal: Option<Box<dyn WalBackend>>,
+            cleanup_cx: Cx,
         }
 
         impl<F: VfsFile> Drop for CheckpointGuard<'_, F> {
@@ -2761,8 +2864,9 @@ where
                         inner.wal_backend = Some(wal);
                     }
                     inner.checkpoint_active = false;
+                    let _mask = self.cleanup_cx.masked();
                     self.published.publish(
-                        &Cx::new(),
+                        &self.cleanup_cx,
                         PublishedPagerUpdate {
                             visible_commit_seq: inner.commit_seq,
                             db_size: inner.db_size,
@@ -2780,6 +2884,7 @@ where
             inner: &self.inner,
             published: self.published.as_ref(),
             wal: Some(wal),
+            cleanup_cx,
         };
 
         // Create a checkpoint writer that writes directly to the database file.
@@ -2807,6 +2912,13 @@ mod tests {
     use std::sync::{Arc, Mutex, OnceLock};
 
     const BEAD_ID: &str = "bd-bca.1";
+    type ObservedLockLevel = Arc<Mutex<LockLevel>>;
+    type ObservedUnlockTraceIds = Arc<Mutex<Vec<u64>>>;
+    type ObservedCleanupUnlockHarness = (
+        SimplePager<ObservedLockVfs>,
+        ObservedLockLevel,
+        ObservedUnlockTraceIds,
+    );
 
     fn init_publication_test_tracing() {
         static TRACING_INIT: OnceLock<()> = OnceLock::new();
@@ -2880,7 +2992,9 @@ mod tests {
     #[derive(Clone)]
     struct ObservedLockVfs {
         inner: MemoryVfs,
-        observed_lock_level: Arc<Mutex<LockLevel>>,
+        observed_lock_level: ObservedLockLevel,
+        observed_unlock_trace_ids: ObservedUnlockTraceIds,
+        fail_unlock_on_checkpoint_error: bool,
     }
 
     impl ObservedLockVfs {
@@ -2888,17 +3002,32 @@ mod tests {
             Self {
                 inner: MemoryVfs::new(),
                 observed_lock_level: Arc::new(Mutex::new(LockLevel::None)),
+                observed_unlock_trace_ids: Arc::new(Mutex::new(Vec::new())),
+                fail_unlock_on_checkpoint_error: false,
             }
         }
 
-        fn observed_lock_level(&self) -> Arc<Mutex<LockLevel>> {
+        fn observed_lock_level(&self) -> ObservedLockLevel {
             Arc::clone(&self.observed_lock_level)
+        }
+
+        fn observed_unlock_trace_ids(&self) -> ObservedUnlockTraceIds {
+            Arc::clone(&self.observed_unlock_trace_ids)
+        }
+
+        fn with_checkpoint_enforced_unlock() -> Self {
+            Self {
+                fail_unlock_on_checkpoint_error: true,
+                ..Self::new()
+            }
         }
     }
 
     struct ObservedLockFile {
         inner: MemoryFile,
-        observed_lock_level: Arc<Mutex<LockLevel>>,
+        observed_lock_level: ObservedLockLevel,
+        observed_unlock_trace_ids: ObservedUnlockTraceIds,
+        fail_unlock_on_checkpoint_error: bool,
     }
 
     impl Vfs for ObservedLockVfs {
@@ -2919,6 +3048,8 @@ mod tests {
                 ObservedLockFile {
                     inner,
                     observed_lock_level: self.observed_lock_level(),
+                    observed_unlock_trace_ids: self.observed_unlock_trace_ids(),
+                    fail_unlock_on_checkpoint_error: self.fail_unlock_on_checkpoint_error,
                 },
                 actual_flags,
             ))
@@ -2973,6 +3104,14 @@ mod tests {
         }
 
         fn unlock(&mut self, cx: &Cx, level: LockLevel) -> Result<()> {
+            self.observed_unlock_trace_ids
+                .lock()
+                .unwrap()
+                .push(cx.trace_id());
+            if self.fail_unlock_on_checkpoint_error {
+                cx.checkpoint()
+                    .map_err(|err| FrankenError::internal(err.to_string()))?;
+            }
             self.inner.unlock(cx, level)?;
             *self.observed_lock_level.lock().unwrap() = level;
             Ok(())
@@ -3013,12 +3152,21 @@ mod tests {
         }
     }
 
-    fn observed_lock_pager() -> (SimplePager<ObservedLockVfs>, Arc<Mutex<LockLevel>>) {
+    fn observed_lock_pager() -> (SimplePager<ObservedLockVfs>, ObservedLockLevel) {
         let vfs = ObservedLockVfs::new();
         let observed_lock_level = vfs.observed_lock_level();
         let path = PathBuf::from("/observed-lock.db");
         let pager = SimplePager::open(vfs, &path, PageSize::DEFAULT).unwrap();
         (pager, observed_lock_level)
+    }
+
+    fn observed_lock_pager_with_checkpoint_enforced_unlock() -> ObservedCleanupUnlockHarness {
+        let vfs = ObservedLockVfs::with_checkpoint_enforced_unlock();
+        let observed_lock_level = vfs.observed_lock_level();
+        let observed_unlock_trace_ids = vfs.observed_unlock_trace_ids();
+        let path = PathBuf::from("/observed-lock-checkpoint.db");
+        let pager = SimplePager::open(vfs, &path, PageSize::DEFAULT).unwrap();
+        (pager, observed_lock_level, observed_unlock_trace_ids)
     }
 
     #[derive(Debug, Default)]
@@ -3785,6 +3933,29 @@ mod tests {
         assert!(
             txn2.is_ok(),
             "bead_id={BEAD_ID} case=drop_releases_writer_lock"
+        );
+    }
+
+    #[test]
+    fn test_drop_cleanup_unlock_preserves_lineage_and_masks_cancellation() {
+        let (pager, observed_lock_level, observed_unlock_trace_ids) =
+            observed_lock_pager_with_checkpoint_enforced_unlock();
+        let cx = Cx::new().with_trace_context(41, 0, 0);
+
+        {
+            let _txn = pager.begin(&cx, TransactionMode::ReadOnly).unwrap();
+            cx.cancel();
+        }
+
+        assert_eq!(
+            *observed_lock_level.lock().unwrap(),
+            LockLevel::None,
+            "bead_id={BEAD_ID} case=drop_cleanup_unlock_releases_lock_after_parent_cancel"
+        );
+        assert_eq!(
+            observed_unlock_trace_ids.lock().unwrap().last().copied(),
+            Some(41),
+            "bead_id={BEAD_ID} case=drop_cleanup_unlock_uses_parent_trace_lineage"
         );
     }
 
@@ -8897,6 +9068,94 @@ mod tests {
             refreshed_reader.get_page(&cx, p).unwrap().as_ref()[0],
             0x22,
             "bead_id={BEAD_ID} case=publication_refresh_reads_latest_committed_page"
+        );
+    }
+
+    fn read_all_vfs_bytes<V: Vfs>(vfs: &V, cx: &Cx, path: &Path) -> Vec<u8> {
+        let flags = VfsOpenFlags::MAIN_DB | VfsOpenFlags::READWRITE;
+        let (mut file, _) = vfs.open(cx, Some(path), flags).unwrap();
+        let size = usize::try_from(file.file_size(cx).unwrap()).unwrap();
+        let mut out = vec![0_u8; size];
+        let read = file.read(cx, &mut out, 0).unwrap();
+        assert_eq!(read, size);
+        file.close(cx).unwrap();
+        out
+    }
+
+    #[test]
+    fn test_copy_database_to_copies_main_db_via_vfs() {
+        let cx = Cx::new();
+        let vfs = MemoryVfs::new();
+        let source_path = PathBuf::from("/copy_source.db");
+        let target_path = PathBuf::from("/copy_target.db");
+        let pager = SimplePager::open(vfs.clone(), &source_path, PageSize::DEFAULT).unwrap();
+        let page_size = PageSize::DEFAULT.as_usize();
+
+        let page_no = {
+            let mut txn = pager.begin(&cx, TransactionMode::Immediate).unwrap();
+            let page_no = txn.allocate_page(&cx).unwrap();
+            let mut page = vec![0xA5; page_size];
+            page[0] = 0x5A;
+            page[page_size - 1] = 0xC3;
+            txn.write_page(&cx, page_no, &page).unwrap();
+            txn.commit(&cx).unwrap();
+            page_no
+        };
+
+        pager.copy_database_to(&cx, &target_path).unwrap();
+
+        let source_bytes = read_all_vfs_bytes(vfs.as_ref(), &cx, &source_path);
+        let target_bytes = read_all_vfs_bytes(vfs.as_ref(), &cx, &target_path);
+        assert_eq!(
+            target_bytes, source_bytes,
+            "bead_id={BEAD_ID} case=copy_database_to_byte_identical_copy"
+        );
+
+        let copied = SimplePager::open(vfs, &target_path, PageSize::DEFAULT).unwrap();
+        let reader = copied.begin(&cx, TransactionMode::ReadOnly).unwrap();
+        let page = reader.get_page(&cx, page_no).unwrap();
+        assert_eq!(
+            page.as_ref()[0],
+            0x5A,
+            "bead_id={BEAD_ID} case=copy_database_to_reopen_reads_committed_page"
+        );
+        assert_eq!(
+            page.as_ref()[page_size - 1],
+            0xC3,
+            "bead_id={BEAD_ID} case=copy_database_to_preserves_page_tail"
+        );
+    }
+
+    #[test]
+    fn test_copy_database_to_rejects_existing_target() {
+        let cx = Cx::new();
+        let vfs = MemoryVfs::new();
+        let source_path = PathBuf::from("/copy_existing_source.db");
+        let target_path = PathBuf::from("/copy_existing_target.db");
+        let pager = SimplePager::open(vfs.clone(), &source_path, PageSize::DEFAULT).unwrap();
+        let _target = SimplePager::open(vfs, &target_path, PageSize::DEFAULT).unwrap();
+
+        let err = pager.copy_database_to(&cx, &target_path).unwrap_err();
+        assert!(
+            matches!(err, FrankenError::CannotOpen { .. }),
+            "bead_id={BEAD_ID} case=copy_database_to_existing_target_err={err:?}"
+        );
+    }
+
+    #[test]
+    fn test_copy_database_to_requires_quiescent_pager() {
+        let cx = Cx::new();
+        let vfs = MemoryVfs::new();
+        let source_path = PathBuf::from("/copy_busy_source.db");
+        let target_path = PathBuf::from("/copy_busy_target.db");
+        let pager = SimplePager::open(vfs, &source_path, PageSize::DEFAULT).unwrap();
+
+        let _reader = pager.begin(&cx, TransactionMode::ReadOnly).unwrap();
+        let err = pager.copy_database_to(&cx, &target_path).unwrap_err();
+        assert_eq!(
+            err,
+            FrankenError::Busy,
+            "bead_id={BEAD_ID} case=copy_database_to_rejects_active_transactions"
         );
     }
 

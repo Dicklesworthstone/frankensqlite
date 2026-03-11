@@ -409,13 +409,20 @@ impl<'a> Lexer<'a> {
             if self.src[self.pos] == b'/' && self.peek_at(1) == Some(b'*') {
                 self.advance(); // skip /
                 self.advance(); // skip *
-                while self.pos < self.src.len() {
+                let closed = loop {
+                    if self.pos >= self.src.len() {
+                        break false;
+                    }
                     if self.src[self.pos] == b'*' && self.peek_at(1) == Some(b'/') {
                         self.advance();
                         self.advance();
-                        break;
+                        break true;
                     }
                     self.advance();
+                };
+                if !closed {
+                    // Unclosed block comment consumes to EOF
+                    self.pos = self.src.len();
                 }
                 continue;
             }
@@ -428,7 +435,6 @@ impl<'a> Lexer<'a> {
     // Literal tokenizers
     // -----------------------------------------------------------------------
 
-    /// Lex a single-quoted string literal. Uses memchr for fast quote search.
     fn lex_string(&mut self) -> TokenKind {
         let start = self.pos;
         self.advance(); // skip opening quote

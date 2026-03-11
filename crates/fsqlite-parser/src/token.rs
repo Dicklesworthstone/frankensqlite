@@ -451,6 +451,7 @@ impl TokenKind {
     pub fn to_sql(&self) -> String {
         match self {
             Self::Integer(i) => i.to_string(),
+            Self::OversizedInt(s) | Self::Id(s) | Self::Error(s) => s.clone(),
             Self::Float(f) => format!("{f}"),
             Self::String(s) => format!("'{}'", s.replace('\'', "''")),
             Self::Blob(b) => {
@@ -463,7 +464,6 @@ impl TokenKind {
                 hex.push('\'');
                 hex
             }
-            Self::Id(s) | Self::Error(s) => s.clone(),
             Self::QuotedId(s, _) => format!("\"{}\"", s.replace('"', "\"\"")),
             Self::Question => "?".to_owned(),
             Self::QuestionNum(n) => format!("?{n}"),

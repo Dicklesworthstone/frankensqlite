@@ -255,13 +255,16 @@ fn posix_lock(file: &impl AsFd, lock_type: impl Into<i32>, start: u64, len: u64)
         l_pid: 0,
     };
 
-    match nix::fcntl::fcntl(
-        file.as_fd().as_raw_fd(),
-        nix::fcntl::FcntlArg::F_SETLK(&flock),
-    ) {
-        Ok(_) => Ok(true),
-        Err(nix::errno::Errno::EACCES | nix::errno::Errno::EAGAIN) => Ok(false),
-        Err(e) => Err(FrankenError::Io(e.into())),
+    loop {
+        match nix::fcntl::fcntl(
+            file.as_fd().as_raw_fd(),
+            nix::fcntl::FcntlArg::F_SETLK(&flock),
+        ) {
+            Ok(_) => return Ok(true),
+            Err(nix::errno::Errno::EINTR) => {}
+            Err(nix::errno::Errno::EACCES | nix::errno::Errno::EAGAIN) => return Ok(false),
+            Err(e) => return Err(FrankenError::Io(e.into())),
+        }
     }
 }
 

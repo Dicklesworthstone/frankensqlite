@@ -672,8 +672,8 @@ pub fn ssi_validate_and_publish(
         committed_writers,
     );
 
-    state.has_in_rw = !in_edges.is_empty();
-    state.has_out_rw = !out_edges.is_empty();
+    state.has_in_rw |= !in_edges.is_empty();
+    state.has_out_rw |= !out_edges.is_empty();
 
     for edge in &in_edges {
         state.rw_in_from.insert(edge.from);

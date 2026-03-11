@@ -552,10 +552,25 @@ impl TieredStorage {
             .l2_segments
             .entry(self.write_back_segment_id)
             .or_default();
-        segment.extend(repairs);
+
+        // Efficiently merge new repairs into the existing segment.
+        // We use a BTreeMap keyed by (ObjectId, ESI) to deduplicate.
         let mut deduped = BTreeMap::<(ObjectId, u32), SymbolRecord>::new();
         for record in segment.drain(..) {
-            merge_symbol_record_by_key(&mut deduped, (record.object_id, record.esi), record);
+            deduped.insert((record.object_id, record.esi), record);
+        }
+        for record in repairs {
+            let key = (record.object_id, record.esi);
+            match deduped.entry(key) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(record);
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    if prefer_symbol_record(entry.get(), &record) {
+                        entry.insert(record);
+                    }
+                }
+            }
         }
         *segment = deduped.into_values().collect();
         added

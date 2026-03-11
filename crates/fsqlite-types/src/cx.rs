@@ -1144,6 +1144,10 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
         if let Some(oracle) = self.inner.eprocess_oracle.get().cloned() {
             child.set_eprocess_oracle(oracle);
         }
+        #[cfg(feature = "native")]
+        if let Some(native_cx) = self.attached_native_cx() {
+            child.set_native_cx(native_cx);
+        }
         {
             let mut children = self
                 .inner
@@ -1648,6 +1652,24 @@ mod tests {
             .cancel_reason()
             .expect("fallback native cx should mirror inherited cancellation");
         assert_eq!(reason.kind, NativeCancelKind::ParentCancelled);
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn test_create_child_inherits_explicit_native_cx_attachment() {
+        let parent = Cx::<FullCaps>::new();
+        let native = NativeCx::for_testing();
+        parent.set_native_cx(native.clone());
+
+        let child = parent.create_child();
+        assert!(child.attached_native_cx().is_some());
+
+        native.set_cancel_reason(NativeCancelReason::timeout());
+        let err = child
+            .checkpoint()
+            .expect_err("child should observe inherited native cancel");
+        assert_eq!(err.kind(), ErrorKind::Cancelled);
+        assert_eq!(child.cancel_reason(), Some(CancelReason::Timeout));
     }
 
     #[test]

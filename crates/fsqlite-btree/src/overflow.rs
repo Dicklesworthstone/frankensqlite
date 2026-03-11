@@ -386,7 +386,12 @@ mod tests {
         );
         // Chain ends (next = 0) but we only have 1 + 16 = 17 bytes, need 50.
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("prematurely"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("unexpected end of overflow chain")
+        );
     }
 
     #[test]

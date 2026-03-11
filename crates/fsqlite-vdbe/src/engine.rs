@@ -2975,9 +2975,10 @@ fn distinct_key(args: &[SqliteValue]) -> DistinctKeyBuf {
 impl VdbeEngine {
     /// Create a new engine with enough registers for the given program.
     ///
-    /// This detached convenience constructor is kept for legacy/test callers.
-    /// Production execution paths should prefer [`Self::new_with_execution_cx`]
-    /// so capability lineage is preserved end-to-end.
+    /// Test-only detached convenience constructor. Production execution paths
+    /// should prefer [`Self::new_with_execution_cx`] so capability lineage is
+    /// preserved end-to-end.
+    #[cfg(test)]
     #[must_use]
     pub fn new(register_count: i32) -> Self {
         let detached_execution_cx = Cx::new();
@@ -7358,9 +7359,20 @@ impl VdbeEngine {
                 col_idx
             };
 
-            if let Some(val) =
-                fsqlite_types::record::parse_record_column(&cursor.payload_buf, payload_idx)
-            {
+            let num_cols = fsqlite_types::record::record_column_count(&cursor.payload_buf)
+                .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: "malformed record header in cursor payload".to_owned(),
+                })?;
+
+            if payload_idx < num_cols {
+                let val =
+                    fsqlite_types::record::parse_record_column(&cursor.payload_buf, payload_idx)
+                        .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                            detail: format!(
+                                "failed to parse record column {} even though count is {}",
+                                payload_idx, num_cols
+                            ),
+                        })?;
                 if collect_vdbe_metrics {
                     FSQLITE_VDBE_COLUMN_READS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
                     record_decoded_value_metrics(&val);

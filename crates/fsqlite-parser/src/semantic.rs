@@ -317,28 +317,24 @@ impl Scope {
             }
         }
 
-        let total_matches = known_matches.len() + unknown_matches.len();
-
-        match total_matches {
-            0 => {
+        match (known_matches.len(), unknown_matches.len()) {
+            (0, 0) => {
                 // Check parent scope.
                 if let Some(ref parent) = self.parent {
                     return parent.resolve_column(schema, None, column_name);
                 }
                 ResolveResult::ColumnNotFound
             }
-            1 => {
-                if known_matches.len() == 1 {
-                    ResolveResult::Resolved(known_matches.into_iter().next().unwrap_or_default())
-                } else {
-                    ResolveResult::Resolved(unknown_matches.into_iter().next().unwrap_or_default())
-                }
+            (1, 0) => ResolveResult::Resolved(known_matches.into_iter().next().unwrap_or_default()),
+            (0, 1) => {
+                ResolveResult::Resolved(unknown_matches.into_iter().next().unwrap_or_default())
             }
             _ => {
                 let mut all_matches = known_matches;
                 all_matches.extend(unknown_matches);
                 all_matches.sort();
                 if self.using_columns.contains(&col_lower) {
+                    // For USING columns, just pick the first one (they are equivalent).
                     ResolveResult::Resolved(all_matches.into_iter().next().unwrap_or_default())
                 } else if all_matches.contains(&"<output>".to_owned()) {
                     ResolveResult::Resolved("<output>".to_owned())
@@ -757,29 +753,29 @@ impl<'a> Resolver<'a> {
         }
 
         // Resolve ORDER BY against the appropriate scope.
-        // In compound queries, ORDER BY can ONLY reference result columns.
         let mut order_by_scope = if select.body.compounds.is_empty() {
             first_core_scope.clone()
         } else {
-            scope.clone() // Start with outer scope, not first_core_scope (so FROM aliases aren't visible)
+            scope.clone() // Compounds can only see outer scope + result columns
         };
 
         if let SelectCore::Select { columns, .. } = &select.body.select {
             let mut output_cols = HashSet::new();
             for col in columns {
-                if let ResultColumn::Expr {
-                    alias: Some(alias_id),
-                    ..
-                } = col
-                {
-                    output_cols.insert(alias_id.to_ascii_lowercase());
-                } else if let ResultColumn::Expr {
-                    expr: Expr::Column(col_ref, _),
-                    ..
-                } = col
-                {
-                    // Also add un-aliased column names to output_cols
-                    output_cols.insert(col_ref.column.to_ascii_lowercase());
+                match col {
+                    ResultColumn::Expr {
+                        alias: Some(alias_id),
+                        ..
+                    } => {
+                        output_cols.insert(alias_id.to_ascii_lowercase());
+                    }
+                    ResultColumn::Expr {
+                        expr: Expr::Column(col_ref, _),
+                        ..
+                    } => {
+                        output_cols.insert(col_ref.column.to_ascii_lowercase());
+                    }
+                    _ => {}
                 }
             }
             if !output_cols.is_empty() {
@@ -1351,8 +1347,8 @@ impl<'a> Resolver<'a> {
         }
     }
 
-    fn resolve_table_name(&mut self, name: &str, scope: &Scope) {
-        if scope.has_cte(name) || self.schema.find_table(name).is_some() {
+    fn resolve_table_name(&mut self, name: &str, _scope: &Scope) {
+        if self.schema.find_table(name).is_some() {
             self.tables_resolved += 1;
         } else {
             self.push_error(SemanticErrorKind::UnresolvedTable {

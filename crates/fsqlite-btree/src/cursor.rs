@@ -425,37 +425,53 @@ impl<P: PageReader> BtCursor<P> {
     }
 
     fn measure_tree_depth(&mut self, cx: &Cx) -> Result<usize> {
+        let saved_stats = self.active_op_stats.take();
         let mut depth = 0usize;
         let mut current_page = self.root_page;
 
-        loop {
+        let result = loop {
             if depth >= BTREE_MAX_DEPTH as usize {
-                return Err(FrankenError::DatabaseCorrupt {
+                break Err(FrankenError::DatabaseCorrupt {
                     detail: format!("B-tree depth exceeds maximum of {}", BTREE_MAX_DEPTH),
                 });
             }
 
-            let entry = self.load_page(cx, current_page)?;
+            let entry = match self.load_page(cx, current_page) {
+                Ok(e) => e,
+                Err(err) => break Err(err),
+            };
             depth = depth.saturating_add(1);
             if entry.header.page_type.is_leaf() {
-                return Ok(depth);
+                break Ok(depth);
             }
 
             current_page = if entry.header.cell_count == 0 {
-                entry
+                match entry
                     .header
                     .right_child
                     .ok_or_else(|| FrankenError::DatabaseCorrupt {
                         detail: "interior page has no right child".to_owned(),
-                    })?
+                    }) {
+                    Ok(p) => p,
+                    Err(err) => break Err(err),
+                }
             } else {
-                let cell = self.parse_cell_at(&entry, 0)?;
-                cell.left_child
-                    .ok_or_else(|| FrankenError::DatabaseCorrupt {
-                        detail: "interior cell has no left child".to_owned(),
-                    })?
+                match self.parse_cell_at(&entry, 0) {
+                    Ok(cell) => match cell
+                        .left_child
+                        .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                            detail: "interior cell has no left child".to_owned(),
+                        }) {
+                        Ok(p) => p,
+                        Err(err) => break Err(err),
+                    },
+                    Err(err) => break Err(err),
+                }
             };
-        }
+        };
+
+        self.active_op_stats = saved_stats;
+        result
     }
 
     fn record_depth_gauge(&mut self, cx: &Cx) -> Result<()> {
@@ -542,7 +558,6 @@ impl<P: PageReader> BtCursor<P> {
         let header_offset = cell::header_offset_for_page(page_no);
         let header = cell::parse_page_header(&page_data, page_no)?;
         let cell_pointers = cell::read_cell_pointers(&page_data, &header, header_offset)?;
-        self.note_page_visit(page_no);
 
         Ok(StackEntry {
             page_no,

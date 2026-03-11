@@ -316,13 +316,48 @@ pub struct RuntimeContext {
 }
 
 impl RuntimeContext {
+    fn detached_root_cx() -> Cx {
+        let root_cx = Cx::new().with_trace_context(next_trace_id(), 0, 0);
+        #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+        if let Some(native_cx) = asupersync::Cx::current() {
+            root_cx.set_native_cx(native_cx);
+        }
+        root_cx
+    }
+
+    fn derived_root_cx(parent: &Cx) -> Cx {
+        parent
+            .create_child()
+            .with_trace_context(next_trace_id(), 0, 0)
+    }
+
     /// Create a runtime context with the provided configuration.
+    ///
+    /// When invoked from within an active asupersync task, this best-effort
+    /// constructor attaches the ambient native runtime context to the new
+    /// FrankenSQLite root `Cx`. Call [`Self::new_with_root_cx`] when the
+    /// caller already owns the canonical parent `Cx` and wants explicit
+    /// capability lineage rather than ambient attachment.
     #[must_use]
     pub fn new(config: RuntimeConfig) -> Self {
         Self {
             runtime_id: NEXT_RUNTIME_ID.fetch_add(1, AtomicOrdering::Relaxed),
             config,
-            root_cx: Cx::new().with_trace_context(next_trace_id(), 0, 0),
+            root_cx: Self::detached_root_cx(),
+        }
+    }
+
+    /// Create a runtime context rooted in a caller-supplied parent `Cx`.
+    ///
+    /// This keeps capability lineage attached to the caller's budget,
+    /// cancellation state, and native asupersync context instead of minting
+    /// a disconnected root inside FrankenSQLite.
+    #[must_use]
+    pub fn new_with_root_cx(config: RuntimeConfig, root_cx: &Cx) -> Self {
+        Self {
+            runtime_id: NEXT_RUNTIME_ID.fetch_add(1, AtomicOrdering::Relaxed),
+            config,
+            root_cx: Self::derived_root_cx(root_cx),
         }
     }
 
@@ -778,6 +813,7 @@ fn default_function_registry(
     fsqlite_ext_icu::register_icu_scalars(&mut registry);
     fsqlite_ext_icu::register_icu_load_collation(&mut registry, Arc::clone(collation_registry));
     fsqlite_ext_misc::register_misc_scalars(&mut registry);
+    fsqlite_ext_rtree::register_geopoly_scalars(&mut registry);
     Arc::new(registry)
 }
 
@@ -2508,7 +2544,12 @@ impl Connection {
 
         // Sync MemDatabase with the pager's committed state.
         if let Ok(cx) = self.op_cx() {
-            let _ = self.reload_memdb_from_pager(&cx);
+            if let Err(err) = self.reload_memdb_from_pager(&cx) {
+                tracing::warn!(
+                    target: "fsqlite.time_travel",
+                    "failed to reload memdb before capturing time-travel snapshot: {err}"
+                );
+            }
         }
 
         let timestamp_ns = SystemTime::now()
@@ -17000,20 +17041,15 @@ impl Connection {
                 // Time-travel mode: read directly from MemDatabase (self.db)
                 // instead of self.query() which goes through the pager and
                 // would return current data, not the historical snapshot.
-                //
-                // Note: reload_memdb_from_pager() double-inserts the IPK column
-                // (the pager payload already includes it, and then it inserts
-                // the rowid at ipk_idx). We must remove that extra element so
-                // the row width matches the schema column count.
                 let row_data = {
                     let schema = self.schema.borrow();
                     let tbl_schema = schema
                         .iter()
                         .find(|t| t.name.eq_ignore_ascii_case(&src.table_name));
-                    let (root_page, num_schema_cols) = tbl_schema
+                    let (root_page, _num_schema_cols) = tbl_schema
                         .map(|t| (t.root_page, t.columns.len()))
                         .unwrap_or((0, 0));
-                    let ipk_idx = self
+                    let _ipk_idx = self
                         .rowid_alias_columns
                         .borrow()
                         .get(&src.table_name.to_ascii_lowercase())
@@ -17022,16 +17058,7 @@ impl Connection {
                     if let Some(mem_table) = db.get_table(root_page) {
                         mem_table
                             .iter_rows()
-                            .map(|(_rowid, vals)| {
-                                let mut v = vals.to_vec();
-                                // Remove the double-inserted IPK value if present.
-                                if let Some(idx) = ipk_idx {
-                                    if v.len() > num_schema_cols && idx < v.len() {
-                                        v.remove(idx);
-                                    }
-                                }
-                                v
-                            })
+                            .map(|(_rowid, vals)| vals.to_vec())
                             .collect::<Vec<Vec<SqliteValue>>>()
                     } else {
                         Vec::new()
@@ -18384,7 +18411,11 @@ impl Connection {
                             // the rowid at that position since it's not stored in the
                             // record payload.
                             if let Some(ipk_idx) = ipk_col_idx {
-                                values.insert(ipk_idx, SqliteValue::Integer(rowid));
+                                if ipk_idx < values.len() {
+                                    values[ipk_idx] = SqliteValue::Integer(rowid);
+                                } else {
+                                    values.insert(ipk_idx, SqliteValue::Integer(rowid));
+                                }
                             }
                             if let Some(mem_table) = new_db.tables.get_mut(&real_root_page) {
                                 mem_table.insert_row(rowid, values);
@@ -28536,6 +28567,36 @@ mod tests {
         assert!(Arc::ptr_eq(&conn._shared_mvcc_state._runtime, &runtime));
     }
 
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+    #[test]
+    fn test_open_with_env_inherits_seeded_runtime_native_lineage() {
+        use asupersync::Cx as NativeCx;
+        use asupersync::types::CancelReason as NativeCancelReason;
+
+        let parent_cx = Cx::new().with_trace_context(77, 0, 0);
+        let native = NativeCx::for_testing();
+        parent_cx.set_native_cx(native.clone());
+        let runtime = Arc::new(RuntimeContext::new_with_root_cx(
+            RuntimeConfig {
+                worker_threads: 1,
+                io_poll_strategy: IoPollStrategy::Auto,
+            },
+            &parent_cx,
+        ));
+
+        let conn = Connection::open_with_env(":memory:", ConnectionEnv::new(Arc::clone(&runtime)))
+            .expect("connection should open");
+
+        assert!(runtime.root_cx.attached_native_cx().is_some());
+        assert!(conn.root_cx.attached_native_cx().is_some());
+
+        native.set_cancel_reason(NativeCancelReason::timeout());
+        assert!(
+            conn.root_cx.checkpoint().is_err(),
+            "seeded native cancellation should reach connection root"
+        );
+    }
+
     #[test]
     fn test_multiple_connections_same_database_share_runtime_region() {
         let dir = tempfile::tempdir().unwrap();
@@ -38421,7 +38482,8 @@ mod tests {
     #[test]
     fn test_memory_pager_backend_uses_its_own_vfs_for_wal_probe() {
         let cx = Cx::new();
-        let pager = SimplePager::open(
+        let pager = SimplePager::open_with_cx(
+            &cx,
             MemoryVfs::new(),
             std::path::Path::new("/:memory:"),
             PageSize::DEFAULT,

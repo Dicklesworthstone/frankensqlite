@@ -375,10 +375,7 @@ pub const fn ptrmap_entry_offset(
         // pointer map page forward by one page.
         return None;
     }
-    let mut index = pgno.get() - ptrmap_page.get() - 1;
-    if ptrmap_page.get() < pending_byte_page && pgno.get() > pending_byte_page {
-        index -= 1;
-    }
+    let index = pgno.get() - ptrmap_page.get() - 1;
     Some(index * PTRMAP_ENTRY_SIZE_BYTES)
 }
 
@@ -746,7 +743,7 @@ mod tests {
         );
         assert_eq!(
             ptrmap_entry_offset(pgno, usable_size, page_size),
-            Some(562 * PTRMAP_ENTRY_SIZE_BYTES)
+            Some(563 * PTRMAP_ENTRY_SIZE_BYTES)
         );
     }
 
