@@ -59,6 +59,13 @@ HOT_PATH_INLINE_BUNDLE_PREFIX="HOT_PATH_INLINE_BUNDLE_JSON="
 mkdir -p "${RUNS_DIR}"
 : > "${LOG_FILE}"
 : > "${RUN_RECORDS_JSONL}"
+: > "${OPCODE_PROFILE_PACKS_JSON}"
+: > "${SUBSYSTEM_PROFILE_PACKS_JSON}"
+: > "${SCENARIO_PROFILES_JSON}"
+: > "${ACTIONABLE_RANKING_JSON}"
+: > "${BENCHMARK_CONTEXT_JSON}"
+: > "${REPORT_JSON}"
+: > "${SUMMARY_MD}"
 
 log_event() {
     local level="$1"
@@ -195,6 +202,11 @@ discover_mode_ids() {
     printf '%s\n' mvcc single_writer
 }
 
+join_csv() {
+    local IFS=','
+    printf '%s' "$*"
+}
+
 capture_run_record() {
     local scenario_id="$1"
     local fixture_id="$2"
@@ -203,7 +215,7 @@ capture_run_record() {
     local stdout_log="$5"
     local stderr_log="$6"
 
-    jq -n \
+    jq -c -n \
         --arg scenario_id "${scenario_id}" \
         --arg fixture_id "${fixture_id}" \
         --arg mode_id "${mode_id}" \
@@ -372,6 +384,9 @@ build_benchmark_context() {
         --arg source_golden_dir "${SOURCE_GOLDEN_DIR}" \
         --arg sync_golden_dir "${SYNC_GOLDEN_DIR}" \
         --arg workload "${WORKLOAD_ID}" \
+        --arg fixture_ids_csv "${FIXTURE_IDS_CSV}" \
+        --arg mode_ids_csv "${MODE_IDS_CSV}" \
+        --argjson expected_runs "${expected_runs}" \
         '
         {
             schema_version: "fsqlite-e2e.hot_path_campaign_context.v1",
@@ -381,6 +396,10 @@ build_benchmark_context() {
             source_golden_dir: $source_golden_dir,
             sync_golden_dir: $sync_golden_dir,
             workload: $workload,
+            fixture_ids: ($fixture_ids_csv | split(",") | map(select(length > 0))),
+            mode_ids: ($mode_ids_csv | split(",") | map(select(length > 0))),
+            expected_runs: $expected_runs,
+            completed_runs: length,
             runs: [
                 .[] | {
                     scenario_id,
@@ -526,6 +545,17 @@ build_actionable_ranking() {
 }
 
 build_summary_md() {
+    local coverage_summary
+    coverage_summary="$(jq -r '
+        [
+            "- fixture_ids: `\(.fixture_ids | join(","))`",
+            "- mode_ids: `\(.mode_ids | join(","))`",
+            "- expected_runs: `\(.expected_runs)`",
+            "- completed_runs: `\(.completed_runs)`"
+        ]
+        | .[]
+    ' "${BENCHMARK_CONTEXT_JSON}")"
+
     local run_summary
     run_summary="$(jq -r '
         .runs
@@ -567,10 +597,11 @@ build_summary_md() {
 - generated_at: \`${GENERATED_AT}\`
 - source_golden_dir: \`${SOURCE_GOLDEN_DIR}\`
 - sync_golden_dir: \`${SYNC_GOLDEN_DIR}\`
-- replay_command: \`bash scripts/verify_bd_db300_4_1_hot_path_profiles.sh\`
+- replay_command: \`${REPLAY_COMMAND}\`
 - cargo_profile: \`${CARGO_PROFILE}\`
 - workload: \`${WORKLOAD_ID}\`
 - concurrency: \`${CONCURRENCY}\`
+${coverage_summary}
 
 ## Run Context
 
@@ -610,7 +641,7 @@ build_report_json() {
         --arg source_golden_dir "${SOURCE_GOLDEN_DIR}" \
         --arg sync_golden_dir "${SYNC_GOLDEN_DIR}" \
         --arg output_dir "${OUTPUT_DIR}" \
-        --arg replay_command "bash scripts/verify_bd_db300_4_1_hot_path_profiles.sh" \
+        --arg replay_command "${REPLAY_COMMAND}" \
         --arg structured_log "${LOG_FILE}" \
         --arg run_records "${RUN_RECORDS_JSONL}" \
         --arg opcode_profile_packs "${OPCODE_PROFILE_PACKS_JSON}" \
@@ -622,9 +653,13 @@ build_report_json() {
         --arg report_json "${REPORT_JSON}" \
         --arg workload "${WORKLOAD_ID}" \
         --arg cargo_profile "${CARGO_PROFILE}" \
+        --arg fixture_ids_csv "${FIXTURE_IDS_CSV}" \
+        --arg mode_ids_csv "${MODE_IDS_CSV}" \
         --argjson concurrency "${CONCURRENCY}" \
         --argjson seed "${SEED}" \
         --argjson scale "${SCALE}" \
+        --argjson expected_runs "${expected_runs}" \
+        --slurpfile benchmark_context "${BENCHMARK_CONTEXT_JSON}" \
         '
         {
             schema_version: $schema_version,
@@ -639,6 +674,10 @@ build_report_json() {
             concurrency: $concurrency,
             seed: $seed,
             scale: $scale,
+            fixture_ids: ($fixture_ids_csv | split(",") | map(select(length > 0))),
+            mode_ids: ($mode_ids_csv | split(",") | map(select(length > 0))),
+            expected_runs: $expected_runs,
+            completed_runs: ($benchmark_context[0].completed_runs // null),
             replay: {
                 command: $replay_command
             },
@@ -671,6 +710,13 @@ mapfile -t MODE_IDS_ARRAY < <(discover_mode_ids)
 (( ${#MODE_IDS_ARRAY[@]} > 0 )) || fail "inputs" "no mode ids configured"
 
 expected_runs=$(( ${#FIXTURE_IDS_ARRAY[@]} * ${#MODE_IDS_ARRAY[@]} ))
+FIXTURE_IDS_CSV="$(join_csv "${FIXTURE_IDS_ARRAY[@]}")"
+MODE_IDS_CSV="$(join_csv "${MODE_IDS_ARRAY[@]}")"
+printf -v REPLAY_COMMAND \
+    'cd %q && GOLDEN_DIR=%q SYNC_GOLDEN_DIR=%q OUTPUT_DIR=%q FIXTURE_IDS=%q MODE_IDS=%q CONCURRENCY=%q SEED=%q SCALE=%q CARGO_PROFILE=%q RCH_TARGET_DIR=%q bash scripts/verify_bd_db300_4_1_hot_path_profiles.sh' \
+    "${WORKSPACE_ROOT}" "${SOURCE_GOLDEN_DIR}" "${SYNC_GOLDEN_DIR}" "${OUTPUT_DIR}" \
+    "${FIXTURE_IDS_CSV}" "${MODE_IDS_CSV}" "${CONCURRENCY}" "${SEED}" "${SCALE}" \
+    "${CARGO_PROFILE}" "${RCH_TARGET_DIR}"
 log_event "INFO" "plan" "fixtures=${#FIXTURE_IDS_ARRAY[@]} modes=${#MODE_IDS_ARRAY[@]} expected_runs=${expected_runs}"
 
 for fixture_id in "${FIXTURE_IDS_ARRAY[@]}"; do
