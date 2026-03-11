@@ -15105,6 +15105,7 @@ mod tests {
 
         let registry = Arc::new(Mutex::new(ConcurrentRegistry::new()));
         let lock_table = Arc::new(InProcessPageLockTable::new());
+        let commit_index = Arc::new(CommitIndex::new());
         let snapshot = Snapshot::new(CommitSeq::new(7), SchemaEpoch::new(1));
         let contested_page = PageNumber::ONE;
         let page_bytes = vec![0xAB; PageSize::DEFAULT.as_usize()];
@@ -15139,6 +15140,7 @@ mod tests {
             writer_session,
             Arc::clone(&registry),
             Arc::clone(&lock_table),
+            Arc::clone(&commit_index),
             1,
         );
 
