@@ -1165,7 +1165,10 @@ impl SimpleTarget {
         let mut skipped = 0usize;
 
         for tc in &changeset.tables {
-            if !touched_tables.iter().any(|name: &String| name == &tc.info.name) {
+            if !touched_tables
+                .iter()
+                .any(|name: &String| name == &tc.info.name)
+            {
                 touched_tables.push(tc.info.name.clone());
             }
             let rows = self.tables.entry(tc.info.name.clone()).or_default();
