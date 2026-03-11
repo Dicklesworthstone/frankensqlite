@@ -16535,8 +16535,8 @@ impl Connection {
         }
 
         let primary_width = table_sources[0].col_names.len();
-        let primary_where_pushdown = where_clause.and_then(|expr| {
-            expr_references_only_col_map(expr, &col_map[..primary_width]).then_some(expr)
+        let primary_where_pushdown = where_clause.as_ref().and_then(|expr| {
+            expr_references_only_col_map(expr, &col_map[..primary_width]).then_some(expr.as_ref())
         });
 
         // ── 3. Load each table's raw rows ──
