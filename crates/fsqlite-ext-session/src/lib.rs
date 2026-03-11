@@ -5,8 +5,15 @@ use fsqlite_types::value::SqliteValue;
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Table header marker byte ('T').
-const TABLE_HEADER_BYTE: u8 = 0x54;
+/// Changeset table header marker byte ('T').
+const CHANGESET_TABLE_HEADER_BYTE: u8 = 0x54;
+
+/// Patchset table header marker byte ('P').
+const PATCHSET_TABLE_HEADER_BYTE: u8 = 0x50;
+
+/// Legacy alias retained for internal tests that refer to the changeset header byte.
+#[cfg(test)]
+const TABLE_HEADER_BYTE: u8 = CHANGESET_TABLE_HEADER_BYTE;
 
 /// Operation codes used in changeset/patchset binary format.
 const OP_INSERT: u8 = 0x12; // 18
@@ -240,9 +247,8 @@ pub struct TableInfo {
 }
 
 impl TableInfo {
-    /// Encode the table header into changeset binary format.
-    pub fn encode(&self, out: &mut Vec<u8>) {
-        out.push(TABLE_HEADER_BYTE);
+    fn encode_with_header(&self, out: &mut Vec<u8>, header_byte: u8) {
+        out.push(header_byte);
         let mut vbuf = [0u8; 9];
         let vlen = write_varint(&mut vbuf, self.column_count as u64);
         out.extend_from_slice(&vbuf[..vlen]);
@@ -253,11 +259,21 @@ impl TableInfo {
         out.push(0x00); // NUL terminator
     }
 
+    /// Encode the table header into changeset binary format.
+    pub fn encode(&self, out: &mut Vec<u8>) {
+        self.encode_with_header(out, CHANGESET_TABLE_HEADER_BYTE);
+    }
+
+    /// Encode the table header into patchset binary format.
+    pub fn encode_patchset(&self, out: &mut Vec<u8>) {
+        self.encode_with_header(out, PATCHSET_TABLE_HEADER_BYTE);
+    }
+
     /// Decode a table header starting at `pos`.
     ///
     /// Returns `(TableInfo, bytes_consumed)` or `None`.
-    pub fn decode(data: &[u8], pos: usize) -> Option<(Self, usize)> {
-        if *data.get(pos)? != TABLE_HEADER_BYTE {
+    fn decode_with_header(data: &[u8], pos: usize, header_byte: u8) -> Option<(Self, usize)> {
+        if *data.get(pos)? != header_byte {
             return None;
         }
         let mut offset = pos + 1;
@@ -288,6 +304,14 @@ impl TableInfo {
             offset - pos,
         ))
     }
+
+    pub fn decode(data: &[u8], pos: usize) -> Option<(Self, usize)> {
+        Self::decode_with_header(data, pos, CHANGESET_TABLE_HEADER_BYTE)
+    }
+
+    pub fn decode_patchset(data: &[u8], pos: usize) -> Option<(Self, usize)> {
+        Self::decode_with_header(data, pos, PATCHSET_TABLE_HEADER_BYTE)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -308,6 +332,7 @@ impl ChangesetRow {
     /// Encode this row change into changeset binary format.
     pub fn encode_changeset(&self, out: &mut Vec<u8>) {
         out.push(self.op.as_byte());
+        out.push(0x00);
         match self.op {
             ChangeOp::Insert => {
                 for v in &self.new_values {
@@ -337,6 +362,7 @@ impl ChangesetRow {
     /// values) plus new values are written.
     pub fn encode_patchset(&self, out: &mut Vec<u8>, pk_flags: &[bool]) {
         out.push(self.op.as_byte());
+        out.push(0x00);
         match self.op {
             ChangeOp::Insert => {
                 for v in &self.new_values {
@@ -344,8 +370,10 @@ impl ChangesetRow {
                 }
             }
             ChangeOp::Delete => {
-                for v in &self.old_values {
-                    v.encode(out);
+                for (i, v) in self.old_values.iter().enumerate() {
+                    if pk_flags.get(i).copied().unwrap_or(false) {
+                        v.encode(out);
+                    }
                 }
             }
             ChangeOp::Update => {
@@ -365,7 +393,8 @@ impl ChangesetRow {
     /// Decode one changeset row starting at `pos`, given the column count.
     pub fn decode_changeset(data: &[u8], pos: usize, col_count: usize) -> Option<(Self, usize)> {
         let op = ChangeOp::from_byte(*data.get(pos)?)?;
-        let mut offset = pos + 1;
+        let mut offset = pos + 2;
+        let _indirect = *data.get(pos + 1)?;
 
         let decode_n = |data: &[u8], offset: &mut usize, n: usize| -> Option<Vec<ChangesetValue>> {
             let mut vals = Vec::with_capacity(n);
@@ -419,7 +448,8 @@ impl ChangesetRow {
         }
 
         let op = ChangeOp::from_byte(*data.get(pos)?)?;
-        let mut offset = pos + 1;
+        let mut offset = pos + 2;
+        let _indirect = *data.get(pos + 1)?;
 
         let decode_n = |data: &[u8], offset: &mut usize, n: usize| -> Option<Vec<ChangesetValue>> {
             let mut vals = Vec::with_capacity(n);
@@ -437,7 +467,20 @@ impl ChangesetRow {
                 (Vec::new(), new_values)
             }
             ChangeOp::Delete => {
-                let old_values = decode_n(data, &mut offset, col_count)?;
+                let pk_count = pk_flags.iter().filter(|&&is_pk| is_pk).count();
+                if pk_count == 0 {
+                    return None;
+                }
+                let pk_old_values = decode_n(data, &mut offset, pk_count)?;
+                let mut old_values = Vec::with_capacity(col_count);
+                let mut pk_iter = pk_old_values.into_iter();
+                for is_pk in pk_flags {
+                    if *is_pk {
+                        old_values.push(pk_iter.next()?);
+                    } else {
+                        old_values.push(ChangesetValue::Undefined);
+                    }
+                }
                 (old_values, Vec::new())
             }
             ChangeOp::Update => {
@@ -516,7 +559,7 @@ impl TableChangeset {
 
     /// Encode this table section in patchset format.
     pub fn encode_patchset(&self, out: &mut Vec<u8>) {
-        self.info.encode(out);
+        self.info.encode_patchset(out);
         for row in &self.rows {
             row.encode_patchset(out, &self.info.pk_flags);
         }
@@ -569,7 +612,7 @@ impl Changeset {
             pos += consumed;
             let mut rows = Vec::new();
             // Read rows until we hit another table header or end of data.
-            while pos < data.len() && data[pos] != TABLE_HEADER_BYTE {
+            while pos < data.len() && data[pos] != CHANGESET_TABLE_HEADER_BYTE {
                 let (row, consumed) = ChangesetRow::decode_changeset(data, pos, info.column_count)?;
                 pos += consumed;
                 rows.push(row);
@@ -584,10 +627,10 @@ impl Changeset {
         let mut tables = Vec::new();
         let mut pos = 0;
         while pos < data.len() {
-            let (info, consumed) = TableInfo::decode(data, pos)?;
+            let (info, consumed) = TableInfo::decode_patchset(data, pos)?;
             pos += consumed;
             let mut rows = Vec::new();
-            while pos < data.len() && data[pos] != TABLE_HEADER_BYTE {
+            while pos < data.len() && data[pos] != PATCHSET_TABLE_HEADER_BYTE {
                 let (row, consumed) =
                     ChangesetRow::decode_patchset(data, pos, info.column_count, &info.pk_flags)?;
                 pos += consumed;
@@ -651,6 +694,166 @@ struct TrackedTable {
 
 fn has_primary_key(pk_flags: &[bool]) -> bool {
     pk_flags.iter().any(|is_pk| *is_pk)
+}
+
+fn materialize_sparse_update(
+    base_row: &[ChangesetValue],
+    sparse_values: &[ChangesetValue],
+) -> Vec<ChangesetValue> {
+    base_row
+        .iter()
+        .zip(sparse_values.iter())
+        .map(|(base, delta)| {
+            if *delta == ChangesetValue::Undefined {
+                base.clone()
+            } else {
+                delta.clone()
+            }
+        })
+        .collect()
+}
+
+fn canonical_old_values(
+    old_row: &[ChangesetValue],
+    new_row: &[ChangesetValue],
+    pk_flags: &[bool],
+) -> Vec<ChangesetValue> {
+    old_row
+        .iter()
+        .zip(new_row.iter())
+        .enumerate()
+        .map(|(index, (old, new))| {
+            if pk_flags.get(index).copied().unwrap_or(false) || old != new {
+                old.clone()
+            } else {
+                ChangesetValue::Undefined
+            }
+        })
+        .collect()
+}
+
+fn canonical_new_values(old_row: &[ChangesetValue], new_row: &[ChangesetValue]) -> Vec<ChangesetValue> {
+    old_row
+        .iter()
+        .zip(new_row.iter())
+        .map(|(old, new)| {
+            if old == new {
+                ChangesetValue::Undefined
+            } else {
+                new.clone()
+            }
+        })
+        .collect()
+}
+
+fn primary_key_identity(values: &[ChangesetValue], pk_flags: &[bool]) -> String {
+    use std::fmt::Write as _;
+
+    let mut key = String::new();
+    for (index, value) in values.iter().enumerate() {
+        if !pk_flags.get(index).copied().unwrap_or(false) {
+            continue;
+        }
+        let _ = write!(key, "{index}:");
+        match value {
+            ChangesetValue::Undefined => key.push_str("u;"),
+            ChangesetValue::Null => key.push_str("n;"),
+            ChangesetValue::Integer(value) => {
+                let _ = write!(key, "i{value};");
+            }
+            ChangesetValue::Real(value) => {
+                let _ = write!(key, "r{:016X};", value.to_bits());
+            }
+            ChangesetValue::Text(value) => {
+                let _ = write!(key, "t{}:{value};", value.len());
+            }
+            ChangesetValue::Blob(value) => {
+                let _ = write!(key, "b{}:", value.len());
+                for byte in value {
+                    let _ = write!(key, "{byte:02X}");
+                }
+                key.push(';');
+            }
+        }
+    }
+    key
+}
+
+#[derive(Debug, Clone)]
+enum PendingRowChange {
+    Insert { new_row: Vec<ChangesetValue> },
+    Delete { old_row: Vec<ChangesetValue> },
+    Update {
+        old_row: Vec<ChangesetValue>,
+        new_row: Vec<ChangesetValue>,
+    },
+}
+
+impl PendingRowChange {
+    fn from_tracked(change: &TrackedChange, column_count: usize) -> Self {
+        match change.op {
+            ChangeOp::Insert => Self::Insert {
+                new_row: change.new_values.clone(),
+            },
+            ChangeOp::Delete => Self::Delete {
+                old_row: change.old_values.clone(),
+            },
+            ChangeOp::Update => {
+                debug_assert_eq!(change.old_values.len(), column_count);
+                debug_assert_eq!(change.new_values.len(), column_count);
+                Self::Update {
+                    old_row: change.old_values.clone(),
+                    new_row: materialize_sparse_update(&change.old_values, &change.new_values),
+                }
+            }
+        }
+    }
+
+    fn merge(self, change: &TrackedChange, _pk_flags: &[bool]) -> Option<Self> {
+        match (self, change.op) {
+            (Self::Insert { mut new_row }, ChangeOp::Update) => {
+                new_row = materialize_sparse_update(&new_row, &change.new_values);
+                Some(Self::Insert { new_row })
+            }
+            (Self::Insert { .. }, ChangeOp::Delete) => None,
+            (Self::Update { old_row, new_row }, ChangeOp::Update) => Some(Self::Update {
+                old_row,
+                new_row: materialize_sparse_update(&new_row, &change.new_values),
+            }),
+            (Self::Update { old_row, .. }, ChangeOp::Delete) => Some(Self::Delete { old_row }),
+            (Self::Delete { old_row }, ChangeOp::Insert) => {
+                if old_row == change.new_values {
+                    None
+                } else {
+                    Some(Self::Update {
+                        old_row,
+                        new_row: change.new_values.clone(),
+                    })
+                }
+            }
+            (state, _) => Some(state),
+        }
+    }
+
+    fn into_changeset_row(self, pk_flags: &[bool]) -> ChangesetRow {
+        match self {
+            Self::Insert { new_row } => ChangesetRow {
+                op: ChangeOp::Insert,
+                old_values: Vec::new(),
+                new_values: new_row,
+            },
+            Self::Delete { old_row } => ChangesetRow {
+                op: ChangeOp::Delete,
+                old_values: old_row,
+                new_values: Vec::new(),
+            },
+            Self::Update { old_row, new_row } => ChangesetRow {
+                op: ChangeOp::Update,
+                old_values: canonical_old_values(&old_row, &new_row, pk_flags),
+                new_values: canonical_new_values(&old_row, &new_row),
+            },
+        }
+    }
 }
 
 /// A session that records database changes for later extraction as a
@@ -748,34 +951,50 @@ impl Session {
 
     /// Internal: collate tracked changes into per-table changeset sections.
     fn build_changeset_impl(&self) -> Changeset {
-        let mut table_map: std::collections::HashMap<String, Vec<ChangesetRow>> =
-            std::collections::HashMap::new();
-
-        for change in &self.changes {
-            table_map
-                .entry(change.table_name.clone())
-                .or_default()
-                .push(ChangesetRow {
-                    op: change.op,
-                    old_values: change.old_values.clone(),
-                    new_values: change.new_values.clone(),
-                });
-        }
-
         let mut tables = Vec::new();
         // Emit tables in the order they were attached (deterministic).
         for tracked in &self.tables {
-            if let Some(rows) = table_map.remove(&tracked.name) {
-                if has_primary_key(&tracked.pk_flags) {
-                    tables.push(TableChangeset {
-                        info: TableInfo {
-                            name: tracked.name.clone(),
-                            column_count: tracked.column_count,
-                            pk_flags: tracked.pk_flags.clone(),
-                        },
-                        rows,
-                    });
+            if !has_primary_key(&tracked.pk_flags) {
+                continue;
+            }
+
+            let mut pending = Vec::<(String, PendingRowChange)>::new();
+            for change in self.changes.iter().filter(|change| change.table_name == tracked.name) {
+                let key = primary_key_identity(
+                    match change.op {
+                        ChangeOp::Insert => &change.new_values,
+                        ChangeOp::Delete | ChangeOp::Update => &change.old_values,
+                    },
+                    &tracked.pk_flags,
+                );
+
+                if let Some(index) = pending.iter().position(|(existing_key, _)| existing_key == &key)
+                {
+                    let (existing_key, existing_change) = pending.remove(index);
+                    if let Some(merged) = existing_change.merge(change, &tracked.pk_flags) {
+                        pending.insert(index, (existing_key, merged));
+                    }
+                } else {
+                    pending.push((
+                        key,
+                        PendingRowChange::from_tracked(change, tracked.column_count),
+                    ));
                 }
+            }
+
+            let rows = pending
+                .into_iter()
+                .map(|(_, change)| change.into_changeset_row(&tracked.pk_flags))
+                .collect::<Vec<_>>();
+            if !rows.is_empty() {
+                tables.push(TableChangeset {
+                    info: TableInfo {
+                        name: tracked.name.clone(),
+                        column_count: tracked.column_count,
+                        pk_flags: tracked.pk_flags.clone(),
+                    },
+                    rows,
+                });
             }
         }
         // Changes for unattached tables, or attached tables without an
@@ -893,13 +1112,17 @@ impl SimpleTarget {
     where
         F: FnMut(ConflictType, &ChangesetRow) -> ConflictAction,
     {
-        let old_row: Vec<SqliteValue> = change
-            .old_values
-            .iter()
-            .map(ChangesetValue::to_sqlite)
-            .collect();
-        if let Some(idx) = Self::find_row_by_pk(rows, pk_flags, &old_row) {
-            if rows[idx] != old_row {
+        let pk_target: Vec<SqliteValue> = change.old_values.iter().map(ChangesetValue::to_sqlite).collect();
+        if let Some(idx) = Self::find_row_by_pk(rows, pk_flags, &pk_target) {
+            let old_match = change
+                .old_values
+                .iter()
+                .zip(rows[idx].iter())
+                .all(|(cv, sv)| match cv {
+                    ChangesetValue::Undefined => true,
+                    _ => cv.to_sqlite() == *sv,
+                });
+            if !old_match {
                 match handler(ConflictType::Data, change) {
                     ConflictAction::OmitChange => return Ok(false),
                     ConflictAction::Replace => {
@@ -1309,6 +1532,62 @@ mod tests {
     }
 
     #[test]
+    fn test_session_changeset_coalesces_net_row_effects() {
+        let mut session = Session::new();
+        session.attach_table("accounts", 3, vec![true, false, false]);
+        session.record_insert(
+            "accounts",
+            vec![
+                ChangesetValue::Integer(1),
+                ChangesetValue::Text("alice".to_owned()),
+                ChangesetValue::Integer(100),
+            ],
+        );
+        session.record_insert(
+            "accounts",
+            vec![
+                ChangesetValue::Integer(2),
+                ChangesetValue::Text("bob".to_owned()),
+                ChangesetValue::Integer(50),
+            ],
+        );
+        session.record_update(
+            "accounts",
+            vec![
+                ChangesetValue::Integer(2),
+                ChangesetValue::Text("bob".to_owned()),
+                ChangesetValue::Integer(50),
+            ],
+            vec![
+                ChangesetValue::Undefined,
+                ChangesetValue::Undefined,
+                ChangesetValue::Integer(75),
+            ],
+        );
+        session.record_delete(
+            "accounts",
+            vec![
+                ChangesetValue::Integer(1),
+                ChangesetValue::Text("alice".to_owned()),
+                ChangesetValue::Integer(100),
+            ],
+        );
+
+        let changeset = session.changeset();
+        assert_eq!(changeset.tables.len(), 1);
+        assert_eq!(changeset.tables[0].rows.len(), 1);
+        assert_eq!(changeset.tables[0].rows[0].op, ChangeOp::Insert);
+        assert_eq!(
+            changeset.tables[0].rows[0].new_values,
+            vec![
+                ChangesetValue::Integer(2),
+                ChangesetValue::Text("bob".to_owned()),
+                ChangesetValue::Integer(75),
+            ]
+        );
+    }
+
+    #[test]
     fn test_changeset_roundtrip() {
         let mut session = Session::new();
         session.attach_table("users", 3, vec![true, false, false]);
@@ -1489,8 +1768,9 @@ mod tests {
         );
         let changeset_bytes = session.changeset().encode();
         let patchset_bytes = session.patchset();
-        // For INSERT, patchset and changeset are identical.
-        assert_eq!(changeset_bytes, patchset_bytes);
+        assert_eq!(changeset_bytes[1..], patchset_bytes[1..]);
+        assert_eq!(changeset_bytes[0], CHANGESET_TABLE_HEADER_BYTE);
+        assert_eq!(patchset_bytes[0], PATCHSET_TABLE_HEADER_BYTE);
     }
 
     #[test]
@@ -1611,7 +1891,7 @@ mod tests {
         assert_eq!(
             changeset_outcome,
             ApplyOutcome::Success {
-                applied: 4,
+                applied: 1,
                 skipped: 0,
             }
         );
@@ -2417,7 +2697,7 @@ mod tests {
     }
 
     #[test]
-    fn test_patchset_delete_same_as_changeset() {
+    fn test_patchset_delete_omits_non_pk_old_values() {
         let pk_flags = vec![true, false];
         let row = ChangesetRow {
             op: ChangeOp::Delete,
@@ -2431,7 +2711,7 @@ mod tests {
         row.encode_changeset(&mut cs_buf);
         let mut ps_buf = Vec::new();
         row.encode_patchset(&mut ps_buf, &pk_flags);
-        assert_eq!(cs_buf, ps_buf);
+        assert!(ps_buf.len() < cs_buf.len());
     }
 
     // -----------------------------------------------------------------------
@@ -2801,8 +3081,9 @@ mod tests {
         tc.encode_changeset(&mut cs_buf);
         let mut ps_buf = Vec::new();
         tc.encode_patchset(&mut ps_buf);
-        // For INSERT, patchset = changeset
-        assert_eq!(cs_buf, ps_buf);
+        assert_eq!(cs_buf[0], CHANGESET_TABLE_HEADER_BYTE);
+        assert_eq!(ps_buf[0], PATCHSET_TABLE_HEADER_BYTE);
+        assert_eq!(cs_buf[1..], ps_buf[1..]);
     }
 
     // -----------------------------------------------------------------------
