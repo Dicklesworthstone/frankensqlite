@@ -430,7 +430,7 @@ fn load_freelist_from_committed_state<F: VfsFile>(
 fn serialize_freelist_to_write_set<F: VfsFile>(
     cx: &Cx,
     inner: &mut PagerInner<F>,
-    write_set: &mut HashMap<PageNumber, PageBuf>,
+    write_set: &mut HashMap<PageNumber, StagedPage>,
     write_pages_sorted: &mut Vec<PageNumber>,
 ) -> Result<()> {
     if inner.db_size == 0 {
@@ -481,9 +481,7 @@ fn serialize_freelist_to_write_set<F: VfsFile>(
             leaf_index += take;
 
             if let Some(pg) = PageNumber::new(*trunk_pg) {
-                if write_set.insert(pg, buf).is_none() {
-                    insert_page_sorted(write_pages_sorted, pg);
-                }
+                insert_staged_page(write_set, write_pages_sorted, pg, StagedPage::from_buf(buf));
             }
         }
     }
@@ -492,9 +490,12 @@ fn serialize_freelist_to_write_set<F: VfsFile>(
 
     page1[32..36].copy_from_slice(&first_trunk.to_be_bytes());
     page1[36..40].copy_from_slice(&total_free.to_be_bytes());
-    if write_set.insert(PageNumber::ONE, page1).is_none() {
-        insert_page_sorted(write_pages_sorted, PageNumber::ONE);
-    }
+    insert_staged_page(
+        write_set,
+        write_pages_sorted,
+        PageNumber::ONE,
+        StagedPage::from_buf(page1),
+    );
 
     Ok(())
 }
@@ -502,10 +503,10 @@ fn serialize_freelist_to_write_set<F: VfsFile>(
 fn ensure_page_one_in_write_set<F: VfsFile>(
     cx: &Cx,
     inner: &mut PagerInner<F>,
-    write_set: &mut HashMap<PageNumber, PageBuf>,
+    write_set: &mut HashMap<PageNumber, StagedPage>,
 ) -> Result<PageBuf> {
-    if let Some(buf) = write_set.remove(&PageNumber::ONE) {
-        return Ok(buf);
+    if let Some(staged) = write_set.remove(&PageNumber::ONE) {
+        return Ok(staged.into_buf());
     }
 
     let page1_vec = inner.read_page_copy(cx, PageNumber::ONE)?;
@@ -527,6 +528,17 @@ fn remove_page_sorted(pages: &mut Vec<PageNumber>, page_no: PageNumber) {
     }
 }
 
+fn insert_staged_page(
+    write_set: &mut HashMap<PageNumber, StagedPage>,
+    write_pages_sorted: &mut Vec<PageNumber>,
+    page_no: PageNumber,
+    staged: StagedPage,
+) {
+    if write_set.insert(page_no, staged).is_none() {
+        insert_page_sorted(write_pages_sorted, page_no);
+    }
+}
+
 struct WalCommitBatch<'a> {
     new_db_size: u32,
     frames: Vec<traits::WalFrameRef<'a>>,
@@ -534,7 +546,7 @@ struct WalCommitBatch<'a> {
 
 fn collect_wal_commit_batch<'a>(
     current_db_size: u32,
-    write_set: &'a HashMap<PageNumber, PageBuf>,
+    write_set: &'a HashMap<PageNumber, StagedPage>,
     write_pages_sorted: &[PageNumber],
 ) -> Result<Option<WalCommitBatch<'a>>> {
     if write_pages_sorted.is_empty() {
@@ -547,7 +559,7 @@ fn collect_wal_commit_batch<'a>(
     let mut frames = Vec::with_capacity(frame_count);
 
     for (idx, page_no) in write_pages_sorted.iter().enumerate() {
-        let page_data = write_set.get(page_no).ok_or_else(|| {
+        let staged_page = write_set.get(page_no).ok_or_else(|| {
             FrankenError::internal(format!(
                 "WAL commit batch missing page {} from write_set",
                 page_no.get()
@@ -561,7 +573,7 @@ fn collect_wal_commit_batch<'a>(
 
         frames.push(traits::WalFrameRef {
             page_number: page_no.get(),
-            page_data,
+            page_data: staged_page.as_page_bytes(),
             db_size_if_commit,
         });
     }
@@ -1586,6 +1598,41 @@ struct SavepointEntry {
     allocated_from_eof_snapshot: Vec<PageNumber>,
 }
 
+#[derive(Debug)]
+struct StagedPage {
+    buf: PageBuf,
+    published: PageData,
+}
+
+impl StagedPage {
+    fn from_buf(buf: PageBuf) -> Self {
+        let published = PageData::from_vec(buf.to_vec());
+        Self { buf, published }
+    }
+
+    fn from_bytes(pool: &PageBufPool, data: &[u8]) -> Result<Self> {
+        let mut buf = pool.acquire()?;
+        let len = buf.len().min(data.len());
+        buf[..len].copy_from_slice(&data[..len]);
+        if len < buf.len() {
+            buf[len..].fill(0);
+        }
+        Ok(Self::from_buf(buf))
+    }
+
+    fn as_page_bytes(&self) -> &[u8] {
+        self.buf.as_slice()
+    }
+
+    fn published_page(&self) -> PageData {
+        self.published.clone()
+    }
+
+    fn into_buf(self) -> PageBuf {
+        self.buf
+    }
+}
+
 /// Transaction handle produced by [`SimplePager`].
 pub struct SimpleTransaction<V: Vfs> {
     vfs: Arc<V>,
@@ -1593,7 +1640,7 @@ pub struct SimpleTransaction<V: Vfs> {
     inner: Arc<Mutex<PagerInner<V::File>>>,
     published: Arc<PublishedPagerState>,
     published_visible_commit_seq: CommitSeq,
-    write_set: HashMap<PageNumber, PageBuf>,
+    write_set: HashMap<PageNumber, StagedPage>,
     write_pages_sorted: Vec<PageNumber>,
     freed_pages: Vec<PageNumber>,
     allocated_from_freelist: Vec<PageNumber>,
@@ -1679,7 +1726,7 @@ where
         vfs: &Arc<V>,
         journal_path: &Path,
         inner: &mut PagerInner<V::File>,
-        write_set: &HashMap<PageNumber, PageBuf>,
+        write_set: &HashMap<PageNumber, StagedPage>,
         original_db_size: u32,
     ) -> Result<()> {
         if !write_set.is_empty() {
@@ -1737,8 +1784,8 @@ where
 
             // Phase 2: Write dirty pages to database.
             let saved_db_size = inner.db_size;
-            for (page_no, data) in write_set {
-                if let Err(e) = inner.flush_page(cx, *page_no, data) {
+            for (page_no, staged) in write_set {
+                if let Err(e) = inner.flush_page(cx, *page_no, staged.as_page_bytes()) {
                     inner.db_size = saved_db_size;
                     return Err(e);
                 }
@@ -1777,7 +1824,7 @@ where
     fn commit_wal(
         cx: &Cx,
         inner: &mut PagerInner<V::File>,
-        write_set: &HashMap<PageNumber, PageBuf>,
+        write_set: &HashMap<PageNumber, StagedPage>,
         write_pages_sorted: &[PageNumber],
     ) -> Result<()> {
         if let Some(batch) = collect_wal_commit_batch(inner.db_size, write_set, write_pages_sorted)?
@@ -1881,8 +1928,8 @@ where
     V::File: Send + Sync,
 {
     fn get_page(&self, cx: &Cx, page_no: PageNumber) -> Result<PageData> {
-        if let Some(data) = self.write_set.get(&page_no) {
-            return Ok(PageData::from_vec(data.to_vec()));
+        if let Some(staged) = self.write_set.get(&page_no) {
+            return Ok(staged.published_page());
         }
 
         let read_start = Instant::now();
@@ -1981,16 +2028,13 @@ where
             self.freed_pages.swap_remove(pos);
         }
 
-        let mut buf = self.pool.acquire()?;
-        let len = buf.len().min(data.len());
-        buf[..len].copy_from_slice(&data[..len]);
-        // Zero-fill tail if needed (shouldn't happen for full page writes).
-        if len < buf.len() {
-            buf[len..].fill(0);
-        }
-        if self.write_set.insert(page_no, buf).is_none() {
-            insert_page_sorted(&mut self.write_pages_sorted, page_no);
-        }
+        let staged = StagedPage::from_bytes(&self.pool, data)?;
+        insert_staged_page(
+            &mut self.write_set,
+            &mut self.write_pages_sorted,
+            page_no,
+            staged,
+        );
         Ok(())
     }
 
@@ -2131,9 +2175,12 @@ where
                 // Offset 92..96: version-valid-for
                 page1[92..96].copy_from_slice(&new_change_counter.to_be_bytes());
             }
-            if self.write_set.insert(PageNumber::ONE, page1).is_none() {
-                insert_page_sorted(&mut self.write_pages_sorted, PageNumber::ONE);
-            }
+            insert_staged_page(
+                &mut self.write_set,
+                &mut self.write_pages_sorted,
+                PageNumber::ONE,
+                StagedPage::from_buf(page1),
+            );
         }
 
         let commit_result = if self.journal_mode == JournalMode::Wal {
@@ -2165,8 +2212,8 @@ where
                     checkpoint_active: inner.checkpoint_active,
                 },
                 |pages| {
-                    for (&page_no, buf) in &self.write_set {
-                        pages.insert(page_no, PageData::from_vec(buf.to_vec()));
+                    for (&page_no, staged) in &self.write_set {
+                        pages.insert(page_no, staged.published_page());
                     }
                     pages.retain(|page_no, _| page_no.get() <= inner.db_size);
                 },
@@ -2174,8 +2221,8 @@ where
 
             // Move newly written pages from the write_set directly into the read cache.
             // This ensures subsequent readers see cache hits for newly committed data.
-            for (page_no, buf) in self.write_set.drain() {
-                inner.cache.insert_buffer(page_no, buf);
+            for (page_no, staged) in self.write_set.drain() {
+                inner.cache.insert_buffer(page_no, staged.into_buf());
             }
             self.write_pages_sorted.clear();
 
@@ -2306,7 +2353,7 @@ where
             write_set_snapshot: self
                 .write_set
                 .iter()
-                .map(|(&k, v)| (k, v.to_vec()))
+                .map(|(&k, v)| (k, v.buf.to_vec()))
                 .collect(),
             write_pages_sorted_snapshot: self.write_pages_sorted.clone(),
             freed_pages_snapshot: self.freed_pages.clone(),
@@ -2345,14 +2392,8 @@ where
         let new_write_set = entry
             .write_set_snapshot
             .iter()
-            .map(|(&k, v)| -> Result<(PageNumber, PageBuf)> {
-                let mut buf = self.pool.acquire()?;
-                let len = buf.len().min(v.len());
-                buf.as_mut_slice()[..len].copy_from_slice(&v[..len]);
-                if len < buf.len() {
-                    buf[len..].fill(0);
-                }
-                Ok((k, buf))
+            .map(|(&k, v)| -> Result<(PageNumber, StagedPage)> {
+                Ok((k, StagedPage::from_bytes(&self.pool, v)?))
             })
             .collect::<Result<HashMap<_, _>>>()?;
 
@@ -6393,11 +6434,11 @@ mod tests {
 
         let mut page1 = PageBuf::new(PageSize::DEFAULT);
         page1.fill(0x11);
-        write_set.insert(PageNumber::ONE, page1);
+        write_set.insert(PageNumber::ONE, StagedPage::from_buf(page1));
 
         let mut page3 = PageBuf::new(PageSize::DEFAULT);
         page3.fill(0x33);
-        write_set.insert(page_three, page3);
+        write_set.insert(page_three, StagedPage::from_buf(page3));
 
         let write_pages_sorted = vec![PageNumber::ONE, page_three];
         let batch = collect_wal_commit_batch(2, &write_set, &write_pages_sorted)
@@ -6442,7 +6483,7 @@ mod tests {
 
         let mut page2 = PageBuf::new(PageSize::DEFAULT);
         page2.fill(0x22);
-        write_set.insert(page_two, page2);
+        write_set.insert(page_two, StagedPage::from_buf(page2));
 
         let batch = collect_wal_commit_batch(9, &write_set, &[page_two])
             .unwrap()
