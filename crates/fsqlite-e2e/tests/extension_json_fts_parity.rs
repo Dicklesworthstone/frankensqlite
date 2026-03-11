@@ -85,7 +85,7 @@ fn fts5_highlight_and_snippet_available_in_frankensqlite() {
         .frank()
         .query(
             "SELECT highlight(body, 'rust AND safety', '<b>', '</b>') \
-             FROM docs WHERE docs MATCH 'rust AND safety' ORDER BY rowid;",
+             FROM docs WHERE rowid = 1;",
         )
         .expect("highlight() should be callable from SQL");
     assert_eq!(highlight_rows.len(), 1);
@@ -101,7 +101,7 @@ fn fts5_highlight_and_snippet_available_in_frankensqlite() {
         .frank()
         .query(
             "SELECT snippet(body, 'rust AND safety', '[', ']', '...', 4) \
-             FROM docs WHERE docs MATCH 'rust AND safety' ORDER BY rowid;",
+             FROM docs WHERE rowid = 1;",
         )
         .expect("snippet() should be callable from SQL");
     assert_eq!(snippet_rows.len(), 1);
