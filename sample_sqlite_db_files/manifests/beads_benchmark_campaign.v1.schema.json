@@ -442,6 +442,7 @@
       "required": [
         "artifact_root_relpath",
         "bundle_dir_template",
+        "manifest_schema_version",
         "result_jsonl_name",
         "summary_md_name",
         "manifest_name",
@@ -454,6 +455,10 @@
         },
         "bundle_dir_template": {
           "$ref": "#/$defs/non_empty_string"
+        },
+        "manifest_schema_version": {
+          "type": "string",
+          "const": "fsqlite-e2e.beads_benchmark_artifact_manifest.v1"
         },
         "result_jsonl_name": {
           "$ref": "#/$defs/non_empty_string"

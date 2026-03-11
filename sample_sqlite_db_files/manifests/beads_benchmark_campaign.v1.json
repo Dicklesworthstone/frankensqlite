@@ -350,6 +350,7 @@
   "artifact_contract": {
     "artifact_root_relpath": "artifacts/perf/bd-db300.1.2",
     "bundle_dir_template": "{row_id}__{fixture_id}__{mode}__{placement_profile_id}__rev_{source_revision}__beads_{beads_hash}",
+    "manifest_schema_version": "fsqlite-e2e.beads_benchmark_artifact_manifest.v1",
     "result_jsonl_name": "results.jsonl",
     "summary_md_name": "summary.md",
     "manifest_name": "manifest.json",
