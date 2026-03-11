@@ -270,6 +270,16 @@ pub fn hot_path_profile_snapshot() -> HotPathProfileSnapshot {
     }
 }
 
+fn statement_reuse_log_context_from_env() -> (String, String) {
+    let run_id = std::env::var("RUN_ID").unwrap_or_else(|_| "(none)".to_owned());
+    let scenario_id = std::env::var("SCENARIO_ID").unwrap_or_else(|_| "(none)".to_owned());
+    (run_id, scenario_id)
+}
+
+fn format_schema_identity(cookie: u32, generation: u64) -> String {
+    format!("cookie={cookie};generation={generation}")
+}
+
 /// I/O polling strategy for the shared runtime context.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IoPollStrategy {
@@ -833,6 +843,7 @@ impl Row {
 
 /// A prepared SQL statement.
 pub struct PreparedStatement<'conn> {
+    sql: String,
     program: VdbeProgram,
     func_registry: Option<Arc<FunctionRegistry>>,
     expression_postprocess: Option<ExpressionPostprocess>,
@@ -984,6 +995,7 @@ fn emit_compat_trace_event(trace: Option<&TraceRegistration>, event: TraceEvent)
 impl std::fmt::Debug for PreparedStatement<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PreparedStatement")
+            .field("sql", &self.sql)
             .field("program", &self.program)
             .finish_non_exhaustive()
     }
@@ -1010,6 +1022,25 @@ impl PreparedStatement<'_> {
             && (self.conn.schema_cookie() != self.schema_cookie
                 || self.conn.schema_generation() != self.schema_generation)
         {
+            let invalidate_reason = if self.conn.schema_cookie() != self.schema_cookie {
+                "schema_cookie_changed"
+            } else {
+                "schema_generation_changed"
+            };
+            let failure_diag = format!(
+                "prepared_schema_identity={} current_schema_identity={}",
+                format_schema_identity(self.schema_cookie, self.schema_generation),
+                self.conn.current_schema_identity()
+            );
+            self.conn.log_statement_reuse_event(
+                "prepared_schema_validation",
+                &self.sql,
+                false,
+                invalidate_reason,
+                0,
+                0,
+                failure_diag.as_str(),
+            );
             return Err(FrankenError::SchemaChanged);
         }
         Ok(())
@@ -2166,6 +2197,70 @@ impl Connection {
         }
     }
 
+    #[must_use]
+    fn pager_backend_label(&self) -> &'static str {
+        match &self.pager {
+            PagerBackend::Memory(_) => "memory",
+            #[cfg(target_os = "linux")]
+            PagerBackend::IoUring(_) => "io_uring",
+            #[cfg(unix)]
+            PagerBackend::Unix(_) => "unix",
+            #[cfg(target_os = "windows")]
+            PagerBackend::Windows(_) => "windows",
+        }
+    }
+
+    #[must_use]
+    fn current_schema_identity(&self) -> String {
+        format_schema_identity(self.schema_cookie(), self.schema_generation())
+    }
+
+    #[must_use]
+    fn backend_identity(&self) -> String {
+        format!(
+            "{}:{}",
+            self.pager_backend_label(),
+            self.backend_mode_label()
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn log_statement_reuse_event(
+        &self,
+        cache_kind: &'static str,
+        sql: &str,
+        cache_hit: bool,
+        invalidate_reason: &'static str,
+        compile_ns: u64,
+        execute_ns: u64,
+        first_failure_diag: &str,
+    ) {
+        if !tracing::enabled!(target: "fsqlite.statement_reuse", tracing::Level::INFO) {
+            return;
+        }
+
+        let (run_id, scenario_id) = statement_reuse_log_context_from_env();
+        let statement_fingerprint = format!("{:016x}", Self::sql_hash(sql));
+        let schema_identity = self.current_schema_identity();
+        let backend_identity = self.backend_identity();
+        tracing::info!(
+            target: "fsqlite.statement_reuse",
+            cache_kind,
+            trace_id = self.root_cx.trace_id(),
+            run_id = %run_id.as_str(),
+            scenario_id = %scenario_id.as_str(),
+            statement_fingerprint = %statement_fingerprint,
+            schema_identity = %schema_identity,
+            cache_hit,
+            invalidate_reason,
+            compile_ns,
+            execute_ns,
+            backend_identity = %backend_identity,
+            first_failure_diag = %first_failure_diag,
+            "statement reuse telemetry"
+        );
+    }
+
     /// Known-benign SELECT fallback reasons that are expected in parity-cert mode.
     /// These represent SQL patterns the VDBE engine doesn't natively handle yet,
     /// so falling back to in-memory evaluation is the correct behavior.
@@ -2762,6 +2857,7 @@ impl Connection {
             }
             statement
         };
+        let canonical_sql = statement.to_string();
         if self.prepared_select_requires_dispatch(&statement) {
             let plan_span = tracing::span!(
                 target: "fsqlite.plan",
@@ -2771,7 +2867,7 @@ impl Connection {
             );
             record_trace_span_created();
             let _plan_guard = plan_span.enter();
-            return self.compile_and_wrap(&statement);
+            return self.compile_and_wrap(&canonical_sql, &statement);
         }
         let plan_span = tracing::span!(
             target: "fsqlite.plan",
@@ -2781,7 +2877,7 @@ impl Connection {
         );
         record_trace_span_created();
         let _plan_guard = plan_span.enter();
-        self.compile_and_wrap(&statement)
+        self.compile_and_wrap(&canonical_sql, &statement)
     }
 
     /// Prepare and execute SQL as a query.
@@ -2962,11 +3058,12 @@ impl Connection {
             FSQLITE_PARSE_SINGLE_CALLS.fetch_add(1, AtomicOrdering::Relaxed);
         }
         let key = Self::sql_hash(sql);
-        self.refresh_parse_cache_if_needed();
+        self.refresh_parse_cache_if_needed(sql);
         if let Some(cached) = self.lookup_parse_cache(key, sql) {
             if profile_enabled {
                 FSQLITE_PARSE_CACHE_HITS.fetch_add(1, AtomicOrdering::Relaxed);
             }
+            self.log_statement_reuse_event("parse", sql, true, "none", 0, 0, "none");
             return Ok(std::sync::Arc::clone(&cached.statement));
         }
         if profile_enabled {
@@ -2977,13 +3074,29 @@ impl Connection {
             );
         }
         let start = profile_enabled.then(Instant::now);
-        let stmt = parse_single_statement(sql)?;
+        let stmt = match parse_single_statement(sql) {
+            Ok(stmt) => stmt,
+            Err(error) => {
+                let failure_diag = error.to_string();
+                self.log_statement_reuse_event(
+                    "parse",
+                    sql,
+                    false,
+                    "parse_error",
+                    0,
+                    0,
+                    failure_diag.as_str(),
+                );
+                return Err(error);
+            }
+        };
         if let Some(start) = start {
             FSQLITE_PARSE_TIME_NS.fetch_add(
                 u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX),
                 AtomicOrdering::Relaxed,
             );
         }
+        self.log_statement_reuse_event("parse", sql, false, "none", 0, 0, "none");
         Ok(std::sync::Arc::clone(
             &self.insert_parse_cache(key, sql, stmt).statement,
         ))
@@ -3000,11 +3113,12 @@ impl Connection {
         // Hot path optimization for repeated single-statement execute() calls.
         // Use the same collision-safe SQL equality check as cached_parse_single.
         let key = Self::sql_hash(sql);
-        self.refresh_parse_cache_if_needed();
+        self.refresh_parse_cache_if_needed(sql);
         if let Some(cached) = self.lookup_parse_cache(key, sql) {
             if profile_enabled {
                 FSQLITE_PARSE_CACHE_HITS.fetch_add(1, AtomicOrdering::Relaxed);
             }
+            self.log_statement_reuse_event("parse", sql, true, "none", 0, 0, "none");
             return Ok(vec![std::sync::Arc::clone(&cached.statement)]);
         }
 
@@ -3017,7 +3131,22 @@ impl Connection {
             );
         }
         let start = profile_enabled.then(Instant::now);
-        let stmts = parse_statements(sql)?;
+        let stmts = match parse_statements(sql) {
+            Ok(stmts) => stmts,
+            Err(error) => {
+                let failure_diag = error.to_string();
+                self.log_statement_reuse_event(
+                    "parse",
+                    sql,
+                    false,
+                    "parse_error",
+                    0,
+                    0,
+                    failure_diag.as_str(),
+                );
+                return Err(error);
+            }
+        };
         if let Some(start) = start {
             FSQLITE_PARSE_TIME_NS.fetch_add(
                 u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX),
@@ -3027,16 +3156,26 @@ impl Connection {
         if stmts.len() == 1 {
             self.insert_parse_cache(key, sql, stmts[0].clone());
         }
+        self.log_statement_reuse_event("parse", sql, false, "none", 0, 0, "none");
         Ok(stmts.into_iter().map(std::sync::Arc::new).collect())
     }
 
-    fn refresh_parse_cache_if_needed(&self) {
+    fn refresh_parse_cache_if_needed(&self, sql: &str) {
         let current_cookie = *self.schema_cookie.borrow();
         let cached_cookie = *self.parse_cache_cookie.borrow();
         if cached_cookie != current_cookie {
             self.parse_cache.borrow_mut().clear();
             self.compiled_cache.borrow_mut().clear();
             *self.parse_cache_cookie.borrow_mut() = current_cookie;
+            self.log_statement_reuse_event(
+                "schema_invalidation",
+                sql,
+                false,
+                "schema_cookie_changed",
+                0,
+                0,
+                "none",
+            );
         }
     }
 
@@ -3084,6 +3223,15 @@ impl Connection {
         let mut cache = self.compiled_cache.borrow_mut();
         if cache.peek(&key).is_some_and(|e| e.sql == sql) {
             cache.pop(&key);
+            self.log_statement_reuse_event(
+                "compiled",
+                sql,
+                false,
+                "explicit_invalidate",
+                0,
+                0,
+                "none",
+            );
         }
     }
 
@@ -3117,19 +3265,35 @@ impl Connection {
             if profile_enabled {
                 FSQLITE_COMPILED_CACHE_HITS.fetch_add(1, AtomicOrdering::Relaxed);
             }
+            self.log_statement_reuse_event("compiled", sql, true, "none", 0, 0, "none");
             return Ok(Arc::clone(&cached.program));
         }
         if profile_enabled {
             FSQLITE_COMPILED_CACHE_MISSES.fetch_add(1, AtomicOrdering::Relaxed);
         }
-        let start = profile_enabled.then(Instant::now);
-        let program = compile_fn(self)?;
-        if let Some(start) = start {
-            FSQLITE_COMPILE_TIME_NS.fetch_add(
-                u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX),
-                AtomicOrdering::Relaxed,
-            );
+        let start = Instant::now();
+        let program = match compile_fn(self) {
+            Ok(program) => program,
+            Err(error) => {
+                let compile_ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                let failure_diag = error.to_string();
+                self.log_statement_reuse_event(
+                    "compiled",
+                    sql,
+                    false,
+                    "compile_error",
+                    compile_ns,
+                    0,
+                    failure_diag.as_str(),
+                );
+                return Err(error);
+            }
+        };
+        let compile_ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        if profile_enabled {
+            FSQLITE_COMPILE_TIME_NS.fetch_add(compile_ns, AtomicOrdering::Relaxed);
         }
+        self.log_statement_reuse_event("compiled", sql, false, "none", compile_ns, 0, "none");
         let entry = self.insert_compiled_cache(sql_key, sql, program);
         Ok(Arc::clone(&entry.program))
     }
@@ -3325,6 +3489,9 @@ impl Connection {
         } else {
             String::new()
         };
+        let statement_reuse_sql =
+            tracing::enabled!(target: "fsqlite.statement_reuse", tracing::Level::INFO)
+                .then(|| statement.to_string());
         let statement_span = tracing::span!(
             target: "fsqlite.statement",
             tracing::Level::DEBUG,
@@ -3420,6 +3587,21 @@ impl Connection {
         let ok = result.is_ok();
         self.resolve_autocommit_txn(was_auto, ok)?;
         let elapsed_ns = u64::try_from(execution_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        if let Some(statement_reuse_sql) = statement_reuse_sql.as_deref() {
+            let failure_diag = match result.as_ref() {
+                Ok(_) => Cow::Borrowed("none"),
+                Err(error) => Cow::Owned(error.to_string()),
+            };
+            self.log_statement_reuse_event(
+                "execution",
+                statement_reuse_sql,
+                precompiled.is_some(),
+                if ok { "none" } else { "execution_error" },
+                0,
+                elapsed_ns,
+                failure_diag.as_ref(),
+            );
+        }
         emit_compat_trace_event(
             trace_registration.as_ref(),
             TraceEvent::Profile {
@@ -4774,7 +4956,7 @@ impl Connection {
     }
 
     /// Compile and wrap a statement into a `PreparedStatement`.
-    fn compile_and_wrap(&self, statement: &Statement) -> Result<PreparedStatement<'_>> {
+    fn compile_and_wrap(&self, sql: &str, statement: &Statement) -> Result<PreparedStatement<'_>> {
         let registry = Some(Arc::clone(&*self.func_registry.borrow()));
         match statement {
             Statement::Select(_) if self.prepared_select_requires_dispatch(statement) => {
@@ -4782,6 +4964,7 @@ impl Connection {
                     FrankenError::Internal(format!("failed to build placeholder program: {e}"))
                 })?;
                 Ok(PreparedStatement {
+                    sql: sql.to_owned(),
                     program: placeholder_program,
                     func_registry: registry,
                     expression_postprocess: None,
@@ -4803,6 +4986,7 @@ impl Connection {
                 let program = compile_expression_select(select)?;
                 let expression_postprocess = Some(build_expression_postprocess(select));
                 Ok(PreparedStatement {
+                    sql: sql.to_owned(),
                     program,
                     func_registry: registry,
                     expression_postprocess,
@@ -4829,6 +5013,7 @@ impl Connection {
                     self.compile_table_select(select)?
                 };
                 Ok(PreparedStatement {
+                    sql: sql.to_owned(),
                     program,
                     func_registry: registry,
                     expression_postprocess: None,
@@ -4863,6 +5048,7 @@ impl Connection {
                 if is_simple_values {
                     let program = self.compile_table_insert(insert)?;
                     Ok(PreparedStatement {
+                        sql: sql.to_owned(),
                         program,
                         func_registry: registry,
                         expression_postprocess: None,
@@ -4883,6 +5069,7 @@ impl Connection {
                         FrankenError::Internal(format!("failed to build placeholder program: {e}"))
                     })?;
                     Ok(PreparedStatement {
+                        sql: sql.to_owned(),
                         program: placeholder_program,
                         func_registry: registry,
                         expression_postprocess: None,
@@ -4906,6 +5093,7 @@ impl Connection {
                     FrankenError::Internal(format!("failed to build placeholder program: {e}"))
                 })?;
                 Ok(PreparedStatement {
+                    sql: sql.to_owned(),
                     program: placeholder_program,
                     func_registry: registry,
                     expression_postprocess: None,
@@ -7222,7 +7410,6 @@ impl Connection {
     }
 
     fn compute_index_stat_string_in_txn(
-        &self,
         cx: &Cx,
         txn: &mut dyn TransactionHandle,
         index: &IndexSchema,
@@ -8889,7 +9076,7 @@ impl Connection {
                 }
 
                 for index in &target.indexes {
-                    if let Some(stat) = self.compute_index_stat_string_in_txn(cx, txn, index)? {
+                    if let Some(stat) = Self::compute_index_stat_string_in_txn(cx, txn, index)? {
                         replacement_rows.push(Stat1Row {
                             table_name: target.table.name.clone(),
                             index_name: Some(index.name.clone()),
@@ -11491,7 +11678,7 @@ impl Connection {
     #[allow(clippy::too_many_arguments)]
     fn walk_integrity_overflow_chain(
         cx: &Cx,
-        txn: &mut dyn TransactionHandle,
+        txn: &dyn TransactionHandle,
         page_size: PageSize,
         reserved_per_page: u8,
         total_pages: u32,
@@ -11691,7 +11878,6 @@ impl Connection {
 
     #[allow(clippy::too_many_arguments)]
     fn validate_page_ownership_in_txn(
-        &self,
         cx: &Cx,
         txn: &mut dyn TransactionHandle,
         page_size: PageSize,
@@ -11810,6 +11996,7 @@ impl Connection {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn validate_schema_btrees_in_txn(
         &self,
         cx: &Cx,
@@ -11828,7 +12015,7 @@ impl Connection {
         let column_defaults_by_root_page = (!quick).then(|| self.column_defaults_by_root_page());
 
         if !quick {
-            self.validate_page_ownership_in_txn(
+            Self::validate_page_ownership_in_txn(
                 cx,
                 txn,
                 page_size,
@@ -19807,6 +19994,7 @@ fn flatten_outer_result_columns(
     Some(flattened)
 }
 
+#[allow(clippy::option_option)]
 fn flatten_expr_option(
     expr: Option<&Expr>,
     outer_alias: Option<&str>,
@@ -19857,7 +20045,10 @@ fn flatten_expr_tree(
     projection_map: &FlattenProjectionMap,
 ) -> Option<Expr> {
     match expr {
-        Expr::Literal(_, _) | Expr::Subquery(_, _) | Expr::Placeholder(_, _) => Some(expr.clone()),
+        Expr::Literal(_, _)
+        | Expr::Subquery(_, _)
+        | Expr::Placeholder(_, _)
+        | Expr::Raise { .. } => Some(expr.clone()),
         Expr::Column(column_ref, span) => {
             flatten_column_ref(column_ref, *span, outer_alias, projection_map)
         }
@@ -20014,7 +20205,6 @@ fn flatten_expr_tree(
             not: *not,
             span: *span,
         }),
-        Expr::Raise { .. } => Some(expr.clone()),
         Expr::JsonAccess {
             expr: inner,
             path,
@@ -35386,25 +35576,32 @@ mod tests {
             .unwrap_or_else(|err| {
                 panic!("first writer UPDATE before conflict cycle failed: {err:?}")
             });
-        conn_b
-            .execute("UPDATE t SET v = v + 1 WHERE id = 1;")
-            .unwrap_or_else(|err| {
-                panic!("second writer UPDATE before conflict cycle failed: {err:?}")
-            });
-
-        conn_a
-            .execute("COMMIT;")
-            .unwrap_or_else(|err| panic!("first writer COMMIT failed unexpectedly: {err:?}"));
-
-        let busy_snapshot = conn_b
-            .execute("COMMIT;")
-            .expect_err("second writer should hit BusySnapshot after stale-snapshot conflict");
+        let loser_err = match conn_b.execute("UPDATE t SET v = v + 1 WHERE id = 1;") {
+            Ok(changes) => {
+                assert_eq!(
+                    changes, 1,
+                    "second writer should affect one row when the stale-write conflict defers to COMMIT"
+                );
+                conn_a.execute("COMMIT;").unwrap_or_else(|err| {
+                    panic!("first writer COMMIT failed unexpectedly: {err:?}")
+                });
+                conn_b.execute("COMMIT;").expect_err(
+                    "second writer should fail transiently once the stale-snapshot conflict resolves",
+                )
+            }
+            Err(err) => {
+                conn_a.execute("COMMIT;").unwrap_or_else(|commit_err| {
+                    panic!("first writer COMMIT after loser UPDATE conflict failed unexpectedly: {commit_err:?}")
+                });
+                err
+            }
+        };
         assert!(
-            matches!(busy_snapshot, FrankenError::BusySnapshot { .. }),
-            "expected BusySnapshot after same-row concurrent commit, got {busy_snapshot:?}"
+            loser_err.is_transient(),
+            "same-row concurrent writer must fail transiently, got {loser_err:?}"
         );
         conn_b.execute("ROLLBACK;").unwrap_or_else(|err| {
-            panic!("losing writer ROLLBACK after BusySnapshot failed: {err:?}")
+            panic!("losing writer ROLLBACK after transient stale-write failure failed: {err:?}")
         });
 
         conn_a
@@ -35415,12 +35612,12 @@ mod tests {
         let latest_commit_seq = conn_a.pager.published_snapshot().visible_commit_seq;
 
         conn_b.execute("BEGIN;").unwrap_or_else(|err| {
-            panic!("retry BEGIN after BusySnapshot + ROLLBACK failed: {err:?}")
+            panic!("retry BEGIN after transient stale-write rollback failed: {err:?}")
         });
         assert_eq!(
             conn_b.current_concurrent_snapshot_seq(),
             Some(latest_commit_seq.get()),
-            "retry BEGIN after BusySnapshot must bind to the latest published commit sequence"
+            "retry BEGIN after rollback must bind to the latest published commit sequence"
         );
         assert_eq!(
             conn_b
@@ -35428,7 +35625,7 @@ mod tests {
                 .unwrap()
                 .values()[0],
             SqliteValue::Integer(2),
-            "retry BEGIN after BusySnapshot + ROLLBACK must refresh conn_b's execution image"
+            "retry BEGIN after rollback must refresh conn_b's execution image"
         );
 
         conn_b
@@ -36108,7 +36305,6 @@ mod tests {
         for _worker_id in 0..WORKERS {
             let db = db.clone();
             let barrier = Arc::clone(&start_barrier);
-            let table_root_page = table_root_page;
             handles.push(std::thread::spawn(move || -> u64 {
                 let conn = Connection::open(&db).unwrap();
                 conn.execute("PRAGMA busy_timeout=5000;").unwrap();
@@ -36508,8 +36704,7 @@ mod tests {
                 .iter()
                 .take(limit)
                 .map(|byte| format!("{byte:02x}"))
-                .collect::<Vec<_>>()
-                .join("")
+                .collect()
         };
         let describe_root_page_layout = |conn: &Connection| -> String {
             let cx = Cx::new();
@@ -49691,6 +49886,359 @@ mod pager_routing_tests {
             .query("SELECT COUNT(*) FROM prep_schema_dml;")
             .unwrap();
         assert_eq!(rows[0].values()[0], SqliteValue::Integer(0));
+    }
+
+    #[cfg(test)]
+    use proptest::{prop_assert, prop_assert_eq};
+
+    #[cfg(test)]
+    struct StatementReuseHotPathProfileGuard;
+
+    #[cfg(test)]
+    impl StatementReuseHotPathProfileGuard {
+        fn new() -> Self {
+            reset_hot_path_profile();
+            set_hot_path_profile_enabled(true);
+            Self
+        }
+    }
+
+    #[cfg(test)]
+    impl Drop for StatementReuseHotPathProfileGuard {
+        fn drop(&mut self) {
+            set_hot_path_profile_enabled(false);
+            reset_hot_path_profile();
+        }
+    }
+
+    #[cfg(test)]
+    fn init_statement_reuse_root_tracing() {
+        static TRACING_INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        TRACING_INIT.get_or_init(|| {
+            if tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::TRACE)
+                .with_test_writer()
+                .try_init()
+                .is_err()
+            {
+                // Another test already installed a global subscriber.
+            }
+        });
+    }
+
+    #[test]
+    fn test_statement_reuse_regression_ad_hoc_hot_path_metrics_and_row_counts() {
+        let _profile_guard = StatementReuseHotPathProfileGuard::new();
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE sr_hot (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+
+        let insert_sql = "INSERT INTO sr_hot (id, val) VALUES (?1, ?2)";
+        for id in 1_i64..=4 {
+            let affected = conn
+                .execute_with_params(
+                    insert_sql,
+                    &[
+                        SqliteValue::Integer(id),
+                        SqliteValue::Text(format!("v{id}")),
+                    ],
+                )
+                .unwrap();
+            assert_eq!(affected, 1);
+        }
+
+        let select_sql = "SELECT val FROM sr_hot WHERE id = ?1";
+        for id in 1_i64..=4 {
+            let row = conn
+                .query_row_with_params(select_sql, &[SqliteValue::Integer(id)])
+                .unwrap();
+            assert_eq!(row.values()[0], SqliteValue::Text(format!("v{id}")));
+        }
+
+        let profile = hot_path_profile_snapshot();
+        assert!(
+            profile.parser.parse_cache_hits >= 4,
+            "expected repeated ad-hoc execution to hit parse cache: {profile:?}"
+        );
+        assert!(
+            profile.parser.compiled_cache_hits >= 4,
+            "expected repeated ad-hoc execution to hit compiled cache: {profile:?}"
+        );
+    }
+
+    #[test]
+    fn test_statement_reuse_regression_prepared_trigger_constraint_row_count() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE sr_main (id INTEGER PRIMARY KEY, val TEXT UNIQUE);")
+            .unwrap();
+        conn.execute("CREATE TABLE sr_audit (main_id INTEGER NOT NULL);")
+            .unwrap();
+        conn.execute(
+            "CREATE TRIGGER sr_after_insert AFTER INSERT ON sr_main \
+             BEGIN INSERT INTO sr_audit(main_id) VALUES (NEW.id); END;",
+        )
+        .unwrap();
+
+        let stmt = conn
+            .prepare("INSERT INTO sr_main (id, val) VALUES (?1, ?2)")
+            .unwrap();
+
+        assert_eq!(
+            stmt.execute_with_params(&[
+                SqliteValue::Integer(1),
+                SqliteValue::Text("alpha".to_owned()),
+            ])
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            stmt.execute_with_params(&[
+                SqliteValue::Integer(2),
+                SqliteValue::Text("beta".to_owned()),
+            ])
+            .unwrap(),
+            1
+        );
+
+        let err = stmt
+            .execute_with_params(&[
+                SqliteValue::Integer(3),
+                SqliteValue::Text("beta".to_owned()),
+            ])
+            .expect_err("duplicate UNIQUE value should fail");
+        let err_text = err.to_string();
+        assert!(
+            err_text.contains("UNIQUE constraint failed") || err_text.contains("constraint failed"),
+            "unexpected constraint error: {err_text}"
+        );
+
+        assert_eq!(
+            stmt.execute_with_params(&[
+                SqliteValue::Integer(3),
+                SqliteValue::Text("gamma".to_owned()),
+            ])
+            .unwrap(),
+            1
+        );
+
+        let main_count = conn.query_row("SELECT COUNT(*) FROM sr_main;").unwrap();
+        let audit_count = conn.query_row("SELECT COUNT(*) FROM sr_audit;").unwrap();
+        assert_eq!(main_count.values()[0], SqliteValue::Integer(3));
+        assert_eq!(audit_count.values()[0], SqliteValue::Integer(3));
+    }
+
+    #[test]
+    fn test_statement_reuse_regression_binding_mismatch_does_not_poison_reuse() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE sr_bind (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
+
+        let stmt = conn
+            .prepare("INSERT INTO sr_bind (id, val) VALUES (?1, ?2)")
+            .unwrap();
+        let err = stmt
+            .execute_with_params(&[SqliteValue::Integer(1)])
+            .expect_err("missing prepared parameter should fail");
+        assert!(matches!(err, FrankenError::OutOfRange { .. }));
+
+        assert_eq!(
+            stmt.execute_with_params(&[
+                SqliteValue::Integer(1),
+                SqliteValue::Text("prepared-ok".to_owned()),
+            ])
+            .unwrap(),
+            1
+        );
+
+        let err = conn
+            .execute_with_params(
+                "INSERT INTO sr_bind (id, val) VALUES (?1, ?2)",
+                &[SqliteValue::Integer(2)],
+            )
+            .expect_err("missing ad-hoc parameter should fail");
+        assert!(matches!(err, FrankenError::OutOfRange { .. }));
+
+        assert_eq!(
+            conn.execute_with_params(
+                "INSERT INTO sr_bind (id, val) VALUES (?1, ?2)",
+                &[
+                    SqliteValue::Integer(2),
+                    SqliteValue::Text("adhoc-ok".to_owned()),
+                ],
+            )
+            .unwrap(),
+            1
+        );
+
+        let rows = conn.query("SELECT val FROM sr_bind ORDER BY id;").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0].values()[0],
+            SqliteValue::Text("prepared-ok".to_owned())
+        );
+        assert_eq!(
+            rows[1].values()[0],
+            SqliteValue::Text("adhoc-ok".to_owned())
+        );
+    }
+
+    #[test]
+    fn test_statement_reuse_regression_file_backed_trace_contract() {
+        init_statement_reuse_root_tracing();
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("statement-reuse-trace.db");
+        let db = db_path.to_string_lossy().into_owned();
+
+        let conn = Connection::open(&db).unwrap();
+        conn.set_reject_mem_fallback(true);
+        conn.set_strict_mem_fallback_rejection(true);
+        conn.execute("CREATE TABLE sr_file (id INTEGER PRIMARY KEY, val TEXT UNIQUE);")
+            .unwrap();
+
+        let stmt = conn
+            .prepare("INSERT INTO sr_file (id, val) VALUES (?1, ?2)")
+            .unwrap();
+        assert_eq!(
+            stmt.execute_with_params(&[
+                SqliteValue::Integer(1),
+                SqliteValue::Text("alpha".to_owned()),
+            ])
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            stmt.execute_with_params(&[
+                SqliteValue::Integer(2),
+                SqliteValue::Text("beta".to_owned()),
+            ])
+            .unwrap(),
+            1
+        );
+
+        let update_sql = "UPDATE sr_file SET val = ?1 WHERE id = ?2";
+        assert_eq!(
+            conn.execute_with_params(
+                update_sql,
+                &[
+                    SqliteValue::Text("alpha-updated".to_owned()),
+                    SqliteValue::Integer(1),
+                ],
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.execute_with_params(
+                update_sql,
+                &[
+                    SqliteValue::Text("beta-updated".to_owned()),
+                    SqliteValue::Integer(2),
+                ],
+            )
+            .unwrap(),
+            1
+        );
+
+        let select_sql = "SELECT val FROM sr_file WHERE id = ?1";
+        let row_a = conn
+            .query_row_with_params(select_sql, &[SqliteValue::Integer(1)])
+            .unwrap();
+        let row_b = conn
+            .query_row_with_params(select_sql, &[SqliteValue::Integer(2)])
+            .unwrap();
+        assert_eq!(
+            row_a.values()[0],
+            SqliteValue::Text("alpha-updated".to_owned())
+        );
+        assert_eq!(
+            row_b.values()[0],
+            SqliteValue::Text("beta-updated".to_owned())
+        );
+
+        conn.execute("ALTER TABLE sr_file ADD COLUMN extra TEXT DEFAULT 'x';")
+            .unwrap();
+        let err = stmt
+            .execute_with_params(&[
+                SqliteValue::Integer(3),
+                SqliteValue::Text("gamma".to_owned()),
+            ])
+            .expect_err("schema change should invalidate prepared insert");
+        assert!(matches!(err, FrankenError::SchemaChanged));
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn proptest_statement_reuse_prepared_prefix_survives_schema_invalidation(
+            values in proptest::collection::vec(-500_i64..500, 1..8),
+            invalidation_at in 0_usize..8,
+        ) {
+            let conn = Connection::open(":memory:").unwrap();
+            conn.execute("CREATE TABLE sr_prop_prepared (id INTEGER PRIMARY KEY, val INTEGER);")
+                .unwrap();
+            let stmt = conn
+                .prepare("INSERT INTO sr_prop_prepared (id, val) VALUES (?1, ?2)")
+                .unwrap();
+
+            let cutoff = invalidation_at.min(values.len());
+            for (index, value) in values.iter().take(cutoff).enumerate() {
+                let id = i64::try_from(index + 1).unwrap();
+                let affected = stmt
+                    .execute_with_params(&[SqliteValue::Integer(id), SqliteValue::Integer(*value)])
+                    .unwrap();
+                prop_assert_eq!(affected, 1);
+            }
+
+            conn.execute("CREATE TABLE sr_prop_prepared_bump (id INTEGER PRIMARY KEY);")
+                .unwrap();
+            let next_id = i64::try_from(cutoff + 1).unwrap();
+            let err = stmt
+                .execute_with_params(&[SqliteValue::Integer(next_id), SqliteValue::Integer(999)])
+                .unwrap_err();
+            prop_assert!(matches!(err, FrankenError::SchemaChanged));
+
+            let count = conn
+                .query_row("SELECT COUNT(*) FROM sr_prop_prepared;")
+                .unwrap();
+            prop_assert_eq!(
+                &count.values()[0],
+                &SqliteValue::Integer(i64::try_from(cutoff).unwrap())
+            );
+        }
+
+        #[test]
+        fn proptest_statement_reuse_ad_hoc_repeated_values_preserve_order(
+            values in proptest::collection::vec(-500_i64..500, 1..8),
+        ) {
+            let _profile_guard = StatementReuseHotPathProfileGuard::new();
+            let conn = Connection::open(":memory:").unwrap();
+            conn.execute("CREATE TABLE sr_prop_adhoc (id INTEGER PRIMARY KEY, val INTEGER);")
+                .unwrap();
+
+            let insert_sql = "INSERT INTO sr_prop_adhoc (id, val) VALUES (?1, ?2)";
+            for (index, value) in values.iter().enumerate() {
+                let id = i64::try_from(index + 1).unwrap();
+                let affected = conn
+                    .execute_with_params(
+                        insert_sql,
+                        &[SqliteValue::Integer(id), SqliteValue::Integer(*value)],
+                    )
+                    .unwrap();
+                prop_assert_eq!(affected, 1);
+            }
+
+            let rows = conn.query("SELECT val FROM sr_prop_adhoc ORDER BY id;").unwrap();
+            prop_assert_eq!(rows.len(), values.len());
+            for (row, expected) in rows.iter().zip(values.iter()) {
+                prop_assert_eq!(&row.values()[0], &SqliteValue::Integer(*expected));
+            }
+
+            let profile = hot_path_profile_snapshot();
+            let expected_hits = u64::try_from(values.len().saturating_sub(1)).unwrap();
+            prop_assert!(profile.parser.parse_cache_hits >= expected_hits);
+            prop_assert!(profile.parser.compiled_cache_hits >= expected_hits);
+        }
     }
 
     #[test]
