@@ -1831,6 +1831,94 @@ pub fn snippet(
 // Scalar functions for FTS5
 // ---------------------------------------------------------------------------
 
+fn fallback_query_terms(query: &str) -> Vec<String> {
+    query
+        .split_whitespace()
+        .filter_map(|raw| {
+            let trimmed = raw
+                .trim_matches(|ch: char| matches!(ch, '"' | '\'' | '(' | ')' | ','))
+                .trim_start_matches('^')
+                .trim_end_matches('*')
+                .to_ascii_lowercase();
+            if trimmed.is_empty() || matches!(trimmed.as_str(), "and" | "or" | "not" | "near") {
+                None
+            } else {
+                Some(trimmed)
+            }
+        })
+        .collect()
+}
+
+fn query_terms_from_query_text(query: &str) -> Vec<String> {
+    parse_fts5_query(query)
+        .and_then(|tokens| build_expr(&tokens))
+        .map_or_else(
+            |_| fallback_query_terms(query),
+            |expr| extract_query_terms(&expr),
+        )
+}
+
+/// highlight(text, query, open, close) — highlight FTS5 query terms in text.
+pub struct Fts5HighlightFunc;
+
+impl ScalarFunction for Fts5HighlightFunc {
+    fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
+        if args.iter().any(|arg| matches!(arg, SqliteValue::Null)) {
+            return Ok(SqliteValue::Null);
+        }
+
+        let text = args[0].to_text();
+        let query = args[1].to_text();
+        let open_tag = args[2].to_text();
+        let close_tag = args[3].to_text();
+        let terms = query_terms_from_query_text(&query);
+
+        Ok(SqliteValue::Text(highlight(
+            &text, &terms, &open_tag, &close_tag,
+        )))
+    }
+
+    fn num_args(&self) -> i32 {
+        4
+    }
+
+    fn name(&self) -> &'static str {
+        "highlight"
+    }
+}
+
+/// snippet(text, query, open, close, ellipsis, max_tokens) — derive a
+/// highlighted snippet from text using FTS5 query terms.
+pub struct Fts5SnippetFunc;
+
+impl ScalarFunction for Fts5SnippetFunc {
+    fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
+        if args.iter().any(|arg| matches!(arg, SqliteValue::Null)) {
+            return Ok(SqliteValue::Null);
+        }
+
+        let text = args[0].to_text();
+        let query = args[1].to_text();
+        let open_tag = args[2].to_text();
+        let close_tag = args[3].to_text();
+        let ellipsis = args[4].to_text();
+        let max_tokens = usize::try_from(args[5].to_integer()).unwrap_or(0);
+        let terms = query_terms_from_query_text(&query);
+
+        Ok(SqliteValue::Text(snippet(
+            &text, &terms, &open_tag, &close_tag, &ellipsis, max_tokens,
+        )))
+    }
+
+    fn num_args(&self) -> i32 {
+        6
+    }
+
+    fn name(&self) -> &'static str {
+        "snippet"
+    }
+}
+
 /// fts5_source_id() — returns the FTS5 extension version string.
 pub struct Fts5SourceIdFunc;
 
@@ -1852,6 +1940,8 @@ impl ScalarFunction for Fts5SourceIdFunc {
 
 /// Register FTS5 scalar functions into a `FunctionRegistry`.
 pub fn register_fts5_scalars(registry: &mut fsqlite_func::FunctionRegistry) {
+    registry.register_scalar(Fts5HighlightFunc);
+    registry.register_scalar(Fts5SnippetFunc);
     registry.register_scalar(Fts5SourceIdFunc);
     debug!("fts5: registered scalar functions");
 }
@@ -2505,7 +2595,62 @@ mod tests {
     fn test_register_fts5_scalars() {
         let mut registry = fsqlite_func::FunctionRegistry::new();
         register_fts5_scalars(&mut registry);
+        assert!(registry.find_scalar("highlight", 4).is_some());
+        assert!(registry.find_scalar("snippet", 6).is_some());
         assert!(registry.find_scalar("fts5_source_id", 0).is_some());
+    }
+
+    #[test]
+    fn test_highlight_scalar_func_uses_query_text() {
+        let func = Fts5HighlightFunc;
+        let result = func
+            .invoke(&[
+                SqliteValue::Text("the quick brown fox".to_owned()),
+                SqliteValue::Text("quick OR fox".to_owned()),
+                SqliteValue::Text("<b>".to_owned()),
+                SqliteValue::Text("</b>".to_owned()),
+            ])
+            .unwrap();
+
+        assert_eq!(
+            result,
+            SqliteValue::Text("the <b>quick</b> brown <b>fox</b>".to_owned())
+        );
+    }
+
+    #[test]
+    fn test_highlight_scalar_func_falls_back_for_invalid_query() {
+        let func = Fts5HighlightFunc;
+        let result = func
+            .invoke(&[
+                SqliteValue::Text("hello world".to_owned()),
+                SqliteValue::Text("(hello".to_owned()),
+                SqliteValue::Text("<b>".to_owned()),
+                SqliteValue::Text("</b>".to_owned()),
+            ])
+            .unwrap();
+
+        assert_eq!(result, SqliteValue::Text("<b>hello</b> world".to_owned()));
+    }
+
+    #[test]
+    fn test_snippet_scalar_func_uses_query_text() {
+        let func = Fts5SnippetFunc;
+        let result = func
+            .invoke(&[
+                SqliteValue::Text("alpha beta gamma delta epsilon".to_owned()),
+                SqliteValue::Text("delta".to_owned()),
+                SqliteValue::Text("[".to_owned()),
+                SqliteValue::Text("]".to_owned()),
+                SqliteValue::Text("...".to_owned()),
+                SqliteValue::Integer(3),
+            ])
+            .unwrap();
+
+        let SqliteValue::Text(snippet_text) = result else {
+            panic!("snippet() should return text");
+        };
+        assert!(snippet_text.contains("[delta]"));
     }
 
     // -- Full query pipeline test --

@@ -57,3 +57,58 @@ fn fts5_source_id_available_in_frankensqlite() {
         assert_eq!(c_rows.len(), 1);
     }
 }
+
+#[test]
+fn fts5_highlight_and_snippet_available_in_frankensqlite() {
+    let runner = ComparisonRunner::new_in_memory().expect("failed to create comparison runner");
+
+    runner
+        .frank()
+        .execute("CREATE VIRTUAL TABLE docs USING fts5(subject, body);")
+        .expect("FrankenSQLite should create FTS5 virtual tables");
+    runner
+        .frank()
+        .execute(
+            "INSERT INTO docs(rowid, subject, body) VALUES \
+             (1, 'Intro', 'Rust systems language safety and speed');",
+        )
+        .expect("first FTS5 insert should succeed");
+    runner
+        .frank()
+        .execute(
+            "INSERT INTO docs(rowid, subject, body) VALUES \
+             (2, 'Other', 'Nothing relevant lives here');",
+        )
+        .expect("second FTS5 insert should succeed");
+
+    let highlight_rows = runner
+        .frank()
+        .query(
+            "SELECT highlight(body, 'rust AND safety', '<b>', '</b>') \
+             FROM docs WHERE docs MATCH 'rust AND safety' ORDER BY rowid;",
+        )
+        .expect("highlight() should be callable from SQL");
+    assert_eq!(highlight_rows.len(), 1);
+    match &highlight_rows[0][0] {
+        SqlValue::Text(text) => {
+            assert!(text.contains("<b>Rust</b>"));
+            assert!(text.contains("<b>safety</b>"));
+        }
+        other => panic!("highlight() must return text, got {other:?}"),
+    }
+
+    let snippet_rows = runner
+        .frank()
+        .query(
+            "SELECT snippet(body, 'rust AND safety', '[', ']', '...', 4) \
+             FROM docs WHERE docs MATCH 'rust AND safety' ORDER BY rowid;",
+        )
+        .expect("snippet() should be callable from SQL");
+    assert_eq!(snippet_rows.len(), 1);
+    match &snippet_rows[0][0] {
+        SqlValue::Text(text) => {
+            assert!(text.contains("[Rust]") || text.contains("[safety]"));
+        }
+        other => panic!("snippet() must return text, got {other:?}"),
+    }
+}
