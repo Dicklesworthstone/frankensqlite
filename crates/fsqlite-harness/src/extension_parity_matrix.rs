@@ -639,6 +639,17 @@ impl ExtensionParityMatrix {
         add(
             ExtensionModule::Fts5,
             SurfaceKind::ScalarFunction,
+            "fts5_source_id()",
+            "Return the FTS5 extension source identifier string",
+            ParityStatus::Partial,
+            &["ext-fts5"],
+            Some(5),
+            None,
+            &["ext", "fts5", "source-id"],
+        );
+        add(
+            ExtensionModule::Fts5,
+            SurfaceKind::ScalarFunction,
             "bm25()",
             "BM25 relevance ranking function",
             ParityStatus::Partial,
@@ -876,16 +887,10 @@ impl ExtensionParityMatrix {
             SurfaceKind::Operator,
             "-> operator",
             "JSON extraction returning JSON text (3.38+)",
-            ParityStatus::Missing,
+            ParityStatus::Partial,
             &["ext-json1"],
             Some(12),
-            Some(OmissionRationale {
-                reason: "Arrow operators require parser changes for infix JSON \
-                         extraction; planned for a future closure wave"
-                    .to_owned(),
-                introduced_version: Some("3.38.0".to_owned()),
-                future_candidate: true,
-            }),
+            None,
             &["ext", "json", "operator"],
         );
         add(
@@ -893,16 +898,10 @@ impl ExtensionParityMatrix {
             SurfaceKind::Operator,
             "->> operator",
             "JSON extraction returning SQL value (3.38+)",
-            ParityStatus::Missing,
+            ParityStatus::Partial,
             &["ext-json1"],
             Some(12),
-            Some(OmissionRationale {
-                reason: "Arrow operators require parser changes for infix JSON \
-                         extraction; planned for a future closure wave"
-                    .to_owned(),
-                introduced_version: Some("3.38.0".to_owned()),
-                future_candidate: true,
-            }),
+            None,
             &["ext", "json", "operator"],
         );
 
@@ -1217,6 +1216,28 @@ impl ExtensionParityMatrix {
             None,
             &["ext", "misc", "uuid"],
         );
+        add(
+            ExtensionModule::Misc,
+            SurfaceKind::ScalarFunction,
+            "uuid_str()",
+            "Convert a 16-byte UUID blob to canonical UUID text",
+            ParityStatus::Partial,
+            &[],
+            None,
+            None,
+            &["ext", "misc", "uuid"],
+        );
+        add(
+            ExtensionModule::Misc,
+            SurfaceKind::ScalarFunction,
+            "uuid_blob()",
+            "Convert canonical UUID text to a 16-byte UUID blob",
+            ParityStatus::Partial,
+            &[],
+            None,
+            None,
+            &["ext", "misc", "uuid"],
+        );
 
         let acceptance =
             |module_path: &str, test_name: &str, oracle_differential: bool| AcceptanceTestRef {
@@ -1442,12 +1463,17 @@ impl ExtensionParityMatrix {
                 "json_quote()",
                 "json_each()",
                 "json_tree()",
+                "-> operator",
+                "->> operator",
                 "FTS5 virtual table",
                 "FTS5 MATCH operator",
+                "fts5_source_id()",
                 "ICU collation registration",
                 "icu_load_collation()",
                 "generate_series()",
                 "uuid()",
+                "uuid_str()",
+                "uuid_blob()",
             ],
             "connection-runtime-wired",
         );
@@ -2137,7 +2163,7 @@ mod tests {
     }
 
     #[test]
-    fn arrow_operators_are_missing_with_rationale() {
+    fn arrow_operators_are_partial_without_omission_rationale() {
         let matrix = ExtensionParityMatrix::canonical();
         let arrows: Vec<_> = matrix
             .entries
@@ -2146,14 +2172,33 @@ mod tests {
             .collect();
         assert_eq!(arrows.len(), 2, "Expected 2 arrow operator entries");
         for entry in &arrows {
-            assert_eq!(entry.status, ParityStatus::Missing);
+            assert_eq!(entry.status, ParityStatus::Partial);
             assert!(
-                entry.omission.is_some(),
-                "Arrow operator {} lacks omission rationale",
+                entry.omission.is_none(),
+                "Arrow operator {} should not carry omission rationale once implemented",
                 entry.name
             );
-            let omission = entry.omission.as_ref().unwrap();
-            assert!(omission.future_candidate);
+        }
+    }
+
+    #[test]
+    fn runtime_wired_scalar_contract_entries_are_present() {
+        let matrix = ExtensionParityMatrix::canonical();
+        for name in ["fts5_source_id()", "uuid_str()", "uuid_blob()"] {
+            let entry = matrix
+                .entries
+                .values()
+                .find(|entry| entry.name == name)
+                .unwrap_or_else(|| panic!("missing contract entry for {name}"));
+            assert_eq!(entry.status, ParityStatus::Partial);
+            assert!(
+                entry.tags.contains("connection-runtime-wired"),
+                "{name} should be tagged as connection-runtime-wired"
+            );
+            assert!(
+                !entry.acceptance_tests.is_empty(),
+                "{name} should retain executable acceptance coverage"
+            );
         }
     }
 

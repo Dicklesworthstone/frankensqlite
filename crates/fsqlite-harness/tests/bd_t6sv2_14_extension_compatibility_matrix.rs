@@ -541,7 +541,10 @@ fn connection_runtime_wired_extension_surfaces_dispatch_through_connection_path(
         .query("SELECT title FROM docs WHERE docs MATCH 'world';")
         .expect("FTS5 MATCH should dispatch through the connection path");
     assert_eq!(fts_rows.len(), 1);
-    assert_eq!(fts_rows[0].values(), &[SqliteValue::Text("hello".to_owned())]);
+    assert_eq!(
+        fts_rows[0].values(),
+        &[SqliteValue::Text("hello".to_owned())]
+    );
 
     let icu_rows = conn
         .query("SELECT icu_upper('straße', 'de_DE'), uuid();")
