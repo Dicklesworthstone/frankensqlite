@@ -24,28 +24,28 @@ use sha2::{Digest, Sha256};
 use rusqlite::{Connection, DatabaseName, OpenFlags};
 use serde::Serialize;
 
-use fsqlite_types::{DATABASE_HEADER_SIZE, DatabaseHeader};
+use fsqlite_types::{DatabaseHeader, DATABASE_HEADER_SIZE};
 
-use fsqlite_e2e::benchmark::{BenchmarkConfig, BenchmarkMeta, BenchmarkSummary, run_benchmark};
-use fsqlite_e2e::corruption::{CorruptionStrategy, inject_corruption};
+use fsqlite_e2e::benchmark::{run_benchmark, BenchmarkConfig, BenchmarkMeta, BenchmarkSummary};
+use fsqlite_e2e::corruption::{inject_corruption, CorruptionStrategy};
 use fsqlite_e2e::fixture_metadata::{
-    ColumnProfileV1, FIXTURE_METADATA_SCHEMA_VERSION_V1, FixtureFeaturesV1, FixtureMetadataV1,
-    FixtureSafetyV1, RiskLevel, SqliteMetaV1, TableProfileV1, normalize_tags, size_bucket_tag,
+    normalize_tags, size_bucket_tag, ColumnProfileV1, FixtureFeaturesV1, FixtureMetadataV1,
+    FixtureSafetyV1, RiskLevel, SqliteMetaV1, TableProfileV1, FIXTURE_METADATA_SCHEMA_VERSION_V1,
 };
-use fsqlite_e2e::fsqlite_executor::{FsqliteExecConfig, run_oplog_fsqlite};
+use fsqlite_e2e::fsqlite_executor::{run_oplog_fsqlite, FsqliteExecConfig};
 use fsqlite_e2e::golden::{format_mismatch_diagnostic, verify_databases};
 use fsqlite_e2e::methodology::EnvironmentMeta;
 use fsqlite_e2e::oplog::{self, OpLog};
 use fsqlite_e2e::perf_runner::{
-    FsqliteHotPathProfileConfig, HotPathArtifactManifest, HotPathProfileReport,
     build_hot_path_actionable_ranking, build_hot_path_opcode_profile,
     build_hot_path_subsystem_profile, profile_fsqlite_mixed_read_write_hot_path,
     render_hot_path_profile_markdown, write_hot_path_profile_artifacts,
+    FsqliteHotPathProfileConfig, HotPathArtifactManifest, HotPathProfileReport,
 };
 use fsqlite_e2e::report::{EngineInfo, RunRecordV1, RunRecordV1Args};
 use fsqlite_e2e::report_render::render_benchmark_summaries_markdown;
-use fsqlite_e2e::run_workspace::{WorkspaceConfig, create_workspace_with_label};
-use fsqlite_e2e::sqlite_executor::{SqliteExecConfig, run_oplog_sqlite};
+use fsqlite_e2e::run_workspace::{create_workspace_with_label, WorkspaceConfig};
+use fsqlite_e2e::sqlite_executor::{run_oplog_sqlite, SqliteExecConfig};
 
 const HOT_PATH_INLINE_BUNDLE_SCHEMA_V1: &str = "fsqlite-e2e.hot_path_inline_bundle.v1";
 const HOT_PATH_INLINE_BUNDLE_PREFIX: &str = "HOT_PATH_INLINE_BUNDLE_JSON=";
@@ -88,6 +88,61 @@ impl RunModeOptions {
             EnvironmentMeta::suppressed(cargo_profile)
         }
     }
+}
+
+fn shell_escape(raw: &str) -> String {
+    if raw
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || b"/._-*=+".contains(&byte))
+    {
+        return raw.to_owned();
+    }
+    let escaped = raw.replace('\'', "'\"'\"'");
+    format!("'{escaped}'")
+}
+
+fn format_hot_profile_replay_command(
+    db: &str,
+    golden_dir: &Path,
+    working_base: &Path,
+    concurrency: u16,
+    seed: u64,
+    scale: u32,
+    output_dir: &Path,
+    mvcc: bool,
+    run_integrity_check: bool,
+) -> String {
+    let mut rendered =
+        String::from("rch exec -- cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile");
+    for (flag, value) in [
+        ("--db", db.to_owned()),
+        (
+            "--golden-dir",
+            golden_dir.as_os_str().to_string_lossy().into_owned(),
+        ),
+        (
+            "--working-base",
+            working_base.as_os_str().to_string_lossy().into_owned(),
+        ),
+        ("--concurrency", concurrency.to_string()),
+        ("--seed", seed.to_string()),
+        ("--scale", scale.to_string()),
+        (
+            "--output-dir",
+            output_dir.as_os_str().to_string_lossy().into_owned(),
+        ),
+    ] {
+        rendered.push(' ');
+        rendered.push_str(flag);
+        rendered.push(' ');
+        rendered.push_str(&shell_escape(&value));
+    }
+    rendered.push(' ');
+    rendered.push_str(if mvcc { "--mvcc" } else { "--no-mvcc" });
+    if run_integrity_check {
+        rendered.push_str(" --integrity-check");
+    }
+    rendered
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2511,7 +2566,7 @@ fn cmd_hot_profile(argv: &[String]) -> i32 {
 
     let workspace_config = WorkspaceConfig {
         golden_dir: golden_dir.clone(),
-        working_base,
+        working_base: working_base.clone(),
     };
     let label = format!("hot_profile_{db}_c{concurrency}_s{seed}");
     let workspace = match create_workspace_with_label(&workspace_config, &[db.as_str()], &label) {
@@ -2531,15 +2586,16 @@ fn cmd_hot_profile(argv: &[String]) -> i32 {
             .join("bd-db300.4.1")
             .join(format!("{db}_c{concurrency}_s{seed}"))
     });
-    let replay_command = format!(
-        "cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db {db} --concurrency {concurrency} --seed {seed} --scale {scale} --output-dir {}{}{}",
-        output_dir.display(),
-        if mvcc { " --mvcc" } else { " --no-mvcc" },
-        if run_integrity_check {
-            " --integrity-check"
-        } else {
-            ""
-        }
+    let replay_command = format_hot_profile_replay_command(
+        &db,
+        &golden_dir,
+        &working_base,
+        concurrency,
+        seed,
+        scale,
+        &output_dir,
+        mvcc,
+        run_integrity_check,
     );
     let config = FsqliteHotPathProfileConfig {
         seed,
@@ -2551,6 +2607,8 @@ fn cmd_hot_profile(argv: &[String]) -> i32 {
             ..FsqliteExecConfig::default()
         },
         replay_command,
+        golden_dir: Some(golden_dir.display().to_string()),
+        working_base: Some(working_base.display().to_string()),
     };
 
     let report = match profile_fsqlite_mixed_read_write_hot_path(&profile_db.db_path, &db, &config)
@@ -3697,12 +3755,12 @@ fn cmd_compare(argv: &[String]) -> i32 {
 mod tests {
     use super::*;
     use fsqlite_e2e::perf_runner::{
-        HOT_PATH_OPCODE_PROFILE_SCHEMA_V1, HOT_PATH_PROFILE_ACTIONABLE_RANKING_SCHEMA_V1,
-        HOT_PATH_PROFILE_MANIFEST_SCHEMA_V1, HOT_PATH_PROFILE_SCHEMA_V1,
-        HOT_PATH_SUBSYSTEM_PROFILE_SCHEMA_V1, HotPathAllocatorPressure, HotPathArtifactFile,
-        HotPathArtifactManifest, HotPathOpcodeProfileEntry, HotPathParserProfile,
-        HotPathProfileReport, HotPathRankingEntry, HotPathRecordDecodeProfile,
-        HotPathRowMaterializationProfile, HotPathTypeProfile, HotPathValueTypeProfile,
+        HotPathAllocatorPressure, HotPathArtifactFile, HotPathArtifactManifest,
+        HotPathOpcodeProfileEntry, HotPathParserProfile, HotPathProfileReport, HotPathRankingEntry,
+        HotPathRecordDecodeProfile, HotPathRowMaterializationProfile, HotPathTypeProfile,
+        HotPathValueTypeProfile, HOT_PATH_OPCODE_PROFILE_SCHEMA_V1,
+        HOT_PATH_PROFILE_ACTIONABLE_RANKING_SCHEMA_V1, HOT_PATH_PROFILE_MANIFEST_SCHEMA_V1,
+        HOT_PATH_PROFILE_SCHEMA_V1, HOT_PATH_SUBSYSTEM_PROFILE_SCHEMA_V1,
     };
     use fsqlite_e2e::report::{CorrectnessReport, EngineRunReport};
     use serde_json::Value;
@@ -3761,7 +3819,13 @@ mod tests {
             seed: 42,
             scale: 50,
             concurrency: 4,
-            replay_command: "cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile".to_owned(),
+            concurrent_mode: true,
+            run_integrity_check: false,
+            golden_dir: Some("/tmp/golden".to_owned()),
+            working_base: Some("/tmp/working".to_owned()),
+            replay_command:
+                "rch exec -- cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db fixture-a --golden-dir /tmp/golden --working-base /tmp/working --concurrency 4 --seed 42 --scale 50 --output-dir /tmp/out --mvcc"
+                    .to_owned(),
             engine_report: sample_engine_report(),
             parser: HotPathParserProfile {
                 parse_single_calls: 1,
@@ -3838,7 +3902,13 @@ mod tests {
             seed: 42,
             scale: 50,
             concurrency: 4,
-            replay_command: "cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile".to_owned(),
+            concurrent_mode: true,
+            run_integrity_check: false,
+            golden_dir: Some("/tmp/golden".to_owned()),
+            working_base: Some("/tmp/working".to_owned()),
+            replay_command:
+                "rch exec -- cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db fixture-a --golden-dir /tmp/golden --working-base /tmp/working --concurrency 4 --seed 42 --scale 50 --output-dir /tmp/out --mvcc"
+                    .to_owned(),
             files: vec![
                 HotPathArtifactFile {
                     path: "profile.json".to_owned(),
@@ -4002,16 +4072,20 @@ mod tests {
             HOT_PATH_PROFILE_MANIFEST_SCHEMA_V1
         );
         assert_eq!(value["manifest"]["fixture_id"], "fixture-a");
+        assert_eq!(value["profile"]["concurrent_mode"], true);
+        assert_eq!(value["profile"]["run_integrity_check"], false);
+        assert_eq!(value["profile"]["golden_dir"], "/tmp/golden");
+        assert_eq!(value["profile"]["working_base"], "/tmp/working");
+        assert_eq!(value["manifest"]["concurrent_mode"], true);
+        assert_eq!(value["manifest"]["golden_dir"], "/tmp/golden");
         assert_eq!(value["opcode_profile"]["opcodes"][0]["opcode"], "Column");
         assert_eq!(
             value["subsystem_profile"]["subsystem_ranking"][0]["subsystem"],
             "record_decode"
         );
-        assert!(
-            value["summary_markdown"]
-                .as_str()
-                .is_some_and(|summary| summary.contains("## Ranked Hotspots"))
-        );
+        assert!(value["summary_markdown"]
+            .as_str()
+            .is_some_and(|summary| summary.contains("## Ranked Hotspots")));
     }
 
     #[test]

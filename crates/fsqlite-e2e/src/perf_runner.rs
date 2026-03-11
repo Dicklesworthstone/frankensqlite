@@ -21,17 +21,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use fsqlite_core::connection::{
-    HotPathProfileSnapshot, ParserHotPathProfileSnapshot, hot_path_profile_enabled,
-    hot_path_profile_snapshot, reset_hot_path_profile, set_hot_path_profile_enabled,
+    hot_path_profile_enabled, hot_path_profile_snapshot, reset_hot_path_profile,
+    set_hot_path_profile_enabled, HotPathProfileSnapshot, ParserHotPathProfileSnapshot,
 };
 
-use crate::HarnessSettings;
-use crate::benchmark::{BenchmarkConfig, BenchmarkMeta, BenchmarkSummary, run_benchmark};
+use crate::benchmark::{run_benchmark, BenchmarkConfig, BenchmarkMeta, BenchmarkSummary};
 use crate::fsqlite_executor::run_oplog_fsqlite;
 use crate::oplog::{self, OpLog};
 use crate::report::EngineRunReport;
-use crate::run_workspace::{WorkspaceConfig, create_workspace_with_label};
+use crate::run_workspace::{create_workspace_with_label, WorkspaceConfig};
 use crate::sqlite_executor::run_oplog_sqlite;
+use crate::HarnessSettings;
 
 // ── Configuration ──────────────────────────────────────────────────────
 
@@ -167,6 +167,8 @@ pub struct FsqliteHotPathProfileConfig {
     pub concurrency: u16,
     pub exec_config: crate::fsqlite_executor::FsqliteExecConfig,
     pub replay_command: String,
+    pub golden_dir: Option<String>,
+    pub working_base: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -309,6 +311,10 @@ pub struct HotPathProfileReport {
     pub seed: u64,
     pub scale: u32,
     pub concurrency: u16,
+    pub concurrent_mode: bool,
+    pub run_integrity_check: bool,
+    pub golden_dir: Option<String>,
+    pub working_base: Option<String>,
     pub replay_command: String,
     pub engine_report: EngineRunReport,
     pub parser: HotPathParserProfile,
@@ -357,6 +363,10 @@ pub struct HotPathArtifactManifest {
     pub seed: u64,
     pub scale: u32,
     pub concurrency: u16,
+    pub concurrent_mode: bool,
+    pub run_integrity_check: bool,
+    pub golden_dir: Option<String>,
+    pub working_base: Option<String>,
     pub replay_command: String,
     pub files: Vec<HotPathArtifactFile>,
 }
@@ -577,6 +587,10 @@ fn build_hot_path_profile_report(
         seed: config.seed,
         scale: config.scale,
         concurrency: config.concurrency,
+        concurrent_mode: config.exec_config.concurrent_mode,
+        run_integrity_check: config.exec_config.run_integrity_check,
+        golden_dir: config.golden_dir.clone(),
+        working_base: config.working_base.clone(),
         replay_command: config.replay_command.clone(),
         engine_report,
         parser,
@@ -667,6 +681,26 @@ pub fn render_hot_path_profile_markdown(report: &HotPathProfileReport) -> String
     let _ = writeln!(out, "- Seed: `{}`", report.seed);
     let _ = writeln!(out, "- Concurrency: `{}`", report.concurrency);
     let _ = writeln!(out, "- Scale: `{}`", report.scale);
+    let _ = writeln!(
+        out,
+        "- Concurrent mode: `{}`",
+        if report.concurrent_mode { "ON" } else { "OFF" }
+    );
+    let _ = writeln!(
+        out,
+        "- Integrity check: `{}`",
+        if report.run_integrity_check {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+    if let Some(golden_dir) = &report.golden_dir {
+        let _ = writeln!(out, "- Golden dir: `{golden_dir}`");
+    }
+    if let Some(working_base) = &report.working_base {
+        let _ = writeln!(out, "- Working base: `{working_base}`");
+    }
     let _ = writeln!(out);
 
     let _ = writeln!(out, "## Engine Summary\n");
@@ -949,6 +983,10 @@ pub fn write_hot_path_profile_artifacts(
         seed: report.seed,
         scale: report.scale,
         concurrency: report.concurrency,
+        concurrent_mode: report.concurrent_mode,
+        run_integrity_check: report.run_integrity_check,
+        golden_dir: report.golden_dir.clone(),
+        working_base: report.working_base.clone(),
         replay_command: report.replay_command.clone(),
         files: vec![
             HotPathArtifactFile {
@@ -1260,16 +1298,12 @@ mod tests {
         assert_eq!(cells.len(), 8);
 
         // Verify all combinations are present.
-        assert!(
-            cells.iter().any(|c| c.engine == Engine::Sqlite3
-                && c.fixture_id == "fix1"
-                && c.concurrency == 1)
-        );
-        assert!(
-            cells.iter().any(|c| c.engine == Engine::Fsqlite
-                && c.fixture_id == "fix2"
-                && c.concurrency == 4)
-        );
+        assert!(cells
+            .iter()
+            .any(|c| c.engine == Engine::Sqlite3 && c.fixture_id == "fix1" && c.concurrency == 1));
+        assert!(cells
+            .iter()
+            .any(|c| c.engine == Engine::Fsqlite && c.fixture_id == "fix2" && c.concurrency == 4));
     }
 
     #[test]
@@ -1383,6 +1417,8 @@ mod tests {
             },
             replay_command: "cargo run -p fsqlite-e2e --bin realdb-e2e -- hot-profile --db smoke"
                 .to_owned(),
+            golden_dir: Some("sample_sqlite_db_files/golden".to_owned()),
+            working_base: Some("sample_sqlite_db_files/working".to_owned()),
         };
 
         let report = profile_fsqlite_mixed_read_write_hot_path(&db_path, "smoke", &config).unwrap();
@@ -1390,6 +1426,16 @@ mod tests {
         assert_eq!(report.schema_version, HOT_PATH_PROFILE_SCHEMA_V1);
         assert_eq!(report.fixture_id, "smoke");
         assert_eq!(report.workload, "mixed_read_write");
+        assert!(report.concurrent_mode);
+        assert!(!report.run_integrity_check);
+        assert_eq!(
+            report.golden_dir.as_deref(),
+            Some("sample_sqlite_db_files/golden")
+        );
+        assert_eq!(
+            report.working_base.as_deref(),
+            Some("sample_sqlite_db_files/working")
+        );
         assert!(!report.opcode_profile.is_empty());
         assert!(
             report.record_decode.parse_record_column_calls > 0
@@ -1412,6 +1458,16 @@ mod tests {
         .unwrap();
 
         assert_eq!(manifest.schema_version, HOT_PATH_PROFILE_MANIFEST_SCHEMA_V1);
+        assert!(manifest.concurrent_mode);
+        assert!(!manifest.run_integrity_check);
+        assert_eq!(
+            manifest.golden_dir.as_deref(),
+            Some("sample_sqlite_db_files/golden")
+        );
+        assert_eq!(
+            manifest.working_base.as_deref(),
+            Some("sample_sqlite_db_files/working")
+        );
         assert!(artifact_dir.join("profile.json").exists());
         assert!(artifact_dir.join("opcode_profile.json").exists());
         assert!(artifact_dir.join("subsystem_profile.json").exists());
@@ -1434,14 +1490,12 @@ mod tests {
         assert!(!opcode_profile.opcodes.is_empty());
         assert!(!subsystem_profile.subsystem_ranking.is_empty());
         assert!(!actionable_ranking.named_hotspots.is_empty());
-        assert!(
-            actionable_ranking
-                .named_hotspots
-                .iter()
-                .flat_map(|entry| entry.mapped_beads.iter())
-                .any(|bead| bead == "bd-db300.4.2"
-                    || bead == "bd-db300.4.3"
-                    || bead == "bd-db300.4.4")
-        );
+        assert!(actionable_ranking
+            .named_hotspots
+            .iter()
+            .flat_map(|entry| entry.mapped_beads.iter())
+            .any(|bead| bead == "bd-db300.4.2"
+                || bead == "bd-db300.4.3"
+                || bead == "bd-db300.4.4"));
     }
 }
