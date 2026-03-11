@@ -3575,14 +3575,13 @@ impl Connection {
                 statement.as_ref(),
                 Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
             );
+        let op_cx = self.op_cx()?;
         let result = if use_statement_savepoint {
             self.with_internal_statement_savepoint(statement_kind, || {
-                let cx = &Cx::new();
-                self.execute_statement_dispatch_impl(cx, statement.as_ref(), params, precompiled)
+                self.execute_statement_dispatch_impl(&op_cx, statement.as_ref(), params, precompiled)
             })
         } else {
-            let cx = &Cx::new();
-            self.execute_statement_dispatch_impl(cx, statement.as_ref(), params, precompiled)
+            self.execute_statement_dispatch_impl(&op_cx, statement.as_ref(), params, precompiled)
         };
         let ok = result.is_ok();
         self.resolve_autocommit_txn(was_auto, ok)?;
@@ -3631,8 +3630,8 @@ impl Connection {
         statement: &Statement,
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Row>> {
-        let cx = &Cx::new();
-        self.execute_statement_dispatch_impl(cx, statement, params, None)
+        let op_cx = self.op_cx()?;
+        self.execute_statement_dispatch_impl(&op_cx, statement, params, None)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -28770,6 +28769,28 @@ mod tests {
             conn.op_cx(),
             Err(FrankenError::BackgroundWorkerFailed(ref msg))
                 if msg.contains("simulated poisoned runtime for op_cx")
+        ));
+    }
+
+    #[test]
+    fn test_execute_statement_dispatch_join_fallback_uses_op_cx() {
+        let conn = Connection::open(":memory:").unwrap();
+        conn.execute("CREATE TABLE t (x INTEGER)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1), (2)").unwrap();
+
+        let statement = conn
+            .cached_parse_single(
+                "SELECT a.x FROM t AS a JOIN t AS b ON a.x = b.x ORDER BY a.x;",
+            )
+            .unwrap();
+
+        conn._shared_mvcc_state
+            .poison("simulated poisoned runtime for execute_statement_dispatch");
+
+        assert!(matches!(
+            conn.execute_statement_dispatch(statement.as_ref(), None),
+            Err(FrankenError::BackgroundWorkerFailed(ref msg))
+                if msg.contains("simulated poisoned runtime for execute_statement_dispatch")
         ));
     }
 
